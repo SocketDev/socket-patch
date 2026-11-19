@@ -135,13 +135,34 @@ fn remove_interactive_bare_enter_proceeds_with_default_yes() {
 /// Collect the paths of every request the mock actually received. Used to
 /// prove which code path the binary really took (vs. fabricating the right
 /// output without touching the network it claims to touch).
+///
+/// On a terminal `get` also asks what Socket measured about each patch it
+/// lists: a view request that carries no file content
+/// (`?include_blobs=false`). Those are not downloads of a patch, and are
+/// left out.
 async fn received_paths(mock: &MockServer) -> Vec<String> {
     mock.received_requests()
         .await
         .expect("wiremock must record received requests")
         .iter()
+        .filter(|r| r.url.query() != Some("include_blobs=false"))
         .map(|r| r.url.path().to_string())
         .collect()
+}
+
+/// The patches whose measurements the listing asked for
+/// (`view/<uuid>?include_blobs=false`), by uuid.
+async fn measured_uuids(mock: &MockServer) -> Vec<String> {
+    let mut uuids: Vec<String> = mock
+        .received_requests()
+        .await
+        .expect("wiremock must record received requests")
+        .iter()
+        .filter(|r| r.url.query() == Some("include_blobs=false"))
+        .filter_map(|r| r.url.path().rsplit('/').next().map(str::to_string))
+        .collect();
+    uuids.sort();
+    uuids
 }
 
 /// A single-file patch-view `files` map that survives the "patch has
@@ -276,7 +297,7 @@ fn get_interactive_dialoguer_enter_accepts_first_ranked_option() {
     );
     // Enter accepted the first-ranked option and get proceeded to save it.
     assert!(
-        output.contains("Added: 1"),
+        output.contains("Saved 1 patch to "),
         "get must have saved the selected patch; got: {output}"
     );
     let body = std::fs::read_to_string(tmp.path().join(".socket/manifest.json"))
@@ -301,6 +322,12 @@ fn get_interactive_dialoguer_enter_accepts_first_ranked_option() {
             .iter()
             .any(|p| p.ends_with(&format!("/patches/view/{UUID_B}"))),
         "the non-selected patch must not be fetched; recorded paths={paths:?}"
+    );
+    // The listing asked what was measured about both candidates, without
+    // their file content.
+    assert_eq!(
+        rt.block_on(measured_uuids(&mock)),
+        [UUID_A.to_string(), UUID_B.to_string()]
     );
 }
 
@@ -419,7 +446,7 @@ fn get_interactive_dialoguer_quit_cancels_with_exit_zero() {
     );
     // Cancelled means NOTHING was downloaded or recorded.
     assert!(
-        !output.contains("Patches saved"),
+        !output.contains("Saved "),
         "cancelled selection must not save anything; got: {output}"
     );
     assert!(

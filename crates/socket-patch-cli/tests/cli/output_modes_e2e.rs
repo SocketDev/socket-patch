@@ -444,8 +444,9 @@ fn rollback_non_json_prints_summary() {
     let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["rollback", "--offline"], &[]);
     assert_eq!(code, 0);
     assert!(
-        stdout.contains("Rolled back packages:") && stdout.contains("pkg:npm/rb-non-json@1.0.0"),
-        "non-JSON rollback should print summary naming the PURL; got: {stdout}"
+        stdout.contains("Rolled back 1 package:\n  pkg:npm/rb-non-json@1.0.0\n")
+            && stdout.contains("\nRemoved 1 patch from manifest.\n"),
+        "non-JSON rollback should print summary naming the PURL once; got: {stdout}"
     );
     // The summary must reflect reality: the file should be restored to the
     // pre-patch ("before") content. The old test's `|| "original"` even

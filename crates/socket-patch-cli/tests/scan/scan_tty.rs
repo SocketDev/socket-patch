@@ -5,7 +5,8 @@
 
 use std::time::Duration;
 
-use wiremock::MockServer;
+use wiremock::matchers::{method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::common;
 use crate::pty_io;
@@ -123,8 +124,8 @@ async fn scan_json_on_a_tty_never_opens_the_select_menu() {
 
 /// The live status line on a real terminal: every progress message is
 /// replaced (never overwritten in place), so what the user sees is the
-/// result lines only — no "Found 1 patch for 1 packagesatch 1/1)"
-/// residue from the longer "Querying API ... (batch 1/1)" line.
+/// result lines only — no residue of a longer status ("Checking 1 package
+/// for patches...") on the end of a shorter line.
 #[tokio::test(flavor = "multi_thread")]
 async fn scan_progress_on_a_tty_renders_without_stale_tail() {
     let mock = MockServer::start().await;
@@ -149,10 +150,18 @@ async fn scan_progress_on_a_tty_renders_without_stale_tail() {
     assert_eq!(code, 0, "output:\n{output}");
 
     // The raw stream really used the live line (so this test would
-    // catch a regression to bare `\r` rewrites)...
+    // catch a regression to bare `\r` rewrites): the status, behind its
+    // activity mark, is drawn after a clear and cleared again...
+    let status = " Checking 1 package for patches\r\x1b[2K";
+    let drawn = output
+        .find(status)
+        .unwrap_or_else(|| panic!("expected a live status update; raw={output:?}"));
+    let line_start = output[..drawn]
+        .rfind('\r')
+        .expect("the line starts with a return");
     assert!(
-        output.contains("\r\x1b[2KQuerying API for patches... (batch 1/1)"),
-        "expected a live status update; raw={output:?}"
+        output[line_start..drawn].starts_with("\r\x1b[2K"),
+        "the status is drawn over a cleared line; raw={output:?}"
     );
     // ...and the screen shows only clean result lines.
     let screen = pty_io::render(output.as_bytes());
@@ -162,14 +171,17 @@ async fn scan_progress_on_a_tty_renders_without_stale_tail() {
         screen.join("\n")
     );
     assert!(
-        screen.iter().any(|l| l == "Found 1 patch for 1 package"),
+        screen
+            .iter()
+            .any(|l| l == "Switched 0 packages to hosted patches; rewrote 0 files."),
         "screen:\n{}",
         screen.join("\n")
     );
     for transient in [
         "Scanning packages",
-        "Querying API",
-        "Fetching patch details",
+        "Checking 1 package",
+        "Reading patches",
+        "Resolving hosted",
     ] {
         assert!(
             !screen.iter().any(|l| l.contains(transient)),
@@ -225,12 +237,111 @@ async fn scan_debug_mode_on_a_tty_keeps_debug_lines_off_the_status() {
         );
     }
     assert!(
-        !output.contains("Querying API for patches..."),
+        !output.contains("Checking 1 package for patches"),
         "no transient status is drawn in debug mode; raw={output:?}"
     );
     assert!(
-        screen.iter().any(|l| l == "Found 1 patch for 1 package"),
+        screen.iter().any(|l| l == "Found 1 package (1 npm)"),
         "the result lines still print; screen:\n{}",
         screen.join("\n")
     );
+}
+
+/// On a terminal a scan asks what Socket measured about the patches it
+/// selected (their view, without file content) and shows it: in each
+/// package's row and in the closing lines. Where the locale is UTF-8 the
+/// lines of what was done open with a check mark; with `LANG=C` the same
+/// lines print in ASCII at the same columns.
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_on_a_terminal_shows_what_was_measured() {
+    for (locale, glyphs) in [("en_US.UTF-8", true), ("C", false)] {
+        let mock = MockServer::start().await;
+        let before = b"before\n";
+        mount_one_patch_api(&mock, MINIMIST, before).await;
+        // The measurement request: the view asked for without its blobs.
+        // It outranks the download's view mock, which has no statistics.
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")))
+            .and(query_param("include_blobs", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": UUID,
+                "statistics": {
+                    "diff": {"linesAdded": 5, "linesRemoved": 0, "filesChanged": 1},
+                    "functionsChanged": null,
+                    "tests": {"before": {"count": 25, "total": 25},
+                              "after": {"count": 25, "total": 25}},
+                    "pocs": {"reproducedBefore": {"count": 1, "total": 1},
+                             "blockedAfter": {"count": 1, "total": 1}},
+                    "performance": null
+                }
+            })))
+            .with_priority(1)
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let tmp = minimist_project(before);
+
+        let uri = mock.uri();
+        let cwd = tmp.path().to_path_buf();
+        let (code, output) = tokio::task::spawn_blocking(move || {
+            let run = pty_io::run_command(
+                common::hermetic::pty_binary_command(),
+                &[&["scan", "--mode", "agent"][..], &api_args(&uri)].concat(),
+                &cwd,
+                &[("LANG", locale)],
+                &[b""],
+                Duration::from_secs(60),
+            );
+            (run.code, run.output)
+        })
+        .await
+        .expect("spawn_blocking join");
+        assert_eq!(code, 0, "{locale}: output:\n{output}");
+        assert_eq!(
+            std::fs::read(tmp.path().join("node_modules/minimist/index.js")).unwrap(),
+            b"after\n",
+            "{locale}"
+        );
+
+        let screen = pty_io::render(output.as_bytes());
+        let shown = screen.join("\n");
+        let (mark, gutter) = if glyphs {
+            ("\u{2714}", "  ")
+        } else {
+            (" ", "")
+        };
+        assert!(
+            screen
+                .iter()
+                .any(|l| *l == format!("{mark} HIGH  minimist@1.2.2  exploit blocked, 25/25 tests")),
+            "{locale}: the row shows the measurements; screen:\n{shown}"
+        );
+        let done = if glyphs { "\u{2714} " } else { "" };
+        assert!(
+            screen.iter().any(
+                |l| l.starts_with(&format!("{done}Patched 1 package in ")) && l.ends_with("s.")
+            ),
+            "{locale}: the totals say how long the run took; screen:\n{shown}"
+        );
+        assert!(
+            screen.iter().any(|l| *l
+                == format!(
+                    "{done}Verified: 1 of 1 exploit blocked, 25 of 25 package tests passing."
+                )),
+            "{locale}: the totals say what was measured; screen:\n{shown}"
+        );
+        assert!(
+            screen
+                .iter()
+                .any(|l| *l == format!("{gutter}Nothing left to patch.")),
+            "{locale}: screen:\n{shown}"
+        );
+        assert_eq!(
+            output.contains('\u{2714}'),
+            glyphs,
+            "{locale}: a check mark only where the terminal is known to show one"
+        );
+        // Each package is named once.
+        assert_eq!(shown.matches("minimist").count(), 1, "{locale}:\n{shown}");
+    }
 }

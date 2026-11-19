@@ -28,6 +28,7 @@ const COMMAND_MODULES: &[&str] = &[
     "repair",
     "rollback",
     "scan",
+    "show",
     "update",
     "vendor",
     "vex",
@@ -83,6 +84,11 @@ const ALLOWED_COMMAND_IMPORTS: &[(&str, &str, &str)] = &[
         "vendored staging reuses apply's variant matching",
     ),
     ("rollback", "vendor", "rollback's vendored leg"),
+    (
+        "list",
+        "show",
+        "the interactive listing opens a patch with show",
+    ),
     (
         "remove",
         "rollback",

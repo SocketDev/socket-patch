@@ -12,7 +12,6 @@ use socket_patch_core::api::client::{
     build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
     is_fallback_candidate, ApiClient, ApiError,
 };
-use socket_patch_core::api::ranking::severity_order;
 use socket_patch_core::api::types::{BatchPackagePatches, BatchSearchResponse, PatchSearchResult};
 use socket_patch_core::crawlers::ruby_crawler::{
     config_path_ignored_warning, stale_plugin_registration_warning,
@@ -28,13 +27,13 @@ use socket_patch_core::vendor::lock_inventory::unsupported_layout_warnings;
 use socket_patch_core::vendor::{purl_keys_cover, VendorState};
 use socket_patch_core::vex::discover::{LedgerLiveness, WiringMode};
 use std::collections::{HashMap, HashSet};
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{
-    crawl_ecosystems, crawl_ecosystems_with_npm, find_package_paths_for_path_scope, partition_purls,
+    crawl_ecosystems_with_npm, crawl_ecosystems_with_npm_roots, find_package_paths_for_path_scope,
+    partition_purls,
 };
 use crate::json_envelope::{
     usage_error, Command as JsonCommand, Envelope, EnvelopeError, PatchAction, PatchEvent,
@@ -55,6 +54,7 @@ mod gc;
 pub(crate) mod hosted;
 pub(crate) mod policy;
 pub(crate) mod render;
+pub(crate) mod report;
 pub(crate) mod rollout;
 pub mod rollout_args;
 mod socket_yml_args;
@@ -62,9 +62,8 @@ pub(crate) mod vendor_flow;
 mod withdrawn;
 
 use self::discovery::{
-    advisory_coverage, collect_vuln_ids, detect_updates, lockfile_only_contains,
-    lockfile_supplement, preverify_vendor_baselines, vendored_ledger_supplement, AdvisoryCoverage,
-    LockfileSupplement,
+    advisory_coverage, detect_updates, lockfile_only_contains, lockfile_supplement,
+    preverify_vendor_baselines, vendored_ledger_supplement, AdvisoryCoverage, LockfileSupplement,
 };
 // Shared with `get --mode hosted|vendored` (commands::get): the lockfile
 // and vendored-ledger crawl supplements. `pub(crate)` re-exports because
@@ -132,8 +131,8 @@ fn is_pypi_purl(purl: &str) -> bool {
 
 /// Mark each API purl that names a lockfile-only PyPI pin under another
 /// PEP 440 spelling (`@1.16.0` for a lock's `@1.16`, #604) as lockfile-only
-/// too, so the `notInstalled` flag, the `[NOT INSTALLED]` marker and the
-/// vendored baseline pre-check treat it as the package it is. A spelling an
+/// too, so the `notInstalled` flag, the agent-mode not-installed skip and
+/// the vendored baseline pre-check treat it as the package it is. A spelling an
 /// installed copy already carries is left alone.
 fn adopt_pypi_equivalents(
     packages: &[BatchPackagePatches],
@@ -772,34 +771,6 @@ fn select_accessible(
     policy.select(accessible)
 }
 
-/// The advisory lines ([`render::coverage_lines`]) of the packages whose
-/// selected patch is one of `landed`: only a patch the run applied (or, on
-/// a dry run, would apply) is said to fix anything.
-pub(super) fn coverage_lines_for(
-    coverage: &[AdvisoryCoverage],
-    landed: &HashSet<&str>,
-    dry_run: bool,
-    verbose: bool,
-) -> Vec<String> {
-    let patched: Vec<&AdvisoryCoverage> = coverage
-        .iter()
-        .filter(|c| c.uuids.iter().any(|uuid| landed.contains(uuid.as_str())))
-        .collect();
-    render::coverage_lines(&patched, dry_run, verbose, ui::stdout_color())
-}
-
-/// Print [`coverage_lines_for`] on stdout, under the mode's result line.
-fn print_coverage(
-    coverage: &[AdvisoryCoverage],
-    landed: &HashSet<&str>,
-    dry_run: bool,
-    verbose: bool,
-) {
-    for line in coverage_lines_for(coverage, landed, dry_run, verbose) {
-        println!("{line}");
-    }
-}
-
 /// The uuids of the patches an agent run left applied: the ones its nested
 /// apply wrote, the ones it found already in place, and the ones whose
 /// code is not in the build installed here
@@ -818,14 +789,6 @@ fn patched_uuids(outcome: &Envelope) -> HashSet<&str> {
         })
         .filter_map(|event| event.uuid.as_deref())
         .collect()
-}
-
-/// Print the blank stdout line that opens a paragraph, once: `opened`
-/// flips on the first call.
-fn open_paragraph(opened: &mut bool) {
-    if !std::mem::replace(opened, true) {
-        println!();
-    }
 }
 
 /// One `search_patches_by_package` query per package with patches, merged
@@ -866,11 +829,7 @@ async fn fetch_patch_details(
         },
     ));
     for i in 0..packages.len() {
-        status.set(format!(
-            "Fetching patch details... ({}/{})",
-            i + 1,
-            packages.len()
-        ));
+        status.progress("Reading patches", i, packages.len());
         let Some((pkg, response)) = responses.next().await else {
             break;
         };
@@ -1322,9 +1281,13 @@ fn is_info_note(code: &str) -> bool {
 }
 
 /// Print the run-level warnings to stderr: advisories as `Note:` (not
-/// under `--silent`), everything else as `Warning:`. User-patch skips are
-/// silenced too, matching `user_patches::check`; the envelope keeps them.
-fn print_layout_refusals(refusals: &[(String, String)], silent: bool) {
+/// under `--silent`), everything else as `Warning:`. The packages the
+/// project's own patches cover have one entry each in `refusals` (the
+/// envelope's), and print as `project_patches`, the one notice for all of
+/// them ([`render::project_patch_notice`]), where the first of them
+/// stands; `--silent` mutes it, matching `user_patches::check`.
+fn print_layout_refusals(refusals: &[(String, String)], project_patches: &[String], silent: bool) {
+    let mut project_patches = Some(project_patches);
     for (code, detail) in refusals {
         if is_info_note(code) {
             if !silent {
@@ -1334,8 +1297,10 @@ fn print_layout_refusals(refusals: &[(String, String)], silent: bool) {
             code.as_str(),
             super::user_patches::CONFLICT | super::user_patches::ALLOWED
         ) {
-            if !silent {
-                eprintln!("Warning: {detail}");
+            for line in project_patches.take().unwrap_or_default() {
+                if !silent {
+                    eprintln!("{line}");
+                }
             }
         } else {
             eprintln!("Warning: {detail}");
@@ -1635,7 +1600,12 @@ fn scanned_ecosystems(purls: &[String]) -> Vec<String> {
 }
 
 pub async fn run(args: ScanArgs) -> i32 {
-    Box::pin(run_scan(args, None, true)).await
+    // One report per invocation: every project directory's run adds to
+    // it, and the totals print once, under the last of them.
+    let mut report = report::Run::new(&args.common);
+    let code = Box::pin(run_scan(args, None, true, None, &mut report)).await;
+    report.finish().await;
+    code
 }
 
 /// The project directories a hosted or vendored scan's PATHs name: each
@@ -1713,6 +1683,7 @@ async fn run_project_dirs(
     invocation: &InvocationPolicy,
     mode_inferred: bool,
     dirs: Vec<(PathBuf, bool)>,
+    report: &mut report::Run,
 ) -> i32 {
     let usage = |code: &str, message: &str| {
         usage_error(
@@ -1779,11 +1750,22 @@ async fn run_project_dirs(
                 .collect(),
         );
     }
+    // The slow, read-only half of every directory's scan, for all of them
+    // at once (see `ahead`). The directories are then scanned one by one,
+    // in order, as before: their output and the patch budget stay ordered.
+    let mut crawled = ahead(&args, &dirs, report).await.into_iter();
     let mut code = 0;
     for (dir, explicit) in &dirs {
         if dirs.len() > 1 && !args.common.silent {
             let shown = crate::commands::projects_below::shown_project_dir(&args.common.cwd, dir);
-            println!("{}", crate::commands::projects_below::heading(&shown));
+            // The heading opens with a blank line; only its text is bold.
+            let heading = crate::commands::projects_below::heading(&shown);
+            let text = heading.trim_start_matches('\n');
+            println!(
+                "{}{}",
+                &heading[..heading.len() - text.len()],
+                ui::bold(text, ui::stdout_color())
+            );
         }
         let mut child = args.clone();
         child.paths.clear();
@@ -1792,9 +1774,216 @@ async fn run_project_dirs(
         if mode_inferred {
             child.mode = None;
         }
-        code = code.max(Box::pin(run_scan(child, Some(invocation), *explicit)).await);
+        let ahead = crawled.next().flatten();
+        code =
+            code.max(Box::pin(run_scan(child, Some(invocation), *explicit, ahead, report)).await);
     }
     code
+}
+
+/// One project directory's crawl, made ahead of its scan ([`ahead`]):
+/// the packages every ecosystem's crawler found, with the options and
+/// ecosystem scope they were crawled with. The scan uses it in place of
+/// its own crawl when it would crawl the same way.
+struct Crawled {
+    options: socket_patch_core::crawlers::CrawlerOptions,
+    scope: Option<Vec<String>>,
+    packages: Vec<socket_patch_core::crawlers::CrawledPackage>,
+    skipped_bundle_config_path: Option<String>,
+    npm: Option<crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+}
+
+impl Crawled {
+    /// Whether a crawl with `options` over `scope` would be this one.
+    fn is_for(
+        &self,
+        options: &socket_patch_core::crawlers::CrawlerOptions,
+        scope: Option<&[String]>,
+    ) -> bool {
+        // Destructured, not field-by-field: a new crawler option that
+        // changes what a crawl finds has to be answered here.
+        let socket_patch_core::crawlers::CrawlerOptions {
+            cwd,
+            global,
+            global_prefix,
+        } = options;
+        self.options.cwd == *cwd
+            && self.options.global == *global
+            && self.options.global_prefix == *global_prefix
+            && self.scope.as_deref() == scope
+            && self.npm.as_ref().is_none_or(|npm| npm.taken_with(options))
+    }
+}
+
+/// How many project directories are crawled at once ahead of their
+/// scans. The crawls share the walk pool, so this bounds how much is held
+/// in flight, not the load.
+const AHEAD_AT_ONCE: usize = 8;
+
+/// A scan of several project directories spends most of its time
+/// waiting: each directory is crawled, then the patch service is asked
+/// about its packages, one directory after another. None of that waiting
+/// depends on the directory before it, so it is done here for all of
+/// them together: every directory is crawled at once, and the patch
+/// service is asked once about every package any of them holds (the batch
+/// search, then the patches of each package that has any), through the
+/// run's client, which remembers the answers
+/// ([`report::Run::share_lookups`]).
+///
+/// The directories' scans then run one by one as they always did (their
+/// output, the per-run patch budget and every write stay in order), each
+/// using its crawl from here and finding its questions already answered.
+/// Nothing here decides anything: a crawl the scan would have made
+/// differently is made again, and a question that was not answered (or
+/// not asked: a failed request, a package only a later step names) is
+/// asked by the scan, which reports failures as before.
+///
+/// Returns each directory's crawl, in `dirs`' order; `None` for a
+/// directory (or all of them) left to its scan.
+async fn ahead(
+    args: &ScanArgs,
+    dirs: &[(PathBuf, bool)],
+    report: &mut report::Run,
+) -> Vec<Option<Crawled>> {
+    use futures_util::StreamExt as _;
+    let mut out: Vec<Option<Crawled>> = dirs.iter().map(|_| None).collect();
+    // One directory waits for nothing but itself. A pruning scan crawls a
+    // scope its policy settles, a global one has no project directories,
+    // and an offline one is refused before it asks anything.
+    if dirs.len() < 2 || args.prune || args.sync || args.common.offline || args.common.is_global() {
+        return out;
+    }
+    report.share_lookups();
+    // The client every directory's scan uses, built as the first of them
+    // would build it (its advisories print here, once).
+    let (client, on_proxy) = report
+        .client(get_api_client_with_overrides(
+            args.common.api_client_overrides(),
+        ))
+        .await;
+    let client = &client;
+    let scope = &args.common.ecosystems;
+    let mut status = StatusLine::stderr(args.common.json, args.common.silent);
+
+    // Every directory's crawl, and the purls its scan may ask about: what
+    // is installed, and what only its lockfiles and vendor ledger name.
+    status.progress("Scanning projects", 0, dirs.len());
+    let mut crawls = futures_util::stream::iter(dirs.iter().enumerate())
+        .map(|(index, (dir, _))| async move {
+            let mut common = args.common.clone();
+            common.cwd = dir.clone();
+            let options = common.crawler_options();
+            let (packages, _, skipped_bundle_config_path, npm) =
+                crawl_ecosystems_with_npm(&options, scope.as_deref()).await;
+            let ctx = crate::commands::context::ProjectContext::new(&common);
+            let lockfile_only = lockfile_supplement(
+                &ctx,
+                &packages,
+                scope.as_deref(),
+                args.mode == Some(ScanMode::Hosted),
+            )
+            .await;
+            let ledger =
+                vendored_ledger_supplement(&ctx, &packages, &ctx.loaded().await.vendor).await;
+            let purls: Vec<String> = packages
+                .iter()
+                .chain(&lockfile_only.packages)
+                .chain(&ledger.packages)
+                .map(|package| package.purl.clone())
+                .collect();
+            let purls = with_pypi_equivalents(&purls, &lockfile_only.purls);
+            let crawled = Crawled {
+                options,
+                scope: scope.clone(),
+                packages,
+                skipped_bundle_config_path,
+                npm,
+            };
+            (index, crawled, purls)
+        })
+        .buffer_unordered(AHEAD_AT_ONCE);
+    let mut asked_by: Vec<Vec<String>> = dirs.iter().map(|_| Vec::new()).collect();
+    let mut done = 0;
+    while let Some((index, crawled, purls)) = crawls.next().await {
+        done += 1;
+        status.progress("Scanning projects", done, dirs.len());
+        out[index] = Some(crawled);
+        asked_by[index] = purls;
+    }
+    drop(crawls);
+
+    // One question per package, however many directories hold it.
+    let mut seen = HashSet::new();
+    let purls: Vec<String> = asked_by
+        .iter()
+        .flatten()
+        .filter(|purl| seen.insert(purl.as_str()))
+        .cloned()
+        .collect();
+    let chunks = batch_chunks(
+        &purls,
+        effective_batch_size(args.batch_size, on_proxy),
+        BATCH_BODY_BYTE_CAP,
+    );
+    let checking = format!(
+        "Checking {} for patches",
+        plural(purls.len(), "package", "packages")
+    );
+    let mut found: Vec<BatchPackagePatches> = Vec::new();
+    let mut paid = false;
+    let Some((first, rest)) = chunks.split_first() else {
+        status.finish();
+        return out;
+    };
+    // The first request goes alone: a refused token (or a service that is
+    // down) is found by one request, and left to the scans to report.
+    status.progress(&checking, 0, chunks.len());
+    let Ok(answer) = client.search_patches_batch(first).await else {
+        status.finish();
+        return out;
+    };
+    paid |= answer.can_access_paid_patches;
+    found.extend(answer.packages);
+    let mut answers = futures_util::stream::iter(rest)
+        .map(|chunk| client.search_patches_batch(chunk))
+        .buffer_unordered(api_concurrency_for(on_proxy, rest.len().max(1)));
+    let mut done = 1;
+    while let Some(answer) = answers.next().await {
+        done += 1;
+        status.progress(&checking, done, chunks.len());
+        if let Ok(answer) = answer {
+            paid |= answer.can_access_paid_patches;
+            found.extend(answer.packages);
+        }
+    }
+    drop(answers);
+
+    // The patches of each package that has any.
+    found.retain(|package| !package.patches.is_empty());
+    let mut reads = futures_util::stream::iter(&found)
+        .map(|package| client.search_patches_by_package(&package.purl))
+        .buffer_unordered(api_concurrency_for(on_proxy, found.len().max(1)));
+    let mut done = 0;
+    status.progress("Reading patches", done, found.len());
+    while reads.next().await.is_some() {
+        done += 1;
+        status.progress("Reading patches", done, found.len());
+    }
+    drop(reads);
+    status.finish();
+
+    // What was measured about the patches each directory is likely to get
+    // is asked for now too, so it is in when that directory's rows print.
+    for asked in &asked_by {
+        let asked: HashSet<&str> = asked.iter().map(String::as_str).collect();
+        let theirs: Vec<BatchPackagePatches> = found
+            .iter()
+            .filter(|package| asked.contains(package.purl.as_str()))
+            .cloned()
+            .collect();
+        report.measure_likely(client, &theirs, paid);
+    }
+    out
 }
 
 /// Report a usage error `scan` enforces itself (exit 2): the coded error
@@ -1822,15 +2011,61 @@ fn report_policy_error(err: &socket_patch_core::policy::PolicyError, args: &Scan
     1
 }
 
+/// A read of the checkout started beside the crawl, for an answer the run
+/// needs only once the crawl is in: the reads are independent, and waiting
+/// for them one after another was most of a scan's time before its first
+/// progress. Dropping it (an early return) cancels the read.
+struct Beside<T>(tokio::task::JoinHandle<T>);
+
+impl<T: Send + 'static> Beside<T> {
+    /// Start `read` now, or not at all where file descriptors are scarce:
+    /// the crawl already uses what there is, and the caller then makes the
+    /// read itself, in turn.
+    fn start(read: impl std::future::Future<Output = T> + Send + 'static) -> Option<Self> {
+        (!socket_patch_core::crawlers::walk_pool::fd_limit_is_tight())
+            .then(|| Beside(tokio::spawn(read)))
+    }
+
+    /// The read's answer.
+    async fn done(mut self) -> T {
+        match (&mut self.0).await {
+            Ok(answer) => answer,
+            // Only a drop cancels the read, and nothing awaits a dropped
+            // one: what is left is the read's own panic.
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        }
+    }
+}
+
+impl<T> Drop for Beside<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// `invocation` is the policy a PATH-list parent already loaded (`None`
 /// loads it here); `explicit` says whether the user named this root.
 ///
 /// The one place a scan's exit code is settled: a run that left packages
 /// unchecked (the patch API gave no answer for them) is a partial failure
 /// whatever the mode it went on to run reported, so it never exits 0.
-async fn run_scan(args: ScanArgs, invocation: Option<&InvocationPolicy>, explicit: bool) -> i32 {
+async fn run_scan(
+    args: ScanArgs,
+    invocation: Option<&InvocationPolicy>,
+    explicit: bool,
+    ahead: Option<Crawled>,
+    report: &mut report::Run,
+) -> i32 {
     let mut unchecked = 0usize;
-    let code = Box::pin(scan_project(args, invocation, explicit, &mut unchecked)).await;
+    let code = Box::pin(scan_project(
+        args,
+        invocation,
+        explicit,
+        ahead,
+        &mut unchecked,
+        report,
+    ))
+    .await;
     if unchecked > 0 && code == 0 {
         1
     } else {
@@ -1840,11 +2075,15 @@ async fn run_scan(args: ScanArgs, invocation: Option<&InvocationPolicy>, explici
 
 /// [`run_scan`]'s body. `unchecked` is set to the number of packages the
 /// patch API gave no answer for (already reported; see `run_scan`).
+/// `report` is the invocation's report: this directory's rows print
+/// through it and its counts join the closing totals.
 async fn scan_project(
     mut args: ScanArgs,
     invocation: Option<&InvocationPolicy>,
     explicit: bool,
+    ahead: Option<Crawled>,
     unchecked: &mut usize,
+    report: &mut report::Run,
 ) -> i32 {
     apply_env_toggles(&args.common);
 
@@ -1931,19 +2170,31 @@ async fn scan_project(
             Ok(dirs) => dirs,
             Err((code, message)) => return scan_usage_error(&args, code, &message),
         };
-        return Box::pin(run_project_dirs(args, invocation, mode_inferred, dirs)).await;
+        return Box::pin(run_project_dirs(
+            args,
+            invocation,
+            mode_inferred,
+            dirs,
+            report,
+        ))
+        .await;
     }
     // A bare one names none and finds them: every project in the checkout
     // at or below `--cwd`. `--json` and `--vex` take one directory, so they
     // scan `--cwd` alone and say which projects were left.
     let mut unscanned_projects = None;
     if discovers_projects(&args, invocation) {
+        // The search walks the checkout before anything else can print:
+        // say so at once, or a large one opens with seconds of nothing.
+        let mut finding = StatusLine::stderr(args.common.json, args.common.silent);
+        finding.set("Finding projects");
         let found = crate::commands::projects_below::discovered(
             &args.common,
             &invocation.policy,
             &invocation.repo_root,
         )
         .await;
+        finding.finish();
         let others: Vec<String> = found
             .dirs
             .iter()
@@ -1970,6 +2221,7 @@ async fn scan_project(
                     invocation,
                     mode_inferred,
                     found.dirs,
+                    report,
                 ))
                 .await;
             }
@@ -2052,8 +2304,11 @@ async fn scan_project(
     let socket_dir = args.common.socket_dir();
 
     let overrides = args.common.api_client_overrides();
-    let (mut api_client, mut use_public_proxy) =
-        get_api_client_with_overrides(overrides.clone()).await;
+    // One client per invocation: the project directories of a run share
+    // its connection (and its org lookup).
+    let (mut api_client, mut use_public_proxy) = report
+        .client(get_api_client_with_overrides(overrides.clone()))
+        .await;
     // Sized for the endpoint the run starts on. A mid-run downgrade to the
     // proxy keeps these chunk boundaries: every chunk is within the proxy's
     // body cap by construction (`BATCH_BODY_BYTE_CAP`).
@@ -2076,7 +2331,7 @@ async fn scan_project(
     // envelope are unaffected.
     let human = !args.common.json && !args.common.silent;
     let mut status = StatusLine::stderr(args.common.json, args.common.silent);
-    status.set(format!("Scanning {scan_target}..."));
+    status.set(format!("Scanning {scan_target}"));
 
     // Which ecosystems to crawl (see `crawl_scope`).
     let crawl_scope = crawl_scope(prune, args.common.ecosystems.as_deref());
@@ -2089,12 +2344,43 @@ async fn scan_project(
     let keep_npm = vendor
         || (hosted && args.vex.vex.is_some() && !args.common.dry_run)
         || !path_scope.is_empty();
-    let (mut all_crawled, mut eco_counts, skipped_bundle_config_path, npm_crawl) = if keep_npm {
-        crawl_ecosystems_with_npm(&crawler_options, crawl_scope).await
-    } else {
-        let (packages, counts, skipped) = crawl_ecosystems(&crawler_options, crawl_scope).await;
-        (packages, counts, skipped, None)
+    // Either way the crawl hands back the `node_modules` roots it walked:
+    // the socket.yml filters below judge a nested project's copies by
+    // them, and finding them is most of the crawl of a large checkout.
+    let crawl = async {
+        if keep_npm {
+            let (packages, _, skipped, npm) =
+                crawl_ecosystems_with_npm(&crawler_options, crawl_scope).await;
+            let roots = npm.as_ref().map(|npm| npm.roots().to_vec());
+            (packages, skipped, npm, roots)
+        } else {
+            let (packages, _, skipped, roots) =
+                crawl_ecosystems_with_npm_roots(&crawler_options, crawl_scope).await;
+            (packages, skipped, None, roots)
+        }
     };
+    // The project's own patches (the consent gate below) are read beside
+    // the crawl ([`Beside`]), and collected where they were always used.
+    let mut project_patches = Beside::start({
+        let common = args.common.clone();
+        async move { super::user_patches::inspect(&common).await }
+    });
+    // A run over several project directories crawled this one ahead of
+    // its turn (`ahead`): that crawl stands in for this one when it was
+    // made the same way.
+    let (mut all_crawled, skipped_bundle_config_path, npm_crawl, npm_roots) =
+        match ahead.filter(|crawled| crawled.is_for(&crawler_options, crawl_scope)) {
+            Some(crawled) => {
+                let roots = crawled.npm.as_ref().map(|npm| npm.roots().to_vec());
+                (
+                    crawled.packages,
+                    crawled.skipped_bundle_config_path,
+                    crawled.npm.filter(|_| keep_npm),
+                    roots,
+                )
+            }
+            None => crawl.await,
+        };
 
     // Lockfile supplement: dependencies the project's lockfile resolves
     // that have NO installed copy (fresh clone, partial install). They join
@@ -2116,49 +2402,14 @@ async fn scan_project(
     if let Some(others) = &unscanned_projects {
         let detail = render::unscanned_projects_detail(others, args.common.json);
         if !args.common.json && !args.common.silent {
-            eprintln!("Warning: {detail}");
+            status.println(format!("Warning: {detail}"));
         }
         layout_refusals.push((render::PROJECTS_NOT_SCANNED.to_string(), detail));
     }
-    // A bare agent-mode scan patches the copies the crawl above found, so
-    // it covers the one project at `--cwd`. It names the project
-    // directories below whose packages that crawl did not read (#2125):
-    // without it the run reads as empty, or as a success for the checkout.
-    // PATHs scope the run to what the user named, and a run for one
-    // directory of several (`carry`) leaves the rest to its parent.
-    let mut projects_left = false;
-    if apply && args.paths.is_empty() && args.rollout.carry.is_none() {
-        use crate::commands::projects_below;
-        let left =
-            projects_below::not_crawled(&args.common, &invocation.policy, &invocation.repo_root)
-                .await;
-        if let Some(first) = left.dirs.first() {
-            let shown: Vec<String> = left
-                .dirs
-                .iter()
-                .map(|dir| projects_below::shown_project_dir(&args.common.cwd, dir))
-                .collect();
-            // The run for a directory is asked as this one was: only an
-            // explicit `--mode` converts a project (#1088).
-            let scan = if args.sync {
-                "scan --sync"
-            } else if mode_explicit {
-                "scan --mode agent"
-            } else {
-                "scan"
-            };
-            let command = projects_below::project_command(first, &args.common, scan);
-            let detail = render::unscanned_agent_projects_detail(&shown, &command);
-            layout_refusals.push((render::PROJECTS_NOT_SCANNED.to_string(), detail));
-            projects_left = true;
-        }
-        if left.truncated {
-            layout_refusals.push((
-                projects_below::PROJECTS_BELOW_NOT_SEARCHED.to_string(),
-                projects_below::NOT_CRAWLED_TRUNCATED.to_string(),
-            ));
-        }
-    }
+    // Where the warnings of the search for project directories below go
+    // once it is in (before the package count is judged, below): the
+    // run-level warnings keep the order they always had.
+    let projects_left_at = layout_refusals.len();
     // A token whose org could not be resolved put the whole run on the
     // public proxy (the client already warned on stderr): `--json`
     // consumers get it on the same run-level `warnings[]` channel.
@@ -2196,9 +2447,6 @@ async fn scan_project(
     let mut supplement_purls: HashSet<String> = HashSet::new();
     if !lockfile_only.packages.is_empty() {
         for pkg in &lockfile_only.packages {
-            if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
-                *eco_counts.entry(eco).or_insert(0) += 1;
-            }
             supplement_purls.insert(pkg.purl.clone());
         }
         all_crawled.extend(lockfile_only.packages.iter().cloned());
@@ -2210,9 +2458,6 @@ async fn scan_project(
     let vendor_state = &ctx.loaded().await.vendor;
     let ledger_supplement = vendored_ledger_supplement(&ctx, &all_crawled, vendor_state).await;
     for pkg in &ledger_supplement.packages {
-        if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
-            *eco_counts.entry(eco).or_insert(0) += 1;
-        }
         supplement_purls.insert(pkg.purl.clone());
     }
     all_crawled.extend(ledger_supplement.packages);
@@ -2450,10 +2695,15 @@ async fn scan_project(
     // The socket.yml root/ecosystem/package filters, after the flags
     // (which only narrow further) and after the prune-universe capture.
     if policy.judges_nested_roots() && args.common.ecosystem_selected(Ecosystem::Npm) {
-        let nm_roots = socket_patch_core::crawlers::NpmCrawler::for_options(&crawler_options)
-            .get_node_modules_paths(&crawler_options)
-            .await
-            .unwrap_or_default();
+        // The roots the crawl just walked, or (a crawl that left npm out)
+        // a walk for them.
+        let nm_roots = match npm_roots {
+            Some(roots) => roots,
+            None => socket_patch_core::crawlers::NpmCrawler::for_options(&crawler_options)
+                .get_node_modules_paths(&crawler_options)
+                .await
+                .unwrap_or_default(),
+        };
         policy
             .locate_nested_copies(&nm_roots, &filtered_crawled)
             .await;
@@ -2461,12 +2711,17 @@ async fn scan_project(
     let mut filtered_crawled = policy.admit_crawled_copies(filtered_crawled, &supplement_purls);
     // Keep the full crawl above for GC: a protected package is still installed.
     // Protect before querying/selecting, in every mode and in dry-run previews.
-    let user_patches = super::user_patches::inspect(&args.common).await;
+    let user_patches = match project_patches.take() {
+        Some(started) => started.done().await,
+        None => super::user_patches::inspect(&args.common).await,
+    };
     let mut user_patch_withheld = 0usize;
     // Of those, the ones held back only because a project file could not
     // be read: a broken file, not a patch the project declares.
     let mut user_patch_unreadable = 0usize;
     let mut user_patch_skips = Vec::new();
+    // The same packages for the human notice: one block, not a line each.
+    let mut project_patched: Vec<render::Protected> = Vec::new();
     filtered_crawled.retain(|package| {
         let sources = user_patches.conflicts(&package.purl);
         if sources.is_empty() {
@@ -2479,6 +2734,11 @@ async fn scan_project(
             args.common.allow_patch_conflicts,
             unreadable,
         );
+        project_patched.push(render::Protected {
+            purl: package.purl.clone(),
+            sources,
+            unreadable,
+        });
         if !args.common.allow_patch_conflicts {
             user_patch_withheld += 1;
             user_patch_unreadable += usize::from(unreadable);
@@ -2503,6 +2763,13 @@ async fn scan_project(
         ));
         args.common.allow_patch_conflicts
     });
+    // The index reports its sources under the absolute project root.
+    let project_patch_notice = render::project_patch_notice(
+        &project_patched,
+        args.common.allow_patch_conflicts,
+        args.common.verbose,
+        &std::path::absolute(&args.common.cwd).unwrap_or_else(|_| args.common.cwd.clone()),
+    );
 
     // Agent mode patches the installed jar where it lies. A version whose
     // directory in the Maven local repository holds only its pom was never
@@ -2526,13 +2793,76 @@ async fn scan_project(
     .await;
     layout_refusals.extend(gradle.notes.iter().cloned());
 
+    // A bare agent-mode scan patches the copies the crawl found, so it
+    // covers the one project at `--cwd`, and names the project directories
+    // below whose packages that crawl did not read (#2125): without it the
+    // run reads as empty, or as a success for the checkout. PATHs scope
+    // the run to what the user named, and a run for one directory of
+    // several (`carry`) leaves the rest to its parent.
+    //
+    // Finding them walks the whole checkout, which used to be most of the
+    // wait before a scan's first progress. Nothing before the patch lookup
+    // needs the answer unless the crawl came back empty, so the walk runs
+    // during the lookup, whose wait is the network's, and its warnings
+    // take their old place among the run's (`projects_left_at`).
+    let searches_below = apply && args.paths.is_empty() && args.rollout.carry.is_none();
+    let search_below = |common: GlobalArgs, policy, repo_root: PathBuf| async move {
+        crate::commands::projects_below::not_crawled(&common, &policy, &repo_root).await
+    };
+    let projects_left_warnings = |left: &crate::commands::projects_below::NotCrawled| {
+        use crate::commands::projects_below;
+        let mut warnings = Vec::new();
+        if let Some(first) = left.dirs.first() {
+            let shown: Vec<String> = left
+                .dirs
+                .iter()
+                .map(|dir| projects_below::shown_project_dir(&args.common.cwd, dir))
+                .collect();
+            // The run for a directory is asked as this one was: only an
+            // explicit `--mode` converts a project (#1088).
+            let scan = if args.sync {
+                "scan --sync"
+            } else if mode_explicit {
+                "scan --mode agent"
+            } else {
+                "scan"
+            };
+            let command = projects_below::project_command(first, &args.common, scan);
+            let detail = render::unscanned_agent_projects_detail(&shown, &command);
+            warnings.push((render::PROJECTS_NOT_SCANNED.to_string(), detail));
+        }
+        if left.truncated {
+            warnings.push((
+                projects_below::PROJECTS_BELOW_NOT_SEARCHED.to_string(),
+                projects_below::NOT_CRAWLED_TRUNCATED.to_string(),
+            ));
+        }
+        warnings
+    };
+
     let all_purls: Vec<String> = filtered_crawled.iter().map(|p| p.purl.clone()).collect();
     let package_count = all_purls.len();
 
     if package_count == 0 {
+        // An empty crawl is where the projects below matter most: they
+        // are why nothing was found.
+        let mut projects_left = false;
+        if searches_below {
+            let left = search_below(
+                args.common.clone(),
+                invocation.policy.clone(),
+                invocation.repo_root.clone(),
+            )
+            .await;
+            projects_left = !left.dirs.is_empty();
+            layout_refusals.splice(
+                projects_left_at..projects_left_at,
+                projects_left_warnings(&left),
+            );
+        }
         status.finish();
         if human {
-            print_layout_refusals(&layout_refusals, args.common.silent);
+            print_layout_refusals(&layout_refusals, &project_patch_notice, args.common.silent);
             policy.print_warnings(args.common.silent);
             // Hosted mode already printed its own prune-ignored warning.
             if prune && !hosted && unwired_vendored.is_empty() {
@@ -2665,18 +2995,16 @@ async fn scan_project(
         .await;
     }
 
-    // Build ecosystem summary
+    // The ecosystem summary counts the packages this run goes on to check,
+    // like the total beside it: a filter, the socket.yml policy or the
+    // project's own patches can each leave some of the crawl out, and
+    // "Found 5703 packages (5724 npm)" reads as a miscount.
     let mut eco_parts = Vec::new();
     for eco in Ecosystem::all() {
-        let count = if args.common.ecosystems.is_some() {
-            // When filtering, count the filtered packages
-            filtered_crawled
-                .iter()
-                .filter(|p| Ecosystem::from_purl(&p.purl) == Some(*eco))
-                .count()
-        } else {
-            eco_counts.get(eco).copied().unwrap_or(0)
-        };
+        let count = filtered_crawled
+            .iter()
+            .filter(|p| Ecosystem::from_purl(&p.purl) == Some(*eco))
+            .count();
         if count > 0 {
             eco_parts.push(format!("{count} {}", eco.display_name()));
         }
@@ -2692,12 +3020,25 @@ async fn scan_project(
         plural(package_count, "package", "packages")
     ));
     if human {
-        if lockfile_only_count > 0 {
+        // Hosted and vendored mode patch from the lockfile, so a package
+        // not yet installed is patched like any other. An agent or
+        // report-only scan patches installed copies, and leaves these out.
+        if lockfile_only_count > 0 && !hosted && !vendor {
             eprintln!("{}", render::lockfile_only_note(lockfile_only_count));
         }
-        print_layout_refusals(&layout_refusals, args.common.silent);
+        print_layout_refusals(&layout_refusals, &project_patch_notice, args.common.silent);
         policy.print_warnings(args.common.silent);
     }
+    // The search for project directories below runs through the lookup.
+    let mut left_below = searches_below
+        .then(|| {
+            Beside::start(search_below(
+                args.common.clone(),
+                invocation.policy.clone(),
+                invocation.repo_root.clone(),
+            ))
+        })
+        .flatten();
 
     // Query API in batches
     let mut all_packages_with_patches: Vec<BatchPackagePatches> = Vec::new();
@@ -2781,10 +3122,14 @@ async fn scan_project(
                 |chunk| hold_back_debug(client.search_patches_batch(chunk)),
             ));
             while next < end {
-                status.set(format!(
-                    "Querying API for patches... (batch {}/{total_batches})",
-                    next + 1
-                ));
+                status.progress(
+                    format_args!(
+                        "Checking {} for patches",
+                        plural(package_count, "package", "packages")
+                    ),
+                    next,
+                    total_batches,
+                );
                 // `ordered_concurrent` yields one item per chunk. Should it
                 // ever run dry early, stop: re-entering the outer loop with
                 // `next` unchanged would re-POST the same window forever.
@@ -2814,6 +3159,7 @@ async fn scan_project(
             api_client = build_proxy_fallback_client(&overrides);
             use_public_proxy = true;
             fallback_to_proxy = true;
+            report.fell_back_to(&api_client);
             let result = api_client.search_patches_batch(chunks[next]).await;
             fold(next, result, &mut status);
             next += 1;
@@ -2821,7 +3167,7 @@ async fn scan_project(
     }
 
     // Batches are only sorted within each chunk. Sort globally: this list
-    // drives the table, the `--json` `packages` array and the apply order,
+    // drives the report, the `--json` `packages` array and the apply order,
     // which operators diff across runs.
     all_packages_with_patches.sort_by(|a, b| a.purl.cmp(&b.purl));
     // #604: a patch the API returned under an equivalent spelling of a
@@ -2897,22 +3243,35 @@ async fn scan_project(
     // failed batch.
     let lookup_incomplete = batch_error_count > 0 || !unanswered.is_empty();
 
-    let total_patches_found: usize = all_packages_with_patches
-        .iter()
-        .map(|p| p.patches.len())
-        .sum();
-
-    if total_patches_found > 0 {
-        status.finish_with(format!(
-            "Found {} for {}",
-            plural(total_patches_found, "patch", "patches"),
-            plural(all_packages_with_patches.len(), "package", "packages")
-        ));
-    } else {
-        // The result line ("No patches available for installed packages.")
-        // is printed on stdout below; saying it here too would repeat it.
-        status.finish();
+    // The project directories below that this run did not read, now that
+    // the lookup is in: usually found by now, else the status says what
+    // the run is waiting for.
+    if searches_below {
+        status.set("Looking for other projects");
+        let left = match left_below.take() {
+            Some(started) => started.done().await,
+            None => {
+                search_below(
+                    args.common.clone(),
+                    invocation.policy.clone(),
+                    invocation.repo_root.clone(),
+                )
+                .await
+            }
+        };
+        let warnings = projects_left_warnings(&left);
+        if human {
+            for (_, detail) in &warnings {
+                status.println(format!("Warning: {detail}"));
+            }
+        }
+        layout_refusals.splice(projects_left_at..projects_left_at, warnings);
     }
+
+    // The lookup's outcome is the run's result line on stdout below (what
+    // was patched, or "No patches available for installed packages."), so
+    // the status only clears.
+    status.finish();
 
     // Hosted mode: restore the lockfile pins whose patch the server no
     // longer serves, before the rewrite below re-pins any replacement.
@@ -2964,7 +3323,6 @@ async fn scan_project(
             }
         }
     }
-    let total_patches = free_patches + paid_patches;
 
     // Telemetry: record the scan outcome with the per-tier counts and the
     // ecosystems the crawl actually found (not the `--ecosystems` filter,
@@ -3024,7 +3382,7 @@ async fn scan_project(
             serde_json::json!(can_access_paid_patches),
         );
         // Flag lockfile-only packages (absent means installed), with the
-        // same predicate as the `[NOT INSTALLED]` marker, and Gradle-cached
+        // same predicate as the agent-mode not-installed skip, and Gradle-cached
         // packages with whether the build's lock files name them (an
         // annotation, never a filter).
         let mut packages =
@@ -3359,9 +3717,9 @@ async fn scan_project(
             // Only a lookup the service answered in full may say it of
             // every installed package.
             if lookup_incomplete {
-                println!("\n{}", render::NO_PATCHES_AMONG_CHECKED);
+                println!("{}", render::NO_PATCHES_AMONG_CHECKED);
             } else {
-                println!("\nNo patches available for installed packages.");
+                println!("No patches available for installed packages.");
             }
         }
         return finish_human(0).await;
@@ -3369,17 +3727,60 @@ async fn scan_project(
 
     // `downloadable_count` (above): a free-tier org whose every offer is
     // paid-tier has nothing any mode could select, so every human arm stops
-    // below the table with the same paid-subscription line.
+    // with the same paid-subscription line.
 
-    // The by-package records every arm selects from, fetched before the
-    // table so its `[UPDATE]` markers are the same UPGRADE rows the
-    // selection acts on (§5.1). Only `discover_selected`'s own `Err`
-    // (every query failed) is a fetch failure: queries that succeed with
-    // no records leave nothing to select, in every arm and in `--json`
-    // alike (#1062). A failed discovery still prints the table first; its
-    // exit code is returned below it.
+    // The by-package records every arm selects from. Only
+    // `discover_selected`'s own `Err` (every query failed) is a fetch
+    // failure: queries that succeed with no records leave nothing to
+    // select, in every arm and in `--json` alike (#1062).
     let mut discovery_failure: Option<i32> = None;
+    let filter = invocation.policy.filter();
+    // A hosted or vendored run patches what the lockfile resolves. Where
+    // that lockfile lists the whole dependency graph, a package it does
+    // not name is a copy installed on this machine that the project does
+    // not use (another project's gem in a shared gem home, an extraneous
+    // `node_modules` entry): the mode reports it, and the report does not
+    // count it as left to patch. A requirements file may pin only the
+    // direct dependencies, so PyPI packages always count.
+    let locked: HashSet<PurlKey> = lockfile_only
+        .entries
+        .iter()
+        .map(|entry| PurlKey::new(&entry.purl))
+        .collect();
+    let complete_locks: HashSet<Ecosystem> = lockfile_only
+        .entries
+        .iter()
+        .filter_map(|entry| Ecosystem::from_purl(&entry.purl))
+        .filter(|eco| *eco != Ecosystem::Pypi)
+        .collect();
+    let in_project = |purl: &str| {
+        !(hosted || vendor)
+            || Ecosystem::from_purl(purl).is_none_or(|eco| !complete_locks.contains(&eco))
+            || locked.contains(&PurlKey::new(purl))
+    };
+    // What Socket measured about the patches this run is likely to select,
+    // asked for now so the answers are in by the time the rows print.
+    if fetch_details {
+        report.measure_likely(
+            &api_client,
+            &all_packages_with_patches,
+            can_access_paid_patches,
+        );
+    }
+    // The report's view of every package with a patch on offer: what the
+    // selected patch fixes and leaves unpatched. Every mode prints the rows
+    // of the packages it patched under its result line, and counts the
+    // rest as left to patch.
+    let mut plan = Vec::new();
     let rows: Vec<rollout::Row> = if !fetch_details {
+        plan = report::plan(
+            &all_packages_with_patches,
+            &[],
+            &[],
+            can_access_paid_patches,
+            filter,
+            &in_project,
+        );
         Vec::new()
     } else {
         match discover_selected(
@@ -3404,6 +3805,16 @@ async fn scan_project(
                     None,
                 );
                 updates = offer_updates(&rows, &discovered, &recorded, &all_packages_with_patches);
+                let records: Vec<&PatchSearchResult> =
+                    discovered.offers.unfiltered.values().flatten().collect();
+                plan = report::plan(
+                    &all_packages_with_patches,
+                    &writers_of(&rows),
+                    &records,
+                    can_access_paid_patches,
+                    filter,
+                    &in_project,
+                );
                 rows
             }
             // `discover_selected` already printed the failure to stderr.
@@ -3413,139 +3824,31 @@ async fn scan_project(
             }
         }
     };
-    // What each package's selected patch fixes and leaves unpatched: every
-    // mode prints it under its result line, for the packages it patched.
-    let coverage = advisory_coverage(&all_packages_with_patches, &writers_of(&rows));
-
-    // Presentational only, so `--silent` skips it wholesale.
-    if !silent {
-        let mut updates_available = 0usize;
-
-        // PURLs with a newer patch, from the same `detect_updates` result the
-        // JSON `updates` array uses, so the table and JSON never disagree.
-        let update_purls: HashSet<&str> = updates.iter().map(|u| u.purl.as_str()).collect();
-
-        // Human display only: the decoded PURL (`%40scope` → `@scope`), like
-        // the "Patches to apply" preview. The PACKAGE column is as wide as
-        // the longest one (capped); longer ones keep their `@version`.
-        let shown_purls: Vec<String> = all_packages_with_patches
-            .iter()
-            .map(|p| normalize_purl(&p.purl).into_owned())
-            .collect();
-        let purl_w = render::purl_col_width(shown_purls.iter().map(String::as_str));
-
-        let mut rows: Vec<String> = Vec::with_capacity(all_packages_with_patches.len());
-        for (pkg, shown) in all_packages_with_patches.iter().zip(&shown_purls) {
-            let display_purl = render::elide_purl(shown, purl_w);
-
-            let pkg_free = pkg.patches.iter().filter(|p| p.tier == "free").count();
-            let pkg_paid = pkg.patches.iter().filter(|p| p.tier == "paid").count();
-
-            let count_str = if pkg_paid > 0 {
-                if can_access_paid_patches {
-                    format!("{}+{}", pkg_free, pkg_paid)
-                } else {
-                    format!(
-                        "{}+{}",
-                        pkg_free,
-                        ui::paint(&pkg_paid.to_string(), "33", use_color)
-                    )
-                }
-            } else {
-                format!("{}", pkg_free)
-            };
-
-            // Get highest severity
-            let severity = pkg
-                .patches
-                .iter()
-                .filter_map(|p| p.severity.as_deref())
-                .min_by_key(|s| severity_order(Some(s)))
-                .unwrap_or("unknown");
-
-            // Collect vuln IDs (deterministic; see collect_vuln_ids).
-            let vuln_str = render::vuln_cell(&collect_vuln_ids(pkg), verbose);
-
-            let has_update = update_purls.contains(pkg.purl.as_str());
-            if has_update {
-                updates_available += 1;
-            }
-
-            let update_marker = if has_update {
-                ui::paint(" [UPDATE]", "33", use_color)
-            } else {
-                String::new()
-            };
-            // Lockfile-only packages can be vendored (fetched pristine) but
-            // not applied in place.
-            let not_installed_marker = if lockfile_only_contains(&lockfile_only.purls, &pkg.purl) {
-                ui::paint(" [NOT INSTALLED]", "33", use_color)
-            } else {
-                String::new()
-            };
-
-            rows.push(render::table_row(
-                purl_w,
-                &display_purl,
-                &count_str,
-                &ui::severity(severity, use_color),
-                &vuln_str,
-                &format!("{update_marker}{not_installed_marker}"),
-            ));
-        }
-
-        // The rule is as wide as the table, but never wraps a terminal.
-        let header = render::table_header(purl_w);
-        let cap = std::io::stdout().is_terminal().then(ui::stdout_width);
-        let rule = render::ruler(
-            std::iter::once(header.as_str()).chain(rows.iter().map(String::as_str)),
-            cap,
-        );
-        println!("\n{rule}");
-        println!("{header}");
-        println!("{rule}");
-        for row in &rows {
-            println!("{row}");
-        }
-        println!("{rule}");
-
-        // Summary
-        let with_patches = all_packages_with_patches.len();
-        if can_access_paid_patches {
-            println!(
-                "\n{}",
-                render::summary_line(with_patches, total_patches, true)
-            );
-        } else {
-            println!(
-                "\n{}",
-                render::summary_line(with_patches, free_patches, false)
-            );
-            if paid_patches > 0 {
-                println!(
-                    "{}",
-                    ui::paint(&render::paid_extra_line(paid_patches), "33", use_color),
-                );
-                println!("\n{}", ui::PAID_UPGRADE);
-            }
-        }
-
-        if updates_available > 0 {
-            println!(
-                "\n{}",
-                ui::paint(&render::updates_line(updates_available), "33", use_color),
-            );
-        }
+    report.reads_reachability(filter);
+    if use_public_proxy {
+        report.saw_free_patches_only();
     }
+    // And about any selected patch that guess missed.
+    report.measure(&api_client, &plan);
 
     if downloadable_count == 0 {
         if !silent {
-            println!("\nNo downloadable patches: every patch found requires a paid Socket plan.");
+            println!("No downloadable patches: every patch found requires a paid Socket plan.");
         }
+        report.upsell();
+        report.count(&plan, &HashSet::new());
         return finish_human(0).await;
     }
     if let Some(code) = discovery_failure {
         return code;
+    }
+    // A recorded patch the run replaces with a newer one, from the same
+    // `detect_updates` result the JSON `updates` array uses.
+    if !silent && !updates.is_empty() {
+        println!(
+            "{}",
+            ui::paint(&render::updates_line(updates.len()), "33", use_color),
+        );
     }
     policy.print_human(silent, verbose);
 
@@ -3571,7 +3874,8 @@ async fn scan_project(
                 rows,
                 prior: prior_discovery,
                 references: sweep_references,
-                coverage,
+                plan,
+                report: Some(report),
             }),
             "scan",
         )
@@ -3583,10 +3887,6 @@ async fn scan_project(
     let report_only = args.mode.is_none();
     let selected: Vec<PatchSearchResult> = writers_of(&rows);
 
-    // The skip / already-recorded lines below open their own paragraph
-    // under the table's Summary: one blank line before the first of them.
-    let mut skip_paragraph = false;
-
     // Agent flow (mirrors the JSON arm): vendor-owned and lockfile-only
     // purls leave the selection as skips. Vendored mode partitions nothing.
     let selected = if vendor {
@@ -3595,12 +3895,15 @@ async fn scan_project(
         let split = partition_agent_selection(selected, &vendor_owned_purls, &lockfile_only);
         if !silent {
             for purl in &split.vendored_purls {
-                open_paragraph(&mut skip_paragraph);
                 println!("{}", render::vendored_skip_line(&normalize_purl(purl)));
             }
-            for purl in &split.not_installed_purls {
-                open_paragraph(&mut skip_paragraph);
-                println!("{}", render::not_installed_skip_line(&normalize_purl(purl)));
+            let not_installed: Vec<String> = split
+                .not_installed_purls
+                .iter()
+                .map(|purl| normalize_purl(purl).into_owned())
+                .collect();
+            for line in render::not_installed_skip_lines(&not_installed, verbose) {
+                println!("{line}");
             }
         }
         split.kept
@@ -3645,9 +3948,12 @@ async fn scan_project(
         selected.into_iter().partition(|p| recorded(p))
     };
     let reapply = !report_only && !args.common.dry_run;
-    if !silent {
+    // A recorded patch the run re-applies (or would) gets its row under the
+    // result line like every other patched package; naming it here as well
+    // is for `--verbose`. A report-only run applies nothing, so this line
+    // is the one place it says the patch is already recorded.
+    if !silent && (verbose || report_only) {
         for p in &already_recorded {
-            open_paragraph(&mut skip_paragraph);
             println!(
                 "{}",
                 render::already_recorded_line(&normalize_purl(&p.purl), &p.uuid, reapply)
@@ -3657,7 +3963,6 @@ async fn scan_project(
 
     if selected.is_empty() && (!reapply || already_recorded.is_empty()) {
         if !silent {
-            open_paragraph(&mut skip_paragraph);
             if !stage.deferred_keys().is_empty() {
                 if args.common.dry_run {
                     println!("No new patches would be added this run.");
@@ -3672,12 +3977,59 @@ async fn scan_project(
                 println!("{}", render::ALL_ALREADY_RECORDED);
             }
         }
+        // A dry run of an agent project whose patches are all recorded
+        // would re-apply them; every other run that stops here patched
+        // nothing.
+        let landing: HashSet<&str> = if args.common.dry_run && !report_only {
+            already_recorded.iter().map(|p| p.uuid.as_str()).collect()
+        } else {
+            HashSet::new()
+        };
+        report.project(&plan, &landing).await;
         print_rollout_human(&stage, args.common.dry_run, silent, &[]);
         return finish_human(0).await;
     }
 
-    // Display detailed summary of selected patches (skipped under --silent).
-    if !silent && !selected.is_empty() {
+    // A replacement that fixes less than the recorded patch is said on
+    // every run; `--verbose` says it under the patch's block below.
+    let replaces_of = |patch: &PatchSearchResult| {
+        existing_manifest
+            .as_ref()
+            .filter(|_| !vendor)
+            .and_then(|m| m.patches.get(&patch.purl))
+            .filter(|r| r.uuid != patch.uuid)
+    };
+    if !silent && !verbose {
+        for patch in &selected {
+            let Some(recorded) = replaces_of(patch) else {
+                continue;
+            };
+            let block = render::PatchBlock {
+                patch,
+                severity: "",
+                replaces: Some(render::Replaces {
+                    uuid: &recorded.uuid,
+                    vuln_ids: recorded
+                        .vulnerabilities
+                        .keys()
+                        .map(String::as_str)
+                        .collect(),
+                }),
+                verbose,
+            };
+            if let Some(warning) = render::replacement_warning(&block) {
+                eprintln!(
+                    "Warning: {}: {}",
+                    normalize_purl(&patch.purl),
+                    warning.trim_start().trim_start_matches("Warning: ")
+                );
+            }
+        }
+    }
+
+    // `--verbose`: each selected patch in full (its tier, every advisory's
+    // summary, the patch description).
+    if !silent && verbose && !selected.is_empty() {
         if vendor {
             println!("\nPatches to vendor:\n");
         } else if report_only {
@@ -3694,15 +4046,10 @@ async fn scan_project(
             // The manifest already records a different patch for this
             // package: say so, and warn when the new one fixes less. Agent
             // mode only: vendored mode never writes the manifest.
-            let replaces = existing_manifest
-                .as_ref()
-                .filter(|_| !vendor)
-                .and_then(|m| m.patches.get(&patch.purl))
-                .filter(|r| r.uuid != patch.uuid)
-                .map(|r| render::Replaces {
-                    uuid: &r.uuid,
-                    vuln_ids: r.vulnerabilities.keys().map(String::as_str).collect(),
-                });
+            let replaces = replaces_of(patch).map(|r| render::Replaces {
+                uuid: &r.uuid,
+                vuln_ids: r.vulnerabilities.keys().map(String::as_str).collect(),
+            });
             let block = render::PatchBlock {
                 patch,
                 severity: &severity,
@@ -3728,7 +4075,22 @@ async fn scan_project(
     // read-only preview on a dry run). The preview never says it would
     // download and apply.
     if report_only {
-        // The "Patches available:" listing already ends with a blank line.
+        // One row per package a patch is available for (the `--verbose`
+        // listing above names each in full instead), none of them patched.
+        let offered: HashSet<&str> = selected
+            .iter()
+            .chain(&already_recorded)
+            .map(|p| p.uuid.as_str())
+            .collect();
+        report.settle().await;
+        if !silent && !verbose {
+            println!("Patches available:");
+            for row in report.rows(&plan, &offered) {
+                println!("{row}");
+            }
+            println!();
+        }
+        report.count(&plan, &HashSet::new());
         if !silent {
             for line in render::report_only_hint(&args.common) {
                 println!("{line}");
@@ -3755,45 +4117,48 @@ async fn scan_project(
         .await;
     }
 
-    // `--dry-run` is a non-mutating preview: stop here, having printed the
-    // table and the per-patch plan above, before the download/apply and the
-    // prune GC (which runs as a read-only preview instead).
+    // `--dry-run` is a non-mutating preview: stop here, before the
+    // download/apply and the prune GC (which runs as a read-only preview
+    // instead).
     if args.common.dry_run {
+        // What the wet run would patch: the agent selection with the
+        // recorded patches it re-applies. A vendored preview narrows it to
+        // its rows less its refusals below.
+        let preview = if vendor {
+            // The planning pass above always computed it for a vendored
+            // run.
+            let mut preview = vendor_preview
+                .take()
+                .expect("the vendored planning pass computed the preview");
+            preview.retain_selected(&selected);
+            Some(preview)
+        } else {
+            None
+        };
+        let landing: HashSet<&str> = match &preview {
+            Some(preview) => preview.landing_uuids(),
+            None => selected
+                .iter()
+                .chain(&already_recorded)
+                .map(|p| p.uuid.as_str())
+                .collect(),
+        };
         if !silent {
             // Vendored preview: the JSON arm's ledger classification,
             // rendered as `[skip]` and `[would-refuse]` lines so a preview
             // never advertises vendoring the wet run would skip or refuse.
-            let preview = if vendor {
-                // The planning pass above always computed it for a
-                // vendored run.
-                let mut preview = vendor_preview
-                    .take()
-                    .expect("the vendored planning pass computed the preview");
-                preview.retain_selected(&selected);
-                Some(preview)
-            } else {
-                None
-            };
             match &preview {
                 Some(preview) => preview.print_human(),
                 None => println!(
                     "{}",
-                    render::dry_run_line(render::Plan::Apply(selected.len()))
+                    render::dry_run_line(render::Plan::Apply {
+                        new: selected.len(),
+                        recorded: already_recorded.len(),
+                    })
                 ),
             }
-            // What the wet run would patch: the vendored preview's rows
-            // less its refusals, or the agent selection with the recorded
-            // patches it re-applies.
-            let landing: HashSet<&str> = match &preview {
-                Some(preview) => preview.landing_uuids(),
-                None => selected
-                    .iter()
-                    .chain(&already_recorded)
-                    .map(|p| p.uuid.as_str())
-                    .collect(),
-            };
-            print_coverage(&coverage, &landing, true, verbose);
         }
+        report.project(&plan, &landing).await;
         print_rollout_human(&stage, true, silent, &[]);
         return finish_human(0).await;
     }
@@ -3851,7 +4216,8 @@ async fn scan_project(
             prune,
             &telemetry_auth,
             npm_crawl.as_ref(),
-            &coverage,
+            &plan,
+            report,
         )
         .await
     } else {
@@ -3865,9 +4231,9 @@ async fn scan_project(
             &download_run(&args, &api_client),
         )
         .await;
-        if !silent {
-            print_coverage(&coverage, &patched_uuids(&outcome), false, verbose);
-        }
+        // Under the apply's result line: one row per package it left
+        // patched.
+        report.project(&plan, &patched_uuids(&outcome)).await;
         // A project run that recorded a patch has something to commit, and
         // a re-apply to wire up after every install.
         if code == 0 && !args.common.is_global() {

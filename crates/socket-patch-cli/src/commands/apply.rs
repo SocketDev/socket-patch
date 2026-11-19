@@ -1892,7 +1892,15 @@ pub(crate) async fn run_locked(
             if !args.common.json && !args.common.silent {
                 let cwd = std::fs::canonicalize(&args.common.cwd)
                     .unwrap_or_else(|_| args.common.cwd.clone());
-                let block = format_results_block(&results, &caveats, args.common.dry_run, &cwd);
+                // A nested apply's caller (`scan`, `get`) has listed the
+                // packages itself: the block that names them again is left
+                // out, and the result is one short line.
+                let compact = args.nested.is_some();
+                let block = if compact {
+                    Vec::new()
+                } else {
+                    format_results_block(&results, &caveats, args.common.dry_run, &cwd)
+                };
                 let mut block = block.iter().peekable();
                 // A nested apply's caller already ended its stdout with a
                 // blank line (its listing or table), so the block's leading
@@ -1907,7 +1915,16 @@ pub(crate) async fn run_locked(
                 if args.common.verbose && !results.is_empty() {
                     print_verbose_verification(&results);
                 }
-                if show_summary {
+                if show_summary && compact {
+                    println!(
+                        "{}",
+                        format_compact_summary(
+                            &tally_results(&results, &caveats),
+                            targeted,
+                            unmatched.len()
+                        )
+                    );
+                } else if show_summary {
                     let tally = tally_results(&results, &caveats);
                     println!();
                     if args.common.dry_run {
@@ -2469,6 +2486,35 @@ fn format_summary_line(tally: &ApplyTally, targeted: usize, not_found: usize) ->
     }
     parts.push(format!("{not_found} not found on disk"));
     format!("Summary: {}", parts.join(", "))
+}
+
+/// [`format_summary_line`] for a nested apply, whose caller (`scan`, `get`)
+/// lists the patched packages itself: `Applied 6 patches.`, and the other
+/// buckets only when a patch landed in one
+/// (`Applied 4 of 6 patches: 1 already patched, 1 failed.`).
+fn format_compact_summary(tally: &ApplyTally, targeted: usize, not_found: usize) -> String {
+    let rest: Vec<String> = [
+        (tally.already, "already patched"),
+        (tally.vendored, "vendored"),
+        (tally.not_applicable, "not applicable"),
+        (tally.not_in_effect, "not in effect"),
+        (tally.failed, "failed"),
+        (not_found, "not found on disk"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect();
+    if rest.is_empty() {
+        format!("Applied {}.", plural(tally.applied, "patch", "patches"))
+    } else {
+        format!(
+            "Applied {} of {}: {}.",
+            tally.applied,
+            plural(targeted, "patch", "patches"),
+            rest.join(", ")
+        )
+    }
 }
 
 /// The dry-run summary block: what a wet run would do, per package.
@@ -4832,6 +4878,33 @@ mod tests {
         assert_eq!(
             format_summary_line(&failed, 1, 0),
             "Summary: 0 of 1 targeted patch applied, 0 already patched, 1 failed, 0 not found on disk"
+        );
+        // The compact form names only the buckets a patch landed in.
+        let all = ApplyTally {
+            applied: 6,
+            ..ApplyTally::default()
+        };
+        assert_eq!(format_compact_summary(&all, 6, 0), "Applied 6 patches.");
+        assert_eq!(format_compact_summary(&one, 1, 0), "Applied 1 patch.");
+        assert_eq!(
+            format_compact_summary(&mixed, 4, 1),
+            "Applied 1 of 4 patches: 2 already patched, 1 not found on disk."
+        );
+        assert_eq!(
+            format_compact_summary(&failed, 1, 0),
+            "Applied 0 of 1 patch: 1 failed."
+        );
+        // A patch written but not in effect never reads as applied, and
+        // one with nothing to patch in this build is named too.
+        let partial = ApplyTally {
+            applied: 1,
+            not_in_effect: 1,
+            not_applicable: 1,
+            ..ApplyTally::default()
+        };
+        assert_eq!(
+            format_compact_summary(&partial, 3, 0),
+            "Applied 1 of 3 patches: 1 not applicable, 1 not in effect."
         );
     }
 

@@ -143,6 +143,16 @@ pub enum Commands {
     /// Apply patches for a package, advisory, or patch UUID
     Get(commands::get::GetArgs),
 
+    /// Show what is inside a patch: its fixes, measurements and diff
+    ///
+    /// Reads the patch from the patch service and changes nothing. Prints
+    /// the advisories the patch fixes, what Socket measured about it
+    /// (exploits blocked, tests passing, size, run-time cost), the files it
+    /// changes and the diff of each. On a terminal a patch that changes
+    /// several files opens a menu of them, and diffs are shown through
+    /// your pager; piped, or with --no-pager, everything prints at once.
+    Show(commands::show::ShowArgs),
+
     /// Show this project's patches in every mode
     List(commands::list::ListArgs),
 
@@ -223,6 +233,7 @@ impl Commands {
             Commands::Vendor(a) => &a.common,
             Commands::Rollback(a) => &a.common,
             Commands::Get(a) => &a.common,
+            Commands::Show(a) => &a.common,
             Commands::List(a) => &a.common,
             Commands::Remove(a) => &a.common,
             Commands::Repair(a) => &a.common,

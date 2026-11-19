@@ -6,12 +6,18 @@
 //! - `text`: wording and shaping shared by several commands.
 //! - [`color_enabled`], [`paint`], [`severity`], [`pad`]: color policy and
 //!   ANSI-aware column alignment.
+//! - [`diff`]: a line diff and its unified rendering.
+//! - [`Style`]: how one stream is drawn (color, and the Unicode marks and
+//!   bars of a terminal known to show them), with [`bar`] as its ASCII
+//!   fallback.
 //! - [`init`] / [`quiet`]: the process-wide `--silent`/`--json` switch,
 //!   shared with core's own advisories.
 //!
 //! Every piece that writes takes (or wraps) a plain `Write` sink so it can
 //! be unit-tested against a `Vec<u8>`.
 
+pub(crate) mod browser;
+pub(crate) mod diff;
 mod prompt;
 mod status;
 mod text;
@@ -21,7 +27,7 @@ use std::io::IsTerminal;
 use crate::args::GlobalArgs;
 
 pub(crate) use prompt::confirm;
-pub use prompt::{select_one, SelectError};
+pub use prompt::{select_from, select_one, SelectError};
 pub(crate) use status::StatusLine;
 pub(crate) use text::{
     agent_next_steps, manifest_error_message, next_steps, next_steps_installed, plural,
@@ -178,6 +184,135 @@ fn env_var(k: &str) -> Option<String> {
     std::env::var(k).ok()
 }
 
+/// Whether the Unicode marks and bars may be drawn, pure over its inputs:
+/// only with `color` on (so `NO_COLOR` turns both off) and only on a
+/// terminal (a pipe or log gets ASCII, whatever forced its colors), and
+/// then only where the terminal is known to show UTF-8:
+///
+/// - `TERM=linux` (the kernel console's font holds few glyphs) → off;
+/// - Windows → on in Windows Terminal (`WT_SESSION`), in an editor's
+///   terminal (`TERM_PROGRAM`) and in an xterm-like one (`TERM=xterm...`:
+///   Git Bash, MSYS2); the legacy console → off;
+/// - elsewhere → on when the locale is UTF-8 (the first set of `LC_ALL`,
+///   `LC_CTYPE`, `LANG`).
+///
+/// Everything drawn with them has an ASCII form of the same width, so a
+/// wrong guess costs polish, never alignment.
+pub(crate) fn glyphs_enabled(
+    color: bool,
+    is_tty: bool,
+    windows: bool,
+    env: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let set = |k: &str| env(k).filter(|v| !v.is_empty());
+    if !color || !is_tty || set("TERM").is_some_and(|t| t == "linux") {
+        return false;
+    }
+    if windows {
+        return set("WT_SESSION").is_some()
+            || set("TERM_PROGRAM").is_some()
+            || set("TERM").is_some_and(|t| t.starts_with("xterm"));
+    }
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .find_map(set)
+        .is_some_and(|locale| {
+            let locale = locale.to_ascii_lowercase();
+            locale.contains("utf-8") || locale.contains("utf8")
+        })
+}
+
+/// Await `work` with `label` on a status line of its own, so a step
+/// that takes a moment shows as work in progress ([`StatusLine::stderr`]
+/// says when a line shows at all). The line is up only while `work` is
+/// awaited, and `work` must not print: its result is what the caller
+/// reports, once this returns.
+pub(crate) async fn busy<T>(
+    common: &GlobalArgs,
+    label: impl std::fmt::Display,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    let mut status = StatusLine::stderr(common.json, common.silent);
+    status.set(label);
+    let done = work.await;
+    status.finish();
+    done
+}
+
+/// How human output is drawn on one stream: with color, and with the
+/// Unicode marks and bars ([`glyphs_enabled`]). Every piece has a plain
+/// form, which is what a pipe, a log and a test see.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Style {
+    pub(crate) color: bool,
+    pub(crate) glyphs: bool,
+}
+
+impl Style {
+    /// No color and no glyphs: logs, pipes, `NO_COLOR`.
+    pub(crate) const PLAIN: Style = Style {
+        color: false,
+        glyphs: false,
+    };
+
+    /// The style of stdout (results).
+    pub(crate) fn stdout() -> Style {
+        Style::of(std::io::stdout().is_terminal(), stdout_color())
+    }
+
+    /// The style of stderr (status lines, warnings).
+    pub(crate) fn stderr() -> Style {
+        Style::of(std::io::stderr().is_terminal(), stderr_color())
+    }
+
+    fn of(is_tty: bool, color: bool) -> Style {
+        Style {
+            color,
+            glyphs: glyphs_enabled(color, is_tty, cfg!(windows), env_var),
+        }
+    }
+
+    /// The mark that opens the line of something done, one column wide:
+    /// a green `✔`, or a space where glyphs are off (so the line keeps its
+    /// indent).
+    pub(crate) fn check(&self) -> String {
+        if self.glyphs {
+            paint("✔", "32", self.color)
+        } else {
+            " ".to_string()
+        }
+    }
+
+    /// A progress bar `cells` columns wide (plus the brackets of the ASCII
+    /// form): `done` of `total` filled.
+    pub(crate) fn bar(&self, done: usize, total: usize, cells: usize) -> String {
+        if !self.glyphs {
+            return bar(done, total, cells);
+        }
+        let filled = filled_cells(done, total, cells);
+        format!(
+            "{}{}",
+            paint(&"━".repeat(filled), "32", self.color),
+            paint(&"─".repeat(cells - filled), "2", self.color)
+        )
+    }
+
+    /// The width of [`Self::bar`] at `cells`.
+    pub(crate) fn bar_width(&self, cells: usize) -> usize {
+        cells + if self.glyphs { 0 } else { 2 }
+    }
+}
+
+/// How many of `cells` are filled at `done` of `total`: rounded down, so a
+/// bar is full only when the work is done.
+fn filled_cells(done: usize, total: usize, cells: usize) -> usize {
+    if total == 0 {
+        0
+    } else {
+        (done.min(total) * cells) / total
+    }
+}
+
 /// [`color_enabled`] for stdout; a terminal must also render escapes
 /// ([`vt`]).
 pub(crate) fn stdout_color() -> bool {
@@ -222,37 +357,54 @@ pub fn paint(text: &str, code: &str, on: bool) -> String {
     }
 }
 
+/// `text` in bold when `on`: the numbers a result line is read for.
+pub(crate) fn bold(text: &str, on: bool) -> String {
+    paint(text, "1", on)
+}
+
+/// `text` dimmed when `on`: detail that supports a line without leading it.
+pub(crate) fn dim(text: &str, on: bool) -> String {
+    paint(text, "2", on)
+}
+
+/// A progress bar of `cells` ASCII characters between brackets,
+/// `[######----]`: `done` of `total` filled, never more than all of them.
+/// ASCII on purpose: every terminal and every log renders it at one column
+/// per character, so a status line holding it can always be rewritten.
+pub(crate) fn bar(done: usize, total: usize, cells: usize) -> String {
+    let filled = filled_cells(done, total, cells);
+    format!("[{}{}]", "#".repeat(filled), "-".repeat(cells - filled))
+}
+
 /// Color a severity label by tier (`critical` bright red, `high` red,
 /// `medium`/`moderate` yellow, `low` cyan; anything else plain). The
 /// text itself is kept verbatim.
 pub fn severity(s: &str, on: bool) -> String {
-    let code = match s.to_lowercase().as_str() {
+    match severity_code(s) {
+        Some(code) => paint(s, code, on),
+        None => s.to_string(),
+    }
+}
+
+/// The SGR color of a severity tier, for output that paints its cells
+/// itself; `None` for a label that is not a tier.
+pub(crate) fn severity_code(s: &str) -> Option<&'static str> {
+    Some(match s.to_lowercase().as_str() {
         "critical" => "91",
         "high" => "31",
         // GHSA emits `moderate`; same tier as medium (core `ranking::severity_order`).
         "medium" | "moderate" => "33",
         "low" => "36",
-        _ => return s.to_string(),
-    };
-    paint(s, code, on)
+        _ => return None,
+    })
 }
 
-/// Column alignment for [`pad`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Align {
-    Left,
-    Right,
-}
-
-/// Pad `s` to `width` *visible* characters. SGR color sequences don't
-/// count, so a colored cell lines up exactly like the plain one (`{:<16}`
-/// counts the invisible bytes and misaligns). Never truncates.
-pub(crate) fn pad(s: &str, width: usize, align: Align) -> String {
-    let fill = " ".repeat(width.saturating_sub(visible_width(s)));
-    match align {
-        Align::Left => format!("{s}{fill}"),
-        Align::Right => format!("{fill}{s}"),
-    }
+/// Pad `s` on the right to `width` *visible* characters. SGR color
+/// sequences don't count, so a colored cell lines up exactly like the
+/// plain one (`{:<16}` counts the invisible bytes and misaligns). Never
+/// truncates.
+pub(crate) fn pad(s: &str, width: usize) -> String {
+    format!("{s}{}", " ".repeat(width.saturating_sub(visible_width(s))))
 }
 
 /// Characters a terminal would display for `s` (SGR sequences excluded).
@@ -362,6 +514,88 @@ mod tests {
     }
 
     #[test]
+    fn glyphs_need_color_a_terminal_and_a_utf8_locale() {
+        type Case<'a> = (bool, bool, bool, &'a [(&'a str, &'a str)], bool);
+        let utf8: &[(&str, &str)] = &[("LANG", "en_US.UTF-8")];
+        let cases: &[Case] = &[
+            // (color, tty, windows, env, glyphs)
+            (true, true, false, utf8, true),
+            (false, true, false, utf8, false),
+            (true, false, false, utf8, false),
+            (true, true, false, &[], false),
+            (true, true, false, &[("LANG", "C")], false),
+            (true, true, false, &[("LANG", "C.utf8")], true),
+            // The first locale variable that is set decides.
+            (
+                true,
+                true,
+                false,
+                &[("LC_ALL", "C"), ("LANG", "en_US.UTF-8")],
+                false,
+            ),
+            (
+                true,
+                true,
+                false,
+                &[("LC_ALL", ""), ("LC_CTYPE", "ja_JP.UTF-8")],
+                true,
+            ),
+            (
+                true,
+                true,
+                false,
+                &[("LANG", "en_US.UTF-8"), ("TERM", "linux")],
+                false,
+            ),
+            // Windows: by terminal, never by locale.
+            (true, true, true, utf8, false),
+            (true, true, true, &[("WT_SESSION", "1")], true),
+            (true, true, true, &[("TERM_PROGRAM", "vscode")], true),
+            (true, true, true, &[("TERM", "xterm-256color")], true),
+            (true, true, true, &[("TERM", "cygwin")], false),
+        ];
+        for (color, tty, windows, vars, want) in cases {
+            assert_eq!(
+                glyphs_enabled(*color, *tty, *windows, env(vars)),
+                *want,
+                "color={color} tty={tty} windows={windows} env={vars:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn style_marks_and_bars_have_a_plain_form_of_the_same_width() {
+        let fancy = Style {
+            color: true,
+            glyphs: true,
+        };
+        assert_eq!(Style::PLAIN.check(), " ");
+        assert_eq!(fancy.check(), "\x1b[32m✔\x1b[0m");
+        assert_eq!(visible_width(&fancy.check()), 1);
+        assert_eq!(Style::PLAIN.bar(1, 4, 8), "[##------]");
+        assert_eq!(fancy.bar(1, 4, 8), "\x1b[32m━━\x1b[0m\x1b[2m──────\x1b[0m");
+        assert_eq!(visible_width(&fancy.bar(1, 4, 8)), fancy.bar_width(8));
+        assert_eq!(
+            visible_width(&Style::PLAIN.bar(1, 4, 8)),
+            Style::PLAIN.bar_width(8)
+        );
+    }
+
+    #[test]
+    fn bar_fills_in_proportion_and_never_overflows() {
+        assert_eq!(bar(0, 4, 8), "[--------]");
+        assert_eq!(bar(1, 4, 8), "[##------]");
+        assert_eq!(bar(4, 4, 8), "[########]");
+        assert_eq!(bar(9, 4, 8), "[########]");
+        // Rounds down: the bar is full only when the work is done.
+        assert_eq!(bar(7, 8, 4), "[###-]");
+        assert_eq!(bar(0, 0, 4), "[----]");
+        assert_eq!(bar(3, 3, 0), "[]");
+        assert_eq!(bold("7", true), "\x1b[1m7\x1b[0m");
+        assert_eq!(dim("x", false), "x");
+    }
+
+    #[test]
     fn severity_ramp_is_exact() {
         assert_eq!(severity("critical", true), "\x1b[91mcritical\x1b[0m");
         assert_eq!(severity("HIGH", true), "\x1b[31mHIGH\x1b[0m");
@@ -378,13 +612,10 @@ mod tests {
 
     #[test]
     fn pad_counts_visible_chars_only() {
-        let colored = pad(&severity("HIGH", true), 16, Align::Left);
-        let plain = pad(&severity("HIGH", false), 16, Align::Left);
+        let colored = pad(&severity("HIGH", true), 16);
+        let plain = pad(&severity("HIGH", false), 16);
         assert_eq!(strip_ansi(&colored), plain);
         assert_eq!(visible_width(&colored), 16);
-        assert_eq!(pad("0+1", 8, Align::Right), "     0+1");
-        let paid = format!("0+{}", paint("1", "33", true));
-        assert_eq!(strip_ansi(&pad(&paid, 8, Align::Right)), "     0+1");
-        assert_eq!(pad("toolongvalue", 4, Align::Left), "toolongvalue");
+        assert_eq!(pad("toolongvalue", 4), "toolongvalue");
     }
 }

@@ -42,7 +42,9 @@ pub use crate::commands::agent_download::{
     download_and_apply_patches_into, download_and_apply_patches_with, DownloadParams, DownloadRun,
 };
 use crate::commands::apply::ApplyRunReport;
-use crate::ecosystem_dispatch::{crawl_ecosystems, find_packages_for_rollback, partition_purls};
+use crate::ecosystem_dispatch::{
+    crawl_ecosystems, find_packages_for_rollback, installed_target_matches, partition_purls,
+};
 use crate::json_envelope::{
     usage_error, Command as JsonCommand, Envelope, EnvelopeError, PatchAction as EventAction,
     PatchEvent, RunWarning, Status,
@@ -334,11 +336,14 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// order [`select_patches`] resolves in, so a package's first entry is the
 /// one that will be applied. A `by-cve` / `by-ghsa` search can span
 /// several packages, hence the grouping. Severities are colored when
-/// `color` is on. Ends with a blank line.
+/// `color` is on. Under a patch's `Fixes:` line come the lines of what
+/// Socket `measured` about it ([`super::measured::lines`]), when it did.
+/// Ends with a blank line.
 fn format_search_results(
     patches: &[&PatchSearchResult],
     can_access_paid: bool,
     color: bool,
+    measured: &super::measured::Measured,
 ) -> String {
     let mut patches: Vec<&PatchSearchResult> = patches.to_vec();
     patches.sort_by(|a, b| natural_cmp(&a.purl, &b.purl).then_with(|| cmp_search_results(a, b)));
@@ -396,10 +401,37 @@ fn format_search_results(
                 .collect();
             out.push_str(&format!("     Fixes: {}\n", fixes.join(", ")));
         }
+        for line in measured
+            .get(&patch.uuid)
+            .map(super::measured::lines)
+            .unwrap_or_default()
+        {
+            out.push_str(&format!("     {line}\n"));
+        }
         out.push('\n');
     }
     out
 }
+
+/// What Socket measured about the patches a listing is about to show, for
+/// [`format_search_results`]: asked for only when someone is watching
+/// ([`super::measured::wanted`]), and only for the first
+/// [`MEASURED_LISTED`] of a long listing.
+async fn measure_listed(
+    common: &GlobalArgs,
+    api_client: &ApiClient,
+    listed: &[&PatchSearchResult],
+) -> super::measured::Measured {
+    let uuids: Vec<String> = listed
+        .iter()
+        .take(MEASURED_LISTED)
+        .map(|p| p.uuid.clone())
+        .collect();
+    super::measured::fetch(common, api_client, uuids).await
+}
+
+/// Most patches of one listing whose measurements are asked for.
+const MEASURED_LISTED: usize = 32;
 
 /// The stderr line naming the installed packages a package-name search
 /// matched (every one of them is searched).
@@ -416,22 +448,6 @@ fn format_matched_packages(purls: &[String]) -> String {
             many.join(", ")
         ),
     }
-}
-
-/// Every installed purl a package-name `target` selects, deduplicated and
-/// sorted (a monorepo can hold the same release in several places).
-fn installed_target_matches(
-    target: &Target,
-    packages: &[socket_patch_core::crawlers::CrawledPackage],
-) -> Vec<String> {
-    let mut purls: Vec<String> = packages
-        .iter()
-        .filter(|pkg| target.matches_package(&pkg.purl))
-        .map(|pkg| pkg.purl.clone())
-        .collect();
-    purls.sort();
-    purls.dedup();
-    purls
 }
 
 /// "Did you mean" for a name that matched nothing exactly: up to five
@@ -1582,9 +1598,15 @@ pub async fn run(args: GetArgs) -> i32 {
                 // stdout itself starts with the result.
                 eprintln!();
             }
+            let measured = measure_listed(&args.common, &api_client, &all).await;
             print!(
                 "{}",
-                format_search_results(&all, search_response.can_access_paid_patches, color)
+                format_search_results(
+                    &all,
+                    search_response.can_access_paid_patches,
+                    color,
+                    &measured
+                )
             );
             println!("All available patches require a paid Socket plan.");
             println!("{}", crate::ui::PAID_UPGRADE);
@@ -1676,9 +1698,15 @@ pub async fn run(args: GetArgs) -> i32 {
             // terminal; stdout itself starts with the result.
             eprintln!();
         }
+        let measured = measure_listed(&args.common, &api_client, &listed).await;
         print!(
             "{}",
-            format_search_results(&listed, search_response.can_access_paid_patches, color)
+            format_search_results(
+                &listed,
+                search_response.can_access_paid_patches,
+                color,
+                &measured
+            )
         );
         let mut skip_lines = format_skip_summary(&narrow_skips);
         if args.common.verbose {
@@ -2167,10 +2195,8 @@ async fn save_and_apply_patch(
 
     let mut apply_report: Option<ApplyRunReport> = None;
     if let Some(lock) = apply_lock {
-        if !quiet {
-            eprintln!();
-            eprintln!("Applying patches...");
-        }
+        // One patch, named on the save line above: the apply says its
+        // result in one line (`Applied 1 patch.`).
         apply_report = Some(
             run_nested_apply(
                 nested_apply_args(&args.common, &manifest_path, quiet),
@@ -2522,7 +2548,7 @@ async fn run_get_vendored(
 mod tests {
     use super::*;
     use crate::commands::agent_download::{
-        base64_decode, files_with_both_hashes, format_record_skip, format_save_summary,
+        base64_decode, files_with_both_hashes, format_record_skip, format_save_line,
         nested_apply_args_from_params, severity_rank, write_blob_entry, APPLY_FAILED,
     };
     use socket_patch_core::crawlers::CrawlerOptions;
@@ -3151,6 +3177,7 @@ mod tests {
             description: "desc".into(),
             license: "MIT".into(),
             tier: "free".into(),
+            statistics: None,
         };
         let meta = patch_event_metadata(&patch);
         assert!(meta.as_object().unwrap().get("severity").is_none());
@@ -3181,6 +3208,7 @@ mod tests {
             description: "Fixes prototype pollution in minimist".into(),
             license: "MIT".into(),
             tier: "free".into(),
+            statistics: None,
         };
         let meta = patch_event_metadata(&patch);
         assert_eq!(meta["description"], "Fixes prototype pollution in minimist");
@@ -3222,6 +3250,7 @@ mod tests {
             description: String::new(),
             license: String::new(),
             tier: String::new(),
+            statistics: None,
         };
         let meta = patch_event_metadata(&patch);
         let ids: Vec<&str> = meta["vulnerabilities"]
@@ -3244,6 +3273,7 @@ mod tests {
             description: "desc".into(),
             license: "MIT".into(),
             tier: "free".into(),
+            statistics: None,
         };
         let meta = patch_event_metadata(&patch);
         // `severity` is intentionally omitted (not null) when there
@@ -3849,6 +3879,7 @@ mod tests {
             description: "desc".into(),
             license: "MIT".into(),
             tier: "free".into(),
+            statistics: None,
         }
     }
 
@@ -4337,7 +4368,8 @@ mod tests {
         );
         let mut b = mk_patch("uuid-b", "pkg:npm/lodash@4.17.2", "paid", "2024-01-01");
         b.description = String::new();
-        let out = format_search_results(&[&a, &b], false, false);
+        let none = crate::commands::measured::Measured::new();
+        let out = format_search_results(&[&a, &b], false, false, &none);
         assert_eq!(
             out,
             "Found 2 patches:\n\n\
@@ -4348,13 +4380,28 @@ mod tests {
              \x20    Description: desc-uuid-a\n\
              \x20    Fixes: CVE-2026-1 (HIGH), CVE-2026-2 (MODERATE)\n\n"
         );
-        let one = format_search_results(&[&a], true, false);
+        let one = format_search_results(&[&a], true, false, &none);
         assert!(one.starts_with("Found 1 patch:\n\n"), "{one}");
         assert_eq!(
-            format_search_results(&[], true, false),
+            format_search_results(&[], true, false, &none),
             "Found 0 patches:\n\n"
         );
-        let colored = format_search_results(&[&a], true, true);
+        // What Socket measured about a patch follows its `Fixes:` line.
+        let measured: crate::commands::measured::Measured = [(
+            "uuid-a".to_string(),
+            crate::commands::measured::tests::stats(2, 35, 35),
+        )]
+        .into();
+        assert_eq!(
+            format_search_results(&[&a], true, false, &measured),
+            "Found 1 patch:\n\n\
+             \x20 1. pkg:npm/lodash@4.17.10 [FREE]\n\
+             \x20    UUID: uuid-a\n\
+             \x20    Description: desc-uuid-a\n\
+             \x20    Fixes: CVE-2026-1 (HIGH), CVE-2026-2 (MODERATE)\n\
+             \x20    Verified: 2 of 2 exploits blocked, 35 of 35 tests passing\n\n"
+        );
+        let colored = format_search_results(&[&a], true, true, &none);
         assert!(
             colored.contains("CVE-2026-1 (\x1b[31mHIGH\x1b[0m)"),
             "{colored:?}"
@@ -4482,23 +4529,27 @@ mod tests {
     }
 
     #[test]
-    fn save_summary_lines() {
+    fn save_line_says_what_changed_in_one_line() {
         let m = Path::new(".socket/manifest.json");
         assert_eq!(
-            format_save_summary(m, 2, 0, 0, 0),
-            "Patches saved to .socket/manifest.json\n  Added: 2"
+            format_save_line(m, 2, 0, 0, 0),
+            "Saved 2 patches to .socket/manifest.json."
         );
         assert_eq!(
-            format_save_summary(m, 1, 1, 1, 1),
-            "Patches saved to .socket/manifest.json\n  Added: 1\n  Updated: 1\n  Skipped: 1\n  Failed: 1"
+            format_save_line(m, 1, 1, 1, 1),
+            "Saved 2 patches to .socket/manifest.json (1 updated, 1 skipped, 1 failed)."
         );
         assert_eq!(
-            format_save_summary(m, 0, 0, 2, 0),
-            "No changes to .socket/manifest.json\n  Added: 0\n  Skipped: 2"
+            format_save_line(m, 1, 0, 0, 0),
+            "Saved 1 patch to .socket/manifest.json."
         );
         assert_eq!(
-            format_save_summary(m, 0, 0, 0, 1),
-            "No changes to .socket/manifest.json\n  Added: 0\n  Failed: 1"
+            format_save_line(m, 0, 0, 2, 0),
+            "No changes to .socket/manifest.json (2 skipped)."
+        );
+        assert_eq!(
+            format_save_line(m, 0, 0, 0, 1),
+            "No changes to .socket/manifest.json (1 failed)."
         );
     }
 

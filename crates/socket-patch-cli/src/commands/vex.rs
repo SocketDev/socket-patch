@@ -183,6 +183,7 @@ impl VexEmbedArgs {
             flag_prefix: "--vex-",
             npm_prior: None,
             hosted_uuids: Vec::new(),
+            warnings_printed: Default::default(),
         }
     }
 }
@@ -253,6 +254,10 @@ pub(crate) struct VexBuildParams {
     /// command, else built at most once when the plan must fetch records.
     /// Telemetry reads its route when it exists.
     pub api_client: RunApiClient,
+    /// How many of the run's advisories a human run has printed so far
+    /// ([`flush_warnings`]): they are held while the run works (a status
+    /// line is up) and printed folded, each once.
+    pub warnings_printed: std::sync::atomic::AtomicUsize,
 }
 
 impl VexBuildParams {
@@ -375,6 +380,7 @@ pub async fn run(args: VexArgs) -> i32 {
             "org_looks_like_path",
             detail,
         );
+        print_warnings(&args.common, &run_warnings);
     }
 
     let params = VexBuildParams {
@@ -393,6 +399,7 @@ pub async fn run(args: VexArgs) -> i32 {
         npm_prior: None,
         hosted_uuids: Vec::new(),
         api_client: RunApiClient::new(),
+        warnings_printed: Default::default(),
     };
 
     // One project for the whole document (#745): the ledgers and the
@@ -855,9 +862,18 @@ async fn generate_vex(
         // every copy, so an agent record is attested only when EVERY copy
         // verifies; the first copy alone would vouch for a later install's
         // unpatched nested duplicate.
+        // The lookup and the checks below walk and hash the installed
+        // tree: the status line says so while they last. A run whose
+        // lookup prints its own lines (`quiet` off) shows it for the
+        // checks alone.
+        let mut verifying = crate::ui::StatusLine::stderr(common.json, common.silent);
+        if quiet {
+            verifying.set("Finding installed packages");
+        }
         let copies =
             find_manifest_package_copies_reusing(&purls, common, quiet, params.npm_prior.as_ref())
                 .await;
+        verifying.set("Verifying installed patches");
         // The record check: every copy of each purl; for Maven, every copy
         // a build consumes (`~/.m2` unless the Gradle build never reads it,
         // each Gradle cache, the read-only cache), re-hashed
@@ -888,6 +904,7 @@ async fn generate_vex(
             Some(&vendor),
         )
         .await;
+        verifying.finish();
         // Hosted lockfile basis: a DISCOVERED Socket-host reference whose
         // lock pins the artifact attests from that wiring when no installed
         // tree exists yet (a lockfile-only CI checkout) — the evidence the
@@ -1344,9 +1361,11 @@ async fn generate_vex(
     outcome
         .failed
         .sort_by(|a, b| (&a.purl, &a.reason).cmp(&(&b.purl, &b.reason)));
+    // The advisories first (they say why), then what was left out.
+    flush_warnings(common, params, warnings);
     if !common.silent && !common.json {
-        for f in &outcome.failed {
-            eprintln!("{}", format_omission_warning(&f.purl, &f.reason));
+        for line in omission_lines(&outcome.failed, common.verbose) {
+            eprintln!("{line}");
         }
     }
 
@@ -1854,19 +1873,133 @@ fn vendored_out_of_sync_detail(purl: &str, copies: &[&Path], notes: &str) -> Str
     )
 }
 
-/// Record a run-level advisory the way `update`/`vendor` do: stderr
-/// (`Warning: <detail>`) in human mode, and into `warnings` so the `--json`
-/// envelope — which silences stderr — carries it in `warnings[]` instead.
-/// Under `--silent` only the envelope copy survives (warnings are not
-/// errors).
-fn note_warning(warnings: &mut Vec<RunWarning>, common: &GlobalArgs, code: &str, detail: String) {
-    if !common.silent && !common.json {
-        eprintln!("Warning: {detail}");
-    }
+/// Record a run-level advisory: into `warnings`, which the `--json`
+/// envelope carries in `warnings[]`. A human run prints it later, folded
+/// with the others of its kind ([`flush_warnings`]): nothing prints while
+/// the run works, so its status line stays whole, and forty advisories of
+/// one kind are not forty lines. Under `--silent` only the envelope copy
+/// survives (warnings are not errors).
+fn note_warning(warnings: &mut Vec<RunWarning>, _common: &GlobalArgs, code: &str, detail: String) {
     warnings.push(RunWarning {
         code: code.to_string(),
         detail,
     });
+}
+
+/// How many advisories of one kind, and how many names, a human run
+/// prints before it folds the rest (`--verbose` prints every one).
+const SHOWN_OF_A_KIND: usize = 1;
+const NAMES_SHOWN: usize = 3;
+
+/// `names` for a sentence, the first [`NAMES_SHOWN`] named: `a, b, c and
+/// 5 more`.
+fn folded_names(names: &[String]) -> String {
+    if names.len() <= NAMES_SHOWN {
+        return names.join(", ");
+    }
+    format!(
+        "{} and {} more",
+        names[..NAMES_SHOWN].join(", "),
+        names.len() - NAMES_SHOWN
+    )
+}
+
+/// The packages `purls` name, as a listing names them: `name@version`
+/// when they are all of one ecosystem, the purl otherwise.
+fn package_names(purls: &[&str]) -> Vec<String> {
+    use socket_patch_core::utils::purl::{canonical_purl, purl_parts};
+    let parts: Vec<_> = purls.iter().map(|purl| purl_parts(purl)).collect();
+    let first = parts.first().and_then(|p| p.as_ref().map(|(ty, _, _)| ty));
+    let one_type = first.is_some()
+        && parts
+            .iter()
+            .all(|p| p.as_ref().map(|(ty, _, _)| ty) == first);
+    purls
+        .iter()
+        .zip(&parts)
+        .map(|(purl, parts)| match parts {
+            Some((_, name, version)) if one_type => format!("{name}@{version}"),
+            _ => canonical_purl(purl),
+        })
+        .collect()
+}
+
+/// The human lines of `warnings`: each kind's first advisory in full,
+/// then one line for the rest of that kind, naming the packages they are
+/// about where each opens with one (`pkg:npm/glob@10.3.16: ...`).
+/// `verbose` prints every advisory.
+fn warning_lines(warnings: &[RunWarning], verbose: bool) -> Vec<String> {
+    let mut kinds: Vec<(&str, Vec<&RunWarning>)> = Vec::new();
+    for warning in warnings {
+        match kinds.iter_mut().find(|(code, _)| *code == warning.code) {
+            Some((_, of_kind)) => of_kind.push(warning),
+            None => kinds.push((&warning.code, vec![warning])),
+        }
+    }
+    let mut lines = Vec::new();
+    for (_, of_kind) in kinds {
+        let shown = if verbose {
+            of_kind.len()
+        } else {
+            SHOWN_OF_A_KIND
+        };
+        lines.extend(
+            of_kind
+                .iter()
+                .take(shown)
+                .map(|warning| format!("Warning: {}", warning.detail)),
+        );
+        let rest = &of_kind[shown.min(of_kind.len())..];
+        if rest.is_empty() {
+            continue;
+        }
+        // The package each of the rest is about, when it says so up front.
+        let purls: Vec<&str> = rest
+            .iter()
+            .filter_map(|warning| {
+                let (purl, _) = warning.detail.split_once(": ")?;
+                purl.starts_with("pkg:").then_some(purl)
+            })
+            .collect();
+        let like = if rest.len() == 1 { "this" } else { "these" };
+        lines.push(if purls.len() == rest.len() {
+            format!(
+                "  ... and {} more like {like}: {} (--verbose lists them all)",
+                rest.len(),
+                folded_names(&package_names(&purls))
+            )
+        } else {
+            format!(
+                "  ... and {} more like {like} (--verbose lists them all)",
+                rest.len()
+            )
+        });
+    }
+    lines
+}
+
+/// Print `warnings` to stderr the way a human run shows them
+/// ([`warning_lines`]); nothing under `--json` (the envelope carries
+/// them) or `--silent`.
+fn print_warnings(common: &GlobalArgs, warnings: &[RunWarning]) {
+    if common.silent || common.json {
+        return;
+    }
+    for line in warning_lines(warnings, common.verbose) {
+        eprintln!("{line}");
+    }
+}
+
+/// Print the advisories recorded since the last flush ([`print_warnings`]).
+/// Called where the run is about to print anyway: before its omissions,
+/// and when generation ends.
+fn flush_warnings(common: &GlobalArgs, params: &VexBuildParams, warnings: &[RunWarning]) {
+    use std::sync::atomic::Ordering;
+    let printed = params
+        .warnings_printed
+        .swap(warnings.len(), Ordering::Relaxed)
+        .min(warnings.len());
+    print_warnings(common, &warnings[printed..]);
 }
 
 /// True when `s` opens with an RFC 3986/3987 scheme
@@ -1960,6 +2093,7 @@ async fn generate_vex_with_cleanup(
     .await;
     match result {
         Ok(mut summary) => {
+            flush_warnings(common, params, &warnings);
             summary.warnings = warnings;
             Ok(summary)
         }
@@ -1981,6 +2115,7 @@ async fn generate_vex_with_cleanup(
                     }
                 }
             }
+            flush_warnings(common, params, &warnings);
             e.warnings = warnings;
             Err(e)
         }
@@ -2085,7 +2220,12 @@ async fn generate_vex_from_manifest_path_inner(
     // too: discovery is what gates the ledgers (core discover rule 11);
     // without it the raw-text fallbacks would decide a uuid a lockfile
     // mentions, attesting a commented-out or rejected pin.
-    let discovery = crate::commands::discover_wiring(common, &common.project_root()).await;
+    let discovery = crate::ui::busy(
+        common,
+        "Reading lockfiles",
+        crate::commands::discover_wiring(common, &common.project_root()),
+    )
+    .await;
     for diag in &discovery.diagnostics {
         note_warning(warnings, common, diag.code, diag.detail.clone());
     }
@@ -2363,12 +2503,16 @@ fn emit_envelope_error(
         println!("{}", env.to_pretty_json());
     } else {
         eprintln!("Error: {message}");
-        // The per-patch "Warning: omitting ..." lines already named each
-        // omission; `--silent` muted them, so list them with the error.
+        // The "Warning: omitting ..." lines already named the omissions;
+        // `--silent` muted them, so list them with the error.
         if args.common.silent {
             for f in failures {
                 eprintln!("  omitted: {} ({})", f.purl, f.reason);
             }
+        } else if let Some(hint) =
+            nothing_attested_hint(failures).filter(|_| code == "no_applicable_patches")
+        {
+            eprintln!("{hint}");
         }
     }
 }
@@ -2468,6 +2612,10 @@ fn omission_phrase(reason: &str) -> &'static str {
             "the lockfiles wire this package to different patches, so which one the build \
              installs cannot be determined"
         }
+        "vex_pnpm_bundled_copy" => {
+            "another package bundles its own copy, which no Socket wiring reaches (the \
+             warning above names it)"
+        }
         _ => "the patch could not be verified",
     }
 }
@@ -2479,6 +2627,78 @@ fn format_omission_warning(purl: &str, reason: &str) -> String {
         "Warning: omitting {purl} from VEX: {} ({reason})",
         omission_phrase(reason)
     )
+}
+
+/// The stderr lines for the patches left out of the document: one per
+/// reason, with the count and the first few packages (a project that has
+/// not installed its patched packages yet leaves every one of them out
+/// for the same reason). A reason with one patch keeps the per-patch
+/// line, and `verbose` prints that line for every patch. `failed` is
+/// sorted by purl; the reasons come largest first.
+fn omission_lines(failed: &[FailedPatch], verbose: bool) -> Vec<String> {
+    if verbose {
+        return failed
+            .iter()
+            .map(|f| format_omission_warning(&f.purl, &f.reason))
+            .collect();
+    }
+    let mut reasons: Vec<(&str, Vec<&str>)> = Vec::new();
+    for f in failed {
+        match reasons.iter_mut().find(|(reason, _)| *reason == f.reason) {
+            Some((_, purls)) => purls.push(&f.purl),
+            None => reasons.push((&f.reason, vec![&f.purl])),
+        }
+    }
+    reasons.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
+    reasons
+        .into_iter()
+        .map(|(reason, purls)| match purls.as_slice() {
+            [purl] => format_omission_warning(purl, reason),
+            _ => format!(
+                "Warning: omitting {} packages from VEX: {} ({reason}): {}{}",
+                purls.len(),
+                omission_phrase(reason),
+                folded_names(&package_names(&purls)),
+                if purls.len() > NAMES_SHOWN {
+                    " (--verbose lists them all)"
+                } else {
+                    ""
+                }
+            ),
+        })
+        .collect()
+}
+
+/// What to do about a document nothing could go into, said under the
+/// error, when patches were left out for a reason with a remedy: the
+/// patched packages are not installed yet (the usual case right after a
+/// hosted or vendored scan), or not installed at all.
+fn nothing_attested_hint(failed: &[FailedPatch]) -> Option<String> {
+    let count = |reason: &str| failed.iter().filter(|f| f.reason == reason).count();
+    let of = |n: usize| {
+        if n == failed.len() {
+            "The".to_string()
+        } else {
+            format!("{n} of the")
+        }
+    };
+    let not_applied = count("not_applied");
+    if not_applied > 0 {
+        return Some(format!(
+            "{} patched packages are not installed yet: the installed copies still hold their \
+             original files. Reinstall from the lockfile (hosted or vendored patches) or run \
+             `socket-patch apply` (agent-mode patches), then run `socket-patch vex` again.",
+            of(not_applied)
+        ));
+    }
+    let missing = count("package_not_found");
+    (missing > 0).then(|| {
+        format!(
+            "{} patched packages are not installed here. Run your package manager's install, \
+             then `socket-patch vex` again.",
+            of(missing)
+        )
+    })
 }
 
 /// Human `reason` string for an omission event; the routing tag rides
@@ -2660,6 +2880,145 @@ mod tests {
         );
         assert_eq!(format_vex_emitted(1), "Emitted 1 VEX statement");
         assert_eq!(format_vex_emitted(12), "Emitted 12 VEX statements");
+    }
+
+    fn failed(purl: &str, reason: &str) -> FailedPatch {
+        FailedPatch {
+            purl: purl.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    /// The reported flood: a project that has not installed its patched
+    /// packages yet got one line per package. The patches left out are one
+    /// line per reason, largest first, with the count and the first few
+    /// names; a reason with one patch keeps its line, and `--verbose`
+    /// prints the line of every patch.
+    #[test]
+    fn omissions_are_one_line_per_reason() {
+        let mut patches: Vec<FailedPatch> = (0..82)
+            .map(|i| failed(&format!("pkg:npm/dep-{i:02}@1.0.0"), "not_applied"))
+            .collect();
+        patches.push(failed(
+            "pkg:npm/%40scope/glob@10.3.16",
+            "vex_pnpm_bundled_copy",
+        ));
+        patches.push(failed("pkg:npm/tar@7.4.3", "vex_pnpm_bundled_copy"));
+        patches.push(failed("pkg:npm/gone@1.0.0", "package_not_found"));
+        assert_eq!(
+            omission_lines(&patches, false),
+            [
+                "Warning: omitting 82 packages from VEX: the patched files still hold the \
+                 original content (not_applied): dep-00@1.0.0, dep-01@1.0.0, dep-02@1.0.0 and \
+                 79 more (--verbose lists them all)",
+                "Warning: omitting 2 packages from VEX: another package bundles its own copy, \
+                 which no Socket wiring reaches (the warning above names it) \
+                 (vex_pnpm_bundled_copy): @scope/glob@10.3.16, tar@7.4.3",
+                "Warning: omitting pkg:npm/gone@1.0.0 from VEX: the package is not installed \
+                 (package_not_found)",
+            ]
+        );
+        let verbose = omission_lines(&patches, true);
+        assert_eq!(verbose.len(), 85);
+        assert_eq!(
+            verbose[0],
+            "Warning: omitting pkg:npm/dep-00@1.0.0 from VEX: the patched files still hold the \
+             original content (not_applied)"
+        );
+        assert!(omission_lines(&[], false).is_empty());
+        // Packages of two ecosystems are named by purl.
+        assert_eq!(
+            omission_lines(
+                &[
+                    failed("pkg:npm/a@1.0.0", "not_applied"),
+                    failed("pkg:pypi/b@2.0.0", "not_applied"),
+                ],
+                false
+            ),
+            [
+                "Warning: omitting 2 packages from VEX: the patched files still hold the original \
+              content (not_applied): pkg:npm/a@1.0.0, pkg:pypi/b@2.0.0"
+            ]
+        );
+    }
+
+    /// Advisories of one kind print once in full, then as one line naming
+    /// the packages the rest are about; `--verbose` prints every one.
+    #[test]
+    fn advisories_of_one_kind_fold_into_two_lines() {
+        let warning = |code: &str, detail: &str| RunWarning {
+            code: code.to_string(),
+            detail: detail.to_string(),
+        };
+        let mut warnings = vec![warning("org_looks_like_path", "the org looks like a path")];
+        warnings.extend(
+            [
+                "glob@10.3.16",
+                "glob@10.4.5",
+                "minimatch@3.1.2",
+                "tar@6.2.1",
+                "tar@7.4.3",
+            ]
+            .map(|package| {
+                warning(
+                    "vex_pnpm_bundled_copy",
+                    &format!("pkg:npm/{package}: patch is wired, but npm@11.19.0 bundles a copy"),
+                )
+            }),
+        );
+        warnings.push(warning("vex_lock_not_read", "yarn.lock could not be read"));
+        warnings.push(warning("vex_lock_not_read", "bun.lock could not be read"));
+        assert_eq!(
+            warning_lines(&warnings, false),
+            [
+                "Warning: the org looks like a path",
+                "Warning: pkg:npm/glob@10.3.16: patch is wired, but npm@11.19.0 bundles a copy",
+                "  ... and 4 more like these: glob@10.4.5, minimatch@3.1.2, tar@6.2.1 and 1 more \
+                 (--verbose lists them all)",
+                "Warning: yarn.lock could not be read",
+                "  ... and 1 more like this (--verbose lists them all)",
+            ]
+        );
+        let verbose = warning_lines(&warnings, true);
+        assert_eq!(verbose.len(), 8);
+        assert!(verbose.iter().all(|line| line.starts_with("Warning: ")));
+        assert!(warning_lines(&[], false).is_empty());
+    }
+
+    /// Under "nothing to attest", the remedy for the patches that only
+    /// need installing.
+    #[test]
+    fn nothing_attested_says_how_to_get_the_patches_installed() {
+        let all = [
+            failed("pkg:npm/a@1.0.0", "not_applied"),
+            failed("pkg:npm/b@1.0.0", "not_applied"),
+        ];
+        assert_eq!(
+            nothing_attested_hint(&all).as_deref(),
+            Some(
+                "The patched packages are not installed yet: the installed copies still hold \
+                 their original files. Reinstall from the lockfile (hosted or vendored patches) \
+                 or run `socket-patch apply` (agent-mode patches), then run `socket-patch vex` \
+                 again."
+            )
+        );
+        let some = [
+            failed("pkg:npm/a@1.0.0", "not_applied"),
+            failed("pkg:npm/b@1.0.0", "vex_pnpm_bundled_copy"),
+        ];
+        assert!(nothing_attested_hint(&some)
+            .unwrap()
+            .starts_with("1 of the patched packages are not installed yet"));
+        assert!(
+            nothing_attested_hint(&[failed("pkg:npm/a@1.0.0", "package_not_found")])
+                .unwrap()
+                .starts_with("The patched packages are not installed here.")
+        );
+        assert_eq!(
+            nothing_attested_hint(&[failed("pkg:npm/a@1.0.0", "hash_mismatch")]),
+            None
+        );
+        assert_eq!(nothing_attested_hint(&[]), None);
     }
 
     #[test]
@@ -3002,6 +3361,7 @@ mod npm_prior_tests {
             npm_prior: prior,
             hosted_uuids: Vec::new(),
             api_client: RunApiClient::new(),
+            warnings_printed: Default::default(),
         };
         let manifest_path = common.resolved_manifest_path();
         match generate_vex_from_manifest_path(common, &params, &manifest_path).await {

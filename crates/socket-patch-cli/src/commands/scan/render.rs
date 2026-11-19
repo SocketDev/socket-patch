@@ -1,5 +1,6 @@
-//! Pure text builders for `scan`'s human output: the results table, the
-//! summary lines, the dry-run line, the per-patch preview, and the hints.
+//! Pure text builders for `scan`'s human output: the status notes, the
+//! dry-run line, the `--verbose` per-patch preview, and the hints. The
+//! rows and the closing totals are `report`'s.
 //! No I/O and no terminal state (color is decided by the caller and passed
 //! in), so every string is unit-testable byte for byte.
 
@@ -8,33 +9,12 @@ use std::collections::HashMap;
 use socket_patch_core::api::types::{PatchSearchResult, VulnerabilityResponse};
 
 use crate::args::GlobalArgs;
-use crate::ui::{self, plural, Align};
+use crate::ui::{self, plural};
 use socket_patch_core::api::ranking::severity_order;
 
-/// Visible widths of the table's PATCHES and SEVERITY columns.
-pub(super) const PATCHES_COL: usize = 8;
-pub(super) const SEVERITY_COL: usize = 16;
-/// The PACKAGE column grows to the longest PURL, up to this many columns;
-/// longer PURLs are middle-elided (keeping `@version`).
-pub(super) const MAX_PURL_COL: usize = 60;
-/// Vulnerability ids shown per table row before `(+N)` (unless `--verbose`).
-const VULN_IDS_SHOWN: usize = 2;
 /// Per-patch preview limits for API free text (unless `--verbose`).
 const SUMMARY_MAX: usize = 76;
 const DESCRIPTION_MAX: usize = 72;
-
-const HEADER_PACKAGE: &str = "PACKAGE";
-
-/// Width of the PACKAGE column for these (display) PURLs: the longest,
-/// never narrower than the header and never wider than [`MAX_PURL_COL`].
-pub(super) fn purl_col_width<'a>(purls: impl IntoIterator<Item = &'a str>) -> usize {
-    purls
-        .into_iter()
-        .map(|p| p.chars().count())
-        .max()
-        .unwrap_or(0)
-        .clamp(HEADER_PACKAGE.len(), MAX_PURL_COL)
-}
 
 /// Fit a PURL into `max` characters, keeping the `@version` (and any
 /// `?qualifiers`) tail and eliding the middle of the name:
@@ -73,158 +53,7 @@ pub(super) fn elide_purl(purl: &str, max: usize) -> String {
     format!("{head}{DOTS}{end}{tail}")
 }
 
-/// The table's column header, aligned like [`table_row`].
-pub(super) fn table_header(purl_w: usize) -> String {
-    table_row(
-        purl_w,
-        HEADER_PACKAGE,
-        "PATCHES",
-        "SEVERITY",
-        "VULNERABILITIES",
-        "",
-    )
-}
-
-/// One table row. Cells may carry color: padding counts visible
-/// characters only, so colored and plain rows line up. `count` is
-/// right-aligned; `markers` (`[UPDATE]`, ...) trail the vulnerabilities.
-pub(super) fn table_row(
-    purl_w: usize,
-    purl: &str,
-    count: &str,
-    severity: &str,
-    vulns: &str,
-    markers: &str,
-) -> String {
-    format!(
-        "{}  {}  {}  {vulns}{markers}",
-        ui::pad(purl, purl_w, Align::Left),
-        ui::pad(count, PATCHES_COL, Align::Right),
-        ui::pad(severity, SEVERITY_COL, Align::Left),
-    )
-}
-
-/// The `=` rule above and below the table: as wide as its widest line,
-/// capped at `cap` columns (the terminal width) so it never wraps.
-pub(super) fn ruler<'a>(lines: impl IntoIterator<Item = &'a str>, cap: Option<usize>) -> String {
-    let widest = lines.into_iter().map(ui::visible_width).max().unwrap_or(0);
-    let width = cap.map_or(widest, |c| widest.min(c)).max(1);
-    "=".repeat(width)
-}
-
-/// The VULNERABILITIES cell: the first two ids plus `(+N)` for the rest of
-/// `vulns.count`, every id under `--verbose`, `-` when there are none.
-pub(super) fn vuln_cell(vulns: &super::discovery::VulnIds, verbose: bool) -> String {
-    if verbose {
-        return if vulns.all.is_empty() {
-            "-".to_string()
-        } else {
-            vulns.all.join(", ")
-        };
-    }
-    let shown = &vulns.primary[..vulns.primary.len().min(VULN_IDS_SHOWN)];
-    let extra = vulns.count.saturating_sub(shown.len());
-    match (shown.is_empty(), extra) {
-        (true, 0) => "-".to_string(),
-        (true, n) => format!("(+{n})"),
-        (false, 0) => shown.join(", "),
-        (false, n) => format!("{} (+{n})", shown.join(", ")),
-    }
-}
-
-/// Advisory ids one list of a coverage line names before `(+N more)`
-/// (unless `--verbose`).
-const COVERAGE_IDS_SHOWN: usize = 8;
-
-fn coverage_ids(ids: &[String], verbose: bool) -> String {
-    if verbose || ids.len() <= COVERAGE_IDS_SHOWN {
-        return ids.join(", ");
-    }
-    format!(
-        "{} (+{} more)",
-        ids[..COVERAGE_IDS_SHOWN].join(", "),
-        ids.len() - COVERAGE_IDS_SHOWN
-    )
-}
-
-/// The lines under a mode's result line, one per patched package: the
-/// advisories its patch fixes and the ones it leaves unpatched (other
-/// patches of the package name them, and only one is applied). A closing
-/// line says why and what fixes them when any package keeps one. `dry_run`
-/// puts it in the future tense. A package whose patches name no advisory
-/// gets no line; `color` highlights what stays unpatched.
-pub(crate) fn coverage_lines(
-    coverage: &[&super::discovery::AdvisoryCoverage],
-    dry_run: bool,
-    verbose: bool,
-    color: bool,
-) -> Vec<String> {
-    let (fixes, stays) = if dry_run {
-        ("would fix", "would stay unpatched")
-    } else {
-        ("fixes", "still unpatched")
-    };
-    let mut lines = Vec::new();
-    let mut incomplete = 0usize;
-    for c in coverage {
-        if c.fixes.is_empty() && c.unpatched.is_empty() {
-            continue;
-        }
-        let mut line = format!(
-            "  {}: ",
-            socket_patch_core::utils::purl::normalize_purl(&c.purl)
-        );
-        if c.fixes.is_empty() {
-            line.push_str("its patch names no advisory");
-        } else {
-            line.push_str(&format!("{fixes} {}", coverage_ids(&c.fixes, verbose)));
-        }
-        if !c.unpatched.is_empty() {
-            incomplete += 1;
-            let rest = format!("{stays}: {}", coverage_ids(&c.unpatched, verbose));
-            line.push_str(&format!("; {}", ui::paint(&rest, "33", color)));
-        }
-        lines.push(line);
-    }
-    if incomplete > 0 {
-        lines.push(format!(
-            "Only one patch is applied per package version. Upgrade {} to fix the advisories \
-             still unpatched.",
-            if incomplete == 1 {
-                "the package"
-            } else {
-                "those packages"
-            }
-        ));
-    }
-    lines
-}
-
-/// The line under the table: how many packages have patches and how many
-/// of those patches this account can download.
-pub(super) fn summary_line(packages: usize, patches: usize, all_accessible: bool) -> String {
-    let kind = if all_accessible {
-        ("available patch", "available patches")
-    } else {
-        ("free patch", "free patches")
-    };
-    format!(
-        "Summary: {} with {}",
-        plural(packages, "package", "packages"),
-        plural(patches, kind.0, kind.1)
-    )
-}
-
-/// The indented follow-up to [`summary_line`] for free accounts.
-pub(super) fn paid_extra_line(paid: usize) -> String {
-    let verb = if paid == 1 { "is" } else { "are" };
-    format!(
-        "         + {} {verb} available with a paid Socket plan",
-        plural(paid, "additional patch", "additional patches")
-    )
-}
-
-/// How many table rows carry `[UPDATE]`.
+/// How many packages have a newer patch than the one the project records.
 pub(super) fn updates_line(n: usize) -> String {
     if n == 1 {
         "1 package has a newer patch available.".to_string()
@@ -281,13 +110,14 @@ pub(crate) fn no_packages_message(
 /// found: `declared` packages the project patches itself, and `unreadable`
 /// ones held back only because a project file could not be read. A broken
 /// file is fixed, not overridden, so only the first line names
-/// `--allow-patch-conflicts`.
+/// `--allow-patch-conflicts`. The notice above
+/// ([`project_patch_notice`]) names the files and the packages.
 pub(crate) fn user_patch_withheld_lines(declared: usize, unreadable: usize) -> Vec<String> {
     let mut lines = Vec::new();
     if unreadable > 0 {
         lines.push(format!(
             "{} not scanned: this project's own patches could not be checked (see the \
-             warnings). Fix the file they name and run again.",
+             warning). Fix the file it names and run again.",
             plural(unreadable, "package was", "packages were")
         ));
     }
@@ -298,12 +128,198 @@ pub(crate) fn user_patch_withheld_lines(declared: usize, unreadable: usize) -> V
             ("were", "them")
         };
         lines.push(format!(
-            "{} protected by this project's own patches and {was} not scanned (see the \
-             warnings). Pass --allow-patch-conflicts to scan {them} anyway.",
+            "{} protected by this project's own patches and {was} not scanned. Pass \
+             --allow-patch-conflicts to scan {them} anyway.",
             plural(declared, "package is", "packages are")
         ));
     }
     lines
+}
+
+/// A package the project's own patches cover, as the scan's consent gate
+/// found it.
+pub(crate) struct Protected {
+    pub purl: String,
+    /// The project files that cover it.
+    pub sources: Vec<String>,
+    /// Covered only because one of those files could not be read or
+    /// parsed: nothing the project is known to declare.
+    pub unreadable: bool,
+}
+
+/// How many packages, and how many files, a project-patch notice names
+/// before it folds the rest.
+const PROTECTED_NAMED: usize = 3;
+
+/// The scan's notice of the packages the project's own patches cover: one
+/// short block per kind, where there used to be a warning per package (a
+/// project file that cannot be read covers every package of its
+/// ecosystem, so that was a warning per installed package).
+///
+/// - Left alone because the project declares a patch or replacement for
+///   them: a `Note:`, the steady state of a project that patches a few
+///   dependencies itself.
+/// - Left alone because a project file could not be read: a `Warning:`
+///   that says to fix the file.
+/// - Not left alone, under `--allow-patch-conflicts` (`allowed`): a
+///   `Warning:` to review the result.
+///
+/// Each names the files (relative to `cwd`) and the first few packages;
+/// `--verbose` lists every package under its block with its own files.
+pub(crate) fn project_patch_notice(
+    protected: &[Protected],
+    allowed: bool,
+    verbose: bool,
+    cwd: &std::path::Path,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if allowed {
+        let group: Vec<&Protected> = protected.iter().collect();
+        notice_block(&mut lines, &group, Kind::Allowed, verbose, cwd);
+    } else {
+        let (unreadable, declared): (Vec<&Protected>, Vec<&Protected>) =
+            protected.iter().partition(|p| p.unreadable);
+        notice_block(&mut lines, &unreadable, Kind::Unreadable, verbose, cwd);
+        notice_block(&mut lines, &declared, Kind::Declared, verbose, cwd);
+    }
+    lines
+}
+
+/// Which block of [`project_patch_notice`] a group of packages gets.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Declared,
+    Unreadable,
+    Allowed,
+}
+
+/// A project file as the notice names it: relative to `cwd` when it is
+/// below it. A source may carry a reason after the path
+/// (`package.json (not valid JSON: ...)`), which stays.
+fn shown_source(source: &str, cwd: &std::path::Path) -> String {
+    let base = cwd.to_string_lossy();
+    source
+        .strip_prefix(base.as_ref())
+        .and_then(|rest| rest.strip_prefix(['/', '\\']))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(source)
+        .to_string()
+}
+
+/// `items` joined for a sentence, the first `shown` of them named:
+/// `a, b, c and 5 more`.
+fn folded(items: &[String], shown: usize) -> String {
+    if items.len() <= shown {
+        return items.join(", ");
+    }
+    format!(
+        "{} and {} more",
+        items[..shown].join(", "),
+        items.len() - shown
+    )
+}
+
+fn notice_block(
+    lines: &mut Vec<String>,
+    group: &[&Protected],
+    kind: Kind,
+    verbose: bool,
+    cwd: &std::path::Path,
+) {
+    use socket_patch_core::utils::purl::{canonical_purl, purl_parts};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // One entry per package: a crawl finds a release once per installed
+    // copy.
+    let mut packages: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for package in group {
+        packages
+            .entry(canonical_purl(&package.purl))
+            .or_default()
+            .extend(package.sources.iter().map(|s| shown_source(s, cwd)));
+    }
+    if packages.is_empty() {
+        return;
+    }
+    // `name@version` when the block is of one ecosystem, else the purl.
+    let parts: Vec<_> = packages.keys().map(|purl| purl_parts(purl)).collect();
+    let first = parts.first().and_then(|p| p.as_ref().map(|(ty, _, _)| ty));
+    let one_type = first.is_some()
+        && parts
+            .iter()
+            .all(|p| p.as_ref().map(|(ty, _, _)| ty) == first);
+    let names: Vec<String> = packages
+        .keys()
+        .zip(&parts)
+        .map(|(purl, parts)| match parts {
+            Some((_, name, version)) if one_type => format!("{name}@{version}"),
+            _ => purl.clone(),
+        })
+        .collect();
+    let sources: Vec<String> = packages
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let files = folded(&sources, PROTECTED_NAMED);
+    let count = plural(names.len(), "package", "packages");
+    let (it, lists) = if names.len() == 1 {
+        ("it", "")
+    } else {
+        ("them", "; --verbose lists them all")
+    };
+    // Every name fits, or `--verbose` lists them below: the fold is for
+    // the long lists only.
+    let named = if verbose && names.len() > PROTECTED_NAMED {
+        String::new()
+    } else {
+        format!(": {}", folded(&names, PROTECTED_NAMED))
+    };
+    let more = if names.len() > PROTECTED_NAMED && !verbose {
+        lists
+    } else {
+        ""
+    };
+    match kind {
+        Kind::Declared => {
+            lines.push(format!(
+                "Note: skipped {count} covered by this project's own patches ({files}){named}."
+            ));
+            lines.push(format!("  --allow-patch-conflicts patches {it} too{more}."));
+        }
+        Kind::Unreadable => {
+            let fix = if sources.len() == 1 {
+                "that file"
+            } else {
+                "those files"
+            };
+            lines.push(format!(
+                "Warning: {count} not patched, because this project's own patches could not \
+                 be checked: {files}. Fix {fix} and run again."
+            ));
+        }
+        Kind::Allowed => {
+            lines.push(format!(
+                "Warning: --allow-patch-conflicts: {count} covered by this project's own \
+                 patches ({files}) may get a Socket patch too{named}. Review and test the \
+                 combined result."
+            ));
+        }
+    }
+    if verbose && names.len() > PROTECTED_NAMED {
+        for (name, own) in names.iter().zip(packages.values()) {
+            // A package's files are worth a line's width only where they
+            // are not the block's.
+            if own.len() == sources.len() {
+                lines.push(format!("  {name}"));
+            } else {
+                let own: Vec<String> = own.iter().cloned().collect();
+                lines.push(format!("  {name}  ({})", own.join(", ")));
+            }
+        }
+    }
 }
 
 /// What a bare scan's search for project directories left out, one line
@@ -467,8 +483,9 @@ pub(super) fn unwired_vendored_detail(purls: &[String]) -> String {
 /// What the dry-run line says the run would do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Plan {
-    /// Agent mode: download `n` patches and apply them in place.
-    Apply(usize),
+    /// Agent mode: download `new` patches and apply them in place, and
+    /// re-apply the `recorded` ones the manifest already holds.
+    Apply { new: usize, recorded: usize },
     /// Vendored mode: of `total` selected patches, `refused` would be
     /// refused by the vendored preflight (listed as `[would-refuse]`
     /// lines) and `in_sync` are held by the ledger at this uuid (listed as
@@ -488,7 +505,13 @@ pub(super) enum Plan {
 /// to vendor either (#1850).
 pub(super) fn dry_run_line(plan: Plan) -> String {
     let what = match plan {
-        Plan::Apply(n) => format!("download and apply {}", plural(n, "patch", "patches")),
+        Plan::Apply { new, recorded: 0 } => {
+            format!("download and apply {}", plural(new, "patch", "patches"))
+        }
+        Plan::Apply { new, recorded } => format!(
+            "download and apply {} and re-apply {recorded} already recorded",
+            plural(new, "patch", "patches")
+        ),
         Plan::Vendor {
             total,
             refused,
@@ -563,6 +586,28 @@ pub(super) fn not_installed_skip_line(purl: &str) -> String {
         "  [skip] {purl} (not installed; run your package manager's install first, \
          or `socket-patch scan --mode vendored` to vendor it from the lockfile)"
     )
+}
+
+/// How many not-installed packages [`not_installed_skip_lines`] names one
+/// per line; past it they share one line that names this many.
+const NOT_INSTALLED_NAMED: usize = 3;
+
+/// The `[skip]` lines for the lockfile-only packages an agent-mode scan
+/// leaves out: one [`not_installed_skip_line`] each, or (past three of
+/// them, unless `--verbose`) one line for them all. A fresh clone locks
+/// every package and installs none, and the remedy is the same for each.
+pub(super) fn not_installed_skip_lines(purls: &[String], verbose: bool) -> Vec<String> {
+    if verbose || purls.len() <= NOT_INSTALLED_NAMED {
+        return purls.iter().map(|p| not_installed_skip_line(p)).collect();
+    }
+    vec![format!(
+        "  [skip] {} with patches are not installed ({}, +{} more); run your package \
+         manager's install first, or `socket-patch scan --mode vendored` to vendor them from \
+         the lockfile",
+        plural(purls.len(), "package", "packages"),
+        purls[..NOT_INSTALLED_NAMED].join(", "),
+        purls.len() - NOT_INSTALLED_NAMED,
+    )]
 }
 
 /// Line for a selection the manifest already records: `[re-apply]` on a
@@ -793,17 +838,6 @@ mod tests {
     // ---- table ------------------------------------------------------------
 
     #[test]
-    fn purl_col_width_tracks_longest_within_bounds() {
-        assert_eq!(purl_col_width([]), HEADER_PACKAGE.len());
-        assert_eq!(purl_col_width(["a"]), HEADER_PACKAGE.len());
-        assert_eq!(purl_col_width(["pkg:npm/minimist@1.2.5"]), 22);
-        let long = "x".repeat(100);
-        assert_eq!(purl_col_width([long.as_str()]), MAX_PURL_COL);
-        // Chars, not bytes.
-        assert_eq!(purl_col_width(["pkg:npm/日本語@1.0.0"]), 17);
-    }
-
-    #[test]
     fn elide_purl_keeps_version() {
         let purl = "pkg:npm/@typescript-eslint/typescript-estree@6.0.0";
         assert_eq!(elide_purl(purl, 60), purl);
@@ -841,131 +875,7 @@ mod tests {
         assert_eq!(out.chars().count(), 30);
     }
 
-    #[test]
-    fn table_colored_and_plain_rows_align_identically() {
-        let w = 24;
-        let vulns_at = w + 2 + PATCHES_COL + 2 + SEVERITY_COL + 2;
-        let header = table_header(w);
-        assert_eq!(header.find("VULNERABILITIES"), Some(vulns_at));
-        assert_eq!(
-            header.find("PATCHES").map(|i| i + "PATCHES".len()),
-            Some(w + 2 + PATCHES_COL)
-        );
-        let row = |on: bool, sev: &str, paid: bool| {
-            let count = if paid {
-                format!("0+{}", ui::paint("2", "33", on))
-            } else {
-                "1".to_string()
-            };
-            table_row(
-                w,
-                "pkg:npm/minimist@1.2.5",
-                &count,
-                &ui::severity(sev, on),
-                "CVE-2021-44906",
-                &ui::paint(" [UPDATE]", "33", on),
-            )
-        };
-        for sev in ["CRITICAL", "HIGH", "MODERATE", "LOW", "unknown"] {
-            for paid in [false, true] {
-                let plain = row(false, sev, paid);
-                assert_eq!(ui::strip_ansi(&row(true, sev, paid)), plain);
-                assert_eq!(plain.find("CVE-"), Some(vulns_at), "{plain:?}");
-                assert!(plain.ends_with("CVE-2021-44906 [UPDATE]"), "{plain:?}");
-                let count_end = w + 2 + PATCHES_COL;
-                let want = if paid { "0+2" } else { "1" };
-                assert_eq!(&plain[count_end - want.len()..count_end], want);
-            }
-        }
-    }
-
-    #[test]
-    fn table_row_exact_string() {
-        assert_eq!(
-            table_row(10, "pkg:a@1", "1", "HIGH", "CVE-1", " [UPDATE]"),
-            "pkg:a@1            1  HIGH              CVE-1 [UPDATE]"
-        );
-    }
-
-    #[test]
-    fn ruler_fits_widest_line_and_cap() {
-        assert_eq!(ruler(["abc", "abcdef"], None), "======");
-        assert_eq!(ruler(["abc", "abcdef"], Some(4)), "====");
-        assert_eq!(ruler(["\x1b[31mab\x1b[0m"], None), "==");
-        assert_eq!(ruler([], None), "=");
-    }
-
-    fn vids(primary: &[&str], all: &[&str], count: usize) -> super::super::discovery::VulnIds {
-        super::super::discovery::VulnIds {
-            primary: primary.iter().map(|s| s.to_string()).collect(),
-            all: all.iter().map(|s| s.to_string()).collect(),
-            count,
-        }
-    }
-
-    #[test]
-    fn vuln_cell_caps_unless_verbose() {
-        let four = ["CVE-1", "CVE-2", "CVE-3", "CVE-4"];
-        assert_eq!(
-            vuln_cell(&vids(&four, &four, 4), false),
-            "CVE-1, CVE-2 (+2)"
-        );
-        assert_eq!(
-            vuln_cell(&vids(&four, &four, 4), true),
-            "CVE-1, CVE-2, CVE-3, CVE-4"
-        );
-        assert_eq!(
-            vuln_cell(&vids(&four[..2], &four[..2], 2), false),
-            "CVE-1, CVE-2"
-        );
-        assert_eq!(vuln_cell(&vids(&four[..1], &four[..1], 1), false), "CVE-1");
-        assert_eq!(vuln_cell(&vids(&[], &[], 0), false), "-");
-        assert_eq!(vuln_cell(&vids(&[], &[], 0), true), "-");
-    }
-
-    #[test]
-    fn vuln_cell_counts_vulnerabilities_not_ids() {
-        // 1 CVE + its alias + a GHSA-only advisory: two vulnerabilities.
-        let v = vids(&["CVE-1"], &["CVE-1", "GHSA-a", "GHSA-b"], 2);
-        assert_eq!(vuln_cell(&v, false), "CVE-1 (+1)");
-        assert_eq!(vuln_cell(&v, true), "CVE-1, GHSA-a, GHSA-b");
-        let v = vids(&["CVE-1", "CVE-2", "GHSA-c"], &[], 5);
-        assert_eq!(vuln_cell(&v, false), "CVE-1, CVE-2 (+3)");
-    }
-
     // ---- summary lines -------------------------------------------------------
-
-    #[test]
-    fn summary_line_singular_and_plural() {
-        assert_eq!(
-            summary_line(1, 1, true),
-            "Summary: 1 package with 1 available patch"
-        );
-        assert_eq!(
-            summary_line(2, 4, true),
-            "Summary: 2 packages with 4 available patches"
-        );
-        assert_eq!(
-            summary_line(1, 0, false),
-            "Summary: 1 package with 0 free patches"
-        );
-        assert_eq!(
-            summary_line(3, 1, false),
-            "Summary: 3 packages with 1 free patch"
-        );
-    }
-
-    #[test]
-    fn paid_extra_line_agrees_in_number() {
-        assert_eq!(
-            paid_extra_line(1),
-            "         + 1 additional patch is available with a paid Socket plan"
-        );
-        assert_eq!(
-            paid_extra_line(3),
-            "         + 3 additional patches are available with a paid Socket plan"
-        );
-    }
 
     #[test]
     fn updates_line_agrees_in_number() {
@@ -1090,8 +1000,21 @@ mod tests {
     #[test]
     fn dry_run_line_counts_refusals() {
         assert_eq!(
-            dry_run_line(Plan::Apply(1)),
+            dry_run_line(Plan::Apply {
+                new: 1,
+                recorded: 0
+            }),
             "[dry-run] Would download and apply 1 patch. No changes made."
+        );
+        // The rows under the line also list a recorded patch the wet run
+        // re-applies: the line says so, so the two counts add up.
+        assert_eq!(
+            dry_run_line(Plan::Apply {
+                new: 5,
+                recorded: 1
+            }),
+            "[dry-run] Would download and apply 5 patches and re-apply 1 already recorded. No \
+             changes made."
         );
         assert_eq!(
             dry_run_line(vendor(2, 0, 0)),
@@ -1121,91 +1044,20 @@ mod tests {
         );
     }
 
-    fn coverage(
-        purl: &str,
-        fixes: &[&str],
-        unpatched: &[&str],
-    ) -> crate::commands::scan::discovery::AdvisoryCoverage {
-        let strs = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        crate::commands::scan::discovery::AdvisoryCoverage {
-            purl: purl.to_string(),
-            uuids: vec!["u".to_string()],
-            fixes: strs(fixes),
-            unpatched: strs(unpatched),
-            fixed_ids: strs(fixes),
-            unfixed_ids: strs(unpatched),
-        }
-    }
-
-    #[test]
-    fn coverage_lines_name_fixed_and_unpatched_advisories_per_package() {
-        let complete = coverage("pkg:npm/%40scope/a@1.0.0", &["CVE-1"], &[]);
-        let partial = coverage("pkg:pypi/urllib3@1.26.18", &["CVE-2"], &["CVE-3", "CVE-4"]);
-        let silent = coverage("pkg:npm/b@1.0.0", &[], &[]);
-        let unnamed = coverage("pkg:npm/c@1.0.0", &[], &["CVE-5"]);
-        // Every advisory fixed: one line, no closing note. A package whose
-        // patches name no advisory has nothing to say.
-        assert_eq!(
-            coverage_lines(&[&complete, &silent], false, false, false),
-            ["  pkg:npm/@scope/a@1.0.0: fixes CVE-1"]
-        );
-        assert_eq!(
-            coverage_lines(&[&complete, &partial], false, false, false),
-            [
-                "  pkg:npm/@scope/a@1.0.0: fixes CVE-1",
-                "  pkg:pypi/urllib3@1.26.18: fixes CVE-2; still unpatched: CVE-3, CVE-4",
-                "Only one patch is applied per package version. Upgrade the package to fix \
-                 the advisories still unpatched.",
-            ]
-        );
-        // A dry run says it in the future tense; the note is for both
-        // packages.
-        assert_eq!(
-            coverage_lines(&[&partial, &unnamed], true, false, false),
-            [
-                "  pkg:pypi/urllib3@1.26.18: would fix CVE-2; would stay unpatched: CVE-3, CVE-4",
-                "  pkg:npm/c@1.0.0: its patch names no advisory; would stay unpatched: CVE-5",
-                "Only one patch is applied per package version. Upgrade those packages to \
-                 fix the advisories still unpatched.",
-            ]
-        );
-        assert!(coverage_lines(&[], false, false, false).is_empty());
-    }
-
-    #[test]
-    fn coverage_lines_bound_a_long_id_list_unless_verbose() {
-        let ids: Vec<String> = (1..=11).map(|i| format!("CVE-2024-{i:04}")).collect();
-        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
-        let many = coverage("pkg:npm/a@1.0.0", &["CVE-1"], &ids);
-        let line = &coverage_lines(&[&many], false, false, false)[0];
-        assert!(
-            line.ends_with("CVE-2024-0007, CVE-2024-0008 (+3 more)"),
-            "{line}"
-        );
-        let line = &coverage_lines(&[&many], false, true, false)[0];
-        assert!(line.ends_with("CVE-2024-0010, CVE-2024-0011"), "{line}");
-        // Color wraps only the unpatched clause.
-        let line = &coverage_lines(&[&many], false, true, true)[0];
-        assert!(
-            line.starts_with("  pkg:npm/a@1.0.0: fixes CVE-1; \u{1b}[33mstill unpatched: "),
-            "{line:?}"
-        );
-    }
-
     #[test]
     fn user_patch_withheld_lines_separate_broken_files_from_declared_patches() {
         assert_eq!(
             user_patch_withheld_lines(0, 2),
             [
                 "2 packages were not scanned: this project's own patches could not be checked \
-              (see the warnings). Fix the file they name and run again."
+              (see the warning). Fix the file it names and run again."
             ]
         );
         assert_eq!(
             user_patch_withheld_lines(3, 0),
             [
-                "3 packages are protected by this project's own patches and were not scanned \
-              (see the warnings). Pass --allow-patch-conflicts to scan them anyway."
+                "3 packages are protected by this project's own patches and were not scanned. \
+              Pass --allow-patch-conflicts to scan them anyway."
             ]
         );
         let both = user_patch_withheld_lines(1, 1);
@@ -1219,6 +1071,127 @@ mod tests {
             "{both:?}"
         );
         assert!(user_patch_withheld_lines(0, 0).is_empty());
+    }
+
+    fn protected(purl: &str, sources: &[&str], unreadable: bool) -> Protected {
+        Protected {
+            purl: purl.to_string(),
+            sources: sources.iter().map(|s| s.to_string()).collect(),
+            unreadable,
+        }
+    }
+
+    /// The reported flood: one long warning per package the project
+    /// patches itself. They are one note now: the count, the files, the
+    /// first few names, and the flag.
+    #[test]
+    fn project_patch_notice_is_one_block_not_a_warning_per_package() {
+        let cwd = std::path::Path::new("/work/app");
+        let lock = "/work/app/pnpm-lock.yaml";
+        let workspace = "/work/app/pnpm-workspace.yaml";
+        let few = [
+            protected("pkg:npm/next-auth@4.24.15", &[lock, workspace], false),
+            // A second installed copy of the same release is the same
+            // package.
+            protected("pkg:npm/next-auth@4.24.15", &[lock, workspace], false),
+            protected("pkg:npm/%40rmp135/sql-ts@1.18.1", &[workspace], false),
+        ];
+        assert_eq!(
+            project_patch_notice(&few, false, false, cwd),
+            [
+                "Note: skipped 2 packages covered by this project's own patches \
+                 (pnpm-lock.yaml, pnpm-workspace.yaml): @rmp135/sql-ts@1.18.1, \
+                 next-auth@4.24.15.",
+                "  --allow-patch-conflicts patches them too.",
+            ]
+        );
+        assert_eq!(
+            project_patch_notice(&few[..1], false, false, cwd),
+            [
+                "Note: skipped 1 package covered by this project's own patches \
+                 (pnpm-lock.yaml, pnpm-workspace.yaml): next-auth@4.24.15.",
+                "  --allow-patch-conflicts patches it too.",
+            ]
+        );
+
+        let many: Vec<Protected> = (0..33)
+            .map(|i| protected(&format!("pkg:npm/dep-{i:02}@1.0.0"), &[workspace], false))
+            .collect();
+        assert_eq!(
+            project_patch_notice(&many, false, false, cwd),
+            [
+                "Note: skipped 33 packages covered by this project's own patches \
+                 (pnpm-workspace.yaml): dep-00@1.0.0, dep-01@1.0.0, dep-02@1.0.0 and 30 more.",
+                "  --allow-patch-conflicts patches them too; --verbose lists them all.",
+            ]
+        );
+        // `--verbose` lists every one, each with its own files.
+        let verbose = project_patch_notice(&many, false, true, cwd);
+        assert_eq!(verbose.len(), 2 + 33, "{verbose:#?}");
+        assert_eq!(
+            verbose[..3],
+            [
+                "Note: skipped 33 packages covered by this project's own patches \
+                 (pnpm-workspace.yaml).",
+                "  --allow-patch-conflicts patches them too.",
+                "  dep-00@1.0.0",
+            ]
+        );
+        // A package says which files cover it where they are not all of
+        // the block's.
+        let mut uneven = many;
+        uneven[1].sources.push(lock.to_string());
+        let verbose = project_patch_notice(&uneven, false, true, cwd);
+        assert_eq!(
+            verbose[2..5],
+            [
+                "  dep-00@1.0.0  (pnpm-workspace.yaml)",
+                "  dep-01@1.0.0",
+                "  dep-02@1.0.0  (pnpm-workspace.yaml)",
+            ]
+        );
+        assert!(project_patch_notice(&[], false, false, cwd).is_empty());
+    }
+
+    /// A file that could not be read is a warning of its own, with the
+    /// reason and the remedy, and it never offers the override. Under the
+    /// override everything is one warning to review the result. Packages of
+    /// two ecosystems are named by purl, and a file outside `--cwd` by its
+    /// whole path.
+    #[test]
+    fn project_patch_notice_separates_unreadable_files_and_the_override() {
+        let cwd = std::path::Path::new("/work/app");
+        let broken = "/work/app/package.json (not valid JSON: expected value at line 1)";
+        let mixed = [
+            protected("pkg:npm/a@1.0.0", &[broken], true),
+            protected("pkg:npm/b@2.0.0", &[broken], true),
+            protected("pkg:cargo/serde@1.0.0", &["/work/Cargo.toml"], false),
+            protected(
+                "pkg:npm/c@3.0.0",
+                &["/work/app/patches/c+3.0.0.patch"],
+                false,
+            ),
+        ];
+        assert_eq!(
+            project_patch_notice(&mixed, false, false, cwd),
+            [
+                "Warning: 2 packages not patched, because this project's own patches could \
+                 not be checked: package.json (not valid JSON: expected value at line 1). Fix \
+                 that file and run again.",
+                "Note: skipped 2 packages covered by this project's own patches \
+                 (/work/Cargo.toml, patches/c+3.0.0.patch): pkg:cargo/serde@1.0.0, \
+                 pkg:npm/c@3.0.0.",
+                "  --allow-patch-conflicts patches them too.",
+            ]
+        );
+        assert_eq!(
+            project_patch_notice(&mixed[2..], true, false, cwd),
+            [
+                "Warning: --allow-patch-conflicts: 2 packages covered by this project's own \
+                 patches (/work/Cargo.toml, patches/c+3.0.0.patch) may get a Socket patch too: \
+                 pkg:cargo/serde@1.0.0, pkg:npm/c@3.0.0. Review and test the combined result.",
+            ]
+        );
     }
 
     #[test]
