@@ -745,6 +745,29 @@ impl<'a> View<'a> {
         self.staged.insert(rel.to_string(), None);
     }
 
+    /// Stage `content` for `rel` only when the flush could write it;
+    /// `false` when it was left out. For a write that is a courtesy and
+    /// must never be the reason a restore is refused: the flush is all or
+    /// nothing, and one file it will not write (a symbolic link, a
+    /// directory that does not take the write, a file edited since it was
+    /// read) leaves every pin unrestored.
+    pub(crate) async fn write_if_writable(&mut self, rel: &str, content: String) -> bool {
+        let read = self
+            .originals
+            .get(rel)
+            .map(|original| original.as_deref().map(str::as_bytes));
+        let pending = vec![Pending {
+            rel,
+            content: Some(content.as_bytes()),
+            read,
+        }];
+        if preflight(self.root, pending).await.is_err() {
+            return false;
+        }
+        self.write(rel, content);
+        true
+    }
+
     /// Files whose staged state differs from what was read from disk.
     fn changed(&self) -> Staged {
         self.staged

@@ -1241,14 +1241,34 @@ async fn run_redirect_selected_untracked(
             gate.stage.may_admit(&purl) || !new.contains(&(purl, c.dep.patch_uuid.clone()))
         })
     });
-    let mut lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() && may_write {
+    let redirects = !candidates.is_empty() && may_write;
+    // A run that writes no redirect can still have one write to make: the
+    // Maven rewriter respells a `.mvn/maven.config` line an earlier release
+    // wrote, whatever the run redirects (`engine::read_maven_heal_files`).
+    // That write needs the lock like any other, but is never a reason to
+    // fail a run that has nothing else to do: when the lock cannot be had
+    // (another run holds it, the checkout cannot be written) the line
+    // waits for the next scan.
+    let heal_pending = !redirects && engine::read_maven_heal_files(&view).await.is_some();
+    let mut lock: Option<LockGuard> = if common.dry_run {
+        None
+    } else if redirects {
         match acquire_hosted_lock(common, &mut scan_result, &mut telemetry.json_error) {
             Ok(guard) => Some(guard),
             Err(code) => return code,
         }
+    } else if heal_pending {
+        crate::commands::lock_cli::acquire_with_status(
+            &common.socket_dir(),
+            Duration::from_secs(common.lock_timeout.unwrap_or(0)),
+            false,
+        )
+        .ok()
     } else {
         None
     };
+    // Whether this run may write that respelling, or preview it.
+    let may_heal = common.dry_run || lock.is_some();
 
     // Re-read project patch declarations under the write lock. A patch added
     // during API selection must not be lost in a takeover or lock rewrite.
@@ -1330,10 +1350,15 @@ async fn run_redirect_selected_untracked(
         .await;
 
     // Read the project's candidate files (through the overlay). Skipped
-    // when no candidate survived (the rewriters do nothing without a dep);
-    // everything after the rewrite still runs.
+    // when no candidate survived (the rewriters redirect nothing without a
+    // dep), but for the files of a `.mvn/maven.config` to heal, read again
+    // now that the lock is held; everything after the rewrite still runs.
     let read = if !candidates.is_empty() {
         engine::read_candidate_files(&view, &std::collections::BTreeSet::new(), &candidates).await
+    } else if heal_pending && may_heal {
+        engine::read_maven_heal_files(&view)
+            .await
+            .unwrap_or_default()
     } else {
         CandidateFiles::default()
     };
@@ -1683,6 +1708,13 @@ async fn run_redirect_selected_untracked(
             Ok(guard) => lock = Some(guard),
             Err(code) => return code,
         }
+    }
+    // A wet run that never took the lock writes nothing: the one write the
+    // rewriters plan without a redirect, the `.mvn/maven.config` heal, is
+    // withheld (every candidate of this run was deferred, and the lock for
+    // the heal could not be had).
+    if !may_heal && lock.is_none() {
+        done.withhold_maven_heal();
     }
     // Held to the end of the function.
     let lock = lock;

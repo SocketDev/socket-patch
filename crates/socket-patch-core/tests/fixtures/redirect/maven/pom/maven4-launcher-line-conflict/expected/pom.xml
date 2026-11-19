@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>dev.socket.test</groupId>
+  <artifactId>consumer</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+  <dependencies>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>1.7.36-socket.77777777</version>
+    </dependency>
+  </dependencies>
+  <repositories>
+    <repository>
+      <id>socket-patch-77777777-7777-7777-7777-777777777777</id>
+      <url>https://patch.socket.dev/patch-registry/maven/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/maven2</url>
+      <releases>
+        <enabled>true</enabled>
+        <checksumPolicy>fail</checksumPolicy>
+      </releases>
+      <snapshots>
+        <enabled>false</enabled>
+      </snapshots>
+    </repository>
+  </repositories>
+</project>
