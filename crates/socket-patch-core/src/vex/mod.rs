@@ -25,8 +25,8 @@ pub mod time;
 pub mod verify;
 
 pub use build::{
-    build_document, build_document_marking_unverified, build_document_with_affected, BuildOptions,
-    NOT_VERIFIED_SUFFIX,
+    build_document, build_document_marking_unverified, build_document_with, Attested, BuildOptions,
+    CODE_NOT_PRESENT_PREFIX, NOT_VERIFIED_SUFFIX,
 };
 pub use discover::{
     discover_patched_refs, discover_patched_refs_in, discover_patched_refs_with, Diag,

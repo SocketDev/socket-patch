@@ -1,0 +1,147 @@
+name: Bazel patch compatibility (Maven)
+
+# The Maven flows of the real-Bazel tests (`maven::` in `e2e_bazel_build`):
+# what a hosted patch of an artifact does in a workspace whose
+# rules_jvm_external hub builds that artifact from a pinned lock, on each
+# Bazel release below. bazel-compatibility.yml holds the legs and what every
+# ecosystem shares; this file says when the Maven legs run and on which
+# releases.
+#
+# Each release has an era of its own, because the ruleset decides the
+# format of the lock and the name of an artifact's repository:
+# rules_jvm_external 7.2 on Bazel 9, 6.9 on Bazel 8 and 6.5 on Bazel 7.
+#
+# Beyond what every leg needs, a Maven leg downloads one JDK (the one its
+# era's rules_java runs javac on, about 215 MB; each era's .bazelrc names
+# it for every Java role, so no build takes a Java from the machine or
+# downloads a second one), java_tools (about 50 MB), the archive of
+# rules_kotlin, a Bazel module the ruleset depends on (about 45 MB),
+# Coursier (about 40 MB) and a Python toolchain that a Bazel module of the
+# graph asks for (about 20 MB). Its repository cache holds them and comes
+# to about 400 MB (macOS arm64, Bazel 9.3.2).
+#
+# No leg asks a public Maven repository, for a pin or for a build. The two
+# artifacts under test are made by the test, under a group only the owner
+# of socket.dev can publish to Maven Central, with an id of the run in the
+# jar. The fixture's hub has a name of its own, because a hub named `maven`
+# also takes the artifacts that other Bazel modules add to a hub of that
+# name, which a pin resolves from Maven Central. Its one repository is the
+# test's loopback server: Coursier resolves the two artifacts there, the
+# lock a test pins holds them alone, with the sha256 of this run's jar,
+# the build takes the jar from that server, and no cache holds a jar of
+# the run. Era e7 (rules_jvm_external 6.5) starts Coursier with the Java
+# of JAVA_HOME, else the `java` on PATH, which the runner images have; the
+# later eras use the Java embedded in Bazel.
+#
+# Not required for merge: no `merge_group` trigger, and no job here is a
+# `needs` of ci.yml's `ci-ok`.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    # What a pull request run covers: the Maven flows and their fixture, the
+    # harness and the workflows that run it, the Bazel installer and its
+    # pins, and the Maven files of socket-patch-core that `get --mode
+    # hosted` and `rollback` run through in the fixture, each by its own
+    # path: the pom model and the trusted checksums (formats/maven), the
+    # rewriter's index of a pom, the model of what Maven selects with the
+    # pom walk under it (the hosted lane pins only where Maven selects the
+    # patch's version), the crawler that says where the Maven local
+    # repository is, lock discovery and the upstream restore of `rollback`,
+    # and what socket-patch reads only in a Bazel workspace (`bazel/`: the
+    # hubs of MODULE.bazel and their locks). Nothing another ecosystem's
+    # flow owns is here, so a change to one ecosystem starts that
+    # ecosystem's legs only.
+    #
+    # What it does not cover: shared engine code (`rewrite_maven_pom` is in
+    # patch/redirect/mod.rs, the file of every ecosystem's rewriter; hosted/,
+    # commands/), the shared test helpers and the toolchain files. A change
+    # there gets its run on the push to main (when the file is in the list
+    # below) or in the nightly run, not on the pull request: that is the
+    # price of not running every ecosystem's legs on every shared change.
+    # On demand, workflow_dispatch runs the legs on any branch.
+    paths:
+      - '.github/workflows/bazel-maven.yml'
+      - '.github/workflows/bazel-compatibility.yml'
+      - 'scripts/install-bazel.sh'
+      - 'scripts/bazel-pins.txt'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/maven.rs'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/harness.rs'
+      - 'crates/socket-patch-cli/tests/fixtures/bazel/rules_jvm_external/**'
+      - 'crates/socket-patch-core/src/formats/maven/**'
+      - 'crates/socket-patch-core/src/patch/redirect/maven_index.rs'
+      - 'crates/socket-patch-core/src/crawlers/maven_selection.rs'
+      - 'crates/socket-patch-core/src/crawlers/maven_scope.rs'
+      - 'crates/socket-patch-core/src/crawlers/maven_crawler.rs'
+      - 'crates/socket-patch-core/src/vex/discover/maven.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/upstream/maven.rs'
+      - 'crates/socket-patch-core/src/bazel/**'
+  push:
+    branches: [main]
+    # The pull request paths, and what only a push to main covers: the
+    # root of the test target (it changes when an ecosystem's module is
+    # added; ci.yml builds the target and runs its hermetic tests on every
+    # pull request), the shared engine code and test helpers the flows run
+    # through, and the toolchain files. A main push outside this list waits
+    # for the nightly run below.
+    paths:
+      - '.github/workflows/bazel-maven.yml'
+      - '.github/workflows/bazel-compatibility.yml'
+      - 'scripts/install-bazel.sh'
+      - 'scripts/bazel-pins.txt'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/maven.rs'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/harness.rs'
+      - 'crates/socket-patch-cli/tests/fixtures/bazel/rules_jvm_external/**'
+      - 'crates/socket-patch-core/src/formats/maven/**'
+      - 'crates/socket-patch-core/src/patch/redirect/maven_index.rs'
+      - 'crates/socket-patch-core/src/crawlers/maven_selection.rs'
+      - 'crates/socket-patch-core/src/crawlers/maven_scope.rs'
+      - 'crates/socket-patch-core/src/crawlers/maven_crawler.rs'
+      - 'crates/socket-patch-core/src/vex/discover/maven.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/upstream/maven.rs'
+      - 'crates/socket-patch-core/src/bazel/**'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/**'
+      - 'crates/socket-patch-core/src/hosted/**'
+      - 'crates/socket-patch-cli/src/commands/**'
+      - 'crates/socket-patch-cli/tests/common/**'
+      - 'crates/socket-patch-cli/tests/hosted_memory_common/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+  schedule:
+    # Nightly, so a main change outside the push list still gets a run
+    # within a day. The macOS leg runs here and on demand only.
+    - cron: '27 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The nightly run has a group of its own. A group holds one pending run, so
+# in the group of main's pushes a second push would replace a nightly that
+# waits behind the first, and the nightly is the only run with the macOS leg.
+concurrency:
+  group: bazel-maven-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  maven:
+    uses: ./.github/workflows/bazel-compatibility.yml
+    with:
+      eco: maven
+      fixtures: rules_jvm_external/bzlmod
+      # One leg per line: a Bazel release, and the era of the fixture that
+      # `maven::FIXTURE` gives it.
+      releases: >-
+        [
+          {"bazel": "9.3.2", "era": "e9"},
+          {"bazel": "8.8.2", "era": "e8"},
+          {"bazel": "7.7.2", "era": "e7"}
+        ]
+      macos: >-
+        [
+          {"bazel": "9.3.2", "era": "e9"}
+        ]

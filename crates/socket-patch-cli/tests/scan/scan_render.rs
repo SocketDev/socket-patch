@@ -5,13 +5,13 @@
 //!
 //!   1. terminals reachable without a network: `--offline`, hosted
 //!      `--prune`, an empty `--global-prefix`, `--ecosystems`, usage errors;
-//!   2. the paid-tier table column, summaries and nudge;
-//!   3. the results table: `[UPDATE]`, `(+N)`, full purls, the preview's
+//!   2. the paid-tier terminal and nudge;
+//!   3. the rows: `(+N)`, full names, newer patches, the `--verbose` preview's
 //!      vulnerability lines, and the detail-fetch warning and error;
 //!   4. `[skip]`, `[re-apply]` and `[would-refuse]` lines;
 //!   5. report-only runs and their hints, agent-mode applies, the GC line
 //!      and the retained-wiring warning;
-//!   6. hosted mode's table, per-directory runs and corrupt `bun.lockb`.
+//!   6. hosted mode's update detection, per-directory runs and corrupt `bun.lockb`.
 
 use wiremock::MockServer;
 
@@ -155,9 +155,9 @@ fn scan_mode_conflict_error_is_capitalized_and_names_no_hidden_flag() {
 // Paid tier: no other fixture sends tier: "paid"
 // ---------------------------------------------------------------------------
 
-/// Paid patch, NO paid access: the `free+paid` table column, the free-only
-/// summary, the paid-plan nudge with the pricing URL, and the "No
-/// downloadable patches" terminal (exit 0, no detail fetch attempted).
+/// Paid patch, NO paid access: the "No downloadable patches" terminal
+/// (exit 0, no detail fetch attempted), then the closing lines saying what
+/// a paid plan would fix, with the pricing URL.
 #[tokio::test]
 async fn scan_paid_patch_without_access_nudges_and_downloads_nothing() {
     let mock = MockServer::start().await;
@@ -166,25 +166,12 @@ async fn scan_paid_patch_without_access_nudges_and_downloads_nothing() {
 
     let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    assert!(
-        stdout.contains("0+1"),
-        "the table column must render free+paid counts; got {stdout:?}"
-    );
-    assert!(
-        stdout.contains("Summary: 1 package with 0 free patches"),
-        "the no-access summary counts FREE patches only; got {stdout:?}"
-    );
-    assert!(
-        stdout.contains("+ 1 additional patch is available with a paid Socket plan"),
-        "the paid nudge must print; got {stdout:?}"
-    );
-    assert!(
-        stdout.contains("https://socket.dev/pricing"),
-        "the pricing URL must print; got {stdout:?}"
-    );
-    assert!(
-        stdout.contains("No downloadable patches: every patch found requires a paid Socket plan."),
-        "the gated-catalog terminal must print; got {stdout:?}"
+    assert_eq!(
+        stdout,
+        "No downloadable patches: every patch found requires a paid Socket plan.\n\
+         Upgrade to a paid Socket plan to access all patches: https://socket.dev/pricing\n\n\
+         1 vulnerability left to patch: 1 needs a paid Socket plan.\n",
+        "the gated catalog says what a paid plan would fix; stderr={stderr:?}"
     );
     assert_eq!(
         by_package_gets(&recorded(&mock).await),
@@ -193,9 +180,9 @@ async fn scan_paid_patch_without_access_nudges_and_downloads_nothing() {
     );
 }
 
-/// Paid patch WITH paid access: the summary counts ALL patches (the
-/// can-access arm) and no nudge prints. The deliberately failing detail
-/// fetch then fails the run (its error line is pinned below).
+/// Paid patch WITH paid access: no nudge prints. The deliberately failing
+/// detail fetch fails the run before any result line (its error is on
+/// stderr).
 #[tokio::test]
 async fn scan_paid_patch_with_access_counts_all_patches() {
     let mock = MockServer::start().await;
@@ -208,29 +195,25 @@ async fn scan_paid_patch_with_access_counts_all_patches() {
         code, 1,
         "a failed detail fetch fails the scan; stdout={stdout}; stderr={stderr}"
     );
-    assert!(
-        stdout.contains("Summary: 1 package with 1 available patch"),
-        "the can-access summary counts all patches; got {stdout:?}"
+    assert_eq!(
+        stdout, "",
+        "a failed detail fetch has no result to print, and a subscriber gets no nudge"
     );
     assert!(
-        stdout.contains("0+1"),
-        "the free+paid column renders for paid-access users too; got {stdout:?}"
-    );
-    assert!(
-        !stdout.contains("paid Socket plan"),
-        "no nudge for a subscriber; got {stdout:?}"
+        stderr.contains("could not fetch patch details"),
+        "the failure is on stderr; got {stderr:?}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// The results table and the per-patch preview
+// The rows and the per-patch preview
 // ---------------------------------------------------------------------------
 
-/// The `[UPDATE]` marker and newer-patches summary (the manifest's OLD uuid
-/// against the batch's NEW uuid), the `(+N)` vuln overflow, and the
-/// dry-run terminal before any confirm.
+/// The newer-patches line (the manifest's OLD uuid against the batch's NEW
+/// uuid), the row's `(+N)` advisory overflow, and the dry-run terminal
+/// before any confirm.
 #[tokio::test]
-async fn scan_human_table_renders_update_marker_and_vuln_overflow() {
+async fn scan_human_row_counts_extra_advisories_and_names_newer_patches() {
     let mock = MockServer::start().await;
     mount_batch_one(
         &mock,
@@ -249,30 +232,35 @@ async fn scan_human_table_renders_update_marker_and_vuln_overflow() {
     // apply never run), so no view/blob mocks are needed.
     let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--dry-run", "--yes"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    assert!(
-        stdout.contains("[UPDATE]"),
-        "the human update marker must render; got {stdout:?}"
+    // The ids are sorted, so the first two show and the third folds into
+    // (+1). The row sits under the dry-run line, the totals close the run.
+    assert_eq!(
+        stdout,
+        "1 package has a newer patch available.\n\
+         [dry-run] Would download and apply 1 patch. No changes made.\n  \
+         HIGH  minimist@1.2.2  CVE-2024-0001, CVE-2024-0002 (+1)\n\n\
+         Would patch 1 package, fixing 3 vulnerabilities.\n\
+         Would save about 2 hours of engineering time (1 package upgrade at ~2 hours).\n\
+         Nothing left to patch.\n",
+        "stderr={stderr:?}"
     );
-    assert!(
-        stdout.contains("1 package has a newer patch available."),
-        "the newer-patches summary must print; got {stdout:?}"
+    // `--verbose` names every id.
+    let (code, stdout, stderr) = run_scan_agent(
+        tmp.path(),
+        &mock.uri(),
+        &["--dry-run", "--yes", "--verbose"],
     );
-    // collect_vuln_ids sorts CVEs, so the first two sorted ids show and the
-    // third folds into (+1).
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stdout.contains("CVE-2024-0001, CVE-2024-0002 (+1)"),
-        "3+ vuln ids must truncate to two plus (+N); got {stdout:?}"
-    );
-    assert!(
-        stdout.contains("[dry-run] Would download and apply 1 patch. No changes made."),
-        "dry-run must stop before the confirm; got {stdout:?}"
+        stdout.contains("  HIGH  minimist@1.2.2  CVE-2024-0001, CVE-2024-0002, CVE-2024-0003\n"),
+        "got {stdout:?}"
     );
 }
 
-/// The table's PACKAGE column grows to fit the PURL (a fixed-width cut
-/// would drop the version), and the rule matches the table.
+/// A row names the package in full, scope and version included (a
+/// fixed-width cut would drop the version).
 #[tokio::test]
-async fn scan_human_table_shows_full_purl_with_version() {
+async fn scan_human_row_names_the_package_in_full_with_its_version() {
     let mock = MockServer::start().await;
     let purl = "pkg:npm/@typescript-eslint/typescript-estree@6.0.0";
     mount_batch_one(&mock, purl, UUID, "free", &["CVE-2024-1"], false).await;
@@ -289,29 +277,25 @@ async fn scan_human_table_shows_full_purl_with_version() {
         r#"{ "name": "@typescript-eslint/typescript-estree", "version": "6.0.0" }"#,
     )
     .unwrap();
-    let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), &["--dry-run"]);
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--dry-run"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    let row = stdout
-        .lines()
-        .find(|l| l.contains("CVE-2024-1") && l.starts_with("pkg:npm/"))
-        .unwrap_or_else(|| panic!("no table row in {stdout:?}"));
-    assert!(row.starts_with(&format!("{purl}  ")), "{row:?}");
-    let header = stdout.lines().find(|l| l.starts_with("PACKAGE")).unwrap();
-    // The right-aligned count ends where the PATCHES header ends.
-    assert_eq!(
-        header.find("PATCHES").map(|i| i + "PATCHES".len()),
-        row.find(" 1  ").map(|i| i + 2),
-        "PATCHES header sits over the count: {stdout}"
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l == "  HIGH  @typescript-eslint/typescript-estree@6.0.0  CVE-2024-1"),
+        "no row for the package in {stdout:?}"
     );
-    // The rule is exactly as wide as the widest table line.
-    let rule = stdout.lines().find(|l| l.starts_with("===")).unwrap();
-    assert_eq!(rule.len(), header.len().max(row.len()), "{stdout}");
+    // No table: nothing is ruled off or headed by column.
+    assert!(
+        !stdout.contains("===") && !stdout.contains("PACKAGE"),
+        "{stdout:?}"
+    );
 }
 
-/// Per-patch vulnerability rendering in the "Patches to apply" preview.
-/// Every other human-path fixture ships `vulnerabilities: {}`, so the
-/// CVE/GHSA fold, the "Fixes:" line, and the per-vuln summary lines had
-/// never executed.
+/// Per-patch vulnerability rendering in the `--verbose` "Patches to apply"
+/// preview. Every other human-path fixture ships `vulnerabilities: {}`, so
+/// the CVE/GHSA fold, the "Fixes:" line, and the per-vuln summary lines had
+/// never executed. Without `--verbose` the row names the same ids.
 #[tokio::test]
 async fn scan_human_preview_renders_vulnerability_details() {
     let mock = MockServer::start().await;
@@ -340,6 +324,22 @@ async fn scan_human_preview_renders_vulnerability_details() {
 
     let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--dry-run", "--yes"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.contains("  HIGH  minimist@1.2.2  CVE-2024-9999, GHSA-dddd-eeee-ffff\n"),
+        "the row names a CVE, and an advisory with none by its own id; got {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("Patches to apply:") && !stdout.contains("Fixes: "),
+        "the per-patch preview is for --verbose; got {stdout:?}"
+    );
+
+    let (code, stdout, stderr) = run_scan_agent(
+        tmp.path(),
+        &mock.uri(),
+        &["--dry-run", "--yes", "--verbose"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(stdout.contains("\nPatches to apply:\n"), "{stdout:?}");
     let fixes = stdout
         .lines()
         .find(|l| l.trim_start().starts_with("Fixes: "))
@@ -374,21 +374,16 @@ async fn scan_human_invalid_package_json_says_to_fix_the_file() {
     assert_eq!(
         stdout,
         "1 package was not scanned: this project's own patches could not be checked (see the \
-         warnings). Fix the file they name and run again.\n"
+         warning). Fix the file it names and run again.\n"
     );
-    let warning = stderr
-        .lines()
-        .find(|l| l.starts_with("Warning: pkg:npm/minimist@1.2.2: "))
-        .unwrap_or_else(|| panic!("the package's warning must print; stderr={stderr}"));
+    // One warning for the file, naming it relative to the project, however
+    // many packages it holds back.
     assert!(
-        warning.starts_with(
-            "Warning: pkg:npm/minimist@1.2.2: not patched, because this project's own patches \
-             for it could not be checked: "
-        ) && warning.ends_with(
-            "package.json (not valid JSON: EOF while parsing a value at line 1 column 10). Fix \
-             that file and run again."
-        ),
-        "{warning}"
+        stderr.lines().any(|l| l
+            == "Warning: 1 package not patched, because this project's own patches could not \
+                be checked: package.json (not valid JSON: EOF while parsing a value at line 1 \
+                column 10). Fix that file and run again."),
+        "the file's warning must print; stderr={stderr}"
     );
     for output in [&stdout, &stderr] {
         assert!(!output.contains("--allow-patch-conflicts"), "{output}");
@@ -406,13 +401,19 @@ async fn scan_human_invalid_package_json_says_to_fix_the_file() {
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert_eq!(
         stdout,
-        "1 package is protected by this project's own patches and was not scanned (see the \
-         warnings). Pass --allow-patch-conflicts to scan it anyway.\n"
+        "1 package is protected by this project's own patches and was not scanned. Pass \
+         --allow-patch-conflicts to scan it anyway.\n"
     );
+    // The packages the project patches itself are one note: the file, the
+    // packages, and the flag.
     assert!(
-        stderr.contains("protected by project patch/replacement metadata in "),
+        stderr.contains(
+            "Note: skipped 1 package covered by this project's own patches (package.json): \
+             minimist@1.2.2.\n  --allow-patch-conflicts patches it too.\n"
+        ),
         "{stderr}"
     );
+    assert!(!stderr.contains("Warning: pkg:npm/"), "{stderr}");
 }
 
 /// A `package-lock.json` that is not JSON, with nothing installed: the
@@ -592,10 +593,9 @@ async fn scan_human_reapplies_an_already_recorded_patch_after_reinstall() {
             b"after\n",
             "flags={flags:?}: the recorded patch must be re-applied; stdout={stdout}; stderr={stderr}"
         );
+        // The re-applied package has its row under the result line.
         assert!(
-            stdout.contains(&format!(
-                "[re-apply] {MINIMIST} (already recorded: 11111111)"
-            )),
+            stdout.starts_with("Applied 1 patch.\n  HIGH  minimist@1.2.2\n"),
             "flags={flags:?}: {stdout:?}"
         );
         assert!(
@@ -645,7 +645,14 @@ async fn scan_human_reapplies_recorded_patch_alongside_a_new_one() {
         b"after\n",
         "recorded patch re-applied; stdout={stdout}; stderr={stderr}"
     );
-    assert!(stdout.contains("Patches to apply:"), "{stdout:?}");
+    assert!(
+        stdout.starts_with("Applied 2 patches.\n  HIGH  left-pad@1.3.0\n  HIGH  minimist@1.2.2\n"),
+        "both packages have a row; got {stdout:?}"
+    );
+    // `--verbose` also says which selection was already recorded.
+    std::fs::write(&index_a, before).unwrap();
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &second.uri(), &["--verbose"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
         stdout.contains(&format!(
             "[re-apply] {MINIMIST} (already recorded: 11111111)"
@@ -668,15 +675,15 @@ async fn scan_human_dry_run_previews_reapply_of_a_recorded_patch() {
 
     let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--dry-run"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    assert!(
-        stdout.contains(&format!("[skip] {MINIMIST} (already recorded: 11111111)")),
-        "{stdout:?}"
+    assert_eq!(
+        stdout,
+        "All selected patches are already recorded in the manifest; a run without --dry-run \
+         re-applies them.\n  HIGH  minimist@1.2.2\n\n\
+         Would patch 1 package.\n\
+         Would save about 2 hours of engineering time (1 package upgrade at ~2 hours).\n\
+         Nothing left to patch.\n",
+        "stderr={stderr:?}"
     );
-    assert!(
-        stdout.contains("a run without --dry-run re-applies them"),
-        "{stdout:?}"
-    );
-    assert!(!stdout.contains("Patches to apply:"), "{stdout:?}");
     assert_eq!(
         view_gets(&recorded(&mock).await),
         0,
@@ -828,7 +835,7 @@ async fn scan_human_empty_batch_reports_no_patches_once() {
 
     let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    assert_eq!(stdout, "\nNo patches available for installed packages.\n");
+    assert_eq!(stdout, "No patches available for installed packages.\n");
     assert!(!stderr.contains("No patches"), "stderr={stderr:?}");
     assert!(
         stderr.lines().any(|l| l == "Found 1 package (1 npm)"),
@@ -867,7 +874,7 @@ async fn scan_human_empty_discovery_stops_in_every_mode() {
     assert_eq!(reference_posts(&recorded(&mock).await), 0);
 }
 
-/// `--prune` with no mode: the discovery, table and per-patch preview
+/// `--prune` with no mode: the discovery and one row per available patch
 /// print (the report IS the value), then the run stops with the
 /// agent-mode hint, writing nothing and downloading nothing.
 #[tokio::test]
@@ -882,8 +889,8 @@ async fn scan_prune_without_a_mode_is_report_only() {
         "report-only is a success; stdout={stdout}; stderr={stderr}"
     );
     assert!(
-        stdout.contains("Patches available:") && stdout.contains(MINIMIST),
-        "the per-patch preview still prints; got {stdout:?}"
+        stdout.starts_with("Patches available:\n  HIGH  minimist@1.2.2\n\n"),
+        "the available patch has its row; got {stdout:?}"
     );
     assert!(
         !stdout.contains("Patches to apply:"),
@@ -958,7 +965,7 @@ async fn scan_global_report_only_hint_keeps_the_global_scope() {
         "report-only is a success; stdout={stdout}; stderr={stderr}"
     );
     assert!(
-        stdout.contains("Patches available:") && stdout.contains(MINIMIST),
+        stdout.starts_with("Patches available:\n  HIGH  minimist@1.2.2\n\n"),
         "the global scan must find the patch; got {stdout:?}"
     );
     // Its preview is the same report, never "Would download and apply".
@@ -1064,23 +1071,23 @@ async fn mount_two_patches(mock: &MockServer, purl: &str, before: &[u8]) {
     mount_view(mock, purl, UUID, before).await;
 }
 
-const UNPATCHED_NOTE: &str = "Only one patch is applied per package version. Upgrade the \
-    package to fix the advisories still unpatched.";
+/// The row of the package whose patch fixes one of its two advisories.
+const ROW: &str = "  CRITICAL  minimist@1.2.2  CVE-2021-0001  1 unpatched\n";
 
 /// Agent mode applies one of a package's two patches. Under the apply
-/// summary the run names the advisory it fixed and the one it left
-/// unpatched; a re-run that finds the package already patched says the same.
+/// summary the package's row names the advisory it fixed and counts the one
+/// it left unpatched, and the closing lines total both; a re-run that finds
+/// the package already patched says the same.
 #[tokio::test]
 async fn scan_human_agent_names_unpatched_advisories() {
     let mock = MockServer::start().await;
     let before = b"before\n";
     mount_two_patches(&mock, MINIMIST, before).await;
     let tmp = minimist_project(before);
-    let expected = format!(
-        "Summary: 1 of 1 targeted patch applied, 0 already patched, 0 not found on disk\n  \
-         {MINIMIST}: fixes CVE-2021-0001; still unpatched: CVE-2021-0002\n\
-         {UNPATCHED_NOTE}\n"
-    );
+    let expected = format!("Applied 1 patch.\n{ROW}");
+    let closing = "\nPatched 1 package, fixing 1 vulnerability (1 critical).\n\
+                   Saved about 2 hours of engineering time (1 package upgrade at ~2 hours).\n\
+                   1 vulnerability left to patch (50%): 1 needs a package upgrade.\n";
 
     let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
@@ -1089,17 +1096,33 @@ async fn scan_human_agent_names_unpatched_advisories() {
         b"after\n"
     );
     assert!(
-        stdout.contains(&expected),
+        stdout.starts_with(&expected) && stdout.ends_with(closing),
         "stdout={stdout}; stderr={stderr}"
+    );
+    // Each package is named once: no table, no per-patch block, no list of
+    // patched packages.
+    assert_eq!(stdout.matches("minimist").count(), 1, "stdout={stdout}");
+    assert!(
+        !stderr.contains("[add]") && !stderr.contains("Downloading"),
+        "stderr={stderr}"
     );
 
     let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert_eq!(
+        stdout,
+        format!("Applied 0 of 1 patch: 1 already patched.\n{ROW}{closing}"),
+        "stderr={stderr}"
+    );
+    // The re-run names the package once, in its row: no `[skip]` line for
+    // a patch the manifest already records.
+    assert!(!stderr.contains("[skip]"), "stderr={stderr}");
+
+    // `--verbose` names the unpatched advisory under the row.
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--verbose"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stdout.ends_with(&format!(
-            "  {MINIMIST}: fixes CVE-2021-0001; still unpatched: CVE-2021-0002\n\
-             {UNPATCHED_NOTE}\n"
-        )),
+        stdout.contains(&format!("{ROW}      still unpatched: CVE-2021-0002\n")),
         "stdout={stdout}; stderr={stderr}"
     );
 }
@@ -1118,12 +1141,13 @@ async fn scan_human_agent_ends_with_commit_and_reapply_next_steps() {
     let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stdout.ends_with(&format!(
-            "{UNPATCHED_NOTE}\n\
+        stdout.contains(&format!(
+            "{ROW}\
              Next steps:\n  \
              1. Commit .socket/ to keep the patches.\n  \
              2. Run `socket-patch apply` after every `npm install`, locally and in CI. A \
-             fresh install removes the patches.\n"
+             fresh install removes the patches.\n\n\
+             Patched 1 package"
         )),
         "stdout={stdout}; stderr={stderr}"
     );
@@ -1143,13 +1167,14 @@ async fn scan_human_agent_dry_run_names_unpatched_advisories_in_the_future_tense
 
     let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--dry-run"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    assert!(
-        stdout.ends_with(&format!(
-            "[dry-run] Would download and apply 1 patch. No changes made.\n  \
-             {MINIMIST}: would fix CVE-2021-0001; would stay unpatched: CVE-2021-0002\n\
-             {UNPATCHED_NOTE}\n"
-        )),
-        "stdout={stdout}; stderr={stderr}"
+    let closing = "\nWould patch 1 package, fixing 1 vulnerability (1 critical).\n\
+                   Would save about 2 hours of engineering time (1 package upgrade at ~2 \
+                   hours).\n\
+                   1 vulnerability would be left to patch (50%): 1 needs a package upgrade.\n";
+    assert_eq!(
+        stdout,
+        format!("[dry-run] Would download and apply 1 patch. No changes made.\n{ROW}{closing}"),
+        "stderr={stderr}"
     );
     assert!(!tmp.path().join(".socket").exists());
 
@@ -1162,9 +1187,7 @@ async fn scan_human_agent_dry_run_names_unpatched_advisories_in_the_future_tense
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
         stdout.ends_with(&format!(
-            "[dry-run] Would download and vendor 1 patch. No changes made.\n  \
-             {MINIMIST}: would fix CVE-2021-0001; would stay unpatched: CVE-2021-0002\n\
-             {UNPATCHED_NOTE}\n"
+            "[dry-run] Would download and vendor 1 patch. No changes made.\n{ROW}{closing}"
         )),
         "stdout={stdout}; stderr={stderr}"
     );
@@ -1431,11 +1454,11 @@ fn scan_human_vex_success_prints_wrote_line() {
 // Hosted mode, layout refusals and corrupt lockfiles
 // ---------------------------------------------------------------------------
 
-/// The hosted human arm shares the table/update block with the
-/// agent/vendored arms, then runs the engine without prompting (scan never
-/// prompts), dry run or not.
+/// The hosted human arm shares update detection with the agent/vendored
+/// arms, then runs the engine without prompting (scan never prompts), dry
+/// run or not. A patch the engine could not switch to counts as left.
 #[tokio::test]
-async fn scan_hosted_human_prints_table_updates_and_redirects() {
+async fn scan_hosted_human_names_newer_patches_and_redirects() {
     let mock = MockServer::start().await;
     mount_batch_one(&mock, MINIMIST, UUID, "free", &["CVE-2024-0001"], false).await;
     mount_by_package(&mock, MINIMIST, UUID, serde_json::json!({})).await;
@@ -1448,17 +1471,12 @@ async fn scan_hosted_human_prints_table_updates_and_redirects() {
     // v5: a bare scan is hosted.
     let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    assert!(
-        stdout.contains("VULNERABILITIES") && stdout.contains("CVE-2024-0001"),
-        "the results table must print in hosted mode; got {stdout:?}"
-    );
-    assert!(
-        stdout.contains("Summary: 1 package with 1 free patch"),
-        "the summary must print in hosted mode; got {stdout:?}"
-    );
-    assert!(
-        stdout.contains("[UPDATE]"),
-        "update detection must run in hosted mode; got {stdout:?}"
+    assert_eq!(
+        stdout,
+        "1 package has a newer patch available.\n\
+         Switched 0 packages to hosted patches; rewrote 0 files.\n\n\
+         1 vulnerability left to patch: 1 is in packages this run did not patch.\n",
+        "update detection runs in hosted mode, and the refused patch is left; stderr={stderr:?}"
     );
     assert!(
         !stderr.contains("Non-interactive mode detected"),
@@ -1498,7 +1516,9 @@ async fn scan_hosted_human_prints_table_updates_and_redirects() {
 }
 
 /// Hosted PATHs name project directories: each runs as its own scan (its
-/// own discovery and redirect), under a `== <dir> ==` header.
+/// own redirect), under a `== <dir> ==` header. The directories are
+/// crawled and looked up together before their scans, and the run asks
+/// the patch service about a package once however many of them hold it.
 #[tokio::test]
 async fn scan_hosted_paths_run_once_per_project_directory() {
     let mock = MockServer::start().await;
@@ -1531,8 +1551,67 @@ async fn scan_hosted_paths_run_once_per_project_directory() {
         "{stdout}"
     );
     let reqs = recorded(&mock).await;
-    assert_eq!(batch_bodies(&reqs).len(), 2, "one discovery per directory");
+    // Both directories hold the same package: one lookup answers both.
+    assert_eq!(
+        batch_bodies(&reqs).len(),
+        1,
+        "the run asks about a package once"
+    );
+    assert_eq!(
+        reqs.iter()
+            .filter(|r| r.url.path().contains("/by-package/"))
+            .count(),
+        1,
+        "and reads its patches once"
+    );
     assert_eq!(reference_posts(&reqs), 2, "one redirect per directory");
+    // Each directory's scan still reports the package it found.
+    assert_eq!(
+        stderr.matches("Found 1 package (1 npm)").count(),
+        2,
+        "{stderr}"
+    );
+}
+
+/// The read made ahead of a multi-directory scan asks the patch service
+/// only what each directory's own scan would ask: a package the project
+/// patches itself is protected before any question, there as in the
+/// scan, and so is one a selection filter leaves out.
+#[tokio::test]
+async fn scan_of_several_directories_asks_about_no_package_a_scan_leaves_out() {
+    // Without and with the projects' own patch of `left-pad`: the first
+    // shows the package is asked about when nothing protects it.
+    for patched in [false, true] {
+        let mock = MockServer::start().await;
+        mount_batch_one(&mock, MINIMIST, UUID, "free", &[], false).await;
+        mount_by_package(&mock, MINIMIST, UUID, serde_json::json!({})).await;
+        mount_forbidden_reference(&mock, MINIMIST).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        for app in ["apps/a", "apps/b"] {
+            let dir = tmp.path().join(app);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_root_package_json(&dir);
+            write_npm_package(&dir, "minimist", "1.2.2", b"x\n");
+            write_npm_package(&dir, "left-pad", "1.3.0", b"x\n");
+            if patched {
+                std::fs::create_dir_all(dir.join("patches")).unwrap();
+                std::fs::write(dir.join("patches/left-pad+1.3.0.patch"), "diff\n").unwrap();
+            }
+        }
+
+        let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), &["apps/*"]);
+        assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+        let bodies = batch_bodies(&recorded(&mock).await);
+        assert_eq!(bodies.len(), 1, "one lookup for the run: {bodies:#?}");
+        assert!(bodies[0].contains("minimist"), "{bodies:#?}");
+        assert_eq!(
+            bodies[0].contains("left-pad"),
+            !patched,
+            "patched={patched}: a package the project patches itself is not asked about: \
+             {bodies:#?}"
+        );
+    }
 }
 
 /// The PnP layout refusal rides a NON-empty human scan (polyglot repo):

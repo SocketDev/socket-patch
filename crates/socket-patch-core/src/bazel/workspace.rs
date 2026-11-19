@@ -80,6 +80,12 @@ pub enum Entry {
 /// other process changes meanwhile: one that swaps a directory for a link
 /// between the two steps of a read is not seen.
 pub fn disk(root: &Path) -> impl Fn(&str) -> Entry + '_ {
+    disk_up_to(root, MAX_BYTES)
+}
+
+/// [`disk`] for files of up to `max` bytes: a lock that a tag names is
+/// data, and can be larger than a file of Starlark.
+pub fn disk_up_to(root: &Path, max: usize) -> impl Fn(&str) -> Entry + '_ {
     let top = std::fs::canonicalize(root);
     move |path| {
         let read = || -> std::io::Result<String> {
@@ -87,7 +93,7 @@ pub fn disk(root: &Path) -> impl Fn(&str) -> Entry + '_ {
             let plain = |part| matches!(part, Component::Normal(_));
             if Path::new(path).components().all(plain) {
                 if let Some(pending) = group_commit::read(&top.join(path)) {
-                    return text(&pending?[..]);
+                    return text(&pending?[..], max);
                 }
             }
             let real = std::fs::canonicalize(top.join(path))?;
@@ -99,7 +105,7 @@ pub fn disk(root: &Path) -> impl Fn(&str) -> Entry + '_ {
             if real.is_dir() {
                 return Err(ErrorKind::InvalidInput.into());
             }
-            text(open_regular_file_sync(&real)?.0)
+            text(open_regular_file_sync(&real)?.0, max)
         };
         let unreadable = |why: &str| Entry::Unreadable(why.to_string());
         match read() {
@@ -116,14 +122,15 @@ pub fn disk(root: &Path) -> impl Fn(&str) -> Entry + '_ {
     }
 }
 
-/// The text of `from`, read to its end. One byte more than [`MAX_BYTES`]
-/// is asked for: a file that grew since its size was taken is refused,
-/// not cut there and read as if it were whole.
-fn text(from: impl Read) -> std::io::Result<String> {
+/// The text of `from`, read to its end. One byte more than `max` is
+/// asked for: a file that grew since its size was taken is refused, not
+/// cut there and read as if it were whole.
+fn text(from: impl Read, max: usize) -> std::io::Result<String> {
     let mut bytes = Vec::new();
-    from.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_BYTES {
-        return Err(std::io::Error::other("it is larger than 1 MiB"));
+    from.take(max as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > max {
+        let why = format!("it is larger than {} MiB", max >> 20);
+        return Err(std::io::Error::other(why));
     }
     String::from_utf8(bytes).map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))
 }
@@ -2136,17 +2143,17 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
     /// it would be read as if it ended there.
     #[test]
     fn a_file_that_grows_past_the_bound_is_not_cut_there() {
-        let read = |len: u64| text(std::io::repeat(b'#').take(len));
+        let read = |len: u64| text(std::io::repeat(b'#').take(len), MAX_BYTES);
         assert_eq!(read(MAX_BYTES as u64).unwrap().len(), MAX_BYTES);
         for len in [MAX_BYTES as u64 + 1, u64::MAX] {
             let refused = read(len).unwrap_err();
             assert_eq!(refused.to_string(), "it is larger than 1 MiB", "{len}");
         }
         assert_eq!(
-            text(&b"caf\xe9"[..]).unwrap_err().kind(),
+            text(&b"caf\xe9"[..], MAX_BYTES).unwrap_err().kind(),
             ErrorKind::InvalidData
         );
-        assert_eq!(text(&b"caf\xc3\xa9"[..]).unwrap(), "caf\u{e9}");
+        assert_eq!(text(&b"caf\xc3\xa9"[..], MAX_BYTES).unwrap(), "caf\u{e9}");
     }
 
     /// A command that has written `MODULE.bazel` in a group commit reads
@@ -2216,6 +2223,8 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
         write("tools/new.MODULE.bazel", "#".repeat(MAX_BYTES + 1)).await;
         let big = Entry::Unreadable("it is larger than 1 MiB".to_string());
         assert_eq!(view("tools/new.MODULE.bazel"), big);
+        let lock = disk_up_to(root, 2 * MAX_BYTES);
+        assert!(matches!(lock("tools/new.MODULE.bazel"), Entry::Text(_)));
         atomic_write_bytes(&root.join("tools/new.MODULE.bazel"), b"# caf\xe9\n")
             .await
             .unwrap();
@@ -2301,6 +2310,13 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
             ("WORKSPACE", "maven_install")
         );
         assert_eq!((ws.files.len(), &ws.doubts), (3, &vec![]));
+        // The same view with the bound of a lock, which is larger.
+        let lock = disk_up_to(&root, 2 * MAX_BYTES);
+        assert!(matches!(lock("big.MODULE.bazel"), Entry::Text(_)));
+        std::fs::write(root.join("huge.json"), vec![b' '; 2 * MAX_BYTES + 1]).unwrap();
+        let huge = Entry::Unreadable("it is larger than 2 MiB".to_string());
+        assert_eq!(lock("huge.json"), huge);
+        assert_eq!(lock("../outside.MODULE.bazel"), out);
         // And a root that is not there at all.
         assert_eq!(
             disk(&tmp.path().join("gone"))("MODULE.bazel"),

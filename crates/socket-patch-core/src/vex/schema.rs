@@ -93,7 +93,7 @@ pub struct Statement {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub impact_statement: Option<String>,
     /// Canonical companion to `status == affected` (per spec): what to
-    /// do about it. Set by `vex::build::build_document_with_affected`.
+    /// do about it. Set by `vex::build::build_document_with`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub action_statement: Option<String>,
 }

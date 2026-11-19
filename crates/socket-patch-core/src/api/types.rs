@@ -46,6 +46,128 @@ pub struct PatchResponse {
     pub description: String,
     pub license: String,
     pub tier: String,
+    /// What Socket measured about the patch, when it has been measured.
+    /// Read leniently ([`lenient`]): the measurements are shown beside a
+    /// patch and nothing depends on them, so a `statistics` object this
+    /// build cannot read is one it does not show, never a patch view it
+    /// cannot read. Reading the view is how a patch is downloaded.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_object"
+    )]
+    pub statistics: Option<PatchStatistics>,
+}
+
+/// Deserialize an optional part of a response that nothing depends on:
+/// whatever does not read as a `T` (a `null`, another shape, a number out
+/// of range) is `None`, where the derived reading would fail the whole
+/// response it is part of.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+/// [`lenient`] for a part that is an object: anything else is `None` (a
+/// derived struct would also read from an array, field by field).
+fn lenient_object<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .filter(serde_json::Value::is_object)
+        .and_then(|value| serde_json::from_value(value).ok()))
+}
+
+/// `count` of `total`: tests that passed, exploits that reproduced or
+/// were blocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchRatio {
+    pub count: u64,
+    pub total: u64,
+}
+
+impl PatchRatio {
+    /// Every one of them: all the tests passed, every exploit was blocked.
+    pub fn is_all(&self) -> bool {
+        self.total > 0 && self.count == self.total
+    }
+}
+
+/// How large a patch is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchDiffSize {
+    pub lines_added: u64,
+    pub lines_removed: u64,
+    pub files_changed: u64,
+}
+
+/// The package's own test suites, run on the unpatched release (`before`,
+/// absent when a suite has no such run) and on the patched one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchTestRuns {
+    #[serde(default)]
+    pub before: Option<PatchRatio>,
+    pub after: PatchRatio,
+}
+
+/// The proof-of-concept exploits of the advisories a patch fixes: how many
+/// reproduced on the unpatched release (absent when one has no such run),
+/// and how many the patch blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchExploitRuns {
+    #[serde(default)]
+    pub reproduced_before: Option<PatchRatio>,
+    pub blocked_after: PatchRatio,
+}
+
+/// What a patch costs at run time, each a relative change against the
+/// unpatched release (`0.05` is 5% more): wall time of the package's
+/// general workload and of the code the patch touches, and peak memory.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PatchPerformance {
+    pub general_wall_change: Option<f64>,
+    pub hot_wall_change: Option<f64>,
+    pub peak_mem_change: Option<f64>,
+}
+
+/// What Socket measured about one patch: the view endpoint's `statistics`.
+/// Every part is optional, since a patch is measured in stages (and an
+/// older patch may never have been), and each is read on its own
+/// ([`lenient`]): a part that does not read (a run with no result yet)
+/// is left out, and the others still show.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PatchStatistics {
+    #[serde(deserialize_with = "lenient_object")]
+    pub diff: Option<PatchDiffSize>,
+    #[serde(deserialize_with = "lenient")]
+    pub functions_changed: Option<u64>,
+    #[serde(deserialize_with = "lenient_object")]
+    pub tests: Option<PatchTestRuns>,
+    #[serde(deserialize_with = "lenient_object")]
+    pub pocs: Option<PatchExploitRuns>,
+    #[serde(deserialize_with = "lenient_object")]
+    pub performance: Option<PatchPerformance>,
+}
+
+/// The one field [`ApiClient::fetch_patch_statistics`] reads of a patch
+/// view.
+///
+/// [`ApiClient::fetch_patch_statistics`]: crate::api::client::ApiClient::fetch_patch_statistics
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct PatchStatisticsView {
+    #[serde(default, deserialize_with = "lenient_object")]
+    pub statistics: Option<PatchStatistics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,20 +306,22 @@ pub struct PackageVendorResult {
 /// One served artifact: the native tarball (`kind: "tarball"`), or a
 /// second artifact — npm's yarn-berry cache zip (`kind: "yarn-berry-zip"`),
 /// gem's path-source stub gemspec (`kind: "gem-stub-gemspec"`), or, per
-/// built prebuild of a gem patch, the patched platform gem (`kind:
-/// "gem-platform"`) and its stub gemspec (`kind:
-/// "gem-platform-stub-gemspec"`). `url` is null only when the artifact isn't
-/// stored yet (e.g. an unbuilt berry zip).
+/// platform a gem patch has a prebuild for, the patched platform gem
+/// (`kind: "gem-platform"`) and its stub gemspec
+/// (`kind: "gem-platform-stub-gemspec"`). `url` is null only when the
+/// artifact isn't stored yet (e.g. an unbuilt berry zip).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackageVendorArtifact {
     pub kind: String,
     #[serde(default)]
     pub url: Option<String>,
-    /// The gem platform (`x86_64-linux-gnu`, `arm64-darwin`) the artifact
-    /// is built for: present exactly on the two per-prebuild kinds. Nothing
-    /// is decided by it, so a value that is no string reads as absent
-    /// instead of failing the whole response.
+    /// The gem platform the artifact is for (`x86_64-linux-gnu`,
+    /// `arm64-darwin`, `java`: `Gem::Platform#to_s` as `Gemfile.lock`
+    /// spells it, never `ruby`). Present exactly on the two `gem-platform*`
+    /// kinds; a patch with no prebuild serves neither. A value that is no
+    /// string reads as absent instead of failing the whole response: that
+    /// artifact is then the prebuild of no platform.
     #[serde(default, deserialize_with = "lenient_string")]
     pub platform: Option<String>,
     /// Every ecosystem's tarball populates `sha512` (npm SRI form
@@ -224,6 +348,83 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view(statistics: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "uuid": "11111111-1111-4111-8111-111111111111",
+            "purl": "pkg:npm/a@1.0.0",
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": {},
+            "vulnerabilities": {},
+            "description": "",
+            "license": "MIT",
+            "tier": "free",
+            "statistics": statistics,
+        })
+    }
+
+    /// The measurements ride the patch view a download reads. Whatever
+    /// shape they come in, the view still reads: a part this build cannot
+    /// read is left out and the others are kept, and a `statistics` that
+    /// is not an object at all is no measurements.
+    #[test]
+    fn statistics_this_build_cannot_read_never_fail_the_patch_view() {
+        use serde_json::json;
+        let whole = json!({
+            "diff": { "linesAdded": 9, "linesRemoved": 2, "filesChanged": 2 },
+            "functionsChanged": 3,
+            "tests": { "before": { "count": 24, "total": 25 }, "after": { "count": 25, "total": 25 } },
+            "pocs": { "reproducedBefore": { "count": 1, "total": 1 }, "blockedAfter": { "count": 1, "total": 1 } },
+            "performance": { "hotWallChange": 0.036 },
+        });
+        let patch: PatchResponse = serde_json::from_value(view(whole)).unwrap();
+        let stats = patch.statistics.expect("measured");
+        assert_eq!(stats.diff.map(|d| d.lines_added), Some(9));
+        assert_eq!(stats.functions_changed, Some(3));
+        assert!(stats.tests.is_some_and(|t| t.after.is_all()));
+        assert!(stats.pocs.is_some_and(|p| p.blocked_after.is_all()));
+
+        // A patch measured in stages: runs with no result yet, a size
+        // missing a field, a count that is not a count.
+        let partial = json!({
+            "diff": { "linesAdded": 9, "linesRemoved": 2 },
+            "functionsChanged": -1,
+            "tests": { "before": { "count": 24, "total": 25 }, "after": null },
+            "pocs": { "reproducedBefore": { "count": 1, "total": 1 }, "blockedAfter": { "count": 1.5, "total": 1 } },
+            "performance": { "hotWallChange": 0.036 },
+            "somethingNew": [1, 2, 3],
+        });
+        let patch: PatchResponse = serde_json::from_value(view(partial)).unwrap();
+        let stats = patch.statistics.expect("the parts that read are kept");
+        assert_eq!(stats.diff, None);
+        assert_eq!(stats.functions_changed, None);
+        assert_eq!(stats.tests, None);
+        assert_eq!(stats.pocs, None);
+        assert_eq!(
+            stats.performance.and_then(|p| p.hot_wall_change),
+            Some(0.036)
+        );
+
+        for odd in [
+            json!(null),
+            json!("soon"),
+            json!([1, 2]),
+            json!(7),
+            json!({}),
+        ] {
+            let patch: PatchResponse = serde_json::from_value(view(odd.clone())).unwrap();
+            let expected = (odd == json!({})).then(PatchStatistics::default);
+            assert_eq!(patch.statistics, expected, "{odd}");
+            let only: PatchStatisticsView =
+                serde_json::from_value(json!({ "statistics": odd })).unwrap();
+            assert_eq!(only.statistics, expected);
+        }
+        // No `statistics` at all, as before this field existed.
+        let mut bare = view(json!(null));
+        bare.as_object_mut().unwrap().remove("statistics");
+        let patch: PatchResponse = serde_json::from_value(bare).unwrap();
+        assert_eq!(patch.statistics, None);
+    }
 
     // The structs are serde DTOs: these pin the JSON field-name contract by
     // deserializing payloads in the exact shape the live endpoints emit.
@@ -366,6 +567,47 @@ mod tests {
                     "title": "Patch one"
                 }]
             })
+        );
+    }
+
+    /// A gem patch with prebuilds serves, beside the ruby gem's `tarball`
+    /// and stub, one `gem-platform` gem and stub per built platform; the
+    /// artifacts every patch served before carry no `platform`.
+    #[test]
+    fn package_vendor_result_reads_the_gem_platform_artifacts() {
+        let json = r#"{
+            "status": "granted",
+            "purl": "pkg:gem/nokogiri@1.18.10?platform=ruby",
+            "url": "https://patch.example/nokogiri-1.18.10.gem",
+            "artifacts": [
+                { "kind": "tarball", "url": "https://patch.example/nokogiri-1.18.10.gem",
+                  "integrity": { "sha512": "sha512-ruby" } },
+                { "kind": "gem-platform", "platform": "x86_64-linux-gnu",
+                  "url": "https://patch.example/nokogiri-1.18.10-x86_64-linux-gnu.gem",
+                  "contentType": "application/octet-stream", "sizeBytes": 4000000,
+                  "integrity": { "sha512": "sha512-prebuild" } },
+                { "kind": "gem-platform-stub-gemspec", "platform": "x86_64-linux-gnu",
+                  "url": "https://patch.example/nokogiri-1.18.10-x86_64-linux-gnu.gemspec",
+                  "integrity": { "sha512": "sha512-stub" } }
+            ]
+        }"#;
+        let result: PackageVendorResult = serde_json::from_str(json).unwrap();
+        let artifacts = result.artifacts.unwrap();
+        let seen: Vec<(&str, Option<&str>)> = artifacts
+            .iter()
+            .map(|a| (a.kind.as_str(), a.platform.as_deref()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("tarball", None),
+                ("gem-platform", Some("x86_64-linux-gnu")),
+                ("gem-platform-stub-gemspec", Some("x86_64-linux-gnu")),
+            ]
+        );
+        assert_eq!(
+            artifacts[1].integrity.sha512.as_deref(),
+            Some("sha512-prebuild")
         );
     }
 

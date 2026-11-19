@@ -107,7 +107,7 @@ fn human_wet_reports_already_original_and_not_installed() {
         "already-original + not-installed exits 0; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains("Rolled back packages:")
+        stdout.contains("Rolled back 1 package:")
             && stdout.contains(&format!("  {purl} (already original)")),
         "the no-op must print its '(already original)' line; stdout=\n{stdout}"
     );

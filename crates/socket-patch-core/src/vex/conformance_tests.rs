@@ -738,8 +738,16 @@ fn affected_doc(patched: bool) -> Document {
     };
     let action = "Run `socket-patch scan --mode hosted`.".to_string();
     let affected = [("pkg:npm/lodash@4.17.20".to_string(), action)];
-    build_document_with_affected(&manifest, applied, &[], &[], &[], &affected, &options())
-        .expect("build affected doc")
+    build_document_with(
+        &manifest,
+        &Attested {
+            applied,
+            affected: &affected,
+            ..Attested::default()
+        },
+        &options(),
+    )
+    .expect("build affected doc")
 }
 
 #[test]

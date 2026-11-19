@@ -243,6 +243,31 @@ impl Mvn {
             .expect("spawn mvn")
     }
 
+    /// `mvn -B <args>` in `cwd` with no local repository on the command
+    /// line: the project's `.mvn/maven.config` and the environment
+    /// `configure` sets decide it, as in a developer's own run. `configure`
+    /// must keep the run out of the real `~/.m2` (a `-Duser.home` in
+    /// `MAVEN_OPTS`).
+    pub fn run_unpinned(
+        &self,
+        cwd: &Path,
+        settings: &Path,
+        args: &[&str],
+        configure: impl FnOnce(&mut Command),
+    ) -> Output {
+        let mut cmd = mvn_command(&self.program);
+        configure(&mut cmd);
+        cmd.current_dir(cwd)
+            .arg("-B")
+            .arg("-s")
+            .arg(settings)
+            .arg("-Dstyle.color=never")
+            .arg("-Dmaven.test.skip=true")
+            .args(args)
+            .output()
+            .expect("spawn mvn")
+    }
+
     /// Resolve the project's dependencies into `<cwd>/<out_rel>` (the
     /// consumption proof: what Maven fetched is what the build links).
     pub fn copy_dependencies(

@@ -218,8 +218,11 @@ const MAX_WALKED_ENTRIES: usize = 500_000;
 /// read. A marker that is itself a symlink still counts, as it does for
 /// the root the user names.
 fn marker_paths_below(dir: &std::path::Path) -> (Vec<String>, bool) {
-    let walk = ignore::WalkBuilder::new(dir)
-        .hidden(false)
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let mut walk = ignore::WalkBuilder::new(dir);
+    walk.hidden(false)
         .ignore(false)
         .follow_links(false)
         .filter_entry(|entry| {
@@ -233,33 +236,56 @@ fn marker_paths_below(dir: &std::path::Path) -> (Vec<String>, bool) {
             let other_repository =
                 entry.depth() > 0 && entry.path().join(".git").symlink_metadata().is_ok();
             !excluded && !other_repository
+        });
+    // The walk is a hosted or vendored scan's first wait in a large
+    // checkout (it looks for its project directories before anything
+    // else), and it is all directory reads: they run on as many threads as
+    // the crawl's walk does (one where file descriptors are scarce).
+    walk.threads(crate::crawlers::walk_pool::threads());
+    let seen = AtomicUsize::new(0);
+    let truncated = AtomicBool::new(false);
+    let markers: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    walk.build_parallel().run(|| {
+        Box::new(|entry| {
+            let Ok(entry) = entry else {
+                return ignore::WalkState::Continue;
+            };
+            if seen.fetch_add(1, Ordering::Relaxed) >= MAX_WALKED_ENTRIES {
+                truncated.store(true, Ordering::Relaxed);
+                return ignore::WalkState::Quit;
+            }
+            if entry.file_type().is_none_or(|t| t.is_dir()) {
+                return ignore::WalkState::Continue;
+            }
+            let is_marker = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|base| marker_ecosystem(base).is_some());
+            if !is_marker {
+                return ignore::WalkState::Continue;
+            }
+            let Ok(rel) = entry.path().strip_prefix(dir) else {
+                return ignore::WalkState::Continue;
+            };
+            // A path that is not UTF-8 names no root a `/`-joined list can
+            // hold.
+            let segments: Option<Vec<&str>> = rel.iter().map(|segment| segment.to_str()).collect();
+            if let Some(segments) = segments {
+                markers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(segments.join("/"));
+            }
+            ignore::WalkState::Continue
         })
-        .build();
-    let mut markers: Vec<String> = Vec::new();
-    for (seen, entry) in walk.flatten().enumerate() {
-        if seen >= MAX_WALKED_ENTRIES {
-            return (markers, true);
-        }
-        if entry.file_type().is_none_or(|t| t.is_dir()) {
-            continue;
-        }
-        let is_marker = entry
-            .file_name()
-            .to_str()
-            .is_some_and(|base| marker_ecosystem(base).is_some());
-        if !is_marker {
-            continue;
-        }
-        let Ok(rel) = entry.path().strip_prefix(dir) else {
-            continue;
-        };
-        // A path that is not UTF-8 names no root a `/`-joined list can hold.
-        let segments: Option<Vec<&str>> = rel.iter().map(|segment| segment.to_str()).collect();
-        if let Some(segments) = segments {
-            markers.push(segments.join("/"));
-        }
-    }
-    (markers, false)
+    });
+    let mut markers = markers
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The threads finish in no particular order; the list is the same
+    // whatever it was.
+    markers.sort();
+    (markers, truncated.load(Ordering::Relaxed))
 }
 
 /// The project roots at and below `dir` on disk, so a disk scan and the

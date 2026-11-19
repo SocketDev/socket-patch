@@ -129,6 +129,24 @@ pub async fn find_cargo_copies(
     found
 }
 
+/// Every installed purl a package-name `target` selects, deduplicated and
+/// sorted (a monorepo can hold the same release in several places).
+/// `packages` is a crawl's result. Shared by the commands that take a
+/// package name and look it up among what is installed (`get`, `show`).
+pub(crate) fn installed_target_matches(
+    target: &socket_patch_core::utils::target::Target,
+    packages: &[socket_patch_core::crawlers::CrawledPackage],
+) -> Vec<String> {
+    let mut purls: Vec<String> = packages
+        .iter()
+        .filter(|pkg| target.matches_package(&pkg.purl))
+        .map(|pkg| pkg.purl.clone())
+        .collect();
+    purls.sort();
+    purls.dedup();
+    purls
+}
+
 /// Partition PURLs by ecosystem, filtering by the `--ecosystems` flag if set.
 pub fn partition_purls(
     purls: &[String],
@@ -1074,8 +1092,13 @@ pub struct NpmCrawlSnapshot {
 }
 
 impl NpmCrawlSnapshot {
+    /// The `node_modules` roots the crawl walked.
+    pub(crate) fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
     /// Whether this snapshot was crawled with exactly `options`.
-    fn taken_with(&self, options: &CrawlerOptions) -> bool {
+    pub(crate) fn taken_with(&self, options: &CrawlerOptions) -> bool {
         // Destructured, not field-by-field: a new crawler option that
         // changes what the crawler walks has to be answered here, and the
         // compiler is what asks. Everything this snapshot stands in for
@@ -1368,14 +1391,15 @@ impl JvmScope {
     pub(crate) async fn of(common: &GlobalArgs) -> Self {
         use socket_patch_core::crawlers::gradle_cache;
         use socket_patch_core::crawlers::maven_crawler::{m2_gate, JvmEnv};
-        let env = JvmEnv::from_process();
         if common.is_global() {
             return Self {
-                env,
+                env: JvmEnv::from_process(),
                 gate: None,
                 verification_metadata: None,
             };
         }
+        // A project run: its `.mvn/maven.config` can name the repository.
+        let env = JvmEnv::for_project(&common.cwd);
         let cwd = common.cwd.clone();
         let probe_env = env.clone();
         let probe = move || {
@@ -1471,6 +1495,26 @@ pub async fn crawl_ecosystems(
 ) {
     let (packages, counts, skipped_config_path, _) = crawl_every_ecosystem(options, only).await;
     (packages, counts, skipped_config_path)
+}
+
+/// [`crawl_ecosystems`], also handing back the `node_modules` roots the
+/// npm crawl walked (exactly [`NpmCrawler::get_node_modules_paths`]'s
+/// answer for the same options and tree), so a caller that needs them
+/// right after the crawl does not walk the tree a second time. `None` when
+/// `only` leaves npm out.
+pub(crate) async fn crawl_ecosystems_with_npm_roots(
+    options: &CrawlerOptions,
+    only: Option<&[String]>,
+) -> (
+    Vec<CrawledPackage>,
+    HashMap<Ecosystem, usize>,
+    Option<String>,
+    Option<Vec<PathBuf>>,
+) {
+    let (packages, counts, skipped_config_path, npm_roots) =
+        crawl_every_ecosystem(options, only).await;
+    let npm_roots = counts.contains_key(&Ecosystem::Npm).then_some(npm_roots);
+    (packages, counts, skipped_config_path, npm_roots)
 }
 
 /// [`crawl_ecosystems`], also handing back the npm half of the crawl as

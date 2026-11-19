@@ -114,15 +114,22 @@ pub(crate) const REDIRECT_UNWIRED: &str = "redirect_unwired";
 /// candidate for that package attests.
 pub(crate) const WIRING_CONFLICT: &str = "wiring_conflict";
 
-/// Ceiling on concurrent patch-view fetches (one GET per uuid; the view
-/// carries blob content, so it is heavy).
+/// Ceiling on concurrent patch-view fetches from the public proxy (one
+/// GET per uuid; its view carries blob content, so it is heavy). The
+/// authenticated API is asked for the view without that content, which
+/// the record does not use, so there the patch API's own window applies.
 const FETCH_CONCURRENCY: usize = 10;
 
 /// The in-flight cap for the record fetch: `SOCKET_API_CONCURRENCY` applies
 /// here like every other patch-API window, with [`FETCH_CONCURRENCY`] as
 /// this window's own ceiling on top (a view is heavy).
 fn fetch_concurrency(use_public_proxy: bool) -> usize {
-    api_concurrency(use_public_proxy).min(FETCH_CONCURRENCY)
+    let window = api_concurrency(use_public_proxy);
+    if use_public_proxy {
+        window.min(FETCH_CONCURRENCY)
+    } else {
+        window
+    }
 }
 
 /// Everything `vex` reads, loaded once by the caller (which owns the
@@ -1326,17 +1333,25 @@ async fn fetch_records(
             let mut views = std::pin::pin!(ordered_concurrent(
                 pending.iter(),
                 fetch_concurrency(use_public_proxy),
-                |uuid| async move { (uuid, hold_back_debug(client.fetch_patch(uuid)).await) },
+                // The record is built from the view's hashes and
+                // advisories: its file contents are never read here.
+                |uuid| async move {
+                    (
+                        uuid,
+                        hold_back_debug(client.fetch_patch_summary(uuid)).await,
+                    )
+                },
             ));
             loop {
-                status.set(format!(
-                    "Fetching {}... ({done}/{total})",
+                status.progress(
                     if total == 1 {
-                        "the patch record"
+                        "Reading the patch record"
                     } else {
-                        "patch records"
-                    }
-                ));
+                        "Reading patch records"
+                    },
+                    done,
+                    total,
+                );
                 let Some((uuid, result)) = views.next().await else {
                     break;
                 };
@@ -1453,18 +1468,24 @@ mod tests {
         use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
         let orig = std::env::var(API_CONCURRENCY_ENV).ok();
         std::env::remove_var(API_CONCURRENCY_ENV);
-        // A view is heavy, so this window's own ceiling binds by default
-        // on the authenticated API (whose cap is above it).
-        assert_eq!(fetch_concurrency(false), FETCH_CONCURRENCY);
+        // The authenticated API serves the view without its file contents,
+        // so the patch API's own window applies there.
+        assert_eq!(fetch_concurrency(false), api_concurrency(false));
+        assert!(fetch_concurrency(false) > FETCH_CONCURRENCY);
         assert_eq!(fetch_concurrency(true), 4);
 
         std::env::set_var(API_CONCURRENCY_ENV, "1");
         assert_eq!(fetch_concurrency(false), 1);
         assert_eq!(fetch_concurrency(true), 1);
 
-        // Turned up past this window's own ceiling, the ceiling holds.
+        // The proxy's view is heavy: its window never passes this one's
+        // own ceiling, however far the setting is turned up.
         std::env::set_var(API_CONCURRENCY_ENV, "32");
-        assert_eq!(fetch_concurrency(false), FETCH_CONCURRENCY);
+        assert_eq!(
+            fetch_concurrency(true),
+            api_concurrency(true).min(FETCH_CONCURRENCY)
+        );
+        assert_eq!(fetch_concurrency(false), 32);
 
         match orig {
             Some(v) => std::env::set_var(API_CONCURRENCY_ENV, v),

@@ -953,6 +953,15 @@ impl Cell {
         self.bazel_with("update", command, args)
     }
 
+    /// [`Cell::bazel`] with variables of the one command: the `REPIN=1` of
+    /// a ruleset's relock. Bazel's client hands its environment to the
+    /// repository rules and to what `bazel run` starts.
+    pub fn bazel_env(&self, command: &str, args: &[&str], env: &[(&str, &str)]) -> Run {
+        let mut cmd = self.command("update", command, args);
+        cmd.envs(env.iter().copied());
+        Run::of(cmd).unwrap_or_else(|why| panic!("{}: {why}", self.test))
+    }
+
     /// `bazel build --lockfile_mode=error <targets>`: passes only when
     /// `MODULE.bazel.lock` already holds what the build resolves.
     fn frozen_build(&self, targets: &[&str]) -> Run {

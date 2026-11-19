@@ -374,6 +374,83 @@ pub struct ApiClient {
     /// the policy, the run-wide retry window (shared by clones, and by
     /// every default client in the process) and the clock hooks.
     api_retry: ApiRetry,
+    /// The lookups this client has answered, when it remembers them
+    /// ([`Self::remembering_lookups`]). Shared by clones.
+    lookups: Option<Arc<Lookups>>,
+}
+
+/// What the patch service answered a client that remembers its lookups
+/// ([`ApiClient::remembering_lookups`]): the batch search, per purl, and
+/// the per-package search. A run over several project directories asks
+/// about the same packages again and again, and asks about all of them up
+/// front; the later, identical questions are answered from here.
+///
+/// Only answers are kept, never failures, and an answer is reused only
+/// for exactly the purl string it was given for: a question any part of
+/// which is not held is sent whole, as if nothing were.
+#[derive(Default)]
+struct Lookups {
+    /// Per purl of an answered batch search: the package's patches (`None`
+    /// when it has none) and the response's `can_access_paid_patches`.
+    batch: std::sync::Mutex<std::collections::HashMap<String, (Option<BatchPackagePatches>, bool)>>,
+    by_package: std::sync::Mutex<std::collections::HashMap<String, SearchResponse>>,
+}
+
+impl Lookups {
+    /// The answer to a batch search of `purls`, when every one of them
+    /// has been answered before: their packages in the order asked.
+    fn batch(&self, purls: &[String]) -> Option<BatchSearchResponse> {
+        let held = self.batch.lock().unwrap_or_else(|e| e.into_inner());
+        let mut packages = Vec::new();
+        let mut can_access_paid_patches = false;
+        let mut seen = HashSet::new();
+        for purl in purls {
+            let (package, paid) = held.get(purl)?;
+            can_access_paid_patches |= paid;
+            if let Some(package) = package {
+                if seen.insert(purl.as_str()) {
+                    packages.push(package.clone());
+                }
+            }
+        }
+        Some(BatchSearchResponse {
+            packages,
+            can_access_paid_patches,
+            unanswered: Vec::new(),
+        })
+    }
+
+    /// Keep the answer to a batch search of `purls`. Nothing is kept of a
+    /// response that names a package by a spelling other than the one it
+    /// was asked with (which answer belongs to which question is then a
+    /// guess), and nothing for a purl the service gave no answer for.
+    fn remember_batch(&self, purls: &[String], response: &BatchSearchResponse) {
+        let asked: HashSet<&str> = purls.iter().map(String::as_str).collect();
+        if response
+            .packages
+            .iter()
+            .any(|package| !asked.contains(package.purl.as_str()))
+        {
+            return;
+        }
+        let unanswered: HashSet<&str> = response
+            .unanswered
+            .iter()
+            .map(|u| u.purl.as_str())
+            .collect();
+        let mut held = self.batch.lock().unwrap_or_else(|e| e.into_inner());
+        for purl in purls {
+            if unanswered.contains(purl.as_str()) {
+                continue;
+            }
+            let package = response
+                .packages
+                .iter()
+                .find(|package| package.purl == *purl)
+                .cloned();
+            held.insert(purl.clone(), (package, response.can_access_paid_patches));
+        }
+    }
 }
 
 /// A JSON request's answer after [`ApiClient::send_json_request`]'s retry
@@ -555,7 +632,20 @@ impl ApiClient {
             service_confirmed: Arc::new(AtomicBool::new(false)),
             vendor_prefetch: Arc::new(std::sync::Mutex::new(None)),
             api_retry: ApiRetry::from_env(),
+            lookups: None,
         }
+    }
+
+    /// This client, remembering what the patch service answers its batch
+    /// and per-package searches: a later search it has the whole answer
+    /// to makes no request (see [`Lookups`]). For a run that asks about
+    /// the same packages more than once, in one process, over seconds; a
+    /// client is otherwise forgetful, so every search is a request. The
+    /// memory is this client's and its clones': a client built for another
+    /// route (the public-proxy fallback) starts without one.
+    pub fn remembering_lookups(mut self) -> Self {
+        self.lookups.get_or_insert_with(Default::default);
+        self
     }
 
     /// Override the JSON calls' 429 / 503 retry policy and clock hooks
@@ -948,6 +1038,59 @@ impl ApiClient {
         self.get_json(&path, Bare404::NotFound).await
     }
 
+    /// [`Self::fetch_patch`] with each changed file's content before the
+    /// patch as well (`beforeBlobContent`), for showing what the patch
+    /// changes. The public proxy serves one cached view per patch whatever
+    /// the query, so its files come back without it: read those by
+    /// `beforeHash` ([`Self::fetch_blob`]).
+    pub async fn fetch_patch_with_sources(
+        &self,
+        uuid: &str,
+    ) -> Result<Option<PatchResponse>, ApiError> {
+        let query = match &self.route {
+            ApiRoute::Org { .. } => "?include_before_blobs=true",
+            ApiRoute::Proxy => "",
+        };
+        let path = self.patches_path(&format!("view/{uuid}{query}"));
+        self.get_json(&path, Bare404::NotFound).await
+    }
+
+    /// Patch `uuid` without its file contents: what it fixes, when it was
+    /// published and what was measured about it, for a listing that names
+    /// many patches. The authenticated API leaves the contents out on
+    /// request; the public proxy serves one cached view per patch whatever
+    /// the query, so there this is the plain view. `Ok(None)` for a patch
+    /// that is not there.
+    pub async fn fetch_patch_summary(&self, uuid: &str) -> Result<Option<PatchResponse>, ApiError> {
+        let query = match &self.route {
+            ApiRoute::Org { .. } => "?include_blobs=false",
+            ApiRoute::Proxy => "",
+        };
+        let path = self.patches_path(&format!("view/{uuid}{query}"));
+        self.get_json(&path, Bare404::NotFound).await
+    }
+
+    /// What Socket measured about patch `uuid` (see [`PatchStatistics`]):
+    /// its view without the file contents, which the authenticated API
+    /// leaves out on request. `Ok(None)` for a patch that is not there or
+    /// has not been measured.
+    ///
+    /// The public proxy serves one cached view per patch whatever the
+    /// query, so there the plain view is asked for: the same response a
+    /// download of the patch reads.
+    pub async fn fetch_patch_statistics(
+        &self,
+        uuid: &str,
+    ) -> Result<Option<PatchStatistics>, ApiError> {
+        let query = match &self.route {
+            ApiRoute::Org { .. } => "?include_blobs=false",
+            ApiRoute::Proxy => "",
+        };
+        let path = self.patches_path(&format!("view/{uuid}{query}"));
+        let view: Option<PatchStatisticsView> = self.get_json(&path, Bare404::NotFound).await?;
+        Ok(view.and_then(|view| view.statistics))
+    }
+
     /// Shared implementation for `search_patches_by_{cve,ghsa,package}`.
     /// `route` is the `by-<x>` URL segment — the rest of the path layout
     /// is identical across the three endpoints.
@@ -1005,8 +1148,23 @@ impl ApiClient {
     /// The PURL must be a valid Package URL starting with `pkg:`.
     /// Examples: `pkg:npm/lodash@4.17.21`, `pkg:pypi/django@3.2.0`
     pub async fn search_patches_by_package(&self, purl: &str) -> Result<SearchResponse, ApiError> {
-        self.search_patches_by_route("by-package", purl, self.search_bare_404())
-            .await
+        if let Some(lookups) = &self.lookups {
+            let held = lookups.by_package.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(answer) = held.get(purl) {
+                return Ok(answer.clone());
+            }
+        }
+        let answer = self
+            .search_patches_by_route("by-package", purl, self.search_bare_404())
+            .await?;
+        if let Some(lookups) = &self.lookups {
+            lookups
+                .by_package
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(purl.to_string(), answer.clone());
+        }
+        Ok(answer)
     }
 
     /// Search patches for multiple packages (batch).
@@ -1029,6 +1187,21 @@ impl ApiClient {
     /// Every return path is normalized through [`sort_batch_response`], so
     /// callers may rely on each package's `patches` being best-first.
     pub async fn search_patches_batch(
+        &self,
+        purls: &[String],
+    ) -> Result<BatchSearchResponse, ApiError> {
+        if let Some(answer) = self.lookups.as_ref().and_then(|l| l.batch(purls)) {
+            return Ok(answer);
+        }
+        let answer = self.search_patches_batch_asking(purls).await?;
+        if let Some(lookups) = &self.lookups {
+            lookups.remember_batch(purls, &answer);
+        }
+        Ok(answer)
+    }
+
+    /// [`Self::search_patches_batch`], always by asking the service.
+    async fn search_patches_batch_asking(
         &self,
         purls: &[String],
     ) -> Result<BatchSearchResponse, ApiError> {
@@ -1445,23 +1618,8 @@ impl ApiClient {
         vendor_url: Option<&str>,
         patch_server_url: Option<&str>,
     ) -> VendorServiceOutcome {
-        if !is_uuid_shaped(uuid) {
-            return VendorServiceOutcome::Failed(ApiError::InvalidHash(format!(
-                "Invalid patch UUID: {uuid}"
-            )));
-        }
-        // Circuit breaker: after consecutive retryable failures the service
-        // is down for this run — skip it without any I/O instead of paying
-        // every package's retries (and mixing sources package by package).
-        let failures = self.vendor_outage.load(Ordering::Relaxed);
-        if failures >= VENDOR_BREAKER_THRESHOLD {
-            // Worded to read inside the callers' "patch service request
-            // failed (...)" wrapper: no request was made, and the skip is
-            // scoped to this run.
-            return VendorServiceOutcome::Failed(ApiError::Other(format!(
-                "not attempted: the service failed for the previous {failures} packages in \
-                 this run"
-            )));
+        if let Some(refused) = self.vendor_request_refused(uuid) {
+            return VendorServiceOutcome::Failed(refused);
         }
         // A download the attached plan already fetched stands in for the
         // live requests; everything around it (the breaker check above, the
@@ -1485,7 +1643,35 @@ impl ApiClient {
                     .await
             }
         };
-        match &outcome {
+        self.note_vendor_outcome(&outcome, retryable_failure);
+        outcome
+    }
+
+    /// Why a vendor-service call for `uuid` is answered without any I/O, if
+    /// it is: a malformed uuid, or the run-level circuit breaker — after
+    /// consecutive retryable failures the service is down for this run, so
+    /// it is skipped instead of paying every package's retries (and mixing
+    /// sources package by package).
+    fn vendor_request_refused(&self, uuid: &str) -> Option<ApiError> {
+        if !is_uuid_shaped(uuid) {
+            return Some(ApiError::InvalidHash(format!("Invalid patch UUID: {uuid}")));
+        }
+        let failures = self.vendor_outage.load(Ordering::Relaxed);
+        // Worded to read inside the callers' "patch service request failed
+        // (...)" wrapper: no request was made, and the skip is scoped to
+        // this run.
+        (failures >= VENDOR_BREAKER_THRESHOLD).then(|| {
+            ApiError::Other(format!(
+                "not attempted: the service failed for the previous {failures} packages in \
+                 this run"
+            ))
+        })
+    }
+
+    /// Fold one vendor-service outcome into the circuit breaker's count of
+    /// consecutive retryable failures.
+    fn note_vendor_outcome<T>(&self, outcome: &VendorServiceOutcome<T>, retryable_failure: bool) {
+        match outcome {
             VendorServiceOutcome::Failed(_) if retryable_failure => {
                 self.vendor_outage.fetch_add(1, Ordering::Relaxed);
             }
@@ -1494,6 +1680,41 @@ impl ApiClient {
             VendorServiceOutcome::Failed(_) => {}
             _ => self.vendor_outage.store(0, Ordering::Relaxed),
         }
+    }
+
+    /// Step 1 of [`Self::fetch_vendor_package`] on its own: what the
+    /// service lists for the patch besides its archive (the per-platform
+    /// gem prebuilds and their stub gemspecs), each with its host-rewritten
+    /// URL and sha512, and NO archive download. A backend that takes only
+    /// those artifacts learns here which exist. Same grant, statuses, retry
+    /// ladder and circuit breaker as the full fetch; a uuid the attached
+    /// plan names is answered from its reference batch.
+    pub(crate) async fn fetch_vendor_reference(
+        &self,
+        uuid: &str,
+        free_only: bool,
+        vendor_url: Option<&str>,
+        patch_server_url: Option<&str>,
+    ) -> VendorServiceOutcome<Vec<SecondaryArtifact>> {
+        if let Some(refused) = self.vendor_request_refused(uuid) {
+            return VendorServiceOutcome::Failed(refused);
+        }
+        let (outcome, retryable_failure) = match self
+            .request_vendor_package(uuid, free_only, vendor_url)
+            .await
+        {
+            Ok(result) => (
+                reference_miss(&result.status).unwrap_or_else(|| {
+                    VendorServiceOutcome::Ready(served_secondary_artifacts(
+                        &result,
+                        patch_server_url,
+                    ))
+                }),
+                false,
+            ),
+            Err((e, retryable)) => (VendorServiceOutcome::Failed(e), retryable),
+        };
+        self.note_vendor_outcome(&outcome, retryable_failure);
         outcome
     }
 
@@ -1583,22 +1804,8 @@ impl ApiClient {
             Err((e, retryable)) => return (VendorServiceOutcome::Failed(e), retryable),
         };
         // Classify the build/grant status before attempting any download.
-        match result.status.as_str() {
-            "granted" | "reused" => {}
-            "pending_build" => return done(VendorServiceOutcome::Pending),
-            "build_failed" | "withdrawn" | "not_found" => {
-                return done(VendorServiceOutcome::Unavailable(result.status.clone()))
-            }
-            "forbidden" => {
-                return done(VendorServiceOutcome::Failed(ApiError::Forbidden(
-                    "Forbidden: not entitled to this patch (paid tier or no org access).".into(),
-                )))
-            }
-            other => {
-                return done(VendorServiceOutcome::Unavailable(format!(
-                    "unknown status `{other}`"
-                )))
-            }
+        if let Some(miss) = reference_miss(&result.status) {
+            return done(miss);
         }
 
         // Select the native tarball artifact and its sha512 (the universal
@@ -1642,35 +1849,7 @@ impl ApiClient {
             return done(VendorServiceOutcome::Unavailable(PYPI_NOT_A_WHEEL.into()));
         }
 
-        // Surface the OTHER served artifacts (e.g. the gem path-source stub
-        // gemspec) — their host-rewritten URL + normalized sha512 — so a
-        // backend that needs one can download + verify it lazily. Each is
-        // skipped unless it carries both a url and a sha512.
-        let mut secondary_artifacts: Vec<SecondaryArtifact> = Vec::new();
-        if let Some(arts) = result.artifacts.as_ref() {
-            for a in arts {
-                if a.kind == "tarball" {
-                    continue;
-                }
-                let (Some(url), Some(sha512)) = (a.url.as_deref(), a.integrity.sha512.as_deref())
-                else {
-                    continue;
-                };
-                let url = match patch_server_url {
-                    Some(base) => match rewrite_url_host(url, base) {
-                        Ok(u) => u,
-                        Err(_) => continue,
-                    },
-                    None => url.to_string(),
-                };
-                secondary_artifacts.push(SecondaryArtifact {
-                    kind: a.kind.clone(),
-                    url,
-                    integrity_sri: normalize_sha512_sri(sha512),
-                    prefetched: None,
-                });
-            }
-        }
+        let secondary_artifacts = served_secondary_artifacts(&result, patch_server_url);
 
         // ── Step 2: download the prebuilt archive ──────────────────────────
         let downloaded = self.download_vendor_archive(&download_url, None).await;
@@ -2127,6 +2306,9 @@ pub(crate) struct FetchedVendorPackage {
 #[derive(Debug, Clone)]
 pub(crate) struct SecondaryArtifact {
     pub kind: String,
+    /// The gem platform a `gem-platform` / `gem-platform-stub-gemspec`
+    /// artifact is for; `None` on every other kind.
+    pub platform: Option<String>,
     pub url: String,
     /// Normalized `sha512-<b64>` of the artifact bytes.
     pub integrity_sri: String,
@@ -2191,15 +2373,17 @@ impl std::fmt::Debug for PrefetchedSecondary {
     }
 }
 
-/// Outcome of [`ApiClient::fetch_vendor_package`].
+/// Outcome of [`ApiClient::fetch_vendor_package`], and, with the served
+/// artifact list in place of the archive, of
+/// [`ApiClient::fetch_vendor_reference`].
 ///
 /// The vendor backends map these onto the `auto`/`service`/`build` policy:
 /// `Ready` → use the service archive; `Pending`/`Unavailable`/`Failed` → fall
 /// back to a local build under `auto`, or hard-fail under `service`.
 #[derive(Debug)]
-pub(crate) enum VendorServiceOutcome {
+pub(crate) enum VendorServiceOutcome<T = FetchedVendorPackage> {
     /// Archive downloaded; integrity carried for the caller to verify.
-    Ready(FetchedVendorPackage),
+    Ready(T),
     /// The archive is still building (`pending_build` status or serve 408) —
     /// retryable.
     Pending,
@@ -2208,6 +2392,59 @@ pub(crate) enum VendorServiceOutcome {
     Unavailable(String),
     /// A request/transport/auth failure (401/403 grant, 5xx, network, malformed).
     Failed(ApiError),
+}
+
+/// What a package reference's build/grant `status` settles on its own,
+/// before any download: `None` for a granted one.
+fn reference_miss<T>(status: &str) -> Option<VendorServiceOutcome<T>> {
+    match status {
+        "granted" | "reused" => None,
+        "pending_build" => Some(VendorServiceOutcome::Pending),
+        "build_failed" | "withdrawn" | "not_found" => {
+            Some(VendorServiceOutcome::Unavailable(status.to_string()))
+        }
+        "forbidden" => Some(VendorServiceOutcome::Failed(ApiError::Forbidden(
+            "Forbidden: not entitled to this patch (paid tier or no org access).".into(),
+        ))),
+        other => Some(VendorServiceOutcome::Unavailable(format!(
+            "unknown status `{other}`"
+        ))),
+    }
+}
+
+/// The served artifacts of a granted reference OTHER than the archive (the
+/// gem path-source stub gemspec, the per-platform gem prebuilds, …) — their
+/// host-rewritten URL + normalized sha512 — so a backend that needs one can
+/// download + verify it lazily. Each is skipped unless it carries both a
+/// url and a sha512.
+fn served_secondary_artifacts(
+    result: &PackageVendorResult,
+    patch_server_url: Option<&str>,
+) -> Vec<SecondaryArtifact> {
+    let mut secondary_artifacts: Vec<SecondaryArtifact> = Vec::new();
+    for a in result.artifacts.iter().flatten() {
+        if a.kind == "tarball" {
+            continue;
+        }
+        let (Some(url), Some(sha512)) = (a.url.as_deref(), a.integrity.sha512.as_deref()) else {
+            continue;
+        };
+        let url = match patch_server_url {
+            Some(base) => match rewrite_url_host(url, base) {
+                Ok(u) => u,
+                Err(_) => continue,
+            },
+            None => url.to_string(),
+        };
+        secondary_artifacts.push(SecondaryArtifact {
+            kind: a.kind.clone(),
+            platform: a.platform.clone(),
+            url,
+            integrity_sri: normalize_sha512_sri(sha512),
+            prefetched: None,
+        });
+    }
+    secondary_artifacts
 }
 
 /// A serve GET's answer short of a failure.
@@ -6401,6 +6638,216 @@ mod authenticated_batch_tests {
             .expect("200 with empty packages is the legitimate no-patches shape");
         assert!(result.packages.is_empty());
         assert!(result.can_access_paid_patches);
+    }
+}
+
+#[cfg(test)]
+mod lookup_memory_tests {
+    //! A client that remembers its lookups answers a search it has the
+    //! whole answer to without a request, and asks for everything else as
+    //! if it remembered nothing.
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    fn org_client(uri: String) -> ApiClient {
+        ApiClient::new(ApiClientOptions {
+            api_url: uri,
+            api_token: Some("sktsec_token_placeholder_value_api".into()),
+            route: ApiRoute::org("acme"),
+        })
+    }
+
+    fn purls(names: &[&str]) -> Vec<String> {
+        names
+            .iter()
+            .map(|name| format!("pkg:npm/{name}@1.0.0"))
+            .collect()
+    }
+
+    /// A batch endpoint that reports one patch for every asked purl whose
+    /// name starts with `patched`, spelled as it was asked.
+    async fn batch_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/batch"))
+            .respond_with(|request: &Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                let packages: Vec<serde_json::Value> = body["components"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|c| c["purl"].as_str())
+                    .filter(|purl| purl.contains("/patched"))
+                    .map(|purl| {
+                        json!({ "purl": purl, "patches": [{
+                            "uuid": "11111111-2222-4333-8444-555555555555",
+                            "purl": purl,
+                            "tier": "free",
+                            "cveIds": ["CVE-2026-0001"],
+                            "ghsaIds": [],
+                            "severity": "high",
+                            "title": "A patch",
+                        }]})
+                    })
+                    .collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "packages": packages, "canAccessPaidPatches": true }))
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn requests(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap_or_default().len()
+    }
+
+    #[tokio::test]
+    async fn a_batch_search_it_has_the_whole_answer_to_makes_no_request() {
+        let server = batch_server().await;
+        let client = org_client(server.uri()).remembering_lookups();
+        let first = purls(&["plain-a", "patched-b", "plain-c", "patched-d"]);
+        let answer = client.search_patches_batch(&first).await.unwrap();
+        assert_eq!(answer.packages.len(), 2);
+        assert_eq!(requests(&server).await, 1);
+
+        // The same question, a part of it, and its purls in another order:
+        // answered from memory, packages in the order asked, with the
+        // response's paid flag. A clone shares the memory.
+        for asked in [
+            first.clone(),
+            purls(&["patched-d", "plain-a"]),
+            purls(&["patched-d", "patched-b", "patched-d"]),
+        ] {
+            let again = client.clone().search_patches_batch(&asked).await.unwrap();
+            let expected: Vec<&String> = {
+                let mut seen = HashSet::new();
+                asked
+                    .iter()
+                    .filter(|purl| purl.contains("/patched") && seen.insert(purl.as_str()))
+                    .collect()
+            };
+            assert_eq!(
+                again.packages.iter().map(|p| &p.purl).collect::<Vec<_>>(),
+                expected
+            );
+            assert!(again.can_access_paid_patches);
+            assert!(again.unanswered.is_empty());
+        }
+        assert_eq!(requests(&server).await, 1, "nothing was asked again");
+
+        // A question with a purl it has no answer for is sent whole.
+        let wider = purls(&["plain-a", "patched-new"]);
+        let answer = client.search_patches_batch(&wider).await.unwrap();
+        assert_eq!(answer.packages.len(), 1);
+        assert_eq!(requests(&server).await, 2);
+        let sent = server.received_requests().await.unwrap();
+        let body: serde_json::Value = sent[1].body_json().unwrap();
+        assert_eq!(body["components"].as_array().unwrap().len(), 2);
+        // And is then remembered too.
+        client.search_patches_batch(&wider).await.unwrap();
+        assert_eq!(requests(&server).await, 2);
+    }
+
+    /// A client is forgetful unless told otherwise: every search is a
+    /// request, as it always was.
+    #[tokio::test]
+    async fn a_plain_client_asks_every_time() {
+        let server = batch_server().await;
+        let client = org_client(server.uri());
+        let asked = purls(&["patched-a"]);
+        client.search_patches_batch(&asked).await.unwrap();
+        client.search_patches_batch(&asked).await.unwrap();
+        assert_eq!(requests(&server).await, 2);
+    }
+
+    /// An answer is kept only for exactly the purl it was given for. A
+    /// response that names a package by another spelling than it was
+    /// asked with keeps nothing: which answer is which question's would be
+    /// a guess.
+    #[tokio::test]
+    async fn a_response_in_another_spelling_is_not_remembered() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/batch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "packages": [{ "purl": "pkg:npm/@scope/name@1.0.0", "patches": [] }],
+                "canAccessPaidPatches": false
+            })))
+            .mount(&server)
+            .await;
+        let client = org_client(server.uri()).remembering_lookups();
+        let asked = vec!["pkg:npm/%40scope/name@1.0.0".to_string()];
+        client.search_patches_batch(&asked).await.unwrap();
+        client.search_patches_batch(&asked).await.unwrap();
+        assert_eq!(requests(&server).await, 2);
+    }
+
+    /// A failed search is not an answer: it is asked again.
+    #[tokio::test]
+    async fn a_failure_is_not_remembered() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/batch"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/batch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "packages": [],
+                "canAccessPaidPatches": false
+            })))
+            .mount(&server)
+            .await;
+        let client = org_client(server.uri()).remembering_lookups();
+        let asked = purls(&["plain-a"]);
+        assert!(client.search_patches_batch(&asked).await.is_err());
+        assert!(client.search_patches_batch(&asked).await.is_ok());
+        assert!(client.search_patches_batch(&asked).await.is_ok());
+        assert_eq!(requests(&server).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_package_search_is_asked_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/v0/orgs/acme/patches/by-package/.+"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "patches": [],
+                "canAccessPaidPatches": true
+            })))
+            .mount(&server)
+            .await;
+        let client = org_client(server.uri()).remembering_lookups();
+        for _ in 0..3 {
+            let answer = client
+                .search_patches_by_package("pkg:npm/a@1.0.0")
+                .await
+                .unwrap();
+            assert!(answer.can_access_paid_patches);
+        }
+        assert_eq!(requests(&server).await, 1);
+        // Another package is another question.
+        client
+            .search_patches_by_package("pkg:npm/b@1.0.0")
+            .await
+            .unwrap();
+        assert_eq!(requests(&server).await, 2);
+        // A plain client asks each time.
+        let plain = org_client(server.uri());
+        plain
+            .search_patches_by_package("pkg:npm/a@1.0.0")
+            .await
+            .unwrap();
+        plain
+            .search_patches_by_package("pkg:npm/a@1.0.0")
+            .await
+            .unwrap();
+        assert_eq!(requests(&server).await, 4);
     }
 }
 

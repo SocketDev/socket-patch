@@ -391,6 +391,34 @@ async fn agent_scan_of_a_root_project_names_the_projects_below_it_left() {
     assert!(not_scanned_detail(&stdout).is_some(), "{stdout}");
 }
 
+/// A lookup that fails ends the run, and the projects below are still
+/// named first: that this run would not have covered them is what the
+/// user needs before running it again.
+#[tokio::test]
+async fn a_failed_lookup_still_names_the_projects_below() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream down"))
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_gem_monorepo(tmp.path());
+    write_gem_project(tmp.path(), "root-gem");
+
+    let (code, stdout, stderr) = run_agent_scan(tmp.path(), &server.uri(), &[]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("2 project directories below this one were not scanned (api, web)"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("not scanned").count(),
+        1,
+        "said once: {stderr}"
+    );
+}
+
 /// An agent-mode scan warns only of a project it did not reach. Its npm
 /// crawl walks the `node_modules` below `--cwd`, so a nested npm project
 /// is scanned from the root and is not named. Nor is a project with no

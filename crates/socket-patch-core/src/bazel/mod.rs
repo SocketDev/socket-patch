@@ -10,6 +10,8 @@ pub const WORKSPACE_FILES: [&str; 4] =
 
 pub mod built;
 pub mod ignore;
+pub mod maven;
+pub mod rc;
 pub mod starlark;
 pub mod workspace;
 

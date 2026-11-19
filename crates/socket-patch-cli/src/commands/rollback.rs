@@ -370,9 +370,16 @@ fn patched_in_other_scope_warning(purl: &str, path: &Path, common: &GlobalArgs) 
 }
 
 /// The wet run's per-package blocks: what was rolled back (naming each
-/// physical copy when a package has several) and what failed.
-fn format_rollback_results(results: &[RollbackResult], cwd: &Path) -> Vec<String> {
-    let rolled_back: Vec<String> = results
+/// physical copy when a package has several) and what failed. The rolled
+/// back packages are counted in their heading and listed by purl; `style`
+/// opens each of their lines with a check mark where the terminal shows
+/// one.
+fn format_rollback_results(
+    results: &[RollbackResult],
+    cwd: &Path,
+    style: crate::ui::Style,
+) -> Vec<String> {
+    let mut rolled_back: Vec<String> = results
         .iter()
         .filter(|r| r.success && !r.files_rolled_back.is_empty())
         .map(|r| copy_label(results, r, None, cwd))
@@ -383,14 +390,43 @@ fn format_rollback_results(results: &[RollbackResult], cwd: &Path) -> Vec<String
                 .map(|r| copy_label(results, r, Some("already original"), cwd)),
         )
         .collect();
+    rolled_back.sort();
     let mut lines = Vec::new();
     if !rolled_back.is_empty() {
+        let packages: std::collections::BTreeSet<&str> = results
+            .iter()
+            .filter(|r| {
+                r.success && (!r.files_rolled_back.is_empty() || all_files_already_original(r))
+            })
+            .map(|r| r.package_key.as_str())
+            .collect();
         lines.push(String::new());
-        lines.push("Rolled back packages:".to_string());
-        lines.extend(rolled_back);
+        lines.push(format!(
+            "Rolled back {}:",
+            plural(packages.len(), "package", "packages")
+        ));
+        // A label opens with two spaces: the mark takes the first.
+        lines.extend(
+            rolled_back
+                .iter()
+                .map(|label| format!("{}{}", style.check(), &label[1..])),
+        );
     }
     lines.extend(format_rollback_failures(results, cwd));
     lines
+}
+
+/// Whether the wet run's `Rolled back N packages:` block
+/// ([`format_rollback_results`]) already names every purl of `removed`:
+/// the manifest removal is then one line, not the same list again.
+fn removal_already_listed(results: &[RollbackResult], removed: &[String]) -> bool {
+    removed.iter().all(|purl| {
+        results.iter().any(|r| {
+            r.success
+                && r.package_key == *purl
+                && (!r.files_rolled_back.is_empty() || all_files_already_original(r))
+        })
+    })
 }
 
 /// `--preserve-state`'s closing line (names vendored artifacts only when
@@ -784,7 +820,24 @@ fn rollback_failure_code(result: &RollbackResult) -> &'static str {
 /// `already_original`, or `failed` with the blocking file's code. The
 /// installed copy rides in `details.path`; a failure adds
 /// `details.filesVerified` (per-file camelCase status + hashes).
-fn agent_result_event(result: &RollbackResult, uuid: Option<&str>, dry_run: bool) -> PatchEvent {
+///
+/// `record` is the result's manifest record. A gem record that lists
+/// files, none of which was looked at on the copy, is `skipped`
+/// `not_in_platform_build`, wet or dry: none of them is part of the build
+/// installed there (the JRuby build of a gem, see
+/// `gem_ext::rollback_files`), so `apply` wrote nothing of the patch and
+/// there is nothing to restore. That is not a record with no files.
+fn agent_result_event(
+    result: &RollbackResult,
+    record: Option<&PatchRecord>,
+    dry_run: bool,
+) -> PatchEvent {
+    let uuid = record.map(|record| record.uuid.as_str());
+    let nothing_of_it_here = result.success
+        && result.files_verified.is_empty()
+        && result.files_rolled_back.is_empty()
+        && record.is_some_and(|record| !record.files.is_empty())
+        && Ecosystem::from_purl(&result.package_key) == Some(Ecosystem::Gem);
     let file = |path: &str| PatchEventFile {
         path: path.to_string(),
         verified: true,
@@ -814,6 +867,12 @@ fn agent_result_event(result: &RollbackResult, uuid: Option<&str>, dry_run: bool
         PatchEvent::new(PatchAction::Skipped, result.package_key.clone()).with_reason(
             "already_original",
             "every file already matches its original (beforeHash) content",
+        )
+    } else if nothing_of_it_here {
+        PatchEvent::new(PatchAction::Skipped, result.package_key.clone()).with_reason(
+            socket_patch_core::patch::gem_ext::NOT_IN_BUILD_CODE,
+            "none of the patch's files are part of the build of the gem installed here: \
+             nothing of the patch was applied to it, so there is nothing to restore",
         )
     } else if dry_run {
         PatchEvent::new(PatchAction::Verified, result.package_key.clone()).with_files(
@@ -1239,7 +1298,7 @@ fn build_rollback_envelope(report: &RollbackReport<'_>) -> Envelope {
     for result in report.results {
         env.record(agent_result_event(
             result,
-            manifest_uuid(&result.package_key),
+            report.manifest.patches.get(&result.package_key),
             dry_run,
         ));
         if let Some(sidecar) = &result.sidecar {
@@ -2773,7 +2832,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 let lines = if args.common.dry_run {
                     format_rollback_dry_run_counts(&results, &cwd_abs)
                 } else {
-                    format_rollback_results(&results, &cwd_abs)
+                    format_rollback_results(&results, &cwd_abs, crate::ui::Style::stdout())
                 };
                 for line in lines {
                     println!("{line}");
@@ -2851,6 +2910,12 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                             println!("  - {purl}");
                         }
                     }
+                } else if !removed.is_empty() && removal_already_listed(&results, &removed) {
+                    // The block above just named each of them.
+                    println!(
+                        "\nRemoved {} from manifest.",
+                        plural(removed.len(), "patch", "patches")
+                    );
                 } else if !removed.is_empty() {
                     println!(
                         "\nRemoved {} from manifest:",
@@ -2866,7 +2931,12 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                     );
                 }
                 if gc_bytes_freed > 0 {
-                    println!("\n{}", format_gc_freed(gc_bytes_freed, args.common.dry_run));
+                    // Under the removal it follows from; on its own
+                    // otherwise.
+                    if removed.is_empty() {
+                        println!();
+                    }
+                    println!("{}", format_gc_freed(gc_bytes_freed, args.common.dry_run));
                 }
                 // Only packages that are NOT also handled in place keep
                 // patched bytes. A successful in-place result that verified
@@ -3546,7 +3616,7 @@ pub(crate) async fn rollback_patches_inner(
         // Transient progress on stderr; the result line replaces it.
         let mut status = StatusLine::stderr(common.json, common.silent);
         status.set(format!(
-            "Downloading {}...",
+            "Downloading {}",
             plural(missing_blobs.len(), "missing blob", "missing blobs")
         ));
 
@@ -3641,7 +3711,19 @@ pub(crate) async fn rollback_patches_inner(
     let mut warnings: Vec<(String, String)> = Vec::new();
     let mut superseded_left: Vec<String> = Vec::new();
 
-    for target in &rollback_targets {
+    // The restores show as counted progress: a large tree of copies takes
+    // a while. Nothing prints while the line is up: a failure prints here
+    // only under `--silent`, where there is no line, and the line comes
+    // down before a gem's native extension is rebuilt, which reports its
+    // own progress.
+    let mut restoring = StatusLine::stderr(common.json, common.silent);
+    let verb = if common.dry_run {
+        "Checking packages"
+    } else {
+        "Rolling back packages"
+    };
+    for (done, target) in rollback_targets.iter().enumerate() {
+        restoring.progress(verb, done, rollback_targets.len());
         let (purl, pkg_path) = (&target.purl, &target.dir);
         let patch = match filtered_manifest.patches.get(purl) {
             Some(p) => p,
@@ -3671,7 +3753,7 @@ pub(crate) async fn rollback_patches_inner(
                     // hold it (a precompiled gem never shipped it; a build
                     // removed it) is removed, not restored.
                     let gem_files = if is_gem {
-                        Some(gem_ext::rollback_files(pkg_path, &patch.files).await)
+                        Some(gem_ext::rollback_files(pkg_path, purl, &patch.files).await)
                     } else {
                         None
                     };
@@ -3694,6 +3776,7 @@ pub(crate) async fn rollback_patches_inner(
                             offline: common.offline,
                             progress: common.gem_build_progress(),
                         };
+                        restoring.finish();
                         if let Err(e) = gem_ext::restore_original_build(pkg_path, &env).await {
                             result.success = false;
                             result.error = Some(format!("{}: {e}", gem_ext::RESTORE_FAILED_CODE));
@@ -3753,6 +3836,7 @@ pub(crate) async fn rollback_patches_inner(
         }
         results.push(result);
     }
+    restoring.finish();
 
     // Redirects the crawler never saw (see `undiscovered_redirects` above):
     // roll the redirect back from the manifest alone. `package_path` is the
@@ -6560,16 +6644,40 @@ mod tests {
                 false,
             ),
         ];
+        let plain = crate::ui::Style::PLAIN;
         assert_eq!(
-            format_rollback_results(&results, Path::new("/p")),
+            format_rollback_results(&results, Path::new("/p"), plain),
             vec![
                 "",
-                "Rolled back packages:",
+                "Rolled back 2 packages:",
                 "  pkg:npm/nuxt@4.5.0 (node_modules/nuxt)",
                 "  pkg:npm/nuxt@4.5.0 (node_modules/vite/node_modules/nuxt)",
                 "  pkg:npm/ok@1 (already original)",
             ]
         );
+        // Where the terminal shows glyphs, a check mark takes the first
+        // column of each package's line.
+        let fancy = crate::ui::Style {
+            color: true,
+            glyphs: true,
+        };
+        let marked: Vec<String> = format_rollback_results(&results, Path::new("/p"), fancy)
+            .iter()
+            .map(|line| crate::ui::strip_ansi(line))
+            .collect();
+        assert_eq!(marked[2], "✔ pkg:npm/nuxt@4.5.0 (node_modules/nuxt)");
+        assert_eq!(marked[4], "✔ pkg:npm/ok@1 (already original)");
+        // The manifest removal names its purls only when the block above
+        // did not.
+        let removed = |purls: &[&str]| purls.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert!(removal_already_listed(
+            &results,
+            &removed(&["pkg:npm/nuxt@4.5.0", "pkg:npm/ok@1"])
+        ));
+        assert!(!removal_already_listed(
+            &results,
+            &removed(&["pkg:npm/nuxt@4.5.0", "pkg:npm/gone@1"])
+        ));
         let mut failed = rb(
             "pkg:npm/x@1",
             "/p/x",
@@ -6579,10 +6687,10 @@ mod tests {
         failed.success = false;
         failed.error = Some("modified".into());
         assert_eq!(
-            format_rollback_results(&[failed], Path::new("/p")),
+            format_rollback_results(&[failed], Path::new("/p"), plain),
             vec!["", "Failed to roll back:", "  pkg:npm/x@1: modified"]
         );
-        assert!(format_rollback_results(&[], Path::new("/p")).is_empty());
+        assert!(format_rollback_results(&[], Path::new("/p"), plain).is_empty());
     }
 
     #[test]

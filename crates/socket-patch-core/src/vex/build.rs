@@ -12,7 +12,8 @@
 //! they merge into one statement with both PURLs as subcomponents.
 //!
 //! A package the caller knows the build takes without its patch gets
-//! `affected` statements ([`build_document_with_affected`]): one per
+//! `affected` statements ([`build_document_with`] with
+//! [`Attested::affected`]): one per
 //! vulnerability ID, of its own, after the `not_affected` one of the same
 //! ID. Such statements are not merged, so that the action statement of
 //! each is about one subcomponent.
@@ -93,48 +94,88 @@ pub fn build_document_marking_unverified(
     unverified: &[String],
     opts: &BuildOptions,
 ) -> Option<Document> {
-    build_document_with_affected(
+    build_document_with(
         manifest,
-        applied,
-        vendored,
-        redirected,
-        unverified,
-        &[],
+        &Attested {
+            applied,
+            vendored,
+            redirected,
+            unverified,
+            ..Attested::default()
+        },
         opts,
     )
 }
 
-/// [`build_document_marking_unverified`], where `affected` names the
-/// PURLs whose patch the caller knows the build does not take, each with
-/// what to do about it. Every vulnerability of such a PURL's record gets a
-/// statement of the PURL's own with the status `affected`: the PURL is
-/// the one subcomponent of the product, and the action statement is what
-/// the caller gave for it, so a reader knows which package to act on. It
-/// has no justification and no impact statement, which belong to
-/// `not_affected`.
+/// The PURLs a document attests, and on what basis each is attested.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Attested<'a> {
+    /// Every attested PURL.
+    pub applied: &'a [String],
+    /// Attested from the committed vendor artifact ([`build_document`]).
+    pub vendored: &'a [String],
+    /// Attested from hosted wiring ([`build_document`]).
+    pub redirected: &'a [String],
+    /// Declared applied with nothing checked on disk
+    /// ([`build_document_marking_unverified`]).
+    pub unverified: &'a [String],
+    /// Attested with nothing applied: no file of the patch is part of any
+    /// installed build of the package
+    /// ([`VerifyOutcome::code_not_present`](crate::vex::verify::VerifyOutcome::code_not_present)).
+    pub code_not_present: &'a [String],
+    /// PURLs whose patch the caller knows the build does not take, each
+    /// with what to do about it. See [`build_document_with`].
+    pub affected: &'a [(String, String)],
+}
+
+/// What the impact statement says of a PURL in
+/// [`Attested::code_not_present`], before the patch's uuid.
+pub const CODE_NOT_PRESENT_PREFIX: &str =
+    "The code this vulnerability is in is not in the installed build of the package: no file of \
+     Socket patch";
+
+/// [`build_document_marking_unverified`], with two more kinds of PURL.
+///
+/// The PURLs in `attested.code_not_present` are not affected because the
+/// code the patch changes is not in any installed build of the package,
+/// with no patch applied to them. Their impact-statement part says so and
+/// names the patch whose files were looked for. A statement all of whose
+/// PURLs are of that kind carries the justification
+/// `vulnerable_code_not_present`; any other keeps
+/// `inline_mitigations_already_exist`, with one part per PURL saying which
+/// is which.
+///
+/// `attested.affected` names the PURLs whose patch the caller knows the
+/// build does not take, each with what to do about it. Every vulnerability
+/// of such a PURL's record gets a statement of the PURL's own with the
+/// status `affected`: the PURL is the one subcomponent of the product, and
+/// the action statement is what the caller gave for it, so a reader knows
+/// which package to act on. It has no justification and no impact
+/// statement, which belong to `not_affected`.
 ///
 /// A PURL is in `applied` or in `affected`, and `affected` wins for one
 /// in both. A vulnerability that PURLs of both kinds share has the
 /// `not_affected` statement of the patched ones first, then one
 /// `affected` statement per PURL: a reader that keeps the last statement
 /// of a document about a product and a vulnerability keeps one that says
-/// `affected`. With no such PURL the document is
+/// `affected`. With neither kind of PURL the document is
 /// [`build_document_marking_unverified`]'s, byte for byte.
-pub fn build_document_with_affected(
+pub fn build_document_with(
     manifest: &PatchManifest,
-    applied: &[String],
-    vendored: &[String],
-    redirected: &[String],
-    unverified: &[String],
-    affected: &[(String, String)],
+    attested: &Attested<'_>,
     opts: &BuildOptions,
 ) -> Option<Document> {
+    fn set(purls: &[String]) -> HashSet<&str> {
+        purls.iter().map(String::as_str).collect()
+    }
     let timestamp = now_rfc3339();
-    let applied_set: HashSet<&str> = applied.iter().map(String::as_str).collect();
-    let vendored_set: HashSet<&str> = vendored.iter().map(String::as_str).collect();
-    let redirected_set: HashSet<&str> = redirected.iter().map(String::as_str).collect();
-    let unverified_set: HashSet<&str> = unverified.iter().map(String::as_str).collect();
-    let actions: BTreeMap<&str, &str> = affected
+    let applied_set = set(attested.applied);
+    let vendored_set = set(attested.vendored);
+    let redirected_set = set(attested.redirected);
+    let unverified_set = set(attested.unverified);
+    let code_not_present_set = set(attested.code_not_present);
+    let actions: BTreeMap<&str, &str> = attested
+        .affected
         .iter()
         .map(|(purl, action)| (purl.as_str(), action.as_str()))
         .collect();
@@ -152,6 +193,13 @@ pub fn build_document_with_affected(
         if action.is_none() && !applied_set.contains(purl.as_str()) {
             continue;
         }
+        // A basis that rests on the patch's own artifact (vendored,
+        // redirected) or on no check at all comes first: nothing was
+        // looked for in an installed build then.
+        let code_not_present = code_not_present_set.contains(purl.as_str())
+            && !vendored_set.contains(purl.as_str())
+            && !redirected_set.contains(purl.as_str())
+            && !unverified_set.contains(purl.as_str());
         for (vuln_id, info) in &record.vulnerabilities {
             let alone = action.map(|_| purl.as_str());
             let entry = grouped.entry((vuln_id.clone(), alone)).or_default();
@@ -161,7 +209,9 @@ pub fn build_document_with_affected(
                 entry.parts.insert(action.to_string());
                 continue;
             }
-            let mut part = if vendored_set.contains(purl.as_str()) {
+            let mut part = if code_not_present {
+                format!("{CODE_NOT_PRESENT_PREFIX} {} is part of it", record.uuid)
+            } else if vendored_set.contains(purl.as_str()) {
                 format!("Patched via Socket patch {} (vendored)", record.uuid)
             } else if redirected_set.contains(purl.as_str()) {
                 format!("Patched via Socket patch {} (redirected)", record.uuid)
@@ -171,6 +221,7 @@ pub fn build_document_with_affected(
             if unverified_set.contains(purl.as_str()) {
                 part.push_str(NOT_VERIFIED_SUFFIX);
             }
+            entry.patched |= !code_not_present;
             entry.parts.insert(part);
         }
     }
@@ -204,7 +255,13 @@ pub fn build_document_with_affected(
         let (status, justification, impact_statement, action_statement) = if affected.is_some() {
             (Status::Affected, None, None, words)
         } else {
-            let justification = Justification::InlineMitigationsAlreadyExist;
+            // A patch in place for any subcomponent is a mitigation; with
+            // none, the statement rests on the code not being there.
+            let justification = if group.patched {
+                Justification::InlineMitigationsAlreadyExist
+            } else {
+                Justification::VulnerableCodeNotPresent
+            };
             (Status::NotAffected, Some(justification), words, None)
         };
 
@@ -250,6 +307,8 @@ struct VulnGroup {
     /// What each PURL adds to the impact statement of a `not_affected`
     /// statement, or the action statement of an `affected` one.
     parts: BTreeSet<String>,
+    /// Some subcomponent is attested because a patch is in place.
+    patched: bool,
 }
 
 #[cfg(test)]
@@ -303,6 +362,23 @@ mod tests {
     /// default [`opts`].
     fn build_plain(manifest: &PatchManifest, applied: &[String]) -> Option<Document> {
         build_document(manifest, applied, &[], &[], &opts())
+    }
+
+    /// [`build_document_with`] with `applied` and `affected` only.
+    fn build_affected(
+        manifest: &PatchManifest,
+        applied: &[String],
+        affected: &[(String, String)],
+    ) -> Option<Document> {
+        build_document_with(
+            manifest,
+            &Attested {
+                applied,
+                affected,
+                ..Attested::default()
+            },
+            &opts(),
+        )
     }
 
     #[test]
@@ -1011,6 +1087,156 @@ mod tests {
         );
     }
 
+    /// A package attested because no file of its patch is part of any
+    /// installed build is not a patched package: the statement says that
+    /// the vulnerable code is not present, names the patch whose files
+    /// were looked for, and never says "Patched via".
+    #[test]
+    fn code_not_present_is_stated_as_such() {
+        let mut manifest = PatchManifest::new();
+        let purl = "pkg:gem/nokogiri@1.18.10?platform=ruby".to_string();
+        manifest.patches.insert(
+            purl.clone(),
+            record("u-c", vec![("GHSA-cccc", vec!["CVE-2026-3"])]),
+        );
+        let applied = vec![purl.clone()];
+        let doc = build_document_with(
+            &manifest,
+            &Attested {
+                applied: &applied,
+                code_not_present: &applied,
+                ..Attested::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+        assert_eq!(doc.statements.len(), 1);
+        let st = &doc.statements[0];
+        assert_eq!(st.status, Status::NotAffected);
+        assert_eq!(
+            st.justification,
+            Some(Justification::VulnerableCodeNotPresent)
+        );
+        let impact = st.impact_statement.as_deref().unwrap();
+        assert_eq!(
+            impact,
+            "The code this vulnerability is in is not in the installed build of the package: \
+             no file of Socket patch u-c is part of it"
+        );
+        assert!(!impact.contains("Patched via"), "{impact}");
+        assert_eq!(st.products[0].subcomponents[0].id, purl);
+
+        // Without the mark the document is the usual one, byte for byte.
+        let untimed = |doc: Option<Document>| {
+            let mut doc = doc.unwrap();
+            doc.timestamp = String::new();
+            for st in &mut doc.statements {
+                st.timestamp = None;
+            }
+            serde_json::to_string(&doc).unwrap()
+        };
+        assert_eq!(
+            untimed(build_document_with(
+                &manifest,
+                &Attested {
+                    applied: &applied,
+                    ..Attested::default()
+                },
+                &opts()
+            )),
+            untimed(build_document(&manifest, &applied, &[], &[], &opts()))
+        );
+    }
+
+    /// One statement covers every package of a vulnerability. When one of
+    /// them is patched, a mitigation is in place and the justification
+    /// says so; the impact statement still says of each package what is
+    /// true of it. A basis that rests on the patch's own artifact
+    /// (vendored, redirected) or on no check keeps its own wording.
+    #[test]
+    fn code_not_present_beside_a_patched_package_keeps_the_mitigation_justification() {
+        let mut manifest = PatchManifest::new();
+        let absent = "pkg:gem/nokogiri@1.18.10?platform=ruby".to_string();
+        let patched = "pkg:gem/other@1.0.0".to_string();
+        manifest
+            .patches
+            .insert(absent.clone(), record("u-c", vec![("GHSA-cccc", vec![])]));
+        manifest
+            .patches
+            .insert(patched.clone(), record("u-p", vec![("GHSA-cccc", vec![])]));
+        let applied = vec![absent.clone(), patched.clone()];
+        let not_present = vec![absent.clone()];
+        let doc = build_document_with(
+            &manifest,
+            &Attested {
+                applied: &applied,
+                code_not_present: &not_present,
+                ..Attested::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+        assert_eq!(doc.statements.len(), 1);
+        let st = &doc.statements[0];
+        assert_eq!(
+            st.justification,
+            Some(Justification::InlineMitigationsAlreadyExist)
+        );
+        let impact = st.impact_statement.as_deref().unwrap();
+        assert!(impact.contains("Patched via Socket patch u-p"), "{impact}");
+        assert!(
+            impact.contains("no file of Socket patch u-c is part of it"),
+            "{impact}"
+        );
+        assert!(!impact.contains("Patched via Socket patch u-c"), "{impact}");
+
+        for (vendored, redirected, unverified, wording) in [
+            (
+                &not_present[..],
+                &[][..],
+                &[][..],
+                "Patched via Socket patch u-c (vendored)",
+            ),
+            (
+                &[][..],
+                &not_present[..],
+                &[][..],
+                "Patched via Socket patch u-c (redirected)",
+            ),
+            (
+                &[][..],
+                &[][..],
+                &not_present[..],
+                "Patched via Socket patch u-c; not verified",
+            ),
+        ] {
+            let doc = build_document_with(
+                &manifest,
+                &Attested {
+                    applied: &not_present,
+                    vendored,
+                    redirected,
+                    unverified,
+                    code_not_present: &not_present,
+                    ..Attested::default()
+                },
+                &opts(),
+            )
+            .unwrap();
+            let st = &doc.statements[0];
+            assert_eq!(
+                st.justification,
+                Some(Justification::InlineMitigationsAlreadyExist),
+                "{wording}"
+            );
+            assert!(
+                st.impact_statement.as_deref().unwrap().contains(wording),
+                "{:?}",
+                st.impact_statement
+            );
+        }
+    }
+
     /// A PURL the build takes without its patch is attested as affected:
     /// each vulnerability of its record gets a statement that names the
     /// PURL under the product as a `not_affected` statement does, and
@@ -1028,8 +1254,7 @@ mod tests {
             ),
         );
         let affected = [("pkg:npm/x@1.0.0".to_string(), "Pin it.".to_string())];
-        let doc = build_document_with_affected(&manifest, &[], &[], &[], &[], &affected, &opts())
-            .unwrap();
+        let doc = build_affected(&manifest, &[], &affected).unwrap();
         let said: Vec<_> = (doc.statements.iter())
             .map(|st| (st.vulnerability.name.as_str(), &st.vulnerability.aliases))
             .collect();
@@ -1081,9 +1306,7 @@ mod tests {
             ("pkg:npm/silent@1.0.0", "Pin u-silent."),
         ]
         .map(|(purl, action)| (purl.to_string(), action.to_string()));
-        let doc =
-            build_document_with_affected(&manifest, &applied, &[], &[], &[], &affected, &opts())
-                .unwrap();
+        let doc = build_affected(&manifest, &applied, &affected).unwrap();
         let said: Vec<_> = (doc.statements.iter())
             .map(|st| {
                 let subs = &st.products[0].subcomponents;
@@ -1112,8 +1335,6 @@ mod tests {
             ]
         );
         let silent = [affected[3].clone()];
-        assert!(
-            build_document_with_affected(&manifest, &[], &[], &[], &[], &silent, &opts()).is_none()
-        );
+        assert!(build_affected(&manifest, &[], &silent).is_none());
     }
 }

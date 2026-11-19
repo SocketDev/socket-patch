@@ -132,6 +132,12 @@ use socket_patch_core::vendor::refusals::refusal_is_benign;
 /// `vendor_prebuilt_required` failure it always was, a failed `Done` minus
 /// the unserved marker (its error already says it).
 ///
+/// One unserved refusal is a skip with nothing to keep as well:
+/// [`vendor::VENDOR_PREBUILT_PLATFORM_PENDING`], a gem locked as platform
+/// gems whose prebuild for one of the locked platforms the service does
+/// not list. A prebuild is listed only once built, so the run cannot tell
+/// "not yet" from "never", and the project is exactly as it was.
+///
 /// [`Discovery::vendor_entry_live`]: socket_patch_core::vex::discover::Discovery::vendor_entry_live
 async fn keep_older_vendored_patch(
     outcome: Option<VendorOutcome>,
@@ -191,6 +197,9 @@ async fn keep_older_vendored_patch(
             entry,
             warnings,
         },
+        None if code == vendor::VENDOR_PREBUILT_PLATFORM_PENDING => {
+            VendorOutcome::Refused { code, detail }
+        }
         None => VendorOutcome::Refused {
             code: vendor::VENDOR_PREBUILT_REQUIRED,
             detail,
@@ -302,6 +311,14 @@ async fn takeover_dry_refusal(
     .await;
     drop(probe);
     match outcome {
+        // A skip, not a failure, for a takeover in the vendor loop: the
+        // wet run rolls the restore back, so the hosted pin stays (see
+        // `keep_older_vendored_patch`). The eject plan refuses it.
+        Some(VendorOutcome::Refused { code, detail })
+            if code == vendor::VENDOR_PREBUILT_PLATFORM_PENDING =>
+        {
+            Some((code, detail))
+        }
         // A takeover has no older vendored patch to keep in force.
         Some(VendorOutcome::Refused { code, detail }) if vendor::is_unserved(code) => {
             Some((vendor::VENDOR_PREBUILT_REQUIRED, detail))
@@ -2102,6 +2119,13 @@ async fn run_eject(
         )
         .await
         {
+            // An eject has no skip: a pin it cannot vendor stays hosted
+            // and the eject is refused whole, so a prebuild that is not
+            // built yet is the plain miss here.
+            let code = match vendor::is_unserved(code) {
+                true => vendor::VENDOR_PREBUILT_REQUIRED,
+                false => code,
+            };
             refused.push((pin.purl.clone(), code, detail));
         }
         // sbt / scala-cli also require build evidence. The backend treats
@@ -3805,6 +3829,17 @@ pub(crate) async fn vendor_records_reusing(
                     )
                     .await
                     {
+                        if refusal_is_benign(code) {
+                            // The wet run's skip: nothing is taken over.
+                            if !common.silent && !common.json {
+                                eprintln!("Skipping {}: {detail}", normalize_purl(candidate));
+                            }
+                            env.record(
+                                PatchEvent::new(PatchAction::Skipped, candidate.clone())
+                                    .with_reason(code, detail),
+                            );
+                            continue;
+                        }
                         has_errors = true;
                         env.record(
                             PatchEvent::new(PatchAction::Failed, candidate.clone())
@@ -4410,6 +4445,12 @@ pub(crate) async fn vendor_records_reusing(
         }
     }
 
+    // A hub of a Bazel workspace builds the jar of its own lock, whatever
+    // this run vendored for the Maven or the Gradle build.
+    let vendored = vendorable.iter().map(String::as_str);
+    env.warnings
+        .extend(crate::commands::bazel_maven_notices(common, vendored, true).await);
+
     // A rolled-back eject's summary would describe a vendoring that was
     // undone: the eject prints it itself once it knows the outcome (#1005).
     match eject {
@@ -4489,16 +4530,10 @@ fn print_vendor_closing(
                 cmds.join(" and ")
             )
         } else if installs.is_empty() {
-            "Reinstall from the updated lockfile so the installed packages pick up the \
-             vendored artifacts"
-                .to_string()
+            "Reinstall from the updated lockfile".to_string()
         } else {
             let cmds: Vec<String> = installs.iter().map(|c| format!("`{c}`")).collect();
-            format!(
-                "Run {} to update the installed tree (vendoring rewires the lockfile \
-                 only; the current install keeps the unpatched bytes until reinstalled)",
-                cmds.join(" and ")
-            )
+            format!("Run {} to update the installed tree", cmds.join(" and "))
         };
         let mut extra = Vec::new();
         if wired_flavors.contains("bun") && common.cwd.join("bun.lockb").exists() {

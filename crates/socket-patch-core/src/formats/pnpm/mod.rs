@@ -199,6 +199,33 @@ pub(crate) fn strip_pnpm_peer_suffix(key: &str) -> &str {
     key.find('(').map_or(key, |p| key[..p].trim_end())
 }
 
+/// Whether a pnpm packages or snapshots key records a patch of the package
+/// it names. pnpm 8+ writes that as a group of the key's own:
+/// `a@1.0.0(patch_hash=…)`. A dependent repeats a patched peer's whole key
+/// inside its peer group (`b@2.0.0(a@1.0.0(patch_hash=…))`), which says
+/// nothing about `b`: only a group at the first level counts. A pnpm 7 key
+/// has no groups and carries the hash on its version (`/a/1.0.0_…`).
+pub(crate) fn pnpm_key_has_own_patch(key: &str) -> bool {
+    const HASH: &str = "patch_hash=";
+    if !key.contains('(') {
+        return key.contains(HASH);
+    }
+    let mut depth = 0usize;
+    for (at, c) in key.char_indices() {
+        match c {
+            '(' => {
+                if depth == 0 && key[at + 1..].starts_with(HASH) {
+                    return true;
+                }
+                depth += 1;
+            }
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// `(name, version)` of a REGISTRY-form pnpm packages key, in every lock
 /// generation's grammar — v9 `name@version`, v6 (pnpm 8) the same behind a
 /// leading `/`, v5.4 (pnpm 7) and shrinkwrap `/name/version`; names may be

@@ -41,6 +41,10 @@ reach (their own `vendor/bundle` or `.venv`, for example), it lists them in the 
 warning with the command to run for one of them
 (`socket-patch scan --mode agent --cwd <dir>`). Run it once per directory.
 
+A scan of several project directories crawls them all at once and asks the patch
+service about each package once for the whole run, then reports the directories one
+by one, in order.
+
 What that scan patched can be seen and undone from the same directory. `list` shows
 the patches of the current directory (headed `== . ==`, as in the scan) and of each
 patched project directory below it, and `rollback` with no target rolls all of them
@@ -80,15 +84,47 @@ is available. See the [ranking contract](../crates/socket-patch-cli/CLI_CONTRACT
 for tie-breaking and upgrade rules.
 
 One patch is applied per package version. When a package has several patches for
-different advisories, `scan` applies the top-ranked one and names the rest:
+different advisories, `scan` applies the top-ranked one. Each patched package gets
+one row (its severity, what the patch fixes, and how many advisories stay unpatched),
+and the run closes with its totals:
 
 ```text
 Switched 1 package to hosted patches; rewrote 1 file.
-  pkg:pypi/urllib3@1.26.18: fixes CVE-2025-66418; still unpatched: CVE-2025-66471, CVE-2026-21441
-Only one patch is applied per package version. Upgrade the package to fix the advisories still unpatched.
+  HIGH  urllib3@1.26.18  CVE-2025-66418  2 unpatched
+
+Patched 1 package, fixing 1 vulnerability (1 high).
+Saved about 2 hours of engineering time (1 package upgrade at ~2 hours).
+2 vulnerabilities left to patch (67%): 2 need a package upgrade.
 ```
 
-`scan --json` lists the same ids as `packages[].fixedIds` and `packages[].unfixedIds`.
+`--verbose` names the unpatched advisories under the row, and `scan --json` lists the
+same ids as `packages[].fixedIds` and `packages[].unfixedIds`. With several project
+directories the totals count every one (`Patched 22 packages in 3 projects, ...`): a
+package patched in three projects counts three times. "Left to patch" counts only
+advisories Socket has a patch for; it says nothing about vulnerabilities with no patch.
+
+The `Saved about N hours` line is an estimate of the upgrade work the patches stood
+in for: two hours for each patched package in each project directory. The two hours
+are an assumption (finding a fixed release, moving to it, fixing what else changed,
+review), not a measurement of your project.
+
+On a terminal, `scan` also shows what Socket measured about each patch (the exploits
+of the fixed advisories blocked, the package's own tests passing) in its row and in a
+`Verified:` closing line. `socket-patch show <patch>` prints the full measurements and
+the patch's diff.
+
+A package your project already patches itself (pnpm `patchedDependencies`, a Yarn
+`patch:` entry, patch-package, a Cargo `[patch]`, a Go `replace`, Composer patches) is
+left alone, and the scan says so in one note that names the files and the first few
+packages:
+
+```text
+Note: skipped 3 packages covered by this project's own patches (pnpm-workspace.yaml): next@16.4.5, next-auth@4.24.15, ts-node@10.9.2.
+  --allow-patch-conflicts patches them too.
+```
+
+`--verbose` lists every package of a longer note. `--allow-patch-conflicts` applies
+Socket's patch on top of yours; review and test the result.
 
 ## CI and automation
 
@@ -224,6 +260,19 @@ ledger when offline attestation is required. A reference no longer used by the
 project is excluded even with `--no-verify`; that flag bypasses file-hash checks,
 not reference validation. A patch record alone does not prove it is consumed.
 
+A patch that cannot be attested is left out of the document, and the run says which
+and why on stderr, one line per reason:
+
+```text
+Warning: omitting 82 packages from VEX: the patched files still hold the original content (not_applied): @sigstore/core@1.1.0, @sigstore/core@2.0.0, @simple-git/argv-parser@1.1.1 and 79 more (--verbose lists them all)
+Error: No applied patches with vulnerability metadata to attest.
+The patched packages are not installed yet: the installed copies still hold their original files. Reinstall from the lockfile (hosted or vendored patches) or run `socket-patch apply` (agent-mode patches), then run `socket-patch vex` again.
+```
+
+`--verbose` prints a line per patch, and `--json` reports each one as its own
+`skipped` event. Warnings of one kind are folded the same way: the first in full,
+then a line naming the packages the rest are about.
+
 `--no-verify` (or `SOCKET_VEX_NO_VERIFY` in the environment) attests without checking
 any file, so it also attests an agent-mode patch whose files are unpatched or missing.
 It never does so silently: the run warns how many statements it emitted that way, and
@@ -273,12 +322,31 @@ The removed `setup` command is covered in the [migration guide](migrating-to-v5.
 
 | Command | Effect |
 | --- | --- |
-| `list` | Show agent records, vendor records, and hosted pins; an empty project succeeds |
+| `list` | Show agent records, vendor records, and hosted pins; an empty project succeeds. On a terminal: a full-screen table of the patches, with what was measured about each, to open one from (see below) |
+| `show <UUID\|PURL\|NAME\|CVE\|GHSA>` | Look inside one patch without applying it: the advisories it fixes, what Socket measured about it (exploits blocked, tests passing, size, run-time cost), the files it changes and their diffs |
 | `rollback [NAME\|PURL\|UUID\|PATH]...` | Restore selected patches, or all patches when no target is given, and remove their local state |
 | `remove <NAME\|PURL\|UUID>` | Restore and remove matching patches; a name or versionless PURL selects every recorded version |
 | `vendor --revert` | Undo vendoring from its recorded edits and remove the vendored artifacts |
 | `repair` | Restore missing or corrupt agent patch data and vendored artifacts using existing records, and clean unused data |
 | `scan --mode agent --prune` | Patch discovered packages and remove records for dependencies that left the project |
+
+`show` reads the patch from the patch service and changes nothing. In a terminal it
+opens the patch full-screen: the fixes, what Socket measured (exploits blocked, tests
+passing before and after, size, run-time cost) and then the diff of every file. Scroll
+with the arrow keys or `j`/`k`, page with PgUp/PgDn, step between files with `n` and
+`p`, shift long lines with the left and right arrows, and leave with `q`. `--stat`
+stops after the summary, `--file <path>` picks files, and `--no-pager` (or a pipe)
+prints everything at once.
+
+In a terminal, `list` shows the project's patches as a full-screen table: severity
+(colored), package, the advisories fixed, and, filled in from the patch service as it
+answers, exploits blocked, tests passing, lines changed, run-time cost and the date
+the patch was published. Move with the arrow keys or `j`/`k`, page with PgUp/PgDn,
+press Enter to open a patch (the same page `show` opens) and `q` or Esc to leave. The
+table follows the terminal's size, and leaving it prints the rows so the listing
+stays on screen. `list --verbose`, `list --yes` and a piped `list` print every
+patch's full entry instead and ask the patch service nothing; so does `--offline`,
+which browses what the project records.
 
 Use `--dry-run` to preview. `rollback --preserve-state` and
 `remove --preserve-state` restore dependencies while keeping local patch records

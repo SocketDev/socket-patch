@@ -10,6 +10,7 @@ use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::json_envelope::{
     Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile, RunWarning,
 };
+use crate::ui::browser::{Cell, Column, Page, Table, Update};
 
 #[derive(Args)]
 pub struct ListArgs {
@@ -211,6 +212,483 @@ struct Listed {
     patches: usize,
     /// How many of them are manifest records (what telemetry counts).
     manifest_patches: usize,
+    /// The patches as an interactive run's table shows and opens them
+    /// (empty otherwise).
+    rows: Vec<Browse>,
+    /// What reading the project had to say on stderr (`Warning: ...`, or
+    /// the `Error: ...` of a project that could not be listed), held back
+    /// so it prints once the status line is down.
+    notes: Vec<String>,
+}
+
+impl Listed {
+    /// Print the held-back stderr lines.
+    fn print_notes(&mut self) {
+        for note in self.notes.drain(..) {
+            eprintln!("{note}");
+        }
+    }
+}
+
+/// One listed patch, as an interactive run shows it: a row of its table,
+/// and what opening it falls back to.
+#[derive(Clone)]
+struct Browse {
+    purl: String,
+    uuid: String,
+    /// The worst severity among the advisories it fixes, upper-cased;
+    /// empty when the project's records name none (a hosted pin carries
+    /// only its uuid: the details are the patch service's).
+    severity: String,
+    /// The ids to show for what it fixes: each advisory's CVEs, or its own
+    /// id when it has none.
+    ids: Vec<String>,
+    /// `agent`, `hosted` or `vendored`.
+    mode: &'static str,
+    /// The entry as the full listing prints it: what opening the patch
+    /// shows when the patch service cannot be asked.
+    detail: String,
+}
+
+/// The worst severity and the ids to show for a set of advisories
+/// ([`crate::ui::worst_and_ids`]), cleaned of control characters: they
+/// may come from the project's own files.
+fn fixes<'a>(
+    advisories: impl Iterator<Item = (&'a String, &'a str, &'a [String])>,
+) -> (String, Vec<String>) {
+    let (worst, ids) = crate::ui::worst_and_ids(
+        advisories.map(|(id, severity, cves)| (id.as_str(), severity, cves)),
+    );
+    // Two ids that differ only in what is cleaned off are one id.
+    let mut ids: Vec<String> = ids.iter().map(|id| sanitize(id)).collect();
+    ids.sort();
+    ids.dedup();
+    (sanitize(&worst), ids)
+}
+
+impl Browse {
+    fn of(entry: &ListEntry<'_>, color: bool) -> Self {
+        let (severity, ids) = fixes(
+            entry
+                .record
+                .vulnerabilities
+                .iter()
+                .map(|(id, v)| (id, v.severity.as_str(), v.cves.as_slice())),
+        );
+        Browse {
+            purl: sanitize(entry.purl),
+            uuid: entry.record.uuid.clone(),
+            severity,
+            ids,
+            mode: match entry.source {
+                Store::Manifest => "agent",
+                Store::Hosted => crate::commands::HOSTED_MODE_LABEL,
+                Store::Vendored => crate::commands::VENDORED_MODE_LABEL,
+            },
+            detail: format_entry(entry, color),
+        }
+    }
+
+    /// The row's cells, in [`columns`]' order. `name` is how the table
+    /// names the package ([`names`]). `detail` is the patch as the patch
+    /// service describes it, once that has arrived: it fills in what was
+    /// measured about the patch and when it was published, and names the
+    /// advisories of a patch the project records by uuid alone.
+    fn cells(
+        &self,
+        name: &str,
+        project: Option<&str>,
+        detail: Option<&socket_patch_core::api::types::PatchResponse>,
+    ) -> Vec<Cell> {
+        use crate::commands::measured::percent;
+        let (mut severity, mut ids) = (self.severity.clone(), self.ids.clone());
+        if let Some(detail) = detail.filter(|_| ids.is_empty()) {
+            (severity, ids) = fixes(
+                detail
+                    .vulnerabilities
+                    .iter()
+                    .map(|(id, v)| (id, v.severity.as_str(), v.cves.as_slice())),
+            );
+        }
+        let ids = if ids.len() > IDS_SHOWN {
+            format!(
+                "{} (+{})",
+                ids[..IDS_SHOWN].join(", "),
+                ids.len() - IDS_SHOWN
+            )
+        } else {
+            ids.join(", ")
+        };
+        // Green when every exploit is blocked / every test passes; yellow
+        // when some are not.
+        let ratio = |ratio: socket_patch_core::api::types::PatchRatio| {
+            Cell::painted(
+                format!("{}/{}", ratio.count, ratio.total),
+                Some(if ratio.is_all() { "32" } else { "33" }),
+            )
+        };
+        let stats = detail.and_then(|d| d.statistics);
+        let exploits = stats
+            .and_then(|s| s.pocs)
+            .map(|pocs| ratio(pocs.blocked_after))
+            .unwrap_or_default();
+        let tests = stats
+            .and_then(|s| s.tests)
+            .map(|tests| ratio(tests.after))
+            .unwrap_or_default();
+        let change = stats
+            .and_then(|s| s.diff)
+            .map(|diff| format!("+{} -{}", diff.lines_added, diff.lines_removed))
+            .unwrap_or_default();
+        // The cost of the code the patch touches, or of the package's
+        // general workload where only that was measured.
+        let perf = stats
+            .and_then(|s| s.performance)
+            .and_then(|p| p.hot_wall_change.or(p.general_wall_change))
+            .map(percent)
+            .unwrap_or_default();
+        let published = detail
+            .map(|d| crate::commands::show::short_date(&d.published_at))
+            .unwrap_or_default();
+        let mut cells = vec![
+            Cell::painted(severity.clone(), crate::ui::severity_code(&severity)),
+            Cell::plain(name),
+            Cell::plain(ids),
+            exploits,
+            tests,
+            Cell::plain(change),
+            Cell::plain(perf),
+            Cell::plain(published),
+            Cell::plain(self.mode),
+        ];
+        if let Some(project) = project {
+            cells.push(Cell::plain(project));
+        }
+        cells
+    }
+
+    /// The patch as a page of the browser from what the project records
+    /// about it, under `why` the patch service's own account is missing
+    /// (the end of a sentence: an error's text, which may run over
+    /// several lines or end in a period of its own).
+    fn local_page(&self, why: Option<&str>) -> Page {
+        let mut lines: Vec<String> = why
+            .map(|why| {
+                let why = sanitize(why)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                vec![
+                    format!(
+                        "The patch could not be read: {}.",
+                        why.trim_end_matches('.')
+                    ),
+                    String::new(),
+                    "What this project records:".to_string(),
+                    String::new(),
+                ]
+            })
+            .unwrap_or_default();
+        lines.extend(self.detail.lines().map(str::to_string));
+        Page {
+            title: self.purl.clone(),
+            lines,
+            marks: Vec::new(),
+        }
+    }
+}
+
+/// How many advisory ids a row names before it counts the rest.
+const IDS_SHOWN: usize = 2;
+
+/// The columns of the interactive table, with what each gives way to on
+/// a narrow terminal (the highest number first): the mode and the dates
+/// before the measurements, the measurements before the advisories.
+/// `projects`: the rows come from several project directories, so each
+/// says whose it is.
+fn columns(projects: bool) -> Vec<Column> {
+    let mut columns: Vec<Column> = [
+        ("SEVERITY", 0),
+        ("PACKAGE", 0),
+        ("FIXES", 1),
+        ("EXPLOITS", 4),
+        ("TESTS", 3),
+        ("CHANGE", 5),
+        ("PERF", 6),
+        ("PUBLISHED", 7),
+        ("MODE", 8),
+    ]
+    .into_iter()
+    .map(|(title, gives_way)| Column { title, gives_way })
+    .collect();
+    if projects {
+        columns.push(Column {
+            title: "PROJECT",
+            gives_way: 2,
+        });
+    }
+    columns
+}
+
+/// How the table names each of `rows`' packages
+/// ([`crate::ui::package_names`]).
+fn names(rows: &[&Browse]) -> Vec<String> {
+    crate::ui::package_names(&rows.iter().map(|row| row.purl.as_str()).collect::<Vec<_>>())
+}
+
+/// The table an interactive run opens with: what the project's own
+/// records say about each patch. The patch service's account of them
+/// fills in afterwards ([`Browse::cells`]).
+fn table_of(rows: &[(Browse, Option<String>)]) -> Table {
+    let patches: Vec<&Browse> = rows.iter().map(|(row, _)| row).collect();
+    let projects = rows.iter().any(|(_, project)| project.is_some());
+    let names = names(&patches);
+    Table {
+        title: format!(
+            "{} in this project",
+            crate::ui::plural(rows.len(), "patch", "patches")
+        ),
+        columns: columns(projects),
+        rows: rows
+            .iter()
+            .zip(&names)
+            .map(|((row, project), name)| row.cells(name, project.as_deref(), None))
+            .collect(),
+    }
+}
+
+/// Whether this run is someone at a terminal who can be shown a table to
+/// browse: a human run on a terminal that can show the full-screen
+/// browser ([`crate::ui::full_screen`]), that `--yes` did not ask to run
+/// unattended. `--verbose` keeps the full listing.
+fn interactive(common: &GlobalArgs) -> bool {
+    !common.json && !common.silent && !common.yes && !common.verbose && crate::ui::full_screen()
+}
+
+/// Browse `rows` full-screen: the table goes up at once with what the
+/// project records, the patch service's account of each patch (what it
+/// fixes, what was measured about it, when it was published) fills in as
+/// it arrives, and Enter opens a patch as a page: its summary and the
+/// diff of every file it changes. Nothing is changed by any of it.
+///
+/// Returns the table as it stood when the user left, for the listing
+/// that stays on the terminal. `--offline` asks the patch service
+/// nothing: the rows keep what the project records, and a patch opens as
+/// the project's own entry for it.
+async fn browse(rows: Vec<(Browse, Option<String>)>, common: &GlobalArgs) -> Table {
+    use futures_util::StreamExt as _;
+    use socket_patch_core::utils::concurrent::api_concurrency_for;
+
+    let table = table_of(&rows);
+    let names = names(&rows.iter().map(|(row, _)| row).collect::<Vec<_>>());
+    // The patch service's client is built once the table is up, by
+    // whichever read needs it first: building it can mean a request (a
+    // token with no organization named has its organization looked up),
+    // and the listing itself needs none, so it never waits for one.
+    // While the browser has the screen, core's advisories are muted: a
+    // line printed under it would land in the middle of the table. The
+    // one that explains what the table shows is printed after.
+    // Both reads go through `show`'s source of patches, so a row and the
+    // page it opens are read the same way, a refused token included.
+    let connection = tokio::sync::OnceCell::<crate::commands::show::Source>::new();
+    let connect = || async {
+        if common.offline {
+            return None;
+        }
+        Some(
+            connection
+                .get_or_init(|| async {
+                    let overrides = common.api_client_overrides();
+                    let client = socket_patch_core::api::client::get_api_client_with_overrides(
+                        overrides.clone(),
+                    )
+                    .await
+                    .0;
+                    crate::commands::show::Source::new(client, overrides)
+                })
+                .await,
+        )
+    };
+    socket_patch_core::utils::notice::set_output_mode(true, common.json);
+    let (updates, received) = std::sync::mpsc::channel::<Update>();
+    let (opened, mut opening) = tokio::sync::mpsc::unbounded_channel::<usize>();
+
+    // The browser blocks on the keyboard, so it runs off the runtime's
+    // threads. What it shows beyond the project's own records is read
+    // here, beside it: the patch service's account of each patch, a few at
+    // a time, and the page of each patch that is opened.
+    let mut browser = tokio::task::spawn_blocking(move || {
+        crate::ui::browser::run(table, received, move |row| {
+            let _ = opened.send(row);
+        })
+    });
+    let details = async {
+        let Some(source) = connect().await else {
+            return;
+        };
+        // What the project records as a patch's uuid comes from its own
+        // files (a manifest anyone can write): only one that is a UUID
+        // goes into a request to the patch service.
+        let mut uuids: Vec<String> = rows
+            .iter()
+            .map(|(row, _)| row.uuid.clone())
+            .filter(|uuid| socket_patch_core::utils::target::is_uuid_shaped(uuid))
+            .collect();
+        uuids.sort_unstable();
+        uuids.dedup();
+        if uuids.is_empty() {
+            return;
+        }
+        let total = uuids.len();
+        let _ = updates.send(Update::Note(format!("loading details 0/{total}")));
+        let mut answers = futures_util::stream::iter(uuids)
+            .map(|uuid| async move {
+                let (_, answer) = source.ask(|client| client.fetch_patch_summary(&uuid)).await;
+                (uuid, answer)
+            })
+            .buffer_unordered(api_concurrency_for(
+                source.client().uses_public_proxy(),
+                total,
+            ));
+        let mut done = 0;
+        while let Some((uuid, answer)) = answers.next().await {
+            done += 1;
+            // A patch that could not be read keeps its row as it is.
+            if let Ok(Some(detail)) = answer {
+                for (index, ((row, project), name)) in rows.iter().zip(&names).enumerate() {
+                    if row.uuid == uuid {
+                        let cells = row.cells(name, project.as_deref(), Some(&detail));
+                        let _ = updates.send(Update::Row(index, cells));
+                    }
+                }
+            }
+            let note = if done < total {
+                format!("loading details {done}/{total}")
+            } else {
+                String::new()
+            };
+            let _ = updates.send(Update::Note(note));
+        }
+    };
+    // A row opens as the page `show` opens for its patch, read the way
+    // `show` reads it; only a patch the service cannot be asked about
+    // opens as the project's own record.
+    let style = crate::ui::Style::stderr();
+    let page = |index: usize| {
+        let (rows, connect, updates) = (&rows, &connect, &updates);
+        async move {
+            let Some((row, _)) = rows.get(index) else {
+                return;
+            };
+            let page = match connect().await {
+                Some(source) => {
+                    match crate::commands::show::load_page(source, &row.uuid, style).await {
+                        Ok(page) => page,
+                        Err(why) => row.local_page(Some(&why)),
+                    }
+                }
+                None => row.local_page(None),
+            };
+            let _ = updates.send(Update::Page(index, Ok(page)));
+        }
+    };
+    let mut details = std::pin::pin!(details);
+    let mut detailed = false;
+    let mut pages = futures_util::stream::FuturesUnordered::new();
+    let left = loop {
+        tokio::select! {
+            left = &mut browser => break left,
+            () = &mut details, if !detailed => detailed = true,
+            Some(index) = opening.recv() => pages.push(page(index)),
+            Some(()) = pages.next(), if !pages.is_empty() => {}
+        }
+    };
+    drop(pages);
+    // The screen is the terminal's again: advisories print as before,
+    // and the one the browser withheld that explains its rows is said
+    // now (a token whose organization could not be found reads the
+    // public service, which knows free patches only).
+    socket_patch_core::utils::notice::set_output_mode(common.silent, common.json);
+    if let Some(reason) = connection
+        .get()
+        .and_then(|source| source.client().org_unresolved())
+    {
+        eprintln!("Warning: {reason}");
+    }
+    match left {
+        Ok(Ok(table)) => table,
+        // No full-screen browser here (the terminal could not be set up
+        // for one, or this is not Unix): the inline menu does the job.
+        Ok(Err(table)) => {
+            for line in listing_lines(&table) {
+                println!("{line}");
+            }
+            println!();
+            browse_inline(&rows, &table, common).await;
+            Table {
+                rows: Vec::new(),
+                ..table
+            }
+        }
+        // The browser's thread panicked: the terminal is restored by its
+        // guard, and the listing is still owed.
+        Err(_) => table_of(&rows),
+    }
+}
+
+/// The inline stand-in for the full-screen browser: an arrow-key menu of
+/// the rows under the printed listing; a pick prints `show`'s summary of
+/// the patch (`show --stat`: its fixes, measurements and files, without
+/// the diffs, which would push the menu off the screen) and comes back
+/// to the menu.
+async fn browse_inline(rows: &[(Browse, Option<String>)], table: &Table, common: &GlobalArgs) {
+    let options: Vec<String> =
+        crate::ui::browser::table_lines(table, usize::MAX, crate::ui::Style::PLAIN)
+            .into_iter()
+            .skip(1)
+            .map(|line| line.trim_start().to_string())
+            .collect();
+    let mut at = 0;
+    while let Ok(picked) =
+        crate::ui::select_from("Open a patch (Esc to leave)", &options, at, common)
+    {
+        at = picked;
+        let patch = &rows[picked].0;
+        // A recorded uuid that is not one is no identifier to look up.
+        let shown = !common.offline
+            && socket_patch_core::utils::target::is_uuid_shaped(&patch.uuid)
+            && crate::commands::show::run(crate::commands::show::ShowArgs {
+                identifier: patch.uuid.clone(),
+                common: common.clone(),
+                files: Vec::new(),
+                stat: true,
+                no_pager: false,
+            })
+            .await
+                == 0;
+        if !shown {
+            println!("{}", patch.detail);
+        }
+        println!();
+    }
+}
+
+/// The listing an interactive run leaves on the terminal: the count,
+/// then the table's rows as they stood ([`table_lines`]), cut to the
+/// terminal's width.
+///
+/// [`table_lines`]: crate::ui::browser::table_lines
+fn listing_lines(table: &Table) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Found {}:",
+        crate::ui::plural(table.rows.len(), "patch", "patches")
+    )];
+    lines.extend(crate::ui::browser::table_lines(
+        table,
+        crate::ui::stdout_width().saturating_sub(1),
+        crate::ui::Style::stdout(),
+    ));
+    lines
 }
 
 /// The listing of a project in an error state. Used for the "manifest not
@@ -224,21 +702,25 @@ fn failed_listing(
     message: String,
     warnings: Vec<RunWarning>,
 ) -> Listed {
+    // Errors print even under --silent; `--json` carries them instead.
+    let mut notes = Vec::new();
     let envelope = if args.common.json {
         let mut env = Envelope::new(Command::List);
         env.mark_error(EnvelopeError::new(code, message));
         env.warnings = warnings;
         Some(env)
     } else {
-        eprintln!("Error: {message}");
+        notes.push(format!("Error: {message}"));
         None
     };
     Listed {
         code: 1,
+        notes,
         envelope,
         text: None,
         patches: 0,
         manifest_patches: 0,
+        rows: Vec::new(),
     }
 }
 
@@ -348,9 +830,24 @@ fn format_listing(entries: &[ListEntry<'_>], color: bool) -> String {
 pub async fn run(args: ListArgs) -> i32 {
     use crate::commands::projects_below::{self, CWD_NAME};
     apply_env_toggles(&args.common);
+    // Someone at a terminal browses the patches; everyone else gets them
+    // printed.
+    let browsing = interactive(&args.common);
+    if !browsing && !args.common.yes && !args.common.verbose {
+        // On a terminal this would have been the table: say why not.
+        crate::ui::note_agent_terminal(&args.common);
+    }
+    // Finding and reading the projects walks the checkout and parses its
+    // lockfiles: the status line says so while it lasts. What a project
+    // has to say on stderr is held back until the line is down.
+    let mut status = crate::ui::StatusLine::stderr(args.common.json, args.common.silent);
+    status.set("Finding patched projects");
     // What `scan` patched from this directory is listed from it: the
     // project at `--cwd`, then the patched project directories below it.
     let below = projects_below::patched(&args.common, projects_below::Depth::All).await;
+    let here_patched =
+        !below.projects.is_empty() && projects_below::cwd_is_patched(&args.common).await;
+    status.finish();
     let loud = !args.common.json && !args.common.silent;
     if loud {
         below.print_notes();
@@ -360,15 +857,21 @@ pub async fn run(args: ListArgs) -> i32 {
     // when it holds patches itself: listed first, under the heading scan
     // gives `--cwd`. A project's warnings and errors go to stderr as it is
     // read, so its heading goes out before it is.
-    let mut here = !below.projects.is_empty() && projects_below::cwd_is_patched(&args.common).await;
-    if here && loud {
+    let mut here = here_patched;
+    // The headings belong to the printed listing: a browsed one names each
+    // row's project in a column.
+    let headed = loud && !browsing;
+    if here && headed {
         println!("{}", projects_below::heading(CWD_NAME));
     }
-    let mut own = list_project(&args).await;
+    status.set("Reading patches");
+    let mut own = list_project(&args, browsing).await;
+    status.finish();
+    own.print_notes();
     // The listing has the last word on what `--cwd` holds.
     if !here && !below.projects.is_empty() && (own.patches > 0 || own.code != 0) {
         here = true;
-        if loud {
+        if headed {
             println!("{}", projects_below::heading(CWD_NAME));
         }
     }
@@ -382,10 +885,13 @@ pub async fn run(args: ListArgs) -> i32 {
         let child = ListArgs {
             common: project.common(&args.common),
         };
-        if loud {
+        if headed {
             println!("{}", projects_below::heading(&project.shown));
         }
-        let listing = list_project(&child).await;
+        status.set(format!("Reading patches in {}", project.shown));
+        let mut listing = list_project(&child, browsing).await;
+        status.finish();
+        listing.print_notes();
         if let Some(text) = &listing.text {
             println!("{text}");
         }
@@ -440,7 +946,7 @@ pub async fn run(args: ListArgs) -> i32 {
             println!("{text}");
         }
     } else {
-        if loud {
+        if headed {
             let patches: usize = listed.iter().map(|(_, listing)| listing.patches).sum();
             println!(
                 "\n{} in {}.",
@@ -471,6 +977,31 @@ pub async fn run(args: ListArgs) -> i32 {
             );
         }
     }
+    // Someone at a terminal browses every patch found, in one table, and
+    // what it showed when they left is the listing that stays.
+    let shown_own = here || listed.is_empty();
+    let several = !listed.is_empty();
+    let rows: Vec<(Browse, Option<String>)> = own
+        .rows
+        .drain(..)
+        .filter(|_| shown_own)
+        .map(|row| (row, several.then(|| CWD_NAME.to_string())))
+        .chain(listed.iter_mut().flat_map(|(shown, listing)| {
+            let shown = shown.to_string();
+            listing
+                .rows
+                .drain(..)
+                .map(move |row| (row, Some(shown.clone())))
+        }))
+        .collect();
+    if !rows.is_empty() {
+        let table = browse(rows, &args.common).await;
+        if !table.rows.is_empty() {
+            for line in listing_lines(&table) {
+                println!("{line}");
+            }
+        }
+    }
     listed
         .iter()
         .fold(own.code, |code, (_, listing)| code.max(listing.code))
@@ -478,7 +1009,11 @@ pub async fn run(args: ListArgs) -> i32 {
 
 /// Read the patches of the project at `args.common.cwd`: the manifest's,
 /// the vendor ledger's and the hosted pins its lockfiles wire.
-async fn list_project(args: &ListArgs) -> Listed {
+///
+/// `browsing`: the run shows its patches in the full-screen table, so the
+/// listing comes back as rows for it instead of text to print (a project
+/// with nothing to list still says so in text).
+async fn list_project(args: &ListArgs, browsing: bool) -> Listed {
     let manifest_path = args.common.resolved_manifest_path();
 
     // One load of the three stores, all from the SAME project as the
@@ -507,6 +1042,8 @@ async fn list_project(args: &ListArgs) -> Listed {
     // to consult", surfaced on stderr unless --silent, or in the envelope's
     // `warnings[]` under --json.
     let mut warnings: Vec<RunWarning> = Vec::new();
+    // The human copies of those warnings: printed by the caller.
+    let mut notes: Vec<String> = Vec::new();
     let legacy_redirect = match &loaded.redirect {
         Ok(state) => state.as_ref(),
         Err(corrupt) => {
@@ -516,7 +1053,7 @@ async fn list_project(args: &ListArgs) -> Listed {
                     corrupt.to_string(),
                 ));
             } else if !args.common.silent {
-                eprintln!("Warning: {corrupt}");
+                notes.push(format!("Warning: {corrupt}"));
             }
             None
         }
@@ -530,7 +1067,7 @@ async fn list_project(args: &ListArgs) -> Listed {
         if args.common.json {
             warnings.push(RunWarning::new("hosted_wiring_contested", detail.clone()));
         } else if !args.common.silent {
-            eprintln!("Warning: {}", crate::ui::sentence_case(detail));
+            notes.push(format!("Warning: {}", crate::ui::sentence_case(detail)));
         }
     }
     // A hosted `resolutions` selector (#1203) or uv override pin (#1445)
@@ -566,7 +1103,7 @@ async fn list_project(args: &ListArgs) -> Listed {
         if args.common.json {
             warnings.push(RunWarning::new("hosted_resolution_orphaned", detail));
         } else if !args.common.silent {
-            eprintln!("Warning: {}", crate::ui::sentence_case(&detail));
+            notes.push(format!("Warning: {}", crate::ui::sentence_case(&detail)));
         }
     }
     // A broken vendor ledger degrades to nothing-to-list here (every path
@@ -581,7 +1118,7 @@ async fn list_project(args: &ListArgs) -> Listed {
             if args.common.json {
                 warnings.push(RunWarning::new("vendor_state_unreadable", detail));
             } else if !args.common.silent {
-                eprintln!("Warning: {detail}");
+                notes.push(format!("Warning: {detail}"));
             }
             None
         }
@@ -593,7 +1130,10 @@ async fn list_project(args: &ListArgs) -> Listed {
     let entries = combined_entries(manifest, &hosted, vendor_state);
     if manifest.is_none() && entries.is_empty() {
         if let Some(detail) = contested {
-            return failed_listing(args, "hosted_wiring_contested", detail, warnings);
+            let mut failed = failed_listing(args, "hosted_wiring_contested", detail, warnings);
+            // The warnings read before the error come before it.
+            failed.notes.splice(0..0, notes);
+            return failed;
         }
     }
 
@@ -607,6 +1147,8 @@ async fn list_project(args: &ListArgs) -> Listed {
         text: None,
         patches: entries.len(),
         manifest_patches: manifest.map_or(0, |m| m.patches.len()),
+        rows: Vec::new(),
+        notes,
     };
     if args.common.json {
         let mut env = build_list_envelope(&entries);
@@ -614,6 +1156,14 @@ async fn list_project(args: &ListArgs) -> Listed {
         listed.envelope = Some(env);
     } else if args.common.silent {
         // `--silent` is "errors only" (CLI_CONTRACT.md).
+    } else if browsing && !entries.is_empty() {
+        // Someone at a terminal browses the patches in a table; a pipe, a
+        // log and `--verbose` get every entry in full.
+        let color = crate::ui::stderr_color();
+        listed.rows = entries
+            .iter()
+            .map(|entry| Browse::of(entry, color))
+            .collect();
     } else {
         listed.text = Some(format_listing(&entries, crate::ui::stdout_color()));
     }
@@ -673,6 +1223,273 @@ mod tests {
         PatchManifest {
             patches,
             setup: None,
+        }
+    }
+
+    fn browse_row(purl: &str, severity: &str, ids: &[&str], mode: &'static str) -> Browse {
+        Browse {
+            purl: purl.to_string(),
+            uuid: format!("{:08x}-1111-4111-8111-111111111111", purl.len()),
+            severity: severity.to_string(),
+            ids: ids.iter().map(|id| id.to_string()).collect(),
+            mode,
+            detail: format!("Package: {purl}\n  UUID: 1234"),
+        }
+    }
+
+    fn text(cells: &[Cell]) -> Vec<&str> {
+        cells.iter().map(|cell| cell.text.as_str()).collect()
+    }
+
+    /// The table someone at a terminal browses opens with what the project
+    /// records: a row per patch with its worst severity (painted), the
+    /// advisories it fixes and the mode it is patched in.
+    #[test]
+    fn the_browsed_table_opens_with_what_the_project_records() {
+        let manifest = sample_manifest();
+        let entries = combined_entries(Some(&manifest), &[], None);
+        let row = Browse::of(&entries[0], false);
+        assert_eq!(row.purl, "pkg:npm/minimist@1.2.2");
+        assert_eq!(row.severity, "HIGH");
+        assert_eq!(row.ids, ["CVE-2024-12345"]);
+        assert_eq!(row.mode, "agent");
+        assert!(row.detail.starts_with("Package: pkg:npm/minimist@1.2.2"));
+
+        let rows = vec![
+            (row, None),
+            (
+                browse_row(
+                    "pkg:npm/%40scope/a-much-longer-name@10.0.0",
+                    "CRITICAL",
+                    &["CVE-2026-1", "CVE-2026-2", "CVE-2026-3"],
+                    "vendored",
+                ),
+                None,
+            ),
+            // A hosted pin records only its uuid: no severity, no ids.
+            (browse_row("pkg:npm/undici@6.27.0", "", &[], "hosted"), None),
+        ];
+        let table = table_of(&rows);
+        assert_eq!(table.title, "3 patches in this project");
+        assert_eq!(
+            table.columns.iter().map(|c| c.title).collect::<Vec<_>>(),
+            [
+                "SEVERITY",
+                "PACKAGE",
+                "FIXES",
+                "EXPLOITS",
+                "TESTS",
+                "CHANGE",
+                "PERF",
+                "PUBLISHED",
+                "MODE"
+            ]
+        );
+        assert_eq!(
+            text(&table.rows[0]),
+            [
+                "HIGH",
+                "minimist@1.2.2",
+                "CVE-2024-12345",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "agent"
+            ]
+        );
+        assert_eq!(table.rows[0][0].paint, Some("31"));
+        assert_eq!(
+            text(&table.rows[1])[..3],
+            [
+                "CRITICAL",
+                "@scope/a-much-longer-name@10.0.0",
+                "CVE-2026-1, CVE-2026-2 (+1)"
+            ]
+        );
+        assert_eq!(table.rows[1][0].paint, Some("91"));
+        assert_eq!(text(&table.rows[2])[..3], ["", "undici@6.27.0", ""]);
+        assert_eq!(table.rows[2][0].paint, None);
+        // The listing that stays on the terminal is those rows in columns;
+        // the ones nothing is known for yet take no room.
+        assert_eq!(
+            crate::ui::browser::table_lines(&table, 200, crate::ui::Style::PLAIN),
+            [
+                "  SEVERITY  PACKAGE                           FIXES                        MODE",
+                "  HIGH      minimist@1.2.2                    CVE-2024-12345               agent",
+                "  CRITICAL  @scope/a-much-longer-name@10.0.0  CVE-2026-1, CVE-2026-2 (+1)  vendored",
+                "            undici@6.27.0                                                  hosted",
+            ]
+        );
+
+        // Rows of several project directories say whose they are, and
+        // packages of two ecosystems are named by purl.
+        let mixed = vec![
+            (
+                browse_row("pkg:npm/undici@6.27.0", "", &[], "hosted"),
+                Some(".".to_string()),
+            ),
+            (
+                browse_row("pkg:pypi/requests@2.31.0", "", &[], "hosted"),
+                Some("services/worker".to_string()),
+            ),
+        ];
+        let table = table_of(&mixed);
+        assert_eq!(table.columns.last().map(|c| c.title), Some("PROJECT"));
+        assert_eq!(
+            text(&table.rows[1])[1..],
+            [
+                "pkg:pypi/requests@2.31.0",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "hosted",
+                "services/worker"
+            ]
+        );
+    }
+
+    /// The patch service's account of a patch fills its row in: what was
+    /// measured about it (green when every exploit is blocked and every
+    /// test passes, yellow when not), the size and cost of the change and
+    /// when it was published. It also names the advisories of a patch the
+    /// project records by uuid alone.
+    #[test]
+    fn a_row_fills_in_from_the_patch_service() {
+        use socket_patch_core::api::types::{
+            PatchDiffSize, PatchPerformance, PatchResponse, PatchStatistics, VulnerabilityResponse,
+        };
+        let detail = |statistics: Option<PatchStatistics>| PatchResponse {
+            uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            purl: "pkg:npm/undici@6.27.0".to_string(),
+            published_at: "Fri, 14 Nov 2026 07:13:44 GMT".to_string(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::from([
+                (
+                    "GHSA-aaaa-bbbb-cccc".to_string(),
+                    VulnerabilityResponse {
+                        cves: vec!["CVE-2026-84961".to_string()],
+                        summary: "A summary".to_string(),
+                        severity: "high".to_string(),
+                        description: String::new(),
+                    },
+                ),
+                (
+                    "GHSA-dddd-eeee-ffff".to_string(),
+                    VulnerabilityResponse {
+                        cves: Vec::new(),
+                        summary: "Another".to_string(),
+                        severity: "critical".to_string(),
+                        description: String::new(),
+                    },
+                ),
+            ]),
+            description: String::new(),
+            license: "MIT".to_string(),
+            tier: "free".to_string(),
+            statistics,
+        };
+        let measured = PatchStatistics {
+            diff: Some(PatchDiffSize {
+                lines_added: 26,
+                lines_removed: 22,
+                files_changed: 2,
+            }),
+            performance: Some(PatchPerformance {
+                general_wall_change: Some(0.2),
+                hot_wall_change: Some(0.008),
+                peak_mem_change: None,
+            }),
+            ..crate::commands::measured::tests::stats(2, 34, 35)
+        };
+
+        // A hosted pin: everything comes from the patch service.
+        let pin = browse_row("pkg:npm/undici@6.27.0", "", &[], "hosted");
+        let cells = pin.cells("undici@6.27.0", None, Some(&detail(Some(measured))));
+        assert_eq!(
+            text(&cells),
+            [
+                "CRITICAL",
+                "undici@6.27.0",
+                "CVE-2026-84961, GHSA-dddd-eeee-ffff",
+                "2/2",
+                "34/35",
+                "+26 -22",
+                "+0.8%",
+                "14 Nov 2026",
+                "hosted"
+            ]
+        );
+        assert_eq!(cells[0].paint, Some("91"));
+        assert_eq!(cells[3].paint, Some("32"), "every exploit blocked");
+        assert_eq!(cells[4].paint, Some("33"), "a test still failing");
+
+        // What the project records about a patch stays: the service only
+        // adds to it. A patch that was never measured shows its date.
+        let recorded = browse_row("pkg:npm/undici@6.27.0", "LOW", &["CVE-2020-1"], "agent");
+        assert_eq!(
+            text(&recorded.cells("undici@6.27.0", Some("."), Some(&detail(None)))),
+            [
+                "LOW",
+                "undici@6.27.0",
+                "CVE-2020-1",
+                "",
+                "",
+                "",
+                "",
+                "14 Nov 2026",
+                "agent",
+                "."
+            ]
+        );
+    }
+
+    /// With the patch service out of reach (or `--offline`) a patch opens
+    /// as what the project records about it, under the reason.
+    #[test]
+    fn a_patch_opens_as_the_projects_record_when_the_service_cannot_be_asked() {
+        let row = browse_row("pkg:npm/undici@6.27.0", "", &[], "hosted");
+        let page = row.local_page(None);
+        assert_eq!(page.title, "pkg:npm/undici@6.27.0");
+        assert_eq!(
+            page.lines,
+            ["Package: pkg:npm/undici@6.27.0", "  UUID: 1234"]
+        );
+        assert!(page.marks.is_empty());
+        assert_eq!(
+            row.local_page(Some("timed out")).lines,
+            [
+                "The patch could not be read: timed out.",
+                "",
+                "What this project records:",
+                "",
+                "Package: pkg:npm/undici@6.27.0",
+                "  UUID: 1234"
+            ]
+        );
+        // An error's text is one line of the page whatever its shape: a
+        // period of its own is not doubled, and a body that runs over
+        // several lines, or carries an escape sequence, cannot break the
+        // frame.
+        for (why, line) in [
+            (
+                "Rate limit exceeded. Please try again later.",
+                "The patch could not be read: Rate limit exceeded. Please try again later.",
+            ),
+            (
+                "status 500:\n  upstream\tfailed\r\n",
+                "The patch could not be read: status 500: upstream failed.",
+            ),
+            (
+                "bad \u{1b}[31mbody",
+                "The patch could not be read: bad [31mbody.",
+            ),
+        ] {
+            assert_eq!(row.local_page(Some(why)).lines[0], line);
         }
     }
 
