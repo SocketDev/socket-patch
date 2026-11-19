@@ -25,6 +25,7 @@ pdm = load_script("backtest-pdm")
 bun = load_script("backtest-bun")
 vlt = load_script("backtest-vlt")
 poetry = load_script("backtest-poetry")
+pixi = load_script("backtest-pixi")
 
 
 class BunTransportRetryTests(unittest.TestCase):
@@ -1230,6 +1231,69 @@ class VltProbeTests(unittest.TestCase):
                                 'details': {'mode': 'vendored'}}]}
         self.assertEqual(sorted(vlt.envelope_codes(envelope)),
                          ['a', 'b', 'c', 'redirect_vlt_lock_unsupported'])
+
+
+class PixiHarnessTests(unittest.TestCase):
+    def test_every_default_release_is_pinned_for_the_ci_hosts(self):
+        for version in pixi.VERSIONS:
+            for triple in ('x86_64-unknown-linux-musl', 'aarch64-apple-darwin'):
+                self.assertRegex(pixi.PIXI_SHA256.get((version, triple), ''), r'^[0-9a-f]{64}$',
+                                 f'{version} {triple}')
+
+    def test_a_release_asset_with_another_digest_is_not_installed(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'not the pinned archive'
+
+        with tempfile.TemporaryDirectory() as temp:
+            tools = Path(temp)
+            with patch.object(pixi.urllib.request, 'urlopen', return_value=Response()), \
+                    patch.object(pixi, 'host_triple', return_value='x86_64-unknown-linux-musl'):
+                with self.assertRaises(SystemExit) as refused:
+                    pixi.fetch_pixi(pixi.VERSIONS[-1], tools, None)
+            self.assertIn('is not the pinned', str(refused.exception))
+            self.assertEqual([p for p in tools.rglob('*') if p.is_file()], [])
+
+    def test_an_unpinned_release_is_refused_before_any_download(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(pixi.urllib.request, 'urlopen', side_effect=AssertionError('downloaded')), \
+                    patch.object(pixi, 'host_triple', return_value='x86_64-unknown-linux-musl'):
+                with self.assertRaises(SystemExit) as refused:
+                    pixi.fetch_pixi('0.0.1', Path(temp), None)
+            self.assertIn('no SHA-256 pinned', str(refused.exception))
+
+    def test_each_shape_puts_the_package_where_its_name_says(self):
+        pin = f'{pixi.PACKAGE} = "=={pixi.PACKAGE_VERSION}"'
+        name, conda = pixi.manifest_text('conda', '0.84.2')
+        self.assertEqual(name, 'pixi.toml')
+        self.assertIn('[workspace]', conda)
+        self.assertIn(pin, conda.split('[dependencies]')[1])
+
+        _, pypi = pixi.manifest_text('pypi', '0.84.2')
+        conda_table, pypi_table = pypi.split('[pypi-dependencies]')
+        self.assertNotIn(pixi.PACKAGE, conda_table.split('[dependencies]')[1])
+        self.assertIn(pin, pypi_table)
+
+        name, pyproject = pixi.manifest_text('pyproject', '0.84.2')
+        self.assertEqual(name, 'pyproject.toml')
+        self.assertIn('[tool.pixi.workspace]', pyproject)
+        self.assertIn(pin, pyproject.split('[tool.pixi.dependencies]')[1])
+
+        # Before 0.41 the manifest's own table is `[project]`.
+        _, old = pixi.manifest_text('conda', '0.39.5')
+        self.assertIn('[project]', old)
+        self.assertNotIn('[workspace]', old)
+
+        _, multi = pixi.manifest_text('multi-env', '0.84.2')
+        self.assertIn('[environments]', multi)
+        self.assertEqual(pixi.environments('multi-env'), ['default', 'extra'])
+        self.assertEqual(pixi.environments('conda'), ['default'])
 
 
 if __name__ == "__main__":
