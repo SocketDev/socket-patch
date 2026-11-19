@@ -2303,6 +2303,31 @@ impl<'a> DiscoverCtx<'a> {
         self.ignored.contains(&rel)
     }
 
+    /// [`Self::read_text`] for a path that may be no file at all (one the
+    /// Maven reactor reader asks about: a module named by its directory, a
+    /// module's `.mvn` file): missing, or not a file that can be opened, it
+    /// is `Ok(None)` with no diagnostic. What is read is recognized and
+    /// logged all the same. A file that is there but is not UTF-8 text is
+    /// `Err`, with the reader's message: its content is unknown, which the
+    /// caller must say rather than take the file for absent.
+    pub(crate) async fn read_text_quiet(&self, rel: &str) -> Result<Option<String>, String> {
+        if self.is_ignored(rel) {
+            return Ok(None);
+        }
+        match self.view.read_text(rel).await {
+            Ok(text) => {
+                self.log_read(rel, true);
+                self.recognize_text(rel, &text);
+                Ok(Some(text))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                self.log_read(rel, false);
+                Err(e.to_string())
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Guarded UTF-8 read of root-relative `rel`: `None` when missing
     /// (silent) or unreadable ([`DIAG_LOCKFILE_UNREADABLE`] recorded). The
     /// content is swept for the Socket identities it mentions BEFORE any

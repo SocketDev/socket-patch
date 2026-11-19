@@ -619,6 +619,12 @@ pub struct CandidateFiles {
     /// are left out of `files`; a project whose candidates could rewrite
     /// one is refused rather than read as if the file were absent.
     pub undecodable_reads: Vec<String>,
+    /// Poms of the Maven reactor (a module's, or a parent's inside the
+    /// checkout, whatever the file is called) that exist but are not UTF-8
+    /// text. A Maven candidate could rewrite any of them, so the run is
+    /// refused like for [`Self::undecodable_reads`], never planned as if
+    /// the pom were missing.
+    pub undecodable_maven_poms: Vec<String>,
     /// Gradle build files the script graph reached that exist but cannot be
     /// read as text (any view): the hosted Gradle planner refuses the build
     /// instead of taking them for absent (and creating a settings file over
@@ -735,19 +741,96 @@ async fn read_advisory(
     unreadable: &BTreeSet<String>,
     rel: &str,
 ) -> Option<String> {
+    read_pom_text(view, unreadable, rel).await.ok().flatten()
+}
+
+/// The file `rel` is there, but is not UTF-8 text.
+struct Undecodable;
+
+/// [`read_advisory`] that tells a file which is there but is not UTF-8
+/// text (`Err`) from one that is missing, linked or not readable at all
+/// (`Ok(None)`): the first is a file whose content this run does not know,
+/// and must never be taken for an absent one.
+async fn read_pom_text(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    rel: &str,
+) -> Result<Option<String>, Undecodable> {
     match view {
-        ProjectView::Disk(_) | ProjectView::Snapshot(_) => view.read_text(rel).await.ok(),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => match view.read_text(rel).await {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(Undecodable),
+            Err(_) => Ok(None),
+        },
         ProjectView::Memory(project) if !project.is_symlink(rel) && !unreadable.contains(rel) => {
             match project.get(rel) {
-                Some(MemoryEntry::Text(text)) => Some(text.to_string()),
-                Some(MemoryEntry::Binary(bytes)) => {
-                    std::str::from_utf8(bytes).ok().map(str::to_string)
-                }
-                _ => None,
+                Some(MemoryEntry::Text(text)) => Ok(Some(text.to_string())),
+                Some(MemoryEntry::Binary(bytes)) => std::str::from_utf8(bytes)
+                    .map(|text| Some(text.to_string()))
+                    .map_err(|_| Undecodable),
+                _ => Ok(None),
             }
         }
-        ProjectView::Memory(_) => None,
+        ProjectView::Memory(_) => Ok(None),
     }
+}
+
+/// Read every file the Maven reactor planner reads for the root `pom.xml`
+/// ([`read_reactor`](crate::vendor::jvm::maven_reactor::read_reactor), the
+/// reader discovery and restore share, so each finds what the others
+/// wrote): every pom is fetched and parsed once, however many modules.
+///
+/// They are advisory input: a module pom that is a symbolic link, or that
+/// cannot be opened, is left out, and the planner then finds the reactor
+/// incomplete and refuses it with nothing written. That is what a reactor
+/// got before module poms were read at all; it never fails the run, as an
+/// unreadable root candidate does. A pom that is there but is not UTF-8
+/// text is another matter: its content is unknown, not absent, so it is
+/// recorded ([`CandidateFiles::undecodable_maven_poms`]) and the guard
+/// refuses the run for it, as for an undecodable root pom.
+async fn read_maven_reactor(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    out: &mut CandidateFiles,
+) {
+    let Some(root) = out.files.get("pom.xml") else {
+        return;
+    };
+    let config = out.files.get(crate::patch::redirect::MVN_CONFIG);
+    // A pom that is there but is not UTF-8 text is not a missing module:
+    // its content is unknown, so it is recorded like any other undecodable
+    // candidate and the run is refused for it (`candidate_file_unreadable`),
+    // instead of the reactor being reported as short of a pom it has.
+    let undecodable = std::sync::Mutex::new(Vec::new());
+    let read = crate::vendor::jvm::maven_reactor::read_reactor(
+        view,
+        root,
+        config.map(String::as_str),
+        |rel| {
+            let undecodable = &undecodable;
+            async move {
+                match read_pom_text(view, unreadable, &rel).await {
+                    Ok(text) => text,
+                    Err(Undecodable) => {
+                        undecodable
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(rel);
+                        None
+                    }
+                }
+            }
+        },
+    )
+    .await;
+    for (rel, text) in read {
+        out.files.entry(rel).or_insert(text);
+    }
+    let mut undecodable = undecodable
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    undecodable.sort();
+    out.undecodable_maven_poms = undecodable;
 }
 
 /// An in-memory project's Go files as the hosted engine reads them
@@ -1072,25 +1155,12 @@ pub async fn read_candidate_files(
         read_go_workspace(view, unreadable, &mut out).await;
     }
 
-    // A Maven 4 root that discovers its subprojects (#1809): each direct
-    // subdirectory holding a `pom.xml` is a module, which the pom rewriter
-    // must see to refuse the root as a reactor (it pins only the root pom).
-    // Advisory: keyed `<dir>/pom.xml`, never rewritten, and one that cannot
-    // be read still counts as present.
+    // Every pom of a Maven reactor (the modules the root lists, theirs in
+    // turn, each parent pom one inherits from inside the checkout, and the
+    // subprojects Maven 4 discovers, #1809): the rewriter pins a patch in
+    // the poms of the modules that select it.
     if candidates.iter().any(|c| c.dep.ecosystem == "maven") {
-        if let Some(pom) = out.files.get("pom.xml") {
-            let config = out.files.get(crate::patch::redirect::MVN_CONFIG);
-            if crate::vendor::jvm::maven_reactor::may_discover_subprojects(
-                pom,
-                config.map(String::as_str),
-            ) {
-                for dir in crate::vendor::jvm::maven_reactor::implicit_subprojects_in(view).await {
-                    let rel = format!("{dir}/pom.xml");
-                    let text = read_advisory(view, unreadable, &rel).await;
-                    out.files.insert(rel, text.unwrap_or_default());
-                }
-            }
-        }
+        read_maven_reactor(view, unreadable, &mut out).await;
     }
 
     // NuGet merges the user config and every parent directory's config
@@ -2063,6 +2133,8 @@ pub struct Rewritten {
     pub symlinked_reads: Vec<String>,
     pub unreadable_reads: Vec<String>,
     pub undecodable_reads: Vec<String>,
+    /// [`CandidateFiles::undecodable_maven_poms`].
+    pub undecodable_maven_poms: Vec<String>,
     /// The rewriters' override slice (the candidates' deps).
     pub overrides: Vec<DepOverride>,
     pub rewrite: RewriteResult,
@@ -2703,6 +2775,7 @@ async fn rewrite_once(
         symlinked_reads,
         unreadable_reads,
         undecodable_reads,
+        undecodable_maven_poms,
         gradle_unreadable,
         gem_refusal,
         pnpm_refusal,
@@ -2751,11 +2824,9 @@ async fn rewrite_once(
     } else {
         CratesIoSource::Registry
     };
-    // Asked only for a pom the rewriter will edit: it refuses a reactor
-    // root whole, whatever Maven selects there.
+    // Asked only when there is a pom to pin: a single one, or a reactor's.
     let maven_selection = (rewrite_overrides.iter().any(|o| o.ecosystem == "maven")
-        && files.contains_key("pom.xml")
-        && !crate::patch::redirect::maven_reactor_root(&files))
+        && files.contains_key("pom.xml"))
     .then(|| (options.maven_selection)())
     .flatten();
     let (files, mut rewrite) = if options.blocking {
@@ -2987,6 +3058,7 @@ async fn rewrite_once(
         symlinked_reads,
         unreadable_reads,
         undecodable_reads,
+        undecodable_maven_poms,
         overrides,
         rewrite,
         rewritten,
@@ -3867,6 +3939,11 @@ fn confirm(
                 if !gradle || !files.contains_key("pom.xml") {
                     return ProbeStep::Decided(gradle);
                 }
+                if rewrite.maven_reactor_uuids.contains(uuid) {
+                    return ProbeStep::Decided(
+                        rewrite.confirmed_maven_reactor_uuids.contains(uuid),
+                    );
+                }
                 let needles = candidate_presence_needles(&c.dep);
                 return ProbeStep::Decided(
                     final_texts
@@ -3874,6 +3951,12 @@ fn confirm(
                         .filter(|(name, _)| *name == "pom.xml" || name.starts_with(".mvn/"))
                         .any(|(_, text)| needles.iter().any(|n| text.contains(n.as_str()))),
                 );
+            }
+            // A dep the Maven reactor planner decided: its pin may sit in a
+            // module pom, a property or a comment-recorded declaration, so
+            // the planner's own report confirms it.
+            if rewrite.maven_reactor_uuids.contains(uuid) {
+                return ProbeStep::Decided(rewrite.confirmed_maven_reactor_uuids.contains(uuid));
             }
             ProbeStep::Needles(candidate_presence_needles(&c.dep))
         })
@@ -3964,6 +4047,17 @@ pub fn undecodable_guard(undecodable: &[String], candidates: &[Candidate]) -> Op
         .map(|rel| undecodable_refusal(rel))
 }
 
+/// The non-UTF-8 rule for the poms of a Maven reactor
+/// ([`CandidateFiles::undecodable_maven_poms`]): with a Maven candidate,
+/// the first of them refuses the run, as an undecodable root `pom.xml`
+/// does. A module's pom may be a file of any name, so these are judged by
+/// what read them, not by their name.
+pub fn undecodable_maven_guard(poms: &[String], candidates: &[Candidate]) -> Option<Refusal> {
+    poms.first()
+        .filter(|_| candidates.iter().any(|c| c.dep.ecosystem == "maven"))
+        .map(|rel| undecodable_refusal(rel))
+}
+
 /// SYMLINK GUARD — fail-closed, whole rewrite, before any write (hosted
 /// rewrites are transactional). The writer stages next to
 /// the path and renames over it, which REPLACES a symbolic link with a
@@ -3996,6 +4090,9 @@ pub fn guard(
         return Some(symlink_refusal(linked));
     }
     if let Some(refusal) = undecodable_guard(&done.undecodable_reads, candidates) {
+        return Some(refusal);
+    }
+    if let Some(refusal) = undecodable_maven_guard(&done.undecodable_maven_poms, candidates) {
         return Some(refusal);
     }
     let candidate_ecosystems: BTreeSet<&str> = candidates
@@ -6523,21 +6620,24 @@ snapshots:
     /// #1809: a Maven 4 root whose subprojects Maven discovers (model
     /// 4.1.0, `pom` packaging, no list) is a reactor once a direct
     /// subdirectory holds a `pom.xml`. The engine reads that pom beside
-    /// the root, on disk and in memory, so the pom rewriter refuses the
-    /// root instead of pinning only it while the module keeps its version.
+    /// the root, on disk and in memory, so the pom rewriter plans both: a
+    /// subproject that declares the version itself is not left behind.
     #[tokio::test]
-    async fn a_maven_4_implicit_reactor_root_is_refused() {
+    async fn a_maven_4_implicit_reactor_is_read_and_planned_whole() {
         let root = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n  <modelVersion>4.1.0</modelVersion>\n  <groupId>x</groupId>\n  <artifactId>y</artifactId>\n  <version>1</version>\n  <packaging>pom</packaging>\n  <dependencies>\n    <dependency>\n      <groupId>com.socketfixture</groupId>\n      <artifactId>victim</artifactId>\n      <version>1.10.0</version>\n    </dependency>\n  </dependencies>\n</project>\n";
         let child = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n  <modelVersion>4.1.0</modelVersion>\n  <parent/>\n  <artifactId>a</artifactId>\n</project>\n";
-        let refused = |read: &CandidateFiles, done: &Rewritten| {
+        let planned = |read: &CandidateFiles, done: &Rewritten| {
             assert!(
                 read.files.contains_key("a/pom.xml"),
                 "{:?}",
                 read.files.keys()
             );
-            assert!(!done.rewrite.files.contains_key("pom.xml"));
-            assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
-            assert!(done
+            assert!(
+                done.rewrite.files["pom.xml"].contains("<version>1.10.0-socket.4d5e6f70</version>")
+            );
+            assert!(done.rewrite.files["pom.xml"].contains("<id>socket-patch-"));
+            assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
+            assert!(!done
                 .rewrite
                 .warnings
                 .iter()
@@ -6548,7 +6648,21 @@ snapshots:
         p.insert_text("pom.xml", root);
         p.insert_text("a/pom.xml", child);
         let (read, done) = gradle_rewrite(&p).await;
-        refused(&read, &done);
+        planned(&read, &done);
+        assert!(!done.rewrite.files.contains_key("a/pom.xml"));
+
+        // A subproject that declares the version itself is rewritten too.
+        let declaring = child.replace(
+            "</artifactId>",
+            "</artifactId>\n  <dependencies>\n    <dependency>\n      <groupId>com.socketfixture</groupId>\n      <artifactId>victim</artifactId>\n      <version>1.10.0</version>\n    </dependency>\n  </dependencies>",
+        );
+        let mut p = MemoryProject::new();
+        p.insert_text("pom.xml", root);
+        p.insert_text("a/pom.xml", declaring.as_str());
+        let (read, done) = gradle_rewrite(&p).await;
+        planned(&read, &done);
+        assert!(done.rewrite.files["a/pom.xml"].contains("1.10.0-socket.4d5e6f70"));
+        assert!(!done.rewrite.files["a/pom.xml"].contains("<repository>"));
 
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("pom.xml"), root).unwrap();
@@ -6557,22 +6671,25 @@ snapshots:
         // A directory without a pom is no subproject.
         std::fs::create_dir(tmp.path().join("src")).unwrap();
         let (read, done) = gradle_rewrite_in(&ProjectView::Disk(tmp.path())).await;
-        refused(&read, &done);
+        planned(&read, &done);
         assert!(!read.files.contains_key("src/pom.xml"));
 
-        // A suffixed version an earlier release pinned into the root, or one
-        // a module names, confirms nothing: the refused root pins nothing.
+        // A reactor one of whose poms cannot be read is refused whole, and
+        // a suffixed version an earlier run left in it then confirms
+        // nothing: the refused root pins nothing.
         let stale = root.replace("1.10.0", "1.10.0-socket.4d5e6f70");
-        let named = child.replace(
-            "</artifactId>",
-            "</artifactId>\n  <properties><v>1.10.0-socket.4d5e6f70</v></properties>",
-        );
-        for (r, c) in [(stale.as_str(), child), (root, named.as_str())] {
+        for r in [root, stale.as_str()] {
             let mut p = MemoryProject::new();
             p.insert_text("pom.xml", r);
-            p.insert_text("a/pom.xml", c);
-            let (read, done) = gradle_rewrite(&p).await;
-            refused(&read, &done);
+            p.insert_text("a/pom.xml", "<project>");
+            let (_, done) = gradle_rewrite(&p).await;
+            assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+            assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+            assert!(done
+                .rewrite
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_maven_multimodule_unsupported"));
         }
 
         // Without a subproject the root is a single pom, pinned as before.
@@ -6581,6 +6698,140 @@ snapshots:
         assert!(!read.files.keys().any(|k| k.ends_with("/pom.xml")));
         assert!(done.rewrite.files["pom.xml"].contains("1.10.0-socket.4d5e6f70"));
         assert_eq!(done.confirmed.len(), 1);
+    }
+
+    /// A reactor of hundreds of modules is read and planned whole: every
+    /// module pom is a candidate file, and each one that declares the
+    /// version is rewritten. (The reader learned one module per round, and
+    /// stopped after 64.)
+    #[tokio::test]
+    async fn a_reactor_of_hundreds_of_modules_is_read_and_planned_whole() {
+        let declaring = "  <dependencies>\n    <dependency>\n      <groupId>com.socketfixture</groupId>\n      <artifactId>victim</artifactId>\n      <version>1.10.0</version>\n    </dependency>\n  </dependencies>\n";
+        let names: Vec<String> = (0..200).map(|n| format!("module-{n}")).collect();
+        let listed: String = names
+            .iter()
+            .map(|name| format!("    <module>{name}</module>\n"))
+            .collect();
+        let mut p = MemoryProject::new();
+        p.insert_text(
+            "pom.xml",
+            format!(
+                "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>x</groupId>\n  <artifactId>y</artifactId>\n  <version>1</version>\n  <packaging>pom</packaging>\n  <modules>\n{listed}  </modules>\n</project>\n"
+            )
+            .as_str(),
+        );
+        for name in &names {
+            p.insert_text(
+                format!("{name}/pom.xml"),
+                format!(
+                    "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <parent>\n    <groupId>x</groupId>\n    <artifactId>y</artifactId>\n    <version>1</version>\n  </parent>\n  <artifactId>{name}</artifactId>\n{declaring}</project>\n"
+                )
+                .as_str(),
+            );
+        }
+        let (read, done) = gradle_rewrite(&p).await;
+        for name in &names {
+            let rel = format!("{name}/pom.xml");
+            assert!(read.files.contains_key(&rel), "{rel} was not read");
+            assert!(
+                done.rewrite.files[&rel].contains("<version>1.10.0-socket.4d5e6f70</version>"),
+                "{rel} was not rewritten: {:?}",
+                done.rewrite.warnings
+            );
+        }
+        assert!(done.rewrite.files["pom.xml"].contains("<id>socket-patch-"));
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
+    }
+
+    /// A module pom that is a symbolic link, or that is there without
+    /// readable content, is no reason to fail the run: the reactor is left
+    /// as it is, with the reason, as every reactor was before module poms
+    /// were read. The guard that refuses a linked or unreadable rewrite
+    /// target has nothing to refuse. A module pom that is there but is not
+    /// UTF-8 text is refused by name instead: it must never look absent.
+    #[tokio::test]
+    async fn a_reactor_with_an_unreadable_module_pom_is_left_alone_not_failed() {
+        let root = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>x</groupId>\n  <artifactId>y</artifactId>\n  <version>1</version>\n  <packaging>pom</packaging>\n  <modules>\n    <module>a</module>\n  </modules>\n  <dependencies>\n    <dependency>\n      <groupId>com.socketfixture</groupId>\n      <artifactId>victim</artifactId>\n      <version>1.10.0</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+        let left_alone = |view: &ProjectView<'_>, read: &CandidateFiles, done: &Rewritten| {
+            assert!(
+                read.symlinked_reads.is_empty()
+                    && read.unreadable_reads.is_empty()
+                    && read.undecodable_reads.is_empty(),
+                "{read:?}"
+            );
+            assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+            assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+            assert!(done
+                .rewrite
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_maven_multimodule_unsupported"));
+            assert!(guard(view, done, &[gradle_candidate()]).is_none());
+        };
+        for entry in [MemoryEntry::Symlink, MemoryEntry::Present] {
+            let mut p = MemoryProject::new();
+            p.insert_text("pom.xml", root);
+            p.insert("a/pom.xml", entry);
+            let view = ProjectView::Memory(&p);
+            let (read, done) = gradle_rewrite_in(&view).await;
+            left_alone(&view, &read, &done);
+        }
+
+        // A pom that is there but is not UTF-8 text is not a missing one:
+        // its content is unknown, so the run is refused for it by name,
+        // as for an undecodable root pom, with nothing written. On disk and
+        // in memory alike.
+        let undecodable = |view: &ProjectView<'_>, read: &CandidateFiles, done: &Rewritten| {
+            assert_eq!(read.undecodable_maven_poms, ["a/pom.xml"]);
+            assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+            assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+            let refusal = guard(view, done, &[gradle_candidate()]).expect("refused");
+            assert_eq!(refusal.code, UNREADABLE_REFUSAL);
+            assert!(refusal.message.contains("a/pom.xml"), "{}", refusal.message);
+        };
+        let mut p = MemoryProject::new();
+        p.insert_text("pom.xml", root);
+        p.insert(
+            "a/pom.xml",
+            MemoryEntry::Binary(vec![0xff, 0xfe, 0x00].into()),
+        );
+        let view = ProjectView::Memory(&p);
+        let (read, done) = gradle_rewrite_in(&view).await;
+        undecodable(&view, &read, &done);
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("pom.xml"), root).unwrap();
+        std::fs::create_dir(tmp.path().join("a")).unwrap();
+        std::fs::write(tmp.path().join("a/pom.xml"), [0xff, 0xfe, 0x00]).unwrap();
+        let view = ProjectView::Disk(tmp.path());
+        let (read, done) = gradle_rewrite_in(&view).await;
+        undecodable(&view, &read, &done);
+        // A module pom of another name is one too.
+        std::fs::write(
+            tmp.path().join("pom.xml"),
+            root.replace("<module>a</module>", "<module>a/build.xml</module>"),
+        )
+        .unwrap();
+        std::fs::rename(tmp.path().join("a/pom.xml"), tmp.path().join("a/build.xml")).unwrap();
+        let (read, done) = gradle_rewrite_in(&view).await;
+        assert_eq!(read.undecodable_maven_poms, ["a/build.xml"]);
+        assert!(guard(&view, &done, &[gradle_candidate()]).is_some());
+        std::fs::rename(tmp.path().join("a/build.xml"), tmp.path().join("a/pom.xml")).unwrap();
+        std::fs::write(tmp.path().join("pom.xml"), root).unwrap();
+        // A link, to a pom that would otherwise be planned.
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(tmp.path().join("a/pom.xml")).unwrap();
+            std::fs::write(
+                tmp.path().join("real.xml"),
+                "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <parent>\n    <groupId>x</groupId>\n    <artifactId>y</artifactId>\n    <version>1</version>\n  </parent>\n  <artifactId>a</artifactId>\n</project>\n",
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(tmp.path().join("real.xml"), tmp.path().join("a/pom.xml"))
+                .unwrap();
+            let (read, done) = gradle_rewrite_in(&view).await;
+            left_alone(&view, &read, &done);
+        }
     }
 
     /// An sbt build beside a Gradle build: the Gradle planner pinning a

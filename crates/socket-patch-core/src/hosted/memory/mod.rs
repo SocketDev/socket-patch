@@ -1619,6 +1619,7 @@ mod tests {
                 symlinked_reads: Vec::new(),
                 unreadable_reads: Vec::new(),
                 undecodable_reads: Vec::new(),
+                undecodable_maven_poms: Vec::new(),
                 overrides: Vec::new(),
                 rewrite,
                 rewritten: files.iter().map(|(rel, _)| (*rel).to_string()).collect(),
