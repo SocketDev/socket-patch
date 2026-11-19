@@ -126,8 +126,8 @@ What socket-patch does with those files:
 
 Every reader — manifest-less `vex`, the lockfile inventory, the npm flavor
 sniff, `repair` — splits CRLF lines like LF ones and skips a leading BOM.
-The shared hosted golden fixtures stay LF: their TypeScript twin in the
-depscan backend has no CRLF path yet.
+The shared hosted golden fixtures stay LF: their TypeScript twin in
+Socket's backend has no CRLF path yet.
 
 ## Running the suites locally
 
