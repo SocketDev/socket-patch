@@ -2198,12 +2198,16 @@ are never printed. The JRuby (`-java`) build of a gem ships
 jars and is always refused for such a patch.
 
 A gem that builds a library into its own directory and loads it from there (an FFI gem such as
-scrypt, a Rakefile build such as digest-crc) is always rebuilt from its installed tree. The
-libraries the gem's build makes there are removed first, as a fresh install has none of them, so
-a build script that would take an existing library for current compiles the patched source. When
-`apply` can't tell which files those are (no source gem to compare with) and the build exits
-without changing any compiled code, the package fails with `native_extension_build_failed`
-instead of being reported as patched.
+scrypt or argon2, a Rakefile build such as digest-crc) is always rebuilt from its installed tree.
+The libraries the gem's build makes there are removed first, as a fresh install has none of them,
+so a build script that would take an existing library for current compiles the patched source.
+The files the gem ships that its first build used up are put back from the source gem for the
+build, so a build script that can only run once (argon2's renames a file it ships) runs again;
+those the build leaves untouched are removed again afterwards. When `apply` has no source gem to
+compare with, it can do neither: a build script that needs a file that is gone fails, and a build
+that exits without changing any compiled code is not taken for one. Either way the package fails
+with `native_extension_build_failed` instead of being reported as patched, and the gem is left as
+it was.
 
 Ruby files are never build inputs outside `ext/` and a build script's directory: a patch that only
 changes `.rb` or `.rbs` files needs no compiler, wherever the gem keeps them.
