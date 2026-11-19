@@ -492,6 +492,12 @@ async fn heal_mvn_config(
     if !trusted_checksums::holds_written_block(config) {
         return;
     }
+    // The flush refuses a write through a symbolic link, and the whole
+    // restore with it: a linked config keeps its line, as a scan keeps it.
+    let path = view.root().join(config_rel);
+    if crate::utils::containment::linked_level(view.root(), &path).is_some() {
+        return;
+    }
     let wrapper = view
         .read(&format!("{dir}{MVN_WRAPPER_PROPERTIES}"))
         .await
@@ -1013,6 +1019,56 @@ mod tests {
         let (outcome, after) = run(&files(theirs.clone(), None)).await;
         assert_eq!(after[".mvn/maven.config"], theirs);
         assert_eq!(codes(&outcome), [left]);
+    }
+
+    /// A leftover block in a `.mvn/maven.config` that is a symbolic link is
+    /// not healed: the flush refuses a linked file, so the heal would
+    /// refuse a restore that has nothing else against it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_linked_config_the_rollback_leaves_is_not_healed() {
+        use super::trusted_checksums::{self, Basedir::Session};
+        let config = format!(
+            "-Dmaven.test.skip=true\n{}\n",
+            trusted_checksums::config_args(Session).join("\n")
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".mvn/checksums")).unwrap();
+        std::fs::create_dir_all(root.join("ci")).unwrap();
+        std::fs::write(
+            root.join("pom.xml"),
+            fixture("basic", "expected", "pom.xml"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".mvn/checksums/checksums.sha256"),
+            fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+        )
+        .unwrap();
+        std::fs::write(root.join("ci/maven.config"), &config).unwrap();
+        std::os::unix::fs::symlink("../ci/maven.config", root.join(".mvn/maven.config")).unwrap();
+        let pins = [HostedPin {
+            purl: "pkg:maven/org.slf4j/slf4j-api@1.7.36".into(),
+            uuid: UUID.into(),
+            files: vec!["pom.xml".into()],
+        }];
+        let opts = RestoreOptions {
+            offline: true,
+            ..RestoreOptions::default()
+        };
+        let outcome = restore_upstream(root, &pins, &opts).await;
+        assert_eq!(outcome.flush_error, None);
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(
+            std::fs::read_to_string(root.join("pom.xml")).unwrap(),
+            fixture("basic", "input", "pom.xml")
+        );
+        assert!(root.join(".mvn/maven.config").is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(root.join("ci/maven.config")).unwrap(),
+            config
+        );
     }
 
     #[tokio::test]
