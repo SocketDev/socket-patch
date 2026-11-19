@@ -1797,16 +1797,15 @@ impl EjectSnapshot {
                 .map(|s| s.to_string()),
         );
         // A hosted Maven pin's restore also removes the repository filter
-        // files hosted mode keeps under `.mvn/socket-patch/`, one per patch.
-        const MVN_FILTER_DIR: &str = ".mvn/socket-patch";
-        if let Ok(mut dir) = tokio::fs::read_dir(root.join(MVN_FILTER_DIR)).await {
-            while let Ok(Some(entry)) = dir.next_entry().await {
-                planned.insert(format!(
-                    "{MVN_FILTER_DIR}/{}",
-                    entry.file_name().to_string_lossy()
-                ));
-            }
-        }
+        // files hosted mode keeps for it, one per patch: its own regular
+        // files only. Anything else in that directory (a subdirectory, a
+        // link, a file of the user's) is not the restore's to touch, and
+        // must not be read as a file here.
+        planned.extend(
+            socket_patch_core::patch::redirect::hosted_maven_filter_dir(root)
+                .await
+                .owned,
+        );
         let mut files = std::collections::BTreeMap::new();
         for rel in root_files.iter().chain(planned.iter()) {
             if files.contains_key(rel) {
@@ -8217,6 +8216,39 @@ mod eject_snapshot_tests {
         .expect("a FIFO must not wedge the eject snapshot");
         let err = taken.err().expect("a FIFO must fail the snapshot");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// The snapshot takes hosted Maven's own filter files, which the
+    /// restore of a hosted pin removes, and nothing else of that
+    /// directory: a subdirectory or a FIFO there (not hosted mode's, and
+    /// not a file) must not fail the eject of every ecosystem.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_takes_only_hosted_maven_filter_files_of_their_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".mvn/socket-patch");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        let ours = "prefixes-socket-patch-77777777-7777-4777-8777-777777777777.txt";
+        std::fs::write(dir.join(ours), "## repository-prefixes/2.0\n").unwrap();
+        std::fs::write(dir.join("prefixes-central.txt"), "/org\n").unwrap();
+        let fifo = dir.join("prefixes-socket-patch-88888888-8888-4888-8888-888888888888.txt");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            EjectSnapshot::take(tmp.path(), &[]),
+        )
+        .await
+        .expect("nothing in the filter directory wedges the snapshot")
+        .expect("nor fails it");
+        let taken: Vec<&str> = snapshot
+            .planned
+            .iter()
+            .map(String::as_str)
+            .filter(|rel| rel.starts_with(".mvn/socket-patch/"))
+            .collect();
+        assert_eq!(taken, [format!(".mvn/socket-patch/{ours}").as_str()]);
+        assert!(snapshot.files[&format!(".mvn/socket-patch/{ours}")].is_some());
     }
 }
 

@@ -591,18 +591,11 @@ async fn unscope(
     reactor_poms: &BTreeMap<String, String>,
 ) -> bool {
     use crate::formats::maven::repository_filter;
-    let mut names = Vec::new();
-    match tokio::fs::read_dir(view.root().join(repository_filter::DIR)).await {
-        Ok(mut entries) => {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                names.push(entry.file_name().to_string_lossy().into_owned());
-            }
-        }
-        // No directory: no file to take out, and none the lines serve.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
-        Err(_) => return false,
+    let dir = crate::patch::redirect::hosted_maven_filter_dir(view.root()).await;
+    // A directory that cannot be listed may hold a file: the lines stay.
+    if dir.unlistable {
+        return false;
     }
-    names.sort();
     let declared = |id: &str| {
         let after = texts.iter().chain(
             reactor_poms
@@ -611,14 +604,18 @@ async fn unscope(
         );
         after.into_iter().any(|(_, pom)| pom.contains(id))
     };
-    let mut left = false;
-    for name in names {
-        let ours = repository_filter::repository_of(&name)
+    // Anything in the directory that is not hosted mode's own file (a file
+    // of the user's, a subdirectory, a link) is left, and so are the lines.
+    let mut left = dir.others;
+    for rel in dir.owned {
+        let ours = rel
+            .rsplit('/')
+            .next()
+            .and_then(repository_filter::owned)
             .and_then(|id| generation::pin_name_uuid(id, false).map(|uuid| (id, uuid)))
-            .filter(|(id, uuid)| restored.contains(uuid) || !declared(id));
-        let rel = format!("{}/{name}", repository_filter::DIR);
+            .is_some_and(|(id, uuid)| restored.contains(&uuid) || !declared(id));
         // Read first: the flush then knows the bytes it removes.
-        if ours.is_some() && matches!(view.read(&rel).await, Ok(Some(_))) {
+        if ours && matches!(view.read(&rel).await, Ok(Some(_))) {
             view.remove(&rel);
         } else {
             left = true;
@@ -1163,7 +1160,7 @@ mod tests {
             let Some(name) = rel.strip_prefix(".mvn/socket-patch/") else {
                 continue;
             };
-            let id = repository_filter::repository_of(name).expect("a filter file");
+            let id = repository_filter::owned(name).expect("a filter file");
             match pins
                 .iter()
                 .find(|pin| generation::hosted_pin_name(&pin.uuid) == id)
@@ -1791,6 +1788,40 @@ mod tests {
             "{:?}",
             outcome.warnings
         );
+    }
+
+    /// A scan that met the user's own filter switch wrote no line and no
+    /// file beside it (`redirect_maven_repository_filter_conflict`). The
+    /// rollback of that pin must leave the switch: nothing marks it as
+    /// hosted mode's, and it was there before.
+    #[tokio::test]
+    async fn the_users_own_filter_switch_survives_a_rollback() {
+        let switch = "-Daether.remoteRepositoryFilter.prefixes=true";
+        // What the scan left: the user's line, then the Trusted Checksums
+        // settings it appended.
+        let config = format!("{switch}\n{}\n", super::MVN_CONFIG_ARGS.join("\n"));
+        let files = vec![
+            ("pom.xml", fixture("basic", "expected", "pom.xml")),
+            (".mvn/maven.config", config.clone()),
+            (
+                ".mvn/checksums/checksums.sha256",
+                fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+            ),
+        ];
+        let (outcome, after) = run(&files).await;
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(after["pom.xml"], fixture("basic", "input", "pom.xml"));
+        assert_eq!(after[".mvn/maven.config"], config);
+        // Nor the directory line of another filter directory of theirs.
+        let theirs = format!(
+            "{switch}\n-Daether.remoteRepositoryFilter.prefixes.basedir=\
+             ${{session.rootDirectory}}/.mvn/rrf\n{}\n",
+            super::MVN_CONFIG_ARGS.join("\n")
+        );
+        let mut files = files;
+        files[1].1 = theirs.clone();
+        let (_, after) = run(&files).await;
+        assert_eq!(after[".mvn/maven.config"], theirs);
     }
 
     /// The repository filter is taken out with its pin: the pin's file, a

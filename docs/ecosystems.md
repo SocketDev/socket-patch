@@ -1139,9 +1139,9 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   - **One directory per build.** The filter reads its files from one directory. When
     `.mvn/maven.config` or `.mvn/jvm.config` already configures the prefix filter,
     hosted mode writes neither the lines nor the file and warns
-    `redirect_maven_repository_filter_conflict`; the pin still lands and the Socket
-    repository stays unfiltered. To filter it yourself, list the path the warning names
-    in a `prefixes-socket-patch-<uuid>.txt` file of your own directory. A build that
+    `redirect_maven_repository_filter_conflict` for each patch; the pin still lands and
+    the Socket repository stays unfiltered. To filter it yourself, list the path the
+    warning names in a `prefixes-socket-patch-<uuid>.txt` file of your own directory. A build that
     switches the filter on from outside the checkout (the command line, `MAVEN_ARGS`)
     and keeps its prefix files in the local repository's default directory stops reading
     them once the two lines are committed: name that directory on the same command line
@@ -1152,7 +1152,11 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
     an earlier release wrote gets no file on a re-scan (a re-run stays edit-free, as for
     the Trusted Checksums): `rollback`, then `scan`, writes it. When a scan takes a
     Socket repository out of the poms (a newer patch replaced it), that repository's
-    file is left empty: a scan writes files and removes none.
+    file is left empty: a scan writes files and removes none. With the last such file
+    emptied, the scan also takes the two lines out of `.mvn/maven.config`. A file that
+    is there and does not list the version a pin in place resolves (the pom's wiring
+    came back by a revert or a merge after a scan emptied the file) is rewritten by the
+    next scan, since Maven would otherwise refuse the pin.
   - **Taken out with the pin.** `rollback` and `remove` delete the files of the pins
     they restore, and any whose repository no pom declares any more. Once the directory
     is empty they also take the two lines out of `.mvn/maven.config`, byte for byte

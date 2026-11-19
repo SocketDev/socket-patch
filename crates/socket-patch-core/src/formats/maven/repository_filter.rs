@@ -72,9 +72,13 @@ pub(crate) fn file_rel(repository_id: &str) -> String {
     format!("{DIR}/prefixes-{repository_id}.txt")
 }
 
-/// The repository id a file name in [`DIR`] filters (`prefixes-<id>.txt`).
-pub(crate) fn repository_of(file_name: &str) -> Option<&str> {
-    file_name.strip_prefix("prefixes-")?.strip_suffix(".txt")
+/// The Socket repository id whose filter the file `file_name` of [`DIR`]
+/// is, when the name is one hosted mode writes:
+/// `prefixes-socket-patch-<canonical uuid>.txt`. Any other name (a file of
+/// the user's, another filter's) is none of hosted mode's.
+pub(crate) fn owned(file_name: &str) -> Option<&str> {
+    let id = file_name.strip_prefix("prefixes-")?.strip_suffix(".txt")?;
+    crate::patch::redirect::generation::pin_name_uuid(id, false).map(|_| id)
 }
 
 /// The path prefix of one version of an artifact, as the maven2 layout
@@ -136,14 +140,7 @@ pub(crate) fn merge_config(existing: &str) -> Config {
             return Config::Conflict(format!("-D{key}={value}"));
         }
     }
-    let block = CONFIG_ARGS.join("\n");
-    Config::Appended(if existing.is_empty() {
-        format!("{block}\n")
-    } else if existing.ends_with('\n') {
-        format!("{existing}{block}\n")
-    } else {
-        format!("{existing}\n{block}")
-    })
+    Config::Appended(super::append_config_args(existing, CONFIG_ARGS, true))
 }
 
 /// Whether `text` (a `.mvn/jvm.config`, or any other argument list) names
@@ -154,15 +151,22 @@ pub(crate) fn mentions_filter(text: &str) -> bool {
 }
 
 /// `config` without the lines hosted mode wrote ([`CONFIG_ARGS`], each a
-/// whole line): `None` when it holds neither. A file whose last line was
+/// whole line): `None` when they are not there. A file whose last line was
 /// one of them, with no line break after it, gets back the ending it had
 /// before [`merge_config`] appended to it.
+///
+/// What marks the pair as hosted mode's is the directory line: it names
+/// [`DIR`], which nothing else uses. The switch on its own
+/// (`…prefixes=true`) is a line anyone may have written, and
+/// [`merge_config`] never adds it to a config that holds it: without the
+/// directory line beside it, it is the user's and is left alone.
 pub(crate) fn strip_config(config: &str) -> Option<String> {
     let is_ours = |line: &str| {
         let arg = line.trim_end_matches(['\r', '\n']);
         CONFIG_ARGS.contains(&arg)
     };
-    if !config.split_inclusive('\n').any(is_ours) {
+    let names_dir = |line: &str| line.trim_end_matches(['\r', '\n']) == CONFIG_ARGS[1];
+    if !config.split_inclusive('\n').any(names_dir) {
         return None;
     }
     let ended_on_ours = config
@@ -195,8 +199,16 @@ mod tests {
             rel,
             ".mvn/socket-patch/prefixes-socket-patch-77777777-7777-7777-7777-777777777777.txt"
         );
-        assert_eq!(repository_of(rel.rsplit('/').next().unwrap()), Some(ID));
-        assert_eq!(repository_of("groupId-central.txt"), None);
+        assert_eq!(owned(rel.rsplit('/').next().unwrap()), Some(ID));
+        // Only the names hosted mode writes are its own.
+        for theirs in [
+            "groupId-central.txt",
+            "prefixes-central.txt",
+            "prefixes-socket-patch-not-a-uuid.txt",
+            "prefixes-socket-patch-77777777-7777-7777-7777-777777777777.txt.bak",
+        ] {
+            assert_eq!(owned(theirs), None, "{theirs}");
+        }
         let text = file_text(ID, "org.slf4j", "slf4j-api", "1.7.36-socket.77777777");
         let mut lines = text.lines();
         // Maven 4 discards a file whose first line is anything else.
@@ -283,5 +295,16 @@ mod tests {
         // A line that only resembles ours is not ours.
         let other = "-Daether.remoteRepositoryFilter.prefixes=true # mine\n";
         assert_eq!(strip_config(other), None);
+        // The switch alone is the user's own (hosted mode writes it only
+        // together with its directory, and never into a config that holds
+        // it): a rollback must not take it.
+        let theirs = format!("-B\n{}\n", CONFIG_ARGS[0]);
+        assert!(matches!(merge_config(&theirs), Config::Conflict(_)));
+        assert_eq!(strip_config(&theirs), None);
+        // The directory line alone (its switch since removed) still goes.
+        assert_eq!(
+            strip_config(&format!("-B\n{}\n", CONFIG_ARGS[1])).as_deref(),
+            Some("-B\n")
+        );
     }
 }

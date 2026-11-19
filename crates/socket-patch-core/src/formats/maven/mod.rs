@@ -1004,6 +1004,26 @@ pub(crate) fn maven_config_properties(config: &str) -> BTreeMap<String, String> 
     props
 }
 
+/// `config` (a `.mvn/maven.config`) with `args` appended, one per line:
+/// the one way hosted mode adds settings to that file. With `keep_ending`
+/// a file that ends without a line break still does, so the lines can be
+/// taken out again byte for byte ([`repository_filter`]); without it the
+/// result always ends with one, as the Trusted Checksums settings have
+/// always been written (and as the rewriter's other implementation
+/// writes them).
+pub(crate) fn append_config_args(config: &str, args: &[&str], keep_ending: bool) -> String {
+    let block = args.join("\n");
+    if config.is_empty() {
+        format!("{block}\n")
+    } else if config.ends_with('\n') {
+        format!("{config}{block}\n")
+    } else if keep_ending {
+        format!("{config}\n{block}")
+    } else {
+        format!("{config}\n{block}\n")
+    }
+}
+
 /// Java's `String.trim`: every char up to U+0020, nothing beyond.
 fn java_trim(s: &str) -> &str {
     s.trim_matches(|c: char| c <= ' ')

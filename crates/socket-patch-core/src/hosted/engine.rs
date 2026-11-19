@@ -1149,11 +1149,7 @@ pub async fn read_candidate_files(
             rels.extend(
                 names
                     .iter()
-                    .filter(|name| {
-                        repository_filter::repository_of(name).is_some_and(|id| {
-                            crate::patch::redirect::generation::pin_name_uuid(id, false).is_some()
-                        })
-                    })
+                    .filter(|name| repository_filter::owned(name).is_some())
                     .map(|name| format!("{}/{name}", repository_filter::DIR)),
             );
         }
