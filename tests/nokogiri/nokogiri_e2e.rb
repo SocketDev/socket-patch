@@ -652,6 +652,15 @@ class NokogiriE2E
     [code, statuses, stdout + stderr]
   end
 
+  # The statement of the `vex` document the last `vex_statuses` wrote that
+  # covers nokogiri, or `{}`.
+  def vex_statement
+    doc = JSON.parse(File.read(File.join(@proj, "vex.json")))
+    (doc["statements"] || []).find { |s| s.to_s.include?("pkg:gem/nokogiri@#{@version}") } || {}
+  rescue Errno::ENOENT, JSON::ParserError
+    {}
+  end
+
   def applied(record, native:, what: "Ruby loads the patched code", &effect)
     write_record(record)
 
@@ -751,6 +760,20 @@ class NokogiriE2E
     check(code.zero?, "`apply --check` is in sync", "exit #{code}\n#{stdout}#{stderr}")
     code, statuses, text = vex_statuses
     check(code.zero? && statuses == ["not_affected"], "`vex` attests the patch", "exit #{code} #{statuses.inspect}\n#{tail(text)}")
+    # Nothing was patched, and the statement does not say so: the code is
+    # not in this build.
+    statement = vex_statement
+    check(statement["justification"] == "vulnerable_code_not_present" &&
+          statement["impact_statement"].to_s.include?("is not in the installed build of the package") &&
+          !statement["impact_statement"].to_s.include?("Patched via"),
+          "as code that is not in this build, not as a patched package", statement.inspect)
+
+    # `rollback` has nothing to restore, and says that.
+    code, stdout, stderr, = sp("rollback", "--json", "--dry-run")
+    found = event(stdout) || {}
+    check(code.zero? && found["action"] == "skipped" && found["errorCode"] == "not_in_platform_build",
+          "`rollback` reports that nothing of the patch was applied to this build",
+          "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
 
     rolled_back
   end

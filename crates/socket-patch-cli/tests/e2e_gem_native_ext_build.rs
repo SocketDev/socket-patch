@@ -1409,6 +1409,24 @@ fn opted_out_native_patch_writes_sources_without_a_build() {
         // The build Ruby loads is still the old one: no attestation.
         let (code, stdout, _) = run_without_ruby(&proj, &["apply", "--check", "--json"]);
         assert_ne!(code, 0, "{stdout}");
+
+        // A dry run writes nothing, and says what apply would do.
+        let (_tmp, proj, gem_dir) = fake_native_gem(true);
+        write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+        let dry: Vec<&str> = opt_out.iter().copied().chain(["--dry-run"]).collect();
+        let (code, stdout, stderr) = common::run_with_env(&proj, &dry, &env);
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        let warning = not_rebuilt_warning(&stdout);
+        assert!(
+            warning.contains("dry run")
+                && warning.contains("apply would write them without rebuilding the extension")
+                && !warning.contains(", written "),
+            "{warning}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(gem_dir.join(C_KEY)).unwrap(),
+            c_source(1)
+        );
     }
 }
 
@@ -1770,6 +1788,28 @@ fn write_record(socket: &Path, purl: &str, entries: &[RecordFile<'_>]) {
 fn vex_attests(run: impl Fn(&[&str]) -> (i32, String, String)) -> bool {
     let (_, stdout, _) = run(&["vex", "--product", "pkg:generic/app@1"]);
     stdout.contains("\"not_affected\"")
+}
+
+/// The `vex` document of the project (`None` when the command writes
+/// none), for a test that reads a statement.
+fn vex_document(run: impl Fn(&[&str]) -> (i32, String, String)) -> Option<serde_json::Value> {
+    let (_, stdout, _) = run(&["vex", "--product", "pkg:generic/app@1"]);
+    serde_json::from_str(&stdout).ok()
+}
+
+/// The `@id` of every subcomponent a `vex` document attests.
+fn vex_subcomponents(document: &serde_json::Value) -> Vec<String> {
+    let mut ids: Vec<String> = document["statements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|statement| statement["products"].as_array().into_iter().flatten())
+        .flat_map(|product| product["subcomponents"].as_array().into_iter().flatten())
+        .filter_map(|sub| sub["@id"].as_str().map(str::to_string))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 const PRE_FULL_NAME: &str = "sp_native-1.0.0-x86_64-linux";
@@ -3405,9 +3445,346 @@ fn a_patch_of_the_c_build_alone_has_nothing_to_do_on_a_java_gem() {
         assert!(gem.attested(), "{purl}: vex did not attest the copy");
         gem.assert_vendor(&gem.pristine, purl);
 
+        // The statement is truthful about why: nothing was patched here.
+        // The code is not in this build.
+        let document = vex_document(|args| gem.run(args)).expect("a vex document");
+        let statement = &document["statements"][0];
+        assert_eq!(statement["status"], "not_affected", "{document:#}");
+        assert_eq!(
+            statement["justification"], "vulnerable_code_not_present",
+            "{purl}: {document:#}"
+        );
+        let impact = statement["impact_statement"].as_str().unwrap_or_default();
+        assert!(
+            impact.contains("is not in the installed build of the package")
+                && impact.contains(UUID)
+                && !impact.contains("Patched via"),
+            "{purl}: {impact}"
+        );
+
+        // `rollback` says what is true too: nothing of the patch was
+        // applied to this build, so there is nothing to restore. Not that
+        // the record lists no files.
+        for args in [
+            &["rollback", "--json", "--dry-run"][..],
+            &["rollback", "--json"],
+        ] {
+            let (code, stdout, stderr) = gem.run(args);
+            assert_eq!(code, 0, "{purl} {args:?}:\n{stdout}\n{stderr}");
+            let env = parse_json_envelope(&stdout);
+            let event = env["events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|e| e["purl"] == purl && e["action"] == "skipped")
+                .unwrap_or_else(|| panic!("{purl} {args:?}: no skip:\n{stdout}"));
+            assert_eq!(
+                event["errorCode"], "not_in_platform_build",
+                "{purl} {args:?}: {stdout}"
+            );
+            assert!(
+                event["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("there is nothing to restore")),
+                "{purl} {args:?}: {stdout}"
+            );
+            assert!(!stdout.contains("no_files"), "{purl} {args:?}: {stdout}");
+            gem.assert_vendor(&gem.pristine, &format!("{purl} {args:?}"));
+        }
+        gem.assert_no_ruby_ran();
+    }
+}
+
+/// A Ruby file is part of every build of a gem. One that the patch
+/// replaces and the JRuby copy does not hold (it was deleted) is the usual
+/// missing file: the patch fails, and the copy is neither in sync nor
+/// attested. It is never taken for a patch with nothing to do there.
+#[test]
+fn a_ruby_file_missing_from_a_java_gem_is_a_missing_file() {
+    for purl in [PURL, RUBY_PLATFORM_PURL] {
+        let gem = JavaGem::new();
+        std::fs::remove_file(gem.gem_dir.join("lib/sp_native.rb")).unwrap();
+        let without = walk_files(&gem.proj.join("vendor"));
+        gem.record(purl, &[("lib/sp_native.rb", Some(LIB_RB), PATCHED_RB)]);
+
+        for args in [&["apply", "--json"][..], &["apply", "--json", "--dry-run"]] {
+            let (code, stdout, stderr) = gem.run(args);
+            assert_eq!(code, 1, "{purl} {args:?}: {stdout}\n{stderr}");
+            assert!(
+                !stdout.contains("not_in_platform_build"),
+                "{purl} {args:?}: {stdout}"
+            );
+            let env = parse_json_envelope(&stdout);
+            assert_eq!(env["summary"]["applied"], 0, "{purl} {args:?}: {stdout}");
+            gem.assert_vendor(&without, &format!("{purl} {args:?}"));
+        }
+        let (_, stdout, _) = gem.run(&["apply", "--json"]);
+        let env = parse_json_envelope(&stdout);
+        let event = common::envelope::event_for(&env, purl);
+        if purl == PURL {
+            // The unqualified record reaches the apply, which names the file.
+            assert_eq!(event["action"], "failed", "{stdout}");
+            assert!(
+                event["error"].as_str().is_some_and(
+                    |e| e.contains("lib/sp_native.rb") && e.contains("File not found")
+                ),
+                "{stdout}"
+            );
+        } else {
+            // A qualified record is matched to a copy by the files it
+            // replaces: with its one file gone, the copy is not one this
+            // record can be told to belong to.
+            assert_eq!(event["errorCode"], "package_not_installed", "{stdout}");
+        }
+        let (code, stdout, _) = gem.run(&["apply", "--check", "--json"]);
+        assert_ne!(code, 0, "{purl}: {stdout}");
+        assert!(!gem.attested(), "{purl}: vex attested a missing file");
+        gem.assert_no_ruby_ran();
+    }
+}
+
+/// A record that brings the compiled code is the patch, whatever source
+/// it changes beside it: the record written for the `java` gem itself (the
+/// rebuilt jar and the source it was rebuilt from, or the gem's own diff
+/// of a source), and a ruby-platform record that replaces the jar. Its
+/// files are written, the copy is in sync and attested, and a second run
+/// has nothing to do. It is not held up as a patch whose jars were not
+/// rebuilt.
+#[test]
+fn a_record_that_brings_the_jar_is_not_held_up_by_its_source() {
+    const JAR_KEY: &str = "lib/sp_native/sp_native.jar";
+    let jar: RecordFile<'_> = (JAR_KEY, Some("PK jar"), "PK patched jar");
+    let source: RecordFile<'_> = (JAVA_KEY, Some(JAVA_SOURCE), PATCHED_JAVA_SOURCE);
+    let cases: [(&str, &str, &[RecordFile<'_>]); 3] = [
+        (
+            "the java gem's jar and source",
+            JAVA_PLATFORM_PURL,
+            &[jar, source],
+        ),
+        ("the java gem's own source", JAVA_PLATFORM_PURL, &[source]),
+        (
+            "a ruby record with the jar",
+            RUBY_PLATFORM_PURL,
+            &[jar, source],
+        ),
+    ];
+    for (case, purl, entries) in cases {
+        let gem = JavaGem::new();
+        gem.record(purl, entries);
+        let mut patched = gem.pristine.clone();
+        for (key, _, after) in entries {
+            patched = tree_with(&patched, &gem.vendor_rel(key), after.as_bytes());
+        }
+
+        let (code, stdout, stderr) = gem.run(&["apply", "--json"]);
+        assert_eq!(code, 0, "{case}: apply failed:\n{stdout}\n{stderr}");
+        assert_eq!(gem.event(&stdout, purl).0, "applied", "{case}: {stdout}");
+        assert!(
+            !stdout.contains("native_extension"),
+            "{case}: the record brings its compiled code: {stdout}"
+        );
+        gem.assert_vendor(&patched, case);
+
+        let (code, stdout, stderr) = gem.run(&["apply", "--check"]);
+        assert_eq!(code, 0, "{case}: {stdout}\n{stderr}");
+        assert!(gem.attested(), "{case}: vex did not attest the patch");
+        let (code, stdout, stderr) = gem.run(&["apply", "--json"]);
+        assert_eq!(code, 0, "{case}: {stdout}\n{stderr}");
+        assert_eq!(
+            gem.event(&stdout, purl),
+            ("skipped".to_string(), "already_patched".to_string()),
+            "{case}: {stdout}"
+        );
+
         gem.assert_rolls_back();
         gem.assert_no_ruby_ran();
     }
+}
+
+/// With a record for the copy's own platform in the manifest, that record
+/// is the copy's, and the ruby-platform record of the same version is not
+/// the copy's for any reader: `apply` does not apply it there and reports
+/// it as not installed, `apply --check` does not count it as in sync, and
+/// `vex` does not attest it.
+#[test]
+fn the_copys_own_record_is_its_only_record_for_every_reader() {
+    const JAR_KEY: &str = "lib/sp_native/sp_native.jar";
+    const OWN_UUID: &str = "29962996-2996-4996-8996-299629962996";
+    let gem = JavaGem::new();
+    let socket = gem.proj.join(".socket");
+    let record = |uuid: &str, key: &str, before: Option<&str>, after: &str| {
+        let before_hash = before.map(|b| git_sha256(b.as_bytes())).unwrap_or_default();
+        if let Some(before) = before {
+            write_blob(&socket, &before_hash, before.as_bytes());
+        }
+        write_blob(&socket, &git_sha256(after.as_bytes()), after.as_bytes());
+        serde_json::json!({
+            "uuid": uuid,
+            "exportedAt": "2026-01-01T00:00:00Z",
+            "files": { key: {
+                "beforeHash": before_hash,
+                "afterHash": git_sha256(after.as_bytes()),
+            }},
+            "vulnerabilities": { "GHSA-aaaa-bbbb-cccc": {
+                "cves": ["CVE-2026-0001"], "summary": "s", "severity": "HIGH",
+                "description": "d",
+            }},
+            "description": "synthetic test patch",
+            "license": "MIT",
+            "tier": "free",
+        })
+    };
+    std::fs::create_dir_all(&socket).unwrap();
+    let manifest = serde_json::json!({ "patches": {
+        RUBY_PLATFORM_PURL: record(UUID, LIBRARY_PATCH_KEY, None, "a patch to the packed library\n"),
+        JAVA_PLATFORM_PURL: record(OWN_UUID, JAR_KEY, Some("PK jar"), "PK patched jar"),
+    }});
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let patched = tree_with(&gem.pristine, &gem.vendor_rel(JAR_KEY), b"PK patched jar");
+
+    let (code, stdout, stderr) = gem.run(&["apply", "--json"]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(
+        gem.event(&stdout, JAVA_PLATFORM_PURL).0,
+        "applied",
+        "{stdout}"
+    );
+    assert_eq!(
+        gem.event(&stdout, RUBY_PLATFORM_PURL),
+        ("skipped".to_string(), "package_not_installed".to_string()),
+        "{stdout}"
+    );
+    gem.assert_vendor(&patched, "after apply");
+
+    // `apply --check`: the copy's record is in sync, and the ruby record
+    // is no patch of this copy, exactly as `apply` reported it.
+    let (code, stdout, stderr) = gem.run(&["apply", "--check", "--json"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(
+        gem.event(&stdout, JAVA_PLATFORM_PURL),
+        ("skipped".to_string(), "already_patched".to_string()),
+        "{stdout}"
+    );
+    assert_eq!(
+        gem.event(&stdout, RUBY_PLATFORM_PURL),
+        ("skipped".to_string(), "package_not_installed".to_string()),
+        "{stdout}"
+    );
+
+    // `vex` attests the copy's record, and not the ruby one.
+    let document = vex_document(|args| gem.run(args)).expect("a vex document");
+    assert_eq!(
+        vex_subcomponents(&document),
+        [JAVA_PLATFORM_PURL],
+        "{document:#}"
+    );
+    let impact = document["statements"][0]["impact_statement"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        impact.contains(OWN_UUID) && !impact.contains(UUID),
+        "{impact}"
+    );
+    gem.assert_no_ruby_ran();
+}
+
+/// A package with one copy that applied and one whose patch is incomplete
+/// is not in effect: the run fails, each copy has its own event, and the
+/// package is neither listed as patched nor counted as applied.
+#[test]
+fn a_package_with_a_patched_and_an_incomplete_copy_is_not_in_effect() {
+    let gem = JavaGem::new();
+    // The same gem as a plain `ruby` platform install in another store of
+    // the project: no extension, no jar, so the record is plain files.
+    let home = gem.proj.join("vendor/bundle/ruby/3.4.0");
+    let plain = home.join("gems").join(FULL_NAME);
+    for (rel, bytes) in [
+        (JAVA_KEY, JAVA_SOURCE.as_bytes()),
+        ("lib/sp_native.rb", LIB_RB.as_bytes()),
+    ] {
+        let path = plain.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    std::fs::create_dir_all(home.join("specifications")).unwrap();
+    std::fs::write(
+        home.join("specifications")
+            .join(format!("{FULL_NAME}.gemspec")),
+        "Gem::Specification.new do |s|\n  s.name = \"sp_native\".freeze\n  \
+         s.version = \"1.0.0\".freeze\n  s.require_paths = [\"lib\".freeze]\nend\n",
+    )
+    .unwrap();
+    gem.record(
+        PURL,
+        &[
+            (JAVA_KEY, Some(JAVA_SOURCE), PATCHED_JAVA_SOURCE),
+            ("lib/sp_native.rb", Some(LIB_RB), PATCHED_RB),
+        ],
+    );
+
+    let (code, stdout, stderr) = gem.run(&["apply", "--json"]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(env["status"], "partialFailure", "{stdout}");
+    let mut actions: Vec<(String, String)> = env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["purl"] == PURL)
+        .map(|e| {
+            let field = |key: &str| e[key].as_str().unwrap_or_default().to_string();
+            (field("action"), field("errorCode"))
+        })
+        .collect();
+    actions.sort();
+    assert_eq!(
+        actions,
+        [
+            ("applied".to_string(), String::new()),
+            (
+                "failed".to_string(),
+                "native_extension_not_rebuilt".to_string()
+            ),
+        ],
+        "each copy has its own event: {stdout}"
+    );
+    // Both copies hold the patch's files.
+    for dir in [&plain, &gem.gem_dir] {
+        assert_eq!(
+            std::fs::read_to_string(dir.join("lib/sp_native.rb")).unwrap(),
+            PATCHED_RB,
+            "{}",
+            dir.display()
+        );
+    }
+
+    // A second run: one copy already patched, one still incomplete. The
+    // package is not in effect, and never listed or counted as patched.
+    let (code, stdout, stderr) = gem.run(&["apply"]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert_eq!(
+        stderr
+            .matches(&format!("Error: Patch of {PURL} is incomplete:"))
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(!stdout.contains("Patched packages:"), "{stdout}");
+    assert!(
+        stdout.contains("0 of 1 targeted patch applied, 0 already patched, 1 not in effect"),
+        "{stdout}"
+    );
+    let (code, stdout, _) = gem.run(&["apply", "--check", "--json"]);
+    assert_ne!(code, 0, "{stdout}");
+    assert!(
+        !gem.attested(),
+        "vex attested a package that is not in effect"
+    );
+    gem.assert_no_ruby_ran();
 }
 
 /// The jars a JRuby gem runs were built from its Java sources, and nothing
@@ -3564,6 +3941,20 @@ fn the_opt_out_leaves_a_java_gems_jars_to_the_caller() {
         &gem.vendor_rel("ext/java/sp/SpNative.java"),
         PATCHED_JAVA_SOURCE.as_bytes(),
     );
+    // A dry run writes nothing, and says what apply would do.
+    let (code, stdout, stderr) =
+        gem.run(&["apply", "--json", "--dry-run", "--no-gem-native-rebuild"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let warning = not_rebuilt_warning(&stdout);
+    assert!(
+        warning.contains("dry run")
+            && warning.contains("apply would write them without rebuilding the jars")
+            && warning.contains("(--no-gem-native-rebuild)")
+            && !warning.contains(", written "),
+        "{warning}"
+    );
+    gem.assert_vendor(&gem.pristine, "after a dry run with the opt-out");
+
     let (code, stdout, stderr) = gem.run(&["apply", "--json", "--no-gem-native-rebuild"]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert_eq!(
@@ -3573,7 +3964,8 @@ fn the_opt_out_leaves_a_java_gems_jars_to_the_caller() {
     );
     let warning = not_rebuilt_warning(&stdout);
     assert!(
-        warning.contains("(--no-gem-native-rebuild)") && warning.contains(JAVA_KEY),
+        warning.contains("written without rebuilding them (--no-gem-native-rebuild)")
+            && warning.contains(JAVA_KEY),
         "{stdout}"
     );
     gem.assert_vendor(&patched, "with the opt-out");
