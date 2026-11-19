@@ -128,6 +128,12 @@ pub(crate) fn owned(file_name: &str) -> Option<&str> {
     crate::patch::redirect::generation::pin_name_uuid(id, false).map(|_| id)
 }
 
+/// The Socket repository id whose filter the project-relative path `rel`
+/// is: a file of [`DIR`] under a name hosted mode writes ([`owned`]).
+pub(crate) fn owned_rel(rel: &str) -> Option<&str> {
+    rel.strip_prefix(DIR)?.strip_prefix('/').and_then(owned)
+}
+
 /// The path prefix of one version of an artifact, as the maven2 layout
 /// spells it: `/<group/path>/<artifact>/<version>`.
 pub(crate) fn prefix(group_id: &str, artifact_id: &str, version: &str) -> String {
@@ -151,6 +157,17 @@ pub(crate) fn file_text(
          path only.\n{}\n",
         prefix(group_id, artifact_id, version)
     )
+}
+
+/// Whether the filter file `text` lets its repository serve `prefix` on
+/// every Maven that reads such a file: its first line is the header Maven 4
+/// requires, and one of its lines is the path. Read as Maven reads it, line
+/// by line with the line ending off, so a file checked out with CRLF line
+/// endings, or one someone added a comment or another path to, says the
+/// same as the bytes hosted mode wrote.
+pub(crate) fn lists(text: &str, prefix: &str) -> bool {
+    let mut lines = text.lines();
+    lines.next() == Some(MAGIC) && lines.any(|line| line == prefix)
 }
 
 /// What `.mvn/maven.config` needs for Maven to read the filter files.
@@ -342,6 +359,15 @@ mod tests {
         ] {
             assert_eq!(owned(theirs), None, "{theirs}");
         }
+        assert_eq!(owned_rel(&rel), Some(ID));
+        for theirs in [
+            ".mvn/socket-patch/prefixes-central.txt",
+            ".mvn/socket-patchy/prefixes-socket-patch-77777777-7777-7777-7777-777777777777.txt",
+            "prefixes-socket-patch-77777777-7777-7777-7777-777777777777.txt",
+            ".mvn/socket-patch",
+        ] {
+            assert_eq!(owned_rel(theirs), None, "{theirs}");
+        }
         let text = file_text(ID, "org.slf4j", "slf4j-api", "1.7.36-socket.77777777");
         let mut lines = text.lines();
         // Maven 4 discards a file whose first line is anything else.
@@ -349,6 +375,37 @@ mod tests {
         let listed: Vec<&str> = lines.filter(|l| !l.starts_with('#')).collect();
         assert_eq!(listed, ["/org/slf4j/slf4j-api/1.7.36-socket.77777777"]);
         assert!(text.ends_with('\n'));
+    }
+
+    /// A file is judged by what Maven reads in it, not by its bytes: the
+    /// header first, and the pinned path on a line of its own.
+    #[test]
+    fn a_file_lists_a_path_whatever_its_line_endings_and_comments() {
+        let path = "/org/slf4j/slf4j-api/1.7.36-socket.77777777";
+        let written = file_text(ID, "org.slf4j", "slf4j-api", "1.7.36-socket.77777777");
+        assert!(lists(&written, path));
+        for same in [
+            written.replace('\n', "\r\n"),
+            written.trim_end().to_string(),
+            format!("{written}# kept for the audit\n"),
+            format!("{written}/com/example/other/1.0\n"),
+            format!("## repository-prefixes/2.0\n\n{path}\n"),
+        ] {
+            assert!(lists(&same, path), "{same:?}");
+        }
+        for other in [
+            String::new(),
+            // No header: Maven 4 discards the file.
+            format!("{path}\n"),
+            format!("# mine\n{written}"),
+            // Another version, a longer path, the path commented out.
+            written.replace("77777777", "88888888"),
+            written.replace(path, &format!("{path}/extra")),
+            written.replace(path, &format!("# {path}")),
+            written.replace(path, &format!("{path} ")),
+        ] {
+            assert!(!lists(&other, path), "{other:?}");
+        }
     }
 
     /// The directory is named through the property the project's Maven

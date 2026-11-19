@@ -1801,8 +1801,9 @@ impl EjectSnapshot {
         // files only. Anything else in that directory (a subdirectory, a
         // link, a file of the user's) is not the restore's to touch, and
         // must not be read as a file here.
+        let disk = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(root);
         planned.extend(
-            socket_patch_core::patch::redirect::hosted_maven_filter_dir(root)
+            socket_patch_core::patch::redirect::hosted_maven_filter_dir(&disk)
                 .await
                 .owned,
         );

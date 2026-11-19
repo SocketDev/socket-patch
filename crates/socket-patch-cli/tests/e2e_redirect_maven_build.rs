@@ -1960,6 +1960,90 @@ mod mediation {
         }
     }
 
+    /// The repository filter is an extra, and a pin never waits for it. A
+    /// project whose `.mvn/maven.config` is a symbolic link cannot take the
+    /// filter's two lines: a write would replace the link, which a scan
+    /// refuses for every file. The scan lands the pin without the filter,
+    /// exits 0 and says so, where the two lines used to refuse the whole
+    /// run. Maven reads the config through the link and resolves the
+    /// patched jar, a re-scan writes nothing, and a rollback puts every
+    /// file back.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_hosted_lands_the_pin_where_the_config_is_a_link() {
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let b = Bench::new();
+        let proj = b.root.join("linked");
+        fixture::write_project(&proj, Shape::Selected, &b.server);
+        let Some(before) = fixture::resolve(SUITE, &mvn, &proj, &b.m2, &b.plain, "target/before")
+        else {
+            return;
+        };
+        // The team keeps its Maven arguments in one place and links them
+        // in: a setting of its own, and the Trusted Checksums settings (an
+        // earlier scan wrote them before the file was moved), so the
+        // filter's two lines are the only write the config would take.
+        let config = [
+            "-B",
+            "-Daether.artifactResolver.postProcessor.trustedChecksums=true",
+            "-Daether.artifactResolver.postProcessor.trustedChecksums.checksumAlgorithms=SHA-256",
+            "-Daether.artifactResolver.postProcessor.trustedChecksums.failIfMissing=false",
+            "-Daether.trustedChecksumsSource.summaryFile=true",
+            "-Daether.trustedChecksumsSource.summaryFile.basedir=${maven.multiModuleProjectDirectory}/.mvn/checksums",
+            "-Daether.trustedChecksumsSource.summaryFile.originAware=false",
+            "",
+        ]
+        .join("\n");
+        std::fs::create_dir_all(proj.join("ci")).unwrap();
+        std::fs::create_dir_all(proj.join(".mvn")).unwrap();
+        std::fs::write(proj.join("ci/maven.config"), &config).unwrap();
+        let link = proj.join(".mvn/maven.config");
+        std::os::unix::fs::symlink("../ci/maven.config", &link).unwrap();
+        let pristine = fixture::snapshot(&proj);
+
+        let (code, env, stderr) = b.scan(&proj);
+        assert_eq!(code, Some(0), "{env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 1, "{env}");
+        let wired = std::fs::read_to_string(proj.join("pom.xml")).unwrap();
+        assert!(
+            wired.contains(&b.suffixed) && wired.contains(&format!("<id>socket-patch-{UUID}</id>")),
+            "the pin landed:\n{wired}"
+        );
+        let skipped = warning(&env, "redirect_maven_repository_filter_skipped")
+            .unwrap_or_else(|| panic!("the scan says the filter was skipped: {env}"));
+        assert!(
+            skipped["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains(".mvn/maven.config cannot be written")),
+            "{skipped}"
+        );
+        assert!(link.is_symlink(), "the link is still a link");
+        assert_eq!(
+            std::fs::read_to_string(proj.join("ci/maven.config")).unwrap(),
+            config,
+            "and nothing was written through it"
+        );
+        assert!(
+            !proj.join(".mvn/socket-patch").exists(),
+            "no filter file without the lines that would make Maven read it"
+        );
+
+        let after = fixture::resolve_warm(&mvn, &proj, &b.m2, &b.mirrored, "target/after", &[]);
+        b.assert_only_the_victim_is_patched("behind a linked config", &before, &after);
+        b.assert_rescan_is_a_no_op(&proj);
+
+        b.rollback(&proj);
+        assert!(link.is_symlink());
+        assert_eq!(
+            fixture::snapshot(&proj),
+            pristine,
+            "rollback restores every file byte for byte and leaves none behind"
+        );
+    }
+
     /// A company's `<mirrorOf>*</mirrorOf>` sends every repository to its
     /// repository manager, the Socket one included, and the manager does
     /// not hold the patched version:

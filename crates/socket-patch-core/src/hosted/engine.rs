@@ -869,6 +869,77 @@ fn read_maven_mirrors(
     }
 }
 
+/// The variables of the environment a Maven build takes JVM or Maven
+/// arguments from. Measured on Maven 3.9.9 and 4.0.0-rc-7: a
+/// `-Daether.remoteRepositoryFilter.prefixes…` in any of them configures
+/// the repository filter of the build.
+const MAVEN_ARGUMENT_VARIABLES: [&str; 4] = [
+    "MAVEN_OPTS",
+    "MAVEN_ARGS",
+    "JAVA_TOOL_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+];
+
+/// What the Maven rewriter weighs for the repository filter, beside the
+/// poms: the filter files hosted mode keeps under `.mvn/socket-patch/`, one
+/// per patch (one already there is not written again), Maven's JVM
+/// arguments (a filter set there is the user's, which the rewriter leaves
+/// alone), and what it cannot see for itself
+/// ([`MAVEN_FILTER_KEY`](crate::patch::redirect::MAVEN_FILTER_KEY)): whether
+/// the directory holds anything else, whether the environment of the
+/// machine that scans configures the filter, and whether
+/// `.mvn/maven.config` can take a write. Advisory, like the module poms:
+/// the filter is an extra, and nothing here keeps a pin from landing.
+async fn read_maven_filter(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    env: &(dyn crate::gradle::Env + Sync),
+    out: &mut CandidateFiles,
+) {
+    use crate::formats::maven::repository_filter;
+    use crate::patch::redirect::{
+        hosted_maven_filter_dir, maven_config_writable, MavenFilterAround, MAVEN_FILTER_KEY,
+        MVN_CONFIG, MVN_JVM_CONFIG,
+    };
+    let dir = hosted_maven_filter_dir(view).await;
+    for rel in std::iter::once(MVN_JVM_CONFIG.to_string()).chain(dir.owned.iter().cloned()) {
+        if out.files.contains_key(&rel) {
+            continue;
+        }
+        if let Some(text) = read_advisory(view, unreadable, &rel).await {
+            out.files.insert(rel, text);
+        }
+    }
+    let around = MavenFilterAround {
+        keeps_lines: dir.others || dir.unlistable,
+        // Only a machine has an environment (a memory view has none).
+        env: view.disk_root().and_then(|_| {
+            MAVEN_ARGUMENT_VARIABLES
+                .iter()
+                .find(|name| {
+                    env.var(name)
+                        .is_some_and(|value| repository_filter::mentions_filter(&value))
+                })
+                .map(|name| name.to_string())
+        }),
+        config_unwritable: match view.disk_root() {
+            // A config that is not there yet is created, its directory
+            // with it; one that is there is replaced where it stands.
+            Some(root) => {
+                let there = tokio::fs::symlink_metadata(root.join(".mvn")).await.is_ok();
+                there && !maven_config_writable(root).await
+            }
+            None => view.is_symlink(MVN_CONFIG),
+        },
+        occupied: dir.occupied,
+    };
+    if around != MavenFilterAround::default() {
+        if let Ok(json) = serde_json::to_string(&around) {
+            out.files.insert(MAVEN_FILTER_KEY.to_string(), json);
+        }
+    }
+}
+
 /// An in-memory project's Go files as the hosted engine reads them
 /// ([`read_advisory`]: a link or an entry without content is unreadable,
 /// but still exists).
@@ -1217,33 +1288,7 @@ pub async fn read_candidate_files_in(
     // the poms of the modules that select it.
     if candidates.iter().any(|c| c.dep.ecosystem == "maven") {
         read_maven_reactor(view, unreadable, &mut out).await;
-        // The repository filter files hosted mode keeps under
-        // `.mvn/socket-patch/`, one per patch (so one already there is not
-        // written again, and one whose repository goes is retired), and
-        // Maven's JVM arguments (a resolver filter set there is the user's,
-        // which the rewriter then leaves alone). Advisory, like the module
-        // poms.
-        use crate::formats::maven::repository_filter;
-        let mut rels = vec![crate::patch::redirect::MVN_JVM_CONFIG.to_string()];
-        if let Ok(entries) = view.list_dir(repository_filter::DIR).await {
-            let mut names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
-            names.sort();
-            // (Only a name in the exact grammar is a path segment.)
-            rels.extend(
-                names
-                    .iter()
-                    .filter(|name| repository_filter::owned(name).is_some())
-                    .map(|name| format!("{}/{name}", repository_filter::DIR)),
-            );
-        }
-        for rel in rels {
-            if out.files.contains_key(&rel) {
-                continue;
-            }
-            if let Some(text) = read_advisory(view, unreadable, &rel).await {
-                out.files.insert(rel, text);
-            }
-        }
+        read_maven_filter(view, unreadable, env, &mut out).await;
         read_maven_mirrors(view, env, &mut out);
     }
 
@@ -6793,6 +6838,148 @@ snapshots:
                 check(&read, &done, theirs);
             }
         }
+    }
+
+    /// The repository filter is an extra: nothing around it keeps a pin
+    /// from landing or refuses a run. The engine tells the rewriter what it
+    /// cannot see for itself, and the pin lands without the filter where
+    /// the filter cannot be had:
+    ///
+    /// - `.mvn/maven.config` is a symbolic link (a write would replace it,
+    ///   and the guard refuses the whole run for one), here to a file that
+    ///   already holds the checksum settings, so the filter's two lines
+    ///   are the only write it would take;
+    /// - the environment of the machine that scans configures the filter;
+    /// - a link stands where the pin's filter file would go.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_maven_filter_never_keeps_a_pin_from_landing() {
+        use crate::formats::maven::repository_filter::file_rel;
+        use crate::formats::maven::trusted_checksums::Basedir::Launcher;
+        use crate::patch::redirect::{MavenFilterAround, MAVEN_FILTER_KEY, MVN_CONFIG};
+        let pom = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>x</groupId>\n  <artifactId>y</artifactId>\n  <version>1</version>\n  <dependencies>\n    <dependency>\n      <groupId>com.socketfixture</groupId>\n      <artifactId>victim</artifactId>\n      <version>1.10.0</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+        let filter = file_rel(&format!("socket-patch-{GRADLE_UUID}"));
+        let candidates = vec![gradle_candidate()];
+        let around = |read: &CandidateFiles| -> MavenFilterAround {
+            read.files
+                .get(MAVEN_FILTER_KEY)
+                .map(|json| serde_json::from_str(json).unwrap())
+                .unwrap_or_default()
+        };
+        let codes = |done: &Rewritten| -> Vec<String> {
+            done.rewrite
+                .warnings
+                .iter()
+                .map(|w| w.code.clone())
+                .collect()
+        };
+        let landed_unfiltered = |view: &ProjectView<'_>, done: &Rewritten, why: &str| {
+            let files = &done.rewrite.files;
+            assert!(files["pom.xml"].contains("1.10.0-socket.4d5e6f70"), "{why}");
+            assert!(!files.contains_key(&filter), "{why}: {:?}", files.keys());
+            assert!(
+                !files
+                    .get(MVN_CONFIG)
+                    .is_some_and(|config| config.contains(".mvn/socket-patch")),
+                "{why}"
+            );
+            assert!(
+                guard(view, done, &candidates).is_none(),
+                "{why}: the run is not refused"
+            );
+        };
+        let project = || {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("pom.xml"), pom).unwrap();
+            std::fs::create_dir_all(tmp.path().join(".mvn")).unwrap();
+            tmp
+        };
+
+        // Control: nothing to say of the surroundings, and the filter is
+        // written with the pin.
+        let tmp = project();
+        let view = ProjectView::Disk(tmp.path());
+        let (read, done) = gradle_rewrite_in(&view).await;
+        assert_eq!(around(&read), MavenFilterAround::default());
+        assert!(done.rewrite.files.contains_key(&filter));
+        assert!(done.rewrite.files[MVN_CONFIG].contains(".mvn/socket-patch"));
+
+        // A linked config.
+        let tmp = project();
+        std::fs::create_dir_all(tmp.path().join("ci")).unwrap();
+        std::fs::write(
+            tmp.path().join("ci/maven.config"),
+            checksums_block(Launcher),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../ci/maven.config", tmp.path().join(MVN_CONFIG)).unwrap();
+        let view = ProjectView::Disk(tmp.path());
+        let (read, done) = gradle_rewrite_in(&view).await;
+        assert!(around(&read).config_unwritable);
+        landed_unfiltered(&view, &done, "a linked config");
+        assert!(!done.rewrite.files.contains_key(MVN_CONFIG));
+        assert!(!done.rewritten.iter().any(|rel| rel == MVN_CONFIG));
+        assert_eq!(codes(&done), ["redirect_maven_repository_filter_skipped"]);
+
+        // The filter named in the environment of the machine that scans.
+        let tmp = project();
+        let view = ProjectView::Disk(tmp.path());
+        let env = BTreeMap::from([(
+            "MAVEN_OPTS".to_string(),
+            "-Xmx1g -Daether.remoteRepositoryFilter.prefixes=true".to_string(),
+        )]);
+        let (read, done) = gradle_rewrite_with(&view, &env).await;
+        assert_eq!(around(&read).env.as_deref(), Some("MAVEN_OPTS"));
+        landed_unfiltered(&view, &done, "the environment");
+        let conflict = done
+            .rewrite
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_maven_repository_filter_conflict")
+            .expect("the conflict is said");
+        assert!(
+            conflict.detail.contains("MAVEN_OPTS"),
+            "{}",
+            conflict.detail
+        );
+        // (A project held in memory has no machine, and so no environment.)
+        let mut memory = MemoryProject::new();
+        memory.insert_text("pom.xml", pom);
+        let (read, done) = gradle_rewrite_with(&ProjectView::Memory(&memory), &env).await;
+        assert_eq!(around(&read), MavenFilterAround::default());
+        assert!(done.rewrite.files.contains_key(&filter));
+
+        // A file of the user's in the directory, and a link where this
+        // pin's own file would go: the link is not read and not written
+        // through, and the directory is known to hold more than ours.
+        let tmp = project();
+        std::fs::create_dir_all(tmp.path().join(".mvn/socket-patch")).unwrap();
+        std::fs::write(
+            tmp.path().join(".mvn/socket-patch/prefixes-central.txt"),
+            "## repository-prefixes/2.0\n/org\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("elsewhere.txt"), "/org\n").unwrap();
+        std::os::unix::fs::symlink("../../elsewhere.txt", tmp.path().join(&filter)).unwrap();
+        let view = ProjectView::Disk(tmp.path());
+        let (read, done) = gradle_rewrite_in(&view).await;
+        let seen = around(&read);
+        assert!(seen.keeps_lines);
+        assert_eq!(seen.occupied, [filter.clone()]);
+        assert!(!read.files.contains_key(&filter), "{:?}", read.files.keys());
+        let files = &done.rewrite.files;
+        assert!(files["pom.xml"].contains("1.10.0-socket.4d5e6f70"));
+        assert!(!files.contains_key(&filter), "{:?}", files.keys());
+        assert!(guard(&view, &done, &candidates).is_none());
+        assert!(
+            codes(&done).contains(&"redirect_maven_repository_filter_skipped".to_string()),
+            "{:?}",
+            done.rewrite.warnings
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("elsewhere.txt")).unwrap(),
+            "/org\n"
+        );
     }
 
     /// On disk the engine reads the mirrors of the Maven settings the

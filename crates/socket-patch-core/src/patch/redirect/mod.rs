@@ -9066,6 +9066,42 @@ pub(crate) const MVN_WRAPPER_PROPERTIES: &str = ".mvn/wrapper/maven-wrapper.prop
 /// Maven's JVM arguments. Read only, never edited: a resolver filter set
 /// there is the user's, and the lines hosted mode adds would override it.
 pub(crate) const MVN_JVM_CONFIG: &str = ".mvn/jvm.config";
+/// Engine-supplied input: what the rewriter cannot see of the repository
+/// filter's surroundings, as the JSON of [`MavenFilterAround`]. Absent
+/// when there is nothing to say.
+pub const MAVEN_FILTER_KEY: &str = "<socket-patch:maven-filter>";
+
+/// What surrounds a project's repository filter beyond the files the
+/// rewriter is handed. The filter is an extra: none of this ever keeps a
+/// pin from landing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MavenFilterAround {
+    /// The filter directory holds something that is not hosted mode's own
+    /// file (a prefix file of the user's, a subdirectory, a link), or could
+    /// not be listed. The two resolver lines are then never taken out: they
+    /// may be what makes Maven read that file, as on a rollback.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keeps_lines: bool,
+    /// The variable of the scanning machine's environment that names the
+    /// `prefixes` filter (`MAVEN_OPTS`, `MAVEN_ARGS`, `JAVA_TOOL_OPTIONS`,
+    /// `JDK_JAVA_OPTIONS`: Maven 3.9.9 and 4.0.0-rc-7 honour the property
+    /// in each). Builds started there configure the filter themselves, and
+    /// the lines hosted mode adds would move the directory their files are
+    /// read from: a conflict, like a setting in `.mvn/jvm.config`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    /// `.mvn/maven.config` cannot take a write (it is a symbolic link, or
+    /// its directory does not take the write). The two resolver lines are
+    /// then not added, and not taken out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub config_unwritable: bool,
+    /// The paths in the filter directory that carry a name hosted mode
+    /// writes and are not regular files (a link, a directory). No filter
+    /// file is written there: a write through a link would replace it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub occupied: Vec<String>,
+}
 /// Engine-supplied input: the `settings.xml` mirrors Maven is configured
 /// with on the machine that scans, as the JSON of
 /// [`settings_mirror_sets`](crate::crawlers::maven_crawler::settings_mirror_sets).
@@ -9362,7 +9398,13 @@ fn rewrite_maven_poms(
     // their pins moved to the new generation this run, so the entries go.
     let mut checksum_drops: Vec<String> = vec![];
     // The repository filter files of the pins that land this run.
-    let mut scope = MavenScope::default();
+    let mut scope = MavenScope {
+        around: files
+            .get(MAVEN_FILTER_KEY)
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default(),
+        ..MavenScope::default()
+    };
     let gradle_build_present = gradle::gradle_build_present(files);
     let mut warned_no_pom = false;
     // Local-repo paths of the suffixed jars this run's Trusted Checksums pin
@@ -10074,12 +10116,7 @@ fn rewrite_maven_poms(
             if versioned.iter().any(|(_, _, v)| *v == suffixed_version)
                 && idx.has_repository(&repo_id)
             {
-                scope.repair(
-                    files,
-                    &repo_id,
-                    (&group_id, &artifact_id, &suffixed_version),
-                    result,
-                );
+                scope.in_place(files, &repo_id);
             }
             continue;
         }
@@ -10120,16 +10157,25 @@ fn rewrite_maven_poms(
         );
     }
 
+    // A run that took the last Socket repository with a filter file out of
+    // the poms takes the two resolver lines out as well: no later run would
+    // (nothing is left to roll back), and they would name a directory whose
+    // files no repository reads. Asked of the poms as this run leaves them.
+    // The lines stay where something else in the directory may need them,
+    // as on a rollback, and where the config cannot take the write.
+    let strips = scope.retired
+        && !scope.around.keeps_lines
+        && !scope.around.config_unwritable
+        && scope.serves_none(files, &|id| {
+            planner.declares(id, pom.as_deref().unwrap_or_default())
+        });
     if pom_changed {
         if let Some(p) = pom {
             result.files.insert("pom.xml".into(), p);
         }
     }
     result.files.extend(planner.module_poms);
-    // A run that retired the last filter file takes the two resolver lines
-    // out as well: no later run would (nothing is left to roll back), and
-    // they would name a directory that serves no file.
-    if scope.retired && scope.none_left(files) {
+    if strips {
         if let Some(rest) = crate::formats::maven::repository_filter::strip_config(&mvn_config) {
             mvn_config = rest;
             mvn_config_changed = true;
@@ -10309,18 +10355,28 @@ fn pin_maven_checksums(
     }
 }
 
-/// The repository filter files of one run ([`repository_filter`]).
+/// The repository filter of one run ([`repository_filter`]).
 #[derive(Default)]
 struct MavenScope {
+    /// What the engine saw around the filter ([`MAVEN_FILTER_KEY`]).
+    around: MavenFilterAround,
     /// The filter files to write, by project-relative path.
     files: BTreeMap<String, String>,
-    /// A filter file was retired this run.
+    /// A Socket repository whose filter file the checkout holds went out
+    /// of the poms this run.
     retired: bool,
     /// The filter files of the pins this run wired or found wired, by
     /// project-relative path: the ones the run answers for when it says
     /// whether the project's Maven reads the filter.
     pinned: std::collections::BTreeSet<String>,
+    /// The run already said that the lines were added.
+    said_enabled: bool,
+    /// The run already said that the filter was skipped.
+    said_skipped: bool,
 }
+
+/// The edit kind of a filter file.
+const MAVEN_FILTER_EDIT: &str = "redirect_maven_repository_filter";
 
 impl MavenScope {
     /// The file as this run leaves it: what is pending for it, else what
@@ -10329,61 +10385,25 @@ impl MavenScope {
         self.files.get(rel).or_else(|| files.get(rel))
     }
 
-    /// Write `text` as the filter file `rel`, unless that is what this run
-    /// already leaves there. A change pending from earlier in the run (a
-    /// retire of the same repository) is taken back when the checkout
-    /// holds `text` already, so nothing is written and nothing reported.
-    fn put(
-        &mut self,
-        files: &BTreeMap<String, String>,
-        (rel, text): (String, String),
-        (repo_id, listed): (&str, String),
-        result: &mut RewriteResult,
-    ) {
-        if self.live(files, &rel) == Some(&text) {
-            return;
-        }
-        if files.get(&rel) == Some(&text) {
-            self.files.remove(&rel);
-            result
-                .edits
-                .retain(|e| !(e.kind == "redirect_maven_repository_filter" && e.path == rel));
-            return;
-        }
-        let action = if files.contains_key(&rel) {
-            "rewritten"
-        } else {
-            "added"
-        };
-        result
-            .edits
-            .retain(|e| !(e.kind == "redirect_maven_repository_filter" && e.path == rel));
-        result.edits.push(FileEdit {
-            path: rel.clone(),
-            kind: "redirect_maven_repository_filter".into(),
-            action: action.into(),
-            key: Some(repo_id.to_string()),
-            original: None,
-            new: Some(Value::String(listed)),
-        });
-        self.files.insert(rel, text);
-    }
-
     /// Keep Maven from asking the Socket repository `repo_id` for anything
     /// but the suffixed version of the artifact it serves, for a dep whose
     /// pin landed this run: the two resolver lines in `.mvn/maven.config`,
     /// which name the filter's directory through the property this project
     /// takes (`form`, the one its Trusted Checksums directory takes), and
     /// the repository's prefix file. A pin an earlier run wrote gets no
-    /// new file, like its Trusted Checksums, so a re-run stays edit-free
-    /// ([`Self::repair`] mends one that is there and wrong).
+    /// new file, like its Trusted Checksums, so a re-run stays edit-free.
     ///
     /// The file lists the one path the pin resolves, from the coordinates
     /// the pin was written with: a file that listed anything else would
-    /// fail the build. Nothing is written when the checkout already
-    /// configures the filter (the Socket repository then stays unfiltered,
-    /// as it was, and the warning names the path to list for it), or for
-    /// coordinates a path or a line cannot hold.
+    /// fail the build. One that is there and lists the path already is
+    /// left as it is, whatever its line endings and comments.
+    ///
+    /// The filter is an extra, and the pin lands without it wherever it
+    /// cannot be had: where the filter is configured already (in the
+    /// checkout, or in the environment of the machine that scans), where
+    /// `.mvn/maven.config` cannot take the two lines, and for coordinates a
+    /// path or a line cannot hold. The Socket repository then stays
+    /// unfiltered, as it was, and the run says so.
     fn repository(
         &mut self,
         files: &BTreeMap<String, String>,
@@ -10402,12 +10422,38 @@ impl MavenScope {
         {
             return;
         }
-        let jvm = files
+        let rel = repository_filter::file_rel(repo_id);
+        // Something that is no file of hosted mode's stands where this
+        // repository's would go.
+        if self.around.occupied.contains(&rel) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_repository_filter_skipped".into(),
+                detail: format!(
+                    "{group_id}:{artifact_id}: {rel} is not a regular file (a link or a \
+                     directory stands there), so no filter file was written for the {repo_id} \
+                     repository. The pin landed all the same: Maven asks that repository for \
+                     every artifact its local repository does not hold, not for the patched \
+                     version only"
+                ),
+            });
+            return;
+        }
+        // A setting outside `maven.config` is the user's as well: the lines
+        // would move the directory their own files are read from.
+        let outside = if files
             .get(MVN_JVM_CONFIG)
-            .is_some_and(|jvm| repository_filter::mentions_filter(jvm));
-        let merged = match repository_filter::merge_config(mvn_config, form) {
-            _ if jvm => Config::Conflict(format!("a setting in {MVN_JVM_CONFIG}")),
-            merged => merged,
+            .is_some_and(|jvm| repository_filter::mentions_filter(jvm))
+        {
+            Some(format!("a setting in {MVN_JVM_CONFIG}"))
+        } else {
+            self.around
+                .env
+                .as_ref()
+                .map(|var| format!("a setting in the {var} environment variable of this machine"))
+        };
+        let merged = match outside {
+            Some(theirs) => Config::Conflict(theirs),
+            None => repository_filter::merge_config(mvn_config, form),
         };
         let listed = repository_filter::prefix(group_id, artifact_id, suffixed_version);
         match merged {
@@ -10417,14 +10463,33 @@ impl MavenScope {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_maven_repository_filter_conflict".into(),
                     detail: format!(
-                        "{group_id}:{artifact_id}: the checkout already configures Maven's \
-                         repository prefix filter ({theirs}); leaving it as-is, so the {repo_id} \
-                         repository is not filtered: Maven asks it for every artifact the local \
-                         repository does not hold, though it serves only {suffixed_version}. To \
-                         filter it, list {listed} in a prefixes-{repo_id}.txt file of that \
-                         filter's directory"
+                        "{group_id}:{artifact_id}: Maven's repository prefix filter is already \
+                         configured ({theirs}); leaving it as-is, so the {repo_id} repository is \
+                         not filtered: Maven asks it for every artifact the local repository \
+                         does not hold, though it serves only {suffixed_version}. To filter it, \
+                         list {listed} in a prefixes-{repo_id}.txt file of that filter's \
+                         directory"
                     ),
                 });
+                return;
+            }
+            // The lines are a write to a file that cannot take one. The
+            // pin has landed; it stays, unfiltered.
+            Config::Appended(_) if self.around.config_unwritable => {
+                if !std::mem::replace(&mut self.said_skipped, true) {
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_maven_repository_filter_skipped".into(),
+                        detail: format!(
+                            "{MVN_CONFIG} cannot be written (it is a symbolic link, or its \
+                             directory does not take the write), so the two lines that point \
+                             Maven at the repository filter in {dir} were not added and no \
+                             filter file was written. The pins landed all the same: Maven asks \
+                             each Socket repository for every artifact its local repository \
+                             does not hold, not for the patched version only",
+                            dir = repository_filter::DIR,
+                        ),
+                    });
+                }
                 return;
             }
             Config::Appended(config) => {
@@ -10443,56 +10508,73 @@ impl MavenScope {
                     original: None,
                     new: None,
                 });
+                // The directory is one per build, not one per repository:
+                // said once, by the run that moves it.
+                if !std::mem::replace(&mut self.said_enabled, true) {
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_maven_repository_filter_enabled".into(),
+                        detail: format!(
+                            "{MVN_CONFIG} now switches Maven's repository prefix filter on and \
+                             names {dir} as its directory, so every build of this project reads \
+                             prefix files from {dir} only. A prefix file kept anywhere else (the \
+                             local repository's default directory, say) is no longer read unless \
+                             a build names its directory on the command line: move it into {dir}",
+                            dir = repository_filter::DIR,
+                        ),
+                    });
+                }
             }
             Config::InPlace => {}
         }
-        let rel = repository_filter::file_rel(repo_id);
-        let text = repository_filter::file_text(repo_id, group_id, artifact_id, suffixed_version);
         self.pinned.insert(rel.clone());
-        self.put(files, (rel, text), (repo_id, listed), result);
-    }
-
-    /// Mend the filter file of a pin that is in place and was not written
-    /// this run: a file that is there (in the checkout, or pending from
-    /// this run) and does not list the pinned version stops Maven from
-    /// resolving the pin at all (`Prefix … NOT allowed`). That happens when
-    /// a scan retired the file and the pom's wiring then came back by
-    /// another road (a revert, a merge), and no later scan would touch it:
-    /// the pin is there, so nothing lands. A pin with no file is left
-    /// without one, and the resolver lines are not touched.
-    fn repair(
-        &mut self,
-        files: &BTreeMap<String, String>,
-        repo_id: &str,
-        (group_id, artifact_id, suffixed_version): (&str, &str, &str),
-        result: &mut RewriteResult,
-    ) {
-        use crate::formats::maven::repository_filter;
-        if generation::pin_name_uuid(repo_id, false).is_none()
-            || !crate::vendor::jvm::layout::safe_coordinates(
-                group_id,
-                artifact_id,
-                suffixed_version,
-            )
+        // By what the file says, not by its bytes: a checkout with CRLF
+        // line endings, or a comment someone added, lists the path too.
+        if self
+            .live(files, &rel)
+            .is_some_and(|text| repository_filter::lists(text, &listed))
         {
             return;
         }
-        let rel = repository_filter::file_rel(repo_id);
-        if self.live(files, &rel).is_none() {
+        let action = if files.contains_key(&rel) {
+            "rewritten"
+        } else {
+            "added"
+        };
+        result.edits.push(FileEdit {
+            path: rel.clone(),
+            kind: MAVEN_FILTER_EDIT.into(),
+            action: action.into(),
+            key: Some(repo_id.to_string()),
+            original: None,
+            new: Some(Value::String(listed)),
+        });
+        let text = repository_filter::file_text(repo_id, group_id, artifact_id, suffixed_version);
+        self.files.insert(rel, text);
+    }
+
+    /// Note the filter file of a pin that is in place and was not written
+    /// this run, when it has one. Nothing is written for it: a re-run
+    /// stays edit-free, and a pin without a file is left without one.
+    fn in_place(&mut self, files: &BTreeMap<String, String>, repo_id: &str) {
+        use crate::formats::maven::repository_filter;
+        if generation::pin_name_uuid(repo_id, false).is_none() {
             return;
         }
-        self.pinned.insert(rel.clone());
-        let text = repository_filter::file_text(repo_id, group_id, artifact_id, suffixed_version);
-        let listed = repository_filter::prefix(group_id, artifact_id, suffixed_version);
-        self.put(files, (rel, text), (repo_id, listed), result);
+        let rel = repository_filter::file_rel(repo_id);
+        if self.live(files, &rel).is_some() {
+            self.pinned.insert(rel);
+        }
     }
 
     /// Retire the filter file of a Socket repository this run took out of
     /// the poms (a patch another superseded, or one whose last pin went).
-    /// A rewrite writes files and removes none, so the file is left empty,
-    /// as the Trusted Checksums file is: nothing in it names the patch any
-    /// more, no repository of that id is left for Maven to read it for,
-    /// and rollback removes it.
+    ///
+    /// The file is left exactly as it is. It is inert while no pom declares
+    /// its repository, and it is the right file if the wiring comes back by
+    /// another road (a pom-only revert, a merge): emptied, it would fail
+    /// that build (`Prefix … NOT allowed`) until the next scan. `rollback`
+    /// and `remove` delete it. A file this same run planned for the
+    /// repository is taken back, as if never written.
     fn retire(
         &mut self,
         files: &BTreeMap<String, String>,
@@ -10504,44 +10586,32 @@ impl MavenScope {
             return;
         }
         let rel = repository_filter::file_rel(repo_id);
-        if self.live(files, &rel).is_none_or(|text| text.is_empty()) {
-            return;
+        self.pinned.remove(&rel);
+        if self.files.remove(&rel).is_some() {
+            result
+                .edits
+                .retain(|e| !(e.kind == MAVEN_FILTER_EDIT && e.path == rel));
         }
-        self.retired = true;
-        result
-            .edits
-            .retain(|e| !(e.kind == "redirect_maven_repository_filter" && e.path == rel));
-        if files.get(&rel).is_none_or(|text| text.is_empty()) {
-            // Written and retired within this run: as if never written
-            // (the checkout holds no file, or one already emptied).
-            self.files.remove(&rel);
-            return;
+        // Only a file the checkout holds is left behind by this run.
+        if files.contains_key(&rel) {
+            self.retired = true;
         }
-        self.files.insert(rel.clone(), String::new());
-        result.edits.push(FileEdit {
-            path: rel,
-            kind: "redirect_maven_repository_filter".into(),
-            action: "removed".into(),
-            key: Some(repo_id.to_string()),
-            original: None,
-            new: None,
-        });
     }
 
     /// Whether, once this run is written, no filter file of hosted mode
-    /// lists anything: the two resolver lines then serve no file.
-    fn none_left(&self, files: &BTreeMap<String, String>) -> bool {
+    /// belongs to a repository a pom still names (`declared`): the two
+    /// resolver lines then serve no file of hosted mode's.
+    fn serves_none(
+        &self,
+        files: &BTreeMap<String, String>,
+        declared: &dyn Fn(&str) -> bool,
+    ) -> bool {
         use crate::formats::maven::repository_filter;
-        let dir = format!("{}/", repository_filter::DIR);
-        let owned = |rel: &&String| {
-            rel.strip_prefix(dir.as_str())
-                .is_some_and(|name| repository_filter::owned(name).is_some())
-        };
         !files
             .keys()
             .chain(self.files.keys())
-            .filter(owned)
-            .any(|rel| self.live(files, rel).is_some_and(|text| !text.is_empty()))
+            .filter_map(|rel| repository_filter::owned_rel(rel))
+            .any(declared)
     }
 }
 
@@ -10607,13 +10677,13 @@ fn settle_maven_plan(
             result,
         );
     } else if run.wired {
-        scope.repair(files, repo_id, coords, result);
+        scope.in_place(files, repo_id);
     }
 }
 
-/// The repository filter files hosted mode keeps under the project at
-/// `root` ([`repository_filter::DIR`]), as every reader of that directory
-/// on disk sees it.
+/// The repository filter files hosted mode keeps under a project
+/// ([`repository_filter::DIR`]), as every reader of that directory sees it:
+/// the engine before a scan, the restore, and the vendored eject.
 #[derive(Debug, Default)]
 pub struct MavenFilterDir {
     /// Hosted mode's own files, project-relative, sorted: regular files
@@ -10622,35 +10692,54 @@ pub struct MavenFilterDir {
     /// The directory holds something else (a file of the user's, a
     /// subdirectory, a link).
     pub others: bool,
-    /// The directory could not be listed (and is not simply absent).
+    /// The entries among those others that carry a name hosted mode
+    /// writes, project-relative, sorted: a link or a directory where a
+    /// filter file would go.
+    pub occupied: Vec<String>,
+    /// The directory could not be listed to its end (and is not simply
+    /// absent): what it holds is not known, so nothing in it is hosted
+    /// mode's to delete and the lines that name it are not taken out.
     pub unlistable: bool,
 }
 
-/// List [`MavenFilterDir`] for the project at `root`. A missing directory
-/// is an empty one.
-pub async fn hosted_maven_filter_dir(root: &std::path::Path) -> MavenFilterDir {
+/// List [`MavenFilterDir`] for the project `view` shows. A missing
+/// directory is an empty one. A listing that fails part-way is no listing:
+/// the files seen so far are not reported.
+pub async fn hosted_maven_filter_dir(
+    view: &crate::vendor::lock_inventory::ProjectView<'_>,
+) -> MavenFilterDir {
     use crate::formats::maven::repository_filter;
     let mut found = MavenFilterDir::default();
-    let mut entries = match tokio::fs::read_dir(root.join(repository_filter::DIR)).await {
+    let entries = match view.list_dir_strict(repository_filter::DIR).await {
         Ok(entries) => entries,
         Err(e) => {
             found.unlistable = e.kind() != std::io::ErrorKind::NotFound;
             return found;
         }
     };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        // (`file_type` does not follow a link: a linked file is not ours.)
-        let regular = entry.file_type().await.is_ok_and(|kind| kind.is_file());
-        if regular && repository_filter::owned(&name).is_some() {
-            found
-                .owned
-                .push(format!("{}/{name}", repository_filter::DIR));
-        } else {
-            found.others = true;
+    for entry in entries {
+        let rel = format!("{}/{}", repository_filter::DIR, entry.name);
+        // Ours is a regular file under a name hosted mode writes: never a
+        // directory, a link (a linked file is not ours to delete or to
+        // write through) or anything else a name can stand for.
+        let regular = !entry.is_dir
+            && match view.disk_root() {
+                Some(root) => tokio::fs::symlink_metadata(root.join(&rel))
+                    .await
+                    .is_ok_and(|meta| meta.file_type().is_file()),
+                None => !view.is_symlink(&rel),
+            };
+        match (repository_filter::owned(&entry.name).is_some(), regular) {
+            (true, true) => found.owned.push(rel),
+            (true, false) => {
+                found.others = true;
+                found.occupied.push(rel);
+            }
+            (false, _) => found.others = true,
         }
     }
     found.owned.sort();
+    found.occupied.sort();
     found
 }
 
@@ -12403,6 +12492,8 @@ mod tests {
     /// The repository filter file of [`granted_maven_override`].
     const MAVEN_FILTER: &str =
         ".mvn/socket-patch/prefixes-socket-patch-aaaaaaaa-1111-4222-8333-444444444444.txt";
+    /// What the run that adds the filter's two lines says, once.
+    const MAVEN_FILTER_ENABLED: &str = "redirect_maven_repository_filter_enabled";
 
     /// A pin that lands keeps Maven from asking its Socket repository for
     /// anything but the pinned version: the prefix file Maven reads for
@@ -12454,7 +12545,14 @@ mod tests {
                 (MVN_CHECKSUMS, "redirect_maven_trusted_checksums", None),
             ]
         );
-        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        // The run that adds the two lines says what they change for the
+        // whole build; nothing else is said.
+        assert_eq!(
+            warning_codes(&r),
+            [MAVEN_FILTER_ENABLED],
+            "{:?}",
+            r.warnings
+        );
         // A second run finds all of it and writes nothing.
         let mut wired = files.clone();
         wired.extend(r.files.clone());
@@ -12580,58 +12678,87 @@ mod tests {
         assert!(!r.files.keys().any(|k| k.starts_with(".mvn/socket-patch/")));
     }
 
-    /// A filter file that is there and does not list the pinned version
-    /// stops Maven from resolving the pin at all (`Prefix … NOT allowed`).
-    /// That is what a scan leaves when it retires a file and the pom's
-    /// wiring then comes back by another road (a revert, a merge). The pin
-    /// is in place, so nothing lands; the file is mended all the same.
+    /// The engine-supplied surroundings of the filter ([`MAVEN_FILTER_KEY`]).
+    fn maven_filter_around(around: &MavenFilterAround) -> (String, String) {
+        (
+            MAVEN_FILTER_KEY.to_string(),
+            serde_json::to_string(around).unwrap(),
+        )
+    }
+
+    /// A filter file is read for what it says, not compared byte for byte.
+    /// A checkout with CRLF line endings, or a file someone added a
+    /// comment to, lists the pinned path all the same: a re-scan reports
+    /// no rewrite, and a pin that lands again leaves the file as it is.
+    /// One that does not list the path is rewritten with the pin, since
+    /// Maven would refuse the pin otherwise (`Prefix … NOT allowed`).
     #[test]
-    fn maven_filter_file_of_a_pin_in_place_is_mended() {
+    fn maven_filter_file_is_judged_by_what_it_lists() {
         let files = BTreeMap::from([(
             "pom.xml".to_string(),
             pom_with_dep("\n      <version>1.7.36</version>", ""),
         )]);
-        let first = rewrite_registry_redirect(&files, &[granted_maven_override()]);
+        let dep = granted_maven_override();
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&dep));
         let mut wired = files.clone();
         wired.extend(first.files.clone());
+        let written = wired[MAVEN_FILTER].clone();
+        for theirs in [
+            written.replace('\n', "\r\n"),
+            format!("{written}# reviewed 2026-11\n"),
+        ] {
+            assert_ne!(theirs, written);
+            // The pin in place: nothing lands, nothing is written.
+            let mut again = wired.clone();
+            again.insert(MAVEN_FILTER.to_string(), theirs.clone());
+            let r = rewrite_registry_redirect(&again, std::slice::from_ref(&dep));
+            assert!(r.files.is_empty(), "{theirs:?}: {:?}", r.files.keys());
+            assert!(r.edits.is_empty(), "{theirs:?}: {:?}", r.edits);
+            // The pom reverted on its own, the pin lands again: the file
+            // there already lists its path.
+            again.insert("pom.xml".to_string(), files["pom.xml"].clone());
+            let r = rewrite_registry_redirect(&again, std::slice::from_ref(&dep));
+            assert_eq!(
+                r.files.keys().collect::<Vec<_>>(),
+                ["pom.xml"],
+                "{theirs:?}"
+            );
+            assert!(
+                !r.edits.iter().any(|e| e.kind == MAVEN_FILTER_EDIT),
+                "{theirs:?}: {:?}",
+                r.edits
+            );
+        }
+        // A file that does not list the path: left alone while the pin is
+        // in place (a re-run is edit-free), rewritten when the pin lands.
         for broken in [
-            // Retired by a scan that took the pin out.
             "",
-            // Listing another generation's version.
             "## repository-prefixes/2.0\n/org/slf4j/slf4j-api/1.7.36-socket.bbbbbbbb\n",
         ] {
             let mut again = wired.clone();
             again.insert(MAVEN_FILTER.to_string(), broken.to_string());
-            let r = rewrite_registry_redirect(&again, &[granted_maven_override()]);
-            assert_eq!(
-                r.files.keys().collect::<Vec<_>>(),
-                [MAVEN_FILTER],
-                "{broken:?}"
-            );
-            assert_eq!(r.files[MAVEN_FILTER], wired[MAVEN_FILTER], "{broken:?}");
-            assert_eq!(
+            let r = rewrite_registry_redirect(&again, std::slice::from_ref(&dep));
+            assert!(r.files.is_empty(), "{broken:?}: {:?}", r.files.keys());
+            again.insert("pom.xml".to_string(), files["pom.xml"].clone());
+            let r = rewrite_registry_redirect(&again, std::slice::from_ref(&dep));
+            assert_eq!(r.files[MAVEN_FILTER], written, "{broken:?}");
+            assert!(
+                r.edits.iter().any(|e| e.kind == MAVEN_FILTER_EDIT
+                    && e.path == MAVEN_FILTER
+                    && e.action == "rewritten"),
+                "{broken:?}: {:?}",
                 r.edits
-                    .iter()
-                    .map(|e| (e.path.as_str(), e.kind.as_str(), e.action.as_str()))
-                    .collect::<Vec<_>>(),
-                [(
-                    MAVEN_FILTER,
-                    "redirect_maven_repository_filter",
-                    "rewritten"
-                )],
-                "{broken:?}"
             );
-            assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         }
     }
 
-    /// A filter file is settled against what the run already plans for
-    /// it, not only against the checkout: a repository retired and wired
-    /// again within one run ends as the checkout has it, with nothing
-    /// written and nothing reported; one written and retired within a run
-    /// was never there.
+    /// The scope object, one repository at a time. A repository that goes
+    /// out of the poms leaves its filter file exactly as it is: nothing is
+    /// written for it and nothing reported. Only a file the checkout holds
+    /// counts as left behind; one this same run planned is taken back, as
+    /// if never written, and leaves nothing behind.
     #[test]
-    fn maven_scope_settles_a_file_against_what_the_run_already_plans() {
+    fn maven_scope_retires_a_file_without_touching_it() {
         use crate::formats::maven::repository_filter;
         let id = format!("socket-patch-{MAVEN_UUID}");
         let coords = ("org.slf4j", "slf4j-api", MAVEN_SUFFIXED);
@@ -12640,8 +12767,10 @@ mod tests {
         let text = repository_filter::file_text(&id, coords.0, coords.1, coords.2);
         let form = RootDirectory::Launcher;
         let lines = format!("{}\n", repository_filter::config_args(form).join("\n"));
+        let nobody = |_: &str| false;
+        let this_one = |declared: &str| declared == id;
 
-        // In the checkout, retired, then wired again.
+        // In the checkout, retired, then wired again within the run.
         let files = BTreeMap::from([
             (rel.clone(), text.clone()),
             (MVN_CONFIG.to_string(), lines.clone()),
@@ -12649,9 +12778,9 @@ mod tests {
         let mut scope = MavenScope::default();
         let mut result = RewriteResult::default();
         scope.retire(&files, &id, &mut result);
-        assert_eq!(scope.files.get(&rel).map(String::as_str), Some(""));
-        assert_eq!(result.edits.len(), 1);
-        assert_eq!(result.edits[0].action, "removed");
+        assert!(scope.retired);
+        assert!(scope.files.is_empty() && result.edits.is_empty());
+        assert!(scope.serves_none(&files, &nobody));
         let (mut config, mut changed) = (lines.clone(), false);
         scope.repository(
             &files,
@@ -12663,10 +12792,12 @@ mod tests {
         assert!(scope.files.is_empty(), "{:?}", scope.files);
         assert!(result.edits.is_empty(), "{:?}", result.edits);
         assert!(!changed && config == lines);
-        // The file lists its path again, so the lines still serve it.
-        assert!(!scope.none_left(&files));
+        // Its repository is declared again, so the lines still serve it.
+        assert!(!scope.serves_none(&files, &this_one));
 
-        // Not in the checkout: written, then retired.
+        // Not in the checkout: written, then retired. Nothing was there
+        // before the run and nothing is after it, so nothing is left
+        // behind for the lines to be taken out over.
         let empty = BTreeMap::from([(MVN_CONFIG.to_string(), lines.clone())]);
         let mut scope = MavenScope::default();
         let mut result = RewriteResult::default();
@@ -12679,17 +12810,231 @@ mod tests {
         );
         assert_eq!(scope.files.get(&rel), Some(&text));
         assert_eq!(result.edits.len(), 1);
+        assert!(scope.pinned.contains(&rel));
         scope.retire(&empty, &id, &mut result);
         assert!(scope.files.is_empty(), "{:?}", scope.files);
         assert!(result.edits.is_empty(), "{:?}", result.edits);
+        assert!(!scope.retired && scope.pinned.is_empty());
 
-        // Emptied in the checkout already: nothing to retire again.
-        let emptied = BTreeMap::from([(rel.clone(), String::new())]);
+        // A repository with no file at all retires nothing.
         let mut scope = MavenScope::default();
-        let mut result = RewriteResult::default();
-        scope.retire(&emptied, &id, &mut result);
-        assert!(scope.files.is_empty() && result.edits.is_empty() && !scope.retired);
-        assert!(scope.none_left(&emptied));
+        scope.retire(&BTreeMap::new(), &id, &mut result);
+        assert!(!scope.retired);
+    }
+
+    /// The two resolver lines are one setting for the whole directory. A
+    /// scan that takes the last Socket repository out of the poms takes
+    /// them out too, but not while the directory holds anything that is
+    /// not hosted mode's own file: a prefix file of the user's is read
+    /// through those lines, and a rollback keeps them for it as well.
+    #[test]
+    fn maven_filter_lines_stay_while_the_directory_holds_anything_else() {
+        let files = poms(&[
+            ("pom.xml", REACTOR_ROOT),
+            ("a/pom.xml", &reactor_module("a", "")),
+            ("b/pom.xml", &reactor_module("b", "")),
+        ]);
+        let first = rewrite_poms_selecting(
+            &files,
+            &[("a/pom.xml", Ok("1.7.36")), ("b/pom.xml", Ok("2.0.9"))],
+        );
+        let mut wired = files.clone();
+        wired.extend(first.files.clone());
+        let gone = [("a/pom.xml", Ok("2.0.9")), ("b/pom.xml", Ok("2.0.9"))];
+
+        // Control: with the directory hosted mode's alone, the lines go.
+        let r = rewrite_poms_selecting(&wired, &gone);
+        assert_eq!(r.files["pom.xml"], files["pom.xml"], "the repository went");
+        assert!(!r.files[MVN_CONFIG].contains(".mvn/socket-patch"));
+
+        // The engine saw a file of the user's there (or could not list
+        // the directory): the pin goes all the same, the lines stay.
+        let mut theirs = wired.clone();
+        theirs.extend([maven_filter_around(&MavenFilterAround {
+            keeps_lines: true,
+            ..Default::default()
+        })]);
+        let r = rewrite_poms_selecting(&theirs, &gone);
+        assert_eq!(r.files["pom.xml"], files["pom.xml"], "the repository went");
+        assert!(
+            !r.files.contains_key(MVN_CONFIG),
+            "{:?}",
+            r.files.get(MVN_CONFIG)
+        );
+        assert!(
+            !r.edits
+                .iter()
+                .any(|e| e.key.as_deref() == Some("repositoryFilter")),
+            "{:?}",
+            r.edits
+        );
+    }
+
+    /// The filter is an extra, and a pin never waits for it. Where
+    /// `.mvn/maven.config` cannot take a write (a symbolic link, say) the
+    /// two lines are not added and no filter file is written: the pin
+    /// lands as it does without the filter, and one line says so. A config
+    /// that already holds the lines needs no write, and gets its file.
+    #[test]
+    fn maven_pin_lands_without_the_filter_where_the_config_cannot_be_written() {
+        use crate::formats::maven::repository_filter;
+        let checksums = format!("{}\n", MVN_CONFIG_ARGS.join("\n"));
+        let unwritable = maven_filter_around(&MavenFilterAround {
+            config_unwritable: true,
+            ..Default::default()
+        });
+        let second_uuid = "88888888-8888-4888-8888-888888888888";
+        let mut second = granted_maven_override();
+        second.name = "slf4j-simple".into();
+        second.patch_uuid = second_uuid.into();
+        let ov = second.registry_override.as_mut().unwrap();
+        ov.index_url =
+            format!("https://patch.socket.dev/patch-registry/maven/tok/{second_uuid}/maven2");
+        ov.identifiers.name = "org.slf4j/slf4j-simple".into();
+        ov.identifiers.maven_artifact_id = Some("slf4j-simple".into());
+        ov.identifiers.maven_suffixed_version = Some("1.7.36-socket.88888888".into());
+        let pom = pom_with_dep("\n      <version>1.7.36</version>", "").replace(
+            "  </dependencies>",
+            "    <dependency>\n      <groupId>org.slf4j</groupId>\n      \
+             <artifactId>slf4j-simple</artifactId>\n      <version>1.7.36</version>\n    \
+             </dependency>\n  </dependencies>",
+        );
+        // The checksum settings are in place (an earlier scan's), so the
+        // filter's lines are the only write the config would take.
+        let files = BTreeMap::from([
+            ("pom.xml".to_string(), pom),
+            (MVN_CONFIG.to_string(), checksums.clone()),
+            unwritable.clone(),
+        ]);
+        let r = rewrite_registry_redirect(&files, &[granted_maven_override(), second.clone()]);
+        assert!(r.files["pom.xml"].contains(MAVEN_SUFFIXED));
+        assert!(r.files["pom.xml"].contains("1.7.36-socket.88888888"));
+        assert!(r.files.contains_key(MVN_CHECKSUMS));
+        assert!(
+            !r.files.contains_key(MVN_CONFIG),
+            "the config is not written"
+        );
+        assert!(
+            !r.files.keys().any(|k| k.starts_with(".mvn/socket-patch/")),
+            "{:?}",
+            r.files.keys()
+        );
+        assert!(
+            !r.edits.iter().any(|e| e.path == MVN_CONFIG),
+            "{:?}",
+            r.edits
+        );
+        // Once for the run, however many pins landed.
+        assert_eq!(
+            warning_codes(&r),
+            ["redirect_maven_repository_filter_skipped"],
+            "{:?}",
+            r.warnings
+        );
+        let detail = &r.warnings[0].detail;
+        for part in [
+            ".mvn/maven.config cannot be written",
+            "The pins landed all the same",
+        ] {
+            assert!(detail.contains(part), "{part}: {detail}");
+        }
+
+        // The lines already there: the file is written, no line is.
+        let lines = format!(
+            "{checksums}{}\n",
+            repository_filter::config_args(RootDirectory::Launcher).join("\n")
+        );
+        let mut in_place = files.clone();
+        in_place.insert(MVN_CONFIG.to_string(), lines);
+        let r = rewrite_registry_redirect(&in_place, &[granted_maven_override()]);
+        assert!(r.files.contains_key(MAVEN_FILTER));
+        assert!(!r.files.contains_key(MVN_CONFIG));
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+
+        // Nor are the lines taken out of a config that cannot be written.
+        let reactor = poms(&[
+            ("pom.xml", REACTOR_ROOT),
+            ("a/pom.xml", &reactor_module("a", "")),
+            ("b/pom.xml", &reactor_module("b", "")),
+        ]);
+        let first = rewrite_poms_selecting(
+            &reactor,
+            &[("a/pom.xml", Ok("1.7.36")), ("b/pom.xml", Ok("2.0.9"))],
+        );
+        let mut wired = reactor.clone();
+        wired.extend(first.files.clone());
+        wired.extend([unwritable]);
+        let r = rewrite_poms_selecting(
+            &wired,
+            &[("a/pom.xml", Ok("2.0.9")), ("b/pom.xml", Ok("2.0.9"))],
+        );
+        assert_eq!(
+            r.files["pom.xml"], reactor["pom.xml"],
+            "the repository went"
+        );
+        assert!(!r.files.contains_key(MVN_CONFIG));
+    }
+
+    /// A build started on the scanning machine that names the prefix
+    /// filter in its environment configures the filter itself, like a
+    /// setting in `.mvn/jvm.config`: the lines would move the directory
+    /// its files are read from. The pin lands, nothing is written for the
+    /// filter, and the conflict names the variable.
+    #[test]
+    fn maven_filter_is_left_to_the_environment_that_configures_it() {
+        let files = BTreeMap::from([
+            (
+                "pom.xml".to_string(),
+                pom_with_dep("\n      <version>1.7.36</version>", ""),
+            ),
+            maven_filter_around(&MavenFilterAround {
+                env: Some("MAVEN_OPTS".to_string()),
+                ..Default::default()
+            }),
+        ]);
+        let r = rewrite_registry_redirect(&files, &[granted_maven_override()]);
+        assert!(r.files["pom.xml"].contains(MAVEN_SUFFIXED));
+        assert!(!r.files.keys().any(|k| k.starts_with(".mvn/socket-patch/")));
+        assert!(!r.files[MVN_CONFIG].contains(".mvn/socket-patch"));
+        assert_eq!(
+            warning_codes(&r),
+            ["redirect_maven_repository_filter_conflict"]
+        );
+        let detail = &r.warnings[0].detail;
+        assert!(
+            detail.contains("a setting in the MAVEN_OPTS environment variable of this machine"),
+            "{detail}"
+        );
+    }
+
+    /// The filter's directory is one per build. The run that adds the two
+    /// lines says, once, that Maven now reads prefix files from that
+    /// directory only; a run that finds them in place says nothing.
+    #[test]
+    fn maven_scan_says_when_it_moves_the_filter_directory() {
+        let files = BTreeMap::from([(
+            "pom.xml".to_string(),
+            pom_with_dep("\n      <version>1.7.36</version>", ""),
+        )]);
+        let r = rewrite_registry_redirect(&files, &[granted_maven_override()]);
+        assert_eq!(
+            warning_codes(&r),
+            [MAVEN_FILTER_ENABLED],
+            "{:?}",
+            r.warnings
+        );
+        let detail = &r.warnings[0].detail;
+        for part in [
+            ".mvn/maven.config now switches Maven's repository prefix filter on",
+            "reads prefix files from .mvn/socket-patch only",
+            "move it into .mvn/socket-patch",
+        ] {
+            assert!(detail.contains(part), "{part}: {detail}");
+        }
+        let mut wired = files.clone();
+        wired.extend(r.files.clone());
+        let again = rewrite_registry_redirect(&wired, &[granted_maven_override()]);
+        assert!(again.warnings.is_empty(), "{:?}", again.warnings);
     }
 
     /// A module's pom may be a file of any name. Whether a repository is
@@ -12734,15 +13079,18 @@ mod tests {
     }
 
     /// Every reader of the filter directory lists it one way: hosted
-    /// mode's own regular files, and whether anything else is there.
+    /// mode's own regular files, and whether anything else is there. A
+    /// link or a directory under a name of hosted mode's is not its file;
+    /// a directory that cannot be listed is not an empty one.
     #[test]
     fn the_filter_directory_lists_only_hosted_modes_own_regular_files() {
+        use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject, ProjectView};
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let listed = || runtime.block_on(hosted_maven_filter_dir(tmp.path()));
+        let listed = || runtime.block_on(hosted_maven_filter_dir(&ProjectView::Disk(tmp.path())));
         // No directory is an empty one.
         let none = listed();
         assert!(none.owned.is_empty() && !none.others && !none.unlistable);
@@ -12764,6 +13112,53 @@ mod tests {
         let mixed = listed();
         assert_eq!(mixed.owned, [format!(".mvn/socket-patch/{ours}")]);
         assert!(mixed.others && !mixed.unlistable);
+        assert_eq!(
+            mixed.occupied,
+            [".mvn/socket-patch/prefixes-socket-patch-99999999-9999-4999-8999-999999999999.txt"]
+        );
+
+        // A link under a name of ours is not ours either: it is not read,
+        // not deleted, and nothing is written through it.
+        #[cfg(unix)]
+        {
+            let linked = tempfile::tempdir().unwrap();
+            let dir = linked.path().join(".mvn/socket-patch");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(linked.path().join("elsewhere.txt"), "/org\n").unwrap();
+            std::os::unix::fs::symlink("../../elsewhere.txt", dir.join(&ours)).unwrap();
+            let found =
+                runtime.block_on(hosted_maven_filter_dir(&ProjectView::Disk(linked.path())));
+            assert!(found.owned.is_empty() && found.others && !found.unlistable);
+            assert_eq!(found.occupied, [format!(".mvn/socket-patch/{ours}")]);
+
+            // A directory that is there and cannot be read: what it holds
+            // is not known. (Root reads anything, so nothing to see there.)
+            if unsafe { libc::geteuid() } != 0 {
+                use std::os::unix::fs::PermissionsExt as _;
+                let dir = tmp.path().join(".mvn/socket-patch");
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+                let unread = listed();
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+                assert!(unread.unlistable && unread.owned.is_empty());
+            }
+        }
+
+        // The same reading of a project held in memory.
+        let mut project = MemoryProject::new();
+        project.insert_text(
+            &format!(".mvn/socket-patch/{ours}"),
+            "## repository-prefixes/2.0\n",
+        );
+        let memory = runtime.block_on(hosted_maven_filter_dir(&ProjectView::Memory(&project)));
+        assert_eq!(memory.owned, [format!(".mvn/socket-patch/{ours}")]);
+        assert!(!memory.others && !memory.unlistable);
+        project.insert(
+            ".mvn/socket-patch/prefixes-socket-patch-99999999-9999-4999-8999-999999999999.txt",
+            MemoryEntry::Symlink,
+        );
+        let memory = runtime.block_on(hosted_maven_filter_dir(&ProjectView::Memory(&project)));
+        assert_eq!(memory.owned, [format!(".mvn/socket-patch/{ours}")]);
+        assert!(memory.others);
     }
 
     /// The engine-supplied mirrors of one settings file.
@@ -13113,7 +13508,10 @@ mod tests {
         );
         assert_eq!(
             warning_codes(&r),
-            ["redirect_maven_mirror_captures_repository"]
+            [
+                "redirect_maven_mirror_captures_repository",
+                MAVEN_FILTER_ENABLED
+            ]
         );
         assert!(r.warnings[0].detail.starts_with("org.slf4j:slf4j-api: "));
         assert!(r.maven_reactor_uuids.contains(MAVEN_UUID));
@@ -13725,7 +14123,10 @@ mod tests {
                 (MVN_CHECKSUMS, "redirect_maven_trusted_checksums", "added"),
             ]
         );
-        assert_eq!(warning_codes(&r), ["redirect_maven_dep_management_added"]);
+        assert_eq!(
+            warning_codes(&r),
+            ["redirect_maven_dep_management_added", MAVEN_FILTER_ENABLED]
+        );
         assert!(r.confirmed_maven_reactor_uuids.contains(MAVEN_UUID));
 
         // A second run over what the first wrote changes nothing, and
@@ -13774,7 +14175,10 @@ mod tests {
         assert!(!r.files.contains_key("b/pom.xml"));
         assert_eq!(
             warning_codes(&r),
-            ["redirect_maven_selection_undetermined"],
+            [
+                "redirect_maven_selection_undetermined",
+                MAVEN_FILTER_ENABLED
+            ],
             "b may resolve it too, and is not pinned on a guess"
         );
         assert!(r.confirmed_maven_reactor_uuids.contains(MAVEN_UUID));
@@ -13889,15 +14293,16 @@ mod tests {
             [
                 ("a/pom.xml", "redirect_maven_dep_management"),
                 ("pom.xml", "redirect_maven_repository"),
-                (MAVEN_FILTER, "redirect_maven_repository_filter"),
                 (MVN_CONFIG, "redirect_maven_config"),
             ]
         );
-        assert!(!wired[MAVEN_FILTER].is_empty());
-        assert_eq!(r.files[MAVEN_FILTER], "");
-        // No filter file lists anything now, so the two resolver lines
-        // that named their directory go too; the Trusted Checksums lines
-        // stay as they were.
+        // The filter file is left exactly as it is: no pom names its
+        // repository, so Maven does not read it, and it is the right file
+        // should the wiring come back by a pom-only revert or a merge.
+        assert!(!r.files.contains_key(MAVEN_FILTER), "{:?}", r.files.keys());
+        // No pom names a repository with a filter file now, so the two
+        // resolver lines that named their directory go; the Trusted
+        // Checksums lines stay as they were.
         assert!(wired[MVN_CONFIG].contains(".mvn/socket-patch"));
         assert_eq!(
             r.files[MVN_CONFIG],
@@ -13910,20 +14315,36 @@ mod tests {
             &unpinned,
             &[("a/pom.xml", Ok("1.7.36")), ("b/pom.xml", Ok("2.0.9"))],
         );
-        assert_eq!(back.files[MAVEN_FILTER], wired[MAVEN_FILTER]);
+        // (The file is still there and lists the path: it is not written.)
+        assert!(!back.files.contains_key(MAVEN_FILTER));
         assert_eq!(back.files[MVN_CONFIG], wired[MVN_CONFIG]);
         assert_eq!(back.files["a/pom.xml"], wired["a/pom.xml"]);
+        // And the wiring coming back with no scan at all (the poms alone
+        // reverted to the wired ones) builds: the file lists the pin.
+        assert!(crate::formats::maven::repository_filter::lists(
+            &unpinned[MAVEN_FILTER],
+            &format!("/org/slf4j/slf4j-api/{MAVEN_SUFFIXED}")
+        ));
     }
 
-    /// The resolver lines stay while another patch's filter file still
-    /// lists a path: only the retired patch's file is emptied.
+    /// The resolver lines stay while a pom still names another Socket
+    /// repository that has a filter file: the lines serve that one.
     #[test]
     fn maven_filter_lines_stay_while_another_filter_file_is_in_use() {
         use crate::formats::maven::repository_filter;
+        let other_id = "socket-patch-99999999-9999-4999-8999-999999999999";
+        // Module `b` is wired for another patch, by an earlier run of it.
+        let other_repository = format!(
+            "  <repositories>\n    <repository>\n      <id>{other_id}</id>\n      \
+             <url>https://patch.socket.dev/patch-registry/maven/tok/x/maven2</url>\n    \
+             </repository>\n  </repositories>\n</project>"
+        );
+        let b = reactor_module("b", "").replace("</project>", &other_repository);
+        assert!(b.contains(other_id));
         let files = poms(&[
             ("pom.xml", REACTOR_ROOT),
             ("a/pom.xml", &reactor_module("a", "")),
-            ("b/pom.xml", &reactor_module("b", "")),
+            ("b/pom.xml", &b),
         ]);
         let first = rewrite_poms_selecting(
             &files,
@@ -13931,24 +14352,24 @@ mod tests {
         );
         let mut wired = files.clone();
         wired.extend(first.files.clone());
-        // Another patch's file, as an earlier run of it left it.
-        let other =
-            repository_filter::file_rel("socket-patch-99999999-9999-4999-8999-999999999999");
+        let other = repository_filter::file_rel(other_id);
         wired.insert(
             other.clone(),
-            repository_filter::file_text(
-                "socket-patch-99999999-9999-4999-8999-999999999999",
-                "com.example",
-                "other",
-                "2.0.0-socket.99999999",
-            ),
+            repository_filter::file_text(other_id, "com.example", "other", "2.0.0-socket.99999999"),
         );
         let r = rewrite_poms_selecting(
             &wired,
             &[("a/pom.xml", Ok("2.0.9")), ("b/pom.xml", Ok("2.0.9"))],
         );
-        assert_eq!(r.files[MAVEN_FILTER], "");
-        assert!(!r.files.contains_key(&other), "{:?}", r.files.keys());
+        assert_eq!(
+            r.files["pom.xml"], files["pom.xml"],
+            "this patch's repository went"
+        );
+        assert!(
+            !r.files.keys().any(|k| k.starts_with(".mvn/socket-patch/")),
+            "no filter file is touched: {:?}",
+            r.files.keys()
+        );
         assert!(
             !r.files.contains_key(MVN_CONFIG),
             "the lines still serve {other}: {:?}",
@@ -13977,7 +14398,8 @@ mod tests {
         let plain = BTreeMap::from([("pom.xml".to_string(), pom.clone())]);
         let wired = run(&plain);
         assert_eq!(form(&wired), Some(Launcher));
-        assert!(wired.warnings.is_empty(), "{:?}", wired.warnings);
+        // (Nothing but the line the first wiring says of the directory.)
+        assert_eq!(warning_codes(&wired), [MAVEN_FILTER_ENABLED]);
         for (wrapper, expected, read) in [
             ("3.6.3", Launcher, false),
             ("3.9.1", Launcher, false),
@@ -14044,7 +14466,7 @@ mod tests {
         assert_ne!(model_4_1["pom.xml"], pom);
         let r = run(&model_4_1);
         assert_eq!(form(&r), Some(Session));
-        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(warning_codes(&r), [MAVEN_FILTER_ENABLED]);
 
         // A directory line in another spelling of the argument is not one
         // the heal rewrites. Under the launcher's property in a project
@@ -14336,7 +14758,7 @@ mod tests {
             &wired,
             &[("a/pom.xml", Ok("2.0.9")), ("b/pom.xml", Ok("2.0.9"))],
         );
-        assert_eq!(r.files[MAVEN_FILTER], "");
+        assert!(!r.files.contains_key(MAVEN_FILTER));
         assert_eq!(
             r.files[MVN_CONFIG],
             format!("{}\n", MVN_CONFIG_ARGS.join("\n"))
@@ -14453,7 +14875,12 @@ mod tests {
         );
         assert_eq!(r.edits[0].kind, "redirect_maven_property");
         assert_eq!(r.edits[0].key.as_deref(), Some("slf4j.version"));
-        assert!(warning_codes(&r).is_empty(), "{:?}", r.warnings);
+        assert_eq!(
+            warning_codes(&r),
+            [MAVEN_FILTER_ENABLED],
+            "{:?}",
+            r.warnings
+        );
         assert!(r.confirmed_maven_reactor_uuids.contains(MAVEN_UUID));
 
         let sibling = "    <dependency>\n      <groupId>org.slf4j</groupId>\n      \
@@ -35902,8 +36329,12 @@ mod owned_pin_generation_matrix {
         gone: &str,
     ) -> (BTreeMap<String, String>, RewriteResult) {
         let (wired, result) = plan(&files, first);
+        // (A first Maven pin adds the filter's two lines, and says so.)
         assert!(
-            result.warnings.is_empty(),
+            result
+                .warnings
+                .iter()
+                .all(|w| w.code == "redirect_maven_repository_filter_enabled"),
             "first pin: {:?}",
             result.warnings
         );
@@ -35913,7 +36344,11 @@ mod owned_pin_generation_matrix {
         );
         let (repinned, result) = plan(&wired, second);
         assert!(result.warnings.is_empty(), "re-pin: {:?}", result.warnings);
-        for (path, text) in &repinned {
+        // (A filter file is never emptied: the superseded generation's
+        // stays as it is, read by no pom, until a rollback removes it.)
+        let retired =
+            |path: &str| crate::formats::maven::repository_filter::owned_rel(path).is_some();
+        for (path, text) in repinned.iter().filter(|(path, _)| !retired(path)) {
             assert!(
                 !text.contains(gone),
                 "{path} kept the superseded generation `{gone}`:\n{text}"
@@ -36154,11 +36589,17 @@ mod owned_pin_generation_matrix {
         let checksums = &repinned[MVN_CHECKSUMS];
         assert!(!checksums.contains("aaaaaaaa"), "{checksums}");
         assert_eq!(checksums.lines().count(), 2, "{checksums}");
-        // The filter file follows its repository: the superseded one is
-        // retired (a rewrite cannot remove a file, so it is left empty),
-        // and the new repository is limited to the new version.
+        // The filter file follows its repository. The superseded one's is
+        // left as it was (a rewrite cannot remove a file, and no pom names
+        // its repository any more, so Maven does not read it), and the new
+        // repository is limited to the new version.
         use crate::formats::maven::repository_filter::file_rel;
-        assert_eq!(repinned[&file_rel(&format!("socket-patch-{A}"))], "");
+        assert_eq!(
+            repinned[&file_rel(&format!("socket-patch-{A}"))]
+                .lines()
+                .last(),
+            Some("/org/apache/commons/commons-lang3/3.12.0-socket.aaaaaaaa")
+        );
         assert_eq!(
             repinned[&file_rel(&format!("socket-patch-{B}"))]
                 .lines()
@@ -36309,7 +36750,17 @@ mod owned_pin_generation_matrix {
         let mut files = pom_project();
         files.insert(MVN_CHECKSUMS.into(), format!("{}\n", user.join("\n")));
         let (wired, result) = plan(&files, &maven(A, tok));
-        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        // (The first pin adds the filter's two lines, and says so.)
+        assert_eq!(
+            result
+                .warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
+            ["redirect_maven_repository_filter_enabled"],
+            "{:?}",
+            result.warnings
+        );
         let (repinned, _) = plan(&wired, &maven(B, tok));
         for (stage, tree) in [("pin", &wired), ("re-pin", &repinned)] {
             let checksums = &tree[MVN_CHECKSUMS];

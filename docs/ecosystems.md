@@ -1210,32 +1210,48 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
     (`maven_repository_filter_maven3_only` on a rollback) says so. When the Maven
     Wrapper pins a Maven older than 3.9.2, the files are written all the same and
     `redirect_maven_repository_filter_unread` says that this Maven does not read them.
-  - **One directory per build.** The filter reads its files from one directory. When
-    `.mvn/maven.config` or `.mvn/jvm.config` already configures the prefix filter,
-    hosted mode writes neither the lines nor the file and warns
+  - **One directory per build.** The filter reads its files from one directory, so
+    once the two lines are committed every build of the project reads prefix files
+    from `.mvn/socket-patch/` only. The scan that adds the lines says so, once
+    (`redirect_maven_repository_filter_enabled`): a prefix file you keep anywhere else
+    (the local repository's default directory, say) is no longer read. Move it into
+    `.mvn/socket-patch/`, or name its directory on the build's command line
+    (`-Daether.remoteRepositoryFilter.prefixes.basedir=...`, which wins over
+    `maven.config`).
+  - **Left to whoever configured it.** When `.mvn/maven.config` or `.mvn/jvm.config`
+    already configures the prefix filter, or the environment of the machine that scans
+    does (`MAVEN_OPTS`, `MAVEN_ARGS`, `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`), hosted
+    mode writes neither the lines nor the file and warns
     `redirect_maven_repository_filter_conflict` for each patch; the pin still lands and
     the Socket repository stays unfiltered. To filter it yourself, list the path the
-    warning names in a `prefixes-socket-patch-<uuid>.txt` file of your own directory. A build that
-    switches the filter on from outside the checkout (the command line, `MAVEN_ARGS`)
-    and keeps its prefix files in the local repository's default directory stops reading
-    them once the two lines are committed: name that directory on the same command line
-    (`-Daether.remoteRepositoryFilter.prefixes.basedir=...`, which wins over
-    `maven.config`), or move the files into `.mvn/socket-patch/`.
+    warning names in a `prefixes-socket-patch-<uuid>.txt` file of your own directory.
+    Only the scanning machine's environment is known: a flag a CI job passes is not.
+  - **Never in the way of a pin.** The filter is an extra. Where it cannot be written,
+    the pin lands without it and the scan says so
+    (`redirect_maven_repository_filter_skipped`): a `.mvn/maven.config` that is a
+    symbolic link or sits in a directory that does not take the write and does not hold
+    the two lines yet, or a link or a directory under the name of a pin's filter file.
   - **Written with the pin.** A file that did not list the pinned version would fail
-    the build, so it is written from the pin's own coordinates, in the same run. A pin
-    an earlier release wrote gets no file on a re-scan (a re-run stays edit-free, as for
-    the Trusted Checksums): `rollback`, then `scan`, writes it. When a scan takes a
-    Socket repository out of the poms (a newer patch replaced it), that repository's
-    file is left empty: a scan writes files and removes none. With the last such file
-    emptied, the scan also takes the two lines out of `.mvn/maven.config`. A file that
-    is there and does not list the version a pin in place resolves (the pom's wiring
-    came back by a revert or a merge after a scan emptied the file) is rewritten by the
-    next scan, since Maven would otherwise refuse the pin.
+    the build, so it is written from the pin's own coordinates, in the same run. A file
+    that is there and lists the path is left as it is, whatever its line endings and
+    whatever comment you added. A pin an earlier release wrote gets no file on a
+    re-scan (a re-run stays edit-free, as for the Trusted Checksums): `rollback`, then
+    `scan`, writes it.
+  - **Never emptied.** When a scan takes a Socket repository out of the poms (a newer
+    patch replaced it, or its last pin went), that repository's file stays exactly as
+    it is: a scan writes files and removes none. No pom names its repository, so Maven
+    does not read it, and it is the right file if the wiring comes back by a pom-only
+    revert or a merge. `rollback` and `remove` delete it. With the last such repository
+    gone, the scan takes the two lines out of `.mvn/maven.config`, unless the directory
+    holds a file of your own, which is read through those lines.
   - **Taken out with the pin.** `rollback` and `remove` delete the files of the pins
     they restore, and any whose repository no pom declares any more. Once the directory
     is empty they also take the two lines out of `.mvn/maven.config`, byte for byte
     (the lines name a directory only hosted mode uses, so they are told from yours); a
-    file of your own in that directory keeps them.
+    file of your own in that directory keeps them. A config they cannot write (a
+    symbolic link, say) keeps the lines too, and a directory they cannot list is left
+    whole; the pins are restored all the same, and `maven_repository_filter_left` says
+    what to remove by hand.
 * **A Maven project's scan is scoped to its dependency graph.** The Maven local
   repository is shared by every project on the machine, so in project mode (no
   `--global` / `--global-prefix`) a Maven build's crawl (a `pom.xml`, no Gradle or

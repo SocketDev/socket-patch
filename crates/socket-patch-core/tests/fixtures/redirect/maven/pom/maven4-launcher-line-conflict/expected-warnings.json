@@ -1,1 +1,5 @@
-["redirect_maven_trusted_checksums_conflict", "redirect_maven_trusted_checksums_unenforced"]
+[
+  "redirect_maven_trusted_checksums_conflict",
+  "redirect_maven_repository_filter_enabled",
+  "redirect_maven_trusted_checksums_unenforced"
+]
