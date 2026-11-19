@@ -3636,6 +3636,18 @@ cc = RbConfig::CONFIG["CC"].split
 abort "could not build #{name}" unless system(*cc, "-shared", "-fPIC", "-o", name, "wrap.c")
 File.rename("Makefile.real", "Makefile")
 "##;
+/// [`ONE_SHOT_EXTCONF`] with a build that only a fresh tree lets finish:
+/// run over an installed one it compiles the library, uses the shipped
+/// file up and then fails.
+const ONCE_ONLY_EXTCONF: &str = r##"require "rbconfig"
+Dir.chdir(__dir__)
+name = RbConfig::CONFIG["host_os"] =~ /darwin/ ? "libsp_wrap.dylib" : "libsp_wrap.so"
+cc = RbConfig::CONFIG["CC"].split
+installed = File.exist?("Makefile")
+abort "could not build #{name}" unless system(*cc, "-shared", "-fPIC", "-o", name, "wrap.c")
+File.rename("Makefile.real", "Makefile")
+abort "this tree was built before" if installed
+"##;
 /// The file [`ONE_SHOT_EXTCONF`] uses up, relative to the gem dir.
 const ONE_SHOT_FILE: &str = "ext/sp_wrap/Makefile.real";
 
@@ -3929,10 +3941,10 @@ fn a_build_script_that_uses_up_a_shipped_file_is_given_it_back() {
     );
 }
 
-/// A patched source that does not compile fails the in-place build after
-/// the shipped file was put back for it: the file goes again with
-/// everything else the build did, and the gem is exactly as installed
-/// (#2106).
+/// A build that fails in the installed tree after it was given the
+/// shipped file back, and after it compiled the patched library and used
+/// the file up: the undo takes everything the build did with it, and the
+/// gem is exactly as installed (#2106).
 #[test]
 #[ignore = "host capstone: compiles a C extension with the real ruby/gem toolchain; \
             the unpinned `test` job skips it, the pinned-Ruby e2e leg runs it via --ignored"]
@@ -3940,24 +3952,20 @@ fn a_failed_build_takes_the_shipped_file_it_was_given_away_again() {
     let Some(abi) = toolchain() else {
         return;
     };
-    let fx = WrapGem::new(&abi, ONE_SHOT_EXTCONF);
-    write_record(
-        &fx.proj.join(".socket"),
-        WRAP_PURL,
-        &[(WRAP_C_KEY, Some(&wrap_c(1)), &broken_source())],
-    );
+    let fx = WrapGem::new(&abi, ONCE_ONLY_EXTCONF);
     let installed = walk_files(&fx.gem_dir);
     let extensions = walk_files(&fx.home.join("extensions"));
 
     let (code, stdout, stderr) = fx.run(&["apply", "--json", "--offline"]);
-    assert_ne!(code, 0, "a broken source cannot apply:\n{stdout}\n{stderr}");
+    assert_ne!(code, 0, "the in-place build fails:\n{stdout}\n{stderr}");
     let env = parse_json_envelope(&stdout);
     let event = common::envelope::event_for(&env, WRAP_PURL);
     assert!(
-        event["error"]
-            .as_str()
-            .is_some_and(|e| e.starts_with("native_extension_build_failed:")),
-        "{stdout}"
+        event["error"].as_str().is_some_and(|e| {
+            e.starts_with("native_extension_build_failed:")
+                && e.contains("this tree was built before")
+        }),
+        "the build got as far as the script's last line, so it was given the file:\n{stdout}"
     );
     assert_eq!(fx.value(), "1");
     assert_tree(&fx.gem_dir, &installed, "after the failed apply");
@@ -3967,6 +3975,7 @@ fn a_failed_build_takes_the_shipped_file_it_was_given_away_again() {
         "after the failed apply",
     );
     assert!(!fx.home.join(".socket-patch-build").exists());
+    assert!(!vex_attests(|args| fx.run(args)));
 }
 
 /// Without the source gem nothing says which files the build makes, so

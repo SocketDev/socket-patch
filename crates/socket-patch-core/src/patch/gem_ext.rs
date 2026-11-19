@@ -3318,10 +3318,12 @@ async fn rebuild(
                 Ok((snapshot, removed))
             });
             // What is written here is in no snapshot: the undo of a failed
-            // build removes it.
-            let prepared = prepared.and_then(|(snapshot, removed)| {
-                let given = give_back(&copy, &snapshot, &used_up, &left)?;
-                Ok((snapshot, removed, given))
+            // build removes it. Files that cannot be written (a full
+            // disk) leave the tree as it is, which is what the build ran
+            // over before there was anything to give it.
+            let prepared = prepared.map(|(snapshot, removed)| {
+                let given = give_back(&copy, &snapshot, &used_up, &left).unwrap_or_default();
+                (snapshot, removed, given)
             });
             match prepared {
                 Ok((snapshot, removed, given)) => Ok((aside, made, snapshot, removed, given)),
@@ -3690,6 +3692,9 @@ struct ShippedFile {
     rel: String,
     bytes: Vec<u8>,
     permissions: std::fs::Permissions,
+    /// When the stage's copy was written: before the record's files were,
+    /// in the stage and in the installed copy.
+    modified: Option<std::time::SystemTime>,
 }
 
 /// What building a gem's source gem in a stage showed of its build, for a
@@ -3709,7 +3714,7 @@ struct SeenInStage {
 /// The most bytes of [`used_up_files`] a run keeps while the staged build
 /// runs. A gem that ships more than this and installs without it is built
 /// in place from the tree as it is.
-const USED_UP_LIMIT: usize = 64 * 1024 * 1024;
+const USED_UP_LIMIT: u64 = 64 * 1024 * 1024;
 
 /// The files of the pristine source gem unpacked at `staged` that the
 /// copy at `installed` does not hold, with their content.
@@ -3722,9 +3727,15 @@ const USED_UP_LIMIT: usize = 64 * 1024 * 1024;
 /// stage uses the staged files up the same way, so they are read before
 /// it. All of them or none: a file that cannot be read, or more than
 /// [`USED_UP_LIMIT`] in all, keeps nothing.
+///
+/// Each keeps the time the stage's copy was written, which is before the
+/// record's files are written anywhere. A file given back with the time
+/// of its writing would be newer than the patched sources, and a build
+/// that makes one from the other (a parser the gem ships generated) would
+/// take the shipped one for current.
 fn used_up_files(installed: &Path, staged: &Path) -> Vec<ShippedFile> {
     let mut files = Vec::new();
-    let mut total = 0usize;
+    let mut total = 0u64;
     for rel in tree_files(staged) {
         if !is_safe_relative_subpath(&rel) || is_own_entry(&rel) {
             continue;
@@ -3734,18 +3745,23 @@ fn used_up_files(installed: &Path, staged: &Path) -> Vec<ShippedFile> {
             continue;
         }
         let path = staged.join(&rel);
-        let (Ok(bytes), Ok(meta)) = (read_regular_to_bytes_sync(&path), std::fs::metadata(&path))
-        else {
+        // Its size before its bytes: one that is over the limit is not
+        // read to find that out.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
             return Vec::new();
         };
-        total = total.saturating_add(bytes.len());
+        total = total.saturating_add(meta.len());
         if total > USED_UP_LIMIT {
             return Vec::new();
         }
+        let Ok(bytes) = read_regular_to_bytes_sync(&path) else {
+            return Vec::new();
+        };
         files.push(ShippedFile {
             rel,
             bytes,
             permissions: meta.permissions(),
+            modified: meta.modified().ok(),
         });
     }
     files
@@ -3834,6 +3850,13 @@ fn write_used_up(
             .files
             .push((rel.clone(), compute_git_sha256_from_bytes(&file.bytes)));
         std::fs::write(&path, &file.bytes)?;
+        if let Some(modified) = file.modified {
+            // Before the permissions, which may not let it be opened.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)?
+                .set_modified(modified)?;
+        }
         std::fs::set_permissions(&path, file.permissions.clone())?;
     }
     Ok(())
@@ -8763,6 +8786,13 @@ mod tests {
             ["ext/a/Makefile.real", "ext/a/vendor/src/b.c"]
         );
         assert_eq!(used_up[0].bytes, b"the makefile");
+        assert_eq!(
+            used_up[0].modified,
+            std::fs::metadata(staged.join("ext/a/Makefile.real"))
+                .unwrap()
+                .modified()
+                .ok()
+        );
     }
 
     /// The used-up files are put back for the in-place build, after the
@@ -8774,6 +8804,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (copy, probe) = in_tree_gem(tmp.path());
         let staged = source_gem_of(&copy, tmp.path());
+        // The stage was unpacked before the patched sources were written.
+        let unpacked = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(staged.join("ext/a/Makefile.real"))
+            .unwrap()
+            .set_modified(unpacked)
+            .unwrap();
         let used_up = used_up_files(&copy.gem_dir, &staged);
         let installed = tree_bytes(&copy.gem_dir);
         let dirs = |copy: &GemCopy| copy.gem_dir.join("ext/a/vendor").exists();
@@ -8786,6 +8824,16 @@ mod tests {
             b"the makefile"
         );
         assert!(copy.gem_dir.join("ext/a/vendor/src/b.c").is_file());
+        // Not newer than the patched source: a build that makes one from
+        // the other would take the file given back for current.
+        let written = |rel: &str| {
+            std::fs::metadata(copy.gem_dir.join(rel))
+                .unwrap()
+                .modified()
+                .unwrap()
+        };
+        assert_eq!(Some(written("ext/a/Makefile.real")), used_up[0].modified);
+        assert!(written("ext/a/Makefile.real") < written("ext/a/a.c"));
         build_in_tree(&copy, &probe);
         restore_tree(&copy, &snapshot.dir).unwrap();
         take_away(&copy, &given);
@@ -8838,6 +8886,7 @@ mod tests {
             permissions: std::fs::metadata(copy.gem_dir.join("lib/a.rb"))
                 .unwrap()
                 .permissions(),
+            modified: None,
         };
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut used_up = vec![
