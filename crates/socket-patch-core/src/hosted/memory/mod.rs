@@ -832,9 +832,18 @@ async fn engine(
             warnings.push(EngineWarning::new(code, detail, Some(&state.root)));
         }
         unsupported_ecosystem_warnings(&state.root, project, ecosystems, &mut warnings);
+        // The inventory's packages, and the gems the Bundler lock resolves
+        // only as precompiled platform builds, which it leaves out: hosted
+        // mode redirects those to their per-platform prebuilds.
+        let platform_gems = crate::vendor::lock_inventory::gem_platform_only_purls_in(
+            &ProjectView::Memory(project),
+        )
+        .await;
         let purls: BTreeSet<String> = entries
             .iter()
-            .filter_map(|e| discover::supplement_purl(&e.purl))
+            .map(|e| e.purl.as_str())
+            .chain(platform_gems.iter().map(String::as_str))
+            .filter_map(discover::supplement_purl)
             .filter(|p| ecosystem_allowed(ecosystems, p))
             .collect();
         let mut admitted: Vec<String> = Vec::with_capacity(purls.len());

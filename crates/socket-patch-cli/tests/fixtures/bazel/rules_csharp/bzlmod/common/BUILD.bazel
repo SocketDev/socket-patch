@@ -1,0 +1,16 @@
+# Prints `OUT: PRISTINE <id>` until the package is patched: a test builds the
+# package anew, with an id of its own in the assembly and at the end of the
+# package's name.
+#
+# `@nuget//:<package>` is the label a C# rule names in `deps`: the hub's alias
+# of the package's `csharp_import`, whose files are the assemblies of the
+# package that Bazel downloaded. The assembly of the fixture's package is a
+# line of text, which no compiler reads. The rule writes that line into the
+# script it builds, so a build needs a shell and no .NET SDK.
+genrule(
+    name = "consumer",
+    srcs = ["@nuget//:SP.Victim.@RUN@"],
+    outs = ["consumer.sh"],
+    cmd = "printf '#!/bin/sh\\necho \"OUT: %s\"\\n' \"$$(cat $(SRCS))\" > $@",
+    executable = True,
+)

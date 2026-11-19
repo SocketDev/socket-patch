@@ -306,7 +306,7 @@ pub async fn gem_vendor_target_preflight(
             .ok()?,
     };
     plan_gemfile_edit(&gemfile_text, &name, &version, &copy_rel)
-        .and_then(|plan| refuse_append_of_direct_dependency(plan, &lock_text, &name))
+        .and_then(|plan| refuse_append_of_direct_dependency(plan, &gemfile_text, &lock_text, &name))
         .and_then(|plan| {
             let after = apply_gemfile_plan(&gemfile_text, &plan);
             gemspec_merge_refusal(project_root, &after, &lock_text, &name, &version)
@@ -579,8 +579,14 @@ fn gem_edits(
     }
     // ── Gemfile edit plan (refusals before any write) ────────────────────
     let plan = match plan_gemfile_edit(&prelude.gemfile_text, name, version, &prelude.copy_rel)
-        .and_then(|plan| refuse_append_of_direct_dependency(plan, &prelude.lock_text, name))
-    {
+        .and_then(|plan| {
+            refuse_append_of_direct_dependency(
+                plan,
+                &prelude.gemfile_text,
+                &prelude.lock_text,
+                name,
+            )
+        }) {
         Ok(p) => p,
         Err(detail) => {
             return Err(Box::new(refused(
@@ -1635,8 +1641,11 @@ fn plan_gemfile_edit(
 /// declares it somewhere the line grammar cannot see (`eval_gemfile`, a
 /// loop, a gemspec). The managed block would declare it a second time and
 /// bundler refuses every install (#482). Every other plan passes through.
+/// `gemfile_text` is the Gemfile the plan was made for; the refusal reads
+/// it to word its way out ([`out_of_sight_declaration_remedy`]).
 fn refuse_append_of_direct_dependency(
     plan: GemfilePlan,
+    gemfile_text: &str,
     lock_text: &str,
     name: &str,
 ) -> Result<GemfilePlan, String> {
@@ -1647,10 +1656,41 @@ fn refuse_append_of_direct_dependency(
             "Gemfile.lock lists \"{name}\" as a direct dependency, but the Gemfile declares \
              it somewhere the line grammar cannot edit (an `eval_gemfile`d file, a loop, a \
              gemspec); refusing to append a second declaration (bundler hard-fails on \
-             duplicates)"
+             duplicates); {}",
+            out_of_sight_declaration_remedy(gemfile_text, name)
         ));
     }
     Ok(plan)
+}
+
+/// The way out of [`refuse_append_of_direct_dependency`] (#2151): a `gem`
+/// line the line grammar can edit, or agent mode. Hosted mode is not named:
+/// it refuses a gem declared in a gemspec, an `eval_gemfile`d file or a
+/// loop for the same reason (`redirect_gem_declaration_not_visible`).
+///
+/// The line stands in place of a `gem` call that declares the gem out of
+/// sight, never next to it: the rewrite gives the line an exact version
+/// and a `path:`, and bundler refuses a Gemfile whose two declarations of
+/// a gem differ. A gemspec's development dependency is no `gem` call and
+/// stays.
+///
+/// Where the Gemfile has a `gemspec` directive, the line goes above it: a
+/// gemspec development dependency on the gem merged into a line below the
+/// directive is refused next ([`gemspec_merge_refusal`]). A Gemfile whose
+/// directives cannot be read gets no such hint, which would not help it:
+/// that refusal cannot tell either way and names hosted mode.
+fn out_of_sight_declaration_remedy(gemfile_text: &str, name: &str) -> String {
+    let above_gemspec = crate::formats::gem::gemspec::gemspec_directives(gemfile_text)
+        .is_ok_and(|directives| !directives.is_empty());
+    let place = if above_gemspec {
+        " above `gemspec`"
+    } else {
+        ""
+    };
+    format!(
+        "declare it with one literal `gem \"{name}\"` line{place} in the Gemfile, in place \
+         of any other `gem` call that declares it, or patch {name} with `--mode agent`"
+    )
 }
 
 /// Looser "declared at all?" probe — the redirect rewriter's `declared_re`
@@ -7599,7 +7639,8 @@ mod tests {
     }
 
     /// #482: a DIRECT dependency declared where the line grammar cannot see
-    /// it (`eval_gemfile`, a loop) is listed under the lock's DEPENDENCIES.
+    /// it (`eval_gemfile`, a loop, a gemspec) is listed under the lock's
+    /// DEPENDENCIES.
     /// Appending the managed block would declare it twice and bundler
     /// refuses every install, so the plan must refuse before any write.
     #[tokio::test]
@@ -7607,12 +7648,36 @@ mod tests {
         for gemfile in [
             "source \"https://rubygems.org\"\n\ngem \"puma\"\neval_gemfile \"Gemfile.common\"\n",
             "source \"https://rubygems.org\"\n\ngem \"puma\"\n%w[rack].each { |g| gem g, \"~> 3.1\" }\n",
+            // A gem only the gemspec declares (a development dependency).
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\ngemspec\n",
+            "source \"https://rubygems.org\"\r\n\r\ngem \"puma\"\r\ngemspec path: \"gems/mylib\"\r\n",
+            // No directive: a variable of that name, which a loop reads.
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\ngemspec_file = Gem::Specification.load(\"x.gemspec\")\ngemspec_file.development_dependencies.each { |d| gem d.name }\n",
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\nspec = Gem::Specification.load(\"x.gemspec\")\n\ngemspec = spec\ngemspec.development_dependencies.each { |d| gem d.name }\n",
         ] {
             let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_DIRECT).await;
             let (code, detail) =
                 unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
             assert_eq!(code, "gemfile_declaration_not_editable", "{gemfile}");
             assert!(detail.contains("direct dependency"), "{detail}");
+            // #2151: the refusal names its way out, and no mode that
+            // refuses the gem as well (hosted mode does, for this reason).
+            assert!(
+                detail.contains("one literal `gem \"rack\"` line"),
+                "{detail}"
+            );
+            assert_names_other_modes(&detail, &["agent"]);
+            // The line replaces a `gem` call out of sight: next to it,
+            // the vendored pin would be a second, differing declaration.
+            assert!(
+                detail.contains("in place of any other `gem` call that declares it"),
+                "{detail}"
+            );
+            assert_eq!(
+                detail.contains("above `gemspec`"),
+                gemfile.contains("\ngemspec\n") || gemfile.contains("\ngemspec path:"),
+                "{detail}"
+            );
             assert!(!root.join(".socket").exists());
             assert_eq!(
                 tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),

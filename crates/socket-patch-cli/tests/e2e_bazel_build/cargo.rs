@@ -1,0 +1,1081 @@
+//! Hosted and vendored mode for a crate that rules_rust's crate_universe
+//! resolves from a Cargo workspace: `crate.from_cargo(cargo_lockfile =
+//! "//:Cargo.lock", manifests = ["//:Cargo.toml"], cargo_config =
+//! "//:.cargo/config.toml")` under Bzlmod, with no cargo-bazel lock (the
+//! hub's `lockfile`).
+//!
+//! The hub runs cargo. Its tool, cargo-bazel, copies the manifest, the lock
+//! and the config the hub names into a workspace of its own and has the
+//! cargo of the Rust toolchain resolve it: that cargo reads the index of
+//! every registry the lock names and downloads each crate file, unless its
+//! home holds them. A registry crate then becomes one repository, which
+//! Bazel's downloader fetches from the registry's download URL and holds to
+//! the checksum of `Cargo.lock`. A crate that a `[patch]` table takes from
+//! a path becomes a repository that mirrors the directory. With no
+//! cargo-bazel lock the hub follows `Cargo.toml` and `Cargo.lock` as they
+//! are, and no build needs a repin (`CARGO_BAZEL_REPIN`).
+//!
+//! Two flows, one test each, on the Bazel the run is given ([`FIXTURE`]
+//! says which ruleset goes with its release), each in a fresh output base:
+//!
+//! - (a) `bazel build` and `bazel run //:consumer` print the unpatched
+//!   marker. The stand-in registry was asked for the crate's file of the
+//!   index and, at least twice, for the crate file ([`asked_for`]).
+//! - (b) The one command of the mode writes its files and no other.
+//!   `scan --mode hosted --yes` adds the patch registry to
+//!   `.cargo/config.toml` (`[registries.socket-patch-<uuid>]`), names it on
+//!   the dependency in `Cargo.toml`, and gives the crate's entry of
+//!   `Cargo.lock` that registry as its source and the checksum of the
+//!   patched crate file. `scan --mode vendored --yes` unpacks the patched
+//!   crate file to `.socket/vendor/cargo/<uuid>/<name>-<version>/`, records
+//!   it in the ledger `.socket/vendor/state.json`, points a
+//!   `[patch.crates-io]` entry of `Cargo.toml` at the copy, and gives the
+//!   lock's entry the version of the copy (`<version>+socket.<uuid>`) and
+//!   no source.
+//! - (c) The same two Bazel commands, with no step in between, print the
+//!   patched marker. Hosted: the stand-in patch host was asked for its index
+//!   file of the crate and, at least twice, for the crate file, and the
+//!   upstream one was not asked for again. Vendored: the scan had fetched
+//!   it, and the build asked the stand-in for nothing. Then `vex` is asked
+//!   for its document. Hosted: it attests the crate, and the command of the
+//!   mode, run a second time as on every run of a pipeline, reports the
+//!   patch applied again and changes no file. Vendored: what `vex` does
+//!   depends on the ruleset (see "Known gaps").
+//! - (d) The undo (`rollback --yes`, or `vendor --revert`) puts every file
+//!   the command wrote back, byte for byte, and the build prints the
+//!   unpatched marker again.
+//! - (e) On a second machine (a new output base and, on Bazel 9, a new
+//!   contents cache) the command runs against a second patch. The first
+//!   machine is removed before the second one builds ([`second_machine`]).
+//!   Hosted: the patch host serves another crate file than the one the lock
+//!   pins, and the build fails on the checksum, whether the index of that
+//!   host names the pinned checksum or the one of the file it serves; the
+//!   upstream crate is not asked for in its place. Vendored: the first
+//!   build there is the patched one, and the command of the mode runs a
+//!   second time; the build after it writes nothing, `vendor --check`
+//!   passes and `vex` attests the crate. Then the library of the copy is
+//!   changed. Nothing in a build holds the committed copy to a checksum, as
+//!   nothing does for any crate a Cargo workspace takes from a path: the
+//!   changed library is what Bazel builds next, and it is
+//!   `socket-patch vendor --check` that reports the copy
+//!   (`vendor_hash_mismatch`).
+//!
+//! What a build writes into the checkout, and so what (c), (d) and (e)
+//! expect beyond that, depends on the ruleset ([`watches`]). rules_rust
+//! 0.75.0 has Bazel watch the files the hub reads, and `MODULE.bazel.lock`
+//! gets an entry for the hub. Every edit of `Cargo.lock` leaves that lock
+//! stale, the command's and the undo's alike: a build that may not update
+//! it (`--lockfile_mode=error`, as a CI with a frozen lock runs it) fails
+//! until a build that may, or `bazel mod deps --lockfile_mode=update`, has
+//! rewritten it and the user has committed that. So the first patched build
+//! rewrites Bazel's lock, the undo leaves that lock behind, and the next
+//! build writes the one of before.
+//!
+//! With rules_rust 0.56.0 Bazel's lock has no entry for the hub and a build
+//! writes no file: the undo restores the checkout at once, `vendor --check`
+//! passes, `vex` attests the crate, and a second scan reports the copy
+//! `already_vendored` and leaves it alone. With rules_rust 0.75.0 a build
+//! also writes a `BUILD.bazel` into the vendored copy, and those three
+//! commands do otherwise right after it (see "Known gaps").
+//!
+//! The two releases also differ in the home of the hub's cargo
+//! ([`cargo_env`]). rules_rust 0.75.0 gives it a directory inside the
+//! output base that is empty whenever the hub is evaluated, so every
+//! evaluation reads the index and downloads the crate file again: in hosted
+//! mode the patch host has to answer then. rules_rust 0.56.0 runs cargo
+//! with the home it is given, and that cargo asks for nothing its home
+//! already holds.
+//!
+//! A marker is read from what Bazel built. Bazel's downloader keeps every
+//! file it fetches in the repository cache, under its checksum, and hands it
+//! out again without a request; the tests of a leg share that cache, and CI
+//! restores it from earlier runs. So every crate file of a run is new: the
+//! library of the upstream crate and of each patch holds an id made for the
+//! run, which the marker shows, and the lock of the workspace copy gets the
+//! upstream checksum from the bytes the run serves ([`lock_pinning`]); the
+//! fixture's own lock holds a placeholder there.
+//!
+//! One loopback server per checkout (the second machine of (e) has its own)
+//! stands in for the Socket API, for the patch host (the sparse index of the
+//! patch registry and the crate file) and for crates.io (`index.crates.io`
+//! and `static.crates.io`, by route prefix; `rollback` reads the upstream
+//! checksum there through `SOCKET_CRATES_INDEX`). No downloader config
+//! reaches cargo, so the checkout says where its crates come from the way a
+//! project behind a mirror of crates.io does: its `.cargo/config.toml`
+//! replaces the `crates-io` source with the stand-in ([`mirror_config`]),
+//! and the hub names that file. That is why the hub of the vendored flow
+//! names a config too, which vendored mode itself does not need:
+//! cargo-bazel leaves the cargo config of a checkout out of the workspace
+//! it resolves unless the hub names it, so a hub without one resolves
+//! against crates.io itself, where no crate of a test can be. The crate is
+//! the tests' own, under a name that crates.io cannot hold ([`NAME`]). What
+//! rules_rust downloads for itself still comes from the network: its
+//! archives and the cargo-bazel binary (GitHub), the Rust toolchain
+//! (static.rust-lang.org), and the crates it builds its own tools from
+//! (static.crates.io).
+//!
+//! # Known gaps
+//!
+//! Two assertions of the vendored flow hold what the release does with
+//! rules_rust 0.75.0, and that is not what a user needs. They are marked
+//! `KNOWN GAP` where they stand. Both have one cause: cargo-bazel 0.75.0
+//! writes a `BUILD.bazel` into the committed copy, the scan recorded no
+//! such file, and `socket-patch` then takes the copy for a damaged one
+//! (`vendor_inventory_mismatch`). Right after a build that is the patched
+//! one:
+//!
+//! - `vendor --check` exits 1.
+//! - `vex` leaves the patch out and, with nothing else to attest, exits 1
+//!   and writes no document.
+//!
+//! The flow also holds how a user gets out of it today. A second
+//! `scan --mode vendored` downloads the crate again, reports the copy
+//! `rebuilt` and removes the file. Nothing the hub reads has changed by
+//! then, so the build after that scan does not write the file again, and
+//! the check and `vex` pass. `vendor --revert` removes the file with the
+//! copy.
+//!
+//! A fix of the product makes the two commands pass right after the build,
+//! as they do with rules_rust 0.56.0. `intact` of the vendored flow is then
+//! true with every ruleset, and the branches marked `KNOWN GAP` go, with
+//! the second download of the crate.
+
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use base64::Engine as _;
+use serde_json::json;
+use sha2::{Digest, Sha256, Sha512};
+use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+
+use crate::envelope::{event_for, has_event};
+use crate::harness::{
+    changed, fixture_path, Cell, Fixture, Ran, Release, StandIn, Tree, CONSUMER, NOTHING,
+    REPO_CACHE,
+};
+use crate::hosted_memory_common::{Patch, ORG};
+
+/// The first Bazel release that [`FIXTURE`] builds with rules_rust 0.75.0.
+const NEWER_RULESET: Release = (8, 0, 0);
+
+/// The workspace the tests build, and the ruleset each Bazel release builds
+/// it with. rules_rust 0.75.0 builds it on Bazel 7.7.2 as well (the hosted
+/// flow passed there). Bazel 7 keeps the older release for what that one
+/// does differently ([`watches`], [`cargo_env`]).
+const FIXTURE: Fixture = Fixture {
+    name: "cargo::FIXTURE",
+    dir: "rules_rust/bzlmod",
+    workflow: "bazel-cargo.yml",
+    eras: &[
+        // rules_rust 0.56.0, with Rust 1.83.0.
+        ((7, 0, 0)..NEWER_RULESET, "e7"),
+        // rules_rust 0.75.0, with Rust 1.99.1.
+        (NEWER_RULESET..(10, 0, 0), "e9"),
+    ],
+};
+
+/// The crate the fixture depends on, at the version its lock pins. crates.io
+/// takes no name of more than 64 characters (the Cargo Book says so where it
+/// describes the `name` field), so nobody can publish this one there: a
+/// cargo or a Bazel that gets past the stand-in finds no stranger's crate,
+/// and the build fails.
+const NAME: &str = "socket-patch-bazel-fixture-with-a-name-that-is-too-long-for-crates-io";
+const VERSION: &str = "1.0.0";
+const PURL: &str =
+    "pkg:cargo/socket-patch-bazel-fixture-with-a-name-that-is-too-long-for-crates-io@1.0.0";
+/// Its `Cargo.toml`. The other file of a crate file is `src/lib.rs`.
+const CRATE_MANIFEST: &str = "[package]\n\
+    name = \"socket-patch-bazel-fixture-with-a-name-that-is-too-long-for-crates-io\"\n\
+    version = \"1.0.0\"\n\
+    edition = \"2021\"\n";
+/// The files of the checkout that cargo and the hub read, and Bazel's lock.
+const CONFIG: &str = ".cargo/config.toml";
+const LOCK: &str = "Cargo.lock";
+const MANIFEST: &str = "Cargo.toml";
+const BAZEL_LOCK: &str = "MODULE.bazel.lock";
+/// How a `Cargo.lock` names crates.io, with or without a mirror.
+const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+/// What the fixture's lock holds as the checksum of the crate: the sum of
+/// no file.
+const PLACEHOLDER: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+/// The route prefixes under which the stand-in plays the two hosts of
+/// crates.io, and the routes of the crate there: its file of the sparse
+/// index, and its crate file.
+const INDEX: &str = "index.crates.io";
+const FILES: &str = "static.crates.io";
+const UPSTREAM_ENTRY: &str =
+    "/index.crates.io/so/ck/socket-patch-bazel-fixture-with-a-name-that-is-too-long-for-crates-io";
+const UPSTREAM_CRATE: &str = "/static.crates.io/crates/socket-patch-bazel-fixture-with-a-name-that-is-too-long-for-crates-io/1.0.0/download";
+/// The access-token level of a hosted URL, which `socket-patch` writes as
+/// the API hands it out.
+const TOKEN: &str = "33333333-3333-4333-8333-333333333333";
+/// The cargo home of every `socket-patch` child: no directory, so a scan
+/// finds the crate in the lock alone, as in a checkout only Bazel built.
+const NO_CARGO_HOME: &str = "/nonexistent/cargo-home";
+
+/// The sha256 of `bytes` in lowercase hex, as a `Cargo.lock` and a registry
+/// index spell a checksum.
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// The crate with `lib_rs` as its library, as a registry serves it. Every
+/// sum a test holds a build to is computed from the bytes it serves, so
+/// nothing depends on the exact bytes the archive crates emit.
+fn crate_file(lib_rs: &str) -> Vec<u8> {
+    let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut archive = tar::Builder::new(gzip);
+    for (name, text) in [("Cargo.toml", CRATE_MANIFEST), ("src/lib.rs", lib_rs)] {
+        let mut header = tar::Header::new_ustar();
+        header.set_size(text.len() as u64);
+        header.set_mode(0o644);
+        let path = format!("{NAME}-{VERSION}/{name}");
+        archive
+            .append_data(&mut header, path, text.as_bytes())
+            .expect("tar");
+    }
+    let gzip = archive.into_inner().expect("tar");
+    gzip.finish().expect("gzip")
+}
+
+/// One build of the crate: a library whose one constant is `<word> <id>`,
+/// the crate file of it, and the line the consumer prints once Bazel built
+/// that crate in. The id is new for every run, so no cache holds the file.
+struct Package {
+    lib_rs: String,
+    crate_file: Vec<u8>,
+    marker: String,
+}
+
+impl Package {
+    fn new(word: &str, id: &str) -> Package {
+        let lib_rs = format!("pub const STATUS: &str = \"{word} {id}\";\n");
+        Package {
+            crate_file: crate_file(&lib_rs),
+            marker: format!("OUT: {word} {id}"),
+            lib_rs,
+        }
+    }
+
+    /// The crate as the registry of one run has it.
+    fn upstream() -> Package {
+        Package::new("PRISTINE", &uuid::Uuid::new_v4().to_string())
+    }
+
+    /// The checksum of the crate file.
+    fn checksum(&self) -> String {
+        sha256_hex(&self.crate_file)
+    }
+
+    /// The crate's file of a sparse index that lists this crate file: one
+    /// line per version.
+    fn index_line(&self) -> String {
+        let version = json!({
+            "name": NAME, "vers": VERSION, "deps": [], "features": {}, "yanked": false,
+            "cksum": self.checksum(),
+        });
+        format!("{version}\n")
+    }
+}
+
+/// One patch of the crate, under an id that is new for every run.
+struct Patched {
+    uuid: String,
+    package: Package,
+    /// The route of the patch registry's sparse index, the one of the
+    /// crate's file there, and the one of the crate file on the patch host.
+    index: String,
+    entry: String,
+    route: String,
+}
+
+impl Patched {
+    fn new() -> Patched {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let index = format!("/patch-registry/cargo/{TOKEN}/{uuid}/index");
+        Patched {
+            package: Package::new("PATCHED", &uuid),
+            entry: format!("{index}/{}", index_path()),
+            route: format!("/patch/cargo/{NAME}/{VERSION}/{TOKEN}/{uuid}/{NAME}-{VERSION}.crate"),
+            index,
+            uuid,
+        }
+    }
+
+    /// The name hosted mode gives the patch registry in the cargo config.
+    fn registry(&self) -> String {
+        format!("socket-patch-{}", self.uuid)
+    }
+
+    /// Where vendored mode commits the unpacked crate.
+    fn vendored(&self) -> String {
+        format!(".socket/vendor/cargo/{}/{NAME}-{VERSION}", self.uuid)
+    }
+}
+
+/// The path of the crate's file in a sparse index: cargo's layout for a
+/// name of four characters or more.
+fn index_path() -> String {
+    format!("{}/{}/{NAME}", &NAME[..2], &NAME[2..4])
+}
+
+/// The entry of a lock that resolves the crate from `source` and pins its
+/// crate file to `checksum`.
+fn lock_entry(source: &str, checksum: &str) -> String {
+    format!(
+        "[[package]]\nname = \"{NAME}\"\nversion = \"{VERSION}\"\n\
+         source = \"{source}\"\nchecksum = \"{checksum}\"\n"
+    )
+}
+
+/// The fixture's lock with the checksum of `upstream` in place of the
+/// placeholder: the lock a test writes into its workspace copy before the
+/// first build.
+fn lock_pinning(upstream: &Package) -> String {
+    let path = fixture_path(FIXTURE.dir).join("common").join(LOCK);
+    let lock = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let unpinned = lock_entry(CRATES_IO, PLACEHOLDER);
+    let entries = lock.matches(&unpinned).count();
+    assert_eq!(entries, 1, "{}: not one\n{unpinned}", path.display());
+    lock.replace(&unpinned, &lock_entry(CRATES_IO, &upstream.checksum()))
+}
+
+/// The `.cargo/config.toml` of a checkout whose crates come from a mirror
+/// of crates.io, the stand-in at `origin`. The fixture commits none: the
+/// port is the run's. The hub names the file, so cargo-bazel's cargo reads
+/// it, and cargo-bazel takes the download URL of a crate from the index the
+/// replacement names.
+fn mirror_config(origin: &str) -> String {
+    format!(
+        "# This project takes its crates from a mirror of crates.io.\n\
+         [source.crates-io]\n\
+         replace-with = \"mirror\"\n\
+         \n\
+         [source.mirror]\n\
+         registry = \"sparse+{origin}/{INDEX}/\"\n"
+    )
+}
+
+/// A stand-in that holds `upstream` as crates.io does: the `config.json` of
+/// the sparse index, which names the download host the way the real one
+/// does (a base URL, to which cargo adds `/<name>/<version>/download`), the
+/// crate's file of the index, and the crate file.
+fn registry(upstream: &Package) -> StandIn {
+    let standin = StandIn::start();
+    let origin = standin.origin();
+    let config = json!({ "dl": format!("{origin}/{FILES}/crates"), "api": origin });
+    let config = serde_json::to_vec(&config).expect("a JSON document");
+    standin.serve(5, &format!("/{INDEX}/config.json"), &config);
+    standin.serve(5, UPSTREAM_ENTRY, upstream.index_line().as_bytes());
+    standin.serve(5, UPSTREAM_CRATE, &upstream.crate_file);
+    standin
+}
+
+/// The Socket API on `standin` for `patch` of `upstream`, free for every
+/// caller, and the patch host: the sparse index of the patch registry, in
+/// the shape of production, and `served` at the URL of the crate file. The
+/// API and the index name the checksum of the patch's own crate file,
+/// whatever is served.
+fn grant(standin: &StandIn, upstream: &Package, patch: &Patched, served: &[u8]) {
+    let origin = standin.origin();
+    let url = format!("{origin}{}", patch.route);
+    let checksum = patch.package.checksum();
+    let sha512 = Sha512::digest(&patch.package.crate_file);
+    let sha512 = base64::engine::general_purpose::STANDARD.encode(sha512);
+    let reference = json!({
+        "status": "granted",
+        "url": url,
+        "purl": PURL,
+        "artifacts": [{
+            "kind": "tarball",
+            "url": url,
+            // Vendored mode holds the file it downloads to the sha512.
+            "integrity": { "sha256": checksum, "sha512": format!("sha512-{sha512}") },
+        }],
+        "registryOverride": {
+            "kind": "cargo-sparse",
+            "indexUrl": format!("sparse+{origin}{}/", patch.index),
+            "identifiers": { "name": NAME, "version": VERSION, "cargoCksumSha256": checksum },
+        },
+    });
+    let granted = Patch {
+        purl: PURL.to_string(),
+        uuid: patch.uuid.clone(),
+        reference,
+    };
+    standin.api(&[granted]);
+    // Priority 1: ahead of the shared API mock's patch record, whose hashes
+    // are fixed, because vendored mode holds the unpacked library to
+    // `afterHash`.
+    let record = json!({
+        "uuid": patch.uuid,
+        "purl": PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": { "src/lib.rs": {
+            "beforeHash": compute_git_sha256_from_bytes(upstream.lib_rs.as_bytes()),
+            "afterHash": compute_git_sha256_from_bytes(patch.package.lib_rs.as_bytes()),
+        }},
+        "vulnerabilities": { "GHSA-test-aaaa-bbbb": {
+            "cves": ["CVE-2024-0001"], "summary": "s", "severity": "high", "description": "d",
+        }},
+        "description": "fixture",
+        "license": "MIT",
+        "tier": "free",
+    });
+    let record = serde_json::to_vec(&record).expect("a JSON document");
+    let record_route = format!("/v0/orgs/{ORG}/patches/view/{}", patch.uuid);
+    standin.serve(1, &record_route, &record);
+    let dl = format!(
+        "{origin}/patch/cargo/{{crate}}/{{version}}/{TOKEN}/{}/{{crate}}-{{version}}.crate",
+        patch.uuid
+    );
+    let config = serde_json::to_vec(&json!({ "dl": dl, "api": origin })).expect("a JSON document");
+    standin.serve(5, &format!("{}/config.json", patch.index), &config);
+    standin.serve(5, &patch.entry, patch.package.index_line().as_bytes());
+    standin.serve(5, &patch.route, served);
+}
+
+/// What the hub and the cargo that cargo-bazel starts read, for
+/// [`Cell::repo_env`]. The harness removes every `CARGO_*` name and `REPIN`
+/// of the caller from a Bazel child, so no cargo setting of a shell and no
+/// repin switch reaches the hub, and these two are set after that.
+/// `CARGO_HOME` is `home`, a directory of the test: under Bzlmod rules_rust
+/// 0.56.0 runs its cargo with the cargo home of the environment, and a
+/// flow says which one that is. rules_rust 0.75.0 gives its cargo a home
+/// inside the output base, which `CARGO_BAZEL_ISOLATED` states.
+fn cargo_env(home: &Path) -> Vec<(String, String)> {
+    let home = home.to_string_lossy();
+    let pins = [("CARGO_HOME", &*home), ("CARGO_BAZEL_ISOLATED", "true")];
+    let owned = pins.map(|(name, value)| (name.to_string(), value.to_string()));
+    owned.to_vec()
+}
+
+/// An empty cargo home, for the Bazel children of one machine.
+fn cargo_home() -> tempfile::TempDir {
+    tempfile::tempdir().expect("create a cargo home")
+}
+
+/// The checkout of the fixture for `test`, the upstream crate of this run,
+/// which the lock of the checkout pins, and the stand-in that holds it,
+/// which the config of the checkout names. The cargo home comes first: it
+/// goes last. `None` after a `SKIP` line when no Bazel runs here.
+fn open(test: &str) -> Option<(tempfile::TempDir, Cell, StandIn, Package)> {
+    let mut cell = Cell::open(test, &FIXTURE)?;
+    let home = cargo_home();
+    cell.repo_env = cargo_env(home.path());
+    let upstream = Package::upstream();
+    let standin = registry(&upstream);
+    cell.write(LOCK, lock_pinning(&upstream));
+    cell.write(CONFIG, mirror_config(&standin.origin()));
+    Some((home, cell, standin, upstream))
+}
+
+/// `socket-patch <args>` in `cell`, with `standin` as the Socket API, as
+/// the patch server (a hosted pin is recognised by that origin) and as the
+/// index `rollback` reads the upstream checksum from.
+fn socket_patch(cell: &Cell, standin: &StandIn, args: &[&str]) -> Ran {
+    let origin = standin.origin();
+    let index = format!("{origin}/{INDEX}");
+    let env = [
+        ("SOCKET_PATCH_SERVER_URL", origin.as_str()),
+        ("SOCKET_CRATES_INDEX", index.as_str()),
+        ("CARGO_HOME", NO_CARGO_HOME),
+    ];
+    cell.socket_patch(&origin, args, &env)
+}
+
+/// A text file of a tree.
+fn text(tree: &Tree, rel: &str) -> String {
+    String::from_utf8(tree[rel].clone()).expect("a text file")
+}
+
+/// Whether the ruleset of `cell` has Bazel watch the files the hub reads,
+/// writes into a crate the workspace takes from a path, and gives the hub's
+/// cargo an empty home at every evaluation: rules_rust 0.75.0 does all
+/// three, 0.56.0 none. Read from the release, as the era is.
+fn watches(cell: &Cell) -> bool {
+    cell.numbers() >= NEWER_RULESET
+}
+
+/// What the first build of `cell` that takes the crate from one registry of
+/// `standin` leaves there: the stand-in was asked for `entry`, the crate's
+/// file of that index, and at least twice for `file`, the crate file, which
+/// no cache holds. That is all this holds. The stand-in records the path of
+/// a request and not who sent it, so which of the two came from the hub's
+/// cargo and which from Bazel's downloader is not told apart.
+fn asked_for(cell: &Cell, standin: &StandIn, entry: &str, file: &str) {
+    let (asked, fetches) = (standin.asked(entry), standin.asked(file));
+    assert!(
+        asked > 0 && fetches >= 2,
+        "{}: requests to the stand-in: {asked} for {entry} and {fetches} for {file}. A first \
+         build asks for the index file, and at least twice for the crate file",
+        cell.test
+    );
+}
+
+/// Step (a): the build of `cell` prints the marker of `upstream`, and
+/// `standin` was asked for the crate's file of the index and, at least
+/// twice, for the crate file, which no cache holds ([`asked_for`]). Bazel's
+/// lock has an entry for the hub exactly where the ruleset watches its
+/// inputs: what the later steps expect of a release follows from it. Gives
+/// the files of the checkout.
+fn builds_upstream(cell: &Cell, standin: &StandIn, upstream: &Package) -> Tree {
+    let before = cell.builds_unpatched(&upstream.marker);
+    asked_for(cell, standin, UPSTREAM_ENTRY, UPSTREAM_CRATE);
+    let locked = text(&before, BAZEL_LOCK).contains("crate_universe:extensions.bzl%crate");
+    assert_eq!(
+        locked,
+        watches(cell),
+        "{}: {BAZEL_LOCK} of Bazel {} must hold an entry for the hub with rules_rust 0.75.0 and \
+         none with 0.56.0",
+        cell.test,
+        cell.release()
+    );
+    before
+}
+
+/// The build of a CI that holds Bazel's lock frozen, right after the
+/// `socket-patch` command `after` on a ruleset that [`watches`]: Bazel must
+/// refuse it over the lock.
+fn refuses_stale_lock(cell: &Cell, after: &str) {
+    let build = cell.bazel("build", &["--lockfile_mode=error", CONSUMER]);
+    assert!(
+        !build.ok()
+            && build
+                .stderr()
+                .contains("MODULE.bazel.lock is no longer up-to-date"),
+        "{}: right after `{after}`, a `--lockfile_mode=error` build on Bazel {} must fail on \
+         the stale {BAZEL_LOCK}: with rules_rust 0.75.0 a user has to run a build that may \
+         update it, or `bazel mod deps --lockfile_mode=update`, and commit the lock before a \
+         CI with a frozen lock passes.\n{}",
+        cell.test,
+        cell.release(),
+        build.dump()
+    );
+}
+
+/// What a build after an edit of `Cargo.lock` rewrites in the checkout of
+/// `cell`: Bazel's own lock where the ruleset [`watches`], and nothing else.
+fn bazel_rewrites(cell: &Cell) -> &'static [&'static str] {
+    if watches(cell) {
+        &[BAZEL_LOCK]
+    } else {
+        &[]
+    }
+}
+
+/// Step (d), for the finished undo: it counts one package under `counted`
+/// of its summary, and every file of the checkout is the one of `before`
+/// but Bazel's lock, which is the one of the patched build where the
+/// ruleset [`watches`] and stale again. The next build prints `marker` and
+/// puts that lock back: from then on every file is the one of `before`.
+/// Written out, and not `Cell::undone`, which expects every file back
+/// before that build.
+fn undone(cell: &Cell, undo: &Ran, counted: &str, before: &Tree, marker: &str) {
+    let (test, said) = (&cell.test, &undo.dump);
+    assert_eq!(undo.code, 0, "{test}: {said}");
+    assert_eq!(undo.envelope["summary"][counted], 1, "{test}: {said}");
+    let left = changed(before, &cell.tree());
+    assert_eq!(left, bazel_rewrites(cell), "{test}: {said}");
+    if watches(cell) {
+        refuses_stale_lock(cell, "the undo");
+    }
+    cell.builds(marker);
+    assert_eq!(changed(before, &cell.tree()), NOTHING, "{test}");
+}
+
+/// Step (e), up to its build: a second machine with the checkout of `cell`,
+/// a cargo home and a stand-in of its own, which its config names and its
+/// commands talk to; the patch `second`, whose URL on that patch host
+/// answers with `served`; and `scan --mode <mode> --yes` there, which
+/// applies it.
+///
+/// The first machine ends here, before the second one builds: its Bazel
+/// server is stopped and its scratch root removed, as at the end of a test.
+/// Every workspace copy unpacks the Rust toolchain for itself (1.7 to
+/// 1.8 GB), so a test holds one of them at a time and a leg of two tests
+/// two, not four. The exception is a run that names no repository cache
+/// ([`REPO_CACHE`]): the cache both machines read is then inside the first
+/// one's scratch root, so the first machine is handed back, first in the
+/// result, and stays until the test ends.
+fn second_machine(
+    cell: Cell,
+    upstream: &Package,
+    mode: &str,
+    second: &Patched,
+    served: &[u8],
+) -> (Option<Cell>, tempfile::TempDir, Cell, StandIn) {
+    let mut twin = cell.twin();
+    let shared = std::env::var_os(REPO_CACHE).is_some_and(|dir| !dir.is_empty());
+    let first = if shared {
+        drop(cell);
+        None
+    } else {
+        Some(cell)
+    };
+    let home = cargo_home();
+    twin.repo_env = cargo_env(home.path());
+    let other = registry(upstream);
+    twin.write(CONFIG, mirror_config(&other.origin()));
+    grant(&other, upstream, second, served);
+    let scan = socket_patch(&twin, &other, &["scan", "--mode", mode, "--yes"]);
+    let (test, said) = (&twin.test, &scan.dump);
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
+    (first, home, twin, other)
+}
+
+/// The build of `twin` fails, and what cargo says about the crate holds
+/// `refusal`.
+fn refuses(twin: &Cell, refusal: &str) {
+    let build = twin.bazel("build", &[CONSUMER]);
+    let stderr = build.stderr();
+    let about = format!("`{NAME} v{VERSION} (registry `");
+    let said = stderr
+        .lines()
+        .any(|line| line.contains(&about) && line.contains(refusal));
+    assert!(
+        !build.ok() && said,
+        "{}: the build did not fail with {refusal:?} for {about}:\n{}",
+        twin.test,
+        build.dump()
+    );
+}
+
+/// `vex` in the checkout of `cell`, which Bazel has built in and which
+/// holds the files of `built`. Its document goes beside the checkout, and
+/// no file of the checkout changes. With `attested` it exits 0 and the
+/// document names the crate as patched by `patch`. Without, which is a
+/// known gap (module docs), it exits 1 and writes no document: the patch is
+/// left out over the inventory of the vendored copy
+/// (`vendor_inventory_mismatch`), and nothing else is there to attest.
+fn vex(cell: &Cell, standin: &StandIn, patch: &Patched, built: &Tree, attested: bool) {
+    let test = &cell.test;
+    let info = cell.bazel("info", &["workspace"]);
+    assert!(info.ok(), "{test}: {}", info.dump());
+    let checkout = PathBuf::from(info.stdout().trim());
+    let document = checkout.parent().expect("a scratch root").join("vex.json");
+    assert!(!document.exists(), "{test}: {}", document.display());
+    let output = document.to_string_lossy();
+    let vex = socket_patch(cell, standin, &["vex", "--output", &output]);
+    let said = &vex.dump;
+    let written = std::fs::read_to_string(&document).unwrap_or_default();
+    if attested {
+        assert_eq!(vex.code, 0, "{test}: {said}");
+        let action = &event_for(&vex.envelope, PURL)["action"];
+        assert_eq!(*action, "verified", "{test}: {said}");
+        let by = format!("Patched via Socket patch {}", patch.uuid);
+        let names = written.contains(&format!("\"{PURL}\"")) && written.contains(&by);
+        assert!(names, "{test}: {said}\n{written}");
+    } else {
+        // KNOWN GAP: what the release does, not what a user needs. Once
+        // `vex` attests a vendored crate whose copy holds the `BUILD.bazel`
+        // a build wrote, no flow passes `attested = false`, and this branch
+        // goes with the parameter.
+        assert_eq!(vex.code, 1, "{test}: {said}");
+        let left_out = has_event(&vex.envelope, "skipped", "vendor_inventory_mismatch", PURL);
+        assert!(left_out, "{test}: {said}");
+        let error = &vex.envelope["error"]["code"];
+        assert_eq!(*error, "no_applicable_patches", "{test}: {said}");
+        assert!(!document.exists(), "{test}: {said}\n{written}");
+    }
+    assert_eq!(changed(built, &cell.tree()), NOTHING, "{test}");
+}
+
+/// The hosted flow of the module docs.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn hosted_from_cargo_with_config() {
+    let test = "cargo::hosted_from_cargo_with_config";
+    let started = Instant::now();
+    let Some((_home, cell, standin, upstream)) = open(test) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let origin = standin.origin();
+    let patch = Patched::new();
+    grant(&standin, &upstream, &patch, &patch.package.crate_file);
+
+    // (a) The unpatched build, with the upstream crate from the stand-in.
+    let before = builds_upstream(&cell, &standin, &upstream);
+    let upstream_fetches = standin.asked(UPSTREAM_CRATE);
+
+    // (b) The one command of hosted mode. It rewrites those three files and
+    // no other: the config keeps what the project had and gains the patch
+    // registry, the dependency names that registry, and the entry of the
+    // lock resolves from it, with the checksum of the patched crate file.
+    let scan = socket_patch(&cell, &standin, &["scan", "--mode", "hosted", "--yes"]);
+    let said = &scan.dump;
+    let written = [CONFIG, LOCK, MANIFEST];
+    let pinned = cell.pinned_by(&scan, PURL, &patch.uuid, &before, &written);
+    let (index, registry) = (format!("sparse+{origin}{}/", patch.index), patch.registry());
+    let config = text(&pinned, CONFIG);
+    let added = format!("[registries.{registry}]\nindex = \"{index}\"\n");
+    assert!(
+        config.starts_with(&mirror_config(&origin)) && config.ends_with(&added),
+        "{test}: {CONFIG}:\n{config}"
+    );
+    let manifest = text(&pinned, MANIFEST);
+    let dependency = format!("{NAME} = {{ version = \"{VERSION}\", registry = \"{registry}\" }}\n");
+    assert!(
+        manifest.contains(&dependency),
+        "{test}: {MANIFEST}:\n{manifest}"
+    );
+    let lock = text(&pinned, LOCK);
+    let entry = lock_entry(&index, &patch.package.checksum());
+    assert!(lock.contains(&entry), "{test}: {LOCK}:\n{lock}");
+    assert_eq!(standin.asked(&patch.route), 0, "{test}: {said}");
+    if watches(&cell) {
+        refuses_stale_lock(&cell, "scan --mode hosted");
+    }
+
+    // (c) The same build, no step in between and no repin: patched, from
+    // the patch host, which was asked for its index file of the crate and,
+    // at least twice, for the crate file.
+    cell.builds(&patch.package.marker);
+    asked_for(&cell, &standin, &patch.entry, &patch.route);
+    assert_eq!(
+        standin.asked(UPSTREAM_CRATE),
+        upstream_fetches,
+        "{test}: the patched build asked for the upstream crate file"
+    );
+    // Bazel changed no file of the checkout but its own lock, and from here
+    // on the checkout stands: the next build changes no file, and that lock
+    // holds when Bazel may not update it.
+    let built = cell.tree();
+    let by_bazel = bazel_rewrites(&cell);
+    assert_eq!(changed(&pinned, &built), by_bazel, "{test}");
+    // Where that lock has an entry for the hub, it now names the crate file
+    // on the patch host, token level included, as `Cargo.lock` names the
+    // index there.
+    let names_patch_host = text(&built, BAZEL_LOCK).contains(&format!("{origin}{}", patch.route));
+    assert_eq!(names_patch_host, watches(&cell), "{test}: {BAZEL_LOCK}");
+    cell.builds_patched(&built, &patch.package.marker);
+    // `vex` attests the crate. The same command a second time, as every run
+    // of a pipeline has it, applies the patch again and changes no file.
+    vex(&cell, &standin, &patch, &built, true);
+    let again = socket_patch(&cell, &standin, &["scan", "--mode", "hosted", "--yes"]);
+    let said = &again.dump;
+    assert_eq!(again.code, 0, "{test}: {said}");
+    assert_eq!(again.envelope["summary"]["applied"], 1, "{test}: {said}");
+    let rewritten = &again.envelope["redirect"]["rewrittenFiles"];
+    assert_eq!(*rewritten, json!([]), "{test}: {said}");
+    assert_eq!(changed(&built, &cell.tree()), NOTHING, "{test}: {said}");
+
+    // (d) The undo. The three files are the ones of before at once; the
+    // config is still there, with what the project had in it.
+    let undo = socket_patch(&cell, &standin, &["rollback", "--yes"]);
+    undone(&cell, &undo, "rolledBack", &before, &upstream.marker);
+    // The build after the undo evaluated the hub again, with the lock of
+    // before. Where the ruleset gives the hub's cargo an empty home every
+    // time, the stand-in was asked for the upstream crate file once more
+    // (Bazel's repository cache holds it, a new cargo home does not).
+    // Elsewhere the cargo home of the test held it, and no request was
+    // sent.
+    let asked_again = standin.asked(UPSTREAM_CRATE) > upstream_fetches;
+    assert_eq!(
+        asked_again,
+        watches(&cell),
+        "{test}: requests to the stand-in for the upstream crate file: {} before the undo and \
+         {} by the end of its build",
+        upstream_fetches,
+        standin.asked(UPSTREAM_CRATE)
+    );
+
+    // (e) A second machine, a second patch, and a patch host that serves
+    // another crate file than the one the lock pins. Its index names the
+    // pinned checksum, as the real one does, so cargo refuses the file it
+    // downloaded.
+    let second = Patched::new();
+    let tampered = Package::new("TAMPERED", &second.uuid);
+    let (_first, _second_home, mut twin, other) =
+        second_machine(cell, &upstream, "hosted", &second, &tampered.crate_file);
+    refuses(&twin, "failed to verify the checksum of");
+    // The patch host was asked for the file, so the build failed on what it
+    // got. The evidence line has the count.
+    let refused_fetches = other.asked(&second.route);
+    assert!(
+        refused_fetches > 0,
+        "{test}: the patch host was not asked, so the failed build proves nothing"
+    );
+    // A patch host that also names the checksum of what it serves gets no
+    // further: the checksum of the lock is not the one of its index. That
+    // build starts from a cargo home that has not seen the index, as the
+    // first build of a machine does. rules_rust 0.56.0 keeps the home it is
+    // given from build to build, and cargo does not ask again for the index
+    // file of a crate the lock pins while its home holds one.
+    other.serve(1, &second.entry, tampered.index_line().as_bytes());
+    let third_home = cargo_home();
+    twin.repo_env = cargo_env(third_home.path());
+    let asked = other.asked(&second.entry);
+    refuses(&twin, "changed between lock files");
+    assert!(
+        other.asked(&second.entry) > asked,
+        "{test}: the index of the patch host was not asked, so the failed build proves nothing"
+    );
+    assert_eq!(
+        other.asked(UPSTREAM_CRATE),
+        0,
+        "{test}: the build went to the upstream crate"
+    );
+
+    println!(
+        "{test}: Bazel {release} built {:?} from {index} after `scan --mode hosted`, with no \
+         repin, and rewrote {:?} itself; `vex` attested the crate and a second scan applied \
+         the patch again without a change; `rollback` restored the three files at once, and the \
+         next build printed {:?} and left all {} files as before; another crate file at the \
+         patch host failed a second machine's build on the checksum, with the index naming the \
+         pinned sum (requests to that patch host for the file: {refused_fetches}) and with it \
+         naming the served one; requests to the stand-in for the upstream crate file: {}, {} of \
+         them before the undo, and for the patched one: {}; {:?}",
+        patch.package.marker,
+        by_bazel,
+        upstream.marker,
+        before.len(),
+        standin.asked(UPSTREAM_CRATE),
+        upstream_fetches,
+        standin.asked(&patch.route),
+        started.elapsed()
+    );
+}
+
+/// The vendored flow of the module docs.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn vendored_from_cargo_with_config() {
+    let test = "cargo::vendored_from_cargo_with_config";
+    let started = Instant::now();
+    let Some((_home, cell, standin, upstream)) = open(test) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let patch = Patched::new();
+    grant(&standin, &upstream, &patch, &patch.package.crate_file);
+
+    // (a) The unpatched build, with the upstream crate from the stand-in.
+    let before = builds_upstream(&cell, &standin, &upstream);
+
+    // (b) The one command of vendored mode.
+    let scan = socket_patch(&cell, &standin, &["scan", "--mode", "vendored", "--yes"]);
+    let said = &scan.dump;
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["downloaded"], 1, "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
+    // The unpacked crate and its ledger under `.socket/vendor`, the two
+    // files that wire it in, and no other.
+    let copy = patch.vendored();
+    let (copied_manifest, library) = (format!("{copy}/Cargo.toml"), format!("{copy}/src/lib.rs"));
+    let written = [
+        copied_manifest.clone(),
+        library.clone(),
+        format!(
+            ".socket/vendor/cargo/{}/socket-patch.vendor.json",
+            patch.uuid
+        ),
+        ".socket/vendor/state.json".to_string(),
+        LOCK.to_string(),
+        MANIFEST.to_string(),
+    ];
+    let vendored = cell.tree();
+    assert_eq!(changed(&before, &vendored), written, "{test}: {said}");
+    // The committed library is the one of the crate file the patch host
+    // served. The copy says it is the patched build of the version, a
+    // `[patch.crates-io]` entry sends the crate there, and the lock's entry
+    // has the copy's version and neither a source nor a checksum.
+    assert_eq!(text(&vendored, &library), patch.package.lib_rs, "{test}");
+    assert!(standin.asked(&patch.route) > 0, "{test}: {said}");
+    let tagged = format!("{VERSION}+socket.{}", patch.uuid);
+    let copied_manifest = text(&vendored, &copied_manifest);
+    assert!(
+        copied_manifest.contains(&format!("version = \"{tagged}\"\n")),
+        "{test}: {copy}/Cargo.toml:\n{copied_manifest}"
+    );
+    let manifest = text(&vendored, MANIFEST);
+    let patched_by = format!(
+        "[patch.crates-io]\n{NAME}-socket-{} = {{ package = \"{NAME}\", path = \"{copy}\" }}\n",
+        &patch.uuid[..8]
+    );
+    assert!(
+        manifest.contains(&patched_by),
+        "{test}: {MANIFEST}:\n{manifest}"
+    );
+    let lock = text(&vendored, LOCK);
+    let entry = format!("[[package]]\nname = \"{NAME}\"\nversion = \"{tagged}\"\n");
+    assert!(
+        lock.ends_with(&entry) && !lock.contains(&upstream.checksum()),
+        "{test}: {LOCK}:\n{lock}"
+    );
+    if watches(&cell) {
+        refuses_stale_lock(&cell, "scan --mode vendored");
+    }
+
+    // (c) The same build, no step in between and no repin: patched, from
+    // the committed copy. Bazel asks the stand-in for nothing.
+    let requests = standin.requests();
+    cell.builds(&patch.package.marker);
+    assert_eq!(standin.requests(), requests, "{test}: Bazel asked a host");
+    // Where the ruleset watches, the build rewrote Bazel's lock, and
+    // cargo-bazel wrote a `BUILD.bazel` into the committed copy. That file
+    // is no part of what the scan recorded: the copy is no longer `intact`,
+    // and `vendor --check` fails right after a build that is the patched
+    // one. Elsewhere the build wrote no file and the check passes.
+    let built = cell.tree();
+    let build_file = format!("{copy}/BUILD.bazel");
+    let by_bazel: &[&str] = if watches(&cell) {
+        &[&build_file, BAZEL_LOCK]
+    } else {
+        &[]
+    };
+    assert_eq!(changed(&vendored, &built), by_bazel, "{test}");
+    let intact = !watches(&cell);
+    let check = socket_patch(&cell, &standin, &["vendor", "--check"]);
+    let said = &check.dump;
+    if intact {
+        assert_eq!(check.code, 0, "{test}: {said}");
+    } else {
+        // KNOWN GAP: what the release does, not what a user needs. Once
+        // `vendor --check` passes on a copy that holds the `BUILD.bazel` a
+        // build wrote, `intact` is true with every ruleset, and this branch
+        // goes.
+        assert_eq!(check.code, 1, "{test}: {said}");
+        let event = event_for(&check.envelope, PURL);
+        assert_eq!(event["errorCode"], "vendor_check_failed", "{test}: {said}");
+        let reason = event["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("vendor_inventory_mismatch"),
+            "{test}: {said}"
+        );
+    }
+    // From here on the checkout stands: the next build changes no file, and
+    // Bazel's lock holds when Bazel may not update it.
+    cell.builds_patched(&built, &patch.package.marker);
+    // `vex` attests the crate of an intact copy, and leaves the patch of
+    // the other out (the KNOWN GAP of `vex`).
+    vex(&cell, &standin, &patch, &built, intact);
+
+    // (d) The undo. The copy goes, with the `BUILD.bazel` a build wrote
+    // into it, and the two files are the ones of before at once.
+    let undo = socket_patch(&cell, &standin, &["vendor", "--revert"]);
+    undone(&cell, &undo, "removed", &before, &upstream.marker);
+
+    // (e) A second machine and a second patch, vendored there. Its first
+    // build is the patched one, from the committed copy.
+    let second = Patched::new();
+    let served = &second.package.crate_file;
+    let (_first, _second_home, twin, other) =
+        second_machine(cell, &upstream, "vendored", &second, served);
+    twin.builds(&second.package.marker);
+    let second_built = twin.tree();
+    // The same command a second time, as every run of a pipeline has it,
+    // ends with the copy `already_vendored`. An intact one it leaves alone.
+    // The other it first downloads again (`rebuilt`), which removes the
+    // `BUILD.bazel`. No file the hub reads has changed, so the next build,
+    // still the patched one, writes nothing: from here on `vendor --check`
+    // passes and `vex` attests the crate with either ruleset.
+    let downloads = other.asked(&second.route);
+    let again = socket_patch(&twin, &other, &["scan", "--mode", "vendored", "--yes"]);
+    let said = &again.dump;
+    assert_eq!(again.code, 0, "{test}: {said}");
+    let in_sync = has_event(&again.envelope, "skipped", "already_vendored", PURL);
+    assert!(in_sync, "{test}: {said}");
+    let rebuilt = again.envelope["summary"]["rebuilt"] == 1;
+    let downloaded = other.asked(&second.route) > downloads;
+    assert_eq!((rebuilt, downloaded), (!intact, !intact), "{test}: {said}");
+    let second_copy = second.vendored();
+    let second_build_file = format!("{second_copy}/BUILD.bazel");
+    let removed: &[&str] = if intact { &[] } else { &[&second_build_file] };
+    let repaired = twin.tree();
+    assert_eq!(changed(&second_built, &repaired), removed, "{test}: {said}");
+    twin.builds_patched(&repaired, &second.package.marker);
+    let check = socket_patch(&twin, &other, &["vendor", "--check"]);
+    assert_eq!(check.code, 0, "{test}: {}", check.dump);
+    vex(&twin, &other, &second, &repaired, true);
+    // Then another library in the committed copy. Nothing in a build holds
+    // the copy to a checksum: Bazel builds what is there. `vendor --check`
+    // is what finds it.
+    let tampered = Package::new("TAMPERED", &second.uuid);
+    twin.write(&format!("{second_copy}/src/lib.rs"), &tampered.lib_rs);
+    twin.builds(&tampered.marker);
+    let check = socket_patch(&twin, &other, &["vendor", "--check"]);
+    let said = &check.dump;
+    assert_eq!(check.code, 1, "{test}: {said}");
+    let reason = event_for(&check.envelope, PURL)["reason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(reason.contains("vendor_hash_mismatch"), "{test}: {said}");
+
+    println!(
+        "{test}: Bazel {release} built {:?} from {copy} after `scan --mode vendored`, with no \
+         repin and no request to the stand-in, and wrote {by_bazel:?} itself; right after \
+         that build {}; `vendor --revert` restored the checkout, and the next build printed \
+         {:?} and left all {} files as before; on a second machine, after its first patched \
+         build, a second scan {}, the next build wrote nothing, `vendor --check` passed and \
+         `vex` attested the crate; a library then changed in the committed copy was built \
+         ({:?}), and `vendor --check` reported vendor_hash_mismatch; {:?}",
+        patch.package.marker,
+        if intact {
+            "`vendor --check` passed and `vex` attested the crate"
+        } else {
+            "(KNOWN GAPS) `vendor --check` failed on the BUILD.bazel \
+             (vendor_inventory_mismatch), and `vex` left the patch out under the same code and \
+             wrote no document"
+        },
+        upstream.marker,
+        before.len(),
+        if intact {
+            "reported the copy already_vendored and changed nothing"
+        } else {
+            "downloaded the crate again (rebuilt) and removed the BUILD.bazel"
+        },
+        tampered.marker,
+        started.elapsed()
+    );
+}
+
+/// Without a Bazel, what stays fixed now that no checksum is committed: the
+/// fixture's directories and the legs of its workflow are those of its
+/// table; the fixture's lock holds the one entry a test pins, with the
+/// placeholder, and pinning changes nothing else; two runs serve two
+/// upstream crate files; the fixture depends on the crate under the names
+/// written out above, and commits no cargo config; every era's hub names
+/// the config a test writes and has no cargo-bazel lock; and crates.io
+/// cannot hold the name.
+#[test]
+fn a_test_pins_the_one_crate_of_the_fixture_lock() {
+    FIXTURE.check();
+    let root = fixture_path(FIXTURE.dir);
+    let read = |rel: &str| std::fs::read_to_string(root.join(rel)).expect(rel);
+
+    let upstream = Package::upstream();
+    let pinned = lock_pinning(&upstream);
+    let entry = lock_entry(CRATES_IO, &upstream.checksum());
+    assert!(pinned.contains(&entry), "no\n{entry}in\n{pinned}");
+    let unpinned = pinned.replace(&entry, &lock_entry(CRATES_IO, PLACEHOLDER));
+    assert_eq!(unpinned, read("common/Cargo.lock"));
+    assert_ne!(Package::upstream().crate_file, upstream.crate_file);
+
+    let dependency = format!("\n[dependencies]\n{NAME} = \"{VERSION}\"\n");
+    assert!(read("common/Cargo.toml").ends_with(&dependency));
+    assert!(read("common/BUILD.bazel").contains(&format!("deps = [\"@crates//:{NAME}\"],")));
+    let imported = format!("{}::STATUS", NAME.replace('-', "_"));
+    assert!(read("common/src/main.rs").contains(&imported));
+    assert!(!root.join("common").join(CONFIG).exists());
+    for (_, era) in FIXTURE.eras {
+        let module = read(&format!("{era}/MODULE.bazel"));
+        let hub = format!(
+            "crate.from_cargo(\n    name = \"crates\",\n    cargo_config = \"//:{CONFIG}\",\n    \
+             cargo_lockfile = \"//:{LOCK}\",\n    manifests = [\"//:{MANIFEST}\"],\n)\n"
+        );
+        assert!(module.contains(&hub), "{era}: no\n{hub}in\n{module}");
+    }
+
+    assert!(NAME.len() > 64, "crates.io can hold {NAME}");
+    assert!(CRATE_MANIFEST.contains(&format!("name = \"{NAME}\"\nversion = \"{VERSION}\"\n")));
+    assert_eq!(PURL, format!("pkg:cargo/{NAME}@{VERSION}"));
+    assert_eq!(UPSTREAM_ENTRY, format!("/{INDEX}/{}", index_path()));
+    assert_eq!(
+        UPSTREAM_CRATE,
+        format!("/{FILES}/crates/{NAME}/{VERSION}/download")
+    );
+}

@@ -45,6 +45,11 @@ const REMOVED: &[&str] = &[
     // Bazel: `TEST_TMPDIR` puts a server in test mode, where a failing
     // module extension on 7.x is a crash (exit 37) instead of an error.
     "TEST_TMPDIR",
+    // Bazel's `http_archive` and downloader, and rules_csharp for every
+    // package: the credentials file of the shell. A path that names no
+    // file fails the first fetch, and a file's login for loopback, or its
+    // `default` one, goes to a stand-in with every download sent there.
+    "NETRC",
     // Any tool: an `XDG_*_HOME` directory would move what it keeps out of
     // the scratch home: a cache, or on Linux the telemetry counters of a Go
     // SDK command that a ruleset starts, which Go puts under
@@ -77,6 +82,9 @@ const REMOVED: &[&str] = &[
     // mirrors decide nothing. It is that process's alone: a Maven a
     // ruleset started would take those settings over its own.
     "MAVEN_ARGS",
+    // rules_rust: its switch for a repin of a crate hub, which it reads
+    // under this name and under `CARGO_BAZEL_REPIN` (a prefix below).
+    "REPIN",
 ];
 
 /// Removed from every Bazel child under every name that starts so.
@@ -89,6 +97,13 @@ const REMOVED_PREFIXES: &[&str] = &[
     "PIP_",
     // uv: the same.
     "UV_",
+    // The cargo a ruleset starts (rules_rust's, for a crate hub): its home
+    // and every setting of its config (`CARGO_NET_OFFLINE`,
+    // `CARGO_SOURCE_*`, `CARGO_REGISTRIES_*`, `CARGO_HTTP_*`), and what
+    // `cargo test` sets for this process. And rules_rust itself: its
+    // `CARGO_BAZEL_*` switches, the repin among them. A flow sets what it
+    // needs of these through [`Cell::repo_env`], after this scrub.
+    "CARGO_",
 ];
 
 /// The scrubs of `hermetic` that every Bazel child gets, for the tools a
@@ -1046,6 +1061,7 @@ fn settings_of_a_shell() -> Vec<String> {
     let names = [
         // `REMOVED`.
         "TEST_TMPDIR",
+        "NETRC",
         "XDG_CACHE_HOME",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
@@ -1062,10 +1078,12 @@ fn settings_of_a_shell() -> Vec<String> {
         // (Also what `hermetic::command` itself sets for the socket-patch
         // binary: neither the shell's value nor that one reaches a child.)
         "MAVEN_ARGS",
+        "REPIN",
         // One name under each of `REMOVED_PREFIXES`.
         "BAZELISK_SETTING",
         "PIP_SETTING",
         "UV_SETTING",
+        "CARGO_SETTING",
         // `Extra::Go`.
         "GOFLAGS",
         "GOWORK",
