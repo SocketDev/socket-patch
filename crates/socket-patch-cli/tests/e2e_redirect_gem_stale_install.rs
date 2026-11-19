@@ -2642,13 +2642,16 @@ async fn hosted_unwind_names_no_rerun_for_a_shared_gem_home() {
             let env = common::parse_json_envelope(&stdout);
             let details = details_with_code(&env, "upstream_gem_stale_install");
             assert_eq!(details.len(), 1, "{case}: {env}");
-            let reinstall = details_with_code(&env, "reinstall_required");
-            assert!(
-                reinstall
-                    .iter()
-                    .all(|d| d.contains("`bundle install` keeps")),
-                "{case}: {reinstall:?}"
-            );
+            // rollback's run-level advisory defers to the gem warning.
+            if unwind[0] == "rollback" {
+                let reinstall = details_with_code(&env, "reinstall_required");
+                assert_eq!(reinstall.len(), 1, "{case}: {env}");
+                assert!(
+                    reinstall[0].contains("`bundle install` keeps an installed gem"),
+                    "{case}: {}",
+                    reinstall[0]
+                );
+            }
             assert!(
                 details[0].contains(&format!(
                     "remove {}, {} and run `bundle install`",
@@ -2691,8 +2694,17 @@ async fn hosted_unwind_names_no_rerun_for_a_shared_gem_home() {
         // Why no re-run is named: the wiring is gone.
         let mut again = args.clone();
         again.push("--gem-refresh-shared");
-        let (code, _, _) = common::run_with_env(&proj, &again, &env);
-        assert_ne!(code, 0, "{case}: premise: a second unwind finds nothing");
+        let (code, stdout, stderr) = common::run_with_env(&proj, &again, &env);
+        assert_eq!(code, 1, "{case}: premise:\n{stdout}\n{stderr}");
+        let nothing = match (json, unwind[0]) {
+            (true, _) => "\"status\": \"error\"",
+            (false, "rollback") => "nothing to roll back",
+            (false, _) => "nothing to remove",
+        };
+        assert!(
+            format!("{stdout}{stderr}").contains(nothing),
+            "{case}: premise: a second unwind finds nothing:\n{stdout}\n{stderr}"
+        );
         assert!(snapshot(&home) == held_before, "{case}");
     }
 }

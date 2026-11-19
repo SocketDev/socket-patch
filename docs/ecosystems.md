@@ -2146,7 +2146,9 @@ shared copy still holds the patched build. Running the command again doesn't hel
 patch is already removed and there is nothing left to roll back. The warning names what to run
 instead: the `bundle config` line above, or an `rm -f` of the gem's `specifications/` entry and
 its `cache/` archive followed by `bundle install`, which fetches the upstream gem into the shared
-gem home. Another project that loads that copy needs a `bundle install` afterwards too.
+gem home. Another project that still pins the patched build of that gem version then loads the
+upstream code; a `socket-patch scan` there reports it, and `--gem-refresh-shared` on that scan
+puts the patched build back.
 
 A shared gem home also holds gem versions this project doesn't use: the gems Ruby ships (`rake`,
 `rexml`, ...) and the versions other projects installed. Hosted and vendored mode patch what
