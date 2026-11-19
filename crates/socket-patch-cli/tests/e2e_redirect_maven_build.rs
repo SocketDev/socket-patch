@@ -144,9 +144,10 @@ fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Val
 }
 
 /// [`socket`] with `env` on top. Unless `env` says otherwise, the Maven
-/// settings the CLI reads are two files that do not exist (`MAVEN_ARGS`
-/// is where it looks for the `-s` / `-gs` Maven would be started with):
-/// the mirrors of whoever runs the suite must not decide a scan.
+/// settings the CLI reads are the harness's empty ones
+/// (`hermetic::neutral_maven_args`: `MAVEN_ARGS` is where the CLI looks
+/// for the `-s` / `-gs` Maven would be started with): the mirrors of
+/// whoever runs the suite must not decide a scan.
 fn socket_with(
     cwd: &Path,
     m2: &Path,
@@ -155,16 +156,10 @@ fn socket_with(
 ) -> (Option<i32>, serde_json::Value, String) {
     let mut cmd = hermetic::command(&binary());
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
-    let no_settings = format!(
-        "-s {} -gs {}",
-        m2.join("no-settings.xml").display(),
-        m2.join("no-global-settings.xml").display()
-    );
     let out = cmd
         .args(args)
         .current_dir(cwd)
         .env("MAVEN_REPO_LOCAL", m2)
-        .env("MAVEN_ARGS", no_settings)
         .env_remove("M2_HOME")
         .env_remove("MAVEN_HOME")
         .envs(env.iter().copied())

@@ -72,6 +72,11 @@ const REMOVED: &[&str] = &[
     "PYTHONHOME",
     "PYTHONPATH",
     "PYTHONSTARTUP",
+    // Maven: `hermetic::command` gives the socket-patch binary a
+    // `MAVEN_ARGS` that names an empty settings file, so the machine's
+    // mirrors decide nothing. It is that process's alone: a Maven a
+    // ruleset started would take those settings over its own.
+    "MAVEN_ARGS",
 ];
 
 /// Removed from every Bazel child under every name that starts so.

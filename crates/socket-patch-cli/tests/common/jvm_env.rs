@@ -85,6 +85,10 @@ pub fn stand_in_home() -> PathBuf {
 /// creates), carrying the version-manager roots over. Call it before
 /// applying a test's own env.
 pub fn isolate_cli(cmd: &mut Command) -> &mut Command {
+    let carried_maven_args = cmd
+        .get_envs()
+        .find(|(key, _)| *key == std::ffi::OsStr::new("MAVEN_ARGS"))
+        .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string));
     for key in AMBIENT {
         cmd.env_remove(key);
     }
@@ -104,15 +108,18 @@ pub fn isolate_cli(cmd: &mut Command) -> &mut Command {
         }
     }
     let home = stand_in_home();
-    // `MAVEN_ARGS` is scrubbed above for the local-repository lookup; the
-    // hosted mirror guard reads the settings files it names. With the home
-    // moved no user settings are left, and these two missing files keep
-    // the installation's `conf/settings.xml` out as well.
     cmd.env("HOME", &home)
         .env("USERPROFILE", &home)
-        .env("GRADLE_USER_HOME", home.join(".gradle"))
-        .env(
-            "MAVEN_ARGS",
-            "-s /socket-patch-tests/no-settings.xml -gs /socket-patch-tests/no-global-settings.xml",
-        )
+        .env("GRADLE_USER_HOME", home.join(".gradle"));
+    // The one variable of [`AMBIENT`] a command may already carry on
+    // purpose: `hermetic::command` gives the socket-patch binary a
+    // `MAVEN_ARGS` that names an empty settings file, so the mirrors of the
+    // machine's Maven settings decide nothing. That value is put back. A
+    // command that carries none (every Maven child: this function is also
+    // how a real `mvn` is isolated) gets none, so no real Maven is ever
+    // started with settings a test did not name.
+    if let Some(args) = carried_maven_args {
+        cmd.env("MAVEN_ARGS", args);
+    }
+    cmd
 }
