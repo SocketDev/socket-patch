@@ -9184,6 +9184,11 @@ pub fn maven_reactor_root(files: &BTreeMap<String, String>) -> bool {
 ///   decided and not confirmed ([`RewriteResult::maven_reactor_uuids`]),
 ///   so wiring an earlier run left is not counted as a redirect, or
 ///   attested, by a substring it still matches.
+///
+/// The gate holds deps back and nothing else: the respelling of a
+/// `.mvn/maven.config` an earlier release wrote ([`heal_mvn_config`]) is
+/// decided by that file, and the rewriter proper makes it whichever deps it
+/// is handed, none included.
 fn rewrite_maven_pom(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -9220,11 +9225,15 @@ fn rewrite_maven_pom(
     );
     let mut wired: Vec<DepOverride> = Vec::with_capacity(overrides.len());
     for dep in overrides {
+        // An earlier run's wiring is in the poms already, or this run
+        // would write it.
+        let mut in_place = false;
         let gate = (dep.ecosystem == "maven")
             .then(|| captured(dep))
             .flatten()
             .filter(|(repo_id, _)| {
-                declares(files, repo_id) || {
+                in_place = declares(files, repo_id);
+                in_place || {
                     let mut alone = RewriteResult::default();
                     rewrite_maven_poms(files, std::slice::from_ref(dep), selection, &mut alone);
                     declares(&alone.files, repo_id)
@@ -9249,9 +9258,11 @@ fn rewrite_maven_pom(
             ),
             None => full_name(dep),
         };
+        let earlier =
+            in_place.then(|| format!("pkg:maven/{}@{}", ga.replace(':', "/"), dep.version));
         result.warnings.push(RewriteWarning {
             code: "redirect_maven_mirror_captures_repository".into(),
-            detail: maven_mirror_detail(&ga, &repo_id, mirror, wrapper),
+            detail: maven_mirror_detail(&ga, &repo_id, mirror, wrapper, earlier.as_deref()),
         });
         result.maven_reactor_uuids.insert(dep.patch_uuid.clone());
     }
@@ -9396,22 +9407,31 @@ fn rewrite_maven_poms(
             .as_ref()
             .is_some_and(|(jar, pom)| !is_hex64_lower(jar) || !is_hex64_lower(pom));
         let checksum_hashes = checksum_hashes.filter(|_| !bad_checksum_hashes);
-        if let Some(suffixed) = suffixed_version.as_deref().filter(|_| bad_checksum_hashes) {
-            // No pin is written for the suffixed version, so none may stay
-            // either: an earlier release wrote such a grant's hash mangled
-            // (lowercased base64), and Maven fails the build on a line
-            // whose hash does not match. Dropped whether or not the version
-            // pin lands this run (a re-run with the pin present too).
-            for ext in ["jar", "pom"] {
-                checksum_drops.push(crate::vendor::jvm::layout::artifact_path(
-                    &group_id,
-                    &artifact_id,
-                    suffixed,
-                    None,
-                    ext,
-                ));
-            }
-        }
+        // No checksum pin is written for the suffixed version of a grant
+        // whose hash is malformed, so none may stay either: an earlier
+        // release wrote such a grant's hash mangled (lowercased base64),
+        // and Maven fails the build on a line whose hash does not match.
+        // The lines go with the pin: when it lands this run, and when an
+        // earlier run's is in place (a re-run). They are queued only then.
+        // A dep this run refuses or skips has no file touched for it, this
+        // one included, which is what its warning says.
+        let stale_checksums: Vec<String> = suffixed_version
+            .as_deref()
+            .filter(|_| bad_checksum_hashes)
+            .map(|suffixed| {
+                ["jar", "pom"]
+                    .map(|ext| {
+                        crate::vendor::jvm::layout::artifact_path(
+                            &group_id,
+                            &artifact_id,
+                            suffixed,
+                            None,
+                            ext,
+                        )
+                    })
+                    .to_vec()
+            })
+            .unwrap_or_default();
 
         // The pom for the rest of this iteration; edits land in place.
         let Some(pom_text) = pom.as_mut() else {
@@ -9477,6 +9497,9 @@ fn rewrite_maven_poms(
                     None,
                     "jar",
                 ));
+            }
+            if run.wired {
+                checksum_drops.extend(stale_checksums);
             }
             checksum_drops.extend(run.drops);
             if run.landed {
@@ -9866,6 +9889,9 @@ fn rewrite_maven_poms(
                     "jar",
                 ));
             }
+            if run.wired {
+                checksum_drops.extend(stale_checksums);
+            }
             checksum_drops.extend(run.drops);
             if run.landed {
                 pin_maven_checksums(
@@ -10004,6 +10030,11 @@ fn rewrite_maven_poms(
                 None,
                 "jar",
             ));
+        }
+        // (A dep whose only declaration names another version is skipped:
+        // no pin landed and none is in place.)
+        if pin_landed || versioned.iter().any(|(_, _, v)| *v == suffixed_version) {
+            checksum_drops.extend(stale_checksums);
         }
 
         // The superseded generations' wiring: once no literal names an old
@@ -10250,9 +10281,23 @@ fn pin_maven_checksums(
     }
 }
 
+/// What a hosted Maven warning says this run did for a dep it did not
+/// wire: one clause, for the mirror gate and the reactor planner's refusal
+/// alike. It speaks of the run and of the dep, not of the state of the
+/// files: an earlier run's pin may still be in the poms, and the same run
+/// may respell a `.mvn/maven.config` line that no dep decides
+/// ([`heal_mvn_config`]).
+const MAVEN_WROTE_NOTHING: &str =
+    "this run wrote nothing for it (no pin in a pom, no line or file under .mvn/)";
+
 /// Why a dep is not wired behind `mirror`, and the ways forward. The
 /// settings read are the scanning machine's, which the line says: the
 /// machine that builds may be configured otherwise.
+///
+/// `earlier` is the purl of the dep when the poms already hold the wiring
+/// an earlier run wrote for it. That wiring is left in place, and a build
+/// behind the mirror fails on it: the line says so, and names the command
+/// that takes it out beside the ways to make it resolve.
 ///
 /// The second way forward is vendored mode, and only where it is one. A
 /// vendored patch gets past a mirror through `maven.repo.local.tail`,
@@ -10262,11 +10307,13 @@ fn pin_maven_checksums(
 /// Maven Wrapper pins an older Maven (`wrapper`, as vendored mode itself
 /// reads it) it does not offer vendored mode as it stands, but says what
 /// makes it work.
+///
 fn maven_mirror_detail(
     ga: &str,
     repo_id: &str,
     mirror: &crate::formats::maven::mirror::Mirror,
     wrapper: Option<(u32, u32, u32)>,
+    earlier: Option<&str>,
 ) -> String {
     let vendor_repo = crate::vendor::jvm::maven_reactor::REPO_ID;
     let exclude = format!(
@@ -10296,12 +10343,21 @@ fn maven_mirror_detail(
              too)"
         ),
     };
+    let left = match earlier {
+        Some(purl) => format!(
+            " The wiring an earlier run wrote for it is still in the poms and was left in \
+             place: a build behind this mirror fails to resolve the patched version until the \
+             mirror leaves the repository out or that wiring is taken out (`socket-patch \
+             rollback {purl}`)."
+        ),
+        None => String::new(),
+    };
     format!(
         "{ga}: on this machine Maven's settings send the {repo_id} repository to the mirror \
          `{id}` (<mirrorOf>{of}</mirrorOf> in {source}), which does not serve the patched \
-         artifact, so the build could not resolve it; pom.xml and .mvn/ were left as they are \
-         and the dep is not counted as redirected. {ways}. Only this machine's settings were \
-         read: the machine that builds needs the same exclusion",
+         artifact, so the build could not resolve it; {MAVEN_WROTE_NOTHING} and the dep is \
+         not counted as redirected.{left} {ways}. Only this machine's settings were read: \
+         the machine that builds needs the same exclusion",
         id = mirror.id,
         of = mirror.mirror_of,
         source = mirror.source,
@@ -10460,9 +10516,8 @@ impl MavenReactorRewrite {
             result.warnings.push(RewriteWarning {
                 code: code.into(),
                 detail: format!(
-                    "{ga}: {why}; the poms and .mvn/ were left as they are and the dep is not \
-                     counted as redirected (`scan --mode vendored` commits the patched \
-                     artifact instead)"
+                    "{ga}: {why}; {MAVEN_WROTE_NOTHING} and the dep is not counted as \
+                     redirected (`scan --mode vendored` commits the patched artifact instead)"
                 ),
             });
         };
@@ -12090,7 +12145,8 @@ mod tests {
 
     /// A gated dep has nothing written for it at all: not even the
     /// checksum lines a grant with a malformed hash would otherwise have
-    /// dropped. The warning says `.mvn/` was left as it is, and it is.
+    /// dropped. The warning says nothing was written for the dep, and
+    /// nothing is.
     #[test]
     fn maven_mirror_gate_touches_no_file_of_a_gated_dep() {
         let mut dep = granted_maven_override();
@@ -12125,6 +12181,149 @@ mod tests {
             warning_codes(&r),
             ["redirect_maven_mirror_captures_repository"]
         );
+        // The line speaks of this run. Nothing of an earlier one is in the
+        // poms, so it names none and no command to take it out.
+        let detail = &r.warnings[0].detail;
+        assert!(detail.contains(MAVEN_WROTE_NOTHING), "{detail}");
+        assert!(
+            !detail.contains("left in place") && !detail.contains("socket-patch rollback"),
+            "{detail}"
+        );
+    }
+
+    /// A dep this run refuses or skips has no file touched for it: no pom,
+    /// and not the checksum lines that a grant with a malformed hash drops
+    /// once its pin lands or is in place. One case for each way out of the
+    /// rewriter: the reactor planner's refusal, a version the build does
+    /// not select (a single pom, and a reactor), and a selection that
+    /// cannot be read. (The mirror gate's is the test above.)
+    #[test]
+    fn maven_dep_that_is_refused_or_skipped_touches_no_file() {
+        let mut dep = granted_maven_override();
+        dep.integrity.sha256 = Some("sha256-q83vEjRWeJA=".into());
+        let stale = format!(
+            "{}  org/slf4j/slf4j-api/{MAVEN_SUFFIXED}/slf4j-api-{MAVEN_SUFFIXED}.jar\n",
+            "c".repeat(64)
+        );
+        let project = |poms: &[(&str, &str)]| -> BTreeMap<String, String> {
+            poms.iter()
+                .map(|(rel, text)| (rel.to_string(), text.to_string()))
+                .chain([(MVN_CHECKSUMS.to_string(), stale.clone())])
+                .collect()
+        };
+        let run = |files: &BTreeMap<String, String>, picks: &[(&str, Result<&str, &str>)]| {
+            let modules: Vec<&str> = files
+                .keys()
+                .map(String::as_str)
+                .filter(|rel| rel.ends_with("pom.xml"))
+                .collect();
+            let picks: Vec<_> = picks
+                .iter()
+                .map(|(pom, pick)| (*pom, "org.slf4j", "slf4j-api", *pick))
+                .collect();
+            let selection = MavenSelection::answering(&modules, &picks);
+            rewrite_registry_redirect_with_host(
+                files,
+                std::slice::from_ref(&dep),
+                &BTreeMap::new(),
+                None,
+                false,
+                &std::collections::BTreeSet::new(),
+                &yarnrc::OuterYarnMirror::default(),
+                &CratesIoSource::Registry,
+                Some(&selection),
+            )
+        };
+        let untouched = |r: &RewriteResult, code: &str, what: &str| {
+            assert!(r.files.is_empty(), "{what}: {:?}", r.files.keys());
+            assert!(r.edits.is_empty(), "{what}: {:?}", r.edits);
+            assert_eq!(warning_codes(r), [code], "{what}");
+        };
+
+        // Control: where the pin lands the stale line goes with it.
+        let direct = pom_with_dep("\n      <version>1.7.36</version>", "");
+        let landed = run(
+            &project(&[("pom.xml", &direct)]),
+            &[("pom.xml", Ok("1.7.36"))],
+        );
+        assert!(landed.files["pom.xml"].contains(MAVEN_SUFFIXED));
+        assert!(
+            !landed.files[MVN_CHECKSUMS].contains(MAVEN_SUFFIXED),
+            "{}",
+            landed.files[MVN_CHECKSUMS]
+        );
+
+        // The reactor planner refuses the plan: a module pom is missing.
+        let headless = direct.replace(
+            "  <dependencies>",
+            "  <packaging>pom</packaging>\n  <modules>\n    <module>app</module>\n  </modules>\n  <dependencies>",
+        );
+        let files = project(&[("pom.xml", &headless)]);
+        assert!(maven_reactor_root(&files));
+        let r = run(&files, &[]);
+        untouched(&r, "redirect_maven_multimodule_unsupported", "refused");
+        assert!(
+            r.warnings[0].detail.contains(MAVEN_WROTE_NOTHING),
+            "{}",
+            r.warnings[0].detail
+        );
+
+        // The build selects another version: a single pom, and a reactor.
+        let r = run(
+            &project(&[("pom.xml", TRANSITIVE_ONLY_POM)]),
+            &[("pom.xml", Ok("2.0.9"))],
+        );
+        untouched(&r, "redirect_maven_version_not_selected", "single pom");
+        let reactor = project(&[
+            ("pom.xml", REACTOR_ROOT),
+            ("a/pom.xml", &reactor_module("a", "")),
+            ("b/pom.xml", &reactor_module("b", "")),
+        ]);
+        let r = run(
+            &reactor,
+            &[("a/pom.xml", Ok("2.0.9")), ("b/pom.xml", Ok("2.0.9"))],
+        );
+        untouched(&r, "redirect_maven_version_not_selected", "reactor");
+
+        // The pom names another version of the artifact: the dep is
+        // skipped where it stands, past every earlier way out.
+        let other = pom_with_dep("\n      <version>2.0.0</version>", "");
+        let r = run(
+            &project(&[("pom.xml", &other)]),
+            &[("pom.xml", Ok("2.0.0"))],
+        );
+        assert!(r.files.is_empty(), "mismatch: {:?}", r.files.keys());
+        assert!(r.edits.is_empty(), "mismatch: {:?}", r.edits);
+
+        // What the build selects cannot be read, and no pom names a
+        // version to replace.
+        let r = run(
+            &project(&[("pom.xml", TRANSITIVE_ONLY_POM)]),
+            &[(
+                "pom.xml",
+                Err("the pom of ch.qos.logback:logback-classic:1.4.14 is not in the local Maven repository"),
+            )],
+        );
+        untouched(&r, "redirect_maven_selection_undetermined", "undetermined");
+    }
+
+    /// `plain` as a hosted scan of an earlier release left it, and what
+    /// that scan writes today: the project wired for `dep`, with the
+    /// Trusted Checksums directory named through `${session.rootDirectory}`
+    /// where today's scan names it through the launcher's property.
+    fn wired_by_an_earlier_release(
+        plain: &BTreeMap<String, String>,
+        dep: &DepOverride,
+    ) -> (BTreeMap<String, String>, RewriteResult) {
+        use trusted_checksums::Basedir::{Launcher, Session};
+        let wired = rewrite_registry_redirect(plain, std::slice::from_ref(dep));
+        let mut earlier = plain.clone();
+        earlier.extend(wired.files.clone());
+        let value = trusted_checksums::basedir_value;
+        let old = earlier[MVN_CONFIG].replace(value(Launcher), value(Session));
+        assert_ne!(old, earlier[MVN_CONFIG]);
+        earlier.insert(MVN_CONFIG.to_string(), old);
+        (earlier, wired)
     }
 
     /// A dep the gate holds back does not keep another dep of the same
@@ -12173,6 +12372,59 @@ mod tests {
         assert!(r.warnings[0].detail.starts_with("org.slf4j:slf4j-api: "));
         assert!(r.maven_reactor_uuids.contains(MAVEN_UUID));
         assert!(!r.maven_reactor_uuids.contains(second_uuid));
+    }
+
+    /// The gate holds a dep back, never the respelling of a
+    /// `.mvn/maven.config` an earlier release wrote: that line stops Maven
+    /// 3.9.2 to 3.9.8 from starting with `-f` from outside the project
+    /// whether or not a mirror takes the Socket repository. So a project
+    /// an earlier release wired, scanned behind a mirror that now captures
+    /// its repository, gets the mirror's warning for the dep and the heal
+    /// for the config, and nothing else is written.
+    #[test]
+    fn maven_mirror_gate_does_not_hold_back_the_heal_of_an_earlier_config() {
+        let dep = granted_maven_override();
+        let plain = BTreeMap::from([(
+            "pom.xml".to_string(),
+            pom_with_dep("\n      <version>1.7.36</version>", ""),
+        )]);
+        let (mut earlier, wired) = wired_by_an_earlier_release(&plain, &dep);
+        earlier.extend([maven_mirrors(&[("corp", "*")])]);
+
+        let r = rewrite_registry_redirect(&earlier, std::slice::from_ref(&dep));
+        assert_eq!(r.files.keys().collect::<Vec<_>>(), [MVN_CONFIG]);
+        assert_eq!(r.files[MVN_CONFIG], wired.files[MVN_CONFIG]);
+        assert_eq!(
+            r.edits
+                .iter()
+                .map(|e| (e.path.as_str(), e.key.as_deref()))
+                .collect::<Vec<_>>(),
+            [(MVN_CONFIG, Some(MVN_CONFIG_HEAL_KEY))]
+        );
+        assert_eq!(
+            warning_codes(&r),
+            [
+                "redirect_maven_mirror_captures_repository",
+                "redirect_maven_trusted_checksums_maven3_only",
+            ]
+        );
+        // The mirror's line speaks of this run, which wrote nothing for
+        // the dep. The earlier run's wiring is still there: the line says
+        // that it was left, that a build behind the mirror fails on it,
+        // and how to take it out.
+        let detail = &r.warnings[0].detail;
+        for part in [
+            MAVEN_WROTE_NOTHING,
+            "The wiring an earlier run wrote for it is still in the poms and was left in place",
+            "a build behind this mirror fails to resolve the patched version",
+            "`socket-patch rollback pkg:maven/org.slf4j/slf4j-api@1.7.36`",
+        ] {
+            assert!(detail.contains(part), "{part}: {detail}");
+        }
+        // Gated, so decided and not confirmed: the wiring the earlier run
+        // left is not counted as this run's redirect.
+        assert!(r.maven_reactor_uuids.contains(MAVEN_UUID));
+        assert!(r.confirmed_maven_reactor_uuids.is_empty());
     }
 
     /// [`maven_override`] as the patch service grants it: the suffix is the
@@ -13640,11 +13892,8 @@ mod tests {
         assert_eq!(form(&run(&model_4_1)), Some(Session));
 
         // An earlier release's wiring: the same files, the session's form.
-        let mut earlier = plain.clone();
-        earlier.extend(wired.files.clone());
-        let old = earlier[MVN_CONFIG].replace(value(Launcher), value(Session));
-        assert_ne!(old, earlier[MVN_CONFIG]);
-        earlier.insert(MVN_CONFIG.to_string(), old);
+        let (earlier, rewired) = wired_by_an_earlier_release(&plain, &maven_override());
+        assert_eq!(rewired.files, wired.files);
         let healed = run(&earlier);
         assert_eq!(healed.files.keys().collect::<Vec<_>>(), [MVN_CONFIG]);
         assert_eq!(healed.files[MVN_CONFIG], wired.files[MVN_CONFIG]);
@@ -13815,6 +14064,13 @@ mod tests {
         assert_eq!(
             warning_codes(&r),
             [trade, "redirect_maven_multimodule_unsupported"]
+        );
+        // The refusal speaks of what this run did for the dep, not of
+        // `.mvn/`: the same run respelled a line there.
+        assert!(
+            r.warnings[1].detail.contains(MAVEN_WROTE_NOTHING),
+            "{}",
+            r.warnings[1].detail
         );
 
         // A root the sbt rewriter owns (no pom.xml beside the build).

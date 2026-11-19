@@ -988,8 +988,9 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   A `${property}` groupId or artifactId is resolved from the pom's own `<properties>`
   before matching, so `<groupId>${ct.group}</groupId>` is rewritten like a literal. One
   the pom does not define (a parent's) may be the patched GA, and then its own version
-  wins: the dep is refused with nothing written (`redirect_maven_coordinate_unresolved`),
-  and `vex` does not attest a pin past such a declaration.
+  wins: the dep is refused and the run writes nothing for it
+  (`redirect_maven_coordinate_unresolved`), and `vex` does not attest a pin past such a
+  declaration.
   The grant serves the main jar only: a `<classifier>` variant keeps its version
   (`redirect_maven_classifier_unsupported`), and the literal-or-pin decision is made from
   the classifier-less declarations. A `sources` / `javadoc` variant at the patched release
@@ -1005,7 +1006,7 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   cached `maven-metadata-*.xml` lists. When the build selects another version (a newer
   or older one nearer the root, the project's own declaration, an excluded path, a
   range), or does not resolve the artifact at all, the patch for that base version has
-  nothing to patch: nothing is written, the run exits 0, and one line names the version
+  nothing to patch: the run writes nothing for it, exits 0, and one line names the version
   Maven selects instead (`redirect_maven_version_not_selected`, vendored
   `vendor_maven_version_not_selected`). A patch for the version that is selected is
   still looked up and applied. When the selection cannot be read (most often because
@@ -1038,11 +1039,11 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   Checksums stay in the project root's `.mvn/`, which Maven also reads when it is
   started in a module directory or with `-f`; a module with a `.mvn` of its own is
   reported (`redirect_maven_trusted_checksums_unenforced`), since a Maven started there
-  reads that one. A reactor one of whose poms cannot be read is left untouched
-  (`redirect_maven_multimodule_unsupported`, with the reason). A pom that is there but is
-  not UTF-8 text (re-saved as Latin-1 or UTF-16, say) is never taken for a missing one:
-  the scan refuses the run and names it (`candidate_file_unreadable`), `vex` reports it
-  as unreadable and attests no pin of that reactor, and `rollback` / `remove` change
+  reads that one. When a pom of a reactor cannot be read, the run writes nothing for the
+  patch (`redirect_maven_multimodule_unsupported`, with the reason). A pom that is there
+  but is not UTF-8 text (re-saved as Latin-1 or UTF-16, say) is never taken for a missing
+  one: the scan refuses the run and names it (`candidate_file_unreadable`), `vex` reports
+  it as unreadable and attests no pin of that reactor, and `rollback` / `remove` change
   nothing until it is UTF-8 again, since it may hold part of a pin. The plan for a patch is
   written whole or not at all: a pom is never left naming a patched version without the
   repository that serves it, its checksum lines, and wiring a rollback can find. So a
@@ -1169,8 +1170,9 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   `originAware=false` and `failIfMissing=false`, so one checksum matches the artifact
   from any repository and a dependency with no committed checksum still resolves — only a
   *mismatch* fails. A grant whose sha256 is not 64 hex digits writes no checksum line
-  (and drops any line an earlier run wrote for that suffixed version) and warns
-  `redirect_maven_trusted_checksums_invalid_hash`. `vex` takes a pin's checksum as the
+  and warns `redirect_maven_trusted_checksums_invalid_hash`; a line an earlier run wrote
+  for that suffixed version goes once the pin lands or is in place, and stays untouched
+  for a dep the run refuses or skips. `vex` takes a pin's checksum as the
   content the project pins only when the pin is known to be enforced: `maven.config`
   enforces the file as Maven 3.9+ reads it (all five settings above with the values
   hosted writes, the directory in either form; `failIfMissing` aside), and the Maven the
@@ -1230,8 +1232,8 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   included. The patch resolves only at its suffixed version, which the mirror does not
   hold, so a project wired behind such a mirror **fails to build**. `scan --mode hosted`
   therefore reads the Maven settings of the machine it runs on before it writes a Maven
-  pin, and wires nothing for a patch whose repository a mirror would take over: the
-  poms and `.mvn/` stay as they are, the scan exits 0, and
+  pin, and wires nothing for a patch whose repository a mirror would take over: the run
+  writes nothing for it (no pin in a pom, no line or file under `.mvn/`), exits 0, and
   `redirect_maven_mirror_captures_repository` names the mirror, the settings file that
   declares it, and the two ways forward:
   - **Leave the repository out of the mirror.** Add `!socket-patch-<uuid>` to its
@@ -1265,7 +1267,9 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   behind a mirror that takes every repository, and a project skipped here may have built
   there. The in-memory engine (a Socket-opened pull request) reads no settings at all.
   A project an earlier scan wired is left as it is and reported the same way, and is no
-  longer counted as redirected or attested by that scan's `--vex`. The skip is only for
+  longer counted as redirected or attested by that scan's `--vex`. Its warning also says
+  that the earlier wiring is still in the poms, that a build behind the mirror fails on
+  it, and how to take it out (`socket-patch rollback <purl>`). The skip is only for
   a patch that would get the repository: one the scan would not wire anyway (the build
   selects another version) is reported under its own reason.
 * **Gradle (hosted Maven).** Gradle builds get automated wiring, not a pasted snippet:
