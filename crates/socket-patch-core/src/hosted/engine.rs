@@ -833,6 +833,42 @@ async fn read_maven_reactor(
     out.undecodable_maven_poms = undecodable;
 }
 
+/// Hand the pom rewriter the mirrors Maven is configured with on this
+/// machine
+/// ([`settings_mirror_sets`](crate::crawlers::maven_crawler::settings_mirror_sets)),
+/// under [`MAVEN_MIRRORS_KEY`](crate::patch::redirect::MAVEN_MIRRORS_KEY):
+/// it adds no repository to a pom that one of them would take over (the
+/// gem path's mirror gate, for Maven). On disk only: a memory view has no
+/// machine, and so no settings to read.
+fn read_maven_mirrors(
+    view: &ProjectView<'_>,
+    env: &(dyn crate::gradle::Env + Sync),
+    out: &mut CandidateFiles,
+) {
+    if !out.files.contains_key("pom.xml") {
+        return;
+    }
+    let Some(root) = view.disk_root() else {
+        return;
+    };
+    let sets = crate::crawlers::maven_crawler::settings_mirror_sets(
+        env,
+        crate::gradle::Os::current(),
+        None,
+        root,
+        out.files
+            .get(crate::patch::redirect::MVN_CONFIG)
+            .map(String::as_str),
+    );
+    if sets.is_empty() {
+        return;
+    }
+    if let Ok(json) = serde_json::to_string(&sets) {
+        out.files
+            .insert(crate::patch::redirect::MAVEN_MIRRORS_KEY.to_string(), json);
+    }
+}
+
 /// An in-memory project's Go files as the hosted engine reads them
 /// ([`read_advisory`]: a link or an entry without content is unreadable,
 /// but still exists).
@@ -999,6 +1035,26 @@ pub async fn read_candidate_files(
     view: &ProjectView<'_>,
     unreadable: &BTreeSet<String>,
     candidates: &[Candidate],
+) -> CandidateFiles {
+    read_candidate_files_in(
+        view,
+        unreadable,
+        candidates,
+        &crate::crawlers::gradle_cache::ProcessEnv,
+    )
+    .await
+}
+
+/// [`read_candidate_files`] with the environment the machine's own
+/// configuration is looked up through (today: where Maven's settings
+/// files are, for the mirror gate). The process environment in
+/// production; a test hands in its own, so what a developer keeps in
+/// `~/.m2/settings.xml` decides nothing.
+pub async fn read_candidate_files_in(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    candidates: &[Candidate],
+    env: &(dyn crate::gradle::Env + Sync),
 ) -> CandidateFiles {
     let mut out = CandidateFiles::default();
     for name in REDIRECT_CANDIDATE_FILES.iter() {
@@ -1188,6 +1244,7 @@ pub async fn read_candidate_files(
                 out.files.insert(rel, text);
             }
         }
+        read_maven_mirrors(view, env, &mut out);
     }
 
     // NuGet merges the user config and every parent directory's config
@@ -4699,6 +4756,74 @@ mod tests {
         );
     }
 
+    /// One reference response answers for a whole batch. A prebuild entry
+    /// that IS a platform and a checksum, but not in the shape the lock
+    /// takes, fails the grant it rides in and no other: the gem is skipped
+    /// with the field named, and the other package keeps its candidate.
+    #[test]
+    fn a_wrong_gem_prebuild_fails_only_its_own_grant() {
+        const GEM: &str = "pkg:gem/nokogiri@1.18.10";
+        const NPM: &str = "pkg:npm/c@1";
+        const GEM_UUID: &str = "5e6f7081-92a3-4b4c-8d5e-6f708192a3b4";
+        let refs = HashMap::from([
+            (
+                GEM_UUID.to_string(),
+                reference(serde_json::json!({
+                    "status": "granted",
+                    "url": format!("https://patch.example/patch/gem/t/{GEM_UUID}/nokogiri-1.18.10.gem"),
+                    "purl": GEM,
+                    "artifacts": [{"kind": "tarball", "url": null, "integrity": {
+                        "sha256": "a".repeat(64)
+                    }}],
+                    "registryOverride": {
+                        "kind": "rubygems-compact-index",
+                        "indexUrl": format!("https://patch.example/patch-registry/gem/t/{GEM_UUID}/"),
+                        "identifiers": {
+                            "name": "nokogiri", "version": "1.18.10",
+                            "gemChecksumSha256": "a".repeat(64),
+                            "gemPlatforms": [
+                                {"platform": "arm64-darwin", "gemChecksumSha256": "not-a-digest"}
+                            ]
+                        }
+                    }
+                })),
+            ),
+            (
+                PATCH_UUID.to_string(),
+                reference(serde_json::json!({
+                    "status": "granted",
+                    "url": format!("https://patch.example/patch/npm/c/1/tok/{PATCH_UUID}/c-1.tgz"),
+                    "purl": NPM,
+                    "artifacts": [{"kind": "tarball", "url": null, "integrity": {
+                        "sha512": "sha512-x", "sha1": "a".repeat(40)
+                    }}],
+                    "registryOverride": null
+                })),
+            ),
+        ]);
+        let selected = vec![
+            (GEM.to_string(), GEM_UUID.to_string()),
+            (NPM.to_string(), PATCH_UUID.to_string()),
+        ];
+        let (mut skipped, mut warnings) = (Vec::new(), Vec::new());
+        let candidates = build_candidates(&selected, &refs, &[], &mut skipped, &mut warnings);
+        let kept: Vec<&str> = candidates.iter().map(|c| c.purl.as_str()).collect();
+        assert_eq!(kept, [NPM], "{skipped:?}");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(
+            (skipped[0].purl.as_str(), skipped[0].reason.as_str()),
+            (GEM, GRANT_MALFORMED)
+        );
+        assert!(
+            skipped[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("its gem platform checksum is not 64 hex digits"),
+            "{skipped:?}"
+        );
+    }
+
     /// A granted cargo reference for `uuid` (a canonical uuid), with no
     /// registry override.
     fn cargo_reference(
@@ -6133,7 +6258,18 @@ snapshots:
         gradle_rewrite_in(&ProjectView::Memory(p)).await
     }
 
+    /// Over `view`, with no machine behind it: an empty environment, so
+    /// no home, no `PATH` and no settings file of whoever runs the tests
+    /// decides what a Maven project is wired to.
     async fn gradle_rewrite_in(view: &ProjectView<'_>) -> (CandidateFiles, Rewritten) {
+        gradle_rewrite_with(view, &BTreeMap::new()).await
+    }
+
+    /// [`gradle_rewrite_in`] on a machine whose environment is `env`.
+    async fn gradle_rewrite_with(
+        view: &ProjectView<'_>,
+        env: &BTreeMap<String, String>,
+    ) -> (CandidateFiles, Rewritten) {
         let outer = OuterAllowRemote::default;
         let options = RewriteOptions {
             dry_run: false,
@@ -6153,7 +6289,7 @@ snapshots:
             prior_discovery: None,
         };
         let candidates = vec![gradle_candidate()];
-        let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
+        let read = read_candidate_files_in(view, &BTreeSet::new(), &candidates, env).await;
         let done = rewrite(view, read.clone(), &candidates, BTreeMap::new(), options).await;
         (read, done)
     }
@@ -6628,6 +6764,141 @@ snapshots:
                 check(&read, &done, theirs);
             }
         }
+    }
+
+    /// On disk the engine reads the mirrors of the Maven settings the
+    /// build would be started with, and a project whose Socket repository
+    /// one of them would take over is left alone: nothing written, nothing
+    /// confirmed, the reason given, and no refusal of the run. A mirror
+    /// that leaves the repository out wires as usual, and so does the
+    /// same project in memory, where no machine's settings exist.
+    #[tokio::test]
+    async fn a_maven_project_behind_a_capturing_mirror_is_left_alone() {
+        use crate::patch::redirect::MAVEN_MIRRORS_KEY;
+        let pom = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>x</groupId>\n  <artifactId>y</artifactId>\n  <version>1</version>\n  <dependencies>\n    <dependency>\n      <groupId>com.socketfixture</groupId>\n      <artifactId>victim</artifactId>\n      <version>1.10.0</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+        // Both settings files are named, so none of this machine's is read.
+        let config = "-s\nsettings.xml\n-gs\nglobal.xml\n";
+        let settings = |mirror_of: &str| {
+            format!(
+                "<settings>\n  <mirrors>\n    <mirror>\n      <id>corp</id>\n      \
+                 <mirrorOf>{mirror_of}</mirrorOf>\n      <url>https://nexus.example/repo</url>\n    \
+                 </mirror>\n  </mirrors>\n</settings>\n"
+            )
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |rel: &str, text: &str| {
+            let path = tmp.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("pom.xml", pom);
+        write(".mvn/maven.config", config);
+        write("global.xml", "<settings/>\n");
+        write("settings.xml", &settings("*"));
+        let view = ProjectView::Disk(tmp.path());
+        let (read, done) = gradle_rewrite_in(&view).await;
+        assert!(read.files.contains_key(MAVEN_MIRRORS_KEY));
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+        let warning = done
+            .rewrite
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_maven_mirror_captures_repository")
+            .unwrap_or_else(|| panic!("{:?}", done.rewrite.warnings));
+        assert!(
+            warning.detail.contains("`corp`") && warning.detail.contains("settings.xml"),
+            "{}",
+            warning.detail
+        );
+        assert!(guard(&view, &done, &[gradle_candidate()]).is_none());
+
+        // The mirror leaves the repository out.
+        write(
+            "settings.xml",
+            &settings(&format!("*,!socket-patch-{GRADLE_UUID}")),
+        );
+        let (_, done) = gradle_rewrite_in(&view).await;
+        assert!(done.rewrite.files["pom.xml"].contains("1.10.0-socket.4d5e6f70"));
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
+
+        // A project an earlier run wired, on a machine whose mirror now
+        // takes the repository: the pom still names the patch, and the
+        // build behind that mirror cannot resolve it. Nothing is written,
+        // and the patch is not confirmed by the text it still matches.
+        let wired = done.rewrite.files.clone();
+        for (rel, text) in &wired {
+            write(rel, text);
+        }
+        write("settings.xml", &settings("*"));
+        let (_, done) = gradle_rewrite_in(&view).await;
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(
+            std::fs::read_to_string(tmp.path().join("pom.xml"))
+                .unwrap()
+                .contains("1.10.0-socket.4d5e6f70"),
+            "the wiring is left as it is"
+        );
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+        assert!(done
+            .rewrite
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_maven_mirror_captures_repository"));
+        write("pom.xml", pom);
+
+        // The settings are found through the environment the engine is
+        // given, never the test process's own: a settings file named in
+        // that environment's `MAVEN_ARGS` is the one read.
+        std::fs::remove_file(tmp.path().join(".mvn/maven.config")).unwrap();
+        write("ci/settings.xml", &settings("*"));
+        let (_, done) = gradle_rewrite_in(&view).await;
+        assert!(
+            done.rewrite.files["pom.xml"].contains("1.10.0-socket.4d5e6f70"),
+            "no environment, no settings: wired"
+        );
+        let ci = BTreeMap::from([(
+            "MAVEN_ARGS".to_string(),
+            format!(
+                "-s {} -gs {}",
+                tmp.path().join("ci/settings.xml").display(),
+                tmp.path().join("global.xml").display()
+            ),
+        )]);
+        let (read, done) = gradle_rewrite_with(&view, &ci).await;
+        assert!(read.files.contains_key(MAVEN_MIRRORS_KEY));
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        write(".mvn/maven.config", config);
+
+        // A settings path with a space, on a line of its own as Maven 3.9
+        // and later read `maven.config`: the file is opened whole, and the
+        // mirror in it gates the pin.
+        write("team settings/settings.xml", &settings("*"));
+        write(
+            ".mvn/maven.config",
+            "-s\nteam settings/settings.xml\n-gs\nglobal.xml\n",
+        );
+        write("settings.xml", &settings("central"));
+        let (read, done) = gradle_rewrite_in(&view).await;
+        assert!(read.files.contains_key(MAVEN_MIRRORS_KEY));
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(done
+            .rewrite
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_maven_mirror_captures_repository"
+                && w.detail.contains("team settings")));
+        write(".mvn/maven.config", config);
+
+        // In memory: the files are there, but no machine to read them for.
+        let mut p = MemoryProject::new();
+        p.insert_text("pom.xml", pom);
+        p.insert_text(".mvn/maven.config", config);
+        p.insert_text("settings.xml", settings("*").as_str());
+        let view = ProjectView::Memory(&p);
+        let (read, done) = gradle_rewrite_in(&view).await;
+        assert!(!read.files.contains_key(MAVEN_MIRRORS_KEY));
+        assert!(done.rewrite.files["pom.xml"].contains("1.10.0-socket.4d5e6f70"));
     }
 
     /// #1809: a Maven 4 root whose subprojects Maven discovers (model
@@ -7170,6 +7441,13 @@ snapshots:
     }
 
     async fn gem_rewrite_in(view: &ProjectView<'_>) -> (CandidateFiles, Rewritten) {
+        gem_rewrite_of(view, vec![gem_candidate()]).await
+    }
+
+    async fn gem_rewrite_of(
+        view: &ProjectView<'_>,
+        candidates: Vec<Candidate>,
+    ) -> (CandidateFiles, Rewritten) {
         let outer = OuterAllowRemote::default;
         let options = RewriteOptions {
             dry_run: false,
@@ -7188,10 +7466,77 @@ snapshots:
             patch_server_origins: Vec::new(),
             prior_discovery: None,
         };
-        let candidates = vec![gem_candidate()];
         let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
         let done = rewrite(view, read.clone(), &candidates, BTreeMap::new(), options).await;
         (read, done)
+    }
+
+    /// A gem locked as precompiled platform builds, with a prebuild for
+    /// each: the rewrite moves every build, and lockfile discovery (what
+    /// `vex`, `rollback` and `remove` read) attributes them to the one pin,
+    /// so the engine confirms it instead of dropping the rewrite as
+    /// unattributable. A second run over the result confirms the same pin
+    /// and writes nothing.
+    #[tokio::test]
+    async fn gem_platform_builds_are_confirmed_as_one_pin() {
+        use crate::patch::redirect::GemPlatformChecksum;
+        let mut candidate = gem_candidate();
+        candidate
+            .dep
+            .registry_override
+            .as_mut()
+            .unwrap()
+            .identifiers
+            .gem_platforms = ["arm64-darwin", "x86_64-linux-gnu"]
+            .iter()
+            .zip(["a", "b"])
+            .map(|(platform, digit)| GemPlatformChecksum {
+                platform: platform.to_string(),
+                gem_checksum_sha256: digit.repeat(64),
+            })
+            .collect();
+        let lock = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0-arm64-darwin)\n    rails \
+             (7.0.0-x86_64-linux-gnu)\n\nPLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\nDEPENDENCIES\n  \
+             rails (= 7.0.0)\n\nCHECKSUMS\n  rails (7.0.0-arm64-darwin) sha256={}\n  rails \
+             (7.0.0-x86_64-linux-gnu) sha256={}\n\nBUNDLED WITH\n  4.0.15\n",
+            "1".repeat(64),
+            "2".repeat(64)
+        );
+        let mut p = MemoryProject::new();
+        p.insert_text("Gemfile", GEMFILE);
+        p.insert_text("Gemfile.lock", lock.as_str());
+        let (_, done) = gem_rewrite_of(&ProjectView::Memory(&p), vec![candidate.clone()]).await;
+        assert!(done.unattributed.is_empty(), "{:?}", done.unattributed);
+        assert_eq!(
+            done.confirmed,
+            [("pkg:gem/rails@7.0.0".to_string(), FIXTURE_UUID.to_string())]
+        );
+        let written = &done.rewrite.files["Gemfile.lock"];
+        assert!(
+            written.contains(
+                "  specs:\n    rails (7.0.0-arm64-darwin)\n    rails (7.0.0-x86_64-linux-gnu)\n\nGEM\n  \
+                 remote: https://rubygems.org/\n  specs:\n\nPLATFORMS"
+            ),
+            "{written}"
+        );
+        assert!(
+            written.contains(&format!(
+                "CHECKSUMS\n  rails (7.0.0-arm64-darwin) sha256={}\n  rails (7.0.0-x86_64-linux-gnu) \
+                 sha256={}\n",
+                "a".repeat(64),
+                "b".repeat(64)
+            )),
+            "{written}"
+        );
+
+        for (rel, text) in &done.rewrite.files {
+            p.insert_text(rel, text.as_str());
+        }
+        let (_, again) = gem_rewrite_of(&ProjectView::Memory(&p), vec![candidate]).await;
+        assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.edits);
+        assert_eq!(again.confirmed, done.confirmed);
+        assert!(again.unattributed.is_empty(), "{:?}", again.unattributed);
     }
 
     /// #390: `bundle config set --local gemfile Gemfile.next` makes bundler

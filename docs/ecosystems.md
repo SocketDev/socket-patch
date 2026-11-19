@@ -1265,14 +1265,50 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   applied. To clear them, add a Maven Wrapper pinned to Maven 3.9.9 or later, or make
   sure your `settings.xml` mirrors exclude `socket-patch-vendor` (for example
   `<mirrorOf>external:*</mirrorOf>` or `<mirrorOf>*,!socket-patch-vendor</mirrorOf>`).
-* **`mirrorOf` mirrors (hosted Maven).** A `settings.xml` `<mirror>` with
-  `<mirrorOf>*</mirrorOf>` (common in corporate environments) reroutes *all* repositories
-  — including the injected `socket-patch-<uuid>` repository — through the mirror. Because
-  the patch resolves only at the suffixed version, the mirror (which does not carry it)
-  can't serve it and the **build fails loudly** rather than silently going unpatched.
-  Scope the mirror to exclude the Socket repos (e.g.
-  `<mirrorOf>*,!socket-patch-*</mirrorOf>`) so the redirect resolves; the
-  `originAware=false` Trusted Checksums act as a backstop when present.
+* **`mirrorOf` mirrors (hosted Maven).** A `settings.xml` `<mirror>` whose
+  `<mirrorOf>` is `*` or `external:*` (common in corporate environments) sends *every*
+  repository to the mirror, the `socket-patch-<uuid>` repository hosted mode adds
+  included. The patch resolves only at its suffixed version, which the mirror does not
+  hold, so a project wired behind such a mirror **fails to build**. `scan --mode hosted`
+  therefore reads the Maven settings of the machine it runs on before it writes a Maven
+  pin, and wires nothing for a patch whose repository a mirror would take over: the
+  poms and `.mvn/` stay as they are, the scan exits 0, and
+  `redirect_maven_mirror_captures_repository` names the mirror, the settings file that
+  declares it, and the two ways forward:
+  - **Leave the repository out of the mirror.** Add `!socket-patch-<uuid>` to its
+    `<mirrorOf>` (`<mirrorOf>*,!socket-patch-<uuid></mirrorOf>`), with no space around
+    it, on every machine that builds, then scan again. Maven compares whole repository
+    ids: there is no pattern for "every Socket repository" (`!socket-patch-*` excludes
+    nothing), and each patch has its own id, so each new patch needs its own exclusion.
+  - **Use vendored mode, on Maven 3.9.2 or later.** `scan --mode vendored` commits the
+    patched artifact and reads it through `maven.repo.local.tail`, which no mirror
+    redirects. Maven reads that setting from 3.9.2 on. An older Maven reads a vendored
+    patch through the `socket-patch-vendor` file repository, which a mirror of everything
+    takes as well, so there vendored mode needs the mirror to leave `socket-patch-vendor`
+    out (one id for every vendored patch). The warning says which applies: when the
+    project's Maven Wrapper pins a Maven older than 3.9.2 it does not offer vendored mode
+    as the project stands.
+
+  What is read: the user settings (`-s` / `--settings` in `MAVEN_ARGS`, then in
+  `.mvn/maven.config`, else `~/.m2/settings.xml`) merged over the global settings (`-gs`
+  / `--global-settings` likewise, else `conf/settings.xml` of the Maven Wrapper's
+  unpacked distribution, of the `mvn` on `PATH`, or, with none there, of `$MAVEN_HOME`
+  / `$M2_HOME`), and a `.mvn/settings.xml` the project keeps. `.mvn/maven.config` is
+  read as the project's Maven reads it: one argument per line from Maven 3.9 on (so a
+  settings path may hold spaces), split on whitespace before; the Maven Wrapper's
+  release decides, and without a wrapper both readings are weighed. The matching is
+  Maven's own: a mirror whose `<mirrorOf>` names the repository's id, alone or in a list
+  (`central,socket-patch-<uuid>`), was written for that repository and is not a reason
+  to skip; a mirror with no `<id>` counts under Maven's default id; `external:http:*` (the blocker Maven ships) never matches the
+  HTTPS Socket repository; `<mirrorOfLayouts>` is honoured. **Only the scanning
+  machine's settings are known.** A build machine with another `settings.xml` (a CI
+  image, a colleague's laptop) is not seen: a project wired here still fails there
+  behind a mirror that takes every repository, and a project skipped here may have built
+  there. The in-memory engine (a Socket-opened pull request) reads no settings at all.
+  A project an earlier scan wired is left as it is and reported the same way, and is no
+  longer counted as redirected or attested by that scan's `--vex`. The skip is only for
+  a patch that would get the repository: one the scan would not wire anyway (the build
+  selects another version) is reported under its own reason.
 * **Gradle (hosted Maven).** Gradle builds get automated wiring, not a pasted snippet:
   an owned settings script pins the suffixed version, every lock file is rewritten,
   and a tripwire fails the build if the base version still resolves. See
@@ -2189,10 +2225,36 @@ wire is skipped, neither file changes for it, and the warning says why and what 
 | `redirect_gem_declaration_not_visible` | the lock lists it as a direct dependency, but it is declared where the scan cannot edit: an `eval_gemfile`d file, a loop, a gemspec. Declare it with a literal `gem "<name>"` line in the Gemfile, in place of any other `gem` call that declares it (a gemspec's development dependency stays), or patch it with `--mode agent`. Vendored mode refuses it for the same reason. |
 | `redirect_gem_dependency_not_locked` | the Gemfile declares it and the lock's `DEPENDENCIES` does not list it. Run `bundle lock` and re-run. |
 | `redirect_gem_lock_unconvergeable` | the lock cannot be brought in line with the Gemfile: it has no `BUNDLED WITH` section to say which layout its Bundler accepts, or a Bundler < 2.2 lock lists its sources in an order the Gemfile's `source` lines do not explain. Run `bundle lock` with your current Bundler and re-run. |
-| `redirect_gem_platform_unsupported` | the lock holds a platform-specific build of the gem (`nokogiri (1.16.0-x86_64-linux)`); the patch registry serves the `ruby` platform gem only. |
+| `redirect_gem_platform_unsupported` | the lock holds a platform-specific build of the gem (`nokogiri (1.18.10-x86_64-linux-gnu)`) that the patch has no patched build for. The warning names the builds the lock holds, the ones that are missing, and what the patch registry serves. See "Precompiled platform gems" below. |
 
 `--mode agent` can still patch a gem hosted mode skips. `--mode vendored` can too, unless it
 refuses the gem itself (see "Ruby gems: gems vendored mode refuses").
+
+**Precompiled platform gems.** Bundler installs a gem such as nokogiri as a precompiled platform
+gem, and the lock then has one entry per platform the project supports, usually with no plain
+`nokogiri (1.18.10)`:
+
+```text
+    nokogiri (1.18.10-arm64-darwin)
+      racc (~> 1.4)
+    nokogiri (1.18.10-x86_64-linux-gnu)
+      racc (~> 1.4)
+```
+
+For such a gem the patch registry serves a patched platform gem (a "prebuild") per platform: the
+upstream platform gem with the patch's files replaced, under the same file name. When the patch
+has a prebuild for every platform the lock names, the scan wires the gem like any other. The
+Gemfile edit is the same, every platform entry moves to the patch registry's `GEM` section with
+its dependency lines (and a plain `nokogiri (1.18.10)` entry beside them moves too),
+`DEPENDENCIES` gains the `!`, and each `CHECKSUMS` entry takes the sha256 of its own prebuild.
+`bundle install` then fetches the one patched platform gem of the machine it runs on and
+compiles nothing, in frozen and deployment mode too.
+
+When the patch has no prebuild for one of the locked platforms, the gem is skipped with
+`redirect_gem_platform_unsupported` and neither file changes: a machine of that platform would
+otherwise be sent to a registry that has no gem for it. Remove the platform from the lock if the
+project does not need it (`bundle lock --remove-platform <platform>`) and re-run, or wait for the
+prebuild.
 
 **Undoing it.** `rollback` and `remove` take the option (or the added line) off again and
 restore the lock: the pair is the pre-scan pair byte for byte, with LF or CRLF line endings.
@@ -2334,7 +2396,7 @@ How each mode gets the patched code running:
 
 | Mode | What happens |
 |---|---|
-| Hosted | Bundler installs the patched `.gem` from the patch registry, and RubyGems compiles it like any registry gem. A precompiled platform gem (`x86_64-linux`) is refused with `redirect_gem_platform_unsupported`. |
+| Hosted | Bundler installs the patched `.gem` from the patch registry, and RubyGems compiles it like any registry gem. A gem the lock pins as precompiled platform gems (`x86_64-linux-gnu`) is installed from the patched platform gem the registry serves for that platform, with nothing to compile; it is skipped with `redirect_gem_platform_unsupported` only while the patch has no patched build for one of the locked platforms. |
 | Vendored | Refused with `native_extensions_unsupported`: Bundler builds no extensions for path-sourced gems. Use hosted or agent mode for the gem. |
 | Agent (`apply`) | The extension is rebuilt from the gem's source archive with the patch laid over it, using RubyGems' builder and the Ruby that owns the install, and the build is put where Ruby loads it: the extension directory of a gem RubyGems built, the prebuilt binary of a precompiled gem. |
 
