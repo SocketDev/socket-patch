@@ -1202,9 +1202,14 @@ pub fn rewrite(
         // What the Bazel build has of the jar: nothing of socket-patch's,
         // the entry of this patch from an earlier run, which is still its
         // pin, or the entry of another patch, which is not this run's to
-        // take out.
+        // take out. An entry that the reason of the decline leaves without
+        // effect is no pin: the patch is not reported as applied for it.
         let ends = match verdict.held.as_deref() {
             None => KEEPS.to_string(),
+            Some(held) if held == dep.patch_uuid && code == NO_EFFECT => format!(
+                "socket-patch left the entry that {file} holds for it as it is, and while that \
+                 stands the entry has no effect: the Bazel build keeps the upstream jar"
+            ),
             Some(held) if held == dep.patch_uuid => {
                 let uuid = dep.patch_uuid.clone();
                 result.confirmed_bazel_maven_uuids.insert(uuid);
@@ -3244,6 +3249,22 @@ override_repo(
                 (result.files.len(), confirmed(&result)),
                 (0, pinned.to_vec())
             );
+        }
+        // An entry that the reason of the decline leaves without effect (an
+        // rc file that switches the block off, an override of the jar) is
+        // not this patch's pin: the build takes the upstream jar, and the
+        // patch is not confirmed for it.
+        for (module, file) in [(Some(&*ours), "MODULE.bazel"), (None, root)] {
+            let files = candidates(module, Err((NO_EFFECT, "why")), Some(NETTY_UUID));
+            let result = ran(&files, &[granted()]);
+            let detail = format!(
+                "{NETTY_PURL}: why. socket-patch left the entry that {file} holds for it as it \
+                 is, and while that stands the entry has no effect: the Bazel build keeps the \
+                 upstream jar"
+            );
+            let code = NO_EFFECT.into();
+            assert_eq!(result.warnings, [RewriteWarning { code, detail }]);
+            assert_eq!((result.files.len(), confirmed(&result)), (0, vec![]));
         }
         // And so does a patch that lacks what an entry holds.
         let mut dep = granted();

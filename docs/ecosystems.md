@@ -1499,7 +1499,11 @@ project below the root, whose warning names the file as "the MODULE.bazel at the
 - nothing: "socket-patch wrote nothing to MODULE.bazel for it, so the Bazel build keeps the
   upstream jar";
 - the entry of this patch, from an earlier run: that entry stays, the patch is `applied`, and
-  the warning ends "socket-patch left the entry that MODULE.bazel holds for it as it is";
+  the warning ends "socket-patch left the entry that MODULE.bazel holds for it as it is". When
+  the reason is one that leaves an entry without effect (`maven_bazel_no_effect`: an rc file
+  that switches the block off, a `maven.override` of the jar), the patch is not `applied`, and
+  the warning goes on "and while that stands the entry has no effect: the Bazel build keeps
+  the upstream jar";
 - the entry of another patch of the same jar: it is not this run's to take out, and the
   warning ends "socket-patch wrote nothing to MODULE.bazel for it: the entry of patch <id>
   remains there, and where the block is in effect the Bazel build takes that patch's jar".
