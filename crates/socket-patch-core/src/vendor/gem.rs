@@ -832,10 +832,10 @@ async fn stub_gemspec_valid(tree: &Path, name: &str) -> bool {
 }
 
 /// The file inventory the vendor ledger records for the copy at
-/// `copy_rel` of the patch `uuid`: what says which files a prebuild tree
-/// was vendored with (see [`verify_platform_tree`]). `None` when the ledger
-/// has no entry for that copy, records no inventory for it, or cannot be
-/// read.
+/// `copy_rel` of the patch `uuid`: what vouches for the bytes of its
+/// prebuild trees once they are vendored (see [`verify_platform_tree`]).
+/// `None` when the ledger has no entry for that copy, records no inventory
+/// for it, or cannot be read.
 ///
 /// [`verify_platform_tree`]: super::verify::verify_platform_tree
 async fn recorded_inventory(
@@ -854,9 +854,10 @@ async fn recorded_inventory(
 }
 
 /// The in-sync test of a copy vendored as platform gems: the tree of every
-/// locked platform is there, carries the patch
-/// ([`super::verify::verify_platform_tree`], against the ledger's
-/// `inventory` of the copy when it has one) and has a valid stub gemspec.
+/// locked platform is there, passes
+/// [`super::verify::verify_platform_tree`] (every file of it is the one
+/// the ledger's `inventory` of the copy records; without an inventory it
+/// must hold a patched file) and has a valid stub gemspec.
 async fn platform_copy_intact(
     copy_dir: &Path,
     name: &str,
@@ -866,7 +867,8 @@ async fn platform_copy_intact(
 ) -> bool {
     for platform in platforms {
         let tree = copy_dir.join(platform);
-        if super::verify::verify_platform_tree(&tree, files, inventory)
+        let voucher = super::verify::TreeVoucher::Ledger(inventory);
+        if super::verify::verify_platform_tree(&tree, files, voucher)
             .await
             .is_err()
             || !stub_gemspec_valid(&tree, name).await
@@ -1708,13 +1710,18 @@ async fn stage_platform_prebuilds(
                 format!("cannot write the stub gemspec for {subject} into the vendored dir: {e}"),
             ));
         }
-        if let Err(reason) = super::verify::verify_platform_tree(&tree, &record.files, None).await {
-            let why = match reason.as_str() {
-                "vendor_hash_mismatch" => "a patched file it ships is not the patched one",
-                _ => "it ships none of the patched files, so nothing shows it carries the patch",
-            };
+        // `gem` passed the service's digest for this platform above
+        // (`platform_artifact`), which is what vouches for a tree that
+        // ships none of the patched files: only one it does ship can
+        // contradict the patch.
+        let verified = super::verify::TreeVoucher::VerifiedDownload;
+        if super::verify::verify_platform_tree(&tree, &record.files, verified)
+            .await
+            .is_err()
+        {
             return Err(policy.miss(format!(
-                "prebuilt platform gem for {subject} does not carry the patch ({why})"
+                "prebuilt platform gem for {subject} does not carry the patch (a patched \
+                 file it ships is not the patched one)"
             )));
         }
     }
@@ -1804,7 +1811,10 @@ async fn empty_shipped_gitignores(
 
 /// One per-platform artifact of `kind` (`what`, for messages about
 /// `subject`), downloaded and verified against its served integrity like
-/// the ruby gem's stub: a mismatch is never vendored.
+/// the ruby gem's stub: a mismatch is never vendored. The check is not
+/// optional: an artifact the service states no digest for is not listed
+/// at all, and for a prebuild that ships none of the patched files it is
+/// the only evidence that the tree is the patched build.
 async fn platform_artifact(
     cfg: &VendorServiceConfig,
     served: &ServedArtifacts,
@@ -12206,9 +12216,9 @@ mod tests {
         /// compiled extension) vendors: the prebuild carries the patched
         /// files it does ship. One rule then judges a tree wherever it is
         /// judged (the download, a re-run's in-sync test, the check): a
-        /// patched file it holds is the patched one; one it lacks is
-        /// accepted unless the ledger's inventory says it was vendored; and
-        /// a tree holding none of them never passes.
+        /// patched file it holds is the patched one, and one it lacks is no
+        /// mismatch; the ledger's inventory vouches for every byte of the
+        /// tree; and with no inventory the tree must hold a patched file.
         #[tokio::test]
         async fn a_patch_of_unshipped_sources_vendors_and_verifies_by_inventory() {
             const EXTRA: &str = "lib/nokogiri/extra.rb";
@@ -12257,15 +12267,17 @@ mod tests {
                 check_vendored_artifact(&root, &bare, &record).await,
                 ArtifactHealth::Healthy
             );
-            // A tree holding none of the patched files shows nothing of the
-            // patch, inventory or not.
+            // A tree holding none of the patched files is vouched for by
+            // the inventory; with none, nothing vouches for it.
             let unshipped = record_of(&record, &[C]);
-            for entry in [&entry, &bare] {
-                assert_eq!(
-                    check_vendored_artifact(&root, entry, &unshipped).await,
-                    corrupt("file_not_found")
-                );
-            }
+            assert_eq!(
+                check_vendored_artifact(&root, &entry, &unshipped).await,
+                ArtifactHealth::Healthy
+            );
+            assert_eq!(
+                check_vendored_artifact(&root, &bare, &unshipped).await,
+                corrupt("file_not_found")
+            );
 
             // A patched file the inventory lists and the tree no longer
             // holds was vendored and then lost. The check says so, and the
@@ -12273,7 +12285,7 @@ mod tests {
             tokio::fs::remove_file(tree.join(EXTRA)).await.unwrap();
             assert_eq!(
                 check_vendored_artifact(&root, &entry, &record).await,
-                corrupt("file_not_found")
+                corrupt("vendor_inventory_mismatch")
             );
             let (result, rebuilt, warnings) =
                 unwrap_done(vendor(&root, &not_installed(&root), &record, &cfg, false).await);
@@ -12319,25 +12331,77 @@ mod tests {
             );
         }
 
-        /// A prebuild that ships none of the patch's files shows nothing of
-        /// the patch: it is not vendored, dry run or not.
+        /// The usual nokogiri patch touches only files no precompiled gem
+        /// ships (`patches/…`, `dependencies.yml`): it lives entirely in the
+        /// binaries the prebuild was rebuilt with. Such a prebuild vendors,
+        /// on the strength of its download's integrity check, and is then
+        /// vouched for by the ledger's inventory: the in-sync test of a
+        /// re-run and the check both pass, and both catch a tampered binary.
         #[tokio::test]
-        async fn a_prebuild_holding_none_of_the_patched_files_is_refused() {
+        async fn a_prebuild_holding_none_of_the_patched_files_vendors_and_verifies_by_inventory() {
             let (_tmp, root, _) = project(&lock(None)).await;
             let record = record(UUID, &[(C, &b"pristine C\n"[..], &b"patched C\n"[..])]);
+            let (server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
             let before = ts::tree_snapshot(&root);
-            let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
-            for dry_run in [true, false] {
-                let (code, detail) = unwrap_refused(
-                    vendor(&root, &not_installed(&root), &record, &cfg, dry_run).await,
-                );
-                assert_eq!(code, "vendor_prebuilt_required", "{detail}");
-                assert!(
-                    detail.contains("ships none of the patched files"),
-                    "{detail}"
-                );
-                assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
-            }
+            let (preview, ..) =
+                unwrap_done(vendor(&root, &not_installed(&root), &record, &cfg, true).await);
+            assert!(preview.success, "{:?}", preview.error);
+            assert_eq!(ts::tree_snapshot(&root), before, "a dry run writes nothing");
+
+            let entry = vendor_and_persist(&root, &record, &cfg).await;
+            let tree = root.join(rel(UUID)).join(LINUX);
+            assert!(!tree.join(C).exists(), "the prebuild ships no patched file");
+            let inventory = entry.artifact.file_inventory.as_ref().expect("inventory");
+            assert!(inventory.contains_key(&format!("{LINUX}/{SO}")));
+            assert_eq!(
+                check_vendored_artifact(&root, &entry, &record).await,
+                ArtifactHealth::Healthy
+            );
+            // A second run is in sync and asks the service nothing.
+            let requests = ts::request_count(&server).await;
+            let (again, rerun_entry, warnings) =
+                unwrap_done(vendor(&root, &not_installed(&root), &record, &cfg, false).await);
+            assert!(again.success, "{:?}", again.error);
+            assert!(rerun_entry.is_none() && warnings.is_empty(), "{warnings:?}");
+            assert_eq!(ts::request_count(&server).await, requests);
+
+            // Without the inventory nothing vouches for such a tree.
+            let mut bare = entry.clone();
+            bare.artifact.file_inventory = None;
+            assert_eq!(
+                check_vendored_artifact(&root, &bare, &record).await,
+                ArtifactHealth::Corrupt {
+                    reason: "file_not_found".to_string()
+                }
+            );
+
+            // A tampered binary: the check reports it, and the next run
+            // rebuilds the copy instead of calling it in sync.
+            tokio::fs::write(tree.join(SO), b"another binary")
+                .await
+                .unwrap();
+            assert_eq!(
+                check_vendored_artifact(&root, &entry, &record).await,
+                ArtifactHealth::Corrupt {
+                    reason: "vendor_inventory_mismatch".to_string()
+                }
+            );
+            let (result, rebuilt, warnings) =
+                unwrap_done(vendor(&root, &not_installed(&root), &record, &cfg, false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert!(
+                warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+                "{warnings:?}"
+            );
+            assert!(rebuilt.is_some(), "a refreshed entry");
+            assert_eq!(
+                tokio::fs::read(tree.join(SO)).await.unwrap(),
+                LINUX.as_bytes()
+            );
+            assert_eq!(
+                check_vendored_artifact(&root, &entry, &record).await,
+                ArtifactHealth::Healthy
+            );
         }
 
         /// `record` with only `files`.

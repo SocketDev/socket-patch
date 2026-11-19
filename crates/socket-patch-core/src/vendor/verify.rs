@@ -139,9 +139,9 @@ pub async fn verify_vendored_patch_record(
             // the tree of whichever platform it runs on, so every one of
             // them must carry the patch.
             Some(trees) => {
-                let inventory = entry.artifact.file_inventory.as_ref();
+                let voucher = TreeVoucher::Ledger(entry.artifact.file_inventory.as_ref());
                 for tree in &trees {
-                    verify_platform_tree(tree, &record.files, inventory).await?;
+                    verify_platform_tree(tree, &record.files, voucher).await?;
                 }
             }
             None => verify_dir_members(&artifact, record, cargo_uuid).await?,
@@ -295,30 +295,45 @@ async fn gem_platform_trees(
     Ok((!trees.is_empty()).then_some(trees))
 }
 
+/// What vouches for the bytes of a prebuild tree beyond the patched files
+/// it holds (see [`verify_platform_tree`]).
+#[derive(Clone, Copy)]
+pub(crate) enum TreeVoucher<'a> {
+    /// The tree was just unpacked from a prebuild archive whose bytes
+    /// passed the integrity digest the patch service states for that
+    /// platform. No unverified archive is ever unpacked.
+    VerifiedDownload,
+    /// The ledger's file inventory of the vendored copy (keyed
+    /// `<platform>/<path>`), taken when the copy was vendored; `None` for
+    /// an entry that records none.
+    Ledger(Option<&'a BTreeMap<String, String>>),
+}
+
 /// The rule one prebuild tree of a gem vendored as precompiled platform
-/// gems must meet to count as carrying the patch (`tree` is
-/// `<artifact>/<platform>/`, `files` the patch record's). One rule for
-/// every place that judges such a tree: the download gate, the in-sync
-/// test of a re-run, and `vendor --check` / `vex` / `repair`.
+/// gems must meet (`tree` is `<artifact>/<platform>/`, `files` the patch
+/// record's). One rule for every place that judges such a tree: the
+/// download gate, the in-sync test of a re-run, and `vendor --check` /
+/// `vex` / `repair`.
 ///
-/// * Every patched file the tree holds hashes to its `afterHash`.
-/// * A patched file the tree does NOT hold is accepted when the platform
-///   gem never shipped it: such a gem ships the compiled extension and
-///   often not the sources it was built from, so a patch of those sources
-///   reaches the tree only through its binary, which the patch service
-///   built and whose bytes the download's integrity check and the ledger's
-///   file inventory cover. `inventory` (the ledger's, keyed
-///   `<platform>/<path>`) is what says "never shipped": a file it lists and
-///   the tree no longer holds was vendored and then lost, a mismatch.
-///   Without an inventory nothing says which, and absence is accepted.
-/// * The tree holds at least one patched file. A tree with none shows
-///   nothing of the patch, so it never passes.
+/// * A patched file the tree holds hashes to its `afterHash`.
+/// * A patched file the tree does NOT hold is no mismatch, even when it
+///   holds none of them. A platform gem ships the compiled extension and
+///   often not what it was built from: the usual nokogiri patch adds a
+///   file under `patches/` or edits `dependencies.yml`, which no
+///   precompiled gem ships, so the patch lives entirely in the binaries
+///   the patch service rebuilt. What stands for those bytes is `voucher`:
+///   the integrity check of the download while the tree is staged, and
+///   afterwards the ledger's inventory, which every file of the tree must
+///   match (a file it lists that is gone or changed is a mismatch, and so
+///   is one it does not list).
+/// * With neither — an entry with no inventory — the tree must hold at
+///   least one patched file: otherwise nothing vouches for it.
 ///
 /// The error is a stable routing tag (see the module docs).
 pub(crate) async fn verify_platform_tree(
     tree: &Path,
     files: &HashMap<String, PatchFileInfo>,
-    inventory: Option<&BTreeMap<String, String>>,
+    voucher: TreeVoucher<'_>,
 ) -> Result<(), String> {
     if !tokio::fs::symlink_metadata(tree)
         .await
@@ -326,7 +341,6 @@ pub(crate) async fn verify_platform_tree(
     {
         return Err("file_not_found".to_string());
     }
-    let platform = tree.file_name().and_then(|name| name.to_str());
     let mut holds_patched_file = false;
     for (file_name, info) in files {
         let normalized = normalize_file_path(file_name);
@@ -337,23 +351,48 @@ pub(crate) async fn verify_platform_tree(
         match compute_file_git_sha256(&tree.join(normalized)).await {
             Ok(hash) if hash == info.after_hash => holds_patched_file = true,
             Ok(_) => return Err("vendor_hash_mismatch".to_string()),
-            Err(e) if is_missing_path(&e) => {
-                let vendored = inventory
-                    .zip(platform)
-                    .is_some_and(|(inventory, platform)| {
-                        inventory.contains_key(&format!("{platform}/{normalized}"))
-                    });
-                if vendored {
-                    return Err("file_not_found".to_string());
-                }
-            }
+            Err(e) if is_missing_path(&e) => {}
             Err(_) => return Err("file_not_found".to_string()),
         }
     }
-    match holds_patched_file {
-        true => Ok(()),
-        false => Err("file_not_found".to_string()),
+    match voucher {
+        TreeVoucher::VerifiedDownload => Ok(()),
+        TreeVoucher::Ledger(Some(inventory)) => verify_tree_inventory(tree, inventory).await,
+        TreeVoucher::Ledger(None) if holds_patched_file => Ok(()),
+        TreeVoucher::Ledger(None) => Err("file_not_found".to_string()),
     }
+}
+
+/// [`verify_dir_inventory`] for one prebuild tree: the files under `tree`
+/// are exactly the ones the copy's `inventory` lists below
+/// `<platform>/`, with the recorded bytes.
+async fn verify_tree_inventory(
+    tree: &Path,
+    inventory: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let mismatch = || "vendor_inventory_mismatch".to_string();
+    let platform = tree
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(mismatch)?;
+    let prefix = format!("{platform}/");
+    let recorded: BTreeMap<&str, &str> = inventory
+        .iter()
+        .filter_map(|(file, hash)| Some((file.strip_prefix(&prefix)?, hash.as_str())))
+        .collect();
+    let actual = compute_dir_inventory(tree)
+        .await
+        .map_err(|_| "vendor_artifact_unreadable".to_string())?;
+    if actual.len() != recorded.len() {
+        return Err(mismatch());
+    }
+    for (file, hash) in recorded {
+        match actual.get(file) {
+            Some(live) if live.eq_ignore_ascii_case(hash) => {}
+            _ => return Err(mismatch()),
+        }
+    }
+    Ok(())
 }
 
 /// A vlt package-dir entry: npm, flavor `vlt`, not a tarball. The vendored
