@@ -48,6 +48,7 @@ mod fs_tree;
 mod hosted_memory_common;
 
 mod cargo;
+mod composer;
 mod go;
 mod harness;
 mod npm;

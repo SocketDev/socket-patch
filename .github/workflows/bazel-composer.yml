@@ -1,0 +1,140 @@
+name: Bazel patch compatibility (Composer)
+
+# The Composer flows of the real-Bazel tests (`composer::` in
+# `e2e_bazel_build`), on each Bazel release below: hosted mode where a
+# repository rule runs `composer install` from the committed lock, hosted
+# mode where a genrule does, and agent mode on a committed `vendor/` tree.
+# No Bazel ruleset builds PHP or takes Composer packages, so the three
+# shapes are the fixture's own, as a PHP project under Bazel writes them by
+# hand. bazel-compatibility.yml holds the legs and what every ecosystem
+# shares; this file says when the Composer legs run and on which releases.
+#
+# With no ruleset there is nothing for Bazel to bring: a leg downloads no
+# ruleset archive and no toolchain, and its repository cache holds what
+# Bazel resolves for its own modules (about 1 MB on Bazel 9, 13 MB on
+# Bazel 8 and under 1 MB on Bazel 7). PHP and Composer are the runner's
+# own, the `php` and `composer` on PATH, which the fixture's rule and
+# genrule look up as a project's would. Nothing here installs or pins
+# them. The legs run on the runner that bazel-compatibility.yml names:
+# `depot-ubuntu-24.04-4`, or `ubuntu-latest` when the repository variable
+# DISABLE_DEPOT_RUNNERS is `true`. What that runner's image holds was not
+# confirmed when this file was written. GitHub's description of its own
+# ubuntu-24.04 image (version 20261111.370.1) lists PHP 8.3.6 and Composer
+# 2.11.2, and the flows were run on PHP 8.4.23 and Composer 2.11.2, on
+# macOS. A test prints the two releases it found at its start, so the
+# first run of a leg shows what its runner has, and it fails the leg when
+# one is missing or older than the oldest the flows take (PHP 7.2.5,
+# Composer 2.0.0). A package under test never comes from a cache:
+# each run builds the upstream archive and the patched one with an id of
+# the run, under a URL of the run, and Composer starts with a home and an
+# empty cache of the test's own, which know no registry but the stand-in.
+#
+# No macOS leg: GitHub's description of the macOS image lists neither PHP
+# nor Composer (macos-26-arm64, version 20261102.0473.1), and the legs
+# take no setup step from a caller.
+#
+# Not required for merge: no `merge_group` trigger, and no job here is a
+# `needs` of ci.yml's `ci-ok`.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    # What a pull request run covers: the Composer flows and their fixture,
+    # the harness and the workflows that run it, the Bazel installer and its
+    # pins, and the Composer files of the product, by the two patterns that
+    # composer-compatibility.yml also uses: every source file and directory
+    # with `composer` in its name. The flows run through most of them: the
+    # lock's model and its hosted rewrite (formats/composer), the crawler
+    # that finds an installed package, the lock inventory, the discovery of
+    # a hosted pin for `vex`, the upstream restore of `rollback`, and the
+    # hints a command prints. The vendored backend (vendor/composer_lock)
+    # matches the patterns too, and no flow runs vendored mode. One more
+    # file is here: patch/user_patches.rs, the inspection of a project's own
+    # patches, whose Composer part every scan of a Composer project runs.
+    # That file also holds the npm, Cargo and Go parts, so a change to
+    # those starts the Composer legs too.
+    #
+    # What it does not cover: shared engine code (patch/redirect/mod.rs,
+    # hosted/, the apply and rollback engines of agent mode, vex/,
+    # commands/), the shared test helpers and the toolchain files. A change
+    # there gets its run on the push to main (when the file is in the list
+    # below) or in the nightly run, not on the pull request: that is the
+    # price of not running every ecosystem's legs on every shared change. On
+    # demand, workflow_dispatch runs the legs on any branch.
+    paths:
+      - '.github/workflows/bazel-composer.yml'
+      - '.github/workflows/bazel-compatibility.yml'
+      - 'scripts/install-bazel.sh'
+      - 'scripts/bazel-pins.txt'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/composer.rs'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/harness.rs'
+      - 'crates/socket-patch-cli/tests/fixtures/bazel/composer/**'
+      - 'crates/*/src/**/*composer*'
+      - 'crates/*/src/**/*composer*/**'
+      - 'crates/socket-patch-core/src/patch/user_patches.rs'
+  push:
+    branches: [main]
+    # The pull request paths, and what only a push to main covers: the
+    # root of the test target (it changes when an ecosystem's module is
+    # added; ci.yml builds the target and runs its hermetic tests on every
+    # pull request), the shared engine code and test helpers the flows run
+    # through, and the toolchain files. A main push outside this list waits
+    # for the nightly run below.
+    paths:
+      - '.github/workflows/bazel-composer.yml'
+      - '.github/workflows/bazel-compatibility.yml'
+      - 'scripts/install-bazel.sh'
+      - 'scripts/bazel-pins.txt'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/composer.rs'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/harness.rs'
+      - 'crates/socket-patch-cli/tests/fixtures/bazel/composer/**'
+      - 'crates/*/src/**/*composer*'
+      - 'crates/*/src/**/*composer*/**'
+      - 'crates/socket-patch-core/src/patch/user_patches.rs'
+      - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/**'
+      - 'crates/socket-patch-core/src/patch/apply.rs'
+      - 'crates/socket-patch-core/src/patch/rollback.rs'
+      - 'crates/socket-patch-core/src/manifest/**'
+      - 'crates/socket-patch-core/src/hosted/**'
+      - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-cli/src/commands/**'
+      - 'crates/socket-patch-cli/tests/common/**'
+      - 'crates/socket-patch-cli/tests/hosted_memory_common/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+  schedule:
+    # Nightly, so a main change outside the push list still gets a run
+    # within a day.
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The nightly run has a group of its own. A group holds one pending run, so
+# in the group of main's pushes a second push would replace a nightly that
+# waits behind the first.
+concurrency:
+  group: bazel-composer-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  composer:
+    uses: ./.github/workflows/bazel-compatibility.yml
+    with:
+      eco: composer
+      fixtures: composer/bzlmod
+      # One leg per line: a Bazel release, and the era of the fixture that
+      # `composer::FIXTURE` gives it.
+      releases: >-
+        [
+          {"bazel": "9.3.2", "era": "e9"},
+          {"bazel": "8.8.2", "era": "e9"},
+          {"bazel": "7.7.2", "era": "e9"}
+        ]
+      # No macOS leg: see the top of the file.
+      macos: '[]'

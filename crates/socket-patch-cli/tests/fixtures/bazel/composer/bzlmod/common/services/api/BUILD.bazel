@@ -1,0 +1,18 @@
+# The packages of this project are the repository @php_vendor, which
+# MODULE.bazel declares: `composer install` from composer.lock, in the
+# repository rule of //:composer.bzl.
+
+# PHP runs main.php when Bazel builds this, on the vendor tree Bazel has;
+# `bazel run` prints what it said.
+genrule(
+    name = "consumer",
+    srcs = [
+        "main.php",
+        "@php_vendor//:vendor",
+        "@php_vendor//:vendor/autoload.php",
+    ],
+    outs = ["consumer.sh"],
+    cmd = "{ echo '#!/bin/sh'; echo \"cat <<'EOF'\"; php -n $(location main.php) $(location @php_vendor//:vendor/autoload.php); echo EOF; } > $@",
+    executable = True,
+    visibility = ["//visibility:public"],
+)
