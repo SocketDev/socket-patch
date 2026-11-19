@@ -46,6 +46,87 @@ pub struct PatchResponse {
     pub description: String,
     pub license: String,
     pub tier: String,
+    /// What Socket measured about the patch, when it has been measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statistics: Option<PatchStatistics>,
+}
+
+/// `count` of `total`: tests that passed, exploits that reproduced or
+/// were blocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchRatio {
+    pub count: u64,
+    pub total: u64,
+}
+
+impl PatchRatio {
+    /// Every one of them: all the tests passed, every exploit was blocked.
+    pub fn is_all(&self) -> bool {
+        self.total > 0 && self.count == self.total
+    }
+}
+
+/// How large a patch is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchDiffSize {
+    pub lines_added: u64,
+    pub lines_removed: u64,
+    pub files_changed: u64,
+}
+
+/// The package's own test suites, run on the unpatched release (`before`,
+/// absent when a suite has no such run) and on the patched one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchTestRuns {
+    #[serde(default)]
+    pub before: Option<PatchRatio>,
+    pub after: PatchRatio,
+}
+
+/// The proof-of-concept exploits of the advisories a patch fixes: how many
+/// reproduced on the unpatched release (absent when one has no such run),
+/// and how many the patch blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchExploitRuns {
+    #[serde(default)]
+    pub reproduced_before: Option<PatchRatio>,
+    pub blocked_after: PatchRatio,
+}
+
+/// What a patch costs at run time, each a relative change against the
+/// unpatched release (`0.05` is 5% more): wall time of the package's
+/// general workload and of the code the patch touches, and peak memory.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PatchPerformance {
+    pub general_wall_change: Option<f64>,
+    pub hot_wall_change: Option<f64>,
+    pub peak_mem_change: Option<f64>,
+}
+
+/// What Socket measured about one patch: the view endpoint's `statistics`.
+/// Every part is optional, since a patch is measured in stages (and an
+/// older patch may never have been).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PatchStatistics {
+    pub diff: Option<PatchDiffSize>,
+    pub functions_changed: Option<u64>,
+    pub tests: Option<PatchTestRuns>,
+    pub pocs: Option<PatchExploitRuns>,
+    pub performance: Option<PatchPerformance>,
+}
+
+/// The one field [`ApiClient::fetch_patch_statistics`] reads of a patch
+/// view.
+///
+/// [`ApiClient::fetch_patch_statistics`]: crate::api::client::ApiClient::fetch_patch_statistics
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct PatchStatisticsView {
+    #[serde(default)]
+    pub statistics: Option<PatchStatistics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
