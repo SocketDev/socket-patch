@@ -32,10 +32,23 @@
 //!
 //! The sizes an archive declares for its entries are the author's claim, so
 //! the byte limits are on what is actually inflated. The entry count and
-//! the central directory's size are read from the archive's end records
+//! the central directory's size are read from the archive's end record
 //! before the zip reader parses the directory, since the reader allocates
-//! for whatever those records declare: a directory of millions of tiny
+//! for whatever that record declares: a directory of millions of tiny
 //! records is refused unread.
+//!
+//! The reader does not take the end record from a fixed place. It looks
+//! for one backwards from the end of the file, however much follows it,
+//! finds a zip64 record forwards from where the locator points, and falls
+//! back to an earlier end record when a directory does not parse. So
+//! [`admit`] walks the same way: it finds the last end record the reader
+//! can take, holds it to the limits, and hides everything below that
+//! record's directory from the reader while the archive is opened
+//! ([`Veiled`]). What the reader can then fall back to lies in the
+//! directory itself, and each such record is held to the limits too. An
+//! end record inside a member's data, as a jar stored inside a fat jar
+//! has, is below the directory: the reader cannot take it, and it is not
+//! looked at.
 //!
 //! * [`MAX_ENTRIES`]: 200,000 entries. Eight times the largest jar measured
 //!   above; the jars a 128 MiB download can carry stay well under it.
@@ -55,6 +68,8 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
@@ -106,7 +121,7 @@ fn inflate_budget(archive_len: u64) -> u64 {
 /// One pass over a jar: the open archive and what is left of its inflate
 /// budget.
 pub(crate) struct Jar<R> {
-    zip: zip::ZipArchive<R>,
+    zip: zip::ZipArchive<Veiled<R>>,
     archive_len: u64,
     budget: u64,
     left: u64,
@@ -124,9 +139,15 @@ impl<'a> Jar<std::io::Cursor<&'a [u8]>> {
 impl<R: Read + Seek> Jar<R> {
     /// A pass over the archive `reader` holds, `archive_len` bytes long.
     pub(crate) fn open(mut reader: R, archive_len: u64) -> Result<Self, JarError> {
-        check_declared_directory(&mut reader, archive_len)?;
-        let zip = zip::ZipArchive::new(reader)
+        let floor = Arc::new(AtomicU64::new(admit(&mut reader, archive_len)?));
+        let veiled = Veiled {
+            inner: reader,
+            floor: Arc::clone(&floor),
+        };
+        let zip = zip::ZipArchive::new(veiled)
             .map_err(|e| JarError::Unreadable(format!("not a readable zip archive ({e})")))?;
+        // The directory is parsed: the members are read from the real bytes.
+        floor.store(0, Ordering::Relaxed);
         if zip.len() > MAX_ENTRIES {
             return Err(JarError::TooLarge(format!(
                 "it holds {} entries, over the limit of {MAX_ENTRIES}",
@@ -477,30 +498,132 @@ impl Md5 {
     }
 }
 
-/// Hold what an archive's end records declare of its central directory to
-/// [`MAX_ENTRIES`] and [`MAX_CENTRAL_DIRECTORY_BYTES`], before the zip reader
-/// parses (and allocates for) it. The reader may settle on any record that
-/// looks like the end of the directory, so every `PK\x05\x06` in the last
-/// 64 KiB is checked, with the zip64 record its locator points at and any
-/// zip64 record in that tail.
-fn check_declared_directory<R: Read + Seek>(reader: &mut R, len: u64) -> Result<(), JarError> {
-    const END: &[u8] = b"PK\x05\x06";
-    const END64: &[u8] = b"PK\x06\x06";
-    const LOCATOR: &[u8] = b"PK\x06\x07";
-    let unread = |e: std::io::Error| JarError::Unreadable(format!("its end cannot be read ({e})"));
-    let le = |bytes: &[u8]| {
-        bytes
-            .iter()
-            .rev()
-            .fold(0u64, |n, b| (n << 8) | u64::from(*b))
-    };
-    let within = |entries: u64, directory: u64| {
-        // A record declaring more than the archive can hold (a central
-        // record is 46 bytes at least) is not its end record: bytes that
-        // happen to spell the signature, which the reader passes over too.
-        if directory > len || entries > len / 46 {
-            return Ok(());
+/// A reader that shows zeros below `floor`, for as long as `floor` is set:
+/// what the zip reader is given while it opens an archive, so that it
+/// cannot take an end record [`admit`] did not look at.
+pub(crate) struct Veiled<R> {
+    inner: R,
+    floor: Arc<AtomicU64>,
+}
+
+impl<R: Read + Seek> Read for Veiled<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let floor = self.floor.load(Ordering::Relaxed);
+        if floor == 0 {
+            return self.inner.read(buf);
         }
+        let at = self.inner.stream_position()?;
+        if at >= floor {
+            return self.inner.read(buf);
+        }
+        let hidden = (floor - at).min(buf.len() as u64) as usize;
+        buf[..hidden].fill(0);
+        self.inner.seek(SeekFrom::Current(hidden as i64))?;
+        Ok(hidden)
+    }
+}
+
+impl<R: Seek> Seek for Veiled<R> {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+/// End records [`admit`] passes over before it gives the archive up.
+const MAX_RECORDS_PASSED_OVER: usize = 64;
+
+const END: &[u8; 4] = b"PK\x05\x06";
+const END64: &[u8; 4] = b"PK\x06\x06";
+const LOCATOR: &[u8; 4] = b"PK\x06\x07";
+const CENTRAL: &[u8; 4] = b"PK\x01\x02";
+
+fn le(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .rev()
+        .fold(0u64, |n, b| (n << 8) | u64::from(*b))
+}
+
+/// `bytes` at `at`, when the archive holds them.
+fn read_at<R: Read + Seek, const N: usize>(
+    reader: &mut R,
+    at: u64,
+    len: u64,
+) -> std::io::Result<Option<[u8; N]>> {
+    if at.checked_add(N as u64).is_none_or(|end| end > len) {
+        return Ok(None);
+    }
+    let mut bytes = [0u8; N];
+    reader.seek(SeekFrom::Start(at))?;
+    reader.read_exact(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+/// The offsets of `magic` in `[from, to)`, a window at a time: the last
+/// first when `backwards`. `visit` returns `true` to stop.
+fn scan<R: Read + Seek>(
+    reader: &mut R,
+    magic: &[u8; 4],
+    (from, to): (u64, u64),
+    backwards: bool,
+    mut visit: impl FnMut(&mut R, u64) -> Result<bool, JarError>,
+) -> Result<(), JarError> {
+    const WINDOW: u64 = 64 * 1024;
+    let unread = |e: std::io::Error| JarError::Unreadable(format!("it cannot be read ({e})"));
+    let (mut low, mut high) = (from, to);
+    while high.saturating_sub(low) >= 4 {
+        // Windows overlap by three bytes, so a magic across an edge is seen.
+        let (start, end) = match backwards {
+            true => (high.saturating_sub(WINDOW).max(low), high),
+            false => (low, low.saturating_add(WINDOW).min(high)),
+        };
+        let mut window = vec![0u8; (end - start) as usize];
+        reader.seek(SeekFrom::Start(start)).map_err(unread)?;
+        reader.read_exact(&mut window).map_err(unread)?;
+        let mut hits: Vec<u64> = window
+            .windows(4)
+            .enumerate()
+            .filter(|(_, bytes)| bytes == magic)
+            .map(|(i, _)| start + i as u64)
+            .collect();
+        if backwards {
+            hits.reverse();
+        }
+        for hit in hits {
+            if visit(reader, hit)? {
+                return Ok(());
+            }
+        }
+        match backwards {
+            true if start == low => break,
+            true => high = start + 3,
+            false if end == high => break,
+            false => low = end - 3,
+        }
+    }
+    Ok(())
+}
+
+/// Decide, before the zip reader parses anything, which end record it can
+/// take from the archive `reader` holds, and hold what that record declares
+/// to [`MAX_ENTRIES`] and [`MAX_CENTRAL_DIRECTORY_BYTES`]. Returns the
+/// offset of that record's central directory: the reader is shown zeros
+/// below it while it opens the archive ([`Veiled`]), so the only end
+/// records it can fall back to are in the directory itself, and those are
+/// held to the limits here as well.
+///
+/// The walk is the reader's own (`zip` 8.6, `find_central_directory`): end
+/// records from the end of the file backwards, whatever follows them; a
+/// zip32 record is taken when a central header is found forwards from the
+/// offset it declares; a record that may be zip64 and has a locator before
+/// it is taken with the first zip64 record, forwards from where the locator
+/// points, that ends where the locator begins. A record the reader would
+/// pass over is passed over here, up to [`MAX_RECORDS_PASSED_OVER`] of
+/// them. An archive with no record it could take is handed over unveiled:
+/// every end record in it was looked at.
+fn admit<R: Read + Seek>(reader: &mut R, len: u64) -> Result<u64, JarError> {
+    let unread = |e: std::io::Error| JarError::Unreadable(format!("its end cannot be read ({e})"));
+    let within = |entries: u64, directory: u64| {
         if entries > MAX_ENTRIES as u64 {
             return Err(JarError::TooLarge(format!(
                 "it holds {entries} entries, over the limit of {MAX_ENTRIES}"
@@ -515,38 +638,92 @@ fn check_declared_directory<R: Read + Seek>(reader: &mut R, len: u64) -> Result<
         }
         Ok(())
     };
-    // An end record, its comment (at most 64 KiB) and a zip64 locator and
-    // record before it.
-    let tail_len = len.min(22 + 65_535 + 20 + 56);
-    reader
-        .seek(SeekFrom::Start(len - tail_len))
-        .map_err(unread)?;
-    let mut tail = vec![0u8; tail_len as usize];
-    reader.read_exact(&mut tail).map_err(unread)?;
-    for at in 0..tail.len() {
-        let rest = &tail[at..];
-        if rest.len() >= 56 && rest.starts_with(END64) {
-            within(le(&rest[32..40]), le(&rest[40..48]))?;
+    // Nothing below `floor` is looked at once a record has been taken.
+    let mut floor: Option<u64> = None;
+    let mut passed_over = 0;
+    scan(reader, END, (0, len), true, |reader, at| {
+        let bottom = floor.unwrap_or(0);
+        if at < bottom {
+            return Ok(true);
         }
-        if rest.len() < 22 || !rest.starts_with(END) {
-            continue;
+        // The record and its comment must fit the file.
+        let Some(end) = read_at::<_, 22>(reader, at, len).map_err(unread)? else {
+            return Ok(false);
+        };
+        if at + 22 + le(&end[20..22]) > len {
+            return Ok(false);
         }
-        within(le(&rest[10..12]), le(&rest[12..16]))?;
-        if at < 20 || !tail[at - 20..].starts_with(LOCATOR) {
-            continue;
+        let (on_disk, total) = (le(&end[8..10]), le(&end[10..12]));
+        let (size, offset) = (le(&end[12..16]), le(&end[16..20]));
+        let may_be_zip64 = total == 0xffff || size == 0xffff_ffff || offset == 0xffff_ffff;
+        let locator = match at.checked_sub(20) {
+            Some(before) if may_be_zip64 && before >= bottom => {
+                read_at::<_, 20>(reader, before, len)
+                    .map_err(unread)?
+                    .filter(|bytes| bytes.starts_with(LOCATOR))
+                    .map(|bytes| (before, le(&bytes[8..16])))
+            }
+            _ => None,
+        };
+        let mut directory = None;
+        match locator {
+            // zip64: the first record, forwards from where the locator
+            // points, that ends where the locator begins.
+            Some((locator_at, declared)) if declared < locator_at => {
+                let range = (declared.max(bottom), locator_at);
+                scan(reader, END64, range, false, |reader, x| {
+                    let Some(record) = read_at::<_, 56>(reader, x, len).map_err(unread)? else {
+                        return Ok(false);
+                    };
+                    if le(&record[4..12]).checked_add(12) != Some(locator_at - x) {
+                        return Ok(false);
+                    }
+                    within(le(&record[32..40]), le(&record[40..48]))?;
+                    // Prepended bytes move the directory with the record.
+                    directory = le(&record[48..56]).checked_add(x - declared);
+                    Ok(true)
+                })?;
+            }
+            Some(_) => {}
+            // An empty archive: nothing of a directory is read.
+            None if total == 0 => directory = Some(at),
+            // zip32: the first central header forwards from the offset.
+            None if offset < at => {
+                scan(
+                    reader,
+                    CENTRAL,
+                    (offset.max(bottom), at),
+                    false,
+                    |_, header| {
+                        directory = Some(header);
+                        Ok(true)
+                    },
+                )?;
+                if directory.is_some() {
+                    within(on_disk.max(total), size)?;
+                }
+            }
+            None => {}
         }
-        let offset = le(&tail[at - 12..at - 4]);
-        if offset.checked_add(56).is_some_and(|end| end <= len) {
-            let mut record = [0u8; 56];
-            reader.seek(SeekFrom::Start(offset)).map_err(unread)?;
-            reader.read_exact(&mut record).map_err(unread)?;
-            if record.starts_with(END64) {
-                within(le(&record[32..40]), le(&record[40..48]))?;
+        match directory {
+            Some(start) if floor.is_none() => floor = Some(start.min(at)),
+            Some(_) => {}
+            // Each record passed over costs a search of the file, here and
+            // in the reader: an archive strewn with them is not a jar.
+            None => {
+                passed_over += 1;
+                if passed_over > MAX_RECORDS_PASSED_OVER {
+                    return Err(JarError::Unreadable(format!(
+                        "it holds more than {MAX_RECORDS_PASSED_OVER} end records that lead to \
+                         no central directory"
+                    )));
+                }
             }
         }
-    }
+        Ok(false)
+    })?;
     reader.seek(SeekFrom::Start(0)).map_err(unread)?;
-    Ok(())
+    Ok(floor.unwrap_or(0))
 }
 
 /// The content digests of a jar's members ([`Jar::content_digests`]).
@@ -717,6 +894,31 @@ pub(crate) mod testing {
             }
         }
         jar
+    }
+
+    /// An archive whose end records declare `entries` 46-byte central
+    /// records where a directory would be, and hold none: a zip64 record
+    /// that ends where its locator begins, the locator (pointing `early`
+    /// bytes before the record) and a zip32 record that defers to them.
+    /// The zip reader takes these records, and would allocate for the
+    /// directory they declare.
+    pub(crate) fn declares_entries(entries: u64, early: u64) -> Vec<u8> {
+        let mut archive = vec![0u8; entries as usize * 46];
+        let at = archive.len() as u64;
+        archive.extend_from_slice(b"PK\x06\x06");
+        archive.extend_from_slice(&44u64.to_le_bytes());
+        archive.extend_from_slice(&[0; 12]);
+        archive.extend_from_slice(&entries.to_le_bytes());
+        archive.extend_from_slice(&entries.to_le_bytes());
+        archive.extend_from_slice(&(entries * 46).to_le_bytes());
+        archive.extend_from_slice(&[0; 8]);
+        archive.extend_from_slice(b"PK\x06\x07\0\0\0\0");
+        archive.extend_from_slice(&(at - early).to_le_bytes());
+        archive.extend_from_slice(&1u32.to_le_bytes());
+        archive.extend_from_slice(b"PK\x05\x06\0\0\0\0");
+        archive.extend_from_slice(&[0xff; 12]);
+        archive.extend_from_slice(&[0; 2]);
+        archive
     }
 
     /// [`jar_with_modes`] of plain files.
@@ -932,56 +1134,112 @@ mod tests {
         );
     }
 
-    /// The limits on the central directory are held to what the end records
-    /// declare, before the zip reader parses (and allocates for) it: these
-    /// archives have no directory to parse at all, so the refusal can only
-    /// have come from the records.
+    /// The limits on the central directory are held to what the end record
+    /// declares, before the zip reader parses (and allocates for) it,
+    /// wherever in the file that record sits. These archives have no
+    /// directory to parse at all, so the refusal can only have come from
+    /// the record; and the reader would take each of them, since the
+    /// records are consistent.
     #[test]
     fn the_central_directory_is_bounded_before_it_is_parsed() {
-        let end = |entries: u16, directory: u32| {
-            let mut record = b"PK\x05\x06\0\0\0\0".to_vec();
-            record.extend_from_slice(&entries.to_le_bytes());
-            record.extend_from_slice(&entries.to_le_bytes());
-            record.extend_from_slice(&directory.to_le_bytes());
-            record.extend_from_slice(&[0; 6]);
-            record
-        };
-        // Millions of 46-byte records fit a download: 200,001 of them here,
-        // declared by a zip64 record and the locator that points at it.
         let entries = MAX_ENTRIES as u64 + 1;
-        let mut many = vec![0u8; entries as usize * 46];
-        let at = many.len() as u64;
-        many.extend_from_slice(b"PK\x06\x06");
-        many.extend_from_slice(&[0; 20]);
-        many.extend_from_slice(&entries.to_le_bytes());
-        many.extend_from_slice(&entries.to_le_bytes());
-        many.extend_from_slice(&(entries * 46).to_le_bytes());
-        many.extend_from_slice(&[0; 8]);
-        many.extend_from_slice(b"PK\x06\x07\0\0\0\0");
-        many.extend_from_slice(&at.to_le_bytes());
-        many.extend_from_slice(&1u32.to_le_bytes());
-        many.extend_from_slice(&end(u16::MAX, u32::MAX));
-        let err = Jar::of_bytes(&many).err().expect("refused");
-        assert_eq!(
-            err.to_string(),
-            format!("it holds {entries} entries, over the limit of {MAX_ENTRIES}")
-        );
-        assert!(err.is_too_large());
+        let limit = format!("it holds {entries} entries, over the limit of {MAX_ENTRIES}");
+        let refused = |archive: &[u8]| Jar::of_bytes(archive).err().expect("refused").to_string();
+        // Millions of 46-byte records fit a download: 200,001 of them here.
+        assert_eq!(refused(&testing::declares_entries(entries, 0)), limit);
+        // The reader finds an end record however much follows it.
+        let mut trailed = testing::declares_entries(entries, 0);
+        trailed.extend_from_slice(&[0u8; 70_000]);
+        assert_eq!(refused(&trailed), limit);
+        let mut trailed = testing::declares_entries(entries, 0);
+        trailed.extend_from_slice(&vec![0x20u8; 3 * 1024 * 1024]);
+        assert_eq!(refused(&trailed), limit);
+        // It finds the zip64 record forwards from where the locator points.
+        let mut early = testing::declares_entries(entries, 100);
+        assert_eq!(refused(&early), limit);
+        early.extend_from_slice(&[0u8; 70_000]);
+        assert_eq!(refused(&early), limit);
 
         // A directory of a few entries with 65 MiB of names and comments.
         let mut wide = vec![0u8; 65 * 1024 * 1024];
-        wide.extend_from_slice(&end(3, 65 * 1024 * 1024));
-        let err = Jar::of_bytes(&wide).err().expect("refused");
+        wide[..4].copy_from_slice(b"PK\x01\x02");
+        wide.extend_from_slice(b"PK\x05\x06\0\0\0\0\x03\0\x03\0");
+        wide.extend_from_slice(&(65u32 * 1024 * 1024).to_le_bytes());
+        wide.extend_from_slice(&[0; 6]);
         assert_eq!(
-            err.to_string(),
+            refused(&wide),
             "its central directory takes 65 MiB, over the limit of 64 MiB"
         );
 
-        // Bytes that spell an end record but declare more than the archive
-        // holds are not one: the real record decides.
-        let lookalike = end(u16::MAX, u32::MAX);
-        let real = jar(&[("a/B.class", &lookalike)]);
+        // End records that lead nowhere are passed over, as the reader
+        // passes over them; an archive strewn with them is given up.
+        // (Each declares one entry at offset 0, where no central header is.)
+        let nowhere = b"PK\x05\x06\0\0\0\0\x01\0\x01\0\0\0\0\0\0\0\0\0\0\0";
+        assert_eq!(
+            refused(&nowhere.repeat(MAX_RECORDS_PASSED_OVER + 1)),
+            "it holds more than 64 end records that lead to no central directory"
+        );
+        assert!(refused(&nowhere.repeat(2)).starts_with("not a readable zip archive"));
+
+        // Bytes that spell an end record in a member's data are not one.
+        let lookalike = testing::declares_entries(entries, 0);
+        let real = jar(&[("a/B.class", &lookalike[lookalike.len() - 98..])]);
         assert_eq!(Digests::of_bytes(&real).unwrap().len(), 1);
+    }
+
+    /// The same for a real archive of 200,001 entries, which the reader
+    /// would parse whole: with bytes after it, the check before the parse
+    /// still refuses it (the count after the parse would too, having paid
+    /// for the parse).
+    #[test]
+    fn an_archive_past_the_limit_is_refused_unparsed_with_bytes_after_it() {
+        let members: Vec<(String, &[u8])> = (0..=MAX_ENTRIES)
+            .map(|i| (format!("c/{i}"), b"".as_slice()))
+            .collect();
+        let members: Vec<(&str, &[u8])> = members.iter().map(|(n, b)| (n.as_str(), *b)).collect();
+        let mut archive = jar(&members);
+        let limit = format!(
+            "it holds {} entries, over the limit of {MAX_ENTRIES}",
+            MAX_ENTRIES + 1
+        );
+        let admitted = |archive: &[u8]| {
+            admit(&mut std::io::Cursor::new(archive), archive.len() as u64)
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(admitted(&archive), Err(limit.clone()));
+        archive.extend_from_slice(&[0u8; 70_000]);
+        assert_eq!(admitted(&archive), Err(limit));
+    }
+
+    /// A fat jar holds other jars as stored members, end records and all.
+    /// The reader cannot take a record below the outer directory, so a
+    /// nested jar is not looked at, whatever its own end record declares:
+    /// the outer directory is what counts, and the members read as ever.
+    #[test]
+    fn a_fat_jar_with_a_stored_nested_jar_is_accepted() {
+        let small = jar(&[("inner/A.class", b"inner")]);
+        let huge = testing::declares_entries(MAX_ENTRIES as u64 + 1, 0);
+        for nested in [&small, &huge] {
+            assert!(nested.windows(4).any(|bytes| bytes == END));
+            let fat = jar(&[
+                ("BOOT-INF/classes/App.class", b"app"),
+                ("BOOT-INF/lib/first.jar", &small),
+                ("BOOT-INF/lib/nested.jar", nested),
+            ]);
+            let digests = Digests::of_bytes(&fat).unwrap();
+            assert_eq!(digests.len(), 3);
+            let mut outer = Jar::of_bytes(&fat).unwrap();
+            assert_eq!(
+                outer.member_git_sha256("BOOT-INF/lib/nested.jar").unwrap(),
+                Some(compute_git_sha256_from_bytes(nested))
+            );
+            // With bytes after the outer end record as well.
+            let mut trailed = fat.clone();
+            trailed.extend_from_slice(&[0u8; 70_000]);
+            assert_eq!(Digests::of_bytes(&trailed).unwrap(), digests);
+        }
+        // On its own the nested archive is past the limit.
+        assert!(Jar::of_bytes(&huge).is_err_and(|e| e.is_too_large()));
     }
 
     /// What is inflated is bounded, whatever the entry declares: a deflated

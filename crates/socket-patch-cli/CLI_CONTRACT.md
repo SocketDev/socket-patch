@@ -2849,8 +2849,8 @@ a committed tree needs the registry-verified jar, as before
 
 Jars are read within fixed limits, counted on the bytes actually inflated and on the
 archive's own entry count, never on the sizes an archive declares: 200,000 entries
-and 64 MiB of central directory (read from the archive's end records before the
-directory is parsed), and per pass over one jar 1 GiB inflated and at most 100 times
+and 64 MiB of central directory (read from the end record the zip reader would take,
+before the directory is parsed), and per pass over one jar 1 GiB inflated and at most 100 times
 the jar's own size (a jar smaller than 655 KiB may still inflate to 64 MiB). A jar
 past a limit is `vendor_artifact_too_large`: a refusal when vendoring (the detail names the limit),
 the `vex` omission tag and the `vendor --check` reason for a committed jar (naming the limit), which
@@ -3281,8 +3281,11 @@ below those of the jar.
 
 Jars are read within fixed limits, counted on the bytes actually inflated and on the
 archive's own entry count, never on the sizes an archive declares: 200,000 entries
-and 64 MiB of central directory (both read from the archive's end records before the
-directory is parsed, so a directory of millions of records is refused unread), and
+and 64 MiB of central directory (both read from the end record the zip reader would
+take, wherever in the file it sits and whatever follows it, before the directory is
+parsed, so a directory of millions of records is refused unread; an end record inside
+a member's data, such as a jar stored in a fat jar, is not one the reader can take
+and is not counted), and
 per pass over one jar 1 GiB inflated and at most 100 times the jar's own size (a
 jar smaller than 655 KiB may still inflate to 64 MiB). The largest jars measured on
 Maven Central are far inside them (`hive-exec-3.1.3.jar`: 23,728 entries, 93 MiB
