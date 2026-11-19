@@ -1,0 +1,9 @@
+{
+  "version": "1.0.0",
+  "private": true,
+  "name": "cli",
+  "dependencies": {
+    "left-pad": "1.3.0",
+    "minimist": "0.0.10"
+  }
+}

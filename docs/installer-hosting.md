@@ -79,22 +79,19 @@ add a signature, and the docs should not imply that it does.
 
 ## How a change to the installer reaches the domain
 
-The publish path lives in [depscan][depscan], which vendors this repository as
-`submodules/socket-patch`:
+The publish path is on Socket's side. Socket's deploy publishes the script from
+a pinned commit of this repository:
 
 1. A change to `scripts/install.sh` merges **here**.
-2. depscan's `submodules/socket-patch` pin is bumped to that commit.
-3. depscan's prod deploy runs its **Publish install.socket.dev site** step,
-   which copies `submodules/socket-patch/scripts/install.sh` to
-   `gs://socket-install-prod/patch`, publishes its sha256 and the landing page,
-   then re-reads the object and fails the deploy if the bytes do not match.
-4. `install-server` (a `gcs-bucket-server` instance, `tanka/lib/depscan/install-server.libsonnet`)
-   serves that bucket at `install.socket.dev`.
+2. Socket bumps its pinned commit of this repository to that change.
+3. Socket's production deploy publishes the pinned `scripts/install.sh` as
+   `install.socket.dev/patch`, with its sha256 and the landing page, then
+   re-reads what it published and fails the deploy if the bytes do not match.
 
-So an installer change needs a depscan submodule bump plus a deploy. That
+So an installer change needs a pin bump plus a deploy on Socket's side. That
 indirection is deliberate: this repository is public and needs no write
-credentials into a Socket bucket, and a submodule bump is a reviewed change, so
-nothing reaches a `curl | sh` endpoint without review on the depscan side too.
+credentials for the host, and a pin bump is a reviewed change, so nothing
+reaches a `curl | sh` endpoint without a second review.
 
 **A new socket-patch release needs none of this.** The script resolves the latest
 release itself at run time (`/releases/latest/download`), so cutting 3.4.0
@@ -107,8 +104,8 @@ installer. Only edits to the script itself require a publish.
 fetches `install.socket.dev/patch` and diffs it against `scripts/install.sh` on
 `main`.
 
-- **Different** → the job fails. The fix is a depscan submodule bump + deploy
-  (steps 2–3 above). Expect this to be red in the window between merging an
+- **Different** → the job fails. The fix is a pin bump plus a deploy on Socket's
+  side (steps 2–3 above). Expect this to be red in the window between merging an
   installer change here and bumping the pin there.
 - **Host does not resolve** → the job reports "not deployed yet" and passes, so
   the check is inert until the domain exists.
@@ -122,15 +119,13 @@ mangled publish is caught even when the hash somehow matches expectations.
   through a package manager or a release archive. A `patch.ps1` object on the
   same host would be the natural addition — the hosting side already supports
   it, nothing here does yet.
-- **Objects must stay flat** — for the *bucket-backed* paths only (`patch`,
-  `patch.sha256`, `index.html`). `gcs-bucket-server` interpolates the object name
-  into the GCS JSON API URL unencoded, so only bucket-root keys resolve. This
-  does not affect `/patch/dl/**`, which is relayed by a separate service and
-  never touches the bucket.
+- **The hosted files must stay flat.** `patch`, `patch.sha256` and
+  `index.html` are served from the root of the host, and a nested path would
+  not resolve. This does not affect `/patch/dl/**`, which a separate service
+  relays.
 - **The default download origin is still GitHub.** The `SOCKET_PATCH_BASE_URL`
   mechanism ships first; flipping the default to `install.socket.dev` is a
   one-line change, deliberately held until the relay is verified in prod. A
   script that defaults to a host which does not answer yet is a broken installer
   for everyone running it from a git checkout or the raw GitHub URL.
 
-[depscan]: https://github.com/SocketDev/depscan

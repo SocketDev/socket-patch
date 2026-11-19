@@ -9,8 +9,8 @@
 //! `VersionParser::normalize`, the function Composer and Packagist key a
 //! release by (Packagist keeps `version_normalized` unique per package). It is
 //! checked against real Composer 2.10.3 by the shared vector file
-//! `tests/fixtures/composer-version-vectors.json`, which depscan's
-//! `composerPatchIdentityVersion` twin asserts byte for byte. A 2-4 part
+//! `tests/fixtures/composer-version-vectors.json`, which the Socket backend's
+//! TypeScript twin asserts byte for byte. A 2-4 part
 //! numeric spelling Composer rejects (the SBOM's four-part padding of a date
 //! version, `20231001.0.0.0`) is normalized with its trailing `.0` parts
 //! dropped, and a date release (6+ digit major) drops its trailing `.0`

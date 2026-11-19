@@ -1,0 +1,947 @@
+//! Hosted mode for a NuGet package that comes through rules_csharp's
+//! `nuget.from_lock(packages_lock_json = "//:packages.lock.json",
+//! nuget_config = "//:nuget.config")` under Bzlmod: the lock that
+//! `dotnet restore` writes beside a project, and a `nuget.config` whose one
+//! package source is nuget.org.
+//!
+//! rules_csharp reads both files itself. It asks the sources of
+//! `nuget.config`, in their order, for every package of the lock, with
+//! Bazel's downloader; it holds the file it gets to the lock's
+//! `contentHash`, and `MODULE.bazel.lock` records the file's sha256, which
+//! Bazel holds every later fetch to. No `dotnet` runs, and a build reads
+//! nothing of NuGet's global packages folder.
+//!
+//! `socket-patch` does read that folder: `scan` finds a NuGet package only
+//! where a restore unpacked it (a folder that an `obj/project.assets.json`
+//! of the checkout records, the `packages` folder of a packages.config
+//! project, or NuGet's global packages folder), and in no lock. The
+//! fixture's checkout holds no record of a restore, so the flow has two
+//! kinds of machine. On one the global folder holds the fixture's two
+//! packages, staged by hand as a restore leaves them
+//! ([`Package::restore_into`]); on the other it holds nothing, as on a
+//! runner that only ever ran Bazel.
+//!
+//! One flow, on the Bazel the run is given ([`FIXTURE`] says which ruleset
+//! goes with its release), in a fresh output base:
+//!
+//! - (a) `bazel build` and `bazel run //:consumer` print the unpatched
+//!   marker, and Bazel fetched the upstream package from the stand-in.
+//!   Where NuGet's folder holds nothing, `scan --mode hosted --yes` then
+//!   finds no package: it exits 0 and writes no file.
+//! - (b) Where the folder holds the packages, the same command rewrites
+//!   `nuget.config` (the Socket source of the patch, ahead of nuget.org,
+//!   and a source mapping, which only NuGet's own restore reads) and
+//!   `packages.lock.json` (the `contentHash` of the patched package), and
+//!   nothing else. It warns that the folder still holds the unpatched copy,
+//!   which is what `dotnet restore` would go on using. That leaves
+//!   `MODULE.bazel.lock` stale: a build that may not update it
+//!   (`--lockfile_mode=error`, as a CI with a frozen lock runs it) fails
+//!   right after the scan, until a build that may update the lock, or
+//!   `bazel mod deps --lockfile_mode=update`, has rewritten it and the user
+//!   has committed that.
+//! - (c) With no other step, the two Bazel commands of (a) print the
+//!   patched marker, and the package came from the stand-in patch host. The
+//!   hub asked that host for the other package of the lock as well, which
+//!   it does not hold: Bazel printed a warning with the URL, the access
+//!   token of the grant included, and the package came from nuget.org as
+//!   before. That build rewrites `MODULE.bazel.lock` and no other file.
+//!   From then on the checkout stands: the next build changes no file, and
+//!   a `--lockfile_mode=error` build passes.
+//!   Then the scan runs a second time, as it does on every run of a
+//!   pipeline: it reports the patch applied again and changes no file. And
+//!   `vex` is asked for its document on both machines. Where NuGet's folder
+//!   holds the unpatched copy it writes none and exits 1 (`not_applied`):
+//!   it reads the package there, which is not the one Bazel built. Where
+//!   the folder holds nothing it attests the package, from the pin in the
+//!   two files.
+//! - (d) `socket-patch rollback --yes` restores `nuget.config` and
+//!   `packages.lock.json` byte for byte, at once. Bazel's change to its own
+//!   lock stays, so a `--lockfile_mode=error` build fails right after the
+//!   rollback as it did right after the scan. The next build that may
+//!   update the lock prints the unpatched marker and writes the lock of
+//!   before: from then on every file of the checkout is the one of before.
+//! - (e) On a second machine (a new output base and, on Bazel 9, a new
+//!   contents cache), a patch service grants another patch of the package
+//!   and its host serves other bytes than the grant pins. After the same
+//!   `scan` the build fails, in both states the checkout can be in. With
+//!   the Bazel lock of before, which the scan left stale, the hub asks the
+//!   sources again and refuses the file over the `contentHash` of
+//!   `packages.lock.json`. With a Bazel lock that pins the granted package,
+//!   Bazel's downloader refuses the file over its sha256, and then the copy
+//!   on nuget.org, which the hub tries next.
+//!
+//! Both markers are read from what Bazel built, and each holds an id made
+//! for the run. Bazel's downloader keeps every file it fetches in the
+//! repository cache, under its sha256, and hands it out again without a
+//! request; the tests of a leg share that cache, and CI restores it from
+//! earlier runs. A package of a run is in no cache, so step (a) has to
+//! fetch the upstream one and counts the requests.
+//!
+//! The names of the two packages end in an id of the run as well ([`RUN`]).
+//! nuget.org has no scopes: an id there belongs to whoever pushes it first,
+//! and the fixture's files are public. Nobody can have pushed an id that is
+//! new for every run, so a build that got past the stand-in would find no
+//! package of that name on nuget.org. The fixture's files hold a
+//! placeholder where a checkout holds that id, and the fixture's lock holds
+//! one for each `contentHash` ([`check_out`]). With the placeholder a name
+//! is no package id (NuGet takes no `@` in one), so the committed project
+//! and lock name no package that anybody could push either.
+//!
+//! The Bazel lock of the second build of (e) is not one a build wrote: the
+//! build that writes it has to fetch the granted package, and then the
+//! repository cache, which the two machines share, would hand it to every
+//! later build without a request. It is the lock the patched build of (c)
+//! wrote, with the four values of the second patch in place of the first's:
+//! its source, the sha256 of its package, and the sha256 of the two files
+//! the scan rewrote. The build runs with `--lockfile_mode=error`, so a lock
+//! that Bazel did not take as current would fail it another way.
+//!
+//! One loopback server per checkout (the second machine of (e) has its own)
+//! stands in for three hosts, by route prefix: the Socket API (`/v0`),
+//! `api.nuget.org` (the flat container with the fixture's two packages,
+//! where `rollback` also reads the upstream package, through
+//! `SOCKET_NUGET_URL`, to compute its `contentHash` again) and
+//! `patch.socket.dev` (the Socket source of a patch: its service index, and
+//! a flat container that holds the patched package and no other). Bazel
+//! drops a plain `http` URL that comes without a checksum, and the hub asks
+//! for a service index and for the packages of a changed lock without one.
+//! So `nuget.config` and the grant keep the `https` URLs of production, and
+//! a downloader config sends every URL of the two hosts to the stand-in
+//! ([`downloads`]). It refuses what is left of them, so no build reaches
+//! nuget.org or the patch host. It is there from the first build on, and
+//! step (c) changes no flag.
+//!
+//! # Known gaps
+//!
+//! Three outcomes the flow asserts are gaps of the product, not its
+//! contract. Each is asserted as the release has it, and marked
+//! `KNOWN GAP` there with what a fix would change in this test:
+//!
+//! - Under Bazel alone `socket-patch` finds no NuGet package: it reads
+//!   none out of `packages.lock.json`, so the scan of (a) does nothing and
+//!   exits 0. The flow has a patched path only because the test stages the
+//!   packages in NuGet's global folder first.
+//! - On the machine that ran the scan, `vex` exits 1 with `not_applied`
+//!   while Bazel builds the patched package (c).
+//! - Bazel prints the access token of the grant, in a warning for each
+//!   package of the lock that the Socket source does not hold (c).
+
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use base64::Engine as _;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256, Sha512};
+use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+
+use crate::envelope::{codes_in, event_triples};
+use crate::harness::{
+    changed, fixture_path, rewrite, Cell, Fixture, Ran, StandIn, Tree, CONSUMER, NOTHING,
+};
+use crate::hosted_memory_common::{read_tree, Patch, ORG};
+
+/// The workspace the test builds, and the ruleset each Bazel release
+/// builds it with.
+const FIXTURE: Fixture = Fixture {
+    name: "nuget::FIXTURE",
+    dir: "rules_csharp/bzlmod",
+    workflow: "bazel-nuget.yml",
+    eras: &[
+        // rules_csharp 0.5.0, whose hub downloads with `block = False`,
+        // which Bazel has from 7.1.0. It ran on Bazel 9.3.2, 8.8.2 and
+        // 7.7.2, the legs of the workflow: every other release of the range
+        // is untested.
+        ((7, 1, 0)..(10, 0, 0), "e9"),
+    ],
+};
+
+/// How the id of the package starts that the fixture's project references
+/// and a patch replaces, and how the id of the package beside it starts,
+/// which has no patch. Each id ends in the tag of its run ([`RUN`]).
+const NAME: &str = "SP.Victim";
+const NEIGHBOUR: &str = "SP.Other";
+/// The version the lock resolves both packages to.
+const VERSION: &str = "1.0.0";
+/// What the fixture's files hold where a checkout holds the tag of its
+/// run, at the end of both ids. NuGet takes no `@` in a package id, so the
+/// committed files name no package that could exist on nuget.org.
+const RUN: &str = "@RUN@";
+/// The two files hosted mode rewrites, and Bazel's own lock.
+const CONFIG: &str = "nuget.config";
+const LOCK: &str = "packages.lock.json";
+const BAZEL_LOCK: &str = "MODULE.bazel.lock";
+/// The files of the fixture that name a package.
+const NAMING: [&str; 3] = ["App.csproj", "BUILD.bazel", LOCK];
+/// nuget.org as the fixture's `nuget.config` names it, and as NuGet records
+/// the source of a package it restored.
+const SOURCE: &str = "https://api.nuget.org/v3/index.json";
+/// The two hosts of a build, which are also the route prefixes of the
+/// stand-in that plays them, and the flat container where the ruleset
+/// finds the packages of [`SOURCE`].
+const NUGET_ORG: &str = "api.nuget.org";
+const PATCH_HOST: &str = "patch.socket.dev";
+const FLAT_CONTAINER: &str = "api.nuget.org/v3-flatcontainer";
+/// The one command of hosted mode.
+const SCAN: [&str; 4] = ["scan", "--mode", "hosted", "--yes"];
+
+/// The sha256 of `bytes` in lowercase hex, as `MODULE.bazel.lock` and
+/// Bazel's downloader spell one.
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// The path of the one assembly in the package `id`.
+fn assembly_path(id: &str) -> String {
+    format!("lib/netstandard2.0/{id}.dll")
+}
+
+/// The manifest of the package `id`.
+fn nuspec(id: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+         <package xmlns=\"http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd\">\n\
+         \x20 <metadata>\n\
+         \x20   <id>{id}</id>\n\
+         \x20   <version>{VERSION}</version>\n\
+         \x20   <authors>socket-patch</authors>\n\
+         \x20   <description>a test fixture</description>\n\
+         \x20 </metadata>\n\
+         </package>\n"
+    )
+}
+
+/// One build of a package of the fixture, for one run.
+struct Package {
+    /// `<name>.<the tag of the run>`.
+    id: String,
+    /// The text of its one assembly: a placeholder, which holds no code.
+    assembly: String,
+    /// The `.nupkg` a source serves for it.
+    nupkg: Vec<u8>,
+}
+
+impl Package {
+    /// Version [`VERSION`] of the package `name` of the run `run`, with
+    /// `assembly` as the text of its assembly, as a source serves it: a zip
+    /// of its manifest and that file, without a signature. Built here, so
+    /// no binary is committed, and every sum a test holds a build to is
+    /// computed from the bytes it serves.
+    fn new(name: &str, run: &str, assembly: &str) -> Package {
+        let id = format!("{name}.{run}");
+        let files = [
+            (format!("{id}.nuspec"), nuspec(&id)),
+            (assembly_path(&id), assembly.to_string()),
+        ];
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, text) in &files {
+            let options = zip::write::SimpleFileOptions::default();
+            archive.start_file(name.as_str(), options).expect("zip");
+            archive.write_all(text.as_bytes()).expect("zip");
+        }
+        Package {
+            id,
+            assembly: assembly.to_string(),
+            nupkg: archive.finish().expect("zip").into_inner(),
+        }
+    }
+
+    /// The line the consumer prints once Bazel built this package in.
+    fn marker(&self) -> String {
+        format!("OUT: {}", self.assembly)
+    }
+
+    /// Its id in lower case, as NuGet and the ruleset spell it in a path.
+    fn lower(&self) -> String {
+        self.id.to_lowercase()
+    }
+
+    /// Its purl, as `scan` names a package it found in NuGet's folder,
+    /// where the directory of a package is its id in lower case.
+    fn purl(&self) -> String {
+        format!("pkg:nuget/{}@{VERSION}", self.lower())
+    }
+
+    /// What a lock holds as its `contentHash`: for a package without a
+    /// signature, the sha512 of the file, in base64.
+    fn content_hash(&self) -> String {
+        base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&self.nupkg))
+    }
+
+    /// The route of its file in the flat container the stand-in plays
+    /// under `/<base>`.
+    fn file(&self, base: &str) -> String {
+        let lower = self.lower();
+        format!("/{base}/{lower}/{VERSION}/{lower}.{VERSION}.nupkg")
+    }
+
+    /// Unpack it into NuGet's global packages folder of the machine whose
+    /// .NET home is `home`, as `dotnet restore` leaves a package there: its
+    /// files, the manifest under the id in lower case, the `.nupkg` itself
+    /// with its hash beside it, and the record of the restore. No `dotnet`
+    /// ran, and nothing is written into the checkout, where a restore also
+    /// leaves the project's `obj` directory.
+    fn restore_into(&self, home: &Path) {
+        let lower = self.lower();
+        let dir = packages_folder(home).join(&lower).join(VERSION);
+        let leaf = format!("{lower}.{VERSION}.nupkg");
+        let record = json!({
+            "version": 2,
+            "contentHash": self.content_hash(),
+            "source": SOURCE,
+        });
+        let files = [
+            (format!("{lower}.nuspec"), nuspec(&self.id).into_bytes()),
+            (assembly_path(&self.id), self.assembly.clone().into_bytes()),
+            (leaf.clone(), self.nupkg.clone()),
+            (format!("{leaf}.sha512"), self.content_hash().into_bytes()),
+            (
+                ".nupkg.metadata".to_string(),
+                serde_json::to_vec_pretty(&record).expect("a JSON document"),
+            ),
+        ];
+        for (name, bytes) in files {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().expect("a file path")).expect("create a folder");
+            std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        }
+    }
+}
+
+/// NuGet's global packages folder of the machine whose .NET home is `home`,
+/// at its default place.
+fn packages_folder(home: &Path) -> PathBuf {
+    home.join(".nuget").join("packages")
+}
+
+/// A file of the fixture's `common` directory, with the tag `run` where it
+/// holds [`RUN`].
+fn fixture_file(rel: &str, run: &str) -> String {
+    let path = fixture_path(FIXTURE.dir).join("common").join(rel);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert!(text.contains(RUN), "{}: no {RUN}", path.display());
+    text.replace(RUN, run)
+}
+
+/// The entry of a lock that resolves the package `id` to the file of
+/// `content_hash`, laid out as `dotnet restore` writes it.
+fn lock_entry(id: &str, content_hash: &str) -> String {
+    format!(
+        "      \"{id}\": {{\n        \"type\": \"Direct\",\n        \
+         \"requested\": \"[{VERSION}, )\",\n        \"resolved\": \"{VERSION}\",\n        \
+         \"contentHash\": \"{content_hash}\"\n      }}"
+    )
+}
+
+/// The `contentHash` of each package in the fixture's own lock, which is
+/// the sum of no file: sixty-four zero bytes.
+fn placeholder() -> String {
+    base64::engine::general_purpose::STANDARD.encode([0; 64])
+}
+
+/// The fixture's lock for the run `run`, with the `contentHash` of each of
+/// `packages` in place of its placeholder.
+fn lock_pinning(run: &str, packages: &[&Package]) -> String {
+    let mut lock = fixture_file(LOCK, run);
+    for package in packages {
+        let unpinned = lock_entry(&package.id, &placeholder());
+        let entries = lock.matches(&unpinned).count();
+        assert_eq!(entries, 1, "{LOCK} of the fixture: not one\n{unpinned}");
+        lock = lock.replace(&unpinned, &lock_entry(&package.id, &package.content_hash()));
+    }
+    lock
+}
+
+/// Make `cell` the checkout of the run `run`: every file that names a
+/// package names the packages of the run, and the lock pins `upstream`,
+/// the two packages nuget.org has for it.
+fn check_out(cell: &Cell, run: &str, upstream: &[&Package]) {
+    for rel in NAMING {
+        let text = match rel {
+            LOCK => lock_pinning(run, upstream),
+            _ => fixture_file(rel, run),
+        };
+        cell.write(rel, text);
+    }
+}
+
+/// One patch of the package, under an id that is new for every run, on a
+/// Socket source of its own.
+struct Patched {
+    uuid: String,
+    package: Package,
+    /// The source, as host and path. As in production, the access token of
+    /// the grant and the patch id are part of the path.
+    feed: String,
+}
+
+impl Patched {
+    fn new(run: &str) -> Patched {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let token = uuid::Uuid::new_v4().to_string();
+        Patched {
+            package: Package::new(NAME, run, &format!("PATCHED {uuid}")),
+            feed: format!("{PATCH_HOST}/patch-registry/nuget/{token}/{uuid}"),
+            uuid,
+        }
+    }
+
+    /// The service index of the source: the URL hosted mode writes into
+    /// `nuget.config`.
+    fn index(&self) -> String {
+        format!("https://{}/index.json", self.feed)
+    }
+
+    /// The route of `package` in the flat container of the source.
+    fn file(&self, package: &Package) -> String {
+        package.file(&format!("{}/flat", self.feed))
+    }
+}
+
+/// A stand-in that holds `packages` as nuget.org's flat container does.
+fn registry(packages: &[&Package]) -> StandIn {
+    let standin = StandIn::start();
+    for package in packages {
+        standin.serve(5, &package.file(FLAT_CONTAINER), &package.nupkg);
+    }
+    standin
+}
+
+/// The Socket API on `standin` for `patch` of `upstream`, free for every
+/// caller, and the Socket source of the patch: its service index, and
+/// `served` as the file of the package. The grant names the sha512 of the
+/// patch's own package, whatever is served. The source holds no other
+/// package: a route nobody serves is a 404.
+fn grant(standin: &StandIn, upstream: &Package, patch: &Patched, served: &[u8]) {
+    let package = &patch.package;
+    // A route starts with the `/` that ends `https://`.
+    let url = format!("https:/{}", patch.file(package));
+    let reference = json!({
+        "status": "granted",
+        "url": url,
+        "purl": package.purl(),
+        "artifacts": [{
+            "kind": "tarball",
+            "url": url,
+            "integrity": { "sha512": format!("sha512-{}", package.content_hash()) },
+        }],
+        "registryOverride": {
+            "kind": "nuget-v3",
+            "indexUrl": patch.index(),
+            "identifiers": {
+                "name": package.id,
+                "version": VERSION,
+                "nugetIdLower": package.lower(),
+                "nugetVersionNorm": VERSION,
+            },
+        },
+    });
+    let granted = Patch {
+        purl: package.purl(),
+        uuid: patch.uuid.clone(),
+        reference,
+    };
+    standin.api(&[granted]);
+    // Priority 1: ahead of the shared API mock's patch record, which names
+    // a file no NuGet package has. `vex` holds the package in NuGet's
+    // folder to the hashes of this one.
+    let record = json!({
+        "uuid": patch.uuid,
+        "purl": package.purl(),
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": { assembly_path(&package.id): {
+            "beforeHash": compute_git_sha256_from_bytes(upstream.assembly.as_bytes()),
+            "afterHash": compute_git_sha256_from_bytes(package.assembly.as_bytes()),
+        }},
+        "vulnerabilities": { "GHSA-test-aaaa-bbbb": {
+            "cves": ["CVE-2024-0001"], "summary": "s", "severity": "high", "description": "d",
+        }},
+        "description": "fixture",
+        "license": "MIT",
+        "tier": "free",
+    });
+    let record = serde_json::to_vec(&record).expect("a JSON document");
+    let record_route = format!("/v0/orgs/{ORG}/patches/view/{}", patch.uuid);
+    standin.serve(1, &record_route, &record);
+    let index = json!({ "version": "3.0.0", "resources": [{
+        "@id": format!("https://{}/flat/", patch.feed),
+        "@type": "PackageBaseAddress/3.0.0",
+    }] });
+    let index = serde_json::to_vec(&index).expect("a JSON document");
+    standin.serve(5, &format!("/{}/index.json", patch.feed), &index);
+    standin.serve(5, &patch.file(package), served);
+}
+
+/// The downloader config of the flow, for [`Cell::route_downloads`]: Bazel
+/// fetches every URL of nuget.org's API host and of the patch host from the
+/// stand-in at `origin`, under the route prefix of the host. A URL of
+/// either that no rule rewrote is refused, and so is every other host of
+/// nuget.org, so no download of Bazel's reaches the real ones. Every other
+/// download is left alone.
+fn downloads(origin: &str) -> Vec<String> {
+    vec![
+        rewrite(&format!("{NUGET_ORG}/"), origin),
+        rewrite(&format!("{PATCH_HOST}/"), origin),
+        "block nuget.org".to_string(),
+        format!("block {PATCH_HOST}"),
+    ]
+}
+
+/// `socket-patch <args>` in `cell`, on the machine whose .NET home is
+/// `home`, with `standin` as the Socket API and as the registry `rollback`
+/// reads the upstream package from. Both variables of the .NET home are
+/// set, so that neither a `NUGET_PACKAGES` nor a `DOTNET_CLI_HOME` of the
+/// caller's shell moves the folder or adds a user-level NuGet config.
+fn socket_patch(cell: &Cell, standin: &StandIn, home: &Path, args: &[&str]) -> Ran {
+    let origin = standin.origin();
+    let upstream = format!("{origin}/{NUGET_ORG}");
+    let packages = packages_folder(home);
+    let (home, packages) = (home.to_string_lossy(), packages.to_string_lossy());
+    let env = [
+        ("SOCKET_NUGET_URL", upstream.as_str()),
+        ("DOTNET_CLI_HOME", home.as_ref()),
+        ("NUGET_PACKAGES", packages.as_ref()),
+    ];
+    cell.socket_patch(&origin, args, &env)
+}
+
+/// A text file of a tree.
+fn text(tree: &Tree, rel: &str) -> String {
+    String::from_utf8(tree[rel].clone()).expect("a text file")
+}
+
+/// The build of a CI that holds Bazel's lock frozen, right after the
+/// `socket-patch` command `after` and before any build that may update the
+/// lock: Bazel must refuse it, because the command changed the two files
+/// the hub reads and the lock records what the hub made of them. The
+/// harness names `--lockfile_mode=update` on every command; Bazel takes the
+/// last one, so the `error` passed here is the one in force.
+fn frozen_build_fails(cell: &Cell, after: &str) {
+    let build = cell.bazel("build", &["--lockfile_mode=error", CONSUMER]);
+    let stale = "MODULE.bazel.lock is no longer up-to-date";
+    assert!(
+        !build.ok() && build.stderr().contains(stale),
+        "{}: right after `{after}`, a `--lockfile_mode=error` build on Bazel {} must fail on the \
+         stale lock: {BAZEL_LOCK} records the two files the command rewrote, so a user has to run \
+         a build that may update it, or `bazel mod deps --lockfile_mode=update`, and commit the \
+         lock before a CI with a frozen lock passes.\n{}",
+        cell.test,
+        cell.release(),
+        build.dump()
+    );
+}
+
+/// The flow of the module docs.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn hosted_from_lock() {
+    let test = "nuget::hosted_from_lock";
+    let started = Instant::now();
+    let Some(mut cell) = Cell::open(test, &FIXTURE) else {
+        return;
+    };
+    let release = cell.release().to_string();
+
+    // The packages of this run: the two nuget.org has, and one patch of the
+    // first. Each id ends in the tag of the run, and the assembly of each
+    // build of the package holds an id that is new for every run.
+    let run = format!("R{}", uuid::Uuid::new_v4().simple());
+    let upstream = Package::new(NAME, &run, &format!("PRISTINE {run}"));
+    let neighbour = Package::new(NEIGHBOUR, &run, "NEIGHBOUR");
+    let patch = Patched::new(&run);
+    let (purl, unpatched, patched) = (upstream.purl(), upstream.marker(), patch.package.marker());
+    let one = |action: &str, code: &str| [(purl.clone(), action.to_string(), code.to_string())];
+
+    let standin = registry(&[&neighbour, &upstream]);
+    let origin = standin.origin();
+    grant(&standin, &upstream, &patch, &patch.package.nupkg);
+    cell.route_downloads(&downloads(&origin));
+    check_out(&cell, &run, &[&neighbour, &upstream]);
+    let (upstream_route, patched_route) =
+        (upstream.file(FLAT_CONTAINER), patch.file(&patch.package));
+
+    // The .NET homes of three machines, outside every checkout: one where
+    // nobody ran `dotnet restore`, the one that restored the project, and
+    // the second machine of (e).
+    let machines = tempfile::Builder::new()
+        .prefix("sp-bazel-nuget-")
+        .tempdir()
+        .expect("create the machines");
+    let [bare, restored, second_home] =
+        ["bare", "restored", "second"].map(|name| machines.path().join(name));
+
+    // (a) The unpatched build, with the upstream package from the stand-in.
+    let before = cell.builds_unpatched(&unpatched);
+    assert!(
+        standin.asked(&upstream_route) > 0,
+        "{test}: the build did not fetch the upstream package from the stand-in"
+    );
+    // KNOWN GAP: where NuGet's folder holds nothing, as on a runner that
+    // only ever ran Bazel, hosted mode does nothing: the scan finds no
+    // package, says so with exit 0, and writes no file. A scan that read
+    // the packages out of `packages.lock.json` would pin here as in (b),
+    // and (b) would need no staged folder.
+    let scan = socket_patch(&cell, &standin, &bare, &SCAN);
+    let said = &scan.dump;
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
+    assert_eq!(scan.envelope["scannedPackages"], 0, "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["applied"], 0, "{test}: {said}");
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{test}: {said}");
+
+    // (b) The one command of hosted mode, where the folder holds the two
+    // packages. It rewrites those two files and no other: the Socket source
+    // is the first one the hub asks, and the lock pins the patched package.
+    for package in [&neighbour, &upstream] {
+        package.restore_into(&restored);
+    }
+    let scan = socket_patch(&cell, &standin, &restored, &SCAN);
+    let said = &scan.dump;
+    let pinned = cell.pinned_by(&scan, &purl, &patch.uuid, &before, &[CONFIG, LOCK]);
+    assert_eq!(scan.envelope["scannedPackages"], 2, "{test}: {said}");
+    let config = text(&pinned, CONFIG);
+    let sources = format!(
+        "  <packageSources>\n    <clear />\n    <add key=\"socket-patch-{}\" value=\"{}\" />\n    \
+         <add key=\"nuget.org\" value=\"{SOURCE}\" />\n  </packageSources>\n",
+        patch.uuid,
+        patch.index()
+    );
+    assert!(config.contains(&sources), "{test}: {CONFIG}:\n{config}");
+    assert_eq!(
+        text(&pinned, LOCK),
+        lock_pinning(&run, &[&neighbour, &patch.package]),
+        "{test}: {LOCK}"
+    );
+    // The one warning is about NuGet's folder, which no build here reads.
+    assert_eq!(
+        codes_in(&scan.envelope["warnings"]),
+        ["redirect_nuget_stale_global_package"],
+        "{test}: {said}"
+    );
+    assert_eq!(standin.asked(&patched_route), 0, "{test}: {said}");
+    // The scan left Bazel's lock as it was, so a frozen lock fails here.
+    frozen_build_fails(&cell, "scan --mode hosted");
+
+    // (c) The build of (a) and no other step: patched, from the patch
+    // host. The hub asked that host for the other package as well.
+    // KNOWN GAP: Bazel printed the URL it got a 404 for, access token
+    // included. A fix (a source without the token in its URL, or no
+    // request for a package the source does not hold) would turn the
+    // second half of the assertion below around: the build prints no URL
+    // of the source.
+    let build = cell.bazel("build", &[CONSUMER]);
+    assert!(build.ok(), "{test}: {}", build.dump());
+    let missed = patch.file(&neighbour);
+    assert!(
+        standin.asked(&missed) > 0
+            && build
+                .stderr()
+                .contains(&format!("WARNING: Download from {origin}{missed} failed")),
+        "{test}: the hub did not ask the Socket source for {}, or Bazel did not warn with its \
+         URL:\n{}",
+        neighbour.id,
+        build.dump()
+    );
+    assert!(
+        standin.asked(&patched_route) > 0,
+        "{test}: the patched build did not fetch the package from the stand-in patch host"
+    );
+    // Bazel changed no file of the checkout but its own lock. From here on
+    // the checkout stands: the build prints the patched marker and changes
+    // no file, and Bazel's lock holds when Bazel may not update it.
+    let built = cell.tree();
+    assert_eq!(changed(&pinned, &built), [BAZEL_LOCK], "{test}");
+    cell.builds_patched(&built, &patched);
+
+    // The same command once more, as a pipeline runs it: applied again,
+    // and no file rewritten.
+    let again = socket_patch(&cell, &standin, &restored, &SCAN);
+    let said = &again.dump;
+    assert_eq!(again.code, 0, "{test}: {said}");
+    assert_eq!(again.envelope["status"], "success", "{test}: {said}");
+    let applied = one("applied", "");
+    assert_eq!(event_triples(&again.envelope), applied, "{test}: {said}");
+    let rewritten = &again.envelope["redirect"]["rewrittenFiles"];
+    assert_eq!(*rewritten, json!([]), "{test}: {said}");
+    // `vex` on the machine that ran the scan. KNOWN GAP: it reads the
+    // package in NuGet's folder, finds the unpatched one, attests nothing
+    // and writes no document, while the build is the patched one. A fix
+    // would make this the `vex` of the next block: exit 0, `verified`,
+    // and the document.
+    let document = machines.path().join("vex.json");
+    let output = document.to_string_lossy();
+    let vex = socket_patch(&cell, &standin, &restored, &["vex", "--output", &output]);
+    let said = &vex.dump;
+    assert_eq!(vex.code, 1, "{test}: {said}");
+    let withheld = one("skipped", "not_applied");
+    assert_eq!(event_triples(&vex.envelope), withheld, "{test}: {said}");
+    assert!(!document.exists(), "{test}: {said}");
+    // `vex` where NuGet's folder holds nothing: it attests the package
+    // from the pin in the two files.
+    let vex = socket_patch(&cell, &standin, &bare, &["vex", "--output", &output]);
+    let said = &vex.dump;
+    assert_eq!(vex.code, 0, "{test}: {said}");
+    let attested = one("verified", "");
+    assert_eq!(event_triples(&vex.envelope), attested, "{test}: {said}");
+    let written = std::fs::read_to_string(&document).unwrap_or_default();
+    // With its closing quote, as the document writes `"@id": "<purl>"`.
+    let names = written.contains(&format!("\"{purl}\""));
+    assert!(names, "{test}: {said}\n{written}");
+    // None of those three commands changed a file, so the build is the
+    // one above.
+    assert_eq!(changed(&built, &cell.tree()), NOTHING, "{test}");
+
+    // (d) The undo: the two files are the ones of before at once, and
+    // Bazel's lock is still the one of the patched build, so a frozen lock
+    // fails again. The next build prints the unpatched marker and puts the
+    // lock back. The step is written out and not `Cell::undone`, which
+    // expects every file back before that build: here it is that build
+    // which brings back Bazel's lock.
+    let undo = socket_patch(&cell, &standin, &restored, &["rollback", "--yes"]);
+    let said = &undo.dump;
+    assert_eq!(undo.code, 0, "{test}: {said}");
+    assert_eq!(undo.envelope["summary"]["rolledBack"], 1, "{test}: {said}");
+    let undone = cell.tree();
+    assert_eq!(changed(&built, &undone), [CONFIG, LOCK], "{test}: {said}");
+    assert_eq!(changed(&before, &undone), [BAZEL_LOCK], "{test}: {said}");
+    frozen_build_fails(&cell, "rollback");
+    cell.builds(&unpatched);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{test}");
+
+    // (e) A second machine, with a patch whose package no machine has
+    // fetched: another service grants it, and its host serves other bytes
+    // than the grant pins, still a package of that name and version.
+    let mut twin = cell.twin();
+    let second = Patched::new(&run);
+    let tampered = Package::new(NAME, &run, "TAMPERED");
+    let rogue = registry(&[&neighbour, &upstream]);
+    grant(&rogue, &upstream, &second, &tampered.nupkg);
+    twin.route_downloads(&downloads(&rogue.origin()));
+    for package in [&neighbour, &upstream] {
+        package.restore_into(&second_home);
+    }
+    let scan = socket_patch(&twin, &rogue, &second_home, &SCAN);
+    let said = &scan.dump;
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
+    let repinned = twin.tree();
+    let second_route = second.file(&second.package);
+
+    // With the Bazel lock of before, which the scan left stale: the hub
+    // asks the sources again, and holds the file to the lock's
+    // `contentHash`. It does not go to nuget.org for the package.
+    let build = twin.bazel("build", &[CONSUMER]);
+    assert!(
+        !build.ok(),
+        "{test}: the tampered package built:\n{}",
+        build.dump()
+    );
+    let refusal = format!(
+        "{} {VERSION}: the downloaded package does not match its contentHash in {LOCK}",
+        upstream.id
+    );
+    assert!(
+        build.stderr().contains(&refusal),
+        "{test}: the build did not fail on the contentHash of the granted package:\n{}",
+        build.dump()
+    );
+    let fetches = rogue.asked(&second_route);
+    assert!(
+        fetches > 0,
+        "{test}: the patch host was not asked, so the failed build proves nothing"
+    );
+    assert_eq!(
+        rogue.asked(&upstream_route),
+        0,
+        "{test}: the build went to the upstream package"
+    );
+
+    // With a Bazel lock that pins the granted package: the lock of the
+    // patched build of (c), with the values of the second patch in place of
+    // the first's. Bazel takes it as current (the `error` named last is the
+    // mode in force, as in `frozen_build_fails`), asks for the package,
+    // which no cache holds, and refuses the file over its sha256; then the
+    // hub's next source, nuget.org, whose copy it refuses the same way.
+    let mut lock = text(&built, BAZEL_LOCK);
+    for (first, other) in [
+        (patch.feed.clone(), second.feed.clone()),
+        (
+            sha256_hex(&patch.package.nupkg),
+            sha256_hex(&second.package.nupkg),
+        ),
+        (sha256_hex(&pinned[CONFIG]), sha256_hex(&repinned[CONFIG])),
+        (sha256_hex(&pinned[LOCK]), sha256_hex(&repinned[LOCK])),
+    ] {
+        let recorded = lock.contains(&first);
+        assert!(recorded, "{test}: {BAZEL_LOCK} does not hold {first}");
+        lock = lock.replace(&first, &other);
+    }
+    twin.write(BAZEL_LOCK, lock);
+    let build = twin.bazel("build", &["--lockfile_mode=error", CONSUMER]);
+    assert!(
+        !build.ok(),
+        "{test}: the tampered package built:\n{}",
+        build.dump()
+    );
+    let wanted = sha256_hex(&second.package.nupkg);
+    for served in [&tampered, &upstream] {
+        let refusal = format!(
+            "Checksum was {} but wanted {wanted}",
+            sha256_hex(&served.nupkg)
+        );
+        assert!(
+            build.stderr().contains(&refusal),
+            "{test}: the build did not fail with {refusal:?}:\n{}",
+            build.dump()
+        );
+    }
+    assert!(
+        rogue.asked(&second_route) > fetches && rogue.asked(&upstream_route) > 0,
+        "{test}: the patch host and nuget.org were not both asked, so the failed build proves \
+         nothing"
+    );
+
+    println!(
+        "{test}: Bazel {release} built {patched:?} from {} after `scan --mode hosted`, and \
+         rewrote {BAZEL_LOCK} itself; a `--lockfile_mode=error` build right after the scan, and \
+         again right after `rollback`, failed on the stale lock; a scan where NuGet's folder \
+         holds nothing found no package; a second scan reported the patch applied again; `vex` \
+         attested the package where NuGet's folder holds nothing and withheld it (not_applied) \
+         where the folder holds the unpatched copy; `rollback` restored {CONFIG} and {LOCK} at \
+         once, and the next build printed {unpatched:?} and left all {} files as before; other \
+         bytes at the patch host failed a second machine's build over the contentHash of {LOCK}, \
+         and over the sha256 in {BAZEL_LOCK}; the stand-in answered {} requests for the upstream \
+         package and {} for the patched one; {:?}",
+        patch.index(),
+        before.len(),
+        standin.asked(&upstream_route),
+        standin.asked(&patched_route),
+        started.elapsed()
+    );
+}
+
+/// Without a Bazel, what stays fixed now that no id and no sum is
+/// committed: the fixture's directories and the legs of its workflow are
+/// those of its table; every era names the two files the hub reads; the
+/// files that hold the placeholder of an id are the three a checkout
+/// rewrites, every id they name ends in it and so is no package id, and the
+/// consumer reads the package through the hub; the fixture's lock holds
+/// one entry per package, with the placeholder of a `contentHash`, and
+/// pinning changes nothing else; two runs serve two packages; and the
+/// downloader config is the four rules that keep a build off nuget.org and
+/// the patch host.
+#[test]
+fn a_checkout_names_and_pins_the_packages_of_its_run() {
+    FIXTURE.check();
+    let root = fixture_path(FIXTURE.dir);
+    for (_, era) in FIXTURE.eras {
+        let path = root.join(era).join("MODULE.bazel");
+        let module = std::fs::read_to_string(&path).expect("the era's MODULE.bazel");
+        for named in [
+            format!("nuget_config = \"//:{CONFIG}\""),
+            format!("packages_lock_json = \"//:{LOCK}\""),
+        ] {
+            assert!(module.contains(&named), "{}: no {named}", path.display());
+        }
+    }
+    let common = root.join("common");
+    let read = |rel: &str| std::fs::read_to_string(common.join(rel)).expect(rel);
+    // The regular files, at any depth: one that is no text says its name.
+    let holds_run = |(rel, bytes): &(String, Vec<u8>)| match std::str::from_utf8(bytes) {
+        Ok(text) => text.contains(RUN),
+        Err(_) => panic!("{rel} of the fixture is no UTF-8 text"),
+    };
+    let files = read_tree(&common).into_iter().filter(holds_run);
+    let naming: Vec<String> = files.map(|(rel, _)| rel).collect();
+    assert_eq!(naming, NAMING);
+    // Every id those files name (the references of the project, the label
+    // of the consumer, the keys of the lock) ends in the placeholder, whose
+    // `@` no package id takes: nobody can push one of them to nuget.org.
+    let after = |rel: &str, opener: &str| -> Vec<String> {
+        let text = read(rel);
+        let ids = text
+            .split(opener)
+            .skip(1)
+            .map(|rest| rest.split('"').next());
+        ids.map(|id| id.expect("an id").to_string()).collect()
+    };
+    let mut ids = after("App.csproj", "<PackageReference Include=\"");
+    ids.extend(after("BUILD.bazel", "\"@nuget//:"));
+    let committed: Value = serde_json::from_str(&read(LOCK)).expect("a JSON lock");
+    for (_, locked) in committed["dependencies"].as_object().expect("frameworks") {
+        ids.extend(locked.as_object().expect("ids").keys().cloned());
+    }
+    assert_eq!(ids.len(), 5, "{ids:?}");
+    let pushable = |id: &&String| !id.ends_with(RUN) || !id.contains('@');
+    let pushable = ids.iter().find(pushable);
+    assert_eq!(pushable, None, "an id anybody could push to nuget.org");
+    assert!(read(CONFIG).contains(&format!("<add key=\"nuget.org\" value=\"{SOURCE}\" />")));
+
+    let package = |name, run| Package::new(name, run, "PRISTINE of a run");
+    let (neighbour, upstream) = (package(NEIGHBOUR, "R1"), package(NAME, "R1"));
+    let label = format!("srcs = [\"@nuget//:{}\"]", upstream.id);
+    assert!(fixture_file("BUILD.bazel", "R1").contains(&label));
+    let pinned = lock_pinning("R1", &[&neighbour, &upstream]);
+    let lock: Value = serde_json::from_str(&pinned).expect("a JSON lock");
+    let entries = lock["dependencies"]["net8.0"].as_object().expect("entries");
+    assert_eq!(entries.len(), 2, "{pinned}");
+    for package in [&neighbour, &upstream] {
+        let entry = &entries[&package.id];
+        assert_eq!(entry["resolved"], VERSION, "{pinned}");
+        assert_eq!(entry["contentHash"], package.content_hash(), "{pinned}");
+    }
+    // The hashes first: the base64 of one may hold the tag of the run.
+    let mut unpinned = pinned;
+    for package in [&neighbour, &upstream] {
+        unpinned = unpinned.replace(&package.content_hash(), &placeholder());
+    }
+    assert_eq!(unpinned.replace("R1", RUN), read(LOCK));
+
+    assert_ne!(package(NAME, "R2").nupkg, upstream.nupkg);
+    assert_eq!(upstream.purl(), "pkg:nuget/sp.victim.r1@1.0.0");
+    assert_eq!(
+        upstream.file(FLAT_CONTAINER),
+        "/api.nuget.org/v3-flatcontainer/sp.victim.r1/1.0.0/sp.victim.r1.1.0.0.nupkg"
+    );
+    assert_eq!(
+        downloads("http://127.0.0.1:1"),
+        [
+            r"rewrite (\Qapi.nuget.org/\E.*) http://127.0.0.1:1/$1",
+            r"rewrite (\Qpatch.socket.dev/\E.*) http://127.0.0.1:1/$1",
+            "block nuget.org",
+            "block patch.socket.dev",
+        ]
+    );
+}
+
+/// Without a Bazel: the workflow names the product files of the flow one by
+/// one, and a path that names no file, or a pattern under no directory,
+/// would start no run. What a pull request starts a run for, a push to main
+/// starts one for as well.
+#[test]
+fn the_workflow_names_files_that_exist() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workflow = root.join(".github/workflows").join(FIXTURE.workflow);
+    let text = std::fs::read_to_string(&workflow).expect("the workflow");
+    // The two lists of the file, in its order: `pull_request`, then `push`.
+    let (on_pull_request, on_push) = text.split_once("\n  push:\n").expect("a push trigger");
+    fn listed(part: &str) -> Vec<&str> {
+        let lines = part.lines().map(str::trim);
+        lines
+            .filter_map(|line| line.strip_prefix("- '")?.strip_suffix('\''))
+            .collect()
+    }
+    let (on_pull_request, on_push) = (listed(on_pull_request), listed(on_push));
+    assert!(!on_pull_request.is_empty(), "{}", workflow.display());
+    for path in &on_pull_request {
+        assert!(on_push.contains(path), "{path} starts no run on main");
+    }
+    for path in &on_push {
+        // A pattern has to name the directory before its first `*`.
+        let named = match path.split_once('*') {
+            Some((fixed, _)) => root.join(&fixed[..fixed.rfind('/').unwrap_or(0)]).is_dir(),
+            None => root.join(path).is_file(),
+        };
+        assert!(named, "{}: {path}", workflow.display());
+    }
+}

@@ -1,0 +1,9 @@
+# The build actions of this workspace run the `php` and the `composer` of the
+# machine. An action sees no variable of the shell that is not named here, so
+# these hand it the two it needs: PATH (without it, Bazel 9 gives an action a
+# fixed PATH of system directories) and the Composer home, where the machine's
+# repositories and settings are. An action writes nothing outside its sandbox,
+# so Composer keeps no cache there.
+build --action_env=PATH
+build --action_env=COMPOSER_HOME
+build --action_env=COMPOSER_CACHE_DIR=/dev/null
