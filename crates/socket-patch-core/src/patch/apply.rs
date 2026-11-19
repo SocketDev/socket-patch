@@ -1532,6 +1532,27 @@ pub async fn needs_npm_bin_rewrite(
 
 /// The single-copy apply engine behind [`apply_package_patch`]: verifies
 /// and patches the package at exactly the one `pkg_path` it is given.
+/// Whether every file of a patch already holds the patched bytes in the
+/// copy at `pkg_path` (and the patch has files at all).
+async fn every_file_already_patched(
+    pkg_path: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+) -> bool {
+    if files.is_empty() {
+        return false;
+    }
+    for (file_name, file_info) in files {
+        if verify_file_patch(pkg_path, file_name, file_info)
+            .await
+            .status
+            != VerifyStatus::AlreadyPatched
+        {
+            return false;
+        }
+    }
+    true
+}
+
 async fn apply_package_patch_at(
     scope: crate::utils::repo_root::ReadScope,
     package_key: &str,
@@ -1571,19 +1592,31 @@ async fn apply_package_patch_at(
     // A copy conda built is patched only as the PyPI release the patch was
     // made from (see `conda_copy`): never a compiled build, and never by
     // overwriting a file that is not the release's. Refused before anything
-    // is verified or written, dry run included, and no policy relaxes it:
-    // `--force` and `--allow-patch-conflicts` consent to losing local
-    // changes, not to writing another distribution's files into this one.
-    // Content an earlier Socket patch wrote still gives way to its update.
+    // is written, dry run included, and no flag relaxes it: `--force` and
+    // `--allow-patch-conflicts` consent to losing local changes, not to
+    // writing another distribution's files into this one, so they act as
+    // the default policy here (content an earlier Socket patch wrote still
+    // gives way to its update). `--strict` stays as strict as it is.
     let policy = match crate::patch::conda_copy::conda_build(package_key, pkg_path).await {
-        Some(_) => {
-            if let Some(refused) =
-                crate::patch::conda_copy::refusal(package_key, pkg_path, files).await
-            {
-                result.error = Some(refused);
-                return result;
+        Some(build) => {
+            let refused =
+                crate::patch::conda_copy::refusal_for(&build, package_key, pkg_path, files);
+            // A copy that already holds the patch (an earlier release
+            // applied it) has nothing written to it: it is reported as
+            // patched, which is what its files are.
+            if let Some(refused) = refused {
+                if !every_file_already_patched(pkg_path, files).await {
+                    result.error = Some(format!(
+                        "{refused}; `socket-patch remove {}` drops its record",
+                        crate::utils::purl::strip_purl_qualifiers(package_key)
+                    ));
+                    return result;
+                }
             }
-            MismatchPolicy::SocketContent
+            match policy {
+                MismatchPolicy::Warn | MismatchPolicy::Force => MismatchPolicy::SocketContent,
+                strict_or_default => strict_or_default,
+            }
         }
         None => policy,
     };

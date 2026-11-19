@@ -680,6 +680,112 @@ fn an_earlier_socket_patch_still_gives_way_on_a_pure_python_conda_build() {
     assert_eq!(std::fs::read(&target).unwrap(), CONDA_PATCHED);
 }
 
+/// A manifest can hold the source distribution's record beside the
+/// wheel's (both match a release whose files are the same in each). On a
+/// pure-Python conda build the wheel's record patches the copy and the
+/// sdist's finds it patched: the run succeeds, as it does in a venv.
+#[test]
+fn an_sdist_record_beside_the_wheels_does_not_fail_a_pure_python_conda_build() {
+    let release = b"# the PyPI release's file\n";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let wheel = "pkg:pypi/certifi@2026.7.22?artifact_id=py3-none-any-whl";
+    let target = stage_conda_copy(
+        tmp.path(),
+        &CondaCopy {
+            name: "certifi",
+            version: "2026.7.22",
+            purl: wheel,
+            installer: Some("conda"),
+            purelib: true,
+            file: "certifi/core.py",
+            installed: release,
+            release,
+        },
+    );
+    let manifest_path = tmp.path().join(".socket").join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let mut sdist = manifest["patches"][wheel].clone();
+    sdist["uuid"] = "20000001-0000-4001-8001-000000000089".into();
+    manifest["patches"]["pkg:pypi/certifi@2026.7.22?artifact_id=tar-gz"] = sdist;
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = apply_in(tmp.path(), &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(std::fs::read(&target).unwrap(), CONDA_PATCHED);
+    assert!(!stderr.contains(CONDA_REFUSAL), "stderr:\n{stderr}");
+}
+
+/// `--strict` fails on any file that is not the patch's original. The
+/// conda rule tightens `--force` and `--allow-patch-conflicts`; it must
+/// not loosen `--strict`, which here refuses even content an earlier
+/// Socket patch wrote.
+#[test]
+fn strict_stays_strict_on_a_conda_build() {
+    let earlier_patch = b"# what the earlier patch wrote\n";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = stage_conda_copy(
+        tmp.path(),
+        &CondaCopy {
+            name: "certifi",
+            version: "2026.7.22",
+            purl: "pkg:pypi/certifi@2026.7.22",
+            installer: Some("conda"),
+            purelib: true,
+            file: "certifi/core.py",
+            installed: earlier_patch,
+            release: b"# the PyPI release's file\n",
+        },
+    );
+    write_blob(
+        &tmp.path().join(".socket"),
+        &git_sha256(earlier_patch),
+        earlier_patch,
+    );
+    let (code, stdout, stderr) = apply_in(tmp.path(), &["--strict"]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(std::fs::read(&target).unwrap(), earlier_patch);
+}
+
+/// An earlier release patched compiled conda builds whose Python file
+/// matched. Such a copy already holds the patch: nothing is written to it,
+/// so there is nothing to refuse, and `apply` reports it as what it is,
+/// patched. The same record on an unpatched copy is refused, and the
+/// refusal says how to drop the record.
+#[test]
+fn a_compiled_conda_build_that_already_holds_the_patch_is_reported_as_patched() {
+    let copy = |installed: &'static [u8]| CondaCopy {
+        name: "pillow",
+        version: "12.3.0",
+        purl: "pkg:pypi/pillow@12.3.0?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl",
+        installer: Some("conda"),
+        purelib: false,
+        file: "PIL/TarIO.py",
+        installed,
+        release: b"# PIL/TarIO.py as PyPI ships it\n",
+    };
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = stage_conda_copy(tmp.path(), &copy(CONDA_PATCHED));
+    let (code, stdout, stderr) = apply_in(tmp.path(), &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("already patched"), "stdout:\n{stdout}");
+    assert!(!stderr.contains(CONDA_REFUSAL), "stderr:\n{stderr}");
+    assert_eq!(std::fs::read(&target).unwrap(), CONDA_PATCHED);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    stage_conda_copy(tmp.path(), &copy(b"# PIL/TarIO.py as PyPI ships it\n"));
+    let (code, _stdout, stderr) = apply_in(tmp.path(), &[]);
+    assert_eq!(code, 1, "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("`socket-patch remove pkg:pypi/pillow@12.3.0` drops its record"),
+        "stderr:\n{stderr}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Gem — advisory-only, code = gem_bundle_install_reverts
 // ─────────────────────────────────────────────────────────────────────

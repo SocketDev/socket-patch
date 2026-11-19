@@ -598,6 +598,14 @@ fn shadowed_names_sync(
                 continue;
             }
             let here = names_in(&base);
+            // A pixi environment is run on its own (`pixi run`), whatever
+            // venv is layered on its interpreter: its copies are consumed
+            // there, so the venv hides none of them.
+            if super::pixi_env::conda_prefix_of(&base).is_some_and(super::pixi_env::is_pixi_prefix)
+            {
+                hidden.extend(here);
+                continue;
+            }
             match shadowed.entry(base) {
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     slot.insert(hidden.clone());
@@ -3510,9 +3518,10 @@ async fn local_site_packages_with(
     // A project only pixi installs has its packages in pixi's own
     // environments (see `pixi_env`). With none installed yet nothing is
     // installed for it; the OS Python, or whichever one is on PATH, is
-    // never its env. One that pip installs too (a `requirements.txt` beside
-    // pixi's files) keeps the interpreter fallback below.
-    if super::pixi_env::pixi_owns_project_env(cwd) {
+    // never its env. One that pip installs too (a `requirements.txt` or a
+    // packaged `pyproject.toml` beside pixi's files) keeps the interpreter
+    // fallback below.
+    if super::pixi_env::pixi_owns_project_env(cwd).await {
         return Vec::new();
     }
     if is_python_project(cwd).await {
@@ -4456,6 +4465,66 @@ mod tests {
         assert_eq!(
             find_local_venv_site_packages_with(&project, &activated).await,
             vec![activated_site, pixi_site]
+        );
+    }
+
+    /// A `--system-site-packages` venv built on a pixi environment's Python
+    /// hides, for the venv's interpreter, every package it installs too.
+    /// The pixi environment is still run on its own (`pixi run`), where its
+    /// copy is the one imported, so that copy stays visible to the crawl
+    /// beside the venv's.
+    #[tokio::test]
+    async fn a_venv_layered_on_a_pixi_environment_does_not_hide_its_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("analysis");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("pixi.toml"), "[workspace]\n").unwrap();
+        let pixi_site = fake_pixi_env(&project, "default");
+        let prefix = project.join(".pixi").join("envs").join("default");
+        // The stdlib landmark the venv's base interpreter is recognised by.
+        let home = if cfg!(windows) {
+            std::fs::write(prefix.join("Lib").join("os.py"), "").unwrap();
+            prefix.clone()
+        } else {
+            std::fs::write(prefix.join("lib").join("python3.12").join("os.py"), "").unwrap();
+            std::fs::create_dir_all(prefix.join("bin")).unwrap();
+            prefix.join("bin")
+        };
+        let venv_site = fake_venv(&project, ".venv");
+        std::fs::write(
+            project.join(".venv").join("pyvenv.cfg"),
+            format!(
+                "home = {}\ninclude-system-site-packages = true\nversion = 3.12.4\n",
+                home.display()
+            ),
+        )
+        .unwrap();
+        for (site, version) in [(&venv_site, "2099.1.1"), (&pixi_site, "2026.7.22")] {
+            let dist = site.join(format!("certifi-{version}.dist-info"));
+            std::fs::create_dir_all(&dist).unwrap();
+            std::fs::write(
+                dist.join("METADATA"),
+                format!("Metadata-Version: 2.4\nName: certifi\nVersion: {version}\n"),
+            )
+            .unwrap();
+        }
+
+        let crawler = PythonCrawler::new();
+        let options = CrawlerOptions {
+            cwd: project.clone(),
+            global: false,
+            global_prefix: None,
+        };
+        let mut purls: Vec<String> = crawler
+            .crawl_all_with(&options, &no_env)
+            .await
+            .into_iter()
+            .map(|package| package.purl)
+            .collect();
+        purls.sort();
+        assert_eq!(
+            purls,
+            ["pkg:pypi/certifi@2026.7.22", "pkg:pypi/certifi@2099.1.1"]
         );
     }
 

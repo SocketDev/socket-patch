@@ -47,8 +47,8 @@ pub struct PixiEnvironment {
 /// beside pixi's files, another installer may put the project's packages
 /// into the interpreter on `PATH` (a container image that runs `pip
 /// install -r requirements.txt`), so pixi does not own the project's
-/// environment alone. A `pyproject.toml` is not one of them: pixi reads it
-/// as its manifest, or installs the project it describes.
+/// environment alone. A `pyproject.toml` counts when it has a
+/// `[build-system]` (see [`pixi_owns_project_env`]).
 const PIP_INSTALL_FILES: [&str; 3] = ["requirements.txt", "setup.py", "setup.cfg"];
 
 /// Whether pixi installs the project at `cwd`: it has a `pixi.toml` or a
@@ -59,10 +59,27 @@ pub fn is_pixi_project(cwd: &Path) -> bool {
 
 /// Whether only pixi installs the project at `cwd`, so its packages are
 /// only ever in pixi's own environments and one with none installed yet
-/// has nothing installed: a pixi project (see [`is_pixi_project`]) with
-/// none of the files pip installs from beside pixi's.
-pub fn pixi_owns_project_env(cwd: &Path) -> bool {
-    is_pixi_project(cwd) && !PIP_INSTALL_FILES.iter().any(|name| cwd.join(name).exists())
+/// has nothing installed: a pixi project (see [`is_pixi_project`]) that
+/// nothing shows pip installing too. pip installs from a
+/// `requirements.txt`, a `setup.py` or `setup.cfg`, and a `pyproject.toml`
+/// that declares a `[build-system]` (a library that keeps pixi for its
+/// development environments and is `pip install`ed elsewhere). A
+/// `pyproject.toml` that only holds project metadata or tool settings is
+/// not something pip installs dependencies from.
+pub async fn pixi_owns_project_env(cwd: &Path) -> bool {
+    is_pixi_project(cwd)
+        && !PIP_INSTALL_FILES.iter().any(|name| cwd.join(name).exists())
+        && !pyproject_declares_build_system(cwd).await
+}
+
+/// Whether `cwd/pyproject.toml` has a `[build-system]` table.
+async fn pyproject_declares_build_system(cwd: &Path) -> bool {
+    let Ok(text) = crate::utils::fs::read_regular_to_string(&cwd.join("pyproject.toml")).await
+    else {
+        return false;
+    };
+    text.parse::<toml_edit::DocumentMut>()
+        .is_ok_and(|document| document.get("build-system").is_some())
 }
 
 /// The existing pixi environments of the project at `cwd`, by name. Empty
@@ -78,14 +95,19 @@ pub(crate) async fn pixi_environments_with(
     var: &impl Fn(&str) -> Option<String>,
 ) -> Vec<PixiEnvironment> {
     let mut found: Vec<PixiEnvironment> = Vec::new();
-    let envs_dir = cwd.join(".pixi").join("envs");
-    for entry in crate::utils::fs::list_dir_entries(&envs_dir).await {
-        let prefix = envs_dir.join(entry.file_name());
-        if is_conda_prefix(&prefix) {
-            found.push(PixiEnvironment {
-                name: entry.file_name().to_string_lossy().into_owned(),
-                prefix,
-            });
+    // `.pixi/envs` is a project's only beside pixi's own files: in the
+    // home directory the same path holds the tool environments of `pixi
+    // global install`, which are no project's.
+    if is_pixi_project(cwd) {
+        let envs_dir = cwd.join(".pixi").join("envs");
+        for entry in crate::utils::fs::list_dir_entries(&envs_dir).await {
+            let prefix = envs_dir.join(entry.file_name());
+            if is_conda_prefix(&prefix) {
+                found.push(PixiEnvironment {
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    prefix,
+                });
+            }
         }
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
@@ -102,12 +124,14 @@ pub(crate) async fn pixi_environments_with(
 /// `cwd`: `CONDA_PREFIX`, when pixi's own variables name a workspace root
 /// that is `cwd` or a directory above it. At the root it is how a detached
 /// environment is reached where pixi leaves no `.pixi/envs` link. Below
-/// the root (a workspace member, whose packages pixi installs into the
-/// workspace's environments) it is the only environment in reach, unless
-/// `cwd` has environments of its own (`has_own_envs`): then it is a
-/// workspace of its own, and the one activated above it is another
-/// project's. An activated environment of an unrelated project, or a conda
-/// environment pixi did not activate, is never this project's.
+/// the root it counts only for a workspace member: a directory with pixi
+/// files of its own (a member's `pixi.toml`) and no environments of its
+/// own (`has_own_envs`), whose packages pixi installs into the
+/// workspace's environments. Any other directory below the root (a uv or
+/// Poetry project that happens to sit in the workspace's tree, a plain
+/// subdirectory) keeps the answer it has without pixi. An activated
+/// environment of an unrelated project, or a conda environment pixi did
+/// not activate, is never this project's.
 fn activated_environment(
     cwd: &Path,
     var: &impl Fn(&str) -> Option<String>,
@@ -116,7 +140,8 @@ fn activated_environment(
     let set = |name: &str| var(name).filter(|value| !value.trim().is_empty());
     let root = set("PIXI_WORKSPACE_ROOT").or_else(|| set("PIXI_PROJECT_ROOT"))?;
     let root = Path::new(&root);
-    if !same_dir(root, cwd) && (has_own_envs || !is_below(cwd, root)) {
+    let member = !has_own_envs && is_pixi_project(cwd) && is_below(cwd, root);
+    if !same_dir(root, cwd) && !member {
         return None;
     }
     let prefix = PathBuf::from(set("CONDA_PREFIX")?);
@@ -235,29 +260,44 @@ mod tests {
     }
 
     /// pixi alone installs a project that has only pixi's files, with or
-    /// without a `pyproject.toml`. A file pip installs from beside them
-    /// means another installer may fill the interpreter on `PATH`.
-    #[test]
-    fn pixi_owns_the_environment_unless_pip_installs_the_project_too() {
+    /// without a `pyproject.toml` of metadata and tool settings. A file
+    /// pip installs from beside them, a `pyproject.toml` with a
+    /// `[build-system]` among them, means another installer may fill the
+    /// interpreter on `PATH`.
+    #[tokio::test]
+    async fn pixi_owns_the_environment_unless_pip_installs_the_project_too() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path();
-        assert!(!pixi_owns_project_env(project), "not a pixi project");
+        assert!(!pixi_owns_project_env(project).await, "not a pixi project");
         std::fs::write(project.join("pixi.toml"), "[workspace]\n").unwrap();
-        assert!(pixi_owns_project_env(project));
-        std::fs::write(project.join("pyproject.toml"), "[project]\nname = \"a\"\n").unwrap();
-        assert!(pixi_owns_project_env(project));
+        assert!(pixi_owns_project_env(project).await);
+        let metadata =
+            "[project]\nname = \"a\"\nversion = \"0.1.0\"\n\n[tool.ruff]\nline-length = 100\n";
+        std::fs::write(project.join("pyproject.toml"), metadata).unwrap();
+        assert!(pixi_owns_project_env(project).await);
         for pip_file in ["requirements.txt", "setup.py", "setup.cfg"] {
             std::fs::write(project.join(pip_file), "").unwrap();
-            assert!(!pixi_owns_project_env(project), "{pip_file}");
+            assert!(!pixi_owns_project_env(project).await, "{pip_file}");
             std::fs::remove_file(project.join(pip_file)).unwrap();
         }
-        assert!(pixi_owns_project_env(project));
+        assert!(pixi_owns_project_env(project).await);
+
+        // A library packaged with a build backend is `pip install`ed too.
+        let packaged = format!(
+            "{metadata}\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n"
+        );
+        std::fs::write(project.join("pyproject.toml"), packaged).unwrap();
+        assert!(!pixi_owns_project_env(project).await);
+        // One that does not parse shows nothing.
+        std::fs::write(project.join("pyproject.toml"), "[build-system\n").unwrap();
+        assert!(pixi_owns_project_env(project).await);
     }
 
     #[tokio::test]
     async fn every_installed_environment_is_found_by_name() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path();
+        std::fs::write(project.join("pixi.toml"), "[workspace]\n").unwrap();
         assert!(pixi_environments_with(project, &no_env).await.is_empty());
         let envs = project.join(".pixi").join("envs");
         conda_prefix(&envs.join("test"));
@@ -270,6 +310,22 @@ mod tests {
         assert_eq!(found[0].prefix, envs.join("default"));
     }
 
+    /// `~/.pixi/envs` holds the tool environments of `pixi global
+    /// install`. A run from the home directory, which has no pixi manifest
+    /// or lock, must not take them for a project's.
+    #[tokio::test]
+    async fn envs_under_a_directory_without_pixi_files_are_no_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        conda_prefix(&home.join(".pixi").join("envs").join("ruff"));
+        assert!(pixi_environments_with(home, &no_env).await.is_empty());
+        std::fs::write(home.join("pixi.lock"), "version: 6\n").unwrap();
+        assert_eq!(
+            names(&pixi_environments_with(home, &no_env).await),
+            ["ruff"]
+        );
+    }
+
     /// `detached-environments`: pixi keeps the environments elsewhere and
     /// leaves `.pixi/envs` as a link to them.
     #[cfg(unix)]
@@ -280,6 +336,7 @@ mod tests {
         let detached = tmp.path().join("cache").join("envs").join("project-1234");
         conda_prefix(&detached.join("envs").join("default"));
         std::fs::create_dir_all(project.join(".pixi")).unwrap();
+        std::fs::write(project.join("pixi.toml"), "[workspace]\n").unwrap();
         std::os::unix::fs::symlink(detached.join("envs"), project.join(".pixi").join("envs"))
             .unwrap();
         let found = pixi_environments_with(&project, &no_env).await;
@@ -344,9 +401,22 @@ mod tests {
         let nested = root.join("vendor").join("tool");
         let own = nested.join(".pixi").join("envs").join("default");
         conda_prefix(&own);
+        std::fs::write(nested.join("pixi.toml"), "[workspace]\n").unwrap();
         let found = pixi_environments_with(&nested, &var).await;
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].prefix, own);
+
+        // A project of another tool that sits in the workspace's tree (a
+        // uv service with its own `.venv`) is no member: the workspace's
+        // environment is not its, activated or not.
+        let service = root.join("services").join("api");
+        std::fs::create_dir_all(service.join(".venv")).unwrap();
+        std::fs::write(service.join("uv.lock"), "version = 1\n").unwrap();
+        assert!(pixi_environments_with(&service, &var).await.is_empty());
+        // Nor is a plain subdirectory.
+        let scripts = root.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        assert!(pixi_environments_with(&scripts, &var).await.is_empty());
 
         // A directory outside the activated workspace is not its member.
         let outside = tmp.path().join("elsewhere");
@@ -358,6 +428,7 @@ mod tests {
     async fn an_activated_environment_is_not_listed_twice() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path();
+        std::fs::write(project.join("pixi.toml"), "[workspace]\n").unwrap();
         let prefix = project.join(".pixi").join("envs").join("default");
         conda_prefix(&prefix);
         let var = env_of(&[("PIXI_PROJECT_ROOT", project), ("CONDA_PREFIX", &prefix)]);

@@ -1132,10 +1132,10 @@ fn warn_no_pypi_wiring(
     // pin nothing, since pixi installs from its own lock, and mostly from
     // conda channels. A project whose own files name another lock tool (a
     // Pipfile, a `[tool.uv]` table) is installed by that tool too, and
-    // keeps its remedy.
+    // keeps its remedy; a build backend names no such tool.
     let pixi_files = crate::crawlers::pixi_env::PIXI_FILES;
     if pixi_files.iter().any(|file| files.contains_key(*file))
-        && pypi_named_lock_step(files).is_none()
+        && pypi_lock_step(files, false).is_none()
     {
         result.warnings.push(RewriteWarning {
             code: "redirect_pypi_pixi_project".into(),
@@ -1186,6 +1186,16 @@ fn pypi_no_lockfile_remedy(files: &BTreeMap<String, String>) -> String {
 /// for a Pipfile, else the lock of the tool a pyproject names with a
 /// `[tool.<tool>]` table or its build backend. `None` when they name none.
 fn pypi_named_lock_step(files: &BTreeMap<String, String>) -> Option<String> {
+    pypi_lock_step(files, true)
+}
+
+/// [`pypi_named_lock_step`], with or without the build backend as a name
+/// (`by_backend`). A build backend builds the project's own package and
+/// says nothing about which tool installs its dependencies: a pixi project
+/// packaged with `poetry-core` or `uv_build` is still installed by pixi.
+/// Only a tool's own file or table (a `Pipfile`, `[tool.uv]`,
+/// `[tool.poetry]`, `[tool.pdm]`) says that tool manages them.
+fn pypi_lock_step(files: &BTreeMap<String, String>, by_backend: bool) -> Option<String> {
     if files.contains_key("Pipfile") {
         return Some("run `pipenv lock` and commit Pipfile.lock, then re-run".into());
     }
@@ -1196,6 +1206,7 @@ fn pypi_named_lock_step(files: &BTreeMap<String, String>) -> Option<String> {
         .and_then(|doc| doc.get("build-system"))
         .and_then(|build| build.get("build-backend"))
         .and_then(toml_edit::Item::as_str)
+        .filter(|_| by_backend)
         .unwrap_or_default();
     let names = |tool: &str| {
         document

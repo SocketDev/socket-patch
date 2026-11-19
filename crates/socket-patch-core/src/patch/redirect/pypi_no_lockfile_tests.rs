@@ -325,6 +325,32 @@ fn a_pixi_project_that_names_a_lock_tool_keeps_that_tools_remedy() {
     }
 }
 
+/// A build backend builds the project's own package; it does not say which
+/// tool installs the dependencies. A pixi project packaged with
+/// poetry-core, PDM's backend or uv's is still installed by pixi, and is
+/// not told to make a lock pixi never reads.
+#[test]
+fn a_pixi_project_packaged_with_another_tools_backend_is_still_pixis() {
+    let overrides = [six("aaaaaaaa-0000-4000-8000-000000000638")];
+    for backend in ["poetry.core.masonry.api", "pdm.backend", "uv_build"] {
+        let pyproject =
+            format!("[project]\nname = \"app\"\n\n[build-system]\nbuild-backend = \"{backend}\"\n");
+        let result = rewrite_registry_redirect(
+            &files(&[
+                ("pixi.lock", "version: 6\n"),
+                ("pyproject.toml", &pyproject),
+            ]),
+            &overrides,
+        );
+        assert!(
+            codes(&result).contains(&PIXI_CODE),
+            "{backend}: {:?}",
+            codes(&result)
+        );
+        assert!(no_lockfile_warnings(&result).is_empty(), "{backend}");
+    }
+}
+
 /// A file a PyPI rewriter reads still owns the project's diagnostics in a
 /// pixi project (pip installing a requirements file into the pixi
 /// environment), and no pypi patch means nothing to say.

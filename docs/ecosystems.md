@@ -980,25 +980,34 @@ pixi install && socket-patch apply
 - **A project only pixi installs never falls back to the Python on `PATH`.** With a
   `pixi.toml` or `pixi.lock` at the root and no environment installed, nothing is
   installed for the project; the scan says so instead of crawling the system
-  interpreter. A `requirements.txt`, `setup.py` or `setup.cfg` beside pixi's files
-  keeps that fallback: pip installs from those, so the interpreter on `PATH` may hold
-  the project's packages (a container image that runs `pip install -r
-  requirements.txt`). A `pyproject.toml` does not: pixi reads it as its manifest, or
-  installs the project it describes.
+  interpreter. A file pip installs from beside pixi's files keeps that fallback,
+  because the interpreter on `PATH` may then hold the project's packages (a container
+  image that runs `pip install -r requirements.txt`, a library that keeps pixi for
+  development and is `pip install`ed in CI): a `requirements.txt`, `setup.py` or
+  `setup.cfg`, or a `pyproject.toml` with a `[build-system]` table. A `pyproject.toml`
+  that only holds project metadata or tool settings does not.
+- **Environments are a project's only beside pixi's files.** `.pixi/envs` is read
+  where a `pixi.toml` or `pixi.lock` is. In the home directory the same path holds
+  the tool environments of `pixi global install`, which only `--global` reads.
 - **From a workspace member directory, use `pixi run`.** The environments are under the
-  workspace root's `.pixi/envs`. Run from a directory below it, socket-patch uses the
-  environment `pixi run` or `pixi shell` activated for that workspace; without an
-  activation it finds none there.
+  workspace root's `.pixi/envs`. Run from a member directory (one with a `pixi.toml` of
+  its own and no environments of its own), socket-patch uses the environment `pixi
+  run` or `pixi shell` activated for that workspace; without an activation it finds
+  none there. A directory below the root that is not a pixi project (another tool's
+  project in the same tree) is not given the workspace's environment.
+- **A venv layered on a pixi environment** (`--system-site-packages`, built on the
+  environment's Python) hides, for its own interpreter, the packages it installs too.
+  The environment's copies are still patched: `pixi run` imports them.
 - **A conda build is patched only as the PyPI release it repackages.** A patch is
   made from a PyPI release and records the hash of each file it replaces there. A
   copy conda built (its `INSTALLER` says `conda`, or it has none) takes that patch
   only when all of this holds, and no flag changes it, `--force` and
   `--allow-patch-conflicts` included:
-  - the patch is for a pure-Python wheel (`…-none-any`) and the copy does not say it
-    holds compiled code (`Root-Is-Purelib: false` in its `WHEEL`). A compiled conda
-    package is built separately from the PyPI wheel and links conda's own libraries,
-    so it is never that release, even when the Python file a patch touches is
-    identical;
+  - the patch is not for a platform wheel, and the copy holds no compiled code: its
+    `WHEEL` says `Root-Is-Purelib: true`, or, for an install without one
+    (`.egg-info`), no extension module is among its files. A compiled conda package
+    is built separately from the PyPI wheel and links conda's own libraries, so it is
+    never that release, even when the Python file a patch touches is identical;
   - every file the patch replaces has the release's bytes, and the patch replaces at
     least one file. A file that differs (a recipe that changes the source) is never
     overwritten, and nothing of the copy is changed.
@@ -1007,7 +1016,10 @@ pixi install && socket-patch apply
   `conda_build_not_pypi_release`, when no installed copy can take it because it is a
   compiled conda build; nothing is recorded and the run exits 0. A patch already in
   the manifest that a copy cannot take makes `apply` fail for that copy with the same
-  code, or with `no matching variant found` when a replaced file differs. A wheel
+  code (the error names `socket-patch remove`, which drops the record), or with `no
+  matching variant found` when a replaced file differs. A copy that already holds the
+  patch, as one an earlier release patched does, has nothing written to it and is
+  reported as already patched. `--strict` is as strict as anywhere else. A wheel
   that pip or uv installed into the environment (`[pypi-dependencies]`, or `pip
   install` in a conda environment) is the PyPI release itself and is patched as
   anywhere else. **Not compared:** the files a patch leaves alone. A patch record

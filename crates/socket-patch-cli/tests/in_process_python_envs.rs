@@ -1155,13 +1155,27 @@ async fn pixi_fresh_checkout_never_scans_the_system_python() {
 #[serial]
 async fn pixi_project_that_pip_also_installs_keeps_the_interpreter_crawl() {
     use socket_patch_cli::commands::scan::ScanMode;
-    for mode in [ScanMode::Agent, ScanMode::Vendored, ScanMode::Hosted] {
+    // A requirements file, or a `pyproject.toml` packaged with a build
+    // backend (a library that keeps pixi for development and is `pip
+    // install`ed elsewhere).
+    let pip_files = [
+        ("requirements.txt", "image-pkg==1.0.0\n"),
+        (
+            "pyproject.toml",
+            "[project]\nname = \"lib\"\nversion = \"0.1.0\"\n\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
+        ),
+    ];
+    for ((pip_file, text), mode) in pip_files.into_iter().flat_map(|file| {
+        [ScanMode::Agent, ScanMode::Vendored, ScanMode::Hosted]
+            .into_iter()
+            .map(move |mode| (file, mode))
+    }) {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("service");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("pixi.toml"), "[workspace]\n").unwrap();
         std::fs::write(project.join("pixi.lock"), "version: 6\n").unwrap();
-        std::fs::write(project.join("requirements.txt"), "image-pkg==1.0.0\n").unwrap();
+        std::fs::write(project.join(pip_file), text).unwrap();
         let home = tmp.path().join("home");
         let system = home
             .join("anaconda3")
@@ -1176,7 +1190,7 @@ async fn pixi_project_that_pip_also_installs_keeps_the_interpreter_crawl() {
         let mut args = default_args(&project, server.uri());
         args.mode = Some(mode);
         let code = scan_unactivated(args, &home).await;
-        assert_eq!(code, 0, "{mode:?}");
+        assert_eq!(code, 0, "{pip_file} {mode:?}");
         assert_discovered(&batch_bodies(&server).await, "pkg:pypi/image-pkg@1.0.0");
     }
 }
