@@ -1180,6 +1180,78 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   Maven and carries the default form is enforced by Maven 3 only, so its checksum is not
   taken; the statement itself does not depend on it, since the suffixed version is the
   pin.
+* **The Socket repository is asked only for the patched version (hosted Maven 3.9.2+,
+  and Maven 4 in a project that declares it).**
+  Maven asks a `<repository>` a pom declares, before Maven Central, for every artifact
+  and parent pom its local repository does not hold yet. With each pin, hosted mode
+  therefore also writes a prefix file for
+  [Maven Resolver's remote repository filter](https://maven.apache.org/resolver/remote-repository-filtering.html),
+  `.mvn/socket-patch/prefixes-socket-patch-<uuid>.txt`, listing the one path that
+  repository serves (`/<group/path>/<artifact>/<version>-socket.<hex8>`), and two lines
+  in `.mvn/maven.config` that switch the `prefixes` filter on and point it at
+  `.mvn/socket-patch`. Maven then asks the Socket repository for the patched version's
+  jar and pom and for nothing else, from the project root, a module directory or with
+  `-f <project>/pom.xml` from outside the project. A repository with no file of its own
+  in that directory is not filtered. This needs **Maven 3.9.2 or later**. Before 3.9 the
+  two properties mean nothing, and 3.9.0 / 3.9.1 do not interpolate the directory, so
+  the file is never found: those builds run as before, unfiltered. Behind a mirror the
+  repository takes the mirror's id, so its file is not read and nothing is filtered.
+  - **The directory follows the project's Maven, like the checksums directory.** The
+    line names `.mvn/socket-patch` through `${maven.multiModuleProjectDirectory}`, which
+    no Maven 3 build fails on wherever it is started. Maven 4 does not read that
+    property, so a project that declares Maven 4 (a Maven Wrapper that pins it, or a
+    root pom of model 4.1.0) gets `${session.rootDirectory}` instead, the only form
+    Maven 4 reads; a Maven 4 build of a project that does not declare it runs
+    unfiltered. A line in the other spelling is respelled by the next hosted scan (and
+    by a `rollback` that leaves it), whatever the scan redirects: under
+    `${session.rootDirectory}` it stops Maven 3.9.2 to 3.9.8 from starting with `-f`
+    from outside the project. When that takes the filter away from a Maven 4 build of a
+    project that declares no Maven, `redirect_maven_repository_filter_maven3_only`
+    (`maven_repository_filter_maven3_only` on a rollback) says so. When the Maven
+    Wrapper pins a Maven older than 3.9.2, the files are written all the same and
+    `redirect_maven_repository_filter_unread` says that this Maven does not read them.
+  - **One directory per build.** The filter reads its files from one directory, so
+    once the two lines are committed every build of the project reads prefix files
+    from `.mvn/socket-patch/` only. The scan that adds the lines says so, once
+    (`redirect_maven_repository_filter_enabled`): a prefix file you keep anywhere else
+    (the local repository's default directory, say) is no longer read. Move it into
+    `.mvn/socket-patch/`, or name its directory on the build's command line
+    (`-Daether.remoteRepositoryFilter.prefixes.basedir=...`, which wins over
+    `maven.config`).
+  - **Left to whoever configured it.** When `.mvn/maven.config` or `.mvn/jvm.config`
+    already configures the prefix filter, or the environment of the machine that scans
+    does (`MAVEN_OPTS`, `MAVEN_ARGS`, `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`), hosted
+    mode writes neither the lines nor the file and warns
+    `redirect_maven_repository_filter_conflict` for each patch; the pin still lands and
+    the Socket repository stays unfiltered. To filter it yourself, list the path the
+    warning names in a `prefixes-socket-patch-<uuid>.txt` file of your own directory.
+    Only the scanning machine's environment is known: a flag a CI job passes is not.
+  - **Never in the way of a pin.** The filter is an extra. Where it cannot be written,
+    the pin lands without it and the scan says so
+    (`redirect_maven_repository_filter_skipped`): a `.mvn/maven.config` that is a
+    symbolic link or sits in a directory that does not take the write and does not hold
+    the two lines yet, or a link or a directory under the name of a pin's filter file.
+  - **Written with the pin.** A file that did not list the pinned version would fail
+    the build, so it is written from the pin's own coordinates, in the same run. A file
+    that is there and lists the path is left as it is, whatever its line endings and
+    whatever comment you added. A pin an earlier release wrote gets no file on a
+    re-scan (a re-run stays edit-free, as for the Trusted Checksums): `rollback`, then
+    `scan`, writes it.
+  - **Never emptied.** When a scan takes a Socket repository out of the poms (a newer
+    patch replaced it, or its last pin went), that repository's file stays exactly as
+    it is: a scan writes files and removes none. No pom names its repository, so Maven
+    does not read it, and it is the right file if the wiring comes back by a pom-only
+    revert or a merge. `rollback` and `remove` delete it. With the last such repository
+    gone, the scan takes the two lines out of `.mvn/maven.config`, unless the directory
+    holds a file of your own, which is read through those lines.
+  - **Taken out with the pin.** `rollback` and `remove` delete the files of the pins
+    they restore, and any whose repository no pom declares any more. Once the directory
+    is empty they also take the two lines out of `.mvn/maven.config`, byte for byte
+    (the lines name a directory only hosted mode uses, so they are told from yours); a
+    file of your own in that directory keeps them. A config they cannot write (a
+    symbolic link, say) keeps the lines too, and a directory they cannot list is left
+    whole; the pins are restored all the same, and `maven_repository_filter_left` says
+    what to remove by hand.
 * **A Maven project's scan is scoped to its dependency graph.** The Maven local
   repository is shared by every project on the machine, so in project mode (no
   `--global` / `--global-prefix`) a Maven build's crawl (a `pom.xml`, no Gradle or

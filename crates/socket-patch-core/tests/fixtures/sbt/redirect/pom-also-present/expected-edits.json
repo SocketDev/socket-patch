@@ -24,6 +24,19 @@
     "key": "trustedChecksums"
   },
   {
+    "path": ".mvn/maven.config",
+    "kind": "redirect_maven_config",
+    "action": "added",
+    "key": "repositoryFilter"
+  },
+  {
+    "path": ".mvn/socket-patch/prefixes-socket-patch-abcdef12-0000-4000-8000-000000000001.txt",
+    "kind": "redirect_maven_repository_filter",
+    "action": "added",
+    "key": "socket-patch-abcdef12-0000-4000-8000-000000000001",
+    "new": "/org/apache/commons/commons-lang3/3.11-socket.abcdef12"
+  },
+  {
     "path": ".mvn/checksums/checksums.sha256",
     "kind": "redirect_maven_trusted_checksums",
     "action": "added"

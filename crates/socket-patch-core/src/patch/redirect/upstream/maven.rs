@@ -38,7 +38,7 @@ use super::{by_uuid, read_or_refuse, Ctx, FormatResult, HostedPin, View};
 use crate::formats::maven::declared_maven::DeclaredMaven;
 use crate::formats::maven::trusted_checksums;
 use crate::patch::redirect::{
-    generation, heal_trade_detail, maven_repositories_with_id, maven_tag_inner_range,
+    generation, heal_maven_config, maven_repositories_with_id, maven_tag_inner_range,
     maven_tag_text_in, remove_maven_repository, MAVEN_DEPENDENCY_BLOCK_RE, MVN_CHECKSUMS,
     MVN_CONFIG, MVN_WRAPPER_PROPERTIES,
 };
@@ -569,8 +569,10 @@ pub(crate) async fn restore(
         })
         .collect();
     dirs.insert(String::new());
+    let unscoped = unscope(view, &restored, &texts, &reactor_poms, &mut result).await;
     for dir in dirs {
-        restore_mvn(view, &dir, &checksum_dirs, &mut result).await;
+        let unscoped = unscoped && dir.is_empty();
+        restore_mvn(view, &dir, &checksum_dirs, unscoped, &mut result).await;
     }
     result
         .handled
@@ -578,17 +580,113 @@ pub(crate) async fn restore(
     result
 }
 
+/// Remove the repository filter files (`.mvn/socket-patch/`) of the
+/// `restored` pins, and any whose repository no pom declares once the
+/// restore is written: a scan writes files and never removes one, so a
+/// patch it superseded or took out leaves its file behind. `true` when the
+/// directory then holds nothing, so the resolver lines that point Maven at
+/// it serve no file.
+///
+/// A directory that cannot be listed to its end may hold anything: no
+/// file in it is deleted, the lines stay, and the restore says so.
+async fn unscope(
+    view: &mut View<'_>,
+    restored: &[&str],
+    texts: &BTreeMap<String, String>,
+    reactor_poms: &BTreeMap<String, String>,
+    result: &mut FormatResult,
+) -> bool {
+    use crate::formats::maven::repository_filter;
+    let disk = crate::vendor::lock_inventory::ProjectView::Disk(view.root());
+    let dir = crate::patch::redirect::hosted_maven_filter_dir(&disk).await;
+    if dir.unlistable {
+        result.warnings.push((
+            MAVEN_FILTER_LEFT,
+            format!(
+                "{dir} could not be listed, so the repository filter files in it and the two \
+                 lines of {MVN_CONFIG} that name it were left as they are; remove them by hand \
+                 once the directory can be read, if nothing else needs them",
+                dir = repository_filter::DIR,
+            ),
+        ));
+        return false;
+    }
+    let declared = |id: &str| {
+        let after = texts.iter().chain(
+            reactor_poms
+                .iter()
+                .filter(|(rel, _)| !texts.contains_key(*rel)),
+        );
+        after.into_iter().any(|(_, pom)| pom.contains(id))
+    };
+    // Anything in the directory that is not hosted mode's own file (a file
+    // of the user's, a subdirectory, a link) is left, and so are the lines.
+    let mut left = dir.others;
+    for rel in dir.owned {
+        let ours = rel
+            .rsplit('/')
+            .next()
+            .and_then(repository_filter::owned)
+            .and_then(|id| generation::pin_name_uuid(id, false).map(|uuid| (id, uuid)))
+            .is_some_and(|(id, uuid)| restored.contains(&uuid) || !declared(id));
+        // Read first: the flush then knows the bytes it removes.
+        if ours && matches!(view.read(&rel).await, Ok(Some(_))) {
+            view.remove(&rel);
+        } else {
+            left = true;
+        }
+    }
+    !left
+}
+
+/// The restore left something of the repository filter where it was, and
+/// says what and why.
+const MAVEN_FILTER_LEFT: &str = "maven_repository_filter_left";
+
 /// Drop the restored pins' trusted-checksum lines, and the `.mvn` files
-/// themselves when nothing but hosted mode's content is left. A config
-/// that stays is healed ([`heal_mvn_config`]).
+/// themselves when nothing but hosted mode's content is left. With
+/// `unscoped`, the repository filter's resolver lines go first: they name
+/// a directory only hosted mode uses, so they are told from the user's.
+/// A config that stays is healed ([`heal_mvn_config`]).
 async fn restore_mvn(
     view: &mut View<'_>,
     dir: &str,
     checksum_dirs: &[String],
+    unscoped: bool,
     result: &mut FormatResult,
 ) {
     let config_rel = format!("{dir}{MVN_CONFIG}");
-    let config = view.read(&config_rel).await.ok().flatten();
+    let mut config = view.read(&config_rel).await.ok().flatten();
+    if unscoped {
+        let stripped = config
+            .as_deref()
+            .and_then(crate::formats::maven::repository_filter::strip_config);
+        // Taking the lines out is a courtesy, never the reason a restore
+        // is refused: the flush is all or nothing, and a config it would
+        // not write (a symbolic link, a directory that does not take the
+        // write, a file edited since it was read) keeps the lines. They
+        // then name a directory that holds no file, which filters nothing.
+        if let Some(rest) = stripped {
+            let staged = if rest.is_empty() {
+                view.remove_if_writable(&config_rel).await
+            } else {
+                view.write_if_writable(&config_rel, rest.clone()).await
+            };
+            if staged {
+                config = Some(rest).filter(|rest| !rest.is_empty());
+            } else {
+                result.warnings.push((
+                    MAVEN_FILTER_LEFT,
+                    format!(
+                        "{config_rel} could not be written, so it keeps the two repository \
+                         filter lines hosted mode added (`-Daether.remoteRepositoryFilter.…`); \
+                         the filter files they name were removed, so they filter nothing. \
+                         Remove them by hand if nothing else needs them"
+                    ),
+                ));
+            }
+        }
+    }
     let removed = drop_checksums(
         view,
         dir,
@@ -652,13 +750,15 @@ async fn drop_checksums(
     false
 }
 
-/// The block hosted mode wrote into a `.mvn/maven.config` that stays
+/// The lines hosted mode wrote into a `.mvn/maven.config` that stays
 /// (`config`, at `config_rel`), respelled for the Maven the project under
-/// `dir` declares ([`trusted_checksums::heal_basedir`]): the lines are left
-/// in place, but the one an earlier release wrote must not go on stopping
-/// Maven 3.9.2 to 3.9.8 from starting with `-f` from outside the project.
-/// What that trades away on Maven 4 is said, as the scan says it. Left out
-/// where the config cannot be written ([`View::write_if_writable`]).
+/// `dir` declares ([`heal_maven_config`]: the Trusted Checksums block, and
+/// the repository filter's directory line where a file of the user's keeps
+/// it). They are left in place, but one that names its directory through
+/// `${session.rootDirectory}` must not go on stopping Maven 3.9.2 to 3.9.8
+/// from starting with `-f` from outside the project. What that trades away
+/// on Maven 4 is said, as the scan says it. Left out where the config
+/// cannot be written ([`View::write_if_writable`]).
 async fn heal_mvn_config(
     view: &mut View<'_>,
     dir: &str,
@@ -666,10 +766,9 @@ async fn heal_mvn_config(
     config: &str,
     result: &mut FormatResult,
 ) {
-    use trusted_checksums::Basedir;
-    // The cheap test first: only a config that holds a block in either
+    // The cheap test first: only a config that holds such lines in either
     // spelling is worth reading the wrapper and the pom for.
-    if !trusted_checksums::holds_written_block(config) {
+    if !crate::formats::maven::holds_respellable_lines(config) {
         return;
     }
     // The flush refuses a write through a symbolic link, and the whole
@@ -685,21 +784,19 @@ async fn heal_mvn_config(
         .flatten();
     let pom = view.read(&format!("{dir}pom.xml")).await.ok().flatten();
     let declared = DeclaredMaven::of(wrapper.as_deref(), pom.as_deref());
-    let Some(healed) = trusted_checksums::heal_basedir(config, Basedir::for_maven(&declared))
-    else {
+    let Some(healed) = heal_maven_config(config, &declared, dir) else {
         return;
     };
-    let trade = heal_trade_detail(&healed, &declared, dir);
     // A courtesy, never the reason a restore is refused: a config the
     // flush would not write (a symbolic link, say) keeps its line, as it
     // did before there was a heal, and the pins are restored all the same.
-    if !view.write_if_writable(config_rel, healed).await {
+    if !view.write_if_writable(config_rel, healed.text).await {
         return;
     }
-    if let Some(detail) = trade {
-        result
-            .warnings
-            .push(("maven_trusted_checksums_maven3_only", detail));
+    for (lines, trade) in healed.lines {
+        if let Some(detail) = trade {
+            result.warnings.push((lines.restore_trade(), detail));
+        }
     }
 }
 
@@ -1164,6 +1261,34 @@ mod tests {
                 pin.uuid
             );
         }
+        // A repository filter file lists the one version its repository
+        // serves, whether or not a pom still declares that repository: one
+        // that listed anything else, or nothing, would fail the build of a
+        // pin, also of one that comes back by a pom-only revert. A scan
+        // never empties a file.
+        use crate::formats::maven::repository_filter;
+        for (rel, text) in &tree {
+            let Some(id) = repository_filter::owned_rel(rel) else {
+                assert!(!rel.starts_with(".mvn/socket-patch/"), "{case}: {rel}");
+                continue;
+            };
+            let uuid = generation::pin_name_uuid(id, false).expect("a filter file");
+            assert!(
+                repository_filter::lists(
+                    text,
+                    &format!("/org/slf4j/slf4j-api/1.7.36-socket.{}", &uuid[..8])
+                ),
+                "{case}: {rel}: {text:?}"
+            );
+        }
+        // And every pin a scan of this release wired has one.
+        let scoped = tree
+            .get(MVN_CONFIG)
+            .is_some_and(|config| config.contains(repository_filter::DIR));
+        for pin in pins.iter().filter(|_| scoped) {
+            let rel = repository_filter::file_rel(&generation::hosted_pin_name(&pin.uuid));
+            assert!(tree.contains_key(&rel), "{case}: no {rel}");
+        }
         pins
     }
 
@@ -1200,8 +1325,14 @@ mod tests {
             .iter()
             .map(|(rel, text)| (rel.to_string(), text.clone()))
             .collect();
-        let suffixed_in =
-            |tree: &BTreeMap<String, String>| tree.values().any(|text| text.contains("-socket."));
+        // (A filter file a scan retired aside: it names its patch for as
+        // long as it stays, and no pom reads it.)
+        let retired =
+            |rel: &str| crate::formats::maven::repository_filter::owned_rel(rel).is_some();
+        let suffixed_in = |tree: &BTreeMap<String, String>| {
+            tree.iter()
+                .any(|(rel, text)| !retired(rel) && text.contains("-socket."))
+        };
 
         let tmp = tempfile::tempdir().unwrap();
         write_tree(tmp.path(), files);
@@ -1245,9 +1376,9 @@ mod tests {
         );
         assert!(
             !read_tree(tmp.path())
-                .values()
-                .any(|text| text.contains(&UUID[..8])),
-            "{case}: nothing of the first patch is left: {:#?}",
+                .iter()
+                .any(|(rel, text)| !retired(rel) && text.contains(&UUID[..8])),
+            "{case}: nothing of the first patch is left but its retired filter file: {:#?}",
             read_tree(tmp.path())
         );
         let again = scan(tmp.path(), NEWER, picks);
@@ -1263,13 +1394,20 @@ mod tests {
             assert_eq!(after.get(rel), Some(text), "{case}: {rel}");
         }
         // (A scan that took out the last pin itself cannot delete the
-        // `.mvn` files it once wrote: they stay, with no line of a patch.)
+        // `.mvn` files it once wrote: they stay, with no line of a patch,
+        // and the filter files as they were, which no pom reads.)
         for rel in after.keys().filter(|rel| !before.contains_key(*rel)) {
             assert!(
-                [MVN_CONFIG, MVN_CHECKSUMS].contains(&rel.as_str()),
+                [MVN_CONFIG, MVN_CHECKSUMS].contains(&rel.as_str()) || retired(rel),
                 "{case}: {rel} is left over"
             );
         }
+        assert!(
+            !after
+                .get(MVN_CONFIG)
+                .is_some_and(|config| config.contains(".mvn/socket-patch")),
+            "{case}: the lines that named the retired files went with the last pin"
+        );
     }
 
     const REACTOR_ROOT: &str = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  \
@@ -1798,6 +1936,348 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|(code, _)| *code == "maven_trusted_checksums_left"),
+            "{:?}",
+            outcome.warnings
+        );
+    }
+
+    /// A scan that met the user's own filter switch wrote no line and no
+    /// file beside it (`redirect_maven_repository_filter_conflict`). The
+    /// rollback of that pin must leave the switch: nothing marks it as
+    /// hosted mode's, and it was there before.
+    #[tokio::test]
+    async fn the_users_own_filter_switch_survives_a_rollback() {
+        let switch = "-Daether.remoteRepositoryFilter.prefixes=true";
+        // What the scan left: the user's line, then the Trusted Checksums
+        // settings it appended.
+        let config = format!(
+            "{switch}\n{}\n",
+            super::trusted_checksums::CONFIG_ARGS.join("\n")
+        );
+        let files = vec![
+            ("pom.xml", fixture("basic", "expected", "pom.xml")),
+            (".mvn/maven.config", config.clone()),
+            (
+                ".mvn/checksums/checksums.sha256",
+                fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+            ),
+        ];
+        let (outcome, after) = run(&files).await;
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(after["pom.xml"], fixture("basic", "input", "pom.xml"));
+        assert_eq!(after[".mvn/maven.config"], config);
+        // Nor the directory line of another filter directory of theirs.
+        let theirs = format!(
+            "{switch}\n-Daether.remoteRepositoryFilter.prefixes.basedir=\
+             ${{session.rootDirectory}}/.mvn/rrf\n{}\n",
+            super::trusted_checksums::CONFIG_ARGS.join("\n")
+        );
+        let mut files = files;
+        files[1].1 = theirs.clone();
+        let (_, after) = run(&files).await;
+        assert_eq!(after[".mvn/maven.config"], theirs);
+    }
+
+    /// The repository filter is taken out with its pin: the pin's file, a
+    /// file whose repository no pom declares any more (a scan retires one
+    /// and cannot remove it), and the two resolver lines, which name a
+    /// directory only hosted mode uses. A line of the user's stays where
+    /// it was, and so do the trusted-checksums lines beside it.
+    #[tokio::test]
+    async fn the_repository_filter_goes_with_its_pin() {
+        const FILTER: &str =
+            ".mvn/socket-patch/prefixes-socket-patch-77777777-7777-7777-7777-777777777777.txt";
+        const RETIRED: &str =
+            ".mvn/socket-patch/prefixes-socket-patch-66666666-6666-4666-8666-666666666666.txt";
+        let config = format!("-B\n{}", fixture("basic", "expected", ".mvn/maven.config"));
+        assert!(config.contains(".mvn/socket-patch"), "{config}");
+        let tree = |more: &[(&'static str, String)]| {
+            let mut files = vec![
+                ("pom.xml", fixture("basic", "expected", "pom.xml")),
+                (".mvn/maven.config", config.clone()),
+                (
+                    ".mvn/checksums/checksums.sha256",
+                    fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+                ),
+                (FILTER, fixture("basic", "expected", FILTER)),
+                (RETIRED, String::new()),
+            ];
+            files.extend(more.iter().cloned());
+            files
+        };
+        let in_dir = |after: &BTreeMap<String, String>| -> Vec<String> {
+            after
+                .keys()
+                .filter(|rel| rel.starts_with(".mvn/socket-patch/"))
+                .cloned()
+                .collect()
+        };
+
+        let (outcome, after) = run(&tree(&[])).await;
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(after["pom.xml"], fixture("basic", "input", "pom.xml"));
+        assert_eq!(in_dir(&after), Vec::<String>::new());
+        assert_eq!(
+            after[".mvn/maven.config"],
+            format!("-B\n{}\n", super::trusted_checksums::CONFIG_ARGS.join("\n"))
+        );
+
+        // A file of the user's in that directory keeps the lines that make
+        // Maven read it.
+        const THEIRS: &str = ".mvn/socket-patch/prefixes-central.txt";
+        let theirs = "## repository-prefixes/2.0\n/org\n".to_string();
+        let (outcome, after) = run(&tree(&[(THEIRS, theirs)])).await;
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(in_dir(&after), [THEIRS]);
+        assert_eq!(after[".mvn/maven.config"], config);
+    }
+
+    /// The filter's lines are hosted mode's in either spelling of their
+    /// directory: a rollback takes the session's out as it takes the
+    /// launcher's, byte for byte. Where a file of the user's keeps them,
+    /// the directory line that stays is respelled for the Maven the
+    /// project declares, like the Trusted Checksums block beside it, and
+    /// what that trades away on Maven 4 is said.
+    #[tokio::test]
+    async fn filter_lines_in_either_spelling_go_or_are_healed() {
+        use crate::formats::maven::declared_maven::RootDirectory::{Launcher, Session};
+        use crate::formats::maven::{repository_filter, trusted_checksums};
+        const FILTER: &str =
+            ".mvn/socket-patch/prefixes-socket-patch-77777777-7777-7777-7777-777777777777.txt";
+        const THEIRS: &str = ".mvn/socket-patch/prefixes-central.txt";
+        // (The fixture declares no Maven: both directories are named
+        // through the launcher's property.)
+        let wired = fixture("basic", "expected", ".mvn/maven.config");
+        assert_eq!(repository_filter::form(&wired), Some(Launcher));
+        let in_session = wired.replace(
+            repository_filter::basedir_value(Launcher),
+            repository_filter::basedir_value(Session),
+        );
+        assert_eq!(repository_filter::form(&in_session), Some(Session));
+        let tree = |config: &str, more: &[(&'static str, String)]| {
+            let mut files = vec![
+                ("pom.xml", fixture("basic", "expected", "pom.xml")),
+                (".mvn/maven.config", config.to_string()),
+                (
+                    ".mvn/checksums/checksums.sha256",
+                    fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+                ),
+                (FILTER, fixture("basic", "expected", FILTER)),
+            ];
+            files.extend(more.iter().cloned());
+            files
+        };
+        let codes = |outcome: &RestoreOutcome| -> Vec<&'static str> {
+            outcome.warnings.iter().map(|(code, _)| *code).collect()
+        };
+
+        // Nothing of the user's: all the scan wrote goes, whichever
+        // spelling the directory line stands in.
+        for config in [&wired, &in_session] {
+            let (outcome, after) = run(&tree(config, &[])).await;
+            assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+            assert_eq!(after.keys().collect::<Vec<_>>(), ["pom.xml"], "{config}");
+            assert_eq!(after["pom.xml"], fixture("basic", "input", "pom.xml"));
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        }
+
+        // The lines go and a setting of the user's keeps the config: what
+        // stays is the Trusted Checksums block, healed in the same restore
+        // (an earlier release's spelling here), and nothing is said about
+        // a filter line that is gone.
+        let both_in_session = format!(
+            "-B\n{}",
+            in_session.replace(
+                trusted_checksums::basedir_value(Launcher),
+                trusted_checksums::basedir_value(Session),
+            )
+        );
+        assert!(!both_in_session.contains("multiModuleProjectDirectory"));
+        let (outcome, after) = run(&tree(&both_in_session, &[])).await;
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(
+            after[".mvn/maven.config"],
+            format!("-B\n{}\n", trusted_checksums::CONFIG_ARGS.join("\n"))
+        );
+        assert_eq!(
+            codes(&outcome),
+            [
+                "maven_trusted_checksums_left",
+                "maven_trusted_checksums_maven3_only"
+            ],
+            "{:?}",
+            outcome.warnings
+        );
+
+        // A file of the user's in the directory keeps the lines. The one
+        // that names it through the session's property is respelled.
+        let theirs = (THEIRS, "## repository-prefixes/2.0\n/org\n".to_string());
+        let (outcome, after) = run(&tree(&in_session, &[theirs.clone()])).await;
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(after[".mvn/maven.config"], wired);
+        assert_eq!(
+            codes(&outcome),
+            [
+                "maven_trusted_checksums_left",
+                "maven_repository_filter_maven3_only"
+            ],
+            "{:?}",
+            outcome.warnings
+        );
+        let said = &outcome.warnings[1].1;
+        assert!(
+            said.contains("the repository filter's directory")
+                && said.contains("A Maven 4 build of this project no longer does"),
+            "{said}"
+        );
+
+        // This project's own spelling: the bytes are not touched.
+        let (outcome, after) = run(&tree(&wired, &[theirs.clone()])).await;
+        assert_eq!(after[".mvn/maven.config"], wired);
+        assert_eq!(codes(&outcome), ["maven_trusted_checksums_left"]);
+
+        // A project that declares Maven 4 gets the spelling Maven 4 reads,
+        // for both directories, and nothing is traded.
+        let wrapper = (
+            ".mvn/wrapper/maven-wrapper.properties",
+            "distributionUrl=https://repo.maven.apache.org/maven2/org/apache/maven/\
+             apache-maven/4.0.0/apache-maven-4.0.0-bin.zip\n"
+                .to_string(),
+        );
+        let (outcome, after) = run(&tree(&wired, &[theirs, wrapper])).await;
+        let config = &after[".mvn/maven.config"];
+        assert_eq!(repository_filter::form(config), Some(Session), "{config}");
+        assert_eq!(
+            trusted_checksums::Settings::read(config).basedir(),
+            Some(Session),
+            "{config}"
+        );
+        assert_eq!(codes(&outcome), ["maven_trusted_checksums_left"]);
+    }
+
+    /// Taking the filter's lines out is a courtesy, never the reason a
+    /// restore is refused. The flush is all or nothing, so a config it
+    /// would not write (here a symbolic link) keeps the lines: the pin is
+    /// restored all the same, the filter file goes, and the restore says
+    /// which lines it left.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_linked_config_keeps_the_filter_lines_and_refuses_no_restore() {
+        const FILTER: &str =
+            ".mvn/socket-patch/prefixes-socket-patch-77777777-7777-7777-7777-777777777777.txt";
+        // The user's own line keeps the config a file of its own.
+        let config = format!("-B\n{}", fixture("basic", "expected", ".mvn/maven.config"));
+        assert!(config.contains(".mvn/socket-patch"), "{config}");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_tree(
+            root,
+            &[
+                ("pom.xml", fixture("basic", "expected", "pom.xml")),
+                (
+                    ".mvn/checksums/checksums.sha256",
+                    fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+                ),
+                (FILTER, fixture("basic", "expected", FILTER)),
+                ("ci/maven.config", config.clone()),
+            ],
+        );
+        std::os::unix::fs::symlink("../ci/maven.config", root.join(".mvn/maven.config")).unwrap();
+        let pins = [HostedPin {
+            purl: "pkg:maven/org.slf4j/slf4j-api@1.7.36".into(),
+            uuid: UUID.into(),
+            files: vec!["pom.xml".into()],
+        }];
+        let opts = RestoreOptions {
+            offline: true,
+            ..RestoreOptions::default()
+        };
+        let outcome = restore_upstream(root, &pins, &opts).await;
+        assert_eq!(outcome.flush_error, None);
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(
+            std::fs::read_to_string(root.join("pom.xml")).unwrap(),
+            fixture("basic", "input", "pom.xml")
+        );
+        assert!(!root.join(FILTER).exists(), "the pin's filter file goes");
+        assert!(root.join(".mvn/maven.config").is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(root.join("ci/maven.config")).unwrap(),
+            config,
+            "the linked config is not written through"
+        );
+        let left: Vec<&str> = outcome
+            .warnings
+            .iter()
+            .filter(|(code, _)| *code == "maven_repository_filter_left")
+            .map(|(_, detail)| detail.as_str())
+            .collect();
+        assert_eq!(left.len(), 1, "{:?}", outcome.warnings);
+        assert!(
+            left[0].contains(".mvn/maven.config could not be written")
+                && left[0].contains("they filter nothing"),
+            "{}",
+            left[0]
+        );
+    }
+
+    /// A filter directory that cannot be listed may hold anything: no file
+    /// in it is deleted and the lines that name it stay, the pin is
+    /// restored all the same, and the restore says what it left. (Root
+    /// reads anything, so there is nothing to see as root.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unlistable_filter_directory_is_left_and_said_so() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        const FILTER: &str =
+            ".mvn/socket-patch/prefixes-socket-patch-77777777-7777-7777-7777-777777777777.txt";
+        let config = format!("-B\n{}", fixture("basic", "expected", ".mvn/maven.config"));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_tree(
+            root,
+            &[
+                ("pom.xml", fixture("basic", "expected", "pom.xml")),
+                (".mvn/maven.config", config.clone()),
+                (
+                    ".mvn/checksums/checksums.sha256",
+                    fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+                ),
+                (FILTER, fixture("basic", "expected", FILTER)),
+            ],
+        );
+        let dir = root.join(".mvn/socket-patch");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let pins = [HostedPin {
+            purl: "pkg:maven/org.slf4j/slf4j-api@1.7.36".into(),
+            uuid: UUID.into(),
+            files: vec!["pom.xml".into()],
+        }];
+        let opts = RestoreOptions {
+            offline: true,
+            ..RestoreOptions::default()
+        };
+        let outcome = restore_upstream(root, &pins, &opts).await;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(outcome.flush_error, None);
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(
+            std::fs::read_to_string(root.join("pom.xml")).unwrap(),
+            fixture("basic", "input", "pom.xml")
+        );
+        assert!(root.join(FILTER).is_file(), "nothing in it is deleted");
+        let after = std::fs::read_to_string(root.join(".mvn/maven.config")).unwrap();
+        assert!(
+            after.contains(".mvn/socket-patch"),
+            "the lines stay: {after}"
+        );
+        assert!(
+            outcome.warnings.iter().any(|(code, detail)| {
+                *code == "maven_repository_filter_left" && detail.contains("could not be listed")
+            }),
             "{:?}",
             outcome.warnings
         );

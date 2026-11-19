@@ -385,6 +385,12 @@ mod tests {
     /// A hosted Maven pin wired through three files, which the restore
     /// flushes in this order: [`SUMS`] (deleted), [`CONFIG`] (deleted),
     /// [`POM`] (rewritten).
+    ///
+    /// The config holds the Trusted Checksums settings and nothing else,
+    /// as a pin wired without the repository filter leaves it: removing
+    /// that file is part of the restore. (Taking the filter's two lines
+    /// out of a config is a courtesy the restore leaves undone where the
+    /// file cannot be written, so it would refuse nothing here.)
     fn maven_project() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         for rel in [SUMS, CONFIG, POM] {
@@ -396,6 +402,11 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::copy(fixture, path).unwrap();
         }
+        let config = tmp.path().join(CONFIG);
+        let wired = std::fs::read_to_string(&config).unwrap();
+        let checksums_only = crate::formats::maven::repository_filter::strip_config(&wired)
+            .expect("the fixture is wired with the filter");
+        std::fs::write(&config, checksums_only).unwrap();
         tmp
     }
 

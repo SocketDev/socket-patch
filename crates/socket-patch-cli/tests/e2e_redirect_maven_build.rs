@@ -512,6 +512,14 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
         config_after.contains(launcher_line) && !config_after.contains(session_line),
         "a project that declares no Maven takes the default spelling:\n{config_after}"
     );
+    // The repository filter's directory follows the same rule, in the same
+    // run: no line of the config names `${session.rootDirectory}` now.
+    assert!(
+        config_after
+            .contains("prefixes.basedir=${maven.multiModuleProjectDirectory}/.mvn/socket-patch")
+            && !config_after.contains("${session.rootDirectory}"),
+        "both directories take the default spelling:\n{config_after}"
+    );
     let warned = |code: &str| {
         env["warnings"]
             .as_array()
@@ -526,9 +534,16 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
          away, and only then: {env}",
         mvn.version
     );
+    assert_eq!(
+        warned("redirect_maven_repository_filter_maven3_only"),
+        mvn.major() >= 4,
+        "Maven {}: and when it trades the repository filter on Maven 4 away: {env}",
+        mvn.version
+    );
     assert!(
-        !warned("redirect_maven_trusted_checksums_unenforced"),
-        "no Maven is named, so none is said to ignore the pin: {env}"
+        !warned("redirect_maven_trusted_checksums_unenforced")
+            && !warned("redirect_maven_repository_filter_unread"),
+        "no Maven is named, so none is said to ignore the pin or the filter: {env}"
     );
     assert_eq!(
         std::fs::read(undeclared.join("pom.xml")).unwrap(),
@@ -704,7 +719,12 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
         pristine_pom,
         "rollback restores the pom byte-for-byte"
     );
-    for rel in [".mvn/checksums/checksums.sha256", ".mvn/maven.config"] {
+    let filter = format!(".mvn/socket-patch/prefixes-socket-patch-{UUID}.txt");
+    for rel in [
+        ".mvn/checksums/checksums.sha256",
+        ".mvn/maven.config",
+        filter.as_str(),
+    ] {
         assert!(
             !proj.join(rel).exists(),
             "rollback removes the {rel} hosted mode wrote"
@@ -1671,6 +1691,357 @@ mod mediation {
                 std::fs::copy(entry.path(), &target).unwrap();
             }
         }
+    }
+
+    /// A pom's `<repository>` is asked, before Maven Central, for every
+    /// artifact and parent pom the local repository does not hold yet. The
+    /// hosted scan therefore commits, with each pin, the prefix file that
+    /// limits its Socket repository to the pinned version
+    /// (`.mvn/socket-patch/prefixes-socket-patch-<uuid>.txt`) and the two
+    /// resolver lines that make Maven read it.
+    ///
+    /// The line that names the file's directory takes the property the
+    /// Trusted Checksums directory takes: the launcher's, which stops no
+    /// Maven 3 from starting, unless the project declares Maven 4, which
+    /// reads only the session's.
+    ///
+    /// For a single pom and for a reactor, on a local repository that
+    /// holds none of the project's artifacts:
+    ///
+    /// - Maven 3.9.2 and later 3.x ask the Socket repository for the
+    ///   patched version's jar and pom and their checksums, and for nothing
+    ///   else, from the project root and with `-f <project>/pom.xml` from
+    ///   outside it (where a line naming `${session.rootDirectory}` stops
+    ///   Maven 3.9.2 to 3.9.8 from starting at all);
+    /// - an older Maven reads no such file and asks it for the rest too,
+    ///   and still builds (asserted, so a change either way is noticed).
+    ///   So does Maven 4 while the project does not declare it;
+    /// - once the project declares the Maven under test, the next scan
+    ///   leaves a Maven 3 project as it is and respells a Maven 4 project's
+    ///   line, and Maven 4 then asks for nothing else either;
+    /// - without the file (the wiring of an earlier release) every Maven
+    ///   asks for the rest, which also shows the repository was cold;
+    /// - a rollback takes the file and the lines out again, byte for byte.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_hosted_asks_the_socket_repository_only_for_the_patched_version() {
+        use std::collections::BTreeSet;
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let b = Bench::new();
+        // The prefix file is read by repository id, and a mirror gives a
+        // repository its own: this one keeps the id the pom declares, as
+        // the repository has on a machine that reaches patch.socket.dev.
+        let id = format!("socket-patch-{UUID}");
+        let settings = b.root.join("settings-socket-id.xml");
+        let mirror_url = format!("{}{}", b.server.uri(), PATCH.repo_path());
+        write_settings_with_ids(&settings, &[(&id, &id, &mirror_url)]);
+        let repo = format!("{}/", PATCH.repo_path());
+        let victim: BTreeSet<String> = ["jar", "jar.sha1", "pom", "pom.sha1"]
+            .iter()
+            .map(|ext| PATCH.served_path(ext)[repo.len()..].to_string())
+            .collect();
+        // What Maven asked of the Socket repository since request `mark`.
+        let asked = |mark: usize| -> BTreeSet<String> {
+            b.server.paths()[mark..]
+                .iter()
+                .filter_map(|path| path.strip_prefix(repo.as_str()).map(str::to_string))
+                .collect()
+        };
+
+        for reactor in [false, true] {
+            let name = if reactor { "reactor" } else { "single" };
+            let proj = b.root.join(name);
+            if reactor {
+                fixture::write_reactor(&proj, &b.server);
+            } else {
+                fixture::write_project(&proj, Shape::Selected, &b.server);
+            }
+            // Warm the dependency plugin, and resolve what the scan reads
+            // the selection from.
+            let warmed = if reactor {
+                fixture::resolve_reactor(SUITE, &mvn, &proj, &b.m2, &b.plain, "target/before")
+                    .is_some()
+            } else {
+                fixture::resolve(SUITE, &mvn, &proj, &b.m2, &b.plain, "target/before").is_some()
+            };
+            if !warmed {
+                return;
+            }
+            // The wired project, resolved into the local repository `m2`
+            // (no fallback: nothing here may reach beyond the test's
+            // server), from the project root, or with `-f` from a directory
+            // outside the project.
+            let elsewhere = b.root.join(format!("elsewhere-{name}"));
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            let root_pom = proj.join("pom.xml");
+            let goal = format!("{DEPENDENCY_PLUGIN}:copy-dependencies");
+            let resolve = |m2: &Path, outside: bool, what: &str| {
+                let out = if outside {
+                    let out_dir = format!("-DoutputDirectory={}", elsewhere.join("dep").display());
+                    let args = ["-f", root_pom.to_str().unwrap(), &goal, &out_dir];
+                    mvn.run(&elsewhere, m2, &settings, &args)
+                } else {
+                    mvn.copy_dependencies(&proj, m2, &settings, "target/after")
+                };
+                assert!(
+                    ok(&out),
+                    "{name}, Maven {}, {what}:\n{}",
+                    mvn.version,
+                    dump(&out)
+                );
+                let _ = std::fs::remove_dir_all(proj.join("target"));
+                for (module, ..) in fixture::REACTOR_MODULES {
+                    let _ = std::fs::remove_dir_all(proj.join(module).join("target"));
+                }
+            };
+            let pristine = fixture::snapshot(&proj);
+
+            let (code, env, stderr) = b.scan(&proj);
+            assert_eq!(code, Some(0), "{name}: {env}\n{stderr}");
+            assert_eq!(env["summary"]["applied"], 1, "{name}: {env}");
+            let filter = proj.join(format!(".mvn/socket-patch/prefixes-{id}.txt"));
+            let listed = std::fs::read_to_string(&filter)
+                .unwrap_or_else(|e| panic!("{name}: {}: {e}", filter.display()));
+            assert_eq!(
+                listed.lines().last(),
+                Some(
+                    format!(
+                        "/{}/{}/{}",
+                        fixture::GROUP_PATH,
+                        fixture::VICTIM,
+                        b.suffixed
+                    )
+                    .as_str()
+                ),
+                "{name}: {listed}"
+            );
+            assert!(
+                warning(&env, "redirect_maven_repository_filter_conflict").is_none(),
+                "{name}: {env}"
+            );
+            // The project declares no Maven: the directory is named through
+            // the launcher's property, which Maven 4 does not read.
+            let config = || std::fs::read_to_string(proj.join(".mvn/maven.config")).unwrap();
+            let names_dir = |property: &str| {
+                let line = format!(
+                    "-Daether.remoteRepositoryFilter.prefixes.basedir={property}/.mvn/socket-patch"
+                );
+                config().lines().any(|l| l == line)
+            };
+            let (launcher, session) = (
+                "${maven.multiModuleProjectDirectory}",
+                "${session.rootDirectory}",
+            );
+            assert!(
+                names_dir(launcher) && !config().contains(session),
+                "{name}:\n{}",
+                config()
+            );
+            let reads_launcher = mvn.filters_repositories() && mvn.major() < 4;
+
+            // A local repository with the dependency plugin and none of
+            // the project's artifacts.
+            let cold = |tag: &str| -> PathBuf {
+                let m2 = b.root.join(format!("m2-{name}-{tag}"));
+                copy_tree(&b.m2, &m2);
+                std::fs::remove_dir_all(m2.join("com").join("socketfixture")).unwrap();
+                m2
+            };
+            let rest = |asked: &BTreeSet<String>| -> Vec<String> {
+                asked.difference(&victim).cloned().collect()
+            };
+
+            // From the project root, then with `-f` from outside it, where
+            // Maven 3.9.2 to 3.9.8 would not start at all on a line that
+            // named the directory through `${session.rootDirectory}`.
+            for (outside, tag, whence) in [
+                (false, "filtered", "from the project root"),
+                (true, "outside", "with -f from outside the project"),
+            ] {
+                let mark = b.server.paths().len();
+                resolve(&cold(tag), outside, whence);
+                let filtered = asked(mark);
+                assert!(
+                    filtered.is_superset(&victim),
+                    "{name}, {whence}: the patched version comes from the Socket repository: \
+                     {filtered:?}"
+                );
+                if reads_launcher {
+                    assert_eq!(
+                        rest(&filtered),
+                        Vec::<String>::new(),
+                        "{name}, {whence}: Maven {} asks the Socket repository for nothing else",
+                        mvn.version
+                    );
+                } else {
+                    assert!(
+                        !rest(&filtered).is_empty(),
+                        "{name}, {whence}: Maven {} does not read the prefix file of a project \
+                         that does not declare it: {filtered:?}",
+                        mvn.version
+                    );
+                }
+            }
+
+            // The project declares the Maven under test (its Maven Wrapper
+            // pins it) and is scanned again. A Maven 3 keeps the line; a
+            // Maven 4 gets the spelling it reads, and filters from then on,
+            // from the root and from outside. A Maven too old to read the
+            // filter is told so.
+            let wrapper = proj.join(".mvn/wrapper/maven-wrapper.properties");
+            std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "distributionUrl=https\\://repo.maven.apache.org/maven2/org/apache/maven/\
+                     apache-maven/{v}/apache-maven-{v}-bin.zip\n",
+                    v = mvn.version
+                ),
+            )
+            .unwrap();
+            let (code, env, stderr) = b.scan(&proj);
+            assert_eq!(code, Some(0), "{name}, declared: {env}\n{stderr}");
+            let declares_4 = mvn.major() >= 4;
+            assert!(
+                names_dir(session) == declares_4 && names_dir(launcher) != declares_4,
+                "{name}: a project that declares Maven {}:\n{}",
+                mvn.version,
+                config()
+            );
+            assert_eq!(
+                warning(&env, "redirect_maven_repository_filter_unread").is_some(),
+                !mvn.filters_repositories(),
+                "{name}: Maven {}: {env}",
+                mvn.version
+            );
+            if declares_4 {
+                for (outside, tag, whence) in [
+                    (false, "declared", "from the project root"),
+                    (true, "declared-outside", "with -f from outside the project"),
+                ] {
+                    let mark = b.server.paths().len();
+                    resolve(&cold(tag), outside, whence);
+                    let filtered = asked(mark);
+                    assert!(
+                        filtered.is_superset(&victim) && rest(&filtered).is_empty(),
+                        "{name}, {whence}: Maven {}, declared, asks the Socket repository for \
+                         the patched version only: {filtered:?}",
+                        mvn.version
+                    );
+                }
+            }
+
+            std::fs::remove_file(&filter).unwrap();
+            let mark = b.server.paths().len();
+            resolve(&cold("unfiltered"), false, "without the prefix file");
+            let unfiltered = asked(mark);
+            assert!(
+                unfiltered.is_superset(&victim) && !rest(&unfiltered).is_empty(),
+                "{name}: without the file every Maven asks for the rest: {unfiltered:?}"
+            );
+            std::fs::write(&filter, listed).unwrap();
+
+            b.rollback(&proj);
+            // (The wrapper pin is the test's own, not the scan's.)
+            std::fs::remove_file(&wrapper).unwrap();
+            let after = fixture::snapshot(&proj);
+            let differ: BTreeSet<&String> = after
+                .keys()
+                .chain(pristine.keys())
+                .filter(|rel| after.get(*rel) != pristine.get(*rel))
+                .collect();
+            assert!(
+                differ.is_empty(),
+                "{name}: a rollback takes the filter and its lines out again; these differ: \
+                 {differ:?}"
+            );
+        }
+    }
+
+    /// The repository filter is an extra, and a pin never waits for it. A
+    /// project whose `.mvn/maven.config` is a symbolic link cannot take the
+    /// filter's two lines: a write would replace the link, which a scan
+    /// refuses for every file. The scan lands the pin without the filter,
+    /// exits 0 and says so, where the two lines used to refuse the whole
+    /// run. Maven reads the config through the link and resolves the
+    /// patched jar, a re-scan writes nothing, and a rollback puts every
+    /// file back.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_hosted_lands_the_pin_where_the_config_is_a_link() {
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let b = Bench::new();
+        let proj = b.root.join("linked");
+        fixture::write_project(&proj, Shape::Selected, &b.server);
+        let Some(before) = fixture::resolve(SUITE, &mvn, &proj, &b.m2, &b.plain, "target/before")
+        else {
+            return;
+        };
+        // The team keeps its Maven arguments in one place and links them
+        // in: a setting of its own, and the Trusted Checksums settings (an
+        // earlier scan wrote them before the file was moved), so the
+        // filter's two lines are the only write the config would take.
+        let config = [
+            "-B",
+            "-Daether.artifactResolver.postProcessor.trustedChecksums=true",
+            "-Daether.artifactResolver.postProcessor.trustedChecksums.checksumAlgorithms=SHA-256",
+            "-Daether.artifactResolver.postProcessor.trustedChecksums.failIfMissing=false",
+            "-Daether.trustedChecksumsSource.summaryFile=true",
+            "-Daether.trustedChecksumsSource.summaryFile.basedir=${maven.multiModuleProjectDirectory}/.mvn/checksums",
+            "-Daether.trustedChecksumsSource.summaryFile.originAware=false",
+            "",
+        ]
+        .join("\n");
+        std::fs::create_dir_all(proj.join("ci")).unwrap();
+        std::fs::create_dir_all(proj.join(".mvn")).unwrap();
+        std::fs::write(proj.join("ci/maven.config"), &config).unwrap();
+        let link = proj.join(".mvn/maven.config");
+        std::os::unix::fs::symlink("../ci/maven.config", &link).unwrap();
+        let pristine = fixture::snapshot(&proj);
+
+        let (code, env, stderr) = b.scan(&proj);
+        assert_eq!(code, Some(0), "{env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 1, "{env}");
+        let wired = std::fs::read_to_string(proj.join("pom.xml")).unwrap();
+        assert!(
+            wired.contains(&b.suffixed) && wired.contains(&format!("<id>socket-patch-{UUID}</id>")),
+            "the pin landed:\n{wired}"
+        );
+        let skipped = warning(&env, "redirect_maven_repository_filter_skipped")
+            .unwrap_or_else(|| panic!("the scan says the filter was skipped: {env}"));
+        assert!(
+            skipped["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains(".mvn/maven.config cannot be written")),
+            "{skipped}"
+        );
+        assert!(link.is_symlink(), "the link is still a link");
+        assert_eq!(
+            std::fs::read_to_string(proj.join("ci/maven.config")).unwrap(),
+            config,
+            "and nothing was written through it"
+        );
+        assert!(
+            !proj.join(".mvn/socket-patch").exists(),
+            "no filter file without the lines that would make Maven read it"
+        );
+
+        let after = fixture::resolve_warm(&mvn, &proj, &b.m2, &b.mirrored, "target/after", &[]);
+        b.assert_only_the_victim_is_patched("behind a linked config", &before, &after);
+        b.assert_rescan_is_a_no_op(&proj);
+
+        b.rollback(&proj);
+        assert!(link.is_symlink());
+        assert_eq!(
+            fixture::snapshot(&proj),
+            pristine,
+            "rollback restores every file byte for byte and leaves none behind"
+        );
     }
 
     /// A company's `<mirrorOf>*</mirrorOf>` sends every repository to its

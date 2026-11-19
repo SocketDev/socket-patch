@@ -17,8 +17,9 @@ pub(crate) use properties::{
 
 use super::xml::{blank_non_markup, child_text, elements, open_tags, Element};
 
-pub(crate) mod mirror;
 pub(crate) mod declared_maven;
+pub(crate) mod mirror;
+pub(crate) mod repository_filter;
 pub(crate) mod trusted_checksums;
 pub(crate) mod version;
 
@@ -1003,6 +1004,38 @@ pub(crate) fn maven_config_properties(config: &str) -> BTreeMap<String, String> 
     }
     props.extend(legacy);
     props
+}
+
+/// `config` (a `.mvn/maven.config`) with `args` appended, one per line:
+/// the one way hosted mode adds settings to that file. With `keep_ending`
+/// a file that ends without a line break still does, so the lines can be
+/// taken out again byte for byte ([`repository_filter`]); without it the
+/// result always ends with one, as the Trusted Checksums settings have
+/// always been written (and as the rewriter's other implementation
+/// writes them).
+pub(crate) fn append_config_args(config: &str, args: &[&str], keep_ending: bool) -> String {
+    let block = args.join("\n");
+    if config.is_empty() {
+        format!("{block}\n")
+    } else if config.ends_with('\n') {
+        format!("{config}{block}\n")
+    } else if keep_ending {
+        format!("{config}\n{block}")
+    } else {
+        format!("{config}\n{block}\n")
+    }
+}
+
+/// Whether `config` (a `.mvn/maven.config`) holds lines hosted mode wrote
+/// that name a directory of the checkout through a root-directory
+/// property, in either spelling: the Trusted Checksums block
+/// ([`trusted_checksums::holds_written_block`]) or the repository filter's
+/// directory line ([`repository_filter::holds_written_line`]). Such lines
+/// are respelled for the Maven the project declares, so a caller asks this
+/// (a substring test for nearly every config) before it reads the Maven
+/// Wrapper and the root pom to find out which spelling the project takes.
+pub(crate) fn holds_respellable_lines(config: &str) -> bool {
+    trusted_checksums::holds_written_block(config) || repository_filter::holds_written_line(config)
 }
 
 /// Java's `String.trim`: every char up to U+0020, nothing beyond.

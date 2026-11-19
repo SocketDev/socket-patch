@@ -966,7 +966,9 @@ async fn a_cap_of_zero_with_a_maven_config_to_heal_writes_nothing_but_the_heal()
     let names9: Vec<&str> = PACKAGES.iter().map(|(n, _)| *n).collect();
     write_project(tmp.path(), &names9);
     // The six Trusted Checksums settings as releases up to 5.1.0 wrote
-    // them for every project.
+    // them for every project, and the repository filter's two lines with
+    // their directory named through the same property: both directory
+    // lines are healed, and they are all the run writes.
     let earlier = [
         "-Daether.artifactResolver.postProcessor.trustedChecksums=true",
         "-Daether.artifactResolver.postProcessor.trustedChecksums.checksumAlgorithms=SHA-256",
@@ -974,6 +976,8 @@ async fn a_cap_of_zero_with_a_maven_config_to_heal_writes_nothing_but_the_heal()
         "-Daether.trustedChecksumsSource.summaryFile=true",
         "-Daether.trustedChecksumsSource.summaryFile.basedir=${session.rootDirectory}/.mvn/checksums",
         "-Daether.trustedChecksumsSource.summaryFile.originAware=false",
+        "-Daether.remoteRepositoryFilter.prefixes=true",
+        "-Daether.remoteRepositoryFilter.prefixes.basedir=${session.rootDirectory}/.mvn/socket-patch",
         "",
     ]
     .join("\n");

@@ -752,19 +752,30 @@ impl<'a> View<'a> {
     /// directory that does not take the write, a file edited since it was
     /// read) leaves every pin unrestored.
     pub(crate) async fn write_if_writable(&mut self, rel: &str, content: String) -> bool {
+        self.stage_if_writable(rel, Some(content)).await
+    }
+
+    /// [`Self::write_if_writable`] for a removal.
+    pub(crate) async fn remove_if_writable(&mut self, rel: &str) -> bool {
+        self.stage_if_writable(rel, None).await
+    }
+
+    /// Stage `content` for `rel` (`None`: its removal) only when the flush
+    /// could carry it out.
+    async fn stage_if_writable(&mut self, rel: &str, content: Option<String>) -> bool {
         let read = self
             .originals
             .get(rel)
             .map(|original| original.as_deref().map(str::as_bytes));
         let pending = vec![Pending {
             rel,
-            content: Some(content.as_bytes()),
+            content: content.as_deref().map(str::as_bytes),
             read,
         }];
         if preflight(self.root, pending).await.is_err() {
             return false;
         }
-        self.write(rel, content);
+        self.staged.insert(rel.to_string(), content);
         true
     }
 

@@ -218,6 +218,50 @@ impl RootDirectory {
     pub(crate) fn unread_by(self, maven: &DeclaredMaven) -> bool {
         self == RootDirectory::Launcher && maven.is_maven_4()
     }
+
+    /// What the Maven the project declares (`maven`) makes of a
+    /// `.mvn/maven.config` line that names a directory of the checkout
+    /// through this property, for a setting Maven acts on from the release
+    /// `since` on. The one answer for every such line hosted mode writes:
+    /// the Trusted Checksums directory and the repository filter's.
+    pub(crate) fn read_by(self, maven: &DeclaredMaven, since: [u32; 3]) -> Reads {
+        // A wrapper that pins a Maven 3 cannot build a pom only Maven 4
+        // reads, so its release then says nothing about the Maven that does.
+        if let Some(version) = maven.release().filter(|_| !maven.maven_4_model()) {
+            if release(version) < since {
+                return Reads::TooOld(version.to_string());
+            }
+        }
+        if self.unread_by(maven) {
+            Reads::UnreadByMaven4
+        } else if self == RootDirectory::Launcher && maven.release().is_none() {
+            Reads::Maven3Only
+        } else {
+            Reads::Read
+        }
+    }
+}
+
+/// What the Maven a project declares makes of a `.mvn/maven.config` line
+/// that names a directory of the checkout through a root-directory property
+/// ([`RootDirectory::read_by`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Reads {
+    /// The Maven Wrapper pins this Apache Maven release, which is older
+    /// than the first that acts on the setting.
+    TooOld(String),
+    /// The project declares Maven 4 and the line names the directory
+    /// through [`RootDirectory::Launcher`], which Maven 4 does not
+    /// interpolate.
+    UnreadByMaven4,
+    /// The project declares no Maven and the line names the directory
+    /// through [`RootDirectory::Launcher`]: Maven 3 reads it, a Maven 4
+    /// build does not, and nothing in the checkout says which builds it.
+    Maven3Only,
+    /// The Maven the project declares reads the line; or it declares none,
+    /// and the line is spelled so that every Maven that acts on the
+    /// setting at all finds the directory.
+    Read,
 }
 
 #[cfg(test)]

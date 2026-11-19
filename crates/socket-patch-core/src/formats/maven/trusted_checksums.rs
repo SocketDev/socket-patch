@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::declared_maven::{launcher_root, release, session_root, DeclaredMaven};
+use super::declared_maven::{launcher_root, session_root, DeclaredMaven, Reads};
 use super::maven_config_line_properties;
 use crate::utils::digest::{is_hex64_lower, sha256_hex};
 
@@ -319,19 +319,11 @@ pub(crate) enum Enforcement {
 /// check, the heal, the unenforced warning and discovery all ask it here.
 /// Never [`Enforcement::Off`].
 pub(crate) fn form_enforcement(form: Basedir, maven: &DeclaredMaven) -> Enforcement {
-    // A wrapper that pins a Maven 3 cannot build a pom only Maven 4 reads,
-    // so its release then says nothing about the Maven that does.
-    if let Some(version) = maven.release().filter(|_| !maven.maven_4_model()) {
-        if release(version) < MIN_MAVEN {
-            return Enforcement::TooOld(version.to_string());
-        }
-    }
-    if form.unread_by(maven) {
-        Enforcement::UnreadByMaven4
-    } else if form == Basedir::Launcher && maven.release().is_none() {
-        Enforcement::Maven3Only
-    } else {
-        Enforcement::Enforced
+    match form.read_by(maven, MIN_MAVEN) {
+        Reads::TooOld(version) => Enforcement::TooOld(version),
+        Reads::UnreadByMaven4 => Enforcement::UnreadByMaven4,
+        Reads::Maven3Only => Enforcement::Maven3Only,
+        Reads::Read => Enforcement::Enforced,
     }
 }
 

@@ -213,6 +213,21 @@ impl Mvn {
         self.numeric() >= vec![3, 9, 4]
     }
 
+    /// Maven ≥ 3.9.2 reads the repository prefix file the hosted rewriter
+    /// commits under `.mvn/socket-patch/`, and asks a Socket repository for
+    /// nothing but the version it lists. 3.9.0 / 3.9.1 interpolate neither
+    /// root-directory property in `maven.config`, so the file is never
+    /// found; older lines have no such filter. Below 3.9.2 the Socket
+    /// repository is asked for every artifact the local repository lacks,
+    /// like any repository a pom declares.
+    ///
+    /// Maven 4 finds the directory only when it is named through
+    /// `${session.rootDirectory}`, which the rewriter writes for a project
+    /// that declares Maven 4; under the default spelling it runs unfiltered.
+    pub fn filters_repositories(&self) -> bool {
+        self.numeric() >= vec![3, 9, 2]
+    }
+
     /// `mvn -B <args>` in `cwd` against the local repository `m2`, with the
     /// user settings file `settings`.
     pub fn run(&self, cwd: &Path, m2: &Path, settings: &Path, args: &[&str]) -> Output {

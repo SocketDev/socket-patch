@@ -1,4 +1,5 @@
 [
   "redirect_maven_classifier_unsupported",
-  "redirect_maven_dep_management_added"
+  "redirect_maven_dep_management_added",
+  "redirect_maven_repository_filter_enabled"
 ]

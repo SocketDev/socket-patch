@@ -24,6 +24,19 @@
     "key": "trustedChecksums"
   },
   {
+    "path": ".mvn/maven.config",
+    "kind": "redirect_maven_config",
+    "action": "rewritten",
+    "key": "repositoryFilter"
+  },
+  {
+    "path": ".mvn/socket-patch/prefixes-socket-patch-77777777-7777-7777-7777-777777777777.txt",
+    "kind": "redirect_maven_repository_filter",
+    "action": "added",
+    "key": "socket-patch-77777777-7777-7777-7777-777777777777",
+    "new": "/org/slf4j/slf4j-api/1.7.36-socket.77777777"
+  },
+  {
     "path": ".mvn/checksums/checksums.sha256",
     "kind": "redirect_maven_trusted_checksums",
     "action": "rewritten"

@@ -3711,10 +3711,14 @@ async fn maven_goldens_round_trip() {
     // the user's `<x/>` to hold its entry; the restore removes the entry and
     // leaves the equivalent empty `<x></x>` (asserted in the upstream
     // maven unit tests).
+    // repository-filter-conflict: like mvn-config-merge, `.mvn/maven.config`
+    // existed (it configures Maven's prefix filter), so the trusted-checksums
+    // lines stay.
     let not_invertible = [
         "mvn-config-merge",
         "maven4-launcher-line-conflict",
         "no-suffix-fallback",
+        "repository-filter-conflict",
         "self-closed-repositories",
         "self-closed-depmgmt",
     ];
@@ -3746,9 +3750,22 @@ async fn maven_config_merge_keeps_the_resolver_lines() {
     for rel in ["pom.xml", ".mvn/checksums/checksums.sha256"] {
         assert_eq!(after.get(rel), case.input.get(rel), "{rel}");
     }
-    assert_eq!(
-        after.get(".mvn/maven.config"),
-        case.expected.get(".mvn/maven.config")
+    // The trusted-checksums lines stay: whether they were the user's is not
+    // recorded. The repository filter's two go, with its file: they name a
+    // directory only hosted mode uses.
+    let kept: String = case.expected[".mvn/maven.config"]
+        .lines()
+        .filter(|line| !line.contains("remoteRepositoryFilter"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_ne!(kept, case.expected[".mvn/maven.config"]);
+    assert_eq!(after.get(".mvn/maven.config"), Some(&kept));
+    assert!(
+        !after
+            .keys()
+            .any(|rel| rel.starts_with(".mvn/socket-patch/")),
+        "{:?}",
+        after.keys()
     );
 }
 
