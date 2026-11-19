@@ -7,9 +7,12 @@ name: Bazel patch compatibility (Maven)
 # ecosystem shares; this file says when the Maven legs run and on which
 # releases.
 #
-# Each release has an era of its own, because the ruleset decides the
-# format of the lock and the name of an artifact's repository:
+# Each major release has an era of its own, because the ruleset decides
+# the format of the lock and the name of an artifact's repository:
 # rules_jvm_external 7.2 on Bazel 9, 6.9 on Bazel 8 and 6.5 on Bazel 7.
+# Bazel 7 has two legs: 7.7.2, and 7.4.0, the first release with
+# `override_repo`, which is the oldest Bazel a Maven patch for a hub can
+# be written for.
 #
 # Beyond what every leg needs, a Maven leg downloads one JDK (the one its
 # era's rules_java runs javac on, about 215 MB; each era's .bazelrc names
@@ -139,7 +142,8 @@ jobs:
         [
           {"bazel": "9.3.2", "era": "e9"},
           {"bazel": "8.8.2", "era": "e8"},
-          {"bazel": "7.7.2", "era": "e7"}
+          {"bazel": "7.7.2", "era": "e7"},
+          {"bazel": "7.4.0", "era": "e7"}
         ]
       macos: >-
         [

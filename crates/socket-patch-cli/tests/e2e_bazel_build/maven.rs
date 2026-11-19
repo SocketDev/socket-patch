@@ -17,15 +17,26 @@
 //!   patched jar. `rollback --yes` restores every file.
 //! - [`a_tree_only_bazel_builds`]: the same checkout without a `pom.xml`.
 //!   The same command writes nothing and reports the patch `skipped`
-//!   (`redirect_unconfirmed`), and the build is as before.
+//!   (`redirect_unconfirmed`), and the build is as before. `bazel mod
+//!   tidy` leaves the fixture's `MODULE.bazel` as it is, and `rollback
+//!   --yes` finds no patch state (`manifest_not_found`).
+//! - [`a_version_bump_of_the_patched_artifact`]: after that command the
+//!   checkout asks for the artifact one version up and pins again. The
+//!   build takes the new upstream jar, and nothing stops it.
+//! - [`the_users_own_override_of_the_artifact`]: the hub has a
+//!   `maven.override` that puts a target of the checkout in the artifact's
+//!   place. The command writes nothing, and the build prints that target's
+//!   marker before and after.
 //!
-//! In both the command says what the build shows: one warning,
+//! In the first three the command says what the build shows: one warning,
 //! `maven_bazel_hub_unpatched`, that Bazel builds the artifact from
 //! `maven_install.json`, with the hub and the line of its `maven.install`.
-//! In the second it stands after `redirect_maven_no_pom`, "no pom.xml
-//! present", which the command says as it does without a Bazel workspace.
-//! The lock each ruleset release writes is the one socket-patch reads it
-//! from ([`Lock`]).
+//! In a tree without `pom.xml` it stands after `redirect_maven_no_pom`,
+//! "no pom.xml present", which the command says as it does without a Bazel
+//! workspace. Beside the override it is `maven_bazel_unreadable` with the
+//! line of the override: what that target builds is not read. The lock
+//! each ruleset release writes is the one socket-patch reads it from
+//! ([`Lock`]).
 //!
 //! The artifacts are made here, for the run, under the group
 //! `dev.socket.fixture`, which only the owner of `socket.dev` can publish
@@ -164,6 +175,27 @@ fn repo_path(artifact: &str, version: &str, ext: &str) -> String {
     format!("{GROUP_PATH}/{artifact}/{version}/{artifact}-{version}.{ext}")
 }
 
+/// Puts the jar `bytes` of `artifact` at `version` and its pom, which
+/// depends on `needs`, in the stand-in's Maven repository. Gives the route
+/// of the jar.
+fn serve_upstream(
+    standin: &StandIn,
+    artifact: &str,
+    version: &str,
+    bytes: &[u8],
+    needs: Option<(&str, &str)>,
+) -> String {
+    let pom = pom(artifact, version, needs);
+    for (ext, bytes) in [("jar", bytes), ("pom", pom.as_bytes())] {
+        // Coursier takes a file only with a checksum beside it.
+        let route = format!("/{UPSTREAM}/{}", repo_path(artifact, version, ext));
+        let sha1 = hex::encode(Sha1::digest(bytes));
+        standin.serve(5, &route, bytes);
+        standin.serve(5, &format!("{route}.sha1"), sha1.as_bytes());
+    }
+    format!("/{UPSTREAM}/{}", repo_path(artifact, version, "jar"))
+}
+
 /// A checkout whose hub is pinned, and what its flow reads afterwards.
 struct Pinned {
     cell: Cell,
@@ -174,6 +206,8 @@ struct Pinned {
     /// fills when it pins; `gradle`, which nothing fills.
     tools: tempfile::TempDir,
     uuid: String,
+    /// The id of the run, which every upstream jar made for it holds.
+    run: String,
     /// The line of `maven.install` in the checkout's `MODULE.bazel`.
     install: usize,
     /// What `//:consumer` prints while Bazel builds the upstream jar.
@@ -185,12 +219,13 @@ struct Pinned {
 }
 
 impl Pinned {
-    /// Step 0 of both flows: the fixture's checkout for `test`, with a
-    /// `pom.xml` that declares the victim when `maven` is set, pinned by
-    /// the ruleset against a stand-in that has the two artifacts, the
-    /// patched jar and the grant of its patch. `None` when no Bazel runs
-    /// here.
-    fn open(test: &str, maven: bool) -> Option<Pinned> {
+    /// Step 0 of every flow: the fixture's checkout for `test`, with a
+    /// `pom.xml` that declares the victim when `maven` is set and with
+    /// what `prepare` adds to its files and to the text of `MODULE.bazel`,
+    /// pinned by the ruleset against a stand-in that has the two
+    /// artifacts, the patched jar and the grant of its patch. `None` when
+    /// no Bazel runs here.
+    fn open(test: &str, maven: bool, prepare: &dyn Fn(&Cell, &mut String)) -> Option<Pinned> {
         let started = Instant::now();
         let mut cell = Cell::open(test, &FIXTURE)?;
         // The cache of the Coursier that pins. Before 7.2 the ruleset
@@ -210,24 +245,14 @@ impl Pinned {
 
         let standin = StandIn::start();
         let origin = standin.origin();
-        let served: [(String, Vec<u8>); 4] = [
-            (repo_path(VICTIM, VERSION, "jar"), upstream_jar.clone()),
-            (repo_path(VICTIM, VERSION, "pom"), victim_pom.clone().into()),
-            (repo_path("consumer", "2.0", "jar"), jar(&[])),
-            (
-                repo_path("consumer", "2.0", "pom"),
-                pom("consumer", "2.0", Some((VICTIM, VERSION))).into(),
-            ),
-        ];
-        for (path, bytes) in &served {
-            // Coursier takes a file only with a checksum beside it.
-            let (route, sha1) = (
-                format!("/{UPSTREAM}/{path}"),
-                hex::encode(Sha1::digest(bytes)),
-            );
-            standin.serve(5, &route, bytes);
-            standin.serve(5, &format!("{route}.sha1"), sha1.as_bytes());
-        }
+        serve_upstream(&standin, VICTIM, VERSION, &upstream_jar, None);
+        serve_upstream(
+            &standin,
+            "consumer",
+            "2.0",
+            &jar(&[]),
+            Some((VICTIM, VERSION)),
+        );
         // The patch registry and the grant, as production has them: a
         // token and the patch id in the path, the version with the suffix
         // only that registry serves.
@@ -272,7 +297,9 @@ impl Pinned {
         let install = module.lines().position(|line| line == "maven.install(");
         let install = install.expect("the fixture's maven.install") + 1;
         let repository = format!("{origin}/{UPSTREAM}");
-        cell.write("MODULE.bazel", module.replace(PLACEHOLDER, &repository));
+        let mut module = module.replace(PLACEHOLDER, &repository);
+        prepare(&cell, &mut module);
+        cell.write("MODULE.bazel", module);
         cell.write("maven_install.json", "");
         if maven {
             cell.write("pom.xml", pom("app", "1.0.0", Some((VICTIM, VERSION))));
@@ -319,13 +346,15 @@ impl Pinned {
             (format, Some(&jar)),
             "{test}: {lock:?}"
         );
+        let upstream = format!("OUT: PRISTINE {run}");
         Some(Pinned {
             cell,
             standin,
             tools,
             uuid,
+            run,
             install,
-            upstream: format!("OUT: PRISTINE {run}"),
+            upstream,
             upstream_route: format!("/{UPSTREAM}/{}", repo_path(VICTIM, VERSION, "jar")),
             patched_route,
             started,
@@ -373,6 +402,74 @@ impl Pinned {
         assert_eq!(get.envelope["warnings"], json!(warnings), "{test}: {said}");
     }
 
+    /// The command in a tree without `pom.xml`: it reports the patch
+    /// skipped, gives the two warnings `after_no_pom` gives for what it
+    /// says after "no pom.xml", and changes no file of `before`.
+    fn skips(&self, before: &Tree, after_no_pom: &dyn Fn(&Pinned, &Ran, &[Value])) -> Ran {
+        let test = &self.cell.test;
+        let get = self.socket_patch(&["get", PURL, "--mode", "hosted", "--yes"]);
+        let said = &get.dump;
+        assert_eq!(get.code, 0, "{test}: {said}");
+        let event = event_for(&get.envelope, PURL);
+        assert_eq!(
+            (&event["action"], &event["errorCode"]),
+            (&json!("skipped"), &json!("redirect_unconfirmed")),
+            "{test}: {said}"
+        );
+        let no_pom = "no pom.xml present; maven redirect skipped";
+        after_no_pom(
+            self,
+            &get,
+            &[json!({ "code": "redirect_maven_no_pom", "detail": no_pom })],
+        );
+        assert_eq!(
+            changed(before, &self.cell.tree()),
+            NOTHING,
+            "{test}: {said}"
+        );
+        get
+    }
+
+    /// `bazel mod tidy` passes and leaves `MODULE.bazel` as it is.
+    fn tidy_keeps_the_module_file(&self) {
+        let test = &self.cell.test;
+        let module = std::fs::read(self.cell.path("MODULE.bazel")).expect("MODULE.bazel");
+        let tidy = self.cell.bazel("mod", &["tidy"]);
+        assert!(tidy.ok(), "{test}: {}", tidy.dump());
+        let after = std::fs::read(self.cell.path("MODULE.bazel")).expect("MODULE.bazel");
+        assert!(
+            module == after,
+            "{test}: `bazel mod tidy` changed MODULE.bazel to:\n{}",
+            String::from_utf8_lossy(&after)
+        );
+    }
+
+    /// The checkout asks for the victim at `version` by name, the stand-in
+    /// has that release, and the ruleset's relock takes it into the lock.
+    /// Gives what `//:consumer` prints with that jar.
+    fn bump(&self, version: &str) -> String {
+        let test = &self.cell.test;
+        let marker = format!("PRISTINE {version} {}", self.run);
+        serve_upstream(&self.standin, VICTIM, version, &victim(&marker), None);
+        let module = std::fs::read_to_string(self.cell.path("MODULE.bazel")).expect("MODULE.bazel");
+        let named = format!("\"{GROUP}:consumer:2.0\"");
+        assert_eq!(module.matches(&named).count(), 1, "{test}: {module}");
+        let both = format!("{named}, \"{GROUP}:{VICTIM}:{version}\"");
+        self.cell
+            .write("MODULE.bazel", module.replace(&named, &both));
+        let pin = self
+            .cell
+            .bazel_env("run", &[&format!("@{HUB}//:pin")], &[("REPIN", "1")]);
+        assert!(pin.ok(), "{test}: {}", pin.dump());
+        let lock = std::fs::read_to_string(self.cell.path("maven_install.json")).expect("the lock");
+        let lock = Lock::parse(&lock).unwrap_or_else(|why| panic!("{test}: {why}:\n{lock}"));
+        let pinned = lock
+            .plain_jar(GROUP, VICTIM)
+            .map(|jar| jar.version.as_str());
+        assert_eq!(pinned, Some(version), "{test}: {lock:?}");
+        format!("OUT: {marker}")
+    }
+
     /// The step after the command: the build prints the upstream marker
     /// as before and changed no file of `after`, and no request for the
     /// patched jar reached the stand-in.
@@ -392,7 +489,7 @@ impl Pinned {
 #[ignore = "real Bazel; run with --ignored"]
 fn a_pom_patch_beside_a_pinned_hub() {
     let test = "maven::a_pom_patch_beside_a_pinned_hub";
-    let Some(flow) = Pinned::open(test, true) else {
+    let Some(flow) = Pinned::open(test, true, &|_, _| {}) else {
         return;
     };
     let before = flow.builds_upstream();
@@ -424,36 +521,117 @@ fn a_pom_patch_beside_a_pinned_hub() {
 #[ignore = "real Bazel; run with --ignored"]
 fn a_tree_only_bazel_builds() {
     let test = "maven::a_tree_only_bazel_builds";
-    let Some(flow) = Pinned::open(test, false) else {
+    let Some(flow) = Pinned::open(test, false, &|_, _| {}) else {
         return;
     };
     let before = flow.builds_upstream();
 
-    let get = flow.socket_patch(&["get", PURL, "--mode", "hosted", "--yes"]);
-    let said = &get.dump;
-    assert_eq!(get.code, 0, "{test}: {said}");
-    let event = event_for(&get.envelope, PURL);
+    flow.skips(&before, &Pinned::names_the_hub);
+    flow.still_builds_upstream(&before);
+    flow.tidy_keeps_the_module_file();
+
+    // Nothing was pinned, so the undo finds no patch state at all.
+    let undo = flow.socket_patch(&["rollback", "--yes"]);
+    let said = &undo.dump;
     assert_eq!(
-        (&event["action"], &event["errorCode"]),
-        (&json!("skipped"), &json!("redirect_unconfirmed")),
+        (undo.code, &undo.envelope["error"]["code"]),
+        (1, &json!("manifest_not_found")),
         "{test}: {said}"
-    );
-    let no_pom = "no pom.xml present; maven redirect skipped";
-    flow.names_the_hub(
-        &get,
-        &[json!({ "code": "redirect_maven_no_pom", "detail": no_pom })],
     );
     assert_eq!(
         changed(&before, &flow.cell.tree()),
         NOTHING,
         "{test}: {said}"
     );
-    flow.still_builds_upstream(&before);
     println!(
         "{test}: Bazel {} built {:?} before and after `get --mode hosted` skipped {PURL} \
          and named the hub; {:?}",
         flow.cell.release(),
         flow.upstream,
+        flow.started.elapsed()
+    );
+}
+
+/// The checkout moves the artifact one version up after the command: the
+/// relock takes the new release, and the build takes its upstream jar.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn a_version_bump_of_the_patched_artifact() {
+    let test = "maven::a_version_bump_of_the_patched_artifact";
+    let Some(flow) = Pinned::open(test, false, &|_, _| {}) else {
+        return;
+    };
+    let before = flow.builds_upstream();
+    flow.skips(&before, &Pinned::names_the_hub);
+
+    let bumped = flow.bump("1.11.0");
+    flow.cell.builds(&bumped);
+    println!(
+        "{test}: Bazel {} built {:?}, `get --mode hosted` skipped {PURL}, and after the \
+         checkout pinned the artifact at 1.11.0 the build printed {bumped:?}; {:?}",
+        flow.cell.release(),
+        flow.upstream,
+        flow.started.elapsed()
+    );
+}
+
+/// What the checkout builds in the artifact's place, and its package.
+const OWN_MARKER: &str = "OUT: OWN of the checkout";
+const OWN_BUILD: &str = r#"load("@rules_java//java:defs.bzl", "java_library")
+
+java_library(
+    name = "victim",
+    resource_strip_prefix = "own",
+    resources = ["dev/socket/fixture/victim/marker.txt"],
+    visibility = ["//visibility:public"],
+)
+"#;
+
+/// A hub whose `maven.override` gives the artifact a target of the
+/// checkout: the command writes nothing and says where the override is,
+/// and the build prints that target's marker before and after.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn the_users_own_override_of_the_artifact() {
+    let test = "maven::the_users_own_override_of_the_artifact";
+    let own = |cell: &Cell, module: &mut String| {
+        cell.write("own/BUILD.bazel", OWN_BUILD);
+        let marker = OWN_MARKER.trim_start_matches("OUT: ");
+        cell.write(&format!("own/{MARKER}"), format!("{marker}\n"));
+        module.push_str(&format!(
+            "maven.override(\n    name = \"{HUB}\",\n    coordinates = \"{GROUP}:{VICTIM}\",\n    \
+             target = \"//own:victim\",\n)\n"
+        ));
+    };
+    let Some(flow) = Pinned::open(test, false, &own) else {
+        return;
+    };
+    let before = flow.cell.builds_unpatched(OWN_MARKER);
+
+    let module = std::fs::read_to_string(flow.cell.path("MODULE.bazel")).expect("MODULE.bazel");
+    let line = module.lines().position(|line| line == "maven.override(");
+    let line = line.expect("the override") + 1;
+    let names_the_override = |flow: &Pinned, get: &Ran, others: &[Value]| {
+        let detail = format!(
+            "{PURL}: socket-patch could not tell whether Bazel takes this artifact from a \
+             rules_jvm_external hub: MODULE.bazel:{line}: a `maven.override` gives this artifact \
+             another target"
+        );
+        let warning = json!({ "code": "maven_bazel_unreadable", "detail": detail });
+        let warnings = [others, &[warning]].concat();
+        let (test, said) = (&flow.cell.test, &get.dump);
+        assert_eq!(get.envelope["warnings"], json!(warnings), "{test}: {said}");
+    };
+    flow.skips(&before, &names_the_override);
+
+    flow.cell.builds(OWN_MARKER);
+    assert_eq!(changed(&before, &flow.cell.tree()), NOTHING, "{test}");
+    let asked = flow.standin.asked(&flow.patched_route);
+    assert_eq!(asked, 0, "{test}: something fetched the patched jar");
+    println!(
+        "{test}: Bazel {} built {OWN_MARKER:?} before and after `get --mode hosted` skipped \
+         {PURL} and named the override at MODULE.bazel:{line}; {:?}",
+        flow.cell.release(),
         flow.started.elapsed()
     );
 }
