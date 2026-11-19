@@ -12175,6 +12175,54 @@ mod tests {
         assert!(!r.maven_reactor_uuids.contains(second_uuid));
     }
 
+    /// The gate holds a dep back, never the respelling of a
+    /// `.mvn/maven.config` an earlier release wrote: that line stops Maven
+    /// 3.9.2 to 3.9.8 from starting with `-f` from outside the project
+    /// whether or not a mirror takes the Socket repository. So a project
+    /// an earlier release wired, scanned behind a mirror that now captures
+    /// its repository, gets the mirror's warning for the dep and the heal
+    /// for the config, and nothing else is written.
+    #[test]
+    fn maven_mirror_gate_does_not_hold_back_the_heal_of_an_earlier_config() {
+        use trusted_checksums::Basedir::{Launcher, Session};
+        let dep = granted_maven_override();
+        let plain = BTreeMap::from([(
+            "pom.xml".to_string(),
+            pom_with_dep("\n      <version>1.7.36</version>", ""),
+        )]);
+        let wired = rewrite_registry_redirect(&plain, std::slice::from_ref(&dep));
+        // An earlier release's wiring: the same files, the session's form.
+        let mut earlier = plain.clone();
+        earlier.extend(wired.files.clone());
+        let value = trusted_checksums::basedir_value;
+        let old = earlier[MVN_CONFIG].replace(value(Launcher), value(Session));
+        assert_ne!(old, earlier[MVN_CONFIG]);
+        earlier.insert(MVN_CONFIG.to_string(), old);
+        earlier.extend([maven_mirrors(&[("corp", "*")])]);
+
+        let r = rewrite_registry_redirect(&earlier, std::slice::from_ref(&dep));
+        assert_eq!(r.files.keys().collect::<Vec<_>>(), [MVN_CONFIG]);
+        assert_eq!(r.files[MVN_CONFIG], wired.files[MVN_CONFIG]);
+        assert_eq!(
+            r.edits
+                .iter()
+                .map(|e| (e.path.as_str(), e.key.as_deref()))
+                .collect::<Vec<_>>(),
+            [(MVN_CONFIG, Some(MVN_CONFIG_HEAL_KEY))]
+        );
+        assert_eq!(
+            warning_codes(&r),
+            [
+                "redirect_maven_mirror_captures_repository",
+                "redirect_maven_trusted_checksums_maven3_only",
+            ]
+        );
+        // Gated, so decided and not confirmed: the wiring the earlier run
+        // left is not counted as this run's redirect.
+        assert!(r.maven_reactor_uuids.contains(MAVEN_UUID));
+        assert!(r.confirmed_maven_reactor_uuids.is_empty());
+    }
+
     /// [`maven_override`] as the patch service grants it: the suffix is the
     /// first eight hex digits of the patch uuid, which is what ties a pin
     /// to its repository and what the reactor planner writes.
