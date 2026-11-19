@@ -157,8 +157,9 @@ async fn batched_purls(server: &MockServer) -> BTreeSet<String> {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Verify `socket-patch scan` discovers Go modules in a fake module cache and
-/// reports them — by exact count, by ecosystem, and by exact decoded PURL.
+/// Verify `socket-patch scan` discovers the Go modules a project requires in
+/// a fake module cache and reports them — by exact count, by ecosystem, and
+/// by exact decoded PURL.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scan_discovers_go_modules() {
     let server = MockServer::start().await;
@@ -189,21 +190,24 @@ async fn scan_discovers_go_modules() {
     )
     .unwrap();
 
-    // --- Decoys that MUST NOT be counted, proving the crawler parses the
-    // versioned (`name@version`) layout rather than counting every directory:
-    //   * the root `cache/` download dir is pruned at the cache root, so a
-    //     versioned dir beneath it must be ignored;
-    //   * a non-versioned directory (no `@`) is not a module.
-    // If either leaked in, `scannedPackages` would be 3+ and the exact-count
+    // --- Decoys that MUST NOT be counted. A local scan looks up what the
+    // project's go.mod and go.sum name, and nothing else in the cache is
+    // this project's:
+    //   * a module another project left in the shared cache;
+    //   * a versioned dir under the root `cache/` download dir, and a
+    //     non-versioned directory (no `@`), which are not modules at all.
+    // If any leaked in, `scannedPackages` would be 3+ and the exact-count
     // assertion below would fail.
+    std::fs::create_dir_all(cache_dir.join("example.com").join("unrelated@v0.1.0")).unwrap();
     let decoy_cache = cache_dir.join("cache").join("download").join("evil@v9.9.9");
     std::fs::create_dir_all(&decoy_cache).unwrap();
     std::fs::create_dir_all(cache_dir.join("github.com").join("plain").join("noversion")).unwrap();
 
-    // Create a go.mod in the project directory so local mode activates
+    // The project requires both modules (a go.mod is also what activates
+    // local mode).
     std::fs::write(
         dir.path().join("go.mod"),
-        "module example.com/myproject\n\ngo 1.21\n",
+        "module example.com/myproject\n\ngo 1.21\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.9.1\n\tgolang.org/x/text v0.14.0\n)\n",
     )
     .unwrap();
 
@@ -266,6 +270,45 @@ async fn scan_discovers_go_modules() {
     );
 }
 
+/// A module on the standard library alone (no `require`, no go.sum) has no
+/// Go packages: the modules other projects left in the shared module cache
+/// are not scanned, and none of them is sent to the API.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_of_a_module_without_dependencies_ignores_the_shared_cache() {
+    let server = MockServer::start().await;
+    mount_batch(&server).await;
+    let api_url = server.uri();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("gomodcache");
+    for module in [
+        "github.com/gin-gonic/gin@v1.9.1",
+        "golang.org/x/text@v0.14.0",
+    ] {
+        std::fs::create_dir_all(cache_dir.join(module)).unwrap();
+    }
+    std::fs::write(
+        dir.path().join("go.mod"),
+        "module example.com/myproject\n\ngo 1.21\n",
+    )
+    .unwrap();
+
+    let json = scan_json(dir.path(), &cache_dir, &api_url).await;
+    assert_eq!(json["status"], "success", "got:\n{json:#}");
+    assert_eq!(
+        json["scannedPackages"], 0,
+        "nothing in the cache is this project's; got:\n{json:#}"
+    );
+    let batch_posts = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/patches/batch"))
+        .count();
+    assert_eq!(batch_posts, 0, "no module was looked up");
+}
+
 /// #344: a module cache configured with `go env -w GOMODCACHE=…` (the
 /// `$GOENV` file, not the environment) is the one scanned, exactly as
 /// `go env GOMODCACHE` and `go build` resolve it.
@@ -288,7 +331,7 @@ async fn scan_finds_the_cache_named_by_the_go_env_file() {
     std::fs::create_dir_all(&project).unwrap();
     std::fs::write(
         project.join("go.mod"),
-        "module example.com/myproject\n\ngo 1.21\n",
+        "module example.com/myproject\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.9.1\n",
     )
     .unwrap();
     // What `go env -w GOMODCACHE=<cache>` writes.
@@ -334,10 +377,10 @@ async fn scan_finds_the_cache_named_by_the_go_env_file() {
 ///
 /// Go's module cache stores uppercase letters as `!`+lowercase, so
 /// `github.com/Azure/...` lands on disk under `github.com/!azure/...`. The
-/// crawler must descend into `!azure` AND decode it back to `Azure` in the
-/// PURL it emits — a crawler that skipped `!`-prefixed dirs would report zero,
-/// and one that descended but left the escaping in place would emit the wrong
-/// PURL. The batch-body assertion below catches both.
+/// crawler must find the module go.mod requires under `!azure` AND report
+/// `Azure` in the PURL it emits — a crawler that looked for an `Azure`
+/// directory would report zero, and one that reported the on-disk name would
+/// emit the wrong PURL. The batch-body assertion below catches both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scan_discovers_case_encoded_modules() {
     let server = MockServer::start().await;
@@ -359,10 +402,11 @@ async fn scan_discovers_case_encoded_modules() {
     // pruned, so the count stays at exactly one.
     std::fs::create_dir_all(cache_dir.join("cache").join("download").join("evil@v9.9.9")).unwrap();
 
-    // Create a go.mod in the project directory so local mode activates.
+    // The project requires the module (a go.mod is also what activates
+    // local mode).
     std::fs::write(
         dir.path().join("go.mod"),
-        "module example.com/myproject\n\ngo 1.21\n",
+        "module example.com/myproject\n\ngo 1.21\n\nrequire github.com/Azure/azure-sdk-for-go v1.0.0\n",
     )
     .unwrap();
 

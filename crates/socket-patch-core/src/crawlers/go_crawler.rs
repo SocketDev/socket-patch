@@ -117,12 +117,12 @@ impl GoCrawler {
 
     /// Crawl the Go module cache and return all discovered packages.
     ///
-    /// A local project with a `go.sum` and no Go workspace in effect only
-    /// gets the modules its `go.sum` records, each looked up in the cache
-    /// ([`go_sum_scope`], [`locate_module`]), so a module another project
-    /// left in `GOMODCACHE` is never crawled and the cache tree is not
-    /// walked. Everything else (`--global`, `--global-prefix`, no `go.sum`,
-    /// a workspace) walks the whole cache.
+    /// A local project with no Go workspace in effect only gets the modules
+    /// its `go.sum` records and its go.mod requires, each looked up in the
+    /// cache ([`go_sum_scope`], [`locate_module`]), so a module another
+    /// project left in `GOMODCACHE` is never crawled and the cache tree is
+    /// not walked. Everything else (`--global`, `--global-prefix`, a
+    /// workspace, a `go.sum` that cannot be read) walks the whole cache.
     ///
     /// The whole crawl is one blocking-pool task (a module cache holds tens
     /// of thousands of directories; one runtime hop per readdir and stat
@@ -273,20 +273,41 @@ fn locate_module(
 /// requires keep a module the project still builds against when its own
 /// go.sum lines are gone: a `replace`d module's go.sum records only the
 /// replacement (the hosted rewrite drops the original's lines, as
-/// `go mod tidy` does). `None` when a Go workspace is in effect
-/// ([`workspace_in_effect`]: its build list spans other modules' `go.sum`
-/// and `go.work.sum`) or there is no readable `go.sum`; the crawl then
-/// walks the whole cache.
+/// `go mod tidy` does).
+///
+/// A project with no `go.sum` is scoped to its requires alone. go writes a
+/// `go.sum` line for every module it loads from the cache, so without the
+/// file the build takes nothing from the cache that go.mod does not name:
+/// a module on the standard library alone has neither, and the modules
+/// other projects left in the cache are not this project's.
+///
+/// `None`, and the crawl walks the whole cache, when a Go workspace is in
+/// effect ([`workspace_in_effect`]: its build list spans other modules'
+/// `go.sum` and `go.work.sum`), when a `go.sum` is there but cannot be
+/// read, or when there is no `go.sum` and go.mod cannot be read or is not
+/// the file go builds from (`-modfile` names another, with its own
+/// `.sum`).
 fn go_sum_scope(cwd: &Path) -> Option<Vec<(String, String)>> {
     if workspace_in_effect(cwd) {
         return None;
     }
-    let text = crate::utils::fs::read_regular_to_string_sync(&cwd.join("go.sum")).ok()?;
+    let go_mod = crate::utils::fs::read_regular_to_string_sync(&cwd.join("go.mod"));
+    let text = match crate::utils::fs::read_regular_to_string_sync(&cwd.join("go.sum")) {
+        Ok(text) => text,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && go_mod.is_ok()
+                && crate::vendor::go_workspace::modfile_setting(cwd).is_none() =>
+        {
+            String::new()
+        }
+        Err(_) => return None,
+    };
     let mut scope: Vec<(String, String)> = go_sum_lines(&text)
         .filter(|line| !line.go_mod)
         .map(|line| (line.module.to_string(), line.version.to_string()))
         .collect();
-    if let Ok(go_mod) = crate::utils::fs::read_regular_to_string_sync(&cwd.join("go.mod")) {
+    if let Ok(go_mod) = go_mod {
         let listed: HashSet<(String, String)> = scope.iter().cloned().collect();
         let mut required: Vec<(String, String)> =
             go_mod_edit::parse_required_versions(&go_mod_edit::normalize_for_read(&go_mod))
@@ -1201,12 +1222,13 @@ mod tests {
         const H1: &str = "h1:mU9vN/n1hbXktM62lJ6MbRKOk3aI8NDH+szCf62RXtE=";
 
         /// A project dir and a module cache, with `GOMODCACHE` pointed at
-        /// the cache and `GOWORK` unset for the test's lifetime.
+        /// the cache and `GOWORK`, `GOFLAGS` and the `go env -w` file out
+        /// of the picture for the test's lifetime.
         struct Fixture {
             _tmp: tempfile::TempDir,
             project: PathBuf,
             cache: PathBuf,
-            _env: (EnvGuard, EnvGuard),
+            _env: EnvGuard,
         }
 
         impl Fixture {
@@ -1217,10 +1239,12 @@ mod tests {
                 mkdir(&project);
                 mkdir(&cache);
                 write(&project.join("go.mod"), "module example.com/app\n");
-                let env = (
-                    EnvGuard::set("GOMODCACHE", &cache),
-                    EnvGuard::unset("GOWORK"),
-                );
+                let env = EnvGuard::many([
+                    ("GOMODCACHE", Some(cache.as_os_str())),
+                    ("GOWORK", None),
+                    ("GOFLAGS", None),
+                    ("GOENV", Some(std::ffi::OsStr::new("off"))),
+                ]);
                 Fixture {
                     _tmp: tmp,
                     project,
@@ -1354,19 +1378,51 @@ mod tests {
             }
         }
 
+        /// A project with no go.sum takes nothing from the cache that its
+        /// go.mod does not require: one on the standard library alone
+        /// crawls nothing, whatever other projects left in the cache.
         #[tokio::test]
         #[serial_test::serial]
-        async fn without_a_go_sum_the_whole_cache_is_walked() {
+        async fn without_a_go_sum_only_the_requires_of_go_mod_are_crawled() {
+            let f = Fixture::new();
+            f.stage("github.com/gin-gonic/gin", "v1.9.1")
+                .stage("github.com/gin-gonic/gin", "v1.8.0")
+                .stage("example.com/unrelated", "v0.1.0");
+            assert_eq!(f.crawl().await, Vec::<String>::new());
+
+            write(
+                &f.project.join("go.mod"),
+                "module example.com/app\n\nrequire github.com/gin-gonic/gin v1.9.1\n",
+            );
+            assert_eq!(
+                f.crawl().await,
+                sorted(&["pkg:golang/github.com/gin-gonic/gin@v1.9.1"])
+            );
+        }
+
+        /// Without a go.sum to read, the walk is kept where go.mod's
+        /// requires may not be the build's: a `-modfile` makes go build
+        /// from another file (with its own `.sum`), and a go.sum that is
+        /// there but cannot be read may record more.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn another_modfile_or_an_unreadable_go_sum_keeps_the_walk() {
             let f = Fixture::new();
             f.stage("github.com/gin-gonic/gin", "v1.9.1")
                 .stage("example.com/unrelated", "v0.1.0");
-            assert_eq!(
-                f.crawl().await,
-                sorted(&[
-                    "pkg:golang/example.com/unrelated@v0.1.0",
-                    "pkg:golang/github.com/gin-gonic/gin@v1.9.1",
-                ])
-            );
+            let walked = sorted(&[
+                "pkg:golang/example.com/unrelated@v0.1.0",
+                "pkg:golang/github.com/gin-gonic/gin@v1.9.1",
+            ]);
+            {
+                let _modfile = EnvGuard::set("GOFLAGS", "-modfile=alt.mod");
+                assert_eq!(f.crawl().await, walked);
+            }
+            assert_eq!(f.crawl().await, Vec::<String>::new());
+
+            // A directory where go.sum belongs: there, and not readable.
+            mkdir(&f.project.join("go.sum"));
+            assert_eq!(f.crawl().await, walked);
         }
 
         /// A workspace's build list spans other modules' go.sum files and
