@@ -223,6 +223,9 @@ impl Machine {
 
         // Nothing of the machine reaches the child: no tool on PATH, an
         // empty home, and the JVM caches a crawl reads in this directory.
+        // `LLVM_PROFILE_FILE` stays: a binary built for coverage writes
+        // its profile where that names, and without it into the project
+        // directory, where a test holds a run to the files it wrote.
         let mut cmd = hermetic::binary_command();
         cmd.env_clear()
             .envs(hermetic::FORCED_OPT_OUTS.iter().copied());
@@ -233,6 +236,7 @@ impl Machine {
             "TMPDIR",
             "TEMP",
             "TMP",
+            "LLVM_PROFILE_FILE",
         ] {
             cmd.envs(std::env::var_os(keep).map(|value| (keep, value)));
         }
