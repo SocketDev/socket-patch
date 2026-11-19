@@ -8256,7 +8256,8 @@ fn plan_gem_redirect(
         // Not declared where the rewriter can see it, yet bundler resolved
         // it as a DIRECT dependency: the Gemfile declares it out of sight
         // (`eval_gemfile`, a loop, a gemspec). Adding a line would declare
-        // it twice (#482).
+        // it twice (#482). Vendored mode refuses the gem for the same
+        // reason, so the way out names agent mode alone (#2151).
         return Err(refuse(
             "redirect_gem_declaration_not_visible",
             format!(
@@ -8264,7 +8265,7 @@ fn plan_gem_redirect(
                  it somewhere the rewriter cannot edit (an `eval_gemfile`d file, a loop, a \
                  gemspec); adding a second declaration would make bundler refuse the Gemfile — \
                  redirect skipped (declare it with a literal `gem \"{name}\"` line in \
-                 {gemfile_name}, or patch it with `--mode vendored` or `--mode agent`)"
+                 {gemfile_name}, or patch it with `--mode agent`)"
             ),
         ));
     } else {

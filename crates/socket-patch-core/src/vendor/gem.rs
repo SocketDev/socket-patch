@@ -306,7 +306,7 @@ pub async fn gem_vendor_target_preflight(
             .ok()?,
     };
     plan_gemfile_edit(&gemfile_text, &name, &version, &copy_rel)
-        .and_then(|plan| refuse_append_of_direct_dependency(plan, &lock_text, &name))
+        .and_then(|plan| refuse_append_of_direct_dependency(plan, &gemfile_text, &lock_text, &name))
         .and_then(|plan| {
             let after = apply_gemfile_plan(&gemfile_text, &plan);
             gemspec_merge_refusal(project_root, &after, &lock_text, &name, &version)
@@ -579,8 +579,14 @@ fn gem_edits(
     }
     // ── Gemfile edit plan (refusals before any write) ────────────────────
     let plan = match plan_gemfile_edit(&prelude.gemfile_text, name, version, &prelude.copy_rel)
-        .and_then(|plan| refuse_append_of_direct_dependency(plan, &prelude.lock_text, name))
-    {
+        .and_then(|plan| {
+            refuse_append_of_direct_dependency(
+                plan,
+                &prelude.gemfile_text,
+                &prelude.lock_text,
+                name,
+            )
+        }) {
         Ok(p) => p,
         Err(detail) => {
             return Err(Box::new(refused(
@@ -1635,8 +1641,11 @@ fn plan_gemfile_edit(
 /// declares it somewhere the line grammar cannot see (`eval_gemfile`, a
 /// loop, a gemspec). The managed block would declare it a second time and
 /// bundler refuses every install (#482). Every other plan passes through.
+/// `gemfile_text` is the Gemfile the plan was made for; the refusal reads
+/// it to word its way out ([`out_of_sight_declaration_remedy`]).
 fn refuse_append_of_direct_dependency(
     plan: GemfilePlan,
+    gemfile_text: &str,
     lock_text: &str,
     name: &str,
 ) -> Result<GemfilePlan, String> {
@@ -1647,10 +1656,34 @@ fn refuse_append_of_direct_dependency(
             "Gemfile.lock lists \"{name}\" as a direct dependency, but the Gemfile declares \
              it somewhere the line grammar cannot edit (an `eval_gemfile`d file, a loop, a \
              gemspec); refusing to append a second declaration (bundler hard-fails on \
-             duplicates)"
+             duplicates); {}",
+            out_of_sight_declaration_remedy(gemfile_text, name)
         ));
     }
     Ok(plan)
+}
+
+/// The way out of [`refuse_append_of_direct_dependency`] (#2151): a `gem`
+/// line the line grammar can edit, or agent mode. Hosted mode is not named:
+/// it refuses the gem for the same reason
+/// (`redirect_gem_declaration_not_visible`).
+///
+/// Where the Gemfile has a `gemspec` directive (or one that cannot be
+/// read), the line goes above it: a gemspec development dependency on the
+/// gem merged into a line below the directive is refused next
+/// ([`gemspec_merge_refusal`]).
+fn out_of_sight_declaration_remedy(gemfile_text: &str, name: &str) -> String {
+    let above_gemspec = crate::formats::gem::gemspec::gemspec_directives(gemfile_text)
+        .map_or(true, |directives| !directives.is_empty());
+    let place = if above_gemspec {
+        " above `gemspec`"
+    } else {
+        ""
+    };
+    format!(
+        "declare it with one literal `gem \"{name}\"` line{place} in the Gemfile, or patch \
+         {name} with `--mode agent`"
+    )
 }
 
 /// Looser "declared at all?" probe — the redirect rewriter's `declared_re`
