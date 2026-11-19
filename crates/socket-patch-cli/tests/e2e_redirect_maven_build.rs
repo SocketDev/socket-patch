@@ -149,6 +149,20 @@ fn mount_api(s: &Server, jar: &[u8], pom: &[u8], view: &serde_json::Value) {
 /// (`tests/common/hermetic.rs`) with the per-test local repository as the
 /// crawler's maven repo.
 fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value, String) {
+    socket_with(cwd, m2, args, &[])
+}
+
+/// [`socket`] with `env` on top. Unless `env` says otherwise, the Maven
+/// settings the CLI reads are the harness's empty ones
+/// (`hermetic::neutral_maven_args`: `MAVEN_ARGS` is where the CLI looks
+/// for the `-s` / `-gs` Maven would be started with): the mirrors of
+/// whoever runs the suite must not decide a scan.
+fn socket_with(
+    cwd: &Path,
+    m2: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (Option<i32>, serde_json::Value, String) {
     let mut cmd = hermetic::command(&binary());
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     let out = cmd
@@ -156,6 +170,8 @@ fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Val
         .current_dir(cwd)
         .env("MAVEN_REPO_LOCAL", m2)
         .env_remove("M2_HOME")
+        .env_remove("MAVEN_HOME")
+        .envs(env.iter().copied())
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -964,7 +980,16 @@ mod mediation {
         }
 
         fn scan(&self, proj: &Path) -> (Option<i32>, serde_json::Value, String) {
-            socket(
+            self.scan_with(proj, &[])
+        }
+
+        /// [`Self::scan`] with extra environment for the CLI.
+        fn scan_with(
+            &self,
+            proj: &Path,
+            env: &[(&str, &str)],
+        ) -> (Option<i32>, serde_json::Value, String) {
+            socket_with(
                 proj,
                 &self.m2,
                 &[
@@ -982,6 +1007,7 @@ mod mediation {
                     "--api-token",
                     "fake",
                 ],
+                env,
             )
         }
 
@@ -1631,5 +1657,141 @@ mod mediation {
             "b still builds the earlier patch, from its repository: {:?}",
             b.keys()
         );
+    }
+
+    /// Every file under `from`, copied into the new directory `to`.
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    /// A company's `<mirrorOf>*</mirrorOf>` sends every repository to its
+    /// repository manager, the Socket one included, and the manager does
+    /// not hold the patched version:
+    ///
+    /// - a project wired where no such mirror is configured no longer
+    ///   builds behind it (the bug);
+    /// - a scan that finds the mirror in the settings Maven would be
+    ///   started with writes nothing, exits 0 and says why, naming the
+    ///   mirror, its settings file and the two ways forward, and the
+    ///   project builds behind the mirror as it did;
+    /// - once the mirror leaves the Socket repository out, the same scan
+    ///   wires the project, and it builds behind the mirror with the
+    ///   patched jar.
+    #[test]
+    #[ignore = "real Maven + Maven Central (dependency plugin); run with --ignored"]
+    fn maven_hosted_is_not_wired_behind_a_mirror_that_takes_every_repository() {
+        let Some(mvn) = Mvn::detect(SUITE) else {
+            return;
+        };
+        let b = Bench::new();
+        let proj = b.root.join("guarded");
+        fixture::write_project(&proj, Shape::Selected, &b.server);
+        let Some(before) = fixture::resolve(SUITE, &mvn, &proj, &b.m2, &b.plain, "target/before")
+        else {
+            return;
+        };
+        let pristine = fixture::snapshot(&proj);
+        // The company's repository manager serves what the fixture
+        // repository serves. (It keeps the id `central`, so the dependency
+        // plugin the local repository holds is not fetched again.)
+        let id = format!("socket-patch-{UUID}");
+        let manager = format!("{}{}", b.server.uri(), fixture::REPO_ROUTE);
+        let corp = b.root.join("settings-corp.xml");
+        write_settings_with_ids(&corp, &[("central", "*", &manager)]);
+        let maven_args = |settings: &Path| format!("-s {}", settings.display());
+        // A local repository with the dependency plugin and none of the
+        // project's artifacts: what a build behind the mirror starts from.
+        // (Maven only probes, with a HEAD the test's server does not
+        // answer, for an artifact it holds from another repository id.)
+        let cold = |tag: &str| -> PathBuf {
+            let m2 = b.root.join(format!("m2-{tag}"));
+            copy_tree(&b.m2, &m2);
+            std::fs::remove_dir_all(m2.join("com").join("socketfixture")).unwrap();
+            m2
+        };
+
+        // Unguarded: wired where no mirror is configured, then built
+        // behind the mirror.
+        let wired = b.root.join("wired");
+        fixture::write_project(&wired, Shape::Selected, &b.server);
+        let (code, env, stderr) = b.scan(&wired);
+        assert_eq!(code, Some(0), "{env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 1, "{env}");
+        let out = mvn.copy_dependencies(&wired, &cold("unguarded"), &corp, "target/after");
+        assert!(
+            !ok(&out) && dump(&out).contains(&b.suffixed),
+            "the mirror cannot serve the patched version:\n{}",
+            dump(&out)
+        );
+
+        // Guarded: the scan reads the settings Maven would be started with.
+        let (code, env, stderr) = b.scan_with(&proj, &[("MAVEN_ARGS", &maven_args(&corp))]);
+        assert_eq!(code, Some(0), "{env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 0, "{env}");
+        assert_eq!(env["summary"]["failed"], 0, "{env}");
+        let detail = warning(&env, "redirect_maven_mirror_captures_repository")
+            .unwrap_or_else(|| panic!("the scan says why: {env}"))["detail"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for names in [
+            "`central`",
+            "<mirrorOf>*</mirrorOf>",
+            corp.to_str().unwrap(),
+            &format!("<mirrorOf>*,!{id}</mirrorOf>"),
+            "scan --mode vendored",
+            "Only this machine's settings were read",
+        ] {
+            assert!(detail.contains(names), "{names}: {detail}");
+        }
+        assert_eq!(
+            fixture::snapshot(&proj),
+            pristine,
+            "the project is left untouched: {env}"
+        );
+        assert_eq!(
+            fixture::resolve_warm(&mvn, &proj, &cold("guarded"), &corp, "target/guarded", &[]),
+            before,
+            "and builds behind the mirror as it did"
+        );
+
+        // The first way forward: the mirror leaves the repository out.
+        // (The Socket repository is itself mirrored onto the test's
+        // server, under its own id, which is what a mirror written for
+        // that one repository looks like.)
+        let excluding = b.root.join("settings-corp-excluding.xml");
+        let socket_url = format!("{}{}", b.server.uri(), PATCH.repo_path());
+        write_settings_with_ids(
+            &excluding,
+            &[
+                ("central", &format!("*,!{id}"), &manager),
+                (&id, &id, &socket_url),
+            ],
+        );
+        let (code, env, stderr) = b.scan_with(&proj, &[("MAVEN_ARGS", &maven_args(&excluding))]);
+        assert_eq!(code, Some(0), "{env}\n{stderr}");
+        assert_eq!(env["summary"]["applied"], 1, "{env}");
+        assert!(
+            warning(&env, "redirect_maven_mirror_captures_repository").is_none(),
+            "{env}"
+        );
+        let after = fixture::resolve_warm(
+            &mvn,
+            &proj,
+            &cold("excluding"),
+            &excluding,
+            "target/excluded",
+            &[],
+        );
+        b.assert_only_the_victim_is_patched("behind the excluding mirror", &before, &after);
     }
 }
