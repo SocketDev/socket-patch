@@ -1,0 +1,72 @@
+# JRuby test image: a JDK, JRuby from its release tarball, Bundler, git and
+# curl. For the real-nokogiri harness (tests/nokogiri/nokogiri_e2e.rb) on
+# JRuby, where Bundler installs a gem's `java` platform build: the copy
+# whose compiled code is jars, and which `apply` patches without building
+# anything.
+#
+# Unlike the other images here, this one holds no socket-patch: the binary
+# under test is mounted, so the image does not need Dockerfile.base and is
+# not rebuilt for a code change. It must be a Linux binary of the image's
+# architecture (`cargo build -p socket-patch-cli` in a Linux container or
+# on a Linux host).
+#
+# The base image is pinned by digest and the JRuby tarball by the sha256
+# its release publishes (the `.sha256` file beside it on Maven Central,
+# where jruby.org's downloads come from).
+#
+# JRuby 9.4 is the Ruby 3.1 line and runs on Java 8 or newer. JRuby 10
+# (10.1 is the Ruby 4.0 line) needs Java 21 or newer, so it is built on
+# another JDK:
+#
+#   docker build -f tests/docker/Dockerfile.jruby -t socket-patch-test-jruby:9.4 tests/docker
+#   docker build -f tests/docker/Dockerfile.jruby -t socket-patch-test-jruby:10.1 \
+#     --build-arg JDK_IMAGE=eclipse-temurin@sha256:884a2f8692cc1e2c7e21f95914adf0ae0eafee9a7eb663a12169cc44468256ec \
+#     --build-arg JRUBY_VERSION=10.1.3.0 \
+#     --build-arg JRUBY_SHA256=3d76fe1fce6aa9f56fd7efb1015a9db95a0aa6f95fe9ec868f9e75d9ddc1871c \
+#     tests/docker
+#
+# Run the harness in it, with the binary and the script mounted read-only.
+# The project it builds, and the gems Bundler installs for it, live in the
+# container's own temp dir:
+#
+#   docker run --rm \
+#     -v "$PWD/tests/nokogiri:/e2e:ro" \
+#     -v "$PWD/target/debug/socket-patch:/usr/local/bin/socket-patch:ro" \
+#     -e SOCKET_NO_CONFIG=1 -e SOCKET_NO_UPDATE_CHECK=1 -e SOCKET_TELEMETRY_DISABLED=1 \
+#     socket-patch-test-jruby:9.4 \
+#     ruby /e2e/nokogiri_e2e.rb --socket-patch /usr/local/bin/socket-patch \
+#       --nokogiri 1.18.10 --install java
+#
+# eclipse-temurin:17-jdk (multi-arch index digest, the one Dockerfile.sbt
+# pins) by default; the digest above is eclipse-temurin:25-jdk.
+ARG JDK_IMAGE=eclipse-temurin@sha256:5d6042fb8cdc14d614e4e421f52e3211fc5aeadddce44cbf9de8ed37c791f824
+FROM ${JDK_IMAGE}
+
+ARG JRUBY_VERSION=9.4.15.0
+ARG JRUBY_SHA256=c8b8c5a7a1581fdba3ba73f7c375f793f6528117b444cc6baf6fb29bbcf9696d
+
+# `ruby` is JRuby: the harness and Bundler's scripts start it by that name.
+RUN set -eu; \
+    if command -v apt-get >/dev/null 2>&1; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends ca-certificates curl git tar gzip \
+      && rm -rf /var/lib/apt/lists/*; \
+    elif command -v microdnf >/dev/null 2>&1; then \
+      microdnf install -y ca-certificates curl git tar gzip findutils && microdnf clean all; \
+    fi; \
+    curl -fsSL -o /tmp/jruby.tar.gz \
+      "https://repo1.maven.org/maven2/org/jruby/jruby-dist/${JRUBY_VERSION}/jruby-dist-${JRUBY_VERSION}-bin.tar.gz"; \
+    echo "${JRUBY_SHA256}  /tmp/jruby.tar.gz" | sha256sum -c -; \
+    mkdir -p /opt/jruby \
+    && tar -xzf /tmp/jruby.tar.gz -C /opt/jruby --strip-components=1 \
+    && rm /tmp/jruby.tar.gz; \
+    ln -s /opt/jruby/bin/jruby /usr/local/bin/ruby
+
+ENV PATH=/opt/jruby/bin:$PATH \
+    LANG=C.UTF-8
+
+RUN jruby --version && gem --version \
+ && (bundle --version || gem install bundler --no-document) \
+ && bundle --version
+
+WORKDIR /workspace

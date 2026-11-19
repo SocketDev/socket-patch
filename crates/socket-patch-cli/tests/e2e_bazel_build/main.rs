@@ -6,7 +6,7 @@
 //! binary in it the way a user does, and builds again. What a test asserts,
 //! it reads from what Bazel built: the line `bazel run //:consumer` prints.
 //!
-//! The tests are `#[ignore]`d: they need a Bazel release and the network
+//! Those tests are `#[ignore]`d: they need a Bazel release and the network
 //! (the Bazel registry, the ruleset archives and the language toolchain),
 //! and a host that does not answer fails them. The package under test and
 //! every Socket host are loopback stand-ins.
@@ -19,10 +19,15 @@
 //! cargo test -p socket-patch-cli --test e2e_bazel_build -- --ignored go:: --nocapture
 //! ```
 //!
-//! A test takes its release from the Bazel it runs: the one
+//! The other tests of the target need neither and run with a plain
+//! `cargo test`: the checks of the harness and of the fixtures, and in
+//! `go.rs` the tests that run `socket-patch` in a checkout no Bazel builds
+//! and read the files it wrote.
+//!
+//! An `#[ignore]`d test takes its release from the Bazel it runs: the one
 //! `SOCKET_PATCH_BAZEL_E2E_BAZEL` names, else `bazel` on `PATH` (a bazelisk
 //! there picks its release as it does anywhere, from `USE_BAZEL_VERSION`).
-//! With no Bazel a test prints `SKIP <why>` and passes; with
+//! With no Bazel it prints `SKIP <why>` and passes; with
 //! `SOCKET_PATCH_BAZEL_E2E_REQUIRED=1` (CI) it fails instead. `harness.rs`
 //! lists the other variables.
 //!
@@ -48,6 +53,7 @@ mod fs_tree;
 mod hosted_memory_common;
 
 mod cargo;
+mod composer;
 mod go;
 mod harness;
 mod npm;

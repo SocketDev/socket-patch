@@ -896,10 +896,14 @@ async fn filter_to_installed_purls(
     // project).
     let mut pnp_diags: Vec<lock_inventory::UnsupportedNpmLayout> = Vec::new();
     if !common.is_global() {
-        let supplement = super::scan::project_lockfile_supplement(&ctx, &[], None).await;
+        let hosted = mode == super::scan::ScanMode::Hosted;
+        let supplement = super::scan::project_lockfile_supplement(&ctx, &[], None, hosted).await;
         pnp_diags = supplement.unsupported;
         if mode != super::scan::ScanMode::Agent {
             present.extend(supplement.entries.iter().map(|e| PurlKey::new(&e.purl)));
+            // A hosted run's supplement also names the gems the lock
+            // resolves only as precompiled platform builds.
+            present.extend(supplement.purls.iter().cloned());
             let vendored =
                 super::scan::project_vendored_supplement(&ctx, &[], &ctx.loaded().await.vendor)
                     .await;
@@ -3460,6 +3464,36 @@ mod tests {
         assert_eq!(env.events[0].error.as_deref(), Some("denied"));
         assert_eq!(env.status, Status::PartialFailure);
         assert!(env.error.is_none());
+    }
+
+    /// An incomplete patch (its files written, its compiled part not in
+    /// effect) reaches the caller as a failure of the nested apply under
+    /// its own code: the recorded patch is `failed` with that code and the
+    /// apply's words, never `applied`, and the run is a partial failure.
+    #[test]
+    fn record_apply_outcome_reports_an_incomplete_patch_under_its_own_code() {
+        let mut env = Envelope::new(JsonCommand::Get);
+        let purl = "pkg:gem/nokogiri@1.18.10?platform=ruby";
+        let report = report_with(
+            vec![failure(
+                purl,
+                "native_extension_not_rebuilt",
+                "the patch's files were written, but not built",
+            )],
+            &[],
+        );
+        let recs = recorded(&[(purl, "un")]);
+        record_apply_outcome(&mut env, &recs, Some(&report), |_| None);
+        assert_eq!(
+            outcomes(&env),
+            vec![o("failed", purl, "un", "native_extension_not_rebuilt")]
+        );
+        assert_eq!(
+            env.events[0].error.as_deref(),
+            Some("the patch's files were written, but not built")
+        );
+        assert_eq!(env.status, Status::PartialFailure);
+        assert_eq!(env.summary.applied, 0);
     }
 
     #[test]

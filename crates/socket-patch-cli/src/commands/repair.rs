@@ -208,6 +208,8 @@ pub async fn run(args: RepairArgs) -> i32 {
     // client's public-proxy advisory ahead of its own output.
     let mut client: Option<ApiClient> = None;
     let result = repair_inner(&args, &manifest_path, &mut client, vendor_references).await;
+    // A vendored Go copy may be back on disk, also when the repair failed.
+    let ignored = crate::commands::sync_bazelignore(&args.common, true).await;
     let auth_fallback = client
         .as_ref()
         .and_then(crate::commands::vex_sources::api_auth_fallback_warning);
@@ -224,6 +226,7 @@ pub async fn run(args: RepairArgs) -> i32 {
         Ok((mut env, counts)) => {
             env.warnings.extend(commit_recovery);
             env.warnings.extend(auth_fallback);
+            env.warnings.extend(ignored);
             let had_failure = matches!(env.status, Status::PartialFailure | Status::Error);
             if had_failure {
                 track_patch_repair_failed("One or more artifacts failed to download", &telemetry)
@@ -248,6 +251,7 @@ pub async fn run(args: RepairArgs) -> i32 {
                 let mut env =
                     error_envelope(Command::Repair, args.common.dry_run, &e.code, &e.message);
                 env.warnings.extend(commit_recovery);
+                env.warnings.extend(ignored);
                 crate::ui::print_json(&env.to_value());
             } else {
                 eprintln!("Error: {}", e.message);

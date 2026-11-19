@@ -54,10 +54,18 @@ pub(crate) struct LockfileSupplement {
 /// crawled): an entry of an ecosystem the crawl skipped is never counted
 /// lockfile-only, since there is no crawl to tell whether it is installed.
 /// `entries` still holds the full inventory.
+///
+/// `hosted`: the run is a hosted scan. The inventory leaves out a gem the
+/// Bundler lock resolves only as precompiled platform builds (`nokogiri
+/// (1.18.10-arm64-darwin)`: no one `.gem` stands for it, so it cannot be
+/// vendored from the lock, and an in-place patch needs the installed copy).
+/// Hosted mode redirects such a gem to its per-platform prebuilds from the
+/// lock alone, so a hosted supplement names it too.
 pub(crate) async fn lockfile_supplement(
     ctx: &crate::commands::context::ProjectContext<'_>,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
     only: Option<&[String]>,
+    hosted: bool,
 ) -> LockfileSupplement {
     let common = ctx.common;
     let mut out = LockfileSupplement::default();
@@ -67,22 +75,32 @@ pub(crate) async fn lockfile_supplement(
     let locks = ctx.locks().await;
     out.unsupported = locks.unsupported.clone();
     let entries = &locks.entries;
-    if entries.is_empty() {
+    let platform_gems = if hosted {
+        ctx.gem_platform_only_purls().await
+    } else {
+        Vec::new()
+    };
+    if entries.is_empty() && platform_gems.is_empty() {
         return out;
     }
-    (out.packages, out.purls) = lockfile_only_packages(entries, crawled, only, &common.cwd);
+    let resolved = entries
+        .iter()
+        .map(|entry| entry.purl.as_str())
+        .chain(platform_gems.iter().map(String::as_str));
+    (out.packages, out.purls) = lockfile_only_packages(resolved, crawled, only, &common.cwd);
     out.entries = entries.clone();
     out
 }
 
-/// The lockfile entries with no crawled counterpart, fabricated as crawl
-/// entries, plus their [`PurlKey`]s. "Crawled" is by [`PurlKey`], the same
-/// relation [`lockfile_only_contains`] answers by: a lock spelling that
-/// differs from the installed crawl's only in encoding, NuGet case, PEP 503
-/// form or composer padding is the installed package, not a lockfile-only
-/// one — keyed in, its every spelling would read as not installed.
-fn lockfile_only_packages(
-    entries: &[LockfileEntry],
+/// The packages `resolved` (the purls the project's lockfiles resolve) with
+/// no crawled counterpart, fabricated as crawl entries, plus their
+/// [`PurlKey`]s. "Crawled" is by [`PurlKey`], the same relation
+/// [`lockfile_only_contains`] answers by: a lock spelling that differs from
+/// the installed crawl's only in encoding, NuGet case, PEP 503 form or
+/// composer padding is the installed package, not a lockfile-only one —
+/// keyed in, its every spelling would read as not installed.
+fn lockfile_only_packages<'a>(
+    resolved: impl Iterator<Item = &'a str>,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
     only: Option<&[String]>,
     cwd: &std::path::Path,
@@ -99,12 +117,12 @@ fn lockfile_only_packages(
                 .is_some_and(|eco| list.iter().any(|name| name == eco.cli_name()))
         })
     };
-    for entry in entries {
-        let key = PurlKey::new(&entry.purl);
-        if crawled_keys.contains(&key) || !in_scope(&entry.purl) {
+    for purl in resolved {
+        let key = PurlKey::new(purl);
+        if crawled_keys.contains(&key) || !in_scope(purl) {
             continue;
         }
-        let Some(pkg) = crawled_from_purl(&entry.purl, cwd) else {
+        let Some(pkg) = crawled_from_purl(purl, cwd) else {
             continue;
         };
         purls.insert(key);
@@ -908,8 +926,12 @@ mod tests {
             crawled_from("pkg:pypi/typing-extensions@4.12.2"),
             crawled_from("pkg:composer/psr/log@3.0.2.0"),
         ];
-        let (packages, purls) =
-            lockfile_only_packages(&entries, &crawled, None, std::path::Path::new("/p"));
+        let (packages, purls) = lockfile_only_packages(
+            entries.iter().map(|entry| entry.purl.as_str()),
+            &crawled,
+            None,
+            std::path::Path::new("/p"),
+        );
         let got: Vec<&str> = packages.iter().map(|p| p.purl.as_str()).collect();
         assert_eq!(got, vec!["pkg:npm/lockonly@1.0.0"]);
         assert!(lockfile_only_contains(&purls, "pkg:npm/lockonly@1.0.0"));

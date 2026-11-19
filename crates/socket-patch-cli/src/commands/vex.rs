@@ -25,7 +25,7 @@ use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated, TelemetryAuth};
 use socket_patch_core::vex::verify::{npm_manifest_after_hash, DEPENDENCY_NOT_INSTALLED};
 use socket_patch_core::vex::{
-    build_document_marking_unverified, detect_product, BuildOptions, Document, FailedPatch,
+    build_document_with, detect_product, Attested, BuildOptions, Document, FailedPatch,
     VendorContext, VerifyOutcome, NOT_VERIFIED_SUFFIX,
 };
 
@@ -1379,12 +1379,17 @@ async fn generate_vex(
         Vec::new()
     };
 
-    let doc = match build_document_marking_unverified(
+    let doc = match build_document_with(
         manifest,
-        &outcome.applied,
-        &outcome.vendored,
-        redirected,
-        &unverified,
+        &Attested {
+            applied: &outcome.applied,
+            vendored: &outcome.vendored,
+            redirected,
+            unverified: &unverified,
+            // A package no installed build of which holds any file of
+            // its patch: not affected because the code is not there.
+            code_not_present: &outcome.code_not_present,
+        },
         &opts,
     ) {
         Some(doc) => doc,

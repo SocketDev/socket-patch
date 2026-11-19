@@ -784,7 +784,24 @@ fn rollback_failure_code(result: &RollbackResult) -> &'static str {
 /// `already_original`, or `failed` with the blocking file's code. The
 /// installed copy rides in `details.path`; a failure adds
 /// `details.filesVerified` (per-file camelCase status + hashes).
-fn agent_result_event(result: &RollbackResult, uuid: Option<&str>, dry_run: bool) -> PatchEvent {
+///
+/// `record` is the result's manifest record. A gem record that lists
+/// files, none of which was looked at on the copy, is `skipped`
+/// `not_in_platform_build`, wet or dry: none of them is part of the build
+/// installed there (the JRuby build of a gem, see
+/// `gem_ext::rollback_files`), so `apply` wrote nothing of the patch and
+/// there is nothing to restore. That is not a record with no files.
+fn agent_result_event(
+    result: &RollbackResult,
+    record: Option<&PatchRecord>,
+    dry_run: bool,
+) -> PatchEvent {
+    let uuid = record.map(|record| record.uuid.as_str());
+    let nothing_of_it_here = result.success
+        && result.files_verified.is_empty()
+        && result.files_rolled_back.is_empty()
+        && record.is_some_and(|record| !record.files.is_empty())
+        && Ecosystem::from_purl(&result.package_key) == Some(Ecosystem::Gem);
     let file = |path: &str| PatchEventFile {
         path: path.to_string(),
         verified: true,
@@ -814,6 +831,12 @@ fn agent_result_event(result: &RollbackResult, uuid: Option<&str>, dry_run: bool
         PatchEvent::new(PatchAction::Skipped, result.package_key.clone()).with_reason(
             "already_original",
             "every file already matches its original (beforeHash) content",
+        )
+    } else if nothing_of_it_here {
+        PatchEvent::new(PatchAction::Skipped, result.package_key.clone()).with_reason(
+            socket_patch_core::patch::gem_ext::NOT_IN_BUILD_CODE,
+            "none of the patch's files are part of the build of the gem installed here: \
+             nothing of the patch was applied to it, so there is nothing to restore",
         )
     } else if dry_run {
         PatchEvent::new(PatchAction::Verified, result.package_key.clone()).with_files(
@@ -1239,7 +1262,7 @@ fn build_rollback_envelope(report: &RollbackReport<'_>) -> Envelope {
     for result in report.results {
         env.record(agent_result_event(
             result,
-            manifest_uuid(&result.package_key),
+            report.manifest.patches.get(&result.package_key),
             dry_run,
         ));
         if let Some(sidecar) = &result.sidecar {
@@ -2671,6 +2694,9 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 .iter()
                 .chain(hosted_leg.warnings.iter())
                 .for_each(|(code, detail)| run_warnings.push((code.clone(), detail.clone())));
+            // Every leg and the orphan sweep are done with the Go copies.
+            let ignored = crate::commands::sync_bazelignore(&args.common, true).await;
+            run_warnings.extend(ignored.into_iter().map(|w| (w.code, w.detail)));
             // A restored package whose ownership could not be put back, or
             // whose stale bytecode could not be removed (the engine reports
             // it on `error` with `success: true`), is restored but worth a
@@ -3668,7 +3694,7 @@ pub(crate) async fn rollback_patches_inner(
                     // hold it (a precompiled gem never shipped it; a build
                     // removed it) is removed, not restored.
                     let gem_files = if is_gem {
-                        Some(gem_ext::rollback_files(pkg_path, &patch.files).await)
+                        Some(gem_ext::rollback_files(pkg_path, purl, &patch.files).await)
                     } else {
                         None
                     };

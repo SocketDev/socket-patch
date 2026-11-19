@@ -1,4 +1,5 @@
-//! Maven — the root `pom.xml`, plus `.mvn/maven.config` +
+//! Maven — the root `pom.xml` (and, when it heads a reactor, every pom of
+//! the reactor), plus `.mvn/maven.config` +
 //! `.mvn/checksums/checksums.sha256` for the hosted integrity pin.
 //!
 //! Maven has no lockfile: both Socket wirings live in `pom.xml`, and in both
@@ -41,10 +42,14 @@
 //! literal version wins over `<dependencyManagement>`, so a managed Socket
 //! pin shadowed by a direct plain version (or a GA declared with several
 //! different effective versions) is diagnosed, not a ref.
-//! A hosted pin in a reactor root (`<modules>` / `<subprojects>`) stays
-//! a ref (rollback / remove find it) but marked unattested: a module's
-//! own literal `<version>` overrides it, and only the root pom is read here
-//! (the rewriter refuses such roots, #261). A `${property}` version is
+//! A reactor (`<modules>` / `<subprojects>`, or Maven 4 subproject
+//! discovery) is read whole ([`extract_hosted_reactor`]): its pins sit in
+//! the poms of the modules that select the patched version, and the patch
+//! is attested only when every module that resolves the base version is
+//! reached by one. A reactor whose poms cannot all be read falls back to
+//! its root pom: a pin there stays a ref (rollback / remove find it) but
+//! marked unattested, since a module's own literal `<version>` overrides
+//! it (#261). A `${property}` version is
 //! interpolated through every property it names (at most 16 deep; a cycle
 //! or an undefined name never resolves to a pin) twice: as the pom spells
 //! it (the root `<properties>`, what the rewriter writes and rolls back)
@@ -136,9 +141,10 @@
 //! (plugin classpaths) are not project resolution and are skipped silently;
 //! `<profiles>` are only read when activated, so a Socket repository or pin
 //! there is diagnosed, never a ref (a profile that bypasses a live pin
-//! withholds its attestation, [`bypasses`]). Submodule poms are not read,
-//! and parent poms only for what they declare of a managed pin's GA
-//! ([`Ancestors`]): a Socket repository or pin in one is not wiring here.
+//! withholds its attestation, [`bypasses`]). Outside a reactor, submodule
+//! poms are not read, and parent poms only for what they declare of a
+//! managed pin's GA ([`Ancestors`]): a Socket repository or pin in one is
+//! not wiring here.
 //! Gradle builds are discovered by
 //! `gradle.rs` (the hosted index) and the vendored JVM backend's own
 //! probes.
@@ -210,21 +216,92 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     }
 
     let gas = live_gas(&pom.deps);
-    let reactor = crate::vendor::jvm::maven_reactor::declares_modules(&raw)
-        || (crate::vendor::jvm::maven_reactor::may_discover_subprojects(&raw, config.as_deref())
-            && !crate::vendor::jvm::maven_reactor::implicit_subprojects_in(&ctx.view)
-                .await
-                .is_empty());
-    extract_hosted(
-        ctx,
-        (&raw, &pom),
-        &gas,
-        &hosted,
-        reactor,
-        config.as_deref(),
-        out,
-    )
+    // The project as the hosted rewriter reads it: every pom of a reactor,
+    // and each parent pom one inherits from inside the checkout. Hosted
+    // wiring may sit in any of them, so whenever there is more than the
+    // root pom they are read together. A pom of the reactor that cannot
+    // be read is left out: the pins of the others are still refs, and
+    // none is attested. Only a root pom the reactor reader cannot parse
+    // falls back to the single-pom reading below.
+    use crate::vendor::jvm::maven_reactor::{heads_reactor_in, read_reactor, HostedReactor};
+    // A pom that is there but is not UTF-8 text is reported as unreadable
+    // (as the root pom is), and stands as a pom of the reactor that could
+    // not be read: it may hold a pin, or declare the base version.
+    let undecodable = std::sync::Mutex::new(Vec::new());
+    let texts = read_reactor(&ctx.view, &raw, config.as_deref(), |rel| {
+        let undecodable = &undecodable;
+        async move {
+            match ctx.read_text_quiet(&rel).await {
+                Ok(text) => text,
+                Err(why) => {
+                    undecodable
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push((rel, why));
+                    None
+                }
+            }
+        }
+    })
     .await;
+    let mut undecodable = undecodable
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    undecodable.sort();
+    for (rel, why) in &undecodable {
+        out.diag(
+            super::DIAG_LOCKFILE_UNREADABLE,
+            rel,
+            format!("cannot read {rel}: {why}"),
+        );
+    }
+    let undecodable: Vec<String> = undecodable
+        .into_iter()
+        .map(|(rel, _)| format!("{rel} is there but is not UTF-8 text"))
+        .collect();
+    let heads_reactor = heads_reactor_in(&ctx.view, &raw, config.as_deref()).await;
+    let reactor = {
+        let read = |rel: &str| texts.get(rel).map(|text| text.clone().into_bytes());
+        let list = |dir: &str| crate::patch::redirect::gradle::key_list(&texts, dir);
+        HostedReactor::read_what_is_there(&read, &list)
+    };
+    match reactor {
+        Ok((reactor, unread)) if heads_reactor || reactor.scope().len() > 1 => {
+            // (The undecodable pom first: the reader below only knows that
+            // it found no pom there.)
+            let unread: Vec<String> = undecodable.iter().cloned().chain(unread).collect();
+            extract_hosted_reactor(
+                ctx,
+                (&reactor, &unread),
+                &texts,
+                config.as_deref(),
+                &user_properties,
+                &hosted,
+                out,
+            )
+            .await;
+        }
+        reactor => {
+            let unread = reactor.err().filter(|_| heads_reactor).map(|refusal| {
+                refusal
+                    .detail
+                    .strip_prefix("reason: ")
+                    .unwrap_or(&refusal.detail)
+                    .to_string()
+            });
+            let unread = undecodable.first().cloned().or(unread);
+            extract_hosted(
+                ctx,
+                (&raw, &pom),
+                &gas,
+                &hosted,
+                unread.as_deref(),
+                config.as_deref(),
+                out,
+            )
+            .await;
+        }
+    }
     if !vendored.is_empty() {
         extract_vendored(ctx, &pom.deps, &vendored, out).await;
     }
@@ -237,7 +314,7 @@ async fn extract_hosted(
     (raw, pom): (&str, &Pom),
     gas: &BTreeSet<(String, String)>,
     hosted: &BTreeMap<String, String>,
-    reactor: bool,
+    unread_reactor: Option<&str>,
     config: Option<&str>,
     out: &mut Discovery,
 ) {
@@ -376,19 +453,20 @@ async fn extract_hosted(
                 .await;
         match candidates.as_slice() {
             [uuid] => {
-                // A reactor root's pin stays a ref (rollback, remove and
-                // list must still find it) but is never attested: a
-                // module's own <version>, unread here, overrides it (#261).
-                if reactor {
+                // The pin of a reactor root whose modules cannot be read
+                // stays a ref (rollback, remove and list must still find
+                // it) but is never attested: a module's own <version>,
+                // unread here, overrides it (#261).
+                if let Some(why) = unread_reactor {
                     out.unattested(
                         &purl,
                         uuid,
                         POM,
                         format!(
                             "{POM} heads a multi-module reactor (<modules>/<subprojects>, or \
-                             Maven 4 subproject discovery), and a module's own \
-                             <version> of {ga} overrides this root pin; hosted mode reads only \
-                             the root pom (re-patch the reactor with `scan --mode vendored`)"
+                             Maven 4 subproject discovery) whose poms cannot all be read \
+                             ({why}), and a module's own <version> of {ga} overrides this root \
+                             pin"
                         ),
                         UnattestedKind::MavenReactorRoot,
                     );
@@ -508,6 +586,252 @@ async fn extract_hosted(
             integrity.filter(|_| !unread),
             unread,
         ));
+    }
+}
+
+// ── hosted, in a reactor ─────────────────────────────────────────────────
+
+/// The hosted pins of a reactor, or of a single pom that inherits from a
+/// parent pom inside the checkout (the reactor planner's wiring,
+/// `HostedReactor::plan`): read from every pom the planner reads, since a
+/// pin sits in the pom of the modules that select the patched version, a
+/// declaration is rewritten where it stands, and a `${property}` version
+/// may be wired through the property in another pom. The `<repository>` (in the local
+/// root a wired pom inherits from) names the patch uuid; a pin's comment
+/// names it too, and any other suffixed version is tied to it by its
+/// 8-hex suffix, as in a single pom.
+///
+/// Every pom that carries part of the wiring is a ref's file (rollback and
+/// remove undo each). The patch is attested only when every module that
+/// resolves the base version, or may, is reached by a pin or a declaration
+/// of the patch, and no declaration may still build the base version
+/// ([`HostedReactor::unattestable`](crate::vendor::jvm::maven_reactor::HostedReactor::unattestable),
+/// the rule vendored mode attests by). What Maven selects is read from the
+/// local Maven repository, on disk only: in memory, a module the wiring
+/// does not reach withholds the attestation.
+async fn extract_hosted_reactor(
+    ctx: &DiscoverCtx<'_>,
+    (reactor, unread): (&crate::vendor::jvm::maven_reactor::HostedReactor, &[String]),
+    texts: &BTreeMap<String, String>,
+    config: Option<&str>,
+    user_properties: &BTreeMap<String, String>,
+    root_hosted: &BTreeMap<String, String>,
+    out: &mut Discovery,
+) {
+    use crate::crawlers::maven_selection::MavenSelection;
+
+    // uuid -> its repository's url, and the poms that declare it.
+    let mut hosted: BTreeMap<String, (String, BTreeSet<String>)> = root_hosted
+        .iter()
+        .map(|(uuid, url)| {
+            (
+                uuid.clone(),
+                (url.clone(), BTreeSet::from([POM.to_string()])),
+            )
+        })
+        .collect();
+    for rel in reactor.scope().iter().filter(|rel| *rel != POM) {
+        let Some(Ok(pom)) = texts
+            .get(rel)
+            .map(|text| parse_pom_with(text, user_properties))
+        else {
+            continue;
+        };
+        for repo in pom.repos.iter().filter(|repo| !repo.in_profile) {
+            let named = socket_patch_name_uuid(&repo.id, false);
+            let Some(uuid) = ctx
+                .hosted_uuid(&repo.url)
+                .filter(|uuid| named.as_deref() == Some(uuid.as_str()))
+            else {
+                continue;
+            };
+            hosted
+                .entry(uuid)
+                .or_insert_with(|| (repo.url.clone(), BTreeSet::new()))
+                .1
+                .insert(rel.clone());
+        }
+    }
+
+    let sites = reactor.sites();
+    // uuid -> the (purl, g, a, suffixed version, poms) pins that tie to it.
+    type Tie = (String, String, String, String, BTreeSet<String>);
+    let mut ties: BTreeMap<String, Vec<Tie>> = BTreeMap::new();
+    for site in sites {
+        let ga = format!("{}:{}", site.group, site.artifact);
+        let (base, hex8) =
+            split_socket_version(&site.suffixed).expect("a site is at a suffixed version");
+        let file = site.rels.iter().next().map_or(POM, String::as_str);
+        let candidates: Vec<&String> = match &site.uuid {
+            Some(uuid) => hosted.keys().filter(|hosted| *hosted == uuid).collect(),
+            None => hosted
+                .keys()
+                .filter(|uuid| uuid.starts_with(hex8))
+                .collect(),
+        };
+        let Some(purl) = maven_purl(&site.group, &site.artifact, base).filter(|_| {
+            is_maven_coordinate(&site.group)
+                && is_maven_coordinate(&site.artifact)
+                && is_maven_version_text(&site.suffixed)
+        }) else {
+            out.diag(
+                DIAG_REF_INVALID,
+                file,
+                format!(
+                    "{file}: {ga} <version>{}</version> is not a usable Maven coordinate",
+                    site.suffixed
+                ),
+            );
+            continue;
+        };
+        match candidates.as_slice() {
+            [uuid] => ties.entry((*uuid).clone()).or_default().push((
+                purl,
+                site.group,
+                site.artifact,
+                site.suffixed,
+                site.rels,
+            )),
+            // A vendored pin (its comment names a patch no hosted
+            // repository serves), or one whose committed tree serves it:
+            // attributed through the vendor ledger.
+            [] if site.uuid.is_some()
+                || ctx
+                    .exists(&format!(
+                        "{}/{}",
+                        layout::MAVEN2_TREE,
+                        layout::artifact_path(
+                            &site.group,
+                            &site.artifact,
+                            &site.suffixed,
+                            None,
+                            "jar"
+                        )
+                    ))
+                    .await => {}
+            [] => out.diag(
+                DIAG_REF_UNATTRIBUTABLE,
+                file,
+                format!(
+                    "{file}: {ga} <version>{}</version> carries a Socket patch suffix but no \
+                     socket-patch-<uuid> repository's uuid starts with {hex8}",
+                    site.suffixed
+                ),
+            ),
+            several => out.diag(
+                DIAG_REF_UNATTRIBUTABLE,
+                file,
+                format!(
+                    "{file}: {ga} <version>{}</version> matches several Socket patch \
+                     repositories ({}); the 8-hex suffix cannot tell which one serves it",
+                    site.suffixed,
+                    several
+                        .iter()
+                        .map(|uuid| uuid.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ),
+        }
+    }
+
+    let mut checksums: Option<BTreeMap<String, String>> = None;
+    let mut selection: Option<MavenSelection> = None;
+    for (uuid, (url, declared_in)) in &hosted {
+        let file = declared_in.iter().next().map_or(POM, String::as_str);
+        let Some(pins) = ties.get(uuid) else {
+            out.diag(
+                DIAG_REF_UNATTRIBUTABLE,
+                file,
+                format!(
+                    "{file}: repository socket-patch-{uuid} is tied to no dependency (no \
+                     <version> of the reactor carries the -socket.{} suffix; a same-GAV \
+                     repository cannot be attributed to an artifact)",
+                    &uuid[..8]
+                ),
+            );
+            continue;
+        };
+        let [(purl, group, artifact, pinned, wired_in)] = &pins[..] else {
+            let purls: Vec<&str> = pins.iter().map(|(purl, ..)| purl.as_str()).collect();
+            out.diag(
+                DIAG_REF_UNATTRIBUTABLE,
+                file,
+                format!(
+                    "{file}: repository socket-patch-{uuid} is pinned by several packages \
+                     ({}); a Socket patch repository serves exactly one artifact",
+                    purls.join(", ")
+                ),
+            );
+            continue;
+        };
+        if checksums.is_none() {
+            // (The root pom is the one whose model declares the Maven.)
+            let root_pom = texts.get(POM).map(String::as_str).unwrap_or_default();
+            checksums = Some(trusted_checksums(ctx, config, root_pom, out).await);
+        }
+        let jar = layout::artifact_path(group, artifact, pinned, None, "jar");
+        let integrity = checksums
+            .as_ref()
+            .and_then(|c| c.get(&jar))
+            .map(|hex| LockIntegrity::Sha256Hex(hex.clone()));
+        for rel in wired_in.iter().chain(declared_in).collect::<BTreeSet<_>>() {
+            out.push(PatchedRef::hosted(
+                purl.clone(),
+                uuid.clone(),
+                rel,
+                Some(url),
+                integrity.clone(),
+                false,
+            ));
+        }
+        // What each module selects, read once and only for a reactor that
+        // carries a hosted pin.
+        if selection.is_none() {
+            selection = Some(match ctx.view.disk_root() {
+                Some(root) => {
+                    let root = root.to_path_buf();
+                    tokio::task::spawn_blocking(move || MavenSelection::for_project(&root))
+                        .await
+                        .unwrap_or_else(|_| {
+                            MavenSelection::unavailable("what Maven selects could not be read")
+                        })
+                }
+                None => MavenSelection::unavailable(
+                    "the project is not on disk, so what Maven selects in each module is \
+                     not read",
+                ),
+            });
+        }
+        let base = split_socket_version(pinned).map_or("", |(base, _)| base);
+        let coords = crate::vendor::jvm::Coords {
+            group_id: group,
+            artifact_id: artifact,
+            version: base,
+            uuid,
+        };
+        // A pom that could not be read may declare the base version
+        // itself, whatever the others are wired to.
+        let why = match unread.first() {
+            Some(first) => Some(format!(
+                "a pom of it cannot be read ({first}), so whether that module builds \
+                 {group}:{artifact} unpatched is not known"
+            )),
+            None => reactor.unattestable(&coords, selection.as_ref().expect("read above")),
+        };
+        if let Some(why) = why {
+            out.unattested(
+                purl,
+                uuid,
+                wired_in.iter().next().map_or(file, String::as_str),
+                format!(
+                    "{POM} heads a multi-module reactor, and {why}; the build may resolve the \
+                     upstream jar there (re-run `scan`, or patch the reactor with `scan --mode \
+                     vendored`)"
+                ),
+                UnattestedKind::MavenReactorRoot,
+            );
+        }
     }
 }
 
@@ -1856,7 +2180,7 @@ mod tests {
     async fn unwired_rewriter_inputs_yield_nothing() {
         for case in [
             "basic",
-            "property-version-warn",
+            "property-version",
             "version-mismatch-skip",
             "transitive-depmgmt",
         ] {
@@ -2099,13 +2423,229 @@ mod tests {
         assert!(out.unattested.is_empty(), "{:?}", out.unattested);
     }
 
+    /// The reactor root `com.example:app:1.0.0` over the modules `a` and
+    /// `b`, carrying the hosted repository of `UUID_A`.
+    fn reactor_root(more: &str) -> String {
+        pom(&format!(
+            "<packaging>pom</packaging>\n<modules>\n<module>a</module>\n<module>b</module>\n\
+             </modules>\n{more}<repositories>\n{}</repositories>\n",
+            hosted_repo_a()
+        ))
+    }
+
+    /// A module of [`reactor_root`] with `body`.
+    fn reactor_module(name: &str, body: &str) -> String {
+        format!(
+            "<project>\n<modelVersion>4.0.0</modelVersion>\n<parent>\n\
+             <groupId>com.example</groupId>\n<artifactId>app</artifactId>\n\
+             <version>1.0.0</version>\n</parent>\n<artifactId>{name}</artifactId>\n{body}</project>\n"
+        )
+    }
+
+    fn sources(out: &Discovery) -> Vec<String> {
+        let mut files: Vec<String> = out
+            .refs
+            .iter()
+            .map(|r| r.source_file.to_string_lossy().replace('\\', "/"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// A reactor's pins are found where the reactor planner writes them:
+    /// a tagged pin in the pom of the module that selects the version, the
+    /// repository in the root. Each pom that carries part of the wiring is
+    /// a file of the ref, so rollback and remove undo every one. The patch
+    /// is attested while every module that resolves the version is reached.
+    #[tokio::test]
+    async fn hosted_pin_in_a_reactor_module_is_found_and_attested() {
+        let pin = format!(
+            "<dependencyManagement>\n<dependencies>\n<!-- socket-patch {UUID_A}: \
+             org.slf4j:slf4j-api:1.7.36 -->\n{}</dependencies>\n</dependencyManagement>\n",
+            dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A)))
+        );
+        let p = Project::new();
+        p.write("pom.xml", reactor_root(""));
+        p.write("a/pom.xml", reactor_module("a", &pin));
+        p.write("b/pom.xml", reactor_module("b", ""));
+        let out = run(&p).await;
+        assert_eq!(sources(&out), ["a/pom.xml", "pom.xml"]);
+        assert!(
+            out.refs
+                .iter()
+                .all(|r| (r.purl.as_str(), r.uuid.as_str(), r.mode)
+                    == (FX_PURL, UUID_A, WiringMode::Hosted)),
+            "{:?}",
+            out.refs
+        );
+        assert!(out.unattested.is_empty(), "{:?}", out.unattested);
+
+        // A module that declares the base version itself is not reached by
+        // the pin in its sibling: the patch is found, and not attested.
+        p.write(
+            "b/pom.xml",
+            reactor_module(
+                "b",
+                &format!(
+                    "<dependencies>\n{}</dependencies>\n",
+                    dep("org.slf4j", "slf4j-api", Some("1.7.36"))
+                ),
+            ),
+        );
+        let out = run(&p).await;
+        assert_eq!(sources(&out), ["a/pom.xml", "pom.xml"]);
+        assert_eq!(out.unattested.len(), 1, "{:?}", out.unattested);
+        let u = &out.unattested[0];
+        assert_eq!(u.kind, UnattestedKind::MavenReactorRoot);
+        assert!(u.detail.contains("b/pom.xml"), "{}", u.detail);
+    }
+
+    /// A `${property}` version wired through the property is a pin of the
+    /// pom that defines it, read by the declarations of other poms; one
+    /// replaced by a recorded literal is a pin of its own pom.
+    #[tokio::test]
+    async fn hosted_property_pins_of_a_reactor_are_found() {
+        let declaring = |version: &str| {
+            reactor_module(
+                "a",
+                &format!(
+                    "<dependencies>\n{}</dependencies>\n",
+                    dep("org.slf4j", "slf4j-api", Some(version))
+                ),
+            )
+        };
+        let p = Project::new();
+        p.write(
+            "pom.xml",
+            reactor_root(&format!(
+                "<properties>\n<slf4j.version>{}</slf4j.version>\n</properties>\n",
+                suffixed(UUID_A)
+            )),
+        );
+        p.write("a/pom.xml", declaring("${slf4j.version}"));
+        p.write("b/pom.xml", reactor_module("b", ""));
+        let out = run(&p).await;
+        assert_eq!(sources(&out), ["pom.xml"]);
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        assert!(out.unattested.is_empty(), "{:?}", out.unattested);
+
+        let p = Project::new();
+        p.write("pom.xml", reactor_root(""));
+        p.write(
+            "a/pom.xml",
+            declaring(&suffixed(UUID_A)).replace(
+                "</version></dependency>",
+                "</version><!-- socket-patch:version ${corp.slf4j} --></dependency>",
+            ),
+        );
+        p.write("b/pom.xml", reactor_module("b", ""));
+        let out = run(&p).await;
+        assert_eq!(sources(&out), ["a/pom.xml", "pom.xml"]);
+        assert!(out.unattested.is_empty(), "{:?}", out.unattested);
+    }
+
+    /// A single pom that inherits from a parent pom inside the checkout
+    /// (no `<modules>`) may be wired through that parent: the property
+    /// the declaration reads, and the repository, sit in the parent's pom.
+    /// Both poms are read, and the parent is a file of the ref, so
+    /// rollback and remove undo it there.
+    #[tokio::test]
+    async fn hosted_wiring_in_a_parent_pom_of_the_checkout_is_found() {
+        let p = Project::new();
+        p.write(
+            "pom.xml",
+            format!(
+                "<project>\n<modelVersion>4.0.0</modelVersion>\n<parent>\n\
+                 <groupId>com.example</groupId>\n<artifactId>parent</artifactId>\n\
+                 <version>1.0.0</version>\n<relativePath>parent/pom.xml</relativePath>\n\
+                 </parent>\n<artifactId>app</artifactId>\n<dependencies>\n{}</dependencies>\n\
+                 </project>\n",
+                dep("org.slf4j", "slf4j-api", Some("${slf4j.version}"))
+            ),
+        );
+        p.write(
+            "parent/pom.xml",
+            format!(
+                "<project>\n<modelVersion>4.0.0</modelVersion>\n<groupId>com.example</groupId>\n\
+                 <artifactId>parent</artifactId>\n<version>1.0.0</version>\n\
+                 <packaging>pom</packaging>\n<properties>\n<slf4j.version>{}</slf4j.version>\n\
+                 </properties>\n<repositories>\n{}</repositories>\n</project>\n",
+                suffixed(UUID_A),
+                hosted_repo_a()
+            ),
+        );
+        let out = run(&p).await;
+        assert_eq!(sources(&out), ["parent/pom.xml"]);
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        assert!(out.unattested.is_empty(), "{:?}", out.unattested);
+    }
+
+    /// A reactor one of whose poms cannot be read is still read for the
+    /// pins of the others, which stay refs (rollback, remove and list find
+    /// them) and are not attested: the unread module may declare the base
+    /// version itself.
+    #[tokio::test]
+    async fn hosted_pins_of_a_reactor_with_an_unread_module_are_found_not_attested() {
+        let pin = format!(
+            "<dependencyManagement>\n<dependencies>\n<!-- socket-patch {UUID_A}: \
+             org.slf4j:slf4j-api:1.7.36 -->\n{}</dependencies>\n</dependencyManagement>\n",
+            dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A)))
+        );
+        let p = Project::new();
+        p.write("pom.xml", reactor_root(""));
+        p.write("a/pom.xml", reactor_module("a", &pin));
+        // (b is listed and missing.)
+        let out = run(&p).await;
+        assert_eq!(sources(&out), ["a/pom.xml", "pom.xml"]);
+        assert_eq!(out.unattested.len(), 1, "{:?}", out.unattested);
+        assert_eq!(out.unattested[0].kind, UnattestedKind::MavenReactorRoot);
+        assert!(
+            out.unattested[0].detail.contains("<module>b</module>"),
+            "{}",
+            out.unattested[0].detail
+        );
+    }
+
+    /// A module pom that is there but is not UTF-8 text is not a missing
+    /// module: discovery says it cannot read the file, by name, and the
+    /// pins of the other poms are refs that are not attested, for that
+    /// reason and not for a pom the reactor "does not have".
+    #[tokio::test]
+    async fn an_undecodable_module_pom_is_reported_unreadable_not_missing() {
+        let pin = format!(
+            "<dependencyManagement>\n<dependencies>\n<!-- socket-patch {UUID_A}: \
+             org.slf4j:slf4j-api:1.7.36 -->\n{}</dependencies>\n</dependencyManagement>\n",
+            dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A)))
+        );
+        let p = Project::new();
+        p.write("pom.xml", reactor_root(""));
+        p.write("a/pom.xml", reactor_module("a", &pin));
+        p.write("b/pom.xml", b"<project>\xff\xfe</project>");
+        let out = run(&p).await;
+        assert_eq!(sources(&out), ["a/pom.xml", "pom.xml"]);
+        assert_eq!(diag_codes(&out), vec![DIAG_LOCKFILE_UNREADABLE]);
+        assert!(
+            out.diagnostics[0].detail.contains("b/pom.xml"),
+            "{:?}",
+            out.diagnostics
+        );
+        assert_eq!(out.unattested.len(), 1, "{:?}", out.unattested);
+        let detail = &out.unattested[0].detail;
+        assert!(
+            detail.contains("b/pom.xml is there but is not UTF-8 text"),
+            "{detail}"
+        );
+        assert!(!detail.contains("has no pom"), "{detail}");
+    }
+
     /// #1809: a Maven 4 (model 4.1.0) `pom`-packaged root listing no
     /// subprojects builds every direct subdirectory holding a `pom.xml`,
-    /// so its hosted pin is a reactor root's: kept as a ref, never
-    /// attested. A 4.0.0 model, no such subdirectory, or discovery turned
-    /// off in `.mvn/maven.config` leaves it a single pom, attested.
+    /// so its hosted pin is a reactor's: attested while the root's pin
+    /// reaches every subproject, and not once one declares the base
+    /// version itself. A 4.0.0 model, no such subdirectory, or discovery
+    /// turned off in `.mvn/maven.config` leaves it a single pom, attested.
     #[tokio::test]
-    async fn hosted_pin_in_a_maven_4_implicit_reactor_root_is_not_attested() {
+    async fn hosted_pin_in_a_maven_4_implicit_reactor_is_weighed_per_subproject() {
         let body = format!(
             "<packaging>pom</packaging>\n<dependencyManagement>\n<dependencies>\n{}</dependencies>\n</dependencyManagement>\n<repositories>\n{}</repositories>\n",
             dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A))),
@@ -2115,12 +2655,25 @@ mod tests {
             .replace("POM/4.0.0", "POM/4.1.0")
             .replace("<modelVersion>4.0.0", "<modelVersion>4.1.0");
         let child = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n<modelVersion>4.1.0</modelVersion>\n<parent/>\n<artifactId>child</artifactId>\n</project>\n";
+        let declaring = child.replace(
+            "</artifactId>",
+            &format!(
+                "</artifactId>\n<dependencies>\n{}</dependencies>",
+                dep("org.slf4j", "slf4j-api", Some("1.7.36"))
+            ),
+        );
         let off = "-Dmaven.project.discoverSubprojects=false\n";
         for (case, root, files, attested) in [
             (
-                "implicit reactor",
+                "implicit reactor the pin reaches",
                 &model_4_1,
                 &[("child/pom.xml", child)][..],
+                true,
+            ),
+            (
+                "implicit reactor with its own version",
+                &model_4_1,
+                &[("child/pom.xml", declaring.as_str())][..],
                 false,
             ),
             ("no subproject", &model_4_1, &[][..], true),

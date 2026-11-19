@@ -19,6 +19,9 @@ mod local_repo_tests;
 mod oracle;
 #[cfg(test)]
 mod scala_cache_tests;
+mod settings_mirrors;
+
+pub(crate) use settings_mirrors::settings_mirror_sets;
 
 /// How many `.pom` paths the parallel parse takes at a time. Every phase
 /// stays in walk order whatever the chunk, so this only bounds peak

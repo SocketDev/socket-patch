@@ -200,7 +200,9 @@ jobs:
   # The macOS legs: nightly and on demand, never on a pull request or a
   # push, so they do not queue on the small macOS runner pool.
   bazel-macos:
-    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && vars.BAZEL_COMPAT_DISABLED != 'true'
+    # A caller without a macOS leg passes `[]`: GitHub fails a job whose
+    # matrix is empty, so the job is skipped then.
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && fromJSON(inputs.macos)[0] != null && vars.BAZEL_COMPAT_DISABLED != 'true'
     strategy:
       fail-fast: false
       matrix:
