@@ -2197,9 +2197,10 @@ checksum are not fetched over a connection someone else could rewrite. Credentia
 are never printed.
 
 JRuby is different. It installs a gem's `java` build (`nokogiri-1.18.10-java`), which runs jars
-and has no C extension, so `apply` builds nothing there and needs no compiler. Patches are
-written for the gem's `ruby` build, and on JRuby `apply` takes from a patch what is part of the
-`java` build:
+and has no C extension, so `apply` builds nothing there and needs no compiler. (A `java` gem that
+does compile something when it is installed, such as jruby-launcher, is rebuilt like any other
+gem with an extension.) Patches are written for the gem's `ruby` build, and on JRuby `apply`
+takes from such a patch what is part of the `java` build:
 
 - A file the patch changes is updated when the installed gem has it: the gem's Ruby code, and
   also a C source the `java` gem ships, though nothing on JRuby compiles it.
@@ -2213,9 +2214,13 @@ in that build at all. `apply` exits 0, changes nothing and prints a note saying 
 event with `not_in_platform_build` under `--json`), and `vex` attests the patch.
 
 The one exception is a patch that changes what the gem's jars are built from: a Java, Kotlin or
-Scala source, a Maven, Ant or Gradle build file, or a jar itself. `apply` can't rebuild a jar. It
-writes the patch's files and warns with `native_extension_not_rebuilt`, and neither
-`apply --check` nor `vex` reports the gem as patched.
+Scala source, or a Maven, Ant or Gradle build file. `apply` can't rebuild a jar. It writes the
+patch's files and warns with `native_extension_not_rebuilt`, and neither `apply --check` nor
+`vex` reports the gem as patched. A patch that replaces a jar itself is different: the patched
+jar is what JRuby loads, so it is applied and attested like any other file.
+
+A patch written for the `java` build itself (its purl carries `?platform=java`) is applied whole,
+like a patch for any other gem: every file it changes must be in the installed gem.
 
 A gem that builds a library into its own directory and loads it from there (an FFI gem such as
 scrypt, a Rakefile build such as digest-crc) is always rebuilt from its installed tree. The
