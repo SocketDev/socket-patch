@@ -15,7 +15,7 @@ use socket_patch_core::utils::purl::purl_parts;
 
 use crate::commands::agent_download::tag_mode;
 use crate::commands::gem_refresh::{self, StaleGem};
-use crate::commands::vex::{generate_vex_embedded, EmbeddedVex};
+use crate::commands::vex::generate_vex_from_manifest_path;
 use crate::json_envelope::{
     Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning, VexSummary,
 };
@@ -1966,9 +1966,6 @@ async fn run_redirect_selected_untracked(
     // --json, so the envelope's `vex.warnings` is their only channel there.
     let mut vex_warnings: Vec<crate::json_envelope::RunWarning> = Vec::new();
     let mut vex_error: Option<crate::commands::vex::VexGenError> = None;
-    // The line a person is told when no document is written and the scan
-    // keeps its exit code.
-    let mut vex_note = None;
     let mut vex_code = 0;
     if vex.vex.is_some() && !common.dry_run {
         let mut params = vex.to_build_params(Some(api_client));
@@ -2037,16 +2034,12 @@ async fn run_redirect_selected_untracked(
             .cloned()
             .collect();
         let manifest_path = common.resolved_manifest_path();
-        match generate_vex_embedded(common, &params, &manifest_path).await {
-            EmbeddedVex::Written(summary) => {
+        match generate_vex_from_manifest_path(common, &params, &manifest_path).await {
+            Ok(summary) => {
                 vex_statements = Some(summary.statements);
                 vex_warnings = summary.warnings;
             }
-            EmbeddedVex::NotWritten(warnings, note) => {
-                vex_warnings = warnings;
-                vex_note = Some(note);
-            }
-            EmbeddedVex::Failed(e) => {
+            Err(e) => {
                 vex_code = 1;
                 vex_warnings = e.embedded_warnings();
                 vex_error = Some(e);
@@ -2165,8 +2158,6 @@ async fn run_redirect_selected_untracked(
             });
         } else if let Some(e) = &vex_error {
             env.mark_error(EnvelopeError::new(e.code.to_string(), e.message.clone()));
-            super::append_vex_error_warnings(&mut env, &vex_warnings);
-        } else if vex_note.is_some() {
             super::append_vex_error_warnings(&mut env, &vex_warnings);
         } else if vex.vex.is_some() && common.dry_run {
             env.warnings.push(super::vex_dry_run_warning());
@@ -2358,9 +2349,6 @@ async fn run_redirect_selected_untracked(
         // "nothing"): exit 1 with no message would be undiagnosable.
         if let Some(e) = &vex_error {
             e.print_embedded(common);
-        }
-        if let Some(note) = vex_note.filter(|_| !common.silent) {
-            println!("{note}");
         }
     }
     vex_code

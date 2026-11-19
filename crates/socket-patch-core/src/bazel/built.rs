@@ -239,7 +239,7 @@ fn lock_text(root: &Path, file: &str) -> Option<String> {
     let mut bytes = Vec::new();
     let plain = |part| matches!(part, Component::Normal(_));
     let plain = Path::new(file).components().all(plain);
-    match group_commit::read(&path).filter(|_| plain) {
+    match plain.then(|| group_commit::read(&path)).flatten() {
         Some(pending) => bytes = pending.ok()?,
         None => {
             let real = std::fs::canonicalize(&path).ok()?;

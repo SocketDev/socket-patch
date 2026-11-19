@@ -92,9 +92,8 @@ pub struct Statement {
     /// Free-form explanation paired with `not_affected`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub impact_statement: Option<String>,
-    /// Canonical companion to `status == affected` (per spec).
-    /// We never emit `affected` today, but the field exists so the type
-    /// round-trips a richer doc through our parser.
+    /// Canonical companion to `status == affected` (per spec): what to
+    /// do about it. Set by `vex::build::build_document_with_affected`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub action_statement: Option<String>,
 }

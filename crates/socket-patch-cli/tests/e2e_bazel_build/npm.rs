@@ -59,12 +59,12 @@
 //! the copy of the package that the user's `pnpm install` left in
 //! `node_modules`. rules_js does not read that directory, so the build is
 //! the unpatched one before the command and after it. The flow asserts
-//! that; that no form of `vex` writes a statement for the package, and
-//! each names the call of `MODULE.bazel` that builds it from the lock; and
-//! that hosted mode, which the warning names, then ends in the patched
-//! build and in the statement. Tests that need no Bazel run the same
-//! steps in a copy of the fixture, and in workspaces where the statement
-//! must stay.
+//! that; that every form of `vex` writes a document that says the package
+//! is affected, and names the call of `MODULE.bazel` that builds it from
+//! the lock; and that hosted mode, which the document names, then ends in
+//! the patched build and in a document that says not affected. Tests that
+//! need no Bazel run the same steps in a copy of the fixture, and in
+//! workspaces where the statement must stay as it is without Bazel.
 //!
 //! A marker is read from what Bazel built. Bazel's downloader keeps every
 //! file it fetches in the repository cache, under its checksum, and hands it
@@ -97,7 +97,7 @@ use sha2::{Digest, Sha512};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::utils::purl::canonical_purl;
 
-use crate::envelope::event_triples;
+use crate::envelope::{codes_in, event_triples};
 use crate::harness::{
     cell_without_bazel, changed, fixture_path, rewrite, with_vex, Cell, Claim, Fixture, How, Ran,
     Run, StandIn, Tree, CONSUMER, NOTHING, NOT_IN_BUILD,
@@ -775,17 +775,16 @@ fn vendored_npm_translate_lock() {
 const MODULE: &str = "MODULE.bazel";
 const HUB: &str = "npm.npm_translate_lock";
 
-/// What `socket-patch` has to name when it withholds the statement of the
-/// package: the hub's call with its line in the workspace file `file` of
-/// `cell`, the lock `lock` that Bazel builds the package from, and the
+/// What `socket-patch` has to name when it says that the package is
+/// affected: the lock `lock` that Bazel builds the package from, with the
+/// hub's call and its line in the workspace file `file` of `cell`, and the
 /// mode that patches that lock.
 fn names(cell: &Cell, file: &str, lock: &str) -> Vec<String> {
     let workspace_file = text(&cell.tree(), file);
     let call = format!("{HUB}(");
     let above = workspace_file.lines().take_while(|line| *line != call);
     vec![
-        format!("`{HUB}` ({file}:{})", above.count() + 1),
-        format!("from {lock},"),
+        format!("from {lock} (`{HUB}`, {file}:{})", above.count() + 1),
         "`socket-patch scan --mode hosted`".to_string(),
     ]
 }
@@ -796,10 +795,10 @@ fn names(cell: &Cell, file: &str, lock: &str) -> Vec<String> {
 /// the record of `patch`, and changes no other file of the project, and the
 /// `apply` of a later install finds it patched. Then what the two say with
 /// `--vex`, and what `vex` and
-/// `vex --no-verify` say. With `withheld`, the [`names`] of the call that
-/// builds the package from the lock, none of the four writes a document:
-/// the two commands pass and warn, and `vex` exits 1. Without, no workspace
-/// file hands a lock of the project to Bazel, and all four attest the
+/// `vex --no-verify` say: all four pass and write one document. With
+/// `unbuilt`, the [`names`] of the call that builds the package from the
+/// lock, it says that the package is affected, and names them. Without, no
+/// workspace file hands a lock of the project to Bazel, and it attests the
 /// package through the patch, as in a checkout without Bazel. Gives the
 /// files of the checkout.
 fn patches_the_installed_copy(
@@ -808,11 +807,14 @@ fn patches_the_installed_copy(
     project: &str,
     patch: &Patched,
     entry: &str,
-    withheld: Option<&[String]>,
+    unbuilt: Option<&[String]>,
 ) -> Tree {
     let test = &cell.test;
     let before = cell.tree();
-    let claim = Claim::new(PURL, &patch.uuid, How::Agent);
+    let claim = match unbuilt {
+        Some(names) => Claim::unbuilt(PURL, &patch.uuid, names),
+        None => Claim::new(PURL, &patch.uuid, How::Agent),
+    };
     let directory = ["--cwd", project.trim_end_matches('/')];
     let run = |cell: &Cell, args: &[&str]| {
         let at: &[&str] = if project.is_empty() { &[] } else { &directory };
@@ -838,29 +840,24 @@ fn patches_the_installed_copy(
 
     let again = cell.document("apply");
     let apply = run(cell, &[&["apply"][..], &with_vex(&again)].concat());
-    match withheld {
-        Some(names) => {
-            cell.withheld_in_run(&scan, &in_run, "success", PURL, names);
-            cell.withheld_in_run(&apply, &again, "success", PURL, names);
-            cell.withholds(run, PURL, names, true);
-            cell.withholds(run, PURL, names, false);
-        }
-        None => {
-            cell.wrote_in_run(&scan, &in_run, &claim);
-            cell.wrote_in_run(&apply, &again, &claim);
-            cell.stands_alone(run, &claim, true);
-            cell.stands_alone(run, &claim, false);
-        }
-    }
+    assert_eq!(
+        apply.envelope["status"], "success",
+        "{test}: {}",
+        apply.dump
+    );
+    cell.wrote_in_run(&scan, &in_run, &claim);
+    cell.wrote_in_run(&apply, &again, &claim);
+    cell.stands_alone(run, &claim, true);
+    cell.stands_alone(run, &claim, false);
     assert_eq!(changed(&patched, &cell.tree()), NOTHING, "{test}");
     patched
 }
 
-/// What a withheld statement tells the user to do, in the checkout of
-/// `cell` that agent mode patched: `scan --mode hosted --yes` pins `patch`
-/// in the lock, which rules_js builds the package from. Its document and
-/// the one of `vex` now attest the package, through the pin. Gives the
-/// files of the checkout.
+/// What the document of an affected package tells the user to do, in the
+/// checkout of `cell` that agent mode patched: `scan --mode hosted --yes`
+/// pins `patch` in the lock, which rules_js builds the package from. Its
+/// document and the one of `vex` now attest the package, through the pin.
+/// Gives the files of the checkout.
 fn pins_the_lock(cell: &Cell, standin: &StandIn, patch: &Patched) -> Tree {
     let test = &cell.test;
     let claim = Claim::new(PURL, &patch.uuid, How::Hosted);
@@ -883,15 +880,16 @@ fn pins_the_lock(cell: &Cell, standin: &StandIn, patch: &Patched) -> Tree {
 ///   `node_modules` of the checkout, which `.bazelignore` names.
 /// - (b) `scan --mode agent --yes` patches the copy in `node_modules`, and
 ///   `apply` finds it patched ([`patches_the_installed_copy`]). Both pass,
-///   and neither they nor `vex` write a document: each names the call of
-///   `MODULE.bazel` that builds the package from `pnpm-lock.yaml`, and
-///   hosted mode, which patches that lock.
+///   and they and `vex` write a document that says the package is
+///   affected: it names `pnpm-lock.yaml`, which Bazel builds the package
+///   from, the call of `MODULE.bazel` that reads it, and hosted mode,
+///   which patches that lock.
 /// - (c) The same two Bazel commands print the unpatched marker again, as
-///   the warning said, and `vex` withholds the statement again.
-/// - (d) What the warning says to do: `scan --mode hosted --yes` pins the
+///   the document said, and `vex` says affected again.
+/// - (d) What the document says to do: `scan --mode hosted --yes` pins the
 ///   patch in the lock ([`pins_the_lock`]), the same two Bazel commands
 ///   print the patched marker, with the tarball from the stand-in patch
-///   host, and `vex` attests the package.
+///   host, and `vex` attests the package as not affected.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
 fn agent_npm_translate_lock() {
@@ -908,7 +906,7 @@ fn agent_npm_translate_lock() {
     let entry = install(&cell, "", false, &upstream);
     builds_upstream(&cell, &standin, &upstream);
 
-    // (b) Agent mode patches the installed copy, and attests nothing.
+    // (b) Agent mode patches the installed copy, and says it is affected.
     let names = names(&cell, MODULE, LOCK);
     let patched = patches_the_installed_copy(&cell, &standin, "", &patch, &entry, Some(&names));
 
@@ -916,7 +914,7 @@ fn agent_npm_translate_lock() {
     cell.builds(&upstream.marker);
     assert_eq!(changed(&patched, &cell.tree()), NOTHING, "{test}");
     let run = |cell: &Cell, args: &[&str]| socket_patch(cell, &standin, args);
-    cell.withholds(run, PURL, &names, true);
+    cell.stands_alone(run, &Claim::unbuilt(PURL, &patch.uuid, &names), true);
 
     // (d) Hosted mode patches what Bazel builds, and `vex` says so.
     let pinned = pins_the_lock(&cell, &standin, &patch);
@@ -930,8 +928,8 @@ fn agent_npm_translate_lock() {
 
     println!(
         "{test}: Bazel {release} built {:?} before and after `scan --mode agent` patched {}; \
-         no form of `vex` wrote a statement for the package, and each named {names:?}; after \
-         `scan --mode hosted` it built {:?}, and `vex` attested the package; {:?}",
+         every form of `vex` said the package is affected, and named {names:?}; after \
+         `scan --mode hosted` it built {:?}, and `vex` said it is not affected; {:?}",
         upstream.marker,
         store(),
         patch.package.marker,
@@ -987,34 +985,38 @@ fn checkout(project: &str) -> (Cell, StandIn, Patched, String) {
     checkout_of(project, false)
 }
 
-/// The two lines a person reads on stderr when the statement of the
-/// package is withheld in the fixture's checkout: the run warning, which
-/// names `call` as [`names`] gives it first, and the omission.
-fn warns(patch: &Patched, call: &str) -> [String; 2] {
-    let warned = format!(
-        "Warning: {PURL}: patch {} is in the installed copy, which Bazel does not build from. \
-         {call} builds this package from {LOCK}, which does not name the patch. Run \
-         `socket-patch scan --mode hosted` in the directory of that lock to pin the patch there.",
+/// The action statement of a package of the fixture's checkout that is
+/// affected because `patch` is in its installed copy alone: it names the
+/// lock and its `call` as [`names`] gives them first.
+fn action(patch: &Patched, call: &str) -> String {
+    format!(
+        "Bazel builds this package {call}, which does not name Socket patch {}: the patch is \
+         only in the installed copy. Run `socket-patch scan --mode hosted` in the directory of \
+         that lock to pin the patch there.",
         patch.uuid
-    );
-    let omitted = format!(
-        "Warning: omitting {PURL} from VEX: Bazel does not build the patched copy of this \
-         package; the run warning names what it builds from (vex_bazel_not_in_build)"
-    );
-    [warned, omitted]
+    )
+}
+
+/// The line a person reads on stderr when the document says that the
+/// fixture's package is affected: the run warning, which says so and then
+/// what the [`action`] statement says.
+fn warns(patch: &Patched, call: &str) -> String {
+    let action = action(patch, call);
+    format!("Warning: {PURL}: the VEX document says affected. {action}")
 }
 
 /// Without a Bazel: step (b) of [`agent_npm_translate_lock`] in the
 /// fixture's checkout, where `MODULE.bazel` hands the lock to rules_js.
 /// Then `apply --vex` and `scan --mode agent --vex` as a person runs them:
-/// each passes, with the two warnings on stderr, a note on stdout that no
-/// document was written, and no error; with `--silent` each passes and
-/// prints nothing.
+/// each passes and writes the document, with the warning on stderr, the
+/// line that it wrote a document on stdout, and no error; with `--silent`
+/// each passes, writes the document and prints nothing.
 #[test]
-fn an_installed_patch_is_withheld_beside_a_hub_that_reads_the_lock() {
+fn an_installed_patch_is_affected_beside_a_hub_that_reads_the_lock() {
     let (cell, standin, patch, entry) = checkout("");
     let names = names(&cell, MODULE, LOCK);
-    assert_eq!(names[0], "`npm.npm_translate_lock` (MODULE.bazel:7)");
+    let call = "from pnpm-lock.yaml (`npm.npm_translate_lock`, MODULE.bazel:7)";
+    assert_eq!(names[0], call);
     patches_the_installed_copy(&cell, &standin, "", &patch, &entry, Some(&names));
 
     let origin = standin.origin();
@@ -1024,28 +1026,28 @@ fn an_installed_patch_is_withheld_beside_a_hub_that_reads_the_lock() {
         ("SOCKET_NPM_REGISTRY", registry.as_str()),
     ];
     let document = cell.document("person");
+    let claim = Claim::unbuilt(PURL, &patch.uuid, &names);
     let warned = warns(&patch, &names[0]);
     let scan = ["scan", "--mode", "agent", "--yes"];
     for command in [&["apply"][..], &scan[..]] {
         let loud = [command, &with_vex(&document)].concat();
-        cell.tells_a_person(&origin, &loud, &env, &document, &warned);
+        cell.tells_a_person(&origin, &loud, &env, &document, &claim, &warned);
         let silent = [&loud[..], &["--silent"]].concat();
-        cell.tells_a_person(&origin, &silent, &env, &document, &warned);
+        cell.tells_a_person(&origin, &silent, &env, &document, &claim, &warned);
     }
 
-    // What the warning says to do ends in a statement.
+    // What the document says to do ends in one that says not affected.
     pins_the_lock(&cell, &standin, &patch);
 }
 
-/// Without a Bazel: the installed patch is withheld beside a second patch
+/// Without a Bazel: the installed patch is affected beside a second patch
 /// of the manifest whose package this checkout does not have, as a
 /// manifest shared by several projects holds one. Every form omits that
-/// one with or without Bazel. Before the first was withheld, `apply --vex`
-/// attested it, wrote its document and passed; it passes still, writes no
-/// document, and warns of both. `vex` exits 1, as whenever it attests
-/// nothing.
+/// one with or without Bazel. `apply --vex` passes and writes the document
+/// of the first, as it did when it attested it as patched. So does `vex`,
+/// which reports the second as skipped.
 #[test]
-fn an_installed_patch_is_withheld_beside_a_patch_that_is_omitted_for_another_reason() {
+fn an_installed_patch_is_affected_beside_a_patch_that_is_omitted_for_another_reason() {
     let (cell, standin, patch, entry) = checkout("");
     let names = names(&cell, MODULE, LOCK);
     patches_the_installed_copy(&cell, &standin, "", &patch, &entry, Some(&names));
@@ -1068,20 +1070,150 @@ fn an_installed_patch_is_withheld_beside_a_patch_that_is_omitted_for_another_rea
     let document = cell.document("beside");
     let apply = [&["apply"][..], &with_vex(&document)].concat();
     let apply = socket_patch(&cell, &standin, &apply);
-    cell.withheld_beside(&apply, &document, "success", PURL, &names, 1);
+    assert_eq!(apply.envelope["status"], "success", "{}", apply.dump);
+    cell.wrote_in_run(
+        &apply,
+        &document,
+        &Claim::unbuilt(PURL, &patch.uuid, &names),
+    );
 
     let alone = cell.document("alone");
     let vex = ["vex", "--output", alone.to_str().expect("a path")];
     let vex = socket_patch(&cell, &standin, &vex);
     let (test, said) = (&cell.test, &vex.dump);
-    assert_eq!(vex.code, 1, "{test}: {said}");
-    let error = &vex.envelope["error"]["code"];
-    assert_eq!(*error, "no_applicable_patches", "{test}: {said}");
-    let skipped = reported(&vex.envelope);
-    assert_eq!(skipped.len(), 2, "{test}: {said}");
-    let ours = (canonical_purl(PURL), "skipped".into(), NOT_IN_BUILD.into());
-    assert!(skipped.contains(&ours), "{test}: {said}");
-    assert!(!alone.exists(), "{test}: {said}");
+    assert_eq!(vex.code, 0, "{test}: {said}");
+    assert_eq!(vex.envelope["status"], "partialFailure", "{test}: {said}");
+    let ours = (canonical_purl(PURL), "verified".into(), String::new());
+    let absent = (
+        canonical_purl(other),
+        "skipped".into(),
+        "package_not_found".into(),
+    );
+    assert_eq!(reported(&vex.envelope), [ours, absent], "{test}: {said}");
+    let written: Value =
+        serde_json::from_str(&std::fs::read_to_string(&alone).expect("a document"))
+            .expect("a JSON document");
+    let statuses: Vec<&Value> = (written["statements"].as_array().into_iter().flatten())
+        .map(|statement| &statement["status"])
+        .collect();
+    assert_eq!(statuses, ["affected"], "{test}: {written:#}");
+}
+
+/// Without a Bazel: a document says of each package what Bazel builds of
+/// it. Hosted mode pinned the fixture's package in the lock, which rules_js
+/// builds it from. The lock lists a second package, which is patched in its
+/// installed copy alone, as agent mode leaves one, and both patches are for
+/// the same advisory. `vex` and `apply --vex` pass, and their document
+/// holds two statements for that advisory: the first package is not
+/// affected, through its pin, and the second is affected, with what to do
+/// about it.
+#[test]
+fn a_document_says_of_each_package_what_bazel_builds_of_it() {
+    let (cell, standin, patch, _) = checkout("");
+    std::fs::remove_dir_all(cell.path("node_modules")).expect("remove the installed tree");
+    let pinned = pins_the_lock(&cell, &standin, &patch);
+
+    // The second package: an entry of the lock as pnpm writes one for a
+    // registry package, the patched files where `pnpm install` puts them,
+    // and the record agent mode keeps in the manifest.
+    let second = Patched::new();
+    let renamed = |text: &str| text.replace("upstream", "second");
+    let (name, purl) = (renamed(NAME), renamed(PURL));
+    let lock = text(&pinned, LOCK);
+    let snapshots = "\nsnapshots:\n";
+    assert_eq!(lock.matches(snapshots).count(), 1, "{lock}");
+    let entry = renamed(&lock_entry(&placeholder()));
+    cell.write(
+        LOCK,
+        lock.replace(snapshots, &format!("\n{entry}{snapshots}")),
+    );
+    let store = renamed(&store());
+    cell.write(&format!("{store}/package.json"), renamed(MANIFEST));
+    cell.write(&format!("{store}/index.js"), &second.package.index_js);
+    let link = cell.path(&format!("node_modules/{name}"));
+    std::fs::create_dir_all(link.parent().expect("the scope")).expect("create the scope");
+    std::os::unix::fs::symlink(store.replacen("node_modules/", "../", 1), &link)
+        .expect("link the package");
+    let mut record = record(&Package::upstream(), &second);
+    record["purl"] = purl.as_str().into();
+    record["exportedAt"] = record["publishedAt"].take();
+    let patched = record["files"]["package/index.js"]["afterHash"].as_str();
+    let blob = format!(".socket/blobs/{}", patched.expect("a hash"));
+    cell.write(&blob, &second.package.index_js);
+    let manifest = json!({ "patches": { purl.as_str(): record } });
+    cell.write(".socket/manifest.json", manifest.to_string());
+
+    let names = names(&cell, MODULE, LOCK);
+    let alone = cell.document("each");
+    let vex = ["vex", "--output", alone.to_str().expect("a path")];
+    let vex = socket_patch(&cell, &standin, &vex);
+    let (test, said) = (&cell.test, &vex.dump);
+    assert_eq!(vex.code, 0, "{test}: {said}");
+    assert_eq!(vex.envelope["status"], "success", "{test}: {said}");
+    let events = vex.envelope["events"].as_array().into_iter().flatten();
+    let events: Vec<_> = events
+        .map(|event| {
+            let purl = canonical_purl(event["purl"].as_str().unwrap_or_default());
+            (purl, &event["action"], &event["details"]["status"])
+        })
+        .collect();
+    let verified = &json!("verified");
+    let expected = [
+        (canonical_purl(PURL), verified, &json!("not_affected")),
+        (canonical_purl(&purl), verified, &json!("affected")),
+    ];
+    assert_eq!(events, expected, "{test}: {said}");
+    assert_eq!(
+        codes_in(&vex.envelope["warnings"]),
+        [NOT_IN_BUILD],
+        "{test}: {said}"
+    );
+
+    let written = std::fs::read_to_string(&alone).expect("a document");
+    let mut document: Value = serde_json::from_str(&written).expect("a JSON document");
+    let statements = document["statements"].as_array_mut().expect("statements");
+    let ids: Vec<String> = statements
+        .iter_mut()
+        .map(|statement| {
+            let object = statement.as_object_mut().expect("a statement");
+            assert!(object.remove("timestamp").is_some(), "{written}");
+            let id = &object["products"][0]["subcomponents"][0]["@id"];
+            id.as_str().unwrap_or_default().to_string()
+        })
+        .collect();
+    let about = |id: &String| {
+        json!({
+            "vulnerability": { "name": "GHSA-test-aaaa-bbbb", "aliases": ["CVE-2024-0001"] },
+            "products": [{ "@id": PRODUCT, "subcomponents": [{ "@id": id }] }],
+        })
+    };
+    let mut expected = [about(&ids[0]), about(&ids[1])];
+    expected[0]["status"] = "not_affected".into();
+    expected[0]["justification"] = "inline_mitigations_already_exist".into();
+    let impact = format!("Patched via Socket patch {} (redirected)", patch.uuid);
+    expected[0]["impact_statement"] = impact.into();
+    expected[1]["status"] = "affected".into();
+    expected[1]["action_statement"] = action(&second, &names[0]).into();
+    assert_eq!(document["statements"], json!(expected), "{test}: {written}");
+    let named: Vec<String> = ids.iter().map(|id| canonical_purl(id)).collect();
+    assert_eq!(
+        named,
+        [canonical_purl(PURL), canonical_purl(&purl)],
+        "{written}"
+    );
+
+    let in_run = cell.document("each-apply");
+    let apply = [&["apply"][..], &with_vex(&in_run)].concat();
+    let apply = socket_patch(&cell, &standin, &apply);
+    let (summary, said) = (&apply.envelope["vex"], &apply.dump);
+    assert_eq!(apply.code, 0, "{test}: {said}");
+    assert_eq!(summary["statements"], 2, "{test}: {said}");
+    assert_eq!(
+        codes_in(&summary["warnings"]),
+        [NOT_IN_BUILD],
+        "{test}: {said}"
+    );
+    println!("{test}: the document of `vex`:\n{written}");
 }
 
 /// Without a Bazel: a patch whose record names no advisory gets no
@@ -1144,19 +1276,19 @@ fn reads(cell: &Cell, label: &str) {
     cell.write(MODULE, module.replace(&own, &format!("\"{label}\"")));
 }
 
-/// Without a Bazel: the statement is withheld wherever a workspace file
+/// Without a Bazel: the package is affected wherever a workspace file
 /// hands Bazel the lock of the project, which lists the package.
 ///
 /// - The hub is in a file that `MODULE.bazel` includes, as a workspace
-///   keeps the hubs of one language apart: the warning names the call in
-///   that file.
+///   keeps the hubs of one language apart: the document names the call
+///   in that file.
 /// - The project is a directory of the workspace, and the hub reads the
 ///   project's lock.
 /// - The project is a member of a pnpm workspace at the root, and the hub
 ///   reads the workspace's lock there, which names the project among its
 ///   importers. The patched copy is in the store at the root.
 #[test]
-fn an_installed_patch_is_withheld_wherever_a_hub_reads_the_lock_of_the_project() {
+fn an_installed_patch_is_affected_wherever_a_hub_reads_the_lock_of_the_project() {
     let included = "tools/npm.MODULE.bazel";
     let web = format!("web/{LOCK}");
     let cases: [(&str, bool, &str, &str, Arrange); 3] = [
@@ -1187,11 +1319,11 @@ fn an_installed_patch_is_withheld_wherever_a_hub_reads_the_lock_of_the_project()
 /// Without a Bazel: `scan --mode hosted --vex` over the patch that agent
 /// mode left in the installed copy, at a patch service that has no hosted
 /// artifact of it. The scan pins nothing, skips the package and passes, as
-/// it does without `--vex`. It writes no document and names the call that
-/// builds the package from the lock, in its envelope and as a person runs
-/// it.
+/// it does without `--vex`. Its document says the package is affected,
+/// and names the call that builds it from the lock, in its envelope and as
+/// a person runs it.
 #[test]
-fn an_installed_patch_is_withheld_by_a_hosted_scan_that_pins_nothing() {
+fn an_installed_patch_is_affected_after_a_hosted_scan_that_pins_nothing() {
     let (cell, standin, patch, entry) = checkout("");
     let names = names(&cell, MODULE, LOCK);
     patches_the_installed_copy(&cell, &standin, "", &patch, &entry, Some(&names));
@@ -1212,21 +1344,28 @@ fn an_installed_patch_is_withheld_by_a_hosted_scan_that_pins_nothing() {
     let (test, said) = (&cell.test, &scan.dump);
     let skipped = [(canonical_purl(PURL), "skipped".into(), "no_url".into())];
     assert_eq!(reported(&scan.envelope), skipped, "{test}: {said}");
-    cell.withheld_in_run(&scan, &document, "success", PURL, &names);
+    assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
+    // A hosted scan says of every document it writes that it hashed no
+    // file for a hosted patch.
+    let summary = &scan.envelope["vex"];
+    assert_eq!(summary["statements"], 1, "{test}: {said}");
+    let warned = ["vex_hosted_unverified", NOT_IN_BUILD];
+    assert_eq!(codes_in(&summary["warnings"]), warned, "{test}: {said}");
+    let claim = Claim::unbuilt(PURL, &patch.uuid, &names);
 
     let origin = other.origin();
     let env = [("SOCKET_PATCH_SERVER_URL", origin.as_str())];
     let warned = warns(&patch, &names[0]);
-    cell.tells_a_person(&origin, &hosted, &env, &document, &warned);
+    cell.tells_a_person(&origin, &hosted, &env, &document, &claim, &warned);
     let silent = [&hosted[..], &["--silent"]].concat();
-    cell.tells_a_person(&origin, &silent, &env, &document, &warned);
+    cell.tells_a_person(&origin, &silent, &env, &document, &claim, &warned);
     assert_eq!(changed(&patched, &cell.tree()), NOTHING, "{test}");
 }
 
-/// Without a Bazel: workspaces that give `socket-patch` no ground to
-/// withhold the statement, each made from the fixture's `MODULE.bazel`.
-/// Every form says of the installed patch what it says in a checkout
-/// without Bazel.
+/// Without a Bazel: workspaces that give `socket-patch` no ground to say
+/// that the package is affected, each made from the fixture's
+/// `MODULE.bazel`. Every form says of the installed patch what it says in
+/// a checkout without Bazel.
 ///
 /// - The project is a directory of the workspace, and the hub reads the
 ///   lock of another directory beside it, which lists the package too:
@@ -1286,16 +1425,16 @@ fn an_installed_patch_is_attested_where_no_hub_is_shown_to_build_it() {
     }
 }
 
-/// Without a Bazel: what is withheld is a patch in a copy Bazel does not
-/// build from, and a hosted pin is none. Here a second hub reads a second
-/// lock in the project's directory, under a name of its own, that lists
-/// the package without the patch, as the project's lock did before hosted
-/// mode pinned it there. Hosted mode pins the project's lock and no other,
-/// and its document and the one of `vex` attest the package, as they do
-/// without the second hub. Whether Bazel links the package from that other
-/// lock is not looked at yet. Nothing is installed in this checkout: an
-/// installed copy without the patch withholds a hosted pin with or without
-/// Bazel.
+/// Without a Bazel: what makes a package affected is a patch in a copy
+/// Bazel does not build from, and a hosted pin is none. Here a second hub
+/// reads a second lock in the project's directory, under a name of its
+/// own, that lists the package without the patch, as the project's lock
+/// did before hosted mode pinned it there. Hosted mode pins the project's
+/// lock and no other, and its document and the one of `vex` attest the
+/// package, as they do without the second hub. Whether Bazel links the
+/// package from that other lock is not looked at yet. Nothing is installed
+/// in this checkout: an installed copy without the patch leaves a hosted
+/// pin out of the document with or without Bazel.
 #[test]
 fn a_hosted_pin_is_attested_beside_a_second_hub_that_lists_the_package() {
     let (cell, standin, patch, _) = checkout("");

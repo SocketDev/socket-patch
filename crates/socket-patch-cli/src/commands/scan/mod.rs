@@ -32,7 +32,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::args::{apply_env_toggles, GlobalArgs};
-use crate::commands::vex::{generate_vex_embedded, EmbeddedVex, VexEmbedArgs};
+use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{
     crawl_ecosystems, crawl_ecosystems_with_npm, find_package_paths_for_path_scope, partition_purls,
 };
@@ -447,8 +447,8 @@ async fn embed_vex_into_json(
     // A hosted scan that redirected nothing (empty catalog / no grants)
     // still attests older hosted gem pins: check them against the mirror.
     params.hosted_gem_mirror_check = hosted;
-    match generate_vex_embedded(common, &params, manifest_path).await {
-        EmbeddedVex::Written(summary) => {
+    match generate_vex_from_manifest_path(common, &params, manifest_path).await {
+        Ok(summary) => {
             // `vex.warnings`: note_warning suppressed these on stderr under
             // --json, so this is their only surviving channel.
             env.vex = Some(VexSummary {
@@ -464,11 +464,7 @@ async fn embed_vex_into_json(
             });
             0
         }
-        EmbeddedVex::NotWritten(warnings, _) => {
-            append_vex_error_warnings(env, &warnings);
-            0
-        }
-        EmbeddedVex::Failed(e) => {
+        Err(e) => {
             env.mark_error(EnvelopeError::new(e.code.to_string(), e.message.clone()));
             append_vex_error_warnings(env, &e.embedded_warnings());
             1
@@ -514,8 +510,8 @@ async fn embed_vex_human(
     // A hosted scan that redirected nothing (empty catalog / no grants)
     // still attests older hosted gem pins: check them against the mirror.
     params.hosted_gem_mirror_check = hosted;
-    match generate_vex_embedded(common, &params, manifest_path).await {
-        EmbeddedVex::Written(summary) => {
+    match generate_vex_from_manifest_path(common, &params, manifest_path).await {
+        Ok(summary) => {
             if !common.silent {
                 println!(
                     "{}",
@@ -530,13 +526,7 @@ async fn embed_vex_human(
             }
             0
         }
-        EmbeddedVex::NotWritten(_, note) => {
-            if !common.silent {
-                println!("{note}");
-            }
-            0
-        }
-        EmbeddedVex::Failed(e) => {
+        Err(e) => {
             e.print_embedded(common);
             1
         }

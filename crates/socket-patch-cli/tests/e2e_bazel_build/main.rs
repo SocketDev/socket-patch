@@ -47,15 +47,16 @@
 //! where the fixture has no such file.
 //!
 //! `socket-patch` reads `MODULE.bazel` for the calls that hand a lock to a
-//! ruleset, and writes no statement for a patch that such a ruleset does
-//! not build: one in the copy a package manager installed, or a PyPI or
-//! RubyGems one in a copy committed under `.socket/vendor`. Two flows hold
-//! it to that (`npm::agent_npm_translate_lock`,
-//! `pypi::vendored_pip_parse`): the build is not the patched one, no form
-//! of `vex` writes a document, each names the call and the file Bazel
-//! builds from, and after what the warning says to do the build is patched
-//! and the document is there. So these tests say for which workspaces the
-//! document and the build agree, and for which there is no document.
+//! ruleset, and says of a package whose patch such a ruleset does not
+//! build that it is affected: a patch in the copy a package manager
+//! installed, or a PyPI or RubyGems one in a copy committed under
+//! `.socket/vendor`. Two flows hold it to that
+//! (`npm::agent_npm_translate_lock`, `pypi::vendored_pip_parse`): the
+//! build is not the patched one, every form of `vex` writes a document
+//! that says affected and names the call and the file Bazel builds from,
+//! and after what the document says to do the build is patched and the
+//! document says not affected. So these tests say for which workspaces
+//! the document and the build agree.
 //!
 //! A flow is one `#[ignore]`d test in its ecosystem's module, and its
 //! fixture is one directory of files that every release builds beside one

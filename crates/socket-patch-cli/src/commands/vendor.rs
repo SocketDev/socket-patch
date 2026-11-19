@@ -60,7 +60,7 @@ use crate::commands::vendored_backend::{
     ApplyRequest, KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
 };
 use crate::commands::vex::{
-    generate_vex_embedded, generate_vex_without_manifest, EmbeddedVex, VexEmbedArgs,
+    generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
 };
 use crate::ecosystem_dispatch::{
     find_packages_for_rollback_reusing, npm_paths_by_identity, npm_paths_by_identity_in,
@@ -1110,7 +1110,7 @@ pub async fn run(args: VendorArgs) -> i32 {
             env.dry_run = args.common.dry_run;
             env.warnings.extend(commit_recovery);
             match vex_result.as_ref() {
-                Some(EmbeddedVex::Written(summary)) => {
+                Some(ManifestlessVex::Written(summary)) => {
                     env.vex = Some(VexSummary {
                         path: args
                             .vex
@@ -1124,11 +1124,11 @@ pub async fn run(args: VendorArgs) -> i32 {
                         warnings: summary.warnings.clone(),
                     });
                 }
-                Some(EmbeddedVex::Failed(e)) => {
+                Some(ManifestlessVex::Failed(e)) => {
                     env.warnings.extend(e.embedded_warnings());
                     env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
                 }
-                Some(EmbeddedVex::NotWritten(warnings, _)) => {
+                Some(ManifestlessVex::NothingToAttest(warnings)) => {
                     env.warnings.extend(warnings.iter().cloned());
                 }
                 None => {}
@@ -1136,7 +1136,7 @@ pub async fn run(args: VendorArgs) -> i32 {
             println!("{}", env.to_pretty_json());
         } else {
             match vex_result.as_ref() {
-                Some(EmbeddedVex::Written(summary)) if !args.common.silent => println!(
+                Some(ManifestlessVex::Written(summary)) if !args.common.silent => println!(
                     "{}",
                     crate::commands::vex::format_vex_written(
                         summary.statements,
@@ -1147,8 +1147,10 @@ pub async fn run(args: VendorArgs) -> i32 {
                     )
                 ),
                 // Errors print even under --silent ("errors only").
-                Some(EmbeddedVex::Failed(e)) => e.print_embedded(&args.common),
-                Some(EmbeddedVex::NotWritten(_, note)) if !args.common.silent => println!("{note}"),
+                Some(ManifestlessVex::Failed(e)) => e.print_embedded(&args.common),
+                Some(ManifestlessVex::NothingToAttest(_)) if !args.common.silent => {
+                    println!("{}", crate::commands::vex::format_vex_nothing_to_attest())
+                }
                 None if !args.common.silent && args.common.dry_run && args.vex.vex.is_some() => {
                     println!(
                         "{}",
@@ -1158,7 +1160,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                 _ => {}
             }
         }
-        return i32::from(matches!(vex_result, Some(EmbeddedVex::Failed(_))));
+        return i32::from(matches!(vex_result, Some(ManifestlessVex::Failed(_))));
     }
 
     // The API client and vendoring-service config exist for the vendoring
@@ -1250,8 +1252,8 @@ pub async fn run(args: VendorArgs) -> i32 {
                         .as_ref()
                         .and_then(|(svc, _)| svc.client.as_ref()),
                 );
-                match generate_vex_embedded(&args.common, &params, &manifest_path).await {
-                    EmbeddedVex::Written(summary) => {
+                match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await {
+                    Ok(summary) => {
                         env.vex = Some(VexSummary {
                             path: vex_path.display().to_string(),
                             statements: summary.statements,
@@ -1262,13 +1264,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                             warnings: summary.warnings,
                         });
                     }
-                    EmbeddedVex::NotWritten(warnings, note) => {
-                        env.warnings.extend(warnings);
-                        if !args.common.json && !args.common.silent {
-                            println!("{note}");
-                        }
-                    }
-                    EmbeddedVex::Failed(e) => {
+                    Err(e) => {
                         env.warnings.extend(e.embedded_warnings());
                         env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
                         // The envelope only prints under --json; in human mode
@@ -2474,7 +2470,7 @@ async fn run_eject(
                 let params = args.vex.to_build_params(Some(&client));
                 let manifest_path = common.resolved_manifest_path();
                 match generate_vex_without_manifest(common, &params, &manifest_path).await {
-                    EmbeddedVex::Written(summary) => {
+                    ManifestlessVex::Written(summary) => {
                         env.vex = Some(VexSummary {
                             path: vex_path.display().to_string(),
                             statements: summary.statements,
@@ -2482,13 +2478,13 @@ async fn run_eject(
                             warnings: summary.warnings,
                         });
                     }
-                    EmbeddedVex::NotWritten(warnings, note) => {
+                    ManifestlessVex::NothingToAttest(warnings) => {
                         env.warnings.extend(warnings);
                         if !common.json && !common.silent {
-                            println!("{note}");
+                            println!("{}", crate::commands::vex::format_vex_nothing_to_attest());
                         }
                     }
-                    EmbeddedVex::Failed(e) => {
+                    ManifestlessVex::Failed(e) => {
                         env.warnings.extend(e.embedded_warnings());
                         env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
                         if !common.json {

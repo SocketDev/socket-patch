@@ -42,8 +42,8 @@ on:
     # the core, the files of the `vex` command, and `bazel/` of the core,
     # which reads the workspace files and decides whether Bazel builds what
     # was patched. Every flow holds the exact document socket-patch writes
-    # about its build, or that it writes none, so a change to how a
-    # document is built, worded or withheld starts the legs of every
+    # about its build, patched or not, so a change to how a document is
+    # built or worded starts the legs of every
     # ecosystem. Nothing else that another ecosystem's flow owns is here:
     # any other change to one ecosystem starts that ecosystem's legs only.
     #
