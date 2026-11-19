@@ -9184,6 +9184,11 @@ pub fn maven_reactor_root(files: &BTreeMap<String, String>) -> bool {
 ///   decided and not confirmed ([`RewriteResult::maven_reactor_uuids`]),
 ///   so wiring an earlier run left is not counted as a redirect, or
 ///   attested, by a substring it still matches.
+///
+/// The gate holds deps back and nothing else: the respelling of a
+/// `.mvn/maven.config` an earlier release wrote ([`heal_mvn_config`]) is
+/// decided by that file, and the rewriter proper makes it whichever deps it
+/// is handed, none included.
 fn rewrite_maven_pom(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -10262,6 +10267,10 @@ fn pin_maven_checksums(
 /// Maven Wrapper pins an older Maven (`wrapper`, as vendored mode itself
 /// reads it) it does not offer vendored mode as it stands, but says what
 /// makes it work.
+///
+/// What the line says was not written is the dep's own wiring. The
+/// respelling of a `.mvn/maven.config` an earlier release wrote
+/// ([`heal_mvn_config`]) is no dep's, and the same run may make it.
 fn maven_mirror_detail(
     ga: &str,
     repo_id: &str,
@@ -10299,9 +10308,9 @@ fn maven_mirror_detail(
     format!(
         "{ga}: on this machine Maven's settings send the {repo_id} repository to the mirror \
          `{id}` (<mirrorOf>{of}</mirrorOf> in {source}), which does not serve the patched \
-         artifact, so the build could not resolve it; pom.xml and .mvn/ were left as they are \
-         and the dep is not counted as redirected. {ways}. Only this machine's settings were \
-         read: the machine that builds needs the same exclusion",
+         artifact, so the build could not resolve it; nothing was written for it (no pin in \
+         pom.xml, no line in .mvn/) and the dep is not counted as redirected. {ways}. Only \
+         this machine's settings were read: the machine that builds needs the same exclusion",
         id = mirror.id,
         of = mirror.mirror_of,
         source = mirror.source,
@@ -10460,9 +10469,9 @@ impl MavenReactorRewrite {
             result.warnings.push(RewriteWarning {
                 code: code.into(),
                 detail: format!(
-                    "{ga}: {why}; the poms and .mvn/ were left as they are and the dep is not \
-                     counted as redirected (`scan --mode vendored` commits the patched \
-                     artifact instead)"
+                    "{ga}: {why}; nothing was written for it (no pin in a pom, no line in \
+                     .mvn/) and the dep is not counted as redirected (`scan --mode vendored` \
+                     commits the patched artifact instead)"
                 ),
             });
         };
@@ -12090,7 +12099,8 @@ mod tests {
 
     /// A gated dep has nothing written for it at all: not even the
     /// checksum lines a grant with a malformed hash would otherwise have
-    /// dropped. The warning says `.mvn/` was left as it is, and it is.
+    /// dropped. The warning says nothing was written for the dep, and
+    /// nothing is.
     #[test]
     fn maven_mirror_gate_touches_no_file_of_a_gated_dep() {
         let mut dep = granted_maven_override();
@@ -12216,6 +12226,14 @@ mod tests {
                 "redirect_maven_mirror_captures_repository",
                 "redirect_maven_trusted_checksums_maven3_only",
             ]
+        );
+        // What the mirror's line says was not written is the dep's own.
+        assert!(
+            r.warnings[0]
+                .detail
+                .contains("nothing was written for it (no pin in pom.xml, no line in .mvn/)"),
+            "{}",
+            r.warnings[0].detail
         );
         // Gated, so decided and not confirmed: the wiring the earlier run
         // left is not counted as this run's redirect.
@@ -13863,6 +13881,15 @@ mod tests {
         assert_eq!(
             warning_codes(&r),
             [trade, "redirect_maven_multimodule_unsupported"]
+        );
+        // The refusal speaks for the dep, not for `.mvn/`: the same run
+        // respelled a line there.
+        assert!(
+            r.warnings[1]
+                .detail
+                .contains("nothing was written for it (no pin in a pom, no line in .mvn/)"),
+            "{}",
+            r.warnings[1].detail
         );
 
         // A root the sbt rewriter owns (no pom.xml beside the build).

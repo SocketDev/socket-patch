@@ -1038,8 +1038,8 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   Checksums stay in the project root's `.mvn/`, which Maven also reads when it is
   started in a module directory or with `-f`; a module with a `.mvn` of its own is
   reported (`redirect_maven_trusted_checksums_unenforced`), since a Maven started there
-  reads that one. A reactor one of whose poms cannot be read is left untouched
-  (`redirect_maven_multimodule_unsupported`, with the reason). A pom that is there but is
+  reads that one. A reactor one of whose poms cannot be read takes no pin and no line
+  under `.mvn/` (`redirect_maven_multimodule_unsupported`, with the reason). A pom that is there but is
   not UTF-8 text (re-saved as Latin-1 or UTF-16, say) is never taken for a missing one:
   the scan refuses the run and names it (`candidate_file_unreadable`), `vex` reports it
   as unreadable and attests no pin of that reactor, and `rollback` / `remove` change
@@ -1230,8 +1230,8 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   included. The patch resolves only at its suffixed version, which the mirror does not
   hold, so a project wired behind such a mirror **fails to build**. `scan --mode hosted`
   therefore reads the Maven settings of the machine it runs on before it writes a Maven
-  pin, and wires nothing for a patch whose repository a mirror would take over: the
-  poms and `.mvn/` stay as they are, the scan exits 0, and
+  pin, and wires nothing for a patch whose repository a mirror would take over:
+  nothing is written for it in the poms or under `.mvn/`, the scan exits 0, and
   `redirect_maven_mirror_captures_repository` names the mirror, the settings file that
   declares it, and the two ways forward:
   - **Leave the repository out of the mirror.** Add `!socket-patch-<uuid>` to its
