@@ -896,10 +896,14 @@ async fn filter_to_installed_purls(
     // project).
     let mut pnp_diags: Vec<lock_inventory::UnsupportedNpmLayout> = Vec::new();
     if !common.is_global() {
-        let supplement = super::scan::project_lockfile_supplement(&ctx, &[], None).await;
+        let hosted = mode == super::scan::ScanMode::Hosted;
+        let supplement = super::scan::project_lockfile_supplement(&ctx, &[], None, hosted).await;
         pnp_diags = supplement.unsupported;
         if mode != super::scan::ScanMode::Agent {
             present.extend(supplement.entries.iter().map(|e| PurlKey::new(&e.purl)));
+            // A hosted run's supplement also names the gems the lock
+            // resolves only as precompiled platform builds.
+            present.extend(supplement.purls.iter().cloned());
             let vendored =
                 super::scan::project_vendored_supplement(&ctx, &[], &ctx.loaded().await.vendor)
                     .await;
