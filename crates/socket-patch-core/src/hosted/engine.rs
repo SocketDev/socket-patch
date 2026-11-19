@@ -11,8 +11,9 @@
 //! 3. (caller) the apply lock and the vendored→hosted takeover.
 //! 4. [`read_candidate_files`] → [`wheel_targets`] → (caller) wheel metadata,
 //!    and [`yarn_berry_manifest_targets`] → (caller) served npm manifests.
-//! 5. [`rewrite`] — the rewriters, the pnpm `trustLockfile` and npm
-//!    `allow-remote` auto-configs, and the per-ecosystem confirmation.
+//! 5. [`rewrite`] — the rewriters, the pnpm named-registry /
+//!    `trustLockfile` and npm `allow-remote` auto-configs, and the
+//!    per-ecosystem confirmation.
 //! 6. [`guard`] — the symlink / unreadable-file refusal before any write.
 //!
 //! Nothing here writes, spawns, reads the environment or touches the
@@ -52,14 +53,18 @@ use super::guidance::{
     npm_allow_remote_user_set_detail, npm_lock_url_needles, npm_omit_lockfile_resolved_detail,
     npm_replace_registry_host_detail, plan_workspace_trust, pnpm_heal_root,
     pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag, pnpm_lock_version_major,
+    pnpm_named_registries, pnpm_registry_already_detail, pnpm_registry_configured_detail,
+    pnpm_registry_keyless_members_detail, pnpm_registry_manual_guidance,
+    pnpm_registry_workspace_unreadable_detail, pnpm_registry_workspace_unsupported_detail,
     pnpm_root_only_workspace_breaks_add, pnpm_trust_configured_detail,
     pnpm_trust_keyless_members_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
     pnpm_trust_not_needed_detail, pnpm_trust_policy_preamble, pnpm_trust_rush_detail,
     pnpm_trust_scaffolded_detail, pnpm_trust_workspace_unreadable_detail,
     pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
-    TrustPlan, NPM_LOCKS, NPM_OMIT_LOCKFILE_RESOLVED_CODE, NPM_REPLACE_REGISTRY_HOST_CODE,
-    PNPM_TRUST_RUSH_MIXED_NOTE, PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL,
-    REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+    strip_cli_trust, RegistryWrite, TrustLeftover, TrustPlan, NPM_LOCKS,
+    NPM_OMIT_LOCKFILE_RESOLVED_CODE, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_TRUST_RUSH_MIXED_NOTE,
+    PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL,
+    REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
 
@@ -337,7 +342,7 @@ pub fn build_candidates(
             .and_then(|o| crate::patch::redirect::grant_token_path_segment(&o.index_url, sel_uuid))
             .or_else(|| crate::patch::redirect::grant_token_path_segment(&url, sel_uuid))
             .unwrap_or_default();
-        let dep = DepOverride {
+        let mut dep = DepOverride {
             ecosystem,
             name,
             namespace: None,
@@ -345,9 +350,13 @@ pub fn build_candidates(
             token,
             patch_uuid: sel_uuid.clone(),
             artifact_url: url,
+            npm_registry_url: reference.npm_registry_url.clone(),
             registry_override: reference.registry_override.clone(),
             integrity,
         };
+        // A registry address pnpm could not route the artifact URL to
+        // reads as not served: the pin then takes the `trustLockfile` path.
+        dep.npm_registry_url = grant::npm_registry_url(&dep).map(str::to_string);
         // The served purl is printed and recorded as it is: a line break in
         // one would forge a line of the run's output.
         let checked = if purl.chars().any(|c| c.is_whitespace() || c.is_control()) {
@@ -2054,9 +2063,14 @@ pub struct Rewritten {
     pub pnpm_warnings: Vec<RewriteWarning>,
     pub npm_warnings: Vec<RewriteWarning>,
     /// Human mode: this run touched nothing pnpm-related (no lock spliced,
-    /// trust already configured), so the full guidance shrinks to a
-    /// one-line reminder.
+    /// trust or the named registries already configured), so the full
+    /// guidance shrinks to a one-line reminder.
     pub pnpm_rerun_only: bool,
+    /// The run's pnpm guidance is the named-registry one: every hosted pin
+    /// of the governing pnpm locks has a registry declared (or to declare)
+    /// in pnpm-workspace.yaml, so `trustLockfile` is not what installs
+    /// rely on.
+    pub pnpm_named_registries: bool,
     /// In memory only: the trust auto-config would write through a
     /// symlinked `pnpm-workspace.yaml`.
     pub(crate) workspace_symlinked: bool,
@@ -2897,7 +2911,13 @@ async fn rewrite_once(
         ));
     }
 
-    let (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked) = pnpm_trust(
+    let PnpmTrust {
+        warnings: pnpm_warnings,
+        config_write: pnpm_config_write,
+        rerun_only: pnpm_rerun_only,
+        workspace_symlinked,
+        named_registries: pnpm_named_registries,
+    } = pnpm_trust(
         view,
         &files,
         &pnpm_member_lock_keys,
@@ -2909,11 +2929,11 @@ async fn rewrite_once(
     let (mut npm_warnings, npmrc_config_write) =
         npm_allow_remote(view, &files, &rewrite, &overrides, &options);
     npm_warnings.extend(npm_allow_scripts(&files, &rewrite, &overrides));
-    if let Some((text, edit)) = trust_config_write {
+    if let Some((text, edits)) = pnpm_config_write {
         rewrite.files.insert(PNPM_WORKSPACE_REL.to_string(), text);
-        // Appended last, after the lock edits it serves. v5 keeps no hosted
+        // Appended last, after the lock edits they serve. v5 keeps no hosted
         // ledger, so nothing replays these edits; the order is write order.
-        rewrite.edits.push(edit);
+        rewrite.edits.extend(edits);
     }
     if let Some((text, edit)) = npmrc_config_write {
         rewrite.files.insert(NPMRC_REL.to_string(), text);
@@ -2944,12 +2964,27 @@ async fn rewrite_once(
         pnpm_warnings,
         npm_warnings,
         pnpm_rerun_only,
+        pnpm_named_registries,
         workspace_symlinked,
         final_discovery: None,
     }
 }
 
 type ConfigWrite = Option<(String, FileEdit)>;
+
+/// What [`pnpm_trust`] settles for a run.
+#[derive(Default)]
+struct PnpmTrust {
+    warnings: Vec<RewriteWarning>,
+    /// The new pnpm-workspace.yaml and the edits that make it.
+    config_write: Option<(String, Vec<FileEdit>)>,
+    /// See [`Rewritten::pnpm_rerun_only`].
+    rerun_only: bool,
+    /// See [`Rewritten::workspace_symlinked`].
+    workspace_symlinked: bool,
+    /// See [`Rewritten::pnpm_named_registries`].
+    named_registries: bool,
+}
 
 /// pnpm >=11 enforces a lockfile supply-chain policy: it compares each
 /// resolution's tarball URL against the registry's published metadata and
@@ -2967,15 +3002,31 @@ type ConfigWrite = Option<(String, FileEdit)>;
 /// root pnpm-lock.yaml, or a workspace member's own lock under
 /// `sharedWorkspaceLockfile: false`, #492) and its lockfileVersion is >= 9
 /// (5.x/6.0 locks mean pnpm 7/8, which have neither the policy nor the
-/// flag and get their own guidance), the run
-/// auto-ensures `trustLockfile: true` in pnpm-workspace.yaml. The same
-/// auto-config re-engages on a run that spliced NOTHING when a governing v9
-/// lock already carries a granted hosted artifact URL (HEAL-ON-RERUN). The
-/// key always goes to the root pnpm-workspace.yaml, the only one pnpm reads
-/// for every member.
+/// flag and get their own guidance), the run configures the root
+/// pnpm-workspace.yaml, the only one pnpm reads for every member, so
+/// pnpm >=11 installs the lock. The same auto-config re-engages on a run
+/// that spliced NOTHING when a governing v9 lock already carries a granted
+/// hosted artifact URL (HEAL-ON-RERUN).
+///
+/// NAMED REGISTRIES, when every hosted tarball of the governing v9 locks
+/// has one ([`pnpm_named_registries`]) and the project's pnpm pins prove
+/// pnpm 12 or newer ([`pins_pnpm_12_or_newer`]): the patch service serves
+/// each patch under a one-package npm registry, and pnpm verifies a lock
+/// entry against the named registry whose address its tarball URL starts
+/// with. The run declares one `namedRegistries` entry per pin
+/// ([`pnpm_registry_config`]), which leaves pnpm's verification on for the
+/// whole lock. A lock half covered would fail to install, so a single
+/// hosted tarball without a registry (a patch service that serves none, a
+/// pin of an earlier run) keeps the whole run on the path below, as does a
+/// project whose pnpm may be older: pnpm 11 drops a registry-verified
+/// entry on `pnpm add`.
+///
+/// TRUST, otherwise: the run auto-ensures `trustLockfile: true`, which
+/// switches the verification off for every entry.
 /// pnpm <=10 ignores the key; the per-entry sha512 pin still fails closed
 /// on tampered bytes. An explicit user `trustLockfile: <non-true>` is
-/// RESPECTED (never flipped), and `--no-trust-lockfile-config` opts out.
+/// RESPECTED (never flipped), and `--no-trust-lockfile-config` opts out of
+/// either write.
 /// Rush common/subspace locks (`rush_lock_keys`) are excluded from the
 /// write: rush runs pnpm in common/temp with a pnpm-workspace.yaml it
 /// generates, which never reads the repo-root one. When every spliced lock
@@ -2992,11 +3043,8 @@ fn pnpm_trust(
     rush_lock_keys: &[String],
     overrides: &[DepOverride],
     options: &RewriteOptions<'_>,
-) -> (Vec<RewriteWarning>, ConfigWrite, bool, bool) {
-    let mut pnpm_warnings: Vec<RewriteWarning> = Vec::new();
-    let mut trust_config_write: ConfigWrite = None;
-    let mut pnpm_rerun_only = false;
-    let mut workspace_symlinked = false;
+) -> PnpmTrust {
+    let mut out = PnpmTrust::default();
     // pnpm locks spliced THIS run (any depth — the rewriter is
     // basename-generalized).
     let (spliced_keys, mut pnpm_lock_texts): (Vec<&String>, Vec<&String>) = rewrite
@@ -3054,12 +3102,7 @@ fn pnpm_trust(
         }
     }
     if pnpm_lock_texts.is_empty() {
-        return (
-            pnpm_warnings,
-            trust_config_write,
-            pnpm_rerun_only,
-            workspace_symlinked,
-        );
+        return out;
     }
     // Name only the hosts whose artifact URL actually landed in a touched
     // pnpm lock's final text (spliced this run, or the already-redirected
@@ -3104,13 +3147,56 @@ fn pnpm_trust(
             || pnpm_is_shrinkwrap_lock(text)
     });
     let rush_only = spliced_rush > 0 && spliced_rush == pnpm_lock_texts.len();
+    // A governing v9 lock is what either auto-config serves. In a workspace
+    // member with its own lock the settings live in the workspace root's
+    // file, which this run never writes.
+    let auto_config_lock = governing_lock_v9 && !all_locks_legacy && !rush_only;
+    let member_root = auto_config_lock
+        .then(|| governing_workspace(view))
+        .flatten();
+    let root_workspace = (auto_config_lock && member_root.is_none()).then(|| read_workspace(view));
+    // Every governing lock as this run leaves it.
+    let governing_texts: Vec<&String> = governing
+        .iter()
+        .filter_map(|key| rewrite.files.get(*key).or_else(|| files.get(*key)))
+        .collect();
+    let registries = root_workspace.as_ref().and_then(|(workspace, _)| {
+        // Only for a pnpm that keeps a registry-verified entry across
+        // `pnpm add`; any other project stays on `trustLockfile`.
+        if !pins_pnpm_12_or_newer(view) {
+            return None;
+        }
+        let declared = match workspace {
+            Ok(Some(text)) => crate::formats::pnpm::named_registries::declared(text),
+            _ => Vec::new(),
+        };
+        let v9: Vec<&String> = governing_texts
+            .iter()
+            .copied()
+            .filter(|text| is_v9(text))
+            .collect();
+        pnpm_named_registries(&v9, overrides, &declared)
+    });
     let detail = if all_locks_legacy {
         pnpm_trust_legacy_detail(&server)
     } else if rush_only {
         pnpm_trust_rush_detail(&server)
+    } else if let Some(wanted) = registries {
+        let (workspace, symlinked) = root_workspace.unwrap_or_else(|| read_workspace(view));
+        out.named_registries = true;
+        // A lock that still names a patch keeps its registry, whether or
+        // not this run was asked about that patch.
+        let pinned = |uuid: &str| governing_texts.iter().any(|text| text.contains(uuid));
+        let config = pnpm_registry_config(
+            view, overrides, options, &server, &wanted, workspace, symlinked, &pinned,
+        );
+        out.workspace_symlinked = config.symlinked;
+        out.rerun_only = config.in_sync && spliced_pnpm_locks == 0;
+        out.config_write = config.write;
+        config.detail
     } else if !governing_lock_v9 || !options.trust_lockfile_config {
         pnpm_trust_manual_guidance(&server)
-    } else if let Some(root_file) = governing_workspace(view) {
+    } else if let Some(root_file) = member_root {
         // A workspace member with its own lock: pnpm reads `trustLockfile`
         // only from the workspace root's file, and a nested one would be
         // ignored (#880). The governing-root pre-check refused every root
@@ -3135,7 +3221,7 @@ fn pnpm_trust(
                 .map(|text| plan_workspace_trust(Some(&text)))
             {
                 Some(TrustPlan::AlreadyTrue) => {
-                    pnpm_rerun_only = spliced_pnpm_locks == 0;
+                    out.rerun_only = spliced_pnpm_locks == 0;
                     pnpm_trust_already_true_detail(&server, &root_file)
                 }
                 Some(TrustPlan::UserSet(value)) => {
@@ -3145,8 +3231,8 @@ fn pnpm_trust(
             }
         }
     } else {
-        let (workspace, symlinked) = read_workspace(view);
-        workspace_symlinked = symlinked;
+        let (workspace, symlinked) = root_workspace.unwrap_or_else(|| read_workspace(view));
+        out.workspace_symlinked = symlinked;
         let trust_edit = |action: &str| FileEdit {
             path: PNPM_WORKSPACE_REL.into(),
             kind: REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND.into(),
@@ -3201,19 +3287,19 @@ fn pnpm_trust(
             Err(e) => pnpm_trust_workspace_unreadable_detail(&server, &e),
             Ok(ws_existing) => match plan_workspace_trust(ws_existing.as_deref()) {
                 TrustPlan::Create(text) => {
-                    trust_config_write = Some((text, trust_edit("created")));
+                    out.config_write = Some((text, vec![trust_edit("created")]));
                     pnpm_trust_configured_detail(&server, true, options.dry_run)
                 }
                 TrustPlan::Append(text) => {
-                    trust_config_write = Some((text, trust_edit("added")));
+                    out.config_write = Some((text, vec![trust_edit("added")]));
                     pnpm_trust_configured_detail(&server, false, options.dry_run)
                 }
                 TrustPlan::Scaffold(text) => {
-                    trust_config_write = Some((text, trust_edit("added")));
+                    out.config_write = Some((text, vec![trust_edit("added")]));
                     pnpm_trust_scaffolded_detail(&server, options.dry_run)
                 }
                 TrustPlan::AlreadyTrue => {
-                    pnpm_rerun_only = spliced_pnpm_locks == 0;
+                    out.rerun_only = spliced_pnpm_locks == 0;
                     let detail = pnpm_trust_already_true_detail(&server, PNPM_WORKSPACE_REL);
                     // The root-only scaffold an earlier run created (4.x and
                     // early v5 did so whatever the pnpm), in a project pinned
@@ -3268,13 +3354,195 @@ fn pnpm_trust(
             detail.trim_end_matches('.')
         )
     };
-    pnpm_warnings.push(warning("redirect_pnpm_trust_lockfile", message));
-    (
-        pnpm_warnings,
-        trust_config_write,
-        pnpm_rerun_only,
-        workspace_symlinked,
-    )
+    out.warnings
+        .push(warning("redirect_pnpm_trust_lockfile", message));
+    out
+}
+
+/// What [`pnpm_registry_config`] settles.
+struct RegistryConfig {
+    detail: String,
+    write: Option<(String, Vec<FileEdit>)>,
+    /// The workspace file already declares every registry.
+    in_sync: bool,
+    /// In memory only: the write would go through a symlinked
+    /// pnpm-workspace.yaml (see [`Rewritten::workspace_symlinked`]).
+    symlinked: bool,
+}
+
+/// The named-registry auto-config: make the root pnpm-workspace.yaml
+/// (`workspace`, as [`read_workspace`] classified it) declare `wanted`,
+/// the alias → address of each hosted pin of the governing locks.
+///
+/// The file is created with the root-only `packages` scaffold when absent
+/// and spliced otherwise ([`crate::formats::pnpm::named_registries::plan`]:
+/// the user's own registries stay byte for byte, an alias of ours at
+/// another address is repointed, and one whose patch no governing lock
+/// names any more (`pinned`, by uuid) is removed). The rules that decide
+/// whether the trust auto-config may write a workspace file at all apply
+/// unchanged: `--no-trust-lockfile-config`, a keyless file with workspace
+/// members (#1096), an unreadable file, a shape a splice would corrupt.
+/// (The pnpm 9.0–10.4 rule, #734, cannot apply: the caller only comes here
+/// for a project pinned to pnpm 12 or newer.) A
+/// `pnpm_config_trust_lockfile` variable is not one of them: a declared
+/// registry needs no trust.
+///
+/// A `trustLockfile: true` an earlier run wrote goes with the write when
+/// the file's bytes prove that run wrote it ([`strip_cli_trust`]), so the
+/// project ends with pnpm's verification back on. Any other one may be the
+/// user's: it stays, and the warning says the hosted patches no longer
+/// need it.
+#[allow(clippy::too_many_arguments)]
+fn pnpm_registry_config(
+    view: &ProjectView<'_>,
+    overrides: &[DepOverride],
+    options: &RewriteOptions<'_>,
+    server: &str,
+    wanted: &BTreeMap<String, String>,
+    workspace: std::io::Result<Option<String>>,
+    symlinked: bool,
+    pinned: &dyn Fn(&str) -> bool,
+) -> RegistryConfig {
+    use crate::formats::pnpm::named_registries::{self, Plan};
+    use crate::formats::pnpm::workspace::is_keyless;
+
+    let settled = |detail: String| RegistryConfig {
+        detail,
+        write: None,
+        in_sync: false,
+        symlinked: false,
+    };
+    // The lines a user adds by hand. The warning reaches CI logs, so each
+    // address is shown without its grant token.
+    let manual_lines = || -> Vec<String> {
+        named_registries::section_lines(wanted)
+            .into_iter()
+            .map(|line| {
+                overrides
+                    .iter()
+                    .find(|o| line.contains(&named_registries::alias(&o.patch_uuid)))
+                    .map_or(line.clone(), |o| {
+                        redact_artifact_text(&line, &o.artifact_url, &o.patch_uuid)
+                    })
+            })
+            .collect()
+    };
+    let leftover = |text: Option<&str>| match text.map(|text| plan_workspace_trust(Some(text))) {
+        Some(TrustPlan::AlreadyTrue) => TrustLeftover::Left,
+        _ => TrustLeftover::None,
+    };
+    if !options.trust_lockfile_config {
+        return match &workspace {
+            Ok(Some(text))
+                if named_registries::plan(Some(text.as_str()), wanted, pinned) == Plan::InSync =>
+            {
+                RegistryConfig {
+                    in_sync: true,
+                    ..settled(pnpm_registry_already_detail(
+                        server,
+                        leftover(Some(text.as_str())),
+                    ))
+                }
+            }
+            _ => settled(pnpm_registry_manual_guidance(server, &manual_lines())),
+        };
+    }
+    // A keyless file the lock was installed from as a multi-package
+    // workspace: only pnpm <= 10.4 reads one that way, and the root-only
+    // scaffold would drop those members (#1096).
+    let keyless_members = !symlinked
+        && matches!(&workspace, Ok(Some(text)) if is_keyless(text))
+        && lock_lists_members(view);
+    let existing = match workspace {
+        Ok(_) if keyless_members => {
+            return RegistryConfig {
+                symlinked,
+                ..settled(pnpm_registry_keyless_members_detail(
+                    server,
+                    options.dry_run,
+                ))
+            }
+        }
+        // Present but UNREADABLE: never plan a Create (it would overwrite
+        // the user's workspace file).
+        Err(e) => {
+            return RegistryConfig {
+                symlinked,
+                ..settled(pnpm_registry_workspace_unreadable_detail(
+                    server,
+                    &e,
+                    &manual_lines(),
+                ))
+            }
+        }
+        Ok(existing) => existing,
+    };
+    // The file the registries go into: the project's, less the trust key
+    // an earlier run provably wrote.
+    let untrusted = existing.as_deref().and_then(strip_cli_trust);
+    let trust = match &untrusted {
+        Some(_) => TrustLeftover::Removed,
+        None => leftover(existing.as_deref()),
+    };
+    let base = untrusted.as_deref().or(existing.as_deref());
+    let (text, changes, write) = match named_registries::plan(base, wanted, pinned) {
+        Plan::Create(text, changes) => (text, changes, RegistryWrite::Created),
+        Plan::Scaffold(text, changes) => (text, changes, RegistryWrite::Scaffolded),
+        Plan::Edit(text, changes) => (text, changes, RegistryWrite::Merged),
+        Plan::InSync => {
+            return RegistryConfig {
+                in_sync: true,
+                symlinked,
+                ..settled(pnpm_registry_already_detail(
+                    server,
+                    leftover(existing.as_deref()),
+                ))
+            };
+        }
+        Plan::Unsupported(why) => {
+            return RegistryConfig {
+                symlinked,
+                ..settled(pnpm_registry_workspace_unsupported_detail(
+                    server,
+                    &why,
+                    &manual_lines(),
+                ))
+            }
+        }
+    };
+    let mut edits = Vec::new();
+    if trust == TrustLeftover::Removed {
+        edits.push(FileEdit {
+            path: PNPM_WORKSPACE_REL.into(),
+            kind: REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND.into(),
+            action: "removed".into(),
+            key: Some("trustLockfile".into()),
+            original: Some(serde_json::json!("true")),
+            new: None,
+        });
+    }
+    edits.extend(changes.into_iter().map(|change| {
+        let action = match (&change.from, &change.to) {
+            _ if write == RegistryWrite::Created => "created",
+            (None, _) => "added",
+            (Some(_), Some(_)) => "rewritten",
+            (Some(_), None) => "removed",
+        };
+        FileEdit {
+            path: PNPM_WORKSPACE_REL.into(),
+            kind: REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND.into(),
+            action: action.into(),
+            key: Some(change.alias),
+            original: change.from.map(serde_json::Value::String),
+            new: change.to.map(serde_json::Value::String),
+        }
+    }));
+    RegistryConfig {
+        detail: pnpm_registry_configured_detail(server, write, trust, options.dry_run),
+        write: Some((text, edits)),
+        in_sync: false,
+        symlinked,
+    }
 }
 
 /// The trust detail for a settings file (`file`) that already carries
@@ -3353,6 +3621,17 @@ fn pnpm_trust_env_set_detail(server: &str, source: &str) -> String {
          the variable or set it to `true` wherever the project installs, or re-run \
          the scan with `--mode vendored`. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
         pnpm_trust_policy_preamble(server),
+    )
+}
+
+/// Whether every pnpm pin the project carries names pnpm 12 or newer (see
+/// [`crate::formats::pnpm::pins_pnpm_12_or_newer`]), read from the files
+/// [`root_only_workspace_breaks_add`] reads.
+fn pins_pnpm_12_or_newer(view: &ProjectView<'_>) -> bool {
+    let read = |rel: &str| read_advisory_text(view, rel);
+    crate::formats::pnpm::pins_pnpm_12_or_newer(
+        read(crate::hosted::memory::select::NPM_MANIFEST_REL).as_deref(),
+        read("node_modules/.modules.yaml").as_deref(),
     )
 }
 
@@ -4206,6 +4485,7 @@ mod tests {
             token: GRANT.into(),
             patch_uuid: PATCH_UUID.into(),
             artifact_url,
+            npm_registry_url: None,
             registry_override: None,
             integrity: crate::patch::redirect::Integrity::default(),
         }
@@ -4721,6 +5001,7 @@ mod tests {
                 artifact_url:
                     "https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/uuid/left-pad-1.3.0.tgz"
                         .into(),
+                npm_registry_url: None,
                 registry_override: None,
                 integrity: Integrity::default(),
             },
@@ -4769,6 +5050,7 @@ mod tests {
                 token: "tok".into(),
                 patch_uuid: "uuid".into(),
                 artifact_url: url.into(),
+                npm_registry_url: None,
                 registry_override: None,
                 integrity: Integrity::default(),
             },
@@ -4824,6 +5106,7 @@ mod tests {
                 token: "tok".into(),
                 patch_uuid: "uuid".into(),
                 artifact_url: url.into(),
+                npm_registry_url: None,
                 registry_override: None,
                 integrity: Integrity {
                     yarn_berry10c0: Some(format!("10c0/{}", "7".repeat(128))),
@@ -4905,6 +5188,7 @@ mod tests {
                 token: FIXTURE_TOKEN.into(),
                 patch_uuid: FIXTURE_UUID.into(),
                 artifact_url: left_pad_url(),
+                npm_registry_url: None,
                 registry_override: None,
                 integrity: Integrity {
                     sha512: Some("sha512-PATCHED==".into()),
@@ -5591,6 +5875,822 @@ snapshots:
         }
     }
 
+    // ── pnpm named registries ────────────────────────────────────────────
+
+    /// The address of the one-package registry the patch service serves
+    /// the left-pad patch under: its tarball URL's directory.
+    fn left_pad_registry_url() -> String {
+        format!("https://patch.test/patch/npm/left-pad/1.3.0/{FIXTURE_TOKEN}/{FIXTURE_UUID}/")
+    }
+
+    /// [`left_pad_candidate`] as a patch service that serves registry
+    /// metadata grants it.
+    fn left_pad_registry_candidate() -> Candidate {
+        let mut candidate = left_pad_candidate();
+        candidate.dep.npm_registry_url = Some(left_pad_registry_url());
+        candidate
+    }
+
+    const IS_NUMBER_UUID: &str = "88888888-8888-4888-8888-888888888888";
+
+    fn is_number_url() -> String {
+        format!(
+            "https://patch.test/patch/npm/is-number/7.0.0/{FIXTURE_TOKEN}/{IS_NUMBER_UUID}/is-number-7.0.0.tgz"
+        )
+    }
+
+    fn is_number_registry_url() -> String {
+        format!("https://patch.test/patch/npm/is-number/7.0.0/{FIXTURE_TOKEN}/{IS_NUMBER_UUID}/")
+    }
+
+    /// A second pin of the same lock; `registry` as the patch service
+    /// serves it or not.
+    fn is_number_candidate(registry: bool) -> Candidate {
+        let mut candidate = left_pad_candidate();
+        candidate.purl = "pkg:npm/is-number@7.0.0".into();
+        candidate.dep.name = "is-number".into();
+        candidate.dep.version = "7.0.0".into();
+        candidate.dep.patch_uuid = IS_NUMBER_UUID.into();
+        candidate.dep.artifact_url = is_number_url();
+        candidate.dep.npm_registry_url = registry.then(is_number_registry_url);
+        candidate
+    }
+
+    const TWO_PACKAGE_V9_LOCK: &str = "lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      is-number:
+        specifier: 7.0.0
+        version: 7.0.0
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+
+packages:
+  is-number@7.0.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+
+snapshots:
+  is-number@7.0.0: {}
+
+  left-pad@1.3.0: {}
+";
+
+    fn left_pad_alias_line() -> String {
+        format!("  socket-patch-{FIXTURE_UUID}: {}", left_pad_registry_url())
+    }
+
+    fn is_number_alias_line() -> String {
+        format!(
+            "  socket-patch-{IS_NUMBER_UUID}: {}",
+            is_number_registry_url()
+        )
+    }
+
+    /// The pin that proves a pnpm hosted mode declares named registries
+    /// for.
+    const PNPM_12_MANIFEST: &str = r#"{"name":"app","packageManager":"pnpm@12.22.0"}"#;
+
+    /// A project pinned to pnpm 12 whose root lock is `lock`.
+    fn pnpm12_project(lock: &str) -> MemoryProject {
+        let mut project = MemoryProject::new();
+        project.insert_text("pnpm-lock.yaml", lock);
+        project.insert_text("package.json", PNPM_12_MANIFEST);
+        project
+    }
+
+    /// One pnpm rewrite of `view` for `candidates`: `config` is the trust
+    /// auto-config switch (`--no-trust-lockfile-config` turns it off).
+    async fn pnpm_rewrite(
+        view: &ProjectView<'_>,
+        candidates: &[Candidate],
+        config: bool,
+        dry_run: bool,
+        env: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+    ) -> Rewritten {
+        let outer = OuterAllowRemote::default;
+        let options = RewriteOptions {
+            dry_run,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: config,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
+            maven_selection: &no_maven_selection,
+            pnpm_env: env,
+            blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
+        };
+        let read = read_candidate_files(view, &BTreeSet::new(), candidates).await;
+        rewrite(view, read, candidates, BTreeMap::new(), options).await
+    }
+
+    /// The default run over an in-memory project.
+    async fn registry_rewrite(project: &MemoryProject, candidates: &[Candidate]) -> Rewritten {
+        pnpm_rewrite(
+            &ProjectView::Memory(project),
+            candidates,
+            true,
+            false,
+            &no_env,
+        )
+        .await
+    }
+
+    fn workspace_of(done: &Rewritten) -> Option<&str> {
+        done.rewrite
+            .files
+            .get(PNPM_WORKSPACE_REL)
+            .map(String::as_str)
+    }
+
+    fn workspace_edits(done: &Rewritten) -> Vec<(&str, &str, Option<&str>)> {
+        done.rewrite
+            .edits
+            .iter()
+            .filter(|e| e.path == PNPM_WORKSPACE_REL)
+            .map(|e| (e.kind.as_str(), e.action.as_str(), e.key.as_deref()))
+            .collect()
+    }
+
+    /// `project` as the run left it: its files with the rewritten ones on
+    /// top.
+    fn after(project: &MemoryProject, done: &Rewritten) -> MemoryProject {
+        let mut next = project.clone();
+        for (rel, text) in &done.rewrite.files {
+            next.insert_text(rel.as_str(), text.as_str());
+        }
+        next
+    }
+
+    /// Every pin of the governing lock has a registry address: the run
+    /// declares the patch server as a named registry for each and writes no
+    /// `trustLockfile`, so pnpm's verification stays on. The warning says
+    /// so, keeps the cautions that are still true, and drops the
+    /// whole-lock tradeoff note.
+    #[tokio::test]
+    async fn named_registries_are_declared_when_every_pin_has_one() {
+        let root = pnpm12_project(TWO_PACKAGE_V9_LOCK);
+        let candidates = [left_pad_registry_candidate(), is_number_candidate(true)];
+        let done = registry_rewrite(&root, &candidates).await;
+        assert!(done.rewrite.files.contains_key("pnpm-lock.yaml"));
+        assert_eq!(
+            workspace_of(&done),
+            Some(
+                format!(
+                    "packages:\n  - '.'\nnamedRegistries:\n{}\n{}\n",
+                    left_pad_alias_line(),
+                    is_number_alias_line()
+                )
+                .as_str()
+            )
+        );
+        let left_pad_alias = format!("socket-patch-{FIXTURE_UUID}");
+        let is_number_alias = format!("socket-patch-{IS_NUMBER_UUID}");
+        assert_eq!(
+            workspace_edits(&done),
+            [
+                (
+                    REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                    "created",
+                    Some(left_pad_alias.as_str())
+                ),
+                (
+                    REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                    "created",
+                    Some(is_number_alias.as_str())
+                ),
+            ]
+        );
+        assert!(done.pnpm_named_registries);
+        assert!(!done.pnpm_rerun_only);
+        assert!(guard(&ProjectView::Memory(&root), &done, &candidates).is_none());
+        let detail = pnpm_trust_detail(&done);
+        for said in [
+            "repointed at the hosted patch server (patch.test)",
+            "a new pnpm-workspace.yaml now declares the patch server as a named registry",
+            "pnpm >=11 verifies those entries against it",
+            "commit it alongside the lock",
+            "lockfile verification stays on",
+            "ERR_PNPM_TARBALL_URL_MISMATCH",
+            "ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION",
+            "pnpm clean --lockfile",
+            "--store-dir <new-empty-directory>",
+            "socket-patch vex",
+        ] {
+            assert!(detail.contains(said), "{said}: {detail}");
+        }
+        for unsaid in [
+            "trustLockfile",
+            "ALL lockfile entries",
+            "--trust-lockfile",
+            FIXTURE_TOKEN,
+        ] {
+            assert!(!detail.contains(unsaid), "{unsaid}: {detail}");
+        }
+
+        // A re-run over what the run wrote changes nothing.
+        let written = after(&root, &done);
+        let again = registry_rewrite(&written, &candidates).await;
+        assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.files);
+        assert!(again.rewrite.edits.is_empty(), "{:?}", again.rewrite.edits);
+        assert!(again.pnpm_rerun_only && again.pnpm_named_registries);
+        let detail = pnpm_trust_detail(&again);
+        assert!(
+            detail.contains("already declares the patch server as a named registry"),
+            "{detail}"
+        );
+        assert!(!detail.contains("trustLockfile"), "{detail}");
+    }
+
+    /// One pin the patch service serves no registry for keeps the whole run
+    /// on `trustLockfile`, exactly as a run with no registry at all: a lock
+    /// half covered would fail to install on pnpm >= 11.
+    #[tokio::test]
+    async fn one_pin_without_a_registry_keeps_the_run_on_trust() {
+        let root = pnpm12_project(TWO_PACKAGE_V9_LOCK);
+        let before =
+            registry_rewrite(&root, &[left_pad_candidate(), is_number_candidate(false)]).await;
+        assert_eq!(
+            workspace_of(&before),
+            Some("packages:\n  - '.'\ntrustLockfile: true\n")
+        );
+        let mixed = registry_rewrite(
+            &root,
+            &[left_pad_registry_candidate(), is_number_candidate(false)],
+        )
+        .await;
+        assert_eq!(mixed.rewrite.files, before.rewrite.files);
+        assert_eq!(mixed.rewrite.edits, before.rewrite.edits);
+        assert_eq!(mixed.pnpm_warnings, before.pnpm_warnings);
+        assert!(!mixed.pnpm_named_registries);
+        assert_eq!(
+            workspace_edits(&mixed),
+            [(
+                REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+                "created",
+                Some("trustLockfile")
+            )]
+        );
+
+        // A pin an earlier run left on the patch server, which this run was
+        // not asked about, counts the same way.
+        let pinned = after(&root, &before);
+        let mut without_trust = pinned.clone();
+        without_trust.insert_text(PNPM_WORKSPACE_REL, "packages:\n  - 'apps/*'\n");
+        let one = registry_rewrite(&without_trust, &[left_pad_registry_candidate()]).await;
+        assert_eq!(
+            workspace_of(&one),
+            Some("packages:\n  - 'apps/*'\ntrustLockfile: true\n")
+        );
+        assert!(!one.pnpm_named_registries);
+    }
+
+    /// `--no-trust-lockfile-config` opts out of the registry write too: the
+    /// warning carries the lines to add, with the grant token left out (it
+    /// reaches CI logs; the lock holds the full URL).
+    #[tokio::test]
+    async fn the_opt_out_writes_no_registry_and_names_the_lines() {
+        let root = pnpm12_project(LEFT_PAD_V9_LOCK);
+        let candidates = [left_pad_registry_candidate()];
+        let done = pnpm_rewrite(
+            &ProjectView::Memory(&root),
+            &candidates,
+            false,
+            false,
+            &no_env,
+        )
+        .await;
+        assert!(done.rewrite.files.contains_key("pnpm-lock.yaml"));
+        assert_eq!(workspace_of(&done), None);
+        assert!(workspace_edits(&done).is_empty());
+        assert!(done.pnpm_named_registries);
+        let detail = pnpm_trust_detail(&done);
+        let line = format!(
+            "`  socket-patch-{FIXTURE_UUID}: https://patch.test/patch/npm/left-pad/1.3.0/<redacted>/{FIXTURE_UUID}/`"
+        );
+        for said in [
+            "Nothing was written to pnpm-workspace.yaml (--no-trust-lockfile-config)",
+            "`namedRegistries:`",
+            line.as_str(),
+            "`pnpm install --trust-lockfile` works too",
+            "pnpm clean --lockfile",
+        ] {
+            assert!(detail.contains(said), "{said}: {detail}");
+        }
+        assert!(!detail.contains(FIXTURE_TOKEN), "{detail}");
+        assert!(!detail.contains("trustLockfile"), "{detail}");
+
+        // With the registries already declared the opt-out has nothing to
+        // ask for.
+        let mut declared = after(&root, &done);
+        declared.insert_text(
+            PNPM_WORKSPACE_REL,
+            format!(
+                "packages:\n  - '.'\nnamedRegistries:\n{}\n",
+                left_pad_alias_line()
+            ),
+        );
+        let again = pnpm_rewrite(
+            &ProjectView::Memory(&declared),
+            &candidates,
+            false,
+            false,
+            &no_env,
+        )
+        .await;
+        assert!(again.rewrite.files.is_empty());
+        assert!(again.pnpm_rerun_only);
+        assert!(pnpm_trust_detail(&again).contains("already declares"));
+    }
+
+    /// HEAL-ON-RERUN: a lock an earlier (opted-out, or interrupted) run
+    /// already redirected gets its registries on a re-run that splices
+    /// nothing.
+    #[tokio::test]
+    async fn a_rerun_declares_the_registries_a_redirected_lock_misses() {
+        let root = pnpm12_project(LEFT_PAD_V9_LOCK);
+        let candidates = [left_pad_registry_candidate()];
+        let first = pnpm_rewrite(
+            &ProjectView::Memory(&root),
+            &candidates,
+            false,
+            false,
+            &no_env,
+        )
+        .await;
+        let redirected = after(&root, &first);
+        let healed = registry_rewrite(&redirected, &candidates).await;
+        assert_eq!(
+            healed.rewrite.files.keys().collect::<Vec<_>>(),
+            [PNPM_WORKSPACE_REL]
+        );
+        assert_eq!(
+            workspace_of(&healed),
+            Some(
+                format!(
+                    "packages:\n  - '.'\nnamedRegistries:\n{}\n",
+                    left_pad_alias_line()
+                )
+                .as_str()
+            )
+        );
+        assert!(!healed.pnpm_rerun_only);
+
+        // A dry run says what it would do.
+        let dry = pnpm_rewrite(
+            &ProjectView::Memory(&redirected),
+            &candidates,
+            true,
+            true,
+            &no_env,
+        )
+        .await;
+        let detail = pnpm_trust_detail(&dry);
+        assert!(
+            detail.contains("a new pnpm-workspace.yaml would declare the patch server"),
+            "{detail}"
+        );
+    }
+
+    /// A `trustLockfile: true` an earlier run wrote (the file is exactly
+    /// what that run creates, or a keyless file plus the lines it splices)
+    /// goes in the run that lands the registries, in the file's own line
+    /// ending: the project ends with pnpm's verification back on.
+    #[tokio::test]
+    async fn a_trust_key_an_earlier_run_wrote_is_replaced() {
+        let candidates = [left_pad_registry_candidate()];
+        let alias = format!("socket-patch-{FIXTURE_UUID}");
+        for (before, want) in [
+            (
+                "packages:\n  - '.'\ntrustLockfile: true\n".to_string(),
+                format!(
+                    "packages:\n  - '.'\nnamedRegistries:\n{}\n",
+                    left_pad_alias_line()
+                ),
+            ),
+            (
+                "packages:\r\n  - '.'\r\ntrustLockfile: true\r\n".to_string(),
+                format!(
+                    "packages:\r\n  - '.'\r\nnamedRegistries:\r\n{}\r\n",
+                    left_pad_alias_line()
+                ),
+            ),
+            (
+                "# team settings\npackages:\n  - '.'\ntrustLockfile: true\n".to_string(),
+                format!(
+                    "# team settings\npackages:\n  - '.'\nnamedRegistries:\n{}\n",
+                    left_pad_alias_line()
+                ),
+            ),
+        ] {
+            let mut root = pnpm12_project(LEFT_PAD_V9_LOCK);
+            root.insert_text(PNPM_WORKSPACE_REL, before.as_str());
+            let done = registry_rewrite(&root, &candidates).await;
+            assert_eq!(workspace_of(&done), Some(want.as_str()), "{before:?}");
+            assert_eq!(
+                workspace_edits(&done),
+                [
+                    (
+                        REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+                        "removed",
+                        Some("trustLockfile")
+                    ),
+                    (
+                        REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                        "added",
+                        Some(alias.as_str())
+                    ),
+                ],
+                "{before:?}"
+            );
+            let detail = pnpm_trust_detail(&done);
+            assert!(
+                detail.contains(
+                    "The `trustLockfile: true` an earlier socket-patch run wrote there was removed"
+                ),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("verifies the whole lockfile again"),
+                "{detail}"
+            );
+            // What is left is the file a registry run creates or splices.
+            let again = registry_rewrite(&after(&root, &done), &candidates).await;
+            assert!(again.rewrite.files.is_empty(), "{before:?}");
+        }
+    }
+
+    /// A `trustLockfile` the file's bytes do not prove an earlier run wrote
+    /// is the user's: `true` stays, and the warning says the hosted patches
+    /// no longer need it; any other value no longer stands in the way of
+    /// anything. A `pnpm_config_trust_lockfile` variable is irrelevant to a
+    /// declared registry too.
+    #[tokio::test]
+    async fn a_users_trust_key_is_left_alone() {
+        fn off(var: &str) -> Option<String> {
+            (var == "pnpm_config_trust_lockfile").then(|| "false".to_string())
+        }
+        let candidates = [left_pad_registry_candidate()];
+        let section = format!("namedRegistries:\n{}\n", left_pad_alias_line());
+        for (user, left) in [
+            ("packages:\n  - 'apps/*'\ntrustLockfile: true\n", true),
+            ("trustLockfile: true\npackages:\n  - '.'\n", true),
+            ("packages:\n  - '.'\ntrustLockfile: false\n", false),
+            ("packages:\n  - 'apps/*'\n", false),
+        ] {
+            for env in [no_env as fn(&str) -> Option<String>, off] {
+                let mut root = pnpm12_project(LEFT_PAD_V9_LOCK);
+                root.insert_text(PNPM_WORKSPACE_REL, user);
+                let done =
+                    pnpm_rewrite(&ProjectView::Memory(&root), &candidates, true, false, &env).await;
+                assert_eq!(
+                    workspace_of(&done),
+                    Some(format!("{user}{section}").as_str()),
+                    "{user:?}"
+                );
+                let alias = format!("socket-patch-{FIXTURE_UUID}");
+                assert_eq!(
+                    workspace_edits(&done),
+                    [(
+                        REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                        "added",
+                        Some(alias.as_str())
+                    )]
+                );
+                let detail = pnpm_trust_detail(&done);
+                assert!(
+                    detail.contains("the existing pnpm-workspace.yaml now declares"),
+                    "{detail}"
+                );
+                assert_eq!(
+                    detail.contains(
+                        "also sets `trustLockfile: true`, which the hosted patches no longer need"
+                    ),
+                    left,
+                    "{user:?}: {detail}"
+                );
+                assert!(!detail.contains("respected"), "{detail}");
+                assert!(!detail.contains("pnpm_config_trust_lockfile"), "{detail}");
+            }
+        }
+    }
+
+    /// The user's own registries stay byte for byte; an alias of ours whose
+    /// patch no governing lock names goes; one a lock still names stays,
+    /// though this run was not asked about its patch; one at another
+    /// address (a rotated grant) is repointed.
+    #[tokio::test]
+    async fn stale_aliases_go_and_pinned_ones_stay() {
+        const GONE: &str = "99999999-9999-4999-8999-999999999999";
+        // The lock an earlier run left: is-number hosted, left-pad not yet.
+        let root = pnpm12_project(TWO_PACKAGE_V9_LOCK);
+        let earlier = registry_rewrite(&root, &[is_number_candidate(true)]).await;
+        let mut root = after(&root, &earlier);
+        let user = format!(
+            "packages:\n  - 'apps/*'\nnamedRegistries:\n  corp: https://npm.corp.example/ # ours\n\
+             \x20 socket-patch-{GONE}: https://patch.test/patch/npm/gone/1.0.0/tok/{GONE}/\n{}\n\
+             \x20 socket-patch-{FIXTURE_UUID}: https://patch.test/patch/npm/left-pad/1.3.0/oldtoken/{FIXTURE_UUID}/\n",
+            is_number_alias_line()
+        );
+        root.insert_text(PNPM_WORKSPACE_REL, user.as_str());
+        let done = registry_rewrite(&root, &[left_pad_registry_candidate()]).await;
+        assert_eq!(
+            workspace_of(&done),
+            Some(
+                format!(
+                    "packages:\n  - 'apps/*'\nnamedRegistries:\n  corp: https://npm.corp.example/ # ours\n{}\n{}\n",
+                    is_number_alias_line(),
+                    left_pad_alias_line()
+                )
+                .as_str()
+            )
+        );
+        let gone = format!("socket-patch-{GONE}");
+        let left_pad = format!("socket-patch-{FIXTURE_UUID}");
+        assert_eq!(
+            workspace_edits(&done),
+            [
+                (
+                    REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                    "removed",
+                    Some(gone.as_str())
+                ),
+                (
+                    REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                    "rewritten",
+                    Some(left_pad.as_str())
+                ),
+            ]
+        );
+        assert!(done.pnpm_named_registries);
+    }
+
+    /// A workspace file the splice cannot extend safely is left untouched,
+    /// and the warning names the reason and the lines to add.
+    #[tokio::test]
+    async fn an_unspliceable_workspace_gets_the_lines_instead() {
+        let candidates = [left_pad_registry_candidate()];
+        for (user, why) in [
+            (
+                "packages:\n  - '.'\nnamedRegistries: {corp: https://npm.corp.example/}\n",
+                "sets `namedRegistries` on one line",
+            ),
+            ("{packages: ['.']}\n", "is a flow-style YAML document"),
+            (
+                "packages:\n  - '.'\n---\nother: 1\n",
+                "holds more than one YAML document",
+            ),
+        ] {
+            let mut root = pnpm12_project(LEFT_PAD_V9_LOCK);
+            root.insert_text(PNPM_WORKSPACE_REL, user);
+            let done = registry_rewrite(&root, &candidates).await;
+            assert_eq!(workspace_of(&done), None, "{user:?}");
+            assert!(workspace_edits(&done).is_empty());
+            let detail = pnpm_trust_detail(&done);
+            assert!(detail.contains(why), "{why}: {detail}");
+            assert!(detail.contains("it was left untouched"), "{detail}");
+            assert!(detail.contains("`namedRegistries:`"), "{detail}");
+            assert!(
+                detail.contains(&format!("`  socket-patch-{FIXTURE_UUID}: ")),
+                "{detail}"
+            );
+            assert!(!detail.contains(FIXTURE_TOKEN), "{detail}");
+        }
+    }
+
+    /// Named registries are declared only for a project whose pnpm pins
+    /// prove pnpm 12 or newer: pnpm 11 drops a registry-verified entry on
+    /// `pnpm add`. Any other project (an older or open-ended pin, pins that
+    /// disagree, no pin) gets today's `trustLockfile` write, byte for byte.
+    #[tokio::test]
+    async fn named_registries_need_a_project_pinned_to_pnpm_12() {
+        let candidates = [left_pad_registry_candidate()];
+        let registries = format!(
+            "packages:\n  - '.'\nnamedRegistries:\n{}\n",
+            left_pad_alias_line()
+        );
+        const TRUST: &str = "packages:\n  - '.'\ntrustLockfile: true\n";
+        let mut unpinned = MemoryProject::new();
+        unpinned.insert_text("pnpm-lock.yaml", LEFT_PAD_V9_LOCK);
+        let baseline = registry_rewrite(&unpinned, &[left_pad_candidate()]).await;
+        assert_eq!(workspace_of(&baseline), Some(TRUST));
+        for (manifest, modules_yaml, want) in [
+            (None, None, TRUST),
+            (Some(r#"{"name":"app"}"#), None, TRUST),
+            (Some(r#"{"packageManager":"npm@11.0.0"}"#), None, TRUST),
+            (Some(r#"{"packageManager":"pnpm@11.28.13"}"#), None, TRUST),
+            (Some(r#"{"packageManager":"pnpm@10.34.6"}"#), None, TRUST),
+            (Some(r#"{"engines":{"pnpm":">=12"}}"#), None, TRUST),
+            (
+                Some(r#"{"devEngines":{"packageManager":{"name":"pnpm"}}}"#),
+                None,
+                TRUST,
+            ),
+            (
+                Some(r#"{"packageManager":"pnpm@12.4.2","engines":{"pnpm":"11"}}"#),
+                None,
+                TRUST,
+            ),
+            (
+                Some(r#"{"packageManager":"pnpm@12.4.2"}"#),
+                Some("packageManager: pnpm@11.28.13\n"),
+                TRUST,
+            ),
+            (
+                Some(r#"{"packageManager":"pnpm@12.0.0"}"#),
+                None,
+                registries.as_str(),
+            ),
+            (
+                Some(r#"{"engines":{"pnpm":"^12.4.0"}}"#),
+                None,
+                registries.as_str(),
+            ),
+            (
+                Some(r#"{"packageManager":"pnpm@13.1.0+sha512.abc"}"#),
+                None,
+                registries.as_str(),
+            ),
+            (
+                None,
+                Some("packageManager: pnpm@12.22.0\n"),
+                registries.as_str(),
+            ),
+            (
+                Some(r#"{"packageManager":"pnpm@12.4.2"}"#),
+                Some("packageManager: pnpm@12.22.0\n"),
+                registries.as_str(),
+            ),
+        ] {
+            let mut root = unpinned.clone();
+            if let Some(manifest) = manifest {
+                root.insert_text("package.json", manifest);
+            }
+            if let Some(modules_yaml) = modules_yaml {
+                root.insert_text("node_modules/.modules.yaml", modules_yaml);
+            }
+            let done = registry_rewrite(&root, &candidates).await;
+            assert_eq!(
+                workspace_of(&done),
+                Some(want),
+                "{manifest:?} {modules_yaml:?}"
+            );
+            assert_eq!(
+                done.pnpm_named_registries,
+                want != TRUST,
+                "{manifest:?} {modules_yaml:?}"
+            );
+            if want == TRUST {
+                // Exactly what a grant with no registry address gets.
+                assert_eq!(done.rewrite.edits, baseline.rewrite.edits);
+                assert_eq!(done.pnpm_warnings, baseline.pnpm_warnings);
+            }
+        }
+
+        // A project pinned to pnpm 9.0–10.4 keeps its own rule (#734): no
+        // file, and the trust path's reason.
+        let mut pnpm9 = unpinned.clone();
+        pnpm9.insert_text("package.json", r#"{"packageManager":"pnpm@9.15.9"}"#);
+        let done = registry_rewrite(&pnpm9, &candidates).await;
+        assert_eq!(workspace_of(&done), None);
+        assert!(!done.pnpm_named_registries);
+        assert!(pnpm_trust_detail(&done).contains("does not read `trustLockfile`"));
+    }
+
+    /// The rules that keep the trust auto-config from writing a workspace
+    /// file keep the registry write out too: Rush and legacy locks keep
+    /// their own guidance, and a keyless file with workspace members
+    /// (#1096) gets no file.
+    #[tokio::test]
+    async fn the_registry_write_respects_what_the_trust_write_respects() {
+        let candidates = [left_pad_registry_candidate()];
+
+        let mut rush = MemoryProject::new();
+        rush.insert_text("rush.json", r#"{ "rushVersion": "5.100.0" }"#);
+        rush.insert_text(RUSH_COMMON_LOCK_REL, LEFT_PAD_V9_LOCK);
+        let done = registry_rewrite(&rush, &candidates).await;
+        assert!(done.rewrite.files.contains_key(RUSH_COMMON_LOCK_REL));
+        assert_eq!(workspace_of(&done), None);
+        assert!(!done.pnpm_named_registries);
+        assert!(pnpm_trust_detail(&done).contains("pnpm_config_trust_lockfile=true rush install"));
+
+        let mut legacy = MemoryProject::new();
+        legacy.insert_text(
+            "pnpm-lock.yaml",
+            "lockfileVersion: 5.4\n\nspecifiers:\n  left-pad: 1.3.0\n\ndependencies:\n  left-pad: 1.3.0\n\n\
+             packages:\n\n  /left-pad/1.3.0:\n    resolution: {integrity: sha512-UPSTREAM==}\n    dev: false\n",
+        );
+        let done = registry_rewrite(&legacy, &candidates).await;
+        assert!(done.rewrite.files.contains_key("pnpm-lock.yaml"));
+        assert_eq!(workspace_of(&done), None);
+        assert!(!done.pnpm_named_registries);
+        assert!(pnpm_trust_detail(&done).contains("no trust step exists or is needed"));
+
+        let mut keyless = pnpm12_project(&LEFT_PAD_V9_LOCK.replace(
+            "\npackages:\n",
+            "\n  packages/a:\n    dependencies:\n      left-pad:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n",
+        ));
+        keyless.insert_text(PNPM_WORKSPACE_REL, "# no keys yet\n");
+        let done = registry_rewrite(&keyless, &candidates).await;
+        assert_eq!(workspace_of(&done), None);
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("has no keys and pnpm-lock.yaml lists workspace members"),
+            "{detail}"
+        );
+
+        // A keyless file with no members gets the scaffold with the map.
+        let mut comments = pnpm12_project(LEFT_PAD_V9_LOCK);
+        comments.insert_text(PNPM_WORKSPACE_REL, "# no keys yet\n");
+        let done = registry_rewrite(&comments, &candidates).await;
+        assert_eq!(
+            workspace_of(&done),
+            Some(
+                format!(
+                    "# no keys yet\npackages:\n  - '.'\nnamedRegistries:\n{}\n",
+                    left_pad_alias_line()
+                )
+                .as_str()
+            )
+        );
+        assert!(pnpm_trust_detail(&done).contains("with the root-only `packages: ['.']`"));
+
+        // In memory, a symlinked workspace file is refused, not written
+        // through.
+        let mut linked = pnpm12_project(LEFT_PAD_V9_LOCK);
+        linked.insert(PNPM_WORKSPACE_REL, MemoryEntry::Symlink);
+        let done = registry_rewrite(&linked, &candidates).await;
+        let refusal = guard(&ProjectView::Memory(&linked), &done, &candidates)
+            .expect("a symlinked workspace file is refused");
+        assert_eq!(refusal.code, SYMLINK_REFUSAL);
+    }
+
+    /// The grant → candidate step carries the registry address only when
+    /// pnpm could route the artifact URL to it; anything else reads as not
+    /// served, and the pin takes the trust path.
+    #[test]
+    fn a_registry_address_is_carried_only_when_it_routes_the_artifact() {
+        let url = left_pad_url();
+        let selected = vec![(
+            "pkg:npm/left-pad@1.3.0".to_string(),
+            FIXTURE_UUID.to_string(),
+        )];
+        let carried = |npm_registry_url: serde_json::Value| {
+            let mut refs: HashMap<String, PackageVendorResult> = HashMap::new();
+            let mut grant = serde_json::json!({
+                "status": "granted",
+                "url": url,
+                "purl": "pkg:npm/left-pad@1.3.0",
+                "artifacts": [{"kind": "tarball", "url": url,
+                               "integrity": {"sha512": "sha512-PATCHED=="}}],
+                "registryOverride": null
+            });
+            if !npm_registry_url.is_null() {
+                grant["npmRegistryUrl"] = npm_registry_url;
+            }
+            refs.insert(FIXTURE_UUID.into(), reference(grant));
+            candidates_of(&selected, &refs)[0]
+                .dep
+                .npm_registry_url
+                .clone()
+        };
+        assert_eq!(
+            carried(serde_json::json!(left_pad_registry_url())),
+            Some(left_pad_registry_url())
+        );
+        // A patch service that serves no registry omits the field.
+        assert_eq!(carried(serde_json::Value::Null), None);
+        for unusable in [
+            "",
+            "https://",
+            "https://patch.test",
+            "https://other.test/patch/npm/left-pad/1.3.0/",
+            // No trailing slash: pnpm would route `…-backup/x.tgz` there too.
+            "https://patch.test/patch/npm/left-pad/1.3.0",
+            "ftp://patch.test/patch/npm/left-pad/1.3.0/",
+            "https://patch.test/patch/npm/left-pad/1.3.0/ ",
+        ] {
+            assert_eq!(carried(serde_json::json!(unusable)), None, "{unusable:?}");
+        }
+        // The artifact URL itself is not a registry.
+        assert_eq!(carried(serde_json::json!(url)), None);
+        // Another ecosystem's grant carries none.
+        let mut pypi = left_pad_registry_candidate().dep;
+        pypi.ecosystem = "pypi".into();
+        assert_eq!(crate::patch::redirect::grant::npm_registry_url(&pypi), None);
+    }
+
     /// REGRESSION (#367), binary lock: a `bun.lockb`-only project's root
     /// manifest is read for its `patchedDependencies`, and a package the
     /// project patches itself with `bun patch` keeps its registry record,
@@ -5612,6 +6712,7 @@ snapshots:
                 artifact_url: format!(
                     "https://patch.test/patch/npm/is-number/7.0.0/{FIXTURE_TOKEN}/{FIXTURE_UUID}/is-number-7.0.0.tgz"
                 ),
+                npm_registry_url: None,
                 registry_override: None,
                 integrity: Integrity {
                     sha512: Some(format!("sha512-{}==", "A".repeat(86))),
@@ -5711,6 +6812,7 @@ snapshots:
                 token: "tok".into(),
                 patch_uuid: uuid.into(),
                 artifact_url: format!("https://patch.test/{name}-{version}.tgz"),
+                npm_registry_url: None,
                 registry_override: None,
                 integrity: Integrity {
                     sha512: Some(format!("sha512-{}==", "A".repeat(86))),
@@ -5895,6 +6997,7 @@ snapshots:
                 artifact_url: format!(
                     "https://patch.test/patch-registry/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/gems/rails-7.0.0.gem"
                 ),
+                npm_registry_url: None,
                 registry_override: Some(RegistryOverride {
                     kind: "rubygems-compact-index".into(),
                     index_url: format!(
@@ -5929,6 +7032,7 @@ snapshots:
                 artifact_url: format!(
                     "https://patch.socket.dev/patch/maven/com.socketfixture/victim/1.10.0/{token}/{GRADLE_UUID}/victim-1.10.0-socket.4d5e6f70.jar"
                 ),
+                npm_registry_url: None,
                 registry_override: Some(RegistryOverride {
                     kind: "maven2".into(),
                     index_url: format!(
@@ -6539,6 +7643,7 @@ snapshots:
                 artifact_url: format!(
                     "{base}/flat/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
                 ),
+                npm_registry_url: None,
                 registry_override: Some(RegistryOverride {
                     kind: "nuget-v3".into(),
                     index_url: format!("{base}/index.json"),
@@ -7282,6 +8387,51 @@ snapshots:
         );
         assert_eq!(again.confirmed.len(), 1);
         assert!(again.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+    }
+
+    /// Members' own locks are governing locks: with a registry served for
+    /// the pin, the root workspace file (the one pnpm reads for every
+    /// member) declares it, the user's lines intact, and no trust key goes
+    /// in. A re-run over pinned member locks heals a missing declaration.
+    #[tokio::test]
+    async fn member_locks_get_their_named_registry_in_the_root_workspace_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+        write_member_workspace(tmp.path(), ws);
+        write_rel(
+            tmp.path(),
+            "package.json",
+            r#"{"name":"root","private":true,"packageManager":"pnpm@12.22.0"}"#,
+        );
+        let registry = &MEMBER_URL[..=MEMBER_URL.rfind('/').unwrap()];
+        let mut candidates = is_number_candidates();
+        candidates[0].dep.npm_registry_url = Some(registry.to_string());
+        let view = ProjectView::Disk(tmp.path());
+        let done = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        for key in MEMBER_KEYS {
+            assert!(done.rewrite.files.contains_key(key), "{key}");
+        }
+        let declared = format!("{ws}namedRegistries:\n  socket-patch-{MEMBER_UUID}: {registry}\n");
+        assert_eq!(workspace_of(&done), Some(declared.as_str()));
+        assert!(done.pnpm_named_registries);
+        assert_eq!(
+            done.rewrite.edits.last().map(|e| e.kind.as_str()),
+            Some(REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND)
+        );
+
+        for key in MEMBER_KEYS {
+            write_rel(tmp.path(), key, &done.rewrite.files[key]);
+        }
+        let healed = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        assert_eq!(
+            healed.rewrite.files.keys().collect::<Vec<_>>(),
+            [PNPM_WORKSPACE_REL]
+        );
+        assert_eq!(workspace_of(&healed), Some(declared.as_str()));
+        write_rel(tmp.path(), PNPM_WORKSPACE_REL, &declared);
+        let again = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.files);
+        assert!(again.pnpm_rerun_only);
     }
 
     #[tokio::test]

@@ -189,6 +189,7 @@ mod tests {
                 token: "tok".into(),
                 patch_uuid: "uuid".into(),
                 artifact_url: String::new(),
+                npm_registry_url: None,
                 registry_override: None,
                 integrity: Integrity::default(),
             },

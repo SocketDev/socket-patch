@@ -25,7 +25,7 @@ discovery and tarball endpoints are local test servers.
 | 8.0.0, 8.15.9 | 16.20.2 | 6.0, per-peer package resolutions |
 | 9.0.0, 9.15.9 | 24.11.1 | 9.0, packages/snapshots split |
 | 10.0.0, 10.33.0, 10.34.5 | 24.11.1 | 9.0 |
-| 11.0.0, 11.27.0, 12.0.0, 12.4.2 | 24.11.1 | 9.0, hosted URLs require lockfile trust |
+| 11.0.0, 11.27.0, 12.0.0, 12.4.2 | 24.11.1 | 9.0, hosted URLs require lockfile trust or a named registry |
 
 This samples each released major from 1 through 12 and important major
 boundaries; it is not an exhaustive test of every historical patch release or
@@ -52,6 +52,29 @@ LF/CRLF, nested peer suffixes, quoted keys and URLs, unrelated versions,
 malformed mappings, and refusal across multiple locks. A CLI regression test
 ensures a hosted URL in one instance cannot confirm a partially patched package.
 
+## Named registries
+
+On pnpm 12 and newer, hosted mode can have pnpm verify the patched entries
+instead of trusting the whole lock. When the patch service serves a registry
+for every hosted pin and every pnpm pin of the project names pnpm 12 or newer,
+the scan declares those registries under `namedRegistries` in
+`pnpm-workspace.yaml` and writes no `trustLockfile` (see `docs/ecosystems.md`).
+The matrix above installs through `trustLockfile`: its fixture grants carry no
+registry address.
+
+`pnpm12_named_registry_frozen_install_verifies_the_hosted_entry` runs with the
+other real-pnpm legs of `e2e_redirect_pnpm_build`, on the pnpm 12 that
+Corepack provides. It covers the declaration over a lock a real pnpm 12 scan
+pinned, a frozen install from a clean checkout with the default registry
+unreachable (pnpm fetches the package's version document from the declared
+registry), a `pnpm add` of another package that keeps the hosted entry, the
+same install rejected without the declaration, and rollback.
+Offline tests cover the workspace-file edit
+(`formats::pnpm::named_registries`), the choice between the two settings
+(`hosted::engine`), and the scan and rollback end to end
+(`in_process_redirect_pnpm`). No test here installs a named registry on
+pnpm 11: the scan never declares one there.
+
 ## Reliable installation
 
 `scan --mode hosted` changes lockfiles; it does not replace already installed
@@ -75,9 +98,10 @@ member `node_modules` trees. Keep the redirected lockfile and any generated
 installation error. VEX uses installed-file verification by default; exporting
 VEX does not automatically upload it or change Socket alert counts.
 
-A generated `pnpm-workspace.yaml` (`packages: ['.']` plus `trustLockfile: true`
-or the vendored `overrides:`) makes a single-package project a root-only
-workspace. pnpm 9.0.0–10.4.x then refuse `pnpm add <pkg>` with
+A generated `pnpm-workspace.yaml` (`packages: ['.']` plus `trustLockfile: true`,
+the hosted `namedRegistries:` or the vendored `overrides:`) makes a
+single-package project a root-only workspace. pnpm 9.0.0–10.4.x then refuse
+`pnpm add <pkg>` with
 `ERR_PNPM_ADDING_TO_ROOT` unless given `-w`; 10.5.0 and later add normally. So
 neither mode creates the file when every pnpm pin of the project (the
 `node_modules/.modules.yaml` install record, package.json `packageManager`,

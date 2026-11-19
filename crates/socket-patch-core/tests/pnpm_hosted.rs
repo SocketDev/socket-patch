@@ -15,6 +15,7 @@ fn dep(name: &str) -> DepOverride {
         token: "token".into(),
         patch_uuid: "patch-id".into(),
         artifact_url: "https://patch.example/left-pad-1.3.0.tgz".into(),
+        npm_registry_url: None,
         registry_override: None,
         integrity: Integrity {
             sha512: Some("sha512-PATCHED==".into()),

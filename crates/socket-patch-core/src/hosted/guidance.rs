@@ -1,6 +1,7 @@
-//! The install-policy guidance of the hosted flow: the pnpm `trustLockfile`
-//! and npm `allow-remote` auto-config planners and every warning text they
-//! emit, shared verbatim by the disk and in-memory engines.
+//! The install-policy guidance of the hosted flow: the pnpm named-registry
+//! and `trustLockfile` and the npm `allow-remote` auto-config planners and
+//! every warning text they emit, shared verbatim by the disk and in-memory
+//! engines.
 
 /// Repo-relative path of the pnpm workspace manifest the trustLockfile
 /// auto-config edits (the same file the vendor backend's override surface
@@ -14,6 +15,16 @@ pub const PNPM_WORKSPACE_REL: &str = "pnpm-workspace.yaml";
 /// removes exactly that line). Additive ledger vocabulary: older ledgers
 /// without it load unchanged (kind is an opaque string to the loader).
 pub const REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND: &str = "redirect_pnpm_workspace_trust";
+
+/// `FileEdit.kind` recorded when the hosted flow declares the patch server
+/// as a pnpm named registry in pnpm-workspace.yaml, one edit per alias
+/// (`key`): `action: "created"` — the workspace file itself was created
+/// holding the entry; `"added"` — the entry was spliced into an existing
+/// file; `"rewritten"` — an alias of ours was repointed (`original` is the
+/// address it had); `"removed"` — an alias of ours no governing lock pins
+/// any more was taken out. Additive ledger vocabulary, like the kind above.
+pub const REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND: &str =
+    "redirect_pnpm_workspace_named_registry";
 
 /// The honest-tradeoff + don't-rebuild tail shared by every trustLockfile
 /// warning variant. The tradeoff sentence is a security disclosure, not
@@ -326,6 +337,300 @@ pub fn pnpm_trust_not_needed_detail(server: &str, pins: &str, dry_run: bool) -> 
          `pnpm install --trust-lockfile`. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
         pnpm_trust_policy_preamble(server),
     )
+}
+
+/// The don't-rebuild tail of every named-registry warning variant. Unlike
+/// [`PNPM_TRUST_TRADEOFF_AND_CAUTION`] it discloses no tradeoff: a named
+/// registry leaves pnpm's lockfile verification on for every entry.
+pub const PNPM_REGISTRY_CAUTION: &str =
+    "Do NOT follow pnpm's advice to rebuild the lockfile (`pnpm clean \
+     --lockfile`): that silently discards the hosted patches and reinstalls \
+     the vulnerable upstream artifact. pnpm <=10 does not verify lockfile \
+     entries and installs work unchanged";
+
+/// The policy preamble shared by every named-registry warning variant:
+/// what was repointed, and what pnpm >=11 checks.
+pub fn pnpm_registry_policy_preamble(server: &str) -> String {
+    format!(
+        "pnpm-lock.yaml was repointed at {server}; pnpm >=11 checks every \
+         lockfile entry that records a tarball URL against a registry and \
+         rejects the lock when none vouches for it (pnpm 11: \
+         ERR_PNPM_TARBALL_URL_MISMATCH, pnpm 12: \
+         ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION)"
+    )
+}
+
+/// What a named-registry run found of `trustLockfile: true` in the
+/// workspace file, which the hosted patches no longer need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustLeftover {
+    /// Not set to true.
+    None,
+    /// An earlier hosted run wrote it ([`strip_cli_trust`]): taken out.
+    Removed,
+    /// Set, by the user or by a run the file's bytes cannot prove: left.
+    Left,
+}
+
+/// The sentence a named-registry warning adds about `trustLockfile`.
+fn trust_leftover_note(leftover: TrustLeftover, dry_run: bool) -> String {
+    match leftover {
+        TrustLeftover::None => String::new(),
+        TrustLeftover::Removed => format!(
+            " The `trustLockfile: true` an earlier socket-patch run wrote there {} \
+             removed: the hosted patches no longer need it, and pnpm verifies the \
+             whole lockfile again.",
+            if dry_run { "would be" } else { "was" }
+        ),
+        TrustLeftover::Left => format!(
+            " {PNPM_WORKSPACE_REL} also sets `trustLockfile: true`, which the hosted \
+             patches no longer need; it was left untouched (socket-patch cannot tell \
+             whether it wrote that line), and while it stays pnpm skips lockfile \
+             verification for ALL entries — remove it if nothing else needs it."
+        ),
+    }
+}
+
+/// How a named-registry run changed pnpm-workspace.yaml.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryWrite {
+    /// A new file: the root-only `packages` scaffold and the map.
+    Created,
+    /// An existing file with no keys: the scaffold went in with the map.
+    Scaffolded,
+    /// An existing file: the map, or entries of it, changed.
+    Merged,
+}
+
+/// The auto-config variant: the named registries were (or, on `--dry-run`,
+/// would be) declared in pnpm-workspace.yaml, so installs need no flags
+/// and pnpm's lockfile verification stays on.
+pub fn pnpm_registry_configured_detail(
+    server: &str,
+    write: RegistryWrite,
+    leftover: TrustLeftover,
+    dry_run: bool,
+) -> String {
+    let declares = if dry_run {
+        "would declare"
+    } else {
+        "now declares"
+    };
+    let file = match write {
+        RegistryWrite::Created => format!("a new {PNPM_WORKSPACE_REL}"),
+        RegistryWrite::Scaffolded | RegistryWrite::Merged => {
+            format!("the existing {PNPM_WORKSPACE_REL}")
+        }
+    };
+    let scaffold = if write == RegistryWrite::Scaffolded {
+        " (with the root-only `packages: ['.']` that pnpm 8–10.4 require once the \
+         file holds a key)"
+    } else {
+        ""
+    };
+    format!(
+        "{}, so {file} {declares} the patch server as a named registry for each \
+         patched package (`namedRegistries`, one `socket-patch-<patch uuid>` entry \
+         each){scaffold} and pnpm >=11 verifies those entries against it — commit \
+         it alongside the lock; installs need no extra flags, and lockfile \
+         verification stays on.{} {PNPM_REGISTRY_CAUTION}",
+        pnpm_registry_policy_preamble(server),
+        trust_leftover_note(leftover, dry_run),
+    )
+}
+
+/// The workspace file already declares every named registry the hosted
+/// pins need.
+pub fn pnpm_registry_already_detail(server: &str, leftover: TrustLeftover) -> String {
+    format!(
+        "{}, and {PNPM_WORKSPACE_REL} already declares the patch server as a named \
+         registry for each patched package (`namedRegistries`), which pnpm >=11 \
+         verifies those entries against — keep it committed alongside the lock; \
+         installs need no extra flags.{} {PNPM_REGISTRY_CAUTION}",
+        pnpm_registry_policy_preamble(server),
+        trust_leftover_note(leftover, false),
+    )
+}
+
+/// The lines a user adds to pnpm-workspace.yaml by hand, as one sentence
+/// fragment. `lines` are the map's lines with each address's grant token
+/// redacted: the warning lands in CI logs, and the token is in the lock.
+fn registry_lines_to_add(lines: &[String]) -> String {
+    let quoted: Vec<String> = lines.iter().map(|line| format!("`{line}`")).collect();
+    format!(
+        "add these lines to {PNPM_WORKSPACE_REL}, each address being the package's \
+         `tarball` URL in pnpm-lock.yaml up to and including its last `/` (the \
+         grant token is redacted here): {}",
+        quoted.join(", ")
+    )
+}
+
+/// The opt-out (`--no-trust-lockfile-config`) variant: nothing written,
+/// the declarations spelled out.
+pub fn pnpm_registry_manual_guidance(server: &str, lines: &[String]) -> String {
+    format!(
+        "{}. Nothing was written to {PNPM_WORKSPACE_REL} \
+         (--no-trust-lockfile-config): declare the patch server there as a named \
+         registry for each patched package so pnpm >=11 verifies those entries \
+         against it, and commit the file alongside the lock — {}. Installing with \
+         `pnpm install --trust-lockfile` works too, but skips the verification for \
+         the whole lockfile. {PNPM_REGISTRY_CAUTION}",
+        pnpm_registry_policy_preamble(server),
+        registry_lines_to_add(lines),
+    )
+}
+
+/// The unspliceable-workspace fallback of the named-registry edit:
+/// pnpm-workspace.yaml is a shape a line splice would corrupt (a
+/// flow-style root or `namedRegistries` map, several documents), so
+/// nothing is written and the warning names the reason and the lines.
+pub fn pnpm_registry_workspace_unsupported_detail(
+    server: &str,
+    why: &str,
+    lines: &[String],
+) -> String {
+    format!(
+        "{}. {PNPM_WORKSPACE_REL} {why}, which the named-registry edit cannot \
+         extend without corrupting it; it was left untouched. To let pnpm >=11 \
+         verify the patched entries, {}. Commit the file alongside the lock. \
+         {PNPM_REGISTRY_CAUTION}",
+        pnpm_registry_policy_preamble(server),
+        registry_lines_to_add(lines),
+    )
+}
+
+/// The unreadable-workspace fallback of the named-registry edit (see
+/// [`pnpm_trust_workspace_unreadable_detail`]).
+pub fn pnpm_registry_workspace_unreadable_detail(
+    server: &str,
+    err: &std::io::Error,
+    lines: &[String],
+) -> String {
+    format!(
+        "{}. {PNPM_WORKSPACE_REL} exists but could not be read ({err}); it was \
+         left untouched — editing it would risk overwriting it. Fix the file and \
+         re-run `socket-patch scan --mode hosted`, or {}. Commit the file \
+         alongside the lock. {PNPM_REGISTRY_CAUTION}",
+        pnpm_registry_policy_preamble(server),
+        registry_lines_to_add(lines),
+    )
+}
+
+/// The keyless-workspace variant of the named-registry edit (see
+/// [`pnpm_trust_keyless_members_detail`]): nothing is written. The project
+/// pins pnpm 12 or newer here, so the lock is a leftover of an older pnpm.
+pub fn pnpm_registry_keyless_members_detail(server: &str, dry_run: bool) -> String {
+    let was = if dry_run { "would be" } else { "was" };
+    format!(
+        "{}. {PNPM_WORKSPACE_REL} has no keys and pnpm-lock.yaml lists workspace \
+         members, which only pnpm <=10.4 installs from such a file: pnpm >=10.5 \
+         reads it as the root package alone, and the root-only `packages` list the \
+         edit needs would drop those members, so nothing {was} written. List the \
+         members under `packages:` in {PNPM_WORKSPACE_REL} and re-run \
+         `socket-patch scan --mode hosted`. {PNPM_REGISTRY_CAUTION}",
+        pnpm_registry_policy_preamble(server),
+    )
+}
+
+/// The named registries that cover every Socket-hosted tarball the
+/// governing pnpm locks (`lock_texts`, their final lockfileVersion >= 9
+/// texts) record: alias → address, one per pin this run's grants serve a
+/// registry for. `None` when a hosted tarball has no registry to be
+/// verified against, or the locks record none: the run then keeps the
+/// `trustLockfile` path, since a lock half covered would fail to install.
+///
+/// A tarball is covered by a grant of this run whose registry address it
+/// starts with ([`npm_registry_url`](crate::patch::redirect::grant::npm_registry_url)),
+/// or by a registry the workspace file already declares (`declared`)
+/// under one of hosted mode's aliases — one an earlier run wrote for a
+/// pin this run was not asked about. A registry under any other alias is
+/// the user's and vouches for nothing here. A tarball is hosted when this
+/// run pinned it or its URL has the patch server's path shape on any
+/// origin; every other tarball is the user's own and is verified against
+/// the user's registries as before.
+pub fn pnpm_named_registries(
+    lock_texts: &[&String],
+    overrides: &[crate::patch::redirect::DepOverride],
+    declared: &[(String, String)],
+) -> Option<std::collections::BTreeMap<String, String>> {
+    use crate::formats::pnpm::{named_registries, PnpmLock};
+    use crate::patch::redirect::grant::npm_registry_url;
+
+    let served: Vec<(&str, &str)> = overrides
+        .iter()
+        .filter_map(|o| Some((o.patch_uuid.as_str(), npm_registry_url(o)?)))
+        .collect();
+    // pnpm routes a tarball to the named registry whose address, read with
+    // a trailing `/`, it starts with.
+    let routed_by_declared = |tarball: &str| {
+        declared.iter().any(|(alias, address)| {
+            if named_registries::alias_uuid(alias).is_none() {
+                return false;
+            }
+            let base = address.trim_end_matches('/');
+            let has_host = base
+                .strip_prefix("https://")
+                .or_else(|| base.strip_prefix("http://"))
+                .is_some_and(|host| !host.is_empty());
+            has_host
+                && tarball
+                    .strip_prefix(base)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    };
+    let mut wanted = std::collections::BTreeMap::new();
+    let mut hosted = false;
+    for text in lock_texts {
+        for wired in PnpmLock::parse(text).wired_refs() {
+            let tarball = wired.tarball;
+            if !(tarball.starts_with("https://") || tarball.starts_with("http://")) {
+                continue;
+            }
+            if let Some((uuid, address)) = served
+                .iter()
+                .find(|(_, address)| tarball.starts_with(*address))
+            {
+                wanted.insert(named_registries::alias(uuid), (*address).to_string());
+                hosted = true;
+                continue;
+            }
+            let ours = overrides
+                .iter()
+                .any(|o| o.ecosystem == "npm" && o.artifact_url == tarball)
+                || crate::origin::hosted_shape_uuid(tarball).is_some();
+            if !ours {
+                continue;
+            }
+            if !routed_by_declared(tarball) {
+                return None;
+            }
+            hosted = true;
+        }
+    }
+    hosted.then_some(wanted)
+}
+
+/// `text` (a pnpm-workspace.yaml) without the `trustLockfile: true` an
+/// earlier hosted run wrote, when the file's bytes prove the run wrote it:
+/// the file is exactly what the trust auto-config creates (its `packages`
+/// scaffold stays for the keys that follow), or a file with no keys plus
+/// the lines the auto-config splices into one. These are the two shapes
+/// the upstream restore takes back by; v5 keeps no record of who wrote a
+/// line, so in any other file a `trustLockfile: true` may be the user's
+/// own and this is `None`.
+pub fn strip_cli_trust(text: &str) -> Option<String> {
+    use crate::formats::pnpm::workspace::{strip_keyless_splice, PACKAGES_SCAFFOLD};
+    let created = format!("{}\n", TRUST_SCAFFOLD_LINES.join("\n"));
+    if crate::utils::line_endings::eol_eq(text.as_bytes(), created.as_bytes()) {
+        let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+        return Some(
+            PACKAGES_SCAFFOLD
+                .iter()
+                .map(|line| format!("{line}{eol}"))
+                .collect(),
+        );
+    }
+    strip_keyless_splice(text, &TRUST_SCAFFOLD_LINES)
 }
 
 // The pnpm lock-version sniffs live with the format's model.
@@ -1112,9 +1417,258 @@ mod tests {
             token: "tok".to_string(),
             patch_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
             artifact_url: artifact_url.to_string(),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Default::default(),
         }
+    }
+
+    const REGISTRY_UUID: &str = "11111111-1111-4111-8111-111111111111";
+    const OTHER_UUID: &str = "22222222-2222-4222-8222-222222222222";
+
+    /// A v9 lock recording `tarballs` (name, URL) as flow resolutions.
+    fn tarball_lock(tarballs: &[(&str, &str)]) -> String {
+        let mut lock = "lockfileVersion: '9.0'\n\nimporters:\n  .: {}\n\npackages:\n".to_string();
+        for (name, tarball) in tarballs {
+            lock.push_str(&format!(
+                "  {name}@1.0.0:\n    resolution: {{integrity: sha512-X==, tarball: {tarball}}}\n\n"
+            ));
+        }
+        lock.push_str("  plain@1.0.0:\n    resolution: {integrity: sha512-Y==}\n");
+        lock
+    }
+
+    /// A grant served under its own registry: the tarball URL's directory.
+    fn registry_override(artifact_url: &str) -> DepOverride {
+        let dir = &artifact_url[..=artifact_url.rfind('/').unwrap()];
+        DepOverride {
+            npm_registry_url: Some(dir.to_string()),
+            ..npm_override(artifact_url)
+        }
+    }
+
+    /// Registry mode needs every hosted tarball of the governing locks
+    /// covered: by a grant of this run that serves a registry, or by one
+    /// the workspace file already declares. One hosted tarball without a
+    /// registry, or no hosted tarball at all, leaves the run on trust; the
+    /// user's own tarballs never count.
+    #[test]
+    fn named_registries_cover_every_hosted_tarball_or_none() {
+        let ours = format!(
+            "https://patch.test/patch/npm/in-proc-heal/1.0.0/tok/{REGISTRY_UUID}/in-proc-heal-1.0.0.tgz"
+        );
+        let ours_registry =
+            format!("https://patch.test/patch/npm/in-proc-heal/1.0.0/tok/{REGISTRY_UUID}/");
+        let earlier = format!(
+            "https://patch.test/patch/npm/earlier/1.0.0/tok/{OTHER_UUID}/earlier-1.0.0.tgz"
+        );
+        let earlier_registry =
+            format!("https://patch.test/patch/npm/earlier/1.0.0/tok/{OTHER_UUID}/");
+        let (ours, earlier) = (ours.as_str(), earlier.as_str());
+        let users = "https://npm.pkg.github.com/download/@corp/lib/1.0.0/abcdef";
+        let alias = format!("socket-patch-{REGISTRY_UUID}");
+        let wanted = std::collections::BTreeMap::from([(alias.clone(), ours_registry.clone())]);
+        let cover = |tarballs: &[(&str, &str)],
+                     overrides: &[DepOverride],
+                     declared: &[(String, String)]| {
+            let lock = tarball_lock(tarballs);
+            pnpm_named_registries(&[&lock], overrides, declared)
+        };
+        let served = [registry_override(ours)];
+        let unserved = [npm_override(ours)];
+
+        // This run's pin, served a registry; the user's own tarball beside
+        // it is not ours to cover.
+        assert_eq!(
+            cover(&[("in-proc-heal", ours)], &served, &[]),
+            Some(wanted.clone())
+        );
+        assert_eq!(
+            cover(&[("in-proc-heal", ours), ("lib", users)], &served, &[]),
+            Some(wanted.clone())
+        );
+        // The patch service serves no registry for the pin.
+        assert_eq!(cover(&[("in-proc-heal", ours)], &unserved, &[]), None);
+        // A pin an earlier run left, which this run was not asked about:
+        // covered only by a registry the workspace file already declares
+        // (with or without its trailing slash, as pnpm reads it).
+        let both = [("in-proc-heal", ours), ("earlier", earlier)];
+        assert_eq!(cover(&both, &served, &[]), None);
+        for address in [
+            earlier_registry.clone(),
+            earlier_registry.trim_end_matches('/').to_string(),
+        ] {
+            let declared = [(format!("socket-patch-{OTHER_UUID}"), address)];
+            assert_eq!(cover(&both, &served, &declared), Some(wanted.clone()));
+        }
+        // A registry declared for another address covers nothing, nor does
+        // one under an alias that is not hosted mode's.
+        for (alias, address) in [
+            (
+                format!("socket-patch-{OTHER_UUID}"),
+                format!("https://patch.test/patch/npm/earlier/1.0.0/tok/{REGISTRY_UUID}/"),
+            ),
+            (format!("socket-patch-{OTHER_UUID}"), "https://".to_string()),
+            (format!("socket-patch-{OTHER_UUID}"), String::new()),
+            ("corp".to_string(), earlier_registry.clone()),
+            ("corp".to_string(), "https://patch.test/".to_string()),
+        ] {
+            assert_eq!(cover(&both, &served, &[(alias, address)]), None);
+        }
+        // A pin on a custom server with no `/patch/` level is hosted because
+        // this run pinned it.
+        let custom = format!("https://api.corp.example/serve/tok/{REGISTRY_UUID}/x-1.0.0.tgz");
+        let custom = custom.as_str();
+        assert_eq!(cover(&[("x", custom)], &[npm_override(custom)], &[]), None);
+        assert_eq!(
+            cover(&[("x", custom)], &[registry_override(custom)], &[]),
+            Some(std::collections::BTreeMap::from([(
+                alias.clone(),
+                format!("https://api.corp.example/serve/tok/{REGISTRY_UUID}/")
+            )]))
+        );
+        // Every hosted tarball covered by the file alone: nothing to add.
+        let declared = [(alias, ours_registry)];
+        assert_eq!(
+            cover(&[("in-proc-heal", ours)], &unserved, &declared),
+            Some(std::collections::BTreeMap::new())
+        );
+        // No hosted tarball in the governing locks: not registry mode.
+        assert_eq!(cover(&[("lib", users)], &served, &[]), None);
+        assert_eq!(cover(&[], &served, &[]), None);
+        assert_eq!(pnpm_named_registries(&[], &served, &[]), None);
+    }
+
+    /// The trust key is taken out only of a file whose bytes prove an
+    /// earlier run wrote it: the file that run creates (either line
+    /// ending; the `packages` scaffold stays), or a file with no keys plus
+    /// the lines it splices into one.
+    #[test]
+    fn strip_cli_trust_takes_only_what_an_earlier_run_provably_wrote() {
+        assert_eq!(
+            strip_cli_trust("packages:\n  - '.'\ntrustLockfile: true\n").as_deref(),
+            Some("packages:\n  - '.'\n")
+        );
+        assert_eq!(
+            strip_cli_trust("packages:\r\n  - '.'\r\ntrustLockfile: true\r\n").as_deref(),
+            Some("packages:\r\n  - '.'\r\n")
+        );
+        assert_eq!(
+            strip_cli_trust("# team\npackages:\n  - '.'\ntrustLockfile: true\n").as_deref(),
+            Some("# team\n")
+        );
+        for theirs in [
+            "packages:\n  - 'apps/*'\ntrustLockfile: true\n",
+            "trustLockfile: true\npackages:\n  - '.'\n",
+            "packages:\n  - '.'\ntrustLockfile: true\ncatalog:\n  a: 1\n",
+            "packages:\n  - '.'\ntrustLockfile: false\n",
+            "packages:\n  - '.'\n",
+            "",
+        ] {
+            assert_eq!(strip_cli_trust(theirs), None, "{theirs:?}");
+        }
+    }
+
+    /// The named-registry warning variants carry what a reader acts on, and
+    /// none recommends or discloses `trustLockfile` unless the file sets it.
+    #[test]
+    fn pnpm_registry_warning_variants_carry_the_load_bearing_sentences() {
+        let server = "the hosted patch server (patch.test)";
+        let lines = vec![
+            "namedRegistries:".to_string(),
+            "  socket-patch-u: https://patch.test/patch/npm/x/1.0.0/<redacted>/u/".to_string(),
+        ];
+        let variants = [
+            pnpm_registry_configured_detail(
+                server,
+                RegistryWrite::Created,
+                TrustLeftover::None,
+                false,
+            ),
+            pnpm_registry_configured_detail(
+                server,
+                RegistryWrite::Merged,
+                TrustLeftover::None,
+                true,
+            ),
+            pnpm_registry_configured_detail(
+                server,
+                RegistryWrite::Scaffolded,
+                TrustLeftover::None,
+                false,
+            ),
+            pnpm_registry_already_detail(server, TrustLeftover::None),
+            pnpm_registry_manual_guidance(server, &lines),
+            pnpm_registry_workspace_unsupported_detail(
+                server,
+                "is a flow-style YAML document",
+                &lines,
+            ),
+            pnpm_registry_workspace_unreadable_detail(
+                server,
+                &std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+                &lines,
+            ),
+            pnpm_registry_keyless_members_detail(server, false),
+        ];
+        for detail in &variants {
+            for said in [
+                "repointed at the hosted patch server (patch.test)",
+                "ERR_PNPM_TARBALL_URL_MISMATCH",
+                "ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION",
+                "pnpm clean --lockfile",
+                "pnpm <=10",
+            ] {
+                assert!(detail.contains(said), "{said}: {detail}");
+            }
+            for unsaid in ["trustLockfile", ".npmrc"] {
+                assert!(!detail.contains(unsaid), "{unsaid}: {detail}");
+            }
+        }
+        // Only the opt-out names the per-run flag, as the way around it.
+        for (i, detail) in variants.iter().enumerate() {
+            assert_eq!(
+                detail.contains("pnpm install --trust-lockfile"),
+                i == 4,
+                "{detail}"
+            );
+        }
+        // A project pinned to pnpm 12 has no pnpm 9.0–10.4 note to read.
+        for detail in &variants {
+            assert!(!detail.contains("pnpm add -w"), "{detail}");
+        }
+        assert!(variants[0].contains("a new pnpm-workspace.yaml now declares"));
+        assert!(variants[1].contains("the existing pnpm-workspace.yaml would declare"));
+        assert!(variants[2].contains("with the root-only `packages: ['.']`"));
+        // The variants that write nothing spell the lines out.
+        for detail in &variants[4..7] {
+            assert!(
+                detail.contains(
+                    "`namedRegistries:`, `  socket-patch-u: https://patch.test/patch/npm/x/1.0.0/<redacted>/u/`"
+                ),
+                "{detail}"
+            );
+        }
+        // What a run says of a `trustLockfile: true` the registries replace.
+        let removed = pnpm_registry_configured_detail(
+            server,
+            RegistryWrite::Merged,
+            TrustLeftover::Removed,
+            false,
+        );
+        assert!(removed.contains("was removed"), "{removed}");
+        let would = pnpm_registry_configured_detail(
+            server,
+            RegistryWrite::Merged,
+            TrustLeftover::Removed,
+            true,
+        );
+        assert!(would.contains("would be removed"), "{would}");
+        let left = pnpm_registry_already_detail(server, TrustLeftover::Left);
+        assert!(
+            left.contains("no longer need") && left.contains("ALL entries"),
+            "{left}"
+        );
     }
 
     /// Heal-on-rerun probe: a root lock ALREADY

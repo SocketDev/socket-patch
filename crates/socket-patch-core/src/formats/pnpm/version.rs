@@ -167,6 +167,27 @@ pub fn root_only_workspace_breaks_add(
     })
 }
 
+/// Whether every pnpm pin the project carries (at least one) names pnpm 12
+/// or newer: the releases hosted mode declares its named registries for.
+///
+/// pnpm verifies a lock entry against a named registry from 11.10 on, but
+/// what `pnpm add` then does to a hosted entry differs by release: 11.10
+/// through 11.25 re-resolve it from the default registry (dropping the
+/// patch) under either setting, 11.28 keeps it under `trustLockfile` but
+/// drops it under a named registry, and 12.0 through 12.22 keep it under
+/// both. So a named registry costs nothing only from pnpm 12 on. The
+/// evidence is read as conservatively as
+/// [`root_only_workspace_breaks_add`] reads it: a pin that may be an older
+/// pnpm, one that does not parse, or no pin at all leaves the project on
+/// `trustLockfile`.
+pub fn pins_pnpm_12_or_newer(package_json: Option<&str>, modules_yaml: Option<&str>) -> bool {
+    let pins = pnpm_pins(package_json, modules_yaml);
+    !pins.is_empty()
+        && pins
+            .iter()
+            .all(|(_, spec)| version_span(spec).is_some_and(|(lo, _)| lo >= (12, 0)))
+}
+
 /// Whether the pnpm the project runs matches build decisions against a
 /// vendored `file:` id (see [`matches_file_ids`]): `Some(true)` when every
 /// pin that parses admits only such a release, `Some(false)` when every one
@@ -352,6 +373,56 @@ mod tests {
         // engines.pnpm.
         assert!(breaks(Some(r#"{"engines":{"pnpm":"~9.15.0"}}"#), None));
         assert!(!breaks(Some(r#"{"engines":{"pnpm":">=9"}}"#), None));
+    }
+
+    /// Named registries are declared only on proof of pnpm 12 or newer:
+    /// every pin present (at least one) admits nothing older.
+    #[test]
+    fn pnpm_12_is_proven_only_by_every_pin() {
+        let proven = pins_pnpm_12_or_newer;
+        for pkg in [
+            r#"{"packageManager":"pnpm@12.0.0"}"#,
+            r#"{"packageManager":"pnpm@12.22.0+sha512.abc=="}"#,
+            r#"{"packageManager":"pnpm@13.0.1"}"#,
+            r#"{"engines":{"pnpm":"^12.4.0"}}"#,
+            r#"{"engines":{"pnpm":"12"}}"#,
+            r#"{"devEngines":{"packageManager":{"name":"pnpm","version":"~12.4.2"}}}"#,
+        ] {
+            assert!(proven(Some(pkg), None), "{pkg}");
+        }
+        assert!(proven(None, Some("packageManager: pnpm@12.22.0\n")));
+        assert!(proven(
+            Some(r#"{"packageManager":"pnpm@12.4.2"}"#),
+            Some(r#"{"packageManager":"pnpm@12.22.0"}"#)
+        ));
+        for (pkg, modules) in [
+            // No pin: nothing says which pnpm installs the project.
+            (None, None),
+            (Some(r#"{"name":"app"}"#), None),
+            (Some(r#"{"packageManager":"yarn@4.5.0"}"#), None),
+            // An older pnpm, or a spec that admits one.
+            (Some(r#"{"packageManager":"pnpm@11.28.13"}"#), None),
+            (Some(r#"{"packageManager":"pnpm@10.34.6"}"#), None),
+            (Some(r#"{"engines":{"pnpm":">=12"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":">=11"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":"11 || 12"}}"#), None),
+            (
+                Some(r#"{"devEngines":{"packageManager":{"name":"pnpm"}}}"#),
+                None,
+            ),
+            // Pins that disagree: the install record lags the manifest, or
+            // the manifest's own pins differ.
+            (
+                Some(r#"{"packageManager":"pnpm@12.4.2"}"#),
+                Some("packageManager: pnpm@11.28.13\n"),
+            ),
+            (
+                Some(r#"{"packageManager":"pnpm@12.4.2","engines":{"pnpm":"^11.0.0"}}"#),
+                None,
+            ),
+        ] {
+            assert!(!proven(pkg, modules), "{pkg:?} {modules:?}");
+        }
     }
 
     #[test]

@@ -1621,6 +1621,7 @@ mod tests {
             token: "tok".into(),
             patch_uuid: UUID.into(),
             artifact_url: "https://patch.test/rails-7.0.0.gem".into(),
+            npm_registry_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "rubygems-compact-index".into(),
                 index_url: IDX.into(),
@@ -1912,6 +1913,7 @@ mod tests {
                 token: "tok".into(),
                 patch_uuid: UUID.into(),
                 artifact_url: "https://patch.test/rails-7.0.0.gem".into(),
+                npm_registry_url: None,
                 registry_override: Some(crate::patch::redirect::RegistryOverride {
                     kind: "rubygems-compact-index".into(),
                     index_url: IDX.into(),
@@ -1981,6 +1983,7 @@ mod tests {
                 token: "tok".into(),
                 patch_uuid: UUID.into(),
                 artifact_url: "https://patch.test/rails-7.0.0.gem".into(),
+                npm_registry_url: None,
                 registry_override: Some(crate::patch::redirect::RegistryOverride {
                     kind: "rubygems-compact-index".into(),
                     index_url: IDX.into(),
@@ -2441,6 +2444,7 @@ mod tests {
                 token: "tok".into(),
                 patch_uuid: UUID.into(),
                 artifact_url: "https://patch.test/rails-7.0.0.gem".into(),
+                npm_registry_url: None,
                 registry_override: Some(crate::patch::redirect::RegistryOverride {
                     kind: "rubygems-compact-index".into(),
                     index_url: IDX.into(),

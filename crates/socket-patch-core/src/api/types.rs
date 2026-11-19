@@ -179,6 +179,13 @@ pub struct PackageVendorResult {
     /// `DepOverride`.
     #[serde(default)]
     pub registry_override: Option<RegistryOverride>,
+    /// npm only: the address of the one-package registry the patch service
+    /// serves this patch under (the tarball URL's directory, with its
+    /// trailing slash). Hosted-mode `scan` declares it as a pnpm named
+    /// registry. Absent from a patch service that does not serve it, null
+    /// for every other ecosystem.
+    #[serde(default)]
+    pub npm_registry_url: Option<String>,
 }
 
 /// One served artifact: the native tarball (`kind: "tarball"`), or a

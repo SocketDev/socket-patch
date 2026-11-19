@@ -30,6 +30,7 @@ fn dep(wheel: &str) -> DepOverride {
         artifact_url: format!(
             "https://patch.socket.dev/patch/pypi/urllib3/1.26.18/11111111-1111-4111-8111-111111111111/{UUID}/{wheel}"
         ),
+        npm_registry_url: None,
         registry_override: None,
         integrity: Integrity {
             sha256: Some(HEX.into()),

@@ -227,8 +227,44 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   which pnpm applies through `overrides` without a lock; `vex` attests such a
   vendored pin only while the override map that pnpm reads still routes the
   package to its artifact, and omits it otherwise (`vex_lock_not_read`).
-  For 9.0 root or member locks, the CLI configures `trustLockfile: true` in
-  the root `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
+  pnpm >=11 checks every lock entry that records a tarball URL against a
+  registry, so a hosted pin needs a setting in the root `pnpm-workspace.yaml`.
+  For 9.0 root or member locks the CLI writes one of two, unless opted out
+  with `--no-trust-lockfile-config`.
+  **Named registries.** The patch service serves each npm patch under its own
+  one-package registry, and pnpm checks a lock entry against the named
+  registry whose address its tarball URL starts with. When there is such a
+  registry for every hosted pin of those locks, and every pnpm pin of the
+  project (the same sources as the pnpm 9.0–10.4 rule below, at least one
+  present) names pnpm 12 or newer, the CLI declares one per patched package:
+
+  ```yaml
+  namedRegistries:
+    socket-patch-<patch uuid>: https://patch.socket.dev/patch/npm/<name>/<version>/<grant token>/<patch uuid>/
+  ```
+
+  pnpm then verifies the patched entries against that address and keeps
+  verifying every other entry, so nothing is trusted blindly. Commit the file
+  with the lock. Your own `namedRegistries` entries are kept byte for byte;
+  an alias of the CLI's is repointed when its address changes and removed
+  when no lock names its patch any more, and `rollback` / `remove` take the
+  aliases back out. A `trustLockfile: true` that an earlier run wrote is
+  removed in the same run when the file is still exactly what that run wrote
+  (the file it creates, or a comments-only file plus the lines it adds); any
+  other one is left alone, and the warning says the hosted patches no longer
+  need it. A `trustLockfile: false` or a `pnpm_config_trust_lockfile`
+  variable does not matter here. A file the edit cannot extend safely (a
+  one-line `namedRegistries` map, several YAML documents) is left untouched
+  and the warning lists the lines to add, as it does under
+  `--no-trust-lockfile-config`. The address is only ever declared as a named
+  registry: it answers for that one package and nothing else. pnpm 11 is left
+  on the setting below because it re-resolves such an entry from the default
+  registry on `pnpm add`, which drops the patch, where pnpm 11.28 keeps an
+  entry under `trustLockfile`.
+  **`trustLockfile: true`.** In every other case (a pin the patch service
+  serves no registry for, a pin an earlier run left without one, pnpm 11, a
+  project with no pnpm pin) the CLI configures `trustLockfile: true` in
+  the root `pnpm-workspace.yaml` unless
   explicitly disabled by the project or, for pnpm >=11, by a
   `pnpm_config_trust_lockfile=false` environment variable the scan runs with
   (pnpm reads it ahead of the file, so nothing is written and the warning names
@@ -236,9 +272,8 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   `true` or `false` (pnpm 12 trims surrounding spaces first, pnpm 11 does
   not); any other value (empty, `null`, `undefined`, `0`) is ignored for the
   file, so the CLI ignores it too and writes the key.
-  pnpm >=11 needs this for hosted URLs.
   This skips registry re-verification for the whole lock; tarball integrity
-  remains enforced. pnpm <=10 does not need the setting. An existing
+  remains enforced. pnpm <=10 needs neither setting. For both, an existing
   `pnpm-workspace.yaml` with no keys (empty or only comments) gets the
   root-only `packages:` list with the key, because pnpm 8–10.4 refuse a
   workspace file that has keys but no `packages`. When the lock lists
@@ -765,8 +800,9 @@ On pnpm >=11 a repointed lock does not install under Rush's default flow: `rush 
 either fails (`ERR_PNPM_TARBALL_URL_MISMATCH` /
 `ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION`) or, on pnpm 11, exits 0 after silently
 re-resolving the patched entries to the upstream registry. Rush runs pnpm in `common/temp`
-with a `pnpm-workspace.yaml` it generates, so the `trustLockfile` auto-config is not written
-in a Rush repo; the `redirect_pnpm_trust_lockfile` warning gives the Rush remedy instead
+with a `pnpm-workspace.yaml` it generates, so neither the named registries nor
+`trustLockfile` are written in a Rush repo; the `redirect_pnpm_trust_lockfile` warning gives
+the Rush remedy instead
 (verified with Rush 5.180.0):
 
 - pnpm 12: install with `pnpm_config_trust_lockfile=true rush install` (set it in CI too).

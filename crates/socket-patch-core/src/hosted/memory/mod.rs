@@ -1620,6 +1620,7 @@ mod tests {
                 pnpm_warnings: Vec::new(),
                 npm_warnings: Vec::new(),
                 pnpm_rerun_only: false,
+                pnpm_named_registries: false,
                 workspace_symlinked: false,
                 final_discovery: None,
             },

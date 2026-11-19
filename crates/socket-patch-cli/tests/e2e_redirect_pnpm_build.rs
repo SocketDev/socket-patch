@@ -56,6 +56,15 @@
 //! reachable registry metadata) and the manual `--trust-lockfile` flag
 //! recovers.
 //!
+//! NAMED REGISTRIES: when the grant carries the address of the patch's
+//! one-package registry and the project runs pnpm >= 12, the scan declares
+//! it in pnpm-workspace.yaml (`namedRegistries`) instead of trusting the
+//! lock. The pnpm@12 leg proves the real pnpm then verifies the hosted
+//! entry against that address (a wiremock version document) and installs
+//! the patched bytes with lockfile verification on, that a later
+//! `pnpm add` keeps the hosted entry, that the same install is rejected
+//! without the declaration, and that `rollback` takes it back out.
+//!
 //! Two synthetic legs need no pnpm at all (hermetic wiremock, never ignored),
 //! pinning the rewrite grammar against byte-accurate locks captured from the
 //! 2026-08-18 pnpm matrix sweep: a v5.4 lock (`/name/version:` key) and a v6
@@ -104,6 +113,8 @@ const GHSA: &str = "GHSA-redirect-pnpm";
 const PNPM_PRIMARY: &str = "pnpm@10";
 const PNPM_SECONDARY: &str = "pnpm@9";
 const PNPM_TERTIARY: &str = "pnpm@11";
+/// The first major hosted mode declares named registries for.
+const PNPM_NAMED_REGISTRY: &str = "pnpm@12";
 const PNPM_LEGACY_V5: &str = "pnpm@7";
 const PNPM_LEGACY_V6: &str = "pnpm@8";
 /// left-pad@1.3.0's registry integrity, byte-accurate from the matrix legs'
@@ -1217,6 +1228,203 @@ async fn pnpm11_zero_touch_frozen_install_lands_patched_bytes_via_auto_trust_con
     let (fresh, ci) = fresh_checkout_install(&fx, PNPM_TERTIARY, "pnpm11-zero-touch", &[], true);
     assert_marker_landed(&fresh, &fx.patched, &ci, "pnpm11 zero-touch");
     assert_fixture_manifestless_vex(&fx, &fresh, "pnpm11 zero-touch");
+}
+
+/// NAMED REGISTRIES: over a lock the real pnpm 12 scan pinned without any
+/// workspace config (the opted-out fixture), the patch service starts
+/// serving the patch's one-package registry: the grant carries its address
+/// and the address answers the package's version document. A re-run
+/// declares it in pnpm-workspace.yaml and writes no `trustLockfile`. The
+/// committed checkout then frozen-installs against a DEAD default registry
+/// with no flags: pnpm 12 verifies the hosted entry against the declared
+/// registry and lands the marker bytes with lockfile verification on, and
+/// a `pnpm add` of another package keeps the hosted entry. Without the
+/// declaration the same install is rejected, and `rollback` takes the
+/// declaration back out with the pin.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm install (~60s); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm12_named_registry_frozen_install_verifies_the_hosted_entry() {
+    let Some(fx) = redirect_scanned_pnpm_project(
+        PNPM_NAMED_REGISTRY,
+        "pnpm12-registry",
+        false,
+        true,
+        HostedDriver::Scan,
+    )
+    .await
+    else {
+        return;
+    };
+    let server = &fx._server;
+    let hosted_url = hosted_url_for(&server.uri());
+    let registry_path = format!("/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/");
+    let registry = format!("{}{registry_path}", server.uri());
+    let lock_path = fx.proj.join(&fx.lock_name);
+    let pinned_lock = std::fs::read_to_string(&lock_path).unwrap();
+    let sri = regex::Regex::new(r"integrity: (sha512-[A-Za-z0-9+/=]+), tarball: ")
+        .unwrap()
+        .captures(&pinned_lock)
+        .map(|c| c[1].to_string())
+        .unwrap_or_else(|| panic!("no hosted resolution in the pinned lock:\n{pinned_lock}"));
+    let ws_path = fx.proj.join("pnpm-workspace.yaml");
+    let ws_before = std::fs::read_to_string(&ws_path).ok();
+    assert!(
+        !ws_before
+            .as_deref()
+            .is_some_and(|ws| ws.contains("trustLockfile") || ws.contains("namedRegistries")),
+        "the opted-out scan configures nothing: {ws_before:?}"
+    );
+
+    // The grant now carries the registry address (it outranks the fixture's
+    // grant), and the address answers the package's version document.
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                UUID: {
+                    "status": "granted",
+                    "url": hosted_url,
+                    "purl": PURL,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": hosted_url,
+                        "integrity": { "sha512": sri }
+                    }],
+                    "registryOverride": null,
+                    "npmRegistryUrl": registry
+                }
+            }
+        })))
+        .with_priority(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{registry_path}{DEP}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": DEP,
+            "dist-tags": { "latest": DEP_VERSION },
+            "versions": {
+                DEP_VERSION: {
+                    "name": DEP,
+                    "version": DEP_VERSION,
+                    "dist": { "tarball": hosted_url, "integrity": sri }
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+
+    let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &fx.proj, &server.uri(), &[]);
+    assert_eq!(
+        code, 0,
+        "the re-run must declare the registry.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        pinned_lock,
+        "the pinned lock is left as it is"
+    );
+    let ws = std::fs::read_to_string(&ws_path)
+        .expect("the re-run writes pnpm-workspace.yaml")
+        .replace("\r\n", "\n");
+    assert!(
+        ws.contains(&format!(
+            "namedRegistries:\n  socket-patch-{UUID}: {registry}\n"
+        )),
+        "the patch server is declared as a named registry:\n{ws}"
+    );
+    assert!(
+        !ws.contains("trustLockfile"),
+        "a declared registry needs no trust:\n{ws}"
+    );
+    assert!(
+        env["redirect"]["rewrittenFiles"]
+            .as_array()
+            .is_some_and(|files| files.iter().any(|f| f == "pnpm-workspace.yaml")),
+        "{env}"
+    );
+
+    let (fresh, ci) =
+        fresh_checkout_install(&fx, PNPM_NAMED_REGISTRY, "pnpm12-registry", &[], true);
+    assert_marker_landed(&fresh, &fx.patched, &ci, "pnpm12 named registry");
+    let document = format!("{registry_path}{DEP}");
+    let asked = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .any(|request| request.url.path() == document);
+    assert!(
+        asked,
+        "pnpm must have verified the entry against the declared registry ({document})"
+    );
+
+    // `pnpm add` keeps the hosted entry: pnpm 12 re-verifies it against the
+    // declared registry instead of re-resolving it from the default one.
+    // The default registry is reachable again for the added package; the
+    // store is the fresh install's own.
+    std::fs::remove_file(fresh.join(".npmrc")).unwrap();
+    let add_store = format!(
+        "--store-dir={}",
+        fx.tmp.path().join("fresh-store-pnpm12-registry").display()
+    );
+    let add = corepack_with_retries(
+        &fresh,
+        PNPM_NAMED_REGISTRY,
+        &["add", "is-number@7.0.0", &add_store],
+        true,
+    );
+    if add.status.success() {
+        let added_lock = std::fs::read_to_string(fresh.join(&fx.lock_name)).unwrap();
+        assert!(
+            added_lock.contains("is-number") && added_lock.contains(&hosted_url),
+            "`pnpm add` must keep the hosted entry:\n{added_lock}"
+        );
+        assert_marker_landed(
+            &fresh,
+            &fx.patched,
+            &add,
+            "pnpm12 named registry after `pnpm add`",
+        );
+    } else {
+        assert!(!pnpm_required(), "required `pnpm add` failed: {add:?}");
+        println!(
+            "SKIP pnpm12 named registry `pnpm add` (registry unreachable?):\n{}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+    }
+
+    // The control: the same checkout without the declaration.
+    let (_plain_dir, plain) = fresh_checkout_install(
+        &fx,
+        PNPM_NAMED_REGISTRY,
+        "pnpm12-registry-plain",
+        &[],
+        false,
+    );
+    let chatter = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&plain.stdout),
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert!(
+        !plain.status.success() && chatter.contains("ERR_PNPM"),
+        "pnpm 12 must reject the hosted entry no registry vouches for:\n{chatter}"
+    );
+
+    // `rollback` restores the lock and takes the declaration back out.
+    let unwind = unwind_env(server, &fx.lock_before).await;
+    let (code, stdout, stderr) =
+        run_socket_env(&fx.proj, &["rollback", "--yes", "--json"], &unwind);
+    assert_eq!(code, 0, "rollback failed: {stdout}\n{stderr}");
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), fx.lock_before);
+    assert_eq!(
+        std::fs::read_to_string(&ws_path).ok(),
+        ws_before,
+        "the workspace file is back as the scan found it"
+    );
 }
 
 /// #1074: with pnpm's `lockfile` setting off, pnpm neither reads nor
