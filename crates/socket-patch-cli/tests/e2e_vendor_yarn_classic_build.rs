@@ -598,7 +598,7 @@ fn sha512_sri_b64(bytes: &[u8]) -> String {
 
 /// `scan --mode vendored` against a
 /// wiremock Socket API: vendored mode NEVER writes `.socket/manifest.json` (the vendor
-/// ledger embeds the record) — the shape a depscan-opened PR commits. The
+/// ledger embeds the record) — the shape a GitHub-app PR commits. The
 /// scan discovers the dep (batch search), the record (with `blobContent`)
 /// comes from the mocked `view/<uuid>` and the tarball is built locally
 /// (`--vendor-source build`). A fresh checkout of

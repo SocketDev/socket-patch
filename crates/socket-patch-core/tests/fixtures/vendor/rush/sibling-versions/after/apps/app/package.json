@@ -1,0 +1,12 @@
+{
+  "version": "1.0.0",
+  "private": true,
+  "name": "app",
+  "dependencies": {
+    "left-pad": "1.3.0",
+    "mkdirp": "0.5.1",
+    "once": "1.4.0",
+    "util": "workspace:*",
+    "minimist": "file:../../.socket/vendor/npm/d8533454-f3bf-44d2-a187-7b5a9ec251ce/minimist-0.0.10.tgz"
+  }
+}

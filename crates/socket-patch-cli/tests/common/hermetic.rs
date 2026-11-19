@@ -108,7 +108,75 @@ pub fn command(bin: &Path) -> Command {
     // binary's exit: lift the short grace it gives telemetry still in
     // flight (the send's own 5 s request timeout still ends the wait).
     cmd.env("SOCKET_TELEMETRY_GRACE_MS", "30000");
+    // Hosted mode weighs the mirrors of the machine's Maven settings before
+    // it adds a repository to a pom. The settings of whoever runs a suite
+    // (a `mirrorOf=*` in `~/.m2/settings.xml`, or in the installation's)
+    // must not decide what its scan wires.
+    cmd.env("MAVEN_ARGS", neutral_maven_args());
     cmd
+}
+
+/// The Maven settings file every socket-patch child is pointed at: real,
+/// valid and empty, so it declares no mirror.
+const NEUTRAL_MAVEN_SETTINGS: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<settings xmlns=\"http://maven.apache.org/SETTINGS/1.0.0\"/>\n";
+
+/// The file of [`NEUTRAL_MAVEN_SETTINGS`], written on first use: one per
+/// account, in the temp directory, outside every test's scratch tree and
+/// never removed, so it outlives every test that was handed its path.
+pub fn neutral_maven_settings() -> std::path::PathBuf {
+    static FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let file = FILE.get_or_init(|| {
+        let account: String = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        let dir = std::env::temp_dir().join(format!("socket-patch-cli-maven-settings-{account}"));
+        std::fs::create_dir_all(&dir).expect("create the neutral Maven settings directory");
+        let file = dir.join("settings.xml");
+        // Written beside and renamed over, so a suite running at the same
+        // time never reads half a file.
+        if std::fs::read_to_string(&file).ok().as_deref() != Some(NEUTRAL_MAVEN_SETTINGS) {
+            let staged = dir.join(format!("settings.xml.{}", std::process::id()));
+            std::fs::write(&staged, NEUTRAL_MAVEN_SETTINGS)
+                .expect("write the neutral Maven settings");
+            std::fs::rename(&staged, &file).expect("place the neutral Maven settings");
+        }
+        file
+    });
+    assert!(
+        file.is_file(),
+        "the neutral Maven settings file is gone: {}",
+        file.display()
+    );
+    file.clone()
+}
+
+/// The `MAVEN_ARGS` of a socket-patch child: [`neutral_maven_settings`] as
+/// both the user settings (`-s`) and the global settings (`-gs`).
+/// `MAVEN_ARGS` is where the CLI looks for the settings a build would be
+/// started with, so with this value it reads no settings of the machine
+/// at all.
+///
+/// The value is for the socket-patch process alone. [`command`] is the
+/// only place that sets it, and no test builds a Maven or a Gradle child
+/// with [`command`]; `jvm_env::isolate_cli`, which Maven children do go
+/// through, removes `MAVEN_ARGS` from a command that does not already
+/// carry one. A real Maven reads `MAVEN_ARGS` too: it would take these
+/// settings over the ones a test names on its command line, and it refuses
+/// to start when a settings file named there does not exist, which is why
+/// the file is a real one.
+pub fn neutral_maven_args() -> String {
+    let file = neutral_maven_settings();
+    let file = file.to_string_lossy();
+    // (The CLI reads a double-quoted argument as one, on every platform.)
+    if file.contains(char::is_whitespace) {
+        format!("-s \"{file}\" -gs \"{file}\"")
+    } else {
+        format!("-s {file} -gs {file}")
+    }
 }
 
 /// [`command`] for the `socket-patch` binary cargo built for this test run.

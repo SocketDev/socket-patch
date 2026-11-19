@@ -2241,7 +2241,7 @@ fn gem_bundler_vendored_install_proof() {
     // this purl — the service artifact was used (`vendor_prebuilt_downloaded`)
     // or the invalid-served-stub fallback built locally
     // (`vendor_prebuilt_stub_invalid`). Asserting exactly one auto-retires the
-    // fallback expectation the moment the depscan stub fix deploys and the
+    // fallback expectation the moment the server-side stub fix deploys and the
     // rebuilt artifacts serve valid stubs (and catches both-or-neither as a
     // defect either way).
     let route_markers = env_json["events"]

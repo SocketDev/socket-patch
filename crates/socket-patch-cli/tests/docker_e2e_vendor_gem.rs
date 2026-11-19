@@ -255,7 +255,7 @@ exit 0
 "#;
 
 /// Stage 2b (`--network none`, the fresh checkout stage 2 just installed):
-/// MANIFEST-LESS VEX, the depscan shape. Shared by
+/// MANIFEST-LESS VEX, the GitHub-app shape. Shared by
 /// both flavors.
 ///
 ///   1. `.socket/manifest.json` deleted → `vex --offline` attests from the

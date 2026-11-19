@@ -2097,7 +2097,13 @@ async fn scan_project(
     // that have NO installed copy (fresh clone, partial install). They join
     // discovery and are flagged "not yet installed". Scoped to the crawled
     // ecosystems.
-    let mut lockfile_only = lockfile_supplement(&ctx, &all_crawled, crawl_scope).await;
+    let mut lockfile_only = lockfile_supplement(
+        &ctx,
+        &all_crawled,
+        crawl_scope,
+        args.mode == Some(ScanMode::Hosted),
+    )
+    .await;
     // Counted once: #604 adds the API's spellings of lockfile-only PyPI pins
     // to `lockfile_only.purls` after the batch query.
     let lockfile_only_count = lockfile_only.purls.len();
