@@ -437,6 +437,7 @@ async fn refresh_installed(
             crate::patch::gem_ext::install_staged(
                 &install.gem_dir,
                 &staged_archive,
+                kind,
                 &stage.join("home"),
                 ruby,
             )
