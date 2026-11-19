@@ -8706,18 +8706,24 @@ fn rewrite_gem(
             });
             continue;
         }
-        let Some(sha256) = ov
+        let sha256 = ov
             .identifiers
             .gem_checksum_sha256
             .clone()
-            .or_else(|| dep.integrity.sha256.clone())
-        else {
+            .or_else(|| dep.integrity.sha256.clone());
+        // A lock that names only platform builds pins no ruby-platform gem:
+        // its prebuilds' sha256 (checked below) are all the redirect needs.
+        let platform_only = handed_in.as_ref().is_some_and(|parsed| {
+            let builds = parsed.locked_builds(&dep.name, &dep.version);
+            !builds.platforms.is_empty() && !builds.ruby
+        });
+        if sha256.is_none() && !platform_only {
             result.warnings.push(RewriteWarning {
                 code: "redirect_gem_missing_sha256".into(),
                 detail: format!("{} has no sha256 checksum", dep.name),
             });
             continue;
-        };
+        }
         // Neither manifest nor lock in the chosen spelling: nothing to pin.
         // Say so once (parity with `redirect_npm_no_lockfile`) instead of
         // silently dropping the dep from the redirected count. A lock-only
@@ -8757,7 +8763,10 @@ fn rewrite_gem(
 
         // What `CHECKSUMS` pins for the gem: the ruby gem's sha256 under
         // `name (version)`, unless the lock names platform builds.
-        let mut checksums = vec![(dep.version.clone(), sha256.clone())];
+        let mut checksums: Vec<(String, String)> = sha256
+            .iter()
+            .map(|sha| (dep.version.clone(), sha.clone()))
+            .collect();
         // Platform-specific builds (`name (version-arm64-darwin)` among the
         // specs or the CHECKSUMS entries): bundler installs the build of
         // the machine it runs on, so the redirect holds only when the patch
@@ -8832,7 +8841,7 @@ fn rewrite_gem(
                     .filter_map(|id| {
                         let sha256 = match id.platform.as_deref() {
                             Some(platform) => prebuilt(platform)?.gem_checksum_sha256.clone(),
-                            None => sha256.clone(),
+                            None => sha256.clone()?,
                         };
                         Some((id.token(), sha256))
                     })
@@ -20461,6 +20470,48 @@ mod tests {
                 warning.detail
             );
         }
+    }
+
+    /// A lock that names only platform builds needs no ruby-platform
+    /// sha256: a grant whose prebuilds cover every locked platform but that
+    /// carries no `gemChecksumSha256` (nor a tarball sha256) still moves the
+    /// builds. A lock with the ruby entry beside them still needs it.
+    #[test]
+    fn gem_platform_only_lock_needs_no_ruby_checksum() {
+        let (arm, linux) = ("a".repeat(64), "b".repeat(64));
+        let platforms = ["arm64-darwin", "x86_64-linux-gnu"];
+        let mut dep = gem_override_prebuilt(
+            "nokogiri",
+            "1.18.10",
+            &[("arm64-darwin", &arm), ("x86_64-linux-gnu", &linux)],
+        );
+        dep.registry_override
+            .as_mut()
+            .expect("gem_override always carries a registry override")
+            .identifiers
+            .gem_checksum_sha256 = None;
+        dep.integrity.sha256 = None;
+        let (_, lock, r) = gem_redirect(
+            NOKOGIRI_GEMFILE,
+            &nokogiri_lock(&platforms, false, true),
+            dep.clone(),
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(
+            lock,
+            nokogiri_lock_hosted(
+                &platforms,
+                false,
+                Some(&[
+                    ("1.18.10-arm64-darwin", &arm),
+                    ("1.18.10-x86_64-linux-gnu", &linux)
+                ])
+            )
+        );
+        let with_ruby = nokogiri_lock(&platforms, true, true);
+        let (_, after, r) = gem_redirect(NOKOGIRI_GEMFILE, &with_ruby, dep);
+        assert_eq!(after, with_ruby);
+        assert_eq!(warning_codes(&r), ["redirect_gem_missing_sha256"]);
     }
 
     /// A platform build named only under `CHECKSUMS` counts as locked: with
