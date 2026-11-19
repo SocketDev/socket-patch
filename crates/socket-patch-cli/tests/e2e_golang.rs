@@ -55,16 +55,20 @@ async fn mount_batch(server: &MockServer) {
 /// `SOCKET_GLOBAL*` and the output-mode trio can't change what the crawler
 /// discovers or whether it calls home), `VIRTUAL_ENV` is removed (the scans
 /// are unscoped, so an activated venv would add its packages to the batch),
-/// `GOPATH` is removed, and the token/url/org steer the API at the in-test
-/// server. Callers pin the module cache.
+/// the developer's go settings are removed (`GOFLAGS`, `GOWORK`, `GOPATH`,
+/// `GOMODCACHE` and the `go env -w` file: a workspace or a `-modfile` there
+/// changes which modules a project scan looks up), and the token/url/org
+/// steer the API at the in-test server. Callers pin the module cache.
 fn golang_command(cwd: &Path, api_url: &str) -> std::process::Command {
     let mut cmd = common::hermetic::command(&binary());
-    common::hermetic::scrub_extra(&mut cmd, &[common::hermetic::Extra::Venv]);
+    common::hermetic::scrub_extra(
+        &mut cmd,
+        &[common::hermetic::Extra::Venv, common::hermetic::Extra::Go],
+    );
     cmd.current_dir(cwd)
         .env("SOCKET_API_URL", api_url)
         .env("SOCKET_API_TOKEN", "sktsec_dummy_e2e_golang_token_api")
-        .env("SOCKET_ORG_SLUG", ORG)
-        .env_remove("GOPATH");
+        .env("SOCKET_ORG_SLUG", ORG);
     cmd
 }
 
@@ -95,13 +99,19 @@ async fn run(args: &[&str], cwd: &Path, gomodcache: &Path, api_url: &str) -> Out
 /// envelope fails the test loudly instead of slipping past a `.contains()`
 /// check.
 async fn scan_json(cwd: &Path, gomodcache: &Path, api_url: &str) -> serde_json::Value {
-    let output = run(
-        &["scan", "--json", "--cwd", cwd.to_str().unwrap()],
-        cwd,
-        gomodcache,
-        api_url,
-    )
-    .await;
+    scan_json_with(&[], cwd, gomodcache, api_url).await
+}
+
+/// [`scan_json`] with `extra` arguments after `scan --json --cwd <cwd>`.
+async fn scan_json_with(
+    extra: &[&str],
+    cwd: &Path,
+    gomodcache: &Path,
+    api_url: &str,
+) -> serde_json::Value {
+    let mut args = vec!["scan", "--json", "--cwd", cwd.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    let output = run(&args, cwd, gomodcache, api_url).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -157,8 +167,9 @@ async fn batched_purls(server: &MockServer) -> BTreeSet<String> {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Verify `socket-patch scan` discovers Go modules in a fake module cache and
-/// reports them — by exact count, by ecosystem, and by exact decoded PURL.
+/// Verify `socket-patch scan` discovers the Go modules a project requires in
+/// a fake module cache and reports them — by exact count, by ecosystem, and
+/// by exact decoded PURL.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scan_discovers_go_modules() {
     let server = MockServer::start().await;
@@ -189,21 +200,25 @@ async fn scan_discovers_go_modules() {
     )
     .unwrap();
 
-    // --- Decoys that MUST NOT be counted, proving the crawler parses the
-    // versioned (`name@version`) layout rather than counting every directory:
-    //   * the root `cache/` download dir is pruned at the cache root, so a
-    //     versioned dir beneath it must be ignored;
-    //   * a non-versioned directory (no `@`) is not a module.
-    // If either leaked in, `scannedPackages` would be 3+ and the exact-count
-    // assertion below would fail.
+    // --- Decoys that MUST NOT be counted:
+    //   * a module another project left in the shared cache. A project
+    //     scan looks up what the project's go.mod and go.sum name, and
+    //     nothing else in the cache is this project's; only the walk of
+    //     the whole cache at the end of the test reports it;
+    //   * a versioned dir under the root `cache/` download dir, and a
+    //     non-versioned directory (no `@`), which are not modules at all:
+    //     the walk prunes the first and does not count the second.
+    // If any leaked in, a count below would be one too high.
+    std::fs::create_dir_all(cache_dir.join("example.com").join("unrelated@v0.1.0")).unwrap();
     let decoy_cache = cache_dir.join("cache").join("download").join("evil@v9.9.9");
     std::fs::create_dir_all(&decoy_cache).unwrap();
     std::fs::create_dir_all(cache_dir.join("github.com").join("plain").join("noversion")).unwrap();
 
-    // Create a go.mod in the project directory so local mode activates
+    // The project requires both modules (a go.mod is also what activates
+    // local mode).
     std::fs::write(
         dir.path().join("go.mod"),
-        "module example.com/myproject\n\ngo 1.21\n",
+        "module example.com/myproject\n\ngo 1.21\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.9.1\n\tgolang.org/x/text v0.14.0\n)\n",
     )
     .unwrap();
 
@@ -264,6 +279,74 @@ async fn scan_discovers_go_modules() {
         purls, expected,
         "scan must query the API for exactly the two planted module PURLs"
     );
+
+    // --- The walk of the whole cache (`--global-prefix`) parses the
+    // versioned (`name@version`) layout: it reports the other project's
+    // module too, and still neither the root `cache/` download dir nor the
+    // non-versioned directory.
+    let json = scan_json_with(
+        &[
+            "--ecosystems",
+            "golang",
+            "--global-prefix",
+            cache_dir.to_str().unwrap(),
+        ],
+        dir.path(),
+        &cache_dir,
+        &api_url,
+    )
+    .await;
+    assert_eq!(
+        json["scannedPackages"], 3,
+        "the walk must report the three modules in the cache and skip the \
+         cache/ and non-versioned decoys; got:\n{json:#}"
+    );
+    let mut walked = expected;
+    walked.insert("pkg:golang/example.com/unrelated@v0.1.0".to_string());
+    assert_eq!(
+        batched_purls(&server).await,
+        walked,
+        "the walk must query the API for exactly the three cached modules"
+    );
+}
+
+/// A module on the standard library alone (no `require`, no go.sum) has no
+/// Go packages: the modules other projects left in the shared module cache
+/// are not scanned, and none of them is sent to the API.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_of_a_module_without_dependencies_ignores_the_shared_cache() {
+    let server = MockServer::start().await;
+    mount_batch(&server).await;
+    let api_url = server.uri();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("gomodcache");
+    for module in [
+        "github.com/gin-gonic/gin@v1.9.1",
+        "golang.org/x/text@v0.14.0",
+    ] {
+        std::fs::create_dir_all(cache_dir.join(module)).unwrap();
+    }
+    std::fs::write(
+        dir.path().join("go.mod"),
+        "module example.com/myproject\n\ngo 1.21\n",
+    )
+    .unwrap();
+
+    let json = scan_json(dir.path(), &cache_dir, &api_url).await;
+    assert_eq!(json["status"], "success", "got:\n{json:#}");
+    assert_eq!(
+        json["scannedPackages"], 0,
+        "nothing in the cache is this project's; got:\n{json:#}"
+    );
+    let batch_posts = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/patches/batch"))
+        .count();
+    assert_eq!(batch_posts, 0, "no module was looked up");
 }
 
 /// #344: a module cache configured with `go env -w GOMODCACHE=…` (the
@@ -288,7 +371,7 @@ async fn scan_finds_the_cache_named_by_the_go_env_file() {
     std::fs::create_dir_all(&project).unwrap();
     std::fs::write(
         project.join("go.mod"),
-        "module example.com/myproject\n\ngo 1.21\n",
+        "module example.com/myproject\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.9.1\n",
     )
     .unwrap();
     // What `go env -w GOMODCACHE=<cache>` writes.
@@ -334,10 +417,10 @@ async fn scan_finds_the_cache_named_by_the_go_env_file() {
 ///
 /// Go's module cache stores uppercase letters as `!`+lowercase, so
 /// `github.com/Azure/...` lands on disk under `github.com/!azure/...`. The
-/// crawler must descend into `!azure` AND decode it back to `Azure` in the
-/// PURL it emits — a crawler that skipped `!`-prefixed dirs would report zero,
-/// and one that descended but left the escaping in place would emit the wrong
-/// PURL. The batch-body assertion below catches both.
+/// crawler must find the module go.mod requires under `!azure` AND report
+/// `Azure` in the PURL it emits — a crawler that looked for an `Azure`
+/// directory would report zero, and one that reported the on-disk name would
+/// emit the wrong PURL. The batch-body assertion below catches both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scan_discovers_case_encoded_modules() {
     let server = MockServer::start().await;
@@ -355,14 +438,16 @@ async fn scan_discovers_case_encoded_modules() {
         .join("azure-sdk-for-go@v1.0.0");
     std::fs::create_dir_all(&azure_dir).unwrap();
 
-    // Decoy: a root-level cache/ download dir whose versioned entry must be
-    // pruned, so the count stays at exactly one.
+    // Decoy for the walk of the whole cache at the end of the test: a
+    // versioned entry under the root-level cache/ download dir is pruned,
+    // so the count stays at exactly one.
     std::fs::create_dir_all(cache_dir.join("cache").join("download").join("evil@v9.9.9")).unwrap();
 
-    // Create a go.mod in the project directory so local mode activates.
+    // The project requires the module (a go.mod is also what activates
+    // local mode).
     std::fs::write(
         dir.path().join("go.mod"),
-        "module example.com/myproject\n\ngo 1.21\n",
+        "module example.com/myproject\n\ngo 1.21\n\nrequire github.com/Azure/azure-sdk-for-go v1.0.0\n",
     )
     .unwrap();
 
@@ -414,5 +499,30 @@ async fn scan_discovers_case_encoded_modules() {
     assert_eq!(
         purls, expected,
         "scan must query the API with the case-DECODED module PURL (Azure, not !azure)"
+    );
+
+    // --- The walk of the whole cache (`--global-prefix`) must descend into
+    // `!azure` and decode it the same way: one module, and no second PURL
+    // in the on-disk spelling joins the set the API was asked about.
+    let json = scan_json_with(
+        &[
+            "--ecosystems",
+            "golang",
+            "--global-prefix",
+            cache_dir.to_str().unwrap(),
+        ],
+        dir.path(),
+        &cache_dir,
+        &api_url,
+    )
+    .await;
+    assert_eq!(
+        json["scannedPackages"], 1,
+        "the walk must report exactly the one case-encoded module; got:\n{json:#}"
+    );
+    assert_eq!(
+        batched_purls(&server).await,
+        expected,
+        "the walk must report the case-DECODED module PURL too"
     );
 }
