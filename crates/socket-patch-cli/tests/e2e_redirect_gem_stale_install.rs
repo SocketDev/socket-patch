@@ -4342,15 +4342,109 @@ fn gem_events(env: &serde_json::Value) -> Vec<String> {
 /// installed copy matches neither side of the newer patch, but the gem is
 /// installed and its lock entry is ours: `scan --mode vendored` vendors
 /// the newer patch, as it does on a checkout with no gems installed, and
-/// leaves the installed copy alone. The dry run previews the same.
+/// leaves the installed copy alone. The dry run previews the same, and a
+/// second run finds nothing left to do. `get --mode vendored` takes the
+/// same path.
 #[tokio::test(flavor = "multi_thread")]
 async fn vendored_takeover_of_a_hosted_gem_whose_patch_was_superseded() {
+    let takeovers: [&[&str]; 2] = [
+        &["scan", "--mode", "vendored"],
+        &["get", NEWER_UUID, "--mode", "vendored"],
+    ];
+    for takeover in takeovers {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let home = hosted_on_a_superseded_patch(&server, &proj).await;
+        let uri = server.uri();
+        let held_before = snapshot(&home);
+        let read_pair = || {
+            format!(
+                "{}{}",
+                std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+                std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap()
+            )
+        };
+        let pair_before = read_pair();
+        let run = |extra: &[&str]| {
+            let mut args = takeover.to_vec();
+            args.extend(["--yes", "--json"]);
+            args.extend(extra);
+            let (code, stdout, stderr) = unwind_run(&proj, &uri, &args);
+            let env = common::parse_json_envelope(&stdout);
+            assert_eq!(code, 0, "{takeover:?} {extra:?}: {env}\nstderr:\n{stderr}");
+            assert!(
+                !env.to_string().contains("package_not_installed"),
+                "{takeover:?} {extra:?}: the gem is installed: {env}"
+            );
+            env
+        };
+
+        run(&["--dry-run"]);
+        assert_eq!(
+            read_pair(),
+            pair_before,
+            "{takeover:?}: the dry run wrote nothing"
+        );
+        assert!(
+            !proj.join(".socket").join("vendor").exists(),
+            "{takeover:?}"
+        );
+
+        let env = run(&[]);
+        let copy_rel = format!(".socket/vendor/gem/{NEWER_UUID}/{DEP}-{DEP_VERSION}");
+        let pair = read_pair();
+        assert!(
+            pair.matches(&copy_rel).count() >= 2 && !pair.contains("/patch-registry/"),
+            "{takeover:?}: the pair names the newer patch's copy and no hosted pin:\n{pair}\n{env}"
+        );
+        assert_eq!(
+            installed_lib(&proj.join(&copy_rel)),
+            NEWER_PATCHED_LIB,
+            "{takeover:?}: the vendored copy is the newer patch"
+        );
+        assert!(
+            snapshot(&home) == held_before,
+            "{takeover:?}: the takeover left the installed copy alone: {env}"
+        );
+
+        let env = run(&[]);
+        assert_eq!(
+            read_pair(),
+            pair,
+            "{takeover:?}: the re-run changed the pair: {env}"
+        );
+        assert!(
+            snapshot(&home) == held_before,
+            "{takeover:?}: the re-run changed the installed copy: {env}"
+        );
+    }
+}
+
+/// #2129, the native-extension half: a hosted gem that builds an
+/// extension cannot be vendored, superseded patch or not. The refusal
+/// names that (`native_extensions_unsupported`), not a gem that is "not
+/// installed", and the hosted pin stays. (A dry run of the scan previews
+/// no native-extension refusal for any hosted gem, so only the real run is
+/// held to this.)
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_takeover_of_a_superseded_native_gem_names_the_extension() {
     let server = MockServer::start().await;
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     let home = hosted_on_a_superseded_patch(&server, &proj).await;
-    let uri = server.uri();
-    let held_before = snapshot(&home);
+    let spec = home
+        .join("specifications")
+        .join(format!("{DEP}-{DEP_VERSION}.gemspec"));
+    let text = std::fs::read_to_string(&spec).unwrap();
+    std::fs::write(
+        &spec,
+        text.replace(
+            "  s.require_paths",
+            "  s.extensions = [\"ext/probe/extconf.rb\".freeze]\n  s.require_paths",
+        ),
+    )
+    .unwrap();
     let pair_before = (
         std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
         std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
@@ -4358,111 +4452,26 @@ async fn vendored_takeover_of_a_hosted_gem_whose_patch_was_superseded() {
 
     let (code, stdout, stderr) = unwind_run(
         &proj,
-        &uri,
-        &["scan", "--mode", "vendored", "--yes", "--json", "--dry-run"],
+        &server.uri(),
+        &["scan", "--mode", "vendored", "--yes", "--json"],
     );
     let env = common::parse_json_envelope(&stdout);
-    assert_eq!(code, 0, "dry run: {env}\nstderr:\n{stderr}");
+    let events = gem_events(&env);
     assert!(
-        !env.to_string().contains("package_not_installed"),
-        "dry run: {env}"
+        events
+            .iter()
+            .any(|e| e.ends_with("/native_extensions_unsupported")),
+        "{events:?}\n{env}\nstderr:\n{stderr}"
     );
+    assert!(!env.to_string().contains("package_not_installed"), "{env}");
+    assert_ne!(code, 0, "{env}");
     assert_eq!(
         (
             std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
             std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
         ),
         pair_before,
-        "the dry run wrote nothing"
+        "the hosted pin stays"
     );
     assert!(!proj.join(".socket").join("vendor").exists());
-
-    let (code, stdout, stderr) = unwind_run(
-        &proj,
-        &uri,
-        &["scan", "--mode", "vendored", "--yes", "--json"],
-    );
-    let env = common::parse_json_envelope(&stdout);
-    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
-    assert!(
-        !env.to_string().contains("package_not_installed"),
-        "the gem is installed: {env}"
-    );
-    let copy_rel = format!(".socket/vendor/gem/{NEWER_UUID}/{DEP}-{DEP_VERSION}");
-    let pair = format!(
-        "{}{}",
-        std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
-        std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap()
-    );
-    assert!(
-        pair.matches(&copy_rel).count() >= 2 && !pair.contains("/patch-registry/"),
-        "the pair names the newer patch's copy and no hosted pin:\n{pair}\n{env}"
-    );
-    assert_eq!(
-        installed_lib(&proj.join(&copy_rel)),
-        NEWER_PATCHED_LIB,
-        "the vendored copy is the newer patch"
-    );
-    assert!(
-        snapshot(&home) == held_before,
-        "the takeover left the installed copy alone: {env}"
-    );
-}
-
-/// #2129, the native-extension half: a hosted gem that builds an
-/// extension cannot be vendored, superseded patch or not. The refusal
-/// names that (`native_extensions_unsupported`), not a gem that is "not
-/// installed", and the hosted pin stays.
-#[tokio::test(flavor = "multi_thread")]
-async fn vendored_takeover_of_a_superseded_native_gem_names_the_extension() {
-    for dry_run in [true, false] {
-        let server = MockServer::start().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("proj");
-        let home = hosted_on_a_superseded_patch(&server, &proj).await;
-        let spec = home
-            .join("specifications")
-            .join(format!("{DEP}-{DEP_VERSION}.gemspec"));
-        let text = std::fs::read_to_string(&spec).unwrap();
-        std::fs::write(
-            &spec,
-            text.replace(
-                "  s.require_paths",
-                "  s.extensions = [\"ext/probe/extconf.rb\".freeze]\n  s.require_paths",
-            ),
-        )
-        .unwrap();
-        let pair_before = (
-            std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
-            std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
-        );
-
-        let mut args = vec!["scan", "--mode", "vendored", "--yes", "--json"];
-        if dry_run {
-            args.push("--dry-run");
-        }
-        let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &args);
-        let env = common::parse_json_envelope(&stdout);
-        let events = gem_events(&env);
-        assert!(
-            events
-                .iter()
-                .any(|e| e.ends_with("/native_extensions_unsupported")),
-            "dry_run={dry_run}: {events:?}\n{env}\nstderr:\n{stderr}"
-        );
-        assert!(
-            !env.to_string().contains("package_not_installed"),
-            "dry_run={dry_run}: {env}"
-        );
-        assert_ne!(code, 0, "dry_run={dry_run}: {env}");
-        assert_eq!(
-            (
-                std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
-                std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
-            ),
-            pair_before,
-            "dry_run={dry_run}: the hosted pin stays"
-        );
-        assert!(!proj.join(".socket").join("vendor").exists());
-    }
 }
