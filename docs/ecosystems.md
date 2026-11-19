@@ -2194,8 +2194,28 @@ mirror of rubygems.org, set `SOCKET_RUBYGEMS_URL` to it. The mirror must be reac
 (plain `http` is accepted only for a mirror on the same machine, such as `http://localhost:9292`,
 and such a request never goes through a proxy): the gem's build scripts run, so its archive and
 checksum are not fetched over a connection someone else could rewrite. Credentials in the URL
-are never printed. The JRuby (`-java`) build of a gem ships
-jars and is always refused for such a patch.
+are never printed.
+
+JRuby is different. It installs a gem's `java` build (`nokogiri-1.18.10-java`), which runs jars
+and has no C extension, so `apply` builds nothing there and needs no compiler. Patches are
+written for the gem's `ruby` build, and on JRuby `apply` takes from a patch what is part of the
+`java` build:
+
+- A file the patch changes is updated when the installed gem has it: the gem's Ruby code, and
+  also a C source the `java` gem ships, though nothing on JRuby compiles it.
+- A file the installed gem doesn't have is skipped. So is a new file that only a C build would
+  read, such as a new C source or a new `patches/libxml2/*.patch`.
+
+The patch then counts as applied: `apply --check` reports it in sync, `vex` attests it, and
+`rollback` restores the files `apply` changed. When no file of a patch is part of the `java`
+build (a patch to the libxml2 that nokogiri packs for its C extension), the vulnerable code is not
+in that build at all. `apply` exits 0, changes nothing and prints a note saying so (a `skipped`
+event with `not_in_platform_build` under `--json`), and `vex` attests the patch.
+
+The one exception is a patch that changes what the gem's jars are built from: a Java, Kotlin or
+Scala source, a Maven, Ant or Gradle build file, or a jar itself. `apply` can't rebuild a jar. It
+writes the patch's files and warns with `native_extension_not_rebuilt`, and neither
+`apply --check` nor `vex` reports the gem as patched.
 
 A gem that builds a library into its own directory and loads it from there (an FFI gem such as
 scrypt, a Rakefile build such as digest-crc) is always rebuilt from its installed tree. The
