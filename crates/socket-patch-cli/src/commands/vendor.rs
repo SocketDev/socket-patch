@@ -3022,19 +3022,19 @@ impl<'a> CandidateGates<'a> {
                     )) {
                         let sole_candidate = group.candidates.len() == 1;
                         let hosted_pinned = (self.hosted_pinned)(candidate);
-                        if hosted_gem_install(candidate, sole_candidate, hosted_pinned) {
-                            // Vendored from the installed dir, as a gem
-                            // the probe matched.
-                        } else if superseded_install(
-                            ledger,
-                            candidate,
-                            record,
-                            sole_candidate,
-                            hosted_pinned,
-                        ) {
+                        // The hosted gem is asked first: it goes on from
+                        // its installed dir, whatever the ledger records.
+                        if !hosted_gem_install(candidate, sole_candidate, hosted_pinned) {
+                            if !superseded_install(
+                                ledger,
+                                candidate,
+                                record,
+                                sole_candidate,
+                                hosted_pinned,
+                            ) {
+                                return CandidateVerdict::Skip;
+                            }
                             superseded = true;
-                        } else {
-                            return CandidateVerdict::Skip;
                         }
                     }
                 }
@@ -5485,6 +5485,63 @@ mod plan_gate_tests {
         assert!(!hosted_gem_install(gem, false, true));
         assert!(!hosted_gem_install(gem, true, false));
         assert!(!hosted_gem_install("pkg:pypi/six@1.16.0", true, true));
+    }
+
+    /// #2129 at the gate: an installed gem that matches neither side of
+    /// the record is skipped, unless the lockfiles pin it hosted. Then it
+    /// is vendored from its installed dir (never the stand-in a superseded
+    /// install gets), even when the ledger also records it at an older
+    /// uuid, so the backend still sees the dir's name and gemspec.
+    #[tokio::test]
+    async fn judge_sends_a_hosted_gem_on_from_its_installed_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let purl = "pkg:gem/rack@3.2.8";
+        let dir = root.join("gems/rack-3.2.8");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.php"), "an older patch's bytes").unwrap();
+        let all_packages = vec![(purl.to_string(), StagedSource::Installed(dir))];
+        let records = HashMap::from([(purl.to_string(), record(UUID_B))]);
+        let none = HashSet::new();
+        let groups = candidate_groups(&all_packages, &HashMap::new());
+        let unpinned = gates(root, &records, &none);
+        let pinned = CandidateGates {
+            hosted_pinned: &|_| true,
+            ..gates(root, &records, &none)
+        };
+        let mut older = VendorState::default();
+        older.entries.insert(
+            purl.to_string(),
+            VendorEntry::new(
+                "gem".to_string(),
+                purl.to_string(),
+                UUID_A.to_string(),
+                socket_patch_core::vendor::state::VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: format!(".socket/vendor/gem/{UUID_A}/rack-3.2.8"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                Vec::new(),
+            ),
+        );
+        let fresh = VendorState::default();
+
+        assert!(matches!(
+            unpinned.judge(&fresh, &groups[0], purl).await,
+            CandidateVerdict::Skip
+        ));
+        for ledger in [&fresh, &older] {
+            assert!(matches!(
+                pinned.judge(ledger, &groups[0], purl).await,
+                CandidateVerdict::Vendor {
+                    superseded: false,
+                    ..
+                }
+            ));
+        }
     }
 
     /// Gates with no vendored refusals, no hosted pins and no `--force`.

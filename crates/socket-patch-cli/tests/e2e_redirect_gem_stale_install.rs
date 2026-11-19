@@ -84,18 +84,30 @@ async fn mount_api(server: &MockServer, view_budget: Option<u64>) {
 /// [`mount_api`] with the grant naming `patched_sha` as the patched
 /// archive's sha256.
 async fn mount_api_for(server: &MockServer, view_budget: Option<u64>, patched_sha: &str) {
+    mount_patch_api(server, UUID, PATCHED_LIB, view_budget, patched_sha).await;
+}
+
+/// [`mount_api_for`] for the patch `uuid`, whose patched lib is
+/// `patched_lib`.
+async fn mount_patch_api(
+    server: &MockServer,
+    uuid: &str,
+    patched_lib: &str,
+    view_budget: Option<u64>,
+    patched_sha: &str,
+) {
     let hosted_url = format!(
-        "{}/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.gem",
+        "{}/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{uuid}/{DEP}-{DEP_VERSION}.gem",
         server.uri()
     );
-    let index_url = format!("{}/patch-registry/gem/{TOKEN}/{UUID}/", server.uri());
+    let index_url = format!("{}/patch-registry/gem/{TOKEN}/{uuid}/", server.uri());
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "packages": [{
                 "purl": PURL,
                 "patches": [{
-                    "uuid": UUID, "purl": PURL, "tier": "free",
+                    "uuid": uuid, "purl": PURL, "tier": "free",
                     "cveIds": [], "ghsaIds": [], "severity": "high",
                     "title": "gem stale-install fixture"
                 }]
@@ -110,7 +122,7 @@ async fn mount_api_for(server: &MockServer, view_budget: Option<u64>, patched_sh
         )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
-                "uuid": UUID, "purl": PURL,
+                "uuid": uuid, "purl": PURL,
                 "publishedAt": "2026-01-01T00:00:00Z",
                 "description": "x", "license": "MIT", "tier": "free",
                 "vulnerabilities": {}
@@ -123,7 +135,7 @@ async fn mount_api_for(server: &MockServer, view_budget: Option<u64>, patched_sh
         .and(path(format!("/v0/orgs/{ORG}/patches/package")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "results": {
-                UUID: {
+                uuid: {
                     "status": "granted",
                     "url": hosted_url,
                     "purl": PURL,
@@ -147,15 +159,15 @@ async fn mount_api_for(server: &MockServer, view_budget: Option<u64>, patched_sh
         .mount(server)
         .await;
     let view = Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
+            "uuid": uuid,
             "purl": PURL,
             "publishedAt": "2026-01-01T00:00:00Z",
             "files": {
                 "lib/stale_probe_gem.rb": {
                     "beforeHash": compute_git_sha256_from_bytes(UPSTREAM_LIB.as_bytes()),
-                    "afterHash": compute_git_sha256_from_bytes(PATCHED_LIB.as_bytes()),
+                    "afterHash": compute_git_sha256_from_bytes(patched_lib.as_bytes()),
                 }
             },
             "vulnerabilities": {
@@ -175,7 +187,7 @@ async fn mount_api_for(server: &MockServer, view_budget: Option<u64>, patched_sh
             }
             // After the budget: transient server failure — the re-fire arm.
             Mock::given(method("GET"))
-                .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+                .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
                 .respond_with(ResponseTemplate::new(500))
                 .mount(server)
                 .await;
@@ -2985,6 +2997,11 @@ async fn hosted_unwind_leaves_an_upstream_install_in_a_pruned_home_alone() {
 /// answers `patches/package` in place of [`mount_api_for`]'s hosted-only
 /// grant.
 async fn mount_vendored_grant(server: &MockServer, patched: &[u8]) {
+    mount_vendored_grant_of(server, UUID, patched).await;
+}
+
+/// [`mount_vendored_grant`] for the patch `uuid`.
+async fn mount_vendored_grant_of(server: &MockServer, uuid: &str, patched: &[u8]) {
     use base64::Engine as _;
     use sha2::Digest as _;
     let sri = |bytes: &[u8]| {
@@ -3001,14 +3018,14 @@ async fn mount_vendored_grant(server: &MockServer, patched: &[u8]) {
     )
     .into_bytes();
     let leaf = format!("{DEP}-{DEP_VERSION}");
-    let base = format!("/artifacts/{UUID}");
+    let base = format!("/artifacts/{uuid}");
     let gem_url = format!("{}{base}/{leaf}.gem", server.uri());
     let stub_url = format!("{}{base}/{leaf}.gemspec", server.uri());
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/package")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "results": {
-                UUID: {
+                uuid: {
                     "status": "granted",
                     "url": gem_url,
                     "purl": PURL,
@@ -3020,7 +3037,7 @@ async fn mount_vendored_grant(server: &MockServer, patched: &[u8]) {
                     ],
                     "registryOverride": {
                         "kind": "rubygems-compact-index",
-                        "indexUrl": format!("{}/patch-registry/gem/{TOKEN}/{UUID}/", server.uri()),
+                        "indexUrl": format!("{}/patch-registry/gem/{TOKEN}/{uuid}/", server.uri()),
                         "identifiers": {
                             "name": DEP,
                             "version": DEP_VERSION,
@@ -4178,124 +4195,19 @@ const NEWER_PATCHED_LIB: &str =
 
 /// The patch API once [`NEWER_UUID`] supersedes [`UUID`] (mount it on a
 /// reset server): discovery, selection and the view name only the newer
-/// patch, and its grant carries the vendored artifacts (the patched `.gem`
-/// and the stub gemspec a path source loads) beside the hosted override.
+/// patch, and its grant carries the vendored artifacts beside the hosted
+/// override.
 async fn mount_newer_patch(server: &MockServer) {
-    use base64::Engine as _;
-    use sha2::Digest as _;
-    let sri = |bytes: &[u8]| {
-        format!(
-            "sha512-{}",
-            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(bytes))
-        )
-    };
     let patched = real_gem(NEWER_PATCHED_LIB);
-    let stub = format!(
-        "Gem::Specification.new do |s|\n  s.name = \"{DEP}\".freeze\n  s.version = \
-         \"{DEP_VERSION}\".freeze\n  s.authors = [\"e2e\".freeze]\n  s.summary = \
-         \"fixture\".freeze\n  s.files = [\"lib/stale_probe_gem.rb\".freeze]\n  s.require_paths \
-         = [\"lib\".freeze]\nend\n"
+    mount_patch_api(
+        server,
+        NEWER_UUID,
+        NEWER_PATCHED_LIB,
+        None,
+        &sha256_of(&patched),
     )
-    .into_bytes();
-    let leaf = format!("{DEP}-{DEP_VERSION}");
-    let base = format!("/artifacts/{NEWER_UUID}");
-    let gem_url = format!("{}{base}/{leaf}.gem", server.uri());
-    let stub_url = format!("{}{base}/{leaf}.gemspec", server.uri());
-    Mock::given(method("POST"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "packages": [{
-                "purl": PURL,
-                "patches": [{
-                    "uuid": NEWER_UUID, "purl": PURL, "tier": "free",
-                    "cveIds": [], "ghsaIds": [], "severity": "high",
-                    "title": "gem stale-install fixture, newer patch"
-                }]
-            }],
-            "canAccessPaidPatches": false,
-        })))
-        .mount(server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path_regex(format!(
-            "^/v0/orgs/{ORG}/patches/by-package/.+$"
-        )))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "patches": [{
-                "uuid": NEWER_UUID, "purl": PURL,
-                "publishedAt": "2026-02-01T00:00:00Z",
-                "description": "x", "license": "MIT", "tier": "free",
-                "vulnerabilities": {}
-            }],
-            "canAccessPaidPatches": false,
-        })))
-        .mount(server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/view/{NEWER_UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": NEWER_UUID,
-            "purl": PURL,
-            "publishedAt": "2026-02-01T00:00:00Z",
-            "files": {
-                "lib/stale_probe_gem.rb": {
-                    "beforeHash": compute_git_sha256_from_bytes(UPSTREAM_LIB.as_bytes()),
-                    "afterHash": compute_git_sha256_from_bytes(NEWER_PATCHED_LIB.as_bytes()),
-                }
-            },
-            "vulnerabilities": {
-                GHSA: {
-                    "cves": ["CVE-2026-4444"],
-                    "summary": "gem stale-install fixture vuln",
-                    "severity": "high",
-                    "description": "d"
-                }
-            },
-            "description": "x", "license": "MIT", "tier": "free"
-        })))
-        .mount(server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "results": {
-                NEWER_UUID: {
-                    "status": "granted",
-                    "url": gem_url,
-                    "purl": PURL,
-                    "artifacts": [
-                        { "kind": "tarball", "url": gem_url,
-                          "integrity": { "sha512": sri(&patched), "sha256": sha256_of(&patched) } },
-                        { "kind": "gem-stub-gemspec", "url": stub_url,
-                          "integrity": { "sha512": sri(&stub) } }
-                    ],
-                    "registryOverride": {
-                        "kind": "rubygems-compact-index",
-                        "indexUrl": format!(
-                            "{}/patch-registry/gem/{TOKEN}/{NEWER_UUID}/",
-                            server.uri()
-                        ),
-                        "identifiers": {
-                            "name": DEP,
-                            "version": DEP_VERSION,
-                            "gemChecksumSha256": sha256_of(&patched),
-                        }
-                    }
-                }
-            }
-        })))
-        .mount(server)
-        .await;
-    for (file, bytes) in [
-        (format!("{leaf}.gem"), patched),
-        (format!("{leaf}.gemspec"), stub),
-    ] {
-        Mock::given(method("GET"))
-            .and(path(format!("{base}/{file}")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
-            .mount(server)
-            .await;
-    }
+    .await;
+    mount_vendored_grant_of(server, NEWER_UUID, &patched).await;
     serve_upstream_gem(server, &real_gem(UPSTREAM_LIB)).await;
 }
 
