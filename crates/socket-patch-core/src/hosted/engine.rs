@@ -1001,23 +1001,23 @@ async fn read_go_workspace(
 
 /// The files a hosted scan with nothing to redirect still reads, so that
 /// the Maven rewriter can heal a `.mvn/maven.config` an earlier release
-/// wrote: `None` unless that file holds the Trusted Checksums block in a
-/// spelling some project is healed out of
-/// ([`crate::formats::maven::trusted_checksums::heal_basedir`]), and then
+/// wrote: `None` unless that file holds lines some project is healed out
+/// of (the Trusted Checksums block, the repository filter's directory
+/// line: [`crate::formats::maven::holds_respellable_lines`]), and then
 /// it, the Maven Wrapper's properties and the root pom, which say which
 /// spelling this project takes. The line an earlier release wrote stops
 /// Maven 3.9.2 to 3.9.8 from starting with `-f` from outside the project
 /// whether or not a patch still applies, so a project whose only patched
 /// dependency was bumped past the patch must not keep it for ever.
 pub async fn read_maven_heal_files(view: &ProjectView<'_>) -> Option<CandidateFiles> {
-    use crate::formats::maven::trusted_checksums::holds_written_block;
+    use crate::formats::maven::holds_respellable_lines;
     use crate::patch::redirect::{MVN_CONFIG, MVN_WRAPPER_PROPERTIES};
     let none = BTreeSet::new();
     let mut out = CandidateFiles::default();
     if !out.read(view, &none, MVN_CONFIG).await {
         return None;
     }
-    if !holds_written_block(out.files.get(MVN_CONFIG)?) {
+    if !holds_respellable_lines(out.files.get(MVN_CONFIG)?) {
         return None;
     }
     for rel in [MVN_WRAPPER_PROPERTIES, "pom.xml"] {
@@ -6331,36 +6331,72 @@ snapshots:
     }
 
     /// A scan that redirects nothing reads the Maven files only when
-    /// `.mvn/maven.config` holds a block to heal, and then heals it: on
-    /// disk and in memory alike.
+    /// `.mvn/maven.config` holds lines to heal (the Trusted Checksums
+    /// block, the repository filter's directory line), and then heals
+    /// them: on disk and in memory alike.
     #[tokio::test]
     async fn a_run_with_nothing_to_redirect_heals_the_maven_config() {
+        use crate::formats::maven::repository_filter;
         use crate::formats::maven::trusted_checksums::Basedir::{Launcher, Session};
         use crate::patch::redirect::{MVN_CONFIG, MVN_WRAPPER_PROPERTIES};
         let wrapper_4 = "distributionUrl=https://repo.maven.apache.org/maven2/org/apache/maven/\
                          apache-maven/4.0.0/apache-maven-4.0.0-bin.zip\n";
-        // (the config, a Maven 4 wrapper, what the heal leaves)
-        for (config, maven_4, healed) in [
+        let filter_lines = |form| format!("{}\n", repository_filter::config_args(form).join("\n"));
+        let checksums = "redirect_maven_trusted_checksums_maven3_only";
+        let filter = "redirect_maven_repository_filter_maven3_only";
+        // (the config, a Maven 4 wrapper, what the heal leaves, what it
+        // says it traded away: only a heal that takes the session's
+        // property out of a project that declares no Maven trades anything)
+        let cases: [(String, bool, Option<String>, &[&str]); 11] = [
             (
                 checksums_block(Session),
                 false,
                 Some(checksums_block(Launcher)),
+                &[checksums],
             ),
             (
                 checksums_block(Launcher),
                 true,
                 Some(checksums_block(Session)),
+                &[],
             ),
             (
                 format!("-T4\n{}", checksums_block(Session)),
                 false,
                 Some(format!("-T4\n{}", checksums_block(Launcher))),
+                &[checksums],
             ),
-            // This project's own spelling, or no block: nothing to do.
-            (checksums_block(Launcher), false, None),
-            (checksums_block(Session), true, None),
-            ("-T4\n".to_string(), false, None),
-        ] {
+            // The filter's directory line on its own, and beside the block.
+            (
+                filter_lines(Session),
+                false,
+                Some(filter_lines(Launcher)),
+                &[filter],
+            ),
+            (
+                filter_lines(Launcher),
+                true,
+                Some(filter_lines(Session)),
+                &[],
+            ),
+            (
+                format!("{}{}", checksums_block(Session), filter_lines(Session)),
+                false,
+                Some(format!(
+                    "{}{}",
+                    checksums_block(Launcher),
+                    filter_lines(Launcher)
+                )),
+                &[checksums, filter],
+            ),
+            // This project's own spelling, or no such line: nothing to do.
+            (checksums_block(Launcher), false, None, &[]),
+            (checksums_block(Session), true, None, &[]),
+            (filter_lines(Launcher), false, None, &[]),
+            (filter_lines(Session), true, None, &[]),
+            ("-T4\n".to_string(), false, None, &[]),
+        ];
+        for (config, maven_4, healed, trade) in cases {
             let tmp = tempfile::tempdir().unwrap();
             let mut memory = MemoryProject::new();
             let mut put = |rel: &str, text: &str| {
@@ -6403,13 +6439,6 @@ snapshots:
                     .iter()
                     .map(|w| w.code.as_str())
                     .collect();
-                // Only the heal that takes the session's property out of a
-                // project that declares no Maven trades anything away.
-                let trade: &[&str] = if maven_4 {
-                    &[]
-                } else {
-                    &["redirect_maven_trusted_checksums_maven3_only"]
-                };
                 assert_eq!(codes, trade, "{config:?}");
 
                 // A caller that cannot write withholds all of it.

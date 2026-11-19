@@ -512,6 +512,14 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
         config_after.contains(launcher_line) && !config_after.contains(session_line),
         "a project that declares no Maven takes the default spelling:\n{config_after}"
     );
+    // The repository filter's directory follows the same rule, in the same
+    // run: no line of the config names `${session.rootDirectory}` now.
+    assert!(
+        config_after
+            .contains("prefixes.basedir=${maven.multiModuleProjectDirectory}/.mvn/socket-patch")
+            && !config_after.contains("${session.rootDirectory}"),
+        "both directories take the default spelling:\n{config_after}"
+    );
     let warned = |code: &str| {
         env["warnings"]
             .as_array()
@@ -526,9 +534,16 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
          away, and only then: {env}",
         mvn.version
     );
+    assert_eq!(
+        warned("redirect_maven_repository_filter_maven3_only"),
+        mvn.major() >= 4,
+        "Maven {}: and when it trades the repository filter on Maven 4 away: {env}",
+        mvn.version
+    );
     assert!(
-        !warned("redirect_maven_trusted_checksums_unenforced"),
-        "no Maven is named, so none is said to ignore the pin: {env}"
+        !warned("redirect_maven_trusted_checksums_unenforced")
+            && !warned("redirect_maven_repository_filter_unread"),
+        "no Maven is named, so none is said to ignore the pin or the filter: {env}"
     );
     assert_eq!(
         std::fs::read(undeclared.join("pom.xml")).unwrap(),
@@ -1685,14 +1700,25 @@ mod mediation {
     /// (`.mvn/socket-patch/prefixes-socket-patch-<uuid>.txt`) and the two
     /// resolver lines that make Maven read it.
     ///
+    /// The line that names the file's directory takes the property the
+    /// Trusted Checksums directory takes: the launcher's, which stops no
+    /// Maven 3 from starting, unless the project declares Maven 4, which
+    /// reads only the session's.
+    ///
     /// For a single pom and for a reactor, on a local repository that
     /// holds none of the project's artifacts:
     ///
-    /// - Maven 3.9.2 and later (Maven 4 too) ask the Socket repository for
-    ///   the patched version's jar and pom and their checksums, and for
-    ///   nothing else;
+    /// - Maven 3.9.2 and later 3.x ask the Socket repository for the
+    ///   patched version's jar and pom and their checksums, and for nothing
+    ///   else, from the project root and with `-f <project>/pom.xml` from
+    ///   outside it (where a line naming `${session.rootDirectory}` stops
+    ///   Maven 3.9.2 to 3.9.8 from starting at all);
     /// - an older Maven reads no such file and asks it for the rest too,
-    ///   and still builds (asserted, so a change either way is noticed);
+    ///   and still builds (asserted, so a change either way is noticed).
+    ///   So does Maven 4 while the project does not declare it;
+    /// - once the project declares the Maven under test, the next scan
+    ///   leaves a Maven 3 project as it is and respells a Maven 4 project's
+    ///   line, and Maven 4 then asks for nothing else either;
     /// - without the file (the wiring of an earlier release) every Maven
     ///   asks for the rest, which also shows the repository was cold;
     /// - a rollback takes the file and the lines out again, byte for byte.
@@ -1744,10 +1770,27 @@ mod mediation {
                 return;
             }
             // The wired project, resolved into the local repository `m2`
-            // (no fallback: nothing here may reach beyond the test's server).
-            let resolve = |m2: &Path, what: &str| {
-                let out = mvn.copy_dependencies(&proj, m2, &settings, "target/after");
-                assert!(ok(&out), "{name}, {what}:\n{}", dump(&out));
+            // (no fallback: nothing here may reach beyond the test's
+            // server), from the project root, or with `-f` from a directory
+            // outside the project.
+            let elsewhere = b.root.join(format!("elsewhere-{name}"));
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            let root_pom = proj.join("pom.xml");
+            let goal = format!("{DEPENDENCY_PLUGIN}:copy-dependencies");
+            let resolve = |m2: &Path, outside: bool, what: &str| {
+                let out = if outside {
+                    let out_dir = format!("-DoutputDirectory={}", elsewhere.join("dep").display());
+                    let args = ["-f", root_pom.to_str().unwrap(), &goal, &out_dir];
+                    mvn.run(&elsewhere, m2, &settings, &args)
+                } else {
+                    mvn.copy_dependencies(&proj, m2, &settings, "target/after")
+                };
+                assert!(
+                    ok(&out),
+                    "{name}, Maven {}, {what}:\n{}",
+                    mvn.version,
+                    dump(&out)
+                );
                 let _ = std::fs::remove_dir_all(proj.join("target"));
                 for (module, ..) in fixture::REACTOR_MODULES {
                     let _ = std::fs::remove_dir_all(proj.join(module).join("target"));
@@ -1778,6 +1821,25 @@ mod mediation {
                 warning(&env, "redirect_maven_repository_filter_conflict").is_none(),
                 "{name}: {env}"
             );
+            // The project declares no Maven: the directory is named through
+            // the launcher's property, which Maven 4 does not read.
+            let config = || std::fs::read_to_string(proj.join(".mvn/maven.config")).unwrap();
+            let names_dir = |property: &str| {
+                let line = format!(
+                    "-Daether.remoteRepositoryFilter.prefixes.basedir={property}/.mvn/socket-patch"
+                );
+                config().lines().any(|l| l == line)
+            };
+            let (launcher, session) = (
+                "${maven.multiModuleProjectDirectory}",
+                "${session.rootDirectory}",
+            );
+            assert!(
+                names_dir(launcher) && !config().contains(session),
+                "{name}:\n{}",
+                config()
+            );
+            let reads_launcher = mvn.filters_repositories() && mvn.major() < 4;
 
             // A local repository with the dependency plugin and none of
             // the project's artifacts.
@@ -1791,31 +1853,89 @@ mod mediation {
                 asked.difference(&victim).cloned().collect()
             };
 
-            let mark = b.server.paths().len();
-            resolve(&cold("filtered"), "with the prefix file");
-            let filtered = asked(mark);
-            assert!(
-                filtered.is_superset(&victim),
-                "{name}: the patched version comes from the Socket repository: {filtered:?}"
-            );
-            if mvn.filters_repositories() {
-                assert_eq!(
-                    rest(&filtered),
-                    Vec::<String>::new(),
-                    "{name}: Maven {} asks the Socket repository for nothing else",
-                    mvn.version
-                );
-            } else {
+            // From the project root, then with `-f` from outside it, where
+            // Maven 3.9.2 to 3.9.8 would not start at all on a line that
+            // named the directory through `${session.rootDirectory}`.
+            for (outside, tag, whence) in [
+                (false, "filtered", "from the project root"),
+                (true, "outside", "with -f from outside the project"),
+            ] {
+                let mark = b.server.paths().len();
+                resolve(&cold(tag), outside, whence);
+                let filtered = asked(mark);
                 assert!(
-                    !rest(&filtered).is_empty(),
-                    "{name}: Maven {} reads no prefix file: {filtered:?}",
-                    mvn.version
+                    filtered.is_superset(&victim),
+                    "{name}, {whence}: the patched version comes from the Socket repository: \
+                     {filtered:?}"
                 );
+                if reads_launcher {
+                    assert_eq!(
+                        rest(&filtered),
+                        Vec::<String>::new(),
+                        "{name}, {whence}: Maven {} asks the Socket repository for nothing else",
+                        mvn.version
+                    );
+                } else {
+                    assert!(
+                        !rest(&filtered).is_empty(),
+                        "{name}, {whence}: Maven {} does not read the prefix file of a project \
+                         that does not declare it: {filtered:?}",
+                        mvn.version
+                    );
+                }
+            }
+
+            // The project declares the Maven under test (its Maven Wrapper
+            // pins it) and is scanned again. A Maven 3 keeps the line; a
+            // Maven 4 gets the spelling it reads, and filters from then on,
+            // from the root and from outside. A Maven too old to read the
+            // filter is told so.
+            let wrapper = proj.join(".mvn/wrapper/maven-wrapper.properties");
+            std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "distributionUrl=https\\://repo.maven.apache.org/maven2/org/apache/maven/\
+                     apache-maven/{v}/apache-maven-{v}-bin.zip\n",
+                    v = mvn.version
+                ),
+            )
+            .unwrap();
+            let (code, env, stderr) = b.scan(&proj);
+            assert_eq!(code, Some(0), "{name}, declared: {env}\n{stderr}");
+            let declares_4 = mvn.major() >= 4;
+            assert!(
+                names_dir(session) == declares_4 && names_dir(launcher) != declares_4,
+                "{name}: a project that declares Maven {}:\n{}",
+                mvn.version,
+                config()
+            );
+            assert_eq!(
+                warning(&env, "redirect_maven_repository_filter_unread").is_some(),
+                !mvn.filters_repositories(),
+                "{name}: Maven {}: {env}",
+                mvn.version
+            );
+            if declares_4 {
+                for (outside, tag, whence) in [
+                    (false, "declared", "from the project root"),
+                    (true, "declared-outside", "with -f from outside the project"),
+                ] {
+                    let mark = b.server.paths().len();
+                    resolve(&cold(tag), outside, whence);
+                    let filtered = asked(mark);
+                    assert!(
+                        filtered.is_superset(&victim) && rest(&filtered).is_empty(),
+                        "{name}, {whence}: Maven {}, declared, asks the Socket repository for \
+                         the patched version only: {filtered:?}",
+                        mvn.version
+                    );
+                }
             }
 
             std::fs::remove_file(&filter).unwrap();
             let mark = b.server.paths().len();
-            resolve(&cold("unfiltered"), "without the prefix file");
+            resolve(&cold("unfiltered"), false, "without the prefix file");
             let unfiltered = asked(mark);
             assert!(
                 unfiltered.is_superset(&victim) && !rest(&unfiltered).is_empty(),
@@ -1824,13 +1944,12 @@ mod mediation {
             std::fs::write(&filter, listed).unwrap();
 
             b.rollback(&proj);
+            // (The wrapper pin is the test's own, not the scan's.)
+            std::fs::remove_file(&wrapper).unwrap();
             let after = fixture::snapshot(&proj);
-            // (Maven 4 keeps copies of the reactor's poms, as it last built
-            // them, in a project-local repository under `.mvn/target/`.)
             let differ: BTreeSet<&String> = after
                 .keys()
                 .chain(pristine.keys())
-                .filter(|rel| !rel.starts_with(".mvn/target/"))
                 .filter(|rel| after.get(*rel) != pristine.get(*rel))
                 .collect();
             assert!(

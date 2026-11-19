@@ -1180,7 +1180,8 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   Maven and carries the default form is enforced by Maven 3 only, so its checksum is not
   taken; the statement itself does not depend on it, since the suffixed version is the
   pin.
-* **The Socket repository is asked only for the patched version (hosted Maven, 3.9.2+).**
+* **The Socket repository is asked only for the patched version (hosted Maven 3.9.2+,
+  and Maven 4 in a project that declares it).**
   Maven asks a `<repository>` a pom declares, before Maven Central, for every artifact
   and parent pom its local repository does not hold yet. With each pin, hosted mode
   therefore also writes a prefix file for
@@ -1190,11 +1191,25 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   in `.mvn/maven.config` that switch the `prefixes` filter on and point it at
   `.mvn/socket-patch`. Maven then asks the Socket repository for the patched version's
   jar and pom and for nothing else, from the project root, a module directory or with
-  `-f`. A repository with no file of its own in that directory is not filtered. This
-  needs **Maven 3.9.2 or later** (Maven 4 included). Before 3.9 the two properties mean
-  nothing, and 3.9.0 / 3.9.1 do not interpolate `${session.rootDirectory}`, so the file
-  is never found: those builds run as before, unfiltered. Behind a mirror the repository
-  takes the mirror's id, so its file is not read and nothing is filtered.
+  `-f <project>/pom.xml` from outside the project. A repository with no file of its own
+  in that directory is not filtered. This needs **Maven 3.9.2 or later**. Before 3.9 the
+  two properties mean nothing, and 3.9.0 / 3.9.1 do not interpolate the directory, so
+  the file is never found: those builds run as before, unfiltered. Behind a mirror the
+  repository takes the mirror's id, so its file is not read and nothing is filtered.
+  - **The directory follows the project's Maven, like the checksums directory.** The
+    line names `.mvn/socket-patch` through `${maven.multiModuleProjectDirectory}`, which
+    no Maven 3 build fails on wherever it is started. Maven 4 does not read that
+    property, so a project that declares Maven 4 (a Maven Wrapper that pins it, or a
+    root pom of model 4.1.0) gets `${session.rootDirectory}` instead, the only form
+    Maven 4 reads; a Maven 4 build of a project that does not declare it runs
+    unfiltered. A line in the other spelling is respelled by the next hosted scan (and
+    by a `rollback` that leaves it), whatever the scan redirects: under
+    `${session.rootDirectory}` it stops Maven 3.9.2 to 3.9.8 from starting with `-f`
+    from outside the project. When that takes the filter away from a Maven 4 build of a
+    project that declares no Maven, `redirect_maven_repository_filter_maven3_only`
+    (`maven_repository_filter_maven3_only` on a rollback) says so. When the Maven
+    Wrapper pins a Maven older than 3.9.2, the files are written all the same and
+    `redirect_maven_repository_filter_unread` says that this Maven does not read them.
   - **One directory per build.** The filter reads its files from one directory. When
     `.mvn/maven.config` or `.mvn/jvm.config` already configures the prefix filter,
     hosted mode writes neither the lines nor the file and warns

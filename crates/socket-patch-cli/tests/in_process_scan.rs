@@ -1921,6 +1921,62 @@ async fn scan_hosted_with_nothing_to_redirect_heals_the_maven_config() {
     );
 }
 
+/// The same for the repository filter's directory line, here with no
+/// Trusted Checksums block beside it: the scan that redirects nothing
+/// reads the config for that line alone and respells it, so it does not go
+/// on stopping Maven 3.9.2 to 3.9.8 from starting with `-f` from outside
+/// the project.
+#[tokio::test]
+#[serial]
+async fn scan_hosted_with_nothing_to_redirect_heals_the_maven_filter_line() {
+    use socket_patch_cli::commands::scan::ScanMode;
+    let _no_jvm_caches = NoJvmCaches::new();
+    let m2 = tempfile::tempdir().unwrap();
+    std::env::set_var("MAVEN_REPO_LOCAL", m2.path());
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let lines = |property: &str| {
+        format!(
+            "-B\n-Daether.remoteRepositoryFilter.prefixes=true\n\
+             -Daether.remoteRepositoryFilter.prefixes.basedir={property}/.mvn/socket-patch\n"
+        )
+    };
+    let earlier = lines("${session.rootDirectory}");
+    let healed = lines("${maven.multiModuleProjectDirectory}");
+    let args_for = |root: &Path, dry_run: bool| {
+        let mut args = default_args(root);
+        args.common.api_url = Some(server.uri());
+        args.common.dry_run = dry_run;
+        args.mode = Some(ScanMode::Hosted);
+        args
+    };
+    let config = |root: &Path| std::fs::read_to_string(root.join(".mvn/maven.config")).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    project_with_a_stale_maven_config(tmp.path());
+    std::fs::write(tmp.path().join(".mvn/maven.config"), &earlier).unwrap();
+    // Dry: nothing written, no lock taken.
+    assert_eq!(run_scrubbed(args_for(tmp.path(), true)).await, 0);
+    assert_eq!(config(tmp.path()), earlier);
+    assert!(!tmp.path().join(".socket").exists());
+    // Wet: the one line is respelled, and a second run has nothing to do.
+    assert_eq!(run_scrubbed(args_for(tmp.path(), false)).await, 0);
+    assert_eq!(config(tmp.path()), healed);
+    assert_eq!(run_scrubbed(args_for(tmp.path(), false)).await, 0);
+    assert_eq!(config(tmp.path()), healed);
+
+    // This project's own spelling: the run reads it and touches nothing.
+    let settled = tempfile::tempdir().unwrap();
+    project_with_a_stale_maven_config(settled.path());
+    std::fs::write(settled.path().join(".mvn/maven.config"), &healed).unwrap();
+    assert_eq!(run_scrubbed(args_for(settled.path(), false)).await, 0);
+    assert_eq!(config(settled.path()), healed);
+    assert!(
+        !settled.path().join(".socket").exists(),
+        "a run with nothing to write takes no lock"
+    );
+}
+
 /// The heal is never a reason to fail a run that has nothing else to do:
 /// while another run holds the write lock the line is left for the next
 /// scan, and the scan still exits 0.

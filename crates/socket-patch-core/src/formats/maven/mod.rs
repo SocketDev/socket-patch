@@ -1026,6 +1026,18 @@ pub(crate) fn append_config_args(config: &str, args: &[&str], keep_ending: bool)
     }
 }
 
+/// Whether `config` (a `.mvn/maven.config`) holds lines hosted mode wrote
+/// that name a directory of the checkout through a root-directory
+/// property, in either spelling: the Trusted Checksums block
+/// ([`trusted_checksums::holds_written_block`]) or the repository filter's
+/// directory line ([`repository_filter::holds_written_line`]). Such lines
+/// are respelled for the Maven the project declares, so a caller asks this
+/// (a substring test for nearly every config) before it reads the Maven
+/// Wrapper and the root pom to find out which spelling the project takes.
+pub(crate) fn holds_respellable_lines(config: &str) -> bool {
+    trusted_checksums::holds_written_block(config) || repository_filter::holds_written_line(config)
+}
+
 /// Java's `String.trim`: every char up to U+0020, nothing beyond.
 fn java_trim(s: &str) -> &str {
     s.trim_matches(|c: char| c <= ' ')
