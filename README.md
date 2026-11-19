@@ -86,6 +86,8 @@ socket-patch scan --package lodash         # limit selection to a package
 socket-patch scan --max-new-patches 5       # introduce at most five new patches
 socket-patch scan 'apps/*'                  # scan projects in a monorepo
 socket-patch get pkg:npm/lodash@4.17.20      # target one package version
+socket-patch show pkg:npm/lodash@4.17.20     # look inside a patch: fixes, measurements, diff
+socket-patch list                          # what is patched here; in a terminal, browse and open patches
 socket-patch vendor                        # eject an existing hosted patch set
 socket-patch repair                        # restore agent or vendored patch artifacts
 socket-patch rollback lodash               # restore one package to upstream

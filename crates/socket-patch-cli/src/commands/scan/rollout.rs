@@ -50,10 +50,14 @@ pub(crate) struct Gate<'a> {
     /// The withdrawn-pin sweep's reference answers: the redirect asks the
     /// endpoint only about the selected uuids these do not cover.
     pub(crate) references: Option<super::withdrawn::KnownReferences>,
-    /// What each selected patch fixes and leaves unpatched, for the human
-    /// lines under the summary (empty under `--json`, which carries it on
+    /// The report's view of every package with a patch on offer: what
+    /// the selected patch fixes and leaves unpatched, for the rows under
+    /// the summary line (empty under `--json`, which carries it on
     /// `packages[]`).
-    pub(crate) coverage: Vec<super::discovery::AdvisoryCoverage>,
+    pub(crate) plan: Vec<super::report::Package>,
+    /// The invocation's report, which prints those rows and counts this
+    /// directory into its closing totals (`None` under `--json`).
+    pub(crate) report: Option<&'a mut super::report::Run>,
 }
 
 /// Scan's discovery, made BEFORE the apply lock, with the paths it read.

@@ -192,8 +192,10 @@ async fn human_vendored_uuid_prints_fetch_and_vendor_error_without_manifest_note
     );
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        stderr.contains(&format!("[fetch] {PURL}")),
-        "the detached download phase reports the fetched record; stderr={stderr}"
+        stderr.contains(&format!(
+            "Found patch for {PURL} [FREE]\nError: Cannot vendor {PURL}: "
+        )),
+        "the patch is named once, then the vendor error; stderr={stderr}"
     );
     assert!(
         !stdout.contains("Patch record saved to") && !stdout.contains("Added: 1"),
@@ -752,11 +754,11 @@ async fn silent_apply_failure_still_prints_an_error() {
     );
 }
 
-/// The nested apply's `Patched packages:` block puts its leading blank
-/// line on stderr: stdout gets no blank line of its own before it, and
-/// never two in a row.
+/// `get <uuid>` says what its apply did in one line: the patch was named
+/// by the save line (stderr), so stdout starts with the result and holds
+/// no list of patched packages and no blank line.
 #[tokio::test]
-async fn nested_apply_block_starts_stdout_without_a_blank_line() {
+async fn nested_apply_says_its_result_in_one_line() {
     let server = MockServer::start().await;
     mount_view_files(
         &server,
@@ -776,10 +778,17 @@ async fn nested_apply_block_starts_stdout_without_a_blank_line() {
     let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[UUID]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        stdout.starts_with(&format!("Patched packages:\n  {PURL}")),
+        stdout.starts_with("Applied 1 patch.\nNext steps:\n"),
         "stdout={stdout:?}"
     );
-    assert!(!stdout.contains("\n\n\n"), "stdout={stdout:?}");
+    assert!(
+        !stdout.contains("Patched packages:") && !stdout.contains("\n\n"),
+        "stdout={stdout:?}"
+    );
+    assert!(
+        stderr.contains("Patch saved to ") && !stderr.contains("Applying patches"),
+        "stderr={stderr:?}"
+    );
 }
 
 /// The two steps agent mode needs, as `get` prints them after a run that

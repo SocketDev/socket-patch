@@ -533,8 +533,8 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
     them where they are installed.
   - **A hosted or vendored package disappears from `bun audit` and `bun outdated`.** Bun
     checks registry resolutions only, so it stops reporting the package at all, including
-    advisories the applied patch does not fix. `socket-patch scan` lists those as
-    `still unpatched`.
+    advisories the applied patch does not fix. `socket-patch scan` counts those on the
+    package's row (`2 unpatched`) and names them under `--verbose`.
 
   In vendored mode the patched tarballs are files in the repository, so a build that
   copies only `package.json` and `bun.lock` before `bun install` (a common Dockerfile

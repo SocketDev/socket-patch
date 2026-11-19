@@ -1,14 +1,14 @@
 //! The human-readable `get` summary must not report one patch twice.
 //!
-//! `download_and_apply_patches_with` prints an `Added: / Skipped: / Failed: /
-//! Updated:` block after writing the manifest. Regression guard: the "added"
-//! tally was bumped for EVERY record it wrote — including the ones classified
-//! `Updated` — so replacing an existing manifest entry printed both
-//! `Added: 1` and `Updated: 1` for the single patch it had just swapped.
+//! `download_and_apply_patches_with` says what a `--save-only` run wrote in
+//! one line (`Saved 1 patch to <manifest> (1 updated).`). Regression guard:
+//! the "added" tally was once bumped for EVERY record it wrote — including
+//! the ones classified `Updated` — so replacing an existing manifest entry
+//! was reported as both an add and an update for the single patch it had
+//! just swapped.
 //!
 //! The JSON `downloaded` count deliberately covers adds + updates (pinned by
-//! `in_process_get_update_count.rs`); only the human `Added:` line is the
-//! true-adds count.
+//! `in_process_get_update_count.rs`), as does the line's "Saved N".
 //!
 //! Runs `--save-only` so the apply step never fires: this is purely about the
 //! download bookkeeping.
@@ -120,13 +120,12 @@ async fn replacing_a_manifest_entry_is_reported_as_updated_only() {
     assert_eq!(code, 0, "save-only update must succeed; stderr={stderr}");
 
     assert!(
-        stderr.contains("Updated: 1"),
-        "the replacement must be reported as an update; stderr={stderr}"
-    );
-    assert!(
-        !stderr.contains("Added: 1"),
-        "a replaced entry must NOT also be counted as an add — one patch, one \
-         line; stdout={stdout}\nstderr={stderr}"
+        stderr.ends_with(&format!(
+            "  [update] {PURL} (replacing 00000000)\n\
+             Saved 1 patch to ./.socket/manifest.json (1 updated).\n"
+        )),
+        "the replacement must be reported as one saved patch, an update, never also an add; \
+         stdout={stdout}\nstderr={stderr}"
     );
 
     // The manifest really was swapped (so the assertions above aren't
@@ -149,11 +148,11 @@ async fn a_brand_new_entry_is_still_reported_as_added() {
     assert_eq!(code, 0, "save-only add must succeed; stderr={stderr}");
 
     assert!(
-        stderr.contains("Added: 1"),
-        "a new entry must be reported as an add; stdout={stdout}\nstderr={stderr}"
+        stderr.ends_with("Saved 1 patch to ./.socket/manifest.json.\n"),
+        "a new entry must be reported as one saved patch; stdout={stdout}\nstderr={stderr}"
     );
     assert!(
-        !stderr.contains("Updated:"),
+        !stderr.contains("updated") && !stderr.contains("[update]"),
         "a new entry must not report an update; stderr={stderr}"
     );
 

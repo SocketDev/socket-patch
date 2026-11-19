@@ -81,7 +81,7 @@ fn help_flag_triggers_display_help() {
     // listed in the rendered help.
     let help = err.to_string();
     for name in [
-        "scan", "apply", "vex", "vendor", "rollback", "get", "list", "remove", "repair",
+        "scan", "apply", "vex", "vendor", "rollback", "get", "show", "list", "remove", "repair",
     ] {
         assert!(
             help.contains(name),

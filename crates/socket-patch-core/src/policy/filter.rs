@@ -537,17 +537,29 @@ impl SelectionFilter {
             .max()
     }
 
-    /// Why the advisory known by `ids` (its id and CVE aliases, canonical
-    /// spelling) needs no fix on `purl`; `None` when it does.
-    fn dropped(
+    /// Whether the file holds any reachability finding.
+    pub fn has_findings(&self) -> bool {
+        self.finding_count > 0
+    }
+
+    /// The state of the finding that decides the advisory known by `ids`
+    /// (its id and CVE aliases, any spelling) on `purl`: the most specific
+    /// finding, the most cautious of equally specific ones. `None` when no
+    /// finding covers it. `skip.advisories` is not consulted: a skipped
+    /// advisory keeps the state its findings give it.
+    pub fn reachability(&self, purl: &str, ids: &[String]) -> Option<Reachability> {
+        let ids: Vec<String> = ids.iter().map(|id| canonical_id(id)).collect();
+        self.finding_state(purl, &ids, self.package_state(purl))
+    }
+
+    /// [`Self::reachability`] over canonical `ids`, with the package-only
+    /// findings already matched (`package_state`).
+    fn finding_state(
         &self,
         purl: &str,
         ids: &[String],
         package_state: Option<Reachability>,
-    ) -> Option<Dropped> {
-        if ids.iter().any(|id| self.skip_advisories.contains(id)) {
-            return Some(Dropped::Skipped);
-        }
+    ) -> Option<Reachability> {
         // `Option`'s order puts `None` below every state.
         let mut for_package: Option<Reachability> = None;
         let mut anywhere: Option<Reachability> = None;
@@ -564,7 +576,21 @@ impl SelectionFilter {
                 None => anywhere = anywhere.max(Some(*state)),
             }
         }
-        match for_package.or(anywhere).or(package_state) {
+        for_package.or(anywhere).or(package_state)
+    }
+
+    /// Why the advisory known by `ids` (its id and CVE aliases, canonical
+    /// spelling) needs no fix on `purl`; `None` when it does.
+    fn dropped(
+        &self,
+        purl: &str,
+        ids: &[String],
+        package_state: Option<Reachability>,
+    ) -> Option<Dropped> {
+        if ids.iter().any(|id| self.skip_advisories.contains(id)) {
+            return Some(Dropped::Skipped);
+        }
+        match self.finding_state(purl, ids, package_state) {
             Some(Reachability::Unreachable) => Some(Dropped::Unreachable),
             Some(Reachability::Reachable | Reachability::Unknown) => None,
             None => match self.unlisted {
@@ -1069,6 +1095,46 @@ mod tests {
         // Another package: only the advisory-wide finding applies.
         let elsewhere = offer("pkg:npm/underscore@1.0.0", &[(B, "high", &[])]);
         assert!(needs_all(&f, &elsewhere));
+    }
+
+    /// The report's lookup: the deciding finding's state, by any spelling
+    /// of the advisory's id or a CVE alias, and `None` where no finding
+    /// reaches. A skipped advisory keeps its finding's state.
+    #[test]
+    fn reachability_reports_the_deciding_findings_state() {
+        let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        let none = filter(r#"{"version": 1, "skip": {"advisories": ["CVE-2021-23337"]}}"#);
+        assert!(!none.has_findings());
+        assert_eq!(none.reachability(LODASH, &ids(&[A])), None);
+
+        let f = filter(&format!(
+            r#"{{"version": 1, "skip": {{"advisories": ["{B}"]}}, "reachability": [
+                {{"package": "pkg:npm/minimist", "state": "unreachable"}},
+                {{"advisory": "{A}", "state": "unknown"}},
+                {{"advisory": "CVE-2021-23337", "package": "pkg:npm/lodash", "state": "reachable"}},
+                {{"advisory": "{B}", "state": "reachable"}}
+            ]}}"#
+        ));
+        assert!(f.has_findings());
+        assert_eq!(
+            f.reachability(LODASH, &ids(&[A])),
+            Some(Reachability::Unknown)
+        );
+        // An alias in another spelling finds the package-specific finding,
+        // which outranks the advisory-wide one.
+        assert_eq!(
+            f.reachability(LODASH, &ids(&[&A.to_lowercase(), "cve-2021-23337"])),
+            Some(Reachability::Reachable)
+        );
+        assert_eq!(
+            f.reachability("pkg:npm/minimist@1.2.5", &ids(&["GHSA-cccc-cccc-cccc"])),
+            Some(Reachability::Unreachable)
+        );
+        assert_eq!(f.reachability(LODASH, &ids(&["GHSA-cccc-cccc-cccc"])), None);
+        assert_eq!(
+            f.reachability(LODASH, &ids(&[B])),
+            Some(Reachability::Reachable)
+        );
     }
 
     #[test]

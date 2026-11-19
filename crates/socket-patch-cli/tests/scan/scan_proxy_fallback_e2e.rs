@@ -331,7 +331,12 @@ async fn one_unanswered_package_is_a_partial_failure_that_names_it() {
     let (code, stdout, stderr) = run_scan(tmp.path(), &server.uri(), &["--dry-run"]);
     assert_eq!(code, 1, "{stdout}\n{stderr}");
     assert!(stderr.contains(&format!("Warning: {detail}")), "{stderr}");
-    assert!(stdout.contains(NAMES[0]), "{stdout}");
+    // The answered package's patch is acted on (here: named as one the
+    // fixture's server has no hosted artifact for), never dropped.
+    assert!(
+        format!("{stdout}{stderr}").contains(NAMES[0]),
+        "{stdout}\n{stderr}"
+    );
     assert!(!stdout.contains("No patches available"), "{stdout}");
 }
 
