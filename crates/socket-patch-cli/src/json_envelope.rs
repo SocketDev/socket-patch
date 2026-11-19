@@ -158,6 +158,10 @@ pub struct VexSummary {
     pub path: String,
     /// Number of OpenVEX statements in the document.
     pub statements: usize,
+    /// How many of them say `affected` (see `vex_bazel_not_in_build`), not
+    /// `not_affected`. Omitted from JSON when none does.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub affected: usize,
     /// Document format tag, e.g. `"openvex-0.2.0"`.
     pub format: String,
     /// Run-level advisories raised during VEX generation (e.g.
@@ -168,6 +172,10 @@ pub struct VexSummary {
     /// Omitted from JSON when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<RunWarning>,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 impl Envelope {
@@ -1081,12 +1089,16 @@ mod tests {
         env.vex = Some(VexSummary {
             path: "/tmp/openvex.json".into(),
             statements: 3,
+            affected: 0,
             format: "openvex-0.2.0".into(),
             warnings: Vec::new(),
         });
         let v = env.to_value();
         assert_eq!(v["vex"]["path"], "/tmp/openvex.json");
         assert_eq!(v["vex"]["statements"], 3);
+        assert!(!v["vex"].as_object().unwrap().contains_key("affected"));
+        env.vex.as_mut().unwrap().affected = 2;
+        assert_eq!(env.to_value()["vex"]["affected"], 2);
         assert_eq!(v["vex"]["format"], "openvex-0.2.0");
         assert!(
             !v["vex"].as_object().unwrap().contains_key("warnings"),

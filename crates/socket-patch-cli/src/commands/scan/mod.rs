@@ -459,6 +459,7 @@ async fn embed_vex_into_json(
                     .display()
                     .to_string(),
                 statements: summary.statements,
+                affected: summary.affected,
                 format: "openvex-0.2.0".to_string(),
                 warnings: summary.warnings,
             });
@@ -517,6 +518,7 @@ async fn embed_vex_human(
                     "{}",
                     crate::commands::vex::format_vex_written(
                         summary.statements,
+                        summary.affected,
                         vex_args
                             .vex
                             .as_ref()

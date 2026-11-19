@@ -9,15 +9,12 @@
 //! repositories of Bazel's own and builds from there. None of them reads
 //! what a package manager installed in the checkout (`node_modules`, a
 //! virtualenv, a gem home), so a patch that is only in such a copy is not
-//! in the build. And rules_python and rules_ruby build no package from a
-//! line that points at a copy committed under `.socket/vendor`.
-//! rules_python 2.5.0-rc4 takes the path for the name of a project and
-//! fails the build of everything the hub serves (Bazel 9.3.2, 8.8.2 and
-//! 7.7.2). rules_ruby 1.0.0-rc2 runs `bundle install` in a repository that
-//! holds the Gemfile, its lock and the files the call lists as `srcs`,
-//! where the path of the copy does not exist; a call with `srcs` may list
-//! the files of the copy, and is not judged. rules_js does build a
-//! vendored tarball.
+//! in the build. And rules_python builds no package from a line that
+//! points at a copy committed under `.socket/vendor`: 2.5.0-rc4 takes the
+//! path for the name of a project and fails the build of everything the
+//! hub serves (Bazel 9.3.2, 8.8.2 and 7.7.2). rules_js does build a
+//! vendored tarball. What rules_ruby does with a vendored gem no build has
+//! shown, so a vendored gem is not judged.
 //!
 //! [`unbuilt`] names, for a patched package, the call that builds it from a
 //! file without its patch. It says so only when the files of the workspace
@@ -39,14 +36,19 @@
 //! Only a call that is a statement of its own counts ([`Call::whole`]):
 //! it runs, once. One in a comprehension, behind an `and`, in a
 //! conditional or in the arguments of another call may never run, and is
-//! passed over.
+//! passed over. So is a call that passes `*` or `**`, whose arguments are
+//! not all written out, and a `pip.parse` with `uv_lock`: rules_python
+//! (2.2.0 and later) can take the packages of such a call from that file
+//! alone, which is not read here.
 //!
 //! A lock is read like a file of the workspace ([`disk`]): never through a
 //! link that leads out of the Bazel root, although Bazel follows such a
 //! link. It is read only when it lies where the project's own lock can
-//! lie, once however many calls name it, and up to 64 MiB. Of a pnpm lock
-//! the project documents are read, for their keys alone: rules_js links
-//! nothing of the document pnpm 11 keeps for its own configuration.
+//! lie, once however many calls name it, and up to 64 MiB; its text is
+//! searched once for the patches of all the packages, and not kept. Of a
+//! pnpm lock the project documents are read, for their keys alone:
+//! rules_js links nothing of the document pnpm 11 keeps for its own
+//! configuration.
 //!
 //! Not looked at: what a `--override_repository` or an rc file changes,
 //! BUILD files, and hubs of other rulesets.
@@ -56,6 +58,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Component, Path};
+
+use aho_corasick::AhoCorasick;
 
 use super::starlark::{Call, Value};
 use super::workspace::{disk, Extension, Repo, Workspace};
@@ -114,8 +118,9 @@ struct Hub {
     /// each from that directory: the members of a pnpm workspace.
     members: fn(&str) -> Vec<String>,
     /// Whether a call of the tag may build a package from a line that
-    /// points at a copy under `.socket/vendor`.
-    builds_vendored: fn(&Call) -> bool,
+    /// points at a copy under `.socket/vendor`: rules_js does, and of
+    /// rules_ruby no build has shown that it does not.
+    builds_vendored: bool,
 }
 
 const HUBS: [Hub; 3] = [
@@ -137,7 +142,7 @@ const HUBS: [Hub; 3] = [
             owned(keys.filter_map(|package| pnpm_registry_key(package.key)))
         },
         members: lock_text_member_importers,
-        builds_vendored: |_| true,
+        builds_vendored: true,
     },
     Hub {
         ecosystem: "pypi",
@@ -163,7 +168,7 @@ const HUBS: [Hub; 3] = [
             )
         },
         members: |_| Vec::new(),
-        builds_vendored: |_| false,
+        builds_vendored: false,
     },
     Hub {
         ecosystem: "gem",
@@ -176,7 +181,7 @@ const HUBS: [Hub; 3] = [
         files: &["gemfile_lock", "gemfile"],
         lists: |text| owned(locked_specs(text).into_iter()),
         members: |_| Vec::new(),
-        builds_vendored: |call| call.unpacks() || call.arg("srcs").is_some(),
+        builds_vendored: true,
     },
 ];
 
@@ -275,17 +280,19 @@ fn judge(
         if !tags.doubts.is_empty() {
             continue;
         }
-        // What a file lists and its text, read when a package first asks
-        // and once for all the calls that name it: `None` for a file that
+        // What a file lists, and which patches of the packages its text
+        // names: read when a package first asks and once for all the calls
+        // that name it, and the text is not kept. `None` for a file that
         // is not the project's lock or cannot be read.
         let mut listed = HashMap::new();
-        for tag in tags.calls.iter().filter(|tag| tag.call.whole) {
+        let elsewhere = |call: &Call| call.unpacks() || call.arg("uv_lock").is_some();
+        for tag in (tags.calls.iter()).filter(|tag| tag.call.whole && !elsewhere(tag.call)) {
             for lock in files(workspace, tag.call, hub.files) {
                 for &at in &ours {
                     let package = &packages[at];
                     let unpatched = match &package.pins {
                         Some(pins) => {
-                            !(hub.builds_vendored)(tag.call)
+                            !hub.builds_vendored
                                 && pins.iter().any(|pin| below(project, pin) == lock)
                         }
                         None => {
@@ -300,13 +307,20 @@ fn judge(
                                 let key = |(name, version)| {
                                     PurlKey::new(&format!("pkg:{}/{name}@{version}", hub.ecosystem))
                                 };
-                                Some((listed.map(key).collect::<HashSet<_>>(), text))
+                                // One pass over the text for all the patches.
+                                let uuid = |at: usize| packages[at].uuid.as_str();
+                                let ids = ours.iter().map(|at| uuid(*at));
+                                let named = AhoCorasick::new(ids).ok()?;
+                                let named = named.find_overlapping_iter(&text);
+                                let named = named.map(|id| uuid(ours[id.pattern()]));
+                                Some((listed.map(key).collect(), named.collect()))
                             });
                             // A file that names the patch may hold it.
-                            listed.as_ref().is_some_and(|(listed, text)| {
+                            let lists = |(listed, named): &(HashSet<_>, HashSet<_>)| {
                                 listed.contains(&PurlKey::new(&package.purl))
-                                    && !text.contains(&package.uuid)
-                            })
+                                    && !named.contains(package.uuid.as_str())
+                            };
+                            listed.as_ref().is_some_and(lists)
                         }
                     };
                     if unpatched && found[at].is_none() {
@@ -618,38 +632,21 @@ use_repo(ruby, "bundle")
         let requests = "pkg:pypi/requests@2.31.0";
         assert_eq!(vendored("api", requests, &["requirements.txt"]), pypi);
         assert_eq!(vendored("api", requests, &["./requirements.txt"]), pypi);
-        let gem = "ruby.bundle_fetch billing/ruby.MODULE.bazel:2 billing/Gemfile";
-        let pins = ["Gemfile", "Gemfile.lock"];
-        assert_eq!(
-            vendored("billing", "pkg:gem/rack@2.2.8", &pins),
-            format!("{gem}.lock")
-        );
-        assert_eq!(vendored("billing", "pkg:gem/rack@2.2.8", &pins[..1]), gem);
-        // A call with `srcs` may copy the gem to where Bundler looks.
-        let listing = RUBY.replace(
-            "    gemfile =",
-            "    srcs = glob([\".socket/**\"]),\n    gemfile =",
-        );
-        assert_ne!(listing, RUBY);
-        let listing: &'static str = Box::leak(listing.into_boxed_str());
-        let files = with("billing/ruby.MODULE.bazel", listing);
-        assert_eq!(
-            said(&files, "billing", "pkg:gem/rack@2.2.8", Some(&pins)),
-            ""
-        );
-        assert_ne!(said(&files, "billing", "pkg:gem/rack@2.2.8", None), "");
-        // rules_js builds a committed tarball.
-        assert_eq!(
-            vendored("web", "pkg:npm/left-pad@1.3.0", &["pnpm-lock.yaml"]),
-            ""
-        );
-        // A file no hub reads, and the same name in another project. That
-        // the lock still lists the package is not asked of a committed
-        // copy.
-        assert_eq!(
-            vendored("api", requests, &["pyproject.toml", "uv.lock"]),
-            ""
-        );
+        // rules_js builds a committed tarball. What rules_ruby does with a
+        // committed gem no build has shown: it is not judged, in the
+        // Gemfile or in its lock, while an installed one is.
+        let (npm, gem) = ("pkg:npm/left-pad@1.3.0", "pkg:gem/rack@2.2.8");
+        assert_eq!(vendored("web", npm, &["pnpm-lock.yaml"]), "");
+        assert_eq!(vendored("billing", gem, &["Gemfile", "Gemfile.lock"]), "");
+        assert_eq!(vendored("billing", gem, &["Gemfile"]), "");
+        assert_ne!(said(&SHOP, "billing", gem, None), "");
+        // Not judged yet: a copy that files point at which no hub reads,
+        // while the lock the hub does read lists the registry's package.
+        let listed = "pkg:pypi/flask-cors@4.0.0";
+        assert_ne!(said(&SHOP, "api", listed, None), "");
+        assert_eq!(vendored("api", listed, &["pyproject.toml", "uv.lock"]), "");
+        assert_eq!(vendored("web", npm, &["package-lock.json"]), "");
+        // The same name in another project, and no file at all.
         assert_eq!(vendored("mobile", requests, &["requirements.txt"]), "");
         assert_eq!(vendored("api", "pkg:pypi/flask-cors@4.0.0", &[]), "");
     }
@@ -669,6 +666,36 @@ use_repo(ruby, "bundle")
         assert_eq!(said(&files, "web", "pkg:npm/left-pad@1.3.0", None), "");
         // The lock without it is judged as before.
         assert_eq!(said(&SHOP, "web", "pkg:npm/left-pad@1.3.0", None), NPM);
+
+        // Each package is judged by its own patch, also where two share
+        // one, and a package the lock does not list by none.
+        let other = "7a11e000-0000-4000-8000-0000000000b2";
+        let patched = |files: &[(&'static str, &'static str)], uuids: [&str; 3]| {
+            let text = |path: &str| files.iter().find(|(name, _)| *name == path);
+            let workspace = Workspace::read(&|path| match text(path) {
+                Some((_, text)) => Entry::Text(text.to_string()),
+                None => Entry::Absent,
+            });
+            let purls = [
+                "pkg:npm/left-pad@1.3.0",
+                "pkg:npm/@shop/ui@2.0.0",
+                "pkg:npm/is-odd@3.0.1",
+            ];
+            let packages: Vec<_> = (purls.iter().zip(uuids))
+                .map(|(purl, uuid)| Patched {
+                    purl: purl.to_string(),
+                    uuid: uuid.to_string(),
+                    pins: None,
+                })
+                .collect();
+            let read = |path: &str| text(path).map(|(_, text)| text.to_string());
+            let found = judge(&workspace, "web", &read, &packages);
+            found.iter().map(Option::is_some).collect::<Vec<_>>()
+        };
+        assert_eq!(patched(&files, [UUID, other, UUID]), [false, true, false]);
+        assert_eq!(patched(&files, [UUID, UUID, other]), [false, false, false]);
+        assert_eq!(patched(&files, [other, other, UUID]), [true, true, false]);
+        assert_eq!(patched(&SHOP, [UUID, UUID, UUID]), [true, true, false]);
     }
 
     #[test]
@@ -746,6 +773,35 @@ use_repo(ruby, "bundle")
         assert_eq!(said(&files, "api", "pkg:pypi/flask-cors@4.0.0", None), "");
         // A call of the same hub that does run is judged as before.
         assert_ne!(said(&files, "tools", "pkg:pypi/idna@3.6", None), "");
+    }
+
+    /// A call whose arguments are not all written out is passed over, and
+    /// so is a `pip.parse` with `uv_lock`: rules_python can take the
+    /// packages of such a call from that file, whatever the requirements
+    /// file lists or points at.
+    #[test]
+    fn a_call_that_may_read_another_file_withholds_nothing() {
+        let lock = "    requirements_lock = \"//api:requirements.txt\",\n";
+        let pypi = |argument: &str| {
+            let root = ROOT.replace(lock, &format!("{lock}    {argument},\n"));
+            assert_ne!(root, ROOT, "{argument}");
+            let root: &'static str = Box::leak(root.into_boxed_str());
+            let files = with("MODULE.bazel", root);
+            let pins = ["requirements.txt"];
+            [
+                said(&files, "api", "pkg:pypi/flask-cors@4.0.0", None),
+                said(&files, "api", "pkg:pypi/requests@2.31.0", Some(&pins)),
+            ]
+        };
+        let judged = "pip.parse MODULE.bazel:15 api/requirements.txt".to_string();
+        assert_eq!(pypi("quiet = False"), [judged.clone(), judged]);
+        for elsewhere in ["uv_lock = \"//api:uv.lock\"", "**COMMON", "*LOCKS"] {
+            assert_eq!(
+                pypi(elsewhere),
+                [String::new(), String::new()],
+                "{elsewhere}"
+            );
+        }
     }
 
     /// pnpm 11 keeps the packages of its own configuration in a first

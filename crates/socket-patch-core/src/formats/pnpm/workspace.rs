@@ -219,7 +219,8 @@ pub(crate) fn lock_text_has_member_importers(text: &str) -> bool {
 /// names: the directories of the workspace's members, each from the
 /// directory of the lock. Read as [`lock_text_has_member_importers`] reads
 /// them (the project documents alone, comment lines and CRLF as there),
-/// to the end of the lock.
+/// to the end of the `importers` section of each: a lock has some
+/// hundred lines of packages for each of them.
 pub(crate) fn lock_text_member_importers(text: &str) -> Vec<String> {
     use super::grammar::{documents, PnpmDocument};
     let mut members = Vec::new();
@@ -232,6 +233,9 @@ pub(crate) fn lock_text_member_importers(text: &str) -> Vec<String> {
                 continue;
             }
             if !line.is_empty() && !line.starts_with([' ', '\t']) {
+                if in_importers {
+                    break;
+                }
                 in_importers = line.trim_end() == "importers:";
             } else if in_importers {
                 let key = super::lines::parse_key_line(line, 2).map(|(key, _, _)| key);
@@ -721,6 +725,13 @@ mod tests {
         );
         let none: [&str; 0] = [];
         assert_eq!(lock_text_member_importers("lockfileVersion: '9.0'\n"), none);
+        // The reading ends with the section: what a later key holds, also
+        // under the same name, is not read.
+        let late = format!("{v9}\nimporters:\n\n  late: {{}}\n");
+        assert_eq!(
+            lock_text_member_importers(&late),
+            ["apps/web", "packages/ui"]
+        );
         // A commented-out importer is none, and a comment at column 0
         // does not end the section.
         let commented = v9.replace("  packages/ui:", "# kept\n  # apps/old: {}\n  packages/ui:");

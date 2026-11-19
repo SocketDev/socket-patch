@@ -1045,7 +1045,7 @@ fn an_installed_patch_is_affected_beside_a_hub_that_reads_the_lock() {
 /// manifest shared by several projects holds one. Every form omits that
 /// one with or without Bazel. `apply --vex` passes and writes the document
 /// of the first, as it did when it attested it as patched. So does `vex`,
-/// which reports the second as skipped.
+/// which reports both as skipped, each with its own code.
 #[test]
 fn an_installed_patch_is_affected_beside_a_patch_that_is_omitted_for_another_reason() {
     let (cell, standin, patch, entry) = checkout("");
@@ -1083,7 +1083,7 @@ fn an_installed_patch_is_affected_beside_a_patch_that_is_omitted_for_another_rea
     let (test, said) = (&cell.test, &vex.dump);
     assert_eq!(vex.code, 0, "{test}: {said}");
     assert_eq!(vex.envelope["status"], "partialFailure", "{test}: {said}");
-    let ours = (canonical_purl(PURL), "verified".into(), String::new());
+    let ours = (canonical_purl(PURL), "skipped".into(), NOT_IN_BUILD.into());
     let absent = (
         canonical_purl(other),
         "skipped".into(),
@@ -1099,27 +1099,17 @@ fn an_installed_patch_is_affected_beside_a_patch_that_is_omitted_for_another_rea
     assert_eq!(statuses, ["affected"], "{test}: {written:#}");
 }
 
-/// Without a Bazel: a document says of each package what Bazel builds of
-/// it. Hosted mode pinned the fixture's package in the lock, which rules_js
-/// builds it from. The lock lists a second package, which is patched in its
-/// installed copy alone, as agent mode leaves one, and both patches are for
-/// the same advisory. `vex` and `apply --vex` pass, and their document
-/// holds two statements for that advisory: the first package is not
-/// affected, through its pin, and the second is affected, with what to do
-/// about it.
-#[test]
-fn a_document_says_of_each_package_what_bazel_builds_of_it() {
-    let (cell, standin, patch, _) = checkout("");
-    std::fs::remove_dir_all(cell.path("node_modules")).expect("remove the installed tree");
-    let pinned = pins_the_lock(&cell, &standin, &patch);
-
-    // The second package: an entry of the lock as pnpm writes one for a
-    // registry package, the patched files where `pnpm install` puts them,
-    // and the record agent mode keeps in the manifest.
+/// A second package in the checkout of `cell`, patched in its installed
+/// copy alone, as agent mode leaves one: an entry of the lock as pnpm
+/// writes one for a registry package, the patched files where
+/// `pnpm install` puts them, and the patched file among the blobs. Gives
+/// its patch, its purl and the record agent mode keeps in the manifest,
+/// which names the advisory of the fixture's own patch.
+fn second_installed_patch(cell: &Cell) -> (Patched, String, Value) {
     let second = Patched::new();
     let renamed = |text: &str| text.replace("upstream", "second");
     let (name, purl) = (renamed(NAME), renamed(PURL));
-    let lock = text(&pinned, LOCK);
+    let lock = text(&cell.tree(), LOCK);
     let snapshots = "\nsnapshots:\n";
     assert_eq!(lock.matches(snapshots).count(), 1, "{lock}");
     let entry = renamed(&lock_entry(&placeholder()));
@@ -1140,80 +1130,206 @@ fn a_document_says_of_each_package_what_bazel_builds_of_it() {
     let patched = record["files"]["package/index.js"]["afterHash"].as_str();
     let blob = format!(".socket/blobs/{}", patched.expect("a hash"));
     cell.write(&blob, &second.package.index_js);
+    (second, purl, record)
+}
+
+/// What `vex --output <path>` of `cell` says to a script and to a person,
+/// in a checkout where it writes a document: it exits 0 both times. Gives
+/// the envelope's status, its events (each as its purl, its action, its
+/// code and the status of its details, in the order of the purls), the
+/// verified and skipped counts of its summary, the codes of its warnings,
+/// the statements of the document without their times, and the lines with
+/// which it tells a person what it wrote: to the file, to the file had it
+/// not been a dry run, and to stdout.
+fn vex_says(cell: &Cell, standin: &StandIn, name: &str) -> (Value, Vec<Value>, [String; 3]) {
+    let path = cell.document(name);
+    let args = ["vex", "--output", path.to_str().expect("a path")];
+    let vex = socket_patch(cell, standin, &args);
+    let (test, said) = (&cell.test, &vex.dump);
+    assert_eq!(vex.code, 0, "{test}: {said}");
+    let events = vex.envelope["events"].as_array().into_iter().flatten();
+    let mut events: Vec<Value> = events
+        .map(|event| {
+            let purl = canonical_purl(event["purl"].as_str().unwrap_or_default());
+            let (code, status) = (&event["errorCode"], &event["details"]["status"]);
+            json!([purl, event["action"], code, status])
+        })
+        .collect();
+    events.sort_by_key(|event| event[0].as_str().map(str::to_string));
+    let summary = &vex.envelope["summary"];
+    let machine = json!({
+        "status": vex.envelope["status"],
+        "events": events,
+        "verified": summary["verified"],
+        "skipped": summary["skipped"],
+        "warnings": codes_in(&vex.envelope["warnings"]),
+    });
+    let written = std::fs::read_to_string(&path).expect("a document");
+    let mut document: Value = serde_json::from_str(&written).expect("a JSON document");
+    let statements = document["statements"].as_array_mut().expect("statements");
+    for statement in statements.iter_mut() {
+        let object = statement.as_object_mut().expect("a statement");
+        assert!(object.remove("timestamp").is_some(), "{written}");
+    }
+    let origin = standin.origin();
+    let env = [("SOCKET_PATCH_SERVER_URL", origin.as_str())];
+    let told = |args: &[&str], starts: &str| {
+        let streams = cell.socket_patch_person(&origin, args, &env);
+        assert!(!streams[1].contains("Error"), "{test}: {streams:?}");
+        let mut lines = streams.iter().flat_map(|stream| stream.lines());
+        let line = lines.find(|line| line.starts_with(starts));
+        let line = line.unwrap_or_else(|| panic!("{test}: no {starts:?} line: {streams:?}"));
+        line.replace(path.to_str().expect("a path"), "<path>")
+    };
+    let dry = [&args[..], &["--dry-run"]].concat();
+    let wrote = [
+        told(&args, "Wrote "),
+        told(&dry, "[dry-run] "),
+        told(&args[..1], "Emitted "),
+    ];
+    println!("{test}: the document of `vex`:\n{written}");
+    (machine, std::mem::take(statements), wrote)
+}
+
+/// The statement of a document of the fixture's product about the package
+/// `id` and the advisory of the fixture's patches, without its status.
+fn about(id: &Value) -> Value {
+    json!({
+        "vulnerability": { "name": "GHSA-test-aaaa-bbbb", "aliases": ["CVE-2024-0001"] },
+        "products": [{ "@id": PRODUCT, "subcomponents": [{ "@id": id }] }],
+    })
+}
+
+/// Without a Bazel: a document says of each package what Bazel builds of
+/// it. Hosted mode pinned the fixture's package in the lock, which rules_js
+/// builds it from. The lock lists a second package, which is patched in its
+/// installed copy alone, as agent mode leaves one, and both patches are for
+/// the same advisory. `vex` and `apply --vex` exit 0, and their document
+/// holds two statements for that advisory: the first package is not
+/// affected, through its pin, and the second is affected, with what to do
+/// about it. `vex` reports the first as verified and the second as
+/// skipped, so the run is a partial failure, and tells a person how many
+/// of the statements say affected; `apply --vex` counts them in its
+/// envelope.
+#[test]
+fn a_document_says_of_each_package_what_bazel_builds_of_it() {
+    let (cell, standin, patch, _) = checkout("");
+    std::fs::remove_dir_all(cell.path("node_modules")).expect("remove the installed tree");
+    pins_the_lock(&cell, &standin, &patch);
+    let (second, purl, record) = second_installed_patch(&cell);
     let manifest = json!({ "patches": { purl.as_str(): record } });
     cell.write(".socket/manifest.json", manifest.to_string());
 
     let names = names(&cell, MODULE, LOCK);
-    let alone = cell.document("each");
-    let vex = ["vex", "--output", alone.to_str().expect("a path")];
-    let vex = socket_patch(&cell, &standin, &vex);
-    let (test, said) = (&cell.test, &vex.dump);
-    assert_eq!(vex.code, 0, "{test}: {said}");
-    assert_eq!(vex.envelope["status"], "success", "{test}: {said}");
-    let events = vex.envelope["events"].as_array().into_iter().flatten();
-    let events: Vec<_> = events
-        .map(|event| {
-            let purl = canonical_purl(event["purl"].as_str().unwrap_or_default());
-            (purl, &event["action"], &event["details"]["status"])
-        })
-        .collect();
-    let verified = &json!("verified");
-    let expected = [
-        (canonical_purl(PURL), verified, &json!("not_affected")),
-        (canonical_purl(&purl), verified, &json!("affected")),
+    let (machine, statements, wrote) = vex_says(&cell, &standin, "each");
+    let test = &cell.test;
+    let (first, other) = (canonical_purl(PURL), canonical_purl(&purl));
+    let expected = json!({
+        "status": "partialFailure",
+        "events": [
+            [other, "skipped", NOT_IN_BUILD, "affected"],
+            [first, "verified", null, "not_affected"],
+        ],
+        "verified": 1,
+        "skipped": 1,
+        "warnings": [NOT_IN_BUILD],
+    });
+    assert_eq!(machine, expected, "{test}");
+    let told = [
+        "Wrote OpenVEX document with 2 statements (1 affected) to <path>",
+        "[dry-run] Would write OpenVEX document with 2 statements (1 affected) to <path>",
+        "Emitted 2 VEX statements (1 affected)",
     ];
-    assert_eq!(events, expected, "{test}: {said}");
-    assert_eq!(
-        codes_in(&vex.envelope["warnings"]),
-        [NOT_IN_BUILD],
-        "{test}: {said}"
-    );
+    assert_eq!(wrote, told, "{test}");
 
-    let written = std::fs::read_to_string(&alone).expect("a document");
-    let mut document: Value = serde_json::from_str(&written).expect("a JSON document");
-    let statements = document["statements"].as_array_mut().expect("statements");
-    let ids: Vec<String> = statements
-        .iter_mut()
-        .map(|statement| {
-            let object = statement.as_object_mut().expect("a statement");
-            assert!(object.remove("timestamp").is_some(), "{written}");
-            let id = &object["products"][0]["subcomponents"][0]["@id"];
-            id.as_str().unwrap_or_default().to_string()
-        })
-        .collect();
-    let about = |id: &String| {
-        json!({
-            "vulnerability": { "name": "GHSA-test-aaaa-bbbb", "aliases": ["CVE-2024-0001"] },
-            "products": [{ "@id": PRODUCT, "subcomponents": [{ "@id": id }] }],
-        })
-    };
-    let mut expected = [about(&ids[0]), about(&ids[1])];
+    let ids = statements
+        .iter()
+        .map(|statement| &statement["products"][0]["subcomponents"][0]["@id"]);
+    let ids: Vec<&Value> = ids.collect();
+    let mut expected = [about(ids[0]), about(ids[1])];
     expected[0]["status"] = "not_affected".into();
     expected[0]["justification"] = "inline_mitigations_already_exist".into();
     let impact = format!("Patched via Socket patch {} (redirected)", patch.uuid);
     expected[0]["impact_statement"] = impact.into();
     expected[1]["status"] = "affected".into();
     expected[1]["action_statement"] = action(&second, &names[0]).into();
-    assert_eq!(document["statements"], json!(expected), "{test}: {written}");
-    let named: Vec<String> = ids.iter().map(|id| canonical_purl(id)).collect();
-    assert_eq!(
-        named,
-        [canonical_purl(PURL), canonical_purl(&purl)],
-        "{written}"
-    );
+    assert_eq!(statements, expected, "{test}");
+    let named: Vec<String> = ids
+        .iter()
+        .map(|id| canonical_purl(id.as_str().unwrap_or_default()))
+        .collect();
+    assert_eq!(named, [first, other], "{test}");
 
     let in_run = cell.document("each-apply");
     let apply = [&["apply"][..], &with_vex(&in_run)].concat();
     let apply = socket_patch(&cell, &standin, &apply);
     let (summary, said) = (&apply.envelope["vex"], &apply.dump);
     assert_eq!(apply.code, 0, "{test}: {said}");
-    assert_eq!(summary["statements"], 2, "{test}: {said}");
+    let counted = [&summary["statements"], &summary["affected"]];
+    assert_eq!(counted, [&json!(2), &json!(1)], "{test}: {said}");
     assert_eq!(
         codes_in(&summary["warnings"]),
         [NOT_IN_BUILD],
         "{test}: {said}"
     );
-    println!("{test}: the document of `vex`:\n{written}");
+}
+
+/// Without a Bazel: two packages that are patched in their installed
+/// copies alone, by two patches for one advisory, while the hub reads the
+/// lock that lists both. `vex` exits 0 with a document of two statements
+/// for that advisory, one per package: each names its package alone, and
+/// its action statement names the patch of that package. It reports both
+/// as skipped and none as verified, warns of each, and tells a person that
+/// both statements say affected.
+#[test]
+fn each_affected_package_of_an_advisory_has_a_statement_of_its_own() {
+    let (cell, standin, patch, entry) = checkout("");
+    let names = names(&cell, MODULE, LOCK);
+    patches_the_installed_copy(&cell, &standin, "", &patch, &entry, Some(&names));
+    let (second, purl, record) = second_installed_patch(&cell);
+    let manifest = ".socket/manifest.json";
+    let mut recorded: Value = serde_json::from_str(&text(&cell.tree(), manifest)).expect(manifest);
+    recorded["patches"][purl.as_str()] = record;
+    cell.write(manifest, recorded.to_string());
+
+    let (machine, statements, wrote) = vex_says(&cell, &standin, "both");
+    let test = &cell.test;
+    let (first, other) = (canonical_purl(PURL), canonical_purl(&purl));
+    let expected = json!({
+        "status": "partialFailure",
+        "events": [
+            [other, "skipped", NOT_IN_BUILD, "affected"],
+            [first, "skipped", NOT_IN_BUILD, "affected"],
+        ],
+        "verified": 0,
+        "skipped": 2,
+        "warnings": [NOT_IN_BUILD, NOT_IN_BUILD],
+    });
+    assert_eq!(machine, expected, "{test}");
+    let told = [
+        "Wrote OpenVEX document with 2 statements (2 affected) to <path>",
+        "[dry-run] Would write OpenVEX document with 2 statements (2 affected) to <path>",
+        "Emitted 2 VEX statements (2 affected)",
+    ];
+    assert_eq!(wrote, told, "{test}");
+
+    let said: Vec<(String, Value)> = statements
+        .iter()
+        .map(|statement| {
+            let id = &statement["products"][0]["subcomponents"][0]["@id"];
+            let mut expected = about(id);
+            expected["status"] = "affected".into();
+            expected["action_statement"] = statement["action_statement"].clone();
+            assert_eq!(*statement, expected, "{test}");
+            let action = statement["action_statement"].clone();
+            (canonical_purl(id.as_str().unwrap_or_default()), action)
+        })
+        .collect();
+    let expected = [
+        (other, json!(action(&second, &names[0]))),
+        (first, json!(action(&patch, &names[0]))),
+    ];
+    assert_eq!(said, expected, "{test}");
 }
 
 /// Without a Bazel: a patch whose record names no advisory gets no
@@ -1348,7 +1464,8 @@ fn an_installed_patch_is_affected_after_a_hosted_scan_that_pins_nothing() {
     // A hosted scan says of every document it writes that it hashed no
     // file for a hosted patch.
     let summary = &scan.envelope["vex"];
-    assert_eq!(summary["statements"], 1, "{test}: {said}");
+    let counted = [&summary["statements"], &summary["affected"]];
+    assert_eq!(counted, [&json!(1), &json!(1)], "{test}: {said}");
     let warned = ["vex_hosted_unverified", NOT_IN_BUILD];
     assert_eq!(codes_in(&summary["warnings"]), warned, "{test}: {said}");
     let claim = Claim::unbuilt(PURL, &patch.uuid, &names);

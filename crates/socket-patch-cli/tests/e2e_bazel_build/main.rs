@@ -49,8 +49,8 @@
 //! `socket-patch` reads `MODULE.bazel` for the calls that hand a lock to a
 //! ruleset, and says of a package whose patch such a ruleset does not
 //! build that it is affected: a patch in the copy a package manager
-//! installed, or a PyPI or RubyGems one in a copy committed under
-//! `.socket/vendor`. Two flows hold it to that
+//! installed, or a PyPI one in a copy committed under `.socket/vendor`.
+//! Two flows hold it to that
 //! (`npm::agent_npm_translate_lock`, `pypi::vendored_pip_parse`): the
 //! build is not the patched one, every form of `vex` writes a document
 //! that says affected and names the call and the file Bazel builds from,

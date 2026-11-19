@@ -1112,9 +1112,9 @@ impl Cell {
     /// not build the patched copy of the one package the run attests. The
     /// command passes and writes the document, which says `claim`: the
     /// package is affected. It prints the line `warned` on stderr and no
-    /// error, and says that it wrote a document with one statement (a
-    /// hosted scan on stderr, with a note after it). With `--silent` among
-    /// `args` it prints nothing at all.
+    /// error, and says that it wrote a document with one statement, which
+    /// says affected (a hosted scan on stderr, with a note after it). With
+    /// `--silent` among `args` it prints nothing at all.
     pub fn tells_a_person(
         &self,
         api: &str,
@@ -1140,7 +1140,7 @@ impl Cell {
             return;
         }
         let wrote = format!(
-            "Wrote OpenVEX document with 1 statement to {}",
+            "Wrote OpenVEX document with 1 statement (1 affected) to {}",
             path.display()
         );
         let mut lines = stdout.lines().chain(stderr.lines());
@@ -1222,8 +1222,10 @@ impl Cell {
     /// the one of an earlier call. `verified` is false for
     /// `vex --no-verify`, which says in a warning, and in the document,
     /// that it checked no file. Of an affected package it says the same
-    /// with and without that option: its one event has the status
-    /// `affected`, and its one warning names what the claim names.
+    /// with and without that option, and does not report it as verified:
+    /// its one event is `skipped` with the code [`NOT_IN_BUILD`] and the
+    /// status `affected`, the run is a partial failure that exits 0, and
+    /// its one warning names what the claim names.
     pub fn stands_alone(&self, run: impl Fn(&Cell, &[&str]) -> Ran, claim: &Claim, verified: bool) {
         let path = self.document("stand-alone");
         let _ = std::fs::remove_file(&path);
@@ -1231,16 +1233,26 @@ impl Cell {
         let ran = run(self, &[&vex(&path), unchecked].concat());
         let (test, said) = (&self.test, &ran.dump);
         assert_eq!(ran.code, 0, "{test}: {said}");
-        assert_eq!(ran.envelope["status"], "success", "{test}: {said}");
         let [event] = events(&ran.envelope) else {
             panic!("{test}: not one event: {said}");
         };
-        assert_eq!(event["action"], "verified", "{test}: {said}");
+        let affected = usize::from(claim.affected());
+        let [status, action, state] = [
+            ["success", "verified", "not_affected"],
+            ["partialFailure", "skipped", "affected"],
+        ][affected];
+        assert_eq!(ran.envelope["status"], status, "{test}: {said}");
+        assert_eq!(event["action"], action, "{test}: {said}");
+        let code = [Value::Null, json!(NOT_IN_BUILD)][affected].clone();
+        assert_eq!(event["errorCode"], code, "{test}: {said}");
+        let summary = &ran.envelope["summary"];
+        let counted = [&summary["verified"], &summary["skipped"]].map(Value::as_u64);
+        let expected = [[Some(1), Some(0)], [Some(0), Some(1)]][affected];
+        assert_eq!(counted, expected, "{test}: {said}");
         let purl = normalize_purl(event["purl"].as_str().unwrap_or_default());
         assert_eq!(purl, normalize_purl(claim.purl), "{test}: {said}");
         let details = &event["details"];
-        let status = ["not_affected", "affected"][usize::from(claim.affected())];
-        assert_eq!(details["status"], status, "{test}: {said}");
+        assert_eq!(details["status"], state, "{test}: {said}");
         assert_eq!(details["vulnerability"], ADVISORY, "{test}: {said}");
         let warned: &[&str] = match (claim.affected(), verified) {
             (true, _) => &[NOT_IN_BUILD],
@@ -1289,12 +1301,15 @@ impl Cell {
     /// `claim` and nothing else. A hosted scan says of its document that
     /// no file was hashed for it: the lock names the patch, and the bytes
     /// come with the next build. A run whose document says the package is
-    /// affected warns of it once, and names what the claim names.
+    /// affected counts that statement as such, warns of it once, and names
+    /// what the claim names.
     pub fn wrote_in_run(&self, ran: &Ran, path: &Path, claim: &Claim) {
         let (test, said) = (&self.test, &ran.dump);
         assert_eq!(ran.code, 0, "{test}: {said}");
         let vex = &ran.envelope["vex"];
         assert_eq!(vex["statements"], 1, "{test}: {said}");
+        let affected = [Value::Null, json!(1)][usize::from(claim.affected())].clone();
+        assert_eq!(vex["affected"], affected, "{test}: {said}");
         assert_eq!(vex["format"], "openvex-0.2.0", "{test}: {said}");
         assert_eq!(vex["path"], argument(path), "{test}: {said}");
         let warned: &[&str] = match claim.how {

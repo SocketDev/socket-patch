@@ -2297,18 +2297,19 @@ is patched:
   the lock of a pnpm workspace above it that names that directory among its `importers`.
   Measured for rules_js 3.6.0 on Bazel 9.3.2, 8.8.2 and 7.7.2: the build prints the
   unpatched package before `scan --mode agent` and after it.
-- **A PyPI or RubyGems patch committed under `.socket/vendor`** (vendored mode), when such a
-  call names the file that points at the copy. rules_python 2.5.0-rc4 takes the path of the
-  line for the name of a project, and the build of everything the hub serves fails (same
-  three releases). rules_ruby runs `bundle install` where the path does not exist; a
-  `bundle_fetch` with `srcs`, which may copy the gem there, is left alone, and no test here
-  builds a vendored gem. A vendored npm tarball is built by rules_js and keeps its statement.
+- **A PyPI patch committed under `.socket/vendor`** (vendored mode), when such a call names
+  the file that points at the copy. rules_python 2.5.0-rc4 takes the path of the line for
+  the name of a project, and the build of everything the hub serves fails (same three
+  releases). A vendored npm tarball is built by rules_js and keeps its statement. So does a
+  vendored gem, for another reason: no build here has shown what rules_ruby does with one,
+  so nothing is said of it.
 
-Each advisory of such a patch gets a statement with the status `affected`. It names the
-package under the product as a `not_affected` statement does, and its `action_statement`
-says what Bazel builds the package from and what to run so that the build holds the patch.
-It has no `justification` and no `impact_statement`. An advisory that a patched package and
-such a package share has two statements, the `not_affected` one first:
+Each advisory of such a patch gets a statement of the package's own with the status
+`affected`. It names that package alone under the product, and its `action_statement` says
+what Bazel builds the package from and what to run so that the build holds the patch. It
+has no `justification` and no `impact_statement`. Packages that share an advisory are not
+merged into one such statement, so each action statement is about one package; the
+`not_affected` statement of the advisory, for the packages that are patched, comes first:
 
 ```json
 {
@@ -2322,7 +2323,7 @@ such a package share has two statements, the `not_affected` one first:
 }
 ```
 
-For a vendored PyPI or RubyGems package the action statement is:
+For a vendored PyPI package the action statement is:
 
 ```
 Bazel builds no package from the line of requirements.txt that points at the copy of Socket patch 7a11e000-... under .socket/vendor (`pip.parse`, MODULE.bazel:15): the build fails, or takes the registry's package. Run `socket-patch vendor --revert`, then `socket-patch scan --mode hosted`.
@@ -2339,11 +2340,20 @@ Warning: pkg:npm/left-pad@1.3.0: the VEX document says affected. Bazel builds th
 
 Nothing is left out of the document for this reason, so the document is always written:
 `vex` exits 0 with it, also when every statement says `affected`, and `scan --vex`,
-`apply --vex` and `vendor --vex` write it and keep their exit code. A script tells the two
-kinds of statement apart by the document's `status`; by `details.status` of the `verified`
-event that `vex --json` reports for each package of a statement (`affected` or
-`not_affected`); and, in a command run with `--vex`, by a `vex_bazel_not_in_build` entry in
-`vex.warnings` of its envelope. `--no-verify` changes none of this.
+`apply --vex` and `vendor --vex` write it and keep their exit code. No run reports such a
+package as patched. `vex --json` reports each `affected` statement as a `skipped` event with
+`errorCode: "vex_bazel_not_in_build"` and `details.status: "affected"`, beside the
+`verified` events of the `not_affected` ones. `summary.verified` counts only those, and the
+envelope's `status` is `partialFailure`, as for every run that leaves a patch unattested. A
+command run with `--vex` keeps its own status, and the `vex` object of its envelope says
+how many statements were written (`statements`) and how many of them say `affected`
+(`affected`, left out when none does), with the warning in `vex.warnings`. The line a
+person reads counts them too: `Wrote OpenVEX document with 2 statements (1 affected) to
+out.json`. `--no-verify` changes none of this.
+
+When a hub reads the project's own lock, the document describes what Bazel builds from that
+lock, also for a repository that ships what its package manager installed and keeps the
+hub for something else, such as its tests.
 
 Nothing changes where the files do not show such a call: outside a Bazel workspace, in a
 `--global` run, for a hosted pin, for a project whose own lock no call names, and wherever
@@ -2356,14 +2366,15 @@ Python or Ruby project below the directory of the file a hub reads). The workspa
 read with certainty when a module file is missing, cannot be read or holds a statement the
 reader does not follow (a `load`, an `if`, a hub proxy handed to anything but `use_repo` or
 `inject_repo`); when the call gives its file as anything but a plain string label of the
-main repository; when the lock cannot be read, is larger than 64 MiB, or is a link that
-leads out of the Bazel root (Bazel follows such a link; socket-patch reads no file outside
-the root); and when a `WORKSPACE`, `WORKSPACE.bazel` or `WORKSPACE.bzlmod` at the root holds
-more than a `workspace(...)` call. Bazel 7 reads that file beside `MODULE.bazel`, and its
-calls are not read yet; Bazel 9 never reads it, so a workspace on Bazel 9 that still has
-such a file keeps its `not_affected` statements although nothing builds the patched copy. A
-workspace
-without a `MODULE.bazel` is not read at all. In each of these the document is the one of a
+main repository, passes `*` or `**`, or is a `pip.parse` with `uv_lock`, whose packages
+rules_python 2.2.0 and later can take from that file; when the lock cannot be read, is
+larger than 64 MiB, or is a link that leads out of the Bazel root (Bazel follows such a
+link; socket-patch reads no file outside the root); and when a `WORKSPACE`,
+`WORKSPACE.bazel` or `WORKSPACE.bzlmod` at the root holds more than a `workspace(...)` call.
+Bazel 7 reads that file beside `MODULE.bazel`, and its calls are not read yet; Bazel 9 never
+reads it, so a workspace on Bazel 9 that still has such a file keeps its `not_affected`
+statements although nothing builds the patched copy. A workspace without a `MODULE.bazel`
+is not read at all. In each of these the document is the one of a
 project without Bazel. Flags outside the committed files (`--override_repository`, an rc
 file) and BUILD files are not read either.
 
@@ -2397,18 +2408,30 @@ the build is broken):
 
 - **Agent mode beside rules_js, rules_python or rules_ruby**, wherever the statement does
   not say `affected` above. `npm_translate_lock` is given an `npm_package_lock` or a
-  `yarn_lock`, which are not read. The hub reads a lock above the project that does not name
-  the project among its importers. The hub reads a lock below the directory the command runs
-  in: a run at the repository root while the hub reads `web/pnpm-lock.yaml`. A Python or Ruby
-  project lies below the directory of the file the hub reads. The call is not a statement of
-  its own. A `WORKSPACE` file at the root defines something, or the workspace has no
-  `MODULE.bazel`. Measured for rules_js, which builds from the lock and never reads the
-  patched `node_modules`.
-- **Vendored mode for PyPI and RubyGems**, where the workspace is not read with certainty: a
+  `yarn_lock`, which are not read, or `pip.parse` a `uv_lock`. The hub reads a lock above
+  the project that does not name the project among its importers. The hub reads a lock
+  below the directory the command runs in: a run at the repository root while the hub reads
+  `web/pnpm-lock.yaml`. A Python or Ruby project lies below the directory of the file the
+  hub reads. The call is not a statement of its own, or passes `*` or `**`. A `WORKSPACE`
+  file at the root defines something, or the workspace has no `MODULE.bazel`. Measured for
+  rules_js, which builds from the lock and never reads the patched `node_modules`.
+- **Vendored mode for PyPI**, where the workspace is not read with certainty: a
   `WORKSPACE` file that defines something, no `MODULE.bazel`, a call that is not a statement
   of its own, a file that is not given as a plain string label. And where the line that
   points at the copy is in a requirements file that the file the call names brings in with
   `-r`. Measured for PyPI, where the build fails.
+- **Vendored mode for RubyGems** beside `ruby.bundle_fetch`. rules_ruby 1.0.0-rc2 runs
+  `bundle install` in a repository that holds the Gemfile, its lock and the files the call
+  lists as `srcs`, so the path of the copy may not exist there. Read from its source; no
+  build has been run, so the statement is left as it is.
+- **A vendored package whose own files the hub does not read**, while the lock the hub does
+  read still lists the registry's package: a uv or Poetry project vendored through
+  `pyproject.toml` and its lock while `pip.parse` reads a requirements file exported before;
+  an npm package vendored through `package-lock.json` while `npm_translate_lock` reads a
+  `pnpm-lock.yaml`. Bazel builds the registry's package. The check of an installed copy is
+  not applied to them yet: rules_js can rewrite the pnpm lock from the other files under
+  `update_pnpm_lock`, `npm_package_lock` or `yarn_lock`, and rules_python can take the
+  packages from `uv_lock`, so the lock a call names does not always decide.
 - **Hosted mode for PyPI**, when a `pip.parse` or `pip_parse` takes the requirements of the
   build's platform from another file than the one socket-patch rewrote.
 - **Go** under a `go_repository` rule of a `WORKSPACE`, in hosted and vendored mode; and

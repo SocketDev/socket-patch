@@ -13,8 +13,9 @@
 //!
 //! A package the caller knows the build takes without its patch gets
 //! `affected` statements ([`build_document_with_affected`]): one per
-//! vulnerability ID again, apart from the `not_affected` one of the same
-//! ID, so an ID that a patched and an unpatched package share has two.
+//! vulnerability ID, of its own, after the `not_affected` one of the same
+//! ID. Such statements are not merged, so that the action statement of
+//! each is about one subcomponent.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -106,17 +107,18 @@ pub fn build_document_marking_unverified(
 /// [`build_document_marking_unverified`], where `affected` names the
 /// PURLs whose patch the caller knows the build does not take, each with
 /// what to do about it. Every vulnerability of such a PURL's record gets a
-/// statement with the status `affected`: the PURL is a subcomponent of
-/// the product, as in a `not_affected` statement, and the action
-/// statement holds what the caller gave (those of several PURLs, each
-/// once, after one another). It has no justification and no impact
-/// statement, which belong to `not_affected`.
+/// statement of the PURL's own with the status `affected`: the PURL is
+/// the one subcomponent of the product, and the action statement is what
+/// the caller gave for it, so a reader knows which package to act on. It
+/// has no justification and no impact statement, which belong to
+/// `not_affected`.
 ///
 /// A PURL is in `applied` or in `affected`, and `affected` wins for one
-/// in both. A vulnerability that PURLs of both kinds share has two
-/// statements, the `not_affected` one first: a reader that keeps the
-/// last statement of a document about a product and a vulnerability
-/// keeps the one that says `affected`. With no such PURL the document is
+/// in both. A vulnerability that PURLs of both kinds share has the
+/// `not_affected` statement of the patched ones first, then one
+/// `affected` statement per PURL: a reader that keeps the last statement
+/// of a document about a product and a vulnerability keeps one that says
+/// `affected`. With no such PURL the document is
 /// [`build_document_marking_unverified`]'s, byte for byte.
 pub fn build_document_with_affected(
     manifest: &PatchManifest,
@@ -137,11 +139,13 @@ pub fn build_document_with_affected(
         .map(|(purl, action)| (purl.as_str(), action.as_str()))
         .collect();
 
-    // (vuln-id, affected) -> (aliases, statement parts, subcomponent PURLs)
+    // (vuln-id, affected PURL) -> (aliases, statement parts, subcomponent
+    // PURLs): the patched PURLs of an ID share a group, and each affected
+    // one has its own.
     // BTreeMap/BTreeSet keep every output field sorted, which keeps
     // statement order deterministic and helps reproducibility for
     // downstream diffs.
-    let mut grouped: BTreeMap<(String, bool), VulnGroup> = BTreeMap::new();
+    let mut grouped: BTreeMap<(String, Option<&str>), VulnGroup> = BTreeMap::new();
 
     for (purl, record) in &manifest.patches {
         let action = actions.get(purl.as_str());
@@ -149,9 +153,8 @@ pub fn build_document_with_affected(
             continue;
         }
         for (vuln_id, info) in &record.vulnerabilities {
-            let entry = grouped
-                .entry((vuln_id.clone(), action.is_some()))
-                .or_default();
+            let alone = action.map(|_| purl.as_str());
+            let entry = grouped.entry((vuln_id.clone(), alone)).or_default();
             entry.aliases.extend(info.cves.iter().cloned());
             entry.subcomponents.insert(purl.clone());
             if let Some(action) = action {
@@ -193,19 +196,12 @@ pub fn build_document_with_affected(
         // (purl, vuln) pair, so every group present in `grouped`
         // has ≥1 entry. The defensive `None` arm stays in case a
         // future refactor decouples grouping from impact tracking.
-        // Impact parts are clauses; an action statement is sentences.
         let words = if group.parts.is_empty() {
             None
         } else {
-            Some(
-                group
-                    .parts
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .join(if affected { " " } else { "; " }),
-            )
+            Some(group.parts.into_iter().collect::<Vec<_>>().join("; "))
         };
-        let (status, justification, impact_statement, action_statement) = if affected {
+        let (status, justification, impact_statement, action_statement) = if affected.is_some() {
             (Status::Affected, None, None, words)
         } else {
             let justification = Justification::InlineMitigationsAlreadyExist;
@@ -252,7 +248,7 @@ struct VulnGroup {
     aliases: BTreeSet<String>,
     subcomponents: BTreeSet<String>,
     /// What each PURL adds to the impact statement of a `not_affected`
-    /// statement, or to the action statement of an `affected` one.
+    /// statement, or the action statement of an `affected` one.
     parts: BTreeSet<String>,
 }
 
@@ -1049,14 +1045,14 @@ mod tests {
         }
     }
 
-    /// A vulnerability that a patched PURL and an affected one share has
-    /// one statement per status, the `not_affected` one first, each with
-    /// its own PURLs. Affected PURLs that share a vulnerability share its
-    /// statement, with the action of each once. A PURL in both sets is
-    /// affected, and one whose record names no vulnerability gets no
-    /// statement.
+    /// A vulnerability that a patched PURL and affected ones share has the
+    /// `not_affected` statement of the patched one first, then an
+    /// `affected` statement for each of the others, with that PURL alone
+    /// and its own action, also where two share a patch and so the words.
+    /// A PURL in both sets is affected, and one whose record names no
+    /// vulnerability gets no statement.
     #[test]
-    fn a_vulnerability_has_one_statement_per_status() {
+    fn each_affected_purl_of_a_vulnerability_has_a_statement_of_its_own() {
         let mut manifest = PatchManifest::new();
         for (purl, uuid, vulns) in [
             ("pkg:npm/built@1.0.0", "u-built", vec!["GHSA-shared"]),
@@ -1099,32 +1095,20 @@ mod tests {
                 (st.vulnerability.name.as_str(), st.status, subs, words)
             })
             .collect();
-        let lost = vec![
-            "pkg:npm/lost@1.0.0",
-            "pkg:npm/lost@2.0.0",
-            "pkg:pypi/gone@3.0",
-        ];
+        let affected_by = |id, purl, action| (id, Status::Affected, vec![purl], Some(action));
         assert_eq!(
             said,
             [
-                (
-                    "GHSA-own",
-                    Status::Affected,
-                    vec!["pkg:pypi/gone@3.0"],
-                    Some("Revert u-gone.")
-                ),
+                affected_by("GHSA-own", "pkg:pypi/gone@3.0", "Revert u-gone."),
                 (
                     "GHSA-shared",
                     Status::NotAffected,
                     vec!["pkg:npm/built@1.0.0"],
                     Some("Patched via Socket patch u-built")
                 ),
-                (
-                    "GHSA-shared",
-                    Status::Affected,
-                    lost,
-                    Some("Pin u-lost. Revert u-gone.")
-                ),
+                affected_by("GHSA-shared", "pkg:npm/lost@1.0.0", "Pin u-lost."),
+                affected_by("GHSA-shared", "pkg:npm/lost@2.0.0", "Pin u-lost."),
+                affected_by("GHSA-shared", "pkg:pypi/gone@3.0", "Revert u-gone."),
             ]
         );
         let silent = [affected[3].clone()];

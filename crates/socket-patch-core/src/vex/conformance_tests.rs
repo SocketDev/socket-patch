@@ -751,7 +751,8 @@ fn an_affected_statement_carries_an_action_statement_and_no_justification() {
     let alone = affected_doc(false);
     assert_eq!(alone.statements.len(), 1);
     let mixed = affected_doc(true);
-    // One statement per vulnerability and status: the shared one has two.
+    // The patched package and the affected one each have a statement for
+    // the vulnerability they share.
     let said: Vec<_> = (mixed.statements.iter())
         .map(|st| (st.vulnerability.name.as_str(), st.status))
         .collect();
@@ -798,6 +799,8 @@ fn an_affected_statement_carries_an_action_statement_and_no_justification() {
                     let action = st.action_statement.as_deref().unwrap_or_default();
                     assert!(!action.is_empty(), "affected requires an action_statement");
                     assert_eq!(json["action_statement"], action);
+                    let about = product.subcomponents.len();
+                    assert_eq!(about, 1, "an action statement is about one package");
                     for key in reserved {
                         assert!(!obj.contains_key(key), "{key} goes with not_affected");
                     }
