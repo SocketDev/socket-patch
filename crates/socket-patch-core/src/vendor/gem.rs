@@ -857,7 +857,10 @@ async fn recorded_inventory(
 /// locked platform is there, passes
 /// [`super::verify::verify_platform_tree`] (every file of it is the one
 /// the ledger's `inventory` of the copy records; without an inventory it
-/// must hold a patched file) and has a valid stub gemspec.
+/// must hold a patched file) and has a valid stub gemspec. With an
+/// inventory, the copy as a whole must also match it, as `vendor --check`
+/// requires: a file outside every locked tree (at the copy root, or the
+/// tree of a platform the lock does not name) is not in sync.
 async fn platform_copy_intact(
     copy_dir: &Path,
     name: &str,
@@ -876,7 +879,12 @@ async fn platform_copy_intact(
             return false;
         }
     }
-    true
+    match inventory {
+        Some(inventory) => super::verify::verify_dir_inventory(copy_dir, inventory, None)
+            .await
+            .is_ok(),
+        None => true,
+    }
 }
 
 /// A fresh wet vendor's pure edits, computed before any download or write:
@@ -12402,6 +12410,47 @@ mod tests {
                 check_vendored_artifact(&root, &entry, &record).await,
                 ArtifactHealth::Healthy
             );
+        }
+
+        /// A file planted outside every locked platform's tree (at the copy
+        /// root, or as the tree of a platform the lock does not name, which
+        /// bundler's glob would load once that platform is added) is one
+        /// the ledger's inventory does not list. The check rejects it, and
+        /// so does the in-sync test of a re-run, which rebuilds the copy.
+        #[tokio::test]
+        async fn a_file_planted_outside_the_locked_trees_is_not_in_sync() {
+            let (_tmp, root, record) = project(&lock(None)).await;
+            let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            let entry = vendor_and_persist(&root, &record, &cfg).await;
+            let copy = root.join(rel(UUID));
+            for planted in [
+                copy.join("planted.rb"),
+                copy.join("x64-mingw-ucrt").join(SO),
+            ] {
+                tokio::fs::create_dir_all(planted.parent().unwrap())
+                    .await
+                    .unwrap();
+                tokio::fs::write(&planted, b"unpatched").await.unwrap();
+                assert_eq!(
+                    check_vendored_artifact(&root, &entry, &record).await,
+                    ArtifactHealth::Corrupt {
+                        reason: "vendor_inventory_mismatch".to_string()
+                    }
+                );
+                let (result, rebuilt, warnings) =
+                    unwrap_done(vendor(&root, &not_installed(&root), &record, &cfg, false).await);
+                assert!(result.success, "{:?}", result.error);
+                assert!(
+                    warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+                    "{warnings:?}"
+                );
+                assert!(rebuilt.is_some(), "a refreshed entry");
+                assert!(!planted.exists(), "the rebuild drops {planted:?}");
+                assert_eq!(
+                    check_vendored_artifact(&root, &entry, &record).await,
+                    ArtifactHealth::Healthy
+                );
+            }
         }
 
         /// `record` with only `files`.
