@@ -493,6 +493,12 @@ async fn heal_mvn_config(
     if !trusted_checksums::holds_written_block(config) {
         return;
     }
+    // The flush refuses a write through a symbolic link, and the whole
+    // restore with it: a linked config keeps its line, as a scan keeps it.
+    let path = view.root().join(config_rel);
+    if crate::utils::containment::linked_level(view.root(), &path).is_some() {
+        return;
+    }
     let wrapper = view
         .read(&format!("{dir}{MVN_WRAPPER_PROPERTIES}"))
         .await
@@ -1022,32 +1028,32 @@ mod tests {
         assert_eq!(codes(&outcome), [left]);
     }
 
-    /// The heal is a courtesy. The flush is all or nothing and will not
-    /// write through a symbolic link, so a linked config that keeps the
-    /// block is left exactly as it is, and the pin is restored all the
-    /// same, as it was before there was a heal. (`rollback` and `remove`
-    /// both restore through here.)
+    /// A leftover block in a `.mvn/maven.config` that is a symbolic link is
+    /// not healed: the flush refuses a linked file, so the heal would
+    /// refuse a restore that has nothing else against it.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_linked_config_keeps_its_line_and_the_pin_is_still_restored() {
+    async fn a_linked_config_the_rollback_leaves_is_not_healed() {
         use super::trusted_checksums::{self, Basedir::Session};
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let put = |rel: &str, text: &str| {
-            let path = root.join(rel);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, text).unwrap();
-        };
         let config = format!(
             "-Dmaven.test.skip=true\n{}\n",
             trusted_checksums::config_args(Session).join("\n")
         );
-        put("pom.xml", &fixture("basic", "expected", "pom.xml"));
-        put(
-            ".mvn/checksums/checksums.sha256",
-            &fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
-        );
-        put("ci/maven.config", &config);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".mvn/checksums")).unwrap();
+        std::fs::create_dir_all(root.join("ci")).unwrap();
+        std::fs::write(
+            root.join("pom.xml"),
+            fixture("basic", "expected", "pom.xml"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".mvn/checksums/checksums.sha256"),
+            fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+        )
+        .unwrap();
+        std::fs::write(root.join("ci/maven.config"), &config).unwrap();
         std::os::unix::fs::symlink("../ci/maven.config", root.join(".mvn/maven.config")).unwrap();
         let pins = [HostedPin {
             purl: "pkg:maven/org.slf4j/slf4j-api@1.7.36".into(),
@@ -1065,13 +1071,68 @@ mod tests {
             std::fs::read_to_string(root.join("pom.xml")).unwrap(),
             fixture("basic", "input", "pom.xml")
         );
-        assert!(!root.join(".mvn/checksums/checksums.sha256").exists());
-        let link = std::fs::symlink_metadata(root.join(".mvn/maven.config")).unwrap();
-        assert!(link.file_type().is_symlink(), "the link is still a link");
+        assert!(root.join(".mvn/maven.config").is_symlink());
         assert_eq!(
             std::fs::read_to_string(root.join("ci/maven.config")).unwrap(),
-            config,
-            "and what it points at is untouched"
+            config
+        );
+    }
+
+    /// The same holds for anything else the flush will not write, which
+    /// is all or nothing: a `.mvn` directory that does not take the write
+    /// keeps the config as it is, and the pins are restored all the same,
+    /// as they were before there was a heal. (Root writes anywhere, so
+    /// there is nothing to see as root.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_config_the_flush_could_not_write_is_not_healed() {
+        use super::trusted_checksums::{self, Basedir::Session};
+        use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let config = format!(
+            "-Dmaven.test.skip=true\n{}\n",
+            trusted_checksums::config_args(Session).join("\n")
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".mvn/checksums")).unwrap();
+        std::fs::write(
+            root.join("pom.xml"),
+            fixture("basic", "expected", "pom.xml"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".mvn/checksums/checksums.sha256"),
+            fixture("basic", "expected", ".mvn/checksums/checksums.sha256"),
+        )
+        .unwrap();
+        std::fs::write(root.join(".mvn/maven.config"), &config).unwrap();
+        // The config's own directory is read-only; the checksums
+        // directory below it still takes the removal of its file.
+        let mvn = root.join(".mvn");
+        std::fs::set_permissions(&mvn, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let pins = [HostedPin {
+            purl: "pkg:maven/org.slf4j/slf4j-api@1.7.36".into(),
+            uuid: UUID.into(),
+            files: vec!["pom.xml".into()],
+        }];
+        let opts = RestoreOptions {
+            offline: true,
+            ..RestoreOptions::default()
+        };
+        let outcome = restore_upstream(root, &pins, &opts).await;
+        std::fs::set_permissions(&mvn, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(outcome.flush_error, None);
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(
+            std::fs::read_to_string(root.join("pom.xml")).unwrap(),
+            fixture("basic", "input", "pom.xml")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".mvn/maven.config")).unwrap(),
+            config
         );
         // The leftover lines are reported; no trade is claimed for a line
         // that was not changed.
