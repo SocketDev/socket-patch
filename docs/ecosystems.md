@@ -2102,10 +2102,36 @@ wire is skipped, neither file changes for it, and the warning says why and what 
 | `redirect_gem_declaration_not_visible` | the lock lists it as a direct dependency, but it is declared where the scan cannot edit: an `eval_gemfile`d file, a loop, a gemspec. Declare it with a literal `gem "<name>"` line in the Gemfile, in place of any other `gem` call that declares it (a gemspec's development dependency stays), or patch it with `--mode agent`. Vendored mode refuses it for the same reason. |
 | `redirect_gem_dependency_not_locked` | the Gemfile declares it and the lock's `DEPENDENCIES` does not list it. Run `bundle lock` and re-run. |
 | `redirect_gem_lock_unconvergeable` | the lock cannot be brought in line with the Gemfile: it has no `BUNDLED WITH` section to say which layout its Bundler accepts, or a Bundler < 2.2 lock lists its sources in an order the Gemfile's `source` lines do not explain. Run `bundle lock` with your current Bundler and re-run. |
-| `redirect_gem_platform_unsupported` | the lock holds a platform-specific build of the gem (`nokogiri (1.16.0-x86_64-linux)`); the patch registry serves the `ruby` platform gem only. |
+| `redirect_gem_platform_unsupported` | the lock holds a platform-specific build of the gem (`nokogiri (1.18.10-x86_64-linux-gnu)`) that the patch has no patched build for. The warning names the builds the lock holds, the ones that are missing, and what the patch registry serves. See "Precompiled platform gems" below. |
 
 `--mode agent` can still patch a gem hosted mode skips. `--mode vendored` can too, unless it
 refuses the gem itself (see "Ruby gems: gems vendored mode refuses").
+
+**Precompiled platform gems.** Bundler installs a gem such as nokogiri as a precompiled platform
+gem, and the lock then has one entry per platform the project supports, usually with no plain
+`nokogiri (1.18.10)`:
+
+```text
+    nokogiri (1.18.10-arm64-darwin)
+      racc (~> 1.4)
+    nokogiri (1.18.10-x86_64-linux-gnu)
+      racc (~> 1.4)
+```
+
+For such a gem the patch registry serves a patched platform gem (a "prebuild") per platform: the
+upstream platform gem with the patch's files replaced, under the same file name. When the patch
+has a prebuild for every platform the lock names, the scan wires the gem like any other. The
+Gemfile edit is the same, every platform entry moves to the patch registry's `GEM` section with
+its dependency lines (and a plain `nokogiri (1.18.10)` entry beside them moves too),
+`DEPENDENCIES` gains the `!`, and each `CHECKSUMS` entry takes the sha256 of its own prebuild.
+`bundle install` then fetches the one patched platform gem of the machine it runs on and
+compiles nothing, in frozen and deployment mode too.
+
+When the patch has no prebuild for one of the locked platforms, the gem is skipped with
+`redirect_gem_platform_unsupported` and neither file changes: a machine of that platform would
+otherwise be sent to a registry that has no gem for it. Remove the platform from the lock if the
+project does not need it (`bundle lock --remove-platform <platform>`) and re-run, or wait for the
+prebuild.
 
 **Undoing it.** `rollback` and `remove` take the option (or the added line) off again and
 restore the lock: the pair is the pre-scan pair byte for byte, with LF or CRLF line endings.
@@ -2247,7 +2273,7 @@ How each mode gets the patched code running:
 
 | Mode | What happens |
 |---|---|
-| Hosted | Bundler installs the patched `.gem` from the patch registry, and RubyGems compiles it like any registry gem. A precompiled platform gem (`x86_64-linux`) is refused with `redirect_gem_platform_unsupported`. |
+| Hosted | Bundler installs the patched `.gem` from the patch registry, and RubyGems compiles it like any registry gem. A gem the lock pins as precompiled platform gems (`x86_64-linux-gnu`) is installed from the patched platform gem the registry serves for that platform, with nothing to compile; it is skipped with `redirect_gem_platform_unsupported` only while the patch has no patched build for one of the locked platforms. |
 | Vendored | A gem `Gemfile.lock` pins as precompiled platform gems (one entry per platform, such as `nokogiri (1.18.10-x86_64-linux-gnu)`) is vendored from prebuilt patched platform gems. The patch service builds one for each platform, and the vendored directory holds each of them unpacked (`<name>-<version>/<platform>/`), so Bundler loads the one for the platform it runs on and builds nothing. Every platform in the lock needs one. While the patch service has none for one of them the gem is skipped with `vendor_prebuilt_platform_pending`, which names the platforms that have none: the run does not fail, nothing is written, a patch that is already vendored stays in place, and a later run vendors the gem once every platform has one. A lock that also holds the plain `nokogiri (1.18.10)` entry of the `ruby` platform is refused with `platform_gem_unsupported`, and so is a lock written by a Bundler older than 2.3 (its `BUNDLED WITH`), the oldest version the layout is verified on. The vendored directory carries its own `.gitignore` and `.gitattributes`, so a project rule such as `*.so` or a Git LFS filter does not keep the prebuilt binaries out of the commit or change their bytes. Bundler cannot add a platform the vendored directory has no gem for: to add one later, revert the gem (`vendor --revert`), run `bundle lock --add-platform <platform>` and vendor again. A gem with a native extension that is locked for the `ruby` platform alone is refused (`native_extensions_unsupported`, or `platform_gem_unsupported` when the installed copy is a precompiled one): Bundler builds no extensions for path-sourced gems. Use hosted or agent mode for that gem. |
 | Agent (`apply`) | The extension is rebuilt from the gem's source archive with the patch laid over it, using RubyGems' builder and the Ruby that owns the install, and the build is put where Ruby loads it: the extension directory of a gem RubyGems built, the prebuilt binary of a precompiled gem. |
 

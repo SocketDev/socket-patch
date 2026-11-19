@@ -29,6 +29,7 @@ pub(crate) mod ruby;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
+use crate::patch::gem_source::GemId;
 use crate::utils::digest::sha256_hex;
 use crate::utils::purl::simple_purl;
 use crate::vendor::lock_inventory::{http_url, LockIntegrity, LockfileEntry, SourceKind};
@@ -90,6 +91,25 @@ pub(crate) struct SpecLine<'t> {
     /// The entry text, trimmed.
     pub(crate) raw: &'t str,
     pub(crate) parsed: Option<Spec<'t>>,
+}
+
+impl SpecLine<'_> {
+    /// Whether this entry locks a build of the gem `name` at `version`: the
+    /// ruby-platform entry `name (version)`, or a precompiled platform
+    /// build `name (version-<platform>)`. Bundler resolves one gem version
+    /// to one entry per platform the lock supports, so a redirect of the
+    /// version moves all of them together.
+    pub(crate) fn locks(&self, name: &str, version: &str) -> bool {
+        let ruby = self
+            .raw
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix(" ("))
+            .and_then(|rest| rest.strip_suffix(')'))
+            == Some(version);
+        ruby || self.parsed.is_some_and(|spec| {
+            spec.platform.is_some() && spec.name == name && spec.version == version
+        })
+    }
 }
 
 /// One source section (`GEM`, `PATH`, `GIT`, `PLUGIN SOURCE`).
@@ -242,12 +262,151 @@ impl<'t> GemfileLock<'t> {
         self.checksum_entries.is_some()
     }
 
+    /// The builds of `name` at `version` the lock names ([`LockedBuilds`]),
+    /// among the `GEM` sections' specs and the `CHECKSUMS` entries that pin
+    /// a sha256. A bare `CHECKSUMS` entry is what Bundler writes for a gem
+    /// it has no digest for (a `PATH` or `GIT` gem): it names no registry
+    /// build.
+    pub(crate) fn locked_builds(&self, name: &str, version: &str) -> LockedBuilds<'t> {
+        let mut builds = LockedBuilds::default();
+        let specs = self
+            .gem_sections()
+            .flat_map(|section| section.specs.iter().map(|line| line.raw));
+        // A `CHECKSUMS` entry up to its `)`: the spec it pins.
+        let checksums = self
+            .checksum_entries
+            .iter()
+            .flatten()
+            .copied()
+            .filter_map(|entry| {
+                let (name, token, tail) = split_checksum_entry(entry)?;
+                tail.contains("sha256=")
+                    .then(|| &entry[..name.len() + " (".len() + token.len() + ")".len()])
+            });
+        for entry in specs.chain(checksums) {
+            let Some(spec) = parse_spec(entry).filter(|s| s.name == name && s.version == version)
+            else {
+                continue;
+            };
+            match spec.platform {
+                Some(platform) => {
+                    builds.platforms.insert(platform);
+                }
+                None => builds.ruby = true,
+            }
+        }
+        builds
+    }
+
     /// [`Self::checksum`] as the lock pin readers record: the valid sha256
     /// as [`LockIntegrity::Sha256Hex`], `None` when the lock pins nothing.
     pub(crate) fn integrity(&self, name: &'t str, token: &'t str) -> Option<LockIntegrity> {
         self.checksum(name, token)
             .map(|sha| LockIntegrity::Sha256Hex(sha.to_string()))
     }
+}
+
+/// The builds of one gem version a lock names
+/// ([`GemfileLock::locked_builds`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct LockedBuilds<'t> {
+    /// The platform of every `name (version-<platform>)` entry, sorted the
+    /// way Bundler orders them.
+    pub(crate) platforms: BTreeSet<&'t str>,
+    /// A ruby-platform `name (version)` entry is among them.
+    pub(crate) ruby: bool,
+}
+
+impl LockedBuilds<'_> {
+    /// The builds as releases of `name` at `version`, in Bundler's order:
+    /// the ruby-platform gem (when the lock names it), then each platform
+    /// build. A [`GemId`] spells a build's lock token and its file name,
+    /// so the rewrite, the restore and the refresh all take them from here.
+    pub(crate) fn ids(&self, name: &str, version: &str) -> Vec<GemId> {
+        let id = |platform: Option<&str>| GemId {
+            name: name.to_string(),
+            version: version.to_string(),
+            platform: platform.map(str::to_string),
+        };
+        let ruby = self.ruby.then(|| id(None));
+        ruby.into_iter()
+            .chain(self.platforms.iter().map(|platform| id(Some(platform))))
+            .collect()
+    }
+}
+
+/// One build of a gem version as RubyGems installs it and Bundler's cache
+/// dir archives it: the ruby-platform gem, or a precompiled platform gem.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GemBuild {
+    /// `<name>-<version>[-<platform>]`: the name of its gem dir, its
+    /// gemspec and its `.gem` archive.
+    pub leaf: String,
+    /// `None` for the ruby-platform gem.
+    pub platform: Option<String>,
+}
+
+impl GemBuild {
+    fn of(id: &GemId) -> GemBuild {
+        GemBuild {
+            leaf: id.full_name(),
+            platform: id.platform.clone(),
+        }
+    }
+
+    /// The ruby-platform build of the gem `purl` (`None`: no gem purl).
+    pub fn ruby(purl: &str) -> Option<GemBuild> {
+        let (name, version) = gem_coordinates(purl)?;
+        Some(GemBuild::of(&GemId {
+            name,
+            version,
+            platform: None,
+        }))
+    }
+
+    /// The build of the gem `purl` that a gem dir or archive named `leaf`
+    /// holds; `None` when `leaf` names no build of that version (another
+    /// gem whose name starts the same way: a platform starts with a
+    /// letter, see `is_platform_dir_of`).
+    pub fn of_leaf(purl: &str, leaf: &str) -> Option<GemBuild> {
+        let ruby = GemBuild::ruby(purl)?;
+        if leaf == ruby.leaf {
+            return Some(ruby);
+        }
+        let (name, version) = gem_coordinates(purl)?;
+        crate::crawlers::ruby_crawler::is_platform_dir_of(leaf, &name, &version).then(|| GemBuild {
+            leaf: leaf.to_string(),
+            platform: Some(leaf[ruby.leaf.len() + 1..].to_string()),
+        })
+    }
+}
+
+/// The name and version of the gem `purl`, qualifiers dropped.
+fn gem_coordinates(purl: &str) -> Option<(String, String)> {
+    let (ecosystem, name, version) = crate::utils::purl::purl_parts(purl)?;
+    (ecosystem == "gem").then_some((name, version))
+}
+
+/// The builds the Bundler lock text `lock` names for each gem of `purls`
+/// ([`GemfileLock::locked_builds`]), the ruby-platform gem first: element
+/// `i` answers `purls[i]`, and is empty when the lock names no build of it
+/// (or it is no gem purl). The lock is parsed once for all of them. This is
+/// the one answer to "which builds of this gem are this project's": an
+/// installed copy or a cached archive of any other build (another project's,
+/// in a shared gem home) is not.
+pub fn locked_gem_builds(lock: &str, purls: &[String]) -> Vec<Vec<GemBuild>> {
+    let lock = crate::utils::line_endings::to_lf(lock);
+    let parsed = parse(&lock);
+    purls
+        .iter()
+        .map(|purl| {
+            let Some((name, version)) = gem_coordinates(purl) else {
+                return Vec::new();
+            };
+            let ids = parsed.locked_builds(&name, &version).ids(&name, &version);
+            ids.iter().map(GemBuild::of).collect()
+        })
+        .collect()
 }
 
 impl<'t> GemfileLock<'t> {
@@ -304,6 +463,31 @@ impl<'t> GemfileLock<'t> {
             }
         }
         (!out.is_empty()).then_some(out)
+    }
+}
+
+impl GemfileLock<'_> {
+    /// The gems the lock resolves ONLY as precompiled platform builds:
+    /// `pkg:gem/<name>@<version>` for each gem version with `name
+    /// (version-<platform>)` specs in a `GEM` section and no ruby-platform
+    /// `name (version)` beside them, sorted. [`Self::entries`] leaves them
+    /// out (no single `.gem` stands for such a gem). Hosted mode patches
+    /// one through its per-platform prebuilds, so its discovery asks for
+    /// them here.
+    pub fn platform_only_purls(&self) -> Vec<String> {
+        let specs = || {
+            self.gem_sections()
+                .flat_map(|section| section.specs.iter().filter_map(|line| line.parsed))
+        };
+        let ruby: HashSet<(&str, &str)> = specs()
+            .filter(|spec| spec.platform.is_none())
+            .map(|spec| (spec.name, spec.version))
+            .collect();
+        let purls: BTreeSet<String> = specs()
+            .filter(|spec| spec.platform.is_some() && !ruby.contains(&(spec.name, spec.version)))
+            .filter_map(|spec| simple_purl("gem", spec.name, spec.version))
+            .collect();
+        purls.into_iter().collect()
     }
 }
 
@@ -672,6 +856,115 @@ mod tests {
             parse_checksum("rails (7.0.0) sha256=abc"),
             Some((("rails", "7.0.0"), None))
         );
+    }
+
+    /// The builds a lock names for one gem version: platform entries among
+    /// the specs and the sha256-pinned `CHECKSUMS` entries, and whether the
+    /// ruby-platform entry is one of them. Other versions, other gems,
+    /// non-`GEM` sections and bare `CHECKSUMS` entries do not count.
+    #[test]
+    fn locked_builds_of_a_gem_version() {
+        let sha = "a".repeat(64);
+        let text = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    ffi (1.17.2-x86_64-linux-gnu)\n    \
+             nokogiri (1.18.10-x86_64-linux-gnu)\n      racc (~> 1.4)\n    nokogiri \
+             (1.18.10-arm64-darwin)\n    nokogiri (1.18.9-java)\n    nokogiri-ext (1.18.10)\n\n\
+             PATH\n  remote: vendor/x\n  specs:\n    nokogiri (1.18.10-aarch64-linux-musl)\n\n\
+             CHECKSUMS\n  nokogiri (1.18.10-x64-mingw-ucrt)\n  nokogiri (1.18.10-java) \
+             sha256={sha}\n  racc (1.8.1) sha256={sha}\n"
+        );
+        let lock = parse(&text);
+        let builds = lock.locked_builds("nokogiri", "1.18.10");
+        assert_eq!(
+            builds.platforms.iter().copied().collect::<Vec<_>>(),
+            ["arm64-darwin", "java", "x86_64-linux-gnu"],
+            "the specs' platforms, and the one CHECKSUMS pins a sha256 for"
+        );
+        assert!(!builds.ruby);
+        assert_eq!(
+            lock.locked_builds("racc", "1.8.1"),
+            LockedBuilds {
+                platforms: BTreeSet::new(),
+                ruby: true
+            },
+            "a CHECKSUMS entry alone names the ruby gem"
+        );
+        assert_eq!(
+            lock.locked_builds("nokogiri", "1.18"),
+            LockedBuilds::default()
+        );
+        // The same reader, as the builds a refresh looks for on disk.
+        let purls = [
+            "pkg:gem/nokogiri@1.18.10?platform=ruby".to_string(),
+            "pkg:gem/racc@1.8.1".to_string(),
+            "pkg:gem/absent@1.0.0".to_string(),
+            "pkg:npm/nokogiri@1.18.10".to_string(),
+        ];
+        let leaves: Vec<Vec<String>> = locked_gem_builds(&text, &purls)
+            .into_iter()
+            .map(|builds| builds.into_iter().map(|build| build.leaf).collect())
+            .collect();
+        assert_eq!(
+            leaves,
+            [
+                vec![
+                    "nokogiri-1.18.10-arm64-darwin".to_string(),
+                    "nokogiri-1.18.10-java".to_string(),
+                    "nokogiri-1.18.10-x86_64-linux-gnu".to_string()
+                ],
+                vec!["racc-1.8.1".to_string()],
+                vec![],
+                vec![],
+            ]
+        );
+        let purl = "pkg:gem/nokogiri@1.18.10";
+        assert_eq!(
+            GemBuild::of_leaf(purl, "nokogiri-1.18.10-arm64-darwin")
+                .and_then(|build| build.platform)
+                .as_deref(),
+            Some("arm64-darwin")
+        );
+        assert_eq!(
+            GemBuild::of_leaf(purl, "nokogiri-1.18.10"),
+            GemBuild::ruby(purl)
+        );
+        // `nokogiri-1.18.10` at version `2.0`, and another version.
+        assert_eq!(GemBuild::of_leaf(purl, "nokogiri-1.18.10-2.0"), None);
+        assert_eq!(GemBuild::of_leaf(purl, "nokogiri-1.18.9-java"), None);
+        // The registry inventory lists only gems with a ruby-platform
+        // entry; hosted discovery asks for the platform-only ones apart.
+        assert_eq!(
+            lock.platform_only_purls(),
+            [
+                "pkg:gem/ffi@1.17.2",
+                "pkg:gem/nokogiri@1.18.10",
+                "pkg:gem/nokogiri@1.18.9"
+            ]
+        );
+        let inventoried: Vec<String> = lock
+            .entries()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| entry.purl)
+            .collect();
+        assert_eq!(inventoried, ["pkg:gem/nokogiri-ext@1.18.10"]);
+
+        let section = lock.gem_sections().next().unwrap();
+        let locking: Vec<&str> = section
+            .specs
+            .iter()
+            .filter(|line| line.locks("nokogiri", "1.18.10"))
+            .map(|line| line.raw)
+            .collect();
+        assert_eq!(
+            locking,
+            [
+                "nokogiri (1.18.10-x86_64-linux-gnu)",
+                "nokogiri (1.18.10-arm64-darwin)"
+            ]
+        );
+        assert!(section.specs[4].locks("nokogiri-ext", "1.18.10"));
+        assert!(!section.specs[4].locks("nokogiri", "1.18.10"));
     }
 
     #[test]
