@@ -88,6 +88,17 @@ impl<'a> ProjectContext<'a> {
             .await
     }
 
+    /// The gems the project's Bundler lock resolves only as precompiled
+    /// platform builds, which [`Self::locks`] leaves out (see
+    /// `gem_platform_only_purls_in`): read through the same snapshot, so
+    /// the lock is the one the inventory saw.
+    pub(crate) async fn gem_platform_only_purls(&self) -> Vec<String> {
+        socket_patch_core::vendor::lock_inventory::gem_platform_only_purls_in(
+            &ProjectView::Snapshot(&self.snapshot),
+        )
+        .await
+    }
+
     /// The lockfile wiring discovery of `--cwd` ([`super::discover_wiring_in`]).
     pub(crate) async fn discovery(&self) -> &Discovery {
         &self.recorded_discovery().await.0
