@@ -160,6 +160,32 @@ fn pin_dependency<'a>(
     }
 }
 
+/// Why [`converge_gem_lock_source`] left a lock alone.
+#[derive(Debug)]
+pub(crate) struct LockRefusal {
+    /// The reason, worded to follow "the lock cannot record the source (…)".
+    pub(crate) why: String,
+    /// How many remotes the `GEM` section that locks the gem names, when
+    /// that is the reason: no older bundler wrote it if the manifest has
+    /// several top-level sources, which bundler 2.2 to 2.7 lock that way.
+    pub(crate) shared_remotes: Option<usize>,
+}
+
+impl From<String> for LockRefusal {
+    fn from(why: String) -> Self {
+        LockRefusal {
+            why,
+            shared_remotes: None,
+        }
+    }
+}
+
+impl std::fmt::Display for LockRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
 /// Converge the lock's source attribution for one redirected dep so the
 /// Gemfile + lock pair is what bundler >= 2.2 itself writes after an
 /// install from the redirected Gemfile (verified byte for byte against
@@ -200,7 +226,7 @@ pub(crate) fn converge_gem_lock_source(
     pin: DependencyPin<'_>,
     lock_changed: &mut bool,
     result: &mut RewriteResult,
-) -> Result<(), String> {
+) -> Result<(), LockRefusal> {
     let eol = crate::utils::line_endings::terminator(lk);
     // Borrowed until edited: most of a large lock's lines are only moved.
     let mut lines: Vec<Cow<'_, str>> = lk.split_inclusive('\n').map(Cow::Borrowed).collect();
@@ -221,10 +247,10 @@ pub(crate) fn converge_gem_lock_source(
         })
         .collect();
     let Some(deps) = &model.dependencies else {
-        return Err("it has no DEPENDENCIES section".to_string());
+        return Err("it has no DEPENDENCIES section".to_string().into());
     };
     let Some(&(sec_idx, _, _)) = spec_at.first() else {
-        return Err(format!("no GEM section lists `{spec_raw}`"));
+        return Err(format!("no GEM section lists `{spec_raw}`").into());
     };
     if let Some((_, _, twice)) = spec_at
         .iter()
@@ -232,22 +258,27 @@ pub(crate) fn converge_gem_lock_source(
         .find(|(at, (_, _, raw))| spec_at[..*at].iter().any(|(_, _, earlier)| earlier == raw))
         .map(|(_, entry)| entry)
     {
-        return Err(format!("more than one GEM section lists `{twice}`"));
+        return Err(format!("more than one GEM section lists `{twice}`").into());
     }
     if spec_at.iter().any(|(k, _, _)| *k != sec_idx) {
         return Err(format!(
             "the builds of {} {} are spread over more than one GEM section",
             dep.name, dep.version
-        ));
+        )
+        .into());
     }
     // Exclusive of the header.
     let deps_start = deps.line_no;
     if sections[sec_idx].remotes.len() != 1 {
-        return Err(format!(
-            "the GEM section that lists `{spec_raw}` names {} remotes (the one-section layout \
-             of bundler < 2.2, which a later bundler rewrites on its next unfrozen install)",
-            sections[sec_idx].remotes.len()
-        ));
+        let remotes = sections[sec_idx].remotes.len();
+        return Err(LockRefusal {
+            why: format!(
+                "the GEM section that lists `{spec_raw}` names {remotes} remotes (the \
+                 one-section layout of bundler < 2.2, which a later bundler rewrites on its \
+                 next unfrozen install)"
+            ),
+            shared_remotes: (remotes > 1).then_some(remotes),
+        });
     }
     // Bundler always writes source sections before DEPENDENCIES — the pin
     // edit below runs first on that premise (its lines sit after the parsed
@@ -258,7 +289,8 @@ pub(crate) fn converge_gem_lock_source(
     if deps_start < sections[sec_idx].end {
         return Err(format!(
             "its DEPENDENCIES section comes before the GEM section that lists `{spec_raw}`"
-        ));
+        )
+        .into());
     }
     let remote_idx = sections[sec_idx].remote_line_nos[0] - 1;
     let remote_url = sections[sec_idx].remotes[0].to_string();
@@ -473,6 +505,18 @@ fn refresh_remote_line(
 /// section is proven frozen-installable. False when it names none.
 pub(crate) fn bundled_before_2_2(lock: &str) -> bool {
     bundled_with(lock).is_some_and(|version| version < (2, 2))
+}
+
+/// The version of the lock's bundler when it is a 2.2 release that keeps a
+/// multi-remote `GEM` section as one on `bundle lock`, even after the
+/// manifest stops declaring several top-level sources. Run against the
+/// real thing: 2.2.15 and 2.2.18 keep it (and say so on `bundle install`),
+/// 2.2.25, 2.2.29, 2.2.31, 2.2.33 and 2.5.22 split it. The releases between
+/// 2.2.18 and 2.2.25 are taken to keep it.
+pub(crate) fn bundler_keeps_merged_section(lock: &str) -> Option<&str> {
+    let (version, text) = bundled_with_version(lock)?;
+    let patch = text.split('.').nth(2)?.parse::<u32>().ok()?;
+    (version == (2, 2) && patch < 25).then_some(text)
 }
 
 /// The `major.minor` of the bundler the lock's `BUNDLED WITH` names, and
@@ -876,7 +920,8 @@ BUNDLED WITH
             &mut changed,
             &mut result,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .why;
         assert!(
             why.contains("spread over more than one GEM section"),
             "{why}"
@@ -1395,6 +1440,29 @@ DEPENDENCIES
             assert_eq!(&out, lock, "{label}");
             assert!(edits.is_empty(), "{label}: {edits:?}");
         }
+    }
+
+    /// The 2.2 releases before 2.2.25 keep a merged section on relock.
+    #[test]
+    fn bundler_keeps_merged_section_names_the_early_2_2_releases() {
+        for (version, want) in [
+            ("2.1.4", false),
+            ("2.2.0", true),
+            ("2.2.18", true),
+            ("2.2.25", false),
+            ("2.2.33", false),
+            ("2.5.22", false),
+            ("2.2", false),
+            ("2.2.x", false),
+        ] {
+            let lock = format!("GEM\n  specs:\n\nBUNDLED WITH\r\n   {version}\r\n");
+            assert_eq!(
+                bundler_keeps_merged_section(&lock),
+                want.then_some(version),
+                "{version}"
+            );
+        }
+        assert_eq!(bundler_keeps_merged_section("GEM\n  specs:\n"), None);
     }
 
     /// Only a lock bundler < 2.2 wrote counts as the merged era.
