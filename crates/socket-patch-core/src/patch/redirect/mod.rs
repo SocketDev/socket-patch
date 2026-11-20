@@ -15996,6 +15996,60 @@ mod tests {
         assert!(fresh.confirmed_yarn_berry_uuids.is_empty());
     }
 
+    /// Under a patch mirror, whose host serves the project's own packages
+    /// too, yarn berry and Bun take over an earlier pin only under the
+    /// mirror's base: a tarball of the same name and version in another
+    /// repository of that host is the project's own source.
+    #[test]
+    fn a_tarball_elsewhere_on_the_mirrors_host_is_not_an_earlier_pin() {
+        let base = "https://repo.example/artifactory/socket-patch";
+        let leaf = "left-pad-1.3.0.tgz";
+        let current = format!("{base}/patch/npm/left-pad/1.3.0/new/u2/{leaf}");
+        let earlier = format!("{base}/patch/npm/left-pad/1.3.0/old/u1/{leaf}");
+        let fork = format!("https://repo.example/artifactory/npm-local/left-pad/-/{leaf}");
+
+        assert!(berry_hosted_pin_is_ours(
+            &earlier,
+            "left-pad",
+            Some("1.3.0"),
+            &current
+        ));
+        assert!(berry_hosted_pin_is_ours(
+            &earlier, "left-pad", None, &current
+        ));
+        assert!(!berry_hosted_pin_is_ours(
+            &fork,
+            "left-pad",
+            Some("1.3.0"),
+            &current
+        ));
+        assert!(!berry_hosted_pin_is_ours(&fork, "left-pad", None, &current));
+
+        let spec = |url: &str| format!("left-pad@{url}");
+        assert!(is_prior_hosted_bun_spec(
+            &spec(&earlier),
+            "left-pad",
+            &current
+        ));
+        assert!(!is_prior_hosted_bun_spec(
+            &spec(&fork),
+            "left-pad",
+            &current
+        ));
+
+        // On the patch server itself the origin and the file name decide,
+        // as they always have: nothing else is served from that host.
+        let direct = current.replace(base, "https://patch.socket.dev");
+        let stale = earlier.replace(base, "https://patch.socket.dev");
+        assert!(berry_hosted_pin_is_ours(
+            &stale,
+            "left-pad",
+            Some("1.3.0"),
+            &direct
+        ));
+        assert!(is_prior_hosted_bun_spec(&spec(&stale), "left-pad", &direct));
+    }
+
     /// A lock written by an earlier release carries the old
     /// `npm:…::__archiveUrl=` pin; a repeat hosted run re-pins it (#404).
     #[test]
