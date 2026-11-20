@@ -472,6 +472,14 @@ impl ScanPolicy {
         self.policy.enabled()
     }
 
+    /// Whether the run may take out a pin of `purl` that none of its
+    /// packages stands for (a stale entry of a Bazel workspace's block):
+    /// not in a root the policy filtered, and not for a package it
+    /// filters, as for a pin of a package the run covers.
+    pub(crate) fn admits_restore(&self, purl: &str) -> bool {
+        self.root_verdict.is_ok() && self.policy.admits_purl(purl).is_ok()
+    }
+
     /// Set the merged recorded view (manifest > hosted pins > vendor ledger).
     pub(crate) fn set_recorded(&mut self, merged: Option<&PatchManifest>) {
         self.recorded = merged

@@ -226,6 +226,23 @@ async fn withdrawn(
     gone
 }
 
+/// `gone` and the pins of `stale` after it. A stale pin whose patch is
+/// withdrawn too is in `gone` already, with every file that holds it: it
+/// is restored, and reported, once.
+fn with_stale(mut gone: Vec<Gone>, stale: &[HostedPin]) -> Vec<Gone> {
+    let known = |pin: &&HostedPin| {
+        let same = |(gone, ..): &Gone| (&gone.purl, &gone.uuid) == (&pin.purl, &pin.uuid);
+        !gone.iter().any(same)
+    };
+    let stale: Vec<_> = stale.iter().filter(known).cloned().collect();
+    gone.extend(
+        stale
+            .into_iter()
+            .map(|pin| (pin, MAVEN_BAZEL_ENTRY_STALE, STALE.to_string())),
+    );
+    gone
+}
+
 /// Check `pins` against the reference endpoint and restore the withdrawn
 /// ones upstream (see the module docs), and with them the pins of `stale`,
 /// which are asked about nowhere: the entries of a Bazel workspace's block
@@ -238,9 +255,8 @@ pub(super) async fn sweep(
     stale: &[HostedPin],
 ) -> WithdrawnSweep {
     let mut out = WithdrawnSweep::default();
-    let mut gone = withdrawn(common, api_client, pins, &mut out).await;
-    let stale = stale.iter().cloned();
-    gone.extend(stale.map(|pin| (pin, MAVEN_BAZEL_ENTRY_STALE, STALE.to_string())));
+    let gone = withdrawn(common, api_client, pins, &mut out).await;
+    let gone = with_stale(gone, stale);
     if gone.is_empty() {
         return out;
     }
@@ -388,6 +404,28 @@ mod tests {
         let pins = vec![pin("pkg:npm/b@2.0.0", "u2")];
         assert!(pins_in_scope(&pins, ["pkg:npm/b@2.0.1"]).is_empty());
         assert!(pins_in_scope(&pins, Vec::<String>::new()).is_empty());
+    }
+
+    #[test]
+    fn a_stale_pin_that_is_withdrawn_too_is_taken_once() {
+        let both = HostedPin {
+            files: vec!["MODULE.bazel".to_string(), "pom.xml".to_string()],
+            ..pin("pkg:maven/g/a@1.0", "u1")
+        };
+        let stale = [
+            pin("pkg:maven/g/a@1.0", "u1"),
+            pin("pkg:maven/g/b@2.0", "u2"),
+        ];
+        let gone = vec![(both.clone(), PATCH_WITHDRAWN, "is gone".to_string())];
+        let taken: Vec<_> = with_stale(gone, &stale)
+            .into_iter()
+            .map(|(pin, code, _)| (pin, code))
+            .collect();
+        let expected = [
+            (both, PATCH_WITHDRAWN),
+            (stale[1].clone(), MAVEN_BAZEL_ENTRY_STALE),
+        ];
+        assert_eq!(taken, expected);
     }
 
     #[test]

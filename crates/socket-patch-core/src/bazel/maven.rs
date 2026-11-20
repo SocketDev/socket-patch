@@ -120,8 +120,10 @@ const RULESETS: [&str; 10] = [
 /// What a doubt about a hub without a lock ends with.
 const NO_LOCK: &str = "has no `lock_file`";
 
-/// The largest lock that is read, and how many bytes of locks are read for
-/// one workspace: each lock once, for every hub that names it.
+/// The largest lock that is read, each lock once for every hub that names
+/// it, and how many bytes of locks a scan takes its packages from in one
+/// workspace ([`hub_jars`]): the first lock that does not fit is the last
+/// one read.
 const MAX_LOCK: usize = 16 << 20;
 const MAX_LOCKS: usize = 4 * MAX_LOCK;
 
@@ -485,6 +487,17 @@ impl Hubs {
     /// `maven_install` or cannot be read while Bazel may read it (the
     /// workspace names no release, or one before 9) are doubts.
     pub fn read(view: &dyn Fn(&str) -> Entry, locks: &dyn Fn(&str) -> Entry) -> Hubs {
+        Hubs::read_within(view, locks, usize::MAX)
+    }
+
+    /// [`Hubs::read`] with at most `room` bytes of locks in all: the lock
+    /// that does not fit is a doubt, and so is every lock after it, which
+    /// is not read.
+    fn read_within(
+        view: &dyn Fn(&str) -> Entry,
+        locks: &dyn Fn(&str) -> Entry,
+        mut room: usize,
+    ) -> Hubs {
         // The block is socket-patch's own: the workspace is read without
         // it, as the user wrote it, and with every line where it was. A
         // block that was changed by hand is read like any other text.
@@ -528,7 +541,13 @@ impl Hubs {
         });
         let overrides = overrides.collect();
         let (mut pinned, mut lockless) = (Vec::new(), None);
-        let (mut read_locks, mut room) = (HashMap::new(), MAX_LOCKS);
+        let mut read_locks = HashMap::new();
+        let past = || {
+            let bound = MAX_LOCKS >> 20;
+            Err(format!(
+                "the locks of the workspace are larger than {bound} MiB in all"
+            ))
+        };
         for hub in hubs {
             // Where a doubt about its lock is: the lock, or the tag.
             let (file, line) = match &hub.lock {
@@ -538,17 +557,18 @@ impl Hubs {
             let lock = match &hub.lock {
                 None => Err(format!("hub \"{}\" {NO_LOCK}", hub.name)),
                 Some(path) => {
-                    let parsed = || match locks(path) {
-                        Entry::Text(text) if text.len() > room => Err(format!(
-                            "the locks of the workspace are larger than {} MiB in all",
-                            MAX_LOCKS >> 20
-                        )),
-                        Entry::Text(text) => {
+                    let parsed = || match (room > 0).then(|| locks(path)) {
+                        None => past(),
+                        Some(Entry::Text(text)) if text.len() > room => {
+                            room = 0;
+                            past()
+                        }
+                        Some(Entry::Text(text)) => {
                             room -= text.len();
                             Lock::parse(&text).map(Rc::new)
                         }
-                        Entry::Absent => Err("it does not exist".to_string()),
-                        Entry::Unreadable(why) => Err(format!("it cannot be read: {why}")),
+                        Some(Entry::Absent) => Err("it does not exist".to_string()),
+                        Some(Entry::Unreadable(why)) => Err(format!("it cannot be read: {why}")),
                     };
                     let lock = read_locks.entry(path.clone()).or_insert_with(parsed);
                     lock.clone()
@@ -1361,7 +1381,8 @@ fn hub_jars_blocking(project: &Path) -> HubJars {
     let Some(root) = root else {
         return HubJars::default();
     };
-    let hubs = Hubs::read(&disk(&root.dir), &disk_up_to(&root.dir, MAX_LOCK));
+    let locks = disk_up_to(&root.dir, MAX_LOCK);
+    let hubs = Hubs::read_within(&disk(&root.dir), &locks, MAX_LOCKS);
     // Each lock once, however many hubs name it.
     let (mut purls, mut seen) = (BTreeSet::new(), HashSet::new());
     let locks = hubs.pinned.iter().map(|(_, lock)| lock);
@@ -2467,9 +2488,10 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
         assert_eq!(hub_jars_blocking(plain.path()), HubJars::default());
     }
 
-    /// A lock is read once for all the hubs that name it, and the locks of
-    /// one workspace within a bound: the lock past it is a doubt, like one
-    /// that is too large by itself.
+    /// A lock is read once for all the hubs that name it. A scan takes
+    /// the locks of one workspace within a bound: the lock past it is a
+    /// doubt, like one that is too large by itself, and no lock after it
+    /// is read. Every other reader takes them all, as before.
     #[test]
     fn the_locks_of_a_workspace_are_read_once_and_within_a_bound() {
         let hub = |name: &str, lock: &str| {
@@ -2499,16 +2521,25 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
                 _ => Entry::Absent,
             }
         };
-        let read = Hubs::read(&view, &view);
         let names = |(hub, _): &(Hub, Rc<Lock>)| hub.name.clone();
+        let read = Hubs::read_within(&view, &view, MAX_LOCKS);
         let pinned: Vec<String> = read.pinned.iter().map(names).collect();
-        assert_eq!(pinned, ["maven", "a", "b", "c", "d", "f"]);
+        assert_eq!(pinned, ["maven", "a", "b", "c", "d"]);
         let doubt = read.doubt.expect("a doubt");
         let why = "the locks of the workspace are larger than 64 MiB in all";
         assert_eq!((doubt.file.as_str(), doubt.why.as_str()), ("e.json", why));
-        let asked = asked.borrow();
-        let times = |lock: &str| asked.iter().filter(|path| *path == lock).count();
-        assert_eq!(["a.json", "c.json", "e.json"].map(times), [1, 1, 1]);
+        let times = |lock: &str| asked.borrow().iter().filter(|path| *path == lock).count();
+        assert_eq!(
+            ["a.json", "c.json", "e.json", "f.json"].map(times),
+            [1, 1, 1, 0]
+        );
+
+        asked.borrow_mut().clear();
+        let read = Hubs::read(&view, &view);
+        let pinned: Vec<String> = read.pinned.iter().map(names).collect();
+        assert_eq!(pinned, ["maven", "a", "b", "c", "d", "e", "f"]);
+        assert!(read.doubt.is_none());
+        assert_eq!(["a.json", "e.json", "f.json"].map(times), [1, 1, 1]);
     }
 
     // The block, and what a hosted run writes of it.

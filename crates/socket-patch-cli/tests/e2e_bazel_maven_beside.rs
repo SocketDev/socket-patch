@@ -1222,6 +1222,19 @@ fn a_hosted_scan_takes_the_jars_of_a_hub_beside_a_lockfile_of_the_root() {
 
 /// The block for a patch `uuid` of the victim at `version`, as
 /// socket-patch writes it.
+/// A Gradle build that has nothing of the hub's jars.
+const GRADLE: [(&str, &str); 3] = [
+    ("settings.gradle", "rootProject.name = 'app'\n"),
+    (
+        "build.gradle",
+        "plugins { id 'java' }\ndependencies { implementation 'com.example:other:1.0' }\n",
+    ),
+    (
+        "gradle.lockfile",
+        "com.example:other:1.0=compileClasspath\nempty=\n",
+    ),
+];
+
 fn block_at(version: &str, uuid: &str) -> String {
     let name = version.replace('.', "_");
     let block = BLOCK.replace("1.10.0", version).replace("1_10_0", &name);
@@ -1388,6 +1401,64 @@ fn a_hosted_scan_takes_a_stale_entry_out_of_the_block() {
         [event(PURL, "rolledBack", stale), event(PURL, "applied", "")],
         "{scan:?}"
     );
+
+    // Beside a Gradle build the same: the entry alone goes, and the pin
+    // that the first scan wrote for Gradle stays for `list` to show and
+    // for `rollback <purl>` to take out.
+    let mut files = pinned();
+    files.extend(GRADLE.iter().map(|(path, text)| (*path, text.to_string())));
+    machine.make(&files, false, false);
+    assert_eq!(machine.step(&SCAN).wrote.len(), 5);
+    std::fs::write(machine.root.join("proj/maven_install.json"), &moved).expect("the lock");
+    let scan = machine.step(&SCAN);
+    assert_eq!(scan.wrote.keys().collect::<Vec<_>>(), [MODULE], "{scan:?}");
+    assert_eq!(
+        triples(&scan),
+        [event(PURL, "rolledBack", stale)],
+        "{scan:?}"
+    );
+    let list = machine.step(&["list", "--json"]).envelope();
+    assert_eq!(
+        event_for(&list, PURL)["details"]["lockfiles"],
+        json!([".socket/gradle/hosted-index.tsv"]),
+        "{list:#}"
+    );
+}
+
+/// The socket.yml policy holds a stale entry as it holds the packages of
+/// the run: a scan of a root that the policy filters, and one whose
+/// policy filters the package, leave the entry where it is.
+#[test]
+fn a_hosted_scan_leaves_a_stale_entry_that_the_policy_filters() {
+    let machine = Machine::start();
+    let mut files = pinned();
+    files[0].1 = format!(
+        "{HUB}\n{}",
+        block_at("1.9.0", "0a1b2c3d-1111-4222-8333-444455556666")
+    );
+    let below: Vec<(String, String)> = files
+        .iter()
+        .map(|(path, text)| (format!("legacy/{path}"), text.clone()))
+        .collect();
+    let mut below: Files = below
+        .iter()
+        .map(|(path, text)| (&*path.clone().leak(), text.clone()))
+        .collect();
+    let filtered = |policy: &str| ("socket.yml", format!("version: 2\npatches:\n  {policy}\n"));
+    below.push(filtered("ignorePaths: [\"/legacy/\"]"));
+    files.push(filtered(
+        "ignorePackages: [\"pkg:maven/dev.socket.fixture/victim\"]",
+    ));
+    for (files, dir) in [(&below, "proj/legacy"), (&files, "proj")] {
+        machine.make(files, false, false);
+        let scan = machine.step_in(&machine.root.join(dir), &SCAN);
+        let said = scan.envelope();
+        assert_eq!(
+            (scan.code, &said["events"], &scan.wrote),
+            (Some(0), &json!([]), &BTreeMap::new()),
+            "{dir}: {scan:?}"
+        );
+    }
 }
 
 /// A checkout that Gradle or Maven builds too. A hub's jar with a patch is
@@ -1397,17 +1468,6 @@ fn a_hosted_scan_takes_a_stale_entry_out_of_the_block() {
 #[test]
 fn a_hosted_scan_pins_a_hubs_jar_in_the_other_builds_as_get_does() {
     let machine = Machine::start();
-    let gradle = [
-        ("settings.gradle", "rootProject.name = 'app'\n"),
-        (
-            "build.gradle",
-            "plugins { id 'java' }\ndependencies { implementation 'com.example:other:1.0' }\n",
-        ),
-        (
-            "gradle.lockfile",
-            "com.example:other:1.0=compileClasspath\nempty=\n",
-        ),
-    ];
     // A pom whose dependency is not in the Maven local repository: what
     // Maven selects cannot be told.
     let other = PROJECT_POM
@@ -1415,7 +1475,7 @@ fn a_hosted_scan_pins_a_hubs_jar_in_the_other_builds_as_get_does() {
         .replace("victim", "other");
     let rows: [(&[(&str, &str)], &[&str], &[&str]); 2] = [
         (
-            &gradle,
+            &GRADLE,
             &[
                 "proj/.socket/gradle/.gitattributes",
                 "proj/.socket/gradle/hosted-index.tsv",
@@ -1743,6 +1803,29 @@ fn a_hosted_get_by_advisory_keeps_the_release_a_pinned_hub_fetches() {
         (&event_for(&envelope, PURL)["errorCode"], &unread.wrote),
         (&json!("package_not_installed"), &BTreeMap::new()),
         "{unread:?}"
+    );
+
+    // An advisory with no Maven artifact: the hub that was not read has
+    // nothing to do with it, and is not named.
+    let (npm, other) = ("pkg:npm/left-pad@1.3.0", "GHSA-test-cccc-dddd");
+    let found = json!({ "uuid": UUID, "purl": npm, "publishedAt": "2024-01-01T00:00:00Z",
+        "description": "fixture", "license": "MIT", "tier": "free", "vulnerabilities": {} });
+    let answer = json!({ "patches": [found], "canAccessPaidPatches": false });
+    let search = wiremock::Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/by-ghsa/{other}")))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(answer));
+    machine._runtime.block_on(search.mount(&machine.api));
+    let lockless = HUB.replace("    lock_file = \"//:maven_install.json\",\n", "");
+    machine.make(&[("MODULE.bazel", lockless)], false, false);
+    let unrelated = machine.step(&["get", other, "--mode", "hosted", "--yes", "--json"]);
+    let envelope = unrelated.envelope();
+    assert_eq!(
+        (
+            &envelope["warnings"],
+            &event_for(&envelope, npm)["errorCode"]
+        ),
+        (&Value::Null, &json!("package_not_installed")),
+        "{unrelated:?}"
     );
 }
 
