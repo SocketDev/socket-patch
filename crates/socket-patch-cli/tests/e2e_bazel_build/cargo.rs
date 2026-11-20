@@ -36,11 +36,13 @@
 //!   patched marker. Hosted: the stand-in patch host was asked for its index
 //!   file of the crate and, at least twice, for the crate file, and the
 //!   upstream one was not asked for again. Vendored: the scan had fetched
-//!   it, and the build asked the stand-in for nothing. Then `vex` is asked
+//!   it, and the build asked no host for the crate. Then `vex` is asked
 //!   for its document. Hosted: it attests the crate, and the command of the
 //!   mode, run a second time as on every run of a pipeline, reports the
 //!   patch applied again and changes no file. Vendored: what `vex` does
-//!   depends on the ruleset (see "Known gaps").
+//!   depends on the ruleset (see "Known gaps"), and `bazel build //...` and
+//!   `bazel query //...` say what Bazel takes the copy for (see "The build
+//!   file in the copy").
 //! - (d) The undo (`rollback --yes`, or `vendor --revert`) puts every file
 //!   the command wrote back, byte for byte, and the build prints the
 //!   unpatched marker again.
@@ -53,8 +55,10 @@
 //!   upstream crate is not asked for in its place. Vendored: the first
 //!   build there is the patched one, and the command of the mode runs a
 //!   second time; the build after it writes nothing, `vendor --check`
-//!   passes and `vex` attests the crate. Then the library of the copy is
-//!   changed. Nothing in a build holds the committed copy to a checksum, as
+//!   passes and `vex` attests the crate. Then a build file that
+//!   cargo-bazel did not write is put into the copy (see "The build file
+//!   in the copy"), and then the library of the copy is changed. Nothing in
+//!   a build holds the committed copy to a checksum, as
 //!   nothing does for any crate a Cargo workspace takes from a path: the
 //!   changed library is what Bazel builds next, and it is
 //!   `socket-patch vendor --check` that reports the copy
@@ -114,19 +118,52 @@
 //! (static.rust-lang.org), and the crates it builds its own tools from
 //! (static.crates.io).
 //!
+//! # The build file in the copy
+//!
+//! cargo-bazel renders a build file for every crate of the hub. Since
+//! rules_rust 0.59.0 the one of a crate that the workspace takes from a
+//! path goes to `<path>/BUILD.bazel`, into the checkout
+//! (`crate_universe/src/rendering.rs`, `render_build_files`), each time
+//! Bazel evaluates the hub, which a build does when a file the hub reads
+//! has changed since the last one. The hub does not build the crate from
+//! there: it copies the directory into a repository of its own and renders
+//! the `BUILD.bazel` of that repository again, over the copied one
+//! (`crate_universe/private/local_crate_mirror.bzl`). What the flow holds
+//! of that:
+//!
+//! - Where the ruleset writes the file, it starts with the banner of every
+//!   file cargo-bazel renders ([`BANNER`]), and it makes the copy a package
+//!   of the user's workspace: `bazel query //...` lists targets there, and
+//!   `bazel build //...` passes ([`every_target`]). The crate has a
+//!   dependency ([`DEP`]), so the file names a repository of the hub,
+//!   which the main repository does not see, and the commands that analyse
+//!   every target fail on that package: `bazel cquery //...` and
+//!   `bazel query 'deps(//...)'` ([`analyses`]). With a `.bazelignore`
+//!   line for the copies, which the test writes as a user would, `//...`
+//!   is the user's own target again, those two commands pass, and the
+//!   build is still the patched one: the hub reads the copy by its path,
+//!   not as a package.
+//! - With either ruleset, a build file that someone else put there under
+//!   the same banner does not reach the crate: the build still prints the
+//!   patched marker. It is a package of the workspace all the same, and
+//!   `bazel build //...` builds its target. `vendor --check` reports it,
+//!   as it reports any file the scan did not record.
+//!
 //! # Known gaps
 //!
-//! Two assertions of the vendored flow hold what the release does with
+//! Three assertions of the vendored flow hold what the release does with
 //! rules_rust 0.75.0, and that is not what a user needs. They are marked
-//! `KNOWN GAP` where they stand. Both have one cause: cargo-bazel 0.75.0
-//! writes a `BUILD.bazel` into the committed copy, the scan recorded no
-//! such file, and `socket-patch` then takes the copy for a damaged one
-//! (`vendor_inventory_mismatch`). Right after a build that is the patched
-//! one:
+//! `KNOWN GAP` where they stand. All have one cause: cargo-bazel 0.75.0
+//! writes a `BUILD.bazel` into the committed copy. The scan recorded no
+//! such file, so `socket-patch` then takes the copy for a damaged one
+//! (`vendor_inventory_mismatch`), and Bazel takes the copy for a package.
+//! Right after a build that is the patched one:
 //!
 //! - `vendor --check` exits 1.
 //! - `vex` leaves the patch out and, with nothing else to attest, exits 1
 //!   and writes no document.
+//! - `bazel cquery //...` and `bazel query 'deps(//...)'` fail, until the
+//!   user writes a `.bazelignore` line for the copies.
 //!
 //! The flow also holds how a user gets out of it today. A second
 //! `scan --mode vendored` downloads the crate again, reports the copy
@@ -135,12 +172,13 @@
 //! the check and `vex` pass. `vendor --revert` removes the file with the
 //! copy.
 //!
-//! A fix of the product makes the two commands pass right after the build,
-//! as they do with rules_rust 0.56.0. `intact` of the vendored flow is then
-//! true with every ruleset, and the branches marked `KNOWN GAP` go, with
-//! the second download of the crate.
+//! A fix of the product makes the two commands of `socket-patch` pass
+//! right after the build, as they do with rules_rust 0.56.0, and writes the
+//! `.bazelignore` line itself. `intact` of the vendored flow is then true
+//! with every ruleset, and the branches marked `KNOWN GAP` go, with the
+//! second download of the crate.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use base64::Engine as _;
@@ -150,8 +188,8 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
 use crate::envelope::{event_for, has_event};
 use crate::harness::{
-    changed, fixture_path, Cell, Fixture, Ran, Release, StandIn, Tree, CONSUMER, NOTHING,
-    REPO_CACHE,
+    cell_without_bazel, changed, fixture_path, Cell, Fixture, Ran, Release, StandIn, Tree,
+    CONSUMER, NOTHING, REPO_CACHE,
 };
 use crate::hosted_memory_common::{Patch, ORG};
 
@@ -183,9 +221,22 @@ const NAME: &str = "socket-patch-bazel-fixture-with-a-name-that-is-too-long-for-
 const VERSION: &str = "1.0.0";
 const PURL: &str =
     "pkg:cargo/socket-patch-bazel-fixture-with-a-name-that-is-too-long-for-crates-io@1.0.0";
-/// Its `Cargo.toml`. The other file of a crate file is `src/lib.rs`.
+/// The crate that one depends on, at the same version, which the same
+/// registry holds under a name crates.io cannot hold either. Its crate
+/// file is the same in every run. With a dependency, the build file that
+/// cargo-bazel renders for [`NAME`] names a repository of the hub.
+const DEP: &str =
+    "socket-patch-bazel-fixture-dependency-with-a-name-that-is-too-long-for-crates-io";
+/// The `Cargo.toml` of each. The other file of a crate file is `src/lib.rs`.
 const CRATE_MANIFEST: &str = "[package]\n\
     name = \"socket-patch-bazel-fixture-with-a-name-that-is-too-long-for-crates-io\"\n\
+    version = \"1.0.0\"\n\
+    edition = \"2021\"\n\
+    \n\
+    [dependencies]\n\
+    socket-patch-bazel-fixture-dependency-with-a-name-that-is-too-long-for-crates-io = \"1.0.0\"\n";
+const DEP_MANIFEST: &str = "[package]\n\
+    name = \"socket-patch-bazel-fixture-dependency-with-a-name-that-is-too-long-for-crates-io\"\n\
     version = \"1.0.0\"\n\
     edition = \"2021\"\n";
 /// The files of the checkout that cargo and the hub read, and Bazel's lock.
@@ -193,14 +244,16 @@ const CONFIG: &str = ".cargo/config.toml";
 const LOCK: &str = "Cargo.lock";
 const MANIFEST: &str = "Cargo.toml";
 const BAZEL_LOCK: &str = "MODULE.bazel.lock";
-/// How a `Cargo.lock` names crates.io, with or without a mirror.
+/// How a `Cargo.lock` names crates.io, with or without a mirror, and how
+/// the index of another registry names it.
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+const CRATES_IO_INDEX: &str = "https://github.com/rust-lang/crates.io-index";
 /// What the fixture's lock holds as the checksum of the crate: the sum of
 /// no file.
 const PLACEHOLDER: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 /// The route prefixes under which the stand-in plays the two hosts of
 /// crates.io, and the routes of the crate there: its file of the sparse
-/// index, and its crate file.
+/// index, and its crate file. The dependency has the same two.
 const INDEX: &str = "index.crates.io";
 const FILES: &str = "static.crates.io";
 const UPSTREAM_ENTRY: &str =
@@ -209,6 +262,16 @@ const UPSTREAM_CRATE: &str = "/static.crates.io/crates/socket-patch-bazel-fixtur
 /// The access-token level of a hosted URL, which `socket-patch` writes as
 /// the API hands it out.
 const TOKEN: &str = "33333333-3333-4333-8333-333333333333";
+/// How every file cargo-bazel renders begins: its banner, up to the name
+/// of the tool (`crate_universe/src/rendering/templates/partials/header.j2`,
+/// the same since 2022). The command that renders the file again follows.
+const BANNER: &str =
+    "###############################################################################\n\
+    # @generated\n\
+    # DO NOT MODIFY: This file is auto-generated by a crate_universe tool.";
+/// The `.bazelignore` line of a user who keeps Bazel out of the vendored
+/// crates.
+const IGNORED: &str = ".socket/vendor/cargo\n";
 /// The cargo home of every `socket-patch` child: no directory, so a scan
 /// finds the crate in the lock alone, as in a checkout only Bazel built.
 const NO_CARGO_HOME: &str = "/nonexistent/cargo-home";
@@ -219,17 +282,18 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-/// The crate with `lib_rs` as its library, as a registry serves it. Every
-/// sum a test holds a build to is computed from the bytes it serves, so
-/// nothing depends on the exact bytes the archive crates emit.
-fn crate_file(lib_rs: &str) -> Vec<u8> {
+/// The crate `name` with `manifest` and with `lib_rs` as its library, as a
+/// registry serves it. Every sum a test holds a build to is computed from
+/// the bytes it serves, so nothing depends on the exact bytes the archive
+/// crates emit.
+fn crate_file(name: &str, manifest: &str, lib_rs: &str) -> Vec<u8> {
     let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut archive = tar::Builder::new(gzip);
-    for (name, text) in [("Cargo.toml", CRATE_MANIFEST), ("src/lib.rs", lib_rs)] {
+    for (file, text) in [("Cargo.toml", manifest), ("src/lib.rs", lib_rs)] {
         let mut header = tar::Header::new_ustar();
         header.set_size(text.len() as u64);
         header.set_mode(0o644);
-        let path = format!("{NAME}-{VERSION}/{name}");
+        let path = format!("{name}-{VERSION}/{file}");
         archive
             .append_data(&mut header, path, text.as_bytes())
             .expect("tar");
@@ -251,7 +315,7 @@ impl Package {
     fn new(word: &str, id: &str) -> Package {
         let lib_rs = format!("pub const STATUS: &str = \"{word} {id}\";\n");
         Package {
-            crate_file: crate_file(&lib_rs),
+            crate_file: crate_file(NAME, CRATE_MANIFEST, &lib_rs),
             marker: format!("OUT: {word} {id}"),
             lib_rs,
         }
@@ -268,14 +332,31 @@ impl Package {
     }
 
     /// The crate's file of a sparse index that lists this crate file: one
-    /// line per version.
-    fn index_line(&self) -> String {
-        let version = json!({
-            "name": NAME, "vers": VERSION, "deps": [], "features": {}, "yanked": false,
-            "cksum": self.checksum(),
+    /// line per version. It names the dependency as being in `registry`,
+    /// an index: crates.io's own on the patch host, as cargo wants it of a
+    /// registry that is not the dependency's, and none on crates.io itself.
+    fn index_line(&self, registry: Option<&str>) -> String {
+        let dependency = json!({
+            "name": DEP, "req": format!("^{VERSION}"), "features": [], "optional": false,
+            "default_features": true, "target": null, "kind": "normal", "registry": registry,
         });
-        format!("{version}\n")
+        index_line(NAME, &self.checksum(), json!([dependency]))
     }
+}
+
+/// One line of a crate's file of a sparse index.
+fn index_line(name: &str, checksum: &str, deps: serde_json::Value) -> String {
+    let version = json!({
+        "name": name, "vers": VERSION, "deps": deps, "features": {}, "yanked": false,
+        "cksum": checksum,
+    });
+    format!("{version}\n")
+}
+
+/// The crate file of [`DEP`].
+fn dependency_file() -> Vec<u8> {
+    let lib_rs = "pub const DEPENDENCY: &str = \"of the fixture\";\n";
+    crate_file(DEP, DEP_MANIFEST, lib_rs)
 }
 
 /// One patch of the crate, under an id that is new for every run.
@@ -295,7 +376,7 @@ impl Patched {
         let index = format!("/patch-registry/cargo/{TOKEN}/{uuid}/index");
         Patched {
             package: Package::new("PATCHED", &uuid),
-            entry: format!("{index}/{}", index_path()),
+            entry: format!("{index}/{}", index_path(NAME)),
             route: format!("/patch/cargo/{NAME}/{VERSION}/{TOKEN}/{uuid}/{NAME}-{VERSION}.crate"),
             index,
             uuid,
@@ -313,10 +394,15 @@ impl Patched {
     }
 }
 
-/// The path of the crate's file in a sparse index: cargo's layout for a
-/// name of four characters or more.
-fn index_path() -> String {
-    format!("{}/{}/{NAME}", &NAME[..2], &NAME[2..4])
+/// The path of the file of the crate `name` in a sparse index: cargo's
+/// layout for a name of four characters or more.
+fn index_path(name: &str) -> String {
+    format!("{}/{}/{name}", &name[..2], &name[2..4])
+}
+
+/// What the lock's entry of the crate says of its dependency.
+fn depends() -> String {
+    format!("dependencies = [\n \"{DEP}\",\n]\n")
 }
 
 /// The entry of a lock that resolves the crate from `source` and pins its
@@ -324,20 +410,40 @@ fn index_path() -> String {
 fn lock_entry(source: &str, checksum: &str) -> String {
     format!(
         "[[package]]\nname = \"{NAME}\"\nversion = \"{VERSION}\"\n\
-         source = \"{source}\"\nchecksum = \"{checksum}\"\n"
+         source = \"{source}\"\nchecksum = \"{checksum}\"\n{}",
+        depends()
     )
 }
 
-/// The fixture's lock with the checksum of `upstream` in place of the
-/// placeholder: the lock a test writes into its workspace copy before the
-/// first build.
+/// The entry of a lock that pins the crate file of the dependency to
+/// `checksum`.
+fn dependency_entry(checksum: &str) -> String {
+    format!(
+        "[[package]]\nname = \"{DEP}\"\nversion = \"{VERSION}\"\n\
+         source = \"{CRATES_IO}\"\nchecksum = \"{checksum}\"\n"
+    )
+}
+
+/// The fixture's lock with the checksum of `upstream`, and the one of the
+/// dependency, in place of the placeholders: the lock a test writes into
+/// its workspace copy before the first build.
 fn lock_pinning(upstream: &Package) -> String {
     let path = fixture_path(FIXTURE.dir).join("common").join(LOCK);
-    let lock = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let unpinned = lock_entry(CRATES_IO, PLACEHOLDER);
-    let entries = lock.matches(&unpinned).count();
-    assert_eq!(entries, 1, "{}: not one\n{unpinned}", path.display());
-    lock.replace(&unpinned, &lock_entry(CRATES_IO, &upstream.checksum()))
+    let mut lock =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let dependency = dependency_entry(&sha256_hex(&dependency_file()));
+    for (unpinned, pinned) in [
+        (
+            lock_entry(CRATES_IO, PLACEHOLDER),
+            lock_entry(CRATES_IO, &upstream.checksum()),
+        ),
+        (dependency_entry(PLACEHOLDER), dependency),
+    ] {
+        let entries = lock.matches(&unpinned).count();
+        assert_eq!(entries, 1, "{}: not one\n{unpinned}", path.display());
+        lock = lock.replace(&unpinned, &pinned);
+    }
+    lock
 }
 
 /// The `.cargo/config.toml` of a checkout whose crates come from a mirror
@@ -359,15 +465,22 @@ fn mirror_config(origin: &str) -> String {
 /// A stand-in that holds `upstream` as crates.io does: the `config.json` of
 /// the sparse index, which names the download host the way the real one
 /// does (a base URL, to which cargo adds `/<name>/<version>/download`), the
-/// crate's file of the index, and the crate file.
+/// crate's file of the index, and the crate file. And the same two of the
+/// dependency.
 fn registry(upstream: &Package) -> StandIn {
     let standin = StandIn::start();
     let origin = standin.origin();
     let config = json!({ "dl": format!("{origin}/{FILES}/crates"), "api": origin });
     let config = serde_json::to_vec(&config).expect("a JSON document");
     standin.serve(5, &format!("/{INDEX}/config.json"), &config);
-    standin.serve(5, UPSTREAM_ENTRY, upstream.index_line().as_bytes());
+    standin.serve(5, UPSTREAM_ENTRY, upstream.index_line(None).as_bytes());
     standin.serve(5, UPSTREAM_CRATE, &upstream.crate_file);
+    let dependency = dependency_file();
+    let listed = index_line(DEP, &sha256_hex(&dependency), json!([]));
+    let entry = format!("/{INDEX}/{}", index_path(DEP));
+    standin.serve(5, &entry, listed.as_bytes());
+    let file = format!("/{FILES}/crates/{DEP}/{VERSION}/download");
+    standin.serve(5, &file, &dependency);
     standin
 }
 
@@ -431,7 +544,8 @@ fn grant(standin: &StandIn, upstream: &Package, patch: &Patched, served: &[u8]) 
     );
     let config = serde_json::to_vec(&json!({ "dl": dl, "api": origin })).expect("a JSON document");
     standin.serve(5, &format!("{}/config.json", patch.index), &config);
-    standin.serve(5, &patch.entry, patch.package.index_line().as_bytes());
+    let listed = patch.package.index_line(Some(CRATES_IO_INDEX));
+    standin.serve(5, &patch.entry, listed.as_bytes());
     standin.serve(5, &patch.route, served);
 }
 
@@ -642,8 +756,35 @@ fn refuses(twin: &Cell, refusal: &str) {
     );
 }
 
-/// `vex` in the checkout of `cell`, which Bazel has built in and which
-/// holds the files of `built`. Its document goes beside the checkout, and
+/// What Bazel takes the checkout of `cell` for: `bazel build //...` passes,
+/// and these are the targets `bazel query //...` lists, sorted.
+fn every_target(cell: &Cell) -> Vec<String> {
+    let build = cell.bazel("build", &["//..."]);
+    assert!(build.ok(), "{}: {}", cell.test, build.dump());
+    let query = cell.bazel("query", &["//..."]);
+    assert!(query.ok(), "{}: {}", cell.test, query.dump());
+    let mut targets: Vec<String> = query.stdout().lines().map(str::to_string).collect();
+    targets.sort();
+    targets
+}
+
+/// Whether the commands that analyse every target of the checkout of
+/// `cell` pass: `bazel cquery //...` and `bazel query 'deps(//...)'`, which
+/// agree. One that fails has met a repository of the hub, which the main
+/// repository does not see.
+fn analyses(cell: &Cell) -> bool {
+    let runs = [("cquery", "//..."), ("query", "deps(//...)")];
+    let runs = runs.map(|(command, targets)| cell.bazel(command, &[targets]));
+    for run in &runs {
+        let unseen = run.stderr().contains("No repository visible as '@crates__");
+        assert_ne!(run.ok(), unseen, "{}: {}", cell.test, run.dump());
+    }
+    assert_eq!(runs[0].ok(), runs[1].ok(), "{}", cell.test);
+    runs[0].ok()
+}
+
+/// `vex` in the checkout of `cell`, which holds the files of `built`. Its
+/// document goes beside the checkout ([`Cell::document`]), and
 /// no file of the checkout changes. With `attested` it exits 0 and the
 /// document names the crate as patched by `patch`. Without, which is a
 /// known gap (module docs), it exits 1 and writes no document: the patch is
@@ -651,11 +792,8 @@ fn refuses(twin: &Cell, refusal: &str) {
 /// (`vendor_inventory_mismatch`), and nothing else is there to attest.
 fn vex(cell: &Cell, standin: &StandIn, patch: &Patched, built: &Tree, attested: bool) {
     let test = &cell.test;
-    let info = cell.bazel("info", &["workspace"]);
-    assert!(info.ok(), "{test}: {}", info.dump());
-    let checkout = PathBuf::from(info.stdout().trim());
-    let document = checkout.parent().expect("a scratch root").join("vex.json");
-    assert!(!document.exists(), "{test}: {}", document.display());
+    let document = cell.document("vex");
+    let _ = std::fs::remove_file(&document);
     let output = document.to_string_lossy();
     let vex = socket_patch(cell, standin, &["vex", "--output", &output]);
     let said = &vex.dump;
@@ -804,7 +942,8 @@ fn hosted_from_cargo_with_config() {
     // first build of a machine does. rules_rust 0.56.0 keeps the home it is
     // given from build to build, and cargo does not ask again for the index
     // file of a crate the lock pins while its home holds one.
-    other.serve(1, &second.entry, tampered.index_line().as_bytes());
+    let listed = tampered.index_line(Some(CRATES_IO_INDEX));
+    other.serve(1, &second.entry, listed.as_bytes());
     let third_home = cargo_home();
     twin.repo_env = cargo_env(third_home.path());
     let asked = other.asked(&second.entry);
@@ -901,7 +1040,10 @@ fn vendored_from_cargo_with_config() {
         "{test}: {MANIFEST}:\n{manifest}"
     );
     let lock = text(&vendored, LOCK);
-    let entry = format!("[[package]]\nname = \"{NAME}\"\nversion = \"{tagged}\"\n");
+    let entry = format!(
+        "[[package]]\nname = \"{NAME}\"\nversion = \"{tagged}\"\n{}",
+        depends()
+    );
     assert!(
         lock.ends_with(&entry) && !lock.contains(&upstream.checksum()),
         "{test}: {LOCK}:\n{lock}"
@@ -911,10 +1053,17 @@ fn vendored_from_cargo_with_config() {
     }
 
     // (c) The same build, no step in between and no repin: patched, from
-    // the committed copy. Bazel asks the stand-in for nothing.
-    let requests = standin.requests();
+    // the committed copy. Bazel asks no host for the crate: what the hub's
+    // cargo fetches again is the dependency.
+    let routes = [UPSTREAM_ENTRY, UPSTREAM_CRATE, patch.route.as_str()];
+    let asked = || routes.map(|route| standin.asked(route));
+    let requests = asked();
     cell.builds(&patch.package.marker);
-    assert_eq!(standin.requests(), requests, "{test}: Bazel asked a host");
+    assert_eq!(
+        asked(),
+        requests,
+        "{test}: Bazel asked a host for the crate"
+    );
     // Where the ruleset watches, the build rewrote Bazel's lock, and
     // cargo-bazel wrote a `BUILD.bazel` into the committed copy. That file
     // is no part of what the scan recorded: the copy is no longer `intact`,
@@ -928,6 +1077,10 @@ fn vendored_from_cargo_with_config() {
         &[]
     };
     assert_eq!(changed(&vendored, &built), by_bazel, "{test}");
+    if watches(&cell) {
+        let rendered = text(&built, &build_file);
+        assert!(rendered.starts_with(BANNER), "{test}: {rendered}");
+    }
     let intact = !watches(&cell);
     let check = socket_patch(&cell, &standin, &["vendor", "--check"]);
     let said = &check.dump;
@@ -953,6 +1106,30 @@ fn vendored_from_cargo_with_config() {
     // `vex` attests the crate of an intact copy, and leaves the patch of
     // the other out (the KNOWN GAP of `vex`).
     vex(&cell, &standin, &patch, &built, intact);
+    // What Bazel takes the copy for. With the build file in it, the copy is
+    // a package of the workspace: `//...` names targets there. A line of
+    // the user's in `.bazelignore` leaves the consumer alone, and the build
+    // is the patched one still.
+    let targets = every_target(&cell);
+    let package = format!("//{copy}:");
+    let (in_copy, own): (Vec<&str>, Vec<&str>) =
+        (targets.iter().map(String::as_str)).partition(|target| target.starts_with(&package));
+    let in_copy = in_copy.len();
+    assert_eq!(own, [CONSUMER], "{test}: {targets:?}");
+    assert_eq!(in_copy > 0, watches(&cell), "{test}: {targets:?}");
+    // KNOWN GAP: what the release does, not what a user needs. The package
+    // of the copy names a repository of the hub, and the commands that
+    // analyse every target fail on it until a `.bazelignore` line keeps
+    // Bazel out of the copies. Once `socket-patch` writes that line, they
+    // pass from the start.
+    let analysed = analyses(&cell);
+    assert_eq!(analysed, !watches(&cell), "{test}: without a line");
+    cell.write(".bazelignore", IGNORED);
+    assert_eq!(every_target(&cell), [CONSUMER], "{test}");
+    assert!(analyses(&cell), "{test}: with the line of a user");
+    cell.builds(&patch.package.marker);
+    std::fs::remove_file(cell.path(".bazelignore")).expect("remove the line");
+    assert_eq!(changed(&built, &cell.tree()), NOTHING, "{test}");
 
     // (d) The undo. The copy goes, with the `BUILD.bazel` a build wrote
     // into it, and the two files are the ones of before at once.
@@ -991,6 +1168,30 @@ fn vendored_from_cargo_with_config() {
     let check = socket_patch(&twin, &other, &["vendor", "--check"]);
     assert_eq!(check.code, 0, "{test}: {}", check.dump);
     vex(&twin, &other, &second, &repaired, true);
+    // A build file that cargo-bazel did not write, under its banner. It
+    // does not reach the crate, which Bazel builds as before; it is a
+    // package of the workspace, whose target `//...` builds; and it is no
+    // file the scan recorded, so `vendor --check` reports the copy.
+    let planted = format!(
+        "{BANNER}\n\ngenrule(\n    name = \"planted\",\n    outs = [\"planted.txt\"],\n    \
+         cmd = \"touch $@\",\n)\n"
+    );
+    twin.write(&second_build_file, &planted);
+    twin.builds(&second.package.marker);
+    let planted_target = format!("//{second_copy}:planted");
+    assert_eq!(
+        every_target(&twin),
+        [planted_target.as_str(), CONSUMER],
+        "{test}"
+    );
+    let check = socket_patch(&twin, &other, &["vendor", "--check"]);
+    let said = &check.dump;
+    assert_eq!(check.code, 1, "{test}: {said}");
+    let reason = event_for(&check.envelope, PURL)["reason"]
+        .as_str()
+        .unwrap_or_default();
+    let mismatch = reason.contains("vendor_inventory_mismatch");
+    assert!(mismatch, "{test}: {said}");
     // Then another library in the committed copy. Nothing in a build holds
     // the copy to a checksum: Bazel builds what is there. `vendor --check`
     // is what finds it.
@@ -1007,11 +1208,16 @@ fn vendored_from_cargo_with_config() {
 
     println!(
         "{test}: Bazel {release} built {:?} from {copy} after `scan --mode vendored`, with no \
-         repin and no request to the stand-in, and wrote {by_bazel:?} itself; right after \
-         that build {}; `vendor --revert` restored the checkout, and the next build printed \
+         repin and no request for the crate, and wrote {by_bazel:?} itself; right after \
+         that build {}; `//...` held {in_copy} target(s) in the copy and `cquery //...` and \
+         `query 'deps(//...)'` {}, and with a `.bazelignore` line for the copies `//...` \
+         held the consumer alone, the two commands passed and the build was still patched; \
+         `vendor --revert` restored the checkout, and the next build printed \
          {:?} and left all {} files as before; on a second machine, after its first patched \
          build, a second scan {}, the next build wrote nothing, `vendor --check` passed and \
-         `vex` attested the crate; a library then changed in the committed copy was built \
+         `vex` attested the crate; a BUILD.bazel of someone else's under cargo-bazel's banner \
+         left the build patched, `//...` built its target, and `vendor --check` reported \
+         vendor_inventory_mismatch; a library then changed in the committed copy was built \
          ({:?}), and `vendor --check` reported vendor_hash_mismatch; {:?}",
         patch.package.marker,
         if intact {
@@ -1020,6 +1226,11 @@ fn vendored_from_cargo_with_config() {
             "(KNOWN GAPS) `vendor --check` failed on the BUILD.bazel \
              (vendor_inventory_mismatch), and `vex` left the patch out under the same code and \
              wrote no document"
+        },
+        if analysed {
+            "passed"
+        } else {
+            "(KNOWN GAP) failed on a repository of the hub"
         },
         upstream.marker,
         before.len(),
@@ -1033,16 +1244,100 @@ fn vendored_from_cargo_with_config() {
     );
 }
 
+/// The module file of the fixture with rules_rust 0.75.0: one that makes a
+/// crate hub.
+fn hub() -> String {
+    let module = fixture_path(FIXTURE.dir).join("e9/MODULE.bazel");
+    std::fs::read_to_string(module).expect("a fixture file")
+}
+
+/// Without a Bazel: the fixture's Cargo project in a checkout of its own,
+/// with the file `marks` at its root, which holds `module` and makes the
+/// checkout a Bazel workspace when it is one of Bazel's names; the
+/// stand-in that holds the crate and one patch of it; and that patch,
+/// which `scan --mode vendored --yes` has applied there.
+fn vendored_checkout(marks: &str, module: &str) -> (Cell, StandIn, Patched) {
+    let cell = cell_without_bazel("9.3.2");
+    let upstream = Package::upstream();
+    let (standin, patch) = (registry(&upstream), Patched::new());
+    grant(&standin, &upstream, &patch, &patch.package.crate_file);
+    let manifest = fixture_path(FIXTURE.dir).join("common").join(MANIFEST);
+    cell.write(MANIFEST, std::fs::read(manifest).expect("a fixture file"));
+    cell.write(LOCK, lock_pinning(&upstream));
+    cell.write(CONFIG, mirror_config(&standin.origin()));
+    cell.write(".git/HEAD", "ref: refs/heads/main\n");
+    cell.write(marks, module);
+    let scan = socket_patch(&cell, &standin, &["scan", "--mode", "vendored", "--yes"]);
+    assert_eq!(scan.code, 0, "{}", scan.dump);
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{}", scan.dump);
+    (cell, standin, patch)
+}
+
+/// What `socket-patch` does in `cell` with a vendored copy that it takes
+/// for a changed one over `extra`, a file the scan did not record:
+/// `vendor --check` exits 1 over the inventory, `vex` leaves the patch out,
+/// and a second scan downloads the crate again and removes the file.
+fn takes_for_changed(cell: &Cell, standin: &StandIn, patch: &Patched, extra: &str) {
+    let left = cell.tree();
+    let check = socket_patch(cell, standin, &["vendor", "--check"]);
+    assert_eq!(check.code, 1, "{extra}: {}", check.dump);
+    let reason = event_for(&check.envelope, PURL)["reason"]
+        .as_str()
+        .unwrap_or_default();
+    let mismatch = reason.contains("vendor_inventory_mismatch");
+    assert!(mismatch, "{extra}: {}", check.dump);
+    vex(cell, standin, patch, &left, false);
+    let downloads = standin.asked(&patch.route);
+    let again = socket_patch(cell, standin, &["scan", "--mode", "vendored", "--yes"]);
+    let said = &again.dump;
+    assert_eq!(again.code, 0, "{extra}: {said}");
+    assert_eq!(again.envelope["summary"]["rebuilt"], 1, "{extra}: {said}");
+    let downloaded = standin.asked(&patch.route) - downloads;
+    assert_eq!(downloaded, 1, "{extra}: {said}");
+    assert_eq!(changed(&left, &cell.tree()), [extra], "{extra}: {said}");
+}
+
+/// Without a Bazel: what the release does with a build file in a vendored
+/// copy that the scan did not record, whoever wrote it. The first is where
+/// cargo-bazel writes one and starts as its files do, in a Bazel workspace
+/// with a crate hub. The others differ from it in one thing each: a
+/// checkout that is no Bazel workspace (a directory named like a workspace
+/// file marks none), a workspace whose module file makes no crate hub, no
+/// banner, Bazel's other name for a build file, and a directory of the
+/// crate. The copy is a changed one every time ([`takes_for_changed`]),
+/// and the scan wrote no `.bazelignore` in any of the checkouts.
+#[test]
+fn a_build_file_in_a_vendored_copy_is_a_changed_copy() {
+    let rendered = format!("{BANNER} To \n# regenerate this file, run the following:\n");
+    let (hub, bazel) = (hub(), "MODULE.bazel");
+    let no_hub = "module(name = \"socket_fixture\", version = \"0.0.0\")\n";
+    for (marks, module, file, text) in [
+        (bazel, hub.as_str(), "BUILD.bazel", rendered.as_str()),
+        ("WORKSPACE/README", &hub, "BUILD.bazel", &rendered),
+        (bazel, no_hub, "BUILD.bazel", &rendered),
+        (bazel, &hub, "BUILD.bazel", "genrule(name = \"x\")\n"),
+        (bazel, &hub, "BUILD", &rendered),
+        (bazel, &hub, "src/BUILD.bazel", &rendered),
+    ] {
+        let (cell, standin, patch) = vendored_checkout(marks, module);
+        assert!(!cell.tree().contains_key(".bazelignore"), "{marks}");
+        let extra = format!("{}/{file}", patch.vendored());
+        cell.write(&extra, text);
+        takes_for_changed(&cell, &standin, &patch, &extra);
+    }
+}
+
 /// Without a Bazel, what stays fixed now that no checksum is committed: the
 /// fixture's directories and the legs of its workflow are those of its
-/// table; the fixture's lock holds the one entry a test pins, with the
-/// placeholder, and pinning changes nothing else; two runs serve two
-/// upstream crate files; the fixture depends on the crate under the names
-/// written out above, and commits no cargo config; every era's hub names
-/// the config a test writes and has no cargo-bazel lock; and crates.io
-/// cannot hold the name.
+/// table; the fixture's lock holds the two entries a test pins, the
+/// crate's and its dependency's, with the placeholder, and pinning changes
+/// nothing else; two runs serve two upstream crate files and one of the
+/// dependency; the fixture depends on the crate under the names written
+/// out above, and commits no cargo config; every era's hub names the
+/// config a test writes and has no cargo-bazel lock; and crates.io can
+/// hold neither name.
 #[test]
-fn a_test_pins_the_one_crate_of_the_fixture_lock() {
+fn a_test_pins_the_crates_of_the_fixture_lock() {
     FIXTURE.check();
     let root = fixture_path(FIXTURE.dir);
     let read = |rel: &str| std::fs::read_to_string(root.join(rel)).expect(rel);
@@ -1051,9 +1346,14 @@ fn a_test_pins_the_one_crate_of_the_fixture_lock() {
     let pinned = lock_pinning(&upstream);
     let entry = lock_entry(CRATES_IO, &upstream.checksum());
     assert!(pinned.contains(&entry), "no\n{entry}in\n{pinned}");
-    let unpinned = pinned.replace(&entry, &lock_entry(CRATES_IO, PLACEHOLDER));
+    let dependency = dependency_entry(&sha256_hex(&dependency_file()));
+    assert!(pinned.contains(&dependency), "no\n{dependency}in\n{pinned}");
+    let unpinned = pinned
+        .replace(&entry, &lock_entry(CRATES_IO, PLACEHOLDER))
+        .replace(&dependency, &dependency_entry(PLACEHOLDER));
     assert_eq!(unpinned, read("common/Cargo.lock"));
     assert_ne!(Package::upstream().crate_file, upstream.crate_file);
+    assert_eq!(dependency_file(), dependency_file());
 
     let dependency = format!("\n[dependencies]\n{NAME} = \"{VERSION}\"\n");
     assert!(read("common/Cargo.toml").ends_with(&dependency));
@@ -1070,10 +1370,14 @@ fn a_test_pins_the_one_crate_of_the_fixture_lock() {
         assert!(module.contains(&hub), "{era}: no\n{hub}in\n{module}");
     }
 
-    assert!(NAME.len() > 64, "crates.io can hold {NAME}");
-    assert!(CRATE_MANIFEST.contains(&format!("name = \"{NAME}\"\nversion = \"{VERSION}\"\n")));
+    for (name, manifest) in [(NAME, CRATE_MANIFEST), (DEP, DEP_MANIFEST)] {
+        assert!(name.len() > 64, "crates.io can hold {name}");
+        assert!(manifest.contains(&format!("name = \"{name}\"\nversion = \"{VERSION}\"\n")));
+    }
+    let needs = format!("\n[dependencies]\n{DEP} = \"{VERSION}\"\n");
+    assert!(CRATE_MANIFEST.ends_with(&needs));
     assert_eq!(PURL, format!("pkg:cargo/{NAME}@{VERSION}"));
-    assert_eq!(UPSTREAM_ENTRY, format!("/{INDEX}/{}", index_path()));
+    assert_eq!(UPSTREAM_ENTRY, format!("/{INDEX}/{}", index_path(NAME)));
     assert_eq!(
         UPSTREAM_CRATE,
         format!("/{FILES}/crates/{NAME}/{VERSION}/download")
