@@ -91,7 +91,7 @@ Every event has these fields:
 | `context.version` | The Socket Patch version |
 | `context.platform`, `context.arch` | Operating system and CPU architecture (for example `linux`, `x86_64`) |
 | `context.command` | The subcommand (`scan`, `apply`, …) |
-| `context.channel` | How this copy of Socket Patch was installed: `standalone` (the install script or a downloaded binary), `npm`, `cargo`, `homebrew`, `pypi` or `launcher_cache`. It is worked out from where the binary sits and names the channel only, never the path |
+| `context.channel` | How this copy of Socket Patch was installed: `npm`, `cargo`, `homebrew`, `pypi` or `launcher_cache` when the binary sits where that tool puts it, and `standalone` for anywhere else (the install script, a downloaded binary, a container image). It names the channel only, never the path, and is left out when the binary cannot read its own location |
 | `metadata` | The per-event fields in the table below, and nothing else |
 | `error.type`, `error.message` | Failure events only. URLs in the message are redacted (credentials, grant tokens, signed query values), your home directory is replaced by `~`, and a message longer than 1,000 characters is cut. The message can still quote a package name or a path in the project |
 

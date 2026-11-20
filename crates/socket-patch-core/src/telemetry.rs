@@ -208,13 +208,25 @@ fn debug_log(message: &str) {
 /// The install channel of the running binary, worked out once per process
 /// from the binary's own path: the check `--update` makes before it
 /// replaces a binary. It names one of six channels and never a path. It
-/// reads no project file and makes no request.
+/// reads no project file, makes no request and does not ask the user
+/// database for a home directory ([`ChannelEnv::from_env_vars`]).
+///
+/// `None` when the binary's own path cannot be read: no `/proc`, or a
+/// binary that was replaced or removed while it ran.
 fn install_channel() -> Option<&'static str> {
     static CHANNEL: Lazy<Option<&'static str>> = Lazy::new(|| {
         let exe = crate::update::resolve_install_path().ok()?;
-        Some(detect_channel(&exe, &ChannelEnv::from_env()).id())
+        Some(detect_channel(&exe, &ChannelEnv::from_env_vars()).id())
     });
     *CHANNEL
+}
+
+/// Work the install channel out now, while the running binary is still
+/// where it was started from. `--update` calls this before it swaps the
+/// binary: on Linux the old path reads as deleted afterwards, and the
+/// `cli_updated` event would go out without its channel.
+pub fn prime_install_channel() {
+    let _ = install_channel();
 }
 
 /// Build the telemetry context for the current environment.
@@ -1865,10 +1877,29 @@ mod tests {
             .map(String::as_str)
             .collect();
         ctx.sort_unstable();
-        assert_eq!(ctx, ["arch", "channel", "command", "platform", "version"]);
-        // The channel is one of the ids `InstallChannel::id` names, never a
-        // path. A test binary sits in the build directory: standalone.
-        assert_eq!(v["context"]["channel"], "standalone");
+        // The channel is the id of the test binary's own install channel,
+        // never a path. It depends on where the build directory sits (a
+        // checkout under `node_modules` reads as npm), and is left out
+        // where the binary cannot read its own path.
+        match install_channel() {
+            Some(channel) => {
+                assert_eq!(ctx, ["arch", "channel", "command", "platform", "version"]);
+                assert_eq!(v["context"]["channel"], channel);
+                assert!(
+                    [
+                        "standalone",
+                        "npm",
+                        "pypi",
+                        "cargo",
+                        "launcher_cache",
+                        "homebrew"
+                    ]
+                    .contains(&channel),
+                    "unexpected channel id {channel}"
+                );
+            }
+            None => assert_eq!(ctx, ["arch", "command", "platform", "version"]),
+        }
         assert_eq!(v["error"]["type"], "Error");
         assert_eq!(v["error"]["message"], "boom");
         assert_eq!(v["metadata"]["patches_count"], 2);

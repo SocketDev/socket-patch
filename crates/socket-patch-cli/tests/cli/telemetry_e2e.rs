@@ -1156,11 +1156,23 @@ async fn scan_reports_requested_and_project_modes() {
         env!("CARGO_PKG_VERSION"),
         "every event carries the client version"
     );
-    // The binary under test sits in the build directory, which no package
-    // manager owns.
-    assert_eq!(
-        scanned["context"]["channel"], "standalone",
-        "every event says how the binary was installed"
+    // Where the binary under test sits decides the channel (a build
+    // directory no package manager owns is `standalone`), so only the
+    // shape is pinned here: one of the six ids, never a path.
+    let channel = scanned["context"]["channel"]
+        .as_str()
+        .expect("every event says how the binary was installed");
+    assert!(
+        [
+            "standalone",
+            "npm",
+            "pypi",
+            "cargo",
+            "launcher_cache",
+            "homebrew"
+        ]
+        .contains(&channel),
+        "unexpected channel id {channel}"
     );
 }
 

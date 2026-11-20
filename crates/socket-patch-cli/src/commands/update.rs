@@ -8,7 +8,9 @@
 //! machinery lives in `socket_patch_core::update`.
 
 use clap::Args;
-use socket_patch_core::telemetry::{track_cli_update_failed, track_cli_updated};
+use socket_patch_core::telemetry::{
+    prime_install_channel, track_cli_update_failed, track_cli_updated,
+};
 use socket_patch_core::update::{
     self as core_update, asset_name_for_target, channel_label_for, current_version, detect_channel,
     fetch_latest_version, is_newer, upgrade_hint_for, ChannelEnv, InstallChannel, UpdateEndpoints,
@@ -190,6 +192,10 @@ pub async fn run(args: UpdateArgs) -> i32 {
     };
     let channel_env = ChannelEnv::from_env();
     let channel = detect_channel(&install_path, &channel_env);
+    // Before anything replaces this binary: the event this run reports
+    // names the channel of the binary that ran, and once the swap has
+    // happened that binary's path no longer resolves on Linux.
+    prime_install_channel();
     let hint = upgrade_hint_for(channel, &install_path, &channel_env);
     if channel != InstallChannel::Standalone {
         if args.force {
