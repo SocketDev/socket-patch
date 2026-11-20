@@ -945,6 +945,7 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs: args.mode != Some(ScanMode::Vendored),
         patch_server_url: args.common.patch_server_url.clone(),
+        patch_mirror_url: args.common.patch_mirror_url.clone(),
     }
 }
 

@@ -2321,6 +2321,7 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs,
         patch_server_url: args.common.patch_server_url.clone(),
+        patch_mirror_url: args.common.patch_mirror_url.clone(),
     }
 }
 
@@ -4209,6 +4210,7 @@ mod tests {
             ecosystems: None,
             persist_blobs: false,
             patch_server_url: None,
+            patch_mirror_url: None,
         }
     }
 
@@ -4960,6 +4962,7 @@ mod tests {
             // The vendor-detached posture this fn exists for.
             persist_blobs: false,
             patch_server_url: None,
+            patch_mirror_url: None,
         }
     }
 
