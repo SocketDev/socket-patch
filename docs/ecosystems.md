@@ -2241,30 +2241,22 @@ into the copy's own directory each time Bazel evaluates the hub, as it does for 
 a Cargo workspace takes from a path. The scan recorded no such file, and Bazel reads it as
 a package of your workspace.
 
-socket-patch does two things about that file, both only where the Bazel workspace has such
-a hub: `MODULE.bazel` at the Bazel root (see [`.bazelignore`](#bazel-workspaces-bazelignore)
-for where that is), or a file it includes, calls `from_cargo` on the extension `crate` of
-`@rules_rust//crate_universe:extensions.bzl` (or of `extension.bzl`, its older name).
+socket-patch does two things about that file, both only where the Bazel workspace has a hub
+of the project's crates: `MODULE.bazel` at the Bazel root (see
+[`.bazelignore`](#bazel-workspaces-bazelignore) for where that is, and for the checkouts in
+which no root is looked for), or a file it includes, calls `from_cargo` on the extension
+`crate` of `@rules_rust//crate_universe:extensions.bzl` (or of `extension.bzl`, its older
+name), and that call
 
-**The file is no change of the copy.** `vendor --check` passes, `vex` attests the crate,
-`repair` has nothing to restore, and a second `scan --mode vendored` reports the copy
-`already_vendored` and downloads nothing. socket-patch never writes the file, and removes
-it only with the copy: on `vendor --revert`, or when it replaces a copy that is changed in
-another way. Only this file is left out of the comparison with the ledger's inventory:
+- is a statement of its own: one in a comprehension, behind an `and` or in a condition may
+  never run, and is passed over;
+- names the project's `Cargo.lock` as its `cargo_lockfile`, or the project's root
+  `Cargo.toml` among its `manifests`, by a label of your own repository that is written
+  out as a string (`"//:Cargo.lock"`, `"//services/api:Cargo.toml"`).
 
-- a regular file named `BUILD.bazel` in the copy's own directory that the inventory does
-  not list (a build file the crate ships is listed, and is held to the crate's bytes);
-- that starts with the banner of every file cargo-bazel renders: a line of `#`, the line
-  `# @generated`, and a line that starts with `# DO NOT MODIFY: This file is auto-generated
-  by a crate_universe tool.`;
-- in a project whose Bazel workspace has a crate hub, as above. In any other project a file
-  like it is a changed copy, as before (`vendor_inventory_mismatch`).
-
-Every recorded file is still held to its bytes, any other file the scan did not record is
-still a changed copy, and a download that `repair` or a scan stages for a copy is held to
-the inventory alone. Of the build file itself socket-patch reads the banner and nothing
-after it: the rest differs from one machine and one ruleset release to the next, so no
-recorded copy of it could be compared.
+A hub that names the files of another Cargo workspace of the checkout, or names its files
+through a constant, is not taken for a hub of this project: socket-patch then does neither
+of the two things, and what follows a build is what is described under "Limits".
 
 **Bazel is kept out of the copies.** While the project has vendored crates, the
 `.bazelignore` at the Bazel root holds the line `.socket/vendor/cargo` (after the project's
@@ -2289,14 +2281,48 @@ adds no line. What the line is for, measured with rules_rust 0.75.0 on Bazel 9.3
   '@crates__<dependency>' from main repository`. With the line both pass, and `//...` holds
   your own targets alone.
 
+**Under that line, the file is no change of the copy.** `vendor --check` passes, `vex`
+attests the crate, `repair` has nothing to restore, and a second `scan --mode vendored`
+reports the copy `already_vendored` and downloads nothing. socket-patch never writes the
+file, and removes it only with the copy: on `vendor --revert`, or when it replaces a copy
+that is changed in another way. Only this file is left out of the comparison with the
+ledger's inventory:
+
+- a regular file named `BUILD.bazel` in the copy's own directory that the inventory does
+  not list (a build file the crate ships is listed, and is held to the crate's bytes);
+- that starts with the banner of every file cargo-bazel renders: a line of `#`, the line
+  `# @generated`, and a line that starts with `# DO NOT MODIFY: This file is auto-generated
+  by a crate_universe tool.`;
+- in a project whose Bazel workspace has a hub of its crates, as above;
+- in a copy that a line of the root's `.bazelignore` covers: the line socket-patch writes,
+  or one of your own for the directory or one above it (`.socket`).
+
+In any other case a file like it is a changed copy, as before (`vendor_inventory_mismatch`).
+Every recorded file is still held to its bytes, any other file the scan did not record is
+still a changed copy, and a download that `repair` or a scan stages for a copy is held to
+the inventory alone. Of the build file itself socket-patch reads the banner and nothing
+after it: the rest differs from one machine and one ruleset release to the next, so no
+recorded copy of it could be compared. That is why the line is part of the rule: a
+`BUILD.bazel` that someone else puts into a copy under the same banner is let through only
+where Bazel reads no package there, and where Bazel does read it, it is a changed copy.
+
 Limits:
 
-- With the path line commented out (the opt-out) the copy is a package again. Those two
-  commands fail after the next build, and a `BUILD.bazel` that someone else puts into the
-  copy under cargo-bazel's banner passes `vendor --check` and is a package whose targets
-  `bazel build //...` builds.
-- A workspace whose module files make no `crate.from_cargo` hub gets neither: no line is
-  written, and a `BUILD.bazel` in a copy is a changed copy. That holds for a hub of the
+- With the path line commented out (the opt-out), or where the line could not be written
+  (`bazelignore_not_updated`), or in a checkout vendored by an earlier release until a
+  command that writes the line has run (`scan --mode vendored`, `repair`, `apply`), the copy
+  is a package again and cargo-bazel's file is a changed copy again: after the next build
+  those two commands fail, `vendor --check` exits 1, `vex` leaves the patch out, and the
+  next vendored scan downloads the crate again.
+- Both parts need the Bazel root, which is looked for as the `.bazelignore` section says:
+  above the project's own directory only up to the root of its git checkout, and only when
+  that checkout's `.git` belongs to you, to root, or to the user `sudo` ran for. A project
+  that is a checkout of its own below the root (a submodule), or a checkout that a CI
+  container mounts from another user, has no Bazel root for socket-patch: both parts are
+  off there, and the commands above fail after a build although they pass on a developer's
+  machine.
+- A workspace whose module files make no hub of the project's crates gets neither: no line
+  is written, and a `BUILD.bazel` in a copy is a changed copy. That holds for a hub of the
   older `WORKSPACE` system (`crates_repository`) and for rules_rust's `crates_vendor`. By
   rules_rust's source, which no build here has run, `crates_vendor` with `mode = "local"`
   renders build files into the checkout that name a path crate by its package: there the

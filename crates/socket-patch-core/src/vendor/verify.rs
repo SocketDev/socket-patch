@@ -22,7 +22,8 @@
 //! verify their FULL file tree — missing, extra and modified unpatched
 //! files all fail; entries without one keep member-only verification). One
 //! extra file is none: the build file cargo-bazel writes into a vendored
-//! crate of a Bazel workspace with a crate hub
+//! crate of a Bazel workspace with a hub of the project's crates, where a
+//! `.bazelignore` line keeps Bazel from reading it
 //! ([`crate::bazel::cargo_bazel`]).
 //!
 //! [`file_inventory`]: super::state::VendorArtifact::file_inventory
@@ -170,9 +171,9 @@ pub async fn verify_vendored_patch_record(
             let mut actual = dir_inventory(&artifact).await?;
             // One file the inventory does not list is no extra file of a
             // cargo copy in its place: the `BUILD.bazel` in the copy's own
-            // directory that cargo-bazel wrote there. A build file the
-            // crate ships is in the inventory and is held to its bytes,
-            // like every other recorded file.
+            // directory that cargo-bazel wrote there and Bazel does not
+            // read. A build file the crate ships is in the inventory and
+            // is held to its bytes, like every other recorded file.
             let unlisted = cargo_uuid.is_some()
                 && actual.contains_key(BUILD_FILE)
                 && !inventory.contains_key(BUILD_FILE);
@@ -1651,11 +1652,13 @@ mod tests {
         );
     }
 
-    /// In a Bazel workspace with a crate hub the `BUILD.bazel` that
+    /// In a Bazel workspace with a hub of the project's crates and a
+    /// `.bazelignore` line over the copies, the `BUILD.bazel` that
     /// cargo-bazel wrote into the directory of a vendored crate is no extra
     /// file of the copy (first row). Every other row differs from it in one
     /// thing, and is the changed copy it was before. So is the first with
-    /// one more change, and a build file the crate ships is a recorded file.
+    /// one more change or without the line, and a build file the crate
+    /// ships is a recorded file.
     #[tokio::test]
     async fn cargo_inventory_leaves_out_only_the_build_file_cargo_bazel_wrote() {
         use crate::bazel::cargo_bazel::tests::HUB;
@@ -1669,14 +1672,17 @@ mod tests {
         const BUILD: &str = "BUILD.bazel";
         const BAZEL: &str = "MODULE.bazel";
         const REL: &str = ".socket/vendor/cargo/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/cfg-if-1.0.4";
+        const IGNORE: &str = ".bazelignore";
         // A checkout with the file `marks` at its root, which holds
-        // `module`, and the crate in it.
+        // `module`, the crate in it, and the line that keeps Bazel out of
+        // the copies.
         let checkout = |marks: &str, module: &str| {
             let tmp = tempfile::tempdir().unwrap();
             let dir = tmp.path().join(REL);
             std::fs::create_dir_all(dir.join("src")).unwrap();
             std::fs::create_dir(tmp.path().join(".git")).unwrap();
             std::fs::write(tmp.path().join(marks), module).unwrap();
+            std::fs::write(tmp.path().join(IGNORE), ".socket/vendor/cargo\n").unwrap();
             let manifest = "[package]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n";
             std::fs::write(dir.join("Cargo.toml"), manifest).unwrap();
             std::fs::write(dir.join("README.md"), "read me\n").unwrap();
@@ -1734,6 +1740,23 @@ mod tests {
         let mut ent = entry("cargo", UUID, REL);
         ent.artifact.file_inventory = Some(compute_dir_inventory(&dir).await.unwrap());
         std::fs::write(dir.join(BUILD), WRITTEN).unwrap();
+        // Bazel must not read the file. Without a line that covers the
+        // copy, or under one the user commented out, it is a package of
+        // the workspace, whoever wrote it, and a change of the copy.
+        for (lines, verdict) in [
+            ("", changed.clone()),
+            ("# .socket/vendor/cargo\n", changed.clone()),
+            (".socket/vendor/golang\n", changed.clone()),
+            (".socket\n", Ok(())),
+        ] {
+            std::fs::write(tmp.path().join(IGNORE), lines).unwrap();
+            let got = verify_vendored_patch_record(tmp.path(), &ent, &rec).await;
+            assert_eq!(got, verdict, "{lines:?}");
+        }
+        std::fs::remove_file(tmp.path().join(IGNORE)).unwrap();
+        let got = verify_vendored_patch_record(tmp.path(), &ent, &rec).await;
+        assert_eq!(got, changed, "no .bazelignore");
+        std::fs::write(tmp.path().join(IGNORE), ".socket/vendor/cargo\n").unwrap();
         for (file, text, back) in [
             ("src/x.rs", "", None),
             ("src/BUILD.bazel", WRITTEN, None),

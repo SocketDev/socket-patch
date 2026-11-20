@@ -1094,7 +1094,8 @@ fn vendored_from_cargo_with_config() {
     // package: `//...` is the consumer alone, and the commands that analyse
     // every target pass. A user who comments the line out has the package
     // back, where the ruleset writes the build file: `//...` names targets
-    // there, and those commands fail on the repository of the dependency.
+    // there, those commands fail on the repository of the dependency, and
+    // the file Bazel now reads is a change of the copy again.
     assert_eq!(every_target(&cell), [CONSUMER], "{test}");
     assert!(analyses(&cell), "{test}: under the line of the scan");
     cell.write(".bazelignore", DECLINED);
@@ -1106,6 +1107,9 @@ fn vendored_from_cargo_with_config() {
     assert_eq!(own, [CONSUMER], "{test}: {targets:?}");
     assert_eq!(in_copy > 0, watches(&cell), "{test}: {targets:?}");
     assert_eq!(analyses(&cell), !watches(&cell), "{test}: without the line");
+    let check = socket_patch(&cell, &standin, &["vendor", "--check"]);
+    let read = i32::from(watches(&cell));
+    assert_eq!(check.code, read, "{test}: {}", check.dump);
     let declined = ["failed there", "passed"][usize::from(!watches(&cell))];
     cell.write(".bazelignore", IGNORED);
     cell.builds(&patch.package.marker);
@@ -1154,7 +1158,8 @@ fn vendored_from_cargo_with_config() {
     // the line of the scan it is no package. The banner is all that
     // `socket-patch` reads of such a file, so `vendor --check` passes on
     // this one too. With the line commented out it is a package of the
-    // workspace, whose target `//...` builds.
+    // workspace, whose target `//...` builds, and `vendor --check` takes
+    // the copy for a changed one.
     let planted = format!(
         "{BANNER}\n\ngenrule(\n    name = \"planted\",\n    outs = [\"planted.txt\"],\n    \
          cmd = \"touch $@\",\n)\n"
@@ -1170,6 +1175,16 @@ fn vendored_from_cargo_with_config() {
         every_target(&twin),
         [planted_target.as_str(), CONSUMER],
         "{test}"
+    );
+    let check = socket_patch(&twin, &other, &["vendor", "--check"]);
+    let said = &check.dump;
+    assert_eq!(check.code, 1, "{test}: {said}");
+    let reason = event_for(&check.envelope, PURL)["reason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        reason.contains("vendor_inventory_mismatch"),
+        "{test}: {said}"
     );
     twin.write(".bazelignore", IGNORED);
     // Then another library in the committed copy. Nothing in a build holds
@@ -1192,13 +1207,15 @@ fn vendored_from_cargo_with_config() {
          that build `vendor --check` passed and `vex` attested the crate; under the \
          `.bazelignore` line of the scan `//...` held the consumer alone and `cquery //...` \
          and `query 'deps(//...)'` passed, and with the line commented out `//...` held \
-         {in_copy} target(s) in the copy and the two commands {declined}; `vendor --revert` \
+         {in_copy} target(s) in the copy, the two commands {declined} and `vendor --check` \
+         exited {read}; `vendor --revert` \
          restored the checkout, and the next build printed {:?} and left all {} files as \
          before; on a second machine, after its first patched build, a second scan reported \
          the copy already_vendored, downloaded nothing and changed no file, `vendor --check` \
          passed and `vex` attested the crate; a BUILD.bazel of someone else's under \
          cargo-bazel's banner left the build patched and `vendor --check` passed, under the \
-         line it was no package, and with the line commented out `//...` built its target; a \
+         line it was no package, and with the line commented out `//...` built its target and \
+         `vendor --check` reported vendor_inventory_mismatch; a \
          library then changed in the committed copy was built ({:?}), and `vendor --check` \
          reported vendor_hash_mismatch; {:?}",
         patch.package.marker,
@@ -1281,28 +1298,44 @@ fn takes_for(cell: &Cell, standin: &StandIn, patch: &Patched, extra: &str, is_ch
     assert_eq!(changed(&scanned, &cell.tree()), NOTHING, "{extra}");
 }
 
+/// The module file of [`hub`] with the Cargo files of another directory of
+/// the checkout: a hub of another Cargo workspace.
+fn hub_elsewhere() -> String {
+    let (hub, ours) = (hub(), "\"//:Cargo");
+    assert_eq!(hub.matches(ours).count(), 2, "{hub}");
+    hub.replace(ours, "\"//other:Cargo")
+}
+
 /// Without a Bazel: a build file in a vendored copy that the scan did not
 /// record. The first is where cargo-bazel writes one and starts as its
-/// files do, in a Bazel workspace with a crate hub: that one is no change
-/// of the copy. The others differ from it in one thing each, and are the
-/// changed copy they were: a checkout that is no Bazel workspace (a
-/// directory named like a workspace file marks none), a workspace whose
-/// module file makes no crate hub, no banner, Bazel's other name for a
-/// build file, and a directory of the crate ([`takes_for`]).
+/// files do, in a Bazel workspace with a hub of the project's crates,
+/// under the `.bazelignore` line of the scan: that one is no change of the
+/// copy. The others differ from it in one thing each, and are the changed
+/// copy they were: a checkout that is no Bazel workspace (a directory
+/// named like a workspace file marks none), a workspace whose module file
+/// makes no crate hub, or the hub of another Cargo workspace, a path line
+/// that the user commented out, no banner, Bazel's other name for a build
+/// file, and a directory of the crate ([`takes_for`]).
 #[test]
 fn only_the_build_file_of_cargo_bazel_is_no_change_of_a_vendored_copy() {
     let rendered = format!("{BANNER} To \n# regenerate this file, run the following:\n");
-    let (hub, bazel) = (hub(), "MODULE.bazel");
+    let (hub, elsewhere, bazel) = (hub(), hub_elsewhere(), "MODULE.bazel");
     let no_hub = "module(name = \"socket_fixture\", version = \"0.0.0\")\n";
-    for (marks, module, file, text, is_changed) in [
-        (bazel, hub.as_str(), "BUILD.bazel", rendered.as_str(), false),
-        ("WORKSPACE/README", &hub, "BUILD.bazel", &rendered, true),
-        (bazel, no_hub, "BUILD.bazel", &rendered, true),
-        (bazel, &hub, "BUILD.bazel", "genrule(name = \"x\")\n", true),
-        (bazel, &hub, "BUILD", &rendered, true),
-        (bazel, &hub, "src/BUILD.bazel", &rendered, true),
+    let (build, mine) = ("BUILD.bazel", "genrule(name = \"x\")\n");
+    for (marks, module, lines, file, text, is_changed) in [
+        (bazel, hub.as_str(), None, build, rendered.as_str(), false),
+        ("WORKSPACE/README", &hub, None, build, &rendered, true),
+        (bazel, no_hub, None, build, &rendered, true),
+        (bazel, &elsewhere, None, build, &rendered, true),
+        (bazel, &hub, Some(DECLINED), build, &rendered, true),
+        (bazel, &hub, None, build, mine, true),
+        (bazel, &hub, None, "BUILD", &rendered, true),
+        (bazel, &hub, None, "src/BUILD.bazel", &rendered, true),
     ] {
         let (cell, standin, patch) = vendored_checkout(marks, module);
+        if let Some(lines) = lines {
+            cell.write(".bazelignore", lines);
+        }
         let extra = format!("{}/{file}", patch.vendored());
         cell.write(&extra, text);
         takes_for(&cell, &standin, &patch, &extra, is_changed);
@@ -1314,12 +1347,18 @@ fn only_the_build_file_of_cargo_bazel_is_no_change_of_a_vendored_copy() {
 /// vendored` writes the pair and `vendor --revert` takes it away with the
 /// copies, and a person is told of each. A run that leaves Cargo out adds
 /// no pair, and a path line that the user commented out stays as it is.
-/// In a workspace without such a hub, and in no workspace, the scan writes
-/// no such file.
+/// In a workspace without such a hub, in one whose hub reads another Cargo
+/// workspace, and in no workspace, the scan writes no such file.
 #[test]
 fn the_vendored_crates_get_a_bazelignore_line_where_a_crate_hub_builds_them() {
     let no_hub = "module(name = \"socket_fixture\", version = \"0.0.0\")\n";
-    for (marks, module) in [("MODULE.bazel", no_hub), ("WORKSPACE/README", "")] {
+    let elsewhere = hub_elsewhere();
+    let none = [
+        ("MODULE.bazel", no_hub),
+        ("MODULE.bazel", elsewhere.as_str()),
+        ("WORKSPACE/README", ""),
+    ];
+    for (marks, module) in none {
         let (cell, _standin, _patch) = vendored_checkout(marks, module);
         assert!(!cell.tree().contains_key(".bazelignore"), "{marks}");
     }

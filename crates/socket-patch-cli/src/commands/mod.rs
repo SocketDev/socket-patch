@@ -78,7 +78,7 @@ pub(crate) async fn sync_bazelignore(
         return warnings;
     }
     // The agent copies are those of `--cwd`, the vendored ones those of
-    // the manifest's project. A root both are under is named once.
+    // the manifest's project.
     let mut projects = vec![common.cwd.clone()];
     if common.manifest_project_is_foreign() {
         projects.push(common.project_root());
@@ -87,22 +87,23 @@ pub(crate) async fn sync_bazelignore(
     let [go, cargo] = [Golang, Cargo].map(|eco| adds && common.ecosystem_selected(eco));
     for project in projects {
         match ignore::sync(&project, go, cargo).await {
-            Ok(Some((file, copies))) if loud && !told.contains(&file) => {
-                let (verb, what) = match file.exists() {
-                    true => (
-                        "Updated",
-                        format!(
-                            "the lines that keep patched {copies} copies under .socket out of \
-                             Bazel's packages"
-                        ),
+            Ok(Some((file, copies))) if loud => {
+                // A root that both projects are under is named once for
+                // each kind of copy whose lines changed there.
+                let (shown, copies) = (file.display(), copies.join(" and "));
+                let line = match file.exists() {
+                    true => format!(
+                        "Updated {shown}: the lines that keep patched {copies} copies under \
+                         .socket out of Bazel's packages"
                     ),
-                    false => (
-                        "Removed",
-                        format!("no patched {copies} copy is left under .socket"),
-                    ),
+                    false => {
+                        format!("Removed {shown}: no patched {copies} copy is left under .socket")
+                    }
                 };
-                println!("{verb} {}: {what}", file.display());
-                told.push(file);
+                if !told.contains(&line) {
+                    println!("{line}");
+                    told.push(line);
+                }
             }
             Err(detail) if adds => {
                 if loud {

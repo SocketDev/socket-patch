@@ -18,9 +18,10 @@
 //! package of the workspace, and that package names repositories only the
 //! hub sees: for a crate with a dependency `bazel cquery //...` and
 //! `bazel query 'deps(//...)'` fail on it. So where the module files of
-//! the workspace make such a hub ([`hub`]), the file is no change of the
-//! copy ([`wrote_build_file`]) and the copies get a `.bazelignore` line
-//! ([`super::ignore`]).
+//! the workspace make such a hub of the project's crates ([`hub`]), the
+//! copies get a `.bazelignore` line ([`super::ignore`]), and under such a
+//! line, where Bazel reads no package in the copy, the file is no change
+//! of the copy ([`wrote_build_file`]).
 //!
 //! Nowhere else. Read in the same source and not run: where `crates_vendor`
 //! renders build files into the checkout (`mode = "local"`), they name such
@@ -30,11 +31,10 @@
 use std::io::Read as _;
 use std::path::Path;
 
-use super::workspace::{disk, Extension, Workspace};
+use super::starlark::Value;
+use super::workspace::{disk, Extension, Repo, Workspace};
+use super::BazelRoot;
 use crate::utils::fs::{open_regular_file_sync, run_blocking};
-
-/// Where vendored mode keeps its crates, from the project.
-pub(crate) const VENDOR_DIR: &str = ".socket/vendor/cargo";
 
 /// The name of that file, in the directory of the crate.
 pub(crate) const BUILD_FILE: &str = "BUILD.bazel";
@@ -55,39 +55,73 @@ const EXTENSION_FILES: [&str; 2] = [
     "//crate_universe:extension.bzl",
 ];
 
-/// Whether the module files of the Bazel workspace at `root` call
-/// `crate.from_cargo`, the tag that makes a hub from a Cargo workspace.
-/// Any such call counts, whichever manifests it names: this is asked of a
-/// workspace that holds a vendored crate, to tell what may have written
-/// into it. A hub of the older `WORKSPACE` system is not looked for.
-pub(crate) fn hub(root: &Path) -> bool {
-    let workspace = Workspace::read(&disk(root));
+/// Whether the module files of the Bazel workspace `root` make a hub of
+/// the project's crates: a `crate.from_cargo` call that is a statement of
+/// its own ([`super::starlark::Call::whole`]: it runs, once) and names the
+/// project's `Cargo.lock` as its `cargo_lockfile`, or the project's
+/// `Cargo.toml` among its `manifests`, by a label of the main repository
+/// that is written out as a string. A call in a comprehension or behind a
+/// condition may never run, and one that names its files in another way,
+/// or the files of another Cargo workspace of the checkout, does not show
+/// that it reads this project: each is none, and socket-patch then leaves
+/// the copies and the `.bazelignore` as they are. A hub of the older
+/// `WORKSPACE` system is not looked for.
+pub(crate) fn hub(root: &BazelRoot) -> bool {
+    let workspace = Workspace::read(&disk(&root.dir));
+    // Bazel has `/` between the parts of a path on every system.
+    let project = super::ignore::from_root(root, Path::new(""));
+    let ours = ["Cargo.lock", "Cargo.toml"].map(|file| format!("{project}{file}"));
+    let names = |label: &str| {
+        let main = |label: &super::workspace::Label| label.repo == Repo::Main;
+        let label = workspace.label(label).filter(main);
+        label.is_some_and(|label| ours.contains(&label.path()))
+    };
     EXTENSION_FILES.iter().any(|file| {
         let (module, name) = ("rules_rust", "crate");
         let extension = Extension { module, file, name };
-        !workspace.tags(&extension, "from_cargo").calls.is_empty()
+        let tags = workspace.tags(&extension, "from_cargo");
+        tags.calls.iter().any(|tag| {
+            let lock = match tag.call.arg("cargo_lockfile") {
+                Some(Value::Str(label)) => names(label),
+                _ => false,
+            };
+            let manifests = match tag.call.arg("manifests") {
+                Some(Value::List(labels)) => labels.iter().any(|label| names(label)),
+                _ => false,
+            };
+            tag.call.whole && (lock || manifests)
+        })
     })
 }
 
 /// Whether the [`BUILD_FILE`] of `crate_dir`, a crate of the project at
-/// `project`, is one cargo-bazel wrote: a file that begins with [`BANNER`],
-/// in a project whose Bazel workspace ([`super::bazel_root`]) has a crate
-/// [`hub`]. The banner says which tool the file names as its writer. It
-/// does not vouch for the rest of the file, which differs from one machine
-/// to the next. A link is followed: the one caller asks about a file that
-/// its own walk of the copy found to be a regular one.
+/// `project`, is one cargo-bazel wrote and Bazel does not read: a file that
+/// begins with [`BANNER`], in a project whose Bazel workspace
+/// ([`super::bazel_root`]) has a [`hub`] of its crates and a `.bazelignore`
+/// line that covers the crate ([`super::ignore::ignores`]). The banner says
+/// which tool the file names as its writer. It does not vouch for the rest
+/// of the file, which differs from one machine to the next, so the file is
+/// let through only where it is no package of the workspace: without the
+/// line it is one, whoever wrote it, and stays a change of the copy. A
+/// link is followed: the one caller asks about a file that its own walk of
+/// the copy found to be a regular one.
 pub(crate) async fn wrote_build_file(project: &Path, crate_dir: &Path) -> bool {
-    let (project, file) = (project.to_path_buf(), crate_dir.join(BUILD_FILE));
+    let (project, dir) = (project.to_path_buf(), crate_dir.to_path_buf());
     run_blocking(move || {
         // What cannot be read has no banner.
         let mut start = Vec::new();
-        let _ = open_regular_file_sync(&file)
+        let _ = open_regular_file_sync(&dir.join(BUILD_FILE))
             .and_then(|(file, _)| file.take(512).read_to_end(&mut start));
         let start = String::from_utf8_lossy(&start);
         let mut lines = start.lines();
-        BANNER[..2].iter().all(|line| lines.next() == Some(line))
-            && lines.next().is_some_and(|line| line.starts_with(BANNER[2]))
-            && super::bazel_root(&project).is_some_and(|root| hub(&root.dir))
+        let banner = BANNER[..2].iter().all(|line| lines.next() == Some(line))
+            && lines.next().is_some_and(|line| line.starts_with(BANNER[2]));
+        // The cheaper question first: the module files are read last.
+        let unread = |root: &BazelRoot| {
+            let copy = dir.strip_prefix(&project);
+            copy.is_ok_and(|copy| super::ignore::ignores(root, copy))
+        };
+        banner && super::bazel_root(&project).is_some_and(|root| unread(&root) && hub(&root))
     })
     .await
 }
@@ -105,13 +139,15 @@ pub(crate) mod tests {
         use_repo(crate, \"crates\")\n";
 
     /// A checkout with the file `marks` at its root, which holds `module`,
-    /// and a crate in `krate`, whose build file holds `text`.
+    /// a crate in `krate`, whose build file holds `text`, and a
+    /// `.bazelignore` line for that directory.
     fn checkout(marks: &str, module: &str, text: &str) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join(".git")).unwrap();
         fs::create_dir_all(tmp.path().join("krate")).unwrap();
         fs::write(tmp.path().join(marks), module).unwrap();
         fs::write(tmp.path().join("krate").join(BUILD_FILE), text).unwrap();
+        fs::write(tmp.path().join(".bazelignore"), "krate\n").unwrap();
         tmp
     }
 
@@ -183,5 +219,77 @@ pub(crate) mod tests {
         let tmp = checkout(MODULE, "include(\"//:rust.MODULE.bazel\")\n", WRITTEN);
         fs::write(tmp.path().join("rust.MODULE.bazel"), HUB).unwrap();
         assert!(wrote_build_file(tmp.path(), &tmp.path().join("krate")).await);
+    }
+
+    /// The file is let through only where Bazel does not read it: under a
+    /// `.bazelignore` line that covers the crate. Without one, or with one
+    /// the user commented out, it is a package of the workspace, whoever
+    /// wrote it.
+    #[tokio::test]
+    async fn a_build_file_that_bazel_reads_is_not_let_through() {
+        let tmp = checkout("MODULE.bazel", HUB, WRITTEN);
+        let (file, krate) = (tmp.path().join(".bazelignore"), tmp.path().join("krate"));
+        for (lines, covered) in [
+            ("krate\n", true),
+            ("node_modules\nkrate/\n", true),
+            ("", false),
+            ("# krate\n", false),
+            ("krate/src\n", false),
+            ("other\n", false),
+        ] {
+            fs::write(&file, lines).unwrap();
+            let wrote = wrote_build_file(tmp.path(), &krate).await;
+            assert_eq!(wrote, covered, "{lines:?}");
+        }
+        fs::remove_file(&file).unwrap();
+        assert!(!wrote_build_file(tmp.path(), &krate).await, "no file");
+    }
+
+    /// A hub of the project's crates is a `from_cargo` call that runs and
+    /// names the project's lock or manifest in so many words.
+    #[tokio::test]
+    async fn only_a_call_that_names_the_projects_cargo_files_is_its_hub() {
+        const MODULE: &str = "MODULE.bazel";
+        let lock = "    cargo_lockfile = \"//:Cargo.lock\",\n";
+        let manifests = "    manifests = [\"//:Cargo.toml\"],\n";
+        assert!(HUB.contains(lock) && HUB.contains(manifests));
+        let elsewhere = |hub: &str| hub.replace("\"//:", "\"//other:");
+        // Either file names the project, under any name for the main
+        // repository.
+        for module in [
+            HUB.replace(lock, ""),
+            HUB.replace(manifests, ""),
+            elsewhere(HUB).replace("\"//other:Cargo.lock\"", "\"@//:Cargo.lock\""),
+            elsewhere(HUB).replace("//other:Cargo.toml", "@@//:Cargo.toml"),
+        ] {
+            assert!(wrote(MODULE, &module, WRITTEN).await, "{module}");
+        }
+        // The files of another Cargo workspace, of another repository, or
+        // not written out; and a call that may never run.
+        for module in [
+            elsewhere(HUB),
+            HUB.replace("\"//:", "\"@other//:"),
+            HUB.replace("\"//:Cargo.lock\"", "LOCK")
+                .replace("[\"//:Cargo.toml\"]", "MANIFESTS"),
+            HUB.replace("crate.from_cargo(", "False and crate.from_cargo("),
+            HUB.replace("crate.from_cargo(", "[crate.from_cargo(")
+                .replace(")\nuse_repo", ") for _ in []]\nuse_repo"),
+        ] {
+            assert!(!wrote(MODULE, &module, WRITTEN).await, "{module}");
+        }
+        // A project below the root is named from the root.
+        let tmp = tempfile::tempdir().unwrap();
+        let (svc, krate) = (tmp.path().join("svc"), tmp.path().join("svc/krate"));
+        fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        fs::create_dir_all(&krate).unwrap();
+        fs::write(krate.join(BUILD_FILE), WRITTEN).unwrap();
+        fs::write(tmp.path().join(".bazelignore"), "svc/krate\n").unwrap();
+        for (module, ours) in [
+            (elsewhere(HUB).replace("other", "svc"), true),
+            (HUB.into(), false),
+        ] {
+            fs::write(tmp.path().join(MODULE), &module).unwrap();
+            assert_eq!(wrote_build_file(&svc, &krate).await, ours, "{module}");
+        }
     }
 }
