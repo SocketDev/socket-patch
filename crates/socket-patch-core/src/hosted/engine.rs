@@ -1287,7 +1287,9 @@ pub async fn read_candidate_files_in(
         // the hub makes of the project is read from the checkout here and
         // rides a synthetic key, for the rewriter to judge each package.
         // A project in no Bazel workspace, or whose locks no tag reads,
-        // gets none, and its run is the one it was.
+        // gets none, and its run is the one it was. The root is the raw
+        // one: which files of the workspace this reads is not known
+        // beforehand, so a recording gives up instead of listing them.
         if let Some(root) = view.disk_root() {
             use crate::bazel::nuget::{withheld, WITHHELD_KEY};
             let config = crate::patch::redirect::nuget_config_path(&out.files);

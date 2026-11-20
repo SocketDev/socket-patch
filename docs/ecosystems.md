@@ -1517,6 +1517,8 @@ build updates `MODULE.bazel.lock`, which records the two files: commit all three
 `MODULE.bazel`. The label is the one of the project's own config, in the package of the lock's
 label: the file of NuGet's spellings (`nuget.config`, `NuGet.config`, `NuGet.Config`) that the
 project directory holds, as the directory spells it, or `nuget.config` where it holds none.
+Where the tag does not name its lock as a label in a plain string, or the config lies outside
+the package of that label, the warning names the file and leaves the label to you.
 
 The other cases, each with its own way on in the warning:
 
@@ -1528,6 +1530,10 @@ The other cases, each with its own way on in the warning:
 - **The tag that decides has `feeds` and no `nuget_config`.** Put the attribute on it and name
   its feeds in the project's config: the sources of a `nuget_config` stand in the place of
   `feeds`.
+- **A tag has `feeds`, and the config names no package source.** A config without a source
+  leaves the `feeds` of the tags as they are; the first source in it takes their place. So
+  hosted mode does not name the Socket source there until the config names those feeds: name
+  them and run the command again.
 - **A tag is not written out:** it stands in a comprehension or a condition, passes `**`, or
   has a `nuget_config` that is a constant or an expression. socket-patch evaluates nothing, so
   it cannot tell which file the hub reads, and a build that may break outranks a patch that is
@@ -1544,7 +1550,9 @@ for the package and names the tag and the lock. Run the command in a directory a
 locks (`--cwd`) that holds a solution file or a `nuget.config`, which is what makes hosted mode
 look for projects below it: there it re-pins the lock of every project. Where the tags are in
 more than one file their order is not known, and such a lock stands against the pin wherever
-its tag is; a lock that cannot be read counts as one that holds the package.
+its tag is; a lock that cannot be read counts as one that holds the package. So does the lock
+of a tag that does not name it as a label in a plain string, beside a tag that names a lock of
+the project: the warning says to write that label out.
 
 ### What is read, and what is not
 
@@ -1556,12 +1564,15 @@ name. Nothing is evaluated and no Bazel is run.
   [Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore)), for one that restores
   into no lock file, and for one whose locks no `nuget.from_lock` call names, which Bazel does
   not build. A tag whose `packages_lock_json` is not a label in a plain string may name any
-  lock, and counts as one that names the project's. Nothing changes either for a package that
-  no lock of the project which a tag reads holds: the hub does not build it from this project.
+  lock, and counts as one that names the project's where no tag names a lock of the project.
+  Nothing changes either for a package that no lock of the project which a tag reads holds:
+  the hub does not build it from this project.
 - **Hosted mode writes** when every `nuget.from_lock` is a call of its own and the last one
   that has a `nuget_config` or `feeds` names the project's config as a label in a plain string
   (`//:nuget.config`, `@//:nuget.config`, or with the root module's own name; in another case
-  too, unless the directory holds both spellings). Where the tags are in more than one file,
+  too, unless the directory holds both spellings, or one that is not NuGet's on a disk that
+  does not fold case, beside which hosted mode writes a file of its own). Where the tags are
+  in more than one file,
   every tag that has either must name the config. A tag that reads another lock and names the
   config serves, unless its lock holds the package as above.
 - **A part of `MODULE.bazel` that socket-patch cannot read** (a `bazel_dep` whose name is an
@@ -1574,12 +1585,14 @@ name. Nothing is evaluated and no Bazel is run.
   build fails on a re-pinned lock (measured on Bazel 9.3.2). The warning says so in a workspace
   that has the attribute; where the tags show that the hub reads the config, hosted mode
   writes as it does without Bazel.
-- **Not covered:** a Bazel workspace below the directory of the run, whose tags are not read
-  while the locks of its projects are re-pinned with the others; a project below the root of a
-  workspace that is in no git checkout, because a workspace is looked for only up to the root
-  of the project's checkout; and a project whose own locks no tag reads while a tag names its
-  `nuget.config` and reads another lock that holds the package. Hosted mode writes in each as
-  it does without Bazel.
+- **Not covered:** a release of rules_csharp after 0.5.0 that gives each `name` of
+  `nuget.from_lock` a hub of its own, where the two rules above hold per name and the tags are
+  still read as one hub; a Bazel workspace below the directory of the run, whose tags are not
+  read while the locks of its projects are re-pinned with the others; a project below the root
+  of a workspace that is in no git checkout, because a workspace is looked for only up to the
+  root of the project's checkout; and a project whose own locks no tag reads while a tag names
+  its `nuget.config` and reads another lock that holds the package. Hosted mode writes in each
+  as it does without Bazel.
 - A pin that an earlier release wrote in such a workspace stays in the two files: `socket-patch
   rollback` takes it out, and the attribute makes the build read it.
 

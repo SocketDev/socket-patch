@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use super::starlark::Value;
 use super::workspace::{disk, disk_up_to, Entry, Extension, Repo, Tag, Workspace};
 use crate::formats::nuget::lock::{locked_at, nuget_lock_entries, parse_lock};
+use crate::formats::nuget::parse_config;
 use crate::patch::redirect::NUGET_CONFIG_FILE_NAMES as NAMES;
 
 /// The extension whose `from_lock` tags make the hub.
@@ -64,6 +65,21 @@ const MAX_LOCK: usize = 16 << 20;
 const NOT_PLAIN: &str = "is not a call of its own that names its `nuget_config` in a plain string";
 const DIRS: &str = "; rules_csharp asks the directories of `local_package_dirs` before every \
                     source, so the upstream package must not lie in one";
+/// What the build does with a re-pinned lock and without the Socket source.
+const WITHOUT: &str =
+    ", where hosted mode names the Socket source of a patch; without that source \
+                       rules_csharp downloads the upstream package, and the Bazel build fails on \
+                       the `contentHash` that hosted mode re-pins in the lock";
+
+/// What a lock warning says of a tag whose lock is not named plainly
+/// beside one that names the project's, and the way on of each kind.
+const UNNAMED: &str = "names its lock in no plain string, so that lock may hold the package and \
+                       may be one this run does not re-pin";
+const NAME_IT: &str = "Write its `packages_lock_json` as a label in a plain string and run this \
+                       command again";
+const ABOVE_BOTH: &str = "Run this command in a directory above both locks that holds a solution \
+                          file or a `nuget.config` (`--cwd`): there it re-pins the lock of every \
+                          project";
 
 /// What the hub of a Bazel workspace makes of one project.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -72,6 +88,10 @@ pub struct Hub {
     /// `nuget.config`, as the warning of a package says it after its name.
     /// `None`: the tags show that it does.
     pub why: Option<String>,
+    /// [`Self::why`] stands against every package of the run, not only
+    /// against one that a lock the hub reads holds: the hub does read the
+    /// config, which must not get a source yet.
+    pub every: bool,
     /// The lock of each tag that names one this reader can tell, in the
     /// order of the tags.
     pub locks: Vec<Read>,
@@ -89,8 +109,10 @@ pub enum Read {
     /// Another file of the checkout: where its tag is, its path from the
     /// Bazel root, and its text (`None`: it cannot be read).
     Other(String, String, Option<String>),
-    /// A label that cannot be read: any lock, the project's among them.
-    Any,
+    /// A label that cannot be read, and where its tag is: any lock. Where
+    /// no tag names a lock of the project it is taken for the project's;
+    /// beside a tag that does, it is another lock, which cannot be read.
+    Any(String),
 }
 
 impl Hub {
@@ -104,20 +126,28 @@ impl Hub {
     /// First the locks this run does not re-pin: one that holds the
     /// package at that version with another `contentHash`, or cannot be
     /// read, stands against the pin, unless the hub has the package from
-    /// a lock before it. Then the config ([`Self::why`]), for a package
-    /// that the run re-pins in a lock the hub reads. A package in no such
-    /// lock is not the hub's: its pin changes nothing a build reads.
+    /// a lock before it. That is asked for every package, also where the
+    /// hub does not read the config yet: the run names the package's
+    /// source in the config that the other warning says to put on a tag,
+    /// and the hub would then take the patched package against that lock.
+    /// Then the config ([`Self::why`]), for a package that the run re-pins
+    /// in a lock the hub reads. A package in no such lock is not the
+    /// hub's: its pin changes nothing a build reads.
+    ///
+    /// `docs` are [`Self::docs`], read once for all the packages of a run.
     pub fn against(
         &self,
+        docs: &[Option<serde_json::Value>],
         pinned: &dyn Fn(Option<&str>) -> bool,
         id: &str,
         version: &str,
         hash: &str,
     ) -> Option<(&'static str, String)> {
+        let named = self.locks.iter().any(|lock| matches!(lock, Read::Ours(_)));
         let (mut read, mut first) = (false, false);
-        for lock in &self.locks {
-            let (at, path, text) = match lock {
-                Read::Any => {
+        for (lock, doc) in self.locks.iter().zip(docs) {
+            let (at, reads, way) = match lock {
+                Read::Any(_) if !named => {
                     read |= pinned(None);
                     continue;
                 }
@@ -126,32 +156,47 @@ impl Hub {
                     (read, first) = (read || ours, first || ours);
                     continue;
                 }
-                Read::Other(..) if first && self.ordered => continue,
-                Read::Other(at, path, text) => (at, path, text),
-            };
-            let doc = text.as_deref().and_then(|text| parse_lock(text).ok());
-            let state = match &doc {
-                None => "cannot be read and may hold the package",
-                Some(doc) if locked_at(doc, id, version).any(|e| e.content_hash != Some(hash)) => {
-                    "holds the package as well"
-                }
-                Some(doc) => {
-                    first |= nuget_lock_entries(doc).any(|e| e.id.eq_ignore_ascii_case(id));
-                    continue;
+                _ if first && self.ordered => continue,
+                Read::Any(at) => (at, UNNAMED.to_string(), NAME_IT),
+                Read::Other(at, path, _) => {
+                    let state = match doc {
+                        None => "cannot be read and may hold the package",
+                        Some(doc)
+                            if locked_at(doc, id, version)
+                                .any(|e| e.content_hash != Some(hash)) =>
+                        {
+                            "holds the package as well"
+                        }
+                        Some(doc) => {
+                            first |= nuget_lock_entries(doc).any(|e| e.id.eq_ignore_ascii_case(id));
+                            continue;
+                        }
+                    };
+                    let reads =
+                        format!("reads {path}, which {state} and which this run does not re-pin");
+                    (at, reads, ABOVE_BOTH)
                 }
             };
             let why = format!(
-                "{at}: this `nuget.from_lock` reads {path}, which {state} and which this run \
-                 does not re-pin; rules_csharp holds a package to the `contentHash` of the first \
-                 lock that names it, so the Bazel build can fail on the patched package. So \
-                 hosted mode wrote nothing for it. Run this command in a directory above both \
-                 locks that holds a solution file or a `nuget.config` (`--cwd`): there it re-pins \
-                 the lock of every project"
+                "{at}: this `nuget.from_lock` {reads}; rules_csharp holds a package to the \
+                 `contentHash` of the first lock that names it, so the Bazel build can fail on \
+                 the patched package. So hosted mode wrote nothing for it. {way}"
             );
             return Some((LOCK_NOT_REPINNED, why));
         }
-        let why = self.why.clone().filter(|_| read)?;
+        let why = self.why.clone().filter(|_| read || self.every)?;
         Some((CONFIG_UNDECLARED, why))
+    }
+
+    /// The locks of the other tags as documents, one for each of
+    /// [`Self::locks`]: `None` for one that is not such a lock, has no
+    /// text or is no JSON.
+    pub fn docs(&self) -> Vec<Option<serde_json::Value>> {
+        let doc = |lock: &Read| match lock {
+            Read::Other(_, _, Some(text)) => parse_lock(text).ok(),
+            _ => None,
+        };
+        self.locks.iter().map(doc).collect()
     }
 }
 
@@ -170,7 +215,9 @@ impl Hub {
 /// `config` is taken as the project's directory spells it: a disk that
 /// folds case answers to every spelling, and a label has to name the file
 /// as a disk that does not would. A label that differs from it only in
-/// case names the same file, unless the directory holds both.
+/// case names the same file, unless the directory holds both, or holds a
+/// spelling that is not NuGet's on a disk that does not fold case, where
+/// the rewriter writes a file of its own beside it.
 ///
 /// Not seen: a tag of another Bazel module, whose sources and locks the
 /// hub takes as well; a tag that an unreadable part of the workspace
@@ -191,11 +238,22 @@ pub fn withheld(project: &Path, config: &str, locks: &[String]) -> Option<String
         .filter_map(|entry| entry.file_name().into_string().ok())
         .filter(|name| name.eq_ignore_ascii_case(config))
         .collect();
-    let exact = spelled.iter().find(|name| *name == config);
-    let config = exact.or(spelled.first()).map_or(config, |name| name);
-    let workspace = Workspace::read(&disk(&root.dir));
-    let mut hub = judge(&workspace, &dir, config, locks, spelled.len() > 1)?;
+    let exact = spelled.iter().any(|name| name == config);
+    // A spelling in another case is the file the rewriter writes only
+    // where the disk folds case: there its own name finds the file.
+    let folds = !exact && project.join(config).exists();
+    let strict = spelled.len() > 1 || !(exact || folds || spelled.is_empty());
+    let config = spelled
+        .first()
+        .filter(|_| folds)
+        .map_or(config, |name| name);
     let read = disk_up_to(&root.dir, MAX_LOCK);
+    let sources = match read(&format!("{dir}{config}")) {
+        Entry::Text(text) => parse_config(&text).is_some_and(|c| !c.sources.is_empty()),
+        _ => false,
+    };
+    let workspace = Workspace::read(&disk(&root.dir));
+    let mut hub = judge(&workspace, &dir, config, locks, strict, sources)?;
     for lock in &mut hub.locks {
         if let Read::Other(_, path, text) = lock {
             *text = match read(path) {
@@ -210,6 +268,7 @@ pub fn withheld(project: &Path, config: &str, locks: &[String]) -> Option<String
 /// [`withheld`] for the workspace `ws` and the project in its directory
 /// `dir` (empty, or with a `/` at its end), before the locks of the other
 /// tags are read. `exact`: a label names `config` only in its own case.
+/// `sources`: `config` has package sources of its own.
 ///
 /// The hub reads `config` when the last tag that has a `nuget_config` or
 /// `feeds` names it, as a label in a string; where the tags are in more
@@ -219,7 +278,19 @@ pub fn withheld(project: &Path, config: &str, locks: &[String]) -> Option<String
 /// reading withholds: a build that may break outranks a patch that is
 /// missed and explained. A doubt of the reader elsewhere in the files can
 /// only hide a tag, and changes nothing here.
-fn judge(ws: &Workspace, dir: &str, config: &str, locks: &[String], exact: bool) -> Option<Hub> {
+///
+/// A config without a package source does not replace the `feeds` of the
+/// tags (`if parsed_sources: feeds = parsed_sources`), and it would once
+/// hosted mode names the Socket source in it: where a tag has `feeds`,
+/// that is withheld as well, until the config names them.
+fn judge(
+    ws: &Workspace,
+    dir: &str,
+    config: &str,
+    locks: &[String],
+    exact: bool,
+    sources: bool,
+) -> Option<Hub> {
     let tags = ws.tags(&EXTENSION, "from_lock");
     let given = |tag: &Tag, attribute: &str| tag.call.arg(attribute).is_some();
     // The file of the checkout that a tag names in a plain string.
@@ -237,11 +308,11 @@ fn judge(ws: &Workspace, dir: &str, config: &str, locks: &[String], exact: bool)
                 None => Read::Other(at(tag), path, None),
             })
         }
-        Some(_) => Some(Read::Any),
-        None => tag.call.unpacks().then_some(Read::Any),
+        Some(_) => Some(Read::Any(at(tag))),
+        None => tag.call.unpacks().then(|| Read::Any(at(tag))),
     };
     let reads: Vec<Option<Read>> = tags.calls.iter().map(read).collect();
-    let mine = |read: &Option<Read>| matches!(read, Some(Read::Ours(_) | Read::Any));
+    let mine = |read: &Option<Read>| matches!(read, Some(Read::Ours(_) | Read::Any(_)));
     let reader = &tags.calls[reads.iter().position(mine)?];
 
     let config = format!("{dir}{config}");
@@ -263,43 +334,62 @@ fn judge(ws: &Workspace, dir: &str, config: &str, locks: &[String], exact: bool)
     };
     let vague = tags.calls.iter().find(|tag| !plain(tag));
     let shown = other.is_none() && tags.calls.iter().any(|tag| sets(&tag));
+    // The tag whose `feeds` the config would replace once it has a source.
+    let fed = tags.calls.iter().find(|tag| given(tag, "feeds"));
+    let fed = fed.filter(|_| shown && !sources);
     let locks: Vec<Read> = reads.into_iter().flatten().collect();
+    let every = vague.is_none() && fed.is_some();
     let hub = |why, locks| Hub {
         why,
+        every,
         locks,
         ordered,
     };
-    if vague.is_none() && shown {
+    if vague.is_none() && shown && fed.is_none() {
         // The config is read: only another lock can stand against a pin.
-        let others = locks.iter().any(|lock| matches!(lock, Read::Other(..)));
-        return others.then(|| hub(None, locks));
+        return (locks.len() > 1).then(|| hub(None, locks));
     }
 
-    // The label of `config` for the tag: in the package of the lock, when
-    // the tag names the lock plainly and `config` lies in that package,
-    // else in the package of its own directory.
+    // The label of `config` for the tag, in the package of the lock, when
+    // the tag names the lock plainly and `config` lies in that package:
+    // one that Bazel reads already. Elsewhere the package of `config` is
+    // not known, and the answer names the file.
     let package = file(reader, "packages_lock_json").map(|label| label.package);
     let inside = |package: &String| match config.strip_prefix(package.as_str()) {
         Some(rest) => package.is_empty() || rest.starts_with('/'),
         None => false,
     };
-    let (package, name) = match package.as_ref().filter(|package| inside(package)) {
-        Some(package) => (&**package, config[package.len()..].trim_start_matches('/')),
-        None => config.rsplit_once('/').unwrap_or(("", &config)),
+    let attribute = match package.as_ref().filter(|package| inside(package)) {
+        Some(package) => {
+            let name = config[package.len()..].trim_start_matches('/');
+            format!("`nuget_config = \"//{package}:{name}\"`")
+        }
+        None => format!("a `nuget_config` that names {config}"),
     };
-    let attribute = format!("`nuget_config = \"//{package}:{name}\"`");
     let put = format!("Put {attribute} on that tag");
     let again = format!(
         " and run this command again: it then names the source in {config}, which it creates \
          where there is none"
     );
     let unread = format!("so rules_csharp does not read {config}");
-    let tag = vague.or(other).unwrap_or(reader);
+    let tag = vague.or(other).or(fed).unwrap_or(reader);
+    let mut harm = WITHOUT.to_string();
     let (why, way) = match tag.call.arg("nuget_config") {
         _ if vague.is_some() => (
             format!("{NOT_PLAIN}, so socket-patch cannot tell whether rules_csharp reads {config}"),
             format!("Write that plainly, with {attribute} on the tag,{again}"),
         ),
+        _ if other.is_none() && fed.is_some() => {
+            harm = format!(
+                ": with the Socket source that hosted mode names there, rules_csharp takes the \
+                 package sources of {config} in place of those `feeds`, and the Bazel build \
+                 cannot download a package that only they hold"
+            );
+            (
+                format!("has `feeds`, and {config} names no package source"),
+                format!("Name those `feeds` in {config} and run this command again"),
+            )
+        }
         Some(Value::Str(theirs)) => {
             // A config of NuGet's in a directory above the project's is
             // one the same command writes, when it runs there.
@@ -338,10 +428,8 @@ fn judge(ws: &Workspace, dir: &str, config: &str, locks: &[String], exact: bool)
     let dirs = tags.calls.iter().any(held);
     let dirs = if dirs { DIRS } else { "" };
     let why = format!(
-        "{}: this `nuget.from_lock` {why}, where hosted mode names the Socket source of a patch; \
-         without that source rules_csharp downloads the upstream package, and the Bazel build \
-         fails on the `contentHash` that hosted mode re-pins in the lock. So hosted mode wrote \
-         nothing for it. {way}, and the Bazel build takes the patched package{dirs}",
+        "{}: this `nuget.from_lock` {why}{harm}. So hosted mode wrote nothing for it. {way}, and \
+         the Bazel build takes the patched package{dirs}",
         at(tag)
     );
     Some(hub(Some(why), locks))
@@ -382,7 +470,14 @@ mod tests {
             None => Entry::Absent,
         };
         let lock = ["packages.lock.json".to_string()];
-        judge(&Workspace::read(&view), dir, "nuget.config", &lock, false)
+        judge(
+            &Workspace::read(&view),
+            dir,
+            "nuget.config",
+            &lock,
+            false,
+            true,
+        )
     }
 
     /// What stands against the config there ([`Hub::why`]).
@@ -472,9 +567,12 @@ mod tests {
                     nuget.config";
         let bare = format!("MODULE.bazel:4: {none}{WHERE}Put {ATTRIBUTE} on that tag{AGAIN}");
         assert_eq!(at_root(BARE), Some(bare.clone()));
-        // A tag whose lock cannot be read may read the project's.
+        // A tag whose lock cannot be read may read the project's. The
+        // package of the config is then not known, and the file is named.
         let computed = BARE.replace("\"//:packages.lock.json\"", "LOCK");
-        assert_eq!(at_root(&computed), Some(bare.clone()));
+        let file = bare.replace(ATTRIBUTE, "a `nuget_config` that names nuget.config");
+        assert_ne!(file, bare);
+        assert_eq!(at_root(&computed), Some(file));
         // What a directory of the tag holds is asked before every source.
         let dirs = BARE.replace(")", ", local_package_dirs = [\"/opt/packages\"])");
         let first = "; rules_csharp asks the directories of `local_package_dirs` before every \
@@ -610,8 +708,8 @@ mod tests {
             Workspace::read(&view),
             ["app/packages.lock.json".to_string()],
         );
-        let said = judge(&ws, "svc/", "nuget.config", &lock, false).expect("withheld");
-        let way = "Put `nuget_config = \"//svc:nuget.config\"` on that tag";
+        let said = judge(&ws, "svc/", "nuget.config", &lock, false, true).expect("withheld");
+        let way = "Put a `nuget_config` that names svc/nuget.config on that tag";
         assert!(said.why.expect("why").contains(way));
         // A label in another case names the config, unless the directory
         // holds both spellings.
@@ -620,8 +718,8 @@ mod tests {
             _ => Entry::Absent,
         };
         let (ws, lock) = (Workspace::read(&view), ["packages.lock.json".to_string()]);
-        assert_eq!(judge(&ws, "", "nuget.config", &lock, false), None);
-        let said = judge(&ws, "", "nuget.config", &lock, true).and_then(|hub| hub.why);
+        assert_eq!(judge(&ws, "", "nuget.config", &lock, false, true), None);
+        let said = judge(&ws, "", "nuget.config", &lock, true, true).and_then(|hub| hub.why);
         let said = said.expect("another file");
         let names = "names `//:NuGet.Config` as its `nuget_config`, not nuget.config";
         assert!(said.contains(names), "{said}");
@@ -643,10 +741,15 @@ mod tests {
         ] {
             let said = at_root(&rest).unwrap_or_else(|| panic!("not withheld: {rest}"));
             let line = 4 + rest.matches(WIRED).count() * 4;
+            // The tag that reads the lock names it plainly, or none does.
+            let attribute = match rest.contains("//:packages.lock.json") {
+                true => ATTRIBUTE,
+                false => "a `nuget_config` that names nuget.config",
+            };
             let whole = format!(
                 "MODULE.bazel:{line}: this `nuget.from_lock` {NOT_PLAIN}, so socket-patch cannot \
                  tell whether rules_csharp reads nuget.config{WHERE}Write that plainly, with \
-                 {ATTRIBUTE} on the tag,{AGAIN}"
+                 {attribute} on the tag,{AGAIN}"
             );
             assert_eq!(said, whole, "{rest}");
         }
@@ -673,7 +776,8 @@ mod tests {
         let computed = BARE.replace("\"//:packages.lock.json\"", "LOCK");
         let listed = read(&format!("{lib}\n{WIRED}\n{computed}"));
         assert_eq!((listed.why, listed.ordered), (None, true));
-        assert_eq!(listed.locks, [other(4), ours(), Read::Any]);
+        let unnamed = Read::Any("MODULE.bazel:12".to_string());
+        assert_eq!(listed.locks, [other(4), ours(), unnamed]);
         // And about the config as well.
         let listed = read(&format!("{BARE}\n{}", lib.replace("//:n", "//lib:n")));
         assert_eq!((listed.why.is_some(), listed.ordered), (true, true));
@@ -697,12 +801,14 @@ mod tests {
             let why = Some("why".to_string());
             let hub = Hub {
                 why,
+                every: false,
                 locks,
                 ordered,
             };
-            let said = hub.against(&|_| pinned, "newtonsoft.json", "1.0.0", "NEW");
+            let said = hub.against(&hub.docs(), &|_| pinned, "newtonsoft.json", "1.0.0", "NEW");
             said.map(|(code, why)| (code, why.starts_with("M:4: ") || why == "why"))
         };
+        let any = || Read::Any("M:4".to_string());
         let (config, elsewhere) = (
             Some((CONFIG_UNDECLARED, true)),
             Some((LOCK_NOT_REPINNED, true)),
@@ -716,7 +822,7 @@ mod tests {
             (vec![ours(), other(upstream())], false, true, elsewhere),
             // The project's lock does not hold it: the other is the first.
             (vec![ours(), other(upstream())], true, false, elsewhere),
-            (vec![Read::Any, other(upstream())], true, true, elsewhere),
+            (vec![any(), other(upstream())], true, true, elsewhere),
             // A lock that cannot be read may hold it.
             (vec![other(None), ours()], true, true, elsewhere),
             (vec![other(Some("{".into())), ours()], true, true, elsewhere),
@@ -747,18 +853,26 @@ mod tests {
             // A package in no lock that the hub reads and the run re-pins
             // is written as without Bazel.
             (vec![ours()], true, false, None),
-            (vec![Read::Any], true, false, None),
-            (vec![Read::Any], true, true, config),
+            (vec![any()], true, false, None),
+            (vec![any()], true, true, config),
+            // Beside a tag that names the project's lock, a tag whose lock
+            // cannot be read reads another one, which may hold the package
+            // first.
+            (vec![any(), ours()], true, true, elsewhere),
+            (vec![ours(), any()], true, true, config),
+            (vec![ours(), any()], true, false, elsewhere),
+            (vec![ours(), any()], false, true, elsewhere),
         ] {
             assert_eq!(against(locks, ordered, pinned), said);
         }
         let hub = Hub {
             why: None,
+            every: false,
             locks: vec![other(None), ours()],
             ordered: true,
         };
         let (_, said) = hub
-            .against(&|_| true, "a", "1.0.0", "NEW")
+            .against(&hub.docs(), &|_| true, "a", "1.0.0", "NEW")
             .expect("withheld");
         assert_eq!(
             said,
@@ -775,7 +889,80 @@ mod tests {
             locks: vec![ours()],
             ..hub
         };
-        assert_eq!(read.against(&|_| true, "a", "1.0.0", "NEW"), None);
+        assert_eq!(read.against(&[None], &|_| true, "a", "1.0.0", "NEW"), None);
+        // The tag whose lock is not named, before the project's own.
+        let unnamed = Hub {
+            locks: vec![any(), ours()],
+            ..read
+        };
+        let (code, said) = unnamed
+            .against(&unnamed.docs(), &|_| true, "a", "1.0.0", "NEW")
+            .expect("withheld");
+        assert_eq!(code, LOCK_NOT_REPINNED);
+        assert_eq!(
+            said,
+            "M:4: this `nuget.from_lock` names its lock in no plain string, so that lock may \
+             hold the package and may be one this run does not re-pin; rules_csharp holds a \
+             package to the `contentHash` of the first lock that names it, so the Bazel build \
+             can fail on the patched package. So hosted mode wrote nothing for it. Write its \
+             `packages_lock_json` as a label in a plain string and run this command again"
+        );
+    }
+
+    #[test]
+    fn a_config_without_a_source_does_not_take_the_place_of_feeds() {
+        let feeds = "feeds = [\"https://feed.example/v3/index.json\"]";
+        let both = WIRED.replace("nuget_config", &format!("{feeds},\n    nuget_config"));
+        let earlier = format!(
+            "nuget.from_lock({feeds}, packages_lock_json = \"//api:packages.lock.json\")\n{WIRED}"
+        );
+        let judged = |rest: &str, sources: bool| {
+            let view = |path: &str| match path {
+                "MODULE.bazel" => Entry::Text(module(rest)),
+                _ => Entry::Absent,
+            };
+            let lock = ["packages.lock.json".to_string()];
+            judge(
+                &Workspace::read(&view),
+                "",
+                "nuget.config",
+                &lock,
+                false,
+                sources,
+            )
+        };
+        let why = |rest: &str, sources: bool| judged(rest, sources).and_then(|hub| hub.why);
+        // The config has a source: it stands in the place of the feeds
+        // already, and hosted mode adds its own.
+        assert_eq!(judged(&both, true), None);
+        assert_eq!(why(&earlier, true), None);
+        // No tag has feeds: the hub has nuget.org alone, with or without it.
+        assert_eq!(judged(WIRED, false), None);
+        // It has none: the first source in it would drop the feeds.
+        for rest in [&both, &earlier] {
+            assert_eq!(
+                why(rest, false).expect("withheld"),
+                "MODULE.bazel:4: this `nuget.from_lock` has `feeds`, and nuget.config names no \
+                 package source: with the Socket source that hosted mode names there, \
+                 rules_csharp takes the package sources of nuget.config in place of those \
+                 `feeds`, and the Bazel build cannot download a package that only they hold. So \
+                 hosted mode wrote nothing for it. Name those `feeds` in nuget.config and run \
+                 this command again, and the Bazel build takes the patched package"
+            );
+        }
+        // The config is the hub's: no package of the run may put a source
+        // in it, also one that no lock the hub reads holds.
+        let hub = judged(&both, false).expect("withheld");
+        let said = hub.against(&hub.docs(), &|_| false, "a", "1.0.0", "NEW");
+        assert_eq!(said.map(|(code, _)| code), Some(CONFIG_UNDECLARED));
+        let hub = Hub {
+            every: false,
+            ..hub
+        };
+        assert_eq!(
+            hub.against(&hub.docs(), &|_| false, "a", "1.0.0", "NEW"),
+            None
+        );
     }
 
     #[test]
@@ -786,8 +973,11 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir(root.join(".git")).unwrap();
         let lock = ["packages.lock.json".to_string()];
+        // The config as the rewriter names it: the first of NuGet's
+        // spellings that the directory answers to.
         let read = |project: &Path| {
-            let hub = withheld(project, "nuget.config", &lock)?;
+            let named = NAMES.iter().find(|name| project.join(name).exists());
+            let hub = withheld(project, named.unwrap_or(&NAMES[0]), &lock)?;
             Some(serde_json::from_str::<Hub>(&hub).expect("a hub"))
         };
         // No Bazel workspace.
@@ -827,6 +1017,31 @@ mod tests {
         std::fs::write(root.join("MODULE.bazel"), module(&wired)).unwrap();
         let two = std::fs::read_dir(&project).unwrap().count() == 2;
         assert_eq!(read(&project).is_some(), two);
+        // A spelling that is not NuGet's is the rewriter's file only on a
+        // disk that folds case; elsewhere the rewriter writes a file of
+        // its own, and a tag that names the other one does not read it.
+        for name in ["nuget.config", "NuGet.Config"] {
+            std::fs::remove_file(project.join(name)).ok();
+        }
+        std::fs::write(project.join("Nuget.Config"), "").unwrap();
+        let folds = project.join("nuget.config").exists();
+        let odd = wired.replace("NuGet.Config", "Nuget.Config");
+        std::fs::write(root.join("MODULE.bazel"), module(&odd)).unwrap();
+        assert_eq!(read(&project).is_some(), !folds);
+        // The config has no source: a tag with `feeds` keeps them until
+        // it has.
+        let fed = odd.replace("(", "(feeds = [\"https://feed.example/v3/index.json\"], ");
+        std::fs::write(root.join("MODULE.bazel"), module(&fed)).unwrap();
+        let said = read(&project).and_then(|hub| hub.why).expect("withheld");
+        let stands = match folds {
+            true => "has `feeds`, and svc/app/Nuget.Config names no package source",
+            false => "as its `nuget_config`, not svc/app/nuget.config",
+        };
+        assert!(said.contains(stands), "{said}");
+        let source = "<configuration><packageSources><add key=\"a\" value=\"https://a.example\" />\
+                      </packageSources></configuration>";
+        std::fs::write(project.join("Nuget.Config"), source).unwrap();
+        assert_eq!(read(&project).is_some(), !folds);
         // The project at the root, whose lock the tag does not read. And
         // a project without a lock, which no tag can read: not the one
         // whose name cannot be read either.

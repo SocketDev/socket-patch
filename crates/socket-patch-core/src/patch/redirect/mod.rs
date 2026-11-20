@@ -7597,6 +7597,8 @@ fn rewrite_nuget(
     let hub: Option<crate::bazel::nuget::Hub> = files
         .get(crate::bazel::nuget::WITHHELD_KEY)
         .and_then(|hub| serde_json::from_str(hub).ok());
+    // The locks of its other tags, parsed once for every dep.
+    let hub = hub.map(|hub| (hub.docs(), hub));
 
     for dep in &nuget {
         // The uuid lands in the source key, the mapping and the set-aside
@@ -7757,8 +7759,8 @@ fn rewrite_nuget(
                 lock.is_none_or(|lock| lock == rel) && held.count() > 0
             })
         };
-        let against = |hub: &crate::bazel::nuget::Hub| {
-            hub.against(&pinned, &id_lower, &version_norm, &content_hash)
+        let against = |(docs, hub): &(Vec<Option<Value>>, crate::bazel::nuget::Hub)| {
+            hub.against(docs, &pinned, &id_lower, &version_norm, &content_hash)
         };
         if let Some((code, why)) = hub.as_ref().and_then(against) {
             result.warnings.push(RewriteWarning {
@@ -32337,6 +32339,7 @@ packages:
             let (why, ordered) = (why.map(String::from), true);
             let hub = Hub {
                 why,
+                every: false,
                 locks,
                 ordered,
             };
