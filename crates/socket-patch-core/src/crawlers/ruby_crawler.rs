@@ -1115,7 +1115,8 @@ impl RubyCrawler {
     }
 
     /// Verify that a directory looks like an installed gem.
-    /// Checks for a `.gemspec` file or a `lib/` directory.
+    /// Checks for a `lib/` directory, a `.gemspec` file, or the gemspec
+    /// RubyGems installed for the dir in its gem home.
     async fn verify_gem_at_path(&self, path: &Path) -> bool {
         if !is_dir(path).await {
             return false;
@@ -1123,6 +1124,11 @@ impl RubyCrawler {
 
         // Check for lib/ directory
         if is_dir(&path.join("lib")).await {
+            return true;
+        }
+
+        let copy = path.to_path_buf();
+        if run_blocking(move || home_lists_copy(&copy) == Some(true)).await {
             return true;
         }
 
@@ -1308,13 +1314,21 @@ fn locate_gem_dirs_sync(
 }
 
 /// Blocking twin of `RubyCrawler::verify_gem_at_path`: a directory holding
-/// `lib/` or a `.gemspec`.
+/// `lib/` or a `.gemspec`, or one its gem home has a gemspec for.
+///
+/// A gem need not ship either: `cassandra-web` packs `app.rb`, `app/` and
+/// `bin/` at its root, and RubyGems writes its spec only to
+/// `<home>/specifications/<leaf>.gemspec`. That spec is what RubyGems and
+/// Bundler load the gem by, so it proves the dir installed.
 fn verify_gem_at_path_sync(path: &Path) -> bool {
     use crate::utils::fs::is_dir_sync;
     if !is_dir_sync(path) {
         return false;
     }
     if is_dir_sync(&path.join("lib")) {
+        return true;
+    }
+    if home_lists_copy(path) == Some(true) {
         return true;
     }
     super::listing::list_dir_sync(path).iter().any(|entry| {
@@ -6808,6 +6822,46 @@ mod tests {
 
         let crawler = RubyCrawler::new();
         assert!(!crawler.verify_gem_at_path(&gem_dir).await);
+    }
+
+    /// A gem that ships neither `lib/` nor a `.gemspec` (`cassandra-web`:
+    /// `app.rb`, `app/`, `bin/` at its root) is installed when its gem home
+    /// has `specifications/<leaf>.gemspec`, for the PURL lookup and the
+    /// scan alike; without that spec the dir is still no gem.
+    #[tokio::test]
+    async fn verify_gem_lib_less_dir_listed_by_its_home_spec() {
+        let home = tempfile::tempdir().unwrap();
+        let gems = home.path().join("gems");
+        let gem_dir = gems.join("cassandra-web-0.5.0");
+        tokio::fs::create_dir_all(gem_dir.join("app")).await.unwrap();
+        tokio::fs::write(gem_dir.join("app.rb"), b"# app").await.unwrap();
+        let specs = home.path().join("specifications");
+        tokio::fs::create_dir_all(&specs).await.unwrap();
+
+        let crawler = RubyCrawler::new();
+        let purls = vec!["pkg:gem/cassandra-web@0.5.0".to_string()];
+        let options = CrawlerOptions {
+            cwd: home.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(gems.clone()),
+        };
+        assert!(!crawler.verify_gem_at_path(&gem_dir).await);
+        assert!(crawler.find_by_purls(&gems, &purls).await.unwrap().is_empty());
+        assert!(crawler.crawl_all(&options).await.is_empty());
+
+        tokio::fs::write(specs.join("cassandra-web-0.5.0.gemspec"), b"# spec")
+            .await
+            .unwrap();
+        assert!(crawler.verify_gem_at_path(&gem_dir).await);
+        let found = crawler.find_by_purls(&gems, &purls).await.unwrap();
+        assert_eq!(found["pkg:gem/cassandra-web@0.5.0"].path, gem_dir);
+        let scanned: Vec<_> = crawler
+            .crawl_all(&options)
+            .await
+            .into_iter()
+            .map(|p| p.purl)
+            .collect();
+        assert_eq!(scanned, ["pkg:gem/cassandra-web@0.5.0"]);
     }
 
     /// `locate_gem_dirs_sync`' platform-dir scan must skip a `<name>-<version>-*` dir
