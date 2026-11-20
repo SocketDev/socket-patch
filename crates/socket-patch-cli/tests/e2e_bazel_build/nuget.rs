@@ -128,9 +128,17 @@
 //! tag: the last tag with sources decides which config the hub reads, and
 //! the first lock that names a package gives its `contentHash`.
 //!
+//! A third flow, [`vendored_from_lock`], runs vendored mode in the
+//! fixture's workspace. `scan --mode vendored --yes` downloads the patched
+//! package from the patch service once, keeps it under `.socket/vendor`,
+//! names that folder as a package source in `nuget.config` and re-pins the
+//! lock. NuGet takes a folder as a source. The hub reads the same line as
+//! the URL of a feed, so the next `bazel build` fails. `vendor --revert`
+//! puts every file back, and the build with them.
+//!
 //! # Known gaps
 //!
-//! Three outcomes the flow asserts are gaps of the product, not its
+//! Four outcomes the flows assert are gaps of the product, not its
 //! contract. Each is asserted as the release has it, and marked
 //! `KNOWN GAP` there with what a fix would change in this test:
 //!
@@ -142,6 +150,8 @@
 //!   while Bazel builds the patched package (c).
 //! - Bazel prints the access token of the grant, in a warning for each
 //!   package of the lock that the Socket source does not hold (c).
+//! - Vendored mode exits 0 and reports the package vendored, and the next
+//!   `bazel build` fails ([`vendored_from_lock`]).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -205,6 +215,9 @@ const PATCH_HOST: &str = "patch.socket.dev";
 const FLAT_CONTAINER: &str = "api.nuget.org/v3-flatcontainer";
 /// The one command of hosted mode.
 const SCAN: [&str; 4] = ["scan", "--mode", "hosted", "--yes"];
+/// The one command of vendored mode, before the option that names the
+/// patch service ([`vendored_scan`]).
+const VENDORED: [&str; 4] = ["scan", "--mode", "vendored", "--yes"];
 
 /// The sha256 of `bytes` in lowercase hex, as `MODULE.bazel.lock` and
 /// Bazel's downloader spell one.
@@ -966,6 +979,162 @@ fn hosted_no_config() {
          nuget_config and warned ({WITHHELD}), and the build still printed {unpatched:?}; with \
          the attribute on the tag the same scan wrote {CONFIG} and {LOCK}, and the build printed \
          {patched:?} from the Socket source ({fetches} requests for the package); {:?}",
+        started.elapsed()
+    );
+}
+
+/// `scan --mode vendored --yes <more>` in `cell`, on the machine whose .NET
+/// home is `home`. The grant names the patched package by its URL on the
+/// patch host, and vendored mode downloads it itself: `--patch-server-url`
+/// sends that one download to `standin`, which serves the package there
+/// under the path of that URL (`service` of [`service_route`]).
+fn vendored_scan(cell: &Cell, standin: &StandIn, home: &Path, more: &[&str]) -> Ran {
+    let origin = standin.origin();
+    let args = [&VENDORED[..], &["--patch-server-url", &origin], more].concat();
+    socket_patch(cell, standin, home, &args)
+}
+
+/// Has `standin` serve the package of `patch` to vendored mode, and gives
+/// the route: the path of the URL the grant names, without the prefix of
+/// the patch host that a download of Bazel's carries on the stand-in.
+fn service_route(standin: &StandIn, patch: &Patched) -> String {
+    let route = patch.file(&patch.package);
+    let service = route
+        .strip_prefix(&format!("/{PATCH_HOST}"))
+        .expect("a route of the patch host");
+    standin.serve(5, service, &patch.package.nupkg);
+    service.to_string()
+}
+
+/// Where vendored mode keeps what it wrote for `patch`: the folder of the
+/// patch under the checkout's `.socket/vendor`.
+fn vendor_dir(patch: &Patched) -> String {
+    format!(".socket/vendor/nuget/{}", patch.uuid)
+}
+
+/// Vendored mode in the fixture's workspace, on the machine that restored
+/// the project. The command downloads the patched package from the patch
+/// service once and keeps it under `.socket/vendor`; it names that folder
+/// as a package source in `nuget.config`, with a source mapping, and
+/// re-pins the lock. It exits 0 and reports the package vendored, and
+/// `vex` attests it. The hub reads the folder as the URL of a feed, so the
+/// next `bazel build` fails. `vendor --revert` puts every file back, and
+/// the build with them.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn vendored_from_lock() {
+    let test = "nuget::vendored_from_lock";
+    let started = Instant::now();
+    let Some(mut cell) = Cell::open(test, &FIXTURE) else {
+        return;
+    };
+    let release = cell.release().to_string();
+
+    let run = format!("R{}", uuid::Uuid::new_v4().simple());
+    let upstream = Package::new(NAME, &run, &format!("PRISTINE {run}"));
+    let neighbour = Package::new(NEIGHBOUR, &run, "NEIGHBOUR");
+    let patch = Patched::new(&run);
+    let (purl, unpatched) = (upstream.purl(), upstream.marker());
+    let standin = registry(&[&neighbour, &upstream]);
+    grant(&standin, &upstream, &patch, &patch.package.nupkg);
+    let service = service_route(&standin, &patch);
+    cell.route_downloads(&downloads(&standin.origin()));
+    check_out(&cell, &run, &[&neighbour, &upstream]);
+    let home = tempfile::Builder::new()
+        .prefix("sp-bazel-nuget-")
+        .tempdir()
+        .expect("create the .NET home");
+    for package in [&neighbour, &upstream] {
+        package.restore_into(home.path());
+    }
+
+    // (a) The unpatched build.
+    let before = cell.builds_unpatched(&unpatched);
+
+    // (b) The one command of vendored mode: the package from the patch
+    // service, once, into the folder of the patch; that folder as a source
+    // of `nuget.config`; and the lock re-pinned.
+    let scan = vendored_scan(&cell, &standin, home.path(), &[]);
+    let said = &scan.dump;
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
+    let event = |action: &str, code: &str| (purl.clone(), action.to_string(), code.to_string());
+    let events = [
+        event("downloaded", ""),
+        event("applied", ""),
+        event("skipped", "vendor_prebuilt_downloaded"),
+        // NuGet's folder holds the unpatched copy, which no build here reads.
+        event("skipped", "vendor_nuget_stale_global_package"),
+    ];
+    assert_eq!(event_triples(&scan.envelope), events, "{test}: {said}");
+    assert_eq!(standin.asked(&service), 1, "{test}: {said}");
+    let vendored = cell.tree();
+    let dir = vendor_dir(&patch);
+    let copy = format!("{dir}/{}.{VERSION}.nupkg", upstream.lower());
+    let mut written = vec![
+        format!("{dir}/.gitignore"),
+        format!("{dir}/socket-patch.vendor.json"),
+        copy.clone(),
+        ".socket/vendor/state.json".to_string(),
+        CONFIG.to_string(),
+        LOCK.to_string(),
+    ];
+    written.sort();
+    assert_eq!(changed(&before, &vendored), written, "{test}: {said}");
+    assert_eq!(vendored[&copy], patch.package.nupkg, "{test}: {copy}");
+    let source = format!(
+        "    <add key=\"socket-patch-{}\" value=\"{dir}\" />\n",
+        patch.uuid
+    );
+    let config = text(&vendored, CONFIG);
+    assert!(config.contains(&source), "{test}: {CONFIG}:\n{config}");
+    assert_eq!(
+        text(&vendored, LOCK),
+        lock_pinning(&run, &[&neighbour, &patch.package]),
+        "{test}: {LOCK}"
+    );
+    // `vex` attests the package: it reads the committed copy.
+    let document = cell.document("vendored");
+    let output = document.to_string_lossy();
+    let vex = socket_patch(&cell, &standin, home.path(), &["vex", "--output", &output]);
+    assert_eq!(vex.code, 0, "{test}: {}", vex.dump);
+    let attested = [event("verified", "")];
+    assert_eq!(event_triples(&vex.envelope), attested, "{}", vex.dump);
+    assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{test}");
+
+    // (c) KNOWN GAP: the next build fails. The hub takes the sources of
+    // `nuget.config` as the URLs of its feeds, and the folder is none:
+    // Bazel 9 crashes in the module extension, Bazel 8 and 7 refuse the
+    // URL. A fix would have the build print the patched marker here.
+    let build = cell.bazel("build", &[CONSUMER]);
+    let failure = match cell.numbers() >= (9, 0, 0) {
+        true => "NullPointerException thrown during Starlark evaluation".to_string(),
+        false => format!("Bad URL: {dir}"),
+    };
+    // Compared without white space: nothing says where Bazel breaks a long
+    // line.
+    let squeezed = |text: &str| text.split_whitespace().collect::<String>();
+    assert!(
+        !build.ok() && squeezed(&build.stderr()).contains(&squeezed(&failure)),
+        "{test}: the build after the vendored scan did not fail with {failure:?}:\n{}",
+        build.dump()
+    );
+    // Bazel asked no host for the patched package, and changed no file.
+    assert_eq!(standin.asked(&service), 1, "{test}");
+    assert_eq!(standin.asked(&patch.file(&patch.package)), 0, "{test}");
+    assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{test}");
+
+    // (d) The undo: every file is the one of before, and so is the build.
+    let undo = socket_patch(&cell, &standin, home.path(), &["vendor", "--revert"]);
+    cell.undone(&undo, "removed", &before, &unpatched);
+
+    println!(
+        "{test}: on Bazel {release}, `scan --mode vendored` exited 0, kept the patched package \
+         at {copy} and named {dir} in {CONFIG}; `vex` attested the package; the next build \
+         failed ({failure}); `vendor --revert` restored all {} files and the build printed \
+         {unpatched:?}; {:?}",
+        before.len(),
         started.elapsed()
     );
 }

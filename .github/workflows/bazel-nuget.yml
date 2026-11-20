@@ -3,7 +3,8 @@ name: Bazel patch compatibility (NuGet)
 # The NuGet flows of the real-Bazel tests (`nuget::` in `e2e_bazel_build`):
 # hosted mode for a package that rules_csharp's `nuget.from_lock` reads from
 # `packages.lock.json` and `nuget.config`, and for a tag that names no
-# `nuget_config`, on each Bazel release below.
+# `nuget_config`, and vendored mode for the same package, on each Bazel
+# release below.
 # bazel-compatibility.yml holds the legs and what every ecosystem shares;
 # this file says when the NuGet legs run and on which releases.
 #
@@ -40,8 +41,8 @@ on:
     # reads the tag in `MODULE.bazel`: the reader of the workspace files,
     # which every ecosystem's flow shares (bazel/mod.rs, starlark.rs and
     # workspace.rs), and what hosted mode makes of the tag (bazel/nuget.rs).
-    # vendor/nuget_feed.rs is the vendored backend; it is here for the
-    # version and folder helpers that every one of those files calls.
+    # vendor/nuget_feed.rs is the vendored backend, which the vendored flow
+    # runs; every one of those files calls its version and folder helpers.
     # Nothing else that another ecosystem's flow owns is here, so any other
     # change to one ecosystem starts that ecosystem's legs only.
     #
