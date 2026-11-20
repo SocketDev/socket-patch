@@ -1786,34 +1786,43 @@ workspace and that Bazel does not build keeps the matrix at the top.
 | Go: gazelle `go_deps.from_file` over `go.mod` | Supported | Supported | Not supported | Supported with a hosted or vendored patch |
 | RubyGems: rules_ruby `ruby.bundle_fetch` over `Gemfile.lock` | Supported with no `gem_checksums` on the call | Not supported | Not supported | Supported |
 | Cargo: rules_rust `crate.from_cargo` over `Cargo.lock` | Supported with `cargo_config` on the hub | Supported | Not supported | Supported with a hosted or vendored patch |
-| NuGet: rules_csharp `nuget.from_lock` over `packages.lock.json` | Supported with `nuget_config` on the tag | Not supported | Not supported | Supported with a hosted patch |
+| NuGet: rules_csharp `nuget.from_lock` over `packages.lock.json` | Supported with `nuget_config` on the tag | Not supported | Not supported | Supported with no restored copy on the machine |
 | Composer: a rule of your own that runs `composer install` from `composer.lock` | Supported | Not supported | Not supported | Supported with a hosted patch |
 | Maven: rules_jvm_external `maven.install` with a `lock_file` | Supported with Bazel 7.4.0 or later | Not supported | Not supported | Supported with a hosted patch |
 
-What a cell says:
+These words are the table's own, not the [v5 support tiers](#v5-support-tiers). In
+particular "Not supported" does not mean that the command refuses: in several cells it runs,
+exits 0 and leaves a build that fails (the known problems below). What a cell says:
 
 - **Supported**, for hosted and vendored mode: after the one command of the mode
   (`scan --mode hosted` or `scan --mode vendored`; for Maven
   `get <purl> --mode hosted` at the Bazel root), the next `bazel build` takes the patched
-  package with nothing else to do, and the undo (`rollback`, `vendor --revert`) brings the
-  upstream build back. A test builds exactly that on a real Bazel, for the shape the list
-  below names.
-- **Not supported**: do not use the mode for a package that Bazel builds. The patch does not
-  reach the build, or the build breaks (see the known problems below).
+  package with no other step, and the undo (`rollback`, `vendor --revert`) brings the
+  upstream build back. The one exception is a build that may not update Bazel's own lock
+  (see below). A test builds exactly that on a real Bazel, for the shape the list below
+  names.
+- **Not supported**: socket-patch promises nothing about what a Bazel build holds after the
+  mode ran, so do not use it for a package that Bazel builds. In most of these cells the
+  patch does not reach the build, or the build breaks (see the known problems below).
 - **Supported**, for VEX: `socket-patch vex` and `--vex` say `not_affected` of a package the
   Bazel build takes patched, and `affected` of one whose patch Bazel does not build.
   [Bazel workspaces: VEX](#bazel-workspaces-vex) has the cases and the limits; a vendored gem
   is one of the limits.
-- **Supported with a hosted (or vendored) patch**, for VEX: the document is right for a patch
-  that was applied in that mode. It is not checked against what Bazel builds, so of a package
-  whose patch is in no build of Bazel's (one that is only in an installed copy, say) it still
-  says `not_affected`. Do not publish that document.
+- **Supported with a condition**, for VEX: under the condition the cell names, the document
+  says `not_affected` of a package the Bazel build takes patched, and a test holds it to
+  that (for Maven a test without Bazel). It does not say `affected` of a package whose patch
+  is in no build of Bazel's, one that is only in an installed copy, say: of that package it
+  still says `not_affected`. Do not publish that document. For Maven,
+  [Bazel workspaces: Maven](#bazel-workspaces-maven) says what `vex` checks of the hub before
+  it attests an entry.
 
 **Agent mode is not supported for Bazel builds, in any ecosystem.** Agent mode is made for
 the copies a package manager installed: `socket-patch apply` patches them after each install.
-A Bazel build does not use those copies and runs no such step. Use hosted or vendored mode
-for a package that Bazel builds. Agent mode stays what it is for whatever uses the installed
-copies outside Bazel.
+A Bazel build takes its packages from what its rulesets read and runs no such step. Whether
+an agent-mode patch reaches a Bazel build differs from one ruleset to the next, and no
+release promises it for any of them. Use hosted mode for a package that Bazel builds, or
+vendored mode where the table lists it. Agent mode stays what it is for whatever uses the
+installed copies outside Bazel.
 
 What the table was tested with:
 
@@ -1831,7 +1840,9 @@ What the table was tested with:
   [`.bazelignore`](#bazel-workspaces-bazelignore). Hosted mode for Go has the limit of the
   matrix at the top: free-tier patches.
 - **RubyGems**: rules_ruby 1.0.0-rc2, `ruby.bundle_fetch` with `gemfile` and `gemfile_lock`
-  and no `gem_checksums`, and a `Gemfile.lock` that has a `CHECKSUMS` section.
+  and no `gem_checksums`, and a `Gemfile.lock` that has a `CHECKSUMS` section. That section
+  is what holds the patched gem to its sha256, in Bundler's step of the build: with a lock
+  that has none the build takes whatever the patch registry serves.
 - **Cargo**: rules_rust 0.75.0 (Bazel 9 and 8) and 0.56.0 (Bazel 7), `crate.from_cargo` with
   `cargo_lockfile = "//:Cargo.lock"`, `manifests = ["//:Cargo.toml"]` and
   `cargo_config = "//:.cargo/config.toml"`, and no cargo-bazel lock (`lockfile`).
@@ -1858,8 +1869,7 @@ lock (`--lockfile_mode=error`) fails until one that may, or
 `bazel mod deps --lockfile_mode=update`, has rewritten it. Commit the rewritten lock with the
 patch.
 
-Known problems. In each of these a command exits 0 today and the next Bazel build fails,
-unless it says otherwise:
+Known problems. In each of these a command exits 0 today and the next Bazel build fails:
 
 - **Vendored mode for PyPI, RubyGems, NuGet and Composer.** The path of the committed copy
   means nothing where Bazel runs: rules_python takes it for a package name, rules_ruby's
@@ -1874,7 +1884,7 @@ unless it says otherwise:
   `cargo_config = "//:.cargo/config.toml"` to the `crate.from_cargo` call and commit that
   file, or use vendored mode, or run `socket-patch rollback`.
 - **Cargo on a hub with a cargo-bazel lock** (`lockfile`), in hosted and vendored mode: the
-  build stops at `The current lockfile is out of date` until the repin that message names
+  build stops at ``The current `lockfile` is out of date`` until the repin that message names
   (`CARGO_BAZEL_REPIN=true bazel build ...`). After it the build is the patched one; in
   hosted mode the hub needs `cargo_config` as well.
 - **Hosted NuGet on a tag without `nuget_config`**: Bazel asks nuget.org alone and the
@@ -1886,9 +1896,10 @@ unless it says otherwise:
   sha256 (`Bundler found mismatched checksums`, or `Checksum was ... but wanted ...` on a
   machine with an empty repository cache). Where the lock has no `CHECKSUMS` section the
   build can also pass on the upstream gem from Bazel's repository cache. Run
-  `socket-patch rollback`. To keep the patch, delete the gem's line from `gem_checksums`
-  (Bundler still holds the gem to the `CHECKSUMS` section of the lock), or set it by hand to
-  the sha256 of the patched gem, which a later `rollback` does not put back.
+  `socket-patch rollback`. To keep the patch, set the gem's entry by hand to the sha256 of
+  the patched gem, which a later `rollback` does not put back. Where the lock has a
+  `CHECKSUMS` section, deleting the entry works too: Bundler then holds the gem to that
+  section.
 - **npm on a hub with `update_pnpm_lock = True`.** Hosted mode with a pnpm of 11 or later,
   when `pnpm-workspace.yaml` is not in the hub's `data`: the pnpm that Bazel runs rejects the
   lock (`ERR_PNPM_TARBALL_URL_MISMATCH`). List `//:package.json` and
@@ -1898,13 +1909,35 @@ unless it says otherwise:
 - **Vendored Go with gazelle 0.36.0 or older**: `go_deps` rejects the directory `replace`
   (`local file path not supported in replace directive`). Use hosted mode, or a gazelle of
   the list above.
-- **Vendored Cargo under rules_rust 0.75.0**, where the build passes: a build writes a
-  `BUILD.bazel` into the committed copy, and right after it `vendor --check` exits 1
-  (`vendor_inventory_mismatch`) and `vex` writes no document. A second
+
+In these a command exits 0 and the Bazel build passes on the unpatched package:
+
+- **Hosted NuGet on a machine without a restore.** `scan` reads no package out of
+  `packages.lock.json`, so where only Bazel ever ran it finds none and writes nothing. Run it
+  where `dotnet restore` has run.
+- **Go, when another Bazel module of the build requires a higher version** of the patched
+  module: gazelle builds that version and drops the replacement. With
+  `go_deps.config(check_direct_dependencies = "error")` and the module required directly in
+  `go.mod`, as in the list above, gazelle fails the build instead.
+- **Hosted PyPI, when `pip.parse` takes the requirements of the build's platform from
+  another file** than the one socket-patch rewrote (`requirements_by_platform`,
+  `requirements_linux` and its siblings).
+
+[Bazel workspaces: VEX](#bazel-workspaces-vex) lists what the document says in such cases.
+
+And three that concern neither:
+
+- **Vendored Cargo under rules_rust 0.75.0**: a build writes a `BUILD.bazel` into the
+  committed copy, and right after it `vendor --check` exits 1 (`vendor_inventory_mismatch`)
+  and `vex` writes no document, although the build is the patched one. A second
   `scan --mode vendored` puts the copy right.
 - **`vex` for a hosted NuGet patch**, on a machine whose NuGet folder still holds the
-  unpatched package: it writes no document and exits 1 (`not_applied`), although the Bazel
-  build is the patched one. Where that folder holds nothing it attests the package.
+  unpatched package, as the one that ran the scan does: it writes no document and exits 1
+  (`not_applied`), although the Bazel build is the patched one. Where that folder holds
+  nothing, as on a runner that only ran Bazel, it attests the package.
+- **Hosted NuGet prints the access token of the patch in the build's output.** rules_csharp
+  asks the Socket source for every package of the lock, and Bazel prints a warning with that
+  source's URL, the token in it, for each package the source does not hold.
 
 ## Bazel workspaces: Maven
 
@@ -3223,8 +3256,17 @@ after the undo `vex` writes no document. For PyPI on Bazel 8.5 and later a hoste
 `--lockfile_mode=error` fails until a build that may update the lock has run, and the updated
 lock has to be committed.
 
-In every other Bazel shape nothing checks the document against the build, and in these the
-document is still wrong (`not_affected` while Bazel builds the unpatched package, or while
+Three more flows hold the document of `vex` to their patched build on the same releases,
+after a hosted scan: Cargo through rules_rust's `crate.from_cargo` with `cargo_config` (and
+after a vendored scan), Composer through a rule or a genrule of the project's own that runs
+`composer install` from the lock, and NuGet through rules_csharp's `nuget.from_lock` with
+`nuget_config`, on a machine whose NuGet folder does not hold the package. For these, and
+for a Maven entry in `MODULE.bazel`,
+[Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported) says what the
+document does not show.
+
+For no other Bazel shape do these pages say that the document and the build agree, and in
+these the document is still wrong (`not_affected` while Bazel builds the unpatched package, or while
 the build is broken):
 
 - **Agent mode beside rules_js, rules_python or rules_ruby**, wherever the statement does
