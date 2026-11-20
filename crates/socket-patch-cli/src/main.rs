@@ -131,11 +131,17 @@ async fn run(own_args: Vec<OsString>, hot_patch_command: Option<hot_patch::Start
         leave(&hot_patch_command, 2);
     }
     // A patch mirror base that cannot prefix a committed URL is a usage
-    // error too, for every command: each of them reads the project's
-    // hosted pins against it.
-    if let Err(message) = cli.command.global_args().validate_patch_mirror() {
-        eprintln!("Error: {message}");
-        leave(&hot_patch_command, 2);
+    // error too, for the commands that read the project's hosted pins
+    // against it. The commands that patch installed files in place do not,
+    // and they run unattended (from an install hook, at a container's
+    // start), where a mistyped experimental variable must not fail what
+    // they run inside. A base that does not parse is no mirror there
+    // (`GlobalArgs::patch_mirror`).
+    if !matches!(cli.command, Commands::Apply(_) | Commands::HotPatch(_)) {
+        if let Err(message) = cli.command.global_args().validate_patch_mirror() {
+            eprintln!("Error: {message}");
+            leave(&hot_patch_command, 2);
+        }
     }
 
     // Human-output policy (core advisories and prompt notes go quiet under

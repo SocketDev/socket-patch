@@ -800,7 +800,14 @@ fn yarn_berry_installs_the_patch_through_an_anonymous_repository() {
     )
     .unwrap();
     let env_vars = [("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")];
-    let install = tool(&fx.proj, "corepack", &["yarn", "install"], &env_vars);
+    // This install writes the lock. Under `CI` yarn installs immutably by
+    // default and would refuse to create it.
+    let install = tool(
+        &fx.proj,
+        "corepack",
+        &["yarn", "install"],
+        &[env_vars[0], ("YARN_ENABLE_IMMUTABLE_INSTALLS", "false")],
+    );
     if !install.status.success() {
         soft_skip!(LEG, "upstream `yarn install` failed:\n{}", dump(&install));
     }
@@ -1041,6 +1048,8 @@ fn bundler_fetches_the_patched_gems_through_artifactory() {
             ("BUNDLE_APP_CONFIG", app_config.as_str()),
             ("BUNDLE_USER_HOME", user_home),
             ("GEM_HOME", user_home),
+            // Lockfile checksums are opt-in before Bundler 4.
+            ("BUNDLE_LOCKFILE_CHECKSUMS", "true"),
         ];
         env.extend_from_slice(extra);
         tool(&fx.proj, "bundle", args, &env)

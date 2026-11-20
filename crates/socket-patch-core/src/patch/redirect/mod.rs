@@ -5984,7 +5984,10 @@ const BERRY_MANIFEST: &str = "package.json";
 /// this run's own artifact URL, or a URL on the same patch server (scheme,
 /// host and port of `artifact_url`) whose leaf names the package version.
 /// A user's own tarball for the package — a mirror, a fork — is on another
-/// origin and is never ours to rewrite.
+/// origin and is never ours to rewrite. When `artifact_url` is served under
+/// a patch mirror's base, whose host serves the project's own packages
+/// too, the URL must also sit under that base
+/// ([`crate::origin::same_hosted_base`]).
 fn berry_hosted_pin_is_ours(
     url: &str,
     name: &str,
@@ -6007,7 +6010,7 @@ fn berry_hosted_pin_is_ours(
         }
         _ => false,
     };
-    names_it && same_origin
+    names_it && same_origin && crate::origin::same_hosted_base(url, artifact_url)
 }
 
 /// Whether `value` (a `resolutions` value) is a hosted tarball pin written
@@ -6690,6 +6693,9 @@ fn rewrite_bun_lock(
 /// override — nothing about the patch server's URL layout is assumed — and
 /// anything that fails to parse fails the match (closed): user URL deps live
 /// on other origins, and another version's artifact has a different leaf.
+/// Under a patch mirror, whose host serves the project's own packages too,
+/// the two must also share the mirror's base
+/// ([`crate::origin::same_hosted_base`]).
 pub(crate) fn is_prior_hosted_bun_spec(spec: &str, fname: &str, current_url: &str) -> bool {
     let Some(old_url) = spec
         .strip_prefix(fname)
@@ -6713,7 +6719,9 @@ pub(crate) fn is_prior_hosted_bun_spec(spec: &str, fname: &str, current_url: &st
         Some((&url[..path_start], leaf))
     }
     match (origin_and_leaf(old_url), origin_and_leaf(current_url)) {
-        (Some(old), Some(new)) => old == new,
+        (Some(old), Some(new)) => {
+            old == new && crate::origin::same_hosted_base(old_url, current_url)
+        }
         _ => false,
     }
 }

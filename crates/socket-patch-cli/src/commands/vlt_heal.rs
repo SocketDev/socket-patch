@@ -38,14 +38,17 @@ pub(crate) const BUNDLED_INSTANCE_SKIPPED: &str = "redirect_vlt_bundled_instance
 /// setup serving the hosted tarballs from the API origin is healed too.
 /// Discovery-facing code must use the `hosted_unwind` helper, not this one.
 fn vlt_heal_origins(common: &crate::args::GlobalArgs) -> Vec<String> {
-    common
-        .patch_server_url
-        .iter()
-        .chain(common.patch_mirror_url.iter())
-        .chain(common.api_url.iter())
-        .filter(|url| !url.trim().is_empty())
-        .cloned()
-        .collect()
+    // The patch server and the mirror as discovery lists them (the mirror
+    // as a mirror's base), then `--api-url`.
+    let mut origins = crate::commands::hosted_unwind::patch_server_origins(common);
+    origins.extend(
+        common
+            .api_url
+            .iter()
+            .filter(|url| !url.trim().is_empty())
+            .cloned(),
+    );
+    origins
 }
 
 /// How a heal ended, for the advisory wording.

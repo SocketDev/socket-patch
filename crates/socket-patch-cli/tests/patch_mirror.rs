@@ -427,6 +427,14 @@ async fn a_run_pins_the_mirror_and_a_run_without_it_leaves_the_pin_alone() {
         !list(&[]).contains(FIRST.uuid),
         "a host the run was not given is no patch host"
     );
+    // The mirror is its base, not its host: another repository of the same
+    // host is not where the patch server is mirrored.
+    let sibling = format!("{}/artifactory/team-local", mirror.uri());
+    assert_ne!(sibling, base);
+    assert!(
+        !list(&["--patch-mirror-url", &sibling]).contains(FIRST.uuid),
+        "a pin under another base of the mirror's host is no hosted pin"
+    );
 
     // A run without the mirror: nothing moves onto the patch server.
     let bare = hosted_scan(tmp.path(), &api, &[], &[]);
@@ -755,6 +763,20 @@ fn a_base_that_cannot_be_committed_is_refused_without_echoing_it() {
             assert!(out.stderr.contains(why), "{base}: {}", out.stderr);
             assert!(!out.stderr.contains("secret"), "{}", out.stderr);
         }
+        // `apply` does not use the mirror and runs unattended from install
+        // hooks: a base it cannot use must not fail the install.
+        let mut cmd = cli();
+        cmd.args(["apply", "--cwd", tmp.path().to_str().unwrap()])
+            .env("SOCKET_PATCH_MIRROR_URL", base);
+        let out = run(cmd);
+        assert_eq!(
+            out.code,
+            Some(0),
+            "apply {base}: {}\n{}",
+            out.stdout,
+            out.stderr
+        );
+        assert!(!out.stderr.contains("secret"), "{}", out.stderr);
     }
     assert_eq!(lock(tmp.path()), pristine);
 }

@@ -517,8 +517,9 @@ pub fn mirror_candidates(
             continue;
         }
         let mut skip = |code: &str, why: String, purl: &str, uuid: &str| {
-            let detail =
-                format!("{purl}: {why}; nothing was written for it, so it stays unpatched");
+            // Not "it stays unpatched": an earlier run may have pinned it
+            // on the patch server, which this run does not read here.
+            let detail = format!("{purl}: {why}; nothing was changed for it");
             warnings.push(warning(code, detail.clone()));
             skipped.push(SkippedPatch {
                 detail: Some(detail),
@@ -4960,6 +4961,42 @@ mod tests {
         assert_eq!(
             pinned_on(&lock_at("https://patch.socket.dev"), &[]).as_deref(),
             Some("patch.socket.dev")
+        );
+        // An older composer.lock escapes every slash. Pinned on Socket's
+        // own server it is the run's own pin, not one on a host called
+        // `https`; pinned on a mirror the run was not given, it is withheld
+        // and the mirror's host is named.
+        let escaped = |base: &str| {
+            let url = format!("{base}{path}").replace('/', "\\/");
+            BTreeMap::from([(
+                "composer.lock".to_string(),
+                format!(r#"{{"dist": {{"url": "{url}"}}}}"#),
+            )])
+        };
+        assert!(escaped(mirror)["composer.lock"].contains(r"https:\/\/repo.example\/"));
+        assert_eq!(run(&escaped("https://patch.socket.dev"), &[]).0, 1);
+        assert_eq!(run(&escaped(mirror), &[mirror.to_string()]).0, 1);
+        let (kept, _, warnings) = run(&escaped(mirror), &[]);
+        assert_eq!(kept, 0);
+        assert!(
+            warnings[0].detail.contains("repo.example"),
+            "{}",
+            warnings[0].detail
+        );
+        assert_eq!(
+            pinned_on(&escaped(mirror), &[mirror.to_string()]).as_deref(),
+            Some("repo.example")
+        );
+        // Another repository of the mirror's host is not the mirror, once
+        // the mirror is listed as one (`mirror_entry`, as the CLI lists it).
+        let sibling = "https://repo.example/artifactory/team-local";
+        let listed = [crate::origin::mirror_entry(mirror)];
+        assert_eq!(run(&lock_at(mirror), &listed).0, 1);
+        assert_eq!(run(&lock_at(sibling), &listed).0, 0);
+        assert_eq!(pinned_on(&lock_at(sibling), &listed), None);
+        assert_eq!(
+            pinned_on(&lock_at(mirror), &listed).as_deref(),
+            Some("repo.example")
         );
         // Another patch's uuid on that host says nothing about this one.
         let other = lock_at(mirror).into_iter().map(|(k, v)| {

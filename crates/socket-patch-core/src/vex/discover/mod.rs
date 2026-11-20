@@ -3161,10 +3161,14 @@ pub fn foreign_hosted_host_in_text(text: &str, uuid: &str, origins: &[String]) -
         return None;
     }
     for token in url_tokens_around(text, uuid) {
+        // An older composer.lock escapes every slash (`https:\/\/…`): the
+        // url is the unescaped text. Read escaped, it has no `://`, and the
+        // scheme-less branch below would take `https` for its host.
+        let token = token.replace("\\/", "/");
         // A lock may spell the url inside a specifier (`name@https://…`, as
         // bun and yarn berry key a tarball dependency): the url starts at
         // its scheme.
-        let token = from_scheme(token);
+        let token = from_scheme(&token);
         let schemed;
         let url = if token.contains("://") || token.contains("%3A%2F%2F") {
             token
@@ -3193,11 +3197,12 @@ pub fn hosted_host_in_text(text: &str, uuid: &str, origins: &[String]) -> Option
     }
     url_tokens_around(text, uuid)
         .into_iter()
-        .map(from_scheme)
+        .map(|token| token.replace("\\/", "/"))
+        .map(|token| from_scheme(&token).to_string())
         .filter(|token| token.contains("://") || token.contains("%3A%2F%2F"))
         .find(|url| crate::origin::hosted_patch_uuid(url, origins).as_deref() == Some(uuid))
         .map(|url| {
-            crate::origin::hosted_shape_host(url).unwrap_or_else(|| "the patch server".to_string())
+            crate::origin::hosted_shape_host(&url).unwrap_or_else(|| "the patch server".to_string())
         })
 }
 

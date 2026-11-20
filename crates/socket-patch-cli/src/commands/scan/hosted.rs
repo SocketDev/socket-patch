@@ -111,7 +111,14 @@ fn mirror_pins_not_moved(
     confirmed: &[(String, String)],
     files: &std::collections::BTreeMap<String, String>,
 ) -> Vec<socket_patch_core::patch::redirect::RewriteWarning> {
-    let served: Vec<String> = mirror_sources.served_urls().map(str::to_string).collect();
+    // By origin: an earlier pin of the patch may carry another grant token
+    // in its path.
+    let served: Vec<String> = mirror_sources
+        .served_urls()
+        .filter_map(socket_patch_core::origin::bare_origin)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let mirrored: std::collections::BTreeSet<&str> = mirror_sources.mirrored_urls().collect();
     candidates
         .iter()
@@ -143,7 +150,7 @@ fn mirror_pins_not_moved(
 
 /// Ask the patch mirror about every mirrored pin this run would newly
 /// write, before anything is written
-/// ([`socket_patch_core::api::client::ApiClient::probe_mirror`]): every
+/// ([`socket_patch_core::api::client::MirrorProber::probe`]): every
 /// later install fetches from the mirror, so a mistyped base, a repository
 /// that does not proxy the patch server, or a patch the mirror cannot fetch
 /// must not reach a lockfile. A pin the project's files already hold is not
@@ -151,12 +158,17 @@ fn mirror_pins_not_moved(
 ///
 /// * The mirror serves the artifact: the pin goes ahead.
 /// * It asks for credentials, or redirects: nothing more is asked (every
-///   answer would be the same), the pins are written, and one
-///   [`MIRROR_UNVERIFIED`] warning says they were not checked. Package
+///   answer would be the same), the pins it has not already refused are
+///   written, and one [`MIRROR_UNVERIFIED`] warning says they were not
+///   checked. Package
 ///   managers hold the mirror's credentials, not this CLI, so most private
 ///   mirrors answer this way unless the operator sets
 ///   [`PATCH_MIRROR_AUTHORIZATION_ENV`].
-/// * Anything else: that candidate is withheld with [`MIRROR_UNAVAILABLE`]
+/// * It cannot be reached, or does not answer in time: nothing more is
+///   asked (each further request would wait as long for the same), and
+///   that candidate and every one not yet asked about are withheld with
+///   [`MIRROR_UNAVAILABLE`].
+/// * Any other answer: that candidate is withheld with [`MIRROR_UNAVAILABLE`]
 ///   and nothing is written for it. A lockfile pinned to a mirror that
 ///   does not serve the patch breaks every install, where an unpatched one
 ///   only stays as it was. When the mirror served none of the artifacts it
@@ -180,10 +192,13 @@ async fn check_mirror(
     // The pins to ask about, one per artifact URL: mirrored, and not
     // already in the project's files in either spelling a lock uses.
     let already_pinned = |url: &str| {
+        // As a lock spells it: plain, wholly percent-encoded (yarn berry),
+        // or with every slash escaped (an older composer.lock).
         let encoded = socket_patch_core::utils::uri::encode_uri_component(url);
-        files
-            .values()
-            .any(|text| text.contains(url) || text.contains(encoded.as_str()))
+        let escaped = url.replace('/', "\\/");
+        files.values().any(|text| {
+            text.contains(url) || text.contains(encoded.as_str()) || text.contains(escaped.as_str())
+        })
     };
     let mut asked = std::collections::BTreeSet::new();
     let new_pins: Vec<String> = candidates
@@ -206,14 +221,37 @@ async fn check_mirror(
     let authorization = std::env::var(PATCH_MIRROR_AUTHORIZATION_ENV).ok();
     let mut refused: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     let mut unverified = None;
+    // Every pin from `from` on is withheld for `reason`: the mirror gave no
+    // answer, and each further request would wait as long for the same.
+    let withhold_from =
+        |from: usize, reason: &str, refused: &mut std::collections::BTreeMap<String, String>| {
+            let reason = socket_patch_core::utils::redact::redact_urls_in(reason).into_owned();
+            for url in &new_pins[from..] {
+                refused.insert(url.clone(), reason.clone());
+            }
+        };
+    let prober = match api_client.mirror_prober(authorization.as_deref()) {
+        Ok(prober) => Some(prober),
+        Err(reason) => {
+            withhold_from(0, &reason, &mut refused);
+            None
+        }
+    };
     for (at, url) in new_pins.iter().enumerate() {
+        let Some(prober) = prober.as_ref() else {
+            break;
+        };
         status.set(format!(
             "Checking the patch mirror ({}/{})...",
             at + 1,
             new_pins.len()
         ));
-        match api_client.probe_mirror(url, authorization.as_deref()).await {
+        match prober.probe(url).await {
             MirrorProbe::Serves => {}
+            MirrorProbe::Unreachable(reason) => {
+                withhold_from(at, &reason, &mut refused);
+                break;
+            }
             MirrorProbe::NeedsCredentials(status) => {
                 unverified = Some(format!(
                     "answered HTTP {status}, so socket-patch could not check that it serves the \
@@ -239,9 +277,10 @@ async fn check_mirror(
         warnings.push(engine::warning(
             MIRROR_UNVERIFIED,
             format!(
-                "the patch mirror {base} {why}. The references were written anyway. Run an \
-                 install to confirm, or set {PATCH_MIRROR_AUTHORIZATION_ENV} to an \
-                 `Authorization` header value the mirror accepts so the next run can check"
+                "the patch mirror {base} {why}. The references it had not already refused were \
+                 written without that check. Run an install to confirm, or set \
+                 {PATCH_MIRROR_AUTHORIZATION_ENV} to an `Authorization` header value the mirror \
+                 accepts so the next run can check"
             ),
         ));
     }
@@ -1681,7 +1720,13 @@ async fn run_redirect_selected_untracked(
             &accepted,
         );
         accepted.extend(own);
-        accepted.extend(mirror_sources.served_urls().map(str::to_string));
+        // By origin: a direct pin an earlier run wrote may carry another
+        // grant token in its path.
+        accepted.extend(
+            mirror_sources
+                .served_urls()
+                .filter_map(socket_patch_core::origin::bare_origin),
+        );
         engine::withhold_foreign_host_pins(
             &read.files,
             &accepted,

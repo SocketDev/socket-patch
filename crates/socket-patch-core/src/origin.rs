@@ -234,18 +234,108 @@ pub fn hosted_patch_url_uuids(url: &str, extra_origins: &[String]) -> Option<Vec
     )
 }
 
+/// How an allowlist entry that names a patch MIRROR's base is spelled:
+/// `mirror+https://repo.example/artifactory/socket-patch`, in the idiom of
+/// Cargo's `sparse+https://…` ([`mirror_entry`]).
+const MIRROR_ENTRY_PREFIX: &str = "mirror+";
+
+/// The allowlist entry for a patch mirror's `base` (`--patch-mirror-url`).
+/// Unlike a `--patch-server-url` entry, which holds its whole origin, it
+/// holds only the urls at or below the base's path: a mirror is one
+/// repository of an artifact host that serves many others, some of them
+/// writable by the people who write lockfiles, so the rest of that host is
+/// not the mirror.
+pub fn mirror_entry(base: &str) -> String {
+    format!("{MIRROR_ENTRY_PREFIX}{}", base.trim())
+}
+
+/// The url of an allowlist `entry`, and whether the entry is a mirror's
+/// base ([`mirror_entry`]).
+fn entry_url(entry: &str) -> (&str, bool) {
+    let entry = entry.trim();
+    match entry.strip_prefix(MIRROR_ENTRY_PREFIX) {
+        Some(base) => (base, true),
+        None => (entry, false),
+    }
+}
+
 /// Whether `url` is on one of `origins` (the operator's `--patch-server-url`
-/// deployments), compared on scheme + host + port: the one rule by which a
-/// configured origin is recognized, a plain-`http` one included.
+/// deployments and patch mirror), compared on scheme + host + port: the one
+/// rule by which a configured origin is recognized, a plain-`http` one
+/// included. A mirror's entry ([`mirror_entry`]) also needs the url's path
+/// to be at or below the mirror's base.
 pub(crate) fn on_configured_origin(url: &reqwest::Url, origins: &[String]) -> bool {
     origins.iter().any(|origin| {
-        reqwest::Url::parse(origin.trim()).is_ok_and(|o| {
+        let (origin, mirror) = entry_url(origin);
+        reqwest::Url::parse(origin).is_ok_and(|o| {
             o.scheme() == url.scheme()
                 && o.host_str().is_some()
                 && o.host_str() == url.host_str()
                 && o.port_or_known_default() == url.port_or_known_default()
+                && (!mirror || under_base_path(url.path(), o.path()))
         })
     })
+}
+
+/// Whether `path` is `base` or below it, a whole segment at a time. A base
+/// of `/` (a mirror given with no path) holds every path.
+fn under_base_path(path: &str, base: &str) -> bool {
+    let base = base.trim_end_matches('/');
+    base.is_empty()
+        || path
+            .strip_prefix(base)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// `url` reduced to its origin, `scheme://host[:port]`: an allowlist entry
+/// that holds every path of that host. `None` for what is not a url with a
+/// host.
+pub fn bare_origin(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url.trim()).ok()?;
+    let host = parsed.host_str()?;
+    Some(match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    })
+}
+
+/// The start of a hosted artifact `url` up to and including the `/` before
+/// the level the patch server serves patches under (`patch/<eco>/…`,
+/// `patch-registry/<eco>/…`, `gopatch/…`), when that level is NOT the first
+/// of the path: the base of a deployment that sits under a path prefix,
+/// which is what a patch mirror is. `None` for a url served from the root
+/// of its host, and for one in no such shape.
+fn hosted_base_prefix(url: &str) -> Option<&str> {
+    let url = url.split(['#', '?']).next()?;
+    let path_start = url.find("://")? + 3;
+    let path_start = path_start + url[path_start..].find('/')?;
+    let mut at = path_start + 1;
+    let mut segments = Vec::new();
+    for segment in url[at..].split('/') {
+        segments.push((at, segment));
+        at += segment.len() + 1;
+    }
+    let level = (0..segments.len()).find(|&i| {
+        let root = segments[i].1;
+        root == GO_SERVE_ROOT
+            || (SERVE_ROOTS.contains(&root)
+                && segments
+                    .get(i + 1)
+                    .is_some_and(|(_, eco)| ECOSYSTEM_DIRS.contains(eco)))
+    })?;
+    (level > 0).then(|| &url[..segments[level].0])
+}
+
+/// Whether `existing` may be an earlier pin of the artifact `current` is
+/// served as, as far as their BASE goes: when `current` is served under a
+/// path prefix (a patch mirror's repository), `existing` must sit under
+/// that same prefix. The rewriters that take over an earlier hosted pin in
+/// place recognize it by origin and file name, which is enough on a host
+/// that serves nothing but patches. A mirror shares its host with the
+/// project's own packages, so there the origin alone would claim a fork of
+/// the same name and version as an earlier Socket pin.
+pub(crate) fn same_hosted_base(existing: &str, current: &str) -> bool {
+    hosted_base_prefix(current).is_none_or(|base| existing.starts_with(base))
 }
 
 /// The host of `url` when it is a PLAIN `http(s)` url — printable ASCII
@@ -327,7 +417,7 @@ impl<'a> OriginPolicy<'a> {
         self.hosts.get_or_init(|| {
             let mut hosts = BTreeSet::from([SOCKET_PATCH_SERVER_HOST.to_string()]);
             hosts.extend(self.origins.iter().filter_map(|o| {
-                reqwest::Url::parse(o.trim())
+                reqwest::Url::parse(entry_url(o).0)
                     .ok()?
                     .host_str()
                     .map(str::to_ascii_lowercase)
@@ -1179,5 +1269,113 @@ mod tests {
         ] {
             assert_eq!(plain_url_domain(not_plain), None, "{not_plain}");
         }
+    }
+
+    /// A mirror's entry holds what is under the mirror's base and nothing
+    /// else on its host: a patch mirror is one repository of an artifact
+    /// host that serves many. A `--patch-server-url` entry holds its whole
+    /// origin, whatever path it was given with.
+    #[test]
+    fn a_mirror_entry_holds_only_what_is_under_its_base() {
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let tail = format!("patch/npm/left-pad/1.3.0/tok/{uuid}/left-pad-1.3.0.tgz");
+        let mirror = vec![mirror_entry(
+            "https://repo.example/artifactory/socket-patch",
+        )];
+        assert_eq!(
+            mirror,
+            ["mirror+https://repo.example/artifactory/socket-patch"]
+        );
+        let under = |base: &str| format!("https://repo.example/{base}/{tail}");
+        assert_eq!(
+            hosted_patch_uuid(&under("artifactory/socket-patch"), &mirror).as_deref(),
+            Some(uuid)
+        );
+        for elsewhere in [
+            "artifactory/team-local",
+            "artifactory/socket-patch-evil",
+            "artifactory",
+            "other/artifactory/socket-patch",
+        ] {
+            assert_eq!(
+                hosted_patch_uuid(&under(elsewhere), &mirror),
+                None,
+                "{elsewhere} is not the mirror"
+            );
+        }
+        // A trailing slash on the base changes nothing; a mirror given with
+        // no path holds its whole host; and so does a patch-server entry,
+        // with or without a path.
+        for whole in [
+            vec![mirror_entry(
+                "https://repo.example/artifactory/socket-patch/",
+            )],
+            vec![mirror_entry("https://repo.example")],
+            vec![mirror_entry("https://repo.example/")],
+            vec!["https://repo.example".to_string()],
+            vec!["https://repo.example/some/base".to_string()],
+        ] {
+            assert_eq!(
+                hosted_patch_uuid(&under("artifactory/socket-patch"), &whole).as_deref(),
+                Some(uuid),
+                "{whole:?}"
+            );
+        }
+        assert_eq!(
+            hosted_patch_uuid(
+                &under("artifactory/team-local"),
+                &["https://repo.example/artifactory/socket-patch".to_string()]
+            )
+            .as_deref(),
+            Some(uuid),
+            "an unmarked entry is an origin"
+        );
+        // The mirror's host is one the identity sweep looks for.
+        assert!(OriginPolicy::new(&mirror).hosts().contains("repo.example"));
+        assert_eq!(
+            bare_origin("http://127.0.0.1:8081/artifactory/x?y#z").as_deref(),
+            Some("http://127.0.0.1:8081")
+        );
+        assert_eq!(
+            bare_origin("https://Repo.Example/a").as_deref(),
+            Some("https://repo.example")
+        );
+        assert_eq!(bare_origin("repo.example/a"), None);
+    }
+
+    /// An earlier pin shares the base its replacement is served under: on a
+    /// mirror, a url elsewhere on the mirror's host is the project's own.
+    #[test]
+    fn an_earlier_pin_shares_the_base_of_a_mirrored_artifact() {
+        let mirrored = "https://repo.example/artifactory/socket-patch/patch/pypi/urllib3/1.26.18/tok/u/urllib3-1.26.18-py2.py3-none-any.whl";
+        assert_eq!(
+            hosted_base_prefix(mirrored),
+            Some("https://repo.example/artifactory/socket-patch/")
+        );
+        assert!(same_hosted_base(
+            "https://repo.example/artifactory/socket-patch/patch/pypi/urllib3/1.26.18/old/u2/urllib3-1.26.18-py2.py3-none-any.whl#sha256=0",
+            mirrored
+        ));
+        for own in [
+            "https://repo.example/artifactory/pypi-local/urllib3-1.26.18-py2.py3-none-any.whl",
+            "https://repo.example/artifactory/socket-patch-2/patch/pypi/urllib3/1.26.18/t/u/urllib3-1.26.18-py2.py3-none-any.whl",
+            "https://repo.example/urllib3-1.26.18-py2.py3-none-any.whl",
+        ] {
+            assert!(!same_hosted_base(own, mirrored), "{own}");
+        }
+        // Served from the root of its host, or in no served shape: the
+        // origin and the file name decide, as before.
+        for current in [
+            "https://patch.socket.dev/patch/pypi/urllib3/1.26.18/tok/u/urllib3-1.26.18-py2.py3-none-any.whl",
+            "http://127.0.0.1:4000/files/urllib3-1.26.18-py2.py3-none-any.whl",
+            "https://patch.socket.dev/gopatch/u",
+        ] {
+            assert_eq!(hosted_base_prefix(current), None, "{current}");
+            assert!(same_hosted_base("https://anything.example/x", current));
+        }
+        assert_eq!(
+            hosted_base_prefix("https://repo.example/m/gopatch/u"),
+            Some("https://repo.example/m/")
+        );
     }
 }
