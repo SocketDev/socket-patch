@@ -1656,10 +1656,17 @@ async fn apply_package_patch_at(
             // patched, which is what its files are.
             if let Some(refused) = refused {
                 if !every_file_already_patched(pkg_path, files).await {
-                    result.error = Some(format!(
-                        "{refused}; `socket-patch remove {}` drops its record",
-                        crate::utils::purl::strip_purl_qualifiers(package_key)
-                    ));
+                    // A compiled build is one a command skips, with this
+                    // text as its warning. Any other refusal fails the
+                    // copy on every run, so it says how to drop the record.
+                    result.error = Some(if build.unsupported(pkg_path).is_some() {
+                        refused
+                    } else {
+                        format!(
+                            "{refused}; `socket-patch remove {}` drops its record",
+                            crate::utils::purl::strip_purl_qualifiers(package_key)
+                        )
+                    });
                     return result;
                 }
             }

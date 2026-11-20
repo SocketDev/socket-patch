@@ -2065,12 +2065,19 @@ pub(crate) fn record_apply_outcome(
     }
     // The nested apply covers the whole manifest, so its other skips
     // (`already_patched`, `vendored`, ...) belong to packages this run did
-    // not select; only a user-patch conflict found after selection is news.
+    // not select. Two are news all the same: a user-patch conflict found
+    // after selection, and a copy left unpatched because it is not
+    // supported yet (a compiled conda build), which would otherwise go
+    // unsaid, the nested apply being silent under `--json`.
     for skip in &report.skipped {
         let Some(key) = skip.purl.as_deref() else {
             continue;
         };
-        if skip.error_code.as_deref() != Some(super::user_patches::CONFLICT)
+        let news = matches!(
+            skip.error_code.as_deref(),
+            Some(super::user_patches::CONFLICT) | Some(CONDA_BUILD_NOT_PYPI_RELEASE)
+        );
+        if !news
             || recorded.iter().any(|(purl, _)| apply_key_covers(key, purl))
             || report
                 .failures

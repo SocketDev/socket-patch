@@ -567,11 +567,42 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     }
     let mut in_sync: Vec<String> = Vec::new();
     let mut not_installed: Vec<String> = Vec::new();
+    // Records with a copy `apply` does not support patching yet (a
+    // compiled conda build that does not hold the patch): their `skipped`
+    // events, one per record and copy, and how many of the records have
+    // no other copy.
+    let mut not_supported: Vec<PatchEvent> = Vec::new();
+    let mut skipped_copies: HashSet<String> = HashSet::new();
+    let mut skipped_events: HashSet<(String, String)> = HashSet::new();
+    let mut only_skipped_copies = 0usize;
     if !tree.patches.is_empty() {
-        let outcome = verify_installed_tree(&args.common, &tree).await;
+        let (outcome, compiled_conda) = verify_installed_tree(&args.common, &tree).await;
+        // A copy `apply` skips as not supported yet (a compiled conda
+        // build) is not drift: a warning, once per copy, as `apply` gives
+        // it, and a `skipped` event per record under `--json`.
+        let mut warned = HashSet::new();
+        for copy in &compiled_conda.skipped {
+            let warning = copy.warning();
+            if warned.insert(warning) && !args.common.json && !args.common.silent {
+                eprintln!("Warning: {}", copy.warning());
+            }
+            // One event per record and copy: the reason names the copy.
+            if skipped_events.insert((copy.purl.clone(), copy.detail.clone())) {
+                not_supported.push(copy.event());
+            }
+            skipped_copies.insert(copy.purl.clone());
+        }
         in_sync = outcome.applied;
         for failed in outcome.failed {
             match failed.reason.as_str() {
+                // A record whose every copy was skipped that way is not
+                // supported here, which is not the same as not installed.
+                "package_not_found" if skipped_copies.contains(&failed.purl) => {
+                    only_skipped_copies += 1;
+                }
+                // Its copy holds a sibling record's patch, and `apply`
+                // reports the copy under that record alone.
+                "package_not_found" if compiled_conda.passed_over.contains(&failed.purl) => {}
                 "package_not_found" => not_installed.push(failed.purl),
                 // A zero-file record (`no_files`) is drift, not in sync:
                 // nothing was hashed, and `apply` / `get` count such a
@@ -605,7 +636,10 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     if drifts.is_empty() {
         if args.common.json {
             let mut env = Envelope::new(Command::Apply);
-            record_check_skips(&mut env, &in_sync, &not_installed);
+            record_check_skips(&mut env, &in_sync, &not_installed, &skipped_copies);
+            for event in not_supported {
+                env.record(event);
+            }
             for event in unchecked_events {
                 env.record(event);
             }
@@ -614,7 +648,12 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         } else if !args.common.silent {
             println!(
                 "{}",
-                format_check_in_sync(checked, not_installed.len(), unchecked_events.len())
+                format_check_in_sync(
+                    checked,
+                    not_installed.len(),
+                    only_skipped_copies,
+                    unchecked_events.len()
+                )
             );
         }
         0
@@ -627,7 +666,10 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                         .with_reason(code.clone(), detail.clone()),
                 );
             }
-            record_check_skips(&mut env, &in_sync, &not_installed);
+            record_check_skips(&mut env, &in_sync, &not_installed, &skipped_copies);
+            for event in not_supported {
+                env.record(event);
+            }
             for event in unchecked_events {
                 env.record(event);
             }
@@ -672,10 +714,15 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
 ///   best-effort once the store copy is patched, and an unpatched store
 ///   copy is drift on its own. Copies under a containment-refused
 ///   `.bundle/config` `BUNDLE_PATH` root are kept: Bundler loads them.
+/// * PyPI: a compiled conda build is judged as `apply` treats it, per copy
+///   over every record of its release (see [`CompiledCondaCopies`]): a
+///   copy that holds no record's patch is dropped — `apply` skips it as
+///   not supported yet, so it is not drift — and one that holds some
+///   record's patch is in sync for those records and judged for no other.
 async fn verify_installed_tree(
     common: &GlobalArgs,
     tree: &PatchManifest,
-) -> socket_patch_core::vex::VerifyOutcome {
+) -> (socket_patch_core::vex::VerifyOutcome, CompiledCondaCopies) {
     use socket_patch_core::crawlers::gradle_cache::expands;
     use socket_patch_core::patch::apply::select_installed_variants;
     use socket_patch_core::vex::FailedPatch;
@@ -684,6 +731,7 @@ async fn verify_installed_tree(
         crate::ecosystem_dispatch::find_manifest_package_copies_reusing(&purls, common, true, None)
             .await;
     let mut copies = crate::commands::vex::vex_copy_sets(common, tree, &found).await;
+    let compiled_conda = settle_compiled_conda_copies(tree, &mut copies).await;
 
     // Gem copy classes, decided exactly as `apply` decides them.
     let (gem_stores, refused_root): (Vec<PathBuf>, Option<PathBuf>) = if !common.global
@@ -744,6 +792,14 @@ async fn verify_installed_tree(
         let mut kept: HashMap<&str, Vec<PathBuf>> = HashMap::new();
         let mut stray: Vec<PathBuf> = Vec::new();
         for path in group_copies {
+            // A compiled conda build is settled already: in sync for the
+            // records whose patch it holds, and judged for no other.
+            if let Some(held) = compiled_conda.held.get(&(base.clone(), path.clone())) {
+                for key in keys.iter().filter(|key| held.contains(*key)) {
+                    kept.entry(key.as_str()).or_default().push(path.clone());
+                }
+                continue;
+            }
             let matched = select_installed_variants(&path, &variants).await;
             if matched.is_empty() {
                 if !expands(&path) {
@@ -806,7 +862,116 @@ async fn verify_installed_tree(
             purl,
             reason: "not_applied".to_string(),
         }));
-    outcome
+    (outcome, compiled_conda)
+}
+
+/// How `apply --check` judges the compiled conda builds among a tree's
+/// copies, which `apply` does not support patching yet.
+#[derive(Default)]
+struct CompiledCondaCopies {
+    /// The copies that hold no record's patch: `apply` skips them. One
+    /// entry per record of the copy's release, in purl order.
+    skipped: Vec<UnsupportedCopy>,
+    /// The copies that already hold the patch of some record of their
+    /// release (an earlier release wrote it), by release (its base purl)
+    /// and copy, with those records' keys: `apply` reports them as
+    /// already patched. A copy's path is its site-packages directory,
+    /// which every other package of the environment shares, so the
+    /// release is part of the key.
+    held: HashMap<(String, PathBuf), Vec<String>>,
+    /// The other records of such a copy's release. `apply` passes over
+    /// them on that copy without a report, so they are not drift there
+    /// and not "not installed" either.
+    passed_over: HashSet<String>,
+}
+
+/// Takes the compiled conda builds out of `copies` (the copies of each
+/// PyPI record of `tree`), leaving one only under the records whose patch
+/// it already holds, and says what became of each (see
+/// [`CompiledCondaCopies`]). The decision is the copy's, over every record
+/// of its release, as `apply` makes it.
+async fn settle_compiled_conda_copies(
+    tree: &PatchManifest,
+    copies: &mut HashMap<String, Vec<PathBuf>>,
+) -> CompiledCondaCopies {
+    use socket_patch_core::patch::conda_copy::conda_build;
+    let mut settled = CompiledCondaCopies::default();
+    let mut releases: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for purl in copies.keys() {
+        if Ecosystem::from_purl(purl) == Some(Ecosystem::Pypi) && tree.patches.contains_key(purl) {
+            releases
+                .entry(strip_purl_qualifiers(purl).to_string())
+                .or_default()
+                .push(purl.clone());
+        }
+    }
+    for (base, mut keys) in releases {
+        keys.sort();
+        let mut spellings: Vec<PathBuf> = keys
+            .iter()
+            .flat_map(|key| copies.get(key).cloned().unwrap_or_default())
+            .collect();
+        spellings.sort();
+        spellings.dedup();
+        // One install can be found under two spellings of its directory
+        // (conda's `lib/python3.1 -> python3.13`): it is one copy, as it is
+        // to `apply`.
+        let mut real_of: HashMap<PathBuf, PathBuf> = HashMap::new();
+        for spelling in &spellings {
+            let real = tokio::fs::canonicalize(spelling)
+                .await
+                .unwrap_or_else(|_| spelling.clone());
+            real_of.insert(spelling.clone(), real);
+        }
+        let is_copy =
+            |spelling: &PathBuf, path: &PathBuf| real_of.get(spelling) == real_of.get(path);
+        for path in crate::ecosystem_dispatch::distinct_install_dirs(&spellings).await {
+            let reason = match conda_build(&base, &path).await {
+                Some(build) => build.unsupported(&path),
+                None => None,
+            };
+            let Some(reason) = reason else {
+                continue;
+            };
+            let mut held: Vec<String> = Vec::new();
+            for key in &keys {
+                let files = &tree.patches[key].files;
+                let mut holds_patch = !files.is_empty();
+                for (file_name, file_info) in files {
+                    if verify_file_patch(&path, file_name, file_info).await.status
+                        != VerifyStatus::AlreadyPatched
+                    {
+                        holds_patch = false;
+                        break;
+                    }
+                }
+                if holds_patch {
+                    held.push(key.clone());
+                }
+            }
+            for key in &keys {
+                let keeps = held.contains(key);
+                if let Some(paths) = copies.get_mut(key) {
+                    paths.retain(|spelling| !is_copy(spelling, &path));
+                    if keeps {
+                        paths.push(path.clone());
+                    }
+                }
+                if held.is_empty() {
+                    settled.skipped.push(UnsupportedCopy {
+                        purl: key.clone(),
+                        detail: reason.clone(),
+                    });
+                } else if !keeps {
+                    settled.passed_over.insert(key.clone());
+                }
+            }
+            if !held.is_empty() {
+                settled.held.insert((base.clone(), path), held);
+            }
+        }
+    }
+    settled
 }
 
 /// The `apply --check` drift text for a verifier routing tag.
@@ -831,11 +996,22 @@ fn describe_check_failure(reason: &str) -> &'static str {
 /// The `skipped` events of an `apply --check --json` envelope: in-sync
 /// patches as `already_patched` (apply's own tag for them) and patches with
 /// no installed copy as `package_not_installed`.
-fn record_check_skips(env: &mut Envelope, in_sync: &[String], not_installed: &[String]) {
+fn record_check_skips(
+    env: &mut Envelope,
+    in_sync: &[String],
+    not_installed: &[String],
+    skipped_copies: &HashSet<String>,
+) {
     for purl in in_sync {
+        // A copy `apply` skips as not supported yet has its own event.
+        let detail = if skipped_copies.contains(purl) {
+            "every installed copy that can be patched is patched"
+        } else {
+            "every installed copy is patched"
+        };
         env.record(
             PatchEvent::new(PatchAction::Skipped, purl.clone())
-                .with_reason("already_patched", "every installed copy is patched"),
+                .with_reason("already_patched", detail),
         );
     }
     for purl in not_installed {
@@ -879,16 +1055,27 @@ fn check_remedy(common: &GlobalArgs, user_patched: bool) -> String {
 /// uninstalled tree never reads as a vacuous "in sync". With `unchecked`
 /// records of an ecosystem this CLI does not support, the line claims "in
 /// sync" only for the patches it did check.
-fn format_check_in_sync(checked: usize, not_installed: usize, unchecked: usize) -> String {
-    let skipped = if not_installed == 0 {
-        String::new()
-    } else {
-        format!(
+fn format_check_in_sync(
+    checked: usize,
+    not_installed: usize,
+    not_supported: usize,
+    unchecked: usize,
+) -> String {
+    let mut skipped = String::new();
+    if not_installed > 0 {
+        skipped.push_str(&format!(
             "; {} not installed, skipped",
             plural(not_installed, "patch", "patches")
-        )
-    };
-    let nothing_checked = checked == 0 && not_installed == 0;
+        ));
+    }
+    // Installed, and `apply` skips it too (a compiled conda build).
+    if not_supported > 0 {
+        skipped.push_str(&format!(
+            "; {} not supported, skipped",
+            plural(not_supported, "patch", "patches")
+        ));
+    }
+    let nothing_checked = checked == 0 && not_installed == 0 && not_supported == 0;
     if unchecked == 0 {
         return if nothing_checked {
             "No patches to check.".to_string()
@@ -1517,6 +1704,7 @@ fn collect_apply_outcomes(
 ) -> (Vec<String>, Vec<PatchEvent>) {
     let mut applied = Vec::new();
     skipped.extend(caveats.not_in_build.iter().map(LeftCopy::event));
+    skipped.extend(caveats.unsupported.iter().map(UnsupportedCopy::event));
     for result in results {
         let event = caveats.event_of(result, dry_run);
         match event.action {
@@ -1868,6 +2056,15 @@ pub(crate) async fn run_locked(
                         eprintln!("Note: {}: {}", normalize_purl(&left.purl), left.detail);
                     }
                 }
+                // A copy skipped as not supported yet (a compiled conda
+                // build) stays unpatched: a warning, once per copy.
+                let mut warned = HashSet::new();
+                for copy in &caveats.unsupported {
+                    let warning = copy.warning();
+                    if warned.insert(warning.clone()) {
+                        eprintln!("Warning: {warning}");
+                    }
+                }
                 // A package's sidecar advisory (the PyPI `RECORD`, a gem
                 // `--redownload`, `go mod verify`, a signed NuGet package,
                 // a Gradle cache copy) is `sidecars[]` under `--json`; a
@@ -2046,6 +2243,15 @@ pub(crate) async fn run_locked(
                 // files.
                 for left in &caveats.not_in_build {
                     env.record(left.event());
+                }
+                // Copies skipped as not supported yet (a compiled conda
+                // build): one Skipped event per record and copy, with the
+                // reason, which names the copy.
+                let mut recorded = HashSet::new();
+                for copy in &caveats.unsupported {
+                    if recorded.insert((copy.purl.as_str(), copy.detail.as_str())) {
+                        env.record(copy.event());
+                    }
                 }
                 // Best-effort gem-env fallback-home copies left unpatched:
                 // one non-fatal Skipped event each, with the copy's path
@@ -2425,6 +2631,9 @@ struct ApplyTally {
     /// patch's ([`gem_ext::GemCaveat::Incomplete`]). The package is not
     /// patched, and is counted neither as applied nor as already patched.
     not_in_effect: usize,
+    /// Every copy was skipped because patching it is not supported yet (a
+    /// compiled conda build). The package is not patched.
+    unsupported: usize,
 }
 
 fn tally_results(results: &[ApplyResult], caveats: &GemCaveats) -> ApplyTally {
@@ -2456,6 +2665,16 @@ fn tally_results(results: &[ApplyResult], caveats: &GemCaveats) -> ApplyTally {
             !by_purl.contains_key(purl) && !vendored.contains(purl) && !not_in_effect.contains(purl)
         })
         .collect();
+    // A skipped copy counts for its package only when no copy of the
+    // package says more.
+    let unsupported: std::collections::BTreeSet<&str> = caveats
+        .unsupported
+        .iter()
+        .map(|copy| copy.purl.as_str())
+        .filter(|purl| {
+            !by_purl.contains_key(purl) && !vendored.contains(purl) && !not_in_effect.contains(purl)
+        })
+        .collect();
     let mut tally = ApplyTally {
         vendored: vendored
             .iter()
@@ -2463,6 +2682,7 @@ fn tally_results(results: &[ApplyResult], caveats: &GemCaveats) -> ApplyTally {
             .count(),
         not_applicable: not_applicable.len(),
         not_in_effect: not_in_effect.len(),
+        unsupported: unsupported.len(),
         ..ApplyTally::default()
     };
     for copies in by_purl.values() {
@@ -2509,6 +2729,9 @@ fn format_summary_line(tally: &ApplyTally, targeted: usize, not_found: usize) ->
     if tally.not_in_effect > 0 {
         parts.push(format!("{} not in effect", tally.not_in_effect));
     }
+    if tally.unsupported > 0 {
+        parts.push(format!("{} not supported", tally.unsupported));
+    }
     if tally.failed > 0 {
         parts.push(format!("{} failed", tally.failed));
     }
@@ -2526,6 +2749,7 @@ fn format_compact_summary(tally: &ApplyTally, targeted: usize, not_found: usize)
         (tally.vendored, "vendored"),
         (tally.not_applicable, "not applicable"),
         (tally.not_in_effect, "not in effect"),
+        (tally.unsupported, "not supported"),
         (tally.failed, "failed"),
         (not_found, "not found on disk"),
     ]
@@ -2570,6 +2794,12 @@ fn format_dry_run_summary(tally: &ApplyTally, not_found: usize) -> Vec<String> {
         lines.push(format!(
             "  {} would not take effect",
             plural(tally.not_in_effect, "package", "packages")
+        ));
+    }
+    if tally.unsupported > 0 {
+        lines.push(format!(
+            "  {} not supported",
+            plural(tally.unsupported, "package", "packages")
         ));
     }
     if tally.failed > 0 {
@@ -2755,6 +2985,10 @@ struct GemCaveats {
     not_in_build: Vec<LeftCopy>,
     /// Copies whose patch is incomplete. They fail the run.
     incomplete: Vec<IncompleteCopy>,
+    /// Copies skipped because patching them is not supported yet: a
+    /// compiled conda build of a Python package (the one entry here that
+    /// is not a gem's). They have no result and do not fail the run.
+    unsupported: Vec<UnsupportedCopy>,
 }
 
 impl GemCaveats {
@@ -3233,6 +3467,9 @@ async fn apply_patches_inner(
             // is not gone over again under another of its manifest keys,
             // which would run its build a second time), and not applied.
             let mut any_copy_incomplete = false;
+            // A copy was skipped as not supported yet (a compiled conda
+            // build). The package was dealt with, and not applied.
+            let mut any_copy_unsupported = false;
             for (pkg_path, is_store_copy) in store_copies
                 .into_iter()
                 .map(|p| (p, true))
@@ -3276,15 +3513,18 @@ async fn apply_patches_inner(
                 // its failure. The engine still sees each record, so one
                 // whose files already hold the patch reads as already
                 // patched, as it does on any other copy.
-                let conda_never_takes =
-                    Box::pin(conda_refused_variants(&base_purl, pkg_path, &variants)).await;
+                //
+                // A compiled conda build is not supported yet: nothing is
+                // written to it, and the copy is skipped below with a
+                // warning instead of failing the run.
+                let conda = Box::pin(conda_copy_view(&base_purl, pkg_path, &variants)).await;
                 let mut ordered_variants: Vec<&String> = variants.iter().collect();
-                if !conda_never_takes.is_empty() {
+                if !conda.never_takes.is_empty() {
                     // By purl within each half, so the run reads the same
                     // whatever order the manifest's map yields.
                     ordered_variants.sort_by(|a, b| {
-                        (conda_never_takes.contains(*a), a.as_str())
-                            .cmp(&(conda_never_takes.contains(*b), b.as_str()))
+                        (conda.never_takes.contains(*a), a.as_str())
+                            .cmp(&(conda.never_takes.contains(*b), b.as_str()))
                     });
                 }
 
@@ -3357,7 +3597,7 @@ async fn apply_patches_inner(
 
                     // A record this conda build never takes, tried after
                     // another record of the release on the same copy.
-                    let conda_sibling = attempted && conda_never_takes.contains(variant_purl);
+                    let conda_sibling = attempted && conda.never_takes.contains(variant_purl);
                     attempted = true;
                     // A gem patch to native-extension sources rebuilds the
                     // extension (#1996). One it cannot build is refused
@@ -3465,7 +3705,9 @@ async fn apply_patches_inner(
                     // not this copy's distribution, and the copy's outcome
                     // is the earlier record's. It did match the copy's
                     // file, so it is not reported as not installed either.
-                    if conda_sibling && is_conda_refusal(&result) {
+                    // On a compiled conda build every record ends here, and
+                    // the copy's outcome is its skip below.
+                    if (conda_sibling || conda.unsupported.is_some()) && is_conda_refusal(&result) {
                         matched_manifest_purls.insert(variant_purl.clone());
                         continue;
                     }
@@ -3535,6 +3777,23 @@ async fn apply_patches_inner(
                     if is_store_copy {
                         any_store_copy_applied = true;
                     }
+                } else if let Some(reason) = &conda.unsupported {
+                    // A compiled conda build that does not already hold the
+                    // patch: not supported yet, so the copy is skipped. The
+                    // skip accounts for every record of the release, whether
+                    // or not the copy's files match it, and does not fail
+                    // the run. (A record that failed on it for another
+                    // reason was flagged above.)
+                    for variant_purl in &variants {
+                        if manifest.patches.contains_key(variant_purl) {
+                            matched_manifest_purls.insert(variant_purl.clone());
+                            caveats.unsupported.push(UnsupportedCopy {
+                                purl: variant_purl.clone(),
+                                detail: reason.clone(),
+                            });
+                        }
+                    }
+                    any_copy_unsupported = true;
                 } else if best_effort {
                     // Nothing applied on a best-effort fallback-home copy.
                     // Attempted-but-failed variants already recorded their
@@ -3575,7 +3834,7 @@ async fn apply_patches_inner(
                 }
             }
 
-            if any_copy_applied || any_copy_incomplete {
+            if any_copy_applied || any_copy_incomplete || any_copy_unsupported {
                 applied_base_purls.insert(base_purl.clone());
             }
         } else {
@@ -4432,25 +4691,65 @@ fn format_patch_failure(purl: &str, why: &str) -> String {
     format!("Error: Failed to patch {purl}: {why}")
 }
 
-/// The records among `variants` that the copy of `base_purl` at `pkg_path`
-/// never takes because conda built it (see
-/// `socket_patch_core::patch::conda_copy`): a platform wheel's record
-/// always, and every record when the build holds compiled code. Empty for
-/// a copy that is not a conda build.
-async fn conda_refused_variants(
-    base_purl: &str,
-    pkg_path: &Path,
-    variants: &[String],
-) -> HashSet<String> {
+/// What the conda rule (`socket_patch_core::patch::conda_copy`) says
+/// about one installed copy. Both fields are empty for a copy that is not
+/// a conda build.
+#[derive(Default)]
+struct CondaCopyView {
+    /// The records the copy never takes: a platform wheel's always, and
+    /// every record when the build holds compiled code.
+    never_takes: HashSet<String>,
+    /// Why the copy is skipped whatever the record: it is a compiled
+    /// conda build, which is not supported yet.
+    unsupported: Option<String>,
+}
+
+/// [`CondaCopyView`] of the copy of `base_purl` at `pkg_path`, for the
+/// records `variants` of its release.
+async fn conda_copy_view(base_purl: &str, pkg_path: &Path, variants: &[String]) -> CondaCopyView {
     use socket_patch_core::patch::conda_copy::{conda_build, static_refusal_for};
     let Some(build) = conda_build(base_purl, pkg_path).await else {
-        return HashSet::new();
+        return CondaCopyView::default();
     };
-    variants
-        .iter()
-        .filter(|variant| static_refusal_for(&build, variant, pkg_path).is_some())
-        .cloned()
-        .collect()
+    CondaCopyView {
+        never_takes: variants
+            .iter()
+            .filter(|variant| static_refusal_for(&build, variant, pkg_path).is_some())
+            .cloned()
+            .collect(),
+        unsupported: build.unsupported(pkg_path),
+    }
+}
+
+/// One copy `apply` skipped because patching it is not supported yet: a
+/// compiled conda build of a Python package. It is a `Skipped` event of
+/// each record of its release, with the rule's code, and a warning. It is
+/// never a failure, and never an apply result.
+struct UnsupportedCopy {
+    /// The manifest key of the patch.
+    purl: String,
+    /// The reason, in words; it starts with the rule's code and names the
+    /// copy.
+    detail: String,
+}
+
+impl UnsupportedCopy {
+    fn event(&self) -> PatchEvent {
+        PatchEvent::new(PatchAction::Skipped, self.purl.clone()).with_reason(
+            socket_patch_core::patch::conda_copy::REFUSAL_CODE,
+            self.detail.as_str(),
+        )
+    }
+
+    /// The warning of the copy: `<base purl>: <reason>`, the same for
+    /// every record of the release.
+    fn warning(&self) -> String {
+        format!(
+            "{}: {}",
+            normalize_purl(strip_purl_qualifiers(&self.purl)),
+            self.detail
+        )
+    }
 }
 
 /// Whether the engine refused `result`'s record because conda built the
@@ -5078,6 +5377,7 @@ mod tests {
                 vendored: 1,
                 not_applicable: 0,
                 not_in_effect: 0,
+                unsupported: 0,
             }
         );
         assert_eq!(
@@ -5378,6 +5678,83 @@ mod tests {
         assert!(!format_results_block(&[other], &caveats, false, Path::new("/p")).is_empty());
     }
 
+    /// A copy skipped as not supported yet (a compiled conda build) counts
+    /// for its package once, under its own heading, and only when no other
+    /// copy of the package has a result. It is a `skipped` event with the
+    /// rule's code, and one warning per copy however many records the
+    /// release has.
+    #[test]
+    fn a_copy_skipped_as_not_supported_has_its_own_bucket_event_and_warning() {
+        let code = socket_patch_core::patch::conda_copy::REFUSAL_CODE;
+        let detail = format!("{code}: conda built the copy in /env with compiled code");
+        let pure = "pkg:pypi/pillow@12.3.0?artifact_id=py3-none-any-whl";
+        let platform = "pkg:pypi/pillow@12.3.0?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl";
+        let skipped = |purl: &str| UnsupportedCopy {
+            purl: purl.to_string(),
+            detail: detail.clone(),
+        };
+        let caveats = GemCaveats {
+            unsupported: vec![skipped(pure), skipped(platform)],
+            ..GemCaveats::default()
+        };
+
+        let t = tally_results(&[], &caveats);
+        assert_eq!(
+            t,
+            ApplyTally {
+                unsupported: 2,
+                ..ApplyTally::default()
+            }
+        );
+        assert_eq!(
+            format_summary_line(&t, 2, 0),
+            "Summary: 0 of 2 targeted patches applied, 0 already patched, 2 not supported, \
+             0 not found on disk"
+        );
+        assert_eq!(
+            format_compact_summary(&t, 2, 0),
+            "Applied 0 of 2 patches: 2 not supported."
+        );
+
+        // Another copy of the package (a venv's) that took the patch says
+        // more than the skip.
+        let applied = ApplyResult {
+            package_key: platform.to_string(),
+            package_path: "/venv/site-packages".to_string(),
+            success: true,
+            files_verified: Vec::new(),
+            files_patched: vec!["PIL/TarIO.py".to_string()],
+            applied_via: HashMap::new(),
+            error: None,
+            sidecar: None,
+        };
+        let t = tally_results(&[applied], &caveats);
+        assert_eq!((t.applied, t.unsupported), (1, 1));
+
+        let event = serde_json::to_value(caveats.unsupported[0].event()).unwrap();
+        assert_eq!(event["action"], "skipped");
+        assert_eq!(event["errorCode"], code);
+        assert_eq!(
+            caveats.unsupported[0].warning(),
+            caveats.unsupported[1].warning()
+        );
+        assert!(caveats.unsupported[0]
+            .warning()
+            .starts_with(&format!("pkg:pypi/pillow@12.3.0: {code}: ")));
+
+        // `apply --check` names it apart from a package that is not
+        // installed.
+        assert_eq!(
+            format_check_in_sync(1, 1, 2, 0),
+            "Patches are in sync (1 patch checked; 1 patch not installed, skipped; \
+             2 patches not supported, skipped)."
+        );
+        assert_eq!(
+            format_check_in_sync(0, 0, 1, 0),
+            "Patches are in sync (0 patches checked; 1 patch not supported, skipped)."
+        );
+    }
+
     #[test]
     fn dry_run_summary_lists_every_nonzero_bucket() {
         let t = ApplyTally {
@@ -5388,6 +5765,7 @@ mod tests {
             vendored: 0,
             not_applicable: 1,
             not_in_effect: 2,
+            unsupported: 1,
         };
         assert_eq!(
             format_dry_run_summary(&t, 3),
@@ -5397,6 +5775,7 @@ mod tests {
                 "  2 packages already patched",
                 "  1 package not applicable",
                 "  2 packages would not take effect",
+                "  1 package not supported",
                 "  1 package cannot be patched",
                 "  3 packages not found on disk",
             ]
@@ -5509,33 +5888,33 @@ mod tests {
 
     #[test]
     fn check_in_sync_line() {
-        assert_eq!(format_check_in_sync(0, 0, 0), "No patches to check.");
+        assert_eq!(format_check_in_sync(0, 0, 0, 0), "No patches to check.");
         assert_eq!(
-            format_check_in_sync(1, 0, 0),
+            format_check_in_sync(1, 0, 0, 0),
             "Patches are in sync (1 patch checked)."
         );
         assert_eq!(
-            format_check_in_sync(3, 0, 0),
+            format_check_in_sync(3, 0, 0, 0),
             "Patches are in sync (3 patches checked)."
         );
         // A check that skipped uninstalled packages says so, never a bare
         // vacuous "in sync".
         assert_eq!(
-            format_check_in_sync(0, 2, 0),
+            format_check_in_sync(0, 2, 0, 0),
             "Patches are in sync (0 patches checked; 2 patches not installed, skipped)."
         );
         // Records of an unsupported ecosystem were not checked: "in sync"
         // is claimed only for the ones that were.
         assert_eq!(
-            format_check_in_sync(0, 0, 3),
+            format_check_in_sync(0, 0, 0, 3),
             "No patches checked: 3 patches not checked (unsupported ecosystem)."
         );
         assert_eq!(
-            format_check_in_sync(1, 0, 1),
+            format_check_in_sync(1, 0, 0, 1),
             "1 checked patch is in sync; 1 patch not checked (unsupported ecosystem)."
         );
         assert_eq!(
-            format_check_in_sync(2, 1, 2),
+            format_check_in_sync(2, 1, 0, 2),
             "2 checked patches are in sync; 1 patch not installed, skipped; 2 patches not \
              checked (unsupported ecosystem)."
         );
