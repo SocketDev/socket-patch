@@ -52,17 +52,6 @@ use crate::json_envelope::{
 };
 use crate::ui::{print_json, select_one, SelectError};
 
-/// Best-effort ecosystem extractor for a `pkg:<eco>/...` PURL. Used as
-/// the telemetry `ecosystem` field. Returns an empty string when the
-/// PURL is malformed — telemetry events should never block on input
-/// validation.
-fn ecosystem_from_purl(purl: &str) -> String {
-    purl.strip_prefix("pkg:")
-        .and_then(|rest| rest.split('/').next())
-        .unwrap_or("")
-        .to_string()
-}
-
 /// A fresh `get` envelope for this run (`dryRun` from the flags).
 fn new_envelope(common: &GlobalArgs) -> Envelope {
     let mut env = Envelope::new(JsonCommand::Get);
@@ -129,7 +118,14 @@ async fn report_fetch_failure(
     common: &GlobalArgs,
 ) -> i32 {
     let msg = error.to_string();
-    track_patch_fetch_failed(identifier, &msg, fallback_to_proxy, telemetry).await;
+    track_patch_fetch_failed(
+        identifier,
+        "patch_fetch_failed",
+        &msg,
+        fallback_to_proxy,
+        telemetry,
+    )
+    .await;
     report_error(common, "patch_fetch_failed", msg)
 }
 
@@ -1335,7 +1331,8 @@ pub async fn run(args: GetArgs) -> i32 {
                 track_patch_fetched(
                     &patch.uuid,
                     &patch.tier,
-                    &ecosystem_from_purl(&patch.purl),
+                    &crate::telemetry_outcomes::ecosystem_of(&patch.purl),
+                    mode.cli_name(),
                     fallback_to_proxy,
                     &telemetry,
                 )
@@ -1413,6 +1410,7 @@ pub async fn run(args: GetArgs) -> i32 {
             Ok(None) => {
                 track_patch_fetch_failed(
                     &args.identifier,
+                    "not_found",
                     "not_found",
                     fallback_to_proxy,
                     &telemetry,
@@ -1890,7 +1888,14 @@ async fn report_paid_required_uuid(
     telemetry: &TelemetryAuth,
     org_warnings: &[(String, String)],
 ) -> i32 {
-    track_patch_fetch_failed(patch_id, "paid_required", fallback_to_proxy, telemetry).await;
+    track_patch_fetch_failed(
+        patch_id,
+        "paid_required",
+        "paid_required",
+        fallback_to_proxy,
+        telemetry,
+    )
+    .await;
     if args.common.json {
         let mut env = new_envelope(&args.common);
         env.status = Status::PaidRequired;
@@ -2223,6 +2228,7 @@ async fn save_and_apply_patch(
         // result in one line (`Applied 1 patch.`).
         apply_report = Some(
             run_nested_apply(
+                "get",
                 nested_apply_args(&args.common, &manifest_path, quiet),
                 args.common.json,
                 true,
@@ -2326,6 +2332,7 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs,
         patch_server_url: args.common.patch_server_url.clone(),
+        patch_mirror_url: args.common.patch_mirror_url.clone(),
     }
 }
 
@@ -2477,8 +2484,16 @@ async fn run_get_vendored(
             // Same failure telemetry as the vendor-step Err arm below: this
             // run exits 1 without vendoring anything.
             socket_patch_core::telemetry::track_patch_vendor_failed(
+                "get",
+                code,
                 detail,
                 args.common.dry_run,
+                &crate::telemetry_outcomes::uniform_outcomes(
+                    [(patch.purl.as_str(), patch.uuid.as_str())],
+                    socket_patch_core::telemetry::MODE_VENDORED,
+                    socket_patch_core::telemetry::OUTCOME_FAILED,
+                    Some(code),
+                ),
                 telemetry,
             )
             .await;
@@ -2517,6 +2532,7 @@ async fn run_get_vendored(
         ))
         .await
     };
+    let download_failures = download.failed_outcomes();
     let (dl_code, _, records) = download.into_envelope(&mut env);
 
     // The vendor step (scan's, verbatim): apply lock, in-memory staging
@@ -2525,6 +2541,7 @@ async fn run_get_vendored(
     // and over this run's client, then the run's telemetry. A per-patch
     // download failure does not skip it (scan parity).
     match super::scan::boxed_vendor_step(super::scan::VendorStep {
+        command: "get",
         common: &args.common,
         records,
         client: api_client.clone(),
@@ -2532,6 +2549,7 @@ async fn run_get_vendored(
         report_empty: true,
         prior: None,
         download_errors: dl_code != 0,
+        download_failures,
         telemetry_auth: telemetry,
         closing_lines: None,
     })
@@ -4214,6 +4232,7 @@ mod tests {
             ecosystems: None,
             persist_blobs: false,
             patch_server_url: None,
+            patch_mirror_url: None,
         }
     }
 
@@ -4965,6 +4984,7 @@ mod tests {
             // The vendor-detached posture this fn exists for.
             persist_blobs: false,
             patch_server_url: None,
+            patch_mirror_url: None,
         }
     }
 

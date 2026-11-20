@@ -684,11 +684,10 @@ async fn scan_vendor_dry_run_previews_without_touching_disk() {
 /// recorded the error only in their JSON report, so the human path exited
 /// non-zero with no error output at all (the JSON report is discarded and
 /// the vendor engine just says "No vendorable patches in scope").
-#[tokio::test]
-async fn scan_vendor_fetch_failure_reports_error() {
-    let mock = MockServer::start().await;
-    // Discovery succeeds (batch + per-package search, same shapes as
-    // `mount_patch_api`), but the view fetch fails.
+/// A patch API whose discovery succeeds (batch + per-package search, same
+/// shapes as `mount_patch_api`) and whose view fetch fails: the selected
+/// patch cannot be downloaded.
+async fn mount_patch_api_with_failing_view(mock: &MockServer) {
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -706,7 +705,7 @@ async fn scan_vendor_fetch_failure_reports_error() {
             }],
             "canAccessPaidPatches": false,
         })))
-        .mount(&mock)
+        .mount(mock)
         .await;
     Mock::given(method("GET"))
         .and(path(format!(
@@ -724,13 +723,19 @@ async fn scan_vendor_fetch_failure_reports_error() {
             }],
             "canAccessPaidPatches": false,
         })))
-        .mount(&mock)
+        .mount(mock)
         .await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")))
         .respond_with(ResponseTemplate::new(500))
-        .mount(&mock)
+        .mount(mock)
         .await;
+}
+
+#[tokio::test]
+async fn scan_vendor_fetch_failure_reports_error() {
+    let mock = MockServer::start().await;
+    mount_patch_api_with_failing_view(&mock).await;
 
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path());
@@ -868,6 +873,190 @@ async fn scan_vendor_emits_no_telemetry_even_with_endpoint_env() {
 
 const SCOPED_CRAWLER_PURL: &str = "pkg:npm/@scope/left-pad@1.3.0";
 const SCOPED_API_PURL: &str = "pkg:npm/%40scope/left-pad@1.3.0";
+
+/// Every telemetry event the mock received (either arm), in firing order.
+async fn telemetry_events(mock: &MockServer) -> Vec<serde_json::Value> {
+    let mut events: Vec<serde_json::Value> = mock
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/telemetry"))
+        .map(|r| serde_json::from_slice(&r.body).expect("telemetry body is JSON"))
+        .collect();
+    events.sort_by_key(|e| e["event_sender_created_at"].as_str().unwrap().to_string());
+    events
+}
+
+/// A vendored scan whose download fails vendors nothing, and its failure
+/// event names the patch it could not get. The vendor step works from the
+/// records that did download, so without the download phase's failures
+/// the event named no patch at all.
+#[tokio::test]
+async fn scan_vendor_download_failure_names_the_patch() {
+    let mock = MockServer::start().await;
+    mount_patch_api_with_failing_view(&mock).await;
+    for telemetry in [
+        format!("/v0/orgs/{ORG_SLUG}/telemetry"),
+        "/patch/telemetry".to_string(),
+    ] {
+        Mock::given(method("POST"))
+            .and(path(telemetry))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .mount(&mock)
+            .await;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+    let mock_uri = mock.uri();
+
+    for json in [true, false] {
+        let mut argv = vec!["scan", "--mode", "vendored", "--yes"];
+        if json {
+            argv.push("--json");
+        }
+        argv.extend_from_slice(&[
+            "--api-url",
+            mock_uri.as_str(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ]);
+        let before = telemetry_events(&mock).await.len();
+        let (code, stdout, stderr) = run_cli_env(
+            tmp.path(),
+            &argv,
+            &[
+                ("SOCKET_TELEMETRY_DISABLED", "0"),
+                ("SOCKET_API_URL", mock_uri.as_str()),
+                ("SOCKET_PROXY_URL", mock_uri.as_str()),
+            ],
+        );
+        assert_eq!(code, 1, "json={json}; stdout={stdout}; stderr={stderr}");
+
+        let events = telemetry_events(&mock).await;
+        let failed: Vec<&serde_json::Value> = events[before..]
+            .iter()
+            .filter(|e| e["event_type"] == "patch_vendor_failed")
+            .collect();
+        assert_eq!(failed.len(), 1, "json={json}: {events:#?}");
+        let failed = failed[0];
+        assert_eq!(failed["context"]["command"], "scan");
+        assert_eq!(failed["metadata"]["mode"], "vendored");
+        assert_eq!(failed["metadata"]["patches_count"], 0);
+        assert_eq!(
+            failed["metadata"]["outcomes"],
+            serde_json::json!({ "failed": 1 })
+        );
+        let patches = failed["metadata"]["patches"].as_array().unwrap();
+        assert_eq!(patches.len(), 1, "json={json}: {failed:#}");
+        assert_eq!(patches[0]["uuid"], UUID);
+        assert_eq!(patches[0]["mode"], "vendored");
+        assert_eq!(patches[0]["outcome"], "failed");
+        assert!(
+            patches[0]["code"]
+                .as_str()
+                .is_some_and(|code| !code.is_empty()),
+            "the failed download carries its code: {failed:#}"
+        );
+        // Nothing was vendored, so nothing reports as vendored.
+        assert!(
+            !events[before..]
+                .iter()
+                .any(|e| e["event_type"] == "patch_vendored"),
+            "json={json}: {events:#?}"
+        );
+    }
+}
+
+/// With telemetry on, a vendored scan reports the vendoring under the
+/// command the user ran, tagged `mode: "vendored"`, and names the patch by
+/// UUID. `vendor --revert`, which takes every vendored patch back out and
+/// used to report nothing, reports each as removed.
+#[tokio::test]
+async fn scan_vendor_and_revert_report_their_patches() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    for telemetry in [
+        format!("/v0/orgs/{ORG_SLUG}/telemetry"),
+        "/patch/telemetry".to_string(),
+    ] {
+        Mock::given(method("POST"))
+            .and(path(telemetry))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .mount(&mock)
+            .await;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+    let mock_uri = mock.uri();
+    // The suite's opt-in (see `hermetic_command`), aimed at the mock.
+    let telemetry_on = [
+        ("SOCKET_TELEMETRY_DISABLED", "0"),
+        ("SOCKET_API_URL", mock_uri.as_str()),
+        ("SOCKET_PROXY_URL", mock_uri.as_str()),
+    ];
+    let auth = [
+        "--api-url",
+        mock_uri.as_str(),
+        "--api-token",
+        "fake-token",
+        "--org",
+        ORG_SLUG,
+    ];
+
+    let mut scan = vec!["scan", "--json", "--mode", "vendored", "--yes"];
+    scan.extend_from_slice(&auth);
+    let (code, stdout, stderr) = run_cli_env(tmp.path(), &scan, &telemetry_on);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+
+    let events = telemetry_events(&mock).await;
+    let vendored: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["event_type"] == "patch_vendored")
+        .collect();
+    assert_eq!(vendored.len(), 1, "{events:#?}");
+    let vendored = vendored[0];
+    assert_eq!(vendored["context"]["command"], "scan");
+    assert_eq!(vendored["metadata"]["mode"], "vendored");
+    assert_eq!(vendored["metadata"]["dry_run"], false);
+    assert_eq!(vendored["metadata"]["patches_count"], 1);
+    assert_eq!(
+        vendored["metadata"]["patches"],
+        serde_json::json!([{
+            "uuid": UUID,
+            "ecosystem": "npm",
+            "mode": "vendored",
+            "outcome": "applied",
+        }])
+    );
+    // By patch UUID only: the package is not named.
+    assert!(!vendored.to_string().contains("left-pad"), "{vendored:#}");
+    let sent = events.len();
+
+    let mut revert = vec!["vendor", "--revert", "--json", "--yes"];
+    revert.extend_from_slice(&auth);
+    let (code, stdout, stderr) = run_cli_env(tmp.path(), &revert, &telemetry_on);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+
+    let events = telemetry_events(&mock).await;
+    let reverted = &events[sent..];
+    assert_eq!(reverted.len(), 1, "{reverted:#?}");
+    let removed = &reverted[0];
+    assert_eq!(removed["event_type"], "patch_removed");
+    assert_eq!(removed["context"]["command"], "vendor");
+    assert_eq!(removed["metadata"]["removed_count"], 1);
+    assert_eq!(
+        removed["metadata"]["patches"],
+        serde_json::json!([{
+            "uuid": UUID,
+            "ecosystem": "npm",
+            "mode": "vendored",
+            "outcome": "removed",
+        }])
+    );
+}
 
 /// Like `write_fixture`, but the installed package is the SCOPED
 /// `@scope/left-pad` (the crawler reports the literal `@scope` form).

@@ -19,14 +19,16 @@ use socket_patch_core::crawlers::ruby_crawler::{
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::ledgers::merge_ledger_records_for_updates;
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::telemetry::{track_patch_scan_failed, track_patch_scanned, TelemetryAuth};
+use socket_patch_core::telemetry::{
+    track_patch_scan_failed, track_patch_scanned, ScanReport, TelemetryAuth,
+};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl};
 use socket_patch_core::utils::purl_key::{canonical_base_purl, PurlKey};
 use socket_patch_core::vendor::lock_inventory::unsupported_layout_warnings;
 use socket_patch_core::vendor::{purl_keys_cover, VendorState};
 use socket_patch_core::vex::discover::{LedgerLiveness, WiringMode};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::args::{apply_env_toggles, GlobalArgs};
@@ -42,8 +44,7 @@ use crate::json_envelope::{
 use crate::ui::{self, plural, print_json, StatusLine};
 
 use crate::commands::agent_download::{
-    download_and_apply_patches_into, download_and_apply_patches_with, DownloadParams, DownloadRun,
-    ALREADY_IN_MANIFEST,
+    download_and_apply_patches_into, DownloadParams, DownloadRun, ALREADY_IN_MANIFEST,
 };
 
 use self::policy::{load_invocation_policy, InvocationPolicy, PolicyLoadError, ScanPolicy};
@@ -945,6 +946,7 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs: args.mode != Some(ScanMode::Vendored),
         patch_server_url: args.common.patch_server_url.clone(),
+        patch_mirror_url: args.common.patch_mirror_url.clone(),
     }
 }
 
@@ -1607,17 +1609,20 @@ fn emit_scan_error(common: &GlobalArgs, error: EnvelopeError) {
 /// back leaves the lockfiles half restored: the run stops there with exit
 /// 1 (`Err`), rather than write over them. The restore printed the
 /// failure as it happened; `counts` are the scanned and the lockfile-only
-/// packages of the envelope. Otherwise `sweep` goes on.
-fn stop_half_restored(
+/// packages of the envelope, and the last argument is what the failed
+/// scan's telemetry takes. Otherwise `sweep` goes on.
+async fn stop_half_restored(
     common: &GlobalArgs,
     sweep: Option<withdrawn::WithdrawnSweep>,
     counts: (usize, usize),
     paths: &crate::path_scope::PathScope,
+    (fallback_to_proxy, mode, auth): (bool, &str, &TelemetryAuth),
 ) -> Result<Option<withdrawn::WithdrawnSweep>, i32> {
     let half = |sweep: &withdrawn::WithdrawnSweep| sweep.half_restored().map(str::to_string);
     let Some(why) = sweep.as_ref().and_then(half) else {
         return Ok(sweep);
     };
+    track_patch_scan_failed("lockfile_write_failed", &why, fallback_to_proxy, mode, auth).await;
     if common.json {
         let mut env = scan_envelope(common);
         env.set_extra("scannedPackages", serde_json::json!(counts.0));
@@ -1632,15 +1637,21 @@ fn stop_half_restored(
     Err(1)
 }
 
-/// The ecosystems `purls` span, by CLI name, sorted and deduplicated.
-fn scanned_ecosystems(purls: &[String]) -> Vec<String> {
-    purls
-        .iter()
-        .filter_map(|purl| Ecosystem::from_purl(purl))
-        .map(|eco| eco.cli_name().to_string())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect()
+/// `(purl, n)` pairs summed per ecosystem, by CLI name: how many packages
+/// (or patches) of each ecosystem a scan found. An ecosystem with nothing
+/// has no entry; a purl of no known ecosystem is not counted.
+fn count_by_ecosystem<'a>(
+    counts: impl Iterator<Item = (&'a String, usize)>,
+) -> BTreeMap<String, usize> {
+    let mut by_ecosystem = BTreeMap::new();
+    for (purl, n) in counts {
+        if let Some(ecosystem) = Ecosystem::from_purl(purl).filter(|_| n > 0) {
+            *by_ecosystem
+                .entry(ecosystem.cli_name().to_string())
+                .or_default() += n;
+        }
+    }
+    by_ecosystem
 }
 
 pub async fn run(args: ScanArgs) -> i32 {
@@ -2605,6 +2616,14 @@ async fn scan_project(
         let err = crate::json_envelope::manifest_load_error(&manifest_path, e);
         if apply {
             status.finish();
+            track_patch_scan_failed(
+                &err.code,
+                &err.message,
+                false,
+                ScanMode::Agent.cli_name(),
+                &telemetry_auth,
+            )
+            .await;
             if args.common.json {
                 emit_scan_error(&args.common, err);
             } else {
@@ -2984,7 +3003,10 @@ async fn scan_project(
         } else {
             None
         };
-        let stale_sweep = match stop_half_restored(&args.common, stale_sweep, (0, 0), &path_scope) {
+        let telemetry = (false, requested_mode, &telemetry_auth);
+        let stopped =
+            stop_half_restored(&args.common, stale_sweep, (0, 0), &path_scope, telemetry).await;
+        let stale_sweep = match stopped {
             Ok(sweep) => sweep,
             Err(code) => return code,
         };
@@ -3012,14 +3034,17 @@ async fn scan_project(
         }
         // Telemetry: empty-scan still counts as a successful scan.
         track_patch_scanned(
-            0,
-            0,
-            0,
-            false,
-            &[],
-            false,
-            requested_mode,
-            &project_modes,
+            ScanReport {
+                packages_by_ecosystem: &BTreeMap::new(),
+                patches_by_ecosystem: &BTreeMap::new(),
+                free_patches: 0,
+                paid_patches: 0,
+                can_access_paid: false,
+                fallback_to_proxy: false,
+                mode: requested_mode,
+                project_modes: &project_modes,
+                dry_run: args.common.dry_run,
+            },
             &telemetry_auth,
         )
         .await;
@@ -3384,7 +3409,14 @@ async fn scan_project(
     if total_batches > 0 && batch_error_count == total_batches {
         status.finish();
         let err = last_batch_error.unwrap_or_else(|| "all batches failed".to_string());
-        track_patch_scan_failed(&err, fallback_to_proxy, &telemetry_auth).await;
+        track_patch_scan_failed(
+            API_BATCH_FAILED,
+            &err,
+            fallback_to_proxy,
+            requested_mode,
+            &telemetry_auth,
+        )
+        .await;
         if args.common.json {
             let mut env = scan_envelope(&args.common);
             env.set_extra("scannedPackages", serde_json::json!(package_count));
@@ -3433,11 +3465,19 @@ async fn scan_project(
         None
     };
     let counts = (package_count, lockfile_only_count);
-    let mut withdrawn_sweep =
-        match stop_half_restored(&args.common, withdrawn_sweep, counts, &path_scope) {
-            Ok(sweep) => sweep,
-            Err(code) => return code,
-        };
+    let telemetry = (fallback_to_proxy, requested_mode, &telemetry_auth);
+    let stopped = stop_half_restored(
+        &args.common,
+        withdrawn_sweep,
+        counts,
+        &path_scope,
+        telemetry,
+    )
+    .await;
+    let mut withdrawn_sweep = match stopped {
+        Ok(sweep) => sweep,
+        Err(code) => return code,
+    };
     // The sweep's reference answers, reused by the hosted redirect.
     let sweep_references = withdrawn_sweep
         .as_mut()
@@ -3460,14 +3500,21 @@ async fn scan_project(
     // ecosystems the crawl actually found (not the `--ecosystems` filter,
     // which is empty on a default run).
     track_patch_scanned(
-        package_count,
-        free_patches,
-        paid_patches,
-        can_access_paid_patches,
-        &scanned_ecosystems(&all_purls),
-        fallback_to_proxy,
-        requested_mode,
-        &project_modes,
+        ScanReport {
+            packages_by_ecosystem: &count_by_ecosystem(all_purls.iter().map(|purl| (purl, 1))),
+            patches_by_ecosystem: &count_by_ecosystem(
+                all_packages_with_patches
+                    .iter()
+                    .map(|pkg| (&pkg.purl, pkg.patches.len())),
+            ),
+            free_patches,
+            paid_patches,
+            can_access_paid: can_access_paid_patches,
+            fallback_to_proxy,
+            mode: requested_mode,
+            project_modes: &project_modes,
+            dry_run: args.common.dry_run,
+        },
         &telemetry_auth,
     )
     .await;
@@ -4357,10 +4404,14 @@ async fn scan_project(
         // record and the nested apply re-applies them (a no-op on disk
         // when the installed copy is still patched).
         let to_download: Vec<_> = selected.iter().chain(&already_recorded).cloned().collect();
-        let (code, outcome) = download_and_apply_patches_with(
+        // Into a scan envelope (never printed here): the engine reports
+        // its telemetry under the command whose envelope it fills.
+        let mut outcome = scan_envelope(&args.common);
+        let code = download_and_apply_patches_into(
             &to_download,
             &params,
             &download_run(&args, &api_client),
+            &mut outcome,
         )
         .await;
         // Under the apply's result line: one row per package it left

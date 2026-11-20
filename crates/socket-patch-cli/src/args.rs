@@ -172,6 +172,26 @@ pub struct GlobalArgs {
     )]
     pub patch_server_url: Option<String>,
 
+    /// Base URL of a mirror of Socket's patch server: a caching proxy in
+    /// front of https://patch.socket.dev, such as an Artifactory remote
+    /// repository. Hosted mode writes its patch references under this base
+    /// instead of the patch server's own host (same path), and every
+    /// command accepts lockfile URLs on this origin as hosted patch
+    /// references. Set it the same way wherever socket-patch runs for the
+    /// project.
+    //
+    // EXPERIMENTAL (hidden from `--help`): for organizations that install
+    // through their own artifact host. The flag, its variables and its
+    // warning codes carry no stability guarantee yet; see "Patch mirror
+    // (experimental)" in CLI_CONTRACT.md.
+    #[arg(
+        help_heading = GLOBAL_OPTIONS,
+        long = "patch-mirror-url",
+        env = "SOCKET_PATCH_MIRROR_URL",
+        hide = true
+    )]
+    pub patch_mirror_url: Option<String>,
+
     /// Disable network access; fail if remote data is needed.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
@@ -626,6 +646,42 @@ impl GlobalArgs {
             .map_or_else(|| self.telemetry_auth(), TelemetryAuth::for_client)
     }
 
+    /// Refuse a `--patch-mirror-url` that cannot prefix a committed URL,
+    /// once, before any command reads the project. The message says what
+    /// is wrong and never repeats the value: a base given with credentials
+    /// in it must not be echoed into a terminal or a CI log.
+    pub fn validate_patch_mirror(&self) -> Result<(), String> {
+        let Some(raw) = self
+            .patch_mirror_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+        else {
+            return Ok(());
+        };
+        socket_patch_core::patch::redirect::mirror::PatchMirror::parse(raw)
+            .map(|_| ())
+            .map_err(|why| {
+                format!(
+                    "--patch-mirror-url (or SOCKET_PATCH_MIRROR_URL) is not a usable patch \
+                     mirror base URL: {why}"
+                )
+            })
+    }
+
+    /// The patch-server mirror this run was given (`--patch-mirror-url`).
+    /// [`Self::validate_patch_mirror`] refused a base that does not parse
+    /// before the command started; a struct literal with one has no mirror.
+    pub(crate) fn patch_mirror(
+        &self,
+    ) -> Option<socket_patch_core::patch::redirect::mirror::PatchMirror> {
+        self.patch_mirror_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .and_then(|url| {
+                socket_patch_core::patch::redirect::mirror::PatchMirror::parse(url).ok()
+            })
+    }
+
     /// The vendoring-service config every vendor entry point (`vendor`,
     /// `scan`/`get --mode vendored`) builds from the same flags, so they
     /// commit byte-identical artifacts for the same patch. Clap validated
@@ -728,6 +784,7 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_VENDOR_SOURCE",
     "SOCKET_VENDOR_URL",
     "SOCKET_PATCH_SERVER_URL",
+    "SOCKET_PATCH_MIRROR_URL",
     "SOCKET_OFFLINE",
     "SOCKET_STRICT",
     "SOCKET_GLOBAL",
@@ -800,6 +857,7 @@ impl Default for GlobalArgs {
             maven_config: None,
             vendor_url: None,
             patch_server_url: None,
+            patch_mirror_url: None,
             offline: false,
             strict: false,
             allow_patch_conflicts: false,

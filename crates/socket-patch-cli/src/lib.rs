@@ -73,6 +73,7 @@ pub mod interrupt;
 pub use socket_patch_core::hosted::memory as hosted_memory;
 pub mod json_envelope;
 pub mod path_scope;
+pub(crate) mod telemetry_outcomes;
 pub mod ui;
 pub mod update_notifier;
 
