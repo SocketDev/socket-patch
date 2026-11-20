@@ -1304,17 +1304,23 @@ pub async fn run(args: VendorArgs) -> i32 {
     env.warnings
         .extend(crate::commands::sync_bazelignore(&args.common, true).await);
 
+    // The patches this run's event names are read while the lock is still
+    // held. Once it is released another run on the same project can rewrite
+    // the ledger and the manifest, and this run's event would be credited to
+    // that run's patches.
+    let uuids = match &vendor_service {
+        Some(_) => recorded_patch_uuids(&args.common, &manifest_path).await,
+        None => HashMap::new(),
+    };
+
     // Everything below is output and telemetry, so release the lock before
     // the telemetry round-trip.
     drop(lock);
 
-    if args.common.json {
-        println!("{}", env.to_pretty_json());
-    }
-
+    // Sent before the envelope prints, like `remove` and the hosted flow: a
+    // consumer that closes stdout on the envelope cannot drop the event.
     match &vendor_service {
         Some((_, telemetry)) => {
-            let uuids = recorded_patch_uuids(&args.common, &manifest_path).await;
             track_outcomes_for_vendor(
                 "vendor",
                 exit != 0,
@@ -1328,6 +1334,10 @@ pub async fn run(args: VendorArgs) -> i32 {
         }
         // `--revert` takes every vendored patch out: a removal.
         None => track_revert(&args, exit, &env, &reverted_uuids).await,
+    }
+
+    if args.common.json {
+        println!("{}", env.to_pretty_json());
     }
 
     exit
