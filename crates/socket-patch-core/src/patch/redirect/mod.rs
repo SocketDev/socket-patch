@@ -51,6 +51,7 @@ mod group_equivalence_tests;
 #[cfg(test)]
 mod lock_index_equivalence_tests;
 mod maven_index;
+pub mod mirror;
 pub mod npm_allow_scripts;
 pub mod npmrc;
 mod pdm;
@@ -1167,6 +1168,27 @@ fn warn_no_pypi_wiring(
     if wired || crate::utils::hatch::is_hatch(files) {
         return;
     }
+    // A pixi project: a requirements file or another tool's lock would
+    // pin nothing, since pixi installs from its own lock, and mostly from
+    // conda channels. A project whose own files name another lock tool (a
+    // Pipfile, a `[tool.uv]` table) is installed by that tool too, and
+    // keeps its remedy; a build backend names no such tool.
+    let pixi_files = crate::crawlers::pixi_env::PIXI_FILES;
+    if pixi_files.iter().any(|file| files.contains_key(*file))
+        && pypi_lock_step(files, false).is_none()
+    {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_pypi_pixi_project".into(),
+            detail: "pixi installs this project (pixi.toml / pixi.lock), most of it from \
+                     conda channels, and hosted mode cannot point a pixi lock at Socket's \
+                     patched packages; patch the installed packages in place instead: run \
+                     `socket-patch scan --mode agent` after `pixi install`, commit \
+                     .socket/, and run `socket-patch apply` after every later `pixi \
+                     install`"
+                .into(),
+        });
+        return;
+    }
     result.warnings.push(RewriteWarning {
         code: "redirect_pypi_no_lockfile".into(),
         detail: format!(
@@ -1188,18 +1210,43 @@ fn warn_no_pypi_wiring(
 /// both remedies are offered.
 fn pypi_no_lockfile_remedy(files: &BTreeMap<String, String>) -> String {
     const PIN: &str = "pin the package in a root requirements.txt";
-    if files.contains_key("Pipfile") {
-        return "run `pipenv lock` and commit Pipfile.lock, then re-run".into();
+    if let Some(step) = pypi_named_lock_step(files) {
+        return step;
     }
-    let Some(pyproject) = files.get("pyproject.toml") else {
+    if !files.contains_key("pyproject.toml") {
         return format!("{PIN} or commit the project's lock, then re-run");
-    };
+    }
+    format!(
+        "{PIN}, or, if a lock tool installs the project, generate and commit its \
+         lock (`uv lock`, `poetry lock`, `pdm lock`), then re-run"
+    )
+}
+
+/// The lock step of the tool the project's own files name: `pipenv lock`
+/// for a Pipfile, else the lock of the tool a pyproject names with a
+/// `[tool.<tool>]` table or its build backend. `None` when they name none.
+fn pypi_named_lock_step(files: &BTreeMap<String, String>) -> Option<String> {
+    pypi_lock_step(files, true)
+}
+
+/// [`pypi_named_lock_step`], with or without the build backend as a name
+/// (`by_backend`). A build backend builds the project's own package and
+/// says nothing about which tool installs its dependencies: a pixi project
+/// packaged with `poetry-core` or `uv_build` is still installed by pixi.
+/// Only a tool's own file or table (a `Pipfile`, `[tool.uv]`,
+/// `[tool.poetry]`, `[tool.pdm]`) says that tool manages them.
+fn pypi_lock_step(files: &BTreeMap<String, String>, by_backend: bool) -> Option<String> {
+    if files.contains_key("Pipfile") {
+        return Some("run `pipenv lock` and commit Pipfile.lock, then re-run".into());
+    }
+    let pyproject = files.get("pyproject.toml")?;
     let document = pyproject.parse::<toml_edit::DocumentMut>().ok();
     let backend = document
         .as_ref()
         .and_then(|doc| doc.get("build-system"))
         .and_then(|build| build.get("build-backend"))
         .and_then(toml_edit::Item::as_str)
+        .filter(|_| by_backend)
         .unwrap_or_default();
     let names = |tool: &str| {
         document
@@ -1209,19 +1256,14 @@ fn pypi_no_lockfile_remedy(files: &BTreeMap<String, String>) -> String {
             || backend.starts_with(&format!("{tool}."))
             || backend.starts_with(&format!("{tool}_"))
     };
-    for (tool, command) in [
+    [
         ("uv", "uv lock"),
         ("poetry", "poetry lock"),
         ("pdm", "pdm lock"),
-    ] {
-        if names(tool) {
-            return format!("run `{command}` and commit its lock, then re-run");
-        }
-    }
-    format!(
-        "{PIN}, or, if a lock tool installs the project, generate and commit its \
-         lock (`uv lock`, `poetry lock`, `pdm lock`), then re-run"
-    )
+    ]
+    .into_iter()
+    .find(|(tool, _)| names(tool))
+    .map(|(_, command)| format!("run `{command}` and commit its lock, then re-run"))
 }
 
 fn rewrite_hatch(
@@ -5957,7 +5999,10 @@ const BERRY_MANIFEST: &str = "package.json";
 /// this run's own artifact URL, or a URL on the same patch server (scheme,
 /// host and port of `artifact_url`) whose leaf names the package version.
 /// A user's own tarball for the package — a mirror, a fork — is on another
-/// origin and is never ours to rewrite.
+/// origin and is never ours to rewrite. When `artifact_url` is served under
+/// a patch mirror's base, whose host serves the project's own packages
+/// too, the URL must also sit under that base
+/// ([`crate::origin::same_hosted_base`]).
 fn berry_hosted_pin_is_ours(
     url: &str,
     name: &str,
@@ -5980,7 +6025,7 @@ fn berry_hosted_pin_is_ours(
         }
         _ => false,
     };
-    names_it && same_origin
+    names_it && same_origin && crate::origin::same_hosted_base(url, artifact_url)
 }
 
 /// Whether `value` (a `resolutions` value) is a hosted tarball pin written
@@ -6663,6 +6708,9 @@ fn rewrite_bun_lock(
 /// override — nothing about the patch server's URL layout is assumed — and
 /// anything that fails to parse fails the match (closed): user URL deps live
 /// on other origins, and another version's artifact has a different leaf.
+/// Under a patch mirror, whose host serves the project's own packages too,
+/// the two must also share the mirror's base
+/// ([`crate::origin::same_hosted_base`]).
 pub(crate) fn is_prior_hosted_bun_spec(spec: &str, fname: &str, current_url: &str) -> bool {
     let Some(old_url) = spec
         .strip_prefix(fname)
@@ -6686,7 +6734,9 @@ pub(crate) fn is_prior_hosted_bun_spec(spec: &str, fname: &str, current_url: &st
         Some((&url[..path_start], leaf))
     }
     match (origin_and_leaf(old_url), origin_and_leaf(current_url)) {
-        (Some(old), Some(new)) => old == new,
+        (Some(old), Some(new)) => {
+            old == new && crate::origin::same_hosted_base(old_url, current_url)
+        }
         _ => false,
     }
 }
@@ -15959,6 +16009,60 @@ mod tests {
         assert!(fresh.files.is_empty());
         assert!(fresh.yarn_berry_uuids.contains(BERRY_UUID));
         assert!(fresh.confirmed_yarn_berry_uuids.is_empty());
+    }
+
+    /// Under a patch mirror, whose host serves the project's own packages
+    /// too, yarn berry and Bun take over an earlier pin only under the
+    /// mirror's base: a tarball of the same name and version in another
+    /// repository of that host is the project's own source.
+    #[test]
+    fn a_tarball_elsewhere_on_the_mirrors_host_is_not_an_earlier_pin() {
+        let base = "https://repo.example/artifactory/socket-patch";
+        let leaf = "left-pad-1.3.0.tgz";
+        let current = format!("{base}/patch/npm/left-pad/1.3.0/new/u2/{leaf}");
+        let earlier = format!("{base}/patch/npm/left-pad/1.3.0/old/u1/{leaf}");
+        let fork = format!("https://repo.example/artifactory/npm-local/left-pad/-/{leaf}");
+
+        assert!(berry_hosted_pin_is_ours(
+            &earlier,
+            "left-pad",
+            Some("1.3.0"),
+            &current
+        ));
+        assert!(berry_hosted_pin_is_ours(
+            &earlier, "left-pad", None, &current
+        ));
+        assert!(!berry_hosted_pin_is_ours(
+            &fork,
+            "left-pad",
+            Some("1.3.0"),
+            &current
+        ));
+        assert!(!berry_hosted_pin_is_ours(&fork, "left-pad", None, &current));
+
+        let spec = |url: &str| format!("left-pad@{url}");
+        assert!(is_prior_hosted_bun_spec(
+            &spec(&earlier),
+            "left-pad",
+            &current
+        ));
+        assert!(!is_prior_hosted_bun_spec(
+            &spec(&fork),
+            "left-pad",
+            &current
+        ));
+
+        // On the patch server itself the origin and the file name decide,
+        // as they always have: nothing else is served from that host.
+        let direct = current.replace(base, "https://patch.socket.dev");
+        let stale = earlier.replace(base, "https://patch.socket.dev");
+        assert!(berry_hosted_pin_is_ours(
+            &stale,
+            "left-pad",
+            Some("1.3.0"),
+            &direct
+        ));
+        assert!(is_prior_hosted_bun_spec(&spec(&stale), "left-pad", &direct));
     }
 
     /// A lock written by an earlier release carries the old

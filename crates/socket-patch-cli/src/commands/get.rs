@@ -43,7 +43,8 @@ pub use crate::commands::agent_download::{
 };
 use crate::commands::apply::ApplyRunReport;
 use crate::ecosystem_dispatch::{
-    crawl_ecosystems, find_packages_for_rollback, installed_target_matches, partition_purls,
+    crawl_ecosystems_for_name, find_packages_for_rollback, installed_target_matches,
+    partition_purls,
 };
 use crate::json_envelope::{
     usage_error, Command as JsonCommand, Envelope, EnvelopeError, PatchAction as EventAction,
@@ -1465,9 +1466,13 @@ pub async fn run(args: GetArgs) -> i32 {
         TargetKind::Name => {
             status.set("Enumerating packages...");
             // `--ecosystems` scopes the crawl, so a name can only resolve
-            // inside the selected ecosystems.
+            // inside the selected ecosystems. A name resolves among every
+            // installed package, as its PURL would: a Python project with
+            // no environment of its own is otherwise crawled only for the
+            // packages it declares.
             let only = args.common.ecosystems.as_deref().filter(|l| !l.is_empty());
-            let (all_packages, _, _) = crawl_ecosystems(&args.common.crawler_options(), only).await;
+            let (all_packages, _, _) =
+                crawl_ecosystems_for_name(&args.common.crawler_options(), only).await;
 
             if all_packages.is_empty() {
                 status.finish();
@@ -2316,6 +2321,7 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs,
         patch_server_url: args.common.patch_server_url.clone(),
+        patch_mirror_url: args.common.patch_mirror_url.clone(),
     }
 }
 
@@ -3472,6 +3478,47 @@ mod tests {
         assert_eq!(json["events"][1]["errorCode"], "user_patch_conflict");
     }
 
+    /// A copy the nested apply skipped as not supported yet (a compiled
+    /// conda build) is said for each copy: beside the applied copy of a
+    /// selected record, as the only outcome of a selected record whose
+    /// every copy was skipped, and for a record this run did not select.
+    #[test]
+    fn record_apply_outcome_says_each_copy_skipped_as_not_supported() {
+        let code = "conda_build_not_pypi_release";
+        let skip = |purl: &str, env_name: &str| {
+            PatchEvent::new(EventAction::Skipped, purl)
+                .with_reason(code, format!("{code}: conda built the copy in /{env_name}"))
+        };
+        let mixed = "pkg:pypi/pillow@12.3.0?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl";
+        let only_conda = "pkg:pypi/pyyaml@6.0.3?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl";
+        let unselected = "pkg:pypi/numpy@2.4.4?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl";
+        let report = ApplyRunReport {
+            applied: vec![mixed.into()],
+            skipped: vec![
+                skip(mixed, "default"),
+                skip(mixed, "test"),
+                skip(only_conda, "default"),
+                skip(unselected, "default"),
+            ],
+            ..ApplyRunReport::default()
+        };
+        let mut env = Envelope::new(JsonCommand::Get);
+        let recs = recorded(&[(mixed, "um"), (only_conda, "uo")]);
+        record_apply_outcome(&mut env, &recs, Some(&report), |_| Some("uu".into()));
+        assert_eq!(
+            outcomes(&env),
+            vec![
+                o("applied", mixed, "um", ""),
+                o("skipped", mixed, "um", code),
+                o("skipped", mixed, "um", code),
+                o("skipped", only_conda, "uo", code),
+                o("skipped", unselected, "uu", code),
+            ]
+        );
+        assert_eq!(env.status, Status::Success);
+        assert_ne!(env.events[1].reason, env.events[2].reason);
+    }
+
     #[test]
     fn record_apply_outcome_never_infers_a_write_from_exit_zero() {
         let mut env = Envelope::new(JsonCommand::Get);
@@ -4163,6 +4210,7 @@ mod tests {
             ecosystems: None,
             persist_blobs: false,
             patch_server_url: None,
+            patch_mirror_url: None,
         }
     }
 
@@ -4914,6 +4962,7 @@ mod tests {
             // The vendor-detached posture this fn exists for.
             persist_blobs: false,
             patch_server_url: None,
+            patch_mirror_url: None,
         }
     }
 

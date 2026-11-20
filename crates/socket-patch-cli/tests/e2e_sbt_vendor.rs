@@ -853,6 +853,53 @@ fn vendor_takeover_of_a_hosted_sbt_pin_dry_and_wet() {
     );
 }
 
+/// A `pom.xml` beside the sbt build that hosted mode pinned too. The eject
+/// restores the pin in every file that wires it, and vendoring wires the
+/// sbt build alone: the pom is the upstream one again, so the Maven build
+/// is no longer patched, and the run says that the pom is not wired.
+#[test]
+fn vendor_takeover_beside_a_pinned_pom_restores_the_pom_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path(), &[(GSON, GSON_UUID)]);
+    write_hosted_pin(&fx.proj(), GSON_UUID);
+    // The core fixture `sbt/redirect/pom-also-present`, respelled for gson.
+    let gson = |rel: &str| {
+        let case = "../socket-patch-core/tests/fixtures/sbt/redirect/pom-also-present";
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(case).join(rel))
+            .unwrap()
+            .replace("org.apache.commons", GSON.group)
+            .replace("org/apache/commons", &GSON.group_path())
+            .replace("commons-lang3", GSON.artifact)
+            .replace("3.11", GSON.version)
+            .replace("abcdef12-0000-4000-8000-000000000001", GSON_UUID)
+            .replace("abcdef12", &GSON_UUID[..8])
+    };
+    let pinned = [
+        "pom.xml",
+        ".mvn/maven.config",
+        ".mvn/checksums/checksums.sha256",
+    ];
+    for rel in pinned {
+        let path = fx.proj().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, gson(&format!("expected/{rel}"))).unwrap();
+    }
+    let (_rt, server) = mock_gson_api();
+    let uri = server.uri();
+    let mut args = vec!["vendor"];
+    args.extend(api_flags(&uri));
+    let env = fx.ok(&args);
+    assert!(env.to_string().contains("vendor_sbt_pom_ignored"), "{env}");
+    assert_eq!(
+        std::fs::read_to_string(fx.proj().join("pom.xml")).unwrap(),
+        gson("input/pom.xml")
+    );
+    for rel in &pinned[1..] {
+        assert!(!fx.proj().join(rel).exists(), "{rel}: {env}");
+    }
+    assert!(!fx.proj().join(HOSTED_FILE).exists() && fx.generated().contains(GSON_UUID));
+}
+
 /// A mock patch API serving gson's patch record by `GSON_UUID`: plain
 /// `vendor` over a hosted pin ejects it, fetching the pinned record from
 /// the API (the agent manifest is not its input). Returns the runtime that

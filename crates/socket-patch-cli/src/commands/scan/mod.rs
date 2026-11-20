@@ -945,6 +945,7 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs: args.mode != Some(ScanMode::Vendored),
         patch_server_url: args.common.patch_server_url.clone(),
+        patch_mirror_url: args.common.patch_mirror_url.clone(),
     }
 }
 
@@ -2914,6 +2915,18 @@ async fn scan_project(
                 projects_left_warnings(&left),
             );
         }
+        // The prune is skipped on an empty crawl, so no record is dropped
+        // here. A recorded PyPI patch can still be on disk in a copy this
+        // scan no longer reaches, and its warning is what names the
+        // `rollback` that restores it.
+        if prune && !hosted {
+            layout_refusals.extend(
+                gc::kept_pypi_patch_warnings(&args.common, &manifest_path, &socket_dir)
+                    .await
+                    .into_iter()
+                    .map(|(code, detail)| (code.to_string(), detail)),
+            );
+        }
         status.finish();
         if human {
             print_layout_refusals(&layout_refusals, &project_patch_notice, args.common.silent);
@@ -3027,14 +3040,32 @@ async fn scan_project(
                     )
                 );
             } else if !policy.root_excluded() {
-                println!(
-                    "{}",
-                    render::no_packages_message(
-                        args.common.is_global(),
-                        args.common.ecosystems.as_deref(),
-                        &args.paths,
-                    )
-                );
+                // Nothing was crawled at all, yet the Python on PATH holds
+                // packages the project does not declare: say that they
+                // were left out, not that nothing is installed.
+                let undeclared = if scanned_purls.is_empty()
+                    && args.paths.is_empty()
+                    && !args.common.is_global()
+                    && args.common.ecosystem_selected(Ecosystem::Pypi)
+                {
+                    socket_patch_core::crawlers::PythonCrawler::new()
+                        .undeclared_installed(&crawler_options)
+                        .await
+                } else {
+                    0
+                };
+                if undeclared > 0 {
+                    println!("{}", render::no_declared_python_packages(undeclared));
+                } else {
+                    println!(
+                        "{}",
+                        render::no_packages_message(
+                            args.common.is_global(),
+                            args.common.ecosystems.as_deref(),
+                            &args.paths,
+                        )
+                    );
+                }
             }
             policy.print_human(args.common.silent, args.common.verbose);
         }

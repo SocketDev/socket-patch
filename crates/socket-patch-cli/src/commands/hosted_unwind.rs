@@ -47,19 +47,53 @@ impl HostedLegOutcome {
 }
 
 /// The patch-server origins that count as hosted, besides Socket's own:
-/// the operator's `--patch-server-url` (discovery's allowlist).
+/// the operator's `--patch-server-url` and the origin of their
+/// `--patch-mirror-url` (discovery's allowlist).
 pub(crate) fn patch_server_origins(common: &GlobalArgs) -> Vec<String> {
-    patch_server_origins_of(common.patch_server_url.as_deref())
+    patch_server_origins_of(
+        common.patch_server_url.as_deref(),
+        common.patch_mirror_url.as_deref(),
+    )
 }
 
-/// [`patch_server_origins`] from the `--patch-server-url` value itself, for
-/// callers that carry it outside a [`GlobalArgs`].
-pub(crate) fn patch_server_origins_of(patch_server_url: Option<&str>) -> Vec<String> {
-    patch_server_url
-        .into_iter()
-        .filter(|url| !url.trim().is_empty())
-        .map(str::to_string)
-        .collect()
+/// [`patch_server_origins`] from the `--patch-server-url` and
+/// `--patch-mirror-url` values themselves, for callers that carry them
+/// outside a [`GlobalArgs`].
+///
+/// * `--patch-server-url` is listed as given, and holds its whole origin.
+/// * The mirror is listed as a mirror's base
+///   ([`socket_patch_core::origin::mirror_entry`]), which holds only what
+///   is under that base: a mirrored reference is the patch server's own
+///   path under it, and the rest of the mirror's host is not the mirror. A
+///   base that does not parse ([`PatchMirror::parse`]) is not listed.
+/// * With a mirror, the FIRST entry is always the patch server (the
+///   operator's, else Socket's own): an upstream restore downloads from the
+///   first entry, and what it downloads is not a patch the mirror was
+///   checked for, nor something the run holds the mirror's credentials for.
+pub(crate) fn patch_server_origins_of(
+    patch_server_url: Option<&str>,
+    patch_mirror_url: Option<&str>,
+) -> Vec<String> {
+    use socket_patch_core::patch::redirect::mirror::PatchMirror;
+    fn given(url: Option<&str>) -> Option<&str> {
+        url.map(str::trim).filter(|url| !url.is_empty())
+    }
+    let server = given(patch_server_url).map(str::to_string);
+    let mirror = given(patch_mirror_url)
+        .and_then(|url| PatchMirror::parse(url).ok())
+        .map(|mirror| socket_patch_core::origin::mirror_entry(mirror.base()));
+    match mirror {
+        None => server.into_iter().collect(),
+        Some(mirror) => vec![
+            server.unwrap_or_else(|| {
+                format!(
+                    "https://{}",
+                    socket_patch_core::origin::SOCKET_PATCH_SERVER_HOST
+                )
+            }),
+            mirror,
+        ],
+    }
 }
 
 /// The gem leg of the unwind's installed-tree care (the "Gem stale-install
@@ -290,4 +324,38 @@ pub(crate) async fn run_hosted_leg(
     out.warnings
         .extend(crate::commands::vlt_heal::rollback_heal(common, &unwound).await);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::patch_server_origins_of;
+
+    /// The list every reader recognizes hosted pins against: the patch
+    /// server as given, the mirror as a mirror's base, and with a mirror
+    /// the patch server first, because an upstream restore downloads from
+    /// the first entry and must never ask the mirror.
+    #[test]
+    fn the_patch_server_comes_first_and_the_mirror_is_its_base() {
+        let mirror = "https://repo.example/artifactory/socket-patch";
+        let listed = format!("mirror+{mirror}");
+        assert!(patch_server_origins_of(None, None).is_empty());
+        assert!(patch_server_origins_of(Some("  "), Some("")).is_empty());
+        assert_eq!(
+            patch_server_origins_of(Some("http://127.0.0.1:4545"), None),
+            ["http://127.0.0.1:4545"]
+        );
+        assert_eq!(
+            patch_server_origins_of(None, Some(&format!("{mirror}/"))),
+            ["https://patch.socket.dev", listed.as_str()]
+        );
+        assert_eq!(
+            patch_server_origins_of(Some("http://127.0.0.1:4545"), Some(mirror)),
+            ["http://127.0.0.1:4545", listed.as_str()]
+        );
+        // A base that does not parse is no mirror: it is not listed, and
+        // its userinfo never becomes an accepted origin.
+        assert!(
+            patch_server_origins_of(None, Some("https://user:secret@repo.example/x")).is_empty()
+        );
+    }
 }

@@ -4950,6 +4950,32 @@ end
 File.write("Makefile", "all:\n\ninstall:\n\nclean:\n\n")
 "##;
 
+/// `sp_wrap` with a build script that uses up a file the gem ships, as
+/// argon2's does (`File.rename('Makefile.real', 'Makefile')`): the
+/// installed tree holds no `Makefile.real`, and the script cannot run
+/// there a second time.
+const ONE_SHOT_EXTCONF: &str = r##"require "rbconfig"
+Dir.chdir(__dir__)
+name = RbConfig::CONFIG["host_os"] =~ /darwin/ ? "libsp_wrap.dylib" : "libsp_wrap.so"
+cc = RbConfig::CONFIG["CC"].split
+abort "could not build #{name}" unless system(*cc, "-shared", "-fPIC", "-o", name, "wrap.c")
+File.rename("Makefile.real", "Makefile")
+"##;
+/// [`ONE_SHOT_EXTCONF`] with a build that only a fresh tree lets finish:
+/// run over an installed one it compiles the library, uses the shipped
+/// file up and then fails.
+const ONCE_ONLY_EXTCONF: &str = r##"require "rbconfig"
+Dir.chdir(__dir__)
+name = RbConfig::CONFIG["host_os"] =~ /darwin/ ? "libsp_wrap.dylib" : "libsp_wrap.so"
+cc = RbConfig::CONFIG["CC"].split
+installed = File.exist?("Makefile")
+abort "could not build #{name}" unless system(*cc, "-shared", "-fPIC", "-o", name, "wrap.c")
+File.rename("Makefile.real", "Makefile")
+abort "this tree was built before" if installed
+"##;
+/// The file [`ONE_SHOT_EXTCONF`] uses up, relative to the gem dir.
+const ONE_SHOT_FILE: &str = "ext/sp_wrap/Makefile.real";
+
 /// A project with `sp_wrap` (built by `extconf`) installed into
 /// `vendor/bundle/ruby/<abi>` by the real `gem`, its archive in the home's
 /// `cache/`, and a record that changes `SpWrap.value` from 1 to 2.
@@ -4970,11 +4996,13 @@ impl WrapGem {
         std::fs::write(src.join("ext/sp_wrap/extconf.rb"), extconf).unwrap();
         std::fs::write(src.join(WRAP_C_KEY), wrap_c(1)).unwrap();
         std::fs::write(src.join("lib/sp_wrap.rb"), WRAP_LIB).unwrap();
+        // Shipped with every variant; only `ONE_SHOT_EXTCONF` touches it.
+        std::fs::write(src.join(ONE_SHOT_FILE), "all:\n\ninstall:\n\nclean:\n\n").unwrap();
         std::fs::write(
             src.join("sp_wrap.gemspec"),
             "Gem::Specification.new do |s|\n  s.name = \"sp_wrap\"\n  s.version = \"1.0.0\"\n  \
              s.summary = \"t\"\n  s.authors = [\"t\"]\n  \
-             s.files = Dir[\"lib/**/*.rb\", \"ext/**/*.{c,rb}\"]\n  \
+             s.files = Dir[\"lib/**/*.rb\", \"ext/**/*.{c,rb,real}\"]\n  \
              s.extensions = [\"ext/sp_wrap/extconf.rb\"]\nend\n",
         )
         .unwrap();
@@ -5161,6 +5189,118 @@ fn a_build_that_keeps_a_stale_library_is_made_to_rebuild_it() {
         "the library is rebuilt from the restored source:\n{stdout}"
     );
     assert_eq!(fx.c_file(), wrap_c(1));
+}
+
+/// A build script that uses up a file the gem ships cannot run a second
+/// time over the installed tree (argon2's renames `Makefile.real`). The
+/// source gem still holds the file, so it is put back for the in-place
+/// build: the patch is built, and nothing is left in the tree that the
+/// build did not leave there itself. `rollback` gives the installed tree
+/// back, with or without the backup of the original build (#2106).
+#[test]
+#[ignore = "host capstone: compiles a C extension with the real ruby/gem toolchain; \
+            the unpinned `test` job skips it, the pinned-Ruby e2e leg runs it via --ignored"]
+fn a_build_script_that_uses_up_a_shipped_file_is_given_it_back() {
+    let Some(abi) = toolchain() else {
+        return;
+    };
+    let fx = WrapGem::new(&abi, ONE_SHOT_EXTCONF);
+    assert_eq!(fx.value(), "1");
+    assert!(
+        !fx.gem_dir.join(ONE_SHOT_FILE).exists(),
+        "the install-time build used the file up"
+    );
+    let installed = walk_files(&fx.gem_dir);
+    let extensions = walk_files(&fx.home.join("extensions"));
+
+    let (code, stdout, stderr) = fx.run(&["apply", "--json", "--offline"]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(
+        fx.value(),
+        "2",
+        "Ruby must load the library built from the patched source:\n{stdout}"
+    );
+    let mut changed: Vec<String> = tree_diff(&installed, &walk_files(&fx.gem_dir))
+        .into_iter()
+        .filter(|line| !line.contains(".socket-patch-native-"))
+        .collect();
+    changed.sort();
+    assert_eq!(
+        changed,
+        [format!("~{}", fx.library()), format!("~{WRAP_C_KEY}")],
+        "the patched source and the library built from it are all that changed"
+    );
+    let (code, stdout, stderr) = fx.run(&["apply", "--check"]);
+    assert_eq!(code, 0, "a rebuilt patch checks clean:\n{stdout}\n{stderr}");
+    assert!(vex_attests(|args| fx.run(args)));
+
+    let (code, stdout, stderr) = fx.run(&["rollback", "--json", "--offline"]);
+    assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
+    assert_eq!(fx.value(), "1", "Ruby must load the original library again");
+    assert_tree(&fx.gem_dir, &installed, "after rollback");
+    assert_tree(&fx.home.join("extensions"), &extensions, "after rollback");
+
+    // A rollback that has lost the backup rebuilds from the restored
+    // source, with the same script. (The first rollback dropped the
+    // record.)
+    write_record(
+        &fx.proj.join(".socket"),
+        WRAP_PURL,
+        &[(WRAP_C_KEY, Some(&wrap_c(1)), &wrap_c(2))],
+    );
+    let (code, stdout, stderr) = fx.run(&["apply", "--json", "--offline"]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(fx.value(), "2");
+    std::fs::remove_dir_all(fx.gem_dir.join(".socket-patch-native-orig")).unwrap();
+    let (code, stdout, stderr) = fx.run(&["rollback", "--json", "--offline"]);
+    assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
+    assert_eq!(
+        fx.value(),
+        "1",
+        "the library is rebuilt from the restored source:\n{stdout}"
+    );
+    assert_eq!(fx.c_file(), wrap_c(1));
+    assert!(
+        !fx.gem_dir.join(ONE_SHOT_FILE).exists(),
+        "the file put back for the build is not left behind"
+    );
+}
+
+/// A build that fails in the installed tree after it was given the
+/// shipped file back, and after it compiled the patched library and used
+/// the file up: the undo takes everything the build did with it, and the
+/// gem is exactly as installed (#2106).
+#[test]
+#[ignore = "host capstone: compiles a C extension with the real ruby/gem toolchain; \
+            the unpinned `test` job skips it, the pinned-Ruby e2e leg runs it via --ignored"]
+fn a_failed_build_takes_the_shipped_file_it_was_given_away_again() {
+    let Some(abi) = toolchain() else {
+        return;
+    };
+    let fx = WrapGem::new(&abi, ONCE_ONLY_EXTCONF);
+    let installed = walk_files(&fx.gem_dir);
+    let extensions = walk_files(&fx.home.join("extensions"));
+
+    let (code, stdout, stderr) = fx.run(&["apply", "--json", "--offline"]);
+    assert_ne!(code, 0, "the in-place build fails:\n{stdout}\n{stderr}");
+    let env = parse_json_envelope(&stdout);
+    let event = common::envelope::event_for(&env, WRAP_PURL);
+    assert!(
+        event["error"].as_str().is_some_and(|e| {
+            e.starts_with("native_extension_build_failed:")
+                && e.contains("this tree was built before")
+        }),
+        "the build got as far as the script's last line, so it was given the file:\n{stdout}"
+    );
+    assert_eq!(fx.value(), "1");
+    assert_tree(&fx.gem_dir, &installed, "after the failed apply");
+    assert_tree(
+        &fx.home.join("extensions"),
+        &extensions,
+        "after the failed apply",
+    );
+    assert!(!fx.home.join(".socket-patch-build").exists());
+    assert!(!vex_attests(|args| fx.run(args)));
 }
 
 /// Without the source gem nothing says which files the build makes, so

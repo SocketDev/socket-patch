@@ -17,8 +17,9 @@
 //! restore over `input/` and expects `expected/` to be the whole restored
 //! `socket-patch.sbt` (absent = deleted).
 //!
-//! Every wiring case that creates `socket-patch.sbt` is also restored: its
-//! confirmed pins out again must delete the file (no other bytes changed).
+//! Every wiring case that creates `socket-patch.sbt` is also restored: with
+//! the pins discovery finds in the wired tree out again, the tree is
+//! `input/` (the file deleted, a `pom.xml` the run wired too put back).
 //!
 //! This harness is separate from the TS-authored `redirect_golden.rs`; the
 //! Socket backend port of these cases is a follow-up.
@@ -152,12 +153,22 @@ fn run(case: &Path) -> (BTreeMap<String, String>, RewriteResult) {
     (files, result)
 }
 
-async fn restore(input: &BTreeMap<String, String>, pins: &[HostedPin]) -> Option<String> {
+/// The tree after the upstream restore of `pins` over `input`. With no
+/// pins given, of the pins discovery finds there, in every file that wires
+/// them, as `rollback` restores them.
+async fn restore(
+    input: &BTreeMap<String, String>,
+    pins: Option<Vec<HostedPin>>,
+) -> BTreeMap<String, String> {
     let tmp = tempfile::tempdir().unwrap();
     write_tree(tmp.path(), input);
+    let pins = match pins {
+        Some(pins) => pins,
+        None => HostedPin::all(&socket_patch_core::vex::discover_patched_refs(tmp.path()).await),
+    };
     let out = restore_upstream(
         tmp.path(),
-        pins,
+        &pins,
         &RestoreOptions {
             offline: true,
             ..Default::default()
@@ -165,13 +176,7 @@ async fn restore(input: &BTreeMap<String, String>, pins: &[HostedPin]) -> Option
     )
     .await;
     assert_eq!(out.refused().count(), 0, "restore refused: {:?}", out.pins);
-    let after = tree(tmp.path());
-    for (rel, text) in input {
-        if rel != HOSTED_FILE {
-            assert_eq!(after.get(rel), Some(text), "restore touched {rel}");
-        }
-    }
-    after.get(HOSTED_FILE).cloned()
+    tree(tmp.path())
 }
 
 async fn run_restore_case(case: &Path) {
@@ -186,11 +191,11 @@ async fn run_restore_case(case: &Path) {
             files: vec![HOSTED_FILE.to_string()],
         })
         .collect();
-    let left = restore(&input, &pins).await;
-    let got: BTreeMap<String, String> = left
-        .into_iter()
-        .map(|t| (HOSTED_FILE.to_string(), t))
-        .collect();
+    let mut after = restore(&input, Some(pins)).await;
+    let got: BTreeMap<String, String> = after.remove_entry(HOSTED_FILE).into_iter().collect();
+    let mut rest = input;
+    rest.remove(HOSTED_FILE);
+    assert_eq!(after, rest, "{}: restore touched more", case.display());
     expect_tree(case, &got);
 }
 
@@ -295,30 +300,17 @@ async fn redirect_sbt_golden_cases_match() {
             );
         }
 
-        // A run that created the file is undone by restoring its pins.
+        // A run that created the file is undone by restoring the pins
+        // discovery finds in what it wrote: the tree is the input again,
+        // whichever other build's file (a `pom.xml`) the run wired too.
         if let (None, Some(_)) = (files.get(HOSTED_FILE), result.files.get(HOSTED_FILE)) {
-            let mut wired = tree(&case.join("input"));
+            let input = tree(&case.join("input"));
+            let mut wired = input.clone();
             wired.extend(result.files.clone());
-            let overrides: Vec<DepOverride> =
-                serde_json::from_value(read_json(&case.join("overrides.json"))).unwrap();
-            let pins: Vec<HostedPin> = overrides
-                .iter()
-                .filter(|o| result.confirmed_sbt_uuids.contains(&o.patch_uuid))
-                .map(|o| HostedPin {
-                    purl: format!(
-                        "pkg:maven/{}/{}@{}",
-                        o.namespace.as_deref().unwrap_or_default(),
-                        o.name,
-                        o.version
-                    ),
-                    uuid: o.patch_uuid.clone(),
-                    files: vec![HOSTED_FILE.to_string()],
-                })
-                .collect();
             assert_eq!(
-                restore(&wired, &pins).await,
-                None,
-                "{}: restoring every pin must delete {HOSTED_FILE}",
+                restore(&wired, None).await,
+                input,
+                "{}: restoring every pin must put the input back",
                 case.display()
             );
         }

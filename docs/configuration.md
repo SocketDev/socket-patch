@@ -55,6 +55,14 @@ Empty environment values are treated as unset.
   bundle on Linux). `SSL_CERT_FILE` / `SSL_CERT_DIR` replace the system store
   with the named bundle or directory, which is how to trust a TLS-inspecting
   proxy's private CA. Certificate verification is never disabled.
+- `SOCKET_PATCH_MIRROR_URL` (experimental) names a mirror of Socket's patch
+  server, such as an Artifactory remote repository, for builds that may only
+  fetch from an internal host. Hosted mode then pins patches under that base,
+  and every command reads the pins there. Set it wherever Socket Patch runs
+  for the project; a repository file cannot set it. It is for Socket
+  Enterprise customers and may change in any release: ask Socket for the
+  setup guide. The rules are in the
+  [CLI contract](../crates/socket-patch-cli/CLI_CONTRACT.md#patch-mirror-experimental).
 - `--offline` prohibits network access. `scan` and `get` require the patch API
   and refuse offline operation. Other commands can use locally available state;
   missing records or artifacts can still prevent completion.

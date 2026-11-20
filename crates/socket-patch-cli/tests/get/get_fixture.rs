@@ -298,6 +298,7 @@ pub fn engine_params(root: &Path) -> DownloadParams {
         ecosystems: None,
         persist_blobs: true,
         patch_server_url: None,
+        patch_mirror_url: None,
         all_releases: true,
     }
 }
