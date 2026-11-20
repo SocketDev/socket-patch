@@ -114,6 +114,18 @@
 //! (static.rust-lang.org), and the crates it builds its own tools from
 //! (static.crates.io).
 //!
+//! # The hub without a cargo config
+//!
+//! A third flow ([`hosted_from_cargo_without_config`]) runs hosted mode on
+//! the hub as the rules_rust README has it, which names no `cargo_config`
+//! ([`open_readme_hub`]). cargo-bazel then hands no cargo config of the
+//! checkout to its cargo, so the registry that hosted mode defines in
+//! `.cargo/config.toml` and names in `Cargo.toml` is one that cargo has
+//! never heard of. The flow holds what the release does there: the scan
+//! exits 0 and reports the crate as hosted, and the next `bazel build`
+//! fails in the hub with cargo's `registry index was not found in any
+//! configuration`.
+//!
 //! # Known gaps
 //!
 //! Two assertions of the vendored flow hold what the release does with
@@ -193,8 +205,20 @@ const CONFIG: &str = ".cargo/config.toml";
 const LOCK: &str = "Cargo.lock";
 const MANIFEST: &str = "Cargo.toml";
 const BAZEL_LOCK: &str = "MODULE.bazel.lock";
+/// The file that declares the hub, and the line of it that names the cargo
+/// config. Every era's hub has that line; without it the hub is the one of
+/// the rules_rust README.
+const MODULE: &str = "MODULE.bazel";
+const HUB_CONFIG: &str = "    cargo_config = \"//:.cargo/config.toml\",\n";
 /// How a `Cargo.lock` names crates.io, with or without a mirror.
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+/// Where a cargo home keeps what cargo has read of the sparse index of
+/// crates.io: the directory cargo names so before 1.85 and the one from 1.85
+/// on (the cargo of rules_rust 0.56.0 is 1.83.0, that of 0.75.0 is 1.99.1).
+const CRATES_IO_INDEXES: [&str; 2] = [
+    "registry/index/index.crates.io-6f17d22bba15001f",
+    "registry/index/index.crates.io-1949cf8c6b5b557f",
+];
 /// What the fixture's lock holds as the checksum of the crate: the sum of
 /// no file.
 const PLACEHOLDER: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -442,10 +466,11 @@ fn grant(standin: &StandIn, upstream: &Package, patch: &Patched, served: &[u8]) 
 /// `CARGO_HOME` is `home`, a directory of the test: under Bzlmod rules_rust
 /// 0.56.0 runs its cargo with the cargo home of the environment, and a
 /// flow says which one that is. rules_rust 0.75.0 gives its cargo a home
-/// inside the output base, which `CARGO_BAZEL_ISOLATED` states.
-fn cargo_env(home: &Path) -> Vec<(String, String)> {
-    let home = home.to_string_lossy();
-    let pins = [("CARGO_HOME", &*home), ("CARGO_BAZEL_ISOLATED", "true")];
+/// inside the output base when `isolated`, which `CARGO_BAZEL_ISOLATED`
+/// states, and runs it with `home` as well when not.
+fn cargo_env(home: &Path, isolated: bool) -> Vec<(String, String)> {
+    let (home, isolated) = (home.to_string_lossy(), isolated.to_string());
+    let pins = [("CARGO_HOME", &*home), ("CARGO_BAZEL_ISOLATED", &*isolated)];
     let owned = pins.map(|(name, value)| (name.to_string(), value.to_string()));
     owned.to_vec()
 }
@@ -462,11 +487,55 @@ fn cargo_home() -> tempfile::TempDir {
 fn open(test: &str) -> Option<(tempfile::TempDir, Cell, StandIn, Package)> {
     let mut cell = Cell::open(test, &FIXTURE)?;
     let home = cargo_home();
-    cell.repo_env = cargo_env(home.path());
+    cell.repo_env = cargo_env(home.path(), true);
     let upstream = Package::upstream();
     let standin = registry(&upstream);
     cell.write(LOCK, lock_pinning(&upstream));
     cell.write(CONFIG, mirror_config(&standin.origin()));
+    Some((home, cell, standin, upstream))
+}
+
+/// [`open`] for the hub of the rules_rust README: the `MODULE.bazel` of the
+/// era without the line that names a cargo config, in a checkout that has
+/// none.
+///
+/// The crate still comes from the stand-in, the way the README says a
+/// private registry is reached: `CARGO_BAZEL_ISOLATED=false` has the hub run
+/// its cargo with the cargo home of the machine, here the one of the test,
+/// and that home's `config.toml` names the mirror. cargo-bazel itself reads
+/// no cargo config the hub does not name, so for a crate the lock takes
+/// from crates.io it goes by what the cargo home keeps of that index: the
+/// `config.json`, for the download URL, and with rules_rust 0.56.0 the
+/// crate's file of the index as well. A cargo behind a mirror fetches
+/// neither. The home holds both, as a home does whose cargo has fetched the
+/// crate from crates.io itself, with the stand-in as the download host.
+fn open_readme_hub(test: &str) -> Option<(tempfile::TempDir, Cell, StandIn, Package)> {
+    let mut cell = Cell::open(test, &FIXTURE)?;
+    let home = cargo_home();
+    cell.repo_env = cargo_env(home.path(), false);
+    let upstream = Package::upstream();
+    let standin = registry(&upstream);
+    let origin = standin.origin();
+    cell.write(LOCK, lock_pinning(&upstream));
+    let module = std::fs::read_to_string(cell.path(MODULE)).expect(MODULE);
+    cell.write(MODULE, module.replace(HUB_CONFIG, ""));
+    let keep = |rel: &str, bytes: &[u8]| {
+        let path = home.path().join(rel);
+        std::fs::create_dir_all(path.parent().expect("a file path")).expect("create the parent");
+        std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    };
+    keep("config.toml", mirror_config(&origin).as_bytes());
+    let index = json!({ "dl": format!("{origin}/{FILES}/crates"), "api": origin }).to_string();
+    // The crate's file of the index as cargo caches it: the version of the
+    // cache format (3) and of the index schema (2), what the server said of
+    // the file's age, and per release its version and its line of the file.
+    let line = upstream.index_line();
+    let cached = format!("etag: \"run\"\0{VERSION}\0{}\0", line.trim_end());
+    let cached = [&[3][..], &2u32.to_le_bytes(), cached.as_bytes()].concat();
+    for directory in CRATES_IO_INDEXES {
+        keep(&format!("{directory}/config.json"), index.as_bytes());
+        keep(&format!("{directory}/.cache/{}", index_path()), &cached);
+    }
     Some((home, cell, standin, upstream))
 }
 
@@ -614,7 +683,7 @@ fn second_machine(
         Some(cell)
     };
     let home = cargo_home();
-    twin.repo_env = cargo_env(home.path());
+    twin.repo_env = cargo_env(home.path(), true);
     let other = registry(upstream);
     twin.write(CONFIG, mirror_config(&other.origin()));
     grant(&other, upstream, second, served);
@@ -806,7 +875,7 @@ fn hosted_from_cargo_with_config() {
     // file of a crate the lock pins while its home holds one.
     other.serve(1, &second.entry, tampered.index_line().as_bytes());
     let third_home = cargo_home();
-    twin.repo_env = cargo_env(third_home.path());
+    twin.repo_env = cargo_env(third_home.path(), true);
     let asked = other.asked(&second.entry);
     refuses(&twin, "changed between lock files");
     assert!(
@@ -1033,14 +1102,72 @@ fn vendored_from_cargo_with_config() {
     );
 }
 
+/// The flow of the hub without a cargo config (module docs).
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn hosted_from_cargo_without_config() {
+    let test = "cargo::hosted_from_cargo_without_config";
+    let started = Instant::now();
+    let Some((_home, cell, standin, upstream)) = open_readme_hub(test) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let origin = standin.origin();
+    let patch = Patched::new();
+    grant(&standin, &upstream, &patch, &patch.package.crate_file);
+
+    // (a) The unpatched build, with the upstream crate from the stand-in.
+    let before = builds_upstream(&cell, &standin, &upstream);
+
+    // (b) The one command of hosted mode. It reports the crate as hosted
+    // and rewrites the three files, as on a hub that names the config. The
+    // config is new: the checkout had none, and it holds the patch registry
+    // alone.
+    let scan = socket_patch(&cell, &standin, &["scan", "--mode", "hosted", "--yes"]);
+    let pinned = cell.pinned_by(&scan, PURL, &patch.uuid, &before, &[CONFIG, LOCK, MANIFEST]);
+    let (index, registry) = (format!("sparse+{origin}{}/", patch.index), patch.registry());
+    let defined = format!("[registries.{registry}]\nindex = \"{index}\"\n");
+    assert_eq!(text(&pinned, CONFIG), defined, "{test}: {CONFIG}");
+    let named = format!("registry = \"{registry}\"");
+    assert!(
+        text(&pinned, MANIFEST).contains(&named),
+        "{test}: {MANIFEST}"
+    );
+
+    // (c) The same build fails: the hub hands its cargo no config, so the
+    // registry the manifest names is defined nowhere cargo looks.
+    let build = cell.bazel("build", &[CONSUMER]);
+    let undefined = format!("registry index was not found in any configuration: `{registry}`");
+    assert!(
+        !build.ok() && build.stderr().contains(&undefined),
+        "{test}: the build after `scan --mode hosted` did not fail with {undefined:?}:\n{}",
+        build.dump()
+    );
+    assert_eq!(
+        standin.asked(&patch.entry),
+        0,
+        "{test}: cargo read the patch index"
+    );
+
+    println!(
+        "{test}: Bazel {release} built {:?} on the hub of the rules_rust README; `scan --mode \
+         hosted` exited 0, reported the crate applied and rewrote {:?}; the next `bazel build` \
+         failed with {undefined:?}; {:?}",
+        upstream.marker,
+        [CONFIG, LOCK, MANIFEST],
+        started.elapsed()
+    );
+}
+
 /// Without a Bazel, what stays fixed now that no checksum is committed: the
 /// fixture's directories and the legs of its workflow are those of its
 /// table; the fixture's lock holds the one entry a test pins, with the
 /// placeholder, and pinning changes nothing else; two runs serve two
 /// upstream crate files; the fixture depends on the crate under the names
 /// written out above, and commits no cargo config; every era's hub names
-/// the config a test writes and has no cargo-bazel lock; and crates.io
-/// cannot hold the name.
+/// the config a test writes, has no cargo-bazel lock, and is the hub of the
+/// rules_rust README but for that one line; and crates.io cannot hold the
+/// name.
 #[test]
 fn a_test_pins_the_one_crate_of_the_fixture_lock() {
     FIXTURE.check();
@@ -1068,6 +1195,11 @@ fn a_test_pins_the_one_crate_of_the_fixture_lock() {
              cargo_lockfile = \"//:{LOCK}\",\n    manifests = [\"//:{MANIFEST}\"],\n)\n"
         );
         assert!(module.contains(&hub), "{era}: no\n{hub}in\n{module}");
+        // Without that one line it is the hub of the rules_rust README.
+        let readme = "crate.from_cargo(\n    name = \"crates\",\n    cargo_lockfile = \
+                      \"//:Cargo.lock\",\n    manifests = [\"//:Cargo.toml\"],\n)\n";
+        let without = module.replace(HUB_CONFIG, "");
+        assert!(without.contains(readme), "{era}: no\n{readme}in\n{without}");
     }
 
     assert!(NAME.len() > 64, "crates.io can hold {NAME}");
