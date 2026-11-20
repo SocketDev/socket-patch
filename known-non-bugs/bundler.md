@@ -195,3 +195,8 @@ Documented limitations and verified false positives. One bullet each. Search thi
 - `redirect_gem_no_checksums_section` says "bundler < 2.6 does not write one" on a lock Bundler 2.6.9 wrote (2.6 writes the section only on request). Imprecise, but its remedy (`bundle lock --add-checksums`, re-scan) works, and a later rollback puts the upstream checksums back (2026-11-19).
 - A project-local `mirror.all` under hosted mode: refused with a remedy that names the scoped mirror key (#681 fixed) (2026-11-19).
 - `eval_gemfile`d declaration of a patched gem: hosted and vendored refuse it with the text #2151 already covers; agent mode patches it (2026-11-19).
+- Hosted / vendored scan refuses nokogiri on a default Bundler 2.5+ / 4.x lock (8 platform entries) when the patch has prebuilds for fewer: documented (`redirect_gem_platform_unsupported`, `vendor_prebuilt_platform_pending`); `bundle lock --remove-platform <platforms>` then a re-scan works (2026-11-20).
+- Vendored scan refuses a lock holding `nokogiri (1.18.10)` beside its platform builds (Bundler 4.1's default lock, or `--add-platform ruby`): documented `platform_gem_unsupported`; `bundle lock --remove-platform ruby` works on 2.5.22 and 4.1.0 (2026-11-20).
+- `bundle lock --add-platform` on a vendored platform gem fails in Bundler: documented (revert, add the platform, vendor again) (2026-11-20).
+- Agent scan against `tests/nokogiri/patch_service.rb` fails with "Blob not found on server": the stand-in serves no blobs (2026-11-20).
+- Hosted scan over a vendored platform gem is refused with a remedy (`remove` or `vendor --revert` first) (2026-11-20).
