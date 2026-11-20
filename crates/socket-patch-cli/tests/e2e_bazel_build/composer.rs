@@ -1,5 +1,5 @@
-//! Hosted and agent mode for a Composer package in a Bazel workspace that
-//! builds PHP with rules of its own.
+//! Hosted, agent and vendored mode for a Composer package in a Bazel
+//! workspace that builds PHP with rules of its own.
 //!
 //! No Bazel ruleset builds PHP or takes Composer packages, and the Bazel
 //! registry holds none. A PHP project under Bazel writes the few lines that
@@ -20,8 +20,15 @@
 //! fresh output base: hosted mode in the first two projects, where Bazel
 //! runs Composer on the lock that `socket-patch` rewrites, and agent mode
 //! in the third, where Bazel reads the files that `socket-patch` patches in
-//! place. Vendored mode is in no flow: it breaks the first two builds
-//! today. The harness builds `//:consumer`, so a test writes the root
+//! place. Vendored mode has two flows of its own, which their tests
+//! describe. In the first project it is declined, because the build would
+//! fail on the path it writes into the lock, and hosted mode patches the
+//! build in its place; with the flag that lifts the refusal the build does
+//! fail. In the third it is declined as well, and with the flag the build
+//! is the patched one once the developer has installed from the lock. The
+//! tests at the end that need no Bazel hold every command that would
+//! vendor to the refusal, and to the user's word, which alone lifts it.
+//! The harness builds `//:consumer`, so a test writes the root
 //! `BUILD.bazel` that points that label at the consumer of its project.
 //!
 //! - (a) `bazel build` and `bazel run //:consumer` print the unpatched
@@ -132,7 +139,8 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
 use crate::envelope::{codes_in, event_for, event_triples};
 use crate::harness::{
-    changed, fixture_path, Cell, Fixture, Ran, Release, StandIn, Tree, CONSUMER, NOTHING, REQUIRED,
+    cell_without_bazel, changed, fixture_path, Cell, Fixture, Ran, Release, StandIn, Tree,
+    CONSUMER, NOTHING, REQUIRED,
 };
 use crate::hosted_memory_common::hermetic::{self, Extra};
 use crate::hosted_memory_common::{read_tree, Patch, ORG};
@@ -189,6 +197,11 @@ const PRODUCT: &str = "pkg:composer/socketsecurity/bazel-fixture-app@1.0.0";
 const REFUSAL: &str = "The checksum verification of the file failed";
 /// The hosts a proxy is never asked for: a stand-in listens on loopback.
 const LOOPBACK: &str = "127.0.0.1,localhost";
+/// The code under which vendored mode declines a Composer project in a
+/// Bazel workspace, and the flag and the variable that lift it.
+const DECLINED: &str = "vendor_composer_bazel_workspace";
+const ALLOW: &str = "--allow-vendored-in-bazel";
+const ALLOW_ENV: &str = "SOCKET_ALLOW_VENDORED_IN_BAZEL";
 
 /// The two tools of the machine a flow runs: the program, the arguments
 /// that make it print its release, the text before the release, and the
@@ -579,7 +592,9 @@ impl Machine {
     fn composer(&self, test: &str, files: &[(&str, &[u8])], args: &[&str]) -> (Tree, String) {
         let project = tempfile::tempdir_in(self.root()).expect("a project directory");
         for (rel, bytes) in files {
-            std::fs::write(project.path().join(rel), bytes).expect("write a project file");
+            let path = project.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("a file path")).expect("create a parent");
+            std::fs::write(path, bytes).expect("write a project file");
         }
         let mut cmd = hermetic::tool_command("composer");
         hermetic::scrub_socket_vars(&mut cmd);
@@ -689,6 +704,17 @@ fn open(test: &str, project: &str, args: &[&str]) -> Option<Flow> {
 /// the patch server (a hosted pin is recognised by that origin) and as the
 /// registry `rollback` reads the upstream entry from.
 fn socket_patch(cell: &Cell, standin: &StandIn, project: &str, args: &[&str]) -> Ran {
+    socket_patch_with(cell, standin, project, args, &[])
+}
+
+/// [`socket_patch`] with the variables `more` set as well.
+fn socket_patch_with(
+    cell: &Cell,
+    standin: &StandIn,
+    project: &str,
+    args: &[&str],
+    more: &[(&str, &str)],
+) -> Ran {
     let origin = standin.origin();
     let packagist = format!("{origin}/{PACKAGIST}");
     let env = [
@@ -696,7 +722,7 @@ fn socket_patch(cell: &Cell, standin: &StandIn, project: &str, args: &[&str]) ->
         ("SOCKET_PACKAGIST_URL", packagist.as_str()),
     ];
     let args = [args, &["--cwd", project][..]].concat();
-    cell.socket_patch(&origin, &args, &env)
+    cell.socket_patch(&origin, &args, &[&env[..], more].concat())
 }
 
 /// What a command reports when its one event is about the package: that
@@ -1174,6 +1200,368 @@ fn agent_committed_vendor() {
         upstream.package.marker,
         started.elapsed()
     );
+}
+
+/// The one command of vendored mode.
+const VENDORED: [&str; 4] = ["scan", "--mode", "vendored", "--yes"];
+
+/// Vendored mode where it declines: `socket-patch <args>` in `project`
+/// ends with `code` and reports the package under [`DECLINED`], as the one
+/// event `action`, in words that name hosted mode and the flag. No file of
+/// the checkout differs from `before`. Gives the finished command.
+fn declines(
+    flow: &Flow,
+    project: &str,
+    args: &[&str],
+    code: i32,
+    action: &str,
+    before: &Tree,
+) -> Ran {
+    let (cell, standin) = (&flow.cell, &flow.standin);
+    let ran = socket_patch(cell, standin, project, args);
+    let (test, said) = (&cell.test, &ran.dump);
+    assert_eq!(ran.code, code, "{test}: {said}");
+    let declined = one(action, DECLINED);
+    assert_eq!(event_triples(&ran.envelope), declined, "{test}: {said}");
+    let event = event_for(&ran.envelope, PURL);
+    let why = event["error"].as_str().or(event["reason"].as_str());
+    let why = why.unwrap_or_default();
+    let named = ["`--mode hosted`", &format!("`{ALLOW}`")];
+    assert!(
+        named.iter().all(|part| why.contains(part)),
+        "{test}: {said}"
+    );
+    assert_eq!(changed(before, &cell.tree()), NOTHING, "{test}: {said}");
+    ran
+}
+
+/// Where vendored mode keeps the copy of the package for `patch`, as the
+/// lock names it: a path from the directory Composer runs in.
+fn copy_of(patch: &Patched) -> String {
+    format!(".socket/vendor/composer/{}/{NAME}@{VERSION}", patch.uuid)
+}
+
+/// Vendored mode where it goes on: `scan --mode vendored --yes <allow>` in
+/// `project` vendors `patch`. It keeps the patched package under the
+/// project's `.socket/vendor`, with its ledger, and rewrites the lock, and
+/// no other file of the checkout differs from `before`. The entry of the
+/// package has that copy as its `dist`, by the relative path of
+/// [`copy_of`] and under the id of the patch, to be copied and never
+/// linked, and no `source`; the rest of the lock says what it said. Gives
+/// the files of the checkout as the command left them.
+fn vendors(flow: &Flow, project: &str, patch: &Patched, before: &Tree, allow: &[&str]) -> Tree {
+    let (cell, standin) = (&flow.cell, &flow.standin);
+    let args = [&VENDORED[..], allow].concat();
+    let scan = socket_patch(cell, standin, project, &args);
+    let (test, said) = (&cell.test, &scan.dump);
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
+    let event = event_for(&scan.envelope, PURL);
+    assert_eq!(event["uuid"], patch.uuid.as_str(), "{test}: {said}");
+    let events = ["downloaded", "applied", "skipped"].map(|action| {
+        let code = if action == "skipped" {
+            "vendor_prebuilt_downloaded"
+        } else {
+            ""
+        };
+        (PURL.to_string(), action.to_string(), code.to_string())
+    });
+    assert_eq!(event_triples(&scan.envelope), events, "{test}: {said}");
+    let vendored = cell.tree();
+    let lock = lock_of(project);
+    let kept = format!("{project}/.socket/vendor");
+    let copy = format!("{project}/{}", copy_of(patch));
+    let mut written = vec![
+        format!("{kept}/composer/{}/socket-patch.vendor.json", patch.uuid),
+        format!("{copy}/composer.json"),
+        format!("{copy}/{FILE}"),
+        format!("{kept}/state.json"),
+        lock.clone(),
+    ];
+    written.sort();
+    assert_eq!(changed(before, &vendored), written, "{test}: {said}");
+    let patched = patch.package.source.as_bytes();
+    assert_eq!(vendored[&format!("{copy}/{FILE}")], patched, "{test}");
+
+    let parsed = |tree: &Tree| -> Value { serde_json::from_slice(&tree[&lock]).expect("a lock") };
+    let mut expected = parsed(before);
+    let entry = expected["packages"][0].as_object_mut().expect("an entry");
+    entry.remove("source");
+    entry["dist"] = json!({ "type": "path", "url": copy_of(patch), "reference": patch.uuid });
+    entry.insert("transport-options".to_string(), json!({ "symlink": false }));
+    assert_eq!(parsed(&vendored), expected, "{test}: {lock}");
+    vendored
+}
+
+/// Vendored mode in the project whose packages a repository rule
+/// installs. The lock would name the copy by a path from the directory
+/// Composer runs in, and the rule runs Composer in a repository of Bazel's
+/// that holds the two Composer files and nothing else. So the command
+/// declines: it writes nothing, and the build stays the one of before.
+/// Hosted mode, which the refusal names, patches that build. With the flag
+/// the command does what it did before the refusal was there: it reports
+/// the package vendored, the build fails, and `vex` attests the package
+/// all the same. `vendor --revert`, which takes no flag, puts every file
+/// back, and the build with them.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn vendored_repository_rule() {
+    let test = "composer::vendored_repository_rule";
+    let started = Instant::now();
+    let Some(flow) = open(test, API, &["--no-install"]) else {
+        return;
+    };
+    let (cell, standin, upstream) = (&flow.cell, &flow.standin, &flow.upstream);
+    let release = cell.release().to_string();
+    let patch = Patched::new();
+    grant(standin, upstream, &patch, &patch.package);
+
+    // (a) The unpatched build.
+    let before = cell.builds_unpatched(&upstream.package.marker);
+
+    // (b) The one command of vendored mode, in the project: declined, with
+    // nothing written and nothing of the patch fetched.
+    declines(&flow, API, &VENDORED, 1, "failed", &before);
+    assert_eq!(standin.asked(&patch.route), 0, "{test}");
+
+    // (c) The same build passes, on the upstream package.
+    cell.builds_patched(&before, &upstream.package.marker);
+
+    // The remedy the refusal names: hosted mode patches the build, and its
+    // undo puts every file back.
+    let pinned = pins(&flow, API, &patch, &before);
+    cell.builds_patched(&pinned, &patch.package.marker);
+    let undo = socket_patch(cell, standin, API, &["rollback", "--yes"]);
+    cell.undone(&undo, "rolledBack", &before, &upstream.package.marker);
+
+    // With the flag the package is vendored, and the same build fails:
+    // Composer finds no copy where the rule runs it.
+    vendors(&flow, API, &patch, &before, &[ALLOW]);
+    let build = cell.bazel("build", &[CONSUMER]);
+    assert!(!build.ok(), "{test}: the build passed:\n{}", build.dump());
+    let copy = copy_of(&patch);
+    let missing = format!("Source path \"{copy}\" is not found for package {NAME}");
+    // Composer breaks the message into lines of its console's width, inside
+    // a word too, so the two are compared without white space.
+    let squeezed = |text: &str| text.split_whitespace().collect::<String>();
+    assert!(
+        squeezed(&build.stderr()).contains(&squeezed(&missing)),
+        "{test}: the build did not fail with {missing:?}:\n{}",
+        build.dump()
+    );
+    attested(&flow, API);
+
+    // (d) The undo: every file is the one of before, and so is the build.
+    let undo = socket_patch(cell, standin, API, &["vendor", "--revert"]);
+    cell.undone(&undo, "removed", &before, &upstream.package.marker);
+
+    println!(
+        "{test}: Bazel {release} with {}: `scan --mode vendored --cwd {API}` declined \
+         ({DECLINED}), wrote nothing, and the build stayed {:?}; `scan --mode hosted` built \
+         {:?} and `rollback` restored all {} files; with {ALLOW} the package was vendored and \
+         the next build failed (Composer: {missing}) while `vex` attested the package; `vendor \
+         --revert` restored the files and the build; {:?}",
+        flow.tools,
+        upstream.package.marker,
+        patch.package.marker,
+        before.len(),
+        started.elapsed()
+    );
+}
+
+/// Vendored mode in the project that commits its `vendor/` tree. The
+/// command declines it like any project in a Bazel workspace: the tree
+/// does not show that no rule of the workspace runs Composer somewhere
+/// else as well. Here none does, and Composer runs in the project's
+/// directory, so with the flag the path the lock names leads to the copy.
+/// The build reads the committed tree and stays the unpatched one until
+/// the developer's `composer install` has copied the package from
+/// `.socket/vendor`; then it is the patched one.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn vendored_committed_vendor() {
+    let test = "composer::vendored_committed_vendor";
+    let started = Instant::now();
+    let Some(flow) = open(test, LEGACY, &[]) else {
+        return;
+    };
+    let (cell, standin, upstream) = (&flow.cell, &flow.standin, &flow.upstream);
+    let release = cell.release().to_string();
+    let patch = Patched::new();
+    grant(standin, upstream, &patch, &patch.package);
+
+    // (a) The unpatched build, from the committed tree.
+    let before = cell.builds_unpatched(&upstream.package.marker);
+
+    // (b) The one command of vendored mode, in the project: declined, with
+    // nothing written. With the flag it vendors the package.
+    declines(&flow, LEGACY, &VENDORED, 1, "failed", &before);
+    let vendored = vendors(&flow, LEGACY, &patch, &before, &[ALLOW]);
+
+    // (c) The same build passes and is the unpatched one: Bazel reads the
+    // tree, which no command has touched.
+    cell.builds_patched(&vendored, &upstream.package.marker);
+    // The developer installs from the lock, in the project's directory:
+    // Composer copies the package from `.socket/vendor`, with no request
+    // to a host, and the build is the patched one.
+    let prefix = format!("{LEGACY}/");
+    let project: Vec<(&str, &[u8])> = vendored
+        .iter()
+        .filter_map(|(path, bytes)| Some((path.strip_prefix(&prefix)?, bytes.as_slice())))
+        .collect();
+    let requests = standin.requests();
+    let (installed, said) = flow.machine.composer(test, &project, &["install"]);
+    assert_eq!(standin.requests(), requests, "{test}: {said}");
+    for (rel, bytes) in &installed {
+        cell.write(&format!("{LEGACY}/{rel}"), bytes);
+    }
+    let copied = format!("{LEGACY}/vendor/{NAME}/{FILE}");
+    let reinstalled = cell.tree();
+    assert_eq!(
+        reinstalled[&copied],
+        patch.package.source.as_bytes(),
+        "{test}: {said}"
+    );
+    cell.builds_patched(&reinstalled, &patch.package.marker);
+
+    // (d) The undo: the lock is the one of before and `.socket/vendor` is
+    // gone. The tree keeps what Composer installed, as in any project,
+    // until the developer installs again.
+    let undo = socket_patch(cell, standin, LEGACY, &["vendor", "--revert"]);
+    let said = &undo.dump;
+    assert_eq!(undo.code, 0, "{test}: {said}");
+    let reverted = cell.tree();
+    let lock = lock_of(LEGACY);
+    assert_eq!(reverted[&lock], before[&lock], "{test}: {said}");
+    let kept = format!("{LEGACY}/.socket/vendor/");
+    let left: Vec<&String> = reverted
+        .keys()
+        .filter(|path| path.starts_with(&kept))
+        .collect();
+    assert!(left.is_empty(), "{test}: {left:?}\n{said}");
+
+    println!(
+        "{test}: Bazel {release} with {}: `scan --mode vendored --cwd {LEGACY}` declined \
+         ({DECLINED}) and wrote nothing; with {ALLOW} it vendored the package into {} and the \
+         build stayed {:?}; after the developer's `composer install` it built {:?} from \
+         {copied}; `vendor --revert` restored {lock} and removed the copy; {:?}",
+        flow.tools,
+        copy_of(&patch),
+        upstream.package.marker,
+        patch.package.marker,
+        started.elapsed()
+    );
+}
+
+/// Without a Bazel, a PHP or a Composer: a checkout whose project [`API`]
+/// has a lock that pins the upstream package of a stand-in, with the files
+/// `marks` at the root of the checkout, which make it a Bazel workspace
+/// when one has a name of Bazel's, and a patch of the package that the
+/// stand-in grants.
+fn checkout(marks: &[&str]) -> (Flow, Patched) {
+    let cell = cell_without_bazel("9.3.2");
+    let (upstream, patch) = (Upstream::new(), Patched::new());
+    let standin = registry(&upstream);
+    grant(&standin, &upstream, &patch, &patch.package);
+    cell.write(".git/HEAD", "ref: refs/heads/main\n");
+    for mark in marks {
+        cell.write(mark, "");
+    }
+    cell.write(&format!("{API}/composer.json"), manifest(API));
+    let entry = metadata(&standin.origin(), &upstream);
+    let lock = json!({ "packages": [entry], "packages-dev": [] });
+    cell.write(&lock_of(API), format!("{lock:#}\n"));
+    let flow = Flow {
+        machine: Machine::new(&standin),
+        cell,
+        standin,
+        upstream,
+        tools: String::new(),
+    };
+    (flow, patch)
+}
+
+/// Without a Bazel: in a Bazel workspace every command that would vendor
+/// the package declines the project and writes nothing: the scan, `get`,
+/// `vendor` for a patch the manifest records and, where the package is
+/// pinned hosted, the scan that would take the pin over and the `vendor`
+/// that would eject it, so the pin stays. A dry run of the scan names the
+/// refusal and passes; one of `vendor` fails as its run does. No command
+/// fetches the patched archive.
+#[test]
+fn every_command_that_would_vendor_declines_a_project_in_a_bazel_workspace() {
+    let (flow, patch) = checkout(&["MODULE.bazel"]);
+    let (cell, standin) = (&flow.cell, &flow.standin);
+    let before = cell.tree();
+    let get = ["get", PURL, "--mode", "vendored", "--yes"];
+    let dry_run = [&VENDORED[..], &["--dry-run"]].concat();
+    declines(&flow, API, &VENDORED, 1, "failed", &before);
+    declines(&flow, API, &get, 1, "failed", &before);
+    declines(&flow, API, &dry_run, 0, "skipped", &before);
+
+    let record = ["get", PURL, "--save-only", "--yes"];
+    let saved = socket_patch(cell, standin, API, &record);
+    assert_eq!(saved.code, 0, "{}", saved.dump);
+    let vendor = [["vendor", "--yes"], ["vendor", "--dry-run"]];
+    for vendor in &vendor {
+        declines(&flow, API, vendor, 1, "failed", &cell.tree());
+    }
+    std::fs::remove_dir_all(cell.path(&format!("{API}/.socket"))).expect("remove .socket");
+
+    // The eject is refused whole, before it restores a pin or asks the
+    // service for a record, and so is its dry run.
+    let pinned = pins(&flow, API, &patch, &before);
+    declines(&flow, API, &VENDORED, 1, "failed", &pinned);
+    for eject in &vendor {
+        let asked = standin.requests();
+        let eject = declines(&flow, API, eject, 1, "failed", &pinned);
+        assert_eq!(standin.requests(), asked, "{}", eject.dump);
+        let refused = &eject.envelope["error"]["code"];
+        assert_eq!(*refused, "eject_refused", "{}", eject.dump);
+        let why = event_for(&eject.envelope, PURL)["error"].as_str();
+        let kept = why.is_some_and(|why| why.starts_with("kept hosted: "));
+        assert!(kept, "{}", eject.dump);
+    }
+    assert_eq!(standin.asked(&patch.route), 0);
+}
+
+/// Without a Bazel: vendored mode goes on as before in a project that is
+/// in no Bazel workspace, and in one on the user's word, the flag or its
+/// variable. A later run without the flag passes and writes nothing: the
+/// lock already names the copy of that patch, so the run is in sync, and
+/// so is a scan that names no mode, which runs in vendored mode in a
+/// vendored project. `vendor --revert` takes no flag: it puts every file
+/// back.
+#[test]
+fn vendored_mode_goes_on_outside_bazel_and_on_the_users_word() {
+    let (flow, patch) = checkout(&["BUILD.bazel"]);
+    vendors(&flow, API, &patch, &flow.cell.tree(), &[]);
+
+    let (flow, patch) = checkout(&["WORKSPACE"]);
+    let (cell, standin) = (&flow.cell, &flow.standin);
+    let before = cell.tree();
+    let reverts = |why: &str| {
+        let undo = socket_patch(cell, standin, API, &["vendor", "--revert", "--yes"]);
+        assert_eq!(undo.code, 0, "{why}: {}", undo.dump);
+        assert_eq!(changed(&before, &cell.tree()), NOTHING, "{why}");
+    };
+    let by_variable = socket_patch_with(cell, standin, API, &VENDORED, &[(ALLOW_ENV, "1")]);
+    let said = &by_variable.dump;
+    assert_eq!(by_variable.code, 0, "{said}");
+    assert_eq!(by_variable.envelope["summary"]["applied"], 1, "{said}");
+    reverts(ALLOW_ENV);
+    let vendored = vendors(&flow, API, &patch, &before, &[ALLOW]);
+    for in_sync in [&VENDORED[..], &["scan", "--yes"]] {
+        let again = socket_patch(cell, standin, API, in_sync);
+        let said = &again.dump;
+        assert_eq!(again.code, 0, "{in_sync:?}: {said}");
+        assert_eq!(again.envelope["status"], "success", "{in_sync:?}: {said}");
+        let refused = said.contains(DECLINED);
+        assert!(!refused, "{in_sync:?}: {said}");
+        assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{in_sync:?}");
+    }
+    reverts(ALLOW);
 }
 
 /// Without a Bazel, a PHP or a Composer: the fixture's directories and the

@@ -421,6 +421,23 @@ pub struct GlobalArgs {
         value_parser = parse_bool_flag,
     )]
     pub gem_refresh_shared: bool,
+
+    /// Vendored mode (`vendor`, `scan`/`get --mode vendored`): write for a
+    /// package although the project is in a Bazel workspace, where the
+    /// build may not find the vendored copy. Vendored mode declines such
+    /// a package by default; today that is a Composer package
+    /// (`vendor_composer_bazel_workspace`), whose lock names the copy by a
+    /// path that a Bazel rule running `composer install` in another
+    /// directory does not find. Pass it when the build does find the
+    /// copy. Other subcommands accept it silently.
+    #[arg(
+        help_heading = GLOBAL_OPTIONS,
+        long = "allow-vendored-in-bazel",
+        env = "SOCKET_ALLOW_VENDORED_IN_BAZEL",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
+    pub allow_vendored_in_bazel: bool,
 }
 
 impl GlobalArgs {
@@ -742,8 +759,9 @@ pub(crate) fn socket_dir_of(manifest_path: &Path, cwd: &Path) -> PathBuf {
 
 /// Mirror the flags that core reads from the env (`SOCKET_OFFLINE`,
 /// `SOCKET_DEBUG`, `SOCKET_TELEMETRY_DISABLED`, `SOCKET_API_URL`,
-/// `SOCKET_PROXY_URL`) into it. Core's own parse of `SOCKET_OFFLINE` and
-/// `SOCKET_DEBUG` matches only `"1" | "true"`,
+/// `SOCKET_PROXY_URL`, `SOCKET_ALLOW_VENDORED_IN_BAZEL`) into it. Core's
+/// own parse of `SOCKET_OFFLINE` and `SOCKET_DEBUG` matches only
+/// `"1" | "true"`,
 /// and the telemetry kill-switch and endpoint resolvers never see the parsed
 /// flags: without the mirror `--offline` still sent telemetry, and an
 /// on-prem `--api-url` run sent it, token included, to `api.socket.dev`.
@@ -761,6 +779,9 @@ pub(crate) fn apply_env_toggles(common: &GlobalArgs) {
     }
     if common.no_telemetry {
         std::env::set_var("SOCKET_TELEMETRY_DISABLED", "1");
+    }
+    if common.allow_vendored_in_bazel {
+        std::env::set_var(socket_patch_core::vendor::refusals::ALLOW_IN_BAZEL_ENV, "1");
     }
     if let Some(url) = common.api_url.as_deref().filter(|s| !s.is_empty()) {
         std::env::set_var("SOCKET_API_URL", url);
@@ -803,6 +824,7 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_NO_GEM_NATIVE_REBUILD",
     "SOCKET_NO_GEM_INSTALL_REFRESH",
     "SOCKET_GEM_REFRESH_SHARED",
+    "SOCKET_ALLOW_VENDORED_IN_BAZEL",
 ];
 
 /// Every env var a subcommand-local flag binds (one per `env = "..."`
@@ -877,6 +899,7 @@ impl Default for GlobalArgs {
             no_gem_native_rebuild: false,
             no_gem_install_refresh: false,
             gem_refresh_shared: false,
+            allow_vendored_in_bazel: false,
         }
     }
 }
