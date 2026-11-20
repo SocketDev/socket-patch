@@ -1613,6 +1613,36 @@ async fn track_unstarted(
     track_patch_rollback_failed(code, error, rollback_run(args, 0), &[], telemetry).await;
 }
 
+/// The most patches a rollback's report hint names: past this the
+/// command no longer fits a line, and the run was not about one patch.
+const REPORT_HINT_MAX_PATCHES: usize = 3;
+
+/// The line a rollback of a few named patches ends with at a terminal:
+/// the `report` command for the patches it took off, ready to run. A
+/// patch is usually rolled back because it broke something, and by then
+/// the project no longer holds it, so only its UUID still names it.
+/// `None` when the run took off no patch, or more than a line can name.
+fn report_hint(patches: &[socket_patch_core::telemetry::PatchOutcome]) -> Option<String> {
+    let mut uuids: Vec<&str> = Vec::new();
+    for patch in patches.iter().filter(|p| p.outcome == "rolled_back") {
+        if !uuids.contains(&patch.uuid.as_str()) {
+            uuids.push(&patch.uuid);
+        }
+    }
+    if uuids.is_empty() || uuids.len() > REPORT_HINT_MAX_PATCHES {
+        return None;
+    }
+    Some(format!(
+        "Did {} break something? Tell Socket: socket-patch report {} --message \"what happened\"",
+        if uuids.len() == 1 {
+            "this patch"
+        } else {
+            "one of these patches"
+        },
+        uuids.join(" ")
+    ))
+}
+
 /// The patches a rollback's events name, as its telemetry reports them.
 /// The manifest cleanup's `removed` events are left out: they say a record
 /// was dropped, and the patch's own event already says what happened to
@@ -3075,6 +3105,21 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 }
             }
 
+            // Someone at a terminal who named the patches to take off is
+            // told how to report them. Never a dry run, `--json`,
+            // `--silent`, a pipe or an agent's terminal.
+            if success
+                && !args.targets.is_empty()
+                && !args.common.dry_run
+                && !args.common.json
+                && !args.common.silent
+                && crate::ui::attended(crate::ui::Stream::Stdout)
+            {
+                if let Some(hint) = report_hint(&reported_patches) {
+                    println!("\n{}", crate::ui::dim(&hint, crate::ui::stdout_color()));
+                }
+            }
+
             let run = rollback_run(&args, rolled_back_total);
             if success {
                 track_patch_rolled_back(run, &reported_patches, &telemetry).await;
@@ -4493,6 +4538,50 @@ async fn rollback_maven_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The report hint names the patches a run took off, each once, and
+    /// stays quiet when there are none or too many to name on a line.
+    #[test]
+    fn report_hint_names_the_patches_taken_off() {
+        use socket_patch_core::telemetry::{PatchOutcome, MODE_HOSTED};
+        let patch = |uuid: &str, mode, outcome| PatchOutcome {
+            uuid: uuid.to_string(),
+            ecosystem: "npm".to_string(),
+            mode,
+            outcome,
+            code: None,
+        };
+        assert_eq!(report_hint(&[]), None);
+        assert_eq!(report_hint(&[patch("a", MODE_AGENT, "skipped")]), None);
+        assert_eq!(
+            report_hint(&[
+                patch("a", MODE_AGENT, "rolled_back"),
+                patch("a", MODE_HOSTED, "rolled_back"),
+                patch("b", MODE_AGENT, "failed"),
+            ])
+            .as_deref(),
+            Some(
+                "Did this patch break something? Tell Socket: socket-patch report a \
+                 --message \"what happened\""
+            )
+        );
+        assert_eq!(
+            report_hint(&[
+                patch("a", MODE_AGENT, "rolled_back"),
+                patch("b", MODE_AGENT, "rolled_back"),
+            ])
+            .as_deref(),
+            Some(
+                "Did one of these patches break something? Tell Socket: socket-patch report a b \
+                 --message \"what happened\""
+            )
+        );
+        let many: Vec<PatchOutcome> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|uuid| patch(uuid, MODE_AGENT, "rolled_back"))
+            .collect();
+        assert_eq!(report_hint(&many), None);
+    }
     use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
     use std::collections::HashMap;
 
