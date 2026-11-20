@@ -318,6 +318,10 @@ scala-cli resolve into (restart a running sbt server, Bloop or Metals after
 [ecosystem caveats](ecosystems.md) before using agent mode in shared environments.
 The removed `setup` command is covered in the [migration guide](migrating-to-v5.md).
 
+Agent mode is not supported for a package that Bazel builds: a Bazel build does not use
+the installed copies. Use hosted or vendored mode there (see
+[Bazel workspaces: what is supported](ecosystems.md#bazel-workspaces-what-is-supported)).
+
 ## Inspect, undo, and repair
 
 | Command | Effect |
