@@ -1342,8 +1342,11 @@ fn vendored_repository_rule() {
     assert!(!build.ok(), "{test}: the build passed:\n{}", build.dump());
     let copy = copy_of(&patch);
     let missing = format!("Source path \"{copy}\" is not found for package {NAME}");
+    // Composer breaks the message into lines of its console's width, inside
+    // a word too, so the two are compared without white space.
+    let squeezed = |text: &str| text.split_whitespace().collect::<String>();
     assert!(
-        build.stderr().contains(&missing),
+        squeezed(&build.stderr()).contains(&squeezed(&missing)),
         "{test}: the build did not fail with {missing:?}:\n{}",
         build.dump()
     );
