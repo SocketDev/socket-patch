@@ -1665,10 +1665,10 @@ mod tests {
                      `rm -f {} {} {} {} && bundle install`; another project that still pins \
                      the hosted patch of them then loads the upstream code, which \
                      `socket-patch scan` reports there.",
-                    shell_word(&home.join("specifications/rack-1.0.0.gemspec")),
-                    shell_word(&home.join("cache/rack-1.0.0.gem")),
-                    shell_word(&home.join("specifications/rexml-1.0.0.gemspec")),
-                    shell_word(&home.join("cache/rexml-1.0.0.gem")),
+                    shell_word(&home.join("specifications").join("rack-1.0.0.gemspec")),
+                    shell_word(&home.join("cache").join("rack-1.0.0.gem")),
+                    shell_word(&home.join("specifications").join("rexml-1.0.0.gemspec")),
+                    shell_word(&home.join("cache").join("rexml-1.0.0.gem")),
                 ),
             ]
         );

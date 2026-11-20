@@ -88,6 +88,16 @@ async fn mount_mocks(mock: &MockServer) {
         .await;
 }
 
+/// The manifest as the save line names it: the default `--cwd` (`.`) joined
+/// with the default manifest path, so `./.socket/manifest.json` on Unix and
+/// `.\.socket/manifest.json` on Windows.
+fn manifest_label() -> String {
+    std::path::Path::new(".")
+        .join(".socket/manifest.json")
+        .display()
+        .to_string()
+}
+
 /// Run `get <PURL> --save-only` against `mock`, returning `(code, stdout, stderr)`.
 fn run_get(cwd: &std::path::Path, uri: &str) -> (i32, String, String) {
     common::run(
@@ -122,7 +132,8 @@ async fn replacing_a_manifest_entry_is_reported_as_updated_only() {
     assert!(
         stderr.ends_with(&format!(
             "  [update] {PURL} (replacing 00000000)\n\
-             Saved 1 patch to ./.socket/manifest.json (1 updated).\n"
+             Saved 1 patch to {} (1 updated).\n",
+            manifest_label()
         )),
         "the replacement must be reported as one saved patch, an update, never also an add; \
          stdout={stdout}\nstderr={stderr}"
@@ -148,7 +159,7 @@ async fn a_brand_new_entry_is_still_reported_as_added() {
     assert_eq!(code, 0, "save-only add must succeed; stderr={stderr}");
 
     assert!(
-        stderr.ends_with("Saved 1 patch to ./.socket/manifest.json.\n"),
+        stderr.ends_with(&format!("Saved 1 patch to {}.\n", manifest_label())),
         "a new entry must be reported as one saved patch; stdout={stdout}\nstderr={stderr}"
     );
     assert!(
