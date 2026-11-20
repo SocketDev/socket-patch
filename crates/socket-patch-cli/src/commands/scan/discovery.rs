@@ -1,6 +1,7 @@
 //! Discovery-side helpers for `scan`: lockfile / vendored-ledger crawl
 //! supplements, update detection against the existing manifest, vendor
-//! baseline pre-verification, and the table's vuln-ID helper.
+//! baseline pre-verification, and what each selected patch fixes and
+//! leaves unpatched.
 
 use futures_util::StreamExt;
 use socket_patch_core::api::client::hold_back_debug;
@@ -136,8 +137,8 @@ fn lockfile_only_packages<'a>(
 /// the comparison bridges the two by [`PurlKey`] (encoding, qualifiers,
 /// PyPI/NuGet name folding, composer release identity: the API may serve
 /// the padded `@3.0.2.0` for a lock's `3.0.2`). The ONE predicate behind the
-/// `notInstalled` flag, the `[NOT INSTALLED]` marker, the
-/// `package_not_installed` skip partition and the vendor baseline pre-check.
+/// `notInstalled` flag, the `package_not_installed` skip partition and the
+/// vendor baseline pre-check.
 pub(super) fn lockfile_only_contains(purls: &HashSet<PurlKey>, api_purl: &str) -> bool {
     purls.contains(&PurlKey::new(api_purl))
 }
@@ -180,7 +181,7 @@ pub(crate) struct LedgerSupplement {
 
 /// Vendored-ledger packages with no crawled counterpart: on a fresh clone
 /// the committed artifact IS the dependency, so these stay discoverable
-/// (updates[] detection, the table, and `scan --mode vendored` re-vendor/in-sync
+/// (updates[] detection, the report, and `scan --mode vendored` re-vendor/in-sync
 /// runs all keep working before any install). They are NOT "lockfile-only"
 /// — nothing needs installing; the artifact satisfies the lock. `state` is
 /// the ledger `run` already loaded (`vendor::load_state`).
@@ -450,7 +451,7 @@ pub(super) fn detect_updates(
     let mut updates = Vec::new();
     for pkg in packages {
         // The candidate is the top-ranked patch — the one the apply path
-        // resolves to, so `[UPDATE]` and `updates[]` track what scan
+        // resolves to, so the newer-patches line and `updates[]` track what scan
         // installs. One divergence: the batch response omits `publishedAt`,
         // so on a merge-status + severity tie this falls to the tier/uuid
         // tiebreaks where apply (by-package shape) uses the date.
@@ -510,62 +511,6 @@ pub(super) fn detect_updates(
         });
     }
     updates
-}
-
-/// The scan table's VULNERABILITIES data for one package, built from the
-/// batch results (see [`collect_vuln_ids`]).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(super) struct VulnIds {
-    /// Ids to show first: every CVE, then the GHSAs that only ever appear
-    /// on patches listing no CVE (those cannot be aliases). Each group is
-    /// sorted.
-    pub primary: Vec<String>,
-    /// Every CVE and GHSA id (CVEs first, each group sorted), for `--verbose`.
-    pub all: Vec<String>,
-    /// How many distinct vulnerabilities the ids stand for, for `(+N)`.
-    pub count: usize,
-}
-
-/// A package's vulnerability ids across all its patches, sorted and
-/// deduped so the rendered table is stable.
-///
-/// A GHSA id is usually an alias of a CVE listed beside it, but the batch
-/// endpoint gives the two lists without their pairing, so listing both made
-/// `(+N)` count most vulnerabilities twice. Each vulnerability has at least
-/// one of the two ids, so the count is the larger of the distinct CVEs and
-/// the distinct GHSAs. That is exact when every GHSA has at most one CVE,
-/// and never counts an alias twice.
-pub(super) fn collect_vuln_ids(pkg: &BatchPackagePatches) -> VulnIds {
-    let mut cves: HashSet<&str> = HashSet::new();
-    let mut ghsas: HashSet<&str> = HashSet::new();
-    let mut ghsa_only: HashSet<&str> = HashSet::new();
-    let mut ghsa_beside_cve: HashSet<&str> = HashSet::new();
-    for patch in &pkg.patches {
-        cves.extend(patch.cve_ids.iter().map(String::as_str));
-        ghsas.extend(patch.ghsa_ids.iter().map(String::as_str));
-        let bucket = if patch.cve_ids.is_empty() {
-            &mut ghsa_only
-        } else {
-            &mut ghsa_beside_cve
-        };
-        bucket.extend(patch.ghsa_ids.iter().map(String::as_str));
-    }
-    // A GHSA listed beside a CVE on any patch may be its alias.
-    ghsa_only.retain(|g| !ghsa_beside_cve.contains(g));
-    let sorted = |set: &HashSet<&str>| {
-        let mut v: Vec<String> = set.iter().map(|s| (*s).to_string()).collect();
-        v.sort();
-        v
-    };
-    let cves = sorted(&cves);
-    let ghsas = sorted(&ghsas);
-    let primary: Vec<String> = cves.iter().cloned().chain(sorted(&ghsa_only)).collect();
-    let count = cves.len().max(ghsas.len()).max(primary.len());
-    VulnIds {
-        primary,
-        all: cves.into_iter().chain(ghsas).collect(),
-        count,
-    }
 }
 
 /// What the patch a run selected for one package fixes, and which of the
@@ -674,7 +619,9 @@ pub(crate) fn advisory_coverage(
         .collect()
 }
 
-fn package_coverage(
+/// [`advisory_coverage`] for one package. With no patch selected for it
+/// nothing is fixed, and every advisory its patches name is unfixed.
+pub(super) fn package_coverage(
     pkg: &BatchPackagePatches,
     selected: &[&PatchSearchResult],
 ) -> AdvisoryCoverage {
@@ -1776,24 +1723,6 @@ mod tests {
         );
     }
 
-    /// Build a single-patch package whose patch carries the given CVE and
-    /// GHSA identifier lists.
-    fn batch_with_vulns(purl: &str, cves: &[&str], ghsas: &[&str]) -> BatchPackagePatches {
-        BatchPackagePatches {
-            purl: purl.to_string(),
-            patches: vec![BatchPatchInfo {
-                uuid: "uuid".to_string(),
-                purl: purl.to_string(),
-                tier: "free".to_string(),
-                cve_ids: cves.iter().map(|s| (*s).to_string()).collect(),
-                ghsa_ids: ghsas.iter().map(|s| (*s).to_string()).collect(),
-                severity: None,
-                title: String::new(),
-                published_at: None,
-            }],
-        }
-    }
-
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_string()).collect()
     }
@@ -1937,127 +1866,6 @@ mod tests {
         assert_eq!(c.uuids, strs(&["s", "w"]));
         assert_eq!(c.fixes, strs(&["CVE-1"]));
         assert_eq!(c.unpatched, strs(&["CVE-2", "CVE-3"]));
-    }
-
-    #[test]
-    fn collect_vuln_ids_empty_when_no_vulns() {
-        let pkg = batch_with_vulns("pkg:npm/foo@1.0", &[], &[]);
-        assert_eq!(collect_vuln_ids(&pkg), VulnIds::default());
-    }
-
-    #[test]
-    fn collect_vuln_ids_lists_cves_before_ghsas_each_sorted() {
-        // Deliberately unsorted input; output must be CVEs (sorted) then
-        // GHSAs (sorted) so the rendered table column is deterministic.
-        let pkg = batch_with_vulns(
-            "pkg:npm/foo@1.0",
-            &["CVE-2024-2", "CVE-2024-1"],
-            &[
-                "GHSA-zzzz-zzzz-zzzz",
-                "GHSA-aaaa-aaaa-aaaa",
-                "GHSA-mmmm-mmmm-mmmm",
-            ],
-        );
-        let ids = collect_vuln_ids(&pkg);
-        assert_eq!(
-            ids.all,
-            strs(&[
-                "CVE-2024-1",
-                "CVE-2024-2",
-                "GHSA-aaaa-aaaa-aaaa",
-                "GHSA-mmmm-mmmm-mmmm",
-                "GHSA-zzzz-zzzz-zzzz",
-            ]),
-        );
-        // The GHSAs sit beside CVEs, so none is shown first; there are at
-        // least three vulnerabilities (one GHSA has no CVE of its own).
-        assert_eq!(ids.primary, strs(&["CVE-2024-1", "CVE-2024-2"]));
-        assert_eq!(ids.count, 3);
-    }
-
-    #[test]
-    fn collect_vuln_ids_drops_ghsa_aliases_of_listed_cves() {
-        // minimist: one CVE and its GHSA alias are one vulnerability.
-        let pkg = batch_with_vulns(
-            "pkg:npm/minimist@1.2.5",
-            &["CVE-2021-44906"],
-            &["GHSA-xvch-5gv4-984h"],
-        );
-        let ids = collect_vuln_ids(&pkg);
-        assert_eq!(ids.primary, strs(&["CVE-2021-44906"]));
-        assert_eq!(ids.all, strs(&["CVE-2021-44906", "GHSA-xvch-5gv4-984h"]));
-        assert_eq!(ids.count, 1);
-        // A GHSA-only advisory has no CVE to alias: it stays.
-        let pkg = batch_with_vulns("pkg:npm/x@1", &[], &["GHSA-r4q5-vmmm-2653"]);
-        let ids = collect_vuln_ids(&pkg);
-        assert_eq!(ids.primary, strs(&["GHSA-r4q5-vmmm-2653"]));
-        assert_eq!(ids.count, 1);
-    }
-
-    #[test]
-    fn collect_vuln_ids_one_cve_plus_alias_plus_ghsa_only() {
-        // CVE-1 (alias GHSA-a) and a GHSA-only GHSA-b on one patch: two
-        // vulnerabilities, not three.
-        let pkg = batch_with_vulns("pkg:npm/foo@1.0", &["CVE-1"], &["GHSA-a", "GHSA-b"]);
-        let ids = collect_vuln_ids(&pkg);
-        assert_eq!(ids.count, 2);
-        assert_eq!(ids.primary, strs(&["CVE-1"]));
-    }
-
-    #[test]
-    fn collect_vuln_ids_two_cves_one_ghsa_alias_plus_ghsa_only() {
-        // GHSA-a aliases both CVEs, GHSA-b has none. The batch data cannot
-        // tell this from two CVE/GHSA pairs, so the count is the lower
-        // bound (2) and every id is still listed under --verbose.
-        let pkg = batch_with_vulns(
-            "pkg:npm/foo@1.0",
-            &["CVE-1", "CVE-2"],
-            &["GHSA-a", "GHSA-b"],
-        );
-        let ids = collect_vuln_ids(&pkg);
-        assert_eq!(ids.count, 2);
-        assert_eq!(ids.all, strs(&["CVE-1", "CVE-2", "GHSA-a", "GHSA-b"]));
-        // On its own patch, the GHSA-only advisory is known and shown.
-        let pkg = BatchPackagePatches {
-            purl: "pkg:npm/foo@1.0".to_string(),
-            patches: vec![
-                patch_with("u1", &["CVE-1", "CVE-2"], &["GHSA-a"]),
-                patch_with("u2", &[], &["GHSA-b"]),
-            ],
-        };
-        let ids = collect_vuln_ids(&pkg);
-        assert_eq!(ids.primary, strs(&["CVE-1", "CVE-2", "GHSA-b"]));
-        assert_eq!(ids.count, 3);
-    }
-
-    #[test]
-    fn collect_vuln_ids_ghsa_beside_a_cve_elsewhere_is_not_ghsa_only() {
-        let pkg = BatchPackagePatches {
-            purl: "pkg:npm/foo@1.0".to_string(),
-            patches: vec![
-                patch_with("u1", &["CVE-1"], &["GHSA-a"]),
-                patch_with("u2", &[], &["GHSA-a"]),
-            ],
-        };
-        let ids = collect_vuln_ids(&pkg);
-        assert_eq!(ids.primary, strs(&["CVE-1"]));
-        assert_eq!(ids.count, 1);
-    }
-
-    #[test]
-    fn collect_vuln_ids_dedups_across_patches() {
-        // u2's GHSA is the alias of its one CVE, so it is not counted.
-        let pkg = BatchPackagePatches {
-            purl: "pkg:npm/foo@1.0".to_string(),
-            patches: vec![
-                patch_with("u1", &["CVE-2024-1"], &[]),
-                patch_with("u2", &["CVE-2024-1"], &["GHSA-aaaa-aaaa-aaaa"]),
-            ],
-        };
-        let ids = collect_vuln_ids(&pkg);
-        assert_eq!(ids.primary, strs(&["CVE-2024-1"]));
-        assert_eq!(ids.all, strs(&["CVE-2024-1", "GHSA-aaaa-aaaa-aaaa"]));
-        assert_eq!(ids.count, 1);
     }
 
     #[test]

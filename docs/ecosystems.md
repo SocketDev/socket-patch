@@ -533,8 +533,8 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
     them where they are installed.
   - **A hosted or vendored package disappears from `bun audit` and `bun outdated`.** Bun
     checks registry resolutions only, so it stops reporting the package at all, including
-    advisories the applied patch does not fix. `socket-patch scan` lists those as
-    `still unpatched`.
+    advisories the applied patch does not fix. `socket-patch scan` counts those on the
+    package's row (`2 unpatched`) and names them under `--verbose`.
 
   In vendored mode the patched tarballs are files in the repository, so a build that
   copies only `package.json` and `bun.lock` before `bun install` (a common Dockerfile
@@ -1363,7 +1363,12 @@ keyed by members inside a jar swap in the patch service's build of the whole jar
 they need network access (`jvm_agent_service_required` offline). Before the swap the
 service's jar is compared with the installed one member by member: everything the
 JVM would load outside the patched members and signature files must be identical, or
-that copy is left alone (`jvm_agent_service_jar_mismatch`, naming the members). Jars
+that copy is left alone (`jvm_agent_service_jar_mismatch`, naming the members). A
+signed jar the patch service signed again (a security provider such as Bouncy
+Castle's) may also differ in its manifest, as that signing leaves it: digest lines
+changed for the patched members and added for the others, and sections added for
+entries the manifest did not list. Nothing else of the manifest may differ; the CLI
+contract has the rule. Jars
 of up to 200,000 entries and 1 GiB inflated are handled; one past that is
 `jvm_jar_too_large`. The original is
 backed up under `.socket/jvm-originals/` and `rollback` restores from it. A `~/.m2`
@@ -1658,6 +1663,180 @@ the repository list, so it is left as a
   version, and always for a build whose projects cannot be read statically
   (`projectMatrix`, `crossProject`, a computed `Project(...)`). The note
   names the cause and its remedy.
+
+## Bazel workspaces: Maven
+
+A rules_jvm_external hub (`maven.install` in `MODULE.bazel`) builds the jars that its own lock,
+`maven_install.json`, names, each at the sha256 the lock holds. It reads no `pom.xml` and no
+Gradle file. A lock with `m2local` takes a jar that none of its repositories lists from the
+Maven local repository, at the lock's sha256 too. So a patch in a `pom.xml`, a Gradle build or
+an installed jar does not reach what Bazel builds.
+
+Hosted mode patches a pinned hub. The hub fetches each jar through a repository of its own,
+and Bazel's `override_repo` (7.4.0 and later) puts another repository in its place. `socket-patch
+get <purl> --mode hosted`, run at the Bazel root, appends one block to the root `MODULE.bazel`,
+after one blank line:
+
+```
+# >>> socket-patch: Maven patches for Bazel (managed block: socket-patch writes and removes it) >>>
+socket_patch_http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+socket_patch_maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+
+# pkg:maven/<group>/<artifact>@<version>, Socket patch <uuid>
+socket_patch_http_file(
+    name = "socket_patch_<repository>",
+    downloaded_file_path = "v1/<group path>/<artifact>/<version>/<artifact>-<version>.jar",
+    sha256 = "<sha256 of the patched jar>",
+    urls = ["<the patched jar on the Socket patch host>"],
+)
+
+# If Bazel stops at the next line ("does not generate repository"), the hub's lock no longer pins
+# <group>:<artifact> at <version>: run `socket-patch rollback pkg:maven/<group>/<artifact>@<version>`.
+# Do not change it to inject_repo(): the build would pass without the patch.
+override_repo(
+    socket_patch_maven,
+    <repository> = "socket_patch_<repository>",
+)
+# <<< socket-patch <<<
+```
+
+`<repository>` is the name the ruleset gives the artifact's repository: group, artifact and
+version joined by `_`, with `_` for each `.` and `-`. The label of `use_extension` is the one
+the checkout's own hub is made with. There is one entry per patch, from its `# pkg:maven/` line
+to the `)` of its `override_repo`, and the entries stand in the order of their repository names.
+
+- **What changes.** `MODULE.bazel` alone. The hub, `maven_install.json`, every label, the
+  artifact's dependencies and `MODULE.bazel.lock` stay as they are: a build under
+  `--lockfile_mode=error` passes, the ruleset's relock (`REPIN=1 bazel run @<hub>//:pin`) leaves
+  the lock as it is, and `bazel mod tidy` leaves the block as it is. Commit `MODULE.bazel`. The
+  URL holds the token of the patch, as a hosted pin in `pom.xml` does.
+- **The build.** Bazel downloads the patched jar from the Socket patch host and checks its
+  sha256. A machine that cannot reach the host, or a host that serves other bytes, fails the
+  build: it never falls back to the upstream jar.
+- **A project that Maven or Gradle builds too.** The same run pins both: `pom.xml` (or the
+  Gradle files) and `MODULE.bazel`. The patch counts as `applied` when either build took it,
+  and the warning below says when the Bazel build did not.
+- **The undo.** `socket-patch rollback` and `socket-patch remove` take the entry out, and with
+  the last entry the block and the blank line before it: the file is then byte for byte what it
+  was. A new block is written in the line break of the file, the more frequent one when the
+  file has both. `socket-patch list` shows the pin with `MODULE.bazel` as its file, and
+  `socket-patch vex` attests it while a pinned hub fetches the jar at the entry's version and
+  no rc file of the checkout switches the entry off, on whatever line, or cannot be read.
+- **A version bump of a patched artifact.** The relock passes. Then every Bazel command that
+  evaluates the hub stops at the entry's `override_repo(` with `does not generate repository
+  "<repository>", yet it is overridden via override_repo()`, until `socket-patch rollback
+  <purl>` has taken the entry out; the comment above that line says so. A dependency bot's bump
+  of a patched artifact stays red until then. `socket-patch vex` attests nothing for such an
+  entry. Bazel has nothing softer: with `inject_repo`, which its message suggests, the build
+  passes on the upstream jar.
+- **A block that was changed by hand**, also in its first line alone, is neither written to
+  nor trusted: the run gives `maven_bazel_unreadable` with its line, and `rollback`, `remove`
+  and `list` refuse (`hosted_wiring_contested`) and name `git checkout -- MODULE.bazel`. A
+  block is socket-patch's when it is, byte for byte, what socket-patch writes for the patches
+  it names, in one kind of line break.
+
+Everything is read from the checkout: the root `MODULE.bazel` and the files it includes, for
+the tags of the `maven` extension of `rules_jvm_external` under whatever name the file gives
+the ruleset and the extension (a hub is the `install`, `artifact` and `from_toml` tags of one
+`name`); the lock each hub names with `lock_file` (format 2 or 3, up to 16 MiB; each other file
+up to 1 MiB); `.bazeliskrc`, `.bazelversion`, `MODULE.bazel.lock` and `.bazelrc` with the files
+it imports (`import`, `try-import` and `try-import-if-bazel-version`, whose condition is not
+evaluated; a path under `%workspace%/`, or a relative one, which is read from the Bazel root).
+An rc file is read as Bazel reads one: a `\` before a line break joins two lines, a `#`
+outside quotes starts a comment, a word loses its quotes and the `\` before an escaped
+character, and the first word of a line is its command, not an option.
+Nothing is evaluated and no Bazel is run. When the project is in
+no Bazel workspace (the rule is under
+[Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore)), or no hub holds the artifact
+as a jar without a classifier at the patch's version and every hub was read, nothing is read
+further, said or written: the run is the one it was.
+
+A hosted run writes no entry where it cannot show from the checkout that the block works. It
+then gives one warning, which says why and that the Bazel build keeps the upstream jar. In a
+tree that only Bazel builds the patch is `skipped` (`redirect_unconfirmed`) and the warning
+stands in the place of `redirect_maven_no_pom`; beside a `pom.xml` or Gradle pin that landed,
+the patch is `applied` and the warning stands beside it. The exit code is 0 either way.
+
+The last sentence of the warning says what the block of the root holds for the jar, also for a
+project below the root, whose warning names the file as "the MODULE.bazel at the root":
+
+- nothing: "socket-patch wrote nothing to MODULE.bazel for it, so the Bazel build keeps the
+  upstream jar";
+- the entry of this patch, from an earlier run: that entry stays, the patch is `applied`, and
+  the warning ends "socket-patch left the entry that MODULE.bazel holds for it as it is". When
+  the reason is one that leaves an entry without effect (`maven_bazel_no_effect`: an rc file
+  that switches the block off, a `maven.override` of the jar), the patch is not `applied`, and
+  the warning goes on "and while that stands the entry has no effect: the Bazel build keeps
+  the upstream jar";
+- the entry of another patch of the same jar: it is not this run's to take out, and the
+  warning ends "socket-patch wrote nothing to MODULE.bazel for it: the entry of patch <id>
+  remains there, and where the block is in effect the Bazel build takes that patch's jar".
+
+| Code | When |
+|---|---|
+| `maven_bazel_not_at_root` | The project is below the root of its Bazel workspace. The block belongs in the root's `MODULE.bazel`: run the command there. |
+| `maven_bazel_not_pinned` | A hub has no `lock_file` (also one that only `maven.artifact` or `maven.from_toml` tags make): Bazel resolves its jars when it builds. Also beside a pinned hub that holds the artifact, because the hub without a lock may build the upstream jar. Give it a `lock_file` and pin it. |
+| `maven_bazel_unreadable` | Something could not be read with certainty: a `maven.install` whose `name` or `lock_file` is not a plain string, `install` tags of one hub that name different locks, a construct of `MODULE.bazel` the reader does not follow, a lock that is missing, empty, not format 2 or 3, larger than 16 MiB or no JSON, a `WORKSPACE` file that calls `maven_install` while Bazel may read it, a hub on a `use_extension` with `isolate`, an rc file that cannot be read (also one that an import takes from outside the workspace by a relative path, and one with a line whose reading Bazel's own source calls an oversight: a quote that is never closed, a `\` with nothing after it; the warning names the line), a `MODULE.bazel` that is a symbolic link, or a block that was changed by hand. |
+| `maven_bazel_release` | The Bazel or the ruleset release is not known to be one the block works with. Bazel: `.bazeliskrc` or `.bazelversion` names a release before 7.4.0, or neither names a release of three numbers and `MODULE.bazel.lock` is missing or older than the format Bazel 7.5.0 writes (add a `.bazelversion`). Ruleset: `MODULE.bazel.lock` does not hold the `source.json` of exactly one rules_jvm_external release (build once), that release is not one of 6.4 to 7.2 (update socket-patch), or the lock holds another release than `MODULE.bazel` now takes: an older one than its `bazel_dep` asks for, or any other than the one a `single_version_override` of the ruleset pins (build once). Versions are compared as Bazel compares them (`7.2` is below `7.2.1`). The `bazel_dep` line alone is not taken: Bazel can select a newer release, and a `single_version_override` with a version that the lock agrees with can pin an older one. An `archive_override`, `git_override`, `local_path_override` or `multiple_version_override` of the ruleset, and a `single_version_override` whose version is no plain string, leave the release unknown: the warning names the override's line. |
+| `maven_bazel_artifact` | The repository of this jar has no known name (a character other than letters, digits, `.`, `_` and `-` in its group, artifact or version), the lock lists no repository for the jar (it comes from the Maven local repository under `m2local`), or the patch comes without its served version or a sha256. |
+| `maven_bazel_no_effect` | The build would pass on the upstream jar with the block in place: the root has a `maven.override` for the artifact, or an rc file of the checkout names `--ignore_dev_dependency` without switching it off, or names `enable_bzlmod` other than switched on (`--noenable_bzlmod`, `--enable_bzlmod=false`, and Bazel's other words for it: `0`, `no`, `f`, `n`, in any case) while the checkout names no Bazel 9 or later. |
+| `maven_bazel_download` | An rc file of the checkout names a downloader config, `--repository_disable_download` or `--vendor_dir`: Bazel may not be able to download the patched jar. |
+
+Vendored and agent mode patch no hub, and leave the block as it is. A vendored run that takes
+the hosted pin of a `pom.xml` or Gradle build over (`vendor`, `scan` / `get --mode vendored`),
+and `vendor --revert`, keep the hub's entry: the Bazel build stays on the patched jar until
+`rollback` or `remove` takes the entry out. A `vendor` or an `apply` that has a Maven patch
+(also `get` and `scan` in those modes) reads the same files and says when a hub builds the
+artifact:
+
+- `maven_bazel_hub_unpatched`: a pinned hub fetches the jar of the artifact at the patch's
+  version, and the block holds no entry for it. One warning per artifact names the lock, the
+  hub, the file and line of its `maven.install`, and the hosted command that patches a pinned
+  hub. The events, the exit code and every file the command writes are those of the same run
+  without the workspace.
+- `maven_bazel_unreadable`: whether a hub builds the jar could not be told, for one of the
+  reasons above that concern reading the hubs. The warning names the file, the line and the
+  reason.
+- Nothing is said for a jar the block patches, under `--global`, and by a `vendor` whose
+  `--ecosystems` leaves Maven out.
+
+The Bazel release is the one that `.bazeliskrc` (`USE_BAZEL_VERSION`) or else `.bazelversion`
+at the Bazel root names, read as bazelisk reads them: the last `USE_BAZEL_VERSION` line counts,
+without the blanks around the name and the value, and an empty one leaves it to the first line
+of `.bazelversion`, taken as it is written. Only one release of three numbers (`9.3.2`) names a
+release: with `latest`, `9.x`, a release candidate, a fork's release, or a file that cannot be
+read, the `WORKSPACE` file counts as one Bazel may read, and the Bazel release is taken from
+`MODULE.bazel.lock`.
+
+Limits:
+
+- Not patched: a hub without a lock, a `maven_install` of a `WORKSPACE` file, Bazel before
+  7.4.0, rules_jvm_external before 6.4 or after 7.2, and a hub in vendored or agent mode. Each
+  is said as above.
+- Not looked at: a patch of a jar with a classifier, or of another packaging than `jar`. A lock
+  names the plain jar by group and artifact alone, so such a patch gets no entry and no word
+  about the hub: the run is the one without the workspace.
+- `socket-patch scan` does not find the artifacts of a hub yet: it pins a hub's jar when the
+  package is one it found elsewhere (a `pom.xml`, a Gradle build), and `get` takes any purl. It
+  does not take a stale entry out; `rollback` and `remove` do.
+- Not seen: a hub or a `maven.override` that another Bazel module declares (its hub takes the
+  root's entry where it pins the same version), a `maven_install` inside a function of a `.bzl`
+  file, a jar that reaches Bazel without a hub (`http_jar`, a checked-in jar, the target of a
+  `maven.override`), what the command line or an rc file outside the checkout tells Bazel
+  (`--ignore_dev_dependency`, `--override_repository`; the machine's and the home directory's
+  rc files, and one that an rc file imports by an absolute path), a second `override_repo` or
+  `inject_repo` of the same repository outside the block, and a `USE_BAZEL_VERSION` of the
+  environment or of the `.bazeliskrc` in the home directory, which a bazelisk asks before
+  `.bazelversion`.
+- A scanner that reads only `maven_install.json` keeps reporting the advisory: the lock names
+  the upstream version on purpose. The patch shows in `MODULE.bazel` and in `socket-patch vex`.
+- A vendored or agent `get` that fails before it patches anything says what it said before: in
+  a tree that only Bazel builds those are `vendor_jvm_shape_unsupported` and
+  `package_not_installed`. So does a `vendor` that is refused before it vendors anything (a
+  ledger that cannot be read, or one that git ignores).
+- `socket-patch vex` looks at the hub only for the block's entries: a patch that only the
+  `pom.xml` pin or a patched jar attests is attested, although the Bazel build does not have it.
 
 ## Cargo: shared registry cache
 
@@ -2662,9 +2841,123 @@ restores the original sources and build.
 ## Bazel workspaces: VEX
 
 `vex` and `--vex` read what socket-patch wrote and what the project's own package manager
-installed. They read no `MODULE.bazel`, `WORKSPACE` or BUILD file, so in a Bazel workspace a
-document says what was patched, and that is what Bazel builds only where Bazel builds from
-the files socket-patch rewrote. The two are tested to agree on real Bazel 9.3.2, 8.8.2 and
+installed. In a Bazel workspace (the Bazel root of the section on `.bazelignore` above) they
+also read `MODULE.bazel` and the files it includes, for the calls of three rulesets that hand
+a lock to Bazel:
+
+| Call | Files it names |
+|---|---|
+| aspect_rules_js `npm.npm_translate_lock` | `pnpm_lock` |
+| rules_python `pip.parse` | `requirements_lock`, `requirements_by_platform`, `requirements_darwin`, `requirements_linux`, `requirements_windows` |
+| rules_ruby `ruby.bundle_fetch` | `gemfile_lock`, `gemfile` |
+
+Each of them builds a package from what those files name, in a repository of Bazel's own,
+and never from `node_modules`, a virtualenv or a gem home. So two kinds of patch are in no
+build of Bazel's, and the document says of their package that it is `affected`, not that it
+is patched:
+
+- **A patch in the installed copy** (agent mode) of an npm, PyPI or RubyGems package, when
+  such a call names the project's own lock and that lock lists the package at that version
+  without naming the patch. The project's own lock is the one in the project's directory, or
+  the lock of a pnpm workspace above it that names that directory among its `importers`.
+  Measured for rules_js 3.6.0 on Bazel 9.3.2, 8.8.2 and 7.7.2: the build prints the
+  unpatched package before `scan --mode agent` and after it.
+- **A PyPI patch committed under `.socket/vendor`** (vendored mode), when such a call names
+  the file that points at the copy. rules_python 2.5.0-rc4 takes the path of the line for
+  the name of a project, and the build of everything the hub serves fails (same three
+  releases). A vendored npm tarball is built by rules_js and keeps its statement. So does a
+  vendored gem, for another reason: no build here has shown what rules_ruby does with one,
+  so nothing is said of it.
+
+Each advisory of such a patch gets a statement of the package's own with the status
+`affected`. It names that package alone under the product, and its `action_statement` says
+what Bazel builds the package from and what to run so that the build holds the patch. It
+has no `justification` and no `impact_statement`. Packages that share an advisory are not
+merged into one such statement, so each action statement is about one package; the
+`not_affected` statement of the advisory, for the packages that are patched, comes first:
+
+```json
+{
+  "vulnerability": { "name": "GHSA-xxxx-xxxx-xxxx", "aliases": ["CVE-2024-0001"] },
+  "timestamp": "2026-11-19T15:14:47Z",
+  "products": [
+    { "@id": "pkg:npm/shop@1.0.0", "subcomponents": [{ "@id": "pkg:npm/left-pad@1.3.0" }] }
+  ],
+  "status": "affected",
+  "action_statement": "Bazel builds this package from pnpm-lock.yaml (`npm.npm_translate_lock`, MODULE.bazel:6), which does not name Socket patch 7a11e000-...: the patch is only in the installed copy. Run `socket-patch scan --mode hosted` in the directory of that lock to pin the patch there. If what you ship is the installed tree and not what Bazel builds, pass `--no-bazel` (`--vex-no-bazel` on scan, apply and vendor)."
+}
+```
+
+The last sentence is for a repository that ships the installed tree (see `--no-bazel` below).
+For a vendored PyPI package the action statement does not have it, since the installed tree is
+not the patched one there either:
+
+```
+Bazel builds no package from the line of requirements.txt that points at the copy of Socket patch 7a11e000-... under .socket/vendor (`pip.parse`, MODULE.bazel:15): the build fails, or takes the registry's package. Run `socket-patch vendor --revert`, then `socket-patch scan --mode hosted`.
+```
+
+Both ways out are tested on real Bazel: after the hosted scan the build prints the patched
+package and the document says `not_affected`.
+
+A run tells a person the same in a warning (`vex_bazel_not_in_build`, one per package):
+
+```
+Warning: pkg:npm/left-pad@1.3.0: the VEX document says affected. Bazel builds this package from pnpm-lock.yaml (`npm.npm_translate_lock`, MODULE.bazel:6), which does not name Socket patch 7a11e000-...: the patch is only in the installed copy. Run `socket-patch scan --mode hosted` in the directory of that lock to pin the patch there. If what you ship is the installed tree and not what Bazel builds, pass `--no-bazel` (`--vex-no-bazel` on scan, apply and vendor).
+```
+
+Nothing is left out of the document for this reason, so the document is always written:
+`vex` exits 0 with it, also when every statement says `affected`, and `scan --vex`,
+`apply --vex` and `vendor --vex` write it and keep their exit code. No run reports such a
+package as patched. `vex --json` reports each `affected` statement as a `skipped` event with
+`errorCode: "vex_bazel_not_in_build"` and `details.status: "affected"`, beside the
+`verified` events of the `not_affected` ones. `summary.verified` counts only those, and the
+envelope's `status` is `partialFailure`, as for every run that leaves a patch unattested. A
+command run with `--vex` keeps its own status, and the `vex` object of its envelope says
+how many statements were written (`statements`) and how many of them say `affected`
+(`affected`, left out when none does), with the warning in `vex.warnings`. The line a
+person reads counts them too: `Wrote OpenVEX document with 2 statements (1 affected) to
+out.json`. `--no-verify` changes none of this.
+
+When a hub reads the project's own lock, the document describes what Bazel builds from that
+lock. A repository that ships what its package manager installed (a container image built
+with `pnpm install` and `socket-patch apply`, say) and keeps the hub for something else, such
+as its tests, says so with `--no-bazel` on `vex`, with `--vex-no-bazel` on `scan`, `apply` and
+`vendor`, or with `SOCKET_VEX_NO_BAZEL=1` in the environment. The Bazel workspace is then not
+read: the document describes the installed tree, and it, the warnings, the exit code and
+every line of the run are those of the same checkout without its Bazel files. The option
+changes nothing outside a Bazel workspace.
+
+Nothing changes where the files do not show such a call: outside a Bazel workspace, in a
+`--global` run, for a hosted pin, for a project whose own lock no call names, and wherever
+the workspace is not read with certainty: the statement is then `not_affected`, as without
+Bazel. A lock elsewhere that lists the same package is the
+lock of another project and decides nothing for this one: in a directory beside the project,
+below it, or above it without naming it among the importers of a pnpm workspace (a pnpm app
+beside a Java build; a project with a lock of its own under a root whose lock a hub reads; a
+Python or Ruby project below the directory of the file a hub reads). The workspace is not
+read with certainty when a module file is missing, cannot be read or holds a statement the
+reader does not follow (a `load`, an `if`, a hub proxy handed to anything but `use_repo` or
+`inject_repo`); when the call gives its file as anything but a plain string label of the
+main repository, passes `*` or `**`, or is a `pip.parse` with `uv_lock`, whose packages
+rules_python 2.2.0 and later can take from that file; when the lock cannot be read, is
+larger than 64 MiB, or is a link that leads out of the Bazel root (Bazel follows such a
+link; socket-patch reads no file outside the root); and when a `WORKSPACE`,
+`WORKSPACE.bazel` or `WORKSPACE.bzlmod` at the root holds more than a `workspace(...)` call.
+Bazel 7 reads that file beside `MODULE.bazel`, and its calls are not read yet; Bazel 9 never
+reads it, so a workspace on Bazel 9 that still has such a file keeps its `not_affected`
+statements although nothing builds the patched copy. A workspace without a `MODULE.bazel`
+is not read at all. In each of these the document is the one of a
+project without Bazel. Flags outside the committed files (`--override_repository`, an rc
+file) and BUILD files are not read either.
+
+Three more things change no statement. A call counts only when it is a statement of its own,
+which Bazel runs once: one in a comprehension, behind an `and`, in a conditional or in the
+arguments of another call may never run. Of a pnpm lock the project documents are read: a
+package that only the document pnpm 11 keeps for its own configuration lists is not one
+rules_js links. And a patch whose record names no advisory gets no statement from any run,
+so it is not looked at here: a run over such a patch alone ends as it does without Bazel.
+
+The document and the build are tested to agree on real Bazel 9.3.2, 8.8.2 and
 7.7.2 for four shapes, all under Bzlmod: Go through gazelle's
 `go_deps.from_file(go_mod = "//:go.mod")` with
 `go_deps.config(check_direct_dependencies = "error")` and the module required directly in
@@ -2681,18 +2974,45 @@ after the undo `vex` writes no document. For PyPI on Bazel 8.5 and later a hoste
 `--lockfile_mode=error` fails until a build that may update the lock has run, and the updated
 lock has to be committed.
 
-In every other Bazel shape nothing checks the document against the build, and in these it was
-measured to be wrong (`not_affected` while Bazel builds the unpatched package, or while the
-build is broken): agent mode beside rules_js, which builds from the lock and never reads the
-patched `node_modules`; Go under a `go_repository` rule of a `WORKSPACE`, in hosted and
-vendored mode; Go under `go_deps` when another Bazel module of the build requires a higher
-version of the patched module, because gazelle then builds that version and drops the
-replacement; a
-`pip.parse` or `pip_parse` that takes the requirements of the build's platform from another
-file than the one socket-patch rewrote; vendored mode for PyPI. Do not publish a document for
-an artifact that Bazel built outside those four shapes. A project that Bazel does not build is
-not concerned: beside a Bazel workspace whose files name none of its locks, `vex` says what it
-says without Bazel.
+In every other Bazel shape nothing checks the document against the build, and in these the
+document is still wrong (`not_affected` while Bazel builds the unpatched package, or while
+the build is broken):
+
+- **Agent mode beside rules_js, rules_python or rules_ruby**, wherever the statement does
+  not say `affected` above. `npm_translate_lock` is given an `npm_package_lock` or a
+  `yarn_lock`, which are not read, or `pip.parse` a `uv_lock`. The hub reads a lock above
+  the project that does not name the project among its importers. The hub reads a lock
+  below the directory the command runs in: a run at the repository root while the hub reads
+  `web/pnpm-lock.yaml`. A Python or Ruby project lies below the directory of the file the
+  hub reads. The call is not a statement of its own, or passes `*` or `**`. A `WORKSPACE`
+  file at the root defines something, or the workspace has no `MODULE.bazel`. Measured for
+  rules_js, which builds from the lock and never reads the patched `node_modules`.
+- **Vendored mode for PyPI**, where the workspace is not read with certainty: a
+  `WORKSPACE` file that defines something, no `MODULE.bazel`, a call that is not a statement
+  of its own, a file that is not given as a plain string label. And where the line that
+  points at the copy is in a requirements file that the file the call names brings in with
+  `-r`. Measured for PyPI, where the build fails.
+- **Vendored mode for RubyGems** beside `ruby.bundle_fetch`. rules_ruby 1.0.0-rc2 runs
+  `bundle install` in a repository that holds the Gemfile, its lock and the files the call
+  lists as `srcs`, so the path of the copy may not exist there. Read from its source; no
+  build has been run, so the statement is left as it is.
+- **A vendored package whose own files the hub does not read**, while the lock the hub does
+  read still lists the registry's package: a uv or Poetry project vendored through
+  `pyproject.toml` and its lock while `pip.parse` reads a requirements file exported before;
+  an npm package vendored through `package-lock.json` while `npm_translate_lock` reads a
+  `pnpm-lock.yaml`. Bazel builds the registry's package. The check of an installed copy is
+  not applied to them yet: rules_js can rewrite the pnpm lock from the other files under
+  `update_pnpm_lock`, `npm_package_lock` or `yarn_lock`, and rules_python can take the
+  packages from `uv_lock`, so the lock a call names does not always decide.
+- **Hosted mode for PyPI**, when a `pip.parse` or `pip_parse` takes the requirements of the
+  build's platform from another file than the one socket-patch rewrote.
+- **Go** under a `go_repository` rule of a `WORKSPACE`, in hosted and vendored mode; and
+  under `go_deps` when another Bazel module of the build requires a higher version of the
+  patched module, because gazelle then builds that version and drops the replacement.
+
+Do not publish a document for an artifact that Bazel built outside the shapes listed above
+as tested. A project that Bazel does not build is not concerned: beside a Bazel workspace
+whose files name none of its locks, `vex` says what it says without Bazel.
 
 ## Supported platforms
 

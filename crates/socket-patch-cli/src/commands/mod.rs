@@ -9,12 +9,14 @@ pub mod hosted_bundle;
 pub(crate) mod hosted_unwind;
 pub mod list;
 pub(crate) mod lock_cli;
+pub(crate) mod measured;
 pub(crate) mod projects_below;
 pub(crate) mod pypi_reinstall;
 pub mod remove;
 pub mod repair;
 pub mod rollback;
 pub mod scan;
+pub mod show;
 pub mod update;
 pub(crate) mod user_patches;
 pub mod vendor;
@@ -107,6 +109,39 @@ pub(crate) async fn sync_bazelignore(
         }
     }
     warnings
+}
+
+/// In a Bazel workspace a rules_jvm_external hub builds the jars its own
+/// lock pins, whatever a `pom.xml`, a Gradle build or an installed jar
+/// holds (`socket_patch_core::bazel::maven`). A command that vendors or
+/// applies patches calls this once with the purls it was about, and hands
+/// what it gets to the warnings of its run: one for each Maven jar among
+/// them that a hub builds, or may build, from its lock. Nothing for a
+/// `--global` run, whose target is not the project, for a jar that hosted
+/// mode has patched for the hub, and no file is looked for when no purl is
+/// a Maven one. A hosted run does not come here: its hub lane patches such
+/// a jar, or says why not, among the warnings of its rewriters.
+///
+/// With `tell`, a human run is told here, as [`sync_bazelignore`] tells
+/// it. A command that prints the warnings of its run itself passes
+/// `false`.
+pub(crate) async fn bazel_maven_notices<'a>(
+    common: &crate::args::GlobalArgs,
+    purls: impl Iterator<Item = &'a str>,
+    tell: bool,
+) -> Vec<crate::json_envelope::RunWarning> {
+    if common.is_global() {
+        return Vec::new();
+    }
+    let purls = purls.map(str::to_string).collect();
+    let said = socket_patch_core::bazel::maven::notices(&common.cwd, purls).await;
+    let warning = |(code, detail): (&str, String)| {
+        if tell && !common.json && !common.silent {
+            eprintln!("Warning: {detail}");
+        }
+        crate::json_envelope::RunWarning::new(code, detail)
+    };
+    said.into_iter().map(warning).collect()
 }
 
 /// The vendor-ledger keys (`ledger`, the project's

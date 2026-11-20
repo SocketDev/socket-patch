@@ -71,6 +71,14 @@ pub fn command(bin: &Path) -> Command {
     for k in COLOR_ENV {
         cmd.env_remove(k);
     }
+    // The variables an AI coding agent sets for the commands it runs. An
+    // agent running this suite has them in its environment, and they
+    // would turn the terminal output the PTY suites test into the plain
+    // output an agent gets. (`SOCKET_PLAIN` goes with the other
+    // `SOCKET_*` below.)
+    for k in socket_patch_cli::ui::AGENT_ENV_VARS {
+        cmd.env_remove(k);
+    }
     // The flag-bound vars are removed by name, not only when the sweep below
     // finds them: in-process tests in the same binary set some of them
     // (`apply_env_toggles`, env save/restore helpers), and one set between

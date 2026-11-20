@@ -1,0 +1,11 @@
+load("@rules_java//java:defs.bzl", "java_binary")
+
+# Prints OUT: and the marker in the victim's jar. The workspace names only
+# `consumer`: the victim is on the classpath through the hub's own
+# dependency edge.
+java_binary(
+    name = "consumer",
+    srcs = ["App.java"],
+    main_class = "App",
+    deps = ["@fixture_maven//:dev_socket_fixture_consumer"],
+)

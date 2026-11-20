@@ -456,8 +456,8 @@ pub(crate) async fn restore(
     for pin in pins.values() {
         // The poms among the pin's files. A checkout that another build
         // reads too wires the pin in a file of that build as well (the
-        // sbt file, the Gradle index), which is its own restorer's to
-        // take out.
+        // sbt file, the Gradle index, the block of a Bazel hub), which is
+        // its own restorer's to take out.
         let own = pin.files.iter().filter(|rel| files.contains(rel));
         let mut poms: Vec<String> = own.cloned().collect();
         // A file that could not be read refused the pin above.

@@ -953,29 +953,13 @@ async fn run_vendor_interactive_path(
     telemetry_auth: &TelemetryAuth,
     // The npm half of scan's crawl, for the vendor engine to reuse.
     prior: Option<&NpmCrawlSnapshot>,
-    // What each selected patch fixes and leaves unpatched.
-    coverage: &[super::discovery::AdvisoryCoverage],
+    // The report's view of every package with a patch on offer, and the
+    // invocation's report.
+    plan: &[super::report::Package],
+    report: &mut super::report::Run,
 ) -> i32 {
-    // Under the engine's summary line: the advisory lines of the packages
-    // it vendored or found already vendored.
-    let verbose = args.common.verbose;
-    let closing_lines = move |vendored: &[&str]| -> Vec<String> {
-        let keys: HashSet<PurlKey> = vendored.iter().map(|purl| PurlKey::new(purl)).collect();
-        let landed: HashSet<&str> = coverage
-            .iter()
-            .filter(|c| keys.contains(&PurlKey::new(&c.purl)))
-            .flat_map(|c| c.uuids.iter().map(String::as_str))
-            .collect();
-        super::coverage_lines_for(coverage, &landed, false, verbose)
-    };
-    // The download phase is quiet about its own header in vendored mode
-    // (only the manifest-mode download prints it), so this arm does.
-    if !args.common.silent && !selected.is_empty() {
-        eprintln!(
-            "Downloading {}...",
-            plural(selected.len(), "patch", "patches")
-        );
-    }
+    // The download shows on the status line; the packages it fetched are
+    // the rows under the summary line.
     let download =
         boxed_download_patch_records(selected, params, api_client, prefetched, prior).await;
     let (dl_code, records) = (download.code, download.records);
@@ -984,6 +968,27 @@ async fn run_vendor_interactive_path(
     // The vendor step is a silent no-op on an empty record set (it can't
     // know why it is empty); this arm can.
     let nothing_to_vendor = records.is_empty();
+    // The measurements asked for when the patches were selected: in by
+    // now, so the rows below show them.
+    report.settle().await;
+
+    // Under the engine's summary line: one row per package it vendored or
+    // found already vendored. The engine calls this once it knows which;
+    // those packages are then counted into the report below.
+    let landed_purls: std::sync::Mutex<HashSet<PurlKey>> = Default::default();
+    let landed_of = |keys: &HashSet<PurlKey>| -> HashSet<&str> {
+        plan.iter()
+            .filter(|p| keys.contains(&PurlKey::new(&p.purl)))
+            .flat_map(|p| p.uuids.iter().map(String::as_str))
+            .collect()
+    };
+    let rows_report = &*report;
+    let closing_lines = |vendored: &[&str]| -> Vec<String> {
+        let keys: HashSet<PurlKey> = vendored.iter().map(|purl| PurlKey::new(purl)).collect();
+        let rows = rows_report.rows(plan, &landed_of(&keys));
+        *landed_purls.lock().unwrap_or_else(|e| e.into_inner()) = keys;
+        rows
+    };
     let code = match boxed_vendor_step(VendorStep {
         common: &args.common,
         records,
@@ -1011,6 +1016,8 @@ async fn run_vendor_interactive_path(
             return 1;
         }
     };
+    let landed_purls = landed_purls.into_inner().unwrap_or_else(|e| e.into_inner());
+    report.count(plan, &landed_of(&landed_purls));
     // GC after the vendor step (see the JSON arm).
     if prune {
         let gc = run_apply_gc(
@@ -1163,7 +1170,8 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
     prune: bool,
     telemetry_auth: &'a TelemetryAuth,
     prior: Option<&'a NpmCrawlSnapshot>,
-    coverage: &'a [super::discovery::AdvisoryCoverage],
+    plan: &'a [super::report::Package],
+    report: &'a mut super::report::Run,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
     Box::pin(run_vendor_interactive_path(
         args,
@@ -1179,7 +1187,8 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
         prune,
         telemetry_auth,
         prior,
-        coverage,
+        plan,
+        report,
     ))
 }
 

@@ -876,14 +876,18 @@ impl UserPatchIndex {
         }
     }
 
-    /// The pnpm lock entries pnpm patches: a `(patch_hash=…)` key suffix,
-    /// or an older lock's `patched: true`.
+    /// The pnpm lock entries pnpm patches: a key with a `(patch_hash=…)`
+    /// group of its own, or an older lock's `patched: true`. A key that
+    /// only repeats a patched peer's hash names a package pnpm installs
+    /// unpatched.
     fn pnpm_lock_patches(&mut self, value: &Value, path: &Path) {
         // Older pnpm locks can carry patch hashes without a mirrored map.
         for field in ["packages", "snapshots"] {
             if let Some(map) = value[field].as_object() {
                 for (key, entry) in map {
-                    if key.contains("patch_hash=") || !entry["patched"].is_null() {
+                    if crate::formats::pnpm::pnpm_key_has_own_patch(key)
+                        || !entry["patched"].is_null()
+                    {
                         if let Some((name, version)) = crate::formats::pnpm::pnpm_registry_key(key)
                         {
                             self.add("npm", name, Some(version), path);
@@ -1417,6 +1421,37 @@ mod tests {
             let index = UserPatchIndex::discover(tmp.path()).await;
             assert!(!index.conflicts("pkg:npm/%40s/pkg@1.2.0").is_empty(), "{index:?}");
             assert!(index.conflicts("pkg:npm/@s/pkg@2.0.0").is_empty());
+        }
+    }
+
+    /// REGRESSION: pnpm repeats a patched package's whole key, hash and
+    /// all, inside the peer group of every package that depends on it
+    /// (`@redis/json@1.0.7(@redis/client@1.6.0(patch_hash=…))`). Each of
+    /// those dependents was read as patched by the project, so a scan left
+    /// dozens of packages the project never touched without their fixes.
+    #[tokio::test]
+    async fn a_patched_peer_in_a_pnpm_key_does_not_protect_the_dependent() {
+        for text in [
+            "lockfileVersion: '9.0'\nsnapshots:\n  \
+             '@redis/client@1.6.0(patch_hash=abc)': {}\n  \
+             '@redis/json@1.0.7(@redis/client@1.6.0(patch_hash=abc))': {}\n  \
+             'next-intl@4.11.2(@swc/helpers@0.5.23)(next@16.4.5(patch_hash=def)(react@19.0.0))(react@19.0.0)': {}\n  \
+             'both@3.0.0(patch_hash=ghi)(@redis/client@1.6.0(patch_hash=abc))': {}\n",
+            "lockfileVersion: '6.0'\npackages:\n  \
+             /@redis/client@1.6.0(patch_hash=abc): {}\n  \
+             /@redis/json@1.0.7(@redis/client@1.6.0(patch_hash=abc)): {}\n  \
+             /next-intl@4.11.2(next@16.4.5(patch_hash=def)): {}\n  \
+             /both@3.0.0(patch_hash=ghi)(@redis/client@1.6.0(patch_hash=abc)): {}\n",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(tmp.path(), "pnpm-lock.yaml", text);
+            let index = UserPatchIndex::discover(tmp.path()).await;
+            for purl in ["pkg:npm/%40redis/client@1.6.0", "pkg:npm/both@3.0.0"] {
+                assert!(!index.conflicts(purl).is_empty(), "{purl}: {index:?}");
+            }
+            for purl in ["pkg:npm/%40redis/json@1.0.7", "pkg:npm/next-intl@4.11.2"] {
+                assert!(index.conflicts(purl).is_empty(), "{purl}: {index:?}");
+            }
         }
     }
 

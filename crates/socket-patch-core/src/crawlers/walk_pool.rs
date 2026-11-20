@@ -123,6 +123,13 @@ fn read_soft_nofile_limit() -> Option<u64> {
     None
 }
 
+/// How many threads a directory walk outside the pool should use: the
+/// pool's own count, which the measurements above settled (one under a
+/// tight descriptor limit).
+pub(crate) fn threads() -> usize {
+    walk_pool().map_or(1, rayon::ThreadPool::current_num_threads)
+}
+
 /// Whether the descriptor limit is too tight for concurrent crawling (see
 /// the module docs). The ecosystem dispatch then runs the crawlers one at
 /// a time, and the walk pool has a single thread.

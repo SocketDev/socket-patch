@@ -3917,7 +3917,9 @@ async fn scan_vendor_gem_skips_a_version_the_lock_does_not_resolve() {
 async fn scan_vendor_gem_unlocked_version_skip_reads_as_a_skip() {
     let (_, gemfile, lock) = gem_unlocked_projects().remove(0);
     for (extra, headline) in [
-        (&[][..], "Downloading 1 patch"),
+        // The wet run ends on the empty-run line: with the one patch
+        // skipped, there was nothing to vendor.
+        (&[][..], "No vendorable patches in scope."),
         (
             &["--dry-run"][..],
             "Would download and vendor 0 of 1 patch (1 would be skipped)",
