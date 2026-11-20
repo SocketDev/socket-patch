@@ -164,6 +164,15 @@ pub enum Commands {
     /// Restore selected patches, or all patches when no target is given
     Rollback(commands::rollback::RollbackArgs),
 
+    /// Tell Socket that a patch broke your build, tests or application
+    ///
+    /// Sends, for each patch named: its id, its ecosystem and how it was
+    /// applied (hosted, vendored or agent), with the reason, your message,
+    /// and this CLI's version and platform. No package names, paths or
+    /// file contents. Nothing in the project changes: use `rollback` to
+    /// take a patch off.
+    Report(commands::report::ReportArgs),
+
     /// Generate OpenVEX for vulnerabilities addressed by verified patches
     Vex(commands::vex::VexArgs),
 
@@ -234,6 +243,7 @@ impl Commands {
             Commands::Vex(a) => &a.common,
             Commands::Vendor(a) => &a.common,
             Commands::Rollback(a) => &a.common,
+            Commands::Report(a) => &a.common,
             Commands::Get(a) => &a.common,
             Commands::Show(a) => &a.common,
             Commands::List(a) => &a.common,

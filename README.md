@@ -91,6 +91,7 @@ socket-patch list                          # what is patched here; in a terminal
 socket-patch vendor                        # eject an existing hosted patch set
 socket-patch repair                        # restore agent or vendored patch artifacts
 socket-patch rollback lodash               # restore one package to upstream
+socket-patch report lodash --reason tests   # tell Socket a patch broke something
 socket-patch rollback                      # restore upstream dependencies
 ```
 
