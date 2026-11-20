@@ -24,6 +24,11 @@
 //!   build fails on the sha256 and never goes to the upstream jar. On a
 //!   Bazel before 7.5.0 the checkout first has no `.bazelversion`: the
 //!   command then writes nothing and says so (`maven_bazel_release`).
+//! - [`a_hosted_scan_of_a_tree_only_bazel_builds`]: the same checkout, and
+//!   `socket-patch scan --mode hosted --yes` in the place of the `get`. It
+//!   knows no Maven package in a tree without a `pom.xml` or a Gradle
+//!   build: it asks the API about none, reports none and changes no file,
+//!   while the API has a patch for a jar that the build takes.
 //! - [`a_pom_patch_beside_a_pinned_hub`]: a checkout that Maven builds
 //!   too. The one command pins both builds: the three files of a Maven pin
 //!   and `MODULE.bazel`. The Bazel build is patched, and `rollback --yes`
@@ -33,7 +38,9 @@
 //!   passes. The build then stops at the line of the entry's
 //!   `override_repo(`, where the block says what to run. `socket-patch
 //!   rollback <purl> --yes` takes the entry out, and the build takes the
-//!   new upstream jar.
+//!   new upstream jar. The API has a patch of that release too, and a
+//!   hosted `scan` of the checkout with the stale entry does not find it
+//!   and leaves the entry: the lock is not where it looks.
 //! - [`the_users_own_override_of_the_artifact`]: the hub has a
 //!   `maven.override` that puts a target of the checkout in the artifact's
 //!   place. The command writes nothing and names the override's line
@@ -94,7 +101,7 @@ use socket_patch_core::bazel::maven::{Lock, Pinned as Jar};
 
 use crate::envelope::event_for;
 use crate::harness::{changed, rewrite, Cell, Fixture, Ran, StandIn, Tree, CONSUMER, NOTHING};
-use crate::hosted_memory_common::Patch;
+use crate::hosted_memory_common::{Patch, ORG};
 
 /// The workspace the tests build, and the ruleset each Bazel release
 /// builds it with. One era per way the ruleset names an artifact's
@@ -121,6 +128,8 @@ const GROUP_PATH: &str = "dev/socket/fixture";
 const VICTIM: &str = "victim";
 const VERSION: &str = "1.10.0";
 const PURL: &str = "pkg:maven/dev.socket.fixture/victim@1.10.0";
+/// The release a flow moves the checkout to, which has a patch too.
+const BUMPED: &str = "1.11.0";
 /// The file of the victim's jar that `App.java` prints.
 const MARKER: &str = "dev/socket/fixture/victim/marker.txt";
 /// The fixture's hub, under a name no other Bazel module adds to.
@@ -232,27 +241,29 @@ struct Granted {
     marker: String,
 }
 
-/// Puts the grant of a new patch of the victim on the API of `standin`,
-/// as production has it: a token and the patch id in the path of the patch
-/// registry, the version with the suffix only that registry serves. The
-/// route of the jar answers with `tampered`, or with the jar the grant
-/// pins.
-fn grant(standin: &StandIn, tampered: Option<&[u8]>) -> Granted {
+/// The grant of a new patch of the victim at `version`, as production has
+/// it: a token and the patch id in the path of the patch registry, the
+/// version with the suffix only that registry serves. The route of the jar
+/// on `standin` answers with `tampered`, or with the jar the grant pins.
+/// Gives the patch for the API of the stand-in too, which takes every
+/// patch it grants in one call ([`StandIn::api`]).
+fn grant(standin: &StandIn, version: &str, tampered: Option<&[u8]>) -> (Granted, Patch) {
     let uuid = uuid::Uuid::new_v4().to_string();
     let token = uuid::Uuid::new_v4().to_string();
-    let suffixed = format!("{VERSION}-socket.{}", &uuid[..8]);
+    let purl = format!("pkg:maven/{GROUP}/{VICTIM}@{version}");
+    let suffixed = format!("{version}-socket.{}", &uuid[..8]);
     let jar = victim(&format!("PATCHED {uuid}"));
     let registry = format!("{PATCH_HOST}/patch-registry/maven/{token}/{uuid}/maven2");
     let file = repo_path(VICTIM, &suffixed, "jar");
     let route = format!("/{registry}/{file}");
     standin.serve(5, &route, tampered.unwrap_or(&jar));
     let artifact = format!(
-        "https://{PATCH_HOST}/patch/maven/{GROUP}/{VICTIM}/{VERSION}/{token}/{uuid}/{VICTIM}-{suffixed}.jar"
+        "https://{PATCH_HOST}/patch/maven/{GROUP}/{VICTIM}/{version}/{token}/{uuid}/{VICTIM}-{suffixed}.jar"
     );
     let reference = json!({
         "status": "granted",
         "url": artifact,
-        "purl": PURL,
+        "purl": purl,
         "artifacts": [{
             "kind": "tarball",
             "url": artifact,
@@ -263,7 +274,7 @@ fn grant(standin: &StandIn, tampered: Option<&[u8]>) -> Granted {
             "indexUrl": format!("https://{registry}"),
             "identifiers": {
                 "name": format!("{GROUP}/{VICTIM}"),
-                "version": VERSION,
+                "version": version,
                 "mavenGroupId": GROUP,
                 "mavenArtifactId": VICTIM,
                 "mavenSuffixedVersion": suffixed,
@@ -271,18 +282,19 @@ fn grant(standin: &StandIn, tampered: Option<&[u8]>) -> Granted {
             },
         },
     });
-    standin.api(&[Patch {
-        purl: PURL.to_string(),
+    let patch = Patch {
+        purl,
         uuid: uuid.clone(),
         reference,
-    }]);
-    Granted {
+    };
+    let granted = Granted {
         sha256: sha256_hex(&jar),
         url: format!("https://{registry}/{file}"),
         route,
         marker: format!("OUT: PATCHED {uuid}"),
         uuid,
-    }
+    };
+    (granted, patch)
 }
 
 /// The name of the repository through which the fixture's hub fetches the
@@ -329,8 +341,10 @@ struct Pinned {
     /// checkout leaves it; `coursier`, the cache the ruleset's Coursier
     /// fills when it pins; `gradle`, which nothing fills.
     tools: tempfile::TempDir,
-    /// The patch the stand-in grants, whose jar it serves.
+    /// The patch the stand-in grants, whose jar it serves, and the one it
+    /// grants for the victim at [`BUMPED`].
     patch: Granted,
+    next: Granted,
     /// The id of the run, which every upstream jar made for it holds.
     run: String,
     /// What `//:consumer` prints while Bazel builds the upstream jar, and
@@ -378,7 +392,9 @@ impl Pinned {
             &jar(&[]),
             Some((VICTIM, VERSION)),
         );
-        let patch = grant(&standin, None);
+        let (patch, first) = grant(&standin, VERSION, None);
+        let (next, second) = grant(&standin, BUMPED, None);
+        standin.api(&[first, second]);
 
         // The checkout: the hub's repository is the stand-in, the lock is
         // the empty file the ruleset's documentation starts from.
@@ -440,6 +456,7 @@ impl Pinned {
             standin,
             tools,
             patch,
+            next,
             run,
             upstream,
             upstream_route: format!("/{UPSTREAM}/{}", repo_path(VICTIM, VERSION, "jar")),
@@ -495,6 +512,30 @@ impl Pinned {
         let detail = format!("{PURL}: {why}. {KEEPS}");
         let warnings = json!([{ "code": code, "detail": detail }]);
         assert_eq!(get.envelope["warnings"], warnings, "{test}: {said}");
+        assert_eq!(
+            changed(before, &self.cell.tree()),
+            NOTHING,
+            "{test}: {said}"
+        );
+    }
+
+    /// `socket-patch scan --mode hosted --yes` in a checkout without a
+    /// `pom.xml`, whose API has a patch for a jar of the hub's lock: the
+    /// command knows no package there. It asks the API about none, reports
+    /// none and changes no file of `before`.
+    fn scan_finds_no_package(&self, before: &Tree) {
+        let test = &self.cell.test;
+        let batch = format!("/v0/orgs/{ORG}/patches/batch");
+        let asked = self.standin.asked(&batch);
+        let scan = self.socket_patch(&["scan", "--mode", "hosted", "--yes"]);
+        let said = &scan.dump;
+        assert_eq!(scan.code, 0, "{test}: {said}");
+        assert_eq!(scan.envelope["scannedPackages"], 0, "{test}: {said}");
+        assert_eq!(scan.envelope["packages"], json!([]), "{test}: {said}");
+        assert_eq!(scan.envelope["events"], json!([]), "{test}: {said}");
+        let rewritten = &scan.envelope["redirect"]["rewrittenFiles"];
+        assert_eq!(*rewritten, json!([]), "{test}: {said}");
+        assert_eq!(self.standin.asked(&batch), asked, "{test}: {said}");
         assert_eq!(
             changed(before, &self.cell.tree()),
             NOTHING,
@@ -563,7 +604,8 @@ impl Pinned {
         let mut twin = self.cell.twin();
         let rogue = StandIn::start();
         let tampered = victim("TAMPERED");
-        let other = grant(&rogue, Some(&tampered));
+        let (other, served) = grant(&rogue, VERSION, Some(&tampered));
+        rogue.api(&[served]);
         let host = format!("{PATCH_HOST}/");
         twin.route_downloads(&[
             rewrite(&host, &rogue.origin()),
@@ -741,9 +783,39 @@ fn a_tree_only_bazel_builds() {
     );
 }
 
+/// A hosted scan of the checkout without a `pom.xml`: the lock of the hub
+/// is the one file that names the jars Bazel builds, and the command does
+/// not read it for packages. So it finds none, although the API has a
+/// patch for the victim, and the build is the one of before.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn a_hosted_scan_of_a_tree_only_bazel_builds() {
+    let test = "maven::a_hosted_scan_of_a_tree_only_bazel_builds";
+    let Some(flow) = Pinned::open(test, false, &|_, _| {}) else {
+        return;
+    };
+    flow.builds_upstream();
+    let before = flow.names_its_bazel();
+
+    flow.scan_finds_no_package(&before);
+    flow.cell.builds(&flow.upstream);
+    let asked = flow.standin.asked(&flow.patch.route);
+    assert_eq!(asked, 0, "{test}: something fetched the patched jar");
+    println!(
+        "{test}: Bazel {} built {:?} before and after `scan --mode hosted --yes`, which found \
+         no package in a checkout whose lock pins {PURL} and changed none of its {} files; {:?}",
+        flow.cell.release(),
+        flow.upstream,
+        before.len(),
+        flow.started.elapsed()
+    );
+}
+
 /// The checkout moves the artifact one version up after the command: the
 /// relock passes, the build stops at the line of the entry, and the
-/// command the block names there takes the entry out.
+/// command the block names there takes the entry out. A hosted scan of
+/// the checkout with the stale entry does not: it leaves the entry, and
+/// does not find the patch of the new release.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
 fn a_version_bump_of_the_patched_artifact() {
@@ -756,7 +828,7 @@ fn a_version_bump_of_the_patched_artifact() {
     flow.pins(&before, &[MODULE]);
 
     // The relock evaluates the hub with the entry in place, and passes.
-    let bumped = flow.bump("1.11.0");
+    let bumped = flow.bump(BUMPED);
     let module = std::fs::read_to_string(flow.cell.path(MODULE)).expect("MODULE.bazel");
     let entry = module.lines().position(|line| line == "override_repo(");
     let line = entry.expect("the entry's override_repo") + 1;
@@ -789,10 +861,20 @@ fn a_version_bump_of_the_patched_artifact() {
     let after = std::fs::read_to_string(flow.cell.path(MODULE)).expect("MODULE.bazel");
     assert_eq!(after, unpatched, "{test}: {said}");
     flow.cell.builds(&bumped);
+
+    // A user who runs a hosted scan where the block says to roll back:
+    // the stale entry is in the file again, as it was when the build
+    // stopped. The API has a patch of the release the lock now pins, and
+    // the scan knows no package: the entry stays where Bazel stops.
+    flow.cell.write(MODULE, module);
+    flow.scan_finds_no_package(&flow.cell.tree());
+    let asked = flow.standin.asked(&flow.next.route);
+    assert_eq!(asked, 0, "{test}: something fetched the patched jar");
     println!(
         "{test}: Bazel {} built {:?}; after `get --mode hosted` and the checkout's bump to \
-         1.11.0 the relock passed and the build stopped at {at} ({stops}); `rollback {PURL}` \
-         took the entry out and the build printed {bumped:?}; {:?}",
+         {BUMPED} the relock passed and the build stopped at {at} ({stops}); `rollback {PURL}` \
+         took the entry out and the build printed {bumped:?}; with the stale entry back, `scan \
+         --mode hosted --yes` found no package and left it; {:?}",
         flow.cell.release(),
         flow.upstream,
         flow.started.elapsed()
