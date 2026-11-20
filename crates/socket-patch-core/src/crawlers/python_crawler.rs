@@ -3787,6 +3787,17 @@ impl PythonCrawler {
         self.crawl_with(options, &var, false).await
     }
 
+    /// How many packages installed where the project installs
+    /// [`Self::crawl_all`] leaves out because the project does not declare
+    /// them. Zero for a project with an environment of its own, under
+    /// `--global`, and when the crawl is not scoped.
+    pub async fn undeclared_installed(&self, options: &CrawlerOptions) -> usize {
+        let var = |name: &str| std::env::var(name).ok();
+        let installed = self.crawl_with(options, &var, false).await.len();
+        let declared = self.crawl_with(options, &var, true).await.len();
+        installed.saturating_sub(declared)
+    }
+
     /// [`Self::crawl_all`] over an explicit environment.
     async fn crawl_all_with(
         &self,

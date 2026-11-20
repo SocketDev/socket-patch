@@ -449,6 +449,25 @@ async fn keep_patched_pypi_copies(
         .collect()
 }
 
+/// The `pypi_installed_patch_kept` warnings of a `--prune` whose crawl
+/// found nothing. The manifest half of the GC is skipped there, so no
+/// record is dropped, but a recorded PyPI patch can still be on disk in a
+/// copy the scan no longer reaches (another interpreter, a tool's
+/// environment), and this warning is what names the `rollback` that
+/// restores it. Read-only: no lock, nothing written.
+pub(super) async fn kept_pypi_patch_warnings(
+    common: &GlobalArgs,
+    manifest_path: &Path,
+    socket_dir: &Path,
+) -> Vec<(&'static str, String)> {
+    let Ok(Some(manifest)) = read_manifest(manifest_path).await else {
+        return Vec::new();
+    };
+    let mut recorded: Vec<String> = manifest.patches.keys().cloned().collect();
+    recorded.sort();
+    keep_patched_pypi_copies(common, &manifest, socket_dir, &mut recorded).await
+}
+
 /// The vendored-state half of the GC alone, for a `--prune` whose crawl
 /// found nothing (the manifest half is skipped there: pruning against an
 /// empty crawl would drop every entry). Reverting entries whose patch left

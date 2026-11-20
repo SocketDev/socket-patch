@@ -984,7 +984,10 @@ make it this project's. `scan` keeps only:
 
 A project that declares nothing, or whose declared packages are not
 installed, has no packages there. Install them first
-(`pip install -r requirements.txt`), preferably into a virtualenv.
+(`pip install -r requirements.txt`), preferably into a virtualenv. When
+the interpreter does hold packages and the project declares none of them,
+the scan ends with `No packages found: the N packages installed in the
+Python on PATH are not ones this project declares`.
 
 The filter is skipped, and every package in the interpreter is reported,
 when nothing states the project's dependencies (its only marker is a
@@ -1014,7 +1017,8 @@ longer reported while an installed copy is still patched
 restore that copy. `socket-patch rollback <purl>` restores it and drops the
 record; add `--global` when the copy is in another interpreter or a tool's
 environment. Copies outside the interpreter are looked for only when the
-project installs into a shared one.
+project installs into a shared one. A `--prune` that is skipped because
+the scan found nothing reports the same warning, and drops no record.
 
 ## PyPI: pixi projects
 
