@@ -111,9 +111,18 @@
 //! nuget.org or the patch host. It is there from the first build on, and
 //! step (c) changes no flag.
 //!
+//! A second flow, [`hosted_no_config`], is the workspace of rules_csharp's
+//! own examples: the tag names the lock and no `nuget_config`, and the
+//! checkout holds no `nuget.config`. The hub then has nuget.org as its one
+//! source. The same `scan` exits 0 and reports the patch applied: it
+//! creates a `nuget.config` with the Socket source, which nothing of the
+//! build reads, and re-pins the lock, which the hub does read. The next
+//! `bazel build` fails: the hub downloads the upstream package from
+//! nuget.org and refuses it over the `contentHash` of the patched one.
+//!
 //! # Known gaps
 //!
-//! Three outcomes the flow asserts are gaps of the product, not its
+//! Four outcomes the flows assert are gaps of the product, not its
 //! contract. Each is asserted as the release has it, and marked
 //! `KNOWN GAP` there with what a fix would change in this test:
 //!
@@ -125,6 +134,8 @@
 //!   while Bazel builds the patched package (c).
 //! - Bazel prints the access token of the grant, in a warning for each
 //!   package of the lock that the Socket source does not hold (c).
+//! - Where the tag names no `nuget_config`, `scan --mode hosted` exits 0
+//!   and the next build fails ([`hosted_no_config`]).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -171,6 +182,9 @@ const RUN: &str = "@RUN@";
 const CONFIG: &str = "nuget.config";
 const LOCK: &str = "packages.lock.json";
 const BAZEL_LOCK: &str = "MODULE.bazel.lock";
+/// The file of the tag, and the line of it that names [`CONFIG`] there.
+const MODULE: &str = "MODULE.bazel";
+const NAMES_CONFIG: &str = "    nuget_config = \"//:nuget.config\",\n";
 /// The files of the fixture that name a package.
 const NAMING: [&str; 3] = ["App.csproj", "BUILD.bazel", LOCK];
 /// nuget.org as the fixture's `nuget.config` names it, and as NuGet records
@@ -820,6 +834,84 @@ fn hosted_from_lock() {
     );
 }
 
+/// The flow of a tag that names no `nuget_config`, in a checkout without a
+/// `nuget.config`, on the machine that restored the project.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn hosted_no_config() {
+    let test = "nuget::hosted_no_config";
+    let started = Instant::now();
+    let Some(mut cell) = Cell::open(test, &FIXTURE) else {
+        return;
+    };
+    let release = cell.release().to_string();
+
+    let run = format!("R{}", uuid::Uuid::new_v4().simple());
+    let upstream = Package::new(NAME, &run, &format!("PRISTINE {run}"));
+    let neighbour = Package::new(NEIGHBOUR, &run, "NEIGHBOUR");
+    let patch = Patched::new(&run);
+    let (purl, unpatched) = (upstream.purl(), upstream.marker());
+    let standin = registry(&[&neighbour, &upstream]);
+    grant(&standin, &upstream, &patch, &patch.package.nupkg);
+    cell.route_downloads(&downloads(&standin.origin()));
+    check_out(&cell, &run, &[&neighbour, &upstream]);
+    // The fixture's tag without the line that names its `nuget.config`,
+    // and no such file.
+    let module = std::fs::read_to_string(cell.path(MODULE)).expect(MODULE);
+    cell.write(MODULE, module.replace(NAMES_CONFIG, ""));
+    std::fs::remove_file(cell.path(CONFIG)).expect("remove nuget.config");
+    let home = tempfile::Builder::new()
+        .prefix("sp-bazel-nuget-")
+        .tempdir()
+        .expect("create the .NET home");
+    for package in [&neighbour, &upstream] {
+        package.restore_into(home.path());
+    }
+
+    // The unpatched build: the hub has nuget.org alone.
+    let before = cell.builds_unpatched(&unpatched);
+    assert!(!before.contains_key(CONFIG), "{test}: a {CONFIG} is left");
+
+    // KNOWN GAP: the scan reports the patch applied. It creates the
+    // `nuget.config` that names the Socket source, which the hub does not
+    // read, and re-pins the lock, which it does. A fix would write neither
+    // file and say why: the build below would then pass on the upstream
+    // package.
+    let scan = socket_patch(&cell, &standin, home.path(), &SCAN);
+    let pinned = cell.pinned_by(&scan, &purl, &patch.uuid, &before, &[CONFIG, LOCK]);
+    assert_eq!(
+        text(&pinned, LOCK),
+        lock_pinning(&run, &[&neighbour, &patch.package]),
+        "{test}: {LOCK}"
+    );
+
+    // KNOWN GAP: the build fails. The hub fetched the upstream package
+    // from nuget.org, which the lock no longer pins, and never asked the
+    // Socket source.
+    let build = cell.bazel("build", &[CONSUMER]);
+    let refusal = format!(
+        "{} {VERSION}: the downloaded package does not match its contentHash in {LOCK}",
+        upstream.id
+    );
+    assert!(
+        !build.ok() && build.stderr().contains(&refusal),
+        "{test}: the build after `scan --mode hosted` did not fail on the contentHash of the \
+         patched package:\n{}",
+        build.dump()
+    );
+    let asked = standin.requests();
+    let source = format!("/{PATCH_HOST}/");
+    let source = asked.iter().find(|path| path.starts_with(&source));
+    assert_eq!(source, None, "{test}: the hub asked the Socket source");
+
+    println!(
+        "{test}: on Bazel {release}, `scan --mode hosted` exited 0 with the patch applied and \
+         wrote {CONFIG} and {LOCK} for a tag that names no nuget_config, and the next build \
+         failed: {refusal}; {:?}",
+        started.elapsed()
+    );
+}
+
 /// Without a Bazel, what stays fixed now that no id and no sum is
 /// committed: the fixture's directories and the legs of its workflow are
 /// those of its table; every era names the two files the hub reads; the
@@ -843,6 +935,8 @@ fn a_checkout_names_and_pins_the_packages_of_its_run() {
         ] {
             assert!(module.contains(&named), "{}: no {named}", path.display());
         }
+        // The one line a flow takes out for a tag without the config.
+        assert_eq!(module.matches(NAMES_CONFIG).count(), 1, "{module}");
     }
     let common = root.join("common");
     let read = |rel: &str| std::fs::read_to_string(common.join(rel)).expect(rel);
