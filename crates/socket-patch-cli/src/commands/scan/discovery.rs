@@ -38,6 +38,11 @@ pub(crate) struct LockfileSupplement {
     /// packages included), kept so the hosted-wiring probes reuse it instead
     /// of re-parsing every project lockfile. Empty for global scans.
     pub(crate) entries: Vec<LockfileEntry>,
+    /// The gems the Bundler lock resolves only as precompiled platform
+    /// builds, as `pkg:gem/<name>@<version>`. `entries` leaves them out,
+    /// in every mode, and the lock names them all the same: with
+    /// `entries` they are what the project's lockfiles resolve.
+    pub(crate) platform_gems: Vec<String>,
     /// npm layouts the lockfile inventory REFUSED (Plug'n'Play loaders).
     /// Scan surfaces these as refusal warnings: under PnP the installed-tree
     /// crawl is empty too, so otherwise the project scans as a silent no-op.
@@ -76,20 +81,19 @@ pub(crate) async fn lockfile_supplement(
     let locks = ctx.locks().await;
     out.unsupported = locks.unsupported.clone();
     let entries = &locks.entries;
-    let platform_gems = if hosted {
-        ctx.gem_platform_only_purls().await
-    } else {
-        Vec::new()
-    };
+    let platform_gems = ctx.gem_platform_only_purls().await;
     if entries.is_empty() && platform_gems.is_empty() {
         return out;
     }
+    // Only a hosted supplement names a platform-only gem that has no
+    // installed copy (see above).
     let resolved = entries
         .iter()
         .map(|entry| entry.purl.as_str())
-        .chain(platform_gems.iter().map(String::as_str));
+        .chain(platform_gems.iter().filter(|_| hosted).map(String::as_str));
     (out.packages, out.purls) = lockfile_only_packages(resolved, crawled, only, &common.cwd);
     out.entries = entries.clone();
+    out.platform_gems = platform_gems;
     out
 }
 
