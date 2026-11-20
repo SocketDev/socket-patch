@@ -113,6 +113,12 @@ const REGISTRY: &[FormatFile] = &[
     row("Pipfile", "pypi", HOSTED | PRESENCE_ONLY),
     row("pyproject.toml", "pypi", HOSTED | VENDORED | PROBE),
     row("hatch.toml", "pypi", HOSTED | VENDORED | PROBE),
+    // Never edited: pixi's manifest and lock say pixi installs the project,
+    // from conda channels no hosted rewriter can point elsewhere, so the
+    // PyPI planner sends its packages to agent mode instead of asking for
+    // a requirements file pixi would never read.
+    row("pixi.toml", "pypi", HOSTED | PRESENCE_ONLY),
+    row("pixi.lock", "pypi", HOSTED | PRESENCE_ONLY),
     // ── cargo ──
     row("Cargo.toml", "cargo", HOSTED | VENDORED | PROBE),
     row("Cargo.lock", "cargo", HOSTED | VENDORED | ROOT),
@@ -406,6 +412,9 @@ mod tests {
         assert_eq!(hosted_file_ecosystem("gradle-wrapper.properties"), None);
         assert_eq!(hosted_file_ecosystem("gradle-index.tsv"), None);
         assert_eq!(hosted_file_ecosystem("Pipfile"), None);
+        assert_eq!(hosted_file_ecosystem("pixi.lock"), None);
+        assert_eq!(hosted_file_ecosystem("pixi.toml"), None);
+        assert!(paths_with(HOSTED).contains(&"pixi.lock"));
         assert_eq!(hosted_file_ecosystem("package.json"), None);
         assert_eq!(hosted_file_ecosystem("NuGet.Config"), Some("nuget"));
     }

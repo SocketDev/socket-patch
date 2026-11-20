@@ -1,0 +1,162 @@
+name: pixi patch compatibility
+
+# Native pixi matrix: builds the CLI once per OS, downloads each pinned pixi
+# release (SHA-256 pinned in the harness) and runs `scripts/backtest-pixi.py`:
+# agent mode against the public urllib3 free patch with no `pixi run` around
+# the CLI, verifying the INSTALLED bytes in every environment, pixi's package
+# cache, reinstall + re-apply and rollback, plus the hosted and vendored
+# refusals. No Socket API token is needed. See
+# docs/testing/pixi-compatibility.md.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    # Only this package manager's own files. A change to shared engine code
+    # runs the full matrix on push to main, or on demand via
+    # workflow_dispatch on the PR branch; ci.yml's hermetic tests still run
+    # on every PR and in the merge queue.
+    paths:
+      - '.github/actions/upload-artifact/**'
+      - '.github/workflows/pixi-compatibility.yml'
+      - 'scripts/backtest-pixi.py'
+      - 'crates/*/src/**/*pixi*'
+      - 'crates/socket-patch-core/src/crawlers/python_crawler.rs'
+  push:
+    branches: [main]
+    paths:
+      - '.github/actions/upload-artifact/**'
+      - '.github/workflows/pixi-compatibility.yml'
+      - 'scripts/backtest-pixi.py'
+      - 'crates/*/src/**/*pixi*'
+      - 'crates/socket-patch-core/src/crawlers/**'
+      - 'crates/socket-patch-core/src/patch/**'
+      - 'crates/socket-patch-cli/src/commands/apply.rs'
+      - 'crates/socket-patch-cli/src/commands/rollback.rs'
+      - 'crates/socket-patch-cli/src/commands/scan/**'
+      - 'crates/socket-patch-cli/src/commands/vex*.rs'
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: 'Space-separated pixi versions (empty = the required matrix below)'
+        required: false
+        default: ''
+      shapes:
+        description: 'Space-separated shapes (empty = every shape)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pixi-compat-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  SOCKET_NO_CONFIG: '1'
+  SOCKET_NO_UPDATE_CHECK: '1'
+  SOCKET_TELEMETRY_DISABLED: '1'
+
+jobs:
+  build:
+    if: github.event.pull_request.draft != true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        exclude:
+          # macOS legs run on push to main, not per PR push.
+          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: dev-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Compile the CLI once
+        run: |
+          set -euo pipefail
+          cargo build --locked -p socket-patch-cli --bin socket-patch
+          mkdir -p target/pixi-e2e
+          cp target/debug/socket-patch target/pixi-e2e/socket-patch
+      - uses: ./.github/actions/upload-artifact
+        with:
+          name: pixi-cli-${{ matrix.os }}
+          path: target/pixi-e2e/
+          if-no-files-found: error
+          retention-days: 7
+
+  native:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest release the harness drives, a lock-format-6 release and
+        # two recent ones. No Windows: the harness is POSIX only.
+        os: [ubuntu-latest]
+        pixi: ['0.20.1', '0.39.5', '0.63.2', '0.84.2']
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
+    timeout-minutes: 30
+    steps: &native-steps
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: pixi-cli-${{ matrix.os }}*
+          merge-multiple: true
+          path: native-cli
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12.13'
+      - name: Exercise real pixi projects
+        shell: bash
+        env:
+          PIXI_VERSION: ${{ matrix.pixi }}
+          VERSIONS_OVERRIDE: ${{ github.event.inputs.versions }}
+          SHAPES_OVERRIDE: ${{ github.event.inputs.shapes }}
+        run: |
+          chmod +x native-cli/socket-patch
+          versions="$PIXI_VERSION"
+          if [ -n "$VERSIONS_OVERRIDE" ]; then versions="$VERSIONS_OVERRIDE"; fi
+          shapes_arg=()
+          if [ -n "$SHAPES_OVERRIDE" ]; then shapes_arg=(--shapes $SHAPES_OVERRIDE); fi
+          python3 scripts/backtest-pixi.py \
+            --socket-patch native-cli/socket-patch \
+            --socket-patch-revision "$GITHUB_SHA" \
+            --output native-pixi \
+            --versions $versions \
+            "${shapes_arg[@]}"
+      - uses: ./.github/actions/upload-artifact
+        if: always()
+        with:
+          name: pixi-results-${{ matrix.os }}-${{ matrix.pixi }}
+          path: |
+            native-pixi/provenance.json
+            native-pixi/summary.json
+            native-pixi/summary.md
+            native-pixi/cases/**/result.json
+            native-pixi/cases/**/logs/*.log
+            native-pixi/cases/**/project/pixi.toml
+            native-pixi/cases/**/project/pyproject.toml
+            native-pixi/cases/**/project/pixi.lock
+          retention-days: 14
+
+  # The macOS rows of `native`: they run on push to main, not on every PR
+  # push, so PRs stop queueing on the small macOS runner pool.
+  native-macos:
+    if: github.event_name != 'pull_request'
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        # The ends of the range.
+        os: [macos-latest]
+        pixi: ['0.20.1', '0.84.2']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps: *native-steps

@@ -1623,7 +1623,7 @@ fn took(elapsed: Duration) -> String {
 }
 
 /// Run a build of `copy`'s extension (`run`, `from`: "its source gem with
-/// the patch applied", "its patched gem"), saying when it starts and how it
+/// the patch applied", "its upstream gem"), saying when it starts and how it
 /// ended
 /// ([`RubyEnv::progress`]). What the build was worth is the caller's to
 /// say: one that exits cleanly may still have built nothing of the patch.
@@ -2546,10 +2546,13 @@ fn parse_installed(stdout: &str) -> Option<(String, PathBuf)> {
 /// Nothing of the installed copy is changed. The Ruby is found as for a
 /// rebuild ([`find_ruby`]): the one whose extension dir for the gem is the
 /// installed one, so the staged build has the installed build's platform
-/// and ABI. `Err` says why there is no staged install to use.
+/// and ABI. `kind` says which gem `archive` is, for the build's progress
+/// line: `patched`, or `upstream` when an unwind puts that one back
+/// (#2152). `Err` says why there is no staged install to use.
 pub(crate) async fn install_staged(
     installed: &Path,
     archive: &Path,
+    kind: &str,
     stage_home: &Path,
     env: &RubyEnv,
 ) -> Result<StagedInstall, String> {
@@ -2571,7 +2574,7 @@ pub(crate) async fn install_staged(
         archive,
         stage_home,
     };
-    let stdout = run_build(&probe, run, &copy, env, "its patched gem").await?;
+    let stdout = run_build(&probe, run, &copy, env, &format!("its {kind} gem")).await?;
     let (full_name, built) = parse_installed(&stdout)
         .ok_or_else(|| format!("{}: unreadable install output", probe.ruby.display()))?;
     let staged = StagedInstall {
@@ -3628,10 +3631,15 @@ fn stale_build(
 }
 
 /// Rebuild `copy`'s extension from the sources on disk with `probe.ruby`,
-/// in its installed tree. `stale` are files of that tree the gem's build is
-/// known to make ([`StageFailure::InTree`]): they are taken out of the
-/// build's way, as a fresh install has none of them, so a build that would
-/// take them for current makes them again.
+/// in its installed tree, as close to a fresh install's as `seen` (what
+/// the build of its source gem showed, [`StageFailure::InTree`]) lets it
+/// be made. The files of the tree that build is known to make are taken
+/// out of the build's way, as a fresh install has none of them, so a build
+/// that would take them for current makes them again. The files the gem
+/// ships that the tree no longer holds are put back for it ([`give_back`]),
+/// so a build script that uses one up can run again (#2106); those the
+/// build leaves as they were are taken away after it, whether it finished
+/// or not.
 ///
 /// The gem's own tree is snapshotted first ([`TreeSnapshot`]). What a
 /// finished build replaced or added there is backed up with the original
@@ -3650,7 +3658,7 @@ async fn rebuild(
     files: &HashMap<String, PatchFileInfo>,
     env: &RubyEnv,
     back_up: bool,
-    stale: &[String],
+    seen: &SeenInStage,
 ) -> Result<(), NotRebuilt> {
     // A backup this rebuild made is dropped again when the build does not
     // land: the install-time build is back in place, so the copy is as it
@@ -3666,8 +3674,9 @@ async fn rebuild(
         .keys()
         .map(|key| normalize_file_path(key).to_string())
         .collect();
-    let (aside, made_backup, snapshot, removed) = {
-        let (copy, probe, stale) = (copy.clone(), probe.clone(), stale.to_vec());
+    let (aside, made_backup, snapshot, removed, given) = {
+        let (copy, probe) = (copy.clone(), probe.clone());
+        let (stale, used_up) = (seen.created.clone(), seen.used_up.clone());
         crate::utils::fs::run_blocking(move || {
             let made = if back_up {
                 back_up_original(&copy, &probe, &[])
@@ -3696,8 +3705,16 @@ async fn rebuild(
                 }
                 Ok((snapshot, removed))
             });
+            // What is written here is in no snapshot: the undo of a failed
+            // build removes it. Files that cannot be written (a full
+            // disk) leave the tree as it is, which is what the build ran
+            // over before there was anything to give it.
+            let prepared = prepared.map(|(snapshot, removed)| {
+                let given = give_back(&copy, &snapshot, &used_up, &left).unwrap_or_default();
+                (snapshot, removed, given)
+            });
             match prepared {
-                Ok((snapshot, removed)) => Ok((aside, made, snapshot, removed)),
+                Ok((snapshot, removed, given)) => Ok((aside, made, snapshot, removed, given)),
                 Err(e) => {
                     // The parked build stays where it is when the tree
                     // cannot be put back: the next run tries again.
@@ -3753,6 +3770,9 @@ async fn rebuild(
                 let unread = watch
                     .as_ref()
                     .and_then(|watch| unread_inputs(&copy.gem_dir, watch, &snapshot.dir));
+                // What the build left of the files it was given is no
+                // change it made.
+                take_away(&copy, &given);
                 let changes = tree_changes(&copy, &snapshot);
                 let stale = stale_build(&copy, &probe, &removed, &snapshot, &changes);
                 match (stale, unread) {
@@ -3799,8 +3819,13 @@ async fn rebuild(
         // The gem's own tree first, while the parked build still says a
         // rebuild is under way: if it cannot be put back, the parked build
         // stays, and the next run tries again from the snapshot.
-        let undone =
-            restore_tree(&copy, &snapshot.dir).and_then(|()| put_back(&copy, &probe, aside));
+        let undone = restore_tree(&copy, &snapshot.dir)
+            .map(|()| {
+                // The files went with the restore; the dirs made for them
+                // are left to go.
+                take_away(&copy, &given);
+            })
+            .and_then(|()| put_back(&copy, &probe, aside));
         match undone {
             Ok(()) => {
                 drop_new_backup(&copy, made_backup);
@@ -4042,10 +4067,204 @@ enum StageFailure {
     /// in for it.
     InTree {
         products: Vec<String>,
-        /// Those of `products` the source gem does not ship: the build
-        /// made them, and a fresh install builds without them.
-        created: Vec<String>,
+        /// What the staged build showed that a build of the installed
+        /// tree goes by.
+        seen: SeenInStage,
     },
+}
+
+/// A file the source gem ships that the installed copy does not hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShippedFile {
+    /// Its path in the gem dir, `/`-separated.
+    rel: String,
+    bytes: Vec<u8>,
+    permissions: std::fs::Permissions,
+    /// When the stage's copy was written: before the record's files were,
+    /// in the stage and in the installed copy.
+    modified: Option<std::time::SystemTime>,
+}
+
+/// What building a gem's source gem in a stage showed of its build, for a
+/// build of the installed tree ([`rebuild`]) to go by. The default (no
+/// staged build to learn from) changes nothing of that build.
+#[derive(Debug, Default)]
+struct SeenInStage {
+    /// The files Ruby loads that the build made in the gem's own tree and
+    /// the source gem does not ship ([`in_tree_products`]): a fresh
+    /// install builds without them.
+    created: Vec<String>,
+    /// The files the source gem ships that the installed copy no longer
+    /// holds ([`used_up_files`]): a fresh install builds with them.
+    used_up: Vec<ShippedFile>,
+}
+
+/// The most bytes of [`used_up_files`] a run keeps while the staged build
+/// runs. A gem that ships more than this and installs without it is built
+/// in place from the tree as it is.
+const USED_UP_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// The files of the pristine source gem unpacked at `staged` that the
+/// copy at `installed` does not hold, with their content.
+///
+/// RubyGems installs every file of a gem, so one that is gone was taken
+/// away after the install, as a rule by the gem's own build: a script that
+/// renames a file it ships (argon2's `extconf.rb` makes `Makefile.real`
+/// its `Makefile`), or one that deletes the sources it has compiled. That
+/// build cannot run a second time over what it left, and the build of the
+/// stage uses the staged files up the same way, so they are read before
+/// it. All of them or none: a file that cannot be read, or more than
+/// [`USED_UP_LIMIT`] in all, keeps nothing.
+///
+/// Each keeps the time the stage's copy was written, which is before the
+/// record's files are written anywhere. A file given back with the time
+/// of its writing would be newer than the patched sources, and a build
+/// that makes one from the other (a parser the gem ships generated) would
+/// take the shipped one for current.
+fn used_up_files(installed: &Path, staged: &Path) -> Vec<ShippedFile> {
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    for rel in tree_files(staged) {
+        if !is_safe_relative_subpath(&rel) || is_own_entry(&rel) {
+            continue;
+        }
+        // Only a file that is not there is one the copy does not hold.
+        if !matches!(try_entry_type(&installed.join(&rel)), Ok(None)) {
+            continue;
+        }
+        let path = staged.join(&rel);
+        // Its size before its bytes: one that is over the limit is not
+        // read to find that out.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            return Vec::new();
+        };
+        total = total.saturating_add(meta.len());
+        if total > USED_UP_LIMIT {
+            return Vec::new();
+        }
+        let Ok(bytes) = read_regular_to_bytes_sync(&path) else {
+            return Vec::new();
+        };
+        files.push(ShippedFile {
+            rel,
+            bytes,
+            permissions: meta.permissions(),
+            modified: meta.modified().ok(),
+        });
+    }
+    files
+}
+
+/// The files [`give_back`] wrote, and the dirs it made for them.
+#[derive(Debug, Default)]
+struct GivenBack {
+    /// Gem-dir path → git-sha256 of what was written.
+    files: Vec<(String, String)>,
+    /// Deepest first.
+    dirs: Vec<PathBuf>,
+}
+
+/// Write the files a fresh install of the gem would hold and `copy` does
+/// not (`used_up`) into its tree, for an in-place build to find: after
+/// `snapshot` was taken, so the undo of a failed build removes them
+/// ([`restore_tree`]). A path the tree holds by now, one of the record's
+/// (`left`), and one under a link in the gem dir (it would be written
+/// through the link) are left alone. On `Err` nothing of it is left.
+fn give_back(
+    copy: &GemCopy,
+    snapshot: &TreeSnapshot,
+    used_up: &[ShippedFile],
+    left: &[String],
+) -> std::io::Result<GivenBack> {
+    let mut given = GivenBack::default();
+    let written = write_used_up(copy, snapshot, used_up, left, &mut given);
+    // Deepest first, each once.
+    given
+        .dirs
+        .sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    given.dirs.dedup();
+    match written {
+        Ok(()) => Ok(given),
+        Err(e) => {
+            // Nothing has run since: every file listed is this call's,
+            // whole or not.
+            for (rel, _) in &given.files {
+                let _ = std::fs::remove_file(copy.gem_dir.join(rel));
+            }
+            take_away(copy, &given);
+            Err(e)
+        }
+    }
+}
+
+/// [`give_back`]'s writes, each listed in `given` before it is made.
+fn write_used_up(
+    copy: &GemCopy,
+    snapshot: &TreeSnapshot,
+    used_up: &[ShippedFile],
+    left: &[String],
+    given: &mut GivenBack,
+) -> std::io::Result<()> {
+    for file in used_up {
+        let rel = &file.rel;
+        if !is_safe_relative_subpath(rel)
+            || is_own_entry(rel)
+            || left.contains(rel)
+            || snapshot.files.contains_key(rel)
+        {
+            continue;
+        }
+        let path = copy.gem_dir.join(rel);
+        if crate::utils::containment::try_linked_level(&copy.gem_dir, &path)?.is_some()
+            || try_entry_type(&path)?.is_some()
+        {
+            continue;
+        }
+        // The dirs that are made for it, to take away again with it.
+        let mut made = Vec::new();
+        let mut dir = path.parent();
+        while let Some(parent) = dir.filter(|parent| *parent != copy.gem_dir) {
+            if try_entry_type(parent)?.is_some() {
+                break;
+            }
+            made.push(parent.to_path_buf());
+            dir = parent.parent();
+        }
+        given.dirs.extend(made);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        given
+            .files
+            .push((rel.clone(), compute_git_sha256_from_bytes(&file.bytes)));
+        std::fs::write(&path, &file.bytes)?;
+        if let Some(modified) = file.modified {
+            // Before the permissions, which may not let it be opened.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)?
+                .set_modified(modified)?;
+        }
+        std::fs::set_permissions(&path, file.permissions.clone())?;
+    }
+    Ok(())
+}
+
+/// Take away what [`give_back`] wrote and the build left as it was: a
+/// file of the gem that the installed copy did not hold before the build
+/// is not left in it after. A file the build changed is the build's, and
+/// stays. So does a dir that still holds something.
+fn take_away(copy: &GemCopy, given: &GivenBack) {
+    for (rel, hash) in &given.files {
+        let path = copy.gem_dir.join(rel);
+        if is_real_file(&path) && compute_file_git_sha256_sync(&path).ok().as_ref() == Some(hash) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    for dir in &given.dirs {
+        // Fails on a dir that is not empty, which is the point.
+        let _ = std::fs::remove_dir(dir);
+    }
 }
 
 impl StageFailure {
@@ -4507,6 +4726,14 @@ async fn build_in_stage(
             .await
             .map_err(StageFailure::NotOwnSource)?;
     }
+    // What the installed copy's build used up of the gem, while the stage
+    // still holds it: only a copy RubyGems built is ever built in place.
+    let used_up = if source.full_name() == copy.full_name {
+        let (installed, unpacked) = (copy.gem_dir.clone(), staged.gem_dir.clone());
+        crate::utils::fs::run_blocking(move || used_up_files(&installed, &unpacked)).await
+    } else {
+        Vec::new()
+    };
     // The record over the pristine source gem, before anything runs.
     if let Some(record) = record {
         let blobs = stage_blobs(record.pkg_path, record.files, record.sources).await;
@@ -4604,7 +4831,10 @@ async fn build_in_stage(
         .await
     };
     if !products.is_empty() {
-        return Err(StageFailure::InTree { products, created });
+        return Err(StageFailure::InTree {
+            products,
+            seen: SeenInStage { created, used_up },
+        });
     }
     Ok(built)
 }
@@ -6036,12 +6266,13 @@ async fn rebuild_in_place(
             warning: None,
         };
     }
-    // What the source gem's build was seen to make in the gem's own tree.
-    let stale: &[String] = match staged {
-        StageFailure::InTree { created, .. } => created,
-        _ => &[],
+    // What the source gem's build showed of this gem's build.
+    let nothing = SeenInStage::default();
+    let seen = match staged {
+        StageFailure::InTree { seen, .. } => seen,
+        _ => &nothing,
     };
-    match rebuild(job.copy, probe, job.scope, job.files, job.env, true, stale).await {
+    match rebuild(job.copy, probe, job.scope, job.files, job.env, true, seen).await {
         Ok(()) => job.built(result),
         // The previous build is back, and the sources stay written.
         Err(NotRebuilt::NotOfPatch(why)) => job.not_compiled(result, &why),
@@ -6305,9 +6536,9 @@ pub async fn restore_original_build(pkg_path: &Path, env: &RubyEnv) -> Result<bo
     })?;
     let rebuilt = match rebuild_unpatched_from_source_gem(&copy, &probe, env).await {
         Ok(rebuilt) => rebuilt,
-        Err(stale) => {
+        Err(seen) => {
             let scope = NativeScope::default();
-            rebuild(&copy, &probe, &scope, &HashMap::new(), env, false, &stale)
+            rebuild(&copy, &probe, &scope, &HashMap::new(), env, false, &seen)
                 .await
                 .map_err(NotRebuilt::into_detail)
         }
@@ -6327,32 +6558,32 @@ pub async fn restore_original_build(pkg_path: &Path, env: &RubyEnv) -> Result<bo
 /// over it), for a rollback that has no backup of the original build.
 /// `Err` when it cannot be built from the source gem
 /// ([`build_from_source_gem`]): the in-place rebuild is what is left, and
-/// the error holds the files that build is known to make in the gem's own
-/// tree ([`StageFailure::InTree`]), for [`rebuild`] to take out of its way.
+/// the error holds what the staged build showed of the gem's build
+/// ([`StageFailure::InTree`]), for [`rebuild`] to go by.
 async fn rebuild_unpatched_from_source_gem(
     copy: &GemCopy,
     probe: &Probe,
     env: &RubyEnv,
-) -> Result<Result<(), String>, Vec<String>> {
+) -> Result<Result<(), String>, SeenInStage> {
     let spec_text = crate::utils::fs::read_regular_to_string(&copy.spec_path)
         .await
-        .map_err(|_| Vec::new())?;
+        .map_err(|_| SeenInStage::default())?;
     let facts = SpecFacts::of(&spec_text, &copy.full_name);
     let source = facts
         .release
         .filter(|_| facts.extensions.declared)
-        .ok_or_else(Vec::new)?;
+        .ok_or_else(SeenInStage::default)?;
     let gems = GemSource::of(&env.cwd, env.offline).await;
     let archive = gems
         .archive(&copy.home, &source)
         .await
-        .map_err(|_| Vec::new())?;
+        .map_err(|_| SeenInStage::default())?;
     let (stage, built) =
         match build_from_source_gem(copy, probe, &source, archive, &gems, env, None).await {
             Ok(staged) => staged,
             Err(StageFailure::Busy(why)) => return Ok(Err(why)),
-            Err(StageFailure::InTree { created, .. }) => return Err(created),
-            Err(_) => return Err(Vec::new()),
+            Err(StageFailure::InTree { seen, .. }) => return Err(seen),
+            Err(_) => return Err(SeenInStage::default()),
         };
     let moved_in = {
         let (copy, probe) = (copy.clone(), probe.clone());
@@ -9780,6 +10011,171 @@ mod tests {
             (tree_bytes(&copy.gem_dir), tree_bytes(&probe.extension_dir)),
             installed
         );
+    }
+
+    /// The source gem of [`in_tree_gem`], unpacked: what the installed
+    /// copy holds of it, a Makefile its build script renames and a dir of
+    /// sources its build deletes.
+    fn source_gem_of(copy: &GemCopy, at: &Path) -> PathBuf {
+        let staged = at.join("staged");
+        for (rel, bytes) in [
+            ("ext/a/a.c", "patched source"),
+            ("ext/a/Makefile.real", "the makefile"),
+            ("ext/a/vendor/src/b.c", "packed source"),
+            ("lib/a.rb", "ruby"),
+            (MARKER_FILE, "not the gem's"),
+        ] {
+            let path = staged.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        assert!(!copy.gem_dir.join("ext/a/Makefile.real").exists());
+        staged
+    }
+
+    fn rels(files: &[ShippedFile]) -> Vec<&str> {
+        files.iter().map(|file| file.rel.as_str()).collect()
+    }
+
+    /// The files a fresh install would hold and the copy does not are the
+    /// ones its build used up: they are read from the pristine source gem,
+    /// with nothing of this module's among them (#2106).
+    #[test]
+    fn the_files_a_build_used_up_are_read_from_the_source_gem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (copy, _probe) = in_tree_gem(tmp.path());
+        let staged = source_gem_of(&copy, tmp.path());
+        let used_up = used_up_files(&copy.gem_dir, &staged);
+        assert_eq!(
+            rels(&used_up),
+            ["ext/a/Makefile.real", "ext/a/vendor/src/b.c"]
+        );
+        assert_eq!(used_up[0].bytes, b"the makefile");
+        assert_eq!(
+            used_up[0].modified,
+            std::fs::metadata(staged.join("ext/a/Makefile.real"))
+                .unwrap()
+                .modified()
+                .ok()
+        );
+    }
+
+    /// The used-up files are put back for the in-place build, after the
+    /// snapshot: a failed build's undo removes them, and after a finished
+    /// one those the build left alone go again, with the dirs made for
+    /// them. One the build wrote to is the build's (#2106).
+    #[test]
+    fn used_up_files_are_given_back_for_the_build_and_taken_away_after() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (copy, probe) = in_tree_gem(tmp.path());
+        let staged = source_gem_of(&copy, tmp.path());
+        // The stage was unpacked before the patched sources were written.
+        let unpacked = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(staged.join("ext/a/Makefile.real"))
+            .unwrap()
+            .set_modified(unpacked)
+            .unwrap();
+        let used_up = used_up_files(&copy.gem_dir, &staged);
+        let installed = tree_bytes(&copy.gem_dir);
+        let dirs = |copy: &GemCopy| copy.gem_dir.join("ext/a/vendor").exists();
+
+        // A build that fails: the snapshot's undo, then the dirs.
+        let snapshot = snapshot_tree(&copy, &probe.extension_dir, &record_paths()).unwrap();
+        let given = give_back(&copy, &snapshot, &used_up, &record_paths()).unwrap();
+        assert_eq!(
+            std::fs::read(copy.gem_dir.join("ext/a/Makefile.real")).unwrap(),
+            b"the makefile"
+        );
+        assert!(copy.gem_dir.join("ext/a/vendor/src/b.c").is_file());
+        // Not newer than the patched source: a build that makes one from
+        // the other would take the file given back for current.
+        let written = |rel: &str| {
+            std::fs::metadata(copy.gem_dir.join(rel))
+                .unwrap()
+                .modified()
+                .unwrap()
+        };
+        assert_eq!(Some(written("ext/a/Makefile.real")), used_up[0].modified);
+        assert!(written("ext/a/Makefile.real") < written("ext/a/a.c"));
+        build_in_tree(&copy, &probe);
+        restore_tree(&copy, &snapshot.dir).unwrap();
+        take_away(&copy, &given);
+        assert_eq!(tree_bytes(&copy.gem_dir), installed);
+        assert!(!dirs(&copy), "the dirs made for the files go with them");
+
+        // A build that finishes, having renamed one file as argon2's
+        // script does and left the other: neither is a change it made.
+        let snapshot = snapshot_tree(&copy, &probe.extension_dir, &record_paths()).unwrap();
+        let given = give_back(&copy, &snapshot, &used_up, &record_paths()).unwrap();
+        std::fs::rename(
+            copy.gem_dir.join("ext/a/Makefile.real"),
+            copy.gem_dir.join("ext/a/Makefile"),
+        )
+        .unwrap();
+        take_away(&copy, &given);
+        assert!(!dirs(&copy));
+        assert_eq!(
+            tree_changes(&copy, &snapshot),
+            TreeChanges {
+                replaced: vec!["ext/a/Makefile".to_string()],
+                created: vec![],
+            }
+        );
+        restore_tree(&copy, &snapshot.dir).unwrap();
+
+        // A file the build wrote to stays, and is one it created.
+        let snapshot = snapshot_tree(&copy, &probe.extension_dir, &record_paths()).unwrap();
+        let given = give_back(&copy, &snapshot, &used_up, &record_paths()).unwrap();
+        std::fs::write(copy.gem_dir.join("ext/a/vendor/src/b.c"), b"generated").unwrap();
+        take_away(&copy, &given);
+        assert_eq!(
+            tree_changes(&copy, &snapshot).created,
+            ["ext/a/vendor/src/b.c"]
+        );
+        restore_tree(&copy, &snapshot.dir).unwrap();
+        take_away(&copy, &given);
+        assert_eq!(tree_bytes(&copy.gem_dir), installed);
+    }
+
+    /// Nothing is written over a file the tree holds, in place of a file
+    /// of the record, or through a link in the gem dir (#2106).
+    #[test]
+    fn a_used_up_file_is_only_written_where_the_tree_has_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (copy, probe) = in_tree_gem(tmp.path());
+        let shipped = |rel: &str| ShippedFile {
+            rel: rel.to_string(),
+            bytes: b"shipped".to_vec(),
+            permissions: std::fs::metadata(copy.gem_dir.join("lib/a.rb"))
+                .unwrap()
+                .permissions(),
+            modified: None,
+        };
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut used_up = vec![
+            shipped("ext/a/Makefile"),
+            shipped("ext/a/a.c"),
+            shipped("../outside"),
+            shipped(MARKER_FILE),
+        ];
+        let outside = tmp.path().join("elsewhere");
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(&outside).unwrap();
+            std::os::unix::fs::symlink(&outside, copy.gem_dir.join("linked")).unwrap();
+            used_up.push(shipped("linked/planted"));
+        }
+        // The record's file is gone from the tree (a patch may delete one).
+        std::fs::remove_file(copy.gem_dir.join("ext/a/a.c")).unwrap();
+        let installed = tree_bytes(&copy.gem_dir);
+        let snapshot = snapshot_tree(&copy, &probe.extension_dir, &record_paths()).unwrap();
+        let given = give_back(&copy, &snapshot, &used_up, &record_paths()).unwrap();
+        assert!(given.files.is_empty(), "{given:?}");
+        assert_eq!(tree_bytes(&copy.gem_dir), installed);
+        assert!(!outside.join("planted").exists());
+        assert!(!tmp.path().join("gems/outside").exists());
     }
 
     /// A build that fails part-way has already written into the gem's own

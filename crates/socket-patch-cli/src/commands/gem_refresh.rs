@@ -1241,14 +1241,16 @@ pub(crate) async fn after_vendored_unwind(
     unwound: &[String],
     records: &BTreeMap<String, PatchRecord>,
 ) -> RestoreRefresh {
+    use socket_patch_core::patch::redirect::upstream::gem_upstream;
+
     let mut installed: BTreeSet<String> = BTreeSet::new();
-    // A vendored gem is the ruby-platform gem: a platform build installed
-    // beside it was never the vendored copy's stand-in.
-    let ruby_builds: Vec<(String, String)> = unwound
-        .iter()
-        .filter_map(|purl| Some((purl.clone(), GemBuild::ruby(purl)?.leaf)))
-        .collect();
-    for copy in installed_builds(common, &ruby_builds).await {
+    // The builds the restored lock names: a gem vendored from prebuilt
+    // platform gems is back on its platform entries, and the copy Bundler
+    // loads again is `<name>-<version>-<platform>` (#2174). Reading the
+    // lock asks no registry.
+    let lock = gem_upstream(&common.cwd, &BTreeMap::new(), true).await;
+    let builds = build_leaves(&named_builds(&lock, unwound), |_| true);
+    for copy in installed_builds(common, &builds).await {
         if copy.archive.is_file() || holds_patch(&copy, records).await {
             installed.insert(copy.purl);
         }
@@ -1266,6 +1268,26 @@ pub(crate) async fn after_vendored_unwind(
         Scope::Installed,
     )
     .await
+}
+
+/// The builds of each gem of `gems` that are this project's: the ones the
+/// restored lock (`upstream`) names. A lock that names none (it could not
+/// be read) leaves the ruby-platform gem, the one build an unwind looked
+/// at before platform builds were followed.
+fn named_builds(
+    upstream: &socket_patch_core::patch::redirect::upstream::GemUpstream,
+    gems: &[String],
+) -> BTreeMap<String, Vec<GemBuild>> {
+    let mut named = BTreeMap::new();
+    for (purl, builds) in gems.iter().zip(upstream.builds(gems)) {
+        let builds = if builds.is_empty() {
+            GemBuild::ruby(purl).into_iter().collect()
+        } else {
+            builds
+        };
+        named.insert(purl.clone(), builds);
+    }
+    named
 }
 
 async fn refresh_restored(
@@ -1308,19 +1330,7 @@ async fn refresh_restored(
     // The restored lock, read once, and one registry client for every
     // lookup below.
     let upstream = gem_upstream(&common.cwd, staged, common.offline).await;
-    // The builds of each restored gem that are this project's: the ones the
-    // restored lock names. A lock that names none (it could not be read)
-    // leaves the ruby-platform gem, the one build an unwind looked at
-    // before platform builds were followed.
-    let mut named: BTreeMap<String, Vec<GemBuild>> = BTreeMap::new();
-    for (purl, builds) in gems.iter().zip(upstream.builds(&gems)) {
-        let builds = if builds.is_empty() {
-            GemBuild::ruby(purl).into_iter().collect()
-        } else {
-            builds
-        };
-        named.insert(purl.clone(), builds);
-    }
+    let named = named_builds(&upstream, &gems);
     // A lock names a platform build for every platform the project
     // supports, and this machine holds one of them: only a platform build
     // that is installed in a gem home Bundler uses or (in [`Scope::All`])

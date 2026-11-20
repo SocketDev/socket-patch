@@ -478,7 +478,14 @@ async fn agent_scan_names_a_python_project_below_with_its_own_venv() {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     std::fs::write(root.join(".gitignore"), ".venv/\n").unwrap();
     let svc = root.join("svc");
-    let dist = svc.join(".venv/lib/python3.12/site-packages/six-1.16.0.dist-info");
+    // The venv layout the Python crawler reads on this platform: Windows
+    // has no per-version directory.
+    let site_packages = if cfg!(windows) {
+        svc.join(".venv").join("Lib").join("site-packages")
+    } else {
+        svc.join(".venv/lib/python3.12/site-packages")
+    };
+    let dist = site_packages.join("six-1.16.0.dist-info");
     std::fs::create_dir_all(&dist).unwrap();
     std::fs::write(svc.join(".venv/pyvenv.cfg"), "version = 3.12.0\n").unwrap();
     std::fs::write(

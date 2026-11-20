@@ -715,6 +715,7 @@ const TOOL_DIR_VARS: &[&str] = &[
     "UV_TOOL_DIR",
     "UV_PYTHON_INSTALL_DIR",
     "PDM_CONFIG_FILE",
+    "PIXI_HOME",
 ];
 
 /// Run `get_global_python_site_packages` with HOME and `vars` bound and
@@ -781,6 +782,40 @@ async fn get_global_python_site_packages_discovers_uv_tools_under_uv_tool_dir() 
 
     let result = global_site_packages_with_vars(tmp.path(), &[("UV_TOOL_DIR", &tools)]).await;
     assert_surfaces(&result, &sp, "uv tool env under UV_TOOL_DIR");
+}
+
+/// `pixi global install <tool>` keeps one conda prefix per tool under
+/// `<pixi home>/envs`, and `PIXI_HOME` relocates pixi's home on every OS.
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pixi_global_tools_under_pixi_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pixi_home = tmp.path().join("custom-pixi");
+    let sp = stage_env(&pixi_home.join("envs").join("ruff")).await;
+
+    let result = global_site_packages_with_vars(tmp.path(), &[("PIXI_HOME", &pixi_home)]).await;
+    assert_surfaces(&result, &sp, "pixi global tool env under PIXI_HOME");
+}
+
+/// Without `PIXI_HOME`, pixi's home is `~/.pixi`. A tool installed there
+/// before `PIXI_HOME` was set is still a real install, so both are read.
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pixi_global_tools_under_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sp = stage_env(&tmp.path().join(".pixi").join("envs").join("ipython")).await;
+
+    let result = global_site_packages_with_vars(tmp.path(), &[]).await;
+    assert_surfaces(&result, &sp, "pixi global tool env under ~/.pixi");
+
+    let elsewhere = tmp.path().join("elsewhere");
+    let result = global_site_packages_with_vars(tmp.path(), &[("PIXI_HOME", &elsewhere)]).await;
+    assert_surfaces(
+        &result,
+        &sp,
+        "pixi global tool env under ~/.pixi with PIXI_HOME set",
+    );
 }
 
 /// uv's data dir follows an absolute `$XDG_DATA_HOME` on Linux and macOS
