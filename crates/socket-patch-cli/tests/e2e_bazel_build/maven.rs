@@ -25,10 +25,11 @@
 //!   Bazel before 7.5.0 the checkout first has no `.bazelversion`: the
 //!   command then writes nothing and says so (`maven_bazel_release`).
 //! - [`a_hosted_scan_of_a_tree_only_bazel_builds`]: the same checkout, and
-//!   `socket-patch scan --mode hosted --yes` in the place of the `get`. It
-//!   knows no Maven package in a tree without a `pom.xml` or a Gradle
-//!   build: it asks the API about none, reports none and changes no file,
-//!   while the API has a patch for a jar that the build takes.
+//!   `socket-patch scan --mode hosted --yes` in the place of the `get`. The
+//!   two jars of the hub's lock are its packages, neither of them
+//!   installed where a crawl looks; it finds the patch of the victim and
+//!   writes the same block. The build is patched, a second scan writes
+//!   nothing, and `rollback --yes` restores every file.
 //! - [`a_pom_patch_beside_a_pinned_hub`]: a checkout that Maven builds
 //!   too. The one command pins both builds: the three files of a Maven pin
 //!   and `MODULE.bazel`. The Bazel build is patched, and `rollback --yes`
@@ -38,9 +39,10 @@
 //!   passes. The build then stops at the line of the entry's
 //!   `override_repo(`, where the block says what to run. `socket-patch
 //!   rollback <purl> --yes` takes the entry out, and the build takes the
-//!   new upstream jar. The API has a patch of that release too, and a
-//!   hosted `scan` of the checkout with the stale entry does not find it
-//!   and leaves the entry: the lock is not where it looks.
+//!   new upstream jar. The API has a patch of that release too: a hosted
+//!   `scan` of the checkout with the stale entry takes the entry out,
+//!   reads the release from the lock, pins that patch, and the build
+//!   takes its jar.
 //! - [`the_users_own_override_of_the_artifact`]: the hub has a
 //!   `maven.override` that puts a target of the checkout in the artifact's
 //!   place. The command writes nothing and names the override's line
@@ -99,9 +101,9 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use socket_patch_core::bazel::maven::{Lock, Pinned as Jar};
 
-use crate::envelope::event_for;
+use crate::envelope::{event_for, event_triples};
 use crate::harness::{changed, rewrite, Cell, Fixture, Ran, StandIn, Tree, CONSUMER, NOTHING};
-use crate::hosted_memory_common::{Patch, ORG};
+use crate::hosted_memory_common::Patch;
 
 /// The workspace the tests build, and the ruleset each Bazel release
 /// builds it with. One era per way the ruleset names an artifact's
@@ -230,6 +232,8 @@ fn serve_upstream(
 
 /// A patch of the victim that a stand-in grants.
 struct Granted {
+    /// The release of the victim it is for.
+    version: String,
     uuid: String,
     /// The sha256 the grant pins, of a jar with [`Granted::marker`].
     sha256: String,
@@ -288,6 +292,7 @@ fn grant(standin: &StandIn, version: &str, tampered: Option<&[u8]>) -> (Granted,
         reference,
     };
     let granted = Granted {
+        version: version.to_string(),
         sha256: sha256_hex(&jar),
         url: format!("https://{registry}/{file}"),
         route,
@@ -304,28 +309,34 @@ const REPOSITORY: &str = "dev_socket_fixture_victim_1_10_0";
 /// The block of `MODULE.bazel` for `patch`, with its last line break.
 fn block(patch: &Granted) -> String {
     let Granted {
-        uuid, sha256, url, ..
+        version,
+        uuid,
+        sha256,
+        url,
+        ..
     } = patch;
+    let repository = REPOSITORY.replace("1_10_0", &version.replace('.', "_"));
+    let purl = format!("pkg:maven/{GROUP}/{VICTIM}@{version}");
     format!(
         r#"# >>> socket-patch: Maven patches for Bazel (managed block: socket-patch writes and removes it) >>>
 socket_patch_http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
 
 socket_patch_maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
 
-# {PURL}, Socket patch {uuid}
+# {purl}, Socket patch {uuid}
 socket_patch_http_file(
-    name = "socket_patch_{REPOSITORY}",
-    downloaded_file_path = "v1/{GROUP_PATH}/{VICTIM}/{VERSION}/{VICTIM}-{VERSION}.jar",
+    name = "socket_patch_{repository}",
+    downloaded_file_path = "v1/{GROUP_PATH}/{VICTIM}/{version}/{VICTIM}-{version}.jar",
     sha256 = "{sha256}",
     urls = ["{url}"],
 )
 
 # If Bazel stops at the next line ("does not generate repository"), the hub's lock no longer pins
-# {GROUP}:{VICTIM} at {VERSION}: run `socket-patch rollback {PURL}`.
+# {GROUP}:{VICTIM} at {version}: run `socket-patch rollback {purl}`.
 # Do not change it to inject_repo(): the build would pass without the patch.
 override_repo(
     socket_patch_maven,
-    {REPOSITORY} = "socket_patch_{REPOSITORY}",
+    {repository} = "socket_patch_{repository}",
 )
 # <<< socket-patch <<<
 "#
@@ -520,27 +531,27 @@ impl Pinned {
     }
 
     /// `socket-patch scan --mode hosted --yes` in a checkout without a
-    /// `pom.xml`, whose API has a patch for a jar of the hub's lock: the
-    /// command knows no package there. It asks the API about none, reports
-    /// none and changes no file of `before`.
-    fn scan_finds_no_package(&self, before: &Tree) {
+    /// `pom.xml`: the two jars of the hub's lock are its packages, neither
+    /// installed where a crawl looks, and it pins the one `patch` is for
+    /// as the `get` of [`Pinned::pins`] does. `stale` is the patch of an
+    /// entry in the block that the lock no longer pins the jar of: the
+    /// scan takes that entry out first, and says so. `before` is the
+    /// checkout without any entry. Gives the files of the checkout.
+    fn scan_pins(&self, patch: &Granted, before: &Tree, stale: Option<&Granted>) -> Tree {
         let test = &self.cell.test;
-        let batch = format!("/v0/orgs/{ORG}/patches/batch");
-        let asked = self.standin.asked(&batch);
         let scan = self.socket_patch(&["scan", "--mode", "hosted", "--yes"]);
         let said = &scan.dump;
-        assert_eq!(scan.code, 0, "{test}: {said}");
-        assert_eq!(scan.envelope["scannedPackages"], 0, "{test}: {said}");
-        assert_eq!(scan.envelope["packages"], json!([]), "{test}: {said}");
-        assert_eq!(scan.envelope["events"], json!([]), "{test}: {said}");
-        let rewritten = &scan.envelope["redirect"]["rewrittenFiles"];
-        assert_eq!(*rewritten, json!([]), "{test}: {said}");
-        assert_eq!(self.standin.asked(&batch), asked, "{test}: {said}");
-        assert_eq!(
-            changed(before, &self.cell.tree()),
-            NOTHING,
-            "{test}: {said}"
-        );
+        let counted = ["scannedPackages", "lockfileOnlyPackages"].map(|n| &scan.envelope[n]);
+        assert_eq!(counted, [&json!(2), &json!(2)], "{test}: {said}");
+        let gone = |stale: &Granted| {
+            let purl = format!("pkg:maven/{GROUP}/{VICTIM}@{}", stale.version);
+            (purl, "rolledBack".into(), "maven_bazel_entry_stale".into())
+        };
+        let taken_out: Vec<_> = stale.map(gone).into_iter().collect();
+        let events = event_triples(&scan.envelope);
+        assert_eq!(events[..taken_out.len()], taken_out, "{test}: {said}");
+        assert_eq!(events.len(), taken_out.len() + 1, "{test}: {said}");
+        self.pinned(&scan, patch, before, &[MODULE])
     }
 
     /// A Bazel before 7.5.0 writes a lock that does not tell it from one
@@ -554,23 +565,27 @@ impl Pinned {
         self.cell.tree()
     }
 
-    /// The one command of hosted mode: it reports the patch applied,
-    /// rewrites `files` and no other file of `before`, and gives no
-    /// warning. `MODULE.bazel` is the one of before with the block after
-    /// one blank line, and nothing has asked for the patched jar yet.
-    /// Gives the files of the checkout.
+    /// The one command of hosted mode, a `get` of the purl: what
+    /// [`Pinned::pinned`] holds of it. Gives the files of the checkout.
     fn pins(&self, before: &Tree, files: &[&str]) -> Tree {
-        let test = &self.cell.test;
         let get = self.socket_patch(&["get", PURL, "--mode", "hosted", "--yes"]);
-        let said = &get.dump;
-        let pinned = self
-            .cell
-            .pinned_by(&get, PURL, &self.patch.uuid, before, files);
-        assert_eq!(get.envelope["warnings"], Value::Null, "{test}: {said}");
+        self.pinned(&get, &self.patch, before, files)
+    }
+
+    /// What a finished hosted command did for `patch`: it reports the
+    /// patch applied, rewrote `files` and no other file of `before`, and
+    /// gave no warning. `MODULE.bazel` is the one of before with the block
+    /// after one blank line, and nothing has asked for the patched jar
+    /// yet. Gives the files of the checkout.
+    fn pinned(&self, ran: &Ran, patch: &Granted, before: &Tree, files: &[&str]) -> Tree {
+        let (test, said) = (&self.cell.test, &ran.dump);
+        let purl = format!("pkg:maven/{GROUP}/{VICTIM}@{}", patch.version);
+        let pinned = self.cell.pinned_by(ran, &purl, &patch.uuid, before, files);
+        assert_eq!(ran.envelope["warnings"], Value::Null, "{test}: {said}");
         let text = |tree: &Tree| String::from_utf8(tree[MODULE].clone()).expect("a text file");
-        let with_block = format!("{}\n{}", text(before), block(&self.patch));
+        let with_block = format!("{}\n{}", text(before), block(patch));
         assert_eq!(text(&pinned), with_block, "{test}: {said}");
-        let asked = self.standin.asked(&self.patch.route);
+        let asked = self.standin.asked(&patch.route);
         assert_eq!(asked, 0, "{test}: the command fetched the patched jar");
         pinned
     }
@@ -784,9 +799,10 @@ fn a_tree_only_bazel_builds() {
 }
 
 /// A hosted scan of the checkout without a `pom.xml`: the lock of the hub
-/// is the one file that names the jars Bazel builds, and the command does
-/// not read it for packages. So it finds none, although the API has a
-/// patch for the victim, and the build is the one of before.
+/// is the one file that names the jars Bazel builds, and the command takes
+/// them for the packages of the project. It finds the patch of the victim
+/// and pins it as the `get` does: the build is patched, a second scan has
+/// nothing to write, and the undo restores every file.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
 fn a_hosted_scan_of_a_tree_only_bazel_builds() {
@@ -797,15 +813,32 @@ fn a_hosted_scan_of_a_tree_only_bazel_builds() {
     flow.builds_upstream();
     let before = flow.names_its_bazel();
 
-    flow.scan_finds_no_package(&before);
-    flow.cell.builds(&flow.upstream);
-    let asked = flow.standin.asked(&flow.patch.route);
-    assert_eq!(asked, 0, "{test}: something fetched the patched jar");
+    let pinned = flow.scan_pins(&flow.patch, &before, None);
+    flow.builds_patched(&pinned);
+    let again = flow.socket_patch(&["scan", "--mode", "hosted", "--yes"]);
+    let said = &again.dump;
+    let rewritten = &again.envelope["redirect"]["rewrittenFiles"];
+    assert_eq!(
+        (again.code, &again.envelope["summary"]["applied"], rewritten),
+        (0, &json!(1), &json!([])),
+        "{test}: {said}"
+    );
+    assert_eq!(
+        changed(&pinned, &flow.cell.tree()),
+        NOTHING,
+        "{test}: {said}"
+    );
+
+    let undo = flow.socket_patch(&["rollback", "--yes"]);
+    flow.cell
+        .undone(&undo, "rolledBack", &before, &flow.upstream);
     println!(
-        "{test}: Bazel {} built {:?} before and after `scan --mode hosted --yes`, which found \
-         no package in a checkout whose lock pins {PURL} and changed none of its {} files; {:?}",
+        "{test}: Bazel {} built {:?}, then {:?} from the patch host after `scan --mode hosted \
+         --yes` found {PURL} in the hub's lock and appended the block to MODULE.bazel; a second \
+         scan wrote nothing; `rollback` restored all {} files and the first build; {:?}",
         flow.cell.release(),
         flow.upstream,
+        flow.patch.marker,
         before.len(),
         flow.started.elapsed()
     );
@@ -813,9 +846,9 @@ fn a_hosted_scan_of_a_tree_only_bazel_builds() {
 
 /// The checkout moves the artifact one version up after the command: the
 /// relock passes, the build stops at the line of the entry, and the
-/// command the block names there takes the entry out. A hosted scan of
-/// the checkout with the stale entry does not: it leaves the entry, and
-/// does not find the patch of the new release.
+/// command the block names there takes the entry out. So does a hosted
+/// scan of the checkout with the stale entry: it takes the entry out,
+/// finds the new release in the lock, and pins the patch of it.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
 fn a_version_bump_of_the_patched_artifact() {
@@ -864,19 +897,23 @@ fn a_version_bump_of_the_patched_artifact() {
 
     // A user who runs a hosted scan where the block says to roll back:
     // the stale entry is in the file again, as it was when the build
-    // stopped. The API has a patch of the release the lock now pins, and
-    // the scan knows no package: the entry stays where Bazel stops.
+    // stopped. The scan takes it out as the rollback did, and the API has
+    // a patch of the release the lock now pins.
+    let rolled_back = flow.cell.tree();
     flow.cell.write(MODULE, module);
-    flow.scan_finds_no_package(&flow.cell.tree());
+    let pinned = flow.scan_pins(&flow.next, &rolled_back, Some(&flow.patch));
+    flow.cell.builds_patched(&pinned, &flow.next.marker);
     let asked = flow.standin.asked(&flow.next.route);
-    assert_eq!(asked, 0, "{test}: something fetched the patched jar");
+    assert!(asked > 0, "{test}: the build did not fetch the patched jar");
     println!(
         "{test}: Bazel {} built {:?}; after `get --mode hosted` and the checkout's bump to \
          {BUMPED} the relock passed and the build stopped at {at} ({stops}); `rollback {PURL}` \
          took the entry out and the build printed {bumped:?}; with the stale entry back, `scan \
-         --mode hosted --yes` found no package and left it; {:?}",
+         --mode hosted --yes` took it out, pinned the patch of {BUMPED} and the build printed \
+         {:?}; {:?}",
         flow.cell.release(),
         flow.upstream,
+        flow.next.marker,
         flow.started.elapsed()
     );
 }
