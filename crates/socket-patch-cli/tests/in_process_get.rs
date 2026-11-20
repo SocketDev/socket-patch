@@ -603,6 +603,74 @@ async fn get_package_name_matches_pypi_spellings_pip_accepts() {
     }
 }
 
+/// A name given to `get` resolves among every package installed where the
+/// project installs, declared or not. A Python project with no environment
+/// of its own is otherwise crawled only for the packages it declares, but
+/// the name says this one is wanted, as its PURL would.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn get_package_name_resolves_an_undeclared_package_in_the_path_interpreter() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let purl = "pkg:pypi/undeclared-pkg@2.0.0";
+    let encoded = "pkg%3Apypi%2Fundeclared-pkg%402.0.0";
+    let (server, url) = start_wiremock().await;
+    make_search_mock_one(&server, "by-package", encoded, UUID, purl, "free").await;
+    make_view_mock(&server, UUID, purl, "free").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("requirements.txt"), "declared-pkg\n").unwrap();
+    // The interpreter on PATH, and what is installed in it.
+    let site = tmp.path().join("system/lib/python3.12/site-packages");
+    for (name, version) in [("declared_pkg", "1.0.0"), ("undeclared_pkg", "2.0.0")] {
+        let dist = site.join(format!("{name}-{version}.dist-info"));
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(
+            dist.join("METADATA"),
+            format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"),
+        )
+        .unwrap();
+    }
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let python = bin.join("python3");
+    std::fs::write(
+        &python,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'Python 3.12.0'; exit 0; fi\n\
+             printf '%s\\n' '{}'\n",
+            site.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let saved_path = std::env::var_os("PATH");
+    let saved_venv = std::env::var_os("VIRTUAL_ENV");
+    let mut path = vec![bin.clone()];
+    path.extend(std::env::split_paths(
+        &saved_path.clone().unwrap_or_default(),
+    ));
+    std::env::set_var("PATH", std::env::join_paths(path).unwrap());
+    std::env::remove_var("VIRTUAL_ENV");
+    let mut args = default_args("undeclared-pkg", &project);
+    args.common.api_url = Some(url);
+    let code = run(args).await;
+    match saved_path {
+        Some(v) => std::env::set_var("PATH", v),
+        None => std::env::remove_var("PATH"),
+    }
+    if let Some(v) = saved_venv {
+        std::env::set_var("VIRTUAL_ENV", v);
+    }
+
+    assert_eq!(code, 0, "a named, installed package must resolve");
+    assert_patch_saved(&project, purl, UUID);
+}
+
 // ---------------------------------------------------------------------------
 // The shared target grammar (B11, B56, B57)
 // ---------------------------------------------------------------------------

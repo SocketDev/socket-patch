@@ -43,7 +43,8 @@ pub use crate::commands::agent_download::{
 };
 use crate::commands::apply::ApplyRunReport;
 use crate::ecosystem_dispatch::{
-    crawl_ecosystems, find_packages_for_rollback, installed_target_matches, partition_purls,
+    crawl_ecosystems_for_name, find_packages_for_rollback, installed_target_matches,
+    partition_purls,
 };
 use crate::json_envelope::{
     usage_error, Command as JsonCommand, Envelope, EnvelopeError, PatchAction as EventAction,
@@ -1465,9 +1466,13 @@ pub async fn run(args: GetArgs) -> i32 {
         TargetKind::Name => {
             status.set("Enumerating packages...");
             // `--ecosystems` scopes the crawl, so a name can only resolve
-            // inside the selected ecosystems.
+            // inside the selected ecosystems. A name resolves among every
+            // installed package, as its PURL would: a Python project with
+            // no environment of its own is otherwise crawled only for the
+            // packages it declares.
             let only = args.common.ecosystems.as_deref().filter(|l| !l.is_empty());
-            let (all_packages, _, _) = crawl_ecosystems(&args.common.crawler_options(), only).await;
+            let (all_packages, _, _) =
+                crawl_ecosystems_for_name(&args.common.crawler_options(), only).await;
 
             if all_packages.is_empty() {
                 status.finish();
