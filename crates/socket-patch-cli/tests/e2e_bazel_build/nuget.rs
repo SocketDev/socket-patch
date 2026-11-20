@@ -111,6 +111,23 @@
 //! nuget.org or the patch host. It is there from the first build on, and
 //! step (c) changes no flag.
 //!
+//! A second flow, [`hosted_no_config`], is the workspace of rules_csharp's
+//! own examples: the tag names the lock and no `nuget_config`, and the
+//! checkout holds no `nuget.config`. The hub then has nuget.org as its one
+//! source, so a lock re-pinned to the patched package would fail the build:
+//! the hub downloads the upstream package and refuses it over the lock's
+//! `contentHash`. `socket-patch` reads the tag in `MODULE.bazel` and
+//! writes nothing: the same `scan` exits 0, reports the patch as skipped
+//! and warns with the tag's file and line and the attribute to add, and
+//! the build passes on the upstream package as before. With that
+//! attribute on the tag and no other step, the same `scan` creates
+//! `nuget.config` and re-pins the lock, and the build is the patched one.
+//! [`only_a_tag_that_reads_the_lock_without_its_config_is_withheld`] holds
+//! the other workspaces to what the command does without Bazel, and
+//! [`the_pin_is_written_where_the_hub_takes_it`] the hubs of more than one
+//! tag: the last tag with sources decides which config the hub reads, and
+//! the first lock that names a package gives its `contentHash`.
+//!
 //! # Known gaps
 //!
 //! Three outcomes the flow asserts are gaps of the product, not its
@@ -137,7 +154,8 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
 use crate::envelope::{codes_in, event_triples};
 use crate::harness::{
-    changed, fixture_path, rewrite, Cell, Fixture, Ran, StandIn, Tree, CONSUMER, NOTHING,
+    cell_without_bazel, changed, fixture_path, rewrite, Cell, Fixture, Ran, StandIn, Tree,
+    CONSUMER, NOTHING,
 };
 use crate::hosted_memory_common::{read_tree, Patch, ORG};
 
@@ -171,6 +189,9 @@ const RUN: &str = "@RUN@";
 const CONFIG: &str = "nuget.config";
 const LOCK: &str = "packages.lock.json";
 const BAZEL_LOCK: &str = "MODULE.bazel.lock";
+/// The file of the tag, and the line of it that names [`CONFIG`] there.
+const MODULE: &str = "MODULE.bazel";
+const NAMES_CONFIG: &str = "    nuget_config = \"//:nuget.config\",\n";
 /// The files of the fixture that name a package.
 const NAMING: [&str; 3] = ["App.csproj", "BUILD.bazel", LOCK];
 /// nuget.org as the fixture's `nuget.config` names it, and as NuGet records
@@ -321,6 +342,12 @@ fn fixture_file(rel: &str, run: &str) -> String {
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     assert!(text.contains(RUN), "{}: no {RUN}", path.display());
     text.replace(RUN, run)
+}
+
+/// A file of the fixture's `common` directory that names no package.
+fn fixture_file_as_is(rel: &str) -> String {
+    let path = fixture_path(FIXTURE.dir).join("common").join(rel);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
 /// The entry of a lock that resolves the package `id` to the file of
@@ -493,6 +520,12 @@ fn downloads(origin: &str) -> Vec<String> {
 /// set, so that neither a `NUGET_PACKAGES` nor a `DOTNET_CLI_HOME` of the
 /// caller's shell moves the folder or adds a user-level NuGet config.
 fn socket_patch(cell: &Cell, standin: &StandIn, home: &Path, args: &[&str]) -> Ran {
+    on_machine(standin, home, |api, env| cell.socket_patch(api, args, env))
+}
+
+/// What `run` gives for the Socket API and the environment of
+/// [`socket_patch`].
+fn on_machine<T>(standin: &StandIn, home: &Path, run: impl Fn(&str, &[(&str, &str)]) -> T) -> T {
     let origin = standin.origin();
     let upstream = format!("{origin}/{NUGET_ORG}");
     let packages = packages_folder(home);
@@ -502,7 +535,7 @@ fn socket_patch(cell: &Cell, standin: &StandIn, home: &Path, args: &[&str]) -> R
         ("DOTNET_CLI_HOME", home.as_ref()),
         ("NUGET_PACKAGES", packages.as_ref()),
     ];
-    cell.socket_patch(&origin, args, &env)
+    run(&origin, &env)
 }
 
 /// A text file of a tree.
@@ -820,6 +853,408 @@ fn hosted_from_lock() {
     );
 }
 
+/// The codes of the warnings with which hosted mode says that it wrote
+/// nothing for a package: the hub does not read `nuget.config`, or it has
+/// the package from a lock that the run does not re-pin.
+const WITHHELD: &str = "redirect_bazel_nuget_config_undeclared";
+const NOT_REPINNED: &str = "redirect_bazel_nuget_lock_not_repinned";
+
+/// For a finished `scan --mode hosted --yes` in a checkout whose tag names
+/// no `nuget_config`: it passed and reports the package `purl` as skipped
+/// and no file as rewritten, and its one warning is about `package`, under
+/// the name the purl has for it. The warning names the tag by its file and
+/// line, and says to put on it the attribute that [`NAMES_CONFIG`] is in
+/// the fixture; it does not send the user to vendored mode, which no
+/// Bazel build of NuGet packages is known to take. Gives the warning's
+/// text.
+fn withheld(test: &str, scan: &Ran, package: &Package, purl: &str) -> String {
+    let said = &scan.dump;
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["applied"], 0, "{test}: {said}");
+    let skipped = [(
+        purl.to_string(),
+        "skipped".to_string(),
+        "redirect_unconfirmed".to_string(),
+    )];
+    assert_eq!(event_triples(&scan.envelope), skipped, "{test}: {said}");
+    let rewritten = &scan.envelope["redirect"]["rewrittenFiles"];
+    assert_eq!(*rewritten, json!([]), "{test}: {said}");
+    let warnings = &scan.envelope["warnings"];
+    assert_eq!(codes_in(warnings), [WITHHELD], "{test}: {said}");
+    let detail = warnings[0]["detail"].as_str().unwrap_or_default();
+    let starts = format!(
+        "{}@{VERSION}: {MODULE}:9: this `nuget.from_lock` names no `nuget_config`, so \
+         rules_csharp does not read {CONFIG}",
+        package.lower()
+    );
+    assert!(detail.starts_with(&starts), "{test}: {detail}");
+    let attribute = NAMES_CONFIG.trim().trim_end_matches(',');
+    let way = format!("Put `{attribute}` on that tag and run this command again");
+    assert!(detail.contains(&way), "{test}: {detail}");
+    assert!(!detail.contains("vendored"), "{test}: {detail}");
+    detail.to_string()
+}
+
+/// The flow of a tag that names no `nuget_config`, in a checkout without a
+/// `nuget.config`, on the machine that restored the project.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn hosted_no_config() {
+    let test = "nuget::hosted_no_config";
+    let started = Instant::now();
+    let Some(mut cell) = Cell::open(test, &FIXTURE) else {
+        return;
+    };
+    let release = cell.release().to_string();
+
+    let run = format!("R{}", uuid::Uuid::new_v4().simple());
+    let upstream = Package::new(NAME, &run, &format!("PRISTINE {run}"));
+    let neighbour = Package::new(NEIGHBOUR, &run, "NEIGHBOUR");
+    let patch = Patched::new(&run);
+    let (purl, unpatched, patched) = (upstream.purl(), upstream.marker(), patch.package.marker());
+    let standin = registry(&[&neighbour, &upstream]);
+    grant(&standin, &upstream, &patch, &patch.package.nupkg);
+    cell.route_downloads(&downloads(&standin.origin()));
+    check_out(&cell, &run, &[&neighbour, &upstream]);
+    // The fixture's tag without the line that names its `nuget.config`,
+    // and no such file.
+    let module = std::fs::read_to_string(cell.path(MODULE)).expect(MODULE);
+    cell.write(MODULE, module.replace(NAMES_CONFIG, ""));
+    std::fs::remove_file(cell.path(CONFIG)).expect("remove nuget.config");
+    let home = tempfile::Builder::new()
+        .prefix("sp-bazel-nuget-")
+        .tempdir()
+        .expect("create the .NET home");
+    for package in [&neighbour, &upstream] {
+        package.restore_into(home.path());
+    }
+
+    // The unpatched build: the hub has nuget.org alone.
+    let before = cell.builds_unpatched(&unpatched);
+    assert!(!before.contains_key(CONFIG), "{test}: a {CONFIG} is left");
+
+    // The scan writes nothing: a lock re-pinned to the patched package
+    // would fail the next build, because the hub would still download the
+    // upstream one. So the build passes as before, and changes no file.
+    let scan = socket_patch(&cell, &standin, home.path(), &SCAN);
+    withheld(test, &scan, &upstream, &purl);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{test}");
+    cell.builds(&unpatched);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{test}");
+
+    // What the warning says to do, and no other step: the attribute on the
+    // tag, and the same command. It creates the file the tag now names and
+    // re-pins the lock, and the build is the patched one, from the Socket
+    // source.
+    cell.write(MODULE, &module);
+    let wired = cell.tree();
+    let scan = socket_patch(&cell, &standin, home.path(), &SCAN);
+    let pinned = cell.pinned_by(&scan, &purl, &patch.uuid, &wired, &[CONFIG, LOCK]);
+    assert_eq!(
+        text(&pinned, LOCK),
+        lock_pinning(&run, &[&neighbour, &patch.package]),
+        "{test}: {LOCK}"
+    );
+    cell.builds(&patched);
+    assert_eq!(changed(&pinned, &cell.tree()), [BAZEL_LOCK], "{test}");
+    let fetches = standin.asked(&patch.file(&patch.package));
+    assert!(fetches > 0, "{test}: the Socket source was not asked");
+
+    println!(
+        "{test}: on Bazel {release}, `scan --mode hosted` wrote nothing for a tag that names no \
+         nuget_config and warned ({WITHHELD}), and the build still printed {unpatched:?}; with \
+         the attribute on the tag the same scan wrote {CONFIG} and {LOCK}, and the build printed \
+         {patched:?} from the Socket source ({fetches} requests for the package); {:?}",
+        started.elapsed()
+    );
+}
+
+/// Without a Bazel: `scan --mode hosted --yes` through the binary, in
+/// checkouts of the fixture's project that hold no `nuget.config`. What it
+/// gives a person, then a script, and the files it leaves are the same in
+/// a checkout that is no Bazel workspace, in one whose tag names the
+/// config, and in one whose tag reads the lock of another project. Only
+/// the tag that reads this lock and names no config is withheld: nothing
+/// is written, a person reads the warning a script gets, and with the
+/// attribute on the tag the command gives what it gives without Bazel.
+/// Where the two files already hold the pin, it warns and leaves them.
+#[test]
+fn only_a_tag_that_reads_the_lock_without_its_config_is_withheld() {
+    let test = "nuget::only_a_tag_that_reads_the_lock_without_its_config_is_withheld";
+    let (upstream, neighbour) = (
+        Package::new(NAME, "R1", "PRISTINE"),
+        Package::new(NEIGHBOUR, "R1", "NEIGHBOUR"),
+    );
+    let (patch, purl) = (Patched::new("R1"), upstream.purl());
+    let standin = StandIn::start();
+    grant(&standin, &upstream, &patch, &patch.package.nupkg);
+    let home = tempfile::tempdir().expect("create the .NET home");
+    for package in [&neighbour, &upstream] {
+        package.restore_into(home.path());
+    }
+    let era = fixture_path(FIXTURE.dir).join(FIXTURE.eras[0].1);
+    let module = std::fs::read_to_string(era.join(MODULE)).expect(MODULE);
+    let bare = module.replace(NAMES_CONFIG, "");
+    let checkout = |module: Option<&str>| {
+        let cell = cell_without_bazel("9.3.2");
+        check_out(&cell, "R1", &[&neighbour, &upstream]);
+        cell.write(".git/HEAD", "ref: refs/heads/main\n");
+        if let Some(module) = module {
+            cell.write(MODULE, module);
+        }
+        cell
+    };
+    // What the command gives a person, then a script, and the files it
+    // leaves beside `MODULE.bazel`.
+    let gives = |cell: &Cell| {
+        let scan = |api: &str, env: &[(&str, &str)]| cell.socket_patch_person(api, &SCAN, env);
+        let person = on_machine(&standin, home.path(), scan);
+        let ran = socket_patch(cell, &standin, home.path(), &SCAN);
+        let mut files = cell.tree();
+        files.remove(MODULE);
+        (person, ran, files)
+    };
+    let said = |(person, ran, files): &([String; 2], Ran, Tree)| {
+        (
+            person.clone(),
+            ran.code,
+            ran.envelope.clone(),
+            files.clone(),
+        )
+    };
+
+    // Without Bazel the command pins the package: it creates the config
+    // and re-pins the lock.
+    let plain = checkout(None);
+    let before = plain.tree();
+    let without = gives(&plain);
+    let pinned = changed(&before, &plain.tree());
+    assert_eq!(pinned, [CONFIG, LOCK], "{test}: {}", without.1.dump);
+    assert!(
+        without.0[0].contains("Switched 1 package"),
+        "{:?}",
+        without.0
+    );
+    let elsewhere = bare.replace("//:packages", "//api:packages");
+    for same in [&module, &elsewhere] {
+        assert_eq!(
+            said(&gives(&checkout(Some(same)))),
+            said(&without),
+            "{same}"
+        );
+    }
+
+    let cell = checkout(Some(&bare));
+    let before = cell.tree();
+    let (person, scan, _) = gives(&cell);
+    let detail = withheld(test, &scan, &upstream, &purl);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{test}");
+    let told = [
+        "No patches could be switched to hosted:".to_string(),
+        format!(
+            "  {purl}: no lockfile entry pinning it could be rewritten (see the warning below)"
+        ),
+        format!("Warning: {detail}"),
+    ];
+    // The last lines of stderr, after what every scan says there.
+    let mut lines: Vec<&str> = person[1].lines().collect();
+    let last = lines.split_off(lines.len().saturating_sub(told.len()));
+    assert_eq!(last, told, "{test}: {person:?}");
+    assert!(person[0].starts_with("Switched 0 packages"), "{person:?}");
+    cell.write(MODULE, &module);
+    assert_eq!(said(&gives(&cell)), said(&without), "{test}");
+
+    // A checkout that an earlier release pinned under such a tag: the pin
+    // stays in the two files and is reported as it is, beside the warning.
+    plain.write(MODULE, &bare);
+    let before = plain.tree();
+    let scan = socket_patch(&plain, &standin, home.path(), &SCAN);
+    assert_eq!(changed(&before, &plain.tree()), NOTHING, "{test}");
+    let applied = [(purl, "applied".to_string(), String::new())];
+    assert_eq!(event_triples(&scan.envelope), applied, "{}", scan.dump);
+    let warned = codes_in(&scan.envelope["warnings"]);
+    assert_eq!(warned[0], WITHHELD, "{}", scan.dump);
+}
+
+/// Without a Bazel: `scan --mode hosted --yes` through the binary in the
+/// workspaces of a hub with more than one tag, or with a tag that is not
+/// the fixture's. Each is a checkout of the fixture's project, also below
+/// the root as `app` and `lib`, with the tags of its row; the scan runs in
+/// the directory of the row. It pins the package and rewrites the files
+/// named, or it writes nothing and its one warning has the code and the
+/// words of the row. What Bazel builds in each was measured on 9.3.2 and
+/// is not run here.
+#[test]
+fn the_pin_is_written_where_the_hub_takes_it() {
+    let test = "nuget::the_pin_is_written_where_the_hub_takes_it";
+    let (upstream, neighbour) = (
+        Package::new(NAME, "R1", "PRISTINE"),
+        Package::new(NEIGHBOUR, "R1", "NEIGHBOUR"),
+    );
+    let (patch, purl) = (Patched::new("R1"), upstream.purl());
+    let standin = StandIn::start();
+    grant(&standin, &upstream, &patch, &patch.package.nupkg);
+    let home = tempfile::tempdir().expect("create the .NET home");
+    for package in [&neighbour, &upstream] {
+        package.restore_into(home.path());
+    }
+    let era = fixture_path(FIXTURE.dir).join(FIXTURE.eras[0].1);
+    let module = std::fs::read_to_string(era.join(MODULE)).expect(MODULE);
+    let (top, _) = module.split_once("nuget.from_lock(").expect("the tag");
+    // A file of tags, each the lock it reads and the rest of its lines.
+    let with = |tags: &[(&str, &str)]| {
+        let tag = |(lock, more): &(&str, &str)| {
+            format!("nuget.from_lock(\n{more}    packages_lock_json = \"{lock}\",\n)\n")
+        };
+        let tags: String = tags.iter().map(tag).collect();
+        format!("{top}{tags}use_repo(nuget, \"nuget\")\n")
+    };
+    let (root, app, lib) = (
+        "//:packages.lock.json",
+        "//app:packages.lock.json",
+        "//lib:packages.lock.json",
+    );
+    let (own, of_app, of_api) = (
+        NAMES_CONFIG,
+        "    nuget_config = \"//app:nuget.config\",\n",
+        "    nuget_config = \"//api:nuget.config\",\n",
+    );
+    let feeds = format!("    feeds = [\"{SOURCE}\"],\n");
+    let computed = "\"0.5.0\", repo_name = \"rules_\" + \"csharp\")";
+    let renamed = module.replacen("\"0.5.0\")", computed, 1);
+    assert_ne!(renamed, module);
+    let (app_lock, app_config) = ("app/packages.lock.json", "app/nuget.config");
+    let empty = "{\n  \"version\": 1,\n  \"dependencies\": {\n    \"net8.0\": {}\n  }\n}\n";
+    // The module file, the file added to the checkout, the directory of
+    // the scan, and then the files it rewrites, or the code and the words
+    // of its warning.
+    type Row<'a> = (String, &'a str, &'a str, &'a [&'a str], &'a [&'a str]);
+    let rows: [Row; 9] = [
+        // The last tag with sources names the config; a line that the
+        // reader cannot read is beside the tag, which names the config.
+        (
+            with(&[("//api:packages.lock.json", of_api), (root, own)]),
+            "api/packages.lock.json",
+            "",
+            &[CONFIG, LOCK],
+            &[],
+        ),
+        (renamed, "", "", &[CONFIG, LOCK], &[]),
+        // Feeds and no config; a config that the directory spells its own
+        // way.
+        (
+            with(&[(root, &feeds)]),
+            "",
+            "",
+            &[],
+            &[
+                WITHHELD,
+                "MODULE.bazel:9: this `nuget.from_lock` has `feeds` and no `nuget_config`",
+                "name its `feeds` in nuget.config",
+            ],
+        ),
+        (
+            with(&[(root, "")]),
+            "NuGet.Config",
+            "",
+            &[],
+            &[
+                WITHHELD,
+                "does not read NuGet.Config, where",
+                "Put `nuget_config = \"//:NuGet.Config\"` on that tag",
+            ],
+        ),
+        // Two locks hold the package and the scan re-pins one: the hub
+        // has the package from the first.
+        (
+            with(&[(lib, of_app), (app, of_app)]),
+            "",
+            "app",
+            &[],
+            &[
+                NOT_REPINNED,
+                "MODULE.bazel:9: this `nuget.from_lock` reads lib/packages.lock.json, which holds \
+                 the package as well and which this run does not re-pin",
+                "Run this command in a directory above both locks",
+            ],
+        ),
+        (
+            with(&[(app, of_app), (lib, of_app)]),
+            "",
+            "app",
+            &[app_config, app_lock],
+            &[],
+        ),
+        (
+            with(&[(lib, own), (app, own)]),
+            "",
+            "",
+            &[app_lock, "lib/packages.lock.json", CONFIG, LOCK],
+            &[],
+        ),
+        // The tag names a config above the project: the scan writes it
+        // where it runs in that directory.
+        (
+            with(&[(app, own)]),
+            "",
+            "app",
+            &[],
+            &[
+                WITHHELD,
+                "names `//:nuget.config` as its `nuget_config`, not app/nuget.config",
+                "Run this command in the directory of that file (`--cwd`)",
+            ],
+        ),
+        (with(&[(app, own)]), "", "", &[app_lock, CONFIG, LOCK], &[]),
+    ];
+    for (module, added, cwd, rewritten, warned) in rows {
+        let cell = cell_without_bazel("9.3.2");
+        check_out(&cell, "R1", &[&neighbour, &upstream]);
+        cell.write(".git/HEAD", "ref: refs/heads/main\n");
+        cell.write(MODULE, &module);
+        // The project again, below each directory the tags name.
+        let named = |dir: &&str| module.contains(&format!("//{dir}:"));
+        for dir in ["app", "lib"].into_iter().filter(named) {
+            for file in ["App.csproj", LOCK] {
+                let text = std::fs::read(cell.path(file)).expect(file);
+                cell.write(&format!("{dir}/{file}"), text);
+            }
+        }
+        match added {
+            "" => {}
+            "NuGet.Config" => cell.write(added, fixture_file_as_is(CONFIG)),
+            _ => cell.write(added, empty),
+        }
+        let before = cell.tree();
+        let args: Vec<&str> = match cwd {
+            "" => SCAN.to_vec(),
+            _ => SCAN.iter().copied().chain(["--cwd", cwd]).collect(),
+        };
+        let scan = socket_patch(&cell, &standin, home.path(), &args);
+        let said = format!("{test}: {cwd:?} {module}\n{}", scan.dump);
+        assert_eq!(scan.code, 0, "{said}");
+        assert_eq!(changed(&before, &cell.tree()), rewritten, "{said}");
+        let (action, code) = match warned.is_empty() {
+            true => ("applied", ""),
+            false => ("skipped", "redirect_unconfirmed"),
+        };
+        let event = [(purl.clone(), action.to_string(), code.to_string())];
+        assert_eq!(event_triples(&scan.envelope), event, "{said}");
+        let warnings = &scan.envelope["warnings"];
+        let Some((code, words)) = warned.split_first() else {
+            let codes = codes_in(warnings);
+            assert!(!codes.iter().any(|code| code.contains("bazel")), "{said}");
+            continue;
+        };
+        assert_eq!(codes_in(warnings), [*code], "{said}");
+        let detail = warnings[0]["detail"].as_str().unwrap_or_default();
+        for words in words {
+            assert!(detail.contains(words), "{said}");
+        }
+    }
+}
+
 /// Without a Bazel, what stays fixed now that no id and no sum is
 /// committed: the fixture's directories and the legs of its workflow are
 /// those of its table; every era names the two files the hub reads; the
@@ -843,6 +1278,8 @@ fn a_checkout_names_and_pins_the_packages_of_its_run() {
         ] {
             assert!(module.contains(&named), "{}: no {named}", path.display());
         }
+        // The one line a flow takes out for a tag without the config.
+        assert_eq!(module.matches(NAMES_CONFIG).count(), 1, "{module}");
     }
     let common = root.join("common");
     let read = |rel: &str| std::fs::read_to_string(common.join(rel)).expect(rel);
