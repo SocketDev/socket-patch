@@ -1075,6 +1075,76 @@ async fn requirements_project_without_a_venv_scans_only_what_it_declares() {
     }
 }
 
+/// A package the project's patch manifest records stays one of the
+/// project's packages when no requirements file names it: `get <name>`
+/// patched it on purpose. The scan keeps asking about it, so a newer patch
+/// is offered and `--prune` does not take its record for a stale one.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn requirements_project_without_a_venv_keeps_scanning_a_recorded_package() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".socket")).unwrap();
+    std::fs::write(project.join("requirements.txt"), "declared_pkg\n").unwrap();
+    std::fs::write(
+        project.join(".socket/manifest.json"),
+        serde_json::json!({ "patches": { "pkg:pypi/recorded-pkg@3.0.0": {
+            "uuid": "11111111-1111-4111-8111-111111111111",
+            "exportedAt": "2026-01-01T00:00:00Z",
+            "files": {},
+            "vulnerabilities": {},
+            "description": "seed",
+            "license": "MIT",
+            "tier": "free",
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let site = tmp.path().join("system/lib/python3.12/site-packages");
+    std::fs::create_dir_all(&site).unwrap();
+    write_dist_info(&site, "declared_pkg", "1.0.0");
+    write_dist_info(&site, "recorded_pkg", "3.0.0");
+    write_dist_info(&site, "system_decoy", "6.6.6");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let python = bin.join("python3");
+    std::fs::write(
+        &python,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'Python 3.12.0'; exit 0; fi\n\
+             printf '%s\\n' '{}'\n",
+            site.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let saved_path = std::env::var_os("PATH");
+    let mut path = vec![bin.clone()];
+    path.extend(std::env::split_paths(
+        &saved_path.clone().unwrap_or_default(),
+    ));
+    std::env::set_var("PATH", std::env::join_paths(path).unwrap());
+    let mut args = default_args(&project, server.uri());
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Agent);
+    let code = scan_scrubbed(args).await;
+    match saved_path {
+        Some(v) => std::env::set_var("PATH", v),
+        None => std::env::remove_var("PATH"),
+    }
+
+    assert_eq!(code, 0);
+    let bodies = batch_bodies(&server).await;
+    assert_discovered(&bodies, "pkg:pypi/declared-pkg@1.0.0");
+    assert_discovered(&bodies, "pkg:pypi/recorded-pkg@3.0.0");
+    assert_not_discovered(&bodies, "pkg:pypi/system-decoy");
+}
+
 /// #525: uv syncs into `UV_PROJECT_ENVIRONMENT`, absolute or relative to the
 /// project, and ignores an activated `VIRTUAL_ENV` for project commands.
 #[tokio::test]

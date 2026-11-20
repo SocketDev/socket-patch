@@ -332,8 +332,12 @@ async fn keep_project_entries(common: &GlobalArgs, prunable: &mut Vec<String>) {
         global_prefix: None,
         ..common.clone()
     };
+    // Every package installed where the project installs, not only the
+    // ones a Python project with no environment of its own declares: a
+    // record for an undeclared one (`get <name>`) is the project's too.
     let (installed, _, _) =
-        crate::ecosystem_dispatch::crawl_ecosystems(&project.crawler_options(), None).await;
+        crate::ecosystem_dispatch::crawl_ecosystems_for_name(&project.crawler_options(), None)
+            .await;
     let ctx = crate::commands::context::ProjectContext::new(&project);
     let locked = &ctx.locks().await.entries;
     let accounted: HashSet<PurlKey> = installed

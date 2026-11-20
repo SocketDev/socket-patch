@@ -1340,13 +1340,22 @@ async fn crawl_all_of_an_environment_on_path_is_not_scoped() {
         install_dist(&site, "Flask", "3.0.0", &[]);
         // Installed by hand, named in no requirements file.
         install_dist(&site, "gunicorn", "22.0.0", &[]);
+        // The interpreter names its user site too. A venv that does not
+        // take the system site packages never imports from it; a conda
+        // environment does.
+        let user_site = home.path().join("user-site");
+        install_dist(&user_site, "userpkg", "1.0.0", &[]);
         if marker == "pyvenv.cfg" {
-            std::fs::write(prefix.join(marker), "home = /usr/bin\n").unwrap();
+            std::fs::write(
+                prefix.join(marker),
+                "home = /usr/bin\ninclude-system-site-packages = false\n",
+            )
+            .unwrap();
         } else {
             std::fs::create_dir_all(prefix.join(marker)).unwrap();
         }
         let bin = prefix.join("bin");
-        install_fake_python(&bin, &[&site]);
+        install_fake_python(&bin, &[&site, &user_site]);
 
         let crawler = PythonCrawler::new();
         let opts = CrawlerOptions {
@@ -1362,12 +1371,70 @@ async fn crawl_all_of_an_environment_on_path_is_not_scoped() {
         .map(|package| package.purl)
         .collect();
         purls.sort();
-        assert_eq!(
-            purls,
-            ["pkg:pypi/flask@3.0.0", "pkg:pypi/gunicorn@22.0.0"],
-            "{marker}"
-        );
+        let mut expected = vec!["pkg:pypi/flask@3.0.0", "pkg:pypi/gunicorn@22.0.0"];
+        if marker == "conda-meta" {
+            expected.push("pkg:pypi/userpkg@1.0.0");
+        }
+        assert_eq!(purls, expected, "{marker}");
+
+        // The conda root is the machine's default interpreter, which
+        // carries conda's own dependencies: it is shared, and scoped.
+        if marker == "conda-meta" {
+            std::fs::create_dir_all(prefix.join("condabin")).unwrap();
+            let purls: Vec<String> = with_project_env(home.path(), &bin, || async {
+                crawler.crawl_all(&opts).await
+            })
+            .await
+            .into_iter()
+            .map(|package| package.purl)
+            .collect();
+            assert_eq!(purls, ["pkg:pypi/flask@3.0.0"], "the conda root");
+        }
     }
+}
+
+/// With no interpreter to ask, the well-known locations that stand in for
+/// it are every project's, whatever environments sit among them: a conda
+/// root under HOME does not make the whole list the project's own.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn crawl_all_without_an_interpreter_is_scoped() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("requirements.txt"),
+        "sp-fallback-declared\n",
+    )
+    .unwrap();
+    let conda = home.path().join("miniconda3");
+    std::fs::create_dir_all(conda.join("conda-meta")).unwrap();
+    let site = conda.join("lib/python3.12/site-packages");
+    install_dist(&site, "sp-fallback-declared", "1.0.0", &[]);
+    install_dist(&site, "sp-fallback-decoy", "6.6.6", &[]);
+
+    let crawler = PythonCrawler::new();
+    let opts = CrawlerOptions {
+        cwd: project.path().to_path_buf(),
+        global: false,
+        global_prefix: None,
+    };
+    let purls: Vec<String> = with_project_env(home.path(), empty_path.path(), || async {
+        crawler.crawl_all(&opts).await
+    })
+    .await
+    .into_iter()
+    .map(|package| package.purl)
+    .collect();
+    assert!(
+        purls.contains(&"pkg:pypi/sp-fallback-declared@1.0.0".to_string()),
+        "{purls:?}"
+    );
+    assert!(
+        !purls.iter().any(|purl| purl.contains("sp-fallback-decoy")),
+        "{purls:?}"
+    );
 }
 
 /// #964: a uv project (`uv.lock`) and a PEP 723 script lock (`*.py.lock`)

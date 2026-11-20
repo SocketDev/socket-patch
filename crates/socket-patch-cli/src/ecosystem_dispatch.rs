@@ -68,8 +68,12 @@ pub async fn cargo_copies_still_patched<'a>(
 /// tool environment on the machine, outlives that: nothing uninstalls it.
 /// Its manifest record holds the only before-blobs that can restore the
 /// copy, so `scan --prune` keeps the record. The copies looked up are the
-/// ones `rollback` restores (by PURL, in the project's interpreter) and,
-/// for a project run, the ones `rollback --global` restores.
+/// ones `rollback` restores (by PURL, where `options` installs) and, for a
+/// project that installs into a shared interpreter, the ones `rollback
+/// --global` restores. A project with an environment of its own never
+/// patched a copy outside it, so a same-version copy elsewhere on the
+/// machine, patched under another project's record, does not keep this
+/// project's.
 pub async fn pypi_copies_still_patched<'a>(
     manifest: &socket_patch_core::manifest::schema::PatchManifest,
     purls: impl IntoIterator<Item = &'a String>,
@@ -82,7 +86,10 @@ pub async fn pypi_copies_still_patched<'a>(
     }
     let partitioned = HashMap::from([(Ecosystem::Pypi, pypi)]);
     let mut found = find_all_packages_for_rollback(&partitioned, options, true).await;
-    if !options.global && options.global_prefix.is_none() {
+    if PythonCrawler::new()
+        .installs_into_a_shared_interpreter(options)
+        .await
+    {
         let machine = CrawlerOptions {
             cwd: options.cwd.clone(),
             global: true,

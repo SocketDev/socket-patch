@@ -37,13 +37,38 @@ use crate::vendor::pypi_requirements::{
 
 /// The canonical names of the packages that belong to the project at `cwd`
 /// among the distributions installed in `sites`: the ones it declares and,
-/// transitively, the ones those require. `None` when the project declares
-/// dependencies in a way this module does not read in full; the crawl then
-/// stays unscoped.
+/// transitively, the ones those require, plus the ones its patch manifest
+/// records ([`recorded_names`]). `None` when the project declares
+/// dependencies in a way this module does not read in full, or in no place
+/// this module reads; the crawl then stays unscoped.
 pub(super) async fn project_scope(cwd: &Path, sites: &[PathBuf]) -> Option<HashSet<String>> {
     let declared = declared_names(cwd).await?;
     let sites = sites.to_vec();
-    Some(run_blocking(move || required_closure(declared, &sites)).await)
+    let mut scope = run_blocking(move || required_closure(declared, &sites)).await;
+    scope.extend(recorded_names(cwd).await);
+    Some(scope)
+}
+
+/// The canonical names of the PyPI packages the project's patch manifest
+/// (`.socket/manifest.json`) records. A recorded patch names its package:
+/// `get <name>` patched it on purpose, or an earlier scan did, so it stays
+/// one of the project's packages whether or not a requirements file names
+/// it. Left out of the scope, it would get no newer patch and `scan
+/// --prune` would report its record as one to roll back. Only the package
+/// itself counts: what it requires is not the project's on its account. A
+/// manifest kept elsewhere (`--manifest-path`) is not read here, and its
+/// packages are judged by the project's declarations alone.
+async fn recorded_names(cwd: &Path) -> Vec<String> {
+    let path = cwd.join(crate::constants::DEFAULT_PATCH_MANIFEST_PATH);
+    let Ok(Some(manifest)) = crate::manifest::operations::read_manifest(&path).await else {
+        return Vec::new();
+    };
+    manifest
+        .patches
+        .keys()
+        .filter_map(|purl| crate::utils::purl::parse_pypi_purl(purl))
+        .map(|(name, _)| canonicalize_pypi_name(&name))
+        .collect()
 }
 
 /// What a project declares: the canonical name of each package, and the
@@ -100,7 +125,12 @@ const UNREAD_TOOL_TABLES: &[&[&str]] = &[
 
 /// The packages the project at `cwd` declares as dependencies, over all of
 /// its requirements files and its `pyproject.toml`. `None` when one of its
-/// declarations is not read in full (see the module docs).
+/// declarations is not read in full (see the module docs), and when nothing
+/// that states dependencies was found: a project whose only marker is a
+/// `pyproject.toml` that configures tools keeps its requirements somewhere
+/// this module does not look (`deploy/docker/requirements.txt`), if it has
+/// any. A requirements file with no requirement in it is a statement: the
+/// project declares none.
 async fn declared_names(cwd: &Path) -> Option<Declared> {
     let view = ProjectView::Disk(cwd);
     for name in UNREAD_DECLARATIONS {
@@ -114,16 +144,18 @@ async fn declared_names(cwd: &Path) -> Option<Declared> {
         return None;
     }
     let mut names = Declared::new();
+    let mut states_dependencies = false;
     match view.read_text("pyproject.toml").await {
-        Ok(text) => pyproject_declares(&text, &mut names)?,
+        Ok(text) => states_dependencies |= pyproject_declares(&text, &mut names)?,
         // A read that fails on a file that is there (a link leaving the
         // repository, which reads as not found) hides its declarations.
         Err(_) if view.exists_no_follow("pyproject.toml").await => return None,
         Err(_) => {}
     }
     let files = requirements_files(&view).await?;
+    states_dependencies |= !files.is_empty();
     requirements_declare(&view, files, &mut names).await?;
-    Some(names)
+    states_dependencies.then_some(names)
 }
 
 /// The pip requirements files the project keeps: every `*.txt` or `*.in`
@@ -277,12 +309,13 @@ fn location_declares(location: &str, rel: &str, names: &mut Declared) -> Option<
 
 /// Adds to `names` what a `pyproject.toml` declares: the PEP 621 `[project]`
 /// name, `dependencies` and `optional-dependencies`, and the PEP 735
-/// `[dependency-groups]`. A file with none of those tables (linter and
-/// formatter configuration only) declares nothing. `None` for a file that
-/// does not parse, a dependency list the build backend fills in at build
-/// time (`dynamic`), an entry that is not a PEP 508 requirement, and
-/// dependencies kept in a tool's own table ([`UNREAD_TOOL_TABLES`]).
-fn pyproject_declares(text: &str, names: &mut Declared) -> Option<()> {
+/// `[dependency-groups]`. `Some(false)` for a file with none of those
+/// tables (linter and formatter configuration only): it says nothing about
+/// dependencies. `None` for a file that does not parse, a dependency list
+/// the build backend fills in at build time (`dynamic`), an entry that is
+/// not a PEP 508 requirement, and dependencies kept in a tool's own table
+/// ([`UNREAD_TOOL_TABLES`]).
+fn pyproject_declares(text: &str, names: &mut Declared) -> Option<bool> {
     let document: DocumentMut = text.parse().ok()?;
     let root = document.as_item();
     let unread = UNREAD_TOOL_TABLES
@@ -317,7 +350,7 @@ fn pyproject_declares(text: &str, names: &mut Declared) -> Option<()> {
             array_declares(group, names)?;
         }
     }
-    Some(())
+    Some(root.get("project").is_some() || root.get("dependency-groups").is_some())
 }
 
 /// The item at `path` under `item`, each step through a table.
@@ -859,13 +892,22 @@ line-length = 100
             .await,
             Some(names(&["flask"]))
         );
+        // A `[project]` table with no dependencies states that there are
+        // none.
+        assert_eq!(
+            declared(&[("pyproject.toml", "[project]\nname = \"app\"\n")]).await,
+            Some(names(&["app"]))
+        );
+        // Tool configuration and nothing else: the project's dependencies
+        // are stated somewhere this module does not look, if anywhere, so
+        // the crawl is not scoped.
         assert_eq!(
             declared(&[(
                 "pyproject.toml",
                 "[tool.poetry-dynamic-versioning]\nenable = true\n"
             )])
             .await,
-            Some(BTreeSet::new())
+            None
         );
     }
 
@@ -1072,5 +1114,42 @@ line-length = 100
         );
         write(&project, "setup.py", "");
         assert_eq!(project_scope(&project, &[site]).await, None);
+    }
+
+    /// A package the project's patch manifest records stays the project's
+    /// when no requirements file names it: `get <name>` patched it on
+    /// purpose. Only that package: what it requires is not.
+    #[tokio::test]
+    async fn a_recorded_patch_keeps_its_package_in_the_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, site) = (tmp.path().join("project"), tmp.path().join("site"));
+        write(&project, "requirements.txt", "flask\n");
+        install(&site, "Flask", "3.0.0", &[]);
+        install(&site, "requests", "2.32.0", &["urllib3<3"]);
+        install(&site, "urllib3", "2.2.0", &[]);
+        let record = r#"{
+            "uuid": "11111111-1111-4111-8111-111111111111",
+            "exportedAt": "2026-01-01T00:00:00Z",
+            "files": {},
+            "vulnerabilities": {},
+            "description": "seed",
+            "license": "MIT",
+            "tier": "free"
+        }"#;
+        write(
+            &project,
+            ".socket/manifest.json",
+            &format!(
+                r#"{{"patches": {{
+                    "pkg:pypi/Requests@2.32.0?artifact_id=py3-none-any-whl": {record},
+                    "pkg:npm/left-pad@1.3.0": {record}
+                }}}}"#
+            ),
+        );
+        let scope = project_scope(&project, &[site]).await.unwrap();
+        assert_eq!(
+            scope,
+            HashSet::from(["flask".to_string(), "requests".to_string()])
+        );
     }
 }

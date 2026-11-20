@@ -385,19 +385,17 @@ fn venv_root_of_site(site: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// The environment a `site-packages` dir belongs to, when it is one a
-/// project has to itself: a venv ([`venv_root_of_site`]) or a conda
-/// environment, whose root holds `conda-meta`. `None` for an interpreter
-/// installed for the whole machine (the distro's, Homebrew's, python.org's,
-/// a version manager's).
-fn own_environment_of_site(site: &Path) -> Option<PathBuf> {
-    venv_root_of_site(site).or_else(|| {
-        site.ancestors()
-            .skip(1)
-            .take(3)
-            .find(|dir| dir.join("conda-meta").is_dir())
-            .map(Path::to_path_buf)
-    })
+/// The conda environment a `site-packages` dir belongs to, when it is one
+/// a project has to itself: a prefix holding `conda-meta` that is not the
+/// conda root. The root (`base`, which also holds `condabin`) is the
+/// machine's default interpreter and carries conda's own dependencies, as
+/// Homebrew's Python carries Homebrew's.
+fn conda_env_of_site(site: &Path) -> Option<PathBuf> {
+    site.ancestors()
+        .skip(1)
+        .take(3)
+        .find(|dir| dir.join("conda-meta").is_dir() && !dir.join("condabin").is_dir())
+        .map(Path::to_path_buf)
 }
 
 /// The base interpreter's prefix for a venv whose `pyvenv.cfg` names `home`:
@@ -2815,21 +2813,59 @@ fn memoized_site_query(runner: &ProbeRunner) -> Option<String> {
 /// project: under `--global` no project's `.python-version` picks the
 /// Python a pyenv shim runs.
 pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
-    system_python_site_packages(ProbeRunner::global(), SystemReach::Machine).await
+    system_python_site_packages(ProbeRunner::global()).await
 }
 
 /// The `site-packages` of the interpreter a project with no environment of
-/// its own installs into: the Python on `PATH`, asked from the project's
-/// directory (`--cwd`) so a version manager's shim follows that project's
-/// `.python-version`. Only that interpreter's own answer counts. The other
-/// interpreters on the machine, and the environments tools keep for
-/// themselves, hold other projects' packages: `pip install -r
-/// requirements.txt` never puts this project's there.
+/// its own installs into, and whether that interpreter is shared with the
+/// rest of the machine.
 ///
-/// When no interpreter answers (none on `PATH`, or a shim that fails), the
-/// well-known interpreter locations stand in for it.
-async fn project_interpreter_site_packages(cwd: &Path) -> Vec<PathBuf> {
-    system_python_site_packages(ProbeRunner::project(cwd), SystemReach::Project).await
+/// The interpreter is the Python on `PATH`, asked from the project's
+/// directory (`--cwd`) so a version manager's shim follows that project's
+/// `.python-version`. Only its own answer counts. The other interpreters
+/// on the machine, and the environments tools keep for themselves, hold
+/// other projects' packages: `pip install -r requirements.txt` never puts
+/// this project's there.
+///
+/// * An interpreter in a venv (a Docker image's `ENV
+///   PATH=/opt/venv/bin:$PATH`, with no `VIRTUAL_ENV`) is the project's own
+///   environment, read like an activated one: the venv's dirs, then what
+///   its `pyvenv.cfg` lets in. The interpreter also names its user site,
+///   which a venv does not import from unless it takes the system site
+///   packages.
+/// * An interpreter in a conda environment other than the root is the
+///   project's own too ([`conda_env_of_site`]).
+/// * Any other interpreter is shared: what is installed in it is not all
+///   this project's (see [`scope`]).
+/// * When no interpreter answers (none on `PATH`, or a shim that fails),
+///   the well-known interpreter locations stand in for it. They are every
+///   project's, whatever environments sit among them.
+async fn project_interpreter_sites(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> (Vec<PathBuf>, bool) {
+    let answered = interpreter_site_packages(ProbeRunner::project(cwd)).await;
+    if answered.is_empty() {
+        let stand_ins = with_well_known_site_packages(answered, SystemReach::Project).await;
+        return (stand_ins, true);
+    }
+    let probed = answered.clone();
+    let (venv_sites, conda_env) = run_blocking(move || {
+        let venv_sites: Vec<PathBuf> = probed
+            .iter()
+            .filter(|site| venv_root_of_site(site).is_some())
+            .cloned()
+            .collect();
+        let conda_env = probed.iter().any(|site| conda_env_of_site(site).is_some());
+        (venv_sites, conda_env)
+    })
+    .await;
+    if !venv_sites.is_empty() {
+        let mut sites = venv_sites;
+        add_system_site_packages(&mut sites, var);
+        return (sites, false);
+    }
+    (answered, !conda_env)
 }
 
 /// How far a search of the system Python reaches.
@@ -2838,16 +2874,47 @@ enum SystemReach {
     /// `--global`: every interpreter on the machine, and the environments
     /// tools keep for themselves.
     Machine,
-    /// A project with no environment of its own: the one interpreter it
-    /// installs into (see [`project_interpreter_site_packages`]).
+    /// A project with no environment of its own whose interpreter did not
+    /// answer (see [`project_interpreter_sites`]): the interpreters on the
+    /// machine, never a tool's environment.
     Project,
 }
 
-/// The system Python `site-packages` within `reach`, the interpreter asked
-/// through `runner`.
-async fn system_python_site_packages(runner: ProbeRunner, reach: SystemReach) -> Vec<PathBuf> {
-    let mut results = Vec::new();
-    let mut seen = HashSet::new();
+/// The system Python `site-packages` of the whole machine, the interpreter
+/// asked through `runner`.
+async fn system_python_site_packages(runner: ProbeRunner) -> Vec<PathBuf> {
+    let answered = interpreter_site_packages(runner).await;
+    with_well_known_site_packages(answered, SystemReach::Machine).await
+}
+
+/// The directories the interpreter `runner` finds names as its site and
+/// user-site packages, absolute and without repeats. Empty when no
+/// interpreter answers.
+async fn interpreter_site_packages(runner: ProbeRunner) -> Vec<PathBuf> {
+    // Subprocesses: on the blocking pool.
+    let site_output = run_blocking(move || memoized_site_query(&runner)).await;
+    let mut results: Vec<PathBuf> = Vec::new();
+    for p in site_output
+        .iter()
+        .flat_map(|stdout| parse_python_site_packages_output(stdout))
+    {
+        let resolved = if p.is_absolute() {
+            p
+        } else {
+            std::path::absolute(&p).unwrap_or(p)
+        };
+        if !results.contains(&resolved) {
+            results.push(resolved);
+        }
+    }
+    results
+}
+
+/// `answered` (an interpreter's own answer), then the well-known
+/// interpreter locations and, within `reach`, the tool environments.
+async fn with_well_known_site_packages(answered: Vec<PathBuf>, reach: SystemReach) -> Vec<PathBuf> {
+    let mut seen: HashSet<PathBuf> = answered.iter().cloned().collect();
+    let mut results = answered;
 
     fn add_path(p: PathBuf, seen: &mut HashSet<PathBuf>, results: &mut Vec<PathBuf>) {
         let resolved = if p.is_absolute() {
@@ -2860,20 +2927,7 @@ async fn system_python_site_packages(runner: ProbeRunner, reach: SystemReach) ->
         }
     }
 
-    // 1. Ask Python for site-packages (subprocesses: on the blocking pool)
-    let site_output = run_blocking(move || memoized_site_query(&runner)).await;
-    if let Some(stdout) = site_output {
-        for p in parse_python_site_packages_output(&stdout) {
-            add_path(p, &mut seen, &mut results);
-        }
-    }
-
-    // A project installs into one interpreter, and it just answered.
-    if reach == SystemReach::Project && !results.is_empty() {
-        return results;
-    }
-
-    // 2. Well-known system paths
+    // Well-known system paths
     let home_dir = crate::utils::fs::home_dir();
 
     // Helper closure to scan base/{lib,lib64}/python3.*/[dist|site]-packages.
@@ -3491,13 +3545,10 @@ async fn local_site_packages_with(
 
 /// Local-mode discovery for [`PythonCrawler::get_site_packages_paths`]
 /// over an explicit environment (tests pass a closure instead of mutating
-/// the process environment), plus whether the dirs are the shared
-/// interpreter's ([`project_interpreter_site_packages`]) rather than an
-/// environment of the project's own. What is installed in a shared
-/// interpreter is not all this project's: see [`scope`]. An interpreter on
-/// `PATH` that sits in a venv or a conda environment (a Docker image's
-/// `ENV PATH=/opt/venv/bin:$PATH`, with no `VIRTUAL_ENV`) is the project's
-/// own environment, like an activated one.
+/// the process environment), plus whether the dirs are a shared
+/// interpreter's ([`project_interpreter_sites`]) rather than an environment
+/// of the project's own. What is installed in a shared interpreter is not
+/// all this project's: see [`scope`].
 async fn local_sites_with(
     cwd: &Path,
     var: &impl Fn(&str) -> Option<String>,
@@ -3523,15 +3574,7 @@ async fn local_sites_with(
         return (Vec::new(), false);
     }
     if is_python_project(cwd).await {
-        let sites = project_interpreter_site_packages(cwd).await;
-        let probed = sites.clone();
-        let own = run_blocking(move || {
-            probed
-                .iter()
-                .any(|site| own_environment_of_site(site).is_some())
-        })
-        .await;
-        return (sites, !own);
+        return project_interpreter_sites(cwd, var).await;
     }
     (Vec::new(), false)
 }
@@ -3596,10 +3639,9 @@ impl PythonCrawler {
     ///      Pipenv's own (`is_pipenv_project`), uv's own (see
     ///      `uv_owns_project_env`) or Poetry's own (see
     ///      `poetry_owns_project_env`), fall through to the interpreter
-    ///      the project installs into
-    ///      (`project_interpreter_site_packages`): the Python on `PATH`,
-    ///      not every interpreter and tool environment on the machine,
-    ///      which only `--global` reads.
+    ///      the project installs into (`project_interpreter_sites`): the
+    ///      Python on `PATH`, not every interpreter and tool environment
+    ///      on the machine, which only `--global` reads.
     ///
     /// A fresh uv clone (`uv.lock`, no `.venv` yet) returns nothing:
     /// its lock-only packages come from `uv.lock` instead.
@@ -3640,6 +3682,14 @@ impl PythonCrawler {
         let (sites, shared) = local_sites_with(&options.cwd, var).await;
         self.set_search_order(&sites).await;
         (sites, shared)
+    }
+
+    /// Whether the project at `options.cwd` has no environment of its own
+    /// and installs into an interpreter it shares with the rest of the
+    /// machine. Never so under `--global` / `--global-prefix`.
+    pub async fn installs_into_a_shared_interpreter(&self, options: &CrawlerOptions) -> bool {
+        let var = |name: &str| std::env::var(name).ok();
+        self.sites_with(options, &var).await.1
     }
 
     /// Crawl all discovered `site-packages` and return every package found.
