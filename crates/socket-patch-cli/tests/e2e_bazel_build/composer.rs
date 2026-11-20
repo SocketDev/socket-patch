@@ -1506,12 +1506,14 @@ fn every_command_that_would_vendor_declines_a_project_in_a_bazel_workspace() {
     }
     std::fs::remove_dir_all(cell.path(&format!("{API}/.socket"))).expect("remove .socket");
 
-    // The eject is refused whole, before it restores a pin, and so is its
-    // dry run.
+    // The eject is refused whole, before it restores a pin or asks the
+    // service for a record, and so is its dry run.
     let pinned = pins(&flow, API, &patch, &before);
     declines(&flow, API, &VENDORED, 1, "failed", &pinned);
     for eject in &vendor {
+        let asked = standin.requests();
         let eject = declines(&flow, API, eject, 1, "failed", &pinned);
+        assert_eq!(standin.requests(), asked, "{}", eject.dump);
         let refused = &eject.envelope["error"]["code"];
         assert_eq!(*refused, "eject_refused", "{}", eject.dump);
         let why = event_for(&eject.envelope, PURL)["error"].as_str();
@@ -1523,10 +1525,11 @@ fn every_command_that_would_vendor_declines_a_project_in_a_bazel_workspace() {
 
 /// Without a Bazel: vendored mode goes on as before in a project that is
 /// in no Bazel workspace, and in one on the user's word, the flag or its
-/// variable. A later run without the flag declines again and leaves the
-/// copy as it is, and so does a scan that names no mode, which runs in
-/// vendored mode in a vendored project. `vendor --revert` takes no flag:
-/// it puts every file back.
+/// variable. A later run without the flag passes and writes nothing: the
+/// lock already names the copy of that patch, so the run is in sync, and
+/// so is a scan that names no mode, which runs in vendored mode in a
+/// vendored project. `vendor --revert` takes no flag: it puts every file
+/// back.
 #[test]
 fn vendored_mode_goes_on_outside_bazel_and_on_the_users_word() {
     let (flow, patch) = checkout(&["BUILD.bazel"]);
@@ -1546,8 +1549,15 @@ fn vendored_mode_goes_on_outside_bazel_and_on_the_users_word() {
     assert_eq!(by_variable.envelope["summary"]["applied"], 1, "{said}");
     reverts(ALLOW_ENV);
     let vendored = vendors(&flow, API, &patch, &before, &[ALLOW]);
-    declines(&flow, API, &VENDORED, 1, "failed", &vendored);
-    declines(&flow, API, &["scan", "--yes"], 1, "failed", &vendored);
+    for in_sync in [&VENDORED[..], &["scan", "--yes"]] {
+        let again = socket_patch(cell, standin, API, in_sync);
+        let said = &again.dump;
+        assert_eq!(again.code, 0, "{in_sync:?}: {said}");
+        assert_eq!(again.envelope["status"], "success", "{in_sync:?}: {said}");
+        let refused = said.contains(DECLINED);
+        assert!(!refused, "{in_sync:?}: {said}");
+        assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{in_sync:?}");
+    }
     reverts(ALLOW);
 }
 

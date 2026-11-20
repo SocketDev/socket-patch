@@ -2535,7 +2535,8 @@ brings its packages into the build with a few lines of its own: a repository rul
 that runs `composer install` from the committed `composer.lock`, or a committed `vendor/` tree
 that Bazel reads as source files. Hosted mode patches the first two when Bazel runs the rule
 or the action again: Composer runs on the lock that socket-patch rewrote and fetches the
-patched archive. Agent mode patches the third.
+patched archive. For the third, see vendored mode with the flag below. Agent mode is not
+supported in a Bazel workspace.
 
 Vendored mode is declined there by default. It makes `composer.lock` name the patched copy by
 a path relative to the directory Composer runs in
@@ -2552,8 +2553,7 @@ A project is in a Bazel workspace by the lookup of
 it up to the root of its git checkout, holds `MODULE.bazel`, `REPO.bazel`, `WORKSPACE` or
 `WORKSPACE.bazel`. There, every command that would vendor a Composer package reports the
 package `failed` with `vendor_composer_bazel_workspace` and exits 1: `scan --mode vendored`,
-`get --mode vendored`, `vendor`, and a `scan` or `get` with no `--mode` in a project that is
-already vendored, which runs in vendored mode. It writes nothing and downloads no patch, and a
+`get --mode vendored` and `vendor`. It writes nothing and downloads no patch, and a
 package that is pinned hosted stays pinned. With `--dry-run`, `scan` and `get` list the package
 as one the run would refuse and exit 0; `vendor --dry-run` reports the refusal and exits 1, as
 it does for any package it could not vendor. The message names the Bazel root and the mode
@@ -2573,16 +2573,22 @@ socket-patch checks none of these. The switch is not Composer's alone: it lets v
 write for any package it would decline because the project is in a Bazel workspace, where the
 build may not find the vendored copy. The Composer refusal is the only such refusal today.
 
-`vendor --revert` is never declined. A project that was vendored with the flag, or by an
-earlier release, is declined again by a later vendored run without the flag, which changes
-nothing. A `scan` or `get` with no `--mode` is such a run in that project.
+`vendor --revert` is never declined. Neither is a package that is already vendored: where
+`composer.lock` already names the copy of the same patch, a vendored run leaves the lock as it
+is. So a project that was vendored with the flag, or by an earlier release, keeps passing its
+runs without the flag, a `scan` or `get` with no `--mode` included, which runs in vendored mode
+there. A new patch for that package, or another package, is declined until the run has the
+flag.
 
 Limits:
 
 - A project in a Bazel workspace that Bazel does not build, and one that commits its `vendor/`
   tree, are declined like any other until they have the flag.
-- A Bazel root that the lookup does not reach (one above the git checkout, or above a project
-  that is in no checkout) is not seen, and vendored mode goes on there as before.
+- A Bazel root that the lookup does not reach is not seen, and vendored mode goes on there as
+  before: one above the git checkout (a project that is a checkout of its own, such as a
+  submodule, in a Bazel repository), one above a project that is in no checkout or whose
+  checkout's `.git` belongs to another user, and the home directory itself for a project
+  below it.
 - Hosted mode, which the message names, changes `composer.lock` and nothing else. It patches
   the build when Bazel runs Composer on that lock again. A repository rule that links the lock
   with `rctx.symlink` is not run again on Bazel 8 and 9 until its repository is fetched again,
@@ -2590,7 +2596,7 @@ Limits:
   never reads it: there the hosted run exits 0 and the build stays the unpatched one.
 
 [`e2e_bazel_build/composer.rs`](../crates/socket-patch-cli/tests/e2e_bazel_build/composer.rs)
-runs the three modes on a real Bazel.
+runs these flows on a real Bazel.
 
 ## Ruby gems: hosted mode
 

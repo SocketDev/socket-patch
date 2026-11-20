@@ -25,7 +25,8 @@
 //!    (`vendor_maven_version_not_selected`, a skip too);
 //! 7. a Composer project in a Bazel workspace
 //!    (`vendor_composer_bazel_workspace`), unless the user allowed it
-//!    ([`ALLOW_IN_BAZEL_ENV`]).
+//!    ([`ALLOW_IN_BAZEL_ENV`]) or the lock already names the patch's copy
+//!    ([`bazel_workspace_refusals`]).
 //!
 //! Each check lives in its backend's module; this one only dispatches and
 //! scopes them.
@@ -99,6 +100,30 @@ fn is_npm(purl: &str) -> bool {
 
 fn is_cargo(purl: &str) -> bool {
     Ecosystem::from_purl(purl) == Some(Ecosystem::Cargo)
+}
+
+fn is_composer(purl: &str) -> bool {
+    Ecosystem::from_purl(purl) == Some(Ecosystem::Composer)
+}
+
+/// The refusals of vendored mode that rest on the Bazel workspace of the
+/// project at `project_root`, for `candidates` (`(purl, uuid)` pairs):
+/// each refused purl with its code and detail. None when the user allowed
+/// it ([`ALLOW_IN_BAZEL_ENV`]). Read-only, and it asks no service. Every
+/// vendored entry point takes this one answer: [`vendor_refusals`] hands it
+/// to a scan, a `get` and a `vendor`, and the eject of hosted pins asks it
+/// before it fetches or restores anything. A refusal of this kind for
+/// another ecosystem belongs here; Composer's is the only one today.
+pub async fn bazel_workspace_refusals<'a>(
+    project_root: &Path,
+    candidates: &[(&'a str, &str)],
+) -> Vec<(&'a str, &'static str, String)> {
+    let composer: Vec<(&str, &str)> = candidates
+        .iter()
+        .filter(|(purl, _)| is_composer(purl))
+        .copied()
+        .collect();
+    composer_lock::bazel::refusals(project_root, &composer).await
 }
 
 /// Every refusal the vendor engine can decide for `candidates` (`(purl,
@@ -180,14 +205,8 @@ pub async fn vendor_refusals(
     for (purl, (code, detail)) in maven_refusals(project_root, candidates).await {
         refuse(&mut out, &purl, code, &detail);
     }
-    let composer = |purl: &str| Ecosystem::from_purl(purl) == Some(Ecosystem::Composer);
-    if candidates.iter().any(|(purl, _)| composer(purl)) {
-        // One answer for the project: the lock of every package is its.
-        if let Some((code, detail)) = composer_lock::bazel::refusal(project_root).await {
-            for (purl, _) in candidates.iter().filter(|(purl, _)| composer(purl)) {
-                refuse(&mut out, purl, code, &detail);
-            }
-        }
+    for (purl, code, detail) in bazel_workspace_refusals(project_root, candidates).await {
+        refuse(&mut out, purl, code, &detail);
     }
     out
 }
@@ -442,9 +461,12 @@ mod tests {
 
     /// A Composer project in a Bazel workspace: every Composer candidate
     /// is refused with the one answer of the project, and no candidate of
-    /// another ecosystem is. Without the workspace file nothing is.
+    /// another ecosystem is. Without the workspace file nothing is. The
+    /// switch is read from the environment, so the test holds it unset.
     #[tokio::test]
+    #[serial_test::serial]
     async fn composer_candidates_in_a_bazel_workspace_are_refused() {
+        let _unset = crate::test_env::EnvGuard::unset(ALLOW_IN_BAZEL_ENV);
         let tmp = tempfile::tempdir().unwrap();
         let (one, other) = ("pkg:composer/a/b@1.0.0", "pkg:composer/c/d@2.0.0");
         let pairs = [(one, UUID), (other, OTHER_UUID), ("pkg:pypi/x@1.0.0", UUID)];

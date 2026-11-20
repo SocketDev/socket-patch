@@ -49,12 +49,13 @@ on:
     # that finds an installed package, the lock inventory, the discovery of
     # a hosted pin for `vex`, the upstream restore of `rollback`, the hints
     # a command prints, and the vendored backend (vendor/composer_lock), with
-    # the refusal of vendored mode in a Bazel workspace. Three more are here.
+    # the refusal of vendored mode in a Bazel workspace. Four more are here.
     # patch/user_patches.rs is the inspection of a project's own patches,
     # whose Composer part every scan of a Composer project runs; it also
     # holds the npm, Cargo and Go parts, so a change to those starts the
-    # Composer legs too. `bazel/` finds the Bazel root that refusal asks
-    # for, and vendor/refusals.rs hands the refusal to every command.
+    # Composer legs too. bazel/mod.rs finds the Bazel root that refusal asks
+    # for, on the walk of utils/repo_root.rs, and vendor/refusals.rs hands
+    # the refusal to every command.
     #
     # What it does not cover: shared engine code (patch/redirect/mod.rs,
     # hosted/, the apply and rollback engines of agent mode, vex/,
@@ -74,7 +75,8 @@ on:
       - 'crates/*/src/**/*composer*'
       - 'crates/*/src/**/*composer*/**'
       - 'crates/socket-patch-core/src/patch/user_patches.rs'
-      - 'crates/socket-patch-core/src/bazel/**'
+      - 'crates/socket-patch-core/src/bazel/mod.rs'
+      - 'crates/socket-patch-core/src/utils/repo_root.rs'
       - 'crates/socket-patch-core/src/vendor/refusals.rs'
   push:
     branches: [main]
@@ -95,7 +97,8 @@ on:
       - 'crates/*/src/**/*composer*'
       - 'crates/*/src/**/*composer*/**'
       - 'crates/socket-patch-core/src/patch/user_patches.rs'
-      - 'crates/socket-patch-core/src/bazel/**'
+      - 'crates/socket-patch-core/src/bazel/mod.rs'
+      - 'crates/socket-patch-core/src/utils/repo_root.rs'
       - 'crates/socket-patch-core/src/vendor/refusals.rs'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
       - 'crates/socket-patch-core/src/patch/redirect/**'
