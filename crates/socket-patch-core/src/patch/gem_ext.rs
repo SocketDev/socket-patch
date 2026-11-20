@@ -1623,7 +1623,7 @@ fn took(elapsed: Duration) -> String {
 }
 
 /// Run a build of `copy`'s extension (`run`, `from`: "its source gem with
-/// the patch applied", "its patched gem"), saying when it starts and how it
+/// the patch applied", "its upstream gem"), saying when it starts and how it
 /// ended
 /// ([`RubyEnv::progress`]). What the build was worth is the caller's to
 /// say: one that exits cleanly may still have built nothing of the patch.
@@ -2546,10 +2546,13 @@ fn parse_installed(stdout: &str) -> Option<(String, PathBuf)> {
 /// Nothing of the installed copy is changed. The Ruby is found as for a
 /// rebuild ([`find_ruby`]): the one whose extension dir for the gem is the
 /// installed one, so the staged build has the installed build's platform
-/// and ABI. `Err` says why there is no staged install to use.
+/// and ABI. `kind` says which gem `archive` is, for the build's progress
+/// line: `patched`, or `upstream` when an unwind puts that one back
+/// (#2152). `Err` says why there is no staged install to use.
 pub(crate) async fn install_staged(
     installed: &Path,
     archive: &Path,
+    kind: &str,
     stage_home: &Path,
     env: &RubyEnv,
 ) -> Result<StagedInstall, String> {
@@ -2571,7 +2574,7 @@ pub(crate) async fn install_staged(
         archive,
         stage_home,
     };
-    let stdout = run_build(&probe, run, &copy, env, "its patched gem").await?;
+    let stdout = run_build(&probe, run, &copy, env, &format!("its {kind} gem")).await?;
     let (full_name, built) = parse_installed(&stdout)
         .ok_or_else(|| format!("{}: unreadable install output", probe.ruby.display()))?;
     let staged = StagedInstall {
