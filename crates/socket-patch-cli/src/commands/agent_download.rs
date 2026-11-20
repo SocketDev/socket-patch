@@ -2433,7 +2433,8 @@ pub async fn download_and_apply_patches_into(
 /// none undoes the patch (Go builds from the committed copies). A Python
 /// project pixi installs gets `pixi install` beside any other tool's
 /// install: pixi keeps its own environments, whatever venv that tool
-/// fills.
+/// fills. Beside pixi's files `pip install` is named only when a file pip
+/// installs from is there too.
 fn install_commands(ecosystem: Ecosystem, has_file: &dyn Fn(&str) -> bool) -> Vec<&'static str> {
     use socket_patch_core::constants::npm_family::{BUN_LOCK, BUN_LOCKB, PNPM_LOCK, VLT_LOCK};
     let one = |command: &'static str| vec![command];
@@ -2455,13 +2456,19 @@ fn install_commands(ecosystem: Ecosystem, has_file: &dyn Fn(&str) -> bool) -> Ve
             .map(|(_, command)| command)
             .into_iter()
             .collect();
+            let other_tool = !commands.is_empty();
             // pixi links the packages of a project into its own
             // environments, conda and PyPI ones alike.
-            let pixi_files = socket_patch_core::crawlers::pixi_env::PIXI_FILES;
-            if pixi_files.iter().any(|file| has_file(file)) {
+            use socket_patch_core::crawlers::pixi_env::{PIP_INSTALL_FILES, PIXI_FILES};
+            let pixi = PIXI_FILES.iter().any(|file| has_file(file));
+            if pixi {
                 commands.push("pixi install");
             }
-            if commands.is_empty() {
+            // With no other tool's lock, pip installs the project; beside
+            // pixi's files only when a file pip installs from is there too
+            // (the crawl then also reads the interpreter on `PATH`).
+            let pip_files = PIP_INSTALL_FILES.iter().any(|file| has_file(file));
+            if !other_tool && (!pixi || pip_files) {
                 commands.push("pip install");
             }
             commands
@@ -2617,6 +2624,18 @@ mod tests {
         let named = steps(&["pkg:pypi/a@1"], both.path());
         assert!(
             named[2].contains("after every `pixi install` and `uv sync`,"),
+            "{named:?}"
+        );
+
+        // A file pip installs from beside pixi's: pip fills the
+        // interpreter on `PATH`, which the crawl reads too.
+        let pip_too = tempfile::tempdir().unwrap();
+        for file in ["requirements.txt", "pixi.toml"] {
+            std::fs::write(pip_too.path().join(file), "").unwrap();
+        }
+        let named = steps(&["pkg:pypi/a@1"], pip_too.path());
+        assert!(
+            named[2].contains("after every `pip install` and `pixi install`,"),
             "{named:?}"
         );
 

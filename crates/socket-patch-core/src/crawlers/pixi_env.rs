@@ -49,7 +49,7 @@ pub struct PixiEnvironment {
 /// install -r requirements.txt`), so pixi does not own the project's
 /// environment alone. A `pyproject.toml` counts when it has a
 /// `[build-system]` (see [`pixi_owns_project_env`]).
-const PIP_INSTALL_FILES: [&str; 3] = ["requirements.txt", "setup.py", "setup.cfg"];
+pub const PIP_INSTALL_FILES: [&str; 3] = ["requirements.txt", "setup.py", "setup.cfg"];
 
 /// Whether pixi installs the project at `cwd`: it has a `pixi.toml` or a
 /// `pixi.lock`.
@@ -144,8 +144,11 @@ fn activated_environment(
     if !same_dir(root, cwd) && !member {
         return None;
     }
+    // A `conda activate` run inside `pixi shell` leaves pixi's variables
+    // set over a prefix pixi did not install: that one is not the
+    // workspace's.
     let prefix = PathBuf::from(set("CONDA_PREFIX")?);
-    if !is_conda_prefix(&prefix) {
+    if !is_conda_prefix(&prefix) || !is_pixi_prefix(&prefix) {
         return None;
     }
     let name = set("PIXI_ENVIRONMENT_NAME").unwrap_or_else(|| {
@@ -464,6 +467,18 @@ mod tests {
             ("CONDA_PREFIX", &other),
         ]);
         assert!(pixi_environments_with(&project, &not_a_prefix)
+            .await
+            .is_empty());
+
+        // pixi's variables still set over a conda environment pixi did not
+        // install (`conda activate` inside `pixi shell`).
+        let plain = tmp.path().join("miniconda").join("envs").join("plain");
+        std::fs::create_dir_all(plain.join("conda-meta")).unwrap();
+        let conda_over_pixi = env_of(&[
+            ("PIXI_PROJECT_ROOT", project.as_path()),
+            ("CONDA_PREFIX", &plain),
+        ]);
+        assert!(pixi_environments_with(&project, &conda_over_pixi)
             .await
             .is_empty());
 
