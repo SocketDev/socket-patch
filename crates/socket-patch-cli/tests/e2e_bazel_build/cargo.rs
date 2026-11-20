@@ -29,9 +29,10 @@
 //!   patched crate file. `scan --mode vendored --yes` unpacks the patched
 //!   crate file to `.socket/vendor/cargo/<uuid>/<name>-<version>/`, records
 //!   it in the ledger `.socket/vendor/state.json`, points a
-//!   `[patch.crates-io]` entry of `Cargo.toml` at the copy, and gives the
+//!   `[patch.crates-io]` entry of `Cargo.toml` at the copy, gives the
 //!   lock's entry the version of the copy (`<version>+socket.<uuid>`) and
-//!   no source.
+//!   no source, and writes the line of the vendored crates into
+//!   `.bazelignore` ([`IGNORED`]): the workspace has a crate hub.
 //! - (c) The same two Bazel commands, with no step in between, print the
 //!   patched marker. Hosted: the stand-in patch host was asked for its index
 //!   file of the crate and, at least twice, for the crate file, and the
@@ -39,10 +40,10 @@
 //!   it, and the build asked no host for the crate. Then `vex` is asked
 //!   for its document. Hosted: it attests the crate, and the command of the
 //!   mode, run a second time as on every run of a pipeline, reports the
-//!   patch applied again and changes no file. Vendored: what `vex` does
-//!   depends on the ruleset (see "Known gaps"), and `bazel build //...` and
-//!   `bazel query //...` say what Bazel takes the copy for (see "The build
-//!   file in the copy").
+//!   patch applied again and changes no file. Vendored: `vendor --check`
+//!   passes and `vex` attests the crate, `//...` is the user's own target,
+//!   and the commands that analyse every target pass (see "The build file
+//!   in the copy").
 //! - (d) The undo (`rollback --yes`, or `vendor --revert`) puts every file
 //!   the command wrote back, byte for byte, and the build prints the
 //!   unpatched marker again.
@@ -53,14 +54,14 @@
 //!   pins, and the build fails on the checksum, whether the index of that
 //!   host names the pinned checksum or the one of the file it serves; the
 //!   upstream crate is not asked for in its place. Vendored: the first
-//!   build there is the patched one, and the command of the mode runs a
-//!   second time; the build after it writes nothing, `vendor --check`
-//!   passes and `vex` attests the crate. Then a build file that
-//!   cargo-bazel did not write is put into the copy (see "The build file
-//!   in the copy"), and then the library of the copy is changed. Nothing in
-//!   a build holds the committed copy to a checksum, as
-//!   nothing does for any crate a Cargo workspace takes from a path: the
-//!   changed library is what Bazel builds next, and it is
+//!   build there is the patched one, and the command of the mode, run a
+//!   second time, reports the copy `already_vendored`, downloads nothing
+//!   and changes no file; `vendor --check` passes and `vex` attests the
+//!   crate. Then a build file that cargo-bazel did not write is put into
+//!   the copy (see "The build file in the copy"), and then the library of
+//!   the copy is changed. Nothing in a build holds the committed copy to a
+//!   checksum, as nothing does for any crate a Cargo workspace takes from a
+//!   path: the changed library is what Bazel builds next, and it is
 //!   `socket-patch vendor --check` that reports the copy
 //!   (`vendor_hash_mismatch`).
 //!
@@ -76,11 +77,11 @@
 //! build writes the one of before.
 //!
 //! With rules_rust 0.56.0 Bazel's lock has no entry for the hub and a build
-//! writes no file: the undo restores the checkout at once, `vendor --check`
-//! passes, `vex` attests the crate, and a second scan reports the copy
-//! `already_vendored` and leaves it alone. With rules_rust 0.75.0 a build
-//! also writes a `BUILD.bazel` into the vendored copy, and those three
-//! commands do otherwise right after it (see "Known gaps").
+//! writes no file: the undo restores the checkout at once. With rules_rust
+//! 0.75.0 a build also writes a `BUILD.bazel` into the vendored copy (see
+//! "The build file in the copy"). With either, `vendor --check` passes
+//! right after the build, `vex` attests the crate, and a second scan
+//! reports the copy `already_vendored` and leaves it alone.
 //!
 //! The two releases also differ in the home of the hub's cargo
 //! ([`cargo_env`]). rules_rust 0.75.0 gives it a directory inside the
@@ -132,51 +133,33 @@
 //! of that:
 //!
 //! - Where the ruleset writes the file, it starts with the banner of every
-//!   file cargo-bazel renders ([`BANNER`]), and it makes the copy a package
-//!   of the user's workspace: `bazel query //...` lists targets there, and
-//!   `bazel build //...` passes ([`every_target`]). The crate has a
-//!   dependency ([`DEP`]), so the file names a repository of the hub,
-//!   which the main repository does not see, and the commands that analyse
-//!   every target fail on that package: `bazel cquery //...` and
-//!   `bazel query 'deps(//...)'` ([`analyses`]). With a `.bazelignore`
-//!   line for the copies, which the test writes as a user would, `//...`
-//!   is the user's own target again, those two commands pass, and the
-//!   build is still the patched one: the hub reads the copy by its path,
-//!   not as a package.
+//!   file cargo-bazel renders ([`BANNER`]), and `socket-patch` takes a
+//!   `BUILD.bazel` that starts so, in the copy's own directory of a
+//!   project whose Bazel workspace has a crate hub, for no change of the
+//!   copy: the scan recorded no such file, and the commands above pass all
+//!   the same.
+//! - Bazel would read that file as a package of the user's workspace. The
+//!   crate has a dependency ([`DEP`]), so the file names a repository of
+//!   the hub, which the main repository does not see, and the commands
+//!   that analyse every target fail on it: `bazel cquery //...` and
+//!   `bazel query 'deps(//...)'` ([`analyses`]). The line that the scan
+//!   wrote into `.bazelignore` keeps the copies out of Bazel's packages:
+//!   `//...` is the user's own target ([`every_target`]), both commands
+//!   pass, and the build is the patched one, because the hub reads the
+//!   copy by its path, not as a package. A user who comments the line out
+//!   has the package back, and the two commands fail where the ruleset
+//!   writes the file.
 //! - With either ruleset, a build file that someone else put there under
 //!   the same banner does not reach the crate: the build still prints the
-//!   patched marker. It is a package of the workspace all the same, and
-//!   `bazel build //...` builds its target. `vendor --check` reports it,
-//!   as it reports any file the scan did not record.
+//!   patched marker. `vendor --check` passes on it: the banner is all that
+//!   `socket-patch` reads of the file. Under the line it is no package.
+//!   With the line commented out it is one, and `bazel build //...` builds
+//!   its target.
 //!
-//! # Known gaps
-//!
-//! Three assertions of the vendored flow hold what the release does with
-//! rules_rust 0.75.0, and that is not what a user needs. They are marked
-//! `KNOWN GAP` where they stand. All have one cause: cargo-bazel 0.75.0
-//! writes a `BUILD.bazel` into the committed copy. The scan recorded no
-//! such file, so `socket-patch` then takes the copy for a damaged one
-//! (`vendor_inventory_mismatch`), and Bazel takes the copy for a package.
-//! Right after a build that is the patched one:
-//!
-//! - `vendor --check` exits 1.
-//! - `vex` leaves the patch out and, with nothing else to attest, exits 1
-//!   and writes no document.
-//! - `bazel cquery //...` and `bazel query 'deps(//...)'` fail, until the
-//!   user writes a `.bazelignore` line for the copies.
-//!
-//! The flow also holds how a user gets out of it today. A second
-//! `scan --mode vendored` downloads the crate again, reports the copy
-//! `rebuilt` and removes the file. Nothing the hub reads has changed by
-//! then, so the build after that scan does not write the file again, and
-//! the check and `vex` pass. `vendor --revert` removes the file with the
-//! copy.
-//!
-//! A fix of the product makes the two commands of `socket-patch` pass
-//! right after the build, as they do with rules_rust 0.56.0, and writes the
-//! `.bazelignore` line itself. `intact` of the vendored flow is then true
-//! with every ruleset, and the branches marked `KNOWN GAP` go, with the
-//! second download of the crate.
+//! What else is a changed copy, and where the line is written, is held
+//! without a Bazel
+//! ([`only_the_build_file_of_cargo_bazel_is_no_change_of_a_vendored_copy`],
+//! [`the_vendored_crates_get_a_bazelignore_line_where_a_crate_hub_builds_them`]).
 
 use std::path::Path;
 use std::time::Instant;
@@ -269,9 +252,13 @@ const BANNER: &str =
     "###############################################################################\n\
     # @generated\n\
     # DO NOT MODIFY: This file is auto-generated by a crate_universe tool.";
-/// The `.bazelignore` line of a user who keeps Bazel out of the vendored
-/// crates.
-const IGNORED: &str = ".socket/vendor/cargo\n";
+/// The two lines `socket-patch` keeps in the `.bazelignore` of a workspace
+/// with a crate hub while the project has vendored crates, and the same
+/// with the path line commented out: a user's "no" to them.
+const IGNORED: &str = "# socket-patch: patched crate copies, not Bazel packages (to opt out, \
+    comment out the next line)\n.socket/vendor/cargo\n";
+const DECLINED: &str = "# socket-patch: patched crate copies, not Bazel packages (to opt out, \
+    comment out the next line)\n# .socket/vendor/cargo\n";
 /// The cargo home of every `socket-patch` child: no directory, so a scan
 /// finds the crate in the lock alone, as in a checkout only Bazel built.
 const NO_CARGO_HOME: &str = "/nonexistent/cargo-home";
@@ -588,14 +575,31 @@ fn open(test: &str) -> Option<(tempfile::TempDir, Cell, StandIn, Package)> {
 /// the patch server (a hosted pin is recognised by that origin) and as the
 /// index `rollback` reads the upstream checksum from.
 fn socket_patch(cell: &Cell, standin: &StandIn, args: &[&str]) -> Ran {
+    let (origin, index) = hosts(standin);
+    cell.socket_patch(&origin, args, &env(&origin, &index))
+}
+
+/// [`socket_patch`] as a person runs it: what it printed on stdout and on
+/// stderr.
+fn person(cell: &Cell, standin: &StandIn, args: &[&str]) -> [String; 2] {
+    let (origin, index) = hosts(standin);
+    cell.socket_patch_person(&origin, args, &env(&origin, &index))
+}
+
+/// The origin of `standin`, and the index of crates.io there.
+fn hosts(standin: &StandIn) -> (String, String) {
     let origin = standin.origin();
     let index = format!("{origin}/{INDEX}");
-    let env = [
-        ("SOCKET_PATCH_SERVER_URL", origin.as_str()),
-        ("SOCKET_CRATES_INDEX", index.as_str()),
+    (origin, index)
+}
+
+/// What a `socket-patch` child of a flow is told of its hosts.
+fn env<'a>(origin: &'a str, index: &'a str) -> [(&'a str, &'a str); 3] {
+    [
+        ("SOCKET_PATCH_SERVER_URL", origin),
+        ("SOCKET_CRATES_INDEX", index),
         ("CARGO_HOME", NO_CARGO_HOME),
-    ];
-    cell.socket_patch(&origin, args, &env)
+    ]
 }
 
 /// A text file of a tree.
@@ -786,9 +790,9 @@ fn analyses(cell: &Cell) -> bool {
 /// `vex` in the checkout of `cell`, which holds the files of `built`. Its
 /// document goes beside the checkout ([`Cell::document`]), and
 /// no file of the checkout changes. With `attested` it exits 0 and the
-/// document names the crate as patched by `patch`. Without, which is a
-/// known gap (module docs), it exits 1 and writes no document: the patch is
-/// left out over the inventory of the vendored copy
+/// document names the crate as patched by `patch`. Without, for a vendored
+/// copy that is a changed one, it exits 1 and writes no document: the
+/// patch is left out over the inventory of the copy
 /// (`vendor_inventory_mismatch`), and nothing else is there to attest.
 fn vex(cell: &Cell, standin: &StandIn, patch: &Patched, built: &Tree, attested: bool) {
     let test = &cell.test;
@@ -806,10 +810,6 @@ fn vex(cell: &Cell, standin: &StandIn, patch: &Patched, built: &Tree, attested: 
         let names = written.contains(&format!("\"{PURL}\"")) && written.contains(&by);
         assert!(names, "{test}: {said}\n{written}");
     } else {
-        // KNOWN GAP: what the release does, not what a user needs. Once
-        // `vex` attests a vendored crate whose copy holds the `BUILD.bazel`
-        // a build wrote, no flow passes `attested = false`, and this branch
-        // goes with the parameter.
         assert_eq!(vex.code, 1, "{test}: {said}");
         let left_out = has_event(&vex.envelope, "skipped", "vendor_inventory_mismatch", PURL);
         assert!(left_out, "{test}: {said}");
@@ -1002,10 +1002,12 @@ fn vendored_from_cargo_with_config() {
     assert_eq!(scan.envelope["summary"]["downloaded"], 1, "{test}: {said}");
     assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
     // The unpacked crate and its ledger under `.socket/vendor`, the two
-    // files that wire it in, and no other.
+    // files that wire it in, the line that keeps Bazel out of the copies,
+    // and no other.
     let copy = patch.vendored();
     let (copied_manifest, library) = (format!("{copy}/Cargo.toml"), format!("{copy}/src/lib.rs"));
     let written = [
+        ".bazelignore".to_string(),
         copied_manifest.clone(),
         library.clone(),
         format!(
@@ -1018,6 +1020,7 @@ fn vendored_from_cargo_with_config() {
     ];
     let vendored = cell.tree();
     assert_eq!(changed(&before, &vendored), written, "{test}: {said}");
+    assert_eq!(text(&vendored, ".bazelignore"), IGNORED, "{test}: {said}");
     // The committed library is the one of the crate file the patch host
     // served. The copy says it is the patched build of the version, a
     // `[patch.crates-io]` entry sends the crate there, and the lock's entry
@@ -1065,10 +1068,10 @@ fn vendored_from_cargo_with_config() {
         "{test}: Bazel asked a host for the crate"
     );
     // Where the ruleset watches, the build rewrote Bazel's lock, and
-    // cargo-bazel wrote a `BUILD.bazel` into the committed copy. That file
-    // is no part of what the scan recorded: the copy is no longer `intact`,
-    // and `vendor --check` fails right after a build that is the patched
-    // one. Elsewhere the build wrote no file and the check passes.
+    // cargo-bazel wrote a `BUILD.bazel` into the committed copy, under its
+    // banner. That file is no part of what the scan recorded, and no change
+    // of the copy: `vendor --check` passes right after the build, as it
+    // does where the build wrote no file.
     let built = cell.tree();
     let build_file = format!("{copy}/BUILD.bazel");
     let by_bazel: &[&str] = if watches(&cell) {
@@ -1081,35 +1084,20 @@ fn vendored_from_cargo_with_config() {
         let rendered = text(&built, &build_file);
         assert!(rendered.starts_with(BANNER), "{test}: {rendered}");
     }
-    let intact = !watches(&cell);
     let check = socket_patch(&cell, &standin, &["vendor", "--check"]);
-    let said = &check.dump;
-    if intact {
-        assert_eq!(check.code, 0, "{test}: {said}");
-    } else {
-        // KNOWN GAP: what the release does, not what a user needs. Once
-        // `vendor --check` passes on a copy that holds the `BUILD.bazel` a
-        // build wrote, `intact` is true with every ruleset, and this branch
-        // goes.
-        assert_eq!(check.code, 1, "{test}: {said}");
-        let event = event_for(&check.envelope, PURL);
-        assert_eq!(event["errorCode"], "vendor_check_failed", "{test}: {said}");
-        let reason = event["reason"].as_str().unwrap_or_default();
-        assert!(
-            reason.contains("vendor_inventory_mismatch"),
-            "{test}: {said}"
-        );
-    }
+    assert_eq!(check.code, 0, "{test}: {}", check.dump);
     // From here on the checkout stands: the next build changes no file, and
     // Bazel's lock holds when Bazel may not update it.
     cell.builds_patched(&built, &patch.package.marker);
-    // `vex` attests the crate of an intact copy, and leaves the patch of
-    // the other out (the KNOWN GAP of `vex`).
-    vex(&cell, &standin, &patch, &built, intact);
-    // What Bazel takes the copy for. With the build file in it, the copy is
-    // a package of the workspace: `//...` names targets there. A line of
-    // the user's in `.bazelignore` leaves the consumer alone, and the build
-    // is the patched one still.
+    vex(&cell, &standin, &patch, &built, true);
+    // What Bazel takes the copy for. Under the line the scan wrote it is no
+    // package: `//...` is the consumer alone, and the commands that analyse
+    // every target pass. A user who comments the line out has the package
+    // back, where the ruleset writes the build file: `//...` names targets
+    // there, and those commands fail on the repository of the dependency.
+    assert_eq!(every_target(&cell), [CONSUMER], "{test}");
+    assert!(analyses(&cell), "{test}: under the line of the scan");
+    cell.write(".bazelignore", DECLINED);
     let targets = every_target(&cell);
     let package = format!("//{copy}:");
     let (in_copy, own): (Vec<&str>, Vec<&str>) =
@@ -1117,22 +1105,15 @@ fn vendored_from_cargo_with_config() {
     let in_copy = in_copy.len();
     assert_eq!(own, [CONSUMER], "{test}: {targets:?}");
     assert_eq!(in_copy > 0, watches(&cell), "{test}: {targets:?}");
-    // KNOWN GAP: what the release does, not what a user needs. The package
-    // of the copy names a repository of the hub, and the commands that
-    // analyse every target fail on it until a `.bazelignore` line keeps
-    // Bazel out of the copies. Once `socket-patch` writes that line, they
-    // pass from the start.
-    let analysed = analyses(&cell);
-    assert_eq!(analysed, !watches(&cell), "{test}: without a line");
+    assert_eq!(analyses(&cell), !watches(&cell), "{test}: without the line");
+    let declined = ["failed there", "passed"][usize::from(!watches(&cell))];
     cell.write(".bazelignore", IGNORED);
-    assert_eq!(every_target(&cell), [CONSUMER], "{test}");
-    assert!(analyses(&cell), "{test}: with the line of a user");
     cell.builds(&patch.package.marker);
-    std::fs::remove_file(cell.path(".bazelignore")).expect("remove the line");
     assert_eq!(changed(&built, &cell.tree()), NOTHING, "{test}");
 
     // (d) The undo. The copy goes, with the `BUILD.bazel` a build wrote
-    // into it, and the two files are the ones of before at once.
+    // into it and with the line in `.bazelignore`, and the two files are
+    // the ones of before at once.
     let undo = socket_patch(&cell, &standin, &["vendor", "--revert"]);
     undone(&cell, &undo, "removed", &before, &upstream.marker);
 
@@ -1145,11 +1126,9 @@ fn vendored_from_cargo_with_config() {
     twin.builds(&second.package.marker);
     let second_built = twin.tree();
     // The same command a second time, as every run of a pipeline has it,
-    // ends with the copy `already_vendored`. An intact one it leaves alone.
-    // The other it first downloads again (`rebuilt`), which removes the
-    // `BUILD.bazel`. No file the hub reads has changed, so the next build,
-    // still the patched one, writes nothing: from here on `vendor --check`
-    // passes and `vex` attests the crate with either ruleset.
+    // finds the copy `already_vendored` and leaves it alone, with the
+    // `BUILD.bazel` the build wrote into it: nothing is downloaded and no
+    // file changes. `vendor --check` passes and `vex` attests the crate.
     let downloads = other.asked(&second.route);
     let again = socket_patch(&twin, &other, &["scan", "--mode", "vendored", "--yes"]);
     let said = &again.dump;
@@ -1158,40 +1137,41 @@ fn vendored_from_cargo_with_config() {
     assert!(in_sync, "{test}: {said}");
     let rebuilt = again.envelope["summary"]["rebuilt"] == 1;
     let downloaded = other.asked(&second.route) > downloads;
-    assert_eq!((rebuilt, downloaded), (!intact, !intact), "{test}: {said}");
+    assert_eq!((rebuilt, downloaded), (false, false), "{test}: {said}");
     let second_copy = second.vendored();
     let second_build_file = format!("{second_copy}/BUILD.bazel");
-    let removed: &[&str] = if intact { &[] } else { &[&second_build_file] };
-    let repaired = twin.tree();
-    assert_eq!(changed(&second_built, &repaired), removed, "{test}: {said}");
-    twin.builds_patched(&repaired, &second.package.marker);
+    assert_eq!(
+        changed(&second_built, &twin.tree()),
+        NOTHING,
+        "{test}: {said}"
+    );
+    twin.builds_patched(&second_built, &second.package.marker);
     let check = socket_patch(&twin, &other, &["vendor", "--check"]);
     assert_eq!(check.code, 0, "{test}: {}", check.dump);
-    vex(&twin, &other, &second, &repaired, true);
+    vex(&twin, &other, &second, &second_built, true);
     // A build file that cargo-bazel did not write, under its banner. It
-    // does not reach the crate, which Bazel builds as before; it is a
-    // package of the workspace, whose target `//...` builds; and it is no
-    // file the scan recorded, so `vendor --check` reports the copy.
+    // does not reach the crate, which Bazel builds as before, and under
+    // the line of the scan it is no package. The banner is all that
+    // `socket-patch` reads of such a file, so `vendor --check` passes on
+    // this one too. With the line commented out it is a package of the
+    // workspace, whose target `//...` builds.
     let planted = format!(
         "{BANNER}\n\ngenrule(\n    name = \"planted\",\n    outs = [\"planted.txt\"],\n    \
          cmd = \"touch $@\",\n)\n"
     );
     twin.write(&second_build_file, &planted);
     twin.builds(&second.package.marker);
+    assert_eq!(every_target(&twin), [CONSUMER], "{test}");
+    let check = socket_patch(&twin, &other, &["vendor", "--check"]);
+    assert_eq!(check.code, 0, "{test}: {}", check.dump);
+    twin.write(".bazelignore", DECLINED);
     let planted_target = format!("//{second_copy}:planted");
     assert_eq!(
         every_target(&twin),
         [planted_target.as_str(), CONSUMER],
         "{test}"
     );
-    let check = socket_patch(&twin, &other, &["vendor", "--check"]);
-    let said = &check.dump;
-    assert_eq!(check.code, 1, "{test}: {said}");
-    let reason = event_for(&check.envelope, PURL)["reason"]
-        .as_str()
-        .unwrap_or_default();
-    let mismatch = reason.contains("vendor_inventory_mismatch");
-    assert!(mismatch, "{test}: {said}");
+    twin.write(".bazelignore", IGNORED);
     // Then another library in the committed copy. Nothing in a build holds
     // the copy to a checksum: Bazel builds what is there. `vendor --check`
     // is what finds it.
@@ -1209,36 +1189,21 @@ fn vendored_from_cargo_with_config() {
     println!(
         "{test}: Bazel {release} built {:?} from {copy} after `scan --mode vendored`, with no \
          repin and no request for the crate, and wrote {by_bazel:?} itself; right after \
-         that build {}; `//...` held {in_copy} target(s) in the copy and `cquery //...` and \
-         `query 'deps(//...)'` {}, and with a `.bazelignore` line for the copies `//...` \
-         held the consumer alone, the two commands passed and the build was still patched; \
-         `vendor --revert` restored the checkout, and the next build printed \
-         {:?} and left all {} files as before; on a second machine, after its first patched \
-         build, a second scan {}, the next build wrote nothing, `vendor --check` passed and \
-         `vex` attested the crate; a BUILD.bazel of someone else's under cargo-bazel's banner \
-         left the build patched, `//...` built its target, and `vendor --check` reported \
-         vendor_inventory_mismatch; a library then changed in the committed copy was built \
-         ({:?}), and `vendor --check` reported vendor_hash_mismatch; {:?}",
+         that build `vendor --check` passed and `vex` attested the crate; under the \
+         `.bazelignore` line of the scan `//...` held the consumer alone and `cquery //...` \
+         and `query 'deps(//...)'` passed, and with the line commented out `//...` held \
+         {in_copy} target(s) in the copy and the two commands {declined}; `vendor --revert` \
+         restored the checkout, and the next build printed {:?} and left all {} files as \
+         before; on a second machine, after its first patched build, a second scan reported \
+         the copy already_vendored, downloaded nothing and changed no file, `vendor --check` \
+         passed and `vex` attested the crate; a BUILD.bazel of someone else's under \
+         cargo-bazel's banner left the build patched and `vendor --check` passed, under the \
+         line it was no package, and with the line commented out `//...` built its target; a \
+         library then changed in the committed copy was built ({:?}), and `vendor --check` \
+         reported vendor_hash_mismatch; {:?}",
         patch.package.marker,
-        if intact {
-            "`vendor --check` passed and `vex` attested the crate"
-        } else {
-            "(KNOWN GAPS) `vendor --check` failed on the BUILD.bazel \
-             (vendor_inventory_mismatch), and `vex` left the patch out under the same code and \
-             wrote no document"
-        },
-        if analysed {
-            "passed"
-        } else {
-            "(KNOWN GAP) failed on a repository of the hub"
-        },
         upstream.marker,
         before.len(),
-        if intact {
-            "reported the copy already_vendored and changed nothing"
-        } else {
-            "downloaded the crate again (rebuilt) and removed the BUILD.bazel"
-        },
         tampered.marker,
         started.elapsed()
     );
@@ -1273,58 +1238,140 @@ fn vendored_checkout(marks: &str, module: &str) -> (Cell, StandIn, Patched) {
     (cell, standin, patch)
 }
 
-/// What `socket-patch` does in `cell` with a vendored copy that it takes
-/// for a changed one over `extra`, a file the scan did not record:
+/// What `socket-patch` does in `cell` with a vendored copy that holds
+/// `extra`, a file the scan did not record. A copy it takes for `changed`:
 /// `vendor --check` exits 1 over the inventory, `vex` leaves the patch out,
-/// and a second scan downloads the crate again and removes the file.
-fn takes_for_changed(cell: &Cell, standin: &StandIn, patch: &Patched, extra: &str) {
+/// and a second scan downloads the crate again and removes the file. The
+/// other: the check passes, `vex` attests the crate of `patch`, and a
+/// second scan downloads nothing and leaves every file as it is. `repair`
+/// after that scan does the same with either.
+fn takes_for(cell: &Cell, standin: &StandIn, patch: &Patched, extra: &str, is_changed: bool) {
     let left = cell.tree();
     let check = socket_patch(cell, standin, &["vendor", "--check"]);
-    assert_eq!(check.code, 1, "{extra}: {}", check.dump);
+    assert_eq!(check.code, i32::from(is_changed), "{extra}: {}", check.dump);
     let reason = event_for(&check.envelope, PURL)["reason"]
         .as_str()
         .unwrap_or_default();
     let mismatch = reason.contains("vendor_inventory_mismatch");
-    assert!(mismatch, "{extra}: {}", check.dump);
-    vex(cell, standin, patch, &left, false);
+    assert_eq!(mismatch, is_changed, "{extra}: {}", check.dump);
+    vex(cell, standin, patch, &left, !is_changed);
     let downloads = standin.asked(&patch.route);
     let again = socket_patch(cell, standin, &["scan", "--mode", "vendored", "--yes"]);
     let said = &again.dump;
     assert_eq!(again.code, 0, "{extra}: {said}");
-    assert_eq!(again.envelope["summary"]["rebuilt"], 1, "{extra}: {said}");
+    let in_sync = has_event(&again.envelope, "skipped", "already_vendored", PURL);
+    assert!(in_sync, "{extra}: {said}");
+    let rebuilt = again.envelope["summary"]["rebuilt"] == 1;
     let downloaded = standin.asked(&patch.route) - downloads;
-    assert_eq!(downloaded, 1, "{extra}: {said}");
-    assert_eq!(changed(&left, &cell.tree()), [extra], "{extra}: {said}");
+    let count = usize::from(is_changed);
+    assert_eq!(
+        (rebuilt, downloaded),
+        (is_changed, count),
+        "{extra}: {said}"
+    );
+    let removed: &[&str] = if is_changed { &[extra] } else { &[] };
+    let scanned = cell.tree();
+    assert_eq!(changed(&left, &scanned), removed, "{extra}: {said}");
+    // `repair` has nothing to restore by now, the file of the other copy
+    // included.
+    let repair = socket_patch(cell, standin, &["repair"]);
+    assert_eq!(repair.code, 0, "{extra}: {}", repair.dump);
+    let restored = standin.asked(&patch.route) - downloads - downloaded;
+    assert_eq!(restored, 0, "{extra}: {}", repair.dump);
+    assert_eq!(changed(&scanned, &cell.tree()), NOTHING, "{extra}");
 }
 
-/// Without a Bazel: what the release does with a build file in a vendored
-/// copy that the scan did not record, whoever wrote it. The first is where
-/// cargo-bazel writes one and starts as its files do, in a Bazel workspace
-/// with a crate hub. The others differ from it in one thing each: a
-/// checkout that is no Bazel workspace (a directory named like a workspace
-/// file marks none), a workspace whose module file makes no crate hub, no
-/// banner, Bazel's other name for a build file, and a directory of the
-/// crate. The copy is a changed one every time ([`takes_for_changed`]),
-/// and the scan wrote no `.bazelignore` in any of the checkouts.
+/// Without a Bazel: a build file in a vendored copy that the scan did not
+/// record. The first is where cargo-bazel writes one and starts as its
+/// files do, in a Bazel workspace with a crate hub: that one is no change
+/// of the copy. The others differ from it in one thing each, and are the
+/// changed copy they were: a checkout that is no Bazel workspace (a
+/// directory named like a workspace file marks none), a workspace whose
+/// module file makes no crate hub, no banner, Bazel's other name for a
+/// build file, and a directory of the crate ([`takes_for`]).
 #[test]
-fn a_build_file_in_a_vendored_copy_is_a_changed_copy() {
+fn only_the_build_file_of_cargo_bazel_is_no_change_of_a_vendored_copy() {
     let rendered = format!("{BANNER} To \n# regenerate this file, run the following:\n");
     let (hub, bazel) = (hub(), "MODULE.bazel");
     let no_hub = "module(name = \"socket_fixture\", version = \"0.0.0\")\n";
-    for (marks, module, file, text) in [
-        (bazel, hub.as_str(), "BUILD.bazel", rendered.as_str()),
-        ("WORKSPACE/README", &hub, "BUILD.bazel", &rendered),
-        (bazel, no_hub, "BUILD.bazel", &rendered),
-        (bazel, &hub, "BUILD.bazel", "genrule(name = \"x\")\n"),
-        (bazel, &hub, "BUILD", &rendered),
-        (bazel, &hub, "src/BUILD.bazel", &rendered),
+    for (marks, module, file, text, is_changed) in [
+        (bazel, hub.as_str(), "BUILD.bazel", rendered.as_str(), false),
+        ("WORKSPACE/README", &hub, "BUILD.bazel", &rendered, true),
+        (bazel, no_hub, "BUILD.bazel", &rendered, true),
+        (bazel, &hub, "BUILD.bazel", "genrule(name = \"x\")\n", true),
+        (bazel, &hub, "BUILD", &rendered, true),
+        (bazel, &hub, "src/BUILD.bazel", &rendered, true),
     ] {
         let (cell, standin, patch) = vendored_checkout(marks, module);
-        assert!(!cell.tree().contains_key(".bazelignore"), "{marks}");
         let extra = format!("{}/{file}", patch.vendored());
         cell.write(&extra, text);
-        takes_for_changed(&cell, &standin, &patch, &extra);
+        takes_for(&cell, &standin, &patch, &extra, is_changed);
     }
+}
+
+/// Without a Bazel: the `.bazelignore` line of the vendored crates. Where
+/// the module files of the workspace make a crate hub, `scan --mode
+/// vendored` writes the pair and `vendor --revert` takes it away with the
+/// copies, and a person is told of each. A run that leaves Cargo out adds
+/// no pair, and a path line that the user commented out stays as it is.
+/// In a workspace without such a hub, and in no workspace, the scan writes
+/// no such file.
+#[test]
+fn the_vendored_crates_get_a_bazelignore_line_where_a_crate_hub_builds_them() {
+    let no_hub = "module(name = \"socket_fixture\", version = \"0.0.0\")\n";
+    for (marks, module) in [("MODULE.bazel", no_hub), ("WORKSPACE/README", "")] {
+        let (cell, _standin, _patch) = vendored_checkout(marks, module);
+        assert!(!cell.tree().contains_key(".bazelignore"), "{marks}");
+    }
+
+    let (cell, standin, _patch) = vendored_checkout("MODULE.bazel", &hub());
+    let file = || cell.tree().get(".bazelignore").cloned();
+    assert_eq!(file().as_deref(), Some(IGNORED.as_bytes()));
+    // A run that leaves Cargo out adds none, whatever else it has in scope;
+    // the same run without the option does, and says so to a person.
+    std::fs::remove_file(cell.path(".bazelignore")).expect("remove the file");
+    let repair = socket_patch(&cell, &standin, &["repair", "--ecosystems", "golang"]);
+    assert_eq!((repair.code, file()), (0, None), "{}", repair.dump);
+    let told = |[stdout, stderr]: [String; 2], verb: &str, what: &str| {
+        let line = stdout.lines().find(|line| line.contains(".bazelignore"));
+        let said = line.is_some_and(|line| line.starts_with(verb) && line.ends_with(what));
+        assert!(said, "{verb} ... {what}:\n{stdout}\n{stderr}");
+    };
+    let updated = ".bazelignore: the lines that keep patched crate copies under .socket out \
+                   of Bazel's packages";
+    told(person(&cell, &standin, &["repair"]), "Updated ", updated);
+    assert_eq!(file().as_deref(), Some(IGNORED.as_bytes()));
+    // The user's "no", over a scan and a repair.
+    cell.write(".bazelignore", DECLINED);
+    for command in [&["scan", "--mode", "vendored", "--yes"][..], &["repair"]] {
+        let ran = socket_patch(&cell, &standin, command);
+        assert_eq!(ran.code, 0, "{}", ran.dump);
+        let warnings = ran.envelope["warnings"].as_array();
+        let warned = |w: &serde_json::Value| w["code"] == "bazelignore_not_updated";
+        assert!(
+            !warnings.is_some_and(|w| w.iter().any(warned)),
+            "{}",
+            ran.dump
+        );
+        assert_eq!(file().as_deref(), Some(DECLINED.as_bytes()), "{command:?}");
+    }
+    // The pair goes with the copies, out of a file that keeps the user's
+    // line, and the file the scan made goes with its last pair.
+    cell.write(".bazelignore", format!("node_modules\n{IGNORED}"));
+    let undo = socket_patch(&cell, &standin, &["vendor", "--revert"]);
+    assert_eq!(undo.code, 0, "{}", undo.dump);
+    assert_eq!(file().as_deref(), Some(&b"node_modules\n"[..]));
+    std::fs::remove_file(cell.path(".bazelignore")).expect("remove the file");
+    let scan = socket_patch(&cell, &standin, &["scan", "--mode", "vendored", "--yes"]);
+    assert_eq!(scan.code, 0, "{}", scan.dump);
+    assert_eq!(file().as_deref(), Some(IGNORED.as_bytes()));
+    let gone = ".bazelignore: no patched crate copy is left under .socket";
+    told(
+        person(&cell, &standin, &["vendor", "--revert"]),
+        "Removed ",
+        gone,
+    );
+    assert_eq!(file(), None);
 }
 
 /// Without a Bazel, what stays fixed now that no checksum is committed: the

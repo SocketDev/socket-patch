@@ -54,15 +54,16 @@ pub(crate) fn project_state_in_scope(common: &crate::args::GlobalArgs) -> bool {
 }
 
 /// In a Bazel workspace the root's `.bazelignore` names the directories of
-/// the project's patched Go module copies, so that Bazel and gazelle read
-/// no package there (`socket_patch_core::bazel::ignore`). A command that can
-/// write or remove such a copy calls this once, after the last step that
-/// can change a copy or take one back and before it gives up its apply
-/// lock. Nothing is done in a dry run or a `--global` run, and a run whose
-/// `--ecosystems` leaves `golang` out only takes away the pair of a copy
-/// that is gone. So does the prune pass of a scan, which comes here after
-/// its scan has (`adds` false) and can only have removed a copy: a file
-/// it cannot write is left to the next command's warning.
+/// the project's patched Go module copies, and of the vendored crates a
+/// crate hub builds, so that Bazel and gazelle read no package there
+/// (`socket_patch_core::bazel::ignore`). A command that can write or
+/// remove such a copy calls this once, after the last step that can change
+/// a copy or take one back and before it gives up its apply lock. Nothing
+/// is done in a dry run or a `--global` run, and a run whose `--ecosystems`
+/// leaves `golang` or `cargo` out only takes away that ecosystem's pair of
+/// a copy that is gone. So does the prune pass of a scan, which comes here
+/// after its scan has (`adds` false) and can only have removed a copy: a
+/// file it cannot write is left to the next command's warning.
 ///
 /// A human run is told here that the file changed, or why it could not be;
 /// the result is that warning again, for the command's envelope.
@@ -70,7 +71,8 @@ pub(crate) async fn sync_bazelignore(
     common: &crate::args::GlobalArgs,
     adds: bool,
 ) -> Vec<crate::json_envelope::RunWarning> {
-    use socket_patch_core::{bazel::ignore, crawlers::Ecosystem::Golang};
+    use socket_patch_core::bazel::ignore;
+    use socket_patch_core::crawlers::Ecosystem::{Cargo, Golang};
     let mut warnings = Vec::new();
     if common.dry_run || common.is_global() {
         return warnings;
@@ -82,16 +84,22 @@ pub(crate) async fn sync_bazelignore(
         projects.push(common.project_root());
     }
     let (loud, mut told) = (!common.json && !common.silent, Vec::new());
+    let [go, cargo] = [Golang, Cargo].map(|eco| adds && common.ecosystem_selected(eco));
     for project in projects {
-        match ignore::sync(&project, adds && common.ecosystem_selected(Golang)).await {
-            Ok(Some(file)) if loud && !told.contains(&file) => {
+        match ignore::sync(&project, go, cargo).await {
+            Ok(Some((file, copies))) if loud && !told.contains(&file) => {
                 let (verb, what) = match file.exists() {
                     true => (
                         "Updated",
-                        "the lines that keep patched Go module copies under .socket out of \
-                         Bazel's packages",
+                        format!(
+                            "the lines that keep patched {copies} copies under .socket out of \
+                             Bazel's packages"
+                        ),
                     ),
-                    false => ("Removed", "no patched Go module copy is left under .socket"),
+                    false => (
+                        "Removed",
+                        format!("no patched {copies} copy is left under .socket"),
+                    ),
                 };
                 println!("{verb} {}: {what}", file.display());
                 told.push(file);

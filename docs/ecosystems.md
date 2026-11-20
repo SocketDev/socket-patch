@@ -2232,6 +2232,86 @@ version = "1.0.4+socket.<uuid>"
   hosted pin left there. Hosted scan and `vendor` refuse the same directories
   (`cargo_manifest_not_workspace_root`).
 
+## Bazel workspaces: the build file in a vendored crate
+
+A rules_rust crate hub (`crate.from_cargo`) builds a vendored crate from its copy under
+`.socket/vendor/cargo`: the build after `scan --mode vendored` is the patched one, with no
+repin. From rules_rust 0.59.0 on, the hub's tool, cargo-bazel, also writes a `BUILD.bazel`
+into the copy's own directory each time Bazel evaluates the hub, as it does for every crate
+a Cargo workspace takes from a path. The scan recorded no such file, and Bazel reads it as
+a package of your workspace.
+
+socket-patch does two things about that file, both only where the Bazel workspace has such
+a hub: `MODULE.bazel` at the Bazel root (see [`.bazelignore`](#bazel-workspaces-bazelignore)
+for where that is), or a file it includes, calls `from_cargo` on the extension `crate` of
+`@rules_rust//crate_universe:extensions.bzl` (or of `extension.bzl`, its older name).
+
+**The file is no change of the copy.** `vendor --check` passes, `vex` attests the crate,
+`repair` has nothing to restore, and a second `scan --mode vendored` reports the copy
+`already_vendored` and downloads nothing. socket-patch never writes the file, and removes
+it only with the copy: on `vendor --revert`, or when it replaces a copy that is changed in
+another way. Only this file is left out of the comparison with the ledger's inventory:
+
+- a regular file named `BUILD.bazel` in the copy's own directory that the inventory does
+  not list (a build file the crate ships is listed, and is held to the crate's bytes);
+- that starts with the banner of every file cargo-bazel renders: a line of `#`, the line
+  `# @generated`, and a line that starts with `# DO NOT MODIFY: This file is auto-generated
+  by a crate_universe tool.`;
+- in a project whose Bazel workspace has a crate hub, as above. In any other project a file
+  like it is a changed copy, as before (`vendor_inventory_mismatch`).
+
+Every recorded file is still held to its bytes, any other file the scan did not record is
+still a changed copy, and a download that `repair` or a scan stages for a copy is held to
+the inventory alone. Of the build file itself socket-patch reads the banner and nothing
+after it: the rest differs from one machine and one ruleset release to the next, so no
+recorded copy of it could be compared.
+
+**Bazel is kept out of the copies.** While the project has vendored crates, the
+`.bazelignore` at the Bazel root holds the line `.socket/vendor/cargo` (after the project's
+path from that root, for a project below it), under the comment line
+`# socket-patch: patched crate copies, not Bazel packages (to opt out, comment out the next line)`.
+`scan --mode vendored` writes the two lines and `vendor --revert` takes them away; every
+rule of the Go lines in [Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore)
+holds for them: which commands bring the file in line, what covers a directory, the opt-out,
+the warning `bazelignore_not_updated`. A command whose `--ecosystems` leaves `cargo` out
+adds no line. What the line is for, measured with rules_rust 0.75.0 on Bazel 9.3.2 and 8.8.2
+(with rules_rust 0.56.0, on 7.7.2, a build writes no file):
+
+- The hub does not build the crate from the file in the checkout. It reads the copy by its
+  path, copies the directory into a repository of its own and renders the build file there
+  again. So the build with the line is the same patched one, and another file under the
+  same banner does not change what the crate is built from.
+- Without the line the file makes the copy a package of your workspace: `bazel query //...`
+  lists its targets, and `bazel build //...` builds those not tagged `manual` (cargo-bazel
+  tags the crate's library so). That package names repositories only the hub sees, so for a
+  vendored crate with a dependency the commands that analyse every target fail on it:
+  `bazel cquery //...` and `bazel query 'deps(//...)'` end with `No repository visible as
+  '@crates__<dependency>' from main repository`. With the line both pass, and `//...` holds
+  your own targets alone.
+
+Limits:
+
+- With the path line commented out (the opt-out) the copy is a package again. Those two
+  commands fail after the next build, and a `BUILD.bazel` that someone else puts into the
+  copy under cargo-bazel's banner passes `vendor --check` and is a package whose targets
+  `bazel build //...` builds.
+- A workspace whose module files make no `crate.from_cargo` hub gets neither: no line is
+  written, and a `BUILD.bazel` in a copy is a changed copy. That holds for a hub of the
+  older `WORKSPACE` system (`crates_repository`) and for rules_rust's `crates_vendor`. By
+  rules_rust's source, which no build here has run, `crates_vendor` with `mode = "local"`
+  renders build files into the checkout that name a path crate by its package: there the
+  file in the copy is what Bazel builds the crate from, and a `.bazelignore` line would take
+  the crate out of the build. A workspace that has both such a vendor target and a hub over
+  the same Cargo workspace must comment the line out.
+- Bazel leaves an ignored directory out of every `glob()` of a package above it. A target
+  that hands the project's files to a `cargo` of its own through such a glob no longer
+  receives the copies. From rules_rust 0.59.0 on, the build file that cargo-bazel writes
+  into a copy takes that copy out of the glob in the same way.
+- Not covered: a crate that ships a `BUILD.bazel` of its own. By its source, which no build
+  here has run for such a crate, cargo-bazel writes its file over that one. The inventory
+  lists the crate's, so the copy reads as changed after a build, as it did before, until a
+  second `scan --mode vendored` or `repair` restores the crate's file.
+
 ## Go: directory replaces and go.sum
 
 Both Go modes work through a `go.mod` `replace` directive pointing at a committed
@@ -2397,8 +2477,10 @@ Side effects and limits:
   copy takes the copy out of the glob in the same way. With the line it builds when it names
   the files of the copy one by one beside the glob, or runs outside the sandbox. Such a
   workspace can opt out as above.
-- Only Go module copies are covered. The unpacked packages other ecosystems keep under
-  `.socket/vendor/` get no line.
+- Only Go module copies are covered, and the vendored crates of a workspace with a
+  rules_rust crate hub, which have a comment line of their own (see
+  [Bazel workspaces: the build file in a vendored crate](#bazel-workspaces-the-build-file-in-a-vendored-crate)).
+  The unpacked packages other ecosystems keep under `.socket/vendor/` get no line.
 - A Bazel root that socket-patch does not look for gets no line, and no warning is given: add
   the line by hand, with the directory's path from that root. That is a root above the root of
   the project's git checkout (the project is a git submodule, or several checkouts sit below
