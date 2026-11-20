@@ -1826,6 +1826,32 @@ pub(crate) fn nested_apply_args_from_params(
     nested_apply_args(&common, manifest_path, params.quiet())
 }
 
+/// The patches an agent-mode download pass reached, as its telemetry
+/// names them: a patch fetched in place of an older one is `downloaded`
+/// like any other.
+fn fetched_outcomes(events: &[PatchEvent]) -> Vec<socket_patch_core::telemetry::PatchOutcome> {
+    let events: Vec<PatchEvent> = events
+        .iter()
+        .map(|event| PatchEvent {
+            action: match event.action {
+                EventAction::Updated => EventAction::Downloaded,
+                action => action,
+            },
+            ..event.clone()
+        })
+        .collect();
+    crate::telemetry_outcomes::patch_outcomes_of(&events, socket_patch_core::telemetry::MODE_AGENT)
+}
+
+/// The command an engine run's telemetry reports: the one whose envelope
+/// it fills (`scan`, or `get`).
+pub(crate) fn telemetry_command(env: &Envelope) -> &'static str {
+    match env.command {
+        crate::json_envelope::Command::Get => "get",
+        _ => "scan",
+    }
+}
+
 /// Run the nested `apply` step with `common` (see [`nested_apply_args`])
 /// on the caller's `client`, under the apply `lock` the caller took for
 /// its manifest write — one lock window for download → manifest write →
@@ -1839,6 +1865,7 @@ pub(crate) fn nested_apply_args_from_params(
 /// opt-in on the top-level command only, never on this internal
 /// invocation.
 pub(crate) async fn run_nested_apply(
+    command: &'static str,
     common: GlobalArgs,
     json: bool,
     report_user_patch_skips: bool,
@@ -1856,6 +1883,7 @@ pub(crate) async fn run_nested_apply(
         nested: Some(super::apply::NestedApply {
             caller_json: json,
             report_user_patch_skips,
+            command,
         }),
     };
     // The nested apply runs on the host's client: seeded, never rebuilt.
@@ -2228,6 +2256,14 @@ pub async fn download_and_apply_patches_into(
     // single-uuid flow's summary in `save_and_apply_patch`; their sum gates
     // the apply step.
     let downloaded = batch.fetched.len();
+    // Telemetry: the patch records this run fetched. `get <uuid>` reports
+    // its own fetch; every other agent-mode download comes through here.
+    socket_patch_core::telemetry::track_patches_fetched(
+        telemetry_command(env),
+        &fetched_outcomes(&batch.events),
+        &socket_patch_core::telemetry::TelemetryAuth::for_client(run.api_client),
+    )
+    .await;
     let mut updated = 0usize;
     let mut new_blobs: Vec<String> = Vec::new();
     // `(purl, uuid)` of every selected patch now recorded: the fetched ones
@@ -2331,6 +2367,7 @@ pub async fn download_and_apply_patches_into(
         crate::hot_patch::mark_apply_started();
         apply_report = Some(
             run_nested_apply(
+                telemetry_command(env),
                 nested_apply_args_from_params(params, run, &manifest_path),
                 params.json,
                 !params.user_patch_skips_reported,

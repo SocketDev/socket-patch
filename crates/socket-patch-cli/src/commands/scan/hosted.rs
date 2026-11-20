@@ -91,6 +91,20 @@ pub(super) fn record_hosted_events(
     skipped: &[socket_patch_core::hosted::engine::SkippedPatch],
     dry_run: bool,
 ) {
+    for event in hosted_events(confirmed, unconfirmed, skipped, dry_run) {
+        env.record(event);
+    }
+}
+
+/// A hosted run's per-patch outcomes as events, tagged `mode: "hosted"`
+/// (see [`record_hosted_events`]): what the envelope records and what the
+/// run's telemetry names.
+fn hosted_events(
+    confirmed: &[(String, String)],
+    unconfirmed: &[(String, String)],
+    skipped: &[socket_patch_core::hosted::engine::SkippedPatch],
+    dry_run: bool,
+) -> Vec<PatchEvent> {
     let pinned = if dry_run {
         PatchAction::Verified
     } else {
@@ -116,9 +130,10 @@ pub(super) fn record_hosted_events(
         }))
         .collect();
     events.sort_by(|a, b| (&a.purl, &a.uuid).cmp(&(&b.purl, &b.uuid)));
-    for event in events {
-        env.record(tag_mode(event, Some("hosted")));
-    }
+    events
+        .into_iter()
+        .map(|event| tag_mode(event, Some("hosted")))
+        .collect()
 }
 
 /// A `{code, detail}` warning object (the shape the stale-install probes
@@ -131,7 +146,8 @@ fn run_warning_of(w: &serde_json::Value) -> RunWarning {
 }
 
 /// An engine refusal (nothing was written): `Error (<code>): <message>` on
-/// stderr plus the `--json` error envelope carrying the code, exit 1.
+/// stderr plus the error envelope carrying the code (printed under
+/// `--json`; its code is also the failure event's), exit 1.
 fn refuse(
     common: &crate::args::GlobalArgs,
     scan_result: Option<Envelope>,
@@ -139,14 +155,12 @@ fn refuse(
     json_error: &mut Option<Envelope>,
 ) -> i32 {
     eprintln!("Error ({}): {}", refusal.code, refusal.message);
-    if common.json {
-        *json_error = Some(json_error_envelope(
-            common,
-            scan_result,
-            &refusal.code,
-            &refusal.message,
-        ));
-    }
+    *json_error = Some(json_error_envelope(
+        common,
+        scan_result,
+        &refusal.code,
+        &refusal.message,
+    ));
     1
 }
 
@@ -169,14 +183,12 @@ fn acquire_hosted_lock(
                 "{}",
                 crate::commands::lock_cli::format_lock_error(&socket_dir, &err, timeout)
             );
-            if common.json {
-                *json_error = Some(json_error_envelope(
-                    common,
-                    scan_result.take(),
-                    code,
-                    &message,
-                ));
-            }
+            *json_error = Some(json_error_envelope(
+                common,
+                scan_result.take(),
+                code,
+                &message,
+            ));
             Err(1)
         }
     }
@@ -1059,17 +1071,35 @@ pub(crate) async fn run_redirect_selected(
     )
     .await;
     if code != 0 && !telemetry.sent && !selected.is_empty() {
+        // Nothing was pinned: every selected patch is one the run failed
+        // on, under the code its error envelope carries.
+        let error_code = telemetry
+            .json_error
+            .as_ref()
+            .and_then(|envelope| envelope.error.as_ref())
+            .map_or("hosted_failed", |error| error.code.as_str());
+        let failed = crate::telemetry_outcomes::uniform_outcomes(
+            selected
+                .iter()
+                .map(|(purl, uuid)| (purl.as_str(), uuid.as_str())),
+            socket_patch_core::telemetry::MODE_HOSTED,
+            socket_patch_core::telemetry::OUTCOME_FAILED,
+            Some(error_code),
+        );
         socket_patch_core::telemetry::track_patch_hosted_failed(
             command,
+            error_code,
             "hosted redirect failed",
             common.dry_run,
+            &failed,
             &telemetry.auth,
         )
         .await;
     }
-    // The `--json` error envelope prints only after the failure event went
-    // out, so a consumer that closes stdout on it cannot drop the event.
-    if let Some(envelope) = telemetry.json_error.take() {
+    // The error envelope prints (under `--json`) only after the failure
+    // event went out, so a consumer that closes stdout on it cannot drop
+    // the event.
+    if let Some(envelope) = telemetry.json_error.take().filter(|_| common.json) {
         emit_scan(&envelope);
     }
     code
@@ -1081,8 +1111,9 @@ struct HostedTelemetry {
     command: &'static str,
     auth: socket_patch_core::telemetry::TelemetryAuth,
     sent: bool,
-    /// A `--json` error envelope a failure path built, printed by
-    /// [`run_redirect_selected`] after the failure event is sent.
+    /// The error envelope a failure path built: [`run_redirect_selected`]
+    /// takes the failure event's code from it and, under `--json`, prints
+    /// it after that event is sent.
     json_error: Option<Envelope>,
 }
 
@@ -1171,14 +1202,12 @@ async fn run_redirect_selected_untracked(
                     "{} (nothing was changed; re-run to retry)",
                     format_error_line(&message)
                 );
-                if common.json {
-                    telemetry.json_error = Some(json_error_envelope(
-                        common,
-                        scan_result.take(),
-                        "reference_resolve_failed",
-                        &message,
-                    ));
-                }
+                telemetry.json_error = Some(json_error_envelope(
+                    common,
+                    scan_result.take(),
+                    "reference_resolve_failed",
+                    &message,
+                ));
                 return 1;
             }
         };
@@ -1876,14 +1905,12 @@ async fn run_redirect_selected_untracked(
     .await
     {
         eprintln!("{}", format_error_line(&message));
-        if common.json {
-            telemetry.json_error = Some(json_error_envelope(
-                common,
-                scan_result.take(),
-                "lockfile_write_failed",
-                &message,
-            ));
-        }
+        telemetry.json_error = Some(json_error_envelope(
+            common,
+            scan_result.take(),
+            "lockfile_write_failed",
+            &message,
+        ));
         return 1;
     }
 
@@ -2237,6 +2264,10 @@ async fn run_redirect_selected_untracked(
             confirmed.len(),
             done.rewritten.len(),
             common.dry_run,
+            &crate::telemetry_outcomes::patch_outcomes_of(
+                &hosted_events(&confirmed, &unconfirmed, &skipped, common.dry_run),
+                socket_patch_core::telemetry::MODE_HOSTED,
+            ),
             &telemetry.auth,
         )
         .await;

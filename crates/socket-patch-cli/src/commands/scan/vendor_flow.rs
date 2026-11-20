@@ -476,6 +476,9 @@ pub(crate) fn merge_vendor_envelope(env: &mut Envelope, venv: Envelope) {
 /// blob `seed` that phase fetched (so the stager fetches no view twice),
 /// the run's API client, and the run outcome so far for telemetry.
 pub(crate) struct VendorStep<'a> {
+    /// The command the user ran (`scan`, `get`): what the step's telemetry
+    /// reports as its command.
+    pub(crate) command: &'static str,
     pub(crate) common: &'a GlobalArgs,
     pub(crate) records: HashMap<String, PatchRecord>,
     pub(crate) client: ApiClient,
@@ -516,6 +519,7 @@ pub(crate) struct VendorStep<'a> {
 /// `success`.
 async fn run_vendor_step(step: VendorStep<'_>) -> VendorStepResult {
     let VendorStep {
+        command,
         common,
         records,
         client,
@@ -526,6 +530,12 @@ async fn run_vendor_step(step: VendorStep<'_>) -> VendorStepResult {
         telemetry_auth,
         closing_lines,
     } = step;
+    // The records' patches, for the telemetry of a run whose events name
+    // packages only.
+    let uuids: HashMap<String, String> = records
+        .iter()
+        .map(|(purl, record)| (purl.clone(), record.uuid.clone()))
+        .collect();
     let outcome = vendor_under_lock(
         common,
         records,
@@ -542,15 +552,35 @@ async fn run_vendor_step(step: VendorStep<'_>) -> VendorStepResult {
         // successful vendoring of zero patches.
         Ok((vendor_errors, venv)) => {
             track_outcomes_for_vendor(
+                command,
                 download_errors || *vendor_errors,
                 venv,
                 common.dry_run,
+                &uuids,
                 telemetry_auth,
             )
             .await
         }
-        Err((_, message, _)) => {
-            track_patch_vendor_failed(message, common.dry_run, telemetry_auth).await
+        // Nothing was vendored: every selected patch is one the step
+        // failed on.
+        Err((code, message, _)) => {
+            let failed = crate::telemetry_outcomes::uniform_outcomes(
+                uuids
+                    .iter()
+                    .map(|(purl, uuid)| (purl.as_str(), uuid.as_str())),
+                socket_patch_core::telemetry::MODE_VENDORED,
+                socket_patch_core::telemetry::OUTCOME_FAILED,
+                Some(code),
+            );
+            track_patch_vendor_failed(
+                command,
+                code,
+                message,
+                common.dry_run,
+                &failed,
+                telemetry_auth,
+            )
+            .await
         }
     }
     outcome.map(|(vendor_errors, venv)| (download_errors || vendor_errors, venv))
@@ -868,6 +898,7 @@ async fn run_vendor_json_path(
     // 2) The vendor engine, under the same lock as apply/vendor (a no-op
     //    that creates nothing when there is nothing to vendor).
     let vendor_code = match boxed_vendor_step(VendorStep {
+        command: "scan",
         common: &args.common,
         records,
         client: api_client.clone(),
@@ -990,6 +1021,7 @@ async fn run_vendor_interactive_path(
         rows
     };
     let code = match boxed_vendor_step(VendorStep {
+        command: "scan",
         common: &args.common,
         records,
         client: api_client.clone(),

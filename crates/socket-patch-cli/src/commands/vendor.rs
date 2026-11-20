@@ -30,7 +30,7 @@ use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::telemetry::{
-    track_patch_vendor_failed, track_patch_vendored, TelemetryAuth,
+    track_patch_vendor_failed, track_patch_vendored, TelemetryAuth, MODE_VENDORED,
 };
 use socket_patch_core::utils::concurrent::ordered_concurrent;
 use socket_patch_core::utils::group_commit::{CommittedFile, GroupCommit};
@@ -1246,8 +1246,10 @@ pub async fn run(args: VendorArgs) -> i32 {
         }
     }
 
+    // The patches of the ledger entries a `--revert` starts from.
+    let mut reverted_uuids: HashMap<String, String> = HashMap::new();
     let mut exit = match &vendor_service {
-        None => run_revert(&args, &mut env).await,
+        None => run_revert(&args, &mut env, &mut reverted_uuids).await,
         Some((service, _)) => run_vendor(&args, &manifest_path, &mut env, service).await,
     };
 
@@ -1310,8 +1312,21 @@ pub async fn run(args: VendorArgs) -> i32 {
         println!("{}", env.to_pretty_json());
     }
 
-    if let Some((_, telemetry)) = &vendor_service {
-        track_outcomes_for_vendor(exit != 0, &env, args.common.dry_run, telemetry).await;
+    match &vendor_service {
+        Some((_, telemetry)) => {
+            let uuids = recorded_patch_uuids(&args.common, &manifest_path).await;
+            track_outcomes_for_vendor(
+                "vendor",
+                exit != 0,
+                &env,
+                args.common.dry_run,
+                &uuids,
+                telemetry,
+            )
+            .await;
+        }
+        // `--revert` takes every vendored patch out: a removal.
+        None => track_revert(&args, exit, &env, &reverted_uuids).await,
     }
 
     exit
@@ -1957,6 +1972,8 @@ async fn run_eject(
     commit_recovery: Option<RunWarning>,
 ) -> i32 {
     let common = &args.common;
+    // The pins' patches, for the run's telemetry.
+    let eject_uuids = pin_uuids(&pins);
     // A ledger git would not commit refuses before anything is fetched or
     // restored, so the project stays hosted (#1638).
     let purls: Vec<String> = pins.iter().map(|pin| pin.purl.clone()).collect();
@@ -2059,7 +2076,15 @@ async fn run_eject(
         if common.json {
             println!("{}", env.to_pretty_json());
         }
-        track_outcomes_for_vendor(true, &env, common.dry_run, &telemetry).await;
+        track_outcomes_for_vendor(
+            "vendor",
+            true,
+            &env,
+            common.dry_run,
+            &eject_uuids,
+            &telemetry,
+        )
+        .await;
         return 1;
     }
 
@@ -2166,7 +2191,15 @@ async fn run_eject(
         if common.json {
             println!("{}", env.to_pretty_json());
         }
-        track_outcomes_for_vendor(true, &env, common.dry_run, &telemetry).await;
+        track_outcomes_for_vendor(
+            "vendor",
+            true,
+            &env,
+            common.dry_run,
+            &eject_uuids,
+            &telemetry,
+        )
+        .await;
         return 1;
     }
 
@@ -2213,7 +2246,7 @@ async fn run_eject(
         if common.json {
             println!("{}", env.to_pretty_json());
         }
-        track_outcomes_for_vendor(false, &env, true, &telemetry).await;
+        track_outcomes_for_vendor("vendor", false, &env, true, &eject_uuids, &telemetry).await;
         return 0;
     }
 
@@ -2524,7 +2557,15 @@ async fn run_eject(
     if common.json {
         println!("{}", env.to_pretty_json());
     }
-    track_outcomes_for_vendor(exit != 0, &env, common.dry_run, &telemetry).await;
+    track_outcomes_for_vendor(
+        "vendor",
+        exit != 0,
+        &env,
+        common.dry_run,
+        &eject_uuids,
+        &telemetry,
+    )
+    .await;
     exit
 }
 
@@ -2554,19 +2595,111 @@ fn no_manifest_message(tracked_entries: usize) -> String {
     }
 }
 
+/// Telemetry for `vendor --revert`: each entry it took out is a patch
+/// removed (in vendored mode), as `remove` reports one. A run that could
+/// take none out is the failure; a `--dry-run` reports nothing, like
+/// `remove`'s.
+async fn track_revert(
+    args: &VendorArgs,
+    exit: i32,
+    env: &Envelope,
+    uuids: &HashMap<String, String>,
+) {
+    if args.common.dry_run {
+        return;
+    }
+    let patches = crate::telemetry_outcomes::patch_outcomes(
+        &env.events,
+        MODE_VENDORED,
+        crate::telemetry_outcomes::uuid_lookup(uuids),
+    );
+    let removed = socket_patch_core::telemetry::PatchOutcome::count(&patches, "removed");
+    let telemetry = args.common.telemetry_auth();
+    if exit != 0 && removed == 0 {
+        let (code, message) = env.error.as_ref().map_or(
+            ("vendor_revert_failed", "vendor --revert failed"),
+            |error| (error.code.as_str(), error.message.as_str()),
+        );
+        socket_patch_core::telemetry::track_patch_remove_failed(
+            "vendor", code, message, &patches, &telemetry,
+        )
+        .await;
+    } else if removed > 0 {
+        socket_patch_core::telemetry::track_patch_removed("vendor", removed, &patches, &telemetry)
+            .await;
+    }
+}
+
 /// Telemetry for a vendor run's success/failure split, shared by
-/// [`run`] and the scan-driven vendor step (`scan --mode vendored`).
+/// [`run`] and the vendor step of `scan` / `get --mode vendored`
+/// (`command` is the one the user ran). The run's events name packages;
+/// `uuids` (purl → patch UUID) names their patches.
 pub(crate) async fn track_outcomes_for_vendor(
+    command: &'static str,
     has_errors: bool,
     env: &Envelope,
     dry_run: bool,
+    uuids: &HashMap<String, String>,
     telemetry: &TelemetryAuth,
 ) {
+    let patches = crate::telemetry_outcomes::patch_outcomes(
+        &env.events,
+        MODE_VENDORED,
+        crate::telemetry_outcomes::uuid_lookup(uuids),
+    );
     if has_errors {
-        track_patch_vendor_failed("vendor completed with failures", dry_run, telemetry).await;
+        let code = env
+            .error
+            .as_ref()
+            .map_or("vendor_failed", |e| e.code.as_str());
+        track_patch_vendor_failed(
+            command,
+            code,
+            "vendor completed with failures",
+            dry_run,
+            &patches,
+            telemetry,
+        )
+        .await;
     } else {
-        track_patch_vendored(env.summary.applied, dry_run, telemetry).await;
+        track_patch_vendored(command, env.summary.applied, dry_run, &patches, telemetry).await;
     }
+}
+
+/// purl → patch UUID over what this project records: the vendor ledger's
+/// entries (under their key and their base purl) and the manifest's
+/// records. For the telemetry of a run whose events name packages only.
+/// Nothing is read when telemetry is off.
+async fn recorded_patch_uuids(
+    common: &GlobalArgs,
+    manifest_path: &Path,
+) -> HashMap<String, String> {
+    let mut uuids = HashMap::new();
+    if socket_patch_core::telemetry::is_telemetry_disabled() {
+        return uuids;
+    }
+    if let Ok(Some(manifest)) = read_manifest(manifest_path).await {
+        uuids.extend(
+            manifest
+                .patches
+                .into_iter()
+                .map(|(purl, record)| (purl, record.uuid)),
+        );
+    }
+    if let Ok(state) = load_state(&common.project_root()).await {
+        for (key, entry) in state.entries {
+            uuids.insert(entry.base_purl, entry.uuid.clone());
+            uuids.insert(key, entry.uuid);
+        }
+    }
+    uuids
+}
+
+/// The patches of hosted pins, by purl.
+fn pin_uuids(pins: &[HostedPin]) -> HashMap<String, String> {
+    pins.iter()
+        .map(|pin| (pin.purl.clone(), pin.uuid.clone()))
+        .collect()
 }
 
 async fn run_vendor(
@@ -4862,7 +4995,11 @@ pub(crate) async fn reconcile_dropped(
     (had_error, Ok(state))
 }
 
-async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
+async fn run_revert(
+    args: &VendorArgs,
+    env: &mut Envelope,
+    uuids: &mut HashMap<String, String>,
+) -> i32 {
     let common = &args.common;
     let mut state = match load_state(&common.cwd).await {
         Ok(s) => s,
@@ -4872,6 +5009,12 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             return 1;
         }
     };
+    uuids.extend(
+        state
+            .entries
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.uuid.clone())),
+    );
 
     let mut has_errors = false;
     let mut recorded: Vec<String> = state.entries.keys().cloned().collect();

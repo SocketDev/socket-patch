@@ -234,8 +234,20 @@ pub fn sanitize_error_message(message: &str) -> String {
     message.replace(home, "~")
 }
 
+/// `text` cut to at most `max` characters, the last of them an ellipsis
+/// when anything was dropped.
+fn truncate_chars(text: String, max: usize) -> String {
+    match text.char_indices().nth(max.saturating_sub(1)) {
+        Some((cut, _)) if text[cut..].chars().nth(1).is_some() => {
+            format!("{}…", &text[..cut])
+        }
+        _ => text,
+    }
+}
+
 /// Build a telemetry event. `error` is an `(error_type, message)` pair; the
-/// message is home-dir-sanitized before it leaves the process.
+/// message is sanitized ([`sanitize_error_message`]) and cut to
+/// [`MAX_ERROR_MESSAGE_CHARS`] before it leaves the process.
 fn build_telemetry_event(
     event_type: PatchTelemetryEventType,
     command: &str,
@@ -250,7 +262,10 @@ fn build_telemetry_event(
         metadata,
         error: error.map(|(error_type, message)| PatchTelemetryError {
             error_type,
-            message: Some(sanitize_error_message(&message)),
+            message: Some(truncate_chars(
+                sanitize_error_message(&message),
+                MAX_ERROR_MESSAGE_CHARS,
+            )),
         }),
     }
 }
@@ -484,6 +499,111 @@ pub async fn flush(grace: Duration) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-patch outcomes
+// ---------------------------------------------------------------------------
+
+/// The patch modes an event names (`mode`, and each [`PatchOutcome`]'s).
+pub const MODE_AGENT: &str = "agent";
+pub const MODE_HOSTED: &str = "hosted";
+pub const MODE_VENDORED: &str = "vendored";
+
+/// The [`PatchOutcome::outcome`] of a patch the run could not act on.
+pub const OUTCOME_FAILED: &str = "failed";
+
+/// How many patches one event names. A run over more names this many,
+/// the failed ones first, and says so (`patches_truncated`); the counts
+/// beside the list are of the whole run.
+///
+/// The cap keeps an event small: the server stores an event's body in a
+/// form its dashboards cannot read once the body passes 10,000 characters,
+/// and one entry is about 110.
+pub const MAX_REPORTED_PATCHES: usize = 50;
+
+/// The longest error message an event carries, in characters. One error
+/// can quote a whole command's output, and the event has to stay small
+/// (see [`MAX_REPORTED_PATCHES`]).
+const MAX_ERROR_MESSAGE_CHARS: usize = 1000;
+
+/// One patch a run acted on, as its event names it: by patch UUID, with
+/// the ecosystem and the mode it was patched in, and what the run did to
+/// it. Never the package name, a path or a file list.
+///
+/// This is what lets Socket see that one patch is being rolled back, or
+/// fails to apply, far more often than the others.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PatchOutcome {
+    /// The patch UUID.
+    pub uuid: String,
+    /// The ecosystem's CLI name (`npm`, `pypi`, …); empty when unknown.
+    pub ecosystem: String,
+    /// [`MODE_AGENT`], [`MODE_HOSTED`] or [`MODE_VENDORED`].
+    pub mode: &'static str,
+    /// What happened: `applied`, `rolled_back`, `removed`, `downloaded`,
+    /// `failed`, `skipped`, … (the command's own vocabulary).
+    pub outcome: &'static str,
+    /// The stable code of a `failed` or `skipped` outcome
+    /// (`hash_mismatch`, `already_patched`, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+impl PatchOutcome {
+    /// How many of `patches` ended as `outcome`.
+    pub fn count(patches: &[PatchOutcome], outcome: &str) -> usize {
+        patches.iter().filter(|p| p.outcome == outcome).count()
+    }
+}
+
+/// The fields an event about specific patches carries, added to `metadata`
+/// (an object; the event's own keys win):
+///
+/// * `patches`: at most [`MAX_REPORTED_PATCHES`] outcomes, and
+///   `patches_truncated: true` when that cap dropped some;
+/// * `outcomes`: how many patches ended each way, over the whole run;
+/// * `ecosystems`, `modes`: the distinct values, sorted, over the whole run.
+///
+/// A run that named no patch adds nothing.
+fn with_patches(mut metadata: serde_json::Value, patches: &[PatchOutcome]) -> serde_json::Value {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let Some(fields) = metadata.as_object_mut() else {
+        return metadata;
+    };
+    if patches.is_empty() {
+        return metadata;
+    }
+    let mut outcomes: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut ecosystems: BTreeSet<&str> = BTreeSet::new();
+    let mut modes: BTreeSet<&str> = BTreeSet::new();
+    for patch in patches {
+        *outcomes.entry(patch.outcome).or_default() += 1;
+        if !patch.ecosystem.is_empty() {
+            ecosystems.insert(&patch.ecosystem);
+        }
+        modes.insert(patch.mode);
+    }
+    // Failures first: when the cap drops entries, the ones worth
+    // investigating are the ones kept. Otherwise the run's own order.
+    let reported: Vec<&PatchOutcome> = patches
+        .iter()
+        .filter(|p| p.outcome == OUTCOME_FAILED)
+        .chain(patches.iter().filter(|p| p.outcome != OUTCOME_FAILED))
+        .take(MAX_REPORTED_PATCHES)
+        .collect();
+    let mut add = |key: &str, value: serde_json::Value| {
+        fields.entry(key).or_insert(value);
+    };
+    if reported.len() < patches.len() {
+        add("patches_truncated", serde_json::json!(true));
+    }
+    add("patches", serde_json::json!(reported));
+    add("outcomes", serde_json::json!(outcomes));
+    add("ecosystems", serde_json::json!(ecosystems));
+    add("modes", serde_json::json!(modes));
+    metadata
+}
+
+// ---------------------------------------------------------------------------
 // Per-event tracker wrappers (the public API)
 //
 // Each takes the run's `TelemetryAuth` (see `TelemetryAuth::for_client`),
@@ -520,34 +640,74 @@ fn fire(
     start_send(prepare_send(event, auth));
 }
 
-/// Track a successful in-place (agent mode) patch application.
-pub async fn track_patch_applied(patches_count: usize, dry_run: bool, auth: &TelemetryAuth) {
+/// Track a successful in-place (agent mode) patch application, as
+/// `command` (`apply`, or the `scan` / `get` whose agent mode ran it):
+/// `patches` are the patches the run acted on, `patches_count` how many
+/// packages it patched.
+pub async fn track_patch_applied(
+    command: &'static str,
+    patches_count: usize,
+    dry_run: bool,
+    patches: &[PatchOutcome],
+    auth: &TelemetryAuth,
+) {
     fire(
         PatchTelemetryEventType::PatchApplied,
-        "apply",
-        serde_json::json!({
-            "patches_count": patches_count,
-            "dry_run": dry_run,
-            "mode": "agent",
-        }),
+        command,
+        with_patches(
+            serde_json::json!({
+                "patches_count": patches_count,
+                "dry_run": dry_run,
+                "mode": MODE_AGENT,
+            }),
+            patches,
+        ),
         None::<&str>,
         auth,
     );
 }
 
-/// Track a failed patch application.
+/// The fields of a failure event: `fields`, the run's stable `error_code`
+/// (the code its `--json` envelope reports, e.g. `patch_not_found`: what
+/// tells a mistyped target from a patch that would not come off) and the
+/// patches it acted on.
+fn failure_metadata(
+    mut fields: serde_json::Value,
+    error_code: &str,
+    patches: &[PatchOutcome],
+) -> serde_json::Value {
+    if let Some(fields) = fields.as_object_mut() {
+        fields.insert("error_code".to_string(), serde_json::json!(error_code));
+    }
+    with_patches(fields, patches)
+}
+
+/// Track a failed patch application. `patches` names what the run acted
+/// on before it failed (the failed ones and the ones it did apply); empty
+/// when it failed before reaching any.
 ///
 /// Accepts any `Display` type for the error (works with `&str`, `String`,
 /// `anyhow::Error`, `std::io::Error`, etc.).
 pub async fn track_patch_apply_failed(
+    command: &'static str,
+    error_code: &str,
     error: impl std::fmt::Display,
     dry_run: bool,
+    patches: &[PatchOutcome],
     auth: &TelemetryAuth,
 ) {
     fire(
         PatchTelemetryEventType::PatchApplyFailed,
-        "apply",
-        serde_json::json!({ "dry_run": dry_run, "mode": "agent" }),
+        command,
+        failure_metadata(
+            serde_json::json!({
+                "patches_count": PatchOutcome::count(patches, "applied"),
+                "dry_run": dry_run,
+                "mode": MODE_AGENT,
+            }),
+            error_code,
+            patches,
+        ),
         Some(error),
         auth,
     );
@@ -558,23 +718,28 @@ pub async fn track_patch_apply_failed(
 /// `patch_applied` with `mode: "hosted"`: the lockfile pin is how hosted
 /// mode applies a patch, and the backend's adoption views count
 /// `patch_applied`. `files_count` is the number of lockfiles/manifests
-/// rewritten.
+/// rewritten; `patches` are the pins the run confirmed and the ones it
+/// could not make.
 pub async fn track_patch_hosted(
     command: &'static str,
     patches_count: usize,
     files_count: usize,
     dry_run: bool,
+    patches: &[PatchOutcome],
     auth: &TelemetryAuth,
 ) {
     fire(
         PatchTelemetryEventType::PatchApplied,
         command,
-        serde_json::json!({
-            "patches_count": patches_count,
-            "files_count": files_count,
-            "dry_run": dry_run,
-            "mode": "hosted",
-        }),
+        with_patches(
+            serde_json::json!({
+                "patches_count": patches_count,
+                "files_count": files_count,
+                "dry_run": dry_run,
+                "mode": MODE_HOSTED,
+            }),
+            patches,
+        ),
         None::<&str>,
         auth,
     );
@@ -583,84 +748,174 @@ pub async fn track_patch_hosted(
 /// Track a failed hosted-mode run (see [`track_patch_hosted`]).
 pub async fn track_patch_hosted_failed(
     command: &'static str,
+    error_code: &str,
     error: impl std::fmt::Display,
     dry_run: bool,
+    patches: &[PatchOutcome],
     auth: &TelemetryAuth,
 ) {
     fire(
         PatchTelemetryEventType::PatchApplyFailed,
         command,
-        serde_json::json!({ "dry_run": dry_run, "mode": "hosted" }),
+        failure_metadata(
+            serde_json::json!({ "dry_run": dry_run, "mode": MODE_HOSTED }),
+            error_code,
+            patches,
+        ),
         Some(error),
         auth,
     );
 }
 
-/// Track a successful vendor run (count = packages vendored).
-pub async fn track_patch_vendored(vendored_count: u32, dry_run: bool, auth: &TelemetryAuth) {
+/// Track a successful vendor run, as `command` (`vendor`, or the `scan` /
+/// `get` whose vendored mode ran it): `vendored_count` packages vendored,
+/// `patches` what the run did to each.
+pub async fn track_patch_vendored(
+    command: &'static str,
+    vendored_count: u32,
+    dry_run: bool,
+    patches: &[PatchOutcome],
+    auth: &TelemetryAuth,
+) {
     fire(
         PatchTelemetryEventType::PatchVendored,
-        "vendor",
-        serde_json::json!({ "patches_count": vendored_count, "dry_run": dry_run }),
+        command,
+        with_patches(
+            serde_json::json!({
+                "patches_count": vendored_count,
+                "dry_run": dry_run,
+                "mode": MODE_VENDORED,
+            }),
+            patches,
+        ),
         None::<&str>,
         auth,
     );
 }
 
-/// Track a failed vendor run.
+/// Track a failed vendor run (see [`track_patch_vendored`]). `patches`
+/// names what it acted on before it failed; empty when it failed before
+/// reaching any.
 pub async fn track_patch_vendor_failed(
+    command: &'static str,
+    error_code: &str,
     error: impl std::fmt::Display,
     dry_run: bool,
+    patches: &[PatchOutcome],
     auth: &TelemetryAuth,
 ) {
     fire(
         PatchTelemetryEventType::PatchVendorFailed,
-        "vendor",
-        serde_json::json!({ "dry_run": dry_run }),
+        command,
+        failure_metadata(
+            serde_json::json!({
+                "patches_count": PatchOutcome::count(patches, "applied"),
+                "dry_run": dry_run,
+                "mode": MODE_VENDORED,
+            }),
+            error_code,
+            patches,
+        ),
         Some(error),
         auth,
     );
 }
 
-/// Track a successful patch removal.
-pub async fn track_patch_removed(removed_count: usize, auth: &TelemetryAuth) {
+/// Track a patch removal that took `removed_count` patches out, as
+/// `command` (`remove`, or `vendor` for its `--revert`). `patches` names
+/// each one.
+pub async fn track_patch_removed(
+    command: &'static str,
+    removed_count: usize,
+    patches: &[PatchOutcome],
+    auth: &TelemetryAuth,
+) {
     fire(
         PatchTelemetryEventType::PatchRemoved,
-        "remove",
-        serde_json::json!({ "removed_count": removed_count }),
+        command,
+        with_patches(
+            serde_json::json!({ "removed_count": removed_count }),
+            patches,
+        ),
         None::<&str>,
         auth,
     );
 }
 
-/// Track a failed patch removal. Accepts any `Display` type for the error.
-pub async fn track_patch_remove_failed(error: impl std::fmt::Display, auth: &TelemetryAuth) {
+/// Track a patch removal that did not happen. Accepts any `Display` type
+/// for the error; `patches` names the patches it could not remove, when
+/// the run got as far as resolving them.
+pub async fn track_patch_remove_failed(
+    command: &'static str,
+    error_code: &str,
+    error: impl std::fmt::Display,
+    patches: &[PatchOutcome],
+    auth: &TelemetryAuth,
+) {
     fire(
         PatchTelemetryEventType::PatchRemoveFailed,
-        "remove",
-        serde_json::Value::Null,
+        command,
+        failure_metadata(serde_json::json!({}), error_code, patches),
         Some(error),
         auth,
     );
 }
 
-/// Track a successful patch rollback.
-pub async fn track_patch_rolled_back(rolled_back_count: usize, auth: &TelemetryAuth) {
+/// What a rollback run reports besides the patches themselves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RollbackRun {
+    /// How many patched packages the run restored (would restore, on a
+    /// dry run), across every mode.
+    pub rolled_back_count: usize,
+    /// A preview: nothing was restored.
+    pub dry_run: bool,
+    /// The user named the patches to roll back (a purl, a UUID, a path),
+    /// rather than rolling the whole project back.
+    pub targeted: bool,
+}
+
+impl RollbackRun {
+    fn metadata(self) -> serde_json::Value {
+        serde_json::json!({
+            "rolled_back_count": self.rolled_back_count,
+            "dry_run": self.dry_run,
+            "targeted": self.targeted,
+        })
+    }
+}
+
+/// Track a rollback that left nothing patched. `patches` names each patch
+/// the run rolled back (`rolled_back`, or `verified` on a dry run) or had
+/// nothing to do for (`skipped`).
+pub async fn track_patch_rolled_back(
+    run: RollbackRun,
+    patches: &[PatchOutcome],
+    auth: &TelemetryAuth,
+) {
     fire(
         PatchTelemetryEventType::PatchRolledBack,
         "rollback",
-        serde_json::json!({ "rolled_back_count": rolled_back_count }),
+        with_patches(run.metadata(), patches),
         None::<&str>,
         auth,
     );
 }
 
-/// Track a failed patch rollback. Accepts any `Display` type for the error.
-pub async fn track_patch_rollback_failed(error: impl std::fmt::Display, auth: &TelemetryAuth) {
+/// Track a rollback that left something patched, or never started.
+/// Accepts any `Display` type for the error. `patches` names the patches
+/// that failed and the ones the same run did roll back; empty when the
+/// run failed before it resolved any.
+pub async fn track_patch_rollback_failed(
+    error_code: &str,
+    error: impl std::fmt::Display,
+    run: RollbackRun,
+    patches: &[PatchOutcome],
+    auth: &TelemetryAuth,
+) {
     fire(
         PatchTelemetryEventType::PatchRollbackFailed,
         "rollback",
-        serde_json::Value::Null,
+        failure_metadata(run.metadata(), error_code, patches),
         Some(error),
         auth,
     );
@@ -670,83 +925,140 @@ pub async fn track_patch_rollback_failed(error: impl std::fmt::Display, auth: &T
 // Read-side trackers: scan + get
 // ---------------------------------------------------------------------------
 
-/// Track a successful `scan`. Reports per-tier patch counts, whether the
-/// call was downgraded to the public proxy after an auth-endpoint 401/403
-/// (`fallback_to_proxy`), the mode the run was asked for (`hosted` /
-/// `vendored` / `agent`, or `report` with none) and the modes the project
-/// is already wired for, from its hosted lockfile pins, vendor ledger and
-/// agent manifest.
-///
-/// The argument count intentionally mirrors the metadata fields the
-/// dashboard needs — grouping them into a struct would force callers
-/// to build a config object for a single fire-and-forget call, which
-/// is worse ergonomics for a tracker.
-#[allow(clippy::too_many_arguments)]
-pub async fn track_patch_scanned(
-    packages_scanned: usize,
-    free_patches: usize,
-    paid_patches: usize,
-    can_access_paid: bool,
-    ecosystems: &[String],
-    fallback_to_proxy: bool,
-    mode: &str,
-    project_modes: &[&str],
-    auth: &TelemetryAuth,
-) {
+/// What a successful `scan` reports.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanReport<'a> {
+    /// Packages the crawl found, per ecosystem (CLI name). Its keys are
+    /// the event's `ecosystems`, its sum `packages_scanned`: the
+    /// ecosystems the crawl found, not the `--ecosystems` filter.
+    pub packages_by_ecosystem: &'a std::collections::BTreeMap<String, usize>,
+    /// Patches the API offered for those packages, per ecosystem.
+    pub patches_by_ecosystem: &'a std::collections::BTreeMap<String, usize>,
+    pub free_patches: usize,
+    pub paid_patches: usize,
+    pub can_access_paid: bool,
+    /// The call was downgraded to the public proxy after an auth-endpoint
+    /// 401/403.
+    pub fallback_to_proxy: bool,
+    /// The mode the run was asked for (`hosted` / `vendored` / `agent`,
+    /// or `report` with none).
+    pub mode: &'a str,
+    /// The modes the project is already wired for, from its hosted
+    /// lockfile pins, vendor ledger and agent manifest.
+    pub project_modes: &'a [&'a str],
+    pub dry_run: bool,
+}
+
+/// Track a successful `scan` of one project directory.
+pub async fn track_patch_scanned(report: ScanReport<'_>, auth: &TelemetryAuth) {
+    let ecosystems: Vec<&String> = report.packages_by_ecosystem.keys().collect();
     fire(
         PatchTelemetryEventType::PatchScanned,
         "scan",
         serde_json::json!({
-            "packages_scanned": packages_scanned,
-            "free_patches": free_patches,
-            "paid_patches": paid_patches,
-            "can_access_paid": can_access_paid,
+            "packages_scanned": report.packages_by_ecosystem.values().sum::<usize>(),
+            "free_patches": report.free_patches,
+            "paid_patches": report.paid_patches,
+            "can_access_paid": report.can_access_paid,
             "ecosystems": ecosystems,
-            "fallback_to_proxy": fallback_to_proxy,
-            "mode": mode,
-            "project_modes": project_modes,
+            "packages_by_ecosystem": report.packages_by_ecosystem,
+            "patches_by_ecosystem": report.patches_by_ecosystem,
+            "fallback_to_proxy": report.fallback_to_proxy,
+            "mode": report.mode,
+            "project_modes": report.project_modes,
+            "dry_run": report.dry_run,
         }),
         None::<&str>,
         auth,
     );
 }
 
-/// Track a failed `scan`.
+/// Track a failed `scan`: `error_code` is the code its `--json` envelope
+/// reports, `mode` the mode the run was asked for.
 pub async fn track_patch_scan_failed(
+    error_code: &str,
     error: impl std::fmt::Display,
     fallback_to_proxy: bool,
+    mode: &str,
     auth: &TelemetryAuth,
 ) {
     fire(
         PatchTelemetryEventType::PatchScanFailed,
         "scan",
-        serde_json::json!({ "fallback_to_proxy": fallback_to_proxy }),
+        serde_json::json!({
+            "error_code": error_code,
+            "fallback_to_proxy": fallback_to_proxy,
+            "mode": mode,
+        }),
         Some(error),
         auth,
     );
 }
 
-/// Track a successful `get`. Reports patch identity and whether the call
-/// was downgraded to the public proxy after an auth-endpoint 401/403.
-/// `download_mode` is always `"file"`: v5 fetches patch content only as
-/// per-file blobs, and the field stays so the event schema is unchanged.
+/// Track a `get <uuid>` that resolved its patch. Reports patch identity,
+/// the mode the run patches in, and whether the call was downgraded to the
+/// public proxy after an auth-endpoint 401/403. `download_mode` is always
+/// `"file"`: v5 fetches patch content only as per-file blobs, and the
+/// field stays so the event schema is unchanged.
 pub async fn track_patch_fetched(
     uuid: &str,
     tier: &str,
     ecosystem: &str,
+    mode: &'static str,
     fallback_to_proxy: bool,
     auth: &TelemetryAuth,
 ) {
+    let patch = PatchOutcome {
+        uuid: uuid.to_string(),
+        ecosystem: ecosystem.to_string(),
+        mode,
+        outcome: "downloaded",
+        code: None,
+    };
     fire(
         PatchTelemetryEventType::PatchFetched,
         "get",
-        serde_json::json!({
-            "uuid": uuid,
-            "tier": tier,
-            "ecosystem": ecosystem,
-            "download_mode": "file",
-            "fallback_to_proxy": fallback_to_proxy,
-        }),
+        with_patches(
+            serde_json::json!({
+                "uuid": uuid,
+                "tier": tier,
+                "ecosystem": ecosystem,
+                "mode": mode,
+                "patches_count": 1,
+                "download_mode": "file",
+                "fallback_to_proxy": fallback_to_proxy,
+            }),
+            std::slice::from_ref(&patch),
+        ),
+        None::<&str>,
+        auth,
+    );
+}
+
+/// Track the patch records an agent-mode run downloaded, as `command`
+/// (`scan`, or a `get` by package or advisory): one event for the run,
+/// naming each patch it downloaded (`downloaded`), already had
+/// (`skipped`) or could not fetch (`failed`). `patches_count` is how many
+/// it downloaded. A run that reached no patch sends nothing.
+pub async fn track_patches_fetched(
+    command: &'static str,
+    patches: &[PatchOutcome],
+    auth: &TelemetryAuth,
+) {
+    if patches.is_empty() {
+        return;
+    }
+    fire(
+        PatchTelemetryEventType::PatchFetched,
+        command,
+        with_patches(
+            serde_json::json!({
+                "mode": MODE_AGENT,
+                "patches_count": PatchOutcome::count(patches, "downloaded"),
+                "download_mode": "file",
+            }),
+            patches,
+        ),
         None::<&str>,
         auth,
     );
@@ -1494,11 +1806,42 @@ mod tests {
         );
     }
 
-    /// Each public tracker posts the event type and metadata the backend
-    /// and its dashboards key on, to the org endpoint with the bearer.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn trackers_post_the_documented_events() {
+    const UUID_A: &str = "11111111-1111-4111-8111-111111111111";
+    const UUID_B: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn outcome(
+        uuid: &str,
+        ecosystem: &str,
+        mode: &'static str,
+        outcome: &'static str,
+        code: Option<&str>,
+    ) -> PatchOutcome {
+        PatchOutcome {
+            uuid: uuid.to_string(),
+            ecosystem: ecosystem.to_string(),
+            mode,
+            outcome,
+            code: code.map(str::to_string),
+        }
+    }
+
+    /// The bodies an org-style mock received, in arrival order, each
+    /// checked for the bearer.
+    async fn posted(server: &wiremock::MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| {
+                assert_eq!(r.headers.get("authorization").unwrap(), "Bearer tok");
+                serde_json::from_slice(&r.body).unwrap()
+            })
+            .collect()
+    }
+
+    /// A mock of the org telemetry endpoint and the route to it.
+    async fn org_endpoint() -> (wiremock::MockServer, TelemetryAuth) {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1508,66 +1851,113 @@ mod tests {
             .respond_with(ResponseTemplate::new(201))
             .mount(&server)
             .await;
-
-        let _on = TelemetryOn::new();
         let auth = TelemetryAuth {
             url: format!("{}/v0/orgs/acme/telemetry", server.uri()),
             bearer: Some("tok".to_string()),
         };
+        (server, auth)
+    }
+
+    /// Each public tracker posts the event type and metadata the backend
+    /// and its dashboards key on, to the org endpoint with the bearer.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn trackers_post_the_documented_events() {
+        let (server, auth) = org_endpoint().await;
+        let _on = TelemetryOn::new();
         // Sends run side by side, so each is waited for before the next
         // fires: the requests then arrive in the order asserted below.
-        track_patch_applied(3, false, &auth).await;
+        track_patch_applied(
+            "scan",
+            3,
+            false,
+            &[outcome(UUID_A, "npm", MODE_AGENT, "applied", None)],
+            &auth,
+        )
+        .await;
         flush(AMPLE).await;
-        track_patch_hosted("scan", 2, 1, false, &auth).await;
+        track_patch_hosted(
+            "scan",
+            2,
+            1,
+            false,
+            &[outcome(UUID_A, "npm", MODE_HOSTED, "applied", None)],
+            &auth,
+        )
+        .await;
         flush(AMPLE).await;
-        track_patch_hosted_failed("get", "lockfile write failed", true, &auth).await;
+        track_patch_hosted_failed(
+            "get",
+            "lockfile_write_failed",
+            "lockfile write failed",
+            true,
+            &[outcome(
+                UUID_A,
+                "npm",
+                MODE_HOSTED,
+                OUTCOME_FAILED,
+                Some("lockfile_write_failed"),
+            )],
+            &auth,
+        )
+        .await;
         flush(AMPLE).await;
         track_cli_updated("9.9.9", "standalone", false, false, &auth).await;
         flush(AMPLE).await;
         track_cli_update_failed("managed_install", "managed by npm", &auth).await;
         flush(AMPLE).await;
-        let ecosystems = vec!["npm".to_string(), "pypi".to_string()];
+        let packages = [("npm".to_string(), 4), ("pypi".to_string(), 1)]
+            .into_iter()
+            .collect();
+        let patches = [("npm".to_string(), 5)].into_iter().collect();
         track_patch_scanned(
-            5,
-            3,
-            2,
-            true,
-            &ecosystems,
-            true,
-            "hosted",
-            &["vendored"],
+            ScanReport {
+                packages_by_ecosystem: &packages,
+                patches_by_ecosystem: &patches,
+                free_patches: 3,
+                paid_patches: 2,
+                can_access_paid: true,
+                fallback_to_proxy: true,
+                mode: "hosted",
+                project_modes: &["vendored"],
+                dry_run: false,
+            },
             &auth,
         )
         .await;
         flush(AMPLE).await;
-        track_patch_scan_failed("all batches failed", true, &auth).await;
+        track_patch_scan_failed(
+            "api_batch_failed",
+            "all batches failed",
+            true,
+            "agent",
+            &auth,
+        )
+        .await;
         flush(AMPLE).await;
 
-        let reqs = server.received_requests().await.unwrap();
-        let bodies: Vec<serde_json::Value> = reqs
-            .iter()
-            .map(|r| {
-                assert_eq!(r.headers.get("authorization").unwrap(), "Bearer tok");
-                serde_json::from_slice(&r.body).unwrap()
-            })
-            .collect();
+        let bodies = posted(&server).await;
         assert_eq!(bodies.len(), 7);
 
         assert_eq!(bodies[0]["event_type"], "patch_applied");
-        assert_eq!(bodies[0]["context"]["command"], "apply");
+        assert_eq!(bodies[0]["context"]["command"], "scan");
         assert_eq!(bodies[0]["metadata"]["mode"], "agent");
         assert_eq!(bodies[0]["metadata"]["patches_count"], 3);
+        assert_eq!(bodies[0]["metadata"]["patches"][0]["uuid"], UUID_A);
 
         assert_eq!(bodies[1]["event_type"], "patch_applied");
         assert_eq!(bodies[1]["context"]["command"], "scan");
         assert_eq!(bodies[1]["metadata"]["mode"], "hosted");
         assert_eq!(bodies[1]["metadata"]["patches_count"], 2);
         assert_eq!(bodies[1]["metadata"]["files_count"], 1);
+        assert_eq!(bodies[1]["metadata"]["patches"][0]["mode"], "hosted");
 
         assert_eq!(bodies[2]["event_type"], "patch_apply_failed");
         assert_eq!(bodies[2]["context"]["command"], "get");
         assert_eq!(bodies[2]["metadata"]["mode"], "hosted");
         assert_eq!(bodies[2]["metadata"]["dry_run"], true);
+        assert_eq!(bodies[2]["metadata"]["error_code"], "lockfile_write_failed");
+        assert_eq!(bodies[2]["metadata"]["outcomes"]["failed"], 1);
         assert_eq!(bodies[2]["error"]["message"], "lockfile write failed");
 
         assert_eq!(bodies[3]["event_type"], "cli_updated");
@@ -1589,7 +1979,16 @@ mod tests {
             bodies[5]["metadata"]["ecosystems"],
             serde_json::json!(["npm", "pypi"])
         );
+        assert_eq!(
+            bodies[5]["metadata"]["packages_by_ecosystem"],
+            serde_json::json!({ "npm": 4, "pypi": 1 })
+        );
+        assert_eq!(
+            bodies[5]["metadata"]["patches_by_ecosystem"],
+            serde_json::json!({ "npm": 5 })
+        );
         assert_eq!(bodies[5]["metadata"]["mode"], "hosted");
+        assert_eq!(bodies[5]["metadata"]["dry_run"], false);
         assert_eq!(
             bodies[5]["metadata"]["project_modes"],
             serde_json::json!(["vendored"])
@@ -1598,7 +1997,379 @@ mod tests {
         assert_eq!(bodies[6]["event_type"], "patch_scan_failed");
         assert_eq!(bodies[6]["context"]["command"], "scan");
         assert_eq!(bodies[6]["metadata"]["fallback_to_proxy"], true);
+        assert_eq!(bodies[6]["metadata"]["error_code"], "api_batch_failed");
+        assert_eq!(bodies[6]["metadata"]["mode"], "agent");
         assert_eq!(bodies[6]["error"]["message"], "all batches failed");
+    }
+
+    /// The events that take a patch out name it: the patch UUID with its
+    /// ecosystem, mode and outcome, the exact counts over the run, and on
+    /// a failure the run's error code. This is what lets the server tell
+    /// which patch is being rolled back or removed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rollback_and_remove_events_name_their_patches() {
+        let (server, auth) = org_endpoint().await;
+        let _on = TelemetryOn::new();
+
+        let run = RollbackRun {
+            rolled_back_count: 2,
+            dry_run: false,
+            targeted: true,
+        };
+        track_patch_rolled_back(
+            run,
+            &[
+                outcome(UUID_A, "npm", MODE_AGENT, "rolled_back", None),
+                outcome(UUID_B, "pypi", MODE_VENDORED, "rolled_back", None),
+            ],
+            &auth,
+        )
+        .await;
+        flush(AMPLE).await;
+        track_patch_rollback_failed(
+            "rollback_failed",
+            "One or more rollbacks failed",
+            RollbackRun {
+                rolled_back_count: 1,
+                dry_run: false,
+                targeted: false,
+            },
+            &[
+                outcome(UUID_A, "npm", MODE_AGENT, "rolled_back", None),
+                outcome(
+                    UUID_B,
+                    "gem",
+                    MODE_HOSTED,
+                    OUTCOME_FAILED,
+                    Some("hosted_restore_refused"),
+                ),
+            ],
+            &auth,
+        )
+        .await;
+        flush(AMPLE).await;
+        track_patch_rollback_failed(
+            "patch_not_found",
+            "No patch found matching identifier: lodash",
+            RollbackRun {
+                targeted: true,
+                ..RollbackRun::default()
+            },
+            &[],
+            &auth,
+        )
+        .await;
+        flush(AMPLE).await;
+        track_patch_removed(
+            "remove",
+            1,
+            &[outcome(UUID_A, "npm", MODE_AGENT, "removed", None)],
+            &auth,
+        )
+        .await;
+        flush(AMPLE).await;
+        track_patch_remove_failed(
+            "vendor",
+            "vendor_revert_kept",
+            "kept",
+            &[outcome(
+                UUID_B,
+                "cargo",
+                MODE_VENDORED,
+                OUTCOME_FAILED,
+                Some("vendor_revert_kept"),
+            )],
+            &auth,
+        )
+        .await;
+        flush(AMPLE).await;
+
+        let bodies = posted(&server).await;
+        assert_eq!(bodies.len(), 5);
+
+        let rolled_back = &bodies[0];
+        assert_eq!(rolled_back["event_type"], "patch_rolled_back");
+        assert_eq!(rolled_back["context"]["command"], "rollback");
+        assert_eq!(
+            rolled_back["metadata"],
+            serde_json::json!({
+                "rolled_back_count": 2,
+                "dry_run": false,
+                "targeted": true,
+                "patches": [
+                    { "uuid": UUID_A, "ecosystem": "npm", "mode": "agent", "outcome": "rolled_back" },
+                    { "uuid": UUID_B, "ecosystem": "pypi", "mode": "vendored", "outcome": "rolled_back" },
+                ],
+                "outcomes": { "rolled_back": 2 },
+                "ecosystems": ["npm", "pypi"],
+                "modes": ["agent", "vendored"],
+            })
+        );
+
+        let failed = &bodies[1];
+        assert_eq!(failed["event_type"], "patch_rollback_failed");
+        assert_eq!(failed["metadata"]["error_code"], "rollback_failed");
+        assert_eq!(failed["metadata"]["rolled_back_count"], 1);
+        assert_eq!(failed["metadata"]["targeted"], false);
+        assert_eq!(
+            failed["metadata"]["outcomes"],
+            serde_json::json!({ "failed": 1, "rolled_back": 1 })
+        );
+        // The failed patch leads, with the code of its failure.
+        assert_eq!(
+            failed["metadata"]["patches"][0],
+            serde_json::json!({
+                "uuid": UUID_B,
+                "ecosystem": "gem",
+                "mode": "hosted",
+                "outcome": "failed",
+                "code": "hosted_restore_refused",
+            })
+        );
+        assert_eq!(failed["metadata"]["patches"][1]["uuid"], UUID_A);
+
+        // A run that never reached a patch names none, and its code says
+        // why: a mistyped target is not a patch that would not come off.
+        let unstarted = &bodies[2];
+        assert_eq!(unstarted["event_type"], "patch_rollback_failed");
+        assert_eq!(
+            unstarted["metadata"],
+            serde_json::json!({
+                "rolled_back_count": 0,
+                "dry_run": false,
+                "targeted": true,
+                "error_code": "patch_not_found",
+            })
+        );
+
+        let removed = &bodies[3];
+        assert_eq!(removed["event_type"], "patch_removed");
+        assert_eq!(removed["context"]["command"], "remove");
+        assert_eq!(removed["metadata"]["removed_count"], 1);
+        assert_eq!(removed["metadata"]["patches"][0]["uuid"], UUID_A);
+        assert_eq!(removed["metadata"]["patches"][0]["outcome"], "removed");
+
+        let kept = &bodies[4];
+        assert_eq!(kept["event_type"], "patch_remove_failed");
+        assert_eq!(kept["context"]["command"], "vendor");
+        assert_eq!(kept["metadata"]["error_code"], "vendor_revert_kept");
+        assert_eq!(kept["metadata"]["patches"][0]["code"], "vendor_revert_kept");
+    }
+
+    /// Vendor and download events carry the mode, the command the user
+    /// ran and their patches.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn vendor_and_fetch_events_carry_mode_and_patches() {
+        let (server, auth) = org_endpoint().await;
+        let _on = TelemetryOn::new();
+
+        track_patch_vendored(
+            "scan",
+            1,
+            false,
+            &[outcome(UUID_A, "npm", MODE_VENDORED, "applied", None)],
+            &auth,
+        )
+        .await;
+        flush(AMPLE).await;
+        track_patch_vendor_failed(
+            "vendor",
+            "vendor_failed",
+            "vendor completed with failures",
+            false,
+            &[
+                outcome(UUID_A, "npm", MODE_VENDORED, "applied", None),
+                outcome(
+                    UUID_B,
+                    "npm",
+                    MODE_VENDORED,
+                    OUTCOME_FAILED,
+                    Some("no_local_source"),
+                ),
+            ],
+            &auth,
+        )
+        .await;
+        flush(AMPLE).await;
+        track_patch_fetched(UUID_A, "free", "npm", MODE_HOSTED, false, &auth).await;
+        flush(AMPLE).await;
+        track_patches_fetched(
+            "scan",
+            &[
+                outcome(UUID_A, "npm", MODE_AGENT, "downloaded", None),
+                outcome(
+                    UUID_B,
+                    "pypi",
+                    MODE_AGENT,
+                    "skipped",
+                    Some("already_in_manifest"),
+                ),
+            ],
+            &auth,
+        )
+        .await;
+        flush(AMPLE).await;
+        // A pass that reached no patch sends nothing.
+        track_patches_fetched("scan", &[], &auth).await;
+        flush(AMPLE).await;
+
+        let bodies = posted(&server).await;
+        assert_eq!(bodies.len(), 4);
+
+        assert_eq!(bodies[0]["event_type"], "patch_vendored");
+        assert_eq!(bodies[0]["context"]["command"], "scan");
+        assert_eq!(bodies[0]["metadata"]["mode"], "vendored");
+        assert_eq!(bodies[0]["metadata"]["patches_count"], 1);
+        assert_eq!(bodies[0]["metadata"]["patches"][0]["uuid"], UUID_A);
+
+        assert_eq!(bodies[1]["event_type"], "patch_vendor_failed");
+        assert_eq!(bodies[1]["context"]["command"], "vendor");
+        assert_eq!(bodies[1]["metadata"]["mode"], "vendored");
+        assert_eq!(bodies[1]["metadata"]["error_code"], "vendor_failed");
+        // What the failed run did vendor is counted, not lost.
+        assert_eq!(bodies[1]["metadata"]["patches_count"], 1);
+        assert_eq!(bodies[1]["metadata"]["patches"][0]["uuid"], UUID_B);
+
+        assert_eq!(bodies[2]["event_type"], "patch_fetched");
+        assert_eq!(bodies[2]["context"]["command"], "get");
+        assert_eq!(bodies[2]["metadata"]["uuid"], UUID_A);
+        assert_eq!(bodies[2]["metadata"]["mode"], "hosted");
+        assert_eq!(bodies[2]["metadata"]["patches_count"], 1);
+        assert_eq!(bodies[2]["metadata"]["download_mode"], "file");
+        assert_eq!(bodies[2]["metadata"]["patches"][0]["outcome"], "downloaded");
+
+        assert_eq!(bodies[3]["event_type"], "patch_fetched");
+        assert_eq!(bodies[3]["context"]["command"], "scan");
+        assert_eq!(bodies[3]["metadata"]["mode"], "agent");
+        assert_eq!(bodies[3]["metadata"]["patches_count"], 1);
+        assert_eq!(
+            bodies[3]["metadata"]["outcomes"],
+            serde_json::json!({ "downloaded": 1, "skipped": 1 })
+        );
+    }
+
+    /// An event names at most [`MAX_REPORTED_PATCHES`] patches, the failed
+    /// ones first, and says when it dropped some; the counts beside the
+    /// list stay those of the whole run.
+    #[test]
+    fn a_long_run_reports_its_failures_first_and_exact_counts() {
+        let total = MAX_REPORTED_PATCHES + 30;
+        let patches: Vec<PatchOutcome> = (0..total)
+            .map(|i| {
+                let uuid = format!("00000000-0000-4000-8000-{i:012}");
+                if i % 20 == 19 {
+                    outcome(
+                        &uuid,
+                        "pypi",
+                        MODE_AGENT,
+                        OUTCOME_FAILED,
+                        Some("hash_mismatch"),
+                    )
+                } else {
+                    outcome(&uuid, "npm", MODE_AGENT, "applied", None)
+                }
+            })
+            .collect();
+        let failed = PatchOutcome::count(&patches, OUTCOME_FAILED);
+        assert!(failed > 0 && failed < MAX_REPORTED_PATCHES);
+
+        let metadata = with_patches(serde_json::json!({ "dry_run": false }), &patches);
+        let reported = metadata["patches"].as_array().unwrap();
+        assert_eq!(reported.len(), MAX_REPORTED_PATCHES);
+        assert_eq!(metadata["patches_truncated"], true);
+        for entry in &reported[..failed] {
+            assert_eq!(entry["outcome"], "failed", "failures lead: {entry}");
+        }
+        for entry in &reported[failed..] {
+            assert_eq!(entry["outcome"], "applied");
+        }
+        // The run's own order is kept within each group.
+        assert_eq!(
+            reported[failed]["uuid"],
+            "00000000-0000-4000-8000-000000000000"
+        );
+        assert_eq!(
+            metadata["outcomes"],
+            serde_json::json!({ "applied": total - failed, "failed": failed })
+        );
+        assert_eq!(metadata["ecosystems"], serde_json::json!(["npm", "pypi"]));
+        assert_eq!(metadata["modes"], serde_json::json!(["agent"]));
+
+        // Under the cap nothing is flagged.
+        let short = with_patches(serde_json::json!({}), &patches[..3]);
+        assert_eq!(short["patches"].as_array().unwrap().len(), 3);
+        assert!(short.get("patches_truncated").is_none());
+        // No patch, no fields; and the event's own keys are never replaced.
+        assert_eq!(
+            with_patches(serde_json::json!({ "dry_run": true }), &[]),
+            serde_json::json!({ "dry_run": true })
+        );
+        let own = with_patches(
+            serde_json::json!({ "ecosystems": ["cargo"] }),
+            &patches[..1],
+        );
+        assert_eq!(own["ecosystems"], serde_json::json!(["cargo"]));
+    }
+
+    /// The server keeps an event's body readable to its dashboards only
+    /// up to 10,000 characters: the largest event a run can build (the
+    /// patch cap, every entry with a code, the longest error) stays under.
+    #[test]
+    fn the_largest_event_fits_the_servers_readable_body() {
+        let patches: Vec<PatchOutcome> = (0..MAX_REPORTED_PATCHES * 4)
+            .map(|i| {
+                outcome(
+                    &format!("00000000-0000-4000-8000-{i:012}"),
+                    "composer",
+                    MODE_VENDORED,
+                    OUTCOME_FAILED,
+                    Some("replaced_patch_not_restored_before_update"),
+                )
+            })
+            .collect();
+        let metadata = failure_metadata(
+            RollbackRun {
+                rolled_back_count: 1000,
+                dry_run: true,
+                targeted: true,
+            }
+            .metadata(),
+            "vendor_state_write_failed",
+            &patches,
+        );
+        let serde_json::Value::Object(metadata) = metadata else {
+            panic!("metadata is an object");
+        };
+        let event = build_telemetry_event(
+            PatchTelemetryEventType::PatchRollbackFailed,
+            "rollback",
+            Some(metadata.into_iter().collect()),
+            Some(("Error".to_string(), "x".repeat(50_000))),
+        );
+        let body = serde_json::to_string(&event).unwrap();
+        assert!(
+            body.chars().count() < 10_000,
+            "the event body is {} characters",
+            body.chars().count()
+        );
+        let message = event.error.unwrap().message.unwrap();
+        assert_eq!(message.chars().count(), MAX_ERROR_MESSAGE_CHARS);
+        assert!(message.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_chars_cuts_on_a_character_and_only_when_too_long() {
+        assert_eq!(truncate_chars("short".to_string(), 10), "short");
+        assert_eq!(truncate_chars("exactly10!".to_string(), 10), "exactly10!");
+        assert_eq!(
+            truncate_chars("more than ten".to_string(), 10),
+            "more than…"
+        );
+        // Multi-byte characters are counted, not their bytes.
+        assert_eq!(truncate_chars("ééééé".to_string(), 5), "ééééé");
+        assert_eq!(truncate_chars("éééééé".to_string(), 5), "éééé…");
     }
 
     #[test]

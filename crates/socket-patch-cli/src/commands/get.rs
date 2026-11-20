@@ -1330,6 +1330,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     &patch.uuid,
                     &patch.tier,
                     &ecosystem_from_purl(&patch.purl),
+                    mode.cli_name(),
                     fallback_to_proxy,
                     &telemetry,
                 )
@@ -2213,6 +2214,7 @@ async fn save_and_apply_patch(
         // result in one line (`Applied 1 patch.`).
         apply_report = Some(
             run_nested_apply(
+                "get",
                 nested_apply_args(&args.common, &manifest_path, quiet),
                 args.common.json,
                 true,
@@ -2467,8 +2469,16 @@ async fn run_get_vendored(
             // Same failure telemetry as the vendor-step Err arm below: this
             // run exits 1 without vendoring anything.
             socket_patch_core::telemetry::track_patch_vendor_failed(
+                "get",
+                code,
                 detail,
                 args.common.dry_run,
+                &crate::telemetry_outcomes::uniform_outcomes(
+                    [(patch.purl.as_str(), patch.uuid.as_str())],
+                    socket_patch_core::telemetry::MODE_VENDORED,
+                    socket_patch_core::telemetry::OUTCOME_FAILED,
+                    Some(code),
+                ),
                 telemetry,
             )
             .await;
@@ -2515,6 +2525,7 @@ async fn run_get_vendored(
     // and over this run's client, then the run's telemetry. A per-patch
     // download failure does not skip it (scan parity).
     match super::scan::boxed_vendor_step(super::scan::VendorStep {
+        command: "get",
         common: &args.common,
         records,
         client: api_client.clone(),
