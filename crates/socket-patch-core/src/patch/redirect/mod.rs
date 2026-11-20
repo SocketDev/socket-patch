@@ -1167,6 +1167,27 @@ fn warn_no_pypi_wiring(
     if wired || crate::utils::hatch::is_hatch(files) {
         return;
     }
+    // A pixi project: a requirements file or another tool's lock would
+    // pin nothing, since pixi installs from its own lock, and mostly from
+    // conda channels. A project whose own files name another lock tool (a
+    // Pipfile, a `[tool.uv]` table) is installed by that tool too, and
+    // keeps its remedy; a build backend names no such tool.
+    let pixi_files = crate::crawlers::pixi_env::PIXI_FILES;
+    if pixi_files.iter().any(|file| files.contains_key(*file))
+        && pypi_lock_step(files, false).is_none()
+    {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_pypi_pixi_project".into(),
+            detail: "pixi installs this project (pixi.toml / pixi.lock), most of it from \
+                     conda channels, and hosted mode cannot point a pixi lock at Socket's \
+                     patched packages; patch the installed packages in place instead: run \
+                     `socket-patch scan --mode agent` after `pixi install`, commit \
+                     .socket/, and run `socket-patch apply` after every later `pixi \
+                     install`"
+                .into(),
+        });
+        return;
+    }
     result.warnings.push(RewriteWarning {
         code: "redirect_pypi_no_lockfile".into(),
         detail: format!(
@@ -1188,18 +1209,43 @@ fn warn_no_pypi_wiring(
 /// both remedies are offered.
 fn pypi_no_lockfile_remedy(files: &BTreeMap<String, String>) -> String {
     const PIN: &str = "pin the package in a root requirements.txt";
-    if files.contains_key("Pipfile") {
-        return "run `pipenv lock` and commit Pipfile.lock, then re-run".into();
+    if let Some(step) = pypi_named_lock_step(files) {
+        return step;
     }
-    let Some(pyproject) = files.get("pyproject.toml") else {
+    if !files.contains_key("pyproject.toml") {
         return format!("{PIN} or commit the project's lock, then re-run");
-    };
+    }
+    format!(
+        "{PIN}, or, if a lock tool installs the project, generate and commit its \
+         lock (`uv lock`, `poetry lock`, `pdm lock`), then re-run"
+    )
+}
+
+/// The lock step of the tool the project's own files name: `pipenv lock`
+/// for a Pipfile, else the lock of the tool a pyproject names with a
+/// `[tool.<tool>]` table or its build backend. `None` when they name none.
+fn pypi_named_lock_step(files: &BTreeMap<String, String>) -> Option<String> {
+    pypi_lock_step(files, true)
+}
+
+/// [`pypi_named_lock_step`], with or without the build backend as a name
+/// (`by_backend`). A build backend builds the project's own package and
+/// says nothing about which tool installs its dependencies: a pixi project
+/// packaged with `poetry-core` or `uv_build` is still installed by pixi.
+/// Only a tool's own file or table (a `Pipfile`, `[tool.uv]`,
+/// `[tool.poetry]`, `[tool.pdm]`) says that tool manages them.
+fn pypi_lock_step(files: &BTreeMap<String, String>, by_backend: bool) -> Option<String> {
+    if files.contains_key("Pipfile") {
+        return Some("run `pipenv lock` and commit Pipfile.lock, then re-run".into());
+    }
+    let pyproject = files.get("pyproject.toml")?;
     let document = pyproject.parse::<toml_edit::DocumentMut>().ok();
     let backend = document
         .as_ref()
         .and_then(|doc| doc.get("build-system"))
         .and_then(|build| build.get("build-backend"))
         .and_then(toml_edit::Item::as_str)
+        .filter(|_| by_backend)
         .unwrap_or_default();
     let names = |tool: &str| {
         document
@@ -1209,19 +1255,14 @@ fn pypi_no_lockfile_remedy(files: &BTreeMap<String, String>) -> String {
             || backend.starts_with(&format!("{tool}."))
             || backend.starts_with(&format!("{tool}_"))
     };
-    for (tool, command) in [
+    [
         ("uv", "uv lock"),
         ("poetry", "poetry lock"),
         ("pdm", "pdm lock"),
-    ] {
-        if names(tool) {
-            return format!("run `{command}` and commit its lock, then re-run");
-        }
-    }
-    format!(
-        "{PIN}, or, if a lock tool installs the project, generate and commit its \
-         lock (`uv lock`, `poetry lock`, `pdm lock`), then re-run"
-    )
+    ]
+    .into_iter()
+    .find(|(tool, _)| names(tool))
+    .map(|(_, command)| format!("run `{command}` and commit its lock, then re-run"))
 }
 
 fn rewrite_hatch(

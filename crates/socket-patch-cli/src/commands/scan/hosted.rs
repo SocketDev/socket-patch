@@ -5025,6 +5025,8 @@ mod tests {
                 "Pipfile",
                 "pyproject.toml",
                 "hatch.toml",
+                "pixi.toml",
+                "pixi.lock",
                 "Cargo.toml",
                 "Cargo.lock",
                 ".cargo/config.toml",

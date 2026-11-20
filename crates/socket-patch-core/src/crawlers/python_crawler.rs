@@ -598,6 +598,14 @@ fn shadowed_names_sync(
                 continue;
             }
             let here = names_in(&base);
+            // A pixi environment is run on its own (`pixi run`), whatever
+            // venv is layered on its interpreter: its copies are consumed
+            // there, so the venv hides none of them.
+            if super::pixi_env::conda_prefix_of(&base).is_some_and(super::pixi_env::is_pixi_prefix)
+            {
+                hidden.extend(here);
+                continue;
+            }
             match shadowed.entry(base) {
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     slot.insert(hidden.clone());
@@ -684,7 +692,11 @@ pub async fn inherited_same_release(site: &Path, name: &str, version: &str) -> O
 ///    [`super::hatch_env::hatch_environments`]), added to whichever of the
 ///    above answered: `hatch run` never uses an env another manager
 ///    records or activates, so its envs stay the project's (#335)
-/// 7. For every venv above created with `--system-site-packages`, its base
+/// 7. pixi's environments for the project (see
+///    [`super::pixi_env::pixi_environments`]), added the same way: `pixi
+///    run` only ever uses the conda prefixes under `.pixi/envs`, whatever
+///    venv another tool keeps beside them
+/// 8. For every venv above created with `--system-site-packages`, its base
 ///    interpreter's site dirs, after the venv's own (see
 ///    [`add_system_site_packages`], #409)
 pub async fn find_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
@@ -700,14 +712,16 @@ async fn find_local_venv_site_packages_with(
 ) -> Vec<PathBuf> {
     let mut found = managed_or_local_site_packages(cwd, var).await;
     add_hatch_site_packages(cwd, var, &mut found).await;
+    add_pixi_site_packages(cwd, var, &mut found).await;
     add_system_site_packages(&mut found, var);
     found
 }
 
-/// Steps 0-5 and 7 of [`find_local_venv_site_packages`] (no Hatch envs):
-/// the env a package manager records or activates, else the project's local
-/// venvs, plus the base site dirs a `--system-site-packages` one reaches.
-/// What a non-Hatch manager's own reinstall reaches, e.g. Pipenv's venv.
+/// Steps 0-5 and 8 of [`find_local_venv_site_packages`] (no Hatch or pixi
+/// envs): the env a package manager records or activates, else the
+/// project's local venvs, plus the base site dirs a
+/// `--system-site-packages` one reaches. What a non-Hatch manager's own
+/// reinstall reaches, e.g. Pipenv's venv.
 pub async fn non_hatch_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
     let var = |name: &str| std::env::var(name).ok();
     let mut found = managed_or_local_site_packages(cwd, &var).await;
@@ -792,6 +806,31 @@ async fn add_hatch_site_packages(
 
 /// The `site-packages` directories of one Hatch env.
 pub async fn hatch_env_site_packages(env: &super::hatch_env::HatchEnvironment) -> Vec<PathBuf> {
+    find_site_packages_under(&env.prefix, "site-packages").await
+}
+
+/// Appends the `site-packages` of every existing pixi environment of the
+/// project at `cwd` (see [`super::pixi_env::pixi_environments`]) not
+/// already in `results`. An environment without Python (R or C++ only)
+/// has none.
+async fn add_pixi_site_packages(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+    results: &mut Vec<PathBuf>,
+) {
+    for env in super::pixi_env::pixi_environments_with(cwd, var).await {
+        for site in pixi_env_site_packages(&env).await {
+            if !results.contains(&site) {
+                results.push(site);
+            }
+        }
+    }
+}
+
+/// The `site-packages` directories of one pixi environment: a conda prefix,
+/// so `lib/python3.X/site-packages` on Unix and `Lib\site-packages` on
+/// Windows.
+pub async fn pixi_env_site_packages(env: &super::pixi_env::PixiEnvironment) -> Vec<PathBuf> {
     find_site_packages_under(&env.prefix, "site-packages").await
 }
 
@@ -2791,8 +2830,8 @@ fn memoized_site_query(runner: &ProbeRunner) -> Option<String> {
 ///
 /// Queries `python3` for site-packages paths, then checks well-known system
 /// locations including Homebrew, conda, uv tools and interpreters, pipx
-/// venvs, Poetry's installer venv, PDM's global project and interpreters,
-/// pip --user, etc.
+/// venvs, pixi's global tools, Poetry's installer venv, PDM's global
+/// project and interpreters, pip --user, etc.
 ///
 /// The interpreter is asked from the neutral directory, never from a
 /// project: under `--global` no project's `.python-version` picks the
@@ -3017,6 +3056,14 @@ async fn system_python_site_packages(runner: ProbeRunner) -> Vec<PathBuf> {
         }
     }
 
+    // pixi's global tool environments (`pixi global install ruff`): one
+    // conda prefix per tool under `<pixi home>/envs`.
+    for pixi_home in pixi_home_candidates(home_dir.as_deref()) {
+        for m in find_child_env_site_packages(&pixi_home.join("envs")).await {
+            add_path(m, &mut seen, &mut results);
+        }
+    }
+
     // Poetry's own venv from the official installer
     // (`install.python-poetry.org`): `<data dir>/venv`, where the data dir
     // is `$POETRY_HOME` or the installer's platform default (#640). Both are
@@ -3105,6 +3152,20 @@ fn absolute_env_dir(var: &str) -> Option<PathBuf> {
     std::env::var_os(var)
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
+}
+
+/// The directories pixi may keep its global data in: `$PIXI_HOME`, and
+/// `~/.pixi`, its default. Both are returned: a tool installed before
+/// `PIXI_HOME` was set (or unset) is still a real install. Callers skip the
+/// ones that don't exist.
+fn pixi_home_candidates(home_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = std::env::var_os("PIXI_HOME").filter(|v| !v.is_empty()) {
+        let dir = PathBuf::from(dir);
+        dirs.push(std::path::absolute(&dir).unwrap_or(dir));
+    }
+    dirs.extend(home_dir.map(|h| h.join(".pixi")));
+    dirs
 }
 
 /// The directories uv may keep `bucket` (`tools` or `python`) in, most
@@ -3454,6 +3515,15 @@ async fn local_site_packages_with(
     if poetry_owns_project_env(cwd, var).await {
         return Vec::new();
     }
+    // A project only pixi installs has its packages in pixi's own
+    // environments (see `pixi_env`). With none installed yet nothing is
+    // installed for it; the OS Python, or whichever one is on PATH, is
+    // never its env. One that pip installs too (a `requirements.txt` or a
+    // packaged `pyproject.toml` beside pixi's files) keeps the interpreter
+    // fallback below.
+    if super::pixi_env::pixi_owns_project_env(cwd).await {
+        return Vec::new();
+    }
     if is_python_project(cwd).await {
         return system_python_site_packages(ProbeRunner::project(cwd)).await;
     }
@@ -3514,12 +3584,13 @@ impl PythonCrawler {
     /// Local-mode discovery has two stages:
     ///   1. `find_local_venv_site_packages` — handles `VIRTUAL_ENV`,
     ///      `.venv`, and `venv` directories, then Poetry's and Pipenv's
-    ///      out-of-tree virtualenvs.
+    ///      out-of-tree virtualenvs, and Hatch's and pixi's environments.
     ///   2. If no venv was found AND the cwd looks like a Python
     ///      project (see `is_python_project`) whose env is not only ever
     ///      Pipenv's own (`is_pipenv_project`), uv's own (see
-    ///      `uv_owns_project_env`) or Poetry's own (see
-    ///      `poetry_owns_project_env`), fall through
+    ///      `uv_owns_project_env`), Poetry's own (see
+    ///      `poetry_owns_project_env`) or pixi's own (see
+    ///      `pixi_env::pixi_owns_project_env`), fall through
     ///      to `get_global_python_site_packages`. This mirrors the
     ///      cargo / ruby / go pattern where a project marker
     ///      indicates "scan this ecosystem globally for this project".
@@ -4301,6 +4372,276 @@ mod tests {
         assert_eq!(
             base_site_dirs(prefix, Some("3.12"), false, &no_env),
             dirs[..3].to_vec()
+        );
+    }
+
+    /// A pixi environment at `project/.pixi/envs/<name>` as pixi leaves
+    /// one: a conda prefix with pixi's own record, and its site-packages
+    /// (platform layout). Returns the site-packages.
+    fn fake_pixi_env(project: &Path, name: &str) -> PathBuf {
+        let envs = project.join(".pixi").join("envs");
+        let site = fake_venv(&envs, name);
+        let meta = envs.join(name).join("conda-meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(meta.join("pixi"), "{\"environment_name\": \"default\"}").unwrap();
+        site
+    }
+
+    /// pixi installs a project into `.pixi/envs/<name>`, a conda prefix, and
+    /// nothing activates it for a plain `socket-patch` run after `pixi
+    /// install` (CI's shape). Every installed environment is the project's,
+    /// with or without another Python marker beside `pixi.toml`.
+    #[tokio::test]
+    async fn pixi_environments_are_project_envs_without_activation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("analysis");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pixi.toml"),
+            "[workspace]\nname = \"analysis\"\nchannels = [\"conda-forge\"]\nplatforms = [\"linux-64\"]\n",
+        )
+        .unwrap();
+        assert!(find_local_venv_site_packages_with(&project, &no_env)
+            .await
+            .is_empty());
+
+        let default_site = fake_pixi_env(&project, "default");
+        let test_site = fake_pixi_env(&project, "test");
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &no_env).await,
+            vec![default_site.clone(), test_site.clone()]
+        );
+        assert_eq!(
+            local_site_packages_with(&project, &no_env).await,
+            vec![default_site.clone(), test_site.clone()]
+        );
+
+        // An environment with no Python in it (R only) has no site dir.
+        std::fs::create_dir_all(
+            project
+                .join(".pixi")
+                .join("envs")
+                .join("r-only")
+                .join("conda-meta"),
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &no_env).await,
+            vec![default_site.clone(), test_site.clone()]
+        );
+
+        // The envs another manager's reinstall reaches do not include them.
+        assert!(managed_or_local_site_packages(&project, &no_env)
+            .await
+            .is_empty());
+    }
+
+    /// A venv another tool keeps in a pixi project (uv or pip for the
+    /// Python packages, pixi for the rest) stays the project's too, ahead
+    /// of pixi's environments; an activated one does not hide them.
+    #[tokio::test]
+    async fn pixi_environments_are_added_to_another_tools_venv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("analysis");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("pixi.toml"), "[workspace]\n").unwrap();
+        let pixi_site = fake_pixi_env(&project, "default");
+        let venv_site = fake_venv(&project, ".venv");
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &no_env).await,
+            vec![venv_site, pixi_site.clone()]
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        let activated_site = fake_venv(other.path(), "tool-venv");
+        let activated = env_of(&[(
+            "VIRTUAL_ENV",
+            other
+                .path()
+                .join("tool-venv")
+                .to_string_lossy()
+                .into_owned(),
+        )]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &activated).await,
+            vec![activated_site, pixi_site]
+        );
+    }
+
+    /// A `--system-site-packages` venv built on a pixi environment's Python
+    /// hides, for the venv's interpreter, every package it installs too.
+    /// The pixi environment is still run on its own (`pixi run`), where its
+    /// copy is the one imported, so that copy stays visible to the crawl
+    /// beside the venv's.
+    #[tokio::test]
+    async fn a_venv_layered_on_a_pixi_environment_does_not_hide_its_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("analysis");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("pixi.toml"), "[workspace]\n").unwrap();
+        let pixi_site = fake_pixi_env(&project, "default");
+        let prefix = project.join(".pixi").join("envs").join("default");
+        // The stdlib landmark the venv's base interpreter is recognised by.
+        let home = if cfg!(windows) {
+            std::fs::write(prefix.join("Lib").join("os.py"), "").unwrap();
+            prefix.clone()
+        } else {
+            std::fs::write(prefix.join("lib").join("python3.12").join("os.py"), "").unwrap();
+            std::fs::create_dir_all(prefix.join("bin")).unwrap();
+            prefix.join("bin")
+        };
+        let venv_site = fake_venv(&project, ".venv");
+        std::fs::write(
+            project.join(".venv").join("pyvenv.cfg"),
+            format!(
+                "home = {}\ninclude-system-site-packages = true\nversion = 3.12.4\n",
+                home.display()
+            ),
+        )
+        .unwrap();
+        for (site, version) in [(&venv_site, "2099.1.1"), (&pixi_site, "2026.7.22")] {
+            let dist = site.join(format!("certifi-{version}.dist-info"));
+            std::fs::create_dir_all(&dist).unwrap();
+            std::fs::write(
+                dist.join("METADATA"),
+                format!("Metadata-Version: 2.4\nName: certifi\nVersion: {version}\n"),
+            )
+            .unwrap();
+        }
+
+        let crawler = PythonCrawler::new();
+        let options = CrawlerOptions {
+            cwd: project.clone(),
+            global: false,
+            global_prefix: None,
+        };
+        let mut purls: Vec<String> = crawler
+            .crawl_all_with(&options, &no_env)
+            .await
+            .into_iter()
+            .map(|package| package.purl)
+            .collect();
+        purls.sort();
+        assert_eq!(
+            purls,
+            ["pkg:pypi/certifi@2026.7.22", "pkg:pypi/certifi@2099.1.1"]
+        );
+    }
+
+    /// `pixi run` from a workspace member activates the workspace's
+    /// environment: that is where the member's packages are, also when the
+    /// member has a `pixi.toml` of its own and so counts as a pixi project
+    /// with no environments in it.
+    #[tokio::test]
+    async fn pixi_environment_activated_from_a_member_directory_is_crawled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("pixi.toml"), "[workspace]\n").unwrap();
+        let site = fake_pixi_env(&root, "default");
+        let member = root.join("packages").join("foo");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("pixi.toml"), "[package]\nname = \"foo\"\n").unwrap();
+        std::fs::write(
+            member.join("pyproject.toml"),
+            "[project]\nname = \"foo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let prefix = root.join(".pixi").join("envs").join("default");
+        let activated = env_of(&[
+            ("PIXI_PROJECT_ROOT", root.to_string_lossy().into_owned()),
+            ("CONDA_PREFIX", prefix.to_string_lossy().into_owned()),
+        ]);
+        assert_eq!(
+            local_site_packages_with(&member, &activated).await,
+            vec![site]
+        );
+        // Without the activation the member has nothing installed, and the
+        // Python on PATH is not asked.
+        assert!(local_site_packages_with(&member, &no_env).await.is_empty());
+    }
+
+    /// A pixi project with no environment installed yet has nothing
+    /// installed: the Python on PATH (the OS one on a CI runner) is not its
+    /// env, even with a `pyproject.toml` beside the pixi files, which would
+    /// otherwise send the crawl to the system interpreters.
+    #[tokio::test]
+    async fn pixi_project_without_an_environment_never_reads_the_system_python() {
+        let tmp = tempfile::tempdir().unwrap();
+        for marker in ["pixi.toml", "pixi.lock"] {
+            let project = tmp.path().join(marker.replace('.', "-"));
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(
+                project.join("pyproject.toml"),
+                "[project]\nname = \"analysis\"\nversion = \"0.1.0\"\n",
+            )
+            .unwrap();
+            std::fs::write(project.join(marker), "").unwrap();
+            assert!(
+                local_site_packages_with(&project, &no_env).await.is_empty(),
+                "{marker}"
+            );
+        }
+    }
+
+    /// The packages of a pixi environment are crawled whichever way pixi
+    /// installed them: conda packages built with pip carry `.dist-info`,
+    /// older builds `.egg-info` (conda-forge's setuptools), and the PyPI
+    /// wheels uv installs for pixi carry `.dist-info`.
+    #[tokio::test]
+    async fn crawl_all_reads_a_pixi_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("analysis");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("pixi.lock"), "version: 6\n").unwrap();
+        let site = fake_pixi_env(&project, "default");
+        let dist = site.join("certifi-2026.7.22.dist-info");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(
+            dist.join("METADATA"),
+            "Metadata-Version: 2.4\nName: certifi\nVersion: 2026.7.22\n",
+        )
+        .unwrap();
+        std::fs::write(dist.join("INSTALLER"), "conda\n").unwrap();
+        let egg = site.join("setuptools-80.10.2-py3.10.egg-info");
+        std::fs::create_dir_all(&egg).unwrap();
+        std::fs::write(
+            egg.join("PKG-INFO"),
+            "Metadata-Version: 2.4\nName: setuptools\nVersion: 80.10.2\n",
+        )
+        .unwrap();
+        let wheel = site.join("somadata-1.2.5.dist-info");
+        std::fs::create_dir_all(&wheel).unwrap();
+        std::fs::write(
+            wheel.join("METADATA"),
+            "Metadata-Version: 2.4\nName: somadata\nVersion: 1.2.5\n",
+        )
+        .unwrap();
+        std::fs::write(wheel.join("INSTALLER"), "uv-pixi\n").unwrap();
+
+        let crawler = PythonCrawler::new();
+        let options = CrawlerOptions {
+            cwd: project.clone(),
+            global: false,
+            global_prefix: None,
+        };
+        let mut purls: Vec<String> = crawler
+            .crawl_all_with(&options, &no_env)
+            .await
+            .into_iter()
+            .map(|package| {
+                assert_eq!(package.path, site);
+                package.purl
+            })
+            .collect();
+        purls.sort();
+        assert_eq!(
+            purls,
+            [
+                "pkg:pypi/certifi@2026.7.22",
+                "pkg:pypi/setuptools@80.10.2",
+                "pkg:pypi/somadata@1.2.5"
+            ]
         );
     }
 

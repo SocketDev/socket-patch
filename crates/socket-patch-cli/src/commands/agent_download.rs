@@ -721,6 +721,10 @@ pub(crate) struct FetchBatch {
     events: Vec<PatchEvent>,
     /// Release-narrowing fallbacks (uninstalled base, no matching variant).
     warnings: Vec<String>,
+    /// Manifest store only: the patches left out because conda built every
+    /// installed copy as something other than the PyPI release (see
+    /// [`leave_out_patches_no_conda_build_takes`]), as `<purl>: <reason>`.
+    conda_refusals: Vec<String>,
     /// `Some("vendored")` for the ledger store (see [`tag_mode`]).
     mode: Option<&'static str>,
 }
@@ -1317,6 +1321,17 @@ pub(crate) async fn fetch_selected_patches(
         api_client,
     )
     .await;
+    // Agent mode writes into the installed copies. A patch no copy can
+    // take, because conda built each of them as something other than the
+    // pure-Python PyPI release, is left out here instead of being recorded
+    // and then refused by every later `apply`. `--all-releases` asks for
+    // records other environments use, so it keeps them.
+    let (selected, conda_refusals) =
+        if matches!(store, RecordStore::Manifest(_)) && !params.all_releases {
+            leave_out_patches_no_conda_build_takes(selected, &params.crawler_options(), quiet).await
+        } else {
+            (selected, Vec::new())
+        };
     status.finish();
     prefetched.extend(views);
     // The callers have already listed the patches (`scan`'s rows, `get`'s
@@ -1334,6 +1349,7 @@ pub(crate) async fn fetch_selected_patches(
         reused: Vec::new(),
         events: Vec::new(),
         warnings,
+        conda_refusals,
         mode: match store {
             RecordStore::Ledger(_) => Some("vendored"),
             RecordStore::Manifest(_) => None,
@@ -1614,6 +1630,77 @@ fn release_warnings(warnings: Vec<String>) -> Vec<RunWarning> {
         .into_iter()
         .map(|w| RunWarning::new(RELEASE_NARROWING, w))
         .collect()
+}
+
+/// Warning code: a PyPI patch was left out of an agent-mode run because
+/// conda built every installed copy as something other than the PyPI
+/// release the patch was made from.
+pub(crate) const CONDA_BUILD_NOT_PYPI_RELEASE: &str =
+    socket_patch_core::patch::conda_copy::REFUSAL_CODE;
+
+/// The PyPI patches of `selected` that at least one installed copy can
+/// take, and a `<purl>: <reason>` line for each one left out: every copy
+/// of its package is a conda build the patch is never applied to (a
+/// compiled build, or one nothing shows to be pure Python; see
+/// `socket_patch_core::patch::conda_copy`). A package that is not
+/// installed, or has a copy pip or uv installed, keeps its patch. Whether
+/// a pure-Python conda build's files are the release's is the apply
+/// engine's check, as for any other copy.
+///
+/// A record left out beside a kept one of the same release has no line:
+/// it is only not the installed distribution (the platform wheel's record
+/// beside the pure wheel's, for a pure-Python conda build), and the kept
+/// record patches the package.
+async fn leave_out_patches_no_conda_build_takes(
+    selected: Vec<PatchSearchResult>,
+    crawler_options: &CrawlerOptions,
+    quiet: bool,
+) -> (Vec<PatchSearchResult>, Vec<String>) {
+    use socket_patch_core::patch::conda_copy::static_refusal;
+    let pypi: Vec<String> = selected
+        .iter()
+        .filter(|sr| Ecosystem::from_purl(&sr.purl) == Some(Ecosystem::Pypi))
+        .map(|sr| sr.purl.clone())
+        .collect();
+    if pypi.is_empty() {
+        return (selected, Vec::new());
+    }
+    let copies =
+        find_all_packages_for_rollback(&partition_purls(&pypi, None), crawler_options, true).await;
+    let mut kept = Vec::with_capacity(selected.len());
+    // (base purl, line) of each record left out.
+    let mut left_out: Vec<(String, String)> = Vec::new();
+    for sr in selected {
+        let mut reason = None;
+        for copy in copies.get(&sr.purl).map(Vec::as_slice).unwrap_or_default() {
+            reason = static_refusal(&sr.purl, copy).await;
+            if reason.is_none() {
+                break;
+            }
+        }
+        match reason {
+            Some(reason) => left_out.push((
+                strip_purl_qualifiers(&sr.purl).to_string(),
+                format!("{}: {reason}", normalize_purl(&sr.purl)),
+            )),
+            None => kept.push(sr),
+        }
+    }
+    let refused: Vec<String> = left_out
+        .into_iter()
+        .filter(|(base, _)| {
+            !kept
+                .iter()
+                .any(|sr| strip_purl_qualifiers(&sr.purl) == base.as_str())
+        })
+        .map(|(_, line)| line)
+        .collect();
+    if !quiet {
+        for line in &refused {
+            eprintln!("  [note] {line}");
+        }
+    }
+    (kept, refused)
 }
 
 /// Warning code: release narrowing kept every variant of a base (the base
@@ -2306,6 +2393,12 @@ pub async fn download_and_apply_patches_into(
     // later. (`scan` never hits this: it filters vendored purls before
     // download.) The nested apply below skips the vendored purl either way.
     let mut warnings = release_warnings(batch.warnings);
+    warnings.extend(
+        batch
+            .conda_refusals
+            .into_iter()
+            .map(|detail| RunWarning::new(CONDA_BUILD_NOT_PYPI_RELEASE, detail)),
+    );
     warnings.extend(rollback_warnings);
     warn_on_vendored_uuid_drift(&params.project_root(), quiet, &changed, &mut warnings).await;
     if !recorded.is_empty() {
@@ -2350,30 +2443,59 @@ pub async fn download_and_apply_patches_into(
     run_outcome(batch.failed > 0, apply_failed)
 }
 
-/// The install command whose fresh run undoes the in-place patches of an
+/// The install commands whose fresh run undoes the in-place patches of an
 /// ecosystem's packages: the package manager the project's lockfile names
 /// (`has_file` answers for the project root), else the ecosystem's default.
-/// `None` where no one install step does (Maven, Gradle, sbt), or where
-/// none undoes the patch (Go builds from the committed copies).
-fn install_command(ecosystem: Ecosystem, has_file: &dyn Fn(&str) -> bool) -> Option<&'static str> {
+/// Empty where no one install step does (Maven, Gradle, sbt), or where
+/// none undoes the patch (Go builds from the committed copies). A Python
+/// project pixi installs gets `pixi install` beside any other tool's
+/// install: pixi keeps its own environments, whatever venv that tool
+/// fills. Beside pixi's files `pip install` is named only when a file pip
+/// installs from is there too.
+fn install_commands(ecosystem: Ecosystem, has_file: &dyn Fn(&str) -> bool) -> Vec<&'static str> {
     use socket_patch_core::constants::npm_family::{BUN_LOCK, BUN_LOCKB, PNPM_LOCK, VLT_LOCK};
-    Some(match ecosystem {
-        Ecosystem::Npm if has_file(PNPM_LOCK) => "pnpm install",
-        Ecosystem::Npm if has_file("yarn.lock") => "yarn install",
-        Ecosystem::Npm if has_file(BUN_LOCK) || has_file(BUN_LOCKB) => "bun install",
-        Ecosystem::Npm if has_file(VLT_LOCK) => "vlt install",
-        Ecosystem::Npm => "npm install",
-        Ecosystem::Pypi if has_file("uv.lock") => "uv sync",
-        Ecosystem::Pypi if has_file("poetry.lock") => "poetry install",
-        Ecosystem::Pypi if has_file("Pipfile.lock") => "pipenv install",
-        Ecosystem::Pypi if has_file("pdm.lock") => "pdm install",
-        Ecosystem::Pypi => "pip install",
-        Ecosystem::Gem => "bundle install",
-        Ecosystem::Composer => "composer install",
-        Ecosystem::Cargo => "cargo fetch",
-        Ecosystem::Nuget => "dotnet restore",
-        Ecosystem::Golang | Ecosystem::Maven | Ecosystem::Deno => return None,
-    })
+    let one = |command: &'static str| vec![command];
+    match ecosystem {
+        Ecosystem::Npm if has_file(PNPM_LOCK) => one("pnpm install"),
+        Ecosystem::Npm if has_file("yarn.lock") => one("yarn install"),
+        Ecosystem::Npm if has_file(BUN_LOCK) || has_file(BUN_LOCKB) => one("bun install"),
+        Ecosystem::Npm if has_file(VLT_LOCK) => one("vlt install"),
+        Ecosystem::Npm => one("npm install"),
+        Ecosystem::Pypi => {
+            let mut commands: Vec<&'static str> = [
+                ("uv.lock", "uv sync"),
+                ("poetry.lock", "poetry install"),
+                ("Pipfile.lock", "pipenv install"),
+                ("pdm.lock", "pdm install"),
+            ]
+            .into_iter()
+            .find(|(lock, _)| has_file(lock))
+            .map(|(_, command)| command)
+            .into_iter()
+            .collect();
+            let other_tool = !commands.is_empty();
+            // pixi links the packages of a project into its own
+            // environments, conda and PyPI ones alike.
+            use socket_patch_core::crawlers::pixi_env::{PIP_INSTALL_FILES, PIXI_FILES};
+            let pixi = PIXI_FILES.iter().any(|file| has_file(file));
+            if pixi {
+                commands.push("pixi install");
+            }
+            // With no other tool's lock, pip installs the project; beside
+            // pixi's files only when a file pip installs from is there too
+            // (the crawl then also reads the interpreter on `PATH`).
+            let pip_files = PIP_INSTALL_FILES.iter().any(|file| has_file(file));
+            if !other_tool && (!pixi || pip_files) {
+                commands.push("pip install");
+            }
+            commands
+        }
+        Ecosystem::Gem => one("bundle install"),
+        Ecosystem::Composer => one("composer install"),
+        Ecosystem::Cargo => one("cargo fetch"),
+        Ecosystem::Nuget => one("dotnet restore"),
+        Ecosystem::Golang | Ecosystem::Maven | Ecosystem::Deno => Vec::new(),
+    }
 }
 
 /// The "Next steps:" block that ends a wet agent-mode run (`get`,
@@ -2404,7 +2526,7 @@ pub(crate) fn next_steps(
     let has_file = |name: &str| project_root.join(name).is_file();
     let mut installs: Vec<&str> = ecosystems
         .iter()
-        .filter_map(|ecosystem| install_command(*ecosystem, &has_file))
+        .flat_map(|ecosystem| install_commands(*ecosystem, &has_file))
         .collect();
     installs.sort_unstable();
     installs.dedup();
@@ -2498,6 +2620,8 @@ mod tests {
             ("bun.lock", "pkg:npm/a@1", "bun install"),
             ("uv.lock", "pkg:pypi/a@1", "uv sync"),
             ("poetry.lock", "pkg:pypi/a@1", "poetry install"),
+            ("pixi.lock", "pkg:pypi/a@1", "pixi install"),
+            ("pixi.toml", "pkg:pypi/a@1", "pixi install"),
         ] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join(lock), "").unwrap();
@@ -2508,11 +2632,118 @@ mod tests {
             );
         }
 
+        // pixi keeps its own environments beside another tool's venv: both
+        // installs undo a patch.
+        let both = tempfile::tempdir().unwrap();
+        for file in ["uv.lock", "pixi.toml"] {
+            std::fs::write(both.path().join(file), "").unwrap();
+        }
+        let named = steps(&["pkg:pypi/a@1"], both.path());
+        assert!(
+            named[2].contains("after every `pixi install` and `uv sync`,"),
+            "{named:?}"
+        );
+
+        // A file pip installs from beside pixi's: pip fills the
+        // interpreter on `PATH`, which the crawl reads too.
+        let pip_too = tempfile::tempdir().unwrap();
+        for file in ["requirements.txt", "pixi.toml"] {
+            std::fs::write(pip_too.path().join(file), "").unwrap();
+        }
+        let named = steps(&["pkg:pypi/a@1"], pip_too.path());
+        assert!(
+            named[2].contains("after every `pip install` and `pixi install`,"),
+            "{named:?}"
+        );
+
         // No single install command: the step still says when to re-apply.
         let maven = steps(&["pkg:maven/g/a@1"], root);
         assert!(
             maven[2].contains("after every dependency install,"),
             "{maven:?}"
+        );
+    }
+
+    /// Agent mode records only what an installed copy can take. A compiled
+    /// conda build takes no PyPI patch, so its patch is left out with the
+    /// reason; a pure-Python conda build, a wheel uv installed into the
+    /// same environment, a package that is not installed and another
+    /// ecosystem's patch are all kept.
+    #[tokio::test]
+    async fn patches_no_conda_build_takes_are_left_out_of_an_agent_run() {
+        fn selection(purl: &str) -> PatchSearchResult {
+            PatchSearchResult {
+                uuid: "20000001-0000-4001-8001-000000000099".to_string(),
+                purl: purl.to_string(),
+                published_at: String::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: "free".to_string(),
+                vulnerabilities: HashMap::new(),
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(project.join("pixi.toml"), "[workspace]\n").unwrap();
+        let prefix = project.join(".pixi").join("envs").join("default");
+        std::fs::create_dir_all(prefix.join("conda-meta")).unwrap();
+        let site = if cfg!(windows) {
+            prefix.join("Lib").join("site-packages")
+        } else {
+            prefix.join("lib").join("python3.13").join("site-packages")
+        };
+        let install = |name: &str, version: &str, installer: &str, purelib: bool| {
+            let dist = site.join(format!("{name}-{version}.dist-info"));
+            std::fs::create_dir_all(&dist).unwrap();
+            std::fs::write(
+                dist.join("METADATA"),
+                format!("Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n"),
+            )
+            .unwrap();
+            std::fs::write(dist.join("INSTALLER"), format!("{installer}\n")).unwrap();
+            std::fs::write(
+                dist.join("WHEEL"),
+                format!("Wheel-Version: 1.0\nRoot-Is-Purelib: {purelib}\n"),
+            )
+            .unwrap();
+        };
+        install("pillow", "12.3.0", "conda", false);
+        install("certifi", "2026.7.22", "conda", true);
+        install("numpy", "2.4.4", "uv-pixi", false);
+
+        let compiled = "pkg:pypi/pillow@12.3.0?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl";
+        let kept = [
+            "pkg:npm/minimist@1.2.2",
+            "pkg:pypi/certifi@2026.7.22?artifact_id=py3-none-any-whl",
+            "pkg:pypi/numpy@2.4.4?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl",
+            "pkg:pypi/requests@2.33.1?artifact_id=py3-none-any-whl",
+        ];
+        let mut selected: Vec<PatchSearchResult> = kept.iter().map(|p| selection(p)).collect();
+        selected.insert(2, selection(compiled));
+        // The platform wheel's record of a release whose pure wheel's
+        // record is kept: left out too (a conda build is never a platform
+        // wheel), with nothing to report, since the package is patched.
+        selected.insert(
+            1,
+            selection(
+                "pkg:pypi/certifi@2026.7.22?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl",
+            ),
+        );
+        let options = CrawlerOptions {
+            cwd: project.to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        let (taken, refused) =
+            leave_out_patches_no_conda_build_takes(selected, &options, true).await;
+        let taken: Vec<&str> = taken.iter().map(|sr| sr.purl.as_str()).collect();
+        assert_eq!(taken, kept);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].starts_with("pkg:pypi/pillow@12.3.0")
+                && refused[0].contains(CONDA_BUILD_NOT_PYPI_RELEASE)
+                && refused[0].contains("compiled conda package"),
+            "{refused:?}"
         );
     }
 
