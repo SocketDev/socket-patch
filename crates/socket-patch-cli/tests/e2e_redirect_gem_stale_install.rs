@@ -41,7 +41,7 @@
 use std::path::{Path, PathBuf};
 
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
-use wiremock::matchers::{method, path, path_regex};
+use wiremock::matchers::{body_string_contains, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/mod.rs"]
@@ -2814,11 +2814,11 @@ async fn gem_hosted_scan_pins_platform_builds_from_the_lock_alone() {
 }
 
 /// A lock that names the gem only as platform builds, beside a plain
-/// gem, with a prebuild missing for one locked platform: no mode can
-/// patch the gem. The lock still resolves it, so the closing totals count
-/// its advisory as left to patch, in hosted mode (which reads the gem
-/// from the lock alone) and in vendored mode (which reads the installed
-/// platform copy).
+/// gem, and a patch without a patched build for every locked platform:
+/// the run refuses the gem. The lock still resolves it, so the closing
+/// totals count its advisory as left to patch, in hosted mode (which
+/// reads the gem from the lock alone) and in vendored mode (which reads
+/// the installed platform copy).
 #[tokio::test(flavor = "multi_thread")]
 async fn refused_platform_gem_is_counted_as_left_to_patch() {
     const LEFT: &str =
@@ -2827,9 +2827,20 @@ async fn refused_platform_gem_is_counted_as_left_to_patch() {
     for mode in ["hosted", "vendored"] {
         let server = MockServer::start().await;
         // The lookup names the advisory the patch fixes, as the service
-        // does: the totals count advisories.
+        // does (the totals count advisories), and only for a run that
+        // asks about the gem.
         Mock::given(method("POST"))
             .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "packages": [],
+                "canAccessPaidPatches": false,
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+            .and(body_string_contains(DEP))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "packages": [{
                     "purl": PURL,
@@ -2899,11 +2910,15 @@ async fn refused_platform_gem_is_counted_as_left_to_patch() {
             &[],
         );
         assert_eq!(code, 0, "{mode}\nstdout:\n{stdout}\nstderr:\n{stderr}");
-        // The premise: the run refused the gem for its missing prebuild.
+        // The premise: the run refused the gem for a platform the patch
+        // has no build for.
+        let refusal = match mode {
+            "hosted" => format!("no patched build for `{DEP} ({DEP_VERSION}-{OTHER_PLATFORM})`"),
+            _ => format!("the patch service has no prebuilt platform gem of `{DEP}`"),
+        };
         assert!(
-            format!("{stdout}{stderr}").contains(OTHER_PLATFORM),
-            "{mode}: the run names the platform it has no patched build for\nstdout:\n\
-             {stdout}\nstderr:\n{stderr}"
+            stderr.contains(&refusal),
+            "{mode}: the run refuses the gem\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert_eq!(
             std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),

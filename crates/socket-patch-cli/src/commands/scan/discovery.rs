@@ -85,8 +85,8 @@ pub(crate) async fn lockfile_supplement(
     if entries.is_empty() && platform_gems.is_empty() {
         return out;
     }
-    // Only a hosted run can patch a platform-only gem that has no
-    // installed copy, so only a hosted supplement fabricates one.
+    // Only a hosted supplement names a platform-only gem that has no
+    // installed copy (see above).
     let resolved = entries
         .iter()
         .map(|entry| entry.purl.as_str())
