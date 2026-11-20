@@ -73,6 +73,7 @@ use crate::formats::composer::{
     composer_lock_packages, ComposerLockPackage, ORIGIN_BOUND_ENTRY_KEYS,
 };
 
+pub mod bazel;
 mod lock_text;
 pub(super) mod mirror_filters;
 

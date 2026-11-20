@@ -2121,6 +2121,14 @@ async fn run_eject(
         if restore_refused.contains(&pin.purl) {
             continue;
         }
+        // A Composer project in a Bazel workspace: the refusal of the
+        // vendored run, asked before the eject touches anything.
+        if Ecosystem::from_purl(&pin.purl) == Some(Ecosystem::Composer) {
+            if let Some((code, detail)) = vendor::composer_lock::bazel::refusal(&common.cwd).await {
+                refused.push((pin.purl.clone(), code, format!("kept hosted: {detail}")));
+                continue;
+            }
+        }
         if let Some((code, detail)) = takeover_dry_refusal(
             &plan,
             &pin.purl,

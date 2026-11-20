@@ -23,7 +23,7 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 | Maven (`maven`) — Maven and Gradle | ✅ in place in every copy the build consumes: each `~/.m2` copy it reads and each Gradle `files-2.1` copy; `~/.m2` `.sha1`/`.md5` sidecars are rewritten, Gradle copies get advisories; jar-member records swap in the patch service's whole jar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) | ✅ suffixed Maven repository (`<version>-socket.<hex8>` pin + `.mvn/maven.config` + fallback file repository) for every pom root, single-module or reactor, or Gradle 6.8+ same-GAV repository with settings wiring and SHA-256 checks (a root with both `pom.xml` and a Gradle build wires both); see [JVM vendoring](design/maven-vendoring.md) and [Gradle](#gradle) | ✅ fail-closed by a Socket-only `<version>-socket.<hex8>` suffix: pom projects get a pinned `<version>` (`${property}` versions are refused); Gradle 6.8+ builds get an owned settings script, lock-entry rewrites and a resolution tripwire — see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) |
 | sbt / Mill / scala-cli (`maven`) | ✅ Coursier caches (sbt 1.3+, sbt 2, Mill, scala-cli) and Ivy caches (sbt 0.13–1.2, `useCoursier := false`) patched in place, Coursier checksum sidecars resynced — see [Scala build tools](#scala-build-tools-sbt-mill-scala-cli) | ✅ sbt 0.13.18+: generated `socket-patch-vendor.sbt` over the committed suffixed `.socket/vendor/maven2` tree; scala-cli directory builds: owned `socket-patch.scala` + same-GAV `.socket/vendor/coursier` tree (Linux / macOS); Mill: not wired (agent or hosted guidance) | ✅ sbt 0.13.18+: one generated `socket-patch.sbt`, gated on sbt's own `sbt update` records; Mill / scala-cli: paste-able snippets only (`redirect_mill_manual_snippet`, `redirect_scala_cli_manual_snippet`) |
 | NuGet (`nuget`) | ✅ in-place patching deletes `.nupkg.metadata` and advises on the `.nupkg.sha512` tamper-evidence sidecar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed folder feed (its `.gitignore` re-includes the nupkg against `*.nupkg` rules) + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats) |
-| Composer (`composer`) | ✅ in place (`vendor/`) | ✅ `composer.lock` `dist: path` rewrite | ✅ `composer.lock` dist url + shasum rewrite; the entry's `source` and `dist.mirrors` are removed. See [composer-compatibility.md](testing/composer-compatibility.md) |
+| Composer (`composer`) | ✅ in place (`vendor/`) | ✅ `composer.lock` `dist: path` rewrite; declined in a Bazel workspace, see [Bazel workspaces: Composer](#bazel-workspaces-composer) | ✅ `composer.lock` dist url + shasum rewrite; the entry's `source` and `dist.mirrors` are removed. See [composer-compatibility.md](testing/composer-compatibility.md) |
 | Deno (`deno`) | ✅ in place (the only mode for Deno) | ❌ refused (`vendor_unsupported_ecosystem`) | ❌ not supported |
 
 > **Maven / NuGet sidecar caveat**: Maven and NuGet are fully enabled in every mode.
@@ -2527,6 +2527,70 @@ Important limits:
 
 The implemented hosted shape and fresh-checkout behavior are exercised by
 [`e2e_golang_hosted_build.rs`](../crates/socket-patch-cli/tests/e2e_golang_hosted_build.rs).
+
+## Bazel workspaces: Composer
+
+No Bazel ruleset builds PHP or takes Composer packages, so a PHP project in a Bazel workspace
+brings its packages into the build with a few lines of its own: a repository rule or a genrule
+that runs `composer install` from the committed `composer.lock`, or a committed `vendor/` tree
+that Bazel reads as source files. Hosted mode patches the first two when Bazel runs the rule
+or the action again: Composer runs on the lock that socket-patch rewrote and fetches the
+patched archive. Agent mode patches the third.
+
+Vendored mode is declined there by default. It makes `composer.lock` name the patched copy by
+a path relative to the directory Composer runs in
+(`.socket/vendor/composer/<uuid>/<vendor>/<name>@<version>`). A rule or a build action runs
+Composer in a directory of Bazel's that holds `composer.json` and `composer.lock` and nothing
+else, so Composer fails with `Source path "..." is not found for package ...`, and the build
+fails with it, after a command that exited 0 (Bazel 9.3.2, 8.8.2 and 7.7.2). What a workspace's
+rules do with the lock cannot be read from its files: a rule may take the lock through a glob,
+or live in another module, and a committed `vendor/` tree does not show that no rule runs
+Composer somewhere else as well. So socket-patch does not try to.
+
+A project is in a Bazel workspace by the lookup of
+[Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore): its directory, or one above
+it up to the root of its git checkout, holds `MODULE.bazel`, `REPO.bazel`, `WORKSPACE` or
+`WORKSPACE.bazel`. There, every command that would vendor a Composer package reports the
+package `failed` with `vendor_composer_bazel_workspace` and exits 1: `scan --mode vendored`,
+`get --mode vendored`, `vendor`, and a `scan` or `get` with no `--mode` in a project that is
+already vendored, which runs in vendored mode. It writes nothing and downloads no patch, and a
+package that is pinned hosted stays pinned. With `--dry-run`, `scan` and `get` list the package
+as one the run would refuse and exit 0; `vendor --dry-run` reports the refusal and exits 1, as
+it does for any package it could not vendor. The message names the Bazel root and the mode
+that writes no such path: `--mode hosted`.
+
+Vendored mode goes on when you say so, with `--allow-vendored-in-bazel` or
+`SOCKET_ALLOW_VENDORED_IN_BAZEL=1`. That is for a project where Composer only runs in the
+project's directory, or where the build finds the copy all the same:
+
+- A project that Bazel does not build: a Dockerfile runs `composer install` in it.
+- A project that commits its `vendor/` tree, when no rule of the workspace installs from the
+  lock as well. The build is the patched one after your next `composer install` in the
+  project, which copies the package from `.socket/vendor`, as in a project without Bazel.
+- A project whose rule brings the project's `.socket` directory to where it runs Composer.
+
+socket-patch checks none of these. The switch is not Composer's alone: it lets vendored mode
+write for any package it would decline because the project is in a Bazel workspace, where the
+build may not find the vendored copy. The Composer refusal is the only such refusal today.
+
+`vendor --revert` is never declined. A project that was vendored with the flag, or by an
+earlier release, is declined again by a later vendored run without the flag, which changes
+nothing. A `scan` or `get` with no `--mode` is such a run in that project.
+
+Limits:
+
+- A project in a Bazel workspace that Bazel does not build, and one that commits its `vendor/`
+  tree, are declined like any other until they have the flag.
+- A Bazel root that the lookup does not reach (one above the git checkout, or above a project
+  that is in no checkout) is not seen, and vendored mode goes on there as before.
+- Hosted mode, which the message names, changes `composer.lock` and nothing else. It patches
+  the build when Bazel runs Composer on that lock again. A repository rule that links the lock
+  with `rctx.symlink` is not run again on Bazel 8 and 9 until its repository is fetched again,
+  and a workspace that takes the package without the lock (an `http_archive` of its archive)
+  never reads it: there the hosted run exits 0 and the build stays the unpatched one.
+
+[`e2e_bazel_build/composer.rs`](../crates/socket-patch-cli/tests/e2e_bazel_build/composer.rs)
+runs the three modes on a real Bazel.
 
 ## Ruby gems: hosted mode
 

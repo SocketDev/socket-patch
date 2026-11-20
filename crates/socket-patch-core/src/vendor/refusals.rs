@@ -22,7 +22,10 @@
 //!    resolve (`vendor_gem_version_not_locked`, which the callers report
 //!    as a skip);
 //! 6. a Maven version no module of the build selects
-//!    (`vendor_maven_version_not_selected`, a skip too).
+//!    (`vendor_maven_version_not_selected`, a skip too);
+//! 7. a Composer project in a Bazel workspace
+//!    (`vendor_composer_bazel_workspace`), unless the user allowed it
+//!    ([`ALLOW_IN_BAZEL_ENV`]).
 //!
 //! Each check lives in its backend's module; this one only dispatches and
 //! scopes them.
@@ -36,12 +39,18 @@ use crate::crawlers::Ecosystem;
 use crate::patch::redirect::upstream::HostedPin;
 use crate::utils::purl_key::PurlKey;
 use crate::vendor::state::{lookup_entry, VendorEntry};
-use crate::vendor::{bun_lock, gem, lock_inventory, npm_flavor, npm_lock, vlt_lock};
+use crate::vendor::{bun_lock, composer_lock, gem, lock_inventory, npm_flavor, npm_lock, vlt_lock};
 
 /// The vendor ledger as the refusals consume it: the caller's own load
 /// outcome, so an UNREADABLE ledger is a refusal the run can report
 /// instead of a silently empty ledger.
 pub type LedgerLoad<'a> = Result<&'a HashMap<String, VendorEntry>, &'a std::io::Error>;
+
+/// The binding of `--allow-vendored-in-bazel`, which the CLI mirrors the
+/// flag into: `1` or `true` lets vendored mode write for a package although
+/// the project is in a Bazel workspace, where the build may not find the
+/// vendored copy. Every refusal that rests on the workspace reads it.
+pub const ALLOW_IN_BAZEL_ENV: &str = "SOCKET_ALLOW_VENDORED_IN_BAZEL";
 
 /// Refusal codes that are expected skips, not command failures: the user's
 /// request is still fully satisfied when these are the only non-successes.
@@ -170,6 +179,15 @@ pub async fn vendor_refusals(
     }
     for (purl, (code, detail)) in maven_refusals(project_root, candidates).await {
         refuse(&mut out, &purl, code, &detail);
+    }
+    let composer = |purl: &str| Ecosystem::from_purl(purl) == Some(Ecosystem::Composer);
+    if candidates.iter().any(|(purl, _)| composer(purl)) {
+        // One answer for the project: the lock of every package is its.
+        if let Some((code, detail)) = composer_lock::bazel::refusal(project_root).await {
+            for (purl, _) in candidates.iter().filter(|(purl, _)| composer(purl)) {
+                refuse(&mut out, purl, code, &detail);
+            }
+        }
     }
     out
 }
@@ -420,6 +438,24 @@ mod tests {
 
     fn entry(json: serde_json::Value) -> VendorEntry {
         serde_json::from_value(json).unwrap()
+    }
+
+    /// A Composer project in a Bazel workspace: every Composer candidate
+    /// is refused with the one answer of the project, and no candidate of
+    /// another ecosystem is. Without the workspace file nothing is.
+    #[tokio::test]
+    async fn composer_candidates_in_a_bazel_workspace_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, other) = ("pkg:composer/a/b@1.0.0", "pkg:composer/c/d@2.0.0");
+        let pairs = [(one, UUID), (other, OTHER_UUID), ("pkg:pypi/x@1.0.0", UUID)];
+        let empty = HashMap::new();
+        assert!(run(tmp.path(), &pairs, Ok(&empty)).await.is_empty());
+        std::fs::write(tmp.path().join("MODULE.bazel"), "").unwrap();
+        let got = run(tmp.path(), &pairs, Ok(&empty)).await;
+        assert_eq!(got.keys().collect::<Vec<_>>(), [one, other]);
+        assert_eq!(got[one].code, "vendor_composer_bazel_workspace");
+        assert_eq!(got[one], got[other]);
+        assert!(!refusal_is_benign(got[one].code));
     }
 
     mod gem {
