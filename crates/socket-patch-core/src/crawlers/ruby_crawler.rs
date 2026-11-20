@@ -262,7 +262,8 @@ impl RubyCrawler {
                 // coordinate is a single path segment, so reject any that
                 // could traverse out of the gem root (`..`/`.`, a separator,
                 // an absolute path, NUL). `verify_gem_at_path` only checks
-                // for `lib/`/`.gemspec` and gems patch in place, so fail
+                // for `lib/`/`.gemspec` (in the dir, or the home's
+                // `specifications/`) and gems patch in place, so fail
                 // closed here — same as the deno/go/maven/npm/nuget guards.
                 if !path_safety::is_safe_name_version(name, version) {
                     continue;
@@ -1090,7 +1091,7 @@ impl RubyCrawler {
 
             // Parse name-version from directory name
             if let Some((name, version)) = Self::parse_dir_name_version(&dir_name_str) {
-                // Verify it looks like a gem (has .gemspec or lib/)
+                // Verify it looks like an installed gem
                 if !self.verify_gem_at_path(&gem_dir).await {
                     continue;
                 }
@@ -1114,34 +1115,11 @@ impl RubyCrawler {
         results
     }
 
-    /// Verify that a directory looks like an installed gem.
-    /// Checks for a `lib/` directory, a `.gemspec` file, or the gemspec
-    /// RubyGems installed for the dir in its gem home.
+    /// Verify that a directory looks like an installed gem
+    /// ([`verify_gem_at_path_sync`] on the blocking pool).
     async fn verify_gem_at_path(&self, path: &Path) -> bool {
-        if !is_dir(path).await {
-            return false;
-        }
-
-        // Check for lib/ directory
-        if is_dir(&path.join("lib")).await {
-            return true;
-        }
-
-        let copy = path.to_path_buf();
-        if run_blocking(move || home_lists_copy(&copy) == Some(true)).await {
-            return true;
-        }
-
-        // Check for any .gemspec file
-        for entry in list_dir_entries(path).await {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".gemspec") {
-                    return true;
-                }
-            }
-        }
-
-        false
+        let path = path.to_path_buf();
+        run_blocking(move || verify_gem_at_path_sync(&path)).await
     }
 
     /// Parse a gem directory name into its base `(name, version)`.
@@ -1313,22 +1291,21 @@ fn locate_gem_dirs_sync(
     dirs
 }
 
-/// Blocking twin of `RubyCrawler::verify_gem_at_path`: a directory holding
-/// `lib/` or a `.gemspec`, or one its gem home has a gemspec for.
+/// Whether `path` looks like an installed gem dir: it holds `lib/` or a
+/// `.gemspec`, or its gem home has `specifications/<leaf>.gemspec`.
 ///
 /// A gem need not ship either: `cassandra-web` packs `app.rb`, `app/` and
 /// `bin/` at its root, and RubyGems writes its spec only to
-/// `<home>/specifications/<leaf>.gemspec`. That spec is what RubyGems and
-/// Bundler load the gem by, so it proves the dir installed.
+/// `<home>/specifications/<leaf>.gemspec`, the file RubyGems and Bundler
+/// load the gem by. A spec under `specifications/default/` does not count:
+/// a default gem's `gems/<leaf>/` dir holds only its executables, while its
+/// code lives in Ruby's own lib dir.
 fn verify_gem_at_path_sync(path: &Path) -> bool {
     use crate::utils::fs::is_dir_sync;
     if !is_dir_sync(path) {
         return false;
     }
-    if is_dir_sync(&path.join("lib")) {
-        return true;
-    }
-    if home_lists_copy(path) == Some(true) {
+    if is_dir_sync(&path.join("lib")) || home_installed_spec(path) {
         return true;
     }
     super::listing::list_dir_sync(path).iter().any(|entry| {
@@ -1609,6 +1586,23 @@ fn home_lists_copy(copy: &Path) -> Option<bool> {
         }
     }
     listed
+}
+
+/// Whether the gem home of the gem dir `<home>/gems/<leaf>` has the
+/// installed (non-default) gemspec `specifications/<leaf>.gemspec`.
+fn home_installed_spec(copy: &Path) -> bool {
+    let (Some(leaf), Some(gems)) = (copy.file_name(), copy.parent()) else {
+        return false;
+    };
+    if gems.file_name() != Some(OsStr::new("gems")) {
+        return false;
+    }
+    let Some(home) = gems.parent() else {
+        return false;
+    };
+    let mut spec = leaf.to_os_string();
+    spec.push(".gemspec");
+    home.join("specifications").join(spec).is_file()
 }
 
 /// Whether a standalone bundle's `bundler/setup.rb` names the gem dir
@@ -6607,9 +6601,10 @@ mod tests {
     /// A tampered manifest PURL whose name carries `..` must not resolve
     /// to a directory outside the gem root. `locate_gem_dirs_sync` joins
     /// `<name>-<version>` straight onto `gem_path`, and
-    /// `verify_gem_at_path` only checks for `lib/`/`.gemspec`, so without
-    /// a coordinate gate `pkg:gem/../outside@1.0.0` escapes the gem store
-    /// and the patch applies in place out of tree.
+    /// `verify_gem_at_path` only checks for `lib/`/`.gemspec` (in the dir,
+    /// or the home's `specifications/`), so without a coordinate gate
+    /// `pkg:gem/../outside@1.0.0` escapes the gem store and the patch
+    /// applies in place out of tree.
     #[tokio::test]
     async fn find_by_purls_rejects_traversal_coordinates() {
         let dir = tempfile::tempdir().unwrap();
@@ -6827,7 +6822,8 @@ mod tests {
     /// A gem that ships neither `lib/` nor a `.gemspec` (`cassandra-web`:
     /// `app.rb`, `app/`, `bin/` at its root) is installed when its gem home
     /// has `specifications/<leaf>.gemspec`, for the PURL lookup and the
-    /// scan alike; without that spec the dir is still no gem.
+    /// scan alike; without that spec, or with only a
+    /// `specifications/default/` one, the dir is still no gem.
     #[tokio::test]
     async fn verify_gem_lib_less_dir_listed_by_its_home_spec() {
         let home = tempfile::tempdir().unwrap();
@@ -6845,6 +6841,18 @@ mod tests {
             global: false,
             global_prefix: Some(gems.clone()),
         };
+        assert!(!crawler.verify_gem_at_path(&gem_dir).await);
+        assert!(crawler.find_by_purls(&gems, &purls).await.unwrap().is_empty());
+        assert!(crawler.crawl_all(&options).await.is_empty());
+
+        // A default gem's spec does not make its executables-only dir a copy.
+        tokio::fs::create_dir_all(specs.join("default")).await.unwrap();
+        tokio::fs::write(
+            specs.join("default").join("cassandra-web-0.5.0.gemspec"),
+            b"# default spec",
+        )
+        .await
+        .unwrap();
         assert!(!crawler.verify_gem_at_path(&gem_dir).await);
         assert!(crawler.find_by_purls(&gems, &purls).await.unwrap().is_empty());
         assert!(crawler.crawl_all(&options).await.is_empty());
