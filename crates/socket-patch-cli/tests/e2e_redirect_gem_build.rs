@@ -7239,10 +7239,22 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
                     && !stdout.contains("upstream_gem_stale_install"),
                 "{command}: the copy is refreshed, and nothing is left patched:\n{stdout}"
             );
+            // Both commands report a vendored unwind's advisories as events.
+            let env: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|e| panic!("{command}: not JSON: {e}\nstdout:\n{stdout}"));
+            let named: Vec<String> = env["events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|e| e["errorCode"] == "upstream_gem_stale_cache")
+                .map(|e| e.to_string())
+                .collect();
+            assert_eq!(named.len(), 1, "{command}: one stale-cache warning: {env}");
             assert!(
-                stdout.contains("upstream_gem_stale_cache")
-                    && stdout.contains(&cached.display().to_string()),
-                "{command}: the patched platform archive in the cache dir is named:\n{stdout}"
+                named[0].contains(&cached.display().to_string())
+                    && named[0].contains("non-upstream"),
+                "{command}: the patched platform archive in the cache dir is named: {}",
+                named[0]
             );
         }
     }

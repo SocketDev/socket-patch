@@ -1114,7 +1114,7 @@ async fn stale_cache_warning(
 /// archive, and that of each platform build the lock names (a gem vendored
 /// from prebuilt platform gems is back on its platform entries, #2174),
 /// against the lock's `CHECKSUMS` entry, else the rubygems.org compact
-/// index (unless `offline`). A build locked from another remote with no
+/// index (unless `offline`). A gem locked from another remote with no
 /// `CHECKSUMS` sha can't be judged, and is most likely a private gem cached
 /// on purpose: no warning.
 pub(super) async fn unwound_stale_cache(
@@ -1145,15 +1145,22 @@ pub(super) async fn unwound_stale_cache(
                 .map(GemId::token),
         );
     }
+    // A gem none of whose builds the lock pins a sha256 for or resolves
+    // from rubygems.org is not judged. One that is has its ruby-platform
+    // archive judged too, whether or not the lock names that build: the
+    // hosted restore does the same, and bundler takes the archive as soon
+    // as the `ruby` platform is added back.
+    if let Some(text) = &lock {
+        let judged = |token: &String| {
+            lock_checksum(text, &name, token).is_some() || rubygems_locked(text, &name, token)
+        };
+        if !tokens.iter().any(judged) {
+            return Vec::new();
+        }
+    }
     let client = UpstreamClient::new(offline);
     let mut warnings = Vec::new();
     for token in tokens {
-        if let Some(text) = &lock {
-            if lock_checksum(text, &name, &token).is_none() && !rubygems_locked(text, &name, &token)
-            {
-                continue;
-            }
-        }
         warnings
             .extend(stale_cache_warning(root, purl, &name, &token, lock.as_deref(), &client).await);
     }
@@ -3090,7 +3097,8 @@ mod tests {
     /// platform entries, and `bundle cache` keeps each build under
     /// `<name>-<version>-<platform>.gem`. The patched archive of a locked
     /// platform build is named; an upstream one, and the archive of a
-    /// build the lock does not name, are not.
+    /// platform build the lock does not name, are not. A ruby-platform
+    /// archive is judged beside them, as the hosted restore judges it.
     #[tokio::test]
     async fn vendored_unwind_names_a_patched_platform_archive() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3126,6 +3134,20 @@ mod tests {
             "{hits:?}"
         );
         assert!(hits[0].1.contains("non-upstream"), "{hits:?}");
+
+        // The lock pins no sha256 for the ruby-platform gem, and the run is
+        // offline: its archive is named as unchecked, beside the platform's.
+        let ruby = cache.join("nokogiri-1.18.10.gem");
+        std::fs::write(&ruby, b"patched gem").unwrap();
+        let hits = unwound_stale_cache(tmp.path(), "pkg:gem/nokogiri@1.18.10", true).await;
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(
+            hits.iter().any(|(_, detail)| {
+                detail.contains(&format!("{},", ruby.display()))
+                    && detail.contains("could not be checked")
+            }),
+            "{hits:?}"
+        );
     }
 
     /// #1594: an upstream archive, or none at all, is healthy.
