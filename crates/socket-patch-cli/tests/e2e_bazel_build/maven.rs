@@ -40,6 +40,13 @@
 //!   (`maven_bazel_no_effect`), and the build prints that target's marker
 //!   before and after.
 //!
+//! - [`a_vendored_patch_in_a_tree_only_bazel_builds`]: vendored mode in the
+//!   checkout without a `pom.xml`. `socket-patch get <purl> --mode vendored
+//!   --yes` fails (exit 1, `vendor_jvm_shape_unsupported`: no Maven, Gradle,
+//!   sbt or scala-cli build is there to pin), says that the hub builds the
+//!   upstream jar (`maven_bazel_hub_unpatched`) and writes no file: the
+//!   build prints the upstream marker before and after.
+//!
 //! A command that writes the block gives no warning. One that does not
 //! gives one, in the place of "no pom.xml", with the reason and the words
 //! that the Bazel build keeps the upstream jar. The lock each ruleset
@@ -87,14 +94,17 @@
 use std::io::Write as _;
 use std::time::Instant;
 
+use base64::Engine as _;
+
 use serde_json::{json, Value};
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use socket_patch_core::bazel::maven::{Lock, Pinned as Jar};
+use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes as git_sha256;
 
 use crate::envelope::event_for;
 use crate::harness::{changed, rewrite, Cell, Fixture, Ran, StandIn, Tree, CONSUMER, NOTHING};
-use crate::hosted_memory_common::Patch;
+use crate::hosted_memory_common::{Patch, ORG};
 
 /// The workspace the tests build, and the ruleset each Bazel release
 /// builds it with. One era per way the ruleset names an artifact's
@@ -228,6 +238,9 @@ struct Granted {
     /// stand-in.
     url: String,
     route: String,
+    /// The route of the same jar as vendored mode downloads it: the path of
+    /// the grant's own URL for it on the patch host.
+    archive: String,
     /// What `//:consumer` prints with the patched jar.
     marker: String,
 }
@@ -237,7 +250,11 @@ struct Granted {
 /// registry, the version with the suffix only that registry serves. The
 /// route of the jar answers with `tampered`, or with the jar the grant
 /// pins.
-fn grant(standin: &StandIn, tampered: Option<&[u8]>) -> Granted {
+///
+/// Vendored mode downloads that jar from the grant's own URL for it, whose
+/// host a flow sends to the stand-in, and holds it to the record of the
+/// patch: the one file that differs from the jar of the run `run`.
+fn grant(standin: &StandIn, run: &str, tampered: Option<&[u8]>) -> Granted {
     let uuid = uuid::Uuid::new_v4().to_string();
     let token = uuid::Uuid::new_v4().to_string();
     let suffixed = format!("{VERSION}-socket.{}", &uuid[..8]);
@@ -246,9 +263,12 @@ fn grant(standin: &StandIn, tampered: Option<&[u8]>) -> Granted {
     let file = repo_path(VICTIM, &suffixed, "jar");
     let route = format!("/{registry}/{file}");
     standin.serve(5, &route, tampered.unwrap_or(&jar));
-    let artifact = format!(
-        "https://{PATCH_HOST}/patch/maven/{GROUP}/{VICTIM}/{VERSION}/{token}/{uuid}/{VICTIM}-{suffixed}.jar"
-    );
+    let archive =
+        format!("/patch/maven/{GROUP}/{VICTIM}/{VERSION}/{token}/{uuid}/{VICTIM}-{suffixed}.jar");
+    standin.serve(5, &archive, &jar);
+    let artifact = format!("https://{PATCH_HOST}{archive}");
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let sha512 = format!("sha512-{}", b64(&Sha512::digest(&jar)));
     let reference = json!({
         "status": "granted",
         "url": artifact,
@@ -256,7 +276,7 @@ fn grant(standin: &StandIn, tampered: Option<&[u8]>) -> Granted {
         "artifacts": [{
             "kind": "tarball",
             "url": artifact,
-            "integrity": { "sha256": sha256_hex(&jar) },
+            "integrity": { "sha256": sha256_hex(&jar), "sha512": sha512 },
         }],
         "registryOverride": {
             "kind": "maven2",
@@ -276,10 +296,31 @@ fn grant(standin: &StandIn, tampered: Option<&[u8]>) -> Granted {
         uuid: uuid.clone(),
         reference,
     }]);
+    let (upstream, patched) = (format!("PRISTINE {run}\n"), format!("PATCHED {uuid}\n"));
+    let record = json!({
+        "uuid": uuid,
+        "purl": PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": { MARKER: {
+            "beforeHash": git_sha256(upstream.as_bytes()),
+            "afterHash": git_sha256(patched.as_bytes()),
+            "blobContent": b64(patched.as_bytes()),
+            "beforeBlobContent": b64(upstream.as_bytes()),
+        }},
+        "vulnerabilities": { "GHSA-test-aaaa-bbbb": {
+            "cves": ["CVE-2024-0001"], "summary": "s", "severity": "high", "description": "d",
+        }},
+        "description": "fixture",
+        "license": "MIT",
+        "tier": "free",
+    });
+    let view = format!("/v0/orgs/{ORG}/patches/view/{uuid}");
+    standin.serve(1, &view, record.to_string().as_bytes());
     Granted {
         sha256: sha256_hex(&jar),
         url: format!("https://{registry}/{file}"),
         route,
+        archive,
         marker: format!("OUT: PATCHED {uuid}"),
         uuid,
     }
@@ -378,7 +419,7 @@ impl Pinned {
             &jar(&[]),
             Some((VICTIM, VERSION)),
         );
-        let patch = grant(&standin, None);
+        let patch = grant(&standin, &run, None);
 
         // The checkout: the hub's repository is the stand-in, the lock is
         // the empty file the ruleset's documentation starts from.
@@ -477,6 +518,14 @@ impl Pinned {
         cell.socket_patch(&standin.origin(), args, &env)
     }
 
+    /// `socket-patch <args>` for a command of vendored mode, which downloads
+    /// the patched jar from the URL the grant has for it on the patch host:
+    /// that host is the stand-in here.
+    fn vendored(&self, args: &[&str]) -> Ran {
+        let origin = self.standin.origin();
+        self.socket_patch(&[args, &["--patch-server-url", &origin]].concat())
+    }
+
     /// The command where it writes no entry for the hub, in a tree without
     /// `pom.xml`: it reports the patch skipped, gives one warning, `code`
     /// with the reason `why` and the words that the Bazel build keeps the
@@ -563,7 +612,7 @@ impl Pinned {
         let mut twin = self.cell.twin();
         let rogue = StandIn::start();
         let tampered = victim("TAMPERED");
-        let other = grant(&rogue, Some(&tampered));
+        let other = grant(&rogue, &self.run, Some(&tampered));
         let host = format!("{PATCH_HOST}/");
         twin.route_downloads(&[
             rewrite(&host, &rogue.origin()),
@@ -793,6 +842,81 @@ fn a_version_bump_of_the_patched_artifact() {
         "{test}: Bazel {} built {:?}; after `get --mode hosted` and the checkout's bump to \
          1.11.0 the relock passed and the build stopped at {at} ({stops}); `rollback {PURL}` \
          took the entry out and the build printed {bumped:?}; {:?}",
+        flow.cell.release(),
+        flow.upstream,
+        flow.started.elapsed()
+    );
+}
+
+/// The command of vendored mode, and what it says today of a patch whose
+/// jar only a hub builds.
+const VENDORED: [&str; 5] = ["get", PURL, "--mode", "vendored", "--yes"];
+const NO_BUILD: &str = "reason: no_build_file: no pom.xml, Gradle, sbt or scala-cli build at the \
+                        project root";
+
+/// Vendored mode in a checkout that only Bazel builds: the command fails
+/// for want of a Maven or Gradle build to pin, says that the hub builds
+/// the upstream jar, and leaves every file and the build as they were.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn a_vendored_patch_in_a_tree_only_bazel_builds() {
+    let test = "maven::a_vendored_patch_in_a_tree_only_bazel_builds";
+    let Some(flow) = Pinned::open(test, false, &|_, _| {}) else {
+        return;
+    };
+    flow.builds_upstream();
+    let before = flow.names_its_bazel();
+
+    let get = flow.vendored(&VENDORED);
+    let said = &get.dump;
+    assert_eq!(get.code, 1, "{test}: {said}");
+    let events = get.envelope["events"].as_array().expect("events");
+    let failed = events.iter().find(|event| event["action"] == "failed");
+    let failed = failed.unwrap_or_else(|| panic!("{test}: nothing failed: {said}"));
+    assert_eq!(
+        (&failed["purl"], &failed["errorCode"], &failed["error"]),
+        (
+            &json!(PURL),
+            &json!("vendor_jvm_shape_unsupported"),
+            &json!(NO_BUILD)
+        ),
+        "{test}: {said}"
+    );
+    assert_eq!(get.envelope["summary"]["applied"], 0, "{test}: {said}");
+    let warnings = get.envelope["warnings"].as_array().expect("warnings");
+    let [warning] = &warnings[..] else {
+        panic!("{test}: not one warning: {said}");
+    };
+    let detail = warning["detail"].as_str().unwrap_or_default();
+    let unpatched =
+        format!("{PURL}: Bazel takes this artifact from maven_install.json (hub \"{HUB}\", ");
+    assert_eq!(
+        warning["code"], "maven_bazel_hub_unpatched",
+        "{test}: {said}"
+    );
+    assert!(
+        detail.starts_with(&unpatched) && detail.contains("the Bazel build stays unpatched"),
+        "{test}: {said}"
+    );
+    assert_eq!(
+        changed(&before, &flow.cell.tree()),
+        NOTHING,
+        "{test}: {said}"
+    );
+    for route in [&flow.patch.route, &flow.patch.archive] {
+        let asked = flow.standin.asked(route);
+        assert_eq!(asked, 0, "{test}: the command fetched {route}");
+    }
+
+    // The build is the one of before, and the undo of vendored mode has
+    // nothing to take out.
+    flow.cell.builds(&flow.upstream);
+    let undo = flow.vendored(&["vendor", "--revert", "--yes"]);
+    assert_eq!(undo.code, 0, "{test}: {}", undo.dump);
+    assert_eq!(changed(&before, &flow.cell.tree()), NOTHING, "{test}");
+    println!(
+        "{test}: Bazel {} built {:?} before and after `get --mode vendored` failed for {PURL} \
+         (vendor_jvm_shape_unsupported) and wrote nothing; {:?}",
         flow.cell.release(),
         flow.upstream,
         flow.started.elapsed()
