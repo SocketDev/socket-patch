@@ -213,6 +213,7 @@ pub use crate::origin::{
     VendorRef,
 };
 
+pub(crate) mod bazel_maven;
 pub(crate) mod bun;
 pub(crate) mod cargo;
 pub(crate) mod composer;
@@ -2059,6 +2060,7 @@ async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
     maven::extract(&ctx, &mut out).await;
     gradle::extract(&ctx, &mut out).await;
     sbt::extract(&ctx, &mut out).await;
+    bazel_maven::extract(&ctx, &mut out).await;
     ctx.ecosystem = "nuget";
     nuget::extract(&ctx, &mut out).await;
     ctx.ecosystem = "deno";

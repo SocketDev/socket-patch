@@ -21,11 +21,12 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use socket_patch_core::api::client::ApiClient;
+use socket_patch_core::bazel::built::{unbuilt, Patched, Unbuilt};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated, TelemetryAuth};
 use socket_patch_core::vex::verify::{npm_manifest_after_hash, DEPENDENCY_NOT_INSTALLED};
 use socket_patch_core::vex::{
-    build_document_with, detect_product, Attested, BuildOptions, Document, FailedPatch,
+    build_document_with, detect_product, Attested, BuildOptions, Document, FailedPatch, Status,
     VendorContext, VerifyOutcome, NOT_VERIFIED_SUFFIX,
 };
 
@@ -90,6 +91,18 @@ pub struct VexArgs {
     )]
     pub no_verify: bool,
 
+    /// Describe what the package manager installed, and do not read a Bazel
+    /// workspace: no package is attested as affected because a Bazel hub
+    /// builds it from a lock without the patch. Use this when what you ship
+    /// is the installed tree, not what Bazel builds.
+    #[arg(
+        long = "no-bazel",
+        env = "SOCKET_VEX_NO_BAZEL",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
+    pub no_bazel: bool,
+
     /// Override the document `@id`. Default is `urn:uuid:<random v4>`,
     /// regenerated on every invocation. Pin this to get a reproducible
     /// doc identifier across runs.
@@ -143,6 +156,18 @@ pub struct VexEmbedArgs {
     )]
     pub vex_no_verify: bool,
 
+    /// Have the VEX document describe what the package manager installed,
+    /// without reading a Bazel workspace: no package is attested as affected
+    /// because a Bazel hub builds it from a lock without the patch. See
+    /// `socket-patch vex --no-bazel`.
+    #[arg(
+        long = "vex-no-bazel",
+        env = "SOCKET_VEX_NO_BAZEL",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
+    pub vex_no_bazel: bool,
+
     /// Pin the VEX document `@id`. See `socket-patch vex --doc-id`.
     #[arg(long = "vex-doc-id", env = "SOCKET_VEX_DOC_ID")]
     pub vex_doc_id: Option<String>,
@@ -171,6 +196,7 @@ impl VexEmbedArgs {
             output: self.vex.clone(),
             product: self.vex_product.clone(),
             no_verify: self.vex_no_verify,
+            no_bazel: self.vex_no_bazel,
             doc_id: self.vex_doc_id.clone(),
             compact: self.vex_compact,
             assume_applied: Vec::new(),
@@ -196,6 +222,9 @@ pub(crate) struct VexBuildParams {
     pub output: Option<PathBuf>,
     pub product: Option<String>,
     pub no_verify: bool,
+    /// The document is about what the package manager installed: the Bazel
+    /// workspace of the project is not read ([`unbuilt_by_bazel`]).
+    pub no_bazel: bool,
     pub doc_id: Option<String>,
     pub compact: bool,
     /// In-run `scan --mode hosted --vex` only: the PURLs whose lockfile rewrite
@@ -281,6 +310,8 @@ impl VexBuildParams {
 /// Successful result of [`generate_vex`].
 pub(crate) struct VexWriteSummary {
     pub statements: usize,
+    /// How many of them say `affected` ([`unbuilt_by_bazel`]).
+    pub affected: usize,
     pub failed: Vec<FailedPatch>,
     /// The built document — returned so the standalone `vex` command can
     /// emit its per-subcomponent envelope without rebuilding.
@@ -387,6 +418,7 @@ pub async fn run(args: VexArgs) -> i32 {
         output: output.clone(),
         product: args.product.clone(),
         no_verify: args.no_verify,
+        no_bazel: args.no_bazel,
         doc_id: args.doc_id.clone(),
         compact: args.compact,
         assume_applied: Vec::new(),
@@ -416,14 +448,15 @@ pub async fn run(args: VexArgs) -> i32 {
             if args.common.json {
                 emit_envelope_success(&summary, params.dry_run);
             } else if !args.common.silent {
+                let count = summary.statements;
                 match &output {
                     Some(path) if summary.wrote_file => {
-                        println!("{}", format_vex_written(summary.statements, path));
+                        println!("{}", format_vex_written(count, summary.affected, path));
                     }
                     Some(path) => {
-                        println!("{}", format_vex_dry_run(summary.statements, path));
+                        println!("{}", format_vex_dry_run(count, summary.affected, path));
                     }
-                    None => eprintln!("{}", format_vex_emitted(summary.statements)),
+                    None => eprintln!("{}", format_vex_emitted(count, summary.affected)),
                 }
             }
             0
@@ -505,12 +538,23 @@ fn format_manifest_not_found_hint(message: &str, manifest_path: &str) -> String 
     }
 }
 
+/// ` (1 affected)`, after the count of statements in each line below, for
+/// a document in which that many of them say `affected`. Nothing for a
+/// document of `not_affected` statements alone.
+pub(crate) fn affected_note(affected: usize) -> String {
+    match affected {
+        0 => String::new(),
+        affected => format!(" ({affected} affected)"),
+    }
+}
+
 /// `Wrote OpenVEX document with 1 statement to out.json` — the one-line
 /// summary after writing a document to a file.
-pub(crate) fn format_vex_written(statements: usize, path: &Path) -> String {
+pub(crate) fn format_vex_written(statements: usize, affected: usize, path: &Path) -> String {
     format!(
-        "Wrote OpenVEX document with {} to {}",
+        "Wrote OpenVEX document with {}{} to {}",
         plural(statements, "statement", "statements"),
+        affected_note(affected),
         path.display()
     )
 }
@@ -533,19 +577,21 @@ pub(crate) fn format_vex_nothing_to_attest() -> String {
 }
 
 /// The `--dry-run` twin of [`format_vex_written`]: nothing was written.
-pub(crate) fn format_vex_dry_run(statements: usize, path: &Path) -> String {
+pub(crate) fn format_vex_dry_run(statements: usize, affected: usize, path: &Path) -> String {
     format!(
-        "[dry-run] Would write OpenVEX document with {} to {}",
+        "[dry-run] Would write OpenVEX document with {}{} to {}",
         plural(statements, "statement", "statements"),
+        affected_note(affected),
         path.display()
     )
 }
 
 /// The stderr summary after the document went to stdout.
-pub(crate) fn format_vex_emitted(statements: usize) -> String {
+pub(crate) fn format_vex_emitted(statements: usize, affected: usize) -> String {
     format!(
-        "Emitted {}",
-        plural(statements, "VEX statement", "VEX statements")
+        "Emitted {}{}",
+        plural(statements, "VEX statement", "VEX statements"),
+        affected_note(affected)
     )
 }
 
@@ -1293,6 +1339,13 @@ async fn generate_vex(
         outcome.applied = kept;
     }
 
+    // What the checks above verified is what the project's own package
+    // manager uses. Where a Bazel hub builds the package from a lock, that
+    // is another copy, and the last word: every form of the command comes
+    // through here, `--no-verify` and the in-run ones included. A run told
+    // that the installed tree is what ships (`--no-bazel`) skips the step.
+    let affected = unbuilt_by_bazel(&mut outcome, &plan, common, params, warnings).await;
+
     // The plan's gate omissions (record_unavailable / record_mismatch /
     // vendor_unwired / redirect_unwired / wiring_conflict) join the omission
     // channel so they surface as per-purl `skipped` events like any
@@ -1408,6 +1461,7 @@ async fn generate_vex(
             // A package no installed build of which holds any file of
             // its patch: not affected because the code is not there.
             code_not_present: &outcome.code_not_present,
+            affected: &affected,
         },
         &opts,
     ) {
@@ -1507,8 +1561,10 @@ async fn generate_vex(
     )
     .await;
 
+    let says_affected = |st: &&socket_patch_core::vex::Statement| st.status == Status::Affected;
     Ok(VexWriteSummary {
         statements: doc.statements.len(),
+        affected: doc.statements.iter().filter(says_affected).count(),
         failed: outcome.failed,
         doc,
         warnings: Vec::new(),
@@ -1834,6 +1890,124 @@ async fn withhold_stale_go_tools(
             purl,
             reason: GO_INSTALLED_TOOL_STALE.to_string(),
         }));
+}
+
+/// Run warning: the files of the project's Bazel workspace show that Bazel
+/// builds the package from a file that does not hold the patch, so the
+/// document says `affected` of it.
+const BAZEL_NOT_IN_BUILD: &str = "vex_bazel_not_in_build";
+
+/// The `reason` of the `skipped` event `vex --json` reports for a package
+/// of such a statement.
+const AFFECTED_REASON: &str = "attested as affected, not as patched: Bazel does not build the \
+    patched copy of this package; the run warning names what it builds from";
+
+/// The closing sentence of the action statement, and so of the run warning,
+/// of a package that is affected because its patch is in the installed copy
+/// alone.
+const INSTALLED_TREE_SHIPS: &str = "If what you ship is the installed tree and not what Bazel \
+    builds, pass `--no-bazel` (`--vex-no-bazel` on scan, apply and vendor).";
+
+/// In a Bazel workspace, a hub of aspect_rules_js, rules_python or
+/// rules_ruby builds a package from the lock a workspace file names, never
+/// from the copy a package manager installed, and rules_python builds
+/// nothing from a line that points at a copy under `.socket/vendor`
+/// ([`socket_patch_core::bazel::built`]). A patch that is only in such a
+/// copy is in no build of Bazel's, so its package is not attested as
+/// patched: it leaves `outcome.applied` and is returned with what to do
+/// about it, for statements that say `affected`
+/// ([`build_document_with_affected`]). A run warning tells a person the
+/// same. Nothing is omitted for this, so a document is always written.
+/// The package also leaves `outcome.vendored_out_of_sync`: that warning
+/// says the attestation is based on the committed copy and to install
+/// again, where the statement now says to revert the copy.
+///
+/// A hosted pin is left alone, and so is everything outside a Bazel
+/// workspace, in a `--global` run, or behind workspace files that cannot
+/// be read with certainty: the statement stays the one of a project
+/// without Bazel. So is a patch whose record names no advisory: no run
+/// writes a statement for it, and it is left out for that reason alone.
+///
+/// With `--no-bazel` / `--vex-no-bazel` (`params.no_bazel`) the user has
+/// said that the document is about the installed tree, which is what the
+/// repository ships, and not about what Bazel builds: the step returns
+/// before it opens a file, and the run is the one of the same checkout
+/// without its Bazel files.
+///
+/// One project is asked about, `common.cwd`: it is where the installed
+/// copies were looked for, and it is the manifest's project, whose files
+/// the pins of a vendored copy are from. `vex` runs in that project, and
+/// every host command refuses a `--manifest-path` in another one.
+async fn unbuilt_by_bazel(
+    outcome: &mut VerifyOutcome,
+    plan: &Plan,
+    common: &GlobalArgs,
+    params: &VexBuildParams,
+    warnings: &mut Vec<RunWarning>,
+) -> Vec<(String, String)> {
+    if params.no_bazel || common.is_global() {
+        return Vec::new();
+    }
+    let patched = |purl: &String| {
+        let record = plan.view.patches.get(purl)?;
+        let judged = !plan.hosted.contains_key(purl) && !record.vulnerabilities.is_empty();
+        judged.then(|| Patched {
+            purl: purl.clone(),
+            uuid: record.uuid.clone(),
+            pins: plan.vendor_pins.get(purl).cloned(),
+        })
+    };
+    let mut packages: Vec<Patched> = outcome.applied.iter().filter_map(patched).collect();
+    // The applied set is in the order of a hash map: warn in one order.
+    packages.sort_by(|a, b| a.purl.cmp(&b.purl));
+    let calls = unbuilt(&common.cwd, packages.clone()).await;
+    let mut affected = Vec::new();
+    for (package, call) in packages.into_iter().zip(calls) {
+        let Some(call) = call else { continue };
+        let action = bazel_build_action(&package, &call);
+        let detail = format!("{}: the VEX document says affected. {action}", package.purl);
+        note_warning(warnings, common, BAZEL_NOT_IN_BUILD, detail);
+        outcome.applied.retain(|purl| *purl != package.purl);
+        let drifted = &mut outcome.vendored_out_of_sync;
+        drifted.retain(|purl| *purl != package.purl);
+        affected.push((package.purl, action));
+    }
+    affected
+}
+
+/// The action statement for `package`, whose patch Bazel does not build:
+/// what `call` builds the package from, and what to run so that the build
+/// holds the patch. Hosted mode pins a patch in the lock of the project it
+/// runs in, so the remedy names the directory of the lock.
+///
+/// For an installed copy it ends with the way out of a repository that
+/// ships the installed tree and keeps the hub for something else: the
+/// option, in both spellings, since the statement is the same whichever
+/// command wrote the document. Not for a committed PyPI copy: there the
+/// build is broken or takes the registry's package, and the installed tree
+/// is not the patched one either.
+fn bazel_build_action(package: &Patched, call: &Unbuilt) -> String {
+    let Patched { uuid, pins, .. } = package;
+    let Unbuilt {
+        call: tag,
+        file,
+        line,
+        lock,
+    } = call;
+    match pins {
+        None => format!(
+            "Bazel builds this package from {lock} (`{tag}`, {file}:{line}), which does not \
+             name Socket patch {uuid}: the patch is only in the installed copy. Run \
+             `socket-patch scan --mode hosted` in the directory of that lock to pin the patch \
+             there. {INSTALLED_TREE_SHIPS}"
+        ),
+        Some(_) => format!(
+            "Bazel builds no package from the line of {lock} that points at the copy of Socket \
+             patch {uuid} under .socket/vendor (`{tag}`, {file}:{line}): the build fails, or \
+             takes the registry's package. Run `socket-patch vendor --revert`, then \
+             `socket-patch scan --mode hosted`."
+        ),
+    }
 }
 
 /// The `vendored_tree_out_of_sync` detail for `purl`. `copies` are the
@@ -2685,15 +2859,19 @@ fn emit_envelope_success(summary: &VexWriteSummary, dry_run: bool) {
     for st in &summary.doc.statements {
         for prod in &st.products {
             for sub in &prod.subcomponents {
-                env.record(
-                    PatchEvent::new(PatchAction::Verified, sub.id.clone()).with_details(
-                        serde_json::json!({
-                            "vulnerability": st.vulnerability.name,
-                            "aliases": st.vulnerability.aliases,
-                            "status": "not_affected",
-                        }),
-                    ),
-                );
+                // A package the document says is affected is not reported
+                // as verified, nor counted as such: it is skipped, like a
+                // patch the document leaves out, under its own code.
+                let event = match st.status {
+                    Status::Affected => PatchEvent::new(PatchAction::Skipped, sub.id.clone())
+                        .with_reason(BAZEL_NOT_IN_BUILD, AFFECTED_REASON),
+                    _ => PatchEvent::new(PatchAction::Verified, sub.id.clone()),
+                };
+                env.record(event.with_details(serde_json::json!({
+                    "vulnerability": st.vulnerability.name,
+                    "aliases": st.vulnerability.aliases,
+                    "status": st.status,
+                })));
             }
         }
     }
@@ -2703,7 +2881,7 @@ fn emit_envelope_success(summary: &VexWriteSummary, dry_run: bool) {
                 .with_reason(f.reason.clone(), omission_reason_message(&f.reason)),
         );
     }
-    if !summary.failed.is_empty() {
+    if !summary.failed.is_empty() || summary.affected > 0 {
         env.mark_partial_failure();
     }
     env.warnings = summary.warnings.clone();
@@ -2827,7 +3005,7 @@ mod tests {
     fn vex_summary_lines_pluralize() {
         let p = Path::new("out.json");
         assert_eq!(
-            format_vex_written(1, p),
+            format_vex_written(1, 0, p),
             "Wrote OpenVEX document with 1 statement to out.json"
         );
         assert_eq!(
@@ -2835,23 +3013,46 @@ mod tests {
             "Skipping VEX generation (--dry-run: nothing was applied)."
         );
         assert_eq!(
-            format_vex_written(0, p),
+            format_vex_written(0, 0, p),
             "Wrote OpenVEX document with 0 statements to out.json"
         );
         assert_eq!(
-            format_vex_written(3, Path::new("dir/é.json")),
+            format_vex_written(3, 0, Path::new("dir/é.json")),
             "Wrote OpenVEX document with 3 statements to dir/é.json"
         );
         assert_eq!(
-            format_vex_dry_run(1, p),
+            format_vex_dry_run(1, 0, p),
             "[dry-run] Would write OpenVEX document with 1 statement to out.json"
         );
         assert_eq!(
-            format_vex_dry_run(2, p),
+            format_vex_dry_run(2, 0, p),
             "[dry-run] Would write OpenVEX document with 2 statements to out.json"
         );
-        assert_eq!(format_vex_emitted(1), "Emitted 1 VEX statement");
-        assert_eq!(format_vex_emitted(12), "Emitted 12 VEX statements");
+        assert_eq!(format_vex_emitted(1, 0), "Emitted 1 VEX statement");
+        assert_eq!(format_vex_emitted(12, 0), "Emitted 12 VEX statements");
+    }
+
+    /// Each line says how many of the statements say `affected`, when any
+    /// does.
+    #[test]
+    fn vex_summary_lines_count_the_affected_statements() {
+        let p = Path::new("out.json");
+        assert_eq!(
+            format_vex_written(2, 1, p),
+            "Wrote OpenVEX document with 2 statements (1 affected) to out.json"
+        );
+        assert_eq!(
+            format_vex_written(1, 1, p),
+            "Wrote OpenVEX document with 1 statement (1 affected) to out.json"
+        );
+        assert_eq!(
+            format_vex_dry_run(3, 2, p),
+            "[dry-run] Would write OpenVEX document with 3 statements (2 affected) to out.json"
+        );
+        assert_eq!(
+            format_vex_emitted(2, 2),
+            "Emitted 2 VEX statements (2 affected)"
+        );
     }
 
     fn failed(purl: &str, reason: &str) -> FailedPatch {
@@ -3144,7 +3345,10 @@ mod tests {
         Vex(VexArgs),
     }
 
+    // Serial, like every test that parses with the environment: the table
+    // of env-bound flags in `args` sets `SOCKET_VEX_*` for its own parses.
     #[test]
+    #[serial_test::serial]
     fn parses_with_defaults() {
         let w = Wrap::parse_from(["test", "vex"]);
         match w.cmd {
@@ -3152,6 +3356,7 @@ mod tests {
                 assert!(args.output.is_none());
                 assert!(args.product.is_none());
                 assert!(!args.no_verify);
+                assert!(!args.no_bazel);
                 assert!(args.doc_id.is_none());
                 assert!(!args.compact);
             }
@@ -3159,6 +3364,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn parses_all_flags() {
         let w = Wrap::parse_from([
             "test",
@@ -3168,6 +3374,7 @@ mod tests {
             "--product",
             "pkg:npm/app@1.0.0",
             "--no-verify",
+            "--no-bazel",
             "--doc-id",
             "urn:uuid:fixed",
             "--compact",
@@ -3177,6 +3384,7 @@ mod tests {
                 assert_eq!(args.output.unwrap().to_str(), Some("out.vex.json"));
                 assert_eq!(args.product.as_deref(), Some("pkg:npm/app@1.0.0"));
                 assert!(args.no_verify);
+                assert!(args.no_bazel);
                 assert_eq!(args.doc_id.as_deref(), Some("urn:uuid:fixed"));
                 assert!(args.compact);
             }
@@ -3322,6 +3530,7 @@ mod npm_prior_tests {
             output: Some(out.to_path_buf()),
             product: Some("pkg:npm/app@1.0.0".into()),
             no_verify: false,
+            no_bazel: false,
             doc_id: Some("urn:uuid:00000000-0000-4000-8000-000000000000".into()),
             compact: false,
             assume_applied: Vec::new(),
@@ -3458,6 +3667,7 @@ mod mirror_refusal_tests {
                 let plan = Plan {
                     view,
                     vendor_entries: HashMap::from([(purls[3].to_string(), vendor_entry)]),
+                    vendor_pins: HashMap::new(),
                     redirected: vec![purls[0].to_string(), purls[2].to_string()],
                     lockfile_basis: HashSet::from([purls[0].to_string(), purls[2].to_string()]),
                     hosted,
@@ -3579,6 +3789,7 @@ mod mirror_refusal_tests {
             let plan = Plan {
                 view,
                 vendor_entries: HashMap::new(),
+                vendor_pins: HashMap::new(),
                 redirected: vec![gem.to_string(), npm.to_string()],
                 lockfile_basis: HashSet::from([gem.to_string(), npm.to_string()]),
                 hosted,
@@ -3754,6 +3965,7 @@ mod unjudged_tests {
             let plan = Plan {
                 view,
                 vendor_entries: HashMap::new(),
+                vendor_pins: HashMap::new(),
                 redirected: purls.map(str::to_string).to_vec(),
                 lockfile_basis: purls
                     .map(str::to_string)
@@ -3794,6 +4006,153 @@ mod unjudged_tests {
                 ],
                 "no_verify={no_verify}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod bazel_tests {
+    use super::*;
+    use crate::commands::vex_sources::HostedWiring;
+    use socket_patch_core::manifest::schema::PatchRecord;
+    use std::collections::BTreeMap;
+
+    /// The step that finds what Bazel does not build, on a workspace on
+    /// disk whose hubs read the project's pnpm lock and requirements file.
+    /// A project run takes the npm patch of the installed copy and the
+    /// PyPI patch of the committed copy out of the applied set and gives
+    /// each back with its action statement, which names the call and what
+    /// to run; a warning says the same after the package, in the order of
+    /// the packages whatever the order of the applied set. Nothing is
+    /// omitted. The PyPI package also leaves the list of those whose
+    /// installed tree differs from the committed copy, which the crate
+    /// stays on: that warning is about an attestation of the copy. The
+    /// step leaves the hosted pin and the crate alone, and so a
+    /// patch of the installed copy whose record names no advisory, which
+    /// no run attests. A `--global` run, whose packages are not the
+    /// project's, changes nothing. Nor does a run with `--vex-no-bazel`,
+    /// whose document is about the installed tree: the step returns before
+    /// it asks about a package, and every set it was given is as it was.
+    #[tokio::test]
+    async fn the_bazel_step_finds_what_no_hub_builds_in_a_project_run_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let module = "module(name = \"shop\")\n\
+            bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+            bazel_dep(name = \"rules_python\", version = \"2.5.0\")\n\
+            npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+            npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n\
+            pip = use_extension(\"@rules_python//python/extensions:pip.bzl\", \"pip\")\n\
+            pip.parse(hub_name = \"pip\", requirements_lock = \"//:requirements.txt\")\n";
+        let lock = "lockfileVersion: '9.0'\n\npackages:\n\n  is-odd@3.0.1:\n    \
+            resolution: {integrity: sha512-AAAA}\n\n  left-pad@1.3.0:\n    \
+            resolution: {integrity: sha512-BBBB}\n\n  is-even@1.0.0:\n    \
+            resolution: {integrity: sha512-CCCC}\n";
+        let files = [
+            (".git/HEAD", "ref: refs/heads/main\n"),
+            ("MODULE.bazel", module),
+            ("pnpm-lock.yaml", lock),
+            (
+                "requirements.txt",
+                "./.socket/vendor/pypi/u/idna-3.6-py3-none-any.whl\n",
+            ),
+        ];
+        for (path, text) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let purls = [
+            "pkg:npm/left-pad@1.3.0",
+            "pkg:pypi/idna@3.6",
+            "pkg:npm/is-odd@3.0.1",
+            "pkg:cargo/serde@1.0.0",
+            "pkg:npm/is-even@1.0.0",
+        ];
+        let advisory = serde_json::json!({ "GHSA-test-aaaa-bbbb": {
+            "cves": [], "summary": "s", "severity": "high", "description": "d",
+        }});
+        let mut view = PatchManifest::new();
+        for (index, purl) in purls.iter().enumerate() {
+            let record: PatchRecord = serde_json::from_value(serde_json::json!({
+                "uuid": format!("00000000-0000-4000-8000-00000000000{index}"),
+                "exportedAt": "2026-01-01T00:00:00Z",
+                "files": {"index.js": {"beforeHash": "a".repeat(64), "afterHash": "b".repeat(64)}},
+                "vulnerabilities": if index < 4 { advisory.clone() } else { serde_json::json!({}) },
+                "description": "test", "license": "MIT", "tier": "free"
+            }))
+            .unwrap();
+            view.patches.insert(purl.to_string(), record);
+        }
+        let wiring = HostedWiring {
+            uuid: view.patches[purls[2]].uuid.clone(),
+            refs: Vec::new(),
+        };
+        let plan = Plan {
+            view,
+            vendor_entries: HashMap::new(),
+            vendor_pins: HashMap::from([(purls[1].to_string(), vec!["requirements.txt".into()])]),
+            redirected: vec![purls[2].to_string()],
+            lockfile_basis: HashSet::new(),
+            hosted: BTreeMap::from([(purls[2].to_string(), wiring)]),
+            gated: Vec::new(),
+            notes: Vec::new(),
+        };
+        for (global, no_bazel) in [(false, false), (true, false), (false, true)] {
+            let common = GlobalArgs {
+                cwd: root.clone(),
+                json: true,
+                no_telemetry: true,
+                global,
+                ..Default::default()
+            };
+            let embedded = VexEmbedArgs {
+                vex_no_bazel: no_bazel,
+                ..Default::default()
+            };
+            let params = embedded.to_build_params(None);
+            let drifted = [purls[1], purls[3]].map(str::to_string);
+            let applied: Vec<String> = purls.iter().rev().map(|purl| purl.to_string()).collect();
+            let mut outcome = VerifyOutcome {
+                applied: applied.clone(),
+                vendored_out_of_sync: drifted.to_vec(),
+                ..Default::default()
+            };
+            let mut warnings = Vec::new();
+            let affected =
+                unbuilt_by_bazel(&mut outcome, &plan, &common, &params, &mut warnings).await;
+            assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+            let details: Vec<&str> = warnings.iter().map(|w| w.detail.as_str()).collect();
+            if global || no_bazel {
+                let run = format!("--global: {global}, --vex-no-bazel: {no_bazel}");
+                assert_eq!(outcome.applied, applied, "{run}");
+                assert_eq!(outcome.vendored_out_of_sync, drifted, "{run}");
+                assert_eq!((affected, details), (vec![], vec![]), "{run}");
+                continue;
+            }
+            assert_eq!(outcome.applied, applied[..3]);
+            assert_eq!(outcome.vendored_out_of_sync, drifted[1..]);
+            let codes: Vec<&str> = warnings.iter().map(|w| w.code.as_str()).collect();
+            assert_eq!(codes, [BAZEL_NOT_IN_BUILD; 2]);
+            let installed = "Bazel builds this package from pnpm-lock.yaml \
+                (`npm.npm_translate_lock`, MODULE.bazel:5), which does not name Socket patch \
+                00000000-0000-4000-8000-000000000000: the patch is only in the installed copy. \
+                Run `socket-patch scan --mode hosted` in the directory of that lock to pin the \
+                patch there. If what you ship is the installed tree and not what Bazel builds, \
+                pass `--no-bazel` (`--vex-no-bazel` on scan, apply and vendor).";
+            let committed = "Bazel builds no package from the line of requirements.txt that \
+                points at the copy of Socket patch 00000000-0000-4000-8000-000000000001 under \
+                .socket/vendor (`pip.parse`, MODULE.bazel:7): the build fails, or takes the \
+                registry's package. Run `socket-patch vendor --revert`, then `socket-patch scan \
+                --mode hosted`.";
+            let expected = [(purls[0], installed), (purls[1], committed)];
+            let said: Vec<(&str, &str)> = (affected.iter())
+                .map(|(purl, action)| (purl.as_str(), action.as_str()))
+                .collect();
+            assert_eq!(said, expected);
+            let warned = expected
+                .map(|(purl, action)| format!("{purl}: the VEX document says affected. {action}"));
+            assert_eq!(details, warned);
         }
     }
 }

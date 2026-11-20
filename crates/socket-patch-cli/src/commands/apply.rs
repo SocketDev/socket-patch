@@ -1329,6 +1329,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
                     env.vex = Some(VexSummary {
                         path: vex_path().display().to_string(),
                         statements: summary.statements,
+                        affected: summary.affected,
                         format: "openvex-0.2.0".to_string(),
                         warnings: summary.warnings.clone(),
                     });
@@ -1351,7 +1352,11 @@ pub async fn run(args: ApplyArgs) -> i32 {
             match &vex_result {
                 Some(ManifestlessVex::Written(summary)) if !args.common.silent => println!(
                     "{}",
-                    crate::commands::vex::format_vex_written(summary.statements, vex_path())
+                    crate::commands::vex::format_vex_written(
+                        summary.statements,
+                        summary.affected,
+                        vex_path(),
+                    )
                 ),
                 // Errors print even under --silent (same as the main path).
                 Some(ManifestlessVex::Failed(e)) => e.print_embedded(&args.common),
@@ -1773,6 +1778,8 @@ pub(crate) async fn run_locked(
                 .collect();
             run_warnings.extend(user_patch_warnings.iter().cloned());
             run_warnings.extend(unsupported_warning);
+            let patched = results.iter().map(|r| r.package_key.as_str());
+            run_warnings.extend(super::bazel_maven_notices(&args.common, patched, false).await);
             run_warnings.extend(results.iter().flat_map(|r| {
                 let note = r.error.as_deref().filter(|_| r.success).unwrap_or_default();
                 socket_patch_core::patch::apply::advisory_warning_codes(note)
@@ -2079,6 +2086,7 @@ pub(crate) async fn run_locked(
                                 .display()
                                 .to_string(),
                             statements: summary.statements,
+                            affected: summary.affected,
                             format: "openvex-0.2.0".to_string(),
                             // note_warning suppressed these on stderr under
                             // --json; the envelope copy is their only
@@ -2105,6 +2113,7 @@ pub(crate) async fn run_locked(
                                 "{}",
                                 crate::commands::vex::format_vex_written(
                                     summary.statements,
+                                    summary.affected,
                                     args.vex
                                         .vex
                                         .as_ref()

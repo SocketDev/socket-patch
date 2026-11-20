@@ -166,6 +166,11 @@ pub(crate) struct Plan {
     /// Vendored-basis entries, keyed by view purl — the verification
     /// routing for `applied_patches_with_vendor`.
     pub vendor_entries: HashMap<String, VendorEntry>,
+    /// For each key of `vendor_entries`, the project files that point at
+    /// its committed copy: those lockfile discovery found the vendored
+    /// reference in, each from the project with `/` between its parts.
+    /// Empty for an entry that is live without such a reference.
+    pub vendor_pins: HashMap<String, Vec<String>>,
     /// Live hosted-basis view purls (the `(redirected)` marker and the
     /// property-7 bypass).
     pub redirected: Vec<String>,
@@ -865,6 +870,7 @@ pub(crate) async fn plan(
             setup: manifest.setup.clone(),
         },
         vendor_entries: HashMap::new(),
+        vendor_pins: HashMap::new(),
         redirected: Vec::new(),
         lockfile_basis: HashSet::new(),
         hosted: BTreeMap::new(),
@@ -892,6 +898,7 @@ pub(crate) async fn plan(
             // statement and a skip at once.
             if plan.view.patches.remove(&cand.key).is_some() {
                 plan.vendor_entries.remove(&cand.key);
+                plan.vendor_pins.remove(&cand.key);
                 plan.redirected.retain(|k| *k != cand.key);
                 plan.lockfile_basis.remove(&cand.key);
                 plan.hosted.remove(&cand.key);
@@ -903,6 +910,10 @@ pub(crate) async fn plan(
         match basis {
             Basis::Installed => {}
             Basis::Vendored(entry) => {
+                let found = cand.discovered.iter();
+                let found = found.filter(|r| r.mode == WiringMode::Vendored);
+                let pins = found.map(|r| r.source_file.to_string_lossy().replace('\\', "/"));
+                plan.vendor_pins.insert(cand.key.clone(), pins.collect());
                 plan.vendor_entries.insert(cand.key.clone(), *entry);
             }
             Basis::Hosted { lockfile_basis } => {
@@ -2405,6 +2416,47 @@ mod tests {
             "{:?}",
             gated.notes
         );
+    }
+
+    /// The pin files of a vendored package are the files its vendored
+    /// reference was found in. A second file that pins the same patch on
+    /// the patch host points at no committed copy, and is none.
+    #[tokio::test]
+    async fn the_pins_of_a_vendored_package_are_the_files_that_point_at_its_copy() {
+        const PURL: &str = "pkg:pypi/idna@3.6";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(PURL.into(), record(U1));
+        let copy = format!(".socket/vendor/pypi/{U1}/idna-3.6-py3-none-any.whl");
+        let vref = vendor_ref(&copy).unwrap();
+        let hosted = PatchedRef::hosted(
+            PURL.to_string(),
+            U1.to_string(),
+            "requirements-dev.txt",
+            None,
+            None,
+            true,
+        );
+        let found = discovery(vec![
+            hosted,
+            PatchedRef::vendored(PURL.into(), &vref, "requirements.txt", None),
+        ]);
+        let plan = plan(
+            &common(tmp.path()),
+            Sources {
+                manifest,
+                vendor: VendorState::new(),
+                redirect: None,
+                discovery: found,
+                hosted_uuids: Vec::new(),
+            },
+            &[],
+            &RunApiClient::new(),
+        )
+        .await;
+        assert!(plan.gated.is_empty(), "{:?}", plan.gated);
+        assert_eq!(plan.vendor_entries[PURL].artifact.path, copy);
+        assert_eq!(plan.vendor_pins[PURL], ["requirements.txt"]);
     }
 
     /// Ledger-only records with no wiring anywhere are gated, except the

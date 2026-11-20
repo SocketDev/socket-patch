@@ -215,6 +215,37 @@ pub(crate) fn lock_text_has_member_importers(text: &str) -> bool {
         })
 }
 
+/// The importers besides the root `.` that a whole `pnpm-lock.yaml` text
+/// names: the directories of the workspace's members, each from the
+/// directory of the lock. Read as [`lock_text_has_member_importers`] reads
+/// them (the project documents alone, comment lines and CRLF as there),
+/// to the end of the `importers` section of each: a lock has some
+/// hundred lines of packages for each of them.
+pub(crate) fn lock_text_member_importers(text: &str) -> Vec<String> {
+    use super::grammar::{documents, PnpmDocument};
+    let mut members = Vec::new();
+    let project = |(_, kind): &(_, PnpmDocument)| *kind == PnpmDocument::Project;
+    for (span, _) in documents(text).into_iter().filter(project) {
+        let mut in_importers = false;
+        for line in strip_bom(&text[span]).split('\n') {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            if !line.is_empty() && !line.starts_with([' ', '\t']) {
+                if in_importers {
+                    break;
+                }
+                in_importers = line.trim_end() == "importers:";
+            } else if in_importers {
+                let key = super::lines::parse_key_line(line, 2).map(|(key, _, _)| key);
+                members.extend(key.filter(|key| *key != ".").map(str::to_string));
+            }
+        }
+    }
+    members
+}
+
 /// Insert `block` at line `at` of `lines` (a file split at `\n`), ending
 /// its lines as the file ends its own (`eol`, the file's
 /// [`terminator`](crate::utils::line_endings::terminator)): in a CRLF file
@@ -674,6 +705,40 @@ mod tests {
                 .map(|l| format!("{l}\r"))
                 .collect();
         assert!(lock_has_member_importers(&crlf));
+    }
+
+    /// The members a lock names, in the key spelling of each lock
+    /// generation, and none from an env document.
+    #[test]
+    fn member_importers_are_named_as_the_lock_names_them() {
+        let v9 = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies: {}\n\n  \
+                  apps/web:\n    dependencies:\n      a:\n        specifier: 1.0.0\n\n  \
+                  packages/ui: {}\n\npackages:\n\n  a@1.0.0:\n    resolution: {}\n";
+        assert_eq!(lock_text_member_importers(v9), ["apps/web", "packages/ui"]);
+        let v6 = "lockfileVersion: '6.0'\r\nimporters:\r\n  '.': {}\r\n  'packages/a': {}\r\n";
+        assert_eq!(lock_text_member_importers(v6), ["packages/a"]);
+        let env = "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n\n  tooling:\n    \
+                   configDependencies: {}\n\n";
+        assert_eq!(
+            lock_text_member_importers(&format!("{env}---\n{v9}")),
+            ["apps/web", "packages/ui"]
+        );
+        let none: [&str; 0] = [];
+        assert_eq!(lock_text_member_importers("lockfileVersion: '9.0'\n"), none);
+        // The reading ends with the section: what a later key holds, also
+        // under the same name, is not read.
+        let late = format!("{v9}\nimporters:\n\n  late: {{}}\n");
+        assert_eq!(
+            lock_text_member_importers(&late),
+            ["apps/web", "packages/ui"]
+        );
+        // A commented-out importer is none, and a comment at column 0
+        // does not end the section.
+        let commented = v9.replace("  packages/ui:", "# kept\n  # apps/old: {}\n  packages/ui:");
+        assert_eq!(
+            lock_text_member_importers(&commented),
+            ["apps/web", "packages/ui"]
+        );
     }
 
     /// #1952: a commented-out importer is not a member, a column-0 comment

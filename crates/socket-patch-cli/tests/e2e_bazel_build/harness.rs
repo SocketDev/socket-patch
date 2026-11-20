@@ -153,13 +153,20 @@ const PRODUCT: &str = "pkg:generic/socket-fixture@0.0.0";
 /// shared API stand-in, and of the records a flow writes itself.
 const ADVISORY: &str = "GHSA-test-aaaa-bbbb";
 
+/// The code of the warning with which `socket-patch` says that Bazel does
+/// not build the patched copy of a package, so that its document says the
+/// package is affected.
+pub const NOT_IN_BUILD: &str = "vex_bazel_not_in_build";
+
 /// The mode a flow patched its package in, which a document says after the
-/// patch id.
+/// patch id. Or [`How::Unbuilt`]: the patch is in a copy that Bazel does
+/// not build, and a document says the package is affected.
 #[derive(Clone, Copy)]
 pub enum How {
     Hosted,
     Vendored,
     Agent,
+    Unbuilt,
 }
 
 impl How {
@@ -167,23 +174,47 @@ impl How {
         match self {
             How::Hosted => " (redirected)",
             How::Vendored => " (vendored)",
-            How::Agent => "",
+            How::Agent | How::Unbuilt => "",
         }
     }
 }
 
 /// What a document has to say: the package `purl` is not affected, through
 /// the patch `uuid` of this run. The id is new for every run, so no
-/// document of an earlier run says it.
+/// document of an earlier run says it. Or, for [`Claim::unbuilt`], that the
+/// package is affected, and what to do about it.
 pub struct Claim<'a> {
     pub purl: &'a str,
     pub uuid: &'a str,
     pub how: How,
+    /// What the action statement of an affected package names, and the
+    /// warning of its run: the call's file and line, the file Bazel builds
+    /// the package from, what to run.
+    names: &'a [String],
 }
 
 impl<'a> Claim<'a> {
     pub fn new(purl: &'a str, uuid: &'a str, how: How) -> Claim<'a> {
-        Claim { purl, uuid, how }
+        let names = &[];
+        Claim {
+            purl,
+            uuid,
+            how,
+            names,
+        }
+    }
+
+    /// The package is affected: its patch `uuid` is in a copy that Bazel
+    /// does not build, and `names` is what the document has to name.
+    pub fn unbuilt(purl: &'a str, uuid: &'a str, names: &'a [String]) -> Claim<'a> {
+        Claim {
+            names,
+            ..Claim::new(purl, uuid, How::Unbuilt)
+        }
+    }
+
+    fn affected(&self) -> bool {
+        matches!(self.how, How::Unbuilt)
     }
 }
 
@@ -211,7 +242,7 @@ fn document_at(test: &str, path: &Path) -> (String, Value) {
 /// of `vex --no-verify` at the end of an impact statement. What is left is
 /// what a document says and the strings it says it with: the product, the
 /// package, the advisory and its aliases, the status, the justification
-/// and the patch.
+/// and the patch, or for an affected package what to do.
 fn wording(mut document: Value) -> Value {
     fn without(of: &mut Value, fields: &[&str]) {
         let Some(object) = of.as_object_mut() else {
@@ -772,8 +803,9 @@ pub struct Cell {
     /// The rules of the downloader config, once a flow has asked for one.
     downloads: Option<Vec<String>>,
     /// The [`wording`] of the first document [`Cell::attests`] read in
-    /// this checkout, which every later one is held to.
-    wording: OnceLock<Value>,
+    /// this checkout, which every later one is held to: of the first that
+    /// says not affected, and of the first that says affected.
+    wording: [OnceLock<Value>; 2],
     // Dropped after `Cell::drop` has stopped the server.
     scratch: Scratch,
 }
@@ -830,7 +862,7 @@ impl Cell {
             numbers,
             socket_bin,
             downloads: None,
-            wording: OnceLock::new(),
+            wording: Default::default(),
             scratch,
         })
     }
@@ -872,7 +904,7 @@ impl Cell {
             numbers: self.numbers,
             socket_bin: self.socket_bin.clone(),
             downloads: None,
-            wording: OnceLock::new(),
+            wording: Default::default(),
             scratch: Scratch::new(Some(self.scratch.repository_cache.clone())),
         };
         for (rel, bytes) in files {
@@ -919,6 +951,15 @@ impl Cell {
     /// `bazel <command> <options> <args>` in the workspace copy.
     pub fn bazel(&self, command: &str, args: &[&str]) -> Run {
         self.bazel_with("update", command, args)
+    }
+
+    /// [`Cell::bazel`] with variables of the one command: the `REPIN=1` of
+    /// a ruleset's relock. Bazel's client hands its environment to the
+    /// repository rules and to what `bazel run` starts.
+    pub fn bazel_env(&self, command: &str, args: &[&str], env: &[(&str, &str)]) -> Run {
+        let mut cmd = self.command("update", command, args);
+        cmd.envs(env.iter().copied());
+        Run::of(cmd).unwrap_or_else(|why| panic!("{}: {why}", self.test))
     }
 
     /// `bazel build --lockfile_mode=error <targets>`: passes only when
@@ -1103,6 +1144,70 @@ impl Cell {
         [out.stdout, out.stderr].map(|stream| String::from_utf8_lossy(&stream).into_owned())
     }
 
+    /// [`Cell::socket_patch_person`] for a command that is given
+    /// [`with_vex`] for `path` among `args`, in a checkout where Bazel does
+    /// not build the patched copy of the one package the run attests. The
+    /// command passes and writes the document, which says `claim`: the
+    /// package is affected. It prints the line `warned` on stderr and no
+    /// error, and says that it wrote a document with one statement, which
+    /// says affected (a hosted scan on stderr, with a note after it). With
+    /// `--silent` among `args` it prints nothing at all.
+    pub fn tells_a_person(
+        &self,
+        api: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        path: &Path,
+        claim: &Claim,
+        warned: &str,
+    ) {
+        let _ = std::fs::remove_file(path);
+        let mut cmd = self.socket_patch_command(api, args, env);
+        let out = cmd.output().expect("spawn socket-patch");
+        let code = out.status.code();
+        let [stdout, stderr] =
+            [out.stdout, out.stderr].map(|stream| String::from_utf8_lossy(&stream).into_owned());
+        let test = &self.test;
+        let said =
+            format!("{test}: {args:?}\nexit {code:?}\n--- stdout\n{stdout}\n--- stderr\n{stderr}");
+        assert_eq!(code, Some(0), "{said}");
+        self.attests(path, claim, true);
+        if args.contains(&"--silent") {
+            assert_eq!([stdout.as_str(), stderr.as_str()], ["", ""], "{said}");
+            return;
+        }
+        let wrote = format!(
+            "Wrote OpenVEX document with 1 statement (1 affected) to {}",
+            path.display()
+        );
+        let mut lines = stdout.lines().chain(stderr.lines());
+        assert!(lines.any(|line| line.starts_with(&wrote)), "{said}");
+        let printed = stderr.lines().any(|line| line == warned);
+        assert!(printed, "no {warned:?}:\n{said}");
+        assert!(!stderr.contains("Error"), "{said}");
+    }
+
+    /// What `socket-patch <args>`, a command that is to write its document
+    /// to `path`, gives a script and a person: of a run with `--json` and
+    /// of one without, the exit code, all it printed on stdout and on
+    /// stderr, and what the document it wrote says ([`wording`]: all but
+    /// its id and its times), null when it left none. Two commands that
+    /// give the same differ in nothing a script or a person sees.
+    pub fn gives(&self, api: &str, args: &[&str], env: &[(&str, &str)], path: &Path) -> Value {
+        let run = |form: &[&str]| {
+            let _ = std::fs::remove_file(path);
+            let mut cmd = self.socket_patch_command(api, &[args, form].concat(), env);
+            let out = cmd.output().expect("spawn socket-patch");
+            let [stdout, stderr] = [out.stdout, out.stderr]
+                .map(|stream| String::from_utf8_lossy(&stream).into_owned());
+            let written = path
+                .exists()
+                .then(|| wording(document_at(&self.test, path).1));
+            json!({ "code": out.status.code(), "stdout": stdout, "stderr": stderr, "document": written })
+        };
+        json!([run(&["--json"]), run(&[])])
+    }
+
     /// Where a flow has `socket-patch` write the VEX document `name`:
     /// beside the workspace copy, so it is no file of the checkout, and no
     /// comparison of the checkout's files sees it.
@@ -1114,10 +1219,14 @@ impl Cell {
     /// `not_affected` for the one advisory, with the package as the one
     /// subcomponent of the one product and the patch of this run in its
     /// impact statement, which ends with `; not verified on disk` exactly
-    /// when the run did not check the files (`verified` is false). And it
-    /// says so in the words of every other document read in this checkout:
-    /// the forms spell the product, the package, the advisory and the
-    /// status alike, and differ in nothing but what [`wording`] leaves out.
+    /// when the run did not check the files (`verified` is false). For
+    /// [`Claim::unbuilt`] the one statement is `affected` for that
+    /// advisory, product and package, with no justification and no impact
+    /// statement, and an action statement that holds the patch and each
+    /// name of the claim. And it says so in the words of every other
+    /// document of that status read in this checkout: the forms spell the
+    /// product, the package, the advisory and the status alike, and differ
+    /// in nothing but what [`wording`] leaves out.
     fn attests(&self, path: &Path, claim: &Claim, verified: bool) {
         let test = &self.test;
         let (text, document) = document_at(test, path);
@@ -1127,9 +1236,6 @@ impl Cell {
         let Some([statement]) = statements.map(Vec::as_slice) else {
             panic!("{test}: not one statement:\n{text}");
         };
-        assert_eq!(statement["status"], "not_affected", "{test}: {text}");
-        let justification = "inline_mitigations_already_exist";
-        assert_eq!(statement["justification"], justification, "{test}: {text}");
         let advisory = &statement["vulnerability"]["name"];
         assert_eq!(*advisory, ADVISORY, "{test}: {text}");
         // The package is named as its record names it: with `%40` or with
@@ -1141,13 +1247,27 @@ impl Cell {
         let products = json!([{ "@id": PRODUCT, "subcomponents": [{ "@id": named }] }]);
         assert_eq!(statement["products"], products, "{test}: {text}");
         let (uuid, how) = (claim.uuid, claim.how.words());
-        let mut impact = format!("Patched via Socket patch {uuid}{how}");
-        if !verified {
-            impact += NOT_VERIFIED_SUFFIX;
+        if claim.affected() {
+            assert_eq!(statement["status"], "affected", "{test}: {text}");
+            let reserved = ["justification", "impact_statement"];
+            let reserved = reserved.map(|key| statement.get(key).is_some());
+            assert_eq!(reserved, [false, false], "{test}: {text}");
+            let action = statement["action_statement"].as_str().unwrap_or_default();
+            for name in claim.names.iter().map(String::as_str).chain([uuid]) {
+                assert!(action.contains(name), "{test}: no {name:?} in {action:?}");
+            }
+        } else {
+            assert_eq!(statement["status"], "not_affected", "{test}: {text}");
+            let justification = "inline_mitigations_already_exist";
+            assert_eq!(statement["justification"], justification, "{test}: {text}");
+            let mut impact = format!("Patched via Socket patch {uuid}{how}");
+            if !verified {
+                impact += NOT_VERIFIED_SUFFIX;
+            }
+            assert_eq!(statement["impact_statement"], impact, "{test}: {text}");
         }
-        assert_eq!(statement["impact_statement"], impact, "{test}: {text}");
         let said = wording(document);
-        let first = self.wording.get_or_init(|| said.clone());
+        let first = self.wording[usize::from(claim.affected())].get_or_init(|| said.clone());
         assert_eq!(
             said, *first,
             "{test}: not the words of the first document of this checkout:\n{text}"
@@ -1159,7 +1279,11 @@ impl Cell {
     /// else, in its envelope and in the document it writes, which is not
     /// the one of an earlier call. `verified` is false for
     /// `vex --no-verify`, which says in a warning, and in the document,
-    /// that it checked no file.
+    /// that it checked no file. Of an affected package it says the same
+    /// with and without that option, and does not report it as verified:
+    /// its one event is `skipped` with the code [`NOT_IN_BUILD`] and the
+    /// status `affected`, the run is a partial failure that exits 0, and
+    /// its one warning names what the claim names.
     pub fn stands_alone(&self, run: impl Fn(&Cell, &[&str]) -> Ran, claim: &Claim, verified: bool) {
         let path = self.document("stand-alone");
         let _ = std::fs::remove_file(&path);
@@ -1167,19 +1291,35 @@ impl Cell {
         let ran = run(self, &[&vex(&path), unchecked].concat());
         let (test, said) = (&self.test, &ran.dump);
         assert_eq!(ran.code, 0, "{test}: {said}");
-        assert_eq!(ran.envelope["status"], "success", "{test}: {said}");
         let [event] = events(&ran.envelope) else {
             panic!("{test}: not one event: {said}");
         };
-        assert_eq!(event["action"], "verified", "{test}: {said}");
+        let affected = usize::from(claim.affected());
+        let [status, action, state] = [
+            ["success", "verified", "not_affected"],
+            ["partialFailure", "skipped", "affected"],
+        ][affected];
+        assert_eq!(ran.envelope["status"], status, "{test}: {said}");
+        assert_eq!(event["action"], action, "{test}: {said}");
+        let code = [Value::Null, json!(NOT_IN_BUILD)][affected].clone();
+        assert_eq!(event["errorCode"], code, "{test}: {said}");
+        let summary = &ran.envelope["summary"];
+        let counted = [&summary["verified"], &summary["skipped"]].map(Value::as_u64);
+        let expected = [[Some(1), Some(0)], [Some(0), Some(1)]][affected];
+        assert_eq!(counted, expected, "{test}: {said}");
         let purl = normalize_purl(event["purl"].as_str().unwrap_or_default());
         assert_eq!(purl, normalize_purl(claim.purl), "{test}: {said}");
         let details = &event["details"];
-        assert_eq!(details["status"], "not_affected", "{test}: {said}");
+        assert_eq!(details["status"], state, "{test}: {said}");
         assert_eq!(details["vulnerability"], ADVISORY, "{test}: {said}");
-        let warned: &[&str] = if verified { &[] } else { &["vex_not_verified"] };
-        let warnings = codes_in(&ran.envelope["warnings"]);
-        assert_eq!(warnings, warned, "{test}: {said}");
+        let warned: &[&str] = match (claim.affected(), verified) {
+            (true, _) => &[NOT_IN_BUILD],
+            (false, true) => &[],
+            (false, false) => &["vex_not_verified"],
+        };
+        let warnings = &ran.envelope["warnings"];
+        assert_eq!(codes_in(warnings), warned, "{test}: {said}");
+        self.names_the_build(warnings, claim, said);
         self.attests(&path, claim, verified);
     }
 
@@ -1209,7 +1349,7 @@ impl Cell {
             "{test}: {said}"
         );
         let (text, document) = document_at(test, &path);
-        let mut named = self.wording.get().cloned().expect("a document here");
+        let mut named = self.wording[0].get().cloned().expect("a document here");
         named["statements"][0]["products"][0]["@id"] = product.into();
         assert_eq!(wording(document), named, "{test}: {said}\n{text}");
     }
@@ -1218,19 +1358,25 @@ impl Cell {
     /// passed, and wrote the document of its own run, which attests
     /// `claim` and nothing else. A hosted scan says of its document that
     /// no file was hashed for it: the lock names the patch, and the bytes
-    /// come with the next build.
+    /// come with the next build. A run whose document says the package is
+    /// affected counts that statement as such, warns of it once, and names
+    /// what the claim names.
     pub fn wrote_in_run(&self, ran: &Ran, path: &Path, claim: &Claim) {
         let (test, said) = (&self.test, &ran.dump);
         assert_eq!(ran.code, 0, "{test}: {said}");
         let vex = &ran.envelope["vex"];
         assert_eq!(vex["statements"], 1, "{test}: {said}");
+        let affected = [Value::Null, json!(1)][usize::from(claim.affected())].clone();
+        assert_eq!(vex["affected"], affected, "{test}: {said}");
         assert_eq!(vex["format"], "openvex-0.2.0", "{test}: {said}");
         assert_eq!(vex["path"], argument(path), "{test}: {said}");
         let warned: &[&str] = match claim.how {
             How::Hosted => &["vex_hosted_unverified"],
             How::Vendored | How::Agent => &[],
+            How::Unbuilt => &[NOT_IN_BUILD],
         };
         assert_eq!(codes_in(&vex["warnings"]), warned, "{test}: {said}");
+        self.names_the_build(&vex["warnings"], claim, said);
         self.attests(path, claim, true);
     }
 
@@ -1259,7 +1405,7 @@ impl Cell {
         let differ = changed(&undated(patched), &undated(&fresh.tree()));
         assert_eq!(differ, NOTHING, "{test}: {said}");
         fresh.stands_alone(run, claim, true);
-        let (here, there) = (self.wording.get(), fresh.wording.get());
+        let (here, there) = (self.wording[0].get(), fresh.wording[0].get());
         assert_eq!(there, here, "{test}: the two checkouts word it apart");
     }
 
@@ -1277,6 +1423,43 @@ impl Cell {
         let warned = codes_in(&ran.envelope["warnings"]);
         let removed = warned.iter().any(|code| code == "vex_stale_doc_removed");
         assert!(removed, "{test}: {said}");
+    }
+
+    /// For [`Claim::unbuilt`], the one [`NOT_IN_BUILD`] warning of
+    /// `warnings` is about the package of `claim`, says that the document
+    /// says affected, and holds each name of the claim. For every other
+    /// claim there is no such warning.
+    fn names_the_build(&self, warnings: &Value, claim: &Claim, said: &str) {
+        let test = &self.test;
+        let ours = |warning: &&Value| warning["code"] == NOT_IN_BUILD;
+        let ours: Vec<&Value> = warnings
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(ours)
+            .collect();
+        if !claim.affected() {
+            assert!(ours.is_empty(), "{test}: {said}");
+            return;
+        }
+        let [warning] = ours[..] else {
+            panic!("{test}: not one {NOT_IN_BUILD} warning: {said}");
+        };
+        let detail = warning["detail"].as_str().unwrap_or_default();
+        let (about, rest) = detail.split_once(": ").unwrap_or_default();
+        assert_eq!(
+            normalize_purl(about),
+            normalize_purl(claim.purl),
+            "{test}: {said}"
+        );
+        let affected = "the VEX document says affected. ";
+        assert!(rest.starts_with(affected), "{test}: {detail:?}");
+        for name in claim.names {
+            assert!(
+                rest.contains(name.as_str()),
+                "{test}: no {name:?} in {detail:?}"
+            );
+        }
     }
 
     /// `bazel shutdown`, when the pid file of a server is there. No command
@@ -1355,7 +1538,7 @@ pub fn cell_without_bazel(release: &str) -> Cell {
         numbers: numbers(release).expect("a release"),
         socket_bin: None,
         downloads: None,
-        wording: OnceLock::new(),
+        wording: Default::default(),
         scratch: Scratch::new(None),
     }
 }

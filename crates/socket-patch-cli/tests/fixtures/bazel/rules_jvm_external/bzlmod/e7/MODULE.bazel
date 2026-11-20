@@ -1,0 +1,28 @@
+module(
+    name = "socket_fixture",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "rules_jvm_external", version = "6.5")
+bazel_dep(name = "rules_java", version = "7.6.5")
+
+single_version_override(
+    module_name = "rules_jvm_external",
+    version = "6.5",
+)
+
+# The hub has a name of its own. A hub named "maven" also takes the
+# artifacts that other Bazel modules of the build add to a hub of that name
+# (protobuf does), and a pin resolves those from Maven Central. Nothing but
+# this file adds to this hub, and its one repository is the test's own,
+# which a test puts in the place of the URL below: no pin and no build asks
+# a public Maven repository. Only `consumer` is named here; the victim is
+# its dependency.
+maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+maven.install(
+    name = "fixture_maven",
+    artifacts = ["dev.socket.fixture:consumer:2.0"],
+    lock_file = "//:maven_install.json",
+    repositories = ["http://socket-fixture.invalid/maven2"],
+)
+use_repo(maven, "fixture_maven")
