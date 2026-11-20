@@ -1019,7 +1019,11 @@ pixi install && socket-patch apply
   code (the error names `socket-patch remove`, which drops the record), or with `no
   matching variant found` when a replaced file differs. A copy that already holds the
   patch, as one an earlier release patched does, has nothing written to it and is
-  reported as already patched. `--strict` is as strict as anywhere else. A wheel
+  reported as already patched. A release with a platform wheel beside its
+  pure-Python one has a record for each: on a pure-Python conda build the pure
+  wheel's record patches the copy, and the platform wheel's is not an error there
+  (it reads as already patched, as its file is). A copy that fails is reported
+  once. `--strict` is as strict as anywhere else. A wheel
   that pip or uv installed into the environment (`[pypi-dependencies]`, or `pip
   install` in a conda environment) is the PyPI release itself and is patched as
   anywhere else. **Not compared:** the files a patch leaves alone. A patch record

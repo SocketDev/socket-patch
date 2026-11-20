@@ -720,6 +720,156 @@ fn an_sdist_record_beside_the_wheels_does_not_fail_a_pure_python_conda_build() {
     assert!(!stderr.contains(CONDA_REFUSAL), "stderr:\n{stderr}");
 }
 
+/// Copies the manifest record of `from` in `cwd` to the key `to`: a second
+/// record of the same release, replacing the same files.
+fn add_sibling_record(cwd: &Path, from: &str, to: &str) {
+    let manifest_path = cwd.join(".socket").join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let mut record = manifest["patches"][from].clone();
+    record["uuid"] = "20000001-0000-4001-8001-000000000090".into();
+    manifest["patches"][to] = record;
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
+const SIBLING_PURE: &str = "pkg:pypi/charset-normalizer@3.4.4?artifact_id=py3-none-any-whl";
+const SIBLING_PLATFORM: &str =
+    "pkg:pypi/charset-normalizer@3.4.4?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl";
+
+/// A conda build of a release that has a pure wheel's record and a
+/// platform wheel's record replacing the same file.
+fn sibling_records_copy<'a>(
+    purelib: bool,
+    installed: &'a [u8],
+    release: &'a [u8],
+) -> CondaCopy<'a> {
+    CondaCopy {
+        name: "charset-normalizer",
+        version: "3.4.4",
+        purl: SIBLING_PURE,
+        installer: Some("conda"),
+        purelib,
+        file: "charset_normalizer/api.py",
+        installed,
+        release,
+    }
+}
+
+/// A release with a platform wheel beside its pure-Python one (a project
+/// that compiles an optional speed-up) has a record for each, and its
+/// Python files are the same in both. A pure-Python conda build is the
+/// pure wheel: that record patches the copy, and the platform wheel's
+/// record, which a conda build never takes, then finds its file patched,
+/// as it does in a venv. The run succeeds with or without `--force`, and
+/// neither record is reported as refused or as not installed.
+///
+/// The records are tried in an order that does not depend on the
+/// manifest's map. Each run is a new process with its own map order, so
+/// the rounds are a guard, by chance, against that order mattering again:
+/// with it, the platform wheel's record came first in some runs, was
+/// refused, and failed a run that had patched the file.
+#[test]
+fn a_platform_wheel_record_beside_the_pure_one_does_not_fail_a_pure_python_conda_build() {
+    let release = b"# the PyPI release's file\n";
+    for flags in [&[][..], &["--force"][..]] {
+        for round in 0..4 {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let target =
+                stage_conda_copy(tmp.path(), &sibling_records_copy(true, release, release));
+            add_sibling_record(tmp.path(), SIBLING_PURE, SIBLING_PLATFORM);
+
+            // A dry run first: the copy can be patched, and nothing is.
+            let (code, stdout, stderr) = apply_in(tmp.path(), &[flags, &["--dry-run"]].concat());
+            assert_eq!(
+                code, 0,
+                "{flags:?} round {round}, dry run\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), release);
+            assert!(
+                !stderr.contains(CONDA_REFUSAL) && !stderr.contains("Failed to patch"),
+                "{flags:?} round {round}, dry run\nstderr:\n{stderr}"
+            );
+
+            // Then the patch, and a second run that finds it in place.
+            for run in ["first", "second"] {
+                let (code, stdout, stderr) = apply_in(tmp.path(), flags);
+                let at = format!("{flags:?} round {round}, {run} run");
+                assert_eq!(code, 0, "{at}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+                assert_eq!(std::fs::read(&target).unwrap(), CONDA_PATCHED, "{at}");
+                assert!(
+                    !stderr.contains(CONDA_REFUSAL)
+                        && !stderr.contains("Failed to patch")
+                        && !stderr.contains("no matching installed package"),
+                    "{at}\nstderr:\n{stderr}"
+                );
+                assert!(
+                    stdout.contains("0 not found on disk")
+                        && stdout.contains(&format!("{SIBLING_PLATFORM} (already patched)")),
+                    "{at}\nstdout:\n{stdout}"
+                );
+            }
+        }
+    }
+
+    // The platform wheel's record on its own is still refused.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut alone = sibling_records_copy(true, release, release);
+    alone.purl = SIBLING_PLATFORM;
+    let target = stage_conda_copy(tmp.path(), &alone);
+    let (code, stdout, stderr) = apply_in(tmp.path(), &[]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(std::fs::read(&target).unwrap(), release);
+    assert!(stderr.contains(CONDA_REFUSAL), "stderr:\n{stderr}");
+}
+
+/// A copy that fails is reported once, with its own cause. A pure-Python
+/// conda build whose file is not the release's fails under the pure
+/// wheel's record, for that file; the platform wheel's record is not
+/// refused on top of it. A compiled conda build, which takes neither
+/// record, is refused once.
+#[test]
+fn a_conda_build_two_records_fail_on_is_reported_once() {
+    let release = b"# the PyPI release's file\n";
+    let conda_build = b"# changed by the conda recipe\n";
+    let failures = |stderr: &str| stderr.matches("Failed to patch").count();
+
+    // `--force` hands both records to the engine whatever the file holds.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = stage_conda_copy(
+        tmp.path(),
+        &sibling_records_copy(true, conda_build, release),
+    );
+    add_sibling_record(tmp.path(), SIBLING_PURE, SIBLING_PLATFORM);
+    let (code, stdout, stderr) = apply_in(tmp.path(), &["--force"]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(std::fs::read(&target).unwrap(), conda_build);
+    assert_eq!(failures(&stderr), 1, "stderr:\n{stderr}");
+    assert!(
+        stderr.contains(&format!("Failed to patch {SIBLING_PURE}"))
+            && !stderr.contains(CONDA_REFUSAL)
+            && !stderr.contains("no matching installed package"),
+        "stderr:\n{stderr}"
+    );
+
+    for flags in [&[][..], &["--force"][..]] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = stage_conda_copy(tmp.path(), &sibling_records_copy(false, release, release));
+        add_sibling_record(tmp.path(), SIBLING_PURE, SIBLING_PLATFORM);
+        let (code, stdout, stderr) = apply_in(tmp.path(), flags);
+        assert_eq!(code, 1, "{flags:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(std::fs::read(&target).unwrap(), release, "{flags:?}");
+        assert_eq!(failures(&stderr), 1, "{flags:?}\nstderr:\n{stderr}");
+        assert!(
+            stderr.contains(CONDA_REFUSAL) && !stderr.contains("no matching installed package"),
+            "{flags:?}\nstderr:\n{stderr}"
+        );
+    }
+}
+
 /// `--strict` fails on any file that is not the patch's original. The
 /// conda rule tightens `--force` and `--allow-patch-conflicts`; it must
 /// not loosen `--strict`, which here refuses even content an earlier

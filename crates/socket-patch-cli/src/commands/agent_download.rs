@@ -1646,6 +1646,11 @@ pub(crate) const CONDA_BUILD_NOT_PYPI_RELEASE: &str =
 /// installed, or has a copy pip or uv installed, keeps its patch. Whether
 /// a pure-Python conda build's files are the release's is the apply
 /// engine's check, as for any other copy.
+///
+/// A record left out beside a kept one of the same release has no line:
+/// it is only not the installed distribution (the platform wheel's record
+/// beside the pure wheel's, for a pure-Python conda build), and the kept
+/// record patches the package.
 async fn leave_out_patches_no_conda_build_takes(
     selected: Vec<PatchSearchResult>,
     crawler_options: &CrawlerOptions,
@@ -1663,7 +1668,8 @@ async fn leave_out_patches_no_conda_build_takes(
     let copies =
         find_all_packages_for_rollback(&partition_purls(&pypi, None), crawler_options, true).await;
     let mut kept = Vec::with_capacity(selected.len());
-    let mut refused = Vec::new();
+    // (base purl, line) of each record left out.
+    let mut left_out: Vec<(String, String)> = Vec::new();
     for sr in selected {
         let mut reason = None;
         for copy in copies.get(&sr.purl).map(Vec::as_slice).unwrap_or_default() {
@@ -1673,14 +1679,25 @@ async fn leave_out_patches_no_conda_build_takes(
             }
         }
         match reason {
-            Some(reason) => {
-                let line = format!("{}: {reason}", normalize_purl(&sr.purl));
-                if !quiet {
-                    eprintln!("  [note] {line}");
-                }
-                refused.push(line);
-            }
+            Some(reason) => left_out.push((
+                strip_purl_qualifiers(&sr.purl).to_string(),
+                format!("{}: {reason}", normalize_purl(&sr.purl)),
+            )),
             None => kept.push(sr),
+        }
+    }
+    let refused: Vec<String> = left_out
+        .into_iter()
+        .filter(|(base, _)| {
+            !kept
+                .iter()
+                .any(|sr| strip_purl_qualifiers(&sr.purl) == base.as_str())
+        })
+        .map(|(_, line)| line)
+        .collect();
+    if !quiet {
+        for line in &refused {
+            eprintln!("  [note] {line}");
         }
     }
     (kept, refused)
@@ -2703,6 +2720,15 @@ mod tests {
         ];
         let mut selected: Vec<PatchSearchResult> = kept.iter().map(|p| selection(p)).collect();
         selected.insert(2, selection(compiled));
+        // The platform wheel's record of a release whose pure wheel's
+        // record is kept: left out too (a conda build is never a platform
+        // wheel), with nothing to report, since the package is patched.
+        selected.insert(
+            1,
+            selection(
+                "pkg:pypi/certifi@2026.7.22?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl",
+            ),
+        );
         let options = CrawlerOptions {
             cwd: project.to_path_buf(),
             global: false,

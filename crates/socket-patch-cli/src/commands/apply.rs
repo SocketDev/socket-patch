@@ -3264,7 +3264,31 @@ async fn apply_patches_inner(
                     None
                 };
 
-                for variant_purl in &variants {
+                // A copy conda built is never a platform wheel, and takes
+                // no record at all when it holds compiled code (see
+                // `conda_copy`). The records such a copy never takes are
+                // tried last, and one of them is refused aloud only when
+                // it is the first record tried on the copy. After another
+                // record of the release, the copy has been dealt with: a
+                // pure-Python conda build patched by the pure wheel's
+                // record is done, whatever the platform wheel's record
+                // beside it says, and a copy that one record failed on has
+                // its failure. The engine still sees each record, so one
+                // whose files already hold the patch reads as already
+                // patched, as it does on any other copy.
+                let conda_never_takes =
+                    Box::pin(conda_refused_variants(&base_purl, pkg_path, &variants)).await;
+                let mut ordered_variants: Vec<&String> = variants.iter().collect();
+                if !conda_never_takes.is_empty() {
+                    // By purl within each half, so the run reads the same
+                    // whatever order the manifest's map yields.
+                    ordered_variants.sort_by(|a, b| {
+                        (conda_never_takes.contains(*a), a.as_str())
+                            .cmp(&(conda_never_takes.contains(*b), b.as_str()))
+                    });
+                }
+
+                for variant_purl in ordered_variants {
                     if only_variant.is_some_and(|only| only != variant_purl) {
                         continue;
                     }
@@ -3331,6 +3355,9 @@ async fn apply_patches_inner(
                         }
                     }
 
+                    // A record this conda build never takes, tried after
+                    // another record of the release on the same copy.
+                    let conda_sibling = attempted && conda_never_takes.contains(variant_purl);
                     attempted = true;
                     // A gem patch to native-extension sources rebuilds the
                     // extension (#1996). One it cannot build is refused
@@ -3433,6 +3460,15 @@ async fn apply_patches_inner(
                         )
                         .await
                     };
+
+                    // The engine refused it, with nothing written: it is
+                    // not this copy's distribution, and the copy's outcome
+                    // is the earlier record's. It did match the copy's
+                    // file, so it is not reported as not installed either.
+                    if conda_sibling && is_conda_refusal(&result) {
+                        matched_manifest_purls.insert(variant_purl.clone());
+                        continue;
+                    }
 
                     warn_mismatch_overwrites(&result, &args.common);
                     // A variant that reached apply is the installed distribution
@@ -4394,6 +4430,36 @@ fn print_lockfile_only_note(
 /// `Error: Failed to patch <purl>: <why>` (stderr, even under --silent).
 fn format_patch_failure(purl: &str, why: &str) -> String {
     format!("Error: Failed to patch {purl}: {why}")
+}
+
+/// The records among `variants` that the copy of `base_purl` at `pkg_path`
+/// never takes because conda built it (see
+/// `socket_patch_core::patch::conda_copy`): a platform wheel's record
+/// always, and every record when the build holds compiled code. Empty for
+/// a copy that is not a conda build.
+async fn conda_refused_variants(
+    base_purl: &str,
+    pkg_path: &Path,
+    variants: &[String],
+) -> HashSet<String> {
+    use socket_patch_core::patch::conda_copy::{conda_build, static_refusal_for};
+    let Some(build) = conda_build(base_purl, pkg_path).await else {
+        return HashSet::new();
+    };
+    variants
+        .iter()
+        .filter(|variant| static_refusal_for(&build, variant, pkg_path).is_some())
+        .cloned()
+        .collect()
+}
+
+/// Whether the engine refused `result`'s record because conda built the
+/// copy (the error of `socket_patch_core::patch::conda_copy`'s rule).
+fn is_conda_refusal(result: &ApplyResult) -> bool {
+    !result.success
+        && result.error.as_deref().is_some_and(|error| {
+            error.starts_with(socket_patch_core::patch::conda_copy::REFUSAL_CODE)
+        })
 }
 
 /// Why no release variant in the manifest matched the installed copy of
