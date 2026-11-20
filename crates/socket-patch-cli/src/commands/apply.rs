@@ -1704,7 +1704,6 @@ fn collect_apply_outcomes(
 ) -> (Vec<String>, Vec<PatchEvent>) {
     let mut applied = Vec::new();
     skipped.extend(caveats.not_in_build.iter().map(LeftCopy::event));
-    skipped.extend(caveats.unsupported.iter().map(UnsupportedCopy::event));
     for result in results {
         let event = caveats.event_of(result, dry_run);
         match event.action {
@@ -1744,6 +1743,16 @@ fn collect_apply_outcomes(
     });
     skipped.sort_by(|a, b| (&a.purl, &a.error_code).cmp(&(&b.purl, &b.error_code)));
     skipped.dedup_by(|a, b| a.purl == b.purl && a.error_code == b.error_code);
+    // A copy skipped as not supported yet (a compiled conda build) stays
+    // unpatched whatever another copy of its record did, and its reason
+    // names it: one event per record and copy, kept beside an applied or
+    // failed copy's outcome.
+    let mut said = HashSet::new();
+    for copy in &caveats.unsupported {
+        if said.insert((copy.purl.as_str(), copy.detail.as_str())) {
+            skipped.push(copy.event());
+        }
+    }
     (applied, skipped)
 }
 
@@ -3777,6 +3786,18 @@ async fn apply_patches_inner(
                     if is_store_copy {
                         any_store_copy_applied = true;
                     }
+                    // A compiled conda build is judged as a whole (as
+                    // `apply --check` settles it): one that already holds
+                    // a record's patch accounts for every record of its
+                    // release, so a sibling its files do not match is not
+                    // reported as not installed.
+                    if conda.unsupported.is_some() {
+                        for variant_purl in &variants {
+                            if manifest.patches.contains_key(variant_purl) {
+                                matched_manifest_purls.insert(variant_purl.clone());
+                            }
+                        }
+                    }
                 } else if let Some(reason) = &conda.unsupported {
                     // A compiled conda build that does not already hold the
                     // patch: not supported yet, so the copy is skipped. The
@@ -5728,8 +5749,31 @@ mod tests {
             error: None,
             sidecar: None,
         };
-        let t = tally_results(&[applied], &caveats);
+        let t = tally_results(std::slice::from_ref(&applied), &caveats);
         assert_eq!((t.applied, t.unsupported), (1, 1));
+
+        // The outcomes a nested caller (`scan`, `get`) reads keep each
+        // skipped copy's event, beside the applied copy of the same
+        // record and once per copy.
+        let mut two_envs = GemCaveats {
+            unsupported: vec![skipped(platform), skipped(platform)],
+            ..GemCaveats::default()
+        };
+        two_envs.unsupported[1].detail = format!("{code}: conda built the copy in /other-env");
+        let (applied_keys, skips) = collect_apply_outcomes(
+            std::slice::from_ref(&applied),
+            &two_envs,
+            &[],
+            &HashSet::new(),
+            Vec::new(),
+            false,
+        );
+        assert_eq!(applied_keys, [platform]);
+        assert_eq!(skips.len(), 2, "{skips:?}");
+        assert!(skips
+            .iter()
+            .all(|skip| skip.error_code.as_deref() == Some(code)
+                && skip.purl.as_deref() == Some(platform)));
 
         let event = serde_json::to_value(caveats.unsupported[0].event()).unwrap();
         assert_eq!(event["action"], "skipped");

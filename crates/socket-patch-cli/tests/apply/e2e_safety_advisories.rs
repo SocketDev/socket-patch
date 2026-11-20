@@ -996,6 +996,13 @@ fn a_compiled_conda_build_holding_one_records_patch_is_in_sync() {
     let second = b"# PIL/TiffImagePlugin.py as PyPI ships it\n";
     let second_path = target.parent().unwrap().join("TiffImagePlugin.py");
     std::fs::write(&second_path, second).unwrap();
+    // A third record, whose only file the conda recipe changed: it matches
+    // nothing of the copy.
+    let sdist = "pkg:pypi/pillow@12.3.0?artifact_id=tar-gz";
+    add_sibling_record(tmp.path(), pure, sdist);
+    let recipe_patched = b"# PIL/ImageFile.py as the conda recipe patched it\n";
+    let third_path = target.parent().unwrap().join("ImageFile.py");
+    std::fs::write(&third_path, recipe_patched).unwrap();
     let manifest_path = tmp.path().join(".socket").join("manifest.json");
     let mut manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
@@ -1003,6 +1010,10 @@ fn a_compiled_conda_build_holding_one_records_patch_is_in_sync() {
         "beforeHash": git_sha256(second),
         "afterHash": git_sha256(CONDA_PATCHED),
     });
+    manifest["patches"][sdist]["files"] = serde_json::json!({ "PIL/ImageFile.py": {
+        "beforeHash": git_sha256(b"# PIL/ImageFile.py as PyPI ships it\n"),
+        "afterHash": git_sha256(CONDA_PATCHED),
+    } });
     std::fs::write(
         &manifest_path,
         serde_json::to_vec_pretty(&manifest).unwrap(),
@@ -1015,8 +1026,13 @@ fn a_compiled_conda_build_holding_one_records_patch_is_in_sync() {
         stdout.contains(&format!("{pure} (already patched)")),
         "stdout:\n{stdout}"
     );
-    assert!(!stderr.contains(CONDA_REFUSAL), "stderr:\n{stderr}");
+    assert!(
+        !stderr.contains(CONDA_REFUSAL) && !stderr.contains("no matching installed package"),
+        "stderr:\n{stderr}"
+    );
+    assert!(stdout.contains("0 not found on disk"), "stdout:\n{stdout}");
     assert_eq!(std::fs::read(&second_path).unwrap(), second);
+    assert_eq!(std::fs::read(&third_path).unwrap(), recipe_patched);
 
     let (code, stdout, stderr) = apply_in(tmp.path(), &["--check"]);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
