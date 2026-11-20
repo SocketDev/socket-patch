@@ -130,6 +130,13 @@ async fn run(own_args: Vec<OsString>, hot_patch_command: Option<hot_patch::Start
         eprintln!("Error: {message}");
         leave(&hot_patch_command, 2);
     }
+    // A patch mirror base that cannot prefix a committed URL is a usage
+    // error too, for every command: each of them reads the project's
+    // hosted pins against it.
+    if let Err(message) = cli.command.global_args().validate_patch_mirror() {
+        eprintln!("Error: {message}");
+        leave(&hot_patch_command, 2);
+    }
 
     // Human-output policy (core advisories and prompt notes go quiet under
     // --silent/--json) is fixed once, before any command code runs.

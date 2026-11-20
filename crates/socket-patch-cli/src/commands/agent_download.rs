@@ -398,6 +398,9 @@ pub struct DownloadParams {
     /// `--patch-server-url`: the extra origin whose URLs count as hosted
     /// when lockfile discovery reads the project's hosted pins.
     pub patch_server_url: Option<String>,
+    /// `--patch-mirror-url`: the patch-server mirror whose origin counts as
+    /// hosted the same way.
+    pub patch_mirror_url: Option<String>,
 }
 
 impl DownloadParams {
@@ -1202,8 +1205,10 @@ pub(crate) async fn vendored_download_refusals(
     prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 ) -> VendorRefusals {
     let cwd = params.cwd.as_path();
-    let origins =
-        crate::commands::hosted_unwind::patch_server_origins_of(params.patch_server_url.as_deref());
+    let origins = crate::commands::hosted_unwind::patch_server_origins_of(
+        params.patch_server_url.as_deref(),
+        params.patch_mirror_url.as_deref(),
+    );
     let pins = hosted_pins(cwd, origins.clone()).await;
     let options = params.crawler_options();
     let installed = crate::commands::vendor::installed_lookup(&options, prior);

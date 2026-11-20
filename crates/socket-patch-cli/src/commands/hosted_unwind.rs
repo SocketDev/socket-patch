@@ -47,16 +47,27 @@ impl HostedLegOutcome {
 }
 
 /// The patch-server origins that count as hosted, besides Socket's own:
-/// the operator's `--patch-server-url` (discovery's allowlist).
+/// the operator's `--patch-server-url` and the origin of their
+/// `--patch-mirror-url` (discovery's allowlist).
 pub(crate) fn patch_server_origins(common: &GlobalArgs) -> Vec<String> {
-    patch_server_origins_of(common.patch_server_url.as_deref())
+    patch_server_origins_of(
+        common.patch_server_url.as_deref(),
+        common.patch_mirror_url.as_deref(),
+    )
 }
 
-/// [`patch_server_origins`] from the `--patch-server-url` value itself, for
-/// callers that carry it outside a [`GlobalArgs`].
-pub(crate) fn patch_server_origins_of(patch_server_url: Option<&str>) -> Vec<String> {
+/// [`patch_server_origins`] from the `--patch-server-url` and
+/// `--patch-mirror-url` values themselves, for callers that carry them
+/// outside a [`GlobalArgs`]. A mirrored reference is the patch server's own
+/// path under the mirror's base, so the mirror's origin is all a reader
+/// needs to take it as a hosted one.
+pub(crate) fn patch_server_origins_of(
+    patch_server_url: Option<&str>,
+    patch_mirror_url: Option<&str>,
+) -> Vec<String> {
     patch_server_url
         .into_iter()
+        .chain(patch_mirror_url)
         .filter(|url| !url.trim().is_empty())
         .map(str::to_string)
         .collect()

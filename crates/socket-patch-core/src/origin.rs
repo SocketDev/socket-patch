@@ -180,6 +180,19 @@ pub(crate) fn hosted_shape_uuid(url: &str) -> Option<String> {
     hosted_patch_uuid(parsed.as_str(), &[origin])
 }
 
+/// The `host[:port]` a hosted-shape `url` routes to, read the way
+/// [`hosted_shape_uuid`] reads it (normalized, userinfo dropped): the name
+/// to show for a pin on an origin a run was not given.
+pub(crate) fn hosted_shape_host(url: &str) -> Option<String> {
+    let normalized = normalized_hosted_url(url)?;
+    let parsed = reqwest::Url::parse(&normalized).ok()?;
+    let host = parsed.host_str()?;
+    Some(match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
 /// `url` parsed, when it is an `http(s)` url with no userinfo on an
 /// accepted origin — Socket's patch server or one of `extra_origins` — and
 /// whether that origin is Socket's own: the origin half of

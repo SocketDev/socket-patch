@@ -31,7 +31,8 @@ pub(crate) const REINSTALL_REQUIRED: &str = "redirect_vlt_reinstall_required";
 pub(crate) const BUNDLED_INSTANCE_SKIPPED: &str = "redirect_vlt_bundled_instance_skipped";
 
 /// The origins the vlt heal treats as Socket-owned in the final lock: the
-/// patch server plus `--api-url`. Unlike discovery's
+/// patch server, the patch mirror (`--patch-mirror-url`, where the pins a
+/// mirrored run wrote resolve from) and `--api-url`. Unlike discovery's
 /// [`crate::commands::hosted_unwind::patch_server_origins`], it also counts the
 /// `--api-url` origin, so a
 /// setup serving the hosted tarballs from the API origin is healed too.
@@ -40,6 +41,7 @@ fn vlt_heal_origins(common: &crate::args::GlobalArgs) -> Vec<String> {
     common
         .patch_server_url
         .iter()
+        .chain(common.patch_mirror_url.iter())
         .chain(common.api_url.iter())
         .filter(|url| !url.trim().is_empty())
         .cloned()

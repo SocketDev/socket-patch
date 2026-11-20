@@ -2091,6 +2091,71 @@ impl ApiClient {
         .await
     }
 
+    /// Ask a patch-server mirror (`--patch-mirror-url`) whether it serves
+    /// `url`, a mirrored artifact URL, with one `HEAD`. The request carries
+    /// no Socket credential; `authorization`, when given, is the operator's
+    /// own `Authorization` header value for the mirror
+    /// (`SOCKET_PATCH_MIRROR_AUTHORIZATION`) and goes to no other host.
+    ///
+    /// Redirects are not followed: the mirrored URL holds the grant token,
+    /// which a followed redirect would hand to the next host as a
+    /// `Referer`, and a gateway that redirects to a login page answering
+    /// 200 would otherwise read as a mirror that serves the patch. No
+    /// retry: this is a check before anything is written, and a mirror
+    /// that cannot answer one request is not one to pin installs to.
+    pub async fn probe_mirror(&self, url: &str, authorization: Option<&str>) -> MirrorProbe {
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return MirrorProbe::Refused("it is not an http(s) URL".to_string());
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static(USER_AGENT_VALUE),
+        );
+        let Ok(client) = crate::utils::http::client_builder()
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .referer(false)
+            .build()
+        else {
+            return MirrorProbe::Refused("the HTTP client could not be built".to_string());
+        };
+        debug_log(&format!("HEAD patch mirror {}", redact_url(url)));
+        let mut request = client.head(url);
+        if let Some(value) = authorization.filter(|v| !v.trim().is_empty()) {
+            match header::HeaderValue::from_str(value.trim()) {
+                Ok(mut value) => {
+                    value.set_sensitive(true);
+                    request = request.header(header::AUTHORIZATION, value);
+                }
+                Err(_) => {
+                    return MirrorProbe::Refused(
+                        "SOCKET_PATCH_MIRROR_AUTHORIZATION is not a valid header value".to_string(),
+                    )
+                }
+            }
+        }
+        match tokio::time::timeout(self.vendor_retry.attempt_timeout, request.send()).await {
+            Ok(Ok(resp)) => match resp.status() {
+                status if status.is_success() => MirrorProbe::Serves,
+                StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+                | StatusCode::PROXY_AUTHENTICATION_REQUIRED => {
+                    MirrorProbe::NeedsCredentials(resp.status().as_u16())
+                }
+                status if status.is_redirection() => MirrorProbe::Redirected(status.as_u16()),
+                status => MirrorProbe::Refused(format!("it answered HTTP {}", status.as_u16())),
+            },
+            Ok(Err(e)) => {
+                MirrorProbe::Refused(format!("the request failed ({})", network_error_detail(&e)))
+            }
+            Err(_) => MirrorProbe::Refused(format!(
+                "it did not answer within {:?}",
+                self.vendor_retry.attempt_timeout
+            )),
+        }
+    }
+
     /// One GET of a grant-tokenized serve URL, its body capped at
     /// `max_bytes`; `noun` names the download in errors. The grant token in
     /// the path is the authorization, so this uses a plain (no-auth) client.
@@ -2239,6 +2304,23 @@ impl ApiClient {
     ) -> Result<Vec<u8>, ApiError> {
         artifact_download_result(self.download_vendor_archive(url, Some(deferred)).await, url)
     }
+}
+
+/// What a patch-server mirror answered for one mirrored artifact URL
+/// ([`ApiClient::probe_mirror`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MirrorProbe {
+    /// It serves the artifact.
+    Serves,
+    /// It asked for credentials the run does not have (the HTTP status):
+    /// whether it serves the artifact is unknown.
+    NeedsCredentials(u16),
+    /// It redirected the request (the HTTP status), which the check does
+    /// not follow: whether it serves the artifact is unknown.
+    Redirected(u16),
+    /// It does not serve the artifact, or could not be reached; the reason
+    /// carries no URL.
+    Refused(String),
 }
 
 /// The unspent remainder of a retry budget: a first attempt that failed

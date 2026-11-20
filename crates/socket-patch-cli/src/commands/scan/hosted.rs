@@ -75,6 +75,214 @@ pub(super) fn prune_ignored_warning() -> RunWarning {
     )
 }
 
+/// The operator's `Authorization` header value for the patch mirror
+/// (`Bearer <token>`, `Basic <base64>`), read from the environment only. It
+/// is sent with the one request that checks the mirror before a run pins
+/// anything to it, and nowhere else: it is never written to a file, and
+/// the package managers the run starts do not inherit it
+/// (`CHILD_ENV_SCRUB`).
+pub(crate) const PATCH_MIRROR_AUTHORIZATION_ENV: &str = "SOCKET_PATCH_MIRROR_AUTHORIZATION";
+
+/// Skip reason and warning code of the patches a run withheld because its
+/// patch mirror (`--patch-mirror-url`) did not serve the artifact it was
+/// asked for, or could not be reached. Nothing is written for them.
+pub(crate) const MIRROR_UNAVAILABLE: &str = "redirect_mirror_unavailable";
+
+/// Warning code of a run whose patch mirror asked for credentials the run
+/// was not given: the pins are written, unchecked.
+pub(crate) const MIRROR_UNVERIFIED: &str = "redirect_mirror_unverified";
+
+/// Warning code of a patch the project pins directly on the patch server,
+/// in a lock format whose pin a run cannot move onto the patch mirror in
+/// place: the pin is left as it is.
+pub(crate) const MIRROR_PIN_NOT_MOVED: &str = "redirect_mirror_pin_not_moved";
+
+/// One [`MIRROR_PIN_NOT_MOVED`] warning for each mirrored candidate the
+/// rewrite did not pin while one of the project's files still pins its
+/// patch directly on the patch server. npm, pnpm, yarn classic,
+/// requirements.txt and uv locks are re-pinned onto the mirror by their
+/// rewriters; the others own an earlier pin only on the host they are
+/// writing, so they leave a direct pin alone as a source the user chose.
+/// Without this the run would report such a patch with only the
+/// rewriter's own, unrelated-looking reason.
+fn mirror_pins_not_moved(
+    mirror_sources: &socket_patch_core::hosted::engine::MirrorSources,
+    candidates: &[socket_patch_core::hosted::engine::Candidate],
+    confirmed: &[(String, String)],
+    files: &std::collections::BTreeMap<String, String>,
+) -> Vec<socket_patch_core::patch::redirect::RewriteWarning> {
+    let served: Vec<String> = mirror_sources.served_urls().map(str::to_string).collect();
+    let mirrored: std::collections::BTreeSet<&str> = mirror_sources.mirrored_urls().collect();
+    candidates
+        .iter()
+        .filter(|c| mirrored.contains(c.dep.artifact_url.as_str()))
+        .filter(|c| !confirmed.iter().any(|(_, uuid)| uuid == &c.dep.patch_uuid))
+        .filter_map(|c| {
+            let (file, host) = files.iter().find_map(|(path, text)| {
+                socket_patch_core::vex::discover::hosted_host_in_text(
+                    text,
+                    &c.dep.patch_uuid,
+                    &served,
+                )
+                .map(|host| (path, host))
+            })?;
+            Some(socket_patch_core::hosted::engine::warning(
+                MIRROR_PIN_NOT_MOVED,
+                format!(
+                    "{}: {file} pins it directly on {host}, and a pin in that file cannot be \
+                     moved onto the patch mirror {} in place, so it was left as it is; run \
+                     `socket-patch rollback {}` and then this command again",
+                    c.purl,
+                    mirror_sources.base(),
+                    c.purl
+                ),
+            ))
+        })
+        .collect()
+}
+
+/// Ask the patch mirror about every mirrored pin this run would newly
+/// write, before anything is written
+/// ([`socket_patch_core::api::client::ApiClient::probe_mirror`]): every
+/// later install fetches from the mirror, so a mistyped base, a repository
+/// that does not proxy the patch server, or a patch the mirror cannot fetch
+/// must not reach a lockfile. A pin the project's files already hold is not
+/// asked about again, so a re-run that changes nothing sends nothing.
+///
+/// * The mirror serves the artifact: the pin goes ahead.
+/// * It asks for credentials, or redirects: nothing more is asked (every
+///   answer would be the same), the pins are written, and one
+///   [`MIRROR_UNVERIFIED`] warning says they were not checked. Package
+///   managers hold the mirror's credentials, not this CLI, so most private
+///   mirrors answer this way unless the operator sets
+///   [`PATCH_MIRROR_AUTHORIZATION_ENV`].
+/// * Anything else: that candidate is withheld with [`MIRROR_UNAVAILABLE`]
+///   and nothing is written for it. A lockfile pinned to a mirror that
+///   does not serve the patch breaks every install, where an unpatched one
+///   only stays as it was. When the mirror served none of the artifacts it
+///   was asked about, one warning says so of the mirror; otherwise each
+///   withheld package gets its own.
+///
+/// Candidates the mirror does not carry (Go modules) are untouched.
+async fn check_mirror(
+    api_client: &socket_patch_core::api::client::ApiClient,
+    mirror_sources: &socket_patch_core::hosted::engine::MirrorSources,
+    files: &std::collections::BTreeMap<String, String>,
+    candidates: &mut Vec<socket_patch_core::hosted::engine::Candidate>,
+    skipped: &mut Vec<socket_patch_core::hosted::engine::SkippedPatch>,
+    warnings: &mut Vec<socket_patch_core::patch::redirect::RewriteWarning>,
+    status: &mut crate::ui::StatusLine<std::io::Stderr>,
+) {
+    use socket_patch_core::api::client::MirrorProbe;
+    use socket_patch_core::hosted::engine::{self, SkippedPatch};
+    let base = mirror_sources.base();
+    let mirrored: std::collections::BTreeSet<&str> = mirror_sources.mirrored_urls().collect();
+    // The pins to ask about, one per artifact URL: mirrored, and not
+    // already in the project's files in either spelling a lock uses.
+    let already_pinned = |url: &str| {
+        let encoded = socket_patch_core::utils::uri::encode_uri_component(url);
+        files
+            .values()
+            .any(|text| text.contains(url) || text.contains(encoded.as_str()))
+    };
+    let mut asked = std::collections::BTreeSet::new();
+    let new_pins: Vec<String> = candidates
+        .iter()
+        .map(|c| &c.dep)
+        .filter(|dep| mirrored.contains(dep.artifact_url.as_str()))
+        .filter(|dep| {
+            let index = dep
+                .registry_override
+                .as_ref()
+                .map(|ov| ov.index_url.trim_end_matches('/'));
+            !already_pinned(&dep.artifact_url) && !index.is_some_and(already_pinned)
+        })
+        .filter(|dep| asked.insert(dep.artifact_url.clone()))
+        .map(|dep| dep.artifact_url.clone())
+        .collect();
+    if new_pins.is_empty() {
+        return;
+    }
+    let authorization = std::env::var(PATCH_MIRROR_AUTHORIZATION_ENV).ok();
+    let mut refused: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut unverified = None;
+    for (at, url) in new_pins.iter().enumerate() {
+        status.set(format!(
+            "Checking the patch mirror ({}/{})...",
+            at + 1,
+            new_pins.len()
+        ));
+        match api_client.probe_mirror(url, authorization.as_deref()).await {
+            MirrorProbe::Serves => {}
+            MirrorProbe::NeedsCredentials(status) => {
+                unverified = Some(format!(
+                    "answered HTTP {status}, so socket-patch could not check that it serves the \
+                     patches: it has no credentials for the mirror, or the ones it was given may \
+                     not read through it"
+                ));
+                break;
+            }
+            MirrorProbe::Redirected(status) => {
+                unverified = Some(format!(
+                    "answered HTTP {status}, a redirect the check does not follow, so \
+                     socket-patch could not check that it serves the patches"
+                ));
+                break;
+            }
+            MirrorProbe::Refused(reason) => {
+                let reason = socket_patch_core::utils::redact::redact_urls_in(&reason).into_owned();
+                refused.insert(url.clone(), reason);
+            }
+        }
+    }
+    if let Some(why) = unverified {
+        warnings.push(engine::warning(
+            MIRROR_UNVERIFIED,
+            format!(
+                "the patch mirror {base} {why}. The references were written anyway. Run an \
+                 install to confirm, or set {PATCH_MIRROR_AUTHORIZATION_ENV} to an \
+                 `Authorization` header value the mirror accepts so the next run can check"
+            ),
+        ));
+    }
+    if refused.is_empty() {
+        return;
+    }
+    // Nothing the mirror was asked about was served: say it of the mirror,
+    // once. Otherwise the mirror works and each refused patch is its own
+    // case (a patch the mirror cannot fetch, a cached miss).
+    let whole_mirror = refused.len() == new_pins.len();
+    if whole_mirror {
+        let reason = refused.values().next().cloned().unwrap_or_default();
+        warnings.push(engine::warning(
+            MIRROR_UNAVAILABLE,
+            format!(
+                "the patch mirror {base} does not serve the patches ({reason}), so nothing was \
+                 pinned to it; check that it proxies Socket's patch server at that base and \
+                 that --patch-mirror-url names it exactly"
+            ),
+        ));
+    }
+    candidates.retain(|c| {
+        let Some(reason) = refused.get(c.dep.artifact_url.as_str()) else {
+            return true;
+        };
+        let detail = format!(
+            "{}: the patch mirror {base} does not serve its patch ({reason}), so nothing was \
+             pinned for it",
+            c.purl
+        );
+        if !whole_mirror {
+            warnings.push(engine::warning(MIRROR_UNAVAILABLE, detail.clone()));
+        }
+        skipped.push(SkippedPatch {
+            detail: Some(detail),
+            ..SkippedPatch::new(&c.purl, &c.dep.patch_uuid, MIRROR_UNAVAILABLE)
+        });
+        false
+    });
+}
+
 /// Warning code inside `vex.warnings` of a hosted run: the patches this
 /// run pinned are attested from their patch records, not hash-verified
 /// (their bytes are fetched at install time).
@@ -708,6 +916,7 @@ async fn refresh_stale_gems(
         std::collections::BTreeSet<String>,
     >,
     overrides: &[DepOverride],
+    mirror_sources: &socket_patch_core::hosted::engine::MirrorSources,
     views: &mut ViewFallback<'_>,
 ) -> GemRefreshed {
     use socket_patch_core::patch::gem_refresh::{Source, Wanted};
@@ -767,14 +976,15 @@ async fn refresh_stale_gems(
             .iter()
             .filter(|o| o.ecosystem == "gem" && o.name == name && o.version == version)
         {
+            // Downloaded from where the patch server serves them: a
+            // mirrored reference names the operator's mirror, which may
+            // want credentials this run does not have.
             if let Some(ro) = &o.registry_override {
-                urls.push(format!(
-                    "{}/gems/{file}",
-                    ro.index_url.trim_end_matches('/')
-                ));
+                let url = format!("{}/gems/{file}", ro.index_url.trim_end_matches('/'));
+                urls.push(mirror_sources.fetch_url(&url).into_owned());
             }
             if o.artifact_url.ends_with(&format!("/{file}")) {
-                urls.push(o.artifact_url.clone());
+                urls.push(mirror_sources.fetch_url(&o.artifact_url).into_owned());
             }
         }
         urls.dedup();
@@ -1197,6 +1407,20 @@ async fn run_redirect_selected_untracked(
             );
         }
     }
+    // `--patch-mirror-url`: move the grants onto the operator's mirror
+    // before anything reads them, so the takeover, the withholds and the
+    // rewriters all see the URL the project's files will hold. The run's
+    // own downloads below still read the patch server (`mirror_sources`).
+    let mut mirror_sources = engine::MirrorSources::default();
+    if let Some(mirror) = common.patch_mirror() {
+        (candidates, mirror_sources) = engine::mirror_candidates(
+            std::mem::take(&mut candidates),
+            &mirror,
+            &crate::commands::hosted_unwind::patch_server_origins(common),
+            &mut skipped,
+            &mut grant_warnings,
+        );
+    }
     // The rollout rows key on the selection's purl spelling; the server's
     // reference may spell a candidate's `purl` differently. Uuids are unique
     // across the selection.
@@ -1444,6 +1668,41 @@ async fn run_redirect_selected_untracked(
         CandidateFiles::default()
     };
 
+    // A patch the project already pins through a host this run was not
+    // given (a patch mirror left out of this run's settings) is left
+    // alone, never moved onto the patch server behind the project's back.
+    // The run's own origins are the configured ones, the origins of its
+    // grants, and where the mirrored grants are served from (a direct pin
+    // an earlier run wrote moves onto the mirror).
+    {
+        let mut accepted = crate::commands::hosted_unwind::patch_server_origins(common);
+        let own = socket_patch_core::patch::redirect::upstream::foreign_dep_origins(
+            candidates.iter().map(|c| &c.dep),
+            &accepted,
+        );
+        accepted.extend(own);
+        accepted.extend(mirror_sources.served_urls().map(str::to_string));
+        engine::withhold_foreign_host_pins(
+            &read.files,
+            &accepted,
+            &mut candidates,
+            &mut skipped,
+            &mut grant_warnings,
+        );
+    }
+    if !mirror_sources.is_empty() {
+        check_mirror(
+            api_client,
+            &mirror_sources,
+            &read.files,
+            &mut candidates,
+            &mut skipped,
+            &mut grant_warnings,
+            &mut status,
+        )
+        .await;
+    }
+
     let mut python_metadata = std::collections::BTreeMap::new();
     let mut unavailable_python_artifacts = std::collections::BTreeSet::new();
     // `pipenv --version` (see `pipenv_major` below), started before the
@@ -1483,7 +1742,11 @@ async fn run_redirect_selected_untracked(
         };
         // Lazily built: a dep's attempt starts only once it is pulled here.
         let mut unstarted = wheel_deps.iter().map(|&(dep, sha256)| {
-            try_fetch_hosted_wheel_metadata_once(api_client, &dep.artifact_url, sha256)
+            try_fetch_hosted_wheel_metadata_once(
+                api_client,
+                mirror_sources.fetch_artifact_url(&dep.artifact_url),
+                sha256,
+            )
         });
         let mut in_flight: futures_util::stream::FuturesOrdered<_> = unstarted
             .by_ref()
@@ -1513,7 +1776,13 @@ async fn run_redirect_selected_untracked(
                     }
                 },
             };
-            match finish_hosted_wheel_metadata(api_client, &dep.artifact_url, sha256, attempt).await
+            match finish_hosted_wheel_metadata(
+                api_client,
+                mirror_sources.fetch_artifact_url(&dep.artifact_url),
+                sha256,
+                attempt,
+            )
+            .await
             {
                 Ok(Some(metadata)) => {
                     python_metadata.insert(dep.artifact_url.clone(), metadata);
@@ -1535,7 +1804,7 @@ async fn run_redirect_selected_untracked(
         status.set(format!("Fetching hosted package manifest for {}", dep.name));
         match socket_patch_core::hosted::npm_manifest::fetch_hosted_npm_manifest(
             api_client,
-            &dep.artifact_url,
+            mirror_sources.fetch_artifact_url(&dep.artifact_url),
             dep.integrity.sha512.as_deref(),
         )
         .await
@@ -1577,7 +1846,9 @@ async fn run_redirect_selected_untracked(
     for (url, sha512, dep) in classic_targets {
         status.set(format!("Fetching hosted tarball for {}", dep.name));
         match socket_patch_core::hosted::npm_manifest::fetch_hosted_classic_artifact(
-            api_client, &url, &sha512,
+            api_client,
+            mirror_sources.fetch_artifact_url(&url),
+            &sha512,
         )
         .await
         {
@@ -1785,6 +2056,12 @@ async fn run_redirect_selected_untracked(
     // Candidates the rewrite left out because discovery would not attribute
     // their pin (`engine::rewrite`).
     skipped.extend(done.unattributed.iter().cloned());
+    grant_warnings.extend(mirror_pins_not_moved(
+        &mirror_sources,
+        &candidates,
+        &done.confirmed,
+        &done.files,
+    ));
     let takeover::Finished {
         warnings: takeover_pre_warnings,
         migrated: takeover_migrated,
@@ -1942,6 +2219,7 @@ async fn run_redirect_selected_untracked(
         &local_records,
         &gem_artifact_shas,
         &done.overrides,
+        &mirror_sources,
         &mut views,
     )
     .await;
@@ -1960,6 +2238,7 @@ async fn run_redirect_selected_untracked(
                 .or_else(|| done.files.get("Pipfile.lock"))
                 .map(String::as_str),
             &done.overrides,
+            &mirror_sources,
             &local_records,
             &mut views,
         )
@@ -3025,6 +3304,21 @@ fn describe_skip_reason(reason: &str) -> String {
              nothing was written for it (reconcile the project's lockfiles; --json has the \
              detail)"
                 .into()
+        }
+        "redirect_mirror_unsupported" => {
+            "its registry cannot be served through the patch mirror; use --mode vendored for it (see the warning)"
+                .into()
+        }
+        "redirect_mirror_url_refused" => {
+            "its reference could not be moved onto the patch mirror (see the warning)".into()
+        }
+        "redirect_pin_on_unconfigured_host" => {
+            "the project already pins it through a host this run was not given, so it was \
+             left as it is (see the warning)"
+                .into()
+        }
+        "redirect_mirror_unavailable" => {
+            "the patch mirror does not serve it, so nothing was pinned (see the warning)".into()
         }
         other => format!("server status `{other}`"),
     }
