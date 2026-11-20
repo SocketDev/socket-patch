@@ -59,12 +59,15 @@ enum PatchTelemetryEventType {
     // Self-update (`socket-patch --update`)
     CliUpdated,
     CliUpdateFailed,
+    // A user's report that a patch broke something (`report`,
+    // `rollback --report`)
+    PatchReported,
 }
 
 impl PatchTelemetryEventType {
     /// Every variant, for the backend-contract test.
     #[cfg(test)]
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 20] = [
         Self::PatchApplied,
         Self::PatchApplyFailed,
         Self::PatchRemoved,
@@ -84,6 +87,7 @@ impl PatchTelemetryEventType {
         Self::VexFailed,
         Self::CliUpdated,
         Self::CliUpdateFailed,
+        Self::PatchReported,
     ];
 
     /// Return the wire-format string for this event type.
@@ -108,6 +112,7 @@ impl PatchTelemetryEventType {
             Self::VexFailed => "vex_failed",
             Self::CliUpdated => "cli_updated",
             Self::CliUpdateFailed => "cli_update_failed",
+            Self::PatchReported => "patch_reported",
         }
     }
 }
@@ -467,19 +472,24 @@ fn prepare_send(event: PatchTelemetryEvent, auth: &TelemetryAuth) -> PreparedSen
 /// cannot finish (a blackholed endpoint, a host that accepts and stalls)
 /// while a long-running command is still at work beside it.
 async fn send_telemetry_event(prepared: PreparedSend) {
+    match post_event(prepared).await {
+        Ok(()) => debug_log("Telemetry sent successfully"),
+        Err(why) => debug_log(&format!("Telemetry request {why}")),
+    }
+}
+
+/// POST one event and say whether the endpoint took it. `Err` is what
+/// the request did instead (`returned status 500`, `failed: …`), to
+/// follow "the request" in a debug line or an error message. Any URL in
+/// it is redacted.
+async fn post_event(prepared: PreparedSend) -> Result<(), String> {
     let PreparedSend { event, url, bearer } = prepared;
 
-    let client = match crate::utils::http::client_builder()
+    let client = crate::utils::http::client_builder()
         .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(5))
         .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            debug_log(&format!("Failed to build HTTP client: {e}"));
-            return;
-        }
-    };
+        .map_err(|e| format!("could not start (no HTTP client: {e})"))?;
 
     let mut request = client
         .post(&url)
@@ -491,17 +501,9 @@ async fn send_telemetry_event(prepared: PreparedSend) {
     }
 
     match request.json(&event).send().await {
-        Ok(response) => {
-            let status = response.status();
-            if status.is_success() {
-                debug_log("Telemetry sent successfully");
-            } else {
-                debug_log(&format!("Telemetry request returned status {status}"));
-            }
-        }
-        Err(e) => {
-            debug_log(&format!("Telemetry request failed: {e}"));
-        }
+        Ok(response) if response.status().is_success() => Ok(()),
+        Ok(response) => Err(format!("returned status {}", response.status())),
+        Err(e) => Err(crate::utils::redact::redact_urls_in(&format!("failed: {e}")).into_owned()),
     }
 }
 
@@ -996,6 +998,143 @@ pub async fn track_patch_rollback_failed(
         Some(error),
         auth,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Patch reports: `report`, `rollback --report`
+// ---------------------------------------------------------------------------
+
+/// The [`PatchOutcome::outcome`] of a patch a user reported.
+pub const OUTCOME_REPORTED: &str = "reported";
+
+/// The [`PatchOutcome::mode`] of a patch reported by UUID that the project
+/// does not hold (one already rolled back, say), so its mode is not known.
+pub const MODE_UNKNOWN: &str = "unknown";
+
+/// The longest message a report carries, in characters.
+pub const MAX_REPORT_MESSAGE_CHARS: usize = 1000;
+
+/// What a reported patch broke. A report is only ever about a patch that
+/// broke something: there is no report that a patch works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportReason {
+    /// The project no longer installs, compiles or builds.
+    BreaksBuild,
+    /// The project's tests fail.
+    BreaksTests,
+    /// The project misbehaves when it runs.
+    BreaksRuntime,
+    /// Something else; the message says what.
+    Other,
+}
+
+impl ReportReason {
+    /// Every reason, in the order help text lists them.
+    pub const ALL: [Self; 4] = [
+        Self::BreaksBuild,
+        Self::BreaksTests,
+        Self::BreaksRuntime,
+        Self::Other,
+    ];
+
+    /// The wire-format string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BreaksBuild => "breaks_build",
+            Self::BreaksTests => "breaks_tests",
+            Self::BreaksRuntime => "breaks_runtime",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Why a report did not reach Socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReportNotSent {
+    /// The run is offline (`--offline`, `SOCKET_OFFLINE`).
+    Offline,
+    /// The endpoint did not take it; the text says what happened.
+    NotDelivered(String),
+}
+
+impl ReportNotSent {
+    /// The stable code a `--json` run reports.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Offline => "offline_unsupported",
+            Self::NotDelivered(_) => "report_not_sent",
+        }
+    }
+}
+
+impl std::fmt::Display for ReportNotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Offline => f.write_str("the run is offline"),
+            Self::NotDelivered(why) => write!(f, "the request {why}"),
+        }
+    }
+}
+
+/// A report's message as it is sent: on one line, with URLs' credentials
+/// and the home directory redacted ([`sanitize_error_message`]), cut to
+/// [`MAX_REPORT_MESSAGE_CHARS`]. `None` for a message with nothing in it.
+pub fn report_message(message: &str) -> Option<String> {
+    // Line breaks and control characters become spaces: each would cost
+    // up to six bytes of the event once JSON escapes it.
+    let flat = message
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flat.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(
+        sanitize_error_message(&flat),
+        MAX_REPORT_MESSAGE_CHARS,
+    ))
+}
+
+/// Send a user's report that `patches` broke something, as `command`
+/// (`report`, or the `rollback` that carried `--report`), and wait for
+/// the answer: unlike a tracker's event, a report is the point of the
+/// run, so the caller says whether it arrived.
+///
+/// The event names each patch by UUID, ecosystem and mode (never a
+/// package name or a path), the reason, and the message the user typed
+/// ([`report_message`]).
+///
+/// A report is something the user asked to send, not telemetry about a
+/// run, so the telemetry opt-outs ([`is_telemetry_disabled`]) do not stop
+/// it. An offline run does: it makes no request of any kind.
+pub async fn send_patch_report(
+    command: &'static str,
+    reason: ReportReason,
+    message: Option<&str>,
+    patches: &[PatchOutcome],
+    auth: &TelemetryAuth,
+) -> Result<(), ReportNotSent> {
+    if is_offline_env() {
+        return Err(ReportNotSent::Offline);
+    }
+    let mut fields = serde_json::json!({ "reason": reason.as_str() });
+    if let Some(message) = message.and_then(report_message) {
+        fields["message"] = serde_json::json!(message);
+    }
+    let metadata = match with_patches(fields, patches) {
+        serde_json::Value::Object(map) => map.into_iter().collect(),
+        _ => HashMap::new(),
+    };
+    let event = build_telemetry_event(
+        PatchTelemetryEventType::PatchReported,
+        command,
+        Some(metadata),
+        None,
+    );
+    post_event(prepare_send(event, auth))
+        .await
+        .map_err(ReportNotSent::NotDelivered)
 }
 
 // ---------------------------------------------------------------------------
@@ -1768,6 +1907,11 @@ mod tests {
             PatchTelemetryEventType::CliUpdateFailed.as_str(),
             "cli_update_failed"
         );
+        // Reports
+        assert_eq!(
+            PatchTelemetryEventType::PatchReported.as_str(),
+            "patch_reported"
+        );
     }
 
     /// The `event_type` strings the Socket API's `/v0/orgs/:slug/telemetry`
@@ -1803,6 +1947,7 @@ mod tests {
         "vex_failed",
         "cli_updated",
         "cli_update_failed",
+        "patch_reported",
     ];
 
     #[test]
@@ -1965,6 +2110,163 @@ mod tests {
             bearer: Some("tok".to_string()),
         };
         (server, auth)
+    }
+
+    /// A report posts `patch_reported` with the reason, the message and
+    /// the patches, and comes back once the endpoint has taken it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_report_posts_the_reason_the_message_and_the_patches() {
+        let (server, auth) = org_endpoint().await;
+        let _on = TelemetryOn::new();
+        let sent = send_patch_report(
+            "report",
+            ReportReason::BreaksTests,
+            Some("jest fails:\n  TypeError in ~ /x\t(see log)"),
+            &[
+                outcome(UUID_A, "npm", MODE_AGENT, OUTCOME_REPORTED, None),
+                outcome(UUID_B, "", MODE_UNKNOWN, OUTCOME_REPORTED, None),
+            ],
+            &auth,
+        )
+        .await;
+        assert_eq!(sent, Ok(()));
+
+        // Nothing is left in flight: the request was awaited.
+        let bodies = posted(&server).await;
+        assert_eq!(bodies.len(), 1);
+        let body = &bodies[0];
+        assert_eq!(body["event_type"], "patch_reported");
+        assert_eq!(body["context"]["command"], "report");
+        // No `event_kind`: the server stores an event without one for
+        // every org (see `wire_shape_matches_the_backend_extractor`).
+        assert!(body.get("event_kind").is_none());
+        let metadata = &body["metadata"];
+        assert_eq!(metadata["reason"], "breaks_tests");
+        assert_eq!(
+            metadata["message"],
+            "jest fails: TypeError in ~ /x (see log)"
+        );
+        assert_eq!(
+            metadata["patches"],
+            serde_json::json!([
+                { "uuid": UUID_A, "ecosystem": "npm", "mode": "agent", "outcome": "reported" },
+                { "uuid": UUID_B, "ecosystem": "", "mode": "unknown", "outcome": "reported" },
+            ])
+        );
+        assert_eq!(metadata["outcomes"], serde_json::json!({ "reported": 2 }));
+    }
+
+    /// A report is sent because the user asked for it: no telemetry
+    /// opt-out stops it. An offline run sends nothing at all.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_report_ignores_the_telemetry_opt_outs_but_not_offline() {
+        let (server, auth) = org_endpoint().await;
+        let _on = TelemetryOn::new();
+        let patches = [outcome(UUID_A, "npm", MODE_AGENT, OUTCOME_REPORTED, None)];
+
+        for var in ["SOCKET_TELEMETRY_DISABLED", "DO_NOT_TRACK"] {
+            std::env::set_var(var, "1");
+            assert!(is_telemetry_disabled());
+            let sent = send_patch_report("report", ReportReason::Other, None, &patches, &auth);
+            assert_eq!(sent.await, Ok(()), "{var} must not stop a report");
+            std::env::remove_var(var);
+        }
+        let bodies = posted(&server).await;
+        assert_eq!(bodies.len(), 2);
+        // A report without a message carries no `message` key.
+        assert!(bodies[0]["metadata"].get("message").is_none());
+
+        std::env::set_var("SOCKET_OFFLINE", "1");
+        let sent = send_patch_report("report", ReportReason::Other, None, &patches, &auth).await;
+        std::env::remove_var("SOCKET_OFFLINE");
+        assert_eq!(sent, Err(ReportNotSent::Offline));
+        assert_eq!(ReportNotSent::Offline.code(), "offline_unsupported");
+        assert_eq!(
+            posted(&server).await.len(),
+            2,
+            "an offline report is not sent"
+        );
+    }
+
+    /// A report the endpoint refuses, or that reaches no endpoint, says
+    /// so: the caller must not tell the user it was received.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_report_that_is_not_delivered_says_so() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _on = TelemetryOn::new();
+        let patches = [outcome(UUID_A, "npm", MODE_AGENT, OUTCOME_REPORTED, None)];
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let refused = send_patch_report(
+            "report",
+            ReportReason::Other,
+            None,
+            &patches,
+            &route_to(&server),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code(), "report_not_sent");
+        assert_eq!(
+            refused.to_string(),
+            "the request returned status 500 Internal Server Error"
+        );
+
+        // Nothing listens here; the URL's credentials stay out of the text.
+        let nowhere = TelemetryAuth {
+            url: "http://user:hunter2@127.0.0.1:9/telemetry".to_string(),
+            bearer: None,
+        };
+        let unreachable =
+            send_patch_report("report", ReportReason::Other, None, &patches, &nowhere)
+                .await
+                .unwrap_err();
+        assert_eq!(unreachable.code(), "report_not_sent");
+        let text = unreachable.to_string();
+        assert!(text.starts_with("the request failed: "), "{text}");
+        assert!(!text.contains("hunter2"), "{text}");
+    }
+
+    /// A message goes out on one line, redacted and bounded; one with
+    /// nothing in it is no message.
+    #[test]
+    fn a_report_message_is_one_bounded_redacted_line() {
+        assert_eq!(report_message("  \n\t "), None);
+        assert_eq!(
+            report_message("line one\r\nline\u{0}two"),
+            Some("line one line two".to_string())
+        );
+        assert_eq!(
+            report_message("see https://user:hunter2@example.com/log"),
+            Some(sanitize_error_message(
+                "see https://user:hunter2@example.com/log"
+            ))
+        );
+        assert!(!report_message("see https://user:hunter2@example.com/log")
+            .unwrap()
+            .contains("hunter2"));
+        let long = report_message(&"é".repeat(MAX_REPORT_MESSAGE_CHARS + 50)).unwrap();
+        assert_eq!(long.chars().count(), MAX_REPORT_MESSAGE_CHARS);
+        assert!(long.ends_with('…'));
+    }
+
+    /// The reasons are what the user types and what the server stores.
+    #[test]
+    fn report_reasons_have_stable_wire_strings() {
+        let wire: Vec<&str> = ReportReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            wire,
+            ["breaks_build", "breaks_tests", "breaks_runtime", "other"]
+        );
     }
 
     /// Each public tracker posts the event type and metadata the backend
