@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::api::client::ApiRoute;
 use crate::constants::USER_AGENT;
+use crate::update::channel::{detect_channel, ChannelEnv};
 use crate::utils::env_compat::{is_offline_env, proxy_url_from_env};
 use crate::utils::fs::home_dir;
 use crate::utils::socket_cli_config::env_truthy;
@@ -118,6 +119,13 @@ struct PatchTelemetryContext {
     platform: String,
     arch: String,
     command: String,
+    /// How this binary was installed ([`InstallChannel::id`]): `standalone`,
+    /// `npm`, `cargo`, `homebrew`, `pypi` or `launcher_cache`. Left out when
+    /// the binary's own path cannot be read.
+    ///
+    /// [`InstallChannel::id`]: crate::update::channel::InstallChannel::id
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<&'static str>,
 }
 
 /// Error details for telemetry events.
@@ -197,6 +205,18 @@ fn debug_log(message: &str) {
 // Build event
 // ---------------------------------------------------------------------------
 
+/// The install channel of the running binary, worked out once per process
+/// from the binary's own path: the check `--update` makes before it
+/// replaces a binary. It names one of six channels and never a path. It
+/// reads no project file and makes no request.
+fn install_channel() -> Option<&'static str> {
+    static CHANNEL: Lazy<Option<&'static str>> = Lazy::new(|| {
+        let exe = crate::update::resolve_install_path().ok()?;
+        Some(detect_channel(&exe, &ChannelEnv::from_env()).id())
+    });
+    *CHANNEL
+}
+
 /// Build the telemetry context for the current environment.
 fn build_telemetry_context(command: &str) -> PatchTelemetryContext {
     PatchTelemetryContext {
@@ -204,6 +224,7 @@ fn build_telemetry_context(command: &str) -> PatchTelemetryContext {
         platform: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         command: command.to_string(),
+        channel: install_channel(),
     }
 }
 
@@ -1844,7 +1865,10 @@ mod tests {
             .map(String::as_str)
             .collect();
         ctx.sort_unstable();
-        assert_eq!(ctx, ["arch", "command", "platform", "version"]);
+        assert_eq!(ctx, ["arch", "channel", "command", "platform", "version"]);
+        // The channel is one of the ids `InstallChannel::id` names, never a
+        // path. A test binary sits in the build directory: standalone.
+        assert_eq!(v["context"]["channel"], "standalone");
         assert_eq!(v["error"]["type"], "Error");
         assert_eq!(v["error"]["message"], "boom");
         assert_eq!(v["metadata"]["patches_count"], 2);

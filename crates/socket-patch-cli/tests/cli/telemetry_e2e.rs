@@ -1156,6 +1156,12 @@ async fn scan_reports_requested_and_project_modes() {
         env!("CARGO_PKG_VERSION"),
         "every event carries the client version"
     );
+    // The binary under test sits in the build directory, which no package
+    // manager owns.
+    assert_eq!(
+        scanned["context"]["channel"], "standalone",
+        "every event says how the binary was installed"
+    );
 }
 
 /// A hosted run that fails after selecting patches reports
