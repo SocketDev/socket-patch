@@ -2813,6 +2813,110 @@ async fn gem_hosted_scan_pins_platform_builds_from_the_lock_alone() {
     }
 }
 
+/// A lock that names the gem only as platform builds, beside a plain
+/// gem, with a prebuild missing for one locked platform: no mode can
+/// patch the gem. The lock still resolves it, so the closing totals count
+/// its advisory as left to patch, in hosted mode (which reads the gem
+/// from the lock alone) and in vendored mode (which reads the installed
+/// platform copy).
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_platform_gem_is_counted_as_left_to_patch() {
+    const LEFT: &str =
+        "\n1 vulnerability left to patch: 1 is in packages this run did not patch.\n";
+    let arm_sha = sha256_of(&real_gem_for(PATCHED_LIB, PLATFORM));
+    for mode in ["hosted", "vendored"] {
+        let server = MockServer::start().await;
+        // The lookup names the advisory the patch fixes, as the service
+        // does: the totals count advisories.
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "packages": [{
+                    "purl": PURL,
+                    "patches": [{
+                        "uuid": UUID, "purl": PURL, "tier": "free",
+                        "cveIds": [], "ghsaIds": [GHSA], "severity": "high",
+                        "title": "gem stale-install fixture"
+                    }]
+                }],
+                "canAccessPaidPatches": false,
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_api_with(
+            &server,
+            None,
+            &sha256_of(&real_gem(PATCHED_LIB)),
+            &[(PLATFORM, arm_sha.clone())],
+        )
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let gemfile = format!(
+            "source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\ngem \
+             \"plain-probe-gem\", \"1.0.0\"\n"
+        );
+        // The plain gem makes the lock one that lists ruby-platform gems
+        // too, as every real lock does (nokogiri beside racc).
+        let lock = platform_lock(&"1".repeat(64), &"2".repeat(64))
+            .replace("  specs:\n", "  specs:\n    plain-probe-gem (1.0.0)\n")
+            .replace(
+                "DEPENDENCIES\n",
+                "DEPENDENCIES\n  plain-probe-gem (= 1.0.0)\n",
+            );
+        assert!(
+            lock.contains("    plain-probe-gem (1.0.0)\n")
+                && !lock.contains(&format!("    {DEP} ({DEP_VERSION})\n")),
+            "the lock holds a plain gem, and {DEP} as platform builds only:\n{lock}"
+        );
+        std::fs::write(proj.join("Gemfile"), &gemfile).unwrap();
+        std::fs::write(proj.join("Gemfile.lock"), &lock).unwrap();
+        if mode == "vendored" {
+            install_real_gem_for(&project_home(&proj), UPSTREAM_LIB, PLATFORM);
+        }
+
+        let uri = server.uri();
+        let (code, stdout, stderr) = common::run_with_env(
+            &proj,
+            &[
+                "scan",
+                "--mode",
+                mode,
+                "--yes",
+                "--cwd",
+                proj.to_str().unwrap(),
+                "--api-url",
+                uri.as_str(),
+                "--patch-server-url",
+                uri.as_str(),
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+            ],
+            &[],
+        );
+        assert_eq!(code, 0, "{mode}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        // The premise: the run refused the gem for its missing prebuild.
+        assert!(
+            format!("{stdout}{stderr}").contains(OTHER_PLATFORM),
+            "{mode}: the run names the platform it has no patched build for\nstdout:\n\
+             {stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
+            lock,
+            "{mode}: the lock is untouched"
+        );
+        assert!(
+            stdout.ends_with(LEFT),
+            "{mode}: the refused gem is left to patch\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
 /// Human output of the run that refreshes: one progress line per kind,
 /// no warning, and the committed archive in the files to commit.
 #[tokio::test(flavor = "multi_thread")]

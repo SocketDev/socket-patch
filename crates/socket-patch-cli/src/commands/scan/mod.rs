@@ -3796,16 +3796,19 @@ async fn scan_project(
     // not use (another project's gem in a shared gem home, an extraneous
     // `node_modules` entry): the mode reports it, and the report does not
     // count it as left to patch. A requirements file may pin only the
-    // direct dependencies, so PyPI packages always count.
-    let locked: HashSet<PurlKey> = lockfile_only
-        .entries
-        .iter()
-        .map(|entry| PurlKey::new(&entry.purl))
-        .collect();
-    let complete_locks: HashSet<Ecosystem> = lockfile_only
-        .entries
-        .iter()
-        .filter_map(|entry| Ecosystem::from_purl(&entry.purl))
+    // direct dependencies, so PyPI packages always count. The lockfile
+    // inventory leaves out a gem the Bundler lock holds only as
+    // precompiled platform builds; the lock names it too.
+    let locked_purls = || {
+        lockfile_only
+            .entries
+            .iter()
+            .map(|entry| entry.purl.as_str())
+            .chain(lockfile_only.platform_gems.iter().map(String::as_str))
+    };
+    let locked: HashSet<PurlKey> = locked_purls().map(PurlKey::new).collect();
+    let complete_locks: HashSet<Ecosystem> = locked_purls()
+        .filter_map(Ecosystem::from_purl)
         .filter(|eco| *eco != Ecosystem::Pypi)
         .collect();
     let in_project = |purl: &str| {
