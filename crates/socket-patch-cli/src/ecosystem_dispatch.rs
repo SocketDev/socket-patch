@@ -1556,6 +1556,11 @@ where
 /// entry. Each crawler reports only its own ecosystem's purls, so the
 /// selected ecosystems' packages, their order and their counts are exactly
 /// the full crawl's.
+///
+/// Every command that crawls keeps something more: `scan` the npm half
+/// ([`crawl_ecosystems_with_npm`]), `get` and `show` every installed Python
+/// package ([`crawl_ecosystems_for_name`]). This plain form is the tests'.
+#[cfg(test)]
 pub async fn crawl_ecosystems(
     options: &CrawlerOptions,
     only: Option<&[String]>,
@@ -1570,7 +1575,7 @@ pub async fn crawl_ecosystems(
 }
 
 /// [`crawl_ecosystems`] for resolving a package the user named
-/// (`get <name>`). A Python project with no environment of its own is
+/// (`get <name>`, `show <name>`). A Python project with no environment of its own is
 /// crawled for every package installed where it installs
 /// (`PythonCrawler::crawl_all_installed`), not only the ones it declares:
 /// the name says the package is wanted, as its PURL would.

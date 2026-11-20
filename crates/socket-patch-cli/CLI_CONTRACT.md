@@ -1402,7 +1402,8 @@ the model is **not uniform** today:
   author chose) or on a url that names no package; a `${VAR}` in a requirements line; or a
   declaration that cannot be read (a missing include, a link leaving the repository).
   `apply`, `rollback` and `vex` look a recorded patch's package up by PURL in the same interpreter
-  and are not scoped, and `get <name>` resolves a name among every package installed there. A
+  and are not scoped, and `get <name>` and `show <name>` resolve a name among every package
+  installed there. A
   project whose environment only its manager creates (uv, Pipenv, Poetry with its virtualenvs on)
   still has nothing installed until that environment exists.
 

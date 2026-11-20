@@ -1003,8 +1003,8 @@ global project), are never read for a project. Use `--global` to patch
 those.
 
 `apply`, `rollback` and `vex` find the packages of recorded patches by name
-and version in the same interpreter, and `socket-patch get <name>` resolves
-a name among everything installed there. The filter applies to `scan`
+and version in the same interpreter, and `socket-patch get <name>` and
+`socket-patch show <name>` resolve a name among everything installed there. The filter applies to `scan`
 discovery only.
 
 `scan --prune` does not drop the record of a patch whose package is no
