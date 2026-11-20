@@ -7141,7 +7141,7 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
     //    `CHECKSUMS` sha256 only for a rubygems.org remote, so that arm
     //    spells the mock upstream as rubygems.org in the pair and serves
     //    that registry from the mock (`SOCKET_RUBYGEMS_URL`). No bundler
-    //    runs on this project after this point.
+    //    runs on that arm's project after this point.
     let upstream = format!("{api}/upstream");
     let as_committed = |text: &str| {
         if checksums_lock {
@@ -7196,6 +7196,12 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
         for command in ["remove", "vendor --revert"] {
             let dir = fx.tmp.path().join(format!("unwind-{}", &command[..6]));
             copy_dir_recursive(&fx.proj, &dir);
+            // What a `bundle cache` taken under the hosted pin left: this
+            // machine's patched prebuild in Bundler's cache dir.
+            let cached = dir.join("vendor/cache").join(format!("{own_leaf}.gem"));
+            let prebuild = patched_builds.iter().find(|b| b.token == token(&own));
+            std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+            std::fs::write(&cached, &prebuild.expect("own prebuild").gem).unwrap();
             let cwd = dir.to_str().expect("utf8 tmp path");
             let mut argv: Vec<&str> = match command {
                 "remove" => vec!["remove", PURL, "--yes"],
@@ -7232,6 +7238,11 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
                 stdout.contains("upstream_gem_install_refreshed")
                     && !stdout.contains("upstream_gem_stale_install"),
                 "{command}: the copy is refreshed, and nothing is left patched:\n{stdout}"
+            );
+            assert!(
+                stdout.contains("upstream_gem_stale_cache")
+                    && stdout.contains(&cached.display().to_string()),
+                "{command}: the patched platform archive in the cache dir is named:\n{stdout}"
             );
         }
     }

@@ -1106,36 +1106,58 @@ async fn stale_cache_warning(
 
 /// [`STALE_CACHE`] for a gem a vendored unwind (`remove`, `rollback`,
 /// `vendor --revert`, `scan --prune`, `vendor`'s reconcile) put back on its
-/// upstream `GEM` entry at `root` (#1594). The archive a `bundle cache`
-/// took while a hosted pin was live survives a hosted → vendored takeover
-/// (the path source shadows it), so once the vendored copy is unwired
-/// bundler installs from it again. Judged like the hosted restore's check,
+/// upstream `GEM` entry at `root` (#1594): one warning per archive. The
+/// archive a `bundle cache` took while a hosted pin was live survives a
+/// hosted → vendored takeover (the path source shadows it), so once the
+/// vendored copy is unwired bundler installs from it again. Judged like
+/// the hosted restore's check, build by build: the ruby-platform gem's
+/// archive, and that of each platform build the lock names (a gem vendored
+/// from prebuilt platform gems is back on its platform entries, #2174),
 /// against the lock's `CHECKSUMS` entry, else the rubygems.org compact
-/// index (unless `offline`). A gem locked from another remote with no
+/// index (unless `offline`). A build locked from another remote with no
 /// `CHECKSUMS` sha can't be judged, and is most likely a private gem cached
 /// on purpose: no warning.
 pub(super) async fn unwound_stale_cache(
     root: &std::path::Path,
     purl: &str,
     offline: bool,
-) -> Option<(&'static str, String)> {
-    let (_, name, version) = crate::utils::purl::purl_parts(purl)?;
+) -> Vec<(&'static str, String)> {
+    let Some((_, name, version)) = crate::utils::purl::purl_parts(purl) else {
+        return Vec::new();
+    };
     let mut lock = None;
     for file in BUNDLER_LOCKS {
         // Guarded: a FIFO or device squatting the lock path must not block.
         if let Ok(text) = crate::utils::fs::read_regular_to_string(&root.join(file)).await {
-            lock = Some(text);
+            lock = Some(to_lf(&text).into_owned());
             break;
         }
     }
+    let mut tokens = vec![version.clone()];
     if let Some(text) = &lock {
-        if lock_checksum(text, &name, &version).is_none() && !rubygems_locked(text, &name, &version)
-        {
-            return None;
-        }
+        let named = crate::formats::gem::parse(text)
+            .locked_builds(&name, &version)
+            .ids(&name, &version);
+        tokens.extend(
+            named
+                .iter()
+                .filter(|id| id.platform.is_some())
+                .map(GemId::token),
+        );
     }
     let client = UpstreamClient::new(offline);
-    stale_cache_warning(root, purl, &name, &version, lock.as_deref(), &client).await
+    let mut warnings = Vec::new();
+    for token in tokens {
+        if let Some(text) = &lock {
+            if lock_checksum(text, &name, &token).is_none() && !rubygems_locked(text, &name, &token)
+            {
+                continue;
+            }
+        }
+        warnings
+            .extend(stale_cache_warning(root, purl, &name, &token, lock.as_deref(), &client).await);
+    }
+    warnings
 }
 
 /// What is known of the upstream archive of a gem that is back on its
@@ -3051,6 +3073,7 @@ mod tests {
         );
         let (code, detail) = unwound_stale_cache(tmp.path(), "pkg:gem/rails@7.0.0", true)
             .await
+            .pop()
             .expect("the patched archive is named");
         assert_eq!(code, STALE_CACHE);
         let path = tmp
@@ -3063,6 +3086,48 @@ mod tests {
         assert!(detail.contains("non-upstream"), "{detail}");
     }
 
+    /// #2174: a gem vendored from prebuilt platform gems is back on its
+    /// platform entries, and `bundle cache` keeps each build under
+    /// `<name>-<version>-<platform>.gem`. The patched archive of a locked
+    /// platform build is named; an upstream one, and the archive of a
+    /// build the lock does not name, are not.
+    #[tokio::test]
+    async fn vendored_unwind_names_a_patched_platform_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_sha = sha_hex(b"upstream gem");
+        std::fs::write(
+            tmp.path().join("Gemfile.lock"),
+            format!(
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    \
+                 nokogiri (1.18.10-arm64-darwin)\n    nokogiri (1.18.10-x86_64-linux-gnu)\n\n\
+                 PLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\n\
+                 DEPENDENCIES\n  nokogiri (= 1.18.10)\n\n\
+                 CHECKSUMS\n  nokogiri (1.18.10-arm64-darwin) sha256={upstream_sha}\n  \
+                 nokogiri (1.18.10-x86_64-linux-gnu) sha256={upstream_sha}\n\n\
+                 BUNDLED WITH\n   2.6.9\n"
+            ),
+        )
+        .unwrap();
+        let cache = tmp.path().join("vendor").join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let patched = cache.join("nokogiri-1.18.10-x86_64-linux-gnu.gem");
+        std::fs::write(&patched, b"patched gem").unwrap();
+        std::fs::write(
+            cache.join("nokogiri-1.18.10-arm64-darwin.gem"),
+            b"upstream gem",
+        )
+        .unwrap();
+        std::fs::write(cache.join("nokogiri-1.18.10-java.gem"), b"patched gem").unwrap();
+        let hits = unwound_stale_cache(tmp.path(), "pkg:gem/nokogiri@1.18.10", true).await;
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].0, STALE_CACHE);
+        assert!(
+            hits[0].1.contains(&patched.display().to_string()),
+            "{hits:?}"
+        );
+        assert!(hits[0].1.contains("non-upstream"), "{hits:?}");
+    }
+
     /// #1594: an upstream archive, or none at all, is healthy.
     #[tokio::test]
     async fn vendored_unwind_keeps_quiet_about_an_upstream_or_missing_archive() {
@@ -3073,10 +3138,10 @@ mod tests {
             Some(b"upstream gem"),
         );
         let hit = unwound_stale_cache(tmp.path(), "pkg:gem/rails@7.0.0", true).await;
-        assert_eq!(hit, None);
+        assert_eq!(hit, Vec::new());
         let tmp = unwound_project("https://rubygems.org/", Some(&upstream_sha), None);
         let hit = unwound_stale_cache(tmp.path(), "pkg:gem/rails@7.0.0", true).await;
-        assert_eq!(hit, None);
+        assert_eq!(hit, Vec::new());
     }
 
     /// #1594 on a lock without `CHECKSUMS`: offline, the upstream sha can't
@@ -3086,6 +3151,7 @@ mod tests {
         let tmp = unwound_project("https://rubygems.org/", None, Some(b"patched gem"));
         let (code, detail) = unwound_stale_cache(tmp.path(), "pkg:gem/rails@7.0.0", true)
             .await
+            .pop()
             .expect("the unchecked archive is named");
         assert_eq!(code, STALE_CACHE);
         assert!(detail.contains("could not be checked"), "{detail}");
@@ -3110,7 +3176,7 @@ mod tests {
         )
         .await
         .expect("a FIFO lock must not block the check");
-        assert!(hit.is_some_and(|(_, d)| d.contains("could not be checked")));
+        assert!(hit.len() == 1 && hit[0].1.contains("could not be checked"));
     }
 
     /// #1594: a gem locked from a private remote with no `CHECKSUMS` sha
@@ -3120,7 +3186,7 @@ mod tests {
     async fn vendored_unwind_skips_an_unchecked_private_gem() {
         let tmp = unwound_project("https://gems.example.com/", None, Some(b"private gem"));
         let hit = unwound_stale_cache(tmp.path(), "pkg:gem/rails@7.0.0", true).await;
-        assert_eq!(hit, None);
+        assert_eq!(hit, Vec::new());
         // A CHECKSUMS sha still judges it, whatever the remote.
         let upstream_sha = sha_hex(b"upstream gem");
         let tmp = unwound_project(
@@ -3129,7 +3195,7 @@ mod tests {
             Some(b"patched gem"),
         );
         let hit = unwound_stale_cache(tmp.path(), "pkg:gem/rails@7.0.0", true).await;
-        assert!(hit.is_some_and(|(_, d)| d.contains("non-upstream")));
+        assert!(hit.len() == 1 && hit[0].1.contains("non-upstream"));
     }
 
     /// A gem restored in both a `Gemfile` and a `gems.rb` pair shares one
