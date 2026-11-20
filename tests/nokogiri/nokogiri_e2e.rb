@@ -209,6 +209,27 @@ class NokogiriE2E
 
   # ---- the install -------------------------------------------------------
 
+  # A `bundle install` failure that is the registry's, not a result: the
+  # install is tried again. (Not "HTTP": Bundler names https://rubygems.org
+  # in every failure.)
+  #
+  # The last one is not a network error by its text. Bundler reads which
+  # Rubies a release supports from the compact index. When one request to
+  # that index fails, Bundler does not fail: it resolves from the full
+  # index instead, which lists names and versions only, takes the newest
+  # release of every gem, and stops at the first one this Ruby cannot run:
+  #
+  #   minitest-5.27.0 requires ruby version >= 3.1, which is incompatible
+  #   with the current version, ruby 2.3.8p459
+  #
+  # (Bundler 2 words it "requires Ruby version >= 3.2. The current ruby
+  # version is 3.1.6.") It writes no lock, so the next try resolves anew.
+  # A requirement the Gemfile really cannot meet fails every try.
+  REGISTRY_BLIP = Regexp.union(
+    /Network error|Gem::RemoteFetcher::FetchError|Net::(?:Open|Read)Timeout|Could not (?:reach|fetch)/,
+    /requires [Rr]uby version/
+  )
+
   def install
     gemfile = ["source \"https://rubygems.org\"", "gem \"nokogiri\", \"#{@version}\""]
     if @opts[:rails]
@@ -249,10 +270,10 @@ class NokogiriE2E
       attempts += 1
       sh!(@install_env, *bundle("install", "--jobs", "4", "--retry", "3"))
     rescue Failure => e
-      # A registry blip, not a result: one more try before giving up. (Not
-      # "HTTP": Bundler names https://rubygems.org in every failure.)
-      blip = /Network error|Gem::RemoteFetcher::FetchError|Net::(Open|Read)Timeout|Could not (reach|fetch)/
-      raise if attempts >= 2 || e.message !~ blip
+      raise if attempts >= 3 || e.message !~ REGISTRY_BLIP
+      puts "  the registry failed a request: installing again, attempt #{attempts + 1} of 3",
+           "    #{e.message.lines.grep(REGISTRY_BLIP).first.to_s.strip}"
+      sleep(5 * attempts)
       retry
     end
 
