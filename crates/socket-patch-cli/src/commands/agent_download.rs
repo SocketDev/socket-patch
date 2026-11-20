@@ -2026,6 +2026,12 @@ pub(crate) fn record_apply_outcome(
             env.warnings.push(warning.clone());
         }
     }
+    // A copy skipped as not supported yet (a compiled conda build) is one
+    // copy's outcome, not its package's: another copy of the same record
+    // may have been patched. Its events are recorded on their own below,
+    // one per copy.
+    let unsupported_copy =
+        |skip: &PatchEvent| skip.error_code.as_deref() == Some(CONDA_BUILD_NOT_PYPI_RELEASE);
     let mut failed_any = false;
     for (purl, uuid) in recorded {
         if let Some(failure) = report
@@ -2040,9 +2046,11 @@ pub(crate) fn record_apply_outcome(
             );
             failed_any = true;
         } else if let Some(skip) = report.skipped.iter().find(|skip| {
-            skip.purl
-                .as_deref()
-                .is_some_and(|key| apply_key_covers(key, purl))
+            !unsupported_copy(skip)
+                && skip
+                    .purl
+                    .as_deref()
+                    .is_some_and(|key| apply_key_covers(key, purl))
         }) {
             let mut event = skip.clone().with_uuid(uuid);
             event.purl = Some(purl.clone());
@@ -2051,6 +2059,14 @@ pub(crate) fn record_apply_outcome(
             env.record(
                 PatchEvent::new(EventAction::Applied, purl.as_str()).with_uuid(uuid.as_str()),
             );
+        } else if report.skipped.iter().any(|skip| {
+            unsupported_copy(skip)
+                && skip
+                    .purl
+                    .as_deref()
+                    .is_some_and(|key| apply_key_covers(key, purl))
+        }) {
+            // Every copy of it was skipped that way: said below.
         } else if report.code == 0 {
             record_apply_skip(
                 env,
@@ -2065,11 +2081,37 @@ pub(crate) fn record_apply_outcome(
     }
     // The nested apply covers the whole manifest, so its other skips
     // (`already_patched`, `vendored`, ...) belong to packages this run did
-    // not select; only a user-patch conflict found after selection is news.
+    // not select. Two are news all the same: a user-patch conflict found
+    // after selection, and a copy left unpatched because it is not
+    // supported yet (a compiled conda build), which would otherwise go
+    // unsaid, the nested apply being silent under `--json`.
     for skip in &report.skipped {
         let Some(key) = skip.purl.as_deref() else {
             continue;
         };
+        if unsupported_copy(skip) {
+            let mut event = skip.clone();
+            if let Some((purl, uuid)) = recorded
+                .iter()
+                .find(|(purl, _)| apply_key_covers(key, purl))
+            {
+                event.purl = Some(purl.clone());
+                event.uuid = Some(uuid.clone());
+            } else if event.uuid.is_none() {
+                event.uuid = uuid_of(key);
+            }
+            // Once per copy: the reason names it.
+            let said = env.events.iter().any(|existing| {
+                existing.action == EventAction::Skipped
+                    && existing.error_code == event.error_code
+                    && existing.purl == event.purl
+                    && existing.reason == event.reason
+            });
+            if !said {
+                env.record(event);
+            }
+            continue;
+        }
         if skip.error_code.as_deref() != Some(super::user_patches::CONFLICT)
             || recorded.iter().any(|(purl, _)| apply_key_covers(key, purl))
             || report
