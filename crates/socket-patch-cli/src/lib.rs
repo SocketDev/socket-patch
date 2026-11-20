@@ -143,6 +143,17 @@ pub enum Commands {
     /// Apply patches for a package, advisory, or patch UUID
     Get(commands::get::GetArgs),
 
+    /// Show what is inside a patch: its fixes, measurements and diff
+    ///
+    /// Reads the patch from the patch service and changes nothing. Prints
+    /// the advisories the patch fixes, what Socket measured about it
+    /// (exploits blocked, tests passing, size, run-time cost), the files it
+    /// changes and the diff of each. On a terminal the patch opens
+    /// full-screen, as the page a row of `list` opens: the arrow keys
+    /// scroll, n and p step between files, q leaves. Piped, or with
+    /// --no-pager, everything prints at once.
+    Show(commands::show::ShowArgs),
+
     /// Show this project's patches in every mode
     List(commands::list::ListArgs),
 
@@ -223,6 +234,7 @@ impl Commands {
             Commands::Vendor(a) => &a.common,
             Commands::Rollback(a) => &a.common,
             Commands::Get(a) => &a.common,
+            Commands::Show(a) => &a.common,
             Commands::List(a) => &a.common,
             Commands::Remove(a) => &a.common,
             Commands::Repair(a) => &a.common,
@@ -301,6 +313,7 @@ fn short_help_hidden_own(sub: &str) -> &'static [&'static str] {
             "all_releases",
             "vex_product",
             "vex_no_verify",
+            "vex_no_bazel",
             "vex_doc_id",
             "vex_compact",
             "no_socket_yml",
@@ -308,9 +321,21 @@ fn short_help_hidden_own(sub: &str) -> &'static [&'static str] {
             "max_new_patches",
         ],
         "get" => &["id", "cve", "ghsa", "package", "save_only", "all_releases"],
-        "vex" => &["doc_id", "compact"],
-        "apply" => &["vex_product", "vex_no_verify", "vex_doc_id", "vex_compact"],
-        "vendor" => &["vex_product", "vex_no_verify", "vex_doc_id", "vex_compact"],
+        "vex" => &["no_bazel", "doc_id", "compact"],
+        "apply" => &[
+            "vex_product",
+            "vex_no_verify",
+            "vex_no_bazel",
+            "vex_doc_id",
+            "vex_compact",
+        ],
+        "vendor" => &[
+            "vex_product",
+            "vex_no_verify",
+            "vex_no_bazel",
+            "vex_doc_id",
+            "vex_compact",
+        ],
         _ => &[],
     }
 }

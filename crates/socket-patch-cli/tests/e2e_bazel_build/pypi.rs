@@ -1,9 +1,9 @@
-//! Hosted mode for a PyPI package that comes through rules_python's
-//! `pip.parse(requirements_lock = "//:requirements.txt")` under Bzlmod: a
-//! root `requirements.txt` in pip's hash-checking mode.
+//! Hosted and vendored mode for a PyPI package that comes through
+//! rules_python's `pip.parse(requirements_lock = "//:requirements.txt")`
+//! under Bzlmod: a root `requirements.txt` in pip's hash-checking mode.
 //!
-//! One flow, on the Bazel the run is given ([`FIXTURE`] says which ruleset
-//! goes with its release), in a fresh output base:
+//! The hosted flow, on the Bazel the run is given ([`FIXTURE`] says which
+//! ruleset goes with its release), in a fresh output base:
 //!
 //! - (a) `bazel build` and `bazel run //:consumer` print the unpatched
 //!   marker. The hub asked the index about the package, and Bazel fetched
@@ -39,7 +39,17 @@
 //!   grant pins: after the same `scan`, the build fails on the sha256.
 //!
 //! The marker is read from what Bazel built, and the patched one holds an
-//! id made for the run, so no cache of an earlier run can supply it.
+//! id made for the run, so no cache of an earlier run can supply it. The
+//! flow asserts the VEX document of its patch as `main.rs` says.
+//!
+//! The vendored flow ([`vendored_pip_parse`]) commits the patched wheel and
+//! points the package's line of `requirements.txt` at it. rules_python
+//! builds no wheel from such a line: the build fails until
+//! `vendor --revert` has put the pin back. The flow asserts that; that
+//! every form of `vex` meanwhile writes a document that says the package
+//! is affected, and names the call of `MODULE.bazel` that reads the file;
+//! and that the revert and hosted mode, which the document names, end in
+//! the patched build and in a document that says not affected.
 //!
 //! One loopback server stands in for four hosts. The Socket API and the
 //! patch host answer at their own paths; `pypi.org` (the project pages of
@@ -79,11 +89,15 @@ use std::time::Instant;
 
 use base64::Engine as _;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha512};
+
+use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
 use crate::harness::{
-    changed, fixture_path, rewrite, Cell, Fixture, Ran, StandIn, Tree, CONSUMER, NOTHING,
+    cell_without_bazel, changed, fixture_path, rewrite, with_vex, Cell, Claim, Fixture, How, Ran,
+    StandIn, Tree, CONSUMER, NOTHING,
 };
-use crate::hosted_memory_common::Patch;
+use crate::hosted_memory_common::{read_tree, Patch, ORG};
 
 // The wheel builder of the in-process Python suites. Its other helpers
 // mount a grant on a server of those suites.
@@ -189,8 +203,12 @@ impl Wheel {
 /// wheel has bytes, and a sha256, that no other run has: Bazel's repository
 /// cache, which keeps every download that has a checksum, cannot hold it.
 fn package(marker: &str, run: &str) -> Wheel {
-    let module = format!("# Built for run {run}.\ndef value():\n    return \"{marker}\"\n");
-    Wheel::new(NAME, VERSION, &["spdep"], &module)
+    Wheel::new(NAME, VERSION, &["spdep"], &module(marker, run))
+}
+
+/// The one module of [`package`]: `spvictim/__init__.py`.
+fn module(marker: &str, run: &str) -> String {
+    format!("# Built for run {run}.\ndef value():\n    return \"{marker}\"\n")
 }
 
 /// The upstream wheels of the run `run`, as the index serves them: the
@@ -237,6 +255,11 @@ fn publish(standin: &StandIn, wheel: &Wheel) {
 /// is the one `patched_wheel::mount_grant` also writes, for a server of the
 /// in-process suites: a change to the shape of a grant is a change to both.
 fn grant(standin: &StandIn, uuid: &str, pinned: &Wheel) -> String {
+    grant_by(standin, uuid, pinned, json!({ "sha256": pinned.sha256 }))
+}
+
+/// [`grant`] with `integrity` as the sums the grant names for the wheel.
+fn grant_by(standin: &StandIn, uuid: &str, pinned: &Wheel, integrity: Value) -> String {
     let filename = pinned.filename();
     let route = format!("/patch/pypi/{NAME}/{VERSION}/grant-token/{uuid}/{filename}");
     let url = format!("{}{route}", standin.origin());
@@ -247,7 +270,7 @@ fn grant(standin: &StandIn, uuid: &str, pinned: &Wheel) -> String {
         "artifacts": [{
             "kind": "tarball",
             "url": url,
-            "integrity": { "sha256": pinned.sha256 },
+            "integrity": integrity,
         }],
         "registryOverride": null,
     });
@@ -397,7 +420,11 @@ fn hosted_pip_parse() {
     // (b) The one command of hosted mode. It rewrites that file and no
     // other: the pin of the dependency as it was, and the package as a
     // direct reference to the patched wheel with its sha256.
-    let scan = socket_patch(&cell, &standin, &["scan", "--mode", "hosted", "--yes"]);
+    let hosted = ["scan", "--mode", "hosted", "--yes"];
+    let claim = Claim::new(PURL, &uuid, How::Hosted);
+    let run = |cell: &Cell, args: &[&str]| socket_patch(cell, &standin, args);
+    let in_run = cell.document("in-run");
+    let scan = run(&cell, &[&hosted[..], &with_vex(&in_run)].concat());
     let said = &scan.dump;
     let pinned = cell.pinned_by(&scan, PURL, &uuid, &before, &[REQUIREMENTS]);
     let direct = format!("{NAME} @ {origin}{patched_route}");
@@ -410,6 +437,10 @@ fn hosted_pip_parse() {
         ),
         "{test}"
     );
+    // The document of that run and the one of `vex` say so, in a checkout
+    // Bazel has built in, before anything has fetched the patched wheel.
+    cell.wrote_in_run(&scan, &in_run, &claim);
+    cell.stands_alone(run, &claim, true);
     assert_eq!(standin.asked(&patched_route), 0, "{test}: {said}");
     let index_requests = standin.asked(&page);
     // The scan left Bazel's lock as it was, so a frozen lock fails here
@@ -435,6 +466,13 @@ fn hosted_pip_parse() {
     // From here on the checkout stands: the next build changes no file,
     // and that lock holds when Bazel may not update it.
     cell.builds_patched(&built, &marker);
+    // `vex` says the same of the build that printed the patched marker,
+    // and with `--no-verify` that it checked no file.
+    cell.stands_alone(run, &claim, true);
+    cell.stands_alone(run, &claim, false);
+    // Without a product, as a user types it, `vex` writes none: the
+    // checkout has no file it reads a product from.
+    cell.detects_product(run, None);
 
     // (d) The undo: `requirements.txt` is the one of before at once, and
     // the lock is still the one of the patched build, so a frozen lock
@@ -461,6 +499,10 @@ fn hosted_pip_parse() {
         standin.asked(&page) > index_requests,
         "{test}: the build after the undo did not ask the index about {NAME}"
     );
+    // `vex` has no document for the checkout of before.
+    cell.attests_nothing(run, 2, "manifest_not_found");
+    // The same two documents where no Bazel has built.
+    cell.attests_unbuilt(run, &hosted, &before, &pinned, &claim);
 
     // (e) A second machine. Bazel keeps a download that has a checksum in
     // the repository cache, which the two machines share, so this one gets
@@ -516,6 +558,389 @@ fn hosted_pip_parse() {
         standin.asked(OTHER_PROJECTS),
         started.elapsed()
     );
+}
+
+/// What the vendored flow patches with: the upstream wheels of a run on a
+/// stand-in index, and one patch of the package, which the Socket API on
+/// the stand-in grants as a wheel on its patch host and records with the
+/// hashes of the module it changes. Vendored mode holds the wheel it
+/// downloads to that record.
+struct Vendoring {
+    standin: StandIn,
+    /// The id of the run and of its patch.
+    uuid: String,
+    wheels: [Wheel; 2],
+    patched: Wheel,
+    /// The record of the patch, as the API serves it.
+    record: Value,
+}
+
+/// The line of `requirements.txt` that vendored mode puts in the place of
+/// the package's pin: the path of the committed wheel `copy`, its sha256,
+/// and the pin it stands for.
+fn vendored_line(copy: &str, wheel: &Wheel) -> String {
+    let (sha256, name, version) = (&wheel.sha256, wheel.name, wheel.version);
+    format!("./{copy} --hash=sha256:{sha256}  # socket-patch vendor: {name}=={version}\n")
+}
+
+impl Vendoring {
+    fn new() -> Vendoring {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let wheels = upstream(&uuid);
+        let marker = format!("PATCHED {uuid}");
+        let patched = package(&marker, &uuid);
+        let standin = StandIn::start();
+        wheels.iter().for_each(|wheel| publish(&standin, wheel));
+        standin.serve(5, OTHER_PROJECTS, NO_FILES.as_bytes());
+        // Vendored mode downloads the wheel itself, and takes it only by
+        // its sha512.
+        let sha512 =
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&patched.bytes));
+        let sums = json!({ "sha256": patched.sha256, "sha512": format!("sha512-{sha512}") });
+        let route = grant_by(&standin, &uuid, &patched, sums);
+        standin.serve(5, &route, &patched.bytes);
+        let hash = |marker: &str| compute_git_sha256_from_bytes(module(marker, &uuid).as_bytes());
+        let record = json!({
+            "uuid": uuid,
+            "purl": PURL,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": { "spvictim/__init__.py": {
+                "beforeHash": hash("PRISTINE"),
+                "afterHash": hash(&marker),
+            }},
+            "vulnerabilities": { "GHSA-test-aaaa-bbbb": {
+                "cves": ["CVE-2024-0001"], "summary": "s", "severity": "high", "description": "d",
+            }},
+            "description": "fixture",
+            "license": "MIT",
+            "tier": "free",
+        });
+        let record_route = format!("/v0/orgs/{ORG}/patches/view/{uuid}");
+        standin.serve(1, &record_route, record.to_string().as_bytes());
+        Vendoring {
+            standin,
+            uuid,
+            wheels,
+            patched,
+            record,
+        }
+    }
+
+    /// `socket-patch <args>` in `cell`, with the stand-in as the Socket
+    /// API, the patch server and the index's JSON API.
+    fn run(&self, cell: &Cell, args: &[&str]) -> Ran {
+        let origin = self.standin.origin();
+        let json_api = format!("{origin}/{INDEX}/pypi");
+        let env = [
+            ("SOCKET_PATCH_SERVER_URL", origin.as_str()),
+            ("SOCKET_PYPI_JSON_API", json_api.as_str()),
+        ];
+        cell.socket_patch(&origin, args, &env)
+    }
+}
+
+/// What `socket-patch` has to name when it says that the package is
+/// affected: the file that points at the committed wheel, the hub's call
+/// with its line in the `MODULE.bazel` of `cell`, and the two commands
+/// that patch what Bazel builds.
+fn names(cell: &Cell) -> Vec<String> {
+    let module = String::from_utf8(cell.tree()["MODULE.bazel"].clone()).expect("a text file");
+    let above = module.lines().take_while(|line| *line != "pip.parse(");
+    vec![
+        format!("the line of {REQUIREMENTS} that points at"),
+        format!("(`pip.parse`, MODULE.bazel:{})", above.count() + 1),
+        "`socket-patch vendor --revert`, then `socket-patch scan --mode hosted`".to_string(),
+    ]
+}
+
+/// Vendored mode in the checkout of `cell`, whose `requirements.txt` pins
+/// the wheels of `with`: `scan --mode vendored --yes` commits the patched
+/// wheel under `.socket/vendor/pypi` and points the package's line of
+/// `requirements.txt` at it. The command passes, and with `--vex` it
+/// writes a document that says the package is affected; so do
+/// `apply --vex` and `vendor --vex`, and `vex` and `vex --no-verify`. Each
+/// names the call of `MODULE.bazel` that hands `requirements.txt` to
+/// rules_python, and the way out. Gives the files of the checkout.
+fn vendors_the_wheel(cell: &Cell, with: &Vendoring) -> Tree {
+    let test = &cell.test;
+    let before = cell.tree();
+    let run = |cell: &Cell, args: &[&str]| with.run(cell, args);
+
+    let in_run = cell.document("in-run");
+    let vendoring = ["scan", "--mode", "vendored", "--yes"];
+    let scan = run(cell, &[&vendoring[..], &with_vex(&in_run)].concat());
+    let said = &scan.dump;
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
+    // The wheel the patch host served, with its ledger under
+    // `.socket/vendor`, and the one file that names it.
+    let vendored = cell.tree();
+    let dir = format!(".socket/vendor/pypi/{}", with.uuid);
+    let copy = format!("{dir}/{}", with.patched.filename());
+    let written = [
+        format!("{dir}/.gitattributes"),
+        format!("{dir}/.gitignore"),
+        format!("{dir}/socket-patch.vendor.json"),
+        copy.clone(),
+        ".socket/vendor/state.json".to_string(),
+        REQUIREMENTS.to_string(),
+    ];
+    assert_eq!(changed(&before, &vendored), written, "{test}: {said}");
+    assert!(vendored[&copy] == with.patched.bytes, "{test}: {copy}");
+    let [dependency, _] = &with.wheels;
+    let rewritten = dependency.requirement() + &vendored_line(&copy, &with.patched);
+    let requirements = String::from_utf8_lossy(&vendored[REQUIREMENTS]);
+    assert_eq!(requirements, rewritten, "{test}: {said}");
+
+    let names = names(cell);
+    let claim = Claim::unbuilt(PURL, &with.uuid, &names);
+    cell.wrote_in_run(&scan, &in_run, &claim);
+    // A vendored checkout has no manifest: the two commands have nothing
+    // to do, and write the document the scan wrote.
+    for command in ["apply", "vendor"] {
+        let document = cell.document(command);
+        let ran = run(cell, &[&[command][..], &with_vex(&document)].concat());
+        assert_eq!(ran.envelope["status"], "noManifest", "{test}: {}", ran.dump);
+        cell.wrote_in_run(&ran, &document, &claim);
+    }
+    cell.stands_alone(run, &claim, true);
+    cell.stands_alone(run, &claim, false);
+    assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{test}");
+    vendored
+}
+
+/// What the document of an affected package tells the user to do, in the
+/// checkout of `cell` that vendored mode patched: `vendor --revert` puts
+/// every file back as it was in `before`, and `scan --mode hosted --yes`
+/// then pins the patch of `with` in `requirements.txt`. Its document and
+/// the one of `vex` attest the package, through the pin.
+fn reverts_and_pins(cell: &Cell, with: &Vendoring, before: &Tree) {
+    let test = &cell.test;
+    let run = |cell: &Cell, args: &[&str]| with.run(cell, args);
+    let undo = run(cell, &["vendor", "--revert", "--yes"]);
+    let said = &undo.dump;
+    assert_eq!(undo.code, 0, "{test}: {said}");
+    assert_eq!(undo.envelope["summary"]["removed"], 1, "{test}: {said}");
+    assert_eq!(changed(before, &cell.tree()), NOTHING, "{test}: {said}");
+
+    let claim = Claim::new(PURL, &with.uuid, How::Hosted);
+    let document = cell.document("hosted");
+    let hosted = ["scan", "--mode", "hosted", "--yes"];
+    let scan = run(cell, &[&hosted[..], &with_vex(&document)].concat());
+    cell.pinned_by(&scan, PURL, &with.uuid, before, &[REQUIREMENTS]);
+    cell.wrote_in_run(&scan, &document, &claim);
+    cell.stands_alone(run, &claim, true);
+}
+
+/// Vendored mode beside a hub that reads `requirements.txt`.
+///
+/// - (a) `bazel build` and `bazel run //:consumer` print the unpatched
+///   marker.
+/// - (b) `scan --mode vendored --yes` commits the patched wheel and points
+///   the package's line of `requirements.txt` at it
+///   ([`vendors_the_wheel`]). The command passes, and it and every other
+///   form of `vex` write a document that says the package is affected:
+///   each names the call of `MODULE.bazel` that reads the file, and the
+///   way out.
+/// - (c) The same `bazel build` fails, as the document said it may:
+///   rules_python takes the path of that line for the name of a project
+///   and leaves the hub without a repository it can name. No build holds
+///   the patched wheel, and `vex` says affected again.
+/// - (d) What the document says to do ([`reverts_and_pins`]):
+///   `vendor --revert` puts every file back, `scan --mode hosted --yes`
+///   pins the patch in `requirements.txt`, the same two Bazel commands
+///   print the patched marker, and `vex` attests the package as not
+///   affected.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn vendored_pip_parse() {
+    let test = "pypi::vendored_pip_parse";
+    let started = Instant::now();
+    let Some(mut cell) = Cell::open(test, &FIXTURE) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let with = Vendoring::new();
+    cell.route_downloads(&downloads(&with.standin.origin(), &with.wheels));
+    cell.write(REQUIREMENTS, requirements(&with.wheels));
+
+    // (a) The unpatched build.
+    let before = cell.builds_unpatched(UNPATCHED);
+
+    // (b) Vendored mode commits the wheel, and says it is affected.
+    let vendored = vendors_the_wheel(&cell, &with);
+
+    // (c) The build fails on the line that names the committed wheel, and
+    // changes no file of the checkout.
+    let build = cell.bazel("build", &[CONSUMER]);
+    let named = with.patched.filename().replace(['-', '.'], "_");
+    assert!(
+        !build.ok() && build.stderr().contains(&named),
+        "{test}: the build did not fail on the vendored line ({named}):\n{}",
+        build.dump()
+    );
+    assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{test}");
+    let run = |cell: &Cell, args: &[&str]| with.run(cell, args);
+    let names = names(&cell);
+    cell.stands_alone(run, &Claim::unbuilt(PURL, &with.uuid, &names), true);
+
+    // (d) The way out: the undo, then hosted mode, whose pin Bazel builds.
+    reverts_and_pins(&cell, &with, &before);
+    let marker = format!("OUT: PATCHED {}", with.uuid);
+    cell.builds(&marker);
+    let claim = Claim::new(PURL, &with.uuid, How::Hosted);
+    cell.stands_alone(run, &claim, true);
+
+    println!(
+        "{test}: Bazel {release} built {UNPATCHED:?}, and failed to build after `scan --mode \
+         vendored`, while every form of `vex` said the package is affected; after `vendor \
+         --revert` and `scan --mode hosted` it built {marker:?}, and `vex` said it is not \
+         affected; {:?}",
+        started.elapsed()
+    );
+}
+
+/// Without a Bazel: the fixture in a checkout of its own, with the
+/// `requirements.txt` that pins the wheels of `with`.
+fn checkout(with: &Vendoring) -> Cell {
+    let cell = cell_without_bazel("9.3.2");
+    for part in ["common", "e9"] {
+        for (rel, bytes) in read_tree(&fixture_path(FIXTURE.dir).join(part)) {
+            cell.write(&rel, bytes);
+        }
+    }
+    cell.write(".git/HEAD", "ref: refs/heads/main\n");
+    cell.write(REQUIREMENTS, requirements(&with.wheels));
+    cell
+}
+
+/// Without a Bazel: steps (b) and (d) of [`vendored_pip_parse`] in the
+/// fixture's checkout, where `MODULE.bazel` hands `requirements.txt` to
+/// rules_python. Between them, `scan --mode vendored --vex`, `vendor --vex`
+/// and `apply --vex` as a person runs them: each passes and writes the
+/// document, with the warning on stderr, the line that it wrote a document
+/// on stdout, and no error; with `--silent` each passes, writes the
+/// document and prints nothing. After them, `vendor --vex` moves the
+/// hosted pin into a committed copy again, and says affected again.
+#[test]
+fn a_vendored_wheel_is_affected_beside_a_hub_that_reads_the_requirements() {
+    let with = Vendoring::new();
+    let cell = checkout(&with);
+    let before = cell.tree();
+    let names = names(&cell);
+    assert_eq!(names[1], "(`pip.parse`, MODULE.bazel:15)");
+    let vendored = vendors_the_wheel(&cell, &with);
+
+    let origin = with.standin.origin();
+    let document = cell.document("person");
+    let env = [("SOCKET_PATCH_SERVER_URL", origin.as_str())];
+    let warned = format!(
+        "Warning: {PURL}: the VEX document says affected. Bazel builds no package from {} the \
+         copy of Socket patch {} under .socket/vendor {}: the build fails, or takes the \
+         registry's package. Run {}.",
+        names[0], with.uuid, names[1], names[2]
+    );
+    let claim = Claim::unbuilt(PURL, &with.uuid, &names);
+    let scan = ["scan", "--mode", "vendored", "--yes"];
+    for command in [&scan[..], &["vendor"], &["apply"]] {
+        let loud = [command, &with_vex(&document)].concat();
+        cell.tells_a_person(&origin, &loud, &env, &document, &claim, &warned);
+        let silent = [&loud[..], &["--silent"]].concat();
+        cell.tells_a_person(&origin, &silent, &env, &document, &claim, &warned);
+    }
+    assert_eq!(changed(&vendored, &cell.tree()), NOTHING);
+
+    reverts_and_pins(&cell, &with, &before);
+
+    // `vendor` in a checkout of hosted pins commits a copy of each: the
+    // line of `requirements.txt` points at the wheel again.
+    let ejected = cell.document("eject");
+    let eject = [&["vendor", "--yes"][..], &with_vex(&ejected)].concat();
+    let eject = with.run(&cell, &eject);
+    assert_eq!(eject.envelope["status"], "success", "{}", eject.dump);
+    cell.wrote_in_run(&eject, &ejected, &claim);
+    let line = String::from_utf8_lossy(&cell.tree()[REQUIREMENTS]).into_owned();
+    assert!(line.contains(".socket/vendor/pypi/"), "{line}");
+}
+
+/// Without a Bazel: `vendor --vex` in a checkout whose manifest records
+/// the patch, as agent mode leaves one. It commits the wheel, points
+/// `requirements.txt` at it, and passes; its document says the package is
+/// affected and names the call that reads the file, as the scan of
+/// [`vendors_the_wheel`] does.
+#[test]
+fn a_wheel_vendored_from_a_manifest_is_affected_beside_the_hub() {
+    let with = Vendoring::new();
+    let cell = checkout(&with);
+    let mut record = with.record.clone();
+    record["exportedAt"] = record["publishedAt"].take();
+    let manifest = json!({ "patches": { PURL: record } });
+    cell.write(".socket/manifest.json", manifest.to_string());
+
+    let document = cell.document("vendor");
+    let vendor = [&["vendor", "--yes"][..], &with_vex(&document)].concat();
+    let vendor = with.run(&cell, &vendor);
+    let line = String::from_utf8_lossy(&cell.tree()[REQUIREMENTS]).into_owned();
+    assert!(
+        line.contains(".socket/vendor/pypi/"),
+        "{line}\n{}",
+        vendor.dump
+    );
+    assert_eq!(vendor.envelope["status"], "success", "{}", vendor.dump);
+    let names = names(&cell);
+    cell.wrote_in_run(
+        &vendor,
+        &document,
+        &Claim::unbuilt(PURL, &with.uuid, &names),
+    );
+}
+
+/// Without a Bazel: `vex` with a `--manifest-path` in another project
+/// attests that project, and asks the workspace about the files of that
+/// project. The checkout holds `svc`, where vendored mode pointed
+/// `requirements.txt` at the wheel, and `app`, where the command is run.
+/// While the hub reads the file of `svc`, the document says the package
+/// is affected and names that file. While it reads the file of `app`,
+/// which pins the same release, the wheel of `svc` is attested as
+/// patched: no call hands Bazel the file that points at it.
+#[test]
+fn a_vendored_wheel_is_judged_by_the_files_of_the_manifest_s_project() {
+    let with = Vendoring::new();
+    let cell = checkout(&with);
+    std::fs::remove_file(cell.path(REQUIREMENTS)).expect(REQUIREMENTS);
+    for project in ["svc", "app"] {
+        cell.write(
+            &format!("{project}/{REQUIREMENTS}"),
+            requirements(&with.wheels),
+        );
+    }
+    let module = String::from_utf8(cell.tree()["MODULE.bazel"].clone()).expect("a text file");
+    let own = format!("\"//:{REQUIREMENTS}\"");
+    assert!(module.contains(&own), "{module}");
+    let reads = |project: &str| {
+        let label = format!("\"//{project}:{REQUIREMENTS}\"");
+        cell.write("MODULE.bazel", module.replace(&own, &label));
+    };
+    reads("svc");
+    let vendoring = ["scan", "--mode", "vendored", "--yes", "--cwd", "svc"];
+    let scan = with.run(&cell, &vendoring);
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{}", scan.dump);
+
+    let foreign = [
+        "--cwd",
+        "app",
+        "--manifest-path",
+        "../svc/.socket/manifest.json",
+    ];
+    let run = |cell: &Cell, args: &[&str]| with.run(cell, &[args, &foreign].concat());
+    let mut names = names(&cell);
+    names[0] = format!("the line of svc/{REQUIREMENTS} that points at");
+    cell.stands_alone(run, &Claim::unbuilt(PURL, &with.uuid, &names), true);
+
+    reads("app");
+    let claim = Claim::new(PURL, &with.uuid, How::Vendored);
+    cell.stands_alone(run, &claim, true);
 }
 
 /// Without a Bazel: the fixture's directories are those of its table, and

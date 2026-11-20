@@ -54,6 +54,7 @@ struct Snap {
     vex: Option<PathBuf>,
     vex_product: Option<String>,
     vex_no_verify: bool,
+    vex_no_bazel: bool,
     vex_doc_id: Option<String>,
     vex_compact: bool,
 }
@@ -66,6 +67,7 @@ fn snapshot(a: &VendorArgs) -> Snap {
         vex: a.vex.vex.clone(),
         vex_product: a.vex.vex_product.clone(),
         vex_no_verify: a.vex.vex_no_verify,
+        vex_no_bazel: a.vex.vex_no_bazel,
         vex_doc_id: a.vex.vex_doc_id.clone(),
         vex_compact: a.vex.vex_compact,
     }
@@ -80,6 +82,7 @@ fn expected_defaults() -> Snap {
         vex: None,
         vex_product: None,
         vex_no_verify: false,
+        vex_no_bazel: false,
         vex_doc_id: None,
         vex_compact: false,
     }
@@ -165,6 +168,7 @@ fn vex_passthrough_knobs_each_set_their_field() {
         "--vex-product",
         "pkg:npm/app@1.0.0",
         "--vex-no-verify",
+        "--vex-no-bazel",
         "--vex-doc-id",
         "urn:uuid:fixed",
         "--vex-compact",
@@ -173,6 +177,7 @@ fn vex_passthrough_knobs_each_set_their_field() {
     want.vex = Some(PathBuf::from("out.vex.json"));
     want.vex_product = Some("pkg:npm/app@1.0.0".to_string());
     want.vex_no_verify = true;
+    want.vex_no_bazel = true;
     want.vex_doc_id = Some("urn:uuid:fixed".to_string());
     want.vex_compact = true;
     // Only the vex fields move; nothing (e.g. --force) rides along on the

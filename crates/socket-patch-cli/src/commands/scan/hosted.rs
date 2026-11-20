@@ -945,7 +945,8 @@ pub(super) async fn run_redirect(
             rows,
             prior,
             references,
-            coverage: Vec::new(),
+            plan: Vec::new(),
+            report: None,
         }),
         "scan",
     )
@@ -1129,7 +1130,7 @@ async fn run_redirect_selected_untracked(
             Ok(std::collections::HashMap::new())
         } else {
             status.set(format!(
-                "Resolving hosted artifacts for {}...",
+                "Resolving hosted artifacts for {}",
                 crate::ui::plural(to_fetch.len(), "patch", "patches")
             ));
             let fetched = api_client.fetch_registry_references(&to_fetch).await;
@@ -1263,8 +1264,12 @@ async fn run_redirect_selected_untracked(
     let mut user_patch_warnings: Vec<socket_patch_core::patch::redirect::RewriteWarning> =
         Vec::new();
     if !common.allow_patch_conflicts {
-        user_patch_warnings =
-            engine::withhold_user_patched_by_supplement(view, &mut candidates, &mut skipped).await;
+        user_patch_warnings = crate::ui::busy(
+            common,
+            "Checking project patches",
+            engine::withhold_user_patched_by_supplement(view, &mut candidates, &mut skipped),
+        )
+        .await;
     }
 
     // A NEW row the lockfiles already pin on the patch server these
@@ -1350,8 +1355,12 @@ async fn run_redirect_selected_untracked(
                     .await;
             user_patch_warnings.extend(late);
         }
-        if let Err(error) =
-            crate::commands::user_patches::check(common, candidates.iter().map(&sel_purl)).await
+        if let Err(error) = crate::ui::busy(
+            common,
+            "Checking project patches",
+            crate::commands::user_patches::check(common, candidates.iter().map(&sel_purl)),
+        )
+        .await
         {
             // The shared refusal path keeps this run's envelope and lets
             // telemetry go out before the JSON error.
@@ -1421,7 +1430,12 @@ async fn run_redirect_selected_untracked(
     // dep), but for the files of a `.mvn/maven.config` to heal, read again
     // now that the lock is held; everything after the rewrite still runs.
     let read = if !candidates.is_empty() {
-        engine::read_candidate_files(&view, &std::collections::BTreeSet::new(), &candidates).await
+        crate::ui::busy(
+            common,
+            "Reading lockfiles",
+            engine::read_candidate_files(&view, &std::collections::BTreeSet::new(), &candidates),
+        )
+        .await
     } else if heal_pending && may_heal {
         engine::read_maven_heal_files(&view)
             .await
@@ -1479,10 +1493,7 @@ async fn run_redirect_selected_untracked(
         // retry, in dep order (the deps after them were never started).
         let mut drained: Option<std::collections::VecDeque<_>> = None;
         for &(dep, sha256) in &wheel_deps {
-            status.set(format!(
-                "Fetching hosted wheel metadata for {}...",
-                dep.name
-            ));
+            status.set(format!("Fetching hosted wheel metadata for {}", dep.name));
             let attempt = match drained.as_mut() {
                 Some(drained) => drained.pop_front(),
                 None => match in_flight.next().await {
@@ -1521,10 +1532,7 @@ async fn run_redirect_selected_untracked(
     // be fetched or read drops its patch rather than pin an entry yarn
     // would rewrite on the next install.
     for dep in engine::yarn_berry_manifest_targets(&candidates, &read.files) {
-        status.set(format!(
-            "Fetching hosted package manifest for {}...",
-            dep.name
-        ));
+        status.set(format!("Fetching hosted package manifest for {}", dep.name));
         match socket_patch_core::hosted::npm_manifest::fetch_hosted_npm_manifest(
             api_client,
             &dep.artifact_url,
@@ -1567,7 +1575,7 @@ async fn run_redirect_selected_untracked(
             })
             .collect();
     for (url, sha512, dep) in classic_targets {
-        status.set(format!("Fetching hosted tarball for {}...", dep.name));
+        status.set(format!("Fetching hosted tarball for {}", dep.name));
         match socket_patch_core::hosted::npm_manifest::fetch_hosted_classic_artifact(
             api_client, &url, &sha512,
         )
@@ -1698,8 +1706,18 @@ async fn run_redirect_selected_untracked(
         .then(|| (read.clone(), python_metadata.clone()));
     // A retracted takeover rewrites again without it (see below).
     let takeover_metadata = takeover.is_staged().then(|| python_metadata.clone());
-    let mut done =
-        engine::rewrite(&view, read, &candidates, python_metadata, rewrite_options()).await;
+    // The rewrite is planned in memory either way; a dry run stops there.
+    let rewriting = if common.dry_run {
+        "Planning lockfile changes"
+    } else {
+        "Rewriting lockfiles"
+    };
+    let mut done = crate::ui::busy(
+        common,
+        rewriting,
+        engine::rewrite(&view, read, &candidates, python_metadata, rewrite_options()),
+    )
+    .await;
 
     // The rollout gate (§5.2): every write-free check has run — grants,
     // purl/url, takeover refusals, wheel metadata, and the rewrite above,
@@ -1723,8 +1741,12 @@ async fn run_redirect_selected_untracked(
         let before = candidates.len();
         candidates.retain(|c| !deferred.contains(&(sel_purl(c), c.dep.patch_uuid.clone())));
         if candidates.len() != before {
-            done =
-                engine::rewrite(&view, read, &candidates, python_metadata, rewrite_options()).await;
+            done = crate::ui::busy(
+                common,
+                rewriting,
+                engine::rewrite(&view, read, &candidates, python_metadata, rewrite_options()),
+            )
+            .await;
         }
     }
     // A staged takeover the rewrite did not pin must not happen: undo every
@@ -1846,8 +1868,12 @@ async fn run_redirect_selected_untracked(
     if common.dry_run {
         // A preview: the staged reverts never reach the disk.
         drop(group);
-    } else if let Err(message) =
-        commit_hosted_writes(common, group, rewrite, &vendor_state, &takeover_migrated).await
+    } else if let Err(message) = crate::ui::busy(
+        common,
+        "Writing lockfiles",
+        commit_hosted_writes(common, group, rewrite, &vendor_state, &takeover_migrated),
+    )
+    .await
     {
         eprintln!("{}", format_error_line(&message));
         if common.json {
@@ -2062,6 +2088,7 @@ async fn run_redirect_selected_untracked(
     // `commands::vex_sources`). Requested-but-failed VEX (including "nothing
     // to attest") flips the exit code.
     let mut vex_statements: Option<usize> = None;
+    let mut vex_affected = 0;
     // VEX run-level advisories: `note_warning` keeps them off stderr under
     // --json, so the envelope's `vex.warnings` is their only channel there.
     let mut vex_warnings: Vec<crate::json_envelope::RunWarning> = Vec::new();
@@ -2137,6 +2164,7 @@ async fn run_redirect_selected_untracked(
         match generate_vex_from_manifest_path(common, &params, &manifest_path).await {
             Ok(summary) => {
                 vex_statements = Some(summary.statements);
+                vex_affected = summary.affected;
                 vex_warnings = summary.warnings;
             }
             Err(e) => {
@@ -2175,6 +2203,12 @@ async fn run_redirect_selected_untracked(
                 .push(socket_patch_core::patch::redirect::RewriteWarning { code, detail });
         }
     }
+    // A run that took the lock may have removed a vendored Go copy (a
+    // takeover). One that took none may write no file (`socket.yml`).
+    let ignored = match &lock {
+        Some(_) => crate::commands::sync_bazelignore(common, true).await,
+        None => Vec::new(),
+    };
     let mut warnings: Vec<RunWarning> = engine_warnings
         .iter()
         .map(|w| RunWarning::new(w.code.as_str(), w.detail.as_str()))
@@ -2219,6 +2253,7 @@ async fn run_redirect_selected_untracked(
         record_hosted_events(&mut env, &confirmed, &unconfirmed, &skipped, common.dry_run);
         env.set_extra("redirect", redirect_block(done.rewritten.clone()));
         env.warnings.extend(warnings);
+        env.warnings.extend(ignored);
         // Taking the lock may have finished an interrupted run's commit
         // (stderr said so then).
         env.warnings.extend(
@@ -2246,6 +2281,7 @@ async fn run_redirect_selected_untracked(
                     .display()
                     .to_string(),
                 statements,
+                affected: vex_affected,
                 format: "openvex-0.2.0".to_string(),
                 warnings,
             });
@@ -2258,10 +2294,11 @@ async fn run_redirect_selected_untracked(
         emit_scan(&env);
     } else {
         if !common.silent {
-            // Wrap long warnings only on a terminal: logs and pipes keep one
-            // line per sentence so CI can grep them.
+            // Wrap long warnings only on a terminal with a person at it:
+            // logs, pipes and agents keep one line per sentence, so CI can
+            // grep them and an agent reads whole sentences.
             let width =
-                std::io::IsTerminal::is_terminal(&std::io::stderr()).then(crate::ui::stderr_width);
+                crate::ui::attended(crate::ui::Stream::Stderr).then(crate::ui::stderr_width);
             for purl in &takeover_migrated {
                 eprintln!("{}", format_takeover_line(purl, common.dry_run));
             }
@@ -2302,18 +2339,14 @@ async fn run_redirect_selected_untracked(
                 "{}",
                 format_hosted_summary(confirmed.len(), already, human_files.len(), common.dry_run)
             );
-            // Under it, per package on a hosted patch: the advisories that
-            // patch fixes and the ones it leaves unpatched.
-            if let Some(gate) = &rollout {
+            // Under it, one row per package on a hosted patch: what the
+            // patch fixes and how much it leaves unpatched. The same call
+            // counts the directory into the invocation's closing totals.
+            if let Some(gate) = rollout.as_mut() {
                 let pinned: std::collections::HashSet<&str> =
                     confirmed.iter().map(|(_, uuid)| uuid.as_str()).collect();
-                for line in super::coverage_lines_for(
-                    &gate.coverage,
-                    &pinned,
-                    common.dry_run,
-                    common.verbose,
-                ) {
-                    println!("{line}");
+                if let Some(report) = gate.report.as_deref_mut() {
+                    report.project(&gate.plan, &pinned).await;
                 }
             }
             // Then what the run did to the user's Bundler manifest.
@@ -2365,7 +2398,15 @@ async fn run_redirect_selected_untracked(
             ) {
                 eprintln!("{line}");
             }
+            // A warning repeated for package after package (a lock that
+            // names none of a shared environment's copies) is shown for the
+            // first few; `--verbose` and `--json` have them all.
+            let human_warnings = fold_repeated_warnings(human_warnings, common.verbose);
             for (code, detail) in &human_warnings {
+                if *code == REPEATED_WARNINGS {
+                    eprintln!("{detail}");
+                    continue;
+                }
                 let detail = if *code == "redirect_npm_allow_remote" && !common.verbose {
                     // One line by default; the full policy text (the
                     // tradeoff, every manual recovery) is in `--json` and
@@ -2375,7 +2416,7 @@ async fn run_redirect_selected_untracked(
                 } else if *code == "redirect_pnpm_trust_lockfile" && done.pnpm_rerun_only {
                     pnpm_trust_rerun_reminder()
                 } else {
-                    detail
+                    detail.as_ref()
                 };
                 eprintln!("{}", format_warning(code, detail, width));
             }
@@ -2387,11 +2428,12 @@ async fn run_redirect_selected_untracked(
             }
             if let Some(statements) = vex_statements {
                 eprintln!(
-                    "Wrote OpenVEX document with {} to {} (hosted patches are attested \
+                    "Wrote OpenVEX document with {}{} to {} (hosted patches are attested \
                      from their patch records, not hash-verified — their bytes are fetched at install \
                      time; run `socket-patch vex` after installing to verify against the \
                      installed tree).",
                     crate::ui::plural(statements, "statement", "statements"),
+                    crate::commands::vex::affected_note(vex_affected),
                     vex.vex
                         .as_ref()
                         .expect("vex_statements is Some only when --vex was given")
@@ -3038,12 +3080,68 @@ fn format_unredirected(
             describe_skip_reason(reason)
         ));
     }
+    // Each of these has a warning of its own below that says why, so a
+    // long list is named once instead of line by line.
+    if unconfirmed.len() > UNPINNED_NAMED {
+        lines.push(format!(
+            "{unpinned_lead}{}: no lockfile entry pinning them could be rewritten{see}",
+            join_names(unconfirmed, UNPINNED_NAMED),
+        ));
+        return lines;
+    }
     for purl in unconfirmed {
         lines.push(format!(
             "{unpinned_lead}{purl}: no lockfile entry pinning it could be rewritten{see}"
         ));
     }
     lines
+}
+
+/// How many unpinned packages [`format_unredirected`] names one per line;
+/// past it they share a line that names this many.
+const UNPINNED_NAMED: usize = 3;
+
+/// How many warnings of one code the human output prints before it counts
+/// the rest ([`fold_repeated_warnings`]).
+const REPEATED_SHOWN: usize = 3;
+
+/// The pseudo-code of the line [`fold_repeated_warnings`] puts in place of
+/// the warnings it leaves out. Never a real warning code: the line prints
+/// as it is.
+const REPEATED_WARNINGS: &str = "";
+
+/// `warnings` (`(code, detail)`, in order) with each code's entries past
+/// the first [`REPEATED_SHOWN`] replaced by one line that counts them,
+/// placed after the last one shown. `verbose` keeps every warning.
+fn fold_repeated_warnings<'a>(
+    warnings: Vec<(&'a str, &'a str)>,
+    verbose: bool,
+) -> Vec<(&'a str, std::borrow::Cow<'a, str>)> {
+    use std::borrow::Cow;
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (code, _) in &warnings {
+        *seen.entry(code).or_default() += 1;
+    }
+    let mut shown: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut out = Vec::new();
+    for (code, detail) in warnings {
+        let total = seen[code];
+        let nth = shown.entry(code).or_default();
+        *nth += 1;
+        if verbose || total <= REPEATED_SHOWN + 1 || *nth <= REPEATED_SHOWN {
+            out.push((code, Cow::Borrowed(detail)));
+        }
+        if !verbose && total > REPEATED_SHOWN + 1 && *nth == REPEATED_SHOWN {
+            out.push((
+                REPEATED_WARNINGS,
+                Cow::Owned(format!(
+                    "  ... and {} more like these (--verbose lists them all)",
+                    total - REPEATED_SHOWN
+                )),
+            ));
+        }
+    }
+    out
 }
 
 /// The human line for a successful (or, on `--dry-run`, planned)
@@ -3147,10 +3245,7 @@ fn format_next_steps(
         ),
         _ => crate::ui::next_steps(
             &commit,
-            &format!(
-                "Reinstall from the updated lockfile{hint} so the installed packages pick up the \
-                 patched artifacts"
-            ),
+            &format!("Reinstall from the updated lockfile{hint}"),
             &extra,
         ),
     }
@@ -5539,9 +5634,8 @@ mod tests {
             vec![
                 "Next steps:".to_string(),
                 "  1. Commit package-lock.json to keep the hosted patches.".to_string(),
-                "  2. Reinstall from the updated lockfile (e.g. `npm ci`) so the installed \
-                 packages pick up the patched artifacts, then run `socket-patch vex` to verify \
-                 the installed patches."
+                "  2. Reinstall from the updated lockfile (e.g. `npm ci`), then run \
+                 `socket-patch vex` to verify the installed patches."
                     .to_string(),
             ]
         );

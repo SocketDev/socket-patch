@@ -114,15 +114,22 @@ pub(crate) const REDIRECT_UNWIRED: &str = "redirect_unwired";
 /// candidate for that package attests.
 pub(crate) const WIRING_CONFLICT: &str = "wiring_conflict";
 
-/// Ceiling on concurrent patch-view fetches (one GET per uuid; the view
-/// carries blob content, so it is heavy).
+/// Ceiling on concurrent patch-view fetches from the public proxy (one
+/// GET per uuid; its view carries blob content, so it is heavy). The
+/// authenticated API is asked for the view without that content, which
+/// the record does not use, so there the patch API's own window applies.
 const FETCH_CONCURRENCY: usize = 10;
 
 /// The in-flight cap for the record fetch: `SOCKET_API_CONCURRENCY` applies
 /// here like every other patch-API window, with [`FETCH_CONCURRENCY`] as
 /// this window's own ceiling on top (a view is heavy).
 fn fetch_concurrency(use_public_proxy: bool) -> usize {
-    api_concurrency(use_public_proxy).min(FETCH_CONCURRENCY)
+    let window = api_concurrency(use_public_proxy);
+    if use_public_proxy {
+        window.min(FETCH_CONCURRENCY)
+    } else {
+        window
+    }
 }
 
 /// Everything `vex` reads, loaded once by the caller (which owns the
@@ -159,6 +166,11 @@ pub(crate) struct Plan {
     /// Vendored-basis entries, keyed by view purl — the verification
     /// routing for `applied_patches_with_vendor`.
     pub vendor_entries: HashMap<String, VendorEntry>,
+    /// For each key of `vendor_entries`, the project files that point at
+    /// its committed copy: those lockfile discovery found the vendored
+    /// reference in, each from the project with `/` between its parts.
+    /// Empty for an entry that is live without such a reference.
+    pub vendor_pins: HashMap<String, Vec<String>>,
     /// Live hosted-basis view purls (the `(redirected)` marker and the
     /// property-7 bypass).
     pub redirected: Vec<String>,
@@ -858,6 +870,7 @@ pub(crate) async fn plan(
             setup: manifest.setup.clone(),
         },
         vendor_entries: HashMap::new(),
+        vendor_pins: HashMap::new(),
         redirected: Vec::new(),
         lockfile_basis: HashSet::new(),
         hosted: BTreeMap::new(),
@@ -885,6 +898,7 @@ pub(crate) async fn plan(
             // statement and a skip at once.
             if plan.view.patches.remove(&cand.key).is_some() {
                 plan.vendor_entries.remove(&cand.key);
+                plan.vendor_pins.remove(&cand.key);
                 plan.redirected.retain(|k| *k != cand.key);
                 plan.lockfile_basis.remove(&cand.key);
                 plan.hosted.remove(&cand.key);
@@ -896,6 +910,10 @@ pub(crate) async fn plan(
         match basis {
             Basis::Installed => {}
             Basis::Vendored(entry) => {
+                let found = cand.discovered.iter();
+                let found = found.filter(|r| r.mode == WiringMode::Vendored);
+                let pins = found.map(|r| r.source_file.to_string_lossy().replace('\\', "/"));
+                plan.vendor_pins.insert(cand.key.clone(), pins.collect());
                 plan.vendor_entries.insert(cand.key.clone(), *entry);
             }
             Basis::Hosted { lockfile_basis } => {
@@ -1315,17 +1333,25 @@ async fn fetch_records(
             let mut views = std::pin::pin!(ordered_concurrent(
                 pending.iter(),
                 fetch_concurrency(use_public_proxy),
-                |uuid| async move { (uuid, hold_back_debug(client.fetch_patch(uuid)).await) },
+                // The record is built from the view's hashes and
+                // advisories: its file contents are never read here.
+                |uuid| async move {
+                    (
+                        uuid,
+                        hold_back_debug(client.fetch_patch_summary(uuid)).await,
+                    )
+                },
             ));
             loop {
-                status.set(format!(
-                    "Fetching {}... ({done}/{total})",
+                status.progress(
                     if total == 1 {
-                        "the patch record"
+                        "Reading the patch record"
                     } else {
-                        "patch records"
-                    }
-                ));
+                        "Reading patch records"
+                    },
+                    done,
+                    total,
+                );
                 let Some((uuid, result)) = views.next().await else {
                     break;
                 };
@@ -1442,18 +1468,24 @@ mod tests {
         use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
         let orig = std::env::var(API_CONCURRENCY_ENV).ok();
         std::env::remove_var(API_CONCURRENCY_ENV);
-        // A view is heavy, so this window's own ceiling binds by default
-        // on the authenticated API (whose cap is above it).
-        assert_eq!(fetch_concurrency(false), FETCH_CONCURRENCY);
+        // The authenticated API serves the view without its file contents,
+        // so the patch API's own window applies there.
+        assert_eq!(fetch_concurrency(false), api_concurrency(false));
+        assert!(fetch_concurrency(false) > FETCH_CONCURRENCY);
         assert_eq!(fetch_concurrency(true), 4);
 
         std::env::set_var(API_CONCURRENCY_ENV, "1");
         assert_eq!(fetch_concurrency(false), 1);
         assert_eq!(fetch_concurrency(true), 1);
 
-        // Turned up past this window's own ceiling, the ceiling holds.
+        // The proxy's view is heavy: its window never passes this one's
+        // own ceiling, however far the setting is turned up.
         std::env::set_var(API_CONCURRENCY_ENV, "32");
-        assert_eq!(fetch_concurrency(false), FETCH_CONCURRENCY);
+        assert_eq!(
+            fetch_concurrency(true),
+            api_concurrency(true).min(FETCH_CONCURRENCY)
+        );
+        assert_eq!(fetch_concurrency(false), 32);
 
         match orig {
             Some(v) => std::env::set_var(API_CONCURRENCY_ENV, v),
@@ -2384,6 +2416,47 @@ mod tests {
             "{:?}",
             gated.notes
         );
+    }
+
+    /// The pin files of a vendored package are the files its vendored
+    /// reference was found in. A second file that pins the same patch on
+    /// the patch host points at no committed copy, and is none.
+    #[tokio::test]
+    async fn the_pins_of_a_vendored_package_are_the_files_that_point_at_its_copy() {
+        const PURL: &str = "pkg:pypi/idna@3.6";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(PURL.into(), record(U1));
+        let copy = format!(".socket/vendor/pypi/{U1}/idna-3.6-py3-none-any.whl");
+        let vref = vendor_ref(&copy).unwrap();
+        let hosted = PatchedRef::hosted(
+            PURL.to_string(),
+            U1.to_string(),
+            "requirements-dev.txt",
+            None,
+            None,
+            true,
+        );
+        let found = discovery(vec![
+            hosted,
+            PatchedRef::vendored(PURL.into(), &vref, "requirements.txt", None),
+        ]);
+        let plan = plan(
+            &common(tmp.path()),
+            Sources {
+                manifest,
+                vendor: VendorState::new(),
+                redirect: None,
+                discovery: found,
+                hosted_uuids: Vec::new(),
+            },
+            &[],
+            &RunApiClient::new(),
+        )
+        .await;
+        assert!(plan.gated.is_empty(), "{:?}", plan.gated);
+        assert_eq!(plan.vendor_entries[PURL].artifact.path, copy);
+        assert_eq!(plan.vendor_pins[PURL], ["requirements.txt"]);
     }
 
     /// Ledger-only records with no wiring anywhere are gated, except the

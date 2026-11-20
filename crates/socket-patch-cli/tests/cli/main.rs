@@ -17,6 +17,7 @@ mod cli_dry_run_paths_e2e;
 mod envelope_helper_copies;
 mod interactive_prompts_e2e;
 mod list_render;
+mod list_tty;
 mod output_modes_e2e;
 mod prompts_tty;
 mod shared_helper_copies;

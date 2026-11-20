@@ -158,6 +158,10 @@ pub struct VexSummary {
     pub path: String,
     /// Number of OpenVEX statements in the document.
     pub statements: usize,
+    /// How many of them say `affected` (see `vex_bazel_not_in_build`), not
+    /// `not_affected`. Omitted from JSON when none does.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub affected: usize,
     /// Document format tag, e.g. `"openvex-0.2.0"`.
     pub format: String,
     /// Run-level advisories raised during VEX generation (e.g.
@@ -168,6 +172,10 @@ pub struct VexSummary {
     /// Omitted from JSON when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<RunWarning>,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 impl Envelope {
@@ -699,6 +707,20 @@ impl RunWarning {
     }
 }
 
+/// Whether a `skipped` apply event with this `errorCode` reports a package
+/// that is patched as far as it can be on this install: every file already
+/// holds the patch (`already_patched`), or the build installed there holds
+/// none of the code the patch changes (`not_in_platform_build`). Whatever
+/// counts the patches a run left in place reads it through this, so that
+/// it agrees with `apply --check` and `vex`. A `native_extension_not_rebuilt`
+/// skip is not one: that patch is not in effect.
+pub(crate) fn skip_leaves_patched(error_code: Option<&str>) -> bool {
+    matches!(
+        error_code,
+        Some("already_patched") | Some(socket_patch_core::patch::gem_ext::NOT_IN_BUILD_CODE)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1081,12 +1103,16 @@ mod tests {
         env.vex = Some(VexSummary {
             path: "/tmp/openvex.json".into(),
             statements: 3,
+            affected: 0,
             format: "openvex-0.2.0".into(),
             warnings: Vec::new(),
         });
         let v = env.to_value();
         assert_eq!(v["vex"]["path"], "/tmp/openvex.json");
         assert_eq!(v["vex"]["statements"], 3);
+        assert!(!v["vex"].as_object().unwrap().contains_key("affected"));
+        env.vex.as_mut().unwrap().affected = 2;
+        assert_eq!(env.to_value()["vex"]["affected"], 2);
         assert_eq!(v["vex"]["format"], "openvex-0.2.0");
         assert!(
             !v["vex"].as_object().unwrap().contains_key("warnings"),
@@ -1322,5 +1348,27 @@ mod tests {
         let value = serde_json::to_value(&env).unwrap();
         assert_eq!(value["gc"], serde_json::to_value(report).unwrap());
         assert_eq!(value["summary"]["bytesFreed"], 34);
+    }
+
+    /// Only a skip that leaves the package patched as far as it can be
+    /// counts as landed: one already patched, and one whose code is not
+    /// in the build installed here. A patch written without effect, a
+    /// package that is not installed and a vendored one are not.
+    #[test]
+    fn only_a_skip_with_nothing_left_to_do_leaves_the_package_patched() {
+        assert!(skip_leaves_patched(Some("already_patched")));
+        assert!(skip_leaves_patched(Some(
+            socket_patch_core::patch::gem_ext::NOT_IN_BUILD_CODE
+        )));
+        assert!(skip_leaves_patched(Some("not_in_platform_build")));
+        for code in [
+            Some(socket_patch_core::patch::gem_ext::NOT_REBUILT_REASON),
+            Some("package_not_installed"),
+            Some("vendored"),
+            Some("gem_fallback_home_skipped"),
+            None,
+        ] {
+            assert!(!skip_leaves_patched(code), "{code:?}");
+        }
     }
 }

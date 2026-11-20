@@ -234,10 +234,10 @@ fn builder_only_emits_not_affected_with_justification() {
 
 #[test]
 fn affected_statement_in_json_omits_justification() {
-    // We never construct affected statements via the builder, but
-    // we DO ship the type — pin the schema invariant that an
-    // affected statement with no justification serializes without
-    // emitting a `justification` key (per spec).
+    // Pin the schema invariant at the type: an affected statement
+    // with no justification serializes without emitting a
+    // `justification` key (per spec). Section 19 holds the builder's
+    // own affected statements to it.
     let s = Statement {
         id: None,
         vulnerability: Vulnerability {
@@ -668,8 +668,9 @@ fn statement_level_id_renders_under_at_sign() {
 #[test]
 fn no_two_statements_share_a_vulnerability_name() {
     // The builder's transpose groups by vuln id, so a well-formed doc
-    // never emits two statements for the same vulnerability — merging
-    // collapses them into one (with all PURLs as subcomponents). Pin
+    // of patched packages never emits two statements for the same
+    // vulnerability — merging collapses them into one (with all PURLs as
+    // subcomponents; section 19 has the `affected` statement beside it). Pin
     // that at the document layer: `sample_doc` carries two *distinct*
     // vulns (GHSA-aaaa / GHSA-bbbb) and `merged_doc` collapses a shared
     // one (GHSA-shared) to a single statement. A grouping regression
@@ -712,4 +713,117 @@ fn fixtures_carry_subcomponents_so_at_id_walks_have_teeth() {
         merged.statements[0].products[0].subcomponents.len() >= 2,
         "merged_doc must produce a product with >=2 subcomponents"
     );
+}
+
+// ── 19. `affected` statements ───────────────────────────────────
+
+/// `sample_doc`'s manifest, with lodash as a package the build takes
+/// without its patch. `patched` says whether minimist is attested as
+/// patched beside it: without it the document holds `affected`
+/// statements alone.
+fn affected_doc(patched: bool) -> Document {
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        "pkg:npm/lodash@4.17.20".to_string(),
+        record("uuid-1", &[("GHSA-aaaa", &["CVE-2024-1", "CVE-2024-2"])]),
+    );
+    manifest.patches.insert(
+        "pkg:npm/minimist@1.2.0".to_string(),
+        record("uuid-2", &[("GHSA-aaaa", &["CVE-2024-1"])]),
+    );
+    let applied: &[String] = if patched {
+        &["pkg:npm/minimist@1.2.0".to_string()]
+    } else {
+        &[]
+    };
+    let action = "Run `socket-patch scan --mode hosted`.".to_string();
+    let affected = [("pkg:npm/lodash@4.17.20".to_string(), action)];
+    build_document_with(
+        &manifest,
+        &Attested {
+            applied,
+            affected: &affected,
+            ..Attested::default()
+        },
+        &options(),
+    )
+    .expect("build affected doc")
+}
+
+#[test]
+fn an_affected_statement_carries_an_action_statement_and_no_justification() {
+    // Spec: a statement with the status `affected` MUST carry an action
+    // statement; `justification` and `impact_statement` go with
+    // `not_affected`. A document of `affected` statements alone is a
+    // document: it has a statement, and every required field.
+    let alone = affected_doc(false);
+    assert_eq!(alone.statements.len(), 1);
+    let mixed = affected_doc(true);
+    // The patched package and the affected one each have a statement for
+    // the vulnerability they share.
+    let said: Vec<_> = (mixed.statements.iter())
+        .map(|st| (st.vulnerability.name.as_str(), st.status))
+        .collect();
+    assert_eq!(
+        said,
+        [
+            ("GHSA-aaaa", Status::NotAffected),
+            ("GHSA-aaaa", Status::Affected)
+        ]
+    );
+    for doc in [alone, mixed] {
+        let v = serde_json::to_value(&doc).unwrap();
+        for key in [
+            "@context",
+            "@id",
+            "author",
+            "timestamp",
+            "version",
+            "statements",
+        ] {
+            assert!(v.get(key).is_some(), "required key {key:?} missing");
+        }
+        for (st, json) in doc
+            .statements
+            .iter()
+            .zip(v["statements"].as_array().unwrap())
+        {
+            let obj = json.as_object().unwrap();
+            for key in ["vulnerability", "timestamp", "products", "status"] {
+                assert!(obj.contains_key(key), "required key {key:?} missing");
+            }
+            assert_eq!(st.timestamp.as_deref(), Some(doc.timestamp.as_str()));
+            assert!(!st.vulnerability.name.is_empty());
+            let [product] = &st.products[..] else {
+                panic!("not one product: {json}");
+            };
+            assert_eq!(product.id, "pkg:npm/test-app@1.0.0");
+            assert!(!product.subcomponents.is_empty());
+            assert!(product.subcomponents.iter().all(|sub| !sub.id.is_empty()));
+            let reserved = ["justification", "impact_statement"];
+            match st.status {
+                Status::Affected => {
+                    assert_eq!(json["status"], "affected");
+                    let action = st.action_statement.as_deref().unwrap_or_default();
+                    assert!(!action.is_empty(), "affected requires an action_statement");
+                    assert_eq!(json["action_statement"], action);
+                    let about = product.subcomponents.len();
+                    assert_eq!(about, 1, "an action statement is about one package");
+                    for key in reserved {
+                        assert!(!obj.contains_key(key), "{key} goes with not_affected");
+                    }
+                }
+                _ => {
+                    assert_eq!(json["status"], "not_affected");
+                    assert!(st.justification.is_some() && st.impact_statement.is_some());
+                    assert!(!obj.contains_key("action_statement"));
+                }
+            }
+        }
+        // Nothing is `null`, and the text reads back as the document.
+        let text = serde_json::to_string_pretty(&doc).unwrap();
+        assert!(!text.contains("null"), "{text}");
+        let reparsed: Document = serde_json::from_str(&text).unwrap();
+        assert_eq!(reparsed, doc);
+    }
 }

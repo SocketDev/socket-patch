@@ -12,6 +12,8 @@
 # To add a release, add one line per platform from those files; never copy a
 # digest from a download you made yourself.
 
+bazel 7.4.0 linux-x86_64 48ea0ff9d397a48add6369c261c5a4431fe6d5d5348cfb81411782fb80c388d3
+bazel 7.4.0 darwin-arm64 f843fe1ecb13e1a212519c0b2a44aeb978c6426f6585e3490ebed6670d6fd295
 bazel 7.7.2 linux-x86_64 f7b8c4e72f8776f6a352fbe699cc1de381342b5e7e0ad1f34d72c5a9b163288c
 bazel 7.7.2 darwin-arm64 7f50ea270dce9f9315afb2a58371dd866e7b23a14f0533de470bb235aff2856f
 bazel 8.8.2 linux-x86_64 bf463ba0f5f782e8fe31071bd2b821c2f6a27f03e5bb62f0879e88cbf3656e04

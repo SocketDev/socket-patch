@@ -177,10 +177,10 @@ async fn hosted_human_empty_discovery_ignores_a_malformed_pre_v5_ledger() {
 }
 
 /// A free-tier org whose every discovered hosted offer is paid-tier: the
-/// human hosted arm stops with the same `No downloadable patches (paid
-/// subscription required).` line the agent/vendored arms print (after the
-/// table's paid nudge), exits 0, and never enters the engine — no reference
-/// grant is requested and no `Redirected 0 package(s)` line is printed.
+/// human hosted arm stops with the same `No downloadable patches` line the
+/// agent/vendored arms print, exits 0, and never enters the engine — no
+/// reference grant is requested and no `Switched 0 packages` line is
+/// printed. The run closes with the paid-plan line.
 #[tokio::test]
 async fn hosted_human_paid_only_discovery_stops_with_the_paid_hint() {
     let server = MockServer::start().await;
@@ -226,9 +226,11 @@ async fn hosted_human_paid_only_discovery_stops_with_the_paid_hint() {
         stdout.contains("No downloadable patches: every patch found requires a paid Socket plan."),
         "stdout=\n{stdout}"
     );
-    assert!(
-        stdout.contains("1 additional patch is available with a paid Socket plan"),
-        "the table's paid nudge still prints; stdout=\n{stdout}"
+    assert_eq!(
+        stdout,
+        "No downloadable patches: every patch found requires a paid Socket plan.\n\
+         Upgrade to a paid Socket plan to access all patches: https://socket.dev/pricing\n",
+        "the paid nudge still prints"
     );
     assert!(
         !stdout.contains("Switched"),
@@ -507,43 +509,53 @@ async fn human_rerun_says_already_redirected_and_first_run_prints_next_steps() {
     assert_eq!(code, 0, "stderr=\n{stderr}");
     assert_eq!(
         engine_stdout(&stdout),
-        "Switched 1 package to hosted patches; rewrote 2 files.\n\
+        "Switched 1 package to hosted patches; rewrote 2 files.\n  \
+         HIGH  covgap-hosted@1.0.0\n\
          Next steps:\n  \
          1. Commit .npmrc and package-lock.json to keep the hosted patches.\n  \
-         2. Reinstall from the updated lockfile (e.g. `npm ci`) so the installed packages pick \
-         up the patched artifacts, then run `socket-patch vex` to verify the installed \
-         patches.\n",
+         2. Reinstall from the updated lockfile (e.g. `npm ci`), then run `socket-patch vex` \
+         to verify the installed patches.\n",
         "stderr=\n{stderr}"
+    );
+    assert!(
+        stdout.ends_with(
+            "\nPatched 1 package.\nSaved about 2 hours of engineering time (1 package upgrade \
+             at ~2 hours).\nNothing left to patch.\n"
+        ),
+        "the run closes with its totals; stdout=\n{stdout}"
     );
 
     let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &[], &[]);
     assert_eq!(code, 0, "stderr=\n{stderr}");
     assert_eq!(
         engine_stdout(&stdout),
-        "1 package is already on hosted patches; nothing to rewrite.\n",
+        "1 package is already on hosted patches; nothing to rewrite.\n  \
+         HIGH  covgap-hosted@1.0.0\n",
         "stderr=\n{stderr}"
     );
     let (code, stdout, _) = scan_hosted(tmp.path(), &server.uri(), &["--dry-run"], &[]);
     assert_eq!(code, 0);
     assert_eq!(
         engine_stdout(&stdout),
-        "1 package is already on hosted patches; nothing to rewrite.\n"
+        "1 package is already on hosted patches; nothing to rewrite.\n  \
+         HIGH  covgap-hosted@1.0.0\n"
     );
 }
 
-/// A package with three patches gets one of them. The run names the
-/// advisory that patch fixes and the two it leaves unpatched (a CVE, and an
-/// advisory that has only a GHSA id), in the future tense on a dry run and
+/// A package with three patches gets one of them. The package's row names
+/// the advisory that patch fixes and counts the two it leaves unpatched (a
+/// CVE, and an advisory that has only a GHSA id), which `--verbose` names;
+/// the closing lines total them, in the future tense on a dry run, and
 /// again on a re-run that rewrites nothing. `--json` carries the same facts
 /// on the package's `packages[]` entry.
 #[tokio::test]
 async fn human_names_the_fixed_advisory_and_the_ones_left_unpatched() {
     const UUID_B: &str = "33333333-3333-4333-8333-333333333333";
     const UUID_C: &str = "44444444-4444-4444-8444-444444444444";
-    const LINE: &str = "  pkg:npm/covgap-hosted@1.0.0: fixes CVE-2026-0001; still unpatched: \
-        CVE-2026-0002, GHSA-cccc-cccc-cccc\n";
-    const NOTE: &str = "Only one patch is applied per package version. Upgrade the package to \
-        fix the advisories still unpatched.\n";
+    const LINE: &str = "  CRITICAL  covgap-hosted@1.0.0  CVE-2026-0001  2 unpatched\n";
+    const NOTE: &str = "\nPatched 1 package, fixing 1 vulnerability (1 critical).\n\
+        Saved about 2 hours of engineering time (1 package upgrade at ~2 hours).\n\
+        2 vulnerabilities left to patch (67%): 2 need a package upgrade.\n";
 
     let server = MockServer::start().await;
     mock_discovery_patches(
@@ -565,13 +577,24 @@ async fn human_names_the_fixed_advisory_and_the_ones_left_unpatched() {
     let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &["--dry-run"], &[]);
     assert_eq!(code, 0, "stderr=\n{stderr}");
     assert_eq!(
-        engine_stdout(&stdout),
+        stdout,
         format!(
             "Would switch 1 package to hosted patches and rewrite 2 files (--dry-run: nothing \
-             was changed).\n  pkg:npm/covgap-hosted@1.0.0: would fix CVE-2026-0001; would stay \
-             unpatched: CVE-2026-0002, GHSA-cccc-cccc-cccc\n{NOTE}"
+             was changed).\n{LINE}\n\
+             Would patch 1 package, fixing 1 vulnerability (1 critical).\n\
+             Would save about 2 hours of engineering time (1 package upgrade at ~2 hours).\n\
+             2 vulnerabilities would be left to patch (67%): 2 need a package upgrade.\n"
         ),
         "stderr=\n{stderr}"
+    );
+    let (code, verbose, stderr) =
+        scan_hosted(tmp.path(), &server.uri(), &["--dry-run", "--verbose"], &[]);
+    assert_eq!(code, 0, "stderr=\n{stderr}");
+    assert!(
+        verbose.contains(&format!(
+            "{LINE}      still unpatched: CVE-2026-0002, GHSA-cccc-cccc-cccc\n"
+        )),
+        "stdout=\n{verbose}"
     );
 
     let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &["--dry-run"], &[]);
@@ -600,18 +623,17 @@ async fn human_names_the_fixed_advisory_and_the_ones_left_unpatched() {
 
     let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &[], &[]);
     assert_eq!(code, 0, "stderr=\n{stderr}");
-    let engine = engine_stdout(&stdout);
     assert!(
-        engine.starts_with(&format!(
-            "Switched 1 package to hosted patches; rewrote 2 files.\n{LINE}{NOTE}Next steps:\n"
-        )),
+        stdout.starts_with(&format!(
+            "Switched 1 package to hosted patches; rewrote 2 files.\n{LINE}Next steps:\n"
+        )) && stdout.ends_with(NOTE),
         "stdout=\n{stdout}\nstderr=\n{stderr}"
     );
 
     let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &[], &[]);
     assert_eq!(code, 0, "stderr=\n{stderr}");
     assert_eq!(
-        engine_stdout(&stdout),
+        stdout,
         format!("1 package is already on hosted patches; nothing to rewrite.\n{LINE}{NOTE}"),
         "stderr=\n{stderr}"
     );
@@ -750,7 +772,9 @@ async fn human_summary_counts_only_the_packages_this_run_switched() {
     assert_eq!(
         engine_stdout(&stdout),
         "Would switch 1 package to hosted patches and rewrite 1 file (--dry-run: nothing was \
-         changed). 1 package is already on hosted patches.\n",
+         changed). 1 package is already on hosted patches.\n  \
+         HIGH  covgap-hosted@1.0.0\n  \
+         HIGH  covgap-second@1.0.0\n",
         "stderr=\n{stderr}"
     );
 
@@ -759,7 +783,10 @@ async fn human_summary_counts_only_the_packages_this_run_switched() {
     assert!(
         engine_stdout(&stdout).starts_with(
             "Switched 1 package to hosted patches; rewrote 1 file. 1 package was already on \
-             hosted patches.\nNext steps:\n"
+             hosted patches.\n  \
+             HIGH  covgap-hosted@1.0.0\n  \
+             HIGH  covgap-second@1.0.0\n\
+             Next steps:\n"
         ),
         "stdout=\n{stdout}\nstderr=\n{stderr}"
     );
@@ -768,7 +795,9 @@ async fn human_summary_counts_only_the_packages_this_run_switched() {
     assert_eq!(code, 0, "stderr=\n{stderr}");
     assert_eq!(
         engine_stdout(&stdout),
-        "2 packages are already on hosted patches; nothing to rewrite.\n",
+        "2 packages are already on hosted patches; nothing to rewrite.\n  \
+         HIGH  covgap-hosted@1.0.0\n  \
+         HIGH  covgap-second@1.0.0\n",
         "stderr=\n{stderr}"
     );
 }
@@ -854,7 +883,8 @@ async fn human_pnpm_rerun_prints_only_the_reminder_and_heal_restores_guidance() 
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert_eq!(
         engine_stdout(&stdout),
-        "1 package is already on hosted patches; nothing to rewrite.\n"
+        "1 package is already on hosted patches; nothing to rewrite.\n  \
+         HIGH  covgap-hosted@1.0.0\n"
     );
     assert_eq!(
         pnpm_part(&stderr),

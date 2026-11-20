@@ -2,9 +2,10 @@ name: Bazel patch compatibility (npm)
 
 # The npm flows of the real-Bazel tests (`npm::` in `e2e_bazel_build`):
 # hosted and vendored mode for a package that aspect_rules_js links from a
-# pnpm lock, on each Bazel release below. bazel-compatibility.yml holds the
-# legs and what every ecosystem shares; this file says when the npm legs run
-# and on which releases.
+# pnpm lock, and agent mode for the copy of it in `node_modules`, on each
+# Bazel release below. bazel-compatibility.yml holds the legs and what
+# every ecosystem shares; this file says when the npm legs run and on which
+# releases.
 #
 # Beyond what every leg needs, an npm leg downloads Node from nodejs.org and
 # ruleset archives from codeload.github.com; its repository cache holds them
@@ -36,18 +37,23 @@ on:
     # Its walk of the pnpm workspace decides what the second run of each
     # flow reports, and no other test runs it beside Bazel's links. That
     # file also holds the Composer, Cargo and Go parts of the gate, so a
-    # change to those starts the npm legs too. The
-    # globs name that one crate, so no bench fixture is here, and nothing
-    # another ecosystem's flow owns: a change to one ecosystem starts that
-    # ecosystem's legs only.
+    # change to those starts the npm legs too. The `*pnpm*` globs name that
+    # one crate, so no bench fixture is here. Last, the VEX code: `vex/` of
+    # the core, the files of the `vex` command, and `bazel/` of the core,
+    # which reads the workspace files and decides whether Bazel builds what
+    # was patched. Every flow holds the exact document socket-patch writes
+    # about its build, patched or not, so a change to how a document is
+    # built or worded starts the legs of every
+    # ecosystem. Nothing else that another ecosystem's flow owns is here:
+    # any other change to one ecosystem starts that ecosystem's legs only.
     #
     # What it does not cover: shared engine code (patch/redirect/mod.rs,
-    # the rest of vendor/, hosted/, commands/), the shared test helpers and
-    # the toolchain files. A change there gets its run on the push to main
-    # (when the file is in the list below) or in the nightly run, not on the
-    # pull request: that is the price of not running every ecosystem's legs
-    # on every shared change. On demand, workflow_dispatch runs the legs on
-    # any branch.
+    # the rest of vendor/, hosted/, the rest of commands/), the shared test
+    # helpers and the toolchain files. A change there gets its run on the
+    # push to main (when the file is in the list below) or in the nightly
+    # run, not on the pull request: that is the price of not running every
+    # ecosystem's legs on every shared change. On demand, workflow_dispatch
+    # runs the legs on any branch.
     paths:
       - '.github/workflows/bazel-npm.yml'
       - '.github/workflows/bazel-compatibility.yml'
@@ -66,6 +72,9 @@ on:
       - 'crates/socket-patch-core/src/crawlers/npm_crawler.rs'
       - 'crates/socket-patch-core/src/formats/package_json.rs'
       - 'crates/socket-patch-core/src/patch/user_patches.rs'
+      - 'crates/socket-patch-core/src/bazel/**'
+      - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-cli/src/commands/vex*.rs'
   push:
     branches: [main]
     # The pull request paths, and what only a push to main covers: the
@@ -92,6 +101,9 @@ on:
       - 'crates/socket-patch-core/src/crawlers/npm_crawler.rs'
       - 'crates/socket-patch-core/src/formats/package_json.rs'
       - 'crates/socket-patch-core/src/patch/user_patches.rs'
+      - 'crates/socket-patch-core/src/bazel/**'
+      - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-cli/src/commands/vex*.rs'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
       - 'crates/socket-patch-core/src/patch/redirect/**'
       - 'crates/socket-patch-core/src/vendor/**'

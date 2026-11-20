@@ -9,12 +9,14 @@ pub mod hosted_bundle;
 pub(crate) mod hosted_unwind;
 pub mod list;
 pub(crate) mod lock_cli;
+pub(crate) mod measured;
 pub(crate) mod projects_below;
 pub(crate) mod pypi_reinstall;
 pub mod remove;
 pub mod repair;
 pub mod rollback;
 pub mod scan;
+pub mod show;
 pub mod update;
 pub(crate) mod user_patches;
 pub mod vendor;
@@ -49,6 +51,97 @@ pub(crate) const VENDORED_MODE_LABEL: &str = "vendored";
 /// unwound, or consulted for ownership of a global copy.
 pub(crate) fn project_state_in_scope(common: &crate::args::GlobalArgs) -> bool {
     !common.is_global()
+}
+
+/// In a Bazel workspace the root's `.bazelignore` names the directories of
+/// the project's patched Go module copies, so that Bazel and gazelle read
+/// no package there (`socket_patch_core::bazel::ignore`). A command that can
+/// write or remove such a copy calls this once, after the last step that
+/// can change a copy or take one back and before it gives up its apply
+/// lock. Nothing is done in a dry run or a `--global` run, and a run whose
+/// `--ecosystems` leaves `golang` out only takes away the pair of a copy
+/// that is gone. So does the prune pass of a scan, which comes here after
+/// its scan has (`adds` false) and can only have removed a copy: a file
+/// it cannot write is left to the next command's warning.
+///
+/// A human run is told here that the file changed, or why it could not be;
+/// the result is that warning again, for the command's envelope.
+pub(crate) async fn sync_bazelignore(
+    common: &crate::args::GlobalArgs,
+    adds: bool,
+) -> Vec<crate::json_envelope::RunWarning> {
+    use socket_patch_core::{bazel::ignore, crawlers::Ecosystem::Golang};
+    let mut warnings = Vec::new();
+    if common.dry_run || common.is_global() {
+        return warnings;
+    }
+    // The agent copies are those of `--cwd`, the vendored ones those of
+    // the manifest's project. A root both are under is named once.
+    let mut projects = vec![common.cwd.clone()];
+    if common.manifest_project_is_foreign() {
+        projects.push(common.project_root());
+    }
+    let (loud, mut told) = (!common.json && !common.silent, Vec::new());
+    for project in projects {
+        match ignore::sync(&project, adds && common.ecosystem_selected(Golang)).await {
+            Ok(Some(file)) if loud && !told.contains(&file) => {
+                let (verb, what) = match file.exists() {
+                    true => (
+                        "Updated",
+                        "the lines that keep patched Go module copies under .socket out of \
+                         Bazel's packages",
+                    ),
+                    false => ("Removed", "no patched Go module copy is left under .socket"),
+                };
+                println!("{verb} {}: {what}", file.display());
+                told.push(file);
+            }
+            Err(detail) if adds => {
+                if loud {
+                    eprintln!("Warning: {detail}");
+                }
+                warnings.push(crate::json_envelope::RunWarning::new(
+                    ignore::NOT_UPDATED,
+                    detail,
+                ));
+            }
+            _ => {}
+        }
+    }
+    warnings
+}
+
+/// In a Bazel workspace a rules_jvm_external hub builds the jars its own
+/// lock pins, whatever a `pom.xml`, a Gradle build or an installed jar
+/// holds (`socket_patch_core::bazel::maven`). A command that vendors or
+/// applies patches calls this once with the purls it was about, and hands
+/// what it gets to the warnings of its run: one for each Maven jar among
+/// them that a hub builds, or may build, from its lock. Nothing for a
+/// `--global` run, whose target is not the project, for a jar that hosted
+/// mode has patched for the hub, and no file is looked for when no purl is
+/// a Maven one. A hosted run does not come here: its hub lane patches such
+/// a jar, or says why not, among the warnings of its rewriters.
+///
+/// With `tell`, a human run is told here, as [`sync_bazelignore`] tells
+/// it. A command that prints the warnings of its run itself passes
+/// `false`.
+pub(crate) async fn bazel_maven_notices<'a>(
+    common: &crate::args::GlobalArgs,
+    purls: impl Iterator<Item = &'a str>,
+    tell: bool,
+) -> Vec<crate::json_envelope::RunWarning> {
+    if common.is_global() {
+        return Vec::new();
+    }
+    let purls = purls.map(str::to_string).collect();
+    let said = socket_patch_core::bazel::maven::notices(&common.cwd, purls).await;
+    let warning = |(code, detail): (&str, String)| {
+        if tell && !common.json && !common.silent {
+            eprintln!("Warning: {detail}");
+        }
+        crate::json_envelope::RunWarning::new(code, detail)
+    };
+    said.into_iter().map(warning).collect()
 }
 
 /// The vendor-ledger keys (`ledger`, the project's

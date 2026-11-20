@@ -1410,6 +1410,27 @@ pub async fn read_candidate_files_in(
                 || crate::vendor::jvm::layout::GRADLE_ROOT_FILES.contains(&rel.as_str())
         });
     }
+    // In a Bazel workspace on disk a rules_jvm_external hub builds the jar
+    // its lock pins. What a run may write for such a jar is read from the
+    // checkout here and rides a synthetic key, with the root `MODULE.bazel`
+    // beside it, which is where the hub lane writes. A project that is in
+    // no Bazel workspace, or whose hubs build none of the candidates, gets
+    // neither, and its run is the one it was.
+    let patches = candidates.iter().map(|c| (c.purl.as_str(), &c.dep));
+    let jars = crate::bazel::maven::jars(patches);
+    if let Some(root) = view.disk_root().filter(|_| !jars.is_empty()) {
+        use crate::bazel::maven::{site, FILE, SITE_KEY};
+        let (root, module) = (root.to_path_buf(), view.read_text(FILE).await.ok());
+        let (read, module) =
+            crate::utils::fs::run_blocking(move || (site(&root, module.as_deref(), &jars), module))
+                .await;
+        if !read.is_empty() {
+            out.files
+                .extend(module.map(|module| (FILE.to_string(), module)));
+            let read = serde_json::to_string(&read).expect("a map of strings is JSON");
+            out.files.insert(SITE_KEY.to_string(), read);
+        }
+    }
     // An sbt build's resolution evidence rides a synthetic key (see
     // `patch::redirect::sbt::SBT_RESOLUTION_KEY`).
     if candidates.iter().any(|c| c.dep.ecosystem == "maven")
@@ -3854,6 +3875,9 @@ fn confirm(
         .filter(|(name, _)| !shadowed_pnpm.contains(name))
         .filter(|(name, _)| !is_npm_manifest(name))
         .filter(|(name, _)| !is_unpinned_maven(name))
+        // The block of a Bazel workspace confirms by the hub lane's own
+        // report: the URL in a block that was changed by hand pins nothing.
+        .filter(|(name, _)| name.as_str() != crate::bazel::maven::FILE)
         .filter(|(name, _)| !crate::patch::redirect::sbt::is_synthetic_key(name))
         .map(|(name, content)| (name.as_str(), rewrite.files.get(name).unwrap_or(content)))
         .chain(
@@ -3902,6 +3926,12 @@ fn confirm(
             // the Gradle arm below confirms an sbt-confirmed uuid, and a
             // uuid the sbt rewriter refused is never confirmed by the
             // Gradle planner alone — the sbt build still loads upstream.
+            // A jar that a rules_jvm_external hub of a Bazel workspace
+            // builds is pinned once its entry is in the block of
+            // `MODULE.bazel`, whatever another build of the checkout pins.
+            if rewrite.confirmed_bazel_maven_uuids.contains(uuid) {
+                return ProbeStep::Decided(true);
+            }
             if purl.starts_with("pkg:maven/") {
                 if let Some(sbt_only) = crate::patch::redirect::sbt::maven_confirmation(files) {
                     let refused_by_sbt = rewrite.refused_sbt_uuids.contains(uuid);

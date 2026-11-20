@@ -109,10 +109,13 @@ fn failed_run_reports_stale_document_removal() {
         )),
         "{err}"
     );
-    // The error line is last.
+    // The error closes the run, with what to do about it under it.
     assert!(
-        err.trim_end()
-            .ends_with("Error: No applied patches with vulnerability metadata to attest."),
+        err.trim_end().ends_with(
+            "Error: No applied patches with vulnerability metadata to attest.\n\
+             The patched packages are not installed here. Run your package manager's install, \
+             then `socket-patch vex` again."
+        ),
         "{err}"
     );
 }
@@ -136,10 +139,24 @@ fn omissions_are_sorted_and_listed_once() {
     assert_eq!(
         lines,
         vec![
+            // One line for the reason, its packages sorted.
+            "Warning: omitting 3 packages from VEX: the package is not installed \
+             (package_not_found): alpha@1.0.0, mid@1.0.0, zeta@1.0.0",
+            "Error: No applied patches with vulnerability metadata to attest.",
+            "The patched packages are not installed here. Run your package manager's install, \
+             then `socket-patch vex` again.",
+        ]
+    );
+    // `--verbose` keeps a line per patch.
+    let o = vex(cwd, &["--verbose"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    let lines: Vec<String> = stderr(&o).lines().map(str::to_string).collect();
+    assert_eq!(
+        lines[..3],
+        [
             "Warning: omitting pkg:npm/alpha@1.0.0 from VEX: the package is not installed (package_not_found)",
             "Warning: omitting pkg:npm/mid@1.0.0 from VEX: the package is not installed (package_not_found)",
             "Warning: omitting pkg:npm/zeta@1.0.0 from VEX: the package is not installed (package_not_found)",
-            "Error: No applied patches with vulnerability metadata to attest.",
         ]
     );
 

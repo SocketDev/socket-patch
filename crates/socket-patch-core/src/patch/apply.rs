@@ -361,6 +361,11 @@ pub async fn verify_file_patch(
 /// this naturally yields ≤1 index and their behavior is unchanged. The
 /// narrow download filter (scan/get) and the rollback dedupe share this
 /// helper so release selection stays consistent with apply.
+///
+/// One more rule for gems, which every reader shares through this
+/// function: a platform gem's copy takes the record written for its own
+/// platform alone, when that record matches it
+/// ([`own_platform_alone`]).
 pub async fn select_installed_variants(
     pkg_path: &Path,
     variants: &[(&str, &HashMap<String, PatchFileInfo>)],
@@ -371,7 +376,39 @@ pub async fn select_installed_variants(
             matched.push(idx);
         }
     }
-    matched
+    own_platform_alone(pkg_path, variants, matched).await
+}
+
+/// Of the variants `matched` to the gem copy at `pkg_path`, the one written
+/// for the copy's own platform alone, when there is one
+/// ([`own_platform_record`](crate::patch::gem_ext::own_platform_record)).
+/// The ruby-platform record of the same version can match a platform
+/// gem's copy too (its sources are what the copy's binary was built from;
+/// on a JRuby copy it may take no file at all), and it is not that copy's
+/// record: `apply` does not apply it there, so `apply --check`, `vex` and
+/// `rollback` do not judge it there either. Any other selection is
+/// returned as it is.
+async fn own_platform_alone(
+    pkg_path: &Path,
+    variants: &[(&str, &HashMap<String, PatchFileInfo>)],
+    matched: Vec<usize>,
+) -> Vec<usize> {
+    use crate::crawlers::types::Ecosystem;
+    let gems = matched.len() > 1
+        && matched
+            .iter()
+            .all(|&idx| Ecosystem::from_purl(variants[idx].0) == Some(Ecosystem::Gem));
+    if !gems {
+        return matched;
+    }
+    let keys = matched.iter().map(|&idx| variants[idx].0);
+    match crate::patch::gem_ext::own_platform_record(pkg_path, keys).await {
+        Some(own) => matched
+            .into_iter()
+            .filter(|&idx| variants[idx].0 == own)
+            .collect(),
+        None => matched,
+    }
 }
 
 /// [`select_installed_variants`] over every copy in `pkg_paths`: a variant
@@ -381,6 +418,19 @@ pub async fn select_installed_variants_any(
     pkg_paths: &[std::path::PathBuf],
     variants: &[(&str, &HashMap<String, PatchFileInfo>)],
 ) -> Vec<usize> {
+    use crate::crawlers::types::Ecosystem;
+    // Gem copies are selected one by one, so that each takes its own
+    // platform's record alone.
+    if variants
+        .iter()
+        .any(|(key, _)| Ecosystem::from_purl(key) == Some(Ecosystem::Gem))
+    {
+        let mut matched = std::collections::BTreeSet::new();
+        for pkg_path in pkg_paths {
+            matched.extend(select_installed_variants(pkg_path, variants).await);
+        }
+        return matched.into_iter().collect();
+    }
     let mut matched = Vec::new();
     for (idx, (key, files)) in variants.iter().enumerate() {
         for pkg_path in pkg_paths {

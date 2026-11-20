@@ -67,8 +67,9 @@ use crate::formats::cargo::source_replacement::{crates_io_source, ConfigLayer, C
 use crate::formats::cargo::{is_crates_io_patch_table, is_crates_io_source, CargoLock};
 use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::hosted::{
-    bundled_before_2_2, checksum_entry_span, converge_gem_lock_source, lock_layout,
-    merge_gem_lock_remote, refresh_merged_gem_lock_remote, DependencyPin, LockLayout,
+    bundled_before_2_2, bundler_keeps_merged_section, checksum_entry_span,
+    converge_gem_lock_source, lock_layout, merge_gem_lock_remote, refresh_merged_gem_lock_remote,
+    DependencyPin, LockLayout,
 };
 use crate::formats::gem::locked_specs as gem_locked_specs;
 use crate::formats::maven::declared_maven::DeclaredMaven;
@@ -500,6 +501,16 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub refused_sbt_uuids: std::collections::BTreeSet<String>,
+    /// Maven patch uuids whose entry is in the block of the root
+    /// `MODULE.bazel` of a Bazel workspace, written by this run or already
+    /// there ([`crate::bazel::maven::rewrite`]): the jar a
+    /// rules_jvm_external hub builds is the patched one. Confirms a Maven
+    /// purl whatever a `pom.xml` or a Gradle build beside the hub holds.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub confirmed_bazel_maven_uuids: std::collections::BTreeSet<String>,
 }
 
 /// The derived `Debug` shape, with the Gradle sets shown only when
@@ -545,6 +556,10 @@ impl std::fmt::Debug for RewriteResult {
             ("refused_gradle_uuids", &self.refused_gradle_uuids),
             ("confirmed_sbt_uuids", &self.confirmed_sbt_uuids),
             ("refused_sbt_uuids", &self.refused_sbt_uuids),
+            (
+                "confirmed_bazel_maven_uuids",
+                &self.confirmed_bazel_maven_uuids,
+            ),
         ] {
             if !set.is_empty() {
                 d.field(name, set);
@@ -593,6 +608,23 @@ fn serialize_json_like(value: &Value, original: &str) -> String {
 /// silently dropped from the redirected count.
 fn registry_override_of_kind<'a>(dep: &'a DepOverride, kind: &str) -> Option<&'a RegistryOverride> {
     dep.registry_override.as_ref().filter(|ov| ov.kind == kind)
+}
+
+/// The `maven2` override of a Maven patch, and the group and the artifact
+/// the patch is pinned under: those of the grant, else those of the purl.
+/// The pom rewriter and the lane for the hubs of a Bazel workspace
+/// ([`crate::bazel::maven`]) both go by it, so that one run pins the same
+/// artifact for both builds.
+pub(crate) fn maven_coordinates(dep: &DepOverride) -> (Option<&RegistryOverride>, String, String) {
+    let ov = registry_override_of_kind(dep, "maven2");
+    let ids = ov.map(|ov| &ov.identifiers);
+    let group = ids.and_then(|ids| ids.maven_group_id.clone());
+    let artifact = ids.and_then(|ids| ids.maven_artifact_id.clone());
+    (
+        ov,
+        group.or_else(|| dep.namespace.clone()).unwrap_or_default(),
+        artifact.unwrap_or_else(|| dep.name.clone()),
+    )
 }
 
 /// Run every rewriter and merge the results (each owns distinct files).
@@ -839,7 +871,10 @@ fn rewriter_groups<'a>(
         Box::new(move |result| rewrite_composer_lock(files, overrides, result)),
         Box::new(move |result| rewrite_nuget(files, overrides, result)),
         Box::new(move |result| rewrite_gem(files, overrides, result)),
-        Box::new(move |result| rewrite_maven_pom(files, overrides, maven, result)),
+        Box::new(move |result| {
+            rewrite_maven_pom(files, overrides, maven, result);
+            crate::bazel::maven::rewrite(files, overrides, result);
+        }),
         Box::new(move |result| {
             gradle::rewrite_gradle_hosted(files, gradle_unreadable, overrides, result)
         }),
@@ -933,6 +968,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         confirmed_maven_reactor_uuids,
         confirmed_sbt_uuids,
         refused_sbt_uuids,
+        confirmed_bazel_maven_uuids,
     } = delta;
     result.files.extend(files);
     result.binary_files.extend(binary_files);
@@ -989,6 +1025,9 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     }
     result.confirmed_sbt_uuids.extend(confirmed_sbt_uuids);
     result.refused_sbt_uuids.extend(refused_sbt_uuids);
+    result
+        .confirmed_bazel_maven_uuids
+        .extend(confirmed_bazel_maven_uuids);
 }
 
 /// [`rewrite_groups_serial`], with the groups run concurrently under
@@ -8439,6 +8478,42 @@ fn plan_gem_redirect(
                     &mut staged,
                 )
                 .map_err(|why| {
+                    // A multi-remote section under a manifest with several
+                    // top-level sources is what this bundler writes for
+                    // it, and `bundle lock` writes it again: the way out
+                    // is the manifest (#2162). The urls stay out of the
+                    // text: a source can carry credentials. Vendored mode
+                    // is not offered: it refuses a gem in a `group` block
+                    // or with a native extension, which this plan cannot
+                    // tell.
+                    let globals = declarations::top_level_source_count(&gf);
+                    if let Some(remotes) = why.shared_remotes.filter(|_| globals > 1) {
+                        let relock = match bundler_keeps_merged_section(&lk) {
+                            Some(bundler) => format!(
+                                "then run `bundle lock` with bundler 2.2.25 or later (bundler \
+                                 {bundler}, which wrote {lock_name}, keeps the one section)"
+                            ),
+                            None => "then run `bundle lock`".to_string(),
+                        };
+                        return refuse(
+                            "redirect_gem_lock_unconvergeable",
+                            format!(
+                                "{gemfile_name} has {globals} top-level `source` lines, and \
+                                 for such a manifest bundler locks every gem in one GEM \
+                                 section that names every source ({lock_name} lists \
+                                 {remotes} remotes over `{name} ({})`), which hosted mode \
+                                 does not rewrite; nothing was changed for {name} — keep \
+                                 the source that serves {name} as the one top-level \
+                                 `source` line and move each other one into a \
+                                 `source \"<url>\" do … end` block around the gems that \
+                                 come from it (bundler's own deprecation warning asks for \
+                                 the same), {relock}, commit {gemfile_name} \
+                                 and {lock_name} and re-run the hosted scan, or patch \
+                                 {name} with `--mode agent`",
+                                dep.version
+                            ),
+                        );
+                    }
                     refuse(
                         "redirect_gem_lock_unconvergeable",
                         format!(
@@ -9225,6 +9300,11 @@ pub fn maven_reactor_root(files: &BTreeMap<String, String>) -> bool {
 ///   decided and not confirmed ([`RewriteResult::maven_reactor_uuids`]),
 ///   so wiring an earlier run left is not counted as a redirect, or
 ///   attested, by a substring it still matches.
+///
+/// The gate holds deps back and nothing else: the respelling of a
+/// `.mvn/maven.config` an earlier release wrote ([`heal_mvn_config`]) is
+/// decided by that file, and the rewriter proper makes it whichever deps it
+/// is handed, none included.
 fn rewrite_maven_pom(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -9261,11 +9341,15 @@ fn rewrite_maven_pom(
     );
     let mut wired: Vec<DepOverride> = Vec::with_capacity(overrides.len());
     for dep in overrides {
+        // An earlier run's wiring is in the poms already, or this run
+        // would write it.
+        let mut in_place = false;
         let gate = (dep.ecosystem == "maven")
             .then(|| captured(dep))
             .flatten()
             .filter(|(repo_id, _)| {
-                declares(files, repo_id) || {
+                in_place = declares(files, repo_id);
+                in_place || {
                     let mut alone = RewriteResult::default();
                     rewrite_maven_poms(files, std::slice::from_ref(dep), selection, &mut alone);
                     declares(&alone.files, repo_id)
@@ -9290,9 +9374,11 @@ fn rewrite_maven_pom(
             ),
             None => full_name(dep),
         };
+        let earlier =
+            in_place.then(|| format!("pkg:maven/{}@{}", ga.replace(':', "/"), dep.version));
         result.warnings.push(RewriteWarning {
             code: "redirect_maven_mirror_captures_repository".into(),
-            detail: maven_mirror_detail(&ga, &repo_id, mirror, wrapper),
+            detail: maven_mirror_detail(&ga, &repo_id, mirror, wrapper, earlier.as_deref()),
         });
         result.maven_reactor_uuids.insert(dep.patch_uuid.clone());
     }
@@ -9404,25 +9490,19 @@ fn rewrite_maven_poms(
     // unenforced-pin warning must fire on re-scans too.
     let mut pinned_jar_paths: Vec<String> = vec![];
 
+    // A patch whose jar a rules_jvm_external hub of a Bazel workspace
+    // builds, or may build, is decided by the lane of the hubs, which says
+    // why when it writes nothing: "no pom.xml" is not said of it.
+    let hub = crate::bazel::maven::handed(files);
+
     for dep in &maven {
-        let Some(ov) = registry_override_of_kind(dep, "maven2") else {
+        let (Some(ov), group_id, artifact_id) = maven_coordinates(dep) else {
             result.warnings.push(RewriteWarning {
                 code: "redirect_maven_missing_override".into(),
                 detail: format!("{} has no maven2 registry override", full_name(dep)),
             });
             continue;
         };
-        let group_id = ov
-            .identifiers
-            .maven_group_id
-            .clone()
-            .or_else(|| dep.namespace.clone())
-            .unwrap_or_default();
-        let artifact_id = ov
-            .identifiers
-            .maven_artifact_id
-            .clone()
-            .unwrap_or_else(|| dep.name.clone());
         let suffixed_version = ov.identifiers.maven_suffixed_version.clone();
         // The jar and served-pom sha256 a Trusted Checksums pin needs, as
         // the bare lowercase hex Maven compares; a grant hash of any other
@@ -9437,29 +9517,38 @@ fn rewrite_maven_poms(
             .as_ref()
             .is_some_and(|(jar, pom)| !is_hex64_lower(jar) || !is_hex64_lower(pom));
         let checksum_hashes = checksum_hashes.filter(|_| !bad_checksum_hashes);
-        if let Some(suffixed) = suffixed_version.as_deref().filter(|_| bad_checksum_hashes) {
-            // No pin is written for the suffixed version, so none may stay
-            // either: an earlier release wrote such a grant's hash mangled
-            // (lowercased base64), and Maven fails the build on a line
-            // whose hash does not match. Dropped whether or not the version
-            // pin lands this run (a re-run with the pin present too).
-            for ext in ["jar", "pom"] {
-                checksum_drops.push(crate::vendor::jvm::layout::artifact_path(
-                    &group_id,
-                    &artifact_id,
-                    suffixed,
-                    None,
-                    ext,
-                ));
-            }
-        }
+        // No checksum pin is written for the suffixed version of a grant
+        // whose hash is malformed, so none may stay either: an earlier
+        // release wrote such a grant's hash mangled (lowercased base64),
+        // and Maven fails the build on a line whose hash does not match.
+        // The lines go with the pin: when it lands this run, and when an
+        // earlier run's is in place (a re-run). They are queued only then.
+        // A dep this run refuses or skips has no file touched for it, this
+        // one included, which is what its warning says.
+        let stale_checksums: Vec<String> = suffixed_version
+            .as_deref()
+            .filter(|_| bad_checksum_hashes)
+            .map(|suffixed| {
+                ["jar", "pom"]
+                    .map(|ext| {
+                        crate::vendor::jvm::layout::artifact_path(
+                            &group_id,
+                            &artifact_id,
+                            suffixed,
+                            None,
+                            ext,
+                        )
+                    })
+                    .to_vec()
+            })
+            .unwrap_or_default();
 
         // The pom for the rest of this iteration; edits land in place.
         let Some(pom_text) = pom.as_mut() else {
             // A Gradle-only project is legitimately pom-less — the Gradle
             // planner is its redirect path. Otherwise say why nothing landed
             // (parity with `redirect_npm_no_lockfile`), once per run.
-            if !gradle_build_present && !warned_no_pom {
+            if !gradle_build_present && !warned_no_pom && !hub.contains_key(&dep.patch_uuid) {
                 warned_no_pom = true;
                 result.warnings.push(RewriteWarning {
                     code: "redirect_maven_no_pom".into(),
@@ -9518,6 +9607,9 @@ fn rewrite_maven_poms(
                     None,
                     "jar",
                 ));
+            }
+            if run.wired {
+                checksum_drops.extend(stale_checksums);
             }
             checksum_drops.extend(run.drops);
             if run.landed {
@@ -9907,6 +9999,9 @@ fn rewrite_maven_poms(
                     "jar",
                 ));
             }
+            if run.wired {
+                checksum_drops.extend(stale_checksums);
+            }
             checksum_drops.extend(run.drops);
             if run.landed {
                 pin_maven_checksums(
@@ -10045,6 +10140,11 @@ fn rewrite_maven_poms(
                 None,
                 "jar",
             ));
+        }
+        // (A dep whose only declaration names another version is skipped:
+        // no pin landed and none is in place.)
+        if pin_landed || versioned.iter().any(|(_, _, v)| *v == suffixed_version) {
+            checksum_drops.extend(stale_checksums);
         }
 
         // The superseded generations' wiring: once no literal names an old
@@ -10291,9 +10391,23 @@ fn pin_maven_checksums(
     }
 }
 
+/// What a hosted Maven warning says this run did for a dep it did not
+/// wire: one clause, for the mirror gate and the reactor planner's refusal
+/// alike. It speaks of the run and of the dep, not of the state of the
+/// files: an earlier run's pin may still be in the poms, and the same run
+/// may respell a `.mvn/maven.config` line that no dep decides
+/// ([`heal_mvn_config`]).
+const MAVEN_WROTE_NOTHING: &str =
+    "this run wrote nothing for it (no pin in a pom, no line or file under .mvn/)";
+
 /// Why a dep is not wired behind `mirror`, and the ways forward. The
 /// settings read are the scanning machine's, which the line says: the
 /// machine that builds may be configured otherwise.
+///
+/// `earlier` is the purl of the dep when the poms already hold the wiring
+/// an earlier run wrote for it. That wiring is left in place, and a build
+/// behind the mirror fails on it: the line says so, and names the command
+/// that takes it out beside the ways to make it resolve.
 ///
 /// The second way forward is vendored mode, and only where it is one. A
 /// vendored patch gets past a mirror through `maven.repo.local.tail`,
@@ -10303,11 +10417,13 @@ fn pin_maven_checksums(
 /// Maven Wrapper pins an older Maven (`wrapper`, as vendored mode itself
 /// reads it) it does not offer vendored mode as it stands, but says what
 /// makes it work.
+///
 fn maven_mirror_detail(
     ga: &str,
     repo_id: &str,
     mirror: &crate::formats::maven::mirror::Mirror,
     wrapper: Option<(u32, u32, u32)>,
+    earlier: Option<&str>,
 ) -> String {
     let vendor_repo = crate::vendor::jvm::maven_reactor::REPO_ID;
     let exclude = format!(
@@ -10337,12 +10453,21 @@ fn maven_mirror_detail(
              too)"
         ),
     };
+    let left = match earlier {
+        Some(purl) => format!(
+            " The wiring an earlier run wrote for it is still in the poms and was left in \
+             place: a build behind this mirror fails to resolve the patched version until the \
+             mirror leaves the repository out or that wiring is taken out (`socket-patch \
+             rollback {purl}`)."
+        ),
+        None => String::new(),
+    };
     format!(
         "{ga}: on this machine Maven's settings send the {repo_id} repository to the mirror \
          `{id}` (<mirrorOf>{of}</mirrorOf> in {source}), which does not serve the patched \
-         artifact, so the build could not resolve it; pom.xml and .mvn/ were left as they are \
-         and the dep is not counted as redirected. {ways}. Only this machine's settings were \
-         read: the machine that builds needs the same exclusion",
+         artifact, so the build could not resolve it; {MAVEN_WROTE_NOTHING} and the dep is \
+         not counted as redirected.{left} {ways}. Only this machine's settings were read: \
+         the machine that builds needs the same exclusion",
         id = mirror.id,
         of = mirror.mirror_of,
         source = mirror.source,
@@ -10501,9 +10626,8 @@ impl MavenReactorRewrite {
             result.warnings.push(RewriteWarning {
                 code: code.into(),
                 detail: format!(
-                    "{ga}: {why}; the poms and .mvn/ were left as they are and the dep is not \
-                     counted as redirected (`scan --mode vendored` commits the patched \
-                     artifact instead)"
+                    "{ga}: {why}; {MAVEN_WROTE_NOTHING} and the dep is not counted as \
+                     redirected (`scan --mode vendored` commits the patched artifact instead)"
                 ),
             });
         };
@@ -12131,7 +12255,8 @@ mod tests {
 
     /// A gated dep has nothing written for it at all: not even the
     /// checksum lines a grant with a malformed hash would otherwise have
-    /// dropped. The warning says `.mvn/` was left as it is, and it is.
+    /// dropped. The warning says nothing was written for the dep, and
+    /// nothing is.
     #[test]
     fn maven_mirror_gate_touches_no_file_of_a_gated_dep() {
         let mut dep = granted_maven_override();
@@ -12166,6 +12291,149 @@ mod tests {
             warning_codes(&r),
             ["redirect_maven_mirror_captures_repository"]
         );
+        // The line speaks of this run. Nothing of an earlier one is in the
+        // poms, so it names none and no command to take it out.
+        let detail = &r.warnings[0].detail;
+        assert!(detail.contains(MAVEN_WROTE_NOTHING), "{detail}");
+        assert!(
+            !detail.contains("left in place") && !detail.contains("socket-patch rollback"),
+            "{detail}"
+        );
+    }
+
+    /// A dep this run refuses or skips has no file touched for it: no pom,
+    /// and not the checksum lines that a grant with a malformed hash drops
+    /// once its pin lands or is in place. One case for each way out of the
+    /// rewriter: the reactor planner's refusal, a version the build does
+    /// not select (a single pom, and a reactor), and a selection that
+    /// cannot be read. (The mirror gate's is the test above.)
+    #[test]
+    fn maven_dep_that_is_refused_or_skipped_touches_no_file() {
+        let mut dep = granted_maven_override();
+        dep.integrity.sha256 = Some("sha256-q83vEjRWeJA=".into());
+        let stale = format!(
+            "{}  org/slf4j/slf4j-api/{MAVEN_SUFFIXED}/slf4j-api-{MAVEN_SUFFIXED}.jar\n",
+            "c".repeat(64)
+        );
+        let project = |poms: &[(&str, &str)]| -> BTreeMap<String, String> {
+            poms.iter()
+                .map(|(rel, text)| (rel.to_string(), text.to_string()))
+                .chain([(MVN_CHECKSUMS.to_string(), stale.clone())])
+                .collect()
+        };
+        let run = |files: &BTreeMap<String, String>, picks: &[(&str, Result<&str, &str>)]| {
+            let modules: Vec<&str> = files
+                .keys()
+                .map(String::as_str)
+                .filter(|rel| rel.ends_with("pom.xml"))
+                .collect();
+            let picks: Vec<_> = picks
+                .iter()
+                .map(|(pom, pick)| (*pom, "org.slf4j", "slf4j-api", *pick))
+                .collect();
+            let selection = MavenSelection::answering(&modules, &picks);
+            rewrite_registry_redirect_with_host(
+                files,
+                std::slice::from_ref(&dep),
+                &BTreeMap::new(),
+                None,
+                false,
+                &std::collections::BTreeSet::new(),
+                &yarnrc::OuterYarnMirror::default(),
+                &CratesIoSource::Registry,
+                Some(&selection),
+            )
+        };
+        let untouched = |r: &RewriteResult, code: &str, what: &str| {
+            assert!(r.files.is_empty(), "{what}: {:?}", r.files.keys());
+            assert!(r.edits.is_empty(), "{what}: {:?}", r.edits);
+            assert_eq!(warning_codes(r), [code], "{what}");
+        };
+
+        // Control: where the pin lands the stale line goes with it.
+        let direct = pom_with_dep("\n      <version>1.7.36</version>", "");
+        let landed = run(
+            &project(&[("pom.xml", &direct)]),
+            &[("pom.xml", Ok("1.7.36"))],
+        );
+        assert!(landed.files["pom.xml"].contains(MAVEN_SUFFIXED));
+        assert!(
+            !landed.files[MVN_CHECKSUMS].contains(MAVEN_SUFFIXED),
+            "{}",
+            landed.files[MVN_CHECKSUMS]
+        );
+
+        // The reactor planner refuses the plan: a module pom is missing.
+        let headless = direct.replace(
+            "  <dependencies>",
+            "  <packaging>pom</packaging>\n  <modules>\n    <module>app</module>\n  </modules>\n  <dependencies>",
+        );
+        let files = project(&[("pom.xml", &headless)]);
+        assert!(maven_reactor_root(&files));
+        let r = run(&files, &[]);
+        untouched(&r, "redirect_maven_multimodule_unsupported", "refused");
+        assert!(
+            r.warnings[0].detail.contains(MAVEN_WROTE_NOTHING),
+            "{}",
+            r.warnings[0].detail
+        );
+
+        // The build selects another version: a single pom, and a reactor.
+        let r = run(
+            &project(&[("pom.xml", TRANSITIVE_ONLY_POM)]),
+            &[("pom.xml", Ok("2.0.9"))],
+        );
+        untouched(&r, "redirect_maven_version_not_selected", "single pom");
+        let reactor = project(&[
+            ("pom.xml", REACTOR_ROOT),
+            ("a/pom.xml", &reactor_module("a", "")),
+            ("b/pom.xml", &reactor_module("b", "")),
+        ]);
+        let r = run(
+            &reactor,
+            &[("a/pom.xml", Ok("2.0.9")), ("b/pom.xml", Ok("2.0.9"))],
+        );
+        untouched(&r, "redirect_maven_version_not_selected", "reactor");
+
+        // The pom names another version of the artifact: the dep is
+        // skipped where it stands, past every earlier way out.
+        let other = pom_with_dep("\n      <version>2.0.0</version>", "");
+        let r = run(
+            &project(&[("pom.xml", &other)]),
+            &[("pom.xml", Ok("2.0.0"))],
+        );
+        assert!(r.files.is_empty(), "mismatch: {:?}", r.files.keys());
+        assert!(r.edits.is_empty(), "mismatch: {:?}", r.edits);
+
+        // What the build selects cannot be read, and no pom names a
+        // version to replace.
+        let r = run(
+            &project(&[("pom.xml", TRANSITIVE_ONLY_POM)]),
+            &[(
+                "pom.xml",
+                Err("the pom of ch.qos.logback:logback-classic:1.4.14 is not in the local Maven repository"),
+            )],
+        );
+        untouched(&r, "redirect_maven_selection_undetermined", "undetermined");
+    }
+
+    /// `plain` as a hosted scan of an earlier release left it, and what
+    /// that scan writes today: the project wired for `dep`, with the
+    /// Trusted Checksums directory named through `${session.rootDirectory}`
+    /// where today's scan names it through the launcher's property.
+    fn wired_by_an_earlier_release(
+        plain: &BTreeMap<String, String>,
+        dep: &DepOverride,
+    ) -> (BTreeMap<String, String>, RewriteResult) {
+        use trusted_checksums::Basedir::{Launcher, Session};
+        let wired = rewrite_registry_redirect(plain, std::slice::from_ref(dep));
+        let mut earlier = plain.clone();
+        earlier.extend(wired.files.clone());
+        let value = trusted_checksums::basedir_value;
+        let old = earlier[MVN_CONFIG].replace(value(Launcher), value(Session));
+        assert_ne!(old, earlier[MVN_CONFIG]);
+        earlier.insert(MVN_CONFIG.to_string(), old);
+        (earlier, wired)
     }
 
     /// A dep the gate holds back does not keep another dep of the same
@@ -12214,6 +12482,59 @@ mod tests {
         assert!(r.warnings[0].detail.starts_with("org.slf4j:slf4j-api: "));
         assert!(r.maven_reactor_uuids.contains(MAVEN_UUID));
         assert!(!r.maven_reactor_uuids.contains(second_uuid));
+    }
+
+    /// The gate holds a dep back, never the respelling of a
+    /// `.mvn/maven.config` an earlier release wrote: that line stops Maven
+    /// 3.9.2 to 3.9.8 from starting with `-f` from outside the project
+    /// whether or not a mirror takes the Socket repository. So a project
+    /// an earlier release wired, scanned behind a mirror that now captures
+    /// its repository, gets the mirror's warning for the dep and the heal
+    /// for the config, and nothing else is written.
+    #[test]
+    fn maven_mirror_gate_does_not_hold_back_the_heal_of_an_earlier_config() {
+        let dep = granted_maven_override();
+        let plain = BTreeMap::from([(
+            "pom.xml".to_string(),
+            pom_with_dep("\n      <version>1.7.36</version>", ""),
+        )]);
+        let (mut earlier, wired) = wired_by_an_earlier_release(&plain, &dep);
+        earlier.extend([maven_mirrors(&[("corp", "*")])]);
+
+        let r = rewrite_registry_redirect(&earlier, std::slice::from_ref(&dep));
+        assert_eq!(r.files.keys().collect::<Vec<_>>(), [MVN_CONFIG]);
+        assert_eq!(r.files[MVN_CONFIG], wired.files[MVN_CONFIG]);
+        assert_eq!(
+            r.edits
+                .iter()
+                .map(|e| (e.path.as_str(), e.key.as_deref()))
+                .collect::<Vec<_>>(),
+            [(MVN_CONFIG, Some(MVN_CONFIG_HEAL_KEY))]
+        );
+        assert_eq!(
+            warning_codes(&r),
+            [
+                "redirect_maven_mirror_captures_repository",
+                "redirect_maven_trusted_checksums_maven3_only",
+            ]
+        );
+        // The mirror's line speaks of this run, which wrote nothing for
+        // the dep. The earlier run's wiring is still there: the line says
+        // that it was left, that a build behind the mirror fails on it,
+        // and how to take it out.
+        let detail = &r.warnings[0].detail;
+        for part in [
+            MAVEN_WROTE_NOTHING,
+            "The wiring an earlier run wrote for it is still in the poms and was left in place",
+            "a build behind this mirror fails to resolve the patched version",
+            "`socket-patch rollback pkg:maven/org.slf4j/slf4j-api@1.7.36`",
+        ] {
+            assert!(detail.contains(part), "{part}: {detail}");
+        }
+        // Gated, so decided and not confirmed: the wiring the earlier run
+        // left is not counted as this run's redirect.
+        assert!(r.maven_reactor_uuids.contains(MAVEN_UUID));
+        assert!(r.confirmed_maven_reactor_uuids.is_empty());
     }
 
     /// [`maven_override`] as the patch service grants it: the suffix is the
@@ -13681,11 +14002,8 @@ mod tests {
         assert_eq!(form(&run(&model_4_1)), Some(Session));
 
         // An earlier release's wiring: the same files, the session's form.
-        let mut earlier = plain.clone();
-        earlier.extend(wired.files.clone());
-        let old = earlier[MVN_CONFIG].replace(value(Launcher), value(Session));
-        assert_ne!(old, earlier[MVN_CONFIG]);
-        earlier.insert(MVN_CONFIG.to_string(), old);
+        let (earlier, rewired) = wired_by_an_earlier_release(&plain, &maven_override());
+        assert_eq!(rewired.files, wired.files);
         let healed = run(&earlier);
         assert_eq!(healed.files.keys().collect::<Vec<_>>(), [MVN_CONFIG]);
         assert_eq!(healed.files[MVN_CONFIG], wired.files[MVN_CONFIG]);
@@ -13856,6 +14174,13 @@ mod tests {
         assert_eq!(
             warning_codes(&r),
             [trade, "redirect_maven_multimodule_unsupported"]
+        );
+        // The refusal speaks of what this run did for the dep, not of
+        // `.mvn/`: the same run respelled a line there.
+        assert!(
+            r.warnings[1].detail.contains(MAVEN_WROTE_NOTHING),
+            "{}",
+            r.warnings[1].detail
         );
 
         // A root the sbt rewriter owns (no pom.xml beside the build).
@@ -32268,6 +32593,174 @@ packages:
             vec!["redirect_gem_unrecognized_declaration"],
             "{:?}",
             r.warnings
+        );
+    }
+
+    /// A Gemfile with more than one top-level `source` line makes bundler
+    /// 2.2 to 2.7 write ONE `GEM` section naming every one of them (the
+    /// locks below are what 2.5.22 and 2.6.9 write), and `bundle lock`
+    /// leaves that lock as it is. The gem is still refused whole, but the
+    /// warning names the Gemfile's sources as the cause and the remedy that
+    /// works: the extra source in a `source "<url>" do … end` block. It does
+    /// not blame an old bundler, does not send the user to a `bundle lock`
+    /// that changes nothing by itself, and offers agent mode only (vendored
+    /// mode refuses a gem in a `group` block or with a native extension,
+    /// which the planner cannot tell apart here). #2162.
+    #[test]
+    fn gem_lock_of_a_gemfile_with_several_top_level_sources_names_the_block_remedy() {
+        let specs = "  specs:\n    rack (2.2.8)\n    rack-test (2.1.0)\n      rack (>= 1.3)\n\n\
+                     PLATFORMS\n  ruby\n  x86_64-linux\n\n\
+                     DEPENDENCIES\n  rack (= 2.2.8)\n  rack-test (= 2.1.0)\n\n";
+        let remotes = "GEM\n  remote: https://rubygems.org/\n  remote: https://user:secret@gems.acme.example/private/\n";
+        let locks = [
+            format!("{remotes}{specs}BUNDLED WITH\n   2.5.22\n"),
+            format!(
+                "{remotes}{specs}CHECKSUMS\n  rack (2.2.8) sha256={}\n  rack-test (2.1.0) sha256={}\n\n\
+                 BUNDLED WITH\n   2.6.9\n",
+                "2".repeat(64),
+                "3".repeat(64)
+            ),
+        ];
+        let gemfiles = [
+            "source \"https://rubygems.org\"\nsource \"https://user:secret@gems.acme.example/private/\"\n\n\
+             gem \"rack\", \"2.2.8\"\n\ngroup :test do\n  gem \"rack-test\", \"2.1.0\"\nend\n",
+            // A url the Gemfile computes is a top-level source all the same.
+            "source \"https://rubygems.org\"\nsource \"https://#{ENV['GEM_USER']}:secret@gems.acme.example/private/\"\n\n\
+             gem \"rack\", \"2.2.8\"\n\ngroup :test do\n  gem \"rack-test\", \"2.1.0\"\nend\n",
+            // CRLF, and the second source in call parentheses.
+            "source 'https://rubygems.org'\r\nsource('https://user:secret@gems.acme.example/private/')\r\n\r\n\
+             gem \"rack\", \"2.2.8\"\r\n\r\ngroup :test do\r\n  gem \"rack-test\", \"2.1.0\"\r\nend\r\n",
+        ];
+        for lock in &locks {
+            for gemfile in gemfiles {
+                let lock = if gemfile.contains('\r') {
+                    lock.replace('\n', "\r\n")
+                } else {
+                    lock.clone()
+                };
+                for (gem, version) in [("rack", "2.2.8"), ("rack-test", "2.1.0")] {
+                    let (out, locked, r) = gem_redirect(gemfile, &lock, gem_override(gem, version));
+                    assert!(
+                        r.files.is_empty() && r.edits.is_empty(),
+                        "neither file may be touched: files={:?} edits={:?}",
+                        r.files.keys(),
+                        r.edits
+                    );
+                    assert_eq!((out.as_str(), &locked), (gemfile, &lock));
+                    assert_eq!(
+                        warning_codes(&r),
+                        vec!["redirect_gem_lock_unconvergeable"],
+                        "{:?}",
+                        r.warnings
+                    );
+                    let detail = &r.warnings[0].detail;
+                    assert!(
+                        detail.contains("Gemfile has 2 top-level `source` lines")
+                            && detail.contains(&format!("keep the source that serves {gem} as"))
+                            && detail.contains("`source \"<url>\" do … end` block")
+                            && detail.contains("then run `bundle lock`")
+                            && detail.contains(&format!("patch {gem} with `--mode agent`")),
+                        "the cause and the remedy that works: {detail}"
+                    );
+                    assert!(
+                        !detail.contains("bundler < 2.2")
+                            && !detail.contains("with your current bundler")
+                            && !detail.contains("--mode vendored"),
+                        "no old-bundler blame, no bare `bundle lock`, no vendored offer: {detail}"
+                    );
+                    assert!(
+                        !detail.contains("secret"),
+                        "a source's credentials stay out of the warning: {detail}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same lock under a Gemfile with ONE top-level source is a stale
+    /// lock, which `bundle lock` does rewrite (verified on bundler 2.5.22):
+    /// that remedy stays. A second `source` in a block, or as a `source:`
+    /// option, is no top-level source.
+    #[test]
+    fn gem_stale_multi_remote_lock_keeps_the_bundle_lock_remedy() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  remote: https://gems.acme.example/\n  specs:\n    \
+                    rack (2.2.8)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (= 2.2.8)\n\n\
+                    BUNDLED WITH\n   2.5.22\n";
+        for gemfile in [
+            "source \"https://rubygems.org\"\n\ngem \"rack\", \"2.2.8\"\n",
+            "source \"https://rubygems.org\"\nsource \"https://rubygems.org/\"\n\ngem \"rack\", \"2.2.8\"\n",
+            "source \"https://rubygems.org\"\n\ngem \"rack\", \"2.2.8\"\n\n\
+             source \"https://gems.acme.example/\" do\n  gem \"acme\"\nend\n",
+            "source \"https://rubygems.org\"\n\ngem \"rack\", \"2.2.8\"\n\
+             gem \"acme\", source: \"https://gems.acme.example/\"\n",
+            // Bundler runs one branch only.
+            "if ENV[\"MIRROR\"]\n  source \"https://gems.acme.example/\"\nelse\n  \
+             source \"https://rubygems.org\"\nend\n\ngem \"rack\", \"2.2.8\"\n",
+        ] {
+            let (_, _, r) = gem_redirect(gemfile, lock, gem_override("rack", "2.2.8"));
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_gem_lock_unconvergeable"],
+                "{:?}",
+                r.warnings
+            );
+            let detail = &r.warnings[0].detail;
+            assert!(
+                detail.contains("names 2 remotes")
+                    && detail.contains("run `bundle lock` with your current bundler")
+                    && !detail.contains("top-level"),
+                "{detail}\n{gemfile}"
+            );
+        }
+    }
+
+    /// Bundler 2.2.15 keeps the one section on `bundle lock` even once the
+    /// second source sits in a block (run against the real thing), so for
+    /// a lock an early 2.2 release wrote the remedy names a bundler that
+    /// splits it.
+    #[test]
+    fn gem_lock_of_an_early_bundler_2_2_names_a_bundler_that_splits_it() {
+        let gemfile = "source \"https://rubygems.org\"\nsource \"https://gems.acme.example/\"\n\n\
+                       gem \"rack\", \"2.2.8\"\n";
+        let lock = "GEM\n  remote: https://rubygems.org/\n  remote: https://gems.acme.example/\n  specs:\n    \
+                    rack (2.2.8)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (= 2.2.8)\n\n\
+                    BUNDLED WITH\n   2.2.15\n";
+        let (_, _, r) = gem_redirect(gemfile, lock, gem_override("rack", "2.2.8"));
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        let detail = &r.warnings[0].detail;
+        assert!(
+            detail.contains("Gemfile has 2 top-level `source` lines")
+                && detail.contains(
+                    "then run `bundle lock` with bundler 2.2.25 or later (bundler 2.2.15, \
+                     which wrote Gemfile.lock, keeps the one section)"
+                ),
+            "{detail}"
+        );
+    }
+
+    /// A lock refused for another reason keeps that reason, whatever the
+    /// Gemfile's sources: here the gem is listed in two `GEM` sections.
+    #[test]
+    fn gem_lock_refused_for_another_reason_is_not_blamed_on_the_sources() {
+        let gemfile = "source \"https://rubygems.org\"\nsource \"https://gems.acme.example/\"\n\n\
+                       gem \"rack\", \"2.2.8\"\n";
+        let lock = "GEM\n  remote: https://rubygems.org/\n  remote: https://gems.acme.example/\n  specs:\n    \
+                    rack (2.2.8)\n\nGEM\n  remote: https://other.example/\n  specs:\n    rack (2.2.8)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (= 2.2.8)\n\nBUNDLED WITH\n   2.5.22\n";
+        let (_, _, r) = gem_redirect(gemfile, lock, gem_override("rack", "2.2.8"));
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_gem_lock_unconvergeable"],
+            "{:?}",
+            r.warnings
+        );
+        let detail = &r.warnings[0].detail;
+        assert!(
+            detail.contains("more than one GEM section lists `rack (2.2.8)`")
+                && !detail.contains("top-level"),
+            "{detail}"
         );
     }
 

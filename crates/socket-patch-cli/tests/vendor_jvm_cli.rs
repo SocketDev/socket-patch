@@ -148,22 +148,37 @@ fn fixture(root: &Path, shape: Shape, packages: &[(&str, &str)]) {
     }
 }
 
-/// `socket-patch <args> --json --offline --cwd <root>/proj`; `(exit, envelope)`.
-fn socket(root: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value) {
+/// `socket-patch <args> --offline --cwd <root>/proj`, with `--json` or as a
+/// person runs it, and the download fixture it needs while it runs.
+fn command(
+    root: &Path,
+    args: &[&str],
+    json: bool,
+) -> (std::process::Command, Option<prebuilt_common::Server>) {
     let mut cmd = hermetic::binary_command();
     let proj = root.join("proj");
-    let _fixture = prebuilt_common::prepare_command(
+    let fixture = prebuilt_common::prepare_command(
         &mut cmd,
         &proj,
         args,
         &[("MAVEN_REPO_LOCAL", root.join("m2").to_str().unwrap())],
     );
-    let out = cmd
-        .args(["--json", "--cwd", proj.to_str().unwrap()])
+    cmd.args(json.then_some("--json"))
+        .args(["--cwd", proj.to_str().unwrap()])
         .env("MAVEN_REPO_LOCAL", root.join("m2"))
-        .env_remove("M2_HOME")
-        .output()
-        .expect("run socket-patch");
+        .env_remove("M2_HOME");
+    (cmd, fixture)
+}
+
+/// What [`command`] printed and how it ended.
+fn spawn(root: &Path, args: &[&str], json: bool) -> std::process::Output {
+    let (mut cmd, _fixture) = command(root, args, json);
+    cmd.output().expect("run socket-patch")
+}
+
+/// `socket-patch <args> --json --offline --cwd <root>/proj`; `(exit, envelope)`.
+fn socket(root: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value) {
+    let out = spawn(root, args, true);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let env = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!(
@@ -356,6 +371,74 @@ fn cold_cache_rerun_vex_repair_and_revert() {
         assert_eq!(std::fs::read(root.join(tree_jar)).unwrap(), expected);
         ok(root, &["vendor", "--revert"]);
         assert_eq!(snapshot(root), pristine);
+    }
+}
+
+/// A jar over the limits jars once shared with Python wheels (10,000
+/// entries, 64 MiB inflated) is vendored, held to upstream by an online
+/// re-run, attested by `vex`, passes `vendor --check`, and is rebuilt by
+/// `repair`. Each of those used to stop at the wheel reader's caps.
+#[test]
+fn a_jar_over_the_old_reader_limits_vendors_attests_and_repairs() {
+    let big = {
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zw.start_file(MEMBER, opts).unwrap();
+        zw.write_all(b"NOTICE foo\n").unwrap();
+        let mut body = vec![0x5au8; 6800];
+        for i in 0..10_001u64 {
+            body[..8].copy_from_slice(&i.to_le_bytes());
+            zw.start_file(format!("p/C{i}.class"), opts).unwrap();
+            zw.write_all(&body).unwrap();
+        }
+        zw.finish().unwrap().into_inner()
+    };
+    assert!(big.len() > 64 * 1024 * 1024);
+    for shape in [Shape::Reactor, Shape::Gradle] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(root, shape, &[("foo", FOO_UUID)]);
+        std::fs::write(root.join("m2/org/example/foo/1.0/foo-1.0.jar"), &big).unwrap();
+        let env = ok(root, &["vendor"]);
+        assert_eq!(env["events"][0]["action"], "applied", "{env}");
+        let tree_jar = root.join(if shape == Shape::Reactor {
+            "proj/.socket/vendor/maven2/org/example/foo/1.0-socket.1d3c1fd2/foo-1.0-socket.1d3c1fd2.jar"
+        } else {
+            "proj/.socket/vendor/gradle/org/example/foo/1.0/foo-1.0.jar"
+        });
+        let vendored = std::fs::read(&tree_jar).unwrap();
+        assert!(vendored.len() > 64 * 1024 * 1024);
+
+        let env = ok(root, &["vendor"]);
+        assert_eq!(
+            events(&env),
+            [(
+                purl("foo"),
+                "skipped".to_string(),
+                "already_vendored".to_string()
+            )],
+            "{env}"
+        );
+        ok(root, &["vendor", "--check"]);
+        let vex = root.join("vex.json");
+        ok(
+            root,
+            &[
+                "vex",
+                "-O",
+                vex.to_str().unwrap(),
+                "--product",
+                "pkg:generic/x@1",
+            ],
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&vex).unwrap()).unwrap();
+        assert_eq!(doc["statements"][0]["status"], "not_affected", "{doc}");
+
+        std::fs::remove_file(&tree_jar).unwrap();
+        let env = ok(root, &["repair"]);
+        assert_eq!(env["events"][0]["action"], "rebuilt", "{env}");
+        assert!(std::fs::read(&tree_jar).unwrap() == vendored);
     }
 }
 
@@ -1609,4 +1692,254 @@ fn gradle_vendor_395_repair_refuses_a_linked_gradle_tree() {
     assert_ne!(code, Some(0), "{env}");
     assert!(env.to_string().contains("vendor_path_unsafe"), "{env}");
     assert_eq!(listing(&outside.join("org/example/foo/1.0")), before);
+}
+
+/// A rules_jvm_external hub of a Bazel workspace builds the jar its own
+/// lock pins, not the vendored one. `vendor` beside such a hub warns once
+/// for each jar the hub builds, in the envelope or as a line a person
+/// reads, and its events and every file it writes are those of the same
+/// run without the workspace. A hub that does not build a vendored jar
+/// adds nothing.
+#[test]
+fn a_bazel_hub_that_builds_a_vendored_jar_adds_one_warning_and_nothing_else() {
+    let module = "bazel_dep(name = \"rules_jvm_external\", version = \"7.2\")\n\
+                  maven = use_extension(\"@rules_jvm_external//:extensions.bzl\", \"maven\")\n\
+                  maven.install(lock_file = \"//:maven_install.json\")\n";
+    let lock = |artifact: &str| {
+        format!(
+            "{{\"artifacts\": {{\"org.example:{artifact}\": {{\"shasums\": {{\"jar\": \"00\"}}, \
+             \"version\": \"1.0\"}}}}, \"repositories\": {{\"https://repo1.maven.org/maven2/\": \
+             [\"org.example:{artifact}\"]}}, \"version\": \"3\"}}\n"
+        )
+    };
+    let checkout = |lock: Option<String>| {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(
+            root,
+            Shape::Reactor,
+            &[("foo", FOO_UUID), ("bar", BAR_UUID)],
+        );
+        if let Some(lock) = lock {
+            write(root, "proj/MODULE.bazel", module.as_bytes());
+            write(root, "proj/maven_install.json", lock.as_bytes());
+        }
+        tmp
+    };
+    let vendor = |lock: Option<String>| {
+        let tmp = checkout(lock);
+        let root = tmp.path();
+        let env = ok(root, &["vendor"]);
+        let mut tree = snapshot(root);
+        tree.retain(|rel, _| rel != "MODULE.bazel" && rel != "maven_install.json");
+        let warnings = env["warnings"].as_array().cloned().unwrap_or_default();
+        (events(&env), tree, warnings)
+    };
+    let without = vendor(None);
+    let applied = without.0.iter().filter(|event| event.1 == "applied");
+    assert_eq!(applied.count(), 2, "{:?}", without.0);
+    assert_eq!(vendor(Some(lock("other"))), without);
+    let (events, tree, warnings) = vendor(Some(lock("foo")));
+    assert_eq!((&events, &tree), (&without.0, &without.1));
+    let detail = format!(
+        "{0}: Bazel takes this artifact from maven_install.json (hub \"maven\", `maven.install` \
+         at MODULE.bazel:3), which pins the upstream jar, and this command does not patch a \
+         rules_jvm_external hub: the Bazel build stays unpatched whatever it did for another \
+         build of the checkout. `socket-patch get {0} --mode hosted` at the Bazel root patches \
+         a pinned hub",
+        purl("foo")
+    );
+    let warning = serde_json::json!({ "code": "maven_bazel_hub_unpatched", "detail": detail });
+    assert_eq!(warnings, [without.2, vec![warning]].concat());
+    // A person reads it once, on stderr, and not under `--silent`; a
+    // program reads it in the envelope alone.
+    let line = format!("Warning: {detail}");
+    for (args, json, times) in [
+        (&["vendor"][..], false, 1),
+        (&["vendor", "--silent"], false, 0),
+        (&["vendor"], true, 0),
+    ] {
+        let tmp = checkout(Some(lock("foo")));
+        let out = spawn(tmp.path(), args, json);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stderr.matches(&line).count(), times, "{args:?}: {stderr}");
+    }
+    // And reads it above the summary of the run and its next steps: both
+    // streams in one file, in the order they were written.
+    let tmp = checkout(Some(lock("foo")));
+    let (mut cmd, _fixture) = command(tmp.path(), &["vendor"], false);
+    let log = std::fs::File::create(tmp.path().join("log")).unwrap();
+    let status = cmd
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .status()
+        .unwrap();
+    let said = std::fs::read_to_string(tmp.path().join("log")).unwrap();
+    assert!(status.success(), "{said}");
+    let at = [line.as_str(), "Vendored 2 packages.", "Next steps:"].map(|text| said.find(text));
+    assert!(at[0].is_some() && at[0] < at[1] && at[1] < at[2], "{said}");
+    // A run whose `--ecosystems` leaves Maven out vendors no Maven patch
+    // and says nothing of the hub, as without the workspace: here the one
+    // npm patch of the manifest, whose package is not installed.
+    let others = |lock: Option<String>| {
+        let tmp = checkout(lock);
+        let manifest = tmp.path().join("proj/.socket/manifest.json");
+        let mut patches: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        patches["patches"]["pkg:npm/left-pad@1.3.0"] = patches["patches"][purl("foo")].clone();
+        std::fs::write(&manifest, patches.to_string()).unwrap();
+        // No server: the run downloads nothing.
+        let npm = ["vendor", "--ecosystems", "npm", "--offline"];
+        let nowhere = ["--patch-server-url", "http://127.0.0.1:9"];
+        let (_, env) = socket(tmp.path(), &[npm.as_slice(), &nowhere].concat());
+        let about = env["events"].as_array().unwrap().iter();
+        let about: Vec<_> = about.map(|event| event["purl"].clone()).collect();
+        assert_eq!(about, ["pkg:npm/left-pad@1.3.0"], "{env}");
+        env["warnings"].clone()
+    };
+    assert_eq!(others(Some(lock("foo"))), others(None));
+}
+
+/// Vendored mode patches no rules_jvm_external hub, and takes none over.
+/// The entry that hosted mode keeps for a jar in the block of
+/// `MODULE.bazel` is a hosted pin of that jar, and `vendor` and `vendor
+/// --revert` leave it as it is: the Bazel build keeps the patched jar.
+/// Everything else is the run without the workspace, and nothing is said
+/// of a hub that the block patches. That holds for an entry alone, and
+/// for one whose patch a hosted run also pinned in the poms of the
+/// reactor: `vendor` takes the poms' part of that pin over, as it does
+/// without the workspace.
+#[test]
+fn vendor_leaves_the_hosted_entry_of_a_bazel_hub_in_place() {
+    let module = format!(
+        r#"bazel_dep(name = "rules_jvm_external", version = "7.2")
+maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+maven.install(lock_file = "//:maven_install.json")
+
+# >>> socket-patch: Maven patches for Bazel (managed block: socket-patch writes and removes it) >>>
+socket_patch_http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+socket_patch_maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+
+# pkg:maven/org.example/foo@1.0, Socket patch {FOO_UUID}
+socket_patch_http_file(
+    name = "socket_patch_org_example_foo_1_0",
+    downloaded_file_path = "v1/org/example/foo/1.0/foo-1.0.jar",
+    sha256 = "{sum}",
+    urls = ["https://patch.socket.dev/patch-registry/maven/token/{FOO_UUID}/maven2/org/example/foo/1.0-socket.1d3c1fd2/foo-1.0-socket.1d3c1fd2.jar"],
+)
+
+# If Bazel stops at the next line ("does not generate repository"), the hub's lock no longer pins
+# org.example:foo at 1.0: run `socket-patch rollback pkg:maven/org.example/foo@1.0`.
+# Do not change it to inject_repo(): the build would pass without the patch.
+override_repo(
+    socket_patch_maven,
+    org_example_foo_1_0 = "socket_patch_org_example_foo_1_0",
+)
+# <<< socket-patch <<<
+"#,
+        sum = "a".repeat(64)
+    );
+    let lock = "{\"artifacts\": {\"org.example:foo\": {\"shasums\": {\"jar\": \"00\"}, \
+                \"version\": \"1.0\"}}, \"repositories\": {\"https://repo1.maven.org/maven2/\": \
+                [\"org.example:foo\"]}, \"version\": \"3\"}\n";
+    // The pin `list` reads from the block, when there is one.
+    let hosted = |root: &Path| {
+        let (code, list) = socket(root, &["list"]);
+        assert_eq!(code, Some(0), "{list}");
+        let events = list["events"].as_array().unwrap().iter();
+        let pin = |event: &&serde_json::Value| {
+            event["purl"] == purl("foo") && event["details"]["mode"] == "hosted"
+        };
+        events
+            .filter(pin)
+            .map(|event| event["details"]["lockfiles"].clone())
+            .collect::<Vec<_>>()
+    };
+    // The pin of a hosted run in the poms of the reactor: the version in
+    // the module, the repository in the root.
+    let repository = format!(
+        "  <repositories>\n    <repository>\n      <id>socket-patch-{FOO_UUID}</id>\n      \
+         <url>https://patch.socket.dev/patch-registry/maven/token/{FOO_UUID}/maven2</url>\n      \
+         <releases>\n        <enabled>true</enabled>\n        \
+         <checksumPolicy>fail</checksumPolicy>\n      </releases>\n      <snapshots>\n        \
+         <enabled>false</enabled>\n      </snapshots>\n    </repository>\n  \
+         </repositories>\n</project>"
+    );
+    let pin_poms = |root: &Path| {
+        for (pom, from, to) in [
+            (
+                "proj/a/pom.xml",
+                "<version>1.0<",
+                "<version>1.0-socket.1d3c1fd2<",
+            ),
+            ("proj/pom.xml", "</project>", repository.as_str()),
+        ] {
+            let text = std::fs::read_to_string(root.join(pom)).unwrap();
+            assert_eq!(text.matches(from).count(), 1, "{pom}");
+            write(root, pom, text.replace(from, to).as_bytes());
+        }
+    };
+    // The API of the patch record, which the eject of a hosted pin asks
+    // for. Without a pin in the poms no record is asked for: an eject
+    // would ask the port of `nowhere` for one.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let api = runtime.block_on(wiremock::MockServer::start());
+    let serve_record = |root: &Path| {
+        let manifest = std::fs::read(root.join("proj/.socket/manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        let mut view = manifest["patches"][purl("foo")].clone();
+        view["purl"] = purl("foo").into();
+        view["publishedAt"] = view["exportedAt"].clone();
+        let record = wiremock::ResponseTemplate::new(200).set_body_json(view);
+        let asked = wiremock::Mock::given(wiremock::matchers::method("GET")).respond_with(record);
+        runtime.block_on(asked.mount(&api));
+        api.uri()
+    };
+    let nowhere = "http://127.0.0.1:9".to_string();
+    let run = |bazel: bool, in_poms: bool| {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+        let mut pinned_in = Vec::new();
+        if bazel {
+            write(root, "proj/MODULE.bazel", module.as_bytes());
+            write(root, "proj/maven_install.json", lock.as_bytes());
+            pinned_in.push("MODULE.bazel");
+        }
+        let records = if in_poms {
+            pin_poms(root);
+            pinned_in.extend(["a/pom.xml", "pom.xml"]);
+            serve_record(root)
+        } else {
+            nowhere.clone()
+        };
+        let pins = usize::from(bazel || in_poms);
+        assert_eq!(hosted(root), [serde_json::json!(pinned_in)][..pins]);
+        let mut steps = Vec::new();
+        for args in [&["vendor"][..], &["vendor", "--revert"]] {
+            let env = ok(root, &[args, &["--proxy-url", &records]].concat());
+            let mut tree = snapshot(root);
+            let module = tree.remove("MODULE.bazel").flatten();
+            tree.remove("maven_install.json");
+            steps.push((events(&env), env["warnings"].clone(), tree, module));
+            // The entry is the hosted pin that is left, and all of it.
+            let entry = [serde_json::json!(["MODULE.bazel"])];
+            assert_eq!(hosted(root), entry[..usize::from(bazel)], "{args:?}");
+        }
+        steps
+    };
+    for in_poms in [false, true] {
+        let (without, beside) = (run(false, in_poms), run(true, in_poms));
+        let vendored = (purl("foo"), "applied".to_string(), String::new());
+        assert!(without[0].0.contains(&vendored), "{:?}", without[0].0);
+        for (beside, without) in beside.iter().zip(&without) {
+            assert_eq!(
+                (&beside.0, &beside.1, &beside.2),
+                (&without.0, &without.1, &without.2),
+                "{in_poms}"
+            );
+            assert_eq!(beside.3.as_deref(), Some(module.as_bytes()), "{in_poms}");
+        }
+    }
 }

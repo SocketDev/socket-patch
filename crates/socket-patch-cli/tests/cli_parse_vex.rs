@@ -47,6 +47,7 @@ struct Snap {
     output: Option<PathBuf>,
     product: Option<String>,
     no_verify: bool,
+    no_bazel: bool,
     doc_id: Option<String>,
     compact: bool,
 }
@@ -57,6 +58,7 @@ fn snapshot(a: &VexArgs) -> Snap {
         output: a.output.clone(),
         product: a.product.clone(),
         no_verify: a.no_verify,
+        no_bazel: a.no_bazel,
         doc_id: a.doc_id.clone(),
         compact: a.compact,
     }
@@ -69,6 +71,7 @@ fn expected_defaults() -> Snap {
         output: None,
         product: None,
         no_verify: false,
+        no_bazel: false,
         doc_id: None,
         compact: false,
     }
@@ -142,6 +145,58 @@ fn empty_vex_compact_env_parses_as_false_on_scan() {
     match cli.command {
         Commands::Scan(a) => assert!(!a.vex.vex_compact, "empty SOCKET_VEX_COMPACT must be false"),
         _ => panic!("expected Scan"),
+    }
+}
+
+/// `vex --no-bazel` is the flag or `SOCKET_VEX_NO_BAZEL`, read as
+/// `SOCKET_VEX_NO_VERIFY` is: `1` and `true` set it, an exported-but-empty
+/// value and no value leave it off, and it moves no other field.
+#[test]
+#[serial_test::serial]
+fn no_bazel_is_the_flag_or_a_truthy_variable_on_vex() {
+    let unset = parse_vex(try_parse(&["socket-patch", "vex"]));
+    assert_eq!(snapshot(&unset), expected_defaults());
+    let mut set = expected_defaults();
+    set.no_bazel = true;
+    let flag = parse_vex(try_parse(&["socket-patch", "vex", "--no-bazel"]));
+    assert_eq!(snapshot(&flag), set);
+    for (value, want) in [("1", &set), ("true", &set), ("", &expected_defaults())] {
+        let a = parse_vex(try_parse_with_env(
+            &[("SOCKET_VEX_NO_BAZEL", value)],
+            &["socket-patch", "vex"],
+        ));
+        assert_eq!(snapshot(&a), *want, "SOCKET_VEX_NO_BAZEL={value:?}");
+    }
+}
+
+/// The same option on each command that takes `--vex`, as `--vex-no-bazel`:
+/// the flag, and the one variable, which must not abort the parse of a
+/// host command. Each field of the embedded options is compared, so a value
+/// that lands in a second one fails too.
+#[test]
+#[serial_test::serial]
+fn no_bazel_is_the_flag_or_a_truthy_variable_on_each_host() {
+    let embedded = |cli: Result<Cli, clap::Error>, run: &str| {
+        let vex = match cli.unwrap_or_else(|e| panic!("{run}: {e}")).command {
+            Commands::Apply(a) => a.vex,
+            Commands::Scan(a) => a.vex,
+            Commands::Vendor(a) => a.vex,
+            _ => panic!("{run}: not a host of --vex"),
+        };
+        let other = (vex.vex, vex.vex_product, vex.vex_doc_id);
+        assert_eq!(other, (None, None, None), "{run}");
+        [vex.vex_no_bazel, vex.vex_no_verify, vex.vex_compact]
+    };
+    for host in ["apply", "scan", "vendor"] {
+        let bare = ["socket-patch", host];
+        assert_eq!(embedded(try_parse(&bare), host), [false; 3]);
+        let flag = ["socket-patch", host, "--vex-no-bazel"];
+        assert_eq!(embedded(try_parse(&flag), host), [true, false, false]);
+        for (value, set) in [("1", true), ("true", true), ("", false)] {
+            let run = format!("SOCKET_VEX_NO_BAZEL={value:?} {host}");
+            let cli = try_parse_with_env(&[("SOCKET_VEX_NO_BAZEL", value)], &bare);
+            assert_eq!(embedded(cli, &run), [set, false, false], "{run}");
+        }
     }
 }
 

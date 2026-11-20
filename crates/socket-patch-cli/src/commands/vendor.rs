@@ -132,6 +132,12 @@ use socket_patch_core::vendor::refusals::refusal_is_benign;
 /// `vendor_prebuilt_required` failure it always was, a failed `Done` minus
 /// the unserved marker (its error already says it).
 ///
+/// One unserved refusal is a skip with nothing to keep as well:
+/// [`vendor::VENDOR_PREBUILT_PLATFORM_PENDING`], a gem locked as platform
+/// gems whose prebuild for one of the locked platforms the service does
+/// not list. A prebuild is listed only once built, so the run cannot tell
+/// "not yet" from "never", and the project is exactly as it was.
+///
 /// [`Discovery::vendor_entry_live`]: socket_patch_core::vex::discover::Discovery::vendor_entry_live
 async fn keep_older_vendored_patch(
     outcome: Option<VendorOutcome>,
@@ -191,6 +197,9 @@ async fn keep_older_vendored_patch(
             entry,
             warnings,
         },
+        None if code == vendor::VENDOR_PREBUILT_PLATFORM_PENDING => {
+            VendorOutcome::Refused { code, detail }
+        }
         None => VendorOutcome::Refused {
             code: vendor::VENDOR_PREBUILT_REQUIRED,
             detail,
@@ -302,6 +311,14 @@ async fn takeover_dry_refusal(
     .await;
     drop(probe);
     match outcome {
+        // A skip, not a failure, for a takeover in the vendor loop: the
+        // wet run rolls the restore back, so the hosted pin stays (see
+        // `keep_older_vendored_patch`). The eject plan refuses it.
+        Some(VendorOutcome::Refused { code, detail })
+            if code == vendor::VENDOR_PREBUILT_PLATFORM_PENDING =>
+        {
+            Some((code, detail))
+        }
         // A takeover has no older vendored patch to keep in force.
         Some(VendorOutcome::Refused { code, detail }) if vendor::is_unserved(code) => {
             Some((vendor::VENDOR_PREBUILT_REQUIRED, detail))
@@ -1120,6 +1137,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                             .display()
                             .to_string(),
                         statements: summary.statements,
+                        affected: summary.affected,
                         format: "openvex-0.2.0".to_string(),
                         warnings: summary.warnings.clone(),
                     });
@@ -1140,6 +1158,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                     "{}",
                     crate::commands::vex::format_vex_written(
                         summary.statements,
+                        summary.affected,
                         args.vex
                             .vex
                             .as_ref()
@@ -1257,6 +1276,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                         env.vex = Some(VexSummary {
                             path: vex_path.display().to_string(),
                             statements: summary.statements,
+                            affected: summary.affected,
                             format: "openvex-0.2.0".to_string(),
                             // note_warning suppressed these on stderr under
                             // --json; the envelope copy is their only
@@ -1282,6 +1302,8 @@ pub async fn run(args: VendorArgs) -> i32 {
     }
 
     note_classic_migration_risk(&mut env, &args.common.cwd, &args.common);
+    env.warnings
+        .extend(crate::commands::sync_bazelignore(&args.common, true).await);
 
     // Everything below is output and telemetry, so release the lock before
     // the telemetry round-trip.
@@ -1691,9 +1713,26 @@ pub(crate) async fn gem_takeover_refusals_for<'a>(
     refusals
 }
 
-/// The hosted pins whose ecosystem `--ecosystems` selects.
+/// The hosted pins a vendored run takes over, of `pins`. Vendored mode
+/// patches no rules_jvm_external hub of a Bazel workspace, so the entry
+/// that hosted mode keeps for a pin in the block of the root
+/// `MODULE.bazel` is none of its wiring: the entry stays as it is, and the
+/// Bazel build keeps the patched jar. A pin that only such an entry wires
+/// is no takeover at all. `rollback` and `remove` take the entry out.
+fn takeover_pins(pins: Vec<HostedPin>) -> Vec<HostedPin> {
+    let beside_the_hub = |mut pin: HostedPin| {
+        pin.files
+            .retain(|file| file != socket_patch_core::bazel::maven::FILE);
+        (!pin.files.is_empty()).then_some(pin)
+    };
+    pins.into_iter().filter_map(beside_the_hub).collect()
+}
+
+/// The hosted pins of an eject: those a vendored run takes over
+/// ([`takeover_pins`]) whose ecosystem `--ecosystems` selects.
 fn hosted_pins_in_scope(common: &GlobalArgs, pins: Vec<HostedPin>) -> Vec<HostedPin> {
-    pins.into_iter()
+    takeover_pins(pins)
+        .into_iter()
         .filter(|pin| {
             socket_patch_core::utils::purl::purl_parts(&pin.purl)
                 .is_some_and(|(eco, _, _)| ecosystem_in_scope(common, &eco))
@@ -2097,6 +2136,13 @@ async fn run_eject(
         )
         .await
         {
+            // An eject has no skip: a pin it cannot vendor stays hosted
+            // and the eject is refused whole, so a prebuild that is not
+            // built yet is the plain miss here.
+            let code = match vendor::is_unserved(code) {
+                true => vendor::VENDOR_PREBUILT_REQUIRED,
+                false => code,
+            };
             refused.push((pin.purl.clone(), code, detail));
         }
         // sbt / scala-cli also require build evidence. The backend treats
@@ -2446,6 +2492,10 @@ async fn run_eject(
         print_vendor_closing(common, &env, 0, &capture.wired_flavors, true, None);
     }
     note_classic_migration_risk(&mut env, &common.cwd, common);
+    // After the rollback, so that the file names no copy the eject made
+    // and took away again.
+    env.warnings
+        .extend(crate::commands::sync_bazelignore(common, true).await);
     drop(guard);
 
     // Embedded VEX: same contract as the manifest-driven arm — only on
@@ -2468,6 +2518,7 @@ async fn run_eject(
                         env.vex = Some(VexSummary {
                             path: vex_path.display().to_string(),
                             statements: summary.statements,
+                            affected: summary.affected,
                             format: "openvex-0.2.0".to_string(),
                             warnings: summary.warnings,
                         });
@@ -3427,7 +3478,9 @@ pub(crate) async fn vendor_records_reusing(
     let hosted_pins = if eject.is_some() {
         Vec::new()
     } else {
-        HostedPin::all(&crate::commands::discover_wiring(common, &common.cwd).await)
+        takeover_pins(HostedPin::all(
+            &crate::commands::discover_wiring(common, &common.cwd).await,
+        ))
     };
     let hosted_pin_of = |purl: &str| {
         hosted_pins
@@ -3795,6 +3848,17 @@ pub(crate) async fn vendor_records_reusing(
                     )
                     .await
                     {
+                        if refusal_is_benign(code) {
+                            // The wet run's skip: nothing is taken over.
+                            if !common.silent && !common.json {
+                                eprintln!("Skipping {}: {detail}", normalize_purl(candidate));
+                            }
+                            env.record(
+                                PatchEvent::new(PatchAction::Skipped, candidate.clone())
+                                    .with_reason(code, detail),
+                            );
+                            continue;
+                        }
                         has_errors = true;
                         env.record(
                             PatchEvent::new(PatchAction::Failed, candidate.clone())
@@ -4400,6 +4464,12 @@ pub(crate) async fn vendor_records_reusing(
         }
     }
 
+    // A hub of a Bazel workspace builds the jar of its own lock, whatever
+    // this run vendored for the Maven or the Gradle build.
+    let vendored = vendorable.iter().map(String::as_str);
+    env.warnings
+        .extend(crate::commands::bazel_maven_notices(common, vendored, true).await);
+
     // A rolled-back eject's summary would describe a vendoring that was
     // undone: the eject prints it itself once it knows the outcome (#1005).
     match eject {
@@ -4479,16 +4549,10 @@ fn print_vendor_closing(
                 cmds.join(" and ")
             )
         } else if installs.is_empty() {
-            "Reinstall from the updated lockfile so the installed packages pick up the \
-             vendored artifacts"
-                .to_string()
+            "Reinstall from the updated lockfile".to_string()
         } else {
             let cmds: Vec<String> = installs.iter().map(|c| format!("`{c}`")).collect();
-            format!(
-                "Run {} to update the installed tree (vendoring rewires the lockfile \
-                 only; the current install keeps the unpatched bytes until reinstalled)",
-                cmds.join(" and ")
-            )
+            format!("Run {} to update the installed tree", cmds.join(" and "))
         };
         let mut extra = Vec::new();
         if wired_flavors.contains("bun") && common.cwd.join("bun.lockb").exists() {
@@ -4937,11 +5001,12 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             .filter(|e| e.action == PatchAction::Removed)
             .filter_map(|e| e.purl.as_deref().map(PurlKey::new))
             .collect();
-        let rehosted: Vec<HostedPin> =
-            HostedPin::all(&crate::commands::discover_wiring(common, &common.cwd).await)
-                .into_iter()
-                .filter(|pin| reverted.contains(&PurlKey::new(&pin.purl)))
-                .collect();
+        let rehosted: Vec<HostedPin> = takeover_pins(HostedPin::all(
+            &crate::commands::discover_wiring(common, &common.cwd).await,
+        ))
+        .into_iter()
+        .filter(|pin| reverted.contains(&PurlKey::new(&pin.purl)))
+        .collect();
         if !rehosted.is_empty() {
             let leg = crate::commands::hosted_unwind::run_hosted_leg(
                 common,
@@ -5357,6 +5422,11 @@ pub(crate) async fn run_vendor_gc(
     for (unit, e) in &sweep.failed {
         let warning = orphan_removal_failed(unit, e);
         out.write_failures.push((warning.code, warning.detail));
+    }
+    // A pass that took a vendored copy away may have taken the last Go one,
+    // after the scan's own step was done with the file: its pair goes too.
+    if !dry_run && (ledger_dirty || out.orphan_dirs > 0) {
+        crate::commands::sync_bazelignore(common, false).await;
     }
     out
 }
@@ -7413,6 +7483,33 @@ mod gc_tests {
 #[cfg(test)]
 mod scope_and_hint_tests {
     use super::*;
+
+    /// A vendored run takes over what wires a hosted pin in a build it
+    /// can vendor into, and never the entry of a Bazel hub: that file is
+    /// no file of the pin it restores, and a pin of that entry alone is
+    /// none of its pins.
+    #[test]
+    fn a_takeover_leaves_the_entry_of_a_bazel_hub() {
+        let pin = |purl: &str, files: &[&str]| HostedPin {
+            purl: purl.to_string(),
+            uuid: "1d3c1fd2-7b4e-4c1a-9f0e-2a3b4c5d6e7f".to_string(),
+            files: files.iter().map(|file| file.to_string()).collect(),
+        };
+        let maven = "pkg:maven/org.example/foo@1.0";
+        let pom = [".mvn/maven.config", "MODULE.bazel", "pom.xml"];
+        let pins = vec![
+            pin(maven, &pom),
+            pin("pkg:maven/org.example/bar@1.0", &["MODULE.bazel"]),
+            pin("pkg:npm/left-pad@1.3.0", &["package-lock.json"]),
+        ];
+        let taken = vec![
+            pin(maven, &[".mvn/maven.config", "pom.xml"]),
+            pins[2].clone(),
+        ];
+        assert_eq!(takeover_pins(pins.clone()), taken);
+        let common = GlobalArgs::default();
+        assert_eq!(hosted_pins_in_scope(&common, pins), taken);
+    }
 
     /// [`flavor_install_command`] drives the human reinstall hints: every
     /// npm-family flavor must name its own package manager's install, and

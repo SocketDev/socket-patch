@@ -1,10 +1,10 @@
 //! `scan --silent` contract tests.
 //!
 //! CLI_CONTRACT.md defines `--silent` as "Errors only": the "No packages
-//! found" hint, the "Found N packages" / "Found N patches" stderr chatter,
-//! the results table, the summary, the "Patches to apply" listing, the
-//! post-apply GC line, and the nested apply step's progress must all be
-//! muted under `--silent` (not just gated on `!json`).
+//! found" hint, the "Found N packages" stderr line, the result line, the
+//! per-package rows, the closing totals, the post-apply GC line, and the
+//! nested apply step's progress must all be muted under `--silent` (not
+//! just gated on `!json`).
 //!
 //! The apply-flow test runs against a wiremock API (same fixture shape
 //! as `scan_sync_e2e.rs`) so the full human-mode scan→select→download→
@@ -188,10 +188,10 @@ fn scan_silent_no_packages_produces_no_output() {
 }
 
 /// The full human-mode apply flow under `--silent --yes` must stay
-/// quiet end to end: no "Found N packages" / "Found N patches" stderr
-/// chatter, no results table, no "Patches to apply" listing, and no
-/// download/apply progress from the nested `download_and_apply_patches`
-/// call (which `scan` configured with a hardcoded `silent: false`).
+/// quiet end to end: no "Found N packages" stderr line, no result line, no
+/// rows, no closing totals, and no download/apply progress from the nested
+/// `download_and_apply_patches` call (which `scan` configured with a
+/// hardcoded `silent: false`).
 /// The mutation itself must still happen.
 #[tokio::test]
 async fn scan_silent_apply_flow_produces_no_output_but_still_applies() {
@@ -275,12 +275,15 @@ async fn scan_silent_apply_flow_produces_no_output_but_still_applies() {
         "control run must succeed; stderr={loud_stderr:?}"
     );
     assert!(
-        loud_stdout.contains("PACKAGE"),
-        "non-silent scan must print the results table; got {loud_stdout:?}"
+        loud_stdout.starts_with("Applied 1 patch.\n  HIGH  silent-target@1.0.0\n"),
+        "non-silent scan must print its result line and the package's row; got {loud_stdout:?}"
     );
     assert!(
-        loud_stdout.contains("Patches to apply:"),
-        "non-silent scan must print the pre-apply listing; got {loud_stdout:?}"
+        loud_stdout.ends_with(
+            "\nPatched 1 package.\nSaved about 2 hours of engineering time (1 package upgrade \
+             at ~2 hours).\nNothing left to patch.\n"
+        ),
+        "non-silent scan must close with its totals; got {loud_stdout:?}"
     );
     assert!(
         loud_stderr.contains("Found 1 package ("),
