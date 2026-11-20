@@ -1,5 +1,5 @@
-//! Hosted and agent mode for a Composer package in a Bazel workspace that
-//! builds PHP with rules of its own.
+//! Hosted, agent and vendored mode for a Composer package in a Bazel
+//! workspace that builds PHP with rules of its own.
 //!
 //! No Bazel ruleset builds PHP or takes Composer packages, and the Bazel
 //! registry holds none. A PHP project under Bazel writes the few lines that
@@ -20,9 +20,12 @@
 //! fresh output base: hosted mode in the first two projects, where Bazel
 //! runs Composer on the lock that `socket-patch` rewrites, and agent mode
 //! in the third, where Bazel reads the files that `socket-patch` patches in
-//! place. Vendored mode is in no flow: it breaks the first two builds
-//! today. The harness builds `//:consumer`, so a test writes the root
-//! `BUILD.bazel` that points that label at the consumer of its project.
+//! place. Vendored mode has two flows of its own, which their tests
+//! describe: in the first project its command passes and the next build
+//! fails, and in the third the build is the patched one once the developer
+//! has installed from the lock. The harness builds `//:consumer`, so a test
+//! writes the root `BUILD.bazel` that points that label at the consumer of
+//! its project.
 //!
 //! - (a) `bazel build` and `bazel run //:consumer` print the unpatched
 //!   marker. The upstream archive came from the stand-in: Composer fetched
@@ -579,7 +582,9 @@ impl Machine {
     fn composer(&self, test: &str, files: &[(&str, &[u8])], args: &[&str]) -> (Tree, String) {
         let project = tempfile::tempdir_in(self.root()).expect("a project directory");
         for (rel, bytes) in files {
-            std::fs::write(project.path().join(rel), bytes).expect("write a project file");
+            let path = project.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("a file path")).expect("create a parent");
+            std::fs::write(path, bytes).expect("write a project file");
         }
         let mut cmd = hermetic::tool_command("composer");
         hermetic::scrub_socket_vars(&mut cmd);
@@ -1172,6 +1177,197 @@ fn agent_committed_vendor() {
         flow.tools,
         patch.package.marker,
         upstream.package.marker,
+        started.elapsed()
+    );
+}
+
+/// Where vendored mode keeps the copy of the package for `patch`, as the
+/// lock names it: a path from the directory Composer runs in.
+fn copy_of(patch: &Patched) -> String {
+    format!(".socket/vendor/composer/{}/{NAME}@{VERSION}", patch.uuid)
+}
+
+/// Step (b) of a vendored flow: `scan --mode vendored --yes` in `project`
+/// vendors `patch`. It keeps the patched package under the project's
+/// `.socket/vendor`, with its ledger, and rewrites the lock, and no other
+/// file of the checkout differs from `before`. The entry of the package
+/// has that copy as its `dist`, by the relative path of [`copy_of`] and
+/// under the id of the patch, to be copied and never linked, and no
+/// `source`; the rest of the lock says what it said. Gives the files of
+/// the checkout as the command left them.
+fn vendors(flow: &Flow, project: &str, patch: &Patched, before: &Tree) -> Tree {
+    let (cell, standin) = (&flow.cell, &flow.standin);
+    let args = ["scan", "--mode", "vendored", "--yes"];
+    let scan = socket_patch(cell, standin, project, &args);
+    let (test, said) = (&cell.test, &scan.dump);
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
+    let event = event_for(&scan.envelope, PURL);
+    assert_eq!(event["uuid"], patch.uuid.as_str(), "{test}: {said}");
+    let events = ["downloaded", "applied", "skipped"].map(|action| {
+        let code = if action == "skipped" {
+            "vendor_prebuilt_downloaded"
+        } else {
+            ""
+        };
+        (PURL.to_string(), action.to_string(), code.to_string())
+    });
+    assert_eq!(event_triples(&scan.envelope), events, "{test}: {said}");
+    let vendored = cell.tree();
+    let lock = lock_of(project);
+    let kept = format!("{project}/.socket/vendor");
+    let copy = format!("{project}/{}", copy_of(patch));
+    let mut written = vec![
+        format!("{kept}/composer/{}/socket-patch.vendor.json", patch.uuid),
+        format!("{copy}/composer.json"),
+        format!("{copy}/{FILE}"),
+        format!("{kept}/state.json"),
+        lock.clone(),
+    ];
+    written.sort();
+    assert_eq!(changed(before, &vendored), written, "{test}: {said}");
+    let patched = patch.package.source.as_bytes();
+    assert_eq!(vendored[&format!("{copy}/{FILE}")], patched, "{test}");
+
+    let parsed = |tree: &Tree| -> Value { serde_json::from_slice(&tree[&lock]).expect("a lock") };
+    let mut expected = parsed(before);
+    let entry = expected["packages"][0].as_object_mut().expect("an entry");
+    entry.remove("source");
+    entry["dist"] = json!({ "type": "path", "url": copy_of(patch), "reference": patch.uuid });
+    entry.insert("transport-options".to_string(), json!({ "symlink": false }));
+    assert_eq!(parsed(&vendored), expected, "{test}: {lock}");
+    vendored
+}
+
+/// What vendored mode does today in the project whose packages a
+/// repository rule installs. The command exits 0 and reports the package
+/// vendored, and the next build fails: the lock names the copy by a path
+/// from the directory Composer runs in, and the rule runs Composer in a
+/// repository of Bazel's that holds the two Composer files and nothing
+/// else. `vex` attests the package all the same. `vendor --revert` puts
+/// every file back, and the build with them.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn vendored_repository_rule() {
+    let test = "composer::vendored_repository_rule";
+    let started = Instant::now();
+    let Some(flow) = open(test, API, &["--no-install"]) else {
+        return;
+    };
+    let (cell, standin, upstream) = (&flow.cell, &flow.standin, &flow.upstream);
+    let release = cell.release().to_string();
+    let patch = Patched::new();
+    grant(standin, upstream, &patch, &patch.package);
+
+    // (a) The unpatched build.
+    let before = cell.builds_unpatched(&upstream.package.marker);
+
+    // (b) The one command of vendored mode, in the project.
+    vendors(&flow, API, &patch, &before);
+
+    // (c) The same build, no step in between: Composer finds no copy where
+    // the rule runs it, and the fetch of the repository fails.
+    let build = cell.bazel("build", &[CONSUMER]);
+    assert!(!build.ok(), "{test}: the build passed:\n{}", build.dump());
+    let copy = copy_of(&patch);
+    let missing = format!("Source path \"{copy}\" is not found for package {NAME}");
+    assert!(
+        build.stderr().contains(&missing),
+        "{test}: the build did not fail with {missing:?}:\n{}",
+        build.dump()
+    );
+    attested(&flow, API);
+
+    // (d) The undo: every file is the one of before, and so is the build.
+    let undo = socket_patch(cell, standin, API, &["vendor", "--revert"]);
+    cell.undone(&undo, "removed", &before, &upstream.package.marker);
+
+    println!(
+        "{test}: Bazel {release} with {}: `scan --mode vendored --cwd {API}` exited 0 and \
+         reported the package vendored; the next build failed (Composer: {missing}) while `vex` \
+         attested the package; `vendor --revert` restored all {} files and the {:?} build; {:?}",
+        flow.tools,
+        before.len(),
+        upstream.package.marker,
+        started.elapsed()
+    );
+}
+
+/// Vendored mode in the project that commits its `vendor/` tree, where
+/// Composer runs in the project's directory, so the path the lock names
+/// leads to the copy. The build reads the committed tree and stays the
+/// unpatched one until the developer's `composer install` has copied the
+/// package from `.socket/vendor`; then it is the patched one.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn vendored_committed_vendor() {
+    let test = "composer::vendored_committed_vendor";
+    let started = Instant::now();
+    let Some(flow) = open(test, LEGACY, &[]) else {
+        return;
+    };
+    let (cell, standin, upstream) = (&flow.cell, &flow.standin, &flow.upstream);
+    let release = cell.release().to_string();
+    let patch = Patched::new();
+    grant(standin, upstream, &patch, &patch.package);
+
+    // (a) The unpatched build, from the committed tree.
+    let before = cell.builds_unpatched(&upstream.package.marker);
+
+    // (b) The one command of vendored mode, in the project.
+    let vendored = vendors(&flow, LEGACY, &patch, &before);
+
+    // (c) The same build passes and is the unpatched one: Bazel reads the
+    // tree, which no command has touched.
+    cell.builds_patched(&vendored, &upstream.package.marker);
+    // The developer installs from the lock, in the project's directory:
+    // Composer copies the package from `.socket/vendor`, with no request
+    // to a host, and the build is the patched one.
+    let prefix = format!("{LEGACY}/");
+    let project: Vec<(&str, &[u8])> = vendored
+        .iter()
+        .filter_map(|(path, bytes)| Some((path.strip_prefix(&prefix)?, bytes.as_slice())))
+        .collect();
+    let requests = standin.requests();
+    let (installed, said) = flow.machine.composer(test, &project, &["install"]);
+    assert_eq!(standin.requests(), requests, "{test}: {said}");
+    for (rel, bytes) in &installed {
+        cell.write(&format!("{LEGACY}/{rel}"), bytes);
+    }
+    let copied = format!("{LEGACY}/vendor/{NAME}/{FILE}");
+    let reinstalled = cell.tree();
+    assert_eq!(
+        reinstalled[&copied],
+        patch.package.source.as_bytes(),
+        "{test}: {said}"
+    );
+    cell.builds_patched(&reinstalled, &patch.package.marker);
+
+    // (d) The undo: the lock is the one of before and `.socket/vendor` is
+    // gone. The tree keeps what Composer installed, as in any project,
+    // until the developer installs again.
+    let undo = socket_patch(cell, standin, LEGACY, &["vendor", "--revert"]);
+    let said = &undo.dump;
+    assert_eq!(undo.code, 0, "{test}: {said}");
+    let reverted = cell.tree();
+    let lock = lock_of(LEGACY);
+    assert_eq!(reverted[&lock], before[&lock], "{test}: {said}");
+    let kept = format!("{LEGACY}/.socket/vendor/");
+    let left: Vec<&String> = reverted
+        .keys()
+        .filter(|path| path.starts_with(&kept))
+        .collect();
+    assert!(left.is_empty(), "{test}: {left:?}\n{said}");
+
+    println!(
+        "{test}: Bazel {release} with {}: `scan --mode vendored --cwd {LEGACY}` vendored the \
+         package into {} and the build stayed {:?}; after the developer's `composer install` it \
+         built {:?} from {copied}; `vendor --revert` restored {lock} and removed the copy; {:?}",
+        flow.tools,
+        copy_of(&patch),
+        upstream.package.marker,
+        patch.package.marker,
         started.elapsed()
     );
 }
