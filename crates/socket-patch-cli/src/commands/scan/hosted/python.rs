@@ -561,6 +561,7 @@ mod tests {
             &BTreeSet::new(),
             None,
             &[],
+            &socket_patch_core::hosted::engine::MirrorSources::default(),
             &ledger,
             &mut ViewFallback::offline(),
         )
