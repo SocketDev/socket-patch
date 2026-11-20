@@ -1466,8 +1466,7 @@ pub async fn read_candidate_files_in(
         let member = |rel: &&String| crate::patch::redirect::is_cargo_member_manifest_key(rel);
         let mut files = vec!["Cargo.lock".to_string(), "Cargo.toml".to_string()];
         files.extend(out.files.keys().filter(member).cloned());
-        let legacy = out.files.contains_key(".cargo/config");
-        let config = [".cargo/config.toml", ".cargo/config"][usize::from(legacy)];
+        let config = crate::patch::redirect::cargo_config_key(&out.files);
         let root = root.to_path_buf();
         let read = crate::utils::fs::run_blocking(move || unread(&root, &files, config));
         out.files

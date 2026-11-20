@@ -29,17 +29,22 @@
 //! - Such a hub is in the way unless its `cargo_config` is one string, the
 //!   label of the config the rewriter writes. A config that cannot be read
 //!   is not taken for the right one.
+//! - A hub that names that config is in the way while the file is there
+//!   and holds nothing: `rollback` deletes a config it leaves empty, and
+//!   the hub then names a missing file, on which it fails. A comment line
+//!   keeps the file. A file that is not there yet is created by the pin.
 //! - A call counts whether or not it is a statement of its own
 //!   ([`Call::whole`]): one that may run is one that may fail.
 //! - When the workspace uses a name bound to the extension in a way that
 //!   may hide a call ([`super::workspace::Tags::doubts`]), a hub may read
 //!   the project's files, and that is in the way too. The way on is then
 //!   that line: there may be no hub to give an attribute.
-//! - The calls of a `WORKSPACE` file count when the module files make no
-//!   such tag and the checkout does not name a Bazel from 9.0.0 on, which
-//!   never reads that file. Bazel 7 reads it, and Bazel 8 when it is told
-//!   to. Beside module files that make one, the file is taken for what a
-//!   move to Bzlmod left behind.
+//! - The calls of a `WORKSPACE` file count when no tag of the module files
+//!   concerns the project and the checkout does not name a Bazel from
+//!   9.0.0 on, which never reads that file. Bazel 7 reads it beside the
+//!   module files, and Bazel 8 when it is told to. Beside a tag that
+//!   concerns the project, the file is taken for what a move to Bzlmod
+//!   left behind.
 //!
 //! So a reading that is not certain withholds the pin wherever a hub, or a
 //! use of the extension through a name bound to it, is seen: the cost is a
@@ -52,8 +57,8 @@
 //! Not seen, and there a hub without the config fails as before:
 //!
 //! - a hub that another Bazel module declares, and a `crates_repository` in
-//!   a `.bzl` file that the `WORKSPACE` file loads or under another name
-//!   than its own;
+//!   a `.bzl` file that the `WORKSPACE` file loads or under a name that no
+//!   `load` of that file gives it;
 //! - a tag called on `use_extension(...)` itself, with no name bound to it,
 //!   a `MODULE.bazel` that cannot be read (a link that leads out of the
 //!   Bazel root, a file past the reader's bounds), and whatever else the
@@ -72,8 +77,8 @@
 use std::path::Path;
 
 use super::rc::declared_release;
-use super::starlark::{Call, Value};
-use super::workspace::{disk, Entry, Extension, Repo, Workspace};
+use super::starlark::{Call, How, Value};
+use super::workspace::{disk, Entry, Extension, Label, Repo, Workspace};
 
 /// The key under which a hosted run hands what [`unread`] says to the
 /// cargo rewriter, among its candidate files: no path of a file.
@@ -117,16 +122,16 @@ pub fn unread(project: &Path, files: &[String], config: &str) -> Option<String> 
     judge(&view, &parts.join("/"), files, config)
 }
 
-/// The files of the main repository that `call` names under the attribute
-/// `name`, each from the Bazel root: none for an attribute it does not
-/// pass. `None` when they are not written out: the attribute is no string
-/// and no list of strings, or it is not written and the call passes `**`.
+/// The labels of files of the main repository that `call` gives the
+/// attribute `name`: none for an attribute it does not pass. `None` when
+/// they are not written out: the attribute is no string and no list of
+/// strings, or it is not written and the call passes `**`.
 ///
 /// `own` is the name a `WORKSPACE` file gives the main repository, for a
 /// call of that file: `workspace(name = "shop")` makes `@shop//` the main
 /// repository there (`WorkspaceGlobals.workspace`, Bazel 7.7.2 and 8.8.2).
 /// Under a name that is not written out, any `@name//` may be it.
-fn named(ws: &Workspace, own: Option<&Value>, call: &Call, name: &str) -> Option<Vec<String>> {
+fn named(ws: &Workspace, own: Option<&Value>, call: &Call, name: &str) -> Option<Vec<Label>> {
     let labels: Vec<&String> = match call.arg(name) {
         None if call.unpacks() => return None,
         None => Vec::new(),
@@ -142,9 +147,19 @@ fn named(ws: &Workspace, own: Option<&Value>, call: &Call, name: &str) -> Option
             (Repo::Apparent(_), Some(_)) => true,
             _ => false,
         };
-        main.then(|| label.path())
+        main.then_some(label)
     };
     Some(labels.iter().filter_map(main).collect())
+}
+
+/// What a call that makes a hub says of a project.
+enum Hub {
+    /// It reads none of the project's Cargo files.
+    Other,
+    /// It reads them, or may, and names the config the rewriter writes.
+    Named,
+    /// It is in the way, and this is the warning's text.
+    InTheWay(String),
 }
 
 /// [`unread`] for the workspace that `view` shows and the project in its
@@ -174,37 +189,44 @@ fn judge(
         )
     };
     let workspace = Workspace::read(view);
-    // The calls that make a hub, each with its file, the first doubt about
-    // a call that may be hidden, and the name a `WORKSPACE` file whose
-    // calls count gives the main repository.
-    let (mut hubs, mut hidden, mut own): (Vec<(&str, &Call)>, _, _) = (Vec::new(), None, None);
-    for extension in &EXTENSIONS {
-        let tags = workspace.tags(extension, "from_cargo");
-        hubs.extend(tags.calls.iter().map(|tag| (tag.file, tag.call)));
-        hidden = hidden.or(tags.doubts.into_iter().next());
-    }
-    if let (true, None, Some(Ok((file, legacy)))) = (hubs.is_empty(), &hidden, &workspace.legacy) {
-        let read = declared_release(view).is_none_or(|release| release < (9, 0, 0));
-        let hub = |call: &&Call| read && call.callee == "crates_repository";
-        let calls = legacy.calls.iter().filter(hub);
-        hubs.extend(calls.map(|call| (file.as_str(), call)));
-        let naming = legacy.calls.iter().find(|call| call.callee == "workspace");
-        own = naming.and_then(|call| call.arg("name"));
-    }
-    for (file, call) in hubs {
+    // What the hub that `call` of `file` makes says of the project. `own`
+    // is the name a `WORKSPACE` file gives the main repository, for a call
+    // of that file.
+    let says = |file: &str, call: &Call, own: Option<&Value>| {
         let read = ["cargo_lockfile", "manifests"].map(|name| named(&workspace, own, call, name));
-        let ours = |path: &String| files.contains(path);
-        let (reads, how) = match read.iter().flatten().flatten().any(ours) {
-            true => ("reads", ""),
-            false if read.iter().all(Option::is_some) => continue,
-            false => (
+        let ours = |label: &&Label| files.contains(&label.path());
+        let first = read.iter().flatten().flatten().find(ours);
+        let (reads, how) = match first {
+            Some(_) => ("reads", ""),
+            None if read.iter().all(Option::is_some) => return Hub::Other,
+            None => (
                 "may read",
                 " (its `cargo_lockfile` or its `manifests` is not written out)",
             ),
         };
+        let hub = format!(
+            "the rules_rust hub at {file}:{} {reads} the Cargo files of this project{how}",
+            call.line
+        );
+        // A name that is not written out widens what a hub may read, never
+        // what names the project's config.
+        let own = own.filter(|own| matches!(own, Value::Str(_)));
         let one = matches!(call.arg("cargo_config"), Some(Value::Str(_)));
-        if one && named(&workspace, own, call, "cargo_config") == Some(vec![written.clone()]) {
-            continue;
+        let given = named(&workspace, own, call, "cargo_config").unwrap_or_default();
+        if one && given.iter().map(Label::path).eq([written.clone()]) {
+            // `rollback` deletes a config it leaves empty, and a hub that
+            // names a missing file fails.
+            return match view(&written) {
+                Entry::Text(text) if text.trim().is_empty() => Hub::InTheWay(format!(
+                    "{hub} and names {written}, which holds nothing: the `rollback` of a pin \
+                     deletes a cargo config it leaves empty, and the hub then fails on the \
+                     missing file, and `bazel build` with it; dependency skipped (nothing \
+                     rewritten). Put a comment line in {written} and run this command again; \
+                     or use `--mode vendored`, which commits the patched crate and needs no \
+                     registry"
+                )),
+                _ => Hub::Named,
+            };
         }
         let names = match call.arg("cargo_config") {
             None if !call.unpacks() => "it names no `cargo_config`".to_string(),
@@ -213,19 +235,65 @@ fn judge(
                  of another file it names belong in {written})"
             ),
         };
-        let why = format!(
-            "the rules_rust hub at {file}:{} {reads} the Cargo files of this project{how}, and \
-             {names}",
-            call.line
-        );
+        // The label as the hub writes its own: the package of the first of
+        // the project's files it names may not be the project's directory.
+        let within = |package: &str| match package {
+            "" => Some(written.as_str()),
+            package => written.strip_prefix(package)?.strip_prefix('/'),
+        };
+        let label = first.and_then(|label| {
+            let name = within(&label.package)?;
+            Some(format!("//{}:{name}", label.package))
+        });
+        let label = label.unwrap_or_else(|| format!("//{project}:{config}"));
         // The file first: a hub that names a missing one fails.
         let way = format!(
             "Commit {written} (where the project has none, create it with a comment line in it: \
              `rollback` deletes a config it leaves empty, and a hub that names a missing file \
-             fails), give the hub `cargo_config = \"//{project}:{config}\"`, the label of that \
-             file as one string, and run this command again"
+             fails), give the hub `cargo_config = \"{label}\"`, the label of that file as one \
+             string, and run this command again"
         );
-        return Some(withheld(why, way));
+        Hub::InTheWay(withheld(format!("{hub}, and {names}"), way))
+    };
+    // The tags that make a hub, and the first doubt about one that may be
+    // hidden.
+    let (mut concerned, mut hidden) = (false, None);
+    for extension in &EXTENSIONS {
+        let tags = workspace.tags(extension, "from_cargo");
+        for tag in &tags.calls {
+            match says(tag.file, tag.call, None) {
+                Hub::InTheWay(why) => return Some(why),
+                Hub::Named => concerned = true,
+                Hub::Other => {}
+            }
+        }
+        hidden = hidden.or(tags.doubts.into_iter().next());
+    }
+    // The calls of a `WORKSPACE` file, where no tag concerns the project
+    // and none may be hidden: by the rule's own name, or by one that a
+    // `load` gives it.
+    if let (false, None, Some(Ok((file, legacy)))) = (concerned, &hidden, &workspace.legacy) {
+        let read = declared_release(view).is_none_or(|release| release < (9, 0, 0));
+        let rule = Value::Str("crates_repository".to_string());
+        let loads = legacy.calls.iter().filter(|call| call.callee == "load");
+        let aliases = loads
+            .flat_map(|load| &load.args)
+            .filter_map(|arg| match &arg.how {
+                How::Keyword(alias) if arg.value == rule => Some(alias.as_str()),
+                _ => None,
+            });
+        let names: Vec<&str> = aliases.chain(["crates_repository"]).collect();
+        let naming = legacy.calls.iter().find(|call| call.callee == "workspace");
+        let own = naming.and_then(|call| call.arg("name"));
+        let hubs = legacy
+            .calls
+            .iter()
+            .filter(|call| read && names.contains(&&*call.callee));
+        for call in hubs {
+            if let Hub::InTheWay(why) = says(file, call, own) {
+                return Some(why);
+            }
+        }
     }
     hidden.map(|doubt| {
         let why = format!(
@@ -433,6 +501,49 @@ mod tests {
         assert_eq!(said(&[("MODULE.bazel", &*module(&right))], "svc/app"), None);
         let roots = nested.replace(")", "    cargo_config = \"//:.cargo/config.toml\",\n)");
         assert!(said(&[("MODULE.bazel", &*module(&roots))], "svc/app").is_some());
+        // The label the warning gives is written as the hub writes its own:
+        // where the hub names the project's files from the root package,
+        // the project's directory is no package of its own.
+        let flat = hub(&[
+            "cargo_lockfile = \"//:svc/app/Cargo.lock\"",
+            "manifests = [\"//:svc/app/Cargo.toml\"]",
+        ]);
+        let why = said(&[("MODULE.bazel", &*module(&flat))], "svc/app").expect("the flat hub");
+        let label = "give the hub `cargo_config = \"//:svc/app/.cargo/config.toml\"`";
+        assert!(why.contains(label), "{why}");
+        let named = flat.replace(
+            ")",
+            "    cargo_config = \"//:svc/app/.cargo/config.toml\",\n)",
+        );
+        assert_eq!(said(&[("MODULE.bazel", &*module(&named))], "svc/app"), None);
+    }
+
+    /// A hub that names the config is still in the way while that file
+    /// holds nothing: the `rollback` of a pin deletes a config it leaves
+    /// empty, and the hub then names a missing file. A file with a comment
+    /// line stays, and a file that is not there yet is created by the pin,
+    /// as before.
+    #[test]
+    fn a_named_config_that_holds_nothing_is_in_the_way() {
+        let right = module(&hub(&readme_with(&[
+            "cargo_config = \"//:.cargo/config.toml\"",
+        ])));
+        for blank in ["", "\n", "  \n\t\n"] {
+            let why = said(&[("MODULE.bazel", &right), (CONFIG, blank)], "");
+            let why = why.unwrap_or_else(|| panic!("{blank:?}"));
+            let said_ = "the rules_rust hub at MODULE.bazel:4 reads the Cargo files of this \
+                         project and names .cargo/config.toml, which holds nothing: the \
+                         `rollback` of a pin deletes a cargo config it leaves empty, and the hub \
+                         then fails on the missing file, and `bazel build` with it; dependency \
+                         skipped (nothing rewritten). Put a comment line in .cargo/config.toml \
+                         and run this command again; or use `--mode vendored`";
+            assert!(why.starts_with(said_), "{blank:?}: {why}");
+        }
+        for kept in ["# The cargo settings of this project.\n", "[net]\n"] {
+            let files = [("MODULE.bazel", &*right), (CONFIG, kept)];
+            assert_eq!(said(&files, ""), None, "{kept:?}");
+        }
+        assert_eq!(said(&[("MODULE.bazel", &right)], ""), None, "no file yet");
     }
 
     #[test]
@@ -616,6 +727,18 @@ mod tests {
         assert_eq!(said(&files, ""), None);
         let files = [("MODULE.bazel", &*module("")), ("WORKSPACE", &*readme)];
         assert!(said(&files, "").is_some());
+        // A module hub over another project's files leaves the question to
+        // the `WORKSPACE` file too: Bazel 7 reads both.
+        let tools = hub(&[
+            "cargo_lockfile = \"//tools:Cargo.lock\"",
+            "manifests = [\"//tools:Cargo.toml\"]",
+        ]);
+        let files = [("MODULE.bazel", &*module(&tools)), ("WORKSPACE", &*readme)];
+        let why = said(&files, "").expect("the WORKSPACE hub beside another project's");
+        assert!(
+            why.starts_with("the rules_rust hub at WORKSPACE:3 reads"),
+            "{why}"
+        );
         // `@shop//` is the main repository there, by the name the file
         // gives it; under a name that is not written out any `@name//` may
         // be. Another repository's files are not the project's.
@@ -631,8 +754,27 @@ mod tests {
         assert_eq!(said(&[("WORKSPACE", &other)], ""), None);
         let unnamed = other.replace("name = \"shop\"", "name = NAME");
         assert!(said(&[("WORKSPACE", &unnamed)], "").is_some());
-        // Not seen: the rule under another name, and a file that only
-        // loads the `.bzl` file that calls it.
+        // That doubt widens what a hub may read, never what names the
+        // project's config: there only the checkout by a name that is
+        // written out counts.
+        let shared = "    cargo_config = \"@shared//:.cargo/config.toml\",\n";
+        let unnamed = call(shared).replace("name = \"shop\"", "name = NAME");
+        let why = said(&[("WORKSPACE", &unnamed)], "").expect("another repository's config");
+        assert!(
+            why.contains("its `cargo_config` is not the label of .cargo/config.toml"),
+            "{why}"
+        );
+        // The rule under the name a `load` gives it is the rule.
+        let alias = readme
+            .replace("\"crates_repository\")", "crates = \"crates_repository\")")
+            .replace("crates_repository(", "crates(");
+        let why = said(&[("WORKSPACE", &alias)], "").expect("the rule by its loaded name");
+        assert!(
+            why.starts_with("the rules_rust hub at WORKSPACE:3 reads"),
+            "{why}"
+        );
+        // Not seen: the rule under a name no `load` gives it, and a file
+        // that only loads the `.bzl` file that calls it.
         let renamed = readme.replace("crates_repository(", "crates(");
         assert_eq!(said(&[("WORKSPACE", &renamed)], ""), None);
         let loads = "load(\"//:deps.bzl\", \"rust_deps\")\nrust_deps()\n";

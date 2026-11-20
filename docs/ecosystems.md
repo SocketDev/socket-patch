@@ -2069,7 +2069,9 @@ scan to the patched build:
 - Commit `.cargo/config.toml` and give the hub the attribute, then run the same command: it
   pins the crate, and the build is the patched one. The file comes first. A project that has
   none creates it with a comment line in it: a hub that names a missing file fails, and
-  `rollback` deletes a cargo config it leaves empty, which a comment line prevents.
+  `rollback` deletes a cargo config it leaves empty, which a comment line prevents. The
+  warning writes the label in the package of the hub's own labels: for a hub that names
+  `//:svc/app/Cargo.toml` it is `//:svc/app/.cargo/config.toml`.
 - Use `--mode vendored`. It commits the patched crate under `.socket/vendor/cargo`, points a
   `[patch.crates-io]` entry at it and needs no registry.
 
@@ -2078,6 +2080,14 @@ already, and there may be no other. The warning then names that line and no attr
 
 ```
 Warning: cfg-if@1.0.4: MODULE.bazel:17: `crate` is used other than to call a tag, so a rules_rust hub that socket-patch cannot read may take the Cargo files of this project. [...] dependency skipped (nothing rewritten). Write that line as the call of a tag (`crate.from_cargo(...)`) or as `use_repo(...)` and run this command again: it then pins the crate, or names the hub that is in the way; or use `--mode vendored`, which commits the patched crate and needs no registry
+```
+
+A hub that names the config is still in the way while that file is there and holds nothing
+but white space. The pin would be written into it, a later `rollback` would delete the file it
+leaves empty, and the hub would fail on the missing file. The warning asks for a comment line:
+
+```
+Warning: cfg-if@1.0.4: the rules_rust hub at MODULE.bazel:10 reads the Cargo files of this project and names .cargo/config.toml, which holds nothing: the `rollback` of a pin deletes a cargo config it leaves empty, and the hub then fails on the missing file, and `bazel build` with it; dependency skipped (nothing rewritten). Put a comment line in .cargo/config.toml and run this command again; or use `--mode vendored`, which commits the patched crate and needs no registry
 ```
 
 A vendored crate that a hosted scan would take over stays vendored and patched
@@ -2089,13 +2099,17 @@ Everything is read from the checkout, and nothing is evaluated: `MODULE.bazel` a
 it includes, for the `from_cargo` tags of the `crate` extension of rules_rust
 (`//crate_universe:extensions.bzl`, and `extension.bzl`, which hands it on) under whatever
 name the file gives the ruleset and the extension; the `WORKSPACE` file, for calls of
-`crates_repository`; `.bazeliskrc` and `.bazelversion`, for the Bazel release.
+`crates_repository`, also under the name a `load` of that file gives the rule; `.bazeliskrc`
+and `.bazelversion`, for the Bazel release; and the cargo config a hub names, for whether it
+holds anything.
 
 - A hub concerns the project when a label of its `cargo_lockfile` or its `manifests` is the
   project's `Cargo.lock`, its `Cargo.toml` or the `Cargo.toml` of a workspace member below
   it. `@<name of the root module>//` is the checkout, and so is `@<name>//` in a `WORKSPACE`
-  file whose `workspace(name = "<name>")` says so (any `@name//`, where that name is not
-  written out as a string). A label of another repository is no file of the project.
+  file whose `workspace(name = "<name>")` says so. Where that name is not written out as a
+  string, any `@name//` label of a lock or a manifest may be the checkout, and none is taken
+  for the checkout as a `cargo_config`. A label of another repository is no file of the
+  project.
 - A hub that concerns the project is in the way unless its `cargo_config` is one string, the
   label of the config hosted mode writes: the project's `.cargo/config.toml`, or its
   `.cargo/config` where the project has that file. Another config is not enough, whatever it
@@ -2113,11 +2127,12 @@ name the file gives the ruleset and the extension; the `WORKSPACE` file, for cal
   - A use of the extension that may hide a call (the name bound to it used for anything but
     a tag or `use_repo`): a hub that cannot be read may take the project's files. The warning
     names the line to rewrite.
-  - A `crates_repository` of the `WORKSPACE` file counts when the module files make no
-    `crate.from_cargo` hub, unless `.bazeliskrc` or `.bazelversion` names Bazel 9.0.0 or later,
-    which never reads that file. Bazel 7 reads it, and Bazel 8 when it is told to. So a
-    `WORKSPACE` file that a move to Bzlmod left behind can withhold a pin on Bazel 8 where the
-    module files make no such hub: give its call the attribute, or delete the call.
+  - A `crates_repository` of the `WORKSPACE` file counts when no `crate.from_cargo` hub of the
+    module files concerns the project, unless `.bazeliskrc` or `.bazelversion` names Bazel
+    9.0.0 or later, which never reads that file. Bazel 7 reads it beside the module files, and
+    Bazel 8 when it is told to. So a `WORKSPACE` file that a move to Bzlmod left behind can
+    withhold a pin on Bazel 8 where the module files make no hub for the project: give its
+    call the attribute, or delete the call.
 - Nothing changes where no hub is seen to concern the project: in no Bazel workspace (the rule
   is under [Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore)), in a workspace
   without a crate_universe hub, for a hub that names the config, for a hub whose labels are all
@@ -2130,7 +2145,7 @@ Limits:
 - Not seen, so that the run is the one it was and a hub without the config fails as before:
   - a hub that another Bazel module declares;
   - a `crates_repository` inside a `.bzl` file that the `WORKSPACE` file loads, or called
-    under another name;
+    under a name that no `load` of the `WORKSPACE` file gives it;
   - where no hub is seen: a tag called on `use_extension(...)` itself, with no name bound to
     it; a `MODULE.bazel` that cannot be read (a link that leads out of the Bazel root, a file
     past the reader's bounds); and what else the module files hide from every reading (a file
@@ -2149,6 +2164,9 @@ Limits:
   is the ruleset's own rule, and this check does not look at it.
 - `socket-patch vex` attests a hosted pin from the three files alone. It does not look at the
   hub.
+- A hub that names a cargo config which is not there yet gets the pin, which creates the
+  file. A later `rollback` deletes the file again, and the hub fails on the missing file as it
+  did before the pin. Create the file with a comment line in it first.
 
 ## Cargo: shared registry cache
 

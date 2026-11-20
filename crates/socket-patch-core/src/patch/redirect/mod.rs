@@ -2049,6 +2049,23 @@ fn rewrite_cargo(
     rewrite_cargo_with(files, overrides, &CratesIoSource::Registry, result);
 }
 
+/// The cargo config the cargo rewriter writes for a project with `files`,
+/// from the project: the one the project's cargo reads.
+///
+/// Cargo reads the LEGACY extensionless `.cargo/config` in preference to
+/// `config.toml` when both exist (it warns about the duplicate), so a
+/// managed `[registries.…]` block written to `config.toml` there is
+/// silently inert and the `registry = "socket-patch-…"` the rewriter puts
+/// in Cargo.toml then names an undefined registry. Same preference
+/// `vendor::cargo_config::config_path` applies on the vendor path.
+pub(crate) fn cargo_config_key(files: &BTreeMap<String, String>) -> &'static str {
+    if files.contains_key(".cargo/config") {
+        ".cargo/config"
+    } else {
+        ".cargo/config.toml"
+    }
+}
+
 /// [`rewrite_cargo`] with `cargo_outer`: where the cargo configs read for a
 /// build in the project (its own, every parent directory's and
 /// `$CARGO_HOME`'s) take crates.io from. The project's own config is also
@@ -2114,17 +2131,7 @@ fn rewrite_cargo_with(
         .get("Cargo.lock")
         .cloned()
         .map(|t| CargoHostedLock::new(to_lf("Cargo.lock", t)));
-    // Cargo reads the LEGACY extensionless `.cargo/config` in preference to
-    // `config.toml` when both exist (it warns about the duplicate), so a
-    // managed `[registries.…]` block written to `config.toml` there is
-    // silently inert and the `registry = "socket-patch-…"` this rewriter puts
-    // in Cargo.toml then names an undefined registry. Same preference
-    // `vendor::cargo_config::config_path` applies on the vendor path.
-    let cargo_config_key = if files.contains_key(".cargo/config") {
-        ".cargo/config"
-    } else {
-        ".cargo/config.toml"
-    };
+    let cargo_config_key = cargo_config_key(files);
     let mut cargo_config = files
         .get(cargo_config_key)
         .cloned()

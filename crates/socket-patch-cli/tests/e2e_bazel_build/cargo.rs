@@ -1334,7 +1334,8 @@ fn granted() -> (Package, StandIn, Patched) {
 /// withholds the pin, and the warning names that line and no attribute.
 /// Without the line the same scan pins the crate, a scan after it leaves
 /// the pin as it is, and `rollback` gives the checkout back, the config
-/// with its comment line.
+/// with its comment line. A config that holds nothing gets no pin, and the
+/// warning asks for the comment line.
 #[test]
 fn a_hub_without_the_config_gets_no_pin_until_it_names_the_config() {
     let (upstream, standin, patch) = granted();
@@ -1408,11 +1409,30 @@ fn a_hub_without_the_config_gets_no_pin_until_it_names_the_config() {
     assert_eq!(undo.envelope["summary"]["rolledBack"], 1, "{}", undo.dump);
     assert_eq!(changed(&edited, &cell.tree()), NOTHING, "{}", undo.dump);
 
-    // KNOWN GAP, and what the comment line is for: a config that holds
-    // nothing else is deleted by the `rollback` that empties it, and a hub
-    // that names a missing file fails. Once `rollback` keeps a file it did
-    // not create, the warning needs no such advice and this goes.
+    // A config that holds nothing gets no pin: the `rollback` of the pin
+    // would delete the file, and a hub that names a missing file fails.
     cell.write(CONFIG, "");
+    let blank = cell.tree();
+    let detail = unread("a blank config", &socket_patch(&cell, &standin, &scan));
+    let starts = format!(
+        "{NAME}@{VERSION}: the rules_rust hub at {} reads the Cargo files of this project and \
+         names {CONFIG}, which holds nothing: ",
+        hub_at(&named)
+    );
+    let way = format!(
+        "Put a comment line in {CONFIG} and run this command again; or use `--mode vendored`"
+    );
+    assert!(
+        detail.starts_with(&starts) && detail.contains(&way),
+        "{detail}"
+    );
+    assert_eq!(changed(&blank, &cell.tree()), NOTHING);
+
+    // KNOWN GAP, and what the comment line is for: a config that the pin
+    // creates is deleted by the `rollback` that empties it, and a hub that
+    // names a missing file fails. Once `rollback` keeps the hub's file,
+    // the warning needs no such advice and this goes.
+    std::fs::remove_file(cell.path(CONFIG)).expect("the blank config");
     let ran = socket_patch(&cell, &standin, &scan);
     assert_eq!(ran.envelope["summary"]["applied"], 1, "{}", ran.dump);
     let undo = socket_patch(&cell, &standin, &["rollback", "--yes"]);
