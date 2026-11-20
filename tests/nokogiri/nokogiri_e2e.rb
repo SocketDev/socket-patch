@@ -209,6 +209,49 @@ class NokogiriE2E
 
   # ---- the install -------------------------------------------------------
 
+  # A `bundle install` failure that may be the registry's and not a result:
+  # the install is tried again. (Not "HTTP": Bundler names
+  # https://rubygems.org in every failure.)
+  #
+  # The last pattern is not a network error by its text. Bundler reads which
+  # Rubies and which RubyGems a release supports from the compact index.
+  # When one request to that index fails, Bundler does not fail: it resolves
+  # from the full index instead, which lists names and versions only, takes
+  # the newest release of every gem, and stops at the first one this Ruby
+  # cannot run:
+  #
+  #   minitest-5.27.0 requires ruby version >= 3.1, which is incompatible
+  #   with the current version, ruby 2.3.8p459
+  #
+  # (Bundler 2 words it "requires Ruby version >= 3.2. The current ruby
+  # version is 3.1.6.") It writes no lock, so the next try resolves anew.
+  # A requirement the Gemfile really cannot meet fails every try.
+  REGISTRY_BLIP = Regexp.union(
+    /Network error|Gem::RemoteFetcher::FetchError|Net::(?:Open|Read)Timeout|Could not (?:reach|fetch)/,
+    /requires ruby(?:gems)? version/i
+  )
+
+  # `bundle install` in the project, up to three times while it fails the
+  # way a registry failure does. Returns the exit code and the output of
+  # the last try.
+  def bundle_install(env = {})
+    attempts = 0
+    loop do
+      attempts += 1
+      code, out = sh(env, *bundle("install", "--jobs", "4", "--retry", "3"))
+      return [code, out] if code.zero? || attempts >= 3 || out !~ REGISTRY_BLIP
+      puts "  `bundle install` failed, maybe on a registry failure: installing again, attempt #{attempts + 1} of 3",
+           "    #{out.lines.grep(REGISTRY_BLIP).first.to_s.strip}"
+      sleep(5 * attempts)
+    end
+  end
+
+  def bundle_install!(env = {})
+    code, out = bundle_install(env)
+    raise Failure, "`bundle install` exited #{code}:\n#{tail(out)}" unless code.zero?
+    out
+  end
+
   def install
     gemfile = ["source \"https://rubygems.org\"", "gem \"nokogiri\", \"#{@version}\""]
     if @opts[:rails]
@@ -244,17 +287,7 @@ class NokogiriE2E
     end
 
     puts "Installing nokogiri #{@version} (#{want}) with #{sh!({}, *bundle('--version')).strip}, #{ruby_label}"
-    attempts = 0
-    begin
-      attempts += 1
-      sh!(@install_env, *bundle("install", "--jobs", "4", "--retry", "3"))
-    rescue Failure => e
-      # A registry blip, not a result: one more try before giving up. (Not
-      # "HTTP": Bundler names https://rubygems.org in every failure.)
-      blip = /Network error|Gem::RemoteFetcher::FetchError|Net::(Open|Read)Timeout|Could not (reach|fetch)/
-      raise if attempts >= 2 || e.message !~ blip
-      retry
-    end
+    bundle_install!(@install_env)
 
     # The copy Bundler loads, wherever this environment keeps its gems.
     where = sh!({}, *bundle("exec", RbConfig.ruby, "-e",
@@ -573,7 +606,7 @@ class NokogiriE2E
 
     checkout = fresh_checkout(mode == "vendored" ? [".socket"] : [])
     in_project(checkout) do
-      code, out = sh({ "BUNDLE_FROZEN" => "true" }, *bundle("install", "--jobs", "4", "--retry", "3"))
+      code, out = bundle_install("BUNDLE_FROZEN" => "true")
       check(code.zero?, "a fresh checkout installs with the lock frozen", tail(out))
       check(File.read(lock_path) == rewritten, "and the install leaves the lock as it was")
       now = probe
@@ -589,7 +622,7 @@ class NokogiriE2E
     FileUtils.rm_rf(checkout)
 
     # The project itself, after one more `bundle install`.
-    sh!({}, *bundle("install", "--jobs", "4", "--retry", "3"))
+    bundle_install!
     check(probe[RB_CONST] == 1, "the scanned project loads the patched nokogiri too", scan_said)
     service.bring_up
     code, stdout, stderr, = sp_service("vex", "--product", PRODUCT, "--output", File.join(@proj, "vex.json"))
@@ -608,7 +641,7 @@ class NokogiriE2E
           "expected:\n#{lock}\ngot:\n#{File.read(lock_path)}")
     check(File.read(File.join(@proj, "Gemfile")) == gemfile, "and so is the Gemfile")
     check(!File.exist?(File.join(@proj, ".socket", "vendor", "gem")), "nothing vendored is left") if mode == "vendored"
-    sh!({}, *bundle("install", "--jobs", "4", "--retry", "3"))
+    bundle_install!
     check(probe == @baseline, "after `bundle install`, Ruby loads what it loaded before the patch")
   end
 

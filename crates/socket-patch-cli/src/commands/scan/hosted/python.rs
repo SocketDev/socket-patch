@@ -59,6 +59,18 @@ impl Evidence<'_> {
     }
 }
 
+/// The remedy for a copy in a pixi environment that still holds the
+/// upstream release after another tool's lock was rewired. pixi installs
+/// its environments from its own lock, so no reinstall from the rewritten
+/// one reaches a package pixi put there; only a package pip installed into
+/// that environment follows the rewritten file.
+const PIXI_STALE_INSTALL_REMEDY: &str =
+    "This copy is in a pixi environment, which pixi installs from its own lock and not \
+     from the rewritten one: a package pixi installed there, from a conda channel or \
+     from PyPI, keeps these files however often it is reinstalled, and \
+     `socket-patch scan --mode agent` patches it in place. A package pip installed \
+     there from the rewritten file is replaced by reinstalling it in that environment.";
+
 /// A lock rewrite cannot prove a warm virtualenv has installed the wheel.
 /// Use the project's own venv discovery (`--global`/`--global-prefix` use
 /// the crawler's global paths), and inspect every interpreter rather than
@@ -278,6 +290,10 @@ pub(super) async fn stale_install_warnings(
                     "rewritten",
                 )
                 .await
+            } else if socket_patch_core::crawlers::pixi_env::conda_prefix_of(&site)
+                .is_some_and(socket_patch_core::crawlers::pixi_env::is_pixi_prefix)
+            {
+                PIXI_STALE_INSTALL_REMEDY.to_string()
             } else {
                 "Reinstall from the rewritten lock in this interpreter and verify with \
                  `socket-patch vex`. Poetry before 1.4 may keep same-version packages: \
@@ -500,6 +516,58 @@ mod tests {
         .await;
         assert_eq!(out.stale_purls, BTreeSet::from([purl.to_string()]));
         assert_eq!(out.warnings[0]["code"], "redirect_pypi_stale_install");
+    }
+
+    /// A project with a wired lock and a pixi environment: the copy pixi
+    /// installed is still the upstream release, and no reinstall from the
+    /// rewritten lock reaches it. The warning says so and names agent mode,
+    /// not "reinstall from the rewritten lock".
+    #[tokio::test]
+    async fn pixi_environment_copy_gets_the_stale_install_warning_with_pixi_remedy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = tmp.path().join(".pixi").join("envs").join("default");
+        std::fs::create_dir_all(prefix.join("conda-meta")).unwrap();
+        std::fs::write(prefix.join("conda-meta").join("pixi"), "{}").unwrap();
+        let site = if cfg!(windows) {
+            prefix.join("Lib").join("site-packages")
+        } else {
+            prefix.join("lib").join("python3.13").join("site-packages")
+        };
+        let dist = site.join("six-1.16.0.dist-info");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("METADATA"), "Name: six\nVersion: 1.16.0\n").unwrap();
+        std::fs::write(site.join("six.py"), b"upstream").unwrap();
+        std::fs::write(tmp.path().join("pixi.toml"), "[workspace]\n").unwrap();
+        let common = crate::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let purl = "pkg:pypi/six@1.16.0";
+        let confirmed = vec![(purl.to_string(), "six-uuid".to_string())];
+        let ledger = BTreeMap::from([("k".into(), record("six-uuid", "six.py", b"patched"))]);
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &BTreeSet::new(),
+            None,
+            &[],
+            &ledger,
+            &mut ViewFallback::offline(),
+        )
+        .await;
+        assert_eq!(out.stale_purls, BTreeSet::from([purl.to_string()]));
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        let detail = out.warnings[0]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("pixi environment")
+                && detail.contains("`socket-patch scan --mode agent`"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("Reinstall from the rewritten lock"),
+            "{detail}"
+        );
     }
 
     /// #1878: hosted words the Pipenv remedy through core's shared

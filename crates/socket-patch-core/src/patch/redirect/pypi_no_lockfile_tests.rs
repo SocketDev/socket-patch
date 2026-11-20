@@ -233,3 +233,144 @@ fn the_detail_names_every_input_looked_for() {
         assert!(detail.contains(input), "{input}: {detail}");
     }
 }
+
+const PIXI_CODE: &str = "redirect_pypi_pixi_project";
+
+/// A pixi project installs from its own lock, and mostly from conda
+/// channels: pinning the package in a requirements file or another tool's
+/// lock would change nothing pixi installs. It is sent to agent mode
+/// instead, once per run, whichever of pixi's two files is there, and never
+/// told to write a requirements.txt.
+#[test]
+fn a_pixi_project_is_sent_to_agent_mode() {
+    let overrides = [
+        six("aaaaaaaa-0000-4000-8000-000000000638"),
+        six("bbbbbbbb-0000-4000-8000-000000000638"),
+    ];
+    let manifest = "[workspace]\nchannels = [\"conda-forge\"]\nplatforms = [\"linux-64\"]\n\n[dependencies]\nsix = \"1.16.0.*\"\n";
+    let layouts: [(&str, BTreeMap<String, String>); 3] = [
+        ("pixi.toml only", files(&[("pixi.toml", manifest)])),
+        (
+            "pixi.toml and pixi.lock",
+            files(&[("pixi.toml", manifest), ("pixi.lock", "version: 6\n")]),
+        ),
+        (
+            "a pyproject manifest and pixi.lock",
+            files(&[
+                ("pyproject.toml", UV_PROJECT),
+                ("pixi.lock", "version: 6\n"),
+            ]),
+        ),
+    ];
+    for (layout, files) in layouts {
+        let result = rewrite_registry_redirect(&files, &overrides);
+        assert!(result.files.is_empty(), "{layout}: {:?}", result.files);
+        let pixi: Vec<&RewriteWarning> = result
+            .warnings
+            .iter()
+            .filter(|w| w.code == PIXI_CODE)
+            .collect();
+        assert_eq!(pixi.len(), 1, "{layout}: {:?}", codes(&result));
+        let detail = &pixi[0].detail;
+        for expected in [
+            "`socket-patch scan --mode agent`",
+            "`pixi install`",
+            "`socket-patch apply`",
+        ] {
+            assert!(detail.contains(expected), "{layout}: {detail}");
+        }
+        assert!(
+            no_lockfile_warnings(&result).is_empty(),
+            "{layout}: {:?}",
+            codes(&result)
+        );
+    }
+}
+
+/// A pixi project whose own files name another lock tool is installed by
+/// that tool as well: it keeps that tool's lock step, which the pixi
+/// warning would otherwise hide.
+#[test]
+fn a_pixi_project_that_names_a_lock_tool_keeps_that_tools_remedy() {
+    let overrides = [six("aaaaaaaa-0000-4000-8000-000000000638")];
+    let cases: [(&str, &str, &str); 2] = [
+        (
+            "Pipfile",
+            "[packages]\nsix = \"==1.16.0\"\n",
+            "`pipenv lock`",
+        ),
+        (
+            "pyproject.toml",
+            "[project]\nname = \"app\"\n\n[tool.uv]\npackage = false\n",
+            "`uv lock`",
+        ),
+    ];
+    for (name, text, step) in cases {
+        let result = rewrite_registry_redirect(
+            &files(&[("pixi.toml", "[workspace]\n"), (name, text)]),
+            &overrides,
+        );
+        assert!(
+            !codes(&result).contains(&PIXI_CODE),
+            "{name}: {:?}",
+            codes(&result)
+        );
+        let warnings = no_lockfile_warnings(&result);
+        assert_eq!(warnings.len(), 1, "{name}: {:?}", codes(&result));
+        assert!(
+            warnings[0].detail.contains(step),
+            "{name}: {}",
+            warnings[0].detail
+        );
+    }
+}
+
+/// A build backend builds the project's own package; it does not say which
+/// tool installs the dependencies. A pixi project packaged with
+/// poetry-core, PDM's backend or uv's is still installed by pixi, and is
+/// not told to make a lock pixi never reads.
+#[test]
+fn a_pixi_project_packaged_with_another_tools_backend_is_still_pixis() {
+    let overrides = [six("aaaaaaaa-0000-4000-8000-000000000638")];
+    for backend in ["poetry.core.masonry.api", "pdm.backend", "uv_build"] {
+        let pyproject =
+            format!("[project]\nname = \"app\"\n\n[build-system]\nbuild-backend = \"{backend}\"\n");
+        let result = rewrite_registry_redirect(
+            &files(&[
+                ("pixi.lock", "version: 6\n"),
+                ("pyproject.toml", &pyproject),
+            ]),
+            &overrides,
+        );
+        assert!(
+            codes(&result).contains(&PIXI_CODE),
+            "{backend}: {:?}",
+            codes(&result)
+        );
+        assert!(no_lockfile_warnings(&result).is_empty(), "{backend}");
+    }
+}
+
+/// A file a PyPI rewriter reads still owns the project's diagnostics in a
+/// pixi project (pip installing a requirements file into the pixi
+/// environment), and no pypi patch means nothing to say.
+#[test]
+fn a_pixi_project_with_a_wired_file_or_no_pypi_patch_is_silent() {
+    let overrides = [six("aaaaaaaa-0000-4000-8000-000000000638")];
+    let result = rewrite_registry_redirect(
+        &files(&[
+            ("pixi.toml", "[workspace]\n"),
+            ("requirements.txt", "six==1.16.0\n"),
+        ]),
+        &overrides,
+    );
+    assert!(!codes(&result).contains(&PIXI_CODE), "{:?}", codes(&result));
+    assert!(
+        result.files.contains_key("requirements.txt"),
+        "{:?}",
+        result.files
+    );
+
+    let result = rewrite_registry_redirect(&files(&[("pixi.toml", "[workspace]\n")]), &[]);
+    assert!(result.warnings.is_empty(), "{:?}", codes(&result));
+}

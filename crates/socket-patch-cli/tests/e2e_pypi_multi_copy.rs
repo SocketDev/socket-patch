@@ -288,3 +288,139 @@ fn global_system_and_user_site_copies_are_all_patched() {
         ],
     );
 }
+
+/// A stub `python3` in `bin` that answers `--version` and names `sites` as
+/// its site-packages, as the crawler's `site` query reads a real one.
+#[cfg(unix)]
+fn stub_python(bin: &Path, sites: &[&Path]) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin).unwrap();
+    let mut script = String::from(
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'Python 3.12.0'; exit 0; fi\n",
+    );
+    for site in sites {
+        script.push_str(&format!("printf '%s\\n' '{}'\n", site.display()));
+    }
+    let stub = bin.join("python3");
+    std::fs::write(&stub, script).unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A project with no environment of its own is scanned in the interpreter
+/// on `PATH`, for the packages it declares. A patch an earlier run left in
+/// another environment on the machine is out of that scan's reach, and so
+/// is its record: the scan finds nothing, and a `--prune` is skipped. The
+/// run still names the record and the `rollback` that restores the copy,
+/// and keeps the record.
+#[cfg(unix)]
+#[test]
+fn a_skipped_prune_names_a_patch_still_installed_outside_the_projects_interpreter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let home = root.join("home");
+    let project = root.join("work");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("requirements.txt"), "# no dependencies\n").unwrap();
+    stage_patch(&project);
+    // The interpreter on PATH holds nothing of the project's.
+    let system_site = root.join("usr/lib/python3/dist-packages");
+    std::fs::create_dir_all(&system_site).unwrap();
+    let bin = root.join("bin");
+    stub_python(&bin, &[&system_site]);
+    // A pipx app's environment holds the patched copy.
+    let tool_site = home.join(".local/pipx/venvs/sometool/lib/python3.12/site-packages");
+    let tool_copy = install_dupkit(&tool_site);
+    std::fs::write(&tool_copy, PATCHED).unwrap();
+
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let env = [("PATH", path.as_str()), ("HOME", home.to_str().unwrap())];
+    let (code, stdout, stderr) = run(
+        &project,
+        &["scan", "--mode", "agent", "--prune", "--json"],
+        &env,
+    );
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let json = envelope(&stdout, &stderr);
+    let warnings = json["warnings"].as_array().cloned().unwrap_or_default();
+    assert!(
+        warnings.iter().any(|w| {
+            w["code"] == "pypi_installed_patch_kept"
+                && w["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains(PURL) && d.contains("--global"))
+        }),
+        "the still-patched copy must be named: {json:#}"
+    );
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(project.join(".socket/manifest.json")).unwrap())
+            .unwrap();
+    assert!(manifest["patches"].get(PURL).is_some(), "{manifest:#}");
+    assert_eq!(std::fs::read(&tool_copy).unwrap(), PATCHED);
+
+    // Restored copy: nothing to name.
+    std::fs::write(&tool_copy, ORIGINAL).unwrap();
+    let (code, stdout, stderr) = run(
+        &project,
+        &["scan", "--mode", "agent", "--prune", "--json"],
+        &env,
+    );
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let json = envelope(&stdout, &stderr);
+    assert!(
+        !json["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|w| w["code"] == "pypi_installed_patch_kept"),
+        "{json:#}"
+    );
+}
+
+/// When a scan finds nothing because every package in the interpreter on
+/// `PATH` was left out as not the project's, it says so: "install first"
+/// alone would send the user to install what is already there.
+#[cfg(unix)]
+#[test]
+fn an_empty_scan_says_when_installed_packages_were_left_out_as_undeclared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let project = root.join("work");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("requirements.txt"), "# no dependencies\n").unwrap();
+    let system_site = root.join("usr/lib/python3/dist-packages");
+    std::fs::create_dir_all(&system_site).unwrap();
+    let bin = root.join("bin");
+    stub_python(&bin, &[&system_site]);
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let env = [("PATH", path.as_str()), ("HOME", home.to_str().unwrap())];
+    let scan = || {
+        run(
+            &project,
+            &["scan", "--mode", "agent", "--ecosystems", "pypi"],
+            &env,
+        )
+    };
+
+    // An interpreter with nothing installed: the plain message.
+    let (code, stdout, stderr) = scan();
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("No pypi packages found."), "{stdout}");
+
+    install_dupkit(&system_site);
+    let (code, stdout, stderr) = scan();
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains(
+            "No packages found: the 1 package installed in the Python on PATH is not one this \
+             project declares."
+        ),
+        "{stdout}"
+    );
+
+    // Once the project declares it, it is scanned like any other.
+    std::fs::write(project.join("requirements.txt"), "dupkit\n").unwrap();
+    let (_, stdout, _) = scan();
+    assert!(!stdout.contains("No packages found"), "{stdout}");
+}

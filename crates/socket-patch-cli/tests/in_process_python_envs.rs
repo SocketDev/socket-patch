@@ -985,6 +985,160 @@ async fn uv_fresh_checkout_never_scans_the_system_python() {
     }
 }
 
+/// A stub `python3` under `root` that names `site` as its site-packages,
+/// as the crawler's `site` query reads a real interpreter. Returns its
+/// directory, for [`scan_with_first_on_path`].
+#[cfg(unix)]
+fn stub_python(root: &Path, site: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let python = bin.join("python3");
+    std::fs::write(
+        &python,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'Python 3.12.0'; exit 0; fi\n\
+             printf '%s\\n' '{}'\n",
+            site.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// Run `scan` with `bin` in front of the host's `PATH` (which the scan
+/// still needs for its other tools), restoring `PATH` afterwards.
+#[cfg(unix)]
+async fn scan_with_first_on_path(bin: &Path, scan: impl std::future::Future<Output = i32>) -> i32 {
+    let saved = std::env::var_os("PATH");
+    let mut path = vec![bin.to_path_buf()];
+    path.extend(std::env::split_paths(&saved.clone().unwrap_or_default()));
+    std::env::set_var("PATH", std::env::join_paths(path).unwrap());
+    let code = scan.await;
+    match saved {
+        Some(v) => std::env::set_var("PATH", v),
+        None => std::env::remove_var("PATH"),
+    }
+    code
+}
+
+/// A project whose only Python manifest is `requirements.txt`, with no
+/// venv, installs into the interpreter on `PATH`, which other projects and
+/// tools share. Only the packages it declares, and what those require,
+/// reach the patch query, in every mode. A package that is merely installed
+/// in that interpreter, or in another tool's own environment under HOME, is
+/// not the project's: hosted mode has no line to pin it on, vendored mode
+/// would add it to the project, and agent mode would patch a copy the
+/// project never uses.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn requirements_project_without_a_venv_scans_only_what_it_declares() {
+    use socket_patch_cli::commands::scan::ScanMode;
+
+    for (requirements, declared_is_found) in [
+        // Nothing declared: nothing in the interpreter is the project's.
+        ("# only the standard library\n", false),
+        ("declared_pkg\n", true),
+    ] {
+        for mode in [ScanMode::Agent, ScanMode::Vendored, ScanMode::Hosted] {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path().join("proj");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(project.join("requirements.txt"), requirements).unwrap();
+            // The interpreter on PATH, and what is installed in it.
+            let site = tmp.path().join("system/lib/python3.12/site-packages");
+            std::fs::create_dir_all(&site).unwrap();
+            write_dist_info(&site, "declared_pkg", "1.0.0");
+            write_dist_info(&site, "system_decoy", "6.6.6");
+            let bin = stub_python(tmp.path(), &site);
+            // A pipx app's own environment under HOME.
+            let home = tmp.path().join("home");
+            let tool = home.join(".local/pipx/venvs/hatch/lib/python3.12/site-packages");
+            std::fs::create_dir_all(&tool).unwrap();
+            write_dist_info(&tool, "tool_decoy", "6.6.6");
+
+            let server = MockServer::start().await;
+            mock_batch_empty(&server).await;
+            let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+                ["HOME", "PIPX_HOME", "XDG_DATA_HOME"]
+                    .into_iter()
+                    .map(|key| (key, std::env::var_os(key)))
+                    .collect();
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("PIPX_HOME");
+            std::env::remove_var("XDG_DATA_HOME");
+            let mut args = default_args(&project, server.uri());
+            args.mode = Some(mode);
+            let code = scan_with_first_on_path(&bin, scan_scrubbed(args)).await;
+            for (key, value) in saved {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+
+            let context = format!("{requirements:?} {mode:?}");
+            assert_eq!(code, 0, "{context}");
+            let bodies = batch_bodies(&server).await;
+            if declared_is_found {
+                assert_discovered(&bodies, "pkg:pypi/declared-pkg@1.0.0");
+            } else {
+                assert_not_discovered(&bodies, "pkg:pypi/declared-pkg");
+            }
+            assert_not_discovered(&bodies, "pkg:pypi/system-decoy");
+            assert_not_discovered(&bodies, "pkg:pypi/tool-decoy");
+        }
+    }
+}
+
+/// A package the project's patch manifest records stays one of the
+/// project's packages when no requirements file names it: `get <name>`
+/// patched it on purpose. The scan keeps asking about it, so a newer patch
+/// is offered and `--prune` does not take its record for a stale one.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn requirements_project_without_a_venv_keeps_scanning_a_recorded_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".socket")).unwrap();
+    std::fs::write(project.join("requirements.txt"), "declared_pkg\n").unwrap();
+    std::fs::write(
+        project.join(".socket/manifest.json"),
+        serde_json::json!({ "patches": { "pkg:pypi/recorded-pkg@3.0.0": {
+            "uuid": "11111111-1111-4111-8111-111111111111",
+            "exportedAt": "2026-01-01T00:00:00Z",
+            "files": {},
+            "vulnerabilities": {},
+            "description": "seed",
+            "license": "MIT",
+            "tier": "free",
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let site = tmp.path().join("system/lib/python3.12/site-packages");
+    std::fs::create_dir_all(&site).unwrap();
+    write_dist_info(&site, "declared_pkg", "1.0.0");
+    write_dist_info(&site, "recorded_pkg", "3.0.0");
+    write_dist_info(&site, "system_decoy", "6.6.6");
+    let bin = stub_python(tmp.path(), &site);
+
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let mut args = default_args(&project, server.uri());
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Agent);
+    let code = scan_with_first_on_path(&bin, scan_scrubbed(args)).await;
+
+    assert_eq!(code, 0);
+    let bodies = batch_bodies(&server).await;
+    assert_discovered(&bodies, "pkg:pypi/declared-pkg@1.0.0");
+    assert_discovered(&bodies, "pkg:pypi/recorded-pkg@3.0.0");
+    assert_not_discovered(&bodies, "pkg:pypi/system-decoy");
+}
+
 /// #525: uv syncs into `UV_PROJECT_ENVIRONMENT`, absolute or relative to the
 /// project, and ignores an activated `VIRTUAL_ENV` for project commands.
 #[tokio::test]
@@ -1021,5 +1175,181 @@ async fn uv_project_environment_is_scanned_not_a_stray_dot_venv() {
         assert_discovered(&bodies, "pkg:pypi/uv-pkg@1.0.0");
         assert_not_discovered(&bodies, "pkg:pypi/stray-decoy@6.6.6");
         assert_not_discovered(&bodies, "pkg:pypi/activated-decoy@6.6.6");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pixi (`.pixi/envs/<name>`, conda prefixes pixi installs the project into)
+// ---------------------------------------------------------------------------
+
+/// A pixi environment at `project/.pixi/envs/<name>` as pixi leaves one: a
+/// conda prefix with pixi's own record. Returns its site-packages.
+fn pixi_env(project: &Path, name: &str) -> std::path::PathBuf {
+    let prefix = project.join(".pixi").join("envs").join(name);
+    let meta = prefix.join("conda-meta");
+    std::fs::create_dir_all(&meta).unwrap();
+    std::fs::write(
+        meta.join("pixi"),
+        format!("{{\"environment_name\": \"{name}\"}}"),
+    )
+    .unwrap();
+    let site = venv_site_packages(&prefix, "python3.13");
+    std::fs::create_dir_all(&site).unwrap();
+    site
+}
+
+/// Run `scan` with no venv or pixi activation in the environment and HOME
+/// pointed at `home`, restoring HOME afterwards.
+async fn scan_unactivated(args: ScanArgs, home: &Path) -> i32 {
+    let prev_home = std::env::var_os("HOME");
+    let prev_profile = std::env::var_os("USERPROFILE");
+    std::env::set_var("HOME", home);
+    std::env::set_var("USERPROFILE", home);
+    for var in [
+        "VIRTUAL_ENV",
+        "UV_PROJECT_ENVIRONMENT",
+        "CONDA_PREFIX",
+        "PIXI_PROJECT_ROOT",
+        "PIXI_WORKSPACE_ROOT",
+    ] {
+        std::env::remove_var(var);
+    }
+    let code = scan_run(args).await;
+    match prev_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+    match prev_profile {
+        Some(v) => std::env::set_var("USERPROFILE", v),
+        None => std::env::remove_var("USERPROFILE"),
+    }
+    code
+}
+
+/// A pixi project's packages are in `.pixi/envs/<name>`, and a plain
+/// `socket-patch scan` after `pixi install` (CI's shape: no `pixi run`, no
+/// `pixi shell`) finds them in every environment and every mode, with only
+/// pixi's own files at the root: no `pyproject.toml`, no requirements file.
+#[tokio::test]
+#[serial]
+async fn pixi_environments_are_scanned_without_activation() {
+    use socket_patch_cli::commands::scan::ScanMode;
+    for mode in [ScanMode::Agent, ScanMode::Vendored, ScanMode::Hosted] {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("analysis");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pixi.toml"),
+            "[workspace]\nname = \"analysis\"\nchannels = [\"conda-forge\"]\nplatforms = [\"linux-64\"]\n\n[dependencies]\npython = \"3.13.*\"\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("pixi.lock"), "version: 6\n").unwrap();
+        write_dist_info(&pixi_env(&project, "default"), "conda_pkg", "1.0.0");
+        write_dist_info(&pixi_env(&project, "test"), "test_env_pkg", "2.0.0");
+
+        let server = MockServer::start().await;
+        mock_batch_empty(&server).await;
+        let mut args = default_args(&project, server.uri());
+        args.mode = Some(mode);
+        let code = scan_unactivated(args, &tmp.path().join("home")).await;
+        assert_eq!(code, 0, "{mode:?}");
+        let bodies = batch_bodies(&server).await;
+        assert_discovered(&bodies, "pkg:pypi/conda-pkg@1.0.0");
+        assert_discovered(&bodies, "pkg:pypi/test-env-pkg@2.0.0");
+    }
+}
+
+/// A pixi project with no environment installed yet has nothing installed.
+/// A `pyproject.toml` beside the pixi files (project metadata only, as
+/// pixi projects often keep one) must not send the crawl to the Python on
+/// PATH or the user-wide interpreters (here a conda root under the stubbed
+/// HOME), in any mode.
+#[tokio::test]
+#[serial]
+async fn pixi_fresh_checkout_never_scans_the_system_python() {
+    use socket_patch_cli::commands::scan::ScanMode;
+    for marker in ["pixi.toml", "pixi.lock"] {
+        for mode in [ScanMode::Agent, ScanMode::Vendored, ScanMode::Hosted] {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path().join("analysis");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(
+                project.join("pyproject.toml"),
+                "[project]\nname = \"analysis\"\nversion = \"0.1.0\"\n",
+            )
+            .unwrap();
+            std::fs::write(project.join(marker), "").unwrap();
+            let home = tmp.path().join("home");
+            let system = home
+                .join("anaconda3")
+                .join("lib")
+                .join("python3.11")
+                .join("site-packages");
+            std::fs::create_dir_all(&system).unwrap();
+            write_dist_info(&system, "system_decoy", "6.6.6");
+
+            let server = MockServer::start().await;
+            mock_batch_empty(&server).await;
+            let mut args = default_args(&project, server.uri());
+            args.mode = Some(mode);
+            let code = scan_unactivated(args, &home).await;
+            assert_eq!(code, 0, "{marker} {mode:?}");
+            assert_not_discovered(&batch_bodies(&server).await, "pkg:pypi/system-decoy@6.6.6");
+        }
+    }
+}
+
+/// A `requirements.txt` beside pixi's files is what pip installs from, so
+/// the project's packages may be in an interpreter outside pixi's
+/// environments (a container image that runs `pip install -r
+/// requirements.txt`). With no pixi environment installed, such a project
+/// still gets the crawl a requirements project has, in every mode: the
+/// packages it declares, in the interpreter on `PATH`.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn pixi_project_that_pip_also_installs_keeps_the_interpreter_crawl() {
+    use socket_patch_cli::commands::scan::ScanMode;
+    // A requirements file, or a `pyproject.toml` packaged with a build
+    // backend (a library that keeps pixi for development and is `pip
+    // install`ed elsewhere). The requirement is not pinned, so only the
+    // installed copy says which release there is to ask about.
+    let pip_files = [
+        ("requirements.txt", "image-pkg\n"),
+        (
+            "pyproject.toml",
+            "[project]\nname = \"lib\"\nversion = \"0.1.0\"\ndependencies = [\"image-pkg\"]\n\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
+        ),
+    ];
+    for ((pip_file, text), mode) in pip_files.into_iter().flat_map(|file| {
+        [ScanMode::Agent, ScanMode::Vendored, ScanMode::Hosted]
+            .into_iter()
+            .map(move |mode| (file, mode))
+    }) {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("service");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("pixi.toml"), "[workspace]\n").unwrap();
+        std::fs::write(project.join("pixi.lock"), "version: 6\n").unwrap();
+        std::fs::write(project.join(pip_file), text).unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        // The interpreter on PATH, where the image installed the project's
+        // requirements beside what it shipped with.
+        let site = tmp.path().join("system/lib/python3.12/site-packages");
+        std::fs::create_dir_all(&site).unwrap();
+        write_dist_info(&site, "image_pkg", "1.0.0");
+        write_dist_info(&site, "system_decoy", "6.6.6");
+        let bin = stub_python(tmp.path(), &site);
+
+        let server = MockServer::start().await;
+        mock_batch_empty(&server).await;
+        let mut args = default_args(&project, server.uri());
+        args.mode = Some(mode);
+        let code = scan_with_first_on_path(&bin, scan_unactivated(args, &home)).await;
+        assert_eq!(code, 0, "{pip_file} {mode:?}");
+        let bodies = batch_bodies(&server).await;
+        assert_discovered(&bodies, "pkg:pypi/image-pkg@1.0.0");
+        assert_not_discovered(&bodies, "pkg:pypi/system-decoy");
     }
 }

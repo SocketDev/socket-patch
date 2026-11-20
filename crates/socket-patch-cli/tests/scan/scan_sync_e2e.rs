@@ -650,3 +650,144 @@ async fn scan_apply_skips_vendored_purl_without_downloading() {
         "no patch view fetch for a vendored purl"
     );
 }
+
+/// A patch made from a PyPI wheel is offered for a package whose only
+/// installed copy is a compiled conda build (pixi's environment). Its
+/// Python file is the wheel's byte for byte, and the copy is still not the
+/// PyPI release: agent mode records nothing, writes nothing, says why, and
+/// exits 0, so a later `apply` has no patch it could never apply.
+#[tokio::test]
+async fn scan_agent_leaves_out_a_patch_no_conda_build_takes() {
+    let release = b"# PIL/TarIO.py as PyPI ships it\n";
+    let patched = b"after\n";
+    let base = "pkg:pypi/pillow@12.3.0";
+    let variant = "pkg:pypi/pillow@12.3.0?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl";
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": base,
+                "patches": [{
+                    "uuid": UUID, "purl": variant, "tier": "free",
+                    "cveIds": [], "ghsaIds": [], "severity": "high", "title": "conda"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(format!(
+            "^/v0/orgs/{ORG_SLUG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID, "purl": variant,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "conda", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID, "purl": variant,
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "files": { "PIL/TarIO.py": {
+                "beforeHash": git_sha256(release),
+                "afterHash": git_sha256(patched),
+                "blobContent": "YWZ0ZXIK",
+            }},
+            "vulnerabilities": {}, "description": "conda", "license": "MIT", "tier": "free",
+        })))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("pixi.toml"), "[workspace]\nname = \"a\"\n").unwrap();
+    let prefix = tmp.path().join(".pixi").join("envs").join("default");
+    std::fs::create_dir_all(prefix.join("conda-meta")).unwrap();
+    std::fs::write(prefix.join("conda-meta").join("pixi"), "{}").unwrap();
+    let site = if cfg!(windows) {
+        prefix.join("Lib").join("site-packages")
+    } else {
+        prefix.join("lib").join("python3.13").join("site-packages")
+    };
+    let dist = site.join("pillow-12.3.0.dist-info");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(
+        dist.join("METADATA"),
+        "Metadata-Version: 2.4\nName: pillow\nVersion: 12.3.0\n",
+    )
+    .unwrap();
+    std::fs::write(dist.join("INSTALLER"), "conda\n").unwrap();
+    std::fs::write(
+        dist.join("WHEEL"),
+        "Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: cp313-cp313-linux_x86_64\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(site.join("PIL")).unwrap();
+    let target = site.join("PIL").join("TarIO.py");
+    std::fs::write(&target, release).unwrap();
+
+    let out = crate::common::hermetic_command(&binary())
+        .args([
+            "scan",
+            "--json",
+            "--mode",
+            "agent",
+            "--yes",
+            "--ecosystems",
+            "pypi",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success", "envelope={v}");
+    let refused: Vec<&serde_json::Value> = v["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .filter(|w| w["code"] == "conda_build_not_pypi_release")
+        .collect();
+    assert_eq!(refused.len(), 1, "envelope={v}");
+    let detail = refused[0]["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with(base) && detail.contains("compiled conda package"),
+        "{detail}"
+    );
+    assert_eq!(v["summary"]["downloaded"], 0, "envelope={v}");
+    assert_eq!(v["summary"]["applied"], 0, "envelope={v}");
+    assert_eq!(v["summary"]["failed"], 0, "envelope={v}");
+
+    assert_eq!(std::fs::read(&target).unwrap(), release);
+    let manifest_path = tmp.path().join(".socket/manifest.json");
+    if manifest_path.exists() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest["patches"].as_object().map(|p| p.len()),
+            Some(0),
+            "manifest={manifest}"
+        );
+    }
+}

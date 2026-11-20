@@ -1724,9 +1724,10 @@ fn requirements_file_name(name: &str) -> bool {
     lower.ends_with(".txt") || lower.ends_with(".in")
 }
 
-/// Top-level directories never searched for constraint readers: installed
-/// packages and build output, not the project's own requirements.
-const NOT_READER_DIRS: &[&str] = &[
+/// Top-level directories never searched for the project's own requirements
+/// files (constraint readers here, the declared-package scope of the Python
+/// crawler): installed packages and build output.
+pub(crate) const NOT_READER_DIRS: &[&str] = &[
     "node_modules",
     "site-packages",
     "venv",

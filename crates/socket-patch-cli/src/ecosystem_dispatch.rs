@@ -49,19 +49,90 @@ pub async fn cargo_copies_still_patched<'a>(
     blobs_path: &std::path::Path,
     shadowed_registry: bool,
 ) -> Vec<String> {
-    use socket_patch_core::patch::rollback::{verify_file_rollback, VerifyRollbackStatus};
-    let cargo: Vec<String> = purls
-        .into_iter()
-        .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Cargo))
-        .filter(|p| manifest.patches.contains_key(p.as_str()))
-        .cloned()
-        .collect();
+    let cargo = manifest_purls_of(manifest, purls, Ecosystem::Cargo);
     if cargo.is_empty() {
         return Vec::new();
     }
     let found = find_cargo_copies(cargo, options, shadowed_registry).await;
+    purls_still_patched(manifest, &found, blobs_path).await
+}
+
+/// Of `purls` (manifest keys), the PyPI ones whose agent-mode in-place
+/// patch may still be on disk, judged as [`cargo_copies_still_patched`]
+/// judges a crate. Sorted.
+///
+/// A project with no environment of its own installs into an interpreter
+/// it shares with the rest of the machine, and its crawl reports only the
+/// packages it declares. A copy patched while the project declared the
+/// package, or by a release whose project crawl read every interpreter and
+/// tool environment on the machine, outlives that: nothing uninstalls it.
+/// Its manifest record holds the only before-blobs that can restore the
+/// copy, so `scan --prune` keeps the record. The copies looked up are the
+/// ones `rollback` restores (by PURL, where `options` installs) and, for a
+/// project that installs into a shared interpreter, the ones `rollback
+/// --global` restores. A project with an environment of its own never
+/// patched a copy outside it, so a same-version copy elsewhere on the
+/// machine, patched under another project's record, does not keep this
+/// project's.
+pub async fn pypi_copies_still_patched<'a>(
+    manifest: &socket_patch_core::manifest::schema::PatchManifest,
+    purls: impl IntoIterator<Item = &'a String>,
+    options: &CrawlerOptions,
+    blobs_path: &std::path::Path,
+) -> Vec<String> {
+    let pypi = manifest_purls_of(manifest, purls, Ecosystem::Pypi);
+    if pypi.is_empty() {
+        return Vec::new();
+    }
+    let partitioned = HashMap::from([(Ecosystem::Pypi, pypi)]);
+    let mut found = find_all_packages_for_rollback(&partitioned, options, true).await;
+    if PythonCrawler::new()
+        .installs_into_a_shared_interpreter(options)
+        .await
+    {
+        let machine = CrawlerOptions {
+            cwd: options.cwd.clone(),
+            global: true,
+            global_prefix: None,
+        };
+        for (purl, paths) in find_all_packages_for_rollback(&partitioned, &machine, true).await {
+            let copies = found.entry(purl).or_default();
+            for path in paths {
+                if !copies.contains(&path) {
+                    copies.push(path);
+                }
+            }
+        }
+    }
+    purls_still_patched(manifest, &found, blobs_path).await
+}
+
+/// The `purls` of `ecosystem` that `manifest` holds a record for.
+fn manifest_purls_of<'a>(
+    manifest: &socket_patch_core::manifest::schema::PatchManifest,
+    purls: impl IntoIterator<Item = &'a String>,
+    ecosystem: Ecosystem,
+) -> Vec<String> {
+    purls
+        .into_iter()
+        .filter(|p| Ecosystem::from_purl(p) == Some(ecosystem))
+        .filter(|p| manifest.patches.contains_key(p.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// The purls of `found` with a copy that may still carry its manifest
+/// record's patch: at least one file at the record's afterHash, or one that
+/// cannot be read to tell (an I/O error, an unsafe key: kept fail-closed).
+/// Sorted.
+async fn purls_still_patched(
+    manifest: &socket_patch_core::manifest::schema::PatchManifest,
+    found: &HashMap<String, Vec<PathBuf>>,
+    blobs_path: &std::path::Path,
+) -> Vec<String> {
+    use socket_patch_core::patch::rollback::{verify_file_rollback, VerifyRollbackStatus};
     let mut patched = Vec::new();
-    for (purl, paths) in &found {
+    for (purl, paths) in found {
         let Some(record) = manifest.patches.get(purl) else {
             continue;
         };
@@ -1485,6 +1556,11 @@ where
 /// entry. Each crawler reports only its own ecosystem's purls, so the
 /// selected ecosystems' packages, their order and their counts are exactly
 /// the full crawl's.
+///
+/// Every command that crawls keeps something more: `scan` the npm half
+/// ([`crawl_ecosystems_with_npm`]), `get` and `show` every installed Python
+/// package ([`crawl_ecosystems_for_name`]). This plain form is the tests'.
+#[cfg(test)]
 pub async fn crawl_ecosystems(
     options: &CrawlerOptions,
     only: Option<&[String]>,
@@ -1493,7 +1569,26 @@ pub async fn crawl_ecosystems(
     HashMap<Ecosystem, usize>,
     Option<String>,
 ) {
-    let (packages, counts, skipped_config_path, _) = crawl_every_ecosystem(options, only).await;
+    let (packages, counts, skipped_config_path, _) =
+        crawl_every_ecosystem(options, only, true).await;
+    (packages, counts, skipped_config_path)
+}
+
+/// [`crawl_ecosystems`] for resolving a package the user named
+/// (`get <name>`, `show <name>`). A Python project with no environment of its own is
+/// crawled for every package installed where it installs
+/// (`PythonCrawler::crawl_all_installed`), not only the ones it declares:
+/// the name says the package is wanted, as its PURL would.
+pub async fn crawl_ecosystems_for_name(
+    options: &CrawlerOptions,
+    only: Option<&[String]>,
+) -> (
+    Vec<CrawledPackage>,
+    HashMap<Ecosystem, usize>,
+    Option<String>,
+) {
+    let (packages, counts, skipped_config_path, _) =
+        crawl_every_ecosystem(options, only, false).await;
     (packages, counts, skipped_config_path)
 }
 
@@ -1512,7 +1607,7 @@ pub(crate) async fn crawl_ecosystems_with_npm_roots(
     Option<Vec<PathBuf>>,
 ) {
     let (packages, counts, skipped_config_path, npm_roots) =
-        crawl_every_ecosystem(options, only).await;
+        crawl_every_ecosystem(options, only, true).await;
     let npm_roots = counts.contains_key(&Ecosystem::Npm).then_some(npm_roots);
     (packages, counts, skipped_config_path, npm_roots)
 }
@@ -1548,7 +1643,7 @@ pub async fn crawl_ecosystems_with_npm(
     Option<NpmCrawlSnapshot>,
 ) {
     let (packages, counts, skipped_config_path, npm_roots) =
-        crawl_every_ecosystem(options, only).await;
+        crawl_every_ecosystem(options, only, true).await;
     let snapshot = counts
         .get(&Ecosystem::Npm)
         .map(|&npm_count| NpmCrawlSnapshot {
@@ -1670,11 +1765,24 @@ pub(crate) async fn own_install_roots(
     roots
 }
 
+/// The PyPI half of [`crawl_every_ecosystem`]: the project's packages
+/// (`declared_only`), or every package installed where it installs.
+async fn crawl_pypi(options: &CrawlerOptions, declared_only: bool) -> Vec<CrawledPackage> {
+    let crawler = PythonCrawler::new();
+    if declared_only {
+        crawler.crawl_all(options).await
+    } else {
+        crawler.crawl_all_installed(options).await
+    }
+}
+
 /// The crawl behind the entry points above; the fourth element is the npm
 /// crawler's `node_modules` roots (empty when npm was not selected).
+/// `pypi_declared_only`: see [`crawl_ecosystems_for_name`].
 async fn crawl_every_ecosystem(
     options: &CrawlerOptions,
     only: Option<&[String]>,
+    pypi_declared_only: bool,
 ) -> (
     Vec<CrawledPackage>,
     HashMap<Ecosystem, usize>,
@@ -1712,7 +1820,7 @@ async fn crawl_every_ecosystem(
                     NpmCrawler::for_options(options).crawl_all_with_roots(options)
                 )
                 .await,
-                crawl!(Ecosystem::Pypi, PythonCrawler::new().crawl_all(options)).await,
+                crawl!(Ecosystem::Pypi, crawl_pypi(options, pypi_declared_only)).await,
                 crawl!(Ecosystem::Cargo, CargoCrawler.crawl_all(options)).await,
                 crawl!(
                     Ecosystem::Gem,
@@ -1731,7 +1839,7 @@ async fn crawl_every_ecosystem(
                     Ecosystem::Npm,
                     NpmCrawler::for_options(options).crawl_all_with_roots(options)
                 ),
-                crawl!(Ecosystem::Pypi, PythonCrawler::new().crawl_all(options)),
+                crawl!(Ecosystem::Pypi, crawl_pypi(options, pypi_declared_only)),
                 crawl!(Ecosystem::Cargo, CargoCrawler.crawl_all(options)),
                 crawl!(
                     Ecosystem::Gem,

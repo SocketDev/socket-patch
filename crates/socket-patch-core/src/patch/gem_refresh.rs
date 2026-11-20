@@ -437,6 +437,7 @@ async fn refresh_installed(
             crate::patch::gem_ext::install_staged(
                 &install.gem_dir,
                 &staged_archive,
+                kind,
                 &stage.join("home"),
                 ruby,
             )
@@ -1128,5 +1129,108 @@ mod tests {
             old
         );
         assert!(!home.join(STAGE_DIR).exists());
+    }
+
+    /// The progress line of a native gem's staged build names the gem
+    /// that is built (#2152): an unwind (`rollback`, `remove`) builds the
+    /// upstream gem, and the line said "from its patched gem" for it too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_native_build_names_the_gem_it_builds() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Mutex;
+        static SAID: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        fn say(line: &str) {
+            SAID.lock().unwrap().push(line.to_string());
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        // A gem home under a Ruby prefix, whose `bin/ruby` is the Ruby
+        // asked first. This one answers the extensions-dir question for
+        // the home and "installs" into the stage home what RubyGems would.
+        let prefix = tmp.path().join("prefix");
+        let home = prefix.join("lib/ruby/gems/3.4.0");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        let fake = prefix.join("bin/ruby");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh
+             if [ \"$3\" = extensions_dir ]; then
+             printf 'sp_extensions_dir\\t%s\\n' \"$4/extensions/p/3.4.0\"
+             elif [ \"$3\" = install ]; then
+             mkdir -p \"$5/gems/rack-2.2.3/lib\" \"$5/extensions/p/3.4.0/rack-2.2.3\"
+             printf 'BUILT\\n' > \"$5/gems/rack-2.2.3/lib/rack.rb\"
+             : > \"$5/extensions/p/3.4.0/rack-2.2.3/gem.build_complete\"
+             printf 'sp_installed\\track-2.2.3\\t%s\\n' \"$5/extensions/p/3.4.0/rack-2.2.3\"
+             else exit 1; fi
+",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let native_meta = metadata("rack", "2.2.3", &["ext/rack/extconf.rb"]);
+        let old = gem_with(&native_meta, &[("lib/rack.rb", PATCHED_LIB, 0o644)]);
+        let new = gem_with(&native_meta, &[("lib/rack.rb", UPSTREAM_LIB, 0o644)]);
+        let gem_dir = install(&home, "PATCHED\n", &old);
+        std::fs::write(
+            home.join("specifications/rack-2.2.3.gemspec"),
+            "Gem::Specification.new do |s|\n  s.name = \"rack\".freeze\n  s.require_paths = \
+             [\"lib\".freeze]\n  s.extensions = [\"ext/rack/extconf.rb\".freeze]\nend\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join("extensions/p/3.4.0/rack-2.2.3")).unwrap();
+        let source = tmp.path().join("upstream.gem");
+        std::fs::write(&source, &new).unwrap();
+
+        let env = RubyEnv {
+            cwd: proj,
+            rebuild: true,
+            offline: true,
+            progress: Some(say),
+        };
+        // The unwind direction first, then the same build as a scan runs
+        // it, for the patched gem.
+        for kind in ["upstream", "patched"] {
+            let wanted = Wanted {
+                kind,
+                ..wanted(&new, &[&source])
+            };
+            let targets = [Target::Installed(gem_dir.clone())];
+            std::fs::write(gem_dir.join("lib/rack.rb"), "INSTALLED\n").unwrap();
+            // A sibling test forking while the script was being written
+            // holds its write fd until it execs: ETXTBSY (os error 26).
+            let out = loop {
+                SAID.lock().unwrap().clear();
+                let out = refresh(&wanted, &targets, &Source::DiskOnly, &env).await;
+                match &out[0] {
+                    Err(why) if why.contains("os error 26") => {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    _ => break out,
+                }
+            };
+            assert_eq!(out, [Ok(())], "{kind}");
+            assert_eq!(
+                std::fs::read(gem_dir.join("lib/rack.rb")).unwrap(),
+                b"BUILT\n",
+                "{kind}: the staged install replaces the copy"
+            );
+            let said = SAID.lock().unwrap().clone();
+            assert_eq!(said.len(), 2, "{kind}: {said:?}");
+            assert_eq!(
+                said[0],
+                format!(
+                    "Rebuilding the native extension of rack-2.2.3 from its {kind} gem; this \
+                     can take several minutes."
+                ),
+                "{kind}"
+            );
+            assert!(
+                said[1].starts_with("The build of rack-2.2.3 finished after "),
+                "{kind}: {said:?}"
+            );
+        }
     }
 }

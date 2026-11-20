@@ -1457,9 +1457,14 @@ async fn scan_ignores_ambient_virtual_env() {
     mock_batch_empty(&server).await;
 
     let decoy = tempfile::tempdir().unwrap();
-    let dist_info = decoy
-        .path()
-        .join("lib/python3.11/site-packages/decoy_pkg-9.9.9.dist-info");
+    // The venv layout the Python crawler reads on this platform (Windows
+    // has no per-version directory), so the decoy is one it would find.
+    let site_packages = if cfg!(windows) {
+        decoy.path().join("Lib").join("site-packages")
+    } else {
+        decoy.path().join("lib/python3.11/site-packages")
+    };
+    let dist_info = site_packages.join("decoy_pkg-9.9.9.dist-info");
     std::fs::create_dir_all(&dist_info).unwrap();
     std::fs::write(
         dist_info.join("METADATA"),

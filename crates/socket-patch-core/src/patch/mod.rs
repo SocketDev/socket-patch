@@ -1,5 +1,6 @@
 pub mod apply;
 pub mod apply_lock;
+pub mod conda_copy;
 // `fresh_copy`/`remove_tree` are shared by the Go redirect and the vendor backends.
 pub mod copy_tree;
 pub(crate) mod file_hash;

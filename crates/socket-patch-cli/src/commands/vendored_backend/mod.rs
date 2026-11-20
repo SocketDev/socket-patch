@@ -387,8 +387,9 @@ fn is_gem(ecosystem: &str) -> bool {
     socket_patch_core::vendor::jvm::layout::ledger_ecosystem(ecosystem) == "gem"
 }
 
-/// Name a patched `<name>-<version>.gem` left in Bundler's cache dir once
-/// the vendored ledger entry of `ecosystem` for `base_purl` is unwired: a
+/// Name each patched `<name>-<version>[-<platform>].gem` left in Bundler's
+/// cache dir once the vendored ledger entry of `ecosystem` for `base_purl`
+/// is unwired: a
 /// `bundle cache` taken while a hosted pin was live keeps it there through
 /// the takeover, and bundler installs from it again once the lock is back
 /// on upstream. The hosted unwind raises the same warning.
@@ -402,7 +403,7 @@ pub(crate) async fn push_gem_stale_cache(
     if !is_gem(ecosystem) {
         return;
     }
-    if let Some((code, detail)) =
+    for (code, detail) in
         socket_patch_core::patch::redirect::upstream::gem_stale_cache_after_unwind(
             root, base_purl, offline,
         )
