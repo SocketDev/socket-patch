@@ -7216,10 +7216,7 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
             ]);
             let (code, stdout, stderr) =
                 run_socket_env(&dir, &argv, &[("SOCKET_RUBYGEMS_URL", &upstream)]);
-            assert_eq!(
-                code, 0,
-                "{command}:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-            );
+            assert_eq!(code, 0, "{command}:\nstdout:\n{stdout}\nstderr:\n{stderr}");
             assert_eq!(
                 std::fs::read_to_string(dir.join("Gemfile.lock")).unwrap(),
                 as_committed(&pristine_lock),
@@ -7316,13 +7313,18 @@ async fn mount_vendored_platform_grant(
 ) {
     let server = &fx._server;
     let gem_of = |token: &str| {
-        let build = patched_builds.iter().find(|b| b.name == DEP && b.token == token);
+        let build = patched_builds
+            .iter()
+            .find(|b| b.name == DEP && b.token == token);
         &build.expect("build").gem
     };
     let ruby_gem = gem_of(DEP_VERSION);
     let ruby_sha = sha256_hex(ruby_gem);
     let stubs = format!("/artifacts/{UUID}");
-    let mut served = vec![(format!("{DEP}-{DEP_VERSION}.gemspec"), stub_gemspec(ruby_gem))];
+    let mut served = vec![(
+        format!("{DEP}-{DEP_VERSION}.gemspec"),
+        stub_gemspec(ruby_gem),
+    )];
     let mut artifacts = vec![
         serde_json::json!({
             "kind": "tarball", "url": hosted_url,

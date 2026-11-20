@@ -2616,7 +2616,8 @@ files to remove before `bundle install`.
 Vendoring a gem that was hosted (`vendor`, `scan --mode vendored`) leaves the installed copies as
 they are: Bundler loads the vendored copy from then on. When that vendored gem is later unwound
 (`rollback`, `remove`, `vendor --revert`), Bundler loads the installed copy again, so the unwind
-puts the upstream gem back there too. The same holds for a gem that agent mode patched in place
+puts the upstream gem back there too (for a gem locked as precompiled platform gems, the upstream
+platform gem of the build that is installed). The same holds for a gem that agent mode patched in place
 before `scan --mode vendored` (or `get --mode vendored`) took it over: the unwind reinstalls the
 upstream gem over the patched files in the project's own gem home, and warns about a copy it
 leaves (a shared gem home, `--no-gem-install-refresh`). A gem that was only ever vendored still
