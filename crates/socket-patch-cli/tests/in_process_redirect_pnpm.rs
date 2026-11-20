@@ -3600,3 +3600,389 @@ async fn hosted_pins_a_pnpm_patched_dependency_only_with_explicit_consent() {
         out.unattested[0].detail
     );
 }
+
+// ── pnpm named registries ────────────────────────────────────────────────
+
+/// The address of the one-package npm registry the patch service serves
+/// the fixture's patch under: `HOSTED_URL`'s directory.
+const REGISTRY_URL: &str = "https://patch.test/patch/npm/in-proc-redirect-pnpm/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/";
+
+/// The workspace file's declaration of that registry.
+fn registry_entry() -> String {
+    format!("  socket-patch-{UUID}: {REGISTRY_URL}\n")
+}
+
+/// [`mock_reference`] as a patch service that serves registry metadata
+/// answers it: the grant also carries the registry address.
+async fn mock_registry_reference(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                UUID: {
+                    "status": "granted",
+                    "url": HOSTED_URL,
+                    "purl": PURL,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": HOSTED_URL,
+                        "integrity": { "sha512": PATCHED_SHA512 }
+                    }],
+                    "registryOverride": null,
+                    "npmRegistryUrl": REGISTRY_URL
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// [`write_pnpm_project`] pinned to a pnpm that installs it.
+fn write_pinned_pnpm_project(root: &Path) {
+    write_pnpm_project(root);
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "packageManager": "pnpm@12.22.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+}
+
+/// A grant that carries a registry address makes the run declare the patch
+/// server as a named registry in a new pnpm-workspace.yaml: no
+/// `trustLockfile`, so pnpm's lockfile verification stays on. The file
+/// counts as rewritten, the warning says what it is for, a re-run is
+/// byte-stable, and `rollback` takes the file back out with the pin.
+#[tokio::test]
+#[serial]
+async fn hosted_declares_the_patch_server_as_a_named_registry() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_registry_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pinned_pnpm_project(tmp.path());
+    let pristine = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+
+    let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    let lock = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+    assert!(lock.contains(&format!("tarball: {HOSTED_URL}")), "{lock}");
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    let ws = std::fs::read_to_string(&ws_path).expect("the run creates pnpm-workspace.yaml");
+    assert_eq!(
+        ws,
+        format!("packages:\n  - '.'\nnamedRegistries:\n{}", registry_entry())
+    );
+    assert!(
+        doc["redirect"]["rewrittenFiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "pnpm-workspace.yaml"),
+        "{doc}"
+    );
+    let detail = doc["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "redirect_pnpm_trust_lockfile")
+        .and_then(|w| w["detail"].as_str())
+        .unwrap_or_else(|| panic!("redirect_pnpm_trust_lockfile: {doc}"));
+    assert!(
+        detail.contains("declares the patch server as a named registry")
+            && detail.contains("commit it alongside the lock")
+            && detail.contains("pnpm clean --lockfile"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains("trustLockfile") && !detail.contains("22222222-2222-4222-8222"),
+        "no trust key is written or recommended, and the grant token stays out: {detail}"
+    );
+    assert_no_ledger(tmp.path());
+
+    let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap(),
+        lock
+    );
+    assert_eq!(std::fs::read_to_string(&ws_path).unwrap(), ws);
+
+    let code = rollback_hosted(tmp.path(), &server).await;
+    assert_eq!(code, 0, "rollback must restore the pnpm pin");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap(),
+        pristine
+    );
+    assert!(
+        !ws_path.exists(),
+        "the pnpm-workspace.yaml the run created goes with the pin"
+    );
+}
+
+/// Named registries are declared only on proof of pnpm 12 or newer (pnpm
+/// 11 drops a registry-verified entry on `pnpm add`). A project pinned to
+/// pnpm 11 and one with no pnpm pin both get today's `trustLockfile`
+/// write; the unpinned one is told what a pin would change.
+#[tokio::test]
+#[serial]
+async fn hosted_named_registry_needs_a_pnpm_12_pin() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_registry_reference(&server).await;
+
+    for (package_manager, hinted) in [(None, true), (Some("pnpm@11.28.13"), false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_project(tmp.path());
+        if let Some(package_manager) = package_manager {
+            std::fs::write(
+                tmp.path().join("package.json"),
+                format!(
+                    r#"{{ "name": "consumer", "version": "0.0.0", "packageManager": "{package_manager}", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+                ),
+            )
+            .unwrap();
+        }
+        let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+        assert_eq!(code, Some(0), "{doc}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("pnpm-workspace.yaml")).unwrap(),
+            "packages:\n  - '.'\ntrustLockfile: true\n",
+            "{package_manager:?}"
+        );
+        let texts = warning_texts(&doc);
+        assert!(texts.contains("ALL lockfile entries"), "{doc}");
+        assert_eq!(
+            texts.contains(
+                "Pinning pnpm 12 or later (for example with package.json `packageManager`) \
+                 and re-running the scan switches the project to per-package registry \
+                 verification instead of `trustLockfile`"
+            ),
+            hinted,
+            "{package_manager:?}: {doc}"
+        );
+    }
+}
+
+/// `--dry-run` with a registry address: nothing lands on disk, the
+/// workspace file is reported as would-be-rewritten, and the warning says
+/// what the run would declare.
+#[tokio::test]
+#[serial]
+async fn hosted_named_registry_dry_run_writes_nothing() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_registry_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pinned_pnpm_project(tmp.path());
+    let lock_before = std::fs::read(tmp.path().join("pnpm-lock.yaml")).unwrap();
+
+    let (code, doc) = run_hosted_json_env(tmp.path(), &server.uri(), &[("SOCKET_DRY_RUN", "1")]);
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("pnpm-lock.yaml")).unwrap(),
+        lock_before
+    );
+    assert!(!tmp.path().join("pnpm-workspace.yaml").exists());
+    assert!(
+        doc["redirect"]["rewrittenFiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "pnpm-workspace.yaml"),
+        "{doc}"
+    );
+    assert!(
+        warning_texts(&doc).contains(
+            "a new pnpm-workspace.yaml would declare the patch server as a named registry"
+        ),
+        "{doc}"
+    );
+}
+
+/// In a workspace file the user wrote, the declaration is appended and
+/// every other byte kept; the alias is hosted mode's own, so `rollback`
+/// takes exactly those lines back out (no `pnpm_trust_lockfile_left`
+/// guesswork, unlike the trust key).
+#[tokio::test]
+#[serial]
+async fn hosted_named_registry_merges_into_a_users_workspace_yaml_and_rolls_back() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_registry_reference(&server).await;
+    mock_registry_version(&server, NAME, VERSION).await;
+
+    for user_ws in [
+        "# team workspace\npackages:\n  - '.'\n  - 'tools/*'\n\ncatalog:\n  react: ^18.0.0\n",
+        "packages:\r\n  - '.'\r\n  - 'tools/*'\r\n",
+        "packages:\n  - '.'\n  - 'tools/*'\nnamedRegistries:\n  corp: https://npm.corp.example/\ntrustLockfile: false\n",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pinned_pnpm_project(tmp.path());
+        let ws_path = tmp.path().join("pnpm-workspace.yaml");
+        std::fs::write(&ws_path, user_ws).unwrap();
+
+        let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+        assert_eq!(code, Some(0), "{doc}");
+        let ws = std::fs::read_to_string(&ws_path).unwrap();
+        let eol = if user_ws.contains("\r\n") { "\r\n" } else { "\n" };
+        let entry = registry_entry().replace('\n', eol);
+        let want = if user_ws.contains("namedRegistries:") {
+            user_ws.replace(
+                "  corp: https://npm.corp.example/\n",
+                &format!("  corp: https://npm.corp.example/\n{entry}"),
+            )
+        } else {
+            format!("{user_ws}namedRegistries:{eol}{entry}")
+        };
+        assert_eq!(ws, want, "{user_ws:?}");
+
+        let (code, warnings, envelope) = rollback_subprocess(tmp.path(), &server, &[]);
+        assert_eq!(code, 0, "{envelope}");
+        assert_eq!(
+            std::fs::read_to_string(&ws_path).unwrap(),
+            user_ws,
+            "rollback restores the user's file byte for byte"
+        );
+        assert!(
+            !warnings.contains(&"pnpm_trust_lockfile_left".to_string()),
+            "{envelope}"
+        );
+    }
+}
+
+/// A project an earlier run configured with `trustLockfile: true` (a patch
+/// service that served no registry then) moves to named registries on the
+/// run that has one for every pin: the trust key that run wrote goes, so
+/// pnpm verifies the whole lockfile again.
+#[tokio::test]
+#[serial]
+async fn hosted_named_registry_replaces_the_trust_key_an_earlier_run_wrote() {
+    let before = MockServer::start().await;
+    mock_discovery(&before).await;
+    mock_reference(&before).await;
+    let after = MockServer::start().await;
+    mock_discovery(&after).await;
+    mock_registry_reference(&after).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pinned_pnpm_project(tmp.path());
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+
+    let (code, doc) = run_hosted_json(tmp.path(), &before.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(
+        std::fs::read_to_string(&ws_path).unwrap(),
+        "packages:\n  - '.'\ntrustLockfile: true\n",
+        "a grant without a registry address keeps today's trust write"
+    );
+
+    let (code, doc) = run_hosted_json(tmp.path(), &after.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(
+        std::fs::read_to_string(&ws_path).unwrap(),
+        format!("packages:\n  - '.'\nnamedRegistries:\n{}", registry_entry())
+    );
+    assert!(
+        warning_texts(&doc).contains("an earlier socket-patch run wrote there was removed"),
+        "{doc}"
+    );
+
+    // `--no-trust-lockfile-config` opts out of this write as well.
+    let fresh = tempfile::tempdir().unwrap();
+    write_pinned_pnpm_project(fresh.path());
+    let (code, doc) = run_hosted_json_env(
+        fresh.path(),
+        &after.uri(),
+        &[("SOCKET_NO_TRUST_LOCKFILE_CONFIG", "1")],
+    );
+    assert_eq!(code, Some(0), "{doc}");
+    assert!(
+        !fresh.path().join("pnpm-workspace.yaml").exists(),
+        "the opt-out writes no workspace file"
+    );
+    let texts = warning_texts(&doc);
+    assert!(
+        texts.contains("`namedRegistries:`")
+            && texts.contains(&format!("socket-patch-{UUID}: "))
+            && texts.contains("<redacted>"),
+        "the opt-out warning names the lines to add: {doc}"
+    );
+}
+
+/// The registries go one patch at a time: a scoped rollback that restores
+/// the root pin while a member's own lock keeps its hosted pin removes the
+/// root pin's alias and leaves the member's.
+#[tokio::test]
+#[serial]
+async fn rollback_removes_only_the_named_registries_of_restored_pins() {
+    const OTHER: &str = "other-pkg";
+    const OTHER_VERSION: &str = "2.0.0";
+    const OTHER_UUID: &str = "33333333-3333-4333-8333-333333333333";
+    const OTHER_REGISTRY: &str = "https://patch.test/patch/npm/other-pkg/2.0.0/22222222-2222-4222-8222-222222222222/33333333-3333-4333-8333-333333333333/";
+    let other_url = format!("{OTHER_REGISTRY}other-pkg-2.0.0.tgz");
+    let server = MockServer::start().await;
+    mock_registry_version(&server, NAME, VERSION).await;
+    mock_registry_version(&server, OTHER, OTHER_VERSION).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        format!(r#"{{ "name": "root", "version": "1.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#),
+    )
+    .unwrap();
+    let user_ws = "packages:\n  - packages/*\nsharedWorkspaceLockfile: false\n";
+    let other_entry = format!("  socket-patch-{OTHER_UUID}: {OTHER_REGISTRY}\n");
+    let ws = format!(
+        "{user_ws}namedRegistries:\n{}{other_entry}",
+        registry_entry()
+    );
+    std::fs::write(root.join("pnpm-workspace.yaml"), &ws).unwrap();
+    let hosted = |url: &str| format!("{{integrity: {PATCHED_SHA512}, tarball: {url}}}");
+    std::fs::write(
+        root.join("pnpm-lock.yaml"),
+        single_dep_lock(NAME, VERSION, &hosted(HOSTED_URL)),
+    )
+    .unwrap();
+    let member = root.join("packages/a");
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        format!(r#"{{ "name": "a", "version": "1.0.0", "dependencies": {{ "{OTHER}": "{OTHER_VERSION}" }} }}"#),
+    )
+    .unwrap();
+    let member_lock = single_dep_lock(OTHER, OTHER_VERSION, &hosted(&other_url));
+    std::fs::write(member.join("pnpm-lock.yaml"), &member_lock).unwrap();
+
+    let (code, _, envelope) = rollback_subprocess(root, &server, &[PURL]);
+    assert_eq!(code, 0, "{envelope}");
+    assert!(
+        !std::fs::read_to_string(root.join("pnpm-lock.yaml"))
+            .unwrap()
+            .contains(HOSTED_URL),
+        "the root pin is restored"
+    );
+    assert_eq!(
+        std::fs::read_to_string(member.join("pnpm-lock.yaml")).unwrap(),
+        member_lock,
+        "the out-of-scope member pin is left hosted"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap(),
+        format!("{user_ws}namedRegistries:\n{other_entry}"),
+        "only the restored pin's registry goes"
+    );
+
+    // The rest of the rollback takes the map out, and the user's file is
+    // back byte for byte.
+    let (code, _, envelope) = rollback_subprocess(root, &server, &[]);
+    assert_eq!(code, 0, "{envelope}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap(),
+        user_ws
+    );
+}

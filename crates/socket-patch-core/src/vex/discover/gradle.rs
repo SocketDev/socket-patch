@@ -280,6 +280,7 @@ mod tests {
             token: TOKEN.into(),
             patch_uuid: UUID.into(),
             artifact_url: "https://patch.socket.dev/patch/maven/x.jar".into(),
+            npm_registry_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "maven2".into(),
                 index_url: format!(

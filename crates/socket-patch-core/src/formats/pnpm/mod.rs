@@ -28,11 +28,14 @@ pub(crate) mod grammar;
 pub(crate) mod hosted;
 pub(crate) mod lines;
 pub(crate) mod modules_yaml;
+pub(crate) mod named_registries;
 pub(crate) mod plan;
 mod version;
 pub(crate) mod workspace;
 
-pub use version::{matches_file_id_build_keys, root_only_workspace_breaks_add};
+pub use version::{
+    matches_file_id_build_keys, pnpm_12_pins, root_only_workspace_breaks_add, Pnpm12Pins,
+};
 
 pub use grammar::PnpmDocument;
 pub(crate) use grammar::{

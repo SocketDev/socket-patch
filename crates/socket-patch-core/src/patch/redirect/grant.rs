@@ -338,6 +338,29 @@ fn check_registry_override(ov: &RegistryOverride, origins: &[String]) -> Result<
     Ok(())
 }
 
+/// The npm registry address a grant serves `dep` under
+/// ([`DepOverride::npm_registry_url`]), when pnpm can use it: an npm
+/// grant's `http(s)` address ending in `/` that the artifact URL sits
+/// below. pnpm verifies a lock entry against the named registry whose
+/// address its tarball URL starts with, so an address the artifact URL
+/// does not start with would route nothing. Anything else reads as not
+/// served. As a prefix of the artifact URL, the address is in the shape
+/// [`check`] holds that URL to.
+pub(crate) fn npm_registry_url(dep: &DepOverride) -> Option<&str> {
+    let url = served(&dep.npm_registry_url)?;
+    let authority_and_path = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let host = authority_and_path.split('/').next().unwrap_or_default();
+    (dep.ecosystem == "npm"
+        && !host.is_empty()
+        && url.ends_with('/')
+        && url.len() < dep.artifact_url.len()
+        && dep.artifact_url.starts_with(url)
+        && url.chars().all(is_url_char))
+    .then_some(url)
+}
+
 /// Whether every field of `dep`, the override built from one grant, has
 /// the shape the rewriters write verbatim. `patch_server_origins` are the
 /// operator's own patch servers, whose plain-`http` URLs are accepted.
@@ -385,6 +408,7 @@ mod tests {
             artifact_url: format!(
                 "https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/{UUID}/left-pad-1.3.0.tgz"
             ),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha512: Some(SRI.into()),

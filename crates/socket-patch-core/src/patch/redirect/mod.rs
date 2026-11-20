@@ -277,6 +277,18 @@ pub struct DepOverride {
     pub token: String,
     pub patch_uuid: String,
     pub artifact_url: String,
+    /// The address of the one-package npm registry the patch service serves
+    /// this patch under: the directory of `artifact_url`, with its trailing
+    /// slash. `GET <address><name>` answers the package's version document,
+    /// whose `dist.tarball` is `artifact_url`; every other path under the
+    /// address is a 404, so it is only ever declared as a pnpm named
+    /// registry, never as a scope or default registry. `None` for other
+    /// ecosystems and for a patch service that serves no such document.
+    /// Read through [`grant::npm_registry_url`], which holds it to that
+    /// shape.
+    #[serde(default)]
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub npm_registry_url: Option<String>,
     #[serde(default)]
     pub registry_override: Option<RegistryOverride>,
     pub integrity: Integrity,
@@ -11685,6 +11697,7 @@ mod tests {
             token: String::new(),
             patch_uuid: "11111111-1111-4111-8111-111111111111".into(),
             artifact_url: url.into(),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha512: Some(sha512.into()),
@@ -11703,6 +11716,7 @@ mod tests {
             token: String::new(),
             patch_uuid: "11111111-1111-4111-8111-111111111111".into(),
             artifact_url: url.into(),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha256: Some(sha256.into()),
@@ -11921,6 +11935,7 @@ mod tests {
             artifact_url:
                 "https://patch.socket.dev/patch/maven/org.slf4j/slf4j-api/1.7.36/tok/uuid/slf4j-api-1.7.36.jar"
                     .into(),
+            npm_registry_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "maven2".into(),
                 index_url: "https://patch.socket.dev/patch-registry/maven/tok/uuid/maven2".into(),
@@ -14565,6 +14580,7 @@ mod tests {
             token: "tok".into(),
             patch_uuid: "uuid".into(),
             artifact_url: "https://patch.test/newtonsoft.json.13.0.3.nupkg".into(),
+            npm_registry_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "nuget-v3".into(),
                 index_url: "https://patch.test/nuget/index.json".into(),
@@ -19048,6 +19064,7 @@ mod tests {
             token: "tok".into(),
             patch_uuid: CARGO_UUID.into(),
             artifact_url: "https://patch.test/serde-1.0.190.crate".into(),
+            npm_registry_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "cargo-sparse".into(),
                 index_url: cargo_index_url(),
@@ -21418,6 +21435,7 @@ mod tests {
             token: "tok".into(),
             patch_uuid: "uuid".into(),
             artifact_url: format!("https://patch.test/{name}-{version}.gem"),
+            npm_registry_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "rubygems-compact-index".into(),
                 index_url: "https://patch.test/gem/tok/uuid/".into(),
@@ -26615,6 +26633,7 @@ snapshots:
             token: String::new(),
             patch_uuid: "44444444-4444-4444-4444-444444444444".into(),
             artifact_url: COMPOSER_ARTIFACT_URL.into(),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha1: Some(COMPOSER_SHA1.into()),
@@ -28408,6 +28427,7 @@ packages:
                 "https://patch.socket.dev/patch-registry/golang/{}/@v/v1.4.2-socketpatch.1.zip",
                 golang_socket_module()
             ),
+            npm_registry_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "goproxy".into(),
                 index_url: "https://patch.socket.dev/patch-registry/golang".into(),
@@ -33897,6 +33917,7 @@ mod python_lock_warning_tests {
             token: "11111111-1111-4111-8111-111111111111".into(),
             patch_uuid: "22222222-2222-4222-8222-222222222222".into(),
             artifact_url: "https://patch.socket.dev/requests-2.28.1-py3-none-any.whl".into(),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity::default(),
         };
@@ -33935,6 +33956,7 @@ mod python_lock_warning_tests {
             token: "11111111-1111-4111-8111-111111111111".into(),
             patch_uuid: "22222222-2222-4222-8222-222222222222".into(),
             artifact_url: "https://patch.socket.dev/six-1.16.0-py2.py3-none-any.whl".into(),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha256: Some("b".repeat(64)),
@@ -34126,6 +34148,7 @@ mod python_metadata_pairing_tests {
             token: "11111111-1111-4111-8111-111111111111".into(),
             patch_uuid: "22222222-2222-4222-8222-222222222222".into(),
             artifact_url: "https://patch.socket.dev/click-8.1.7-py3-none-any.whl".into(),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity::default(),
         }
@@ -34587,6 +34610,7 @@ mod hatch_tests {
             token: String::new(),
             patch_uuid: "test-uuid".into(),
             artifact_url: "https://patch.test/urllib3-1.26.18-py2.py3-none-any.whl".into(),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha256: Some("a".repeat(64)),
@@ -34812,6 +34836,7 @@ mod superseding_repin_tests {
             artifact_url: format!(
                 "https://patch.socket.dev/patch/pypi/six/1.16.0/{grant}/{uuid}/six-1.16.0-py2.py3-none-any.whl"
             ),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha256: Some(sha256.into()),
@@ -35008,6 +35033,7 @@ mod owned_pin_generation_matrix {
             token: "tok".into(),
             patch_uuid: uuid.into(),
             artifact_url: format!("https://patch.test/{uuid}/cfg-if-1.0.4.crate"),
+            npm_registry_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "cargo-sparse".into(),
                 index_url: format!("sparse+https://patch.test/cargo/tok-{uuid}/{uuid}/index/"),
@@ -35083,6 +35109,7 @@ mod owned_pin_generation_matrix {
             artifact_url: format!(
                 "https://patch.socket.dev/patch-registry/golang/{module}/@v/{version}.zip"
             ),
+            npm_registry_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "goproxy".into(),
                 index_url: "https://patch.socket.dev/patch-registry/golang".into(),
@@ -35172,6 +35199,7 @@ mod owned_pin_generation_matrix {
             artifact_url: format!(
                 "https://patch.socket.dev/patch/maven/org.apache.commons/commons-lang3/3.12.0/{token}/{uuid}/commons-lang3-3.12.0.jar"
             ),
+            npm_registry_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "maven2".into(),
                 index_url: format!("https://patch.socket.dev/patch-registry/maven/{token}/{uuid}/maven2"),
@@ -35539,6 +35567,7 @@ mod uv_old_release_advisories {
             token: String::new(),
             patch_uuid: "11111111-1111-4111-8111-111111111111".into(),
             artifact_url: URL.into(),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha256: Some("c".repeat(64)),
@@ -35793,6 +35822,7 @@ mod uv_dynamic_dependencies {
             token: String::new(),
             patch_uuid: "11111111-1111-4111-8111-111111111111".into(),
             artifact_url: URL.into(),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha256: Some("c".repeat(64)),

@@ -2414,7 +2414,7 @@ async fn run_redirect_selected_untracked(
                     eprintln!("{}", npm_allow_remote_one_line(detail));
                     continue;
                 } else if *code == "redirect_pnpm_trust_lockfile" && done.pnpm_rerun_only {
-                    pnpm_trust_rerun_reminder()
+                    pnpm_trust_rerun_reminder(done.pnpm_named_registries)
                 } else {
                     detail.as_ref()
                 };
@@ -2751,14 +2751,22 @@ fn render_warning(headline: &str, bullets: &[String], width: Option<usize>) -> S
     lines.join("\n")
 }
 
-/// The one-line re-run reminder that replaces the full pnpm trustLockfile
-/// guidance in human mode when this run changed nothing pnpm-related (the
-/// lock was redirected and trust configured by an earlier run, whose
+/// The one-line re-run reminder that replaces the full pnpm guidance in
+/// human mode when this run changed nothing pnpm-related (the lock was
+/// redirected and pnpm-workspace.yaml configured by an earlier run, whose
 /// output carried the full text; `--json` still carries it every time).
-fn pnpm_trust_rerun_reminder() -> &'static str {
-    "pnpm-lock.yaml already uses hosted patches and pnpm-workspace.yaml already sets \
-     `trustLockfile: true`; keep both committed, and never rebuild the lockfile \
-     (`pnpm clean --lockfile`), which discards the hosted patches"
+/// `named_registries`: the file declares the patch server as a named
+/// registry for each pin, rather than setting `trustLockfile: true`.
+fn pnpm_trust_rerun_reminder(named_registries: bool) -> &'static str {
+    if named_registries {
+        "pnpm-lock.yaml already uses hosted patches and pnpm-workspace.yaml already \
+         declares their named registries; keep both committed, and never rebuild the \
+         lockfile (`pnpm clean --lockfile`), which discards the hosted patches"
+    } else {
+        "pnpm-lock.yaml already uses hosted patches and pnpm-workspace.yaml already sets \
+         `trustLockfile: true`; keep both committed, and never rebuild the lockfile \
+         (`pnpm clean --lockfile`), which discards the hosted patches"
+    }
 }
 
 /// The stdout summary line.
@@ -3708,6 +3716,7 @@ mod tests {
             token: "tok".to_string(),
             patch_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
             artifact_url: artifact_url.to_string(),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Default::default(),
         }
@@ -5441,10 +5450,15 @@ mod tests {
 
     #[test]
     fn pnpm_rerun_reminder_keeps_the_rebuild_caution() {
-        let r = pnpm_trust_rerun_reminder();
-        assert!(r.contains("trustLockfile: true"), "{r}");
-        assert!(r.contains("pnpm clean --lockfile"), "{r}");
-        assert!(r.chars().count() < 240, "a reminder, not the wall: {r}");
+        for (named_registries, setting) in
+            [(false, "trustLockfile: true"), (true, "named registries")]
+        {
+            let r = pnpm_trust_rerun_reminder(named_registries);
+            assert!(r.contains(setting), "{r}");
+            assert!(r.contains("pnpm clean --lockfile"), "{r}");
+            assert!(r.chars().count() < 240, "a reminder, not the wall: {r}");
+        }
+        assert!(!pnpm_trust_rerun_reminder(true).contains("trustLockfile"));
     }
 
     #[test]

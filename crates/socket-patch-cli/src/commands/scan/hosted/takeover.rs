@@ -682,6 +682,7 @@ mod tests {
             token: String::new(),
             patch_uuid: "u1".into(),
             artifact_url: String::new(),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Default::default(),
         };

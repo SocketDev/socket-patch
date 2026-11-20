@@ -1,7 +1,8 @@
 //! npm-family upstream restores: package-lock.json / npm-shrinkwrap.json,
 //! yarn.lock (classic and berry), pnpm-lock.yaml, bun.lock — plus the
 //! npm-family side settings a hosted run writes (`.npmrc`
-//! `allow-remote=all`, pnpm-workspace.yaml `trustLockfile: true`).
+//! `allow-remote=all`, pnpm-workspace.yaml `trustLockfile: true` and
+//! `namedRegistries`).
 //!
 //! Every restorer rewrites ONLY entries whose resolution is a hosted URL
 //! naming one of the in-scope patch uuids; every other byte of the file is
@@ -2818,12 +2819,13 @@ async fn still_hosted(view: &mut View<'_>, rels: &[&str], ctx: &Ctx<'_>) -> bool
     false
 }
 
-/// Whether this restore put a pnpm lock the root `pnpm-workspace.yaml`
-/// trusts back on the registry and none of those locks is hosted any more.
-/// The file trusts the root lock and, under `sharedWorkspaceLockfile:
-/// false`, every member's own lock (#1268). A workspace whose member locks
-/// cannot be listed fails closed: a member lock may still need the setting.
-async fn trusted_pnpm_locks_restored(view: &mut View<'_>, ctx: &Ctx<'_>) -> bool {
+/// The pnpm locks the root `pnpm-workspace.yaml` governs, when this
+/// restore put one of them back on the registry: the root lock and, under
+/// `sharedWorkspaceLockfile: false`, every member's own lock (#1268).
+/// `None` when it restored none, or for a workspace whose member locks
+/// cannot be listed (fail closed: a member lock may still need the file's
+/// settings).
+async fn governed_pnpm_locks_restored(view: &mut View<'_>) -> Option<Vec<String>> {
     use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
     use crate::vendor::lock_inventory::ProjectView;
 
@@ -2832,25 +2834,61 @@ async fn trusted_pnpm_locks_restored(view: &mut View<'_>, ctx: &Ctx<'_>) -> bool
         .keys()
         .any(|k| k.rsplit('/').next() == Some("pnpm-lock.yaml"))
     {
-        return false;
+        return None;
     }
     let mut locks = vec!["pnpm-lock.yaml".to_string()];
     match member_locks(&ProjectView::Disk(view.root())).await {
         MemberLocks::Shared => {}
         MemberLocks::PerMember(keys) => locks.extend(keys),
-        MemberLocks::Unresolved(_) => return false,
+        MemberLocks::Unresolved(_) => return None,
     }
-    if !view.staged.keys().any(|k| locks.contains(k)) {
-        return false;
+    view.staged
+        .keys()
+        .any(|k| locks.contains(k))
+        .then_some(locks)
+}
+
+/// `ws` (the root pnpm-workspace.yaml) without the named registries of
+/// the patches no governed lock (`locks`) names any more, staged in `view`;
+/// `None` when that deleted the file. An alias stays while its patch uuid
+/// is anywhere in a governed lock, so a pin this restore could not put
+/// back keeps the registry pnpm >= 11 verifies it against. A lock that
+/// cannot be read keeps every alias.
+async fn unwind_named_registries(
+    view: &mut View<'_>,
+    workspace: &str,
+    ws: String,
+    locks: &[String],
+) -> Option<String> {
+    use crate::formats::pnpm::named_registries::{unwind, Unwound};
+
+    let mut texts = Vec::new();
+    for rel in locks {
+        match view.read(rel).await {
+            Ok(text) => texts.extend(text),
+            Err(_) => return Some(ws),
+        }
     }
-    let rels: Vec<&str> = locks.iter().map(String::as_str).collect();
-    !still_hosted(view, &rels, ctx).await
+    match unwind(&ws, &|uuid| texts.iter().any(|text| text.contains(uuid))) {
+        Unwound::Delete => {
+            view.remove(workspace);
+            None
+        }
+        Unwound::Rewrite(text) => {
+            view.write(workspace, text.clone());
+            Some(text)
+        }
+        Unwound::Unchanged => Some(ws),
+    }
 }
 
 /// Remove the `.npmrc` / pnpm-workspace.yaml a hosted run CREATED (still
 /// byte-identical to the scaffold) once no lock entry needs it; warn about
 /// the setting when the file carries other content too (the line may be
 /// the user's own, so it is never removed from a file the user wrote).
+/// The pnpm named registries hosted mode declares are its own by their
+/// alias, so each is taken out of any file once no governed lock names its
+/// patch.
 pub(crate) async fn cleanup_side_config(
     view: &mut View<'_>,
     ctx: &Ctx<'_>,
@@ -2883,36 +2921,49 @@ pub(crate) async fn cleanup_side_config(
         }
     }
 
-    if trusted_pnpm_locks_restored(view, ctx).await {
-        const WORKSPACE: &str = "pnpm-workspace.yaml";
-        if let Ok(Some(ws)) = view.read(WORKSPACE).await {
-            let lines = crate::hosted::guidance::TRUST_SCAFFOLD_LINES;
-            let created = format!("{}\n", lines.join("\n"));
-            // In either line ending: a `core.autocrlf` checkout of the
-            // created file is still that file.
-            if crate::utils::line_endings::eol_eq(ws.as_bytes(), created.as_bytes()) {
-                view.remove(WORKSPACE);
-            } else if let Some(original) =
-                crate::formats::pnpm::workspace::strip_keyless_splice(&ws, &lines)
-            {
-                // The scaffold hosted mode splices into a file with no keys
-                // (#1096): taking it back out restores the user's file.
-                view.write(WORKSPACE, original);
-            } else if ws.lines().any(|l| {
-                crate::formats::pnpm::workspace::top_level_key(l).is_some_and(|(key, value)| {
-                    key == "trustLockfile" && value.trim_matches(['\'', '"']) == "true"
-                })
-            }) {
-                result.warnings.push((
-                    "pnpm_trust_lockfile_left",
-                    format!(
-                        "{WORKSPACE} keeps `trustLockfile: true`, which hosted mode may have \
-                         added; no lock entry needs it any more, so remove the line if nothing \
-                         else does"
-                    ),
-                ));
-            }
-        }
+    const WORKSPACE: &str = "pnpm-workspace.yaml";
+    let Some(locks) = governed_pnpm_locks_restored(view).await else {
+        return;
+    };
+    let Ok(Some(ws)) = view.read(WORKSPACE).await else {
+        return;
+    };
+    // The named registries hosted mode declared, one patch at a time: an
+    // alias is ours by its name, so it goes as soon as its patch does.
+    let Some(ws) = unwind_named_registries(view, WORKSPACE, ws, &locks).await else {
+        return;
+    };
+    // `trustLockfile: true` serves every hosted entry at once, so it goes
+    // only when none of the governed locks is hosted any more.
+    let rels: Vec<&str> = locks.iter().map(String::as_str).collect();
+    if still_hosted(view, &rels, ctx).await {
+        return;
+    }
+    let lines = crate::hosted::guidance::TRUST_SCAFFOLD_LINES;
+    let created = format!("{}\n", lines.join("\n"));
+    // In either line ending: a `core.autocrlf` checkout of the created file
+    // is still that file.
+    if crate::utils::line_endings::eol_eq(ws.as_bytes(), created.as_bytes()) {
+        view.remove(WORKSPACE);
+    } else if let Some(original) =
+        crate::formats::pnpm::workspace::strip_keyless_splice(&ws, &lines)
+    {
+        // The scaffold hosted mode splices into a file with no keys
+        // (#1096): taking it back out restores the user's file.
+        view.write(WORKSPACE, original);
+    } else if ws.lines().any(|l| {
+        crate::formats::pnpm::workspace::top_level_key(l).is_some_and(|(key, value)| {
+            key == "trustLockfile" && value.trim_matches(['\'', '"']) == "true"
+        })
+    }) {
+        result.warnings.push((
+            "pnpm_trust_lockfile_left",
+            format!(
+                "{WORKSPACE} keeps `trustLockfile: true`, which hosted mode may have \
+                 added; no lock entry needs it any more, so remove the line if nothing \
+                 else does"
+            ),
+        ));
     }
 }
 

@@ -570,6 +570,7 @@ mod tests {
                 sha256: Some(HASH.into()),
                 ..Default::default()
             },
+            npm_registry_url: None,
             registry_override: None,
         }
     }
