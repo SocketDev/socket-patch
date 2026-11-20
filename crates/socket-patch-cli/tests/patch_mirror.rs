@@ -20,10 +20,14 @@
 //! Two wiremock servers stand in: one is the Socket API and the patch
 //! server (the grants name its own origin), the other the mirror.
 
+#[path = "common/envelope.rs"]
+mod envelope;
 #[path = "common/hermetic.rs"]
 mod hermetic;
 
 use std::path::Path;
+
+use envelope::warning_codes;
 
 use serial_test::serial;
 use wiremock::matchers::{header, method, path, path_regex};
@@ -302,17 +306,6 @@ fn hosted_scan(cwd: &Path, api: &MockServer, extra: &[&str], env: &[(&str, &str)
     let out = run(cmd);
     assert_eq!(out.code, Some(0), "{}\n{}", out.stdout, out.stderr);
     out
-}
-
-fn warning_codes(env: &serde_json::Value) -> Vec<String> {
-    env["warnings"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|w| w["code"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// `(action, errorCode)` of the run's event for `pkg`.

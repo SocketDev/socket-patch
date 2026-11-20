@@ -33,11 +33,15 @@
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "common/envelope.rs"]
+mod envelope;
 #[path = "common/hermetic.rs"]
 mod hermetic;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+use envelope::warning_codes;
 
 const NPM_NAME: &str = "minimist";
 const NPM_VERSION: &str = "1.2.2";
@@ -207,17 +211,6 @@ fn scan_mirrored(cwd: &Path, base: &str, authorization: Option<&str>) -> serde_j
     );
     serde_json::from_slice(&out.stdout)
         .unwrap_or_else(|e| panic!("scan did not emit JSON ({e}):\n{}", dump(&out)))
-}
-
-fn warning_codes(env: &serde_json::Value) -> Vec<String> {
-    env["warnings"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|w| w["code"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// The purls a hosted run pinned.
