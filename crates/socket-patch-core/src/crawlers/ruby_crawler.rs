@@ -6829,8 +6829,12 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let gems = home.path().join("gems");
         let gem_dir = gems.join("cassandra-web-0.5.0");
-        tokio::fs::create_dir_all(gem_dir.join("app")).await.unwrap();
-        tokio::fs::write(gem_dir.join("app.rb"), b"# app").await.unwrap();
+        tokio::fs::create_dir_all(gem_dir.join("app"))
+            .await
+            .unwrap();
+        tokio::fs::write(gem_dir.join("app.rb"), b"# app")
+            .await
+            .unwrap();
         let specs = home.path().join("specifications");
         tokio::fs::create_dir_all(&specs).await.unwrap();
 
@@ -6842,11 +6846,17 @@ mod tests {
             global_prefix: Some(gems.clone()),
         };
         assert!(!crawler.verify_gem_at_path(&gem_dir).await);
-        assert!(crawler.find_by_purls(&gems, &purls).await.unwrap().is_empty());
+        assert!(crawler
+            .find_by_purls(&gems, &purls)
+            .await
+            .unwrap()
+            .is_empty());
         assert!(crawler.crawl_all(&options).await.is_empty());
 
         // A default gem's spec does not make its executables-only dir a copy.
-        tokio::fs::create_dir_all(specs.join("default")).await.unwrap();
+        tokio::fs::create_dir_all(specs.join("default"))
+            .await
+            .unwrap();
         tokio::fs::write(
             specs.join("default").join("cassandra-web-0.5.0.gemspec"),
             b"# default spec",
@@ -6854,7 +6864,11 @@ mod tests {
         .await
         .unwrap();
         assert!(!crawler.verify_gem_at_path(&gem_dir).await);
-        assert!(crawler.find_by_purls(&gems, &purls).await.unwrap().is_empty());
+        assert!(crawler
+            .find_by_purls(&gems, &purls)
+            .await
+            .unwrap()
+            .is_empty());
         assert!(crawler.crawl_all(&options).await.is_empty());
 
         tokio::fs::write(specs.join("cassandra-web-0.5.0.gemspec"), b"# spec")

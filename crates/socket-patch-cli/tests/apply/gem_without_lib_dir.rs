@@ -19,7 +19,8 @@ use crate::common::git_sha256;
 const PURL: &str = "pkg:gem/cassandra-web@0.5.0";
 const LEAF: &str = "cassandra-web-0.5.0";
 const ORIGINAL: &[u8] = b"class App < Sinatra::Base\n  disable :protection\nend\n";
-const PATCHED: &[u8] = b"class App < Sinatra::Base\n  set :protection, :except => [:json_csrf]\nend\n";
+const PATCHED: &[u8] =
+    b"class App < Sinatra::Base\n  set :protection, :except => [:json_csrf]\nend\n";
 
 /// The gem home `<root>/vendor/bundle/ruby/3.4.0` holding `gems/<LEAF>/app.rb`
 /// (and nothing else in the gem dir), with `specifications/<LEAF>.gemspec`
