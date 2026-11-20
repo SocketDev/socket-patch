@@ -26,7 +26,7 @@ use socket_patch_core::utils::purl::normalize_purl;
 use socket_patch_core::utils::target::{Target, TargetKind};
 
 use crate::args::{apply_env_toggles, GlobalArgs};
-use crate::ecosystem_dispatch::{crawl_ecosystems, installed_target_matches};
+use crate::ecosystem_dispatch::{crawl_ecosystems_for_name, installed_target_matches};
 use crate::ui::diff::{file_diff, FileDiff};
 use crate::ui::{self, plural, select_one, Style};
 
@@ -587,8 +587,12 @@ async fn candidates(args: &ShowArgs, target: &Target, client: &ApiClient) -> Res
         TargetKind::Ghsa => client.search_patches_by_ghsa(target.as_str()).await,
         TargetKind::Purl => client.search_patches_by_package(target.as_str()).await,
         TargetKind::Uuid | TargetKind::Name => {
+            // A name resolves among every installed package, as `get`
+            // resolves it: a Python project with no environment of its own
+            // is otherwise crawled only for the packages it declares.
             let only = args.common.ecosystems.as_deref().filter(|l| !l.is_empty());
-            let (packages, _, _) = crawl_ecosystems(&args.common.crawler_options(), only).await;
+            let (packages, _, _) =
+                crawl_ecosystems_for_name(&args.common.crawler_options(), only).await;
             let matched = installed_target_matches(target, &packages);
             if matched.is_empty() {
                 return Err(Lookup::Target(format!(

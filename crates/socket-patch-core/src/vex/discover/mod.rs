@@ -3142,22 +3142,81 @@ async fn foreign_hosted_url_in_files(
         let Ok(text) = crate::utils::fs::read_regular_to_string(&root.join(&file)).await else {
             continue;
         };
-        for token in url_tokens_around(&text, uuid) {
-            let schemed;
-            let url = if token.contains("://") || token.contains("%3A%2F%2F") {
-                token
-            } else {
-                schemed = format!("https://{token}");
-                &schemed
-            };
-            if crate::origin::hosted_patch_uuid(url, origins).as_deref() != Some(uuid)
-                && crate::origin::hosted_shape_uuid(url).as_deref() == Some(uuid)
-            {
-                return true;
-            }
+        if foreign_hosted_host_in_text(&text, uuid, origins).is_some() {
+            return true;
         }
     }
     false
+}
+
+/// The host of the first url in `text` that has the hosted shape for `uuid`
+/// on an origin that is neither Socket's patch server nor one of `origins`
+/// (the test [`foreign_hosted_url_in_files`] applies to each file): where a
+/// pin of that patch routes to when this run was not given its host — a
+/// patch mirror or a staging server left out of the run's settings, or a
+/// look-alike. `None` when every url naming the uuid is on an accepted
+/// origin, or names it in no hosted shape.
+pub fn foreign_hosted_host_in_text(text: &str, uuid: &str, origins: &[String]) -> Option<String> {
+    if !is_canonical_uuid(uuid) || !text.contains(uuid) {
+        return None;
+    }
+    for token in url_tokens_around(text, uuid) {
+        // An older composer.lock escapes every slash (`https:\/\/…`): the
+        // url is the unescaped text. Read escaped, it has no `://`, and the
+        // scheme-less branch below would take `https` for its host.
+        let token = token.replace("\\/", "/");
+        // A lock may spell the url inside a specifier (`name@https://…`, as
+        // bun and yarn berry key a tarball dependency): the url starts at
+        // its scheme.
+        let token = from_scheme(&token);
+        let schemed;
+        let url = if token.contains("://") || token.contains("%3A%2F%2F") {
+            token
+        } else {
+            schemed = format!("https://{token}");
+            &schemed
+        };
+        if crate::origin::hosted_patch_uuid(url, origins).as_deref() != Some(uuid)
+            && crate::origin::hosted_shape_uuid(url).as_deref() == Some(uuid)
+        {
+            return Some(
+                crate::origin::hosted_shape_host(url).unwrap_or_else(|| "another host".to_string()),
+            );
+        }
+    }
+    None
+}
+
+/// The host of the first url in `text` that is a hosted reference to `uuid`
+/// on Socket's patch server or one of `origins`: where the project pins
+/// that patch, when it pins it on a host the caller names. `None` when no
+/// url naming the uuid is one.
+pub fn hosted_host_in_text(text: &str, uuid: &str, origins: &[String]) -> Option<String> {
+    if !is_canonical_uuid(uuid) || !text.contains(uuid) {
+        return None;
+    }
+    url_tokens_around(text, uuid)
+        .into_iter()
+        .map(|token| token.replace("\\/", "/"))
+        .map(|token| from_scheme(&token).to_string())
+        .filter(|token| token.contains("://") || token.contains("%3A%2F%2F"))
+        .find(|url| crate::origin::hosted_patch_uuid(url, origins).as_deref() == Some(uuid))
+        .map(|url| {
+            crate::origin::hosted_shape_host(&url).unwrap_or_else(|| "the patch server".to_string())
+        })
+}
+
+/// `token` from the scheme of the url it holds (`name@https://host/…` is
+/// `https://host/…`; a Cargo `sparse+https://…` keeps its source kind), or
+/// `token` itself when it holds no `://`.
+fn from_scheme(token: &str) -> &str {
+    let Some(at) = token.find("://") else {
+        return token;
+    };
+    let start = token[..at]
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-')))
+        .map_or(0, |i| i + 1);
+    &token[start..]
 }
 
 /// The url-shaped token around each occurrence of `needle` in `text`:

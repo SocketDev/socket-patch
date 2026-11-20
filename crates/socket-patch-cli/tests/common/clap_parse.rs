@@ -63,6 +63,7 @@ pub fn global_defaults() -> Globals {
         maven_config: None,
         vendor_url: None,
         patch_server_url: None,
+        patch_mirror_url: None,
         offline: false,
         strict: false,
         allow_patch_conflicts: false,

@@ -66,8 +66,9 @@ and no Socket token. POSIX only.
 - **Conda builds that are not the PyPI release.** A conda build takes a patch only
   as the pure-Python PyPI release it repackages (see
   [PyPI: pixi projects](../ecosystems.md#pypi-pixi-projects)). The backtest patches a
-  pure-Python package; the refusals (a compiled build, a replaced file that differs,
-  `--force`) are covered without pixi by `patch::conda_copy`'s unit tests, the
+  pure-Python package; the skip of a compiled build (not supported yet) and the
+  refusals (a replaced file that differs, a platform wheel's record, `--force`) are
+  covered without pixi by `patch::conda_copy`'s unit tests, the
   `apply` suite (`e2e_safety_advisories`) and the `scan` suite (`scan_sync_e2e`).
 - **conda packages that are not Python distributions** (OpenSSL, libxml2, the
   `ca-certificates` bundle) are outside what socket-patch patches.

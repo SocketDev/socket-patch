@@ -19,14 +19,16 @@ use socket_patch_core::crawlers::ruby_crawler::{
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::ledgers::merge_ledger_records_for_updates;
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::telemetry::{track_patch_scan_failed, track_patch_scanned, TelemetryAuth};
+use socket_patch_core::telemetry::{
+    track_patch_scan_failed, track_patch_scanned, ScanReport, TelemetryAuth,
+};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl};
 use socket_patch_core::utils::purl_key::{canonical_base_purl, PurlKey};
 use socket_patch_core::vendor::lock_inventory::unsupported_layout_warnings;
 use socket_patch_core::vendor::{purl_keys_cover, VendorState};
 use socket_patch_core::vex::discover::{LedgerLiveness, WiringMode};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::args::{apply_env_toggles, GlobalArgs};
@@ -42,8 +44,7 @@ use crate::json_envelope::{
 use crate::ui::{self, plural, print_json, StatusLine};
 
 use crate::commands::agent_download::{
-    download_and_apply_patches_into, download_and_apply_patches_with, DownloadParams, DownloadRun,
-    ALREADY_IN_MANIFEST,
+    download_and_apply_patches_into, DownloadParams, DownloadRun, ALREADY_IN_MANIFEST,
 };
 
 use self::policy::{load_invocation_policy, InvocationPolicy, PolicyLoadError, ScanPolicy};
@@ -945,6 +946,7 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs: args.mode != Some(ScanMode::Vendored),
         patch_server_url: args.common.patch_server_url.clone(),
+        patch_mirror_url: args.common.patch_mirror_url.clone(),
     }
 }
 
@@ -1603,15 +1605,21 @@ fn emit_scan_error(common: &GlobalArgs, error: EnvelopeError) {
     emit_scan(&env);
 }
 
-/// The ecosystems `purls` span, by CLI name, sorted and deduplicated.
-fn scanned_ecosystems(purls: &[String]) -> Vec<String> {
-    purls
-        .iter()
-        .filter_map(|purl| Ecosystem::from_purl(purl))
-        .map(|eco| eco.cli_name().to_string())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect()
+/// `(purl, n)` pairs summed per ecosystem, by CLI name: how many packages
+/// (or patches) of each ecosystem a scan found. An ecosystem with nothing
+/// has no entry; a purl of no known ecosystem is not counted.
+fn count_by_ecosystem<'a>(
+    counts: impl Iterator<Item = (&'a String, usize)>,
+) -> BTreeMap<String, usize> {
+    let mut by_ecosystem = BTreeMap::new();
+    for (purl, n) in counts {
+        if let Some(ecosystem) = Ecosystem::from_purl(purl).filter(|_| n > 0) {
+            *by_ecosystem
+                .entry(ecosystem.cli_name().to_string())
+                .or_default() += n;
+        }
+    }
+    by_ecosystem
 }
 
 pub async fn run(args: ScanArgs) -> i32 {
@@ -2564,6 +2572,14 @@ async fn scan_project(
         let err = crate::json_envelope::manifest_load_error(&manifest_path, e);
         if apply {
             status.finish();
+            track_patch_scan_failed(
+                &err.code,
+                &err.message,
+                false,
+                ScanMode::Agent.cli_name(),
+                &telemetry_auth,
+            )
+            .await;
             if args.common.json {
                 emit_scan_error(&args.common, err);
             } else {
@@ -2914,6 +2930,18 @@ async fn scan_project(
                 projects_left_warnings(&left),
             );
         }
+        // The prune is skipped on an empty crawl, so no record is dropped
+        // here. A recorded PyPI patch can still be on disk in a copy this
+        // scan no longer reaches, and its warning is what names the
+        // `rollback` that restores it.
+        if prune && !hosted {
+            layout_refusals.extend(
+                gc::kept_pypi_patch_warnings(&args.common, &manifest_path, &socket_dir)
+                    .await
+                    .into_iter()
+                    .map(|(code, detail)| (code.to_string(), detail)),
+            );
+        }
         status.finish();
         if human {
             print_layout_refusals(&layout_refusals, &project_patch_notice, args.common.silent);
@@ -2939,14 +2967,17 @@ async fn scan_project(
         }
         // Telemetry: empty-scan still counts as a successful scan.
         track_patch_scanned(
-            0,
-            0,
-            0,
-            false,
-            &[],
-            false,
-            requested_mode,
-            &project_modes,
+            ScanReport {
+                packages_by_ecosystem: &BTreeMap::new(),
+                patches_by_ecosystem: &BTreeMap::new(),
+                free_patches: 0,
+                paid_patches: 0,
+                can_access_paid: false,
+                fallback_to_proxy: false,
+                mode: requested_mode,
+                project_modes: &project_modes,
+                dry_run: args.common.dry_run,
+            },
             &telemetry_auth,
         )
         .await;
@@ -3027,14 +3058,32 @@ async fn scan_project(
                     )
                 );
             } else if !policy.root_excluded() {
-                println!(
-                    "{}",
-                    render::no_packages_message(
-                        args.common.is_global(),
-                        args.common.ecosystems.as_deref(),
-                        &args.paths,
-                    )
-                );
+                // Nothing was crawled at all, yet the Python on PATH holds
+                // packages the project does not declare: say that they
+                // were left out, not that nothing is installed.
+                let undeclared = if scanned_purls.is_empty()
+                    && args.paths.is_empty()
+                    && !args.common.is_global()
+                    && args.common.ecosystem_selected(Ecosystem::Pypi)
+                {
+                    socket_patch_core::crawlers::PythonCrawler::new()
+                        .undeclared_installed(&crawler_options)
+                        .await
+                } else {
+                    0
+                };
+                if undeclared > 0 {
+                    println!("{}", render::no_declared_python_packages(undeclared));
+                } else {
+                    println!(
+                        "{}",
+                        render::no_packages_message(
+                            args.common.is_global(),
+                            args.common.ecosystems.as_deref(),
+                            &args.paths,
+                        )
+                    );
+                }
             }
             policy.print_human(args.common.silent, args.common.verbose);
         }
@@ -3290,7 +3339,14 @@ async fn scan_project(
     if total_batches > 0 && batch_error_count == total_batches {
         status.finish();
         let err = last_batch_error.unwrap_or_else(|| "all batches failed".to_string());
-        track_patch_scan_failed(&err, fallback_to_proxy, &telemetry_auth).await;
+        track_patch_scan_failed(
+            API_BATCH_FAILED,
+            &err,
+            fallback_to_proxy,
+            requested_mode,
+            &telemetry_auth,
+        )
+        .await;
         if args.common.json {
             let mut env = scan_envelope(&args.common);
             env.set_extra("scannedPackages", serde_json::json!(package_count));
@@ -3345,6 +3401,14 @@ async fn scan_project(
         .as_ref()
         .and_then(|sweep| sweep.half_restored().map(str::to_string))
     {
+        track_patch_scan_failed(
+            "lockfile_write_failed",
+            &why,
+            fallback_to_proxy,
+            requested_mode,
+            &telemetry_auth,
+        )
+        .await;
         if args.common.json {
             let mut env = scan_envelope(&args.common);
             env.set_extra("scannedPackages", serde_json::json!(package_count));
@@ -3383,14 +3447,21 @@ async fn scan_project(
     // ecosystems the crawl actually found (not the `--ecosystems` filter,
     // which is empty on a default run).
     track_patch_scanned(
-        package_count,
-        free_patches,
-        paid_patches,
-        can_access_paid_patches,
-        &scanned_ecosystems(&all_purls),
-        fallback_to_proxy,
-        requested_mode,
-        &project_modes,
+        ScanReport {
+            packages_by_ecosystem: &count_by_ecosystem(all_purls.iter().map(|purl| (purl, 1))),
+            patches_by_ecosystem: &count_by_ecosystem(
+                all_packages_with_patches
+                    .iter()
+                    .map(|pkg| (&pkg.purl, pkg.patches.len())),
+            ),
+            free_patches,
+            paid_patches,
+            can_access_paid: can_access_paid_patches,
+            fallback_to_proxy,
+            mode: requested_mode,
+            project_modes: &project_modes,
+            dry_run: args.common.dry_run,
+        },
         &telemetry_auth,
     )
     .await;
@@ -4280,10 +4351,14 @@ async fn scan_project(
         // record and the nested apply re-applies them (a no-op on disk
         // when the installed copy is still patched).
         let to_download: Vec<_> = selected.iter().chain(&already_recorded).cloned().collect();
-        let (code, outcome) = download_and_apply_patches_with(
+        // Into a scan envelope (never printed here): the engine reports
+        // its telemetry under the command whose envelope it fills.
+        let mut outcome = scan_envelope(&args.common);
+        let code = download_and_apply_patches_into(
             &to_download,
             &params,
             &download_run(&args, &api_client),
+            &mut outcome,
         )
         .await;
         // Under the apply's result line: one row per package it left

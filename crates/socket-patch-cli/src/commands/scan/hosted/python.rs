@@ -22,7 +22,9 @@ enum Evidence<'a> {
     /// The patched wheel the lock now pins, fetched on the first installed
     /// copy found (`Some(None)` once that fetch failed).
     Wheel {
-        dep: &'a DepOverride,
+        /// Where the patch server serves the wheel: the lock's own URL,
+        /// unless the lock pins it through a patch mirror.
+        fetch_url: &'a str,
         sha256: &'a str,
         fetched: Option<Option<WheelRecord>>,
     },
@@ -41,13 +43,12 @@ impl Evidence<'_> {
         match self {
             Evidence::Local(record) => Some(judge_installed_record(site, record).await),
             Evidence::Wheel {
-                dep,
+                fetch_url,
                 sha256,
                 fetched,
             } => {
                 if fetched.is_none() {
-                    *fetched =
-                        Some(fetch_patched_wheel_record(api, &dep.artifact_url, sha256).await);
+                    *fetched = Some(fetch_patched_wheel_record(api, fetch_url, sha256).await);
                 }
                 match fetched {
                     Some(Some(record)) => judge_installed_wheel(site, record).await,
@@ -96,6 +97,9 @@ pub(super) async fn stale_install_warnings(
     pipenv_lock: Option<&str>,
     // The overrides the rewrite pinned: each patch's wheel URL and sha256.
     overrides: &[DepOverride],
+    // Where a wheel pinned through a patch mirror is served from: the
+    // run's own downloads read the patch server.
+    mirror_sources: &socket_patch_core::hosted::engine::MirrorSources,
     // The agent-mode manifest's records, looked up by uuid.
     local_records: &BTreeMap<String, PatchRecord>,
     views: &mut ViewFallback<'_>,
@@ -126,7 +130,7 @@ pub(super) async fn stale_install_warnings(
                             .is_some_and(|path| path.ends_with(".whl"))
                 })?;
                 Some(Evidence::Wheel {
-                    dep,
+                    fetch_url: mirror_sources.fetch_artifact_url(&dep.artifact_url),
                     sha256: dep.integrity.sha256.as_deref()?,
                     fetched: None,
                 })
@@ -382,6 +386,7 @@ mod tests {
             &BTreeSet::new(),
             None,
             &[],
+            &socket_patch_core::hosted::engine::MirrorSources::default(),
             &ledger,
             &mut ViewFallback::offline(),
         )
@@ -407,6 +412,7 @@ mod tests {
             &BTreeSet::new(),
             None,
             &[],
+            &socket_patch_core::hosted::engine::MirrorSources::default(),
             &ledger,
             &mut ViewFallback::offline(),
         )
@@ -455,6 +461,7 @@ mod tests {
             &BTreeSet::new(),
             None,
             &[],
+            &socket_patch_core::hosted::engine::MirrorSources::default(),
             &ledger,
             &mut ViewFallback::offline(),
         )
@@ -477,6 +484,7 @@ mod tests {
             &BTreeSet::new(),
             None,
             &[],
+            &socket_patch_core::hosted::engine::MirrorSources::default(),
             &ledger,
             &mut ViewFallback::offline(),
         )
@@ -510,6 +518,7 @@ mod tests {
             &BTreeSet::new(),
             None,
             &[],
+            &socket_patch_core::hosted::engine::MirrorSources::default(),
             &ledger,
             &mut ViewFallback::offline(),
         )
@@ -552,6 +561,7 @@ mod tests {
             &BTreeSet::new(),
             None,
             &[],
+            &socket_patch_core::hosted::engine::MirrorSources::default(),
             &ledger,
             &mut ViewFallback::offline(),
         )
@@ -599,6 +609,7 @@ mod tests {
             &pipenv,
             Some(text),
             &[],
+            &socket_patch_core::hosted::engine::MirrorSources::default(),
             &ledger,
             &mut ViewFallback::offline(),
         )
@@ -648,6 +659,7 @@ mod tests {
             &pipenv,
             Some(docs),
             &[],
+            &socket_patch_core::hosted::engine::MirrorSources::default(),
             &ledger,
             &mut ViewFallback::offline(),
         )
@@ -723,6 +735,7 @@ mod tests {
             &pipenv,
             Some(lock),
             &[],
+            &socket_patch_core::hosted::engine::MirrorSources::default(),
             &ledger,
             &mut ViewFallback::offline(),
         )
@@ -763,6 +776,7 @@ mod tests {
             &pipenv,
             Some(lock),
             &[],
+            &socket_patch_core::hosted::engine::MirrorSources::default(),
             &ledger,
             &mut ViewFallback::offline(),
         )
@@ -793,6 +807,7 @@ mod tests {
             &pipenv,
             Some(lock),
             &[],
+            &socket_patch_core::hosted::engine::MirrorSources::default(),
             &ledger,
             &mut ViewFallback::offline(),
         )
@@ -821,6 +836,7 @@ mod tests {
             &pipenv,
             Some(lock),
             &[],
+            &socket_patch_core::hosted::engine::MirrorSources::default(),
             &ledger,
             &mut ViewFallback::offline(),
         )
@@ -971,6 +987,7 @@ mod tests {
                 &BTreeSet::new(),
                 None,
                 &self.overrides,
+                &socket_patch_core::hosted::engine::MirrorSources::default(),
                 &BTreeMap::new(),
                 &mut views,
             )

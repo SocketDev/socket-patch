@@ -103,6 +103,16 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
         ("--patch-server-url", Some("http://localhost:4026"), |c| {
             assert_eq!(c.patch_server_url.as_deref(), Some("http://localhost:4026"))
         }),
+        (
+            "--patch-mirror-url",
+            Some("https://repo.example/artifactory/socket-patch"),
+            |c| {
+                assert_eq!(
+                    c.patch_mirror_url.as_deref(),
+                    Some("https://repo.example/artifactory/socket-patch")
+                )
+            },
+        ),
         ("--offline", None, |c| assert!(c.offline)),
         ("--strict", None, |c| assert!(c.strict)),
         ("--allow-patch-conflicts", None, |c| {
@@ -258,6 +268,7 @@ fn global_flag_cases_cover_every_global_field() {
         vendor_source: _,
         vendor_url: _,
         patch_server_url: _,
+        patch_mirror_url: _,
         maven_config: _,
     } = common;
 
@@ -459,6 +470,10 @@ fn env_vars_populate_global_args() {
         ("SOCKET_VENDOR_SOURCE", "service"),
         ("SOCKET_VENDOR_URL", "https://env-vendor.example.com"),
         ("SOCKET_PATCH_SERVER_URL", "http://localhost:4026"),
+        (
+            "SOCKET_PATCH_MIRROR_URL",
+            "https://repo.example/artifactory/socket-patch",
+        ),
         ("SOCKET_OFFLINE", "true"),
         ("SOCKET_STRICT", "true"),
         ("SOCKET_GLOBAL", "true"),
@@ -499,6 +514,10 @@ fn env_vars_populate_global_args() {
         assert_eq!(
             args.common.patch_server_url.as_deref(),
             Some("http://localhost:4026")
+        );
+        assert_eq!(
+            args.common.patch_mirror_url.as_deref(),
+            Some("https://repo.example/artifactory/socket-patch")
         );
         assert!(args.common.offline);
         assert!(args.common.strict);
@@ -689,6 +708,7 @@ fn empty_nonbool_env_vars_do_not_crash_the_binary() {
         "SOCKET_VENDOR_SOURCE",
         "SOCKET_VENDOR_URL",
         "SOCKET_PATCH_SERVER_URL",
+        "SOCKET_PATCH_MIRROR_URL",
     ] {
         cmd.env(var, "");
     }

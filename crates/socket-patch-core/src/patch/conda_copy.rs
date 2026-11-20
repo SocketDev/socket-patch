@@ -18,7 +18,9 @@
 //!
 //! - the patch is not for a platform wheel, and the copy holds no compiled
 //!   code: its `WHEEL` metadata says so, or, for an install without one,
-//!   no extension module is among its files. A compiled conda package is
+//!   the conda package's record in `conda-meta` lists no shared library
+//!   among its files (with no such record, no extension module is among
+//!   the files of its top-level modules). A compiled conda package is
 //!   never the PyPI wheel, whatever its Python files hash to;
 //! - every file the patch replaces has the release's bytes (or the bytes a
 //!   Socket patch wrote), and the patch replaces at least one file, so
@@ -27,6 +29,11 @@
 //! No flag overrides this: `--force` and `--allow-patch-conflicts` consent
 //! to overwriting local changes to the distribution a patch was made for,
 //! not to writing one distribution's files into another.
+//!
+//! A compiled conda package is not supported yet. The engine writes
+//! nothing to one, and the commands treat it as skipped, not as failed
+//! (see [`CondaBuild::unsupported`]): `scan` and `get` leave its patch
+//! out, and `apply` passes over the copy, each with a warning.
 //!
 //! What is not compared: the files the patch leaves alone. Their hashes in
 //! the PyPI release are not in a patch record, so a conda recipe that
@@ -64,6 +71,25 @@ pub struct CondaBuild {
     evidence: &'static str,
 }
 
+impl CondaBuild {
+    /// Why no patch is applied to this build in `site_packages`, whatever
+    /// the patch: it holds compiled code, and a compiled conda package is
+    /// not supported yet. `None` for a build that is, or may be, pure
+    /// Python. A command reports this as a skip of the copy, with a
+    /// warning, and never as a failure.
+    pub fn unsupported(&self, site_packages: &Path) -> Option<String> {
+        (self.compiled == Some(true)).then(|| {
+            format!(
+                "{REFUSAL_CODE}: conda built the copy in {} with compiled code ({}), and \
+                 compiled conda packages are not supported yet, so it was skipped and is not \
+                 patched",
+                site_packages.display(),
+                self.evidence
+            )
+        })
+    }
+}
+
 /// The conda build behind the installed copy of `purl` in `site_packages`,
 /// or `None` when the copy is not one: not a PyPI package, not in a conda
 /// prefix, or installed by pip or uv (its `INSTALLER` names something
@@ -75,7 +101,7 @@ pub async fn conda_build(purl: &str, site_packages: &Path) -> Option<CondaBuild>
     if Ecosystem::from_purl(purl) != Some(Ecosystem::Pypi) {
         return None;
     }
-    conda_prefix_of(site_packages)?;
+    let prefix = conda_prefix_of(site_packages)?;
     let unknown = Some(CondaBuild {
         compiled: None,
         evidence: "its metadata was not found",
@@ -102,11 +128,91 @@ pub async fn conda_build(purl: &str, site_packages: &Path) -> Option<CondaBuild>
             compiled: Some(!purelib),
             evidence: "its WHEEL metadata says Root-Is-Purelib: false",
         },
-        None => CondaBuild {
-            compiled: Some(holds_extension_modules(site_packages, &metadata, &name).await),
-            evidence: "it holds extension modules",
+        // No `WHEEL` (an `.egg-info` install). The conda package's own
+        // file list says what it ships; without one, the files beside the
+        // metadata are looked at.
+        None => match conda_record_ships_shared_library(prefix, &metadata).await {
+            Some(ships) => CondaBuild {
+                compiled: Some(ships),
+                evidence: "its conda package ships shared libraries",
+            },
+            None => CondaBuild {
+                compiled: Some(holds_extension_modules(site_packages, &metadata, &name).await),
+                evidence: "it holds extension modules",
+            },
         },
     })
+}
+
+/// Whether the conda package that owns `metadata` (a copy's `.dist-info`
+/// or `.egg-info`, a directory or a file) ships a shared library, read
+/// from the package's record in `prefix`'s `conda-meta`. conda, mamba and
+/// pixi write one record per package they link, with the list of its
+/// files, so this says which files are the package's own: a shared
+/// library in a namespace package another distribution also installs into
+/// is not, and one in a top-level module the metadata does not name is.
+/// `None` when no record lists the copy's metadata, or none could be read.
+async fn conda_record_ships_shared_library(prefix: &Path, metadata: &Path) -> Option<bool> {
+    // Records list real paths from the prefix. A site-packages reached
+    // through a link (conda's `lib/python3.1 -> python3.13`) is the same
+    // directory, so both ends are resolved first.
+    let real_prefix = tokio::fs::canonicalize(prefix)
+        .await
+        .unwrap_or_else(|_| prefix.to_path_buf());
+    let real_metadata = tokio::fs::canonicalize(metadata)
+        .await
+        .unwrap_or_else(|_| metadata.to_path_buf());
+    // conda writes the paths `/`-separated on every platform; a record
+    // written with the platform's separator (`\`, escaped in JSON) is
+    // read the same way.
+    let owned: String = real_metadata
+        .strip_prefix(&real_prefix)
+        .ok()?
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    if owned.is_empty() {
+        return None;
+    }
+    let below = format!("{owned}/");
+    let owned_escaped = owned.replace('/', "\\\\");
+    for entry in list_dir_entries(&prefix.join("conda-meta")).await {
+        if !entry.file_name().to_string_lossy().ends_with(".json") {
+            continue;
+        }
+        let Ok(text) = read_regular_to_string(&entry.path()).await else {
+            continue;
+        };
+        // Most records are another package's: skip them without parsing.
+        if !text.contains(owned.as_str()) && !text.contains(owned_escaped.as_str()) {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let files: Vec<String> = record
+            .get("files")
+            .and_then(|files| files.as_array())
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(|file| file.as_str())
+                    .map(|file| file.replace('\\', "/"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if files
+            .iter()
+            .any(|file| *file == owned || file.starts_with(&below))
+        {
+            return Some(files.iter().any(|file| {
+                let name = file.rsplit('/').next().unwrap_or(file);
+                is_shared_library(name) || is_versioned_shared_library(name)
+            }));
+        }
+    }
+    None
 }
 
 /// [`static_refusal_for`] the copy of `purl` in `site_packages`; `None`
@@ -117,28 +223,28 @@ pub async fn static_refusal(purl: &str, site_packages: &Path) -> Option<String> 
 }
 
 /// Why the patch `purl` names is not applied to the conda build `build`
-/// in `site_packages`, judged without the patch's files: the patch is for
-/// a platform wheel, or the copy holds compiled code, or nothing shows
+/// in `site_packages`, judged without the patch's files: the copy holds
+/// compiled code ([`CondaBuild::unsupported`]), or the patch is for a
+/// platform wheel, or nothing shows
 /// what the copy holds and the patch does not name a pure-Python wheel.
 /// `None` when nothing rules the patch out yet (see [`refusal_for`] for
 /// the file rule).
 pub fn static_refusal_for(build: &CondaBuild, purl: &str, site_packages: &Path) -> Option<String> {
+    // A compiled build takes no record, so its reason does not depend on
+    // which one is asked about.
+    if let Some(unsupported) = build.unsupported(site_packages) {
+        return Some(unsupported);
+    }
     let where_ = site_packages.display();
     let variant = Variant::of(purl);
     if let Variant::PlatformWheel(wheel) = variant {
         return Some(format!(
             "{REFUSAL_CODE}: conda built the copy in {where_}, and this patch is for the \
-             platform wheel `{wheel}`: a compiled conda package is built separately from \
-             the PyPI wheel, so the patch was not applied to it"
+             platform wheel `{wheel}`, which a conda build never is, so the patch was not \
+             applied to it"
         ));
     }
     match build.compiled {
-        Some(true) => Some(format!(
-            "{REFUSAL_CODE}: conda built the copy in {where_} with compiled code ({}), \
-             which is not the pure-Python PyPI release the patch was made for, so the \
-             patch was not applied to it",
-            build.evidence
-        )),
         // A patch made from a pure-Python wheel says the release is pure
         // Python; a source distribution's, or a record that names no
         // artifact, does not, so the copy itself has to show it.
@@ -219,7 +325,8 @@ fn root_is_purelib(wheel: &str) -> Option<bool> {
     })
 }
 
-/// Whether a distribution with no `WHEEL` metadata holds an extension
+/// Whether a distribution with no `WHEEL` metadata, and no conda record
+/// that lists its files, holds an extension
 /// module: a shared library named after one of its top-level modules
 /// (`_cffi_backend.cpython-313-darwin.so`), or anywhere in one of its
 /// top-level packages. The top-level names are the metadata's
@@ -252,6 +359,17 @@ async fn holds_extension_modules(site_packages: &Path, metadata: &Path, name: &s
         }
     }
     false
+}
+
+/// `libfoo.so.1`, `libfoo.so.1.2.3`: a shared library with its version
+/// after the extension.
+fn is_versioned_shared_library(file_name: &str) -> bool {
+    file_name.rsplit_once(".so.").is_some_and(|(_, version)| {
+        !version.is_empty()
+            && version
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 fn is_shared_library(file_name: &str) -> bool {
@@ -419,28 +537,215 @@ mod tests {
         }
     }
 
-    /// A compiled conda package is never the PyPI wheel: refused for a
-    /// platform wheel's patch, and for any other record when the copy
-    /// itself says it holds compiled code.
+    /// A compiled conda package is never the PyPI wheel, and is not
+    /// supported yet: it takes no record, a platform wheel's or any
+    /// other, and the reason is the copy's, the same for each.
     #[tokio::test]
     async fn a_compiled_conda_build_takes_no_pypi_patch() {
         let tmp = tempfile::tempdir().unwrap();
         let site = conda_site(tmp.path());
         dist_info(&site, "pillow", "12.3.0", Some("conda"), Some(false));
-        let refused = static_refusal(PLATFORM, &site).await.expect("refused");
+        let build = conda_build(PLATFORM, &site).await.expect("a conda build");
+        let unsupported = build.unsupported(&site).expect("not supported");
         assert!(
-            refused.starts_with(REFUSAL_CODE) && refused.contains("cp313-cp313-manylinux"),
-            "{refused}"
+            unsupported.starts_with(REFUSAL_CODE)
+                && unsupported.contains("Root-Is-Purelib: false")
+                && unsupported.contains("compiled conda packages are not supported yet"),
+            "{unsupported}"
         );
         for purl in [
+            PLATFORM,
             "pkg:pypi/pillow@12.3.0?artifact_id=py3-none-any-whl",
             "pkg:pypi/pillow@12.3.0?artifact_id=tar-gz",
             "pkg:pypi/pillow@12.3.0",
             // The names match however the purl or the directory spells them.
             "pkg:pypi/Pillow@12.3.0?artifact_id=py3-none-any-whl",
         ] {
-            let refused = static_refusal(purl, &site).await.expect(purl);
-            assert!(refused.contains("Root-Is-Purelib: false"), "{refused}");
+            assert_eq!(
+                static_refusal(purl, &site).await.as_deref(),
+                Some(unsupported.as_str()),
+                "{purl}"
+            );
+        }
+    }
+
+    /// A pure-Python conda build is supported. A platform wheel's record
+    /// is still not its distribution, and the refusal names the wheel.
+    #[tokio::test]
+    async fn a_pure_python_conda_build_is_supported_and_takes_no_platform_wheel_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = conda_site(tmp.path());
+        dist_info(&site, "certifi", "2026.7.22", Some("conda"), Some(true));
+        let build = conda_build(PURE, &site).await.expect("a conda build");
+        assert_eq!(build.unsupported(&site), None);
+        let platform =
+            "pkg:pypi/certifi@2026.7.22?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl";
+        let refused = static_refusal(platform, &site).await.expect("refused");
+        assert!(
+            refused.starts_with(REFUSAL_CODE)
+                && refused.contains("cp313-cp313-manylinux")
+                && !refused.contains("not supported yet"),
+            "{refused}"
+        );
+    }
+
+    /// The `conda-meta` record of a conda package: its files, as paths
+    /// from the prefix.
+    fn conda_record(prefix: &Path, name: &str, files: &[&str]) {
+        std::fs::write(
+            prefix.join("conda-meta").join(format!("{name}.json")),
+            serde_json::json!({ "name": name, "files": files }).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// An install with no `WHEEL` is judged by the conda package's own
+    /// file list when the prefix has one: a shared library another
+    /// distribution put into a shared namespace package is not this
+    /// package's, and one in a module the metadata does not name is.
+    #[tokio::test]
+    async fn an_egg_info_conda_build_is_judged_by_its_conda_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = conda_site(tmp.path());
+        let sp = "lib/python3.13/site-packages";
+
+        // Pure Python, in a namespace package (`google`) that also holds
+        // another distribution's extension module.
+        egg_info(&site, "googleapis-common-protos", "1.70.0", "google\n");
+        std::fs::create_dir_all(site.join("google").join("api")).unwrap();
+        std::fs::create_dir_all(site.join("google").join("_upb")).unwrap();
+        std::fs::write(site.join("google").join("api").join("annotations.py"), "").unwrap();
+        std::fs::write(
+            site.join("google").join("_upb").join("_message.abi3.so"),
+            "",
+        )
+        .unwrap();
+        let protos = "pkg:pypi/googleapis-common-protos@1.70.0";
+        // With no record the files of its top-level names are all there
+        // is to go by, and they hold a shared library.
+        assert_eq!(compiled(protos, &site).await, Some(Some(true)));
+        conda_record(
+            tmp.path(),
+            "googleapis-common-protos-1.70.0-pyhd8ed1ab_0",
+            &[
+                &format!("{sp}/google/api/annotations.py"),
+                &format!("{sp}/googleapis-common-protos-1.70.0-py3.13.egg-info/PKG-INFO"),
+            ],
+        );
+        // Another package's record, which lists the extension module.
+        conda_record(
+            tmp.path(),
+            "protobuf-6.31.1-py313h_0",
+            &[
+                &format!("{sp}/google/_upb/_message.abi3.so"),
+                &format!("{sp}/protobuf-6.31.1.dist-info/METADATA"),
+            ],
+        );
+        assert_eq!(compiled(protos, &site).await, Some(Some(false)));
+        assert_eq!(static_refusal(protos, &site).await, None);
+
+        // Compiled, with no `top_level.txt` and an import name that is not
+        // the distribution's: only the record says the library is its own.
+        let flat = site.join("PyYAML-6.0.2-py3.13.egg-info");
+        std::fs::write(
+            &flat,
+            "Metadata-Version: 1.1\nName: PyYAML\nVersion: 6.0.2\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(site.join("yaml")).unwrap();
+        std::fs::write(site.join("yaml").join("__init__.py"), "").unwrap();
+        std::fs::write(site.join("_yaml.cpython-313-darwin.so"), "").unwrap();
+        let yaml = "pkg:pypi/pyyaml@6.0.2";
+        assert_eq!(compiled(yaml, &site).await, Some(Some(false)));
+        conda_record(
+            tmp.path(),
+            "pyyaml-6.0.2-py313h_0",
+            &[
+                &format!("{sp}/PyYAML-6.0.2-py3.13.egg-info"),
+                &format!("{sp}/_yaml.cpython-313-darwin.so"),
+                &format!("{sp}/yaml/__init__.py"),
+            ],
+        );
+        assert_eq!(compiled(yaml, &site).await, Some(Some(true)));
+        let unsupported = static_refusal(yaml, &site).await.expect("not supported");
+        assert!(
+            unsupported.contains("its conda package ships shared libraries")
+                && unsupported.contains("not supported yet"),
+            "{unsupported}"
+        );
+
+        // A record written with the platform's separator reads the same.
+        egg_info(&site, "six", "1.17.0", "six\n");
+        std::fs::write(site.join("six.py"), "").unwrap();
+        std::fs::write(site.join("six.cpython-313-darwin.so"), "").unwrap();
+        assert_eq!(
+            compiled("pkg:pypi/six@1.17.0", &site).await,
+            Some(Some(true))
+        );
+        conda_record(
+            tmp.path(),
+            "six-1.17.0-pyhd8ed1ab_0",
+            &[
+                "lib\\python3.13\\site-packages\\six-1.17.0-py3.13.egg-info\\PKG-INFO",
+                "lib\\python3.13\\site-packages\\six.py",
+            ],
+        );
+        assert_eq!(
+            compiled("pkg:pypi/six@1.17.0", &site).await,
+            Some(Some(false))
+        );
+
+        // A file whose name only contains `.so.` is not a library.
+        egg_info(&site, "docopt", "0.6.2", "docopt\n");
+        std::fs::write(site.join("docopt.py"), "").unwrap();
+        conda_record(
+            tmp.path(),
+            "docopt-0.6.2-pyhd8ed1ab_2",
+            &[
+                &format!("{sp}/docopt-0.6.2-py3.13.egg-info/PKG-INFO"),
+                "share/doc/docopt/libfoo.so.1.md",
+                "share/doc/docopt/notes.so.txt",
+            ],
+        );
+        assert_eq!(
+            compiled("pkg:pypi/docopt@0.6.2", &site).await,
+            Some(Some(false))
+        );
+
+        // A versioned library counts; an unreadable record is passed over.
+        egg_info(&site, "munkres", "1.1.4", "munkres\n");
+        std::fs::write(site.join("munkres.py"), "").unwrap();
+        std::fs::write(
+            tmp.path().join("conda-meta").join("broken.json"),
+            "{ munkres",
+        )
+        .unwrap();
+        conda_record(
+            tmp.path(),
+            "munkres-1.1.4-py313_0",
+            &[
+                &format!("{sp}/munkres-1.1.4-py3.13.egg-info/PKG-INFO"),
+                "lib/libmunkres.so.1",
+            ],
+        );
+        assert_eq!(
+            compiled("pkg:pypi/munkres@1.1.4", &site).await,
+            Some(Some(true))
+        );
+
+        // conda's Python ships `lib/python3.1 -> python3.13`: the same
+        // site-packages under another spelling reads the same records.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("python3.13", tmp.path().join("lib").join("python3.1"))
+                .unwrap();
+            let alias = tmp
+                .path()
+                .join("lib")
+                .join("python3.1")
+                .join("site-packages");
+            assert_eq!(compiled(protos, &alias).await, Some(Some(false)));
+            assert_eq!(compiled(yaml, &alias).await, Some(Some(true)));
         }
     }
 

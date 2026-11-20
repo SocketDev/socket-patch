@@ -280,6 +280,96 @@ async fn show_resolves_a_purl_to_its_best_ranked_patch() {
     );
 }
 
+/// A name given to `show` resolves among every package installed where
+/// the project installs, as `get` resolves it. A Python project with no
+/// environment of its own is otherwise crawled only for the packages it
+/// declares.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn show_resolves_the_name_of_an_installed_package_the_project_does_not_declare() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let purl = "pkg:pypi/undeclared-pkg@2.0.0";
+    let mock = MockServer::start().await;
+    let mut body = view(true);
+    body["purl"] = serde_json::json!(purl);
+    mount_view(&mock, body).await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG}/patches/by-package/{}",
+            purl.replace(':', "%3A")
+                .replace('/', "%2F")
+                .replace('@', "%40")
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID, "purl": purl, "publishedAt": "2026-08-03T00:00:00Z",
+                "description": "", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": true
+        })))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("requirements.txt"), "declared-pkg\n").unwrap();
+    // The interpreter on PATH, and what is installed in it.
+    let site = tmp.path().join("system/lib/python3.12/site-packages");
+    for (name, version) in [("declared_pkg", "1.0.0"), ("undeclared_pkg", "2.0.0")] {
+        let dist = site.join(format!("{name}-{version}.dist-info"));
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(
+            dist.join("METADATA"),
+            format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"),
+        )
+        .unwrap();
+    }
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let python = bin.join("python3");
+    std::fs::write(
+        &python,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'Python 3.12.0'; exit 0; fi\n\
+             printf '%s\\n' '{}'\n",
+            site.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut search_path = vec![bin];
+    search_path.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+
+    let out = hermetic_command(&binary())
+        .args(["show", "undeclared-pkg", "--stat"])
+        .args([
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG,
+        ])
+        .env("PATH", std::env::join_paths(search_path).unwrap())
+        .env_remove("VIRTUAL_ENV")
+        .current_dir(&project)
+        .output()
+        .expect("run socket-patch show");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(stdout.contains(purl), "stdout={stdout}; stderr={stderr}");
+}
+
 /// A token the patch service refuses is not the end of it: the public
 /// service, which has the free patches, is asked for the patch. When it
 /// has none either, the refusal is what is reported: it is the cause, and

@@ -398,6 +398,9 @@ pub struct DownloadParams {
     /// `--patch-server-url`: the extra origin whose URLs count as hosted
     /// when lockfile discovery reads the project's hosted pins.
     pub patch_server_url: Option<String>,
+    /// `--patch-mirror-url`: the patch-server mirror whose origin counts as
+    /// hosted the same way.
+    pub patch_mirror_url: Option<String>,
 }
 
 impl DownloadParams {
@@ -1202,8 +1205,10 @@ pub(crate) async fn vendored_download_refusals(
     prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 ) -> VendorRefusals {
     let cwd = params.cwd.as_path();
-    let origins =
-        crate::commands::hosted_unwind::patch_server_origins_of(params.patch_server_url.as_deref());
+    let origins = crate::commands::hosted_unwind::patch_server_origins_of(
+        params.patch_server_url.as_deref(),
+        params.patch_mirror_url.as_deref(),
+    );
     let pins = hosted_pins(cwd, origins.clone()).await;
     let options = params.crawler_options();
     let installed = crate::commands::vendor::installed_lookup(&options, prior);
@@ -1609,6 +1614,18 @@ pub(crate) struct DetachedDownload {
 }
 
 impl DetachedDownload {
+    /// The patches the phase could not download, as the run's telemetry
+    /// names them: the vendor step never sees these (it works from the
+    /// records that did download), so its event adds them.
+    pub(crate) fn failed_outcomes(&self) -> Vec<socket_patch_core::telemetry::PatchOutcome> {
+        crate::telemetry_outcomes::patch_outcomes_of(
+            self.events
+                .iter()
+                .filter(|event| event.action == EventAction::Failed),
+            socket_patch_core::telemetry::MODE_VENDORED,
+        )
+    }
+
     /// Fold the phase's events and warnings into `env` (records via
     /// [`Envelope::record`], so `summary` and `status` follow) and hand back
     /// the exit code and the records.
@@ -1913,6 +1930,33 @@ pub(crate) fn nested_apply_args_from_params(
     nested_apply_args(&common, manifest_path, params.quiet())
 }
 
+/// The patches an agent-mode download pass reached, as its telemetry
+/// names them: a patch fetched in place of an older one is `downloaded`
+/// like any other.
+fn fetched_outcomes(events: &[PatchEvent]) -> Vec<socket_patch_core::telemetry::PatchOutcome> {
+    let events: Vec<PatchEvent> = events
+        .iter()
+        .map(|event| PatchEvent {
+            action: match event.action {
+                EventAction::Updated => EventAction::Downloaded,
+                action => action,
+            },
+            ..event.clone()
+        })
+        .collect();
+    crate::telemetry_outcomes::patch_outcomes_of(&events, socket_patch_core::telemetry::MODE_AGENT)
+}
+
+/// The command an engine run's telemetry reports: the one whose envelope
+/// it fills. `scan` and `get` are the engine's two callers; both pass
+/// their own envelope, printed or not.
+pub(crate) fn telemetry_command(env: &Envelope) -> &'static str {
+    match env.command {
+        EnvelopeCommand::Scan => "scan",
+        _ => "get",
+    }
+}
+
 /// Run the nested `apply` step with `common` (see [`nested_apply_args`])
 /// on the caller's `client`, under the apply `lock` the caller took for
 /// its manifest write — one lock window for download → manifest write →
@@ -1926,6 +1970,7 @@ pub(crate) fn nested_apply_args_from_params(
 /// opt-in on the top-level command only, never on this internal
 /// invocation.
 pub(crate) async fn run_nested_apply(
+    command: &'static str,
     common: GlobalArgs,
     json: bool,
     report_user_patch_skips: bool,
@@ -1943,6 +1988,7 @@ pub(crate) async fn run_nested_apply(
         nested: Some(super::apply::NestedApply {
             caller_json: json,
             report_user_patch_skips,
+            command,
         }),
     };
     // The nested apply runs on the host's client: seeded, never rebuilt.
@@ -2026,6 +2072,12 @@ pub(crate) fn record_apply_outcome(
             env.warnings.push(warning.clone());
         }
     }
+    // A copy skipped as not supported yet (a compiled conda build) is one
+    // copy's outcome, not its package's: another copy of the same record
+    // may have been patched. Its events are recorded on their own below,
+    // one per copy.
+    let unsupported_copy =
+        |skip: &PatchEvent| skip.error_code.as_deref() == Some(CONDA_BUILD_NOT_PYPI_RELEASE);
     let mut failed_any = false;
     for (purl, uuid) in recorded {
         if let Some(failure) = report
@@ -2040,9 +2092,11 @@ pub(crate) fn record_apply_outcome(
             );
             failed_any = true;
         } else if let Some(skip) = report.skipped.iter().find(|skip| {
-            skip.purl
-                .as_deref()
-                .is_some_and(|key| apply_key_covers(key, purl))
+            !unsupported_copy(skip)
+                && skip
+                    .purl
+                    .as_deref()
+                    .is_some_and(|key| apply_key_covers(key, purl))
         }) {
             let mut event = skip.clone().with_uuid(uuid);
             event.purl = Some(purl.clone());
@@ -2051,6 +2105,14 @@ pub(crate) fn record_apply_outcome(
             env.record(
                 PatchEvent::new(EventAction::Applied, purl.as_str()).with_uuid(uuid.as_str()),
             );
+        } else if report.skipped.iter().any(|skip| {
+            unsupported_copy(skip)
+                && skip
+                    .purl
+                    .as_deref()
+                    .is_some_and(|key| apply_key_covers(key, purl))
+        }) {
+            // Every copy of it was skipped that way: said below.
         } else if report.code == 0 {
             record_apply_skip(
                 env,
@@ -2065,11 +2127,37 @@ pub(crate) fn record_apply_outcome(
     }
     // The nested apply covers the whole manifest, so its other skips
     // (`already_patched`, `vendored`, ...) belong to packages this run did
-    // not select; only a user-patch conflict found after selection is news.
+    // not select. Two are news all the same: a user-patch conflict found
+    // after selection, and a copy left unpatched because it is not
+    // supported yet (a compiled conda build), which would otherwise go
+    // unsaid, the nested apply being silent under `--json`.
     for skip in &report.skipped {
         let Some(key) = skip.purl.as_deref() else {
             continue;
         };
+        if unsupported_copy(skip) {
+            let mut event = skip.clone();
+            if let Some((purl, uuid)) = recorded
+                .iter()
+                .find(|(purl, _)| apply_key_covers(key, purl))
+            {
+                event.purl = Some(purl.clone());
+                event.uuid = Some(uuid.clone());
+            } else if event.uuid.is_none() {
+                event.uuid = uuid_of(key);
+            }
+            // Once per copy: the reason names it.
+            let said = env.events.iter().any(|existing| {
+                existing.action == EventAction::Skipped
+                    && existing.error_code == event.error_code
+                    && existing.purl == event.purl
+                    && existing.reason == event.reason
+            });
+            if !said {
+                env.record(event);
+            }
+            continue;
+        }
         if skip.error_code.as_deref() != Some(super::user_patches::CONFLICT)
             || recorded.iter().any(|(purl, _)| apply_key_covers(key, purl))
             || report
@@ -2315,6 +2403,14 @@ pub async fn download_and_apply_patches_into(
     // single-uuid flow's summary in `save_and_apply_patch`; their sum gates
     // the apply step.
     let downloaded = batch.fetched.len();
+    // Telemetry: the patch records this run fetched. `get <uuid>` reports
+    // its own fetch; every other agent-mode download comes through here.
+    socket_patch_core::telemetry::track_patches_fetched(
+        telemetry_command(env),
+        &fetched_outcomes(&batch.events),
+        &socket_patch_core::telemetry::TelemetryAuth::for_client(run.api_client),
+    )
+    .await;
     let mut updated = 0usize;
     let mut new_blobs: Vec<String> = Vec::new();
     // `(purl, uuid)` of every selected patch now recorded: the fetched ones
@@ -2424,6 +2520,7 @@ pub async fn download_and_apply_patches_into(
         crate::hot_patch::mark_apply_started();
         apply_report = Some(
             run_nested_apply(
+                telemetry_command(env),
                 nested_apply_args_from_params(params, run, &manifest_path),
                 params.json,
                 !params.user_patch_skips_reported,

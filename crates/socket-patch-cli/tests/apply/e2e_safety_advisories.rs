@@ -513,65 +513,130 @@ fn apply_in(cwd: &Path, extra: &[&str]) -> (i32, String, String) {
     run_with_env(cwd, &args, &[])
 }
 
+const CONDA_NOT_SUPPORTED: &str = "compiled conda packages are not supported yet";
+
+/// What a run that skipped a compiled conda build says: a warning with
+/// the rule's code, and no failure of any kind.
+fn assert_skipped_as_not_supported(stderr: &str, at: &str) {
+    assert!(
+        stderr.contains(&format!("Warning: pkg:pypi/pillow@12.3.0: {CONDA_REFUSAL}"))
+            && stderr.contains(CONDA_NOT_SUPPORTED),
+        "{at}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches(CONDA_REFUSAL).count(),
+        1,
+        "one warning for the copy: {at}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Error:")
+            && !stderr.contains("no matching installed package")
+            && !stderr.contains("socket-patch remove"),
+        "{at}\nstderr:\n{stderr}"
+    );
+}
+
 /// A compiled conda package is built separately from the PyPI wheel and
 /// links conda's own libraries. Its Python files are often the wheel's
-/// byte for byte, as here, and that is not enough: a patch made from the
-/// wheel is not applied to it, with or without `--force`.
+/// byte for byte, as here, and that is not enough: compiled conda
+/// packages are not supported yet. The copy is skipped with a warning,
+/// nothing is written to it, and the run does not fail, with or without
+/// `--force`, for a platform wheel's record or a pure-Python wheel's.
 #[test]
-fn a_compiled_conda_build_takes_no_pypi_patch_even_when_the_file_matches() {
+fn a_compiled_conda_build_is_skipped_even_when_the_file_matches() {
     let release = b"# PIL/TarIO.py as PyPI ships it\n";
-    for flags in [&[][..], &["--force"][..], &["--allow-patch-conflicts"][..]] {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let target = stage_conda_copy(
-            tmp.path(),
-            &CondaCopy {
-                name: "pillow",
-                version: "12.3.0",
-                purl: "pkg:pypi/pillow@12.3.0?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl",
-                installer: Some("conda"),
-                purelib: false,
-                file: "PIL/TarIO.py",
-                installed: release,
-                release,
-            },
-        );
-        let (code, stdout, stderr) = apply_in(tmp.path(), flags);
-        assert_eq!(code, 1, "{flags:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
-        assert_eq!(std::fs::read(&target).unwrap(), release, "{flags:?}");
-        assert!(
-            stderr.contains(CONDA_REFUSAL) && stderr.contains("compiled conda package"),
-            "{flags:?}\nstderr:\n{stderr}"
-        );
+    for purl in [
+        "pkg:pypi/pillow@12.3.0?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl",
+        "pkg:pypi/pillow@12.3.0?artifact_id=py3-none-any-whl",
+        "pkg:pypi/pillow@12.3.0",
+    ] {
+        for flags in [
+            &[][..],
+            &["--force"][..],
+            &["--allow-patch-conflicts"][..],
+            &["--dry-run"][..],
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let target = stage_conda_copy(
+                tmp.path(),
+                &CondaCopy {
+                    name: "pillow",
+                    version: "12.3.0",
+                    purl,
+                    installer: Some("conda"),
+                    purelib: false,
+                    file: "PIL/TarIO.py",
+                    installed: release,
+                    release,
+                },
+            );
+            let at = format!("{purl} {flags:?}");
+            let (code, stdout, stderr) = apply_in(tmp.path(), flags);
+            assert_eq!(code, 0, "{at}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+            assert_eq!(std::fs::read(&target).unwrap(), release, "{at}");
+            assert_skipped_as_not_supported(&stderr, &at);
+            assert!(stderr.contains("Root-Is-Purelib: false"), "{at}\n{stderr}");
+            assert!(
+                stdout.contains("not supported") && !stdout.contains("1 not found on disk"),
+                "{at}\nstdout:\n{stdout}"
+            );
+        }
     }
 }
 
-/// The same copy with a patch made from a pure-Python wheel: the copy's
-/// own metadata says it holds compiled code, so it is still not the
-/// release the patch was made for.
+/// The usual compiled conda build is not the wheel file for file either
+/// (a recipe patches a source, the wheel's extension modules are not
+/// there). It is skipped the same way, not failed as a copy that matches
+/// no release, and `apply --check` agrees: a copy `apply` skips is not
+/// drift. Under `--json` each record is a `skipped` event with the code.
 #[test]
-fn a_conda_build_that_says_it_is_compiled_takes_no_pure_python_patch() {
-    let release = b"# PIL/TarIO.py as PyPI ships it\n";
+fn a_compiled_conda_build_that_differs_from_the_wheel_is_skipped_and_checks_clean() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    let conda_build = b"# PIL/TarIO.py as the conda recipe patched it\n";
+    let purl = "pkg:pypi/pillow@12.3.0?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl";
     let target = stage_conda_copy(
         tmp.path(),
         &CondaCopy {
             name: "pillow",
             version: "12.3.0",
-            purl: "pkg:pypi/pillow@12.3.0?artifact_id=py3-none-any-whl",
+            purl,
             installer: Some("conda"),
             purelib: false,
             file: "PIL/TarIO.py",
-            installed: release,
-            release,
+            installed: conda_build,
+            release: b"# PIL/TarIO.py as PyPI ships it\n",
         },
     );
-    let (code, stdout, stderr) = apply_in(tmp.path(), &[]);
-    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert_eq!(std::fs::read(&target).unwrap(), release);
-    assert!(
-        stderr.contains(CONDA_REFUSAL) && stderr.contains("Root-Is-Purelib: false"),
-        "stderr:\n{stderr}"
+    add_sibling_record(
+        tmp.path(),
+        purl,
+        "pkg:pypi/pillow@12.3.0?artifact_id=py3-none-any-whl",
     );
+
+    for flags in [&[][..], &["--force"][..], &["--check"][..]] {
+        let (code, stdout, stderr) = apply_in(tmp.path(), flags);
+        let at = format!("{flags:?}");
+        assert_eq!(code, 0, "{at}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(std::fs::read(&target).unwrap(), conda_build, "{at}");
+        assert_skipped_as_not_supported(&stderr, &at);
+        assert!(
+            stdout.contains("2 not supported") || stdout.contains("2 patches not supported"),
+            "{at}\nstdout:\n{stdout}"
+        );
+    }
+
+    for flags in [&["--json"][..], &["--check", "--json"][..]] {
+        let (code, stdout, stderr) = apply_in(tmp.path(), flags);
+        assert_eq!(code, 0, "{flags:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("JSON envelope");
+        assert_eq!(envelope["status"], "success", "{flags:?}\n{stdout}");
+        let events = envelope["events"].as_array().expect("events");
+        assert_eq!(events.len(), 2, "{flags:?}\n{stdout}");
+        for event in events {
+            assert_eq!(event["action"], "skipped", "{flags:?}\n{stdout}");
+            assert_eq!(event["errorCode"], CONDA_REFUSAL, "{flags:?}\n{stdout}");
+        }
+    }
 }
 
 /// A pure-Python conda build whose file is not the release's (a recipe
@@ -829,8 +894,7 @@ fn a_platform_wheel_record_beside_the_pure_one_does_not_fail_a_pure_python_conda
 /// A copy that fails is reported once, with its own cause. A pure-Python
 /// conda build whose file is not the release's fails under the pure
 /// wheel's record, for that file; the platform wheel's record is not
-/// refused on top of it. A compiled conda build, which takes neither
-/// record, is refused once.
+/// refused on top of it.
 #[test]
 fn a_conda_build_two_records_fail_on_is_reported_once() {
     let release = b"# the PyPI release's file\n";
@@ -855,19 +919,22 @@ fn a_conda_build_two_records_fail_on_is_reported_once() {
         "stderr:\n{stderr}"
     );
 
-    for flags in [&[][..], &["--force"][..]] {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let target = stage_conda_copy(tmp.path(), &sibling_records_copy(false, release, release));
-        add_sibling_record(tmp.path(), SIBLING_PURE, SIBLING_PLATFORM);
-        let (code, stdout, stderr) = apply_in(tmp.path(), flags);
-        assert_eq!(code, 1, "{flags:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
-        assert_eq!(std::fs::read(&target).unwrap(), release, "{flags:?}");
-        assert_eq!(failures(&stderr), 1, "{flags:?}\nstderr:\n{stderr}");
-        assert!(
-            stderr.contains(CONDA_REFUSAL) && !stderr.contains("no matching installed package"),
-            "{flags:?}\nstderr:\n{stderr}"
-        );
-    }
+    // The platform wheel's record alone, on the same pure-Python build:
+    // refused, with how to drop the record.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut alone = sibling_records_copy(true, release, release);
+    alone.purl = SIBLING_PLATFORM;
+    stage_conda_copy(tmp.path(), &alone);
+    let (code, stdout, stderr) = apply_in(tmp.path(), &[]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(failures(&stderr), 1, "stderr:\n{stderr}");
+    assert!(
+        stderr.contains(CONDA_REFUSAL)
+            && stderr.contains(
+                "`socket-patch remove pkg:pypi/charset-normalizer@3.4.4` drops its record"
+            ),
+        "stderr:\n{stderr}"
+    );
 }
 
 /// `--strict` fails on any file that is not the patch's original. The
@@ -901,11 +968,301 @@ fn strict_stays_strict_on_a_conda_build() {
     assert_eq!(std::fs::read(&target).unwrap(), earlier_patch);
 }
 
+/// A compiled conda build an earlier release patched, in a release with
+/// two records: it holds the pure wheel's patch, and the platform wheel's
+/// record also replaces a file the copy holds unpatched. `apply` reports
+/// the copy as already patched under the record it holds and passes over
+/// the other, and `apply --check` agrees: the copy is judged as a whole,
+/// not once per record, so it is in sync.
+#[test]
+fn a_compiled_conda_build_holding_one_records_patch_is_in_sync() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pure = "pkg:pypi/pillow@12.3.0?artifact_id=py3-none-any-whl";
+    let platform = "pkg:pypi/pillow@12.3.0?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl";
+    let target = stage_conda_copy(
+        tmp.path(),
+        &CondaCopy {
+            name: "pillow",
+            version: "12.3.0",
+            purl: pure,
+            installer: Some("conda"),
+            purelib: false,
+            file: "PIL/TarIO.py",
+            installed: CONDA_PATCHED,
+            release: b"# PIL/TarIO.py as PyPI ships it\n",
+        },
+    );
+    add_sibling_record(tmp.path(), pure, platform);
+    let second = b"# PIL/TiffImagePlugin.py as PyPI ships it\n";
+    let second_path = target.parent().unwrap().join("TiffImagePlugin.py");
+    std::fs::write(&second_path, second).unwrap();
+    // A third record, whose only file the conda recipe changed: it matches
+    // nothing of the copy.
+    let sdist = "pkg:pypi/pillow@12.3.0?artifact_id=tar-gz";
+    add_sibling_record(tmp.path(), pure, sdist);
+    let recipe_patched = b"# PIL/ImageFile.py as the conda recipe patched it\n";
+    let third_path = target.parent().unwrap().join("ImageFile.py");
+    std::fs::write(&third_path, recipe_patched).unwrap();
+    let manifest_path = tmp.path().join(".socket").join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["patches"][platform]["files"]["PIL/TiffImagePlugin.py"] = serde_json::json!({
+        "beforeHash": git_sha256(second),
+        "afterHash": git_sha256(CONDA_PATCHED),
+    });
+    manifest["patches"][sdist]["files"] = serde_json::json!({ "PIL/ImageFile.py": {
+        "beforeHash": git_sha256(b"# PIL/ImageFile.py as PyPI ships it\n"),
+        "afterHash": git_sha256(CONDA_PATCHED),
+    } });
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = apply_in(tmp.path(), &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains(&format!("{pure} (already patched)")),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains(CONDA_REFUSAL) && !stderr.contains("no matching installed package"),
+        "stderr:\n{stderr}"
+    );
+    assert!(stdout.contains("0 not found on disk"), "stdout:\n{stdout}");
+    assert_eq!(std::fs::read(&second_path).unwrap(), second);
+    assert_eq!(std::fs::read(&third_path).unwrap(), recipe_patched);
+
+    let (code, stdout, stderr) = apply_in(tmp.path(), &["--check"]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("Patches are in sync (1 patch checked)."),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("OUT OF SYNC") && !stderr.contains(CONDA_REFUSAL),
+        "stderr:\n{stderr}"
+    );
+}
+
+/// A copy's path is its site-packages directory, which every package of
+/// the environment shares. A compiled conda build that already holds its
+/// patch is in sync, and that says nothing about another package beside
+/// it: an unpatched wheel pip installed there is still out of sync, not
+/// "not installed".
+#[test]
+fn a_compiled_conda_build_holding_its_patch_does_not_hide_another_packages_drift() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = stage_conda_copy(
+        tmp.path(),
+        &CondaCopy {
+            name: "pillow",
+            version: "12.3.0",
+            purl: "pkg:pypi/pillow@12.3.0?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl",
+            installer: Some("conda"),
+            purelib: false,
+            file: "PIL/TarIO.py",
+            installed: CONDA_PATCHED,
+            release: b"# PIL/TarIO.py as PyPI ships it\n",
+        },
+    );
+    // certifi, as pip installed it, in the same site-packages: unpatched.
+    let site_packages = target.parent().unwrap().parent().unwrap();
+    let dist_info = site_packages.join("certifi-2026.7.22.dist-info");
+    std::fs::create_dir_all(&dist_info).unwrap();
+    std::fs::write(
+        dist_info.join("METADATA"),
+        "Metadata-Version: 2.4\nName: certifi\nVersion: 2026.7.22\n",
+    )
+    .unwrap();
+    std::fs::write(dist_info.join("INSTALLER"), "pip\n").unwrap();
+    std::fs::write(
+        dist_info.join("WHEEL"),
+        "Wheel-Version: 1.0\nRoot-Is-Purelib: true\n",
+    )
+    .unwrap();
+    let certifi_release = b"# certifi/core.py as PyPI ships it\n";
+    std::fs::create_dir_all(site_packages.join("certifi")).unwrap();
+    std::fs::write(
+        site_packages.join("certifi").join("core.py"),
+        certifi_release,
+    )
+    .unwrap();
+    let certifi = "pkg:pypi/certifi@2026.7.22?artifact_id=py3-none-any-whl";
+    let manifest_path = tmp.path().join(".socket").join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["patches"][certifi] = serde_json::json!({
+        "uuid": "20000001-0000-4001-8001-000000000091",
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": { "certifi/core.py": {
+            "beforeHash": git_sha256(certifi_release),
+            "afterHash": git_sha256(CONDA_PATCHED),
+        } },
+        "vulnerabilities": {},
+        "description": "t",
+        "license": "MIT",
+        "tier": "free",
+    });
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = apply_in(tmp.path(), &["--check"]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains(&format!("{certifi}: patch not applied")) && !stderr.contains("pillow"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!stdout.contains("not installed"), "stdout:\n{stdout}");
+
+    // `apply` patches certifi and leaves pillow as it is; then all is in sync.
+    let (code, stdout, stderr) = apply_in(tmp.path(), &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let (code, stdout, stderr) = apply_in(tmp.path(), &["--check"]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("Patches are in sync (2 patches checked)."),
+        "stdout:\n{stdout}"
+    );
+}
+
+/// conda's Python ships `lib/python3.1 -> python3.13`, so an
+/// environment's site-packages is found under two spellings. It is one
+/// copy: `apply` and `apply --check` each skip a compiled conda build in
+/// it once, with one warning.
+#[cfg(unix)]
+#[test]
+fn a_compiled_conda_build_under_two_spellings_of_its_directory_is_skipped_once() {
+    let release = b"# PIL/TarIO.py as PyPI ships it\n";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = stage_conda_copy(
+        tmp.path(),
+        &CondaCopy {
+            name: "pillow",
+            version: "12.3.0",
+            purl: "pkg:pypi/pillow@12.3.0?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl",
+            installer: Some("conda"),
+            purelib: false,
+            file: "PIL/TarIO.py",
+            installed: release,
+            release,
+        },
+    );
+    let lib = tmp
+        .path()
+        .join(".pixi")
+        .join("envs")
+        .join("default")
+        .join("lib");
+    std::os::unix::fs::symlink("python3.13", lib.join("python3.1")).unwrap();
+
+    for flags in [&[][..], &["--check"][..]] {
+        let (code, stdout, stderr) = apply_in(tmp.path(), flags);
+        let at = format!("{flags:?}");
+        assert_eq!(code, 0, "{at}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(std::fs::read(&target).unwrap(), release, "{at}");
+        assert_skipped_as_not_supported(&stderr, &at);
+    }
+}
+
+/// Copies `from` to `to`, files and directories.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// A project with the package in two environments: conda's compiled
+/// build in one, the PyPI wheel pip installed in the other. `apply`
+/// patches the wheel, skips the conda build with its warning, and
+/// succeeds. `apply --check` is then in sync, and under `--json` says both
+/// things: the record is patched wherever it can be, and one copy was
+/// skipped.
+#[test]
+fn a_compiled_conda_build_beside_a_pip_installed_wheel_is_skipped_and_the_wheel_patched() {
+    let release = b"# PIL/TarIO.py as PyPI ships it\n";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let purl = "pkg:pypi/pillow@12.3.0?artifact_id=cp313-cp313-manylinux_2_28_x86_64-whl";
+    let conda_copy = stage_conda_copy(
+        tmp.path(),
+        &CondaCopy {
+            name: "pillow",
+            version: "12.3.0",
+            purl,
+            installer: Some("conda"),
+            purelib: false,
+            file: "PIL/TarIO.py",
+            installed: release,
+            release,
+        },
+    );
+    let envs = tmp.path().join(".pixi").join("envs");
+    copy_tree(&envs.join("default"), &envs.join("wheels"));
+    let in_wheels = |path: &Path| {
+        envs.join("wheels")
+            .join(path.strip_prefix(envs.join("default")).unwrap())
+    };
+    let site_packages = conda_copy.parent().unwrap().parent().unwrap();
+    std::fs::write(
+        in_wheels(
+            &site_packages
+                .join("pillow-12.3.0.dist-info")
+                .join("INSTALLER"),
+        ),
+        "pip\n",
+    )
+    .unwrap();
+    let wheel_copy = in_wheels(&conda_copy);
+
+    let (code, stdout, stderr) = apply_in(tmp.path(), &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(std::fs::read(&wheel_copy).unwrap(), CONDA_PATCHED);
+    assert_eq!(std::fs::read(&conda_copy).unwrap(), release);
+    assert_skipped_as_not_supported(&stderr, "apply");
+    assert!(
+        stdout.contains("1 of 1 targeted patch applied") && !stdout.contains("not supported"),
+        "the wheel's copy says more than the skip:\n{stdout}"
+    );
+
+    let (code, stdout, stderr) = apply_in(tmp.path(), &["--check"]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("Patches are in sync (1 patch checked)."),
+        "stdout:\n{stdout}"
+    );
+    assert_skipped_as_not_supported(&stderr, "apply --check");
+
+    let (code, stdout, stderr) = apply_in(tmp.path(), &["--check", "--json"]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("JSON envelope");
+    assert_eq!(envelope["status"], "success", "{stdout}");
+    let events = envelope["events"].as_array().expect("events");
+    let codes: Vec<&str> = events
+        .iter()
+        .map(|event| event["errorCode"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(codes, ["already_patched", CONDA_REFUSAL], "{stdout}");
+    assert_eq!(
+        events[0]["reason"], "every installed copy that can be patched is patched",
+        "{stdout}"
+    );
+}
+
 /// An earlier release patched compiled conda builds whose Python file
 /// matched. Such a copy already holds the patch: nothing is written to it,
-/// so there is nothing to refuse, and `apply` reports it as what it is,
-/// patched. The same record on an unpatched copy is refused, and the
-/// refusal says how to drop the record.
+/// so there is nothing to skip, and `apply` reports it as what it is,
+/// patched.
 #[test]
 fn a_compiled_conda_build_that_already_holds_the_patch_is_reported_as_patched() {
     let copy = |installed: &'static [u8]| CondaCopy {
@@ -926,14 +1283,11 @@ fn a_compiled_conda_build_that_already_holds_the_patch_is_reported_as_patched() 
     assert!(!stderr.contains(CONDA_REFUSAL), "stderr:\n{stderr}");
     assert_eq!(std::fs::read(&target).unwrap(), CONDA_PATCHED);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    stage_conda_copy(tmp.path(), &copy(b"# PIL/TarIO.py as PyPI ships it\n"));
-    let (code, _stdout, stderr) = apply_in(tmp.path(), &[]);
-    assert_eq!(code, 1, "stderr:\n{stderr}");
-    assert!(
-        stderr.contains("`socket-patch remove pkg:pypi/pillow@12.3.0` drops its record"),
-        "stderr:\n{stderr}"
-    );
+    // `apply --check` agrees: the copy is in sync.
+    let (code, stdout, stderr) = apply_in(tmp.path(), &["--check"]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("1 patch checked"), "stdout:\n{stdout}");
+    assert!(!stderr.contains(CONDA_REFUSAL), "stderr:\n{stderr}");
 }
 
 // ─────────────────────────────────────────────────────────────────────

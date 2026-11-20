@@ -83,6 +83,28 @@ pub(crate) fn no_packages_unreadable(warnings: usize) -> String {
     }
 }
 
+/// What an empty crawl says when the Python on `PATH` does hold packages,
+/// `undeclared` of them, and the project declares none: they are left out
+/// as not the project's (a project with no environment of its own shares
+/// that interpreter), and "install first" alone would not say so.
+pub(crate) fn no_declared_python_packages(undeclared: usize) -> String {
+    let (installed, them) = if undeclared == 1 {
+        (
+            "the 1 package installed in the Python on PATH is not one".to_string(),
+            "it",
+        )
+    } else {
+        (
+            format!("the {undeclared} packages installed in the Python on PATH are not ones"),
+            "them",
+        )
+    };
+    format!(
+        "No packages found: {installed} this project declares. Install its requirements \
+         first; `--global` scans {them} with every other package on the machine."
+    )
+}
+
 /// What an empty crawl says, naming the filter that emptied it when there
 /// was one (`--ecosystems`, PATH scoping) instead of a generic
 /// "install first" hint.
@@ -900,6 +922,22 @@ mod tests {
                  p04, p05, p06, p07, p08, p09, and 2 more): "
             ),
             "{cut}"
+        );
+    }
+
+    #[test]
+    fn an_empty_crawl_says_when_installed_packages_were_left_out_as_undeclared() {
+        assert_eq!(
+            no_declared_python_packages(18),
+            "No packages found: the 18 packages installed in the Python on PATH are not ones \
+             this project declares. Install its requirements first; `--global` scans them \
+             with every other package on the machine."
+        );
+        assert_eq!(
+            no_declared_python_packages(1),
+            "No packages found: the 1 package installed in the Python on PATH is not one this \
+             project declares. Install its requirements first; `--global` scans it with every \
+             other package on the machine."
         );
     }
 
