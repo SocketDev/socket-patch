@@ -146,7 +146,7 @@ async fn a_package_name_reports_the_patch_the_project_holds() {
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        format!("Reported 1 patch to Socket as broken:\n  {PURL} ({UUID})\n")
+        format!("Reported 1 patch to Socket as broken:\n  {PURL} ({UUID}, agent mode)\n")
     );
 
     let sent = bodies(&server).await;
@@ -167,8 +167,10 @@ async fn a_package_name_reports_the_patch_the_project_holds() {
     );
 }
 
-/// `--dry-run` resolves the patches and says what would go out, and
-/// sends nothing. `--silent` prints nothing for a report that was sent.
+/// `--dry-run` resolves the patches and shows the whole report (each
+/// patch with its mode, and the message as it would be sent, redacted),
+/// and sends nothing. `--silent` prints nothing for a report that was
+/// sent.
 #[tokio::test]
 async fn a_dry_run_sends_nothing_and_silent_prints_nothing() {
     let server = endpoint(201).await;
@@ -177,12 +179,29 @@ async fn a_dry_run_sends_nothing_and_silent_prints_nothing() {
     let out = report(
         tmp.path(),
         &server,
-        &[PURL, "--reason", "build", "--dry-run"],
+        &[
+            PURL,
+            "--reason",
+            "build",
+            "--message",
+            "see\nhttps://user:hunter2@example.com/log",
+            "--dry-run",
+        ],
     );
     assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        format!("Would report 1 patch to Socket as breaking the build:\n  {PURL} ({UUID})\n")
+        lines[..2],
+        [
+            "Would report 1 patch to Socket as breaking the build:".to_string(),
+            format!("  {PURL} ({UUID}, agent mode)"),
+        ]
+    );
+    assert_eq!(lines.len(), 3, "{stdout}");
+    assert!(
+        lines[2].starts_with("  Message: see https://") && !lines[2].contains("hunter2"),
+        "the message as sent, on one line and redacted: {stdout}"
     );
     assert!(bodies(&server).await.is_empty(), "a dry run sends nothing");
 
@@ -244,4 +263,113 @@ async fn a_report_that_cannot_be_sent_fails_the_run() {
         bodies(&server).await.is_empty(),
         "an offline run sends nothing"
     );
+}
+
+/// A saved login the org endpoint refuses does not cost the report: it
+/// goes out again on the public route, without the token.
+#[tokio::test]
+async fn a_refused_login_still_delivers_the_report() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v0/orgs/acme/telemetry"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/patch/telemetry"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let out = hermetic_command(&binary())
+        .args(["report", UUID, "--json"])
+        .current_dir(tmp.path())
+        .env("SOCKET_API_URL", server.uri())
+        .env("SOCKET_PROXY_URL", server.uri())
+        .env("SOCKET_ORG_SLUG", "acme")
+        .env(
+            "SOCKET_API_TOKEN",
+            "sktsec_00000000000000000000000000000000000000000000_api",
+        )
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(stdout_json(&out)["status"], "success");
+
+    let requests = server.received_requests().await.expect("recording enabled");
+    let seen: Vec<(&str, bool)> = requests
+        .iter()
+        .map(|r| (r.url.path(), r.headers.contains_key("authorization")))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("/v0/orgs/acme/telemetry", true),
+            ("/patch/telemetry", false)
+        ]
+    );
+}
+
+/// A manifest that cannot be read may hold the patch a name meant: the
+/// run says the manifest is the problem, not that no patch matches, and
+/// a report by UUID still goes out.
+#[tokio::test]
+async fn an_unreadable_manifest_is_named_and_a_uuid_still_reports() {
+    let server = endpoint(201).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(tmp.path().join(".socket")).unwrap();
+    std::fs::write(tmp.path().join(".socket/manifest.json"), "{ not json").unwrap();
+
+    let out = report(tmp.path(), &server, &["lodash", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let doc = stdout_json(&out);
+    assert_eq!(doc["error"]["code"], "manifest_invalid");
+    let message = doc["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("manifest.json") && message.contains("UUID"),
+        "{message}"
+    );
+    assert!(bodies(&server).await.is_empty());
+
+    let out = report(tmp.path(), &server, &[UUID]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(bodies(&server).await.len(), 1);
+}
+
+/// One report names at most 50 patches. More is refused, even on a dry
+/// run, rather than sent with some left out.
+#[tokio::test]
+async fn more_patches_than_one_report_names_is_refused() {
+    let server = endpoint(201).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let uuids: Vec<String> = (0..51)
+        .map(|n| format!("{n:08x}-7bd4-40cc-ab8f-36dc6248985a"))
+        .collect();
+    let all: Vec<&str> = uuids.iter().map(String::as_str).collect();
+
+    let mut args = all.clone();
+    args.push("--dry-run");
+    let out = report(tmp.path(), &server, &args);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: The report was not sent: one report names at most 50 patches; send the rest \
+         in another\n"
+    );
+
+    let mut args = all.clone();
+    args.push("--json");
+    let out = report(tmp.path(), &server, &args);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(stdout_json(&out)["error"]["code"], "too_many_patches");
+    assert!(bodies(&server).await.is_empty());
+
+    // Exactly 50 go out, all named.
+    let out = report(tmp.path(), &server, &all[..50]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let sent = bodies(&server).await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["metadata"]["patches"].as_array().unwrap().len(), 50);
+    assert!(sent[0]["metadata"].get("patches_truncated").is_none());
 }

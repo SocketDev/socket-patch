@@ -362,7 +362,8 @@ for it; a patch UUID names any patch, so you can report one after rolling it bac
 its ecosystem and patch mode, the reason, your message, and the CLI's version and
 platform: no package names, paths or file contents. It is sent because you ran it,
 so the telemetry opt-outs do not apply to it; `--offline` sends nothing, and
-`--dry-run` shows what would be sent. `report` changes nothing in the project.
+`--dry-run` shows the whole report as it would be sent. One report names up to 50
+patches. `report` changes nothing in the project.
 
 Use `--dry-run` to preview. `rollback --preserve-state` and
 `remove --preserve-state` restore dependencies while keeping local patch records
