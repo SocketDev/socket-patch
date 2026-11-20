@@ -388,14 +388,25 @@ fn kept_outcomes(kept: &[String], entries: &[(String, VendorEntry)]) -> Vec<Patc
     )
 }
 
-/// Hosted pins, all `outcome`, as telemetry names them.
-fn hosted_pin_outcomes(pins: &[HostedPin], outcome: &'static str) -> Vec<PatchOutcome> {
-    crate::telemetry_outcomes::uniform_outcomes(
-        pins.iter()
-            .map(|pin| (pin.purl.as_str(), pin.uuid.as_str())),
-        MODE_HOSTED,
-        outcome,
-        (outcome == OUTCOME_FAILED).then_some("hosted_revert_failed"),
+/// Hosted pins as telemetry names them: `removed` for the ones the leg
+/// restored (`restored`, by purl), `failed` (`hosted_revert_failed`) for
+/// the rest. A leg that stopped on one pin may have restored others, and
+/// a patch that was taken out is not one that would not come off.
+fn hosted_pin_outcomes(pins: &[HostedPin], restored: &[String]) -> Vec<PatchOutcome> {
+    let (done, failed): (Vec<&HostedPin>, Vec<&HostedPin>) =
+        pins.iter().partition(|pin| restored.contains(&pin.purl));
+    let named = |pins: Vec<&HostedPin>, outcome, code| {
+        crate::telemetry_outcomes::uniform_outcomes(
+            pins.into_iter()
+                .map(|pin| (pin.purl.as_str(), pin.uuid.as_str())),
+            MODE_HOSTED,
+            outcome,
+            code,
+        )
+    };
+    crate::telemetry_outcomes::with_more(
+        named(failed, OUTCOME_FAILED, Some("hosted_revert_failed")),
+        &named(done, "removed", None),
     )
 }
 
@@ -503,6 +514,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         Ok(present) => !present,
         Err(e) => {
             let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+            track_failed(&args, &err.code, &err.message, &[], &telemetry).await;
             emit_error_envelope(
                 args.common.json,
                 args.common.dry_run,
@@ -529,6 +541,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
             // Contested hosted wiring is still hosted state: name it
             // instead of reporting a bare project.
             if let Some(refusal) = hosted_inventory.contested_refusal() {
+                track_failed(&args, "hosted_wiring_contested", &refusal, &[], &telemetry).await;
                 emit_error_envelope(
                     args.common.json,
                     args.common.dry_run,
@@ -558,6 +571,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
             } else {
                 Default::default()
             };
+            let not_found = format!("Manifest not found at {}", manifest_path.display());
+            track_failed(&args, "manifest_not_found", &not_found, &[], &telemetry).await;
             // `--json` keeps its `manifest_not_found` message; a person is
             // told what that means for the command they ran.
             if args.common.json {
@@ -565,7 +580,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     true,
                     args.common.dry_run,
                     "manifest_not_found",
-                    format!("Manifest not found at {}", manifest_path.display()),
+                    not_found,
                     below.warnings(),
                 );
             } else {
@@ -1150,12 +1165,12 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     hosted_leg_warnings.extend(leg.warnings.iter().cloned());
                     leg
                 }
-                Err(err) => {
+                Err((err, restored)) => {
                     track_failed(
                         &args,
                         "hosted_revert_failed",
                         &err,
-                        &hosted_pin_outcomes(&hosted_matches, OUTCOME_FAILED),
+                        &hosted_pin_outcomes(&hosted_matches, &restored),
                         &telemetry,
                     )
                     .await;
@@ -1793,6 +1808,16 @@ async fn revert_vendored_matches(
                         println!("{line}");
                     }
                 }
+                let failed = crate::telemetry_outcomes::uniform_outcomes(
+                    uuids
+                        .iter()
+                        .filter(|(k, _)| *k == key)
+                        .map(|(k, uuid)| (k.as_str(), uuid.as_str())),
+                    MODE_VENDORED,
+                    OUTCOME_FAILED,
+                    Some("vendor_state_write_failed"),
+                );
+                track_failed(args, "vendor_state_write_failed", &e, &failed, telemetry).await;
                 emit_error_envelope(
                     args.common.json,
                     args.common.dry_run,
@@ -1869,18 +1894,19 @@ async fn sweep_target_orphans(
 /// Restore the hosted pins in `hosted_matches` to their upstream registry
 /// entries. Nothing is written unless every pin resolved (the restore is
 /// all-or-nothing per pin, and a refused pin fails the remove). The error
-/// is the first refusal (or write failure), naming the pin and its remedy.
+/// is the first refusal (or write failure), naming the pin and its remedy,
+/// with the pins the stopped leg did restore.
 async fn unwind_hosted(
     common: &GlobalArgs,
     hosted_matches: &[HostedPin],
     api_client: &RunApiClient,
-) -> Result<HostedLegOutcome, String> {
+) -> Result<HostedLegOutcome, (String, Vec<String>)> {
     let leg = run_hosted_leg(common, hosted_matches, api_client).await;
     // Printed as soon as the leg returns, so a human run that then fails
     // still says what it did to the files.
     print_run_warnings(common, &leg.warnings);
     if let Some((_, why)) = leg.failed.first().cloned() {
-        return Err(why);
+        return Err((why, leg.reverted));
     }
     if let Some(warning) = super::rollback::retire_legacy_redirect_ledger(common).await {
         print_run_warnings(common, std::slice::from_ref(&warning));
@@ -1949,15 +1975,17 @@ async fn remove_hosted_only(
 ) -> i32 {
     let loud = !args.common.json && !args.common.silent;
     if args.skip_rollback {
+        let msg = format!(
+            "{} matches only hosted lockfile pins; removing one means restoring its \
+             upstream registry entry, which --skip-rollback prevents",
+            args.identifier
+        );
+        track_failed(args, "hosted_state_retained", &msg, &[], telemetry).await;
         emit_error_envelope(
             args.common.json,
             args.common.dry_run,
             "hosted_state_retained",
-            format!(
-                "{} matches only hosted lockfile pins; removing one means restoring its \
-                 upstream registry entry, which --skip-rollback prevents",
-                args.identifier
-            ),
+            msg,
         );
         return 1;
     }
@@ -2000,12 +2028,12 @@ async fn remove_hosted_only(
 
     let leg = match unwind_hosted(&args.common, &hosted_matches, api_client).await {
         Ok(leg) => leg,
-        Err(err) => {
+        Err((err, restored)) => {
             track_failed(
                 args,
                 "hosted_revert_failed",
                 "hosted redirect revert failed",
-                &hosted_pin_outcomes(&hosted_matches, OUTCOME_FAILED),
+                &hosted_pin_outcomes(&hosted_matches, &restored),
                 telemetry,
             )
             .await;
@@ -2043,7 +2071,7 @@ async fn remove_hosted_only(
         track_patch_removed(
             "remove",
             leg.reverted.len(),
-            &hosted_pin_outcomes(&restored, "removed"),
+            &hosted_pin_outcomes(&restored, &leg.reverted),
             telemetry,
         )
         .await;
@@ -2072,15 +2100,17 @@ async fn remove_ledger_only(
 ) -> i32 {
     let loud = !args.common.json && !args.common.silent;
     if args.skip_rollback {
+        let msg = format!(
+            "{} matches only vendored patches with no manifest record; removing one \
+             means reverting its vendoring, which --skip-rollback prevents",
+            args.identifier
+        );
+        track_failed(args, "vendor_state_retained", &msg, &[], telemetry).await;
         emit_error_envelope(
             args.common.json,
             args.common.dry_run,
             "vendor_state_retained",
-            format!(
-                "{} matches only vendored patches with no manifest record; removing one \
-                 means reverting its vendoring, which --skip-rollback prevents",
-                args.identifier
-            ),
+            msg,
         );
         return 1;
     }
@@ -2176,11 +2206,10 @@ async fn remove_ledger_only(
             env.error = Some(EnvelopeError::new("vendor_revert_kept", msg));
         }
     }
-    if args.common.json {
-        crate::ui::print_json(&env.to_value());
-    }
     // One event per run: a removal that took nothing out is the failure
-    // alone, not a failure and a removal of zero.
+    // alone, not a failure and a removal of zero. Sent before the
+    // envelope prints, so a consumer that closes stdout on it cannot drop
+    // the event.
     match &env.error {
         Some(error) => {
             track_failed(
@@ -2203,6 +2232,9 @@ async fn remove_ledger_only(
         }
         None => {}
     }
+    if args.common.json {
+        crate::ui::print_json(&env.to_value());
+    }
     kept_exit_code(&args.common, &leg.kept_causes, "ledger record")
 }
 
@@ -2211,6 +2243,43 @@ mod tests {
     use super::*;
     use socket_patch_core::manifest::schema::PatchRecord;
     use std::collections::HashMap;
+
+    /// A hosted leg that stopped on one pin may have restored others. The
+    /// failure event counts only the refused pin as failed: the restored
+    /// one was taken out.
+    #[test]
+    fn a_stopped_hosted_leg_reports_what_it_restored_as_removed() {
+        const RESTORED: &str = "11111111-1111-4111-8111-111111111111";
+        const REFUSED: &str = "22222222-2222-4222-8222-222222222222";
+        let pin = |purl: &str, uuid: &str| HostedPin {
+            purl: purl.to_string(),
+            uuid: uuid.to_string(),
+            files: vec!["package-lock.json".to_string()],
+        };
+        let pins = [
+            pin("pkg:npm/a@1.0.0", RESTORED),
+            pin("pkg:npm/b@1.0.0", REFUSED),
+        ];
+
+        let outcomes = hosted_pin_outcomes(&pins, &["pkg:npm/a@1.0.0".to_string()]);
+        let named: Vec<(&str, &str, Option<&str>)> = outcomes
+            .iter()
+            .map(|o| (o.uuid.as_str(), o.outcome, o.code.as_deref()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                (REFUSED, OUTCOME_FAILED, Some("hosted_revert_failed")),
+                (RESTORED, "removed", None),
+            ]
+        );
+        assert!(outcomes.iter().all(|o| o.mode == MODE_HOSTED));
+
+        // Nothing restored (a failed write): every pin failed.
+        let outcomes = hosted_pin_outcomes(&pins, &[]);
+        assert!(outcomes.iter().all(|o| o.outcome == OUTCOME_FAILED));
+        assert_eq!(outcomes.len(), 2);
+    }
 
     fn make_record(uuid: &str) -> PatchRecord {
         PatchRecord {

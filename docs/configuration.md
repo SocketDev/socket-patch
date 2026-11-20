@@ -113,7 +113,8 @@ A `scan` reports once for each project directory it scans. A failure event
 carries the subset of its row's fields known when it failed, plus `error_code`:
 the code the command's `--json` output reports (for example `patch_not_found`
 or `rollback_failed`). `patch_fetch_failed` reports `uuid` only when you asked
-for a patch by UUID.
+for a patch by UUID. A command that stops on a usage error, or because another
+run holds the lock, reports nothing.
 
 #### Patches named in an event
 

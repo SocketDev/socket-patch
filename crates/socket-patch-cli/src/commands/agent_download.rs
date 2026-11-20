@@ -1593,6 +1593,18 @@ pub(crate) struct DetachedDownload {
 }
 
 impl DetachedDownload {
+    /// The patches the phase could not download, as the run's telemetry
+    /// names them: the vendor step never sees these (it works from the
+    /// records that did download), so its event adds them.
+    pub(crate) fn failed_outcomes(&self) -> Vec<socket_patch_core::telemetry::PatchOutcome> {
+        crate::telemetry_outcomes::patch_outcomes_of(
+            self.events
+                .iter()
+                .filter(|event| event.action == EventAction::Failed),
+            socket_patch_core::telemetry::MODE_VENDORED,
+        )
+    }
+
     /// Fold the phase's events and warnings into `env` (records via
     /// [`Envelope::record`], so `summary` and `status` follow) and hand back
     /// the exit code and the records.
@@ -1844,11 +1856,12 @@ fn fetched_outcomes(events: &[PatchEvent]) -> Vec<socket_patch_core::telemetry::
 }
 
 /// The command an engine run's telemetry reports: the one whose envelope
-/// it fills (`scan`, or `get`).
+/// it fills. `scan` and `get` are the engine's two callers; both pass
+/// their own envelope, printed or not.
 pub(crate) fn telemetry_command(env: &Envelope) -> &'static str {
     match env.command {
-        crate::json_envelope::Command::Get => "get",
-        _ => "scan",
+        EnvelopeCommand::Scan => "scan",
+        _ => "get",
     }
 }
 

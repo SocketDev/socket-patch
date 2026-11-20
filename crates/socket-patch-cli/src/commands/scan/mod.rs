@@ -44,8 +44,7 @@ use crate::json_envelope::{
 use crate::ui::{self, plural, print_json, StatusLine};
 
 use crate::commands::agent_download::{
-    download_and_apply_patches_into, download_and_apply_patches_with, DownloadParams, DownloadRun,
-    ALREADY_IN_MANIFEST,
+    download_and_apply_patches_into, DownloadParams, DownloadRun, ALREADY_IN_MANIFEST,
 };
 
 use self::policy::{load_invocation_policy, InvocationPolicy, PolicyLoadError, ScanPolicy};
@@ -4319,10 +4318,14 @@ async fn scan_project(
         // record and the nested apply re-applies them (a no-op on disk
         // when the installed copy is still patched).
         let to_download: Vec<_> = selected.iter().chain(&already_recorded).cloned().collect();
-        let (code, outcome) = download_and_apply_patches_with(
+        // Into a scan envelope (never printed here): the engine reports
+        // its telemetry under the command whose envelope it fills.
+        let mut outcome = scan_envelope(&args.common);
+        let code = download_and_apply_patches_into(
             &to_download,
             &params,
             &download_run(&args, &api_client),
+            &mut outcome,
         )
         .await;
         // Under the apply's result line: one row per package it left

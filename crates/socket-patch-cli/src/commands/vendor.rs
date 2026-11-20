@@ -1321,6 +1321,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                 &env,
                 args.common.dry_run,
                 &uuids,
+                &[],
                 telemetry,
             )
             .await;
@@ -2082,6 +2083,7 @@ async fn run_eject(
             &env,
             common.dry_run,
             &eject_uuids,
+            &[],
             &telemetry,
         )
         .await;
@@ -2197,6 +2199,7 @@ async fn run_eject(
             &env,
             common.dry_run,
             &eject_uuids,
+            &[],
             &telemetry,
         )
         .await;
@@ -2246,7 +2249,7 @@ async fn run_eject(
         if common.json {
             println!("{}", env.to_pretty_json());
         }
-        track_outcomes_for_vendor("vendor", false, &env, true, &eject_uuids, &telemetry).await;
+        track_outcomes_for_vendor("vendor", false, &env, true, &eject_uuids, &[], &telemetry).await;
         return 0;
     }
 
@@ -2563,6 +2566,7 @@ async fn run_eject(
         &env,
         common.dry_run,
         &eject_uuids,
+        &[],
         &telemetry,
     )
     .await;
@@ -2608,11 +2612,7 @@ async fn track_revert(
     if args.common.dry_run {
         return;
     }
-    let patches = crate::telemetry_outcomes::patch_outcomes(
-        &env.events,
-        MODE_VENDORED,
-        crate::telemetry_outcomes::uuid_lookup(uuids),
-    );
+    let patches = vendor_outcomes(env, uuids);
     let removed = socket_patch_core::telemetry::PatchOutcome::count(&patches, "removed");
     let telemetry = args.common.telemetry_auth();
     if exit != 0 && removed == 0 {
@@ -2630,23 +2630,41 @@ async fn track_revert(
     }
 }
 
+/// The patches a vendor run's events are about, as its telemetry names
+/// them. The events name packages; `uuids` (purl → patch UUID) names
+/// their patches. A swept orphan directory is left out: its event names
+/// the package it once held, which would credit the sweep to the patch
+/// the ledger records for that package now.
+fn vendor_outcomes(
+    env: &Envelope,
+    uuids: &HashMap<String, String>,
+) -> Vec<socket_patch_core::telemetry::PatchOutcome> {
+    crate::telemetry_outcomes::patch_outcomes(
+        env.events
+            .iter()
+            .filter(|event| event.error_code.as_deref() != Some("vendor_orphan_removed")),
+        MODE_VENDORED,
+        crate::telemetry_outcomes::uuid_lookup(uuids),
+    )
+}
+
 /// Telemetry for a vendor run's success/failure split, shared by
 /// [`run`] and the vendor step of `scan` / `get --mode vendored`
-/// (`command` is the one the user ran). The run's events name packages;
-/// `uuids` (purl → patch UUID) names their patches.
+/// (`command` is the one the user ran). `uuids` names the patches of the
+/// run's events ([`vendor_outcomes`]); `download_failures` are the
+/// patches a download phase before the step could not get, which the
+/// step's own events never name.
 pub(crate) async fn track_outcomes_for_vendor(
     command: &'static str,
     has_errors: bool,
     env: &Envelope,
     dry_run: bool,
     uuids: &HashMap<String, String>,
+    download_failures: &[socket_patch_core::telemetry::PatchOutcome],
     telemetry: &TelemetryAuth,
 ) {
-    let patches = crate::telemetry_outcomes::patch_outcomes(
-        &env.events,
-        MODE_VENDORED,
-        crate::telemetry_outcomes::uuid_lookup(uuids),
-    );
+    let patches =
+        crate::telemetry_outcomes::with_more(vendor_outcomes(env, uuids), download_failures);
     if has_errors {
         let code = env
             .error
@@ -2666,17 +2684,34 @@ pub(crate) async fn track_outcomes_for_vendor(
     }
 }
 
-/// purl → patch UUID over what this project records: the vendor ledger's
-/// entries (under their key and their base purl) and the manifest's
-/// records. For the telemetry of a run whose events name packages only.
-/// Nothing is read when telemetry is off.
+/// [`read_recorded_patch_uuids`] for a run's telemetry: nothing is read
+/// when telemetry is off.
 async fn recorded_patch_uuids(
     common: &GlobalArgs,
     manifest_path: &Path,
 ) -> HashMap<String, String> {
-    let mut uuids = HashMap::new();
     if socket_patch_core::telemetry::is_telemetry_disabled() {
-        return uuids;
+        return HashMap::new();
+    }
+    read_recorded_patch_uuids(&common.project_root(), manifest_path).await
+}
+
+/// purl → patch UUID over what the project at `root` records: the vendor
+/// ledger's entries, and over them the manifest's records. For the
+/// telemetry of a `vendor` run, whose events name packages only. The
+/// manifest wins: it is what the run vendors from, and the ledger may
+/// still hold the patch a failed run was replacing. Only keys are
+/// recorded, never an entry's base purl: a purl with no key of its own is
+/// matched across qualifiers by the lookup, which refuses an ambiguous one.
+async fn read_recorded_patch_uuids(root: &Path, manifest_path: &Path) -> HashMap<String, String> {
+    let mut uuids = HashMap::new();
+    if let Ok(state) = load_state(root).await {
+        uuids.extend(
+            state
+                .entries
+                .into_iter()
+                .map(|(key, entry)| (key, entry.uuid)),
+        );
     }
     if let Ok(Some(manifest)) = read_manifest(manifest_path).await {
         uuids.extend(
@@ -2685,12 +2720,6 @@ async fn recorded_patch_uuids(
                 .into_iter()
                 .map(|(purl, record)| (purl, record.uuid)),
         );
-    }
-    if let Ok(state) = load_state(&common.project_root()).await {
-        for (key, entry) in state.entries {
-            uuids.insert(entry.base_purl, entry.uuid.clone());
-            uuids.insert(key, entry.uuid);
-        }
     }
     uuids
 }
@@ -6595,6 +6624,73 @@ mod gc_tests {
                 Vec::new(),
             )
         }
+    }
+
+    /// A `vendor` run's events are credited to the patch the manifest
+    /// records, not to the one the ledger still holds for the package: a
+    /// run that fails to replace a patch leaves the old one in the ledger.
+    #[tokio::test]
+    async fn telemetry_credits_the_manifests_patch_over_the_ledgers() {
+        const NEW_UUID: &str = "22222222-2222-4222-8222-222222222222";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            PURL.to_string(),
+            socket_patch_core::manifest::schema::PatchRecord {
+                uuid: NEW_UUID.to_string(),
+                exported_at: String::new(),
+                files: HashMap::new(),
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            },
+        );
+        let manifest_path = root.join(".socket/manifest.json");
+        tokio::fs::create_dir_all(root.join(".socket"))
+            .await
+            .unwrap();
+        write_manifest(&manifest_path, &manifest).await.unwrap();
+        let mut state = VendorState::default();
+        state.entries.insert(PURL.to_string(), entry(false));
+        // A ledger-only entry keeps its own patch.
+        let other = "pkg:npm/other@1.0.0?artifact_id=x";
+        state.entries.insert(other.to_string(), entry(true));
+        save_state(root, &state).await.unwrap();
+
+        let uuids = read_recorded_patch_uuids(root, &manifest_path).await;
+        assert_eq!(uuids.get(PURL).map(String::as_str), Some(NEW_UUID));
+        assert_eq!(uuids.get(other).map(String::as_str), Some(UUID));
+        // Keys only: an entry's base purl is not a key of its own.
+        assert_eq!(uuids.len(), 2, "{uuids:?}");
+    }
+
+    /// A swept orphan directory names the package it once held. Its
+    /// `removed` event must not be credited to the patch the ledger
+    /// records for that package, which this run kept.
+    #[test]
+    fn a_swept_orphan_is_not_credited_to_the_ledgers_patch() {
+        let mut env = Envelope::new(Command::Vendor);
+        env.record(
+            PatchEvent::new(PatchAction::Skipped, PURL)
+                .with_reason("vendor_revert_kept", "the lockfile drifted"),
+        );
+        env.record(
+            PatchEvent::new(PatchAction::Removed, PURL)
+                .with_reason("vendor_orphan_removed", "an unowned artifact directory"),
+        );
+        let uuids: HashMap<String, String> = [(PURL.to_string(), UUID.to_string())].into();
+
+        let outcomes = vendor_outcomes(&env, &uuids);
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        assert_eq!(outcomes[0].uuid, UUID);
+        assert_eq!(outcomes[0].outcome, "skipped");
+        assert_eq!(outcomes[0].code.as_deref(), Some("vendor_revert_kept"));
+        assert_eq!(
+            socket_patch_core::telemetry::PatchOutcome::count(&outcomes, "removed"),
+            0
+        );
     }
 
     /// Tempdir with: a manifest carrying PURL, a ledger with one entry,

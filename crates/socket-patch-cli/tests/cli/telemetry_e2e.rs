@@ -56,6 +56,23 @@ fn run_cmd(
     )
 }
 
+/// [`run_cmd`] without `--json`: the output a person gets.
+fn run_human(
+    cwd: &Path,
+    api_url: &str,
+    subcommand: &str,
+    extra_args: &[&str],
+) -> (i32, String, String) {
+    let out = build_cmd_as(cwd, api_url, subcommand, false, extra_args, &[])
+        .output()
+        .expect("run socket-patch");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
 /// The [`run_cmd`] invocation, unstarted (for tests that wire its stdio).
 fn build_cmd(
     cwd: &Path,
@@ -64,16 +81,30 @@ fn build_cmd(
     extra_args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> Command {
-    let mut args = vec![
-        subcommand,
-        "--json",
+    build_cmd_as(cwd, api_url, subcommand, true, extra_args, extra_env)
+}
+
+/// [`build_cmd`], with `--json` or without.
+fn build_cmd_as(
+    cwd: &Path,
+    api_url: &str,
+    subcommand: &str,
+    json: bool,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Command {
+    let mut args = vec![subcommand];
+    if json {
+        args.push("--json");
+    }
+    args.extend_from_slice(&[
         "--api-url",
         api_url,
         "--api-token",
         "fake-token-for-test",
         "--org",
         ORG_SLUG,
-    ];
+    ]);
     args.extend_from_slice(extra_args);
     // The binary binds a wide `SOCKET_*` env surface; an ambient value
     // silently changes what these tests exercise — SOCKET_ECOSYSTEMS=cargo
@@ -357,6 +388,33 @@ async fn get_emits_patch_fetched_telemetry_on_uuid_lookup_success() {
             .map(|r| r.url.path().to_string())
             .collect::<Vec<_>>()
     );
+}
+
+/// A `get` for a patch that does not exist reports the failure with the
+/// code its `--json` output carries, like every other failure event.
+#[tokio::test]
+async fn get_of_an_unknown_patch_reports_not_found() {
+    const UUID: &str = "12345678-1234-4123-8123-123456789abc";
+    // No view endpoint is mounted: the lookup is a 404.
+    let mock = setup_mock(
+        serde_json::json!({ "packages": [], "canAccessPaidPatches": false }),
+        None,
+    )
+    .await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+
+    let (_code, stdout, stderr) = run_cmd(tmp.path(), &mock.uri(), "get", &["--id", UUID], &[]);
+    let bodies = telemetry_bodies(&mock).await;
+    assert_eq!(
+        bodies.len(),
+        1,
+        "stdout:\n{stdout}\nstderr:\n{stderr}\n{bodies:#?}"
+    );
+    let failed = &bodies[0];
+    assert_eq!(failed["event_type"], "patch_fetch_failed");
+    assert_eq!(failed["metadata"]["error_code"], "not_found");
+    assert_eq!(failed["metadata"]["uuid"], UUID);
 }
 
 #[tokio::test]
@@ -1152,22 +1210,8 @@ async fn a_hosted_failure_is_coded_the_same_without_json() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_hosted_npm_project(tmp.path());
 
-    let cmd = build_cmd(tmp.path(), &mock.uri(), "scan", &["--yes"], &[]);
-    let args: Vec<std::ffi::OsString> = cmd
-        .get_args()
-        .filter(|arg| *arg != "--json")
-        .map(std::ffi::OsString::from)
-        .collect();
-    let mut human = hermetic_command(&binary());
-    human.args(&args).current_dir(tmp.path());
-    for (key, value) in cmd.get_envs() {
-        match value {
-            Some(value) => human.env(key, value),
-            None => human.env_remove(key),
-        };
-    }
-    let out = human.output().expect("run socket-patch");
-    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let (code, stdout, stderr) = run_human(tmp.path(), &mock.uri(), "scan", &["--yes"]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
 
     let bodies = telemetry_bodies(&mock).await;
     let failed = bodies
@@ -1513,93 +1557,96 @@ async fn an_agent_mode_scan_reports_its_downloads_and_its_applies() {
         },
         "vulnerabilities": {},
     });
-    let mock = setup_mock(batch, Some(view)).await;
-    // The detail query the selection runs for each package the batch
-    // found a patch for.
-    Mock::given(method("GET"))
-        .and(wiremock::matchers::path_regex(format!(
-            "^/v0/orgs/{ORG_SLUG}/patches/by-package/.+$"
-        )))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "patches": [{
-                "uuid": UUID, "purl": PURL,
-                "publishedAt": "2024-06-01T00:00:00Z",
-                "description": "test patch", "license": "MIT", "tier": "free",
-                "vulnerabilities": {}
-            }],
-            "canAccessPaidPatches": false,
-        })))
-        .mount(&mock)
-        .await;
-    let tmp = tempfile::tempdir().expect("tempdir");
-    write_root_package_json(tmp.path());
-    write_npm_package(tmp.path(), "lodash", "4.17.20");
+    // With `--json` and without: the two take different paths through the
+    // download engine, and both report under `scan`.
+    for json in [true, false] {
+        let mock = setup_mock(batch.clone(), Some(view.clone())).await;
+        // The detail query the selection runs for each package the batch
+        // found a patch for.
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex(format!(
+                "^/v0/orgs/{ORG_SLUG}/patches/by-package/.+$"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "patches": [{
+                    "uuid": UUID, "purl": PURL,
+                    "publishedAt": "2024-06-01T00:00:00Z",
+                    "description": "test patch", "license": "MIT", "tier": "free",
+                    "vulnerabilities": {}
+                }],
+                "canAccessPaidPatches": false,
+            })))
+            .mount(&mock)
+            .await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_root_package_json(tmp.path());
+        write_npm_package(tmp.path(), "lodash", "4.17.20");
 
-    let (code, stdout, stderr) = run_cmd(
-        tmp.path(),
-        &mock.uri(),
-        "scan",
-        &["--mode", "agent", "--yes"],
-        &[],
-    );
-    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert_eq!(
-        std::fs::read(tmp.path().join("node_modules/lodash/index.js")).ok(),
-        Some(b"patched\n".to_vec()),
-        "stdout:\n{stdout}\nstderr:\n{stderr}"
-    );
+        let flags = ["--mode", "agent", "--yes"];
+        let (code, stdout, stderr) = if json {
+            run_cmd(tmp.path(), &mock.uri(), "scan", &flags, &[])
+        } else {
+            run_human(tmp.path(), &mock.uri(), "scan", &flags)
+        };
+        assert_eq!(code, 0, "json={json}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(
+            std::fs::read(tmp.path().join("node_modules/lodash/index.js")).ok(),
+            Some(b"patched\n".to_vec()),
+            "json={json}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
 
-    let bodies = telemetry_bodies(&mock).await;
-    let types: Vec<&str> = bodies
-        .iter()
-        .map(|b| b["event_type"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        types,
-        ["patch_scanned", "patch_fetched", "patch_applied"],
-        "{bodies:#?}"
-    );
+        let bodies = telemetry_bodies(&mock).await;
+        let types: Vec<&str> = bodies
+            .iter()
+            .map(|b| b["event_type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            ["patch_scanned", "patch_fetched", "patch_applied"],
+            "json={json}: {bodies:#?}"
+        );
 
-    let scanned = &bodies[0];
-    assert_eq!(scanned["metadata"]["mode"], "agent");
-    assert_eq!(scanned["metadata"]["dry_run"], false);
-    assert_eq!(scanned["metadata"]["packages_scanned"], 1);
-    assert_eq!(
-        scanned["metadata"]["packages_by_ecosystem"],
-        serde_json::json!({ "npm": 1 })
-    );
-    assert_eq!(
-        scanned["metadata"]["patches_by_ecosystem"],
-        serde_json::json!({ "npm": 1 })
-    );
+        let scanned = &bodies[0];
+        assert_eq!(scanned["metadata"]["mode"], "agent");
+        assert_eq!(scanned["metadata"]["dry_run"], false);
+        assert_eq!(scanned["metadata"]["packages_scanned"], 1);
+        assert_eq!(
+            scanned["metadata"]["packages_by_ecosystem"],
+            serde_json::json!({ "npm": 1 })
+        );
+        assert_eq!(
+            scanned["metadata"]["patches_by_ecosystem"],
+            serde_json::json!({ "npm": 1 })
+        );
 
-    let fetched = &bodies[1];
-    assert_eq!(fetched["context"]["command"], "scan");
-    assert_eq!(fetched["metadata"]["mode"], "agent");
-    assert_eq!(fetched["metadata"]["patches_count"], 1);
-    assert_eq!(
-        only_patch(fetched),
-        &serde_json::json!({
-            "uuid": UUID,
-            "ecosystem": "npm",
-            "mode": "agent",
-            "outcome": "downloaded",
-        })
-    );
+        let fetched = &bodies[1];
+        assert_eq!(fetched["context"]["command"], "scan", "json={json}");
+        assert_eq!(fetched["metadata"]["mode"], "agent");
+        assert_eq!(fetched["metadata"]["patches_count"], 1);
+        assert_eq!(
+            only_patch(fetched),
+            &serde_json::json!({
+                "uuid": UUID,
+                "ecosystem": "npm",
+                "mode": "agent",
+                "outcome": "downloaded",
+            })
+        );
 
-    let applied = &bodies[2];
-    assert_eq!(applied["context"]["command"], "scan");
-    assert_eq!(applied["metadata"]["mode"], "agent");
-    assert_eq!(applied["metadata"]["patches_count"], 1);
-    assert_eq!(only_patch(applied)["uuid"], UUID);
-    assert_eq!(only_patch(applied)["outcome"], "applied");
+        let applied = &bodies[2];
+        assert_eq!(applied["context"]["command"], "scan", "json={json}");
+        assert_eq!(applied["metadata"]["mode"], "agent");
+        assert_eq!(applied["metadata"]["patches_count"], 1);
+        assert_eq!(only_patch(applied)["uuid"], UUID);
+        assert_eq!(only_patch(applied)["outcome"], "applied");
 
-    // One run, one session: the three events are linked.
-    let sessions: std::collections::HashSet<&str> = bodies
-        .iter()
-        .map(|b| b["session_id"].as_str().unwrap())
-        .collect();
-    assert_eq!(sessions.len(), 1);
+        // One run, one session: the three events are linked.
+        let sessions: std::collections::HashSet<&str> = bodies
+            .iter()
+            .map(|b| b["session_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(sessions.len(), 1);
+    }
 }
 
 /// A telemetry endpoint the test answers by hand. It accepts one

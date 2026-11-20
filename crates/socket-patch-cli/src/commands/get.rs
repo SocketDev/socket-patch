@@ -51,17 +51,6 @@ use crate::json_envelope::{
 };
 use crate::ui::{print_json, select_one, SelectError};
 
-/// Best-effort ecosystem extractor for a `pkg:<eco>/...` PURL. Used as
-/// the telemetry `ecosystem` field. Returns an empty string when the
-/// PURL is malformed — telemetry events should never block on input
-/// validation.
-fn ecosystem_from_purl(purl: &str) -> String {
-    purl.strip_prefix("pkg:")
-        .and_then(|rest| rest.split('/').next())
-        .unwrap_or("")
-        .to_string()
-}
-
 /// A fresh `get` envelope for this run (`dryRun` from the flags).
 fn new_envelope(common: &GlobalArgs) -> Envelope {
     let mut env = Envelope::new(JsonCommand::Get);
@@ -128,7 +117,14 @@ async fn report_fetch_failure(
     common: &GlobalArgs,
 ) -> i32 {
     let msg = error.to_string();
-    track_patch_fetch_failed(identifier, &msg, fallback_to_proxy, telemetry).await;
+    track_patch_fetch_failed(
+        identifier,
+        "patch_fetch_failed",
+        &msg,
+        fallback_to_proxy,
+        telemetry,
+    )
+    .await;
     report_error(common, "patch_fetch_failed", msg)
 }
 
@@ -1329,7 +1325,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 track_patch_fetched(
                     &patch.uuid,
                     &patch.tier,
-                    &ecosystem_from_purl(&patch.purl),
+                    &crate::telemetry_outcomes::ecosystem_of(&patch.purl),
                     mode.cli_name(),
                     fallback_to_proxy,
                     &telemetry,
@@ -1408,6 +1404,7 @@ pub async fn run(args: GetArgs) -> i32 {
             Ok(None) => {
                 track_patch_fetch_failed(
                     &args.identifier,
+                    "not_found",
                     "not_found",
                     fallback_to_proxy,
                     &telemetry,
@@ -1881,7 +1878,14 @@ async fn report_paid_required_uuid(
     telemetry: &TelemetryAuth,
     org_warnings: &[(String, String)],
 ) -> i32 {
-    track_patch_fetch_failed(patch_id, "paid_required", fallback_to_proxy, telemetry).await;
+    track_patch_fetch_failed(
+        patch_id,
+        "paid_required",
+        "paid_required",
+        fallback_to_proxy,
+        telemetry,
+    )
+    .await;
     if args.common.json {
         let mut env = new_envelope(&args.common);
         env.status = Status::PaidRequired;
@@ -2517,6 +2521,7 @@ async fn run_get_vendored(
         ))
         .await
     };
+    let download_failures = download.failed_outcomes();
     let (dl_code, _, records) = download.into_envelope(&mut env);
 
     // The vendor step (scan's, verbatim): apply lock, in-memory staging
@@ -2533,6 +2538,7 @@ async fn run_get_vendored(
         report_empty: true,
         prior: None,
         download_errors: dl_code != 0,
+        download_failures,
         telemetry_auth: telemetry,
         closing_lines: None,
     })

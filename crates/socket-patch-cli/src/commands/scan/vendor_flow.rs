@@ -494,6 +494,10 @@ pub(crate) struct VendorStep<'a> {
     /// The download phase failed or refused some patch: the run exits 1
     /// and its telemetry must not report a clean vendoring.
     pub(crate) download_errors: bool,
+    /// The patches the download phase could not get
+    /// (`DetachedDownload::failed_outcomes`), for the step's telemetry to
+    /// name beside the ones it vendored.
+    pub(crate) download_failures: Vec<socket_patch_core::telemetry::PatchOutcome>,
     pub(crate) telemetry_auth: &'a TelemetryAuth,
     /// Lines for the human close to print under its summary line (see
     /// [`VendoredBackend::with_closing_lines`]).
@@ -527,6 +531,7 @@ async fn run_vendor_step(step: VendorStep<'_>) -> VendorStepResult {
         report_empty,
         prior,
         download_errors,
+        download_failures,
         telemetry_auth,
         closing_lines,
     } = step;
@@ -557,20 +562,24 @@ async fn run_vendor_step(step: VendorStep<'_>) -> VendorStepResult {
                 venv,
                 common.dry_run,
                 &uuids,
+                &download_failures,
                 telemetry_auth,
             )
             .await
         }
-        // Nothing was vendored: every selected patch is one the step
-        // failed on.
+        // Nothing was vendored: every downloaded patch is one the step
+        // failed on, beside the ones that never downloaded.
         Err((code, message, _)) => {
-            let failed = crate::telemetry_outcomes::uniform_outcomes(
-                uuids
-                    .iter()
-                    .map(|(purl, uuid)| (purl.as_str(), uuid.as_str())),
-                socket_patch_core::telemetry::MODE_VENDORED,
-                socket_patch_core::telemetry::OUTCOME_FAILED,
-                Some(code),
+            let failed = crate::telemetry_outcomes::with_more(
+                crate::telemetry_outcomes::uniform_outcomes(
+                    uuids
+                        .iter()
+                        .map(|(purl, uuid)| (purl.as_str(), uuid.as_str())),
+                    socket_patch_core::telemetry::MODE_VENDORED,
+                    socket_patch_core::telemetry::OUTCOME_FAILED,
+                    Some(code),
+                ),
+                &download_failures,
             );
             track_patch_vendor_failed(
                 command,
@@ -890,10 +899,10 @@ async fn run_vendor_json_path(
     let params = download_params(
         args, /*save_only=*/ true, /*json=*/ true, /*silent=*/ true,
     );
-    let (dl_code, _, records) =
-        boxed_download_patch_records(&selected, &params, api_client, HashMap::new(), prior)
-            .await
-            .into_envelope(env);
+    let download =
+        boxed_download_patch_records(&selected, &params, api_client, HashMap::new(), prior).await;
+    let download_failures = download.failed_outcomes();
+    let (dl_code, _, records) = download.into_envelope(env);
 
     // 2) The vendor engine, under the same lock as apply/vendor (a no-op
     //    that creates nothing when there is nothing to vendor).
@@ -906,6 +915,7 @@ async fn run_vendor_json_path(
         report_empty: true,
         prior,
         download_errors: dl_code != 0,
+        download_failures,
         telemetry_auth,
         closing_lines: None,
     })
@@ -993,6 +1003,7 @@ async fn run_vendor_interactive_path(
     // the rows under the summary line.
     let download =
         boxed_download_patch_records(selected, params, api_client, prefetched, prior).await;
+    let download_failures = download.failed_outcomes();
     let (dl_code, records) = (download.code, download.records);
     // Patches the download phase could not get (it reported each one).
     let download_failed = download.failed as u64;
@@ -1029,6 +1040,7 @@ async fn run_vendor_interactive_path(
         report_empty: false,
         prior,
         download_errors: dl_code != 0,
+        download_failures,
         telemetry_auth,
         closing_lines: Some(&closing_lines),
     })

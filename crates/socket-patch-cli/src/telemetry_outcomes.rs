@@ -14,13 +14,36 @@ use socket_patch_core::telemetry::{
 
 use crate::json_envelope::{PatchAction, PatchEvent};
 
-/// The ecosystem a purl names (`pkg:npm/…` is `npm`), which is also the
-/// ecosystem's CLI name. Empty for a key that is not a purl.
+/// The ecosystem a purl names, as events spell it: the ecosystem's CLI
+/// name (`npm`, `pypi`, … the names `scan` reports), or the purl's own
+/// type for one this CLI has no ecosystem for. Empty for a key that is
+/// not a purl.
 pub(crate) fn ecosystem_of(purl: &str) -> String {
-    purl.strip_prefix("pkg:")
-        .and_then(|rest| rest.split('/').next())
-        .unwrap_or("")
-        .to_string()
+    match socket_patch_core::crawlers::Ecosystem::from_purl(purl) {
+        Some(ecosystem) => ecosystem.cli_name().to_string(),
+        None => purl
+            .strip_prefix("pkg:")
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or("")
+            .to_string(),
+    }
+}
+
+/// `outcomes` with each of `more` it does not already name (by patch and
+/// mode) added at the end.
+pub(crate) fn with_more(
+    mut outcomes: Vec<PatchOutcome>,
+    more: &[PatchOutcome],
+) -> Vec<PatchOutcome> {
+    for outcome in more {
+        if !outcomes
+            .iter()
+            .any(|have| have.uuid == outcome.uuid && have.mode == outcome.mode)
+        {
+            outcomes.push(outcome.clone());
+        }
+    }
+    outcomes
 }
 
 /// The telemetry word for an envelope action, and how much it says about
@@ -357,9 +380,51 @@ mod tests {
         assert_eq!(lookup("pkg:npm/unknown@1.0.0"), None);
     }
 
+    /// Events spell an ecosystem the way `scan` reports it, so the two
+    /// join: the CLI name, which is not always the purl's type.
     #[test]
-    fn a_key_that_is_not_a_purl_has_no_ecosystem() {
+    fn the_ecosystem_is_the_cli_name() {
+        use socket_patch_core::crawlers::Ecosystem;
         assert_eq!(ecosystem_of("pkg:golang/example.com/m@v1.0.0"), "golang");
+        for purl in [
+            "pkg:npm/a@1.0.0",
+            "pkg:jsr/@std/path@1.0.0",
+            "pkg:gem/a@1.0.0",
+        ] {
+            let ecosystem = Ecosystem::from_purl(purl).expect("a known ecosystem");
+            assert_eq!(ecosystem_of(purl), ecosystem.cli_name(), "{purl}");
+        }
+        // No ecosystem of this CLI: the purl's own type. Not a purl: none.
+        assert_eq!(ecosystem_of("pkg:hex/phoenix@1.7.0"), "hex");
         assert_eq!(ecosystem_of("not-a-purl"), "");
+    }
+
+    #[test]
+    fn with_more_adds_only_the_patches_not_already_named() {
+        let have = vec![entry(A, "npm", MODE_VENDORED, "applied", None)];
+        let more = [
+            // Already named in this mode: the outcome on record stands.
+            entry(A, "npm", MODE_VENDORED, OUTCOME_FAILED, Some("x")),
+            entry(
+                B,
+                "npm",
+                MODE_VENDORED,
+                OUTCOME_FAILED,
+                Some("download_failed"),
+            ),
+        ];
+        assert_eq!(
+            with_more(have, &more),
+            [
+                entry(A, "npm", MODE_VENDORED, "applied", None),
+                entry(
+                    B,
+                    "npm",
+                    MODE_VENDORED,
+                    OUTCOME_FAILED,
+                    Some("download_failed")
+                ),
+            ]
+        );
     }
 }

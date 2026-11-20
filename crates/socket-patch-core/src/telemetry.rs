@@ -247,14 +247,15 @@ fn truncate_chars(text: String, max: usize) -> String {
 
 /// Build a telemetry event. `error` is an `(error_type, message)` pair; the
 /// message is sanitized ([`sanitize_error_message`]) and cut to
-/// [`MAX_ERROR_MESSAGE_CHARS`] before it leaves the process.
+/// [`MAX_ERROR_MESSAGE_CHARS`] before it leaves the process, and the whole
+/// event is made to fit [`MAX_EVENT_BYTES`] ([`fit`]).
 fn build_telemetry_event(
     event_type: PatchTelemetryEventType,
     command: &str,
     metadata: Option<HashMap<String, serde_json::Value>>,
     error: Option<(String, String)>,
 ) -> PatchTelemetryEvent {
-    PatchTelemetryEvent {
+    fit(PatchTelemetryEvent {
         event_sender_created_at: chrono_now_iso(),
         event_type: event_type.as_str().to_string(),
         context: build_telemetry_context(command),
@@ -267,7 +268,50 @@ fn build_telemetry_event(
                 MAX_ERROR_MESSAGE_CHARS,
             )),
         }),
+    })
+}
+
+/// The largest event body sent, in bytes of JSON. The server keeps a body
+/// in a form its dashboards can read only up to 10,000 characters, and a
+/// body never has more characters than bytes.
+const MAX_EVENT_BYTES: usize = 9_000;
+
+/// The shortest an error message is cut to when an event is too large.
+const MIN_ERROR_MESSAGE_CHARS: usize = 200;
+
+/// `event` cut down until its JSON body fits [`MAX_EVENT_BYTES`]. The
+/// caps on the patch list and the error message leave room in almost
+/// every event; what they do not bound is how much a message grows when
+/// JSON escapes it (a quote or a newline doubles, a control character
+/// becomes six). An event that is still too large gives up the tail of
+/// its error message first, then entries off the end of its patch list
+/// (the failed ones lead), flagged `patches_truncated`.
+fn fit(mut event: PatchTelemetryEvent) -> PatchTelemetryEvent {
+    let too_large = |event: &PatchTelemetryEvent| {
+        serde_json::to_string(event).is_ok_and(|body| body.len() > MAX_EVENT_BYTES)
+    };
+    while too_large(&event) {
+        if let Some(message) = event.error.as_mut().and_then(|e| e.message.as_mut()) {
+            let chars = message.chars().count();
+            if chars > MIN_ERROR_MESSAGE_CHARS {
+                let shorter = (chars / 2).max(MIN_ERROR_MESSAGE_CHARS);
+                *message = truncate_chars(std::mem::take(message), shorter);
+                continue;
+            }
+        }
+        let Some(metadata) = event.metadata.as_mut() else {
+            break;
+        };
+        match metadata
+            .get_mut("patches")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            Some(patches) if !patches.is_empty() => patches.truncate(patches.len() / 2),
+            _ => break,
+        }
+        metadata.insert("patches_truncated".to_string(), serde_json::json!(true));
     }
+    event
 }
 
 /// Get the current time as an ISO 8601 string with millisecond precision,
@@ -515,8 +559,8 @@ pub const OUTCOME_FAILED: &str = "failed";
 /// beside the list are of the whole run.
 ///
 /// The cap keeps an event small: the server stores an event's body in a
-/// form its dashboards cannot read once the body passes 10,000 characters,
-/// and one entry is about 110.
+/// form its dashboards cannot read once the body passes 10,000 characters
+/// (see [`MAX_EVENT_BYTES`]), and one entry is about 110.
 pub const MAX_REPORTED_PATCHES: usize = 50;
 
 /// The longest error message an event carries, in characters. One error
@@ -1078,9 +1122,12 @@ fn fetch_failed_uuid(identifier: &str) -> &str {
 
 /// Track a failed `get`. `uuid` may be empty when the failure occurred
 /// before the patch was resolved (e.g. lookup miss); anything that is not
-/// a uuid is reported as empty.
+/// a uuid is reported as empty. `error_code` is the code the run's
+/// `--json` output reports (`not_found`, `paid_required`,
+/// `patch_fetch_failed`).
 pub async fn track_patch_fetch_failed(
     uuid: &str,
+    error_code: &str,
     error: impl std::fmt::Display,
     fallback_to_proxy: bool,
     auth: &TelemetryAuth,
@@ -1090,6 +1137,7 @@ pub async fn track_patch_fetch_failed(
         "get",
         serde_json::json!({
             "uuid": fetch_failed_uuid(uuid),
+            "error_code": error_code,
             "fallback_to_proxy": fallback_to_proxy
         }),
         Some(error),
@@ -1132,12 +1180,17 @@ pub async fn track_patch_repaired(
     );
 }
 
-/// Track a failed `repair`.
-pub async fn track_patch_repair_failed(error: impl std::fmt::Display, auth: &TelemetryAuth) {
+/// Track a failed `repair`: `error_code` is the code its `--json`
+/// envelope reports.
+pub async fn track_patch_repair_failed(
+    error_code: &str,
+    error: impl std::fmt::Display,
+    auth: &TelemetryAuth,
+) {
     fire(
         PatchTelemetryEventType::PatchRepairFailed,
         "repair",
-        serde_json::Value::Null,
+        serde_json::json!({ "error_code": error_code }),
         Some(error),
         auth,
     );
@@ -1168,13 +1221,14 @@ pub async fn track_vex_generated(
     );
 }
 
-/// Track a failed `vex` generation.
-pub async fn track_vex_failed(error: impl std::fmt::Display, auth: &TelemetryAuth) {
+/// Track a failed `vex` generation: `error_code` is the code its error
+/// reports (and, as it always was, the event's error message).
+pub async fn track_vex_failed(error_code: &str, auth: &TelemetryAuth) {
     fire(
         PatchTelemetryEventType::VexFailed,
         "vex",
-        serde_json::Value::Null,
-        Some(error),
+        serde_json::json!({ "error_code": error_code }),
+        Some(error_code),
         auth,
     );
 }
@@ -2313,12 +2367,10 @@ mod tests {
         assert_eq!(own["ecosystems"], serde_json::json!(["cargo"]));
     }
 
-    /// The server keeps an event's body readable to its dashboards only
-    /// up to 10,000 characters: the largest event a run can build (the
-    /// patch cap, every entry with a code, the longest error) stays under.
-    #[test]
-    fn the_largest_event_fits_the_servers_readable_body() {
-        let patches: Vec<PatchOutcome> = (0..MAX_REPORTED_PATCHES * 4)
+    /// The event a rollback failure builds for `failed` patches, every
+    /// entry with a long code, and `message`.
+    fn rollback_failure(failed: usize, message: String) -> PatchTelemetryEvent {
+        let patches: Vec<PatchOutcome> = (0..failed)
             .map(|i| {
                 outcome(
                     &format!("00000000-0000-4000-8000-{i:012}"),
@@ -2342,21 +2394,79 @@ mod tests {
         let serde_json::Value::Object(metadata) = metadata else {
             panic!("metadata is an object");
         };
-        let event = build_telemetry_event(
+        build_telemetry_event(
             PatchTelemetryEventType::PatchRollbackFailed,
             "rollback",
             Some(metadata.into_iter().collect()),
-            Some(("Error".to_string(), "x".repeat(50_000))),
-        );
-        let body = serde_json::to_string(&event).unwrap();
-        assert!(
-            body.chars().count() < 10_000,
-            "the event body is {} characters",
-            body.chars().count()
-        );
-        let message = event.error.unwrap().message.unwrap();
+            Some(("Error".to_string(), message)),
+        )
+    }
+
+    /// The server keeps an event's body readable to its dashboards only
+    /// up to 10,000 characters. The largest event a run can build stays
+    /// under that whatever its error message holds: plain text, or text
+    /// that grows when JSON escapes it (quotes, backslashes, newlines,
+    /// control characters, as in quoted command output or Windows paths).
+    #[test]
+    fn the_largest_event_fits_the_servers_readable_body() {
+        for (what, message) in [
+            ("plain", "x".repeat(50_000)),
+            ("quotes and newlines", "\"line\"\n".repeat(10_000)),
+            ("control characters", "\u{1b}[31m".repeat(10_000)),
+            (
+                "Windows paths",
+                r"C:\Users\dev\project\node_modules\".repeat(2_000),
+            ),
+            ("wide characters", "错误：补丁".repeat(10_000)),
+        ] {
+            // Four times the patch cap: as large as an event gets.
+            let event = rollback_failure(MAX_REPORTED_PATCHES * 4, message);
+            let body = serde_json::to_string(&event).unwrap();
+            assert!(
+                body.len() <= MAX_EVENT_BYTES && body.chars().count() < 10_000,
+                "{what}: the event body is {} bytes",
+                body.len()
+            );
+            // The event still says what failed and why.
+            let metadata = event.metadata.as_ref().unwrap();
+            assert_eq!(metadata["error_code"], "vendor_state_write_failed");
+            assert_eq!(metadata["outcomes"]["failed"], MAX_REPORTED_PATCHES * 4);
+            assert_eq!(metadata["patches_truncated"], true);
+            assert!(
+                !metadata["patches"].as_array().unwrap().is_empty(),
+                "{what}"
+            );
+            let message = event.error.unwrap().message.unwrap();
+            assert!(message.chars().count() >= MIN_ERROR_MESSAGE_CHARS, "{what}");
+        }
+    }
+
+    /// An event with room to spare is sent as built: its message cut to
+    /// the cap and no further, every patch named. Only one that would not
+    /// fit gives up more, and then the tail of its message before any
+    /// patch.
+    #[test]
+    fn an_event_that_fits_is_left_alone() {
+        let event = rollback_failure(5, "\"line\"\n".repeat(10_000));
+        let message = event.error.as_ref().unwrap().message.as_ref().unwrap();
         assert_eq!(message.chars().count(), MAX_ERROR_MESSAGE_CHARS);
-        assert!(message.ends_with('…'));
+        assert!(message.starts_with("\"line\"\n") && message.ends_with('…'));
+        let metadata = event.metadata.as_ref().unwrap();
+        assert_eq!(metadata["patches"].as_array().unwrap().len(), 5);
+        assert!(metadata.get("patches_truncated").is_none());
+
+        // At the patch cap, a message this long does not fit beside the
+        // patches: the message is cut, the patches all stay.
+        let event = rollback_failure(MAX_REPORTED_PATCHES, "x".repeat(50_000));
+        let message = event.error.as_ref().unwrap().message.as_ref().unwrap();
+        assert!(message.chars().count() < MAX_ERROR_MESSAGE_CHARS);
+        assert!(message.chars().count() >= MIN_ERROR_MESSAGE_CHARS);
+        let metadata = event.metadata.as_ref().unwrap();
+        assert_eq!(
+            metadata["patches"].as_array().unwrap().len(),
+            MAX_REPORTED_PATCHES
+        );
+        assert!(metadata.get("patches_truncated").is_none());
     }
 
     #[test]
