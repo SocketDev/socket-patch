@@ -200,3 +200,7 @@ Documented limitations and verified false positives. One bullet each. Search thi
 - `bundle lock --add-platform` on a vendored platform gem fails in Bundler: documented (revert, add the platform, vendor again) (2026-11-20).
 - Agent scan against `tests/nokogiri/patch_service.rb` fails with "Blob not found on server": the stand-in serves no blobs (2026-11-20).
 - Hosted scan over a vendored platform gem is refused with a remedy (`remove` or `vendor --revert` first) (2026-11-20).
+- Two `PatchService` stand-ins on different loopback ports: a scan pointed at one takes the other's `source:` for a foreign source (`redirect_gem_source_option`) and `vex` / `rollback` see no patches. Put one front server before them (2026-11-20).
+- Agent `rollback` fails with "Before blob could not be downloaded" against a mock that serves only the after blobs: serve `@before` too. The real API serves both (2026-11-20).
+- Vendored mode rewrites `gem "sqlite3", "~> 2.10.0"` to the exact `"2.10.2", path:` pin; rollback restores the range byte for byte (2026-11-20).
+- Recompiled `.so` / `gem_make.out` differ after a hosted rollback of a source-built gem (racc, ffi with `force_ruby_platform`): builds are not reproducible; every other file is byte-exact (2026-11-20).
