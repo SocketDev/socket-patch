@@ -26,6 +26,10 @@
 //!
 //! The flow asserts the VEX document of its patch as `main.rs` says.
 //!
+//! A second flow, [`hosted_bundle_fetch_gem_checksums`], runs the command
+//! in the same workspace with a `gem_checksums` on the call that names the
+//! two gems, and holds what a release does there today.
+//!
 //! Both markers are read from what Bazel built, and each holds an id made
 //! for the run, so no cache of an earlier run can supply either gem. The
 //! fixture's lock therefore holds no sha256 of a gem: it has a placeholder
@@ -69,7 +73,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::harness::{
-    fixture_path, rewrite, with_vex, Cell, Claim, Fixture, How, StandIn, CONSUMER,
+    changed, fixture_path, rewrite, with_vex, Cell, Claim, Fixture, How, Ran, StandIn, CONSUMER,
+    NOTHING,
 };
 use crate::hosted_memory_common::Patch;
 
@@ -222,6 +227,89 @@ fn grant(standin: &StandIn, uuid: &str, url: &str, index: &str, patched: &[u8]) 
     standin.api(&[patch]);
 }
 
+/// What a flow serves on its stand-in and builds: the upstream gem and the
+/// patched gem, one gem with two texts in its one file, each with an id
+/// that is new for every run. The grant names the patch host as production
+/// does, with a token and the patch id in the paths of the artifact and of
+/// the patch registry.
+struct Served {
+    standin: StandIn,
+    /// The id of the patch.
+    uuid: String,
+    /// The line the consumer prints from the upstream gem, and from the
+    /// patched one.
+    unpatched: String,
+    patched: String,
+    upstream_gem: Vec<u8>,
+    patched_gem: Vec<u8>,
+    neighbour_gem: Vec<u8>,
+    /// The patch registry of the grant, and the routes of the gem on
+    /// rubygems.org and on that registry.
+    index: String,
+    upstream_route: String,
+    patched_route: String,
+}
+
+impl Served {
+    /// Starts the stand-in, and sends the downloads of `cell`'s Bazel to it.
+    fn start(cell: &mut Cell) -> Served {
+        let run = uuid::Uuid::new_v4().to_string();
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let token = uuid::Uuid::new_v4().to_string();
+        let patched_gem = victim(&format!("PATCHED {uuid}"));
+        let upstream_gem = victim(&format!("PRISTINE {run}"));
+        let neighbour_gem = neighbour();
+        let registry = format!("{PATCH_HOST}/patch-registry/gem/{token}/{uuid}");
+        let index = format!("https://{registry}/");
+        let artifact = format!(
+            "https://{PATCH_HOST}/patch/gem/{NAME}/{VERSION}/{token}/{uuid}/{NAME}-{VERSION}.gem"
+        );
+        let (upstream_route, patched_route) =
+            (gem_route(RUBYGEMS, NAME), gem_route(&registry, NAME));
+
+        let standin = StandIn::start();
+        let origin = standin.origin();
+        standin.serve(5, &upstream_route, &upstream_gem);
+        standin.serve(5, &gem_route(RUBYGEMS, NEIGHBOUR), &neighbour_gem);
+        standin.serve(5, &patched_route, &patched_gem);
+        // What `rollback` reads to restore the upstream `CHECKSUMS` line: the
+        // gem's file of the compact index, one line per version.
+        let info = format!("---\n{VERSION} |checksum:{}\n", sha256_hex(&upstream_gem));
+        standin.serve(5, &format!("/{RUBYGEMS}/info/{NAME}"), info.as_bytes());
+        grant(&standin, &uuid, &artifact, &index, &patched_gem);
+        // Bazel's downloads of the fixture's two gems on rubygems.org and of
+        // anything on the patch host go to the stand-in, under the route
+        // prefix of the host. A URL of the patch host that no rule rewrote is
+        // refused, so no download of Bazel's reaches the real one.
+        let gems = |name: &str| rewrite(&format!("{RUBYGEMS}/gems/{name}-"), &origin);
+        cell.route_downloads(&[
+            gems(NAME),
+            gems(NEIGHBOUR),
+            rewrite(&format!("{PATCH_HOST}/"), &origin),
+            format!("block {PATCH_HOST}"),
+        ]);
+        Served {
+            standin,
+            unpatched: format!("OUT: PRISTINE {run}"),
+            patched: format!("OUT: PATCHED {uuid}"),
+            uuid,
+            upstream_gem,
+            patched_gem,
+            neighbour_gem,
+            index,
+            upstream_route,
+            patched_route,
+        }
+    }
+}
+
+/// `socket-patch <args>` in `cell`, against `standin`.
+fn socket_patch_at(standin: &StandIn, cell: &Cell, args: &[&str]) -> Ran {
+    let origin = standin.origin();
+    let rubygems = format!("{origin}/{RUBYGEMS}");
+    cell.socket_patch(&origin, args, &[("SOCKET_RUBYGEMS_URL", rubygems.as_str())])
+}
+
 /// The flow of the module docs.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
@@ -232,51 +320,20 @@ fn hosted_bundle_fetch() {
         return;
     };
     let release = cell.release().to_string();
-
-    // The upstream gem and the patched gem: one gem with two texts in its
-    // one file, each with an id that is new for every run. The grant names
-    // the patch host as production does, with a token and the patch id in
-    // the paths of the artifact and of the patch registry.
-    let run = uuid::Uuid::new_v4().to_string();
-    let uuid = uuid::Uuid::new_v4().to_string();
-    let token = uuid::Uuid::new_v4().to_string();
-    let unpatched = format!("OUT: PRISTINE {run}");
-    let patched = format!("OUT: PATCHED {uuid}");
-    let patched_gem = victim(&format!("PATCHED {uuid}"));
-    let upstream_gem = victim(&format!("PRISTINE {run}"));
-    let neighbour_gem = neighbour();
-    let registry = format!("{PATCH_HOST}/patch-registry/gem/{token}/{uuid}");
-    let index = format!("https://{registry}/");
-    let artifact = format!(
-        "https://{PATCH_HOST}/patch/gem/{NAME}/{VERSION}/{token}/{uuid}/{NAME}-{VERSION}.gem"
-    );
-    let (upstream_route, patched_route) = (gem_route(RUBYGEMS, NAME), gem_route(&registry, NAME));
-
-    let standin = StandIn::start();
+    let Served {
+        standin,
+        uuid,
+        unpatched,
+        patched,
+        upstream_gem,
+        patched_gem,
+        neighbour_gem,
+        index,
+        upstream_route,
+        patched_route,
+    } = Served::start(&mut cell);
     let origin = standin.origin();
-    standin.serve(5, &upstream_route, &upstream_gem);
-    standin.serve(5, &gem_route(RUBYGEMS, NEIGHBOUR), &neighbour_gem);
-    standin.serve(5, &patched_route, &patched_gem);
-    // What `rollback` reads to restore the upstream `CHECKSUMS` line: the
-    // gem's file of the compact index, one line per version.
-    let info = format!("---\n{VERSION} |checksum:{}\n", sha256_hex(&upstream_gem));
-    standin.serve(5, &format!("/{RUBYGEMS}/info/{NAME}"), info.as_bytes());
-    grant(&standin, &uuid, &artifact, &index, &patched_gem);
-    let rubygems = format!("{origin}/{RUBYGEMS}");
-    let socket_patch = |cell: &Cell, args: &[&str]| {
-        cell.socket_patch(&origin, args, &[("SOCKET_RUBYGEMS_URL", rubygems.as_str())])
-    };
-    // Bazel's downloads of the fixture's two gems on rubygems.org and of
-    // anything on the patch host go to the stand-in, under the route prefix
-    // of the host. A URL of the patch host that no rule rewrote is refused,
-    // so no download of Bazel's reaches the real one.
-    let gems = |name: &str| rewrite(&format!("{RUBYGEMS}/gems/{name}-"), &origin);
-    cell.route_downloads(&[
-        gems(NAME),
-        gems(NEIGHBOUR),
-        rewrite(&format!("{PATCH_HOST}/"), &origin),
-        format!("block {PATCH_HOST}"),
-    ]);
+    let socket_patch = |cell: &Cell, args: &[&str]| socket_patch_at(&standin, cell, args);
 
     // (a) The unpatched build. The lock of the checkout pins the two
     // upstream gems of this run, which only the stand-in has.
@@ -394,6 +451,100 @@ fn hosted_bundle_fetch() {
         before.len(),
         standin.asked(&upstream_route),
         standin.asked(&patched_route),
+        started.elapsed()
+    );
+}
+
+/// The fixture's `MODULE.bazel` with a `gem_checksums` on its
+/// `ruby.bundle_fetch` call, which holds version [`VERSION`] of each gem of
+/// `sums` to the sha256 beside its name: the file a test writes into its
+/// workspace copy. The call stays on the line it is on.
+fn module_pinning(sums: &[(&str, &str)]) -> String {
+    let path = fixture_path(FIXTURE.dir).join("e9/MODULE.bazel");
+    let module = std::fs::read_to_string(&path).expect("the fixture's MODULE.bazel");
+    let lock = "    gemfile_lock = \"//:Gemfile.lock\",\n";
+    assert_eq!(module.matches(lock).count(), 1, "{}", path.display());
+    let entry =
+        |(name, sha256): &(&str, &str)| format!("        \"{name}-{VERSION}\": \"{sha256}\",\n");
+    let entries: String = sums.iter().map(entry).collect();
+    module.replace(
+        lock,
+        &format!("{lock}    gem_checksums = {{\n{entries}    }},\n"),
+    )
+}
+
+/// Hosted mode beside a hub that pins the gem: the `ruby.bundle_fetch` call
+/// of the workspace copy holds each of the two gems to the sha256 of its
+/// upstream archive in `gem_checksums`, as the examples of rules_ruby do.
+/// rules_ruby gives Bazel's downloader that sha256 for the gem, whatever
+/// the lock says.
+///
+/// What a release does today: `scan --mode hosted --yes` exits 0 and
+/// reports the gem applied, with the patch registry and the sha256 of the
+/// patched gem in `Gemfile.lock`, and the call as it was. The same `bazel
+/// build` then fails. Bazel has the upstream gem in its repository cache
+/// under the sha256 the call names and takes it from there, and Bundler, in
+/// the `bundle install` action of the build, refuses it for the sha256 of
+/// the lock.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn hosted_bundle_fetch_gem_checksums() {
+    let test = "ruby::hosted_bundle_fetch_gem_checksums";
+    let started = Instant::now();
+    let Some(mut cell) = Cell::open(test, &FIXTURE) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let served = Served::start(&mut cell);
+    let (other, upstream, patched) = (
+        sha256_hex(&served.neighbour_gem),
+        sha256_hex(&served.upstream_gem),
+        sha256_hex(&served.patched_gem),
+    );
+
+    // (a) The unpatched build, with the two upstream gems pinned in the
+    // lock and in the call.
+    cell.write(
+        "Gemfile.lock",
+        lock_pinning(&served.neighbour_gem, &served.upstream_gem),
+    );
+    cell.write(
+        "MODULE.bazel",
+        module_pinning(&[(NEIGHBOUR, &other), (NAME, &upstream)]),
+    );
+    let before = cell.builds_unpatched(&served.unpatched);
+
+    // (b) The one command of hosted mode: applied, in the two files.
+    let scan = socket_patch_at(
+        &served.standin,
+        &cell,
+        &["scan", "--mode", "hosted", "--yes"],
+    );
+    let files = ["Gemfile", "Gemfile.lock"];
+    let pinned = cell.pinned_by(&scan, PURL, &served.uuid, &before, &files);
+    let lock = String::from_utf8_lossy(&pinned["Gemfile.lock"]).into_owned();
+    assert!(lock.contains(&checksum(NAME, &patched)), "{test}:\n{lock}");
+
+    // (c) The same build fails: the gem Bazel hands Bundler is the upstream
+    // one, and the lock holds the patched one's sha256.
+    let build = cell.bazel("build", &[CONSUMER]);
+    assert!(!build.ok(), "{test}: the build passed:\n{}", build.dump());
+    let stderr = build.stderr();
+    let sums = [&patched, &upstream].map(|sum| format!("sha256={sum}"));
+    assert!(
+        stderr.contains("mismatched checksums") && sums.iter().all(|sum| stderr.contains(sum)),
+        "{test}: the build did not fail on the checksum of the gem:\n{}",
+        build.dump()
+    );
+    assert_eq!(changed(&pinned, &cell.tree()), NOTHING, "{test}");
+
+    println!(
+        "{test}: Bazel {release} built {:?}; `scan --mode hosted` exited 0 and reported the gem \
+         applied, and the next build failed (Bundler: mismatched checksums) on the upstream \
+         gem that `gem_checksums` names; the stand-in answered {} requests for the patched gem; \
+         {:?}",
+        served.unpatched,
+        served.standin.asked(&served.patched_route),
         started.elapsed()
     );
 }
