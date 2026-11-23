@@ -2893,21 +2893,26 @@ a file of the package's project that the vendored run for that package would poi
 
 | Call | Attributes | Files of the project that count |
 |---|---|---|
-| rules_python `pip.parse` | `requirements_lock`, `requirements_by_platform`, `requirements_darwin`, `requirements_linux`, `requirements_windows`, `uv_lock` | `requirements.txt` and each file it includes with `-r` (in the project), where the run would write them; `uv.lock` in a uv project |
+| rules_python `pip.parse` | `requirements_lock`, `requirements_by_platform`, `requirements_darwin`, `requirements_linux`, `requirements_windows`, `uv_lock` | `requirements.txt` and each file it includes with `-r` (in the project), as one set, where the run writes a requirements file; `uv.lock` in a uv project |
 | rules_ruby `ruby.bundle_fetch` | `gemfile_lock`, `gemfile` | `Gemfile`, `Gemfile.lock` |
-| any call of the `WORKSPACE` file that passes one of those attributes (`pip_parse`, `rb_bundle_fetch`) | the same | the same |
+| any call of the `WORKSPACE` file that passes one of those attributes (`pip_parse`, `rb_bundle_fetch`) | the same; a label `@<name>//...` names the main repository where the file says `workspace(name = "<name>")` | the same |
 
 Which files a run writes depends on the tool that locks the Python project, as in the matrix
 at the top:
 
-- A project with no tool lock is wired through its requirements files. They count.
+- A project with no tool lock is wired through its requirements files. They count as one
+  set: a package is declined when the hub reads any file of the set, also one that does not
+  pin it, because that file can bring in the rewritten one with `-r`.
 - A uv, Pipenv or PEP 751 lock is wired together with a pin of the same package in the
   requirements files beside it. So those files count for a package they name, and not for
   one they do not name.
 - A Poetry or PDM lock is wired alone. A hub that reads the requirements file exported from
   it stands in no run's way, and the package is vendored as it is without Bazel. Bazel goes on
   building the registry's package from that file; `socket-patch vex` does not say so yet (see
-  the limits of [Bazel workspaces: VEX](#bazel-workspaces-vex)).
+  the limits of [Bazel workspaces: VEX](#bazel-workspaces-vex)). The one exception is a
+  requirements file that holds the package by a URL, which is what a hosted pin is: a
+  vendored run that takes the pin over restores that line, so the files count and the
+  package is declined.
 
 Every such call counts, also one that may not run (in a comprehension, behind an `and`). The
 refusal is for every package whose run would write a file the call names, since the lock is
@@ -2975,8 +2980,11 @@ the file that the call names already names the copy of the same patch
 what the hub reads. So a project that was vendored with the switch, or by an earlier release,
 keeps passing its runs without the switch, a `scan` or `get` with no `--mode` included, which
 runs in vendored mode there. A new patch for that package, or another package, is declined
-until the run has the switch. Where the reading is uncertain no file is known to be the
-hub's, so nothing is let through: every vendored run there needs the switch.
+until the run has the switch. Where the calls name more than one file of the project, each
+of them that holds the package has to name the copy: a `uv.lock` that was locked again
+beside a vendored requirements file does not, and the package is declined. Where the reading
+is uncertain no file is known to be the hub's, so nothing is let through: every vendored run
+there needs the switch.
 
 Passing such a run does not mean that the build is the patched one. A build that takes the
 project's packages from the hub fails on a vendored PyPI package, and on a vendored gem
@@ -2990,7 +2998,8 @@ Limits:
   `.bzl` file that a `WORKSPACE` file loads, a hub that another Bazel module declares,
   another tag or another ruleset that reads the same file under Bzlmod (rules_ruby's older
   `ruby.bundle`, rules_pycross, aspect_rules_py), a `WORKSPACE` call that hides its
-  arguments behind `**`, a Bazel root that the lookup does not reach, and a hub whose call
+  arguments behind `**`, the `pip_install(requirements = ...)` of an older rules_python in a
+  `WORKSPACE` file, a Bazel root that the lookup does not reach, and a hub whose call
   and whose `bazel_dep` are both in an included file that cannot be read, while the files
   that were read name neither.
 - Declined although the build would pass: a `WORKSPACE` file that names the lock while the
@@ -3001,8 +3010,10 @@ Limits:
   is already vendored where the file that names its copy is not the one the call names (a
   requirements file that the named one includes with `-r`; the `Gemfile` when the call names
   the lock too and the lock does not name the copy), any already vendored package where the
-  reading is uncertain, and a package of a uv, Pipenv or PEP 751 project that the
-  requirements file names in a form that is not wired with the lock (a range, extras).
+  reading is uncertain, a package of a uv, Pipenv or PEP 751 project that the
+  requirements file names in a form that is not wired with the lock (a range, extras), and a
+  package of a project with no tool lock where the hub reads a file of the requirements set
+  that neither pins the package nor brings in the file that does.
 - Only the `Gemfile` spelling is looked for, as vendored mode wires no `gems.rb` project.
 - A `pip.parse` that names a `uv.lock` is declined by the rule above, not by a measurement:
   no build was run on a vendored `uv.lock`.

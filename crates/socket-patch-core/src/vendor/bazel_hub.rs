@@ -14,7 +14,9 @@
 //!
 //! Which lock a hub reads is in the files of the workspace
 //! ([`crate::bazel::built::reader`]), so the refusal is for a package whose
-//! run would write a file that one reads and for no other. A project
+//! run may write a file that one reads and for no other. The requirements
+//! files of a project count as one set there, since a file the hub reads
+//! can bring in the rewritten one with `-r`. A project
 //! beside a workspace whose calls name other files is vendored as it is
 //! without Bazel, and so is a package whose run leaves the file the hub
 //! reads alone: one of a Poetry or PDM project, whose lock is wired alone,
@@ -100,9 +102,12 @@ async fn refusals_unless<'a>(
         };
         // The files a hub can be given that the run for this package would
         // point at a copy. With none, no hub stands in its way.
-        let locks = match purls {
-            "pypi" => super::pypi::hub_files(project, purl).await,
-            _ => ["Gemfile", "Gemfile.lock"].map(String::from).to_vec(),
+        let locks = match Ecosystem::from_purl(purl) {
+            Some(Ecosystem::Pypi) => super::pypi::hub_files(project, purl).await,
+            Some(Ecosystem::Gem) => [super::gem::GEMFILE, super::gem::GEMFILE_LOCK]
+                .map(String::from)
+                .to_vec(),
+            _ => continue,
         };
         if locks.is_empty() {
             continue;
@@ -122,13 +127,41 @@ async fn refusals_unless<'a>(
         // A lock names the copy of a patch by the copy's directory, outside
         // a comment (`#` starts one in each of these files).
         let copy = vendor_uuid_dir_rel(purls, uuid).map(|dir| format!("{dir}/"));
-        let wired = match (lock, copy) {
+        let names = |lock: &Option<String>| match (lock, &copy) {
             (Some(lock), Some(copy)) => {
-                let names = |line: &str| line.split('#').next().is_some_and(|l| l.contains(&copy));
+                let names = |line: &str| line.split('#').next().is_some_and(|l| l.contains(copy));
                 lock.lines().any(names)
             }
             _ => false,
         };
+        let mut wired = names(lock);
+        // The first file a call names says nothing of a second one. Another
+        // file of the list that a call names stands in the way when it
+        // holds the package and not by the copy (a `uv.lock` locked again
+        // beside a vendored requirements file): the run would rewrite it.
+        // One that cannot be read may hold it.
+        let name = purl
+            .rsplit('/')
+            .next()
+            .and_then(|rest| rest.split('@').next());
+        let squash = |text: &str| text.to_ascii_lowercase().replace(['_', '.'], "-");
+        let name = squash(name.unwrap_or_default());
+        let holds = |text: &Option<String>| match text {
+            Some(text) => squash(text).contains(&name),
+            None => true,
+        };
+        let files = &asked[at].0 .1;
+        let several = wired && files.len() > 1;
+        for file in files.iter().filter(|_| several) {
+            if !wired {
+                break;
+            }
+            if let Some(Ok(named)) = reader(&root, purls, vec![file.clone()]).await {
+                let dir = root.dir.clone();
+                let text = run_blocking(move || lock_text(&dir, &named.lock)).await;
+                wired = names(&text) || !holds(&text);
+            }
+        }
         if !wired {
             refused.push((*purl, code, detail.clone()));
         }
@@ -320,9 +353,16 @@ ruby.bundle_fetch(name = "bundle", gemfile = "//api:Gemfile", gemfile_lock = "//
         };
         let line = format!("./.socket/vendor/pypi/{UUID}/a-1.0.0-py3-none-any.whl  # a==1.0.0\n");
         let path = format!("PATH\n  remote: .socket/vendor/gem/{UUID}/b-1.0.0\n");
+        let gemfile = path.replace("remote:", "gem 'b', path:");
         fs::write(api.join("base.txt"), &line).unwrap();
+        fs::write(api.join("Gemfile"), &gemfile).unwrap();
         fs::write(api.join("Gemfile.lock"), &path).unwrap();
         assert_eq!(declined().await, [other]);
+        // The other file the call names is read too: a Gemfile that cannot
+        // be read may hold the gem by the registry.
+        fs::remove_file(api.join("Gemfile")).unwrap();
+        assert_eq!(declined().await, [other, gem]);
+        fs::write(api.join("Gemfile"), &gemfile).unwrap();
         // The lock is read as a file of the workspace is: one that is a
         // link out of the Bazel root lets nothing through.
         #[cfg(unix)]
@@ -340,11 +380,6 @@ ruby.bundle_fetch(name = "bundle", gemfile = "//api:Gemfile", gemfile_lock = "//
         assert_eq!(declined().await, [wheel, other]);
         // Named by the Gemfile alone: the lock is the file the call names
         // first, and it still holds the registry's gem.
-        fs::write(
-            api.join("Gemfile"),
-            path.replace("remote:", "gem 'b', path:"),
-        )
-        .unwrap();
         fs::write(api.join("Gemfile.lock"), "GEM\n  specs:\n    b (1.0.0)\n").unwrap();
         assert_eq!(declined().await, [wheel, other, gem]);
         // A hub whose file is not written out: no lock is known to be its.
@@ -352,6 +387,25 @@ ruby.bundle_fetch(name = "bundle", gemfile = "//api:Gemfile", gemfile_lock = "//
         let unwritten = HUBS.replace("\"//api:base.txt\"", "LOCK");
         fs::write(root.join("MODULE.bazel"), unwritten).unwrap();
         assert_eq!(declined().await, [wheel, other, gem]);
+        // A second file that the hub reads: the uv lock, locked again
+        // beside the vendored requirements file. It holds the package by
+        // the registry's wheel, so the run would rewrite it.
+        let both = "\"//api:base.txt\", uv_lock = \"//api:uv.lock\"";
+        fs::write(
+            root.join("MODULE.bazel"),
+            HUBS.replace("\"//api:base.txt\"", both),
+        )
+        .unwrap();
+        let entry =
+            |source: &str| format!("[[package]]\nname = \"a\"\nversion = \"1.0.0\"\n{source}");
+        fs::write(api.join("uv.lock"), entry("")).unwrap();
+        assert_eq!(declined().await, [wheel, other, gem]);
+        // Held by the copy there too, or not held at all: let through.
+        let copy = format!("source = {{ path = \".socket/vendor/pypi/{UUID}/a.whl\" }}\n");
+        fs::write(api.join("uv.lock"), entry(&copy)).unwrap();
+        assert_eq!(declined().await, [other, gem]);
+        fs::write(api.join("uv.lock"), "").unwrap();
+        assert_eq!(declined().await, [other, gem]);
     }
 
     /// The uv lock of the project is a file a hub can be given, and a hub
@@ -416,6 +470,12 @@ ruby.bundle_fetch(name = "bundle", gemfile = "//api:Gemfile", gemfile_lock = "//
             fs::write(root.join("MODULE.bazel"), &unwritten).unwrap();
             assert_eq!(pypi().await, None, "{lock}, a hub in doubt");
             fs::write(root.join("MODULE.bazel"), &hub).unwrap();
+            // But for a hosted pin of the requirements file: a run that
+            // takes it over restores the line the hub reads.
+            let hosted = "x @ https://h/x-1.0.0-py3-none-any.whl\n";
+            fs::write(api.join("requirements.txt"), hosted).unwrap();
+            assert_eq!(pypi().await, Some(PYPI_CODE), "{lock}, a hosted pin");
+            fs::write(api.join("requirements.txt"), "x==1.0.0\n").unwrap();
             fs::remove_file(api.join(lock)).unwrap();
         }
         // A uv or Pipenv lock is wired with the pin of the requirements

@@ -497,6 +497,22 @@ pub(super) async fn sibling_names_package(root: &Path, canon_name: &str) -> bool
     files.is_ok_and(|files| files.iter().any(names))
 }
 
+/// Whether a requirements file of the project names the package by a URL
+/// (`name @ https://...`), which is the form of a hosted pin. A lock that
+/// is wired alone leaves the requirements files as they are, but a run
+/// that takes a hosted pin over restores the line that holds it.
+pub(super) async fn sibling_names_package_by_url(root: &Path, canon_name: &str) -> bool {
+    let by_url = |file: &ReqFile| {
+        logical_lines(&file.content).into_iter().any(|ll| {
+            let text = strip_comment(&ll.text);
+            let named = requirement_name(text).map(canonicalize_pypi_name);
+            text.contains("://") && named.as_deref() == Some(canon_name)
+        })
+    };
+    let files = collect_requirements_files(root).await;
+    files.is_ok_and(|files| files.iter().any(by_url))
+}
+
 /// #1873: refuse a requirements line naming `canon_name` through a
 /// `${NAME}` pip expands where it runs (`six==${SIXV}`). What it installs
 /// is unknowable here, so the vendor neither rewrites it nor names the file

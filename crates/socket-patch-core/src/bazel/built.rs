@@ -295,15 +295,22 @@ fn reads(
         .and_then(|read| read.as_ref().ok());
     let passes = |call: &&Call| hub.files.iter().any(|file| call.arg(file).is_some());
     let legacy = legacy.into_iter().flat_map(|(name, file)| {
+        // `workspace(name = "shop")` makes `@shop//` the main repository
+        // for the labels of that file.
+        let main = file.calls.iter().find_map(workspace_name);
         let calls = file.calls.iter().filter(passes);
-        calls.map(move |call| (name.as_str(), call, call.callee.as_str()))
+        calls.map(move |call| (name.as_str(), call, call.callee.as_str(), main))
     });
+    let tagged = tagged.map(|(file, call, name)| (file, call, name, None));
     let mut doubt = tags.doubts.first().cloned();
     let mut called = doubt.is_some();
-    for (file, call, name) in tagged.chain(legacy) {
+    for (file, call, name, main) in tagged.chain(legacy) {
         called = true;
         let own = |lock: &String| locks.iter().any(|own| below(project, own) == *lock);
-        if let Some(lock) = files(workspace, call, hub.files).into_iter().find(own) {
+        if let Some(lock) = files(workspace, call, hub.files, main)
+            .into_iter()
+            .find(own)
+        {
             return Some(Ok(Unbuilt {
                 call: name.to_string(),
                 file: file.to_string(),
@@ -338,6 +345,14 @@ fn reads(
     let hidden = || workspace.doubts.first().filter(|_| may());
     let unread = || workspace.legacy.as_ref()?.as_ref().err();
     doubt.or_else(|| hidden().or_else(unread).cloned()).map(Err)
+}
+
+/// The name a `workspace(name = ...)` call gives the main repository.
+fn workspace_name(call: &Call) -> Option<&str> {
+    match (call.callee.as_str(), call.arg("name")) {
+        ("workspace", Some(Value::Str(name))) => Some(name.as_str()),
+        _ => None,
+    }
 }
 
 /// The most of a lock that is read: the lock of a large pnpm workspace has
@@ -399,7 +414,7 @@ fn judge(
         let mut listed = HashMap::new();
         let elsewhere = |call: &Call| call.unpacks() || call.arg("uv_lock").is_some();
         for tag in (tags.calls.iter()).filter(|tag| tag.call.whole && !elsewhere(tag.call)) {
-            for lock in files(workspace, tag.call, hub.files) {
+            for lock in files(workspace, tag.call, hub.files, None) {
                 for &at in &ours {
                     let package = &packages[at];
                     let unpatched = match &package.pins {
@@ -452,8 +467,15 @@ fn judge(
 
 /// The files of the main repository that `call` names under `attributes`,
 /// each by its path from the Bazel root. An attribute that is not written
-/// out as a string, or as a dict with strings as keys, names none.
-fn files(workspace: &Workspace, call: &Call, attributes: &[&str]) -> Vec<String> {
+/// out as a string, or as a dict with strings as keys, names none. `main`
+/// is the name a `WORKSPACE` file gives the main repository, for a call of
+/// that file: `@<main>//` is then the main repository too.
+fn files(
+    workspace: &Workspace,
+    call: &Call,
+    attributes: &[&str],
+    main: Option<&str>,
+) -> Vec<String> {
     let mut labels: Vec<&str> = Vec::new();
     for attribute in attributes {
         match call.arg(attribute) {
@@ -464,13 +486,16 @@ fn files(workspace: &Workspace, call: &Call, attributes: &[&str]) -> Vec<String>
             _ => {}
         }
     }
-    let main = |label: &&str| {
-        let label = workspace
-            .label(label)
-            .filter(|label| label.repo == Repo::Main);
-        label.map(|label| label.path())
+    let ours = |label: &&str| {
+        let label = workspace.label(label)?;
+        let ours = match &label.repo {
+            Repo::Main => true,
+            Repo::Apparent(repo) => main == Some(repo.as_str()),
+            Repo::Canonical(_) => false,
+        };
+        ours.then(|| label.path())
     };
-    labels.iter().filter_map(main).collect()
+    labels.iter().filter_map(ours).collect()
 }
 
 /// The path from the Bazel root of `file`, a path from the project in the
@@ -1182,6 +1207,17 @@ use_repo(ruby, "bundle")
         // A file that calls neither says nothing of them.
         let rule = "http_archive(name = \"x\", urls = [LOCK])\n";
         let files = [("WORKSPACE", rule)];
+        assert_eq!(reader_of(&files, "svc", "pypi", &["requirements.txt"]), "");
+        // The name the file gives the main repository names it in a label
+        // of that file; without that call the label is another
+        // repository's.
+        let call =
+            "pip_parse(name = \"pypi\", requirements_lock = \"@shop//svc:requirements.txt\")\n";
+        let named = format!("workspace(name = \"shop\")\n{call}");
+        let files = [("WORKSPACE", named.as_str())];
+        let pip = "pip_parse WORKSPACE:2 svc/requirements.txt";
+        assert_eq!(reader_of(&files, "svc", "pypi", &["requirements.txt"]), pip);
+        let files = [("WORKSPACE", call)];
         assert_eq!(reader_of(&files, "svc", "pypi", &["requirements.txt"]), "");
     }
 
