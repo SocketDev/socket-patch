@@ -4496,6 +4496,53 @@ mod tests {
     use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
     use std::collections::HashMap;
 
+    /// The command this warning tells the user to run is one they paste:
+    /// a record's purl can carry qualifiers (`?platform=ruby`,
+    /// `?artifact_id=...`) and `--cwd` can hold a space, and a shell
+    /// would glob or split either one unquoted (#2182).
+    #[test]
+    fn other_scope_warning_prints_a_command_a_shell_reads_as_written() {
+        let quoted = |word: &str| {
+            if cfg!(windows) {
+                format!("\"{word}\"")
+            } else {
+                format!("'{word}'")
+            }
+        };
+        let purl = "pkg:gem/rack@3.1.8?platform=ruby";
+        let path = Path::new("/gems/rack-3.1.8");
+        let local = crate::args::GlobalArgs::default();
+        let warning = patched_in_other_scope_warning(purl, path, &local);
+        assert!(
+            warning.contains(&format!("run `socket-patch rollback {} -g` to", quoted(purl))),
+            "{warning}"
+        );
+        // The message's own naming of the package stays the plain purl.
+        assert!(warning.starts_with(&format!("{purl}: its copy in")), "{warning}");
+
+        let global = crate::args::GlobalArgs {
+            global: true,
+            cwd: PathBuf::from("my app"),
+            ..crate::args::GlobalArgs::default()
+        };
+        let warning = patched_in_other_scope_warning(purl, path, &global);
+        assert!(
+            warning.contains(&format!(
+                "run `socket-patch rollback {} --cwd {}` to",
+                quoted(purl),
+                quoted("my app")
+            )),
+            "{warning}"
+        );
+
+        // A purl no shell treats specially is printed bare, as before.
+        let plain = patched_in_other_scope_warning("pkg:cargo/serde@1.0.0", path, &local);
+        assert!(
+            plain.contains("run `socket-patch rollback pkg:cargo/serde@1.0.0 -g` to"),
+            "{plain}"
+        );
+    }
+
     // The legacy path-taking delegation shape, kept for the unit tests below
     // (`remove` now threads its already-loaded manifest and ledger straight
     // into `rollback_patches_inner`; this wrapper reads them from disk). The

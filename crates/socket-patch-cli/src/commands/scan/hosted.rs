@@ -5938,6 +5938,42 @@ mod tests {
                  `socket-patch scan` again."
             )
         );
+        // A gem record's purl carries `?platform=ruby`. The note names the
+        // pin as `rollback` selects it, without the qualifier: with it the
+        // command matches no hosted pin, and its `?` is a glob character
+        // that zsh refuses and bash under `nullglob` drops, leaving a bare
+        // `rollback` (#2182).
+        let qualified = [
+            pin("pkg:gem/rack@3.1.8?platform=ruby"),
+            pin("pkg:gem/nokogiri@1.16.0?platform=x86_64-linux"),
+        ];
+        for command in ["scan", "get"] {
+            let note =
+                super::format_gem_hold_note(&edits[..1], &qualified, command, false).unwrap();
+            assert!(
+                note.contains("run `socket-patch rollback pkg:gem/rack@3.1.8`, then"),
+                "{note}"
+            );
+            assert!(!note.contains('?'), "{note}");
+        }
+        // Two records of the one release (a ruby and a platform build) are
+        // one pin, so the note still names it.
+        let builds = [
+            pin("pkg:gem/rack@3.1.8?platform=ruby"),
+            pin("pkg:gem/rack@3.1.8?platform=x86_64-linux"),
+        ];
+        let note = super::format_gem_hold_note(&edits[..1], &builds, "scan", false).unwrap();
+        assert!(
+            note.contains("run `socket-patch rollback pkg:gem/rack@3.1.8`, then"),
+            "{note}"
+        );
+        // Two versions of it are two pins: the user fills in which.
+        let versions = [pin("pkg:gem/rack@3.1.8"), pin("pkg:gem/rack@2.2.8")];
+        let note = super::format_gem_hold_note(&edits[..1], &versions, "scan", false).unwrap();
+        assert!(
+            note.contains("run `socket-patch rollback pkg:gem/<gem>@<version>`, then"),
+            "{note}"
+        );
         // No bare `socket-patch rollback` anywhere: it unwinds every patch.
         for edits in [&edits[..], &edits[..1]] {
             for confirmed in [&confirmed[..], &[]] {
