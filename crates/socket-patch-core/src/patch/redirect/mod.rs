@@ -51,6 +51,7 @@ mod group_equivalence_tests;
 #[cfg(test)]
 mod lock_index_equivalence_tests;
 mod maven_index;
+pub mod mirror;
 pub mod npm_allow_scripts;
 pub mod npmrc;
 mod pdm;
@@ -5983,7 +5984,10 @@ const BERRY_MANIFEST: &str = "package.json";
 /// this run's own artifact URL, or a URL on the same patch server (scheme,
 /// host and port of `artifact_url`) whose leaf names the package version.
 /// A user's own tarball for the package — a mirror, a fork — is on another
-/// origin and is never ours to rewrite.
+/// origin and is never ours to rewrite. When `artifact_url` is served under
+/// a patch mirror's base, whose host serves the project's own packages
+/// too, the URL must also sit under that base
+/// ([`crate::origin::same_hosted_base`]).
 fn berry_hosted_pin_is_ours(
     url: &str,
     name: &str,
@@ -6006,7 +6010,7 @@ fn berry_hosted_pin_is_ours(
         }
         _ => false,
     };
-    names_it && same_origin
+    names_it && same_origin && crate::origin::same_hosted_base(url, artifact_url)
 }
 
 /// Whether `value` (a `resolutions` value) is a hosted tarball pin written
@@ -6689,6 +6693,9 @@ fn rewrite_bun_lock(
 /// override — nothing about the patch server's URL layout is assumed — and
 /// anything that fails to parse fails the match (closed): user URL deps live
 /// on other origins, and another version's artifact has a different leaf.
+/// Under a patch mirror, whose host serves the project's own packages too,
+/// the two must also share the mirror's base
+/// ([`crate::origin::same_hosted_base`]).
 pub(crate) fn is_prior_hosted_bun_spec(spec: &str, fname: &str, current_url: &str) -> bool {
     let Some(old_url) = spec
         .strip_prefix(fname)
@@ -6712,7 +6719,9 @@ pub(crate) fn is_prior_hosted_bun_spec(spec: &str, fname: &str, current_url: &st
         Some((&url[..path_start], leaf))
     }
     match (origin_and_leaf(old_url), origin_and_leaf(current_url)) {
-        (Some(old), Some(new)) => old == new,
+        (Some(old), Some(new)) => {
+            old == new && crate::origin::same_hosted_base(old_url, current_url)
+        }
         _ => false,
     }
 }
@@ -16019,6 +16028,60 @@ mod tests {
         assert!(fresh.files.is_empty());
         assert!(fresh.yarn_berry_uuids.contains(BERRY_UUID));
         assert!(fresh.confirmed_yarn_berry_uuids.is_empty());
+    }
+
+    /// Under a patch mirror, whose host serves the project's own packages
+    /// too, yarn berry and Bun take over an earlier pin only under the
+    /// mirror's base: a tarball of the same name and version in another
+    /// repository of that host is the project's own source.
+    #[test]
+    fn a_tarball_elsewhere_on_the_mirrors_host_is_not_an_earlier_pin() {
+        let base = "https://repo.example/artifactory/socket-patch";
+        let leaf = "left-pad-1.3.0.tgz";
+        let current = format!("{base}/patch/npm/left-pad/1.3.0/new/u2/{leaf}");
+        let earlier = format!("{base}/patch/npm/left-pad/1.3.0/old/u1/{leaf}");
+        let fork = format!("https://repo.example/artifactory/npm-local/left-pad/-/{leaf}");
+
+        assert!(berry_hosted_pin_is_ours(
+            &earlier,
+            "left-pad",
+            Some("1.3.0"),
+            &current
+        ));
+        assert!(berry_hosted_pin_is_ours(
+            &earlier, "left-pad", None, &current
+        ));
+        assert!(!berry_hosted_pin_is_ours(
+            &fork,
+            "left-pad",
+            Some("1.3.0"),
+            &current
+        ));
+        assert!(!berry_hosted_pin_is_ours(&fork, "left-pad", None, &current));
+
+        let spec = |url: &str| format!("left-pad@{url}");
+        assert!(is_prior_hosted_bun_spec(
+            &spec(&earlier),
+            "left-pad",
+            &current
+        ));
+        assert!(!is_prior_hosted_bun_spec(
+            &spec(&fork),
+            "left-pad",
+            &current
+        ));
+
+        // On the patch server itself the origin and the file name decide,
+        // as they always have: nothing else is served from that host.
+        let direct = current.replace(base, "https://patch.socket.dev");
+        let stale = earlier.replace(base, "https://patch.socket.dev");
+        assert!(berry_hosted_pin_is_ours(
+            &stale,
+            "left-pad",
+            Some("1.3.0"),
+            &direct
+        ));
+        assert!(is_prior_hosted_bun_spec(&spec(&stale), "left-pad", &direct));
     }
 
     /// A lock written by an earlier release carries the old

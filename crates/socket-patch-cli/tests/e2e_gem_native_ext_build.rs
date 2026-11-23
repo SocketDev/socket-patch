@@ -3183,11 +3183,10 @@ impl JavaGem {
 
     /// The gem file `file` as [`walk_files`] of `vendor/` names it.
     fn vendor_rel(&self, file: &str) -> String {
-        let mut path = self
-            .gem_dir
-            .strip_prefix(self.proj.join("vendor"))
-            .unwrap()
-            .to_path_buf();
+        // Component by component: `gem_dir` was joined from `/` strings,
+        // and Windows would keep those separators where the walk has `\`.
+        let rel = self.gem_dir.strip_prefix(self.proj.join("vendor")).unwrap();
+        let mut path: PathBuf = rel.components().collect();
         path.extend(file.split('/'));
         path.display().to_string()
     }

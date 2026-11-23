@@ -98,7 +98,7 @@ fn is_berry_checksum(s: &str) -> bool {
 /// Ruby and `.npmrc`), `<` `>` `&` (XML), `#` (a fragment: the locks append
 /// their own `#<sha1>` / `#sha256=`), and `;` `|` `^`. Whitespace, control
 /// characters and anything outside ASCII are never URL characters.
-fn is_url_char(c: char) -> bool {
+pub(crate) fn is_url_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "-._~:/?[]@!()*+,=%".contains(c)
 }
 

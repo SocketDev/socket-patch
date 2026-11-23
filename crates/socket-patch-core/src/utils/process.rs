@@ -64,6 +64,10 @@ pub const CHILD_ENV_SCRUB: &[&str] = &[
     // proxy URL.
     "SOCKET_CLI_CONFIG",
     "SOCKET_CLI_API_PROXY",
+    // The operator's credential for their patch mirror
+    // (`--patch-mirror-url`): only this CLI's own check of the mirror
+    // sends it.
+    "SOCKET_PATCH_MIRROR_AUTHORIZATION",
     // The other accepted socket-cli aliases (`env_compat::PEER_ENV_ALIASES`)
     // and the canonical name of the one that is not a flag.
     "SOCKET_CLI_ORG_SLUG",
@@ -80,6 +84,7 @@ pub const CHILD_ENV_SCRUB: &[&str] = &[
     "SOCKET_VENDOR_SOURCE",
     "SOCKET_VENDOR_URL",
     "SOCKET_PATCH_SERVER_URL",
+    "SOCKET_PATCH_MIRROR_URL",
     "SOCKET_OFFLINE",
     "SOCKET_STRICT",
     "SOCKET_GLOBAL",
@@ -98,6 +103,7 @@ pub const CHILD_ENV_SCRUB: &[&str] = &[
     "SOCKET_NO_GEM_NATIVE_REBUILD",
     "SOCKET_NO_GEM_INSTALL_REFRESH",
     "SOCKET_GEM_REFRESH_SHARED",
+    "SOCKET_ALLOW_VENDORED_IN_BAZEL",
     "SOCKET_PATCH_VERSION",
     "SOCKET_SAVE_ONLY",
     "SOCKET_ALL_RELEASES",

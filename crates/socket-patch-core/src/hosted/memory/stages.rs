@@ -195,6 +195,21 @@ pub(crate) async fn plan(
         engine::withhold_user_patched(&view, &read.files, &mut candidates, &mut skipped, false)
             .await,
     );
+    // A patch the project already pins through a host these grants do not
+    // name (a patch mirror the embedding host knows nothing of) is left
+    // alone, as on disk: rewriting it would move a working pin onto the
+    // patch server.
+    let own_origins = crate::patch::redirect::upstream::foreign_dep_origins(
+        candidates.iter().map(|c| &c.dep),
+        &[],
+    );
+    engine::withhold_foreign_host_pins(
+        &read.files,
+        &own_origins,
+        &mut candidates,
+        &mut skipped,
+        &mut pre_warnings,
+    );
     let wheels = engine::wheel_targets(&candidates, &read.files)
         .into_iter()
         .map(|(dep, sha256)| (dep.artifact_url.clone(), sha256.to_string()))

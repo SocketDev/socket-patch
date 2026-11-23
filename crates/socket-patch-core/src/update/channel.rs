@@ -56,21 +56,51 @@ pub struct ChannelEnv {
     read_yarn_config: bool,
 }
 
+/// An environment variable naming a directory. Empty values count as
+/// unset, matching the CLI-wide `env_non_empty` convention.
+fn path_var(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `root` as [`detect_channel`] must see it: canonical, like the executable
+/// path it is compared with. A home reached through a symlink, and every
+/// Windows path (canonical paths there carry the `\\?\` prefix), would
+/// otherwise never be a prefix of the executable's path, and a
+/// `cargo install` would read as a standalone binary.
+///
+/// A root that does not resolve is kept as it is: nothing is installed
+/// under it. A relative one is kept too, so it goes on matching nothing
+/// rather than being resolved against the working directory.
+fn canonical_root(root: PathBuf) -> PathBuf {
+    if !root.is_absolute() {
+        return root;
+    }
+    std::fs::canonicalize(&root).unwrap_or(root)
+}
+
 impl ChannelEnv {
-    /// Snapshot the process environment. Empty values count as unset,
-    /// matching the CLI-wide `env_non_empty` convention.
+    /// Snapshot the process environment.
     pub fn from_env() -> Self {
-        fn path_var(name: &str) -> Option<PathBuf> {
-            std::env::var(name)
-                .ok()
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-        }
+        Self::snapshot(crate::utils::cargo_home::cargo_home())
+    }
+
+    /// [`ChannelEnv::from_env`] from environment variables alone: cargo's
+    /// home is `CARGO_HOME` or `<home>/.cargo`, and the user database is
+    /// never asked. For a caller that must not wait on a directory service
+    /// (the telemetry context).
+    pub fn from_env_vars() -> Self {
+        Self::snapshot(path_var("CARGO_HOME"))
+    }
+
+    fn snapshot(cargo_home: Option<PathBuf>) -> Self {
         ChannelEnv {
-            cargo_home: crate::utils::cargo_home::cargo_home(),
-            xdg_cache_home: path_var("XDG_CACHE_HOME"),
-            home: crate::utils::fs::home_dir(),
-            local_app_data: path_var("LOCALAPPDATA"),
+            cargo_home: cargo_home.map(canonical_root),
+            xdg_cache_home: path_var("XDG_CACHE_HOME").map(canonical_root),
+            home: crate::utils::fs::home_dir().map(canonical_root),
+            local_app_data: path_var("LOCALAPPDATA").map(canonical_root),
             yarn_global_folders: OnceLock::new(),
             read_yarn_config: true,
         }
@@ -556,6 +586,61 @@ fn cargo_bin_dir(env: &ChannelEnv) -> Option<PathBuf> {
         return Some(cargo_home.join("bin"));
     }
     env.home.as_ref().map(|h| h.join(".cargo").join("bin"))
+}
+
+#[cfg(all(test, unix))]
+mod canonical_root_tests {
+    use super::*;
+
+    /// A home reached through a symlink: the executable's canonical path
+    /// is under the real directory, so the root has to be canonical too
+    /// for a `cargo install` to be recognized.
+    #[test]
+    fn a_symlinked_home_still_names_its_cargo_bin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("data").join("home");
+        std::fs::create_dir_all(real.join(".cargo").join("bin")).unwrap();
+        let link = tmp.path().join("home");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let exe = real.join(".cargo").join("bin").join("socket-patch");
+        std::fs::write(&exe, b"").unwrap();
+        let exe = std::fs::canonicalize(&exe).unwrap();
+
+        let raw = ChannelEnv {
+            home: Some(link.clone()),
+            ..ChannelEnv::default()
+        };
+        assert_eq!(
+            detect_channel(&exe, &raw),
+            InstallChannel::Standalone,
+            "the raw root is not a prefix of the canonical path"
+        );
+
+        let canonical = ChannelEnv {
+            home: Some(canonical_root(link.clone())),
+            ..ChannelEnv::default()
+        };
+        assert_eq!(detect_channel(&exe, &canonical), InstallChannel::Cargo);
+
+        // The same through CARGO_HOME.
+        let cargo_home = ChannelEnv {
+            cargo_home: Some(canonical_root(link.join(".cargo"))),
+            ..ChannelEnv::default()
+        };
+        assert_eq!(detect_channel(&exe, &cargo_home), InstallChannel::Cargo);
+    }
+
+    #[test]
+    fn a_root_that_does_not_resolve_or_is_relative_is_kept() {
+        let missing = PathBuf::from("/nonexistent-socket-patch-root/x");
+        assert_eq!(canonical_root(missing.clone()), missing);
+        let relative = PathBuf::from("cache");
+        assert_eq!(
+            canonical_root(relative.clone()),
+            relative,
+            "a relative root is not resolved against the working directory"
+        );
+    }
 }
 
 /// Cache roots the pre-v5 gem launcher resolved, in its probe order:

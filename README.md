@@ -91,6 +91,7 @@ socket-patch list                          # what is patched here; in a terminal
 socket-patch vendor                        # eject an existing hosted patch set
 socket-patch repair                        # restore agent or vendored patch artifacts
 socket-patch rollback lodash               # restore one package to upstream
+socket-patch report lodash --reason tests   # tell Socket a patch broke something
 socket-patch rollback                      # restore upstream dependencies
 ```
 
@@ -108,11 +109,14 @@ to Socket as a small JSON event. An event holds the event name (for example
 `patch_applied` or `patch_scan_failed`), the subcommand, the CLI version, the
 operating system and CPU architecture, a timestamp, a random ID generated for
 that one run, and a few counters and flags for the command (such as patches
-applied, packages scanned, ecosystems found, the patch mode, `dry_run`). `get`
-adds the patch UUID. A failure adds the error message, with URL credentials
-redacted and your home directory replaced by `~`. Apart from what an error
-message quotes, events hold no package names, file paths, file contents, or
-dependency lists.
+applied, packages scanned, ecosystems found, the patch mode, `dry_run`). An
+event about specific patches (downloading, applying, vendoring, removing, or
+rolling them back) names each by its patch UUID, with its ecosystem, mode, and
+outcome; a patch UUID tells Socket which package version the patch is for. A
+failure adds an error code and the error message, with URL credentials redacted
+and your home directory replaced by `~`. Apart from those patch UUIDs and what
+an error message quotes, events hold no package names, file paths, file
+contents, or dependency lists.
 
 Events go to `api.socket.dev` with your API token when a token and organization
 are configured, otherwise anonymously to `patches-api.socket.dev`. They are sent

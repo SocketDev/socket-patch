@@ -559,6 +559,7 @@ async fn engine_get(
         ecosystems: None,
         persist_blobs: true,
         patch_server_url: None,
+        patch_mirror_url: None,
         all_releases: true,
     };
     let selected: Vec<PatchSearchResult> = selected

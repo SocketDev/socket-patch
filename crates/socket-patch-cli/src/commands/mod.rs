@@ -14,6 +14,7 @@ pub(crate) mod projects_below;
 pub(crate) mod pypi_reinstall;
 pub mod remove;
 pub mod repair;
+pub mod report;
 pub mod rollback;
 pub mod scan;
 pub mod show;

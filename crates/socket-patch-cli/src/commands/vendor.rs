@@ -30,7 +30,7 @@ use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::telemetry::{
-    track_patch_vendor_failed, track_patch_vendored, TelemetryAuth,
+    track_patch_vendor_failed, track_patch_vendored, TelemetryAuth, MODE_VENDORED,
 };
 use socket_patch_core::utils::concurrent::ordered_concurrent;
 use socket_patch_core::utils::group_commit::{CommittedFile, GroupCommit};
@@ -1248,8 +1248,10 @@ pub async fn run(args: VendorArgs) -> i32 {
         }
     }
 
+    // The patches of the ledger entries a `--revert` starts from.
+    let mut reverted_uuids: HashMap<String, String> = HashMap::new();
     let mut exit = match &vendor_service {
-        None => run_revert(&args, &mut env).await,
+        None => run_revert(&args, &mut env, &mut reverted_uuids).await,
         Some((service, _)) => run_vendor(&args, &manifest_path, &mut env, service).await,
     };
 
@@ -1305,16 +1307,40 @@ pub async fn run(args: VendorArgs) -> i32 {
     env.warnings
         .extend(crate::commands::sync_bazelignore(&args.common, true).await);
 
+    // The patches this run's event names are read while the lock is still
+    // held. Once it is released another run on the same project can rewrite
+    // the ledger and the manifest, and this run's event would be credited to
+    // that run's patches.
+    let uuids = match &vendor_service {
+        Some(_) => recorded_patch_uuids(&args.common, &manifest_path).await,
+        None => HashMap::new(),
+    };
+
     // Everything below is output and telemetry, so release the lock before
     // the telemetry round-trip.
     drop(lock);
 
-    if args.common.json {
-        println!("{}", env.to_pretty_json());
+    // Sent before the envelope prints, like `remove` and the hosted flow: a
+    // consumer that closes stdout on the envelope cannot drop the event.
+    match &vendor_service {
+        Some((_, telemetry)) => {
+            track_outcomes_for_vendor(
+                "vendor",
+                exit != 0,
+                &env,
+                args.common.dry_run,
+                &uuids,
+                &[],
+                telemetry,
+            )
+            .await;
+        }
+        // `--revert` takes every vendored patch out: a removal.
+        None => track_revert(&args, exit, &env, &reverted_uuids).await,
     }
 
-    if let Some((_, telemetry)) = &vendor_service {
-        track_outcomes_for_vendor(exit != 0, &env, args.common.dry_run, telemetry).await;
+    if args.common.json {
+        println!("{}", env.to_pretty_json());
     }
 
     exit
@@ -1961,6 +1987,57 @@ impl EjectSnapshot {
     }
 }
 
+/// An eject refused whole, with nothing changed: each pin of `refused` is
+/// a `failed` event with its code and its reason, the envelope's error is
+/// `eject_refused`, and the exit code is 1.
+async fn eject_refused(
+    common: &GlobalArgs,
+    run_warnings: Vec<(String, String)>,
+    client: &socket_patch_core::api::client::ApiClient,
+    telemetry: &TelemetryAuth,
+    eject_uuids: &HashMap<String, String>,
+    refused: &[(String, &'static str, String)],
+) -> i32 {
+    let mut env = Envelope::new(Command::Vendor);
+    env.warnings.extend(
+        run_warnings
+            .into_iter()
+            .map(|(code, detail)| RunWarning { code, detail }),
+    );
+    env.dry_run = common.dry_run;
+    if common.json {
+        env.warnings
+            .extend(crate::commands::vex_sources::api_auth_fallback_warning(
+                client,
+            ));
+    }
+    for (purl, code, why) in refused {
+        report_vendor_failure(common, purl, why);
+        env.record(
+            PatchEvent::new(PatchAction::Failed, purl.clone()).with_error(*code, why.clone()),
+        );
+    }
+    env.mark_error(EnvelopeError::new(
+        "eject_refused",
+        "not every hosted pin can be restored to its upstream registry entry and vendored; \
+         nothing was changed",
+    ));
+    if common.json {
+        println!("{}", env.to_pretty_json());
+    }
+    track_outcomes_for_vendor(
+        "vendor",
+        true,
+        &env,
+        common.dry_run,
+        eject_uuids,
+        &[],
+        telemetry,
+    )
+    .await;
+    1
+}
+
 /// Standalone `vendor` with hosted pins in scope: EJECT. The patch set comes
 /// only from the lockfile pins (purl + the uuid in each hosted URL), even
 /// when `.socket/manifest.json` exists: manifest-only patches are not
@@ -1977,6 +2054,8 @@ async fn run_eject(
     commit_recovery: Option<RunWarning>,
 ) -> i32 {
     let common = &args.common;
+    // The pins' patches, for the run's telemetry.
+    let eject_uuids = pin_uuids(&pins);
     // A ledger git would not commit refuses before anything is fetched or
     // restored, so the project stays hosted (#1638).
     let purls: Vec<String> = pins.iter().map(|pin| pin.purl.clone()).collect();
@@ -2001,6 +2080,30 @@ async fn run_eject(
         get_api_client_with_overrides(common.api_client_overrides()).await;
     let telemetry = TelemetryAuth::for_client(&client);
     let service = common.vendor_service_config(Some(client.clone()), use_public_proxy);
+    // The refusals that rest on the Bazel workspace need no record and no
+    // registry, so they are asked before either is fetched: the pins stay
+    // hosted whatever the network says.
+    let pairs: Vec<(&str, &str)> = pins
+        .iter()
+        .map(|pin| (pin.purl.as_str(), pin.uuid.as_str()))
+        .collect();
+    let declined: Vec<(String, &'static str, String)> =
+        vendor::refusals::bazel_workspace_refusals(&common.cwd, &pairs)
+            .await
+            .into_iter()
+            .map(|(purl, code, detail)| (purl.to_string(), code, format!("kept hosted: {detail}")))
+            .collect();
+    if !declined.is_empty() {
+        return eject_refused(
+            common,
+            run_warnings,
+            &client,
+            &telemetry,
+            &eject_uuids,
+            &declined,
+        )
+        .await;
+    }
     if !common.json && !common.silent {
         println!(
             "{} {} into .socket/vendor/...",
@@ -2079,7 +2182,16 @@ async fn run_eject(
         if common.json {
             println!("{}", env.to_pretty_json());
         }
-        track_outcomes_for_vendor(true, &env, common.dry_run, &telemetry).await;
+        track_outcomes_for_vendor(
+            "vendor",
+            true,
+            &env,
+            common.dry_run,
+            &eject_uuids,
+            &[],
+            &telemetry,
+        )
+        .await;
         return 1;
     }
 
@@ -2159,35 +2271,15 @@ async fn run_eject(
         }
     }
     if !refused.is_empty() {
-        let mut env = Envelope::new(Command::Vendor);
-        env.warnings.extend(
-            run_warnings
-                .into_iter()
-                .map(|(code, detail)| RunWarning { code, detail }),
-        );
-        env.dry_run = common.dry_run;
-        if common.json {
-            env.warnings
-                .extend(crate::commands::vex_sources::api_auth_fallback_warning(
-                    &client,
-                ));
-        }
-        for (purl, code, why) in &refused {
-            report_vendor_failure(common, purl, why);
-            env.record(
-                PatchEvent::new(PatchAction::Failed, purl.clone()).with_error(*code, why.clone()),
-            );
-        }
-        env.mark_error(EnvelopeError::new(
-            "eject_refused",
-            "not every hosted pin can be restored to its upstream registry entry and vendored; \
-             nothing was changed",
-        ));
-        if common.json {
-            println!("{}", env.to_pretty_json());
-        }
-        track_outcomes_for_vendor(true, &env, common.dry_run, &telemetry).await;
-        return 1;
+        return eject_refused(
+            common,
+            run_warnings,
+            &client,
+            &telemetry,
+            &eject_uuids,
+            &refused,
+        )
+        .await;
     }
 
     // A dry run stops at the verified plan: restoring the live lock to
@@ -2233,7 +2325,7 @@ async fn run_eject(
         if common.json {
             println!("{}", env.to_pretty_json());
         }
-        track_outcomes_for_vendor(false, &env, true, &telemetry).await;
+        track_outcomes_for_vendor("vendor", false, &env, true, &eject_uuids, &[], &telemetry).await;
         return 0;
     }
 
@@ -2545,7 +2637,16 @@ async fn run_eject(
     if common.json {
         println!("{}", env.to_pretty_json());
     }
-    track_outcomes_for_vendor(exit != 0, &env, common.dry_run, &telemetry).await;
+    track_outcomes_for_vendor(
+        "vendor",
+        exit != 0,
+        &env,
+        common.dry_run,
+        &eject_uuids,
+        &[],
+        &telemetry,
+    )
+    .await;
     exit
 }
 
@@ -2575,19 +2676,136 @@ fn no_manifest_message(tracked_entries: usize) -> String {
     }
 }
 
+/// Telemetry for `vendor --revert`: each entry it took out is a patch
+/// removed (in vendored mode), as `remove` reports one. A run that could
+/// take none out is the failure; a `--dry-run` reports nothing, like
+/// `remove`'s.
+async fn track_revert(
+    args: &VendorArgs,
+    exit: i32,
+    env: &Envelope,
+    uuids: &HashMap<String, String>,
+) {
+    if args.common.dry_run {
+        return;
+    }
+    let patches = vendor_outcomes(env, uuids);
+    let removed = socket_patch_core::telemetry::PatchOutcome::count(&patches, "removed");
+    let telemetry = args.common.telemetry_auth();
+    if exit != 0 && removed == 0 {
+        let (code, message) = env.error.as_ref().map_or(
+            ("vendor_revert_failed", "vendor --revert failed"),
+            |error| (error.code.as_str(), error.message.as_str()),
+        );
+        socket_patch_core::telemetry::track_patch_remove_failed(
+            "vendor", code, message, &patches, &telemetry,
+        )
+        .await;
+    } else if removed > 0 {
+        socket_patch_core::telemetry::track_patch_removed("vendor", removed, &patches, &telemetry)
+            .await;
+    }
+}
+
+/// The patches a vendor run's events are about, as its telemetry names
+/// them. The events name packages; `uuids` (purl → patch UUID) names
+/// their patches. A swept orphan directory is left out: its event names
+/// the package it once held, which would credit the sweep to the patch
+/// the ledger records for that package now.
+fn vendor_outcomes(
+    env: &Envelope,
+    uuids: &HashMap<String, String>,
+) -> Vec<socket_patch_core::telemetry::PatchOutcome> {
+    crate::telemetry_outcomes::patch_outcomes(
+        env.events
+            .iter()
+            .filter(|event| event.error_code.as_deref() != Some("vendor_orphan_removed")),
+        MODE_VENDORED,
+        crate::telemetry_outcomes::uuid_lookup(uuids),
+    )
+}
+
 /// Telemetry for a vendor run's success/failure split, shared by
-/// [`run`] and the scan-driven vendor step (`scan --mode vendored`).
+/// [`run`] and the vendor step of `scan` / `get --mode vendored`
+/// (`command` is the one the user ran). `uuids` names the patches of the
+/// run's events ([`vendor_outcomes`]); `download_failures` are the
+/// patches a download phase before the step could not get, which the
+/// step's own events never name.
 pub(crate) async fn track_outcomes_for_vendor(
+    command: &'static str,
     has_errors: bool,
     env: &Envelope,
     dry_run: bool,
+    uuids: &HashMap<String, String>,
+    download_failures: &[socket_patch_core::telemetry::PatchOutcome],
     telemetry: &TelemetryAuth,
 ) {
+    let patches =
+        crate::telemetry_outcomes::with_more(vendor_outcomes(env, uuids), download_failures);
     if has_errors {
-        track_patch_vendor_failed("vendor completed with failures", dry_run, telemetry).await;
+        let code = env
+            .error
+            .as_ref()
+            .map_or("vendor_failed", |e| e.code.as_str());
+        track_patch_vendor_failed(
+            command,
+            code,
+            "vendor completed with failures",
+            dry_run,
+            &patches,
+            telemetry,
+        )
+        .await;
     } else {
-        track_patch_vendored(env.summary.applied, dry_run, telemetry).await;
+        track_patch_vendored(command, env.summary.applied, dry_run, &patches, telemetry).await;
     }
+}
+
+/// [`read_recorded_patch_uuids`] for a run's telemetry: nothing is read
+/// when telemetry is off.
+async fn recorded_patch_uuids(
+    common: &GlobalArgs,
+    manifest_path: &Path,
+) -> HashMap<String, String> {
+    if socket_patch_core::telemetry::is_telemetry_disabled() {
+        return HashMap::new();
+    }
+    read_recorded_patch_uuids(&common.project_root(), manifest_path).await
+}
+
+/// purl → patch UUID over what the project at `root` records: the vendor
+/// ledger's entries, and over them the manifest's records. For the
+/// telemetry of a `vendor` run, whose events name packages only. The
+/// manifest wins: it is what the run vendors from, and the ledger may
+/// still hold the patch a failed run was replacing. Only keys are
+/// recorded, never an entry's base purl: a purl with no key of its own is
+/// matched across qualifiers by the lookup, which refuses an ambiguous one.
+async fn read_recorded_patch_uuids(root: &Path, manifest_path: &Path) -> HashMap<String, String> {
+    let mut uuids = HashMap::new();
+    if let Ok(state) = load_state(root).await {
+        uuids.extend(
+            state
+                .entries
+                .into_iter()
+                .map(|(key, entry)| (key, entry.uuid)),
+        );
+    }
+    if let Ok(Some(manifest)) = read_manifest(manifest_path).await {
+        uuids.extend(
+            manifest
+                .patches
+                .into_iter()
+                .map(|(purl, record)| (purl, record.uuid)),
+        );
+    }
+    uuids
+}
+
+/// The patches of hosted pins, by purl.
+fn pin_uuids(pins: &[HostedPin]) -> HashMap<String, String> {
+    pins.iter()
+        .map(|pin| (pin.purl.clone(), pin.uuid.clone()))
+        .collect()
 }
 
 async fn run_vendor(
@@ -4891,7 +5109,11 @@ pub(crate) async fn reconcile_dropped(
     (had_error, Ok(state))
 }
 
-async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
+async fn run_revert(
+    args: &VendorArgs,
+    env: &mut Envelope,
+    uuids: &mut HashMap<String, String>,
+) -> i32 {
     let common = &args.common;
     let mut state = match load_state(&common.cwd).await {
         Ok(s) => s,
@@ -4901,6 +5123,12 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             return 1;
         }
     };
+    uuids.extend(
+        state
+            .entries
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.uuid.clone())),
+    );
 
     let mut has_errors = false;
     let mut recorded: Vec<String> = state.entries.keys().cloned().collect();
@@ -6482,6 +6710,73 @@ mod gc_tests {
                 Vec::new(),
             )
         }
+    }
+
+    /// A `vendor` run's events are credited to the patch the manifest
+    /// records, not to the one the ledger still holds for the package: a
+    /// run that fails to replace a patch leaves the old one in the ledger.
+    #[tokio::test]
+    async fn telemetry_credits_the_manifests_patch_over_the_ledgers() {
+        const NEW_UUID: &str = "22222222-2222-4222-8222-222222222222";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            PURL.to_string(),
+            socket_patch_core::manifest::schema::PatchRecord {
+                uuid: NEW_UUID.to_string(),
+                exported_at: String::new(),
+                files: HashMap::new(),
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            },
+        );
+        let manifest_path = root.join(".socket/manifest.json");
+        tokio::fs::create_dir_all(root.join(".socket"))
+            .await
+            .unwrap();
+        write_manifest(&manifest_path, &manifest).await.unwrap();
+        let mut state = VendorState::default();
+        state.entries.insert(PURL.to_string(), entry(false));
+        // A ledger-only entry keeps its own patch.
+        let other = "pkg:npm/other@1.0.0?artifact_id=x";
+        state.entries.insert(other.to_string(), entry(true));
+        save_state(root, &state).await.unwrap();
+
+        let uuids = read_recorded_patch_uuids(root, &manifest_path).await;
+        assert_eq!(uuids.get(PURL).map(String::as_str), Some(NEW_UUID));
+        assert_eq!(uuids.get(other).map(String::as_str), Some(UUID));
+        // Keys only: an entry's base purl is not a key of its own.
+        assert_eq!(uuids.len(), 2, "{uuids:?}");
+    }
+
+    /// A swept orphan directory names the package it once held. Its
+    /// `removed` event must not be credited to the patch the ledger
+    /// records for that package, which this run kept.
+    #[test]
+    fn a_swept_orphan_is_not_credited_to_the_ledgers_patch() {
+        let mut env = Envelope::new(Command::Vendor);
+        env.record(
+            PatchEvent::new(PatchAction::Skipped, PURL)
+                .with_reason("vendor_revert_kept", "the lockfile drifted"),
+        );
+        env.record(
+            PatchEvent::new(PatchAction::Removed, PURL)
+                .with_reason("vendor_orphan_removed", "an unowned artifact directory"),
+        );
+        let uuids: HashMap<String, String> = [(PURL.to_string(), UUID.to_string())].into();
+
+        let outcomes = vendor_outcomes(&env, &uuids);
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        assert_eq!(outcomes[0].uuid, UUID);
+        assert_eq!(outcomes[0].outcome, "skipped");
+        assert_eq!(outcomes[0].code.as_deref(), Some("vendor_revert_kept"));
+        assert_eq!(
+            socket_patch_core::telemetry::PatchOutcome::count(&outcomes, "removed"),
+            0
+        );
     }
 
     /// Tempdir with: a manifest carrying PURL, a ledger with one entry,
