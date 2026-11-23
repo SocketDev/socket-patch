@@ -1958,13 +1958,18 @@ patch.
 
 Known problems. In each of these a command exits 0 today and the next Bazel build fails:
 
-- **Vendored mode for PyPI, RubyGems, NuGet and Composer.** The path of the committed copy
-  means nothing where Bazel runs: rules_python takes it for a package name, rules_ruby's
-  `bundle install` does not find it (`The path ... does not exist`), rules_csharp reads it as
-  a URL (`Bad URL`, or a crash of Bazel 9.3.2), and a Composer that Bazel runs elsewhere
-  reports `Source path ... is not found`. Run `socket-patch vendor --revert`, then
-  `socket-patch scan --mode hosted`. Of these builds a test of this repository runs the PyPI
-  one; the others were measured by hand on the three Bazel releases.
+- **Vendored mode for PyPI, RubyGems and NuGet.** The path of the committed copy means
+  nothing where Bazel runs: rules_python takes it for a package name, rules_ruby's
+  `bundle install` does not find it (`The path ... does not exist`), and rules_csharp reads
+  it as a URL (`Bad URL`, or a crash of Bazel 9.3.2). Run `socket-patch vendor --revert`,
+  then `socket-patch scan --mode hosted`. Of these builds a test of this repository runs the
+  PyPI one; the others were measured by hand on the three Bazel releases. A Composer package
+  is not among them: in a Bazel workspace vendored mode declines it and writes nothing
+  (`vendor_composer_bazel_workspace`, exit 1; see
+  [Bazel workspaces: Composer](#bazel-workspaces-composer)). With
+  `--allow-vendored-in-bazel` it writes what it writes outside Bazel, and a Composer that a
+  Bazel rule runs in another directory then fails the build with
+  `Source path ... is not found`.
 - **Hosted Cargo on a hub without `cargo_config`**, which is the hub as the rules_rust README
   shows it: the hub's cargo does not see the patch registry that `.cargo/config.toml` defines
   (`registry index was not found in any configuration`). Add
