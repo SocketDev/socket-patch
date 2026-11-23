@@ -83,6 +83,7 @@ pub fn global_defaults() -> Globals {
         no_gem_native_rebuild: false,
         no_gem_install_refresh: false,
         gem_refresh_shared: false,
+        allow_vendored_in_bazel: false,
     })
 }
 
