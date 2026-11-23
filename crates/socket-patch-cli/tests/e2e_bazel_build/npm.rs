@@ -68,6 +68,16 @@
 //! Tests that need no Bazel run the same steps in a copy of the fixture,
 //! and in workspaces where the statement must stay as it is without Bazel.
 //!
+//! A fourth flow is hosted mode on a hub that keeps the lock up to date
+//! ([`hosted_update_pnpm_lock_on_pnpm_11`]): with `update_pnpm_lock = True`
+//! rules_js runs a pnpm of its own during the build, over the lock and the
+//! files the hub lists as `data`. Here that pnpm is 11 and the hub lists no
+//! `pnpm-workspace.yaml`, so it never reads the `trustLockfile: true` that
+//! hosted mode writes there. The flow holds what `socket-patch` does today:
+//! the scan passes and reports the patch applied, and the next
+//! `bazel build` fails, because pnpm 11 rejects a lock whose tarball URL
+//! is not the registry's.
+//!
 //! A marker is read from what Bazel built. Bazel's downloader keeps every
 //! file it fetches in the repository cache, under its checksum, and hands it
 //! out again without a request; the tests of a leg share that cache, and CI
@@ -772,6 +782,141 @@ fn vendored_npm_translate_lock() {
         started.elapsed()
     );
 }
+
+/// The release of pnpm 11 that Bazel runs in the flow below. rules_js 3.6.0
+/// holds its checksum, so Bazel fetches it like the Node that runs it: from
+/// the public registry, into the repository cache of the leg.
+const PNPM_11: &str = "11.28.10";
+
+/// The line of the fixture's hub that names the lock.
+fn lock_line() -> String {
+    format!("    pnpm_lock = \"//:{LOCK}\",\n")
+}
+
+/// [`open`] with a hub that keeps the lock up to date: the fixture's call
+/// with `update_pnpm_lock = True`. rules_js then keeps a file of hashes
+/// under `.aspect/` in the checkout, and whenever the lock or a
+/// `package.json` is not what that file says, the build runs
+/// `pnpm install --lockfile-only` in a directory that holds the lock, the
+/// `package.json` of each importer and the files the call lists as `data`,
+/// and no other file of the checkout. With `pnpm`, a `pnpm.pnpm` tag states
+/// the release of that pnpm; without, rules_js runs the one it picks itself
+/// (3.6.0: its newest pnpm 10).
+///
+/// That pnpm has the stand-in as its registry, under the variable each
+/// release reads (`pnpm_config_registry` from pnpm 11 on), as on a machine
+/// behind a registry mirror. pnpm 11 holds every entry of a lock to what
+/// the registry publishes for it before it does anything else, so the
+/// stand-in serves the document of the package: its one version, with the
+/// URL the public registry has for the tarball and the sum of this run's.
+fn open_updating(test: &str, pnpm: Option<&str>) -> Option<(Cell, StandIn, Package)> {
+    let (mut cell, standin, upstream) = open(test)?;
+    let module = text(&cell.tree(), MODULE);
+    let lock = lock_line();
+    assert_eq!(module.matches(&lock).count(), 1, "{test}: {module}");
+    let mut module = module.replace(&lock, &format!("{lock}    update_pnpm_lock = True,\n"));
+    if let Some(release) = pnpm {
+        module.push_str(&format!(
+            "\npnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
+             pnpm.pnpm(name = \"pnpm\", pnpm_version = \"{release}\")\n\
+             use_repo(pnpm, \"pnpm\")\n"
+        ));
+    }
+    cell.write(MODULE, module);
+    let registry = format!("{}/{REGISTRY}/", standin.origin());
+    for name in ["npm_config_registry", "pnpm_config_registry"] {
+        cell.repo_env.push((name.to_string(), registry.clone()));
+    }
+    let published = "2020-01-01T00:00:00.000Z";
+    let document = json!({
+        "name": NAME,
+        "dist-tags": { "latest": VERSION },
+        "versions": { VERSION: {
+            "name": NAME,
+            "version": VERSION,
+            "dist": {
+                "tarball": format!("https://{REGISTRY}/{NAME}/-/{TGZ}"),
+                "integrity": integrity(&upstream.tarball),
+            },
+        }},
+        "time": { "created": published, "modified": published, VERSION: published },
+    });
+    let document = serde_json::to_vec(&document).expect("a JSON document");
+    standin.serve(5, &document_route(), &document);
+    Some((cell, standin, upstream))
+}
+
+/// The route of the document a pnpm asks its registry for about the
+/// package: the name with `%2F` for its `/`.
+fn document_route() -> String {
+    format!("/{REGISTRY}/{}", NAME.replace('/', "%2F"))
+}
+
+/// Hosted mode on a hub that keeps the lock up to date with pnpm 11 and
+/// lists no `pnpm-workspace.yaml` as `data` ([`open_updating`]). The
+/// checkout has no such file, as the fixture has none.
+///
+/// - (a) The first build runs that pnpm, which finds the lock as the
+///   registry has the package, and rules_js writes its file of hashes; the
+///   build prints the unpatched marker.
+/// - (b) `scan --mode hosted --yes` passes and reports the patch applied:
+///   it pins the lock and creates `pnpm-workspace.yaml` with
+///   `trustLockfile: true`.
+/// - (c) The next `bazel build` fails. The lock changed, so rules_js runs
+///   pnpm again, in a directory without that `pnpm-workspace.yaml`, and
+///   pnpm 11 rejects the lock: `ERR_PNPM_TARBALL_URL_MISMATCH`.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn hosted_update_pnpm_lock_on_pnpm_11() {
+    let test = "npm::hosted_update_pnpm_lock_on_pnpm_11";
+    let started = Instant::now();
+    let Some((cell, standin, upstream)) = open_updating(test, Some(PNPM_11)) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let patch = Patched::new();
+    grant(&standin, &upstream, &patch, &patch.package.tarball);
+
+    // (a) The unpatched build. The pnpm that Bazel ran asked the stand-in
+    // for the package, and rules_js left its hashes in the checkout.
+    let before = builds_upstream(&cell, &standin, &upstream);
+    assert!(
+        standin.asked(&document_route()) > 0,
+        "{test}: no pnpm asked the stand-in registry about the package"
+    );
+    let hashes = |tree: &Tree| tree.keys().any(|file| file.starts_with(HASHES));
+    assert!(hashes(&before), "{test}: {:?}", before.keys());
+
+    // (b) The one command of hosted mode: applied, as on any other hub.
+    let scan = socket_patch(&cell, &standin, &["scan", "--mode", "hosted", "--yes"]);
+    let written = [LOCK, "pnpm-workspace.yaml"];
+    let pinned = cell.pinned_by(&scan, PURL, &patch.uuid, &before, &written);
+    assert_eq!(text(&pinned, "pnpm-workspace.yaml"), TRUSTING_WORKSPACE);
+
+    // (c) The same build fails: the pnpm that Bazel runs does not trust the
+    // lock, because it reads no `pnpm-workspace.yaml`.
+    let build = cell.bazel("build", &[CONSUMER]);
+    assert!(!build.ok(), "{test}: the build passed:\n{}", build.dump());
+    let refusal = "ERR_PNPM_TARBALL_URL_MISMATCH";
+    assert!(
+        build.stderr().contains(refusal),
+        "{test}: the build did not fail with {refusal}:\n{}",
+        build.dump()
+    );
+    assert_eq!(changed(&pinned, &cell.tree()), NOTHING, "{test}");
+
+    println!(
+        "{test}: Bazel {release} built {:?} with pnpm {PNPM_11} keeping the lock up to date; \
+         `scan --mode hosted` exited 0 and reported the patch applied; the next build failed \
+         with {refusal}; {:?}",
+        upstream.marker,
+        started.elapsed()
+    );
+}
+
+/// The directory of the checkout where rules_js keeps the hashes of what a
+/// hub with `update_pnpm_lock` read, one file per hub.
+const HASHES: &str = ".aspect/rules/external_repository_action_cache/";
 
 /// The file that hands the lock to rules_js, and the call that does.
 const MODULE: &str = "MODULE.bazel";
