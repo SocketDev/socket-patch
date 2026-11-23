@@ -180,10 +180,23 @@ pub async fn vendor_maven(
         ) if result.success && !dry_run => {
             let committed = jvm_committed_patch(shape, purl, project_root, record).await;
             let jar = committed.map(|((jar, ..), _)| jar);
-            let written = match jar {
-                Some(jar) => write_hub(&hub, project_root, jar, true).await,
-                None => Err("the vendored tree holds no jar of the patch".to_string()),
+            // The directory must survive the commit, as the hub's own
+            // vendoring requires: an entry that names a directory git
+            // leaves out fails the build of every other checkout.
+            let unit = hub.1.unit().unwrap_or_default();
+            let ignored = super::npm_dir::ignored_root_refusal(project_root, &unit).await;
+            let written = match (jar, ignored) {
+                (_, Some((_, detail))) => Err(detail),
+                (Some(jar), None) => write_hub(&hub, project_root, jar, true).await,
+                (None, None) => Err("the vendored tree holds no jar of the patch".to_string()),
             };
+            // The entry took the place of the one an earlier patch of the
+            // jar had: that patch's directory is named by nothing now.
+            if written.is_ok() {
+                let left = drop_superseded_units(project_root).await;
+                let left = left.into_iter();
+                warnings.extend(left.map(|why| VendorWarning::new("cleanup_failed", why)));
+            }
             warnings.extend(match written {
                 // The build was in sync and the hub's part was not: said, as
                 // every artifact that a run of an in-sync package writes.
@@ -293,21 +306,33 @@ async fn stale_hub_entry(project_root: &Path, purl: &str) -> String {
     }
 }
 
-/// After a hosted run wrote `module`, the text of `MODULE.bazel`: removes
-/// the directory that vendored mode kept for the hub's jar of each patch
-/// of `uuids` which the file no longer names and no entry of `state`
-/// records. A hosted entry took the place of the vendored one there, and
-/// beside a Maven build the ledger entry of the patch is that build's and
-/// stays, so no revert removed the directory. Gives what could not be
-/// removed.
-pub async fn drop_unnamed_units<'a>(
+/// After a run wrote `module`, the text of `MODULE.bazel`: removes each
+/// directory that vendored mode kept for the hub's jar of a patch which
+/// the file no longer names and no entry of `state` records. Another entry
+/// took the place of the vendored one there (a hosted one, or the one of a
+/// later patch of the jar), and beside a Maven build the ledger entry of
+/// the patch is that build's, so no revert removed the directory. Gives
+/// what could not be removed.
+pub async fn drop_unnamed_units(
     project_root: &Path,
     module: &str,
-    uuids: impl Iterator<Item = &'a String>,
     state: &super::VendorState,
 ) -> Vec<String> {
     let mut left = Vec::new();
-    for unit in uuids.filter_map(|uuid| vendor_uuid_dir_rel("maven", uuid)) {
+    // Every directory there, not only the ones of the patches this run
+    // wrote: an entry also takes the place of an earlier patch of its jar.
+    let units = project_root.join(crate::bazel::maven::UNITS);
+    let mut uuids = Vec::new();
+    if let Ok(mut dirs) = tokio::fs::read_dir(&units).await {
+        while let Ok(Some(dir)) = dirs.next_entry().await {
+            uuids.extend(dir.file_name().into_string());
+        }
+    }
+    uuids.sort();
+    for unit in uuids
+        .iter()
+        .filter_map(|uuid| vendor_uuid_dir_rel("maven", uuid))
+    {
         let recorded = |entry: &VendorEntry| entry.artifact.path.starts_with(&unit);
         let dir = project_root.join(&unit);
         let ours = read_regular_to_bytes(&dir.join(crate::bazel::maven::REPO)).await;
@@ -323,6 +348,18 @@ pub async fn drop_unnamed_units<'a>(
         }
     }
     left
+}
+
+/// [`drop_unnamed_units`] for the checkout as a vendored run left it, read
+/// from its `MODULE.bazel` and its ledger. Nothing is dropped where either
+/// cannot be read.
+async fn drop_superseded_units(project_root: &Path) -> Vec<String> {
+    let module = read_regular_to_string(&project_root.join(crate::bazel::maven::FILE)).await;
+    let state = super::state::load_state(project_root).await;
+    match (module, state) {
+        (Ok(module), Ok(state)) => drop_unnamed_units(project_root, &module, &state).await,
+        _ => Vec::new(),
+    }
 }
 
 /// Writes the directory of `hub`'s entry with `jar` and puts the entry in
@@ -407,11 +444,17 @@ async fn vendor_hub(
         Ok(state) => state,
         Err(e) => return refused("vendor_state_unreadable", e.to_string()),
     };
+    // The committed jar is taken as it is only when the ledger records its
+    // bytes: one that merely carries the patch's files may hold anything
+    // else, and would be recorded and wired as the vendored jar.
     let recorded = super::state::lookup_entry(&state.entries, purl)
-        .is_some_and(|entry| entry.uuid == record.uuid && entry.artifact.path == jar_rel);
+        .filter(|entry| entry.uuid == record.uuid && entry.artifact.path == jar_rel)
+        .map(|entry| entry.artifact.sha256.clone());
+    let on_record = |jar: &Vec<u8>| Some(hex::encode(Sha256::digest(jar))) == recorded;
     let mut warnings = Vec::new();
     let committed = read_regular_to_bytes(&jar_path).await.ok();
-    let committed = committed.filter(|jar| zip_bytes_match_after_hashes(jar, &record.files));
+    let committed =
+        committed.filter(|jar| on_record(jar) && zip_bytes_match_after_hashes(jar, &record.files));
     let was_committed = committed.is_some();
     let jar = match committed {
         Some(jar) => jar,
@@ -430,7 +473,7 @@ async fn vendor_hub(
     };
     match write_hub(&hub, project_root, jar, !dry_run).await {
         // In place, and on record: the run changes nothing.
-        Ok(false) if recorded && was_committed => done(result, None, warnings),
+        Ok(false) if was_committed => done(result, None, warnings),
         Ok(_) if dry_run => {
             let preview = super::common::preview_result(purl, &jar_path, &record.files);
             done(preview, None, warnings)
@@ -615,6 +658,42 @@ async fn unwire_hub(
             .map_err(|e| format!("cannot write {FILE}: {e}"))?;
     }
     Ok(Some(unit))
+}
+
+/// After `repair` put back the jar of a patch that only a hub takes:
+/// the other files of its directory, written where one is missing or is
+/// not the file vendored mode writes. A directory that was lost whole is
+/// no repository with its jar alone, and Bazel stops at the entry that
+/// names it. Nothing for a patch whose entry the block does not hold.
+pub(crate) async fn restore_hub_files(
+    project_root: &Path,
+    entry: &VendorEntry,
+) -> Result<(), String> {
+    use crate::bazel::maven::{entries, unit_files, Patch, FILE};
+    let text = read_regular_to_string(&project_root.join(FILE)).await;
+    let ours = |patch: &Patch| patch.uuid == entry.uuid && patch.unit().is_some();
+    let patch = entries(&text.unwrap_or_default()).into_iter().find(ours);
+    let files = patch.and_then(|patch| unit_files(&patch, Vec::new()));
+    let Some([repo, build, _, ignore]) = files else {
+        return Ok(());
+    };
+    for (rel, bytes) in [repo, build, ignore] {
+        let path = project_root.join(&rel);
+        if read_regular_to_bytes(&path)
+            .await
+            .is_ok_and(|held| held == bytes)
+        {
+            continue;
+        }
+        let dir = path.parent().unwrap_or(project_root);
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        atomic_write_artifact(&path, &bytes)
+            .await
+            .map_err(|e| format!("cannot write {rel}: {e}"))?;
+    }
+    Ok(())
 }
 
 /// What `vendor --check` holds the hub's copy of a patch to, for the
@@ -5849,7 +5928,7 @@ mod tests {
             if made {
                 std::fs::write(dir.join(crate::bazel::maven::REPO), b"# a repository\n").unwrap();
             }
-            let left = drop_unnamed_units(tmp.path(), &module, [&uuid].into_iter(), state).await;
+            let left = drop_unnamed_units(tmp.path(), &module, state).await;
             assert_eq!(left, Vec::<String>::new(), "{module:?} {made}");
             assert_eq!(dir.exists(), stays, "{module:?} {made}");
             let vendor = tmp.path().join(".socket/vendor");

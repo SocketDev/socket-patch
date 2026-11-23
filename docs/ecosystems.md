@@ -2151,19 +2151,27 @@ repository cache holds no copy of the jar, and a checkout builds patched with no
   by hand; and when the entry is one a build stops at or may pass without (no pinned hub takes
   the jar at that version any more, for which it names `socket-patch rollback <purl>`, or an
   rc file switches the entry off). Run it in CI. `socket-patch vex` hashes the same jar before
-  it attests the patch.
+  it attests the patch. A later `vendor` takes the committed jar as it is only when the ledger
+  records its bytes: any other jar at that path, also one that carries the patch's files, is
+  replaced by the patch's own. `socket-patch repair` puts back a jar that is lost or changed,
+  and with it the other files of a directory that was lost whole.
 - **One entry per jar.** A vendored run puts its entry in the place of a hosted one for the
   same jar, and a hosted run in the place of a vendored one. The hosted run removes what
   vendored mode kept for the hub: the directory, its `.bazelignore` line and, for a patch that
   only the hub took, the ledger entry. Neither leaves both. Beside a Maven build the vendored
-  tree of that build stays through a hosted run, as it does without the workspace.
+  tree of that build stays through a hosted run, as it does without the workspace. The entry
+  of a later patch of the jar takes the place of the earlier one in the same way: the run
+  that writes it removes each directory under `.socket/vendor/maven` that `MODULE.bazel` no
+  longer names and no ledger entry records (`cleanup_failed` when it cannot).
 - **A project that Maven or Gradle builds too.** That build is vendored exactly as without the
   workspace (the suffixed tree under `.socket/vendor/maven2`, the pom pin, and so on), and the
   hub gets a copy of the same jar in its own directory. The ledger entry is the Maven or
   Gradle one, and the hub's copy is that entry's jar byte for byte: `vendor --check` holds the
   copy to the same sha256, and the entry of the block to the rules above. A later `vendor`
   that finds the copy missing or changed, or the entry gone, writes them again and says so
-  (`vendor_artifact_rebuilt`).
+  (`vendor_artifact_rebuilt`). The hub's directory has to survive the commit like the tree
+  beside it: where a rule of the checkout makes git ignore it, the run writes nothing for
+  the hub and warns `maven_bazel_hub_unpatched` with that rule.
 - **The undo.** `vendor --revert`, `rollback` and `remove` take the entry out, then the
   directory, and the `.bazelignore` line goes with the last directory: every file is the one of
   before, byte for byte, but for a `.bazelignore` that was an empty file of yours, which is
@@ -2231,7 +2239,9 @@ A vendored run that writes no entry for a jar a hub builds leaves the block as i
 entry that is there stays, and the Bazel build keeps the patched jar. Beside a Maven or Gradle
 build it warns, once per artifact, with the code and the reason of the table, or with
 `maven_bazel_hub_unpatched` when it could have written the entry and vendored nothing for the
-package (the Maven or Gradle build failed first). A dry run warns of the declines alone.
+package (the Maven or Gradle build failed first). It also warns `maven_bazel_no_effect` for
+an entry that is there and that the checkout leaves without effect: the Bazel build takes the
+upstream jar past it. A dry run warns of the declines alone.
 
 Agent mode patches no hub, and leaves the block as it is. An `apply` that has a Maven patch
 (also `get` and `scan` in agent mode) reads the same files and says when a hub builds the

@@ -426,6 +426,12 @@ pub async fn restore(
                 .map_err(|e| format!("cannot restore the vendored dir's git metadata: {e}"))?;
         }
     }
+    // The jar that vendored mode keeps for the hub of a Bazel workspace
+    // alone is one file of a directory that is a repository: the stage held
+    // the jar, and a directory that was lost whole needs the rest.
+    if entry.flavor.as_deref() == Some(super::maven_repo::HUB_FLAVOR) {
+        super::maven_repo::restore_hub_files(root, entry).await?;
+    }
     Ok(warnings)
 }
 

@@ -1389,7 +1389,13 @@ pub fn rewrite(
         // take out. An entry that the reason of the decline leaves without
         // effect is no pin: the patch is not reported as applied for it.
         let held = verdict.held.as_deref();
-        if held == Some(&dep.patch_uuid) && code != NO_EFFECT {
+        // A vendored entry of the same patch is not this run's pin: the
+        // run wrote nothing, and the checkout stays a vendored one.
+        let vendored = |patch: &Patch| patch.uuid == dep.patch_uuid && patch.unit().is_some();
+        let vendored = files
+            .get(FILE)
+            .is_some_and(|text| entries(text).iter().any(vendored));
+        if held == Some(&dep.patch_uuid) && code != NO_EFFECT && !vendored {
             let uuid = dep.patch_uuid.clone();
             result.confirmed_bazel_maven_uuids.insert(uuid);
         }
@@ -1493,6 +1499,15 @@ fn notices_blocking(
         let jars: Vec<Jar> = jars.iter().map(by_purl).collect();
         let said = |(purl, entry, held): (String, Result<String, Declined>, Option<String>)| {
             let (code, why) = match (held, entry) {
+                // The entry is there and the checkout leaves it without
+                // effect (an rc file that switches the block off, an
+                // override of the jar): the build takes the upstream jar
+                // past it, which is said as a hosted run says it.
+                (Some(held), Err((code, why))) if code == NO_EFFECT => {
+                    let ends = left(Some(&held), &held, code, FILE);
+                    return Some((code, format!("{purl}: {why}. {ends}")));
+                }
+                // Any other entry stands: the hub takes its jar.
                 (Some(_), _) => return None,
                 (None, Err(declined)) => declined,
                 (None, Ok(_)) => {
@@ -3473,6 +3488,13 @@ override_repo(
                 (0, pinned.to_vec())
             );
         }
+        // A vendored entry of the same patch is not the hosted run's pin:
+        // the run wrote nothing, and the patch is not confirmed as hosted.
+        let vendored = with_patch(PINNED, LABEL, vendored_netty()).expect("a block");
+        let files = candidates(Some(&vendored), Err((RELEASE, "why")), Some(NETTY_UUID));
+        let result = ran(&files, &[granted()]);
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert_eq!((result.files.len(), confirmed(&result)), (0, vec![]));
         // An entry that the reason of the decline leaves without effect (an
         // rc file that switches the block off, an override of the jar) is
         // not this patch's pin: the build takes the upstream jar, and the
@@ -3808,8 +3830,18 @@ override_repo(
         assert!(warned[0].1.ends_with(KEEPS), "{warned:?}");
         for held in [vendored_netty(), netty()] {
             let module = with_patch(PINNED, LABEL, held).expect("a block");
-            std::fs::write(dir.path().join(FILE), module).unwrap();
+            std::fs::write(dir.path().join(FILE), &module).unwrap();
             assert_eq!(said(dir.path()), []);
+            // The same entry in a checkout whose rc file switches the block
+            // off: the build takes the upstream jar past it, and the run
+            // says so although the entry is there.
+            std::fs::write(declined.path().join(FILE), module).unwrap();
+            let warned = said(declined.path());
+            assert_eq!(warned.len(), 1, "{warned:?}");
+            assert_eq!(warned[0].0, NO_EFFECT);
+            let ends = "left the entry that MODULE.bazel holds for it as it is, and while that \
+                        stands the entry has no effect: the Bazel build keeps the upstream jar";
+            assert!(warned[0].1.ends_with(ends), "{warned:?}");
         }
         assert_eq!(said(project(&[]).path()), []);
     }

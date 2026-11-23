@@ -2221,6 +2221,7 @@ fn vendor_gives_a_pinned_bazel_hub_the_patched_jar() {
         grown.start_file("other/Other.class", plain).unwrap();
         let grown = grown.finish().unwrap().into_inner();
         assert_eq!(notice(&grown), notice(&patched));
+        let planted = grown.clone();
         for (rel, other) in [
             ("file/foo-1.0.jar", jar(b"NOTICE foo\n")),
             ("file/foo-1.0.jar", grown),
@@ -2291,13 +2292,25 @@ fn vendor_gives_a_pinned_bazel_hub_the_patched_jar() {
             write(root, &tree, &held);
         }
 
-        // A jar that is lost comes back: by `repair` where it is the
-        // vendored artifact, and by the next `vendor` beside a Maven build,
-        // which gives the hub the jar of the Maven tree again.
-        std::fs::remove_file(root.join("proj").join(unit("file/foo-1.0.jar"))).unwrap();
+        // A directory that is lost whole comes back with every file: by
+        // `repair` where its jar is the vendored artifact, and by the next
+        // `vendor` beside a Maven build, which gives the hub the jar of the
+        // Maven tree again. That run also drops the directory an earlier
+        // patch of the jar left behind, which nothing names any more.
+        std::fs::remove_dir_all(root.join("proj").join(FOO_UNIT)).unwrap();
+        let stale = ".socket/vendor/maven/0e77a000-0000-4000-8000-0000000000a1";
+        if !alone {
+            write(
+                root,
+                &format!("proj/{stale}/REPO.bazel"),
+                b"# an earlier patch\n",
+            );
+            write(root, &format!("proj/{stale}/file/foo-1.0.jar"), b"jar");
+        }
         let (code, check) = socket(root, &["vendor", "--check"]);
         assert_eq!(code, Some(1), "{alone}: {check}");
         let back = ok(root, if alone { &["repair"] } else { &["vendor"] });
+        assert!(!root.join("proj").join(stale).exists(), "{alone}: {back}");
         if !alone {
             let rebuilt = (
                 purl("foo"),
@@ -2340,6 +2353,23 @@ fn vendor_gives_a_pinned_bazel_hub_the_patched_jar() {
             );
         }
 
+        // A jar that waits at the hub's path with no ledger entry is not
+        // taken for the vendored one, although it carries the patch's
+        // file: the run fetches the patch's own jar over it.
+        if alone {
+            std::fs::write(&manifest, &patches).unwrap();
+            write(
+                root,
+                &format!("proj/{}", unit("file/foo-1.0.jar")),
+                &planted,
+            );
+            ok(root, &["vendor"]);
+            let taken = read(&unit("file/foo-1.0.jar")).unwrap();
+            assert_eq!(taken, committed, "the planted jar was vendored");
+            ok(root, &["vendor", "--revert"]);
+            assert_eq!(snapshot(root), pristine);
+        }
+
         // What a person reads: every file of the hub among those to commit,
         // the step that takes the jar where the hub is the only build, and
         // after the undo no step of a package manager.
@@ -2373,6 +2403,39 @@ fn vendor_gives_a_pinned_bazel_hub_the_patched_jar() {
         );
         assert_eq!(snapshot(root), pristine, "{alone}");
     }
+}
+
+/// Beside a Maven build the hub's directory must survive the commit, as
+/// every vendored artifact must: where a rule of the checkout ignores it,
+/// the run vendors for the Maven build, writes nothing for the hub and
+/// says why. An entry that names a directory git leaves out would fail
+/// the Bazel build of every other checkout.
+#[test]
+fn vendor_beside_a_maven_build_skips_a_hub_directory_that_git_ignores() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+    pinned_hub(root, "foo");
+    let proj = root.join("proj");
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&proj)
+        .output();
+    if !init.is_ok_and(|out| out.status.success()) {
+        return;
+    }
+    write(root, "proj/.gitignore", b".socket/vendor/maven/\n");
+    let env = ok(root, &["vendor"]);
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    let said = (
+        purl("foo"),
+        "skipped".to_string(),
+        "maven_bazel_hub_unpatched".to_string(),
+    );
+    assert!(events(&env).contains(&said), "{env}");
+    let module = std::fs::read_to_string(proj.join("MODULE.bazel")).unwrap();
+    assert_eq!(module, HUB_MODULE, "{env}");
+    assert!(!proj.join(".socket/vendor/maven").exists(), "{env}");
 }
 
 /// Where vendored mode cannot show that an entry would work, it writes

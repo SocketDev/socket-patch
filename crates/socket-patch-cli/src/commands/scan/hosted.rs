@@ -2243,13 +2243,8 @@ async fn run_redirect_selected_untracked(
         rewrite.files.get(socket_patch_core::bazel::maven::FILE),
         &vendor_state,
     ) {
-        let uuids = rewrite.confirmed_bazel_maven_uuids.iter();
-        let left = socket_patch_core::vendor::maven_repo::drop_unnamed_units(
-            &common.cwd,
-            module,
-            uuids,
-            state,
-        );
+        let left =
+            socket_patch_core::vendor::maven_repo::drop_unnamed_units(&common.cwd, module, state);
         let warning = |detail| RunWarning::new("cleanup_failed", detail);
         unit_warnings.extend(left.await.into_iter().map(warning));
     }
