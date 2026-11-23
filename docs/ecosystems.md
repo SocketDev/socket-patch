@@ -1963,13 +1963,14 @@ Known problems. In each of these a command exits 0 today and the next Bazel buil
   `bundle install` does not find it (`The path ... does not exist`), and rules_csharp reads
   it as a URL (`Bad URL`, or a crash of Bazel 9.3.2). Run `socket-patch vendor --revert`,
   then `socket-patch scan --mode hosted`. Of these builds a test of this repository runs the
-  PyPI one; the others were measured by hand on the three Bazel releases. A Composer package
-  is not among them: in a Bazel workspace vendored mode declines it and writes nothing
-  (`vendor_composer_bazel_workspace`, exit 1; see
-  [Bazel workspaces: Composer](#bazel-workspaces-composer)). With
-  `--allow-vendored-in-bazel` it writes what it writes outside Bazel, and a Composer that a
-  Bazel rule runs in another directory then fails the build with
-  `Source path ... is not found`.
+  PyPI one; the others were measured by hand on the three Bazel releases.
+- **Vendored mode for Composer, where its refusal is lifted or does not apply.** In a Bazel
+  workspace vendored mode declines a Composer package:
+  [Bazel workspaces: Composer](#bazel-workspaces-composer) has the refusal, what lifts it and
+  the cases it does not see. In those cases the command exits 0, and a Composer that a Bazel
+  rule runs in another directory fails the build with `Source path ... is not found`. Run
+  `socket-patch vendor --revert`, then `socket-patch scan --mode hosted`. A test of this
+  repository builds that failure on the three Bazel releases.
 - **Hosted Cargo on a hub without `cargo_config`**, which is the hub as the rules_rust README
   shows it: the hub's cargo does not see the patch registry that `.cargo/config.toml` defines
   (`registry index was not found in any configuration`). Add
