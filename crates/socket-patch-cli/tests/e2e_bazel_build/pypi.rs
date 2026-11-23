@@ -48,8 +48,9 @@
 //! `vendor --revert` has put the pin back. The flow asserts that; that
 //! every form of `vex` meanwhile writes a document that says the package
 //! is affected, and names the call of `MODULE.bazel` that reads the file;
-//! and that the revert and hosted mode, which the document names, end in
-//! the patched build and in a document that says not affected.
+//! that the revert brings the unpatched build back; and that hosted mode,
+//! which the document names, ends in the patched build and in a document
+//! that says not affected.
 //!
 //! One loopback server stands in for four hosts. The Socket API and the
 //! patch host answer at their own paths; `pypi.org` (the project pages of
@@ -710,20 +711,13 @@ fn vendors_the_wheel(cell: &Cell, with: &Vendoring) -> Tree {
     vendored
 }
 
-/// What the document of an affected package tells the user to do, in the
-/// checkout of `cell` that vendored mode patched: `vendor --revert` puts
-/// every file back as it was in `before`, and `scan --mode hosted --yes`
-/// then pins the patch of `with` in `requirements.txt`. Its document and
-/// the one of `vex` attest the package, through the pin.
-fn reverts_and_pins(cell: &Cell, with: &Vendoring, before: &Tree) {
-    let test = &cell.test;
+/// The second thing the document of an affected package tells the user to
+/// do, in the checkout of `cell` whose files `vendor --revert` has put back
+/// as they were in `before`: `scan --mode hosted --yes` pins the patch of
+/// `with` in `requirements.txt`. Its document and the one of `vex` attest
+/// the package, through the pin.
+fn pins(cell: &Cell, with: &Vendoring, before: &Tree) {
     let run = |cell: &Cell, args: &[&str]| with.run(cell, args);
-    let undo = run(cell, &["vendor", "--revert", "--yes"]);
-    let said = &undo.dump;
-    assert_eq!(undo.code, 0, "{test}: {said}");
-    assert_eq!(undo.envelope["summary"]["removed"], 1, "{test}: {said}");
-    assert_eq!(changed(before, &cell.tree()), NOTHING, "{test}: {said}");
-
     let claim = Claim::new(PURL, &with.uuid, How::Hosted);
     let document = cell.document("hosted");
     let hosted = ["scan", "--mode", "hosted", "--yes"];
@@ -747,11 +741,11 @@ fn reverts_and_pins(cell: &Cell, with: &Vendoring, before: &Tree) {
 ///   rules_python takes the path of that line for the name of a project
 ///   and leaves the hub without a repository it can name. No build holds
 ///   the patched wheel, and `vex` says affected again.
-/// - (d) What the document says to do ([`reverts_and_pins`]):
-///   `vendor --revert` puts every file back, `scan --mode hosted --yes`
-///   pins the patch in `requirements.txt`, the same two Bazel commands
-///   print the patched marker, and `vex` attests the package as not
-///   affected.
+/// - (d) What the document says to do: `vendor --revert` puts every file
+///   back, and the same two Bazel commands print the unpatched marker
+///   again. `scan --mode hosted --yes` then pins the patch in
+///   `requirements.txt` ([`pins`]), the two commands print the patched
+///   marker, and `vex` attests the package as not affected.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
 fn vendored_pip_parse() {
@@ -772,11 +766,18 @@ fn vendored_pip_parse() {
     let vendored = vendors_the_wheel(&cell, &with);
 
     // (c) The build fails on the line that names the committed wheel, and
-    // changes no file of the checkout.
+    // changes no file of the checkout: rules_python makes the name of a
+    // repository from the path, and Bazel takes no such name. A console
+    // may break the message, so it is compared without white space.
     let build = cell.bazel("build", &[CONSUMER]);
-    let named = with.patched.filename().replace(['-', '.'], "_");
+    let named = format!(
+        "invalid user-provided repo name 'pip_311__/_socket/vendor/pypi/{}/{}'",
+        with.uuid.replace('-', "_"),
+        with.patched.filename().replace(['-', '.'], "_")
+    );
+    let squeezed = |text: &str| text.split_whitespace().collect::<String>();
     assert!(
-        !build.ok() && build.stderr().contains(&named),
+        !build.ok() && squeezed(&build.stderr()).contains(&squeezed(&named)),
         "{test}: the build did not fail on the vendored line ({named}):\n{}",
         build.dump()
     );
@@ -785,8 +786,11 @@ fn vendored_pip_parse() {
     let names = names(&cell);
     cell.stands_alone(run, &Claim::unbuilt(PURL, &with.uuid, &names), true);
 
-    // (d) The way out: the undo, then hosted mode, whose pin Bazel builds.
-    reverts_and_pins(&cell, &with, &before);
+    // (d) The way out: the undo, which brings the files and the build
+    // back, then hosted mode, whose pin Bazel builds.
+    let undo = run(&cell, &["vendor", "--revert", "--yes"]);
+    cell.undone(&undo, "removed", &before, UNPATCHED);
+    pins(&cell, &with, &before);
     let marker = format!("OUT: PATCHED {}", with.uuid);
     cell.builds(&marker);
     let claim = Claim::new(PURL, &with.uuid, How::Hosted);
@@ -794,9 +798,9 @@ fn vendored_pip_parse() {
 
     println!(
         "{test}: Bazel {release} built {UNPATCHED:?}, and failed to build after `scan --mode \
-         vendored`, while every form of `vex` said the package is affected; after `vendor \
-         --revert` and `scan --mode hosted` it built {marker:?}, and `vex` said it is not \
-         affected; {:?}",
+         vendored` ({named}), while every form of `vex` said the package is affected; after \
+         `vendor --revert` it built {UNPATCHED:?} again, and after `scan --mode hosted` \
+         {marker:?}, and `vex` said it is not affected; {:?}",
         started.elapsed()
     );
 }
@@ -851,7 +855,10 @@ fn a_vendored_wheel_is_affected_beside_a_hub_that_reads_the_requirements() {
     }
     assert_eq!(changed(&vendored, &cell.tree()), NOTHING);
 
-    reverts_and_pins(&cell, &with, &before);
+    let undo = with.run(&cell, &["vendor", "--revert", "--yes"]);
+    assert_eq!(undo.envelope["summary"]["removed"], 1, "{}", undo.dump);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", undo.dump);
+    pins(&cell, &with, &before);
 
     // `vendor` in a checkout of hosted pins commits a copy of each: the
     // line of `requirements.txt` points at the wheel again.
