@@ -56,12 +56,15 @@ pub(crate) fn project_state_in_scope(common: &crate::args::GlobalArgs) -> bool {
 
 /// In a Bazel workspace the root's `.bazelignore` names the directories of
 /// the project's patched Go module copies, so that Bazel and gazelle read
-/// no package there (`socket_patch_core::bazel::ignore`). A command that can
+/// no package there (`socket_patch_core::bazel::ignore`), and the directory
+/// of the patched Maven jars that vendored mode keeps for a hub. A command
+/// that can
 /// write or remove such a copy calls this once, after the last step that
 /// can change a copy or take one back and before it gives up its apply
 /// lock. Nothing is done in a dry run or a `--global` run, and a run whose
 /// `--ecosystems` leaves `golang` out only takes away the pair of a copy
-/// that is gone. So does the prune pass of a scan, which comes here after
+/// that is gone, as one that leaves `maven` out does for the jars. So does
+/// the prune pass of a scan, which comes here after
 /// its scan has (`adds` false) and can only have removed a copy: a file
 /// it cannot write is left to the next command's warning.
 ///
@@ -71,7 +74,8 @@ pub(crate) async fn sync_bazelignore(
     common: &crate::args::GlobalArgs,
     adds: bool,
 ) -> Vec<crate::json_envelope::RunWarning> {
-    use socket_patch_core::{bazel::ignore, crawlers::Ecosystem::Golang};
+    use socket_patch_core::bazel::ignore;
+    use socket_patch_core::crawlers::Ecosystem::{Golang, Maven};
     let mut warnings = Vec::new();
     if common.dry_run || common.is_global() {
         return warnings;
@@ -83,30 +87,44 @@ pub(crate) async fn sync_bazelignore(
         projects.push(common.project_root());
     }
     let (loud, mut told) = (!common.json && !common.silent, Vec::new());
+    // What a person is told of the file, when it stays and when it goes:
+    // of the Go copies, then of the jars.
+    let said = [
+        (
+            "the lines that keep patched Go module copies under .socket out of Bazel's packages",
+            "no patched Go module copy is left under .socket",
+        ),
+        (
+            "the line that keeps the patched Maven jars under .socket out of Bazel's packages",
+            "no patched Maven jar is left under .socket",
+        ),
+    ];
     for project in projects {
-        match ignore::sync(&project, adds && common.ecosystem_selected(Golang)).await {
-            Ok(Some(file)) if loud && !told.contains(&file) => {
-                let (verb, what) = match file.exists() {
-                    true => (
-                        "Updated",
-                        "the lines that keep patched Go module copies under .socket out of \
-                         Bazel's packages",
-                    ),
-                    false => ("Removed", "no patched Go module copy is left under .socket"),
-                };
-                println!("{verb} {}: {what}", file.display());
-                told.push(file);
-            }
-            Err(detail) if adds => {
-                if loud {
-                    eprintln!("Warning: {detail}");
+        let synced = [
+            ignore::sync(&project, adds && common.ecosystem_selected(Golang)).await,
+            ignore::sync_jars(&project, adds && common.ecosystem_selected(Maven)).await,
+        ];
+        for (synced, (stays, gone)) in synced.into_iter().zip(said) {
+            match synced {
+                Ok(Some(file)) if loud && !told.contains(&(file.clone(), stays)) => {
+                    let (verb, what) = match file.exists() {
+                        true => ("Updated", stays),
+                        false => ("Removed", gone),
+                    };
+                    println!("{verb} {}: {what}", file.display());
+                    told.push((file, stays));
                 }
-                warnings.push(crate::json_envelope::RunWarning::new(
-                    ignore::NOT_UPDATED,
-                    detail,
-                ));
+                Err(detail) if adds => {
+                    if loud {
+                        eprintln!("Warning: {detail}");
+                    }
+                    warnings.push(crate::json_envelope::RunWarning::new(
+                        ignore::NOT_UPDATED,
+                        detail,
+                    ));
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
     warnings
@@ -125,24 +143,31 @@ pub(crate) async fn sync_bazelignore(
 ///
 /// With `tell`, a human run is told here, as [`sync_bazelignore`] tells
 /// it. A command that prints the warnings of its run itself passes
-/// `false`.
+/// `false`. A `vendored` run patches a pinned hub itself: it is warned of
+/// the jars it wrote no entry for, each with the reason.
 pub(crate) async fn bazel_maven_notices<'a>(
     common: &crate::args::GlobalArgs,
     purls: impl Iterator<Item = &'a str>,
     tell: bool,
+    vendored: bool,
 ) -> Vec<crate::json_envelope::RunWarning> {
     if common.is_global() {
         return Vec::new();
     }
     let purls = purls.map(str::to_string).collect();
-    let said = socket_patch_core::bazel::maven::notices(&common.cwd, purls).await;
+    use socket_patch_core::bazel::maven::{notices, HUB_UNPATCHED};
+    let said = notices(&common.cwd, purls, vendored).await;
+    // A vendored dry run wrote no entry for any jar: the ones it would
+    // write are not unpatched.
+    let would_write = |code: &str| vendored && common.dry_run && code == HUB_UNPATCHED;
+    let said = said.into_iter().filter(|(code, _)| !would_write(code));
     let warning = |(code, detail): (&str, String)| {
         if tell && !common.json && !common.silent {
             eprintln!("Warning: {detail}");
         }
         crate::json_envelope::RunWarning::new(code, detail)
     };
-    said.into_iter().map(warning).collect()
+    said.map(warning).collect()
 }
 
 /// The vendor-ledger keys (`ledger`, the project's

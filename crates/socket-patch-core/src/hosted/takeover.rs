@@ -20,8 +20,10 @@ use crate::vendor::VendorEntry;
 /// * composer: the composer.lock rewriter would repoint the vendored entry
 ///   in place, keeping its patch-uuid `dist.reference`, which no upstream
 ///   restore can match (#536);
-/// * maven: only a Gradle build's vendored JVM entry (see
-///   [`is_gradle_jvm_entry`]); a pom-only vendored entry stays.
+/// * maven: a Gradle build's vendored JVM entry (see
+///   [`is_gradle_jvm_entry`]), and the entry of a patch that only the hub
+///   of a Bazel workspace takes, whose vendored entry in `MODULE.bazel`
+///   the hosted one replaces; a pom-only vendored entry stays.
 fn takeover_ecosystem(purl: &str) -> bool {
     [
         "pkg:cargo/",
@@ -61,7 +63,11 @@ pub fn in_reach(purl: &str, entry: Option<&VendorEntry>) -> bool {
     if !takeover_ecosystem(purl) {
         return false;
     }
-    !purl.starts_with("pkg:maven/") || entry.is_some_and(is_gradle_jvm_entry)
+    let hub = |entry: &VendorEntry| {
+        entry.flavor.as_deref() == Some(crate::vendor::maven_repo::HUB_FLAVOR)
+    };
+    !purl.starts_with("pkg:maven/")
+        || entry.is_some_and(|entry| is_gradle_jvm_entry(entry) || hub(entry))
 }
 
 #[cfg(test)]
@@ -97,6 +103,17 @@ mod tests {
         for purl in ["pkg:gem/a@1", "pkg:nuget/a@1"] {
             assert!(!in_reach(purl, None), "{purl}");
         }
+    }
+
+    /// The entry of a patch that only the hub of a Bazel workspace takes
+    /// is in reach: its vendored entry in `MODULE.bazel` gives way to the
+    /// hosted one.
+    #[test]
+    fn a_maven_patch_of_a_bazel_hub_alone_is_in_reach() {
+        let mut hub = entry("maven", &[]);
+        assert!(!in_reach("pkg:maven/g/a@1", Some(&hub)));
+        hub.flavor = Some(crate::vendor::maven_repo::HUB_FLAVOR.to_string());
+        assert!(in_reach("pkg:maven/g/a@1", Some(&hub)));
     }
 
     #[test]

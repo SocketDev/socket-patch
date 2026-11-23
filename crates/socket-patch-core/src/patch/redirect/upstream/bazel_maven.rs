@@ -19,12 +19,13 @@ pub(crate) async fn restore(view: &mut View<'_>, pins: &[&HostedPin]) -> FormatR
         Err(why) => Err(why),
     };
     // The entries of exactly these pins: a patch id for the package the
-    // entry names.
+    // entry names, in an entry of hosted mode. A vendored one is no pin.
     let mut gone = Vec::new();
     let mut named = |patch: &Patch| {
+        let hosted = patch.unit().is_none();
         let pin = pins
             .iter()
-            .find(|pin| pin.uuid == patch.uuid && pin.purl == patch.purl());
+            .find(|pin| hosted && pin.uuid == patch.uuid && pin.purl == patch.purl());
         gone.extend(pin.map(|pin| pin.uuid.clone()));
         pin.is_some()
     };
@@ -152,7 +153,25 @@ mod tests {
         let [plain, _, ours] = sample(UUID);
         let other = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
         let edited = ours.replace("# Do not change", "# Do change");
+        // The entry of vendored mode for the same patch is no hosted pin.
+        let label = "@rules_jvm_external//:extensions.bzl";
+        let [group, artifact, version] =
+            ["io.netty", "netty-tcnative-classes", "2.0.61.Final"].map(String::from);
+        let vendored = Patch {
+            group,
+            artifact,
+            version,
+            uuid: UUID.to_string(),
+            sha256: String::new(),
+            url: String::new(),
+        };
+        let vendored = crate::bazel::maven::with_patch(&plain, label, vendored).unwrap();
         for (module, pins, why) in [
+            (
+                &vendored,
+                vec![pin(PURL, UUID)],
+                "MODULE.bazel holds no entry of this patch",
+            ),
             (
                 &ours,
                 vec![pin(PURL, other)],

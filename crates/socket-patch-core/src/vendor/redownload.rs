@@ -137,6 +137,11 @@ pub async fn restore(
     let mut warnings = Vec::new();
     // The JVM tree directories the stage holds besides the artifact's own.
     let mut jvm_trees: Vec<String> = Vec::new();
+    // A Maven artifact is a tree with its pom, but for the jar that
+    // vendored mode keeps for the hub of a Bazel workspace alone: that one
+    // is a file of its directory, beside files that are not the artifact.
+    let maven_tree = layout::ledger_ecosystem(&entry.ecosystem) == "maven"
+        && entry.flavor.as_deref() != Some(super::maven_repo::HUB_FLAVOR);
     if file_shaped {
         let archive = download_archive(
             service,
@@ -190,7 +195,7 @@ pub async fn restore(
         crate::utils::fs::atomic_write_artifact(&stage, &archive.bytes)
             .await
             .map_err(|e| e.to_string())?;
-        if layout::ledger_ecosystem(&entry.ecosystem) == "maven" {
+        if maven_tree {
             jvm_trees = restore_maven_metadata(
                 root,
                 temporary.path(),
@@ -338,7 +343,7 @@ pub async fn restore(
             super::verify::verify_dir_inventory(&stage, inventory, uuid).await?;
         }
     }
-    if layout::ledger_ecosystem(&entry.ecosystem) == "maven" {
+    if maven_tree {
         let target = artifact.parent().ok_or("artifact has no parent")?;
         tokio::fs::create_dir_all(target.parent().ok_or("artifact tree has no parent")?)
             .await

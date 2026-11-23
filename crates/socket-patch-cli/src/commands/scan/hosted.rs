@@ -2235,6 +2235,24 @@ async fn run_redirect_selected_untracked(
         ));
         return 1;
     }
+    // A hosted entry that took the place of a vendored one in the block of
+    // a Bazel hub leaves the directory of that entry without a reader.
+    let mut unit_warnings: Vec<RunWarning> = Vec::new();
+    if let (false, Some(module), Ok(state)) = (
+        common.dry_run,
+        rewrite.files.get(socket_patch_core::bazel::maven::FILE),
+        &vendor_state,
+    ) {
+        let uuids = rewrite.confirmed_bazel_maven_uuids.iter();
+        let left = socket_patch_core::vendor::maven_repo::drop_unnamed_units(
+            &common.cwd,
+            module,
+            uuids,
+            state,
+        );
+        let warning = |detail| RunWarning::new("cleanup_failed", detail);
+        unit_warnings.extend(left.await.into_iter().map(warning));
+    }
 
     // The agent-mode manifest's records: local proof that an installed copy
     // was patched in place, for the stale-install probes below.
@@ -2570,6 +2588,7 @@ async fn run_redirect_selected_untracked(
     warnings.extend(vlt_stale.warnings.iter().map(run_warning_of));
     warnings.extend(takeover_pre_warnings.iter().map(run_warning_of));
     warnings.extend(takeover_warnings.iter().cloned());
+    warnings.extend(unit_warnings);
     warnings.extend(prune_warnings.iter().cloned());
 
     // Granted, but nothing in the project pins it (no lock entry,

@@ -644,6 +644,55 @@ fn a_pinned_hub_gets_its_block_and_the_undo_takes_it_out() {
     assert!(!person.stderr.contains("Warning: pkg:maven"), "{person:?}");
 }
 
+/// A hosted run puts its entry in the place of the vendored one that the
+/// block holds for the jar, and removes what vendored mode kept for the
+/// hub: the directory of the jar, which nothing names any more, and its
+/// line of `.bazelignore`. Beside a Maven build no undo of a vendored
+/// patch does that, since the ledger entry there is the Maven build's.
+#[test]
+fn a_hosted_run_removes_the_jar_vendored_mode_kept_for_the_hub() {
+    let machine = Machine::start();
+    let unit = format!(".socket/vendor/maven/{UUID}");
+    let hosted = "socket_patch_http_file(\n";
+    let (head, entry) = BLOCK.split_once(hosted).expect("the entry");
+    let (_, tail) = entry.split_once(")\n").expect("its end");
+    let vendored = format!(
+        "{}socket_patch_local_repository(\n    name = \
+         \"socket_patch_dev_socket_fixture_victim_1_10_0\",\n    path = \"{unit}\",\n)\n{tail}",
+        head.replace(
+            "socket_patch_http_file = use_repo_rule(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_file\")",
+            "socket_patch_local_repository = use_repo_rule(\"@bazel_tools//tools/build_defs/repo:local.bzl\", \"local_repository\")",
+        )
+    );
+    let ignore = "# socket-patch: patched Maven jars for a Bazel hub, not Bazel packages (to opt \
+                  out, comment out the next line)\n.socket/vendor/maven\n";
+    machine.make(&pinned(), true, false);
+    let proj = machine.root.join("proj");
+    std::fs::create_dir_all(proj.join(&unit).join("file")).expect("the directory");
+    for (path, text) in [
+        ("MODULE.bazel".to_string(), format!("{HUB}\n{vendored}")),
+        (".bazelignore".to_string(), ignore.to_string()),
+        (format!("{unit}/REPO.bazel"), "# a repository\n".to_string()),
+        (format!("{unit}/file/BUILD.bazel"), String::new()),
+        (format!("{unit}/file/victim-1.10.0.jar"), "jar".to_string()),
+    ] {
+        std::fs::write(proj.join(path), text).expect("write it");
+    }
+    let get = machine.step(COMMANDS[0]);
+    assert_eq!(get.code, Some(0), "{get:?}");
+    assert_eq!(get.envelope()["warnings"], Value::Null, "{get:?}");
+    let with_block = format!("{HUB}\n{BLOCK}");
+    assert_eq!(
+        String::from_utf8_lossy(&get.wrote[MODULE]),
+        with_block,
+        "{get:?}"
+    );
+    let left = machine.files();
+    let of_the_hub = |path: &&String| path.contains(".socket/vendor") || path.ends_with("ignore");
+    let kept: Vec<&String> = left.keys().filter(of_the_hub).collect();
+    assert_eq!(kept, Vec::<&String>::new(), "{get:?}");
+}
+
 /// The Bazel files of a checkout, each with its text.
 type Files = Vec<(&'static str, String)>;
 

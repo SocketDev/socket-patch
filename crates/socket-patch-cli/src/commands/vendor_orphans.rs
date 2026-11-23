@@ -50,10 +50,15 @@ pub(crate) async fn sweep_orphan_vendor_dirs_where(
     dry_run: bool,
     select: impl Fn(&vendor::path::SweptVendorDir) -> bool,
 ) -> OrphanSweep {
+    // A JVM entry owns the `maven/<uuid>` unit of its patch too: the
+    // directory of the jar that a hub of a Bazel workspace builds.
     let recorded_units: HashSet<(&str, &str)> = state
         .entries
         .values()
-        .map(|e| (e.ecosystem.as_str(), e.uuid.as_str()))
+        .map(|e| {
+            let eco = vendor::jvm::layout::ledger_ecosystem(&e.ecosystem);
+            (eco, e.uuid.as_str())
+        })
         .collect();
     let mut candidates: Vec<vendor::path::SweptVendorDir> = vendor::path::sweep_vendor_dirs(cwd)
         .await

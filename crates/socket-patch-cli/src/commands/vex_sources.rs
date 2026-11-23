@@ -713,10 +713,16 @@ pub(crate) async fn plan(
             }
         }
         let mut took_over = false;
+        // A JVM entry is attested from its own tree, as it is without the
+        // copy of its jar that the block of a Bazel hub names.
+        let of_tree = cand
+            .vendor_entry
+            .as_ref()
+            .is_some_and(socket_patch_core::vendor::jvm::apply::is_jvm_entry);
         let basis = if let Some(vref) = cand
             .discovered
             .iter()
-            .find(|r| r.mode == WiringMode::Vendored)
+            .find(|r| r.mode == WiringMode::Vendored && !of_tree)
         {
             Basis::Vendored(Box::new(vendored_entry_for(&cand, vref)))
         } else if cand.discovered.iter().any(|r| r.mode == WiringMode::Hosted) {

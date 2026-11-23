@@ -1,7 +1,11 @@
-//! The block that hosted mode keeps in the root `MODULE.bazel` of a Bazel
-//! workspace ([`crate::bazel::maven`]): each of its entries puts a patched
-//! jar in the place of the one a rules_jvm_external hub fetches, and is a
-//! hosted pin of that jar's package.
+//! The block that hosted and vendored mode keep in the root `MODULE.bazel`
+//! of a Bazel workspace ([`crate::bazel::maven`]): each of its entries puts
+//! a patched jar in the place of the one a rules_jvm_external hub fetches.
+//! An entry with the URL of that jar is a hosted pin of the jar's package.
+//! One that names a directory of the checkout is vendored wiring: its
+//! artifact is the jar committed there, `.socket/vendor/maven/<patch
+//! id>/file/<artifact>-<version>.jar`, which is hashed like any vendored
+//! artifact.
 //!
 //! - An entry whose jar a pinned hub still fetches at the entry's version
 //!   is a ref: a build takes the patched jar, at the sha256 of the entry,
@@ -20,7 +24,9 @@
 //! on disk; over an in-memory project, which has no hub lane, nothing is
 //! read at all.
 
-use super::{DiscoverCtx, Discovery, PatchedRef, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE};
+use super::{
+    vendor_ref, DiscoverCtx, Discovery, PatchedRef, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
+};
 use crate::bazel::maven::{begins, pins, Pin, FILE};
 use crate::utils::purl::maven_purl;
 use crate::vendor::lock_inventory::LockIntegrity;
@@ -47,18 +53,26 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     };
     for Pin { patch, unbuilt } in pins {
         // The patch an entry is for is the one its URL names on a patch
-        // host, and nothing else says so.
+        // host, or the one whose directory it names, and nothing else
+        // says so.
         let purl = maven_purl(&patch.group, &patch.artifact, &patch.version);
-        let hosted = ctx
-            .hosted_uuid(&patch.url)
-            .is_some_and(|uuid| uuid == patch.uuid);
-        let Some(purl) = purl.filter(|_| hosted) else {
+        let vendored = patch.jar().map(|jar| vendor_ref(&jar));
+        let wired = match (purl, vendored) {
+            (Some(purl), Some(Some(jar))) if jar.uuid == patch.uuid => {
+                Some(PatchedRef::vendored(purl, &jar, FILE, None))
+            }
+            (Some(purl), None) if ctx.hosted_uuid(&patch.url).as_ref() == Some(&patch.uuid) => {
+                let sum = LockIntegrity::Sha256Hex(patch.sha256.clone());
+                let (uuid, url) = (patch.uuid.clone(), Some(&*patch.url));
+                Some(PatchedRef::hosted(purl, uuid, FILE, url, Some(sum), true))
+            }
+            _ => None,
+        };
+        let Some(wired) = wired else {
             let detail = format!("the entry of patch {} names no jar of it", patch.uuid);
             out.diag(DIAG_REF_INVALID, FILE, detail);
             continue;
         };
-        let sum = LockIntegrity::Sha256Hex(patch.sha256.clone());
-        let wired = PatchedRef::hosted(purl, patch.uuid, FILE, Some(&patch.url), Some(sum), true);
         match unbuilt {
             None => out.push(wired),
             Some(why) => {
@@ -119,6 +133,38 @@ mod tests {
         assert_eq!(pins, [(PURL, UUID_A)]);
         assert_eq!((inventory.contested, inventory.stale), (vec![], vec![]));
         assert_eq!(inventory.pins[0].files, [FILE]);
+    }
+
+    /// The entry of vendored mode is vendored wiring: its artifact is the
+    /// jar committed in the directory it names, which a ledger entry of
+    /// that jar is live by. It is no hosted pin. One whose jar the hub no
+    /// longer fetches is withheld like a hosted one.
+    #[tokio::test]
+    async fn an_entry_that_names_a_directory_is_vendored_wiring() {
+        use crate::bazel::maven::{with_patch, Patch};
+        let [plain, lock, _] = sample(UUID_A);
+        let patch = Patch {
+            group: "io.netty".to_string(),
+            artifact: "netty-tcnative-classes".to_string(),
+            version: "2.0.61.Final".to_string(),
+            uuid: UUID_A.to_string(),
+            sha256: String::new(),
+            url: String::new(),
+        };
+        let jar = patch.jar().expect("a vendored entry");
+        let label = "@rules_jvm_external//:extensions.bzl";
+        let ours = with_patch(&plain, label, patch).expect("a block");
+        let out = extracted(&project(&ours, &lock)).await;
+        assert_refs(&out, &[(PURL, UUID_A, super::super::WiringMode::Vendored)]);
+        assert_eq!(out.diagnostics, []);
+        assert_eq!(out.refs[0].artifact_rel.as_deref(), Some(jar.as_str()));
+        assert_eq!(out.vendored_claim(PURL, UUID_A, &jar), Some(true));
+        assert_eq!(HostedInventory::of(&out).pins.len(), 0);
+        let moved = lock.replace("2.0.61.Final", "2.0.62.Final");
+        let out = extracted(&project(&ours, &moved)).await;
+        assert_refs(&out, &[]);
+        assert_eq!(diag_codes(&out), [DIAG_REF_UNATTRIBUTABLE]);
+        assert_eq!(out.vendored_claim(PURL, UUID_A, &jar), Some(false));
     }
 
     /// An entry that a build may pass without (the lock moved on, a hub

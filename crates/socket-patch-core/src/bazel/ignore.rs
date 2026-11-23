@@ -10,6 +10,15 @@
 //! fails to load rules_go from it. A `.bazelignore` line keeps both out.
 //! Bazel reads the file at the root of the workspace only and takes each
 //! line as a literal directory path from that root.
+//!
+//! Vendored mode also keeps the patched jar of a Maven artifact that a
+//! rules_jvm_external hub builds in a directory of its own under
+//! `.socket/vendor/maven`, with the BUILD file that makes it the
+//! repository Bazel links to ([`super::maven`]). Without a line Bazel
+//! reads that file as a package of the workspace too: `bazel query
+//! //...` lists it (Bazel 9.3.2, 8.8.2, 7.7.2 and 7.4.0), and the build is
+//! the same with the line and without. [`sync_jars`] keeps the line for
+//! that directory, as [`sync`] does for the Go copies.
 
 use std::path::{Path, PathBuf};
 
@@ -22,6 +31,29 @@ pub const NOT_UPDATED: &str = "bazelignore_not_updated";
 /// The line above every line [`sync`] writes.
 const COMMENT: &str =
     "# socket-patch: patched Go module copies, not Bazel packages (to opt out, comment out the next line)";
+
+/// The directories a call keeps lines for, the line above each line it
+/// writes, and why a user has to add a line that could not be written.
+struct Kept {
+    dirs: &'static [&'static str],
+    comment: &'static str,
+    why: &'static str,
+}
+
+const GO: Kept = Kept {
+    dirs: &[GO_VENDOR_DIR, GO_PATCHES_DIR],
+    comment: COMMENT,
+    why: "so that Bazel and gazelle do not read the patched Go module copies there as packages \
+          (`bazel run //:gazelle` or `bazel build //...` can otherwise break the build)",
+};
+
+const JARS: Kept = Kept {
+    dirs: &[super::maven::UNITS],
+    comment: "# socket-patch: patched Maven jars for a Bazel hub, not Bazel packages (to opt out, \
+              comment out the next line)",
+    why: "so that Bazel reads no package of the workspace in the directory of the patched Maven \
+          jars",
+};
 
 /// How [`COMMENT`] starts, in this wording and in any other. A line is
 /// [`sync`]'s to remove only when it stands under a line that starts so,
@@ -51,10 +83,18 @@ const MARK: &str = "# socket-patch:";
 /// has done its work either way.
 pub async fn sync(project: &Path, add: bool) -> Result<Option<PathBuf>, String> {
     let project = project.to_path_buf();
-    run_blocking(move || sync_blocking(&project, add)).await
+    run_blocking(move || sync_blocking(&project, &GO, add)).await
 }
 
-fn sync_blocking(project: &Path, add: bool) -> Result<Option<PathBuf>, String> {
+/// [`sync`] for the directory of the jars that vendored mode keeps for a
+/// rules_jvm_external hub, `.socket/vendor/maven`: one line under a comment
+/// line of its own while the directory exists, with the same rules.
+pub async fn sync_jars(project: &Path, add: bool) -> Result<Option<PathBuf>, String> {
+    let project = project.to_path_buf();
+    run_blocking(move || sync_blocking(&project, &JARS, add)).await
+}
+
+fn sync_blocking(project: &Path, kept: &Kept, add: bool) -> Result<Option<PathBuf>, String> {
     let Some(root) = super::bazel_root(project) else {
         return Ok(None);
     };
@@ -69,8 +109,11 @@ fn sync_blocking(project: &Path, add: bool) -> Result<Option<PathBuf>, String> {
         Ok(meta) => Some(meta.is_dir()),
         Err(e) => (e.kind() == std::io::ErrorKind::NotFound).then_some(false),
     };
-    let wanted =
-        [GO_VENDOR_DIR, GO_PATCHES_DIR].map(|dir| (format!("{from_root}{dir}"), exists(dir)));
+    let wanted = kept.dirs.iter();
+    let wanted: Vec<_> = wanted
+        .map(|dir| (format!("{from_root}{dir}"), exists(dir)))
+        .collect();
+    let edited = |old: &[u8]| edited(old, &wanted, add, kept.comment);
 
     let file = root.dir.join(".bazelignore");
     let read = || match read_regular_to_bytes_sync(&file) {
@@ -80,7 +123,7 @@ fn sync_blocking(project: &Path, add: bool) -> Result<Option<PathBuf>, String> {
     // Most runs find nothing to change, and take no lock to find that. A
     // file that cannot be read is an edit only with a copy to name in it.
     let unlocked = read().unwrap_or_default();
-    if edited(&unlocked, &wanted, add) == unlocked {
+    if edited(&unlocked) == unlocked {
         return Ok(None);
     }
     let _lock = lock(&root.dir);
@@ -88,7 +131,7 @@ fn sync_blocking(project: &Path, add: bool) -> Result<Option<PathBuf>, String> {
         Ok(old) => (old, None),
         Err(e) => (Vec::new(), Some(e)),
     };
-    let new = edited(&old, &wanted, add);
+    let new = edited(&old);
     // The root is canonical: on Windows that spelling has a prefix no user
     // types and no tool prints.
     let shown = crate::utils::pnpm_workspace::without_verbatim_prefix(file.clone());
@@ -114,10 +157,9 @@ fn sync_blocking(project: &Path, add: bool) -> Result<Option<PathBuf>, String> {
         .collect();
     let advice = if !missing.is_empty() {
         format!(
-            "add {} to it on a line of its own, with no space before or after, so that Bazel \
-             and gazelle do not read the patched Go module copies there as packages (`bazel run \
-             //:gazelle` or `bazel build //...` can otherwise break the build)",
-            missing.join(" and ")
+            "add {} to it on a line of its own, with no space before or after, {}",
+            missing.join(" and "),
+            kept.why
         )
     } else {
         "the lines under socket-patch's comment in it name directories that no longer exist \
@@ -224,7 +266,7 @@ fn settled(old: &[u8], path: &str) -> bool {
 /// no line break gets one before the pair and none after it, and loses that
 /// one (the comment line's own) with a pair that ends the file that way, so
 /// that the file without the pair is the file of before, byte for byte.
-fn edited(old: &[u8], wanted: &[(String, Option<bool>)], add: bool) -> Vec<u8> {
+fn edited(old: &[u8], wanted: &[(String, Option<bool>)], add: bool, comment: &str) -> Vec<u8> {
     let gone = |line: &[u8]| {
         wanted
             .iter()
@@ -254,8 +296,8 @@ fn edited(old: &[u8], wanted: &[(String, Option<bool>)], add: bool) -> Vec<u8> {
             continue;
         }
         let pair = match new.is_empty() || new.ends_with(b"\n") {
-            true => format!("{COMMENT}{nl}{line}{nl}"),
-            false => format!("{nl}{COMMENT}{nl}{line}"),
+            true => format!("{comment}{nl}{line}{nl}"),
+            false => format!("{nl}{comment}{nl}{line}"),
         };
         new.extend_from_slice(pair.as_bytes());
     }
@@ -275,7 +317,7 @@ mod tests {
     fn edit(old: &str, vendor: bool, patches: bool) -> String {
         let wanted = [(VENDOR, vendor), (PATCHES, patches)];
         let wanted = wanted.map(|(line, exists)| (line.to_string(), Some(exists)));
-        String::from_utf8(edited(old.as_bytes(), &wanted, true)).unwrap()
+        String::from_utf8(edited(old.as_bytes(), &wanted, true, COMMENT)).unwrap()
     }
 
     fn pair(line: &str) -> String {
@@ -658,6 +700,55 @@ mod tests {
                 fs::create_dir_all(a.join(VENDOR)).unwrap();
             }
         }
+    }
+
+    /// The directory of the jars that vendored mode keeps for a hub has a
+    /// pair of its own, under a comment of its own. It comes and goes with
+    /// that directory by the rules of the Go pairs, and neither call
+    /// touches the other's pair or adds one for the other's directory.
+    #[tokio::test]
+    async fn the_jars_of_a_hub_have_a_pair_of_their_own() {
+        let jars = JARS.dirs[0];
+        assert_eq!(jars, ".socket/vendor/maven");
+        assert!(JARS.comment.starts_with(MARK) && JARS.comment != COMMENT);
+        let of_jars = format!("{}\n{jars}\n", JARS.comment);
+        let (_tmp, root, project) = project("", jars);
+        let file = root.join(".bazelignore");
+        let left = || fs::read_to_string(&file).ok();
+        assert_eq!(sync(&project).await, Ok(None), "no Go copy");
+        assert_eq!(sync_jars(&project, false).await, Ok(None), "Maven left out");
+        assert_eq!(left(), None);
+        assert_eq!(sync_jars(&project, true).await, changed(&root));
+        assert_eq!(sync_jars(&project, true).await, Ok(None), "a second run");
+        assert_eq!(left(), Some(of_jars.clone()));
+        fs::create_dir_all(project.join(VENDOR)).unwrap();
+        assert_eq!(sync(&project).await, changed(&root));
+        assert_eq!(left(), Some(of_jars.clone() + &pair(VENDOR)));
+        // Each goes with its own directory, and the file with the last.
+        fs::remove_dir_all(project.join(jars)).unwrap();
+        assert_eq!(sync(&project).await, Ok(None));
+        assert_eq!(sync_jars(&project, false).await, changed(&root));
+        assert_eq!(left(), Some(pair(VENDOR)));
+        fs::remove_dir_all(project.join(VENDOR)).unwrap();
+        assert_eq!(sync(&project).await, changed(&root));
+        assert_eq!(left(), None);
+        // A line of the user's that covers the directory, and the pair
+        // with its path line commented out, are left as they are.
+        fs::create_dir_all(project.join(jars)).unwrap();
+        let declined = format!("{}\n# {jars}\n", JARS.comment);
+        for settled in [".socket\n", ".socket/vendor\n", declined.as_str()] {
+            fs::write(&file, settled).unwrap();
+            assert_eq!(sync_jars(&project, true).await, Ok(None), "{settled:?}");
+            assert_eq!(left().as_deref(), Some(settled));
+        }
+        // What cannot be written is said with the line to add, and why.
+        fs::remove_file(&file).unwrap();
+        fs::create_dir(&file).unwrap();
+        let detail = sync_jars(&project, true).await.expect_err("a directory");
+        assert!(
+            detail.contains("add `.socket/vendor/maven` to it") && detail.ends_with(JARS.why),
+            "{detail}"
+        );
     }
 
     #[tokio::test]
