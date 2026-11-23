@@ -272,11 +272,11 @@ fn global_flag_cases_cover_every_global_field() {
         maven_config: _,
     } = common;
 
-    // 31 fields ↔ 31 long-flag cases. Bump both this count and add a case when
+    // 32 fields ↔ 32 long-flag cases. Bump both this count and add a case when
     // the destructure above forces you to add a field.
     assert_eq!(
         global_flag_cases().len(),
-        31,
+        32,
         "every GlobalArgs field needs a long-flag case in global_flag_cases()",
     );
 }
