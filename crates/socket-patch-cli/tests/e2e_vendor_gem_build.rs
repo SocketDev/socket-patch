@@ -2274,7 +2274,8 @@ fn gemspec_library(proj: &Path, gemfile: &str) {
     let relock = bundle(proj, &["install"], false);
     assert!(
         relock.status.success(),
-        "the gem library installs before vendor (test premise):\n{}",
+        "the gem library installs before vendor (test premise):\n{}\n{}",
+        String::from_utf8_lossy(&relock.stdout),
         String::from_utf8_lossy(&relock.stderr)
     );
 }
@@ -2445,6 +2446,8 @@ fn gem_vendor_gemspec_only_dependency_refusal_names_remedies_that_work() {
         locked_gem_version(&lock, DEP)
     };
 
+    let bundle_config = proj.join(".bundle/config");
+    let committed_config = std::fs::read(&bundle_config).unwrap();
     gemspec_library(&proj, hidden);
     assert_eq!(locked(&proj).as_deref(), Some(version), "test premise");
     let lock_before = std::fs::read(proj.join("Gemfile.lock")).unwrap();
@@ -2550,7 +2553,11 @@ fn gem_vendor_gemspec_only_dependency_refusal_names_remedies_that_work() {
         "revert restores Gemfile.lock byte-identical"
     );
 
-    // The second way out: agent mode, with the Gemfile as it was.
+    // The second way out: agent mode, with the Gemfile as it was. Bundler
+    // <= 2.0 persisted `BUNDLE_FROZEN: "true"` into `.bundle/config` on the
+    // frozen install above and would refuse the changed Gemfile; a
+    // developer's unfrozen install runs from the committed config.
+    std::fs::write(&bundle_config, &committed_config).unwrap();
     gemspec_library(&proj, hidden);
     assert_eq!(locked(&proj).as_deref(), Some(version), "test premise");
     let installed_rb = PathBuf::from(gem_path(&proj)).join("lib/rack.rb");
