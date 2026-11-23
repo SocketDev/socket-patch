@@ -28,7 +28,7 @@ export interface BatchPatchInfo { uuid: string; purl: string; tier: string; cveI
 export interface BatchSearchResponse { packages: { purl: string; patches: BatchPatchInfo[] }[]; canAccessPaidPatches: boolean }
 export interface PatchSearchResult { uuid: string; purl: string; publishedAt: string; description: string; license: string; tier: string; vulnerabilities: Record<string, { cves: string[]; summary: string; severity: string; description: string }> }
 export interface SearchResponse { patches: PatchSearchResult[]; canAccessPaidPatches: boolean }
-export interface PackageVendorResult { status: string; url: string | null; purl: string | null; artifacts: unknown[] | null; registryOverride: unknown | null }   // exactly what the v0 API serializes
+export interface PackageVendorResult { status: string; url: string | null; purl: string | null; artifacts: unknown[] | null; registryOverride: unknown | null; npmRegistryUrl?: string | null }   // exactly what the v0 API serializes (npmRegistryUrl: npm only, the patch's one-package registry address; omit or null when not served)
 export interface PatchResponse { uuid: string; purl: string; publishedAt: string; files: Record<string, { beforeHash?: string; afterHash?: string; socketBlob?: string }>; vulnerabilities: Record<string, unknown>; description: string; license: string; tier: string }
 
 export interface PatchProvider {
@@ -49,7 +49,7 @@ export interface HostedScanSessionOptions {
   batchSize?: number               // 1..500, default 100
   dryRun?: boolean
   pipenvMajor?: number             // never spawns pipenv; absent => same default as CLI when pipenv unavailable
-  trustLockfileConfig?: boolean    // default true
+  trustLockfileConfig?: boolean    // default true; false writes neither the pnpm named registries and overrides nor trustLockfile
   npmAllowRemoteConfig?: boolean   // default true
   projectRoots?: string[]          // must match selectHostedScanPaths input
   providerConcurrency?: number     // default 8
@@ -91,7 +91,7 @@ export interface HostedScanResult {
   projects: ProjectResult[]
   changedFiles: { path: string; content: string }[]            // repo-relative, sorted, only byte-changed, includes ledgers (wet runs only)
   changedBinaryFiles: { path: string; content: Buffer }[]
-  deletedFiles: string[]
+  deletedFiles: string[]                                       // repo-relative, sorted: a pnpm-workspace.yaml hosted mode created that holds nothing of a registry route any more
   warnings: EngineWarning[]
   rollout?: RolloutBlock                              // session-level: one budget across every project; absent only with policyError
   stats: { projects: number; filesInput: number; bytesInput: number; packagesScanned: number; packagesWithPatches: number; patchesSelected: number; patchesRedirected: number; filesChanged: number; providerCalls: Record<string, number>; phaseMs: Record<string, number> }

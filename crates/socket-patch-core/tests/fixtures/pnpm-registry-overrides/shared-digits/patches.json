@@ -1,0 +1,18 @@
+[
+  {
+    "name": "leaf",
+    "version": "1.0.0",
+    "uuid": "aaaaaaaa-1111-4111-8111-111111111111",
+    "artifactUrl": "https://patch.test/patch/npm/leaf/1.0.0/22222222-2222-4222-8222-222222222222/aaaaaaaa-1111-4111-8111-111111111111/leaf-1.0.0.tgz",
+    "npmRegistryUrl": "https://patch.test/patch/npm/leaf/1.0.0/22222222-2222-4222-8222-222222222222/aaaaaaaa-1111-4111-8111-111111111111/",
+    "sha512": "sha512-5NKOKLzUvevt2gvNVak8PX6XkpbPRlfkrMG5Fd3lKSkoVzQhmVzvm7o41H97u/Q09wv78/tNy1ZaU56xnZm8Sg=="
+  },
+  {
+    "name": "@scope/direct",
+    "version": "1.0.0",
+    "uuid": "aaaaaaaa-2222-4222-8222-222222222222",
+    "artifactUrl": "https://patch.test/patch/npm/@scope/direct/1.0.0/22222222-2222-4222-8222-222222222222/aaaaaaaa-2222-4222-8222-222222222222/direct-1.0.0.tgz",
+    "npmRegistryUrl": "https://patch.test/patch/npm/@scope/direct/1.0.0/22222222-2222-4222-8222-222222222222/aaaaaaaa-2222-4222-8222-222222222222/",
+    "sha512": "sha512-zpSu1965GYxgc1++jQeL7Uwt3CjCNedIfugMF5tb5f/UYJE6JSNDo/Qo3W7Sqjpu8bCX+zaZJuQ29VxpPm630w=="
+  }
+]

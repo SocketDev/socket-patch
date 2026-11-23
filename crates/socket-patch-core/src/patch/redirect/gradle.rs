@@ -1693,6 +1693,7 @@ mod tests {
             token: TOKEN.into(),
             patch_uuid: uuid.into(),
             artifact_url: format!("https://patch.socket.dev/patch/maven/{G}/{artifact}/{base}/{TOKEN}/{uuid}/{artifact}.jar"),
+            npm_registry_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "maven2".into(),
                 index_url: url(uuid),

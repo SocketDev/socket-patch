@@ -199,6 +199,7 @@ mod tests {
             artifact_url: format!(
                 "https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/minimist-1.2.2.tgz"
             ),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha512: Some(format!(

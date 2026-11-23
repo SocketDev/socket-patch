@@ -1,0 +1,41 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+overrides:
+  old-notes@1.0.0: socket-11111111:1.0.0
+
+importers:
+
+  .:
+    dependencies:
+      mid:
+        specifier: 1.0.0
+        version: 1.0.0
+      old-notes:
+        specifier: socket-11111111:1.0.0
+        version: socket-11111111:1.0.0
+
+packages:
+
+  leaf@1.0.0:
+    resolution: {integrity: sha512-iuZ2dEUwKbJuRnXq78FAd95+hAtb2Y+tujnKMgcQFHj+5DKBz46Mo578ZeRnXrP8kRoNqCyWTAjJFw5m88RRFg==}
+    engines: {node: '>=8'}
+
+  mid@1.0.0:
+    resolution: {integrity: sha512-KgTAgictdFo5Wq2/+mO75142wnayvsOHEaj9y43h9CO4tJGffqGKaBhp6QSgTEV6F1jcrpF7pxXhj6+x8ZnViA==}
+
+  old-notes@socket-11111111:1.0.0:
+    resolution: {integrity: sha512-GHSrcQ2B7Jhevmw7D3a07aXuZZ8VpyY6n8ATw5TImeqENqO5TNmR65CKciaWYUx7GBN35TeFXoNRgg0igsedLg==, tarball: https://patch.test/patch/npm/old-notes/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/old-notes-1.0.0.tgz}
+
+snapshots:
+
+  leaf@1.0.0: {}
+
+  mid@1.0.0:
+    dependencies:
+      leaf: 1.0.0
+
+  old-notes@socket-11111111:1.0.0: {}

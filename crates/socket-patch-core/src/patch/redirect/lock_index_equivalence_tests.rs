@@ -33,6 +33,7 @@ fn dep(name: &str, version: &str, uuid: usize, rng: &mut Rng) -> DepOverride {
         token: String::new(),
         patch_uuid: format!("00000000-0000-4000-8000-{uuid:012}"),
         artifact_url: format!("https://patch.socket.dev/{tag}/{name}-{version}.tgz"),
+        npm_registry_url: None,
         registry_override: None,
         integrity: Integrity {
             sha512: (!rng.chance(5)).then(|| format!("sha512-P{}==", rng.below(3))),

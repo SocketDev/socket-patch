@@ -338,6 +338,29 @@ fn check_registry_override(ov: &RegistryOverride, origins: &[String]) -> Result<
     Ok(())
 }
 
+/// The npm registry address a grant serves `dep` under
+/// ([`DepOverride::npm_registry_url`]), when pnpm can be routed through
+/// it: an npm grant's `http(s)` address ending in `/` that is the
+/// directory the artifact is served from, itself named by the patch's
+/// UUID (`<origin>/patch/npm/<name>/<version>/<token>/<patch uuid>/` on
+/// Socket's servers). pnpm verifies a lock entry against the registry
+/// document that lists its tarball, and the patch service answers that
+/// document for the patch's own directory, so any other address would
+/// route nothing. Anything else reads as not served: no address, one the
+/// artifact URL is not a file of, and an address that names several
+/// patches at once (`<origin>/patch/npm/~/<digits>.<digits>/`).
+pub(crate) fn npm_registry_url(dep: &DepOverride) -> Option<&str> {
+    use crate::formats::pnpm::named_registries::Address;
+
+    let url = served(&dep.npm_registry_url)?;
+    (dep.ecosystem == "npm"
+        && url.ends_with('/')
+        && url.chars().all(is_url_char)
+        && Address::parse(url).is_some_and(|address| address.uuid == dep.patch_uuid)
+        && Address::serves(url, &dep.artifact_url))
+    .then_some(url)
+}
+
 /// Whether every field of `dep`, the override built from one grant, has
 /// the shape the rewriters write verbatim. `patch_server_origins` are the
 /// operator's own patch servers, whose plain-`http` URLs are accepted.
@@ -385,6 +408,7 @@ mod tests {
             artifact_url: format!(
                 "https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/{UUID}/left-pad-1.3.0.tgz"
             ),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha512: Some(SRI.into()),

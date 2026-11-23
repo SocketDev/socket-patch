@@ -1,0 +1,44 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+overrides:
+  peer-user@1.0.0: socket-11111111:1.0.0
+
+importers:
+
+  .:
+    dependencies:
+      host:
+        specifier: 1.0.0
+        version: 1.0.0
+      peer-user:
+        specifier: socket-11111111:1.0.0
+        version: socket-11111111:1.0.0(host@1.0.0)
+
+packages:
+
+  host@1.0.0:
+    resolution: {integrity: sha512-+JyhDCb2D1u3QyQFoDWHQDaRLNC3WqMDR7yAy7uz3jR3kN8x62ig4ZEAD8So05cK97wiF83NN1vv8Z95FeVpTw==}
+
+  leaf@1.0.0:
+    resolution: {integrity: sha512-iuZ2dEUwKbJuRnXq78FAd95+hAtb2Y+tujnKMgcQFHj+5DKBz46Mo578ZeRnXrP8kRoNqCyWTAjJFw5m88RRFg==}
+    engines: {node: '>=8'}
+
+  peer-user@socket-11111111:1.0.0:
+    resolution: {integrity: sha512-QqLjVUu/xrG7j1uUKhVkB4kSQLXeB1I/Dsd8eblsa3gG9/6wF8olMywMh4x3QnhQFvavdVOaKMV8ctrhFo0WsQ==, tarball: https://patch.test/patch/npm/peer-user/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/peer-user-1.0.0.tgz}
+    peerDependencies:
+      host: ^1.0.0
+
+snapshots:
+
+  host@1.0.0: {}
+
+  leaf@1.0.0: {}
+
+  peer-user@socket-11111111:1.0.0(host@1.0.0):
+    dependencies:
+      host: 1.0.0
+      leaf: 1.0.0

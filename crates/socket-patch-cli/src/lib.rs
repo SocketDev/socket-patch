@@ -191,8 +191,10 @@ pub enum Commands {
     ///
     /// Downloads missing agent patch data and redownloads missing or corrupt
     /// vendored artifacts using the existing vendor ledger, then deletes
-    /// unreferenced artifacts. A lost `.socket/vendor/state.json` cannot be
-    /// reconstructed; restore it from version control.
+    /// unreferenced artifacts and the pnpm registry entries of hosted
+    /// patches that no lockfile uses any more. A lost
+    /// `.socket/vendor/state.json` cannot be reconstructed; restore it from
+    /// version control.
     Repair(commands::repair::RepairArgs),
 
     // Internal parse target of the root `--update` flag (see the rewrite

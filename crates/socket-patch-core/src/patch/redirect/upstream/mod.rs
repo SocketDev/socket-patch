@@ -1098,6 +1098,76 @@ pub async fn restore_upstream(
     }
 }
 
+/// What [`sweep_pnpm_registry_route`] did.
+#[derive(Debug, Default)]
+pub struct RouteSweep {
+    /// One edit per entry of the route the sweep changed (or would, on a
+    /// dry run or had the flush not failed), in file order.
+    pub edits: Vec<super::FileEdit>,
+    /// Root-relative files rewritten or removed (or that would be), sorted.
+    pub files: Vec<String>,
+    /// Why the project was left as it is: its locks or its workspace file
+    /// could not be read to tell what still uses the route.
+    pub unread: Option<String>,
+    /// Why the swept files were not written ([`RestoreOutcome::flush_error`]).
+    pub flush_error: Option<String>,
+    /// Files a failed flush had written and could not put back
+    /// ([`RestoreOutcome::half_applied`]).
+    pub half_applied: Vec<String>,
+    /// Registries the sweep left alone that have the name and the address
+    /// of a patch's registry, on a host outside the run's patch servers:
+    /// `(origin, how many)`, by origin. The sweep cannot tell them from the
+    /// project's own; a caller says so, since on a patch server it was not
+    /// told of they are hosted mode's and nothing of them was tidied.
+    pub unknown_hosts: Vec<(String, usize)>,
+}
+
+/// Take out of the pnpm project at `root` what is left of hosted mode's
+/// registry route that no lock uses any more: an override of ours for a
+/// release no governed lock keys by a registry of ours (in
+/// pnpm-workspace.yaml and in each lock's record of it), and a registry of
+/// ours no lock key names. Each patch has its own registry, so the locks
+/// alone say which are in use. A workspace file left as hosted mode
+/// created it is deleted.
+///
+/// From the project's files alone (`opts.offline` is not consulted: nothing
+/// is asked of the patch service or a registry), so it is what `repair`
+/// and a `--prune` run without `--mode hosted` reconcile with; a hosted
+/// scan does the same as part of its rewrite. `opts.dry_run` stages and
+/// checks the writes without making them.
+pub async fn sweep_pnpm_registry_route(root: &Path, opts: &RestoreOptions) -> RouteSweep {
+    let mut view = View::new(root);
+    let swept = npm::sweep_registry_route(&mut view, &opts.patch_server_origins).await;
+    let (edits, unknown_hosts) = match swept {
+        Ok(swept) => swept,
+        Err(why) => {
+            return RouteSweep {
+                unread: Some(why),
+                ..RouteSweep::default()
+            }
+        }
+    };
+    let changed = view.changed();
+    let changed_bytes = view.changed_bytes();
+    let (flush_error, half_applied) =
+        match preflight(root, view.pending(&changed, &changed_bytes)).await {
+            Err(refused) => (Some(refused), Vec::new()),
+            Ok(_) if opts.dry_run => (None, Vec::new()),
+            Ok(checked) => match flush(&checked).await {
+                Ok(()) => (None, Vec::new()),
+                Err(failed) => (Some(failed.message), failed.left),
+            },
+        };
+    RouteSweep {
+        edits,
+        files: changed.keys().cloned().collect(),
+        unread: None,
+        flush_error,
+        half_applied,
+        unknown_hosts,
+    }
+}
+
 /// One restore pass over `view` for the `active` pins.
 async fn restore_pass(view: &mut View<'_>, active: &[&HostedPin], ctx: &Ctx<'_>) -> FormatResult {
     let mut by_format: BTreeMap<Format, (Vec<&HostedPin>, BTreeSet<String>)> = BTreeMap::new();
@@ -1169,6 +1239,9 @@ async fn restore_pass(view: &mut View<'_>, active: &[&HostedPin], ctx: &Ctx<'_>)
     npm::cleanup_side_config(view, ctx, &mut out).await;
     out
 }
+
+#[cfg(test)]
+mod route_sweep_tests;
 
 #[cfg(test)]
 mod tests {

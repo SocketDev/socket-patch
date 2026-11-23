@@ -1,0 +1,57 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .: {}
+
+  packages/a:
+    dependencies:
+      host:
+        specifier: 1.0.0
+        version: 1.0.0
+      opt-peers:
+        specifier: 1.0.0
+        version: 1.0.0(host@1.0.0)(other@1.0.0)
+
+  packages/b:
+    dependencies:
+      opt-peers:
+        specifier: 1.0.0
+        version: 1.0.0(host@1.0.0)(other@1.0.0)
+      other:
+        specifier: 1.0.0
+        version: 1.0.0
+
+packages:
+
+  host@1.0.0:
+    resolution: {integrity: sha512-+JyhDCb2D1u3QyQFoDWHQDaRLNC3WqMDR7yAy7uz3jR3kN8x62ig4ZEAD8So05cK97wiF83NN1vv8Z95FeVpTw==}
+
+  opt-peers@1.0.0:
+    resolution: {integrity: sha512-g8XurAjKJCz5w5+XDTD5EVwV609LWDx/FwYC2/mJbCnCWtYI1FN3i1fH3AtzCM346SvIf9nPmkE/TAauZBNtPg==}
+    peerDependencies:
+      host: ^1.0.0
+      other: ^1.0.0
+    peerDependenciesMeta:
+      host:
+        optional: true
+      other:
+        optional: true
+
+  other@1.0.0:
+    resolution: {integrity: sha512-xHnSAbJF4ryxPDMX7+xocyTzv/SXhQ52Jd8kvReD3cYCwJvHDTHlLszgHzS69s0UZcHLtS55pIle/9oXvJytHQ==}
+
+snapshots:
+
+  host@1.0.0: {}
+
+  opt-peers@1.0.0(host@1.0.0)(other@1.0.0):
+    optionalDependencies:
+      host: 1.0.0
+      other: 1.0.0
+
+  other@1.0.0: {}

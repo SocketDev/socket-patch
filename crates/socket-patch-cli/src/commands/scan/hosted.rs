@@ -67,12 +67,33 @@ pub(super) fn redirect_block(rewritten: Vec<String>) -> serde_json::Value {
     serde_json::json!({ "mode": "hosted", "rewrittenFiles": rewritten })
 }
 
-/// `--prune` is a no-op in hosted mode.
+/// `--prune` sweeps no `.socket/` state in hosted mode.
 pub(super) fn prune_ignored_warning() -> RunWarning {
     RunWarning::new(
         super::REDIRECT_PRUNE_IGNORED,
         super::REDIRECT_PRUNE_IGNORED_DETAIL,
     )
+}
+
+/// Report what a hosted run took out of a pnpm registry route because no
+/// lockfile uses it any more (`entries`; on a dry run, would take out):
+/// one artifact-level event per entry on every run, and under `--prune`,
+/// for a project that held a route (`gc`), the envelope's `gc` with the
+/// count. Hosted mode sweeps no `.socket/` state, so the other `gc` counts
+/// are zero there.
+pub(super) fn record_registry_cleanup(
+    env: &mut Envelope,
+    entries: &[socket_patch_core::hosted::guidance::RegistryEntry],
+    gc: bool,
+    dry_run: bool,
+) {
+    crate::commands::registry_gc::record(env, entries, dry_run);
+    if gc {
+        env.set_gc(crate::json_envelope::GcReport {
+            removed_registry_entries: entries.len(),
+            ..Default::default()
+        });
+    }
 }
 
 /// The operator's `Authorization` header value for the patch mirror
@@ -1148,8 +1169,9 @@ pub(super) async fn run_redirect(
     // The withdrawn-pin sweep's reference answers (see
     // `rollout::Gate::references`).
     references: Option<super::withdrawn::KnownReferences>,
-    // `--prune` / `--sync` after the policy gate: only feeds the
-    // `redirect_prune_ignored` warning.
+    // `--prune` / `--sync` after the policy gate: feeds the
+    // `redirect_prune_ignored` warning and the `gc` count of the registry
+    // entries the run took out.
     prune: bool,
 ) -> i32 {
     let discovered = match discover_selected(
@@ -1284,7 +1306,9 @@ fn discovery_after_writes<'d>(
 /// a concurrent writer's edits.
 ///
 /// `scan_result` must be `Some` exactly when `common.json` is set.
-/// `prune_requested` only feeds the `redirect_prune_ignored` warning.
+/// `prune_requested` feeds the `redirect_prune_ignored` warning and the
+/// `gc` count of the pnpm registry entries the run took out (it takes them
+/// out with or without the flag).
 ///
 /// Telemetry: a run with a non-empty selection reports `patch_applied`
 /// before the result prints or, on a non-zero exit before that,
@@ -1606,14 +1630,20 @@ async fn run_redirect_selected_untracked(
         })
     });
     let redirects = !candidates.is_empty() && may_write;
-    // A run that writes no redirect can still have one write to make: the
+    // A run that writes no redirect can still have a write to make. The
     // Maven rewriter respells a `.mvn/maven.config` line an earlier release
     // wrote, whatever the run redirects (`engine::read_maven_heal_files`).
-    // That write needs the lock like any other, but is never a reason to
+    // And a pnpm project an earlier run routed through the patch server's
+    // named registries is tidied even when this run selects no patch: what
+    // is left of the route that no lock references any more goes (a package
+    // that left the lock), which takes the locks read.
+    // Either write needs the lock like any other, but is never a reason to
     // fail a run that has nothing else to do: when the lock cannot be had
-    // (another run holds it, the checkout cannot be written) the line
-    // waits for the next scan.
+    // (another run holds it, the checkout cannot be written) it waits for
+    // the next scan.
     let heal_pending = !redirects && engine::read_maven_heal_files(&view).await.is_some();
+    let route_present = engine::pnpm_route_present(&common.cwd).await;
+    let route_cleanup = candidates.is_empty() && route_present;
     let mut lock: Option<LockGuard> = if common.dry_run {
         None
     } else if redirects {
@@ -1621,7 +1651,7 @@ async fn run_redirect_selected_untracked(
             Ok(guard) => Some(guard),
             Err(code) => return code,
         }
-    } else if heal_pending {
+    } else if heal_pending || route_cleanup {
         crate::commands::lock_cli::acquire_with_status(
             &common.socket_dir(),
             Duration::from_secs(common.lock_timeout.unwrap_or(0)),
@@ -1631,7 +1661,8 @@ async fn run_redirect_selected_untracked(
     } else {
         None
     };
-    // Whether this run may write that respelling, or preview it.
+    // Whether this run may write that respelling or that tidying, or
+    // preview it.
     let may_heal = common.dry_run || lock.is_some();
 
     // Re-read project patch declarations under the write lock. A patch added
@@ -1719,15 +1750,27 @@ async fn run_redirect_selected_untracked(
 
     // Read the project's candidate files (through the overlay). Skipped
     // when no candidate survived (the rewriters redirect nothing without a
-    // dep), but for the files of a `.mvn/maven.config` to heal, read again
-    // now that the lock is held; everything after the rewrite still runs.
-    let read = if !candidates.is_empty() {
-        crate::ui::busy(
+    // dep), but for what a run with nothing to redirect still tidies: a
+    // pnpm registry route (the candidate files, read whole), or the files
+    // of a `.mvn/maven.config` to heal, read again now that the lock is
+    // held; everything after the rewrite still runs.
+    let read = if !candidates.is_empty() || (route_cleanup && may_heal) {
+        let mut read = crate::ui::busy(
             common,
             "Reading lockfiles",
             engine::read_candidate_files(&view, &std::collections::BTreeSet::new(), &candidates),
         )
-        .await
+        .await;
+        // The candidate read of a run with no candidate may leave out a
+        // file the Maven heal goes by.
+        if candidates.is_empty() && heal_pending {
+            if let Some(heal) = engine::read_maven_heal_files(&view).await {
+                for (rel, text) in heal.files {
+                    read.files.entry(rel).or_insert(text);
+                }
+            }
+        }
+        read
     } else if heal_pending && may_heal {
         engine::read_maven_heal_files(&view)
             .await
@@ -2235,6 +2278,17 @@ async fn run_redirect_selected_untracked(
         ));
         return 1;
     }
+    // A pnpm-workspace.yaml a hosted run created, which this run emptied of
+    // its registry route: deleted, not left as a bare `packages` list. The
+    // rewrite carries writes only, so the file goes once they have landed.
+    let workspace_warning = if !common.dry_run && done.pnpm_workspace_emptied {
+        remove_emptied_workspace(&common.cwd, rewrite)
+            .await
+            .err()
+            .map(|why| RunWarning::new(crate::commands::registry_gc::REGISTRY_CLEANUP_FAILED, why))
+    } else {
+        None
+    };
 
     // The agent-mode manifest's records: local proof that an installed copy
     // was patched in place, for the stale-install probes below.
@@ -2419,14 +2473,19 @@ async fn run_redirect_selected_untracked(
         ));
     }
 
-    // `--prune` is a no-op in hosted mode (both hosted terminals return
-    // before the GC blocks): make that explicit in the JSON `warnings[]`
-    // rather than silently dropping the flag. The human path warns once up
-    // front in `run`.
+    // `--prune` sweeps no `.socket/` state in hosted mode (both hosted
+    // terminals return before the GC blocks): make that explicit in the
+    // JSON `warnings[]` rather than silently dropping the flag. The human
+    // path warns once up front in `run`.
     let mut prune_warnings: Vec<RunWarning> = Vec::new();
     if prune_requested {
         prune_warnings.push(prune_ignored_warning());
     }
+    // What the rewrite took out of a pnpm registry route because no
+    // lockfile uses it any more: every hosted run reconciles the route,
+    // `--prune` or not, and says what went.
+    let registry_removed =
+        socket_patch_core::hosted::guidance::pnpm_registry_entries_removed(&rewrite.edits);
 
     // Emit an OpenVEX attestation when `--vex` was requested. The redirected
     // bytes are fetched from the hosted patch server at install time, so the
@@ -2571,6 +2630,7 @@ async fn run_redirect_selected_untracked(
     warnings.extend(takeover_pre_warnings.iter().map(run_warning_of));
     warnings.extend(takeover_warnings.iter().cloned());
     warnings.extend(prune_warnings.iter().cloned());
+    warnings.extend(workspace_warning);
 
     // Granted, but nothing in the project pins it (no lock entry,
     // unreadable lock, ...): reported per purl (`redirect.patches[]`
@@ -2606,6 +2666,12 @@ async fn run_redirect_selected_untracked(
         // engine's warnings hoisted to the top-level `warnings`.
         let mut env = scan_result.take().unwrap_or_else(|| scan_envelope(common));
         record_hosted_events(&mut env, &confirmed, &unconfirmed, &skipped, common.dry_run);
+        record_registry_cleanup(
+            &mut env,
+            &registry_removed,
+            prune_requested && route_present,
+            common.dry_run,
+        );
         env.set_extra("redirect", redirect_block(done.rewritten.clone()));
         env.warnings.extend(warnings);
         env.warnings.extend(ignored);
@@ -2708,6 +2774,10 @@ async fn run_redirect_selected_untracked(
             for line in format_gem_manifest_edits(&rewrite.edits, common.dry_run) {
                 println!("{line}");
             }
+            // And what it took out of a pnpm registry route nothing uses.
+            for line in crate::commands::registry_gc::lines(&registry_removed, common.dry_run) {
+                println!("{line}");
+            }
             // And what that costs: Bundler can no longer update those gems.
             if let Some(note) = format_gem_hold_note(
                 &rewrite.edits,
@@ -2769,11 +2839,17 @@ async fn run_redirect_selected_untracked(
                     eprintln!("{}", npm_allow_remote_one_line(detail));
                     continue;
                 } else if *code == "redirect_pnpm_trust_lockfile" && done.pnpm_rerun_only {
-                    pnpm_trust_rerun_reminder()
+                    // The reminder, and what the route may still reach: that
+                    // is the project's state, not this run's news.
+                    let reminder = pnpm_trust_rerun_reminder(done.pnpm_named_registries);
+                    match &done.pnpm_route_note {
+                        Some(note) => std::borrow::Cow::Owned(format!("{reminder}. {note}")),
+                        None => std::borrow::Cow::Borrowed(reminder),
+                    }
                 } else {
-                    detail.as_ref()
+                    std::borrow::Cow::Borrowed(detail.as_ref())
                 };
-                eprintln!("{}", format_warning(code, detail, width));
+                eprintln!("{}", format_warning(code, &detail, width));
             }
             if let Some(summary) = &gem_refreshed.summary {
                 eprintln!(
@@ -2842,6 +2918,42 @@ async fn run_redirect_selected_untracked(
         }
     }
     vex_code
+}
+
+/// Delete the pnpm-workspace.yaml `rewrite` just wrote as what is left of a
+/// file a hosted run created (see `Rewritten::pnpm_workspace_emptied`): its
+/// `packages` list and nothing else. Only a regular file that still holds
+/// exactly those bytes is deleted. `Err` is why the file stays.
+async fn remove_emptied_workspace(
+    root: &std::path::Path,
+    rewrite: &socket_patch_core::patch::redirect::RewriteResult,
+) -> Result<(), String> {
+    use socket_patch_core::hosted::guidance::PNPM_WORKSPACE_REL;
+
+    let Some(written) = rewrite.files.get(PNPM_WORKSPACE_REL) else {
+        return Ok(());
+    };
+    let path = root.join(PNPM_WORKSPACE_REL);
+    let left = |why: String| {
+        format!(
+            "{PNPM_WORKSPACE_REL} holds only the `packages` list a hosted run created it \
+             with and was not deleted ({why}); delete it"
+        )
+    };
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Err(left("it is not a regular file".to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(left(e.to_string())),
+    }
+    match tokio::fs::read(&path).await {
+        Ok(bytes) if bytes == written.as_bytes() => tokio::fs::remove_file(&path)
+            .await
+            .map_err(|e| left(e.to_string())),
+        // Changed since the write: no longer the file this run left.
+        Ok(_) => Ok(()),
+        Err(e) => Err(left(e.to_string())),
+    }
 }
 
 /// Write the hosted pins and commit `group` (see `run_redirect_selected`):
@@ -3106,14 +3218,22 @@ fn render_warning(headline: &str, bullets: &[String], width: Option<usize>) -> S
     lines.join("\n")
 }
 
-/// The one-line re-run reminder that replaces the full pnpm trustLockfile
-/// guidance in human mode when this run changed nothing pnpm-related (the
-/// lock was redirected and trust configured by an earlier run, whose
+/// The one-line re-run reminder that replaces the full pnpm guidance in
+/// human mode when this run changed nothing pnpm-related (the lock was
+/// redirected and pnpm-workspace.yaml configured by an earlier run, whose
 /// output carried the full text; `--json` still carries it every time).
-fn pnpm_trust_rerun_reminder() -> &'static str {
-    "pnpm-lock.yaml already uses hosted patches and pnpm-workspace.yaml already sets \
-     `trustLockfile: true`; keep both committed, and never rebuild the lockfile \
-     (`pnpm clean --lockfile`), which discards the hosted patches"
+/// `named_registries`: the file routes each pin through the patch
+/// server's named registry, rather than setting `trustLockfile: true`.
+fn pnpm_trust_rerun_reminder(named_registries: bool) -> &'static str {
+    if named_registries {
+        "pnpm-lock.yaml already uses hosted patches and pnpm-workspace.yaml already \
+         routes them through a named registry; keep both committed, and never rebuild \
+         the lockfile (`pnpm clean --lockfile`), which discards the hosted patches"
+    } else {
+        "pnpm-lock.yaml already uses hosted patches and pnpm-workspace.yaml already sets \
+         `trustLockfile: true`; keep both committed, and never rebuild the lockfile \
+         (`pnpm clean --lockfile`), which discards the hosted patches"
+    }
 }
 
 /// The stdout summary line.
@@ -4078,6 +4198,7 @@ mod tests {
             token: "tok".to_string(),
             patch_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
             artifact_url: artifact_url.to_string(),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Default::default(),
         }
@@ -5813,10 +5934,15 @@ mod tests {
 
     #[test]
     fn pnpm_rerun_reminder_keeps_the_rebuild_caution() {
-        let r = pnpm_trust_rerun_reminder();
-        assert!(r.contains("trustLockfile: true"), "{r}");
-        assert!(r.contains("pnpm clean --lockfile"), "{r}");
-        assert!(r.chars().count() < 240, "a reminder, not the wall: {r}");
+        for (named_registries, setting) in
+            [(false, "trustLockfile: true"), (true, "named registry")]
+        {
+            let r = pnpm_trust_rerun_reminder(named_registries);
+            assert!(r.contains(setting), "{r}");
+            assert!(r.contains("pnpm clean --lockfile"), "{r}");
+            assert!(r.chars().count() < 240, "a reminder, not the wall: {r}");
+        }
+        assert!(!pnpm_trust_rerun_reminder(true).contains("trustLockfile"));
     }
 
     #[test]

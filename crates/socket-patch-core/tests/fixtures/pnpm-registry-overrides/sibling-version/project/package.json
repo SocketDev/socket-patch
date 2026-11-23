@@ -1,0 +1,9 @@
+{
+  "name": "app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "mid": "1.0.0",
+    "uses-two": "1.0.0"
+  }
+}

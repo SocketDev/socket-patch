@@ -28,11 +28,17 @@ pub(crate) mod grammar;
 pub(crate) mod hosted;
 pub(crate) mod lines;
 pub(crate) mod modules_yaml;
+pub(crate) mod named_registries;
 pub(crate) mod plan;
+pub(crate) mod registry_alias;
 mod version;
 pub(crate) mod workspace;
 
-pub use version::{matches_file_id_build_keys, root_only_workspace_breaks_add};
+pub(crate) use version::range_admits;
+pub use version::{
+    matches_file_id_build_keys, registry_route_pins, root_only_workspace_breaks_add,
+    RegistryRoutePins, REGISTRY_ROUTE_FLOOR,
+};
 
 pub use grammar::PnpmDocument;
 pub(crate) use grammar::{
@@ -227,9 +233,10 @@ pub(crate) fn pnpm_key_has_own_patch(key: &str) -> bool {
 }
 
 /// `(name, version)` of a REGISTRY-form pnpm packages key, in every lock
-/// generation's grammar — v9 `name@version`, v6 (pnpm 8) the same behind a
-/// leading `/`, v5.4 (pnpm 7) and shrinkwrap `/name/version`; names may be
-/// scoped in all of them. Peer suffixes are stripped: v6/v9 append
+/// generation's grammar — v9 `name@version` (or `name@<alias>:version` for
+/// a release routed through one of hosted mode's named registries), v6
+/// (pnpm 8) the same behind a leading `/`, v5.4 (pnpm 7) and shrinkwrap
+/// `/name/version`; names may be scoped in all of them. Peer suffixes are stripped: v6/v9 append
 /// `(peer@1.2.3)…` after the version, v5 appends `_peer@x` / `_<hash>` to
 /// the version itself. `None` for anything that is not a plain registry
 /// version (digit-first): `file:` / `link:` / url / git keys and v5
@@ -242,6 +249,9 @@ pub(crate) fn pnpm_registry_key(key: &str) -> Option<(&str, &str)> {
         None => (base, false),
     };
     let (name, version) = split_pnpm_key(base, legacy)?;
+    // A release hosted mode routes through the patch server's named
+    // registry is keyed `name@socket:version` ([`registry_alias`]).
+    let version = named_registries::strip_alias(version);
     let version = version.split('_').next().unwrap_or(version);
     version
         .chars()
@@ -674,6 +684,41 @@ pub(crate) fn vendored_npm_uuids(text: &str) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key is read through a named registry only when the registry has
+    /// the name hosted mode gives one today, `socket-` and 8 to 32 hex
+    /// digits: such a name is taken for hosted mode's on sight. Any other
+    /// registry is the project's own, the names an unreleased build used
+    /// included (`socket`, `socket-patch`, a number after either, the
+    /// whole patch UUID): a release from it is not the npm release of the
+    /// same name and version, and no reader takes it for one.
+    #[test]
+    fn a_key_is_read_through_a_registry_only_under_hosted_modes_own_name() {
+        for key in [
+            "leaf@socket-58f14d5a:1.0.0",
+            "leaf@socket-58f14d5a9122:1.0.0(host@1.0.0)",
+            "leaf@socket-58f14d5a9122413a962ff9338960eedf:1.0.0",
+        ] {
+            assert_eq!(pnpm_registry_key(key), Some(("leaf", "1.0.0")), "{key}");
+            assert!(
+                grammar::hosted_suffix(key, "leaf", "1.0.0").is_some(),
+                "{key}"
+            );
+        }
+        for key in [
+            "leaf@socket:1.0.0",
+            "leaf@socket-2:1.0.0",
+            "leaf@socket-patch:1.0.0",
+            "leaf@socket-patch-12:1.0.0",
+            "leaf@socket-patch-58f14d5a-9122-413a-962f-f9338960eedf:1.0.0",
+            "leaf@corp:1.0.0",
+            "leaf@socket-58f14d5:1.0.0",
+            "leaf@socket-58F14D5A:1.0.0",
+        ] {
+            assert_eq!(pnpm_registry_key(key), None, "{key}");
+            assert_eq!(grammar::hosted_suffix(key, "leaf", "1.0.0"), None, "{key}");
+        }
+    }
 
     /// pnpm 11's env lockfile document for config dependency
     /// `cfg-dep@2.0.0`, up to its packages entry's key line.

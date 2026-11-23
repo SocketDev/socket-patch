@@ -1,0 +1,35 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+overrides:
+  '@scope/direct@1.0.0': socket-aaaaaaaa2222:1.0.0
+  leaf@1.0.0: socket-aaaaaaaa1111:1.0.0
+
+importers:
+
+  .:
+    dependencies:
+      '@scope/direct':
+        specifier: socket-aaaaaaaa2222:1.0.0
+        version: socket-aaaaaaaa2222:1.0.0
+
+packages:
+
+  '@scope/direct@socket-aaaaaaaa2222:1.0.0':
+    resolution: {integrity: sha512-zpSu1965GYxgc1++jQeL7Uwt3CjCNedIfugMF5tb5f/UYJE6JSNDo/Qo3W7Sqjpu8bCX+zaZJuQ29VxpPm630w==, tarball: https://patch.test/patch/npm/@scope/direct/1.0.0/22222222-2222-4222-8222-222222222222/aaaaaaaa-2222-4222-8222-222222222222/direct-1.0.0.tgz}
+    hasBin: true
+
+  leaf@socket-aaaaaaaa1111:1.0.0:
+    resolution: {integrity: sha512-5NKOKLzUvevt2gvNVak8PX6XkpbPRlfkrMG5Fd3lKSkoVzQhmVzvm7o41H97u/Q09wv78/tNy1ZaU56xnZm8Sg==, tarball: https://patch.test/patch/npm/leaf/1.0.0/22222222-2222-4222-8222-222222222222/aaaaaaaa-1111-4111-8111-111111111111/leaf-1.0.0.tgz}
+    engines: {node: '>=8'}
+
+snapshots:
+
+  '@scope/direct@socket-aaaaaaaa2222:1.0.0':
+    dependencies:
+      leaf: socket-aaaaaaaa1111:1.0.0
+
+  leaf@socket-aaaaaaaa1111:1.0.0: {}

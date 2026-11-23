@@ -301,6 +301,16 @@ pub struct PackageVendorResult {
     /// `DepOverride`.
     #[serde(default)]
     pub registry_override: Option<RegistryOverride>,
+    /// npm only: the registry address the patch service answers this
+    /// patch's version document under. It is the directory the patch's
+    /// tarball (`url`) is served from, which ends in the patch UUID:
+    /// `<origin>/patch/npm/<name>/<version>/<token>/<patch uuid>/`.
+    /// Hosted-mode `scan` declares it as the pnpm named registry of this
+    /// one patch. Absent from a patch service that does not serve it, null
+    /// for every other ecosystem and for a patch that has no document; any
+    /// other shape reads as no address.
+    #[serde(default)]
+    pub npm_registry_url: Option<String>,
 }
 
 /// One served artifact: the native tarball (`kind: "tarball"`), or a

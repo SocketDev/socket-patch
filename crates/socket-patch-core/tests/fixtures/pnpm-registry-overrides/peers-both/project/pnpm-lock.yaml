@@ -1,0 +1,55 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      host:
+        specifier: 1.0.0
+        version: 1.0.0
+      peer-of-peer:
+        specifier: 1.0.0
+        version: 1.0.0(host@1.0.0)(peer-user@1.0.0(host@1.0.0))
+      peer-user:
+        specifier: 1.0.0
+        version: 1.0.0(host@1.0.0)
+
+packages:
+
+  host@1.0.0:
+    resolution: {integrity: sha512-+JyhDCb2D1u3QyQFoDWHQDaRLNC3WqMDR7yAy7uz3jR3kN8x62ig4ZEAD8So05cK97wiF83NN1vv8Z95FeVpTw==}
+
+  leaf@1.0.0:
+    resolution: {integrity: sha512-iuZ2dEUwKbJuRnXq78FAd95+hAtb2Y+tujnKMgcQFHj+5DKBz46Mo578ZeRnXrP8kRoNqCyWTAjJFw5m88RRFg==}
+    engines: {node: '>=8'}
+
+  peer-of-peer@1.0.0:
+    resolution: {integrity: sha512-oO5h5DR6dXHZj1oMK0OmqieFwDe9dh6yMXylKpw4OVIuYTFLLA4NTI5F9WocFuTPbmXQhrXMqnGSCH/G+9H6oA==}
+    peerDependencies:
+      host: ^1.0.0
+      peer-user: ^1.0.0
+
+  peer-user@1.0.0:
+    resolution: {integrity: sha512-TSaQIYjZjutMpzB7Cw+m9dQ+ZBMKurrAmen4gSRHH2R2o7AwGFRHfhpO7uxXM5Uk2gJ1AUwo2+mIcZ2xHcc9hw==}
+    peerDependencies:
+      host: ^1.0.0
+
+snapshots:
+
+  host@1.0.0: {}
+
+  leaf@1.0.0: {}
+
+  peer-of-peer@1.0.0(host@1.0.0)(peer-user@1.0.0(host@1.0.0)):
+    dependencies:
+      host: 1.0.0
+      peer-user: 1.0.0(host@1.0.0)
+
+  peer-user@1.0.0(host@1.0.0):
+    dependencies:
+      host: 1.0.0
+      leaf: 1.0.0

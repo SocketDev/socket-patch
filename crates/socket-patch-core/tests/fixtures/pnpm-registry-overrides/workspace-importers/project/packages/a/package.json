@@ -1,0 +1,9 @@
+{
+  "name": "a",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "leaf": "1.0.0",
+    "mid": "1.0.0"
+  }
+}

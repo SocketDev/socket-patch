@@ -397,6 +397,7 @@ fn day2_machine_builds_patched_module_from_committed_files_alone() {
         token: String::new(),
         patch_uuid: UUID.into(),
         artifact_url: format!("{proxy_url}/{smod}/@v/{SVER}.zip"),
+        npm_registry_url: None,
         registry_override: Some(RegistryOverride {
             kind: "goproxy".into(),
             index_url: proxy_url.clone(),
@@ -931,6 +932,7 @@ async fn tidy_pruned_zip_line_pins_and_a_rerun_restores_it() {
         token: String::new(),
         patch_uuid: UUID.into(),
         artifact_url: format!("{proxy_url}/{smod}/@v/{SVER}.zip"),
+        npm_registry_url: None,
         registry_override: Some(RegistryOverride {
             kind: "goproxy".into(),
             index_url: proxy_url.clone(),

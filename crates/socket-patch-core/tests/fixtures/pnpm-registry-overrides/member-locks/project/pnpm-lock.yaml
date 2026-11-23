@@ -1,0 +1,23 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    devDependencies:
+      leaf:
+        specifier: ^1.0.0
+        version: 1.0.0
+
+packages:
+
+  leaf@1.0.0:
+    resolution: {integrity: sha512-iuZ2dEUwKbJuRnXq78FAd95+hAtb2Y+tujnKMgcQFHj+5DKBz46Mo578ZeRnXrP8kRoNqCyWTAjJFw5m88RRFg==}
+    engines: {node: '>=8'}
+
+snapshots:
+
+  leaf@1.0.0: {}

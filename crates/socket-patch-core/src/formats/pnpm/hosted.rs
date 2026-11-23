@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::patch::redirect::{full_name, DepOverride, FileEdit, RewriteResult, RewriteWarning};
 
 use super::grammar as pnpm;
-use super::plan::{hosted_refuses_lock, match_key, planned_locks, KeyMatch, Target};
+use super::plan::{hosted_refuses_lock, match_hosted_key, planned_locks, KeyMatch, Target};
 
 /// Whether `entry` resolves to exactly `artifact_url` — the per-instance
 /// residual-gate predicate.
@@ -97,7 +97,8 @@ impl<'f> PnpmLockState<'f> {
     }
 
     /// Entries whose key names `fname@version` (any suffix), in file order —
-    /// the same set a full [`match_key`] scan of the logical lock yields.
+    /// the same set a full [`match_hosted_key`] scan of the logical lock
+    /// yields.
     fn hits(&mut self, fname: &str, version: &str) -> Vec<usize> {
         let hits = self.lookup(fname, version, false);
         if hits.iter().any(|i| self.spliced.contains(i)) {
@@ -107,12 +108,17 @@ impl<'f> PnpmLockState<'f> {
         hits
     }
 
-    /// The entries [`match_key`] matches as a registry instance or, with
-    /// `rekeyed`, as a vendored rekey, found by their key prefixes.
+    /// The entries [`match_hosted_key`] matches as a registry instance or,
+    /// with `rekeyed`, as a vendored rekey, found by their key prefixes.
     fn lookup(&self, fname: &str, version: &str, rekeyed: bool) -> Vec<usize> {
         let prefixes = match rekeyed {
-            false => [format!("{fname}@{version}"), format!("{fname}/{version}")],
-            true => [format!("{fname}@file:"), "file:".to_string()],
+            false => vec![
+                format!("{fname}@{version}"),
+                format!("{fname}/{version}"),
+                // Routed through the patch server's named registry.
+                format!("{fname}@{}", super::named_registries::ALIAS_PREFIX),
+            ],
+            true => vec![format!("{fname}@file:"), "file:".to_string()],
         };
         let mut out = Vec::new();
         for prefix in &prefixes {
@@ -125,7 +131,7 @@ impl<'f> PnpmLockState<'f> {
         out.sort_unstable();
         out.dedup();
         out.retain(|&i| {
-            match_key(self.entry(i).key, fname, version)
+            match_hosted_key(self.entry(i).key, fname, version)
                 .is_some_and(|m| (m == KeyMatch::Rekeyed) == rekeyed)
         });
         out
@@ -249,7 +255,7 @@ pub(crate) fn plan_hosted(
             let mut leftover: Vec<String> = Vec::new();
             for &i in hits {
                 let entry = lock.entry(i);
-                let suffix = pnpm::suffix(entry.key, &fname, &dep.version)
+                let suffix = pnpm::hosted_suffix(entry.key, &fname, &dep.version)
                     .expect("hits only holds entries naming this dep");
                 let resolution = if Target::Hosted.repoints(suffix) {
                     pnpm::resolution(&entry)
@@ -390,7 +396,7 @@ pub(crate) fn pnpm_unrewritten_instances(
     pnpm::entries(content)
         .into_iter()
         .filter_map(|entry| {
-            pnpm::suffix(entry.key, fname, version)?;
+            pnpm::hosted_suffix(entry.key, fname, version)?;
             (!pnpm_resolves_to(&entry, artifact_url)).then(|| entry.key.to_string())
         })
         .collect()

@@ -427,6 +427,7 @@ fn repair_offline_removes_orphan_blob() {
             "removedDiffArchives": 0,
             "removedPackageArchives": 0,
             "bytesFreed": freed,
+            "removedRegistryEntries": 0,
         }),
         "{v:#}"
     );

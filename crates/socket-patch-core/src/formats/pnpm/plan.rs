@@ -179,6 +179,19 @@ pub(crate) fn match_key<'k>(key: &'k str, name: &str, version: &str) -> Option<K
         .map(|_| KeyMatch::Rekeyed)
 }
 
+/// [`match_key`] as the hosted edit reads a key ([`grammar::hosted_suffix`]):
+/// a release already routed through the patch server's named registry is
+/// the registry entry too. The vendored rekey never takes such an entry.
+pub(crate) fn match_hosted_key<'k>(
+    key: &'k str,
+    name: &str,
+    version: &str,
+) -> Option<KeyMatch<'k>> {
+    match_key(key, name, version).or_else(|| {
+        grammar::hosted_suffix(key, name, version).map(|suffix| KeyMatch::Registry { suffix })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{sniff_lock_grammar, PnpmLockGrammar};
@@ -207,6 +220,55 @@ mod tests {
             })
         );
         assert_eq!(match_key("left-pad@1.3.01", "left-pad", "1.3.0"), None);
+        // A release routed through the named registry of its patch (at
+        // any length of its name): the hosted edit's entry, never the
+        // vendored rekey's.
+        for alias in [
+            "socket-0b8d2c3e",
+            "socket-0b8d2c3e4f5a",
+            "socket-0b8d2c3e4f5a4b6c8d7e9f0a1b2c3d4e",
+        ] {
+            for (key, suffix) in [
+                (format!("left-pad@{alias}:1.3.0"), ""),
+                (
+                    format!("'left-pad@{alias}:1.3.0(react@18.2.0)'"),
+                    "(react@18.2.0)",
+                ),
+            ] {
+                assert_eq!(match_key(&key, "left-pad", "1.3.0"), None, "{key}");
+                assert_eq!(
+                    match_hosted_key(&key, "left-pad", "1.3.0"),
+                    Some(KeyMatch::Registry { suffix }),
+                    "{key}"
+                );
+            }
+        }
+        // Any other registry is the project's own, the names an unreleased
+        // build used included: its release is not the npm one.
+        for key in [
+            "left-pad@socket:1.3.0",
+            "left-pad@socket-2:1.3.0",
+            "left-pad@socket-patch:1.3.0",
+            "left-pad@socket-patch-12:1.3.0",
+            "left-pad@socket-patch-0b8d2c3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e:1.3.0",
+            "'left-pad@socket:1.3.0(react@18.2.0)'",
+            "left-pad@socket-0b8d2c3e:1.3.01",
+            "left-pad@socket-0b8d2c3e:1.3.1",
+            "left-pad@corp:1.3.0",
+            "left-pad@socket-1:1.3.0",
+            "left-pad@socket-02:1.3.0",
+            "left-pad@socket-0b8d2c3:1.3.0",
+            "left-pad@socket-0B8D2C3E:1.3.0",
+            "left-pad@socket-0b8d2c3e4f5a4b6c8d7e9f0a1b2c3d4e0:1.3.0",
+            "left-pad@sockets:1.3.0",
+            "is-odd@socket-0b8d2c3e:1.3.0",
+        ] {
+            assert_eq!(match_hosted_key(key, "left-pad", "1.3.0"), None, "{key}");
+        }
+        assert_eq!(
+            match_hosted_key("left-pad@1.3.0", "left-pad", "1.3.0"),
+            Some(KeyMatch::Registry { suffix: "" })
+        );
         assert_eq!(
             match_key(&format!("left-pad@file:{ART}"), "left-pad", "1.3.0"),
             Some(KeyMatch::Rekeyed)
