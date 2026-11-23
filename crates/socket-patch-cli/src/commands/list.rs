@@ -1088,7 +1088,7 @@ async fn list_project(args: &ListArgs, browsing: bool) -> Listed {
                  more; `socket-patch remove {}` removes that entry alone",
                 pin.files.join(", "),
                 pin.purl,
-                pin.purl
+                crate::ui::shell_word(&pin.purl)
             )
         } else {
             format!(
@@ -1097,7 +1097,7 @@ async fn list_project(args: &ListArgs, browsing: bool) -> Listed {
                 uv_metadata.join(", "),
                 pin.purl,
                 pin.files.join(", "),
-                pin.purl
+                crate::ui::shell_word(&pin.purl)
             )
         };
         if args.common.json {

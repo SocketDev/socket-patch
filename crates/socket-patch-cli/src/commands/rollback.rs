@@ -351,18 +351,24 @@ async fn patched_in_other_scope(
 
 /// `rollback`'s pointer at the scope that still holds a patched copy: a
 /// rollback of just that purl, naming `--cwd` when the run used one (the record lives in that
-/// project's manifest).
+/// project's manifest). The purl and the directory are quoted where a
+/// shell would otherwise glob or split them (a record's purl can carry
+/// `?platform=ruby`).
 fn patched_in_other_scope_warning(purl: &str, path: &Path, common: &GlobalArgs) -> String {
+    let word = crate::ui::shell_word(purl);
     let (scope, mut command) = if common.is_global() {
-        ("the project", format!("socket-patch rollback {purl}"))
+        ("the project", format!("socket-patch rollback {word}"))
     } else {
         (
             "the global install",
-            format!("socket-patch rollback {purl} -g"),
+            format!("socket-patch rollback {word} -g"),
         )
     };
     if common.cwd != Path::new(".") {
-        command.push_str(&format!(" --cwd {}", common.cwd.display()));
+        command.push_str(&format!(
+            " --cwd {}",
+            crate::ui::shell_word(&common.cwd.to_string_lossy())
+        ));
     }
     format!(
         "{purl}: its copy in {scope} ({}) is still patched or could not be \
@@ -4514,11 +4520,17 @@ mod tests {
         let local = crate::args::GlobalArgs::default();
         let warning = patched_in_other_scope_warning(purl, path, &local);
         assert!(
-            warning.contains(&format!("run `socket-patch rollback {} -g` to", quoted(purl))),
+            warning.contains(&format!(
+                "run `socket-patch rollback {} -g` to",
+                quoted(purl)
+            )),
             "{warning}"
         );
         // The message's own naming of the package stays the plain purl.
-        assert!(warning.starts_with(&format!("{purl}: its copy in")), "{warning}");
+        assert!(
+            warning.starts_with(&format!("{purl}: its copy in")),
+            "{warning}"
+        );
 
         let global = crate::args::GlobalArgs {
             global: true,

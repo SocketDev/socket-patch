@@ -141,7 +141,10 @@ fn mirror_pins_not_moved(
                      `socket-patch rollback {}` and then this command again",
                     c.purl,
                     mirror_sources.base(),
-                    c.purl
+                    // As `rollback` selects a hosted pin: no qualifiers.
+                    crate::ui::shell_word(socket_patch_core::utils::purl::strip_purl_qualifiers(
+                        &c.purl
+                    ))
                 ),
             ))
         })
@@ -3277,23 +3280,32 @@ fn format_gem_hold_note(
     if dry_run {
         return Some(note);
     }
-    // The one gem's own purl, when exactly one confirmed pin carries its
-    // name; else the shape of one, for the user to fill in.
+    // The one gem's own pin, when the confirmed pins of its name are one
+    // release; else the shape of one, for the user to fill in. A pin is
+    // named as `rollback` selects it, without the record's qualifiers
+    // (`?platform=ruby` on every gem record): with them the command
+    // matches no hosted pin, and under bash's `nullglob` the unquoted `?`
+    // drops the argument, leaving the bare `rollback` this note must not
+    // give.
     let purl = one.and_then(|name| {
         let prefix = format!("pkg:gem/{name}@");
-        let mut pins = confirmed
+        let mut pins: Vec<&str> = confirmed
             .iter()
-            .map(|(purl, _)| purl.as_str())
-            .filter(|purl| purl.starts_with(&prefix));
-        match (pins.next(), pins.next()) {
-            (Some(purl), None) => Some(purl),
+            .map(|(purl, _)| socket_patch_core::utils::purl::strip_purl_qualifiers(purl))
+            .filter(|purl| purl.starts_with(&prefix))
+            .collect();
+        pins.sort_unstable();
+        pins.dedup();
+        match pins.as_slice() {
+            [purl] => Some(crate::ui::shell_word(purl)),
             _ => None,
         }
     });
+    let placeholder = || "pkg:gem/<gem>@<version>".to_string();
     let (move_one, target, update_arg) = match (one, purl) {
         (Some(name), Some(purl)) => ("it", purl, name),
-        (Some(name), None) => ("it", "pkg:gem/<gem>@<version>", name),
-        (None, _) => ("one", "pkg:gem/<gem>@<version>", "<gem>"),
+        (Some(name), None) => ("it", placeholder(), name),
+        (None, _) => ("one", placeholder(), "<gem>"),
     };
     let again = if command == "scan" {
         "then `socket-patch scan` again"
