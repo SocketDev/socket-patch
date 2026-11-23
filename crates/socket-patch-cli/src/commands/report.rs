@@ -366,18 +366,26 @@ pub async fn run(args: ReportArgs) -> i32 {
     apply_env_toggles(&args.common);
     let common = &args.common;
     let project = held_patches(common).await;
-    let named = match select(&args.targets, &project.held) {
-        Ok(named) => named,
-        // The store that could not be read may hold the patch the name
-        // meant: its error is the cause, not "no such patch".
-        Err(("patch_not_found", _)) if project.unreadable.is_some() => {
-            let (code, why) = project.unreadable.unwrap_or_default();
+    // The store that could not be read may hold the patch a name meant,
+    // or the copy the build consumes in place of one the readable stores
+    // still hold: its error is the cause, and a name is not resolved
+    // against what is left (that could report the wrong patch). A UUID
+    // names its patch without any store.
+    if let Some((code, why)) = &project.unreadable {
+        let by_name = args
+            .targets
+            .iter()
+            .any(|token| Target::parse(token).kind() != TargetKind::Uuid);
+        if by_name {
             return fail(
                 common,
-                &code,
+                code,
                 &format!("{why}. To report a patch anyway, name it by its UUID"),
             );
         }
+    }
+    let named = match select(&args.targets, &project.held) {
+        Ok(named) => named,
         Err((code, message)) => return fail(common, code, &message),
     };
     let patches: Vec<PatchOutcome> = named.iter().map(Named::outcome).collect();

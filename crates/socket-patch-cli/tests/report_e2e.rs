@@ -337,6 +337,32 @@ async fn an_unreadable_manifest_is_named_and_a_uuid_still_reports() {
     assert_eq!(bodies(&server).await.len(), 1);
 }
 
+/// A vendor ledger that cannot be read may hold the vendored copy the
+/// build consumes: a name is refused with the ledger's error rather than
+/// resolved to the manifest's record of the same package, which could be
+/// a patch the vendored artifact has replaced.
+#[tokio::test]
+async fn an_unreadable_vendor_ledger_refuses_a_name_the_manifest_still_holds() {
+    let server = endpoint(201).await;
+    let tmp = project_with_lodash();
+    std::fs::create_dir_all(tmp.path().join(".socket/vendor")).unwrap();
+    std::fs::write(tmp.path().join(".socket/vendor/state.json"), "{ not json").unwrap();
+
+    let out = report(tmp.path(), &server, &["lodash", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let doc = stdout_json(&out);
+    assert_eq!(doc["error"]["code"], "vendor_state_unreadable");
+    assert!(
+        doc["error"]["message"].as_str().unwrap().contains("UUID"),
+        "{doc}"
+    );
+    assert!(bodies(&server).await.is_empty());
+
+    let out = report(tmp.path(), &server, &[UUID]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(bodies(&server).await.len(), 1);
+}
+
 /// One report names at most 50 patches. More is refused, even on a dry
 /// run, rather than sent with some left out.
 #[tokio::test]
