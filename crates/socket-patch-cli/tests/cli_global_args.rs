@@ -53,7 +53,7 @@ const SUBCOMMANDS_NO_POSITIONAL: &[&str] = &[
 ];
 
 /// Subcommands that require a positional identifier.
-const SUBCOMMANDS_WITH_IDENTIFIER: &[&str] = &["get", "remove", "show"];
+const SUBCOMMANDS_WITH_IDENTIFIER: &[&str] = &["get", "remove", "report", "show"];
 
 const DUMMY_IDENTIFIER: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
 
@@ -164,6 +164,7 @@ fn common_of(cli: &Cli) -> &GlobalArgs {
     match &cli.command {
         Apply(a) => &a.common,
         Rollback(a) => &a.common,
+        Report(a) => &a.common,
         Get(a) => &a.common,
         Show(a) => &a.common,
         Scan(a) => &a.common,

@@ -1235,4 +1235,68 @@ mod interactive {
             "a declined rollback must leave the manifest byte-identical"
         );
     }
+
+    /// Someone at a terminal who names the patch to take off is given the
+    /// command that reports it, by UUID: the project no longer holds the
+    /// patch, so nothing else names it. A piped run, a dry run and a bare
+    /// rollback say nothing of the kind.
+    #[test]
+    fn a_targeted_rollback_at_a_terminal_ends_with_the_report_command() {
+        const HINT: &str = "Did this patch break something? Tell Socket: socket-patch report \
+                            aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa --message \"what happened\"";
+        // A terminal wraps the line at its 80 columns.
+        let unwrapped = |output: &str| output.replace("\r\n", "").replace('\n', "");
+
+        let fx = patched_fixture();
+        let (code, output) = pty_io::run(
+            &["rollback", "covgap-target", "--offline", "--dry-run"],
+            fx.root.path(),
+            "y\n",
+            Duration::from_secs(15),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(!output.contains("Tell Socket"), "a dry run: {output}");
+
+        let (code, output) = pty_io::run(
+            &["rollback", "covgap-target", "--offline"],
+            fx.root.path(),
+            "y\n",
+            Duration::from_secs(15),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert_eq!(
+            std::fs::read(fx.pkg_dir.join("index.js")).unwrap(),
+            fx.before
+        );
+        assert!(unwrapped(&output).contains(HINT), "{output}");
+
+        // Piped: the same rollback, and no hint.
+        let fx = patched_fixture();
+        let (code, stdout, stderr) =
+            run(fx.root.path(), &["rollback", "covgap-target", "--offline"]);
+        assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+        assert_eq!(
+            std::fs::read(fx.pkg_dir.join("index.js")).unwrap(),
+            fx.before
+        );
+        assert!(
+            !stdout.contains("Tell Socket") && !stderr.contains("Tell Socket"),
+            "{stdout}{stderr}"
+        );
+
+        // A bare rollback at a terminal: it was not about one patch.
+        let fx = patched_fixture();
+        let (code, output) = pty_io::run(
+            &["rollback", "--offline"],
+            fx.root.path(),
+            "y\n",
+            Duration::from_secs(15),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert_eq!(
+            std::fs::read(fx.pkg_dir.join("index.js")).unwrap(),
+            fx.before
+        );
+        assert!(!output.contains("Tell Socket"), "a bare rollback: {output}");
+    }
 }
