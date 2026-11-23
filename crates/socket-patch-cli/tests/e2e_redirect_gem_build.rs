@@ -6551,10 +6551,14 @@ async fn gem_hosted_scan_says_the_gem_is_held_at_its_version() {
     // And the way past it works: roll back, then `bundle update <gem>`.
     // The rollback is the command the note printed, as a shell reads it.
     std::fs::write(&lock_path, &scanned_lock).unwrap();
-    let printed = note
-        .split('`')
-        .find(|span| span.starts_with("socket-patch rollback "))
-        .expect("the note names a rollback");
+    let printed = stdout
+        .lines()
+        .find(|line| line.starts_with("Bundler now takes "))
+        .and_then(|line| {
+            line.split('`')
+                .find(|span| span.starts_with("socket-patch rollback "))
+        })
+        .expect("the scan's hold line names a rollback");
     let words = bash_nullglob_words(&fx.proj, printed);
     assert_eq!(
         words,
