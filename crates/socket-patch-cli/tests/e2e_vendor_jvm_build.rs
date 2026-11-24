@@ -742,14 +742,14 @@ fn maven_reactor_implicit_subprojects_warm_and_offline_build_and_revert() {
     // one) although both modules build the patched jar.
     assert_eq!(code, Some(1), "vex: {env}\n{stderr}");
     assert_eq!(env["error"]["code"], "no_applicable_patches", "{env}");
-    let withheld = &env["warnings"][0];
-    assert_eq!(withheld["code"], "vendor_jvm_shape_unsupported", "{env}");
     assert!(
-        withheld["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("is not wired in every module")
-                && detail.contains("Maven 4")),
-        "{env}"
+        env["warnings"].as_array().unwrap().iter().any(|warning| {
+            warning["code"] == "vendor_jvm_shape_unsupported"
+                && warning["detail"].as_str().is_some_and(|detail| {
+                    detail.contains("is not wired in every module") && detail.contains("Maven 4")
+                })
+        }),
+        "the run names the module that may build unpatched: {env}"
     );
     assert!(!vex_doc.exists(), "no VEX document is written: {env}");
     let (code, env, stderr) = socket_in(
