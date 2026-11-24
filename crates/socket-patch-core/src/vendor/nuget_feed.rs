@@ -4436,7 +4436,6 @@ mod tests {
         tokio::fs::metadata(p).await.unwrap().permissions().mode() & 0o7777
     }
 
-    #[cfg(unix)]
     fn preexisting_cfg() -> &'static str {
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
          <configuration>\n\
