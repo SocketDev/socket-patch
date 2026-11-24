@@ -13,10 +13,12 @@
 //! points at a copy committed under `.socket/vendor`: 2.5.0-rc4 takes the
 //! path for the name of a project and fails the build of everything the
 //! hub serves (Bazel 9.3.2, 8.8.2 and 7.7.2). rules_js does build a
-//! vendored tarball. rules_ruby 1.0.0-rc2 fails the build on a vendored
-//! gem (same three releases) unless the call lists every file of the copy
-//! among its `srcs`, which it copies beside the Gemfile: `srcs` is not
-//! read here, so a vendored gem is not judged.
+//! vendored tarball. rules_ruby 1.0.0-rc2 builds a gem that is committed
+//! as its archive and named by a `file:` source
+//! ([`crate::vendor::gem::bazel`]), and fails the build on one vendored by
+//! its path (same three releases) unless the call lists every file of the
+//! copy among its `srcs`, which it copies beside the Gemfile: `srcs` is
+//! not read here, so a vendored gem is not judged.
 //!
 //! [`unbuilt`] names, for a patched package, the call that builds it from a
 //! file without its patch. It says so only when the files of the workspace
@@ -79,7 +81,7 @@ use std::path::{Component, Path};
 use aho_corasick::AhoCorasick;
 
 use super::starlark::{Call, File, Value};
-use super::workspace::{disk, Doubt, Extension, Repo, Workspace};
+use super::workspace::{disk, Doubt, Extension, Repo, Tag, Workspace};
 use super::BazelRoot;
 use crate::formats::gem::locked_specs;
 use crate::formats::pnpm::grammar::documents;
@@ -138,7 +140,8 @@ struct Hub {
     members: fn(&str) -> Vec<String>,
     /// Whether a call of the tag may build a package from a line that
     /// points at a copy under `.socket/vendor`: rules_js does, and
-    /// rules_ruby does when the call lists the files of the copy.
+    /// rules_ruby does for a gem committed as its archive, or when the
+    /// call lists the files of the copy.
     builds_vendored: bool,
 }
 
@@ -345,6 +348,25 @@ fn reads(
     let hidden = || workspace.doubts.first().filter(|_| may());
     let unread = || workspace.legacy.as_ref()?.as_ref().err();
     doubt.or_else(|| hidden().or_else(unread).cloned()).map(Err)
+}
+
+/// The calls of the hub of `ecosystem` in the module files of `workspace`,
+/// each with the files of the main repository it names by a label that is
+/// written out (their paths from the Bazel root), and what leaves open
+/// whether these are all of them ([`Tags::doubts`]). No call of a
+/// `WORKSPACE` file is among them.
+///
+/// [`Tags::doubts`]: super::workspace::Tags::doubts
+pub(crate) fn hub_calls<'w>(
+    workspace: &'w Workspace,
+    ecosystem: &str,
+) -> (Vec<(Tag<'w>, Vec<String>)>, Vec<Doubt>) {
+    let Some(hub) = HUBS.iter().find(|hub| hub.ecosystem == ecosystem) else {
+        return Default::default();
+    };
+    let tags = workspace.tags(&hub.extension, hub.tag);
+    let named = |tag: Tag<'w>| (tag, files(workspace, tag.call, hub.files, None));
+    (tags.calls.into_iter().map(named).collect(), tags.doubts)
 }
 
 /// The name a `workspace(name = ...)` call gives the main repository.

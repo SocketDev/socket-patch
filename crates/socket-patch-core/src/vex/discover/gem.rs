@@ -188,13 +188,29 @@
 //! `CHECKSUMS` entry for them), so vendored refs never set
 //! `locked_integrity` — the committed artifact is hashed instead.
 //!
+//! ## Vendored for a Bazel hub (`vendor::gem::bazel`)
+//!
+//! ```text
+//! GEM
+//!   remote: file:.socket/vendor/gem/<uuid>/
+//!   specs:
+//!     <name> (<version>)
+//! ```
+//!
+//! A `GEM` section whose one remote is the directory of a patch under
+//! `.socket/vendor/gem`, spelled as that relative `file:` URL, is a
+//! vendored reference of the ruby-platform gem under it to the archive
+//! committed at `<that directory>/gems/<name>-<version>.gem`, which is
+//! where rules_ruby asks the source for it. The manifest has to give the
+//! gem that source, as for a hosted one, and `CHECKSUMS` pins the archive.
+//!
 //! `GIT` / `PLUGIN SOURCE` sections are never Socket wiring and are ignored.
 
 use std::collections::{BTreeSet, HashMap};
 
 use super::{
-    names_vendor_dir, simple_purl, vendor_ref, vendored_leaf_purl, DiscoverCtx, Discovery,
-    PatchedRef, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
+    names_vendor_dir, simple_purl, vendor_ref, vendor_uuid_dir, vendored_leaf_purl, DiscoverCtx,
+    Discovery, PatchedRef, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::crawlers::ruby_crawler::bundler_loaded_lock_in;
 use crate::formats::gem::{
@@ -255,7 +271,10 @@ async fn extract_file(ctx: &DiscoverCtx<'_>, file: &str, confirm: bool, out: &mu
     // One with a section that reads as Socket wiring.
     let wired = readable
         && lock.sections.iter().any(|sec| match sec.header {
-            "GEM" => sec.remotes.iter().any(|r| ctx.hosted_uuid(r).is_some()),
+            "GEM" => {
+                let wires = |r: &&str| ctx.hosted_uuid(r).is_some() || names_vendor_dir(r);
+                sec.remotes.iter().any(wires)
+            }
             "PATH" => sec.remotes.iter().any(|r| names_vendor_dir(r)),
             _ => false,
         });
@@ -386,7 +405,9 @@ impl ManifestSources {
             return Err(format!("there is no readable {rel} beside it"));
         };
         let want = match wiring {
-            Wiring::Hosted { remote, .. } => format!("`source: \"{remote}\"`"),
+            Wiring::Hosted { remote, .. } | Wiring::Archive { remote, .. } => {
+                format!("`source: \"{remote}\"`")
+            }
             Wiring::Vendored(vref) => format!("`path: \"{}\"`", vref.artifact_rel),
         };
         let mut declared = false;
@@ -394,7 +415,8 @@ impl ManifestSources {
             declared = true;
             let given = Self::given(text, decl);
             let ours = match (&given, wiring) {
-                (Given::Source(url), Wiring::Hosted { remote, .. }) => same_remote(url, remote),
+                (Given::Source(url), Wiring::Hosted { remote, .. })
+                | (Given::Source(url), Wiring::Archive { remote, .. }) => same_remote(url, remote),
                 (Given::Path(dir), Wiring::Vendored(vref)) => {
                     vendor_ref(dir).is_some_and(|v| v.artifact_rel == vref.artifact_rel)
                 }
@@ -760,12 +782,19 @@ enum Wiring<'t> {
         only: Option<BTreeSet<String>>,
     },
     Vendored(super::VendorRef),
+    /// The directory of a patch as a `GEM` section's one remote: the gem
+    /// is committed there as its archive (module docs, "Vendored for a
+    /// Bazel hub").
+    Archive {
+        remote: &'t str,
+        uuid: String,
+    },
 }
 
 impl Wiring<'_> {
     fn uuid(&self) -> &str {
         match self {
-            Wiring::Hosted { uuid, .. } => uuid,
+            Wiring::Hosted { uuid, .. } | Wiring::Archive { uuid, .. } => uuid,
             Wiring::Vendored(vref) => &vref.uuid,
         }
     }
@@ -783,6 +812,13 @@ fn hosted_wirings<'t>(
     blocks: &[(String, String)],
     out: &mut Discovery,
 ) -> Vec<Wiring<'t>> {
+    if let [remote] = sec.remotes.as_slice() {
+        let uuid = vendor_uuid_dir(remote).filter(|(eco, _)| eco == "gem");
+        let uuid = uuid.filter(|(_, uuid)| *remote == format!("file:.socket/vendor/gem/{uuid}/"));
+        if let Some((_, uuid)) = uuid {
+            return vec![Wiring::Archive { remote, uuid }];
+        }
+    }
     for remote in sec.remotes.iter().filter(|r| names_vendor_dir(r)) {
         out.diag(
             DIAG_REF_INVALID,
@@ -1007,6 +1043,21 @@ fn spec_ref(
                 out.shadow(pin);
             }
         }
+        Wiring::Archive { remote, .. } => {
+            let archive = format!("{remote}gems/{}-{}.gem", spec.name, spec.version);
+            let Some(vref) = vendor_ref(&archive).filter(|_| spec.platform.is_none()) else {
+                out.diag(
+                    DIAG_REF_INVALID,
+                    file,
+                    format!("{at}: {purl} is locked from {remote:?}, which holds no such gem"),
+                );
+                return;
+            };
+            if manifest_confirms(file, &at, coords, wiring, manifest, out) {
+                let pin = lock.integrity(spec.name, spec.version);
+                out.push(PatchedRef::vendored(purl, &vref, file, pin));
+            }
+        }
         Wiring::Vendored(vref) => {
             let leaf = format!("{}-{}", spec.name, spec.version);
             if vref.leaf != leaf
@@ -1048,7 +1099,7 @@ fn manifest_confirms(
     // source-pinned, so the lock has to follow the manifest first.
     let rewire = match wiring {
         Wiring::Hosted { .. } => "socket-patch scan",
-        Wiring::Vendored(_) => "socket-patch vendor",
+        Wiring::Vendored(_) | Wiring::Archive { .. } => "socket-patch vendor",
     };
     let rel = manifest.rel;
     out.diag(
@@ -1374,6 +1425,78 @@ mod tests {
         assert_eq!(r.artifact_rel.as_deref(), Some(rel.as_str()));
         assert_eq!(r.locked_integrity, None);
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    /// `vendor::gem::bazel`'s pair for a Bazel hub: a `GEM` section whose one
+    /// remote is the patch's directory as a relative `file:` URL is a
+    /// vendored reference to the gem committed under it, pinned by
+    /// `CHECKSUMS`, where the manifest gives the gem that source. Any other
+    /// spelling of such a remote is none, nor is a platform entry there.
+    #[tokio::test]
+    async fn a_gem_section_of_the_patch_s_directory_is_a_vendored_archive() {
+        let source = format!("file:.socket/vendor/gem/{UUID_A}/");
+        let lock = |remote: &str, spec: &str| {
+            format!(
+                "GEM\n  remote: {remote}\n  specs:\n    {spec}\n\n\
+                 GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.4.2)\n\n\
+                 PLATFORMS\n  ruby\n\nDEPENDENCIES\n  puma\n  rack (~> 3.2)!\n\n\
+                 CHECKSUMS\n  rack (3.2.6) sha256={SHA_A}\n\nBUNDLED WITH\n   2.6.9\n"
+            )
+        };
+        let declared = |source: &str| {
+            manifest(&[
+                "gem \"puma\"".to_string(),
+                format!("gem \"rack\", \"~> 3.2\", source: \"{source}\""),
+            ])
+        };
+        let p = Project::new();
+        p.write("Gemfile", declared(&source));
+        p.write("Gemfile.lock", lock(&source, "rack (3.2.6)"));
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:gem/rack@3.2.6", UUID_A, WiringMode::Vendored)],
+        );
+        let r = only(&out);
+        let archive = vendored_rel(UUID_A, "gems/rack-3.2.6.gem");
+        assert_eq!(r.artifact_rel.as_deref(), Some(archive.as_str()));
+        let pinned = crate::vendor::lock_inventory::LockIntegrity::Sha256Hex(SHA_A.into());
+        assert_eq!(r.locked_integrity, Some(pinned));
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+
+        // A manifest that does not give the gem that source, a platform
+        // entry, and the directory spelled any other way.
+        let other = format!("file:.socket/vendor/gem/{UUID_B}/");
+        for (gemfile, lock, code) in [
+            (
+                declared(&other),
+                lock(&source, "rack (3.2.6)"),
+                DIAG_REF_UNATTRIBUTABLE,
+            ),
+            (
+                declared(&source),
+                lock(&source, "rack (3.2.6-java)"),
+                DIAG_REF_INVALID,
+            ),
+            (
+                declared(&source),
+                lock(&source.replace("file:", "file:./"), "rack (3.2.6)"),
+                DIAG_REF_INVALID,
+            ),
+            (
+                declared(&source),
+                lock(source.trim_end_matches('/'), "rack (3.2.6)"),
+                DIAG_REF_INVALID,
+            ),
+        ] {
+            let p = Project::new();
+            p.write("Gemfile", gemfile);
+            p.write("Gemfile.lock", &lock);
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{lock}: {:#?}", out.refs);
+            let codes: Vec<&str> = out.diagnostics.iter().map(|d| d.code).collect();
+            assert_eq!(codes, [code], "{lock}: {:?}", out.diagnostics);
+        }
     }
 
     /// bundler 2.7 with `lockfile_checksums`: the path gem keeps a BARE

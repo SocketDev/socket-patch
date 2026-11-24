@@ -26,16 +26,11 @@
 //!
 //! The flow asserts the VEX document of its patch as `main.rs` says.
 //!
-//! Vendored mode would commit the unpacked patched gem under
-//! `.socket/vendor/gem` and make `Gemfile` and `Gemfile.lock` name it by
-//! its path from the project, and rules_ruby runs `bundle install` in a
-//! repository of Bazel's that holds the two files and not the copy. So in
-//! this checkout, where the hub reads both files, the command declines the
-//! gem and writes nothing ([`vendored_bundle_fetch`]): the build stays the
-//! unpatched one. With `--allow-vendored-in-bazel` it does what it did
-//! before it declined, and the build fails until `vendor --revert` has put
-//! the two files back. Hosted mode, which the refusal names, then patches
-//! the build.
+//! Outside a Bazel workspace vendored mode commits the unpacked patched gem
+//! under `.socket/vendor/gem` and makes `Gemfile` and `Gemfile.lock` name
+//! it by its path from the project. rules_ruby runs `bundle install` in a
+//! repository of Bazel's that holds the two files and not the copy, so that
+//! form fails the build of this checkout, where the hub reads both files.
 //!
 //! A vendored gem that this hub does build is one the lock names as hosted
 //! mode names it, with the patch registry's URL replaced by a relative
@@ -47,6 +42,19 @@
 //! reaches no patch host, and on a third one where one byte of the gem is
 //! another. The hub runs the Bundler its lock names, so the flow does both
 //! again with a lock that names Bundler 2.6.9 ([`OLDER_BUNDLER`]).
+//!
+//! [`vendored_bundle_fetch`] holds `scan --mode vendored` to writing those
+//! files, byte for byte, where the checkout names the Bazel release it is
+//! built with, and to declining the gem where it names none: Bazel 9.1.0
+//! fails on such a URL, and nothing in the checkout says that another
+//! release builds it. The tests without a Bazel hold it to every other
+//! condition under which it declines
+//! ([`a_gem_is_declined_where_the_committed_gem_is_not_known_to_build`]):
+//! a Bundler in the lock that no hub here was built with, a second call
+//! that reads the pair and holds the gem to other bytes or to none, and
+//! the rest.
+//! With `--allow-vendored-in-bazel` the command writes the copy of every
+//! other project, as it did.
 //!
 //! Both markers are read from what Bazel built, and each holds an id made
 //! for the run, so no cache of an earlier run can supply either gem. The
@@ -96,6 +104,7 @@ use sha2::{Digest, Sha256, Sha512};
 
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
+use crate::envelope::events;
 use crate::harness::{
     cell_without_bazel, changed, fixture_path, rewrite, with_vex, Cell, Claim, Declined, Fixture,
     How, Ran, StandIn, Tree, ALLOW, CONSUMER, NOTHING, REPO_CACHE, VENDORED,
@@ -629,13 +638,13 @@ fn fails_on_the_checksum(cell: &Cell, patched: &[u8], changed: &[u8]) {
 /// `BUNDLED WITH` in the hub, and the hub's `bundle install` is that one's.
 const OLDER_BUNDLER: &str = "2.6.9";
 
-/// Makes the lock of `cell` name [`OLDER_BUNDLER`].
-fn names_the_older_bundler(cell: &Cell) {
+/// Makes the lock of `cell` name Bundler `version`.
+fn names_bundler(cell: &Cell, version: &str) {
     let lock = String::from_utf8(cell.tree()["Gemfile.lock"].clone()).expect("a text file");
     let named = "\nBUNDLED WITH\n  4.0.15\n";
     assert!(lock.ends_with(named), "{}: {lock}", cell.test);
-    let older = format!("\nBUNDLED WITH\n  {OLDER_BUNDLER}\n");
-    cell.write("Gemfile.lock", lock.replace(named, &older));
+    let other = format!("\nBUNDLED WITH\n  {version}\n");
+    cell.write("Gemfile.lock", lock.replace(named, &other));
 }
 
 /// `gem` with its last byte changed: one of the padding a tar ends with, so
@@ -717,7 +726,7 @@ fn file_source_by_hand() {
     // (e) The same two machines with the Bundler of most locks.
     let fourth = without_patch_host(&third, &origin);
     fourth.write(&committed_gem(uuid), &served.patched_gem);
-    names_the_older_bundler(&fourth);
+    names_bundler(&fourth, OLDER_BUNDLER);
     fourth.builds_patched(&fourth.tree(), &served.patched);
     let bundler = format!("@bundle//:bundler-{OLDER_BUNDLER}");
     let held = fourth.bazel("query", &[&bundler]);
@@ -746,16 +755,24 @@ fn file_source_by_hand() {
 
 /// The code under which vendored mode declines a gem whose Gemfile or lock
 /// a hub of the workspace reads, and what a refusal has to name in the
-/// fixture's checkout: the hub's call with its line in `MODULE.bazel`, and
-/// the file it reads.
+/// fixture's checkout: the hub's call with its line in `MODULE.bazel`, the
+/// file it reads, and why the committed gem is not known to build there.
+/// The fixture names no Bazel release.
 const DECLINED: Declined = Declined {
     purl: PURL,
     code: "vendor_gem_bazel_hub",
     names: &[
         "`ruby.bundle_fetch` (MODULE.bazel:15)",
         "names Gemfile.lock; ",
+        "the checkout names no Bazel release as three numbers (`.bazelversion`",
     ],
 };
+
+/// The advisory of a run that committed a gem for a hub.
+const ADVISORY: &str = "vendor_gem_bazel_file_source";
+/// The warning of an undo that leaves a `gem_checksums` entry of the call
+/// holding the gem to the patched one.
+const ENTRY_LEFT: &str = "vendor_gem_bazel_checksum_left";
 
 /// The variables of a command of vendored mode, which downloads the
 /// patched gem from the patch host: the stand-in at `origin` is that host.
@@ -763,29 +780,74 @@ fn patch_host(origin: &str) -> [(&str, &str); 1] {
     [("SOCKET_PATCH_SERVER_URL", origin)]
 }
 
-/// Vendored mode beside a hub that reads the Gemfile and its lock.
+/// For a finished `scan --mode vendored --yes` in the fixture's checkout
+/// with the files `before`, where the hub reads the lock and the checkout
+/// names its Bazel release: the command vendored the one gem and says what
+/// that form costs. It wrote the three files of [`by_hand`], byte for
+/// byte, and beside them only its own: the ledger, the marker of the
+/// patch's directory, and the two files that keep git from ignoring or
+/// converting the gem. Gives the files of the checkout.
+fn committed_for_the_hub(cell: &Cell, scan: &Ran, served: &Served, before: &Tree) -> Tree {
+    let (test, said) = (&cell.test, &scan.dump);
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
+    let advised = |event: &&serde_json::Value| event["errorCode"] == ADVISORY;
+    let advisory = events(&scan.envelope).iter().find(advised);
+    let advisory = advisory.and_then(|event| event["reason"].as_str());
+    let advisory = advisory.unwrap_or_default();
+    let costs = [
+        "through Bazel only",
+        "keeps that unpatched copy",
+        "`--mode hosted`",
+        "does not watch",
+    ];
+    for cost in costs {
+        assert!(advisory.contains(cost), "{test}: no {cost:?} in {said}");
+    }
+    let by_hand = by_hand(&served.uuid, &served.patched_gem);
+    let dir = format!(".socket/vendor/gem/{}", served.uuid);
+    let own = [".gitattributes", ".gitignore", "socket-patch.vendor.json"];
+    let own = own.map(|file| format!("{dir}/{file}"));
+    let ledger = ".socket/vendor/state.json".to_string();
+    let mut written: Vec<String> = by_hand.keys().cloned().chain(own).chain([ledger]).collect();
+    written.sort();
+    let vendored = cell.tree();
+    assert_eq!(changed(before, &vendored), written, "{test}: {said}");
+    for (rel, bytes) in &by_hand {
+        let same = vendored[rel] == *bytes;
+        assert!(same, "{test}: {rel} is not the file written by hand");
+    }
+    vendored
+}
+
+/// Vendored mode beside a hub that reads the Gemfile and its lock, on a
+/// machine whose Bazel reaches no patch host.
 ///
 /// - (a) `bazel build` and `bazel run //:consumer` print the unpatched
 ///   marker.
-/// - (b) `socket-patch scan --mode vendored --yes` declines the gem: it
-///   exits 1, names the call of `MODULE.bazel` that reads the lock, hosted
-///   mode and the switch, writes nothing and downloads no gem. The same
-///   two Bazel commands print the unpatched marker, and change no file.
-/// - (c) With `--allow-vendored-in-bazel` the command does what it did
-///   before it declined: it passes and reports the gem vendored. It
-///   commits the unpacked patched gem, with its specification and its
-///   ledger, under `.socket/vendor`, and makes the declaration of
-///   `Gemfile` and a `PATH` section of `Gemfile.lock` name that copy by
-///   its path from the project. The same `bazel build` fails: rules_ruby
-///   copies `Gemfile` and `Gemfile.lock` into a repository of Bazel's and
-///   runs `bundle install` there, where the path names nothing. `vex`
-///   attests the gem as patched all the same: it reads the committed
-///   copy, and what rules_ruby builds from one is not judged.
-/// - (d) `socket-patch vendor --revert`, which takes no switch: every file
-///   of the checkout is the one of before, and the build prints the
-///   unpatched marker again.
-/// - (e) Hosted mode, which the refusal names: the same two Bazel commands
-///   print the patched marker.
+/// - (b) The checkout names no Bazel release, so `socket-patch scan --mode
+///   vendored --yes` declines the gem: it exits 1, names the call of
+///   `MODULE.bazel` that reads the lock, the missing release, hosted mode
+///   and the switch, writes nothing and downloads no gem. The same two
+///   Bazel commands print the unpatched marker, and change no file.
+/// - (c) With the release of this Bazel in `.bazelversion`, the same
+///   command vendors the gem: it writes the three files of
+///   [`file_source_by_hand`], byte for byte, with its ledger, and says
+///   what the form costs.
+/// - (d) The same two Bazel commands, with no step in between, print the
+///   patched marker. Bazel asked for no patched gem and no upstream one,
+///   changed no file, and a `--lockfile_mode=error` build passes.
+///   `vendor --check` passes.
+/// - (e) On a second machine with those files, where one byte of the
+///   committed gem is another, `vendor --check` fails on the sha256 of the
+///   ledger and the build fails on the lock's checksum.
+/// - (f) `socket-patch vendor --revert`: every file of the checkout is the
+///   one of before, and the build prints the unpatched marker again.
+/// - (g) Hosted mode, which the refusal names, on a machine that reaches
+///   the patch host: the same two Bazel commands print the patched marker.
+///
+/// The flow asserts the VEX document of its patch as `main.rs` says.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
 fn vendored_bundle_fetch() {
@@ -798,82 +860,83 @@ fn vendored_bundle_fetch() {
     let served = Served::to(&mut cell);
     let (standin, uuid) = (&served.standin, served.uuid.as_str());
     let origin = standin.origin();
-    let vendoring = |args: &[&str]| run(standin, &cell, args, &patch_host(&origin));
+    cell.route_downloads(&routes(&origin, false));
+    let run = |cell: &Cell, args: &[&str]| run(standin, cell, args, &patch_host(&origin));
 
     // (a) The unpatched build.
     let before = cell.builds_unpatched(&served.unpatched);
+    let upstream_fetches = standin.asked(&served.upstream_route);
 
-    // (b) The one command of vendored mode: declined, with nothing written
-    // and nothing of the patch fetched. The same build passes, on the
-    // upstream gem.
-    cell.declined(&vendoring(&VENDORED), &DECLINED, 1, "failed", &before);
+    // (b) No release is named: declined, with nothing written and nothing
+    // of the patch fetched. The same build passes, on the upstream gem.
+    cell.declined(&run(&cell, &VENDORED), &DECLINED, 1, "failed", &before);
     assert_eq!(standin.asked(&served.artifact_route), 0, "{test}");
     cell.builds_patched(&before, &served.unpatched);
 
-    // (c) On the user's word: the copy, its ledger, and the two files that
-    // name it.
-    let scan = vendoring(&[&VENDORED[..], &[ALLOW]].concat());
-    let said = &scan.dump;
-    assert_eq!(scan.code, 0, "{test}: {said}");
-    assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
-    assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
-    let vendored = cell.tree();
-    let kept = format!(".socket/vendor/gem/{uuid}");
-    let copy = format!("{kept}/{NAME}-{VERSION}");
-    let mut written = vec![
-        format!("{kept}/socket-patch.vendor.json"),
-        format!("{copy}/{LIB}"),
-        format!("{copy}/{NAME}.gemspec"),
-        ".socket/vendor/state.json".to_string(),
-        "Gemfile".to_string(),
-        "Gemfile.lock".to_string(),
-    ];
-    written.sort();
-    assert_eq!(changed(&before, &vendored), written, "{test}: {said}");
-    let patched_source = source(&format!("PATCHED {uuid}"));
-    let lib = &vendored[&format!("{copy}/{LIB}")];
-    assert_eq!(*lib, patched_source.as_bytes(), "{test}");
-    let text = |rel: &str| String::from_utf8(vendored[rel].clone()).expect("a text file");
-    let (gemfile, lock) = (text("Gemfile"), text("Gemfile.lock"));
-    let declaration = format!("gem \"{NAME}\", \"{VERSION}\", path: \"{copy}\"");
-    let declared = gemfile.lines().filter(|line| *line == declaration).count();
-    assert_eq!(declared, 1, "{test}: Gemfile:\n{gemfile}");
-    let section = format!("PATH\n  remote: {copy}\n  specs:\n    {NAME} ({VERSION})\n\n");
-    assert!(lock.starts_with(&section), "{test}: Gemfile.lock:\n{lock}");
+    // (c) The release is named: the gem, its ledger, and the two files
+    // that name it. The document of that run and the one of `vex` say so,
+    // before the patched build.
+    cell.write(".bazelversion", format!("{release}\n"));
+    let before = cell.tree();
+    let claim = Claim::new(PURL, uuid, How::Vendored);
+    let in_run = cell.document("in-run");
+    let scan = run(&cell, &[&VENDORED[..], &with_vex(&in_run)].concat());
+    let vendored = committed_for_the_hub(&cell, &scan, &served, &before);
+    cell.wrote_in_run(&scan, &in_run, &claim);
+    cell.stands_alone(run, &claim, true);
 
-    // The same build fails where rules_ruby runs Bundler, on the path of
-    // the copy, and changes no file of the checkout. Bundler breaks the
-    // message at the width of its console, so it is compared without white
-    // space.
-    let build = cell.bazel("build", &[CONSUMER]);
-    let stderr = squeezed(&build.stderr());
-    let missing = squeezed(&format!("{copy}` does not exist."));
-    assert!(
-        !build.ok() && stderr.contains("Runningbundleinstall") && stderr.contains(&missing),
-        "{test}: the build did not fail on the path of the copy ({missing:?}):\n{}",
-        build.dump()
+    // (d) The same build, no step in between: patched, from the committed
+    // gem.
+    cell.builds_patched(&vendored, &served.patched);
+    assert_eq!(standin.asked(&served.patched_route), 0, "{test}");
+    assert_eq!(
+        standin.asked(&served.upstream_route),
+        upstream_fetches,
+        "{test}: the patched build fetched the upstream gem"
     );
-    assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{test}");
-    let socket_patch = |cell: &Cell, args: &[&str]| run(standin, cell, args, &[]);
-    cell.stands_alone(socket_patch, &Claim::new(PURL, uuid, How::Vendored), true);
+    cell.stands_alone(run, &claim, true);
+    cell.stands_alone(run, &claim, false);
+    cell.detects_product(run, None);
+    let check = run(&cell, &["vendor", "--check"]);
+    assert_eq!(check.code, 0, "{test}: {}", check.dump);
 
-    // (d) The undo: every file is the one of before, and so is the build.
-    let undo = socket_patch(&cell, &["vendor", "--revert", "--yes"]);
+    // (e) A second machine, where one byte of the committed gem is another.
+    {
+        let second = cell.twin();
+        let other = one_byte_changed(&served.patched_gem);
+        second.write(&committed_gem(uuid), &other);
+        let check = run(&second, &["vendor", "--check"]);
+        let caught = check.dump.contains("vendor_sha256_mismatch");
+        assert!(check.code == 1 && caught, "{test}: {}", check.dump);
+        fails_on_the_checksum(&second, &served.patched_gem, &other);
+    }
+
+    // (f) The undo: every file is the one of before, and so is the build,
+    // and `vex` has no document for it. The same two documents where no
+    // Bazel has built.
+    let undo = run(&cell, &["vendor", "--revert", "--yes"]);
     cell.undone(&undo, "removed", &before, &served.unpatched);
+    cell.attests_nothing(run, 2, "manifest_not_found");
+    cell.attests_unbuilt(run, &VENDORED, &before, &vendored, &claim);
 
-    // (e) The remedy the refusal names: hosted mode patches the build.
-    let scan = socket_patch(&cell, &["scan", "--mode", "hosted", "--yes"]);
+    // (g) The remedy the refusal names, where Bazel reaches the patch host:
+    // hosted mode patches the build.
+    cell.route_downloads(&routes(&origin, true));
+    let scan = run(&cell, &["scan", "--mode", "hosted", "--yes"]);
     let pinned = cell.pinned_by(&scan, PURL, uuid, &before, &["Gemfile", "Gemfile.lock"]);
     cell.builds_patched(&pinned, &served.patched);
 
     println!(
-        "{test}: Bazel {release} built {:?}; `scan --mode vendored` declined ({}), wrote \
-         nothing, and the build stayed the same; with {ALLOW} it wrote {copy} and pointed \
-         Gemfile and Gemfile.lock at it, and the next build failed (Bundler: The path ... does \
-         not exist) while `vex` attested the gem; `vendor --revert` restored all {} files and \
-         the build; `scan --mode hosted` built {:?}; {:?}",
+        "{test}: Bazel {release} built {:?}; `scan --mode vendored` declined ({}) in a checkout \
+         that names no Bazel release, and the build stayed the same; with the release named it \
+         wrote {} and a `file:` source in Gemfile and Gemfile.lock, the files written by hand, \
+         and the next build printed {:?} with no patch host; one changed byte failed `vendor \
+         --check` and a second machine's build (Bundler: mismatched checksums); `vendor \
+         --revert` restored all {} files and the build; `scan --mode hosted` built {:?}; {:?}",
         served.unpatched,
         DECLINED.code,
+        committed_gem(uuid),
+        served.patched,
         before.len(),
         served.patched,
         started.elapsed()
@@ -895,10 +958,11 @@ fn checkout() -> (Cell, Served) {
 }
 
 /// Without a Bazel: in the fixture's checkout, where the hub reads the
-/// Gemfile and its lock, every command that would vendor the gem declines
-/// it, writes nothing and fetches no gem. On the user's word vendored mode
-/// goes on, and a later run without it passes and writes nothing: the lock
-/// the hub reads already names the copy.
+/// Gemfile and its lock and no file names a Bazel release, every command
+/// that would vendor the gem declines it, writes nothing and fetches no
+/// gem. On the user's word vendored mode goes on, with the copy of every
+/// other project, and a later run without it passes and writes nothing:
+/// the lock the hub reads already names the copy.
 #[test]
 fn every_command_that_would_vendor_declines_beside_a_hub_that_reads_the_lock() {
     let (cell, served) = checkout();
@@ -921,6 +985,301 @@ fn every_command_that_would_vendor_declines_beside_a_hub_that_reads_the_lock() {
     let undo = run(&cell, &["rollback", "--yes"], &[]);
     assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", undo.dump);
     cell.vendors_on_the_users_word(run, &DECLINED);
+}
+
+/// Without a Bazel: in the fixture's checkout with its Bazel release named
+/// in `.bazelversion`, vendored mode commits the gem for the hub.
+///
+/// - A dry run names no refusal and writes nothing.
+/// - The run writes the three files of [`by_hand`], byte for byte, and
+///   says what the form costs.
+/// - A later run passes and writes nothing, also a scan that names no mode
+///   and one with the switch: the pair names the committed gem.
+/// - A hosted scan leaves the pair alone and names the undo.
+/// - `vendor --check` passes, and fails on one changed byte of the gem,
+///   which `repair` puts right.
+/// - `vendor --revert`, `rollback` and `remove` each put every file back,
+///   byte for byte, and the gem is vendored the same again after each.
+/// - Run as a person runs it, the command names the Bazel build as the
+///   next step, and no reinstall: Bundler by itself fails on the source.
+/// - With Bundler 2.6.9 in the lock the gem is vendored the same way.
+/// - With the switch the run writes the copy of every other project.
+/// - A vendored scan takes over a hosted pin of the gem, and writes the
+///   same three files.
+#[test]
+fn a_gem_is_committed_for_the_hub_and_put_back() {
+    let (cell, served) = checkout();
+    cell.write(".bazelversion", "9.3.2\n");
+    let (standin, uuid) = (&served.standin, served.uuid.as_str());
+    let origin = standin.origin();
+    let go = |args: &[&str]| run(standin, &cell, args, &patch_host(&origin));
+    let before = cell.tree();
+    let same = |ran: &Ran, tree: &Tree| {
+        assert_eq!(ran.code, 0, "{}", ran.dump);
+        assert_eq!(changed(tree, &cell.tree()), NOTHING, "{}", ran.dump);
+    };
+
+    let dry = go(&[&VENDORED[..], &["--dry-run"]].concat());
+    same(&dry, &before);
+    assert!(!dry.dump.contains(DECLINED.code), "{}", dry.dump);
+    let vendored = committed_for_the_hub(&cell, &go(&VENDORED), &served, &before);
+    for in_sync in [
+        &VENDORED[..],
+        &["scan", "--yes"],
+        &[&VENDORED[..], &[ALLOW]].concat(),
+    ] {
+        let again = go(in_sync);
+        same(&again, &vendored);
+        assert_eq!(again.envelope["status"], "success", "{}", again.dump);
+        assert!(!again.dump.contains(DECLINED.code), "{}", again.dump);
+    }
+
+    // Hosted mode leaves a gem vendored this way alone, and says how to
+    // hand it over.
+    let hosted = go(&["scan", "--mode", "hosted", "--yes"]);
+    same(&hosted, &vendored);
+    let handed_over = hosted.dump.contains("socket-patch's own vendored wiring");
+    assert!(handed_over, "{}", hosted.dump);
+
+    same(&go(&["vendor", "--check"]), &vendored);
+    cell.write(&committed_gem(uuid), one_byte_changed(&served.patched_gem));
+    let check = go(&["vendor", "--check"]);
+    let caught = check.dump.contains("vendor_sha256_mismatch");
+    assert!(check.code == 1 && caught, "{}", check.dump);
+    same(&go(&["repair"]), &vendored);
+
+    for undo in [
+        &["vendor", "--revert", "--yes"][..],
+        &["rollback", "--yes"],
+        &["remove", PURL, "--yes"],
+    ] {
+        same(&go(undo), &before);
+        committed_for_the_hub(&cell, &go(&VENDORED), &served, &before);
+    }
+    same(&go(&["vendor", "--revert", "--yes"]), &before);
+
+    // As a person runs it: the next step is the build, and no reinstall.
+    let rubygems = format!("{origin}/{RUBYGEMS}");
+    let env = [
+        ("SOCKET_RUBYGEMS_URL", rubygems.as_str()),
+        patch_host(&origin)[0],
+    ];
+    let [stdout, stderr] = cell.socket_patch_person(&origin, &VENDORED, &env);
+    let said = format!("--- stdout\n{stdout}\n--- stderr\n{stderr}");
+    let step =
+        "2. Build with Bazel, which installs the committed gems, then run `socket-patch vex`";
+    let stepped = squeezed(&stdout).contains(&squeezed(step));
+    assert!(stepped && !stdout.contains("Reinstall"), "{said}");
+    assert!(
+        stderr.contains("Warning: ") && stderr.contains("through Bazel only"),
+        "{said}"
+    );
+    same(&go(&["vendor", "--revert", "--yes"]), &before);
+
+    // The Bundler of most locks, which a hub was built with too.
+    names_bundler(&cell, OLDER_BUNDLER);
+    let older = cell.tree();
+    let ran = go(&VENDORED);
+    assert_eq!(ran.envelope["summary"]["applied"], 1, "{}", ran.dump);
+    assert!(ran.dump.contains(ADVISORY), "{}", ran.dump);
+    same(&go(&["vendor", "--revert", "--yes"]), &older);
+    cell.write("Gemfile.lock", &before["Gemfile.lock"]);
+
+    // On the user's word: the copy of every other project, named by its
+    // path.
+    let allowed = go(&[&VENDORED[..], &[ALLOW]].concat());
+    assert_eq!(
+        allowed.envelope["summary"]["applied"], 1,
+        "{}",
+        allowed.dump
+    );
+    let lock = String::from_utf8(cell.tree()["Gemfile.lock"].clone()).expect("a text file");
+    let copy = format!("PATH\n  remote: .socket/vendor/gem/{uuid}/{NAME}-{VERSION}\n");
+    assert!(lock.starts_with(&copy), "{lock}");
+    same(&go(&["vendor", "--revert", "--yes"]), &before);
+
+    let hosted = go(&["scan", "--mode", "hosted", "--yes"]);
+    assert_eq!(hosted.envelope["summary"]["applied"], 1, "{}", hosted.dump);
+    let taken_over = go(&VENDORED);
+    assert_eq!(taken_over.code, 0, "{}", taken_over.dump);
+    let tree = cell.tree();
+    for (rel, bytes) in by_hand(uuid, &served.patched_gem) {
+        assert!(tree[&rel] == bytes, "{rel}: {}", taken_over.dump);
+    }
+    same(&go(&["vendor", "--revert", "--yes"]), &before);
+}
+
+/// Without a Bazel: each condition under which the committed gem is not
+/// known to build declines the gem, with nothing written and no gem
+/// fetched, and names the call, the lock and the condition. The lock's
+/// `CHECKSUMS` line or the `gem_checksums` entry of every call that reads
+/// the pair is what holds the committed gem to its bytes: an entry that
+/// holds the gem to other bytes declines it once the patched gem is known,
+/// naming the call, the entry and both sums, also where it is a second
+/// call's. With the sum of the patched gem written there the gem is
+/// vendored, also in a lock with no `CHECKSUMS` section, and each undo
+/// then puts every file back and says that the entry it leaves in the call
+/// fails the build.
+#[test]
+fn a_gem_is_declined_where_the_committed_gem_is_not_known_to_build() {
+    let scan = |cell: &Cell, served: &Served| {
+        let origin = served.standin.origin();
+        run(&served.standin, cell, &VENDORED, &patch_host(&origin))
+    };
+    let text =
+        |cell: &Cell, rel: &str| String::from_utf8(cell.tree()[rel].clone()).expect("a text file");
+    // The lock without its `CHECKSUMS` section.
+    let unchecked = |cell: &Cell| {
+        let lock = text(cell, "Gemfile.lock");
+        let (head, sums) = lock.split_once("CHECKSUMS\n").expect("a CHECKSUMS section");
+        let (_, tail) = sums.split_once("\n\n").expect("a section after it");
+        cell.write("Gemfile.lock", format!("{head}{tail}"));
+    };
+    // The call with `gem_checksums = <sums>`.
+    let pins = |cell: &Cell, sums: &str| {
+        let lock = "    gemfile_lock = \"//:Gemfile.lock\",\n";
+        let module = text(cell, "MODULE.bazel");
+        assert!(module.contains(lock), "{module}");
+        let pinned = format!("{lock}    gem_checksums = {sums},\n");
+        cell.write("MODULE.bazel", module.replace(lock, &pinned));
+    };
+    // A second call that reads the same pair, for a hub of its own, with
+    // the arguments `more`: the line of `MODULE.bazel` it is on.
+    let second = |cell: &Cell, more: &str| {
+        let module = text(cell, "MODULE.bazel");
+        let call = format!(
+            "ruby.bundle_fetch(name = \"tools\", gemfile = \"//:Gemfile\", gemfile_lock = \
+             \"//:Gemfile.lock\"{more})\n"
+        );
+        cell.write("MODULE.bazel", format!("{module}{call}"));
+        module.lines().count() + 1
+    };
+    let entry = |sum: &str| format!("{{\"{NAME}-{VERSION}\": \"{sum}\"}}");
+    let unheld = |line: usize| {
+        format!(
+            "has no CHECKSUMS section and `ruby.bundle_fetch` (MODULE.bazel:{line}) has no \
+             `gem_checksums` entry for {NAME}-{VERSION}"
+        )
+    };
+    let (first_unheld, second_unheld) = (unheld(15), unheld(28));
+    type Edit<'a> = &'a dyn Fn(&Cell);
+    let cases: [(Edit, &str); 9] = [
+        (
+            &|cell| cell.write(".bazelversion", "9.1.0\n"),
+            "Bazel 9.1.0 fails on such a URL",
+        ),
+        (
+            &|cell| cell.write(".bazelversion", "10.0.0\n"),
+            "not known to build on Bazel 10.0.0",
+        ),
+        (
+            &|cell| cell.write(".bazelversion", "latest\n"),
+            DECLINED.names[2],
+        ),
+        (&unchecked, &first_unheld),
+        (
+            // The first call holds the gem, and the second one does not.
+            &|cell| {
+                unchecked(cell);
+                pins(cell, &entry(PLACEHOLDER));
+                assert_eq!(second(cell, ""), 28);
+            },
+            &second_unheld,
+        ),
+        (
+            &|cell| names_bundler(cell, "2.5.23"),
+            "not known to build with Bundler 2.5.23, which Gemfile.lock names",
+        ),
+        (
+            &|cell| names_bundler(cell, "5.0.0"),
+            "not known to build with Bundler 5.0.0, which Gemfile.lock names",
+        ),
+        (
+            &|cell| pins(cell, "SUMS"),
+            "the `gem_checksums` of `ruby.bundle_fetch` (MODULE.bazel:15) are not written out",
+        ),
+        (
+            &|cell| {
+                cell.write(
+                    "WORKSPACE",
+                    "local_repository(name = \"x\", path = \"x\")\n",
+                )
+            },
+            "a `WORKSPACE` file of the workspace defines repositories",
+        ),
+    ];
+    for (edit, why) in cases {
+        let (cell, served) = checkout();
+        cell.write(".bazelversion", "9.3.2\n");
+        edit(&cell);
+        let package = Declined {
+            names: &[DECLINED.names[0], DECLINED.names[1], why],
+            ..DECLINED
+        };
+        let before = cell.tree();
+        cell.declined(&scan(&cell, &served), &package, 1, "failed", &before);
+        assert_eq!(served.standin.asked(&served.artifact_route), 0, "{why}");
+    }
+
+    // An entry that holds the gem to the upstream bytes.
+    let (cell, served) = checkout();
+    cell.write(".bazelversion", "9.3.2\n");
+    let sums = [&served.upstream_gem, &served.patched_gem].map(|gem| sha256_hex(gem));
+    let unpinned = text(&cell, "MODULE.bazel");
+    pins(&cell, &entry(&sums[0]));
+    let before = cell.tree();
+    let ran = scan(&cell, &served);
+    let said = squeezed(&ran.dump);
+    let named = [
+        format!("hold {NAME}-{VERSION} to sha256 {}", sums[0]),
+        format!("the patched gem has {}", sums[1]),
+        DECLINED.code.to_string(),
+    ];
+    let named = named.iter().all(|part| said.contains(&squeezed(part)));
+    assert!(ran.code == 1 && named, "{}", ran.dump);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", ran.dump);
+
+    // The sum of the patched gem there, and a second call that reads the
+    // pair and holds the gem to the upstream bytes: its hub would fail.
+    cell.write("MODULE.bazel", &unpinned);
+    pins(&cell, &entry(&sums[1]));
+    let pinned = text(&cell, "MODULE.bazel");
+    let line = second(&cell, &format!(", gem_checksums = {}", entry(&sums[0])));
+    let before = cell.tree();
+    let ran = scan(&cell, &served);
+    let said = squeezed(&ran.dump);
+    let named = format!(
+        "`ruby.bundle_fetch` (MODULE.bazel:{line}) hold {NAME}-{VERSION} to sha256 {}",
+        sums[0]
+    );
+    let named = said.contains(&squeezed(&named)) && said.contains(DECLINED.code);
+    assert!(ran.code == 1 && named, "{}", ran.dump);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", ran.dump);
+
+    // The one call, with the sum of the patched gem: vendored, with and
+    // without a `CHECKSUMS` section in the lock. Each undo puts every file
+    // back and names the entry it leaves in the call.
+    cell.write("MODULE.bazel", &pinned);
+    for (with_section, undo) in [
+        (true, &["vendor", "--revert", "--yes"][..]),
+        (true, &["rollback", "--yes"]),
+        (false, &["remove", PURL, "--yes"]),
+    ] {
+        if !with_section {
+            unchecked(&cell);
+        }
+        let before = cell.tree();
+        let ran = scan(&cell, &served);
+        assert_eq!(ran.envelope["summary"]["applied"], 1, "{}", ran.dump);
+        let pinned = text(&cell, "Gemfile.lock").contains(&checksum(NAME, &sums[1]));
+        assert_eq!(pinned, with_section, "{}", ran.dump);
+        let undo = run(&served.standin, &cell, undo, &[]);
+        assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", undo.dump);
+        let said = squeezed(&undo.dump);
+        let left = format!("`ruby.bundle_fetch` (MODULE.bazel:15) still hold {NAME}-{VERSION}");
+        let left = said.contains(ENTRY_LEFT) && said.contains(&squeezed(&left));
+        assert!(undo.code == 0 && left, "{}", undo.dump);
+    }
 }
 
 /// Without a Bazel: the refusal is the project's whose files a hub reads,

@@ -4759,7 +4759,15 @@ fn print_vendor_closing(
                 .iter()
                 .filter(|f| flavor_install_command(f).is_some())
                 .all(|f| JVM_TOOLS.contains(&f.as_str()));
-        let reinstall = if jvm_only {
+        // A gem committed for a rules_ruby hub is installed by the Bazel
+        // build alone: Bundler by itself fails on its source, which the
+        // warning of the run says.
+        let for_bazel =
+            |e: &&PatchEvent| e.error_code.as_deref() == Some("vendor_gem_bazel_file_source");
+        let for_bazel = env.events.iter().filter(for_bazel).count();
+        let reinstall = if for_bazel > 0 && for_bazel == env.summary.applied as usize {
+            "Build with Bazel, which installs the committed gems".to_string()
+        } else if jvm_only {
             let cmds: Vec<String> = installs.iter().map(|c| format!("`{c}`")).collect();
             format!(
                 "Run {} so the build resolves the vendored artifacts (the generated root \

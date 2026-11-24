@@ -433,8 +433,10 @@ pub struct GlobalArgs {
     /// (`vendor_pypi_bazel_hub`, `vendor_gem_bazel_hub`), which builds
     /// nothing from a lock that names a copy under `.socket/vendor`. Pass
     /// it when the build does find the copy, or does not take the
-    /// project's packages from that lock. Other subcommands accept it
-    /// silently.
+    /// project's packages from that lock. Without it a gem is committed
+    /// for a rules_ruby hub as an archive that the hub builds, where
+    /// that is known to build; with it every gem is vendored by its
+    /// path. Other subcommands accept it silently.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long = "allow-vendored-in-bazel",

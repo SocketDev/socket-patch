@@ -28,7 +28,8 @@
 //!    it ([`ALLOW_IN_BAZEL_ENV`]) or the lock already names the patch's
 //!    copy: any Composer project (`vendor_composer_bazel_workspace`), and a
 //!    PyPI or RubyGems project whose lock a hub of the workspace reads
-//!    (`vendor_pypi_bazel_hub`, `vendor_gem_bazel_hub`).
+//!    (`vendor_pypi_bazel_hub`, `vendor_gem_bazel_hub`), but a gem that
+//!    can be committed for the hub as its archive ([`gem::bazel`]).
 //!
 //! Each check lives in its backend's module; this one only dispatches and
 //! scopes them.

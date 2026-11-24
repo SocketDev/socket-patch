@@ -1871,7 +1871,7 @@ workspace and that Bazel does not build keeps the matrix at the top.
 | npm: aspect_rules_js `npm.npm_translate_lock` over a pnpm lock | Supported | Supported | Not supported | Supported |
 | PyPI: rules_python `pip.parse` over a requirements file | Supported | Not supported | Not supported | Supported |
 | Go: gazelle `go_deps.from_file` over `go.mod` | Supported | Supported | Not supported | Supported with a hosted or vendored patch |
-| RubyGems: rules_ruby `ruby.bundle_fetch` over `Gemfile.lock` | Supported with no `gem_checksums` on the call | Not supported | Not supported | Supported |
+| RubyGems: rules_ruby `ruby.bundle_fetch` over `Gemfile.lock` | Supported with no `gem_checksums` on the call | Supported with the Bazel release named in `.bazelversion` | Not supported | Supported |
 | Cargo: rules_rust `crate.from_cargo` over `Cargo.lock` | Supported with `cargo_config` on the hub | Supported | Not supported | Supported with a hosted or vendored patch |
 | NuGet: rules_csharp `nuget.from_lock` over `packages.lock.json` | Supported with `nuget_config` on the tag | Not supported | Not supported | Supported with no restored copy on the machine |
 | Composer: a rule of your own that runs `composer install` from `composer.lock` | Supported | Not supported | Not supported | Supported with a hosted patch |
@@ -1891,15 +1891,19 @@ exits 0 and leaves a build that fails (the known problems below). What a cell sa
 - **Not supported**: socket-patch promises nothing about what a Bazel build holds after the
   mode ran, so do not use it for a package that Bazel builds. In most of these cells the
   patch does not reach the build, or the build breaks (see the known problems below).
-  Vendored mode for PyPI, RubyGems and Composer declines instead: the command exits 1 and
-  writes nothing. For PyPI and RubyGems that is where the call of the row reads a file the
+  Vendored mode for PyPI and Composer declines instead: the command exits 1 and
+  writes nothing. For PyPI that is where the call of the row reads a file the
   run would rewrite
   ([Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode)),
   for Composer in every Bazel workspace ([Bazel workspaces: Composer](#bazel-workspaces-composer)).
+  Vendored mode for RubyGems declines the same way wherever the condition of its cell, or
+  another one of
+  [Bazel workspaces: RubyGems vendored mode](#bazel-workspaces-rubygems-vendored-mode), does
+  not hold.
 - **Supported**, for VEX: `socket-patch vex` and `--vex` say `not_affected` of a package the
   Bazel build takes patched, and `affected` of one whose patch Bazel does not build.
-  [Bazel workspaces: VEX](#bazel-workspaces-vex) has the cases and the limits; a vendored gem
-  is one of the limits.
+  [Bazel workspaces: VEX](#bazel-workspaces-vex) has the cases and the limits; a gem vendored
+  with `--allow-vendored-in-bazel` is one of the limits.
 - **Supported with a condition**, for VEX: under the condition the cell names, the document
   says `not_affected` of a package the Bazel build takes patched, and a test holds it to
   that (for Maven a test without Bazel). It does not say `affected` of a package whose patch
@@ -1934,7 +1938,11 @@ What the table was tested with:
 - **RubyGems**: rules_ruby 1.0.0-rc2, `ruby.bundle_fetch` with `gemfile` and `gemfile_lock`
   and no `gem_checksums`, and a `Gemfile.lock` that has a `CHECKSUMS` section. That section
   is what holds the patched gem to its sha256, in Bundler's step of the build: with a lock
-  that has none the build takes whatever the patch registry serves.
+  that has none the build takes whatever the patch registry serves. Vendored mode: the same
+  call and lock, with the project at the Bazel root and the Bazel release in `.bazelversion`;
+  the files it writes were built with Bundler 2.6.9 in the lock as well, written by hand;
+  [Bazel workspaces: RubyGems vendored mode](#bazel-workspaces-rubygems-vendored-mode) has
+  every condition.
 - **Cargo**: rules_rust 0.75.0 (Bazel 9 and 8) and 0.56.0 (Bazel 7), `crate.from_cargo` with
   `cargo_lockfile = "//:Cargo.lock"`, `manifests = ["//:Cargo.toml"]` and
   `cargo_config = "//:.cargo/config.toml"`, and no cargo-bazel lock (`lockfile`).
@@ -1989,6 +1997,12 @@ Known problems. In each of these a command exits 0 today and the next Bazel buil
   the patched gem, which a later `rollback` does not put back. Where the lock has a
   `CHECKSUMS` section, deleting the entry works too: Bundler then holds the gem to that
   section.
+- **A vendored gem that `gem_checksums` pins, after an undo.** Vendored mode declines such a
+  gem until the entry holds the sha256 of the patched gem, which you write. No undo puts the
+  old value back: after `vendor --revert`, `rollback` or `remove` the lock names the upstream
+  gem again and the build fails on the entry (`Checksum was ... but wanted ...`) until it
+  holds the upstream sha256 again or is deleted. The undo says so in a warning
+  (`vendor_gem_bazel_checksum_left`).
 - **npm on a hub with `update_pnpm_lock = True`.** Hosted mode with a pnpm of 11 or later,
   when `pnpm-workspace.yaml` is not in the hub's `data`: the pnpm that Bazel runs rejects the
   lock (`ERR_PNPM_TARBALL_URL_MISMATCH`). List `//:package.json` and
@@ -2011,10 +2025,14 @@ In these a command exits 0 and the Bazel build passes on the unpatched package:
 - **Hosted PyPI, when `pip.parse` takes the requirements of the build's platform from
   another file** than the one socket-patch rewrote (`requirements_by_platform`,
   `requirements_linux` and its siblings).
+- **RubyGems, where Bazel does not fetch the hub again**: a hub pinned in a vendor directory
+  (`VENDOR.bazel`) that was made before the patch, and a build with `--nofetch` after an
+  earlier fetch, keep the gems they have, in every mode. Measured by hand on Bazel 9.3.2;
+  no test here runs it, and `vex` does not see it.
 
 [Bazel workspaces: VEX](#bazel-workspaces-vex) lists what the document says in such cases.
 
-And three that concern neither:
+And five that concern neither:
 
 - **Vendored Cargo under rules_rust 0.75.0**: a build writes a `BUILD.bazel` into the
   committed copy, and right after it `vendor --check` exits 1 (`vendor_inventory_mismatch`)
@@ -2027,6 +2045,20 @@ And three that concern neither:
 - **Hosted NuGet prints the access token of the patch in the build's output.** rules_csharp
   asks the Socket source for every package of the lock, and Bazel prints a warning with that
   source's URL, the token in it, for each package the source does not hold.
+- **Vendored RubyGems and Bundler outside Bazel.** The lock names the committed gem by a
+  relative `file:` URL, which Bundler by itself does not install from: `bundle install` on a
+  machine that has not installed the gem fails, and so does every `bundle lock --update`,
+  until `vendor --revert`. On a machine that installed the gem before the patch, Bundler
+  keeps that installed copy: `bundle install` passes there and the program runs the
+  unpatched gem, with no error. The run says both in a warning. Hosted mode serves both
+  builds.
+- **Vendored RubyGems in an output base that fetched the gems before.** Bazel does not watch
+  the committed gem. When the gem alone changes afterwards (another commit with the same
+  `Gemfile.lock`, a damaged file), such an output base keeps building what it fetched, never
+  the changed bytes, until it fetches the hub again: after a change of `Gemfile.lock`, or
+  after `bazel clean --expunge`. The same holds the other way: an output base that fetched a
+  damaged gem keeps failing after `repair` put the gem right, until it fetches the hub
+  again.
 
 ## Bazel workspaces: Maven
 
@@ -2882,7 +2914,9 @@ and neither ruleset builds from such a file:
 
 Both were measured on Bazel 9.3.2, 8.8.2 and 7.7.2, after a `scan --mode vendored` that exited
 0 and reported the package vendored. So vendored mode now declines such a package, where the
-files of the workspace show that a hub reads the file it would rewrite.
+files of the workspace show that a hub reads the file it would rewrite. For a gem it writes
+another form there, which rules_ruby builds, and declines only where that form is not known
+to build: [Bazel workspaces: RubyGems vendored mode](#bazel-workspaces-rubygems-vendored-mode).
 
 **What is read.** The project is in a Bazel workspace by the lookup of
 [Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore). There socket-patch reads
@@ -2972,7 +3006,9 @@ file that your Bazel no longer reads (Bazel 9 never reads it, Bazel 8 only with
 `--enable_workspace`), or for a `ruby.bundle_fetch` to which you add every file of the
 vendored gem as `srcs`, which rules_ruby copies beside the Gemfile (no test here builds
 that). socket-patch checks none of these. It is the switch of
-[Bazel workspaces: Composer](#bazel-workspaces-composer).
+[Bazel workspaces: Composer](#bazel-workspaces-composer). With it a gem is vendored by its
+path, as in every other project, also where the form of the next section would be written
+without it.
 
 `vendor --revert` is never declined. Neither is a package that is already vendored: where
 the file that the call names already names the copy of the same patch
@@ -3023,6 +3059,125 @@ Limits:
 [`e2e_bazel_build/pypi.rs`](../crates/socket-patch-cli/tests/e2e_bazel_build/pypi.rs) and
 [`ruby.rs`](../crates/socket-patch-cli/tests/e2e_bazel_build/ruby.rs) run the refusal, the
 switch and hosted mode on a real Bazel.
+
+## Bazel workspaces: RubyGems vendored mode
+
+For a gem whose `Gemfile` and lock a `ruby.bundle_fetch` call reads, vendored mode commits
+the patched gem as the archive the patch service serves, and names it in the two files as
+hosted mode names a patch registry, with a relative `file:` URL in the registry's place:
+
+```
+gem "rack", "~> 2.2", source: "file:.socket/vendor/gem/<uuid>/"     # Gemfile
+
+GEM                                                                 # Gemfile.lock
+  remote: file:.socket/vendor/gem/<uuid>/
+  specs:
+    rack (2.2.3)
+
+DEPENDENCIES
+  rack (~> 2.2)!
+
+CHECKSUMS
+  rack (2.2.3) sha256=<the patched gem>
+
+.socket/vendor/gem/<uuid>/gems/rack-2.2.3.gem                       # the patched gem
+```
+
+rules_ruby asks Bazel for `<remote>gems/<name>-<version>.gem`. Bazel's server runs in the
+root of the workspace and opens the relative URL from there, which Bazel documents nowhere,
+and Bundler, in the `bundle install` step of the build, holds the file to the lock's
+`CHECKSUMS` line. No file of Bazel's is written, and `MODULE.bazel.lock` stays as it is. The
+directory of the patch also holds the marker of the patch and a `.gitignore` (`!*`) and
+`.gitattributes` of its own: stock ignore templates name `*.gem`.
+
+Built on Bazel 9.3.2, 8.8.2 and 7.7.2 with rules_ruby 1.0.0-rc2, and with Bundler 4.0.15
+and 2.6.9 in the lock, which is the Bundler the hub installs and runs: the build is the
+patched one on a machine that reaches no patch host, and one changed byte of the committed
+gem fails the build of a machine that fetches the hub anew (`Bundler found mismatched
+checksums`). By hand, and by no test here: a gem that the `Gemfile` does not declare builds
+patched (9.3.2), and a build without the committed gem fails.
+
+**Where it is written.** Only for a gem whose `Gemfile` or `Gemfile.lock` a call of the hub
+names, read as
+[Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode)
+says, and only where each of these holds. All are read from the files of the checkout; no
+Bazel is run. Where one does not hold the gem is declined with `vendor_gem_bazel_hub`,
+nothing is written, and the message names it:
+
+- **The checkout names a Bazel release that opens such a URL.** `.bazelversion`, or
+  `USE_BAZEL_VERSION` in `.bazeliskrc`, names a release of Bazel 7, 8 or 9 other than 9.1.0.
+  Bazel's own history says that the downloader of 9.1.0 fails on such a URL and that 9.1.1
+  and 9.2.0 fixed it (read, not run). A checkout that names no release, or one that is not
+  three numbers (`latest`, `8.x`), is declined: 9.1.0 may build it, or a release to come.
+  What the environment of a machine names (`USE_BAZEL_VERSION` in a shell) is not seen.
+- **The project is the root of the Bazel workspace.** Bazel opens the URL from the root, and
+  the committed gem lies under the project.
+- **The workspace is read with certainty**: its module files are, no `WORKSPACE` file
+  defines a repository, every `ruby.bundle_fetch` call writes out the files it reads, and a
+  call that reads the `Gemfile` or the lock of the project reads both.
+- **Something holds the gem to its bytes, in the hub of every call that reads the two
+  files**: the lock has a `CHECKSUMS` section, or the `gem_checksums` of each such call
+  have an entry for the gem. With neither, any bytes at that path would build in that hub.
+  `bundle lock --add-checksums` writes the section (Bundler 2.6 or later). `gem_checksums`
+  have to be written out as a dict of strings.
+- **Every `gem_checksums` entry for the gem holds it to the patched gem.** rules_ruby hands
+  that sha256 to Bazel, which fails the download of any other bytes. An entry for the
+  upstream gem, in any call that reads the two files, declines the gem once the patched
+  one is downloaded, and the message names the call, the entry and the sha256 to write
+  there. socket-patch does not edit the call: write the value, and run the command again.
+  A dry run downloads no gem, so it cannot see this condition and lists the gem as one the
+  run would vendor. No undo puts the old value back: after `vendor --revert`, `rollback` or
+  `remove` the build fails on the entry (`Checksum was ... but wanted ...`) until it holds
+  the upstream sha256 again or is deleted, and the undo says so in a warning
+  (`vendor_gem_bazel_checksum_left`).
+- **The lock names a Bundler that a hub was built with** (`BUNDLED WITH`): 2.6 or later of
+  the 2 line, or one of the 4 line. rules_ruby installs the Bundler of the lock in the hub
+  and runs it there. Built with 2.6.9 and 4.0.15, which both hold the gem to the lock's
+  `CHECKSUMS` line; an older one, and a lock that names none, is declined.
+- **The lock holds the gem as its ruby-platform entry** and not as platform gems.
+
+Before any of these, the gem meets what vendored mode refuses for every gem
+([Ruby gems: gems vendored mode refuses](#ruby-gems-gems-vendored-mode-refuses)): a native
+extension, a declaration that cannot be edited and the rest answer as they do outside Bazel.
+
+**What it costs.** The run says both in a warning (`vendor_gem_bazel_file_source`):
+
+- **Bundler by itself does not install from that source.** `bundle install` on a machine
+  that has not installed the gem fails, and so does every `bundle lock --update` (measured
+  with Bundler 4.0.15). On a machine that installed the gem before the patch, Bundler keeps
+  that installed copy: `bundle install` passes there and the program runs the unpatched
+  gem, with no error. The checkout then builds its gems through Bazel only. Hosted mode
+  serves both builds. A run that vendored nothing but such gems names the Bazel build as
+  its next step, and no reinstall.
+- **Bazel does not watch the committed gem.** An output base that fetched the hub before
+  keeps building what it fetched when the gem alone changes afterwards, never the changed
+  bytes. A change of `Gemfile.lock` fetches the hub again, and so does a new output base.
+  An output base that fetched a damaged gem likewise keeps failing after `repair`, until
+  it fetches the hub again (`bazel clean --expunge`).
+
+**The other commands.** A later run passes and writes nothing. `vendor --check` holds the
+committed gem to the patch, by its patched files, and to the sha256 of the ledger, and
+`repair` downloads it again. `vendor --revert`, `rollback` and `remove` take the source off
+the `Gemfile`, put the lock's entry back into its section where Bundler sorts it, with its
+`DEPENDENCIES` entry and its `CHECKSUMS` line as they were, and delete the directory of the
+patch: byte for byte for a lock whose entries are in Bundler's own order. A pair whose
+`source:` or `GEM` section is no longer what the run wrote is left alone with the gem
+(`vendor_lock_entry_drifted`); the gem's `CHECKSUMS` line is put back as it was whatever
+it holds by then. A newer patch of the gem takes the source over in place, and a vendored
+scan takes over a hosted pin of the gem. `list` and `vex` show the gem as vendored; `vex`
+says `not_affected` of it, and the flow below holds that document to the patched build.
+`vex` holds the committed gem to its patched files; only `vendor --check` holds it to its
+bytes as well, which a fresh build does too.
+
+With `--allow-vendored-in-bazel` vendored mode writes what it writes in every other project,
+the unpacked copy named by its path, which this hub does not build.
+
+Not covered: `rb_bundle_fetch` in a `WORKSPACE` file, a project below the Bazel root, a gem
+locked as platform gems and a lock of a Bundler older than 2.6, which are declined; Windows,
+releases of rules_ruby other than 1.0.0-rc2, and a Bundler inside the hub other than 4.0.15
+and 2.6.9, which were not run.
+[`ruby.rs`](../crates/socket-patch-cli/tests/e2e_bazel_build/ruby.rs) builds the form on a
+real Bazel, written by hand and written by the command.
 
 ## Ruby gems: hosted mode
 
@@ -3470,12 +3625,14 @@ is patched:
   the file that points at the copy. rules_python 2.5.0-rc4 takes the path of the line for
   the name of a project, and the build of everything the hub serves fails (same three
   releases). A vendored npm tarball is built by rules_js and keeps its statement. So does a
-  vendored gem, for another reason: rules_ruby builds one only when the call lists every
+  vendored gem. One committed as its archive for the hub
+  ([Bazel workspaces: RubyGems vendored mode](#bazel-workspaces-rubygems-vendored-mode)) is
+  built by rules_ruby. One vendored by its path is built only when the call lists every
   file of the copy among its `srcs`, which is not read, so nothing is said of it.
-  Vendored mode declines both by default where the hub reads the file
-  ([Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode)),
-  so this is the state of a project vendored with `--allow-vendored-in-bazel` or by an
-  earlier release.
+  Vendored mode declines a PyPI package by default where the hub reads the file
+  ([Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode))
+  and writes the path of a gem only with `--allow-vendored-in-bazel`, so these are the
+  states of a project vendored with that switch or by an earlier release.
 
 Each advisory of such a patch gets a statement of the package's own with the status
 `affected`. It names that package alone under the product, and its `action_statement` says
@@ -3573,7 +3730,8 @@ The document and the build are tested to agree on real Bazel 9.3.2, 8.8.2 and
 aspect_rules_js's `npm.npm_translate_lock(pnpm_lock = "//:pnpm-lock.yaml")` (hosted and
 vendored), PyPI through rules_python's `pip.parse(requirements_lock = "//:requirements.txt")`
 (hosted), and RubyGems through rules_ruby's
-`ruby.bundle_fetch(gemfile_lock = "//:Gemfile.lock")` without `gem_checksums` (hosted). There
+`ruby.bundle_fetch(gemfile_lock = "//:Gemfile.lock")` without `gem_checksums` (hosted, and
+vendored as the gem's committed archive). There
 the build prints the patched package, and the document of the run (`--vex`), of `vex` and of
 `vex --no-verify` is one `not_affected` statement that names the package and the patch; the
 first two are the same in a checkout with the same files that Bazel has not built in, and
@@ -3609,12 +3767,13 @@ the build is broken):
   of its own, a file that is not given as a plain string label. And where the line that
   points at the copy is in a requirements file that the file the call names brings in with
   `-r`. Measured for PyPI, where the build fails.
-- **Vendored mode for RubyGems** beside `ruby.bundle_fetch`. rules_ruby 1.0.0-rc2 runs
+- **A gem vendored by its path** beside `ruby.bundle_fetch`. rules_ruby 1.0.0-rc2 runs
   `bundle install` in a repository that holds the Gemfile, its lock and the files the call
   lists as `srcs`, so the path of the copy does not exist there unless every file of the copy
   is listed. Measured on the three releases: the build fails, and the statement still says
-  `not_affected`. Vendored mode declines such a gem by default, so this is the state of a
-  project vendored with `--allow-vendored-in-bazel` or by an earlier release.
+  `not_affected`. Vendored mode writes that form beside such a hub only with
+  `--allow-vendored-in-bazel`, so this is the state of a project vendored with the switch or
+  by an earlier release.
 - **A vendored package whose own files the hub does not read**, while the lock the hub does
   read still lists the registry's package: a uv or Poetry project vendored through
   `pyproject.toml` and its lock while `pip.parse` reads a requirements file exported before;
