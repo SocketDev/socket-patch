@@ -891,7 +891,9 @@ pub struct CandidateFiles {
     /// workspace keeps one lock per member but the members cannot be
     /// listed (#492), `gitBranchLockfile` installs the branch from a
     /// `pnpm-lock.<branch>.yaml` (#556), or pnpm's `lockfile` setting is
-    /// off so pnpm reads no lock at all (#1074). The root lock was left out of
+    /// off so pnpm reads no lock at all (#1074). And when a pin in it would
+    /// fail the Bazel build of the project ([`crate::bazel::pnpm`]). The
+    /// root lock was left out of
     /// `files`, and the rewrite reports this instead of a redirect or a
     /// "no lockfile" hint.
     pub pnpm_refusal: Option<RewriteWarning>,
@@ -1630,6 +1632,8 @@ pub async fn read_candidate_files_in(
             withhold_root_pnpm_locks(&mut out, disabled_lockfile_refusal(&source, pnpm_lock));
         } else if let Some(branch) = crate::utils::pnpm_workspace::git_branch_locks(view).await {
             refuse_git_branch_locks(&mut out, &branch);
+        } else if let Some(hidden) = bazel_hides_pnpm_workspace(view, &out).await {
+            withhold_root_pnpm_locks(&mut out, hidden);
         } else {
             read_pnpm_member_locks(view, unreadable, &mut out).await;
         }
@@ -1774,13 +1778,31 @@ fn refuse_git_branch_locks(
     withhold_root_pnpm_locks(out, git_branch_lock_refusal(branch));
 }
 
+/// The refusal for a project whose `pnpm-lock.yaml` a rules_js hub of its
+/// Bazel workspace keeps up to date with a pnpm that would not read the
+/// `trustLockfile: true` a hosted pin needs ([`crate::bazel::pnpm::hidden`]):
+/// the build would fail on the pinned lock, so the caller leaves the root
+/// locks out and the run refuses every pnpm pin (see
+/// [`withhold_root_pnpm_locks`]). Nothing of Bazel is read for a project
+/// without that lock.
+async fn bazel_hides_pnpm_workspace(
+    view: &ProjectView<'_>,
+    out: &CandidateFiles,
+) -> Option<RewriteWarning> {
+    if !out.files.contains_key(ROOT_PNPM_LOCKS[0]) {
+        return None;
+    }
+    crate::bazel::pnpm::hidden(view).await
+}
+
 /// The root pnpm locks (see [`withhold_root_pnpm_locks`]).
 const ROOT_PNPM_LOCKS: [&str; 2] = ["pnpm-lock.yaml", "shrinkwrap.yaml"];
 
 /// Leave every root pnpm lock out of the run and refuse every pnpm pin
 /// with `refusal` (see [`CandidateFiles::pnpm_refusal`]): a branch lock
-/// (#556) or pnpm's `lockfile` setting off (#1074, where pnpm reads no
-/// lock at all; member locks are never read then). In memory the root
+/// (#556), pnpm's `lockfile` setting off (#1074, where pnpm reads no
+/// lock at all; member locks are never read then), or a Bazel hub that
+/// would fail on the pin ([`bazel_hides_pnpm_workspace`]). In memory the root
 /// lock is dropped from the link and unreadable lists too: it is not
 /// written.
 fn withhold_root_pnpm_locks(out: &mut CandidateFiles, refusal: RewriteWarning) {
