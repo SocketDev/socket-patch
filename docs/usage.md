@@ -275,6 +275,9 @@ it pulled the hosted `Gemfile.lock` still runs the upstream copies, and
 `bundle install`, `bundle install --redownload` and `bundle pristine` don't change
 that. The scan replaces the installed copies; see
 [Ruby gems: gems already installed](ecosystems.md#ruby-gems-gems-already-installed).
+In a project that also holds agent-mode or vendored patches, where a scan with no
+`--mode` is not a hosted one, the line names the files to remove before
+`bundle install` instead.
 
 `--verbose` prints a line per patch, and `--json` reports each one as its own
 `skipped` event. Warnings of one kind are folded the same way: the first in full,

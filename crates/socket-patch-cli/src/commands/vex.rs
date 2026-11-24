@@ -337,7 +337,7 @@ pub(crate) struct VexGenError {
     pub failed: Vec<FailedPatch>,
     /// The purls in `failed` that a hosted pin wires. What gets such a
     /// package installed depends on its package manager (see
-    /// [`nothing_attested_hint`]).
+    /// [`StaleHostedGems`]).
     pub hosted: Vec<String>,
     /// Advisories raised before the failure (already printed in human
     /// mode) — for `no_applicable_patches` often the only explanation of a
@@ -518,7 +518,8 @@ pub async fn run(args: VexArgs) -> i32 {
                 ),
                 _ => (e.message, 2),
             };
-            emit_envelope_error(&args, e.code, &message, &e.failed, &e.hosted, &run_warnings);
+            let gems = StaleHostedGems::among(&common, &manifest_path, &e.failed, &e.hosted).await;
+            emit_envelope_error(&args, e.code, &message, &e.failed, &gems, &run_warnings);
             if !args.common.json {
                 below.print();
             }
@@ -2634,15 +2635,15 @@ async fn synthesize_go_patches(
 /// Emit a `vex` error to the active output channel: an error envelope on
 /// stdout in `--json` mode, a stderr message otherwise. `failures` lists
 /// patches omitted by verification (populated for `no_applicable_patches`,
-/// empty everywhere else), `hosted` the ones of them a hosted pin wires;
-/// `warnings` are the run's advisories, already on stderr in human mode,
-/// folded into the envelope's `warnings[]` here.
+/// empty everywhere else), `gems` the hosted gems among them that the hint
+/// sends to the scan; `warnings` are the run's advisories, already on
+/// stderr in human mode, folded into the envelope's `warnings[]` here.
 fn emit_envelope_error(
     args: &VexArgs,
     code: &str,
     message: &str,
     failures: &[FailedPatch],
-    hosted: &[String],
+    gems: &StaleHostedGems,
     warnings: &[RunWarning],
 ) {
     if args.common.json {
@@ -2666,7 +2667,7 @@ fn emit_envelope_error(
                 eprintln!("  omitted: {} ({})", f.purl, f.reason);
             }
         } else if let Some(hint) =
-            nothing_attested_hint(failures, hosted).filter(|_| code == "no_applicable_patches")
+            nothing_attested_hint(failures, gems).filter(|_| code == "no_applicable_patches")
         {
             eprintln!("{hint}");
         }
@@ -2830,17 +2831,70 @@ fn omission_lines(failed: &[FailedPatch], verbose: bool) -> Vec<String> {
         .collect()
 }
 
+/// The omitted gems whose installed copy no reinstall replaces: Bundler
+/// keeps a gem it has already installed whatever source the lock names,
+/// so after the lock moved to a hosted pin `bundle install` changes
+/// nothing, and `bundle pristine` on Bundler 2.6+ removes the gems and
+/// then fails on the lock's checksum (#2219). The hosted scan is what
+/// replaces such a copy.
+#[derive(Debug, Default)]
+struct StaleHostedGems {
+    /// The purls omitted as `not_applied` that are gems on a hosted pin
+    /// with no manifest record (`apply` patches a recorded one in place).
+    purls: Vec<String>,
+    /// Whether a `scan` with no `--mode` runs in hosted mode here, the one
+    /// mode that replaces the copies. It does not where the project also
+    /// holds agent-mode or vendored patches: the bare scan then keeps that
+    /// mode or stops with `mode_ambiguous`, and `--mode hosted` would move
+    /// those patches over, so the hint names the files to remove instead.
+    bare_scan_is_hosted: bool,
+}
+
+impl StaleHostedGems {
+    /// Those among `failed`, of which `hosted` are on a hosted pin. The
+    /// project's state is read only when there is such a gem.
+    async fn among(
+        common: &GlobalArgs,
+        manifest_path: &Path,
+        failed: &[FailedPatch],
+        hosted: &[String],
+    ) -> Self {
+        let mut purls: Vec<String> = failed
+            .iter()
+            .filter(|f| {
+                f.reason == "not_applied"
+                    && f.purl.starts_with("pkg:gem/")
+                    && hosted.contains(&f.purl)
+            })
+            .map(|f| f.purl.clone())
+            .collect();
+        if purls.is_empty() {
+            return Self::default();
+        }
+        if let Ok(Some(manifest)) =
+            socket_patch_core::manifest::operations::read_manifest(manifest_path).await
+        {
+            purls.retain(|purl| !manifest.patches.contains_key(purl));
+        }
+        let bare_scan_is_hosted = !purls.is_empty()
+            && !common.is_global()
+            && matches!(
+                crate::commands::mode_from_project_state(common).await,
+                Ok(crate::commands::scan::ScanMode::Hosted)
+            );
+        Self {
+            purls,
+            bare_scan_is_hosted,
+        }
+    }
+}
+
 /// What to do about a document nothing could go into, said under the
 /// error, when patches were left out for a reason with a remedy: the
 /// patched packages are not installed yet (the usual case right after a
-/// hosted or vendored scan), or not installed at all.
-///
-/// `hosted` names the purls a hosted pin wires. A gem among them gets its
-/// own remedy: Bundler keeps a gem it has already installed whatever
-/// source the lock names, so no reinstall brings the patched gem in (and
-/// `bundle pristine` on Bundler 2.6+ removes the gems, then fails on the
-/// lock's checksum). The hosted scan is what replaces the installed copy.
-fn nothing_attested_hint(failed: &[FailedPatch], hosted: &[String]) -> Option<String> {
+/// hosted or vendored scan), or not installed at all. The `gems` among
+/// them get their own remedy, since no reinstall works for them.
+fn nothing_attested_hint(failed: &[FailedPatch], gems: &StaleHostedGems) -> Option<String> {
     let of = |n: usize| {
         if n == failed.len() {
             "The".to_string()
@@ -2849,8 +2903,8 @@ fn nothing_attested_hint(failed: &[FailedPatch], hosted: &[String]) -> Option<St
         }
     };
     let not_applied = failed.iter().filter(|f| f.reason == "not_applied");
-    let (gems, others): (Vec<_>, Vec<_>) =
-        not_applied.partition(|f| f.purl.starts_with("pkg:gem/") && hosted.contains(&f.purl));
+    let (gem_copies, others): (Vec<_>, Vec<_>) =
+        not_applied.partition(|f| gems.purls.contains(&f.purl));
     let mut remedies = Vec::new();
     if !others.is_empty() {
         remedies.push(format!(
@@ -2860,15 +2914,25 @@ fn nothing_attested_hint(failed: &[FailedPatch], hosted: &[String]) -> Option<St
             of(others.len())
         ));
     }
-    if !gems.is_empty() {
+    if !gem_copies.is_empty() {
+        let remedy = if gems.bare_scan_is_hosted {
+            format!(
+                "Run `socket-patch scan` to replace the installed copies (for a gem home \
+                 outside the project, run `{}` instead, or add `--gem-refresh-shared` to the \
+                 scan)",
+                crate::commands::gem_refresh::LOCAL_PATH_REMEDY
+            )
+        } else {
+            "Remove each gem's `specifications/<name>-<version>.gemspec` and \
+             `cache/<name>-<version>.gem` from its gem home (and its archive in `vendor/cache`, \
+             if the project keeps one), run `bundle install`"
+                .to_string()
+        };
         remedies.push(format!(
             "{} patched packages are hosted gems whose installed copies are still the upstream \
              builds. Bundler keeps a gem it has already installed, so `bundle install`, `bundle \
-             install --redownload` and `bundle pristine` do not bring in the patched gem. Run \
-             `socket-patch scan` here to replace the installed copies (for a gem home outside \
-             the project, run `{}` instead, or add `--gem-refresh-shared` to the scan)",
-            of(gems.len()),
-            crate::commands::gem_refresh::LOCAL_PATH_REMEDY
+             install --redownload` and `bundle pristine` do not bring in the patched gem. {remedy}",
+            of(gem_copies.len()),
         ));
     }
     if !remedies.is_empty() {
@@ -3213,30 +3277,28 @@ mod tests {
                          hold their original files. Reinstall from the lockfile (hosted or \
                          vendored patches) or run `socket-patch apply` (agent-mode patches), \
                          then run `socket-patch vex` again.";
-        assert_eq!(nothing_attested_hint(&all, &[]).as_deref(), Some(reinstall));
-        // A hosted pin of any other package manager installs from the lock.
-        let hosted = ["pkg:npm/a@1.0.0".to_string(), "pkg:npm/b@1.0.0".to_string()];
+        let none = StaleHostedGems::default();
         assert_eq!(
-            nothing_attested_hint(&all, &hosted).as_deref(),
+            nothing_attested_hint(&all, &none).as_deref(),
             Some(reinstall)
         );
         let some = [
             failed("pkg:npm/a@1.0.0", "not_applied"),
             failed("pkg:npm/b@1.0.0", "vex_pnpm_bundled_copy"),
         ];
-        assert!(nothing_attested_hint(&some, &[])
+        assert!(nothing_attested_hint(&some, &none)
             .unwrap()
             .starts_with("1 of the patched packages are not installed yet"));
         assert!(
-            nothing_attested_hint(&[failed("pkg:npm/a@1.0.0", "package_not_found")], &[])
+            nothing_attested_hint(&[failed("pkg:npm/a@1.0.0", "package_not_found")], &none)
                 .unwrap()
                 .starts_with("The patched packages are not installed here.")
         );
         assert_eq!(
-            nothing_attested_hint(&[failed("pkg:npm/a@1.0.0", "hash_mismatch")], &[]),
+            nothing_attested_hint(&[failed("pkg:npm/a@1.0.0", "hash_mismatch")], &none),
             None
         );
-        assert_eq!(nothing_attested_hint(&[], &[]), None);
+        assert_eq!(nothing_attested_hint(&[], &none), None);
     }
 
     /// #2219: Bundler keeps a gem it has installed whatever source the lock
@@ -3250,26 +3312,45 @@ mod tests {
             failed("pkg:gem/rack@2.2.8", "not_applied"),
             failed("pkg:gem/rake@13.2.1", "not_applied"),
         ];
-        let hosted = [
-            "pkg:gem/rack@2.2.8".to_string(),
-            "pkg:gem/rake@13.2.1".to_string(),
-        ];
+        let stale = |purls: &[&str], bare_scan_is_hosted| StaleHostedGems {
+            purls: purls.iter().map(|purl| purl.to_string()).collect(),
+            bare_scan_is_hosted,
+        };
+        let both = ["pkg:gem/rack@2.2.8", "pkg:gem/rake@13.2.1"];
         assert_eq!(
-            nothing_attested_hint(&gems, &hosted).as_deref(),
+            nothing_attested_hint(&gems, &stale(&both, true)).as_deref(),
             Some(
                 "The patched packages are hosted gems whose installed copies are still the \
                  upstream builds. Bundler keeps a gem it has already installed, so `bundle \
                  install`, `bundle install --redownload` and `bundle pristine` do not bring in \
-                 the patched gem. Run `socket-patch scan` here to replace the installed copies \
-                 (for a gem home outside the project, run `bundle config set --local path \
+                 the patched gem. Run `socket-patch scan` to replace the installed copies (for \
+                 a gem home outside the project, run `bundle config set --local path \
                  vendor/bundle && bundle install` instead, or add `--gem-refresh-shared` to the \
                  scan), then run `socket-patch vex` again."
             )
         );
 
-        // A gem that agent mode patches, or a vendored one, keeps the
-        // general remedy: `apply` and a reinstall do work there.
-        let general = nothing_attested_hint(&gems, &[]).unwrap();
+        // Where a scan with no `--mode` is not a hosted one (the project
+        // holds agent-mode or vendored patches too), the hint names no
+        // scan: it would not replace the copies, or would need a `--mode`
+        // that moves the other patches.
+        assert_eq!(
+            nothing_attested_hint(&gems, &stale(&both, false)).as_deref(),
+            Some(
+                "The patched packages are hosted gems whose installed copies are still the \
+                 upstream builds. Bundler keeps a gem it has already installed, so `bundle \
+                 install`, `bundle install --redownload` and `bundle pristine` do not bring in \
+                 the patched gem. Remove each gem's `specifications/<name>-<version>.gemspec` \
+                 and `cache/<name>-<version>.gem` from its gem home (and its archive in \
+                 `vendor/cache`, if the project keeps one), run `bundle install`, then run \
+                 `socket-patch vex` again."
+            )
+        );
+
+        // A gem that is not among them (agent mode patches it, or it is
+        // vendored) keeps the general remedy: `apply` and a reinstall do
+        // work there.
+        let general = nothing_attested_hint(&gems, &StaleHostedGems::default()).unwrap();
         assert!(
             general.contains("Reinstall from the lockfile") && !general.contains("Bundler"),
             "{general}"
@@ -3282,7 +3363,7 @@ mod tests {
             failed("pkg:npm/a@1.0.0", "not_applied"),
             failed("pkg:npm/b@1.0.0", "hash_mismatch"),
         ];
-        let hint = nothing_attested_hint(&mixed, &hosted[..1]).unwrap();
+        let hint = nothing_attested_hint(&mixed, &stale(&both[..1], true)).unwrap();
         assert!(
             hint.starts_with("1 of the patched packages are not installed yet")
                 && hint.contains("Reinstall from the lockfile")
@@ -3290,7 +3371,7 @@ mod tests {
                     " 1 of the patched packages are hosted gems whose installed copies are \
                      still the upstream builds."
                 )
-                && hint.contains("Run `socket-patch scan` here"),
+                && hint.contains("Run `socket-patch scan` to replace"),
             "{hint}"
         );
         assert_eq!(
@@ -3303,10 +3384,71 @@ mod tests {
         // replaces: a hosted gem that is not installed keeps its own hint.
         assert!(nothing_attested_hint(
             &[failed("pkg:gem/rack@2.2.8", "package_not_found")],
-            &hosted
+            &stale(&both, true)
         )
         .unwrap()
         .starts_with("The patched packages are not installed here."));
+    }
+
+    /// Which omitted packages are stale hosted gems, and whether the scan
+    /// with no `--mode` is the one that replaces them.
+    #[tokio::test]
+    async fn stale_hosted_gems_are_the_unrecorded_gems_on_a_hosted_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let common = GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            no_telemetry: true,
+            ..GlobalArgs::default()
+        };
+        let manifest_path = common.resolved_manifest_path();
+        let failures = [
+            failed("pkg:gem/rack@2.2.8", "not_applied"),
+            failed("pkg:gem/rake@13.2.1", "not_applied"),
+            failed("pkg:gem/json@2.7.0", "hash_mismatch"),
+            failed("pkg:npm/a@1.0.0", "not_applied"),
+        ];
+        let hosted: Vec<String> = [
+            "pkg:gem/rack@2.2.8",
+            "pkg:gem/json@2.7.0",
+            "pkg:npm/a@1.0.0",
+        ]
+        .map(String::from)
+        .to_vec();
+
+        // No patch state beside the lock: a bare scan is a hosted one.
+        let gems = StaleHostedGems::among(&common, &manifest_path, &failures, &hosted).await;
+        assert_eq!(gems.purls, ["pkg:gem/rack@2.2.8"]);
+        assert!(gems.bare_scan_is_hosted);
+
+        // No such gem: nothing of the project is read.
+        let gems = StaleHostedGems::among(&common, &manifest_path, &failures, &[]).await;
+        assert!(gems.purls.is_empty() && !gems.bare_scan_is_hosted);
+
+        // An agent-mode record of another package: the bare scan keeps
+        // agent mode, which replaces no gem.
+        let record = |purl: &str| {
+            serde_json::json!({ "patches": { purl: {
+                "uuid": "11111111-1111-4111-8111-111111111111",
+                "exportedAt": "2026-01-01T00:00:00Z",
+                "files": {},
+                "vulnerabilities": {},
+                "description": "",
+                "license": "MIT",
+                "tier": "free",
+            }}})
+            .to_string()
+        };
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(&manifest_path, record("pkg:npm/b@1.0.0")).unwrap();
+        let gems = StaleHostedGems::among(&common, &manifest_path, &failures, &hosted).await;
+        assert_eq!(gems.purls, ["pkg:gem/rack@2.2.8"]);
+        assert!(!gems.bare_scan_is_hosted);
+
+        // A record of the gem itself: `apply` patches it in place, so it
+        // keeps the general remedy.
+        std::fs::write(&manifest_path, record("pkg:gem/rack@2.2.8")).unwrap();
+        let gems = StaleHostedGems::among(&common, &manifest_path, &failures, &hosted).await;
+        assert!(gems.purls.is_empty() && !gems.bare_scan_is_hosted);
     }
 
     #[test]

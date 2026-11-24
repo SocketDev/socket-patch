@@ -2382,7 +2382,8 @@ async fn standalone_vex_sends_a_stale_hosted_gem_to_the_scan_that_replaces_it() 
     let out = run_vex(&bin, &proj, &run(true));
     assert_eq!(out.code, Some(1), "{out}");
     assert!(
-        out.stderr.contains("Run `socket-patch scan` here")
+        out.stderr
+            .contains("Run `socket-patch scan` to replace the installed copies")
             && out.stderr.contains("`bundle pristine`")
             && out.stderr.contains("--gem-refresh-shared"),
         "the remedy for an installed hosted gem is the scan:\n{}",
@@ -2395,6 +2396,37 @@ async fn standalone_vex_sends_a_stale_hosted_gem_to_the_scan_that_replaces_it() 
         out.stderr
     );
     assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB, "vex writes nothing");
+
+    // The same checkout with an agent-mode patch of another package: a
+    // scan with no `--mode` keeps agent mode there and replaces no gem, so
+    // the hint names the files to remove, not a scan.
+    let mixed = tmp.path().join("mixed");
+    std::fs::create_dir_all(&mixed).unwrap();
+    for file in ["Gemfile", "Gemfile.lock"] {
+        std::fs::copy(a.join(file), mixed.join(file)).unwrap();
+    }
+    install_real_gem(&project_home(&mixed), UPSTREAM_LIB);
+    common::write_minimal_manifest(
+        &mixed.join(".socket"),
+        "pkg:npm/left-pad@1.3.0",
+        "22222222-2222-4222-8222-222222222222",
+        &[],
+    );
+    let out = run_vex(&bin, &mixed, &run(true));
+    assert_eq!(out.code, Some(1), "{out}");
+    assert!(
+        out.stderr
+            .contains("Remove each gem's `specifications/<name>-<version>.gemspec`")
+            && out.stderr.contains("run `bundle install`, then run"),
+        "a mixed-mode project is told which files to remove:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("Run `socket-patch scan`")
+            && !out.stderr.contains("Reinstall from the lockfile"),
+        "no scan that would keep agent mode, and no reinstall:\n{}",
+        out.stderr
+    );
 
     // The scan the hint names: no `--mode`, the project's own.
     let args = [
