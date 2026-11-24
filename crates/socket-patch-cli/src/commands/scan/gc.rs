@@ -550,7 +550,8 @@ pub(super) async fn run_registry_only_gc(
     if hosted {
         let root = common.project_root();
         let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&root);
-        if let Some(hidden) = socket_patch_core::bazel::pnpm::hidden(&view).await {
+        let hidden = socket_patch_core::hosted::engine::pnpm_root_lock_left_to_bazel(&view);
+        if let Some(hidden) = hidden.await {
             gc.warnings
                 .push((socket_patch_core::bazel::pnpm::HIDDEN, hidden.detail));
             return Some(gc);

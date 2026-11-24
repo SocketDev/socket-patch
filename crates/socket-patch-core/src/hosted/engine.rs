@@ -1973,22 +1973,26 @@ fn refuse_git_branch_locks(
 /// ([`crate::bazel::pnpm::Hubs::hidden`]), the build would fail on the
 /// pinned lock: the root locks are left out and the run refuses every pin
 /// in them (see [`withhold_root_pnpm_locks`]). That answer is about a pin
-/// in the root lock, so a project without that lock gets none. Nothing of
-/// Bazel is read for a project with no pnpm lock at all.
+/// in the root lock, so a project without that lock gets none, and nothing
+/// of Bazel is read for a project with no pnpm lock at all: both are
+/// decided where the answer is read ([`crate::bazel::pnpm::hubs`]).
 async fn read_pnpm_bazel(view: &ProjectView<'_>, root: bool, out: &mut CandidateFiles) {
-    if !root && out.pnpm_member_lock_keys.is_empty() {
-        return;
-    }
-    let mut locks = vec![ROOT_PNPM_LOCKS[0].to_string()];
-    locks.extend(out.pnpm_member_lock_keys.iter().cloned());
-    let mut hubs = crate::bazel::pnpm::hubs(view, &locks).await;
-    if !root {
-        hubs.hidden = None;
-    }
+    let hubs = crate::bazel::pnpm::hubs(view, root, &out.pnpm_member_lock_keys).await;
     if let Some(hidden) = hubs.hidden.clone() {
         withhold_root_pnpm_locks(out, hidden);
     }
     out.pnpm_bazel = hubs;
+}
+
+/// Whether a hosted scan leaves the root pnpm lock of the project of
+/// `view` to a Bazel hub ([`crate::bazel::pnpm::Hubs::hidden`]), for a
+/// caller that reads no other file: the answer [`read_candidate_files`]
+/// gets, with the root lock read as it reads it, so that a scan which
+/// crawls nothing and one which crawls a package decide alike.
+pub async fn pnpm_root_lock_left_to_bazel(view: &ProjectView<'_>) -> Option<RewriteWarning> {
+    let mut out = CandidateFiles::default();
+    let root = out.read(view, &BTreeSet::new(), ROOT_PNPM_LOCKS[0]).await;
+    crate::bazel::pnpm::hubs(view, root, &[]).await.hidden
 }
 
 /// The root pnpm locks (see [`withhold_root_pnpm_locks`]).

@@ -1738,6 +1738,63 @@ async fn a_hosted_scan_leaves_a_lock_to_its_bazel_hub_whatever_it_is_granted() {
     }
 }
 
+/// Whether a hosted scan leaves a route to a Bazel hub is one answer,
+/// whatever the scan crawled. A hub that would fail on a pin in the root
+/// lock stands against nothing in a workspace that has no root lock: what
+/// a route left in a member's own lock is tidied, by the scan that crawls
+/// a package and is granted nothing and by the one that crawls nothing,
+/// and neither says that a lock which is not there "was not rewritten".
+#[tokio::test]
+async fn a_hub_of_a_root_lock_that_is_not_there_stands_against_no_cleanup() {
+    const B: &str = "packages/b/pnpm-lock.yaml";
+    const BARE: &str = "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n";
+    let server = MockServer::start().await;
+    mock_api(&server, &[], &[]).await;
+    for crawled in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("package.json", r#"{"name":"app","private":true}"#);
+        write(
+            "pnpm-workspace.yaml",
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        );
+        write("packages/b/package.json", r#"{"name":"b"}"#);
+        let record = "overrides:\n  leaf@1.0.0: socket-11111111:1.0.0\n\nimporters:\n";
+        write(B, &BARE.replace("importers:\n", record));
+        write("MODULE.bazel", HIDING_HUB);
+        if crawled {
+            write(
+                "node_modules/other/package.json",
+                r#"{"name":"other","version":"1.0.0"}"#,
+            );
+        }
+        let (code, doc) = scan_hosted(root, &server, &[]);
+        assert_eq!(code, Some(0), "crawled {crawled}: {doc}");
+        let scanned = doc["scannedPackages"].as_u64();
+        assert_eq!(
+            scanned,
+            Some(u64::from(crawled)),
+            "crawled {crawled}: {doc}"
+        );
+        assert_eq!(
+            entries(&doc, "removed"),
+            [entry(B, "lockOverride", "leaf@1.0.0")],
+            "crawled {crawled}: {doc}"
+        );
+        let warned = doc["warnings"].to_string();
+        assert!(
+            !warned.contains("redirect_pnpm_bazel_workspace_hidden"),
+            "crawled {crawled}: {doc}"
+        );
+        assert_eq!(read(root, B).as_deref(), Some(BARE), "crawled {crawled}");
+    }
+}
+
 // ── what a person is told ────────────────────────────────────────────────
 
 /// (4) Without `--json` each removal is a line, in `repair` and in a

@@ -166,12 +166,34 @@ pub enum Reader {
     Unseen(String),
 }
 
+/// What the Bazel workspace says of the pnpm locks of the project of
+/// `view`, as hosted mode acts on it: of its root `pnpm-lock.yaml` (`root`:
+/// whether the project has one that was read) and of the members' own
+/// locks (`members`, paths from the project).
+///
+/// The one place that decides it, for every caller. A project with no
+/// pnpm lock is asked nothing: no Bazel file is read for it. And
+/// [`Hubs::hidden`] is about a pin in the root lock, so a project without
+/// that lock has none, whatever the hub names.
+pub async fn hubs(view: &ProjectView<'_>, root: bool, members: &[String]) -> Hubs {
+    if !root && members.is_empty() {
+        return Hubs::default();
+    }
+    let mut locks = vec![LOCK.to_string()];
+    locks.extend(members.iter().cloned());
+    let mut hubs = read(view, &locks).await;
+    if !root {
+        hubs.hidden = None;
+    }
+    hubs
+}
+
 /// What the Bazel workspace the project of `view` is in says of its pnpm
 /// locks `locks` (paths from the project): on disk the workspace of
 /// [`super::bazel_root`], read off the async runtime, in memory the
 /// project itself, whose files are all there is. Nothing outside a Bazel
 /// workspace.
-pub async fn hubs(view: &ProjectView<'_>, locks: &[String]) -> Hubs {
+async fn read(view: &ProjectView<'_>, locks: &[String]) -> Hubs {
     match *view {
         ProjectView::Memory(project) => answer(&memory(project), "", locks),
         _ => {
@@ -194,9 +216,9 @@ pub async fn hubs(view: &ProjectView<'_>, locks: &[String]) -> Hubs {
     }
 }
 
-/// [`Hubs::hidden`] alone, for a caller that asks nothing else.
+/// [`Hubs::hidden`] of a project with a root lock, and nothing else.
 pub async fn hidden(view: &ProjectView<'_>) -> Option<RewriteWarning> {
-    hubs(view, &[]).await.hidden
+    hubs(view, true, &[]).await.hidden
 }
 
 /// [`hubs`] for the project in the directory `project` (from the Bazel
@@ -1359,13 +1381,19 @@ mod tests {
         );
         assert_eq!(hidden(&ProjectView::Memory(&project)).await, Some(on_disk));
         // One read answers both questions, on disk and in memory alike.
-        let locks = [LOCK.to_string()];
-        let disk = hubs(&ProjectView::Disk(dir.path()), &locks).await;
+        let disk = hubs(&ProjectView::Disk(dir.path()), true, &[]).await;
         assert_eq!(
             disk.reader,
             Some(Reader::Call("MODULE.bazel:4".to_string()))
         );
         assert_eq!(disk.hidden, hidden(&ProjectView::Disk(dir.path())).await);
-        assert_eq!(hubs(&ProjectView::Memory(&project), &locks).await, disk);
+        assert_eq!(hubs(&ProjectView::Memory(&project), true, &[]).await, disk);
+        // No root lock: nothing to keep out of a run, and the call is
+        // still the reader of a member's lock. No pnpm lock: nothing asked.
+        let member = ["packages/a/pnpm-lock.yaml".to_string()];
+        let lockless = hubs(&ProjectView::Memory(&project), false, &member).await;
+        assert_eq!((lockless.hidden, lockless.reader), (None, disk.reader));
+        let none = hubs(&ProjectView::Memory(&project), false, &[]).await;
+        assert_eq!(none, Hubs::default());
     }
 }
