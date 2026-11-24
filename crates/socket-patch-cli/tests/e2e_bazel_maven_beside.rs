@@ -431,26 +431,24 @@ fn a_maven_project_no_hub_builds_reports_as_without_bazel() {
     }
 }
 
-#[test]
-fn a_hub_that_pins_the_artifact_adds_one_warning_and_nothing_else() {
+/// Every command of [`COMMANDS`] in the checkout with the Bazel files
+/// `bazel` is the command of the same checkout without them, with one
+/// warning more: the code and the detail that `warning` gives for the
+/// command's arguments.
+fn adds_one_warning(bazel: &Files, warning: &dyn Fn(&[&str]) -> (&'static str, String)) {
     let machine = Machine::start();
-    let [plain, _, _, hub] = checkouts();
+    let [plain, ..] = checkouts();
     for args in COMMANDS {
         let (without, beside) = (
             machine.run(&plain, true, args),
-            machine.run(&hub, true, args),
+            machine.run(bazel, true, args),
         );
         assert_eq!(
             (beside.code, &beside.wrote),
             (without.code, &without.wrote),
             "{args:?}: {beside:?}"
         );
-        // An agent run patches no hub. A hosted run would, and says why it
-        // does not here: nothing in this checkout names its Bazel.
-        let (code, detail) = match args[0] {
-            "get" => ("maven_bazel_release", declined(NO_RELEASE)),
-            _ => ("maven_bazel_hub_unpatched", HUB_WARNING.to_string()),
-        };
+        let (code, detail) = warning(args);
         if args.contains(&"--json") {
             let (mut said, mut expected) = (beside.envelope(), without.envelope());
             let warning = json!({ "code": code, "detail": detail });
@@ -482,6 +480,40 @@ fn a_hub_that_pins_the_artifact_adds_one_warning_and_nothing_else() {
                 "{args:?}: {beside:?}"
             );
         }
+    }
+}
+
+#[test]
+fn a_hub_that_pins_the_artifact_adds_one_warning_and_nothing_else() {
+    let [.., hub] = checkouts();
+    // An agent run patches no hub. A hosted run would, and says why it
+    // does not here: nothing in this checkout names its Bazel.
+    adds_one_warning(&hub, &|args| match args[0] {
+        "get" => ("maven_bazel_release", declined(NO_RELEASE)),
+        _ => ("maven_bazel_hub_unpatched", HUB_WARNING.to_string()),
+    });
+}
+
+/// A workspace with a file its reader cannot have, and no hub that holds
+/// the artifact: each command says that it could not tell whether a hub
+/// builds the jar, and does what it does without Bazel. So it is in a
+/// workspace that names the ruleset of a Maven hub, and in one that names
+/// only another ruleset's.
+#[test]
+fn a_workspace_that_is_not_read_adds_one_warning_whatever_its_ruleset() {
+    let named = "bazel_dep(name = \"rules_jvm_external\", version = \"7.2\")\n\
+                 include(\"//:more.MODULE.bazel\")\n";
+    let named = vec![("MODULE.bazel", named.to_string())];
+    for (bazel, line) in [(named, 2), (unread_other(), 6)] {
+        let unread = format!(
+            "socket-patch could not tell whether Bazel takes this artifact from a \
+             rules_jvm_external hub: more.MODULE.bazel: it does not exist; MODULE.bazel:{line} \
+             includes it"
+        );
+        adds_one_warning(&bazel, &|args| match args[0] {
+            "get" => ("maven_bazel_unreadable", declined(&unread)),
+            _ => ("maven_bazel_unreadable", format!("{PURL}: {unread}")),
+        });
     }
 }
 

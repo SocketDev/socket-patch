@@ -1564,6 +1564,51 @@ fn vendored_mode_goes_on_outside_bazel_and_on_the_users_word() {
     reverts(ALLOW);
 }
 
+/// Without a Bazel: a project that a release before the refusal vendored,
+/// in a checkout with a Bazel workspace file that no Bazel builds it from.
+/// Its lock names the copy of the patch of then. A newer patch of the
+/// package is declined, by the scan in vendored mode and by the scan that
+/// names no mode, which such a pipeline runs: each exits 1 where it exited
+/// 0, writes nothing and fetches nothing, and the older copy stays.
+#[test]
+fn a_project_vendored_by_an_earlier_release_is_declined_a_newer_patch() {
+    let (flow, newer) = checkout(&[]);
+    let (cell, upstream) = (&flow.cell, &flow.upstream);
+    let older = Patched::new();
+    let then = registry(upstream);
+    grant(&then, upstream, &older, &older.package);
+    let earlier = socket_patch(cell, &then, API, &VENDORED);
+    assert_eq!(earlier.code, 0, "{}", earlier.dump);
+    cell.write("MODULE.bazel", "");
+    let vendored = cell.tree();
+    let lock: Value = serde_json::from_slice(&vendored[&lock_of(API)]).expect("a lock");
+    assert_eq!(lock["packages"][0]["dist"]["url"], copy_of(&older).as_str());
+
+    for scan in [&VENDORED[..], &["scan", "--yes"]] {
+        declines(&flow, API, scan, 1, "failed", &vendored);
+    }
+    assert_eq!(flow.standin.asked(&newer.route), 0);
+}
+
+/// Without a Bazel: a regular file named `workspace`, in lower case, at
+/// the root of a checkout that has no Bazel file. On a disk that folds
+/// case it is what a lookup of `WORKSPACE` finds, and vendored mode
+/// declines the project; on a disk that does not, the project is vendored.
+/// The test asks the disk which of the two it runs on and says so.
+#[test]
+fn a_file_named_workspace_in_lower_case_declines_where_the_disk_folds_case() {
+    let (flow, patch) = checkout(&["workspace"]);
+    let before = flow.cell.tree();
+    let folds = flow.cell.path("WORKSPACE").is_file();
+    if folds {
+        declines(&flow, API, &VENDORED, 1, "failed", &before);
+    } else {
+        vendors(&flow, API, &patch, &before, &[]);
+    }
+    let ran = ["does not fold case: vendored", "folds case: declined"][usize::from(folds)];
+    println!("a file named `workspace`: the disk {ran}");
+}
+
 /// Without a Bazel, a PHP or a Composer: the fixture's directories and the
 /// legs of its workflow are those of its table. The fixture commits no
 /// lock, no `vendor/` tree and no root `BUILD.bazel`: the run makes them.
