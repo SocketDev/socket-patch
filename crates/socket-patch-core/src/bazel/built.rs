@@ -265,7 +265,9 @@ pub type Reader = Result<Unbuilt, Doubt>;
 /// The call of the workspace `root` that hands Bazel one of `locks`: files
 /// of the project in that workspace, each by its path from the project,
 /// which vendored mode would rewrite for a package of `ecosystem` (the type
-/// of its purls). Or the doubt that leaves that open. `None` when the
+/// of its purls), or the doubt that leaves that open. A requirements file
+/// that a call names hands Bazel each file its `-r` includes reach as
+/// well, and is then the file returned. `None` when the
 /// calls of the hub are read with certainty and name other files, and when
 /// nothing shows that the workspace may call it: no call of the hub and no
 /// file that names its ruleset, with a root module file and a `WORKSPACE`
@@ -276,16 +278,33 @@ pub async fn reader(
     locks: Vec<String>,
 ) -> Option<Reader> {
     let (dir, project) = (root.dir.clone(), slashed(&root.project));
-    run_blocking(move || reads(&Workspace::read(&disk(&dir)), &project, ecosystem, &locks)).await
+    run_blocking(move || {
+        let read = |file: &str| lock_text(&dir, file);
+        reads(
+            &Workspace::read(&disk(&dir)),
+            &project,
+            ecosystem,
+            &locks,
+            &read,
+        )
+    })
+    .await
+}
+
+/// The path from the Bazel root `root` of `file`, a path from its project.
+pub(crate) fn from_root(root: &BazelRoot, file: &str) -> String {
+    below(&slashed(&root.project), file)
 }
 
 /// [`reader`] for the workspace `workspace` and the project in its
-/// directory `project` (empty: the root itself).
+/// directory `project` (empty: the root itself), with `read` for the text
+/// of a file of the workspace.
 fn reads(
     workspace: &Workspace,
     project: &str,
     ecosystem: &str,
     locks: &[String],
+    read: &dyn Fn(&str) -> Option<String>,
 ) -> Option<Reader> {
     let hub = HUBS.iter().find(|hub| hub.ecosystem == ecosystem)?;
     let tags = workspace.tags(&hub.extension, hub.tag);
@@ -310,15 +329,17 @@ fn reads(
     for (file, call, name, main) in tagged.chain(legacy) {
         called = true;
         let own = |lock: &String| locks.iter().any(|own| below(project, own) == *lock);
-        if let Some(lock) = files(workspace, call, hub.files, main)
-            .into_iter()
-            .find(own)
-        {
+        let named = files(workspace, call, hub.files, main);
+        // A requirements file that brings one of the locks in with `-r`
+        // hands the hub that lock as well.
+        let includes = |lock: &&String| ecosystem == "pypi" && includes_one(lock, &own, read);
+        let found = named.iter().find(|lock| own(lock));
+        if let Some(lock) = found.or_else(|| named.iter().find(includes)) {
             return Some(Ok(Unbuilt {
                 call: name.to_string(),
                 file: file.to_string(),
                 line: call.line,
-                lock,
+                lock: lock.clone(),
             }));
         }
         let written = |file: &&str| {
@@ -367,6 +388,34 @@ pub(crate) fn hub_calls<'w>(
     let tags = workspace.tags(&hub.extension, hub.tag);
     let named = |tag: Tag<'w>| (tag, files(workspace, tag.call, hub.files, None));
     (tags.calls.into_iter().map(named).collect(), tags.doubts)
+}
+
+/// Whether the requirements file `start` (a path from the Bazel root)
+/// brings in a file for which `own` holds, through its `-r` includes and
+/// theirs, each read with `read`. An include that cannot be read brings in
+/// nothing that can be seen.
+fn includes_one(
+    start: &str,
+    own: &dyn Fn(&String) -> bool,
+    read: &dyn Fn(&str) -> Option<String>,
+) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![start.to_string()];
+    while let Some(file) = stack.pop() {
+        if !seen.insert(file.clone()) {
+            continue;
+        }
+        let Some(text) = read(&file) else {
+            continue;
+        };
+        for include in crate::vendor::pypi_requirements::requirements_includes(&file, &text) {
+            if own(&include) {
+                return true;
+            }
+            stack.push(include);
+        }
+    }
+    false
 }
 
 /// The name a `workspace(name = ...)` call gives the main repository.
@@ -1035,7 +1084,8 @@ use_repo(ruby, "bundle")
             None => Entry::Absent,
         });
         let locks: Vec<String> = locks.iter().map(|lock| lock.to_string()).collect();
-        match reads(&workspace, project, ecosystem, &locks) {
+        let read = |path: &str| text(path).map(|(_, text)| text.to_string());
+        match reads(&workspace, project, ecosystem, &locks, &read) {
             Some(Ok(by)) => format!("{} {}:{} {}", by.call, by.file, by.line, by.lock),
             Some(Err(doubt)) => format!("? {}:{} {}", doubt.file, doubt.line, doubt.why),
             None => String::new(),
@@ -1100,6 +1150,26 @@ use_repo(ruby, "bundle")
         assert_eq!(reader_of(&files, "api", "pypi", &["requirements.txt"]), "");
         assert_eq!(gem("api", &["requirements.txt"]), "");
         assert_eq!(reader_of(&SHOP, "api", "cargo", &["requirements.txt"]), "");
+    }
+
+    /// A requirements file a call names that brings a lock of the project
+    /// in with `-r`, directly or through another include, hands the hub
+    /// that lock: the call is found, with the file it names. An include
+    /// that reaches no lock of the project, or a Gemfile, is not.
+    #[test]
+    fn a_hub_file_that_includes_a_lock_of_the_project_is_found() {
+        let parent = "api/requirements.txt";
+        let mut files = with(parent, "-r requirements/all.txt\n");
+        files.push(("api/requirements/all.txt", "-r ../base.txt\n-r dev.txt\n"));
+        files.push(("api/requirements/dev.txt", "-r all.txt\n"));
+        let api = "pip.parse MODULE.bazel:15 api/requirements.txt";
+        assert_eq!(reader_of(&files, "api", "pypi", &["base.txt"]), api);
+        let all = ["requirements/all.txt"];
+        assert_eq!(reader_of(&files, "api", "pypi", &all), api);
+        assert_eq!(reader_of(&files, "api", "pypi", &["other.txt"]), "");
+        let mut files = with("billing/Gemfile.lock", "-r Gemfile.other\n");
+        files.push(("billing/Gemfile", "-r Gemfile.other\n"));
+        assert_eq!(reader_of(&files, "billing", "gem", &["Gemfile.other"]), "");
     }
 
     /// Where the workspace calls the hub and what a call names cannot be
