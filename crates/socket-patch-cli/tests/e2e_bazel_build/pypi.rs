@@ -55,6 +55,12 @@
 //! that hosted mode, which the refusal and the document name, ends in the
 //! patched build and in a document that says not affected.
 //!
+//! What makes a vendored copy that rules_python does build is in
+//! [`vendored_download_cache`]: hosted mode's pin, the patched wheel
+//! committed where a `--distdir` line of `.bazelrc` makes Bazel look for
+//! its downloads, and so a build that needs no patch host. That flow
+//! writes the copy and the line by hand.
+//!
 //! One loopback server stands in for four hosts. The Socket API and the
 //! patch host answer at their own paths; `pypi.org` (the project pages of
 //! the index, and the JSON document `rollback` reads through
@@ -570,7 +576,14 @@ fn hosted_pip_parse() {
 /// hashes of the module it changes. Vendored mode holds the wheel it
 /// downloads to that record.
 struct Vendoring {
+    /// The index, and with [`Vendoring::new`] the Socket API and the patch
+    /// host as well.
     standin: StandIn,
+    /// With [`Vendoring::apart`], the Socket API and the patch host on a
+    /// server of their own, until [`Vendoring::stop`].
+    host: Option<StandIn>,
+    /// The origin of the Socket API and the patch host.
+    origin: String,
     /// The id of the run and of its patch.
     uuid: String,
     wheels: [Wheel; 2],
@@ -591,19 +604,31 @@ fn vendored_line(copy: &str, wheel: &Wheel) -> String {
 
 impl Vendoring {
     fn new() -> Vendoring {
+        Vendoring::on(None)
+    }
+
+    /// [`Vendoring::new`] with the Socket API and the patch host on a
+    /// server of their own, which a flow can stop while the index goes on
+    /// answering.
+    fn apart() -> Vendoring {
+        Vendoring::on(Some(StandIn::alone()))
+    }
+
+    fn on(host: Option<StandIn>) -> Vendoring {
         let uuid = uuid::Uuid::new_v4().to_string();
         let wheels = upstream(&uuid);
         let marker = format!("PATCHED {uuid}");
         let patched = package(&marker, &uuid);
-        let standin = StandIn::start();
-        wheels.iter().for_each(|wheel| publish(&standin, wheel));
-        standin.serve(5, OTHER_PROJECTS, NO_FILES.as_bytes());
+        let index = StandIn::start();
+        wheels.iter().for_each(|wheel| publish(&index, wheel));
+        index.serve(5, OTHER_PROJECTS, NO_FILES.as_bytes());
+        let standin = host.as_ref().unwrap_or(&index);
         // Vendored mode downloads the wheel itself, and takes it only by
         // its sha512.
         let sha512 =
             base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&patched.bytes));
         let sums = json!({ "sha256": patched.sha256, "sha512": format!("sha512-{sha512}") });
-        let route = grant_by(&standin, &uuid, &patched, sums);
+        let route = grant_by(standin, &uuid, &patched, sums);
         standin.serve(5, &route, &patched.bytes);
         let hash = |marker: &str| compute_git_sha256_from_bytes(module(marker, &uuid).as_bytes());
         let record = json!({
@@ -623,8 +648,11 @@ impl Vendoring {
         });
         let record_route = format!("/v0/orgs/{ORG}/patches/view/{uuid}");
         standin.serve(1, &record_route, record.to_string().as_bytes());
+        let origin = standin.origin();
         Vendoring {
-            standin,
+            standin: index,
+            host,
+            origin,
             uuid,
             wheels,
             patched,
@@ -641,13 +669,26 @@ impl Vendoring {
 
     /// [`Vendoring::run`] with the variables `more` as well.
     fn run_with(&self, cell: &Cell, args: &[&str], more: &[(&str, &str)]) -> Ran {
-        let origin = self.standin.origin();
-        let json_api = format!("{origin}/{INDEX}/pypi");
+        let origin = &self.origin;
+        let json_api = format!("{}/{INDEX}/pypi", self.standin.origin());
         let env = [
             ("SOCKET_PATCH_SERVER_URL", origin.as_str()),
             ("SOCKET_PYPI_JSON_API", json_api.as_str()),
         ];
-        cell.socket_patch(&origin, args, &[&env[..], more].concat())
+        cell.socket_patch(origin, args, &[&env[..], more].concat())
+    }
+
+    /// How often the patched wheel was asked for at the patch host.
+    fn fetched(&self) -> usize {
+        let host = self.host.as_ref().unwrap_or(&self.standin);
+        host.asked(&self.route)
+    }
+
+    /// Stop the patch host of [`Vendoring::apart`], and the Socket API
+    /// with it: the index goes on answering.
+    fn stop(&mut self) {
+        let host = self.host.take().expect("a host apart from the index");
+        host.stop();
     }
 }
 
@@ -856,6 +897,141 @@ fn vendored_pip_parse() {
          vendored the wheel and the build failed ({named}), while every form of `vex` said the \
          package is affected; after `vendor --revert` it built {UNPATCHED:?} again, and after \
          `scan --mode hosted` {marker:?}, and `vex` said it is not affected; {:?}",
+        started.elapsed()
+    );
+}
+
+/// The comment line above a `--distdir` line of `.bazelrc`.
+const CACHE_COMMENT: &str = "# socket-patch: the committed copy of a patched wheel, for \
+    Bazel's downloads (to opt out, comment out the next line)";
+
+/// Give the checkout of `cell` a `--distdir` of the user's own: a
+/// directory of downloads, and its line at the end of `.bazelrc`.
+fn has_a_distdir_of_its_own(cell: &Cell) {
+    cell.write("third_party/distfiles/notes.txt", "downloads of our own\n");
+    let rc = String::from_utf8(cell.tree()[".bazelrc"].clone()).expect("a text file");
+    cell.write(
+        ".bazelrc",
+        format!("{rc}common --distdir=third_party/distfiles\n"),
+    );
+}
+
+/// A download cache for the patch of `with`, in the checkout of `cell`
+/// whose `requirements.txt` holds hosted mode's pin of the package: the
+/// patched wheel under `.socket/vendor/pypi/<uuid>`, by the name its URL
+/// ends in, and at the end of `.bazelrc` a comment line and the line that
+/// makes that directory one Bazel looks in before it downloads. Bazel
+/// takes a file from there by the name of the download and its sha256,
+/// which the pin holds. Gives the path of the wheel.
+fn caches_the_wheel(cell: &Cell, with: &Vendoring) -> String {
+    let dir = format!(".socket/vendor/pypi/{}", with.uuid);
+    let copy = format!("{dir}/{}", with.patched.filename());
+    cell.write(&copy, &with.patched.bytes);
+    let rc = String::from_utf8(cell.tree()[".bazelrc"].clone()).expect("a text file");
+    assert!(rc.ends_with('\n'), "{rc:?}");
+    cell.write(
+        ".bazelrc",
+        format!("{rc}{CACHE_COMMENT}\ncommon --distdir={dir}\n"),
+    );
+    copy
+}
+
+/// The patched wheel committed as a download cache of Bazel, beside a hub
+/// that reads `requirements.txt`. The files are written by hand here: the
+/// flow shows what Bazel makes of them. The checkout has a `--distdir` of
+/// the user's own in its `.bazelrc` from the start.
+///
+/// - (a) `bazel build` and `bazel run //:consumer` print the unpatched
+///   marker.
+/// - (b) `scan --mode hosted --yes` pins the patch in `requirements.txt`,
+///   as a direct reference to the wheel on the patch host with its sha256.
+///   By hand ([`caches_the_wheel`]): the wheel is copied to
+///   `.socket/vendor/pypi/<uuid>/`, and `.bazelrc` gets
+///   `common --distdir=.socket/vendor/pypi/<uuid>` under a comment line.
+///   Nothing has fetched the wheel: the patch host was not asked for it,
+///   and Bazel's repository cache does not hold it. The patch host is then
+///   stopped. The index goes on answering, since a hub asks it about the
+///   other packages of the lock.
+/// - (c) On a second machine (a new output base), with one byte of the
+///   committed copy changed: the build fails. Bazel passes over a copy
+///   whose sha256 is not the pin's, and asks the patch host, which does
+///   not answer.
+/// - (d) On a third machine, with the copy as it was committed: the two
+///   Bazel commands print the patched marker, although the patch host is
+///   stopped. The repository cache holds the wheel afterwards, and Bazel
+///   changed no file of the checkout but its own lock, as in hosted mode.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn vendored_download_cache() {
+    let test = "pypi::vendored_download_cache";
+    let started = Instant::now();
+    let Some(mut cell) = Cell::open(test, &FIXTURE) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let mut with = Vendoring::apart();
+    cell.route_downloads(&downloads(&with.standin.origin(), &with.wheels));
+    cell.write(REQUIREMENTS, requirements(&with.wheels));
+    has_a_distdir_of_its_own(&cell);
+    let marker = format!("OUT: PATCHED {}", with.uuid);
+    let sha256 = with.patched.sha256.clone();
+
+    // (a) The unpatched build.
+    let before = cell.builds_unpatched(UNPATCHED);
+
+    // (b) Hosted mode's pin, then the copy and the line by hand.
+    let hosted = with.run(&cell, &["scan", "--mode", "hosted", "--yes"]);
+    let pinned = cell.pinned_by(&hosted, PURL, &with.uuid, &before, &[REQUIREMENTS]);
+    let [dependency, _] = &with.wheels;
+    let direct = format!("{NAME} @ {}{}", with.origin, with.route);
+    assert_eq!(
+        String::from_utf8_lossy(&pinned[REQUIREMENTS]),
+        format!(
+            "{}{direct} --hash=sha256:{sha256}\n",
+            dependency.requirement()
+        ),
+        "{test}"
+    );
+    let copy = caches_the_wheel(&cell, &with);
+    let cached = cell.tree();
+    assert_eq!(changed(&pinned, &cached), [".bazelrc", &copy], "{test}");
+    assert_eq!(with.fetched(), 0, "{test}: the patch host served the wheel");
+    assert!(
+        !cell.cached(&sha256),
+        "{test}: the repository cache holds it"
+    );
+    with.stop();
+
+    // (c) One changed byte, on a machine that has built nothing. The
+    // message names the URL of the pin; a console may break it.
+    let twin = cell.twin();
+    let mut bytes = with.patched.bytes.clone();
+    bytes[0] ^= 1;
+    twin.write(&copy, bytes);
+    let build = twin.bazel("build", &[CONSUMER]);
+    let squeezed = |text: &str| text.split_whitespace().collect::<String>();
+    assert!(
+        !build.ok() && squeezed(&build.stderr()).contains(&squeezed(&with.route)),
+        "{test}: the build with a changed copy did not fail on the download of the wheel:\n{}",
+        build.dump()
+    );
+    assert!(!twin.cached(&sha256), "{test}: {}", build.dump());
+    drop(twin);
+
+    // (d) The copy as committed, on a machine that has built nothing.
+    let twin = cell.twin();
+    twin.builds(&marker);
+    assert!(twin.cached(&sha256), "{test}: Bazel did not keep the wheel");
+    let recorded = cell.numbers() >= (8, 5, 0);
+    let bazel_rewrites: &[&str] = if recorded { &[LOCK] } else { &[] };
+    assert_eq!(changed(&cached, &twin.tree()), bazel_rewrites, "{test}");
+
+    println!(
+        "{test}: Bazel {release} built {UNPATCHED:?}; with hosted mode's pin, the wheel copied \
+         to {copy} and `common --distdir` in .bazelrc, and the patch host stopped, a new output \
+         base failed on a copy with one changed byte and built {marker:?} from the copy as \
+         committed, with no request for the wheel; Bazel rewrote {bazel_rewrites:?} itself; \
+         {:?}",
         started.elapsed()
     );
 }

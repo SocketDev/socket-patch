@@ -742,9 +742,31 @@ impl StandIn {
         StandIn { server, runtime }
     }
 
+    /// A stand-in on a listener of its own, for a host that a flow stops:
+    /// [`StandIn::stop`] closes it. The listener of [`StandIn::start`] is
+    /// one of a pool, which goes on answering after its stand-in is gone.
+    pub fn alone() -> StandIn {
+        let mut standin = StandIn::start();
+        standin.server = standin.runtime.block_on(MockServer::builder().start());
+        standin
+    }
+
     /// `http://127.0.0.1:<port>`.
     pub fn origin(&self) -> String {
         self.server.uri()
+    }
+
+    /// Stop the host of [`StandIn::alone`]: from here on a connection to
+    /// its origin is refused.
+    pub fn stop(self) {
+        let address = *self.server.address();
+        drop(self);
+        let refused = || std::net::TcpStream::connect(address).is_err();
+        let stopped = (0..200).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            refused()
+        });
+        assert!(stopped, "the stand-in at {address} still answers");
     }
 
     /// Answer `GET <route>` with `body`. A route nobody serves is a 404.
@@ -960,6 +982,15 @@ impl Cell {
     /// The path of `rel` in the workspace copy.
     pub fn path(&self, rel: &str) -> PathBuf {
         self.scratch.workspace.join(rel)
+    }
+
+    /// Whether Bazel's repository cache holds a download with `sha256`, in
+    /// hex. The cache keeps every download that has a checksum, and hands
+    /// it to the next build without a request, on any machine that shares
+    /// the cache ([`Cell::twin`]).
+    pub fn cached(&self, sha256: &str) -> bool {
+        let entry = format!("content_addressable/sha256/{sha256}/file");
+        self.scratch.repository_cache.join(entry).is_file()
     }
 
     /// Every regular file of the workspace copy. Bazel's `bazel-*` links
