@@ -2401,6 +2401,11 @@ what hosted mode writes. That holds for every hosted scan, whatever it was grant
 with a patch for a package of the lock, one with none and one that crawled nothing all
 leave the files and give the same warning. `repair`, `scan --prune` with no mode,
 `rollback` and `remove` settle a route from the lockfiles alone and work as without Bazel.
+They read no Bazel file, for this route as for any other hosted pin: under a hub whose
+`data` lists a `pnpm-workspace.yaml` that a routed scan created, they still delete that
+file with the last of the route, and the build is then handed a missing file. Put a
+comment line in the file first, as the warning of a hosted scan says; a hosted scan itself
+never deletes the file under a hub that reads, or may read, the lock.
 
 The file the hub lists has to be one that a pin and its undo leave standing, so hosted mode
 also writes nothing for a hub that lists it in two cases, and the warning then names what
@@ -2461,9 +2466,11 @@ build fails as above. Not read either is a `trustLockfile` that reaches the pnpm
 build another way (`pnpm_config_trust_lockfile` in Bazel's environment): hosted mode
 withholds there as well. Not read either: a hub that names the lock of a workspace member
 (`pnpm_lock = "//packages/a:pnpm-lock.yaml"`), which is pinned as without Bazel. The
-in-memory engine reads the Bazel files beside the lock (`MODULE.bazel`, the
-`*.MODULE.bazel` files it can include and the `WORKSPACE` files) and gives the answer of a
-checkout with the same files; it sees no Bazel root above the project and no
+in-memory engine reads the Bazel files beside the lock or beside a `pnpm-workspace.yaml`
+(`MODULE.bazel`, the `*.MODULE.bazel` files it can include and the `WORKSPACE` files) and
+gives the answer of a checkout with the same files; it sees no Bazel root above the
+project, for the pin and for the route through a named registry alike (a project in a
+directory of a Bazel workspace is routed in memory where a checkout is not), and no
 `MODULE.bazel.lock`, and a `pnpm_version_from` file that is not among the project's own
 manifests reads there as a release that is not written out, so a lock that a checkout pins
 can be left as it is in memory. Nor does hosted mode look at `--no-trust-lockfile-config`

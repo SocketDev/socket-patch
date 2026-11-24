@@ -54,10 +54,12 @@
 //! the pnpm 11 of the tag `pnpm` under the name `eleven`).
 //!
 //! In memory the workspace is the project's own files: path selection
-//! asks for the `MODULE.bazel` beside a `pnpm-lock.yaml`, for the files
-//! one can include and for the `WORKSPACE` files, and the answer is the
-//! one of a checkout with the same files. A Bazel root above the project
-//! is not seen there. A
+//! asks for the `MODULE.bazel` beside a `pnpm-lock.yaml` or a
+//! `pnpm-workspace.yaml`, for the files one can include and for the
+//! `WORKSPACE` files, and the answer is the one of a checkout with the
+//! same files. A Bazel root above the project is not seen there, for
+//! either answer of this module: a project in a directory of a Bazel
+//! workspace is pinned, and routed, in memory as if it were in none. A
 //! `pnpm_version_from` file that was not handed in (one outside the
 //! project's own manifests) and `MODULE.bazel.lock` are not there either:
 //! the first reads as a release that is not written out, so a lock that a
@@ -164,6 +166,11 @@ pub enum Reader {
     /// taking the route costs no patch: the project gets the pin it gets
     /// today. So the route is taken only where it is certain that no hub
     /// reads a lock.
+    ///
+    /// Certain of the files that were read, that is. On disk those are the
+    /// files of the Bazel workspace the project is in. In memory they are
+    /// the project's own, so a hub in a Bazel root above the project is
+    /// seen by neither answer there (the module docs).
     Unseen(String),
 }
 
