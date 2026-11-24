@@ -3,7 +3,8 @@
 //! reads (`REDIRECT_CANDIDATE_FILES`, Python lock / script pairs, Cargo
 //! member manifests, Rush locks, pnpm workspace members' own locks, the
 //! install-policy configs, the
-//! Plug'n'Play markers and the vendored ledger), plus one
+//! Plug'n'Play markers, the `MODULE.bazel` beside a pnpm lock and the
+//! vendored ledger), plus one
 //! presence-only Maven / NuGet marker per ecosystem so a repo holding only
 //! those still gets its `ecosystem_unsupported_in_memory` warning.
 
@@ -151,8 +152,13 @@ fn is_rush_subspace_file(rel: &str, basename: &str) -> bool {
 
 /// What `rel` (relative to a root whose files are `root_files`) is needed
 /// for. `user_patches` says whether npm is selected, so the files only the
-/// npm user-patch walk reads ([`user_patch_need`]) are fetched at all.
-fn classify(rel: &str, root_files: &BTreeSet<&str>, user_patches: bool) -> Option<Need> {
+/// npm user-patch walk reads ([`user_patch_need`]) are fetched at all, and
+/// `gems` whether gem is, for the files only the gem rewriter is handed.
+fn classify(
+    rel: &str,
+    root_files: &BTreeSet<&str>,
+    (user_patches, gems): (bool, bool),
+) -> Option<Need> {
     if rel == BUN_LOCKB {
         return Some(Need::Binary);
     }
@@ -161,6 +167,16 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>, user_patches: bool) -> Optio
     }
     if PNP_MARKERS.contains(&rel) || rel == "rush.json" {
         return Some(Need::Present);
+    }
+    // Beside a gem lock, the files of a Bazel workspace at this root: they
+    // say whether a rules_ruby hub holds a gem of the lock to a sha256 of
+    // its own (`bazel::ruby`).
+    let locks = ["Gemfile.lock", "gems.locked"];
+    if gems
+        && locks.iter().any(|lock| root_files.contains(lock))
+        && crate::bazel::ruby::is_workspace_file(rel)
+    {
+        return Some(Need::Text);
     }
     if !rel.contains('/') {
         if is_python_lock_name(rel) {
@@ -178,6 +194,11 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>, user_patches: bool) -> Optio
         // [`user_patch_need`]).
         if user_patches && rel.ends_with(".patch") {
             return Some(Need::Present);
+        }
+        // A hub of the Bazel workspace can stand against a pin in the pnpm
+        // lock beside its `MODULE.bazel` ([`crate::bazel::pnpm`]).
+        if rel == "MODULE.bazel" && root_files.contains("pnpm-lock.yaml") {
+            return Some(Need::Text);
         }
         return None;
     }
@@ -471,14 +492,17 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
     // The user-patch walk only protects npm packages: without npm, its
     // nested manifests and `.patch` files would only count against the
     // session's file and byte limits.
-    let user_patches = options
-        .ecosystems
-        .as_deref()
-        .is_none_or(|list| list.iter().any(|e| e == "npm"));
+    let selected = |ecosystem: &str| {
+        let list = options.ecosystems.as_deref();
+        list.is_none_or(|list| list.iter().any(|e| e == ecosystem))
+    };
+    // The same for the files of a Bazel workspace, which only the gem
+    // rewriter is handed.
+    let wanted = (selected("npm"), selected("gem"));
     let mut needs: BTreeMap<String, Need> = BTreeMap::new();
     for (root, files) in &per_root {
         for rel in files {
-            let Some(need) = classify(rel, files, user_patches) else {
+            let Some(need) = classify(rel, files, wanted) else {
                 continue;
             };
             let full = join_root(root, rel);
@@ -596,7 +620,9 @@ pub fn candidate_files() -> Vec<String> {
         "pylock.toml",
         "pylock.*.toml",
         "pnpm-lock.*.yaml (presence only)",
+        "MODULE.bazel (beside pnpm-lock.yaml)",
         "**/Cargo.toml (Cargo workspaces)",
+        "MODULE.bazel, **/*.MODULE.bazel and WORKSPACE files (beside a gem lock)",
     ] {
         out.insert(pattern.to_string());
     }
@@ -848,6 +874,55 @@ mod tests {
         assert_eq!(safe_repo_path("a/b.json").as_deref(), Some("a/b.json"));
         assert_eq!(safe_root_path("").as_deref(), Some(""));
         assert_eq!(safe_root_path("a/").as_deref(), Some("a"));
+    }
+
+    /// Beside a gem lock, the files of a Bazel workspace at that root are
+    /// fetched, with the files a `MODULE.bazel` can include: the engine
+    /// reads which sha256 a rules_ruby hub holds a gem to. No other root
+    /// fetches them.
+    #[test]
+    fn a_gem_root_fetches_the_files_of_its_bazel_workspace() {
+        let bazel = [
+            "MODULE.bazel",
+            "WORKSPACE",
+            "WORKSPACE.bazel",
+            "WORKSPACE.bzlmod",
+            "tools/gems.MODULE.bazel",
+        ];
+        let others = ["MODULE.bazel.lock", "BUILD.bazel", "tools/MODULE.bazel"];
+        let files = bazel.iter().chain(&others).copied();
+        for (lock, fetched) in [
+            ("Gemfile.lock", true),
+            ("gems.locked", true),
+            ("package-lock.json", false),
+        ] {
+            let entries: Vec<_> = files.clone().chain([lock]).map(blob).collect();
+            let s = select_paths(&entries, &SelectOptions::default());
+            assert_eq!(s.roots, vec![""], "{lock}");
+            let mut wanted: Vec<&str> = if fetched { bazel.to_vec() } else { Vec::new() };
+            wanted.push(lock);
+            wanted.sort_unstable();
+            assert_eq!(s.fetch_text, wanted, "{lock}");
+        }
+        // Nor does a run that leaves gem out, whose rewriter is not asked.
+        let both = files.clone().chain(["Gemfile.lock", "package-lock.json"]);
+        let entries: Vec<_> = both.map(blob).collect();
+        let only = |ecosystem: &str| SelectOptions {
+            ecosystems: Some(vec![ecosystem.into()]),
+            ..SelectOptions::default()
+        };
+        let fetched = |ecosystem: &str| {
+            let fetched = select_paths(&entries, &only(ecosystem)).fetch_text;
+            fetched.iter().any(|path| path == "MODULE.bazel")
+        };
+        assert!(fetched("gem") && !fetched("npm"));
+        // A gem root below the Bazel root has no file of the workspace.
+        let entries: Vec<_> = ["MODULE.bazel", "svc/Gemfile.lock"].map(blob).to_vec();
+        let s = select_paths(&entries, &SelectOptions::default());
+        assert_eq!(
+            (s.roots, s.fetch_text),
+            (vec!["svc".into()], vec!["svc/Gemfile.lock".into()])
+        );
     }
 
     #[test]

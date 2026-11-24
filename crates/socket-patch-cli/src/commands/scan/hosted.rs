@@ -141,7 +141,10 @@ fn mirror_pins_not_moved(
                      `socket-patch rollback {}` and then this command again",
                     c.purl,
                     mirror_sources.base(),
-                    c.purl
+                    // As `rollback` selects a hosted pin: no qualifiers.
+                    crate::ui::shell_word(socket_patch_core::utils::purl::strip_purl_qualifiers(
+                        &c.purl
+                    ))
                 ),
             ))
         })
@@ -3291,23 +3294,32 @@ fn format_gem_hold_note(
     if dry_run {
         return Some(note);
     }
-    // The one gem's own purl, when exactly one confirmed pin carries its
-    // name; else the shape of one, for the user to fill in.
+    // The one gem's own pin, when the confirmed pins of its name are one
+    // release; else the shape of one, for the user to fill in. A pin is
+    // named as `rollback` selects it, without the record's qualifiers
+    // (`?platform=ruby` on every gem record): with them the command
+    // matches no hosted pin, and under bash's `nullglob` the unquoted `?`
+    // drops the argument, leaving the bare `rollback` this note must not
+    // give.
     let purl = one.and_then(|name| {
         let prefix = format!("pkg:gem/{name}@");
-        let mut pins = confirmed
+        let mut pins: Vec<&str> = confirmed
             .iter()
-            .map(|(purl, _)| purl.as_str())
-            .filter(|purl| purl.starts_with(&prefix));
-        match (pins.next(), pins.next()) {
-            (Some(purl), None) => Some(purl),
+            .map(|(purl, _)| socket_patch_core::utils::purl::strip_purl_qualifiers(purl))
+            .filter(|purl| purl.starts_with(&prefix))
+            .collect();
+        pins.sort_unstable();
+        pins.dedup();
+        match pins.as_slice() {
+            [purl] => Some(crate::ui::shell_word(purl)),
             _ => None,
         }
     });
+    let placeholder = || "pkg:gem/<gem>@<version>".to_string();
     let (move_one, target, update_arg) = match (one, purl) {
         (Some(name), Some(purl)) => ("it", purl, name),
-        (Some(name), None) => ("it", "pkg:gem/<gem>@<version>", name),
-        (None, _) => ("one", "pkg:gem/<gem>@<version>", "<gem>"),
+        (Some(name), None) => ("it", placeholder(), name),
+        (None, _) => ("one", placeholder(), "<gem>"),
     };
     let again = if command == "scan" {
         "then `socket-patch scan` again"
@@ -5951,6 +5963,42 @@ mod tests {
                  `socket-patch rollback pkg:gem/rack@3.1.8`, then `bundle update rack`, then \
                  `socket-patch scan` again."
             )
+        );
+        // A gem record's purl carries `?platform=ruby`. The note names the
+        // pin as `rollback` selects it, without the qualifier: with it the
+        // command matches no hosted pin, and its `?` is a glob character
+        // that zsh refuses and bash under `nullglob` drops, leaving a bare
+        // `rollback` (#2182).
+        let qualified = [
+            pin("pkg:gem/rack@3.1.8?platform=ruby"),
+            pin("pkg:gem/nokogiri@1.16.0?platform=x86_64-linux"),
+        ];
+        for command in ["scan", "get"] {
+            let note =
+                super::format_gem_hold_note(&edits[..1], &qualified, command, false).unwrap();
+            assert!(
+                note.contains("run `socket-patch rollback pkg:gem/rack@3.1.8`, then"),
+                "{note}"
+            );
+            assert!(!note.contains('?'), "{note}");
+        }
+        // Two records of the one release (a ruby and a platform build) are
+        // one pin, so the note still names it.
+        let builds = [
+            pin("pkg:gem/rack@3.1.8?platform=ruby"),
+            pin("pkg:gem/rack@3.1.8?platform=x86_64-linux"),
+        ];
+        let note = super::format_gem_hold_note(&edits[..1], &builds, "scan", false).unwrap();
+        assert!(
+            note.contains("run `socket-patch rollback pkg:gem/rack@3.1.8`, then"),
+            "{note}"
+        );
+        // Two versions of it are two pins: the user fills in which.
+        let versions = [pin("pkg:gem/rack@3.1.8"), pin("pkg:gem/rack@2.2.8")];
+        let note = super::format_gem_hold_note(&edits[..1], &versions, "scan", false).unwrap();
+        assert!(
+            note.contains("run `socket-patch rollback pkg:gem/<gem>@<version>`, then"),
+            "{note}"
         );
         // No bare `socket-patch rollback` anywhere: it unwinds every patch.
         for edits in [&edits[..], &edits[..1]] {

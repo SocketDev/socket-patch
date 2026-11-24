@@ -891,7 +891,9 @@ pub struct CandidateFiles {
     /// workspace keeps one lock per member but the members cannot be
     /// listed (#492), `gitBranchLockfile` installs the branch from a
     /// `pnpm-lock.<branch>.yaml` (#556), or pnpm's `lockfile` setting is
-    /// off so pnpm reads no lock at all (#1074). The root lock was left out of
+    /// off so pnpm reads no lock at all (#1074). And when a pin in it would
+    /// fail the Bazel build of the project ([`crate::bazel::pnpm`]). The
+    /// root lock was left out of
     /// `files`, and the rewrite reports this instead of a redirect or a
     /// "no lockfile" hint.
     pub pnpm_refusal: Option<RewriteWarning>,
@@ -1449,11 +1451,28 @@ pub async fn read_candidate_files_in(
     // dependencies of their own: a member's direct `cfg-if = "1"` must be
     // pinned alongside the root's, or the redirected lock entry is
     // unsatisfiable. Keyed `<dir>/Cargo.toml` for the cargo rewriter.
-    if out.files.contains_key("Cargo.toml") && candidates.iter().any(|c| c.dep.ecosystem == "cargo")
-    {
+    let cargo = candidates.iter().any(|c| c.dep.ecosystem == "cargo");
+    if out.files.contains_key("Cargo.toml") && cargo {
         for rel in crate::utils::cargo_workspace::member_manifests_in(view).await {
             out.read(view, unreadable, &rel).await;
         }
+    }
+    // In a Bazel workspace on disk a rules_rust hub may run cargo over
+    // these files without the cargo config that defines the registry of a
+    // pin. What stands against a pin is read from the checkout here and
+    // rides a synthetic key to the cargo rewriter. A project in no Bazel
+    // workspace, or one that no such hub is seen to read, gets none, and
+    // its run is the one it was.
+    if let Some(root) = view.disk_root().filter(|_| cargo) {
+        use crate::bazel::cargo::{unread, KEY};
+        let member = |rel: &&String| crate::patch::redirect::is_cargo_member_manifest_key(rel);
+        let mut files = vec!["Cargo.lock".to_string(), "Cargo.toml".to_string()];
+        files.extend(out.files.keys().filter(member).cloned());
+        let config = crate::patch::redirect::cargo_config_key(&out.files);
+        let root = root.to_path_buf();
+        let read = crate::utils::fs::run_blocking(move || unread(&root, &files, config));
+        out.files
+            .extend(read.await.map(|why| (KEY.to_string(), why)));
     }
 
     // Go: the workspace in effect decides which version a replace must pin,
@@ -1532,6 +1551,26 @@ pub async fn read_candidate_files_in(
             crate::patch::redirect::NUGET_LOCKS_KEY.to_string(),
             lines.join("\n"),
         );
+        // In a Bazel workspace a rules_csharp hub reads those locks, with
+        // the locks of its other tags, and takes its package sources from
+        // the config the rewriter writes only when a tag names it. What
+        // the hub makes of the project is read from the checkout here and
+        // rides a synthetic key, for the rewriter to judge each package.
+        // A project in no Bazel workspace, or whose locks no tag reads,
+        // gets none, and its run is the one it was. The root is the raw
+        // one: which files of the workspace this reads is not known
+        // beforehand, so a recording gives up instead of listing them.
+        if let Some(root) = view.disk_root() {
+            use crate::bazel::nuget::{withheld, WITHHELD_KEY};
+            let config = crate::patch::redirect::nuget_config_path(&out.files);
+            let locks = lines.iter().filter_map(|line| line.strip_prefix("lock\t"));
+            let locks: Vec<String> = locks.map(String::from).collect();
+            let root = root.to_path_buf();
+            let read = move || withheld(&root, config, &locks);
+            let read = crate::utils::fs::run_blocking(read).await;
+            out.files
+                .extend(read.map(|hub| (WITHHELD_KEY.to_string(), hub)));
+        }
     }
 
     for path in view.python_lock_paths() {
@@ -1631,12 +1670,49 @@ pub async fn read_candidate_files_in(
         } else if let Some(branch) = crate::utils::pnpm_workspace::git_branch_locks(view).await {
             refuse_git_branch_locks(&mut out, &branch);
         } else {
+            // A hub stands against a pin in the root lock it reads, not
+            // against the members' own locks, which no hub of this answer
+            // reads: they are read and pinned as without it.
+            let hidden = bazel_hides_pnpm_workspace(view, &out).await;
             read_pnpm_member_locks(view, unreadable, &mut out).await;
+            if let Some(hidden) = hidden {
+                withhold_root_pnpm_locks(&mut out, hidden);
+            }
         }
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "gem") {
         keep_bundler_loaded_gem_files(view, candidates, &mut out).await;
         read_gemspecs(view, unreadable, &mut out).await;
+        // In a Bazel workspace a rules_ruby hub can hold a gem of the lock
+        // to a sha256 of its own (`gem_checksums`), which a redirect leaves
+        // on the upstream archive. What the calls that may read the lock
+        // hold is read here and rides a synthetic key to the gem rewriter:
+        // from the checkout on disk, and in memory from the files handed
+        // over, where the project's directory is the Bazel root. A project
+        // in no Bazel workspace, or whose lock no such call may read, gets
+        // none, and its run is the one it was.
+        let (_, lock) = crate::patch::redirect::gem_pair(&out.files);
+        if out.files.contains_key(lock) {
+            use crate::bazel::ruby::{handed, handed_on_disk, KEY};
+            use crate::bazel::workspace::Entry;
+            use crate::vendor::lock_inventory::MemoryEntry;
+            let held = match view {
+                ProjectView::Memory(project) => {
+                    let file = |path: &str| match project.get(path) {
+                        Some(MemoryEntry::Text(text)) => Entry::Text(text.to_string()),
+                        None => Entry::Absent,
+                        Some(_) => Entry::Unreadable("it was not handed over as text".into()),
+                    };
+                    handed(&file, lock)
+                }
+                _ => {
+                    let root = view.disk_root().expect("a disk view has a root");
+                    let root = root.to_path_buf();
+                    crate::utils::fs::run_blocking(move || handed_on_disk(&root, lock)).await
+                }
+            };
+            out.files.extend(held.map(|held| (KEY.to_string(), held)));
+        }
     }
     // A Gradle build: every script, catalog and lock file its script graph
     // reaches, for the hosted Gradle planner.
@@ -1775,13 +1851,32 @@ fn refuse_git_branch_locks(
     withhold_root_pnpm_locks(out, git_branch_lock_refusal(branch));
 }
 
+/// The refusal for a project whose `pnpm-lock.yaml` a rules_js hub of its
+/// Bazel workspace keeps up to date with a pnpm that would not read the
+/// `trustLockfile: true` a hosted pin needs ([`crate::bazel::pnpm::hidden`]):
+/// the build would fail on the pinned lock, so the caller leaves the root
+/// locks out and the run refuses every pin in them (see
+/// [`withhold_root_pnpm_locks`]). Nothing of Bazel is read for a project
+/// without that lock.
+async fn bazel_hides_pnpm_workspace(
+    view: &ProjectView<'_>,
+    out: &CandidateFiles,
+) -> Option<RewriteWarning> {
+    if !out.files.contains_key(ROOT_PNPM_LOCKS[0]) {
+        return None;
+    }
+    crate::bazel::pnpm::hidden(view).await
+}
+
 /// The root pnpm locks (see [`withhold_root_pnpm_locks`]).
 const ROOT_PNPM_LOCKS: [&str; 2] = ["pnpm-lock.yaml", "shrinkwrap.yaml"];
 
 /// Leave every root pnpm lock out of the run and refuse every pnpm pin
 /// with `refusal` (see [`CandidateFiles::pnpm_refusal`]): a branch lock
-/// (#556) or pnpm's `lockfile` setting off (#1074, where pnpm reads no
-/// lock at all; member locks are never read then). In memory the root
+/// (#556), pnpm's `lockfile` setting off (#1074, where pnpm reads no
+/// lock at all; member locks are never read then), or a Bazel hub that
+/// would fail on a pin in the root lock ([`bazel_hides_pnpm_workspace`];
+/// the members' own locks are read all the same). In memory the root
 /// lock is dropped from the link and unreadable lists too: it is not
 /// written.
 fn withhold_root_pnpm_locks(out: &mut CandidateFiles, refusal: RewriteWarning) {
@@ -6747,6 +6842,83 @@ snapshots:
         }
     }
 
+    /// In a Bazel workspace on disk the read of a run with a cargo
+    /// candidate hands the rewriter what stands against a pin: the hub
+    /// that reads the project's manifests, a member's among them, and not
+    /// the config the rewriter writes, which is the legacy file where the
+    /// project has one. Nothing is handed over in no Bazel workspace, for a
+    /// hub that names that config, or to a run without a cargo candidate.
+    #[tokio::test]
+    async fn a_bazel_hub_without_the_cargo_config_rides_to_the_cargo_rewriter() {
+        use crate::bazel::cargo::KEY;
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |rel: &str, text: &str| {
+            let path = tmp.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let hub = |attributes: &str| {
+            format!(
+                "bazel_dep(name = \"rules_rust\", version = \"0.75.0\")\ncrate = use_extension(\
+                 \"@rules_rust//crate_universe:extensions.bzl\", \"crate\")\n\
+                 crate.from_cargo({attributes})\n"
+            )
+        };
+        write("Cargo.toml", "[workspace]\nmembers = [\"member\"]\n");
+        write(
+            "member/Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n",
+        );
+        let cargo = Candidate {
+            purl: "pkg:cargo/serde@1.0.190".into(),
+            dep: grant_dep("cargo", "https://patch.test/serde-1.0.190.crate".into()),
+        };
+        let view = ProjectView::Disk(tmp.path());
+        let handed = |candidate: &Candidate| {
+            let candidates = [candidate.clone()];
+            async move {
+                let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+                read.files.get(KEY).cloned()
+            }
+        };
+        assert_eq!(handed(&cargo).await, None, "no Bazel workspace");
+
+        write(
+            "MODULE.bazel",
+            &hub("manifests = [\"//member:Cargo.toml\"]"),
+        );
+        let why = handed(&cargo).await.expect("the hub reads a member");
+        assert!(
+            why.starts_with("the rules_rust hub at MODULE.bazel:3 reads"),
+            "{why}"
+        );
+        assert!(why.contains("without .cargo/config.toml, where"), "{why}");
+
+        let root = "manifests = [\"//:Cargo.toml\"]";
+        write("MODULE.bazel", &hub(root));
+        assert!(handed(&cargo).await.is_some(), "the hub reads the root");
+        let lock = "cargo_lockfile = \"//:Cargo.lock\", manifests = [\"//x:Cargo.toml\"]";
+        write("MODULE.bazel", &hub(lock));
+        assert!(handed(&cargo).await.is_some(), "the hub reads the lock");
+        write("MODULE.bazel", &hub(root));
+        assert_eq!(
+            handed(&left_pad_candidate()).await,
+            None,
+            "no cargo candidate"
+        );
+        let named = format!("{root}, cargo_config = \"//:.cargo/config.toml\"");
+        write("MODULE.bazel", &hub(&named));
+        assert_eq!(handed(&cargo).await, None, "the hub names the config");
+        write(".cargo/config", "");
+        let why = handed(&cargo)
+            .await
+            .expect("the rewriter writes the legacy file");
+        assert!(
+            why.contains("is not the label of .cargo/config as one string"),
+            "{why}"
+        );
+    }
+
     fn gem_candidate() -> Candidate {
         use crate::patch::redirect::{Integrity, RegistryOverride, RegistryOverrideIdentifiers};
         Candidate {
@@ -7981,6 +8153,81 @@ snapshots:
         (read, done)
     }
 
+    /// In a Bazel workspace the read of a run with a gem candidate hands
+    /// the gem rewriter what the rules_ruby calls that may read the lock
+    /// hold in `gem_checksums`, from a checkout and from the same files in
+    /// memory alike, and a gem that a call holds to another sha256 than the
+    /// patched archive's is left as it is. In no Bazel workspace, beside a
+    /// call that reads another lock and with the patched sha256 in the
+    /// entry, the run is the one it is without Bazel.
+    #[tokio::test]
+    async fn gem_checksums_of_a_bazel_hub_ride_to_the_gem_rewriter() {
+        use crate::bazel::ruby::{KEY, PINNED};
+        let module = |lock: &str, sum: &str| {
+            format!(
+                "bazel_dep(name = \"rules_ruby\", version = \"1.0.0-rc2\")\n\
+                 ruby = use_extension(\"@rules_ruby//ruby:extensions.bzl\", \"ruby\")\n\
+                 ruby.bundle_fetch(gemfile_lock = \"{lock}\", gem_checksums = \
+                 {{\"rails-7.0.0\": \"{sum}\"}})\n"
+            )
+        };
+        let (upstream, patched) = ("1".repeat(64), "f".repeat(64));
+        // A file over the size the reader takes is read on neither side.
+        let large = "#".repeat(crate::bazel::starlark::MAX_BYTES);
+        let large = module("//:Gemfile.lock", &upstream) + &large;
+        // The `MODULE.bazel`, whether its call is handed over, and whether
+        // the gem is left as it is.
+        for (module, handed, left) in [
+            (None, false, false),
+            (Some(module("//:Gemfile.lock", &upstream)), true, true),
+            (Some(module("//:Gemfile.lock", &patched)), true, false),
+            (Some(large), false, false),
+            (
+                Some(module("//other:Gemfile.lock", &upstream)),
+                false,
+                false,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut p = MemoryProject::new();
+            let module = module.as_deref().map(|module| ("MODULE.bazel", module));
+            for (rel, text) in [("Gemfile", GEMFILE), ("Gemfile.lock", GEM_LOCK)]
+                .into_iter()
+                .chain(module)
+            {
+                std::fs::write(tmp.path().join(rel), text).unwrap();
+                p.insert_text(rel, text);
+            }
+            let (on_disk, disk) = gem_rewrite_in(&ProjectView::Disk(tmp.path())).await;
+            let (in_memory, memory) = gem_rewrite(&p).await;
+            let module = module.map(|(_, module)| &module[..module.len().min(200)]);
+            assert_eq!(
+                on_disk.files.get(KEY),
+                in_memory.files.get(KEY),
+                "{module:?}"
+            );
+            assert_eq!(on_disk.files.contains_key(KEY), handed, "{module:?}");
+            assert!(disk.rewrite == memory.rewrite, "{module:?}");
+            assert_eq!(disk.confirmed, memory.confirmed, "{module:?}");
+            let pinned = |w: &RewriteWarning| w.code == PINNED;
+            assert_eq!(disk.rewrite.warnings.iter().any(pinned), left, "{module:?}");
+            assert_eq!(disk.confirmed.is_empty(), left, "{module:?}");
+            assert_eq!(disk.rewrite.files.is_empty(), left, "{module:?}");
+        }
+        // In memory a file that was not handed over as text is there, and
+        // unread: Bazel takes `WORKSPACE.bazel` before `WORKSPACE`, so the
+        // call of the second is not what it builds from.
+        let rule = "rb_bundle_fetch(gemfile_lock = \"//:Gemfile.lock\", gem_checksums = {})\n";
+        let mut p = MemoryProject::new();
+        for (rel, text) in [("Gemfile", GEMFILE), ("Gemfile.lock", GEM_LOCK)] {
+            p.insert_text(rel, text);
+        }
+        p.insert_text("WORKSPACE", rule);
+        assert!(gem_rewrite(&p).await.0.files.contains_key(KEY));
+        p.insert_present("WORKSPACE.bazel");
+        assert!(!gem_rewrite(&p).await.0.files.contains_key(KEY));
+    }
+
     /// A gem locked as precompiled platform builds, with a prebuild for
     /// each: the rewrite moves every build, and lockfile discovery (what
     /// `vex`, `rollback` and `remove` read) attributes them to the one pin,
@@ -8696,6 +8943,48 @@ snapshots:
         );
         assert_eq!(again.confirmed.len(), 1);
         assert!(again.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+    }
+
+    /// A Bazel hub that stands against a pin in the root lock
+    /// ([`crate::bazel::pnpm`]) reads that lock alone. The members' own
+    /// locks are read and pinned as without it; the root lock is left out.
+    #[tokio::test]
+    async fn member_locks_are_pinned_beside_a_root_lock_that_a_bazel_hub_withholds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+        write_member_workspace(tmp.path(), ws);
+        write_rel(
+            tmp.path(),
+            "MODULE.bazel",
+            "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+             npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+             npm.npm_translate_lock(pnpm_lock = \"//:pnpm-lock.yaml\", update_pnpm_lock = True)\n\
+             pnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
+             pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")\n",
+        );
+        let (read, done) = member_rewrite(tmp.path()).await;
+        let hidden = crate::bazel::pnpm::HIDDEN;
+        assert_eq!(
+            read.pnpm_refusal.as_ref().map(|w| w.code.as_str()),
+            Some(hidden)
+        );
+        assert!(!read.files.contains_key("pnpm-lock.yaml"));
+        assert_eq!(read.pnpm_member_lock_keys, MEMBER_KEYS);
+        for key in MEMBER_KEYS {
+            let text = done
+                .rewrite
+                .files
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} must be pinned: {:?}", done.rewrite.warnings));
+            assert!(text.contains(&format!("tarball: {MEMBER_URL}")), "{text}");
+        }
+        assert!(!done.rewrite.files.contains_key("pnpm-lock.yaml"));
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.confirmed);
+        assert!(
+            warning_codes(&done).contains(&hidden),
+            "{:?}",
+            warning_codes(&done)
+        );
     }
 
     #[tokio::test]

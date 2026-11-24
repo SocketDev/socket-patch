@@ -5,6 +5,22 @@ persisted login, and repository patch-selection policy. For the complete flag an
 environment-variable tables, see the
 [CLI contract](../crates/socket-patch-cli/CLI_CONTRACT.md#environment-variables).
 
+## Free and paid patches
+
+| Tier | Patches included | What you need |
+| --- | --- | --- |
+| Free | Every patch for a critical vulnerability, merged patches included | Nothing: no account and no token |
+| Paid | Patches for every vulnerability, at every severity | A token for an organization on a paid Socket plan |
+
+A merged patch fixes several vulnerabilities of one package version together, so
+that one patch per package version is enough. The free tier's merged patch combines
+the version's critical fixes. The paid tier's combines all of them.
+
+Socket publishes a merged patch after the single patches it combines. Until it is
+ready, `scan` and `get` apply the top-ranked single patch and report that the merged
+patch is not ready yet and that Socket is still processing it. Run
+`socket-patch scan` again later: a rerun moves the package to the merged patch.
+
 ## Authentication and endpoints
 
 Without a token, Socket Patch uses `https://patches-api.socket.dev` to access the
