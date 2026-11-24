@@ -4681,15 +4681,20 @@ fn pnpm_route(
                     ));
                 }
                 // Left as it is for a Bazel hub, and nothing else to
-                // serve: no trust key.
+                // serve: no trust key. The root lock that the hub keeps out
+                // of the run is a governing lock like the others, and is
+                // read for this one question: a plain pin in it, from
+                // before the hub was there, needs the key as it did.
                 if root_withheld && matches!(route.unrouted, Some(Err(_))) {
-                    let left: Vec<(&str, &String)> = governing
+                    let root = read_advisory_text(view, ROOT_PNPM_LOCKS[0]);
+                    let mut left: Vec<(&str, &String)> = governing
                         .iter()
                         .filter_map(|key| {
                             let text = rewrite.files.get(*key).or_else(|| files.get(*key))?;
                             Some((*key, text))
                         })
                         .collect();
+                    left.extend(root.as_ref().map(|text| (ROOT_PNPM_LOCKS[0], text)));
                     route.kept = !holds_trust_pin(&left, overrides, &owned);
                 }
             }
@@ -14054,6 +14059,52 @@ snapshots:
             assert_eq!(workspace_of(&done), Some("packages:\n  - '.'\n"), "{call}");
             assert!(!done.pnpm_workspace_emptied, "{call}");
         }
+    }
+
+    /// Whether a route that is left as it is needs no trust key is asked of
+    /// every governing lock, the root lock that a hub keeps out of the run
+    /// among them. A plain hosted pin there, from before the hub hid the
+    /// workspace file, is one pnpm takes only with `trustLockfile`: the run
+    /// writes the key as it did before, and does not report the project as
+    /// settled on its registries.
+    #[tokio::test]
+    async fn a_plain_pin_in_the_withheld_root_lock_still_gets_its_trust_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+        write_member_workspace(tmp.path(), ws);
+        write_rel(
+            tmp.path(),
+            "package.json",
+            r#"{"name":"root","private":true,"packageManager":"pnpm@12.22.0"}"#,
+        );
+        write_rel(
+            tmp.path(),
+            "packages/a/package.json",
+            r#"{"name":"a","dependencies":{"is-number":"7.0.0"}}"#,
+        );
+        let mut candidates = is_number_candidates();
+        candidates[0].dep.npm_registry_url = Some(registry_address(MEMBER_URL));
+        let view = ProjectView::Disk(tmp.path());
+        let routed = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        assert!(routed.pnpm_named_registries);
+        commit(tmp.path(), &routed);
+        // The root lock pins the release in the plain shape.
+        let plain = format!(
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      is-number:\n        \
+             specifier: 7.0.0\n        version: 7.0.0\n\npackages:\n\n  is-number@7.0.0:\n    \
+             resolution: {{integrity: sha512-PATCHED==, tarball: {MEMBER_URL}}}\n\n\
+             snapshots:\n\n  is-number@7.0.0: {{}}\n"
+        );
+        write_rel(tmp.path(), "pnpm-lock.yaml", &plain);
+        write_rel(tmp.path(), "MODULE.bazel", &rules_js_hub(HIDING_HUB_CALL));
+
+        let done = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        let routed_ws = &routed.rewrite.files[PNPM_WORKSPACE_REL];
+        assert_eq!(
+            workspace_of(&done),
+            Some(format!("{routed_ws}trustLockfile: true\n").as_str())
+        );
+        assert!(!done.pnpm_named_registries);
     }
 
     /// The members' own locks beside a root lock that a hub withholds are
