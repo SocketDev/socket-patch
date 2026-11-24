@@ -2931,12 +2931,16 @@ async fn run_redirect_selected_untracked(
 /// `packages` list and nothing else. Only a regular file that still holds
 /// exactly those bytes is deleted. `Err` is why the file stays.
 ///
-/// The path is a file of the user's, which can be replaced at any time. A
-/// link is never followed, nor removed in the file's place. Whatever else
-/// is there is opened with the opener every project file is read with,
-/// which never waits on a FIFO or a device and refuses what the opened
-/// handle shows is no regular file: one check, on the handle, with nothing
-/// between it and the read for a swap to slip into.
+/// The path is a file of the user's, which can be replaced at any time.
+/// What is there is opened with the opener every project file is read
+/// with, which never waits on a FIFO or a device and refuses what the
+/// opened handle shows is no regular file, so nothing stands between that
+/// check and the read. That opener follows a link. So the path is looked
+/// at before the read, where a link is refused unread, and once more
+/// after it: only what is a regular file at that look is unlinked, and a
+/// link that took the file's place during the read stays. There is no
+/// unlink by handle, so what happens to the path between that last look
+/// and the unlink is not seen.
 async fn remove_emptied_workspace(
     root: &std::path::Path,
     rewrite: &socket_patch_core::patch::redirect::RewriteResult,
@@ -2961,9 +2965,16 @@ async fn remove_emptied_workspace(
         Err(e) => return Err(left(e.to_string())),
     }
     match socket_patch_core::utils::fs::read_regular_to_bytes(&path).await {
-        Ok(bytes) if bytes == written.as_bytes() => tokio::fs::remove_file(&path)
-            .await
-            .map_err(|e| left(e.to_string())),
+        Ok(bytes) if bytes == written.as_bytes() => {
+            match tokio::fs::symlink_metadata(&path).await {
+                Ok(meta) if meta.is_file() => tokio::fs::remove_file(&path)
+                    .await
+                    .map_err(|e| left(e.to_string())),
+                Ok(_) => Err(not_regular()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(left(e.to_string())),
+            }
+        }
         // Changed since the write: no longer the file this run left.
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Err(not_regular()),
