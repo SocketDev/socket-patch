@@ -219,6 +219,33 @@ class Repository(unittest.TestCase):
         self.assertGreaterEqual(seen.count("python-version"), 2, seen)
         self.assertGreaterEqual(seen.count("go-version"), 3, seen)
 
+    def test_exact_python_pins_are_ones_ci_yml_uses(self):
+        # setup-python serves CPython's source-only security releases
+        # (3.12.11 and later) for Linux only, so an exact pin that works on
+        # an Ubuntu leg can fail every macOS and Windows leg (#2184). ci.yml
+        # runs its pin on all three, so another workflow's exact pin has to
+        # be one of ci.yml's.
+        def exact_python_pins(path):
+            return {
+                (path.name, value)
+                for _, _, inputs in pins.steps(path.read_text().splitlines())
+                for key, (_, raw) in inputs.items()
+                if key == "python-version"
+                for value in [pins.unquote(pins.strip_comment(raw))]
+                if pins.EXACT.match(value)
+            }
+
+        proven = {value for _, value in exact_python_pins(self.CI)}
+        self.assertTrue(proven)
+        workflows = sorted(self.CI.parent.glob("*.yml"))
+        strays = sorted(
+            pin
+            for path in workflows
+            for pin in exact_python_pins(path)
+            if pin[1] not in proven
+        )
+        self.assertEqual(strays, [], f"ci.yml pins {sorted(proven)}")
+
     def test_main_exit_codes(self):
         self.assertEqual(pins.main([]), 2)
         self.assertEqual(pins.main([str(self.CI)]), 0)
