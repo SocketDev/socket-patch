@@ -13686,22 +13686,7 @@ snapshots:
         );
     }
 
-    /// The `MODULE.bazel` of a workspace with a rules_js hub: its
-    /// `npm.npm_translate_lock` (line 3) with `call` as its arguments, and
-    /// a tag that states pnpm 11.28.10 as the pnpm Bazel runs.
-    fn rules_js_hub(call: &str) -> String {
-        format!(
-            "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
-             npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
-             npm.npm_translate_lock({call})\n\
-             pnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
-             pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")\n"
-        )
-    }
-
-    /// The hub of [`crate::bazel::pnpm::hidden`]: it keeps the root lock up
-    /// to date with a pnpm 11 that does not see pnpm-workspace.yaml.
-    const HIDING_HUB_CALL: &str = "pnpm_lock = \"//:pnpm-lock.yaml\", update_pnpm_lock = True";
+    use crate::bazel::pnpm::fixtures::{rules_js_hub, HIDING_HUB_CALL};
 
     /// A pnpm lock that a rules_js hub of the Bazel workspace reads is not
     /// routed through a named registry, whatever the patch service offers

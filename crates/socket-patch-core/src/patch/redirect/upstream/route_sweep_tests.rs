@@ -209,15 +209,6 @@ async fn a_dependency_that_left_the_lock_takes_its_entries() {
     }
 }
 
-/// A rules_js hub of a Bazel workspace that keeps the lock up to date with
-/// a pnpm 11 that does not see pnpm-workspace.yaml: hosted mode pins
-/// nothing in that lock ([`crate::bazel::pnpm::hidden`]).
-const HIDING_HUB: &str = "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
-    npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
-    npm.npm_translate_lock(pnpm_lock = \"//:pnpm-lock.yaml\", update_pnpm_lock = True)\n\
-    pnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
-    pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")\n";
-
 /// The sweep reads the lockfiles alone and pins nothing, so a Bazel hub
 /// that hosted mode leaves the lock to changes nothing about it: in a
 /// project routed before the hub was there, what a departed dependency
@@ -238,7 +229,8 @@ async fn a_bazel_hub_changes_nothing_about_the_sweep() {
             &lock(&[LEAF, MID], &[LEAF_ROUTED]),
         );
         if hub {
-            write(dir.path(), "MODULE.bazel", HIDING_HUB);
+            use crate::bazel::pnpm::fixtures::{rules_js_hub, HIDING_HUB_CALL};
+            write(dir.path(), "MODULE.bazel", &rules_js_hub(HIDING_HUB_CALL));
         }
         dir
     };

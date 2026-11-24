@@ -568,6 +568,30 @@ fn picks_an_older_pnpm(ws: &Workspace, view: &dyn Fn(&str) -> Entry) -> bool {
     known(&asked) && selected
 }
 
+/// What the tests of this crate write as the `MODULE.bazel` of a workspace
+/// with a rules_js hub.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    /// A `MODULE.bazel` whose `npm.npm_translate_lock` (line 3) has `call`
+    /// as its arguments, with a tag that states pnpm 11.28.10 as the pnpm
+    /// Bazel runs.
+    pub(crate) fn rules_js_hub(call: &str) -> String {
+        format!(
+            "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+             npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+             npm.npm_translate_lock({call})\n\
+             pnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
+             pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")\n"
+        )
+    }
+
+    /// The arguments of the hub of [`super::Hubs::hidden`]: it keeps the
+    /// root lock up to date with a pnpm 11 that does not see
+    /// pnpm-workspace.yaml.
+    pub(crate) const HIDING_HUB_CALL: &str =
+        "pnpm_lock = \"//:pnpm-lock.yaml\", update_pnpm_lock = True";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

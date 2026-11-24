@@ -2930,6 +2930,13 @@ async fn run_redirect_selected_untracked(
 /// file a hosted run created (see `Rewritten::pnpm_workspace_emptied`): its
 /// `packages` list and nothing else. Only a regular file that still holds
 /// exactly those bytes is deleted. `Err` is why the file stays.
+///
+/// The path is a file of the user's, which can be replaced at any time. A
+/// link is never followed, nor removed in the file's place. Whatever else
+/// is there is opened with the opener every project file is read with,
+/// which never waits on a FIFO or a device and refuses what the opened
+/// handle shows is no regular file: one check, on the handle, with nothing
+/// between it and the read for a swap to slip into.
 async fn remove_emptied_workspace(
     root: &std::path::Path,
     rewrite: &socket_patch_core::patch::redirect::RewriteResult,
@@ -2946,30 +2953,22 @@ async fn remove_emptied_workspace(
              with and was not deleted ({why}); delete it"
         )
     };
+    let not_regular = || left("it is not a regular file".to_string());
     match tokio::fs::symlink_metadata(&path).await {
-        Ok(meta) if meta.is_file() => {}
-        Ok(_) => return Err(left("it is not a regular file".to_string())),
+        Ok(meta) if meta.file_type().is_symlink() => return Err(not_regular()),
+        Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(left(e.to_string())),
     }
-    match read_written_workspace(&path).await {
+    match socket_patch_core::utils::fs::read_regular_to_bytes(&path).await {
         Ok(bytes) if bytes == written.as_bytes() => tokio::fs::remove_file(&path)
             .await
             .map_err(|e| left(e.to_string())),
         // Changed since the write: no longer the file this run left.
         Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Err(not_regular()),
         Err(e) => Err(left(e.to_string())),
     }
-}
-
-/// The bytes of the pnpm-workspace.yaml at `path`, for
-/// [`remove_emptied_workspace`], through the opener every project file is
-/// read with: it never waits on a FIFO or a device, and refuses whatever
-/// the opened handle shows is no regular file. The path is a file of the
-/// user's, and can be replaced between the check of what is there and the
-/// open.
-async fn read_written_workspace(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
-    socket_patch_core::utils::fs::read_regular_to_bytes(path).await
 }
 
 /// Write the hosted pins and commit `group` (see `run_redirect_selected`):
@@ -3871,6 +3870,7 @@ fn created_settings_over_existing(
 
 #[cfg(test)]
 mod tests {
+    use super::remove_emptied_workspace;
     use super::{
         describe_skip_reason, format_error_line, format_hosted_summary, format_next_steps,
         format_redirect_summary, format_takeover_line, format_unredirected, format_warning,
@@ -3881,7 +3881,6 @@ mod tests {
         gem_stale_install_warnings, gem_stale_warning, prune_ignored_warning, record_hosted_events,
         redirect_block, stale_cache_gem, stale_installed_gem,
     };
-    use super::{read_written_workspace, remove_emptied_workspace};
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
 
     use socket_patch_core::hosted::engine::REDIRECT_CANDIDATE_FILES;
@@ -3926,45 +3925,38 @@ mod tests {
         }
     }
 
-    /// The read behind that check opens a project file a person can replace
-    /// at any time, also between the check of what is there and the open. A
-    /// FIFO at the path is refused as no regular file, at once: an
-    /// unguarded read would wait in open(2) for a writer, with no timeout.
+    /// The step opens a project file a person can replace at any time. A
+    /// FIFO at the path is refused as no regular file, at once, by the
+    /// opener itself: nothing looks at the path first and lets it through
+    /// to a read that would wait in open(2) for a writer, with no timeout.
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_emptied_workspace_is_never_read_through_a_fifo() {
+    async fn an_emptied_workspace_that_is_a_fifo_is_refused_without_waiting() {
         use std::os::unix::ffi::OsStrExt as _;
         let tmp = tempfile::tempdir().unwrap();
         let fifo = tmp.path().join("pnpm-workspace.yaml");
         let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
-        let read = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            read_written_workspace(&fifo),
-        )
-        .await;
-        match read {
-            Ok(result) => assert_eq!(
-                result.map_err(|e| e.kind()),
-                Err(std::io::ErrorKind::InvalidInput)
-            ),
-            Err(_) => {
-                // Release the wedged opener so the suite can fail cleanly.
-                let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
-                panic!("the read wedged in open(2) on a FIFO");
-            }
-        }
-        // The whole step refuses it too, by what is at the path.
         let mut rewrite = socket_patch_core::patch::redirect::RewriteResult::default();
         rewrite
             .files
             .insert("pnpm-workspace.yaml".to_string(), "packages:\n".to_string());
-        let kept = remove_emptied_workspace(tmp.path(), &rewrite).await;
+        let step = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            remove_emptied_workspace(tmp.path(), &rewrite),
+        )
+        .await;
+        let Ok(kept) = step else {
+            // Release the wedged opener so the suite can fail cleanly.
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("the step wedged in open(2) on a FIFO");
+        };
         assert!(
             kept.as_ref()
                 .is_err_and(|why| why.contains("it is not a regular file")),
             "{kept:?}"
         );
+        assert!(fifo.exists(), "what is not the run's file is not removed");
     }
 
     /// A failed hosted write may say `nothing was changed` only when every
