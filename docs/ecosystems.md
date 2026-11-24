@@ -3146,8 +3146,9 @@ adds no line. What the line is for, measured with rules_rust 0.75.0 on Bazel 9.3
   tags the crate's library so). That package names repositories only the hub sees, so for a
   vendored crate with a dependency the commands that analyse every target fail on it:
   `bazel cquery //...` and `bazel query 'deps(//...)'` end with `No repository visible as
-  '@crates__<dependency>' from main repository`. With the line both pass, and `//...` holds
-  your own targets alone.
+  '@crates__<dependency>' from main repository`, or with the same words about `@platforms`,
+  which the file names too: Bazel reports the first of the two that it meets. With the line
+  both pass, and `//...` holds your own targets alone.
 
 **Under that line, the file is no change of the copy.** `vendor --check` passes, `vex`
 attests the crate, `repair` has nothing to restore, and a second `scan --mode vendored`
