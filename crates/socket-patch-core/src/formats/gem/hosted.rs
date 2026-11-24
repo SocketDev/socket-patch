@@ -736,6 +736,7 @@ mod tests {
             token: "tok".into(),
             patch_uuid: "uuid".into(),
             artifact_url: format!("https://patch.test/{name}-{version}.gem"),
+            npm_registry_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "rubygems-compact-index".into(),
                 index_url: INDEX_URL.into(),

@@ -15,8 +15,8 @@
 //! (Bazel 9.3.2, rules_js 3.6.0, pnpm 11.28.10). pnpm 10 has no such check
 //! and builds the pinned lock, and so does pnpm 11 once the file is listed.
 //!
-//! [`hidden`] finds such a hub for a project, and hosted mode then writes
-//! nothing for the project's root pnpm lock. One call of the tag must name
+//! [`hubs`] finds such a hub for a project ([`Hubs::hidden`]), and hosted
+//! mode then writes nothing for the project's root pnpm lock. One call of the tag must name
 //! the project's `pnpm-lock.yaml` in a plain string and, as far as it is
 //! written out, keep it up to date, not list the `pnpm-workspace.yaml`
 //! beside it, and run a pnpm that may be 11 or later.
@@ -54,9 +54,12 @@
 //! the pnpm 11 of the tag `pnpm` under the name `eleven`).
 //!
 //! In memory the workspace is the project's own files: path selection
-//! asks for the `MODULE.bazel` beside a `pnpm-lock.yaml`, and the answer is
-//! the one of a checkout with the same files. A hub in a file that one
-//! includes, and a Bazel root above the project, are not seen there. A
+//! asks for the `MODULE.bazel` beside a `pnpm-lock.yaml` or a
+//! `pnpm-workspace.yaml`, for the files one can include and for the
+//! `WORKSPACE` files, and the answer is the one of a checkout with the
+//! same files. A Bazel root above the project is not seen there, for
+//! either answer of this module: a project in a directory of a Bazel
+//! workspace is pinned, and routed, in memory as if it were in none. A
 //! `pnpm_version_from` file that was not handed in (one outside the
 //! project's own manifests) and `MODULE.bazel.lock` are not there either:
 //! the first reads as a release that is not written out, so a lock that a
@@ -73,14 +76,14 @@
 //! project whose lock no listed call names is left as it is.
 
 use super::rc::ModuleLock;
-use super::starlark::{Arg, Call, How, Value};
-use super::workspace::{disk, Entry, Extension, Repo, Workspace};
+use super::starlark::{Arg, Call, File, How, Value};
+use super::workspace::{disk, Doubt, Entry, Extension, Label, Repo, Workspace};
 use crate::formats::text::strip_bom;
 use crate::hosted::guidance::{is_trust_scaffold, plan_workspace_trust, TrustPlan};
 use crate::patch::redirect::RewriteWarning;
 use crate::utils::fs::run_blocking;
 use crate::utils::package_manager::pinned_version;
-use crate::vendor::lock_inventory::{MemoryEntry, ProjectView};
+use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject, ProjectView};
 
 /// The code of the warning with which hosted mode leaves a pnpm lock as it
 /// is because of such a hub.
@@ -98,60 +101,275 @@ fn extension(name: &'static str) -> Extension<'static> {
     }
 }
 
-/// The warning for the project of `view` when a hub hides its
-/// `pnpm-workspace.yaml` from a pnpm that may be 11 or later (the module
-/// docs), read from the Bazel workspace the project is in: on disk the one
-/// of [`super::bazel_root`], in memory the project itself, whose files are
-/// all there is. `None` in every other case, outside a Bazel workspace, and
-/// for a user who switched the Bazel support off ([`super::off`]).
-pub async fn hidden(view: &ProjectView<'_>) -> Option<RewriteWarning> {
-    let detail = match *view {
-        ProjectView::Memory(_) if super::off() => None,
-        ProjectView::Memory(project) => {
-            let read = |path: &str| match project.get(path) {
-                Some(MemoryEntry::Text(text)) => Entry::Text(text.to_string()),
-                Some(_) => Entry::Unreadable("it was not handed in as text".to_string()),
-                None => Entry::Absent,
-            };
-            judge(&read, "")
-        }
+/// The files of an in-memory project, as the workspace reader takes them.
+fn memory(project: &MemoryProject) -> impl Fn(&str) -> Entry + '_ {
+    |path| match project.get(path) {
+        Some(MemoryEntry::Text(text)) => Entry::Text(text.to_string()),
+        Some(_) => Entry::Unreadable("it was not handed in as text".to_string()),
+        None => Entry::Absent,
+    }
+}
+
+/// What the Bazel workspace of a project says of its pnpm locks: both
+/// answers of this module, from one read of the workspace ([`hubs`]).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Hubs {
+    /// The warning ([`HIDDEN`]) when a hub hides the project's
+    /// `pnpm-workspace.yaml` from a pnpm that may be 11 or later (the
+    /// module docs): hosted mode then writes nothing for the root pnpm
+    /// lock.
+    pub hidden: Option<RewriteWarning>,
+    /// The hub that reads one of the project's pnpm locks ([`Reader`]):
+    /// hosted mode then routes none of them through a named registry.
+    pub reader: Option<Reader>,
+}
+
+/// A rules_js hub that reads a pnpm lock of the project.
+///
+/// Hosted mode asks before it routes a patched release through a named
+/// registry of pnpm-workspace.yaml, and keeps such a project on the pin
+/// that the Bazel legs build, whatever else the call says: with or without
+/// `update_pnpm_lock`, and whatever pnpm it runs.
+///
+/// The lock reader of rules_js is not what holds the route back: it takes
+/// a routed lock (measured on macOS: rules_js 3.6.0 on Bazel 9.3.2 builds
+/// one, a hub without `update_pnpm_lock`, and the packages it builds hold
+/// the patched bytes; so does rules_js 2.9.3 on Bazel 8.8.2). The pnpm of
+/// a hub with `update_pnpm_lock` is: it runs in a directory that holds the
+/// lock, the `package.json` files and the `data` of the call, so it sees
+/// the registries only where the call lists pnpm-workspace.yaml, and
+/// without them pnpm 11.28.13 and 12.22.0 reject a routed lock
+/// (`ERR_PNPM_MISSING_NAMED_REGISTRY`, measured with
+/// `pnpm install --lockfile-only`). It may also be older than the pnpm
+/// 11.20 that reads such a lock: rules_js picks a pnpm 10 where the
+/// workspace states none. No Bazel leg builds a routed lock with
+/// `update_pnpm_lock` yet, and a hub can turn that attribute on at any
+/// time, so the answer is the same for every hub that reads the lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reader {
+    /// The call (`MODULE.bazel:7`) that names one of the locks in a plain
+    /// string, or whose `pnpm_lock` is not written out as one, which may.
+    /// For a project below the Bazel root the text says that its paths are
+    /// from that root, here and in [`Self::Unseen`], as the warning of
+    /// [`Hubs::hidden`] does: a run in the project's directory has no file
+    /// of that name beside it.
+    Call(String),
+    /// No such call was read, and the workspace was not read whole: what
+    /// could not be read of it, where a hub may be. A doubt of the reader
+    /// ([`Workspace::doubts`], the doubts of the hub's tags) as `file:line:
+    /// why`, or the file of the older `WORKSPACE` system
+    /// ([`Workspace::legacy`]) where it cannot be read or brings in
+    /// rules_js: the repositories it defines are in no tag.
+    ///
+    /// [`Hubs::hidden`] passes over what was not seen, because withholding
+    /// there would take a patch from projects that are patched today. Not
+    /// taking the route costs no patch: the project gets the pin it gets
+    /// today. So the route is taken only where it is certain that no hub
+    /// reads a lock.
+    ///
+    /// Certain of the files that were read, that is. On disk those are the
+    /// files of the Bazel workspace the project is in. In memory they are
+    /// the project's own, so a hub in a Bazel root above the project is
+    /// seen by neither answer there (the module docs).
+    Unseen(String),
+}
+
+/// What the Bazel workspace says of the pnpm locks of the project of
+/// `view`, as hosted mode acts on it: of its root `pnpm-lock.yaml` (`root`:
+/// whether the project has one that was read) and of the members' own
+/// locks (`members`, paths from the project).
+///
+/// The one place that decides it, for every caller. A project with no
+/// pnpm lock is asked nothing: no Bazel file is read for it. And
+/// [`Hubs::hidden`] is about a pin in the root lock, so a project without
+/// that lock has none, whatever the hub names.
+pub async fn hubs(view: &ProjectView<'_>, root: bool, members: &[String]) -> Hubs {
+    if !root && members.is_empty() {
+        return Hubs::default();
+    }
+    let mut locks = vec![LOCK.to_string()];
+    locks.extend(members.iter().cloned());
+    let mut hubs = read(view, &locks).await;
+    if !root {
+        hubs.hidden = None;
+    }
+    hubs
+}
+
+/// What the Bazel workspace the project of `view` is in says of its pnpm
+/// locks `locks` (paths from the project): on disk the workspace of
+/// [`super::bazel_root`], read off the async runtime, in memory the
+/// project itself, whose files are all there is. Nothing outside a Bazel
+/// workspace, and nothing for a user who switched the Bazel support off
+/// ([`super::off`]), on disk and in memory.
+async fn read(view: &ProjectView<'_>, locks: &[String]) -> Hubs {
+    match *view {
+        ProjectView::Memory(_) if super::off() => Hubs::default(),
+        ProjectView::Memory(project) => answer(&memory(project), "", locks),
         _ => {
-            let project = view.disk_root()?.to_path_buf();
+            let Some(project) = view.disk_root().map(std::path::Path::to_path_buf) else {
+                return Hubs::default();
+            };
+            let locks = locks.to_vec();
             run_blocking(move || {
-                let root = super::bazel_root(&project)?;
+                let Some(root) = super::bazel_root(&project) else {
+                    return Hubs::default();
+                };
                 // Bazel has `/` between the parts of a path on every system.
                 let below = root.project.to_string_lossy();
                 let below = below.replace(std::path::MAIN_SEPARATOR, "/");
                 let read = disk(&root.dir);
-                judge(&read, &below)
+                answer(&read, &below, &locks)
             })
             .await
         }
-    };
-    detail.map(|detail| RewriteWarning {
-        code: HIDDEN.into(),
-        detail,
-    })
+    }
 }
 
-/// The text of [`hidden`] for the project in the directory `project` (from
-/// the Bazel root, empty for the root) of the workspace behind `view`.
-fn judge(view: &dyn Fn(&str) -> Entry, project: &str) -> Option<String> {
+/// [`Hubs::hidden`] of a project with a root lock, and nothing else.
+pub async fn hidden(view: &ProjectView<'_>) -> Option<RewriteWarning> {
+    hubs(view, true, &[]).await.hidden
+}
+
+/// [`hubs`] for the project in the directory `project` (from the Bazel
+/// root, empty for the root) of the workspace behind `view`.
+fn answer(view: &dyn Fn(&str) -> Entry, project: &str, locks: &[String]) -> Hubs {
     let ws = Workspace::read(view);
-    let below = |file: &str| match project {
+    let hidden = judge(&ws, view, project).map(|detail| RewriteWarning {
+        code: HIDDEN.into(),
+        detail,
+    });
+    let reader = reader(&ws, project, locks);
+    Hubs { hidden, reader }
+}
+
+/// A path of the project in the directory `project`, from the Bazel root.
+fn below(project: &str, file: &str) -> String {
+    match project {
         "" => file.to_string(),
         project => format!("{project}/{file}"),
+    }
+}
+
+/// What a text says after the place it names, for the project in the
+/// directory `project`: every path of such a text is one from the Bazel
+/// root, which is not the directory of a project below it.
+fn from_root(project: &str) -> &'static str {
+    match project {
+        "" => "",
+        _ => ", with paths from the root of the Bazel workspace",
+    }
+}
+
+/// The lock a call of `npm.npm_translate_lock` names.
+enum Named {
+    /// A file of the main repository, in a plain string.
+    File(Label),
+    /// Another repository's file, or no lock at all.
+    Elsewhere,
+    /// Not written out as a label in a plain string: it may be any lock.
+    Unwritten,
+}
+
+/// The lock that the hub `call` names in `pnpm_lock`.
+fn names(ws: &Workspace, call: &Call) -> Named {
+    match call.arg("pnpm_lock") {
+        Some(Value::Str(label)) => match ws.label(label) {
+            Some(label) if label.repo == Repo::Main => Named::File(label),
+            Some(_) => Named::Elsewhere,
+            None => Named::Unwritten,
+        },
+        Some(_) => Named::Unwritten,
+        None if call.unpacks() => Named::Unwritten,
+        None => Named::Elsewhere,
+    }
+}
+
+/// [`Hubs::reader`] for the locks `locks` of the project in the directory
+/// `project` of the workspace `ws`.
+fn reader(ws: &Workspace, project: &str, locks: &[String]) -> Option<Reader> {
+    let hubs = ws.tags(&extension("npm"), "npm_translate_lock");
+    let from = from_root(project);
+    let call = hubs.calls.iter().find_map(|tag| {
+        let reads = match names(ws, tag.call) {
+            Named::File(label) => locks
+                .iter()
+                .any(|lock| label.path() == below(project, lock)),
+            Named::Elsewhere => false,
+            Named::Unwritten => true,
+        };
+        reads.then(|| Reader::Call(format!("{}:{}{from}", tag.file, tag.call.line)))
+    });
+    if call.is_some() {
+        return call;
+    }
+    // No call that was read reads a lock. That is the answer only where
+    // every call was read.
+    let doubt = |doubt: &Doubt| match doubt.line {
+        0 => format!("{}: {}{from}", doubt.file, doubt.why),
+        line => format!("{}:{line}: {}{from}", doubt.file, doubt.why),
     };
-    let (lock, settings) = (below(LOCK), below(SETTINGS));
+    if let Some(unread) = ws.doubts.first().or(hubs.doubts.first()) {
+        return Some(Reader::Unseen(doubt(unread)));
+    }
+    match &ws.legacy {
+        Some(Ok((file, legacy))) => brings_in_rules_js(legacy).map(|line| {
+            Reader::Unseen(format!(
+                "{file}:{line}: it brings in rules_js, and a hub that this file defines is \
+                 not read{from}"
+            ))
+        }),
+        Some(Err(unread)) => Some(Reader::Unseen(doubt(unread))),
+        None => None,
+    }
+}
+
+/// The line on which the file of the older `WORKSPACE` system brings in
+/// rules_js: a `load` from the ruleset's repository, a `load` of its hub
+/// rule from anywhere, or a call of that rule, by its own name or by one a
+/// `load` gives it. `None` for a file that plainly does none of these: an
+/// `http_archive` of something else defines no hub of a pnpm lock.
+///
+/// Not looked at, as for the other rulesets: a macro of a `.bzl` file that
+/// makes the call, and a repository of the ruleset under another name
+/// whose hub rule the file does not load itself.
+fn brings_in_rules_js(legacy: &File) -> Option<usize> {
+    const RULE: &str = "npm_translate_lock";
+    let rule = Value::Str(RULE.to_string());
+    let loads = legacy.calls.iter().filter(|call| call.callee == "load");
+    let names: Vec<&str> = loads
+        .flat_map(|load| &load.args)
+        .filter_map(|arg| match &arg.how {
+            How::Keyword(alias) if arg.value == rule => Some(alias.as_str()),
+            _ => None,
+        })
+        .chain([RULE])
+        .collect();
+    let brings = |call: &&Call| match call.callee.as_str() {
+        "load" => {
+            let ruleset = |label: &str| {
+                let repository = label.trim_start_matches('@');
+                repository.starts_with("aspect_rules_js//")
+            };
+            matches!(call.positional(0), Some(Value::Str(label)) if ruleset(label))
+                || call.args.iter().any(|arg| arg.value == rule)
+        }
+        callee => names.contains(&callee),
+    };
+    legacy.calls.iter().find(brings).map(|call| call.line)
+}
+
+/// The text of [`Hubs::hidden`] for the project in the directory `project`
+/// (from the Bazel root, empty for the root) of the workspace `ws`, whose
+/// other files are read through `view`.
+fn judge(ws: &Workspace, view: &dyn Fn(&str) -> Entry, project: &str) -> Option<String> {
+    let (lock, settings) = (below(project, LOCK), below(project, SETTINGS));
     let main = |label: &str| ws.label(label).filter(|label| label.repo == Repo::Main);
     let hubs = ws.tags(&extension("npm"), "npm_translate_lock");
     for (file, call) in hubs.calls.iter().map(|tag| (tag.file, tag.call)) {
-        let named = match call.arg("pnpm_lock") {
-            Some(Value::Str(label)) => main(label).filter(|label| label.path() == lock),
-            _ => None,
-        };
-        let Some(named) = named else {
-            continue;
+        let named = match names(ws, call) {
+            Named::File(named) if named.path() == lock => named,
+            _ => continue,
         };
         let (has, how) = match call.arg("update_pnpm_lock") {
             Some(Value::Name(written)) if written == "True" => ("has", "`update_pnpm_lock`"),
@@ -203,7 +421,7 @@ fn judge(view: &dyn Fn(&str) -> Entry, project: &str) -> Option<String> {
         if written.is_none() && fix.is_none() {
             continue;
         }
-        let Some(pnpm) = release(&ws, view, call) else {
+        let Some(pnpm) = release(ws, view, call) else {
             continue;
         };
         // The label of the file beside the lock, in the lock's own package.
@@ -254,11 +472,7 @@ fn judge(view: &dyn Fn(&str) -> Entry, project: &str) -> Option<String> {
             ),
         };
         let steps: Vec<String> = fix.into_iter().chain(list).collect();
-        // Every path of the text is one from the Bazel root.
-        let from = match project {
-            "" => "",
-            _ => ", with paths from the root of the Bazel workspace",
-        };
+        let from = from_root(project);
         return Some(format!(
             "{file}:{}{from}: this `{}` {has} Bazel run {pnpm} to keep {lock} up to date \
              ({how}), and {why}; {lock} was not rewritten — {} and re-run",
@@ -274,10 +488,22 @@ fn judge(view: &dyn Fn(&str) -> Entry, project: &str) -> Option<String> {
 /// hosted pin: with the setting in it, the file is byte for byte the one
 /// hosted mode creates, which the undo cannot tell from the user's own
 /// (`cleanup_side_config` of the npm restore).
+///
+/// A file an earlier run made for a route through named registries is one
+/// too: the run that pins the lock takes the route's entries out
+/// ([`Hubs::reader`]), and what is left is that file. Any registry of the
+/// shape counts, as nothing here says which host is a patch server's.
 fn removed_with_the_pin(text: &str) -> bool {
-    match plan_workspace_trust(Some(text)) {
+    use crate::formats::pnpm::named_registries::{unwind, Owned, Unwound};
+
+    let text = match unwind(text, &Owned::of(Some(text), &|_| true), &[]) {
+        Unwound::Delete => return true,
+        Unwound::Rewrite(without, _) => without,
+        Unwound::Unchanged => text.to_string(),
+    };
+    match plan_workspace_trust(Some(&text)) {
         TrustPlan::Append(pinned) | TrustPlan::Scaffold(pinned) => is_trust_scaffold(&pinned),
-        TrustPlan::AlreadyTrue => is_trust_scaffold(text),
+        TrustPlan::AlreadyTrue => is_trust_scaffold(&text),
         _ => false,
     }
 }
@@ -411,6 +637,30 @@ fn picks_an_older_pnpm(ws: &Workspace, view: &dyn Fn(&str) -> Entry) -> bool {
     known(&asked) && selected
 }
 
+/// What the tests of this crate write as the `MODULE.bazel` of a workspace
+/// with a rules_js hub.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    /// A `MODULE.bazel` whose `npm.npm_translate_lock` (line 3) has `call`
+    /// as its arguments, with a tag that states pnpm 11.28.10 as the pnpm
+    /// Bazel runs.
+    pub(crate) fn rules_js_hub(call: &str) -> String {
+        format!(
+            "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+             npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+             npm.npm_translate_lock({call})\n\
+             pnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
+             pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")\n"
+        )
+    }
+
+    /// The arguments of the hub of [`super::Hubs::hidden`]: it keeps the
+    /// root lock up to date with a pnpm 11 that does not see
+    /// pnpm-workspace.yaml.
+    pub(crate) const HIDING_HUB_CALL: &str =
+        "pnpm_lock = \"//:pnpm-lock.yaml\", update_pnpm_lock = True";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,7 +693,7 @@ mod tests {
             Some((_, text)) => Entry::Text(text.to_string()),
             None => Entry::Absent,
         };
-        judge(&view, project)
+        judge(&Workspace::read(&view), &view, project)
     }
 
     /// [`said`] for the root project of a workspace with `module` and a
@@ -548,9 +798,25 @@ mod tests {
              {OWN} and re-run"
         );
         let scaffold = "packages:\n  - '.'\ntrustLockfile: true\n";
-        for text in [None, Some(""), Some("packages:\n  - '.'\n"), Some(scaffold)] {
+        // The file of an earlier run that routed a release through a named
+        // registry: the run that pins the lock takes the route out of it.
+        let patch = "58f14d5a-0000-4000-8000-000000000000";
+        let routed = format!(
+            "packages:\n  - '.'\nnamedRegistries:\n  socket-58f14d5a: \
+             https://patch.test/patch/npm/leaf/1.0.0/t/{patch}/\n\
+             overrides:\n  'leaf@1.0.0': 'socket-58f14d5a:1.0.0'\n"
+        );
+        for text in [
+            None,
+            Some(""),
+            Some("packages:\n  - '.'\n"),
+            Some(scaffold),
+            Some(routed.as_str()),
+        ] {
             assert_eq!(with(ELEVEN, text), Some(gone.clone()), "{text:?}");
         }
+        // With a line of the user's own it is a file that stays.
+        assert_eq!(with(ELEVEN, Some(&format!("# mine\n{routed}"))), None);
         // Hosted mode does not write the setting to it: the pnpm of the
         // hub would reject the pinned lock although it reads the file.
         let unset = format!(
@@ -1015,6 +1281,167 @@ mod tests {
         assert_eq!(hub("//:pnpm-lock.yaml", ""), None, "the lock of the root");
     }
 
+    /// [`Hubs::reader`] names the call of a hub that reads one of the locks
+    /// asked about, whatever else the call says, and a call whose lock is
+    /// not written out, which may be one of them. A hub that reads another
+    /// lock, another repository's, or no hub at all is no reader.
+    #[test]
+    fn a_hub_reads_the_lock_it_names_whatever_else_it_says() {
+        let reads = |hub: &str, project: &str, locks: &[&str]| {
+            let module = module(hub, ELEVEN);
+            let view = |path: &str| match path {
+                "MODULE.bazel" => Entry::Text(module.clone()),
+                _ => Entry::Absent,
+            };
+            let locks: Vec<String> = locks.iter().map(|lock| lock.to_string()).collect();
+            answer(&view, project, &locks).reader
+        };
+        let call = Some(Reader::Call("MODULE.bazel:4".to_string()));
+        let listed = format!("{HUB}, data = [\"//:pnpm-workspace.yaml\"]");
+        for hub in [LOCKED, HUB, listed.as_str(), "pnpm_lock = LOCK", "**hub"] {
+            assert_eq!(reads(hub, "", &[LOCK]), call, "{hub}");
+        }
+        // The lock of a member, and a project below the Bazel root.
+        let member = "pnpm_lock = \"//packages/a:pnpm-lock.yaml\"";
+        assert_eq!(reads(member, "", &[LOCK]), None);
+        assert_eq!(
+            reads(member, "", &[LOCK, "packages/a/pnpm-lock.yaml"]),
+            call
+        );
+        // Its call is in a file of the Bazel root, not of the project.
+        let from_root = "MODULE.bazel:4, with paths from the root of the Bazel workspace";
+        assert_eq!(
+            reads(member, "packages/a", &[LOCK]),
+            Some(Reader::Call(from_root.to_string()))
+        );
+        assert_eq!(reads(LOCKED, "packages/a", &[LOCK]), None);
+        // Another repository's lock, and a workspace with no hub.
+        assert_eq!(
+            reads("pnpm_lock = \"@other//:pnpm-lock.yaml\"", "", &[LOCK]),
+            None
+        );
+        let none = |_: &str| Entry::Absent;
+        assert_eq!(answer(&none, "", &[LOCK.to_string()]), Hubs::default());
+    }
+
+    /// Where no call that was read reads the lock, the answer is "no hub
+    /// reads it" only if the workspace was read whole. A file that
+    /// `MODULE.bazel` includes and that is not there, a proxy of the
+    /// extension that is handed to something else, and a `WORKSPACE` file
+    /// that brings in rules_js each leave a hub that may read the lock, and
+    /// say what was not read. A call that does read the lock is named
+    /// first. A workspace that is read whole, with a hub of another lock or
+    /// with no rules_js at all, has no reader, and neither has one whose
+    /// `WORKSPACE` file is about something else.
+    #[test]
+    fn what_the_reader_may_not_have_seen_counts_as_a_hub_that_may_read_the_lock() {
+        let reader = |files: &[(&str, &str)]| {
+            let view = |path: &str| match files.iter().find(|(name, _)| *name == path) {
+                Some((_, text)) => Entry::Text(text.to_string()),
+                None => Entry::Absent,
+            };
+            answer(&view, "", &[LOCK.to_string()]).reader
+        };
+        let unseen = |files: &[(&str, &str)]| match reader(files) {
+            Some(Reader::Unseen(what)) => what,
+            other => panic!("{files:?}: {other:?}"),
+        };
+        let elsewhere = module("pnpm_lock = \"//tools:pnpm-lock.yaml\"", ELEVEN);
+        assert_eq!(reader(&[("MODULE.bazel", &elsewhere)]), None);
+        let java = "bazel_dep(name = \"rules_java\", version = \"8.0.0\")\n";
+        assert_eq!(reader(&[("MODULE.bazel", java)]), None);
+
+        // A file that is included and not there.
+        let including = format!("{elsewhere}include(\"//tools:npm.MODULE.bazel\")\n");
+        let what = unseen(&[("MODULE.bazel", &including)]);
+        assert!(
+            what.starts_with("tools/npm.MODULE.bazel: ") && what.contains("MODULE.bazel:7"),
+            "{what}"
+        );
+        // The same file, there: read, and its hub is the reader.
+        let hub = "npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+                   npm.npm_translate_lock(pnpm_lock = \"//:pnpm-lock.yaml\")\n";
+        assert_eq!(
+            reader(&[
+                ("MODULE.bazel", &including),
+                ("tools/npm.MODULE.bazel", hub)
+            ]),
+            Some(Reader::Call("tools/npm.MODULE.bazel:2".to_string()))
+        );
+        // A proxy of the extension that is not only called.
+        let handed = format!("{elsewhere}register(npm)\n");
+        let what = unseen(&[("MODULE.bazel", &handed)]);
+        assert!(what.starts_with("MODULE.bazel:7: "), "{what}");
+        // The file of the older system, beside module files or alone.
+        let rule = "npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n";
+        for files in [
+            &[("MODULE.bazel", elsewhere.as_str()), ("WORKSPACE", rule)][..],
+            &[("WORKSPACE.bazel", rule)],
+        ] {
+            let what = unseen(files);
+            let file = files.last().expect("a file").0;
+            assert_eq!(
+                what,
+                format!(
+                    "{file}:1: it brings in rules_js, and a hub that this file defines is not \
+                     read"
+                )
+            );
+        }
+        // The file brings in rules_js by a `load` from its repository, by a
+        // `load` of the hub rule from anywhere, or by a call of the rule
+        // under the name a `load` gave it.
+        let other = "http_archive(name = \"other\", urls = [\"https://example.test/o.tgz\"])\n";
+        for (text, line) in [
+            (
+                "load(\"@aspect_rules_js//js:repositories.bzl\", \"rules_js_dependencies\")\n",
+                1,
+            ),
+            (
+                "load(\"@js//npm:repositories.bzl\", \"npm_translate_lock\")\n",
+                1,
+            ),
+            (
+                "load(\"//tools:js.bzl\", lock = \"npm_translate_lock\")\n\nlock(name = \"npm\")\n",
+                1,
+            ),
+        ] {
+            let text = format!("{other}{text}");
+            let what = unseen(&[("WORKSPACE", text.as_str())]);
+            assert!(
+                what.starts_with(&format!("WORKSPACE:{}: it brings in rules_js", line + 1)),
+                "{text}: {what}"
+            );
+        }
+        // One that only names the workspace defines nothing, and one that
+        // defines something else defines no hub of a pnpm lock.
+        let named = "workspace(name = \"app\")\n";
+        let unrelated = format!("{named}{other}load(\"@other//:deps.bzl\", \"deps\")\n\ndeps()\n");
+        for text in [named, unrelated.as_str()] {
+            assert_eq!(
+                reader(&[("MODULE.bazel", &elsewhere), ("WORKSPACE", text)]),
+                None,
+                "{text}"
+            );
+        }
+        // One that cannot be read may define anything.
+        let unread = |path: &str| match path {
+            "WORKSPACE" => Entry::Unreadable("it is not UTF-8".to_string()),
+            _ => Entry::Absent,
+        };
+        let what = answer(&unread, "", &[LOCK.to_string()]).reader;
+        assert!(
+            matches!(&what, Some(Reader::Unseen(what)) if what.starts_with("WORKSPACE: ")),
+            "{what:?}"
+        );
+        // A lock that is no label may be any.
+        let odd = module("pnpm_lock = \"//:a:b\"", ELEVEN);
+        assert_eq!(
+            reader(&[("MODULE.bazel", &odd)]),
+            Some(Reader::Call("MODULE.bazel:4".to_string()))
+        );
+    }
+
     /// A checkout and a project in memory with the same files get the same
     /// warning, and a checkout that is no Bazel workspace gets none.
     #[tokio::test]
@@ -1041,5 +1468,20 @@ mod tests {
             on_disk.detail
         );
         assert_eq!(hidden(&ProjectView::Memory(&project)).await, Some(on_disk));
+        // One read answers both questions, on disk and in memory alike.
+        let disk = hubs(&ProjectView::Disk(dir.path()), true, &[]).await;
+        assert_eq!(
+            disk.reader,
+            Some(Reader::Call("MODULE.bazel:4".to_string()))
+        );
+        assert_eq!(disk.hidden, hidden(&ProjectView::Disk(dir.path())).await);
+        assert_eq!(hubs(&ProjectView::Memory(&project), true, &[]).await, disk);
+        // No root lock: nothing to keep out of a run, and the call is
+        // still the reader of a member's lock. No pnpm lock: nothing asked.
+        let member = ["packages/a/pnpm-lock.yaml".to_string()];
+        let lockless = hubs(&ProjectView::Memory(&project), false, &member).await;
+        assert_eq!((lockless.hidden, lockless.reader), (None, disk.reader));
+        let none = hubs(&ProjectView::Memory(&project), false, &[]).await;
+        assert_eq!(none, Hubs::default());
     }
 }

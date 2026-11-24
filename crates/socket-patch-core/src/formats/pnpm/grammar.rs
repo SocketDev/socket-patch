@@ -257,6 +257,25 @@ pub(crate) fn suffix<'a>(key: &'a str, name: &str, version: &str) -> Option<&'a 
     Some(suffix)
 }
 
+/// [`suffix`] as the hosted edit reads a key: a release routed through
+/// the named registry of its patch (`name@socket-58f14d5a:version`,
+/// [`super::registry_alias`]) is the same registry entry. Only a registry
+/// under the name hosted mode gives one today counts
+/// ([`super::named_registries::strip_alias`]): any other is the project's
+/// own, and its release is not the npm one.
+pub(crate) fn hosted_suffix<'a>(key: &'a str, name: &str, version: &str) -> Option<&'a str> {
+    if let Some(suffix) = suffix(key, name, version) {
+        return Some(suffix);
+    }
+    let (registry, rest) = unquote(key)
+        .strip_prefix(name)?
+        .strip_prefix('@')?
+        .split_once(':')?;
+    super::named_registries::is_current_alias(registry).then_some(())?;
+    let suffix = rest.strip_prefix(version)?;
+    (suffix.is_empty() || suffix.starts_with('(')).then_some(suffix)
+}
+
 pub(crate) struct Resolution<'a> {
     pub range: Range<usize>,
     pub fields: Vec<(&'a str, &'a str)>,

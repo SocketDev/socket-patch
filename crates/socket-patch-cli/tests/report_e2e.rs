@@ -211,6 +211,70 @@ async fn a_dry_run_sends_nothing_and_silent_prints_nothing() {
     assert_eq!(bodies(&server).await.len(), 1);
 }
 
+/// A pnpm pin that hosted mode routed through its patch's named registry
+/// is a hosted pin like any other: the lock keys the release
+/// `name@socket-<id>:version`, and a report by package name still finds
+/// the patch and names it under hosted mode.
+#[tokio::test]
+async fn a_pin_on_the_pnpm_registry_route_is_reported_as_hosted() {
+    const TOKEN: &str = "22222222-2222-4222-8222-222222222222";
+    let server = endpoint(201).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let address = format!("https://patch.socket.dev/patch/npm/left-pad/1.3.0/{TOKEN}/{UUID}/");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"consumer","version":"0.0.0","packageManager":"pnpm@12.22.0","dependencies":{"left-pad":"1.3.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pnpm-workspace.yaml"),
+        format!(
+            "packages:\n  - '.'\nnamedRegistries:\n  socket-8be53d06: {address}\noverrides:\n  \
+             'left-pad@1.3.0': 'socket-8be53d06:1.3.0'\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pnpm-lock.yaml"),
+        format!(
+            "lockfileVersion: '9.0'\n\noverrides:\n  left-pad@1.3.0: socket-8be53d06:1.3.0\n\n\
+             importers:\n\n  .:\n    dependencies:\n      left-pad:\n        \
+             specifier: socket-8be53d06:1.3.0\n        version: socket-8be53d06:1.3.0\n\n\
+             packages:\n\n  left-pad@socket-8be53d06:1.3.0:\n    \
+             resolution: {{integrity: sha512-PATCHEDpatchedPATCHEDpatched0123456789==, \
+             tarball: {address}left-pad-1.3.0.tgz}}\n\n\
+             snapshots:\n\n  left-pad@socket-8be53d06:1.3.0: {{}}\n"
+        ),
+    )
+    .unwrap();
+
+    let out = report(root, &server, &["left-pad", "--reason", "build", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(
+        stdout_json(&out)["patches"],
+        serde_json::json!([{
+            "uuid": UUID,
+            "ecosystem": "npm",
+            "mode": "hosted",
+            "purl": "pkg:npm/left-pad@1.3.0",
+        }])
+    );
+    let sent = bodies(&server).await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0]["metadata"]["patches"],
+        serde_json::json!([
+            { "uuid": UUID, "ecosystem": "npm", "mode": "hosted", "outcome": "reported" }
+        ])
+    );
+    let text = sent[0].to_string();
+    assert!(
+        !text.contains("left-pad") && !text.contains(TOKEN) && !text.contains("socket-8be53d06"),
+        "neither the package, the grant nor the registry is sent: {text}"
+    );
+}
+
 /// A name the project holds no patch for is an error that says how to
 /// report by UUID, and nothing is sent, not even for the targets that
 /// did match.

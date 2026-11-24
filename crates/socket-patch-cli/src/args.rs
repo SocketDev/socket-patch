@@ -325,13 +325,15 @@ pub struct GlobalArgs {
     pub no_telemetry: bool,
 
     /// Hosted mode (`scan`/`get --mode hosted`): do NOT auto-configure
-    /// `trustLockfile: true` in pnpm-workspace.yaml after a pnpm-lock.yaml
-    /// (lockfileVersion >= 9) is repointed at the hosted patch server.
-    /// pnpm >= 11 rejects the repointed lock without that trust grant, so
-    /// opting out means every install needs `pnpm install --trust-lockfile`
-    /// instead (the run's warning spells out both recoveries). Only
-    /// hosted-mode `scan` and `get` read this; other subcommands accept it
-    /// silently.
+    /// pnpm-workspace.yaml after a pnpm-lock.yaml (lockfileVersion >= 9) is
+    /// repointed at the hosted patch server. The run otherwise declares the
+    /// patch server's registry of each patched package (`namedRegistries`)
+    /// and routes the package to it (`overrides`), or sets
+    /// `trustLockfile: true` where that does not apply. pnpm >= 11 rejects
+    /// the repointed lock without one of them, so opting out means setting
+    /// `trustLockfile: true` yourself or installing with
+    /// `pnpm install --trust-lockfile`. Only hosted-mode `scan` and `get`
+    /// read this; other subcommands accept it silently.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long = "no-trust-lockfile-config",

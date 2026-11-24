@@ -255,9 +255,11 @@ impl ScanMode {
 ///   check lives here. `--mode agent --sync` is redundant but accepted.
 /// * `--prune` is an orthogonal GC knob and never conflicts. (`--sync`'s
 ///   prune half is orthogonal too, and stays a separate read in `run`.)
-///   Hosted mode runs no GC, so `--mode hosted --prune` stays accepted but
-///   emits an explicit `redirect_prune_ignored` warning in `run` rather
-///   than silently dropping the flag.
+///   Hosted mode sweeps no `.socket/` state, so `--mode hosted --prune`
+///   stays accepted but emits an explicit `redirect_prune_ignored` warning
+///   in `run` rather than silently dropping that half of the flag; the
+///   pnpm registry entries no lockfile uses go on every hosted run, and
+///   the flag adds their count as the envelope's `gc`.
 ///
 /// Public (not `pub(crate)`) so the CLI-contract tests can exercise the
 /// resolution without driving a full `run()`.
@@ -333,7 +335,9 @@ pub struct ScanArgs {
     /// diff and package-archive files from `.socket/`. Off by default so
     /// a temporary uninstall does not lose manifest entries; combine with
     /// `--mode agent` (or use `--sync`) for the auto-update workflow.
-    /// Ignored, with a warning, in hosted mode
+    /// The pass also removes the pnpm registry entries of hosted patches
+    /// that no lockfile uses any more. Hosted mode has no `.socket/` state
+    /// to sweep (the run says so) and removes those entries on every scan
     #[arg(long, default_value_t = false)]
     pub prune: bool,
 
@@ -1012,15 +1016,19 @@ fn download_run<'a>(args: &'a ScanArgs, api_client: &'a ApiClient) -> DownloadRu
 pub(super) const REDIRECT_SUPERSEDES_VENDORED: &str = "redirect_supersedes_vendored";
 
 /// Warning code + detail emitted when `--prune` is combined with
-/// `--mode hosted`: the hosted flow runs no GC, so the flag would otherwise
-/// be silently dropped. `--prune` stays accepted (CLI_CONTRACT.md: an
-/// orthogonal GC knob, never a usage error), but the no-op is explicit in
-/// both the JSON `warnings[]` and stderr.
+/// `--mode hosted`: the hosted flow sweeps no `.socket/` state, so that
+/// half of the flag would otherwise be silently dropped. `--prune` stays
+/// accepted (CLI_CONTRACT.md: an orthogonal GC knob, never a usage error),
+/// and what it does not do is explicit in both the JSON `warnings[]` and
+/// stderr. Hosted mode's own state is in the lockfiles: every hosted scan
+/// takes out the pnpm registry entries no lockfile uses any more, with or
+/// without the flag, which only adds the `gc` count of them.
 pub(super) const REDIRECT_PRUNE_IGNORED: &str = "redirect_prune_ignored";
 pub(super) const REDIRECT_PRUNE_IGNORED_DETAIL: &str =
-    "--prune has no effect with --mode hosted: the hosted flow rewrites lockfiles only and \
-     runs no GC sweep of `.socket/` state; run `scan --mode agent --prune` or \
-     `scan --mode vendored --prune` to garbage-collect";
+    "--prune sweeps no `.socket/` state with --mode hosted (run `scan --mode agent --prune` \
+     or `scan --mode vendored --prune` to garbage-collect that); a hosted scan keeps its \
+     state in the lockfiles and already removes the pnpm registry entries no lockfile uses \
+     any more on every run";
 
 /// The PURLs claimed by BOTH a hosted pin (`redirect`, the lockfiles'
 /// hosted state — see [`crate::commands::hosted_state_from_pins`]) and
@@ -2408,8 +2416,8 @@ async fn scan_project(
     // `patches.enabled: false` writes nothing, the GC included.
     let prune = (args.prune || args.sync) && policy.writes_allowed();
 
-    // Hosted mode runs no GC: say so once up front on the human path. The
-    // `--json` path carries it in `redirect.warnings[]`.
+    // Hosted mode sweeps no `.socket/` state: say so once up front on the
+    // human path. The `--json` path carries it in `warnings[]`.
     if hosted && prune && !args.common.json && !args.common.silent {
         eprintln!("Warning: {REDIRECT_PRUNE_IGNORED_DETAIL}");
     }
@@ -3049,6 +3057,12 @@ async fn scan_project(
         // last vendored dependency was removed could never reconcile.
         let unwired_gc = if prune_reverts_unwired && !unwired_vendored.is_empty() {
             Some(gc::run_vendor_only_gc(&args.common, &manifest_path, &socket_dir).await)
+        } else if (hosted || prune) && policy.writes_allowed() {
+            // What is left of a pnpm registry route that no lockfile uses
+            // any more is judged by the lockfiles too. A hosted scan takes
+            // it out on every run; with nothing crawled its rewrite never
+            // runs, so this pass does.
+            gc::run_registry_only_gc(&args.common, &socket_dir, hosted).await
         } else {
             None
         };
@@ -3091,12 +3105,26 @@ async fn scan_project(
             for skip in &user_patch_skips {
                 env.record(skip.clone());
             }
-            if let Some(gc) = &unwired_gc {
-                gc.record_into(&mut env, args.common.dry_run);
+            // A hosted run reports the registry entries it took out as
+            // the >=1-package path does: an event each, and under
+            // `--prune` the `gc` count (it sweeps no `.socket/` state).
+            match &unwired_gc {
+                Some(gc) if hosted => {
+                    hosted::record_registry_cleanup(
+                        &mut env,
+                        gc.registry_entries(),
+                        prune && gc.swept_registry(),
+                        args.common.dry_run,
+                    );
+                    env.warnings.extend(gc.run_warnings());
+                }
+                Some(gc) => gc.record_into(&mut env, args.common.dry_run),
+                None => {}
             }
             policy.fold_into_envelope(&mut env);
             // Hosted mode: the same `redirect` block as the ≥1-package
-            // path (nothing rewritten).
+            // path (nothing rewritten but what the registry cleanup took
+            // entries out of).
             if hosted {
                 if prune {
                     env.warnings.push(hosted::prune_ignored_warning());
@@ -3104,7 +3132,11 @@ async fn scan_project(
                 if let Some(sweep) = stale_sweep {
                     sweep.record_into(&mut env);
                 }
-                env.set_extra("redirect", hosted::redirect_block(Vec::new()));
+                let rewritten = unwired_gc
+                    .as_ref()
+                    .map(gc::GcSummary::registry_files)
+                    .unwrap_or_default();
+                env.set_extra("redirect", hosted::redirect_block(rewritten));
             } else if !vendor {
                 // `redirectState` rides the empty-discovery envelope too
                 // (same rule as the ≥1-package path). `wiringLive` is empty

@@ -1,0 +1,9 @@
+{
+  "name": "b",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "opt-peers": "1.0.0",
+    "other": "1.0.0"
+  }
+}

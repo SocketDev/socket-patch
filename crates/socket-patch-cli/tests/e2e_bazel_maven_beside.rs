@@ -1550,6 +1550,76 @@ fn a_hosted_scan_takes_a_stale_entry_out_of_the_block() {
     );
 }
 
+/// A hosted scan that crawls nothing does two things, and they leave each
+/// other alone. It takes a stale entry out of the Bazel workspace's block,
+/// first and under the apply lock; and it takes what a pnpm registry route
+/// left out of the pnpm files, after that and under a lock of its own. The
+/// envelope holds both: the event of the entry, an event for each entry of
+/// the route, and the route's files as what the run rewrote.
+#[test]
+fn an_empty_hosted_scan_takes_a_stale_entry_and_what_a_pnpm_route_left() {
+    let machine = Machine::start();
+    machine.make(&pinned(), false, false);
+    assert_eq!(machine.step(COMMANDS[0]).wrote.len(), 1);
+    let proj = machine.root.join("proj");
+    // A hub that fetches no jar at all: the scan has no package.
+    let empty = json!({ "artifacts": {}, "dependencies": {}, "repositories": {}, "version": "3" });
+    std::fs::write(proj.join("maven_install.json"), empty.to_string()).expect("the lock");
+    // What a routed scan left once its package was gone: the file it
+    // created, with a registry and an override that no lock uses, and the
+    // lock's record of that override.
+    let (token, patch) = (
+        "22222222-2222-4222-8222-222222222222",
+        "aaaaaaaa-1111-4111-8111-111111111111",
+    );
+    let workspace = format!(
+        "packages:\n  - '.'\nnamedRegistries:\n  socket-aaaaaaaa: \
+         https://patch.socket.dev/patch/npm/gone/1.0.0/{token}/{patch}/\noverrides:\n  \
+         'gone@1.0.0': 'socket-aaaaaaaa:1.0.0'\n"
+    );
+    std::fs::write(proj.join("pnpm-workspace.yaml"), workspace).expect("the workspace file");
+    let bare = "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n";
+    let record = "overrides:\n  gone@1.0.0: socket-aaaaaaaa:1.0.0\n\nimporters:\n";
+    std::fs::write(
+        proj.join("pnpm-lock.yaml"),
+        bare.replace("importers:\n", record),
+    )
+    .expect("the pnpm lock");
+
+    let scan = machine.step(&SCAN);
+    let envelope = scan.envelope();
+    assert_eq!(scan.code, Some(0), "{scan:?}");
+    assert_eq!(envelope["scannedPackages"], 0, "{scan:?}");
+    // The entry of the block.
+    let stale = (
+        PURL.to_string(),
+        "rolledBack".to_string(),
+        "maven_bazel_entry_stale".to_string(),
+    );
+    assert!(event_triples(&envelope).contains(&stale), "{scan:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&scan.wrote[MODULE]),
+        HUB,
+        "{scan:?}"
+    );
+    // The entries of the route.
+    let unused = envelope["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter(|event| event["errorCode"] == "registry_entry_unused")
+        .count();
+    assert_eq!(unused, 3, "{scan:?}");
+    assert_eq!(
+        envelope["redirect"]["rewrittenFiles"],
+        json!(["pnpm-lock.yaml", "pnpm-workspace.yaml"]),
+        "{scan:?}"
+    );
+    let lock = std::fs::read_to_string(proj.join("pnpm-lock.yaml")).expect("the pnpm lock");
+    assert_eq!(lock, bare, "{scan:?}");
+    assert!(!proj.join("pnpm-workspace.yaml").exists(), "{scan:?}");
+}
+
 /// The socket.yml policy holds a stale entry as it holds the packages of
 /// the run: a scan of a root that the policy filters, and one whose
 /// policy filters the package, leave the entry where it is.
