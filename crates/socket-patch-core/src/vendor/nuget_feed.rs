@@ -121,6 +121,40 @@ pub(crate) fn nupkg_leaf(id_lower: &str, version: &str) -> String {
     format!("{id_lower}.{}.nupkg", normalize_nuget_version(version))
 }
 
+/// Where a rules_csharp hub has the package `id version_norm` in the folder
+/// `uuid_dir_rel` of its patch: `<folder>/<idLower>/<version>`, the shape of
+/// a folder feed. `nuget.config` names this folder for such a package.
+fn hub_folder_rel(uuid_dir_rel: &str, id: &str, version_norm: &str) -> String {
+    format!("{uuid_dir_rel}/{}/{version_norm}", id.to_lowercase())
+}
+
+/// Why a hub would not find `id version_norm` in the folder of its patch:
+/// a lock that spells the version otherwise. rules_csharp asks a feed for
+/// the lock's `resolved` as it is written, in lower case, and the folder
+/// holds the version as NuGet normalizes it, which is what `dotnet restore`
+/// writes into a lock.
+fn spelled_otherwise<'a>(
+    locks: impl IntoIterator<Item = (&'a str, &'a str)>,
+    id: &str,
+    version_norm: &str,
+) -> Option<String> {
+    locks.into_iter().find_map(|(rel, text)| {
+        let doc = lock_value(text).ok()?;
+        let spelled = crate::formats::nuget::lock::nuget_lock_entries(&doc)
+            .filter(|entry| entry.id.eq_ignore_ascii_case(id))
+            .map(|entry| entry.resolved)
+            .find(|resolved| {
+                normalize_nuget_version(resolved) == version_norm
+                    && resolved.to_lowercase() != version_norm
+            })?;
+        Some(format!(
+            "{rel} names {id} {spelled}, and a rules_csharp hub asks its feeds for the version as \
+             the lock spells it, where the folder of the patch holds {version_norm}: run `dotnet \
+             restore` so that the lock names {version_norm}"
+        ))
+    })
+}
+
 /// Everything [`vendor_nuget`] decides before it can first ask the patch
 /// service: the coordinate guards, the no-op of an empty patch, the
 /// nuget.config and packages.lock.json reads, and whether the feed already
@@ -145,6 +179,12 @@ struct NugetPrelude {
     /// Why the block of a package that is wired for a hub can no longer
     /// be shown to work.
     hub_doubt: Option<String>,
+    /// The folders of earlier patches of this package that `nuget.config`
+    /// still names for a hub: this patch takes their place in the block.
+    superseded: Vec<String>,
+    /// The locks of the project as the gate of the block is asked about
+    /// them ([`vendored`]).
+    governed_rels: Vec<String>,
     config_path: Option<PathBuf>,
     config_text: Option<String>,
     /// Every lock the projects under the root restore into (#353, #514).
@@ -268,29 +308,46 @@ async fn nuget_prelude(
     // The idempotent hot path's test (see `vendor_nuget`): a live
     // `<packageSources>` source under our key. A commented-out one — or the
     // key merely mentioned elsewhere — is not wiring NuGet reads.
-    let named = config_text
+    let sources = config_text
         .as_deref()
         .and_then(crate::formats::nuget::parse_config)
-        .and_then(|parsed| {
-            parsed
-                .sources
-                .into_iter()
-                .find(|(key, _)| *key == source_key)
-        });
+        .map(|parsed| parsed.sources)
+        .unwrap_or_default();
+    let named = sources.iter().find(|(key, _)| *key == source_key);
     let config_wired = named.is_some();
     // Where the package lies. A rules_csharp hub that reads a lock of the
     // project takes it from `<folder>/<idLower>/<version>/`, through the
     // block of the root MODULE.bazel; every other project keeps it in the
     // folder itself. A package that is wired stays where the config names
     // it, and only one that lies where a hub has it is the hub's.
-    let nested = format!("{uuid_dir_rel}/{id_lower}/{version_norm}");
-    let for_hub = named.is_some_and(|(_, value)| value == nested);
+    let nested = hub_folder_rel(&uuid_dir_rel, name, &version_norm);
+    let for_hub = named.is_some_and(|(_, value)| *value == nested);
+    // An earlier patch of this package keeps its source in the config (its
+    // pattern is set aside): where that one lies as a hub has it, its
+    // folder is one this patch supersedes.
+    let below = format!("/{id_lower}/{version_norm}");
+    let earlier = sources.iter().filter(|(key, _)| *key != source_key);
+    let superseded: Vec<String> = earlier
+        .filter_map(|(_, value)| value.strip_suffix(&below))
+        .filter(|folder| {
+            let uuid = folder.rsplit('/').next().unwrap_or_default();
+            vendor_uuid_dir_rel("nuget", uuid).as_deref() == Some(*folder)
+        })
+        .map(str::to_string)
+        .collect();
     let hub = match config_wired && !for_hub {
         true => Vendored::Plain,
         false => {
-            let root = project_root.to_path_buf();
-            run_blocking(move || vendored(&root, &governed_rels)).await
+            let (root, rels) = (project_root.to_path_buf(), governed_rels.clone());
+            run_blocking(move || vendored(&root, &rels)).await
         }
+    };
+    let hub = match hub {
+        Vendored::Block(feeds) => match spelled_otherwise(texts(&locks), name, &version_norm) {
+            Some(why) => Vendored::Declined(why),
+            None => Vendored::Block(feeds),
+        },
+        hub => hub,
     };
     let (feeds, hub_doubt) = match hub {
         Vendored::Block(feeds) => (Some(feeds), None),
@@ -372,6 +429,8 @@ async fn nuget_prelude(
         source_key,
         feeds,
         hub_doubt,
+        superseded,
+        governed_rels,
         config_path,
         config_text,
         locks,
@@ -395,7 +454,8 @@ fn declined_detail(why: &str) -> String {
 /// The NuGet `candidates` (`(purl, uuid)` pairs) that vendored mode
 /// declines in the project at `project_root`, each with [`VENDOR_DECLINED`]
 /// and the detail: those of a project whose lock a rules_csharp hub reads,
-/// where the block cannot be shown to work ([`vendored`]), unless the user
+/// where the block cannot be shown to work ([`vendored`]) or a lock spells
+/// the package's version otherwise ([`spelled_otherwise`]), unless the user
 /// allowed it ([`ALLOW_IN_BAZEL_ENV`]). A package whose folder
 /// `nuget.config` already names is let through: the run leaves the config
 /// as it is. Read-only, and it starts no program.
@@ -407,16 +467,42 @@ pub(crate) async fn bazel_refusals<'a>(
         return Vec::new();
     }
     let root = project_root.to_path_buf();
-    let hub = run_blocking(move || {
+    let (hub, rels) = run_blocking(move || {
+        // Outside a Bazel workspace nothing is declined: no lock is looked
+        // for there.
+        if crate::bazel::bazel_root(&root).is_none() {
+            return (Vendored::Plain, Vec::new());
+        }
         let governed = super::nuget_config::governed_locks_on_disk(&root);
-        vendored(
-            &root,
-            &governed.map(|governed| governed.locks).unwrap_or_default(),
-        )
-    });
-    let Vendored::Declined(why) = hub.await else {
-        return Vec::new();
+        let rels = governed.map(|governed| governed.locks).unwrap_or_default();
+        (vendored(&root, &rels), rels)
+    })
+    .await;
+    // A hub whose block works still finds no package whose version a lock
+    // spells otherwise ([`spelled_otherwise`]).
+    let mut locks: Vec<(String, String)> = Vec::new();
+    for rel in rels
+        .into_iter()
+        .filter(|_| matches!(hub, Vendored::Block(_)))
+    {
+        if let Ok(text) = read_regular_to_string(&project_root.join(&rel)).await {
+            locks.push((rel, text));
+        }
+    }
+    let why = |purl: &str| match &hub {
+        Vendored::Plain => None,
+        Vendored::Declined(why) => Some(why.clone()),
+        Vendored::Block(_) => {
+            let (id, version) = parse_nuget_purl(purl)?;
+            let texts = locks
+                .iter()
+                .map(|(rel, text)| (rel.as_str(), text.as_str()));
+            spelled_otherwise(texts, &id, &normalize_nuget_version(&version))
+        }
     };
+    if matches!(hub, Vendored::Plain) {
+        return Vec::new();
+    }
     let config = match existing_config_path(project_root).await {
         Some(path) => read_regular_to_string(&path).await.ok(),
         None => None,
@@ -433,25 +519,26 @@ pub(crate) async fn bazel_refusals<'a>(
         };
         sources.iter().any(names)
     };
-    let detail = declined_detail(&why);
     let declined = candidates.iter().filter(|(_, uuid)| !wired(uuid));
     declined
-        .map(|(purl, _)| (*purl, VENDOR_DECLINED, detail.clone()))
+        .filter_map(|(purl, _)| Some((*purl, VENDOR_DECLINED, declined_detail(&why(purl)?))))
         .collect()
 }
 
 /// Keep the folder of a patch, `uuid_dir_rel`, in the block of the root
-/// `MODULE.bazel`, which then holds what `feeds` holds now.
+/// `MODULE.bazel`, which then holds what `feeds` holds now, without the
+/// folders of `superseded`.
 async fn keep_in_block(
     project_root: &Path,
     feeds: &Feeds,
     uuid_dir_rel: &str,
+    superseded: &[String],
 ) -> Result<(), String> {
     let path = project_root.join(MODULE_FILE);
     let module = read_regular_to_string(&path)
         .await
         .map_err(|e| format!("unreadable {}: {e}", path.display()))?;
-    let Some(kept) = with_folder(&module, feeds, uuid_dir_rel) else {
+    let Some(kept) = with_folder(&module, feeds, uuid_dir_rel, superseded) else {
         return Err(format!(
             "the block that socket-patch keeps in {MODULE_FILE} was changed by hand"
         ));
@@ -472,9 +559,12 @@ async fn block_refreshed(
     feeds: Option<&Feeds>,
     doubt: Option<String>,
     uuid_dir_rel: &str,
+    superseded: &[String],
 ) -> Option<VendorWarning> {
     let why = match feeds {
-        Some(feeds) => keep_in_block(project_root, feeds, uuid_dir_rel).await.err(),
+        Some(feeds) => keep_in_block(project_root, feeds, uuid_dir_rel, superseded)
+            .await
+            .err(),
         None => doubt,
     }?;
     Some(VendorWarning::new(
@@ -540,6 +630,8 @@ pub async fn vendor_nuget(
         source_key,
         feeds,
         hub_doubt,
+        superseded,
+        governed_rels,
         config_path,
         config_text,
         locks,
@@ -561,7 +653,10 @@ pub async fn vendor_nuget(
         // A package of a hub: the block follows the hub's tag, wired or not.
         let block = match dry_run {
             true => None,
-            false => block_refreshed(project_root, feeds.as_ref(), hub_doubt, &uuid_dir_rel).await,
+            false => {
+                let feeds = feeds.as_ref();
+                block_refreshed(project_root, feeds, hub_doubt, &uuid_dir_rel, &superseded).await
+            }
         };
         if in_sync {
             // The warning keeps firing on re-runs until the stale copy is
@@ -836,8 +931,17 @@ pub async fn vendor_nuget(
         }
     }
     // ── the block of a rules_csharp hub (a failure unwinds both) ─────────
-    if let Some(feeds) = &feeds {
-        if let Err(detail) = keep_in_block(project_root, feeds, &uuid_dir_rel).await {
+    if let Some(first) = feeds {
+        // As the hub's tag reads now: this run gave a config without a
+        // package source its first one, and the next run reads the block's
+        // sources from that file.
+        let root = project_root.to_path_buf();
+        let feeds = match run_blocking(move || vendored(&root, &governed_rels)).await {
+            Vendored::Block(now) => now,
+            _ => first,
+        };
+        let kept = keep_in_block(project_root, &feeds, &uuid_dir_rel, &superseded).await;
+        if let Err(detail) = kept {
             unwind_locks(&written).await;
             unwind_config(&config_target, config_text.as_deref(), &uuid_dir).await;
             result.success = false;
@@ -1043,11 +1147,7 @@ pub async fn revert_nuget_opts(
     };
     // The folder the config names: the patch's own, or the one below it
     // where a hub has the package, when the artifact lies there.
-    let nested = format!(
-        "{uuid_dir_rel}/{}/{}",
-        id.to_lowercase(),
-        package.version_norm
-    );
+    let nested = hub_folder_rel(&uuid_dir_rel, &id, &package.version_norm);
     let for_hub = entry.artifact.path.starts_with(&format!("{nested}/"));
     let feed_rel = if for_hub { &nested } else { &uuid_dir_rel };
     // SECURITY: state.json is committed and tamper-able, and the records are
@@ -1090,7 +1190,8 @@ pub async fn revert_nuget_opts(
         }
     }
     // Reverse application order: lock pin, then the (no-op) mapping audit
-    // record, then the authoritative config restore.
+    // record, then the authoritative config restore. The block of a hub
+    // goes after them all, below.
     for w in entry.wiring.iter().rev() {
         let restored = match w.kind.as_str() {
             // SECURITY: state.json is committed and tamper-able; the lock
@@ -1126,7 +1227,7 @@ pub async fn revert_nuget_opts(
             CONFIG_SOURCE_WIRING_KIND => {
                 revert_config_record(project_root, feed_rel, &package, w, dry_run).await
             }
-            BAZEL_WIRING_KIND => revert_block_record(project_root, &uuid_dir_rel, dry_run).await,
+            BAZEL_WIRING_KIND => continue,
             _ => {
                 warnings.push(VendorWarning::new(
                     "vendor_lock_entry_drifted",
@@ -1153,6 +1254,36 @@ pub async fn revert_nuget_opts(
                     error: Some(e),
                 };
             }
+        }
+    }
+
+    // The block of a hub goes last, and only with the config's source: a
+    // lock that failed above leaves it, so the build stays as it was for
+    // the retry. A config that is left wired keeps its lock pin and its
+    // package, and the hub takes that package through the block alone:
+    // without it the hub would read the folder in `nuget.config` as the
+    // URL of a feed, and the Bazel build would fail.
+    if entry.wiring.iter().any(|w| w.kind == BAZEL_WIRING_KIND) {
+        if config_still_routes {
+            let config = entry
+                .wiring
+                .iter()
+                .find(|c| c.kind == CONFIG_SOURCE_WIRING_KIND)
+                .map_or("nuget.config", |c| c.file.as_str());
+            warnings.push(VendorWarning::new(
+                "vendor_lock_entry_drifted",
+                format!(
+                    "{config} still routes {id} to the vendored feed, so the block of \
+                     {MODULE_FILE} is kept"
+                ),
+            ));
+        } else if let Err(e) = revert_block_record(project_root, &uuid_dir_rel, dry_run).await {
+            return RevertOutcome {
+                kept_artifact: false,
+                success: false,
+                warnings,
+                error: Some(e),
+            };
         }
     }
 
@@ -2261,6 +2392,13 @@ struct LockFile {
     rel: String,
     path: PathBuf,
     text: String,
+}
+
+/// The root-relative path and the text of each of `locks`.
+fn texts(locks: &[LockFile]) -> impl Iterator<Item = (&str, &str)> {
+    locks
+        .iter()
+        .map(|lock| (lock.rel.as_str(), lock.text.as_str()))
 }
 
 /// Put back the locks a failed vendor already re-pinned.
@@ -7334,6 +7472,151 @@ mod tests {
             "the lock is the one of before"
         );
         assert!(!root.join(&entry.artifact.path).exists());
+    }
+
+    /// A config that the revert leaves wired (tooling wrote it anew, and
+    /// it still names the folder) keeps its lock pin and its package, and
+    /// so the block: the hub takes that package through the block alone.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_hub_config_that_is_left_wired_keeps_the_block() {
+        let _unset = crate::test_env::EnvGuard::unset(ALLOW_IN_BAZEL_ENV);
+        let (dir, blobs, installed, record) = fixture(true, Some(preexisting_cfg())).await;
+        let root = dir.path();
+        crate::bazel::nuget::tests::checkout(root);
+        let (_, entry, _) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let entry = entry.expect("a ledger entry");
+        let config = std::fs::read_to_string(root.join("nuget.config")).unwrap();
+        std::fs::write(root.join("nuget.config"), config.replace("    <", "\t\t<")).unwrap();
+        let kept = hub_files(root);
+
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert_eq!(hub_files(root), kept, "the block, the config and the lock");
+        assert!(root.join(&entry.artifact.path).is_file());
+        let says = format!("so the block of {MODULE_FILE} is kept");
+        let warned = |w: &VendorWarning| w.detail.contains(&says);
+        assert!(
+            outcome.warnings.iter().any(warned),
+            "{:?}",
+            outcome.warnings
+        );
+    }
+
+    /// A config without a package source gets nuget.org beside the folder
+    /// of the patch, and the block holds the sources of the hub's tag as
+    /// they are after that: the next run writes no file.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_hub_config_without_a_source_gives_the_block_of_the_next_run() {
+        let _unset = crate::test_env::EnvGuard::unset(ALLOW_IN_BAZEL_ENV);
+        let bare =
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n</configuration>\n";
+        let (dir, blobs, installed, record) = fixture(true, Some(bare)).await;
+        let root = dir.path();
+        crate::bazel::nuget::tests::checkout(root);
+        let before = hub_files(root);
+
+        let (result, entry, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("a ledger entry");
+        let wired = std::fs::read_to_string(root.join(MODULE_FILE)).unwrap();
+        let feeds = format!(
+            "    feeds = [\n        \"file:.socket/vendor/nuget/{UUID}\",\n        \
+             \"https://api.nuget.org/v3/index.json\",\n    ],\n"
+        );
+        assert!(wired.contains(&feeds), "{wired}");
+        let vendored = hub_files(root);
+        let (again, rerecorded, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(again.success && rerecorded.is_none());
+        assert_eq!(hub_files(root), vendored);
+
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(hub_files(root), before);
+    }
+
+    /// A later patch of a hub's package takes the place of the earlier
+    /// one in the block, whose source the config keeps: the block names
+    /// the later folder alone, and goes with it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_later_patch_of_a_hub_package_takes_the_place_of_the_earlier_one() {
+        let _unset = crate::test_env::EnvGuard::unset(ALLOW_IN_BAZEL_ENV);
+        let (dir, blobs, installed, record) = fixture(true, Some(preexisting_cfg())).await;
+        let root = dir.path();
+        let module = crate::bazel::nuget::tests::checkout(root);
+        let (first, _, _) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(first.success, "{:?}", first.error);
+        let earlier = format!("file:.socket/vendor/nuget/{UUID}\"");
+        let wired = std::fs::read_to_string(root.join(MODULE_FILE)).unwrap();
+        assert!(wired.contains(&earlier), "{wired}");
+
+        let mut later = record.clone();
+        later.uuid = "33333333-3333-4333-8333-333333333333".to_string();
+        let (second, entry, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &later, false).await);
+        assert!(second.success, "{:?}", second.error);
+        let entry = entry.expect("a ledger entry");
+        let wired = std::fs::read_to_string(root.join(MODULE_FILE)).unwrap();
+        let folder = format!("file:.socket/vendor/nuget/{}\"", later.uuid);
+        assert!(
+            wired.contains(&folder) && !wired.contains(&earlier),
+            "{wired}"
+        );
+        // And a run of it again leaves the block as it is.
+        let (again, rerecorded, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &later, false).await);
+        assert!(again.success && rerecorded.is_none());
+        assert_eq!(
+            std::fs::read_to_string(root.join(MODULE_FILE)).unwrap(),
+            wired
+        );
+
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            std::fs::read_to_string(root.join(MODULE_FILE)).unwrap(),
+            module,
+            "the block goes with the later folder"
+        );
+    }
+
+    /// A hub asks its feeds for the version as the lock spells it. A lock
+    /// that spells it otherwise than NuGet writes it is declined: the hub
+    /// would not find the package in the folder of the patch.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_hub_lock_that_spells_the_version_otherwise_is_declined() {
+        let _unset = crate::test_env::EnvGuard::unset(ALLOW_IN_BAZEL_ENV);
+        let (dir, blobs, installed, record) = fixture(true, Some(preexisting_cfg())).await;
+        let root = dir.path();
+        crate::bazel::nuget::tests::checkout(root);
+        let lock = std::fs::read_to_string(root.join(PACKAGES_LOCK)).unwrap();
+        let spelled = lock.replace("\"resolved\": \"13.0.3\"", "\"resolved\": \"13.0.3.0\"");
+        assert_ne!(spelled, lock);
+        std::fs::write(root.join(PACKAGES_LOCK), spelled).unwrap();
+        let before = hub_files(root);
+
+        let (code, detail) =
+            unwrap_refused(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, VENDOR_DECLINED);
+        for part in [
+            "packages.lock.json names Newtonsoft.Json 13.0.3.0",
+            "holds 13.0.3",
+            "`--mode hosted`",
+        ] {
+            assert!(detail.contains(part), "{detail}");
+        }
+        assert!(!root.join(".socket").exists());
+        assert_eq!(hub_files(root), before);
+        assert!(service_preflight(PURL, root, &record).await.is_none());
+        // What every way in is told before it fetches anything.
+        let refused = bazel_refusals(root, &[(PURL, UUID)]).await;
+        assert_eq!(refused, [(PURL, VENDOR_DECLINED, detail)]);
     }
 
     /// The package of a hub lies below `<idLower>/<version>` in the folder

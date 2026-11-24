@@ -90,8 +90,11 @@ on:
     # root of the test target (it changes when an ecosystem's module is
     # added; ci.yml builds the target and runs its hermetic tests on every
     # pull request), the shared engine code and test helpers the flow runs
-    # through, `vex`, whose verdicts the flow asserts, and the toolchain
-    # files. A main push outside this list waits for the nightly run below.
+    # through, `vex`, whose verdicts the flow asserts, the ledger and the
+    # artifact paths of vendored mode (vendor/state.rs and vendor/path.rs,
+    # which every ecosystem shares: they hold the record of the block and
+    # the place of a hub's package), and the toolchain files. A main push
+    # outside this list waits for the nightly run below.
     paths:
       - '.github/workflows/bazel-nuget.yml'
       - '.github/workflows/bazel-compatibility.yml'
@@ -119,6 +122,8 @@ on:
       - 'crates/socket-patch-core/src/patch/redirect/**'
       - 'crates/socket-patch-core/src/hosted/**'
       - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-core/src/vendor/path.rs'
+      - 'crates/socket-patch-core/src/vendor/state.rs'
       - 'crates/socket-patch-cli/src/commands/**'
       - 'crates/socket-patch-cli/tests/common/**'
       - 'crates/socket-patch-cli/tests/hosted_memory_common/**'

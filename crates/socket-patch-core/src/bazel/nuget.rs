@@ -908,15 +908,23 @@ fn find(text: &str) -> Block {
 /// `module`, the text of the root `MODULE.bazel`, with the folder `folder`
 /// of a vendored package (from the Bazel root) in the block for `feeds`:
 /// in the block that is there, which then holds what `feeds` holds now, or
-/// in a new one at the end of the file ([`block::put`]). `None` when the
-/// block that is there was changed by hand.
-pub fn with_folder(module: &str, feeds: &Feeds, folder: &str) -> Option<String> {
+/// in a new one at the end of the file ([`block::put`]). The folders of
+/// `superseded`, those of earlier patches of the same package, go out of
+/// the block: the hub asks its feeds in their order, and such a folder no
+/// longer holds what the lock pins. `None` when the block that is there
+/// was changed by hand.
+pub fn with_folder(
+    module: &str,
+    feeds: &Feeds,
+    folder: &str,
+    superseded: &[String],
+) -> Option<String> {
     let (at, mut folders) = match find(module) {
         Block::Edited(_) => return None,
         Block::None => (None, Vec::new()),
         Block::Ours(at, _, folders) => (Some(at), folders),
     };
-    folders.retain(|other| other != folder);
+    folders.retain(|other| other != folder && !superseded.contains(other));
     folders.push(folder.to_string());
     folders.sort();
     Some(block::put(module, at, &render(feeds, &folders)))
@@ -1918,7 +1926,7 @@ socket_patch_nuget.from_lock(
         let crlf = ends[0].replace('\n', "\r\n");
         for module in ends.iter().chain([&crlf]) {
             let eol = if module.contains('\r') { "\r\n" } else { "\n" };
-            let one = with_folder(module, &fixture, FOLDER_A).expect("a block");
+            let one = with_folder(module, &fixture, FOLDER_A, &[]).expect("a block");
             let block = BLOCK.replace('\n', eol);
             let expected = match module.ends_with('\n') {
                 true => format!("{module}{eol}{block}{eol}"),
@@ -1926,11 +1934,14 @@ socket_patch_nuget.from_lock(
             };
             assert_eq!(one, expected);
             // Once more: the same text.
-            assert_eq!(with_folder(&one, &fixture, FOLDER_A), Some(one.clone()));
+            assert_eq!(
+                with_folder(&one, &fixture, FOLDER_A, &[]),
+                Some(one.clone())
+            );
             // A second folder, in the order of their names, and the name
             // of a hub that has one.
             let named = feeds(Some("packages"), &[NUGET_ORG]);
-            let two = with_folder(&one, &named, FOLDER_B).expect("two folders");
+            let two = with_folder(&one, &named, FOLDER_B, &[]).expect("two folders");
             let both =
                 format!("        \"file:{FOLDER_A}\",{eol}        \"file:{FOLDER_B}\",{eol}");
             assert!(two.contains(&both), "{two}");
@@ -1945,6 +1956,15 @@ socket_patch_nuget.from_lock(
             );
             assert_eq!(without_folder(&left, FOLDER_B).as_ref(), Ok(module));
             assert_eq!(without_folder(&one, FOLDER_A).as_ref(), Ok(module));
+            // A later patch of the same package takes the place of the
+            // folder it supersedes, and the block goes with it alone.
+            let later = with_folder(&one, &fixture, FOLDER_B, &[FOLDER_A.to_string()]);
+            let later = later.expect("the folder of the later patch");
+            assert!(
+                !later.contains(FOLDER_A) && later.contains(FOLDER_B),
+                "{later}"
+            );
+            assert_eq!(without_folder(&later, FOLDER_B).as_ref(), Ok(module));
             // A folder that is not there, and a file without a block.
             assert_eq!(without_folder(&one, FOLDER_B), Ok(one.clone()));
             assert_eq!(without_folder(module, FOLDER_A).as_ref(), Ok(module));
@@ -1954,7 +1974,7 @@ socket_patch_nuget.from_lock(
     #[test]
     fn a_block_that_was_changed_by_hand_is_left_alone() {
         let fixture = feeds(None, &[NUGET_ORG]);
-        let one = with_folder(&module(WIRED), &fixture, FOLDER_A).expect("a block");
+        let one = with_folder(&module(WIRED), &fixture, FOLDER_A, &[]).expect("a block");
         for edited in [
             one.replace("\"https://api.nuget.org/v3/index.json\",\n", ""),
             one.replace("    feeds = [", "    feeds = [  # ours"),
@@ -1963,7 +1983,11 @@ socket_patch_nuget.from_lock(
             format!("{one}{BLOCK}\n"),
         ] {
             assert_ne!(edited, one);
-            assert_eq!(with_folder(&edited, &fixture, FOLDER_B), None, "{edited}");
+            assert_eq!(
+                with_folder(&edited, &fixture, FOLDER_B, &[]),
+                None,
+                "{edited}"
+            );
             assert_eq!(without_folder(&edited, FOLDER_A), Err(10), "{edited}");
         }
     }
@@ -1994,7 +2018,7 @@ socket_patch_nuget.from_lock(
         assert_eq!(read, feeds(None, &[NUGET_ORG]));
         // With its own block in the file the workspace reads as before:
         // the block's tag is no second tag.
-        let wired = with_folder(&module, &read, FOLDER_A).expect("a block");
+        let wired = with_folder(&module, &read, FOLDER_A, &[]).expect("a block");
         std::fs::write(root.join(FILE), &wired).unwrap();
         assert_eq!(vendored(&root, &lock), Vendored::Block(read));
         // A block that was changed by hand.
@@ -2027,7 +2051,7 @@ socket_patch_nuget.from_lock(
 
     #[test]
     fn a_hosted_pin_beside_the_block_of_vendored_mode_is_withheld() {
-        let wired = with_folder(&module(WIRED), &feeds(None, &[NUGET_ORG]), FOLDER_A);
+        let wired = with_folder(&module(WIRED), &feeds(None, &[NUGET_ORG]), FOLDER_A, &[]);
         let said = said(&[("MODULE.bazel", &wired.expect("a block"))], "").expect("withheld");
         let starts = "MODULE.bazel:12: this `nuget.from_lock` is the one vendored mode keeps for \
                       the vendored NuGet packages of this project, and its `feeds` stand in the \

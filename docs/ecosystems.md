@@ -1665,9 +1665,15 @@ file as it is. With the lock restored beside such a block, the hub would hold th
 package to the upstream `contentHash` and the build would fail. Put the block back as
 socket-patch wrote it, or delete it, and run the command again.
 
+A `nuget.config` that was written anew since the vendored run, and still names the folder, is
+left as it is with a warning (`vendor_lock_entry_drifted`), as without Bazel. Its lock pin and
+its package stay with it, and so does the block: the hub takes the package through the block
+alone, and `dotnet restore` and the Bazel build both keep the patched package.
+
 `vendor --check`, `list` and `vex` see the package as any vendored NuGet package. A later
 vendored run keeps the block in step with your tag: a source you add to `nuget.config`
-reaches the hub once socket-patch has run again.
+reaches the hub once socket-patch has run again. A later patch of the same package takes the
+place of the earlier one's folder in the block.
 
 **Where it declines.** The block is written only where the checkout shows that it works.
 Elsewhere every command that would vendor the package reports it `failed` with
@@ -1703,6 +1709,10 @@ and exit 0. The message names the reason, with the file and line where there is 
   read, and 8.8.2 and 9.3.2 download every package of the lock without it. That is read and
   not built.
 - `MODULE.bazel` is a symbolic link, or its block was changed by hand.
+- A lock spells the package's version otherwise than NuGet writes it (`1.2.3.0` for `1.2.3`).
+  The hub asks its feeds for the version as the lock spells it, and the folder of the patch
+  holds the version as `dotnet restore` writes it. Run `dotnet restore`, which rewrites the
+  lock.
 
 `--allow-vendored-in-bazel` (or `SOCKET_ALLOW_VENDORED_IN_BAZEL=1`) lifts the decline. The
 package is then vendored as in a project without Bazel, which the hub does not take: that is
