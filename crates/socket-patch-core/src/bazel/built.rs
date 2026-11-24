@@ -374,7 +374,8 @@ fn reads(
 /// under `attribute` alone, in calls that run. `Ok` when they show it,
 /// which takes what [`unbuilt`] takes: no doubt about the workspace or
 /// about the hub, no `WORKSPACE` file that defines anything, and every
-/// call of the hub written out.
+/// call of the hub written out, and none that names a requirements file
+/// which brings a file of `locks` in with `-r` (each read with `read`).
 ///
 /// This is what vendored mode asks before it writes a form that only a
 /// build through that one file takes ([`super::distdir`]): a call that
@@ -386,6 +387,7 @@ pub(crate) fn alone(
     ecosystem: &str,
     (attribute, lock): (&str, &str),
     locks: &[String],
+    read: &dyn Fn(&str) -> Option<String>,
 ) -> Result<(), String> {
     let project = slashed(&root.project);
     let Some(hub) = HUBS.iter().find(|hub| hub.ecosystem == ecosystem) else {
@@ -415,6 +417,16 @@ pub(crate) fn alone(
         let named = files(workspace, call, hub.files, None);
         let own = |file: &String| locks.iter().any(|own| below(&project, own) == *file);
         if !named.iter().any(own) {
+            // A requirements file that brings one of them in with `-r`
+            // hands the hub that file as well, in whatever order the
+            // calls are written.
+            let includes = |file: &String| ecosystem == "pypi" && includes_one(file, &own, read);
+            if let Some(file) = named.iter().find(|file| includes(file)) {
+                return Err(format!(
+                    "{place} names {file}, which brings a file of this project in with `-r`: \
+                     no build through such a file is shown to take the committed copy"
+                ));
+            }
             continue;
         }
         if !call.whole {

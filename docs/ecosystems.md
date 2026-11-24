@@ -3114,6 +3114,15 @@ message ends with the one that failed:
 - The line can be written: `.bazelrc` is no symbolic link and not read-only, and the
   project's path from the Bazel root holds no blank, quote, backslash or `#`.
 
+Three more are seen only later. A requirement that names the package by a URL of the user's
+own, and not by a version, is declined before anything is fetched (no scan finds a package in
+such a line; `get` for the release does). A hub that names a file which brings
+`requirements.txt` in with `-r` is declined, whichever of several hubs is written first. And
+what the patch service serves must be a wheel for every platform (`-none-any.whl`): for a
+source distribution or a wheel of one platform the run fails after its download
+(`apply_failed`, with an error that starts `vendor_pypi_bazel_hub:`), writes no line and
+keeps a wheel that an earlier run committed.
+
 With `--allow-vendored-in-bazel` vendored mode writes the path line instead, here too: the
 switch says that no build takes the project's packages from the hub.
 
@@ -3131,7 +3140,9 @@ switch says that no build takes the project's packages from the hub.
 - A relock (`pip-compile`, a version bump) writes the registry's pin back over the line. The
   build is then green and unpatched, and the copy and its `.bazelrc` line stay behind
   without effect. `socket-patch vendor --check` fails on that, and the next scan pins the
-  package again.
+  package again. That scan asks the patch service for the wheel once more, also where the
+  committed copy is intact: the line holds the URL the service grants, and a run takes it
+  from the grant.
 - A downloader config that the files of the checkout do not show is not seen: one given on
   the command line, in the rc file of the home directory or of the machine, or in a file
   that a `try-import` names and this checkout does not have (a `user.bazelrc` that is not
@@ -3143,8 +3154,8 @@ switch says that no build takes the project's packages from the hub.
 - A Bazel command that reads no workspace rc file (`--ignore_all_rc_files`,
   `--noworkspace_rc`) does not see the line, and asks the patch host (by Bazel's
   documentation of the two options; not run).
-- Not measured: a wheel with a platform tag, a second Python version in the hub, Linux and
-  Windows (every run was on macOS; CI runs the test on Linux), and remote execution.
+- Not measured: a second Python version in the hub, Linux and Windows (every run was on
+  macOS; CI runs the test on Linux), and remote execution.
 
 **The `.bazelrc` lines.** They are kept as the `.bazelignore` lines of
 [Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore) are, by the same commands

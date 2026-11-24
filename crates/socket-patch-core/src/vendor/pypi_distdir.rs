@@ -51,7 +51,9 @@ use crate::vex::discover::{Discovery, Recognized, WiringMode};
 use super::bazel_hub::PYPI_CODE;
 use super::path::vendor_uuid_dir_rel;
 use super::pypi_requirements::{one_pin, RECORD_KIND};
-use super::state::{load_state, lookup_entry, VendorEntry, WiringAction, WiringRecord};
+use super::state::{
+    load_state_shared as load_state, lookup_entry, VendorEntry, WiringAction, WiringRecord,
+};
 use super::VendorWarning;
 
 /// The code of the warning a run gives with the form: what it does not do.
@@ -245,18 +247,45 @@ pub(super) async fn gate(
     // in this form, that is the line of the form, and no longer as it was
     // written ([`in_sync`] and [`without_older`] know it as written): a
     // run over it would fetch the wheel and then not write the line.
-    // Elsewhere it is a pin that hosted mode made. The run that takes it
-    // over puts the registry's pin back first, and the line is judged
-    // then ([`wire`]).
+    // Elsewhere it is a pin that hosted mode made, where its URL is one of
+    // a patch (which host serves it is judged with the pin): the run that
+    // takes it over puts the registry's pin back first, and the line is
+    // judged then ([`wire`]). Any other URL is the user's own reference,
+    // which no run takes over: declined here, before anything is fetched.
     let state = load_state(project).await.unwrap_or_default();
-    match lookup_entry(&state.entries, purl).and_then(line_of) {
-        Some(_) => Err(format!(
+    if lookup_entry(&state.entries, purl)
+        .and_then(line_of)
+        .is_some()
+    {
+        return Err(format!(
             "the line that socket-patch wrote for this wheel in {FILE} has been changed since: \
              put it back as it was, or run `socket-patch vendor --revert` and vendor the package \
              again"
-        )),
-        None => Ok(()),
+        ));
     }
+    let of_a_patch = |line: &crate::utils::requirements::LogicalLine| {
+        let held = direct_reference(strip_comment(&line.text));
+        // The URL of a patch names the patch's id before its file.
+        let patch = |url| super::lock_inventory::pypi::hosted_artifact_url(url).ok();
+        let names_patch =
+            |url| patch(url).is_some_and(|at| at.uuid_level.is_some_and(|id| !id.is_empty()));
+        held.is_some_and(|(of, url)| canonicalize_pypi_name(of) == name && names_patch(url))
+    };
+    if logical_lines(&content).iter().any(of_a_patch) {
+        return Ok(());
+    }
+    Err(format!(
+        "{FILE} names the package by a URL of its own, and the form is written over a pin of \
+         one version with its hashes"
+    ))
+}
+
+/// Whether the file `artifact` is a wheel that every platform installs
+/// (`<name>-<version>-<python>-none-any.whl`): what a build has taken from
+/// a `--distdir` here. A source distribution and a wheel of one platform
+/// reach the hub through other code, which no build here has run.
+fn for_every_platform(artifact: &str) -> bool {
+    artifact.ends_with("-none-any.whl")
 }
 
 /// Write the line of this form for the release `purl`, whose patched wheel
@@ -273,6 +302,13 @@ pub(super) async fn wire(
     origins: &[String],
 ) -> Result<Vec<WiringRecord>, (&'static str, String)> {
     let declined = |why: String| (PYPI_CODE, why);
+    if !for_every_platform(wheel) {
+        return Err(declined(format!(
+            "the patch service serves {wheel}, and the form was built with a wheel for every \
+             platform (`-none-any.whl`) alone, not with a source distribution or a wheel of \
+             one platform"
+        )));
+    }
     let hosted = super::lock_inventory::pypi::hosted_pypi_reference(url, origins);
     let of_patch = hosted.is_some_and(|at| at.uuid_level.as_deref() == Some(uuid));
     if !of_patch || !url.ends_with(&format!("/{wheel}")) {
@@ -396,6 +432,19 @@ mod tests {
         format!(
             "https://patch.socket.dev/patch/pypi/six/1.16.0/tok/{uuid}/six-1.16.0-py3-none-any.whl"
         )
+    }
+
+    #[test]
+    fn only_a_wheel_for_every_platform_is_one_the_form_is_written_for() {
+        assert!(for_every_platform("six-1.16.0-py2.py3-none-any.whl"));
+        for other in [
+            "six-1.16.0.tar.gz",
+            "six-1.16.0.zip",
+            "lxml-5.2.0-cp311-cp311-manylinux_2_28_x86_64.whl",
+            "pkg-1.0-cp311-abi3-any.whl",
+        ] {
+            assert!(!for_every_platform(other), "{other}");
+        }
     }
 
     #[test]

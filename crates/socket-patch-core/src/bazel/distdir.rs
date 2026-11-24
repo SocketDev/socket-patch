@@ -85,13 +85,21 @@ fn below(root: &BazelRoot) -> String {
         .collect()
 }
 
+/// Whether a line of an rc file takes `project`, a path from the Bazel
+/// root, as it is: Bazel splits a line at blanks and reads quotes, `\` and
+/// `#` otherwise.
+fn plain(project: &str) -> bool {
+    !project.contains(|c: char| c.is_whitespace() || "\"'\\#".contains(c))
+}
+
 /// Make the `.bazelrc` at the Bazel root `root` agree with `dirs`, the
 /// directories of the project's committed wheels, each by its path from
 /// the project (`.socket/vendor/pypi/<uuid>`): one line under [`COMMENT`]
 /// for each while it exists and the file neither has nor declines the line
 /// ([`settled`]), and no such pair for a directory of the project under
-/// `.socket/vendor/pypi` that is gone. Without `add`, pairs are only taken
-/// away. A directory that cannot be probed keeps what the file says of it,
+/// `.socket/vendor/pypi` that is gone. Without `add`, and for a project
+/// whose path a line does not take as it is ([`plain`]), pairs are only
+/// taken away. A directory that cannot be probed keeps what the file says of it,
 /// and a file left empty is deleted. The edit is made as the one of
 /// [`super::ignore`] is: under a lock of the root, never through a link.
 ///
@@ -99,6 +107,10 @@ fn below(root: &BazelRoot) -> String {
 /// [`NOT_UPDATED`] warning.
 pub fn sync(root: &BazelRoot, dirs: &[String], add: bool) -> Result<Option<PathBuf>, String> {
     let from_root = below(root);
+    // A project that was moved to a path no line can hold as it is (a
+    // blank would start a second word for Bazel) gets no line: the build
+    // then downloads the wheel, as without the pair.
+    let add = add && plain(&from_root);
     let project = root.dir.join(&root.project);
     // `None`: it cannot be told. Only a directory that is not found is gone.
     let exists = |dir: &str| match std::fs::metadata(project.join(dir)) {
@@ -168,7 +180,7 @@ pub fn sync(root: &BazelRoot, dirs: &[String], add: bool) -> Result<Option<PathB
 ///   file reads otherwise, and `.bazelrc` is no link and not read-only.
 pub fn ready(root: &BazelRoot, lock: &str, locks: &[String]) -> Result<(), String> {
     let project = below(root);
-    if project.contains(|c: char| c.is_whitespace() || "\"'\\#".contains(c)) {
+    if !plain(&project) {
         return Err(format!(
             "the path of the project from the Bazel root, {project}, holds a character that a \
              line of .bazelrc does not take as it is"
@@ -189,7 +201,9 @@ pub fn ready(root: &BazelRoot, lock: &str, locks: &[String]) -> Result<(), Strin
     let view = disk(&root.dir);
     let view: &dyn Fn(&str) -> Entry = &view;
     let workspace = Workspace::read(view);
-    super::built::alone(&workspace, root, "pypi", ("requirements_lock", lock), locks)?;
+    let read = |file: &str| super::built::lock_text(&root.dir, file);
+    let hub = ("requirements_lock", lock);
+    super::built::alone(&workspace, root, "pypi", hub, locks, &read)?;
 
     let written = match disk_up_to(&root.dir, 64 << 20)("MODULE.bazel.lock") {
         Entry::Text(lock) => ModuleLock::parse(&lock),
@@ -273,6 +287,17 @@ mod tests {
 
     fn rc(root: &BazelRoot) -> Option<String> {
         fs::read_to_string(root.dir.join(".bazelrc")).ok()
+    }
+
+    /// A project at a path that a line of the file does not take as it is
+    /// gets no line, however it came to hold a committed wheel: a blank in
+    /// the line would be a second word on every Bazel command.
+    #[test]
+    fn a_project_whose_path_a_line_does_not_take_gets_no_line() {
+        let user = "build --jobs=4\n";
+        let (_tmp, root) = checkout("my svc", &[(".bazelrc", user)], &[UUID]);
+        assert_eq!(sync(&root, &[dir(UUID)], true), Ok(None));
+        assert_eq!(rc(&root).unwrap(), user);
     }
 
     /// The line follows the directory: added for a directory that is
@@ -558,6 +583,19 @@ use_repo(pip, "pip")
             assert_ne!(module, MODULE);
             declined(&[("MODULE.bazel", &module), good], names);
         }
+        // A second hub whose file brings the project's in with `-r`: it is
+        // judged although the first call names the file itself.
+        let second = "pip.parse(hub_name = \"all\", python_version = \"3.11\", \
+                      requirements_lock = \"//:all.txt\")\n";
+        let both = format!("{MODULE}{second}");
+        let module = ("MODULE.bazel", &*both);
+        declined(
+            &[module, good, ("all.txt", "-r requirements.txt\n")],
+            "names all.txt, which brings a file of this project in with `-r`",
+        );
+        // Without the include that file stands against nothing.
+        let other = ("all.txt", "y==1.0.0\n");
+        assert_eq!(asked_of(&[module, good, other]), Ok(()));
         // A `WORKSPACE` file that defines repositories, and a module file
         // with a byte that is not UTF-8.
         let legacy = ("WORKSPACE", "pip_parse(name = \"pip\")\n");

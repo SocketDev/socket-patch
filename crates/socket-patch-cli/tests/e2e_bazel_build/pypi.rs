@@ -1489,6 +1489,14 @@ fn a_download_cache_is_declined_where_the_workspace_does_not_show_that_it_works(
     let more = format!("{own},\n    requirements_windows = \"//:win.txt\"");
     let downloads = "common --downloader_config=ci/downloads.cfg\n";
     let unhashed = requirements(&with.wheels).replace(" \\\n    --hash=sha256:", "  # ");
+    // The package held by a URL that is the user's own, not one of a patch.
+    let own_url = requirements(&with.wheels).replace(
+        &format!("{NAME}=={VERSION}"),
+        &format!(
+            "{NAME} @ https://files.example/{}",
+            with.wheels[1].filename()
+        ),
+    );
     // What each checkout has that the one of the test above has not, and
     // what the refusal says of it.
     let cases = || -> [(&str, &str, String); 8] {
@@ -1573,6 +1581,27 @@ fn a_download_cache_is_declined_where_the_workspace_does_not_show_that_it_works(
         let before = cell.tree();
         cell.declined(&with.run(&cell, &VENDORED), &package, 1, "failed", &before);
     }
+    assert_eq!(with.fetched(), 0);
+
+    // The package held by a URL of the user's own. No scan finds a package
+    // in such a line; `get` is given the release, and declines it before
+    // it fetches anything.
+    let cell = checkout(&with);
+    cell.write(LOCK, bazel_lock(28, "2.5.0-rc4"));
+    cell.write(REQUIREMENTS, own_url);
+    let names = refusal_names(&cell);
+    let package = Declined {
+        purl: PURL,
+        code: DECLINED,
+        names: &[
+            &names[0],
+            "is written only where the checkout shows",
+            "names the package by a URL of its own",
+        ],
+    };
+    let before = cell.tree();
+    let get = ["get", PURL, "--mode", "vendored", "--yes"];
+    cell.declined(&with.run(&cell, &get), &package, 1, "failed", &before);
     assert_eq!(with.fetched(), 0);
 
     // A hosted pin of a requirement that the form is not written for: the
