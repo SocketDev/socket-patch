@@ -2949,7 +2949,7 @@ async fn remove_emptied_workspace(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(left(e.to_string())),
     }
-    match tokio::fs::read(&path).await {
+    match read_written_workspace(&path).await {
         Ok(bytes) if bytes == written.as_bytes() => tokio::fs::remove_file(&path)
             .await
             .map_err(|e| left(e.to_string())),
@@ -2957,6 +2957,16 @@ async fn remove_emptied_workspace(
         Ok(_) => Ok(()),
         Err(e) => Err(left(e.to_string())),
     }
+}
+
+/// The bytes of the pnpm-workspace.yaml at `path`, for
+/// [`remove_emptied_workspace`], through the opener every project file is
+/// read with: it never waits on a FIFO or a device, and refuses whatever
+/// the opened handle shows is no regular file. The path is a file of the
+/// user's, and can be replaced between the check of what is there and the
+/// open.
+async fn read_written_workspace(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    socket_patch_core::utils::fs::read_regular_to_bytes(path).await
 }
 
 /// Write the hosted pins and commit `group` (see `run_redirect_selected`):
@@ -3868,11 +3878,91 @@ mod tests {
         gem_stale_install_warnings, gem_stale_warning, prune_ignored_warning, record_hosted_events,
         redirect_block, stale_cache_gem, stale_installed_gem,
     };
+    use super::{read_written_workspace, remove_emptied_workspace};
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
 
     use socket_patch_core::hosted::engine::REDIRECT_CANDIDATE_FILES;
     use socket_patch_core::patch::redirect::DepOverride;
     use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
+
+    /// The pnpm-workspace.yaml a run emptied is deleted only while it is the
+    /// regular file the run wrote: one a person changed since stays, and so
+    /// does anything that is not a regular file, with the reason.
+    #[tokio::test]
+    async fn an_emptied_workspace_is_deleted_only_as_the_file_the_run_wrote() {
+        use socket_patch_core::hosted::guidance::PNPM_WORKSPACE_REL;
+        let scaffold = "packages:\n  - '.'\n";
+        let mut rewrite = socket_patch_core::patch::redirect::RewriteResult::default();
+        rewrite
+            .files
+            .insert(PNPM_WORKSPACE_REL.to_string(), scaffold.to_string());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(PNPM_WORKSPACE_REL);
+        // Nothing there, and nothing written for it: nothing to do.
+        assert_eq!(remove_emptied_workspace(tmp.path(), &rewrite).await, Ok(()));
+        std::fs::write(&path, "packages:\n  - 'apps/*'\n").unwrap();
+        assert_eq!(remove_emptied_workspace(tmp.path(), &rewrite).await, Ok(()));
+        assert!(path.exists(), "a file changed since the write stays");
+        std::fs::write(&path, scaffold).unwrap();
+        assert_eq!(remove_emptied_workspace(tmp.path(), &rewrite).await, Ok(()));
+        assert!(!path.exists(), "the file the run wrote goes");
+
+        #[cfg(unix)]
+        {
+            let target = tmp.path().join("elsewhere.yaml");
+            std::fs::write(&target, scaffold).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            let kept = remove_emptied_workspace(tmp.path(), &rewrite).await;
+            assert!(
+                kept.as_ref()
+                    .is_err_and(|why| why.contains("it is not a regular file")),
+                "{kept:?}"
+            );
+            assert!(path.is_symlink() && target.exists());
+        }
+    }
+
+    /// The read behind that check opens a project file a person can replace
+    /// at any time, also between the check of what is there and the open. A
+    /// FIFO at the path is refused as no regular file, at once: an
+    /// unguarded read would wait in open(2) for a writer, with no timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_emptied_workspace_is_never_read_through_a_fifo() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pnpm-workspace.yaml");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_written_workspace(&fifo),
+        )
+        .await;
+        match read {
+            Ok(result) => assert_eq!(
+                result.map_err(|e| e.kind()),
+                Err(std::io::ErrorKind::InvalidInput)
+            ),
+            Err(_) => {
+                // Release the wedged opener so the suite can fail cleanly.
+                let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+                panic!("the read wedged in open(2) on a FIFO");
+            }
+        }
+        // The whole step refuses it too, by what is at the path.
+        let mut rewrite = socket_patch_core::patch::redirect::RewriteResult::default();
+        rewrite
+            .files
+            .insert("pnpm-workspace.yaml".to_string(), "packages:\n".to_string());
+        let kept = remove_emptied_workspace(tmp.path(), &rewrite).await;
+        assert!(
+            kept.as_ref()
+                .is_err_and(|why| why.contains("it is not a regular file")),
+            "{kept:?}"
+        );
+    }
 
     /// A failed hosted write may say `nothing was changed` only when every
     /// file already written was put back; otherwise it names the rest.
