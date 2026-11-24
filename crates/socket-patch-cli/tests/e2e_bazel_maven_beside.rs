@@ -18,6 +18,13 @@
 //! and says so, unless the block already does. A `--global` run says
 //! nothing.
 //!
+//! A hosted `scan` at the Bazel root takes the jars that the pinned hubs
+//! fetch for packages of the project, at the versions of their locks, so
+//! it finds the patch of one in a tree that only Bazel builds, also from a
+//! root above other projects, and names a hub it could not read. A scan
+//! in another mode, one that leaves Maven out, and one where no hub of the
+//! ruleset is declared are the scans without Bazel.
+//!
 //! The vendored twin is in `vendor_jvm_cli.rs`, which has the fixture of a
 //! vendored Maven run. `e2e_bazel_build/maven.rs` holds the hosted flows
 //! against what a real Bazel builds, with a hub of the fixture's own name
@@ -33,7 +40,7 @@ mod hosted_memory_common;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use envelope::{event_for, warning_codes};
+use envelope::{event_for, event_triples, warning_codes};
 use hosted_memory_common::{hermetic, mount_api, read_tree, Patch, ORG};
 use serde_json::{json, Value};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes as git_sha256;
@@ -73,6 +80,13 @@ pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
 pip.parse(hub_name = "pypi", python_version = "3.11", requirements_lock = "//:maven_install.json")
 use_repo(pip, "pypi")
 "#;
+/// That workspace with a file its `MODULE.bazel` includes and the checkout
+/// lacks: something of it cannot be read, and nothing of it names the
+/// ruleset of a Maven hub.
+fn unread_other() -> Files {
+    let module = format!("{OTHER_HUB}include(\"//:more.MODULE.bazel\")\n");
+    vec![("MODULE.bazel", module)]
+}
 
 /// A lock of format 3 as a pin of [`HUB`] writes it when another Bazel
 /// module adds to the hub named `maven` too, which the real-Bazel flows do
@@ -644,14 +658,10 @@ fn a_pinned_hub_gets_its_block_and_the_undo_takes_it_out() {
     assert!(!person.stderr.contains("Warning: pkg:maven"), "{person:?}");
 }
 
-/// A hosted run puts its entry in the place of the vendored one that the
-/// block holds for the jar, and removes what vendored mode kept for the
-/// hub: the directory of the jar, which nothing names any more, and its
-/// line of `.bazelignore`. Beside a Maven build no undo of a vendored
-/// patch does that, since the ledger entry there is the Maven build's.
-#[test]
-fn a_hosted_run_removes_the_jar_vendored_mode_kept_for_the_hub() {
-    let machine = Machine::start();
+/// Makes the checkout of [`pinned`] as a vendored run left it for the hub:
+/// the block with the entry of vendored mode, the directory of the jar and
+/// its line of `.bazelignore`; with `maven`, beside a `pom.xml`.
+fn vendored(machine: &Machine, maven: bool) {
     let unit = format!(".socket/vendor/maven/{UUID}");
     let hosted = "socket_patch_http_file(\n";
     let (head, entry) = BLOCK.split_once(hosted).expect("the entry");
@@ -666,7 +676,7 @@ fn a_hosted_run_removes_the_jar_vendored_mode_kept_for_the_hub() {
     );
     let ignore = "# socket-patch: patched Maven jars for a Bazel hub, not Bazel packages (to opt \
                   out, comment out the next line)\n.socket/vendor/maven\n";
-    machine.make(&pinned(), true, false);
+    machine.make(&pinned(), maven, false);
     let proj = machine.root.join("proj");
     std::fs::create_dir_all(proj.join(&unit).join("file")).expect("the directory");
     for (path, text) in [
@@ -678,19 +688,34 @@ fn a_hosted_run_removes_the_jar_vendored_mode_kept_for_the_hub() {
     ] {
         std::fs::write(proj.join(path), text).expect("write it");
     }
-    let get = machine.step(COMMANDS[0]);
-    assert_eq!(get.code, Some(0), "{get:?}");
-    assert_eq!(get.envelope()["warnings"], Value::Null, "{get:?}");
-    let with_block = format!("{HUB}\n{BLOCK}");
-    assert_eq!(
-        String::from_utf8_lossy(&get.wrote[MODULE]),
-        with_block,
-        "{get:?}"
-    );
-    let left = machine.files();
-    let of_the_hub = |path: &&String| path.contains(".socket/vendor") || path.ends_with("ignore");
-    let kept: Vec<&String> = left.keys().filter(of_the_hub).collect();
-    assert_eq!(kept, Vec::<&String>::new(), "{get:?}");
+}
+
+/// A hosted run puts its entry in the place of the vendored one that the
+/// block holds for the jar, and removes what vendored mode kept for the
+/// hub: the directory of the jar, which nothing names any more, and its
+/// line of `.bazelignore`. Beside a Maven build no undo of a vendored
+/// patch does that, since the ledger entry there is the Maven build's.
+/// A hosted scan, which finds the jar in the hub's lock, does the same.
+#[test]
+fn a_hosted_run_removes_the_jar_vendored_mode_kept_for_the_hub() {
+    let machine = Machine::start();
+    for command in [COMMANDS[0], &SCAN[..]] {
+        vendored(&machine, true);
+        let ran = machine.step(command);
+        assert_eq!(ran.code, Some(0), "{ran:?}");
+        assert_eq!(ran.envelope()["warnings"], Value::Null, "{ran:?}");
+        let with_block = format!("{HUB}\n{BLOCK}");
+        assert_eq!(
+            String::from_utf8_lossy(&ran.wrote[MODULE]),
+            with_block,
+            "{ran:?}"
+        );
+        let left = machine.files();
+        let of_the_hub =
+            |path: &&String| path.contains(".socket/vendor") || path.ends_with("ignore");
+        let kept: Vec<&String> = left.keys().filter(of_the_hub).collect();
+        assert_eq!(kept, Vec::<&String>::new(), "{ran:?}");
+    }
 }
 
 /// The Bazel files of a checkout, each with its text.
@@ -1133,6 +1158,773 @@ fn an_agent_run_says_nothing_of_a_hub_the_block_patches() {
         let beside = machine.run(&patched, true, args);
         assert_eq!(beside, without, "{args:?}");
     }
+}
+
+/// A hosted scan, as a program reads it.
+const SCAN: [&str; 5] = ["scan", "--mode", "hosted", "--yes", "--json"];
+
+/// A hosted scan in a tree that only Bazel builds: the jars the pinned
+/// hub's lock fetches are its packages, each one that no crawl found
+/// installed, and the one with a patch gets its entry in the block.
+#[test]
+fn a_hosted_scan_takes_the_jars_of_a_pinned_hub_for_packages() {
+    let machine = Machine::start();
+    let with_block = format!("{HUB}\n{BLOCK}");
+    machine.make(&pinned(), false, false);
+    // A dry run says what the scan will do, and writes nothing.
+    let dry = machine.step(&[&SCAN[..], &["--dry-run"]].concat());
+    let action = |ran: &Ran| event_for(&ran.envelope(), PURL)["action"].clone();
+    assert_eq!(action(&dry), "verified", "{dry:?}");
+    assert_eq!(
+        (dry.code, &dry.wrote),
+        (Some(0), &BTreeMap::new()),
+        "{dry:?}"
+    );
+
+    let scan = machine.step(&SCAN);
+    let envelope = scan.envelope();
+    assert_eq!(scan.code, Some(0), "{scan:?}");
+    // The victim, the consumer and what another Bazel module added.
+    let counted = ["scannedPackages", "lockfileOnlyPackages"].map(|count| &envelope[count]);
+    assert_eq!(counted, [&json!(3), &json!(3)], "{scan:?}");
+    let found = envelope["packages"].as_array().expect("the packages");
+    let patched: Vec<_> = found.iter().map(|package| &package["purl"]).collect();
+    assert_eq!(patched, [PURL], "{scan:?}");
+    assert_eq!(found[0]["notInstalled"], true, "{scan:?}");
+    assert_eq!(action(&scan), "applied", "{scan:?}");
+    assert_eq!(
+        envelope["redirect"]["rewrittenFiles"],
+        json!(["MODULE.bazel"]),
+        "{scan:?}"
+    );
+    assert_eq!(envelope["warnings"], Value::Null, "{scan:?}");
+    assert_eq!(scan.wrote.keys().collect::<Vec<_>>(), [MODULE], "{scan:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&scan.wrote[MODULE]),
+        with_block,
+        "{scan:?}"
+    );
+    // Again: the pin stands, and nothing is written.
+    let again = machine.step(&SCAN);
+    assert_eq!(action(&again), "applied", "{again:?}");
+    assert_eq!(
+        (again.code, &again.wrote),
+        (Some(0), &BTreeMap::new()),
+        "{again:?}"
+    );
+
+    // A scan that names no mode is a hosted one, and a person is told
+    // which file to commit.
+    machine.make(&pinned(), false, false);
+    let person = machine.step(&["scan", "--yes"]);
+    assert_eq!(person.code, Some(0), "{person:?}");
+    assert!(person.stdout.contains("Commit MODULE.bazel"), "{person:?}");
+    assert!(!person.stdout.contains("No packages found"), "{person:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&person.wrote[MODULE]),
+        with_block,
+        "{person:?}"
+    );
+
+    // A jar whose repository has no known name is a package too: the run
+    // that finds a patch of it says why it gets no entry.
+    let mut odd = pinned();
+    odd[1].1 = lock(&[("consumer", "2.0"), ("victim", "1.10.0+local")]);
+    machine.make(&odd, false, false);
+    let scan = machine.step(&SCAN);
+    assert_eq!(scan.envelope()["scannedPackages"], 3, "{scan:?}");
+    assert_eq!(scan.wrote, BTreeMap::new(), "{scan:?}");
+}
+
+/// A Bazel root is often a project of another package manager too. The
+/// jars of its hub join the packages its own lockfile names, and the root
+/// is scanned once, above the projects below it.
+#[test]
+fn a_hosted_scan_takes_the_jars_of_a_hub_beside_a_lockfile_of_the_root() {
+    let machine = Machine::start();
+    let package = json!({ "name": "app", "version": "1.0.0" });
+    let npm = json!({ "name": "app", "version": "1.0.0", "lockfileVersion": 3,
+        "packages": { "": package, "node_modules/left-pad": { "version": "1.3.0" } } });
+    let mut files = pinned();
+    files.push(("package.json", package.to_string()));
+    files.push(("package-lock.json", npm.to_string()));
+    machine.make(&files, false, false);
+    let scan = machine.step(&SCAN);
+    let envelope = scan.envelope();
+    // The npm package of the root's lock and the three jars of the hub's.
+    let counted = ["scannedPackages", "lockfileOnlyPackages"].map(|count| &envelope[count]);
+    assert_eq!(counted, [&json!(4), &json!(4)], "{scan:?}");
+    assert_eq!(event_for(&envelope, PURL)["action"], "applied", "{scan:?}");
+    assert_eq!(scan.wrote.keys().collect::<Vec<_>>(), [MODULE], "{scan:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&scan.wrote[MODULE]),
+        format!("{HUB}\n{BLOCK}"),
+        "{scan:?}"
+    );
+
+    // Above another project: the root has its one section, the first.
+    files.push(("web/package.json", package.to_string()));
+    files.push(("web/package-lock.json", npm.to_string()));
+    machine.make(&files, false, false);
+    let person = machine.step(&["scan", "--yes"]);
+    let headings: Vec<&str> = person
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("== "))
+        .collect();
+    assert_eq!(headings, ["== . ==", "== web =="], "{person:?}");
+    assert_eq!(
+        person.wrote.keys().collect::<Vec<_>>(),
+        [MODULE],
+        "{person:?}"
+    );
+}
+
+/// The block for a patch `uuid` of the victim at `version`, as
+/// socket-patch writes it.
+/// A Gradle build that has nothing of the hub's jars.
+const GRADLE: [(&str, &str); 3] = [
+    ("settings.gradle", "rootProject.name = 'app'\n"),
+    (
+        "build.gradle",
+        "plugins { id 'java' }\ndependencies { implementation 'com.example:other:1.0' }\n",
+    ),
+    (
+        "gradle.lockfile",
+        "com.example:other:1.0=compileClasspath\nempty=\n",
+    ),
+];
+
+fn block_at(version: &str, uuid: &str) -> String {
+    let name = version.replace('.', "_");
+    let block = BLOCK.replace("1.10.0", version).replace("1_10_0", &name);
+    block.replace(UUID, uuid).replace(&UUID[..8], &uuid[..8])
+}
+
+/// The hub's lock moves on after a pin, and Bazel stops at the entry of
+/// the release it held. A hosted scan takes that entry out as `rollback
+/// <purl>` does, says so, and pins the patch of the release the lock holds
+/// now. It leaves the entry while a hub is in doubt, and a scan that reads
+/// no hub leaves it too.
+#[test]
+fn a_hosted_scan_takes_a_stale_entry_out_of_the_block() {
+    let machine = Machine::start();
+    let old = "pkg:maven/dev.socket.fixture/victim@1.9.0";
+    let old_uuid = "0a1b2c3d-1111-4222-8333-444455556666";
+    let stale = "maven_bazel_entry_stale";
+    let mut files = pinned();
+    files[0].1 = format!("{HUB}\n{}", block_at("1.9.0", old_uuid));
+    let triples = |ran: &Ran| event_triples(&ran.envelope());
+    let event = |purl: &str, action: &str, code: &str| {
+        (purl.to_string(), action.to_string(), code.to_string())
+    };
+
+    // The API has a patch of the release the lock holds: a dry run says
+    // what the scan will do, and writes nothing.
+    machine.make(&files, false, false);
+    let dry = machine.step(&[&SCAN[..], &["--dry-run"]].concat());
+    assert_eq!(
+        triples(&dry),
+        [event(old, "verified", stale), event(PURL, "verified", "")],
+        "{dry:?}"
+    );
+    assert_eq!(
+        (dry.code, &dry.wrote),
+        (Some(0), &BTreeMap::new()),
+        "{dry:?}"
+    );
+    let scan = machine.step(&SCAN);
+    assert_eq!(
+        triples(&scan),
+        [event(old, "rolledBack", stale), event(PURL, "applied", "")],
+        "{scan:?}"
+    );
+    let said = scan.envelope();
+    let taken_out = &said["events"][0];
+    assert_eq!(taken_out["uuid"], old_uuid, "{scan:?}");
+    assert_eq!(
+        taken_out["reason"],
+        format!(
+            "patch {old_uuid} is for a jar that no pinned rules_jvm_external hub of the Bazel \
+             workspace fetches any more, so Bazel stops at its entry in MODULE.bazel; the pin \
+             was restored to the upstream registry entry"
+        ),
+        "{scan:?}"
+    );
+    assert_eq!((scan.code, &said["warnings"]), (Some(0), &Value::Null));
+    assert_eq!(scan.wrote.keys().collect::<Vec<_>>(), [MODULE], "{scan:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&scan.wrote[MODULE]),
+        format!("{HUB}\n{BLOCK}"),
+        "{scan:?}"
+    );
+    let again = machine.step(&SCAN);
+    assert_eq!(triples(&again), [event(PURL, "applied", "")], "{again:?}");
+    assert_eq!(again.wrote, BTreeMap::new(), "{again:?}");
+
+    // No patch of the release the lock holds: the file is the one of
+    // before the first pin, to the byte, and a person reads why.
+    let moved = lock(&[("consumer", "2.0"), ("victim", "1.11.0")]);
+    let bump = || {
+        machine.make(&pinned(), false, false);
+        assert_eq!(machine.step(COMMANDS[0]).wrote.len(), 1);
+        std::fs::write(machine.root.join("proj/maven_install.json"), &moved).expect("the lock");
+    };
+    bump();
+    let scan = machine.step(&SCAN);
+    assert_eq!(
+        triples(&scan),
+        [event(PURL, "rolledBack", stale)],
+        "{scan:?}"
+    );
+    assert_eq!(scan.wrote.keys().collect::<Vec<_>>(), [MODULE], "{scan:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&scan.wrote[MODULE]),
+        HUB,
+        "{scan:?}"
+    );
+    bump();
+    let person = machine.step(&["scan", "--yes"]);
+    let note = format!(
+        "Note: patch {UUID} for {PURL} is for a jar that no pinned rules_jvm_external hub of \
+         the Bazel workspace fetches any more, so Bazel stops at its entry in MODULE.bazel; \
+         restoring its upstream registry entry\n"
+    );
+    assert_eq!(person.stderr.matches(&note).count(), 1, "{person:?}");
+    let restored = format!("Restored {PURL} to its upstream registry entry\n");
+    assert!(person.stdout.contains(&restored), "{person:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&person.wrote[MODULE]),
+        HUB,
+        "{person:?}"
+    );
+
+    // A hub that fetches no jar at all: the scan has no package, and the
+    // entry goes all the same.
+    bump();
+    let empty = json!({ "artifacts": {}, "dependencies": {}, "repositories": {}, "version": "3" });
+    std::fs::write(
+        machine.root.join("proj/maven_install.json"),
+        empty.to_string(),
+    )
+    .expect("it");
+    let scan = machine.step(&SCAN);
+    assert_eq!(scan.envelope()["scannedPackages"], 0, "{scan:?}");
+    assert_eq!(
+        triples(&scan),
+        [event(PURL, "rolledBack", stale)],
+        "{scan:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&scan.wrote[MODULE]),
+        HUB,
+        "{scan:?}"
+    );
+
+    // While a hub is in doubt it may be the one that fetches the jar: the
+    // entry stays. It stays in a scan that reads no hub, too.
+    bump();
+    let module = machine.root.join("proj/MODULE.bazel");
+    let pinned_text = std::fs::read_to_string(&module).expect("MODULE.bazel");
+    let doubted = format!("{pinned_text}maven.install(name = \"tools\")\n");
+    std::fs::write(&module, doubted).expect("MODULE.bazel");
+    let scan = machine.step(&SCAN);
+    assert_eq!(triples(&scan), [], "{scan:?}");
+    assert_eq!(
+        warning_codes(&scan.envelope()),
+        ["maven_bazel_hub_not_read"],
+        "{scan:?}"
+    );
+    assert_eq!(scan.wrote, BTreeMap::new(), "{scan:?}");
+    bump();
+    let no_maven = machine.step(&[&SCAN[..], &["--ecosystems", "npm"]].concat());
+    assert_eq!(
+        (no_maven.code, &no_maven.wrote),
+        (Some(0), &BTreeMap::new()),
+        "{no_maven:?}"
+    );
+
+    // Beside a `pom.xml` that still selects the release: the pin of the
+    // Maven build stays, and the entry alone goes.
+    machine.make(&pinned(), true, false);
+    assert_eq!(machine.step(COMMANDS[0]).wrote.len(), 4);
+    std::fs::write(machine.root.join("proj/maven_install.json"), &moved).expect("the lock");
+    let scan = machine.step(&SCAN);
+    assert_eq!(scan.wrote.keys().collect::<Vec<_>>(), [MODULE], "{scan:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&scan.wrote[MODULE]),
+        HUB,
+        "{scan:?}"
+    );
+    assert_eq!(
+        triples(&scan),
+        [event(PURL, "rolledBack", stale), event(PURL, "applied", "")],
+        "{scan:?}"
+    );
+
+    // Beside a Gradle build the same: the entry alone goes, and the pin
+    // that the first scan wrote for Gradle stays for `list` to show and
+    // for `rollback <purl>` to take out.
+    let mut files = pinned();
+    files.extend(GRADLE.iter().map(|(path, text)| (*path, text.to_string())));
+    machine.make(&files, false, false);
+    assert_eq!(machine.step(&SCAN).wrote.len(), 5);
+    std::fs::write(machine.root.join("proj/maven_install.json"), &moved).expect("the lock");
+    let scan = machine.step(&SCAN);
+    assert_eq!(scan.wrote.keys().collect::<Vec<_>>(), [MODULE], "{scan:?}");
+    assert_eq!(
+        triples(&scan),
+        [event(PURL, "rolledBack", stale)],
+        "{scan:?}"
+    );
+    let list = machine.step(&["list", "--json"]).envelope();
+    assert_eq!(
+        event_for(&list, PURL)["details"]["lockfiles"],
+        json!([".socket/gradle/hosted-index.tsv"]),
+        "{list:#}"
+    );
+}
+
+/// The socket.yml policy holds a stale entry as it holds the packages of
+/// the run: a scan of a root that the policy filters, and one whose
+/// policy filters the package, leave the entry where it is.
+#[test]
+fn a_hosted_scan_leaves_a_stale_entry_that_the_policy_filters() {
+    let machine = Machine::start();
+    let mut files = pinned();
+    files[0].1 = format!(
+        "{HUB}\n{}",
+        block_at("1.9.0", "0a1b2c3d-1111-4222-8333-444455556666")
+    );
+    let below: Vec<(String, String)> = files
+        .iter()
+        .map(|(path, text)| (format!("legacy/{path}"), text.clone()))
+        .collect();
+    let mut below: Files = below
+        .iter()
+        .map(|(path, text)| (&*path.clone().leak(), text.clone()))
+        .collect();
+    let filtered = |policy: &str| ("socket.yml", format!("version: 2\npatches:\n  {policy}\n"));
+    below.push(filtered("ignorePaths: [\"/legacy/\"]"));
+    files.push(filtered(
+        "ignorePackages: [\"pkg:maven/dev.socket.fixture/victim\"]",
+    ));
+    for (files, dir) in [(&below, "proj/legacy"), (&files, "proj")] {
+        machine.make(files, false, false);
+        let scan = machine.step_in(&machine.root.join(dir), &SCAN);
+        let said = scan.envelope();
+        assert_eq!(
+            (scan.code, &said["events"], &scan.wrote),
+            (Some(0), &json!([]), &BTreeMap::new()),
+            "{dir}: {scan:?}"
+        );
+    }
+}
+
+/// The hub's lock moves on after a vendored patch, and Bazel stops at the
+/// entry as it does at a hosted one. A hosted scan leaves that entry: the
+/// directory of its jar and its ledger entry are vendored mode's, whose
+/// undo takes them out with it. The scan changes nothing of the hub and
+/// warns of no restore that failed, alone and beside a Maven build, which
+/// it pins as it does without the workspace.
+#[test]
+fn a_hosted_scan_leaves_a_stale_entry_of_vendored_mode() {
+    let machine = Machine::start();
+    let moved = lock(&[("consumer", "2.0"), ("victim", "1.11.0")]);
+    let of_the_hub = |machine: &Machine| -> BTreeMap<String, Vec<u8>> {
+        let hub = |path: &str| {
+            path.contains(".socket/vendor") || path.ends_with("ignore") || path == MODULE
+        };
+        let files = machine.files().into_iter();
+        files.filter(|(path, _)| hub(path)).collect()
+    };
+    for maven in [false, true] {
+        vendored(&machine, maven);
+        std::fs::write(machine.root.join("proj/maven_install.json"), &moved).expect("the lock");
+        let held = of_the_hub(&machine);
+        assert_eq!(held.len(), 5, "{held:?}");
+        for scan in [&[&SCAN[..], &["--dry-run"]].concat()[..], &SCAN] {
+            let scan = machine.step(scan);
+            let said = scan.envelope();
+            let pins = match maven {
+                true => vec![PURL.to_string()],
+                false => vec![],
+            };
+            let purls = event_triples(&said).into_iter().map(|(purl, ..)| purl);
+            assert_eq!(purls.collect::<Vec<_>>(), pins, "{maven}: {scan:?}");
+            let codes = warning_codes(&said);
+            assert_eq!((scan.code, codes), (Some(0), vec![]), "{maven}: {scan:?}");
+            assert_eq!(of_the_hub(&machine), held, "{maven}: {scan:?}");
+        }
+    }
+}
+
+/// A checkout that Gradle or Maven builds too. A hub's jar with a patch is
+/// a patch of the run like one it found installed, so the scan writes for
+/// it what `get <purl>` writes there: the Gradle pin beside the block, or
+/// what the pom lane says of a `pom.xml` it cannot pin.
+#[test]
+fn a_hosted_scan_pins_a_hubs_jar_in_the_other_builds_as_get_does() {
+    let machine = Machine::start();
+    // A pom whose dependency is not in the Maven local repository: what
+    // Maven selects cannot be told.
+    let other = PROJECT_POM
+        .replace("dev.socket.fixture", "com.example")
+        .replace("victim", "other");
+    let rows: [(&[(&str, &str)], &[&str], &[&str]); 2] = [
+        (
+            &GRADLE,
+            &[
+                "proj/.socket/gradle/.gitattributes",
+                "proj/.socket/gradle/hosted-index.tsv",
+                "proj/.socket/gradle/socket-patch.hosted.settings.gradle",
+                MODULE,
+                "proj/settings.gradle",
+            ],
+            &[
+                "redirect_gradle_module_metadata_unavailable",
+                "redirect_gradle_detached_configs_unguarded",
+            ],
+        ),
+        (
+            &[("pom.xml", &other)],
+            &[MODULE],
+            &["redirect_maven_selection_undetermined"],
+        ),
+    ];
+    for (build, wrote, codes) in rows {
+        let mut files = pinned();
+        files.extend(build.iter().map(|(path, text)| (*path, text.to_string())));
+        machine.make(&files, false, false);
+        let get = machine.step(COMMANDS[0]);
+        machine.make(&files, false, false);
+        let scan = machine.step(&SCAN);
+        assert_eq!(scan.wrote.keys().collect::<Vec<_>>(), wrote, "{scan:?}");
+        assert_eq!(scan.wrote, get.wrote, "{scan:?}");
+        let (scan, get) = (scan.envelope(), get.envelope());
+        assert_eq!(event_for(&scan, PURL)["action"], "applied", "{scan:#}");
+        assert_eq!(warning_codes(&scan), codes, "{scan:#}");
+        assert_eq!(scan["warnings"], get["warnings"], "{scan:#}");
+    }
+}
+
+/// The version of a hub's jar is the lock's, whatever a `pom.xml` beside
+/// the hub selects. Where Maven builds another release, the scan pins the
+/// release Bazel builds, and says that it left the pom as it is.
+#[test]
+fn a_hosted_scan_pins_the_release_of_the_lock_beside_a_pom_of_another() {
+    let machine = Machine::start();
+    let mut files = pinned();
+    files.push(("pom.xml", PROJECT_POM.replace("1.10.0", "1.9.0")));
+    machine.make(&files, false, false);
+    let scan = machine.step(&SCAN);
+    let envelope = scan.envelope();
+    assert_eq!(event_for(&envelope, PURL)["action"], "applied", "{scan:?}");
+    let codes = warning_codes(&envelope);
+    assert_eq!(codes, ["redirect_maven_version_not_selected"], "{scan:?}");
+    assert_eq!(scan.wrote.keys().collect::<Vec<_>>(), [MODULE], "{scan:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&scan.wrote[MODULE]),
+        format!("{HUB}\n{BLOCK}"),
+        "{scan:?}"
+    );
+}
+
+/// The words of the warning for a hub that was not read, after where and
+/// why.
+const NOT_READ: &str = "so socket-patch does not know every Maven artifact that Bazel builds here \
+                        through a rules_jvm_external hub: it looks for patches of the ones in the \
+                        hub locks it read, and of no other";
+
+/// No jar is guessed for a hub that cannot be read: the scan says once
+/// what it did not read, and takes the jars of the hubs it read.
+#[test]
+fn a_hub_that_a_scan_could_not_read_is_named_once() {
+    let machine = Machine::start();
+    let scan = |bazel: &Files, args: &[&str]| {
+        machine.make(bazel, false, false);
+        machine.step(args)
+    };
+    let warned = |ran: &Ran| ran.envelope()["warnings"].clone();
+    let not_read =
+        |detail: String| json!([{ "code": "maven_bazel_hub_not_read", "detail": detail }]);
+    // A hub without a lock, alone: no package, and how to pin it.
+    let lockless = HUB.replace("    lock_file = \"//:maven_install.json\",\n", "");
+    let unpinned = vec![("MODULE.bazel", lockless)];
+    let detail = format!(
+        "MODULE.bazel:4: hub \"maven\" has no `lock_file`, {NOT_READ}. Give the hub a \
+         `lock_file` and pin it (`REPIN=1 bazel run @maven//:pin`)"
+    );
+    let ran = scan(&unpinned, &SCAN);
+    assert_eq!(ran.envelope()["scannedPackages"], 0, "{ran:?}");
+    assert_eq!(warned(&ran), not_read(detail.clone()), "{ran:?}");
+    assert_eq!(
+        (ran.code, &ran.wrote),
+        (Some(0), &BTreeMap::new()),
+        "{ran:?}"
+    );
+    // A person is pointed at the warning, not at an install.
+    let person = scan(&unpinned, &["scan", "--yes"]);
+    assert_eq!(person.stdout, "No packages found (see the warning).\n");
+    let line = format!("Warning: {detail}\n");
+    assert_eq!(person.stderr.matches(&line).count(), 1, "{person:?}");
+
+    // A lock that is not there.
+    let [.., mut missing] = checkouts();
+    missing.truncate(1);
+    let ran = scan(&missing, &SCAN);
+    let detail = format!("maven_install.json: it does not exist, {NOT_READ}");
+    assert_eq!(warned(&ran), not_read(detail), "{ran:?}");
+    assert_eq!(ran.envelope()["scannedPackages"], 0, "{ran:?}");
+
+    // A workspace that names no ruleset of a hub, with a file its reader
+    // cannot have: beside a `maven_install.json` it may have a hub.
+    let mut other = unread_other();
+    other.push(("maven_install.json", lock(&[("victim", "1.10.0")])));
+    let ran = scan(&other, &SCAN);
+    let gone = "more.MODULE.bazel: it does not exist; MODULE.bazel:6 includes it";
+    assert_eq!(
+        warned(&ran),
+        not_read(format!("{gone}, {NOT_READ}")),
+        "{ran:?}"
+    );
+    assert_eq!(ran.envelope()["scannedPackages"], 0, "{ran:?}");
+
+    // Beside a pinned hub: its jars are scanned, and the patch of one
+    // gets no entry while the other hub may build the upstream jar.
+    let mut beside = pinned();
+    beside[0].1.push_str("maven.install(name = \"tools\")\n");
+    let ran = scan(&beside, &SCAN);
+    let envelope = ran.envelope();
+    assert_eq!(envelope["scannedPackages"], 3, "{ran:?}");
+    assert_eq!(
+        warning_codes(&envelope),
+        ["maven_bazel_hub_not_read", "maven_bazel_not_pinned"],
+        "{ran:?}"
+    );
+    let named = envelope["warnings"][0]["detail"].as_str().expect("text");
+    assert!(
+        named.starts_with("MODULE.bazel:9: hub \"tools\" has no `lock_file`, so"),
+        "{named}"
+    );
+    let event = event_for(&envelope, PURL);
+    assert_eq!(
+        (ran.code, &event["action"], &event["errorCode"], &ran.wrote),
+        (
+            Some(0),
+            &json!("skipped"),
+            &json!("redirect_unconfirmed"),
+            &BTreeMap::new()
+        ),
+        "{ran:?}"
+    );
+}
+
+/// A person's scan from the root of a checkout covers the project
+/// directories below it, and the root when it is a project. The root of a
+/// Bazel workspace needs no file that makes it one: it is a project of a
+/// hosted scan when its hubs have jars, or one of them was not read. Of
+/// any other scan it is none, as without Bazel.
+#[test]
+fn a_bare_scan_covers_a_bazel_root_above_other_projects() {
+    let machine = Machine::start();
+    let package = json!({ "name": "web", "version": "1.0.0" });
+    let web = |mut bazel: Files| {
+        let lock = json!({ "name": "web", "version": "1.0.0", "lockfileVersion": 3,
+            "packages": { "": package, "node_modules/left-pad": { "version": "1.3.0" } } });
+        bazel.push(("web/package.json", package.to_string()));
+        bazel.push(("web/package-lock.json", lock.to_string()));
+        bazel
+    };
+    let scan = |bazel: Files, args: &[&str]| {
+        machine.make(&web(bazel), false, false);
+        machine.step(args)
+    };
+    let headings = |ran: &Ran| -> Vec<String> {
+        let lines = ran.stdout.lines().filter(|line| line.starts_with("== "));
+        lines.map(String::from).collect()
+    };
+    let person = ["scan", "--yes"];
+    let both = ["== . ==", "== web =="];
+
+    let ran = scan(pinned(), &person);
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    assert_eq!(headings(&ran), both, "{ran:?}");
+    assert_eq!(ran.wrote.keys().collect::<Vec<_>>(), [MODULE], "{ran:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&ran.wrote[MODULE]),
+        format!("{HUB}\n{BLOCK}"),
+        "{ran:?}"
+    );
+
+    let lockless = HUB.replace("    lock_file = \"//:maven_install.json\",\n", "");
+    let ran = scan(vec![("MODULE.bazel", lockless)], &person);
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    assert_eq!(headings(&ran), both, "{ran:?}");
+    let named = "Warning: MODULE.bazel:4: hub \"maven\" has no `lock_file`, so";
+    assert_eq!(ran.stderr.matches(named).count(), 1, "{ran:?}");
+    assert_eq!(ran.wrote, BTreeMap::new(), "{ran:?}");
+
+    // A hub that fetches no jar, and a stale entry of the block: the
+    // root is scanned for that entry alone, and it goes.
+    let empty = json!({ "artifacts": {}, "dependencies": {}, "repositories": {}, "version": "3" });
+    let stale = vec![
+        ("MODULE.bazel", format!("{HUB}\n{BLOCK}")),
+        ("maven_install.json", empty.to_string()),
+    ];
+    let ran = scan(stale, &person);
+    assert_eq!(headings(&ran), both, "{ran:?}");
+    assert_eq!(String::from_utf8_lossy(&ran.wrote[MODULE]), HUB, "{ran:?}");
+
+    // The root is `--cwd`, which the user named: it is scanned in a
+    // directory that the built-in ignores leave out of a search, where
+    // the project below it is left out.
+    let under = |(path, text): (&str, String)| -> (&'static str, String) {
+        (Box::leak(format!("testdata/{path}").into_boxed_str()), text)
+    };
+    let nested: Files = web(pinned()).into_iter().map(under).collect();
+    machine.make(&nested, false, false);
+    let ran = machine.step_in(&machine.root.join("proj/testdata"), &person);
+    assert_eq!(headings(&ran), [""; 0], "{ran:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&ran.wrote["proj/testdata/MODULE.bazel"]),
+        format!("{HUB}\n{BLOCK}"),
+        "{ran:?}"
+    );
+
+    let [plain, other, ..] = checkouts();
+    let vendored = ["scan", "--mode", "vendored", "--yes"];
+    let no_maven = ["scan", "--yes", "--ecosystems", "npm"];
+    let rows: [(Files, &[&str]); 4] = [
+        (other, &person),
+        (unread_other(), &person),
+        (pinned(), &vendored),
+        (pinned(), &no_maven),
+    ];
+    for (bazel, args) in rows {
+        let without = scan(plain.clone(), args);
+        assert_eq!(without.code, Some(0), "{args:?}: {without:?}");
+        assert_eq!(headings(&without), [""; 0], "{args:?}: {without:?}");
+        assert_eq!(scan(bazel, args), without, "{args:?}");
+    }
+}
+
+/// A scan that patches no hub does not take a hub's jars for packages:
+/// one in vendored or agent mode, one that leaves Maven out. And a hosted
+/// scan finds no hub where none is declared at the project: with a lock
+/// of that name and no workspace file, with another ruleset's hub, and in
+/// a project below the Bazel root. Each is the scan without Bazel.
+#[test]
+fn a_scan_that_reads_no_hub_reports_as_without_bazel() {
+    let machine = Machine::start();
+    let [plain, other, ..] = checkouts();
+    let lock_alone = vec![("maven_install.json", lock(&[("victim", "1.10.0")]))];
+    let no_maven = [&SCAN[..], &["--ecosystems", "npm"]].concat();
+    let unread = unread_other();
+    let rows: [(&Files, bool, &[&str]); 8] = [
+        (&pinned(), false, &["scan", "--mode", "agent", "--json"]),
+        (&pinned(), false, &["scan", "--mode", "vendored", "--json"]),
+        (&pinned(), false, &no_maven),
+        (&other, false, &SCAN),
+        (&other, true, &SCAN),
+        (&unread, false, &SCAN),
+        (&lock_alone, false, &SCAN),
+        (&lock_alone, true, &SCAN),
+    ];
+    for (bazel, maven, args) in rows {
+        let scan = |bazel: &Files| {
+            machine.make(bazel, maven, false);
+            machine.step(args)
+        };
+        let without = scan(&plain);
+        assert_eq!(without.code, Some(0), "{args:?}: {without:?}");
+        assert_eq!(scan(bazel), without, "{args:?} beside {:?}", bazel[0].0);
+    }
+    let below = machine.root.join("proj/services/billing");
+    let scan_below = |bazel: &Files| {
+        machine.make(bazel, false, false);
+        std::fs::create_dir_all(&below).expect("a project");
+        machine.step_in(&below, &SCAN)
+    };
+    assert_eq!(scan_below(&pinned()), scan_below(&plain));
+}
+
+/// `get` by an advisory keeps, of the releases the advisory has patches
+/// for, the ones the project has. In hosted mode the jars of a pinned hub
+/// count, as they do for a hosted scan, and a hub that was not read is
+/// named.
+#[test]
+fn a_hosted_get_by_advisory_keeps_the_release_a_pinned_hub_fetches() {
+    use wiremock::matchers::{method, path};
+    let machine = Machine::start();
+    let ghsa = "GHSA-test-aaaa-bbbb";
+    let found = json!({ "uuid": UUID, "purl": PURL, "publishedAt": "2024-01-01T00:00:00Z",
+        "description": "fixture", "license": "MIT", "tier": "free", "vulnerabilities": {} });
+    let answer = json!({ "patches": [found], "canAccessPaidPatches": false });
+    let search = wiremock::Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/by-ghsa/{ghsa}")))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(answer));
+    machine._runtime.block_on(search.mount(&machine.api));
+    let get = |bazel: &Files| {
+        machine.make(bazel, false, false);
+        machine.step(&["get", ghsa, "--mode", "hosted", "--yes", "--json"])
+    };
+    let [plain, ..] = checkouts();
+    let without = get(&plain);
+    let event = event_for(&without.envelope(), PURL).clone();
+    assert_eq!(
+        (&event["action"], &event["errorCode"], &without.wrote),
+        (
+            &json!("skipped"),
+            &json!("package_not_installed"),
+            &BTreeMap::new()
+        ),
+        "{without:?}"
+    );
+    let beside = get(&pinned());
+    let event = event_for(&beside.envelope(), PURL).clone();
+    assert_eq!(
+        (beside.code, &event["action"]),
+        (Some(0), &json!("applied"))
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&beside.wrote[MODULE]),
+        format!("{HUB}\n{BLOCK}"),
+        "{beside:?}"
+    );
+    let lockless = HUB.replace("    lock_file = \"//:maven_install.json\",\n", "");
+    let unread = get(&vec![("MODULE.bazel", lockless)]);
+    let envelope = unread.envelope();
+    let codes = warning_codes(&envelope);
+    assert_eq!(codes, ["maven_bazel_hub_not_read"], "{unread:?}");
+    assert_eq!(
+        (&event_for(&envelope, PURL)["errorCode"], &unread.wrote),
+        (&json!("package_not_installed"), &BTreeMap::new()),
+        "{unread:?}"
+    );
+
+    // An advisory with no Maven artifact: the hub that was not read has
+    // nothing to do with it, and is not named.
+    let (npm, other) = ("pkg:npm/left-pad@1.3.0", "GHSA-test-cccc-dddd");
+    let found = json!({ "uuid": UUID, "purl": npm, "publishedAt": "2024-01-01T00:00:00Z",
+        "description": "fixture", "license": "MIT", "tier": "free", "vulnerabilities": {} });
+    let answer = json!({ "patches": [found], "canAccessPaidPatches": false });
+    let search = wiremock::Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/by-ghsa/{other}")))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(answer));
+    machine._runtime.block_on(search.mount(&machine.api));
+    let lockless = HUB.replace("    lock_file = \"//:maven_install.json\",\n", "");
+    machine.make(&[("MODULE.bazel", lockless)], false, false);
+    let unrelated = machine.step(&["get", other, "--mode", "hosted", "--yes", "--json"]);
+    let envelope = unrelated.envelope();
+    assert_eq!(
+        (
+            &envelope["warnings"],
+            &event_for(&envelope, npm)["errorCode"]
+        ),
+        (&Value::Null, &json!("package_not_installed")),
+        "{unrelated:?}"
+    );
 }
 
 #[test]

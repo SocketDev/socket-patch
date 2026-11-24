@@ -7,12 +7,13 @@ name: Bazel patch compatibility (Maven)
 # patch is one block in MODULE.bazel that puts a repository with the
 # patched jar in the place of the hub's own (`override_repo`): the flows
 # hold the block's text, the patched build and its sha256 check, the undo,
-# a version bump of the patched artifact, and a hub the block cannot
-# patch. In vendored mode that repository is a directory of the checkout
-# with the committed jar: the flows hold the build from the checkout alone
-# with no host to ask, the audit of the committed jar, the undo, and the
-# way from hosted to vendored and back. bazel-compatibility.yml holds the
-# legs and what every ecosystem
+# a hosted scan that finds the artifact in the hub's lock, a version bump
+# of the patched artifact, and a hub the block cannot patch. In vendored
+# mode that repository is a directory of the checkout with the committed
+# jar: the flows hold the build from the checkout alone with no host to
+# ask, the audit of the committed jar, the undo, and the way from hosted
+# to vendored and back. bazel-compatibility.yml holds the legs and what
+# every ecosystem
 # shares; this file says when the Maven legs run and on which releases.
 #
 # Each major release has an era of its own, because the ruleset decides

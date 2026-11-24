@@ -2330,19 +2330,30 @@ fn vendor_gives_a_pinned_bazel_hub_the_patched_jar() {
         // The undo, by each command: every byte and directory of before.
         // `rollback` and `remove` also drop the patch from the run's
         // manifest, which is no file of the comparison and is put back.
+        // The same after the hub's lock moved on, where Bazel stops at the
+        // entry: the undo takes the stale entry out with its directory,
+        // which no scan does.
         let manifest = root.join("proj/.socket/manifest.json");
         let patches = std::fs::read(&manifest).unwrap();
         let foo = purl("foo");
-        for undo in [
+        let undos = [
             &["vendor", "--revert"][..],
             &["rollback", &foo],
             &["remove", &foo],
-        ] {
+        ];
+        for (undo, stale) in undos
+            .iter()
+            .flat_map(|undo| [(*undo, false), (*undo, true)])
+        {
             std::fs::write(&manifest, &patches).unwrap();
             ok(root, &["vendor"]);
             assert_eq!(snapshot(root), vendored, "{alone} {undo:?}");
+            if stale {
+                write(root, "proj/maven_install.json", bumped.as_bytes());
+            }
             let undone = ok(root, undo);
-            assert_eq!(snapshot(root), pristine, "{alone} {undo:?}");
+            write(root, "proj/maven_install.json", lock.as_bytes());
+            assert_eq!(snapshot(root), pristine, "{alone} {undo:?} {stale}");
             // No installed tree holds the jar of a hub: nothing is said of
             // a package-manager install for a patch that only the hub took.
             let warned = undone["warnings"].as_array().cloned().unwrap_or_default();

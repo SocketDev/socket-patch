@@ -1630,6 +1630,38 @@ fn emit_scan_error(common: &GlobalArgs, error: EnvelopeError) {
     emit_scan(&env);
 }
 
+/// A restore of `sweep` that failed part-way and could not put its files
+/// back leaves the lockfiles half restored: the run stops there with exit
+/// 1 (`Err`), rather than write over them. The restore printed the
+/// failure as it happened; `counts` are the scanned and the lockfile-only
+/// packages of the envelope, and the last argument is what the failed
+/// scan's telemetry takes. Otherwise `sweep` goes on.
+async fn stop_half_restored(
+    common: &GlobalArgs,
+    sweep: Option<withdrawn::WithdrawnSweep>,
+    counts: (usize, usize),
+    paths: &crate::path_scope::PathScope,
+    (fallback_to_proxy, mode, auth): (bool, &str, &TelemetryAuth),
+) -> Result<Option<withdrawn::WithdrawnSweep>, i32> {
+    let half = |sweep: &withdrawn::WithdrawnSweep| sweep.half_restored().map(str::to_string);
+    let Some(why) = sweep.as_ref().and_then(half) else {
+        return Ok(sweep);
+    };
+    track_patch_scan_failed("lockfile_write_failed", &why, fallback_to_proxy, mode, auth).await;
+    if common.json {
+        let mut env = scan_envelope(common);
+        env.set_extra("scannedPackages", serde_json::json!(counts.0));
+        env.set_extra("lockfileOnlyPackages", serde_json::json!(counts.1));
+        env.set_extra("paths", serde_json::json!(paths.raw()));
+        if let Some(sweep) = sweep {
+            sweep.record_into(&mut env);
+        }
+        env.mark_error(EnvelopeError::new("lockfile_write_failed", why));
+        emit_scan(&env);
+    }
+    Err(1)
+}
+
 /// `(purl, n)` pairs summed per ecosystem, by CLI name: how many packages
 /// (or patches) of each ecosystem a scan found. An ecosystem with nothing
 /// has no entry; a purl of no known ecosystem is not counted.
@@ -2292,11 +2324,23 @@ async fn scan_project(
             if args.common.json || args.vex.vex.is_some() {
                 unscanned_projects = Some(others);
             } else {
+                // The root of a Bazel workspace can be without a file
+                // that makes `--cwd` a project, and a hosted scan has work
+                // there all the same: the jars that its pinned
+                // rules_jvm_external hubs fetch, a hub to name as not
+                // read, or a stale entry of the block to take out.
+                let mut dirs = found.dirs;
+                if !dirs.iter().any(|(_, explicit)| *explicit) {
+                    let hosted = args.mode == Some(ScanMode::Hosted);
+                    if discovery::hub_jars(&args.common, hosted).await != Default::default() {
+                        dirs.insert(0, (args.common.cwd.clone(), true));
+                    }
+                }
                 return Box::pin(run_project_dirs(
                     args,
                     invocation,
                     mode_inferred,
-                    found.dirs,
+                    dirs,
                     report,
                 ))
                 .await;
@@ -2937,6 +2981,14 @@ async fn scan_project(
 
     let all_purls: Vec<String> = filtered_crawled.iter().map(|p| p.purl.clone()).collect();
     let package_count = all_purls.len();
+    // The stale entries of a Bazel workspace's block that this run may
+    // take out: the policy holds them as it holds the run's packages.
+    let stale_hub_pins: Vec<_> = lockfile_only
+        .stale_hub_pins
+        .iter()
+        .filter(|pin| policy.admits_restore(&pin.purl))
+        .cloned()
+        .collect();
 
     if package_count == 0 {
         // An empty crawl is where the projects below matter most: they
@@ -2968,6 +3020,21 @@ async fn scan_project(
             );
         }
         status.finish();
+        // Bazel stops at an entry of the block whose jar no hub fetches
+        // any more, whatever the project holds: such an entry is taken
+        // out here too (`withdrawn::sweep`, which asks nothing for it).
+        let stale_sweep = if hosted && policy.writes_allowed() {
+            Some(withdrawn::sweep(&args.common, &api_client, &[], &stale_hub_pins).await)
+        } else {
+            None
+        };
+        let telemetry = (false, requested_mode, &telemetry_auth);
+        let stopped =
+            stop_half_restored(&args.common, stale_sweep, (0, 0), &path_scope, telemetry).await;
+        let stale_sweep = match stopped {
+            Ok(sweep) => sweep,
+            Err(code) => return code,
+        };
         if human {
             print_layout_refusals(&layout_refusals, &project_patch_notice, args.common.silent);
             policy.print_warnings(args.common.silent);
@@ -3033,6 +3100,9 @@ async fn scan_project(
             if hosted {
                 if prune {
                     env.warnings.push(hosted::prune_ignored_warning());
+                }
+                if let Some(sweep) = stale_sweep {
+                    sweep.record_into(&mut env);
                 }
                 env.set_extra("redirect", hosted::redirect_block(Vec::new()));
             } else if !vendor {
@@ -3413,43 +3483,26 @@ async fn scan_project(
     // longer serves, before the rewrite below re-pins any replacement.
     // Runs ahead of every "nothing found" exit: a package whose only patch
     // was withdrawn has no search results at all.
-    let mut withdrawn_sweep = if hosted && !args.common.is_global() && policy.writes_allowed() {
+    let withdrawn_sweep = if hosted && !args.common.is_global() && policy.writes_allowed() {
         let pins = withdrawn::pins_in_scope(&hosted_pin_list, &all_purls);
-        Some(withdrawn::sweep(&args.common, &api_client, &pins).await)
+        Some(withdrawn::sweep(&args.common, &api_client, &pins, &stale_hub_pins).await)
     } else {
         None
     };
-    // A restore that failed part-way and could not put its files back
-    // leaves the lockfiles half restored: stop, rather than rewrite over
-    // them. (The restore printed the failure as it happened.)
-    if let Some(why) = withdrawn_sweep
-        .as_ref()
-        .and_then(|sweep| sweep.half_restored().map(str::to_string))
-    {
-        track_patch_scan_failed(
-            "lockfile_write_failed",
-            &why,
-            fallback_to_proxy,
-            requested_mode,
-            &telemetry_auth,
-        )
-        .await;
-        if args.common.json {
-            let mut env = scan_envelope(&args.common);
-            env.set_extra("scannedPackages", serde_json::json!(package_count));
-            env.set_extra(
-                "lockfileOnlyPackages",
-                serde_json::json!(lockfile_only_count),
-            );
-            env.set_extra("paths", serde_json::json!(path_scope.raw()));
-            if let Some(sweep) = withdrawn_sweep {
-                sweep.record_into(&mut env);
-            }
-            env.mark_error(EnvelopeError::new("lockfile_write_failed", why));
-            emit_scan(&env);
-        }
-        return 1;
-    }
+    let counts = (package_count, lockfile_only_count);
+    let telemetry = (fallback_to_proxy, requested_mode, &telemetry_auth);
+    let stopped = stop_half_restored(
+        &args.common,
+        withdrawn_sweep,
+        counts,
+        &path_scope,
+        telemetry,
+    )
+    .await;
+    let mut withdrawn_sweep = match stopped {
+        Ok(sweep) => sweep,
+        Err(code) => return code,
+    };
     // The sweep's reference answers, reused by the hosted redirect.
     let sweep_references = withdrawn_sweep
         .as_mut()
