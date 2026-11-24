@@ -1645,7 +1645,10 @@ async fn run_redirect_selected_untracked(
     // (another run holds it, the checkout cannot be written) it waits for
     // the next scan.
     let heal_pending = !redirects && engine::read_maven_heal_files(&view).await.is_some();
-    let route_present = engine::pnpm_route_present(&common.cwd).await;
+    // Asked only where the answer decides something: a run that selects no
+    // patch (the tidying), and one with `--prune` (what its report says).
+    let route_present =
+        (candidates.is_empty() || prune_requested) && engine::pnpm_route_present(&common.cwd).await;
     let route_cleanup = candidates.is_empty() && route_present;
     let mut lock: Option<LockGuard> = if common.dry_run {
         None

@@ -1702,23 +1702,8 @@ pub async fn read_candidate_files_in(
             read_pnpm_member_locks(view, unreadable, &mut out).await;
             read_pnpm_bazel(view, root, &mut out).await;
         }
-    } else if names_pnpm_route(
-        view,
-        view.read_text(PNPM_WORKSPACE_REL).await.ok().as_deref(),
-        out.files.get(ROOT_PNPM_LOCKS[0]).map(String::as_str),
-    )
-    .await
-    {
-        // A run with no npm patch still tidies what is left of a registry
-        // route ([`pnpm_prune`]), and every lock the workspace file governs
-        // has a say in what is left: the members' own locks are read for
-        // it, as a run with a patch reads them. And the Bazel workspace is
-        // asked as for such a run: a root lock that a run with a patch
-        // leaves to a hub is not rewritten by one without, so what a scan
-        // does to the files does not turn on what it was granted.
-        let root = out.files.contains_key(ROOT_PNPM_LOCKS[0]);
-        read_pnpm_member_locks(view, unreadable, &mut out).await;
-        read_pnpm_bazel(view, root, &mut out).await;
+    } else {
+        read_pnpm_route_locks(view, unreadable, &mut out).await;
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "gem") {
         keep_bundler_loaded_gem_files(view, candidates, &mut out).await;
@@ -1837,8 +1822,20 @@ async fn read_pnpm_member_locks(
     unreadable: &BTreeSet<String>,
     out: &mut CandidateFiles,
 ) {
-    use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
-    match member_locks(view).await {
+    let listing = crate::utils::pnpm_workspace::member_locks(view).await;
+    take_pnpm_member_locks(view, unreadable, out, listing).await;
+}
+
+/// [`read_pnpm_member_locks`] for members that were listed already
+/// (`listing`): the listing globs the workspace, and a run does it once.
+async fn take_pnpm_member_locks(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    out: &mut CandidateFiles,
+    listing: crate::utils::pnpm_workspace::MemberLocks,
+) {
+    use crate::utils::pnpm_workspace::MemberLocks;
+    match listing {
         MemberLocks::Shared => {}
         MemberLocks::PerMember(keys) => {
             for key in keys {
@@ -1866,41 +1863,76 @@ async fn read_pnpm_member_locks(
     }
 }
 
-/// Whether the pnpm project of `view` holds something of a registry route
-/// ([`pnpm_route`]): its root pnpm-workspace.yaml (`workspace`) holds an
-/// entry of ours, or a lock keys a release by a registry of ours or records
-/// an override of ours. The lock is the root one (`root_lock`) or, in a
-/// workspace that keeps one lock per member (`sharedWorkspaceLockfile:
-/// false`), a member's own: what is left of a route can be in such a lock
-/// alone, with nothing of it in the root files.
+/// For a run with no npm patch: the members' own locks and what Bazel says
+/// of the pnpm locks, read as a run with a patch reads them, when the
+/// project holds something of a registry route ([`pnpm_route`]). Such a
+/// run still tidies what is left of a route ([`pnpm_prune`]), and every
+/// lock the workspace file governs has a say in what is left. And a root
+/// lock that a run with a patch leaves to a Bazel hub is not rewritten by
+/// one without, so what a scan does to the files does not turn on what it
+/// was granted.
 ///
-/// Read from the bytes alone, with every address of the registry's shape
-/// taken for a patch server's. What is ours is settled when the route is.
-/// Members that cannot be listed name nothing: only a project whose root
-/// files hold a route is told that its member locks could not be read.
-async fn names_pnpm_route(
+/// Something of a route is an entry of ours in the root
+/// pnpm-workspace.yaml, or a lock that keys a release by a registry of
+/// ours or records an override of ours: the root lock or, in a workspace
+/// that keeps one lock per member, a member's own, which can be the only
+/// file that still holds any of it. Read from the bytes alone, with every
+/// address of the registry's shape taken for a patch server's; what is
+/// ours is settled when the route is. A project that holds none is read
+/// no further, and no Bazel file is read for it.
+///
+/// The members are listed once, for the question and for the read, and a
+/// lock is parsed only when its bytes name a route.
+async fn read_pnpm_route_locks(
     view: &ProjectView<'_>,
-    workspace: Option<&str>,
-    root_lock: Option<&str>,
-) -> bool {
+    unreadable: &BTreeSet<String>,
+    out: &mut CandidateFiles,
+) {
     use crate::formats::pnpm::named_registries::{holds_ours, Owned};
-    use crate::formats::pnpm::registry_alias::OverrideLock;
+    use crate::formats::pnpm::registry_alias::holds_route;
     use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
 
-    let owned = Owned::of(workspace, &|_| true);
-    if workspace.is_some_and(|text| holds_ours(text, &owned)) {
-        return true;
+    let workspace = view.read_text(PNPM_WORKSPACE_REL).await.ok();
+    let owned = Owned::of(workspace.as_deref(), &|_| true);
+    let root = out.files.get(ROOT_PNPM_LOCKS[0]);
+    let in_root = workspace
+        .as_deref()
+        .is_some_and(|text| holds_ours(text, &owned))
+        || root.is_some_and(|lock| holds_route(lock, &owned));
+    // Without a workspace file there are no members to list.
+    let listing = match workspace {
+        Some(_) => member_locks(view).await,
+        None => MemberLocks::Shared,
+    };
+    if !in_root && !member_lock_holds_route(view, &listing, &owned).await {
+        return;
     }
-    let routes =
-        |lock: &str| OverrideLock::parse(lock, &owned).is_ok_and(|lock| lock.holds_route());
-    if root_lock.is_some_and(routes) {
-        return true;
-    }
-    let MemberLocks::PerMember(keys) = member_locks(view).await else {
+    let root = root.is_some();
+    take_pnpm_member_locks(view, unreadable, out, listing).await;
+    read_pnpm_bazel(view, root, out).await;
+}
+
+/// Whether a member's own lock of `listing` holds something of a registry
+/// route. Members that cannot be listed name none: only a project whose
+/// root files hold a route is told that its member locks could not be
+/// read.
+async fn member_lock_holds_route(
+    view: &ProjectView<'_>,
+    listing: &crate::utils::pnpm_workspace::MemberLocks,
+    owned: &crate::formats::pnpm::named_registries::Owned,
+) -> bool {
+    use crate::formats::pnpm::registry_alias::holds_route;
+    use crate::utils::pnpm_workspace::MemberLocks;
+
+    let MemberLocks::PerMember(keys) = listing else {
         return false;
     };
     for key in keys {
-        if view.read_text(&key).await.is_ok_and(|lock| routes(&lock)) {
+        if view
+            .read_text(key)
+            .await
+            .is_ok_and(|lock| holds_route(&lock, owned))
+        {
             return true;
         }
     }
@@ -4591,11 +4623,9 @@ fn pnpm_route(
     // whatever the patch service offers now.
     let was_routed = {
         use crate::formats::pnpm::named_registries::holds_ours;
-        use crate::formats::pnpm::registry_alias::OverrideLock;
+        use crate::formats::pnpm::registry_alias::holds_route;
         matches!(&workspace, Ok(Some(text)) if holds_ours(text, &owned))
-            || texts.iter().any(|(_, text)| {
-                OverrideLock::parse(text, &owned).is_ok_and(|lock| lock.holds_route())
-            })
+            || texts.iter().any(|(_, text)| holds_route(text, &owned))
     };
     match pnpm_registry_route(
         view, &texts, &workspace, symlinked, &owned, was_routed, overrides, options, bazel,
@@ -4770,27 +4800,45 @@ fn hold_routed_releases(
 
 /// Whether hosted mode routed the pnpm project at `project_root` through
 /// the patch server's named registry, or left something of that route
-/// behind: a lock keys a release by a registry of ours or records an
-/// override of ours (the root lock, or a member's own in a workspace that
-/// keeps one lock per member), or the workspace file holds an entry of
-/// ours ([`names_pnpm_route`]). A caller asks before it decides what to
-/// read and lock; what is ours is settled when the route is
-/// ([`pnpm_route`]).
+/// behind: the workspace file holds an entry of ours, or a lock keys a
+/// release by a registry of ours or records an override of ours (the root
+/// lock, or a member's own in a workspace that keeps one lock per member).
+/// A caller asks before it decides what to read and lock; what is ours is
+/// settled when the route is ([`pnpm_route`]).
+///
+/// Asked by every command that may tidy a route, of projects that mostly
+/// never had one, so it reads as little as answers: the workspace file
+/// first, which settles it for a routed project; the root lock only then;
+/// the members' locks, listed once, only where the workspace keeps one
+/// lock per member; and no lock is parsed unless its bytes name a route.
 pub async fn pnpm_route_present(project_root: &std::path::Path) -> bool {
+    use crate::formats::pnpm::named_registries::{holds_ours, Owned};
+    use crate::formats::pnpm::registry_alias::holds_route;
     use crate::utils::fs::read_regular_to_string;
+    use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
 
     let workspace = read_regular_to_string(&project_root.join(PNPM_WORKSPACE_REL))
         .await
         .ok();
-    let root_lock = read_regular_to_string(&project_root.join(ROOT_PNPM_LOCKS[0]))
-        .await
-        .ok();
-    names_pnpm_route(
-        &ProjectView::Disk(project_root),
-        workspace.as_deref(),
-        root_lock.as_deref(),
-    )
-    .await
+    let owned = Owned::of(workspace.as_deref(), &|_| true);
+    if workspace
+        .as_deref()
+        .is_some_and(|text| holds_ours(text, &owned))
+    {
+        return true;
+    }
+    let root_lock = read_regular_to_string(&project_root.join(ROOT_PNPM_LOCKS[0])).await;
+    if root_lock.is_ok_and(|lock| holds_route(&lock, &owned)) {
+        return true;
+    }
+    // Without a workspace file there are no members to list.
+    if workspace.is_none() {
+        return false;
+    }
+    let view = ProjectView::Disk(project_root);
+    let listing = member_locks(&view).await;
+    matches!(listing, MemberLocks::PerMember(_))
+        && member_lock_holds_route(&view, &listing, &owned).await
 }
 
 /// The registry route, planned: the governing locks it changes, the edits

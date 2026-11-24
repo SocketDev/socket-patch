@@ -3078,7 +3078,7 @@ pub(crate) async fn sweep_registry_route(
     origins: &[String],
 ) -> Result<(Vec<crate::patch::redirect::FileEdit>, Vec<(String, usize)>), String> {
     use crate::formats::pnpm::named_registries::{holds_ours, on_unknown_hosts, Owned};
-    use crate::formats::pnpm::registry_alias::OverrideLock;
+    use crate::formats::pnpm::registry_alias::holds_route;
     use crate::utils::pnpm_workspace::{governing_workspace_file, member_locks, MemberLocks};
     use crate::vendor::lock_inventory::ProjectView;
 
@@ -3107,8 +3107,7 @@ pub(crate) async fn sweep_registry_route(
             let routed = ws.as_deref().is_some_and(|text| holds_ours(text, &owned))
                 || root
                     .as_deref()
-                    .and_then(|text| OverrideLock::parse(text, &owned).ok())
-                    .is_some_and(|lock| lock.holds_route());
+                    .is_some_and(|text| holds_route(text, &owned));
             return match routed {
                 true => Err(why),
                 false => Ok((Vec::new(), unknown_hosts)),

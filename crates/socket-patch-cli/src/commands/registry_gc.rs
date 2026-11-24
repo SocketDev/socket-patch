@@ -77,6 +77,22 @@ pub(crate) async fn route_present(common: &GlobalArgs) -> bool {
         && socket_patch_core::hosted::engine::pnpm_route_present(&common.project_root()).await
 }
 
+/// [`route_present`], asked at most once by the pass that holds it. The
+/// question lists the members of a workspace and reads their locks, and
+/// its answer does not change between the check that keeps a project
+/// without a route free of a `.socket/` and the sweep the check is for.
+#[derive(Debug, Default)]
+pub(crate) struct RouteProbe(Option<bool>);
+
+impl RouteProbe {
+    pub(crate) async fn present(&mut self, common: &GlobalArgs) -> bool {
+        match self.0 {
+            Some(known) => known,
+            None => *self.0.insert(route_present(common).await),
+        }
+    }
+}
+
 /// Take the unused entries of the project's registry route out of its
 /// pnpm-workspace.yaml and pnpm locks (`dry_run`: say what would go).
 /// A wet sweep runs under the caller's apply lock. A global-scope run has

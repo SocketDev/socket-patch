@@ -204,6 +204,9 @@ fn retoken_peers(text: &str, name: &str, from: &str, to: &str) -> Option<String>
 /// take a route out of the workspace file beside it leaves the route
 /// alone: half of a route does not install. A scoped package named
 /// `@socket…/x` is not a route (`@socketsecurity/lib@1.0.0`).
+///
+/// It is also the cheap test before a parse: a lock that names no route in
+/// its bytes holds none ([`holds_route`]).
 pub(crate) fn names_a_route(text: &str) -> bool {
     text.match_indices("socket").any(|(at, _)| {
         let before = text[..at].chars().next_back();
@@ -219,6 +222,16 @@ pub(crate) fn names_a_route(text: &str) -> bool {
             .and_then(|version| version.chars().next())
             .is_some_and(|c| c.is_ascii_digit() || c == '@' || c.is_ascii_alphabetic())
     })
+}
+
+/// Whether the lock `text` holds something of a registry route
+/// ([`OverrideLock::holds_route`]), for a caller that only asks. Asked of
+/// every lock of a workspace by the probes that decide whether a command
+/// looks for a route at all, so a lock whose bytes name none
+/// ([`names_a_route`]) is not parsed. A lock the edits cannot read holds
+/// none they could name.
+pub(crate) fn holds_route(text: &str, owned: &Owned) -> bool {
+    names_a_route(text) && OverrideLock::parse(text, owned).is_ok_and(|lock| lock.holds_route())
 }
 
 impl OverrideLock {
@@ -1119,6 +1132,44 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::{self, Patch};
     use super::*;
+
+    /// The cheap test before a parse never hides a route: for every lock
+    /// of the golden projects, as pnpm locked it and as the scan routed
+    /// it, the question answers what the parsed lock answers. A lock that
+    /// names no route is not parsed at all, and one whose bytes only look
+    /// like it (a scoped `@socket…` package) is parsed and holds none.
+    #[test]
+    fn the_text_test_before_a_parse_never_hides_a_route() {
+        let owned = Owned::of(None, &|_| true);
+        let parsed =
+            |text: &str| OverrideLock::parse(text, &owned).is_ok_and(|lock| lock.holds_route());
+        let (mut routed, mut plain) = (0, 0);
+        for case in fixtures::cases() {
+            for rel in fixtures::locks(&case) {
+                for side in ["project", "expected"] {
+                    let Some(text) = fixtures::read(&case, &format!("{side}/{rel}")) else {
+                        continue;
+                    };
+                    assert_eq!(
+                        holds_route(&text, &owned),
+                        parsed(&text),
+                        "{case} {side}/{rel}"
+                    );
+                    match parsed(&text) {
+                        true => routed += 1,
+                        false => plain += 1,
+                    }
+                    if !names_a_route(&text) {
+                        assert!(!parsed(&text), "{case} {side}/{rel}");
+                    }
+                }
+            }
+        }
+        assert!(routed > 10 && plain > 10, "{routed} routed, {plain} plain");
+        let scoped = "lockfileVersion: '9.0'\n\npackages:\n\n  '@socketsecurity/lib@1.0.0':\n    \
+                      resolution: {integrity: sha512-A==}\n";
+        assert!(!holds_route(scoped, &owned));
+    }
 
     fn pin_of<'p>(patch: &'p Patch, alias: &'p str) -> AliasPin<'p> {
         AliasPin {

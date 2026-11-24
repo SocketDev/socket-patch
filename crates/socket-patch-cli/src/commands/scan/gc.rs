@@ -106,9 +106,15 @@ impl GcSummary {
     /// Run the registry-route half (see `commands::registry_gc`) when the
     /// project holds something of a route: from the lockfiles alone, so it
     /// is safe whatever the crawl found. A wet pass runs under the pass's
-    /// apply lock.
-    async fn sweep_registry(&mut self, common: &GlobalArgs, preview: bool) {
-        if !crate::commands::registry_gc::route_present(common).await {
+    /// apply lock. `route` is the pass's one answer to whether the project
+    /// holds any.
+    async fn sweep_registry(
+        &mut self,
+        common: &GlobalArgs,
+        preview: bool,
+        route: &mut crate::commands::registry_gc::RouteProbe,
+    ) {
+        if !route.present(common).await {
             return;
         }
         let swept = crate::commands::registry_gc::sweep(common, preview).await;
@@ -273,10 +279,8 @@ pub(super) async fn run_apply_gc(
     // on and reports it, as the locked read's load error or, when
     // `.socket/` itself is unusable, as the lock failure.
     let has_manifest = manifest_exists(manifest_path).await.unwrap_or(true);
-    if !has_manifest
-        && !has_ledger(common).await
-        && !crate::commands::registry_gc::route_present(common).await
-    {
+    let mut route = crate::commands::registry_gc::RouteProbe::default();
+    if !has_manifest && !has_ledger(common).await && !route.present(common).await {
         return GcSummary::default();
     }
 
@@ -287,7 +291,7 @@ pub(super) async fn run_apply_gc(
         Err(skipped) => return *skipped,
     };
     let mut gc = apply_gc_locked(common, manifest_path, socket_dir, scanned_purls, vendored).await;
-    gc.sweep_registry(common, false).await;
+    gc.sweep_registry(common, false, &mut route).await;
     gc.note_commit_recovery(common, &guard);
     gc
 }
@@ -506,12 +510,13 @@ pub(super) async fn run_vendor_only_gc(
     manifest_path: &Path,
     socket_dir: &Path,
 ) -> GcSummary {
+    let mut route = crate::commands::registry_gc::RouteProbe::default();
     if common.dry_run {
         let mut gc = GcSummary::vendor_only(run_vendor_gc(common, manifest_path, true).await);
-        gc.sweep_registry(common, true).await;
+        gc.sweep_registry(common, true, &mut route).await;
         return gc;
     }
-    if !has_ledger(common).await && !crate::commands::registry_gc::route_present(common).await {
+    if !has_ledger(common).await && !route.present(common).await {
         return GcSummary::default();
     }
     let guard = match lock(common, socket_dir) {
@@ -519,7 +524,7 @@ pub(super) async fn run_vendor_only_gc(
         Err(skipped) => return *skipped,
     };
     let mut gc = GcSummary::vendor_only(run_vendor_gc(common, manifest_path, false).await);
-    gc.sweep_registry(common, false).await;
+    gc.sweep_registry(common, false, &mut route).await;
     gc.note_commit_recovery(common, &guard);
     gc
 }
@@ -534,7 +539,8 @@ pub(super) async fn run_registry_only_gc(
     socket_dir: &Path,
     hosted: bool,
 ) -> Option<GcSummary> {
-    if !crate::commands::registry_gc::route_present(common).await {
+    let mut route = crate::commands::registry_gc::RouteProbe::default();
+    if !route.present(common).await {
         return None;
     }
     let mut gc = GcSummary::default();
@@ -551,14 +557,14 @@ pub(super) async fn run_registry_only_gc(
         }
     }
     if common.dry_run {
-        gc.sweep_registry(common, true).await;
+        gc.sweep_registry(common, true, &mut route).await;
         return Some(gc);
     }
     let guard = match lock(common, socket_dir) {
         Ok(g) => g,
         Err(skipped) => return Some(*skipped),
     };
-    gc.sweep_registry(common, false).await;
+    gc.sweep_registry(common, false, &mut route).await;
     gc.note_commit_recovery(common, &guard);
     Some(gc)
 }
@@ -574,7 +580,8 @@ async fn preview_apply_gc(
 ) -> GcSummary {
     let mut gc =
         preview_artifact_gc(common, manifest_path, socket_dir, scanned_purls, vendored).await;
-    gc.sweep_registry(common, true).await;
+    let mut route = crate::commands::registry_gc::RouteProbe::default();
+    gc.sweep_registry(common, true, &mut route).await;
     gc
 }
 
