@@ -1077,7 +1077,10 @@ const ROW: &str = "  CRITICAL  minimist@1.2.2  CVE-2021-0001  1 unpatched\n";
 /// Agent mode applies one of a package's two patches. Under the apply
 /// summary the package's row names the advisory it fixed and counts the one
 /// it left unpatched, and the closing lines total both; a re-run that finds
-/// the package already patched says the same.
+/// the package already patched says the same. Both patches are free, but
+/// the one left out is not critical: the free tier's merged patch combines
+/// the critical fixes, so that advisory needs the paid plan, and the run
+/// ends with the line about it.
 #[tokio::test]
 async fn scan_human_agent_names_unpatched_advisories() {
     let mock = MockServer::start().await;
@@ -1087,7 +1090,9 @@ async fn scan_human_agent_names_unpatched_advisories() {
     let expected = format!("Applied 1 patch.\n{ROW}");
     let closing = "\nPatched 1 package, fixing 1 vulnerability (1 critical).\n\
                    Saved about 2 hours of engineering time (1 package upgrade at ~2 hours).\n\
-                   1 vulnerability left to patch (50%): 1 needs a package upgrade.\n";
+                   1 vulnerability left to patch (50%): 1 needs a paid Socket plan.\n\
+                   Upgrade to a paid Socket plan to access all patches: \
+                   https://socket.dev/pricing\n";
 
     let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
@@ -1122,7 +1127,9 @@ async fn scan_human_agent_names_unpatched_advisories() {
     let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--verbose"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stdout.contains(&format!("{ROW}      still unpatched: CVE-2021-0002\n")),
+        stdout.contains(&format!(
+            "{ROW}      needs a paid Socket plan: CVE-2021-0002\n"
+        )),
         "stdout={stdout}; stderr={stderr}"
     );
 }
@@ -1170,7 +1177,10 @@ async fn scan_human_agent_dry_run_names_unpatched_advisories_in_the_future_tense
     let closing = "\nWould patch 1 package, fixing 1 vulnerability (1 critical).\n\
                    Would save about 2 hours of engineering time (1 package upgrade at ~2 \
                    hours).\n\
-                   1 vulnerability would be left to patch (50%): 1 needs a package upgrade.\n";
+                   1 vulnerability would be left to patch (50%): 1 needs a paid Socket \
+                   plan.\n\
+                   Upgrade to a paid Socket plan to access all patches: \
+                   https://socket.dev/pricing\n";
     assert_eq!(
         stdout,
         format!("[dry-run] Would download and apply 1 patch. No changes made.\n{ROW}{closing}"),
@@ -1211,6 +1221,11 @@ async fn scan_human_agent_dry_run_names_unpatched_advisories_in_the_future_tense
         package["unfixedIds"],
         serde_json::json!(["CVE-2021-0002", "GHSA-bbbb-bbbb-bbbb"]),
         "{doc:#}"
+    );
+    assert_eq!(
+        package["mergePendingIds"],
+        serde_json::json!([]),
+        "a free patch that is not critical waits on no merged patch: {doc:#}"
     );
 }
 

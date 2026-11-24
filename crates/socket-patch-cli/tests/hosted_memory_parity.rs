@@ -1582,6 +1582,63 @@ async fn parity_pnpm_member_branch_lock_refusal() {
     );
 }
 
+/// A rules_js hub of the project's `MODULE.bazel` that keeps the pnpm lock
+/// up to date with pnpm 11 and does not list `pnpm-workspace.yaml` as
+/// `data`: the pnpm that Bazel runs would reject a pinned lock, so both
+/// engines refuse every pnpm pin with the same warning, nothing written.
+/// Path selection asks for the `MODULE.bazel` beside the lock. With a
+/// file of the user's own listed both engines pin the lock; with a listed
+/// file that the undo of the pin would remove both pin nothing.
+#[tokio::test]
+async fn parity_pnpm_bazel_hub_that_hides_the_workspace_file() {
+    let lock =
+        String::from_utf8(read_fixture("redirect/npm/pnpm/basic/input/pnpm-lock.yaml")).unwrap();
+    let module = |data: &str| {
+        format!(
+            "module(name = \"app\")\n\
+             bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+             npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+             npm.npm_translate_lock(\n    name = \"npm\",\n{data}    \
+             pnpm_lock = \"//:pnpm-lock.yaml\",\n    update_pnpm_lock = True,\n)\n\
+             pnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
+             pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")\n"
+        )
+    };
+    let workspace = "# own\npackages:\n  - '.'\n";
+    let hidden = module("");
+    let files = pnpm_workspace(workspace, Some(&lock), &[], &[("MODULE.bazel", &hidden)]);
+    let (redirect, changed) = assert_pnpm_workspace_parity(&files, true).await;
+    assert!(changed.is_empty(), "{}", describe(&changed));
+    let warned = redirect["warnings"].to_string();
+    let code = "redirect_pnpm_bazel_workspace_hidden";
+    assert!(warned.contains(code), "{redirect:#}");
+    assert!(warned.contains("MODULE.bazel:4: "), "{redirect:#}");
+
+    let listed = module("    data = [\"//:pnpm-workspace.yaml\"],\n");
+    let files = pnpm_workspace(workspace, Some(&lock), &[], &[("MODULE.bazel", &listed)]);
+    let (redirect, changed) = assert_pnpm_workspace_parity(&files, true).await;
+    let paths: Vec<&str> = changed.keys().map(String::as_str).collect();
+    assert_eq!(paths, ["pnpm-lock.yaml", "pnpm-workspace.yaml"]);
+    assert!(
+        !redirect["warnings"].to_string().contains(code),
+        "{redirect:#}"
+    );
+
+    // Listed, but a file that the undo of the pin would remove: both
+    // engines pin nothing, so that no `rollback` leaves the call with a
+    // missing file.
+    let scaffold = "packages:\n  - '.'\n";
+    let files = pnpm_workspace(scaffold, Some(&lock), &[], &[("MODULE.bazel", &listed)]);
+    let (redirect, changed) = assert_pnpm_workspace_parity(&files, true).await;
+    assert!(changed.is_empty(), "{}", describe(&changed));
+    let warned = redirect["warnings"].to_string();
+    assert!(warned.contains(code), "{redirect:#}");
+    assert!(
+        warned.contains("put a comment line in pnpm-workspace.yaml"),
+        "{redirect:#}"
+    );
+}
+
 /// #492: a member lock beside a shared root lock (one listing the member's
 /// importer) is a stale leftover pnpm never reads: both engines pin the
 /// root lock alone.

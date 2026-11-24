@@ -10,8 +10,11 @@ pub const WORKSPACE_FILES: [&str; 4] =
 
 pub mod built;
 pub mod cargo;
+pub(crate) mod cargo_bazel;
 pub mod ignore;
 pub mod maven;
+pub mod nuget;
+pub mod pnpm;
 pub mod rc;
 pub mod ruby;
 pub mod starlark;
