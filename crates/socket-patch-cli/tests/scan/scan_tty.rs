@@ -331,8 +331,15 @@ async fn scan_on_a_terminal_shows_what_was_measured() {
         let uri = mock.uri();
         let cwd = tmp.path().to_path_buf();
         let (code, output) = tokio::task::spawn_blocking(move || {
+            // `LANG` is the last of the three variables a locale is read
+            // from, and the child inherits the other two: a runner that
+            // exports `LC_ALL` (the macOS ones do) would outrank the
+            // locale under test.
+            let mut binary = common::hermetic::pty_binary_command();
+            binary.env_remove("LC_ALL");
+            binary.env_remove("LC_CTYPE");
             let run = pty_io::run_command(
-                common::hermetic::pty_binary_command(),
+                binary,
                 &[&["scan", "--mode", "agent"][..], &api_args(&uri)].concat(),
                 &cwd,
                 &[("LANG", locale)],
