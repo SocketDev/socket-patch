@@ -891,7 +891,9 @@ pub struct CandidateFiles {
     /// workspace keeps one lock per member but the members cannot be
     /// listed (#492), `gitBranchLockfile` installs the branch from a
     /// `pnpm-lock.<branch>.yaml` (#556), or pnpm's `lockfile` setting is
-    /// off so pnpm reads no lock at all (#1074). The root lock was left out of
+    /// off so pnpm reads no lock at all (#1074). And when a pin in it would
+    /// fail the Bazel build of the project ([`crate::bazel::pnpm`]). The
+    /// root lock was left out of
     /// `files`, and the rewrite reports this instead of a redirect or a
     /// "no lockfile" hint.
     pub pnpm_refusal: Option<RewriteWarning>,
@@ -1549,6 +1551,26 @@ pub async fn read_candidate_files_in(
             crate::patch::redirect::NUGET_LOCKS_KEY.to_string(),
             lines.join("\n"),
         );
+        // In a Bazel workspace a rules_csharp hub reads those locks, with
+        // the locks of its other tags, and takes its package sources from
+        // the config the rewriter writes only when a tag names it. What
+        // the hub makes of the project is read from the checkout here and
+        // rides a synthetic key, for the rewriter to judge each package.
+        // A project in no Bazel workspace, or whose locks no tag reads,
+        // gets none, and its run is the one it was. The root is the raw
+        // one: which files of the workspace this reads is not known
+        // beforehand, so a recording gives up instead of listing them.
+        if let Some(root) = view.disk_root() {
+            use crate::bazel::nuget::{withheld, WITHHELD_KEY};
+            let config = crate::patch::redirect::nuget_config_path(&out.files);
+            let locks = lines.iter().filter_map(|line| line.strip_prefix("lock\t"));
+            let locks: Vec<String> = locks.map(String::from).collect();
+            let root = root.to_path_buf();
+            let read = move || withheld(&root, config, &locks);
+            let read = crate::utils::fs::run_blocking(read).await;
+            out.files
+                .extend(read.map(|hub| (WITHHELD_KEY.to_string(), hub)));
+        }
     }
 
     for path in view.python_lock_paths() {
@@ -1648,7 +1670,14 @@ pub async fn read_candidate_files_in(
         } else if let Some(branch) = crate::utils::pnpm_workspace::git_branch_locks(view).await {
             refuse_git_branch_locks(&mut out, &branch);
         } else {
+            // A hub stands against a pin in the root lock it reads, not
+            // against the members' own locks, which no hub of this answer
+            // reads: they are read and pinned as without it.
+            let hidden = bazel_hides_pnpm_workspace(view, &out).await;
             read_pnpm_member_locks(view, unreadable, &mut out).await;
+            if let Some(hidden) = hidden {
+                withhold_root_pnpm_locks(&mut out, hidden);
+            }
         }
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "gem") {
@@ -1791,13 +1820,32 @@ fn refuse_git_branch_locks(
     withhold_root_pnpm_locks(out, git_branch_lock_refusal(branch));
 }
 
+/// The refusal for a project whose `pnpm-lock.yaml` a rules_js hub of its
+/// Bazel workspace keeps up to date with a pnpm that would not read the
+/// `trustLockfile: true` a hosted pin needs ([`crate::bazel::pnpm::hidden`]):
+/// the build would fail on the pinned lock, so the caller leaves the root
+/// locks out and the run refuses every pin in them (see
+/// [`withhold_root_pnpm_locks`]). Nothing of Bazel is read for a project
+/// without that lock.
+async fn bazel_hides_pnpm_workspace(
+    view: &ProjectView<'_>,
+    out: &CandidateFiles,
+) -> Option<RewriteWarning> {
+    if !out.files.contains_key(ROOT_PNPM_LOCKS[0]) {
+        return None;
+    }
+    crate::bazel::pnpm::hidden(view).await
+}
+
 /// The root pnpm locks (see [`withhold_root_pnpm_locks`]).
 const ROOT_PNPM_LOCKS: [&str; 2] = ["pnpm-lock.yaml", "shrinkwrap.yaml"];
 
 /// Leave every root pnpm lock out of the run and refuse every pnpm pin
 /// with `refusal` (see [`CandidateFiles::pnpm_refusal`]): a branch lock
-/// (#556) or pnpm's `lockfile` setting off (#1074, where pnpm reads no
-/// lock at all; member locks are never read then). In memory the root
+/// (#556), pnpm's `lockfile` setting off (#1074, where pnpm reads no
+/// lock at all; member locks are never read then), or a Bazel hub that
+/// would fail on a pin in the root lock ([`bazel_hides_pnpm_workspace`];
+/// the members' own locks are read all the same). In memory the root
 /// lock is dropped from the link and unreadable lists too: it is not
 /// written.
 fn withhold_root_pnpm_locks(out: &mut CandidateFiles, refusal: RewriteWarning) {
@@ -8789,6 +8837,48 @@ snapshots:
         );
         assert_eq!(again.confirmed.len(), 1);
         assert!(again.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+    }
+
+    /// A Bazel hub that stands against a pin in the root lock
+    /// ([`crate::bazel::pnpm`]) reads that lock alone. The members' own
+    /// locks are read and pinned as without it; the root lock is left out.
+    #[tokio::test]
+    async fn member_locks_are_pinned_beside_a_root_lock_that_a_bazel_hub_withholds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+        write_member_workspace(tmp.path(), ws);
+        write_rel(
+            tmp.path(),
+            "MODULE.bazel",
+            "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+             npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+             npm.npm_translate_lock(pnpm_lock = \"//:pnpm-lock.yaml\", update_pnpm_lock = True)\n\
+             pnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
+             pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")\n",
+        );
+        let (read, done) = member_rewrite(tmp.path()).await;
+        let hidden = crate::bazel::pnpm::HIDDEN;
+        assert_eq!(
+            read.pnpm_refusal.as_ref().map(|w| w.code.as_str()),
+            Some(hidden)
+        );
+        assert!(!read.files.contains_key("pnpm-lock.yaml"));
+        assert_eq!(read.pnpm_member_lock_keys, MEMBER_KEYS);
+        for key in MEMBER_KEYS {
+            let text = done
+                .rewrite
+                .files
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} must be pinned: {:?}", done.rewrite.warnings));
+            assert!(text.contains(&format!("tarball: {MEMBER_URL}")), "{text}");
+        }
+        assert!(!done.rewrite.files.contains_key("pnpm-lock.yaml"));
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.confirmed);
+        assert!(
+            warning_codes(&done).contains(&hidden),
+            "{:?}",
+            warning_codes(&done)
+        );
     }
 
     #[tokio::test]

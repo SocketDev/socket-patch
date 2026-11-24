@@ -7295,6 +7295,16 @@ pub fn artifact_url_spellings(artifact_url: &str) -> [String; 2] {
 pub(crate) const NUGET_CONFIG_FILE_NAMES: [&str; 3] =
     ["nuget.config", "NuGet.config", "NuGet.Config"];
 
+/// The config file the NuGet rewriter writes among `files`: NuGet reads the
+/// first of its spellings present in a directory, and a fresh
+/// `nuget.config` beside a `NuGet.config` would shadow it.
+pub(crate) fn nuget_config_path(files: &BTreeMap<String, String>) -> &'static str {
+    NUGET_CONFIG_FILE_NAMES
+        .into_iter()
+        .find(|name| files.contains_key(*name))
+        .unwrap_or(NUGET_CONFIG_FILE_NAMES[0])
+}
+
 fn default_nuget_config() -> String {
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n</configuration>\n".to_string()
 }
@@ -7523,12 +7533,7 @@ fn rewrite_nuget(
     if nuget.is_empty() {
         return;
     }
-    // NuGet reads the first of these spellings present in a directory; a
-    // fresh `nuget.config` beside a `NuGet.config` would shadow it.
-    let config_path = NUGET_CONFIG_FILE_NAMES
-        .into_iter()
-        .find(|name| files.contains_key(*name))
-        .unwrap_or(NUGET_CONFIG_FILE_NAMES[0]);
+    let config_path = nuget_config_path(files);
     // The source keys the configs below this one define (the engine reads
     // them from disk; absent in memory).
     let inherited: Option<Vec<String>> = files
@@ -7617,6 +7622,14 @@ fn rewrite_nuget(
             }
         }
     }
+
+    // What the rules_csharp hub of a Bazel workspace makes of the project
+    // (the engine reads it from the checkout; absent outside one).
+    let hub: Option<crate::bazel::nuget::Hub> = files
+        .get(crate::bazel::nuget::WITHHELD_KEY)
+        .and_then(|hub| serde_json::from_str(hub).ok());
+    // The locks of its other tags, parsed once for every dep.
+    let hub = hub.map(|hub| (hub.docs(), hub));
 
     for dep in &nuget {
         // The uuid lands in the source key, the mapping and the set-aside
@@ -7766,6 +7779,27 @@ fn rewrite_nuget(
                 continue;
             }
         };
+        // In a Bazel workspace whose rules_csharp hub would not take this
+        // pin (it does not read this config, or has the package from a
+        // lock this run does not re-pin), the build fails on the
+        // `contentHash` ([`crate::bazel::nuget::Hub::against`]). Nothing
+        // is written for a dep that every check above would let through.
+        let pinned = |lock: Option<&str>| {
+            locks.iter().any(|(rel, _, doc, _)| {
+                let held = crate::formats::nuget::lock::locked_at(doc, &id_lower, &version_norm);
+                lock.is_none_or(|lock| lock == rel) && held.count() > 0
+            })
+        };
+        let against = |(docs, hub): &(Vec<Option<Value>>, crate::bazel::nuget::Hub)| {
+            hub.against(docs, &pinned, &id_lower, &version_norm, &content_hash)
+        };
+        if let Some((code, why)) = hub.as_ref().and_then(against) {
+            result.warnings.push(RewriteWarning {
+                code: code.into(),
+                detail: format!("{}@{}: {why}", dep.name, dep.version),
+            });
+            continue;
+        }
         if !moved.is_empty() {
             result.warnings.push(RewriteWarning {
                 code: "redirect_nuget_mapping_set_aside".into(),
@@ -32445,6 +32479,73 @@ packages:
                 .collect::<Vec<_>>(),
             ["redirect_nuget_inherited_config_outside_root"]
         );
+    }
+
+    /// What the engine hands over of the rules_csharp hub of a Bazel
+    /// workspace ([`crate::bazel::nuget::withheld`]): a dep the hub would
+    /// not take is skipped with the hub's word after its name and nothing
+    /// is written, where the same files without it are pinned. A dep the
+    /// rewriter refuses for another reason keeps that reason, and one in
+    /// no lock that the hub reads is pinned as without it.
+    #[test]
+    fn nuget_under_a_bazel_hub_that_would_not_take_the_pin_writes_nothing() {
+        use crate::bazel::nuget::{Hub, Read, WITHHELD_KEY};
+        let lock = ("packages.lock.json".to_string(), simple_lock("UPSTREAM=="));
+        let mut files = BTreeMap::from([lock]);
+        let pinned = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let written: Vec<&str> = pinned.files.keys().map(String::as_str).collect();
+        assert_eq!(written, ["nuget.config", "packages.lock.json"]);
+
+        let hub = |why: Option<&str>, locks: Vec<Read>| {
+            let (why, ordered) = (why.map(String::from), true);
+            let hub = Hub {
+                why,
+                every: false,
+                locks,
+                ordered,
+            };
+            serde_json::to_string(&hub).expect("a hub")
+        };
+        let ours = || Read::Ours("packages.lock.json".to_string());
+        let (at, other) = ("MODULE.bazel:8".to_string(), "lib/packages.lock.json");
+        let other = Read::Other(at, other.to_string(), Some(simple_lock("UPSTREAM==")));
+        let mut refused = nuget_override();
+        (refused.patch_uuid, refused.integrity.sha512) = ("other".into(), None);
+        let missing = "Newtonsoft.Json has no sha512 integrity";
+        for (hub, code, starts) in [
+            (
+                hub(Some("MODULE.bazel:4: why"), vec![ours()]),
+                "redirect_bazel_nuget_config_undeclared",
+                "Newtonsoft.Json@13.0.3: MODULE.bazel:4: why",
+            ),
+            (
+                hub(None, vec![other, ours()]),
+                "redirect_bazel_nuget_lock_not_repinned",
+                "Newtonsoft.Json@13.0.3: MODULE.bazel:8: this `nuget.from_lock` reads \
+                 lib/packages.lock.json, which holds the package as well and which this run",
+            ),
+        ] {
+            files.insert(WITHHELD_KEY.to_string(), hub);
+            for with_config in [false, true] {
+                if with_config {
+                    files.insert("nuget.config".to_string(), default_nuget_config());
+                }
+                let r = rewrite_registry_redirect(&files, &[nuget_override(), refused.clone()]);
+                assert!(r.files.is_empty() && r.edits.is_empty(), "{r:?}");
+                let said: Vec<_> = r.warnings.iter().map(|w| (&*w.code, &*w.detail)).collect();
+                assert_eq!(said.len(), 2, "{said:?}");
+                assert_eq!(said[0].0, code);
+                assert!(said[0].1.starts_with(starts), "{said:?}");
+                assert_eq!(said[1], ("redirect_nuget_missing_sha512", missing));
+            }
+            files.remove("nuget.config");
+        }
+        // The hub reads another lock of the project: this pin is not its.
+        let elsewhere = vec![Read::Ours("src/packages.lock.json".to_string())];
+        let elsewhere = hub(Some("why"), elsewhere);
+        files.insert(WITHHELD_KEY.to_string(), elsewhere);
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert_eq!(r.files, pinned.files);
     }
 
     /// A PRESENT but unparseable packages.lock.json refuses the whole nuget

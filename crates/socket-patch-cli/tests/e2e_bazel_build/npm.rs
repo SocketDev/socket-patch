@@ -68,6 +68,22 @@
 //! Tests that need no Bazel run the same steps in a copy of the fixture,
 //! and in workspaces where the statement must stay as it is without Bazel.
 //!
+//! A fourth flow is hosted mode on a hub that keeps the lock up to date
+//! ([`hosted_update_pnpm_lock_on_pnpm_11`]): with `update_pnpm_lock = True`
+//! rules_js runs a pnpm of its own during the build, over the lock and the
+//! files the hub lists as `data`. Here that pnpm is 11 and the hub lists no
+//! `pnpm-workspace.yaml`, so it would never read the `trustLockfile: true`
+//! that hosted mode writes there, and would reject the pinned lock. Hosted
+//! mode pins nothing, says which call stands in the way and what to add to
+//! it, and the build stays the unpatched one that passes; after that
+//! addition the same scan ends in the patched build, and `rollback` in the
+//! unpatched one. A fifth flow ([`hosted_update_pnpm_lock_on_pnpm_10`]) is
+//! the same hub with the pnpm rules_js picks itself, a pnpm 10, which has
+//! no such check: hosted mode pins the lock as on any other hub. Tests
+//! without Bazel hold the same two answers, the wording of the warning,
+//! and that every hub which hides nothing leaves the run as it is without
+//! Bazel.
+//!
 //! A marker is read from what Bazel built. Bazel's downloader keeps every
 //! file it fetches in the repository cache, under its checksum, and hands it
 //! out again without a request; the tests of a leg share that cache, and CI
@@ -772,6 +788,346 @@ fn vendored_npm_translate_lock() {
         started.elapsed()
     );
 }
+
+/// The release of pnpm 11 that Bazel runs in the flow below. rules_js 3.6.0
+/// holds its checksum, so Bazel fetches it like the Node that runs it: from
+/// the public registry, into the repository cache of the leg.
+const PNPM_11: &str = "11.28.10";
+
+/// The code of the warning with which hosted mode pins no pnpm lock that a
+/// hub keeps up to date with a pnpm that would not trust it.
+const HIDDEN: &str = "redirect_pnpm_bazel_workspace_hidden";
+
+/// What that warning says to do in a project that has no
+/// `pnpm-workspace.yaml`, and in one that has: its last words.
+const WAY_ON: [&str; 2] = [
+    " — put a comment line in pnpm-workspace.yaml (create the file where there is none: \
+     `rollback` removes one that holds only what hosted mode writes, and the call would then \
+     name a missing file), list `//:pnpm-workspace.yaml` in the `data` of that call and re-run",
+    " — list `//:pnpm-workspace.yaml` in the `data` of that call and re-run",
+];
+
+/// The `pnpm-workspace.yaml` a user creates for that warning: a comment.
+const OWN_WORKSPACE: &str = "# What the pnpm that Bazel runs is to read.\n";
+
+/// The line of the fixture's hub that names the lock, and the one that has
+/// rules_js keep that lock up to date.
+const UPDATE: &str = "    update_pnpm_lock = True,\n";
+fn lock_line() -> String {
+    format!("    pnpm_lock = \"//:{LOCK}\",\n")
+}
+
+/// The fixture's hub in the checkout of `cell` as one that keeps the lock
+/// up to date: `update_pnpm_lock = True` on its call. rules_js then keeps
+/// a file of hashes under `.aspect/` in the checkout, and whenever the
+/// lock or a `package.json` is not what that file says, the build runs
+/// `pnpm install --lockfile-only` in a directory that holds the lock, the
+/// `package.json` of each importer and the files the call lists as `data`,
+/// and no other file of the checkout. With `pnpm`, a `pnpm.pnpm` tag
+/// states the release of that pnpm; without, rules_js runs the one it
+/// picks itself (3.6.0: its newest pnpm 10).
+fn keeps_the_lock_up_to_date(cell: &Cell, pnpm: Option<&str>) {
+    let module = text(&cell.tree(), MODULE);
+    let lock = lock_line();
+    assert_eq!(module.matches(&lock).count(), 1, "{}: {module}", cell.test);
+    let mut module = module.replace(&lock, &format!("{lock}{UPDATE}"));
+    if let Some(release) = pnpm {
+        module.push_str(&format!(
+            "\npnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
+             pnpm.pnpm(name = \"pnpm\", pnpm_version = \"{release}\")\n\
+             use_repo(pnpm, \"pnpm\")\n"
+        ));
+    }
+    cell.write(MODULE, module);
+}
+
+/// What the warning of [`HIDDEN`] says to do, in the checkout of `cell`
+/// where [`keeps_the_lock_up_to_date`] wrote the hub: a
+/// `pnpm-workspace.yaml` of the user's own, and its label in the `data` of
+/// the call.
+fn lists_the_workspace_file(cell: &Cell) {
+    cell.write("pnpm-workspace.yaml", OWN_WORKSPACE);
+    let module = text(&cell.tree(), MODULE);
+    assert_eq!(module.matches(UPDATE).count(), 1, "{}: {module}", cell.test);
+    let data = "    data = [\"//:pnpm-workspace.yaml\"],\n";
+    cell.write(MODULE, module.replace(UPDATE, &format!("{data}{UPDATE}")));
+}
+
+/// [`open`] with a hub that keeps the lock up to date
+/// ([`keeps_the_lock_up_to_date`]).
+///
+/// The pnpm that Bazel runs has the stand-in as its registry, under the
+/// variable each release reads (`pnpm_config_registry` from pnpm 11 on),
+/// as on a machine behind a registry mirror. pnpm 11 holds every entry of
+/// a lock to what the registry publishes for it before it does anything
+/// else, so the stand-in serves the document of the package: its one
+/// version, with the URL the public registry has for the tarball and the
+/// sum of this run's.
+fn open_updating(test: &str, pnpm: Option<&str>) -> Option<(Cell, StandIn, Package)> {
+    let (mut cell, standin, upstream) = open(test)?;
+    keeps_the_lock_up_to_date(&cell, pnpm);
+    let registry = format!("{}/{REGISTRY}/", standin.origin());
+    for name in ["npm_config_registry", "pnpm_config_registry"] {
+        cell.repo_env.push((name.to_string(), registry.clone()));
+    }
+    let published = "2020-01-01T00:00:00.000Z";
+    let document = json!({
+        "name": NAME,
+        "dist-tags": { "latest": VERSION },
+        "versions": { VERSION: {
+            "name": NAME,
+            "version": VERSION,
+            "dist": {
+                "tarball": format!("https://{REGISTRY}/{NAME}/-/{TGZ}"),
+                "integrity": integrity(&upstream.tarball),
+            },
+        }},
+        "time": { "created": published, "modified": published, VERSION: published },
+    });
+    let document = serde_json::to_vec(&document).expect("a JSON document");
+    standin.serve(5, &document_route(), &document);
+    Some((cell, standin, upstream))
+}
+
+/// The route of the document a pnpm asks its registry for about the
+/// package: the name with `%2F` for its `/`.
+fn document_route() -> String {
+    format!("/{REGISTRY}/{}", NAME.replace('/', "%2F"))
+}
+
+/// A finished hosted run in the checkout of `cell`, whose files were
+/// `before`, pinned nothing because of the hub: it passes, skips the
+/// package as one no lock entry could be rewritten for, names no file as
+/// rewritten and changes none. Its one warning has the code [`HIDDEN`],
+/// starts with the call (`names`, as far as its text is the same for every
+/// such hub) and ends with what to do (`way_on`).
+fn pinned_nothing(cell: &Cell, ran: &Ran, before: &Tree, names: &str, way_on: &str) {
+    let (test, said) = (&cell.test, &ran.dump);
+    assert_eq!(ran.code, 0, "{test}: {said}");
+    assert_eq!(ran.envelope["status"], "success", "{test}: {said}");
+    let skipped = [(
+        canonical_purl(PURL),
+        "skipped".into(),
+        "redirect_unconfirmed".into(),
+    )];
+    assert_eq!(reported(&ran.envelope), skipped, "{test}: {said}");
+    assert_eq!(ran.envelope["summary"]["applied"], 0, "{test}: {said}");
+    let warnings = &ran.envelope["warnings"];
+    assert_eq!(codes_in(warnings), [HIDDEN], "{test}: {said}");
+    let detail = warnings[0]["detail"].as_str().unwrap_or_default();
+    let named = detail.starts_with(names) && detail.ends_with(way_on);
+    assert!(named, "{test}: not {names:?} ... {way_on:?}: {detail}");
+    let rewritten = &ran.envelope["redirect"]["rewrittenFiles"];
+    assert_eq!(*rewritten, json!([]), "{test}: {said}");
+    assert_eq!(changed(before, &cell.tree()), NOTHING, "{test}: {said}");
+}
+
+/// The start of the warning for the fixture's hub in `cell`, which has
+/// Bazel run [`PNPM_11`]: the file and the line of the call.
+fn names_the_hub(cell: &Cell) -> String {
+    let module = text(&cell.tree(), MODULE);
+    let above = module.lines().take_while(|line| *line != format!("{HUB}("));
+    format!(
+        "{MODULE}:{}: this `{HUB}` has Bazel run pnpm {PNPM_11} to keep ",
+        above.count() + 1
+    )
+}
+
+/// The variable under which rules_js fails a build that would have to
+/// write its hashes anew, which it recommends for CI.
+const FROZEN: &str = "ASPECT_RULES_JS_FROZEN_PNPM_LOCK";
+
+/// Step (c) on a hub that keeps the lock up to date, in the checkout of
+/// `cell` with the files `pinned`. The lock changed, so the hashes of
+/// rules_js are stale: a build that may not write them fails, as after any
+/// change of the lock. The build a user runs passes and prints the marker
+/// of `patch`, with the tarball from the stand-in patch host; rules_js ran
+/// its pnpm again and wrote its hashes anew, and that file is the one file
+/// of the checkout the build changes. After it, a build passes that may
+/// update neither those hashes nor Bazel's own lock.
+fn builds_pinned(cell: &Cell, standin: &StandIn, patch: &Patched, pinned: &Tree) {
+    let test = &cell.test;
+    let stale = cell.bazel_env("build", &[CONSUMER], &[(FROZEN, "1")]);
+    let refused = !stale.ok() && stale.stderr().contains("is out of date");
+    assert!(refused, "{test}: {}", stale.dump());
+    let fetches = standin.asked(&patch.route);
+    cell.builds(&patch.package.marker);
+    assert!(
+        standin.asked(&patch.route) > fetches,
+        "{test}: the patched build did not fetch the tarball from the stand-in patch host"
+    );
+    let rewritten = changed(pinned, &cell.tree());
+    let hashes = matches!(&rewritten[..], [file] if file.starts_with(HASHES));
+    assert!(hashes, "{test}: the build changed {rewritten:?}");
+    // The harness gives every command `--lockfile_mode=update`; the last
+    // one of a command line counts.
+    let frozen = ["--lockfile_mode=error", CONSUMER];
+    let frozen = cell.bazel_env("build", &frozen, &[(FROZEN, "1")]);
+    assert!(frozen.ok(), "{test}: {}", frozen.dump());
+}
+
+/// The undo on such a hub: `rollback --yes` counts the package and leaves
+/// every file of `before` as it was but the hashes of rules_js, which the
+/// patched build wrote; the next build prints `marker` and writes those of
+/// `before` again.
+fn rolls_back(cell: &Cell, standin: &StandIn, before: &Tree, marker: &str) {
+    let undo = socket_patch(cell, standin, &["rollback", "--yes"]);
+    let (test, said) = (&cell.test, &undo.dump);
+    assert_eq!(undo.code, 0, "{test}: {said}");
+    assert_eq!(undo.envelope["summary"]["rolledBack"], 1, "{test}: {said}");
+    let left = changed(before, &cell.tree());
+    let hashes = left.iter().all(|file| file.starts_with(HASHES));
+    assert!(hashes, "{test}: {left:?}: {said}");
+    cell.builds(marker);
+    assert_eq!(changed(before, &cell.tree()), NOTHING, "{test}");
+}
+
+/// Hosted mode on a hub that keeps the lock up to date with pnpm 11 and
+/// lists no `pnpm-workspace.yaml` as `data` ([`open_updating`]). The
+/// checkout has no such file, as the fixture has none.
+///
+/// - (a) The first build runs that pnpm, which finds the lock as the
+///   registry has the package, and rules_js writes its file of hashes; the
+///   build prints the unpatched marker.
+/// - (b) `scan --mode hosted --yes` passes and pins nothing
+///   ([`pinned_nothing`]): the pnpm that Bazel runs would not read the
+///   `trustLockfile: true` of a `pnpm-workspace.yaml`, and would reject a
+///   lock that names the patch host. The warning names the call and what
+///   to add to it.
+/// - (c) The same build passes and prints the unpatched marker.
+/// - (d) What the warning says: a `pnpm-workspace.yaml` of the user's own,
+///   and its label in the `data` of the call
+///   ([`lists_the_workspace_file`]). The build still prints the unpatched
+///   marker. The same scan now pins the lock and puts the setting in that
+///   file, and the same build prints the patched marker
+///   ([`builds_pinned`]).
+/// - (e) `rollback --yes` leaves the checkout of (d) before the scan, the
+///   user's file included, so the call names no missing file, and the
+///   build prints the unpatched marker again ([`rolls_back`]).
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn hosted_update_pnpm_lock_on_pnpm_11() {
+    let test = "npm::hosted_update_pnpm_lock_on_pnpm_11";
+    let started = Instant::now();
+    let Some((cell, standin, upstream)) = open_updating(test, Some(PNPM_11)) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let patch = Patched::new();
+    grant(&standin, &upstream, &patch, &patch.package.tarball);
+
+    // (a) The unpatched build. The pnpm that Bazel ran asked the stand-in
+    // for the package, and rules_js left its hashes in the checkout.
+    let before = builds_upstream(&cell, &standin, &upstream);
+    assert!(
+        standin.asked(&document_route()) > 0,
+        "{test}: no pnpm asked the stand-in registry about the package"
+    );
+    let hashes = |tree: &Tree| tree.keys().any(|file| file.starts_with(HASHES));
+    assert!(hashes(&before), "{test}: {:?}", before.keys());
+
+    // (b) The one command of hosted mode pins nothing, and says why.
+    let hosted = ["scan", "--mode", "hosted", "--yes"];
+    let scan = socket_patch(&cell, &standin, &hosted);
+    pinned_nothing(&cell, &scan, &before, &names_the_hub(&cell), WAY_ON[0]);
+
+    // (c) The same build is the one of (a).
+    cell.builds(&upstream.marker);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{test}");
+
+    // (d) What the warning says to do, and nothing else. The build is
+    // still the unpatched one; then the same scan pins the lock, and the
+    // pnpm that Bazel runs reads the setting in the file the hub lists.
+    lists_the_workspace_file(&cell);
+    cell.builds(&upstream.marker);
+    let listed = cell.tree();
+    let scan = socket_patch(&cell, &standin, &hosted);
+    let written = [LOCK, "pnpm-workspace.yaml"];
+    let pinned = cell.pinned_by(&scan, PURL, &patch.uuid, &listed, &written);
+    let workspace = format!("{OWN_WORKSPACE}{TRUSTING_WORKSPACE}");
+    assert_eq!(text(&pinned, "pnpm-workspace.yaml"), workspace, "{test}");
+    builds_pinned(&cell, &standin, &patch, &pinned);
+
+    // (e) The undo, which leaves the file the hub lists.
+    rolls_back(&cell, &standin, &listed, &upstream.marker);
+
+    println!(
+        "{test}: Bazel {release} built {:?} with pnpm {PNPM_11} keeping the lock up to date; \
+         `scan --mode hosted` pinned nothing and warned {HIDDEN}, and the build stayed that \
+         one; with pnpm-workspace.yaml in the hub's `data` the same scan pinned the lock and \
+         the build printed {:?}; `rollback` brought {:?} back; {:?}",
+        upstream.marker,
+        patch.package.marker,
+        upstream.marker,
+        started.elapsed()
+    );
+}
+
+/// The same hub with no `pnpm.pnpm` tag: rules_js runs the pnpm it picks
+/// itself, which at 3.6.0 is a pnpm 10, and pnpm 10 does not hold a lock
+/// to the registry. Hosted mode pins the lock as on a hub that never runs
+/// pnpm, with no line added to the call.
+///
+/// - (a) The first build prints the unpatched marker, and no pnpm asked
+///   the stand-in about the package.
+/// - (b) `scan --mode hosted --yes` pins the lock and creates
+///   `pnpm-workspace.yaml`, with no warning of [`HIDDEN`].
+/// - (c) The same build prints the patched marker ([`builds_pinned`]).
+/// - (d) `rollback --yes` restores the files, and the build prints the
+///   unpatched marker ([`rolls_back`]).
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn hosted_update_pnpm_lock_on_pnpm_10() {
+    let test = "npm::hosted_update_pnpm_lock_on_pnpm_10";
+    let started = Instant::now();
+    let Some((cell, standin, upstream)) = open_updating(test, None) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let patch = Patched::new();
+    grant(&standin, &upstream, &patch, &patch.package.tarball);
+
+    // (a) The unpatched build, by a hub that ran its pnpm.
+    let before = builds_upstream(&cell, &standin, &upstream);
+    let hashes = before.keys().any(|file| file.starts_with(HASHES));
+    assert!(hashes, "{test}: {:?}", before.keys());
+
+    // (b) The one command of hosted mode, as on any other hub.
+    let scan = socket_patch(&cell, &standin, &["scan", "--mode", "hosted", "--yes"]);
+    let written = [LOCK, "pnpm-workspace.yaml"];
+    let pinned = cell.pinned_by(&scan, PURL, &patch.uuid, &before, &written);
+    assert_eq!(text(&pinned, "pnpm-workspace.yaml"), TRUSTING_WORKSPACE);
+    let warned = codes_in(&scan.envelope["warnings"]);
+    assert!(
+        !warned.iter().any(|code| code == HIDDEN),
+        "{test}: {warned:?}"
+    );
+
+    // (c) The patched build, and (d) the undo.
+    builds_pinned(&cell, &standin, &patch, &pinned);
+    rolls_back(&cell, &standin, &before, &upstream.marker);
+    // A pnpm 11 holds the lock to the registry's document, as the flow
+    // above shows: the pnpm of this hub is none.
+    assert_eq!(
+        standin.asked(&document_route()),
+        0,
+        "{test}: a pnpm held the lock to the registry"
+    );
+
+    println!(
+        "{test}: Bazel {release} built {:?} with the pnpm rules_js picks keeping the lock up \
+         to date; `scan --mode hosted` pinned the lock and the build printed {:?}; `rollback` \
+         brought {:?} back; {:?}",
+        upstream.marker,
+        patch.package.marker,
+        upstream.marker,
+        started.elapsed()
+    );
+}
+
+/// The directory of the checkout where rules_js keeps the hashes of what a
+/// hub with `update_pnpm_lock` read, one file per hub.
+const HASHES: &str = ".aspect/rules/external_repository_action_cache/";
 
 /// The file that hands the lock to rules_js, and the call that does.
 const MODULE: &str = "MODULE.bazel";
@@ -1688,6 +2044,321 @@ fn a_hosted_pin_is_attested_beside_a_second_hub_that_lists_the_package() {
     let pinned = pins_the_lock(&cell, &standin, &patch);
     assert!(text(&pinned, LOCK).contains(&patch.uuid), "{LOCK}");
     assert!(!text(&pinned, &beside).contains(&patch.uuid), "{beside}");
+}
+
+/// A hosted scan in the checkout of `cell`, whose project is in the
+/// directory `project` (as [`install`] takes it), with what else it is
+/// told.
+fn hosted_scan(cell: &Cell, standin: &StandIn, project: &str, more: &[&str]) -> Ran {
+    let at = ["--cwd", project.trim_end_matches('/')];
+    let at: &[&str] = if project.is_empty() { &[] } else { &at };
+    let scan = ["scan", "--mode", "hosted"];
+    socket_patch(cell, standin, &[&scan[..], more, at].concat())
+}
+
+/// Without a Bazel: the two scans of [`hosted_update_pnpm_lock_on_pnpm_11`]
+/// and its undo, in a checkout with that hub, for the project at the root
+/// and for one in a directory of the workspace, whose hub names the lock
+/// there. As long as the hub lists no `pnpm-workspace.yaml`, the scan, a
+/// dry run of it and `get --mode hosted` pin nothing
+/// ([`pinned_nothing`]); a person reads the same warning under the line
+/// that says no patch could be switched. With the file of the user's own
+/// and its label in `data`, the scan pins the lock and writes the setting
+/// under the user's comment, and `rollback` leaves that file as the user
+/// made it.
+#[test]
+fn hosted_mode_pins_nothing_where_a_hub_hides_the_trust_setting_from_pnpm_11() {
+    for project in ["", "web/"] {
+        let (mut cell, standin, patch, _) = checkout(project);
+        cell.test = format!("{project:?}");
+        let test = &cell.test;
+        std::fs::remove_dir_all(cell.path(&format!("{project}node_modules"))).expect("the tree");
+        keeps_the_lock_up_to_date(&cell, Some(PNPM_11));
+        let package = project.trim_end_matches('/');
+        let label = |file: &str| format!("\"//{package}:{file}\"");
+        reads(&cell, label(LOCK).trim_matches('"'));
+        let before = cell.tree();
+        // For a project below the root the warning says where its paths
+        // are from.
+        let from = match project {
+            "" => ": this",
+            _ => ", with paths from the root of the Bazel workspace: this",
+        };
+        let names = names_the_hub(&cell).replacen(": this", from, 1);
+        let listed = WAY_ON.map(|way| way.replace("\"//:", &format!("\"//{package}:")));
+        let listed = listed.map(|way| way.replace("`//:", &format!("`//{package}:")));
+        let way_on = listed[0].replace(
+            "in pnpm-workspace.yaml (create",
+            &format!("in {project}pnpm-workspace.yaml (create"),
+        );
+        assert_ne!(
+            way_on.contains("in web/pnpm-workspace.yaml"),
+            project.is_empty()
+        );
+
+        // A script: the scan, its dry run, and `get` of the package.
+        for more in [&["--yes"][..], &["--dry-run"]] {
+            let scan = hosted_scan(&cell, &standin, project, more);
+            pinned_nothing(&cell, &scan, &before, &names, &way_on);
+        }
+        let get = ["get", PURL, "--mode", "hosted", "--yes"];
+        let at = ["--cwd", project.trim_end_matches('/')];
+        let at: &[&str] = if project.is_empty() { &[] } else { &at };
+        let get = socket_patch(&cell, &standin, &[&get[..], at].concat());
+        pinned_nothing(&cell, &get, &before, &names, &way_on);
+        // A person.
+        let origin = standin.origin();
+        let env = [("SOCKET_PATCH_SERVER_URL", origin.as_str())];
+        let at = ["--cwd", package];
+        let at: &[&str] = if project.is_empty() { &[] } else { &at };
+        let scan = [&["scan", "--mode", "hosted", "--yes"][..], at].concat();
+        let [stdout, stderr] = cell.socket_patch_person(&origin, &scan, &env);
+        let said = format!("{test}:\n--- stdout\n{stdout}\n--- stderr\n{stderr}");
+        let switched = "Switched 0 packages to hosted patches; rewrote 0 files.";
+        assert!(stdout.lines().any(|line| line == switched), "{said}");
+        let none = "No patches could be switched to hosted:";
+        let warning = format!("Warning: {names}");
+        let lines: Vec<&str> = stderr.lines().collect();
+        let below = lines.iter().skip_while(|line| **line != none);
+        let warned = below.skip(1).any(|line| line.starts_with(&warning));
+        assert!(warned, "no {warning:?} under {none:?}: {said}");
+        let unspaced = |text: &str| text.split_whitespace().collect::<String>();
+        assert!(unspaced(&stderr).contains(&unspaced(&way_on)), "{said}");
+        assert_eq!(changed(&before, &cell.tree()), NOTHING, "{test}");
+
+        // What the warning says to do: the file, then its label.
+        let workspace = format!("{project}pnpm-workspace.yaml");
+        cell.write(&workspace, OWN_WORKSPACE);
+        let module = text(&cell.tree(), MODULE);
+        let data = format!("    data = [{}],\n{UPDATE}", label("pnpm-workspace.yaml"));
+        cell.write(MODULE, module.replace(UPDATE, &data));
+        let listed = cell.tree();
+        let scan = hosted_scan(&cell, &standin, project, &["--yes"]);
+        let written = [format!("{project}{LOCK}"), workspace.clone()];
+        let pinned = cell.tree();
+        assert_eq!(changed(&listed, &pinned), written, "{test}: {}", scan.dump);
+        assert_eq!(
+            scan.envelope["summary"]["applied"], 1,
+            "{test}: {}",
+            scan.dump
+        );
+        assert!(text(&pinned, &written[0]).contains(&patch.uuid), "{test}");
+        let trusting = format!("{OWN_WORKSPACE}{TRUSTING_WORKSPACE}");
+        assert_eq!(text(&pinned, &workspace), trusting, "{test}");
+
+        let undo = socket_patch(&cell, &standin, &[&["rollback", "--yes"][..], at].concat());
+        assert_eq!(undo.code, 0, "{test}: {}", undo.dump);
+        assert_eq!(
+            changed(&listed, &cell.tree()),
+            NOTHING,
+            "{test}: {}",
+            undo.dump
+        );
+    }
+}
+
+/// Without a Bazel: a hub that lists the `pnpm-workspace.yaml` of the
+/// project is passed over only where the pin is one the build takes and an
+/// undo leaves standing. Hosted mode pins nothing where it would not write
+/// the setting to that file (the file says `trustLockfile: false`), and
+/// where the file would hold only what hosted mode writes, so that
+/// `rollback` would remove it and leave the call with a missing file. The
+/// warning names what the file needs, and no label, which is there.
+#[test]
+fn a_listed_workspace_file_has_to_hold_the_setting_and_a_line_of_the_users_own() {
+    let own = WAY_ON[0].split_once(", list ").expect("the first step").0;
+    let cases = [
+        (
+            "packages:\n  - '.'\n".to_string(),
+            format!("{own} and re-run"),
+        ),
+        (String::new(), format!("{own} and re-run")),
+        (
+            format!("{OWN_WORKSPACE}trustLockfile: false\n"),
+            " — set `trustLockfile: true` in pnpm-workspace.yaml (it says `trustLockfile: \
+             false`, which hosted mode leaves as it is) and re-run"
+                .to_string(),
+        ),
+    ];
+    for (workspace, way_on) in cases {
+        let (mut cell, standin, _, _) = checkout("");
+        cell.test = format!("{workspace:?}");
+        std::fs::remove_dir_all(cell.path("node_modules")).expect("the installed tree");
+        keeps_the_lock_up_to_date(&cell, Some(PNPM_11));
+        lists_the_workspace_file(&cell);
+        cell.write("pnpm-workspace.yaml", workspace);
+        let before = cell.tree();
+        let scan = hosted_scan(&cell, &standin, "", &["--yes"]);
+        pinned_nothing(&cell, &scan, &before, &names_the_hub(&cell), &way_on);
+    }
+}
+
+/// A `package-lock.json` in the checkout of `cell` that pins the package as
+/// its pnpm lock does: the lock of a project that npm installs.
+fn locks_with_npm(cell: &Cell) {
+    let lock = text(&cell.tree(), LOCK);
+    let (_, sum) = lock.split_once("integrity: ").expect("the sum");
+    let sum = sum.split_once('}').expect("its end").0;
+    let entry = json!({ "version": VERSION, "integrity": sum,
+        "resolved": format!("https://{REGISTRY}/{NAME}/-/{TGZ}") });
+    let root = json!({ "name": "socket-fixture", "version": "0.0.0",
+        "dependencies": { NAME: VERSION } });
+    let packages = json!({ "": root, format!("node_modules/{NAME}"): entry });
+    let npm = json!({ "name": "socket-fixture", "version": "0.0.0",
+        "lockfileVersion": 3, "requires": true, "packages": packages });
+    cell.write("package-lock.json", format!("{npm:#}\n"));
+}
+
+/// Without a Bazel: the project of that hub has a lock of npm's beside its
+/// pnpm lock. Hosted mode pins neither: a pin in the npm lock alone would
+/// be one that the pnpm lock, which still names the registry's tarball,
+/// stands against, and such a pin is never written. The package is skipped
+/// as one whose pin could not be told, under the same warning, and no file
+/// changes.
+#[test]
+fn an_npm_lock_beside_the_pnpm_lock_is_not_pinned_either() {
+    let (cell, standin, _, _) = checkout("");
+    std::fs::remove_dir_all(cell.path("node_modules")).expect("the installed tree");
+    keeps_the_lock_up_to_date(&cell, Some(PNPM_11));
+    locks_with_npm(&cell);
+    let before = cell.tree();
+    let scan = hosted_scan(&cell, &standin, "", &["--yes"]);
+    let (test, said) = (&cell.test, &scan.dump);
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    let skipped = [(
+        canonical_purl(PURL),
+        "skipped".into(),
+        "redirect_unattributable".into(),
+    )];
+    assert_eq!(reported(&scan.envelope), skipped, "{test}: {said}");
+    let warned = codes_in(&scan.envelope["warnings"]);
+    assert_eq!(warned, [HIDDEN], "{test}: {said}");
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{test}: {said}");
+}
+
+/// Without a Bazel: a patch that is in place is not taken away. The
+/// checkout has the hub of [`hosted_update_pnpm_lock_on_pnpm_11`] and a
+/// vendored patch of the package. A hosted scan would take a vendored
+/// patch over; here it pins nothing, so it keeps the vendored one, says
+/// so, and changes no file.
+#[test]
+fn a_vendored_patch_stays_where_hosted_mode_pins_nothing() {
+    let (cell, standin, patch, _) = checkout("");
+    std::fs::remove_dir_all(cell.path("node_modules")).expect("the installed tree");
+    keeps_the_lock_up_to_date(&cell, Some(PNPM_11));
+    let vendoring = socket_patch(&cell, &standin, &["scan", "--mode", "vendored", "--yes"]);
+    let (test, said) = (&cell.test, &vendoring.dump);
+    assert_eq!(
+        vendoring.envelope["summary"]["applied"], 1,
+        "{test}: {said}"
+    );
+    let vendored = cell.tree();
+    assert!(vendored.contains_key(&patch.vendored()), "{test}: {said}");
+
+    let hosted = socket_patch(&cell, &standin, &["scan", "--mode", "hosted", "--yes"]);
+    let said = &hosted.dump;
+    assert_eq!(hosted.code, 0, "{test}: {said}");
+    let warned = codes_in(&hosted.envelope["warnings"]);
+    let kept = [HIDDEN, "redirect_takeover_kept_vendored"];
+    assert!(
+        kept.iter().all(|code| warned.contains(&code.to_string())),
+        "{test}: {said}"
+    );
+    assert_eq!(hosted.envelope["summary"]["applied"], 0, "{test}: {said}");
+    assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{test}: {said}");
+}
+
+/// Without a Bazel: hubs that hide nothing from a pnpm that needs it, each
+/// made from the fixture's `MODULE.bazel`. Hosted mode pins the lock, and
+/// its run is the one of the same checkout without its `MODULE.bazel`, to a
+/// script and to a person: the exit code, both streams byte for byte, and
+/// every file it leaves.
+///
+/// - The hub keeps the lock up to date with a pnpm 10, which a tag states.
+/// - It does so with the pnpm rules_js picks itself.
+/// - It does so with pnpm 11 and lists the `pnpm-workspace.yaml` of the
+///   project.
+/// - A tag states pnpm 11 and the hub leaves the lock to the user.
+/// - The hub keeps the lock of another project up to date with pnpm 11:
+///   the project is a directory of the workspace with a lock of its own
+///   that no hub reads.
+/// - It does so in a file that `MODULE.bazel` includes and that is not
+///   there: a hub that is not read withholds nothing.
+/// - The hub of the flow names a pnpm lock that the project does not have:
+///   its lock is npm's, which no hub reads, and hosted mode pins that.
+#[test]
+fn hosted_mode_pins_as_without_bazel_where_no_hub_hides_the_trust_setting() {
+    let cases: [(&str, &str, Arrange); 7] = [
+        ("pnpm 10", "", |cell| {
+            keeps_the_lock_up_to_date(cell, Some("10.34.9"))
+        }),
+        ("the pnpm rules_js picks", "", |cell| {
+            keeps_the_lock_up_to_date(cell, None)
+        }),
+        ("pnpm 11 and the file listed", "", |cell| {
+            keeps_the_lock_up_to_date(cell, Some(PNPM_11));
+            lists_the_workspace_file(cell);
+        }),
+        ("pnpm 11 and no update", "", |cell| {
+            keeps_the_lock_up_to_date(cell, Some(PNPM_11));
+            let module = text(&cell.tree(), MODULE);
+            cell.write(MODULE, module.replace(UPDATE, ""));
+        }),
+        ("the lock of another project", "web/", |cell| {
+            keeps_the_lock_up_to_date(cell, Some(PNPM_11));
+        }),
+        ("a hub in a file that is missing", "", |cell| {
+            let include = "include(\"//tools:npm.MODULE.bazel\")\n";
+            let module = text(&cell.tree(), MODULE);
+            let (head, _) = module.split_once("npm = use_extension(").expect("the hub");
+            cell.write(MODULE, format!("{head}{include}"));
+        }),
+        ("a lock of npm's", "", |cell| {
+            keeps_the_lock_up_to_date(cell, Some(PNPM_11));
+            locks_with_npm(cell);
+            std::fs::remove_file(cell.path(LOCK)).expect(LOCK);
+        }),
+    ];
+    for (case, project, arrange) in cases {
+        let (mut cell, standin, patch, _) = checkout(project);
+        cell.test = case.to_string();
+        std::fs::remove_dir_all(cell.path(&format!("{project}node_modules"))).expect("the tree");
+        arrange(&cell);
+        // The same files in a checkout that is no Bazel workspace. The
+        // file of the user's own stays: it is no file of Bazel's.
+        let mut files = cell.tree();
+        files.remove(MODULE).expect(MODULE);
+        files.remove(".git/HEAD").expect("the checkout's mark");
+        let twin = cell.unbuilt(&files);
+
+        let origin = standin.origin();
+        let registry = format!("{origin}/{REGISTRY}");
+        let env = [
+            ("SOCKET_PATCH_SERVER_URL", origin.as_str()),
+            ("SOCKET_NPM_REGISTRY", registry.as_str()),
+        ];
+        let at = ["--cwd", project.trim_end_matches('/')];
+        let at: &[&str] = if project.is_empty() { &[] } else { &at };
+        let scan = [&["scan", "--mode", "hosted", "--yes"][..], at].concat();
+        let unwritten = cell.document("none");
+        let gives = |cell: &Cell| cell.gives(&origin, &scan, &env, &unwritten);
+        let (beside_the_hub, without_bazel) = (gives(&cell), gives(&twin));
+        assert_eq!(beside_the_hub, without_bazel, "{case}");
+        let codes: Vec<&Value> = without_bazel.as_array().expect("two runs").iter().collect();
+        let codes = codes.iter().map(|run| &run["code"]).collect::<Vec<_>>();
+        assert_eq!(codes, [&json!(0), &json!(0)], "{case}: {without_bazel:#}");
+
+        let mut left = cell.tree();
+        left.remove(MODULE).expect(MODULE);
+        left.remove(".git/HEAD").expect("the checkout's mark");
+        assert_eq!(left, twin.tree(), "{case}");
+        let pinned = |lock: &str| {
+            left.get(lock)
+                .is_some_and(|lock| String::from_utf8_lossy(lock).contains(&patch.uuid))
+        };
+        let pinned = pinned(&format!("{project}{LOCK}")) || pinned("package-lock.json");
+        assert!(pinned, "{case}: {:?}", left.keys());
+    }
 }
 
 /// Without a Bazel, what stays fixed now that no sum is committed: the
