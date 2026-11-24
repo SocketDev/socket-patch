@@ -425,11 +425,14 @@ pub struct GlobalArgs {
     /// Vendored mode (`vendor`, `scan`/`get --mode vendored`): write for a
     /// package although the project is in a Bazel workspace, where the
     /// build may not find the vendored copy. Vendored mode declines such
-    /// a package by default; today that is a Composer package
+    /// a package by default: a Composer package
     /// (`vendor_composer_bazel_workspace`), whose lock names the copy by a
     /// path that a Bazel rule running `composer install` in another
-    /// directory does not find. Pass it when the build does find the
-    /// copy. Other subcommands accept it silently.
+    /// directory does not find, and a NuGet package of a rules_csharp hub
+    /// where the `MODULE.bazel` block that makes the hub take the copy
+    /// cannot be shown to work (`vendor_nuget_bazel_workspace`). Pass it
+    /// when the build does find the copy, or does not build the project.
+    /// Other subcommands accept it silently.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long = "allow-vendored-in-bazel",

@@ -8,6 +8,7 @@
 pub const WORKSPACE_FILES: [&str; 4] =
     ["MODULE.bazel", "REPO.bazel", "WORKSPACE", "WORKSPACE.bazel"];
 
+mod block;
 pub mod built;
 pub mod cargo;
 pub(crate) mod cargo_bazel;
@@ -45,13 +46,30 @@ pub fn bazel_root(project: &Path) -> Option<BazelRoot> {
     root_in(&dirs, repo_at_end_of(dirs.clone()))
 }
 
+/// The root of a Bazel workspace above the one `project` is in, within the
+/// bounds of [`bazel_root`]: the next directory up that holds one of
+/// [`WORKSPACE_FILES`]. Bazel can build the inner workspace from there, as
+/// a module of the outer one.
+pub fn root_above(project: &Path) -> Option<PathBuf> {
+    let dirs = search_dirs(project);
+    let above = roots_in(&dirs, repo_at_end_of(dirs.clone())).nth(1);
+    above.map(|at| dirs[at].clone())
+}
+
+/// The directories of the walk `dirs`, which ended at the checkout `repo`,
+/// that hold one of [`WORKSPACE_FILES`], from the project up: each as its
+/// place in `dirs`.
+fn roots_in(dirs: &[PathBuf], repo: Option<GitRepo>) -> impl Iterator<Item = usize> + '_ {
+    let within = repo.filter(|repo| repo.trusted).map_or(1, |_| dirs.len());
+    (0..within).filter(|at| {
+        let marks = |name| std::fs::metadata(dirs[*at].join(name)).is_ok_and(|meta| meta.is_file());
+        WORKSPACE_FILES.into_iter().any(marks)
+    })
+}
+
 /// [`bazel_root`] for the walk `dirs`, which ended at the checkout `repo`.
 fn root_in(dirs: &[PathBuf], repo: Option<GitRepo>) -> Option<BazelRoot> {
-    let within = repo.filter(|repo| repo.trusted).map_or(1, |_| dirs.len());
-    let at = dirs.iter().take(within).position(|dir| {
-        let marks = |name| std::fs::metadata(dir.join(name)).is_ok_and(|meta| meta.is_file());
-        WORKSPACE_FILES.into_iter().any(marks)
-    })?;
+    let at = roots_in(dirs, repo).next()?;
     Some(BazelRoot {
         dir: dirs[at].clone(),
         project: dirs[0].strip_prefix(&dirs[at]).ok()?.to_path_buf(),
@@ -97,11 +115,14 @@ mod tests {
             (below.dir, below.project),
             (repo.clone(), PathBuf::from("svc/app"))
         );
-        // The nearest wins, under each name.
+        // The nearest wins, under each name, and the next one up is the
+        // workspace above it.
+        assert_eq!(root_above(&app), None);
         for name in ["WORKSPACE", "WORKSPACE.bazel", "REPO.bazel", "MODULE.bazel"] {
             let file = base.join("repo/svc").join(name);
             fs::write(&file, "").unwrap();
             assert_eq!(root(&app), Some(base.join("repo/svc")), "{name}");
+            assert_eq!(root_above(&app), Some(repo.clone()), "{name}");
             fs::remove_file(&file).unwrap();
         }
         fs::remove_file(repo.join("MODULE.bazel")).unwrap();
@@ -113,6 +134,8 @@ mod tests {
         let (_tmp, base) = tree(&["repo/.git", "repo/app"], &["MODULE.bazel", "WORKSPACE"]);
         assert_eq!(bazel_root(&base.join("repo/app")), None);
         assert_eq!(bazel_root(&base.join("repo")), None);
+        fs::write(base.join("repo/MODULE.bazel"), "").unwrap();
+        assert_eq!(root_above(&base.join("repo/app")), None);
     }
 
     /// `<checkout>/workspace/proj`: where the disk folds case, the directory

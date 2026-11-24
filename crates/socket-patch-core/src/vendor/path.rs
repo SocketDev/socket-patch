@@ -26,7 +26,7 @@
 //! | composer | `<vendor>/<name>@<version>/`           |
 //! | gem      | `<name>-<version>/`                    |
 //! | pypi     | `<dist>-<version>-<tags>.whl` (PEP 427); server sdist: `<dist>-<version>.tar.gz` / `.tgz` / `.zip` |
-//! | nuget    | `<idLower>.<versionNorm>.nupkg`        |
+//! | nuget    | `<idLower>.<versionNorm>.nupkg`; for a rules_csharp hub: `<idLower>/<versionNorm>/<idLower>.<versionNorm>.nupkg` |
 //! | maven    | `<g-as-path>/<a>/<v>/<a>-<v>.jar`      |
 
 use std::path::{Path, PathBuf};
@@ -488,9 +488,13 @@ pub(crate) fn leaf_to_purl(eco: &str, leaf: &str) -> Option<String> {
             Some(format!("pkg:pypi/{dist}@{version}"))
         }
         "nuget" => {
-            let stem = leaf.strip_suffix(".nupkg")?;
+            // The file itself, or the same below `<idLower>/<version>/`,
+            // where a rules_csharp hub has the package.
+            let (below, file) = leaf.rsplit_once('/').unwrap_or(("", leaf));
+            let stem = file.strip_suffix(".nupkg")?;
             let (name, version) = split_nuget_leaf(stem)?;
-            if !is_safe_single_segment(version) {
+            let hub = below == format!("{name}/{version}");
+            if !is_safe_single_segment(version) || !(below.is_empty() || hub) {
                 return None;
             }
             Some(format!("pkg:nuget/{name}@{version}"))
@@ -1069,6 +1073,20 @@ mod tests {
         // nested leaf whose recovered version would span a `/`.
         assert!(leaf_to_purl("nuget", ".1.2.3.nupkg").is_none());
         assert!(leaf_to_purl("nuget", "foo.1.0/evil.nupkg").is_none());
+        // Below `<idLower>/<version>/`, where a rules_csharp hub has the
+        // package, and below no other directory.
+        assert_eq!(
+            leaf_to_purl("nuget", "foo.bar/1.0.0-rc1/foo.bar.1.0.0-rc1.nupkg").as_deref(),
+            Some("pkg:nuget/foo.bar@1.0.0-rc1")
+        );
+        for elsewhere in [
+            "foo.bar/2.0.0/foo.bar.1.0.0.nupkg",
+            "other/1.0.0/foo.bar.1.0.0.nupkg",
+            "a/foo.bar/1.0.0/foo.bar.1.0.0.nupkg",
+            "1.0.0/foo.bar.1.0.0.nupkg",
+        ] {
+            assert!(leaf_to_purl("nuget", elsewhere).is_none(), "{elsewhere}");
+        }
         // maven: an empty group component, and an unsafe group (colon).
         assert!(leaf_to_purl("maven", "/app/1.0.0/app-1.0.0.jar").is_none());
         assert!(leaf_to_purl("maven", "a:b/x/1.0/x-1.0.jar").is_none());

@@ -930,6 +930,21 @@ impl Cell {
         self.downloads = Some(rules.to_vec());
     }
 
+    /// Take the file whose sha256 is `sha256` out of the repository cache,
+    /// which the tests of a leg and every twin share: whether it was
+    /// there. Bazel then has to fetch that file again from where its URLs
+    /// lead, as on a machine that never had it.
+    pub fn uncache(&self, sha256: &str) -> bool {
+        let cache = &self.scratch.repository_cache;
+        let entry = cache.join("content_addressable/sha256").join(sha256);
+        let held = entry.join("file").is_file();
+        if held {
+            std::fs::remove_dir_all(&entry)
+                .unwrap_or_else(|e| panic!("remove {}: {e}", entry.display()));
+        }
+        held
+    }
+
     /// Write a file of the workspace copy.
     pub fn write(&self, rel: &str, bytes: impl AsRef<[u8]>) {
         let path = self.scratch.workspace.join(rel);

@@ -3,8 +3,8 @@ name: Bazel patch compatibility (NuGet)
 # The NuGet flows of the real-Bazel tests (`nuget::` in `e2e_bazel_build`):
 # hosted mode for a package that rules_csharp's `nuget.from_lock` reads from
 # `packages.lock.json` and `nuget.config`, and for a tag that names no
-# `nuget_config`, and vendored mode for the same package, on each Bazel
-# release below.
+# `nuget_config`, and vendored mode for the same package, through the block
+# it keeps in `MODULE.bazel`, on each Bazel release below.
 # bazel-compatibility.yml holds the legs and what every ecosystem shares;
 # this file says when the NuGet legs run and on which releases.
 #
@@ -40,9 +40,14 @@ on:
     # `rollback`, and the hosted scan's check of that folder. Then what
     # reads the tag in `MODULE.bazel`: the reader of the workspace files,
     # which every ecosystem's flow shares (bazel/mod.rs, starlark.rs and
-    # workspace.rs), and what hosted mode makes of the tag (bazel/nuget.rs).
-    # vendor/nuget_feed.rs is the vendored backend, which the vendored flow
-    # runs; every one of those files calls its version and folder helpers.
+    # workspace.rs), and what hosted and vendored mode make of the tag
+    # (bazel/nuget.rs). vendor/nuget_feed.rs is the vendored backend, which
+    # the vendored flow runs; every one of those files calls its version
+    # and folder helpers. The vendored flow also runs through the block of
+    # `MODULE.bazel` (bazel/block.rs), what bazel/maven.rs shares with it
+    # (the label of a `use_extension` and the release of a ruleset), what
+    # names the Bazel release and the rc files (bazel/rc.rs), and the
+    # dispatch of the refusals of vendored mode (vendor/refusals.rs).
     # Nothing else that another ecosystem's flow owns is here, so any other
     # change to one ecosystem starts that ecosystem's legs only.
     #
@@ -71,8 +76,12 @@ on:
       - 'crates/socket-patch-core/src/vex/discover/nuget.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/nuget.rs'
       - 'crates/socket-patch-cli/src/commands/scan/hosted/nuget.rs'
+      - 'crates/socket-patch-core/src/vendor/refusals.rs'
+      - 'crates/socket-patch-core/src/bazel/block.rs'
+      - 'crates/socket-patch-core/src/bazel/maven.rs'
       - 'crates/socket-patch-core/src/bazel/mod.rs'
       - 'crates/socket-patch-core/src/bazel/nuget.rs'
+      - 'crates/socket-patch-core/src/bazel/rc.rs'
       - 'crates/socket-patch-core/src/bazel/starlark.rs'
       - 'crates/socket-patch-core/src/bazel/workspace.rs'
   push:
@@ -98,8 +107,12 @@ on:
       - 'crates/socket-patch-core/src/vex/discover/nuget.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/nuget.rs'
       - 'crates/socket-patch-cli/src/commands/scan/hosted/nuget.rs'
+      - 'crates/socket-patch-core/src/vendor/refusals.rs'
+      - 'crates/socket-patch-core/src/bazel/block.rs'
+      - 'crates/socket-patch-core/src/bazel/maven.rs'
       - 'crates/socket-patch-core/src/bazel/mod.rs'
       - 'crates/socket-patch-core/src/bazel/nuget.rs'
+      - 'crates/socket-patch-core/src/bazel/rc.rs'
       - 'crates/socket-patch-core/src/bazel/starlark.rs'
       - 'crates/socket-patch-core/src/bazel/workspace.rs'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'

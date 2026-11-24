@@ -130,15 +130,23 @@
 //!
 //! A third flow, [`vendored_from_lock`], runs vendored mode in the
 //! fixture's workspace. `scan --mode vendored --yes` downloads the patched
-//! package from the patch service once, keeps it under `.socket/vendor`,
-//! names that folder as a package source in `nuget.config` and re-pins the
-//! lock. NuGet takes a folder as a source. The hub reads the same line as
-//! the URL of a feed, so the next `bazel build` fails. `vendor --revert`
-//! puts every file back, and the build with them.
+//! package from the patch service once and keeps it under `.socket/vendor`,
+//! at the path a feed of the hub has a package. It names that folder as a
+//! package source in `nuget.config`, which NuGet takes, re-pins the lock,
+//! and appends a block to `MODULE.bazel`: a `nuget.from_lock` of its own,
+//! whose feeds are the folder of the patch, as a `file:` URL that Bazel
+//! reads from the root of the workspace, and then the sources of the
+//! config. The build then takes the committed package and asks no host for
+//! it, also on a machine with no host to ask; a changed copy fails the
+//! build; and `vendor --revert` puts every file back. Where the checkout
+//! does not show that the block works (it names no Bazel release), the
+//! command declines the package and writes nothing.
+//! [`vendored_mode_keeps_the_block_or_declines`] holds the commands to the
+//! same without a Bazel, with the other ways in and out.
 //!
 //! # Known gaps
 //!
-//! Four outcomes the flows assert are gaps of the product, not its
+//! Three outcomes the flows assert are gaps of the product, not its
 //! contract. Each is asserted as the release has it, and marked
 //! `KNOWN GAP` there with what a fix would change in this test:
 //!
@@ -150,8 +158,6 @@
 //!   while Bazel builds the patched package (c).
 //! - Bazel prints the access token of the grant, in a warning for each
 //!   package of the lock that the Socket source does not hold (c).
-//! - Vendored mode exits 0 and reports the package vendored, and the next
-//!   `bazel build` fails ([`vendored_from_lock`]).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -162,7 +168,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256, Sha512};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
-use crate::envelope::{codes_in, event_triples};
+use crate::envelope::{all_codes as codes_of, codes_in, event_triples};
 use crate::harness::{
     cell_without_bazel, changed, fixture_path, rewrite, Cell, Fixture, Ran, StandIn, Tree,
     CONSUMER, NOTHING,
@@ -1012,14 +1018,77 @@ fn vendor_dir(patch: &Patched) -> String {
     format!(".socket/vendor/nuget/{}", patch.uuid)
 }
 
+/// Where vendored mode keeps the package of `patch` for a hub, below
+/// [`vendor_dir`]: the path at which a feed of rules_csharp has a package.
+fn hub_copy(patch: &Patched) -> String {
+    let lower = patch.package.lower();
+    format!(
+        "{}/{lower}/{VERSION}/{lower}.{VERSION}.nupkg",
+        vendor_dir(patch)
+    )
+}
+
+/// The block vendored mode keeps at the end of the fixture's `MODULE.bazel`
+/// for the folder `dir` of a patch: the hub's own extension and lock, and
+/// as feeds that folder, which Bazel reads from the root of the workspace,
+/// and then the one source of the fixture's `nuget.config`.
+fn block(dir: &str) -> String {
+    format!(
+        "# >>> socket-patch: NuGet patches for Bazel (managed block: socket-patch writes and \
+         removes it) >>>\n\
+         socket_patch_nuget = use_extension(\"@rules_csharp//csharp:extensions.bzl\", \"nuget\")\n\
+         socket_patch_nuget.from_lock(\n    feeds = [\n        \"file:{dir}\",\n        \
+         \"{SOURCE}\",\n    ],\n    packages_lock_json = \"//:{LOCK}\",\n)\n\
+         # <<< socket-patch <<<\n"
+    )
+}
+
+/// The code with which vendored mode declines a package of a hub, where it
+/// cannot show that its block works, and the file that names the Bazel
+/// release of a checkout.
+const DECLINED: &str = "vendor_nuget_bazel_workspace";
+const BAZEL_VERSION: &str = ".bazelversion";
+
+/// For a finished vendored command that declined the package `purl`: it
+/// failed with exit 1, its one event is the refusal, and the detail says
+/// `why`, names hosted mode and the switch.
+fn declined(test: &str, ran: &Ran, purl: &str, why: &str) {
+    let said = &ran.dump;
+    assert_eq!(ran.code, 1, "{test}: {said}");
+    assert_eq!(ran.envelope["status"], "partialFailure", "{test}: {said}");
+    let refusal = [(purl.to_string(), "failed".to_string(), DECLINED.to_string())];
+    assert_eq!(event_triples(&ran.envelope), refusal, "{test}: {said}");
+    let event = &ran.envelope["events"][0];
+    let detail = event["error"].as_str().or(event["reason"].as_str());
+    let detail = detail.unwrap_or_default();
+    for part in [why, "`--mode hosted`", "`--allow-vendored-in-bazel`"] {
+        assert!(detail.contains(part), "{test}: no {part:?} in {detail:?}");
+    }
+}
+
 /// Vendored mode in the fixture's workspace, on the machine that restored
-/// the project. The command downloads the patched package from the patch
-/// service once and keeps it under `.socket/vendor`; it names that folder
-/// as a package source in `nuget.config`, with a source mapping, and
-/// re-pins the lock. It exits 0 and reports the package vendored, and
-/// `vex` attests it. The hub reads the folder as the URL of a feed, so the
-/// next `bazel build` fails. `vendor --revert` puts every file back, and
-/// the build with them.
+/// the project.
+///
+/// - (a) The unpatched build. The checkout names no Bazel release, so
+///   `scan --mode vendored --yes` declines the package: nothing is
+///   downloaded or written, and the build stays the one of before.
+/// - (b) With the release in `.bazelversion`, the same command downloads
+///   the patched package from the patch service once and keeps it where a
+///   feed of the hub has a package, names that folder in `nuget.config`,
+///   re-pins the lock, and appends its block to `MODULE.bazel`. `vendor
+///   --check` passes, `vex` attests the package, and `bazel query //...`
+///   lists what it listed. Bazel's own lock is stale, as after a hosted
+///   scan: a frozen lock fails until a build has updated it.
+/// - (c) The build of (a) prints the patched marker, from the committed
+///   copy: Bazel asks no host for the package. Then on a second machine,
+///   with the stand-in stopped, a new output base and the package in no
+///   repository cache, the build prints it again.
+/// - (d) On a third machine, one byte of the committed package is another:
+///   `vendor --check` fails, and so does the build, over the sha256 that
+///   Bazel's lock pins.
+/// - (e) `vendor --revert` puts every file back but Bazel's own lock, and
+///   the next build prints the unpatched marker and writes the lock of
+///   before.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
 fn vendored_from_lock() {
@@ -1034,7 +1103,7 @@ fn vendored_from_lock() {
     let upstream = Package::new(NAME, &run, &format!("PRISTINE {run}"));
     let neighbour = Package::new(NEIGHBOUR, &run, "NEIGHBOUR");
     let patch = Patched::new(&run);
-    let (purl, unpatched) = (upstream.purl(), upstream.marker());
+    let (purl, unpatched, patched) = (upstream.purl(), upstream.marker(), patch.package.marker());
     let standin = registry(&[&neighbour, &upstream]);
     grant(&standin, &upstream, &patch, &patch.package.nupkg);
     let service = service_route(&standin, &patch);
@@ -1047,13 +1116,28 @@ fn vendored_from_lock() {
     for package in [&neighbour, &upstream] {
         package.restore_into(home.path());
     }
+    let listing = |cell: &Cell| {
+        let query = cell.bazel("query", &["//..."]);
+        assert!(query.ok(), "{test}: {}", query.dump());
+        query.stdout()
+    };
 
-    // (a) The unpatched build.
-    let before = cell.builds_unpatched(&unpatched);
+    // (a) The unpatched build. No file of the checkout names the Bazel
+    // release that builds it, and the block is written for the releases it
+    // was built on alone: the command declines, with nothing downloaded
+    // and nothing written, and the build passes on the upstream package.
+    let unnamed = cell.builds_unpatched(&unpatched);
+    let scan = vendored_scan(&cell, &standin, home.path(), &[]);
+    let no_release = "no file of the checkout names the Bazel release that builds it";
+    declined(test, &scan, &purl, no_release);
+    assert_eq!(standin.asked(&service), 0, "{test}: {}", scan.dump);
+    assert_eq!(changed(&unnamed, &cell.tree()), NOTHING, "{test}");
+    cell.builds_patched(&unnamed, &unpatched);
 
-    // (b) The one command of vendored mode: the package from the patch
-    // service, once, into the folder of the patch; that folder as a source
-    // of `nuget.config`; and the lock re-pinned.
+    // (b) The checkout names its release, as a launcher reads it.
+    cell.write(BAZEL_VERSION, format!("{release}\n"));
+    let before = cell.tree();
+    let targets = listing(&cell);
     let scan = vendored_scan(&cell, &standin, home.path(), &[]);
     let said = &scan.dump;
     assert_eq!(scan.code, 0, "{test}: {said}");
@@ -1070,21 +1154,24 @@ fn vendored_from_lock() {
     assert_eq!(event_triples(&scan.envelope), events, "{test}: {said}");
     assert_eq!(standin.asked(&service), 1, "{test}: {said}");
     let vendored = cell.tree();
-    let dir = vendor_dir(&patch);
-    let copy = format!("{dir}/{}.{VERSION}.nupkg", upstream.lower());
+    let (dir, copy) = (vendor_dir(&patch), hub_copy(&patch));
     let mut written = vec![
         format!("{dir}/.gitignore"),
         format!("{dir}/socket-patch.vendor.json"),
         copy.clone(),
         ".socket/vendor/state.json".to_string(),
+        MODULE.to_string(),
         CONFIG.to_string(),
         LOCK.to_string(),
     ];
     written.sort();
     assert_eq!(changed(&before, &vendored), written, "{test}: {said}");
     assert_eq!(vendored[&copy], patch.package.nupkg, "{test}: {copy}");
+    // The config names the folder of the package, where NuGet finds it;
+    // the block names the folder of the patch, below which the hub does.
+    let folder = copy.rsplit_once('/').expect("a path").0;
     let source = format!(
-        "    <add key=\"socket-patch-{}\" value=\"{dir}\" />\n",
+        "    <add key=\"socket-patch-{}\" value=\"{folder}\" />\n",
         patch.uuid
     );
     let config = text(&vendored, CONFIG);
@@ -1094,49 +1181,427 @@ fn vendored_from_lock() {
         lock_pinning(&run, &[&neighbour, &patch.package]),
         "{test}: {LOCK}"
     );
-    // `vex` attests the package: it reads the committed copy.
+    let appended = format!("{}\n{}", text(&before, MODULE), block(&dir));
+    assert_eq!(text(&vendored, MODULE), appended, "{test}: {MODULE}");
+    // `vendor --check` and `vex` see the package as any vendored one, and
+    // Bazel sees no package in the folder.
+    let check = socket_patch(&cell, &standin, home.path(), &["vendor", "--check"]);
+    assert_eq!(check.code, 0, "{test}: {}", check.dump);
+    let verified = [event("verified", "vendor_check_ok")];
+    assert_eq!(event_triples(&check.envelope), verified, "{}", check.dump);
     let document = cell.document("vendored");
     let output = document.to_string_lossy();
     let vex = socket_patch(&cell, &standin, home.path(), &["vex", "--output", &output]);
     assert_eq!(vex.code, 0, "{test}: {}", vex.dump);
     let attested = [event("verified", "")];
     assert_eq!(event_triples(&vex.envelope), attested, "{}", vex.dump);
+    // With its closing quote, as the document writes `"@id": "<purl>"`.
+    let written = std::fs::read_to_string(&document).unwrap_or_default();
+    let names = written.contains(&format!("\"{purl}\""));
+    assert!(names, "{test}: {}\n{written}", vex.dump);
+    assert_eq!(listing(&cell), targets, "{test}: `bazel query //...`");
     assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{test}");
+    frozen_build_fails(&cell, "scan --mode vendored");
 
-    // (c) KNOWN GAP: the next build fails. The hub takes the sources of
-    // `nuget.config` as the URLs of its feeds, and the folder is none:
-    // Bazel 9 crashes in the module extension, Bazel 8 and 7 refuse the
-    // URL. A fix would have the build print the patched marker here.
+    // (c) The build of (a) and no other step: patched, from the committed
+    // copy. Bazel asked the folder for the other package of the lock as
+    // well, warned that it is not there, and took it from nuget.org as
+    // before. It rewrote its own lock and no other file.
     let build = cell.bazel("build", &[CONSUMER]);
-    let failure = match cell.numbers() >= (9, 0, 0) {
-        true => "NullPointerException thrown during Starlark evaluation".to_string(),
-        false => format!("Bad URL: {dir}"),
-    };
-    // Compared without white space: nothing says where Bazel breaks a long
-    // line.
+    assert!(build.ok(), "{test}: {}", build.dump());
+    // A line of Bazel's is compared without white space, here and below:
+    // nothing says where a tool breaks a long line.
     let squeezed = |text: &str| text.split_whitespace().collect::<String>();
+    let missed = format!("WARNING: Download from file:{dir}/{}/", neighbour.lower());
     assert!(
-        !build.ok() && squeezed(&build.stderr()).contains(&squeezed(&failure)),
-        "{test}: the build after the vendored scan did not fail with {failure:?}:\n{}",
+        squeezed(&build.stderr()).contains(&squeezed(&missed)),
+        "{test}: no {missed:?}:\n{}",
         build.dump()
     );
-    // Bazel asked no host for the patched package, and changed no file.
-    assert_eq!(standin.asked(&service), 1, "{test}");
-    assert_eq!(standin.asked(&patch.file(&patch.package)), 0, "{test}");
-    assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{test}");
+    let built = cell.tree();
+    assert_eq!(changed(&vendored, &built), [BAZEL_LOCK], "{test}");
+    cell.builds_patched(&built, &patched);
+    let patched_route = patch.file(&patch.package);
+    let asked = (standin.asked(&service), standin.asked(&patched_route));
+    assert_eq!(asked, (1, 0), "{test}: Bazel asked a host for the package");
 
-    // (d) The undo: every file is the one of before, and so is the build.
+    // A second machine, with no host to ask: the stand-in is stopped, the
+    // output base is new, and the repository cache, which held the package
+    // since the build above, holds it no more.
+    let sum = sha256_hex(&patch.package.nupkg);
+    assert!(cell.uncache(&sum), "{test}: the cache did not hold {sum}");
+    drop(standin);
+    let offline = cell.twin();
+    offline.builds(&patched);
+    assert_eq!(changed(&built, &offline.tree()), NOTHING, "{test}");
+
+    // (d) A third machine, where one byte of the committed package is
+    // another: `vendor --check` fails, and the build fails over the sha256
+    // that Bazel's lock pins. The changed bytes are never built.
+    assert!(
+        offline.uncache(&sum),
+        "{test}: the cache did not hold {sum}"
+    );
+    let tampered = offline.twin();
+    let mut bytes = patch.package.nupkg.clone();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x01;
+    tampered.write(&copy, &bytes);
+    let check = tampered.socket_patch("http://127.0.0.1:9", &["vendor", "--check"], &[]);
+    assert_eq!(check.code, 1, "{test}: {}", check.dump);
+    let failed = [event("failed", "vendor_check_failed")];
+    assert_eq!(event_triples(&check.envelope), failed, "{}", check.dump);
+    let build = tampered.bazel("build", &[CONSUMER]);
+    let refusal = format!("Checksum was {} but wanted {sum}", sha256_hex(&bytes));
+    assert!(
+        !build.ok() && squeezed(&build.stderr()).contains(&squeezed(&refusal)),
+        "{test}: the changed package did not fail the build with {refusal:?}:\n{}",
+        build.dump()
+    );
+    drop(tampered);
+    drop(offline);
+
+    // (e) The undo, with a registry to ask again: every file of the
+    // checkout is the one of before but Bazel's own lock, which the next
+    // build puts back with the unpatched marker.
+    let standin = registry(&[&neighbour, &upstream]);
+    cell.route_downloads(&downloads(&standin.origin()));
     let undo = socket_patch(&cell, &standin, home.path(), &["vendor", "--revert"]);
-    cell.undone(&undo, "removed", &before, &unpatched);
+    let said = &undo.dump;
+    assert_eq!(undo.code, 0, "{test}: {said}");
+    assert_eq!(undo.envelope["summary"]["removed"], 1, "{test}: {said}");
+    assert_eq!(
+        changed(&before, &cell.tree()),
+        [BAZEL_LOCK],
+        "{test}: {said}"
+    );
+    cell.builds(&unpatched);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{test}");
 
     println!(
-        "{test}: on Bazel {release}, `scan --mode vendored` exited 0, kept the patched package \
-         at {copy} and named {dir} in {CONFIG}; `vex` attested the package; the next build \
-         failed ({failure}); `vendor --revert` restored all {} files and the build printed \
-         {unpatched:?}; {:?}",
+        "{test}: on Bazel {release}, `scan --mode vendored` declined the package while no file \
+         named the release ({DECLINED}) and the build stayed {unpatched:?}; with {BAZEL_VERSION} \
+         it kept the patched package at {copy} and its block in {MODULE}; `vendor --check` passed \
+         and `vex` attested the package; the build printed {patched:?} with no request for the \
+         package, and again with the stand-in stopped, a new output base and the package in no \
+         repository cache; one changed byte failed `vendor --check` and the build ({refusal}); \
+         `vendor --revert` restored all {} files but {BAZEL_LOCK}, and the next build printed \
+         {unpatched:?} and wrote the lock of before; {:?}",
         before.len(),
         started.elapsed()
     );
+}
+
+/// Bazel's lock of a checkout that a build has selected rules_csharp 0.5.0
+/// for: the one line of it that vendored mode reads.
+const SELECTED: &str = "{\"lockFileVersion\": 28, \"registryFileHashes\": {\
+    \"https://bcr.bazel.build/modules/rules_csharp/0.5.0/source.json\": \"sum\"}}\n";
+
+/// Without a Bazel: vendored mode through the binary, in checkouts of the
+/// fixture's project on the machine that restored it.
+///
+/// Where no Bazel workspace is, and where the tag of one reads the lock of
+/// another project, the command gives a person and a script what it gives
+/// without Bazel, and writes the same files: the package in the folder of
+/// the patch, that folder in `nuget.config`, and no line of `MODULE.bazel`.
+///
+/// In the fixture's workspace it keeps the package where a feed of the hub
+/// has it and its block in `MODULE.bazel`; a second run changes nothing;
+/// `vendor --check` passes and `list` says what it says without Bazel; and
+/// `vendor --revert`, `rollback` and `remove` each put every file back
+/// byte for byte, the block with its one folder. Beside a block that was
+/// changed by hand no undo changes a file, and each says where the block
+/// is; with the block deleted by hand, the undo puts the rest back.
+///
+/// Where the block cannot be shown to work, `scan` and `get` decline the
+/// package with exit 1 and write nothing, a dry run lists it and exits 0,
+/// and a person reads the reason. A pin of hosted mode stays: the scan
+/// that would take it over and the `vendor` that would eject it are
+/// declined too, and where the block does work `vendor` ejects the pin
+/// into it. With `--allow-vendored-in-bazel`, or its variable, the package
+/// is vendored as without Bazel.
+#[test]
+fn vendored_mode_keeps_the_block_or_declines() {
+    let test = "nuget::vendored_mode_keeps_the_block_or_declines";
+    let (upstream, neighbour) = (
+        Package::new(NAME, "R1", "PRISTINE"),
+        Package::new(NEIGHBOUR, "R1", "NEIGHBOUR"),
+    );
+    let (patch, purl) = (Patched::new("R1"), upstream.purl());
+    let standin = registry(&[&neighbour, &upstream]);
+    grant(&standin, &upstream, &patch, &patch.package.nupkg);
+    let service = service_route(&standin, &patch);
+    let home = tempfile::tempdir().expect("create the .NET home");
+    for package in [&neighbour, &upstream] {
+        package.restore_into(home.path());
+    }
+    let era = fixture_path(FIXTURE.dir).join(FIXTURE.eras[0].1);
+    let module = std::fs::read_to_string(era.join(MODULE)).expect(MODULE);
+    // A checkout of the fixture's project and config: with `module` as its
+    // MODULE.bazel, beside Bazel's lock, and the release it names.
+    let checkout = |module: Option<&str>, release: Option<&str>| {
+        let cell = cell_without_bazel("9.3.2");
+        check_out(&cell, "R1", &[&neighbour, &upstream]);
+        cell.write(CONFIG, fixture_file_as_is(CONFIG));
+        cell.write(".git/HEAD", "ref: refs/heads/main\n");
+        if let Some(module) = module {
+            cell.write(MODULE, module);
+            cell.write(BAZEL_LOCK, SELECTED);
+        }
+        if let Some(release) = release {
+            cell.write(BAZEL_VERSION, format!("{release}\n"));
+        }
+        cell
+    };
+    let scan = |cell: &Cell, more: &[&str]| vendored_scan(cell, &standin, home.path(), more);
+    let (dir, flat) = (
+        vendor_dir(&patch),
+        format!("{}.{VERSION}.nupkg", upstream.lower()),
+    );
+    let flat = format!("{dir}/{flat}");
+    // What a vendored run wrote of the three files it shares with a hub,
+    // and the names of everything it wrote.
+    let wrote = |cell: &Cell, before: &Tree| {
+        let after = cell.tree();
+        let files = [CONFIG, LOCK].map(|file| after[file].clone());
+        (changed(before, &after), files)
+    };
+
+    // Without Bazel, and beside a tag that reads the lock of another
+    // project: the package in the folder of the patch.
+    let plain = checkout(None, None);
+    let before = plain.tree();
+    let without = scan(&plain, &[]);
+    assert_eq!(without.code, 0, "{test}: {}", without.dump);
+    let as_before = wrote(&plain, &before);
+    let mut written = vec![
+        format!("{dir}/.gitignore"),
+        format!("{dir}/socket-patch.vendor.json"),
+        flat.clone(),
+        ".socket/vendor/state.json".to_string(),
+        CONFIG.to_string(),
+        LOCK.to_string(),
+    ];
+    written.sort();
+    assert_eq!(as_before.0, written, "{test}: {}", without.dump);
+    let elsewhere = module.replace("//:packages", "//api:packages");
+    for (module, release) in [(&elsewhere, None), (&elsewhere, Some("9.3.2"))] {
+        let cell = checkout(Some(module), release);
+        let before = cell.tree();
+        let ran = scan(&cell, &[]);
+        assert_eq!(ran.code, 0, "{test}: {}", ran.dump);
+        assert_eq!(ran.envelope, without.envelope, "{test}: {}", ran.dump);
+        assert_eq!(wrote(&cell, &before), as_before, "{test}: {}", ran.dump);
+    }
+
+    // The fixture's workspace: the block, and every way to take it out.
+    let hub = checkout(Some(&module), Some("9.3.2"));
+    let before = hub.tree();
+    let undo: [&[&str]; 3] = [
+        &["vendor", "--revert"],
+        &["rollback", "--yes"],
+        &["remove", &purl, "--yes"],
+    ];
+    for undo in undo {
+        let ran = scan(&hub, &[]);
+        assert_eq!(ran.code, 0, "{test}: {}", ran.dump);
+        let vendored = hub.tree();
+        let mut written = vec![
+            format!("{dir}/.gitignore"),
+            format!("{dir}/socket-patch.vendor.json"),
+            hub_copy(&patch),
+            ".socket/vendor/state.json".to_string(),
+            MODULE.to_string(),
+            CONFIG.to_string(),
+            LOCK.to_string(),
+        ];
+        written.sort();
+        assert_eq!(changed(&before, &vendored), written, "{test}: {}", ran.dump);
+        let appended = format!("{module}\n{}", block(&dir));
+        assert_eq!(text(&vendored, MODULE), appended, "{test}");
+        // Once more, and the check: nothing is written.
+        let again = scan(&hub, &[]);
+        assert_eq!(again.code, 0, "{test}: {}", again.dump);
+        let check = socket_patch(&hub, &standin, home.path(), &["vendor", "--check"]);
+        assert_eq!(check.code, 0, "{test}: {}", check.dump);
+        // `list` says of it what it says of the package without Bazel.
+        let list = |cell: &Cell| socket_patch(cell, &standin, home.path(), &["list"]);
+        let (listed, as_without) = (list(&hub), list(&plain));
+        assert_eq!(listed.envelope["events"][0]["details"]["mode"], "vendored");
+        assert_eq!(listed.envelope, as_without.envelope, "{}", listed.dump);
+        assert_eq!(changed(&vendored, &hub.tree()), NOTHING, "{test}: {undo:?}");
+        let ran = socket_patch(&hub, &standin, home.path(), undo);
+        assert_eq!(ran.code, 0, "{test}: {}", ran.dump);
+        assert_eq!(
+            changed(&before, &hub.tree()),
+            NOTHING,
+            "{test}: {}",
+            ran.dump
+        );
+    }
+
+    // A block that was changed by hand keeps the folder of the patch, and
+    // with the lock restored beside it the Bazel build would fail on the
+    // committed package: no undo changes a file, and each names the line
+    // of the block. With the block deleted by hand, the undo puts every
+    // other file back.
+    let squeezed = |text: &str| text.split_whitespace().collect::<String>();
+    let ran = scan(&hub, &[]);
+    assert_eq!(ran.code, 0, "{test}: {}", ran.dump);
+    let wired = text(&hub.tree(), MODULE);
+    hub.write(
+        MODULE,
+        wired.replace("    feeds = [", "    # mine\n    feeds = ["),
+    );
+    let edited = hub.tree();
+    assert_ne!(text(&edited, MODULE), wired, "{test}");
+    let by_hand = format!(
+        "{MODULE}:{}: the block that socket-patch keeps there was changed by hand",
+        module.lines().count() + 2
+    );
+    for undo in undo {
+        let ran = socket_patch(&hub, &standin, home.path(), undo);
+        assert_eq!(ran.code, 1, "{test}: {}", ran.dump);
+        assert!(
+            squeezed(&ran.dump).contains(&squeezed(&by_hand)),
+            "{test}: no {by_hand:?}: {}",
+            ran.dump
+        );
+        assert_eq!(changed(&edited, &hub.tree()), NOTHING, "{test}: {undo:?}");
+    }
+    hub.write(MODULE, &module);
+    let ran = socket_patch(&hub, &standin, home.path(), undo[0]);
+    assert_eq!(ran.code, 0, "{test}: {}", ran.dump);
+    assert_eq!(
+        changed(&before, &hub.tree()),
+        NOTHING,
+        "{test}: {}",
+        ran.dump
+    );
+
+    // Where the block cannot be shown to work: declined by every command
+    // that would vendor, with nothing asked of the patch service. The
+    // last row is a tag with `feeds` beside a config without a source: the
+    // run would name its folder there, and the next one would take the
+    // sources of that file for the hub's in place of those feeds.
+    let asked = standin.asked(&service);
+    let dirs = module.replace(NAMES_CONFIG, "    local_package_dirs = [\"/opt/nuget\"],\n");
+    let fed =
+        format!("    feeds = [\"https://nuget.private.example/v3/index.json\"],\n{NAMES_CONFIG}");
+    let fed = module.replace(NAMES_CONFIG, &fed);
+    let sourceless = "<configuration>\n  <packageSources>\n  </packageSources>\n</configuration>\n";
+    let rows: [(&str, Option<&str>, Option<&str>, &str); 4] = [
+        (
+            &module,
+            None,
+            None,
+            "no file of the checkout names the Bazel release",
+        ),
+        (
+            &module,
+            Some("8.8.1"),
+            None,
+            "the checkout names Bazel 8.8.1",
+        ),
+        (
+            &dirs,
+            Some("9.3.2"),
+            None,
+            "MODULE.bazel:9: this `nuget.from_lock` has `local_package_dirs`",
+        ),
+        (
+            &fed,
+            Some("9.3.2"),
+            Some(sourceless),
+            "MODULE.bazel:9: this `nuget.from_lock` has `feeds`, and its `nuget_config` \
+             `//:nuget.config` names no package source",
+        ),
+    ];
+    for (module, release, config, why) in rows {
+        let cell = checkout(Some(module), release);
+        if let Some(config) = config {
+            cell.write(CONFIG, config);
+        }
+        let before = cell.tree();
+        declined(test, &scan(&cell, &[]), &purl, why);
+        let get = ["get", &purl, "--mode", "vendored", "--yes"];
+        let get = socket_patch(&cell, &standin, home.path(), &get);
+        assert_eq!(get.code, 1, "{test}: {}", get.dump);
+        assert!(
+            codes_of(&get.envelope).contains(&DECLINED.to_string()),
+            "{}",
+            get.dump
+        );
+        // A dry run lists it and passes.
+        let dry = scan(&cell, &["--dry-run"]);
+        assert_eq!(dry.code, 0, "{test}: {}", dry.dump);
+        let listed = [(purl.clone(), "skipped".to_string(), DECLINED.to_string())];
+        assert_eq!(event_triples(&dry.envelope), listed, "{test}: {}", dry.dump);
+        assert_eq!(changed(&before, &cell.tree()), NOTHING, "{test}: {why}");
+        // A person reads the reason after the package, once. The output is
+        // compared without white space: nothing says where a long line is
+        // broken.
+        let run = |api: &str, env: &[(&str, &str)]| {
+            let origin = standin.origin();
+            let args = [&VENDORED[..], &["--patch-server-url", &origin]].concat();
+            cell.socket_patch_person(api, &args, env)
+        };
+        let person = on_machine(&standin, home.path(), run);
+        let told = squeezed(&person.concat());
+        let line = squeezed(&format!("{purl} ({DECLINED}): "));
+        assert!(
+            told.matches(&line).count() == 1 && told.contains(&squeezed(why)),
+            "{test}: {person:?}"
+        );
+        assert_eq!(changed(&before, &cell.tree()), NOTHING, "{test}: {why}");
+        assert_eq!(standin.asked(&service), asked, "{test}: {why}");
+    }
+    // A package that hosted mode pinned: the scan that would take the pin
+    // over and the `vendor` that would eject it are declined, and the pin
+    // stays. Once the checkout names its release, `vendor` ejects the pin
+    // into the block.
+    let cell = checkout(Some(&module), None);
+    let hosted = socket_patch(&cell, &standin, home.path(), &SCAN);
+    assert_eq!(hosted.code, 0, "{test}: {}", hosted.dump);
+    let pinned = cell.tree();
+    declined(test, &scan(&cell, &[]), &purl, rows[0].3);
+    let eject = socket_patch(&cell, &standin, home.path(), &["vendor", "--yes"]);
+    assert_eq!(eject.code, 1, "{test}: {}", eject.dump);
+    let refused = &eject.envelope["error"]["code"];
+    assert_eq!(*refused, "eject_refused", "{test}: {}", eject.dump);
+    let kept = eject.envelope["events"][0]["error"].as_str();
+    let kept = kept.is_some_and(|why| why.starts_with("kept hosted: ") && why.contains(rows[0].3));
+    assert!(kept, "{test}: {}", eject.dump);
+    assert_eq!(changed(&pinned, &cell.tree()), NOTHING, "{test}");
+    assert_eq!(standin.asked(&service), asked, "{test}");
+    cell.write(BAZEL_VERSION, "9.3.2\n");
+    let origin = standin.origin();
+    let eject = ["vendor", "--yes", "--patch-server-url", &origin];
+    let eject = socket_patch(&cell, &standin, home.path(), &eject);
+    assert_eq!(eject.code, 0, "{test}: {}", eject.dump);
+    let ejected = cell.tree();
+    assert_eq!(ejected[&hub_copy(&patch)], patch.package.nupkg, "{test}");
+    let appended = format!("{module}\n{}", block(&dir));
+    assert_eq!(text(&ejected, MODULE), appended, "{test}: {}", eject.dump);
+    assert!(!text(&ejected, CONFIG).contains(PATCH_HOST), "{test}");
+
+    // The user's word, as a flag and as its variable: as without Bazel.
+    for flag in [true, false] {
+        let cell = checkout(Some(&module), None);
+        let before = cell.tree();
+        let ran = match flag {
+            true => scan(&cell, &["--allow-vendored-in-bazel"]),
+            false => on_machine(&standin, home.path(), |api, env| {
+                let origin = standin.origin();
+                let args = [&VENDORED[..], &["--patch-server-url", &origin]].concat();
+                let env = [env, &[("SOCKET_ALLOW_VENDORED_IN_BAZEL", "1")]].concat();
+                cell.socket_patch(api, &args, &env)
+            }),
+        };
+        assert_eq!(ran.code, 0, "{test}: {}", ran.dump);
+        assert_eq!(ran.envelope, without.envelope, "{test}: {}", ran.dump);
+        assert_eq!(wrote(&cell, &before), as_before, "{test}: {}", ran.dump);
+    }
 }
 
 /// Without a Bazel: `scan --mode hosted --yes` through the binary, in

@@ -4,12 +4,16 @@ use std::sync::Arc;
 use crate::utils::digest::sha512_base64_of;
 use serde_json::Value;
 
+use crate::bazel::nuget::{
+    vendored, with_folder, without_folder, Feeds, Vendored, VENDOR_DECLINED,
+};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
+use crate::utils::env_compat::env_flag;
 use crate::utils::fs::{
-    atomic_write_artifact, atomic_write_bytes_preserving_mode, read_regular_to_string,
+    atomic_write_artifact, atomic_write_bytes_preserving_mode, read_regular_to_string, run_blocking,
 };
 use crate::utils::line_endings::{eol_eq, respell, terminator};
 use crate::utils::purl::{build_nuget_purl, parse_nuget_purl};
@@ -20,6 +24,7 @@ use super::common::{
 };
 use super::parse_memo::ParseMemo;
 use super::path::vendor_uuid_dir_rel;
+use super::refusals::ALLOW_IN_BAZEL_ENV;
 use super::revert::{self, KeepPolicy};
 use super::service_fetch::service_archive_copy;
 use super::state::{
@@ -40,6 +45,12 @@ use crate::formats::nuget::lock::{locked_at, PACKAGES_LOCK};
 const CONFIG_SOURCE_WIRING_KIND: &str = "nuget_config_source";
 const CONFIG_MAPPING_WIRING_KIND: &str = "nuget_config_mapping";
 const LOCK_WIRING_KIND: &str = "nuget_lock_entry";
+/// The folder of the patch in the block of the root `MODULE.bazel`
+/// ([`crate::bazel::nuget`]): the revert takes that folder out of the
+/// block, whatever the record says.
+pub(super) const BAZEL_WIRING_KIND: &str = "nuget_bazel_feed";
+/// The file of that block.
+const MODULE_FILE: &str = crate::bazel::nuget::FILE;
 
 /// `<uuid>/.gitignore`, exactly: re-include the vendored nupkg against the
 /// user's ignore rules (VisualStudio.gitignore's `*.nupkg`), #1061.
@@ -120,10 +131,20 @@ struct NugetPrelude {
     version: String,
     version_norm: String,
     uuid_dir_rel: String,
+    /// The folder `nuget.config` names for the patch: [`Self::uuid_dir_rel`],
+    /// or below it `<idLower>/<versionNorm>` for a package of a
+    /// rules_csharp hub, where a feed of the hub has it.
+    feed_rel: String,
     copy_rel: String,
     uuid_dir: PathBuf,
     nupkg_path: PathBuf,
     source_key: String,
+    /// What the block of the root `MODULE.bazel` holds beside the folder
+    /// of the patch. `None`: the package has no folder there.
+    feeds: Option<Feeds>,
+    /// Why the block of a package that is wired for a hub can no longer
+    /// be shown to work.
+    hub_doubt: Option<String>,
     config_path: Option<PathBuf>,
     config_text: Option<String>,
     /// Every lock the projects under the root restore into (#353, #514).
@@ -174,9 +195,8 @@ async fn nuget_prelude(
     let id_lower = name.to_lowercase();
     let version_norm = normalize_nuget_version(version);
     let leaf = nupkg_leaf(&id_lower, version);
-    let copy_rel = format!("{uuid_dir_rel}/{leaf}");
     let uuid_dir = project_root.join(&uuid_dir_rel);
-    let nupkg_path = project_root.join(&copy_rel);
+    let nupkg_path = uuid_dir.join(&leaf);
     let source_key = crate::patch::redirect::generation::hosted_pin_name(&record.uuid);
 
     // The nupkg must survive the commit the vendored workflow ends with: a
@@ -230,6 +250,7 @@ async fn nuget_prelude(
         ));
     }
     let mut locks: Vec<LockFile> = Vec::with_capacity(governed.locks.len());
+    let governed_rels = governed.locks.clone();
     for rel in governed.locks {
         let path = project_root.join(&rel);
         match read_regular_to_string(&path).await {
@@ -247,10 +268,46 @@ async fn nuget_prelude(
     // The idempotent hot path's test (see `vendor_nuget`): a live
     // `<packageSources>` source under our key. A commented-out one — or the
     // key merely mentioned elsewhere — is not wiring NuGet reads.
-    let config_wired = config_text
+    let named = config_text
         .as_deref()
         .and_then(crate::formats::nuget::parse_config)
-        .is_some_and(|parsed| parsed.sources.iter().any(|(key, _)| *key == source_key));
+        .and_then(|parsed| {
+            parsed
+                .sources
+                .into_iter()
+                .find(|(key, _)| *key == source_key)
+        });
+    let config_wired = named.is_some();
+    // Where the package lies. A rules_csharp hub that reads a lock of the
+    // project takes it from `<folder>/<idLower>/<version>/`, through the
+    // block of the root MODULE.bazel; every other project keeps it in the
+    // folder itself. A package that is wired stays where the config names
+    // it, and only one that lies where a hub has it is the hub's.
+    let nested = format!("{uuid_dir_rel}/{id_lower}/{version_norm}");
+    let for_hub = named.is_some_and(|(_, value)| value == nested);
+    let hub = match config_wired && !for_hub {
+        true => Vendored::Plain,
+        false => {
+            let root = project_root.to_path_buf();
+            run_blocking(move || vendored(&root, &governed_rels)).await
+        }
+    };
+    let (feeds, hub_doubt) = match hub {
+        Vendored::Block(feeds) => (Some(feeds), None),
+        Vendored::Declined(why) if for_hub => (None, Some(why)),
+        // The caller's own refusal ([`bazel_refusals`]) comes first; this
+        // one holds for every way in.
+        Vendored::Declined(why) if !env_flag(ALLOW_IN_BAZEL_ENV) => {
+            return Err(refused(VENDOR_DECLINED, declined_detail(&why)));
+        }
+        _ => (None, None),
+    };
+    let feed_rel = match for_hub || feeds.is_some() {
+        true => nested,
+        false => uuid_dir_rel.clone(),
+    };
+    let copy_rel = format!("{feed_rel}/{leaf}");
+    let nupkg_path = project_root.join(&copy_rel);
     // The mapping routes every version of the id to this feed, which serves
     // only the patched one: a framework that locks another version could no
     // longer restore (NU1102). Refused before anything is wired (#593).
@@ -308,16 +365,125 @@ async fn nuget_prelude(
         version: version.to_string(),
         version_norm,
         uuid_dir_rel,
+        feed_rel,
         copy_rel,
         uuid_dir,
         nupkg_path,
         source_key,
+        feeds,
+        hub_doubt,
         config_path,
         config_text,
         locks,
         config_wired,
         in_sync,
     })
+}
+
+/// What a declined package is told after `why`, the reason of
+/// [`vendored`]: what vendored mode would have needed, and the two ways on.
+fn declined_detail(why: &str) -> String {
+    format!(
+        "{why}; vendored mode makes a rules_csharp hub take the committed package through a \
+         block in the root {MODULE_FILE}, which it writes only where the checkout shows that the \
+         block works, so it wrote nothing for this package; use `--mode hosted`, or pass \
+         `--allow-vendored-in-bazel` to vendor the package as in a project without Bazel, which \
+         the hub does not take: its build then fails"
+    )
+}
+
+/// The NuGet `candidates` (`(purl, uuid)` pairs) that vendored mode
+/// declines in the project at `project_root`, each with [`VENDOR_DECLINED`]
+/// and the detail: those of a project whose lock a rules_csharp hub reads,
+/// where the block cannot be shown to work ([`vendored`]), unless the user
+/// allowed it ([`ALLOW_IN_BAZEL_ENV`]). A package whose folder
+/// `nuget.config` already names is let through: the run leaves the config
+/// as it is. Read-only, and it starts no program.
+pub(crate) async fn bazel_refusals<'a>(
+    project_root: &Path,
+    candidates: &[(&'a str, &str)],
+) -> Vec<(&'a str, &'static str, String)> {
+    if candidates.is_empty() || env_flag(ALLOW_IN_BAZEL_ENV) {
+        return Vec::new();
+    }
+    let root = project_root.to_path_buf();
+    let hub = run_blocking(move || {
+        let governed = super::nuget_config::governed_locks_on_disk(&root);
+        vendored(
+            &root,
+            &governed.map(|governed| governed.locks).unwrap_or_default(),
+        )
+    });
+    let Vendored::Declined(why) = hub.await else {
+        return Vec::new();
+    };
+    let config = match existing_config_path(project_root).await {
+        Some(path) => read_regular_to_string(&path).await.ok(),
+        None => None,
+    };
+    let sources = config
+        .as_deref()
+        .and_then(crate::formats::nuget::parse_config);
+    let sources = sources.map(|config| config.sources).unwrap_or_default();
+    let wired = |uuid: &str| {
+        let key = crate::patch::redirect::generation::hosted_pin_name(uuid);
+        let folder = vendor_uuid_dir_rel("nuget", uuid);
+        let names = |(named, value): &(String, String)| {
+            *named == key && folder.as_ref().is_some_and(|dir| value.starts_with(dir))
+        };
+        sources.iter().any(names)
+    };
+    let detail = declined_detail(&why);
+    let declined = candidates.iter().filter(|(_, uuid)| !wired(uuid));
+    declined
+        .map(|(purl, _)| (*purl, VENDOR_DECLINED, detail.clone()))
+        .collect()
+}
+
+/// Keep the folder of a patch, `uuid_dir_rel`, in the block of the root
+/// `MODULE.bazel`, which then holds what `feeds` holds now.
+async fn keep_in_block(
+    project_root: &Path,
+    feeds: &Feeds,
+    uuid_dir_rel: &str,
+) -> Result<(), String> {
+    let path = project_root.join(MODULE_FILE);
+    let module = read_regular_to_string(&path)
+        .await
+        .map_err(|e| format!("unreadable {}: {e}", path.display()))?;
+    let Some(kept) = with_folder(&module, feeds, uuid_dir_rel) else {
+        return Err(format!(
+            "the block that socket-patch keeps in {MODULE_FILE} was changed by hand"
+        ));
+    };
+    if kept == module {
+        return Ok(());
+    }
+    atomic_write_bytes_preserving_mode(&path, kept.as_bytes())
+        .await
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+/// For a package that is wired for a hub: its folder in the block as the
+/// hub's tag has it now, or the warning that the block was left as it is,
+/// and why.
+async fn block_refreshed(
+    project_root: &Path,
+    feeds: Option<&Feeds>,
+    doubt: Option<String>,
+    uuid_dir_rel: &str,
+) -> Option<VendorWarning> {
+    let why = match feeds {
+        Some(feeds) => keep_in_block(project_root, feeds, uuid_dir_rel).await.err(),
+        None => doubt,
+    }?;
+    Some(VendorWarning::new(
+        VENDOR_DECLINED,
+        format!(
+            "{why}; the block of {MODULE_FILE} was left as it is, and socket-patch can no longer \
+             show that the Bazel build takes the committed package"
+        ),
+    ))
 }
 
 /// Whether [`vendor_nuget`] — a wet run with the service enabled — asks the
@@ -367,10 +533,13 @@ pub async fn vendor_nuget(
         version,
         version_norm,
         uuid_dir_rel,
+        feed_rel,
         copy_rel,
         uuid_dir,
         nupkg_path,
         source_key,
+        feeds,
+        hub_doubt,
         config_path,
         config_text,
         locks,
@@ -389,10 +558,15 @@ pub async fn vendor_nuget(
     // first run's ledger entry holds the only copy of the verbatim pre-vendor
     // originals, and re-recording here would clobber them.
     if config_wired {
+        // A package of a hub: the block follows the hub's tag, wired or not.
+        let block = match dry_run {
+            true => None,
+            false => block_refreshed(project_root, feeds.as_ref(), hub_doubt, &uuid_dir_rel).await,
+        };
         if in_sync {
             // The warning keeps firing on re-runs until the stale copy is
             // gone (#352).
-            let mut warnings = Vec::new();
+            let mut warnings: Vec<VendorWarning> = block.into_iter().collect();
             if let (Some(cached), Some(bytes)) = (
                 extracted_content_hash(installed_dir).await,
                 read_zip_artifact(&nupkg_path).await,
@@ -424,7 +598,7 @@ pub async fn vendor_nuget(
         // already correct and the full path would re-record the live vendored
         // fragments as `original`, breaking a later `--revert`.
         if !dry_run {
-            let mut warnings: Vec<VendorWarning> = Vec::new();
+            let mut warnings: Vec<VendorWarning> = block.into_iter().collect();
             let (bytes, mut result) = match materialise_patched_nupkg(
                 purl,
                 installed_dir,
@@ -572,7 +746,7 @@ pub async fn vendor_nuget(
             &inherited.keys,
             inherited.mapped,
             &source_key,
-            &uuid_dir_rel,
+            &feed_rel,
             name,
         ),
     };
@@ -661,6 +835,24 @@ pub async fn vendor_nuget(
             }
         }
     }
+    // ── the block of a rules_csharp hub (a failure unwinds both) ─────────
+    if let Some(feeds) = &feeds {
+        if let Err(detail) = keep_in_block(project_root, feeds, &uuid_dir_rel).await {
+            unwind_locks(&written).await;
+            unwind_config(&config_target, config_text.as_deref(), &uuid_dir).await;
+            result.success = false;
+            result.error = Some(detail);
+            return done(result, None, warnings);
+        }
+        lock_records.push(WiringRecord {
+            file: MODULE_FILE.to_string(),
+            kind: BAZEL_WIRING_KIND.to_string(),
+            action: WiringAction::Added,
+            key: Some(uuid_dir_rel.clone()),
+            original: None,
+            new: None,
+        });
+    }
     if locks.is_empty() {
         warnings.push(VendorWarning::new(
             "vendor_nuget_no_lockfile",
@@ -726,8 +918,8 @@ pub async fn vendor_nuget(
         original: None,
         new: Some(Value::String(config_edit.mapping_fragment.clone())),
     };
-    // Application order: config source, config mapping, then the lock pin.
-    // Revert runs them in reverse (lock → mapping → source).
+    // Application order: config source, config mapping, the lock pin, then
+    // the block of a hub. Revert runs them in reverse.
     let mut wiring = vec![source_record, mapping_record];
     wiring.extend(lock_records);
 
@@ -849,12 +1041,29 @@ pub async fn revert_nuget_opts(
         version_norm: normalize_nuget_version(&version),
         source_key: crate::patch::redirect::generation::hosted_pin_name(&entry.uuid),
     };
+    // The folder the config names: the patch's own, or the one below it
+    // where a hub has the package, when the artifact lies there.
+    let nested = format!(
+        "{uuid_dir_rel}/{}/{}",
+        id.to_lowercase(),
+        package.version_norm
+    );
+    let for_hub = entry.artifact.path.starts_with(&format!("{nested}/"));
+    let feed_rel = if for_hub { &nested } else { &uuid_dir_rel };
     // SECURITY: state.json is committed and tamper-able, and the records are
     // replayed one write at a time: every one of them is checked before the
     // first write, so a refused record leaves the whole entry untouched.
     for w in &entry.wiring {
         if let Some(why) = record_refusal(project_root, &package, w) {
             return RevertOutcome::failed(super::state::refused_record(entry, w, &why));
+        }
+    }
+    // Nor beside a block that was changed by hand, which keeps the folder
+    // of the patch: the hub would hold the committed package to the lock
+    // that the revert restores, and the Bazel build would fail.
+    if entry.wiring.iter().any(|w| w.kind == BAZEL_WIRING_KIND) {
+        if let Err(why) = revert_block_record(project_root, &uuid_dir_rel, true).await {
+            return RevertOutcome::failed(why);
         }
     }
     let mut warnings = Vec::new();
@@ -873,7 +1082,7 @@ pub async fn revert_nuget_opts(
         .filter(|w| w.kind == CONFIG_SOURCE_WIRING_KIND)
     {
         if matches!(
-            revert_config_record(project_root, &uuid_dir_rel, &package, w, true).await,
+            revert_config_record(project_root, feed_rel, &package, w, true).await,
             Ok(false)
         ) && config_references(project_root, &w.file, &uuid_dir_rel).await
         {
@@ -915,8 +1124,9 @@ pub async fn revert_nuget_opts(
             // record, so there is nothing to undo here.
             CONFIG_MAPPING_WIRING_KIND => Ok(true),
             CONFIG_SOURCE_WIRING_KIND => {
-                revert_config_record(project_root, &uuid_dir_rel, &package, w, dry_run).await
+                revert_config_record(project_root, feed_rel, &package, w, dry_run).await
             }
+            BAZEL_WIRING_KIND => revert_block_record(project_root, &uuid_dir_rel, dry_run).await,
             _ => {
                 warnings.push(VendorWarning::new(
                     "vendor_lock_entry_drifted",
@@ -967,6 +1177,37 @@ pub async fn revert_nuget_opts(
     revert::finish(outcome, project_root, &uuid_dir_rel, opts, policy).await
 }
 
+/// Take the folder of a patch, `uuid_dir_rel`, out of the block of the
+/// root `MODULE.bazel`: the block goes with its last folder. `Ok(true)` =
+/// taken out (or would be on a dry run) / not there; `Err` = the block was
+/// changed by hand, with the ways on, or a real I/O failure.
+async fn revert_block_record(
+    project_root: &Path,
+    uuid_dir_rel: &str,
+    dry_run: bool,
+) -> Result<bool, String> {
+    let path = project_root.join(MODULE_FILE);
+    let module = match read_regular_to_string(&path).await {
+        Ok(module) => module,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(format!("unreadable {}: {e}", path.display())),
+    };
+    let without = without_folder(&module, uuid_dir_rel).map_err(|line| {
+        format!(
+            "{MODULE_FILE}:{line}: the block that socket-patch keeps there was changed by hand, \
+             so the folder of this patch stays in it and nothing was reverted: with the lock \
+             restored, the Bazel build would fail on the committed package. Put the block back \
+             as socket-patch wrote it, or delete it, and run this command again"
+        )
+    })?;
+    if without != module && !dry_run {
+        atomic_write_bytes_preserving_mode(&path, without.as_bytes())
+            .await
+            .map_err(|e| format!("failed to restore {}: {e}", path.display()))?;
+    }
+    Ok(true)
+}
+
 // ── materialisation (service download) ─────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -1012,9 +1253,12 @@ async fn materialise_patched_nupkg(
 /// Write `bytes` to `nupkg_path`, creating the uuid dir and its
 /// re-including `.gitignore`. Errors are strings.
 async fn write_nupkg(uuid_dir: &Path, nupkg_path: &Path, bytes: &[u8]) -> Result<(), String> {
-    tokio::fs::create_dir_all(uuid_dir)
+    // The folder of the patch, or the one below it where a hub has the
+    // package.
+    let folder = nupkg_path.parent().unwrap_or(uuid_dir);
+    tokio::fs::create_dir_all(folder)
         .await
-        .map_err(|e| format!("cannot create {}: {e}", uuid_dir.display()))?;
+        .map_err(|e| format!("cannot create {}: {e}", folder.display()))?;
     atomic_write_artifact(nupkg_path, bytes)
         .await
         .map_err(|e| format!("cannot write {}: {e}", nupkg_path.display()))?;
@@ -1046,10 +1290,10 @@ async fn keep_nupkg_committable(
     nupkg_path: &Path,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<(), VendorOutcome> {
-    let leaf = nupkg_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    // From the uuid dir, with `/` between its parts: the file itself, or
+    // below `<idLower>/<version>` where a hub has the package.
+    let below = nupkg_path.strip_prefix(uuid_dir).unwrap_or(nupkg_path);
+    let leaf = below.to_string_lossy().replace('\\', "/");
     let shown = nupkg_path.display().to_string();
     match super::npm_dir::gitignore_probe(uuid_dir, &[leaf, ".gitignore".to_string()]).await {
         Ok(Some(rules)) => Err(refused(
@@ -1588,6 +1832,8 @@ fn record_refusal(project_root: &Path, package: &OwnPackage, w: &WiringRecord) -
                     )
                 })
         }
+        BAZEL_WIRING_KIND => (w.file != MODULE_FILE)
+            .then(|| format!("names a file that is not the root {MODULE_FILE}")),
         LOCK_WIRING_KIND => {
             if !is_safe_multi_segment(&w.file) {
                 return unsafe_path();
@@ -6857,5 +7103,273 @@ mod tests {
             );
             assert!(root.join(format!(".socket/vendor/nuget/{UUID}")).exists());
         }
+    }
+
+    // ── a package of a rules_csharp hub ─────────────────────────────────
+
+    /// The three files vendored mode edits for a package of a hub.
+    fn hub_files(root: &Path) -> [Vec<u8>; 3] {
+        [MODULE_FILE, "nuget.config", PACKAGES_LOCK]
+            .map(|file| std::fs::read(root.join(file)).unwrap())
+    }
+
+    /// In the root of a Bazel workspace whose one `nuget.from_lock` reads
+    /// the project's lock, the package lies where a feed of the hub has it,
+    /// `nuget.config` names that folder, and the block of `MODULE.bazel`
+    /// names the folder of the patch. A second run changes nothing, and
+    /// the revert puts the three files back byte for byte.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_package_of_a_hub_lies_where_its_feed_has_it_and_goes_to_the_byte() {
+        let _unset = crate::test_env::EnvGuard::unset(ALLOW_IN_BAZEL_ENV);
+        let (dir, blobs, installed, record) = fixture(true, Some(preexisting_cfg())).await;
+        let root = dir.path();
+        let module = crate::bazel::nuget::tests::checkout(root);
+        let before = hub_files(root);
+
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("a ledger entry");
+        let folder = format!(".socket/vendor/nuget/{UUID}");
+        let feed = format!("{folder}/newtonsoft.json/13.0.3");
+        assert_eq!(
+            entry.artifact.path,
+            format!("{feed}/newtonsoft.json.13.0.3.nupkg")
+        );
+        assert!(root.join(&entry.artifact.path).is_file());
+        assert!(
+            !root.join(copy_rel()).exists(),
+            "no copy in the folder itself"
+        );
+        let config = std::fs::read_to_string(root.join("nuget.config")).unwrap();
+        let source = format!("<add key=\"{}\" value=\"{feed}\" />", source_key());
+        assert!(config.contains(&source), "{config}");
+        let wired = std::fs::read_to_string(root.join(MODULE_FILE)).unwrap();
+        let feeds = format!(
+            "    feeds = [\n        \"file:{folder}\",\n        \
+             \"https://api.nuget.org/v3/index.json\",\n    ],\n"
+        );
+        assert!(
+            wired.starts_with(&module) && wired.contains(&feeds),
+            "{wired}"
+        );
+        let last = entry.wiring.last().expect("records");
+        assert_eq!(
+            (last.kind.as_str(), last.file.as_str(), last.key.as_deref()),
+            (BAZEL_WIRING_KIND, MODULE_FILE, Some(folder.as_str()))
+        );
+        assert!(warnings.iter().all(|w| w.code != VENDOR_DECLINED));
+        // The committed copy is what the ledger and the check hold it to.
+        let health = crate::vendor::check_vendored_artifact(root, &entry, &record).await;
+        assert_eq!(health, crate::vendor::ArtifactHealth::Healthy);
+
+        // Once more: in sync, and no file is written again.
+        let vendored = hub_files(root);
+        let (again, rerecorded, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(again.success && rerecorded.is_none());
+        assert!(warnings.iter().all(|w| w.code != VENDOR_DECLINED));
+        assert_eq!(hub_files(root), vendored);
+
+        // A record that names another file is not followed.
+        let mut tampered = entry.clone();
+        tampered.wiring.last_mut().unwrap().file = "BUILD.bazel".to_string();
+        let refused = revert_nuget(&tampered, root, false).await;
+        assert!(!refused.success, "{:?}", refused.warnings);
+        assert_eq!(hub_files(root), vendored);
+
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(hub_files(root), before);
+        assert!(
+            !root.join(&folder).exists(),
+            "the folder of the patch is gone"
+        );
+    }
+
+    /// Where the block cannot be shown to work, the package is declined
+    /// before anything is asked for or written. With the user's word it is
+    /// vendored as without Bazel, and a later run without that word leaves
+    /// it as it is.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_hub_whose_block_cannot_be_shown_to_work_is_declined_unless_allowed() {
+        let unset = crate::test_env::EnvGuard::unset(ALLOW_IN_BAZEL_ENV);
+        let (dir, blobs, installed, record) = fixture(true, Some(preexisting_cfg())).await;
+        let root = dir.path();
+        crate::bazel::nuget::tests::checkout(root);
+        std::fs::remove_file(root.join(".bazelversion")).unwrap();
+        let before = hub_files(root);
+        let candidates = [(PURL, UUID)];
+
+        let (code, detail) =
+            unwrap_refused(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, VENDOR_DECLINED);
+        for part in [
+            "no file of the checkout names the Bazel release that builds it",
+            "`--mode hosted`",
+            "`--allow-vendored-in-bazel`",
+        ] {
+            assert!(detail.contains(part), "{detail}");
+        }
+        assert!(!root.join(".socket").exists());
+        assert_eq!(hub_files(root), before);
+        let refused = bazel_refusals(root, &candidates).await;
+        assert_eq!(refused, [(PURL, VENDOR_DECLINED, detail)]);
+        assert!(service_preflight(PURL, root, &record).await.is_none());
+        drop(unset);
+
+        // The user's word: the package in the folder of the patch, and no
+        // block.
+        let allowed = crate::test_env::EnvGuard::set(ALLOW_IN_BAZEL_ENV, "1");
+        assert!(bazel_refusals(root, &candidates).await.is_empty());
+        let (result, entry, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("a ledger entry");
+        assert_eq!(entry.artifact.path, copy_rel());
+        assert!(entry.wiring.iter().all(|w| w.kind != BAZEL_WIRING_KIND));
+        assert_eq!(hub_files(root)[0], before[0], "{MODULE_FILE} is untouched");
+        drop(allowed);
+
+        // Without it again: the package that is wired passes, in sync, and
+        // another patch of it is declined.
+        let _unset = crate::test_env::EnvGuard::unset(ALLOW_IN_BAZEL_ENV);
+        assert!(bazel_refusals(root, &candidates).await.is_empty());
+        let (again, rerecorded, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(again.success && rerecorded.is_none());
+        let other = [(PURL, "33333333-3333-4333-8333-333333333333")];
+        assert_eq!(bazel_refusals(root, &other).await.len(), 1);
+        // And its revert takes it out as any vendored package.
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(hub_files(root), before);
+    }
+
+    /// A package that is wired for a hub follows the hub's tag on every
+    /// run: a source the user adds to `nuget.config` reaches the block.
+    /// Where the block can no longer be shown to work it is left as it is,
+    /// with a warning, and so is a block that was changed by hand. Beside
+    /// that one the revert changes nothing: the lock without its pin would
+    /// fail the Bazel build on the folder the block still names. With the
+    /// block deleted by hand, the revert takes out the rest.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_package_that_is_wired_for_a_hub_follows_its_tag() {
+        let _unset = crate::test_env::EnvGuard::unset(ALLOW_IN_BAZEL_ENV);
+        let (dir, blobs, installed, record) = fixture(true, Some(preexisting_cfg())).await;
+        let root = dir.path();
+        let module = crate::bazel::nuget::tests::checkout(root);
+        let before = hub_files(root);
+        let (_, entry, _) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let entry = entry.expect("a ledger entry");
+        let rerun = || async {
+            let (result, entry, warnings) =
+                unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+            assert!(result.success && entry.is_none(), "{:?}", result.error);
+            let warned = warnings.into_iter().filter(|w| w.code == VENDOR_DECLINED);
+            warned.map(|w| w.detail).collect::<Vec<String>>()
+        };
+
+        let config = std::fs::read_to_string(root.join("nuget.config")).unwrap();
+        let mirror = "    <add key=\"mirror\" value=\"https://mirror.example/v3/index.json\" />\n";
+        let with_mirror = config.replacen(
+            "    <add key=\"nuget.org\"",
+            &format!("{mirror}    <add key=\"nuget.org\""),
+            1,
+        );
+        assert_ne!(with_mirror, config);
+        std::fs::write(root.join("nuget.config"), with_mirror).unwrap();
+        assert_eq!(rerun().await, [""; 0]);
+        let wired = std::fs::read_to_string(root.join(MODULE_FILE)).unwrap();
+        let sources = "        \"https://mirror.example/v3/index.json\",\n        \
+                       \"https://api.nuget.org/v3/index.json\",\n    ],\n";
+        assert!(wired.contains(sources), "{wired}");
+
+        // An rc file under which Bazel may not take the copy.
+        std::fs::write(root.join(".bazelrc"), "common --vendor_dir=third_party\n").unwrap();
+        let warned = rerun().await;
+        let says = ".bazelrc:1 names `--vendor_dir=third_party`";
+        assert!(
+            warned.len() == 1 && warned[0].starts_with(says),
+            "{warned:?}"
+        );
+        assert!(warned[0].contains("the block of MODULE.bazel was left as it is"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(MODULE_FILE)).unwrap(),
+            wired
+        );
+        std::fs::remove_file(root.join(".bazelrc")).unwrap();
+
+        // A block that was changed by hand.
+        let edited = wired.replace("    feeds = [", "    feeds = [  # ours");
+        std::fs::write(root.join(MODULE_FILE), &edited).unwrap();
+        let warned = rerun().await;
+        assert!(
+            warned.len() == 1 && warned[0].contains("was changed by hand"),
+            "{warned:?}"
+        );
+        let kept = hub_files(root);
+        // Wherever the record of the block stands among the others.
+        let mut moved = entry.clone();
+        moved.wiring.rotate_right(1);
+        for (entry, dry_run) in [(&entry, true), (&entry, false), (&moved, false)] {
+            let outcome = revert_nuget(entry, root, dry_run).await;
+            let why = outcome.error.unwrap_or_default();
+            let says =
+                "MODULE.bazel:10: the block that socket-patch keeps there was changed by hand";
+            assert!(!outcome.success && why.starts_with(says), "{why}");
+            assert_eq!(hub_files(root), kept);
+            assert!(root.join(&entry.artifact.path).is_file());
+        }
+        std::fs::write(root.join(MODULE_FILE), &module).unwrap();
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            hub_files(root)[2],
+            before[2],
+            "the lock is the one of before"
+        );
+        assert!(!root.join(&entry.artifact.path).exists());
+    }
+
+    /// The package of a hub lies below `<idLower>/<version>` in the folder
+    /// of the patch, and that is the path git is asked about. The folder's
+    /// own `.gitignore` reaches over every rule above it, so only an
+    /// ignore file below it can drop the package: it is then refused, and
+    /// nothing stays written.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_package_of_a_hub_that_git_would_not_commit_is_refused() {
+        use crate::vendor::test_support::git_project;
+        let _unset = crate::test_env::EnvGuard::unset(ALLOW_IN_BAZEL_ENV);
+        let (dir, blobs, installed, record) = fixture(true, Some(preexisting_cfg())).await;
+        let root = dir.path();
+        if git_project(root, "newtonsoft.json/\n").is_none() {
+            return;
+        }
+        crate::bazel::nuget::tests::checkout(root);
+        let below = root.join(format!(".socket/vendor/nuget/{UUID}/newtonsoft.json"));
+        std::fs::create_dir_all(&below).unwrap();
+        std::fs::write(below.join(".gitignore"), "*.nupkg\n").unwrap();
+        let before = hub_files(root);
+        let (code, detail) =
+            unwrap_refused(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "vendor_artifact_gitignored", "{detail}");
+        assert!(detail.contains("*.nupkg"), "{detail}");
+        assert_eq!(hub_files(root), before);
+        assert!(
+            !root.join(".socket/vendor").exists(),
+            "nothing stays written"
+        );
+
+        // Without that file the rule of the project is no bar: the folder's
+        // own `.gitignore` re-includes what lies below it.
+        let (result, entry, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success && entry.is_some(), "{:?}", result.error);
     }
 }

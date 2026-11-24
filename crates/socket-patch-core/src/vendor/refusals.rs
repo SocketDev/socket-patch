@@ -23,10 +23,14 @@
 //!    as a skip);
 //! 6. a Maven version no module of the build selects
 //!    (`vendor_maven_version_not_selected`, a skip too);
-//! 7. a Composer project in a Bazel workspace
-//!    (`vendor_composer_bazel_workspace`), unless the user allowed it
-//!    ([`ALLOW_IN_BAZEL_ENV`]) or the lock already names the patch's copy
-//!    ([`bazel_workspace_refusals`]).
+//! 7. what rests on the Bazel workspace of the project
+//!    ([`bazel_workspace_refusals`]), unless the user allowed it
+//!    ([`ALLOW_IN_BAZEL_ENV`]): a Composer project in one
+//!    (`vendor_composer_bazel_workspace`), unless the lock already names
+//!    the patch's copy; and a NuGet package of a project whose lock a
+//!    rules_csharp hub reads, where the block that makes the hub take the
+//!    copy cannot be shown to work (`vendor_nuget_bazel_workspace`), unless
+//!    `nuget.config` already names the patch's folder.
 //!
 //! Each check lives in its backend's module; this one only dispatches and
 //! scopes them.
@@ -40,7 +44,9 @@ use crate::crawlers::Ecosystem;
 use crate::patch::redirect::upstream::HostedPin;
 use crate::utils::purl_key::PurlKey;
 use crate::vendor::state::{lookup_entry, VendorEntry};
-use crate::vendor::{bun_lock, composer_lock, gem, lock_inventory, npm_flavor, npm_lock, vlt_lock};
+use crate::vendor::{
+    bun_lock, composer_lock, gem, lock_inventory, npm_flavor, npm_lock, nuget_feed, vlt_lock,
+};
 
 /// The vendor ledger as the refusals consume it: the caller's own load
 /// outcome, so an UNREADABLE ledger is a refusal the run can report
@@ -102,10 +108,6 @@ fn is_cargo(purl: &str) -> bool {
     Ecosystem::from_purl(purl) == Some(Ecosystem::Cargo)
 }
 
-fn is_composer(purl: &str) -> bool {
-    Ecosystem::from_purl(purl) == Some(Ecosystem::Composer)
-}
-
 /// The refusals of vendored mode that rest on the Bazel workspace of the
 /// project at `project_root`, for `candidates` (`(purl, uuid)` pairs):
 /// each refused purl with its code and detail. None when the user allowed
@@ -113,17 +115,19 @@ fn is_composer(purl: &str) -> bool {
 /// vendored entry point takes this one answer: [`vendor_refusals`] hands it
 /// to a scan, a `get` and a `vendor`, and the eject of hosted pins asks it
 /// before it fetches or restores anything. A refusal of this kind for
-/// another ecosystem belongs here; Composer's is the only one today.
+/// another ecosystem belongs here: Composer's and NuGet's are the two
+/// today.
 pub async fn bazel_workspace_refusals<'a>(
     project_root: &Path,
     candidates: &[(&'a str, &str)],
 ) -> Vec<(&'a str, &'static str, String)> {
-    let composer: Vec<(&str, &str)> = candidates
-        .iter()
-        .filter(|(purl, _)| is_composer(purl))
-        .copied()
-        .collect();
-    composer_lock::bazel::refusals(project_root, &composer).await
+    let of = |ecosystem: Ecosystem| -> Vec<(&'a str, &str)> {
+        let named = |(purl, _): &&(&str, &str)| Ecosystem::from_purl(purl) == Some(ecosystem);
+        candidates.iter().filter(named).copied().collect()
+    };
+    let mut refused = composer_lock::bazel::refusals(project_root, &of(Ecosystem::Composer)).await;
+    refused.extend(nuget_feed::bazel_refusals(project_root, &of(Ecosystem::Nuget)).await);
+    refused
 }
 
 /// Every refusal the vendor engine can decide for `candidates` (`(purl,
@@ -478,6 +482,30 @@ mod tests {
         assert_eq!(got[one].code, "vendor_composer_bazel_workspace");
         assert_eq!(got[one], got[other]);
         assert!(!refusal_is_benign(got[one].code));
+    }
+
+    /// A NuGet package of a project whose lock a rules_csharp hub reads,
+    /// in a checkout that names no Bazel release: refused with NuGet's own
+    /// code, beside no candidate of another ecosystem. Where no tag reads
+    /// the lock nothing is.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn nuget_candidates_of_a_hub_without_its_block_are_refused() {
+        let _unset = crate::test_env::EnvGuard::unset(ALLOW_IN_BAZEL_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, other) = ("pkg:nuget/Lib@1.0.0", "pkg:cargo/lib@1.0.0");
+        let pairs = [(one, UUID), (other, OTHER_UUID)];
+        let empty = HashMap::new();
+        std::fs::write(tmp.path().join("packages.lock.json"), "{}").unwrap();
+        let module = crate::bazel::nuget::tests::checkout(tmp.path());
+        std::fs::remove_file(tmp.path().join(".bazelversion")).unwrap();
+        let got = run(tmp.path(), &pairs, Ok(&empty)).await;
+        assert_eq!(got.keys().collect::<Vec<_>>(), [one]);
+        assert_eq!(got[one].code, "vendor_nuget_bazel_workspace");
+        assert!(!refusal_is_benign(got[one].code));
+        let elsewhere = module.replace("//:packages", "//api:packages");
+        std::fs::write(tmp.path().join("MODULE.bazel"), elsewhere).unwrap();
+        assert!(run(tmp.path(), &pairs, Ok(&empty)).await.is_empty());
     }
 
     mod gem {

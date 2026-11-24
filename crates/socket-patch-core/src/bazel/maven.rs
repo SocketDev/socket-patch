@@ -42,6 +42,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 
+use super::block::{self, Found, END};
 use super::rc::{declared_release, mentions, ModuleLock};
 use super::starlark::{Bound, Call, How, Value};
 use super::workspace::{disk, disk_up_to, Doubt, Entry, Extension, Repo, Tag, Workspace};
@@ -51,7 +52,6 @@ use crate::patch::redirect::{
 };
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::fs::run_blocking;
-use crate::utils::line_endings::terminator;
 use crate::utils::purl::{parse_maven_purl, purl_qualifier};
 use crate::vendor::jvm::layout::artifact_path;
 
@@ -94,10 +94,9 @@ pub const DOWNLOAD: &str = "maven_bazel_download";
 pub const FILE: &str = "MODULE.bazel";
 pub const SITE_KEY: &str = "<socket-patch:bazel-maven>";
 
-/// The first and the last line of the block.
+/// The first line of the block.
 pub const BEGIN: &str = "# >>> socket-patch: Maven patches for Bazel (managed block: socket-patch \
                          writes and removes it) >>>";
-const END: &str = "# <<< socket-patch <<<";
 
 /// The releases of rules_jvm_external whose way to name the repository of
 /// a jar was read: `escape(coordinates)` in
@@ -145,7 +144,7 @@ pub struct Hub {
 /// called on, when that usage is shared with every other one of the
 /// extension (`isolate` is not given, or is `False`) and its label holds
 /// nothing a string of the block would have to escape.
-fn proxy(ws: &Workspace, tag: &Tag) -> Option<String> {
+pub(super) fn proxy(ws: &Workspace, tag: &Tag) -> Option<String> {
     let (_, file) = ws.files.iter().find(|(path, _)| path == tag.file)?;
     let Bound::Call(made) = file.binds.get(tag.call.bind?)?.to else {
         return None;
@@ -375,7 +374,7 @@ pub enum Built<'a> {
 /// Discovery.java lines 158 and 159 at 7.7.2, 178 and 179 at 8.8.2 and
 /// 9.3.2).
 #[derive(Debug, PartialEq, Eq)]
-enum Asked {
+pub(super) enum Asked {
     /// No version is given.
     Nothing,
     /// A `bazel_dep` asks for this release: Bazel selects it or a newer
@@ -410,11 +409,33 @@ fn ordered(version: &str) -> impl Ord + '_ {
     (identifiers(release), pre.is_empty(), identifiers(pre))
 }
 
-/// What the root module of `ws` says of the ruleset's release: by its
-/// calls that name the ruleset, a `bazel_dep` and the overrides, which are
-/// the functions whose name ends in `_override`.
-fn asked(ws: &Workspace) -> Asked {
-    let named = Some(&Value::Str(EXTENSION.module.to_string()));
+impl Asked {
+    /// The release that is asked for or pinned, for a message.
+    pub(super) fn wanted(&self) -> &str {
+        match self {
+            Asked::Exactly(wanted) | Asked::AtLeast(wanted) => wanted,
+            Asked::Nothing | Asked::Unknown(_) => "",
+        }
+    }
+
+    /// Whether a `MODULE.bazel.lock` that holds the release `selected` is
+    /// one Bazel has not written since the root asked for another: older
+    /// than what is asked for, or any other than the one a
+    /// `single_version_override` pins.
+    pub(super) fn stale(&self, selected: &str) -> bool {
+        match self {
+            Asked::Exactly(pinned) => ordered(pinned) != ordered(selected),
+            Asked::AtLeast(least) => ordered(least) > ordered(selected),
+            Asked::Nothing | Asked::Unknown(_) => false,
+        }
+    }
+}
+
+/// What the root module of `ws` says of the release of the ruleset
+/// `module`: by its calls that name the ruleset, a `bazel_dep` and the
+/// overrides, which are the functions whose name ends in `_override`.
+pub(super) fn asked(ws: &Workspace, module: &str) -> Asked {
+    let named = Some(&Value::Str(module.to_string()));
     let names = |call: &&Call| {
         call.bind.is_none() && [call.arg("name"), call.arg("module_name")].contains(&named)
     };
@@ -481,9 +502,7 @@ impl Hubs {
                 Block::None => {}
                 Block::Edited(line) => edited = Some(line),
                 Block::Ours(at, _, patches) => {
-                    let lines = "\n".repeat(module[at.clone()].matches('\n').count());
-                    let (head, tail) = (&module[..at.start], &module[at.end..]);
-                    hidden = Some(format!("{head}{lines}{tail}"));
+                    hidden = Some(block::hidden(&module, at));
                     block = patches;
                 }
             }
@@ -503,7 +522,7 @@ impl Hubs {
                 why: "the block that socket-patch keeps there was changed by hand".to_string(),
             }),
         );
-        let asked = asked(&ws);
+        let asked = asked(&ws, EXTENSION.module);
         let overrides = ws.tags(&EXTENSION, "override").calls.into_iter();
         let overrides = overrides.map(|Tag { file, call, .. }| {
             let (replaced, why) = match call.arg("coordinates") {
@@ -732,48 +751,26 @@ enum Block {
 /// touched (a blank after it, another end): [`BEGIN`] up to its bracket.
 /// A file without such a line holds no block.
 pub fn begins(line: &str) -> bool {
-    let mark = BEGIN.split(" (").next().unwrap_or(BEGIN);
-    line.trim_start().starts_with(mark)
+    block::begins(line, BEGIN)
 }
 
 fn find(text: &str) -> Block {
-    let (mut at, mut begin, mut end) = (0, None, None);
-    for (line, whole) in text.split_inclusive('\n').enumerate() {
-        let bare = whole.strip_suffix('\n').unwrap_or(whole);
-        let bare = bare.strip_suffix('\r').unwrap_or(bare);
-        match (bare, begin, end) {
-            (BEGIN, None, _) => begin = Some((at, line + 1)),
-            // A second first line, or one that is not as it is written.
-            _ if begins(bare) => {
-                return Block::Edited(begin.map_or(line + 1, |(_, first)| first));
-            }
-            (END, Some(_), None) => end = Some(at + bare.len()),
-            _ => {}
-        }
-        at += whole.len();
-    }
-    let Some((start, line)) = begin else {
-        return Block::None;
+    let (at, line) = match block::find(text, BEGIN) {
+        Found::None => return Block::None,
+        Found::Edited(line) => return Block::Edited(line),
+        Found::At(at, line) => (at, line),
     };
-    // In the line break of its own lines, whatever the rest of a file
-    // with both has.
-    let ours = end.and_then(|end| {
-        let (label, entries) = parse(&text[start..end])?;
-        let written = render(&label, &entries).replace('\n', terminator(&text[start..end]));
-        (written == text[start..end]).then_some((start..end, label, entries))
-    });
-    ours.map_or(Block::Edited(line), |(at, label, patches)| {
+    let ours = parse(&text[at.clone()]);
+    let ours = ours.filter(|(label, entries)| block::is(text, &at, &render(label, entries)));
+    ours.map_or(Block::Edited(line), |(label, patches)| {
         Block::Ours(at, label, patches)
     })
 }
 
 /// `module` with `patch` in its block, in the place of any patch for the
-/// same repository: in the block that is there, in the line break of its
-/// lines, or in a new one at the end of the file, after one blank line,
-/// in the line break of the file ([`terminator`]: the more frequent one
-/// of a file with both). A file whose last line has no line break gets a
-/// block without one, so that [`without`] can tell. `None` when the block
-/// that is there was changed by hand.
+/// same repository: in the block that is there or in a new one at the end
+/// of the file ([`block::put`]). `None` when the block that is there was
+/// changed by hand.
 fn with_patch(module: &str, label: &str, patch: Patch) -> Option<String> {
     let (at, mut patches) = match find(module) {
         Block::Edited(_) => return None,
@@ -782,14 +779,7 @@ fn with_patch(module: &str, label: &str, patch: Patch) -> Option<String> {
     };
     patches.retain(|other| other.repository() != patch.repository());
     patches.push(patch);
-    let ended = module.is_empty() || module.ends_with('\n');
-    let eol = terminator(at.as_ref().map_or(module, |at| &module[at.clone()]));
-    let block = render(label, &patches).replace('\n', eol);
-    Some(match at {
-        Some(at) => format!("{}{block}{}", &module[..at.start], &module[at.end..]),
-        None if ended => format!("{module}{eol}{block}{eol}"),
-        None => format!("{module}{eol}{eol}{block}"),
-    })
+    Some(block::put(module, at, &render(label, &patches)))
 }
 
 /// `module` without the patches of its block that `gone` names. With the
@@ -801,26 +791,10 @@ pub fn without(module: &str, gone: &mut dyn FnMut(&Patch) -> bool) -> Option<Str
         return None;
     };
     entries.retain(|patch| !gone(patch));
-    let (head, tail) = (&module[..at.start], &module[at.end..]);
-    if !entries.is_empty() {
-        let block = render(&label, &entries).replace('\n', terminator(&module[at]));
-        return Some(format!("{head}{block}{tail}"));
-    }
-    // The line break before the block and, when it ends a blank line, that
-    // line; then the block's own line break or, for a block that ends the
-    // file without one, the one that was added to the last line. A line
-    // break is one of either kind: a file can have both.
-    let cut =
-        |text: &str| text.len() - text.ends_with('\n') as usize - text.ends_with("\r\n") as usize;
-    let blank = |head: &str| cut(head) == 0 || head[..cut(head)].ends_with('\n');
-    let after = tail.strip_prefix('\r').unwrap_or(tail).strip_prefix('\n');
-    let (head, tail) = match after {
-        Some(tail) if blank(head) => (&head[..cut(head)], tail),
-        None if tail.is_empty() && blank(head) => (&head[..cut(&head[..cut(head)])], tail),
-        Some(tail) => (head, tail),
-        None => (head, tail),
-    };
-    Some(format!("{head}{tail}"))
+    Some(match entries.is_empty() {
+        true => block::cut(module, at),
+        false => block::put(module, Some(at), &render(&label, &entries)),
+    })
 }
 
 /// What a hosted run does in the root `MODULE.bazel` for one patch.
@@ -972,19 +946,7 @@ fn settings(
         }
         _ => {}
     }
-    // A lock that holds another release than the root now takes is one
-    // that Bazel has not written since: older than what is asked for, or
-    // any other than the one a `single_version_override` pins.
-    let module = EXTENSION.module;
-    let stale = |selected: &str| match asked {
-        Asked::Exactly(pinned) => ordered(pinned) != ordered(selected),
-        Asked::AtLeast(least) => ordered(least) > ordered(selected),
-        Asked::Nothing | Asked::Unknown(_) => false,
-    };
-    let wanted = match asked {
-        Asked::Exactly(wanted) | Asked::AtLeast(wanted) => wanted.as_str(),
-        Asked::Nothing | Asked::Unknown(_) => "",
-    };
+    let (module, wanted) = (EXTENSION.module, asked.wanted());
     let why = match (asked, &lock.selected(module)[..]) {
         (Asked::Unknown(at), _) => format!(
             "{at} of {module} socket-patch cannot tell which release of the ruleset Bazel \
@@ -994,7 +956,7 @@ fn settings(
             "Bazel selected {module} {selected}, and how the ruleset names the repository of a \
              jar is known for its releases 6.4 to 7.2: update socket-patch"
         ),
-        (_, [selected]) if stale(selected) => format!(
+        (_, [selected]) if asked.stale(selected) => format!(
             "{FILE} asks for {module} {wanted} and MODULE.bazel.lock holds {selected}: build once \
              so that Bazel updates its lock"
         ),
@@ -1346,6 +1308,7 @@ fn notices_blocking(project: &Path, mut purls: Vec<String>) -> Vec<(&'static str
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::utils::line_endings::terminator;
 
     /// For the tests of what reads the block elsewhere: the `MODULE.bazel`
     /// of a checkout whose pinned hub fetches netty's jar, the lock of
