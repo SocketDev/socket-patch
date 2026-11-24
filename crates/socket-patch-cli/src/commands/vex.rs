@@ -2920,10 +2920,13 @@ fn nothing_attested_hint(failed: &[FailedPatch], gems: &StaleHostedGems) -> Opti
                 crate::commands::gem_refresh::LOCAL_PATH_REMEDY
             )
         } else {
-            "Remove each gem's `specifications/<name>-<version>.gemspec` and \
-             `cache/<name>-<version>.gem` from its gem home (and its archive in `vendor/cache`, \
-             if the project keeps one), run `bundle install`"
-                .to_string()
+            format!(
+                "Remove each gem's `specifications/<name>-<version>.gemspec` and \
+                 `cache/<name>-<version>.gem` from its gem home (and its archive in \
+                 `vendor/cache`, if the project keeps one) and run `bundle install`. Other \
+                 projects may load a gem home outside the project, so for one run `{}` instead",
+                crate::commands::gem_refresh::LOCAL_PATH_REMEDY
+            )
         };
         remedies.push(format!(
             "{} patched packages are hosted gems whose installed copies are still the upstream \
@@ -3339,7 +3342,9 @@ mod tests {
                  install`, `bundle install --redownload` and `bundle pristine` do not bring in \
                  the patched gem. Remove each gem's `specifications/<name>-<version>.gemspec` \
                  and `cache/<name>-<version>.gem` from its gem home (and its archive in \
-                 `vendor/cache`, if the project keeps one), run `bundle install`, then run \
+                 `vendor/cache`, if the project keeps one) and run `bundle install`. Other \
+                 projects may load a gem home outside the project, so for one run `bundle \
+                 config set --local path vendor/bundle && bundle install` instead, then run \
                  `socket-patch vex` again."
             )
         );

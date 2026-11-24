@@ -2417,7 +2417,10 @@ async fn standalone_vex_sends_a_stale_hosted_gem_to_the_scan_that_replaces_it() 
     assert!(
         out.stderr
             .contains("Remove each gem's `specifications/<name>-<version>.gemspec`")
-            && out.stderr.contains("run `bundle install`, then run"),
+            && out.stderr.contains(
+                "Other projects may load a gem home outside the project, so for one run \
+                 `bundle config set --local path vendor/bundle && bundle install` instead",
+            ),
         "a mixed-mode project is told which files to remove:\n{}",
         out.stderr
     );
