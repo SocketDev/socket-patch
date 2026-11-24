@@ -1559,6 +1559,58 @@ async fn gem_get_uuid_vendored_fresh_checkout_bundle_install() {
             })
         });
     });
+
+    // ROLLBACK (#2214): the gem was only ever vendored, so Bundler's own
+    // install in `vendor/bundle` is still the upstream build. Once the
+    // pair is restored no patched byte is left anywhere, and rollback
+    // must not name a reinstall.
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "rollback",
+            "--yes",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &api_url,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "rollback failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        std::fs::read(&gemfile_path).unwrap(),
+        gemfile_before,
+        "rollback must restore the Gemfile byte for byte"
+    );
+    assert_eq!(
+        std::fs::read(&lock_path).unwrap(),
+        lock_before,
+        "rollback must restore Gemfile.lock byte for byte"
+    );
+    assert_eq!(
+        std::fs::read(&installed_rb).unwrap(),
+        orig,
+        "the installed gem was upstream all along"
+    );
+    let reinstall: Vec<&serde_json::Value> = env["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|w| w["code"] == "reinstall_required")
+        .collect();
+    assert!(
+        reinstall.is_empty(),
+        "nothing is left to reinstall after an only-vendored gem's rollback: {env}"
+    );
 }
 
 /// A real `rack ~> 3.1` project installed into `vendor/bundle`, with a
