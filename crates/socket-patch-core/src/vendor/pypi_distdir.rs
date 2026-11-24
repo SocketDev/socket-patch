@@ -229,7 +229,9 @@ pub(super) async fn gate(
         ));
     }
     let (root, locks) = (root.clone(), locks.to_vec());
+    let dir = root.dir.clone();
     run_blocking(move || distdir::ready(&root, FILE, &locks)).await?;
+    rc_committed(&dir).await?;
     let content = read_regular_to_string(&project.join(FILE)).await;
     let content = content.map_err(|e| format!("{FILE} cannot be read: {e}"))?;
     let content = without_older(project, purl, uuid, content).await;
@@ -278,6 +280,25 @@ pub(super) async fn gate(
         "{FILE} names the package by a URL of its own, and the form is written over a pin of \
          one version with its hashes"
     ))
+}
+
+/// Why the `.bazelrc` at the Bazel root `dir` would not reach a fresh
+/// checkout: git ignores it and does not track it. The committed wheel
+/// does (its own guard asks git), but without the rc file's line a build
+/// of that checkout downloads the wheel from the patch host. A tracked
+/// file is never ignored, and git that cannot answer, or a root outside a
+/// work tree, lets it through, as the wheel's guard does.
+async fn rc_committed(dir: &Path) -> Result<(), String> {
+    let rc = [".bazelrc".to_string()];
+    match super::npm_dir::ignoring_rule_lines(dir, &rc, false).await {
+        Ok(Some(rules)) => Err(format!(
+            ".bazelrc is ignored by git and not tracked ({}), so a fresh checkout would not have \
+             the line that makes Bazel take the committed wheel: commit .bazelrc or stop \
+             ignoring it",
+            super::npm_dir::summarize_rules(&rules)
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Whether the file `artifact` is a wheel that every platform installs
@@ -432,6 +453,41 @@ mod tests {
         format!(
             "https://patch.socket.dev/patch/pypi/six/1.16.0/tok/{uuid}/six-1.16.0-py3-none-any.whl"
         )
+    }
+
+    /// An untracked `.bazelrc` that git ignores, there or not yet, would
+    /// not reach a fresh checkout; one that is tracked, or not ignored,
+    /// does.
+    #[tokio::test]
+    async fn an_ignored_untracked_bazelrc_is_declined() {
+        let Some(git) = crate::utils::process::resolve_tool("git") else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new(&git)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        assert_eq!(rc_committed(root).await, Ok(()), "no rule ignores it");
+        std::fs::write(root.join(".gitignore"), ".bazelrc\n").unwrap();
+        let missing = rc_committed(root).await.unwrap_err();
+        assert!(missing.contains(".gitignore:1:.bazelrc"), "{missing}");
+        std::fs::write(root.join(".bazelrc"), "build --jobs=4\n").unwrap();
+        let untracked = rc_committed(root).await.unwrap_err();
+        assert!(untracked.starts_with(".bazelrc is ignored"), "{untracked}");
+        git(&["add", "-f", ".bazelrc"]);
+        assert_eq!(
+            rc_committed(root).await,
+            Ok(()),
+            "a tracked file is committed"
+        );
     }
 
     #[test]
