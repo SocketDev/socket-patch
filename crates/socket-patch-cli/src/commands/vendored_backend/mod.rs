@@ -171,7 +171,7 @@ impl<'a> VendoredBackend<'a> {
                     flavor: None,
                     warnings: Vec::new(),
                     progress: Vec::new(),
-                    gem_install_refreshed: false,
+                    gem_install_upstream: false,
                     step: VendorRevertStep::Missing,
                 });
                 continue;
@@ -242,7 +242,7 @@ impl<'a> VendoredBackend<'a> {
                 flavor,
                 warnings,
                 progress: Vec::new(),
-                gem_install_refreshed: false,
+                gem_install_upstream: false,
                 step,
             });
             if stop_on_failure && hard_failure {
@@ -286,8 +286,9 @@ impl<'a> VendoredBackend<'a> {
             crate::commands::gem_refresh::after_vendored_unwind(&self.common, &purls, records)
                 .await;
         for (index, purl) in unwound {
-            if refresh.refreshed_installs.contains(purl) {
-                out[*index].gem_install_refreshed = true;
+            if refresh.refreshed_installs.contains(purl) || refresh.upstream_installs.contains(purl)
+            {
+                out[*index].gem_install_upstream = true;
             }
         }
         let report = refresh.report;
@@ -425,10 +426,11 @@ pub(crate) struct RevertedEntry {
     /// Lines a human run prints to stdout after its own line for the
     /// entry: what the gem refresh replaced in the installed tree.
     pub(crate) progress: Vec<String>,
-    /// The gem's installed copies were brought back to the upstream build,
-    /// with none left on the patched one: nothing of it is left for a
-    /// reinstall.
-    pub(crate) gem_install_refreshed: bool,
+    /// No installed copy of the gem is left on the patched build: the
+    /// unwind brought them back to the upstream one, or found them to be
+    /// it already (a gem that was only ever vendored, #2214). Nothing of
+    /// it is left for a reinstall.
+    pub(crate) gem_install_upstream: bool,
     pub(crate) step: VendorRevertStep,
 }
 

@@ -1039,6 +1039,13 @@ pub(crate) struct RestoreRefresh {
     /// be) with none left on the patched build: nothing of theirs is left
     /// for a reinstall.
     pub(crate) refreshed_installs: BTreeSet<String>,
+    /// The upstream sha256 the refresh verified for each build it judged,
+    /// by leaf.
+    upstream_sha256: BTreeMap<String, String>,
+    /// A vendored unwind's gems with no patched byte in a gem home: each
+    /// installed copy's archive is the upstream one and its files are not
+    /// a recorded patch's, or the gem is not installed.
+    pub(crate) upstream_installs: BTreeSet<String>,
 }
 
 /// After a hosted unwind restored the gems of `pins` to their upstream
@@ -1250,24 +1257,65 @@ pub(crate) async fn after_vendored_unwind(
     // lock asks no registry.
     let lock = gem_upstream(&common.cwd, &BTreeMap::new(), true).await;
     let builds = build_leaves(&named_builds(&lock, unwound), |_| true);
-    for copy in installed_builds(common, &builds).await {
-        if copy.archive.is_file() || holds_patch(&copy, records).await {
-            installed.insert(copy.purl);
+    let copies = installed_builds(common, &builds).await;
+    for copy in &copies {
+        if copy.archive.is_file() || holds_patch(copy, records).await {
+            installed.insert(copy.purl.clone());
         }
     }
-    if installed.is_empty() {
-        return RestoreRefresh::default();
+    let mut refresh = if installed.is_empty() {
+        RestoreRefresh::default()
+    } else {
+        let installed: Vec<String> = installed.into_iter().collect();
+        refresh_restored(
+            common,
+            &installed,
+            &BTreeMap::new(),
+            records,
+            None,
+            Scope::Installed,
+        )
+        .await
+    };
+    refresh.upstream_installs =
+        upstream_installs(unwound, &copies, &refresh.upstream_sha256, records).await;
+    refresh
+}
+
+/// The gems of `unwound` with no patched byte in a gem home once the
+/// refresh ran (#2214): vendoring never wrote there, so a gem that was
+/// only ever vendored is one of them. `copies` is every installed copy of
+/// their builds. A gem is listed when each of its copies is proven to be
+/// the upstream build: the archive RubyGems installed it from hashes to
+/// the build's verified upstream sha256 (`upstream`, by leaf), and its
+/// files are not those of its gem's record in `records`. A gem with no
+/// installed copy is listed too. A copy nothing could judge (no verified
+/// sha256, an unreadable archive) keeps its gem out.
+async fn upstream_installs(
+    unwound: &[String],
+    copies: &[InstalledCopy],
+    upstream: &BTreeMap<String, String>,
+    records: &BTreeMap<String, PatchRecord>,
+) -> BTreeSet<String> {
+    use socket_patch_core::vendor::file_sha256_hex;
+
+    let mut out: BTreeSet<String> = unwound.iter().cloned().collect();
+    for copy in copies {
+        if !out.contains(&copy.purl) {
+            continue;
+        }
+        let proven = match upstream.get(&copy.leaf) {
+            Some(sha) => {
+                file_sha256_hex(&copy.archive).await.as_ref() == Some(sha)
+                    && !holds_patch(copy, records).await
+            }
+            None => false,
+        };
+        if !proven {
+            out.remove(&copy.purl);
+        }
     }
-    let installed: Vec<String> = installed.into_iter().collect();
-    refresh_restored(
-        common,
-        &installed,
-        &BTreeMap::new(),
-        records,
-        None,
-        Scope::Installed,
-    )
-    .await
+    out
 }
 
 /// The builds of each gem of `gems` that are this project's: the ones the
@@ -1440,8 +1488,15 @@ async fn refresh_restored(
         Scope::Installed,
     )
     .await;
+    let upstream_sha256: BTreeMap<String, String> = shas
+        .iter()
+        .filter_map(|(leaf, build)| Some((leaf.clone(), build.sha256.clone()?)))
+        .collect();
     if stale.is_empty() && unchecked.is_empty() && no_record.is_empty() {
-        return RestoreRefresh::default();
+        return RestoreRefresh {
+            upstream_sha256,
+            ..RestoreRefresh::default()
+        };
     }
     let wanted = |gem: &StaleGem| {
         Some(Wanted {
@@ -1499,6 +1554,8 @@ async fn refresh_restored(
     }
     RestoreRefresh {
         refreshed_installs,
+        upstream_sha256,
+        upstream_installs: BTreeSet::new(),
         report: report(direction, &installed, &pass, &policy),
         replaced_archives: if policy.dry_run {
             Vec::new()

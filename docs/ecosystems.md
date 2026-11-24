@@ -3055,7 +3055,9 @@ platform gem of the build that is installed). The same holds for a gem that agen
 before `scan --mode vendored` (or `get --mode vendored`) took it over: the unwind reinstalls the
 upstream gem over the patched files in the project's own gem home, and warns about a copy it
 leaves (a shared gem home, `--no-gem-install-refresh`). A gem that was only ever vendored still
-has the upstream build installed, and its unwind changes nothing in the gem home.
+has the upstream build installed, and its unwind changes nothing in the gem home. `rollback`
+does not count such a gem in its "keeps its patched bytes in installed trees" note or its
+`reinstall_required` warning: there is nothing to reinstall.
 
 Nothing is changed when the patched gem cannot be downloaded or verified: the run still exits 0
 and warns (`redirect_gem_stale_install`), naming the files to remove by hand. `--dry-run` only

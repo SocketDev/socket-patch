@@ -1100,10 +1100,10 @@ struct VendoredLegOutcome {
     /// could not be saved.
     failed: Vec<(String, &'static str, String)>,
     warnings: Vec<(String, String)>,
-    /// The gems (ledger keys) whose installed copies the unwind brought
-    /// back to the upstream build: nothing of theirs is left for a
-    /// reinstall.
-    refreshed_installs: std::collections::BTreeSet<String>,
+    /// The gems (ledger keys) with no installed copy left on the patched
+    /// build, brought back to the upstream one or found to be it already:
+    /// nothing of theirs is left for a reinstall.
+    upstream_installs: std::collections::BTreeSet<String>,
     /// `removed` / `vendor_orphan_removed` events for the orphan uuid
     /// dirs (no ledger entry) swept, also on dry-run.
     orphans_removed: Vec<PatchEvent>,
@@ -1136,13 +1136,13 @@ async fn run_vendored_leg(
         key,
         warnings,
         progress,
-        gem_install_refreshed,
+        gem_install_upstream,
         step,
         ..
     } in reverted
     {
-        if gem_install_refreshed {
-            out.refreshed_installs.insert(key.clone());
+        if gem_install_upstream {
+            out.upstream_installs.insert(key.clone());
         }
         for w in &warnings {
             if loud {
@@ -2745,9 +2745,6 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             let gc_bytes_freed = gc.map_or(0, |gc| gc.bytes_freed);
 
             // ── run-level warnings ───────────────────────────────────────
-            let unwired_any = !vendored_leg.reverted.is_empty()
-                || !vendored_leg.preserved.is_empty()
-                || !hosted_leg.reverted.is_empty();
             let advised = ReinstallAdvised::of(
                 vendored_leg
                     .warnings
@@ -2755,7 +2752,33 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                     .chain(hosted_leg.warnings.iter())
                     .map(|(code, _)| code.as_str()),
             );
-            if unwired_any {
+            // Only packages that are NOT also handled in place keep
+            // patched bytes. A successful in-place result that verified
+            // files leaves the installed tree original: restored now,
+            // restorable (dry run), or already original (never
+            // patched). None of those has anything left to reinstall.
+            let restored = handled_in_place(&results);
+            let base_of = |key: &str| {
+                vendor_entries
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, e)| e.base_purl.clone())
+            };
+            let still_patched = vendored_leg
+                .reverted
+                .iter()
+                .chain(vendored_leg.preserved.iter())
+                .chain(hosted_leg.reverted.iter())
+                .filter(|key| {
+                    !restored.contains(strip_purl_qualifiers(key))
+                        && !base_of(key).is_some_and(|b| restored.contains(b.as_str()))
+                        // A gem the unwind brought back to its upstream
+                        // build, or found on it already (#2214).
+                        && !hosted_leg.refreshed_installs.contains(key.as_str())
+                        && !vendored_leg.upstream_installs.contains(key.as_str())
+                })
+                .count();
+            if still_patched > 0 {
                 run_warnings.push((
                     "reinstall_required".into(),
                     format!(
@@ -3052,32 +3075,6 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                     }
                     println!("{}", format_gc_freed(gc_bytes_freed, args.common.dry_run));
                 }
-                // Only packages that are NOT also handled in place keep
-                // patched bytes. A successful in-place result that verified
-                // files leaves the installed tree original: restored now,
-                // restorable (dry run), or already original (never
-                // patched). None of those has anything left to reinstall.
-                let restored = handled_in_place(&results);
-                let base_of = |key: &str| {
-                    vendor_entries
-                        .iter()
-                        .find(|(k, _)| k == key)
-                        .map(|(_, e)| e.base_purl.clone())
-                };
-                let still_patched = vendored_leg
-                    .reverted
-                    .iter()
-                    .chain(vendored_leg.preserved.iter())
-                    .chain(hosted_leg.reverted.iter())
-                    .filter(|key| {
-                        !restored.contains(strip_purl_qualifiers(key))
-                            && !base_of(key).is_some_and(|b| restored.contains(b.as_str()))
-                            // A gem the hosted leg already brought back to
-                            // its upstream build.
-                            && !hosted_leg.refreshed_installs.contains(key.as_str())
-                            && !vendored_leg.refreshed_installs.contains(key.as_str())
-                    })
-                    .count();
                 if still_patched > 0 {
                     println!(
                         "\n{}",
@@ -7084,7 +7081,7 @@ mod tests {
                 "boom".to_string(),
             )],
             warnings: Vec::new(),
-            refreshed_installs: Default::default(),
+            upstream_installs: Default::default(),
             orphans_removed: Vec::new(),
         };
         let hosted = HostedLegOutcome {
