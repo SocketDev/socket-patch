@@ -313,7 +313,11 @@ mod tests {
                 .each_ref()
                 .map(|dir| pair(&format!("{from_root}{dir}")));
             let changed = sync(&root, &both, true).unwrap();
-            assert_eq!(changed, Some(root.dir.join(".bazelrc")));
+            // The file is reported as a person reads a path: on Windows
+            // without the verbatim prefix the root's own path carries.
+            let file =
+                crate::utils::pnpm_workspace::without_verbatim_prefix(root.dir.join(".bazelrc"));
+            assert_eq!(changed, Some(file));
             assert_eq!(
                 rc(&root).unwrap(),
                 format!("{user}{}{}", lines[0], lines[1])
