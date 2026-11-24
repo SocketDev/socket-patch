@@ -925,6 +925,14 @@ pub const TRUST_SCAFFOLD_LINES: [&str; 3] = [
     "trustLockfile: true",
 ];
 
+/// Whether `text` is, in either line ending, the whole file the trust
+/// auto-config creates ([`TRUST_SCAFFOLD_LINES`]). The undo of a hosted pin
+/// removes such a file: it cannot tell it from one hosted mode created.
+pub fn is_trust_scaffold(text: &str) -> bool {
+    let created = format!("{}\n", TRUST_SCAFFOLD_LINES.join("\n"));
+    crate::utils::line_endings::eol_eq(text.as_bytes(), created.as_bytes())
+}
+
 /// Decide how to ensure `trustLockfile: true` in pnpm-workspace.yaml.
 /// Line splices only (never a YAML library), mirroring the vendor backend's
 /// workspace surgery: untouched lines stay byte-identical, so a revert can

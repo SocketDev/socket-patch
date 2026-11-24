@@ -3,7 +3,8 @@
 //! reads (`REDIRECT_CANDIDATE_FILES`, Python lock / script pairs, Cargo
 //! member manifests, Rush locks, pnpm workspace members' own locks, the
 //! install-policy configs, the
-//! Plug'n'Play markers and the vendored ledger), plus one
+//! Plug'n'Play markers, the `MODULE.bazel` beside a pnpm lock and the
+//! vendored ledger), plus one
 //! presence-only Maven / NuGet marker per ecosystem so a repo holding only
 //! those still gets its `ecosystem_unsupported_in_memory` warning.
 
@@ -178,6 +179,11 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>, user_patches: bool) -> Optio
         // [`user_patch_need`]).
         if user_patches && rel.ends_with(".patch") {
             return Some(Need::Present);
+        }
+        // A hub of the Bazel workspace can stand against a pin in the pnpm
+        // lock beside its `MODULE.bazel` ([`crate::bazel::pnpm`]).
+        if rel == "MODULE.bazel" && root_files.contains("pnpm-lock.yaml") {
+            return Some(Need::Text);
         }
         return None;
     }
@@ -596,6 +602,7 @@ pub fn candidate_files() -> Vec<String> {
         "pylock.toml",
         "pylock.*.toml",
         "pnpm-lock.*.yaml (presence only)",
+        "MODULE.bazel (beside pnpm-lock.yaml)",
         "**/Cargo.toml (Cargo workspaces)",
     ] {
         out.insert(pattern.to_string());

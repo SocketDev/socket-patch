@@ -3209,10 +3209,9 @@ pub(crate) async fn cleanup_side_config(
         return;
     }
     let lines = crate::hosted::guidance::TRUST_SCAFFOLD_LINES;
-    let created = format!("{}\n", lines.join("\n"));
     // In either line ending: a `core.autocrlf` checkout of the created file
     // is still that file.
-    if crate::utils::line_endings::eol_eq(ws.as_bytes(), created.as_bytes()) {
+    if crate::hosted::guidance::is_trust_scaffold(&ws) {
         view.remove(WORKSPACE);
     } else if let Some(original) =
         crate::formats::pnpm::workspace::strip_keyless_splice(&ws, &lines)
