@@ -37,6 +37,17 @@
 //! the two files back. Hosted mode, which the refusal names, then patches
 //! the build.
 //!
+//! A vendored gem that this hub does build is one the lock names as hosted
+//! mode names it, with the patch registry's URL replaced by a relative
+//! `file:` URL of a directory of the checkout that holds the patched gem at
+//! `gems/<name>-<version>.gem`. rules_ruby asks Bazel for that URL, Bazel
+//! reads it from the root of the workspace, and Bundler holds the file to
+//! the lock's `CHECKSUMS` line. [`file_source_by_hand`] writes those three
+//! files by hand ([`by_hand`]) and builds them on a second machine that
+//! reaches no patch host, and on a third one where one byte of the gem is
+//! another. The hub runs the Bundler its lock names, so the flow does both
+//! again with a lock that names Bundler 2.6.9 ([`OLDER_BUNDLER`]).
+//!
 //! Both markers are read from what Bazel built, and each holds an id made
 //! for the run, so no cache of an earlier run can supply either gem. The
 //! fixture's lock therefore holds no sha256 of a gem: it has a placeholder
@@ -76,6 +87,7 @@
 //! that host (`SOCKET_PATCH_SERVER_URL`).
 
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use base64::Engine as _;
@@ -86,7 +98,7 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
 use crate::harness::{
     cell_without_bazel, changed, fixture_path, rewrite, with_vex, Cell, Claim, Declined, Fixture,
-    How, Ran, StandIn, ALLOW, CONSUMER, NOTHING, VENDORED,
+    How, Ran, StandIn, Tree, ALLOW, CONSUMER, NOTHING, REPO_CACHE, VENDORED,
 };
 use crate::hosted_memory_common::{read_tree, Patch, ORG};
 
@@ -348,13 +360,7 @@ impl Served {
         let record_route = format!("/v0/orgs/{ORG}/patches/view/{uuid}");
         standin.serve(1, &record_route, record.to_string().as_bytes());
 
-        let gems = |name: &str| rewrite(&format!("{RUBYGEMS}/gems/{name}-"), &origin);
-        cell.route_downloads(&[
-            gems(NAME),
-            gems(NEIGHBOUR),
-            rewrite(&format!("{PATCH_HOST}/"), &origin),
-            format!("block {PATCH_HOST}"),
-        ]);
+        cell.route_downloads(&routes(&origin, true));
         cell.write("Gemfile.lock", lock_pinning(&neighbour_gem, &upstream_gem));
         Served {
             standin,
@@ -369,6 +375,20 @@ impl Served {
             artifact_route: format!("{artifacts}.gem"),
         }
     }
+}
+
+/// The downloader config of a flow whose stand-in is at `origin`: the
+/// fixture's two gems on rubygems.org go there, and so does everything on
+/// the patch host where the machine reaches one (`patch_host`). A URL of the
+/// patch host that no rule rewrote is refused, so on a machine that reaches
+/// none a build that asks for it fails, and no download of Bazel's goes to
+/// the real one.
+fn routes(origin: &str, patch_host: bool) -> Vec<String> {
+    let gems = |name: &str| rewrite(&format!("{RUBYGEMS}/gems/{name}-"), origin);
+    let mut rules = vec![gems(NAME), gems(NEIGHBOUR)];
+    rules.extend(patch_host.then(|| rewrite(&format!("{PATCH_HOST}/"), origin)));
+    rules.push(format!("block {PATCH_HOST}"));
+    rules
 }
 
 /// `socket-patch <args>` in `cell`, with `standin` as the Socket API and as
@@ -524,6 +544,206 @@ fn hosted_bundle_fetch() {
     );
 }
 
+/// Where the patched gem of the patch `uuid` is committed for a hub: the
+/// directory of the patch under `.socket/vendor`, which the lock names as
+/// the gem's source, and in it the path rules_ruby asks a source for.
+fn committed_gem(uuid: &str) -> String {
+    format!(".socket/vendor/gem/{uuid}/gems/{NAME}-{VERSION}.gem")
+}
+
+/// The fixture's checkout with the patched gem `patched` of the patch
+/// `uuid` vendored for the hub, written by hand: the files that differ from
+/// the fixture's, each whole, by its path from the checkout. `Gemfile` and
+/// `Gemfile.lock` are what hosted mode writes with the patch registry's URL
+/// replaced by `file:.socket/vendor/gem/<uuid>/`, and the gem is committed
+/// where rules_ruby asks that source for it.
+fn by_hand(uuid: &str, patched: &[u8]) -> Tree {
+    let source = format!("file:.socket/vendor/gem/{uuid}/");
+    let gemfile = format!(
+        "source \"https://rubygems.org/\"\n\n\
+         gem \"{NAME}\", \"{VERSION}\", source: \"{source}\"\n\
+         gem \"{NEIGHBOUR}\", \"{VERSION}\"\n"
+    );
+    let lock = format!(
+        "GEM\n  remote: {source}\n  specs:\n    {NAME} ({VERSION})\n\n\
+         GEM\n  remote: https://rubygems.org/\n  specs:\n    {NEIGHBOUR} ({VERSION})\n\n\
+         PLATFORMS\n  ruby\n\n\
+         DEPENDENCIES\n  {NEIGHBOUR} (= {VERSION})\n  {NAME} (= {VERSION})!\n\n\
+         CHECKSUMS\n{}{}\n\
+         BUNDLED WITH\n  4.0.15\n",
+        checksum(NEIGHBOUR, &sha256_hex(&neighbour())),
+        checksum(NAME, &sha256_hex(patched)),
+    );
+    Tree::from([
+        (committed_gem(uuid), patched.to_vec()),
+        ("Gemfile".to_string(), gemfile.into_bytes()),
+        ("Gemfile.lock".to_string(), lock.into_bytes()),
+    ])
+}
+
+/// Whether the repository cache of `cell`, which its twins share, holds a
+/// download of `gem`: Bazel keeps a file there under its sha256.
+fn cached(cell: &Cell, gem: &[u8]) -> bool {
+    let cache = match std::env::var_os(REPO_CACHE) {
+        Some(shared) => PathBuf::from(shared),
+        None => cell.path("../cache"),
+    };
+    let files = cache.join("content_addressable/sha256");
+    assert!(files.is_dir(), "no repository cache at {}", cache.display());
+    files.join(sha256_hex(gem)).join("file").exists()
+}
+
+/// A second machine with the files of `cell` that reaches no patch host: a
+/// new output base, and a downloader config that sends nothing there.
+fn without_patch_host(cell: &Cell, origin: &str) -> Cell {
+    let mut twin = cell.twin();
+    twin.route_downloads(&routes(origin, false));
+    twin
+}
+
+/// What `text` reads without its white space: Bundler breaks a message at
+/// the width of the console it runs in.
+fn squeezed(text: &str) -> String {
+    text.split_whitespace().collect()
+}
+
+/// The build of `cell`, where one byte of the committed gem is not the one
+/// the lock pins (`patched`), fails on the lock's checksum: Bundler names
+/// the sha256 of the lock and the one of the file.
+fn fails_on_the_checksum(cell: &Cell, patched: &[u8], changed: &[u8]) {
+    let build = cell.bazel("build", &[CONSUMER]);
+    let stderr = squeezed(&build.stderr());
+    let sums = [patched, changed].map(|gem| format!("sha256={}", sha256_hex(gem)));
+    assert!(
+        !build.ok()
+            && stderr.contains("mismatchedchecksums")
+            && sums.iter().all(|sum| stderr.contains(sum)),
+        "{}: the build did not fail on the checksum of the committed gem:\n{}",
+        cell.test,
+        build.dump()
+    );
+}
+
+/// A Bundler of the 2 line, which most locks name today, in the place of
+/// the fixture's 4.0.15: rules_ruby installs the Bundler of the lock's
+/// `BUNDLED WITH` in the hub, and the hub's `bundle install` is that one's.
+const OLDER_BUNDLER: &str = "2.6.9";
+
+/// Makes the lock of `cell` name [`OLDER_BUNDLER`].
+fn names_the_older_bundler(cell: &Cell) {
+    let lock = String::from_utf8(cell.tree()["Gemfile.lock"].clone()).expect("a text file");
+    let named = "\nBUNDLED WITH\n  4.0.15\n";
+    assert!(lock.ends_with(named), "{}: {lock}", cell.test);
+    let older = format!("\nBUNDLED WITH\n  {OLDER_BUNDLER}\n");
+    cell.write("Gemfile.lock", lock.replace(named, &older));
+}
+
+/// `gem` with its last byte changed: one of the padding a tar ends with, so
+/// the file is still a gem RubyGems reads, with another sha256.
+fn one_byte_changed(gem: &[u8]) -> Vec<u8> {
+    let mut changed = gem.to_vec();
+    *changed.last_mut().expect("a gem has bytes") ^= 1;
+    changed
+}
+
+/// A vendored gem that the hub builds, written by hand.
+///
+/// - (a) `bazel build` and `bazel run //:consumer` print the unpatched
+///   marker.
+/// - (b) By hand ([`by_hand`]): `Gemfile` gives the gem the source
+///   `file:.socket/vendor/gem/<uuid>/`, `Gemfile.lock` resolves it from a
+///   `GEM` section of that remote with the sha256 of the patched gem in
+///   `CHECKSUMS`, and the patched gem is committed at
+///   `.socket/vendor/gem/<uuid>/gems/<name>-<version>.gem`. No file of
+///   Bazel's is touched.
+/// - (c) On a second machine with those files (a new output base and, on
+///   Bazel 9, a new contents cache), which reaches no patch host and whose
+///   repository cache holds no copy of the patched gem, the same two Bazel
+///   commands print the patched marker. Bazel changed no file, and a
+///   `--lockfile_mode=error` build passes. The stand-in was asked for no
+///   patched gem and for no further upstream one.
+/// - (d) On a third machine, with one byte of the committed gem changed,
+///   the build fails on the lock's checksum.
+/// - (e) On a fourth machine, whose lock names Bundler 2.6.9, the hub holds
+///   that Bundler and the same two Bazel commands print the patched marker;
+///   on a fifth one, with the changed byte, the build fails on the lock's
+///   checksum.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn file_source_by_hand() {
+    let test = "ruby::file_source_by_hand";
+    let started = Instant::now();
+    let Some(mut cell) = Cell::open(test, &FIXTURE) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let served = Served::to(&mut cell);
+    let (standin, uuid) = (&served.standin, served.uuid.as_str());
+    let origin = standin.origin();
+
+    // (a) The unpatched build.
+    let before = cell.builds_unpatched(&served.unpatched);
+    let upstream_fetches = standin.asked(&served.upstream_route);
+
+    // (b) The three files, by hand.
+    let files = by_hand(uuid, &served.patched_gem);
+    for (rel, bytes) in &files {
+        cell.write(rel, bytes);
+    }
+    let wired = cell.tree();
+    let written: Vec<String> = files.keys().cloned().collect();
+    assert_eq!(changed(&before, &wired), written, "{test}");
+
+    // (c) A second machine: patched, from the committed gem and nothing
+    // else.
+    assert!(!cached(&cell, &served.patched_gem), "{test}");
+    let second = without_patch_host(&cell, &origin);
+    second.builds_patched(&wired, &served.patched);
+    let patch_host = |path: &String| path.starts_with(&format!("/{PATCH_HOST}/"));
+    let asked: Vec<String> = standin.requests().into_iter().filter(patch_host).collect();
+    assert_eq!(asked, NOTHING, "{test}: the patch host was asked");
+    assert_eq!(
+        standin.asked(&served.upstream_route),
+        upstream_fetches,
+        "{test}: the patched build fetched the upstream gem"
+    );
+
+    // (d) A third machine, where one byte of the committed gem is another.
+    let third = without_patch_host(&second, &origin);
+    let other = one_byte_changed(&served.patched_gem);
+    third.write(&committed_gem(uuid), &other);
+    fails_on_the_checksum(&third, &served.patched_gem, &other);
+
+    // (e) The same two machines with the Bundler of most locks.
+    let fourth = without_patch_host(&third, &origin);
+    fourth.write(&committed_gem(uuid), &served.patched_gem);
+    names_the_older_bundler(&fourth);
+    fourth.builds_patched(&fourth.tree(), &served.patched);
+    let bundler = format!("@bundle//:bundler-{OLDER_BUNDLER}");
+    let held = fourth.bazel("query", &[&bundler]);
+    assert!(held.ok(), "{test}: no {bundler}:\n{}", held.dump());
+    let fifth = without_patch_host(&fourth, &origin);
+    fifth.write(&committed_gem(uuid), &other);
+    fails_on_the_checksum(&fifth, &served.patched_gem, &other);
+    assert_eq!(
+        standin.asked(&served.upstream_route),
+        upstream_fetches,
+        "{test}: the build went to the upstream gem"
+    );
+    let asked: Vec<String> = standin.requests().into_iter().filter(patch_host).collect();
+    assert_eq!(asked, NOTHING, "{test}: the patch host was asked");
+
+    println!(
+        "{test}: Bazel {release} built {:?} on a second machine that reaches no patch host, \
+         from {} and a `file:` source in Gemfile and Gemfile.lock written by hand; one changed \
+         byte of that gem failed a third machine's build (Bundler: mismatched checksums); the \
+         same with Bundler {OLDER_BUNDLER} in the lock and the hub, on a fourth and a fifth; {:?}",
+        served.patched,
+        committed_gem(uuid),
+        started.elapsed()
+    );
+}
+
 /// The code under which vendored mode declines a gem whose Gemfile or lock
 /// a hub of the workspace reads, and what a refusal has to name in the
 /// fixture's checkout: the hub's call with its line in `MODULE.bazel`, and
@@ -626,7 +846,6 @@ fn vendored_bundle_fetch() {
     // message at the width of its console, so it is compared without white
     // space.
     let build = cell.bazel("build", &[CONSUMER]);
-    let squeezed = |text: &str| text.split_whitespace().collect::<String>();
     let stderr = squeezed(&build.stderr());
     let missing = squeezed(&format!("{copy}` does not exist."));
     assert!(
