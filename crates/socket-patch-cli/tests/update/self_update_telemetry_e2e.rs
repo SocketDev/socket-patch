@@ -8,7 +8,9 @@
 
 use crate::update_fixture;
 
-use update_fixture::{make_served_binary, run_installed, staged_install, FakeReleaseBuilder};
+use update_fixture::{
+    make_served_binary, run_installed, staged_install, staged_install_at, FakeReleaseBuilder,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -75,8 +77,46 @@ async fn successful_update_reports_cli_updated() {
     assert_eq!(event["metadata"]["forced"], true);
     assert_eq!(event["metadata"]["pinned"], false);
     assert!(event.get("error").is_none());
+    // The event is built after the swap. On Linux the path of the binary
+    // that ran reads as deleted by then, so its channel is worked out
+    // before the swap.
+    assert_eq!(
+        event["context"]["channel"], "standalone",
+        "the event still says how the binary that ran was installed"
+    );
 
     release.verify_request_hygiene().await;
+}
+
+/// A binary an npm package bundles reports `npm` as its channel in the
+/// context of every event: here the one a forced update sends.
+#[tokio::test]
+async fn a_binary_inside_node_modules_reports_the_npm_channel() {
+    let install = staged_install_at("lib/node_modules/@socketsecurity/socket-patch-x/bin");
+    let (served, _) = make_served_binary();
+    let release = FakeReleaseBuilder::new(CURRENT)
+        .asset_for_current_target(&served)
+        .mount()
+        .await;
+    let telemetry = telemetry_mock().await;
+
+    let (code, stdout, stderr) = run_installed(
+        &install,
+        &["--update", "--force", "--yes"],
+        &[
+            ("SOCKET_UPDATE_BASE_URL", &release.base_url),
+            ("SOCKET_PROXY_URL", &telemetry.uri()),
+            ("SOCKET_TELEMETRY_DISABLED", "0"),
+        ],
+    );
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let events = telemetry_events(&telemetry).await;
+    assert_eq!(events.len(), 1, "exactly one event: {events:#?}");
+    let event = &events[0];
+    assert_eq!(event["event_type"], "cli_updated");
+    assert_eq!(event["context"]["channel"], "npm");
+    assert_eq!(event["metadata"]["channel"], "npm");
 }
 
 #[tokio::test]

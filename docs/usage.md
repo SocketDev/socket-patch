@@ -318,6 +318,11 @@ scala-cli resolve into (restart a running sbt server, Bloop or Metals after
 [ecosystem caveats](ecosystems.md) before using agent mode in shared environments.
 The removed `setup` command is covered in the [migration guide](migrating-to-v5.md).
 
+Agent mode is not supported for a package that Bazel builds: Bazel takes its packages from
+what its rulesets read, and runs no `socket-patch apply`. Use hosted mode there, or vendored
+mode where [Bazel workspaces: what is supported](ecosystems.md#bazel-workspaces-what-is-supported)
+lists it.
+
 ## Inspect, undo, and repair
 
 | Command | Effect |
@@ -326,6 +331,7 @@ The removed `setup` command is covered in the [migration guide](migrating-to-v5.
 | `show <UUID\|PURL\|NAME\|CVE\|GHSA>` | Look inside one patch without applying it: the advisories it fixes, what Socket measured about it (exploits blocked, tests passing, size, run-time cost), the files it changes and their diffs |
 | `rollback [NAME\|PURL\|UUID\|PATH]...` | Restore selected patches, or all patches when no target is given, and remove their local state |
 | `remove <NAME\|PURL\|UUID>` | Restore and remove matching patches; a name or versionless PURL selects every recorded version |
+| `report <UUID\|PURL\|NAME>...` | Tell Socket that a patch broke the build, the tests or the application |
 | `vendor --revert` | Undo vendoring from its recorded edits and remove the vendored artifacts |
 | `repair` | Restore missing or corrupt agent patch data and vendored artifacts using existing records, and clean unused data |
 | `scan --mode agent --prune` | Patch discovered packages and remove records for dependencies that left the project |
@@ -347,6 +353,22 @@ table follows the terminal's size, and leaving it prints the rows so the listing
 stays on screen. `list --verbose`, `list --yes` and a piped `list` print every
 patch's full entry instead and ask the patch service nothing; so does `--offline`,
 which browses what the project records.
+
+If a patch breaks your project, tell Socket so the patch can be fixed or withdrawn:
+
+```sh
+socket-patch report lodash --reason tests --message "jest: TypeError in merge()"
+```
+
+`--reason` is `build`, `tests`, `runtime` or `other` (the default), and `--message`
+adds one in your own words. A package name or PURL names the patch this project holds
+for it; a patch UUID names any patch, so you can report one after rolling it back (a
+`rollback` of named patches prints the command). The report carries the patch's id,
+its ecosystem and patch mode, the reason, your message, and the CLI's version and
+platform: no package names, paths or file contents. It is sent because you ran it,
+so the telemetry opt-outs do not apply to it; `--offline` sends nothing, and
+`--dry-run` shows the whole report as it would be sent. One report names up to 50
+patches. `report` changes nothing in the project.
 
 Use `--dry-run` to preview. `rollback --preserve-state` and
 `remove --preserve-state` restore dependencies while keeping local patch records

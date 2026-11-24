@@ -419,7 +419,10 @@ fn pair_lines(old: &[(&str, &str)], new: &[(&str, &str)]) -> Vec<Option<usize>> 
 /// current artifact URL, fragments ignored. Grant tokens and patch uuids live
 /// in the path between them, so a rotated token or a superseded patch (new
 /// uuid) takes over the stale pin in place instead of being refused as a
-/// foreign source or stranding it on a URL that no longer serves.
+/// foreign source or stranding it on a URL that no longer serves. Under a
+/// patch mirror the two must also share the mirror's base
+/// ([`crate::origin::same_hosted_base`]): the mirror's host serves the
+/// project's own packages too.
 pub(crate) fn is_prior_hosted_url(existing: &str, current: &str) -> bool {
     fn origin_and_leaf(url: &str) -> Option<(&str, &str)> {
         if !url.starts_with("https://") && !url.starts_with("http://") {
@@ -435,7 +438,7 @@ pub(crate) fn is_prior_hosted_url(existing: &str, current: &str) -> bool {
         Some((&url[..path_start], leaf))
     }
     match (origin_and_leaf(existing), origin_and_leaf(current)) {
-        (Some(old), Some(new)) => old == new,
+        (Some(old), Some(new)) => old == new && crate::origin::same_hosted_base(existing, current),
         _ => false,
     }
 }
@@ -1352,6 +1355,34 @@ pub fn paired_metadata_path(lock: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// An earlier hosted pin is taken over in place; a url that only
+    /// shares the host and the file name of a MIRRORED artifact is the
+    /// project's own source and is not.
+    #[test]
+    fn an_earlier_pin_is_ours_only_under_the_base_it_is_served_from() {
+        let leaf = "urllib3-1.26.18-py2.py3-none-any.whl";
+        let direct = format!("https://patch.socket.dev/patch/pypi/urllib3/1.26.18/new/u2/{leaf}");
+        let stale =
+            format!("https://patch.socket.dev/patch/pypi/urllib3/1.26.18/old/u1/{leaf}#sha256=0");
+        assert!(super::is_prior_hosted_url(&stale, &direct));
+        assert!(!super::is_prior_hosted_url(
+            &format!("https://files.example/{leaf}"),
+            &direct
+        ));
+
+        let base = "https://repo.example/artifactory/socket-patch";
+        let mirrored = format!("{base}/patch/pypi/urllib3/1.26.18/new/u2/{leaf}");
+        assert!(super::is_prior_hosted_url(
+            &format!("{base}/patch/pypi/urllib3/1.26.18/old/u1/{leaf}"),
+            &mirrored
+        ));
+        // The project's own fork, in another repository of the same host.
+        assert!(!super::is_prior_hosted_url(
+            &format!("https://repo.example/artifactory/pypi-local/{leaf}"),
+            &mirrored
+        ));
+    }
+
     use super::*;
 
     /// An entry the rewrite does not apply to (a non-registry, non-direct

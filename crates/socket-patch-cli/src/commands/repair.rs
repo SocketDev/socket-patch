@@ -65,8 +65,12 @@ pub async fn run(args: RepairArgs) -> i32 {
         Ok(present) => present,
         Err(e) => {
             let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
-            track_patch_repair_failed(&err.message, &TelemetryAuth::from_credentials(None, None))
-                .await;
+            track_patch_repair_failed(
+                &err.code,
+                &err.message,
+                &TelemetryAuth::from_credentials(None, None),
+            )
+            .await;
             if args.common.json {
                 let env = error_envelope(
                     Command::Repair,
@@ -229,8 +233,19 @@ pub async fn run(args: RepairArgs) -> i32 {
             env.warnings.extend(ignored);
             let had_failure = matches!(env.status, Status::PartialFailure | Status::Error);
             if had_failure {
-                track_patch_repair_failed("One or more artifacts failed to download", &telemetry)
-                    .await;
+                // The envelope's own error code when it has one; a run
+                // with failed events and no top-level error is
+                // `repair_failed`.
+                let code = env
+                    .error
+                    .as_ref()
+                    .map_or("repair_failed", |e| e.code.as_str());
+                track_patch_repair_failed(
+                    code,
+                    "One or more artifacts failed to download",
+                    &telemetry,
+                )
+                .await;
             } else {
                 track_patch_repaired(
                     counts.downloaded,
@@ -246,7 +261,7 @@ pub async fn run(args: RepairArgs) -> i32 {
             i32::from(had_failure)
         }
         Err(e) => {
-            track_patch_repair_failed(&e.message, &telemetry).await;
+            track_patch_repair_failed(&e.code, &e.message, &telemetry).await;
             if args.common.json {
                 let mut env =
                     error_envelope(Command::Repair, args.common.dry_run, &e.code, &e.message);

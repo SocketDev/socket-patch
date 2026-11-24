@@ -55,6 +55,14 @@ Empty environment values are treated as unset.
   bundle on Linux). `SSL_CERT_FILE` / `SSL_CERT_DIR` replace the system store
   with the named bundle or directory, which is how to trust a TLS-inspecting
   proxy's private CA. Certificate verification is never disabled.
+- `SOCKET_PATCH_MIRROR_URL` (experimental) names a mirror of Socket's patch
+  server, such as an Artifactory remote repository, for builds that may only
+  fetch from an internal host. Hosted mode then pins patches under that base,
+  and every command reads the pins there. Set it wherever Socket Patch runs
+  for the project; a repository file cannot set it. It is for Socket
+  Enterprise customers and may change in any release: ask Socket for the
+  setup guide. The rules are in the
+  [CLI contract](../crates/socket-patch-cli/CLI_CONTRACT.md#patch-mirror-experimental).
 - `--offline` prohibits network access. `scan` and `get` require the patch API
   and refuse offline operation. Other commands can use locally available state;
   missing records or artifacts can still prevent completion.
@@ -76,7 +84,8 @@ files, and repository files cannot set credentials, API endpoints, or safety opt
 ## Telemetry
 
 Telemetry is on by default. Each command reports its outcome to Socket as one
-JSON event (two for a `scan` or `get` that also applies patches).
+JSON event (up to three for a `scan` or `get` that also downloads and applies
+patches).
 
 ### What is sent
 
@@ -90,29 +99,52 @@ Every event has these fields:
 | `context.version` | The Socket Patch version |
 | `context.platform`, `context.arch` | Operating system and CPU architecture (for example `linux`, `x86_64`) |
 | `context.command` | The subcommand (`scan`, `apply`, …) |
+| `context.channel` | How this copy of Socket Patch was installed: `npm`, `cargo`, `homebrew`, `pypi` or `launcher_cache` when the binary sits where that tool puts it, and `standalone` for anywhere else (the install script, a downloaded binary, a container image). It names the channel only, never the path, and is left out when the binary cannot read its own location |
 | `metadata` | The per-event fields in the table below, and nothing else |
-| `error.type`, `error.message` | Failure events only. URLs in the message are redacted (credentials, grant tokens, signed query values) and your home directory is replaced by `~`. The message can still quote a package name or a path in the project |
+| `error.type`, `error.message` | Failure events only. URLs in the message are redacted (credentials, grant tokens, signed query values), your home directory is replaced by `~`, and a message longer than 1,000 characters is cut. The message can still quote a package name or a path in the project |
 
 | Command | Event on success | Event on failure | `metadata` fields |
 | --- | --- | --- | --- |
-| `scan` | `patch_scanned` | `patch_scan_failed` | `packages_scanned`, `free_patches`, `paid_patches`, `can_access_paid`, `ecosystems` (names such as `npm`, not packages), `fallback_to_proxy`, `mode`, `project_modes` |
-| `scan` / `get` in hosted mode | `patch_applied` | `patch_apply_failed` | `mode` (`hosted`), `patches_count`, `files_count`, `dry_run` |
-| `apply`, and `scan` / `get` in agent mode | `patch_applied` | `patch_apply_failed` | `mode` (`agent`), `patches_count`, `dry_run` |
-| `vendor`, and `scan` / `get` in vendored mode | `patch_vendored` | `patch_vendor_failed` | `patches_count`, `dry_run` |
-| `get` | `patch_fetched` | `patch_fetch_failed` | `uuid` (the patch UUID), `tier`, `ecosystem`, `download_mode`, `fallback_to_proxy` |
-| `remove` | `patch_removed` | `patch_remove_failed` | `removed_count` |
-| `rollback` | `patch_rolled_back` | `patch_rollback_failed` | `rolled_back_count` |
+| `scan` | `patch_scanned` | `patch_scan_failed` | `packages_scanned`, `free_patches`, `paid_patches`, `can_access_paid`, `ecosystems` (names such as `npm`, not packages), `packages_by_ecosystem` and `patches_by_ecosystem` (counts per ecosystem name), `fallback_to_proxy`, `mode`, `project_modes`, `dry_run` |
+| `scan` / `get` in hosted mode | `patch_applied` | `patch_apply_failed` | `mode` (`hosted`), `patches_count`, `files_count`, `dry_run`, and the [patches](#patches-named-in-an-event) |
+| `apply`, and `scan` / `get` in agent mode | `patch_applied` | `patch_apply_failed` | `mode` (`agent`), `patches_count`, `dry_run`, and the patches |
+| `scan` / `get <package or advisory>` in agent mode | `patch_fetched` | — | `mode` (`agent`), `patches_count` (patch records downloaded), `download_mode`, and the patches |
+| `vendor`, and `scan` / `get` in vendored mode | `patch_vendored` | `patch_vendor_failed` | `mode` (`vendored`), `patches_count`, `dry_run`, and the patches |
+| `get <uuid>` | `patch_fetched` | `patch_fetch_failed` | `uuid` (the patch UUID), `tier`, `ecosystem`, `mode`, `patches_count`, `download_mode`, `fallback_to_proxy` |
+| `remove`, and `vendor --revert` | `patch_removed` | `patch_remove_failed` | `removed_count`, and the patches. A `--dry-run` sends nothing |
+| `rollback` | `patch_rolled_back` | `patch_rollback_failed` | `rolled_back_count`, `dry_run`, `targeted` (you named the patches to roll back, rather than rolling the project back), and the patches |
 | `list` | `patch_listed` | — | `patches_count` |
 | `repair` | `patch_repaired` | `patch_repair_failed` | `blobs_added`, `blobs_removed`, `bytes_freed` |
 | `vex` | `vex_generated` | `vex_failed` | `advisories_count`, `format`, `output_kind` |
 | `--update` | `cli_updated` | `cli_update_failed` | `from_version`, `to_version`, `channel`, `pinned`, `forced`; on failure `error_code` |
 
-A failure event carries the subset of its row's fields known when it failed;
-`patch_fetch_failed` reports `uuid` only when you asked for a patch by UUID.
+A `scan` reports once for each project directory it scans. A failure event
+carries the subset of its row's fields known when it failed, plus `error_code`:
+the code the command's `--json` output reports (for example `patch_not_found`
+or `rollback_failed`). `patch_fetch_failed` reports `uuid` only when you asked
+for a patch by UUID. A command that stops on a usage error, or because another
+run holds the lock, reports nothing.
 
-An event carries no dependency list, no file contents, and no machine
-identifier. The HTTP request has a `User-Agent` of `SocketPatchCLI/<version>`
-and, like any request, shows the server your IP address.
+#### Patches named in an event
+
+An event about specific patches names them, so that Socket can see when one
+patch fails to apply, or is rolled back, far more often than the others:
+
+| Field | Value |
+| --- | --- |
+| `patches` | Up to 50 entries, failed ones first. Each is `{uuid, ecosystem, mode, outcome}`: the patch UUID, the ecosystem name (`npm`, `pypi`, …), the mode it was patched in (`agent`, `hosted`, `vendored`), and what the run did (`applied`, `downloaded`, `rolled_back`, `removed`, `verified` on a dry run, `skipped`, `failed`). A `skipped` or `failed` entry adds `code`, the reason code `--json` reports (for example `already_patched`) |
+| `patches_truncated` | `true` when the run acted on more than 50 patches |
+| `outcomes` | How many patches ended each way, over the whole run |
+| `ecosystems`, `modes` | The distinct ecosystems and modes of those patches |
+
+A patch UUID is Socket's identifier for one patch, and each patch is for one
+version of one package, so these entries tell Socket which patched package
+versions the run acted on. They hold no package name, path, or file list.
+
+Other than that, an event carries no dependency list, no file contents, and no
+machine identifier. The HTTP request has a `User-Agent` of
+`SocketPatchCLI/<version>` and, like any request, shows the server your IP
+address.
 
 ### Where it goes
 

@@ -172,6 +172,26 @@ pub struct GlobalArgs {
     )]
     pub patch_server_url: Option<String>,
 
+    /// Base URL of a mirror of Socket's patch server: a caching proxy in
+    /// front of https://patch.socket.dev, such as an Artifactory remote
+    /// repository. Hosted mode writes its patch references under this base
+    /// instead of the patch server's own host (same path), and every
+    /// command accepts lockfile URLs on this origin as hosted patch
+    /// references. Set it the same way wherever socket-patch runs for the
+    /// project.
+    //
+    // EXPERIMENTAL (hidden from `--help`): for organizations that install
+    // through their own artifact host. The flag, its variables and its
+    // warning codes carry no stability guarantee yet; see "Patch mirror
+    // (experimental)" in CLI_CONTRACT.md.
+    #[arg(
+        help_heading = GLOBAL_OPTIONS,
+        long = "patch-mirror-url",
+        env = "SOCKET_PATCH_MIRROR_URL",
+        hide = true
+    )]
+    pub patch_mirror_url: Option<String>,
+
     /// Disable network access; fail if remote data is needed.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
@@ -401,6 +421,23 @@ pub struct GlobalArgs {
         value_parser = parse_bool_flag,
     )]
     pub gem_refresh_shared: bool,
+
+    /// Vendored mode (`vendor`, `scan`/`get --mode vendored`): write for a
+    /// package although the project is in a Bazel workspace, where the
+    /// build may not find the vendored copy. Vendored mode declines such
+    /// a package by default; today that is a Composer package
+    /// (`vendor_composer_bazel_workspace`), whose lock names the copy by a
+    /// path that a Bazel rule running `composer install` in another
+    /// directory does not find. Pass it when the build does find the
+    /// copy. Other subcommands accept it silently.
+    #[arg(
+        help_heading = GLOBAL_OPTIONS,
+        long = "allow-vendored-in-bazel",
+        env = "SOCKET_ALLOW_VENDORED_IN_BAZEL",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
+    pub allow_vendored_in_bazel: bool,
 }
 
 impl GlobalArgs {
@@ -626,6 +663,42 @@ impl GlobalArgs {
             .map_or_else(|| self.telemetry_auth(), TelemetryAuth::for_client)
     }
 
+    /// Refuse a `--patch-mirror-url` that cannot prefix a committed URL,
+    /// once, before any command reads the project. The message says what
+    /// is wrong and never repeats the value: a base given with credentials
+    /// in it must not be echoed into a terminal or a CI log.
+    pub fn validate_patch_mirror(&self) -> Result<(), String> {
+        let Some(raw) = self
+            .patch_mirror_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+        else {
+            return Ok(());
+        };
+        socket_patch_core::patch::redirect::mirror::PatchMirror::parse(raw)
+            .map(|_| ())
+            .map_err(|why| {
+                format!(
+                    "--patch-mirror-url (or SOCKET_PATCH_MIRROR_URL) is not a usable patch \
+                     mirror base URL: {why}"
+                )
+            })
+    }
+
+    /// The patch-server mirror this run was given (`--patch-mirror-url`).
+    /// [`Self::validate_patch_mirror`] refused a base that does not parse
+    /// before the command started; a struct literal with one has no mirror.
+    pub(crate) fn patch_mirror(
+        &self,
+    ) -> Option<socket_patch_core::patch::redirect::mirror::PatchMirror> {
+        self.patch_mirror_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .and_then(|url| {
+                socket_patch_core::patch::redirect::mirror::PatchMirror::parse(url).ok()
+            })
+    }
+
     /// The vendoring-service config every vendor entry point (`vendor`,
     /// `scan`/`get --mode vendored`) builds from the same flags, so they
     /// commit byte-identical artifacts for the same patch. Clap validated
@@ -686,8 +759,9 @@ pub(crate) fn socket_dir_of(manifest_path: &Path, cwd: &Path) -> PathBuf {
 
 /// Mirror the flags that core reads from the env (`SOCKET_OFFLINE`,
 /// `SOCKET_DEBUG`, `SOCKET_TELEMETRY_DISABLED`, `SOCKET_API_URL`,
-/// `SOCKET_PROXY_URL`) into it. Core's own parse of `SOCKET_OFFLINE` and
-/// `SOCKET_DEBUG` matches only `"1" | "true"`,
+/// `SOCKET_PROXY_URL`, `SOCKET_ALLOW_VENDORED_IN_BAZEL`) into it. Core's
+/// own parse of `SOCKET_OFFLINE` and `SOCKET_DEBUG` matches only
+/// `"1" | "true"`,
 /// and the telemetry kill-switch and endpoint resolvers never see the parsed
 /// flags: without the mirror `--offline` still sent telemetry, and an
 /// on-prem `--api-url` run sent it, token included, to `api.socket.dev`.
@@ -705,6 +779,9 @@ pub(crate) fn apply_env_toggles(common: &GlobalArgs) {
     }
     if common.no_telemetry {
         std::env::set_var("SOCKET_TELEMETRY_DISABLED", "1");
+    }
+    if common.allow_vendored_in_bazel {
+        std::env::set_var(socket_patch_core::vendor::refusals::ALLOW_IN_BAZEL_ENV, "1");
     }
     if let Some(url) = common.api_url.as_deref().filter(|s| !s.is_empty()) {
         std::env::set_var("SOCKET_API_URL", url);
@@ -728,6 +805,7 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_VENDOR_SOURCE",
     "SOCKET_VENDOR_URL",
     "SOCKET_PATCH_SERVER_URL",
+    "SOCKET_PATCH_MIRROR_URL",
     "SOCKET_OFFLINE",
     "SOCKET_STRICT",
     "SOCKET_GLOBAL",
@@ -746,6 +824,7 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_NO_GEM_NATIVE_REBUILD",
     "SOCKET_NO_GEM_INSTALL_REFRESH",
     "SOCKET_GEM_REFRESH_SHARED",
+    "SOCKET_ALLOW_VENDORED_IN_BAZEL",
 ];
 
 /// Every env var a subcommand-local flag binds (one per `env = "..."`
@@ -800,6 +879,7 @@ impl Default for GlobalArgs {
             maven_config: None,
             vendor_url: None,
             patch_server_url: None,
+            patch_mirror_url: None,
             offline: false,
             strict: false,
             allow_patch_conflicts: false,
@@ -819,6 +899,7 @@ impl Default for GlobalArgs {
             no_gem_native_rebuild: false,
             no_gem_install_refresh: false,
             gem_refresh_shared: false,
+            allow_vendored_in_bazel: false,
         }
     }
 }

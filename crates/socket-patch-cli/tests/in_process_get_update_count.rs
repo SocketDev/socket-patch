@@ -96,6 +96,7 @@ fn params(root: &Path) -> DownloadParams {
         ecosystems: None,
         persist_blobs: true,
         patch_server_url: None,
+        patch_mirror_url: None,
         // Skip release-narrowing; npm has no variants anyway.
         all_releases: true,
     }

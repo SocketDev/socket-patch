@@ -63,6 +63,7 @@ pub fn global_defaults() -> Globals {
         maven_config: None,
         vendor_url: None,
         patch_server_url: None,
+        patch_mirror_url: None,
         offline: false,
         strict: false,
         allow_patch_conflicts: false,
@@ -82,6 +83,7 @@ pub fn global_defaults() -> Globals {
         no_gem_native_rebuild: false,
         no_gem_install_refresh: false,
         gem_refresh_shared: false,
+        allow_vendored_in_bazel: false,
     })
 }
 

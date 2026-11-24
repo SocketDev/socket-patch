@@ -119,6 +119,38 @@
 //! (static.rust-lang.org), and the crates it builds its own tools from
 //! (static.crates.io).
 //!
+//! # The hub without a cargo config
+//!
+//! A third flow ([`hosted_from_cargo_without_config`]) runs hosted mode on
+//! the hub as the rules_rust README has it, which names no `cargo_config`
+//! ([`open_readme_hub`]). cargo-bazel then hands no cargo config of the
+//! checkout to its cargo, so the registry that hosted mode defines in
+//! `.cargo/config.toml` and names in `Cargo.toml` would be one that cargo
+//! has never heard of, and the hub would fail on the manifest (`registry
+//! index was not found in any configuration`). The flow holds that
+//! `socket-patch` writes no such pin:
+//!
+//! - (a) The build prints the unpatched marker.
+//! - (b) `scan --mode hosted --yes` exits 0, reports the crate as skipped
+//!   and warns `redirect_cargo_bazel_config_unread`: the warning names the
+//!   hub by its file and line, the config to commit, the attribute the hub
+//!   lacks and vendored mode. No file of the checkout changes, and a
+//!   person is told the same.
+//! - (c) The same build still prints the unpatched marker and changes no
+//!   file.
+//! - (d) The second way the warning names, on the hub as it is: `scan
+//!   --mode vendored --yes`, and the build prints the patched marker, from
+//!   the committed copy. `vendor --revert` gives the checkout back.
+//! - (e) The first way: the checkout gets `.cargo/config.toml`, with a
+//!   comment line in it, and the hub `cargo_config =
+//!   "//:.cargo/config.toml"`. The same scan then applies the patch and
+//!   rewrites the three files, and the build prints the patched marker,
+//!   from the patch host.
+//!
+//! The tests without a Bazel run the same command in checkouts of the
+//! fixture's Cargo files ([`checkout`]): what it writes where no hub reads
+//! them is what it writes in no Bazel workspace, byte for byte.
+//!
 //! # The build file in the copy
 //!
 //! cargo-bazel renders a build file for every crate of the hub. Since
@@ -169,7 +201,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256, Sha512};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
-use crate::envelope::{event_for, has_event};
+use crate::envelope::{codes_in, event_for, has_event};
 use crate::harness::{
     cell_without_bazel, changed, fixture_path, Cell, Fixture, Ran, Release, StandIn, Tree,
     CONSUMER, NOTHING, REPO_CACHE,
@@ -227,10 +259,22 @@ const CONFIG: &str = ".cargo/config.toml";
 const LOCK: &str = "Cargo.lock";
 const MANIFEST: &str = "Cargo.toml";
 const BAZEL_LOCK: &str = "MODULE.bazel.lock";
+/// The file that declares the hub, and the line of it that names the cargo
+/// config. Every era's hub has that line; without it the hub is the one of
+/// the rules_rust README.
+const MODULE: &str = "MODULE.bazel";
+const HUB_CONFIG: &str = "    cargo_config = \"//:.cargo/config.toml\",\n";
 /// How a `Cargo.lock` names crates.io, with or without a mirror, and how
 /// the index of another registry names it.
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const CRATES_IO_INDEX: &str = "https://github.com/rust-lang/crates.io-index";
+/// Where a cargo home keeps what cargo has read of the sparse index of
+/// crates.io: the directory cargo names so before 1.85 and the one from 1.85
+/// on (the cargo of rules_rust 0.56.0 is 1.83.0, that of 0.75.0 is 1.99.1).
+const CRATES_IO_INDEXES: [&str; 2] = [
+    "registry/index/index.crates.io-6f17d22bba15001f",
+    "registry/index/index.crates.io-1949cf8c6b5b557f",
+];
 /// What the fixture's lock holds as the checksum of the crate: the sum of
 /// no file.
 const PLACEHOLDER: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -543,10 +587,11 @@ fn grant(standin: &StandIn, upstream: &Package, patch: &Patched, served: &[u8]) 
 /// `CARGO_HOME` is `home`, a directory of the test: under Bzlmod rules_rust
 /// 0.56.0 runs its cargo with the cargo home of the environment, and a
 /// flow says which one that is. rules_rust 0.75.0 gives its cargo a home
-/// inside the output base, which `CARGO_BAZEL_ISOLATED` states.
-fn cargo_env(home: &Path) -> Vec<(String, String)> {
-    let home = home.to_string_lossy();
-    let pins = [("CARGO_HOME", &*home), ("CARGO_BAZEL_ISOLATED", "true")];
+/// inside the output base when `isolated`, which `CARGO_BAZEL_ISOLATED`
+/// states, and runs it with `home` as well when not.
+fn cargo_env(home: &Path, isolated: bool) -> Vec<(String, String)> {
+    let (home, isolated) = (home.to_string_lossy(), isolated.to_string());
+    let pins = [("CARGO_HOME", &*home), ("CARGO_BAZEL_ISOLATED", &*isolated)];
     let owned = pins.map(|(name, value)| (name.to_string(), value.to_string()));
     owned.to_vec()
 }
@@ -563,11 +608,66 @@ fn cargo_home() -> tempfile::TempDir {
 fn open(test: &str) -> Option<(tempfile::TempDir, Cell, StandIn, Package)> {
     let mut cell = Cell::open(test, &FIXTURE)?;
     let home = cargo_home();
-    cell.repo_env = cargo_env(home.path());
+    cell.repo_env = cargo_env(home.path(), true);
     let upstream = Package::upstream();
     let standin = registry(&upstream);
     cell.write(LOCK, lock_pinning(&upstream));
     cell.write(CONFIG, mirror_config(&standin.origin()));
+    Some((home, cell, standin, upstream))
+}
+
+/// [`open`] for the hub of the rules_rust README: the `MODULE.bazel` of the
+/// era without the line that names a cargo config, in a checkout that has
+/// none.
+///
+/// The crate still comes from the stand-in, the way the README says a
+/// private registry is reached: `CARGO_BAZEL_ISOLATED=false` has the hub run
+/// its cargo with the cargo home of the machine, here the one of the test,
+/// and that home's `config.toml` names the mirror. cargo-bazel itself reads
+/// no cargo config the hub does not name, so for a crate the lock takes
+/// from crates.io it goes by what the cargo home keeps of that index: the
+/// `config.json`, for the download URL, and with rules_rust 0.56.0 the
+/// files of the index of the crate and of its dependency as well. A cargo behind a mirror fetches
+/// neither. The home holds both, as a home does whose cargo has fetched the
+/// crate from crates.io itself, with the stand-in as the download host.
+fn open_readme_hub(test: &str) -> Option<(tempfile::TempDir, Cell, StandIn, Package)> {
+    let mut cell = Cell::open(test, &FIXTURE)?;
+    let home = cargo_home();
+    cell.repo_env = cargo_env(home.path(), false);
+    let upstream = Package::upstream();
+    let standin = registry(&upstream);
+    let origin = standin.origin();
+    cell.write(LOCK, lock_pinning(&upstream));
+    let module = std::fs::read_to_string(cell.path(MODULE)).expect(MODULE);
+    cell.write(MODULE, module.replace(HUB_CONFIG, ""));
+    let keep = |rel: &str, bytes: &[u8]| {
+        let path = home.path().join(rel);
+        std::fs::create_dir_all(path.parent().expect("a file path")).expect("create the parent");
+        std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    };
+    keep("config.toml", mirror_config(&origin).as_bytes());
+    let index = json!({ "dl": format!("{origin}/{FILES}/crates"), "api": origin }).to_string();
+    // The file of the index of the crate and of its dependency as cargo
+    // caches it: the version of the cache format (3) and of the index schema
+    // (2), what the server said of the file's age, and per release its
+    // version and its line of the file.
+    let cached = |line: String| {
+        let cached = format!("etag: \"run\"\0{VERSION}\0{}\0", line.trim_end());
+        [&[3][..], &2u32.to_le_bytes(), cached.as_bytes()].concat()
+    };
+    let lines = [
+        (NAME, cached(upstream.index_line(None))),
+        (
+            DEP,
+            cached(index_line(DEP, &sha256_hex(&dependency_file()), json!([]))),
+        ),
+    ];
+    for directory in CRATES_IO_INDEXES {
+        keep(&format!("{directory}/config.json"), index.as_bytes());
+        for (name, cached) in &lines {
+            keep(&format!("{directory}/.cache/{}", index_path(name)), cached);
+        }
+    }
     Some((home, cell, standin, upstream))
 }
 
@@ -732,7 +832,7 @@ fn second_machine(
         Some(cell)
     };
     let home = cargo_home();
-    twin.repo_env = cargo_env(home.path());
+    twin.repo_env = cargo_env(home.path(), true);
     let other = registry(upstream);
     twin.write(CONFIG, mirror_config(&other.origin()));
     grant(&other, upstream, second, served);
@@ -945,7 +1045,7 @@ fn hosted_from_cargo_with_config() {
     let listed = tampered.index_line(Some(CRATES_IO_INDEX));
     other.serve(1, &second.entry, listed.as_bytes());
     let third_home = cargo_home();
-    twin.repo_env = cargo_env(third_home.path());
+    twin.repo_env = cargo_env(third_home.path(), true);
     let asked = other.asked(&second.entry);
     refuses(&twin, "changed between lock files");
     assert!(
@@ -1413,6 +1513,401 @@ fn the_vendored_crates_get_a_bazelignore_line_where_a_crate_hub_builds_them() {
     assert_eq!(file(), None);
 }
 
+/// The code of the warning for a crate that hosted mode does not pin
+/// because a rules_rust hub would not read the cargo config of the pin.
+const UNREAD: &str = "redirect_cargo_bazel_config_unread";
+
+/// The attribute a hub names the project's cargo config with, and how the
+/// warning says to write it.
+const NAMES_CONFIG: &str = "cargo_config = \"//:.cargo/config.toml\"";
+const GIVE_THE_HUB: &str = "give the hub `cargo_config = \"//:.cargo/config.toml\"`";
+
+/// What a finished hosted command says when it pins nothing for the crate
+/// because of a hub: it exits 0 with the status `success`, the crate is
+/// skipped as one no file pins, no file is named as rewritten, and its one
+/// warning of [`UNREAD`] names the crate, says that nothing was written
+/// and ends with vendored mode. Gives the detail of that warning.
+fn unread(test: &str, scan: &Ran) -> String {
+    let said = &scan.dump;
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["applied"], 0, "{test}: {said}");
+    let skipped = has_event(&scan.envelope, "skipped", "redirect_unconfirmed", PURL);
+    assert!(skipped, "{test}: {said}");
+    let rewritten = &scan.envelope["redirect"]["rewrittenFiles"];
+    assert_eq!(*rewritten, json!([]), "{test}: {said}");
+    let warnings = scan.envelope["warnings"].as_array().expect("warnings");
+    let ours: Vec<&str> = warnings
+        .iter()
+        .filter(|warning| warning["code"] == UNREAD)
+        .filter_map(|warning| warning["detail"].as_str())
+        .collect();
+    let [detail] = ours[..] else {
+        panic!("{test}: not one {UNREAD} warning: {said}");
+    };
+    let vendored =
+        "; or use `--mode vendored`, which commits the patched crate and needs no registry";
+    let about = detail.starts_with(&format!("{NAME}@{VERSION}: "))
+        && detail.contains("; dependency skipped (nothing rewritten). ")
+        && detail.ends_with(vendored);
+    assert!(about, "{test}: {detail}");
+    detail.to_string()
+}
+
+/// [`unread`] for the hub at `at` (`MODULE.bazel:10`), which names no
+/// config: the warning names the hub, the file to commit first, and the
+/// attribute to give the hub.
+fn withheld(test: &str, scan: &Ran, at: &str) {
+    let detail = unread(test, scan);
+    let starts = format!(
+        "{NAME}@{VERSION}: the rules_rust hub at {at} reads the Cargo files of this project, and \
+         it names no `cargo_config`. "
+    );
+    assert!(detail.starts_with(&starts), "{test}: {detail}");
+    let way = format!(
+        "Commit {CONFIG} (where the project has none, create it with a comment line in it: \
+         `rollback` deletes a config it leaves empty, and a hub that names a missing file fails), \
+         {GIVE_THE_HUB}, the label of that file as one string, and run this command again; or \
+         use `--mode vendored`"
+    );
+    assert!(detail.contains(&way), "{test}: no {way:?} in {detail}");
+}
+
+/// The line of `module` on which its hub is called, as a warning names it.
+fn hub_at(module: &str) -> String {
+    let call = module.lines().position(|line| line == "crate.from_cargo(");
+    format!("{MODULE}:{}", call.expect("a hub") + 1)
+}
+
+/// The flow of the hub without a cargo config (module docs).
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn hosted_from_cargo_without_config() {
+    let test = "cargo::hosted_from_cargo_without_config";
+    let started = Instant::now();
+    let Some((_home, cell, standin, upstream)) = open_readme_hub(test) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let origin = standin.origin();
+    let patch = Patched::new();
+    grant(&standin, &upstream, &patch, &patch.package.crate_file);
+
+    // (a) The unpatched build, with the upstream crate from the stand-in.
+    let before = builds_upstream(&cell, &standin, &upstream);
+
+    // (b) The one command of hosted mode pins nothing: the hub would fail
+    // on the pin. It says so, names the hub and the two ways on, and
+    // changes no file. A person reads the same warning.
+    let command = ["scan", "--mode", "hosted", "--yes"];
+    let readme = text(&before, MODULE);
+    let scan = socket_patch(&cell, &standin, &command);
+    withheld(test, &scan, &hub_at(&readme));
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{test}");
+    let [_, stderr] = person(&cell, &standin, &command);
+    let told = stderr
+        .lines()
+        .any(|line| line.starts_with("Warning: ") && line.contains(GIVE_THE_HUB));
+    assert!(told, "{test}: a person is not told:\n{stderr}");
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{test}");
+
+    // (c) The same build: still the upstream crate, no file changed, and
+    // Bazel's lock stands.
+    cell.builds_patched(&before, &upstream.marker);
+
+    // (d) The second way the warning names, on the hub as it is: vendored
+    // mode needs no registry, and the build is the patched one, from the
+    // committed copy. Its undo gives the checkout back.
+    let vendored = socket_patch(&cell, &standin, &["scan", "--mode", "vendored", "--yes"]);
+    let said = &vendored.dump;
+    assert_eq!(vendored.code, 0, "{test}: {said}");
+    assert_eq!(vendored.envelope["summary"]["applied"], 1, "{test}: {said}");
+    cell.builds(&patch.package.marker);
+    let undo = socket_patch(&cell, &standin, &["vendor", "--revert"]);
+    undone(&cell, &undo, "removed", &before, &upstream.marker);
+    let fetched = standin.asked(&patch.route);
+
+    // (e) The first way: that file in the checkout, with a comment line in
+    // it, and the one attribute on the hub. Then the same command applies
+    // the patch, and the build is the patched one, from the patch host,
+    // which is asked for its index file of the crate and, at least twice,
+    // for the crate file.
+    let lockfile = "    cargo_lockfile = ";
+    let named = readme.replacen(lockfile, &format!("{HUB_CONFIG}{lockfile}"), 1);
+    assert!(named.contains(NAMES_CONFIG), "{test}:\n{named}");
+    cell.write(MODULE, named);
+    let comment = "# The cargo settings of this project.\n";
+    cell.write(CONFIG, comment);
+    let edited = cell.tree();
+    let scan = socket_patch(&cell, &standin, &command);
+    let pinned = cell.pinned_by(&scan, PURL, &patch.uuid, &edited, &[CONFIG, LOCK, MANIFEST]);
+    let warned = codes_in(&scan.envelope["warnings"]);
+    assert!(
+        !warned.iter().any(|code| code == UNREAD),
+        "{test}: {}",
+        scan.dump
+    );
+    let (index, registry) = (format!("sparse+{origin}{}/", patch.index), patch.registry());
+    let defined = format!("{comment}\n[registries.{registry}]\nindex = \"{index}\"\n");
+    assert_eq!(text(&pinned, CONFIG), defined, "{test}: {CONFIG}");
+    cell.builds(&patch.package.marker);
+    let (asked, fetches) = (
+        standin.asked(&patch.entry),
+        standin.asked(&patch.route) - fetched,
+    );
+    assert!(
+        asked > 0 && fetches >= 2,
+        "{test}: requests to the patch host by the hosted build: {asked} for its index file of \
+         the crate and {fetches} for the crate file"
+    );
+
+    println!(
+        "{test}: Bazel {release} built {:?} on the hub of the rules_rust README; `scan --mode \
+         hosted` exited 0, warned {UNREAD} and changed no file, and the same build printed the \
+         same line; after `scan --mode vendored` on that hub the build printed {:?}, and \
+         `vendor --revert` restored the checkout; with {CONFIG} in the checkout and \
+         `{NAMES_CONFIG}` on the hub the hosted scan rewrote {:?}, and the build printed the \
+         same line from the patch host (requests for the crate file: {fetches}); {:?}",
+        upstream.marker,
+        patch.package.marker,
+        [CONFIG, LOCK, MANIFEST],
+        started.elapsed()
+    );
+}
+
+/// Without a Bazel: the Cargo project of the fixture in a checkout of its
+/// own, in the directory `project` of it (`""`: the root, else with a `/`
+/// at its end), its lock pinning `upstream`, with `files` beside it, each
+/// from the root of the checkout.
+fn checkout(project: &str, upstream: &Package, files: &[(&str, &str)]) -> Cell {
+    let cell = cell_without_bazel("9.3.2");
+    let manifest = std::fs::read(fixture_path(FIXTURE.dir).join("common").join(MANIFEST));
+    cell.write(&format!("{project}{MANIFEST}"), manifest.expect(MANIFEST));
+    cell.write(&format!("{project}{LOCK}"), lock_pinning(upstream));
+    cell.write(".git/HEAD", "ref: refs/heads/main\n");
+    for (rel, text) in files {
+        cell.write(rel, text);
+    }
+    cell
+}
+
+/// The `MODULE.bazel` of the newer era, whose hub names the cargo config.
+fn module_naming_config() -> String {
+    let path = fixture_path(FIXTURE.dir).join("e9").join(MODULE);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// An upstream crate, a stand-in that holds it, and a patch of it that the
+/// stand-in grants.
+fn granted() -> (Package, StandIn, Patched) {
+    let (upstream, patch) = (Package::upstream(), Patched::new());
+    let standin = registry(&upstream);
+    grant(&standin, &upstream, &patch, &patch.package.crate_file);
+    (upstream, standin, patch)
+}
+
+/// Without a Bazel: on the hub of the README every hosted command pins
+/// nothing and changes no file, a dry run and `get` included, and a person
+/// reads which package was left out and why. With the config in the
+/// checkout and the attribute on the hub a line that may hide a hub still
+/// withholds the pin, and the warning names that line and no attribute.
+/// Without the line the same scan pins the crate, a scan after it leaves
+/// the pin as it is, and `rollback` gives the checkout back, the config
+/// with its comment line. A config that holds nothing gets no pin, and the
+/// warning asks for the comment line.
+#[test]
+fn a_hub_without_the_config_gets_no_pin_until_it_names_the_config() {
+    let (upstream, standin, patch) = granted();
+    let named = module_naming_config();
+    let readme = named.replace(HUB_CONFIG, "");
+    let cell = checkout("", &upstream, &[(MODULE, &readme)]);
+    let before = cell.tree();
+    let scan = ["scan", "--mode", "hosted", "--yes"];
+    let commands: [&[&str]; 3] = [
+        &scan,
+        &["scan", "--mode", "hosted", "--yes", "--dry-run"],
+        &["get", PURL, "--mode", "hosted", "--yes"],
+    ];
+    for command in commands {
+        let ran = socket_patch(&cell, &standin, command);
+        withheld(&format!("{command:?}"), &ran, &hub_at(&readme));
+        assert_eq!(changed(&before, &cell.tree()), NOTHING, "{command:?}");
+    }
+    let [stdout, stderr] = person(&cell, &standin, &scan);
+    let left_out = format!(
+        "  {PURL}: no lockfile entry pinning it could be rewritten (see the warning below)"
+    );
+    let lines: Vec<&str> = stderr.lines().collect();
+    let warning = format!(
+        "Warning: {NAME}@{VERSION}: the rules_rust hub at {}",
+        hub_at(&readme)
+    );
+    let told = lines.contains(&"No patches could be switched to hosted:")
+        && lines.contains(&left_out.as_str())
+        && lines.iter().any(|line| line.starts_with(&warning));
+    assert!(told, "--- stdout\n{stdout}\n--- stderr\n{stderr}");
+    assert_eq!(changed(&before, &cell.tree()), NOTHING);
+
+    let comment = "# The cargo settings of this project.\n";
+    cell.write(MODULE, &named);
+    cell.write(CONFIG, comment);
+    let edited = cell.tree();
+    // The hub that is seen names the config, and another may be hidden.
+    let hidden = format!("{named}make = crate.from_cargo\n");
+    cell.write(MODULE, &hidden);
+    let detail = unread("a hidden call", &socket_patch(&cell, &standin, &scan));
+    let line = format!(
+        "{NAME}@{VERSION}: {MODULE}:{}: `crate` is used other than to call a tag, so a rules_rust \
+         hub that socket-patch cannot read may take the Cargo files of this project. ",
+        hidden.lines().count()
+    );
+    let way = "Write that line as the call of a tag (`crate.from_cargo(...)`) or as \
+               `use_repo(...)` and run this command again: it then pins the crate, or names the \
+               hub that is in the way; or use `--mode vendored`";
+    let named_line = detail.starts_with(&line) && detail.contains(way);
+    assert!(named_line && !detail.contains("ive the hub"), "{detail}");
+    cell.write(MODULE, &named);
+    assert_eq!(changed(&edited, &cell.tree()), NOTHING);
+    let ran = socket_patch(&cell, &standin, &scan);
+    let pinned = cell.pinned_by(&ran, PURL, &patch.uuid, &edited, &[CONFIG, LOCK, MANIFEST]);
+    // A pin that is in place stays what it was, whatever the hub names by
+    // then: applied, with no file to rewrite and no word about the hub.
+    cell.write(MODULE, &readme);
+    let again = socket_patch(&cell, &standin, &scan);
+    assert_eq!(again.envelope["summary"]["applied"], 1, "{}", again.dump);
+    assert_eq!(
+        codes_in(&again.envelope["warnings"]),
+        NOTHING,
+        "{}",
+        again.dump
+    );
+    cell.write(MODULE, &named);
+    assert_eq!(changed(&pinned, &cell.tree()), NOTHING, "{}", again.dump);
+    let undo = socket_patch(&cell, &standin, &["rollback", "--yes"]);
+    assert_eq!(undo.code, 0, "{}", undo.dump);
+    assert_eq!(undo.envelope["summary"]["rolledBack"], 1, "{}", undo.dump);
+    assert_eq!(changed(&edited, &cell.tree()), NOTHING, "{}", undo.dump);
+
+    // A config that holds nothing gets no pin: the `rollback` of the pin
+    // would delete the file, and a hub that names a missing file fails.
+    cell.write(CONFIG, "");
+    let blank = cell.tree();
+    let detail = unread("a blank config", &socket_patch(&cell, &standin, &scan));
+    let starts = format!(
+        "{NAME}@{VERSION}: the rules_rust hub at {} reads the Cargo files of this project and \
+         names {CONFIG}, which holds nothing: ",
+        hub_at(&named)
+    );
+    let way = format!(
+        "Put a comment line in {CONFIG} and run this command again; or use `--mode vendored`"
+    );
+    assert!(
+        detail.starts_with(&starts) && detail.contains(&way),
+        "{detail}"
+    );
+    assert_eq!(changed(&blank, &cell.tree()), NOTHING);
+
+    // KNOWN GAP, and what the comment line is for: a config that the pin
+    // creates is deleted by the `rollback` that empties it, and a hub that
+    // names a missing file fails. Once `rollback` keeps the hub's file,
+    // the warning needs no such advice and this goes.
+    std::fs::remove_file(cell.path(CONFIG)).expect("the blank config");
+    let ran = socket_patch(&cell, &standin, &scan);
+    assert_eq!(ran.envelope["summary"]["applied"], 1, "{}", ran.dump);
+    let undo = socket_patch(&cell, &standin, &["rollback", "--yes"]);
+    assert_eq!(changed(&edited, &cell.tree()), [CONFIG], "{}", undo.dump);
+    assert!(!cell.tree().contains_key(CONFIG), "{}", undo.dump);
+}
+
+/// Without a Bazel: where no hub is seen to read the project's Cargo files
+/// the scan is the one of a project in no Bazel workspace: the same
+/// envelope, and the same three files, byte for byte. That holds for a
+/// workspace without a hub, for a hub that names the config, for one over
+/// the Cargo files of another directory, for a project beside the one a
+/// hub reads, for a `WORKSPACE` file that Bazel 9 never reads, and for the
+/// tag of another ruleset.
+#[test]
+fn a_project_that_no_hub_is_seen_to_read_is_pinned_as_in_no_bazel_workspace() {
+    let (upstream, standin, patch) = granted();
+    let scan = ["scan", "--mode", "hosted", "--yes"];
+    let written = [CONFIG, LOCK, MANIFEST];
+    let plain = checkout("", &upstream, &[]);
+    let before = plain.tree();
+    let unmarked = socket_patch(&plain, &standin, &scan);
+    let pinned = plain.pinned_by(&unmarked, PURL, &patch.uuid, &before, &written);
+
+    let named = module_naming_config();
+    let readme = named.replace(HUB_CONFIG, "");
+    let hub = readme.find("crate = use_extension(").expect("a hub");
+    let (no_hub, elsewhere) = (&readme[..hub], readme.replace("\"//:", "\"//third_party:"));
+    let rules_rs = "bazel_dep(name = \"rules_rs\", version = \"0.2.2\")\n\
+                    crate = use_extension(\"@rules_rs//rs:extensions.bzl\", \"crate\")\n\
+                    crate.from_cargo(\n    name = \"crates\",\n    cargo_lock = \"//:Cargo.lock\",\n    \
+                    cargo_toml = \"//:Cargo.toml\",\n)\nuse_repo(crate, \"crates\")\n";
+    let stale = "load(\"@rules_rust//crate_universe:defs.bzl\", \"crates_repository\")\n\
+                 crates_repository(\n    name = \"crates\",\n    cargo_lockfile = \
+                 \"//:Cargo.lock\",\n    manifests = [\"//:Cargo.toml\"],\n)\n";
+    let cases: [(&str, &[(&str, &str)]); 6] = [
+        ("", &[(MODULE, no_hub)]),
+        ("", &[(MODULE, &named)]),
+        ("", &[(MODULE, &elsewhere)]),
+        ("tool/", &[(MODULE, &readme)]),
+        ("", &[("WORKSPACE", stale), (".bazelversion", "9.3.2\n")]),
+        ("", &[(MODULE, rules_rs)]),
+    ];
+    for (project, files) in cases {
+        let cell = checkout(project, &upstream, files);
+        let before = cell.tree();
+        let below = ["--cwd", project.trim_end_matches('/')];
+        let command = [&scan[..], &below[..2 * usize::from(!project.is_empty())]].concat();
+        let ran = socket_patch(&cell, &standin, &command);
+        let said = format!("{project:?} {files:?}: {}", ran.dump);
+        assert_eq!(ran.code, 0, "{said}");
+        assert_eq!(ran.envelope, unmarked.envelope, "{said}");
+        let after = cell.tree();
+        let files = written.map(|file| format!("{project}{file}"));
+        assert_eq!(changed(&before, &after), files, "{said}");
+        for (file, written) in files.iter().zip(written) {
+            assert_eq!(after[file], pinned[written], "{file}: {said}");
+        }
+    }
+}
+
+/// Without a Bazel: a crate that vendored mode patched stays vendored when
+/// a hosted scan would take it over on the hub of the README: the scan
+/// names the hub, keeps every file of the vendored copy and its wiring,
+/// and the crate stays patched.
+#[test]
+fn a_vendored_crate_stays_vendored_on_a_hub_without_the_config() {
+    let (upstream, standin, patch) = granted();
+    let readme = module_naming_config().replace(HUB_CONFIG, "");
+    let cell = checkout("", &upstream, &[(MODULE, &readme)]);
+    let vendored = socket_patch(&cell, &standin, &["scan", "--mode", "vendored", "--yes"]);
+    assert_eq!(
+        vendored.envelope["summary"]["applied"], 1,
+        "{}",
+        vendored.dump
+    );
+    let kept = cell.tree();
+    assert!(kept.contains_key(&format!("{}/src/lib.rs", patch.vendored())));
+
+    let hosted = socket_patch(&cell, &standin, &["scan", "--mode", "hosted", "--yes"]);
+    let said = &hosted.dump;
+    assert_eq!(hosted.code, 0, "{said}");
+    assert!(
+        has_event(&hosted.envelope, "skipped", UNREAD, PURL),
+        "{said}"
+    );
+    let warned = codes_in(&hosted.envelope["warnings"]);
+    for code in [UNREAD, "redirect_takeover_kept_vendored"] {
+        assert!(
+            warned.iter().any(|warned| warned == code),
+            "no {code}: {said}"
+        );
+    }
+    assert_eq!(changed(&kept, &cell.tree()), NOTHING, "{said}");
+}
+
 /// Without a Bazel, what stays fixed now that no checksum is committed: the
 /// fixture's directories and the legs of its workflow are those of its
 /// table; the fixture's lock holds the two entries a test pins, the
@@ -1420,8 +1915,9 @@ fn the_vendored_crates_get_a_bazelignore_line_where_a_crate_hub_builds_them() {
 /// nothing else; two runs serve two upstream crate files and one of the
 /// dependency; the fixture depends on the crate under the names written
 /// out above, and commits no cargo config; every era's hub names the
-/// config a test writes and has no cargo-bazel lock; and crates.io can
-/// hold neither name.
+/// config a test writes, has no cargo-bazel lock, and is the hub of the
+/// rules_rust README but for that one line; and crates.io can hold neither
+/// name.
 #[test]
 fn a_test_pins_the_crates_of_the_fixture_lock() {
     FIXTURE.check();
@@ -1454,6 +1950,11 @@ fn a_test_pins_the_crates_of_the_fixture_lock() {
              cargo_lockfile = \"//:{LOCK}\",\n    manifests = [\"//:{MANIFEST}\"],\n)\n"
         );
         assert!(module.contains(&hub), "{era}: no\n{hub}in\n{module}");
+        // Without that one line it is the hub of the rules_rust README.
+        let readme = "crate.from_cargo(\n    name = \"crates\",\n    cargo_lockfile = \
+                      \"//:Cargo.lock\",\n    manifests = [\"//:Cargo.toml\"],\n)\n";
+        let without = module.replace(HUB_CONFIG, "");
+        assert!(without.contains(readme), "{era}: no\n{readme}in\n{without}");
     }
 
     for (name, manifest) in [(NAME, CRATE_MANIFEST), (DEP, DEP_MANIFEST)] {

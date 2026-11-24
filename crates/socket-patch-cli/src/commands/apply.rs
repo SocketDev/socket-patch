@@ -186,6 +186,9 @@ pub struct NestedApply {
     /// (`get`) checked only its own selection. `scan` already reported
     /// every protected installed package, so it passes `false`.
     pub report_user_patch_skips: bool,
+    /// The command the user ran (`scan`, `get`): what the nested run's
+    /// telemetry reports as its command.
+    pub command: &'static str,
 }
 
 impl ApplyArgs {
@@ -1812,6 +1815,12 @@ pub(crate) async fn run_locked(
 
     // Packages the project patched itself sit this run out (warned); every
     // other record still applies. The read-only `--check` verifies them all.
+    // Each record's patch, for telemetry: results name the package only.
+    let patch_uuids: HashMap<String, String> = manifest
+        .patches
+        .iter()
+        .map(|(purl, record)| (purl.clone(), record.uuid.clone()))
+        .collect();
     let mut manifest = manifest;
     let (user_patch_warnings, user_patch_skips) = if args.check {
         Default::default()
@@ -2357,12 +2366,23 @@ pub(crate) async fn run_locked(
             }
 
             // Track telemetry
+            let reported = reported_patches(&results, &caveats, args.common.dry_run, &patch_uuids);
             if success {
-                track_patch_applied(patched_count, args.common.dry_run, &telemetry()).await;
+                track_patch_applied(
+                    telemetry_command(&args),
+                    patched_count,
+                    args.common.dry_run,
+                    &reported,
+                    &telemetry(),
+                )
+                .await;
             } else {
                 track_patch_apply_failed(
+                    telemetry_command(&args),
+                    "apply_failed",
                     "One or more patches failed to apply",
                     args.common.dry_run,
+                    &reported,
                     &telemetry(),
                 )
                 .await;
@@ -2442,6 +2462,34 @@ pub(crate) async fn run_locked(
     }
 }
 
+/// The command an apply run's telemetry reports: `apply`, or the `scan` /
+/// `get` whose agent mode ran it.
+fn telemetry_command(args: &ApplyArgs) -> &'static str {
+    args.nested.map_or("apply", |nested| nested.command)
+}
+
+/// The patches an apply run acted on, as its telemetry names them: the
+/// run's per-package events ([`GemCaveats::event_of`], what `--json`
+/// prints), each under the patch its manifest record names.
+///
+/// A plain fn, so the events it builds stay off the async frame of `run`.
+fn reported_patches(
+    results: &[ApplyResult],
+    caveats: &GemCaveats,
+    dry_run: bool,
+    patch_uuids: &HashMap<String, String>,
+) -> Vec<socket_patch_core::telemetry::PatchOutcome> {
+    let events: Vec<PatchEvent> = results
+        .iter()
+        .map(|result| caveats.event_of(result, dry_run))
+        .collect();
+    crate::telemetry_outcomes::patch_outcomes(
+        &events,
+        socket_patch_core::telemetry::MODE_AGENT,
+        crate::telemetry_outcomes::uuid_lookup(patch_uuids),
+    )
+}
+
 /// The one apply-failure exit: `apply_failed` telemetry, then the error
 /// envelope (`--json`) or an `Error:` line that prints even under
 /// `--silent` ("errors only", never "nothing" — exit 1 with no message
@@ -2456,7 +2504,15 @@ async fn report_apply_failure(
     skipped: &[PatchEvent],
     telemetry: &TelemetryAuth,
 ) -> i32 {
-    track_patch_apply_failed(error, args.common.dry_run, telemetry).await;
+    track_patch_apply_failed(
+        telemetry_command(args),
+        &err.code,
+        error,
+        args.common.dry_run,
+        &[],
+        telemetry,
+    )
+    .await;
     if args.common.json {
         let mut env = Envelope::new(Command::Apply);
         env.dry_run = args.common.dry_run;

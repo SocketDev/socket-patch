@@ -26,6 +26,7 @@ const COMMAND_MODULES: &[&str] = &[
     "list",
     "remove",
     "repair",
+    "report",
     "rollback",
     "scan",
     "show",

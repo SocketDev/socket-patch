@@ -383,6 +383,257 @@ pub fn build_candidates(
     candidates
 }
 
+/// Skip reason and warning code of a patch whose ecosystem cannot be served
+/// through a patch-server mirror (`--patch-mirror-url`): nothing is written
+/// for it, so it stays as it is.
+pub const MIRROR_UNSUPPORTED: &str = "redirect_mirror_unsupported";
+
+/// Skip reason and warning code of a grant that cannot be moved onto the
+/// run's mirror: a URL without a served path, or a mirrored URL the grant
+/// gate refuses. Nothing is written for it.
+pub const MIRROR_URL_REFUSED: &str = "redirect_mirror_url_refused";
+
+/// Where each mirrored reference is served from: the URL the patch
+/// server's grant named, keyed by the mirrored URL the candidate now
+/// carries. The run's own downloads (a wheel's metadata, a tarball's
+/// `package.json`, a gem to refresh a stale install with) read the served
+/// URL: the grant token in it is all the authorization that takes, where
+/// the mirror may ask for credentials the run was never given.
+#[derive(Debug, Clone, Default)]
+pub struct MirrorSources {
+    /// The mirror's base URL (empty when the run has no mirror).
+    base: String,
+    /// Mirrored artifact URL -> served artifact URL.
+    served: BTreeMap<String, String>,
+    /// `(mirrored, served)` registry index URLs, without a trailing slash:
+    /// a URL below a mirrored index is served below its served twin.
+    registries: Vec<(String, String)>,
+}
+
+impl MirrorSources {
+    /// The URL to download `url` from: where the patch server serves it
+    /// when `url` is a mirrored artifact or lies under a mirrored registry
+    /// index, else itself.
+    pub fn fetch_url<'a>(&'a self, url: &'a str) -> std::borrow::Cow<'a, str> {
+        use std::borrow::Cow;
+        if let Some(served) = self.served.get(url) {
+            return Cow::Borrowed(served);
+        }
+        for (mirrored, served) in &self.registries {
+            if let Some(rest) = url.strip_prefix(mirrored.as_str()) {
+                if rest.is_empty() || rest.starts_with('/') {
+                    return Cow::Owned(format!("{served}{rest}"));
+                }
+            }
+        }
+        Cow::Borrowed(url)
+    }
+
+    /// [`Self::fetch_url`] for a candidate's own artifact URL, borrowed:
+    /// the served URL of a mirrored artifact, else the URL itself.
+    pub fn fetch_artifact_url<'a>(&'a self, artifact_url: &'a str) -> &'a str {
+        self.served
+            .get(artifact_url)
+            .map_or(artifact_url, String::as_str)
+    }
+
+    /// The base URL of the mirror these references were moved onto.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// The mirrored artifact URLs, in order.
+    pub fn mirrored_urls(&self) -> impl Iterator<Item = &str> {
+        self.served.keys().map(String::as_str)
+    }
+
+    /// The URLs the patch server serves the mirrored artifacts at.
+    pub fn served_urls(&self) -> impl Iterator<Item = &str> {
+        self.served.values().map(String::as_str)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.served.is_empty()
+    }
+}
+
+/// Why `ecosystem`'s hosted reference cannot move onto a mirror, if it
+/// cannot. A Cargo sparse index and a NuGet service index are documents the
+/// patch server renders with its own absolute download URLs in them
+/// (`config.json`'s `dl`, the service index's resource ids), so a client
+/// reading the index through the mirror is sent straight back to the patch
+/// server for the package.
+fn mirror_unsupported(ecosystem: &str) -> Option<&'static str> {
+    match ecosystem {
+        "cargo" => Some(
+            "a Cargo registry index names the patch server's own download URL, which a mirror \
+             cannot rewrite",
+        ),
+        "nuget" => Some(
+            "a NuGet service index names the patch server's own package URLs, which a mirror \
+             cannot rewrite",
+        ),
+        _ => None,
+    }
+}
+
+/// Move every candidate's hosted reference onto `mirror`
+/// (`--patch-mirror-url`): its artifact URL and its registry index URL,
+/// everything before the path swapped for the mirror's base. Run right
+/// after [`build_candidates`], so the takeover, the withholds and every
+/// rewriter see the URL the project's files will hold (a re-run finds its
+/// own earlier pin, not a foreign one).
+///
+/// * A Go candidate is left alone: its pin is the module path
+///   `patch.socket.dev/gopatch/<uuid>`, which names no host to fetch from
+///   (GOPROXY decides that).
+/// * A Cargo or NuGet candidate is skipped with [`MIRROR_UNSUPPORTED`]:
+///   see [`mirror_unsupported`]. A direct pin is not written in its place,
+///   because the operator configured a mirror to say installs must not
+///   reach the patch server.
+/// * A candidate whose mirrored URLs the grant gate refuses is skipped
+///   with [`MIRROR_URL_REFUSED`].
+///
+/// `patch_server_origins` must hold the mirror's base: it is how the grant
+/// gate takes a plain-`http` mirror, and how every reader recognizes the
+/// mirrored references afterwards.
+pub fn mirror_candidates(
+    candidates: Vec<Candidate>,
+    mirror: &crate::patch::redirect::mirror::PatchMirror,
+    patch_server_origins: &[String],
+    skipped: &mut Vec<SkippedPatch>,
+    warnings: &mut Vec<RewriteWarning>,
+) -> (Vec<Candidate>, MirrorSources) {
+    use crate::patch::redirect::grant;
+    let mut sources = MirrorSources {
+        base: mirror.base().to_string(),
+        ..MirrorSources::default()
+    };
+    let mut kept = Vec::with_capacity(candidates.len());
+    for mut candidate in candidates {
+        let dep = &mut candidate.dep;
+        if dep.ecosystem == "golang" {
+            kept.push(candidate);
+            continue;
+        }
+        let mut skip = |code: &str, why: String, purl: &str, uuid: &str| {
+            // Not "it stays unpatched": an earlier run may have pinned it
+            // on the patch server, which this run does not read here.
+            let detail = format!("{purl}: {why}; nothing was changed for it");
+            warnings.push(warning(code, detail.clone()));
+            skipped.push(SkippedPatch {
+                detail: Some(detail),
+                ..SkippedPatch::new(purl, uuid, code)
+            });
+        };
+        if let Some(why) = mirror_unsupported(&dep.ecosystem) {
+            skip(
+                MIRROR_UNSUPPORTED,
+                format!(
+                    "{why}, so it cannot be installed through the patch mirror; use \
+                     `--mode vendored` for it"
+                ),
+                &candidate.purl,
+                &dep.patch_uuid,
+            );
+            continue;
+        }
+        let served_artifact = dep.artifact_url.clone();
+        // `None`: an index URL that cannot move; `Some(None)`: no override.
+        let mirrored_index = match &dep.registry_override {
+            Some(ov) => mirror.rebase(&ov.index_url).map(Some),
+            None => Some(None),
+        };
+        let (Some(mirrored_artifact), Some(mirrored_index)) =
+            (mirror.rebase(&served_artifact), mirrored_index)
+        else {
+            skip(
+                MIRROR_URL_REFUSED,
+                "the patch server's reference for it has no path to serve through the patch \
+                 mirror"
+                    .to_string(),
+                &candidate.purl,
+                &dep.patch_uuid,
+            );
+            continue;
+        };
+        dep.artifact_url = mirrored_artifact;
+        let mut registry = None;
+        if let (Some(ov), Some(index_url)) = (dep.registry_override.as_mut(), mirrored_index) {
+            registry = Some((
+                index_url.trim_end_matches('/').to_string(),
+                ov.index_url.trim_end_matches('/').to_string(),
+            ));
+            ov.index_url = index_url;
+        }
+        if let Err(flaw) = grant::check(dep, patch_server_origins) {
+            let reason = match flaw {
+                grant::Flaw::Malformed(reason) | grant::Flaw::InsecureUrl(reason) => reason,
+            };
+            skip(
+                MIRROR_URL_REFUSED,
+                format!("its reference on the patch mirror was refused ({reason})"),
+                &candidate.purl,
+                &dep.patch_uuid,
+            );
+            continue;
+        }
+        sources
+            .served
+            .insert(dep.artifact_url.clone(), served_artifact);
+        sources.registries.extend(registry);
+        kept.push(candidate);
+    }
+    (kept, sources)
+}
+
+/// Skip reason and warning code of a patch the project already pins
+/// through a host this run was not given: nothing is changed for it.
+pub const PIN_ON_UNCONFIGURED_HOST: &str = "redirect_pin_on_unconfigured_host";
+
+/// Withhold every candidate whose patch one of `files` already pins through
+/// a host the run does not know as a patch server: a URL with the hosted
+/// shape for the candidate's patch uuid on an origin outside
+/// `accepted_origins` (and Socket's own). That is what a project wired
+/// through a patch mirror looks like to a run that was not given
+/// `--patch-mirror-url`, and rewriting it would move a working pin onto a
+/// host the project's builds may not be able to reach. The files stay as
+/// they are and the run says which host to configure.
+///
+/// `accepted_origins` must hold everything this run can itself write or
+/// supersede: the configured origins, the mirror, and the origins of this
+/// run's grants (a pin an earlier run of the same server wrote is its own).
+pub fn withhold_foreign_host_pins(
+    files: &BTreeMap<String, String>,
+    accepted_origins: &[String],
+    candidates: &mut Vec<Candidate>,
+    skipped: &mut Vec<SkippedPatch>,
+    warnings: &mut Vec<RewriteWarning>,
+) {
+    candidates.retain(|c| {
+        let uuid = c.dep.patch_uuid.as_str();
+        let Some((file, host)) = files.iter().find_map(|(path, text)| {
+            crate::vex::discover::foreign_hosted_host_in_text(text, uuid, accepted_origins)
+                .map(|host| (path.as_str(), host))
+        }) else {
+            return true;
+        };
+        let detail = format!(
+            "{}: {file} already pins patch {uuid} through {host}, which this run was not given \
+             as a patch mirror or patch server, so nothing was changed for it; if that host is \
+             your patch mirror set --patch-mirror-url (SOCKET_PATCH_MIRROR_URL) to its base \
+             URL, if it is another patch server pass --patch-server-url, and re-run",
+            c.purl
+        );
+        warnings.push(warning(PIN_ON_UNCONFIGURED_HOST, detail.clone()));
+        skipped.push(SkippedPatch {
+            detail: Some(detail),
+            ..SkippedPatch::new(&c.purl, uuid, PIN_ON_UNCONFIGURED_HOST)
+        });
+        false
+    });
+}
+
 /// Whether an npm candidate would rewrite a `bun.lockb` that is a symbolic
 /// link (atomic replacement cannot preserve a link; previews refuse too).
 pub fn bun_lockb_symlinked(view: &ProjectView<'_>, candidates: &[Candidate]) -> bool {
@@ -1198,11 +1449,28 @@ pub async fn read_candidate_files_in(
     // dependencies of their own: a member's direct `cfg-if = "1"` must be
     // pinned alongside the root's, or the redirected lock entry is
     // unsatisfiable. Keyed `<dir>/Cargo.toml` for the cargo rewriter.
-    if out.files.contains_key("Cargo.toml") && candidates.iter().any(|c| c.dep.ecosystem == "cargo")
-    {
+    let cargo = candidates.iter().any(|c| c.dep.ecosystem == "cargo");
+    if out.files.contains_key("Cargo.toml") && cargo {
         for rel in crate::utils::cargo_workspace::member_manifests_in(view).await {
             out.read(view, unreadable, &rel).await;
         }
+    }
+    // In a Bazel workspace on disk a rules_rust hub may run cargo over
+    // these files without the cargo config that defines the registry of a
+    // pin. What stands against a pin is read from the checkout here and
+    // rides a synthetic key to the cargo rewriter. A project in no Bazel
+    // workspace, or one that no such hub is seen to read, gets none, and
+    // its run is the one it was.
+    if let Some(root) = view.disk_root().filter(|_| cargo) {
+        use crate::bazel::cargo::{unread, KEY};
+        let member = |rel: &&String| crate::patch::redirect::is_cargo_member_manifest_key(rel);
+        let mut files = vec!["Cargo.lock".to_string(), "Cargo.toml".to_string()];
+        files.extend(out.files.keys().filter(member).cloned());
+        let config = crate::patch::redirect::cargo_config_key(&out.files);
+        let root = root.to_path_buf();
+        let read = crate::utils::fs::run_blocking(move || unread(&root, &files, config));
+        out.files
+            .extend(read.await.map(|why| (KEY.to_string(), why)));
     }
 
     // Go: the workspace in effect decides which version a replace must pin,
@@ -4448,6 +4716,315 @@ mod tests {
         }
     }
 
+    /// A candidate of `ecosystem` on Socket's patch server, shaped the way
+    /// the reference endpoint grants it, with the registry override its
+    /// ecosystem carries.
+    fn mirror_candidate(ecosystem: &str, name: &str, version: &str) -> Candidate {
+        use crate::patch::redirect::{RegistryOverride, RegistryOverrideIdentifiers};
+        const TOKEN: &str = "22222222-2222-4222-8222-222222222222";
+        let registry = |kind: &str, tail: &str| {
+            Some(RegistryOverride {
+                kind: kind.into(),
+                index_url: format!(
+                    "https://patch.socket.dev/patch-registry/{ecosystem}/{TOKEN}/{PATCH_UUID}/{tail}"
+                ),
+                identifiers: RegistryOverrideIdentifiers::default(),
+            })
+        };
+        let mut dep = grant_dep(
+            ecosystem,
+            format!(
+                "https://patch.socket.dev/patch/{ecosystem}/{name}/{version}/{TOKEN}/{PATCH_UUID}/artifact.bin"
+            ),
+        );
+        dep.name = name.into();
+        dep.version = version.into();
+        dep.token = TOKEN.into();
+        dep.registry_override = match ecosystem {
+            "gem" => registry("rubygems-compact-index", ""),
+            "maven" => registry("maven2", "maven2"),
+            "cargo" => registry("cargo-sparse", "index/"),
+            "nuget" => registry("nuget-v3", "index.json"),
+            "golang" => registry("goproxy", ""),
+            _ => None,
+        };
+        Candidate {
+            purl: format!("pkg:{ecosystem}/{name}@{version}"),
+            dep,
+        }
+    }
+
+    /// `--patch-mirror-url` moves every reference a client fetches by URL
+    /// onto the mirror (same path), leaves a Go module pin alone, and
+    /// withholds the two registries whose index names the patch server's
+    /// own host: nothing direct is written in their place.
+    #[test]
+    fn mirror_candidates_moves_url_references_and_withholds_what_a_mirror_cannot_carry() {
+        use crate::patch::redirect::mirror::PatchMirror;
+        let mirror = PatchMirror::parse("https://repo.example/artifactory/socket-patch").unwrap();
+        let origins = vec![mirror.base().to_string()];
+        let candidates = vec![
+            mirror_candidate("npm", "left-pad", "1.3.0"),
+            mirror_candidate("pypi", "urllib3", "1.26.18"),
+            mirror_candidate("composer", "acme/lib", "1.0.0"),
+            mirror_candidate("gem", "rack", "3.0.0"),
+            mirror_candidate("maven", "org.acme/lib", "1.0.0"),
+            mirror_candidate("golang", "github.com/acme/lib", "v1.0.0"),
+            mirror_candidate("cargo", "serde", "1.0.0"),
+            mirror_candidate("nuget", "Newtonsoft.Json", "13.0.3"),
+        ];
+        let served: Vec<DepOverride> = candidates.iter().map(|c| c.dep.clone()).collect();
+        let (mut skipped, mut warnings) = (Vec::new(), Vec::new());
+        let (kept, sources) =
+            mirror_candidates(candidates, &mirror, &origins, &mut skipped, &mut warnings);
+
+        let ecosystems: Vec<&str> = kept.iter().map(|c| c.dep.ecosystem.as_str()).collect();
+        assert_eq!(
+            ecosystems,
+            ["npm", "pypi", "composer", "gem", "maven", "golang"]
+        );
+        for (candidate, before) in kept.iter().zip(&served) {
+            let dep = &candidate.dep;
+            if dep.ecosystem == "golang" {
+                assert_eq!(dep.artifact_url, before.artifact_url);
+                assert_eq!(
+                    dep.registry_override.as_ref().unwrap().index_url,
+                    before.registry_override.as_ref().unwrap().index_url
+                );
+                assert_eq!(
+                    sources.fetch_url(&dep.artifact_url),
+                    dep.artifact_url.as_str()
+                );
+                continue;
+            }
+            // Same path, the mirror's base in front of it.
+            let path = before
+                .artifact_url
+                .strip_prefix("https://patch.socket.dev")
+                .unwrap();
+            assert_eq!(
+                dep.artifact_url,
+                format!("https://repo.example/artifactory/socket-patch{path}")
+            );
+            // The run's own downloads still read the patch server.
+            assert_eq!(
+                sources.fetch_url(&dep.artifact_url),
+                before.artifact_url.as_str()
+            );
+            if let (Some(ov), Some(before_ov)) = (&dep.registry_override, &before.registry_override)
+            {
+                let path = before_ov
+                    .index_url
+                    .strip_prefix("https://patch.socket.dev")
+                    .unwrap();
+                assert_eq!(
+                    ov.index_url,
+                    format!("https://repo.example/artifactory/socket-patch{path}")
+                );
+                // A file under the mirrored index is downloaded from under
+                // the served one.
+                let under = format!("{}/gems/x.gem", ov.index_url.trim_end_matches('/'));
+                assert_eq!(
+                    sources.fetch_url(&under),
+                    format!("{}/gems/x.gem", before_ov.index_url.trim_end_matches('/'))
+                );
+            }
+            // The mirrored reference names the same patch and token.
+            assert_eq!(
+                crate::origin::hosted_patch_uuid(&dep.artifact_url, &origins).as_deref(),
+                Some(PATCH_UUID)
+            );
+            assert_eq!(dep.token, before.token);
+        }
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|s| (s.purl.as_str(), s.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("pkg:cargo/serde@1.0.0", MIRROR_UNSUPPORTED),
+                ("pkg:nuget/Newtonsoft.Json@13.0.3", MIRROR_UNSUPPORTED),
+            ]
+        );
+        assert_eq!(warnings.len(), 2);
+        for w in &warnings {
+            assert_eq!(w.code, MIRROR_UNSUPPORTED);
+            assert!(w.detail.contains("--mode vendored"), "{}", w.detail);
+            assert!(
+                !w.detail.contains("22222222-2222-4222-8222-222222222222"),
+                "a skip detail never carries the grant token: {}",
+                w.detail
+            );
+        }
+    }
+
+    /// A plain-`http` mirror is taken because the operator named it (its
+    /// base is one of the run's origins); a grant that has no path to
+    /// serve is withheld instead of being pinned at the mirror's root.
+    #[test]
+    fn mirror_candidates_takes_an_http_mirror_and_refuses_a_pathless_grant() {
+        use crate::patch::redirect::mirror::PatchMirror;
+        let mirror = PatchMirror::parse("http://artifactory.corp:8081/artifactory/sp").unwrap();
+        let origins = vec![mirror.base().to_string()];
+        let mut pathless = mirror_candidate("npm", "left-pad", "1.3.0");
+        pathless.dep.artifact_url = "https://patch.socket.dev".into();
+        let (mut skipped, mut warnings) = (Vec::new(), Vec::new());
+        let (kept, sources) = mirror_candidates(
+            vec![mirror_candidate("npm", "left-pad", "1.3.0"), pathless],
+            &mirror,
+            &origins,
+            &mut skipped,
+            &mut warnings,
+        );
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0]
+            .dep
+            .artifact_url
+            .starts_with("http://artifactory.corp:8081/artifactory/sp/patch/npm/left-pad/"));
+        assert_eq!(sources.mirrored_urls().count(), 1);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].reason, MIRROR_URL_REFUSED);
+
+        // Without the mirror among the origins the grant gate refuses the
+        // plain-http URL, so the caller's allowlist is load-bearing.
+        let (mut skipped, mut warnings) = (Vec::new(), Vec::new());
+        let (kept, _) = mirror_candidates(
+            vec![mirror_candidate("npm", "left-pad", "1.3.0")],
+            &mirror,
+            &[],
+            &mut skipped,
+            &mut warnings,
+        );
+        assert!(kept.is_empty());
+        assert_eq!(skipped[0].reason, MIRROR_URL_REFUSED);
+    }
+
+    /// A patch the project's files already pin through a host the run was
+    /// not given is withheld; one pinned on an accepted origin, or not
+    /// pinned at all, is not.
+    #[test]
+    fn a_pin_on_an_unconfigured_host_is_withheld_and_named() {
+        let candidate = mirror_candidate("npm", "left-pad", "1.3.0");
+        let path = candidate
+            .dep
+            .artifact_url
+            .strip_prefix("https://patch.socket.dev")
+            .unwrap()
+            .to_string();
+        let lock_at = |base: &str| {
+            BTreeMap::from([(
+                "package-lock.json".to_string(),
+                format!(r#"{{"resolved": "{base}{path}", "integrity": "sha512-x"}}"#),
+            )])
+        };
+        let run = |files: &BTreeMap<String, String>, accepted: &[String]| {
+            let mut candidates = vec![candidate.clone()];
+            let (mut skipped, mut warnings) = (Vec::new(), Vec::new());
+            withhold_foreign_host_pins(
+                files,
+                accepted,
+                &mut candidates,
+                &mut skipped,
+                &mut warnings,
+            );
+            (candidates.len(), skipped, warnings)
+        };
+        let mirror = "https://repo.example/artifactory/socket-patch";
+
+        // The mirror was not given: withheld, the host and the setting named.
+        let (kept, skipped, warnings) = run(&lock_at(mirror), &[]);
+        assert_eq!(kept, 0);
+        assert_eq!(skipped[0].reason, PIN_ON_UNCONFIGURED_HOST);
+        assert!(
+            warnings[0].detail.contains("repo.example")
+                && warnings[0].detail.contains("--patch-mirror-url")
+                && warnings[0].detail.contains("package-lock.json"),
+            "{}",
+            warnings[0].detail
+        );
+        // The mirror was given: the run's own pin.
+        assert_eq!(run(&lock_at(mirror), &[mirror.to_string()]).0, 1);
+        // Pinned on Socket's own server, or still on the registry.
+        assert_eq!(run(&lock_at("https://patch.socket.dev"), &[]).0, 1);
+        let registry = BTreeMap::from([(
+            "package-lock.json".to_string(),
+            r#"{"resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"}"#
+                .to_string(),
+        )]);
+        assert_eq!(run(&registry, &[]).0, 1);
+        // A lock that spells the url inside a specifier, as bun and yarn
+        // berry key a tarball dependency (`name@https://…`).
+        let specifier = BTreeMap::from([(
+            "yarn.lock".to_string(),
+            format!("\"left-pad@{mirror}{path}\":\n  resolution: \"left-pad@{mirror}{path}\"\n"),
+        )]);
+        let (kept, skipped, _) = run(&specifier, &[]);
+        assert_eq!(kept, 0);
+        assert_eq!(skipped[0].reason, PIN_ON_UNCONFIGURED_HOST);
+        assert_eq!(run(&specifier, &[mirror.to_string()]).0, 1);
+        // The same text read for where it pins the patch: the mirror when
+        // the mirror is a known origin, nothing when it is not, and the
+        // patch server for a direct pin.
+        let pinned_on = |files: &BTreeMap<String, String>, origins: &[String]| {
+            files.values().find_map(|text| {
+                crate::vex::discover::hosted_host_in_text(text, PATCH_UUID, origins)
+            })
+        };
+        assert_eq!(
+            pinned_on(&specifier, &[mirror.to_string()]).as_deref(),
+            Some("repo.example")
+        );
+        assert_eq!(pinned_on(&specifier, &[]), None);
+        assert_eq!(
+            pinned_on(&lock_at("https://patch.socket.dev"), &[]).as_deref(),
+            Some("patch.socket.dev")
+        );
+        // An older composer.lock escapes every slash. Pinned on Socket's
+        // own server it is the run's own pin, not one on a host called
+        // `https`; pinned on a mirror the run was not given, it is withheld
+        // and the mirror's host is named.
+        let escaped = |base: &str| {
+            let url = format!("{base}{path}").replace('/', "\\/");
+            BTreeMap::from([(
+                "composer.lock".to_string(),
+                format!(r#"{{"dist": {{"url": "{url}"}}}}"#),
+            )])
+        };
+        assert!(escaped(mirror)["composer.lock"].contains(r"https:\/\/repo.example\/"));
+        assert_eq!(run(&escaped("https://patch.socket.dev"), &[]).0, 1);
+        assert_eq!(run(&escaped(mirror), &[mirror.to_string()]).0, 1);
+        let (kept, _, warnings) = run(&escaped(mirror), &[]);
+        assert_eq!(kept, 0);
+        assert!(
+            warnings[0].detail.contains("repo.example"),
+            "{}",
+            warnings[0].detail
+        );
+        assert_eq!(
+            pinned_on(&escaped(mirror), &[mirror.to_string()]).as_deref(),
+            Some("repo.example")
+        );
+        // Another repository of the mirror's host is not the mirror, once
+        // the mirror is listed as one (`mirror_entry`, as the CLI lists it).
+        let sibling = "https://repo.example/artifactory/team-local";
+        let listed = [crate::origin::mirror_entry(mirror)];
+        assert_eq!(run(&lock_at(mirror), &listed).0, 1);
+        assert_eq!(run(&lock_at(sibling), &listed).0, 0);
+        assert_eq!(pinned_on(&lock_at(sibling), &listed), None);
+        assert_eq!(
+            pinned_on(&lock_at(mirror), &listed).as_deref(),
+            Some("repo.example")
+        );
+        // Another patch's uuid on that host says nothing about this one.
+        let other = lock_at(mirror).into_iter().map(|(k, v)| {
+            (
+                k,
+                v.replace(PATCH_UUID, "99999999-9999-4999-8999-999999999999"),
+            )
+        });
+        assert_eq!(run(&other.collect(), &[]).0, 1);
+    }
+
     /// The hosted skip details reach `--json`: neither the grant token nor
     /// any userinfo survives, however reqwest re-renders the URL (a
     /// trailing `/`, a different quoting) and under whatever root the
@@ -6184,6 +6761,83 @@ snapshots:
             );
             assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
         }
+    }
+
+    /// In a Bazel workspace on disk the read of a run with a cargo
+    /// candidate hands the rewriter what stands against a pin: the hub
+    /// that reads the project's manifests, a member's among them, and not
+    /// the config the rewriter writes, which is the legacy file where the
+    /// project has one. Nothing is handed over in no Bazel workspace, for a
+    /// hub that names that config, or to a run without a cargo candidate.
+    #[tokio::test]
+    async fn a_bazel_hub_without_the_cargo_config_rides_to_the_cargo_rewriter() {
+        use crate::bazel::cargo::KEY;
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |rel: &str, text: &str| {
+            let path = tmp.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let hub = |attributes: &str| {
+            format!(
+                "bazel_dep(name = \"rules_rust\", version = \"0.75.0\")\ncrate = use_extension(\
+                 \"@rules_rust//crate_universe:extensions.bzl\", \"crate\")\n\
+                 crate.from_cargo({attributes})\n"
+            )
+        };
+        write("Cargo.toml", "[workspace]\nmembers = [\"member\"]\n");
+        write(
+            "member/Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n",
+        );
+        let cargo = Candidate {
+            purl: "pkg:cargo/serde@1.0.190".into(),
+            dep: grant_dep("cargo", "https://patch.test/serde-1.0.190.crate".into()),
+        };
+        let view = ProjectView::Disk(tmp.path());
+        let handed = |candidate: &Candidate| {
+            let candidates = [candidate.clone()];
+            async move {
+                let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+                read.files.get(KEY).cloned()
+            }
+        };
+        assert_eq!(handed(&cargo).await, None, "no Bazel workspace");
+
+        write(
+            "MODULE.bazel",
+            &hub("manifests = [\"//member:Cargo.toml\"]"),
+        );
+        let why = handed(&cargo).await.expect("the hub reads a member");
+        assert!(
+            why.starts_with("the rules_rust hub at MODULE.bazel:3 reads"),
+            "{why}"
+        );
+        assert!(why.contains("without .cargo/config.toml, where"), "{why}");
+
+        let root = "manifests = [\"//:Cargo.toml\"]";
+        write("MODULE.bazel", &hub(root));
+        assert!(handed(&cargo).await.is_some(), "the hub reads the root");
+        let lock = "cargo_lockfile = \"//:Cargo.lock\", manifests = [\"//x:Cargo.toml\"]";
+        write("MODULE.bazel", &hub(lock));
+        assert!(handed(&cargo).await.is_some(), "the hub reads the lock");
+        write("MODULE.bazel", &hub(root));
+        assert_eq!(
+            handed(&left_pad_candidate()).await,
+            None,
+            "no cargo candidate"
+        );
+        let named = format!("{root}, cargo_config = \"//:.cargo/config.toml\"");
+        write("MODULE.bazel", &hub(&named));
+        assert_eq!(handed(&cargo).await, None, "the hub names the config");
+        write(".cargo/config", "");
+        let why = handed(&cargo)
+            .await
+            .expect("the rewriter writes the legacy file");
+        assert!(
+            why.contains("is not the label of .cargo/config as one string"),
+            "{why}"
+        );
     }
 
     fn gem_candidate() -> Candidate {

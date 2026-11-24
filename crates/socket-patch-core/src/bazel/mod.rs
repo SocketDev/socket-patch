@@ -9,6 +9,7 @@ pub const WORKSPACE_FILES: [&str; 4] =
     ["MODULE.bazel", "REPO.bazel", "WORKSPACE", "WORKSPACE.bazel"];
 
 pub mod built;
+pub mod cargo;
 pub(crate) mod cargo_bazel;
 pub mod ignore;
 pub mod maven;

@@ -268,8 +268,13 @@ async fn run_removes_matching_patch_and_exits_zero() {
             manifest_path: "manifest.json".to_string(),
             yes: true,
             json: true,
-            // Keep the test fully offline: no telemetry network call.
-            offline: true,
+            // No telemetry network call. Not `offline: true`: `run()`
+            // mirrors its flags into the process environment, and a
+            // `SOCKET_OFFLINE` set there is read by the parse tests of this
+            // binary that run beside it (they expect the forced
+            // `SOCKET_TELEMETRY_DISABLED`, see `opt_out_defaults`). Nothing
+            // in this run reaches the network: the package is not installed,
+            // so no blob is fetched.
             no_telemetry: true,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
