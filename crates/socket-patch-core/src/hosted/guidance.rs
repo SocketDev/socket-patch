@@ -500,6 +500,17 @@ pub fn pnpm_registry_blocked_note(why: &[String]) -> String {
     )
 }
 
+/// [`pnpm_registry_blocked_note`] for a project that an earlier run routed
+/// and that this run leaves routed as it was: nothing relies on
+/// `trustLockfile` there.
+pub fn pnpm_registry_kept_note(why: &[String]) -> String {
+    format!(
+        "Per-package registry verification would not be set up for this project now, \
+         because {}; what an earlier run set up was left as it is",
+        why.join(", and ")
+    )
+}
+
 /// How many packages a warning names before it counts the rest.
 const NAMED_PACKAGES: usize = 5;
 

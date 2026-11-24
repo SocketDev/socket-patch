@@ -3851,6 +3851,7 @@ fn pnpm_trust(
         blocked,
         pin_hint,
         unrouted,
+        kept,
         ..
     } = route;
     // What a routed project is told of a release the route may reach.
@@ -3896,6 +3897,21 @@ fn pnpm_trust(
             out.config_write = Some((text, edits));
             pnpm_registry_configured_detail(&server, write, registry.trust, options.dry_run)
         }
+    } else if kept {
+        // The route of an earlier run, left as it is for a Bazel hub: it
+        // is what verifies the hosted entries, so the file is not written.
+        let (workspace, _) = root_workspace.unwrap_or_else(|| read_workspace(view));
+        let leftover = match workspace {
+            Ok(Some(text))
+                if matches!(plan_workspace_trust(Some(&text)), TrustPlan::AlreadyTrue) =>
+            {
+                TrustLeftover::Left
+            }
+            _ => TrustLeftover::None,
+        };
+        out.named_registries = true;
+        out.rerun_only = spliced_pnpm_locks == 0;
+        pnpm_registry_already_detail(&server, leftover)
     } else if !governing_lock_v9 || !options.trust_lockfile_config {
         pnpm_trust_manual_guidance(&server)
     } else if let Some(root_file) = member_root {
@@ -4058,7 +4074,10 @@ fn pnpm_trust(
     // What a project that qualifies for the registry route is told about
     // staying on trust.
     let notes: Vec<String> = [
-        (!blocked.is_empty()).then(|| pnpm_registry_blocked_note(&blocked)),
+        (!blocked.is_empty()).then(|| match kept {
+            true => crate::hosted::guidance::pnpm_registry_kept_note(&blocked),
+            false => pnpm_registry_blocked_note(&blocked),
+        }),
         unrouted.as_ref().map(|outcome| {
             pnpm_registry_unrouted_note(
                 outcome.as_ref().map(|_| ()).map_err(String::as_str),
@@ -4311,6 +4330,57 @@ struct PnpmRoute {
     /// That tidying left a workspace file a run created with nothing but
     /// its `packages` list ([`Rewritten::pnpm_workspace_emptied`]).
     emptied: bool,
+    /// A Bazel hub keeps the root lock out of the run, so the route of an
+    /// earlier run is left as it is (`unrouted` says so), and it is all
+    /// the governing locks hold: every hosted tarball in them is under a
+    /// key of its registry, which pnpm verifies it through. The workspace
+    /// file then needs nothing from this run and is left byte for byte,
+    /// without a `trustLockfile` that would switch the verification off
+    /// for every entry of a project still on per-package registries.
+    ///
+    /// Not so where the route stays because a lock could not be converted
+    /// back: that project no longer qualifies for the route (a pnpm that
+    /// does not read it, say), and the trust key is what it falls back on.
+    kept: bool,
+}
+
+/// Whether a governing lock (`texts`, by key, as the run leaves them)
+/// records a Socket-hosted tarball under a plain key: a pin that pnpm takes
+/// only with `trustLockfile`. One under a key that names a registry of
+/// ours (`leaf@socket-58f14d5a:1.0.0`) is verified through that registry.
+/// Read with the tolerant lock reader, so that a lock the route's edits
+/// cannot read still answers.
+fn holds_trust_pin(
+    texts: &[(&str, &String)],
+    overrides: &[DepOverride],
+    owned: &crate::formats::pnpm::named_registries::Owned,
+) -> bool {
+    use crate::formats::pnpm::PnpmLock;
+
+    let hosted = |tarball: &str| {
+        overrides
+            .iter()
+            .any(|o| o.ecosystem == "npm" && o.artifact_url == tarball)
+            || crate::origin::hosted_shape_uuid(tarball).is_some()
+    };
+    // The registry a key spells its version through, as
+    // [`OverrideLock::aliased`](crate::formats::pnpm::registry_alias::OverrideLock::aliased)
+    // reads it.
+    let routed = |key: &str| {
+        let version = key
+            .get(1..)
+            .and_then(|rest| rest.find('@'))
+            .map(|at| at + 2);
+        version
+            .and_then(|at| key[at..].split_once(':'))
+            .is_some_and(|(registry, _)| owned.alias(registry))
+    };
+    texts.iter().any(|(_, text)| {
+        PnpmLock::parse(text).packages().iter().any(|package| {
+            let tarball = package.resolution.as_ref().and_then(|r| r.tarball());
+            tarball.is_some_and(hosted) && !routed(package.key)
+        })
+    })
 }
 
 /// The registry route's pnpm-workspace.yaml edit.
@@ -4568,6 +4638,18 @@ fn pnpm_route(
                         REDIRECT_PNPM_REGISTRY_HELD,
                         pnpm_registry_held_detail(&held, !options.trust_lockfile_config),
                     ));
+                }
+                // Left as it is for a Bazel hub, and nothing else to
+                // serve: no trust key.
+                if root_withheld && matches!(route.unrouted, Some(Err(_))) {
+                    let left: Vec<(&str, &String)> = governing
+                        .iter()
+                        .filter_map(|key| {
+                            let text = rewrite.files.get(*key).or_else(|| files.get(*key))?;
+                            Some((*key, text))
+                        })
+                        .collect();
+                    route.kept = !holds_trust_pin(&left, overrides, &owned);
                 }
             }
         }
@@ -13950,32 +14032,58 @@ snapshots:
         );
 
         // The hub, in the project the first run routed: every lock and the
-        // overrides of the workspace file stay as that run wrote them.
+        // workspace file stay as that run wrote them, byte for byte. The
+        // registries still verify the routed releases, so no
+        // `trustLockfile` is added, which would switch that off.
         commit(tmp.path(), &routed);
-        let ws_routed = routed.rewrite.files[PNPM_WORKSPACE_REL].clone();
         for granted in [&candidates[..], &[]] {
             let origins = vec!["https://patch.example".to_string()];
             let done = pnpm_rewrite_from(&view, granted, true, false, &no_env, origins).await;
-            let locks: Vec<&String> = done
-                .rewrite
-                .files
-                .keys()
-                .filter(|key| key.ends_with("pnpm-lock.yaml"))
-                .collect();
-            assert!(locks.is_empty(), "{} granted: {locks:?}", granted.len());
-            if let Some(text) = workspace_of(&done) {
-                assert!(
-                    text.starts_with(ws_routed.as_str()),
-                    "{} granted: {text}",
-                    granted.len()
-                );
-            }
+            assert!(
+                done.rewrite.files.is_empty() && done.rewrite.edits.is_empty(),
+                "{} granted: {:?}",
+                granted.len(),
+                done.rewrite.files.keys()
+            );
         }
         let done = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        assert!(done.pnpm_named_registries && done.pnpm_rerun_only);
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.confirmed);
         let detail = pnpm_trust_detail(&done);
         assert!(
-            detail.contains("could not be converted back (the root pnpm lock"),
+            detail.contains(
+                "Per-package registry verification would not be set up for this project now, \
+                 because a Bazel hub reads the pnpm lock (MODULE.bazel:3)"
+            ) && detail.contains("what an earlier run set up was left as it is")
+                && detail.contains("could not be converted back (the root pnpm lock"),
             "{detail}"
+        );
+        assert!(!detail.contains("rely on `trustLockfile`"), "{detail}");
+
+        // A new pin beside the routed one is in the plain shape, which pnpm
+        // takes only with `trustLockfile`: that run writes the key, after
+        // the route's entries, and leaves the routed release routed.
+        write_rel(
+            tmp.path(),
+            "packages/b/package.json",
+            r#"{"name":"b","dependencies":{"left-pad":"1.3.0"}}"#,
+        );
+        write_rel(tmp.path(), MEMBER_KEYS[1], LEFT_PAD_V9_LOCK);
+        let mut both = candidates.clone();
+        both.push(left_pad_registry_candidate());
+        let origins = vec!["https://patch.example".to_string()];
+        let done = pnpm_rewrite_from(&view, &both, true, false, &no_env, origins).await;
+        let routed_ws = &routed.rewrite.files[PNPM_WORKSPACE_REL];
+        assert_eq!(
+            workspace_of(&done),
+            Some(format!("{routed_ws}trustLockfile: true\n").as_str())
+        );
+        assert_eq!(
+            done.rewrite.files.keys().collect::<Vec<_>>(),
+            [MEMBER_KEYS[1], PNPM_WORKSPACE_REL]
+        );
+        assert!(
+            done.rewrite.files[MEMBER_KEYS[1]].contains(&format!("tarball: {}", left_pad_url()))
         );
     }
 
