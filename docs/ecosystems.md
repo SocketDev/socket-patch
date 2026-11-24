@@ -2257,18 +2257,23 @@ Known problems. In each of these a command exits 0 today and the next Bazel buil
   rule runs in another directory fails the build with `Source path ... is not found`. Run
   `socket-patch vendor --revert`, then `socket-patch scan --mode hosted`. A test of this
   repository builds that failure on the three Bazel releases.
-- **Hosted Cargo on a hub without `cargo_config`**, which is the hub as the rules_rust README
-  shows it: the hub's cargo does not see the patch registry that `.cargo/config.toml` defines
-  (`registry index was not found in any configuration`). Add
-  `cargo_config = "//:.cargo/config.toml"` to the `crate.from_cargo` call and commit that
-  file, or use vendored mode, or run `socket-patch rollback`.
+- **A hosted Cargo pin that is already in the files, on a hub without `cargo_config`**, which
+  is the hub as the rules_rust README shows it: the hub's cargo does not see the patch
+  registry that `.cargo/config.toml` defines
+  (`registry index was not found in any configuration`). Hosted mode writes no such pin any
+  more (see the next list), and it leaves one that is there as it is and reports it applied.
+  Add `cargo_config = "//:.cargo/config.toml"` to the `crate.from_cargo` call and commit that
+  file, or run `socket-patch rollback`.
 - **Cargo on a hub with a cargo-bazel lock** (`lockfile`), in hosted and vendored mode: the
   build stops at ``The current `lockfile` is out of date`` until the repin that message names
   (`CARGO_BAZEL_REPIN=true bazel build ...`). After it the build is the patched one; in
   hosted mode the hub needs `cargo_config` as well.
-- **Hosted NuGet on a tag without `nuget_config`**: Bazel asks nuget.org alone and the
-  package fails the lock (`does not match its contentHash in packages.lock.json`). Give the
-  tag `nuget_config = "//:nuget.config"` and commit that file, which is the shape the table
+- **A hosted NuGet pin that is already in the files, under a tag without `nuget_config`**:
+  Bazel asks nuget.org alone and the package fails the lock
+  (`does not match its contentHash in packages.lock.json`). Hosted mode writes no such pin
+  any more (see the next list), and it leaves one that is there as it is and warns
+  (`redirect_bazel_nuget_config_undeclared`). Give the tag
+  `nuget_config = "//:nuget.config"` and commit that file, which is the shape the table
   lists; or run `socket-patch rollback`, which restores the lock and leaves the
   `nuget.config` it created behind.
 - **`rollback` of a hosted gem whose `gem_checksums` entry you changed** to the sha256 of
@@ -2303,6 +2308,16 @@ Known problems. In each of these a command exits 0 today and the next Bazel buil
 
 In these a command exits 0 and the Bazel build passes on the unpatched package:
 
+- **Hosted Cargo on a hub without `cargo_config`.** The hub's cargo would not see the patch
+  registry, so hosted mode writes nothing for the crate and warns
+  (`redirect_cargo_bazel_config_unread`). Commit `.cargo/config.toml`, add
+  `cargo_config = "//:.cargo/config.toml"` to the `crate.from_cargo` call and run the command
+  again, or use vendored mode: see [Bazel workspaces: Cargo](#bazel-workspaces-cargo).
+- **Hosted NuGet on a tag without `nuget_config`.** Bazel would ask nuget.org alone, so
+  hosted mode writes nothing for the package and warns
+  (`redirect_bazel_nuget_config_undeclared`). Give the tag
+  `nuget_config = "//:nuget.config"` and run the command again: see
+  [Bazel workspaces: NuGet](#bazel-workspaces-nuget).
 - **Hosted NuGet on a machine without a restore.** `scan` reads no package out of
   `packages.lock.json`, so where only Bazel ever ran it finds none and writes nothing. Run it
   where `dotnet restore` has run.
@@ -2318,10 +2333,14 @@ In these a command exits 0 and the Bazel build passes on the unpatched package:
 
 And three that concern neither:
 
-- **Vendored Cargo under rules_rust 0.75.0**: a build writes a `BUILD.bazel` into the
-  committed copy, and right after it `vendor --check` exits 1 (`vendor_inventory_mismatch`)
-  and `vex` writes no document, although the build is the patched one. A second
-  `scan --mode vendored` puts the copy right.
+- **Vendored Cargo under rules_rust 0.75.0, with the `.bazelignore` line of the copies
+  commented out**: a build writes a `BUILD.bazel` into the committed copy, and right after it
+  `vendor --check` exits 1 (`vendor_inventory_mismatch`) and `vex` leaves the patch out,
+  although the build is the patched one. A second `scan --mode vendored` puts the copy right.
+  Under the line, which the scan writes, that file is no change of the copy: the check passes
+  and `vex` attests the crate. See
+  [Bazel workspaces: the build file in a vendored crate](#bazel-workspaces-the-build-file-in-a-vendored-crate)
+  for the other cases without the line.
 - **`vex` for a hosted NuGet patch**, on a machine whose NuGet folder still holds the
   unpatched package, as the one that ran the scan does: it writes no document and exits 1
   (`not_applied`), although the Bazel build is the patched one. Where that folder holds
