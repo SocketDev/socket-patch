@@ -1,5 +1,5 @@
-//! Hosted mode for a NuGet package that comes through rules_csharp's
-//! `nuget.from_lock(packages_lock_json = "//:packages.lock.json",
+//! Hosted and agent mode for a NuGet package that comes through
+//! rules_csharp's `nuget.from_lock(packages_lock_json = "//:packages.lock.json",
 //! nuget_config = "//:nuget.config")` under Bzlmod: the lock that
 //! `dotnet restore` writes beside a project, and a `nuget.config` whose one
 //! package source is nuget.org.
@@ -21,8 +21,8 @@
 //! ([`Package::restore_into`]); on the other it holds nothing, as on a
 //! runner that only ever ran Bazel.
 //!
-//! One flow, on the Bazel the run is given ([`FIXTURE`] says which ruleset
-//! goes with its release), in a fresh output base:
+//! The hosted flow, on the Bazel the run is given ([`FIXTURE`] says which
+//! ruleset goes with its release), in a fresh output base:
 //!
 //! - (a) `bazel build` and `bazel run //:consumer` print the unpatched
 //!   marker, and Bazel fetched the upstream package from the stand-in.
@@ -69,6 +69,13 @@
 //!   `packages.lock.json`. With a Bazel lock that pins the granted package,
 //!   Bazel's downloader refuses the file over its sha256, and then the copy
 //!   on nuget.org, which the hub tries next.
+//!
+//! Another flow is agent mode ([`agent_from_lock`]), which patches the
+//! copy of the package in NuGet's global packages folder, where the user's
+//! `dotnet restore` unpacked it. No build of Bazel's reads that folder, so
+//! the build is the unpatched one before the command and after it. The flow
+//! asserts that, and what every form of `vex` says of the package meanwhile
+//! (see "Known gaps").
 //!
 //! Both markers are read from what Bazel built, and each holds an id made
 //! for the run. Bazel's downloader keeps every file it fetches in the
@@ -130,7 +137,7 @@
 //!
 //! # Known gaps
 //!
-//! Three outcomes the flow asserts are gaps of the product, not its
+//! Four outcomes the flows assert are gaps of the product, not its
 //! contract. Each is asserted as the release has it, and marked
 //! `KNOWN GAP` there with what a fix would change in this test:
 //!
@@ -142,6 +149,11 @@
 //!   while Bazel builds the patched package (c).
 //! - Bazel prints the access token of the grant, in a warning for each
 //!   package of the lock that the Socket source does not hold (c).
+//! - After agent mode, `scan --mode agent --vex`, `apply --vex`, `vex` and
+//!   `vex --no-verify` each write a document that says the package is not
+//!   affected, through the patch, while Bazel builds the unpatched package:
+//!   `vex` reads the copy in NuGet's folder and not what the hub builds
+//!   from (the agent flow).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -154,8 +166,8 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
 use crate::envelope::{codes_in, event_triples};
 use crate::harness::{
-    cell_without_bazel, changed, fixture_path, rewrite, Cell, Fixture, Ran, StandIn, Tree,
-    CONSUMER, NOTHING,
+    cell_without_bazel, changed, fixture_path, rewrite, Cell, Claim, Fixture, How, Ran, StandIn,
+    Tree, CONSUMER, NOTHING,
 };
 use crate::hosted_memory_common::{read_tree, Patch, ORG};
 
@@ -440,6 +452,44 @@ fn registry(packages: &[&Package]) -> StandIn {
 /// patch's own package, whatever is served. The source holds no other
 /// package: a route nobody serves is a 404.
 fn grant(standin: &StandIn, upstream: &Package, patch: &Patched, served: &[u8]) {
+    grant_recorded(standin, patch, served, &record(upstream, patch));
+}
+
+/// The record of `patch`: the assembly of `upstream` becomes the one of the
+/// patch.
+fn record(upstream: &Package, patch: &Patched) -> Value {
+    let package = &patch.package;
+    json!({
+        "uuid": patch.uuid,
+        "purl": package.purl(),
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": { assembly_path(&package.id): {
+            "beforeHash": compute_git_sha256_from_bytes(upstream.assembly.as_bytes()),
+            "afterHash": compute_git_sha256_from_bytes(package.assembly.as_bytes()),
+        }},
+        "vulnerabilities": { "GHSA-test-aaaa-bbbb": {
+            "cves": ["CVE-2024-0001"], "summary": "s", "severity": "high", "description": "d",
+        }},
+        "description": "fixture",
+        "license": "MIT",
+        "tier": "free",
+    })
+}
+
+/// [`grant`] of the patch's own package, with a record that carries both
+/// assemblies: agent mode patches the copy in NuGet's folder from the
+/// record and asks for no package.
+fn grant_installed(standin: &StandIn, upstream: &Package, patch: &Patched) {
+    let b64 = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+    let mut record = record(upstream, patch);
+    let file = &mut record["files"][assembly_path(&patch.package.id)];
+    file["blobContent"] = b64(&patch.package.assembly).into();
+    file["beforeBlobContent"] = b64(&upstream.assembly).into();
+    grant_recorded(standin, patch, &patch.package.nupkg, &record);
+}
+
+/// [`grant`] with `record` as the record of the patch.
+fn grant_recorded(standin: &StandIn, patch: &Patched, served: &[u8], record: &Value) {
     let package = &patch.package;
     // A route starts with the `/` that ends `https://`.
     let url = format!("https:/{}", patch.file(package));
@@ -472,22 +522,7 @@ fn grant(standin: &StandIn, upstream: &Package, patch: &Patched, served: &[u8]) 
     // Priority 1: ahead of the shared API mock's patch record, which names
     // a file no NuGet package has. `vex` holds the package in NuGet's
     // folder to the hashes of this one.
-    let record = json!({
-        "uuid": patch.uuid,
-        "purl": package.purl(),
-        "publishedAt": "2026-01-01T00:00:00Z",
-        "files": { assembly_path(&package.id): {
-            "beforeHash": compute_git_sha256_from_bytes(upstream.assembly.as_bytes()),
-            "afterHash": compute_git_sha256_from_bytes(package.assembly.as_bytes()),
-        }},
-        "vulnerabilities": { "GHSA-test-aaaa-bbbb": {
-            "cves": ["CVE-2024-0001"], "summary": "s", "severity": "high", "description": "d",
-        }},
-        "description": "fixture",
-        "license": "MIT",
-        "tier": "free",
-    });
-    let record = serde_json::to_vec(&record).expect("a JSON document");
+    let record = serde_json::to_vec(record).expect("a JSON document");
     let record_route = format!("/v0/orgs/{ORG}/patches/view/{}", patch.uuid);
     standin.serve(1, &record_route, &record);
     let index = json!({ "version": "3.0.0", "resources": [{
@@ -966,6 +1001,128 @@ fn hosted_no_config() {
          nuget_config and warned ({WITHHELD}), and the build still printed {unpatched:?}; with \
          the attribute on the tag the same scan wrote {CONFIG} and {LOCK}, and the build printed \
          {patched:?} from the Socket source ({fetches} requests for the package); {:?}",
+        started.elapsed()
+    );
+}
+
+/// What a run of agent mode is made of.
+struct Restored {
+    /// The stand-in of the run: nuget.org with the two packages of the
+    /// fixture, and the Socket API with `patch`.
+    standin: StandIn,
+    /// The package a patch replaces, as nuget.org has it for this run.
+    upstream: Package,
+    /// One patch of it, granted with a record that agent mode patches
+    /// from ([`grant_installed`]).
+    patch: Patched,
+    /// The .NET home of a machine that restored the project: its NuGet
+    /// folder holds the two packages ([`Package::restore_into`]).
+    home: tempfile::TempDir,
+}
+
+/// Make `cell` the checkout of a new run of agent mode ([`check_out`]),
+/// whose builds fetch from the stand-in of the run ([`downloads`]).
+fn restored(cell: &mut Cell) -> Restored {
+    let run = format!("R{}", uuid::Uuid::new_v4().simple());
+    let upstream = Package::new(NAME, &run, &format!("PRISTINE {run}"));
+    let neighbour = Package::new(NEIGHBOUR, &run, "NEIGHBOUR");
+    let patch = Patched::new(&run);
+    let standin = registry(&[&neighbour, &upstream]);
+    grant_installed(&standin, &upstream, &patch);
+    cell.route_downloads(&downloads(&standin.origin()));
+    check_out(cell, &run, &[&neighbour, &upstream]);
+    let home = tempfile::Builder::new()
+        .prefix("sp-bazel-nuget-")
+        .tempdir()
+        .expect("create a .NET home");
+    for package in [&neighbour, &upstream] {
+        package.restore_into(home.path());
+    }
+    // Bazel has the two variables of that home which `socket-patch` has
+    // ([`on_machine`]): a build that read NuGet's folder would find it.
+    let folder = packages_folder(home.path());
+    let pairs = [
+        ("NUGET_PACKAGES", folder.as_path()),
+        ("DOTNET_CLI_HOME", home.path()),
+    ];
+    let owned = |(name, path): (&str, &Path)| (name.to_string(), path.to_string_lossy().into());
+    cell.repo_env = pairs.map(owned).to_vec();
+    Restored {
+        standin,
+        upstream,
+        patch,
+        home,
+    }
+}
+
+impl Restored {
+    /// The assembly of the package in NuGet's folder, where agent mode
+    /// patches it.
+    fn assembly(&self) -> PathBuf {
+        let package = packages_folder(self.home.path()).join(self.upstream.lower());
+        package.join(VERSION).join(assembly_path(&self.upstream.id))
+    }
+}
+
+/// Agent mode beside the hub, which builds the package from the lock.
+///
+/// - (a) `bazel build` and `bazel run //:consumer` print the unpatched
+///   marker, and Bazel fetched the upstream package from the stand-in.
+/// - (b) NuGet's folder holds the two packages, as after the user's
+///   `dotnet restore` ([`restored`]). `scan --mode agent --yes` patches the
+///   assembly of the package there and writes nothing into the checkout
+///   but its `.socket` directory, and `apply` passes
+///   ([`Cell::patches_outside`]). KNOWN GAP: both, `vex` and
+///   `vex --no-verify` write a document that says the package is not
+///   affected, through the patch.
+/// - (c) The same two Bazel commands print the unpatched marker again, and
+///   change no file: the hub has Bazel download the package the lock pins,
+///   and no build reads NuGet's folder. So the documents of (b) are false
+///   for what Bazel builds.
+/// - (d) A second machine prints the unpatched marker too. Its Bazel has
+///   built nothing and evaluates the hub anew, with the patched folder
+///   named in its environment ([`Cell::builds_anew`]); the build of (c)
+///   is a warm one, which looks at nothing outside the checkout again.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn agent_from_lock() {
+    let test = "nuget::agent_from_lock";
+    let started = Instant::now();
+    let Some(mut cell) = Cell::open(test, &FIXTURE) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let machine = restored(&mut cell);
+    let (standin, upstream, patch) = (&machine.standin, &machine.upstream, &machine.patch);
+    let (purl, unpatched) = (upstream.purl(), upstream.marker());
+
+    // (a) The unpatched build, with the upstream package from the stand-in.
+    cell.builds_unpatched(&unpatched);
+    assert!(
+        standin.asked(&upstream.file(FLAT_CONTAINER)) > 0,
+        "{test}: the build did not fetch the upstream package from the stand-in"
+    );
+
+    // (b) Agent mode patches the copy in NuGet's folder. KNOWN GAP: every
+    // document says the package is not affected. Once `vex` reads the hub,
+    // the claim is `Claim::unbuilt`, with the call and the lock it names.
+    let assembly = machine.assembly();
+    let run = |cell: &Cell, args: &[&str]| socket_patch(cell, standin, machine.home.path(), args);
+    let claim = Claim::new(&purl, &patch.uuid, How::Agent);
+    let patched = cell.patches_outside(run, &assembly, &patch.package.assembly, &claim);
+
+    // (c) The build is the one of (a): Bazel never reads the patched copy.
+    cell.builds(&unpatched);
+    assert_eq!(changed(&patched, &cell.tree()), NOTHING, "{test}");
+
+    // (d) Nor does a Bazel that evaluates the hub anew read it.
+    cell.builds_anew(&unpatched);
+
+    println!(
+        "{test}: Bazel {release} built {unpatched:?} before and after `scan --mode agent` \
+         patched {}, and on a second machine; (KNOWN GAP) every form of `vex` said the package \
+         is not affected; {:?}",
+        assembly.display(),
         started.elapsed()
     );
 }

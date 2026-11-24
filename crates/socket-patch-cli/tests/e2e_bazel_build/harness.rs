@@ -1024,6 +1024,21 @@ impl Cell {
         );
     }
 
+    /// [`Cell::builds`] on a second machine ([`Cell::twin`]) that has no
+    /// lock of Bazel's either: its Bazel has fetched and built nothing and
+    /// holds no record of a hub, so it evaluates every hub anew, with the
+    /// `repo_env` of this cell. A warm rebuild here proves nothing of what
+    /// lies outside the checkout: Bazel does not look there again. This
+    /// cell goes before the second one builds, unless it holds the
+    /// repository cache (no [`REPO_CACHE`]): a flow keeps one output base
+    /// at a time.
+    pub fn builds_anew(self, marker: &str) {
+        let twin = self.twin();
+        let _first = var(REPO_CACHE).is_none().then_some(self);
+        std::fs::remove_file(twin.path("MODULE.bazel.lock")).expect("Bazel's lock");
+        twin.builds(marker);
+    }
+
     /// Step (a) of a flow: the build prints `marker`, and Bazel wrote its
     /// lock. Gives the files of the checkout, that lock among them.
     pub fn builds_unpatched(&self, marker: &str) -> Tree {
@@ -1407,6 +1422,49 @@ impl Cell {
         fresh.stands_alone(run, claim, true);
         let (here, there) = (self.wording[0].get(), fresh.wording[0].get());
         assert_eq!(there, here, "{test}: the two checkouts word it apart");
+    }
+
+    /// Agent mode in this checkout, through `run`, for a package that its
+    /// package manager keeps outside the checkout, where `installed` is a
+    /// file of that copy: `scan --mode agent --yes` gives the file the text
+    /// `patched`, from the record of the patch, and writes nothing into the
+    /// checkout but its own `.socket` directory, and the `apply` of a later
+    /// run passes. Then what the two say with `--vex`, and what `vex` and
+    /// `vex --no-verify` say: all four pass and write one document, which
+    /// says `claim`. Gives the files of the checkout.
+    pub fn patches_outside(
+        &self,
+        run: impl Fn(&Cell, &[&str]) -> Ran,
+        installed: &Path,
+        patched: &str,
+        claim: &Claim,
+    ) -> Tree {
+        let test = &self.test;
+        let before = self.tree();
+        let in_run = self.document("in-run");
+        let agent = ["scan", "--mode", "agent", "--yes"];
+        let scan = run(self, &[&agent[..], &with_vex(&in_run)].concat());
+        let said = &scan.dump;
+        assert_eq!(scan.code, 0, "{test}: {said}");
+        assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
+        assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
+        let left = self.tree();
+        let mut wrote = changed(&before, &left);
+        wrote.retain(|file| !file.starts_with(".socket/"));
+        assert_eq!(wrote, NOTHING, "{test}: {said}");
+        let holds = std::fs::read_to_string(installed).unwrap_or_default();
+        assert_eq!(holds, patched, "{test}: {}", installed.display());
+
+        let again = self.document("apply");
+        let apply = run(self, &[&["apply"][..], &with_vex(&again)].concat());
+        let status = &apply.envelope["status"];
+        assert_eq!(*status, "success", "{test}: {}", apply.dump);
+        self.wrote_in_run(&scan, &in_run, claim);
+        self.wrote_in_run(&apply, &again, claim);
+        self.stands_alone(&run, claim, true);
+        self.stands_alone(&run, claim, false);
+        assert_eq!(changed(&left, &self.tree()), NOTHING, "{test}");
+        left
     }
 
     /// The stand-alone `vex` of a checkout that holds no patch any more,

@@ -1,5 +1,5 @@
-//! Hosted and vendored mode for a crate that rules_rust's crate_universe
-//! resolves from a Cargo workspace: `crate.from_cargo(cargo_lockfile =
+//! Hosted, vendored and agent mode for a crate that rules_rust's
+//! crate_universe resolves from a Cargo workspace: `crate.from_cargo(cargo_lockfile =
 //! "//:Cargo.lock", manifests = ["//:Cargo.toml"], cargo_config =
 //! "//:.cargo/config.toml")` under Bzlmod, with no cargo-bazel lock (the
 //! hub's `lockfile`).
@@ -15,8 +15,9 @@
 //! cargo-bazel lock the hub follows `Cargo.toml` and `Cargo.lock` as they
 //! are, and no build needs a repin (`CARGO_BAZEL_REPIN`).
 //!
-//! Two flows, one test each, on the Bazel the run is given ([`FIXTURE`]
-//! says which ruleset goes with its release), each in a fresh output base:
+//! The hosted and the vendored flow, one test each, on the Bazel the run is
+//! given ([`FIXTURE`] says which ruleset goes with its release), each in a
+//! fresh output base:
 //!
 //! - (a) `bazel build` and `bazel run //:consumer` print the unpatched
 //!   marker. The stand-in registry was asked for the crate's file of the
@@ -82,6 +83,14 @@
 //! "The build file in the copy"). With either, `vendor --check` passes
 //! right after the build, `vex` attests the crate, and a second scan
 //! reports the copy `already_vendored` and leaves it alone.
+//!
+//! Another flow is agent mode ([`agent_from_cargo_with_config`]), which
+//! patches the copy of the crate in the cargo home, where a `cargo fetch`
+//! or a `cargo build` of the user unpacked it. No build of Bazel's reads a
+//! cargo home: the hub has Bazel download the crate file the lock pins. So
+//! the build is the unpatched one before the command and after it. The flow
+//! asserts that, and what every form of `vex` says of the crate meanwhile
+//! (see "Known gaps").
 //!
 //! The two releases also differ in the home of the hub's cargo
 //! ([`cargo_env`]). rules_rust 0.75.0 gives it a directory inside the
@@ -192,19 +201,30 @@
 //! without a Bazel
 //! ([`only_the_build_file_of_cargo_bazel_is_no_change_of_a_vendored_copy`],
 //! [`the_vendored_crates_get_a_bazelignore_line_where_a_crate_hub_builds_them`]).
+//!
+//! # Known gaps
+//!
+//! One assertion of the agent flow holds what is wrong today, with every
+//! ruleset, and is marked `KNOWN GAP` there with what a fix changes in this
+//! test: `scan --mode agent --vex`, `apply --vex`, `vex` and
+//! `vex --no-verify` each write a document that says the crate is not
+//! affected, through the patch, while Bazel builds the unpatched crate.
+//! `vex` reads the copy in the cargo home and not what the hub builds from.
+//! A fix makes the document say that the crate is affected, and name the
+//! call of `MODULE.bazel` that builds it from the lock.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use base64::Engine as _;
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256, Sha512};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
 use crate::envelope::{codes_in, event_for, has_event};
 use crate::harness::{
-    cell_without_bazel, changed, fixture_path, Cell, Fixture, Ran, Release, StandIn, Tree,
-    CONSUMER, NOTHING, REPO_CACHE,
+    cell_without_bazel, changed, fixture_path, Cell, Claim, Fixture, How, Ran, Release, StandIn,
+    Tree, CONSUMER, NOTHING, REPO_CACHE,
 };
 use crate::hosted_memory_common::{Patch, ORG};
 
@@ -521,6 +541,43 @@ fn registry(upstream: &Package) -> StandIn {
 /// API and the index name the checksum of the patch's own crate file,
 /// whatever is served.
 fn grant(standin: &StandIn, upstream: &Package, patch: &Patched, served: &[u8]) {
+    grant_recorded(standin, patch, served, &record(upstream, patch));
+}
+
+/// The record of `patch`: the library of `upstream` becomes the one of the
+/// patch.
+fn record(upstream: &Package, patch: &Patched) -> Value {
+    json!({
+        "uuid": patch.uuid,
+        "purl": PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": { "src/lib.rs": {
+            "beforeHash": compute_git_sha256_from_bytes(upstream.lib_rs.as_bytes()),
+            "afterHash": compute_git_sha256_from_bytes(patch.package.lib_rs.as_bytes()),
+        }},
+        "vulnerabilities": { "GHSA-test-aaaa-bbbb": {
+            "cves": ["CVE-2024-0001"], "summary": "s", "severity": "high", "description": "d",
+        }},
+        "description": "fixture",
+        "license": "MIT",
+        "tier": "free",
+    })
+}
+
+/// [`grant`] of the patch's own crate file, with a record that carries both
+/// libraries: agent mode patches the copy in a cargo home from the record
+/// and asks for no crate file.
+fn grant_installed(standin: &StandIn, upstream: &Package, patch: &Patched) {
+    let b64 = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+    let mut record = record(upstream, patch);
+    let file = &mut record["files"]["src/lib.rs"];
+    file["blobContent"] = b64(&patch.package.lib_rs).into();
+    file["beforeBlobContent"] = b64(&upstream.lib_rs).into();
+    grant_recorded(standin, patch, &patch.package.crate_file, &record);
+}
+
+/// [`grant`] with `record` as the record of the patch.
+fn grant_recorded(standin: &StandIn, patch: &Patched, served: &[u8], record: &Value) {
     let origin = standin.origin();
     let url = format!("{origin}{}", patch.route);
     let checksum = patch.package.checksum();
@@ -551,22 +608,7 @@ fn grant(standin: &StandIn, upstream: &Package, patch: &Patched, served: &[u8]) 
     // Priority 1: ahead of the shared API mock's patch record, whose hashes
     // are fixed, because vendored mode holds the unpacked library to
     // `afterHash`.
-    let record = json!({
-        "uuid": patch.uuid,
-        "purl": PURL,
-        "publishedAt": "2026-01-01T00:00:00Z",
-        "files": { "src/lib.rs": {
-            "beforeHash": compute_git_sha256_from_bytes(upstream.lib_rs.as_bytes()),
-            "afterHash": compute_git_sha256_from_bytes(patch.package.lib_rs.as_bytes()),
-        }},
-        "vulnerabilities": { "GHSA-test-aaaa-bbbb": {
-            "cves": ["CVE-2024-0001"], "summary": "s", "severity": "high", "description": "d",
-        }},
-        "description": "fixture",
-        "license": "MIT",
-        "tier": "free",
-    });
-    let record = serde_json::to_vec(&record).expect("a JSON document");
+    let record = serde_json::to_vec(record).expect("a JSON document");
     let record_route = format!("/v0/orgs/{ORG}/patches/view/{}", patch.uuid);
     standin.serve(1, &record_route, &record);
     let dl = format!(
@@ -675,15 +717,21 @@ fn open_readme_hub(test: &str) -> Option<(tempfile::TempDir, Cell, StandIn, Pack
 /// the patch server (a hosted pin is recognised by that origin) and as the
 /// index `rollback` reads the upstream checksum from.
 fn socket_patch(cell: &Cell, standin: &StandIn, args: &[&str]) -> Ran {
+    socket_patch_at(cell, standin, Path::new(NO_CARGO_HOME), args)
+}
+
+/// [`socket_patch`] on a machine whose cargo home is `home`.
+fn socket_patch_at(cell: &Cell, standin: &StandIn, home: &Path, args: &[&str]) -> Ran {
     let (origin, index) = hosts(standin);
-    cell.socket_patch(&origin, args, &env(&origin, &index))
+    let home = home.to_string_lossy();
+    cell.socket_patch(&origin, args, &env(&origin, &index, &home))
 }
 
 /// [`socket_patch`] as a person runs it: what it printed on stdout and on
 /// stderr.
 fn person(cell: &Cell, standin: &StandIn, args: &[&str]) -> [String; 2] {
     let (origin, index) = hosts(standin);
-    cell.socket_patch_person(&origin, args, &env(&origin, &index))
+    cell.socket_patch_person(&origin, args, &env(&origin, &index, NO_CARGO_HOME))
 }
 
 /// The origin of `standin`, and the index of crates.io there.
@@ -693,12 +741,13 @@ fn hosts(standin: &StandIn) -> (String, String) {
     (origin, index)
 }
 
-/// What a `socket-patch` child of a flow is told of its hosts.
-fn env<'a>(origin: &'a str, index: &'a str) -> [(&'a str, &'a str); 3] {
+/// What a `socket-patch` child of a flow is told of its hosts, on a machine
+/// whose cargo home is `home`.
+fn env<'a>(origin: &'a str, index: &'a str, home: &'a str) -> [(&'a str, &'a str); 3] {
     [
         ("SOCKET_PATCH_SERVER_URL", origin),
         ("SOCKET_CRATES_INDEX", index),
-        ("CARGO_HOME", NO_CARGO_HOME),
+        ("CARGO_HOME", home),
     ]
 }
 
@@ -1671,6 +1720,103 @@ fn hosted_from_cargo_without_config() {
         upstream.marker,
         patch.package.marker,
         [CONFIG, LOCK, MANIFEST],
+        started.elapsed()
+    );
+}
+
+/// The name of a directory of `registry/src` in a cargo home: cargo names
+/// one after the host of an index and a hash of its own, which nothing
+/// here reads.
+const INDEX_DIR: &str = "127.0.0.1-0000000000000000";
+
+/// The library of the crate in the cargo home `home`, where agent mode
+/// looks for a crate: the copy that a cargo unpacked under `registry/src`,
+/// or, in a home that holds none, one laid out here as `cargo fetch`
+/// leaves it (the files of `upstream`'s crate file, and the mark cargo
+/// sets on a directory it has unpacked). No cargo runs here. The home of a
+/// flow is the one its Bazel children have: rules_rust 0.56.0 runs the
+/// hub's cargo with it, and rules_rust 0.75.0 gives that cargo a home in
+/// the output base and leaves this one empty.
+fn fetched(home: &Path, upstream: &Package) -> PathBuf {
+    let sources = home.join("registry").join("src");
+    let name = format!("{NAME}-{VERSION}");
+    let indexes = std::fs::read_dir(&sources).into_iter().flatten().flatten();
+    let mut unpacked = indexes.map(|index| index.path().join(&name));
+    let copy = unpacked.find(|copy| copy.is_dir()).unwrap_or_else(|| {
+        let copy = sources.join(INDEX_DIR).join(&name);
+        let files = [
+            ("Cargo.toml", CRATE_MANIFEST),
+            ("src/lib.rs", upstream.lib_rs.as_str()),
+            (".cargo-ok", "{\"v\":1}"),
+        ];
+        for (file, text) in files {
+            let path = copy.join(file);
+            std::fs::create_dir_all(path.parent().expect("a file path")).expect("create the copy");
+            std::fs::write(&path, text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        }
+        copy
+    });
+    let library = copy.join("src").join("lib.rs");
+    let holds = std::fs::read_to_string(&library).unwrap_or_default();
+    assert_eq!(holds, upstream.lib_rs, "{}", library.display());
+    library
+}
+
+/// Agent mode beside a hub that builds the crate from the lock.
+///
+/// - (a) `bazel build` and `bazel run //:consumer` print the unpatched
+///   marker.
+/// - (b) The crate is in the cargo home ([`fetched`]), as after the user's
+///   `cargo fetch` or `cargo build`. `scan --mode agent --yes` patches the
+///   library of that copy and writes nothing into the checkout but its
+///   `.socket` directory, and `apply` passes
+///   ([`Cell::patches_outside`]). KNOWN GAP: both, `vex` and
+///   `vex --no-verify` write a document that says the crate is not
+///   affected, through the patch.
+/// - (c) The same two Bazel commands print the unpatched marker again, and
+///   change no file: the hub has Bazel download the crate file the lock
+///   pins, and no build reads a cargo home. So the documents of (b) are
+///   false for what Bazel builds.
+/// - (d) A second machine prints the unpatched marker too. Its Bazel has
+///   built nothing and evaluates the hub anew, with the patched cargo home
+///   as the one of its environment ([`Cell::builds_anew`]); the build of
+///   (c) is a warm one, which looks at nothing outside the checkout again.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn agent_from_cargo_with_config() {
+    let test = "cargo::agent_from_cargo_with_config";
+    let started = Instant::now();
+    let Some((home, cell, standin, upstream)) = open(test) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let patch = Patched::new();
+    grant_installed(&standin, &upstream, &patch);
+
+    // (a) The unpatched build, with the upstream crate from the stand-in.
+    builds_upstream(&cell, &standin, &upstream);
+
+    // (b) Agent mode patches the copy in the cargo home. KNOWN GAP: every
+    // document says the crate is not affected. Once `vex` reads the hub,
+    // the claim is `Claim::unbuilt`, with the call and the lock it names.
+    let library = fetched(home.path(), &upstream);
+    let run = |cell: &Cell, args: &[&str]| socket_patch_at(cell, &standin, home.path(), args);
+    let claim = Claim::new(PURL, &patch.uuid, How::Agent);
+    let patched = cell.patches_outside(run, &library, &patch.package.lib_rs, &claim);
+
+    // (c) The build is the one of (a): Bazel never reads the patched copy.
+    cell.builds(&upstream.marker);
+    assert_eq!(changed(&patched, &cell.tree()), NOTHING, "{test}");
+
+    // (d) Nor does a Bazel that evaluates the hub anew read it.
+    cell.builds_anew(&upstream.marker);
+
+    println!(
+        "{test}: Bazel {release} built {:?} before and after `scan --mode agent` patched {}, \
+         and on a second machine; (KNOWN GAP) every form of `vex` said the crate is not \
+         affected; {:?}",
+        upstream.marker,
+        library.display(),
         started.elapsed()
     );
 }
