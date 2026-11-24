@@ -2897,42 +2897,6 @@ response are counted once.
 
 Production published its first merged patch on 2026-09-04.
 
-#### Free and paid patches, and merged patches that are not ready
-
-The free tier (`tier: "free"`, no token needed) includes every patch for a
-critical advisory, merged patches included: the merged patch that combines
-a package version's critical fixes is free. The paid tier adds the patches
-for every other severity, and the merged patch that combines all of a
-package version's fixes. The service assigns `tier`; the CLI only reads
-it.
-
-A merged patch is published after the single patches it combines. The
-service does not announce one that is on its way, so the CLI reads it off
-the offers: a package is **waiting on a merged patch** when the patches
-the account can download (every patch with `canAccessPaidPatches`, the
-free ones without) name more advisories between them than any one of them
-does. The advisories the selected patch leaves, and another downloadable
-patch names, are the ones waiting. An advisory only a paid patch names is
-never waiting for an account without paid access (it needs a paid plan),
-and nothing is waiting when the selected patch is one the lookup no
-longer offers.
-
-- `scan` (every mode) counts those advisories as `waiting on a merged
-  patch` in its closing line, follows it with `Merged patch not ready yet
-  for 1 package: Socket is still processing it. Run \`socket-patch scan\`
-  again later to apply it.`, names them under the row with `--verbose`,
-  and lists them as `packages[].mergePendingIds` in `--json`.
-- `get` (every mode) prints, under the patch it selected, `Merged patch
-  not ready yet for <purl>: Socket is still processing it. <ids> stays
-  unpatched until then. Run \`socket-patch scan\` again later to apply
-  it.` (several packages are counted, not named), and `--json` carries one
-  `merged_patch_pending` entry per package in `warnings[]`. A CVE, GHSA or
-  UUID search sees only the patches that name the identifier, so it
-  reports a pending merge only when those say so.
-- The run is otherwise unchanged: it applies the top-ranked patch, exits
-  as before, and a later run moves the package to the merged patch once
-  it is published (it supersedes the single patch on advisory count).
-
 This ordering is also the presentation order everywhere patches are
 listed — `scan --json`'s `packages[].patches[]`, `get`'s "Found
 patches:" listing, and the `selectionRequired` `options[]` array — so
@@ -2973,6 +2937,58 @@ per-package results).
 > The client already deserializes `publishedAt` on the batch shape
 > (`#[serde(default)]`), so this closes with no client change the moment
 > the batch endpoint emits it.
+
+#### Free and paid patches, and merged patches that are not ready
+
+The free tier (`tier: "free"`, no token needed) includes every patch for a
+critical advisory, merged patches included: the merged patch that combines
+a package version's critical fixes is free. The paid tier adds the patches
+for every other severity, and the merged patch that combines all of a
+package version's fixes. The service assigns `tier`; the CLI only reads
+it.
+
+A merged patch is published after the single patches it combines. The
+service does not announce one that is on its way, so the CLI reads it off
+the offers: a package is **waiting on a merged patch** when the patches
+the account can download (every patch with `canAccessPaidPatches`, the
+free ones without) name more advisories between them than any one of them
+does. The advisories the selected patch leaves, and another downloadable
+patch names, are the ones waiting. A patch's advisories are its GHSA ids,
+or its CVEs when it names no GHSA, as for the advisory count. What is
+never waiting:
+
+- an advisory only a paid patch names, for an account without paid access
+  (it needs a paid plan);
+- an advisory only a patch the run's selection filter withholds names: the
+  filter says it needs no fix, and prefers the patch that leaves it out
+  even once a merged one exists;
+- any advisory when a patch that fixes them all is on offer and the run
+  selected another (a selection filter can do that);
+- any advisory of a selected patch the lookup no longer offers.
+
+A package with release variants (a wheel and its sdist) is waiting when
+some variant's selected patch leaves an advisory out; `get`, which reports
+before it narrows to the installed variant, names only what every variant
+leaves.
+
+- `scan` (every mode) counts those advisories as `waiting on a merged
+  patch` in its closing line, follows it with `Merged patch not ready yet
+  for 1 package: Socket is still processing it. Run \`socket-patch scan\`
+  again later to apply it.`, names them under the row with `--verbose`,
+  and lists them as `packages[].mergePendingIds` in `--json`.
+- `get` (every mode) prints, under the patch it selected, `Merged patch
+  not ready yet for <purl>: Socket is still processing it. <ids> stays
+  unpatched until then. Run \`socket-patch scan\` again later to apply
+  it.` (several packages are counted, not named), and `--json` carries one
+  `merged_patch_pending` entry per package in `warnings[]`. A CVE, GHSA or
+  UUID search sees only the patches that name the identifier, so it
+  reports a pending merge only when those say so. An agent-mode `get
+  --json` that stops at `selectionRequired` (a caller without paid access
+  and several candidates for one purl) carries no such warning: its
+  `options[]` list the candidates.
+- The run is otherwise unchanged: it applies the top-ranked patch, exits
+  as before, and a later run moves the package to the merged patch once
+  it is published (it supersedes the single patch on advisory count).
 
 ### `jq` recipes for PR-comment bots
 

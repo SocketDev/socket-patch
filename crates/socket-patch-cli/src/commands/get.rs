@@ -560,52 +560,63 @@ fn format_selected_patches(selected: &[PatchSearchResult], color: bool) -> Strin
 pub(crate) const MERGED_PATCH_PENDING: &str = "merged_patch_pending";
 
 /// The selected patches whose package is waiting on a merged patch, as
-/// `(purl, ids)`: the advisories (by CVE, or by their own id when they
-/// have none) that the other `candidates` for the same purl fix and the
-/// selected patch does not. `candidates` are the patches the account can
-/// download. A package waits when they fix more advisories between them
-/// than any one of them does: Socket publishes one patch that fixes a
-/// package version's advisories together, after the single patches it
-/// combines, and that one is not among them yet.
+/// `(purl, ids)` in purl order: the advisories (by CVE, or by their own id
+/// when they have none) that the other `candidates` for the same purl fix
+/// and the selected patch does not. `candidates` are the patches the
+/// account can download. A package waits when they fix more advisories
+/// between them than any one of them does: Socket publishes one patch that
+/// fixes a package version's advisories together, after the single patches
+/// it combines, and that one is not among them yet.
+///
+/// The release variants of a package (a wheel and its sdist) are one
+/// package here, and it waits only for what every selected variant leaves:
+/// the run installs one of them, and this is asked before it is known
+/// which.
 fn merge_pending(
     candidates: &[PatchSearchResult],
     selected: &[PatchSearchResult],
 ) -> Vec<(String, Vec<String>)> {
     use std::collections::{BTreeMap, BTreeSet};
-    let mut pending = Vec::new();
+    // Per package: how it is shown, and the ids every variant seen so far
+    // leaves waiting.
+    let mut pending: BTreeMap<String, (String, BTreeSet<&str>)> = BTreeMap::new();
     for patch in selected {
         // What each advisory the candidates fix is shown as.
         let mut offered: BTreeMap<&str, &[String]> = BTreeMap::new();
-        let mut merged = false;
         let group = || candidates.iter().filter(|c| c.purl == patch.purl);
         for candidate in group() {
             for (advisory, vuln) in &candidate.vulnerabilities {
                 offered.entry(advisory).or_insert(&vuln.cves);
             }
         }
-        for candidate in group() {
-            merged |= offered
-                .keys()
-                .all(|advisory| candidate.vulnerabilities.contains_key(*advisory));
-        }
-        if merged {
-            continue;
-        }
+        let merged = group().any(|candidate| {
+            let fixes = &candidate.vulnerabilities;
+            offered.keys().all(|advisory| fixes.contains_key(*advisory))
+        });
         let ids: BTreeSet<&str> = offered
             .iter()
-            .filter(|(advisory, _)| !patch.vulnerabilities.contains_key(**advisory))
+            .filter(|(advisory, _)| !merged && !patch.vulnerabilities.contains_key(**advisory))
             .flat_map(|(advisory, cves)| match cves.is_empty() {
                 true => vec![*advisory],
                 false => cves.iter().map(String::as_str).collect(),
             })
             .collect();
-        if !ids.is_empty() {
-            pending.push((
-                normalize_purl(&patch.purl).into_owned(),
-                ids.into_iter().map(str::to_string).collect(),
-            ));
+        match pending.entry(PurlKey::new(&patch.purl).into_string()) {
+            std::collections::btree_map::Entry::Occupied(mut package) => {
+                package.get_mut().1.retain(|id| ids.contains(id));
+            }
+            std::collections::btree_map::Entry::Vacant(package) => {
+                let shown = normalize_purl(strip_purl_qualifiers(&patch.purl)).into_owned();
+                package.insert((shown, ids));
+            }
         }
     }
+    let mut pending: Vec<(String, Vec<String>)> = pending
+        .into_values()
+        .filter(|(_, ids)| !ids.is_empty())
+        .map(|(purl, ids)| (purl, ids.into_iter().map(str::to_string).collect()))
+        .collect();
+    pending.sort();
     pending
 }
 
@@ -4497,6 +4508,30 @@ mod tests {
         let with_merged = [a.clone(), b, merged.clone()];
         assert!(merge_pending(&with_merged, &[merged]).is_empty());
         assert!(merge_pending(&with_merged, std::slice::from_ref(&a)).is_empty());
+        // The release variants of one package are named once, however
+        // their purls spell the name.
+        const WHEEL: &str = "pkg:pypi/foo@1.0?artifact_id=whl";
+        const SDIST: &str = "pkg:pypi/Foo@1.0?artifact_id=tar-gz";
+        let variants = [
+            candidate(WHEEL, "w1", &[("GHSA-a", &["CVE-1"])]),
+            candidate(WHEEL, "w2", &[("GHSA-b", &["CVE-2"])]),
+            candidate(SDIST, "s1", &[("GHSA-a", &["CVE-1"])]),
+            candidate(SDIST, "s2", &[("GHSA-b", &["CVE-2"])]),
+        ];
+        assert_eq!(
+            merge_pending(&variants, &[variants[0].clone(), variants[2].clone()]),
+            vec![("pkg:pypi/foo@1.0".to_string(), vec!["CVE-2".to_string()])]
+        );
+        // One variant already has its merged patch: the run may install
+        // that one, so nothing is said to wait.
+        let wheel_merged = candidate(
+            WHEEL,
+            "wm",
+            &[("GHSA-a", &["CVE-1"]), ("GHSA-b", &["CVE-2"])],
+        );
+        let mut with_merged = variants.to_vec();
+        with_merged.push(wheel_merged.clone());
+        assert!(merge_pending(&with_merged, &[wheel_merged, variants[2].clone()]).is_empty());
         // One candidate for the package (a CVE search finds only the
         // patches that name the CVE): nothing is known to wait.
         assert!(merge_pending(std::slice::from_ref(&a), std::slice::from_ref(&a)).is_empty());

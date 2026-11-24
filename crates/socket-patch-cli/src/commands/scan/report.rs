@@ -23,6 +23,7 @@ use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult, Patc
 use socket_patch_core::policy::filter::{Reachability, SelectionFilter};
 use socket_patch_core::utils::purl_key::PurlKey;
 
+use super::discovery::Access;
 use crate::args::GlobalArgs;
 use crate::commands::measured::{self, evidence, Measured, Measurement};
 use crate::ui::{self, plural, Style};
@@ -144,13 +145,15 @@ fn id_facts<'a>(records: &[&'a PatchSearchResult]) -> HashMap<String, IdFacts<'a
 /// chose for each package that got one, `records` every patch record the
 /// run fetched (they pair an advisory with its CVEs and its severity), and
 /// `filter` the run's selection filter, whose reachability findings mark
-/// advisories reachable. `in_project` says whether the project the run
-/// patches uses a package (see [`Package::outside_project`]).
+/// advisories reachable. `access` says which patches the run could take
+/// (the account's tier, and what the filter withholds). `in_project` says
+/// whether the project the run patches uses a package (see
+/// [`Package::outside_project`]).
 pub(crate) fn plan(
     packages: &[BatchPackagePatches],
     selected: &[PatchSearchResult],
     records: &[&PatchSearchResult],
-    can_access_paid_patches: bool,
+    access: Access<'_>,
     filter: Option<&SelectionFilter>,
     in_project: &dyn Fn(&str) -> bool,
 ) -> Vec<Package> {
@@ -174,7 +177,7 @@ pub(crate) fn plan(
         .map(|pkg| {
             let key = PurlKey::new(&pkg.purl);
             let chosen = selected_of.get(&key).map_or(&[][..], Vec::as_slice);
-            let coverage = super::discovery::package_coverage(pkg, chosen, can_access_paid_patches);
+            let coverage = super::discovery::package_coverage(pkg, chosen, access);
             // The selection's own records come first: they are the ones
             // that say what a fixed id is.
             let known: Vec<&PatchSearchResult> = chosen
@@ -224,7 +227,7 @@ pub(crate) fn plan(
                 fixed_high: fixed_at(1),
                 fixed_reachable: coverage.fixes.iter().filter(reachable).count(),
                 unpatched_reachable: coverage.unpatched.iter().filter(reachable).count(),
-                paid_only: !can_access_paid_patches
+                paid_only: !access.paid
                     && !pkg.patches.is_empty()
                     && pkg.patches.iter().all(|p| p.tier != "free"),
                 outside_project: !in_project(&pkg.purl),
@@ -1215,7 +1218,10 @@ mod tests {
             &packages,
             std::slice::from_ref(&chosen),
             &[&chosen, &other],
-            paid_access,
+            Access {
+                paid: paid_access,
+                withheld: &HashSet::new(),
+            },
             filter,
             &|_| true,
         )
@@ -1313,7 +1319,10 @@ mod tests {
             &packages,
             std::slice::from_ref(&chosen),
             &[&chosen],
-            true,
+            Access {
+                paid: true,
+                withheld: &HashSet::new(),
+            },
             None,
             &|purl| !purl.starts_with("pkg:gem/"),
         );
