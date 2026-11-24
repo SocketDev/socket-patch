@@ -110,9 +110,22 @@ jobs:
           pattern: pixi-cli-${{ matrix.os }}*
           merge-multiple: true
           path: native-cli
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - name: Setup Python (attempt 1)
+        # A runner that doesn't cache 3.12.10 downloads it. Cap the download
+        # and try once more, as ci.yml does: a hung manifest fetch has held
+        # a leg there for 19 min.
+        id: setup-python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        timeout-minutes: 4
+        continue-on-error: true
         with:
-          python-version: '3.12.13'
+          python-version: '3.12.10' # exact: last 3.12 with a macOS build (#2184); the pin ci.yml uses
+      - name: Setup Python (attempt 2)
+        if: steps.setup-python.outcome != 'success'
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        timeout-minutes: 4
+        with:
+          python-version: '3.12.10' # exact: last 3.12 with a macOS build (#2184); the pin ci.yml uses
       - name: Exercise real pixi projects
         shell: bash
         env:
