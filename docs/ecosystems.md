@@ -2389,7 +2389,8 @@ routed lock with `update_pnpm_lock` yet, so for now every such project is pinned
 as it is on a patch service that offers no registry, which is the pin the Bazel legs
 build, and the `redirect_pnpm_trust_lockfile` warning names the call ("… because a Bazel
 hub reads the pnpm lock (MODULE.bazel:7), and a lock that a hub reads is not routed
-yet …"). A project that was routed before the
+yet …"). For a project below the Bazel root it says, as the warning above does, that its
+paths are from that root. A project that was routed before the
 hub was there leaves the route on its next scan, the lock and the workspace file together.
 Where hosted mode writes nothing for the root lock (the hub above), a route of an earlier
 run is left exactly as it is, in the workspace file and in every lock, and a

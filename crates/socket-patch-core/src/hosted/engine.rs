@@ -13744,6 +13744,41 @@ snapshots:
         );
     }
 
+    /// A project below the root of its Bazel workspace is told where the
+    /// hub's call is: in a file of that root, which a run in the project's
+    /// directory has no file of that name beside. The warning says that its
+    /// paths are from the root of the Bazel workspace, for a call and for
+    /// what was not read alike.
+    #[tokio::test]
+    async fn a_project_below_the_bazel_root_is_told_where_the_hub_is() {
+        let candidates = [left_pad_registry_candidate()];
+        let from = ", with paths from the root of the Bazel workspace)";
+        for (module, said) in [
+            (
+                rules_js_hub("pnpm_lock = \"//apps/web:pnpm-lock.yaml\""),
+                format!("a Bazel hub reads the pnpm lock (MODULE.bazel:3{from}"),
+            ),
+            (
+                "include(\"//tools:npm.MODULE.bazel\")\n".to_string(),
+                format!(
+                    "a Bazel hub may read the pnpm lock (tools/npm.MODULE.bazel: it does not \
+                     exist; MODULE.bazel:1 includes it{from}"
+                ),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_rel(tmp.path(), ".git/HEAD", "ref: refs/heads/main\n");
+            write_rel(tmp.path(), "MODULE.bazel", &module);
+            write_rel(tmp.path(), "apps/web/package.json", PNPM_12_MANIFEST);
+            write_rel(tmp.path(), "apps/web/pnpm-lock.yaml", LEFT_PAD_V9_LOCK);
+            let project = tmp.path().join("apps/web");
+            let done = golden_rewrite(&project, &candidates).await;
+            assert!(!done.pnpm_named_registries, "{module}");
+            let detail = pnpm_trust_detail(&done);
+            assert!(detail.contains(&said), "{module}: {detail}");
+        }
+    }
+
     /// Where a hub hides pnpm-workspace.yaml from the pnpm 11 it runs
     /// ([`crate::bazel::pnpm::hidden`]), that answer comes first, while the
     /// files are read: the root lock is not part of the run, so nothing is

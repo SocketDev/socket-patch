@@ -147,6 +147,10 @@ pub struct Hubs {
 pub enum Reader {
     /// The call (`MODULE.bazel:7`) that names one of the locks in a plain
     /// string, or whose `pnpm_lock` is not written out as one, which may.
+    /// For a project below the Bazel root the text says that its paths are
+    /// from that root, here and in [`Self::Unseen`], as the warning of
+    /// [`Hubs::hidden`] does: a run in the project's directory has no file
+    /// of that name beside it.
     Call(String),
     /// No such call was read, and the workspace was not read whole: what
     /// could not be read of it, where a hub may be. A doubt of the reader
@@ -215,6 +219,16 @@ fn below(project: &str, file: &str) -> String {
     }
 }
 
+/// What a text says after the place it names, for the project in the
+/// directory `project`: every path of such a text is one from the Bazel
+/// root, which is not the directory of a project below it.
+fn from_root(project: &str) -> &'static str {
+    match project {
+        "" => "",
+        _ => ", with paths from the root of the Bazel workspace",
+    }
+}
+
 /// The lock a call of `npm.npm_translate_lock` names.
 enum Named {
     /// A file of the main repository, in a plain string.
@@ -243,6 +257,7 @@ fn names(ws: &Workspace, call: &Call) -> Named {
 /// `project` of the workspace `ws`.
 fn reader(ws: &Workspace, project: &str, locks: &[String]) -> Option<Reader> {
     let hubs = ws.tags(&extension("npm"), "npm_translate_lock");
+    let from = from_root(project);
     let call = hubs.calls.iter().find_map(|tag| {
         let reads = match names(ws, tag.call) {
             Named::File(label) => locks
@@ -251,7 +266,7 @@ fn reader(ws: &Workspace, project: &str, locks: &[String]) -> Option<Reader> {
             Named::Elsewhere => false,
             Named::Unwritten => true,
         };
-        reads.then(|| Reader::Call(format!("{}:{}", tag.file, tag.call.line)))
+        reads.then(|| Reader::Call(format!("{}:{}{from}", tag.file, tag.call.line)))
     });
     if call.is_some() {
         return call;
@@ -259,15 +274,16 @@ fn reader(ws: &Workspace, project: &str, locks: &[String]) -> Option<Reader> {
     // No call that was read reads a lock. That is the answer only where
     // every call was read.
     let doubt = |doubt: &Doubt| match doubt.line {
-        0 => format!("{}: {}", doubt.file, doubt.why),
-        line => format!("{}:{line}: {}", doubt.file, doubt.why),
+        0 => format!("{}: {}{from}", doubt.file, doubt.why),
+        line => format!("{}:{line}: {}{from}", doubt.file, doubt.why),
     };
     if let Some(unread) = ws.doubts.first().or(hubs.doubts.first()) {
         return Some(Reader::Unseen(doubt(unread)));
     }
     match &ws.legacy {
         Some(Ok((file, _))) => Some(Reader::Unseen(format!(
-            "{file} defines repositories of its own, and a hub among them is not looked for"
+            "{file} defines repositories of its own, and a hub among them is not looked \
+             for{from}"
         ))),
         Some(Err(unread)) => Some(Reader::Unseen(doubt(unread))),
         None => None,
@@ -387,11 +403,7 @@ fn judge(ws: &Workspace, view: &dyn Fn(&str) -> Entry, project: &str) -> Option<
             ),
         };
         let steps: Vec<String> = fix.into_iter().chain(list).collect();
-        // Every path of the text is one from the Bazel root.
-        let from = match project {
-            "" => "",
-            _ => ", with paths from the root of the Bazel workspace",
-        };
+        let from = from_root(project);
         return Some(format!(
             "{file}:{}{from}: this `{}` {has} Bazel run {pnpm} to keep {lock} up to date \
              ({how}), and {why}; {lock} was not rewritten — {} and re-run",
@@ -1203,7 +1215,12 @@ mod tests {
             reads(member, "", &[LOCK, "packages/a/pnpm-lock.yaml"]),
             call
         );
-        assert_eq!(reads(member, "packages/a", &[LOCK]), call);
+        // Its call is in a file of the Bazel root, not of the project.
+        let from_root = "MODULE.bazel:4, with paths from the root of the Bazel workspace";
+        assert_eq!(
+            reads(member, "packages/a", &[LOCK]),
+            Some(Reader::Call(from_root.to_string()))
+        );
         assert_eq!(reads(LOCKED, "packages/a", &[LOCK]), None);
         // Another repository's lock, and a workspace with no hub.
         assert_eq!(
