@@ -2236,7 +2236,11 @@ mod tests {
             "m",
             &[("GHSA-a", &["CVE-1"]), ("GHSA-b", &["CVE-2"])],
         );
-        let c = &coverage_for(std::slice::from_ref(&pkg), &[merged.clone()], false)[0];
+        let c = &coverage_for(
+            std::slice::from_ref(&pkg),
+            std::slice::from_ref(&merged),
+            false,
+        )[0];
         assert_eq!(c.unpatched, strs(&["CVE-3"]));
         assert!(c.merge_pending.is_empty() && c.merge_pending_ids.is_empty());
         assert_eq!(c.needs_paid, strs(&["CVE-3"]));
