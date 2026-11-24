@@ -1677,6 +1677,12 @@ pub async fn read_candidate_files_in(
                 withhold_root_pnpm_locks(&mut out, hidden);
             }
         }
+    } else if names_pnpm_route(view, &out).await {
+        // A run with no npm patch still tidies what is left of a registry
+        // route ([`pnpm_prune`]), and every lock the workspace file governs
+        // has a say in what is left: the members' own locks are read for
+        // it, as a run with a patch reads them.
+        read_pnpm_member_locks(view, unreadable, &mut out).await;
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "gem") {
         keep_bundler_loaded_gem_files(view, candidates, &mut out).await;
@@ -1792,6 +1798,29 @@ async fn read_pnpm_member_locks(
         }
         MemberLocks::Unresolved(why) => refuse_pnpm_members(out, why),
     }
+}
+
+/// Whether the root pnpm-workspace.yaml or the root lock of `out` names
+/// something of a registry route ([`pnpm_route`]), from the bytes alone
+/// and with every address of the registry's shape taken for a patch
+/// server's, as [`pnpm_route_present`] asks it of a checkout. What is ours
+/// is settled when the route is.
+async fn names_pnpm_route(view: &ProjectView<'_>, out: &CandidateFiles) -> bool {
+    use crate::formats::pnpm::named_registries::{holds_ours, Owned};
+    use crate::formats::pnpm::registry_alias::names_a_route;
+
+    if out
+        .files
+        .get(ROOT_PNPM_LOCKS[0])
+        .is_some_and(|lock| names_a_route(lock))
+    {
+        return true;
+    }
+    let workspace = view.read_text(PNPM_WORKSPACE_REL).await.ok();
+    let owned = Owned::of(workspace.as_deref(), &|_| true);
+    workspace
+        .as_deref()
+        .is_some_and(|text| holds_ours(text, &owned))
 }
 
 /// Leave the root pnpm lock out and record why (see
@@ -13299,6 +13328,49 @@ snapshots:
             "{:?}",
             warning_codes(&done)
         );
+    }
+
+    /// A run that is granted no patch tidies a route from every lock the
+    /// workspace file governs. Members' own locks that still route a
+    /// release keep the override and the registry they use: the root lock,
+    /// which holds no patched package, is not the only one asked.
+    #[tokio::test]
+    async fn a_run_granted_nothing_keeps_what_the_members_own_locks_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+        write_member_workspace(tmp.path(), ws);
+        write_rel(
+            tmp.path(),
+            "package.json",
+            r#"{"name":"root","private":true,"packageManager":"pnpm@12.22.0"}"#,
+        );
+        write_rel(
+            tmp.path(),
+            "packages/a/package.json",
+            r#"{"name":"a","dependencies":{"is-number":"7.0.0"}}"#,
+        );
+        let mut candidates = is_number_candidates();
+        candidates[0].dep.npm_registry_url = Some(registry_address(MEMBER_URL));
+        let view = ProjectView::Disk(tmp.path());
+        let routed = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        assert!(routed.pnpm_named_registries);
+        commit(tmp.path(), &routed);
+
+        let origins = vec!["https://patch.example".to_string()];
+        let done = pnpm_rewrite_from(&view, &[], true, false, &no_env, origins.clone()).await;
+        assert!(
+            done.rewrite.files.is_empty(),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        assert!(done.rewrite.edits.is_empty());
+
+        // Once no member's lock routes the release, the route goes whole.
+        write_rel(tmp.path(), MEMBER_KEYS[0], &v9_member_lock(true));
+        write_rel(tmp.path(), MEMBER_KEYS[1], &v9_member_lock(false));
+        let done = pnpm_rewrite_from(&view, &[], true, false, &no_env, origins).await;
+        assert_eq!(workspace_of(&done), Some(ws));
+        assert_eq!(lock_of(&done), Some(ROOT_ONLY_LOCK));
     }
 
     #[tokio::test]
