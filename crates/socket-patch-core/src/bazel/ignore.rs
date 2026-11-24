@@ -67,7 +67,10 @@ const MARK: &str = "# socket-patch:";
 /// a directory that exists keeps what the file says of it, as does one
 /// that cannot be probed. A file left empty is deleted.
 /// Outside a Bazel workspace ([`super::bazel_root`]) nothing is read or
-/// written, and that lookup is all the call costs.
+/// written, and that lookup is all the call costs. For a user who switched
+/// the Bazel support off ([`super::off`]) no pair is added, as outside one;
+/// the pair of a directory that is gone still goes, so that the undo of a
+/// copy an earlier run made is whole.
 ///
 /// The pair follows the directory, not the `replace`: a rollback that
 /// keeps the copy on disk keeps its BUILD files in the workspace too.
@@ -83,8 +86,8 @@ const MARK: &str = "# socket-patch:";
 /// link, which socket-patch does not write through. The command that asked
 /// has done its work either way.
 pub async fn sync(project: &Path, go: bool, cargo: bool) -> Result<Option<Changed>, String> {
-    let project = project.to_path_buf();
-    run_blocking(move || sync_blocking(&project, go, cargo)).await
+    let (project, adds) = (project.to_path_buf(), !super::off());
+    run_blocking(move || sync_blocking(&project, go && adds, cargo && adds)).await
 }
 
 /// The file [`sync`] changed, and the copies its changed lines are about.
@@ -109,7 +112,7 @@ pub(crate) fn ignores(root: &BazelRoot, dir: &Path) -> bool {
 }
 
 fn sync_blocking(project: &Path, go: bool, cargo: bool) -> Result<Option<Changed>, String> {
-    let Some(root) = super::bazel_root(project) else {
+    let Some(root) = super::root_of(project) else {
         return Ok(None);
     };
     let from_root = from_root(&root, Path::new(""));

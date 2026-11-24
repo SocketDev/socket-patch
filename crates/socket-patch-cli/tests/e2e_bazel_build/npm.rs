@@ -1451,7 +1451,8 @@ fn speaks_of_the_installed_tree(cell: &Cell, standin: &StandIn, patch: &Patched)
 /// of the same checkout without its `MODULE.bazel`, to a script and to a
 /// person: the exit code, both streams byte for byte, and what the document
 /// says. In that checkout, which is no Bazel workspace, the option changes
-/// nothing and no run remarks on it.
+/// nothing and no run remarks on it. `SOCKET_NO_BAZEL=1`, the switch for a
+/// project that Bazel does not build, gives each form that same run.
 #[test]
 fn the_option_makes_the_run_the_one_of_a_checkout_without_bazel() {
     let (cell, standin, patch, entry) = checkout("");
@@ -1488,18 +1489,24 @@ fn the_option_makes_the_run_the_one_of_a_checkout_without_bazel() {
             let ran = socket_patch(&cell, &standin, &with_option);
             cell.wrote_in_run(&ran, &document, &claim);
         }
-        beside_the_hub.push([gives(&with_option, &env[..2]), gives(args, &env)]);
+        let switched_off = [env[0], env[1], ("SOCKET_NO_BAZEL", "1")];
+        beside_the_hub.push([
+            gives(&with_option, &env[..2]),
+            gives(args, &env),
+            gives(args, &switched_off),
+        ]);
     }
 
     let patched = cell.tree();
     std::fs::remove_file(cell.path(MODULE)).expect(MODULE);
-    for ((args, option), [by_option, by_variable]) in forms.iter().zip(&beside_the_hub) {
+    for ((args, option), [by_option, by_variable, by_switch]) in forms.iter().zip(&beside_the_hub) {
         let without_bazel = gives(args, &env[..2]);
         assert_eq!(*by_option, without_bazel, "{args:?} {option}");
         assert_eq!(
             *by_variable, without_bazel,
             "{args:?}, SOCKET_VEX_NO_BAZEL=1"
         );
+        assert_eq!(*by_switch, without_bazel, "{args:?}, SOCKET_NO_BAZEL=1");
         let outside = gives(&[&args[..], &[*option]].concat(), &env[..2]);
         assert_eq!(outside, without_bazel, "{args:?} {option}, no {MODULE}");
         for run in without_bazel.as_array().into_iter().flatten() {

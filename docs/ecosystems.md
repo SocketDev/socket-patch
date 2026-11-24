@@ -2174,6 +2174,43 @@ And three that concern neither:
   asks the Socket source for every package of the lock, and Bazel prints a warning with that
   source's URL, the token in it, for each package the source does not hold.
 
+### Bazel workspaces: a project that Bazel does not build
+
+Whether Bazel builds a project is not in the checkout's files. socket-patch takes every project
+for one of a Bazel workspace when its directory, or one above it up to the root of its git
+checkout, holds a Bazel workspace file
+([the lookup](#bazel-workspaces-bazelignore)): a PHP or Maven service of a monorepo whose other
+parts Bazel builds, and a checkout that kept a `WORKSPACE` file from a trial, are such
+projects too. What the sections below then do for it:
+
+- Composer: vendored mode is declined until the lock names a vendored copy
+  ([Bazel workspaces: Composer](#bazel-workspaces-composer)).
+- Go: the `.bazelignore` at the Bazel root gets two lines for the module copies under
+  `.socket` ([Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore)).
+- Hosted mode leaves a crate, a NuGet package or a gem unpinned, with a warning, when a hub
+  call of the workspace may read the project's lock and is not written out plainly.
+- Maven: a warning per patch when a rules_jvm_external hub builds the artifact, or may.
+- VEX: a package is attested `affected` when a hub call names the project's lock.
+
+`SOCKET_NO_BAZEL=1` in the environment switches all of it off (`1`, `true`, `yes` or `on`, as
+for the other switches that are read from the environment alone; an empty or any other value
+does not). Every command then does what it does for a project in no Bazel workspace: the same
+files, the same output, the same exit code, and no word about the variable. The in-memory
+engine asks its host for no Bazel file. There is no flag for it: `vex --no-bazel` is the VEX
+step's own option and switches nothing else off. Set it only for a project that Bazel does
+not build. For one that Bazel builds, what it switches off is what keeps a command that exits
+0 from leaving a build that fails.
+
+What an earlier run wrote for Bazel is still listed and undone with the variable set:
+
+- The block that hosted mode keeps in the root `MODULE.bazel`
+  ([Bazel workspaces: Maven](#bazel-workspaces-maven)): `list`, `vex` and a scan read its
+  entries as hosted pins, and `rollback` and `remove` take them out. No entry is written, and
+  a hosted scan takes no stale entry out.
+- The `.bazelignore` lines: no pair is added, and the pair of a copy that is gone is removed
+  by the command that removed the copy (`rollback`, `remove`, `vendor --revert`, `repair`, a
+  scan).
+
 ## Bazel workspaces: npm
 
 aspect_rules_js reads the pnpm lock itself, so a hosted pin in `pnpm-lock.yaml` is what the
@@ -2475,6 +2512,13 @@ artifact:
 - `maven_bazel_unreadable`: whether a hub builds the jar could not be told, for one of the
   reasons above that concern reading the hubs. The warning names the file, the line and the
   reason.
+- Nothing is said, in any mode, of a jar that no hub fetches in a workspace that has nothing
+  to do with the ruleset (the three signs under "What was not read" above) and whose files
+  were all read: there an `include` of a file that does not exist, and a statement the reader
+  does not follow, are about no hub, and the run is the one without the workspace. A file that
+  is there and was not read as a whole (not UTF-8, over 1 MiB, a link out of the workspace,
+  text the reader cannot parse, a `WORKSPACE` file that cannot be read) may be the one that
+  names the ruleset, and keeps the warning.
 - Nothing is said for a jar the block patches, under `--global`, and by a `vendor` whose
   `--ecosystems` leaves Maven out.
 
@@ -3078,7 +3122,14 @@ line all the same, so that they cannot break the workspace.
 
 A project is in a Bazel workspace when its directory, or one above it up to the root of its git
 checkout, holds a regular file `MODULE.bazel`, `REPO.bazel`, `WORKSPACE` or `WORKSPACE.bazel`
-(the names Bazel itself looks for); the nearest such directory is the Bazel root. The checkout
+(the names Bazel itself looks for); the nearest such directory is the Bazel root. The name
+counts as the directory lists it: a file `workspace` or `Module.bazel` is none, also on a disk
+that folds case, where a lookup of `WORKSPACE` finds it. Bazel itself takes such a file on a
+disk that folds case, so a workspace whose file is spelled in another case gets nothing of
+what socket-patch does for Bazel: give the file Bazel's spelling. No project is in one for a
+run with
+[`SOCKET_NO_BAZEL=1`](#bazel-workspaces-a-project-that-bazel-does-not-build), which adds no
+line and still takes away the pair of a copy that is gone. The checkout
 is the one the `socket.yml` lookup takes for the repository root: on Unix its `.git` belongs to
 you, to root, or to the user `sudo` ran for (a root process takes any owner's). A project in no
 such checkout is looked for in its own directory only: nothing above it is read or written. In
@@ -3400,17 +3451,28 @@ socket-patch checks none of these. The switch is not Composer's alone: it lets v
 write for any package it would decline because the project is in a Bazel workspace, where the
 build may not find the vendored copy. The Composer refusal is the only such refusal today.
 
-`vendor --revert` is never declined. Neither is a package that is already vendored: where
-`composer.lock` already names the copy of the same patch, a vendored run leaves the lock as it
-is. So a project that was vendored with the flag, or by an earlier release, keeps passing its
-runs without the flag, a `scan` or `get` with no `--mode` included, which runs in vendored mode
-there. A new patch for that package, or another package, is declined until the run has the
-flag.
+`vendor --revert` is never declined. Neither is a package of a project that uses vendored
+mode already, by a release before this refusal or with the flag:
+
+- any package, once `packages` of `composer.lock` names a copy under `.socket/vendor/composer`;
+- a package of `packages-dev`, once `packages-dev` names one.
+
+Every later run for such a package goes on without the flag: a newer patch, the first patch of
+another package, and a `scan` or `get` with no `--mode`, which runs in vendored mode there.
+This is safe by the rule above. Either no Bazel rule installs from that lock, and then
+vendored mode works there as it did before the refusal existed; or one does, and its build
+already fails on a path in a section it installs, which one more path there does not change.
+The section matters because a rule may run `composer install --no-dev`, which reads `packages`
+alone: while only `packages-dev` names a copy, such a build passes, and a package of
+`packages` is declined until the run has the flag. `vendor --revert` takes every such path
+out again, and the next vendored run is then declined like a first one.
 
 Limits:
 
 - A project in a Bazel workspace that Bazel does not build, and one that commits its `vendor/`
-  tree, are declined like any other until they have the flag.
+  tree, are declined like any other until their lock names a vendored copy as above, or the
+  run has the flag or
+  [`SOCKET_NO_BAZEL`](#bazel-workspaces-a-project-that-bazel-does-not-build).
 - A Bazel root that the lookup does not reach is not seen, and vendored mode goes on there as
   before: one above the git checkout (a project that is a checkout of its own, such as a
   submodule, in a Bazel repository), one above a project that is in no checkout or whose

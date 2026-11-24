@@ -1566,12 +1566,13 @@ fn vendored_mode_goes_on_outside_bazel_and_on_the_users_word() {
 
 /// Without a Bazel: a project that a release before the refusal vendored,
 /// in a checkout with a Bazel workspace file that no Bazel builds it from.
-/// Its lock names the copy of the patch of then. A newer patch of the
-/// package is declined, by the scan in vendored mode and by the scan that
-/// names no mode, which such a pipeline runs: each exits 1 where it exited
-/// 0, writes nothing and fetches nothing, and the older copy stays.
+/// Its lock names the copy of the patch of then, so the project uses
+/// vendored mode already and is not declined: the scan in vendored mode
+/// vendors a newer patch of the package in the place of the older one, and
+/// the scan that names no mode, which such a pipeline runs, then finds the
+/// project in sync.
 #[test]
-fn a_project_vendored_by_an_earlier_release_is_declined_a_newer_patch() {
+fn a_project_vendored_by_an_earlier_release_is_not_declined_a_newer_patch() {
     let (flow, newer) = checkout(&[]);
     let (cell, upstream) = (&flow.cell, &flow.upstream);
     let older = Patched::new();
@@ -1580,33 +1581,61 @@ fn a_project_vendored_by_an_earlier_release_is_declined_a_newer_patch() {
     let earlier = socket_patch(cell, &then, API, &VENDORED);
     assert_eq!(earlier.code, 0, "{}", earlier.dump);
     cell.write("MODULE.bazel", "");
-    let vendored = cell.tree();
-    let lock: Value = serde_json::from_slice(&vendored[&lock_of(API)]).expect("a lock");
-    assert_eq!(lock["packages"][0]["dist"]["url"], copy_of(&older).as_str());
+    let named = |tree: &Tree| -> Value {
+        let lock: Value = serde_json::from_slice(&tree[&lock_of(API)]).expect("a lock");
+        lock["packages"][0]["dist"]["url"].clone()
+    };
+    assert_eq!(named(&cell.tree()), copy_of(&older).as_str());
 
-    for scan in [&VENDORED[..], &["scan", "--yes"]] {
-        declines(&flow, API, scan, 1, "failed", &vendored);
-    }
-    assert_eq!(flow.standin.asked(&newer.route), 0);
+    let scan = socket_patch(cell, &flow.standin, API, &VENDORED);
+    let said = &scan.dump;
+    assert_eq!(scan.code, 0, "{said}");
+    assert_eq!(scan.envelope["status"], "success", "{said}");
+    let update = json!([{ "purl": PURL, "oldUuid": older.uuid, "newUuid": newer.uuid }]);
+    assert_eq!(scan.envelope["updates"], update, "{said}");
+    let vendored = cell.tree();
+    assert_eq!(named(&vendored), copy_of(&newer).as_str(), "{said}");
+    let source = |patch: &Patched| vendored.get(&format!("{API}/{}/{FILE}", copy_of(patch)));
+    let patched = newer.package.source.as_bytes();
+    assert_eq!(source(&newer).map(Vec::as_slice), Some(patched), "{said}");
+    assert_eq!(source(&older), None, "{said}");
+
+    let again = socket_patch(cell, &flow.standin, API, &["scan", "--yes"]);
+    assert_eq!(again.code, 0, "{}", again.dump);
+    assert_eq!(again.envelope["status"], "success", "{}", again.dump);
+    assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{}", again.dump);
 }
 
 /// Without a Bazel: a regular file named `workspace`, in lower case, at
 /// the root of a checkout that has no Bazel file. On a disk that folds
-/// case it is what a lookup of `WORKSPACE` finds, and vendored mode
-/// declines the project; on a disk that does not, the project is vendored.
-/// The test asks the disk which of the two it runs on and says so.
+/// case it is what a lookup of `WORKSPACE` finds, and it is no Bazel
+/// workspace file all the same: the directory lists it under another name
+/// than Bazel's. So the project is vendored on either disk. The test asks
+/// the disk which of the two it runs on and says so.
 #[test]
-fn a_file_named_workspace_in_lower_case_declines_where_the_disk_folds_case() {
+fn a_file_named_workspace_in_lower_case_makes_no_bazel_workspace() {
     let (flow, patch) = checkout(&["workspace"]);
     let before = flow.cell.tree();
     let folds = flow.cell.path("WORKSPACE").is_file();
-    if folds {
-        declines(&flow, API, &VENDORED, 1, "failed", &before);
-    } else {
-        vendors(&flow, API, &patch, &before, &[]);
-    }
-    let ran = ["does not fold case: vendored", "folds case: declined"][usize::from(folds)];
-    println!("a file named `workspace`: the disk {ran}");
+    vendors(&flow, API, &patch, &before, &[]);
+    println!("a file named `workspace`: vendored, on a disk that folds case: {folds}");
+}
+
+/// Without a Bazel: with `SOCKET_NO_BAZEL=1` vendored mode is not declined
+/// in a Bazel workspace. The scan vendors the package as it does in the
+/// same checkout without the workspace file, to the byte.
+#[test]
+fn the_switch_makes_vendored_mode_the_one_of_a_checkout_without_bazel() {
+    let (flow, _patch) = checkout(&["MODULE.bazel"]);
+    let origin = flow.standin.origin();
+    let packagist = format!("{origin}/{PACKAGIST}");
+    let env = [
+        ("SOCKET_PATCH_SERVER_URL", origin.as_str()),
+        ("SOCKET_PACKAGIST_URL", packagist.as_str()),
+    ];
+    let args = [&VENDORED[..], &["--cwd", API]].concat();
+    let declined = (flow.cell).off_is_without_bazel(&origin, &args, &env, &["MODULE.bazel"]);
+    assert_eq!(declined[0]["code"], 1, "{declined:#}");
 }
 
 /// Without a Bazel, a PHP or a Composer: the fixture's directories and the

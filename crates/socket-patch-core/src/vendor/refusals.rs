@@ -25,7 +25,8 @@
 //!    (`vendor_maven_version_not_selected`, a skip too);
 //! 7. a Composer project in a Bazel workspace
 //!    (`vendor_composer_bazel_workspace`), unless the user allowed it
-//!    ([`ALLOW_IN_BAZEL_ENV`]) or the lock already names the patch's copy
+//!    ([`ALLOW_IN_BAZEL_ENV`]) or the lock already names a vendored copy
+//!    in `packages` or in the package's section
 //!    ([`bazel_workspace_refusals`]).
 //!
 //! Each check lives in its backend's module; this one only dispatches and

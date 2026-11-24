@@ -2,11 +2,35 @@
 
 /// The files that mark the root of a Bazel workspace: the names Bazel's own
 /// client looks for from the working directory up (7.7.2, 8.8.2 and 9.3.2,
-/// `WorkspaceLayout::InWorkspace`). Only a regular file of one of these
-/// names counts (a link to a file is followed); a directory does not: on a
-/// disk that folds case, a directory `workspace` answers for `WORKSPACE`.
+/// `WorkspaceLayout::InWorkspace`). Only a regular file counts (a link to
+/// a file is followed), and only under the name its directory lists it by:
+/// on a disk that folds case, a directory `workspace` or a file
+/// `Module.bazel` answers for `WORKSPACE` or `MODULE.bazel`, and is none.
+///
+/// For a file, that is stricter than Bazel, whose client only tests that
+/// the name exists and so takes a file `Module.bazel` on such a disk. A
+/// workspace whose file is spelled in another case gets nothing of what
+/// socket-patch does for Bazel until the file has Bazel's spelling. Such
+/// a workspace builds on no disk that tells the cases apart, so a stray
+/// file is the likelier reason for the name.
 pub const WORKSPACE_FILES: [&str; 4] =
     ["MODULE.bazel", "REPO.bazel", "WORKSPACE", "WORKSPACE.bazel"];
+
+/// The variable that switches off everything socket-patch does because a
+/// project is in a Bazel workspace: for a project that sits in such a
+/// checkout and that Bazel does not build. It is read from the environment
+/// alone, in the words of every such switch
+/// ([`env_truthy`](crate::utils::socket_cli_config::env_truthy)), and a
+/// run that honours it says nothing.
+pub const OFF_ENV: &str = "SOCKET_NO_BAZEL";
+
+/// Whether the user switched the Bazel support off ([`OFF_ENV`]). Then
+/// [`bazel_root`] finds no workspace, and what judges a workspace from
+/// files handed to it, without that lookup, asks this first. What an
+/// earlier run wrote for Bazel is still listed and undone.
+pub fn off() -> bool {
+    crate::utils::socket_cli_config::env_truthy(OFF_ENV)
+}
 
 pub mod built;
 pub mod cargo;
@@ -41,16 +65,30 @@ pub struct BazelRoot {
 /// its `.git` belongs to a trusted owner; in no such checkout only the
 /// project's own directory is looked at. So nothing above the checkout, or
 /// above a project outside one, is read, and no file is written there.
+/// None for a user who switched the Bazel support off ([`off`]).
 pub fn bazel_root(project: &Path) -> Option<BazelRoot> {
+    (!off()).then(|| root_of(project)).flatten()
+}
+
+/// [`bazel_root`] whatever the switch says: for the one caller that takes
+/// away what an earlier run wrote for Bazel ([`ignore::sync`]).
+pub(crate) fn root_of(project: &Path) -> Option<BazelRoot> {
     let dirs = search_dirs(project);
     root_in(&dirs, repo_at_end_of(dirs.clone()))
 }
 
-/// [`bazel_root`] for the walk `dirs`, which ended at the checkout `repo`.
+/// [`root_of`] for the walk `dirs`, which ended at the checkout `repo`.
 fn root_in(dirs: &[PathBuf], repo: Option<GitRepo>) -> Option<BazelRoot> {
     let within = repo.filter(|repo| repo.trusted).map_or(1, |_| dirs.len());
     let at = dirs.iter().take(within).position(|dir| {
-        let marks = |name| std::fs::metadata(dir.join(name)).is_ok_and(|meta| meta.is_file());
+        let file = |name: &str| std::fs::metadata(dir.join(name)).is_ok_and(|meta| meta.is_file());
+        // Asked only once the stat found a file, so a directory with none
+        // costs what it did. One that cannot be listed keeps the stat's word.
+        let listed = |name: &str| match std::fs::read_dir(dir) {
+            Ok(entries) => entries.flatten().any(|entry| entry.file_name() == name),
+            Err(_) => true,
+        };
+        let marks = |name| file(name) && listed(name);
         WORKSPACE_FILES.into_iter().any(marks)
     })?;
     Some(BazelRoot {
@@ -124,6 +162,44 @@ mod tests {
         let (_tmp, base) = tree(&dirs, &[]);
         assert_eq!(bazel_root(&base.join("workspace/proj")), None);
         assert_eq!(bazel_root(&base.join("sub/proj")), None);
+    }
+
+    /// A regular file whose name is one of the four in another case: on a
+    /// disk that folds case a stat of `WORKSPACE` finds the file
+    /// `workspace`, and the directory lists it as it is. On a disk that
+    /// does not fold case the stat finds nothing. The test asks the disk
+    /// which of the two it runs on and says so.
+    #[test]
+    fn a_file_named_in_another_case_is_no_root() {
+        let spelled = ["workspace", "Workspace.bazel", "Module.bazel", "repo.BAZEL"];
+        let (_tmp, base) = tree(&[".git", "proj"], &spelled);
+        let folds = fs::metadata(base.join("WORKSPACE")).is_ok();
+        println!("a file named `workspace`: the disk folds case: {folds}");
+        assert_eq!(bazel_root(&base.join("proj")), None);
+        assert_eq!(bazel_root(&base), None);
+        // Beside the file under its own name the directory is a root.
+        if !folds {
+            fs::write(base.join("WORKSPACE"), "").unwrap();
+            assert_eq!(root(&base.join("proj")), Some(base));
+        }
+    }
+
+    /// A directory that may be searched and not listed, as a directory of
+    /// another user above the project can be: the stat finds the file, the
+    /// names cannot be read, and the file counts as it did.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_cannot_be_listed_keeps_its_workspace_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, base) = tree(&["repo/.git", "repo/app"], &["repo/MODULE.bazel"]);
+        let repo = base.join("repo");
+        fs::set_permissions(&repo, fs::Permissions::from_mode(0o311)).unwrap();
+        let listed = fs::read_dir(&repo).is_ok();
+        let found = root(&repo.join("app"));
+        fs::set_permissions(&repo, fs::Permissions::from_mode(0o755)).unwrap();
+        // The superuser lists every directory: the stat alone is not shown.
+        println!("a directory without read permission: it can be listed: {listed}");
+        assert_eq!(found, Some(repo));
     }
 
     #[cfg(unix)]

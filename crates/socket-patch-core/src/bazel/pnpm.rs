@@ -102,9 +102,11 @@ fn extension(name: &'static str) -> Extension<'static> {
 /// `pnpm-workspace.yaml` from a pnpm that may be 11 or later (the module
 /// docs), read from the Bazel workspace the project is in: on disk the one
 /// of [`super::bazel_root`], in memory the project itself, whose files are
-/// all there is. `None` in every other case, and outside a Bazel workspace.
+/// all there is. `None` in every other case, outside a Bazel workspace, and
+/// for a user who switched the Bazel support off ([`super::off`]).
 pub async fn hidden(view: &ProjectView<'_>) -> Option<RewriteWarning> {
     let detail = match *view {
+        ProjectView::Memory(_) if super::off() => None,
         ProjectView::Memory(project) => {
             let read = |path: &str| match project.get(path) {
                 Some(MemoryEntry::Text(text)) => Entry::Text(text.to_string()),

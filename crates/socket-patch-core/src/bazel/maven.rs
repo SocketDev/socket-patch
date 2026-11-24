@@ -475,8 +475,13 @@ pub struct Hubs {
     /// Whether the workspace has to do with the ruleset: a call of a file
     /// that was read names it, its `WORKSPACE` file calls `maven_install`,
     /// or a `maven_install.json` lies at the root. In another workspace a
-    /// doubt is about no hub ([`hub_jars`]).
+    /// doubt is about no hub ([`hub_jars`]; [`Hubs::built`] unless
+    /// `unread`).
     ruleset: bool,
+    /// Whether a file that is there was not read as a whole, and may be the
+    /// one that names the ruleset ([`Workspace::unread`]), or the
+    /// `WORKSPACE` file is not read while Bazel may read it.
+    unread: bool,
 }
 
 impl Hubs {
@@ -614,6 +619,7 @@ impl Hubs {
         };
         let ruleset =
             named || (calls && legacy.is_some()) || view("maven_install.json") != Entry::Absent;
+        let unread = ws.unread || legacy.is_some();
         doubts.extend(legacy);
         Hubs {
             pinned,
@@ -624,10 +630,14 @@ impl Hubs {
             edited,
             asked,
             ruleset,
+            unread,
         }
     }
 
-    /// Whether Bazel builds the jar of `group:artifact` at `version`.
+    /// Whether Bazel builds the jar of `group:artifact` at `version`. Of
+    /// a jar that no hub fetches it is not known where something was not
+    /// read, in a workspace that has to do with the ruleset or may: one
+    /// with a file that is there and was not read as a whole.
     pub fn built(&self, group: &str, artifact: &str, version: &str) -> Built<'_> {
         let mut by = Vec::new();
         for (hub, lock) in &self.pinned {
@@ -640,9 +650,10 @@ impl Hubs {
         let named = Some(target(&format!("{group}:{artifact}")));
         let over = |(of, _): &&(Option<String>, Doubt)| of.is_none() || *of == named;
         match self.overrides.iter().find(over) {
-            _ if by.is_empty() => self
-                .doubt()
-                .map_or(Built::No, |(doubt, kind)| Built::Unknown(doubt, kind)),
+            _ if by.is_empty() => {
+                let doubt = self.doubt().filter(|_| self.ruleset || self.unread);
+                doubt.map_or(Built::No, |(doubt, kind)| Built::Unknown(doubt, kind))
+            }
             Some((Some(_), tag)) => Built::Unknown(tag, Kind::Overridden),
             Some((None, tag)) => Built::Unknown(tag, Kind::Unread),
             None => Built::Yes(by),
@@ -1409,8 +1420,11 @@ fn hub_jars_blocking(project: &Path) -> HubJars {
         );
         (HUB_NOT_READ, detail)
     });
-    let stale =
-        |patch: &&Patch| hubs.built(&patch.group, &patch.artifact, &patch.version) == Built::No;
+    // Only when every hub was read: one that was not may fetch the jar.
+    let stale = |patch: &&Patch| {
+        let fetched = hubs.built(&patch.group, &patch.artifact, &patch.version);
+        hubs.doubt().is_none() && fetched == Built::No
+    };
     let stale = hubs.block.iter().filter(stale);
     HubJars {
         jars: purls.into_iter().collect(),
@@ -2174,6 +2188,42 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
         assert_eq!(built(&open), "no");
     }
 
+    /// What was not read is about a hub only in a workspace that has to do
+    /// with the ruleset, or may: a file that was read names it, a lock of
+    /// the ruleset's name lies at the root, or a file that is there was not
+    /// read as a whole, which may be the one that names it. In a workspace
+    /// of other rulesets whose files were all read no hub builds the jar:
+    /// an include that does not exist names nothing, and neither does a
+    /// statement of a file that was read.
+    #[test]
+    fn a_doubt_is_about_no_hub_where_nothing_names_the_ruleset() {
+        let include = "include(\"//:more.MODULE.bazel\")\n";
+        let gone = "more.MODULE.bazel:0: it does not exist; MODULE.bazel";
+        let go = format!("bazel_dep(name = \"rules_go\", version = \"0.50.1\")\n{include}");
+        let dep = go.replace("rules_go", "rules_jvm_external");
+        let hub = format!("{PINNED}{include}");
+        for (module, lock, said) in [
+            (&go, None, "no".to_string()),
+            (&go, Some(LOCK_SKIPS), format!("{gone}:2 includes it")),
+            (&dep, None, format!("{gone}:2 includes it")),
+            (&hub, Some(LOCK_SKIPS), format!("{gone}:9 includes it")),
+        ] {
+            let mut files = vec![("MODULE.bazel", module.as_str())];
+            files.extend(lock.map(|lock| ("maven_install.json", lock)));
+            assert_eq!(built(&files), said, "{module} {}", lock.is_some());
+        }
+        let load = go.replace(include, "load(\"//:defs.bzl\", \"deps\")\n");
+        assert_eq!(built(&[("MODULE.bazel", &load)]), "no");
+        // The included file is there and cannot be parsed, and so the root.
+        let open = "f(\n";
+        let files = [("MODULE.bazel", go.as_str()), ("more.MODULE.bazel", open)];
+        let why = "a bracket is never closed";
+        let said = format!("more.MODULE.bazel:1: {why}; MODULE.bazel:2 includes it");
+        assert_eq!(built(&files), said);
+        let said = format!("MODULE.bazel:1: {why}");
+        assert_eq!(built(&[("MODULE.bazel", open)]), said);
+    }
+
     /// A project directory with the files `files`, in a checkout of its
     /// own.
     fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -2354,7 +2404,11 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
         let entry = patch("netty-tcnative-classes", NETTY_UUID);
         let patched = with_patch(PINNED, LABEL, entry).expect("a block");
         let patched_lockless = format!("{patched}\nmaven.install(name = \"tools\")\n");
-        let rows: [(&str, &[(&str, &str)], Vec<&str>, Option<String>, bool); 19] = [
+        // That block where nothing that was read names the ruleset any
+        // more, beside a file the reader cannot have.
+        let orphan = with_patch(go, LABEL, patch("netty-tcnative-classes", NETTY_UUID));
+        let orphan = orphan.expect("a block");
+        let rows: [(&str, &[(&str, &str)], Vec<&str>, Option<String>, bool); 20] = [
             // The jar without a classifier of each artifact, in each format.
             (PINNED, &[(main, &v2)], netty.clone(), None, false),
             (PINNED, &[(main, &v3)], netty.clone(), None, false),
@@ -2465,6 +2519,9 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
                 Some(format!("maven_install.json: it does not exist, {NOT_READ}")),
                 false,
             ),
+            // Not where something was not read, although no warning says
+            // so there: the file that was not read may hold the hub.
+            (&orphan, &[], vec![], None, false),
         ];
         for (module, locks, jars, unread, stale) in rows {
             let dir = project(&[&[("MODULE.bazel", module)], locks].concat());

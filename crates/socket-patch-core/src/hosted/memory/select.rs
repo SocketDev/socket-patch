@@ -170,11 +170,14 @@ fn classify(
     }
     // Beside a gem lock, the files of a Bazel workspace at this root: they
     // say whether a rules_ruby hub holds a gem of the lock to a sha256 of
-    // its own (`bazel::ruby`).
+    // its own (`bazel::ruby`). Not for a user who switched the Bazel
+    // support off: no file is then asked for that nothing judges, and the
+    // selection is the one of the tree without its Bazel files.
     let locks = ["Gemfile.lock", "gems.locked"];
     if gems
         && locks.iter().any(|lock| root_files.contains(lock))
         && crate::bazel::ruby::is_workspace_file(rel)
+        && !crate::bazel::off()
     {
         return Some(Need::Text);
     }
@@ -197,7 +200,8 @@ fn classify(
         }
         // A hub of the Bazel workspace can stand against a pin in the pnpm
         // lock beside its `MODULE.bazel` ([`crate::bazel::pnpm`]).
-        if rel == "MODULE.bazel" && root_files.contains("pnpm-lock.yaml") {
+        let beside = rel == "MODULE.bazel" && root_files.contains("pnpm-lock.yaml");
+        if beside && !crate::bazel::off() {
             return Some(Need::Text);
         }
         return None;

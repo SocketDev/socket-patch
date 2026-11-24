@@ -282,6 +282,12 @@ pub struct Workspace {
     /// doubt about every answer of [`Self::tags`], which does not repeat
     /// them. The first 1,024 are kept.
     pub doubts: Vec<Doubt>,
+    /// Whether a file that is there was not read as a whole: one that
+    /// cannot be read or parsed, and one past a bound, which is not asked
+    /// for. What such a file says is not known, the name of a ruleset
+    /// included. A file that an `include` names and that does not exist
+    /// says nothing, and is none.
+    pub unread: bool,
     /// The file of the older `WORKSPACE` system at the Bazel root, when
     /// it says more than `workspace(...)`: its name (`WORKSPACE.bzlmod`,
     /// else `WORKSPACE.bazel`, else `WORKSPACE`, as Bazel takes one) and
@@ -396,16 +402,20 @@ impl Workspace {
                 let why =
                     format!("it is one more than the {MAX_FILES} files that are asked for{by}");
                 ws.doubt(&path, 0, why);
+                ws.unread = true;
                 break;
             }
             // What is wrong with the file, and on which line of it: 0 for
             // the file as a whole.
-            let file = match view(&path) {
+            let entry = view(&path);
+            let there = entry != Entry::Absent;
+            let file = match entry {
                 Entry::Absent if includer.is_none() => break,
                 Entry::Absent => Err((0, "it does not exist".to_string())),
                 Entry::Unreadable(why) => Err((0, format!("it cannot be read: {why}"))),
                 Entry::Text(text) if text.len() > budget => {
                     ws.doubt(&path, 0, format!("{OVER_TOTAL}{by}"));
+                    ws.unread = true;
                     break;
                 }
                 Entry::Text(text) => {
@@ -416,6 +426,7 @@ impl Workspace {
             match file {
                 Err((line, why)) => {
                     ws.doubt(&path, line, format!("{why}{by}"));
+                    ws.unread |= there;
                     failed.insert(path);
                 }
                 Ok(file) => {
@@ -1831,6 +1842,31 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
         assert_eq!(ws.tags(&PIP, "parse"), Tags::default());
     }
 
+    /// A file that is there and is not read as a whole is told from one
+    /// that an include names and that does not exist: what the first says
+    /// is not known ([`Workspace::unread`]).
+    #[test]
+    fn a_file_that_is_there_and_not_read_is_told_from_one_that_is_missing() {
+        let unread = |included: Entry| {
+            let view = |path: &str| match path {
+                "MODULE.bazel" => Entry::Text("include('//:a.MODULE.bazel')\n".to_string()),
+                "a.MODULE.bazel" => included.clone(),
+                _ => Entry::Absent,
+            };
+            Workspace::read(&view).unread
+        };
+        assert!(!unread(Entry::Absent));
+        assert!(!unread(Entry::Text("x = 1\n".to_string())));
+        // One that includes itself was read.
+        let cycle = "include('//:a.MODULE.bazel')\n";
+        assert!(!unread(Entry::Text(cycle.to_string())));
+        assert!(unread(Entry::Unreadable("it is not UTF-8".to_string())));
+        assert!(unread(Entry::Text("x = 'never closed\n".to_string())));
+        // The root file, and a workspace with none.
+        assert!(Workspace::read(&|_| Entry::Unreadable("no".to_string())).unread);
+        assert!(!Workspace::read(&|_| Entry::Absent).unread);
+    }
+
     #[test]
     fn the_files_of_a_workspace_are_bounded() {
         // 300 files in a chain: the first 256 are read, and no other is
@@ -1849,6 +1885,7 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
         let want = "256.MODULE.bazel:0: it is one more than the 256 files that are asked for; \
                     255.MODULE.bazel:1 includes it";
         assert_eq!(doubts(&ws.doubts), [want]);
+        assert!(ws.unread, "the file past the bound may be there");
         // Nine files of nearly 1 MiB: the ninth is past 8 MiB.
         let big = format!("#{}\n", "x".repeat(MAX_BYTES - 64));
         let ws = Workspace::read(&|path| match path {
@@ -1862,6 +1899,7 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
         let want = "8.MODULE.bazel:0: the files of the workspace are larger than 8 MiB in all; \
                     MODULE.bazel:9 includes it";
         assert_eq!(doubts(&ws.doubts), [want]);
+        assert!(ws.unread, "the ninth file is there");
         // The `WORKSPACE` file is one of the files of the workspace.
         let (file, why) = ("WORKSPACE.bzlmod".to_string(), OVER_TOTAL.to_string());
         assert_eq!(ws.legacy, Some(Err(Doubt { file, line: 0, why })));

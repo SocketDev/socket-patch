@@ -1690,13 +1690,15 @@ pub async fn read_candidate_files_in(
         // from the checkout on disk, and in memory from the files handed
         // over, where the project's directory is the Bazel root. A project
         // in no Bazel workspace, or whose lock no such call may read, gets
-        // none, and its run is the one it was.
+        // none, and its run is the one it was. So does every project of a
+        // user who switched the Bazel support off.
         let (_, lock) = crate::patch::redirect::gem_pair(&out.files);
         if out.files.contains_key(lock) {
             use crate::bazel::ruby::{handed, handed_on_disk, KEY};
             use crate::bazel::workspace::Entry;
             use crate::vendor::lock_inventory::MemoryEntry;
             let held = match view {
+                ProjectView::Memory(_) if crate::bazel::off() => None,
                 ProjectView::Memory(project) => {
                     let file = |path: &str| match project.get(path) {
                         Some(MemoryEntry::Text(text)) => Entry::Text(text.to_string()),

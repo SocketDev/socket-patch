@@ -1208,6 +1208,81 @@ impl Cell {
         json!([run(&["--json"]), run(&[])])
     }
 
+    /// The workspace copy with the files `files` and nothing else.
+    fn remake(&self, files: &Tree) {
+        let entries = std::fs::read_dir(&self.scratch.workspace).expect("the workspace copy");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let gone = match entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                true => std::fs::remove_dir_all(&path),
+                false => std::fs::remove_file(&path),
+            };
+            gone.unwrap_or_else(|e| panic!("remove {}: {e}", path.display()));
+        }
+        for (rel, bytes) in files {
+            self.write(rel, bytes);
+        }
+    }
+
+    /// `SOCKET_NO_BAZEL=1` makes `socket-patch <args>` in this checkout the
+    /// run of the same checkout without its Bazel files `bazel`, to a
+    /// script (`--json`) and to a person: the exit code, both streams byte
+    /// for byte, and every file the run left but those ([`undated`]). Each
+    /// run starts in the checkout as it is now, made anew, and the checkout
+    /// is left as it is now. The run without the Bazel files passes.
+    /// Without the variable the same command gives something else in the
+    /// workspace, which is what this gives: the comparison is of a run that
+    /// the workspace changes.
+    pub fn off_is_without_bazel(
+        &self,
+        api: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        bazel: &[&str],
+    ) -> Value {
+        let files = self.tree();
+        let mut plain = files.clone();
+        plain.retain(|rel, _| !bazel.contains(&rel.as_str()));
+        let gives = |start: &Tree, env: &[(&str, &str)]| {
+            let run = |form: &[&str]| {
+                self.remake(start);
+                let mut cmd = self.socket_patch_command(api, &[args, form].concat(), env);
+                let out = cmd.output().expect("spawn socket-patch");
+                let text = |bytes: Vec<u8>| String::from_utf8_lossy(&bytes).into_owned();
+                let mut left = undated(&self.tree());
+                left.retain(|rel, _| !bazel.contains(&rel.as_str()));
+                let left: BTreeMap<String, String> = left
+                    .into_iter()
+                    .map(|(rel, bytes)| (rel, text(bytes)))
+                    .collect();
+                json!({
+                    "code": out.status.code(),
+                    "stdout": text(out.stdout),
+                    "stderr": text(out.stderr),
+                    "files": left,
+                })
+            };
+            json!([run(&["--json"]), run(&[])])
+        };
+        let off = [env, &[("SOCKET_NO_BAZEL", "1")]].concat();
+        let without = gives(&plain, env);
+        let (switched, beside) = (gives(&files, &off), gives(&files, env));
+        self.remake(&files);
+        let test = &self.test;
+        let codes = [&without[0]["code"], &without[1]["code"]];
+        assert_eq!(
+            codes,
+            [&json!(0), &json!(0)],
+            "{test}: {args:?}: {without:#}"
+        );
+        assert_eq!(switched, without, "{test}: {args:?} with SOCKET_NO_BAZEL=1");
+        assert_ne!(
+            beside, without,
+            "{test}: {args:?} is no other run in the workspace"
+        );
+        beside
+    }
+
     /// Where a flow has `socket-patch` write the VEX document `name`:
     /// beside the workspace copy, so it is no file of the checkout, and no
     /// comparison of the checkout's files sees it.

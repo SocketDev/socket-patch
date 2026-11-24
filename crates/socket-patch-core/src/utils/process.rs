@@ -122,6 +122,9 @@ pub const CHILD_ENV_SCRUB: &[&str] = &[
     "SOCKET_VEX_NO_BAZEL",
     "SOCKET_VEX_DOC_ID",
     "SOCKET_VEX_COMPACT",
+    // The switch for a project that Bazel does not build, read from the
+    // environment alone (`bazel::OFF_ENV`).
+    "SOCKET_NO_BAZEL",
     // Socket-specific service URLs read from the environment alone.
     "SOCKET_NPM_REGISTRY",
     "SOCKET_PYPI_JSON_API",
@@ -1472,9 +1475,11 @@ pub(crate) mod tests {
 
     /// The scrub list names every accepted socket-cli alias and its
     /// canonical name, each once, and nothing but `SOCKET_*` names: a proxy
-    /// or registry credential of the package manager's is never on it.
+    /// or registry credential of the package manager's is never on it. It
+    /// names the switch that no flag binds as well.
     #[test]
     fn the_scrub_list_covers_the_peer_aliases_and_only_socket_names() {
+        assert!(CHILD_ENV_SCRUB.contains(&crate::bazel::OFF_ENV));
         for (canonical, alias) in crate::utils::env_compat::PEER_ENV_ALIASES {
             for name in [canonical, alias] {
                 assert!(
