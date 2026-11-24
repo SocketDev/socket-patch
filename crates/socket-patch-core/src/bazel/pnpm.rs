@@ -74,7 +74,7 @@
 //! project whose lock no listed call names is left as it is.
 
 use super::rc::ModuleLock;
-use super::starlark::{Arg, Call, How, Value};
+use super::starlark::{Arg, Call, File, How, Value};
 use super::workspace::{disk, Doubt, Entry, Extension, Label, Repo, Workspace};
 use crate::formats::text::strip_bom;
 use crate::hosted::guidance::{is_trust_scaffold, plan_workspace_trust, TrustPlan};
@@ -155,8 +155,9 @@ pub enum Reader {
     /// No such call was read, and the workspace was not read whole: what
     /// could not be read of it, where a hub may be. A doubt of the reader
     /// ([`Workspace::doubts`], the doubts of the hub's tags) as `file:line:
-    /// why`, or the `WORKSPACE` file that says more than `workspace(...)`
-    /// ([`Workspace::legacy`]), whose repositories no tag lists.
+    /// why`, or the file of the older `WORKSPACE` system
+    /// ([`Workspace::legacy`]) where it cannot be read or brings in
+    /// rules_js: the repositories it defines are in no tag.
     ///
     /// [`Hubs::hidden`] passes over what was not seen, because withholding
     /// there would take a patch from projects that are patched today. Not
@@ -303,13 +304,50 @@ fn reader(ws: &Workspace, project: &str, locks: &[String]) -> Option<Reader> {
         return Some(Reader::Unseen(doubt(unread)));
     }
     match &ws.legacy {
-        Some(Ok((file, _))) => Some(Reader::Unseen(format!(
-            "{file} defines repositories of its own, and a hub among them is not looked \
-             for{from}"
-        ))),
+        Some(Ok((file, legacy))) => brings_in_rules_js(legacy).map(|line| {
+            Reader::Unseen(format!(
+                "{file}:{line}: it brings in rules_js, and a hub that this file defines is \
+                 not read{from}"
+            ))
+        }),
         Some(Err(unread)) => Some(Reader::Unseen(doubt(unread))),
         None => None,
     }
+}
+
+/// The line on which the file of the older `WORKSPACE` system brings in
+/// rules_js: a `load` from the ruleset's repository, a `load` of its hub
+/// rule from anywhere, or a call of that rule, by its own name or by one a
+/// `load` gives it. `None` for a file that plainly does none of these: an
+/// `http_archive` of something else defines no hub of a pnpm lock.
+///
+/// Not looked at, as for the other rulesets: a macro of a `.bzl` file that
+/// makes the call, and a repository of the ruleset under another name
+/// whose hub rule the file does not load itself.
+fn brings_in_rules_js(legacy: &File) -> Option<usize> {
+    const RULE: &str = "npm_translate_lock";
+    let rule = Value::Str(RULE.to_string());
+    let loads = legacy.calls.iter().filter(|call| call.callee == "load");
+    let names: Vec<&str> = loads
+        .flat_map(|load| &load.args)
+        .filter_map(|arg| match &arg.how {
+            How::Keyword(alias) if arg.value == rule => Some(alias.as_str()),
+            _ => None,
+        })
+        .chain([RULE])
+        .collect();
+    let brings = |call: &&Call| match call.callee.as_str() {
+        "load" => {
+            let ruleset = |label: &str| {
+                let repository = label.trim_start_matches('@');
+                repository.starts_with("aspect_rules_js//")
+            };
+            matches!(call.positional(0), Some(Value::Str(label)) if ruleset(label))
+                || call.args.iter().any(|arg| arg.value == rule)
+        }
+        callee => names.contains(&callee),
+    };
+    legacy.calls.iter().find(brings).map(|call| call.line)
 }
 
 /// The text of [`Hubs::hidden`] for the project in the directory `project`
@@ -1281,10 +1319,11 @@ mod tests {
     /// reads it" only if the workspace was read whole. A file that
     /// `MODULE.bazel` includes and that is not there, a proxy of the
     /// extension that is handed to something else, and a `WORKSPACE` file
-    /// that says more than `workspace(...)` each leave a hub that may read
-    /// the lock, and say what was not read. A call that does read the lock
-    /// is named first. A workspace that is read whole, with a hub of
-    /// another lock or with no rules_js at all, has no reader.
+    /// that brings in rules_js each leave a hub that may read the lock, and
+    /// say what was not read. A call that does read the lock is named
+    /// first. A workspace that is read whole, with a hub of another lock or
+    /// with no rules_js at all, has no reader, and neither has one whose
+    /// `WORKSPACE` file is about something else.
     #[test]
     fn what_the_reader_may_not_have_seen_counts_as_a_hub_that_may_read_the_lock() {
         let reader = |files: &[(&str, &str)]| {
@@ -1335,16 +1374,56 @@ mod tests {
             assert_eq!(
                 what,
                 format!(
-                    "{file} defines repositories of its own, and a hub among them is not \
-                     looked for"
+                    "{file}:1: it brings in rules_js, and a hub that this file defines is not \
+                     read"
                 )
             );
         }
-        // One that only names the workspace defines none.
+        // The file brings in rules_js by a `load` from its repository, by a
+        // `load` of the hub rule from anywhere, or by a call of the rule
+        // under the name a `load` gave it.
+        let other = "http_archive(name = \"other\", urls = [\"https://example.test/o.tgz\"])\n";
+        for (text, line) in [
+            (
+                "load(\"@aspect_rules_js//js:repositories.bzl\", \"rules_js_dependencies\")\n",
+                1,
+            ),
+            (
+                "load(\"@js//npm:repositories.bzl\", \"npm_translate_lock\")\n",
+                1,
+            ),
+            (
+                "load(\"//tools:js.bzl\", lock = \"npm_translate_lock\")\n\nlock(name = \"npm\")\n",
+                1,
+            ),
+        ] {
+            let text = format!("{other}{text}");
+            let what = unseen(&[("WORKSPACE", text.as_str())]);
+            assert!(
+                what.starts_with(&format!("WORKSPACE:{}: it brings in rules_js", line + 1)),
+                "{text}: {what}"
+            );
+        }
+        // One that only names the workspace defines nothing, and one that
+        // defines something else defines no hub of a pnpm lock.
         let named = "workspace(name = \"app\")\n";
-        assert_eq!(
-            reader(&[("MODULE.bazel", &elsewhere), ("WORKSPACE", named)]),
-            None
+        let unrelated = format!("{named}{other}load(\"@other//:deps.bzl\", \"deps\")\n\ndeps()\n");
+        for text in [named, unrelated.as_str()] {
+            assert_eq!(
+                reader(&[("MODULE.bazel", &elsewhere), ("WORKSPACE", text)]),
+                None,
+                "{text}"
+            );
+        }
+        // One that cannot be read may define anything.
+        let unread = |path: &str| match path {
+            "WORKSPACE" => Entry::Unreadable("it is not UTF-8".to_string()),
+            _ => Entry::Absent,
+        };
+        let what = answer(&unread, "", &[LOCK.to_string()]).reader;
+        assert!(
+            matches!(&what, Some(Reader::Unseen(what)) if what.starts_with("WORKSPACE: ")),
+            "{what:?}"
         );
         // A lock that is no label may be any.
         let odd = module("pnpm_lock = \"//:a:b\"", ELEVEN);

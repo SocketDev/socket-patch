@@ -13808,7 +13808,8 @@ snapshots:
 
     /// In a Bazel workspace the route is taken only where it is certain
     /// that no hub reads a governing lock. A hub the reader cannot see
-    /// leaves that open: one a `WORKSPACE` file defines, one in a file that
+    /// leaves that open: one of a `WORKSPACE` file that brings in rules_js,
+    /// one in a file that
     /// `MODULE.bazel` includes and that was not handed in, one behind a
     /// proxy of the extension that is handed to something else. Each keeps
     /// the project on the pin of a run that is offered no registry, and
@@ -13825,7 +13826,7 @@ snapshots:
             (
                 "WORKSPACE",
                 workspace_hub,
-                "(WORKSPACE defines repositories of its own",
+                "(WORKSPACE:1: it brings in rules_js",
             ),
             (
                 "MODULE.bazel",
@@ -13860,13 +13861,18 @@ snapshots:
         }
 
         // Read whole, and no hub of this lock: a workspace with no rules_js
-        // at all, and one whose `WORKSPACE` file only names it.
+        // at all, whose `WORKSPACE` file names it and fetches something
+        // else.
         let mut plain = pnpm12_project(LEFT_PAD_V9_LOCK);
         plain.insert_text(
             "MODULE.bazel",
             "bazel_dep(name = \"rules_java\", version = \"8.0.0\")\n",
         );
-        plain.insert_text("WORKSPACE", "workspace(name = \"app\")\n");
+        plain.insert_text(
+            "WORKSPACE",
+            "workspace(name = \"app\")\n\
+             http_archive(name = \"other\", urls = [\"https://example.test/o.tgz\"])\n",
+        );
         let done = registry_rewrite(&plain, &candidates).await;
         assert!(done.pnpm_named_registries);
         assert_eq!(

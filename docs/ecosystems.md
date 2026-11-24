@@ -2372,11 +2372,13 @@ or a call whose `pnpm_lock` is not written out, whatever else the call says. In 
 workspace it takes the route only where it is certain that no hub reads the lock, so what
 the reader could not see counts as a hub that may: a file that `MODULE.bazel` includes and
 that is missing or unreadable, a use of the extension that is not a plain call of a tag,
-and a `WORKSPACE` file that says more than `workspace(...)`, whose repositories are not
-looked through. Unlike the answer above, which passes over what it cannot see so that no
+and a `WORKSPACE` file that cannot be read or that brings in rules_js (a `load` from
+`@aspect_rules_js`, a `load` of `npm_translate_lock`, or a call of that rule), whose
+repositories are not looked through. A `WORKSPACE` file that is about something else
+blocks nothing. Unlike the answer above, which passes over what it cannot see so that no
 project loses a patch, declining the route costs nothing: the project gets the same pin as
 before, and the warning names what was not read ("… because a Bazel hub may read the pnpm
-lock (WORKSPACE defines repositories of its own, …) …"). The lock
+lock (WORKSPACE:3: it brings in rules_js, …) …"). The lock
 reader of rules_js is not the reason: it takes a routed lock (measured on macOS: rules_js
 3.6.0 on Bazel 9.3.2 builds one for a hub without `update_pnpm_lock`, and the packages it
 builds hold the patched bytes; rules_js 2.9.3 on Bazel 8.8.2 does too). The pnpm that a
