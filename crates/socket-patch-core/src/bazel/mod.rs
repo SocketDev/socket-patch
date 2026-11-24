@@ -13,6 +13,7 @@ pub mod cargo;
 pub mod ignore;
 pub mod maven;
 pub mod nuget;
+pub mod pnpm;
 pub mod rc;
 pub mod starlark;
 pub mod workspace;
