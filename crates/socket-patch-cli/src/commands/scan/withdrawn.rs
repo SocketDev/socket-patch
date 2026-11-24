@@ -246,7 +246,9 @@ pub(super) async fn sweep(
                             "{} is pinned to patch {}, which is no longer published \
                              ({status}), but it was not restored: {message}; re-run, or run \
                              `socket-patch rollback {}`",
-                            pin.purl, pin.uuid, pin.purl
+                            pin.purl,
+                            pin.uuid,
+                            crate::ui::shell_word(&pin.purl)
                         ),
                     );
                 }

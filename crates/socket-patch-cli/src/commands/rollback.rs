@@ -351,18 +351,26 @@ async fn patched_in_other_scope(
 
 /// `rollback`'s pointer at the scope that still holds a patched copy: a
 /// rollback of just that purl, naming `--cwd` when the run used one (the record lives in that
-/// project's manifest).
+/// project's manifest). The command names the release without the record's
+/// qualifiers (`?platform=ruby`, `?artifact_id=...`): the record was kept
+/// with its whole variant group, a base purl selects that group, and a `?`
+/// is a glob character to the shell. The purl and the directory are quoted
+/// where a shell would otherwise read them as more than one word.
 fn patched_in_other_scope_warning(purl: &str, path: &Path, common: &GlobalArgs) -> String {
+    let word = crate::ui::shell_word(strip_purl_qualifiers(purl));
     let (scope, mut command) = if common.is_global() {
-        ("the project", format!("socket-patch rollback {purl}"))
+        ("the project", format!("socket-patch rollback {word}"))
     } else {
         (
             "the global install",
-            format!("socket-patch rollback {purl} -g"),
+            format!("socket-patch rollback {word} -g"),
         )
     };
     if common.cwd != Path::new(".") {
-        command.push_str(&format!(" --cwd {}", common.cwd.display()));
+        command.push_str(&format!(
+            " --cwd {}",
+            crate::ui::shell_word(&common.cwd.to_string_lossy())
+        ));
     }
     format!(
         "{purl}: its copy in {scope} ({}) is still patched or could not be \
@@ -4611,6 +4619,52 @@ mod tests {
     }
     use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
     use std::collections::HashMap;
+
+    /// The command this warning tells the user to run is one they paste.
+    /// A record's purl can carry qualifiers (`?platform=ruby`,
+    /// `?artifact_id=...`), and `?` is a glob character: the command names
+    /// the release, which selects the variant group the run kept. What is
+    /// left that a shell reads specially (`%40`, a space in `--cwd`) is
+    /// quoted (#2182).
+    #[test]
+    fn other_scope_warning_prints_a_command_a_shell_reads_as_written() {
+        let quoted = |word: &str| {
+            if cfg!(windows) {
+                format!("\"{word}\"")
+            } else {
+                format!("'{word}'")
+            }
+        };
+        let purl = "pkg:gem/rack@3.1.8?platform=ruby";
+        let path = Path::new("/gems/rack-3.1.8");
+        let local = crate::args::GlobalArgs::default();
+        let warning = patched_in_other_scope_warning(purl, path, &local);
+        assert!(
+            warning.contains("run `socket-patch rollback pkg:gem/rack@3.1.8 -g` to"),
+            "{warning}"
+        );
+        // The message's own naming of the record stays its full purl.
+        assert!(
+            warning.starts_with(&format!("{purl}: its copy in")),
+            "{warning}"
+        );
+
+        let scoped = "pkg:npm/%40scope/a@1.0.0";
+        let global = crate::args::GlobalArgs {
+            global: true,
+            cwd: PathBuf::from("my app"),
+            ..crate::args::GlobalArgs::default()
+        };
+        let warning = patched_in_other_scope_warning(scoped, path, &global);
+        assert!(
+            warning.contains(&format!(
+                "run `socket-patch rollback {} --cwd {}` to",
+                quoted(scoped),
+                quoted("my app")
+            )),
+            "{warning}"
+        );
+    }
 
     // The legacy path-taking delegation shape, kept for the unit tests below
     // (`remove` now threads its already-loaded manifest and ledger straight
