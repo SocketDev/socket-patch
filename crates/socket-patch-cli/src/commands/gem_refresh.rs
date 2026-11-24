@@ -1042,9 +1042,8 @@ pub(crate) struct RestoreRefresh {
     /// The upstream sha256 the refresh verified for each build it judged,
     /// by leaf.
     upstream_sha256: BTreeMap<String, String>,
-    /// A vendored unwind's gems with no patched byte in a gem home: each
-    /// installed copy's archive is the upstream one and its files are not
-    /// a recorded patch's, or the gem is not installed.
+    /// A vendored unwind's gems whose installed copies are all proven to
+    /// be the upstream build ([`upstream_installs`]).
     pub(crate) upstream_installs: BTreeSet<String>,
 }
 
@@ -1247,6 +1246,7 @@ pub(crate) async fn after_vendored_unwind(
     common: &GlobalArgs,
     unwound: &[String],
     records: &BTreeMap<String, PatchRecord>,
+    ledger: &BTreeMap<String, PatchRecord>,
 ) -> RestoreRefresh {
     use socket_patch_core::patch::redirect::upstream::gem_upstream;
 
@@ -1278,44 +1278,63 @@ pub(crate) async fn after_vendored_unwind(
         .await
     };
     refresh.upstream_installs =
-        upstream_installs(unwound, &copies, &refresh.upstream_sha256, records).await;
+        upstream_installs(unwound, &copies, &refresh.upstream_sha256, ledger).await;
     refresh
 }
 
-/// The gems of `unwound` with no patched byte in a gem home once the
-/// refresh ran (#2214): vendoring never wrote there, so a gem that was
-/// only ever vendored is one of them. `copies` is every installed copy of
-/// their builds. A gem is listed when each of its copies is proven to be
-/// the upstream build: the archive RubyGems installed it from hashes to
-/// the build's verified upstream sha256 (`upstream`, by leaf), and its
-/// files are not those of its gem's record in `records`. A gem with no
-/// installed copy is listed too. A copy nothing could judge (no verified
-/// sha256, an unreadable archive) keeps its gem out.
+/// The gems of `unwound` whose installed copies are proven to hold no
+/// patched byte once the refresh ran (#2214): vendoring never wrote to a
+/// gem home, so a gem that was only ever vendored is one of them.
+/// `copies` is every installed copy of their builds. A gem is listed when
+/// it has an installed copy and each one is proven to be the upstream
+/// build twice over: the archive RubyGems installed it from hashes to the
+/// build's verified upstream sha256 (`upstream`, by leaf), and every file
+/// of the gem's ledger record (`ledger`, by purl) is in its pre-patch
+/// state there. Anything short of that keeps the gem out: no copy found
+/// (the gem home may be one this run cannot see), no verified sha256, an
+/// unreadable archive, no record, a file that is patched, edited or
+/// unreadable.
 async fn upstream_installs(
     unwound: &[String],
     copies: &[InstalledCopy],
     upstream: &BTreeMap<String, String>,
-    records: &BTreeMap<String, PatchRecord>,
+    ledger: &BTreeMap<String, PatchRecord>,
 ) -> BTreeSet<String> {
     use socket_patch_core::vendor::file_sha256_hex;
 
-    let mut out: BTreeSet<String> = unwound.iter().cloned().collect();
+    let mut proven: BTreeMap<&str, bool> = BTreeMap::new();
     for copy in copies {
-        if !out.contains(&copy.purl) {
-            continue;
-        }
-        let proven = match upstream.get(&copy.leaf) {
-            Some(sha) => {
+        let is_upstream = match (upstream.get(&copy.leaf), ledger.get(&copy.purl)) {
+            (Some(sha), Some(record)) => {
                 file_sha256_hex(&copy.archive).await.as_ref() == Some(sha)
-                    && !holds_patch(copy, records).await
+                    && is_unpatched(&copy.dir, record).await
             }
-            None => false,
+            _ => false,
         };
-        if !proven {
-            out.remove(&copy.purl);
+        *proven.entry(copy.purl.as_str()).or_insert(true) &= is_upstream;
+    }
+    unwound
+        .iter()
+        .filter(|purl| proven.get(purl.as_str()) == Some(&true))
+        .cloned()
+        .collect()
+}
+
+/// Whether every file `record` lists is in its pre-patch state in the
+/// installed gem `dir`: it hashes to its `beforeHash`, or the patch adds
+/// it and it is not there. A record that lists no file proves nothing.
+async fn is_unpatched(dir: &Path, record: &PatchRecord) -> bool {
+    use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
+
+    if record.files.is_empty() {
+        return false;
+    }
+    for (name, info) in &record.files {
+        if verify_file_patch(dir, name, info).await.status != VerifyStatus::Ready {
+            return false;
         }
     }
-    out
+    true
 }
 
 /// The builds of each gem of `gems` that are this project's: the ones the
