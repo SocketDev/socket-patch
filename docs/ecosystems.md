@@ -2427,6 +2427,12 @@ repository cache holds no copy of the jar, and a checkout builds patched with no
   deleted with the last line, as for the Go lines. A `MODULE.bazel` that names the directory
   outside an entry of the block (a block changed by hand) fails the undo before anything is
   removed, because Bazel stops at a `local_repository` whose directory is gone.
+  Beside a Maven or Gradle build the undo writes that build's files and `MODULE.bazel`
+  together: one that cannot be written fails the undo with every file as it was, and the
+  vendored tree, the hub's directory and the ledger entry go only after all of them are
+  written. A run that is killed between two of those files has removed nothing and leaves
+  `.socket/vendor/.commit-journal.json`: the next socket-patch command in the project
+  finishes the files from it, and the undo run again removes the rest.
 - **Where no entry can be written**, the reasons and codes are those of hosted mode below,
   but for `maven_bazel_download`: the jar is in the checkout, so an option about downloads
   does not stand against it. In a tree only Bazel builds the patch then fails with that code

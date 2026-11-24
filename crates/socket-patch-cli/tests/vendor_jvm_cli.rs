@@ -2416,6 +2416,112 @@ fn vendor_gives_a_pinned_bazel_hub_the_patched_jar() {
     }
 }
 
+/// Beside a Maven build the undo edits the files of two builds: the poms
+/// and `.mvn/maven.config` of Maven, and `MODULE.bazel`. They are written
+/// together. Where one of them cannot be replaced (its directory takes no
+/// new file), the undo fails and every file, the vendored tree, the hub's
+/// directory and the ledger are as they were, whichever build the file is
+/// of: `MODULE.bazel` and the root pom in the project directory, or the
+/// pom of the module in its own. Once every file can be written, the same
+/// undo restores every byte.
+#[cfg(unix)]
+#[test]
+fn an_undo_that_cannot_write_a_file_of_either_build_changes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+    pinned_hub(root, "foo");
+    let pristine = snapshot(root);
+    ok(root, &["vendor"]);
+    let vendored = snapshot(root);
+    let manifest = root.join("proj/.socket/manifest.json");
+    let patches = std::fs::read(&manifest).unwrap();
+    let foo = purl("foo");
+    let mode = |dir: &str, mode| {
+        std::fs::set_permissions(root.join(dir), std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    let undos = [
+        &["vendor", "--revert"][..],
+        &["rollback", &foo],
+        &["remove", &foo],
+    ];
+    for dir in ["proj", "proj/a"] {
+        mode(dir, 0o555);
+        let probe = root.join(dir).join("probe");
+        if std::fs::write(&probe, b"").is_ok() {
+            eprintln!("skipping: permission bits not enforced (running as root?)");
+            std::fs::remove_file(probe).unwrap();
+            return mode(dir, 0o755);
+        }
+        let ran = undos.map(|undo| {
+            let (code, env) = socket(root, undo);
+            let left = snapshot(root);
+            std::fs::write(&manifest, &patches).unwrap();
+            (undo, code, env, left)
+        });
+        mode(dir, 0o755);
+        for (undo, code, env, left) in ran {
+            assert_eq!(code, Some(1), "{dir} {undo:?}: {env}");
+            let changed: std::collections::BTreeSet<&String> = (left.keys().chain(vendored.keys()))
+                .filter(|rel| left.get(*rel) != vendored.get(*rel))
+                .collect();
+            assert!(
+                changed.is_empty(),
+                "{dir} {undo:?} changed {changed:?}: {env}"
+            );
+            let why = env.to_string();
+            assert!(
+                why.contains("every file is as it was"),
+                "{dir} {undo:?}: {env}"
+            );
+        }
+    }
+    ok(root, &["vendor", "--revert"]);
+    assert_eq!(snapshot(root), pristine);
+}
+
+/// The files of that undo are replaced one after the other, under a
+/// journal that names them all. A run that ends between two of them (here
+/// it is killed there) has removed nothing, and leaves the journal: the
+/// next command finishes the replacement before it does anything else, and
+/// the undo run again removes the tree, the hub's directory, which no file
+/// names any more, and the ledger entry.
+#[test]
+fn an_undo_killed_between_two_files_is_finished_by_the_next_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+    pinned_hub(root, "foo");
+    let pristine = snapshot(root);
+    let manifest = root.join("proj/.socket/manifest.json");
+    let patches = std::fs::read(&manifest).unwrap();
+    let foo = purl("foo");
+    let tree = FOO_MAVEN_TREE.strip_prefix("proj/").unwrap();
+    for point in [
+        "group_commit_journal",
+        "group_commit_file@1",
+        "group_commit_file@3",
+    ] {
+        std::fs::write(&manifest, &patches).unwrap();
+        ok(root, &["vendor"]);
+        let (mut cmd, _fixture) = command(root, &["rollback", &foo], true);
+        let killed = cmd.env("SOCKET_PATCH_FAILPOINT", point).output().unwrap();
+        assert_eq!(killed.status.code(), Some(86), "{point}: {killed:?}");
+        let left = snapshot(root);
+        for kept in [
+            ".socket/vendor/.commit-journal.json".to_string(),
+            ".socket/vendor/state.json".to_string(),
+            format!("{FOO_UNIT}/file/foo-1.0.jar"),
+            format!("{tree}/foo-1.0-socket.1d3c1fd2.jar"),
+        ] {
+            assert!(left.contains_key(&kept), "{point}: {kept} is gone");
+        }
+        let undone = ok(root, &["rollback", &foo]);
+        assert_eq!(snapshot(root), pristine, "{point}: {undone}");
+    }
+}
+
 /// Beside a Maven build the hub's directory must survive the commit, as
 /// every vendored artifact must: where a rule of the checkout ignores it,
 /// the run vendors for the Maven build, writes nothing for the hub and
