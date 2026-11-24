@@ -269,6 +269,13 @@ Error: No applied patches with vulnerability metadata to attest.
 The patched packages are not installed yet: the installed copies still hold their original files. Reinstall from the lockfile (hosted or vendored patches) or run `socket-patch apply` (agent-mode patches), then run `socket-patch vex` again.
 ```
 
+For a hosted gem the last line names `socket-patch scan` instead of a reinstall.
+Bundler keeps a gem it has already installed, so a checkout that had its gems before
+it pulled the hosted `Gemfile.lock` still runs the upstream copies, and
+`bundle install`, `bundle install --redownload` and `bundle pristine` don't change
+that. The scan replaces the installed copies; see
+[Ruby gems: gems already installed](ecosystems.md#ruby-gems-gems-already-installed).
+
 `--verbose` prints a line per patch, and `--json` reports each one as its own
 `skipped` event. Warnings of one kind are folded the same way: the first in full,
 then a line naming the packages the rest are about.

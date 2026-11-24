@@ -2320,6 +2320,116 @@ async fn refresh_replaces_a_stale_project_install_and_its_archives() {
     );
 }
 
+/// #2219: the machine that did not run the scan. A teammate pulls the
+/// hosted `Gemfile` / `Gemfile.lock` onto a checkout whose gems are already
+/// installed (or CI restores a `vendor/bundle` cache): Bundler keeps the
+/// upstream copy, and standalone `vex` is the one command that notices.
+/// Its remedy must be one that works. "Reinstall from the lockfile" does
+/// not: `bundle install` changes nothing, and `bundle pristine` on Bundler
+/// 2.6+ removes the gems and then fails on the lock's checksum. So `vex`
+/// names the scan, and the scan it names, with no `--mode`, replaces the
+/// installed copy without touching the committed pair, after which `vex`
+/// attests the gem.
+#[tokio::test(flavor = "multi_thread")]
+async fn standalone_vex_sends_a_stale_hosted_gem_to_the_scan_that_replaces_it() {
+    use vex_e2e_common::{assert_attested, assert_not_attested, run_vex, Marker, VexRun};
+    let server = MockServer::start().await;
+    let patched = real_gem(PATCHED_LIB);
+    mount_api_for(&server, None, &sha256_of(&patched)).await;
+    serve_patched_gem(&server, patched.clone()).await;
+    let uri = server.uri();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Machine A: scan and commit the pair.
+    let a = tmp.path().join("a");
+    std::fs::create_dir_all(&a).unwrap();
+    write_manifest_pair(&a);
+    let (code, _, stderr) = common::run_with_env(&a, &scan_args(&a, &uri, &[]), &[]);
+    assert_eq!(code, 0, "{stderr}");
+
+    // Machine B: the same commit over gems installed before it.
+    let proj = tmp.path().join("b");
+    std::fs::create_dir_all(&proj).unwrap();
+    for file in ["Gemfile", "Gemfile.lock"] {
+        std::fs::copy(a.join(file), proj.join(file)).unwrap();
+    }
+    let pair = |proj: &Path| {
+        ["Gemfile", "Gemfile.lock"].map(|file| std::fs::read_to_string(proj.join(file)).unwrap())
+    };
+    let committed = pair(&proj);
+    assert!(
+        committed[1].contains("/patch-registry/gem/"),
+        "the lock pulled onto machine B names the patch registry:\n{}",
+        committed[1]
+    );
+    let home = project_home(&proj);
+    let gem_dir = install_real_gem(&home, UPSTREAM_LIB);
+
+    let bin = vex_e2e_common::binary();
+    let run = |human: bool| VexRun {
+        api_url: Some(uri.clone()),
+        api_token: Some("fake".into()),
+        org: Some(ORG.into()),
+        patch_server_url: Some(uri.clone()),
+        product: Some("pkg:gem/app@1.0.0".into()),
+        human,
+        ..VexRun::default()
+    };
+    let out = run_vex(&bin, &proj, &run(false));
+    assert_eq!(out.code, Some(1), "{out}");
+    assert_not_attested(&out.envelope, PURL, "not_applied");
+
+    let out = run_vex(&bin, &proj, &run(true));
+    assert_eq!(out.code, Some(1), "{out}");
+    assert!(
+        out.stderr.contains("Run `socket-patch scan` here")
+            && out.stderr.contains("`bundle pristine`")
+            && out.stderr.contains("--gem-refresh-shared"),
+        "the remedy for an installed hosted gem is the scan:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("Reinstall from the lockfile")
+            && !out.stderr.contains("socket-patch apply"),
+        "no remedy that leaves or breaks the install:\n{}",
+        out.stderr
+    );
+    assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB, "vex writes nothing");
+
+    // The scan the hint names: no `--mode`, the project's own.
+    let args = [
+        "scan",
+        "--yes",
+        "--cwd",
+        proj.to_str().expect("utf8 tmp path"),
+        "--api-url",
+        &uri,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+    ];
+    let (code, stdout, stderr) = common::run_with_env(&proj, &args, &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "{stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read(home.join("cache").join(format!("{DEP}-{DEP_VERSION}.gem"))).unwrap(),
+        patched,
+        "the archive every reinstall uses is the patched one"
+    );
+    assert_eq!(pair(&proj), committed, "the committed pair is untouched");
+
+    let out = run_vex(&bin, &proj, &run(false));
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_attested(
+        out.doc(),
+        PURL,
+        UUID,
+        Marker::Redirected,
+        &[(GHSA, &["CVE-2026-4444"])],
+    );
+}
+
 /// The machine's platform in the platform-build arm, and one the lock also
 /// names (another machine's).
 const PLATFORM: &str = "arm64-darwin";

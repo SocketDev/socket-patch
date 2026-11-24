@@ -360,7 +360,8 @@ fn home_spec(gem_dir: &Path) -> Option<PathBuf> {
 
 /// The local-path remedy: Bundler then installs every gem of the project
 /// into the project, from the source the lock names.
-const LOCAL_PATH_REMEDY: &str = "bundle config set --local path vendor/bundle && bundle install";
+pub(crate) const LOCAL_PATH_REMEDY: &str =
+    "bundle config set --local path vendor/bundle && bundle install";
 
 /// The files whose removal makes `bundle install` fetch the gem again: the
 /// installed copy's `specifications` entry and cached archive (Bundler
