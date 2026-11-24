@@ -181,8 +181,11 @@ fn classify(
     // Beside a pnpm lock, the same files: a rules_js hub in one of them
     // can stand against a pin in the lock, and against routing it through
     // a named registry, which is done only where every file that can hold
-    // a hub was read ([`crate::bazel::pnpm`]).
-    if root_files.contains("pnpm-lock.yaml") && crate::bazel::ruby::is_workspace_file(rel) {
+    // a hub was read ([`crate::bazel::pnpm`]). Beside a pnpm-workspace.yaml
+    // too: a workspace that keeps one lock per member can have no lock at
+    // its root, and a hub can read a member's own.
+    let pnpm = root_files.contains("pnpm-lock.yaml") || root_files.contains(PNPM_WORKSPACE_REL);
+    if pnpm && crate::bazel::ruby::is_workspace_file(rel) {
         return Some(Need::Text);
     }
     if !rel.contains('/') {
@@ -622,7 +625,8 @@ pub fn candidate_files() -> Vec<String> {
         "pylock.toml",
         "pylock.*.toml",
         "pnpm-lock.*.yaml (presence only)",
-        "MODULE.bazel, **/*.MODULE.bazel and WORKSPACE files (beside pnpm-lock.yaml)",
+        "MODULE.bazel, **/*.MODULE.bazel and WORKSPACE files (beside pnpm-lock.yaml or \
+         pnpm-workspace.yaml)",
         "**/Cargo.toml (Cargo workspaces)",
         "MODULE.bazel, **/*.MODULE.bazel and WORKSPACE files (beside a gem lock)",
     ] {
@@ -910,6 +914,32 @@ mod tests {
             (s.roots, s.fetch_text),
             (vec!["web".into()], vec!["web/pnpm-lock.yaml".into()])
         );
+    }
+
+    /// A workspace that keeps one lock per member can have no lock at its
+    /// root, and a hub can read a member's own lock: the root is known by
+    /// its `pnpm-workspace.yaml`, and fetches the Bazel files beside it.
+    #[test]
+    fn a_pnpm_workspace_root_without_a_lock_fetches_its_bazel_files_too() {
+        let files = [
+            "MODULE.bazel",
+            "WORKSPACE",
+            "package.json",
+            "packages/a/package.json",
+            "packages/a/pnpm-lock.yaml",
+            "pnpm-workspace.yaml",
+            "tools/npm.MODULE.bazel",
+        ];
+        let entries: Vec<_> = files.map(blob).to_vec();
+        let s = select_paths(&entries, &SelectOptions::default());
+        for file in ["MODULE.bazel", "WORKSPACE", "tools/npm.MODULE.bazel"] {
+            assert!(
+                s.fetch_text.iter().any(|path| path == file),
+                "{file}: roots {:?}, fetched {:?}",
+                s.roots,
+                s.fetch_text
+            );
+        }
     }
 
     /// Beside a gem lock, the files of a Bazel workspace at that root are
