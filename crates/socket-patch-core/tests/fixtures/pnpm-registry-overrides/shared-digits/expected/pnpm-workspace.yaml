@@ -1,0 +1,8 @@
+packages:
+  - '.'
+namedRegistries:
+  socket-aaaaaaaa1111: https://patch.test/patch/npm/leaf/1.0.0/22222222-2222-4222-8222-222222222222/aaaaaaaa-1111-4111-8111-111111111111/
+  socket-aaaaaaaa2222: https://patch.test/patch/npm/@scope/direct/1.0.0/22222222-2222-4222-8222-222222222222/aaaaaaaa-2222-4222-8222-222222222222/
+overrides:
+  '@scope/direct@1.0.0': 'socket-aaaaaaaa2222:1.0.0'
+  'leaf@1.0.0': 'socket-aaaaaaaa1111:1.0.0'

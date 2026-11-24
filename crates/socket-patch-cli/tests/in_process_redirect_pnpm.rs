@@ -3600,3 +3600,1036 @@ async fn hosted_pins_a_pnpm_patched_dependency_only_with_explicit_consent() {
         out.unattested[0].detail
     );
 }
+
+// ── pnpm named registry ──────────────────────────────────────────────────
+
+/// The name of the fixture patch's registry: `socket-` and the first
+/// eight digits of the patch UUID.
+const ALIAS: &str = "socket-11111111";
+
+/// The registry address the reference result of the fixture's patch
+/// carries: the directory its tarball is served from.
+const REGISTRY_URL: &str = "https://patch.test/patch/npm/in-proc-redirect-pnpm/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/";
+
+/// The workspace file's two entries for the fixture's patch.
+fn registry_entry() -> String {
+    format!("  {ALIAS}: {REGISTRY_URL}\n")
+}
+
+fn override_entry() -> String {
+    format!("  '{NAME}@{VERSION}': '{ALIAS}:{VERSION}'\n")
+}
+
+/// The two maps a registry run adds for the fixture's patch.
+fn route_maps() -> String {
+    format!(
+        "namedRegistries:\n{}overrides:\n{}",
+        registry_entry(),
+        override_entry()
+    )
+}
+
+/// One dependency of a [`dep_lock`]: its name, version, the registry the
+/// lock spells that version through once routed (`1.0.0`, or
+/// `socket-11111111:1.0.0`) and its `resolution`.
+struct LockedDep<'a> {
+    name: &'a str,
+    version: &'a str,
+    routed: Option<&'a str>,
+    resolution: String,
+}
+
+impl<'a> LockedDep<'a> {
+    fn upstream(name: &'a str, version: &'a str) -> Self {
+        LockedDep {
+            name,
+            version,
+            routed: None,
+            resolution: format!("{{integrity: {UPSTREAM_SHA512}}}"),
+        }
+    }
+
+    /// Routed through the registry `alias`, resolving the tarball `url`.
+    fn hosted(name: &'a str, version: &'a str, alias: &'a str, url: &str) -> Self {
+        LockedDep {
+            name,
+            version,
+            routed: Some(alias),
+            resolution: format!("{{integrity: {PATCHED_SHA512}, tarball: {url}}}"),
+        }
+    }
+
+    fn token(&self) -> String {
+        match self.routed {
+            Some(alias) => format!("{alias}:{}", self.version),
+            None => self.version.to_string(),
+        }
+    }
+}
+
+/// A lockfileVersion 9.0 lock whose `.` importer depends on `deps` (in
+/// name order), recording `overrides` (`key: value` lines), as pnpm lays
+/// one out.
+fn dep_lock(overrides: &[String], deps: &[LockedDep<'_>]) -> String {
+    let mut lock = "lockfileVersion: '9.0'\n\n".to_string();
+    if !overrides.is_empty() {
+        lock.push_str("overrides:\n");
+        for entry in overrides {
+            lock.push_str(&format!("  {entry}\n"));
+        }
+        lock.push('\n');
+    }
+    lock.push_str("importers:\n\n  .:\n    dependencies:\n");
+    for dep in deps {
+        let spec = dep.token();
+        lock.push_str(&format!(
+            "      {}:\n        specifier: {spec}\n        version: {}\n",
+            dep.name,
+            dep.token()
+        ));
+    }
+    lock.push_str("\npackages:\n");
+    for dep in deps {
+        lock.push_str(&format!(
+            "\n  {}@{}:\n    resolution: {}\n",
+            dep.name,
+            dep.token(),
+            dep.resolution
+        ));
+    }
+    lock.push_str("\nsnapshots:\n");
+    for dep in deps {
+        lock.push_str(&format!("\n  {}@{}: {{}}\n", dep.name, dep.token()));
+    }
+    lock
+}
+
+/// [`mock_reference`] as a patch service that serves registry documents
+/// answers it: the grant also carries the patch's registry address.
+async fn mock_registry_reference(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                UUID: {
+                    "status": "granted",
+                    "url": HOSTED_URL,
+                    "purl": PURL,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": HOSTED_URL,
+                        "integrity": { "sha512": PATCHED_SHA512 }
+                    }],
+                    "registryOverride": null,
+                    "npmRegistryUrl": REGISTRY_URL
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// [`write_pnpm_project`] pinned to a pnpm the registry route is taken
+/// for, its lock laid out as pnpm writes one.
+fn write_pinned_pnpm_project(root: &Path) {
+    write_pnpm_project(root);
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "packageManager": "pnpm@12.22.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pnpm-lock.yaml"),
+        dep_lock(&[], &[LockedDep::upstream(NAME, VERSION)]),
+    )
+    .unwrap();
+}
+
+/// The fixture's lock once the scan routed its one dependency.
+fn routed_fixture_lock() -> String {
+    dep_lock(
+        &[format!("{NAME}@{VERSION}: {ALIAS}:{VERSION}")],
+        &[LockedDep::hosted(NAME, VERSION, ALIAS, HOSTED_URL)],
+    )
+}
+
+fn read(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// A grant that carries a registry address makes the run route the
+/// patched release through the patch's own named registry: a new
+/// pnpm-workspace.yaml declares it and overrides the release with it, the
+/// lock takes the shape pnpm writes for that, and no `trustLockfile` is
+/// written, so pnpm's lockfile verification stays on. The file counts as
+/// rewritten, the warning says what it is for, a re-run is byte-stable,
+/// and `rollback` takes every byte of it back out: the lock is the
+/// pristine one and the file the run created is gone.
+#[tokio::test]
+#[serial]
+async fn hosted_routes_the_patched_package_through_the_patch_servers_registry() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_registry_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pinned_pnpm_project(tmp.path());
+    let lock_path = tmp.path().join("pnpm-lock.yaml");
+    let pristine = read(&lock_path);
+
+    let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(read(&lock_path), routed_fixture_lock());
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    assert_eq!(
+        read(&ws_path),
+        format!("packages:\n  - '.'\n{}", route_maps())
+    );
+    assert!(
+        doc["redirect"]["rewrittenFiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "pnpm-workspace.yaml"),
+        "{doc}"
+    );
+    let detail = doc["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "redirect_pnpm_trust_lockfile")
+        .and_then(|w| w["detail"].as_str())
+        .unwrap_or_else(|| panic!("redirect_pnpm_trust_lockfile: {doc}"));
+    assert!(
+        detail.contains("declares the patch server's registry of each patched package")
+            && detail.contains("`socket-<id>:<version>`")
+            && detail.contains("commit the file alongside the lock")
+            && detail.contains("pnpm clean --lockfile"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains("trustLockfile") && !detail.contains("22222222-2222-4222-8222"),
+        "no trust key is written or recommended, and the grant token stays out: {detail}"
+    );
+    assert_no_ledger(tmp.path());
+
+    let ws = read(&ws_path);
+    let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(read(&lock_path), routed_fixture_lock());
+    assert_eq!(read(&ws_path), ws);
+
+    let code = rollback_hosted(tmp.path(), &server).await;
+    assert_eq!(code, 0, "rollback must restore the pnpm pin");
+    assert_eq!(read(&lock_path), pristine);
+    assert!(
+        !ws_path.exists(),
+        "the pnpm-workspace.yaml the run created goes with the pin"
+    );
+}
+
+/// The registry route is taken only on proof of pnpm 11.20 or newer
+/// (older releases write another lock for the same override). A project
+/// pinned below that and one with no pnpm pin both get today's
+/// `trustLockfile` write; the first is told its pins are why, the second
+/// what a pin would change.
+#[tokio::test]
+#[serial]
+async fn hosted_registry_route_needs_a_pnpm_11_20_pin() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_registry_reference(&server).await;
+
+    for (package_manager, hinted) in [(None, true), (Some("pnpm@11.10.0"), false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_project(tmp.path());
+        if let Some(package_manager) = package_manager {
+            std::fs::write(
+                tmp.path().join("package.json"),
+                format!(
+                    r#"{{ "name": "consumer", "version": "0.0.0", "packageManager": "{package_manager}", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+                ),
+            )
+            .unwrap();
+        }
+        let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+        assert_eq!(code, Some(0), "{doc}");
+        assert_eq!(
+            read(&tmp.path().join("pnpm-workspace.yaml")),
+            "packages:\n  - '.'\ntrustLockfile: true\n",
+            "{package_manager:?}"
+        );
+        assert!(
+            !read(&tmp.path().join("pnpm-lock.yaml")).contains("@socket-"),
+            "{package_manager:?}"
+        );
+        let texts = warning_texts(&doc);
+        assert!(texts.contains("ALL lockfile entries"), "{doc}");
+        assert_eq!(
+            texts.contains(
+                "Pinning pnpm 11.20 or later (for example with package.json `packageManager`) \
+                 and re-running the scan switches the project to per-package registry \
+                 verification instead of `trustLockfile`"
+            ),
+            hinted,
+            "{package_manager:?}: {doc}"
+        );
+        assert_eq!(
+            texts.contains(
+                "Per-package registry verification was not set up because the project's \
+                 pnpm pins"
+            ) && texts.contains("do not prove pnpm 11.20 or later"),
+            !hinted,
+            "{package_manager:?}: {doc}"
+        );
+    }
+}
+
+/// A lock that a rules_js hub of the project's Bazel workspace reads is
+/// not routed, also with a registry address and a pnpm 12 pin. The pnpm a
+/// hub runs with `update_pnpm_lock` may not read the registries, so the
+/// project keeps the pin the Bazel legs build. The run writes what
+/// a patch service that offers no registry gets, the warning names the
+/// call, and `rollback` gives the user's file and the lock back.
+#[tokio::test]
+#[serial]
+async fn hosted_registry_route_is_not_taken_for_a_lock_a_bazel_hub_reads() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_registry_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pinned_pnpm_project(tmp.path());
+    let own = "# the project's own\n";
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    std::fs::write(&ws_path, own).unwrap();
+    std::fs::write(
+        tmp.path().join("MODULE.bazel"),
+        "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+         npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+         npm.npm_translate_lock(pnpm_lock = \"//:pnpm-lock.yaml\")\n",
+    )
+    .unwrap();
+    let lock_path = tmp.path().join("pnpm-lock.yaml");
+    let pristine = read(&lock_path);
+
+    let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(
+        read(&ws_path),
+        format!("{own}packages:\n  - '.'\ntrustLockfile: true\n")
+    );
+    let lock = read(&lock_path);
+    assert!(
+        lock.contains(HOSTED_URL) && !lock.contains("@socket-") && !lock.contains("overrides:"),
+        "{lock}"
+    );
+    let texts = warning_texts(&doc);
+    assert!(
+        texts.contains(
+            "Per-package registry verification was not set up because a Bazel hub reads the \
+             pnpm lock (MODULE.bazel:3)"
+        ),
+        "{doc}"
+    );
+
+    let code = rollback_hosted(tmp.path(), &server).await;
+    assert_eq!(code, 0, "rollback must restore the pnpm pin");
+    assert_eq!(read(&lock_path), pristine);
+    assert_eq!(read(&ws_path), own);
+}
+
+/// `--dry-run` with a registry address: nothing lands on disk, the
+/// workspace file is reported as would-be-rewritten, and the warning says
+/// what the run would declare.
+#[tokio::test]
+#[serial]
+async fn hosted_registry_route_dry_run_writes_nothing() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_registry_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pinned_pnpm_project(tmp.path());
+    let lock_before = std::fs::read(tmp.path().join("pnpm-lock.yaml")).unwrap();
+
+    let (code, doc) = run_hosted_json_env(tmp.path(), &server.uri(), &[("SOCKET_DRY_RUN", "1")]);
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("pnpm-lock.yaml")).unwrap(),
+        lock_before
+    );
+    assert!(!tmp.path().join("pnpm-workspace.yaml").exists());
+    let rewritten = doc["redirect"]["rewrittenFiles"].as_array().unwrap();
+    for file in ["pnpm-lock.yaml", "pnpm-workspace.yaml"] {
+        assert!(rewritten.iter().any(|f| f == file), "{file}: {doc}");
+    }
+    assert!(
+        warning_texts(&doc)
+            .contains("a new pnpm-workspace.yaml would declare the patch server's registry"),
+        "{doc}"
+    );
+}
+
+/// In a workspace file the user wrote, the two entries are added and
+/// every other byte kept: the user's own registries and overrides, their
+/// comments, their line endings, and registries of their own under
+/// `socket` and under the very name ours would take (ours then takes four
+/// more digits). The lock's record of the overrides
+/// keeps the user's entry beside ours. `rollback` takes exactly ours back
+/// out of both files (no `pnpm_trust_lockfile_left` guesswork, unlike the
+/// trust key).
+#[tokio::test]
+#[serial]
+async fn hosted_registry_route_merges_into_a_users_workspace_yaml_and_rolls_back() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_registry_reference(&server).await;
+    mock_registry_version(&server, NAME, VERSION).await;
+
+    let ours = route_maps();
+    for (user_ws, want) in [
+        (
+            "# team workspace\npackages:\n  - '.'\n  - 'tools/*'\n\ncatalog:\n  react: ^18.0.0\n",
+            format!(
+                "# team workspace\npackages:\n  - '.'\n  - 'tools/*'\n\ncatalog:\n  react: ^18.0.0\n{ours}"
+            ),
+        ),
+        (
+            "packages:\r\n  - '.'\r\n  - 'tools/*'\r\n",
+            format!("packages:\n  - '.'\n  - 'tools/*'\n{ours}").replace('\n', "\r\n"),
+        ),
+        (
+            "packages:\n  - '.'\n  - 'tools/*'\nnamedRegistries:\n  corp: https://npm.corp.example/\noverrides:\n  lodash: ^4.17.21 # pinned\ntrustLockfile: false\n",
+            format!(
+                "packages:\n  - '.'\n  - 'tools/*'\nnamedRegistries:\n  corp: https://npm.corp.example/\n{}overrides:\n  lodash: ^4.17.21 # pinned\n{}trustLockfile: false\n",
+                registry_entry(),
+                override_entry()
+            ),
+        ),
+        (
+            "packages:\n  - '.'\nnamedRegistries:\n  socket: https://npm.corp.example/\n  socket-11111111: https://npm.work.example/\n",
+            format!(
+                "packages:\n  - '.'\nnamedRegistries:\n  socket: https://npm.corp.example/\n  socket-11111111: https://npm.work.example/\n  socket-111111111111: {REGISTRY_URL}\noverrides:\n  '{NAME}@{VERSION}': 'socket-111111111111:{VERSION}'\n"
+            ),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pinned_pnpm_project(tmp.path());
+        let ws_path = tmp.path().join("pnpm-workspace.yaml");
+        std::fs::write(&ws_path, user_ws).unwrap();
+        // The lock records the overrides the user's file sets.
+        let users_override = user_ws.contains("lodash");
+        let recorded: Vec<String> = users_override
+            .then(|| "lodash: ^4.17.21".to_string())
+            .into_iter()
+            .collect();
+        let lock_path = tmp.path().join("pnpm-lock.yaml");
+        let pristine = dep_lock(&recorded, &[LockedDep::upstream(NAME, VERSION)]);
+        std::fs::write(&lock_path, &pristine).unwrap();
+
+        let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+        assert_eq!(code, Some(0), "{doc}");
+        assert_eq!(read(&ws_path), want, "{user_ws:?}");
+        let alias = if user_ws.contains("  socket-11111111: ") {
+            "socket-111111111111"
+        } else {
+            ALIAS
+        };
+        let mut routed_overrides = recorded.clone();
+        routed_overrides.push(format!("{NAME}@{VERSION}: {alias}:{VERSION}"));
+        assert_eq!(
+            read(&lock_path),
+            dep_lock(
+                &routed_overrides,
+                &[LockedDep::hosted(NAME, VERSION, alias, HOSTED_URL)]
+            ),
+            "{user_ws:?}"
+        );
+
+        let (code, warnings, envelope) = rollback_subprocess(tmp.path(), &server, &[]);
+        assert_eq!(code, 0, "{envelope}");
+        assert_eq!(
+            read(&ws_path),
+            user_ws,
+            "rollback restores the user's file byte for byte"
+        );
+        assert_eq!(
+            read(&lock_path),
+            pristine,
+            "rollback restores the lock, the user's override still recorded: {user_ws:?}"
+        );
+        assert!(
+            !warnings.contains(&"pnpm_trust_lockfile_left".to_string()),
+            "{envelope}"
+        );
+    }
+}
+
+/// A project an earlier run configured with `trustLockfile: true` (a patch
+/// service that gave no registry address then) moves to the registry route
+/// on the run that has an address for every pin: the trust key that run
+/// wrote goes, so pnpm verifies the whole lockfile again. And the reverse:
+/// the next run whose grant has no address puts the project back on
+/// trust, with nothing of the route left in either file.
+#[tokio::test]
+#[serial]
+async fn hosted_registry_route_replaces_the_trust_key_and_goes_back_cleanly() {
+    let before = MockServer::start().await;
+    mock_discovery(&before).await;
+    mock_reference(&before).await;
+    let after = MockServer::start().await;
+    mock_discovery(&after).await;
+    mock_registry_reference(&after).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pinned_pnpm_project(tmp.path());
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    let lock_path = tmp.path().join("pnpm-lock.yaml");
+    const TRUST: &str = "packages:\n  - '.'\ntrustLockfile: true\n";
+
+    let (code, doc) = run_hosted_json(tmp.path(), &before.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(
+        read(&ws_path),
+        TRUST,
+        "a grant without a registry address keeps today's trust write"
+    );
+    let trust_lock = read(&lock_path);
+    assert!(
+        trust_lock.contains(&format!("tarball: {HOSTED_URL}")) && !trust_lock.contains("@socket-"),
+        "{trust_lock}"
+    );
+    assert!(
+        !warning_texts(&doc).contains("registry verification"),
+        "a patch service that offers no route says nothing of one: {doc}"
+    );
+
+    let (code, doc) = run_hosted_json(tmp.path(), &after.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(
+        read(&ws_path),
+        format!("packages:\n  - '.'\n{}", route_maps())
+    );
+    assert_eq!(read(&lock_path), routed_fixture_lock());
+    assert!(
+        warning_texts(&doc).contains("an earlier socket-patch run wrote there was removed"),
+        "{doc}"
+    );
+
+    // The grant lost its address: a dry run says what would go and writes
+    // nothing; the wet run puts the project back on trust whole.
+    let (code, doc) = run_hosted_json_env(tmp.path(), &before.uri(), &[("SOCKET_DRY_RUN", "1")]);
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(read(&lock_path), routed_fixture_lock());
+    assert_eq!(
+        read(&ws_path),
+        format!("packages:\n  - '.'\n{}", route_maps())
+    );
+    let rewritten = doc["redirect"]["rewrittenFiles"].as_array().unwrap();
+    for file in ["pnpm-lock.yaml", "pnpm-workspace.yaml"] {
+        assert!(rewritten.iter().any(|f| f == file), "{file}: {doc}");
+    }
+    let texts = warning_texts(&doc);
+    assert!(
+        texts.contains("those entries would be removed")
+            && texts.contains(&format!(
+                "the patch service gave no registry address for {NAME}@{VERSION}"
+            )),
+        "{doc}"
+    );
+    let (code, doc) = run_hosted_json(tmp.path(), &before.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(read(&ws_path), TRUST);
+    assert_eq!(read(&lock_path), trust_lock);
+    assert!(
+        warning_texts(&doc).contains("those entries were removed"),
+        "{doc}"
+    );
+
+    // `--no-trust-lockfile-config` opts out of the registry write as well:
+    // the run is the trust run that writes no file.
+    let fresh = tempfile::tempdir().unwrap();
+    write_pinned_pnpm_project(fresh.path());
+    let (code, doc) = run_hosted_json_env(
+        fresh.path(),
+        &after.uri(),
+        &[("SOCKET_NO_TRUST_LOCKFILE_CONFIG", "1")],
+    );
+    assert_eq!(code, Some(0), "{doc}");
+    assert!(
+        !fresh.path().join("pnpm-workspace.yaml").exists(),
+        "the opt-out writes no workspace file"
+    );
+    assert!(
+        !read(&fresh.path().join("pnpm-lock.yaml")).contains("@socket-"),
+        "and the lock stays in the plain shape"
+    );
+    assert!(
+        warning_texts(&doc).contains("pnpm install --trust-lockfile"),
+        "{doc}"
+    );
+}
+
+/// [`rollback_subprocess`] for `remove <purl>` or `rollback [<purl>…]`.
+fn unwind_subprocess(
+    cwd: &Path,
+    server: &MockServer,
+    command: &str,
+    targets: &[&str],
+) -> (i32, serde_json::Value) {
+    let out = hermetic::binary_command()
+        .env_remove("npm_config_registry")
+        .env_remove("NPM_CONFIG_REGISTRY")
+        .env(
+            "SOCKET_NPM_REGISTRY",
+            format!("{}/npm-registry", server.uri()),
+        )
+        .arg(command)
+        .args(targets)
+        .args([
+            "--json",
+            "--yes",
+            "--patch-server-url",
+            "https://patch.test",
+            "--cwd",
+            cwd.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run socket-patch");
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{command} --json stdout must be a JSON envelope: {e}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out.status.code().unwrap_or(-1), envelope)
+}
+
+/// `rollback` and `remove` take one package out of the route and leave
+/// the other routed: its lock key back to the plain one with the upstream
+/// resolution, the importer's specifier back to what package.json asks
+/// for, its registry and its override gone from the workspace file and
+/// from the lock's record at once. The other package's registry and
+/// override are not touched. The rest of the rollback then removes the
+/// file the route created and the lock's `overrides:` block.
+#[tokio::test]
+#[serial]
+async fn rollback_and_remove_take_one_package_out_of_the_route() {
+    const OTHER: &str = "other-pkg";
+    const OTHER_VERSION: &str = "2.0.0";
+    const OTHER_PURL: &str = "pkg:npm/other-pkg@2.0.0";
+    const OTHER_ALIAS: &str = "socket-33333333";
+    let other_url = "https://patch.test/patch/npm/other-pkg/2.0.0/22222222-2222-4222-8222-222222222222/33333333-3333-4333-8333-333333333333/other-pkg-2.0.0.tgz";
+    let server = MockServer::start().await;
+    mock_registry_version(&server, NAME, VERSION).await;
+    mock_registry_version(&server, OTHER, OTHER_VERSION).await;
+
+    let other_registry = format!(
+        "  {OTHER_ALIAS}: {}\n",
+        other_url.trim_end_matches("other-pkg-2.0.0.tgz")
+    );
+    let other_override = format!("  '{OTHER}@{OTHER_VERSION}': '{OTHER_ALIAS}:{OTHER_VERSION}'\n");
+    for command in ["rollback", "remove"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("package.json"),
+            format!(
+                r#"{{ "name": "root", "version": "1.0.0", "dependencies": {{ "{NAME}": "{VERSION}", "{OTHER}": "{OTHER_VERSION}" }} }}"#
+            ),
+        )
+        .unwrap();
+        let ws_path = root.join("pnpm-workspace.yaml");
+        std::fs::write(
+            &ws_path,
+            format!(
+                "packages:\n  - '.'\nnamedRegistries:\n{}{other_registry}overrides:\n{}{other_override}",
+                registry_entry(),
+                override_entry()
+            ),
+        )
+        .unwrap();
+        let lock_path = root.join("pnpm-lock.yaml");
+        std::fs::write(
+            &lock_path,
+            dep_lock(
+                &[
+                    format!("{NAME}@{VERSION}: {ALIAS}:{VERSION}"),
+                    format!("{OTHER}@{OTHER_VERSION}: {OTHER_ALIAS}:{OTHER_VERSION}"),
+                ],
+                &[
+                    LockedDep::hosted(NAME, VERSION, ALIAS, HOSTED_URL),
+                    LockedDep::hosted(OTHER, OTHER_VERSION, OTHER_ALIAS, other_url),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let (code, envelope) = unwind_subprocess(root, &server, command, &[PURL]);
+        assert_eq!(code, 0, "{command}: {envelope}");
+        assert_eq!(
+            read(&lock_path),
+            dep_lock(
+                &[format!(
+                    "{OTHER}@{OTHER_VERSION}: {OTHER_ALIAS}:{OTHER_VERSION}"
+                )],
+                &[
+                    LockedDep::upstream(NAME, VERSION),
+                    LockedDep::hosted(OTHER, OTHER_VERSION, OTHER_ALIAS, other_url),
+                ],
+            ),
+            "{command}: one release back on the registry, the other routed"
+        );
+        assert_eq!(
+            read(&ws_path),
+            format!(
+                "packages:\n  - '.'\nnamedRegistries:\n{other_registry}overrides:\n{other_override}"
+            ),
+            "{command}: the restored release's registry and override go from the file with it"
+        );
+
+        // The rest: the lock is the pristine one, and the file the route
+        // created is gone.
+        let (code, envelope) = unwind_subprocess(root, &server, command, &[OTHER_PURL]);
+        assert_eq!(code, 0, "{command}: {envelope}");
+        assert_eq!(
+            read(&lock_path),
+            dep_lock(
+                &[],
+                &[
+                    LockedDep::upstream(NAME, VERSION),
+                    LockedDep::upstream(OTHER, OTHER_VERSION),
+                ],
+            ),
+            "{command}"
+        );
+        assert!(!ws_path.exists(), "{command}: {envelope}");
+    }
+}
+
+/// The route goes one package at a time across a workspace's locks: a
+/// scoped rollback that restores the root pin while a member's own lock
+/// keeps its hosted pin removes the root pin's registry and override from
+/// the file, and the override from EVERY lock's record of it (pnpm
+/// compares each lock's record with the file), and leaves the member's
+/// routed.
+#[tokio::test]
+#[serial]
+async fn rollback_removes_only_the_route_of_restored_pins() {
+    const OTHER: &str = "other-pkg";
+    const OTHER_VERSION: &str = "2.0.0";
+    const OTHER_ALIAS: &str = "socket-33333333";
+    let other_url = "https://patch.test/patch/npm/other-pkg/2.0.0/22222222-2222-4222-8222-222222222222/33333333-3333-4333-8333-333333333333/other-pkg-2.0.0.tgz";
+    let server = MockServer::start().await;
+    mock_registry_version(&server, NAME, VERSION).await;
+    mock_registry_version(&server, OTHER, OTHER_VERSION).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        format!(r#"{{ "name": "root", "version": "1.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#),
+    )
+    .unwrap();
+    let user_ws = "packages:\n  - packages/*\nsharedWorkspaceLockfile: false\n";
+    let other_registry = format!(
+        "  {OTHER_ALIAS}: {}\n",
+        other_url.trim_end_matches("other-pkg-2.0.0.tgz")
+    );
+    let other_override = format!("  '{OTHER}@{OTHER_VERSION}': '{OTHER_ALIAS}:{OTHER_VERSION}'\n");
+    std::fs::write(
+        root.join("pnpm-workspace.yaml"),
+        format!(
+            "{user_ws}namedRegistries:\n{}{other_registry}overrides:\n{}{other_override}",
+            registry_entry(),
+            override_entry()
+        ),
+    )
+    .unwrap();
+    let both = [
+        format!("{NAME}@{VERSION}: {ALIAS}:{VERSION}"),
+        format!("{OTHER}@{OTHER_VERSION}: {OTHER_ALIAS}:{OTHER_VERSION}"),
+    ];
+    std::fs::write(
+        root.join("pnpm-lock.yaml"),
+        dep_lock(
+            &both,
+            &[LockedDep::hosted(NAME, VERSION, ALIAS, HOSTED_URL)],
+        ),
+    )
+    .unwrap();
+    let member = root.join("packages/a");
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        format!(r#"{{ "name": "a", "version": "1.0.0", "dependencies": {{ "{OTHER}": "{OTHER_VERSION}" }} }}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        member.join("pnpm-lock.yaml"),
+        dep_lock(
+            &both,
+            &[LockedDep::hosted(
+                OTHER,
+                OTHER_VERSION,
+                OTHER_ALIAS,
+                other_url,
+            )],
+        ),
+    )
+    .unwrap();
+
+    let (code, _, envelope) = rollback_subprocess(root, &server, &[PURL]);
+    assert_eq!(code, 0, "{envelope}");
+    assert_eq!(
+        read(&root.join("pnpm-lock.yaml")),
+        dep_lock(&both[1..], &[LockedDep::upstream(NAME, VERSION)]),
+        "the root pin is restored, and its lock records the override that is left"
+    );
+    assert_eq!(
+        read(&member.join("pnpm-lock.yaml")),
+        dep_lock(
+            &both[1..],
+            &[LockedDep::hosted(
+                OTHER,
+                OTHER_VERSION,
+                OTHER_ALIAS,
+                other_url
+            )]
+        ),
+        "the out-of-scope member pin stays routed, its record following the file"
+    );
+    assert_eq!(
+        read(&root.join("pnpm-workspace.yaml")),
+        format!("{user_ws}namedRegistries:\n{other_registry}overrides:\n{other_override}"),
+        "only the restored pin's registry and override go"
+    );
+
+    // The rest of the rollback takes the route out, and the user's file is
+    // back byte for byte.
+    let (code, _, envelope) = rollback_subprocess(root, &server, &[]);
+    assert_eq!(code, 0, "{envelope}");
+    assert_eq!(read(&root.join("pnpm-workspace.yaml")), user_ws);
+    assert_eq!(
+        read(&root.join("pnpm-lock.yaml")),
+        dep_lock(&[], &[LockedDep::upstream(NAME, VERSION)])
+    );
+    assert_eq!(
+        read(&member.join("pnpm-lock.yaml")),
+        dep_lock(&[], &[LockedDep::upstream(OTHER, OTHER_VERSION)])
+    );
+}
+
+/// A rollback never leaves a route half undone. Restoring a routed pin
+/// takes its override and its registry out of the workspace file, and
+/// that file serves every lock of the workspace. When the rollback cannot
+/// account for all of them, it must not restore the pin and then leave,
+/// or strip, what another lock still installs through: the pin is refused
+/// and stays hosted, with not a byte of any file changed.
+///
+/// Two ways it cannot account for them: a member's own lock that the
+/// route's edits cannot read (mixed line endings) and that still names a
+/// registry; and a workspace whose members cannot be listed at all
+/// (`sharedWorkspaceLockfile: false` with no `packages:`).
+#[tokio::test]
+#[serial]
+async fn rollback_refuses_a_routed_pin_whose_route_it_cannot_settle() {
+    const OTHER: &str = "other-pkg";
+    const OTHER_VERSION: &str = "2.0.0";
+    const OTHER_ALIAS: &str = "socket-33333333";
+    let other_url = "https://patch.test/patch/npm/other-pkg/2.0.0/22222222-2222-4222-8222-222222222222/33333333-3333-4333-8333-333333333333/other-pkg-2.0.0.tgz";
+    let server = MockServer::start().await;
+    mock_registry_version(&server, NAME, VERSION).await;
+    mock_registry_version(&server, OTHER, OTHER_VERSION).await;
+    let other_registry = format!(
+        "  {OTHER_ALIAS}: {}\n",
+        other_url.trim_end_matches("other-pkg-2.0.0.tgz")
+    );
+    let other_override = format!("  '{OTHER}@{OTHER_VERSION}': '{OTHER_ALIAS}:{OTHER_VERSION}'\n");
+    let both = [
+        format!("{NAME}@{VERSION}: {ALIAS}:{VERSION}"),
+        format!("{OTHER}@{OTHER_VERSION}: {OTHER_ALIAS}:{OTHER_VERSION}"),
+    ];
+    let root_lock = dep_lock(
+        &both,
+        &[LockedDep::hosted(NAME, VERSION, ALIAS, HOSTED_URL)],
+    );
+    let member_lock = dep_lock(
+        &both,
+        &[LockedDep::hosted(
+            OTHER,
+            OTHER_VERSION,
+            OTHER_ALIAS,
+            other_url,
+        )],
+    );
+    for (case, settings, member_lock, why) in [
+        (
+            "a member lock that cannot be read",
+            "packages:\n  - packages/*\nsharedWorkspaceLockfile: false\n",
+            member_lock.replacen('\n', "\r\n", 1),
+            "mixes CRLF and LF line endings",
+        ),
+        (
+            "members that cannot be listed",
+            "sharedWorkspaceLockfile: false\n",
+            member_lock.clone(),
+            "no `packages:` list",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("package.json"),
+            format!(r#"{{ "name": "root", "version": "1.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#),
+        )
+        .unwrap();
+        let workspace = format!(
+            "{settings}namedRegistries:\n{}{other_registry}overrides:\n{}{other_override}",
+            registry_entry(),
+            override_entry()
+        );
+        std::fs::write(root.join("pnpm-workspace.yaml"), &workspace).unwrap();
+        std::fs::write(root.join("pnpm-lock.yaml"), &root_lock).unwrap();
+        let member = root.join("packages/a");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            member.join("package.json"),
+            format!(r#"{{ "name": "a", "version": "1.0.0", "dependencies": {{ "{OTHER}": "{OTHER_VERSION}" }} }}"#),
+        )
+        .unwrap();
+        std::fs::write(member.join("pnpm-lock.yaml"), &member_lock).unwrap();
+
+        let (code, _, envelope) = rollback_subprocess(root, &server, &[PURL]);
+        assert_eq!(
+            read(&root.join("pnpm-workspace.yaml")),
+            workspace,
+            "{case}: the workspace file keeps the whole route: {envelope}"
+        );
+        assert_eq!(
+            read(&root.join("pnpm-lock.yaml")),
+            root_lock,
+            "{case}: the pin stays hosted: {envelope}"
+        );
+        assert_eq!(read(&member.join("pnpm-lock.yaml")), member_lock, "{case}");
+        assert_ne!(code, 0, "{case}: the refusal fails the run: {envelope}");
+        assert!(
+            envelope.to_string().contains(why),
+            "{case}: the refusal says why: {envelope}"
+        );
+    }
+}
+
+/// A package that left the lock (removed, or upgraded to a release with no
+/// patch) takes what is left of its route with it on the next scan, even
+/// one the patch service offers nothing to: its override leaves the
+/// workspace file and the lock's record together, and the registry with
+/// it. The file a routed scan created goes with them; a file of the
+/// user's is back to their bytes. A dry run reports the files and writes
+/// nothing. No `trustLockfile` and no pnpm warning take their place:
+/// nothing in the lock is hosted.
+/// (The fixture's patch server is named to the run: with no grant left to
+/// vouch for it, a registry on an origin the run does not know for a patch
+/// server is the user's.)
+#[tokio::test]
+#[serial]
+async fn hosted_scan_with_no_patch_left_takes_the_route_out() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+
+    const UPGRADED: &str = "1.0.1";
+    let stale = format!("{NAME}@{VERSION}: {ALIAS}:{VERSION}");
+    for (user_ws, left) in [
+        // The file a routed scan created is deleted with the last of the
+        // route, not left as a bare `packages` list.
+        (None, None),
+        (
+            Some("packages:\n  - 'apps/*'\noverrides:\n  lodash: ^4.17.21\n"),
+            Some("packages:\n  - 'apps/*'\noverrides:\n  lodash: ^4.17.21\n".to_string()),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pinned_pnpm_project(tmp.path());
+        let ws_path = tmp.path().join("pnpm-workspace.yaml");
+        let lock_path = tmp.path().join("pnpm-lock.yaml");
+        let routed_ws = match user_ws {
+            None => format!("packages:\n  - '.'\n{}", route_maps()),
+            Some(user) => format!(
+                "{user}{}namedRegistries:\n{}",
+                override_entry(),
+                registry_entry()
+            ),
+        };
+        std::fs::write(&ws_path, &routed_ws).unwrap();
+        // The lock after the user's upgrade: the release is gone, the
+        // override pnpm was configured with is still recorded.
+        let recorded: Vec<String> = user_ws
+            .map(|_| "lodash: ^4.17.21".to_string())
+            .into_iter()
+            .collect();
+        let mut with_stale = recorded.clone();
+        with_stale.push(stale.clone());
+        let upgraded = [LockedDep::upstream(NAME, UPGRADED)];
+        let lock_before = dep_lock(&with_stale, &upgraded);
+        std::fs::write(&lock_path, &lock_before).unwrap();
+
+        const PATCH_SERVER: (&str, &str) = ("SOCKET_PATCH_SERVER_URL", "https://patch.test");
+        // On an origin the run does not know for a patch server the
+        // registry is not the CLI's to remove.
+        let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+        assert_eq!(code, Some(0), "{doc}");
+        assert_eq!(read(&lock_path), lock_before, "{doc}");
+        assert_eq!(read(&ws_path), routed_ws, "{doc}");
+
+        let (code, doc) = run_hosted_json_env(
+            tmp.path(),
+            &server.uri(),
+            &[PATCH_SERVER, ("SOCKET_DRY_RUN", "1")],
+        );
+        assert_eq!(code, Some(0), "{doc}");
+        assert_eq!(read(&lock_path), lock_before, "a dry run writes nothing");
+        assert_eq!(read(&ws_path), routed_ws, "a dry run writes nothing");
+        let rewritten = doc["redirect"]["rewrittenFiles"].as_array().unwrap();
+        for file in ["pnpm-lock.yaml", "pnpm-workspace.yaml"] {
+            assert!(rewritten.iter().any(|f| f == file), "{file}: {doc}");
+        }
+
+        let (code, doc) = run_hosted_json_env(tmp.path(), &server.uri(), &[PATCH_SERVER]);
+        assert_eq!(code, Some(0), "{doc}");
+        assert_eq!(
+            std::fs::read_to_string(&ws_path).ok(),
+            left,
+            "{user_ws:?}: {doc}"
+        );
+        assert_eq!(
+            read(&lock_path),
+            dep_lock(&recorded, &upgraded),
+            "{user_ws:?}"
+        );
+        assert!(
+            !warning_texts(&doc).contains("trustLockfile"),
+            "nothing is hosted, so nothing is said of trust: {doc}"
+        );
+        // Nothing is left to tidy.
+        let (code, doc) = run_hosted_json_env(tmp.path(), &server.uri(), &[PATCH_SERVER]);
+        assert_eq!(code, Some(0), "{doc}");
+        assert_eq!(std::fs::read_to_string(&ws_path).ok(), left);
+        assert!(
+            doc["redirect"]["rewrittenFiles"]
+                .as_array()
+                .is_none_or(|files| files.is_empty()),
+            "{doc}"
+        );
+    }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "peer-user": "1.0.0",
+    "host": "1.0.0",
+    "peer-of-peer": "1.0.0"
+  }
+}

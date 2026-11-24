@@ -232,8 +232,164 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   which pnpm applies through `overrides` without a lock; `vex` attests such a
   vendored pin only while the override map that pnpm reads still routes the
   package to its artifact, and omits it otherwise (`vex_lock_not_read`).
-  For 9.0 root or member locks, the CLI configures `trustLockfile: true` in
-  the root `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
+  pnpm >=11 checks every lock entry that records a tarball URL against a
+  registry, so a hosted pin needs a setting in the root `pnpm-workspace.yaml`.
+  For 9.0 root or member locks the CLI writes one of two, unless opted out
+  with `--no-trust-lockfile-config`.
+  **The registry route.** The patch service answers an npm registry document
+  for each patch, in the directory the patch's tarball is served from. That
+  directory is the patch's registry address: it never changes for the life of
+  the patch and answers for that one package only. When every hosted pin of
+  those locks has such an address (the patch service granted it one in this
+  run, or an earlier run routed the pin and the files still route it), and
+  every pnpm pin of the project (the same sources as the pnpm 9.0–10.4 rule
+  below, at least one present) proves pnpm 11.20 or newer, the CLI declares
+  one named registry per patch and routes each patched release to its own:
+
+  ```yaml
+  namedRegistries:
+    socket-1417d719: https://patch.socket.dev/patch/npm/@a2ui/web_core/0.9.2/<token>/1417d719-…/
+    socket-58f14d5a: https://patch.socket.dev/patch/npm/picomatch/2.3.1/<token>/58f14d5a-…/
+  overrides:
+    '@a2ui/web_core@0.9.2': 'socket-1417d719:0.9.2'
+    'picomatch@2.3.1': 'socket-58f14d5a:2.3.1'
+  ```
+
+  The declaration lets pnpm verify the patched entries against the patch
+  server while it keeps verifying every other entry, so nothing is trusted
+  blindly. The override makes pnpm resolve the package there whenever it
+  resolves again, so `pnpm add`, `pnpm update` and `pnpm dedupe` keep the
+  patched tarball. pnpm writes an overridden release under its own key
+  (`picomatch@socket-58f14d5a:2.3.1`) and records the overrides in the lock,
+  so the CLI rewrites `pnpm-lock.yaml` to exactly that shape; a real pnpm
+  re-locks it without changing a byte. Commit both files.
+
+  A registry is named after its patch: `socket-` and the first eight hex
+  digits of the patch UUID. If two patches of the project start with the same
+  eight digits, or the project already has a registry of its own under that
+  name, the name takes four more digits at a time until it is free.
+
+  When a patch is replaced by a newer one for the same release, the new patch
+  has a new UUID, so its registry has a new name and a new address. The next
+  scan then changes the `namedRegistries` line, the override's value and, in
+  the lock, the `overrides:` record and every key and reference of that
+  release (`picomatch@socket-58f14d5a:2.3.1` becomes
+  `picomatch@socket-<new id>:2.3.1`), along with the tarball and its
+  integrity. Expect that diff, and commit it like any other scan result.
+
+  What is yours stays yours. Your own `namedRegistries` and `overrides`
+  entries are kept byte for byte, including a registry of yours named
+  `socket` or one that happens to have a name of the CLI's shape: a registry
+  is the CLI's only when its name is `socket-` plus the leading digits of a
+  patch UUID and its address is that patch's directory on the patch server.
+  If you override a package the CLI would route (by any selector for that
+  package), your override is left alone and the run uses `trustLockfile`
+  instead, and says so. A package you install from a registry of your own
+  is yours whatever the registry is called: `leaf@socket:1.0.0` from a
+  registry you named `socket` is never taken for npm's `leaf@1.0.0`.
+
+  The route is cleaned up automatically when a patch is no longer needed, so
+  nothing of it is left for you to delete. Cleanup is per patch: a patch's
+  registry, its override and the lock's record of that override go together.
+  They are unused once no lockfile resolves that release through the
+  registry: you removed the dependency, upgraded it past the patched release,
+  the patch was withdrawn or replaced, you ran `remove`, or the project left
+  hosted mode. These commands take unused entries out:
+
+  - `socket-patch scan` in hosted mode, on every run and with no extra flag.
+    It drops the registry and the override of a package that left the lock
+    from the workspace file and the lock together, and restores a withdrawn
+    patch's release to the public registry.
+  - `socket-patch repair`, in its cleanup phase. It reads only
+    `pnpm-workspace.yaml` and the pnpm locks, so it works offline
+    (`repair --offline`) and in CI without a token. It cannot know that a
+    patch was withdrawn; that is the next scan's to restore.
+    `repair --download-only` skips the cleanup.
+    If your patches come from a patch server other than Socket's own, tell
+    this command and `scan --prune` which one with `--patch-server-url`
+    (or `SOCKET_PATCH_SERVER_URL`): they have no patch service answer to
+    recognise it by. Without it they leave that server's registries
+    alone, and say so, naming the host and that setting.
+  - `socket-patch scan --prune` in any other mode or with no `--mode`, in the
+    same pass that prunes `.socket/`.
+  - `rollback`, `remove` and a switch to `--mode vendored`, for the packages
+    they restore: the lock keys, the importer specifiers and the upstream
+    resolution come back, and the package's registry, its override and the
+    lock's record of it go in the same run. Other patches are not touched.
+
+  `--prune` with `--mode hosted` adds nothing to remove: hosted mode keeps no
+  `.socket/` state, which is what the flag sweeps in the other modes (the run
+  says so), and the registry entries already go on every hosted scan. With
+  the flag, `--json` output also counts them in `gc.removedRegistryEntries`.
+
+  Every one of these lists what it removes (one line per entry, or one
+  `registry_entry_unused` event under `--json`), and `--dry-run` lists the
+  same and writes nothing. A registry's address is never printed, because it
+  contains your access token for the patch. The workspace file and the lock
+  always change together, so `pnpm install --frozen-lockfile` keeps passing.
+  With several locks under one workspace file
+  (`sharedWorkspaceLockfile: false`) an entry goes only when none of them
+  uses it. Your own registries and overrides are never touched. A
+  `pnpm-workspace.yaml` the CLI created is deleted, by whichever of these
+  commands takes the last of the route out, once nothing else is in it; a
+  file of yours gets its own bytes back. If a later scan finds that the
+  project no longer qualifies (for example a new patch that has no registry
+  address yet), it converts the project back to `trustLockfile` in the same
+  run rather than leave a lock that is half routed. A scan that is granted
+  only some of the project's patches (a scan of one subtree, a search that
+  lists fewer patches) does not do that: the packages it was not granted stay
+  routed as they are.
+
+  Switching the project to agent mode (`scan --mode agent`) does not undo
+  hosted patches: the lockfile keeps installing them through their
+  registries, so the route stays too, and the run warns
+  `hosted_wiring_retained` with the packages it concerns. To leave hosted
+  mode, run `socket-patch rollback` (or `remove <package>`), or switch with
+  `scan --mode vendored`; each takes the pins and their route out together.
+  Anything left unused afterwards is removed by `repair` or `scan --prune`.
+
+  Two things to know before you rely on the route. While a release is
+  routed, its override holds every dependent whose range admits the patched
+  version at exactly that version, so `pnpm update` does not move the package
+  past it until a later scan finds a patch for the newer release or you run
+  `socket-patch remove <package>`. It also reaches a dependent that is
+  locked on a newer release today: if one package needs `leaf` at exactly
+  the patched `1.0.0` and another asks for `^1.0.0` and is locked on `1.5.0`,
+  the scan routes `1.0.0`, leaves the other on `1.5.0`, and tells you so in
+  a note; the next `pnpm update` or `pnpm dedupe` (and `pnpm add` on pnpm
+  11) then moves that package to the patched `1.0.0` as well. Installs from
+  the committed lock are not affected. And two lock shapes stay on
+  `trustLockfile`, because pnpm 11 and pnpm 12 lock them differently or
+  resolve them around an override: a package installed both with and without
+  the patched release as its peer, and a patched release that is another
+  package's optional peer.
+
+  A `trustLockfile: true` that an earlier run wrote is removed in the run that
+  takes the route, when the file is still exactly what that run wrote (the
+  file it creates, or a comments-only file plus the lines it adds); any other
+  one is left alone, and the warning says the hosted patches no longer need
+  it. A `trustLockfile: false` or a `pnpm_config_trust_lockfile` variable does
+  not matter here. An address is only ever declared as a named registry: it
+  answers for its one patched package and nothing else. Its version document
+  is dated by the upstream release (or undated when that is unknown), so
+  pnpm's default `minimumReleaseAge` does not hold back a new patch. A pin
+  proves pnpm 11.20 when the lowest version it admits is 11.20 or higher
+  (`11.28.13`, `^11.20.0`, `>=12`). Older pnpm 11 releases write a different
+  lock for the same override, and a registry declaration without the override
+  loses patched packages when pnpm resolves again (the measurements are in
+  [pnpm hosted compatibility](testing/pnpm-compatibility.md)).
+  **`trustLockfile: true`.** In every other case the CLI configures
+  `trustLockfile: true`, which switches pnpm's lockfile verification off for
+  the whole lock. When the patch service gave at least one pin a registry
+  address, the warning names what kept the project off the registry route: the
+  packages that have no address (one is enough), pnpm pins that do not prove
+  11.20, a Bazel hub that reads the lock
+  ([Bazel workspaces: npm](#bazel-workspaces-npm)), an override of yours for a
+  patched package, a workspace file or a lock entry the edit cannot follow. A project with no pnpm pin is told that
+  pinning pnpm 11.20 or later (for example with `packageManager`) and
+  re-running the scan switches it to the registry route (not under
+  `--no-trust-lockfile-config`, which writes neither setting). The key goes in
+  the root `pnpm-workspace.yaml` unless
   explicitly disabled by the project or, for pnpm >=11, by a
   `pnpm_config_trust_lockfile=false` environment variable the scan runs with
   (pnpm reads it ahead of the file, so nothing is written and the warning names
@@ -241,9 +397,8 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   `true` or `false` (pnpm 12 trims surrounding spaces first, pnpm 11 does
   not); any other value (empty, `null`, `undefined`, `0`) is ignored for the
   file, so the CLI ignores it too and writes the key.
-  pnpm >=11 needs this for hosted URLs.
   This skips registry re-verification for the whole lock; tarball integrity
-  remains enforced. pnpm <=10 does not need the setting. An existing
+  remains enforced. pnpm <=10 needs neither setting. For both, an existing
   `pnpm-workspace.yaml` with no keys (empty or only comments) gets the
   root-only `packages:` list with the key, because pnpm 8–10.4 refuse a
   workspace file that has keys but no `packages`. When the lock lists
@@ -770,8 +925,9 @@ On pnpm >=11 a repointed lock does not install under Rush's default flow: `rush 
 either fails (`ERR_PNPM_TARBALL_URL_MISMATCH` /
 `ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION`) or, on pnpm 11, exits 0 after silently
 re-resolving the patched entries to the upstream registry. Rush runs pnpm in `common/temp`
-with a `pnpm-workspace.yaml` it generates, so the `trustLockfile` auto-config is not written
-in a Rush repo; the `redirect_pnpm_trust_lockfile` warning gives the Rush remedy instead
+with a `pnpm-workspace.yaml` it generates, so neither the registry route nor
+`trustLockfile` are written in a Rush repo; the `redirect_pnpm_trust_lockfile` warning gives
+the Rush remedy instead
 (verified with Rush 5.180.0):
 
 - pnpm 12: install with `pnpm_config_trust_lockfile=true rush install` (set it in CI too).
@@ -2208,6 +2364,49 @@ npm.npm_translate_lock(
 Run the command again after that: it pins the lock, and the next build takes the patched
 package. rules_js asks for this `data` itself (`docs/pnpm.md`, "update_pnpm_lock").
 
+**No named registries for a lock that a hub reads.** For pnpm 11.20 and later hosted mode
+can route a patched release through a named registry of `pnpm-workspace.yaml` in place of
+`trustLockfile` (see pnpm above). It never does for a lock that a rules_js hub reads: one
+that an `npm.npm_translate_lock` names in a plain string, the root lock or a member's own,
+or a call whose `pnpm_lock` is not written out, whatever else the call says. In a Bazel
+workspace it takes the route only where it is certain that no hub reads the lock, so what
+the reader could not see counts as a hub that may: a file that `MODULE.bazel` includes and
+that is missing or unreadable, a use of the extension that is not a plain call of a tag,
+and a `WORKSPACE` file that cannot be read or that brings in rules_js (a `load` from
+`@aspect_rules_js`, a `load` of `npm_translate_lock`, or a call of that rule), whose
+repositories are not looked through. A `WORKSPACE` file that is about something else
+blocks nothing. Unlike the answer above, which passes over what it cannot see so that no
+project loses a patch, declining the route costs nothing: the project gets the same pin as
+before, and the warning names what was not read ("… because a Bazel hub may read the pnpm
+lock (WORKSPACE:3: it brings in rules_js, …) …"). The lock
+reader of rules_js is not the reason: it takes a routed lock (measured on macOS: rules_js
+3.6.0 on Bazel 9.3.2 builds one for a hub without `update_pnpm_lock`, and the packages it
+builds hold the patched bytes; rules_js 2.9.3 on Bazel 8.8.2 does too). The pnpm that a
+hub runs with `update_pnpm_lock` is. It sees `pnpm-workspace.yaml` only where the call
+lists it, and it may be older than pnpm 11.20: rules_js picks a pnpm 10 where the
+workspace states none. Run as the hub runs it (`pnpm install --lockfile-only` beside the
+lock and `package.json`, without the workspace file), pnpm 11.28.13 and 12.22.0 reject a
+routed lock (`ERR_PNPM_MISSING_NAMED_REGISTRY`, measured). No Bazel test leg builds a
+routed lock with `update_pnpm_lock` yet, so for now every such project is pinned exactly
+as it is on a patch service that offers no registry, which is the pin the Bazel legs
+build, and the `redirect_pnpm_trust_lockfile` warning names the call ("… because a Bazel
+hub reads the pnpm lock (MODULE.bazel:7), and a lock that a hub reads is not routed
+yet …"). For a project below the Bazel root it says, as the warning above does, that its
+paths are from that root. A project that was routed before the
+hub was there leaves the route on its next scan, the lock and the workspace file together.
+Where hosted mode writes nothing for the root lock (the hub above), a route of an earlier
+run is left exactly as it is, in the workspace file and in every lock, and a
+`pnpm-workspace.yaml` that holds nothing but such a route counts as a file that holds only
+what hosted mode writes. That holds for every hosted scan, whatever it was granted: one
+with a patch for a package of the lock, one with none and one that crawled nothing all
+leave the files and give the same warning. `repair`, `scan --prune` with no mode,
+`rollback` and `remove` settle a route from the lockfiles alone and work as without Bazel.
+They read no Bazel file, for this route as for any other hosted pin: under a hub whose
+`data` lists a `pnpm-workspace.yaml` that a routed scan created, they still delete that
+file with the last of the route, and the build is then handed a missing file. Put a
+comment line in the file first, as the warning of a hosted scan says; a hosted scan itself
+never deletes the file under a hub that reads, or may read, the lock.
+
 The file the hub lists has to be one that a pin and its undo leave standing, so hosted mode
 also writes nothing for a hub that lists it in two cases, and the warning then names what
 the file needs and no label:
@@ -2267,9 +2466,12 @@ build fails as above. Not read either is a `trustLockfile` that reaches the pnpm
 build another way (`pnpm_config_trust_lockfile` in Bazel's environment): hosted mode
 withholds there as well. Not read either: a hub that names the lock of a workspace member
 (`pnpm_lock = "//packages/a:pnpm-lock.yaml"`), which is pinned as without Bazel. The
-in-memory engine reads the `MODULE.bazel` beside the lock and gives the answer of a checkout
-with the same files; it sees no file that one includes, no Bazel root above the project and
-no `MODULE.bazel.lock`, and a `pnpm_version_from` file that is not among the project's own
+in-memory engine reads the Bazel files beside the lock or beside a `pnpm-workspace.yaml`
+(`MODULE.bazel`, the `*.MODULE.bazel` files it can include and the `WORKSPACE` files) and
+gives the answer of a checkout with the same files; it sees no Bazel root above the
+project, for the pin and for the route through a named registry alike (a project in a
+directory of a Bazel workspace is routed in memory where a checkout is not), and no
+`MODULE.bazel.lock`, and a `pnpm_version_from` file that is not among the project's own
 manifests reads there as a release that is not written out, so a lock that a checkout pins
 can be left as it is in memory. Nor does hosted mode look at `--no-trust-lockfile-config`
 when it decides this: see the known problems of

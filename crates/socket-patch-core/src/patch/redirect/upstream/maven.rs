@@ -1075,6 +1075,7 @@ mod tests {
             artifact_url: format!(
                 "https://patch.socket.dev/patch/maven/org.slf4j/slf4j-api/1.7.36/tok/{uuid}/slf4j-api-1.7.36.jar"
             ),
+            npm_registry_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "maven2".into(),
                 index_url: format!("https://patch.socket.dev/patch-registry/maven/tok/{uuid}/maven2"),

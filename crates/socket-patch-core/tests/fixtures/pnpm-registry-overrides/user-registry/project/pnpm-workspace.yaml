@@ -1,0 +1,3 @@
+namedRegistries:
+  socket: https://npm.corp.example/
+  socket-11111111: https://npm.work.example/

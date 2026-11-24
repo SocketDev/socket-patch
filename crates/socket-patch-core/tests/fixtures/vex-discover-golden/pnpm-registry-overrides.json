@@ -1,0 +1,1200 @@
+{
+  "pnpm-registry-overrides/both-versions": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/both-versions/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@2.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/uses-two@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/both-versions/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@2.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/uses-two@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/deprecated-block": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/deprecated-block/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/old-notes@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/deprecated-block/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/old-notes@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/member-locks": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/member-locks/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/member-locks/expected/packages/a": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/member-locks/expected/packages/b": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/host@1.1.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/member-locks/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/host@1.1.0",
+        "file": "packages/b/pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "packages/a/pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "packages/a/pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/member-locks/project/packages/a": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/member-locks/project/packages/b": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/host@1.1.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/optional-peer": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/optional-peer/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/host@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/opt-peers@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/other@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/optional-peer/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/host@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/opt-peers@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/other@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/optional-peer/project/packages/a": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/optional-peer/project/packages/b": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/own-peers": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/own-peers/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/host@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/peer-user@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/own-peers/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/host@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/peer-user@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/patched-peer": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/patched-peer/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/host@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/peer-user@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/patched-peer/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/host@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/peer-user@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/peer-suffixed-parent": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/peer-suffixed-parent/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/child@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/host@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/peer-parent@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/peer-suffixed-parent/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/child@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/host@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/peer-parent@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/peer-variants": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/peer-variants/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/host@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/host@1.1.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/peer-user@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/peer-variants/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/host@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/host@1.1.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/peer-user@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/peer-variants/project/packages/a": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/peer-variants/project/packages/b": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/peers-both": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/peers-both/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/host@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/peer-of-peer@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/peer-user@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/peers-both/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/host@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/peer-of-peer@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/peer-user@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/pinned-pnpm": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/pinned-pnpm/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/@pnpm/exe.android-arm64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.android-x64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.darwin-arm64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.darwin-x64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.freebsd-x64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.linux-arm64-musl@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.linux-arm64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.linux-ppc64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.linux-riscv64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.linux-s390x@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.linux-x64-musl@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.linux-x64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.netbsd-x64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.win32-arm64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.win32-x64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/pnpm@12.22.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/pinned-pnpm/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/@pnpm/exe.android-arm64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.android-x64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.darwin-arm64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.darwin-x64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.freebsd-x64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.linux-arm64-musl@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.linux-arm64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.linux-ppc64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.linux-riscv64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.linux-s390x@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.linux-x64-musl@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.linux-x64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.netbsd-x64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.win32-arm64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/@pnpm/exe.win32-x64@12.22.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/pnpm@12.22.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/scoped-direct": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/scoped-direct/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/@scope/direct@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/scoped-direct/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/@scope/direct@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/several": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/several/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/@scope/direct@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/native@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/old@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/several/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/@scope/direct@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/native@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/old@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/shared-digits": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/shared-digits/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/@scope/direct@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/shared-digits/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/@scope/direct@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/sibling-version": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/sibling-version/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@2.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/uses-two@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/sibling-version/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@2.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/uses-two@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/three-packages": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/three-packages/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/@scope/direct@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/host@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/peer-user@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/three-packages/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/@scope/direct@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/host@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/peer-user@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/transitive-leaf": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/transitive-leaf/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/transitive-leaf/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/user-overrides": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/user-overrides/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/other@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/user-overrides/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/other@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/user-registry": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/user-registry/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/user-registry/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/workspace-importers": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/workspace-importers/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/host@1.1.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/workspace-importers/project": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/host@1.1.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/leaf@1.0.0",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "purl": "pkg:npm/mid@1.0.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/workspace-importers/project/packages/a": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "pnpm-registry-overrides/workspace-importers/project/packages/b": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  }
+}
