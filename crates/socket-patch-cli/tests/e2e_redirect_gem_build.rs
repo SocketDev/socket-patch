@@ -6774,25 +6774,13 @@ fn own_and_foreign_platform() -> (String, String) {
 ///      installed copy back on the upstream platform gem;
 ///   6. standalone `vex` attests the gem from the lock, hash-verified
 ///      against the installed platform build.
-///
-/// With `takeover` (#2174), a vendored run takes the gem over before step
-/// 5, which leaves the patched platform copy the hosted scan installed.
-/// Step 5 is then a vendored unwind, and `remove` and `vendor --revert`
-/// run over copies of the project as well: each must put the installed
-/// platform copy back on the upstream platform gem.
 async fn platform_prebuilds_install_frozen_and_roll_back(
     tag: &str,
     checksums_lock: bool,
     ruby_entry: bool,
-    takeover: bool,
 ) {
-    // Bundler locks the specific platform's gem from 2.2; `CHECKSUMS` from
-    // 2.6. Vendor takes platform gems from a lock bundler 2.3 or newer wrote.
-    let floor = match (checksums_lock, takeover) {
-        (true, _) => (2, 6),
-        (false, true) => (2, 3),
-        (false, false) => (2, 2),
-    };
+    // Bundler locks the specific platform's gem from 2.2; `CHECKSUMS` from 2.6.
+    let floor = if checksums_lock { (2, 6) } else { (2, 2) };
     let Some(bundler) = bundler_e2e::gate("e2e_redirect_gem_build", tag, floor, &|c| {
         cache_env::isolate(c);
     }) else {
@@ -7252,7 +7240,7 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
     //    `CHECKSUMS` sha256 only for a rubygems.org remote, so that arm
     //    spells the mock upstream as rubygems.org in the pair and serves
     //    that registry from the mock (`SOCKET_RUBYGEMS_URL`). No bundler
-    //    runs on that arm's project after this point.
+    //    runs on this project after this point.
     let upstream = format!("{api}/upstream");
     let as_committed = |text: &str| {
         if checksums_lock {
@@ -7266,108 +7254,6 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
         let path = fx.proj.join(file);
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, as_committed(&text)).unwrap();
-    }
-    if takeover {
-        mount_vendored_platform_grant(&fx, &hosted_url, &patched_builds, &platforms).await;
-        let (code, stdout, stderr) = run_socket_env(
-            &fx.proj,
-            &[
-                "get",
-                UUID,
-                "--mode",
-                "vendored",
-                "--yes",
-                "--json",
-                "--cwd",
-                proj_str,
-                "--api-url",
-                &api,
-                "--org",
-                ORG,
-                "--api-token",
-                "fake",
-                "--patch-server-url",
-                &api,
-            ],
-            &[("SOCKET_RUBYGEMS_URL", &upstream)],
-        );
-        assert_eq!(code, 0, "takeover:\nstdout:\n{stdout}\nstderr:\n{stderr}");
-        let vendored_lock = std::fs::read_to_string(fx.proj.join("Gemfile.lock")).unwrap();
-        assert!(
-            vendored_lock.starts_with("PATH\n  remote: .socket/vendor/gem/"),
-            "premise: the gem is vendored:\n{vendored_lock}\nstdout:\n{stdout}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&warm_lib).unwrap(),
-            patched,
-            "premise: the takeover leaves the patched platform copy installed"
-        );
-        // `remove` and `vendor --revert`, each over its own copy of the
-        // project; `rollback` runs on the project itself below.
-        for command in ["remove", "vendor --revert"] {
-            let dir = fx.tmp.path().join(format!("unwind-{}", &command[..6]));
-            copy_dir_recursive(&fx.proj, &dir);
-            // What a `bundle cache` taken under the hosted pin left: this
-            // machine's patched prebuild in Bundler's cache dir.
-            let cached = dir.join("vendor/cache").join(format!("{own_leaf}.gem"));
-            let prebuild = patched_builds.iter().find(|b| b.token == token(&own));
-            std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
-            std::fs::write(&cached, &prebuild.expect("own prebuild").gem).unwrap();
-            let cwd = dir.to_str().expect("utf8 tmp path");
-            let mut argv: Vec<&str> = match command {
-                "remove" => vec!["remove", PURL, "--yes"],
-                _ => vec!["vendor", "--revert", "--yes"],
-            };
-            argv.extend([
-                "--json",
-                "--cwd",
-                cwd,
-                "--api-url",
-                &api,
-                "--org",
-                ORG,
-                "--api-token",
-                "fake",
-                "--patch-server-url",
-                &api,
-            ]);
-            let (code, stdout, stderr) =
-                run_socket_env(&dir, &argv, &[("SOCKET_RUBYGEMS_URL", &upstream)]);
-            assert_eq!(code, 0, "{command}:\nstdout:\n{stdout}\nstderr:\n{stderr}");
-            assert_eq!(
-                std::fs::read_to_string(dir.join("Gemfile.lock")).unwrap(),
-                as_committed(&pristine_lock),
-                "{command} must hand the lock back byte for byte"
-            );
-            assert_eq!(
-                std::fs::read_to_string(fresh_installed_lib(&dir, &own_leaf, "vuln_gem.rb"))
-                    .unwrap(),
-                orig,
-                "{command}: the installed platform copy is the upstream build again:\n{stdout}"
-            );
-            assert!(
-                stdout.contains("upstream_gem_install_refreshed")
-                    && !stdout.contains("upstream_gem_stale_install"),
-                "{command}: the copy is refreshed, and nothing is left patched:\n{stdout}"
-            );
-            // Both commands report a vendored unwind's advisories as events.
-            let env: serde_json::Value = serde_json::from_str(&stdout)
-                .unwrap_or_else(|e| panic!("{command}: not JSON: {e}\nstdout:\n{stdout}"));
-            let named: Vec<String> = env["events"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|e| e["errorCode"] == "upstream_gem_stale_cache")
-                .map(|e| e.to_string())
-                .collect();
-            assert_eq!(named.len(), 1, "{command}: one stale-cache warning: {env}");
-            assert!(
-                named[0].contains(&cached.display().to_string())
-                    && named[0].contains("non-upstream"),
-                "{command}: the patched platform archive in the cache dir is named: {}",
-                named[0]
-            );
-        }
     }
     let (code, stdout, stderr) = run_socket_env(
         &fx.proj,
@@ -7409,178 +7295,30 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
             && !stdout.contains("upstream_gem_stale_cache"),
         "nothing is left on the patched build:\n{stdout}"
     );
-    // The arm whose pair still names the mock upstream: bundler loads the
-    // upstream code, and a reinstall from the gem home's archive succeeds.
-    if takeover && !checksums_lock {
-        let probe = "require \"vuln_gem\"; print VulnGem.status";
-        for args in [&["install"][..], &["pristine"]] {
-            let out = bundle(&fx.proj, args);
-            assert!(
-                out.status.success(),
-                "bundle {args:?} after the unwind:\nstdout:\n{}\nstderr:\n{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let run = bundle(&fx.proj, &["exec", "ruby", "-e", probe]);
-            assert_eq!(
-                String::from_utf8_lossy(&run.stdout),
-                "VULNERABLE",
-                "bundle {args:?} leaves the upstream code loaded:\n{}",
-                String::from_utf8_lossy(&run.stderr)
-            );
-        }
-    }
 
     // 6. Standalone VEX over the fresh checkout bundler installed.
     manifestless_vex_matrix(&fx, &fresh).await;
-}
-
-/// The grant of [`UUID`] as the patch service answers it once the patch has
-/// prebuilds a vendored run can take: the hosted reference
-/// [`platform_prebuilds_install_frozen_and_roll_back`] mounts, plus each
-/// prebuild's sha512 and its stub gemspec.
-async fn mount_vendored_platform_grant(
-    fx: &RedirectFixture,
-    hosted_url: &str,
-    patched_builds: &[IndexBuild],
-    platforms: &[&str],
-) {
-    let server = &fx._server;
-    let gem_of = |token: &str| {
-        let build = patched_builds
-            .iter()
-            .find(|b| b.name == DEP && b.token == token);
-        &build.expect("build").gem
-    };
-    let ruby_gem = gem_of(DEP_VERSION);
-    let ruby_sha = sha256_hex(ruby_gem);
-    let stubs = format!("/artifacts/{UUID}");
-    let mut served = vec![(
-        format!("{DEP}-{DEP_VERSION}.gemspec"),
-        stub_gemspec(ruby_gem),
-    )];
-    let mut artifacts = vec![
-        serde_json::json!({
-            "kind": "tarball", "url": hosted_url,
-            "integrity": { "sha512": sri(ruby_gem), "sha256": ruby_sha }
-        }),
-        serde_json::json!({
-            "kind": "gem-stub-gemspec",
-            "url": format!("{}{stubs}/{DEP}-{DEP_VERSION}.gemspec", server.uri()),
-            "integrity": { "sha512": sri(&served[0].1) }
-        }),
-    ];
-    let mut gem_platforms = Vec::new();
-    for platform in platforms {
-        let leaf = format!("{DEP}-{DEP_VERSION}-{platform}");
-        let gem = gem_of(&format!("{DEP_VERSION}-{platform}"));
-        let stub = stub_gemspec(gem);
-        let sha = sha256_hex(gem);
-        artifacts.push(serde_json::json!({
-            "kind": "gem-platform", "platform": platform,
-            "url": format!("{}gems/{leaf}.gem", fx.index_url),
-            "contentType": "application/octet-stream", "sizeBytes": gem.len(),
-            "integrity": { "sha512": sri(gem), "sha256": sha }
-        }));
-        artifacts.push(serde_json::json!({
-            "kind": "gem-platform-stub-gemspec", "platform": platform,
-            "url": format!("{}{stubs}/{leaf}.gemspec", server.uri()),
-            "integrity": { "sha512": sri(&stub) }
-        }));
-        gem_platforms.push(serde_json::json!({ "platform": platform, "gemChecksumSha256": sha }));
-        served.push((format!("{leaf}.gemspec"), stub));
-    }
-    Mock::given(method("POST"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "results": {
-                UUID: {
-                    "status": "granted",
-                    "url": hosted_url,
-                    "purl": PURL,
-                    "artifacts": artifacts,
-                    "registryOverride": {
-                        "kind": "rubygems-compact-index",
-                        "indexUrl": fx.index_url,
-                        "identifiers": {
-                            "name": DEP,
-                            "version": DEP_VERSION,
-                            "gemChecksumSha256": ruby_sha,
-                            "gemPlatforms": gem_platforms,
-                        }
-                    }
-                }
-            }
-        })))
-        .with_priority(1)
-        .mount(server)
-        .await;
-    for (leaf, bytes) in served {
-        Mock::given(method("GET"))
-            .and(path(format!("{stubs}/{leaf}")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
-            .mount(server)
-            .await;
-    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6 for the CHECKSUMS lock); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_platform_prebuilds_install_frozen_and_roll_back() {
-    platform_prebuilds_install_frozen_and_roll_back(
-        "platform-prebuilds-checksums",
-        true,
-        false,
-        false,
-    )
-    .await;
+    platform_prebuilds_install_frozen_and_roll_back("platform-prebuilds-checksums", true, false)
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6 for the CHECKSUMS lock); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_platform_prebuilds_beside_the_ruby_entry_install_frozen_and_roll_back() {
-    platform_prebuilds_install_frozen_and_roll_back(
-        "platform-prebuilds-ruby-entry",
-        true,
-        true,
-        false,
-    )
-    .await;
+    platform_prebuilds_install_frozen_and_roll_back("platform-prebuilds-ruby-entry", true, true)
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.2); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_platform_prebuilds_without_checksums_install_frozen_and_roll_back() {
-    platform_prebuilds_install_frozen_and_roll_back("platform-prebuilds", false, false, false)
-        .await;
-}
-
-/// #2174: a platform gem that went from hosted to vendored, then unwound.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6 for the CHECKSUMS lock); \
-            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
-async fn gem_vendored_unwind_restores_a_platform_install_the_hosted_scan_patched() {
-    platform_prebuilds_install_frozen_and_roll_back(
-        "platform-prebuilds-takeover-checksums",
-        true,
-        false,
-        true,
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.3); \
-            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
-async fn gem_vendored_unwind_restores_a_platform_install_without_checksums() {
-    platform_prebuilds_install_frozen_and_roll_back(
-        "platform-prebuilds-takeover",
-        false,
-        false,
-        true,
-    )
-    .await;
+    platform_prebuilds_install_frozen_and_roll_back("platform-prebuilds", false, false).await;
 }

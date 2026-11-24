@@ -95,34 +95,20 @@ pub async fn recover_lock_entry(
             })
         }
         "gem" => {
-            // One CHECKSUMS line for a gem vendored as its own tree; an
-            // array of them, one per platform entry the edit made bare,
-            // for a gem vendored as precompiled platform gems.
-            let lines: Vec<&str> = match wiring_original(entry, &["gemfile_lock_checksum"]) {
-                Some(Value::String(line)) => vec![line.as_str()],
-                Some(Value::Array(lines)) => lines.iter().filter_map(Value::as_str).collect(),
-                _ => Vec::new(),
-            };
-            if lines.is_empty() {
-                return Err("no pre-vendor Gemfile.lock checksum recorded".to_string());
-            }
-            // The first line with a sha256, and the `.gem` it pins: the
-            // ruby gem for the plain `name (version)` entry, the platform
-            // gem for a `name (version-platform)` one.
-            let (gem_version, sha) = lines
-                .iter()
-                .find_map(|line| {
-                    let sha = checksum_line_sha256(line)?;
-                    let gem_version = match crate::formats::gem::split_checksum_entry(line.trim()) {
-                        Some((gem, token, _))
-                            if gem == name && token.starts_with(&format!("{version}-")) =>
-                        {
-                            token.to_string()
-                        }
-                        _ => version.clone(),
-                    };
-                    Some((gem_version, sha))
+            let line = wiring_original(entry, &["gemfile_lock_checksum"])
+                .and_then(|v| v.as_str().map(str::to_string))
+                .ok_or_else(|| "no pre-vendor Gemfile.lock checksum recorded".to_string())?;
+            let sha = line
+                .split("sha256=")
+                .nth(1)
+                .map(|rest| {
+                    rest.trim_end_matches(',')
+                        .trim()
+                        .chars()
+                        .take_while(|c| c.is_ascii_hexdigit())
+                        .collect::<String>()
                 })
+                .filter(|s| is_hex(s, 64))
                 .ok_or_else(|| {
                     "the pre-vendor checksum line has no sha256; refusing an unverifiable fetch"
                         .to_string()
@@ -157,7 +143,7 @@ pub async fn recover_lock_entry(
                 source_kind: SourceKind::Unspecified,
                 pnpm_env: false,
                 purl: format!("pkg:gem/{name}@{version}"),
-                resolved: gem_download_url(&base, &name, &gem_version),
+                resolved: gem_download_url(&base, &name, &version),
                 name,
                 version,
                 integrity: LockIntegrity::Sha256Hex(sha.to_ascii_lowercase()),
@@ -310,21 +296,6 @@ fn parse_base_purl_coords(base_purl: &str) -> Option<(String, String)> {
         .join("/");
     let version = percent_decode_purl_component(version).into_owned();
     Some((name, version))
-}
-
-/// The 64-hex sha256 a recorded `Gemfile.lock` CHECKSUMS line
-/// (`  <name> (<token>) sha256=<hex>`) pins, if it pins one.
-fn checksum_line_sha256(line: &str) -> Option<String> {
-    line.split("sha256=")
-        .nth(1)
-        .map(|rest| {
-            rest.trim_end_matches(',')
-                .trim()
-                .chars()
-                .take_while(|c| c.is_ascii_hexdigit())
-                .collect::<String>()
-        })
-        .filter(|s| is_hex(s, 64))
 }
 
 /// First wiring record of one of `kinds` carrying an `original` payload.

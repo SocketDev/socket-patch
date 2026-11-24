@@ -178,11 +178,7 @@
 //! root-anchored `.socket/vendor/gem/<uuid>/<name>-<version>` dir
 //! ([`vendor_ref`]; `./` and a trailing `/` tolerated), and each spec under
 //! it must be exactly the gem that leaf names (the vendor backend names the
-//! dir after the gem it replaces; [`vendored_leaf_purl`] must agree). A gem
-//! bundler locked as precompiled platform gems is vendored as one prebuilt
-//! tree per platform in that one dir, so its section holds a spec per
-//! platform (`nokogiri (1.18.10-arm64-darwin)`, …): together they are ONE
-//! vendored reference of the gem. An
+//! dir after the gem it replaces; [`vendored_leaf_purl`] must agree). An
 //! escaping (`../`, absolute), leaf-less, non-gem, or mismatched remote is
 //! [`DIAG_REF_INVALID`]. Path gems carry no sha256 (bundler writes a BARE
 //! `CHECKSUMS` entry for them), so vendored refs never set
@@ -942,13 +938,8 @@ fn spec_ref(
     };
     // A platform build is hosted wiring only in a Socket section of the
     // gem's own, where the rewriter moves every build of the version.
-    // A vendored `PATH` section holds one spec per platform of a gem
-    // vendored as precompiled platform gems (`vendor::gem`): its dir has a
-    // prebuild tree for each, so every one of them is the same reference
-    // to the one artifact ([`Discovery::push`] keeps one).
-    let hosted = matches!(wiring, Wiring::Hosted { .. });
     let own_hosted = matches!(wiring, Wiring::Hosted { only: None, .. });
-    if let Some(platform) = spec.platform.filter(|_| hosted && !own_hosted) {
+    if let Some(platform) = spec.platform.filter(|_| !own_hosted) {
         out.diag(
             DIAG_REF_INVALID,
             file,
@@ -1408,76 +1399,6 @@ mod tests {
         );
         assert_eq!(only(&out).artifact_rel.as_deref(), Some(rel.as_str()));
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
-    }
-
-    /// A gem `vendor::gem` vendored as precompiled platform gems: the one
-    /// PATH section holds a spec per platform (each with its dependency
-    /// sublines) and CHECKSUMS a bare entry per platform. Together they are
-    /// ONE vendored reference of the gem, with or without a CHECKSUMS
-    /// section.
-    #[tokio::test]
-    async fn vendored_platform_gems_are_one_reference() {
-        let rel = vendored_rel(UUID_A, "nokogiri-1.18.10");
-        let checksums = format!(
-            "CHECKSUMS\n  nokogiri (1.18.10-arm64-darwin)\n  nokogiri (1.18.10-x86_64-linux-gnu)\n  \
-             racc (1.8.1) sha256={SHA_UP}\n\n"
-        );
-        for checksums in [checksums.as_str(), ""] {
-            let lock = format!(
-                "PATH\n  remote: {rel}\n  specs:\n    nokogiri (1.18.10-arm64-darwin)\n      \
-                 racc (~> 1.4)\n    nokogiri (1.18.10-x86_64-linux-gnu)\n      racc (~> 1.4)\n\n\
-                 GEM\n  remote: https://rubygems.org/\n  specs:\n    racc (1.8.1)\n\n\
-                 PLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\n\
-                 DEPENDENCIES\n  nokogiri (= 1.18.10)!\n\n{checksums}BUNDLED WITH\n  4.0.15\n"
-            );
-            let p = Project::new();
-            p.write(
-                "Gemfile",
-                manifest(&[vendored_decl("nokogiri", "1.18.10", &rel)]),
-            );
-            p.write("Gemfile.lock", lock);
-            let out = run(&p).await;
-            assert_refs(
-                &out,
-                &[("pkg:gem/nokogiri@1.18.10", UUID_A, WiringMode::Vendored)],
-            );
-            let r = only(&out);
-            assert_eq!(r.artifact_rel.as_deref(), Some(rel.as_str()));
-            assert_eq!(r.locked_integrity, None);
-            assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
-        }
-    }
-
-    /// Platform specs under a vendored PATH section keep the section's
-    /// other rules: the dir must be the gem's own, and the manifest must
-    /// name it. Each failing spec is diagnosed, and none is a reference.
-    #[tokio::test]
-    async fn vendored_platform_specs_keep_the_leaf_and_manifest_rules() {
-        let platform_specs =
-            "    nokogiri (1.18.10-arm64-darwin)\n    nokogiri (1.18.10-x86_64-linux-gnu)\n";
-        let tail = "GEM\n  remote: https://rubygems.org/\n  specs:\n\nDEPENDENCIES\n  \
-                    nokogiri (= 1.18.10)!\n";
-        let own = vendored_rel(UUID_A, "nokogiri-1.18.10");
-        let other = vendored_rel(UUID_A, "rack-3.2.6");
-        for (remote, declared, code) in [
-            // Another gem's vendored dir.
-            (&other, &other, DIAG_REF_INVALID),
-            // The gem's own dir, which the Gemfile does not name.
-            (&own, &other, DIAG_REF_UNATTRIBUTABLE),
-        ] {
-            let p = Project::new();
-            p.write(
-                "Gemfile",
-                manifest(&[vendored_decl("nokogiri", "1.18.10", declared)]),
-            );
-            p.write(
-                "Gemfile.lock",
-                format!("PATH\n  remote: {remote}\n  specs:\n{platform_specs}\n{tail}"),
-            );
-            let out = run(&p).await;
-            assert!(out.refs.is_empty(), "{remote}: {:#?}", out.refs);
-            assert_eq!(diag_codes(&out), vec![code; 2], "{:#?}", out.diagnostics);
-        }
     }
 
     /// Several vendored gems (bundler sorts PATH sections by remote), a

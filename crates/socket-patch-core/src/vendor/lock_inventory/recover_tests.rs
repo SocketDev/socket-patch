@@ -305,41 +305,6 @@ async fn composer_gem_uv_fragments_recover() {
         Some("https://rubygems.org/downloads/rack-3.0.0.gem")
     );
 
-    // gem vendored as precompiled platform gems: the record holds an ARRAY
-    // of lines, one per platform entry that carried a registry checksum.
-    // The first line with a sha256 is recovered, for the platform gem it
-    // pins.
-    let platform_sha = "f".repeat(64);
-    let platform_gem = entry(
-        "gem",
-        "pkg:gem/nokogiri@1.18.10",
-        vec![rec(
-            "gemfile_lock_checksum",
-            serde_json::json!([
-                "  nokogiri (1.18.10-arm64-darwin)",
-                format!("  nokogiri (1.18.10-x86_64-linux-gnu) sha256={platform_sha}"),
-            ]),
-        )],
-    );
-    let got = recover_lock_entry(tmp.path(), &platform_gem).await.unwrap();
-    assert_eq!(got.version, "1.18.10");
-    assert_eq!(got.integrity, LockIntegrity::Sha256Hex(platform_sha));
-    assert_eq!(
-        got.resolved.as_deref(),
-        Some("https://rubygems.org/downloads/nokogiri-1.18.10-x86_64-linux-gnu.gem")
-    );
-    // An array with no checksum at all is as unverifiable as a bare line.
-    let bare = entry(
-        "gem",
-        "pkg:gem/nokogiri@1.18.10",
-        vec![rec(
-            "gemfile_lock_checksum",
-            serde_json::json!(["  nokogiri (1.18.10-arm64-darwin)"]),
-        )],
-    );
-    let err = recover_lock_entry(tmp.path(), &bare).await.unwrap_err();
-    assert!(err.contains("no sha256"), "{err}");
-
     // uv: the original [[package]] unit lists wheels; only the PURE one
     // is recoverable.
     let wheel_sha = "e".repeat(64);

@@ -58,13 +58,6 @@ name: nokogiri patch compatibility
 # of each real platform gem; then a frozen install from a fresh checkout,
 # `vex` and a byte-identical `rollback`. On JRuby the platform is `java`.
 #
-# The `vendored` legs run the script's vendored scenario instead: a vendored
-# scan of a lock that pins nokogiri as platform gems, against a stand-in for
-# the patch service (tests/nokogiri/patch_service.rb) that serves a patched
-# build of each real platform gem; then a frozen install from a fresh
-# checkout with the service unreachable, `vex` and a `rollback` to the lock
-# as it was. On JRuby the platform is `java`.
-#
 # Every leg downloads gems from rubygems.org, and a rebuild of a precompiled
 # install downloads the source gem and `mini_portile2` from it too.
 #
@@ -90,11 +83,6 @@ on:
       - 'crates/socket-patch-core/src/patch/redirect/grant.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/gem.rs'
       - 'crates/socket-patch-cli/src/commands/gem_refresh.rs'
-      # Vendored mode's gem backend.
-      - 'crates/socket-patch-core/src/vendor/gem.rs'
-      - 'crates/socket-patch-core/src/vendor/verify.rs'
-      - 'crates/socket-patch-core/src/vendor/redownload.rs'
-      - 'crates/socket-patch-core/src/vendor/service_fetch.rs'
   push:
     branches: [main]
     paths:
@@ -184,16 +172,6 @@ jobs:
           - {os: ubuntu-latest, ruby: '3.1', nokogiri: '1.15.7', install: precompiled, args: '--scenarios hosted', note: hosted}
           - {os: macos-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, cli: build, args: '--scenarios hosted', note: hosted}
           - {os: ubuntu-latest, ruby: 'jruby-9.4', nokogiri: '1.18.10', install: java, args: '--scenarios hosted', note: hosted}
-          # Vendored mode on a lock that pins nokogiri as platform gems: the
-          # scan commits a patched build of each real platform gem, served
-          # by a stand-in for the patch service, under `.socket/vendor/gem`,
-          # and a fresh checkout installs from that tree with the lock
-          # frozen and the service unreachable. On JRuby the platform is
-          # `java`.
-          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, args: '--scenarios vendored', note: vendored}
-          - {os: ubuntu-latest, ruby: '3.1', nokogiri: '1.15.7', install: precompiled, args: '--scenarios vendored', note: vendored}
-          - {os: macos-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, cli: build, args: '--scenarios vendored', note: vendored}
-          - {os: ubuntu-latest, ruby: 'jruby-9.4', nokogiri: '1.18.10', install: java, args: '--scenarios vendored', note: vendored}
     needs: static-cli
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os }}
     timeout-minutes: 60

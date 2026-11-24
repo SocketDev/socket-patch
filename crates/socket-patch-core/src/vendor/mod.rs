@@ -720,23 +720,10 @@ pub const VENDOR_PREBUILT_UNAVAILABLE: &str = "vendor_prebuilt_unavailable";
 /// no older vendored patch to keep.
 pub const VENDOR_PREBUILT_REQUIRED: &str = "vendor_prebuilt_required";
 
-/// gem: `Gemfile.lock` pins the gem as precompiled platform gems and the
-/// patch service lists no prebuilt platform gem for at least one of the
-/// locked platforms. The service lists a prebuild only once it is built, so
-/// "not built yet" and "never built" look the same from here: the package
-/// is left as it is and the run does not fail because of it, with or
-/// without an older vendored patch to keep (see [`VENDOR_PREBUILT_PENDING`]
-/// for the kept one). A re-run vendors it once every platform has one.
-pub const VENDOR_PREBUILT_PLATFORM_PENDING: &str = "vendor_prebuilt_platform_pending";
-
 /// Whether `code` marks a patch the service does not serve (yet):
-/// [`VENDOR_PREBUILT_PENDING`], [`VENDOR_PREBUILT_UNAVAILABLE`] or
-/// [`VENDOR_PREBUILT_PLATFORM_PENDING`].
+/// [`VENDOR_PREBUILT_PENDING`] or [`VENDOR_PREBUILT_UNAVAILABLE`].
 pub fn is_unserved(code: &str) -> bool {
-    matches!(
-        code,
-        VENDOR_PREBUILT_PENDING | VENDOR_PREBUILT_UNAVAILABLE | VENDOR_PREBUILT_PLATFORM_PENDING
-    )
+    matches!(code, VENDOR_PREBUILT_PENDING | VENDOR_PREBUILT_UNAVAILABLE)
 }
 
 /// The result of one backend `vendor_*` call.

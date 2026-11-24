@@ -317,15 +317,6 @@ pub struct VendorEntry {
     /// pypi/pipenv extras.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipenv: Option<PipenvMeta>,
-    /// gem: the platforms of a gem vendored as precompiled platform gems,
-    /// in `Gemfile.lock` order (`arm64-darwin`, `x86_64-linux-gnu`, …).
-    /// The artifact dir then holds one unpacked prebuild per platform, at
-    /// `<artifact>/<platform>/`, instead of the gem's own tree: bundler
-    /// never builds a `path:` gem's extensions, so a gem the lock resolves
-    /// to platform gems is vendored as the patch service's prebuilt ones.
-    /// Empty for a gem vendored as its ruby-platform tree.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub gem_platforms: Vec<String>,
     /// True when vendored WITHOUT a manifest record — the posture of every
     /// `scan` / `get --mode vendored` entry (vendored mode writes no
     /// `.socket/manifest.json`); only the manifest-driven standalone
@@ -374,7 +365,6 @@ impl VendorEntry {
             poetry: None,
             pdm: None,
             pipenv: None,
-            gem_platforms: Vec::new(),
             detached: false,
             record: None,
         }
@@ -2630,7 +2620,6 @@ mod tests {
             poetry: None,
             pdm: None,
             pipenv: None,
-            gem_platforms: Vec::new(),
         };
         let built = VendorEntry::npm(
             "pkg:npm/left-pad@1.3.0".to_string(),

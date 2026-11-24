@@ -960,18 +960,17 @@ pub const GEM_STALE_CACHE: &str = gem::STALE_CACHE;
 
 pub use gem::UpstreamArchive;
 
-/// The [`GEM_STALE_CACHE`] advisories, as `(code, detail)`, for the gem
+/// The [`GEM_STALE_CACHE`] advisory, as `(code, detail)`, for the gem
 /// `purl` a vendored unwind just put back on its upstream entry in the
-/// project at `root` (#1594): one per archive of a build the lock names.
-/// Empty when Bundler's cache dir holds no archive for it, or holds the
-/// upstream ones. `offline` skips the
+/// project at `root` (#1594). `None` when Bundler's cache dir holds no
+/// archive for it, or holds the upstream one. `offline` skips the
 /// rubygems.org lookup a lock without `CHECKSUMS` needs, so the archive is
 /// then named as unchecked.
 pub async fn gem_stale_cache_after_unwind(
     root: &Path,
     purl: &str,
     offline: bool,
-) -> Vec<(&'static str, String)> {
+) -> Option<(&'static str, String)> {
     gem::unwound_stale_cache(root, purl, offline).await
 }
 

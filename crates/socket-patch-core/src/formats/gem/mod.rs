@@ -417,10 +417,8 @@ impl<'t> GemfileLock<'t> {
 
     /// The registry inventory: `GEM`-section `specs:` entries plus the
     /// bundler >= 2.6 `CHECKSUMS` sha256 pins when present (older locks stay
-    /// discovery-only). Platform-suffixed specs are skipped (the inventory
-    /// names the ruby-platform gem a registry serves; a gem locked as
-    /// platform gems is vendored from the patch service's prebuilt ones,
-    /// never from a registry). Each spec resolves against its OWN
+    /// discovery-only). Platform-suffixed specs are skipped (platform gems
+    /// are unsupported for vendoring). Each spec resolves against its OWN
     /// section's remote (bundler >= 2 emits one GEM section per source); a
     /// section with several distinct remotes (a legacy bundler 1.x
     /// multisource lock) leaves its specs without a resolved URL, fail

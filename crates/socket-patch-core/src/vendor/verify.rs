@@ -35,10 +35,7 @@ use std::path::{Path, PathBuf};
 use crate::bazel::cargo_bazel::{self, BUILD_FILE};
 use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
-use crate::patch::apply::{
-    is_missing_path, is_safe_relative_subpath, normalize_file_path, verify_file_patch, VerifyStatus,
-};
-use crate::patch::file_hash::compute_file_git_sha256;
+use crate::patch::apply::{normalize_file_path, verify_file_patch, VerifyStatus};
 use crate::patch::package::read_archive_to_map;
 
 use super::path::parse_vendor_path;
@@ -149,18 +146,7 @@ pub async fn verify_vendored_patch_record(
     let is_zip = path_str.ends_with(".whl") || path_str.ends_with(".nupkg");
     if !is_tarball && !is_zip {
         let cargo_uuid = (entry.ecosystem == "cargo").then_some(entry.uuid.as_str());
-        match gem_platform_trees(&artifact, entry).await? {
-            // A gem vendored as precompiled platform gems: bundler loads
-            // the tree of whichever platform it runs on, so every one of
-            // them must carry the patch.
-            Some(trees) => {
-                let voucher = TreeVoucher::Ledger(entry.artifact.file_inventory.as_ref());
-                for tree in &trees {
-                    verify_platform_tree(tree, &record.files, voucher).await?;
-                }
-            }
-            None => verify_dir_members(&artifact, record, cargo_uuid).await?,
-        }
+        verify_dir_members(&artifact, record, cargo_uuid).await?;
         // Whole-tree cross-check: a dir-shaped artifact's bytes are covered
         // by NO lockfile integrity (bundler path sources, cargo path deps,
         // …), so the members above are the only thing the record can vouch
@@ -261,161 +247,6 @@ async fn verify_dir_members(
                 return Err("vendor_hash_mismatch".to_string())
             }
             VerifyStatus::NotFound => return Err("file_not_found".to_string()),
-        }
-    }
-    Ok(())
-}
-
-/// The prebuild trees of a gem vendored as precompiled platform gems
-/// (`<artifact>/<platform>/`, see [`super::gem`]'s module docs); `None`
-/// for every other dir-shaped artifact, whose files sit in the artifact dir
-/// itself. The ledger entry names the trees. An entry synthesized from a
-/// lockfile reference names none, so the layout is then read off the
-/// artifact: no `<name>.gemspec` at its root (every gem vendored as its own
-/// tree has one there) and one in each platform's subdirectory.
-async fn gem_platform_trees(
-    artifact: &Path,
-    entry: &VendorEntry,
-) -> Result<Option<Vec<PathBuf>>, String> {
-    if entry.ecosystem != "gem" {
-        return Ok(None);
-    }
-    if !entry.gem_platforms.is_empty() {
-        // SECURITY: state.json is committed and tamper-able, and each
-        // platform is about to name a directory that gets stat'd and hashed.
-        if !entry
-            .gem_platforms
-            .iter()
-            .all(|platform| super::gem::is_platform_dir_name(platform))
-        {
-            return Err("vendor_path_unsafe".to_string());
-        }
-        let trees = entry.gem_platforms.iter().map(|p| artifact.join(p));
-        return Ok(Some(trees.collect()));
-    }
-    let Some((name, _)) = crate::utils::purl::parse_gem_purl(&entry.base_purl) else {
-        return Ok(None);
-    };
-    let stub = format!("{name}.gemspec");
-    let is_file = |path: PathBuf| async move {
-        tokio::fs::symlink_metadata(path)
-            .await
-            .is_ok_and(|m| m.is_file())
-    };
-    if is_file(artifact.join(&stub)).await {
-        return Ok(None);
-    }
-    let mut trees = Vec::new();
-    let Ok(mut entries) = tokio::fs::read_dir(artifact).await else {
-        return Ok(None);
-    };
-    while let Ok(Some(child)) = entries.next_entry().await {
-        // `file_type` does not follow links: a linked tree is no tree.
-        if child.file_type().await.is_ok_and(|t| t.is_dir())
-            && is_file(child.path().join(&stub)).await
-        {
-            trees.push(child.path());
-        }
-    }
-    trees.sort();
-    Ok((!trees.is_empty()).then_some(trees))
-}
-
-/// What vouches for the bytes of a prebuild tree beyond the patched files
-/// it holds (see [`verify_platform_tree`]).
-#[derive(Clone, Copy)]
-pub(crate) enum TreeVoucher<'a> {
-    /// The tree was just unpacked from a prebuild archive whose bytes
-    /// passed the integrity digest the patch service states for that
-    /// platform. No unverified archive is ever unpacked.
-    VerifiedDownload,
-    /// The ledger's file inventory of the vendored copy (keyed
-    /// `<platform>/<path>`), taken when the copy was vendored; `None` for
-    /// an entry that records none.
-    Ledger(Option<&'a BTreeMap<String, String>>),
-}
-
-/// The rule one prebuild tree of a gem vendored as precompiled platform
-/// gems must meet (`tree` is `<artifact>/<platform>/`, `files` the patch
-/// record's). One rule for every place that judges such a tree: the
-/// download gate, the in-sync test of a re-run, and `vendor --check` /
-/// `vex` / `repair`.
-///
-/// * A patched file the tree holds hashes to its `afterHash`.
-/// * A patched file the tree does NOT hold is no mismatch, even when it
-///   holds none of them. A platform gem ships the compiled extension and
-///   often not what it was built from: the usual nokogiri patch adds a
-///   file under `patches/` or edits `dependencies.yml`, which no
-///   precompiled gem ships, so the patch lives entirely in the binaries
-///   the patch service rebuilt. What stands for those bytes is `voucher`:
-///   the integrity check of the download while the tree is staged, and
-///   afterwards the ledger's inventory, which every file of the tree must
-///   match (a file it lists that is gone or changed is a mismatch, and so
-///   is one it does not list).
-/// * With neither — an entry with no inventory — the tree must hold at
-///   least one patched file: otherwise nothing vouches for it.
-///
-/// The error is a stable routing tag (see the module docs).
-pub(crate) async fn verify_platform_tree(
-    tree: &Path,
-    files: &HashMap<String, PatchFileInfo>,
-    voucher: TreeVoucher<'_>,
-) -> Result<(), String> {
-    if !tokio::fs::symlink_metadata(tree)
-        .await
-        .is_ok_and(|m| m.is_dir())
-    {
-        return Err("file_not_found".to_string());
-    }
-    let mut holds_patched_file = false;
-    for (file_name, info) in files {
-        let normalized = normalize_file_path(file_name);
-        // SECURITY: never hash through a record key that escapes the tree.
-        if !is_safe_relative_subpath(normalized) {
-            return Err("file_not_found".to_string());
-        }
-        match compute_file_git_sha256(&tree.join(normalized)).await {
-            Ok(hash) if hash == info.after_hash => holds_patched_file = true,
-            Ok(_) => return Err("vendor_hash_mismatch".to_string()),
-            Err(e) if is_missing_path(&e) => {}
-            Err(_) => return Err("file_not_found".to_string()),
-        }
-    }
-    match voucher {
-        TreeVoucher::VerifiedDownload => Ok(()),
-        TreeVoucher::Ledger(Some(inventory)) => verify_tree_inventory(tree, inventory).await,
-        TreeVoucher::Ledger(None) if holds_patched_file => Ok(()),
-        TreeVoucher::Ledger(None) => Err("file_not_found".to_string()),
-    }
-}
-
-/// [`verify_dir_inventory`] for one prebuild tree: the files under `tree`
-/// are exactly the ones the copy's `inventory` lists below
-/// `<platform>/`, with the recorded bytes.
-async fn verify_tree_inventory(
-    tree: &Path,
-    inventory: &BTreeMap<String, String>,
-) -> Result<(), String> {
-    let mismatch = || "vendor_inventory_mismatch".to_string();
-    let platform = tree
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(mismatch)?;
-    let prefix = format!("{platform}/");
-    let recorded: BTreeMap<&str, &str> = inventory
-        .iter()
-        .filter_map(|(file, hash)| Some((file.strip_prefix(&prefix)?, hash.as_str())))
-        .collect();
-    let actual = compute_dir_inventory(tree)
-        .await
-        .map_err(|_| "vendor_artifact_unreadable".to_string())?;
-    if actual.len() != recorded.len() {
-        return Err(mismatch());
-    }
-    for (file, hash) in recorded {
-        match actual.get(file) {
-            Some(live) if live.eq_ignore_ascii_case(hash) => {}
-            _ => return Err(mismatch()),
         }
     }
     Ok(())
