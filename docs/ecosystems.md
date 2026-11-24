@@ -2284,9 +2284,9 @@ Maven local repository, at the lock's sha256 too. So a patch in a `pom.xml`, a G
 an installed jar does not reach what Bazel builds.
 
 Hosted mode patches a pinned hub. The hub fetches each jar through a repository of its own,
-and Bazel's `override_repo` (7.4.0 and later) puts another repository in its place. `socket-patch
-get <purl> --mode hosted`, run at the Bazel root, appends one block to the root `MODULE.bazel`,
-after one blank line:
+and Bazel's `override_repo` (7.4.0 and later) puts another repository in its place. A hosted
+`socket-patch scan` or `socket-patch get <purl> --mode hosted`, run at the Bazel root, appends
+one block to the root `MODULE.bazel`, after one blank line:
 
 ```
 # >>> socket-patch: Maven patches for Bazel (managed block: socket-patch writes and removes it) >>>
@@ -2350,8 +2350,8 @@ to the `)` of its `override_repo`, and the entries stand in the order of their r
 Everything is read from the checkout: the root `MODULE.bazel` and the files it includes, for
 the tags of the `maven` extension of `rules_jvm_external` under whatever name the file gives
 the ruleset and the extension (a hub is the `install`, `artifact` and `from_toml` tags of one
-`name`); the lock each hub names with `lock_file` (format 2 or 3, up to 16 MiB; each other file
-up to 1 MiB); `.bazeliskrc`, `.bazelversion`, `MODULE.bazel.lock` and `.bazelrc` with the files
+`name`); the lock each hub names with `lock_file` (format 2 or 3, up to 16 MiB, each lock once
+for all the hubs that name it; each other file up to 1 MiB); `.bazeliskrc`, `.bazelversion`, `MODULE.bazel.lock` and `.bazelrc` with the files
 it imports (`import`, `try-import` and `try-import-if-bazel-version`, whose condition is not
 evaluated; a path under `%workspace%/`, or a relative one, which is read from the Bazel root).
 An rc file is read as Bazel reads one: a `\` before a line break joins two lines, a `#`
@@ -2362,6 +2362,72 @@ no Bazel workspace (the rule is under
 [Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore)), or no hub holds the artifact
 as a jar without a classifier at the patch's version and every hub was read, nothing is read
 further, said or written: the run is the one it was.
+
+A hosted `scan` at the Bazel root takes the jars that the pinned hubs fetch for packages of
+the project, beside the ones it finds installed, so it finds their patches in a tree that has
+no `pom.xml` and no Gradle build. A hub's jar is the one without a classifier of an artifact in
+the hub's lock, when the lock has a sha256 for it, does not skip it, and lists it under a
+repository (or takes it from the Maven local repository under `m2local`). Its version is the
+lock's: the one Bazel builds, whatever a `pom.xml` beside the hub selects. A jar whose
+repository has no known name is a package too: a patch found for it gets no entry, and
+`maven_bazel_artifact` below says why.
+
+- **In the output.** Such a package counts in `scannedPackages`, and unless a crawl found that
+  version installed also in `lockfileOnlyPackages`, with `notInstalled` on its `packages[]`
+  entry. A hosted `get <advisory>` keeps the releases that a pinned hub fetches the same way,
+  and names a hub that was not read only when the advisory has a patch of a Maven artifact.
+- **What was not read.** No jar is guessed. When something of the hubs could not be read with
+  certainty (a hub without a `lock_file`, a lock or a tag that cannot be read, a `maven_install`
+  of a `WORKSPACE` file that Bazel may read, a block that was changed by hand), the scan says so
+  once, with the file, the line and the reason: `maven_bazel_hub_not_read` in `warnings[]`, a
+  `Warning:` line for a person, who reads "No packages found (see the warning)." when there is
+  no package at all. The jars of the hubs that were read are still looked up. A patch found
+  for one of them gets no entry while the doubt stands (`maven_bazel_not_pinned` or
+  `maven_bazel_unreadable` below). The warning is for a workspace that has to do with the
+  ruleset: a call in `MODULE.bazel` or a file it includes names `rules_jvm_external`, the
+  `WORKSPACE` file calls `maven_install`, or a `maven_install.json` lies at the Bazel root. In
+  another Bazel workspace a file that cannot be read is about no hub, and the scan is the one
+  without the workspace.
+- **How much is read.** A scan takes its packages from up to 64 MiB of hub locks in one
+  workspace. The first lock that does not fit is not taken, no lock after it is read, and the
+  warning above names it ("the locks of the workspace are larger than 64 MiB in all"). That
+  bound is the scan's alone: a patch that is found is pinned as `get <purl>` pins it, which
+  reads each lock it needs up to 16 MiB.
+- **A stale entry.** When the lock of a hub moves on (a version bump, an artifact that was
+  removed), the entry for the release it held is stale: Bazel stops at it ("does not generate
+  repository"). A hosted scan takes such an entry out as `socket-patch rollback <purl>` does,
+  before it pins the patch of the release the lock holds now. It reports a `rolledBack` event
+  (`verified` in a dry run) with the reason `maven_bazel_entry_stale`, and a person reads a
+  `Note:` and "Restored <purl> to its upstream registry entry". With the last entry the block
+  goes, and `MODULE.bazel` is the file of before its first patch. An entry is stale only when
+  every hub was read and none fetches the jar at the entry's version: while something is in
+  doubt it stays. The `socket.yml` policy holds such an entry as it holds a package of the
+  run: a scan of a root that the policy filters, or one whose policy filters the package,
+  leaves it. Only the entry goes. A pin of the same patch that another build of the checkout
+  holds stays (a `pom.xml`; the hosted Gradle pin, also where the Gradle build has no such
+  artifact), since nothing in the checkout says that the other build is done with the
+  release: `socket-patch list` shows it and `socket-patch rollback <purl>` takes it out.
+  While a Gradle pin of the old release stays, the Gradle lane declines a patch of another
+  release of the artifact (`redirect_gradle_version_conflict`); the entry of the block is
+  written all the same.
+- **Beside another build.** A hub's jar with a patch is a patch of the run like any other, so a
+  hosted scan writes for it what `get <purl> --mode hosted` writes in that checkout. Beside a
+  Gradle build that is the Gradle pin too (`settings.gradle` and three files under
+  `.socket/gradle/`, with the warnings of that pin), whether or not the Gradle build has the
+  artifact. Beside a `pom.xml`, the pom lane pins the release Maven selects and says of any
+  other what it always says: `redirect_maven_version_not_selected` where Maven selects another
+  release, `redirect_maven_selection_undetermined` where it cannot tell. Those two speak of
+  `pom.xml` alone: the hub's jar has its entry.
+- **A root above other projects.** A bare `scan` covers the project directories below `--cwd`,
+  and `--cwd` when it is a project. The root of a Bazel workspace needs no lockfile or build
+  file of its own for that: a hosted scan covers it, under the heading `== . ==`, when its hubs
+  have jars, something of them was not read, or the block has a stale entry. That section is a
+  scan of `--cwd` like any other: it also counts the packages a crawl from the root finds
+  installed in the projects below.
+- **Not for another scan.** A scan in vendored or agent mode, one whose `--ecosystems` leaves
+  Maven out, a `--global` one, and one of a project below the Bazel root take no package from a
+  hub, give no `maven_bazel_hub_not_read` and take no stale entry out: their packages are those
+  of the scan without the workspace.
 
 A hosted run writes no entry where it cannot show from the checkout that the block works. It
 then gives one warning, which says why and that the Bazel build keeps the upstream jar. In a
@@ -2428,11 +2494,14 @@ Limits:
 - Not looked at: a patch of a jar with a classifier, or of another packaging than `jar`. A lock
   names the plain jar by group and artifact alone, so such a patch gets no entry and no word
   about the hub: the run is the one without the workspace.
-- `socket-patch scan` does not find the artifacts of a hub yet: it pins a hub's jar when the
-  package is one it found elsewhere (a `pom.xml`, a Gradle build), and `get` takes any purl. It
-  does not take a stale entry out; `rollback` and `remove` do.
+- A stale entry is taken out by a hosted `scan` at the Bazel root, by `rollback` and by
+  `remove`. `get <purl> --mode hosted` pins the purl it is given and leaves a stale entry of
+  another release where it is, so the build still stops there until one of those three ran.
+- The in-memory hosted engine (GitHub App) reads no hub and writes no block.
 - Not seen: a hub or a `maven.override` that another Bazel module declares (its hub takes the
-  root's entry where it pins the same version), a `maven_install` inside a function of a `.bzl`
+  root's entry where it pins the same version, so an entry that is stale for the root's hubs
+  may still patch that one: a hosted scan takes it out all the same), a hub that the root only
+  takes with `use_repo` and other modules fill, a `maven_install` inside a function of a `.bzl`
   file, a jar that reaches Bazel without a hub (`http_jar`, a checked-in jar, the target of a
   `maven.override`), what the command line or an rc file outside the checkout tells Bazel
   (`--ignore_dev_dependency`, `--override_repository`; the machine's and the home directory's
