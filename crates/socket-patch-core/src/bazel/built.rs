@@ -34,14 +34,15 @@
 //! lists the same package (in a directory beside the project, below it, or
 //! above it without naming it) is the lock of another project, and says
 //! nothing of this one: a project of the checkout that Bazel does not
-//! build keeps what socket-patch says of it.
+//! build keeps what socket-patch says of it. A `packages.lock.json` below
+//! the project's directory is the project's own as well ([`Hub::nested`]).
 //!
 //! Only a call that is a statement of its own counts ([`Call::whole`]):
 //! it runs, once. One in a comprehension, behind an `and`, in a
 //! conditional or in the arguments of another call may never run, and is
 //! passed over. So is a call that passes `*` or `**`, whose arguments are
 //! not all written out, and one that can take its packages from a file
-//! that is not read here ([`ELSEWHERE`]). A `crate.from_cargo` without
+//! that is not read here ([`Hub::elsewhere`]). A `crate.from_cargo` without
 //! `cargo_lockfile` names no lock, so nothing is said: rules_rust 0.75.0
 //! has its cargo resolve the manifests anew, and no file says which
 //! versions it builds.
@@ -61,8 +62,8 @@
 //! last call that has any serve every package, and the first lock that
 //! names a package pins it. So the config of every such call is searched
 //! with the lock ([`Hub::beside`]), and nothing is said of the hub when
-//! one of them is not named plainly or a call passes `*` or `**`. The
-//! locks are still read one call at a time, and `feeds` and
+//! one of them is not a plain label of the main repository or a call
+//! passes `*` or `**`. The locks are still read one call at a time, and `feeds` and
 //! `local_package_dirs` are not read. Whether a hub takes a hosted pin of
 //! the project itself is not judged here: [`super::cargo`] and
 //! [`super::nuget`] say that to hosted mode, and the caller hands over no
@@ -73,6 +74,7 @@
 //!
 //! [`Tags::doubts`]: super::workspace::Tags::doubts
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Component, Path};
@@ -136,11 +138,19 @@ struct Hub {
     /// The attributes that name such a file: a label, or a dict with a
     /// label as each key.
     files: &'static [&'static str],
+    /// The attributes with which a call can take its packages from a file
+    /// that is not read here, whatever its lock lists.
+    elsewhere: &'static [&'static str],
     /// The packages a file lists plainly, each as its name and version.
     lists: fn(&str) -> Vec<(String, String)>,
     /// The directories below a file's own whose lock the file is as well,
     /// each from that directory: the members of a pnpm workspace.
     members: fn(&str) -> Vec<String>,
+    /// Whether a lock below the project's directory is the project's own
+    /// as well. A NuGet project is every project file below the directory
+    /// of a run, each with a lock beside it: agent mode patches what any of
+    /// them restored, and hosted mode pins in each of their locks.
+    nested: bool,
     /// Whether a call of the tag may build a package from a line that
     /// points at a copy under `.socket/vendor`: rules_js and rules_rust
     /// do, and of rules_ruby and rules_csharp no test here has shown
@@ -161,13 +171,6 @@ struct Hub {
 const HOSTED: &str = "Run `socket-patch scan --mode hosted` in the directory of that lock to pin \
     the patch there.";
 
-/// The attributes with which a call can take its packages from a file that
-/// is not read here, whatever its lock lists. `uv_lock` of `pip.parse`:
-/// rules_python 2.2.0 and later. `lockfile` of `crate.from_cargo`: the
-/// lock of rules_rust's own tool, which a hub renders its crates from
-/// until a repin, and which is not held to the `Cargo.lock` (0.75.0).
-const ELSEWHERE: [&str; 2] = ["uv_lock", "lockfile"];
-
 const HUBS: [Hub; 5] = [
     Hub {
         ecosystem: "npm",
@@ -178,6 +181,7 @@ const HUBS: [Hub; 5] = [
         }],
         tag: "npm_translate_lock",
         files: &["pnpm_lock"],
+        elsewhere: &[],
         lists: |text| {
             let project = documents(text).into_iter();
             let project = project.filter(|(_, kind)| *kind == PnpmDocument::Project);
@@ -187,6 +191,7 @@ const HUBS: [Hub; 5] = [
             owned(keys.filter_map(|package| pnpm_registry_key(package.key)))
         },
         members: lock_text_member_importers,
+        nested: false,
         builds_vendored: true,
         beside: &[],
         remedy: HOSTED,
@@ -206,6 +211,8 @@ const HUBS: [Hub; 5] = [
             "requirements_linux",
             "requirements_windows",
         ],
+        // rules_python 2.2.0 and later.
+        elsewhere: &["uv_lock"],
         lists: |text| {
             let lines = logical_lines(text);
             owned(
@@ -215,6 +222,7 @@ const HUBS: [Hub; 5] = [
             )
         },
         members: |_| Vec::new(),
+        nested: false,
         builds_vendored: false,
         beside: &[],
         remedy: HOSTED,
@@ -228,8 +236,10 @@ const HUBS: [Hub; 5] = [
         }],
         tag: "bundle_fetch",
         files: &["gemfile_lock", "gemfile"],
+        elsewhere: &[],
         lists: |text| owned(locked_specs(text).into_iter()),
         members: |_| Vec::new(),
+        nested: false,
         builds_vendored: true,
         beside: &[],
         remedy: HOSTED,
@@ -239,6 +249,10 @@ const HUBS: [Hub; 5] = [
         extensions: &super::cargo::EXTENSIONS,
         tag: "from_cargo",
         files: &["cargo_lockfile"],
+        // The lock of rules_rust's own tool, which a hub renders its crates
+        // from until a repin, and which is not held to the `Cargo.lock`
+        // (0.75.0).
+        elsewhere: &["lockfile"],
         lists: |text| {
             let lock = CargoLock::parse(text).ok();
             let packages = lock.iter().flat_map(|lock| lock.packages());
@@ -247,6 +261,7 @@ const HUBS: [Hub; 5] = [
             owned(built.map(|package| (package.name.as_str(), package.version.as_str())))
         },
         members: |_| Vec::new(),
+        nested: false,
         builds_vendored: true,
         beside: &[],
         remedy: "Run `socket-patch scan --mode hosted` in the directory of that lock to pin \
@@ -259,12 +274,14 @@ const HUBS: [Hub; 5] = [
         extensions: &[super::nuget::EXTENSION],
         tag: "from_lock",
         files: &["packages_lock_json"],
+        elsewhere: &[],
         lists: |text| {
             let lock = parse_lock(text).ok();
             let entries = lock.iter().flat_map(nuget_lock_entries);
             owned(entries.map(|entry| (entry.id, entry.resolved)))
         },
         members: |_| Vec::new(),
+        nested: true,
         builds_vendored: true,
         beside: &["nuget_config"],
         remedy: "Run `socket-patch scan --mode hosted` in the directory of that lock to pin \
@@ -373,23 +390,33 @@ fn judge(
         // The files beside the locks, of every call of the tag: the calls
         // with such a file make one hub (rules_csharp), where the file of
         // one call says where the packages of every lock come from. So
-        // the file of any call may name the patch, and one that is not
-        // named plainly, or that a call may pass unseen, may name any.
-        let beside = |tag: &Tag| files(workspace, tag.call, hub.beside);
-        let beside: Vec<String> = calls().flat_map(beside).collect();
-        let given = |name: &&str| calls().filter(|tag| tag.call.arg(name).is_some()).count();
-        let given: usize = hub.beside.iter().map(given).sum();
+        // the file of any call may name the patch, and one that a call
+        // does not give as a plain label of the main repository, or may
+        // pass unseen, may name any.
+        let plain = |value: &Value| match value {
+            Value::Str(label) => file(workspace, label),
+            _ => None,
+        };
+        let beside = |tag: &Tag| {
+            let given = hub.beside.iter().filter_map(|name| tag.call.arg(name));
+            given.map(plain).collect::<Option<Vec<String>>>()
+        };
+        let beside: Option<Vec<Vec<String>>> = calls().map(beside).collect();
         let unseen = !hub.beside.is_empty() && calls().any(|tag| tag.call.unpacks());
-        if beside.len() != given || unseen {
+        let Some(beside) = beside.filter(|_| !unseen) else {
             continue;
-        }
+        };
+        // Their text, read when a lock first asks and once for the hub.
+        let beside = beside.concat();
+        let texts = || beside.iter().map(|file| read(file)).collect();
+        let configs: OnceCell<Option<String>> = OnceCell::new();
         // What a file lists, and which patches of the packages its text
         // names, with the text of the files beside it: read when a package
         // first asks and once for all the calls that name it, and the
         // text is not kept. `None` for a file that is not the project's
         // lock, or when one of them cannot be read.
         let mut listed = HashMap::new();
-        let named = |call: &Call| ELSEWHERE.iter().any(|name| call.arg(name).is_some());
+        let named = |call: &Call| hub.elsewhere.iter().any(|name| call.arg(name).is_some());
         let elsewhere = |call: &Call| call.unpacks() || named(call);
         for tag in calls().filter(|tag| tag.call.whole && !elsewhere(tag.call)) {
             for lock in files(workspace, tag.call, hub.files) {
@@ -402,16 +429,15 @@ fn judge(
                         }
                         None => {
                             let listed = listed.entry(lock.clone()).or_insert_with(|| {
-                                let member = from_lock(project, &lock)?;
+                                let nested = hub.nested && inside(project, &lock);
+                                let member = from_lock(project, &lock).or(nested.then_some(""))?;
                                 let mut text = read(&lock)?;
                                 let named = || (hub.members)(&text).iter().any(|m| m == member);
                                 if !(member.is_empty() || named()) {
                                     return None;
                                 }
                                 let listed = (hub.lists)(&text).into_iter();
-                                for file in &beside {
-                                    text.push_str(&read(file)?);
-                                }
+                                text.push_str(configs.get_or_init(texts).as_deref()?);
                                 let key = |(name, version)| {
                                     PurlKey::new(&format!("pkg:{}/{name}@{version}", hub.ecosystem))
                                 };
@@ -461,13 +487,8 @@ fn files(workspace: &Workspace, call: &Call, attributes: &[&str]) -> Vec<String>
             _ => {}
         }
     }
-    let main = |label: &&str| {
-        let label = workspace
-            .label(label)
-            .filter(|label| label.repo == Repo::Main);
-        label.map(|label| label.path())
-    };
-    labels.iter().filter_map(main).collect()
+    let main = labels.iter().filter_map(|label| file(workspace, label));
+    main.collect()
 }
 
 /// The path from the Bazel root of `file`, a path from the project in the
@@ -478,6 +499,21 @@ fn below(project: &str, file: &str) -> String {
         "" => file.to_string(),
         project => format!("{project}/{file}"),
     }
+}
+
+/// The file of the main repository that `label` names, by its path from
+/// the Bazel root.
+fn file(workspace: &Workspace, label: &str) -> Option<String> {
+    let label = workspace.label(label);
+    let label = label.filter(|label| label.repo == Repo::Main);
+    label.map(|label| label.path())
+}
+
+/// Whether the workspace's file `lock` lies in a directory below the
+/// directory `project`.
+fn inside(project: &str, lock: &str) -> bool {
+    let rest = lock.strip_prefix(project);
+    rest.is_some_and(|rest| project.is_empty() || rest.starts_with('/'))
 }
 
 /// The directory `project` from the directory of the workspace's file
@@ -873,9 +909,14 @@ replace = "swapped 3.0.0"
         for (project, purl) in [("desk", SERDE), ("", SERDE), ("engine/cli", SERDE)] {
             assert_eq!(installed(project, purl), "", "{project:?}");
         }
-        for project in ["engine", "", "desk/tests"] {
+        for project in ["engine", "desk/tests", "des"] {
             assert_eq!(installed(project, JSON), "", "{project:?}");
         }
+        // But a NuGet project is every project file below the directory of
+        // the run, each with its lock: the lock of `desk` is the root's.
+        assert_eq!(installed("", JSON), NUGET);
+        assert!(inside("shop", "shop/desk/packages.lock.json"));
+        assert!(!inside("shop/desk/tests", "shop/desk/packages.lock.json"));
         // A copy committed under `.socket/vendor` is not judged.
         let pins = ["Cargo.toml", "Cargo.lock"];
         assert_eq!(said(&BUILT, "engine", SERDE, Some(&pins)), "");
@@ -991,6 +1032,7 @@ replace = "swapped 3.0.0"
             "nuget_config = \"//till:nuget.config\"",
             "nuget_config = \"//till:missing.config\"",
             "nuget_config = CONFIG",
+            "nuget_config = {\"//desk:nuget.config\": \"desk\"}",
             "**TILL",
         ] {
             assert_eq!(beside(&format!("{lock}, {other}")), "", "{other}");

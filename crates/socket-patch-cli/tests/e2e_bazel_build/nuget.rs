@@ -1475,7 +1475,7 @@ fn an_installed_package_is_affected_beside_a_hub_that_reads_the_lock() {
 /// Without a Bazel: what stays the statement of a project without Bazel
 /// while the patch is in NuGet's folder alone
 /// ([`Cell::keeps_its_statement`]). The hubs that decide nothing: one over
-/// the lock of another directory, one whose `nuget_config` is not written
+/// a lock that is not in the checkout, one whose `nuget_config` is not written
 /// out, one whose call may not run, and one with a second call, for the
 /// lock of another project, whose `nuget_config` names the patch:
 /// rules_csharp makes one hub of both calls, which may build the patched

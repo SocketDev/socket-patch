@@ -3970,7 +3970,9 @@ package that it is `affected`, not that it is patched:
   package, when such a call names the project's own lock and that lock lists the package at
   that version without naming the patch. The project's own lock is the one in the project's
   directory, or the lock of a pnpm workspace above it that names that directory among its
-  `importers`. Of a `Cargo.lock` the crates of a registry count, which are the ones the hub
+  `importers`. For NuGet it is a `packages.lock.json` below that directory as well: a NuGet
+  project is every project file below the directory the command runs in, each with a lock
+  beside it. Of a `Cargo.lock` the crates of a registry count, which are the ones the hub
   has Bazel download. A `packages.lock.json` never names a patch (a hosted pin there is a
   hash), and rules_csharp makes one hub of all its `nuget.from_lock` calls: the sources of
   the last call that has any serve every package, and the first lock that names a package
@@ -4064,7 +4066,8 @@ Nothing changes where the files do not show such a call: outside a Bazel workspa
 the workspace is not read with certainty: the statement is then `not_affected`, as without
 Bazel. A lock elsewhere that lists the same package is the
 lock of another project and decides nothing for this one: in a directory beside the project,
-below it, or above it without naming it among the importers of a pnpm workspace (a pnpm app
+below it (but for a `packages.lock.json`, see above), or above it without naming it among the
+importers of a pnpm workspace (a pnpm app
 beside a Java build; a project with a lock of its own under a root whose lock a hub reads; a
 Python or Ruby project below the directory of the file a hub reads). The workspace is not
 read with certainty when a module file is missing, cannot be read or holds a statement the
@@ -4132,9 +4135,11 @@ the build is broken):
   crates come through `crate.from_specs` or a `crates_repository` of a `WORKSPACE` file.
   Any `nuget.from_lock` call is given a `nuget_config` that is not read, or passes `*` or
   `**`. The hub reads a lock above
-  the project that does not name the project among its importers. The hub reads a lock
-  below the directory the command runs in: a run at the repository root while the hub reads
-  `web/pnpm-lock.yaml`. A Python or Ruby project lies below the directory of the file the
+  the project that does not name the project among its importers: also the `Cargo.lock` of
+  a Cargo workspace, for a run in one of its members. The hub reads a lock
+  below the directory the command runs in, other than a `packages.lock.json`: a run at the
+  repository root while the hub reads `web/pnpm-lock.yaml`. A Python or Ruby project lies
+  below the directory of the file the
   hub reads. The call is not a statement of its own, or passes `*` or `**`. A `WORKSPACE`
   file at the root defines something, or the workspace has no `MODULE.bazel`. Measured for
   rules_js, rules_rust and rules_csharp, which build from the lock and never read the
