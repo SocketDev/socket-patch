@@ -54,7 +54,7 @@ fn config_doc(content: &str) -> Result<Arc<DocumentMut>, toml_edit::TomlError> {
 
 /// Project-relative root of the vendor backend's committed crate copies. An
 /// entry whose `path` is under this prefix is socket-owned.
-const CARGO_VENDOR_DIR: &str = ".socket/vendor/cargo";
+pub(crate) const CARGO_VENDOR_DIR: &str = ".socket/vendor/cargo";
 
 /// Cargo's legacy extensionless project config: when it exists cargo reads
 /// it INSTEAD of [`CONFIG_TOML`] (and warns that the `.toml` is ignored).

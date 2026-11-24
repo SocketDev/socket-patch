@@ -7310,6 +7310,16 @@ pub fn artifact_url_spellings(artifact_url: &str) -> [String; 2] {
 pub(crate) const NUGET_CONFIG_FILE_NAMES: [&str; 3] =
     ["nuget.config", "NuGet.config", "NuGet.Config"];
 
+/// The config file the NuGet rewriter writes among `files`: NuGet reads the
+/// first of its spellings present in a directory, and a fresh
+/// `nuget.config` beside a `NuGet.config` would shadow it.
+pub(crate) fn nuget_config_path(files: &BTreeMap<String, String>) -> &'static str {
+    NUGET_CONFIG_FILE_NAMES
+        .into_iter()
+        .find(|name| files.contains_key(*name))
+        .unwrap_or(NUGET_CONFIG_FILE_NAMES[0])
+}
+
 fn default_nuget_config() -> String {
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n</configuration>\n".to_string()
 }
@@ -7538,12 +7548,7 @@ fn rewrite_nuget(
     if nuget.is_empty() {
         return;
     }
-    // NuGet reads the first of these spellings present in a directory; a
-    // fresh `nuget.config` beside a `NuGet.config` would shadow it.
-    let config_path = NUGET_CONFIG_FILE_NAMES
-        .into_iter()
-        .find(|name| files.contains_key(*name))
-        .unwrap_or(NUGET_CONFIG_FILE_NAMES[0]);
+    let config_path = nuget_config_path(files);
     // The source keys the configs below this one define (the engine reads
     // them from disk; absent in memory).
     let inherited: Option<Vec<String>> = files
@@ -7632,6 +7637,14 @@ fn rewrite_nuget(
             }
         }
     }
+
+    // What the rules_csharp hub of a Bazel workspace makes of the project
+    // (the engine reads it from the checkout; absent outside one).
+    let hub: Option<crate::bazel::nuget::Hub> = files
+        .get(crate::bazel::nuget::WITHHELD_KEY)
+        .and_then(|hub| serde_json::from_str(hub).ok());
+    // The locks of its other tags, parsed once for every dep.
+    let hub = hub.map(|hub| (hub.docs(), hub));
 
     for dep in &nuget {
         // The uuid lands in the source key, the mapping and the set-aside
@@ -7781,6 +7794,27 @@ fn rewrite_nuget(
                 continue;
             }
         };
+        // In a Bazel workspace whose rules_csharp hub would not take this
+        // pin (it does not read this config, or has the package from a
+        // lock this run does not re-pin), the build fails on the
+        // `contentHash` ([`crate::bazel::nuget::Hub::against`]). Nothing
+        // is written for a dep that every check above would let through.
+        let pinned = |lock: Option<&str>| {
+            locks.iter().any(|(rel, _, doc, _)| {
+                let held = crate::formats::nuget::lock::locked_at(doc, &id_lower, &version_norm);
+                lock.is_none_or(|lock| lock == rel) && held.count() > 0
+            })
+        };
+        let against = |(docs, hub): &(Vec<Option<Value>>, crate::bazel::nuget::Hub)| {
+            hub.against(docs, &pinned, &id_lower, &version_norm, &content_hash)
+        };
+        if let Some((code, why)) = hub.as_ref().and_then(against) {
+            result.warnings.push(RewriteWarning {
+                code: code.into(),
+                detail: format!("{}@{}: {why}", dep.name, dep.version),
+            });
+            continue;
+        }
         if !moved.is_empty() {
             result.warnings.push(RewriteWarning {
                 code: "redirect_nuget_mapping_set_aside".into(),
@@ -8139,6 +8173,9 @@ struct GemPlan {
     mixed: bool,
     /// The lock has no `CHECKSUMS` section to record the artifact's sha256.
     unchecked: bool,
+    /// An earlier run's pin: the manifest gave the gem a Socket source
+    /// already, under whatever address the patch registry had for it then.
+    prior: bool,
 }
 
 /// How the manifest gives a gem its Socket source.
@@ -8791,7 +8828,17 @@ fn plan_gem_redirect(
         staged,
         mixed,
         unchecked,
+        prior: prior_url.is_some(),
     })
+}
+
+/// The Bundler manifest and lock that the gem rewriter edits among `files`:
+/// `gems.rb` and `gems.locked` where the project has a `gems.rb`.
+pub(crate) fn gem_pair(files: &BTreeMap<String, String>) -> (&'static str, &'static str) {
+    match files.contains_key("gems.rb") {
+        true => ("gems.rb", "gems.locked"),
+        false => ("Gemfile", "Gemfile.lock"),
+    }
 }
 
 fn rewrite_gem(
@@ -8831,11 +8878,7 @@ fn rewrite_gem(
         });
         return;
     }
-    let (gemfile_name, lock_name) = if modern {
-        ("gems.rb", "gems.locked")
-    } else {
-        ("Gemfile", "Gemfile.lock")
-    };
+    let (gemfile_name, lock_name) = gem_pair(files);
     let mut gemfile = files.get(gemfile_name).cloned();
     let mut gemfile_changed = false;
     let mut lock = files.get(lock_name).cloned();
@@ -8879,6 +8922,9 @@ fn rewrite_gem(
     // Which lock layout the project's bundler writes and accepts.
     let layout = files.get(lock_name).and_then(|lk| lock_layout(lk));
 
+    // What the calls of a rules_ruby hub hold the gems of this lock to,
+    // read once for every gem (`bazel::ruby`).
+    let held = crate::bazel::ruby::handed_over(files);
     for dep in &gem {
         let Some(ov) = registry_override_of_kind(dep, "rubygems-compact-index") else {
             result.warnings.push(RewriteWarning {
@@ -9096,6 +9142,18 @@ fn rewrite_gem(
             layout.as_ref(),
         ) {
             Ok(plan) => {
+                // In a Bazel workspace a rules_ruby hub may hold the gem to
+                // the sha256 of its upstream archive, which the build after
+                // a redirect fails on: nothing of the plan is taken, and a
+                // pin that an earlier run wrote stays as it is.
+                let said = (GEM_CHECKSUMS_HEADER_RE.is_match(lk), plan.prior);
+                let (name, version) = (&dep.name, &dep.version);
+                let against = crate::bazel::ruby::stands_against;
+                if let Some(detail) = against(&held, name, version, &checksums, lock_name, said) {
+                    let code = crate::bazel::ruby::PINNED.into();
+                    result.warnings.push(RewriteWarning { code, detail });
+                    continue;
+                }
                 if plan.gemfile_changed {
                     gemfile = Some(plan.gemfile);
                     gemfile_changed = true;
@@ -21631,6 +21689,90 @@ mod tests {
         out
     }
 
+    /// In a Bazel workspace the engine hands over what the rules_ruby
+    /// calls that may read the lock hold in `gem_checksums`
+    /// (`bazel::ruby`). A gem that one of them holds to another sha256 than
+    /// the one of its patched archive is left as it is, with one warning
+    /// that names the call, the entry and the sha256 to put there. The gem
+    /// beside it is redirected as it is alone, and with the patched sha256
+    /// in the entry the run is the one it is without Bazel.
+    #[test]
+    fn gem_a_bazel_hub_holds_to_another_sha256_is_left_alone() {
+        use crate::bazel::ruby::{KEY, PINNED};
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    colorize (1.1.0)\n    \
+                    rake (13.2.1)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  colorize\n  rake\n\n\
+                    CHECKSUMS\n  colorize (1.1.0) sha256=aaaa\n  rake (13.2.1) sha256=bbbb\n\n\
+                    BUNDLED WITH\n   4.0.22\n";
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"rake\"\ngem \"colorize\"\n";
+        let both = [
+            gem_override("colorize", "1.1.0"),
+            gem_override("rake", "13.2.1"),
+        ];
+        let patched = "f".repeat(64);
+        let run = |held: Option<String>, overrides: &[DepOverride]| {
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.to_string());
+            files.insert("Gemfile.lock".to_string(), lock.to_string());
+            files.extend(held.map(|held| (KEY.to_string(), held)));
+            rewrite_registry_redirect(&files, overrides)
+        };
+        let call = "`ruby.bundle_fetch` at MODULE.bazel:15";
+        let held = |colorize: &str| {
+            let rake = format!("\"rake-13.2.1\":\"{patched}\"");
+            Some(format!(
+                "[[\"{call}\",{{\"colorize-1.1.0\":\"{colorize}\",{rake}}}]]"
+            ))
+        };
+        let plain = run(None, &both);
+        assert!(
+            plain.files.contains_key("Gemfile.lock"),
+            "{:?}",
+            plain.warnings
+        );
+        assert!(run(held(&patched), &both) == plain);
+
+        let left = run(held("aaaa"), &both);
+        assert_eq!(warning_codes(&left), [PINNED], "{:?}", left.warnings);
+        let detail = &left.warnings[0].detail;
+        let named = format!("colorize@1.1.0: {call} holds `colorize-1.1.0` to another sha256");
+        assert!(detail.starts_with(&named), "{detail}");
+        let way = format!("change `colorize-1.1.0` to `{patched}` there, or delete the gem");
+        assert!(detail.contains(&way), "{detail}");
+        let rake = run(None, &both[1..]);
+        assert_eq!((&left.files, &left.edits), (&rake.files, &rake.edits));
+
+        // A pin that an earlier run wrote stays as it is, also under the
+        // address the patch registry had for the gem then, which a run
+        // without the call brings up to date: the warning says that it
+        // stays, in place of a redirect that was skipped.
+        assert!(detail.contains("; redirect skipped (nothing rewritten)"));
+        for address in ["/tok/", "/old/"] {
+            let mut earlier = run(None, &both[..1]).files;
+            for text in earlier.values_mut() {
+                *text = text.replace("/tok/", address);
+            }
+            let refreshed = rewrite_registry_redirect(&earlier, &both[..1]);
+            assert_eq!(refreshed.files.is_empty(), address == "/tok/");
+            earlier.extend(held("aaaa").map(|held| (KEY.to_string(), held)));
+            let kept = rewrite_registry_redirect(&earlier, &both[..1]);
+            assert_eq!(warning_codes(&kept), [PINNED], "{:?}", kept.warnings);
+            assert!(kept.files.is_empty() && kept.edits.is_empty(), "{address}");
+            let stays = "; the pin an earlier run wrote is left as it is (nothing rewritten)";
+            assert!(kept.warnings[0].detail.contains(stays), "{address}");
+        }
+
+        // A `gem_checksums` that is not written out may hold either gem.
+        let unread = run(Some(format!("[[\"{call}\",null]]")), &both);
+        assert_eq!(warning_codes(&unread), [PINNED, PINNED]);
+        assert!(unread.files.is_empty() && unread.edits.is_empty());
+        // A gem that is refused without Bazel keeps that refusal alone.
+        let unlocked = run(held("aaaa"), &[gem_override("colorize", "0.8.1")]);
+        assert_eq!(
+            warning_codes(&unlocked),
+            ["redirect_gem_version_not_locked"]
+        );
+    }
+
     fn gem_override(name: &str, version: &str) -> DepOverride {
         DepOverride {
             ecosystem: "gem".into(),
@@ -32468,6 +32610,73 @@ packages:
                 .collect::<Vec<_>>(),
             ["redirect_nuget_inherited_config_outside_root"]
         );
+    }
+
+    /// What the engine hands over of the rules_csharp hub of a Bazel
+    /// workspace ([`crate::bazel::nuget::withheld`]): a dep the hub would
+    /// not take is skipped with the hub's word after its name and nothing
+    /// is written, where the same files without it are pinned. A dep the
+    /// rewriter refuses for another reason keeps that reason, and one in
+    /// no lock that the hub reads is pinned as without it.
+    #[test]
+    fn nuget_under_a_bazel_hub_that_would_not_take_the_pin_writes_nothing() {
+        use crate::bazel::nuget::{Hub, Read, WITHHELD_KEY};
+        let lock = ("packages.lock.json".to_string(), simple_lock("UPSTREAM=="));
+        let mut files = BTreeMap::from([lock]);
+        let pinned = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let written: Vec<&str> = pinned.files.keys().map(String::as_str).collect();
+        assert_eq!(written, ["nuget.config", "packages.lock.json"]);
+
+        let hub = |why: Option<&str>, locks: Vec<Read>| {
+            let (why, ordered) = (why.map(String::from), true);
+            let hub = Hub {
+                why,
+                every: false,
+                locks,
+                ordered,
+            };
+            serde_json::to_string(&hub).expect("a hub")
+        };
+        let ours = || Read::Ours("packages.lock.json".to_string());
+        let (at, other) = ("MODULE.bazel:8".to_string(), "lib/packages.lock.json");
+        let other = Read::Other(at, other.to_string(), Some(simple_lock("UPSTREAM==")));
+        let mut refused = nuget_override();
+        (refused.patch_uuid, refused.integrity.sha512) = ("other".into(), None);
+        let missing = "Newtonsoft.Json has no sha512 integrity";
+        for (hub, code, starts) in [
+            (
+                hub(Some("MODULE.bazel:4: why"), vec![ours()]),
+                "redirect_bazel_nuget_config_undeclared",
+                "Newtonsoft.Json@13.0.3: MODULE.bazel:4: why",
+            ),
+            (
+                hub(None, vec![other, ours()]),
+                "redirect_bazel_nuget_lock_not_repinned",
+                "Newtonsoft.Json@13.0.3: MODULE.bazel:8: this `nuget.from_lock` reads \
+                 lib/packages.lock.json, which holds the package as well and which this run",
+            ),
+        ] {
+            files.insert(WITHHELD_KEY.to_string(), hub);
+            for with_config in [false, true] {
+                if with_config {
+                    files.insert("nuget.config".to_string(), default_nuget_config());
+                }
+                let r = rewrite_registry_redirect(&files, &[nuget_override(), refused.clone()]);
+                assert!(r.files.is_empty() && r.edits.is_empty(), "{r:?}");
+                let said: Vec<_> = r.warnings.iter().map(|w| (&*w.code, &*w.detail)).collect();
+                assert_eq!(said.len(), 2, "{said:?}");
+                assert_eq!(said[0].0, code);
+                assert!(said[0].1.starts_with(starts), "{said:?}");
+                assert_eq!(said[1], ("redirect_nuget_missing_sha512", missing));
+            }
+            files.remove("nuget.config");
+        }
+        // The hub reads another lock of the project: this pin is not its.
+        let elsewhere = vec![Read::Ours("src/packages.lock.json".to_string())];
+        let elsewhere = hub(Some("why"), elsewhere);
+        files.insert(WITHHELD_KEY.to_string(), elsewhere);
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert_eq!(r.files, pinned.files);
     }
 
     /// A PRESENT but unparseable packages.lock.json refuses the whole nuget
