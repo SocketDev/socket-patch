@@ -191,9 +191,20 @@ pub fn ready(root: &BazelRoot, lock: &str, locks: &[String]) -> Result<(), Strin
         let link = "is a symbolic link, which socket-patch does not write through";
         return Err(format!("{} {link}", LINES.file));
     }
+    // The line editor reads only a regular file. A FIFO or device there
+    // would also block the append probe below in open(2).
+    if std::fs::metadata(&rc).is_ok_and(|m| !m.is_file()) {
+        return Err(format!("{} is not a regular file", LINES.file));
+    }
     // As the write itself asks: a file that is there opens for appending.
+    // Non-blocking on Unix, so a FIFO swapped in after the check above
+    // fails the open (ENXIO) instead of waiting for a reader.
+    let mut probe = std::fs::OpenOptions::new();
+    probe.append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut probe, libc::O_NONBLOCK);
     let denied = |e: std::io::Error| e.kind() == std::io::ErrorKind::PermissionDenied;
-    if (std::fs::OpenOptions::new().append(true).open(&rc)).is_err_and(denied) {
+    if probe.open(&rc).is_err_and(denied) {
         let closed = "is read-only, so the line that makes Bazel take the committed wheel \
                       cannot be written to it";
         return Err(format!("{} {closed}", LINES.file));
@@ -631,7 +642,21 @@ use_repo(pip, "pip")
             std::os::unix::fs::symlink("elsewhere", root.dir.join(".bazelrc")).unwrap();
             let why = ready(&root, "requirements.txt", &locks).unwrap_err();
             assert!(why.contains(".bazelrc is a symbolic link"), "{why}");
+            // A FIFO declines at once instead of hanging the probe.
+            let (_tmp, root) = checkout("", &files, &[]);
+            let fifo = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(
+                root.dir.join(".bazelrc").as_os_str(),
+            ))
+            .unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+            let why = ready(&root, "requirements.txt", &locks).unwrap_err();
+            assert!(why.contains(".bazelrc is not a regular file"), "{why}");
         }
+        // A directory there is no file to write the line into either.
+        let (_tmp, root) = checkout("", &files, &[]);
+        fs::create_dir(root.dir.join(".bazelrc")).unwrap();
+        let why = ready(&root, "requirements.txt", &locks).unwrap_err();
+        assert!(why.contains(".bazelrc is not a regular file"), "{why}");
         let (_tmp, root) = checkout("", &[files[0], files[1], (".bazelrc", "")], &[]);
         assert_eq!(ready(&root, "requirements.txt", &locks), Ok(()));
         let rc = root.dir.join(".bazelrc");
