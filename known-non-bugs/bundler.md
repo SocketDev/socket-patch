@@ -204,3 +204,5 @@ Documented limitations and verified false positives. One bullet each. Search thi
 - Agent `rollback` fails with "Before blob could not be downloaded" against a mock that serves only the after blobs: serve `@before` too. The real API serves both (2026-11-20).
 - Vendored mode rewrites `gem "sqlite3", "~> 2.10.0"` to the exact `"2.10.2", path:` pin; rollback restores the range byte for byte (2026-11-20).
 - Recompiled `.so` / `gem_make.out` differ after a hosted rollback of a source-built gem (racc, ffi with `force_ruby_platform`): builds are not reproducible; every other file is byte-exact (2026-11-20).
+- With a patch mirror (`--patch-mirror-url`, experimental), `list` / `vex` / `rollback` run without the setting report no patches: documented in CLI_CONTRACT "Patch mirror (experimental)"; a re-scan names the setting (2026-11-24).
+- `bundle update --bundler` to 4.1 adds a `nokogiri (<v>)` ruby entry and `mini_portile2` to a hosted lock: Bundler 4.1's default lock shape, not a socket-patch edit (2026-11-24).
