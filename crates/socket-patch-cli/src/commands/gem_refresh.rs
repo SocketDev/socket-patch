@@ -1039,6 +1039,12 @@ pub(crate) struct RestoreRefresh {
     /// be) with none left on the patched build: nothing of theirs is left
     /// for a reinstall.
     pub(crate) refreshed_installs: BTreeSet<String>,
+    /// The upstream sha256 the refresh verified for each build it judged,
+    /// by leaf.
+    upstream_sha256: BTreeMap<String, String>,
+    /// A vendored unwind's gems whose installed copies are all proven to
+    /// be the upstream build ([`upstream_installs`]).
+    pub(crate) upstream_installs: BTreeSet<String>,
 }
 
 /// After a hosted unwind restored the gems of `pins` to their upstream
@@ -1240,6 +1246,7 @@ pub(crate) async fn after_vendored_unwind(
     common: &GlobalArgs,
     unwound: &[String],
     records: &BTreeMap<String, PatchRecord>,
+    ledger: &BTreeMap<String, PatchRecord>,
 ) -> RestoreRefresh {
     use socket_patch_core::patch::redirect::upstream::gem_upstream;
 
@@ -1250,24 +1257,89 @@ pub(crate) async fn after_vendored_unwind(
     // lock asks no registry.
     let lock = gem_upstream(&common.cwd, &BTreeMap::new(), true).await;
     let builds = build_leaves(&named_builds(&lock, unwound), |_| true);
-    for copy in installed_builds(common, &builds).await {
-        if copy.archive.is_file() || holds_patch(&copy, records).await {
-            installed.insert(copy.purl);
+    let copies = installed_builds(common, &builds).await;
+    for copy in &copies {
+        if copy.archive.is_file() || holds_patch(copy, records).await {
+            installed.insert(copy.purl.clone());
         }
     }
-    if installed.is_empty() {
-        return RestoreRefresh::default();
+    let mut refresh = if installed.is_empty() {
+        RestoreRefresh::default()
+    } else {
+        let installed: Vec<String> = installed.into_iter().collect();
+        refresh_restored(
+            common,
+            &installed,
+            &BTreeMap::new(),
+            records,
+            None,
+            Scope::Installed,
+        )
+        .await
+    };
+    refresh.upstream_installs =
+        upstream_installs(unwound, &copies, &refresh.upstream_sha256, ledger).await;
+    refresh
+}
+
+/// The gems of `unwound` whose installed copies are proven to hold no
+/// patched byte once the refresh ran (#2214): vendoring never wrote to a
+/// gem home, so a gem that was only ever vendored is one of them.
+/// `copies` is every installed copy of their builds. A gem is listed when
+/// it has an installed copy and each one is proven to be the upstream
+/// build twice over: the archive RubyGems installed it from hashes to the
+/// build's verified upstream sha256 (`upstream`, by leaf), and every file
+/// of the gem's ledger record (`ledger`, by purl) is in its pre-patch
+/// state there. Anything short of that keeps the gem out: no copy found
+/// (the gem home may be one this run cannot see), no verified sha256, an
+/// unreadable archive, no record, a file that is patched, edited or
+/// unreadable.
+async fn upstream_installs(
+    unwound: &[String],
+    copies: &[InstalledCopy],
+    upstream: &BTreeMap<String, String>,
+    ledger: &BTreeMap<String, PatchRecord>,
+) -> BTreeSet<String> {
+    use socket_patch_core::vendor::file_sha256_hex;
+
+    let mut proven: BTreeMap<&str, bool> = BTreeMap::new();
+    for copy in copies {
+        let is_upstream = match (upstream.get(&copy.leaf), ledger.get(&copy.purl)) {
+            (Some(sha), Some(record)) => {
+                file_sha256_hex(&copy.archive).await.as_ref() == Some(sha)
+                    && is_unpatched(&copy.dir, record).await
+            }
+            _ => false,
+        };
+        *proven.entry(copy.purl.as_str()).or_insert(true) &= is_upstream;
     }
-    let installed: Vec<String> = installed.into_iter().collect();
-    refresh_restored(
-        common,
-        &installed,
-        &BTreeMap::new(),
-        records,
-        None,
-        Scope::Installed,
-    )
-    .await
+    unwound
+        .iter()
+        .filter(|purl| proven.get(purl.as_str()) == Some(&true))
+        .cloned()
+        .collect()
+}
+
+/// Whether every file `record` lists is in its pre-patch state in the
+/// installed gem `dir`: it hashes to its `beforeHash`, or the patch adds
+/// it and it is not there. A record that lists no file proves nothing.
+async fn is_unpatched(dir: &Path, record: &PatchRecord) -> bool {
+    use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
+
+    if record.files.is_empty() {
+        return false;
+    }
+    for (name, info) in &record.files {
+        let verified = verify_file_patch(dir, name, info).await;
+        // `Ready` also covers a file the patch adds that is there with
+        // other content (apply overwrites it): only its absence proves
+        // the copy never got it.
+        let added_but_present = info.before_hash.is_empty() && verified.current_hash.is_some();
+        if verified.status != VerifyStatus::Ready || added_but_present {
+            return false;
+        }
+    }
+    true
 }
 
 /// The builds of each gem of `gems` that are this project's: the ones the
@@ -1440,8 +1512,15 @@ async fn refresh_restored(
         Scope::Installed,
     )
     .await;
+    let upstream_sha256: BTreeMap<String, String> = shas
+        .iter()
+        .filter_map(|(leaf, build)| Some((leaf.clone(), build.sha256.clone()?)))
+        .collect();
     if stale.is_empty() && unchecked.is_empty() && no_record.is_empty() {
-        return RestoreRefresh::default();
+        return RestoreRefresh {
+            upstream_sha256,
+            ..RestoreRefresh::default()
+        };
     }
     let wanted = |gem: &StaleGem| {
         Some(Wanted {
@@ -1499,6 +1578,8 @@ async fn refresh_restored(
     }
     RestoreRefresh {
         refreshed_installs,
+        upstream_sha256,
+        upstream_installs: BTreeSet::new(),
         report: report(direction, &installed, &pass, &policy),
         replaced_archives: if policy.dry_run {
             Vec::new()
@@ -1511,6 +1592,64 @@ async fn refresh_restored(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2214: what proves an installed gem never got its patch. Each record
+    /// file is at its `beforeHash`, or the patch adds it and it is absent.
+    #[tokio::test]
+    async fn is_unpatched_needs_every_record_file_in_its_pre_patch_state() {
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes as hash;
+        use socket_patch_core::manifest::schema::PatchFileInfo;
+
+        let record = |files: &[(&str, &[u8], &[u8])]| PatchRecord {
+            uuid: "u".into(),
+            exported_at: String::new(),
+            files: files
+                .iter()
+                .map(|(name, before, after)| {
+                    let info = PatchFileInfo {
+                        before_hash: if before.is_empty() {
+                            String::new()
+                        } else {
+                            hash(before)
+                        },
+                        after_hash: hash(after),
+                    };
+                    (name.to_string(), info)
+                })
+                .collect(),
+            vulnerabilities: Default::default(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("a.rb"), b"before").unwrap();
+        let changed = record(&[("a.rb", b"before", b"after")]);
+        let with_added = record(&[("a.rb", b"before", b"after"), ("new.rb", b"", b"added")]);
+
+        assert!(is_unpatched(dir, &changed).await);
+        assert!(
+            is_unpatched(dir, &with_added).await,
+            "the added file is absent"
+        );
+        assert!(!is_unpatched(dir, &record(&[])).await, "no file, no proof");
+
+        // The added file is there, with the patch's content or any other.
+        for leftover in [&b"added"[..], b"something else"] {
+            std::fs::write(dir.join("new.rb"), leftover).unwrap();
+            assert!(!is_unpatched(dir, &with_added).await, "{leftover:?}");
+        }
+        std::fs::remove_file(dir.join("new.rb")).unwrap();
+
+        // The changed file is patched, edited or gone.
+        for content in [&b"after"[..], b"edited"] {
+            std::fs::write(dir.join("a.rb"), content).unwrap();
+            assert!(!is_unpatched(dir, &changed).await, "{content:?}");
+        }
+        std::fs::remove_file(dir.join("a.rb")).unwrap();
+        assert!(!is_unpatched(dir, &changed).await, "a missing file");
+    }
 
     fn policy(root: &Path, enabled: bool, shared: bool, dry_run: bool) -> Policy {
         Policy {

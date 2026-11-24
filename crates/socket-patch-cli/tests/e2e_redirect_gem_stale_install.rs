@@ -4162,6 +4162,11 @@ async fn vendored_unwind_restores_an_install_a_hosted_scan_patched() {
                 && !text.contains("upstream_gem_stale_install"),
             "{unwind:?}: {env}"
         );
+        // Nothing of the gem is left on its patched build (#2214).
+        assert!(
+            details_with_code(&env, "reinstall_required").is_empty(),
+            "{unwind:?}: {env}"
+        );
     }
 }
 
@@ -4416,6 +4421,161 @@ async fn vendored_unwind_leaves_an_upstream_install_alone() {
             assert!(!text.contains(code), "{unwind:?}: {code} in {env}");
         }
     }
+}
+
+/// #2214: rollback's "keeps its patched bytes" note, and the
+/// `reinstall_required` warning `--json` carries for it, are about the
+/// installed trees. Vendored mode never touches a gem home, so a gem that
+/// was only ever vendored has nothing patched there once its pair is
+/// restored: its installed copy is the upstream build, which its archive
+/// in the gem home and the ledger record's pre-patch hashes prove.
+#[tokio::test(flavor = "multi_thread")]
+async fn rollback_of_an_only_vendored_gem_names_no_reinstall() {
+    for json in [true, false] {
+        let case = format!("json={json}");
+        let server = MockServer::start().await;
+        let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+        mount_api_for(&server, None, &sha256_of(&patched)).await;
+        serve_upstream_gem(&server, &upstream).await;
+        mount_vendored_grant(&server, &patched).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        let pair_before = (
+            std::fs::read(proj.join("Gemfile")).unwrap(),
+            std::fs::read(proj.join("Gemfile.lock")).unwrap(),
+        );
+        let home = project_home(&proj);
+        install_real_gem(&home, UPSTREAM_LIB);
+        let uri = server.uri();
+        let (code, stdout, stderr) = unwind_run(
+            &proj,
+            &uri,
+            &["scan", "--mode", "vendored", "--yes", "--json"],
+        );
+        assert_eq!(code, 0, "{case}: vendored scan:\n{stdout}\n{stderr}");
+        assert!(
+            std::fs::read_to_string(proj.join("Gemfile"))
+                .unwrap()
+                .contains(".socket/vendor/gem/"),
+            "{case}: premise: the gem is vendored"
+        );
+        let held_before = snapshot(&home);
+
+        let mut args = vec!["rollback", "--yes"];
+        if json {
+            args.push("--json");
+        }
+        let (code, stdout, stderr) = unwind_run(&proj, &uri, &args);
+        assert_eq!(code, 0, "{case}:\n{stdout}\n{stderr}");
+        let pair_after = (
+            std::fs::read(proj.join("Gemfile")).unwrap(),
+            std::fs::read(proj.join("Gemfile.lock")).unwrap(),
+        );
+        assert!(pair_after == pair_before, "{case}: the pair is restored");
+        assert!(
+            snapshot(&home) == held_before,
+            "{case}: the gem home is untouched"
+        );
+        if json {
+            let env = common::parse_json_envelope(&stdout);
+            assert_eq!(env["status"], "success", "{case}: {env}");
+            assert!(
+                details_with_code(&env, "reinstall_required").is_empty(),
+                "{case}: no installed tree holds patched bytes: {env}"
+            );
+        } else {
+            assert!(
+                stdout.contains(&format!("Reverted vendoring for {PURL}")),
+                "{case}:\n{stdout}"
+            );
+            assert!(
+                !stdout.contains("patched bytes in installed trees")
+                    && !stderr.contains("Warning:"),
+                "{case}: nothing is left to reinstall:\n{stdout}\n{stderr}"
+            );
+        }
+    }
+}
+
+/// The other side of #2214: an installed copy the unwind could not prove
+/// to be the upstream build is still counted. Here agent mode patched the
+/// copy before the gem was vendored, and the gem comes from a remote the
+/// unwind does not judge, so the patched files stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn rollback_still_names_a_reinstall_for_an_install_it_could_not_judge() {
+    for json in [true, false] {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let (gem_dir, _) =
+            agent_then_vendored_from(&server, &proj, "https://gems.example.test").await;
+
+        let mut args = vec!["rollback", "--yes"];
+        if json {
+            args.push("--json");
+        }
+        let (code, stdout, stderr) = unwind_run(&proj, &server.uri(), &args);
+        assert_eq!(code, 0, "json={json}:\n{stdout}\n{stderr}");
+        assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "json={json}: premise");
+        if json {
+            let env = common::parse_json_envelope(&stdout);
+            assert_eq!(
+                details_with_code(&env, "reinstall_required").len(),
+                1,
+                "{env}"
+            );
+        } else {
+            assert!(
+                stdout.contains("1 unwired package keeps its patched bytes in installed trees"),
+                "{stdout}\n{stderr}"
+            );
+        }
+    }
+}
+
+/// #2214, a copy the gem home's archive alone would call upstream: agent
+/// mode patched it in place, beside the upstream archive, and standalone
+/// `vendor` then vendored the gem from the manifest. Rollback may only
+/// drop its reinstall warning when the installed copy no longer holds the
+/// patched file.
+#[tokio::test(flavor = "multi_thread")]
+async fn rollback_never_calls_an_agent_patched_install_upstream() {
+    let server = MockServer::start().await;
+    let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+    mount_api_for(&server, None, &sha256_of(&patched)).await;
+    serve_upstream_gem(&server, &upstream).await;
+    mount_vendored_grant(&server, &patched).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_manifest_pair(&proj);
+    let home = project_home(&proj);
+    let gem_dir = agent_patched_install(&proj, &home);
+    let uri = server.uri();
+    let (code, stdout, stderr) = unwind_run(&proj, &uri, &["vendor", "--yes", "--json"]);
+    assert_eq!(code, 0, "vendor:\n{stdout}\n{stderr}");
+    assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "premise");
+    assert_eq!(
+        std::fs::read(home.join("cache").join(format!("{DEP}-{DEP_VERSION}.gem"))).unwrap(),
+        upstream,
+        "premise: the archive beside it is the upstream one"
+    );
+
+    let (code, stdout, stderr) = unwind_run(&proj, &uri, &["rollback", "--yes", "--json"]);
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    assert_eq!(
+        installed_lib(&gem_dir),
+        PATCHED_LIB,
+        "premise: this rollback leaves the installed copy patched: {env}"
+    );
+    assert_eq!(
+        details_with_code(&env, "reinstall_required").len(),
+        1,
+        "the copy is left patched, so the warning stays: {env}"
+    );
 }
 
 /// A project whose gem agent mode patched in place and a vendored scan
