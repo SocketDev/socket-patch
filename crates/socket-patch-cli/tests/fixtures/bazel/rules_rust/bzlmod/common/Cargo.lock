@@ -10,7 +10,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "socket-patch-bazel-fixture-dependency-with-a-name-that-is-too-long-for-crates-io"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[package]]
 name = "socket-patch-bazel-fixture-with-a-name-that-is-too-long-for-crates-io"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+dependencies = [
+ "socket-patch-bazel-fixture-dependency-with-a-name-that-is-too-long-for-crates-io",
+]

@@ -1,0 +1,10 @@
+[
+  {
+    "name": "old-notes",
+    "version": "1.0.0",
+    "uuid": "11111111-1111-4111-8111-111111111111",
+    "artifactUrl": "https://patch.test/patch/npm/old-notes/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/old-notes-1.0.0.tgz",
+    "npmRegistryUrl": "https://patch.test/patch/npm/old-notes/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/",
+    "sha512": "sha512-GHSrcQ2B7Jhevmw7D3a07aXuZZ8VpyY6n8ATw5TImeqENqO5TNmR65CKciaWYUx7GBN35TeFXoNRgg0igsedLg=="
+  }
+]

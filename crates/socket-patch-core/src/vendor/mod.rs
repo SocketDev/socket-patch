@@ -1040,7 +1040,16 @@ pub async fn lock_text_refusals(
 /// and ref rewritability all key on other text). The one difference is a
 /// `pnpm-workspace.yaml` scaffold hosted mode created, which the restore
 /// deletes; a gate that depended on it would make this under-predict, and
-/// the wet run still refuses. Yarn's restores rewrite key and checksum
+/// the wet run still refuses.
+///
+/// Not so for a project hosted mode routed through the patch server's
+/// named registry
+/// ([`pnpm_route_present`](crate::hosted::engine::pnpm_route_present)): there the restore also
+/// respells the lock's keys and takes the route's override back out of
+/// pnpm-workspace.yaml, both of which the gates read, so the still-hosted
+/// text would refuse a takeover the restored project accepts. Nothing is
+/// predicted for such a project: the dry-run preview asks the backend
+/// over the restored text itself, and the wet run restores first. Yarn's restores rewrite key and checksum
 /// text, and legacy pnpm 7/8 locks (5.4 / 6.0) are not lock-text gated at
 /// all, so neither is predicted here: a mixed line-ending legacy lock, an
 /// override conflict or an unsupported legacy entry previews `would_vendor` while
@@ -1060,6 +1069,9 @@ pub async fn pnpm_takeover_lock_text_refusals(
             _
         ))
     ) {
+        return HashMap::new();
+    }
+    if crate::hosted::engine::pnpm_route_present(project_root).await {
         return HashMap::new();
     }
     let npm: Vec<(&str, &str)> = candidates

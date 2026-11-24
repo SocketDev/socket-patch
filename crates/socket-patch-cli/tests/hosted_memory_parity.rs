@@ -299,6 +299,65 @@ async fn parity_gemfile_platform_prebuilds() {
     assert_parity(case("gem/bundler/platform-prebuilds")).await;
 }
 
+/// The gem fixture as the root of a Bazel workspace whose rules_ruby hub
+/// reads the lock and names the patched gem in `gem_checksums`. With the
+/// sha256 of the upstream archive there, the checkout and the engine write
+/// no file and say why in the same words. With the one of the patched
+/// archive both write what they write without Bazel. The engine is given
+/// the files that path selection asks for.
+#[tokio::test]
+async fn parity_gem_checksums_of_a_bazel_hub_through_selection() {
+    let dir = fixtures_root().join("redirect/gem/bundler/basic");
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
+    mount_api(&server, &patches).await;
+    let mut files = fixture_files(&dir.join("input"));
+    let plain = run_disk(&server, &files, false);
+    assert!(
+        plain.changed.contains_key("Gemfile.lock"),
+        "{}",
+        plain.stderr
+    );
+    let code = "redirect_bazel_gem_checksums_pinned";
+    for (sum, left) in [("2".repeat(64), true), ("deadbeef".repeat(8), false)] {
+        let module = format!(
+            "bazel_dep(name = \"rules_ruby\", version = \"1.0.0-rc2\")\n\
+             ruby = use_extension(\"@rules_ruby//ruby:extensions.bzl\", \"ruby\")\n\
+             ruby.bundle_fetch(\n    name = \"bundle\",\n    gemfile = \"//:Gemfile\",\n    \
+             gemfile_lock = \"//:Gemfile.lock\",\n    gem_checksums = {{\"rails-7.0.0\": \
+             \"{sum}\"}},\n)\n"
+        );
+        files.insert("MODULE.bazel".into(), module.into_bytes());
+        let disk = run_disk(&server, &files, false);
+        let memory = run_engine(&server, selected_input(&files)).await;
+        let project = &memory.projects[0];
+        assert!(project.error.is_none(), "{:?}", project.error);
+        assert_eq!(
+            sorted_redirect(&project.redirect),
+            disk.redirect,
+            "{}",
+            disk.stderr
+        );
+        assert_eq!(engine_changed(&memory), disk.changed, "{}", disk.stderr);
+        let warnings = disk.redirect["warnings"].as_array().unwrap();
+        let said: Vec<&str> = warnings
+            .iter()
+            .filter(|warning| warning["code"] == code)
+            .filter_map(|warning| warning["detail"].as_str())
+            .collect();
+        if left {
+            assert_eq!(disk.changed.len(), 0, "{}", disk.stderr);
+            assert_eq!(said.len(), 1, "{:#}", disk.redirect);
+            let named = "rails@7.0.0: `ruby.bundle_fetch` at MODULE.bazel:3 holds `rails-7.0.0`";
+            assert!(said[0].starts_with(named), "{}", said[0]);
+            assert_eq!(disk.redirect["patches"][0]["action"], "unpinned");
+        } else {
+            assert_eq!(disk.changed, plain.changed, "{}", disk.stderr);
+            assert_eq!(disk.redirect, plain.redirect, "{}", disk.stderr);
+        }
+    }
+}
+
 #[tokio::test]
 async fn parity_golang() {
     assert_parity(case("golang/gomod/basic")).await;
@@ -1519,6 +1578,63 @@ async fn parity_pnpm_member_branch_lock_refusal() {
         redirect["warnings"]
             .to_string()
             .contains("redirect_pnpm_git_branch_lockfile"),
+        "{redirect:#}"
+    );
+}
+
+/// A rules_js hub of the project's `MODULE.bazel` that keeps the pnpm lock
+/// up to date with pnpm 11 and does not list `pnpm-workspace.yaml` as
+/// `data`: the pnpm that Bazel runs would reject a pinned lock, so both
+/// engines refuse every pnpm pin with the same warning, nothing written.
+/// Path selection asks for the `MODULE.bazel` beside the lock. With a
+/// file of the user's own listed both engines pin the lock; with a listed
+/// file that the undo of the pin would remove both pin nothing.
+#[tokio::test]
+async fn parity_pnpm_bazel_hub_that_hides_the_workspace_file() {
+    let lock =
+        String::from_utf8(read_fixture("redirect/npm/pnpm/basic/input/pnpm-lock.yaml")).unwrap();
+    let module = |data: &str| {
+        format!(
+            "module(name = \"app\")\n\
+             bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+             npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+             npm.npm_translate_lock(\n    name = \"npm\",\n{data}    \
+             pnpm_lock = \"//:pnpm-lock.yaml\",\n    update_pnpm_lock = True,\n)\n\
+             pnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
+             pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")\n"
+        )
+    };
+    let workspace = "# own\npackages:\n  - '.'\n";
+    let hidden = module("");
+    let files = pnpm_workspace(workspace, Some(&lock), &[], &[("MODULE.bazel", &hidden)]);
+    let (redirect, changed) = assert_pnpm_workspace_parity(&files, true).await;
+    assert!(changed.is_empty(), "{}", describe(&changed));
+    let warned = redirect["warnings"].to_string();
+    let code = "redirect_pnpm_bazel_workspace_hidden";
+    assert!(warned.contains(code), "{redirect:#}");
+    assert!(warned.contains("MODULE.bazel:4: "), "{redirect:#}");
+
+    let listed = module("    data = [\"//:pnpm-workspace.yaml\"],\n");
+    let files = pnpm_workspace(workspace, Some(&lock), &[], &[("MODULE.bazel", &listed)]);
+    let (redirect, changed) = assert_pnpm_workspace_parity(&files, true).await;
+    let paths: Vec<&str> = changed.keys().map(String::as_str).collect();
+    assert_eq!(paths, ["pnpm-lock.yaml", "pnpm-workspace.yaml"]);
+    assert!(
+        !redirect["warnings"].to_string().contains(code),
+        "{redirect:#}"
+    );
+
+    // Listed, but a file that the undo of the pin would remove: both
+    // engines pin nothing, so that no `rollback` leaves the call with a
+    // missing file.
+    let scaffold = "packages:\n  - '.'\n";
+    let files = pnpm_workspace(scaffold, Some(&lock), &[], &[("MODULE.bazel", &listed)]);
+    let (redirect, changed) = assert_pnpm_workspace_parity(&files, true).await;
+    assert!(changed.is_empty(), "{}", describe(&changed));
+    let warned = redirect["warnings"].to_string();
+    assert!(warned.contains(code), "{redirect:#}");
+    assert!(
+        warned.contains("put a comment line in pnpm-workspace.yaml"),
         "{redirect:#}"
     );
 }

@@ -351,18 +351,26 @@ async fn patched_in_other_scope(
 
 /// `rollback`'s pointer at the scope that still holds a patched copy: a
 /// rollback of just that purl, naming `--cwd` when the run used one (the record lives in that
-/// project's manifest).
+/// project's manifest). The command names the release without the record's
+/// qualifiers (`?platform=ruby`, `?artifact_id=...`): the record was kept
+/// with its whole variant group, a base purl selects that group, and a `?`
+/// is a glob character to the shell. The purl and the directory are quoted
+/// where a shell would otherwise read them as more than one word.
 fn patched_in_other_scope_warning(purl: &str, path: &Path, common: &GlobalArgs) -> String {
+    let word = crate::ui::shell_word(strip_purl_qualifiers(purl));
     let (scope, mut command) = if common.is_global() {
-        ("the project", format!("socket-patch rollback {purl}"))
+        ("the project", format!("socket-patch rollback {word}"))
     } else {
         (
             "the global install",
-            format!("socket-patch rollback {purl} -g"),
+            format!("socket-patch rollback {word} -g"),
         )
     };
     if common.cwd != Path::new(".") {
-        command.push_str(&format!(" --cwd {}", common.cwd.display()));
+        command.push_str(&format!(
+            " --cwd {}",
+            crate::ui::shell_word(&common.cwd.to_string_lossy())
+        ));
     }
     format!(
         "{purl}: its copy in {scope} ({}) is still patched or could not be \
@@ -1100,10 +1108,10 @@ struct VendoredLegOutcome {
     /// could not be saved.
     failed: Vec<(String, &'static str, String)>,
     warnings: Vec<(String, String)>,
-    /// The gems (ledger keys) whose installed copies the unwind brought
-    /// back to the upstream build: nothing of theirs is left for a
-    /// reinstall.
-    refreshed_installs: std::collections::BTreeSet<String>,
+    /// The gems (ledger keys) with no installed copy left on the patched
+    /// build, brought back to the upstream one or found to be it already:
+    /// nothing of theirs is left for a reinstall.
+    upstream_installs: std::collections::BTreeSet<String>,
     /// `removed` / `vendor_orphan_removed` events for the orphan uuid
     /// dirs (no ledger entry) swept, also on dry-run.
     orphans_removed: Vec<PatchEvent>,
@@ -1136,13 +1144,13 @@ async fn run_vendored_leg(
         key,
         warnings,
         progress,
-        gem_install_refreshed,
+        gem_install_upstream,
         step,
         ..
     } in reverted
     {
-        if gem_install_refreshed {
-            out.refreshed_installs.insert(key.clone());
+        if gem_install_upstream {
+            out.upstream_installs.insert(key.clone());
         }
         for w in &warnings {
             if loud {
@@ -2745,9 +2753,6 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             let gc_bytes_freed = gc.map_or(0, |gc| gc.bytes_freed);
 
             // ── run-level warnings ───────────────────────────────────────
-            let unwired_any = !vendored_leg.reverted.is_empty()
-                || !vendored_leg.preserved.is_empty()
-                || !hosted_leg.reverted.is_empty();
             let advised = ReinstallAdvised::of(
                 vendored_leg
                     .warnings
@@ -2755,7 +2760,33 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                     .chain(hosted_leg.warnings.iter())
                     .map(|(code, _)| code.as_str()),
             );
-            if unwired_any {
+            // Only packages that are NOT also handled in place keep
+            // patched bytes. A successful in-place result that verified
+            // files leaves the installed tree original: restored now,
+            // restorable (dry run), or already original (never
+            // patched). None of those has anything left to reinstall.
+            let restored = handled_in_place(&results);
+            let base_of = |key: &str| {
+                vendor_entries
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, e)| e.base_purl.clone())
+            };
+            let still_patched = vendored_leg
+                .reverted
+                .iter()
+                .chain(vendored_leg.preserved.iter())
+                .chain(hosted_leg.reverted.iter())
+                .filter(|key| {
+                    !restored.contains(strip_purl_qualifiers(key))
+                        && !base_of(key).is_some_and(|b| restored.contains(b.as_str()))
+                        // A gem the unwind brought back to its upstream
+                        // build, or found on it already (#2214).
+                        && !hosted_leg.refreshed_installs.contains(key.as_str())
+                        && !vendored_leg.upstream_installs.contains(key.as_str())
+                })
+                .count();
+            if still_patched > 0 {
                 run_warnings.push((
                     "reinstall_required".into(),
                     format!(
@@ -3052,32 +3083,6 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                     }
                     println!("{}", format_gc_freed(gc_bytes_freed, args.common.dry_run));
                 }
-                // Only packages that are NOT also handled in place keep
-                // patched bytes. A successful in-place result that verified
-                // files leaves the installed tree original: restored now,
-                // restorable (dry run), or already original (never
-                // patched). None of those has anything left to reinstall.
-                let restored = handled_in_place(&results);
-                let base_of = |key: &str| {
-                    vendor_entries
-                        .iter()
-                        .find(|(k, _)| k == key)
-                        .map(|(_, e)| e.base_purl.clone())
-                };
-                let still_patched = vendored_leg
-                    .reverted
-                    .iter()
-                    .chain(vendored_leg.preserved.iter())
-                    .chain(hosted_leg.reverted.iter())
-                    .filter(|key| {
-                        !restored.contains(strip_purl_qualifiers(key))
-                            && !base_of(key).is_some_and(|b| restored.contains(b.as_str()))
-                            // A gem the hosted leg already brought back to
-                            // its upstream build.
-                            && !hosted_leg.refreshed_installs.contains(key.as_str())
-                            && !vendored_leg.refreshed_installs.contains(key.as_str())
-                    })
-                    .count();
                 if still_patched > 0 {
                     println!(
                         "\n{}",
@@ -4611,6 +4616,52 @@ mod tests {
     }
     use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
     use std::collections::HashMap;
+
+    /// The command this warning tells the user to run is one they paste.
+    /// A record's purl can carry qualifiers (`?platform=ruby`,
+    /// `?artifact_id=...`), and `?` is a glob character: the command names
+    /// the release, which selects the variant group the run kept. What is
+    /// left that a shell reads specially (`%40`, a space in `--cwd`) is
+    /// quoted (#2182).
+    #[test]
+    fn other_scope_warning_prints_a_command_a_shell_reads_as_written() {
+        let quoted = |word: &str| {
+            if cfg!(windows) {
+                format!("\"{word}\"")
+            } else {
+                format!("'{word}'")
+            }
+        };
+        let purl = "pkg:gem/rack@3.1.8?platform=ruby";
+        let path = Path::new("/gems/rack-3.1.8");
+        let local = crate::args::GlobalArgs::default();
+        let warning = patched_in_other_scope_warning(purl, path, &local);
+        assert!(
+            warning.contains("run `socket-patch rollback pkg:gem/rack@3.1.8 -g` to"),
+            "{warning}"
+        );
+        // The message's own naming of the record stays its full purl.
+        assert!(
+            warning.starts_with(&format!("{purl}: its copy in")),
+            "{warning}"
+        );
+
+        let scoped = "pkg:npm/%40scope/a@1.0.0";
+        let global = crate::args::GlobalArgs {
+            global: true,
+            cwd: PathBuf::from("my app"),
+            ..crate::args::GlobalArgs::default()
+        };
+        let warning = patched_in_other_scope_warning(scoped, path, &global);
+        assert!(
+            warning.contains(&format!(
+                "run `socket-patch rollback {} --cwd {}` to",
+                quoted(scoped),
+                quoted("my app")
+            )),
+            "{warning}"
+        );
+    }
 
     // The legacy path-taking delegation shape, kept for the unit tests below
     // (`remove` now threads its already-loaded manifest and ledger straight
@@ -7084,7 +7135,7 @@ mod tests {
                 "boom".to_string(),
             )],
             warnings: Vec::new(),
-            refreshed_installs: Default::default(),
+            upstream_installs: Default::default(),
             orphans_removed: Vec::new(),
         };
         let hosted = HostedLegOutcome {

@@ -6345,6 +6345,73 @@ async fn release_upstream_1_1_0(fx: &RedirectFixture) {
     }
 }
 
+/// Serve the patch record's purl the way the patch service spells a gem
+/// record's: with its `?platform=ruby` qualifier, on every route that
+/// carries it (the package a batch result is filed under stays bare). Each
+/// route answers what the fixture's own does, respelled, and outranks it.
+async fn serve_record_purl_with_platform(fx: &RedirectFixture) {
+    let api = fx._server.uri();
+    let bare = format!("\"purl\":\"{PURL}\"");
+    let qualified = format!("\"purl\":\"{PURL}?platform=ruby\"");
+    let client = reqwest::Client::new();
+    let post = |route: &str| client.post(format!("{api}{route}")).body("{}");
+    let get = |route: &str| client.get(format!("{api}{route}"));
+    let batch = format!("/v0/orgs/{ORG}/patches/batch");
+    let by_package = format!("/v0/orgs/{ORG}/patches/by-package/{DEP}");
+    let reference = format!("/v0/orgs/{ORG}/patches/package");
+    let view = format!("/v0/orgs/{ORG}/patches/view/{UUID}");
+    for (verb, route, request, keep_first) in [
+        ("POST", batch.as_str(), post(&batch), true),
+        ("GET", by_package.as_str(), get(&by_package), false),
+        ("POST", reference.as_str(), post(&reference), false),
+        ("GET", view.as_str(), get(&view), false),
+    ] {
+        let body = request
+            .send()
+            .await
+            .expect("fixture API reachable")
+            .text()
+            .await
+            .expect("fixture API body");
+        assert!(body.contains(&bare), "{route} carries the purl: {body}");
+        let respelled = if keep_first {
+            let (head, tail) = body.split_once(&bare).expect("checked above");
+            format!("{head}{bare}{}", tail.replace(&bare, &qualified))
+        } else {
+            body.replace(&bare, &qualified)
+        };
+        assert!(respelled.contains(&qualified), "{route}: {respelled}");
+        let matcher = if route == by_package {
+            Mock::given(method(verb)).and(path_regex(format!(
+                "^/v0/orgs/{ORG}/patches/by-package/.+$"
+            )))
+        } else {
+            Mock::given(method(verb)).and(path(route))
+        };
+        matcher
+            .respond_with(ResponseTemplate::new(200).set_body_raw(respelled, "application/json"))
+            .with_priority(1)
+            .mount(&fx._server)
+            .await;
+    }
+}
+
+/// The words a bash with `nullglob` set reads `command` as: a word that
+/// holds an unquoted glob character and matches no file is dropped.
+fn bash_nullglob_words(cwd: &Path, command: &str) -> Vec<String> {
+    let out = Command::new("bash")
+        .args(["-O", "nullglob", "-c", &format!("printf '%s\\n' {command}")])
+        .current_dir(cwd)
+        .output()
+        .expect("bash runs");
+    assert!(out.status.success(), "bash reads `{command}`: {out:?}");
+    String::from_utf8(out.stdout)
+        .expect("utf8 words")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
 /// A hosted gem's only source is its patch's registry, which serves one
 /// version, so the gem leaves `bundle outdated` and `bundle update` cannot
 /// move it (#2070). The scan has to say so, and what it says has to be true
@@ -6352,6 +6419,10 @@ async fn release_upstream_1_1_0(fx: &RedirectFixture) {
 /// lists the gem before the scan and not after, `bundle update` leaves the
 /// scanned lock at the patched version, and the way past the hold the scan
 /// names (`rollback`, then `bundle update <gem>`) does move the gem.
+///
+/// The `rollback` it names is run as printed, through a shell (#2182): the
+/// record's purl carries `?platform=ruby`, which selects no hosted pin and
+/// which a shell globs, so the command names the pin without it.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
@@ -6430,6 +6501,7 @@ async fn gem_hosted_scan_says_the_gem_is_held_at_its_version() {
 
     // The scan, in human output: it names the gem it now holds and the way
     // past the hold.
+    serve_record_purl_with_platform(&fx).await;
     let (code, stdout, stderr) = run_socket(
         &fx.proj,
         &[
@@ -6477,8 +6549,47 @@ async fn gem_hosted_scan_says_the_gem_is_held_at_its_version() {
     );
 
     // And the way past it works: roll back, then `bundle update <gem>`.
+    // The rollback is the command the note printed, as a shell reads it.
     std::fs::write(&lock_path, &scanned_lock).unwrap();
-    rollback();
+    let printed = stdout
+        .lines()
+        .find(|line| line.starts_with("Bundler now takes "))
+        .and_then(|line| {
+            line.split('`')
+                .find(|span| span.starts_with("socket-patch rollback "))
+        })
+        .expect("the scan's hold line names a rollback");
+    let words = bash_nullglob_words(&fx.proj, printed);
+    assert_eq!(
+        words,
+        ["socket-patch", "rollback", PURL],
+        "a shell passes the printed command on whole"
+    );
+    let mut argv: Vec<&str> = words[1..].iter().map(String::as_str).collect();
+    argv.extend([
+        "--json",
+        "--cwd",
+        cwd,
+        "--api-url",
+        &api,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+        "--patch-server-url",
+        &api,
+    ]);
+    let (code, stdout, stderr) =
+        run_socket_env(&fx.proj, &argv, &[("SOCKET_RUBYGEMS_URL", &upstream)]);
+    assert_eq!(
+        code, 0,
+        "`{printed}`:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(&lock_path).unwrap()),
+        String::from_utf8_lossy(&fx.pristine_lock),
+        "`{printed}` hands the lock back byte for byte"
+    );
     let (updated, update) = bundle_cold(&["update", DEP]);
     assert!(updated, "`bundle update {DEP}` after rollback:\n{update}");
     assert!(

@@ -1257,6 +1257,7 @@ async fn engine(
 
     let mut changed: BTreeMap<String, (String, String)> = BTreeMap::new();
     let mut changed_binary: BTreeMap<String, (String, Vec<u8>)> = BTreeMap::new();
+    let mut deleted: BTreeSet<String> = BTreeSet::new();
     let mut results: BTreeMap<usize, ProjectResult> = BTreeMap::new();
     for (index, done) in rewritten {
         let state = &mut states[index];
@@ -1266,6 +1267,7 @@ async fn engine(
             options.dry_run,
             &mut changed,
             &mut changed_binary,
+            &mut deleted,
             &mut warnings,
         );
         result.skipped.extend(state.policy_skipped.iter().cloned());
@@ -1329,7 +1331,7 @@ async fn engine(
         projects,
         changed_files,
         changed_binary_files,
-        deleted_files: Vec::new(),
+        deleted_files: deleted.into_iter().collect(),
         warnings,
         rollout: stage.json(),
         stats,
@@ -1452,6 +1454,7 @@ fn finish_root(
     dry_run: bool,
     changed: &mut BTreeMap<String, (String, String)>,
     changed_binary: &mut BTreeMap<String, (String, Vec<u8>)>,
+    deleted: &mut BTreeSet<String>,
     warnings: &mut Vec<EngineWarning>,
 ) -> ProjectResult {
     let Rewritten {
@@ -1468,12 +1471,20 @@ fn finish_root(
         rush_warnings,
         pnpm_warnings,
         npm_warnings,
+        pnpm_workspace_emptied,
         ..
     } = done;
     let root = state.root.clone();
 
+    // A pnpm-workspace.yaml a hosted run created and this one emptied of
+    // its registry route is deleted, not written back as a bare `packages`
+    // list.
+    let emptied = pnpm_workspace_emptied.then_some(crate::hosted::guidance::PNPM_WORKSPACE_REL);
     let mut project_changes: Vec<(String, String)> = Vec::new();
     for (rel, content) in &rewrite.files {
+        if Some(rel.as_str()) == emptied {
+            continue;
+        }
         if project.text(rel) != Some(content.as_str()) {
             project_changes.push((rel.clone(), content.clone()));
         }
@@ -1534,6 +1545,9 @@ fn finish_root(
         changed
             .entry(path)
             .or_insert_with(|| (root.clone(), content));
+    }
+    if let Some(rel) = emptied {
+        deleted.insert(roots::join_root(&root, rel));
     }
     for (path, bytes) in binary_writes {
         changed_binary
@@ -1630,6 +1644,9 @@ mod tests {
                 pnpm_warnings: Vec::new(),
                 npm_warnings: Vec::new(),
                 pnpm_rerun_only: false,
+                pnpm_named_registries: false,
+                pnpm_route_note: None,
+                pnpm_workspace_emptied: false,
                 workspace_symlinked: false,
                 final_discovery: None,
             },
@@ -1647,6 +1664,7 @@ mod tests {
             false,
             &mut changed,
             &mut changed_binary,
+            &mut BTreeSet::new(),
             &mut warnings,
         );
         assert!(first.error.is_none());
@@ -1657,6 +1675,7 @@ mod tests {
             false,
             &mut changed,
             &mut changed_binary,
+            &mut BTreeSet::new(),
             &mut warnings,
         );
         assert_eq!(second.error.as_ref().unwrap().code, "conflicting_write");
@@ -1674,9 +1693,57 @@ mod tests {
             true,
             &mut changed,
             &mut changed_binary,
+            &mut BTreeSet::new(),
             &mut warnings,
         );
         assert!(same.error.is_none());
+    }
+
+    /// A pnpm-workspace.yaml a hosted run created, emptied of its registry
+    /// route by this one, is reported as deleted and not as changed: the
+    /// host removes it instead of committing a bare `packages` list.
+    #[test]
+    fn an_emptied_workspace_file_is_deleted_not_changed() {
+        const WORKSPACE: &str = crate::hosted::guidance::PNPM_WORKSPACE_REL;
+        let mut project = MemoryProject::new();
+        project.insert_text(
+            WORKSPACE,
+            "packages:\n  - '.'\nnamedRegistries:\n  socket: x\n",
+        );
+        project.insert_text("pnpm-lock.yaml", "old\n");
+        let files = [
+            (WORKSPACE, "packages:\n  - '.'\n"),
+            ("pnpm-lock.yaml", "new\n"),
+        ];
+        for emptied in [true, false] {
+            let mut done = rewritten(&files);
+            done.project = project.clone();
+            done.done.pnpm_workspace_emptied = emptied;
+            let (mut changed, mut changed_binary) = (BTreeMap::new(), BTreeMap::new());
+            let mut deleted = BTreeSet::new();
+            let result = finish_root(
+                &mut state("web", project.clone()),
+                done,
+                false,
+                &mut changed,
+                &mut changed_binary,
+                &mut deleted,
+                &mut Vec::new(),
+            );
+            assert!(result.error.is_none());
+            let changed: Vec<&str> = changed.keys().map(String::as_str).collect();
+            let deleted: Vec<&str> = deleted.iter().map(String::as_str).collect();
+            match emptied {
+                true => {
+                    assert_eq!(changed, ["web/pnpm-lock.yaml"]);
+                    assert_eq!(deleted, ["web/pnpm-workspace.yaml"]);
+                }
+                false => {
+                    assert_eq!(changed, ["web/pnpm-lock.yaml", "web/pnpm-workspace.yaml"]);
+                    assert!(deleted.is_empty());
+                }
+            }
+        }
     }
 
     #[test]
@@ -1696,6 +1763,7 @@ mod tests {
             true,
             &mut changed,
             &mut changed_binary,
+            &mut BTreeSet::new(),
             &mut warnings,
         );
         assert_eq!(result.error.unwrap().code, "conflicting_write");

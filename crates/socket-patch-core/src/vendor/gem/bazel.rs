@@ -380,6 +380,7 @@ impl Site {
                 token: String::new(),
                 patch_uuid: uuid.to_string(),
                 artifact_url: String::new(),
+                npm_registry_url: None,
                 registry_override: None,
                 integrity: Default::default(),
             },
@@ -1250,6 +1251,7 @@ ruby.bundle_fetch(name = "bundle", gemfile = "//:Gemfile", gemfile_lock = "//:Ge
             token: String::new(),
             patch_uuid: uuid.into(),
             artifact_url: String::new(),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Default::default(),
         };

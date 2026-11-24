@@ -26,6 +26,14 @@
 //!
 //! The flow asserts the VEX document of its patch as `main.rs` says.
 //!
+//! A second flow, [`hosted_bundle_fetch_gem_checksums`], runs the command
+//! in the same workspace with a `gem_checksums` on the call that names the
+//! two gems. There the scan leaves the gem as it is and says how to go on,
+//! the build stays the upstream one, and on each of the two ways on the
+//! same scan pins the gem and the build is the patched one. Two tests
+//! without a Bazel hold the command to the same in the fixture's checkout,
+//! with what a person reads and the calls that stand against nothing.
+//!
 //! Outside a Bazel workspace vendored mode commits the unpacked patched gem
 //! under `.socket/vendor/gem` and makes `Gemfile` and `Gemfile.lock` name
 //! it by its path from the project. rules_ruby runs `bundle install` in a
@@ -104,7 +112,7 @@ use sha2::{Digest, Sha256, Sha512};
 
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
-use crate::envelope::events;
+use crate::envelope::{codes_in, event_for, events};
 use crate::harness::{
     cell_without_bazel, changed, fixture_path, rewrite, with_vex, Cell, Claim, Declined, Fixture,
     How, Ran, StandIn, Tree, ALLOW, CONSUMER, NOTHING, REPO_CACHE, VENDORED,
@@ -279,6 +287,7 @@ struct Served {
     patched: String,
     upstream_gem: Vec<u8>,
     patched_gem: Vec<u8>,
+    neighbour_gem: Vec<u8>,
     /// The patch registry of the grant.
     index: String,
     /// The routes of the stand-in for the upstream gem and for the patched
@@ -378,6 +387,7 @@ impl Served {
             patched: format!("OUT: {fixed}"),
             upstream_gem,
             patched_gem,
+            neighbour_gem,
             index,
             upstream_route,
             patched_route,
@@ -407,6 +417,12 @@ fn run(standin: &StandIn, cell: &Cell, args: &[&str], env: &[(&str, &str)]) -> R
     let rubygems = format!("{origin}/{RUBYGEMS}");
     let env = [&[("SOCKET_RUBYGEMS_URL", rubygems.as_str())], env].concat();
     cell.socket_patch(&origin, args, &env)
+}
+
+/// `text` without its white space: a line a terminal may have wrapped, or a
+/// message Bundler broke at the width of its console.
+fn squeezed(text: &str) -> String {
+    text.split_whitespace().collect()
 }
 
 /// The flow of the module docs.
@@ -553,6 +569,188 @@ fn hosted_bundle_fetch() {
     );
 }
 
+/// The fixture's `MODULE.bazel` with a `gem_checksums` on its
+/// `ruby.bundle_fetch` call, which holds version [`VERSION`] of each gem of
+/// `sums` to the sha256 beside its name: the file a test writes into its
+/// workspace copy. The call stays on the line it is on.
+fn module_pinning(sums: &[(&str, &str)]) -> String {
+    let path = fixture_path(FIXTURE.dir).join("e9/MODULE.bazel");
+    let module = std::fs::read_to_string(&path).expect("the fixture's MODULE.bazel");
+    let lock = "    gemfile_lock = \"//:Gemfile.lock\",\n";
+    assert_eq!(module.matches(lock).count(), 1, "{}", path.display());
+    let entry =
+        |(name, sha256): &(&str, &str)| format!("        \"{name}-{VERSION}\": \"{sha256}\",\n");
+    let entries: String = sums.iter().map(entry).collect();
+    module.replace(
+        lock,
+        &format!("{lock}    gem_checksums = {{\n{entries}    }},\n"),
+    )
+}
+
+/// The code of the warning for a gem that a call holds to another sha256.
+const HELD: &str = "redirect_bazel_gem_checksums_pinned";
+
+/// What a hosted scan that left the fixture's gem as it is says, for its
+/// finished `scan`: it passes, applies nothing and rewrites no file, the
+/// gem is skipped as one that nothing pins, one warning names the call of
+/// `MODULE.bazel` and the entry of the gem, and no file of the checkout
+/// differs from `before`. Gives the text of that warning.
+fn left_alone(cell: &Cell, scan: &Ran, before: &Tree) -> String {
+    let (test, said) = (&cell.test, &scan.dump);
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["applied"], 0, "{test}: {said}");
+    let event = event_for(&scan.envelope, PURL);
+    assert_eq!(event["action"], "skipped", "{test}: {said}");
+    assert_eq!(event["errorCode"], "redirect_unconfirmed", "{test}: {said}");
+    let rewritten = &scan.envelope["redirect"]["rewrittenFiles"];
+    assert_eq!(*rewritten, json!([]), "{test}: {said}");
+    let warnings = scan.envelope["warnings"].as_array().expect("warnings");
+    let held = |warning: &&serde_json::Value| warning["code"] == HELD;
+    let held: Vec<_> = warnings.iter().filter(held).collect();
+    assert_eq!(held.len(), 1, "{test}: {said}");
+    let detail = held[0]["detail"].as_str().expect("a detail");
+    let named = format!(
+        "{NAME}@{VERSION}: `ruby.bundle_fetch` at MODULE.bazel:15 holds `{NAME}-{VERSION}` to \
+         another sha256"
+    );
+    assert!(detail.starts_with(&named), "{test}: {said}");
+    assert_eq!(changed(before, &cell.tree()), NOTHING, "{test}: {said}");
+    assert!(!cell.path(".socket").exists(), "{test}: {said}");
+    detail.to_string()
+}
+
+/// The sha256 that the warning `detail` says to put in the entry of the
+/// fixture's gem, and whether it also offers to delete the gem from the
+/// dict.
+fn way_on(detail: &str) -> (&str, bool) {
+    let change = format!("To patch it, change `{NAME}-{VERSION}` to `");
+    let (_, sha256) = detail.split_once(&change).expect("the sha256 to put there");
+    let sha256 = sha256.split('`').next().expect("a sha256");
+    (sha256, detail.contains("or delete the gem from the dict"))
+}
+
+/// Hosted mode beside a hub that holds the gem to a sha256 of its own: the
+/// `ruby.bundle_fetch` call of the workspace copy names the two gems in
+/// `gem_checksums`, each with the sha256 of its upstream archive, as the
+/// examples of rules_ruby do. rules_ruby gives Bazel's downloader that
+/// sha256 for the gem, whatever the lock says.
+///
+/// - (a) The build prints the unpatched marker.
+/// - (b) `socket-patch scan --mode hosted --yes` leaves the gem as it is
+///   ([`left_alone`]): the redirect would fail the next build on the
+///   sha256 of the call.
+/// - (c) The same build passes, on the upstream gem, and nothing asked the
+///   patch registry.
+/// - (d) The first way on of the warning: with the sha256 it names in the
+///   entry, the same scan rewrites `Gemfile` and `Gemfile.lock` and the
+///   build prints the patched marker, from the patch registry. The VEX
+///   documents of that run and of `vex` say so.
+/// - (e) `rollback` restores the two files and leaves the call. With the
+///   old sha256 back in the entry, as the warning says, every file is the
+///   one of before and so is the build.
+/// - (f) The second way on, which the warning offers for a lock with a
+///   `CHECKSUMS` section: with the gem deleted from the dict, which then
+///   names the other gem alone, the same scan rewrites the two files and
+///   the build prints the patched marker.
+///
+/// After (a), which writes Bazel's own lock, no build of the flow changes
+/// a file of the checkout, also after the test changed the call:
+/// rules_ruby declares its extension reproducible, and Bazel keeps such a
+/// one out of that lock.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn hosted_bundle_fetch_gem_checksums() {
+    let test = "ruby::hosted_bundle_fetch_gem_checksums";
+    let started = Instant::now();
+    let Some(mut cell) = Cell::open(test, &FIXTURE) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let served = Served::to(&mut cell);
+    let standin = &served.standin;
+    let socket_patch = |cell: &Cell, args: &[&str]| run(standin, cell, args, &[]);
+    let (other, upstream, patched) = (
+        sha256_hex(&served.neighbour_gem),
+        sha256_hex(&served.upstream_gem),
+        sha256_hex(&served.patched_gem),
+    );
+    let files = ["Gemfile", "Gemfile.lock"];
+
+    // (a) The unpatched build, with the two upstream gems pinned in the
+    // lock, as `Served::to` left it, and in the call.
+    let held = module_pinning(&[(NEIGHBOUR, &other), (NAME, &upstream)]);
+    cell.write("MODULE.bazel", &held);
+    let before = cell.builds_unpatched(&served.unpatched);
+    let upstream_fetches = standin.asked(&served.upstream_route);
+
+    // (b) The one command of hosted mode leaves the gem as it is.
+    let hosted = ["scan", "--mode", "hosted", "--yes"];
+    let warned = left_alone(&cell, &socket_patch(&cell, &hosted), &before);
+    let named = way_on(&warned);
+    assert_eq!(named, (patched.as_str(), true), "{test}: {warned}");
+    let (named, _) = named;
+
+    // (c) The same build, on the upstream gem.
+    cell.builds(&served.unpatched);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{test}");
+    assert_eq!(standin.asked(&served.patched_route), 0, "{test}");
+
+    // (d) The first way on: the sha256 the warning names, in the entry.
+    cell.write(
+        "MODULE.bazel",
+        module_pinning(&[(NEIGHBOUR, &other), (NAME, named)]),
+    );
+    let edited = cell.tree();
+    let claim = Claim::new(PURL, &served.uuid, How::Hosted);
+    let in_run = cell.document("in-run");
+    let scan = socket_patch(&cell, &[&hosted[..], &with_vex(&in_run)].concat());
+    let pinned = cell.pinned_by(&scan, PURL, &served.uuid, &edited, &files);
+    let lock = String::from_utf8_lossy(&pinned["Gemfile.lock"]).into_owned();
+    assert!(lock.contains(&checksum(NAME, &patched)), "{test}:\n{lock}");
+    cell.wrote_in_run(&scan, &in_run, &claim);
+    cell.builds_patched(&pinned, &served.patched);
+    assert!(standin.asked(&served.patched_route) > 0, "{test}");
+    assert_eq!(
+        standin.asked(&served.upstream_route),
+        upstream_fetches,
+        "{test}: the patched build fetched the upstream gem"
+    );
+    cell.stands_alone(socket_patch, &claim, true);
+
+    // (e) The undo restores the two files and leaves the call, which the
+    // warning says to put back by hand: then nothing differs from before.
+    let undo = socket_patch(&cell, &["rollback", "--yes"]);
+    let left = changed(&before, &cell.tree());
+    assert_eq!(left, ["MODULE.bazel"], "{test}: {}", undo.dump);
+    cell.write("MODULE.bazel", &held);
+    cell.undone(&undo, "rolledBack", &before, &served.unpatched);
+
+    // (f) The second way on: the gem deleted from the dict.
+    cell.write("MODULE.bazel", module_pinning(&[(NEIGHBOUR, &other)]));
+    let edited = cell.tree();
+    let patched_fetches = standin.asked(&served.patched_route);
+    let scan = socket_patch(&cell, &hosted);
+    let pinned = cell.pinned_by(&scan, PURL, &served.uuid, &edited, &files);
+    assert_eq!(codes_in(&scan.envelope["warnings"]), NOTHING, "{test}");
+    cell.builds_patched(&pinned, &served.patched);
+    assert!(
+        standin.asked(&served.patched_route) > patched_fetches,
+        "{test}: the patched build did not fetch the patched gem from the stand-in"
+    );
+
+    println!(
+        "{test}: Bazel {release} built {:?} before and after `scan --mode hosted` left the gem \
+         that `gem_checksums` holds as it was ({HELD}); with the sha256 of the warning in the \
+         entry, and again with the gem deleted from the dict, the same scan pinned it and the \
+         build printed {:?} and changed no file; `rollback` restored the files but the call; \
+         {:?}",
+        served.unpatched,
+        served.patched,
+        started.elapsed()
+    );
+}
+
 /// Where the patched gem of the patch `uuid` is committed for a hub: the
 /// directory of the patch under `.socket/vendor`, which the lock names as
 /// the gem's source, and in it the path rules_ruby asks a source for.
@@ -608,12 +806,6 @@ fn without_patch_host(cell: &Cell, origin: &str) -> Cell {
     let mut twin = cell.twin();
     twin.route_downloads(&routes(origin, false));
     twin
-}
-
-/// What `text` reads without its white space: Bundler breaks a message at
-/// the width of the console it runs in.
-fn squeezed(text: &str) -> String {
-    text.split_whitespace().collect()
 }
 
 /// The build of `cell`, where one byte of the committed gem is not the one
@@ -890,7 +1082,6 @@ fn vendored_bundle_fetch() {
         let section = format!("PATH\n  remote: {copy}\n  specs:\n    {NAME} ({VERSION})\n\n");
         assert!(lock.starts_with(&section), "{test}: Gemfile.lock:\n{lock}");
         let build = cell.bazel("build", &[CONSUMER]);
-        let squeezed = |text: &str| text.split_whitespace().collect::<String>();
         let stderr = squeezed(&build.stderr());
         let missing = squeezed(&format!("{copy}` does not exist."));
         assert!(
@@ -974,18 +1165,36 @@ fn vendored_bundle_fetch() {
     );
 }
 
-/// Without a Bazel: the fixture in a checkout of its own, whose lock pins
-/// the gems of the stand-in that comes with it.
-fn checkout() -> (Cell, Served) {
-    let mut cell = cell_without_bazel("9.3.2");
+/// Without a Bazel: the fixture in a checkout of its own, with the lock
+/// that pins the two upstream gems of `served` and `module` as its
+/// `MODULE.bazel`; `None` leaves the checkout without one, in no Bazel
+/// workspace.
+fn checkout_with(served: &Served, module: Option<&str>) -> Cell {
+    let cell = cell_without_bazel("9.3.2");
     for part in ["common", "e9"] {
         for (rel, bytes) in read_tree(&fixture_path(FIXTURE.dir).join(part)) {
             cell.write(&rel, bytes);
         }
     }
     cell.write(".git/HEAD", "ref: refs/heads/main\n");
-    let served = Served::to(&mut cell);
-    (cell, served)
+    cell.write(
+        "Gemfile.lock",
+        lock_pinning(&served.neighbour_gem, &served.upstream_gem),
+    );
+    match module {
+        Some(module) => cell.write("MODULE.bazel", module),
+        None => std::fs::remove_file(cell.path("MODULE.bazel")).expect("remove MODULE.bazel"),
+    }
+    cell
+}
+
+/// Without a Bazel: the fixture in a checkout of its own, as it is, whose
+/// lock pins the gems of the stand-in that comes with it.
+fn checkout() -> (Cell, Served) {
+    let served = Served::to(&mut cell_without_bazel("9.3.2"));
+    let module = fixture_path(FIXTURE.dir).join("e9/MODULE.bazel");
+    let module = std::fs::read_to_string(module).expect("the fixture's MODULE.bazel");
+    (checkout_with(&served, Some(&module)), served)
 }
 
 /// Without a Bazel: in the fixture's checkout, where the hub reads the
@@ -1370,6 +1579,181 @@ fn vendored_mode_goes_on_where_no_hub_reads_the_lock() {
     };
     let before = cell.tree();
     cell.declined(&scan(&cell, &served), &package, 1, "failed", &before);
+}
+
+/// Without a Bazel: steps (b), (d) and (f) of
+/// [`hosted_bundle_fetch_gem_checksums`] in the fixture's checkout, with
+/// what a person reads of (b), and (b) again with `--dry-run` and with
+/// `--vex`. On either way on, the two files a scan rewrites are, byte for
+/// byte, the ones it rewrites in the same checkout without a
+/// `MODULE.bazel`, and `rollback` restores them and leaves the call.
+#[test]
+fn a_gem_that_the_hub_holds_to_its_upstream_sha256_is_left_alone() {
+    let served = Served::to(&mut cell_without_bazel("9.3.2"));
+    let run = |cell: &Cell, args: &[&str]| run(&served.standin, cell, args, &[]);
+    let (other, upstream, patched) = (
+        sha256_hex(&served.neighbour_gem),
+        sha256_hex(&served.upstream_gem),
+        sha256_hex(&served.patched_gem),
+    );
+    let hosted = ["scan", "--mode", "hosted", "--yes"];
+    let files = ["Gemfile", "Gemfile.lock"];
+    let plain = checkout_with(&served, None);
+    let before = plain.tree();
+    let scan = run(&plain, &hosted);
+    let plain = plain.pinned_by(&scan, PURL, &served.uuid, &before, &files);
+
+    let held = module_pinning(&[(NEIGHBOUR, &other), (NAME, &upstream)]);
+    let cell = checkout_with(&served, Some(&held));
+    let before = cell.tree();
+    let warned = left_alone(&cell, &run(&cell, &hosted), &before);
+    assert_eq!(way_on(&warned), (patched.as_str(), true), "{warned}");
+    let preview = run(&cell, &[&hosted[..], &["--dry-run"]].concat());
+    assert_eq!(left_alone(&cell, &preview, &before), warned);
+    // With `--vex` the run has nothing to attest, like any run that pins
+    // nothing: it fails on that, with the warning and no document.
+    let document = cell.document("left-alone");
+    let scan = run(&cell, &[&hosted[..], &with_vex(&document)].concat());
+    assert_eq!(scan.code, 1, "{}", scan.dump);
+    let error = &scan.envelope["error"]["code"];
+    assert_eq!(error, "manifest_not_found", "{}", scan.dump);
+    let warnings = codes_in(&scan.envelope["warnings"]);
+    assert!(warnings.iter().any(|code| code == HELD), "{}", scan.dump);
+    assert!(!document.exists(), "{}", scan.dump);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", scan.dump);
+
+    // A person reads the same words, after the line that names the gem.
+    let origin = served.standin.origin();
+    let [stdout, stderr] = cell.socket_patch_person(&origin, &hosted, &[]);
+    let said = format!("--- stdout\n{stdout}\n--- stderr\n{stderr}");
+    let summary = "Switched 0 packages to hosted patches; rewrote 0 files.";
+    assert!(stdout.lines().any(|line| line == summary), "{said}");
+    let unpinned = format!(
+        "  {PURL}: no lockfile entry pinning it could be rewritten (see the warning below)"
+    );
+    assert!(stderr.lines().any(|line| line == unpinned), "{said}");
+    let warning = squeezed(&format!("Warning: {warned}"));
+    assert!(squeezed(&stderr).contains(&warning), "{said}");
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{said}");
+
+    // A pin that an earlier release wrote beside the entry stays: the scan
+    // names the entry and says that the pin stays, not that a redirect was
+    // skipped, and counts the gem as hosted, for the pin in the lock.
+    for file in files {
+        cell.write(file, &plain[file]);
+    }
+    let earlier = cell.tree();
+    let scan = run(&cell, &hosted);
+    assert_eq!(scan.code, 0, "{}", scan.dump);
+    let event = event_for(&scan.envelope, PURL);
+    assert_eq!(event["action"], "applied", "{}", scan.dump);
+    assert_eq!(
+        codes_in(&scan.envelope["warnings"]),
+        [HELD],
+        "{}",
+        scan.dump
+    );
+    let detail = scan.envelope["warnings"][0]["detail"].as_str().unwrap();
+    let stays = format!(
+        "; the pin an earlier run wrote is left as it is (nothing rewritten). To build it \
+         patched, change `{NAME}-{VERSION}` to `{patched}` there, or delete the gem from the dict"
+    );
+    assert!(detail.contains(&stays), "{}", scan.dump);
+    let undo_one = format!("`socket-patch rollback pkg:gem/{NAME}@{VERSION}`");
+    assert!(detail.contains(&undo_one), "{}", scan.dump);
+    assert!(!detail.contains("redirect skipped"), "{}", scan.dump);
+    assert_eq!(changed(&earlier, &cell.tree()), NOTHING, "{}", scan.dump);
+    let undo = run(&cell, &["rollback", "--yes"]);
+    assert_eq!(undo.envelope["summary"]["rolledBack"], 1, "{}", undo.dump);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", undo.dump);
+
+    // The two ways on.
+    for sums in [
+        vec![(NEIGHBOUR, other.as_str()), (NAME, patched.as_str())],
+        vec![(NEIGHBOUR, other.as_str())],
+    ] {
+        cell.write("MODULE.bazel", module_pinning(&sums));
+        let edited = cell.tree();
+        let scan = run(&cell, &hosted);
+        let pinned = cell.pinned_by(&scan, PURL, &served.uuid, &edited, &files);
+        assert_eq!(codes_in(&scan.envelope["warnings"]), NOTHING, "{sums:?}");
+        for file in files {
+            assert_eq!(pinned[file], plain[file], "{file}: {sums:?}");
+        }
+        let undo = run(&cell, &["rollback", "--yes"]);
+        assert_eq!(undo.envelope["summary"]["rolledBack"], 1, "{}", undo.dump);
+        assert_eq!(changed(&edited, &cell.tree()), NOTHING, "{}", undo.dump);
+    }
+}
+
+/// Without a Bazel: what else a call can say, each as the `MODULE.bazel`
+/// of the fixture's checkout. A lock without a `CHECKSUMS` section leaves
+/// the gem as it is too, and its warning does not offer to delete the gem
+/// from the dict: nothing but the entry would hold the gem to a sha256.
+/// A `gem_checksums` that is not written out may hold the gem. A call that
+/// reads the lock of another project, and one without `gem_checksums`,
+/// stand against nothing: the scan rewrites what it rewrites without a
+/// `MODULE.bazel`.
+#[test]
+fn a_call_stands_against_a_gem_only_where_it_may_hold_it() {
+    let served = Served::to(&mut cell_without_bazel("9.3.2"));
+    let run = |cell: &Cell, args: &[&str]| run(&served.standin, cell, args, &[]);
+    let (upstream, patched) = (
+        sha256_hex(&served.upstream_gem),
+        sha256_hex(&served.patched_gem),
+    );
+    let hosted = ["scan", "--mode", "hosted", "--yes"];
+    let files = ["Gemfile", "Gemfile.lock"];
+    let held = module_pinning(&[(NAME, &upstream)]);
+
+    // A lock that Bundler holds no gem to.
+    let cell = checkout_with(&served, Some(&held));
+    let lock = lock_pinning(&served.neighbour_gem, &served.upstream_gem);
+    let (unchecked, _) = lock.split_once("CHECKSUMS\n").expect("the section");
+    cell.write(
+        "Gemfile.lock",
+        format!("{unchecked}BUNDLED WITH\n  4.0.15\n"),
+    );
+    let before = cell.tree();
+    let warned = left_alone(&cell, &run(&cell, &hosted), &before);
+    assert_eq!(way_on(&warned), (patched.as_str(), false), "{warned}");
+
+    // A `gem_checksums` that names a constant of the file.
+    let (calls, _) = held.split_once("    gem_checksums = {").expect("the dict");
+    let unread = format!("{calls}    gem_checksums = HELD,\n)\n");
+    let unread = unread.replace("ruby.bundle_fetch(", "HELD = {}\n\nruby.bundle_fetch(");
+    let cell = checkout_with(&served, Some(&unread));
+    let before = cell.tree();
+    let scan = run(&cell, &hosted);
+    let warned = codes_in(&scan.envelope["warnings"]);
+    assert_eq!(warned, [HELD], "{}", scan.dump);
+    let detail = scan.envelope["warnings"][0]["detail"].as_str().unwrap();
+    let named = format!(
+        "{NAME}@{VERSION}: `ruby.bundle_fetch` at MODULE.bazel:17 has a `gem_checksums` that is \
+         not written out"
+    );
+    assert!(detail.starts_with(&named), "{}", scan.dump);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", scan.dump);
+
+    // Nothing stands against the gem: as without a `MODULE.bazel`.
+    let plain = checkout_with(&served, None);
+    let before = plain.tree();
+    let scan = run(&plain, &hosted);
+    let plain = plain.pinned_by(&scan, PURL, &served.uuid, &before, &files);
+    let elsewhere = held.replace("\"//:Gemfile.lock\"", "\"//other:Gemfile.lock\"");
+    let unheld = fixture_path(FIXTURE.dir).join("e9/MODULE.bazel");
+    let unheld = std::fs::read_to_string(unheld).expect("the fixture's MODULE.bazel");
+    for module in [elsewhere, unheld] {
+        assert!(module.contains("ruby.bundle_fetch("), "{module}");
+        let cell = checkout_with(&served, Some(&module));
+        let before = cell.tree();
+        let scan = run(&cell, &hosted);
+        let pinned = cell.pinned_by(&scan, PURL, &served.uuid, &before, &files);
+        assert_eq!(codes_in(&scan.envelope["warnings"]), NOTHING, "{module}");
+        for file in files {
+            assert_eq!(pinned[file], plain[file], "{file}: {module}");
+        }
+    }
 }
 
 /// Without a Bazel, what stays fixed now that no sum is committed: the

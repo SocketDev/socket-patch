@@ -23,6 +23,7 @@ use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult, Patc
 use socket_patch_core::policy::filter::{Reachability, SelectionFilter};
 use socket_patch_core::utils::purl_key::PurlKey;
 
+use super::discovery::Access;
 use crate::args::GlobalArgs;
 use crate::commands::measured::{self, evidence, Measured, Measurement};
 use crate::ui::{self, plural, Style};
@@ -67,6 +68,14 @@ pub(crate) struct Package {
     /// The ids to show for what it leaves: advisories only the package's
     /// other patches fix. Every advisory of a package with no selection.
     pub(crate) unpatched: Vec<String>,
+    /// The ids of `unpatched` that are waiting on a merged patch: another
+    /// patch the account can download fixes them, and the patch that
+    /// fixes them together with the selection is not published yet (see
+    /// [`package_coverage`](super::discovery::package_coverage)).
+    pub(crate) merge_pending: Vec<String>,
+    /// The ids of `unpatched` that need a paid plan: only patches this
+    /// account cannot download fix them.
+    pub(crate) needs_paid: Vec<String>,
     /// How many of `fixes` are critical, and how many high.
     pub(crate) fixed_critical: usize,
     pub(crate) fixed_high: usize,
@@ -136,13 +145,15 @@ fn id_facts<'a>(records: &[&'a PatchSearchResult]) -> HashMap<String, IdFacts<'a
 /// chose for each package that got one, `records` every patch record the
 /// run fetched (they pair an advisory with its CVEs and its severity), and
 /// `filter` the run's selection filter, whose reachability findings mark
-/// advisories reachable. `in_project` says whether the project the run
-/// patches uses a package (see [`Package::outside_project`]).
+/// advisories reachable. `access` says which patches the run could take
+/// (the account's tier, and what the filter withholds). `in_project` says
+/// whether the project the run patches uses a package (see
+/// [`Package::outside_project`]).
 pub(crate) fn plan(
     packages: &[BatchPackagePatches],
     selected: &[PatchSearchResult],
     records: &[&PatchSearchResult],
-    can_access_paid_patches: bool,
+    access: Access<'_>,
     filter: Option<&SelectionFilter>,
     in_project: &dyn Fn(&str) -> bool,
 ) -> Vec<Package> {
@@ -166,7 +177,7 @@ pub(crate) fn plan(
         .map(|pkg| {
             let key = PurlKey::new(&pkg.purl);
             let chosen = selected_of.get(&key).map_or(&[][..], Vec::as_slice);
-            let coverage = super::discovery::package_coverage(pkg, chosen);
+            let coverage = super::discovery::package_coverage(pkg, chosen, access);
             // The selection's own records come first: they are the ones
             // that say what a fixed id is.
             let known: Vec<&PatchSearchResult> = chosen
@@ -216,13 +227,15 @@ pub(crate) fn plan(
                 fixed_high: fixed_at(1),
                 fixed_reachable: coverage.fixes.iter().filter(reachable).count(),
                 unpatched_reachable: coverage.unpatched.iter().filter(reachable).count(),
-                paid_only: !can_access_paid_patches
+                paid_only: !access.paid
                     && !pkg.patches.is_empty()
                     && pkg.patches.iter().all(|p| p.tier != "free"),
                 outside_project: !in_project(&pkg.purl),
                 uuids: coverage.uuids,
                 fixes: coverage.fixes,
                 unpatched: coverage.unpatched,
+                merge_pending: coverage.merge_pending,
+                needs_paid: coverage.needs_paid,
             }
         })
         .collect()
@@ -239,10 +252,18 @@ pub(crate) struct Counts {
     pub(crate) fixed_critical: usize,
     pub(crate) fixed_high: usize,
     pub(crate) fixed_reachable: usize,
-    /// Advisories left on patched packages: only another patch of the
-    /// package fixes them, and one patch is applied per package version.
+    /// Advisories left on patched packages that are waiting on a merged
+    /// patch ([`Package::merge_pending`]), and how many patched packages
+    /// have one.
+    pub(crate) left_merge: usize,
+    pub(crate) merge_packages: usize,
+    /// The other advisories left on patched packages that a patch the
+    /// account can download fixes: one patch is applied per package
+    /// version, and the run did not select the one that fixes them.
     pub(crate) left_upgrade: usize,
-    /// Advisories of packages whose every patch needs a paid plan.
+    /// Advisories that need a paid plan: the ones left on patched
+    /// packages that only a paid patch fixes ([`Package::needs_paid`]),
+    /// and every advisory of a package whose every patch is paid.
     pub(crate) left_paid: usize,
     /// Advisories of the other packages the run did not patch.
     pub(crate) left_unpatched: usize,
@@ -274,7 +295,11 @@ impl Counts {
                 counts.fixed_critical += pkg.fixed_critical;
                 counts.fixed_high += pkg.fixed_high;
                 counts.fixed_reachable += pkg.fixed_reachable;
-                counts.left_upgrade += pkg.unpatched.len();
+                counts.left_merge += pkg.merge_pending.len();
+                counts.merge_packages += usize::from(!pkg.merge_pending.is_empty());
+                counts.left_paid += pkg.needs_paid.len();
+                counts.left_upgrade +=
+                    pkg.unpatched.len() - pkg.merge_pending.len() - pkg.needs_paid.len();
                 counts.left_reachable += pkg.unpatched_reachable;
             } else if pkg.outside_project {
                 // Not the project's package: nothing of it is left to
@@ -317,6 +342,8 @@ impl Counts {
         self.fixed_critical += other.fixed_critical;
         self.fixed_high += other.fixed_high;
         self.fixed_reachable += other.fixed_reachable;
+        self.left_merge += other.left_merge;
+        self.merge_packages += other.merge_packages;
         self.left_upgrade += other.left_upgrade;
         self.left_paid += other.left_paid;
         self.left_unpatched += other.left_unpatched;
@@ -325,7 +352,7 @@ impl Counts {
 
     /// Advisories with a patch on offer that the run did not fix.
     pub(crate) fn left(&self) -> usize {
-        self.left_upgrade + self.left_paid + self.left_unpatched
+        self.left_merge + self.left_upgrade + self.left_paid + self.left_unpatched
     }
 }
 
@@ -474,9 +501,25 @@ pub(crate) fn rows(
         let mut out = Vec::new();
         for (row, pkg) in build(None, true).into_iter().zip(&patched) {
             out.push(row);
-            if !pkg.unpatched.is_empty() {
-                let rest = format!("still unpatched: {}", pkg.unpatched.join(", "));
-                out.push(format!("      {}", ui::paint(&rest, "33", color)));
+            let among = |ids: &'_ [String]| -> Vec<&str> {
+                let listed = pkg.unpatched.iter().filter(|id| ids.contains(id));
+                listed.map(String::as_str).collect()
+            };
+            let rest: Vec<&str> = pkg
+                .unpatched
+                .iter()
+                .filter(|id| !pkg.merge_pending.contains(id) && !pkg.needs_paid.contains(id))
+                .map(String::as_str)
+                .collect();
+            for (what, ids) in [
+                ("still unpatched", rest),
+                ("waiting on a merged patch", among(&pkg.merge_pending)),
+                ("needs a paid Socket plan", among(&pkg.needs_paid)),
+            ] {
+                if !ids.is_empty() {
+                    let line = format!("{what}: {}", ids.join(", "));
+                    out.push(format!("      {}", ui::paint(&line, "33", color)));
+                }
             }
         }
         return out;
@@ -522,9 +565,17 @@ fn meter(fixed: usize, left: usize, style: Style) -> Option<String> {
 /// Patched 22 packages in 3 projects, fixing 39 vulnerabilities (5 critical, 21 high) in 4.2s.
 /// Verified: 24 of 24 exploits blocked, 1208 of 1208 package tests passing.
 /// Saved about 44 hours of engineering time (22 package upgrades at ~2 hours each).
-/// 18 vulnerabilities left to patch (32%): 14 need a package upgrade, 4 are in packages this run did not patch.
+/// 18 vulnerabilities left to patch (32%): 6 await a merged patch, 8 need a package upgrade, 4 are in packages this run did not patch.
+/// 4 merged patches are not ready yet: Socket is still processing them.
+/// Run `socket-patch scan` again later to apply them.
 /// Reachable: 9 fixed, 2 left to patch (18%).
 /// ```
+///
+/// An advisory left on a patched package is waiting on a merged patch when
+/// another patch the account can download fixes it: the patch that fixes
+/// it together with the one applied is not published yet, and the two
+/// lines under the count say so (how many merged patches, one per patched
+/// package that waits, and what to do).
 ///
 /// Where the terminal shows glyphs, the lines of what was done open with a
 /// check mark (the others are indented to match) and a meter closes them.
@@ -655,6 +706,12 @@ pub(crate) fn closing(
         lines.push(plain(nothing.to_string()));
     } else {
         let mut why = Vec::new();
+        if counts.left_merge > 0 {
+            why.push(format!(
+                "{} a merged patch",
+                plural(counts.left_merge, "awaits", "await")
+            ));
+        }
         if counts.left_upgrade > 0 {
             why.push(format!(
                 "{} a package upgrade",
@@ -692,6 +749,29 @@ pub(crate) fn closing(
             },
             why.join(", ")
         )));
+        // The advisories waiting on a merged patch are not the user's to
+        // fix: the patch is on its way, and a later scan moves to it. Two
+        // short lines, so that neither wraps an 80-column terminal.
+        if counts.left_merge > 0 {
+            let one = counts.merge_packages == 1;
+            lines.push(plain(format!(
+                "{} {} not ready yet: Socket is still processing {}.",
+                ui::paint(&counts.merge_packages.to_string(), "1;33", color),
+                if one {
+                    "merged patch is"
+                } else {
+                    "merged patches are"
+                },
+                if one { "it" } else { "them" },
+            )));
+            lines.push(plain(ui::dim(
+                &format!(
+                    "Run `socket-patch scan` again later to apply {}.",
+                    if one { "it" } else { "them" }
+                ),
+                color,
+            )));
+        }
     }
     if reachability {
         let share = percent_left(counts.fixed_reachable, counts.left_reachable)
@@ -1150,7 +1230,10 @@ mod tests {
             &packages,
             std::slice::from_ref(&chosen),
             &[&chosen, &other],
-            paid_access,
+            Access {
+                paid: paid_access,
+                withheld: &HashSet::new(),
+            },
             filter,
             &|_| true,
         )
@@ -1167,6 +1250,11 @@ mod tests {
                 severity: Some("CRITICAL".to_string()),
                 fixes: strs(&[CVE_1, CVE_2]),
                 unpatched: strs(&[CVE_3, CVE_4]),
+                // The other free patch fixes CVE_3 and is not critical, so
+                // the free tier's merged patch leaves it out. Only a paid
+                // patch fixes CVE_4. Both need the paid plan.
+                merge_pending: Vec::new(),
+                needs_paid: strs(&[CVE_3, CVE_4]),
                 fixed_critical: 1,
                 fixed_high: 1,
                 fixed_reachable: 0,
@@ -1183,6 +1271,7 @@ mod tests {
                 purl: "pkg:npm/devalue@5.9.0".to_string(),
                 severity: Some("HIGH".to_string()),
                 unpatched: strs(&[CVE_9]),
+                needs_paid: strs(&[CVE_9]),
                 paid_only: true,
                 ..Package::default()
             }
@@ -1197,12 +1286,28 @@ mod tests {
                 fixed: 2,
                 fixed_critical: 1,
                 fixed_high: 1,
-                left_upgrade: 2,
-                left_paid: 1,
+                // Two on the patched package, and the advisory of the
+                // package whose only patch is paid.
+                left_paid: 3,
                 ..Counts::default()
             }
         );
         assert_eq!(counts.left(), 3);
+        // With paid access every patch is downloadable and none fixes all
+        // four advisories: both of the others wait on the merged patch.
+        let paid = undici_plan(None, true);
+        assert_eq!(paid[0].merge_pending, strs(&[CVE_3, CVE_4]));
+        assert!(paid[0].needs_paid.is_empty());
+        let counts = Counts::of(&paid, &landed(&["u1"]));
+        assert_eq!(
+            (
+                counts.left_merge,
+                counts.merge_packages,
+                counts.left_upgrade,
+                counts.left_paid
+            ),
+            (2, 1, 0, 0)
+        );
         // A selected patch that did not land fixes nothing: the package
         // counts whole as left, in a package the run did not patch.
         let nothing = Counts::of(&plan, &landed(&[]));
@@ -1229,7 +1334,10 @@ mod tests {
             &packages,
             std::slice::from_ref(&chosen),
             &[&chosen],
-            true,
+            Access {
+                paid: true,
+                withheld: &HashSet::new(),
+            },
             None,
             &|purl| !purl.starts_with("pkg:gem/"),
         );
@@ -1405,6 +1513,56 @@ mod tests {
                 "      still unpatched: CVE-8, CVE-9",
             ]
         );
+        // The ids waiting on a merged patch are named apart.
+        let mut waiting = plan;
+        waiting[0].merge_pending = strs(&["CVE-9"]);
+        assert_eq!(
+            rows(
+                &waiting,
+                &landed(&["u"]),
+                &none(),
+                true,
+                PLAIN,
+                Some(20),
+                true
+            ),
+            vec![
+                "  HIGH  undici@8.10.0  CVE-1, CVE-2, CVE-3  2 unpatched",
+                "      still unpatched: CVE-8",
+                "      waiting on a merged patch: CVE-9",
+            ]
+        );
+        waiting[0].merge_pending = strs(&["CVE-8", "CVE-9"]);
+        assert_eq!(
+            rows(
+                &waiting,
+                &landed(&["u"]),
+                &none(),
+                true,
+                PLAIN,
+                Some(20),
+                true
+            )[1..],
+            ["      waiting on a merged patch: CVE-8, CVE-9"]
+        );
+        // So are the ones only a paid patch fixes.
+        waiting[0].merge_pending = strs(&["CVE-9"]);
+        waiting[0].needs_paid = strs(&["CVE-8"]);
+        assert_eq!(
+            rows(
+                &waiting,
+                &landed(&["u"]),
+                &none(),
+                true,
+                PLAIN,
+                Some(20),
+                true
+            )[1..],
+            [
+                "      waiting on a merged patch: CVE-9",
+                "      needs a paid Socket plan: CVE-8",
+            ]
+        );
     }
 
     #[test]
@@ -1540,6 +1698,41 @@ mod tests {
         );
         // Nothing found at all: no lines.
         assert!(closing(&Counts::default(), 0, false, false, None, PLAIN).is_empty());
+    }
+
+    /// Advisories waiting on a merged patch are counted apart from the
+    /// ones that need an upgrade, and the next line says the merged patch
+    /// is still being processed.
+    #[test]
+    fn closing_says_a_merged_patch_is_not_ready_yet() {
+        let one = Counts {
+            left_merge: 1,
+            merge_packages: 1,
+            ..counts(1, 1, 0, 0, 0)
+        };
+        assert_eq!(
+            closing(&one, 1, false, false, None, PLAIN)[2..],
+            [
+                "1 vulnerability left to patch (50%): 1 awaits a merged patch.",
+                "1 merged patch is not ready yet: Socket is still processing it.",
+                "Run `socket-patch scan` again later to apply it.",
+            ]
+        );
+        let many = Counts {
+            left_merge: 6,
+            merge_packages: 4,
+            ..counts(22, 39, 8, 3, 1)
+        };
+        assert_eq!(
+            closing(&many, 3, true, false, None, PLAIN)[2..],
+            [
+                "18 vulnerabilities would be left to patch (32%): 6 await a merged patch, 8 need a \
+                 package upgrade, 3 need a paid Socket plan, 1 is in packages a run would not \
+                 patch.",
+                "4 merged patches are not ready yet: Socket is still processing them.",
+                "Run `socket-patch scan` again later to apply them.",
+            ]
+        );
     }
 
     #[test]

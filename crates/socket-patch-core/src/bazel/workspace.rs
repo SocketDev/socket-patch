@@ -56,7 +56,7 @@ const MAX_LABEL: usize = 4096;
 /// The names of the file of the older `WORKSPACE` system, in the order
 /// Bazel takes one: `WorkspaceFileFunction` and `ExternalPackageHelper` at
 /// 7.7.2 and 8.8.2. 9.3.2 has neither.
-const LEGACY: [&str; 3] = ["WORKSPACE.bzlmod", "WORKSPACE.bazel", "WORKSPACE"];
+pub(super) const LEGACY: [&str; 3] = ["WORKSPACE.bzlmod", "WORKSPACE.bazel", "WORKSPACE"];
 
 /// What [`disk`] says of a directory, a FIFO or a device.
 const NOT_A_FILE: &str = "it is not a regular file";

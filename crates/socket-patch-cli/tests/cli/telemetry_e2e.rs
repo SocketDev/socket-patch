@@ -1269,6 +1269,249 @@ async fn hosted_get_reports_patch_applied_under_get() {
 }
 
 // ---------------------------------------------------------------------------
+// hosted mode, pnpm: the registry route
+// ---------------------------------------------------------------------------
+
+/// The name of [`HOSTED_UUID`]'s registry, and its address: the directory
+/// [`HOSTED_URL`] is served from.
+const ROUTE_ALIAS: &str = "socket-11111111";
+const ROUTE_ADDRESS: &str = "https://patch.socket.dev/patch/npm/telemetry-hosted/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/";
+
+/// A lockfileVersion 9 lock whose `.` importer depends on `name@1.0.0`
+/// from the default registry, recording `overrides` (whole lines).
+fn pnpm_v9_lock(overrides: &[&str], name: &str) -> String {
+    let overrides = match overrides {
+        [] => String::new(),
+        lines => format!("overrides:\n  {}\n\n", lines.join("\n  ")),
+    };
+    format!(
+        "lockfileVersion: '9.0'\n\n{overrides}importers:\n\n  .:\n    dependencies:\n      \
+         {name}:\n        specifier: 1.0.0\n        version: 1.0.0\n\npackages:\n\n  \
+         {name}@1.0.0:\n    resolution: {{integrity: sha512-UPSTREAMupstream==}}\n\n\
+         snapshots:\n\n  {name}@1.0.0: {{}}\n"
+    )
+}
+
+/// A pnpm project, pinned to a pnpm that takes the registry route, that
+/// depends on `name@1.0.0`.
+fn write_pnpm_project(root: &Path, name: &str, lock: &str) {
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "packageManager": "pnpm@12.22.0", "dependencies": {{ "{name}": "1.0.0" }} }}"#
+        ),
+    )
+    .unwrap();
+    write_npm_package(root, name, "1.0.0");
+    std::fs::write(root.join("pnpm-lock.yaml"), lock).unwrap();
+}
+
+/// [`setup_hosted_mock`] with a reference grant that carries the patch's
+/// registry address, and the default registry's version document of the
+/// package (what a rollback restores the pin from).
+async fn setup_routed_mock() -> MockServer {
+    let mock = setup_hosted_mock(200).await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                HOSTED_UUID: {
+                    "status": "granted",
+                    "url": HOSTED_URL,
+                    "purl": HOSTED_PURL,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": HOSTED_URL,
+                        "integrity": { "sha512": "sha512-PATCHEDpatchedPATCHEDpatched0123456789==" }
+                    }],
+                    "registryOverride": null,
+                    "npmRegistryUrl": ROUTE_ADDRESS
+                }
+            }
+        })))
+        .with_priority(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/npm-registry/{HOSTED_NAME}/1.0.0")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": HOSTED_NAME,
+            "version": "1.0.0",
+            "dist": {
+                "tarball": format!("{}/npm-registry/{HOSTED_NAME}/-/{HOSTED_NAME}-1.0.0.tgz", mock.uri()),
+                "integrity": "sha512-UPSTREAMupstream==",
+            }
+        })))
+        .mount(&mock)
+        .await;
+    mock
+}
+
+/// The events of `event_type` among `bodies`, in firing order.
+fn telemetry_of<'b>(
+    bodies: &'b [serde_json::Value],
+    event_type: &str,
+) -> Vec<&'b serde_json::Value> {
+    bodies
+        .iter()
+        .filter(|body| body["event_type"] == event_type)
+        .collect()
+}
+
+/// A pin routed through its patch's pnpm registry is hosted work like any
+/// other pin, and is counted the same: one `applied` outcome for its
+/// patch in `patch_applied`, by UUID, when the run writes the route and
+/// again when a re-run finds it in place, and one `rolled_back` outcome
+/// when `rollback` takes the pin and its route out. The registry and the
+/// override are how the pin is wired, not patches: they add no outcome and
+/// no count of their own, and only the files they are in are counted.
+#[tokio::test]
+async fn a_pin_on_the_pnpm_registry_route_is_counted_as_one_hosted_patch() {
+    let mock = setup_routed_mock().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_pnpm_project(tmp.path(), HOSTED_NAME, &pnpm_v9_lock(&[], HOSTED_NAME));
+    let workspace = tmp.path().join("pnpm-workspace.yaml");
+    let the_pin = serde_json::json!({
+        "uuid": HOSTED_UUID,
+        "ecosystem": "npm",
+        "mode": "hosted",
+        "outcome": "applied",
+    });
+
+    // The run that writes the route.
+    let (code, stdout, stderr) = run_cmd(tmp.path(), &mock.uri(), "scan", &[], &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let routed = std::fs::read_to_string(&workspace).expect("the route's workspace file");
+    assert!(
+        routed.contains(&format!("  {ROUTE_ALIAS}: {ROUTE_ADDRESS}\n")),
+        "{routed}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("JSON envelope");
+    let bodies = telemetry_bodies(&mock).await;
+    let applied = telemetry_of(&bodies, "patch_applied");
+    assert_eq!(applied.len(), 1, "{bodies:#?}");
+    assert_eq!(applied[0]["metadata"]["mode"], "hosted");
+    assert_eq!(only_patch(applied[0]), &the_pin);
+    assert_eq!(applied[0]["metadata"]["patches_count"], 1);
+    assert_eq!(
+        applied[0]["metadata"]["files_count"],
+        doc["redirect"]["rewrittenFiles"].as_array().unwrap().len(),
+        "{doc:#}"
+    );
+    assert_eq!(
+        doc["redirect"]["rewrittenFiles"],
+        serde_json::json!(["pnpm-lock.yaml", "pnpm-workspace.yaml"])
+    );
+
+    // The run that finds the route in place.
+    let (code, stdout, stderr) = run_cmd(tmp.path(), &mock.uri(), "scan", &[], &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(std::fs::read_to_string(&workspace).unwrap(), routed);
+    let bodies = telemetry_bodies(&mock).await;
+    let applied = telemetry_of(&bodies, "patch_applied");
+    assert_eq!(applied.len(), 2, "{bodies:#?}");
+    assert_eq!(only_patch(applied[1]), &the_pin);
+    assert_eq!(applied[1]["metadata"]["patches_count"], 1);
+    assert_eq!(applied[1]["metadata"]["files_count"], 0);
+
+    // The rollback that takes the pin and its route out.
+    let registry = format!("{}/npm-registry", mock.uri());
+    let (code, stdout, stderr) = run_cmd(
+        tmp.path(),
+        &mock.uri(),
+        "rollback",
+        &["--yes"],
+        &[("SOCKET_NPM_REGISTRY", &registry)],
+    );
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        !workspace.exists(),
+        "the route's file goes with its last pin"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap(),
+        pnpm_v9_lock(&[], HOSTED_NAME)
+    );
+    let bodies = telemetry_bodies(&mock).await;
+    let rolled_back = telemetry_of(&bodies, "patch_rolled_back");
+    assert_eq!(rolled_back.len(), 1, "{bodies:#?}");
+    assert_eq!(rolled_back[0]["metadata"]["rolled_back_count"], 1);
+    assert_eq!(
+        only_patch(rolled_back[0]),
+        &serde_json::json!({
+            "uuid": HOSTED_UUID,
+            "ecosystem": "npm",
+            "mode": "hosted",
+            "outcome": "rolled_back",
+        })
+    );
+    // Nothing a run reported names the registry, its address or the grant.
+    for body in &bodies {
+        let text = body.to_string();
+        assert!(
+            !text.contains(ROUTE_ALIAS) && !text.contains("22222222-2222-4222-8222-222222222222"),
+            "{body:#}"
+        );
+    }
+}
+
+/// A hosted scan that only tidies a route (the patched dependency left
+/// the project, and its registry, its override and the lock's record of
+/// it go) acted on no patch: it reports the scan, and no `patch_applied`.
+/// The entries it took out are in the `--json` envelope as artifact-level
+/// events that name no patch, which is why they are no patch outcomes.
+#[tokio::test]
+async fn tidying_a_pnpm_registry_route_reports_no_patch() {
+    let mock = setup_mock(
+        serde_json::json!({ "packages": [], "canAccessPaidPatches": false }),
+        None,
+    )
+    .await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let stale = format!("{HOSTED_NAME}@1.0.0: {ROUTE_ALIAS}:1.0.0");
+    write_pnpm_project(tmp.path(), "other", &pnpm_v9_lock(&[&stale], "other"));
+    let workspace = tmp.path().join("pnpm-workspace.yaml");
+    std::fs::write(
+        &workspace,
+        format!(
+            "packages:\n  - '.'\nnamedRegistries:\n  {ROUTE_ALIAS}: {ROUTE_ADDRESS}\noverrides:\n  \
+             '{HOSTED_NAME}@1.0.0': '{ROUTE_ALIAS}:1.0.0'\n"
+        ),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) =
+        run_cmd(tmp.path(), &mock.uri(), "scan", &["--mode", "hosted"], &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(!workspace.exists(), "the file the route created is gone");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap(),
+        pnpm_v9_lock(&[], "other")
+    );
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("JSON envelope");
+    let removed: Vec<&serde_json::Value> = doc["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["errorCode"] == "registry_entry_unused")
+        .collect();
+    assert_eq!(removed.len(), 3, "{doc:#}");
+    for event in &removed {
+        assert!(
+            event.get("purl").is_none() && event.get("uuid").is_none(),
+            "{event:#}"
+        );
+    }
+
+    let bodies = telemetry_bodies(&mock).await;
+    let types: Vec<&str> = bodies
+        .iter()
+        .map(|b| b["event_type"].as_str().unwrap())
+        .collect();
+    assert_eq!(types, ["patch_scanned"], "{bodies:#?}");
+}
+
+// ---------------------------------------------------------------------------
 // Telemetry never holds a command back
 // ---------------------------------------------------------------------------
 

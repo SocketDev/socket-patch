@@ -1,7 +1,8 @@
 //! npm-family upstream restores: package-lock.json / npm-shrinkwrap.json,
 //! yarn.lock (classic and berry), pnpm-lock.yaml, bun.lock — plus the
 //! npm-family side settings a hosted run writes (`.npmrc`
-//! `allow-remote=all`, pnpm-workspace.yaml `trustLockfile: true`).
+//! `allow-remote=all`, pnpm-workspace.yaml `trustLockfile: true` and
+//! `namedRegistries`).
 //!
 //! Every restorer rewrites ONLY entries whose resolution is a hosted URL
 //! naming one of the in-scope patch uuids; every other byte of the file is
@@ -1894,6 +1895,8 @@ pub(crate) async fn restore_pnpm_locks(
     files: &[String],
     ctx: &Ctx<'_>,
 ) -> FormatResult {
+    use crate::formats::pnpm::named_registries::Owned;
+    use crate::formats::pnpm::registry_alias::{manifest_specifier, OverrideLock};
     use crate::formats::pnpm::{grammar as pnpm, PnpmDocument, PnpmLock};
 
     let mut result = FormatResult::default();
@@ -1919,7 +1922,7 @@ pub(crate) async fn restore_pnpm_locks(
                 result.refuse(&uuid, format!("{} is not an npm purl", pin.purl));
                 continue;
             };
-            if pnpm::suffix(entry.key, &name, &version).is_none() {
+            if pnpm::hosted_suffix(entry.key, &name, &version).is_none() {
                 result.refuse(
                     &uuid,
                     format!(
@@ -1960,6 +1963,87 @@ pub(crate) async fn restore_pnpm_locks(
                 result.refuse(uuid, why.clone());
             }
             continue;
+        }
+        // A pin routed through the patch server's named registry is keyed
+        // by it (`name@socket:version`): the key, every reference to it and
+        // each importer's specifier go back with the resolution, or the pin
+        // stays as it is. What an importer asked for is only in its
+        // package.json.
+        let workspace = read_sibling(view, &prefix, "pnpm-workspace.yaml").await;
+        let owned = Owned::of(workspace.as_deref(), &|origin| {
+            crate::origin::on_patch_server_origin(origin, ctx.origins)
+        });
+        let routed = match OverrideLock::parse(&text, &owned) {
+            Ok(lock) => Some(lock).filter(|lock| !lock.aliased().is_empty()),
+            // A lock the route's edits cannot follow: a pin it keys by a
+            // registry cannot go back whole (the key and its references
+            // would stay), so it stays as it is.
+            Err(why) => {
+                for (_, uuid, name, version) in &hits {
+                    let keyed_by_registry = lock.packages().iter().any(|package| {
+                        pnpm::suffix(package.entry.key, name, version).is_none()
+                            && pnpm::hosted_suffix(package.entry.key, name, version).is_some()
+                    });
+                    if keyed_by_registry {
+                        result.refuse(uuid, format!("{rel} {why}"));
+                    }
+                }
+                None
+            }
+        };
+        // Taking a routed pin back takes its override and its registry out
+        // of the workspace file, which every lock of the workspace is
+        // installed by. When they cannot all be accounted for, the pin
+        // stays hosted rather than leave half of a route behind.
+        if routed.is_some() && prefix.is_empty() {
+            if let Some(why) = route_unsettled(view, &owned).await {
+                for (_, uuid, ..) in &hits {
+                    result.refuse(
+                        uuid,
+                        format!(
+                            "its registry route in pnpm-workspace.yaml cannot be taken out                              with it: {why}"
+                        ),
+                    );
+                }
+            }
+        }
+        let mut manifests: BTreeMap<String, String> = BTreeMap::new();
+        // uuid → the routed release it pins here.
+        let mut aliased: BTreeMap<String, (String, String)> = BTreeMap::new();
+        if let Some(lock) = &routed {
+            let dir = rel.rfind('/').map_or("", |at| &rel[..=at]);
+            for importer in lock.importers() {
+                let manifest = match importer.as_str() {
+                    "." => format!("{dir}package.json"),
+                    nested => format!("{dir}{nested}/package.json"),
+                };
+                if let Ok(Some(manifest)) = view.read(&manifest).await {
+                    manifests.insert(importer, manifest);
+                }
+            }
+            let held = lock.aliased();
+            for (_, uuid, name, version) in &hits {
+                if !held
+                    .iter()
+                    .any(|pin| pin.name == *name && pin.version == *version)
+                    || aliased.contains_key(uuid)
+                {
+                    continue;
+                }
+                let mut probe = lock.clone();
+                let moved = probe
+                    .unpin(
+                        &|pin| pin.name == *name && pin.version == *version,
+                        &|importer, dep| manifest_specifier(manifests.get(importer)?, dep),
+                    )
+                    .and_then(|_| probe.finish());
+                match moved {
+                    Ok(()) => {
+                        aliased.insert(uuid.clone(), (name.clone(), version.clone()));
+                    }
+                    Err(why) => result.refuse(uuid, format!("{rel} {why}")),
+                }
+            }
         }
         let policy = pnpm_tarball_policy(view, rel, &text, ctx).await;
         let dists = fetch_dists_on(&wanted, |name| policy.registry(name), ctx, &mut result).await;
@@ -2044,11 +2128,38 @@ pub(crate) async fn restore_pnpm_locks(
             cursor = range.end;
         }
         out.push_str(&text[cursor..]);
-        for (uuid, _) in handled {
-            if !result.refused.contains_key(&uuid) {
-                result.handled.insert(uuid);
+        let restored: Vec<String> = handled
+            .into_iter()
+            .map(|(uuid, _)| uuid)
+            .filter(|uuid| !result.refused.contains_key(uuid))
+            .collect();
+        let unpin: BTreeSet<&(String, String)> = restored
+            .iter()
+            .filter_map(|uuid| aliased.get(uuid))
+            .collect();
+        if !unpin.is_empty() {
+            let unpinned = OverrideLock::parse(&out, &owned).and_then(|mut lock| {
+                lock.unpin(
+                    &|pin| unpin.contains(&(pin.name.clone(), pin.version.clone())),
+                    &|importer, name| manifest_specifier(manifests.get(importer)?, name),
+                )?;
+                lock.finish()?;
+                Ok(lock.render())
+            });
+            match unpinned {
+                Ok(Some(text)) => out = text,
+                Ok(None) => {}
+                // Each pin moved alone above; together they must too. A
+                // lock restored by half would not install.
+                Err(why) => {
+                    for uuid in &restored {
+                        result.refuse(uuid, format!("{rel} {why}"));
+                    }
+                    continue;
+                }
             }
         }
+        result.handled.extend(restored);
         view.write(rel, out);
     }
     result
@@ -2818,12 +2929,13 @@ async fn still_hosted(view: &mut View<'_>, rels: &[&str], ctx: &Ctx<'_>) -> bool
     false
 }
 
-/// Whether this restore put a pnpm lock the root `pnpm-workspace.yaml`
-/// trusts back on the registry and none of those locks is hosted any more.
-/// The file trusts the root lock and, under `sharedWorkspaceLockfile:
-/// false`, every member's own lock (#1268). A workspace whose member locks
-/// cannot be listed fails closed: a member lock may still need the setting.
-async fn trusted_pnpm_locks_restored(view: &mut View<'_>, ctx: &Ctx<'_>) -> bool {
+/// The pnpm locks the root `pnpm-workspace.yaml` governs, when this
+/// restore put one of them back on the registry: the root lock and, under
+/// `sharedWorkspaceLockfile: false`, every member's own lock (#1268).
+/// `None` when it restored none, or for a workspace whose member locks
+/// cannot be listed (fail closed: a member lock may still need the file's
+/// settings).
+async fn governed_pnpm_locks_restored(view: &mut View<'_>) -> Option<Vec<String>> {
     use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
     use crate::vendor::lock_inventory::ProjectView;
 
@@ -2832,25 +2944,206 @@ async fn trusted_pnpm_locks_restored(view: &mut View<'_>, ctx: &Ctx<'_>) -> bool
         .keys()
         .any(|k| k.rsplit('/').next() == Some("pnpm-lock.yaml"))
     {
-        return false;
+        return None;
     }
     let mut locks = vec!["pnpm-lock.yaml".to_string()];
     match member_locks(&ProjectView::Disk(view.root())).await {
         MemberLocks::Shared => {}
         MemberLocks::PerMember(keys) => locks.extend(keys),
-        MemberLocks::Unresolved(_) => return false,
+        MemberLocks::Unresolved(_) => return None,
     }
-    if !view.staged.keys().any(|k| locks.contains(k)) {
-        return false;
+    view.staged
+        .keys()
+        .any(|k| locks.contains(k))
+        .then_some(locks)
+}
+
+/// Why the registry route of the project at the view's root cannot be
+/// reconciled after a restore, if it cannot: the workspace's member locks
+/// cannot be listed, or a lock the workspace file governs is one the
+/// route's edits cannot follow while it names a registry. `None` when
+/// every governed lock is accounted for.
+async fn route_unsettled(
+    view: &mut View<'_>,
+    owned: &crate::formats::pnpm::named_registries::Owned,
+) -> Option<String> {
+    use crate::formats::pnpm::registry_alias::{names_a_route, OverrideLock};
+    use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
+    use crate::vendor::lock_inventory::ProjectView;
+
+    let mut locks = vec!["pnpm-lock.yaml".to_string()];
+    match member_locks(&ProjectView::Disk(view.root())).await {
+        MemberLocks::Shared => {}
+        MemberLocks::PerMember(keys) => locks.extend(keys),
+        MemberLocks::Unresolved(why) => return Some(why),
     }
-    let rels: Vec<&str> = locks.iter().map(String::as_str).collect();
-    !still_hosted(view, &rels, ctx).await
+    for rel in locks {
+        let Ok(Some(text)) = view.read(&rel).await else {
+            continue;
+        };
+        if let Err(why) = OverrideLock::parse(&text, owned) {
+            if names_a_route(&text) {
+                return Some(format!("{rel} {why}"));
+            }
+        }
+    }
+    None
+}
+
+/// Take out of the `overrides:` section of every governed lock (`locks`)
+/// the overrides of ours for releases no governed lock routes through a
+/// registry of ours any more, and answer the releases that still are.
+/// pnpm records the workspace file's overrides in every lock it governs, a
+/// member's own lock that holds no patched package included, and takes a
+/// lock whose record differs from the file for out of date: the section
+/// follows the file, which [`unwind_named_registries`] edits by the same
+/// rule. `None` (nothing touched) when a governed lock cannot be read, or
+/// is one the route's edits cannot follow while it names a registry: it
+/// may still route anything.
+async fn sync_lock_overrides(
+    view: &mut View<'_>,
+    locks: &[String],
+    owned: &crate::formats::pnpm::named_registries::Owned,
+) -> Option<Vec<crate::formats::pnpm::named_registries::HostedOverride>> {
+    use crate::formats::pnpm::named_registries::HostedOverride;
+    use crate::formats::pnpm::registry_alias::{names_a_route, OverrideLock};
+
+    let mut parsed = Vec::new();
+    for rel in locks {
+        match view.read(rel).await {
+            Ok(Some(text)) => match OverrideLock::parse(&text, owned) {
+                Ok(lock) => parsed.push((rel, lock)),
+                Err(_) if names_a_route(&text) => return None,
+                Err(_) => {}
+            },
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+    }
+    let routed: BTreeSet<HostedOverride> =
+        parsed.iter().flat_map(|(_, lock)| lock.aliased()).collect();
+    let routed: Vec<HostedOverride> = routed.into_iter().collect();
+    for (rel, mut lock) in parsed {
+        lock.prune_overrides(&|pin| routed.iter().any(|kept| kept.key() == pin.key()));
+        if let Some(text) = lock.render() {
+            view.write(rel, text);
+        }
+    }
+    Some(routed)
+}
+
+/// `ws` (the root pnpm-workspace.yaml) without the entries of ours the
+/// governed locks no longer need, staged in `view`; `None` when that
+/// deleted the file. The override of a release a lock still routes
+/// (`routed`) stays, and so does the registry it names, so a pin this
+/// restore could not put back keeps the registry pnpm >= 11 resolves and
+/// verifies it through.
+fn unwind_named_registries(
+    view: &mut View<'_>,
+    workspace: &str,
+    ws: String,
+    owned: &crate::formats::pnpm::named_registries::Owned,
+    routed: &[crate::formats::pnpm::named_registries::HostedOverride],
+) -> Option<String> {
+    use crate::formats::pnpm::named_registries::{unwind, Unwound};
+
+    match unwind(&ws, owned, routed) {
+        Unwound::Delete => {
+            view.remove(workspace);
+            None
+        }
+        Unwound::Rewrite(text, _) => {
+            view.write(workspace, text.clone());
+            Some(text)
+        }
+        Unwound::Unchanged => Some(ws),
+    }
+}
+
+/// Take out of the pnpm project at the view's root what is left of a
+/// registry route that no lock it governs uses any more (see
+/// [`crate::hosted::engine::pnpm_prune`]): staged in `view`, and answered
+/// as the edits that make it. `Err` (why) when the project's locks or its
+/// workspace file cannot be read to tell, with nothing staged.
+///
+/// From the files alone: no pin is restored and no registry asked, so a
+/// release a lock still routes keeps everything it needs.
+///
+/// The second answer is what the sweep passed over because it could not
+/// tell it was hosted mode's: the registries in a patch registry's shape
+/// on hosts outside `origins`, as `(origin, how many)`
+/// ([`crate::formats::pnpm::named_registries::on_unknown_hosts`]).
+pub(crate) async fn sweep_registry_route(
+    view: &mut View<'_>,
+    origins: &[String],
+) -> Result<(Vec<crate::patch::redirect::FileEdit>, Vec<(String, usize)>), String> {
+    use crate::formats::pnpm::named_registries::{holds_ours, on_unknown_hosts, Owned};
+    use crate::formats::pnpm::registry_alias::holds_route;
+    use crate::utils::pnpm_workspace::{governing_workspace_file, member_locks, MemberLocks};
+    use crate::vendor::lock_inventory::ProjectView;
+
+    const WORKSPACE: &str = "pnpm-workspace.yaml";
+    const ROOT_LOCK: &str = "pnpm-lock.yaml";
+    // A workspace member with its own lock takes its settings from an
+    // ancestor's file: hosted mode routes no such project.
+    if governing_workspace_file(view.root()).is_some() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let ws = view.read(WORKSPACE).await?;
+    let patch_server = |origin: &str| crate::origin::on_patch_server_origin(origin, origins);
+    let owned = Owned::of(ws.as_deref(), &patch_server);
+    let unknown_hosts = ws
+        .as_deref()
+        .map(|text| on_unknown_hosts(text, &patch_server))
+        .unwrap_or_default();
+    let root = view.read(ROOT_LOCK).await?;
+    let mut locks = vec![ROOT_LOCK.to_string()];
+    match member_locks(&ProjectView::Disk(view.root())).await {
+        MemberLocks::Shared => {}
+        MemberLocks::PerMember(keys) => locks.extend(keys),
+        MemberLocks::Unresolved(why) => {
+            // Only a project that holds something of a route has locks
+            // worth listing.
+            let routed = ws.as_deref().is_some_and(|text| holds_ours(text, &owned))
+                || root
+                    .as_deref()
+                    .is_some_and(|text| holds_route(text, &owned));
+            return match routed {
+                true => Err(why),
+                false => Ok((Vec::new(), unknown_hosts)),
+            };
+        }
+    }
+    let mut texts: Vec<(&str, String)> = Vec::new();
+    for rel in &locks {
+        if let Some(text) = view.read(rel).await? {
+            texts.push((rel.as_str(), text));
+        }
+    }
+    let Some(cleaned) = crate::hosted::engine::pnpm_prune(&texts, ws.as_deref(), &owned) else {
+        return Ok((Vec::new(), unknown_hosts));
+    };
+    let mut edits = cleaned.lock_edits;
+    for (rel, text) in cleaned.locks {
+        view.write(&rel, text);
+    }
+    if let Some(unrouted) = cleaned.workspace {
+        match unrouted.created {
+            true => view.remove(WORKSPACE),
+            false => view.write(WORKSPACE, unrouted.text),
+        }
+        edits.extend(unrouted.edits);
+    }
+    Ok((edits, unknown_hosts))
 }
 
 /// Remove the `.npmrc` / pnpm-workspace.yaml a hosted run CREATED (still
 /// byte-identical to the scaffold) once no lock entry needs it; warn about
 /// the setting when the file carries other content too (the line may be
 /// the user's own, so it is never removed from a file the user wrote).
+/// The pnpm named registry hosted mode declares and the overrides that
+/// route a release to it are its own by the registry's name and address,
+/// so each is taken out of any file once no governed lock needs it.
 pub(crate) async fn cleanup_side_config(
     view: &mut View<'_>,
     ctx: &Ctx<'_>,
@@ -2883,36 +3176,59 @@ pub(crate) async fn cleanup_side_config(
         }
     }
 
-    if trusted_pnpm_locks_restored(view, ctx).await {
-        const WORKSPACE: &str = "pnpm-workspace.yaml";
-        if let Ok(Some(ws)) = view.read(WORKSPACE).await {
-            let lines = crate::hosted::guidance::TRUST_SCAFFOLD_LINES;
-            let created = format!("{}\n", lines.join("\n"));
-            // In either line ending: a `core.autocrlf` checkout of the
-            // created file is still that file.
-            if crate::utils::line_endings::eol_eq(ws.as_bytes(), created.as_bytes()) {
-                view.remove(WORKSPACE);
-            } else if let Some(original) =
-                crate::formats::pnpm::workspace::strip_keyless_splice(&ws, &lines)
-            {
-                // The scaffold hosted mode splices into a file with no keys
-                // (#1096): taking it back out restores the user's file.
-                view.write(WORKSPACE, original);
-            } else if ws.lines().any(|l| {
-                crate::formats::pnpm::workspace::top_level_key(l).is_some_and(|(key, value)| {
-                    key == "trustLockfile" && value.trim_matches(['\'', '"']) == "true"
-                })
-            }) {
-                result.warnings.push((
-                    "pnpm_trust_lockfile_left",
-                    format!(
-                        "{WORKSPACE} keeps `trustLockfile: true`, which hosted mode may have \
-                         added; no lock entry needs it any more, so remove the line if nothing \
-                         else does"
-                    ),
-                ));
-            }
-        }
+    const WORKSPACE: &str = "pnpm-workspace.yaml";
+    let Some(locks) = governed_pnpm_locks_restored(view).await else {
+        return;
+    };
+    let patch_server = |origin: &str| crate::origin::on_patch_server_origin(origin, ctx.origins);
+    let Ok(Some(ws)) = view.read(WORKSPACE).await else {
+        // No file of settings: a lock's own record of the overrides still
+        // follows what the locks route.
+        let owned = crate::formats::pnpm::named_registries::Owned::of(None, &patch_server);
+        sync_lock_overrides(view, &locks, &owned).await;
+        return;
+    };
+    // The named registry hosted mode declared and the overrides that route
+    // a release to it: an override goes as soon as its release is back on
+    // the registry, from the locks' record of it and from the file, and
+    // the registry with the last of them.
+    let owned = crate::formats::pnpm::named_registries::Owned::of(Some(&ws), &patch_server);
+    let Some(routed) = sync_lock_overrides(view, &locks, &owned).await else {
+        return;
+    };
+    let Some(ws) = unwind_named_registries(view, WORKSPACE, ws, &owned, &routed) else {
+        return;
+    };
+    // `trustLockfile: true` serves every hosted entry at once, so it goes
+    // only when none of the governed locks is hosted any more.
+    let rels: Vec<&str> = locks.iter().map(String::as_str).collect();
+    if still_hosted(view, &rels, ctx).await {
+        return;
+    }
+    let lines = crate::hosted::guidance::TRUST_SCAFFOLD_LINES;
+    // In either line ending: a `core.autocrlf` checkout of the created file
+    // is still that file.
+    if crate::hosted::guidance::is_trust_scaffold(&ws) {
+        view.remove(WORKSPACE);
+    } else if let Some(original) =
+        crate::formats::pnpm::workspace::strip_keyless_splice(&ws, &lines)
+    {
+        // The scaffold hosted mode splices into a file with no keys
+        // (#1096): taking it back out restores the user's file.
+        view.write(WORKSPACE, original);
+    } else if ws.lines().any(|l| {
+        crate::formats::pnpm::workspace::top_level_key(l).is_some_and(|(key, value)| {
+            key == "trustLockfile" && value.trim_matches(['\'', '"']) == "true"
+        })
+    }) {
+        result.warnings.push((
+            "pnpm_trust_lockfile_left",
+            format!(
+                "{WORKSPACE} keeps `trustLockfile: true`, which hosted mode may have \
+                 added; no lock entry needs it any more, so remove the line if nothing \
+                 else does"
+            ),
+        ));
     }
 }
 

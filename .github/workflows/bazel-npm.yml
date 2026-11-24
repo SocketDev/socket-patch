@@ -2,14 +2,19 @@ name: Bazel patch compatibility (npm)
 
 # The npm flows of the real-Bazel tests (`npm::` in `e2e_bazel_build`):
 # hosted and vendored mode for a package that aspect_rules_js links from a
-# pnpm lock, and agent mode for the copy of it in `node_modules`, on each
-# Bazel release below. bazel-compatibility.yml holds the legs and what
+# pnpm lock, agent mode for the copy of it in `node_modules`, and hosted
+# mode on a hub that keeps the lock up to date with a pnpm of its own (a
+# pnpm 11, and the pnpm 10 that rules_js picks), on each Bazel release
+# below. bazel-compatibility.yml holds the legs and what
 # every ecosystem shares; this file says when the npm legs run and on which
 # releases.
 #
-# Beyond what every leg needs, an npm leg downloads Node from nodejs.org and
-# ruleset archives from codeload.github.com; its repository cache holds them
-# and comes to about 100 MB. An npm tarball under test passes through that
+# Beyond what every leg needs, an npm leg downloads Node from nodejs.org,
+# ruleset archives from codeload.github.com and, for the hubs that keep
+# their lock up to date, the two pnpm releases that rules_js runs: the
+# `pnpm` package of registry.npmjs.org, about 5 MB each, held to the
+# checksums rules_js has for them. The repository cache of a leg holds them
+# and comes to about 110 MB. An npm tarball under test passes through that
 # cache as well: Bazel's downloader fetches it and keeps it under its
 # sha512. So a test builds the upstream tarball and each patched one anew,
 # with an id of the run in the entry file, and writes the upstream sum into
