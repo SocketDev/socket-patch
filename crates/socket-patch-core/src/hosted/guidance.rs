@@ -542,20 +542,28 @@ pub fn pnpm_registry_mirrored_reason(packages: &[String]) -> String {
 }
 
 /// The clause for a project whose pnpm lock a rules_js hub of its Bazel
-/// workspace reads (`call`: the file and line of the
-/// `npm.npm_translate_lock`, [`crate::bazel::pnpm::reads_lock`]). What
-/// holds the route back is the pnpm such a hub runs with
-/// `update_pnpm_lock`, which sees the registries only where the call lists
-/// pnpm-workspace.yaml and may be older than pnpm 11.20; the lock reader
-/// of rules_js takes a routed lock. The project keeps the pin that the
-/// Bazel legs build.
-pub fn pnpm_registry_bazel_reason(call: &str) -> String {
+/// workspace reads ([`crate::bazel::pnpm::Reader`]). What holds the route
+/// back is the pnpm such a hub runs with `update_pnpm_lock`, which sees the
+/// registries only where the call lists pnpm-workspace.yaml and may be
+/// older than pnpm 11.20; the lock reader of rules_js takes a routed lock.
+/// The project keeps the pin that the Bazel legs build.
+pub fn pnpm_registry_bazel_reason(reader: &crate::bazel::pnpm::Reader) -> String {
+    use crate::bazel::pnpm::Reader;
+    let hub = match reader {
+        Reader::Call(call) => format!("a Bazel hub reads the pnpm lock ({call})"),
+    };
     format!(
-        "a Bazel hub reads the pnpm lock ({call}), and a lock that a hub reads is not routed \
-         yet: the pnpm a hub runs for `update_pnpm_lock` may not read the registries in \
-         {PNPM_WORKSPACE_REL}"
+        "{hub}, and a lock that a hub reads is not routed yet: the pnpm a hub runs for \
+         `update_pnpm_lock` may not read the registries in {PNPM_WORKSPACE_REL}"
     )
 }
+
+/// The clause for a project whose root pnpm lock a Bazel hub keeps out of
+/// the run ([`crate::bazel::pnpm::Hubs::hidden`]) where no call was read as
+/// the hub's: pnpm-workspace.yaml records its overrides in that lock too,
+/// and it is not written.
+pub const PNPM_REGISTRY_BAZEL_WITHHELD: &str =
+    "a Bazel hub keeps the root pnpm lock, which would record the same overrides, out of this run";
 
 /// The reason a route an earlier run set up is left as it is where a
 /// Bazel hub keeps the root pnpm lock out of the run
