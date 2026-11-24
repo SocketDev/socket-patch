@@ -1685,6 +1685,59 @@ async fn cleanup_in_a_bazel_workspace_whose_hub_hides_the_workspace_file() {
     }
 }
 
+/// A hub that keeps the lock up to date with a pnpm 11 and lists the
+/// project's pnpm-workspace.yaml as `data`. The file is the one a routed
+/// scan created, so it holds nothing but what hosted mode writes, and a
+/// run that takes the last of the route out would delete it under the
+/// call that names it.
+const LISTING_HUB: &str = "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+    npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+    npm.npm_translate_lock(pnpm_lock = \"//:pnpm-lock.yaml\", \
+    data = [\"//:pnpm-workspace.yaml\"], update_pnpm_lock = True)\n\
+    pnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
+    pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")\n";
+
+/// What a hosted scan does with a lock that it leaves to a Bazel hub does
+/// not depend on what the scan was granted. With a patch for a package of
+/// the lock, with none, and with nothing crawled at all, it rewrites
+/// neither the lock nor pnpm-workspace.yaml, and says why. Before, only
+/// the first left the files: the other two took the unused entries out, and
+/// with the last of them the file that the hub's `data` names.
+#[tokio::test]
+async fn a_hosted_scan_leaves_a_lock_to_its_bazel_hub_whatever_it_is_granted() {
+    let granting = MockServer::start().await;
+    mock_api(&granting, &[&KEPT], &[]).await;
+    let empty = MockServer::start().await;
+    mock_api(&empty, &[], &[]).await;
+    let hidden = |doc: &Value| {
+        doc["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "redirect_pnpm_bazel_workspace_hidden")
+    };
+    for hub in [HIDING_HUB, LISTING_HUB] {
+        for (granted, server, installed) in [
+            ("a patch", &granting, true),
+            ("no patch", &empty, true),
+            ("nothing crawled", &empty, false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let (workspace, lock_text) = departed_project(root, "removed");
+            if !installed {
+                std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+            }
+            std::fs::write(root.join("MODULE.bazel"), hub).unwrap();
+            let (code, doc) = scan_hosted(root, server, &[]);
+            assert_eq!(code, Some(0), "{granted}: {doc}");
+            assert_eq!(entries(&doc, "removed"), [], "{granted}: {doc}");
+            assert_unchanged(root, &workspace, &lock_text, granted);
+            assert!(hidden(&doc), "{granted}: {doc}");
+        }
+    }
+}
+
 // ── what a person is told ────────────────────────────────────────────────
 
 /// (4) Without `--json` each removal is a line, in `repair` and in a

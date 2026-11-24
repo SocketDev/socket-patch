@@ -2395,8 +2395,10 @@ hub was there leaves the route on its next scan, the lock and the workspace file
 Where hosted mode writes nothing for the root lock (the hub above), a route of an earlier
 run is left exactly as it is, in the workspace file and in every lock, and a
 `pnpm-workspace.yaml` that holds nothing but such a route counts as a file that holds only
-what hosted mode writes. `repair`, `scan --prune` with no mode, `rollback` and `remove`
-settle a route from the lockfiles alone and work as without Bazel.
+what hosted mode writes. That holds for every hosted scan, whatever it was granted: one
+with a patch for a package of the lock, one with none and one that crawled nothing all
+leave the files and give the same warning. `repair`, `scan --prune` with no mode,
+`rollback` and `remove` settle a route from the lockfiles alone and work as without Bazel.
 
 The file the hub lists has to be one that a pin and its undo leave standing, so hosted mode
 also writes nothing for a hub that lists it in two cases, and the warning then names what

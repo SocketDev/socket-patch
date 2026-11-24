@@ -532,11 +532,24 @@ pub(super) async fn run_vendor_only_gc(
 pub(super) async fn run_registry_only_gc(
     common: &GlobalArgs,
     socket_dir: &Path,
+    hosted: bool,
 ) -> Option<GcSummary> {
     if !crate::commands::registry_gc::route_present(common).await {
         return None;
     }
     let mut gc = GcSummary::default();
+    // A hosted scan writes nothing for a root pnpm lock that a Bazel hub
+    // would fail on a pin in, whatever it was granted: it takes nothing
+    // of a route out there either, and says what it says with a patch.
+    if hosted {
+        let root = common.project_root();
+        let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&root);
+        if let Some(hidden) = socket_patch_core::bazel::pnpm::hidden(&view).await {
+            gc.warnings
+                .push((socket_patch_core::bazel::pnpm::HIDDEN, hidden.detail));
+            return Some(gc);
+        }
+    }
     if common.dry_run {
         gc.sweep_registry(common, true).await;
         return Some(gc);

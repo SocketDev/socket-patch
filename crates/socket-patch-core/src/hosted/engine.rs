@@ -1712,8 +1712,13 @@ pub async fn read_candidate_files_in(
         // A run with no npm patch still tidies what is left of a registry
         // route ([`pnpm_prune`]), and every lock the workspace file governs
         // has a say in what is left: the members' own locks are read for
-        // it, as a run with a patch reads them.
+        // it, as a run with a patch reads them. And the Bazel workspace is
+        // asked as for such a run: a root lock that a run with a patch
+        // leaves to a hub is not rewritten by one without, so what a scan
+        // does to the files does not turn on what it was granted.
+        let root = out.files.contains_key(ROOT_PNPM_LOCKS[0]);
         read_pnpm_member_locks(view, unreadable, &mut out).await;
+        read_pnpm_bazel(view, root, &mut out).await;
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "gem") {
         keep_bundler_loaded_gem_files(view, candidates, &mut out).await;
@@ -13828,6 +13833,58 @@ snapshots:
                 done.rewrite.files.keys()
             );
             assert!(!done.pnpm_workspace_emptied);
+        }
+    }
+
+    /// What a run does with a lock that it leaves to a Bazel hub does not
+    /// turn on whether it was granted an npm patch. The project was routed,
+    /// its routed dependency left the lock, and the hub lists the
+    /// pnpm-workspace.yaml the route created: a run that took the unused
+    /// entries out would delete that file under the call that names it. A
+    /// run with a patch for another package leaves the root lock to the
+    /// hub and changes nothing; so does a run that is granted nothing.
+    #[tokio::test]
+    async fn a_run_granted_no_npm_patch_leaves_the_lock_to_the_hub_too() {
+        const PLAIN: &str = "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      \
+             is-number:\n        specifier: 7.0.0\n        version: 7.0.0\n\npackages:\n  \
+             is-number@7.0.0:\n    resolution: {integrity: sha512-UPSTREAM==}\n\n\
+             snapshots:\n  is-number@7.0.0: {}\n";
+        let origins = || vec!["https://patch.test".to_string()];
+        let mut project = pnpm12_project(&PLAIN.replace(
+            "importers:\n",
+            &format!("overrides:\n  left-pad@1.3.0: {LEFT_PAD_ALIAS}:1.3.0\n\nimporters:\n"),
+        ));
+        project.insert_text(PNPM_WORKSPACE_REL, left_pad_routed_workspace());
+        // Without a hub the unused route goes, and the file with it.
+        let view = ProjectView::Memory(&project);
+        let tidied = pnpm_rewrite_from(&view, &[], true, false, &no_env, origins()).await;
+        assert_eq!(lock_of(&tidied), Some(PLAIN));
+        assert!(tidied.pnpm_workspace_emptied);
+
+        project.insert_text(
+            "MODULE.bazel",
+            rules_js_hub(
+                "pnpm_lock = \"//:pnpm-lock.yaml\", data = [\"//:pnpm-workspace.yaml\"], \
+                 update_pnpm_lock = True",
+            ),
+        );
+        let view = ProjectView::Memory(&project);
+        let with = [is_number_candidate(true)];
+        for granted in [&with[..], &[]] {
+            let done = pnpm_rewrite_from(&view, granted, true, false, &no_env, origins()).await;
+            assert!(
+                done.rewrite.files.is_empty(),
+                "{} granted: {:?}",
+                granted.len(),
+                done.rewrite.files.keys()
+            );
+            assert!(!done.pnpm_workspace_emptied, "{} granted", granted.len());
+            assert!(
+                warning_codes(&done).contains(&crate::bazel::pnpm::HIDDEN),
+                "{} granted: {:?}",
+                granted.len(),
+                warning_codes(&done)
+            );
         }
     }
 

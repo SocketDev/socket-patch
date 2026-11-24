@@ -2995,7 +2995,7 @@ async fn scan_project(
             // any more is judged by the lockfiles too. A hosted scan takes
             // it out on every run; with nothing crawled its rewrite never
             // runs, so this pass does.
-            gc::run_registry_only_gc(&args.common, &socket_dir).await
+            gc::run_registry_only_gc(&args.common, &socket_dir, hosted).await
         } else {
             None
         };
