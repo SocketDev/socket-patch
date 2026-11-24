@@ -1994,11 +1994,17 @@ Known problems. In each of these a command exits 0 today and the next Bazel buil
   section.
 - **Vendored npm on a hub with `update_pnpm_lock = True`** (measured with pnpm 9 and 10):
   the pnpm that Bazel runs does not see `.socket/vendor`. Use hosted mode there.
-- **Hosted npm on such a hub with a pnpm of 11 or later, when hosted mode is kept from
-  writing `trustLockfile: true`** (`--no-trust-lockfile-config`, or a `trustLockfile: false`
-  of the project's own): the lock is pinned, with the warning that pnpm 11 rejects it, and
-  the pnpm that Bazel runs does (`ERR_PNPM_TARBALL_URL_MISMATCH`; measured by hand with the
-  option on Bazel 9.3.2). Run `socket-patch rollback`, and scan again without the option.
+- **Hosted npm on such a hub with a pnpm of 11 or later, when hosted mode is told not to
+  write `trustLockfile: true`** (`--no-trust-lockfile-config`): the lock is pinned, with the
+  warning that pnpm 11 rejects it, and the pnpm that Bazel runs does
+  (`ERR_PNPM_TARBALL_URL_MISMATCH`; measured by hand with the option on Bazel 9.3.2). Run
+  `socket-patch rollback`, and scan again without the option. A `trustLockfile: false` of
+  the project's own is not this case: hosted mode pins nothing beside it (see
+  [Bazel workspaces: npm](#bazel-workspaces-npm)).
+- **`rollback` of a hosted npm pin on such a hub that an earlier release wrote, where the
+  `pnpm-workspace.yaml` the hub lists holds only what hosted mode writes**: the undo removes
+  the file, and the call then names a missing one. Put the file back with a comment line in
+  it. Hosted mode pins nothing beside such a file now.
 - **Vendored Go with gazelle 0.36.0 or older**: `go_deps` rejects the directory `replace`
   (`local file path not supported in replace directive`). Use hosted mode, or a gazelle of
   the list above.
@@ -2044,12 +2050,15 @@ and what the call lists as `data`, and nothing else of the checkout.
 pnpm 11 and later reject a lock that names the patch server unless `pnpm-workspace.yaml`
 holds `trustLockfile: true`, which hosted mode writes. A hub that does not list that file
 hides the setting from its pnpm, and the build fails (`ERR_PNPM_TARBALL_URL_MISMATCH`). For
-such a hub hosted mode therefore writes nothing for the project's pnpm lock:
-`scan --mode hosted` and `get --mode hosted` exit 0, report each npm package as skipped
-(`redirect_unconfirmed`) and warn `redirect_pnpm_bazel_workspace_hidden`. A project that also
-has a lock of npm's gets no pin there either: a package that the unpinned pnpm lock still
-names is skipped as `redirect_unattributable`. The build stays the unpatched one that
-passes. The warning names the call by its file and line, and the line to add to it:
+such a hub hosted mode therefore writes nothing for the project's root pnpm lock:
+`scan --mode hosted` and `get --mode hosted` exit 0, report each npm package of that lock as
+skipped (`redirect_unconfirmed`) and warn `redirect_pnpm_bazel_workspace_hidden`. A project
+that also has a lock of npm's gets no pin there either: a package that the unpinned pnpm
+lock still names is skipped as `redirect_unattributable`. The members' own locks of a
+workspace that keeps one lock per member (`sharedWorkspaceLockfile: false`) are pinned as
+without Bazel: the hub reads the root lock alone. The build stays the unpatched one that
+passes. The warning names the call by its file and line, as the file writes it, and the line
+to add to it; for a project below the Bazel root it says that its paths are from that root:
 
 ```starlark
 npm.npm_translate_lock(
@@ -2061,26 +2070,44 @@ npm.npm_translate_lock(
 ```
 
 Run the command again after that: it pins the lock, and the next build takes the patched
-package. rules_js asks for this `data` itself (`docs/pnpm.md`, "update_pnpm_lock"). In a
-project that has no `pnpm-workspace.yaml`, create the file first; a comment line is enough.
-Hosted mode would create it, but `rollback` removes a file that hosted mode created, and the
-call would then name a file that is not there, which fails the build. `rollback` cannot tell
-that file from one of the same bytes, so a file that would be nothing else with the setting
-in it needs a comment line too: an empty one, one that holds only `packages:` and `- '.'`,
-and one that an earlier hosted run created. The warning says so for such a file.
+package. rules_js asks for this `data` itself (`docs/pnpm.md`, "update_pnpm_lock").
+
+The file the hub lists has to be one that a pin and its undo leave standing, so hosted mode
+also writes nothing for a hub that lists it in two cases, and the warning then names what
+the file needs and no label:
+
+- **The file would hold only what hosted mode writes**: there is none, or it is empty, or
+  holds only `packages:` and `- '.'`, or is the file an earlier hosted run created. Hosted
+  mode would create or fill it, but `rollback` removes a file that holds nothing else (it
+  cannot tell it from one hosted mode created), and the call would then name a file that is
+  not there, which fails the build. Put a comment line in the file, creating it where there
+  is none. The same step comes first, before the label, where the hub does not list the
+  file yet.
+- **Hosted mode does not write the setting to the file**: it says `trustLockfile: false`
+  (or any value but `true`), which hosted mode leaves as it is, or it is YAML that a line
+  cannot be added to (a flow-style root, several documents). The pnpm of the hub would read
+  the file and still reject the lock. Set `trustLockfile: true` in it yourself.
 
 Hosted mode withholds when one call names the project's `pnpm-lock.yaml` in a plain string
 and all three hold for it:
 
 - `update_pnpm_lock` is `True`, or is not written out as `True` or `False`.
 - `data` is not a list of strings that holds the label of the `pnpm-workspace.yaml` beside
-  the lock.
+  the lock, or it is and the file is one of the two cases above.
 - The pnpm it runs is stated as 11 or later, or in a way that is no version (`latest`, a
   constant, a `package.json` that cannot be read). That pnpm is the repository `use_pnpm`
   names, `@pnpm` without one, and a `pnpm.pnpm` tag of that `name` states its release: in
   `pnpm_version`, or in the `packageManager` of the `package.json` that `pnpm_version_from`
-  names. Where the workspace states none, rules_js runs one it picks: its newest pnpm 10 at
-  rules_js 3.x, its newest pnpm 8 at 2.x. Those take a pinned lock, so nothing is withheld.
+  names; of several tags the newest release counts. Where the workspace states none,
+  rules_js runs one it picks: its newest pnpm 8 through 2.9.3, its newest pnpm 10 from
+  3.0.0 through 3.6.0 and at 4.0.0-alpha.0 and 4.0.0-alpha.1 (read in its source). Those
+  take a pinned lock, so nothing is withheld for a release of aspect_rules_js of 1, 2 or 3
+  and for those two: the release the root module asks for with `bazel_dep`, or pins with a
+  `single_version_override`, and the one `MODULE.bazel.lock` selected, where that file is
+  there. For any later release, for a version that is not written out and for a ruleset
+  that an override takes from elsewhere than a registry, the choice is not known and
+  counts as a pnpm that may be 11 or later; a `pnpm.pnpm` tag that states the release
+  settles it.
   A `use_pnpm` is followed to such a tag only where a `use_repo` takes its repository by
   position, under the tag's own name. One that names a repository `use_repo` renames
   (`use_repo(pnpm, eleven = "pnpm")`, which runs the pnpm of the tag `pnpm`), or a
@@ -2093,8 +2120,8 @@ build would take the pin (measured); the warning then says to write `data` out a
 that holds the label. A hub whose `update_pnpm_lock` is a constant is taken as one that
 keeps the lock up to date, whatever the constant holds. A lock that is pinned already stays
 pinned. Everything else is as it is without Bazel: a hub without `update_pnpm_lock`, one
-that runs pnpm 10, one that lists the file, a project whose lock no call names, and a
-project in no Bazel workspace.
+that runs pnpm 10, one that lists a file of your own that takes the setting, a project whose
+lock no call names, and a project in no Bazel workspace.
 
 Not read, so that the lock is pinned as it is without Bazel: a `WORKSPACE` file; a hub in a
 workspace file that cannot be read; a pnpm release that another Bazel module of the build
@@ -2102,10 +2129,15 @@ asks for; and a repository named `pnpm` that another extension makes and a `use_
 names. Where the pnpm of such a build is 11 or later and does not read the setting, the
 build fails as above. Not read either is a `trustLockfile` that reaches the pnpm of the
 build another way (`pnpm_config_trust_lockfile` in Bazel's environment): hosted mode
-withholds there as well. The in-memory engine reads the `MODULE.bazel` beside the lock and
-gives the same answer; it sees no file that one includes and no Bazel root above the
-project. Nor does hosted mode look at whether it will write the setting: see the known
-problems of [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported).
+withholds there as well. Not read either: a hub that names the lock of a workspace member
+(`pnpm_lock = "//packages/a:pnpm-lock.yaml"`), which is pinned as without Bazel. The
+in-memory engine reads the `MODULE.bazel` beside the lock and gives the answer of a checkout
+with the same files; it sees no file that one includes, no Bazel root above the project and
+no `MODULE.bazel.lock`, and a `pnpm_version_from` file that is not among the project's own
+manifests reads there as a release that is not written out, so a lock that a checkout pins
+can be left as it is in memory. Nor does hosted mode look at `--no-trust-lockfile-config`
+when it decides this: see the known problems of
+[Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported).
 
 ## Bazel workspaces: Maven
 

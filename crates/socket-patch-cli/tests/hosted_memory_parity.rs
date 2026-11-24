@@ -1527,8 +1527,9 @@ async fn parity_pnpm_member_branch_lock_refusal() {
 /// up to date with pnpm 11 and does not list `pnpm-workspace.yaml` as
 /// `data`: the pnpm that Bazel runs would reject a pinned lock, so both
 /// engines refuse every pnpm pin with the same warning, nothing written.
-/// Path selection asks for the `MODULE.bazel` beside the lock. With the
-/// file listed both engines pin the lock.
+/// Path selection asks for the `MODULE.bazel` beside the lock. With a
+/// file of the user's own listed both engines pin the lock; with a listed
+/// file that the undo of the pin would remove both pin nothing.
 #[tokio::test]
 async fn parity_pnpm_bazel_hub_that_hides_the_workspace_file() {
     let lock =
@@ -1544,7 +1545,7 @@ async fn parity_pnpm_bazel_hub_that_hides_the_workspace_file() {
              pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")\n"
         )
     };
-    let workspace = "packages:\n  - '.'\n";
+    let workspace = "# own\npackages:\n  - '.'\n";
     let hidden = module("");
     let files = pnpm_workspace(workspace, Some(&lock), &[], &[("MODULE.bazel", &hidden)]);
     let (redirect, changed) = assert_pnpm_workspace_parity(&files, true).await;
@@ -1561,6 +1562,20 @@ async fn parity_pnpm_bazel_hub_that_hides_the_workspace_file() {
     assert_eq!(paths, ["pnpm-lock.yaml", "pnpm-workspace.yaml"]);
     assert!(
         !redirect["warnings"].to_string().contains(code),
+        "{redirect:#}"
+    );
+
+    // Listed, but a file that the undo of the pin would remove: both
+    // engines pin nothing, so that no `rollback` leaves the call with a
+    // missing file.
+    let scaffold = "packages:\n  - '.'\n";
+    let files = pnpm_workspace(scaffold, Some(&lock), &[], &[("MODULE.bazel", &listed)]);
+    let (redirect, changed) = assert_pnpm_workspace_parity(&files, true).await;
+    assert!(changed.is_empty(), "{}", describe(&changed));
+    let warned = redirect["warnings"].to_string();
+    assert!(warned.contains(code), "{redirect:#}");
+    assert!(
+        warned.contains("put a comment line in pnpm-workspace.yaml"),
         "{redirect:#}"
     );
 }

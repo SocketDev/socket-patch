@@ -801,9 +801,9 @@ const HIDDEN: &str = "redirect_pnpm_bazel_workspace_hidden";
 /// What that warning says to do in a project that has no
 /// `pnpm-workspace.yaml`, and in one that has: its last words.
 const WAY_ON: [&str; 2] = [
-    " — create pnpm-workspace.yaml (a comment line is enough; `rollback` removes one that \
-     hosted mode created, and the call would then name a missing file), list \
-     `//:pnpm-workspace.yaml` in the `data` of that call and re-run",
+    " — put a comment line in pnpm-workspace.yaml (create the file where there is none: \
+     `rollback` removes one that holds only what hosted mode writes, and the call would then \
+     name a missing file), list `//:pnpm-workspace.yaml` in the `data` of that call and re-run",
     " — list `//:pnpm-workspace.yaml` in the `data` of that call and re-run",
 ];
 
@@ -2078,12 +2078,22 @@ fn hosted_mode_pins_nothing_where_a_hub_hides_the_trust_setting_from_pnpm_11() {
         let label = |file: &str| format!("\"//{package}:{file}\"");
         reads(&cell, label(LOCK).trim_matches('"'));
         let before = cell.tree();
-        let names = names_the_hub(&cell);
+        // For a project below the root the warning says where its paths
+        // are from.
+        let from = match project {
+            "" => ": this",
+            _ => ", with paths from the root of the Bazel workspace: this",
+        };
+        let names = names_the_hub(&cell).replacen(": this", from, 1);
         let listed = WAY_ON.map(|way| way.replace("\"//:", &format!("\"//{package}:")));
         let listed = listed.map(|way| way.replace("`//:", &format!("`//{package}:")));
         let way_on = listed[0].replace(
-            "create pnpm-workspace.yaml",
-            &format!("create {project}pnpm-workspace.yaml"),
+            "in pnpm-workspace.yaml (create",
+            &format!("in {project}pnpm-workspace.yaml (create"),
+        );
+        assert_ne!(
+            way_on.contains("in web/pnpm-workspace.yaml"),
+            project.is_empty()
         );
 
         // A script: the scan, its dry run, and `get` of the package.
@@ -2144,6 +2154,42 @@ fn hosted_mode_pins_nothing_where_a_hub_hides_the_trust_setting_from_pnpm_11() {
             "{test}: {}",
             undo.dump
         );
+    }
+}
+
+/// Without a Bazel: a hub that lists the `pnpm-workspace.yaml` of the
+/// project is passed over only where the pin is one the build takes and an
+/// undo leaves standing. Hosted mode pins nothing where it would not write
+/// the setting to that file (the file says `trustLockfile: false`), and
+/// where the file would hold only what hosted mode writes, so that
+/// `rollback` would remove it and leave the call with a missing file. The
+/// warning names what the file needs, and no label, which is there.
+#[test]
+fn a_listed_workspace_file_has_to_hold_the_setting_and_a_line_of_the_users_own() {
+    let own = WAY_ON[0].split_once(", list ").expect("the first step").0;
+    let cases = [
+        (
+            "packages:\n  - '.'\n".to_string(),
+            format!("{own} and re-run"),
+        ),
+        (String::new(), format!("{own} and re-run")),
+        (
+            format!("{OWN_WORKSPACE}trustLockfile: false\n"),
+            " — set `trustLockfile: true` in pnpm-workspace.yaml (it says `trustLockfile: \
+             false`, which hosted mode leaves as it is) and re-run"
+                .to_string(),
+        ),
+    ];
+    for (workspace, way_on) in cases {
+        let (mut cell, standin, _, _) = checkout("");
+        cell.test = format!("{workspace:?}");
+        std::fs::remove_dir_all(cell.path("node_modules")).expect("the installed tree");
+        keeps_the_lock_up_to_date(&cell, Some(PNPM_11));
+        lists_the_workspace_file(&cell);
+        cell.write("pnpm-workspace.yaml", workspace);
+        let before = cell.tree();
+        let scan = hosted_scan(&cell, &standin, "", &["--yes"]);
+        pinned_nothing(&cell, &scan, &before, &names_the_hub(&cell), &way_on);
     }
 }
 
