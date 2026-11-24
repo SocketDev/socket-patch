@@ -43,15 +43,19 @@
 //!   as it is without Bazel.
 //! - `rb_bundle_fetch` in the file of the older `WORKSPACE` system
 //!   ([`Workspace::legacy`]) is the same rule under that name. Its calls
-//!   count where no tag of the module files may read the lock: beside one
-//!   that does, Bazel 8 and 9 build from the tag and the file is a
-//!   leftover. Which Bazel runs is not known here, so they count on every
-//!   release, also where Bazel no longer reads the file.
+//!   count unless a tag of the module files names the lock in a plain
+//!   string: beside such a tag, Bazel 8 and 9 build from the tag and the
+//!   file is a leftover. Which Bazel runs is not known here, so they count
+//!   on every release, also where Bazel no longer reads the file. In that
+//!   file `workspace(name = "shop")` makes `@shop//` the main repository.
+//! - An entry that is an empty string holds nothing: rules_ruby hands
+//!   Bazel no sha256 for it.
 //!
 //! Not looked at: a call of another Bazel module, a macro of a `.bzl` file
 //! that makes the call, a name other than `rb_bundle_fetch` that a
-//! `WORKSPACE` file loads the rule under, and what the command line or an
-//! rc file tells Bazel.
+//! `WORKSPACE` file loads the rule under, an `rb_bundle_fetch` beside a tag
+//! that names the lock (Bazel 7 reads both files, and a target may use the
+//! hub of either), and what the command line or an rc file tells Bazel.
 //!
 //! [`Tags::doubts`]: super::workspace::Tags::doubts
 
@@ -77,7 +81,7 @@ const HUB: Extension<'static> = Extension {
 /// A call that may read the lock: how a warning names it, and its
 /// `gem_checksums`, each gem with its sha256. `None` for one that is not
 /// written out.
-type Held = (String, Option<BTreeMap<String, String>>);
+pub type Held = (String, Option<BTreeMap<String, String>>);
 
 /// Whether the reader asks for the file `path` of a workspace, by its path
 /// from the Bazel root: `MODULE.bazel`, a file that one can include, and
@@ -87,12 +91,23 @@ pub fn is_workspace_file(path: &str) -> bool {
 }
 
 /// Whether `call` reads the lock at `lock`, a path from the Bazel root.
-/// `None` when the call does not say so in a plain string.
-fn reads(workspace: &Workspace, call: &Call, lock: &str) -> Option<bool> {
+/// `None` when the call does not say so in a plain string. `own` is the
+/// name a `WORKSPACE` file gives the main repository, for a call of that
+/// file: `@<that name>//` is the main repository there, and under a name
+/// that is not written out any repository may be.
+fn reads(workspace: &Workspace, call: &Call, lock: &str, own: Option<&Value>) -> Option<bool> {
     match call.arg("gemfile_lock") {
         Some(Value::Str(label)) => {
             let label = workspace.label(label)?;
-            Some(label.repo == Repo::Main && label.path() == lock)
+            if label.path() != lock {
+                return Some(false);
+            }
+            match (&label.repo, own) {
+                (Repo::Main, _) => Some(true),
+                (Repo::Apparent(repo), Some(Value::Str(own))) => Some(repo == own),
+                (Repo::Apparent(_), Some(_)) => None,
+                _ => Some(false),
+            }
         }
         None if !call.unpacks() => Some(false),
         _ => None,
@@ -102,16 +117,26 @@ fn reads(workspace: &Workspace, call: &Call, lock: &str) -> Option<bool> {
 /// The calls of `workspace` that may read the lock at `lock` and have a
 /// `gem_checksums`.
 fn held(workspace: &Workspace, lock: &str) -> Vec<Held> {
-    let may_read = |call: &Call| reads(workspace, call, lock) != Some(false);
     let tags = workspace.tags(&HUB, "bundle_fetch");
+    let read = |call: &Call| reads(workspace, call, lock, None);
     let tags = tags.calls.iter().map(|tag| (tag.file, tag.call));
-    let mut calls: Vec<(&str, &Call)> = tags.filter(|(_, call)| may_read(call)).collect();
-    if let Some(Ok((file, legacy))) = workspace.legacy.as_ref().filter(|_| calls.is_empty()) {
-        let fetch = |call: &&Call| call.bind.is_none() && call.callee == "rb_bundle_fetch";
-        let fetches = legacy.calls.iter().filter(fetch);
+    let tags: Vec<_> = tags.map(|(file, call)| (file, call, read(call))).collect();
+    let named = tags.iter().any(|(.., reads)| *reads == Some(true));
+    let may = tags.into_iter().filter(|(.., reads)| *reads != Some(false));
+    let mut calls: Vec<(&str, &Call)> = may.map(|(file, call, _)| (file, call)).collect();
+    if let Some(Ok((file, legacy))) = workspace.legacy.as_ref().filter(|_| !named) {
+        let free = |call: &&Call| call.bind.is_none();
+        let naming = legacy
+            .calls
+            .iter()
+            .filter(free)
+            .find(|call| call.callee == "workspace");
+        let own = naming.and_then(|call| call.arg("name"));
+        let fetches = legacy.calls.iter().filter(free);
+        let fetches = fetches.filter(|call| call.callee == "rb_bundle_fetch");
         calls.extend(
             fetches
-                .filter(|call| may_read(call))
+                .filter(|call| reads(workspace, call, lock, own) != Some(false))
                 .map(|call| (file.as_str(), call)),
         );
     }
@@ -159,11 +184,21 @@ pub fn handed_on_disk(project: &Path, lock: &str) -> Option<String> {
     handed(&view, &lock.join("/"))
 }
 
+/// The calls that the hosted engine handed over among `files` under
+/// [`KEY`]: none for a project it handed none for.
+pub fn handed_over(files: &BTreeMap<String, String>) -> Vec<Held> {
+    let held = files
+        .get(KEY)
+        .and_then(|held| serde_json::from_str(held).ok());
+    held.unwrap_or_default()
+}
+
 /// Why hosted mode leaves version `version` of the gem `name` as it is,
-/// with what a warning says of the way on: `None` when no call handed over
-/// among `files` stands against the redirect. `builds` is each build of the
-/// gem that the lock `lock` names, as the words of its line (`<version>`,
-/// or `<version>-<platform>`), with the sha256 of its patched archive.
+/// with what a warning says of the way on: `None` when none of the calls
+/// `held` ([`handed_over`]) stands against the redirect. `builds` is each
+/// build of the gem that the lock `lock` names, as the words of its line
+/// (`<version>`, or `<version>-<platform>`), with the sha256 of its patched
+/// archive.
 /// `checked` says that the lock has a `CHECKSUMS` section, and `pinned`
 /// that an earlier run pinned the gem already: that pin stays, and the
 /// warning says so in place of a redirect that was skipped.
@@ -171,31 +206,43 @@ pub fn handed_on_disk(project: &Path, lock: &str) -> Option<String> {
 /// A call stands against the redirect when it holds one of the builds to
 /// another sha256, or has a `gem_checksums` that is not written out. A
 /// sha256 is the same one in either case of its letters, as it is for
-/// Bazel. The way on is that sha256 in the entry. To delete the entry is
+/// Bazel, and an empty one is none: rules_ruby gives Bazel no sha256 for
+/// it. The way on is that sha256 in the entry. To delete the entry is
 /// one too where the lock is `checked`: Bundler then holds the gem to that
-/// section. Without the section nothing would, so it is not offered.
+/// section. Without the section nothing would, so it is not offered. The
+/// warning words the way on for the first such call and names the others.
 pub fn stands_against(
-    files: &BTreeMap<String, String>,
+    held: &[Held],
     name: &str,
     version: &str,
     builds: &[(String, String)],
     lock: &str,
     (checked, pinned): (bool, bool),
 ) -> Option<String> {
-    let held: Vec<Held> = serde_json::from_str(files.get(KEY)?).ok()?;
-    for (call, sums) in &held {
-        let entry = |build: &String| format!("{name}-{build}");
+    let entry = |build: &String| format!("{name}-{build}");
+    let stale = |sums: &Option<BTreeMap<String, String>>| {
         let stale = builds.iter().filter(|(build, sum)| match sums {
             Some(sums) => {
-                let held = sums.get(&entry(build));
+                let held = sums.get(&entry(build)).filter(|held| !held.is_empty());
                 held.is_some_and(|held| !held.eq_ignore_ascii_case(sum))
             }
             None => true,
         });
-        let stale: Vec<_> = stale.map(|(build, sum)| (entry(build), sum)).collect();
-        if stale.is_empty() {
-            continue;
-        }
+        stale
+            .map(|(build, sum)| (entry(build), sum))
+            .collect::<Vec<_>>()
+    };
+    let standing = held.iter().map(|(call, sums)| (call, sums, stale(sums)));
+    let mut standing = standing.filter(|(.., stale)| !stale.is_empty());
+    if let Some((call, sums, stale)) = standing.next() {
+        let others: Vec<&str> = standing.map(|(call, ..)| call.as_str()).collect();
+        let also = match others.is_empty() {
+            true => String::new(),
+            false => format!(
+                ". The same holds for {}: change it there too",
+                others.join(" and ")
+            ),
+        };
         let listed = |each: &dyn Fn(&(String, &String)) -> String| {
             stale.iter().map(each).collect::<Vec<_>>().join(" and ")
         };
@@ -237,7 +284,7 @@ pub fn stands_against(
             "{name}@{version}: {call} {holds}, so the next Bazel build {would} fail on the \
              patched gem or keep the upstream one; {left} (nothing rewritten). To {to}, \
              {way}{delete} and re-run the hosted scan{undo}. A later `rollback` does not touch \
-             the call: put the old sha256 back in a changed entry then"
+             the call: put the old sha256 back in a changed entry then{also}"
         ));
     }
     None
@@ -377,11 +424,11 @@ mod tests {
         assert_eq!(held_in(&[("MODULE.bazel", &other)], "Gemfile.lock"), []);
     }
 
-    /// The `rb_bundle_fetch` calls of a `WORKSPACE` file count where no tag
-    /// of the module files may read the lock: beside one that does, the
-    /// file is a leftover, and the gem stays one that hosted mode patches.
+    /// The `rb_bundle_fetch` calls of a `WORKSPACE` file count unless a
+    /// tag of the module files names the lock: beside such a tag the file
+    /// is a leftover, and the gem stays one that hosted mode patches.
     #[test]
-    fn the_workspace_file_counts_where_no_tag_may_read_the_lock() {
+    fn the_workspace_file_counts_unless_a_tag_names_the_lock() {
         let rule = |file: &str| {
             vec![(
                 format!("`rb_bundle_fetch` at {file}:2"),
@@ -403,7 +450,8 @@ mod tests {
             (HEAD, true),
             (elsewhere.as_str(), true),
             (hub(LOCK).as_str(), false),
-            (hub("gemfile_lock = NAME").as_str(), false),
+            // A tag that only may read the lock is no sign of a leftover.
+            (hub("gemfile_lock = NAME").as_str(), true),
         ] {
             let files = [("MODULE.bazel", module), ("WORKSPACE", RULE)];
             let handed = if counts {
@@ -416,6 +464,58 @@ mod tests {
         // A name the file binds is not the rule.
         let bound = format!("rb_bundle_fetch = other\n{RULE}");
         assert_eq!(held_in(&[("WORKSPACE", &bound)], "Gemfile.lock"), []);
+    }
+
+    /// In a `WORKSPACE` file the name `workspace(name = ...)` gives is the
+    /// main repository; one that is not written out may be any name.
+    #[test]
+    fn a_workspace_file_names_the_main_repository_itself() {
+        let fetch = |label: &str| {
+            format!("rb_bundle_fetch(gemfile_lock = \"{label}\", gem_checksums = {{\"a-1.0\": \"11\"}})\n")
+        };
+        // What the file says before the call, the label, and whether the
+        // call may read the root's lock.
+        for (naming, label, counts) in [
+            ("workspace(name = \"shop\")\n", "@shop//:Gemfile.lock", true),
+            (
+                "workspace(name = \"shop\")\n",
+                "@other//:Gemfile.lock",
+                false,
+            ),
+            (
+                "workspace(name = \"shop\")\n",
+                "@shop//svc:Gemfile.lock",
+                false,
+            ),
+            ("workspace(name = NAME)\n", "@other//:Gemfile.lock", true),
+            (
+                "workspace(name = NAME)\n",
+                "@other//svc:Gemfile.lock",
+                false,
+            ),
+            ("", "@shop//:Gemfile.lock", false),
+            // A name the file binds is not the call that names it.
+            (
+                "workspace = other\nworkspace(name = \"shop\")\n",
+                "@shop//:Gemfile.lock",
+                false,
+            ),
+        ] {
+            let file = format!("{naming}{}", fetch(label));
+            let held = held_in(&[("WORKSPACE", &file)], "Gemfile.lock");
+            assert_eq!(held.len(), usize::from(counts), "{naming}{label}");
+        }
+        // A tag is not a call of that file: the module's own name alone is
+        // the main repository there.
+        let module = hub(&format!("gemfile_lock = \"@shop//:Gemfile.lock\", {SUMS}"));
+        let files = [
+            ("MODULE.bazel", module.as_str()),
+            (
+                "WORKSPACE",
+                "workspace(name = \"shop\")\nload(\"//:x.bzl\", \"x\")\n",
+            ),
+        ];
+        assert_eq!(held_in(&files, "Gemfile.lock"), []);
     }
 
     /// What the reader cannot read may hide a call. A call that is read
@@ -439,6 +539,7 @@ mod tests {
 
     #[test]
     fn a_gem_is_left_alone_while_a_call_holds_it_to_another_sha256() {
+        // The rewriter gets the calls as the engine handed them over.
         let files = |held: &[Held]| {
             let held = serde_json::to_string(held).unwrap();
             BTreeMap::from([(KEY.to_string(), held)])
@@ -446,7 +547,8 @@ mod tests {
         let said = |held: &[Held], builds: &[(&str, &str)], said: (bool, bool)| {
             let owned = |(build, sum): &(&str, &str)| (build.to_string(), sum.to_string());
             let builds: Vec<_> = builds.iter().map(owned).collect();
-            stands_against(&files(held), "a", "1.0", &builds, "Gemfile.lock", said)
+            let held = handed_over(&files(held));
+            stands_against(&held, "a", "1.0", &builds, "Gemfile.lock", said)
         };
         let against = |held: &[Held], builds: &[(&str, &str)], checked: bool| {
             said(held, builds, (checked, false))
@@ -465,17 +567,18 @@ mod tests {
                 ("a-1.1", "11"),
             ])],
             vec![call(&[("a-1.0", "99")])],
+            // An empty entry holds the gem to nothing.
+            vec![call(&[("a-1.0", "")])],
         ] {
             assert_eq!(against(&held, &ruby, true), None, "{held:?}");
         }
         let lower = [("1.0", "9a")];
         assert_eq!(against(&[call(&[("a-1.0", "9A")])], &lower, true), None);
         assert!(against(&[call(&[("a-1.0", "9B")])], &lower, true).is_some());
-        let none = (true, false);
-        assert_eq!(
-            stands_against(&BTreeMap::new(), "a", "1.0", &[], "Gemfile.lock", none),
-            None
-        );
+        // A project the engine handed nothing for, and what is no JSON.
+        assert_eq!(handed_over(&BTreeMap::new()), []);
+        let broken = BTreeMap::from([(KEY.to_string(), "[".to_string())]);
+        assert_eq!(handed_over(&broken), []);
 
         let stale = against(&[call(&[("a-1.0", "11")])], &ruby, true).unwrap();
         assert_eq!(
@@ -508,8 +611,9 @@ mod tests {
         assert_eq!(unchecked, stale.replace(", or delete the gem from the dict (Bundler holds it to the CHECKSUMS section of Gemfile.lock),", ""));
         assert!(!unchecked.contains("delete"), "{unchecked}");
 
-        // The first call that stands against it is named, with every build
-        // it holds to another sha256 and no other.
+        // The first call that stands against it is worded, with every
+        // build it holds to another sha256 and no other, and each further
+        // call that stands against it is named.
         let builds = [
             ("1.0", "99"),
             ("1.0-java", "88"),
@@ -531,6 +635,22 @@ mod tests {
         assert!(
             stale.contains(
                 "change `a-1.0-java` to `88` and `a-1.0-arm64-darwin` to `77` there and re-run"
+            ),
+            "{stale}"
+        );
+        assert!(stale.ends_with("in a changed entry then"), "{stale}");
+        let third = |at: &str, sums| (format!("`rb.bundle_fetch` at {at}"), sums);
+        let more = [
+            held[1].clone(),
+            third("a.MODULE.bazel:3", sums(&[("a-1.0", "99")])),
+            third("b.MODULE.bazel:3", None),
+            third("c.MODULE.bazel:3", sums(&[("a-1.0", "11")])),
+        ];
+        let stale = against(&more, &builds, false).unwrap();
+        assert!(
+            stale.ends_with(
+                "in a changed entry then. The same holds for `rb.bundle_fetch` at \
+                 b.MODULE.bazel:3 and `rb.bundle_fetch` at c.MODULE.bazel:3: change it there too"
             ),
             "{stale}"
         );

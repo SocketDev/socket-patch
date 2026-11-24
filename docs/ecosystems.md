@@ -3308,7 +3308,8 @@ that a call which may read the project's lock holds to another sha256 than the p
 has: no `source:` option, no change to the lock. The gem is `skipped` (`redirect_unconfirmed`),
 the run exits 0 as for any other gem hosted mode does not pin, the other gems of the run are
 rewritten, and one warning per gem (`redirect_bazel_gem_checksums_pinned`) names the call by
-its file and line, the entry, and the way on:
+its file and line, the entry, and the way on; where more than one call holds the gem, it
+names the others too:
 
 - **Change the entry** to the sha256 the warning gives, which is the one of the patched gem,
   and run the command again. It then rewrites the two files, and the next build takes the
@@ -3335,9 +3336,9 @@ What is read, and what is not:
 - **Nothing changes** for a project in no Bazel workspace (the rule is under
   [Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore)), for one whose lock no
   call may read, beside a call without `gem_checksums`, and for a gem that the dict does not
-  name or holds to the sha256 of the patched gem already, in upper or lower case. The
-  Bundler pair is the one hosted mode rewrites: `gems.locked` where the project has a
-  `gems.rb`.
+  name or holds to the sha256 of the patched gem already, in upper or lower case, or to an
+  empty string, for which rules_ruby gives Bazel no sha256. The Bundler pair is the one
+  hosted mode rewrites: `gems.locked` where the project has a `gems.rb`.
 - **A call that is not written out stands against the gem all the same**, because a build
   that fails outranks a patch that is missed and explained. That is a call in a comprehension
   or a condition, which may run; one whose `gemfile_lock` is not a label in a plain string,
@@ -3353,24 +3354,32 @@ What is read, and what is not:
   it does without Bazel. Withholding there instead would take hosted mode from every gem of
   such a workspace, also where no rules_ruby hub reads the lock.
 - **`rb_bundle_fetch` in a `WORKSPACE` file** (`WORKSPACE.bzlmod`, `WORKSPACE.bazel`) counts
-  like the tag where no `ruby.bundle_fetch` of the module files may read the lock. Bazel 7
-  reads that file, Bazel 8 when it is told to and Bazel 9 never, and socket-patch does not know
-  which Bazel runs, so the call counts on each. Beside a tag that may read the lock the file
-  is taken for a leftover of a migration and not looked at. No test builds such a hub; the
-  failing build was measured by hand on Bazel 7.7.2 with rules_ruby 0.21.1.
+  like the tag unless a `ruby.bundle_fetch` of the module files names the lock in a plain
+  string. Bazel 7 reads that file, Bazel 8 when it is told to and Bazel 9 never, and
+  socket-patch does not know which Bazel runs, so the call counts on each. In that file the
+  name that `workspace(name = "shop")` gives is the main repository, so
+  `@shop//:Gemfile.lock` is the root's lock, and under a name that is not written out any
+  repository may be. Beside a tag that names the lock the file is taken for a leftover of a
+  migration and not looked at. No test builds such a hub; the failing build was measured by
+  hand on Bazel 7.7.2 with rules_ruby 0.21.1.
 - **Not seen:** a call of another Bazel module; a macro of a `.bzl` file that makes the call;
-  `rb_bundle_fetch` loaded under another name; a label that spells the lock's name in another
-  case; and what the command line or an rc file tells Bazel. Hosted mode writes in each as it
-  does without Bazel.
-- **Not covered:** a project below the root of a workspace that is in no git checkout,
-  because a workspace is looked for only up to the root of the project's checkout. And the
-  in-memory engine (a Socket-opened pull request) reads the calls only where the project's
-  directory is the Bazel root: for a project below it, it is not given the files of the
-  workspace.
+  `rb_bundle_fetch` loaded under another name; an `rb_bundle_fetch` of the `WORKSPACE` file
+  beside a tag that names the lock, where Bazel 7 reads both and your targets use the hub of
+  that file; a label that spells the lock's name in another case; and what the command line
+  or an rc file tells Bazel. Hosted mode writes in each as it does without Bazel.
+- **Not covered:** a project below the root of a workspace that is in no git checkout, or
+  that is a git checkout of its own (a submodule), because a workspace is looked for only up
+  to the root of the project's checkout; and a project whose directory the call names
+  through a symbolic link, because the lock is compared by the path the directory really
+  has. And the in-memory engine (a Socket-opened pull request) reads the calls only where
+  the project's directory is the Bazel root, and only from workspace files that are files of
+  the repository themselves: for a project below the root it is not given the files of the
+  workspace, and a `MODULE.bazel` or `WORKSPACE` that is a symbolic link is not read.
 - A pin that an earlier release wrote beside such an entry stays in the two files, and the
   build keeps failing on it, or keeps the upstream gem. The scan now names the entry in a
   warning that says the pin is left as it is, and still counts the gem as hosted, because
-  the pin is in the lock. Change the entry and run the scan again, or take the pin out with
+  the pin is in the lock; `--vex` attests it for the same reason, which is not true of that
+  build. Change the entry and run the scan again, or take the pin out with
   `socket-patch rollback`, as the warning says.
 
 ## Bazel workspaces: VEX

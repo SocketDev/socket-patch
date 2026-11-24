@@ -8851,6 +8851,9 @@ fn rewrite_gem(
     // Which lock layout the project's bundler writes and accepts.
     let layout = files.get(lock_name).and_then(|lk| lock_layout(lk));
 
+    // What the calls of a rules_ruby hub hold the gems of this lock to,
+    // read once for every gem (`bazel::ruby`).
+    let held = crate::bazel::ruby::handed_over(files);
     for dep in &gem {
         let Some(ov) = registry_override_of_kind(dep, "rubygems-compact-index") else {
             result.warnings.push(RewriteWarning {
@@ -9074,8 +9077,8 @@ fn rewrite_gem(
                 // pin that an earlier run wrote stays as it is.
                 let said = (GEM_CHECKSUMS_HEADER_RE.is_match(lk), plan.prior);
                 let (name, version) = (&dep.name, &dep.version);
-                let held = crate::bazel::ruby::stands_against;
-                if let Some(detail) = held(files, name, version, &checksums, lock_name, said) {
+                let against = crate::bazel::ruby::stands_against;
+                if let Some(detail) = against(&held, name, version, &checksums, lock_name, said) {
                     let code = crate::bazel::ruby::PINNED.into();
                     result.warnings.push(RewriteWarning { code, detail });
                     continue;

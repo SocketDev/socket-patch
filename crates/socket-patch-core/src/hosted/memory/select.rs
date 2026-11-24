@@ -151,8 +151,13 @@ fn is_rush_subspace_file(rel: &str, basename: &str) -> bool {
 
 /// What `rel` (relative to a root whose files are `root_files`) is needed
 /// for. `user_patches` says whether npm is selected, so the files only the
-/// npm user-patch walk reads ([`user_patch_need`]) are fetched at all.
-fn classify(rel: &str, root_files: &BTreeSet<&str>, user_patches: bool) -> Option<Need> {
+/// npm user-patch walk reads ([`user_patch_need`]) are fetched at all, and
+/// `gems` whether gem is, for the files only the gem rewriter is handed.
+fn classify(
+    rel: &str,
+    root_files: &BTreeSet<&str>,
+    (user_patches, gems): (bool, bool),
+) -> Option<Need> {
     if rel == BUN_LOCKB {
         return Some(Need::Binary);
     }
@@ -165,8 +170,9 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>, user_patches: bool) -> Optio
     // Beside a gem lock, the files of a Bazel workspace at this root: they
     // say whether a rules_ruby hub holds a gem of the lock to a sha256 of
     // its own (`bazel::ruby`).
-    let gems = ["Gemfile.lock", "gems.locked"];
-    if gems.iter().any(|lock| root_files.contains(lock))
+    let locks = ["Gemfile.lock", "gems.locked"];
+    if gems
+        && locks.iter().any(|lock| root_files.contains(lock))
         && crate::bazel::ruby::is_workspace_file(rel)
     {
         return Some(Need::Text);
@@ -480,14 +486,17 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
     // The user-patch walk only protects npm packages: without npm, its
     // nested manifests and `.patch` files would only count against the
     // session's file and byte limits.
-    let user_patches = options
-        .ecosystems
-        .as_deref()
-        .is_none_or(|list| list.iter().any(|e| e == "npm"));
+    let selected = |ecosystem: &str| {
+        let list = options.ecosystems.as_deref();
+        list.is_none_or(|list| list.iter().any(|e| e == ecosystem))
+    };
+    // The same for the files of a Bazel workspace, which only the gem
+    // rewriter is handed.
+    let wanted = (selected("npm"), selected("gem"));
     let mut needs: BTreeMap<String, Need> = BTreeMap::new();
     for (root, files) in &per_root {
         for rel in files {
-            let Some(need) = classify(rel, files, user_patches) else {
+            let Some(need) = classify(rel, files, wanted) else {
                 continue;
             };
             let full = join_root(root, rel);
@@ -888,6 +897,18 @@ mod tests {
             wanted.sort_unstable();
             assert_eq!(s.fetch_text, wanted, "{lock}");
         }
+        // Nor does a run that leaves gem out, whose rewriter is not asked.
+        let both = files.clone().chain(["Gemfile.lock", "package-lock.json"]);
+        let entries: Vec<_> = both.map(blob).collect();
+        let only = |ecosystem: &str| SelectOptions {
+            ecosystems: Some(vec![ecosystem.into()]),
+            ..SelectOptions::default()
+        };
+        let fetched = |ecosystem: &str| {
+            let fetched = select_paths(&entries, &only(ecosystem)).fetch_text;
+            fetched.iter().any(|path| path == "MODULE.bazel")
+        };
+        assert!(fetched("gem") && !fetched("npm"));
         // A gem root below the Bazel root has no file of the workspace.
         let entries: Vec<_> = ["MODULE.bazel", "svc/Gemfile.lock"].map(blob).to_vec();
         let s = select_paths(&entries, &SelectOptions::default());
