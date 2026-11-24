@@ -12,6 +12,7 @@ pub mod built;
 pub mod ignore;
 pub mod maven;
 pub mod rc;
+pub mod ruby;
 pub mod starlark;
 pub mod workspace;
 

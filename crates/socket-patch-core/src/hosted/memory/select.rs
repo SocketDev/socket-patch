@@ -162,6 +162,15 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>, user_patches: bool) -> Optio
     if PNP_MARKERS.contains(&rel) || rel == "rush.json" {
         return Some(Need::Present);
     }
+    // Beside a gem lock, the files of a Bazel workspace at this root: they
+    // say whether a rules_ruby hub holds a gem of the lock to a sha256 of
+    // its own (`bazel::ruby`).
+    let gems = ["Gemfile.lock", "gems.locked"];
+    if gems.iter().any(|lock| root_files.contains(lock))
+        && crate::bazel::ruby::is_workspace_file(rel)
+    {
+        return Some(Need::Text);
+    }
     if !rel.contains('/') {
         if is_python_lock_name(rel) {
             return Some(Need::Text);
@@ -597,6 +606,7 @@ pub fn candidate_files() -> Vec<String> {
         "pylock.*.toml",
         "pnpm-lock.*.yaml (presence only)",
         "**/Cargo.toml (Cargo workspaces)",
+        "MODULE.bazel, **/*.MODULE.bazel and WORKSPACE files (beside a gem lock)",
     ] {
         out.insert(pattern.to_string());
     }
@@ -848,6 +858,43 @@ mod tests {
         assert_eq!(safe_repo_path("a/b.json").as_deref(), Some("a/b.json"));
         assert_eq!(safe_root_path("").as_deref(), Some(""));
         assert_eq!(safe_root_path("a/").as_deref(), Some("a"));
+    }
+
+    /// Beside a gem lock, the files of a Bazel workspace at that root are
+    /// fetched, with the files a `MODULE.bazel` can include: the engine
+    /// reads which sha256 a rules_ruby hub holds a gem to. No other root
+    /// fetches them.
+    #[test]
+    fn a_gem_root_fetches_the_files_of_its_bazel_workspace() {
+        let bazel = [
+            "MODULE.bazel",
+            "WORKSPACE",
+            "WORKSPACE.bazel",
+            "WORKSPACE.bzlmod",
+            "tools/gems.MODULE.bazel",
+        ];
+        let others = ["MODULE.bazel.lock", "BUILD.bazel", "tools/MODULE.bazel"];
+        let files = bazel.iter().chain(&others).copied();
+        for (lock, fetched) in [
+            ("Gemfile.lock", true),
+            ("gems.locked", true),
+            ("package-lock.json", false),
+        ] {
+            let entries: Vec<_> = files.clone().chain([lock]).map(blob).collect();
+            let s = select_paths(&entries, &SelectOptions::default());
+            assert_eq!(s.roots, vec![""], "{lock}");
+            let mut wanted: Vec<&str> = if fetched { bazel.to_vec() } else { Vec::new() };
+            wanted.push(lock);
+            wanted.sort_unstable();
+            assert_eq!(s.fetch_text, wanted, "{lock}");
+        }
+        // A gem root below the Bazel root has no file of the workspace.
+        let entries: Vec<_> = ["MODULE.bazel", "svc/Gemfile.lock"].map(blob).to_vec();
+        let s = select_paths(&entries, &SelectOptions::default());
+        assert_eq!(
+            (s.roots, s.fetch_text),
+            (vec!["svc".into()], vec!["svc/Gemfile.lock".into()])
+        );
     }
 
     #[test]

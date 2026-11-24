@@ -12,9 +12,11 @@ name: Bazel patch compatibility (RubyGems)
 # downloads no JDK and needs none on the runner: rules_ruby's rules name a
 # Java runtime toolchain that only JRuby uses, and the fixture registers
 # one with nothing behind it. A gem under test never comes from the
-# repository cache: the fixture names no `gem_checksums`, so rules_ruby
-# gives Bazel no checksum for a gem, and Bazel looks a file up in that
-# cache by its checksum only.
+# repository cache of an earlier run: the fixture names no `gem_checksums`,
+# so rules_ruby gives Bazel no checksum for a gem, and Bazel looks a file
+# up in that cache by its checksum only. The flow that writes a
+# `gem_checksums` into its workspace copy names gems it built for its own
+# run, which no earlier run has.
 #
 # Not required for merge: no `merge_group` trigger, and no job here is a
 # `needs` of ci.yml's `ci-ok`.
