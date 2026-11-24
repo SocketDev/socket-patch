@@ -546,8 +546,11 @@ async fn human_rerun_says_already_redirected_and_first_run_prints_next_steps() {
 /// the advisory that patch fixes and counts the two it leaves unpatched (a
 /// CVE, and an advisory that has only a GHSA id), which `--verbose` names;
 /// the closing lines total them, in the future tense on a dry run, and
-/// again on a re-run that rewrites nothing. `--json` carries the same facts
-/// on the package's `packages[]` entry.
+/// again on a re-run that rewrites nothing. The account can download all
+/// three patches and none fixes the three advisories together, so the two
+/// left are waiting on the merged patch, and the run says it is not ready
+/// yet. `--json` carries the same facts on the package's `packages[]`
+/// entry.
 #[tokio::test]
 async fn human_names_the_fixed_advisory_and_the_ones_left_unpatched() {
     const UUID_B: &str = "33333333-3333-4333-8333-333333333333";
@@ -555,7 +558,9 @@ async fn human_names_the_fixed_advisory_and_the_ones_left_unpatched() {
     const LINE: &str = "  CRITICAL  covgap-hosted@1.0.0  CVE-2026-0001  2 unpatched\n";
     const NOTE: &str = "\nPatched 1 package, fixing 1 vulnerability (1 critical).\n\
         Saved about 2 hours of engineering time (1 package upgrade at ~2 hours).\n\
-        2 vulnerabilities left to patch (67%): 2 need a package upgrade.\n";
+        2 vulnerabilities left to patch (67%): 2 are waiting on a merged patch.\n\
+        Merged patch not ready yet for 1 package: Socket is still processing it. Run \
+        `socket-patch scan` again later to apply it.\n";
 
     let server = MockServer::start().await;
     mock_discovery_patches(
@@ -583,7 +588,10 @@ async fn human_names_the_fixed_advisory_and_the_ones_left_unpatched() {
              was changed).\n{LINE}\n\
              Would patch 1 package, fixing 1 vulnerability (1 critical).\n\
              Would save about 2 hours of engineering time (1 package upgrade at ~2 hours).\n\
-             2 vulnerabilities would be left to patch (67%): 2 need a package upgrade.\n"
+             2 vulnerabilities would be left to patch (67%): 2 are waiting on a merged \
+             patch.\n\
+             Merged patch not ready yet for 1 package: Socket is still processing it. Run \
+             `socket-patch scan` again later to apply it.\n"
         ),
         "stderr=\n{stderr}"
     );
@@ -592,7 +600,7 @@ async fn human_names_the_fixed_advisory_and_the_ones_left_unpatched() {
     assert_eq!(code, 0, "stderr=\n{stderr}");
     assert!(
         verbose.contains(&format!(
-            "{LINE}      still unpatched: CVE-2026-0002, GHSA-cccc-cccc-cccc\n"
+            "{LINE}      waiting on a merged patch: CVE-2026-0002, GHSA-cccc-cccc-cccc\n"
         )),
         "stdout=\n{verbose}"
     );
@@ -614,6 +622,10 @@ async fn human_names_the_fixed_advisory_and_the_ones_left_unpatched() {
             "GHSA-cccc-cccc-cccc"
         ]),
         "{doc:#}"
+    );
+    assert_eq!(
+        package["mergePendingIds"], package["unfixedIds"],
+        "both wait on the merged patch: {doc:#}"
     );
     assert_eq!(
         package["patches"].as_array().map(Vec::len),

@@ -83,25 +83,44 @@ publication date. Reruns upgrade existing patches only when a better-ranked patc
 is available. See the [ranking contract](../crates/socket-patch-cli/CLI_CONTRACT.md#which-patch-gets-selected)
 for tie-breaking and upgrade rules.
 
-One patch is applied per package version. When a package has several patches for
-different advisories, `scan` applies the top-ranked one. Each patched package gets
-one row (its severity, what the patch fixes, and how many advisories stay unpatched),
-and the run closes with its totals:
+One patch is applied per package version. When a package version has several
+advisories, Socket publishes a merged patch that fixes them together: one for its
+critical advisories, which is free, and one for all of them, which needs a paid plan
+(see [free and paid patches](configuration.md#free-and-paid-patches)). A merged patch
+is published after the single patches it combines. Until it is ready, `scan` applies
+the top-ranked single patch. Each patched package gets one row (its severity, what
+the patch fixes, and how many advisories stay unpatched), and the run closes with its
+totals:
 
 ```text
 Switched 1 package to hosted patches; rewrote 1 file.
-  HIGH  urllib3@1.26.18  CVE-2025-66418  2 unpatched
+  CRITICAL  crypto-js@3.1.2  CVE-2026-71851  1 unpatched
 
-Patched 1 package, fixing 1 vulnerability (1 high).
+Patched 1 package, fixing 1 vulnerability (1 critical).
 Saved about 2 hours of engineering time (1 package upgrade at ~2 hours).
-2 vulnerabilities left to patch (67%): 2 need a package upgrade.
+1 vulnerability left to patch (50%): 1 is waiting on a merged patch.
+Merged patch not ready yet for 1 package: Socket is still processing it. Run `socket-patch scan` again later to apply it.
 ```
 
-`--verbose` names the unpatched advisories under the row, and `scan --json` lists the
-same ids as `packages[].fixedIds` and `packages[].unfixedIds`. With several project
-directories the totals count every one (`Patched 22 packages in 3 projects, ...`): a
-package patched in three projects counts three times. "Left to patch" counts only
-advisories Socket has a patch for; it says nothing about vulnerabilities with no patch.
+The last line of the totals says why each advisory is left:
+
+| Reason | What it means | What to do |
+| --- | --- | --- |
+| `waiting on a merged patch` | Another patch you can download fixes it, and Socket is still processing the merged patch that fixes it together with the one applied | Run `socket-patch scan` again later; a rerun moves the package to the merged patch |
+| `need a paid Socket plan` | Only a paid patch fixes it | Use a token for an organization on a paid Socket plan |
+| `need a package upgrade` | A patch you can download fixes it, but the patch selected for the package leaves it out, for example under a [selection filter](selection-filter.md) | Upgrade the package |
+| `in packages this run did not patch` | The run did not patch the package: a skip, a failure, a rollout limit or a policy | Read the run's output for that package |
+
+`get` reports a merged patch that is not ready the same way, under the patch it
+selected.
+
+`--verbose` names the unpatched advisories under the row, grouped by reason, and
+`scan --json` lists the same ids as `packages[].fixedIds`, `packages[].unfixedIds`
+and `packages[].mergePendingIds` (the unfixed ids waiting on a merged patch). With
+several project directories the totals count every one (`Patched 22 packages in 3
+projects, ...`): a package patched in three projects counts three times. "Left to
+patch" counts only advisories Socket has a patch for; it says nothing about
+vulnerabilities with no patch.
 
 The `Saved about N hours` line is an estimate of the upgrade work the patches stood
 in for: two hours for each patched package in each project directory. The two hours
