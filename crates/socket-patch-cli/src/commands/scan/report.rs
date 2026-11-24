@@ -565,15 +565,17 @@ fn meter(fixed: usize, left: usize, style: Style) -> Option<String> {
 /// Patched 22 packages in 3 projects, fixing 39 vulnerabilities (5 critical, 21 high) in 4.2s.
 /// Verified: 24 of 24 exploits blocked, 1208 of 1208 package tests passing.
 /// Saved about 44 hours of engineering time (22 package upgrades at ~2 hours each).
-/// 18 vulnerabilities left to patch (32%): 6 are waiting on a merged patch, 8 need a package upgrade, 4 are in packages this run did not patch.
-/// Merged patches not ready yet for 4 packages: Socket is still processing them. Run `socket-patch scan` again later to apply them.
+/// 18 vulnerabilities left to patch (32%): 6 await a merged patch, 8 need a package upgrade, 4 are in packages this run did not patch.
+/// 4 merged patches are not ready yet: Socket is still processing them.
+/// Run `socket-patch scan` again later to apply them.
 /// Reachable: 9 fixed, 2 left to patch (18%).
 /// ```
 ///
 /// An advisory left on a patched package is waiting on a merged patch when
 /// another patch the account can download fixes it: the patch that fixes
-/// it together with the one applied is not published yet, and the line
-/// under the count says so.
+/// it together with the one applied is not published yet, and the two
+/// lines under the count say so (how many merged patches, one per patched
+/// package that waits, and what to do).
 ///
 /// Where the terminal shows glyphs, the lines of what was done open with a
 /// check mark (the others are indented to match) and a meter closes them.
@@ -706,8 +708,8 @@ pub(crate) fn closing(
         let mut why = Vec::new();
         if counts.left_merge > 0 {
             why.push(format!(
-                "{} waiting on a merged patch",
-                plural(counts.left_merge, "is", "are")
+                "{} a merged patch",
+                plural(counts.left_merge, "awaits", "await")
             ));
         }
         if counts.left_upgrade > 0 {
@@ -748,17 +750,27 @@ pub(crate) fn closing(
             why.join(", ")
         )));
         // The advisories waiting on a merged patch are not the user's to
-        // fix: the patch is on its way, and a later scan moves to it.
+        // fix: the patch is on its way, and a later scan moves to it. Two
+        // short lines, so that neither wraps an 80-column terminal.
         if counts.left_merge > 0 {
-            lines.push(plain(match counts.merge_packages {
-                1 => "Merged patch not ready yet for 1 package: Socket is still processing it. \
-                      Run `socket-patch scan` again later to apply it."
-                    .to_string(),
-                packages => format!(
-                    "Merged patches not ready yet for {packages} packages: Socket is still \
-                     processing them. Run `socket-patch scan` again later to apply them."
+            let one = counts.merge_packages == 1;
+            lines.push(plain(format!(
+                "{} {} not ready yet: Socket is still processing {}.",
+                ui::paint(&counts.merge_packages.to_string(), "1;33", color),
+                if one {
+                    "merged patch is"
+                } else {
+                    "merged patches are"
+                },
+                if one { "it" } else { "them" },
+            )));
+            lines.push(plain(ui::dim(
+                &format!(
+                    "Run `socket-patch scan` again later to apply {}.",
+                    if one { "it" } else { "them" }
                 ),
-            }));
+                color,
+            )));
         }
     }
     if reachability {
@@ -1238,11 +1250,11 @@ mod tests {
                 severity: Some("CRITICAL".to_string()),
                 fixes: strs(&[CVE_1, CVE_2]),
                 unpatched: strs(&[CVE_3, CVE_4]),
-                // The other free patch fixes CVE_3, and no free patch
-                // fixes it together with the selection. Only a paid
-                // patch fixes CVE_4.
-                merge_pending: strs(&[CVE_3]),
-                needs_paid: strs(&[CVE_4]),
+                // The other free patch fixes CVE_3 and is not critical, so
+                // the free tier's merged patch leaves it out. Only a paid
+                // patch fixes CVE_4. Both need the paid plan.
+                merge_pending: Vec::new(),
+                needs_paid: strs(&[CVE_3, CVE_4]),
                 fixed_critical: 1,
                 fixed_high: 1,
                 fixed_reachable: 0,
@@ -1274,11 +1286,9 @@ mod tests {
                 fixed: 2,
                 fixed_critical: 1,
                 fixed_high: 1,
-                left_merge: 1,
-                merge_packages: 1,
-                // CVE_4 on the patched package, and the advisory of the
+                // Two on the patched package, and the advisory of the
                 // package whose only patch is paid.
-                left_paid: 2,
+                left_paid: 3,
                 ..Counts::default()
             }
         );
@@ -1290,8 +1300,13 @@ mod tests {
         assert!(paid[0].needs_paid.is_empty());
         let counts = Counts::of(&paid, &landed(&["u1"]));
         assert_eq!(
-            (counts.left_merge, counts.left_upgrade, counts.left_paid),
-            (2, 0, 0)
+            (
+                counts.left_merge,
+                counts.merge_packages,
+                counts.left_upgrade,
+                counts.left_paid
+            ),
+            (2, 1, 0, 0)
         );
         // A selected patch that did not land fixes nothing: the package
         // counts whole as left, in a package the run did not patch.
@@ -1698,9 +1713,9 @@ mod tests {
         assert_eq!(
             closing(&one, 1, false, false, None, PLAIN)[2..],
             [
-                "1 vulnerability left to patch (50%): 1 is waiting on a merged patch.",
-                "Merged patch not ready yet for 1 package: Socket is still processing it. Run \
-                 `socket-patch scan` again later to apply it.",
+                "1 vulnerability left to patch (50%): 1 awaits a merged patch.",
+                "1 merged patch is not ready yet: Socket is still processing it.",
+                "Run `socket-patch scan` again later to apply it.",
             ]
         );
         let many = Counts {
@@ -1711,11 +1726,11 @@ mod tests {
         assert_eq!(
             closing(&many, 3, true, false, None, PLAIN)[2..],
             [
-                "18 vulnerabilities would be left to patch (32%): 6 are waiting on a merged \
-                 patch, 8 need a package upgrade, 3 need a paid Socket plan, 1 is in packages a \
-                 run would not patch.",
-                "Merged patches not ready yet for 4 packages: Socket is still processing them. \
-                 Run `socket-patch scan` again later to apply them.",
+                "18 vulnerabilities would be left to patch (32%): 6 await a merged patch, 8 need a \
+                 package upgrade, 3 need a paid Socket plan, 1 is in packages a run would not \
+                 patch.",
+                "4 merged patches are not ready yet: Socket is still processing them.",
+                "Run `socket-patch scan` again later to apply them.",
             ]
         );
     }

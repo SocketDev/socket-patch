@@ -98,23 +98,25 @@ Switched 1 package to hosted patches; rewrote 1 file.
 
 Patched 1 package, fixing 1 vulnerability (1 critical).
 Saved about 2 hours of engineering time (1 package upgrade at ~2 hours).
-1 vulnerability left to patch (50%): 1 is waiting on a merged patch.
-Merged patch not ready yet for 1 package: Socket is still processing it. Run `socket-patch scan` again later to apply it.
+1 vulnerability left to patch (50%): 1 awaits a merged patch.
+1 merged patch is not ready yet: Socket is still processing it.
+Run `socket-patch scan` again later to apply it.
 ```
 
-The last line of the totals says why each advisory is left:
+The `left to patch` line says why each advisory is left:
 
 | Reason | What it means | What to do |
 | --- | --- | --- |
-| `waiting on a merged patch` | Another patch you can download fixes it, and Socket is still processing the merged patch that fixes it together with the one applied | Run `socket-patch scan` again later; a rerun moves the package to the merged patch |
-| `need a paid Socket plan` | Only a paid patch fixes it | Use a token for an organization on a paid Socket plan |
+| `await a merged patch` | Another patch you can download fixes it, and Socket is still processing the merged patch that fixes it together with the one applied | Run `socket-patch scan` again later; a rerun moves the package to the merged patch |
+| `need a paid Socket plan` | Only the paid tier fixes it: a paid patch, or the paid tier's merged patch when the fix is a free patch for an advisory that is not critical | Use a token for an organization on a paid Socket plan |
 | `need a package upgrade` | A patch you can download fixes it, but the patch selected for the package leaves it out, for example under a [selection filter](selection-filter.md) | Upgrade the package |
 | `in packages this run did not patch` | The run did not patch the package: a skip, a failure, a rollout limit or a policy | Read the run's output for that package |
 
 `get` reports a merged patch that is not ready the same way, under the patch it
-selected.
+selected, and names the package and the advisories that stay unpatched until then.
 
-`--verbose` names the unpatched advisories under the row, grouped by reason, and
+`--verbose` names the unpatched advisories under the row, grouped by reason
+(`waiting on a merged patch: <ids>`, `needs a paid Socket plan: <ids>`), and
 `scan --json` lists the same ids as `packages[].fixedIds`, `packages[].unfixedIds`
 and `packages[].mergePendingIds` (the unfixed ids waiting on a merged patch). With
 several project directories the totals count every one (`Patched 22 packages in 3
