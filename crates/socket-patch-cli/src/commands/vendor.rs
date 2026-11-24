@@ -1987,6 +1987,57 @@ impl EjectSnapshot {
     }
 }
 
+/// An eject refused whole, with nothing changed: each pin of `refused` is
+/// a `failed` event with its code and its reason, the envelope's error is
+/// `eject_refused`, and the exit code is 1.
+async fn eject_refused(
+    common: &GlobalArgs,
+    run_warnings: Vec<(String, String)>,
+    client: &socket_patch_core::api::client::ApiClient,
+    telemetry: &TelemetryAuth,
+    eject_uuids: &HashMap<String, String>,
+    refused: &[(String, &'static str, String)],
+) -> i32 {
+    let mut env = Envelope::new(Command::Vendor);
+    env.warnings.extend(
+        run_warnings
+            .into_iter()
+            .map(|(code, detail)| RunWarning { code, detail }),
+    );
+    env.dry_run = common.dry_run;
+    if common.json {
+        env.warnings
+            .extend(crate::commands::vex_sources::api_auth_fallback_warning(
+                client,
+            ));
+    }
+    for (purl, code, why) in refused {
+        report_vendor_failure(common, purl, why);
+        env.record(
+            PatchEvent::new(PatchAction::Failed, purl.clone()).with_error(*code, why.clone()),
+        );
+    }
+    env.mark_error(EnvelopeError::new(
+        "eject_refused",
+        "not every hosted pin can be restored to its upstream registry entry and vendored; \
+         nothing was changed",
+    ));
+    if common.json {
+        println!("{}", env.to_pretty_json());
+    }
+    track_outcomes_for_vendor(
+        "vendor",
+        true,
+        &env,
+        common.dry_run,
+        eject_uuids,
+        &[],
+        telemetry,
+    )
+    .await;
+    1
+}
+
 /// Standalone `vendor` with hosted pins in scope: EJECT. The patch set comes
 /// only from the lockfile pins (purl + the uuid in each hosted URL), even
 /// when `.socket/manifest.json` exists: manifest-only patches are not
@@ -2029,6 +2080,30 @@ async fn run_eject(
         get_api_client_with_overrides(common.api_client_overrides()).await;
     let telemetry = TelemetryAuth::for_client(&client);
     let service = common.vendor_service_config(Some(client.clone()), use_public_proxy);
+    // The refusals that rest on the Bazel workspace need no record and no
+    // registry, so they are asked before either is fetched: the pins stay
+    // hosted whatever the network says.
+    let pairs: Vec<(&str, &str)> = pins
+        .iter()
+        .map(|pin| (pin.purl.as_str(), pin.uuid.as_str()))
+        .collect();
+    let declined: Vec<(String, &'static str, String)> =
+        vendor::refusals::bazel_workspace_refusals(&common.cwd, &pairs)
+            .await
+            .into_iter()
+            .map(|(purl, code, detail)| (purl.to_string(), code, format!("kept hosted: {detail}")))
+            .collect();
+    if !declined.is_empty() {
+        return eject_refused(
+            common,
+            run_warnings,
+            &client,
+            &telemetry,
+            &eject_uuids,
+            &declined,
+        )
+        .await;
+    }
     if !common.json && !common.silent {
         println!(
             "{} {} into .socket/vendor/...",
@@ -2196,44 +2271,15 @@ async fn run_eject(
         }
     }
     if !refused.is_empty() {
-        let mut env = Envelope::new(Command::Vendor);
-        env.warnings.extend(
-            run_warnings
-                .into_iter()
-                .map(|(code, detail)| RunWarning { code, detail }),
-        );
-        env.dry_run = common.dry_run;
-        if common.json {
-            env.warnings
-                .extend(crate::commands::vex_sources::api_auth_fallback_warning(
-                    &client,
-                ));
-        }
-        for (purl, code, why) in &refused {
-            report_vendor_failure(common, purl, why);
-            env.record(
-                PatchEvent::new(PatchAction::Failed, purl.clone()).with_error(*code, why.clone()),
-            );
-        }
-        env.mark_error(EnvelopeError::new(
-            "eject_refused",
-            "not every hosted pin can be restored to its upstream registry entry and vendored; \
-             nothing was changed",
-        ));
-        if common.json {
-            println!("{}", env.to_pretty_json());
-        }
-        track_outcomes_for_vendor(
-            "vendor",
-            true,
-            &env,
-            common.dry_run,
-            &eject_uuids,
-            &[],
+        return eject_refused(
+            common,
+            run_warnings,
+            &client,
             &telemetry,
+            &eject_uuids,
+            &refused,
         )
         .await;
-        return 1;
     }
 
     // A dry run stops at the verified plan: restoring the live lock to

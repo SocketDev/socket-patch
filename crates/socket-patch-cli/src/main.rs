@@ -167,6 +167,7 @@ async fn run(own_args: Vec<OsString>, hot_patch_command: Option<hot_patch::Start
         Commands::Vex(args) => commands::vex::run(args).await,
         Commands::Vendor(args) => commands::vendor::run(args).await,
         Commands::Rollback(args) => commands::rollback::run(args).await,
+        Commands::Report(args) => commands::report::run(args).await,
         Commands::Get(args) => commands::get::run(args).await,
         Commands::Show(args) => commands::show::run(args).await,
         Commands::List(args) => commands::list::run(args).await,

@@ -103,6 +103,7 @@ pub const CHILD_ENV_SCRUB: &[&str] = &[
     "SOCKET_NO_GEM_NATIVE_REBUILD",
     "SOCKET_NO_GEM_INSTALL_REFRESH",
     "SOCKET_GEM_REFRESH_SHARED",
+    "SOCKET_ALLOW_VENDORED_IN_BAZEL",
     "SOCKET_PATCH_VERSION",
     "SOCKET_SAVE_ONLY",
     "SOCKET_ALL_RELEASES",
@@ -423,8 +424,13 @@ pub fn kill_builds_on_interrupt() {
 
 /// One pass of [`kill_builds_on_interrupt`] over the process group `pgid`:
 /// SIGKILL it (once: `killed` remembers the group), reap its leader when
-/// it has exited, and say whether no process of the group is left.
-/// Async-signal-safe.
+/// it has exited, and say whether no process of the group is left and the
+/// leader is reaped. Async-signal-safe.
+///
+/// The leader is this process's own child, so a wait for it is the one
+/// certain sign that it is dead. The group probe alone is not: macOS stops
+/// counting an exiting process in its group before its parent can wait
+/// for it, so the probe can find nobody while the leader is still going.
 #[cfg(unix)]
 fn end_build_group(pgid: i32, killed: &mut i32) -> bool {
     // SAFETY: plain syscalls on a process group this process created and
@@ -434,15 +440,17 @@ fn end_build_group(pgid: i32, killed: &mut i32) -> bool {
             libc::kill(-pgid, libc::SIGKILL);
             *killed = pgid;
         }
+        // `waitpid(WNOHANG)` answers 0 only for a child that has not
+        // exited yet. Any other answer means the leader is reaped: by
+        // this call, or (ECHILD) by an earlier pass or the build's thread.
         let mut status = 0;
-        libc::waitpid(pgid, &mut status, libc::WNOHANG);
+        let mut reaped = libc::waitpid(pgid, &mut status, libc::WNOHANG) != 0;
         let gone = libc::kill(-pgid, 0) != 0;
-        if gone {
-            // Where a zombie no longer counts as a member of its group
-            // (macOS), the leader may have died since the wait above.
-            libc::waitpid(pgid, &mut status, libc::WNOHANG);
+        if gone && !reaped {
+            // The leader may have died since the wait above.
+            reaped = libc::waitpid(pgid, &mut status, libc::WNOHANG) != 0;
         }
-        gone
+        gone && reaped
     }
 }
 
@@ -1228,7 +1236,44 @@ pub(crate) mod tests {
         assert!(gone, "the build's compiler {compiler} is still there");
         assert!(
             child.try_wait().is_err(),
-            "the pass reaped the build's child itself"
+            "the pass left the build's child unreaped"
+        );
+    }
+
+    /// A pass does not call a group gone while the build's own child is
+    /// still to be reaped. macOS stops counting an exiting process in its
+    /// group before its parent can wait for it; a child that leads no
+    /// group puts a pass in the same state on every Unix: the group probe
+    /// finds nobody, and the child is not waitable.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupt_pass_waits_for_the_leader_the_group_probe_missed() {
+        let mut build = Command::new("sleep");
+        build
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = build.spawn().unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+
+        let mut killed = 0;
+        let gone = end_build_group(pid, &mut killed);
+        // The child is in the test's group, so the pass did not signal it.
+        child.kill().unwrap();
+        assert!(!gone, "the pass called a group gone over its live leader");
+
+        let start = Instant::now();
+        while !end_build_group(pid, &mut killed) {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the killed child {pid} was never reaped"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            child.try_wait().is_err(),
+            "the pass called the group gone with its leader unreaped"
         );
     }
 

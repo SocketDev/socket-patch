@@ -164,6 +164,9 @@ impl<'a> VendoredBackend<'a> {
         // entry), which the entry takes with it.
         let mut unwound_gems: Vec<(usize, String)> = Vec::new();
         let mut gem_records = std::collections::BTreeMap::new();
+        // The ledger's record of every unwound gem that has one, detached
+        // or not: what proves an installed copy unpatched (#2214).
+        let mut gem_ledger_records = std::collections::BTreeMap::new();
         for key in keys {
             let Some(entry) = state.entries.get(key).cloned() else {
                 out.push(RevertedEntry {
@@ -171,7 +174,7 @@ impl<'a> VendoredBackend<'a> {
                     flavor: None,
                     warnings: Vec::new(),
                     progress: Vec::new(),
-                    gem_install_refreshed: false,
+                    gem_install_upstream: false,
                     step: VendorRevertStep::Missing,
                 });
                 continue;
@@ -231,8 +234,11 @@ impl<'a> VendoredBackend<'a> {
                     .await;
                     if is_gem(&entry.ecosystem) {
                         unwound_gems.push((out.len(), entry.base_purl.clone()));
-                        if let (true, Some(record)) = (entry.detached, &entry.record) {
-                            gem_records.insert(entry.base_purl.clone(), record.clone());
+                        if let Some(record) = &entry.record {
+                            gem_ledger_records.insert(entry.base_purl.clone(), record.clone());
+                            if entry.detached {
+                                gem_records.insert(entry.base_purl.clone(), record.clone());
+                            }
                         }
                     }
                 }
@@ -242,14 +248,14 @@ impl<'a> VendoredBackend<'a> {
                 flavor,
                 warnings,
                 progress: Vec::new(),
-                gem_install_refreshed: false,
+                gem_install_upstream: false,
                 step,
             });
             if stop_on_failure && hard_failure {
                 break;
             }
         }
-        self.refresh_unwound_gems(&unwound_gems, &gem_records, &mut out)
+        self.refresh_unwound_gems(&unwound_gems, &gem_records, &gem_ledger_records, &mut out)
             .await;
         out
     }
@@ -263,7 +269,9 @@ impl<'a> VendoredBackend<'a> {
     /// `records` (the record of each unwound gem that the ledger alone
     /// owned) is the last thing that can tell (#2093). Bring those copies back to the
     /// upstream gem as the hosted unwind does, and name what is left (the
-    /// "Gem stale-install guard" section of CLI_CONTRACT.md).
+    /// "Gem stale-install guard" section of CLI_CONTRACT.md). `ledger` is
+    /// the ledger's record of every unwound gem that has one: it proves a
+    /// copy that was never patched to be the upstream build.
     ///
     /// `--json` gets a note per refreshed copy and a warning per stale
     /// one, on the entry of its gem. A human run gets the progress lines on
@@ -273,6 +281,7 @@ impl<'a> VendoredBackend<'a> {
         &self,
         unwound: &[(usize, String)],
         records: &std::collections::BTreeMap<String, PatchRecord>,
+        ledger: &std::collections::BTreeMap<String, PatchRecord>,
         out: &mut [RevertedEntry],
     ) {
         let Some((first, _)) = unwound.first() else {
@@ -282,12 +291,17 @@ impl<'a> VendoredBackend<'a> {
         let purls: Vec<String> = unwound.iter().map(|(_, purl)| purl.clone()).collect();
         let records = self.ended_records(records).await;
         let records = &records;
-        let refresh =
-            crate::commands::gem_refresh::after_vendored_unwind(&self.common, &purls, records)
-                .await;
+        let refresh = crate::commands::gem_refresh::after_vendored_unwind(
+            &self.common,
+            &purls,
+            records,
+            ledger,
+        )
+        .await;
         for (index, purl) in unwound {
-            if refresh.refreshed_installs.contains(purl) {
-                out[*index].gem_install_refreshed = true;
+            if refresh.refreshed_installs.contains(purl) || refresh.upstream_installs.contains(purl)
+            {
+                out[*index].gem_install_upstream = true;
             }
         }
         let report = refresh.report;
@@ -425,10 +439,11 @@ pub(crate) struct RevertedEntry {
     /// Lines a human run prints to stdout after its own line for the
     /// entry: what the gem refresh replaced in the installed tree.
     pub(crate) progress: Vec<String>,
-    /// The gem's installed copies were brought back to the upstream build,
-    /// with none left on the patched one: nothing of it is left for a
-    /// reinstall.
-    pub(crate) gem_install_refreshed: bool,
+    /// No installed copy of the gem is left on the patched build: the
+    /// unwind brought them back to the upstream one, or found them to be
+    /// it already (a gem that was only ever vendored, #2214). Nothing of
+    /// it is left for a reinstall.
+    pub(crate) gem_install_upstream: bool,
     pub(crate) step: VendorRevertStep,
 }
 

@@ -3,7 +3,8 @@ name: Bazel patch compatibility (Composer)
 # The Composer flows of the real-Bazel tests (`composer::` in
 # `e2e_bazel_build`), on each Bazel release below: hosted mode where a
 # repository rule runs `composer install` from the committed lock, hosted
-# mode where a genrule does, and agent mode on a committed `vendor/` tree.
+# mode where a genrule does, agent mode on a committed `vendor/` tree, and
+# vendored mode where the repository rule installs and on the committed tree.
 # No Bazel ruleset builds PHP or takes Composer packages, so the three
 # shapes are the fixture's own, as a PHP project under Bazel writes them by
 # hand. bazel-compatibility.yml holds the legs and what every ecosystem
@@ -46,13 +47,15 @@ on:
     # with `composer` in its name. The flows run through most of them: the
     # lock's model and its hosted rewrite (formats/composer), the crawler
     # that finds an installed package, the lock inventory, the discovery of
-    # a hosted pin for `vex`, the upstream restore of `rollback`, and the
-    # hints a command prints. The vendored backend (vendor/composer_lock)
-    # matches the patterns too, and no flow runs vendored mode. One more
-    # file is here: patch/user_patches.rs, the inspection of a project's own
-    # patches, whose Composer part every scan of a Composer project runs.
-    # That file also holds the npm, Cargo and Go parts, so a change to
-    # those starts the Composer legs too.
+    # a hosted pin for `vex`, the upstream restore of `rollback`, the hints
+    # a command prints, and the vendored backend (vendor/composer_lock), with
+    # the refusal of vendored mode in a Bazel workspace. Four more are here.
+    # patch/user_patches.rs is the inspection of a project's own patches,
+    # whose Composer part every scan of a Composer project runs; it also
+    # holds the npm, Cargo and Go parts, so a change to those starts the
+    # Composer legs too. bazel/mod.rs finds the Bazel root that refusal asks
+    # for, on the walk of utils/repo_root.rs, and vendor/refusals.rs hands
+    # the refusal to every command.
     #
     # What it does not cover: shared engine code (patch/redirect/mod.rs,
     # hosted/, the apply and rollback engines of agent mode, vex/,
@@ -72,6 +75,9 @@ on:
       - 'crates/*/src/**/*composer*'
       - 'crates/*/src/**/*composer*/**'
       - 'crates/socket-patch-core/src/patch/user_patches.rs'
+      - 'crates/socket-patch-core/src/bazel/mod.rs'
+      - 'crates/socket-patch-core/src/utils/repo_root.rs'
+      - 'crates/socket-patch-core/src/vendor/refusals.rs'
   push:
     branches: [main]
     # The pull request paths, and what only a push to main covers: the
@@ -91,6 +97,9 @@ on:
       - 'crates/*/src/**/*composer*'
       - 'crates/*/src/**/*composer*/**'
       - 'crates/socket-patch-core/src/patch/user_patches.rs'
+      - 'crates/socket-patch-core/src/bazel/mod.rs'
+      - 'crates/socket-patch-core/src/utils/repo_root.rs'
+      - 'crates/socket-patch-core/src/vendor/refusals.rs'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
       - 'crates/socket-patch-core/src/patch/redirect/**'
       - 'crates/socket-patch-core/src/patch/apply.rs'

@@ -592,15 +592,35 @@ async fn discover_selected(
     Ok(Discovered {
         offers,
         failed: failures,
+        paid_access: can_access_paid_patches,
     })
 }
 
-/// [`discover_selected`]'s result: the offers and each failed detail
-/// query as `(purl, error)` (a failure for a package with no recorded
-/// patch makes a capped run's data incomplete).
+/// [`discover_selected`]'s result: the offers, each failed detail query
+/// as `(purl, error)` (a failure for a package with no recorded patch
+/// makes a capped run's data incomplete), and whether the account can
+/// download paid patches.
 struct Discovered {
     offers: rollout::Offers,
     failed: Vec<(String, String)>,
+    paid_access: bool,
+}
+
+impl Discovered {
+    /// The uuids of the patches the run's selection filter withholds.
+    fn withheld_uuids(&self) -> HashSet<&str> {
+        let withheld = self.offers.withheld.iter();
+        withheld.map(|(_, uuid)| uuid.as_str()).collect()
+    }
+
+    /// Which patches the run could take, for the advisory coverage:
+    /// `withheld` is [`Self::withheld_uuids`].
+    fn access<'a>(&self, withheld: &'a HashSet<&'a str>) -> discovery::Access<'a> {
+        discovery::Access {
+            paid: self.paid_access,
+            withheld,
+        }
+    }
 }
 
 /// The `updates[]` JSON array.
@@ -638,15 +658,19 @@ fn classified_rows(
     if let Some(env) = result {
         let updates = offer_updates(&rows, discovered, recorded, packages);
         env.set_extra("updates", serde_json::Value::Array(updates_json(&updates)));
-        coverage_into_packages_json(env, &advisory_coverage(packages, &writers_of(&rows)));
+        let withheld = discovered.withheld_uuids();
+        let access = discovered.access(&withheld);
+        let coverage = advisory_coverage(packages, &writers_of(&rows), access);
+        coverage_into_packages_json(env, &coverage);
     }
     rows
 }
 
 /// Say on each `packages[]` entry which patch the run selected for the
-/// package and what that leaves unfixed: `selectedUuids`, `fixedIds` and
-/// `unfixedIds`, absent on a package the run selected no patch for. Whether
-/// a selected patch landed is its event.
+/// package and what that leaves unfixed: `selectedUuids`, `fixedIds`,
+/// `unfixedIds` and `mergePendingIds` (the unfixed ids waiting on a merged
+/// patch), absent on a package the run selected no patch for. Whether a
+/// selected patch landed is its event.
 fn coverage_into_packages_json(env: &mut Envelope, coverage: &[AdvisoryCoverage]) {
     let Some(packages) = env
         .extra
@@ -665,6 +689,7 @@ fn coverage_into_packages_json(env: &mut Envelope, coverage: &[AdvisoryCoverage]
         pkg["selectedUuids"] = serde_json::json!(c.uuids);
         pkg["fixedIds"] = serde_json::json!(c.fixed_ids);
         pkg["unfixedIds"] = serde_json::json!(c.unfixed_ids);
+        pkg["mergePendingIds"] = serde_json::json!(c.merge_pending_ids);
     }
 }
 
@@ -3959,7 +3984,10 @@ async fn scan_project(
             &all_packages_with_patches,
             &[],
             &[],
-            can_access_paid_patches,
+            discovery::Access {
+                paid: can_access_paid_patches,
+                withheld: &HashSet::new(),
+            },
             filter,
             &in_project,
         );
@@ -3989,11 +4017,12 @@ async fn scan_project(
                 updates = offer_updates(&rows, &discovered, &recorded, &all_packages_with_patches);
                 let records: Vec<&PatchSearchResult> =
                     discovered.offers.unfiltered.values().flatten().collect();
+                let withheld = discovered.withheld_uuids();
                 plan = report::plan(
                     &all_packages_with_patches,
                     &writers_of(&rows),
                     &records,
-                    can_access_paid_patches,
+                    discovered.access(&withheld),
                     filter,
                     &in_project,
                 );

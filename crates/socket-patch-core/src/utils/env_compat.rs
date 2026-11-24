@@ -2,7 +2,7 @@
 //! accepted `SOCKET_CLI_*` peer aliases.
 
 /// Whether `name` is exactly `1` or `true`.
-fn env_flag(name: &str) -> bool {
+pub(crate) fn env_flag(name: &str) -> bool {
     matches!(std::env::var(name).as_deref(), Ok("1" | "true"))
 }
 

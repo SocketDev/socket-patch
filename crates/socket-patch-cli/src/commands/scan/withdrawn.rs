@@ -291,7 +291,9 @@ pub(super) async fn sweep(
                         format!(
                             "{} is pinned to patch {}, which {why}, but it was not restored: \
                              {message}; re-run, or run `socket-patch rollback {}`",
-                            pin.purl, pin.uuid, pin.purl
+                            pin.purl,
+                            pin.uuid,
+                            crate::ui::shell_word(&pin.purl)
                         ),
                     );
                 }

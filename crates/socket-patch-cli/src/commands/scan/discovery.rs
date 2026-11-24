@@ -5,8 +5,10 @@
 
 use futures_util::StreamExt;
 use socket_patch_core::api::client::hold_back_debug;
-use socket_patch_core::api::ranking::{batch_supersedes, cmp_batch_infos};
-use socket_patch_core::api::types::{BatchPackagePatches, PatchResponse, PatchSearchResult};
+use socket_patch_core::api::ranking::{batch_supersedes, cmp_batch_infos, severity_order};
+use socket_patch_core::api::types::{
+    BatchPackagePatches, BatchPatchInfo, PatchResponse, PatchSearchResult,
+};
 use socket_patch_core::bazel::maven::HubJars;
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
@@ -576,6 +578,16 @@ pub(crate) struct AdvisoryCoverage {
     pub(crate) fixed_ids: Vec<String>,
     /// Every CVE and advisory id behind `unpatched`, for `--json`.
     pub(crate) unfixed_ids: Vec<String>,
+    /// The ids of `unpatched` that are waiting on a merged patch (see
+    /// [`package_coverage`]): another patch the account can download fixes
+    /// them, and Socket has not published the patch that fixes them
+    /// together with the selection yet.
+    pub(crate) merge_pending: Vec<String>,
+    /// Every CVE and advisory id behind `merge_pending`, for `--json`.
+    pub(crate) merge_pending_ids: Vec<String>,
+    /// The ids of `unpatched` that need a paid plan: only patches the
+    /// account cannot download fix them.
+    pub(crate) needs_paid: Vec<String>,
 }
 
 /// The CVE and advisory (GHSA) ids of a set of patches.
@@ -594,6 +606,22 @@ impl<'a> AdvisoryIds<'a> {
     fn retain_common(&mut self, other: &AdvisoryIds<'a>) {
         self.cves.retain(|id| other.cves.contains(id));
         self.advisories.retain(|id| other.advisories.contains(id));
+    }
+
+    /// Whether `id` (a CVE or an advisory id) is one of these.
+    fn names(&self, id: &str) -> bool {
+        self.cves.contains(id) || self.advisories.contains(id)
+    }
+
+    fn common(&self, other: &AdvisoryIds<'a>) -> AdvisoryIds<'a> {
+        AdvisoryIds {
+            cves: self.cves.intersection(&other.cves).copied().collect(),
+            advisories: self
+                .advisories
+                .intersection(&other.advisories)
+                .copied()
+                .collect(),
+        }
     }
 
     fn without(&self, other: &AdvisoryIds<'a>) -> AdvisoryIds<'a> {
@@ -632,6 +660,51 @@ impl<'a> AdvisoryIds<'a> {
     }
 }
 
+/// Which of a package's patches a run could take.
+#[derive(Clone, Copy)]
+pub(crate) struct Access<'a> {
+    /// The account can download paid patches.
+    pub(crate) paid: bool,
+    /// The uuids of the patches the run's selection filter withholds
+    /// (nothing they fix needs a fix). Empty without a filter.
+    pub(crate) withheld: &'a HashSet<&'a str>,
+}
+
+impl Access<'_> {
+    /// Whether the account can download `info`.
+    fn downloads(&self, info: &BatchPatchInfo) -> bool {
+        self.paid || info.tier == "free"
+    }
+
+    /// Whether the run could take `info`: downloadable, and not withheld.
+    fn takes(&self, info: &BatchPatchInfo) -> bool {
+        self.downloads(info) && !self.withheld.contains(info.uuid.as_str())
+    }
+
+    /// Whether the merged patch of the account's tier combines `info`'s
+    /// fixes with the others the run could take. The paid tier's merged
+    /// patch combines every fix of a package version. The free tier's
+    /// combines the critical ones, so a free patch for a lesser advisory
+    /// (the catalog holds some from before the tiers were drawn) is never
+    /// part of one.
+    fn merges(&self, info: &BatchPatchInfo) -> bool {
+        self.takes(info) && (self.paid || severity_order(info.severity.as_deref()) == 0)
+    }
+}
+
+/// The advisories a batch entry is taken to fix: its advisory ids, or its
+/// CVEs when it names no advisory. The batch data does not pair the two,
+/// and one advisory can carry several CVEs, so the CVEs of an entry that
+/// names advisories are aliases, not more advisories (as the ranking's
+/// advisory count has it).
+fn advisory_keys(info: &BatchPatchInfo) -> impl Iterator<Item = &str> {
+    let ids = match info.ghsa_ids.is_empty() {
+        true => &info.cve_ids,
+        false => &info.ghsa_ids,
+    };
+    ids.iter().map(String::as_str)
+}
+
 /// For each package of `packages` that `selected` holds a patch for: what
 /// the selection fixes and what it leaves unfixed, in `packages` order.
 ///
@@ -642,9 +715,12 @@ impl<'a> AdvisoryIds<'a> {
 /// different patches counts as fixed only what every one of them fixes.
 /// The batch data does not pair an advisory id with its CVE, so an alias
 /// the selected patch does not list is reported unfixed, never the reverse.
+/// `access` says which patches the run could take (see
+/// [`package_coverage`]).
 pub(crate) fn advisory_coverage(
     packages: &[BatchPackagePatches],
     selected: &[PatchSearchResult],
+    access: Access<'_>,
 ) -> Vec<AdvisoryCoverage> {
     let mut by_package: HashMap<PurlKey, Vec<&PatchSearchResult>> = HashMap::new();
     for patch in selected {
@@ -657,16 +733,37 @@ pub(crate) fn advisory_coverage(
         .iter()
         .filter_map(|pkg| {
             let selected = by_package.get(&PurlKey::new(&pkg.purl))?;
-            Some(package_coverage(pkg, selected))
+            Some(package_coverage(pkg, selected, access))
         })
         .collect()
 }
 
 /// [`advisory_coverage`] for one package. With no patch selected for it
 /// nothing is fixed, and every advisory its patches name is unfixed.
+///
+/// Some of the unfixed advisories are waiting on a merged patch. Socket
+/// publishes one patch that fixes a package version's advisories together
+/// (the critical ones in the free tier, all of them in the paid tier), and
+/// it arrives after the single patches it combines. So when the patches
+/// that merged patch combines ([`Access::merges`]: the ones the account
+/// can download, less the ones its selection filter withholds and, for
+/// the free tier, the ones that are not critical) fix more advisories
+/// between them than a selected patch does, and none the run passed over
+/// fixes them all, that merged patch is not published yet, and the
+/// advisories the other such patches fix are waiting on it.
+///
+/// What is never waiting: an advisory only a patch the account cannot
+/// download fixes, or only a free patch that is not critical (it needs a
+/// paid plan: the paid tier's merged patch is the one that has it); an
+/// advisory only a withheld patch fixes (the filter says it needs no fix,
+/// and prefers the patch that leaves it out even once a merged one
+/// exists); any advisory when a patch that fixes them all is on offer and
+/// the run selected another; and any advisory of a selection the lookup
+/// no longer offers (the next run moves off that patch).
 pub(super) fn package_coverage(
     pkg: &BatchPackagePatches,
     selected: &[&PatchSearchResult],
+    access: Access<'_>,
 ) -> AdvisoryCoverage {
     let mut known = AdvisoryIds::default();
     // Advisory ids some patch lists with no CVE at all: they have none.
@@ -684,6 +781,8 @@ pub(super) fn package_coverage(
         listed.entry(info.uuid.as_str()).or_default().extend(&ids);
     }
     let mut fixed: Option<AdvisoryIds> = None;
+    // What each selected patch fixes, one entry per release variant.
+    let mut selections: Vec<AdvisoryIds> = Vec::new();
     for patch in selected {
         let mut ids = listed.get(patch.uuid.as_str()).cloned().unwrap_or_default();
         for (advisory, vuln) in &patch.vulnerabilities {
@@ -694,6 +793,7 @@ pub(super) fn package_coverage(
             }
         }
         known.extend(&ids);
+        selections.push(ids.clone());
         match &mut fixed {
             Some(fixed) => fixed.retain_common(&ids),
             None => fixed = Some(ids),
@@ -701,6 +801,71 @@ pub(super) fn package_coverage(
     }
     let fixed = fixed.unwrap_or_default();
     let unfixed = known.without(&fixed);
+    let ids_of = |info: &BatchPatchInfo| listed.get(info.uuid.as_str());
+    let selected_uuid = |uuid: &str| selected.iter().any(|patch| patch.uuid == uuid);
+    let ids_among = |infos: &[&BatchPatchInfo]| {
+        let mut ids = AdvisoryIds::default();
+        for named in infos.iter().filter_map(|info| ids_of(info)) {
+            ids.extend(named);
+        }
+        ids
+    };
+    // The patches the run could take, and the ones among them the tier's
+    // merged patch combines: every id those name, and the advisories they
+    // fix between them.
+    let takes: Vec<&BatchPatchInfo> = pkg.patches.iter().filter(|i| access.takes(i)).collect();
+    let merges: Vec<&BatchPatchInfo> = pkg.patches.iter().filter(|i| access.merges(i)).collect();
+    let offered = ids_among(&merges);
+    let advisories: BTreeSet<&str> = merges.iter().flat_map(|info| advisory_keys(info)).collect();
+    let fixes_all = |ids: &AdvisoryIds| advisories.iter().all(|id| ids.names(id));
+    let merge_pending = if !selected.is_empty()
+        && selected
+            .iter()
+            .all(|patch| takes.iter().any(|info| info.uuid == patch.uuid))
+        // Some release variant's patch leaves one of them out...
+        && !selections.iter().all(fixes_all)
+        // ...and no patch the run passed over fixes them all.
+        && !takes
+            .iter()
+            .filter(|info| !selected_uuid(&info.uuid))
+            .filter_map(|info| ids_of(info))
+            .any(fixes_all)
+    {
+        unfixed.common(&offered)
+    } else {
+        AdvisoryIds::default()
+    };
+    // What needs a paid plan: what only the patches the account cannot
+    // download name (one whose every advisory a downloadable patch fixes
+    // adds nothing), and what only a free patch the free tier's merged
+    // patch leaves out names.
+    let needs_paid = if access.paid {
+        AdvisoryIds::default()
+    } else {
+        let (downloads, others): (Vec<_>, Vec<_>) =
+            pkg.patches.iter().partition(|info| access.downloads(info));
+        let free = ids_among(&downloads);
+        let others: Vec<&BatchPatchInfo> = others
+            .into_iter()
+            .filter(|info| !advisory_keys(info).all(|id| free.names(id)))
+            .collect();
+        let lesser: Vec<&BatchPatchInfo> = takes
+            .iter()
+            .copied()
+            .filter(|info| !access.merges(info))
+            .collect();
+        let mut paid = ids_among(&others).without(&free);
+        paid.extend(&ids_among(&lesser).without(&offered));
+        unfixed.common(&paid)
+    };
+    let unpatched = unfixed.shown(&no_cve);
+    let shown_of = |ids: &AdvisoryIds| -> Vec<String> {
+        let shown = ids.shown(&no_cve);
+        shown
+            .into_iter()
+            .filter(|id| unpatched.contains(id))
+            .collect()
+    };
     let mut uuids: Vec<String> = selected.iter().map(|p| p.uuid.clone()).collect();
     uuids.sort();
     uuids.dedup();
@@ -708,9 +873,12 @@ pub(super) fn package_coverage(
         purl: pkg.purl.clone(),
         uuids,
         fixes: fixed.shown(&no_cve),
-        unpatched: unfixed.shown(&no_cve),
+        merge_pending: shown_of(&merge_pending),
+        needs_paid: shown_of(&needs_paid),
+        unpatched,
         fixed_ids: fixed.all(),
         unfixed_ids: unfixed.all(),
+        merge_pending_ids: merge_pending.all(),
     }
 }
 
@@ -1770,6 +1938,20 @@ mod tests {
         v.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// [`advisory_coverage`] for an account with or without `paid` access
+    /// and no selection filter.
+    fn coverage_for(
+        packages: &[BatchPackagePatches],
+        selected: &[PatchSearchResult],
+        paid: bool,
+    ) -> Vec<AdvisoryCoverage> {
+        let access = Access {
+            paid,
+            withheld: &HashSet::new(),
+        };
+        advisory_coverage(packages, selected, access)
+    }
+
     fn patch_with(uuid: &str, cves: &[&str], ghsas: &[&str]) -> BatchPatchInfo {
         BatchPatchInfo {
             uuid: uuid.to_string(),
@@ -1777,7 +1959,7 @@ mod tests {
             tier: "free".to_string(),
             cve_ids: strs(cves),
             ghsa_ids: strs(ghsas),
-            severity: None,
+            severity: Some("CRITICAL".to_string()),
             title: String::new(),
             published_at: None,
         }
@@ -1810,7 +1992,8 @@ mod tests {
 
     /// urllib3 1.26.18: three patches, one advisory each. The selected one
     /// fixes its own; the other two stay unfixed, shown by CVE, with every
-    /// id in the JSON lists.
+    /// id in the JSON lists. All three are downloadable and no patch fixes
+    /// them together, so the two are waiting on the merged patch.
     #[test]
     fn advisory_coverage_names_what_the_other_patches_fix_as_unfixed() {
         let pkg = BatchPackagePatches {
@@ -1827,7 +2010,7 @@ mod tests {
             "u1",
             &[("GHSA-gm62-xv2j-4w53", &["CVE-2025-66418"])],
         );
-        let coverage = advisory_coverage(std::slice::from_ref(&pkg), &[selected]);
+        let coverage = coverage_for(std::slice::from_ref(&pkg), &[selected], false);
         assert_eq!(
             coverage,
             vec![AdvisoryCoverage {
@@ -1842,10 +2025,18 @@ mod tests {
                     "GHSA-2xpw-w6gg-jr37",
                     "GHSA-38jv-5279-wg99",
                 ]),
+                merge_pending: strs(&["CVE-2025-66471", "CVE-2026-21441"]),
+                merge_pending_ids: strs(&[
+                    "CVE-2025-66471",
+                    "CVE-2026-21441",
+                    "GHSA-2xpw-w6gg-jr37",
+                    "GHSA-38jv-5279-wg99",
+                ]),
+                needs_paid: Vec::new(),
             }]
         );
         // No patch selected for the package: no entry at all.
-        assert!(advisory_coverage(&[pkg], &[]).is_empty());
+        assert!(coverage_for(&[pkg], &[], false).is_empty());
     }
 
     /// A merged patch that fixes everything leaves nothing unfixed, an
@@ -1869,15 +2060,118 @@ mod tests {
             "merged",
             &[("GHSA-a", &["CVE-1"]), ("GHSA-b", &[])],
         );
-        let c = &advisory_coverage(std::slice::from_ref(&pkg), &[merged])[0];
+        let c = &coverage_for(std::slice::from_ref(&pkg), &[merged], false)[0];
         assert_eq!(c.fixes, strs(&["CVE-1", "GHSA-b"]));
         assert_eq!(c.unpatched, strs(&["CVE-3"]));
         assert_eq!(c.unfixed_ids, strs(&["CVE-3", "GHSA-c"]));
+        // Only a paid patch fixes CVE-3: no merged patch of the free tier
+        // is missing, and CVE-3 needs the paid plan.
+        assert!(c.merge_pending.is_empty() && c.merge_pending_ids.is_empty());
+        assert_eq!(c.needs_paid, strs(&["CVE-3"]));
 
         let single = selected_patch("pkg:npm/foo@1.0", "u1", &[("GHSA-a", &["CVE-1"])]);
-        let c = &advisory_coverage(&[pkg], &[single])[0];
+        let c = &coverage_for(&[pkg], &[single], false)[0];
         assert_eq!(c.fixes, strs(&["CVE-1"]));
         assert_eq!(c.unpatched, strs(&["CVE-3", "GHSA-b"]));
+        // The merged patch of the free tier is published; this run was
+        // steered off it, so nothing is waiting.
+        assert!(c.merge_pending.is_empty());
+        assert_eq!(c.needs_paid, strs(&["CVE-3"]));
+    }
+
+    /// What waits on a merged patch follows what the account can download.
+    /// The free tier's merged patch is the one that fixes every advisory a
+    /// free patch fixes; with paid access it is the one that fixes them all.
+    #[test]
+    fn advisory_coverage_names_what_waits_on_a_merged_patch() {
+        let paid = |uuid: &str, cves: &[&str], ghsas: &[&str]| {
+            let mut patch = patch_with(uuid, cves, ghsas);
+            patch.tier = "paid".to_string();
+            patch
+        };
+        // Two critical advisories with a free patch each, a third only a
+        // paid patch fixes, and the paid tier's merged patch of all three.
+        let pkg = BatchPackagePatches {
+            purl: "pkg:npm/foo@1.0".to_string(),
+            patches: vec![
+                patch_with("a", &["CVE-1"], &["GHSA-a"]),
+                patch_with("b", &["CVE-2"], &["GHSA-b"]),
+                paid("c", &["CVE-3"], &["GHSA-c"]),
+                paid(
+                    "all",
+                    &["CVE-1", "CVE-2", "CVE-3"],
+                    &["GHSA-a", "GHSA-b", "GHSA-c"],
+                ),
+            ],
+        };
+        let a = selected_patch("pkg:npm/foo@1.0", "a", &[("GHSA-a", &["CVE-1"])]);
+        let c = &coverage_for(std::slice::from_ref(&pkg), &[a], false)[0];
+        assert_eq!(c.unpatched, strs(&["CVE-2", "CVE-3"]));
+        assert_eq!(c.merge_pending, strs(&["CVE-2"]));
+        assert_eq!(c.merge_pending_ids, strs(&["CVE-2", "GHSA-b"]));
+        // Only paid patches fix CVE-3.
+        assert_eq!(c.needs_paid, strs(&["CVE-3"]));
+
+        // With paid access the merged patch of all three is on offer.
+        let all = selected_patch(
+            "pkg:npm/foo@1.0",
+            "all",
+            &[
+                ("GHSA-a", &["CVE-1"]),
+                ("GHSA-b", &["CVE-2"]),
+                ("GHSA-c", &["CVE-3"]),
+            ],
+        );
+        let c = &coverage_for(std::slice::from_ref(&pkg), &[all], true)[0];
+        assert!(c.unpatched.is_empty() && c.merge_pending.is_empty());
+        // With paid access and the single patch selected all the same,
+        // nothing needs a plan the account lacks.
+        let a = selected_patch("pkg:npm/foo@1.0", "a", &[("GHSA-a", &["CVE-1"])]);
+        let c = &coverage_for(std::slice::from_ref(&pkg), &[a], true)[0];
+        assert!(c.needs_paid.is_empty() && c.merge_pending.is_empty());
+
+        // The free tier's merged patch is published: nothing is waiting,
+        // and CVE-3 still needs the paid plan.
+        let mut with_free_merge = pkg.clone();
+        with_free_merge.patches.push(patch_with(
+            "critical",
+            &["CVE-1", "CVE-2"],
+            &["GHSA-a", "GHSA-b"],
+        ));
+        let critical = selected_patch(
+            "pkg:npm/foo@1.0",
+            "critical",
+            &[("GHSA-a", &["CVE-1"]), ("GHSA-b", &["CVE-2"])],
+        );
+        let c = &coverage_for(&[with_free_merge], &[critical], false)[0];
+        assert_eq!(c.unpatched, strs(&["CVE-3"]));
+        assert!(c.merge_pending.is_empty());
+        assert_eq!(c.needs_paid, strs(&["CVE-3"]));
+
+        // A partly merged patch leaves the rest waiting.
+        let partly = BatchPackagePatches {
+            purl: "pkg:npm/foo@1.0".to_string(),
+            patches: vec![
+                paid("ab", &["CVE-1", "CVE-2"], &["GHSA-a", "GHSA-b"]),
+                paid("a", &["CVE-1"], &["GHSA-a"]),
+                paid("b", &["CVE-2"], &["GHSA-b"]),
+                paid("c", &[], &["GHSA-c"]),
+            ],
+        };
+        let ab = selected_patch(
+            "pkg:npm/foo@1.0",
+            "ab",
+            &[("GHSA-a", &["CVE-1"]), ("GHSA-b", &["CVE-2"])],
+        );
+        let c = &coverage_for(
+            std::slice::from_ref(&partly),
+            std::slice::from_ref(&ab),
+            true,
+        )[0];
+        assert_eq!(c.merge_pending, strs(&["GHSA-c"]));
+        // Without paid access none of them is downloadable.
+        let c = &coverage_for(&[partly], &[ab], false)[0];
+        assert!(c.merge_pending.is_empty());
     }
 
     /// A recorded patch the batch no longer offers is described by its own
@@ -1890,10 +2184,13 @@ mod tests {
             patches: vec![patch_with("new", &["CVE-2"], &["GHSA-b"])],
         };
         let kept = selected_patch("pkg:pypi/foo@1.0", "old", &[("GHSA-a", &["CVE-1"])]);
-        let c = &advisory_coverage(std::slice::from_ref(&pkg), &[kept])[0];
+        let c = &coverage_for(std::slice::from_ref(&pkg), &[kept], false)[0];
         assert_eq!(c.uuids, strs(&["old"]));
         assert_eq!(c.fixes, strs(&["CVE-1"]));
         assert_eq!(c.unpatched, strs(&["CVE-2"]));
+        // The recorded patch is no longer offered: the next run moves to
+        // the one that is, so nothing waits on a merge with it.
+        assert!(c.merge_pending.is_empty());
 
         let wheel = selected_patch(
             "pkg:pypi/foo@1.0?artifact_id=whl",
@@ -1905,10 +2202,167 @@ mod tests {
             "s",
             &[("GHSA-a", &["CVE-1"])],
         );
-        let c = &advisory_coverage(&[pkg], &[wheel, sdist])[0];
+        let c = &coverage_for(
+            std::slice::from_ref(&pkg),
+            &[wheel.clone(), sdist.clone()],
+            false,
+        )[0];
         assert_eq!(c.uuids, strs(&["s", "w"]));
         assert_eq!(c.fixes, strs(&["CVE-1"]));
         assert_eq!(c.unpatched, strs(&["CVE-2", "CVE-3"]));
+        // CVE-3 is named only by the wheel's own record: no paid patch
+        // fixes it, so it needs no paid plan, with or without paid access.
+        assert!(c.needs_paid.is_empty());
+        assert!(coverage_for(&[pkg], &[wheel, sdist], true)[0]
+            .needs_paid
+            .is_empty());
+    }
+
+    /// The wheel's merged patch is published and the sdist's is not: the
+    /// advisory the sdist's patch leaves is waiting on the merged patch.
+    #[test]
+    fn advisory_coverage_waits_for_the_variant_without_a_merged_patch() {
+        let pkg = BatchPackagePatches {
+            purl: "pkg:pypi/foo@1.0".to_string(),
+            patches: vec![
+                patch_with("wm", &["CVE-1", "CVE-2"], &["GHSA-a", "GHSA-b"]),
+                patch_with("s1", &["CVE-1"], &["GHSA-a"]),
+                patch_with("s2", &["CVE-2"], &["GHSA-b"]),
+            ],
+        };
+        let wheel = selected_patch(
+            "pkg:pypi/foo@1.0?artifact_id=whl",
+            "wm",
+            &[("GHSA-a", &["CVE-1"]), ("GHSA-b", &["CVE-2"])],
+        );
+        let sdist = selected_patch(
+            "pkg:pypi/foo@1.0?artifact_id=tar-gz",
+            "s1",
+            &[("GHSA-a", &["CVE-1"])],
+        );
+        let c = &coverage_for(std::slice::from_ref(&pkg), &[wheel.clone(), sdist], false)[0];
+        assert_eq!(c.unpatched, strs(&["CVE-2"]));
+        assert_eq!(c.merge_pending, strs(&["CVE-2"]));
+        // Both variants on the merged patch: nothing is left.
+        let c = &coverage_for(&[pkg], &[wheel], false)[0];
+        assert!(c.unpatched.is_empty() && c.merge_pending.is_empty());
+    }
+
+    /// The free tier's merged patch combines a package version's critical
+    /// fixes. A free patch for a lesser advisory (the catalog holds some
+    /// from before the tiers were drawn) is never part of one: its
+    /// advisory needs the paid tier's merged patch, and is not waiting.
+    #[test]
+    fn advisory_coverage_leaves_a_lesser_free_patch_to_the_paid_merged_patch() {
+        let lesser = |uuid: &str, cves: &[&str], ghsas: &[&str]| {
+            let mut patch = patch_with(uuid, cves, ghsas);
+            patch.severity = Some("HIGH".to_string());
+            patch
+        };
+        // seroval 1.3.2: the free merged patch of its two critical
+        // advisories is published, beside an older free patch for a high.
+        let pkg = BatchPackagePatches {
+            purl: "pkg:npm/foo@1.0".to_string(),
+            patches: vec![
+                patch_with("m", &["CVE-1", "CVE-2"], &["GHSA-a", "GHSA-b"]),
+                patch_with("a", &["CVE-1"], &["GHSA-a"]),
+                patch_with("b", &["CVE-2"], &["GHSA-b"]),
+                lesser("h", &["CVE-3"], &["GHSA-c"]),
+            ],
+        };
+        let merged = selected_patch(
+            "pkg:npm/foo@1.0",
+            "m",
+            &[("GHSA-a", &["CVE-1"]), ("GHSA-b", &["CVE-2"])],
+        );
+        let c = &coverage_for(
+            std::slice::from_ref(&pkg),
+            std::slice::from_ref(&merged),
+            false,
+        )[0];
+        assert_eq!(c.unpatched, strs(&["CVE-3"]));
+        assert!(c.merge_pending.is_empty() && c.merge_pending_ids.is_empty());
+        assert_eq!(c.needs_paid, strs(&["CVE-3"]));
+        // With paid access the merged patch of all three is the one the
+        // package waits on.
+        let c = &coverage_for(&[pkg], &[merged], true)[0];
+        assert_eq!(c.merge_pending, strs(&["CVE-3"]));
+        assert!(c.needs_paid.is_empty());
+
+        // Two lesser free patches and nothing critical: the free tier has
+        // no merged patch for them.
+        let pkg = BatchPackagePatches {
+            purl: "pkg:npm/foo@1.0".to_string(),
+            patches: vec![
+                lesser("h1", &["CVE-1"], &["GHSA-a"]),
+                lesser("h2", &["CVE-2"], &["GHSA-b"]),
+            ],
+        };
+        let h1 = selected_patch("pkg:npm/foo@1.0", "h1", &[("GHSA-a", &["CVE-1"])]);
+        let c = &coverage_for(&[pkg], &[h1], false)[0];
+        assert!(c.merge_pending.is_empty());
+        assert_eq!(c.needs_paid, strs(&["CVE-2"]));
+    }
+
+    /// A selection filter withholds the patch of an advisory that needs no
+    /// fix, and prefers the patch that leaves it out even once a merged
+    /// one exists. That advisory is not waiting on a merged patch.
+    #[test]
+    fn advisory_coverage_promises_no_merged_patch_the_filter_would_pass_over() {
+        let pkg = BatchPackagePatches {
+            purl: "pkg:npm/foo@1.0".to_string(),
+            patches: vec![
+                patch_with("a", &["CVE-1"], &["GHSA-a"]),
+                patch_with("b", &["CVE-2"], &["GHSA-b"]),
+            ],
+        };
+        let a = selected_patch("pkg:npm/foo@1.0", "a", &[("GHSA-a", &["CVE-1"])]);
+        let withheld: HashSet<&str> = ["b"].into();
+        let filtered = Access {
+            paid: false,
+            withheld: &withheld,
+        };
+        let c = &advisory_coverage(
+            std::slice::from_ref(&pkg),
+            std::slice::from_ref(&a),
+            filtered,
+        )[0];
+        assert_eq!(c.unpatched, strs(&["CVE-2"]));
+        assert!(c.merge_pending.is_empty() && c.merge_pending_ids.is_empty());
+        assert!(c.needs_paid.is_empty());
+        // Without the filter it is.
+        let c = &coverage_for(&[pkg], &[a], false)[0];
+        assert_eq!(c.merge_pending, strs(&["CVE-2"]));
+    }
+
+    /// The batch data does not pair an advisory with its CVEs, so a merged
+    /// patch is judged by the advisories it names: one that lists a CVE
+    /// alias fewer than a single patch does is still the merged patch.
+    #[test]
+    fn advisory_coverage_judges_a_merged_patch_by_its_advisories() {
+        let mut paid = patch_with("p", &["CVE-2"], &["GHSA-b"]);
+        paid.tier = "paid".to_string();
+        let pkg = BatchPackagePatches {
+            purl: "pkg:npm/foo@1.0".to_string(),
+            patches: vec![
+                patch_with("m", &["CVE-1"], &["GHSA-a", "GHSA-b"]),
+                patch_with("b", &["CVE-2"], &["GHSA-b"]),
+                paid,
+            ],
+        };
+        let merged = selected_patch(
+            "pkg:npm/foo@1.0",
+            "m",
+            &[("GHSA-a", &["CVE-1"]), ("GHSA-b", &[])],
+        );
+        let c = &coverage_for(&[pkg], &[merged], false)[0];
+        // The alias is still listed as unfixed, as before...
+        assert_eq!(c.unfixed_ids, strs(&["CVE-2"]));
+        // ...but nothing waits on a merged patch that is already applied,
+        // and a paid patch for an advisory a free patch fixes adds no
+        // need for a paid plan.
+        assert!(c.merge_pending.is_empty() && c.merge_pending_ids.is_empty());
+        assert!(c.needs_paid.is_empty());
     }
 
     #[test]
