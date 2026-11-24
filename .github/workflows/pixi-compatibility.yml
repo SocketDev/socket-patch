@@ -112,7 +112,7 @@ jobs:
           path: native-cli
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: '3.12.13'
+          python-version: '3.12.10' # exact: last 3.12 with Windows+macOS builds; bump deliberately (#1645)
       - name: Exercise real pixi projects
         shell: bash
         env:
