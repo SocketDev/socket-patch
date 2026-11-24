@@ -2200,6 +2200,75 @@ fn a_lock_that_a_hub_reads_stays_on_the_trust_pin_where_a_registry_is_offered() 
     assert!(!warned.contains("Bazel"), "{test}: {}", routed.dump);
 }
 
+/// Without a Bazel: with `SOCKET_NO_BAZEL=1` the hosted scan of
+/// [`a_lock_that_a_hub_reads_stays_on_the_trust_pin_where_a_registry_is_offered`]
+/// is the scan of the same checkout without its `MODULE.bazel`, to the
+/// byte in exit code, both streams and every file it leaves: the lock is
+/// routed through the patch's registry, with the registry and the override
+/// in `pnpm-workspace.yaml`, and no run says a word of Bazel. Without the
+/// variable the scan keeps the lock on the trust pin and its warning names
+/// the hub's call, as that test holds.
+#[test]
+fn the_switch_routes_a_lock_that_a_hub_reads_as_in_a_checkout_without_bazel() {
+    let (cell, standin, patch, _) = checkout_granted("", false, true);
+    let test = &cell.test;
+    std::fs::remove_dir_all(cell.path("node_modules")).expect("the tree");
+    proves_pnpm_12(&cell);
+    let origin = standin.origin();
+    let registry = format!("{origin}/{REGISTRY}");
+    let env = [
+        ("SOCKET_PATCH_SERVER_URL", origin.as_str()),
+        ("SOCKET_NPM_REGISTRY", registry.as_str()),
+    ];
+    let hosted = ["scan", "--mode", "hosted", "--yes"];
+    let (without, beside) = cell.without_and_beside(&origin, &hosted, &env, &[MODULE]);
+    let file = |run: &Value, rel: &str| run["files"][rel].as_str().unwrap_or_default().to_string();
+
+    // The run with the variable is the first of these, to the byte: routed.
+    let name = format!("socket-{}", &patch.uuid[..8]);
+    let key = format!("'{NAME}@{name}:{VERSION}':");
+    for run in without.as_array().expect("the two forms") {
+        let (lock, workspace) = (file(run, LOCK), file(run, "pnpm-workspace.yaml"));
+        assert!(
+            lock.contains(&key) && lock.contains("\noverrides:"),
+            "{test}: {lock}"
+        );
+        assert!(
+            workspace.contains("namedRegistries:")
+                && workspace.contains(&name)
+                && !workspace.contains("trustLockfile"),
+            "{test}: {workspace}"
+        );
+        for stream in ["stdout", "stderr"] {
+            let said = run[stream].as_str().expect("a stream");
+            assert!(!said.contains("Bazel"), "{test}: {stream}: {said}");
+        }
+    }
+
+    // Without the variable the hub decides: the trust pin, and the warning.
+    let entry = format!(
+        "  '{NAME}@{VERSION}':\n    resolution: {{integrity: {}, tarball: {origin}{}}}\n",
+        integrity(&patch.package.tarball),
+        patch.route
+    );
+    for run in beside.as_array().expect("the two forms") {
+        let lock = file(run, LOCK);
+        assert!(
+            lock.contains(&entry) && !lock.contains("@socket-") && !lock.contains("\noverrides:"),
+            "{test}: {lock}"
+        );
+        assert_eq!(
+            file(run, "pnpm-workspace.yaml"),
+            TRUSTING_WORKSPACE,
+            "{test}"
+        );
+    }
+    let said = beside[0]["stdout"].as_str().expect("an envelope");
+    let envelope: Value = serde_json::from_str(said).expect("an envelope");
+    let warned = envelope["warnings"].to_string();
+    assert!(warned.contains(HUB_READS_THE_LOCK), "{test}: {beside:#}");
+}
+
 /// Without a Bazel: the two scans of [`hosted_update_pnpm_lock_on_pnpm_11`]
 /// and its undo, in a checkout with that hub, for the project at the root
 /// and for one in a directory of the workspace, whose hub names the lock

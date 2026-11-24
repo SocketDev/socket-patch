@@ -2343,6 +2343,9 @@ projects too. What the sections below then do for it:
   ([Bazel workspaces: Composer](#bazel-workspaces-composer)).
 - Go: the `.bazelignore` at the Bazel root gets two lines for the module copies under
   `.socket` ([Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore)).
+- npm: hosted mode writes nothing for a root pnpm lock whose rules_js hub may hide
+  `pnpm-workspace.yaml` from its pnpm, and does not route a pnpm lock that a hub reads, or
+  may read, through a named registry ([Bazel workspaces: npm](#bazel-workspaces-npm)).
 - Hosted mode leaves a crate, a NuGet package or a gem unpinned, with a warning, when a hub
   call of the workspace may read the project's lock and is not written out plainly.
 - Maven: a warning per patch when a rules_jvm_external hub builds the artifact, or may.

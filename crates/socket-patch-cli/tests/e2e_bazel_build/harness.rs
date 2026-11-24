@@ -1240,6 +1240,19 @@ impl Cell {
         env: &[(&str, &str)],
         bazel: &[&str],
     ) -> Value {
+        self.without_and_beside(api, args, env, bazel).1
+    }
+
+    /// [`Cell::off_is_without_bazel`], with what the run without the Bazel
+    /// files gave before what the run beside them gave: for a test that
+    /// also holds what the run with the variable did, which is the first.
+    pub fn without_and_beside(
+        &self,
+        api: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        bazel: &[&str],
+    ) -> (Value, Value) {
         let files = self.tree();
         let mut plain = files.clone();
         plain.retain(|rel, _| !bazel.contains(&rel.as_str()));
@@ -1280,7 +1293,7 @@ impl Cell {
             beside, without,
             "{test}: {args:?} is no other run in the workspace"
         );
-        beside
+        (without, beside)
     }
 
     /// Where a flow has `socket-patch` write the VEX document `name`:
