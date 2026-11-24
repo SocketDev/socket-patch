@@ -35,7 +35,7 @@
 
 use std::path::Path;
 
-use crate::bazel::built::{lock_text, reader, Unbuilt};
+use crate::bazel::built::{from_root, lock_text, reader, Unbuilt};
 use crate::bazel::workspace::Doubt;
 use crate::bazel::BazelRoot;
 use crate::crawlers::Ecosystem;
@@ -136,10 +136,11 @@ async fn refusals_unless<'a>(
         };
         let mut wired = names(lock);
         // The first file a call names says nothing of a second one. Another
-        // file of the list that a call names stands in the way when it
-        // holds the package and not by the copy (a `uv.lock` locked again
-        // beside a vendored requirements file): the run would rewrite it.
-        // One that cannot be read may hold it.
+        // file of the list that a call names, or may name where the reading
+        // is in doubt, stands in the way when it holds the package and not
+        // by the copy (a `uv.lock` locked again beside a vendored
+        // requirements file): the run would rewrite it. One that cannot be
+        // read may hold it.
         let name = purl
             .rsplit('/')
             .next()
@@ -156,9 +157,9 @@ async fn refusals_unless<'a>(
             if !wired {
                 break;
             }
-            if let Some(Ok(named)) = reader(&root, purls, vec![file.clone()]).await {
-                let dir = root.dir.clone();
-                let text = run_blocking(move || lock_text(&dir, &named.lock)).await;
+            if reader(&root, purls, vec![file.clone()]).await.is_some() {
+                let (dir, file) = (root.dir.clone(), from_root(&root, file));
+                let text = run_blocking(move || lock_text(&dir, &file)).await;
                 wired = names(&text) || !holds(&text);
             }
         }
@@ -406,6 +407,38 @@ ruby.bundle_fetch(name = "bundle", gemfile = "//api:Gemfile", gemfile_lock = "//
         assert_eq!(declined().await, [other, gem]);
         fs::write(api.join("uv.lock"), "").unwrap();
         assert_eq!(declined().await, [other, gem]);
+        // A second attribute that is not written out may name the uv lock:
+        // it is read as one the call names. (The hub names the vendored
+        // requirements file itself here: `-r base.txt` would hold `a`.)
+        fs::write(api.join("requirements.txt"), &line).unwrap();
+        let unwritten = "\"//api:requirements.txt\", requirements_by_platform = PLATFORMS";
+        fs::write(
+            root.join("MODULE.bazel"),
+            HUBS.replace("\"//api:base.txt\"", unwritten),
+        )
+        .unwrap();
+        fs::write(api.join("uv.lock"), entry("")).unwrap();
+        assert_eq!(declined().await, [wheel, other, gem]);
+        fs::write(api.join("uv.lock"), entry(&copy)).unwrap();
+        assert_eq!(declined().await, [other, gem]);
+    }
+
+    /// A requirements file the hub reads that brings the project's own in
+    /// with `-r` hands the hub every file the run would write: declined.
+    #[tokio::test]
+    async fn a_hub_file_that_includes_the_project_s_requirements_is_declined() {
+        let hub = HUBS.replace("//api:base.txt", "//api:all.txt");
+        let files = [
+            ("api/all.txt", "-r requirements.txt\n"),
+            ("api/requirements.txt", "x==1.0.0\n"),
+        ];
+        let (_tmp, root) = checkout(&hub, &files);
+        let (code, detail) = declined(&root.join("api"), Ecosystem::Pypi).await;
+        assert_eq!(code, PYPI_CODE);
+        assert!(detail.contains("names api/all.txt; "), "{detail}");
+        // Without the include, the hub reads a file the run leaves alone.
+        fs::write(root.join("api/all.txt"), "y==1.0.0\n").unwrap();
+        assert_eq!(asked(&root.join("api"), Ecosystem::Pypi, false).await, None);
     }
 
     /// The uv lock of the project is a file a hub can be given, and a hub
