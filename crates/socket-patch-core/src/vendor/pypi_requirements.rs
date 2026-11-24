@@ -1036,7 +1036,8 @@ fn ledger_record_refusal(entry: &VendorEntry, rec: &WiringRecord) -> Option<Stri
                 && super::lock_inventory::pypi::socket_reference_coords(token)
                     .is_some_and(|(wheel_name, _)| wheel_name == canon)
         });
-    if !ours {
+    // Beside a Bazel hub the line holds the wheel by its URL.
+    if !ours && !super::pypi_distdir::names(new, purl, &entry.uuid) {
         return Some(format!(
             "replaces a line that is not this patch's vendored {canon} wheel line \
              (./.socket/vendor/pypi/{}/…)",
@@ -1067,16 +1068,22 @@ fn ledger_record_refusal(entry: &VendorEntry, rec: &WiringRecord) -> Option<Stri
         text.push_str(body);
         text.push('\n');
     }
-    let scan = scan_pins(&text, &canon, &version);
-    let one_pin = logical_lines(&text).len() == 1
-        && scan.exact.len() == 1
-        && !(scan.extras || scan.range || scan.other_branches || scan.templated);
-    (!one_pin).then(|| {
+    (!one_pin(&text, &canon, &version)).then(|| {
         format!(
             "puts back text that is not the one `{canon}=={version}` requirement vendoring \
              replaced"
         )
     })
+}
+
+/// Whether `text` is one requirement, the exact pin `canon_name==version`
+/// (with its `--hash` options and continuation lines): what a revert may
+/// put back in the place of a line vendoring wrote.
+pub(super) fn one_pin(text: &str, canon_name: &str, version: &str) -> bool {
+    let scan = scan_pins(text, canon_name, version);
+    logical_lines(text).len() == 1
+        && scan.exact.len() == 1
+        && !(scan.extras || scan.range || scan.other_branches || scan.templated)
 }
 
 fn drift_warning(file: &str, rec: &WiringRecord) -> VendorWarning {

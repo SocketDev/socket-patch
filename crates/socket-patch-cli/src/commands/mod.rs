@@ -56,22 +56,37 @@ pub(crate) fn project_state_in_scope(common: &crate::args::GlobalArgs) -> bool {
 
 /// In a Bazel workspace the root's `.bazelignore` names the directories of
 /// the project's patched Go module copies, so that Bazel and gazelle read
-/// no package there (`socket_patch_core::bazel::ignore`). A command that can
-/// write or remove such a copy calls this once, after the last step that
-/// can change a copy or take one back and before it gives up its apply
-/// lock. Nothing is done in a dry run or a `--global` run, and a run whose
-/// `--ecosystems` leaves `golang` out only takes away the pair of a copy
-/// that is gone. So does the prune pass of a scan, which comes here after
-/// its scan has (`adds` false) and can only have removed a copy: a file
-/// it cannot write is left to the next command's warning.
+/// no package there (`socket_patch_core::bazel::ignore`), and the root's
+/// `.bazelrc` names the directory of each patched wheel that vendored
+/// mode committed as a download cache of Bazel, so that the build takes
+/// the wheel from there (`socket_patch_core::vendor::pypi_distdir`). A
+/// command that can write or remove such a copy calls this once, after
+/// the last step that can change a copy or take one back and before it
+/// gives up its apply lock. Nothing is done in a dry run or a `--global`
+/// run, and a run whose `--ecosystems` leaves `golang` or `pypi` out only
+/// takes away the pair of a copy of that ecosystem that is gone. So does
+/// the prune pass of a scan, which comes here after its scan has (`adds`
+/// false) and can only have removed a copy: a file it cannot write is
+/// left to the next command's warning.
 ///
-/// A human run is told here that the file changed, or why it could not be;
+/// A human run is told here that a file changed, or why it could not be;
 /// the result is that warning again, for the command's envelope.
 pub(crate) async fn sync_bazelignore(
     common: &crate::args::GlobalArgs,
     adds: bool,
 ) -> Vec<crate::json_envelope::RunWarning> {
-    use socket_patch_core::{bazel::ignore, crawlers::Ecosystem::Golang};
+    use socket_patch_core::bazel::{distdir, ignore};
+    use socket_patch_core::crawlers::Ecosystem::{Golang, Pypi};
+    use socket_patch_core::vendor::pypi_distdir::sync_bazelrc;
+    // What each file is told to hold, and that nothing is left for it.
+    const GO: [&str; 2] = [
+        "the lines that keep patched Go module copies under .socket out of Bazel's packages",
+        "no patched Go module copy is left under .socket",
+    ];
+    const WHEELS: [&str; 2] = [
+        "the lines that make Bazel take patched wheels from .socket/vendor/pypi",
+        "no patched wheel is left under .socket/vendor/pypi for Bazel to take",
+    ];
     let mut warnings = Vec::new();
     if common.dry_run || common.is_global() {
         return warnings;
@@ -84,29 +99,31 @@ pub(crate) async fn sync_bazelignore(
     }
     let (loud, mut told) = (!common.json && !common.silent, Vec::new());
     for project in projects {
-        match ignore::sync(&project, adds && common.ecosystem_selected(Golang)).await {
-            Ok(Some(file)) if loud && !told.contains(&file) => {
-                let (verb, what) = match file.exists() {
-                    true => (
-                        "Updated",
-                        "the lines that keep patched Go module copies under .socket out of \
-                         Bazel's packages",
-                    ),
-                    false => ("Removed", "no patched Go module copy is left under .socket"),
-                };
-                println!("{verb} {}: {what}", file.display());
-                told.push(file);
-            }
-            Err(detail) if adds => {
-                if loud {
-                    eprintln!("Warning: {detail}");
+        let copies = ignore::sync(&project, adds && common.ecosystem_selected(Golang)).await;
+        let wheels = sync_bazelrc(&project, adds && common.ecosystem_selected(Pypi)).await;
+        let synced = [
+            (copies, GO, ignore::NOT_UPDATED),
+            (wheels, WHEELS, distdir::NOT_UPDATED),
+        ];
+        for (synced, [holds, nothing], not_updated) in synced {
+            match synced {
+                Ok(Some(file)) if loud && !told.contains(&file) => {
+                    let (verb, what) = match file.exists() {
+                        true => ("Updated", holds),
+                        false => ("Removed", nothing),
+                    };
+                    println!("{verb} {}: {what}", file.display());
+                    told.push(file);
                 }
-                warnings.push(crate::json_envelope::RunWarning::new(
-                    ignore::NOT_UPDATED,
-                    detail,
-                ));
+                Err(detail) if adds => {
+                    if loud {
+                        eprintln!("Warning: {detail}");
+                    }
+                    let warning = crate::json_envelope::RunWarning::new(not_updated, detail);
+                    warnings.push(warning);
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
     warnings

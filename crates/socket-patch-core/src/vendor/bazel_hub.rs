@@ -65,9 +65,17 @@ pub async fn refusals<'a>(
 }
 
 /// What stands between vendored mode and a list of files of a project
-/// ([`standing`]): the words of the refusal, and the text of the lock the
-/// hub reads where a call names one. `None` where nothing does.
-type Standing = Option<(String, Option<String>)>;
+/// ([`standing`]): the words of the refusal, the text of the lock the hub
+/// reads where a call names one, and whether one does, with certainty.
+/// `None` where nothing does.
+type Standing = Option<(String, Option<String>, bool)>;
+
+/// What the refusal says after its own words where a wheel could be a
+/// download cache of Bazel ([`super::pypi_distdir`]) and is not made one:
+/// the reason follows.
+const NO_CACHE: &str = "the form that rules_python does build, the patched wheel committed as a \
+                        download cache of Bazel, is written only where the checkout shows that \
+                        it works, and not here";
 
 /// What rules_ruby builds of a hosted pin: the `sha256` of a gem that the
 /// call lists holds the build to the registry's gem.
@@ -103,6 +111,14 @@ async fn refusals_unless<'a>(
         // The files a hub can be given that the run for this package would
         // point at a copy. With none, no hub stands in its way.
         let locks = match Ecosystem::from_purl(purl) {
+            // A wheel that already is a download cache: nothing to write.
+            Some(Ecosystem::Pypi)
+                if super::pypi_distdir::in_sync(project, purl, uuid)
+                    .await
+                    .is_some() =>
+            {
+                continue
+            }
             Some(Ecosystem::Pypi) => super::pypi::hub_files(project, purl).await,
             Some(Ecosystem::Gem) => [super::gem::GEMFILE, super::gem::GEMFILE_LOCK]
                 .map(String::from)
@@ -121,7 +137,7 @@ async fn refusals_unless<'a>(
                 asked.len() - 1
             }
         };
-        let Some((detail, lock)) = &asked[at].1 else {
+        let Some((detail, lock, named)) = &asked[at].1 else {
             continue;
         };
         // A lock names the copy of a patch by the copy's directory, outside
@@ -162,11 +178,57 @@ async fn refusals_unless<'a>(
                 wired = names(&text) || !holds(&text);
             }
         }
-        if !wired {
+        if wired {
+            continue;
+        }
+        // A wheel is committed as a download cache of Bazel where the
+        // checkout shows that the build takes it; elsewhere the refusal
+        // says why not.
+        if code != PYPI_CODE || !*named {
             refused.push((*purl, code, detail.clone()));
+            continue;
+        }
+        let gate = super::pypi_distdir::gate(project, &root, files, (purl, uuid));
+        if let Err(why) = gate.await {
+            refused.push((*purl, code, format!("{detail}; {NO_CACHE}: {why}")));
         }
     }
     refused
+}
+
+/// How the run for the PyPI package `purl` of `project` and its patch
+/// `uuid` writes the wheel as a download cache of Bazel
+/// ([`super::pypi_distdir`]): `Some(Some(pin))` when it already is one,
+/// pinned at that path and sha256, and `Some(None)` when the run makes it
+/// one, which is where [`refusals`] lets the package through for that.
+/// `None` for every other package: one that the user allowed
+/// ([`ALLOW_IN_BAZEL_ENV`]) is written as it is without Bazel.
+///
+/// `Err` is the refusal of [`refusals`], asked again where the lock is
+/// about to be written: a run that takes a hosted pin over has put the
+/// registry's pin back since the run was let through, and that pin may be
+/// one the form is not written for.
+pub(super) async fn download_cache(
+    project: &Path,
+    purl: &str,
+    uuid: &str,
+) -> Result<Option<Option<(String, String)>>, (&'static str, String)> {
+    if let Some(pin) = super::pypi_distdir::in_sync(project, purl, uuid).await {
+        return Ok(Some(Some(pin)));
+    }
+    if let Some((_, code, why)) = refusals(project, &[(purl, uuid)]).await.pop() {
+        return Err((code, why));
+    }
+    let dir = project.to_path_buf();
+    let root = run_blocking(move || crate::bazel::bazel_root(&dir)).await;
+    let Some(root) = root.filter(|_| !env_flag(ALLOW_IN_BAZEL_ENV)) else {
+        return Ok(None);
+    };
+    let locks = super::pypi::hub_files(project, purl).await;
+    let named =
+        !locks.is_empty() && matches!(reader(&root, "pypi", locks.clone()).await, Some(Ok(_)));
+    let gate = super::pypi_distdir::gate(project, &root, &locks, (purl, uuid));
+    Ok((named && gate.await.is_ok()).then_some(None))
 }
 
 /// The [`Standing`] of the files `locks` of the project of `root`, for the
@@ -183,7 +245,7 @@ async fn standing(
     // types and no tool prints.
     let at = without_verbatim_prefix(root.dir.clone());
     let at = at.display();
-    let (reads, lock) = match reader(root, purls, locks).await? {
+    let (reads, lock, named) = match reader(root, purls, locks).await? {
         Ok(Unbuilt {
             call,
             file,
@@ -195,7 +257,8 @@ async fn standing(
             // Read as a lock of the workspace is: within its bound, and
             // not through a link that leads out of the Bazel root.
             let dir = root.dir.clone();
-            (reads, run_blocking(move || lock_text(&dir, &lock)).await)
+            let text = run_blocking(move || lock_text(&dir, &lock)).await;
+            (reads, text, true)
         }
         Err(Doubt { file, line, why }) => {
             let line = match line {
@@ -206,7 +269,7 @@ async fn standing(
                 "the files of the Bazel workspace at {at} cannot be read with certainty, so a \
                  call of {ruleset} may name a lock of this project ({file}{line}: {why})"
             );
-            (reads, None)
+            (reads, None, false)
         }
     };
     let detail = format!(
@@ -216,7 +279,7 @@ async fn standing(
          `--allow-vendored-in-bazel` if no build takes the packages of this project from \
          {ruleset}"
     );
-    Some((detail, lock))
+    Some((detail, lock, named))
 }
 
 #[cfg(test)]

@@ -1869,7 +1869,7 @@ workspace and that Bazel does not build keeps the matrix at the top.
 | Ecosystem, and how Bazel takes its packages | Hosted | Vendored | Agent | VEX |
 |---|---|---|---|---|
 | npm: aspect_rules_js `npm.npm_translate_lock` over a pnpm lock | Supported | Supported | Not supported | Supported |
-| PyPI: rules_python `pip.parse` over a requirements file | Supported | Not supported | Not supported | Supported |
+| PyPI: rules_python `pip.parse` over a requirements file | Supported | Supported with rules_python 2.5.0 | Not supported | Supported |
 | Go: gazelle `go_deps.from_file` over `go.mod` | Supported | Supported | Not supported | Supported with a hosted or vendored patch |
 | RubyGems: rules_ruby `ruby.bundle_fetch` over `Gemfile.lock` | Supported with no `gem_checksums` on the call | Not supported | Not supported | Supported |
 | Cargo: rules_rust `crate.from_cargo` over `Cargo.lock` | Supported with `cargo_config` on the hub | Supported | Not supported | Supported with a hosted or vendored patch |
@@ -1896,6 +1896,9 @@ exits 0 and leaves a build that fails (the known problems below). What a cell sa
   run would rewrite
   ([Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode)),
   for Composer in every Bazel workspace ([Bazel workspaces: Composer](#bazel-workspaces-composer)).
+  For PyPI it declines outside the condition of its cell, which
+  [Bazel workspaces: PyPI vendored mode as a download cache](#bazel-workspaces-pypi-vendored-mode-as-a-download-cache)
+  spells out.
 - **Supported**, for VEX: `socket-patch vex` and `--vex` say `not_affected` of a package the
   Bazel build takes patched, and `affected` of one whose patch Bazel does not build.
   [Bazel workspaces: VEX](#bazel-workspaces-vex) has the cases and the limits; a vendored gem
@@ -1924,7 +1927,10 @@ What the table was tested with:
 - **npm**: aspect_rules_js 3.6.0, `npm.npm_translate_lock(pnpm_lock = "//:pnpm-lock.yaml")`
   without `update_pnpm_lock`, and a lock of `lockfileVersion: '9.0'`.
 - **PyPI**: rules_python 2.5.0-rc4, `pip.parse(requirements_lock = "//:requirements.txt")`,
-  and a root `requirements.txt` with hashes.
+  and a root `requirements.txt` with hashes. Vendored mode pins the wheel by its URL, as
+  hosted mode does, commits it, and makes Bazel take the committed copy with a `--distdir`
+  line in [`.bazelrc`](#bazel-workspaces-pypi-vendored-mode-as-a-download-cache); the test
+  builds it with the patch host stopped.
 - **Go**: gazelle 0.54.0 with rules_go 0.65.0 (Bazel 9 and 8) and gazelle 0.45.0 with
   rules_go 0.53.0 (Bazel 7), `go_deps.from_file(go_mod = "//:go.mod")` with
   `go_deps.config(check_direct_dependencies = "error")`, and the module required directly in
@@ -1956,7 +1962,7 @@ A ruleset, a release of one or a way of calling it that the list does not name i
 Treat it as not supported until a build after the command has shown you the patched package.
 
 Bazel's own lock: a command or an undo leaves `MODULE.bazel.lock` stale for PyPI on Bazel 8.5
-and later, for NuGet, and for Cargo under rules_rust 0.75.0. A build that may not update the
+and later (hosted and vendored mode), for NuGet, and for Cargo under rules_rust 0.75.0. A build that may not update the
 lock (`--lockfile_mode=error`) fails until one that may, or
 `bazel mod deps --lockfile_mode=update`, has rewritten it. Commit the rewritten lock with the
 patch.
@@ -2014,8 +2020,16 @@ In these a command exits 0 and the Bazel build passes on the unpatched package:
 
 [Bazel workspaces: VEX](#bazel-workspaces-vex) lists what the document says in such cases.
 
-And three that concern neither:
+And four that concern neither:
 
+- **Vendored PyPI is a download cache, not a lock that names the copy.** The line of
+  `requirements.txt` is the hosted one, so pip outside Bazel asks the patch host for the
+  wheel; Bazel replaces a changed or missing copy from the patch host, without a message,
+  when it can reach it (it never builds other bytes than the pinned wheel's); and a
+  downloader config that blocks the patch host fails the build although the copy is
+  committed, which is why vendored mode declines where an rc file of the checkout names
+  one or imports a file from outside the checkout. `socket-patch vendor --check` is what
+  holds the committed wheel to the patch: run it in CI.
 - **Vendored Cargo under rules_rust 0.75.0**: a build writes a `BUILD.bazel` into the
   committed copy, and right after it `vendor --check` exits 1 (`vendor_inventory_mismatch`)
   and `vex` writes no document, although the build is the patched one. A second
@@ -2882,7 +2896,11 @@ and neither ruleset builds from such a file:
 
 Both were measured on Bazel 9.3.2, 8.8.2 and 7.7.2, after a `scan --mode vendored` that exited
 0 and reported the package vendored. So vendored mode now declines such a package, where the
-files of the workspace show that a hub reads the file it would rewrite.
+files of the workspace show that a hub reads the file it would rewrite. For a PyPI package it
+first asks whether the checkout shows that another form works, in which the build takes the
+committed wheel, and writes that one where it does:
+[Bazel workspaces: PyPI vendored mode as a download cache](#bazel-workspaces-pypi-vendored-mode-as-a-download-cache).
+What follows is what happens everywhere else.
 
 **What is read.** The project is in a Bazel workspace by the lookup of
 [Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore). There socket-patch reads
@@ -2951,7 +2969,9 @@ and line, the lock, and the mode to use instead:
 ```
 
 For an uncertain reading the message names the file, the line and the reason where the
-call stands. Hosted mode pins the patch in the same file, as a wheel URL with its sha256 or
+call stands. For a PyPI package whose hub was read with certainty the message goes on with
+why the download cache is not written
+([the conditions](#bazel-workspaces-pypi-vendored-mode-as-a-download-cache)). Hosted mode pins the patch in the same file, as a wheel URL with its sha256 or
 as a gem source, and both rulesets build it: that is tested on the three Bazel releases, in
 the checkout where vendored mode was declined. For a gem that holds for a
 `ruby.bundle_fetch` without `gem_checksums`, as the message for a gem says: with a
@@ -3023,6 +3043,137 @@ Limits:
 [`e2e_bazel_build/pypi.rs`](../crates/socket-patch-cli/tests/e2e_bazel_build/pypi.rs) and
 [`ruby.rs`](../crates/socket-patch-cli/tests/e2e_bazel_build/ruby.rs) run the refusal, the
 switch and hosted mode on a real Bazel.
+
+## Bazel workspaces: PyPI vendored mode as a download cache
+
+Where a rules_python `pip.parse` hub reads the project's `requirements.txt`, the path line of
+vendored mode breaks the build
+([Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode)).
+The line of hosted mode does not: the hub fetches a wheel that a requirement names by its URL
+with Bazel's own downloader, by the sha256 of the line. And before Bazel downloads a file
+that has a checksum, it looks in every `--distdir` for a file of that name and checksum. So
+in such a project `scan --mode vendored` (and `get --mode vendored`, and `vendor`) writes
+three things:
+
+1. **The package's line of `requirements.txt`, exactly as hosted mode writes it**:
+   `<name> @ <URL of the patched wheel on the patch host> --hash=sha256:<hex>`.
+2. **The patched wheel**, downloaded once, at `.socket/vendor/pypi/<uuid>/<wheel>`, under the
+   file name its URL ends in, with the files vendored mode keeps beside every wheel and its
+   entry in `.socket/vendor/state.json`.
+3. **One line in the `.bazelrc` at the Bazel root**, under a comment line of socket-patch's
+   own:
+
+   ```
+   # socket-patch: the committed copy of a patched wheel, for Bazel's downloads (to opt out, comment out the next line)
+   common --distdir=.socket/vendor/pypi/<uuid>
+   ```
+
+   The directory is written from the Bazel root (`svc/.socket/vendor/pypi/<uuid>` for a
+   project in `svc`): Bazel reads a relative `--distdir` from the workspace root, from any
+   directory a command runs in, and does not expand `%workspace%` in this option.
+
+Commit all of it. The build then takes the committed wheel and asks no host. Measured with
+rules_python 2.5.0-rc4 on Bazel 9.3.2, 8.8.2 and 7.7.2: a fresh clone builds the patched
+package with the patch host stopped, a new output base and no copy of the wheel in Bazel's
+repository cache, also from a sub-directory and beside a `--distdir` of your own.
+[`e2e_bazel_build/pypi.rs`](../crates/socket-patch-cli/tests/e2e_bazel_build/pypi.rs) builds
+that on the three releases, in a checkout whose `.bazelrc` has a `--distdir` line of its own.
+
+Each patch gets a line for its own directory. A `--distdir` is one flat directory that Bazel
+searches by file name, two patches of one release have wheels of one name, and the directory
+of a patch is what vendored mode writes, checks and removes as a unit.
+
+**When it is written.** Only where the files of the checkout show that it works. Each
+condition that fails declines the package with `vendor_pypi_bazel_hub`, as before, and the
+message ends with the one that failed:
+
+- The project pins in `requirements.txt` alone (no uv, Pipenv, Poetry, PDM or PEP 751 lock
+  holds the package), and that file is in pip's hash-checking mode: Bazel takes a committed
+  file only for a download that has a checksum.
+- The package's requirement is one exact pin with its hashes, which is what hosted mode
+  rewrites; extras, an environment marker, an option, a comment or an indent on it decline,
+  because the form was measured with the plain line.
+- A `pip.parse` names that file by `requirements_lock`, and names no other file of the
+  project by any attribute (a `requirements_linux` or `requirements_by_platform` beside it
+  would build some platform from a file that is not written). Every call of the hub is
+  written out and runs, nothing of the module files is in doubt, and no `WORKSPACE` file
+  defines repositories.
+- Bazel selected rules_python 2.5.0 (or 2.5.0-rc4, the same commit). socket-patch reads that
+  as it reads the release of rules_jvm_external: from the one `source.json` of the ruleset
+  that `MODULE.bazel.lock` records, checked against what `MODULE.bazel` asks for. A checkout
+  without that lock, or with a stale one, is declined: build once, so that Bazel writes it.
+  Other releases fetch a wheel through other code, which no build here has run.
+- The checkout names Bazel 7, 8 or 9 (`.bazeliskrc`, `.bazelversion`); or it names none and
+  its `MODULE.bazel.lock` has a version that Bazel 7.5.0 to 9.3.2 write.
+- No rc file of the checkout (`.bazelrc` and what it imports) names a downloader config
+  (`--downloader_config`, `--experimental_downloader_config`), `--repository_disable_download`
+  or a remote downloader, and all of them can be read. Bazel refuses a download that such a
+  config blocks before it looks in a `--distdir`. An `import` or `try-import` of an absolute
+  path declines as well: that file is outside the checkout, socket-patch does not read it,
+  and it is where the settings of a site's mirror usually are.
+- The line can be written: `.bazelrc` is no symbolic link and not read-only, and the
+  project's path from the Bazel root holds no blank, quote, backslash or `#`.
+
+With `--allow-vendored-in-bazel` vendored mode writes the path line instead, here too: the
+switch says that no build takes the project's packages from the hub.
+
+**What it does not do.** The command says the first two in a warning
+(`vendor_pypi_bazel_download_cache`) when it writes the form:
+
+- pip outside Bazel reads the same line, and asks the patch host for the wheel. It does not
+  take the committed copy.
+- With the patch host unreachable, a changed or missing copy fails the build. With the host
+  reachable, Bazel passes over such a copy without a message and downloads the pinned wheel:
+  it never builds other bytes, and it never says that the committed copy is wrong.
+  `socket-patch vendor --check` is what holds the committed wheel to the patch, so run it
+  in CI. A machine whose repository cache already holds the wheel does not read the copy at
+  all.
+- A relock (`pip-compile`, a version bump) writes the registry's pin back over the line. The
+  build is then green and unpatched, and the copy and its `.bazelrc` line stay behind
+  without effect. `socket-patch vendor --check` fails on that, and the next scan pins the
+  package again.
+- A downloader config that the files of the checkout do not show is not seen: one given on
+  the command line, in the rc file of the home directory or of the machine, or in a file
+  that a `try-import` names and this checkout does not have (a `user.bazelrc` that is not
+  committed). Where it blocks the patch host the build fails although the copy is
+  committed, as it fails on a hosted pin.
+- A build that may not update Bazel's lock (`--lockfile_mode=error`) fails right after the
+  command on Bazel 8.5 and later, until a build that may update `MODULE.bazel.lock` has
+  run, as in hosted mode. Commit the updated lock with the patch.
+- A Bazel command that reads no workspace rc file (`--ignore_all_rc_files`,
+  `--noworkspace_rc`) does not see the line, and asks the patch host (by Bazel's
+  documentation of the two options; not run).
+- Not measured: a wheel with a platform tag, a second Python version in the hub, Linux and
+  Windows (every run was on macOS; CI runs the test on Linux), and remote execution.
+
+**The `.bazelrc` lines.** They are kept as the `.bazelignore` lines of
+[Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore) are, by the same commands
+(every one that can write or remove a copy ends by bringing the file in line, unless it is a
+dry run; one whose `--ecosystems` leaves `pypi` out adds no line). A line is added at the
+end of the file for the directory of each such wheel while it exists, and the pair is taken
+away once the directory is gone, which leaves the file as it was, byte for byte; a `.bazelrc`
+left empty is removed, also when it was an empty file of yours. Your own lines are never
+touched. To decline a line, put a `#` before it and leave socket-patch's comment above it:
+nothing is added for that directory again, and the two lines stay yours. A `.bazelrc` that is
+a link or read-only declines the package before anything is written (the conditions above).
+A file that cannot be written when the command gets to it (it became read-only since, the
+root directory takes no new file, or an undo finds its pair in a file it may not change) is
+a warning, `bazelrc_not_updated`, that names the line to add or the pair that can be
+deleted; without the line the build downloads the wheel from the patch host, as in hosted
+mode.
+
+**The other commands.** `list` shows the package as vendored, and `vex` attests it as a
+vendored package whose committed wheel holds the patch (`not_affected`): the hub builds that
+wheel, by the sha256 of the line. `vendor --check` verifies the committed wheel against the
+patch and that `requirements.txt` still holds the line. `vendor --revert`, `rollback` and
+`remove` put the pin back as it was, delete the directory and take the pair out of
+`.bazelrc`; none of them needs a host. A later run in the same mode writes nothing, while
+`requirements.txt` holds the line as the run wrote it. A line that has been changed since
+(by hand: a comment after it, its hash moved to a line of its own) declines the package
+with `vendor_pypi_bazel_hub` before anything is fetched, and the committed wheel and its
+`.bazelrc` line stay: put the line back, or run `socket-patch vendor --revert` and vendor
+again. A `scan --mode hosted` takes the package over: the line stays, and the copy and its
+`.bazelrc` pair go. A newer patch of the package replaces the line, the wheel and the pair.
 
 ## Ruby gems: hosted mode
 
@@ -3475,7 +3626,10 @@ is patched:
   Vendored mode declines both by default where the hub reads the file
   ([Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode)),
   so this is the state of a project vendored with `--allow-vendored-in-bazel` or by an
-  earlier release.
+  earlier release. A wheel that vendored mode committed as a
+  [download cache](#bazel-workspaces-pypi-vendored-mode-as-a-download-cache) is not such a
+  copy: the file the hub reads names it by its URL and sha256, as a hosted pin does, and the
+  package keeps its `not_affected` statement.
 
 Each advisory of such a patch gets a statement of the package's own with the status
 `affected`. It names that package alone under the product, and its `action_statement` says
@@ -3572,7 +3726,7 @@ The document and the build are tested to agree on real Bazel 9.3.2, 8.8.2 and
 `go.mod` (hosted and vendored mode), npm through
 aspect_rules_js's `npm.npm_translate_lock(pnpm_lock = "//:pnpm-lock.yaml")` (hosted and
 vendored), PyPI through rules_python's `pip.parse(requirements_lock = "//:requirements.txt")`
-(hosted), and RubyGems through rules_ruby's
+(hosted, and vendored as a download cache), and RubyGems through rules_ruby's
 `ruby.bundle_fetch(gemfile_lock = "//:Gemfile.lock")` without `gem_checksums` (hosted). There
 the build prints the patched package, and the document of the run (`--vex`), of `vex` and of
 `vex --no-verify` is one `not_affected` statement that names the package and the patch; the

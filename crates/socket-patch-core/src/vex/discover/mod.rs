@@ -2071,6 +2071,11 @@ async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
     out.recognized.extend(ctx.take_recognized());
     out.read.extend(ctx.take_read());
     out.patch_server_origins = ctx.origin.origins().to_vec();
+    // A wheel that vendored mode committed as a download cache of Bazel
+    // is wired by a line that names it on the patch host.
+    if let Some(root) = ctx.disk_root_reading([crate::vendor::VENDOR_STATE_REL]) {
+        crate::vendor::pypi_distdir::claim(root, &mut out).await;
+    }
     out.finalize();
     out
 }

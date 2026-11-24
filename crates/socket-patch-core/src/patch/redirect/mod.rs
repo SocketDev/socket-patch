@@ -107,7 +107,7 @@ mod pypi_takeover;
 pub use pypi_takeover::preflight_pypi_takeover;
 #[cfg(test)]
 mod python_lock_equivalence_tests;
-mod requirements;
+pub(crate) mod requirements;
 pub mod sbt;
 pub mod scala_guidance;
 pub use requirements::preflight_requirements_takeover;

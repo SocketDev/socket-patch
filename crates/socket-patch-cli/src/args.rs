@@ -433,8 +433,9 @@ pub struct GlobalArgs {
     /// (`vendor_pypi_bazel_hub`, `vendor_gem_bazel_hub`), which builds
     /// nothing from a lock that names a copy under `.socket/vendor`. Pass
     /// it when the build does find the copy, or does not take the
-    /// project's packages from that lock. Other subcommands accept it
-    /// silently.
+    /// project's packages from that lock. A PyPI package is then written
+    /// by its path also where vendored mode would commit its wheel as a
+    /// download cache of Bazel. Other subcommands accept it silently.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long = "allow-vendored-in-bazel",

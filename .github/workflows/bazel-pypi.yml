@@ -44,7 +44,8 @@ on:
     # starts the legs of every ecosystem. `bazel/` also says which lock a
     # hub reads, for the refusal of vendored mode beside such a hub
     # (vendor/bazel_hub.rs), which vendor/refusals.rs hands to every
-    # command. Nothing else that
+    # command, and for the form vendored mode writes where a build takes
+    # a committed wheel (vendor/pypi_distdir.rs). Nothing else that
     # another ecosystem's flow owns is here, so any other change to one
     # ecosystem starts that ecosystem's legs only.
     #
@@ -79,6 +80,7 @@ on:
       - 'crates/socket-patch-core/src/vendor/pypi_requirements.rs'
       - 'crates/socket-patch-core/src/vendor/pypi_wheel.rs'
       - 'crates/socket-patch-core/src/vendor/bazel_hub.rs'
+      - 'crates/socket-patch-core/src/vendor/pypi_distdir.rs'
       - 'crates/socket-patch-core/src/vendor/refusals.rs'
       - 'crates/socket-patch-core/src/vex/discover/pypi_other.rs'
       - 'crates/socket-patch-core/src/bazel/**'
@@ -116,6 +118,7 @@ on:
       - 'crates/socket-patch-core/src/vendor/pypi_requirements.rs'
       - 'crates/socket-patch-core/src/vendor/pypi_wheel.rs'
       - 'crates/socket-patch-core/src/vendor/bazel_hub.rs'
+      - 'crates/socket-patch-core/src/vendor/pypi_distdir.rs'
       - 'crates/socket-patch-core/src/vendor/refusals.rs'
       - 'crates/socket-patch-core/src/vex/discover/pypi_other.rs'
       - 'crates/socket-patch-core/src/bazel/**'

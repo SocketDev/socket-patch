@@ -375,7 +375,7 @@ pub enum Built<'a> {
 /// Discovery.java lines 158 and 159 at 7.7.2, 178 and 179 at 8.8.2 and
 /// 9.3.2).
 #[derive(Debug, PartialEq, Eq)]
-enum Asked {
+pub(super) enum Asked {
     /// No version is given.
     Nothing,
     /// A `bazel_dep` asks for this release: Bazel selects it or a newer
@@ -410,11 +410,11 @@ fn ordered(version: &str) -> impl Ord + '_ {
     (identifiers(release), pre.is_empty(), identifiers(pre))
 }
 
-/// What the root module of `ws` says of the ruleset's release: by its
-/// calls that name the ruleset, a `bazel_dep` and the overrides, which are
-/// the functions whose name ends in `_override`.
-fn asked(ws: &Workspace) -> Asked {
-    let named = Some(&Value::Str(EXTENSION.module.to_string()));
+/// What the root module of `ws` says of the release of the ruleset
+/// `module`: by its calls that name the ruleset, a `bazel_dep` and the
+/// overrides, which are the functions whose name ends in `_override`.
+pub(super) fn asked(ws: &Workspace, module: &str) -> Asked {
+    let named = Some(&Value::Str(module.to_string()));
     let names = |call: &&Call| {
         call.bind.is_none() && [call.arg("name"), call.arg("module_name")].contains(&named)
     };
@@ -440,6 +440,51 @@ fn asked(ws: &Workspace) -> Asked {
         (_, Some(Value::Str(least))) if !least.is_empty() => Asked::AtLeast(least.clone()),
         _ => Asked::Nothing,
     }
+}
+
+/// Why the release of the ruleset `module` that Bazel builds with is not
+/// one of `known`: by the one release `lock` (`MODULE.bazel.lock`) says
+/// Bazel selected, where the root module (`asked`) has not asked for
+/// another since. `Ok` when it is one. `so` is what hangs on the release,
+/// for the two reasons that it cannot be told, and `beyond` what to say of
+/// a release outside `known`.
+///
+/// A lock that holds another release than the root now takes is one that
+/// Bazel has not written since: older than what is asked for, or any other
+/// than the one a `single_version_override` pins.
+pub(super) fn known_release(
+    asked: &Asked,
+    lock: &ModuleLock,
+    module: &str,
+    known: &[&str],
+    so: &str,
+    beyond: &dyn Fn(&str) -> String,
+) -> Result<(), String> {
+    let stale = |selected: &str| match asked {
+        Asked::Exactly(pinned) => ordered(pinned) != ordered(selected),
+        Asked::AtLeast(least) => ordered(least) > ordered(selected),
+        Asked::Nothing | Asked::Unknown(_) => false,
+    };
+    let wanted = match asked {
+        Asked::Exactly(wanted) | Asked::AtLeast(wanted) => wanted.as_str(),
+        Asked::Nothing | Asked::Unknown(_) => "",
+    };
+    Err(match (asked, &lock.selected(module)[..]) {
+        (Asked::Unknown(at), _) => format!(
+            "{at} of {module} socket-patch cannot tell which release of the ruleset Bazel \
+             builds with{so}"
+        ),
+        (_, [selected]) if !known.contains(selected) => beyond(selected),
+        (_, [selected]) if stale(selected) => format!(
+            "{FILE} asks for {module} {wanted} and MODULE.bazel.lock holds {selected}: build once \
+             so that Bazel updates its lock"
+        ),
+        (_, [_]) => return Ok(()),
+        _ => format!(
+            "MODULE.bazel.lock does not say which release of {module} Bazel selected{so}: build \
+             once so that Bazel writes its lock"
+        ),
+    })
 }
 
 /// What the hubs of a workspace build: read once, asked per artifact.
@@ -503,7 +548,7 @@ impl Hubs {
                 why: "the block that socket-patch keeps there was changed by hand".to_string(),
             }),
         );
-        let asked = asked(&ws);
+        let asked = asked(&ws, EXTENSION.module);
         let overrides = ws.tags(&EXTENSION, "override").calls.into_iter();
         let overrides = overrides.map(|Tag { file, call, .. }| {
             let (replaced, why) = match call.arg("coordinates") {
@@ -928,7 +973,7 @@ fn rc(view: &dyn Fn(&str) -> Entry, release: Option<super::rc::Release>) -> Vec<
         };
         Some((code, format!("{file}:{line} names `{word}`, {why}")))
     };
-    match mentions(view, &flags) {
+    match mentions(view, &flags, false) {
         Ok(found) => found.into_iter().filter_map(against).collect(),
         Err(file) => {
             let why = format!("the rc file {file} cannot be read, and may switch an entry off");
@@ -972,39 +1017,18 @@ fn settings(
         }
         _ => {}
     }
-    // A lock that holds another release than the root now takes is one
-    // that Bazel has not written since: older than what is asked for, or
-    // any other than the one a `single_version_override` pins.
     let module = EXTENSION.module;
-    let stale = |selected: &str| match asked {
-        Asked::Exactly(pinned) => ordered(pinned) != ordered(selected),
-        Asked::AtLeast(least) => ordered(least) > ordered(selected),
-        Asked::Nothing | Asked::Unknown(_) => false,
-    };
-    let wanted = match asked {
-        Asked::Exactly(wanted) | Asked::AtLeast(wanted) => wanted.as_str(),
-        Asked::Nothing | Asked::Unknown(_) => "",
-    };
-    let why = match (asked, &lock.selected(module)[..]) {
-        (Asked::Unknown(at), _) => format!(
-            "{at} of {module} socket-patch cannot tell which release of the ruleset Bazel \
-             builds with, and the name of a jar's repository depends on it"
-        ),
-        (_, [selected]) if !RULESETS.contains(selected) => format!(
+    let so = ", and the name of a jar's repository depends on it";
+    let beyond = |selected: &str| {
+        format!(
             "Bazel selected {module} {selected}, and how the ruleset names the repository of a \
              jar is known for its releases 6.4 to 7.2: update socket-patch"
-        ),
-        (_, [selected]) if stale(selected) => format!(
-            "{FILE} asks for {module} {wanted} and MODULE.bazel.lock holds {selected}: build once \
-             so that Bazel updates its lock"
-        ),
-        (_, [_]) => return rc(view, release).into_iter().next().map_or(Ok(()), Err),
-        _ => format!(
-            "MODULE.bazel.lock does not say which release of {module} Bazel selected, and the \
-             name of a jar's repository depends on it: build once so that Bazel writes its lock"
-        ),
+        )
     };
-    Err((RELEASE, why))
+    match known_release(asked, &lock, module, &RULESETS, so, &beyond) {
+        Ok(()) => rc(view, release).into_iter().next().map_or(Ok(()), Err),
+        Err(why) => Err((RELEASE, why)),
+    }
 }
 
 impl Hubs {

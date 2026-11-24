@@ -9,6 +9,7 @@ pub const WORKSPACE_FILES: [&str; 4] =
     ["MODULE.bazel", "REPO.bazel", "WORKSPACE", "WORKSPACE.bazel"];
 
 pub mod built;
+pub mod distdir;
 pub mod ignore;
 pub mod maven;
 pub mod rc;
@@ -20,7 +21,7 @@ use std::path::{Path, PathBuf};
 use crate::utils::repo_root::{repo_at_end_of, search_dirs, GitRepo};
 
 /// The Bazel workspace a project is in.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BazelRoot {
     /// The root: the nearest directory, from the project up, that holds one
     /// of [`WORKSPACE_FILES`]. Canonical.

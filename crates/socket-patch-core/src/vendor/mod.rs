@@ -91,6 +91,7 @@ pub mod pnpm_lock;
 pub mod pnpm_lock_legacy;
 pub mod prestage;
 pub mod pypi;
+pub mod pypi_distdir;
 pub(crate) mod pypi_distribution;
 mod pypi_hatch;
 mod pypi_lock;
