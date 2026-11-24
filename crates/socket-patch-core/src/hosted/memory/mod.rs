@@ -833,8 +833,9 @@ async fn engine(
         }
         unsupported_ecosystem_warnings(&state.root, project, ecosystems, &mut warnings);
         // The inventory's packages, and the gems the Bundler lock resolves
-        // only as precompiled platform builds, which it leaves out: hosted
-        // mode redirects those to their per-platform prebuilds.
+        // only as precompiled platform builds, which it leaves out: the
+        // gem rewriter says of each that hosted mode cannot redirect it
+        // (`redirect_gem_platform_unsupported`).
         let platform_gems = crate::vendor::lock_inventory::gem_platform_only_purls_in(
             &ProjectView::Memory(project),
         )

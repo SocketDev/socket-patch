@@ -1173,7 +1173,7 @@ impl RubyCrawler {
 /// `arm64-…`, `java`, `universal-java-1.8`), so a digit after the prefix
 /// means another gem: `foo-1.0-2.0/` is the gem `foo-1.0` at `2.0`, not a
 /// build of `foo` `1.0`.
-pub(crate) fn is_platform_dir_of(dir_name: &str, name: &str, version: &str) -> bool {
+fn is_platform_dir_of(dir_name: &str, name: &str, version: &str) -> bool {
     dir_name
         .strip_prefix(name)
         .and_then(|rest| rest.strip_prefix('-'))
@@ -1190,32 +1190,6 @@ impl Default for RubyCrawler {
 }
 
 impl RubyCrawler {
-    /// The installed gem dir of each of `leaves` in `gem_path`: element `i`
-    /// is `<gem_path>/<leaves[i]>` when that is an installed-looking gem dir
-    /// (the test [`Self::find_by_purls`] applies), else `None`. A leaf names
-    /// ONE build (`<name>-<version>`, or `<name>-<version>-<platform>`), so,
-    /// unlike [`Self::find_each_by_purl`], a ruby-platform dir never stands
-    /// in for the platform build installed beside it: a caller that knows
-    /// which builds a lock names asks for exactly those.
-    pub async fn find_builds(&self, gem_path: &Path, leaves: &[String]) -> Vec<Option<PathBuf>> {
-        let gem_path = gem_path.to_path_buf();
-        let leaves = leaves.to_vec();
-        crate::utils::fs::run_blocking(move || {
-            leaves
-                .iter()
-                .map(|leaf| {
-                    // One path segment, as a gem dir's name is.
-                    if !path_safety::is_safe_single_segment(leaf) {
-                        return None;
-                    }
-                    let dir = gem_path.join(leaf);
-                    verify_gem_at_path_sync(&dir).then_some(dir)
-                })
-                .collect()
-        })
-        .await
-    }
-
     /// [`Self::find_by_purls`] for each of `purls` ON ITS OWN — element `i`
     /// is what `find_by_purls(gem_path, &[purls[i]])` returns for that PURL
     /// — as one blocking-pool task that lists `gem_path` at most once for

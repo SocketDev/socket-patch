@@ -26,10 +26,7 @@
 //!   name order, into the upstream `GEM` section: the one remaining
 //!   non-Socket single-remote section, or — when there are several — the
 //!   one naming the manifest's global `source`, else the rubygems.org one;
-//!   anything else is ambiguous and refused. A gem locked as precompiled
-//!   platform builds has one spec per platform there (`name
-//!   (version-<platform>)`, with or without the ruby-platform one): each
-//!   goes back to where Bundler sorts it, by full name.
+//!   anything else is ambiguous and refused.
 //! * **Merged** (bundler ≤ 2.1 writes every rubygems source into ONE `GEM`
 //!   section): the Socket `remote:` line is dropped from it.
 //! * **Mixed** (a block of 5.0 / 5.1 on a bundler < 2.6 lock those releases
@@ -42,9 +39,7 @@
 //! In every state a `CHECKSUMS` entry is re-pinned to the upstream sha256
 //! from the rubygems.org compact index (`info/<name>`, what bundler itself
 //! records; other upstream remotes are refused: their index may need
-//! credentials and is not the default registry) — each platform build's
-//! entry to that build's own sha256, the index's `<version>-<platform>`
-//! line — and the `DEPENDENCIES`
+//! credentials and is not the default registry), and the `DEPENDENCIES`
 //! source pin (`name (…)!`) loses its `!` — unless the declaration sits
 //! inside the user's own `source … do` block, where bundler writes the `!`
 //! itself ([`in_source_block`], #1056). A `CHECKSUMS` entry the rewriter
@@ -83,10 +78,8 @@ use super::{Ctx, FormatResult, HostedPin, UpstreamClient, View};
 use crate::formats::gem::declarations::{self, Declaration};
 use crate::formats::gem::ruby::{block_stack, BlockSource};
 use crate::formats::gem::{
-    bundler_manifest_for, locked_gem_builds, parse_spec, same_remote, split_checksum_entry,
-    GemBuild, BUNDLER_LOCKS,
+    bundler_manifest_for, parse_spec, same_remote, split_checksum_entry, BUNDLER_LOCKS,
 };
-use crate::patch::gem_source::GemId;
 use crate::utils::line_endings::{self, to_lf, LineEndings};
 use crate::vendor::gem::{gem_declaration_any, quoted_literal};
 
@@ -113,15 +106,6 @@ struct Entry {
     last: usize,
     name: String,
     version: String,
-    /// The parenthesized token ([`GemId::token`]): `version`, or
-    /// `version-<platform>` for a platform build. Empty for an entry that
-    /// is no `name (token)`.
-    token: String,
-    /// `name-version[-platform]` ([`GemId::full_name`]), the key Bundler
-    /// sorts a section's specs by (`LockfileGenerator#add_specs`:
-    /// `sort_by(&:full_name)`). The entry's text when it is no `name
-    /// (token)`.
-    full_name: String,
     platform: bool,
 }
 
@@ -171,20 +155,11 @@ fn gem_sections(lines: &[&str]) -> Vec<GemSec> {
                 }
             } else if let Some(entry) = indented(line, 4).filter(|_| sec.specs_line.is_some()) {
                 let spec = parse_spec(entry.trim_end());
-                let id = spec.map(|s| GemId {
-                    name: s.name.to_string(),
-                    version: s.version.to_string(),
-                    platform: s.platform.map(str::to_string),
-                });
                 sec.entries.push(Entry {
                     line: k,
                     last: k,
                     name: spec.map(|s| s.name).unwrap_or(entry).to_string(),
                     version: spec.map(|s| s.version).unwrap_or_default().to_string(),
-                    token: id.as_ref().map(GemId::token).unwrap_or_default(),
-                    full_name: id
-                        .as_ref()
-                        .map_or_else(|| entry.to_string(), GemId::full_name),
                     platform: spec.is_none_or(|s| s.platform.is_some()),
                 });
             } else if line.starts_with("      ") {
@@ -315,31 +290,28 @@ fn choose_upstream(
     }
 }
 
-/// The line after which a spec of full name `full_name`
-/// ([`Entry::full_name`]) sorts into `sec` (bundler writes specs sorted by
-/// full name).
+/// The line after which a spec named `name-version` sorts into `sec`
+/// (bundler writes specs sorted by full name).
 fn insertion_point(sec: &GemSec, full_name: &str) -> Option<usize> {
-    let pred = sec
-        .entries
-        .iter()
-        .rfind(|e| e.full_name.as_str() < full_name);
+    let pred = sec.entries.iter().rfind(|e| {
+        let full = if e.version.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{}-{}", e.name, e.version)
+        };
+        full.as_str() < full_name
+    });
     pred.map(|e| e.last).or(sec.specs_line)
 }
 
 /// A lock restore step's outcome.
 enum LockEdit {
-    /// The `CHECKSUMS` entries of the builds `tokens` (`<version>`,
-    /// `<version>-<platform>`) must be re-pinned from `remote` first.
+    /// The `CHECKSUMS` entry must be re-pinned from `remote` first.
     NeedsSha {
         remote: Option<String>,
-        tokens: Vec<String>,
     },
     Done(String),
 }
-
-/// The upstream sha256 of each build of a gem, by its `CHECKSUMS` token
-/// (`<version>`, `<version>-<platform>`).
-type UpstreamShas = BTreeMap<String, String>;
 
 /// One pin's coordinates.
 struct Gem<'p> {
@@ -361,15 +333,13 @@ enum DepEntry {
 }
 
 /// Restore `gem` in the LF lock text (module docs); `dep` says what becomes
-/// of its `DEPENDENCIES` entry, and `shas` holds the upstream sha256 of the
-/// builds whose `CHECKSUMS` entries are re-pinned (asked for with
-/// [`LockEdit::NeedsSha`]).
+/// of its `DEPENDENCIES` entry.
 fn lock_edit(
     lock: &str,
     gem: &Gem<'_>,
     globals: &[String],
     dep: DepEntry,
-    shas: &UpstreamShas,
+    sha: Option<&str>,
     ctx: &Ctx<'_>,
 ) -> Result<LockEdit, String> {
     let lines: Vec<&str> = lock.split('\n').collect();
@@ -378,39 +348,24 @@ fn lock_edit(
     let mut drop: BTreeSet<usize> = BTreeSet::new();
     let mut replace: BTreeMap<usize, String> = BTreeMap::new();
     let mut insert_after: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
-    // A build of the gem's version: the ruby-platform entry or a platform
-    // one.
-    let is_build = |e: &Entry| e.name == gem.name && e.version == gem.version;
-    let is_ours = |e: &Entry| is_build(e) && !e.platform;
+    let is_ours = |e: &Entry| e.name == gem.name && e.version == gem.version && !e.platform;
     let checksum_remote = match &wiring {
         Some(Wiring::Own(si)) => {
             let sec = &secs[*si];
-            // The section holds the builds of this one gem version and
-            // nothing else: its ruby-platform entry, the platform entries
-            // of its prebuilds, or both, each once.
-            let mut ours: Vec<&Entry> = sec.entries.iter().collect();
-            ours.sort_by(|a, b| a.full_name.cmp(&b.full_name));
-            let exact = !ours.is_empty()
-                && ours.iter().all(|e| is_build(e))
-                && ours.windows(2).all(|pair| pair[0].token != pair[1].token);
-            if !exact {
-                return Err(format!(
-                    "its Socket GEM section does not lock exactly {} ({})",
-                    gem.name, gem.version
-                ));
-            }
+            let entry = match sec.entries.as_slice() {
+                [e] if is_ours(e) => e,
+                _ => {
+                    return Err(format!(
+                        "its Socket GEM section does not lock exactly {} ({})",
+                        gem.name, gem.version
+                    ))
+                }
+            };
             let up = choose_upstream(&secs, *si, globals, ctx)?;
-            // Each build back where Bundler sorts it. Builds that land
-            // after the same upstream line keep their own order.
-            for entry in ours {
-                let at = insertion_point(&secs[up], &entry.full_name)
-                    .ok_or("the upstream GEM section has no `specs:` list")?;
-                insert_after
-                    .entry(at)
-                    .or_default()
-                    .extend_from_slice(&lines[entry.line..=entry.last]);
-            }
+            let at = insertion_point(&secs[up], &format!("{}-{}", gem.name, gem.version))
+                .ok_or("the upstream GEM section has no `specs:` list")?;
             drop.extend(sec.start..sec.end);
+            insert_after.insert(at, lines[entry.line..=entry.last].to_vec());
             Some(secs[up].remotes[0].1.clone())
         }
         Some(Wiring::Merged(si, line)) => {
@@ -434,11 +389,9 @@ fn lock_edit(
             }
         }
         None => {
-            // The section that holds the gem's builds (a gem locked as
-            // platform builds may have no ruby-platform entry).
             let holders: Vec<&GemSec> = secs
                 .iter()
-                .filter(|s| s.entries.iter().any(is_build))
+                .filter(|s| s.entries.iter().any(is_ours))
                 .collect();
             match holders.as_slice() {
                 [s] if s.remotes.len() == 1 => Some(s.remotes[0].1.clone()),
@@ -462,20 +415,8 @@ fn lock_edit(
         }
     }
     if let Some((s, e)) = named_section(&lines, "CHECKSUMS") {
-        // Every build of the version, however the lock wires the gem: the
-        // ruby-platform entry and each platform build's. A prebuild's
-        // sha256 left on a platform entry that resolves from the upstream
-        // registry again fails every `bundle install` on a checksum
-        // mismatch, so no wiring state keeps one.
-        let pinned_build = |token: &str| {
-            token == gem.version
-                || token
-                    .strip_prefix(gem.version.as_str())
-                    .is_some_and(|platform| platform.starts_with('-'))
-        };
-        // Per build token: the entries carrying a sha256, and whether a
-        // bare one sits beside them.
-        let mut pinned: BTreeMap<&str, (Vec<usize>, bool)> = BTreeMap::new();
+        let mut with_sha = Vec::new();
+        let mut bare = false;
         for (k, line) in lines.iter().enumerate().take(e).skip(s) {
             let Some(entry) = indented(line, 2) else {
                 continue;
@@ -483,41 +424,33 @@ fn lock_edit(
             let Some((name, token, tail)) = split_checksum_entry(entry.trim_end()) else {
                 continue;
             };
-            if name != gem.name || !pinned_build(token) {
+            if name != gem.name || token != gem.version {
                 continue;
             }
-            let slot = pinned.entry(token).or_default();
             if tail.contains("sha256=") {
-                slot.0.push(k);
+                with_sha.push(k);
             } else {
-                slot.1 = true;
+                bare = true;
             }
         }
-        let re = Regex::new(r"sha256=[0-9A-Fa-f]*").expect("static sha256 regex is valid");
-        let mut unknown: Vec<String> = Vec::new();
-        for (token, (with_sha, bare)) in &pinned {
-            match with_sha.as_slice() {
-                [] => {}
-                [k] if *bare => {
-                    drop.insert(*k);
-                }
-                [k] => match shas.get(*token) {
-                    Some(sha) => {
-                        replace.insert(
-                            *k,
-                            re.replace(lines[*k], format!("sha256={sha}")).into_owned(),
-                        );
-                    }
-                    None => unknown.push(token.to_string()),
-                },
-                _ => return Err("CHECKSUMS pins it more than once".to_string()),
+        match with_sha.as_slice() {
+            [] => {}
+            [k] if bare => {
+                drop.insert(*k);
             }
-        }
-        if !unknown.is_empty() {
-            return Ok(LockEdit::NeedsSha {
-                remote: checksum_remote,
-                tokens: unknown,
-            });
+            [k] => {
+                let Some(sha) = sha else {
+                    return Ok(LockEdit::NeedsSha {
+                        remote: checksum_remote,
+                    });
+                };
+                let re = Regex::new(r"sha256=[0-9A-Fa-f]*").expect("static sha256 regex is valid");
+                replace.insert(
+                    *k,
+                    re.replace(lines[*k], format!("sha256={sha}")).into_owned(),
+                );
+            }
+            _ => return Err("CHECKSUMS pins it more than once".to_string()),
         }
     }
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
@@ -976,34 +909,17 @@ pub(crate) async fn restore(
             let Some((name, version)) = pin.name_version() else {
                 continue;
             };
-            // The ruby gem's archive, then one per platform build the
-            // restored lock names: `bundle cache` keeps each under its own
-            // `<name>-<version>-<platform>.gem`.
-            let mut builds = vec![version.clone()];
-            if let Some(lock) = lock.as_deref() {
-                let named = crate::formats::gem::parse(lock)
-                    .locked_builds(&name, &version)
-                    .ids(&name, &version);
-                builds.extend(
-                    named
-                        .iter()
-                        .filter(|id| id.platform.is_some())
-                        .map(GemId::token),
-                );
-            }
-            for build in builds {
-                if let Some(warning) = stale_cache_warning(
-                    view.root(),
-                    &pin.purl,
-                    &name,
-                    &build,
-                    lock.as_deref(),
-                    ctx.client,
-                )
-                .await
-                {
-                    result.warnings.push(warning);
-                }
+            if let Some(warning) = stale_cache_warning(
+                view.root(),
+                &pin.purl,
+                &name,
+                &version,
+                lock.as_deref(),
+                ctx.client,
+            )
+            .await
+            {
+                result.warnings.push(warning);
             }
         }
         if let (Some(next), Some(endings)) = (lock, endings) {
@@ -1031,16 +947,14 @@ pub(crate) const STALE_CACHE: &str = "upstream_gem_stale_cache";
 /// declaration it replaced (module docs, "The block form").
 pub(crate) const DECLARATION_PINNED: &str = "upstream_gem_declaration_pinned";
 
-/// The `CHECKSUMS` sha256 the lock pins for the build `name (token)`, if
-/// any: `token` is `<version>`, or `<version>-<platform>` for a platform
-/// build.
-fn lock_checksum(lock: &str, name: &str, token: &str) -> Option<String> {
+/// The `CHECKSUMS` sha256 the lock pins for `name (version)`, if any.
+fn lock_checksum(lock: &str, name: &str, version: &str) -> Option<String> {
     let lines: Vec<&str> = lock.split('\n').collect();
     let (s, e) = named_section(&lines, "CHECKSUMS")?;
     lines[s..e].iter().find_map(|line| {
         let entry = indented(line, 2)?.trim_end();
-        let (n, entry_token, tail) = split_checksum_entry(entry)?;
-        if n != name || entry_token != token {
+        let (n, token, tail) = split_checksum_entry(entry)?;
+        if n != name || token != version {
             return None;
         }
         tail.split_whitespace()
@@ -1049,8 +963,7 @@ fn lock_checksum(lock: &str, name: &str, token: &str) -> Option<String> {
     })
 }
 
-/// A restored gem whose `<name>-<token>.gem` (`token`: `<version>`, or
-/// `<version>-<platform>` for a platform build) still sits in Bundler's
+/// A restored gem whose `<name>-<version>.gem` still sits in Bundler's
 /// cache dir (`cache_path`, default `vendor/cache`) and is not proven to
 /// be the upstream archive: bundler installs from that dir before
 /// fetching, so the archive a `bundle cache` took while the hosted pin was
@@ -1064,19 +977,19 @@ async fn stale_cache_warning(
     root: &std::path::Path,
     purl: &str,
     name: &str,
-    token: &str,
+    version: &str,
     lock: Option<&str>,
     client: &UpstreamClient,
 ) -> Option<(&'static str, String)> {
     let cache_dir = crate::crawlers::ruby_crawler::bundler_app_cache_dir(root).await;
-    let archive = cache_dir.join(format!("{name}-{token}.gem"));
+    let archive = cache_dir.join(format!("{name}-{version}.gem"));
     if !archive.is_file() {
         return None;
     }
     let got = crate::vendor::file_sha256_hex(&archive).await;
-    let upstream = match lock.and_then(|l| lock_checksum(l, name, token)) {
+    let upstream = match lock.and_then(|l| lock_checksum(l, name, version)) {
         Some(sha) => Ok(sha),
-        None => client.rubygems_sha256(name, token).await,
+        None => client.rubygems_sha256(name, version).await,
     };
     let fix = "delete it, then run `bundle cache` to cache the upstream gem in its place \
                (or `bundle install` if the project does not commit its cache)";
@@ -1139,7 +1052,7 @@ pub(super) async fn unwound_stale_cache(
 }
 
 /// What is known of the upstream archive of a gem that is back on its
-/// registry entry ([`GemUpstream::archive`]).
+/// registry entry ([`upstream_archive`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamArchive {
     /// Its sha256 (lowercase hex) and, when the lock resolves the gem from
@@ -1152,127 +1065,85 @@ pub enum UpstreamArchive {
     Unverified(String),
 }
 
-/// What the Bundler lock of a project says of its gems once an unwind put
-/// them back on their upstream entries: which builds of a gem it names, and
-/// each build's upstream archive. The refresh that follows the unwind asks
-/// it about every restored gem, so the lock is read once and one registry
-/// client serves every lookup: a gem's compact-index document, which lists
-/// all of its builds, is fetched once however many are asked for.
-pub struct GemUpstream {
-    /// The lock's LF text; `None` when the project has no readable lock.
-    lock: Option<String>,
-    client: UpstreamClient,
+/// The upstream archive of the ruby-platform gem `purl`, as the lock at
+/// `root` pins it once the gem is back on its registry entry: its sha256
+/// (the `CHECKSUMS` entry, else the rubygems.org compact index, unless
+/// `offline`) and, when the lock resolves the gem from rubygems.org, the
+/// URL it is served at. `restored` is the lock's text when the caller holds
+/// it (a restore's staged text; a dry run never wrote it), else the lock is
+/// read from disk. `None` when nothing proves the sha256: a gem from
+/// another remote with no `CHECKSUMS` entry, an offline run, a registry
+/// error. A registry that is refused, not merely out of reach, is
+/// [`UpstreamArchive::Unverified`]: that is a setting to report.
+pub(super) async fn upstream_archive(
+    root: &std::path::Path,
+    restored: Option<&str>,
+    purl: &str,
     offline: bool,
-}
-
-impl GemUpstream {
-    /// For the project at `root`. `restored` is the lock's text when the
-    /// caller holds it (a restore's staged text; a dry run never wrote it),
-    /// else the lock is read from disk.
-    pub(super) async fn load(
-        root: &std::path::Path,
-        restored: Option<&str>,
-        offline: bool,
-    ) -> Self {
-        let mut lock = restored.map(str::to_string);
-        if lock.is_none() {
-            for file in BUNDLER_LOCKS {
-                if let Ok(text) = crate::utils::fs::read_regular_to_string(&root.join(file)).await {
-                    lock = Some(text);
-                    break;
-                }
+) -> Option<UpstreamArchive> {
+    let (_, name, version) = crate::utils::purl::purl_parts(purl)?;
+    let mut lock = restored.map(str::to_string);
+    if lock.is_none() {
+        for file in BUNDLER_LOCKS {
+            if let Ok(text) = crate::utils::fs::read_regular_to_string(&root.join(file)).await {
+                lock = Some(text);
+                break;
             }
         }
-        GemUpstream {
-            lock: lock.map(|text| to_lf(&text).into_owned()),
-            client: UpstreamClient::new(offline),
-            offline,
-        }
     }
-
-    /// The builds the lock names for each gem of `purls`
-    /// ([`locked_gem_builds`]): element `i` answers `purls[i]`, and is
-    /// empty when the lock names none (or there is no lock).
-    pub fn builds(&self, purls: &[String]) -> Vec<Vec<GemBuild>> {
-        match &self.lock {
-            Some(lock) => locked_gem_builds(lock, purls),
-            None => vec![Vec::new(); purls.len()],
-        }
-    }
-
-    /// The name of the gem `purl` and `build`'s token in the lock, the
-    /// compact index and its file name.
-    fn release(purl: &str, build: &GemBuild) -> Option<(String, String)> {
-        let (_, name, version) = crate::utils::purl::purl_parts(purl)?;
-        let id = GemId {
-            name,
-            version,
-            platform: build.platform.clone(),
-        };
-        let token = id.token();
-        Some((id.name, token))
-    }
-
-    /// The upstream archive of `build` of the gem `purl` (its
-    /// ruby-platform gem, or one of its precompiled platform builds), as
-    /// the lock pins it once the gem is back on its registry entry: its
-    /// sha256 (the `CHECKSUMS` entry, else the rubygems.org compact index,
-    /// unless offline) and, when the lock resolves that build from
-    /// rubygems.org, the URL it is served at. `None` when nothing proves
-    /// the sha256: no lock, a gem from another remote with no `CHECKSUMS`
-    /// entry, an offline run, a registry error. A registry that is refused,
-    /// not merely out of reach, is [`UpstreamArchive::Unverified`]: that is
-    /// a setting to report.
-    pub async fn archive(&self, purl: &str, build: &GemBuild) -> Option<UpstreamArchive> {
-        let (name, token) = Self::release(purl, build)?;
-        let lock = self.lock.as_deref()?;
-        let rubygems = rubygems_locked(lock, &name, &token);
-        let sha = match lock_checksum(lock, &name, &token) {
-            Some(sha) => sha,
-            None if rubygems => {
-                if self.offline {
-                    return None;
-                }
-                if let Err(why) = super::rubygems_secure_base() {
-                    return Some(UpstreamArchive::Unverified(why));
-                }
-                self.client.rubygems_sha256(&name, &token).await.ok()?
+    let lock = lock?;
+    let lock = to_lf(&lock);
+    let rubygems = rubygems_locked(&lock, &name, &version);
+    let sha = match lock_checksum(&lock, &name, &version) {
+        Some(sha) => sha,
+        None if rubygems => {
+            if offline {
+                return None;
             }
-            None => return None,
-        };
-        let url = rubygems.then(|| {
-            format!(
-                "{}/gems/{}.gem",
-                super::rubygems_base().trim_end_matches('/'),
-                build.leaf
-            )
-        });
-        Some(UpstreamArchive::Known {
-            sha256: sha.to_ascii_lowercase(),
-            url,
-        })
-    }
-
-    /// Whether the lock resolves `build` of the gem `purl` from
-    /// rubygems.org ([`rubygems_locked`]). `false` with no readable lock.
-    pub fn resolves_from_rubygems(&self, purl: &str, build: &GemBuild) -> bool {
-        match (&self.lock, Self::release(purl, build)) {
-            (Some(lock), Some((name, token))) => rubygems_locked(lock, &name, &token),
-            _ => false,
+            if let Err(why) = super::rubygems_secure_base() {
+                return Some(UpstreamArchive::Unverified(why));
+            }
+            UpstreamClient::new(offline)
+                .rubygems_sha256(&name, &version)
+                .await
+                .ok()?
         }
-    }
+        None => return None,
+    };
+    let url = rubygems.then(|| {
+        format!(
+            "{}/gems/{name}-{version}.gem",
+            super::rubygems_base().trim_end_matches('/')
+        )
+    });
+    Some(UpstreamArchive::Known {
+        sha256: sha.to_ascii_lowercase(),
+        url,
+    })
 }
 
-/// Whether `lock` resolves the build `name (token)` (`token`: `<version>`
-/// for the ruby-platform gem, `<version>-<platform>` for a platform build)
-/// from a `GEM` section whose remote is rubygems.org (or the
-/// `SOCKET_RUBYGEMS_URL` stand-in).
-fn rubygems_locked(lock: &str, name: &str, token: &str) -> bool {
+/// Whether the lock at `root` resolves the ruby-platform gem `purl` from
+/// rubygems.org ([`rubygems_locked`]). `false` with no readable lock.
+pub(super) async fn resolves_from_rubygems(root: &std::path::Path, purl: &str) -> bool {
+    let Some((_, name, version)) = crate::utils::purl::purl_parts(purl) else {
+        return false;
+    };
+    for file in BUNDLER_LOCKS {
+        if let Ok(text) = crate::utils::fs::read_regular_to_string(&root.join(file)).await {
+            return rubygems_locked(&to_lf(&text), &name, &version);
+        }
+    }
+    false
+}
+
+/// Whether `lock` resolves `name (version)` from a `GEM` section whose
+/// remote is rubygems.org (or the `SOCKET_RUBYGEMS_URL` stand-in).
+fn rubygems_locked(lock: &str, name: &str, version: &str) -> bool {
     let lines: Vec<&str> = lock.split('\n').collect();
     gem_sections(&lines).iter().any(|sec| {
         sec.entries
             .iter()
-            .any(|e| e.name == name && e.token == token)
+            .any(|e| e.name == name && e.version == version && !e.platform)
             && sec
                 .remotes
                 .iter()
@@ -1374,34 +1245,27 @@ async fn restore_one(
     };
     let next_lock = match lock {
         None => None,
-        Some(text) => Some(
-            match lock_edit(text, gem, globals, dep, &UpstreamShas::new(), ctx)? {
-                LockEdit::Done(next) => next,
-                LockEdit::NeedsSha { remote, tokens } => {
-                    let remote = remote.ok_or("its upstream GEM remote is ambiguous")?;
-                    if !same_remote(&remote, RUBYGEMS_REMOTE) {
-                        return Err(format!(
-                            "its upstream GEM remote {remote} is not rubygems.org, so its CHECKSUMS \
-                             sha256 cannot be re-derived"
-                        ));
-                    }
-                    // One `info/<name>` document lists every build.
-                    let mut shas = UpstreamShas::new();
-                    for token in tokens {
-                        let sha = ctx
-                            .client
-                            .rubygems_sha256(&gem.name, &token)
-                            .await
-                            .map_err(|why| format!("{} {token}: {why}", gem.name))?;
-                        shas.insert(token, sha);
-                    }
-                    match lock_edit(text, gem, globals, dep, &shas, ctx)? {
-                        LockEdit::Done(next) => next,
-                        LockEdit::NeedsSha { .. } => unreachable!("every sha was supplied"),
-                    }
+        Some(text) => Some(match lock_edit(text, gem, globals, dep, None, ctx)? {
+            LockEdit::Done(next) => next,
+            LockEdit::NeedsSha { remote } => {
+                let remote = remote.ok_or("its upstream GEM remote is ambiguous")?;
+                if !same_remote(&remote, RUBYGEMS_REMOTE) {
+                    return Err(format!(
+                        "its upstream GEM remote {remote} is not rubygems.org, so its CHECKSUMS \
+                         sha256 cannot be re-derived"
+                    ));
                 }
-            },
-        ),
+                let sha = ctx
+                    .client
+                    .rubygems_sha256(&gem.name, &gem.version)
+                    .await
+                    .map_err(|why| format!("{} {}: {why}", gem.name, gem.version))?;
+                match lock_edit(text, gem, globals, dep, Some(&sha), ctx)? {
+                    LockEdit::Done(next) => next,
+                    LockEdit::NeedsSha { .. } => unreachable!("a sha was supplied"),
+                }
+            }
+        }),
     };
     let next_manifest = match (manifest, &wiring_in_manifest) {
         (Some(text), Some(wiring)) => Some(unwire_manifest(text, wiring, gem, &decl)),
@@ -1509,31 +1373,11 @@ mod tests {
                     ruby\n\nDEPENDENCIES\n  puma\n  rails (= 7.0.0)\n\nBUNDLED WITH\n   2.4.0\n";
         // No CHECKSUMS (bundler 2.2–2.5): no registry lookup, offline works.
         assert_eq!(
-            done(
-                lock_edit(
-                    &hosted,
-                    &gem(),
-                    &[],
-                    DepEntry::Unpin,
-                    &UpstreamShas::new(),
-                    &ctx
-                )
-                .unwrap()
-            ),
+            done(lock_edit(&hosted, &gem(), &[], DepEntry::Unpin, None, &ctx).unwrap()),
             want
         );
         // Transitive: the DEPENDENCIES entry the rewriter added goes.
-        let out = done(
-            lock_edit(
-                &hosted,
-                &gem(),
-                &[],
-                DepEntry::Drop,
-                &UpstreamShas::new(),
-                &ctx,
-            )
-            .unwrap(),
-        );
+        let out = done(lock_edit(&hosted, &gem(), &[], DepEntry::Drop, None, &ctx).unwrap());
         assert!(out.contains("DEPENDENCIES\n  puma\n\n"), "{out}");
     }
 
@@ -1547,26 +1391,15 @@ mod tests {
              sha256={}\n",
             "d".repeat(64)
         );
-        match lock_edit(
-            &hosted,
-            &gem(),
-            &[],
-            DepEntry::Unpin,
-            &UpstreamShas::new(),
-            &ctx,
-        )
-        .unwrap()
-        {
-            LockEdit::NeedsSha { remote, tokens } => {
-                assert_eq!(remote.as_deref(), Some("https://rubygems.org/"));
-                assert_eq!(tokens, ["7.0.0"]);
+        match lock_edit(&hosted, &gem(), &[], DepEntry::Unpin, None, &ctx).unwrap() {
+            LockEdit::NeedsSha { remote } => {
+                assert_eq!(remote.as_deref(), Some("https://rubygems.org/"))
             }
             LockEdit::Done(_) => panic!("CHECKSUMS entry left patched"),
         }
         let sha = "2".repeat(64);
-        let shas = UpstreamShas::from([("7.0.0".to_string(), sha.clone())]);
         assert_eq!(
-            done(lock_edit(&hosted, &gem(), &[], DepEntry::Unpin, &shas, &ctx).unwrap()),
+            done(lock_edit(&hosted, &gem(), &[], DepEntry::Unpin, Some(&sha), &ctx).unwrap()),
             format!(
                 "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\nDEPENDENCIES\n  \
                  rails (= 7.0.0)\n\nCHECKSUMS\n  rails (7.0.0) sha256={sha}\n"
@@ -1574,170 +1407,10 @@ mod tests {
         );
         // The rewriter's ADDED entry next to bundler's bare one is dropped.
         let added = hosted.replace("CHECKSUMS\n", "CHECKSUMS\n  rails (7.0.0)\n");
-        assert!(done(
-            lock_edit(
-                &added,
-                &gem(),
-                &[],
-                DepEntry::Unpin,
-                &UpstreamShas::new(),
-                &ctx
-            )
-            .unwrap()
-        )
-        .ends_with("CHECKSUMS\n  rails (7.0.0)\n"));
-    }
-
-    fn nokogiri() -> Gem<'static> {
-        Gem {
-            uuid: UUID,
-            name: "nokogiri".into(),
-            version: "1.18.10".into(),
-        }
-    }
-
-    /// A gem locked as platform builds: every entry of the Socket section
-    /// goes back where Bundler sorts it (by full name, so before
-    /// `nokogiri-happymapper`), each with its sub-lines, and every
-    /// `CHECKSUMS` entry is re-pinned to its own build's upstream sha256.
-    #[test]
-    fn platform_builds_move_back_and_each_checksum_is_repinned() {
-        let client = super::super::UpstreamClient::new(true);
-        let ctx = ctx_with(&client);
-        let (arm, linux, other) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
-        let lock = |socket: bool, arm: &str, linux: &str| {
-            let builds = "    nokogiri (1.18.10-arm64-darwin)\n      racc (~> 1.4)\n    nokogiri \
-                          (1.18.10-x86_64-linux-gnu)\n      racc (~> 1.4)\n";
-            let (own, upstream, pin) = if socket {
-                (
-                    format!("GEM\n  remote: {IDX}\n  specs:\n{builds}\n"),
-                    "",
-                    "!",
-                )
-            } else {
-                (String::new(), builds, "")
-            };
-            format!(
-                "{own}GEM\n  remote: https://rubygems.org/\n  specs:\n    mini_mime (1.1.5)\n{upstream}    \
-                 nokogiri-happymapper (0.10.0)\n    racc (1.8.1)\n\nPLATFORMS\n  arm64-darwin\n  \
-                 x86_64-linux-gnu\n\nDEPENDENCIES\n  nokogiri (= 1.18.10){pin}\n\nCHECKSUMS\n  mini_mime \
-                 (1.1.5) sha256={other}\n  nokogiri (1.18.10-arm64-darwin) sha256={arm}\n  nokogiri \
-                 (1.18.10-x86_64-linux-gnu) sha256={linux}\n  racc (1.8.1) sha256={other}\n\nBUNDLED \
-                 WITH\n  4.0.15\n"
-            )
-        };
-        let hosted = lock(true, &"d".repeat(64), &"e".repeat(64));
-        match lock_edit(
-            &hosted,
-            &nokogiri(),
-            &[],
-            DepEntry::Unpin,
-            &UpstreamShas::new(),
-            &ctx,
-        )
-        .unwrap()
-        {
-            LockEdit::NeedsSha { remote, tokens } => {
-                assert_eq!(remote.as_deref(), Some("https://rubygems.org/"));
-                assert_eq!(tokens, ["1.18.10-arm64-darwin", "1.18.10-x86_64-linux-gnu"]);
-            }
-            LockEdit::Done(_) => panic!("CHECKSUMS entries left patched"),
-        }
-        // One sha is not enough: the other build is still asked for.
-        let mut shas = UpstreamShas::from([("1.18.10-arm64-darwin".to_string(), arm.clone())]);
-        match lock_edit(&hosted, &nokogiri(), &[], DepEntry::Unpin, &shas, &ctx).unwrap() {
-            LockEdit::NeedsSha { tokens, .. } => {
-                assert_eq!(tokens, ["1.18.10-x86_64-linux-gnu"])
-            }
-            LockEdit::Done(_) => panic!("a CHECKSUMS entry left patched"),
-        }
-        shas.insert("1.18.10-x86_64-linux-gnu".to_string(), linux.clone());
-        assert_eq!(
-            done(lock_edit(&hosted, &nokogiri(), &[], DepEntry::Unpin, &shas, &ctx).unwrap()),
-            lock(false, &arm, &linux)
+        assert!(
+            done(lock_edit(&added, &gem(), &[], DepEntry::Unpin, None, &ctx).unwrap())
+                .ends_with("CHECKSUMS\n  rails (7.0.0)\n")
         );
-    }
-
-    /// The ruby-platform entry beside the platform builds goes back with
-    /// them, first (Bundler's order). A lock without `CHECKSUMS` needs no
-    /// lookup, and a `CHECKSUMS` entry the rewriter added next to
-    /// bundler's own bare one is dropped, per build.
-    #[test]
-    fn ruby_entry_beside_platform_builds_moves_back_first() {
-        let client = super::super::UpstreamClient::new(true);
-        let ctx = ctx_with(&client);
-        let hosted = format!(
-            "GEM\n  remote: {IDX}\n  specs:\n    nokogiri (1.18.10)\n      mini_portile2 (~> 2.8.2)\n    \
-             nokogiri (1.18.10-java)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n    \
-             mini_portile2 (2.8.9)\n    zeitwerk (2.6.0)\n\nDEPENDENCIES\n  nokogiri!\n"
-        );
-        let want = "GEM\n  remote: https://rubygems.org/\n  specs:\n    mini_portile2 (2.8.9)\n    \
-                    nokogiri (1.18.10)\n      mini_portile2 (~> 2.8.2)\n    nokogiri (1.18.10-java)\n    \
-                    zeitwerk (2.6.0)\n\nDEPENDENCIES\n  nokogiri\n";
-        assert_eq!(
-            done(
-                lock_edit(
-                    &hosted,
-                    &nokogiri(),
-                    &[],
-                    DepEntry::Unpin,
-                    &UpstreamShas::new(),
-                    &ctx
-                )
-                .unwrap()
-            ),
-            want
-        );
-        let sha = "d".repeat(64);
-        let added = format!(
-            "{hosted}\nCHECKSUMS\n  nokogiri (1.18.10)\n  nokogiri (1.18.10) sha256={sha}\n  nokogiri \
-             (1.18.10-java)\n  nokogiri (1.18.10-java) sha256={sha}\n"
-        );
-        assert_eq!(
-            done(
-                lock_edit(
-                    &added,
-                    &nokogiri(),
-                    &[],
-                    DepEntry::Unpin,
-                    &UpstreamShas::new(),
-                    &ctx
-                )
-                .unwrap()
-            ),
-            format!("{want}\nCHECKSUMS\n  nokogiri (1.18.10)\n  nokogiri (1.18.10-java)\n")
-        );
-    }
-
-    /// A Socket section is one gem version's builds. Another version's
-    /// build in it, or the same build twice, is not ours to split.
-    #[test]
-    fn socket_section_with_foreign_builds_is_refused() {
-        let client = super::super::UpstreamClient::new(true);
-        let ctx = ctx_with(&client);
-        for specs in [
-            "    nokogiri (1.18.10-java)\n    nokogiri (1.18.9-java)\n",
-            "    nokogiri (1.18.10-java)\n    nokogiri (1.18.10-java)\n",
-        ] {
-            let lock = format!(
-                "GEM\n  remote: https://rubygems.org/\n  specs:\n\nGEM\n  remote: {IDX}\n  \
-                 specs:\n{specs}\nDEPENDENCIES\n  nokogiri!\n"
-            );
-            let why = lock_edit(
-                &lock,
-                &nokogiri(),
-                &[],
-                DepEntry::Unpin,
-                &UpstreamShas::new(),
-                &ctx,
-            )
-            .err()
-            .expect("refused");
-            assert!(
-                why.contains("does not lock exactly nokogiri (1.18.10)"),
-                "{why}"
-            );
-        }
     }
 
     #[test]
@@ -1749,7 +1422,7 @@ mod tests {
              rails (7.0.0)\n\nDEPENDENCIES\n  puma\n  rails (= 7.0.0)!\n\nBUNDLED WITH\n   2.1.4\n"
         );
         assert_eq!(
-            done(lock_edit(&hosted, &gem(), &[], DepEntry::Unpin, &UpstreamShas::new(), &ctx).unwrap()),
+            done(lock_edit(&hosted, &gem(), &[], DepEntry::Unpin, None, &ctx).unwrap()),
             "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n    rails (7.0.0)\n\n\
              DEPENDENCIES\n  puma\n  rails (= 7.0.0)\n\nBUNDLED WITH\n   2.1.4\n"
         );
@@ -1763,15 +1436,7 @@ mod tests {
             "GEM\n  remote: https://gems.example/\n  specs:\n\nGEM\n  remote: https://mirror.example/\n  \
              specs:\n\nGEM\n  remote: {IDX}\n  specs:\n    rails (7.0.0)\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n"
         );
-        assert!(lock_edit(
-            &two_upstreams,
-            &gem(),
-            &[],
-            DepEntry::Unpin,
-            &UpstreamShas::new(),
-            &ctx
-        )
-        .is_err());
+        assert!(lock_edit(&two_upstreams, &gem(), &[], DepEntry::Unpin, None, &ctx).is_err());
         // The manifest's global source singles one out.
         let globals = vec!["https://mirror.example".to_string()];
         let out = done(
@@ -1780,7 +1445,7 @@ mod tests {
                 &gem(),
                 &globals,
                 DepEntry::Unpin,
-                &UpstreamShas::new(),
+                None,
                 &ctx,
             )
             .unwrap(),
@@ -1794,27 +1459,11 @@ mod tests {
             "GEM\n  remote: https://rubygems.org/\n  specs:\n\nGEM\n  remote: {IDX}\n  specs:\n    \
              rack (3.0.0)\n    rails (7.0.0)\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n"
         );
-        assert!(lock_edit(
-            &extra,
-            &gem(),
-            &[],
-            DepEntry::Unpin,
-            &UpstreamShas::new(),
-            &ctx
-        )
-        .is_err());
+        assert!(lock_edit(&extra, &gem(), &[], DepEntry::Unpin, None, &ctx).is_err());
         let none = format!(
             "GEM\n  remote: {IDX}\n  specs:\n    rails (7.0.0)\n\nDEPENDENCIES\n  rails!\n"
         );
-        assert!(lock_edit(
-            &none,
-            &gem(),
-            &[],
-            DepEntry::Unpin,
-            &UpstreamShas::new(),
-            &ctx
-        )
-        .is_err());
+        assert!(lock_edit(&none, &gem(), &[], DepEntry::Unpin, None, &ctx).is_err());
     }
 
     #[test]

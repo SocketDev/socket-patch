@@ -83,36 +83,15 @@
 //! * several `remote:` lines in the section (a merged multi-source section)
 //!   UNLESS the gem is source-pinned to the Socket remote — see "Merged
 //!   sections" below;
+//! * a platform-suffixed spec (`nokogiri (1.16.0-x86_64-linux)`): the patch
+//!   registry serves only the ruby-platform gem, and the rewriter refuses
+//!   deps with platform variants;
 //! * the same gem name locked in ANOTHER source section as well (the
 //!   rewriter MOVES the spec; a duplicate is a hand-edit bundler would
 //!   resolve ambiguously).
 //!
-//! **Platform builds.** A gem bundler locks as precompiled platform gems
-//! has one spec per platform, and the rewriter moves all of them (the
-//! patch registry serves a patched build, a "prebuild", for each):
-//!
-//! ```text
-//! GEM
-//!   remote: https://patch.socket.dev/patch-registry/gem/<token>/<uuid>/
-//!   specs:
-//!     nokogiri (1.18.10-arm64-darwin)
-//!       racc (~> 1.4)
-//!     nokogiri (1.18.10-x86_64-linux-gnu)
-//!       racc (~> 1.4)
-//! ```
-//!
-//! The specs of one gem version under a Socket section of its own are ONE
-//! hosted pin of `pkg:gem/<name>@<version>`, with or without the
-//! ruby-platform `name (version)` beside them: one ref, as for a
-//! ruby-platform gem. A platform spec anywhere else Socket wiring reaches
-//! (a merged section, a vendored `PATH` section) is still
-//! [`DIAG_REF_INVALID`]: no writer puts one there.
-//!
 //! **Integrity.** `CHECKSUMS` `  name (version) sha256=<hex>` becomes
 //! [`Sha256Hex`](crate::vendor::lock_inventory::LockIntegrity::Sha256Hex).
-//! A pin of several builds is pinned only when `CHECKSUMS` has a sha256 for
-//! every one of them (each `name (version-<platform>)` entry holds its own
-//! prebuild's); the ref then carries the first build's.
 //! `integrity_required` is true iff the lock HAS a `CHECKSUMS` section: in
 //! that era (bundler ≥ 2.6) the rewriter only converges the lock after
 //! writing the patched gem's sha256, so a pin-less
@@ -194,8 +173,8 @@ use super::{
 };
 use crate::crawlers::ruby_crawler::bundler_loaded_lock_in;
 use crate::formats::gem::{
-    bundler_manifest_for, declarations, gemfile, same_remote, split_entry, GemfileLock, Section,
-    Spec, SpecLine, BUNDLER_LOCKS,
+    bundler_manifest_for, declarations, gemfile, same_remote, GemfileLock, Section, SpecLine,
+    BUNDLER_LOCKS,
 };
 use crate::patch::path_safety::is_canonical_uuid;
 use crate::vendor::gem::{gem_declaration_any, quoted_literal};
@@ -628,13 +607,10 @@ pub async fn manifest_source_pins(view: &ProjectView<'_>) -> Vec<(String, String
         {
             continue;
         }
-        // Any build names the version: a gem locked as precompiled
-        // platform builds has no ruby-platform spec to read it from, and a
-        // hosted pin of one is a recorded pin like any other.
         let versions: BTreeSet<&str> = locked
             .gem_sections()
             .flat_map(|section| section.specs.iter().filter_map(|line| line.parsed))
-            .filter(|spec| spec.name == name)
+            .filter(|spec| spec.name == name && spec.platform.is_none())
             .map(|spec| spec.version)
             .collect();
         if let [version] = versions.into_iter().collect::<Vec<_>>().as_slice() {
@@ -712,11 +688,6 @@ fn section_refs(
         _ => None,
     };
     let mut matched = false;
-    // The gem versions a hosted section of its own already yielded: a gem
-    // locked as platform builds has one spec per platform, and they are one
-    // pin (module docs, "Platform builds").
-    let own_hosted = matches!(wiring, Wiring::Hosted { only: None, .. });
-    let mut pinned: BTreeSet<(&str, &str)> = BTreeSet::new();
     for line in &sec.specs {
         // Merged section: only the gems source-pinned to the Socket remote
         // are its; the rest came from the other remotes.
@@ -724,12 +695,7 @@ fn section_refs(
             continue;
         }
         matched = true;
-        if let Some(spec) = line.parsed.filter(|_| own_hosted) {
-            if !pinned.insert((spec.name, spec.version)) {
-                continue;
-            }
-        }
-        spec_ref(file, lock, owners, sec, line, wiring, manifest, out);
+        spec_ref(file, lock, owners, line, wiring, manifest, out);
     }
     if let Some(only) = only.filter(|_| !matched) {
         out.diag(
@@ -885,39 +851,11 @@ fn vendored_wiring<'t>(file: &str, sec: &Section<'t>, out: &mut Discovery) -> Op
     }
 }
 
-/// The content pin the lock records for the hosted gem version `spec`
-/// names in `sec`: the `CHECKSUMS` sha256 of its one build, or, for a gem
-/// locked as several builds (module docs, "Platform builds"), of the first
-/// one when every build has one. `None` when any build is unpinned: bundler
-/// installs whichever build matches the machine, so one bare entry leaves
-/// the bytes of that platform open.
-fn hosted_integrity(
-    lock: &GemfileLock<'_>,
-    sec: &Section<'_>,
-    spec: Spec<'_>,
-) -> Option<crate::vendor::lock_inventory::LockIntegrity> {
-    let mut pins = sec
-        .specs
-        .iter()
-        .filter(|line| {
-            line.parsed
-                .is_some_and(|s| s.name == spec.name && s.version == spec.version)
-        })
-        .map(|line| {
-            let (name, token, _) = split_entry(line.raw)?;
-            lock.integrity(name, token)
-        });
-    let first = pins.next()??;
-    pins.all(|pin| pin.is_some()).then_some(first)
-}
-
-/// Validate one spec under a Socket-wired section `sec` and push its ref.
-#[allow(clippy::too_many_arguments)]
+/// Validate one spec under a Socket-wired section and push its ref.
 fn spec_ref(
     file: &str,
     lock: &GemfileLock<'_>,
     owners: &HashMap<&str, BTreeSet<usize>>,
-    sec: &Section<'_>,
     line: &SpecLine<'_>,
     wiring: &Wiring<'_>,
     manifest: &ManifestSources,
@@ -936,16 +874,13 @@ fn spec_ref(
         );
         return;
     };
-    // A platform build is hosted wiring only in a Socket section of the
-    // gem's own, where the rewriter moves every build of the version.
-    let own_hosted = matches!(wiring, Wiring::Hosted { only: None, .. });
-    if let Some(platform) = spec.platform.filter(|_| !own_hosted) {
+    if let Some(platform) = spec.platform {
         out.diag(
             DIAG_REF_INVALID,
             file,
             format!(
-                "{at}: {} {} is locked for platform {platform:?}; Socket patches wire a \
-                 platform build only through a patch-registry GEM section of its own",
+                "{at}: {} {} is locked for platform {platform:?}; Socket patches wire only the \
+                 ruby-platform gem",
                 spec.name, spec.version
             ),
         );
@@ -983,11 +918,7 @@ fn spec_ref(
                 uuid.clone(),
                 file,
                 Some(*remote),
-                if own_hosted {
-                    hosted_integrity(lock, sec, spec)
-                } else {
-                    lock.integrity(spec.name, spec.version)
-                },
+                lock.integrity(spec.name, spec.version),
                 lock.has_checksums(),
             );
             if manifest_confirms(file, &at, coords, wiring, manifest, out) {
@@ -1662,7 +1593,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_socket_specs_are_diagnosed() {
         let lock = format!(
-            "GEM\n  remote: {}\n  specs:\n    \
+            "GEM\n  remote: {}\n  specs:\n    nokogiri (1.16.0-x86_64-linux)\n    \
              bad name (1.0.0)\n    ../x (1.0.0)\n    .. (1.0.0)\n    weird (abc)\n\n\
              PATH\n  remote: {}\n  specs:\n    rack (3.2.6)\n\n\
              PATH\n  remote: ../.socket/vendor/gem/{UUID_B}/puma-6.4.2\n  specs:\n    puma (6.4.2)\n\n\
@@ -1679,7 +1610,7 @@ mod tests {
         assert!(out.refs.is_empty(), "{:#?}", out.refs);
         assert_eq!(
             diag_codes(&out),
-            vec![DIAG_REF_INVALID; 9],
+            vec![DIAG_REF_INVALID; 10],
             "{:#?}",
             out.diagnostics
         );
@@ -1687,134 +1618,6 @@ mod tests {
             .diagnostics
             .iter()
             .all(|d| d.detail.starts_with("Gemfile.lock")));
-    }
-
-    /// A lock whose Socket section holds the platform builds of nokogiri
-    /// (and the ruby-platform entry when `ruby`), `checksums` under
-    /// `CHECKSUMS` when given.
-    fn platform_builds_lock(ruby: bool, checksums: Option<&str>) -> String {
-        let ruby = if ruby {
-            "    nokogiri (1.18.10)\n      racc (~> 1.4)\n"
-        } else {
-            ""
-        };
-        let checksums = checksums
-            .map(|entries| format!("\nCHECKSUMS\n{entries}  racc (1.8.1) sha256={SHA_UP}\n"))
-            .unwrap_or_default();
-        format!(
-            "GEM\n  remote: {}\n  specs:\n{ruby}    nokogiri (1.18.10-arm64-darwin)\n      racc (~> \
-             1.4)\n    nokogiri (1.18.10-x86_64-linux-gnu)\n      racc (~> 1.4)\n\nGEM\n  remote: \
-             https://rubygems.org/\n  specs:\n    racc (1.8.1)\n\nPLATFORMS\n  arm64-darwin\n  \
-             x86_64-linux-gnu\n\nDEPENDENCIES\n  nokogiri (= 1.18.10)!\n{checksums}\nBUNDLED WITH\n  \
-             4.0.15\n",
-            index(UUID_A)
-        )
-    }
-
-    /// The hosted rewriter moves every platform build of a precompiled gem
-    /// into the patch registry's section. They are ONE hosted pin of the
-    /// gem version — one ref, no diagnostic — or the engine would drop the
-    /// rewrite as unattributable. The pin is content-pinned only when
-    /// `CHECKSUMS` has a sha256 for every build.
-    #[tokio::test]
-    async fn hosted_platform_builds_are_one_pin() {
-        const SHA_B: &str = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
-        let arm = format!("  nokogiri (1.18.10-arm64-darwin) sha256={SHA_A}\n");
-        let linux = format!("  nokogiri (1.18.10-x86_64-linux-gnu) sha256={SHA_B}\n");
-        let plain = format!("  nokogiri (1.18.10) sha256={SHA_B}\n");
-        // (ruby entry beside the builds, CHECKSUMS entries, the pin, required)
-        let cases: [(bool, Option<String>, Option<&str>, bool); 5] = [
-            (false, Some(format!("{arm}{linux}")), Some(SHA_A), true),
-            (
-                true,
-                Some(format!("{plain}{arm}{linux}")),
-                Some(SHA_B),
-                true,
-            ),
-            // One build bare: the bytes of that platform are open.
-            (
-                false,
-                Some(format!("{arm}  nokogiri (1.18.10-x86_64-linux-gnu)\n")),
-                None,
-                true,
-            ),
-            (false, Some(arm.clone()), None, true),
-            // Bundler < 2.6: no CHECKSUMS section, nothing to require.
-            (false, None, None, false),
-        ];
-        for (ruby, checksums, pin, required) in cases {
-            let p = Project::new();
-            p.write(
-                "Gemfile.lock",
-                platform_builds_lock(ruby, checksums.as_deref()),
-            );
-            p.write("Gemfile", manifest(&[hosted_decl("nokogiri", UUID_A)]));
-            let out = run(&p).await;
-            assert_refs(
-                &out,
-                &[("pkg:gem/nokogiri@1.18.10", UUID_A, WiringMode::Hosted)],
-            );
-            assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
-            let r = only(&out);
-            assert_eq!(
-                r.locked_integrity,
-                pin.map(|sha| LockIntegrity::Sha256Hex(sha.to_string())),
-                "{checksums:?}"
-            );
-            assert_eq!(r.integrity_required, required);
-            assert_eq!(r.lockfile_basis_ok(), pin.is_some() || !required);
-            assert_eq!(
-                out.hosted_claim("pkg:gem/nokogiri@1.18.10", UUID_A),
-                Some(true)
-            );
-        }
-    }
-
-    /// The rollout's recorded view reads a hosted pin from the manifest's
-    /// `source:` option and takes the version from the lock. A gem the lock
-    /// names only as platform builds has no ruby-platform spec to take it
-    /// from: any build names the version, or the pin is never recorded and
-    /// every capped re-scan spends a slot on it again. Builds of two
-    /// versions still name none.
-    #[tokio::test]
-    async fn platform_only_gem_is_a_manifest_source_pin() {
-        let gemfile = manifest(&[hosted_decl("nokogiri", UUID_A)]);
-        for ruby in [false, true] {
-            let lock = platform_builds_lock(ruby, None);
-            let pins = manifest_pins(&[("Gemfile", &gemfile), ("Gemfile.lock", &lock)]).await;
-            assert_eq!(
-                pins,
-                [("pkg:gem/nokogiri@1.18.10".to_string(), UUID_A.to_string())],
-                "ruby entry beside the builds: {ruby}"
-            );
-        }
-        let two_versions = platform_builds_lock(false, None).replace(
-            "nokogiri (1.18.10-x86_64-linux-gnu)",
-            "nokogiri (1.18.9-x86_64-linux-gnu)",
-        );
-        let pins = manifest_pins(&[("Gemfile", &gemfile), ("Gemfile.lock", &two_versions)]).await;
-        assert!(pins.is_empty(), "{pins:?}");
-    }
-
-    /// A platform build is hosted wiring only in a Socket section of the
-    /// gem's own. In a merged section (bundler <= 2.1), where the rewriter
-    /// refuses platform builds, it is still diagnosed and never attested.
-    #[tokio::test]
-    async fn platform_build_in_a_merged_section_is_diagnosed() {
-        let p = Project::new();
-        p.write(
-            "Gemfile.lock",
-            merged_lock(&index(UUID_A), "!").replace("vuln-gem (1.0.0)", "vuln-gem (1.0.0-java)"),
-        );
-        p.write("Gemfile", block_gemfile(&index(UUID_A)));
-        let out = run(&p).await;
-        assert!(out.refs.is_empty(), "{:#?}", out.refs);
-        assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID]);
-        assert!(
-            out.diagnostics[0].detail.contains("platform \"java\""),
-            "{:?}",
-            out.diagnostics
-        );
     }
 
     /// Ambiguous attributions: a legacy multi-remote GEM section, a patched

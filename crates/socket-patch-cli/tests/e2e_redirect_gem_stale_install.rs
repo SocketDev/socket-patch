@@ -98,27 +98,7 @@ async fn mount_api(server: &MockServer, view_budget: Option<u64>) {
 /// [`mount_api`] with the grant naming `patched_sha` as the patched
 /// archive's sha256.
 async fn mount_api_for(server: &MockServer, view_budget: Option<u64>, patched_sha: &str) {
-    mount_api_with(server, view_budget, patched_sha, &[]).await;
-}
-
-/// [`mount_api_for`] with the grant also listing `prebuilds`, the patch's
-/// patched platform gems as `(platform, sha256)` (`gemPlatforms`; absent
-/// from a grant that has none, as the service sends it).
-async fn mount_api_with(
-    server: &MockServer,
-    view_budget: Option<u64>,
-    patched_sha: &str,
-    prebuilds: &[(&str, String)],
-) {
-    mount_patch_api_with(
-        server,
-        UUID,
-        PATCHED_LIB,
-        view_budget,
-        patched_sha,
-        prebuilds,
-    )
-    .await;
+    mount_patch_api(server, UUID, PATCHED_LIB, view_budget, patched_sha).await;
 }
 
 /// [`mount_api_for`] for the patch `uuid`, whose patched lib is
@@ -130,32 +110,6 @@ async fn mount_patch_api(
     view_budget: Option<u64>,
     patched_sha: &str,
 ) {
-    mount_patch_api_with(server, uuid, patched_lib, view_budget, patched_sha, &[]).await;
-}
-
-/// The API of the patch `uuid`, whose patched lib is `patched_lib` and
-/// whose grant lists `prebuilds`.
-async fn mount_patch_api_with(
-    server: &MockServer,
-    uuid: &str,
-    patched_lib: &str,
-    view_budget: Option<u64>,
-    patched_sha: &str,
-    prebuilds: &[(&str, String)],
-) {
-    let mut identifiers = serde_json::json!({
-        "name": DEP,
-        "version": DEP_VERSION,
-        "gemChecksumSha256": patched_sha,
-    });
-    if !prebuilds.is_empty() {
-        identifiers["gemPlatforms"] = prebuilds
-            .iter()
-            .map(|(platform, sha)| {
-                serde_json::json!({ "platform": platform, "gemChecksumSha256": sha })
-            })
-            .collect();
-    }
     let hosted_url = format!(
         "{}/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{uuid}/{DEP}-{DEP_VERSION}.gem",
         server.uri()
@@ -207,7 +161,11 @@ async fn mount_patch_api_with(
                     "registryOverride": {
                         "kind": "rubygems-compact-index",
                         "indexUrl": index_url,
-                        "identifiers": identifiers,
+                        "identifiers": {
+                            "name": DEP,
+                            "version": DEP_VERSION,
+                            "gemChecksumSha256": patched_sha,
+                        }
                     }
                 }
             }
@@ -2102,12 +2060,6 @@ async fn gem_hosted_standalone_vex_ignores_unused_system_home_copy() {
 /// (`metadata.gz`, the same bytes for every build, as the patch service
 /// keeps it) and the package tree (`data.tar.gz`).
 fn real_gem(lib: &str) -> Vec<u8> {
-    real_gem_for(lib, "ruby")
-}
-
-/// [`real_gem`] built for `platform`: `ruby`, or the platform of a
-/// precompiled gem (`<name>-<version>-<platform>.gem`).
-fn real_gem_for(lib: &str, platform: &str) -> Vec<u8> {
     use std::io::Write as _;
     fn gz(bytes: &[u8]) -> Vec<u8> {
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -2127,7 +2079,7 @@ fn real_gem_for(lib: &str, platform: &str) -> Vec<u8> {
     }
     let metadata = format!(
         "--- !ruby/object:Gem::Specification\nname: {DEP}\nversion: \
-         !ruby/object:Gem::Version\n  version: {DEP_VERSION}\nplatform: {platform}\nauthors:\n- \
+         !ruby/object:Gem::Version\n  version: {DEP_VERSION}\nplatform: ruby\nauthors:\n- \
          e2e\nbindir: bin\ndependencies: []\nexecutables: []\nextensions: []\nfiles:\n- \
          lib/stale_probe_gem.rb\nrequire_paths:\n- lib\nrubygems_version: 3.6.9\n"
     );
@@ -2159,23 +2111,14 @@ async fn serve_patched_gem(server: &MockServer, body: Vec<u8>) {
 /// A real install of the fixture gem under `home`: the gem dir, the
 /// archive RubyGems installed it from, and a gemspec that builds nothing.
 fn install_real_gem(home: &Path, lib: &str) -> PathBuf {
-    install_real_gem_for(home, lib, "ruby")
-}
-
-/// [`install_real_gem`] of the build for `platform`: RubyGems names a
-/// platform gem's dir, archive and gemspec `<name>-<version>-<platform>`.
-fn install_real_gem_for(home: &Path, lib: &str, platform: &str) -> PathBuf {
-    let leaf = match platform {
-        "ruby" => format!("{DEP}-{DEP_VERSION}"),
-        platform => format!("{DEP}-{DEP_VERSION}-{platform}"),
-    };
+    let leaf = format!("{DEP}-{DEP_VERSION}");
     let gem_dir = home.join("gems").join(&leaf);
     std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
     std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), lib).unwrap();
     std::fs::create_dir_all(home.join("cache")).unwrap();
     std::fs::write(
         home.join("cache").join(format!("{leaf}.gem")),
-        real_gem_for(lib, platform),
+        real_gem(lib),
     )
     .unwrap();
     std::fs::create_dir_all(home.join("specifications")).unwrap();
@@ -2337,494 +2280,84 @@ fn platform_lock(arm_sha: &str, linux_sha: &str) -> String {
     )
 }
 
-/// A gem locked as precompiled platform builds, with a prebuild for every
-/// one: the scan moves both lock entries to the patch registry, each
-/// pinned to its own prebuild, and the platform copy this machine
-/// installed (`gems/<name>-<version>-<platform>`) is replaced with the
-/// patched platform gem the registry serves under that name, verified
-/// against that platform's sha256 — as is the committed `bundle cache`
-/// archive. A platform gem declares no extensions, so nothing is built.
-/// The same run's `--vex` attests the gem, a re-scan has nothing left to
-/// do, and `rollback` hands back the pre-scan pair byte for byte and puts
-/// the installed copy and the archive back on the upstream platform gem.
-#[tokio::test(flavor = "multi_thread")]
-async fn refresh_replaces_a_stale_platform_install_with_its_prebuild() {
-    let server = MockServer::start().await;
-    let build = |lib: &str, platform: &str| real_gem_for(lib, platform);
-    let (prebuilt, other_prebuilt) = (
-        build(PATCHED_LIB, PLATFORM),
-        build(PATCHED_LIB, OTHER_PLATFORM),
-    );
-    let (upstream, other_upstream) = (
-        build(UPSTREAM_LIB, PLATFORM),
-        build(UPSTREAM_LIB, OTHER_PLATFORM),
-    );
-    mount_api_with(
-        &server,
-        None,
-        &sha256_of(&real_gem(PATCHED_LIB)),
-        &[
-            (PLATFORM, sha256_of(&prebuilt)),
-            (OTHER_PLATFORM, sha256_of(&other_prebuilt)),
-        ],
+/// The installed copy of the fixture gem's precompiled build for
+/// `platform` under `home`, as RubyGems lays one out: the gem dir and the
+/// gemspec are named `<name>-<version>-<platform>`.
+fn install_platform_gem(home: &Path, lib: &str, platform: &str) -> PathBuf {
+    let leaf = format!("{DEP}-{DEP_VERSION}-{platform}");
+    let gem_dir = home.join("gems").join(&leaf);
+    std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+    std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), lib).unwrap();
+    std::fs::create_dir_all(home.join("specifications")).unwrap();
+    std::fs::write(
+        home.join("specifications").join(format!("{leaf}.gemspec")),
+        format!(
+            "Gem::Specification.new do |s|\n  s.name = \"{DEP}\".freeze\n  s.version = \
+             \"{DEP_VERSION}\".freeze\n  s.platform = \"{platform}\".freeze\n  s.require_paths = \
+             [\"lib\".freeze]\nend\n"
+        ),
     )
-    .await;
-    let leaf = format!("{DEP}-{DEP_VERSION}-{PLATFORM}");
-    // The patch registry serves the prebuild under the platform gem's name.
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/patch-registry/gem/{TOKEN}/{UUID}/gems/{leaf}.gem"
-        )))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_raw(prebuilt.clone(), "application/octet-stream"),
-        )
-        .mount(&server)
-        .await;
-    // rubygems.org's stand-in: the index lists each build under its own
-    // `<version>-<platform>` token.
-    Mock::given(method("GET"))
-        .and(path(format!("/upstream/info/{DEP}")))
-        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-            "---\n{DEP_VERSION} |checksum:{}\n{DEP_VERSION}-{PLATFORM} |checksum:{}\n\
-             {DEP_VERSION}-{OTHER_PLATFORM} |checksum:{}\n",
-            sha256_of(&real_gem(UPSTREAM_LIB)),
-            sha256_of(&upstream),
-            sha256_of(&other_upstream),
-        )))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/upstream/gems/{leaf}.gem")))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_raw(upstream.clone(), "application/octet-stream"),
-        )
-        .mount(&server)
-        .await;
+    .unwrap();
+    gem_dir
+}
 
+/// A fresh checkout: nothing is installed, and the lock names the gem only
+/// as platform builds. The hosted scan reads the gem from the lock alone,
+/// pins nothing, says that the lock holds platform builds, and leaves both
+/// files as they were.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_scan_names_a_platform_locked_gem_from_the_lock_alone() {
+    let server = MockServer::start().await;
+    mount_api_for(&server, None, &sha256_of(&real_gem(PATCHED_LIB))).await;
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
     let gemfile = format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\n");
-    let lock = platform_lock(&sha256_of(&upstream), &sha256_of(&other_upstream));
+    let lock = platform_lock(&"1".repeat(64), &"2".repeat(64));
     std::fs::write(proj.join("Gemfile"), &gemfile).unwrap();
     std::fs::write(proj.join("Gemfile.lock"), &lock).unwrap();
-    let home = project_home(&proj);
-    let gem_dir = install_real_gem_for(&home, UPSTREAM_LIB, PLATFORM);
-    assert!(gem_dir.ends_with(&leaf));
-    // A committed `bundle cache` of the upstream platform gem.
-    let committed = proj
-        .join("vendor")
-        .join("cache")
-        .join(format!("{leaf}.gem"));
-    std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
-    std::fs::write(&committed, &upstream).unwrap();
 
-    let vex_path = proj.join("out.vex.json");
-    let uri = server.uri();
-    let args = scan_args(
-        &proj,
-        &uri,
-        &[
-            "--json",
-            "--vex",
-            vex_path.to_str().unwrap(),
-            "--vex-product",
-            "pkg:gem/app@1.0.0",
-        ],
-    );
-    let (code, stdout, stderr) = common::run_with_env(&proj, &args, &[]);
+    let (code, stdout, stderr) = hosted_scan_json(&proj, &server.uri());
     let env = common::parse_json_envelope(&stdout);
     assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
-    assert_eq!(hosted_pinned(&env), 1, "{env}");
+    assert_eq!(hosted_pinned(&env), 0, "{env}");
+    let skipped = warnings_with_code(&env, "redirect_gem_platform_unsupported");
+    let [detail] = skipped.as_slice() else {
+        panic!("one platform skip: {env}");
+    };
     assert!(
-        !stdout.contains("redirect_gem_platform_unsupported"),
-        "every locked platform has a prebuild: {env}"
-    );
-
-    // The lock: both builds under the patch registry, each on its own
-    // prebuild's sha256.
-    let index = format!("{uri}/patch-registry/gem/{TOKEN}/{UUID}/");
-    let hosted_lock = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
-    assert!(
-        hosted_lock.contains(&format!(
-            "GEM\n  remote: {index}\n  specs:\n    {DEP} ({DEP_VERSION}-{PLATFORM})\n    {DEP} \
-             ({DEP_VERSION}-{OTHER_PLATFORM})\n\n"
+        detail.contains(&format!(
+            "Gemfile.lock locks platform-specific builds of {DEP} {DEP_VERSION} (`{DEP} \
+             ({DEP_VERSION}-{PLATFORM})`)"
         )),
-        "{hosted_lock}"
+        "{detail}"
     );
-    assert!(
-        hosted_lock.contains(&format!(
-            "DEPENDENCIES\n  {DEP} (= {DEP_VERSION})!\n\nCHECKSUMS\n  {DEP} \
-             ({DEP_VERSION}-{PLATFORM}) sha256={}\n  {DEP} ({DEP_VERSION}-{OTHER_PLATFORM}) \
-             sha256={}\n",
-            sha256_of(&prebuilt),
-            sha256_of(&other_prebuilt)
-        )),
-        "{hosted_lock}"
-    );
-
-    // The installed platform copy and both archives are the prebuild.
     assert!(
         stale_warnings(&env).is_empty(),
-        "nothing is left stale: {env}"
+        "nothing is installed: {env}"
     );
-    let notes = warnings_with_code(&env, "redirect_gem_install_refreshed");
-    assert_eq!(
-        notes.len(),
-        2,
-        "the install and the committed archive: {env}"
-    );
-    assert_eq!(installed_lib(&gem_dir), PATCHED_LIB);
-    assert_eq!(
-        std::fs::read(home.join("cache").join(format!("{leaf}.gem"))).unwrap(),
-        prebuilt,
-        "the archive RubyGems reinstalls from is the prebuild"
-    );
-    assert_eq!(std::fs::read(&committed).unwrap(), prebuilt);
-    assert!(
-        !home.join(".socket-patch-refresh").exists(),
-        "no stage left"
-    );
-    let doc = std::fs::read_to_string(&vex_path).expect("VEX written");
-    assert!(doc.contains(PURL), "the refreshed copy is attested:\n{doc}");
-
-    // A re-scan: the pair is as the scan wants it, the install is patched.
-    let (code, stdout, stderr) =
-        common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
-    let env = common::parse_json_envelope(&stdout);
-    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
-    assert!(
-        stale_warnings(&env).is_empty()
-            && warnings_with_code(&env, "redirect_gem_install_refreshed").is_empty(),
-        "a re-scan has nothing to refresh or to warn about: {env}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
-        hosted_lock,
-        "a re-scan leaves the lock byte-identical"
-    );
-
-    // Rollback: every platform entry back upstream, each `CHECKSUMS` entry
-    // back on its upstream sha256, the Gemfile as it was.
-    let rubygems = format!("{uri}/upstream");
-    let (code, stdout, stderr) = common::run_with_env(
-        &proj,
-        &[
-            "rollback",
-            PURL,
-            "--json",
-            "--cwd",
-            proj.to_str().unwrap(),
-            "--api-url",
-            uri.as_str(),
-            "--org",
-            ORG,
-            "--api-token",
-            "fake",
-            "--patch-server-url",
-            uri.as_str(),
-        ],
-        &[("SOCKET_RUBYGEMS_URL", rubygems.as_str())],
-    );
-    let env: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}\n{stderr}"));
-    assert_eq!(code, 0, "{env}\n{stderr}");
     assert_eq!(
         std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
         lock,
-        "rollback restores the lock byte for byte"
+        "the lock is untouched"
     );
     assert_eq!(
         std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
-        gemfile
+        gemfile,
+        "the Gemfile is untouched"
     );
-    // The lock pins the upstream platform gem again, so what Bundler holds
-    // goes back to it too: a patched archive left in its cache dir would
-    // fail every install on the restored checksum.
-    assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB);
-    assert_eq!(
-        std::fs::read(home.join("cache").join(format!("{leaf}.gem"))).unwrap(),
-        upstream
-    );
-    assert_eq!(std::fs::read(&committed).unwrap(), upstream);
-    assert_eq!(
-        warnings_with_code(&env, "upstream_gem_install_refreshed").len(),
-        2,
-        "the install and the committed archive: {env}"
-    );
-    assert!(
-        warnings_with_code(&env, "upstream_gem_stale_cache").is_empty()
-            && warnings_with_code(&env, "upstream_gem_stale_install").is_empty(),
-        "nothing is left on the patched build: {env}"
-    );
-}
-
-/// A shared gem home that holds BOTH builds of the gem's version: another
-/// project's ruby-platform copy (`gems/<name>-<version>`, patched in place
-/// there, its archive pruned) and the platform build this project's lock
-/// names. Which copy is this project's is the lock's to say, by leaf:
-///
-/// * the scan reports the stale PLATFORM build (the one Bundler loads here)
-///   and refreshes it on request. Judging the first dir of the version, the
-///   ruby-platform one, would call the gem patched and leave the loaded
-///   build unpatched and unreported;
-/// * `rollback` puts that platform build back on the upstream gem, and
-///   neither run judges, reports or replaces the ruby-platform copy the
-///   lock does not name.
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn stale_guard_follows_the_builds_the_lock_names_in_a_home_with_both() {
-    let server = MockServer::start().await;
-    let (prebuilt, other_prebuilt) = (
-        real_gem_for(PATCHED_LIB, PLATFORM),
-        real_gem_for(PATCHED_LIB, OTHER_PLATFORM),
-    );
-    let (upstream, other_upstream) = (
-        real_gem_for(UPSTREAM_LIB, PLATFORM),
-        real_gem_for(UPSTREAM_LIB, OTHER_PLATFORM),
-    );
-    mount_api_with(
-        &server,
-        None,
-        &sha256_of(&real_gem(PATCHED_LIB)),
-        &[
-            (PLATFORM, sha256_of(&prebuilt)),
-            (OTHER_PLATFORM, sha256_of(&other_prebuilt)),
-        ],
-    )
-    .await;
-    let leaf = format!("{DEP}-{DEP_VERSION}-{PLATFORM}");
-    for (route, body) in [
-        (
-            format!("/patch-registry/gem/{TOKEN}/{UUID}/gems/{leaf}.gem"),
-            prebuilt.clone(),
-        ),
-        (format!("/upstream/gems/{leaf}.gem"), upstream.clone()),
-    ] {
-        Mock::given(method("GET"))
-            .and(path(route))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/octet-stream"))
-            .mount(&server)
-            .await;
-    }
-    Mock::given(method("GET"))
-        .and(path(format!("/upstream/info/{DEP}")))
-        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-            "---\n{DEP_VERSION}-{PLATFORM} |checksum:{}\n{DEP_VERSION}-{OTHER_PLATFORM} \
-             |checksum:{}\n",
-            sha256_of(&upstream),
-            sha256_of(&other_upstream),
-        )))
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let proj = tmp.path().join("proj");
-    std::fs::create_dir_all(&proj).unwrap();
-    let lock = platform_lock(&sha256_of(&upstream), &sha256_of(&other_upstream));
-    std::fs::write(
-        proj.join("Gemfile"),
-        format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\n"),
-    )
-    .unwrap();
-    std::fs::write(proj.join("Gemfile.lock"), &lock).unwrap();
-    // The shared home: the other project's ruby-platform copy first, then
-    // this project's platform build beside it.
-    let home = tmp.path().join("system-home");
-    let bin_dir = tmp.path().join("fake-bin");
-    let ruby_dir = stage_system_home_copy(&home, &bin_dir);
-    let ruby_archive = home.join("cache").join(format!("{DEP}-{DEP_VERSION}.gem"));
-    std::fs::write(ruby_dir.join("lib").join("stale_probe_gem.rb"), PATCHED_LIB).unwrap();
-    std::fs::remove_file(&ruby_archive).unwrap();
-    let platform_dir = install_real_gem_for(&home, UPSTREAM_LIB, PLATFORM);
-    let path_env = [("PATH", bin_dir.to_str().unwrap())];
-    let ruby_copy_untouched = || {
-        assert_eq!(
-            installed_lib(&ruby_dir),
-            PATCHED_LIB,
-            "the ruby-platform copy is not this project's"
-        );
-        assert!(!ruby_archive.exists(), "no archive is added beside it");
-    };
-
-    // The scan: the stale copy is the platform build, and a shared home is
-    // left alone.
-    let uri = server.uri();
-    let (code, stdout, stderr) =
-        common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &path_env);
-    let env = common::parse_json_envelope(&stdout);
-    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
-    assert_eq!(hosted_pinned(&env), 1, "{env}");
-    let stale = stale_warnings(&env);
-    assert_eq!(stale.len(), 1, "one stale copy, the platform build: {env}");
-    assert!(
-        stale[0].contains(&format!("install at {}, and", platform_dir.display())),
-        "{stale:?}"
-    );
-    assert_eq!(installed_lib(&platform_dir), UPSTREAM_LIB);
-    ruby_copy_untouched();
-
-    // On request the platform build is refreshed; the other copy is not.
-    let (code, stdout, stderr) = common::run_with_env(
-        &proj,
-        &scan_args(&proj, &uri, &["--json", "--gem-refresh-shared"]),
-        &path_env,
-    );
-    let env = common::parse_json_envelope(&stdout);
-    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
-    assert!(stale_warnings(&env).is_empty(), "{env}");
-    let notes = warnings_with_code(&env, "redirect_gem_install_refreshed");
-    assert_eq!(notes.len(), 1, "{env}");
-    assert!(
-        notes[0].contains(&platform_dir.display().to_string()),
-        "{notes:?}"
-    );
-    assert_eq!(installed_lib(&platform_dir), PATCHED_LIB);
-    assert_eq!(
-        std::fs::read(home.join("cache").join(format!("{leaf}.gem"))).unwrap(),
-        prebuilt
-    );
-    ruby_copy_untouched();
-
-    // Rollback: the platform build goes back to the upstream gem. The
-    // ruby-platform copy holds the patch and has no archive, and is still
-    // none of this project's builds: it is neither reported nor replaced.
-    let rubygems = format!("{uri}/upstream");
-    let (code, stdout, stderr) = common::run_with_env(
-        &proj,
-        &[
-            "rollback",
-            PURL,
-            "--json",
-            "--gem-refresh-shared",
-            "--cwd",
-            proj.to_str().unwrap(),
-            "--api-url",
-            uri.as_str(),
-            "--org",
-            ORG,
-            "--api-token",
-            "fake",
-            "--patch-server-url",
-            uri.as_str(),
-        ],
-        &[
-            ("PATH", bin_dir.to_str().unwrap()),
-            ("SOCKET_RUBYGEMS_URL", rubygems.as_str()),
-        ],
-    );
-    let env: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}\n{stderr}"));
-    assert_eq!(code, 0, "{env}\n{stderr}");
-    assert_eq!(
-        std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
-        lock,
-        "rollback restores the lock byte for byte"
-    );
-    assert_eq!(installed_lib(&platform_dir), UPSTREAM_LIB);
-    assert_eq!(
-        std::fs::read(home.join("cache").join(format!("{leaf}.gem"))).unwrap(),
-        upstream
-    );
-    assert_eq!(
-        warnings_with_code(&env, "upstream_gem_install_refreshed").len(),
-        1,
-        "{env}"
-    );
-    assert!(
-        warnings_with_code(&env, "upstream_gem_stale_install").is_empty(),
-        "the copy the lock does not name is not reported: {env}"
-    );
-    ruby_copy_untouched();
-}
-
-/// A fresh checkout: nothing is installed, and the lock names the gem only
-/// as platform builds. The hosted scan reads the gem from the lock alone
-/// and pins every build to its prebuild. With a prebuild missing for one
-/// locked platform it pins nothing, says which, and leaves both files as
-/// they were.
-#[tokio::test(flavor = "multi_thread")]
-async fn gem_hosted_scan_pins_platform_builds_from_the_lock_alone() {
-    let ruby_sha = sha256_of(&real_gem(PATCHED_LIB));
-    let (arm_sha, linux_sha) = (
-        sha256_of(&real_gem_for(PATCHED_LIB, PLATFORM)),
-        sha256_of(&real_gem_for(PATCHED_LIB, OTHER_PLATFORM)),
-    );
-    for complete in [true, false] {
-        let server = MockServer::start().await;
-        let mut prebuilds = vec![(PLATFORM, arm_sha.clone())];
-        if complete {
-            prebuilds.push((OTHER_PLATFORM, linux_sha.clone()));
-        }
-        mount_api_with(&server, None, &ruby_sha, &prebuilds).await;
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("proj");
-        std::fs::create_dir_all(&proj).unwrap();
-        let gemfile =
-            format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\n");
-        let lock = platform_lock(&"1".repeat(64), &"2".repeat(64));
-        std::fs::write(proj.join("Gemfile"), &gemfile).unwrap();
-        std::fs::write(proj.join("Gemfile.lock"), &lock).unwrap();
-
-        let (code, stdout, stderr) = hosted_scan_json(&proj, &server.uri());
-        let env = common::parse_json_envelope(&stdout);
-        assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
-        let after = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
-        let skipped = warnings_with_code(&env, "redirect_gem_platform_unsupported");
-        if complete {
-            assert_eq!(hosted_pinned(&env), 1, "{env}");
-            assert!(skipped.is_empty(), "{env}");
-            assert!(
-                after.contains(&format!(
-                    "/patch-registry/gem/{TOKEN}/{UUID}/\n  specs:\n    {DEP} \
-                     ({DEP_VERSION}-{PLATFORM})\n    {DEP} ({DEP_VERSION}-{OTHER_PLATFORM})\n"
-                )),
-                "{after}"
-            );
-            assert!(
-                after.contains(&format!(
-                    "  {DEP} ({DEP_VERSION}-{PLATFORM}) sha256={arm_sha}\n  {DEP} \
-                     ({DEP_VERSION}-{OTHER_PLATFORM}) sha256={linux_sha}\n"
-                )),
-                "{after}"
-            );
-            assert!(
-                stale_warnings(&env).is_empty(),
-                "nothing is installed: {env}"
-            );
-        } else {
-            assert_eq!(hosted_pinned(&env), 0, "{env}");
-            let [detail] = skipped.as_slice() else {
-                panic!("one platform skip: {env}");
-            };
-            assert!(
-                detail.contains(&format!(
-                    "no patched build for `{DEP} ({DEP_VERSION}-{OTHER_PLATFORM})`"
-                )) && detail.contains(&format!("patched builds for {PLATFORM}")),
-                "{detail}"
-            );
-            assert_eq!(after, lock, "the lock is untouched");
-            assert_eq!(
-                std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
-                gemfile,
-                "the Gemfile is untouched"
-            );
-        }
-    }
 }
 
 /// A lock that names the gem only as platform builds, beside a plain
-/// gem, and a patch without a patched build for every locked platform:
-/// the run refuses the gem. The lock still resolves it, so the closing
-/// totals count its advisory as left to patch, in hosted mode (which
-/// reads the gem from the lock alone) and in vendored mode (which reads
-/// the installed platform copy).
+/// gem: the run refuses the gem. The lock still resolves it, so the
+/// closing totals count its advisory as left to patch, in hosted mode
+/// (which reads the gem from the lock alone, and skips it) and in vendored
+/// mode (which reads the installed platform copy, and fails on it).
 #[tokio::test(flavor = "multi_thread")]
 async fn refused_platform_gem_is_counted_as_left_to_patch() {
     const LEFT: &str =
         "\n1 vulnerability left to patch: 1 is in packages this run did not patch.\n";
-    let arm_sha = sha256_of(&real_gem_for(PATCHED_LIB, PLATFORM));
-    for mode in ["hosted", "vendored"] {
+    for (mode, exit) in [("hosted", 0), ("vendored", 1)] {
         let server = MockServer::start().await;
         // The lookup names the advisory the patch fixes, as the service
         // does (the totals count advisories), and only for a run that
@@ -2855,13 +2388,7 @@ async fn refused_platform_gem_is_counted_as_left_to_patch() {
             .with_priority(1)
             .mount(&server)
             .await;
-        mount_api_with(
-            &server,
-            None,
-            &sha256_of(&real_gem(PATCHED_LIB)),
-            &[(PLATFORM, arm_sha.clone())],
-        )
-        .await;
+        mount_api_for(&server, None, &sha256_of(&real_gem(PATCHED_LIB))).await;
         let tmp = tempfile::tempdir().unwrap();
         let proj = tmp.path().join("proj");
         std::fs::create_dir_all(&proj).unwrap();
@@ -2885,7 +2412,7 @@ async fn refused_platform_gem_is_counted_as_left_to_patch() {
         std::fs::write(proj.join("Gemfile"), &gemfile).unwrap();
         std::fs::write(proj.join("Gemfile.lock"), &lock).unwrap();
         if mode == "vendored" {
-            install_real_gem_for(&project_home(&proj), UPSTREAM_LIB, PLATFORM);
+            install_platform_gem(&project_home(&proj), UPSTREAM_LIB, PLATFORM);
         }
 
         let uri = server.uri();
@@ -2909,12 +2436,14 @@ async fn refused_platform_gem_is_counted_as_left_to_patch() {
             ],
             &[],
         );
-        assert_eq!(code, 0, "{mode}\nstdout:\n{stdout}\nstderr:\n{stderr}");
-        // The premise: the run refused the gem for a platform the patch
-        // has no build for.
+        assert_eq!(code, exit, "{mode}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        // The premise: the run refused the gem for its platform builds.
         let refusal = match mode {
-            "hosted" => format!("no patched build for `{DEP} ({DEP_VERSION}-{OTHER_PLATFORM})`"),
-            _ => format!("the patch service has no prebuilt platform gem of `{DEP}`"),
+            "hosted" => format!("locks platform-specific builds of {DEP} {DEP_VERSION}"),
+            _ => format!(
+                "installed dir `{DEP}-{DEP_VERSION}-{PLATFORM}` is not the portable \
+                 `{DEP}-{DEP_VERSION}` gem"
+            ),
         };
         assert!(
             stderr.contains(&refusal),
@@ -5382,4 +4911,215 @@ async fn vendored_takeover_of_a_superseded_native_gem_names_the_extension() {
         "the hosted pin stays"
     );
     assert!(!proj.join(".socket").join("vendor").exists());
+}
+
+// ── a project wired by a development build that was never released ────
+
+/// `args` on the project `proj`, against the mock API.
+fn run_on(proj: &Path, uri: &str, args: &[&str]) -> (i32, String, String) {
+    let mut all = args.to_vec();
+    all.extend_from_slice(&[
+        "--cwd",
+        proj.to_str().unwrap(),
+        "--api-url",
+        uri,
+        "--patch-server-url",
+        uri,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+    ]);
+    common::run_with_env(proj, &all, &[])
+}
+
+/// A development build that was never released redirected a gem locked as
+/// precompiled platform builds: the manifest names the patch registry for
+/// the gem, and the lock holds the gem's platform entries (with or without
+/// the ruby-platform one) in a section of that registry, each pinned to a
+/// patched archive. This build writes no such pair, and does not unwind
+/// one either: a hosted scan rewrites nothing, `rollback` and `remove`
+/// fail and say why, and no command changes a byte of the pair.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_platform_pair_of_an_unreleased_build_is_refused_and_left_as_it_is() {
+    let server = MockServer::start().await;
+    mount_api_for(&server, None, &sha256_of(&real_gem(PATCHED_LIB))).await;
+    let uri = server.uri();
+    let index = format!("{uri}/patch-registry/gem/{TOKEN}/{UUID}/");
+    // With the ruby-platform entry beside the platform ones, the lock has a
+    // `name (version)` spec that lockfile discovery reads as the pin.
+    for ruby_entry in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let gemfile = format!(
+            "source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\", source: \
+             \"{index}\"\n"
+        );
+        let ruby = match ruby_entry {
+            true => format!("    {DEP} ({DEP_VERSION})\n"),
+            false => String::new(),
+        };
+        let lock = format!(
+            "GEM\n  remote: {index}\n  specs:\n{ruby}    {DEP} ({DEP_VERSION}-{PLATFORM})\n    {DEP} \
+             ({DEP_VERSION}-{OTHER_PLATFORM})\n\nGEM\n  remote: https://rubygems.org/\n  \
+             specs:\n\nPLATFORMS\n  {PLATFORM}\n  {OTHER_PLATFORM}\n\nDEPENDENCIES\n  {DEP} (= \
+             {DEP_VERSION})!\n\nCHECKSUMS\n  {DEP} ({DEP_VERSION}-{PLATFORM}) sha256={}\n  {DEP} \
+             ({DEP_VERSION}-{OTHER_PLATFORM}) sha256={}\n\nBUNDLED WITH\n  4.0.15\n",
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+        std::fs::write(proj.join("Gemfile"), &gemfile).unwrap();
+        std::fs::write(proj.join("Gemfile.lock"), &lock).unwrap();
+        let untouched = |after: &str| {
+            assert_eq!(
+                std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
+                lock,
+                "{after}: the lock is untouched (ruby entry: {ruby_entry})"
+            );
+            assert_eq!(
+                std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+                gemfile,
+                "{after}: the Gemfile is untouched (ruby entry: {ruby_entry})"
+            );
+        };
+
+        // The scan writes nothing. (With the ruby-platform entry the lock
+        // has a pin that discovery reads, and the scan reports it as the
+        // pin that is there.)
+        let (code, stdout, stderr) = hosted_scan_json(&proj, &uri);
+        let env = common::parse_json_envelope(&stdout);
+        assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+        assert_eq!(
+            env["redirect"]["rewrittenFiles"],
+            serde_json::json!([]),
+            "{env}"
+        );
+        if !ruby_entry {
+            assert_eq!(hosted_pinned(&env), 0, "{env}");
+        }
+        untouched("scan");
+
+        // What refuses the unwind, and the words that say so.
+        let (refusal, said) = match ruby_entry {
+            false => ("hosted_wiring_contested", "is locked for platform"),
+            true => (
+                "hosted_restore_refused",
+                "its Socket GEM section does not lock exactly",
+            ),
+        };
+        let (code, stdout, stderr) = run_on(&proj, &uri, &["rollback", "--yes", "--json"]);
+        let env = common::parse_json_envelope(&stdout);
+        assert_eq!(code, 1, "{env}\nstderr:\n{stderr}");
+        let reported = env.to_string();
+        assert!(reported.contains(refusal), "{env}");
+        assert!(reported.contains(said), "{env}");
+        assert!(
+            reported.contains("version control"),
+            "the way out is named: {env}"
+        );
+        untouched("rollback");
+
+        let (code, stdout, stderr) = run_on(&proj, &uri, &["remove", PURL, "--yes", "--json"]);
+        assert_eq!(code, 1, "{stdout}\nstderr:\n{stderr}");
+        assert!(stdout.contains(said), "{stdout}");
+        untouched("remove");
+    }
+}
+
+/// A development build that was never released vendored a gem locked as
+/// precompiled platform builds: one tree per platform under the copy dir,
+/// every platform block in one `PATH` section, and a ledger entry that
+/// names the platforms (`gemPlatforms`) and records the `CHECKSUMS` lines
+/// as arrays. This build vendors no such gem, and still undoes one:
+/// `rollback` reads the ledger, puts the Gemfile and the lock back byte
+/// for byte and removes the copies.
+#[tokio::test(flavor = "multi_thread")]
+async fn rollback_undoes_a_platform_gem_an_unreleased_build_vendored() {
+    let server = MockServer::start().await;
+    mount_api_for(&server, None, &sha256_of(&real_gem(PATCHED_LIB))).await;
+    let uri = server.uri();
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+
+    let rel = format!(".socket/vendor/gem/{UUID}/{DEP}-{DEP_VERSION}");
+    let plain_line = format!("gem \"{DEP}\", \"{DEP_VERSION}\"");
+    let wired_line = format!("gem \"{DEP}\", \"{DEP_VERSION}\", path: \"{rel}\"");
+    let gemfile_of = |line: &str| format!("source \"https://rubygems.org\"\n{line}\n");
+    let lock_before = platform_lock(&"1".repeat(64), &"2".repeat(64));
+    let blocks = [
+        format!("    {DEP} ({DEP_VERSION}-{PLATFORM})"),
+        format!("    {DEP} ({DEP_VERSION}-{OTHER_PLATFORM})"),
+    ];
+    let bare = [
+        format!("  {DEP} ({DEP_VERSION}-{PLATFORM})"),
+        format!("  {DEP} ({DEP_VERSION}-{OTHER_PLATFORM})"),
+    ];
+    let lock_wired = format!(
+        "PATH\n  remote: {rel}\n  specs:\n{}\n{}\n\nGEM\n  remote: https://rubygems.org/\n  \
+         specs:\n\nPLATFORMS\n  {PLATFORM}\n  {OTHER_PLATFORM}\n\nDEPENDENCIES\n  {DEP} (= \
+         {DEP_VERSION})!\n\nCHECKSUMS\n{}\n{}\n\nBUNDLED WITH\n  4.0.15\n",
+        blocks[0], blocks[1], bare[0], bare[1]
+    );
+    std::fs::write(proj.join("Gemfile"), gemfile_of(&wired_line)).unwrap();
+    std::fs::write(proj.join("Gemfile.lock"), &lock_wired).unwrap();
+    for platform in [PLATFORM, OTHER_PLATFORM] {
+        let tree = proj.join(&rel).join(platform);
+        std::fs::create_dir_all(tree.join("lib")).unwrap();
+        std::fs::write(tree.join("lib/stale_probe_gem.rb"), PATCHED_LIB).unwrap();
+        std::fs::write(tree.join(format!("{DEP}.gemspec")), "# stub\n").unwrap();
+    }
+    let mut new_lines = vec![
+        "PATH".to_string(),
+        format!("  remote: {rel}"),
+        "  specs:".to_string(),
+    ];
+    new_lines.extend(blocks.iter().cloned());
+    new_lines.push(format!("  {DEP} (= {DEP_VERSION})!"));
+    let mut original_lines = blocks.to_vec();
+    original_lines.push(format!("  {DEP} (= {DEP_VERSION})"));
+    let registry = [
+        format!("{} sha256={}", bare[0], "1".repeat(64)),
+        format!("{} sha256={}", bare[1], "2".repeat(64)),
+    ];
+    let ledger = serde_json::json!({"version": 1, "entries": {PURL: {
+        "ecosystem": "gem",
+        "basePurl": PURL,
+        "uuid": UUID,
+        "artifact": {"path": rel},
+        "wiring": [
+            {"file": "Gemfile", "kind": "gemfile_line", "action": "rewritten", "key": DEP,
+             "original": plain_line, "new": wired_line},
+            {"file": "Gemfile.lock", "kind": "gemfile_lock_spec", "action": "rewritten",
+             "key": DEP, "original": original_lines, "new": new_lines},
+            {"file": "Gemfile.lock", "kind": "gemfile_lock_checksum", "action": "rewritten",
+             "key": DEP, "original": registry, "new": bare},
+        ],
+        "gemPlatforms": [PLATFORM, OTHER_PLATFORM],
+        "detached": true,
+    }}});
+    std::fs::write(
+        proj.join(".socket/vendor/state.json"),
+        serde_json::to_vec_pretty(&ledger).unwrap(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_on(&proj, &uri, &["rollback", "--yes", "--json", "--offline"]);
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    assert_eq!(env["summary"]["rolledBack"], 1, "{env}");
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
+        lock_before,
+        "the lock is the one before vendoring, byte for byte"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+        gemfile_of(&plain_line)
+    );
+    assert!(
+        !proj.join(".socket/vendor/gem").exists(),
+        "the copies are gone"
+    );
 }

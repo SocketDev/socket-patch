@@ -159,35 +159,19 @@ fn packagist_base() -> String {
 }
 
 /// The `checksum:` (sha256 hex of the `.gem`) a compact-index `info/<name>`
-/// file records for the build `token` — the value bundler writes into
-/// `CHECKSUMS`. Lines are `<version>[-<platform>] <deps>|<reqs>`, the
-/// requirement list carrying `checksum:<hex>`: `token` is `<version>` for
-/// the ruby-platform gem and `<version>-<platform>` for a platform gem,
-/// matched whole, so a version never answers for one of its platform
-/// builds.
-pub(crate) fn compact_index_checksum(info: &str, token: &str) -> Option<String> {
+/// file records for the ruby-platform `version` — the value bundler writes
+/// into `CHECKSUMS`. Lines are `<version>[-<platform>] <deps>|<reqs>`, the
+/// requirement list carrying `checksum:<hex>`.
+pub(crate) fn compact_index_checksum(info: &str, version: &str) -> Option<String> {
     info.lines().find_map(|line| {
         let (head, reqs) = line.split_once('|')?;
-        if head.split(' ').next()? != token {
+        let token = head.split(' ').next()?;
+        if token != version {
             return None;
         }
         reqs.split(',')
             .find_map(|r| r.trim().strip_prefix("checksum:"))
             .and_then(crate::utils::digest::sha256_hex)
-    })
-}
-
-/// [`compact_index_checksum`] of the build `token` in the `info` document
-/// read from `url` (already safe to print), or the error that names what
-/// the document lacks.
-fn checksum_in(url: &str, info: &str, token: &str) -> Result<String, String> {
-    compact_index_checksum(info, token).ok_or_else(|| {
-        let build = if token.contains('-') {
-            token.to_string()
-        } else {
-            format!("ruby-platform {token}")
-        };
-        format!("{url} lists no {build} with a checksum")
     })
 }
 
@@ -230,10 +214,6 @@ pub(crate) const OFFLINE: &str =
 
 type Cache<T> = Mutex<HashMap<(String, String), Result<T, String>>>;
 
-/// A compact-index `info/<name>` document with the URL it was read from
-/// (credentials redacted), or why it could not be read.
-type GemInfo = Result<(String, String), String>;
-
 /// [`Cache`] keyed by (registry base, `Authorization` sent, name, version).
 type RegistryCache<T> = Mutex<HashMap<(String, Option<String>, String, String), Result<T, String>>>;
 
@@ -260,11 +240,6 @@ pub(crate) struct UpstreamClient {
     cargo: Cache<String>,
     go: Cache<GoSums>,
     rubygems: Cache<String>,
-    /// The compact-index `info/<name>` documents already read, by gem
-    /// name, each with the URL it was read from: one lists every build of
-    /// the gem, and a gem locked as platform builds asks for the sha256 of
-    /// each.
-    rubygems_info: Mutex<HashMap<String, GemInfo>>,
     packagist: Cache<Vec<Value>>,
     pypi: Cache<Vec<PypiFile>>,
     nuget: Cache<String>,
@@ -287,7 +262,6 @@ impl UpstreamClient {
             cargo: Mutex::default(),
             go: Mutex::default(),
             rubygems: Mutex::default(),
-            rubygems_info: Mutex::default(),
             packagist: Mutex::default(),
             pypi: Mutex::default(),
             nuget: Mutex::default(),
@@ -605,11 +579,8 @@ impl UpstreamClient {
         result
     }
 
-    /// The rubygems.org sha256 of one build of a gem, from the compact
-    /// index bundler itself reads (`info/<name>`). `token` names the build
-    /// as that index and the lock's `CHECKSUMS` do: `<version>` for the
-    /// ruby-platform `name-version.gem`, `<version>-<platform>` for a
-    /// platform gem.
+    /// The rubygems.org sha256 of the ruby-platform `name-version.gem`,
+    /// from the compact index bundler itself reads (`info/<name>`).
     ///
     /// The lock's `CHECKSUMS` entry is re-pinned from it, and after an
     /// unwind the installed copy is replaced by the archive that has it
@@ -617,40 +588,31 @@ impl UpstreamClient {
     /// native extension. So it is read over a transport nobody can rewrite
     /// ([`rubygems_secure_base`], [`SecureRegistryClient`]): a registry
     /// reached over plain http is not asked.
-    pub(crate) async fn rubygems_sha256(&self, name: &str, token: &str) -> Result<String, String> {
-        let key = (name.to_string(), token.to_string());
+    pub(crate) async fn rubygems_sha256(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<String, String> {
+        let key = (name.to_string(), version.to_string());
         if let Some(hit) = self.rubygems.lock().await.get(&key) {
             return hit.clone();
         }
-        // The document is read once per gem: the builds of one version
-        // (a gem locked for several platforms) are lines of the same one.
-        // A build is looked up in the cached copy where it lies.
-        let lookup = |info: &GemInfo| match info {
-            Ok((url, text)) => checksum_in(url, text, token),
-            Err(why) => Err(why.clone()),
-        };
-        let cached = self.rubygems_info.lock().await.get(name).map(lookup);
-        let result = match cached {
-            Some(result) => result,
-            None => {
-                let fetched = self.rubygems_info_at(rubygems_secure_base(), name).await;
-                let result = lookup(&fetched);
-                self.rubygems_info
-                    .lock()
-                    .await
-                    .insert(name.to_string(), fetched);
-                result
-            }
-        };
+        let result = self
+            .rubygems_sha256_at(rubygems_secure_base(), name, version)
+            .await;
         self.rubygems.lock().await.insert(key, result.clone());
         result
     }
 
-    /// The compact-index `info/<name>` document of the registry at `base`
-    /// ([`rubygems_secure_base`]: its URL, or why it is not asked), with
-    /// the URL it was read from. Uncached. The base may carry a mirror's
-    /// credentials: neither the URL returned nor an error repeats them.
-    async fn rubygems_info_at(&self, base: Result<String, String>, name: &str) -> GemInfo {
+    /// [`Self::rubygems_sha256`], uncached, from the registry at `base`
+    /// ([`rubygems_secure_base`]: its URL, or why it is not asked). The
+    /// base may carry a mirror's credentials: no error repeats them.
+    async fn rubygems_sha256_at(
+        &self,
+        base: Result<String, String>,
+        name: &str,
+        version: &str,
+    ) -> Result<String, String> {
         if self.offline {
             return Err(OFFLINE.to_string());
         }
@@ -664,13 +626,13 @@ impl UpstreamClient {
                 let _permit = self.permit().await;
                 registry.download(&url).await?
             };
-            String::from_utf8(bytes).map_err(|_| format!("{url} is not UTF-8"))
+            let text = String::from_utf8(bytes).map_err(|_| format!("{url} is not UTF-8"))?;
+            compact_index_checksum(&text, version)
+                .ok_or_else(|| format!("{url} lists no ruby-platform {version} with a checksum"))
         };
-        let redact = |text: &str| crate::utils::redact::redact_urls_in(text).into_owned();
-        match looked_up.await {
-            Ok(text) => Ok((redact(&url), text)),
-            Err(why) => Err(redact(&why)),
-        }
+        looked_up
+            .await
+            .map_err(|why: String| crate::utils::redact::redact_urls_in(&why).into_owned())
     }
 
     /// Every version packagist serves for the composer package `name`
@@ -1053,12 +1015,8 @@ mod tests {
             .await;
         let base = server.uri().replace("http://", "http://deploy:hunter2@");
         let client = UpstreamClient::new(false);
-        let at = |name: &'static str, token: &'static str| {
-            let (client, base) = (&client, base.clone());
-            async move {
-                let (url, info) = client.rubygems_info_at(Ok(base), name).await?;
-                checksum_in(&url, &info, token)
-            }
+        let at = |name: &'static str, version: &'static str| {
+            client.rubygems_sha256_at(Ok(base.clone()), name, version)
         };
         assert_eq!(at("rails", "7.0.0").await, Ok(sha));
         for (name, version, expected) in [
@@ -1067,7 +1025,6 @@ mod tests {
                 "7.1.0",
                 "lists no ruby-platform 7.1.0 with a checksum",
             ),
-            ("rails", "7.0.0-java", "lists no 7.0.0-java with a checksum"),
             ("garbled", "1.0.0", "is not UTF-8"),
             ("absent", "1.0.0", "HTTP 404"),
         ] {
@@ -1082,7 +1039,10 @@ mod tests {
 
         let asked = server.received_requests().await.unwrap().len();
         let refused = secure_gem_registry("http://deploy:hunter2@gems.example.test".to_string());
-        let why = client.rubygems_info_at(refused, "rails").await.unwrap_err();
+        let why = client
+            .rubygems_sha256_at(refused, "rails", "7.0.0")
+            .await
+            .unwrap_err();
         assert!(why.contains("set it to an https URL"), "{why}");
         assert!(!why.contains("hunter2"), "{why}");
         assert_eq!(server.received_requests().await.unwrap().len(), asked);
@@ -1097,9 +1057,6 @@ mod tests {
              1.1.0-java |checksum:{other}\n"
         );
         assert_eq!(compact_index_checksum(&info, "1.1.0"), Some(sha));
-        // A platform build is named by its whole token, and only by it.
-        assert_eq!(compact_index_checksum(&info, "1.1.0-java"), Some(other));
-        assert_eq!(compact_index_checksum(&info, "1.1.0-jav"), None);
         assert_eq!(compact_index_checksum(&info, "2.0.0"), None);
         assert_eq!(compact_index_checksum("1.0.0 |ruby:>= 2", "1.0.0"), None);
     }

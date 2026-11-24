@@ -60,10 +60,11 @@ pub(super) async fn inventory_gemfile_lock_raw_in(
 
 /// The gems the Bundler lock bundler loads resolves only as precompiled
 /// platform builds ([`GemfileLock::platform_only_purls`]), which
-/// [`inventory_gemfile_lock`] leaves out. Hosted mode's lockfile discovery
-/// adds them: it redirects such a gem to its per-platform prebuilds, so a
-/// lock that has no installed copy beside it (a fresh checkout, the
-/// in-memory engine) must still name it.
+/// [`inventory_gemfile_lock`] leaves out. A scan counts them as the
+/// project's, and hosted mode's lockfile discovery adds them: a hosted run
+/// works from the lock, so a lock that has no installed copy beside it (a
+/// fresh checkout, the in-memory engine) must still name the gem for the
+/// run to say that it cannot redirect it.
 pub async fn gem_platform_only_purls_in(view: &ProjectView<'_>) -> Vec<String> {
     let Some(lock) = bundler_loaded_lock_in(view).await else {
         return Vec::new();
@@ -71,24 +72,6 @@ pub async fn gem_platform_only_purls_in(view: &ProjectView<'_>) -> Vec<String> {
     match view.read_text(lock).await {
         Ok(text) => GemfileLock::parse(&text).platform_only_purls(),
         Err(_) => Vec::new(),
-    }
-}
-
-/// The builds the Bundler lock bundler loads names for each gem of `purls`
-/// ([`locked_gem_builds`](crate::formats::gem::locked_gem_builds)): element
-/// `i` answers `purls[i]`. Empty for every gem when bundler loads no lock
-/// here, or it cannot be read.
-pub async fn gem_locked_builds_in(
-    view: &ProjectView<'_>,
-    purls: &[String],
-) -> Vec<Vec<crate::formats::gem::GemBuild>> {
-    let text = match bundler_loaded_lock_in(view).await {
-        Some(lock) => view.read_text(lock).await.ok(),
-        None => None,
-    };
-    match text {
-        Some(text) => crate::formats::gem::locked_gem_builds(&text, purls),
-        None => vec![Vec::new(); purls.len()],
     }
 }
 

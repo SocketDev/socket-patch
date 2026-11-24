@@ -52,12 +52,6 @@ name: nokogiri patch compatibility
 # binary, and every x86_64 Linux leg runs it, on the runner too: one build
 # instead of one per leg. The macOS, Windows and ARM legs build their own.
 #
-# The `hosted` legs run the script's hosted scenario instead: a hosted scan
-# of a lock that pins nokogiri as platform gems, against a stand-in for the
-# patch service (tests/nokogiri/patch_service.rb) that serves a patched build
-# of each real platform gem; then a frozen install from a fresh checkout,
-# `vex` and a byte-identical `rollback`. On JRuby the platform is `java`.
-#
 # Every leg downloads gems from rubygems.org, and a rebuild of a precompiled
 # install downloads the source gem and `mini_portile2` from it too.
 #
@@ -77,12 +71,6 @@ on:
       - 'crates/socket-patch-core/src/patch/gem_ext.rs'
       - 'crates/socket-patch-core/src/patch/gem_source.rs'
       - 'crates/socket-patch-core/src/crawlers/ruby_crawler.rs'
-      # Hosted mode's gem lock rewrite and restore.
-      - 'crates/socket-patch-core/src/formats/gem/**'
-      - 'crates/socket-patch-core/src/patch/redirect/mod.rs'
-      - 'crates/socket-patch-core/src/patch/redirect/grant.rs'
-      - 'crates/socket-patch-core/src/patch/redirect/upstream/gem.rs'
-      - 'crates/socket-patch-cli/src/commands/gem_refresh.rs'
   push:
     branches: [main]
     paths:
@@ -163,15 +151,6 @@ jobs:
           # A short project path: the MinGW tools stop at 260 characters,
           # and a build in the stage is some 60 deeper than one in place.
           - {os: windows-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, cli: build, args: '--work "$RUNNER_TEMP/n"'}
-          # Hosted mode on a lock that pins nokogiri as platform gems: the
-          # scan moves every platform entry to a stand-in for the patch
-          # registry, which serves a patched build of each real platform
-          # gem, and a fresh checkout installs it with the lock frozen. On
-          # JRuby the platform is `java`.
-          - {os: ubuntu-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, args: '--scenarios hosted', note: hosted}
-          - {os: ubuntu-latest, ruby: '3.1', nokogiri: '1.15.7', install: precompiled, args: '--scenarios hosted', note: hosted}
-          - {os: macos-latest, ruby: '3.4', nokogiri: '1.18.10', install: precompiled, cli: build, args: '--scenarios hosted', note: hosted}
-          - {os: ubuntu-latest, ruby: 'jruby-9.4', nokogiri: '1.18.10', install: java, args: '--scenarios hosted', note: hosted}
     needs: static-cli
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os }}
     timeout-minutes: 60

@@ -204,9 +204,10 @@ pub fn handed_over(files: &BTreeMap<String, String>) -> Vec<Held> {
 /// Why hosted mode leaves version `version` of the gem `name` as it is,
 /// with what a warning says of the way on: `None` when none of the calls
 /// `held` ([`handed_over`]) stands against the redirect. `builds` is each
-/// build of the gem that the lock `lock` names, as the words of its line
-/// (`<version>`, or `<version>-<platform>`), with the sha256 of its patched
-/// archive.
+/// build of the gem that the redirect pins in the lock `lock`, as the words
+/// of its line (`<version>` for the ruby-platform gem, the one build hosted
+/// mode redirects; `<version>-<platform>` is a platform build's), with the
+/// sha256 of its patched archive.
 /// `checked` says that the lock has a `CHECKSUMS` section, and `pinned`
 /// that an earlier run pinned the gem already: that pin stays, and the
 /// warning says so in place of a redirect that was skipped.

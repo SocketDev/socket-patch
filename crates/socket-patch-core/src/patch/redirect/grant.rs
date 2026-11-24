@@ -267,29 +267,6 @@ fn check_registry_override(ov: &RegistryOverride, origins: &[String]) -> Result<
             return Err(bad(what, "64 hex digits"));
         }
     }
-    // A prebuild's platform and sha256 are spelled into `Gemfile.lock`
-    // (`name (version-<platform>) sha256=<hex>`) and its platform into the
-    // gem file name a refresh downloads. One entry per platform: two would
-    // leave which sha256 the lock pins to their order.
-    for (at, prebuild) in ids.gem_platforms.iter().enumerate() {
-        let platform = prebuild.platform.as_str();
-        if !is_plain_gem_token(platform)
-            || platform.len() > MAX_COORDINATE
-            || !platform.starts_with(|c: char| c.is_ascii_alphabetic())
-            || platform == "ruby"
-        {
-            return Err(bad("gem platform", "a plain platform name"));
-        }
-        if !is_hex(&prebuild.gem_checksum_sha256, 64) {
-            return Err(bad("gem platform checksum", "64 hex digits"));
-        }
-        if ids.gem_platforms[..at]
-            .iter()
-            .any(|earlier| earlier.platform == platform)
-        {
-            return Err(bad("gem platform list", "one entry per platform"));
-        }
-    }
     for (what, digest) in [
         ("Maven pom sha256", &ids.maven_pom_sha256),
         ("Maven module sha256", &ids.maven_module_sha256),
@@ -578,53 +555,6 @@ mod tests {
             edit(dep.registry_override.as_mut().unwrap());
             let reason = malformed(&dep);
             assert!(reason.starts_with(&format!("its {field} ")), "{reason}");
-        }
-        // A gem patch's prebuilds: each platform and sha256 is written
-        // into the lock.
-        type Prebuilds = Vec<(&'static str, String)>;
-        let sha = "c".repeat(64);
-        let prebuilds: [(Option<&str>, Prebuilds); 6] = [
-            (
-                None,
-                vec![("x86_64-linux-gnu", sha.clone()), ("java", sha.clone())],
-            ),
-            (Some("gem platform "), vec![("ruby", sha.clone())]),
-            (
-                Some("gem platform "),
-                vec![("arm64-darwin)\n  evil (1.0", sha.clone())],
-            ),
-            (Some("gem platform "), vec![("21-darwin", sha.clone())]),
-            (
-                Some("gem platform checksum "),
-                vec![("arm64-darwin", "abc".to_string())],
-            ),
-            (
-                Some("gem platform list "),
-                vec![("arm64-darwin", sha.clone()), ("arm64-darwin", sha.clone())],
-            ),
-        ];
-        for (field, list) in prebuilds {
-            let mut dep = maven();
-            dep.registry_override
-                .as_mut()
-                .unwrap()
-                .identifiers
-                .gem_platforms = list
-                .iter()
-                .map(
-                    |(platform, sha)| crate::patch::redirect::GemPlatformChecksum {
-                        platform: platform.to_string(),
-                        gem_checksum_sha256: sha.clone(),
-                    },
-                )
-                .collect();
-            match field {
-                None => assert_eq!(check(&dep, &[]), Ok(())),
-                Some(field) => {
-                    let reason = malformed(&dep);
-                    assert!(reason.starts_with(&format!("its {field}")), "{reason}");
-                }
-            }
         }
         // The sparse prefix is cargo's.
         let mut cargo = DepOverride {

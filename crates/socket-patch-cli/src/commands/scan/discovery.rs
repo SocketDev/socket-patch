@@ -77,9 +77,10 @@ pub(crate) struct LockfileSupplement {
 /// Bundler lock resolves only as precompiled platform builds (`nokogiri
 /// (1.18.10-arm64-darwin)`: no one `.gem` stands for it, so it cannot be
 /// vendored from the lock, and an in-place patch needs the installed copy).
-/// Hosted mode redirects such a gem to its per-platform prebuilds from the
-/// lock alone, so a hosted supplement names it too. It also names the jars
-/// of [`hub_jars`], and what was not read of the hubs joins `unsupported`.
+/// Hosted mode works from the lock alone, so a hosted supplement names
+/// such a gem too, and the run says that it cannot redirect it
+/// (`redirect_gem_platform_unsupported`). It also names the jars of
+/// [`hub_jars`], and what was not read of the hubs joins `unsupported`.
 pub(crate) async fn lockfile_supplement(
     ctx: &crate::commands::context::ProjectContext<'_>,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],

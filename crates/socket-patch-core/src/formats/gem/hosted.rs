@@ -198,14 +198,6 @@ impl std::fmt::Display for LockRefusal {
 /// and, on a `CHECKSUMS` lock, an unfrozen one exits 37 "mismatched
 /// checksums".
 ///
-/// A gem locked as precompiled platform builds has one entry per platform
-/// (`name (version-<platform>)`, with or without a ruby-platform `name
-/// (version)` beside them): every entry of the version moves, in the
-/// lock's order, since Bundler resolves all of them from the one source
-/// the Gemfile gives the gem (a frozen install of that shape was verified
-/// on bundler 4.0.15). The caller has checked that the patch registry
-/// serves each of those builds.
-///
 /// Idempotent and rotation-aware: a section whose remote matches the
 /// token-wildcard pattern is recognized as ours (never duplicated) and its
 /// remote is refreshed under a rotated grant or superseding patch
@@ -215,9 +207,8 @@ impl std::fmt::Display for LockRefusal {
 ///
 /// `Ok` when the lock ends converged (already, or via edits recorded into
 /// `result`); `Err` with the reason when the dep cannot be attributed
-/// safely — spec entry absent or duplicated, its builds spread over several
-/// `GEM` sections, a legacy multi-remote `GEM` section, or no DEPENDENCIES
-/// section — in which case nothing is touched.
+/// safely — spec entry absent or duplicated, a legacy multi-remote `GEM`
+/// section, or no DEPENDENCIES section — in which case nothing is touched.
 pub(crate) fn converge_gem_lock_source(
     lk: &mut String,
     dep: &DepOverride,
@@ -234,39 +225,28 @@ pub(crate) fn converge_gem_lock_source(
     let model = super::parse(lk);
     let sections: Vec<&Section<'_>> = model.gem_sections().collect();
     let spec_raw = format!("{} ({})", dep.name, dep.version);
-    // Every build of the version: (section idx, line idx, entry text).
-    let spec_at: Vec<(usize, usize, &str)> = sections
+    let spec_at: Vec<(usize, usize)> = sections // (section idx, line idx)
         .iter()
         .enumerate()
         .flat_map(|(k, section)| {
             section
                 .specs
                 .iter()
-                .filter(|spec| spec.locks(&dep.name, &dep.version))
-                .map(move |spec| (k, spec.line_no - 1, spec.raw))
+                .filter(|spec| spec.raw == spec_raw)
+                .map(move |spec| (k, spec.line_no - 1))
         })
         .collect();
     let Some(deps) = &model.dependencies else {
         return Err("it has no DEPENDENCIES section".to_string().into());
     };
-    let Some(&(sec_idx, _, _)) = spec_at.first() else {
-        return Err(format!("no GEM section lists `{spec_raw}`").into());
-    };
-    if let Some((_, _, twice)) = spec_at
-        .iter()
-        .enumerate()
-        .find(|(at, (_, _, raw))| spec_at[..*at].iter().any(|(_, _, earlier)| earlier == raw))
-        .map(|(_, entry)| entry)
-    {
-        return Err(format!("more than one GEM section lists `{twice}`").into());
-    }
-    if spec_at.iter().any(|(k, _, _)| *k != sec_idx) {
-        return Err(format!(
-            "the builds of {} {} are spread over more than one GEM section",
-            dep.name, dep.version
-        )
+    let &[(sec_idx, spec_idx)] = spec_at.as_slice() else {
+        return Err(if spec_at.is_empty() {
+            format!("no GEM section lists `{spec_raw}`")
+        } else {
+            format!("more than one GEM section lists `{spec_raw}`")
+        }
         .into());
-    }
+    };
     // Exclusive of the header.
     let deps_start = deps.line_no;
     if sections[sec_idx].remotes.len() != 1 {
@@ -342,22 +322,13 @@ pub(crate) fn converge_gem_lock_source(
         // patch registry (`https://patch.socket.dev/…`) sorts first would break
         // every converged hosted pair under `BUNDLE_FROZEN` / deployment
         // mode (verified: 4.0.15 installs it, 4.0.21 refuses it).
-        //
-        // Each entry goes with its 6-space dependency sublines. Drained last
-        // entry first, so the earlier entries' line indices stay valid, and
-        // kept in the lock's order (Bundler's: by full name, the ruby
-        // build before its platform builds).
-        let mut moved: Vec<Cow<'_, str>> = Vec::new();
-        for &(_, spec_idx, _) in spec_at.iter().rev() {
-            let mut last = spec_idx;
-            while last + 1 < lines.len()
-                && gem_lock_line_content(&lines[last + 1]).starts_with("      ")
-            {
-                last += 1;
-            }
-            let entry: Vec<Cow<'_, str>> = lines.drain(spec_idx..=last).collect();
-            moved.splice(0..0, entry);
+        let mut last = spec_idx;
+        while last + 1 < lines.len()
+            && gem_lock_line_content(&lines[last + 1]).starts_with("      ")
+        {
+            last += 1;
         }
+        let moved: Vec<Cow<'_, str>> = lines.drain(spec_idx..=last).collect();
         let n = moved.len();
         // Section bounds after the drain (every drained line sat inside
         // section `sec_idx`, which keeps its start).
@@ -806,128 +777,6 @@ DEPENDENCIES
 BUNDLED WITH
    2.6.2
 ";
-
-    /// A gem locked as precompiled platform builds: every entry of the
-    /// patched version moves, each with its own sub-lines and in the lock's
-    /// order, the ruby-platform entry included. Another version's build
-    /// stays upstream.
-    #[test]
-    fn platform_builds_of_the_version_move_together() {
-        let lock = "GEM
-  remote: https://rubygems.org/
-  specs:
-    mini_portile2 (2.8.9)
-    nokogiri (1.15.0-java)
-    nokogiri (1.16.0)
-      mini_portile2 (~> 2.8.2)
-      racc (~> 1.4)
-    nokogiri (1.16.0-arm64-darwin)
-      racc (~> 1.4)
-    nokogiri (1.16.0-x86_64-linux)
-      racc (~> 1.4)
-    racc (1.7.3)
-
-PLATFORMS
-  arm64-darwin
-  ruby
-  x86_64-linux
-
-DEPENDENCIES
-  nokogiri (~> 1.16)
-
-BUNDLED WITH
-   2.6.2
-";
-        let expected = "GEM
-  remote: https://patch.test/gem/tok/uuid/
-  specs:
-    nokogiri (1.16.0)
-      mini_portile2 (~> 2.8.2)
-      racc (~> 1.4)
-    nokogiri (1.16.0-arm64-darwin)
-      racc (~> 1.4)
-    nokogiri (1.16.0-x86_64-linux)
-      racc (~> 1.4)
-
-GEM
-  remote: https://rubygems.org/
-  specs:
-    mini_portile2 (2.8.9)
-    nokogiri (1.15.0-java)
-    racc (1.7.3)
-
-PLATFORMS
-  arm64-darwin
-  ruby
-  x86_64-linux
-
-DEPENDENCIES
-  nokogiri (~> 1.16)!
-
-BUNDLED WITH
-   2.6.2
-";
-        let dep = dep("nokogiri", "1.16.0");
-        let (ok, lk, edits) = converge_as(lock, &dep, DependencyPin::Keep);
-        assert!(ok);
-        assert_eq!(lk, expected);
-        assert_eq!(
-            edits,
-            [
-                "redirect_gemfile_lock_dependency_pin:rewritten",
-                "redirect_gemfile_lock_gem_source:rewritten"
-            ]
-        );
-        // Converged: a second pass finds every build in the section it
-        // names and changes nothing.
-        let (ok, again, edits) = converge_as(&lk, &dep, DependencyPin::Keep);
-        assert!(ok && again == lk && edits.is_empty(), "{edits:?}");
-        // CRLF: each moved line keeps its ending.
-        let (ok, crlf, _) = converge_as(&lock.replace('\n', "\r\n"), &dep, DependencyPin::Keep);
-        assert!(ok);
-        assert_eq!(crlf, expected.replace('\n', "\r\n"));
-    }
-
-    /// Builds of one version in two `GEM` sections (a hand-merged lock) are
-    /// not one source's to move: refused, nothing touched.
-    #[test]
-    fn platform_builds_spread_over_sections_are_refused() {
-        let lock = "GEM
-  remote: https://gems.mirror.example/
-  specs:
-    nokogiri (1.16.0-arm64-darwin)
-
-GEM
-  remote: https://rubygems.org/
-  specs:
-    nokogiri (1.16.0-x86_64-linux)
-
-DEPENDENCIES
-  nokogiri
-
-BUNDLED WITH
-   2.6.2
-";
-        let mut lk = lock.to_string();
-        let mut changed = false;
-        let mut result = RewriteResult::default();
-        let why = converge_gem_lock_source(
-            &mut lk,
-            &dep("nokogiri", "1.16.0"),
-            INDEX_URL,
-            "Gemfile.lock",
-            DependencyPin::Keep,
-            &mut changed,
-            &mut result,
-        )
-        .unwrap_err()
-        .why;
-        assert!(
-            why.contains("spread over more than one GEM section"),
-            "{why}"
-        );
-        assert!(!changed && lk == lock && result.edits.is_empty());
-    }
 
     /// A transitive gem in the SECOND `GEM` section: located through the
     /// shared reader's section spans, moved into a patch-registry section

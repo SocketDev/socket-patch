@@ -5414,74 +5414,6 @@ mod tests {
         );
     }
 
-    /// One reference response answers for a whole batch. A prebuild entry
-    /// that IS a platform and a checksum, but not in the shape the lock
-    /// takes, fails the grant it rides in and no other: the gem is skipped
-    /// with the field named, and the other package keeps its candidate.
-    #[test]
-    fn a_wrong_gem_prebuild_fails_only_its_own_grant() {
-        const GEM: &str = "pkg:gem/nokogiri@1.18.10";
-        const NPM: &str = "pkg:npm/c@1";
-        const GEM_UUID: &str = "5e6f7081-92a3-4b4c-8d5e-6f708192a3b4";
-        let refs = HashMap::from([
-            (
-                GEM_UUID.to_string(),
-                reference(serde_json::json!({
-                    "status": "granted",
-                    "url": format!("https://patch.example/patch/gem/t/{GEM_UUID}/nokogiri-1.18.10.gem"),
-                    "purl": GEM,
-                    "artifacts": [{"kind": "tarball", "url": null, "integrity": {
-                        "sha256": "a".repeat(64)
-                    }}],
-                    "registryOverride": {
-                        "kind": "rubygems-compact-index",
-                        "indexUrl": format!("https://patch.example/patch-registry/gem/t/{GEM_UUID}/"),
-                        "identifiers": {
-                            "name": "nokogiri", "version": "1.18.10",
-                            "gemChecksumSha256": "a".repeat(64),
-                            "gemPlatforms": [
-                                {"platform": "arm64-darwin", "gemChecksumSha256": "not-a-digest"}
-                            ]
-                        }
-                    }
-                })),
-            ),
-            (
-                PATCH_UUID.to_string(),
-                reference(serde_json::json!({
-                    "status": "granted",
-                    "url": format!("https://patch.example/patch/npm/c/1/tok/{PATCH_UUID}/c-1.tgz"),
-                    "purl": NPM,
-                    "artifacts": [{"kind": "tarball", "url": null, "integrity": {
-                        "sha512": "sha512-x", "sha1": "a".repeat(40)
-                    }}],
-                    "registryOverride": null
-                })),
-            ),
-        ]);
-        let selected = vec![
-            (GEM.to_string(), GEM_UUID.to_string()),
-            (NPM.to_string(), PATCH_UUID.to_string()),
-        ];
-        let (mut skipped, mut warnings) = (Vec::new(), Vec::new());
-        let candidates = build_candidates(&selected, &refs, &[], &mut skipped, &mut warnings);
-        let kept: Vec<&str> = candidates.iter().map(|c| c.purl.as_str()).collect();
-        assert_eq!(kept, [NPM], "{skipped:?}");
-        assert_eq!(skipped.len(), 1, "{skipped:?}");
-        assert_eq!(
-            (skipped[0].purl.as_str(), skipped[0].reason.as_str()),
-            (GEM, GRANT_MALFORMED)
-        );
-        assert!(
-            skipped[0]
-                .detail
-                .as_deref()
-                .unwrap()
-                .contains("its gem platform checksum is not 64 hex digits"),
-            "{skipped:?}"
-        );
-    }
-
     /// A granted cargo reference for `uuid` (a canonical uuid), with no
     /// registry override.
     fn cargo_reference(
@@ -8122,13 +8054,6 @@ snapshots:
     }
 
     async fn gem_rewrite_in(view: &ProjectView<'_>) -> (CandidateFiles, Rewritten) {
-        gem_rewrite_of(view, vec![gem_candidate()]).await
-    }
-
-    async fn gem_rewrite_of(
-        view: &ProjectView<'_>,
-        candidates: Vec<Candidate>,
-    ) -> (CandidateFiles, Rewritten) {
         let outer = OuterAllowRemote::default;
         let options = RewriteOptions {
             dry_run: false,
@@ -8147,6 +8072,7 @@ snapshots:
             patch_server_origins: Vec::new(),
             prior_discovery: None,
         };
+        let candidates = vec![gem_candidate()];
         let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
         let done = rewrite(view, read.clone(), &candidates, BTreeMap::new(), options).await;
         (read, done)
@@ -8225,74 +8151,6 @@ snapshots:
         assert!(gem_rewrite(&p).await.0.files.contains_key(KEY));
         p.insert_present("WORKSPACE.bazel");
         assert!(!gem_rewrite(&p).await.0.files.contains_key(KEY));
-    }
-
-    /// A gem locked as precompiled platform builds, with a prebuild for
-    /// each: the rewrite moves every build, and lockfile discovery (what
-    /// `vex`, `rollback` and `remove` read) attributes them to the one pin,
-    /// so the engine confirms it instead of dropping the rewrite as
-    /// unattributable. A second run over the result confirms the same pin
-    /// and writes nothing.
-    #[tokio::test]
-    async fn gem_platform_builds_are_confirmed_as_one_pin() {
-        use crate::patch::redirect::GemPlatformChecksum;
-        let mut candidate = gem_candidate();
-        candidate
-            .dep
-            .registry_override
-            .as_mut()
-            .unwrap()
-            .identifiers
-            .gem_platforms = ["arm64-darwin", "x86_64-linux-gnu"]
-            .iter()
-            .zip(["a", "b"])
-            .map(|(platform, digit)| GemPlatformChecksum {
-                platform: platform.to_string(),
-                gem_checksum_sha256: digit.repeat(64),
-            })
-            .collect();
-        let lock = format!(
-            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0-arm64-darwin)\n    rails \
-             (7.0.0-x86_64-linux-gnu)\n\nPLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\nDEPENDENCIES\n  \
-             rails (= 7.0.0)\n\nCHECKSUMS\n  rails (7.0.0-arm64-darwin) sha256={}\n  rails \
-             (7.0.0-x86_64-linux-gnu) sha256={}\n\nBUNDLED WITH\n  4.0.15\n",
-            "1".repeat(64),
-            "2".repeat(64)
-        );
-        let mut p = MemoryProject::new();
-        p.insert_text("Gemfile", GEMFILE);
-        p.insert_text("Gemfile.lock", lock.as_str());
-        let (_, done) = gem_rewrite_of(&ProjectView::Memory(&p), vec![candidate.clone()]).await;
-        assert!(done.unattributed.is_empty(), "{:?}", done.unattributed);
-        assert_eq!(
-            done.confirmed,
-            [("pkg:gem/rails@7.0.0".to_string(), FIXTURE_UUID.to_string())]
-        );
-        let written = &done.rewrite.files["Gemfile.lock"];
-        assert!(
-            written.contains(
-                "  specs:\n    rails (7.0.0-arm64-darwin)\n    rails (7.0.0-x86_64-linux-gnu)\n\nGEM\n  \
-                 remote: https://rubygems.org/\n  specs:\n\nPLATFORMS"
-            ),
-            "{written}"
-        );
-        assert!(
-            written.contains(&format!(
-                "CHECKSUMS\n  rails (7.0.0-arm64-darwin) sha256={}\n  rails (7.0.0-x86_64-linux-gnu) \
-                 sha256={}\n",
-                "a".repeat(64),
-                "b".repeat(64)
-            )),
-            "{written}"
-        );
-
-        for (rel, text) in &done.rewrite.files {
-            p.insert_text(rel, text.as_str());
-        }
-        let (_, again) = gem_rewrite_of(&ProjectView::Memory(&p), vec![candidate]).await;
-        assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.edits);
-        assert_eq!(again.confirmed, done.confirmed);
-        assert!(again.unattributed.is_empty(), "{:?}", again.unattributed);
     }
 
     /// #390: `bundle config set --local gemfile Gemfile.next` makes bundler

@@ -293,10 +293,28 @@ async fn parity_gemfile() {
 /// A gem the lock resolves only as precompiled platform builds. The lock
 /// inventory has no ruby-platform entry to list it by, so both hosted
 /// engines find it through the lock's platform specs (nothing is
-/// installed here), and both move every build to its prebuild.
+/// installed here), and both leave every file as it is and say, in the
+/// same words, that hosted mode cannot redirect it.
 #[tokio::test]
-async fn parity_gemfile_platform_prebuilds() {
-    assert_parity(case("gem/bundler/platform-prebuilds")).await;
+async fn parity_gemfile_platform_locked() {
+    let redirect = assert_parity(Case {
+        expect_redirect: false,
+        ..case("gem/bundler/platform-locked")
+    })
+    .await;
+    assert_eq!(redirect["redirected"], 0, "{redirect:#}");
+    let warnings = redirect["warnings"].as_array().unwrap();
+    let said: Vec<&str> = warnings
+        .iter()
+        .filter(|warning| warning["code"] == "redirect_gem_platform_unsupported")
+        .filter_map(|warning| warning["detail"].as_str())
+        .collect();
+    assert_eq!(said.len(), 1, "{redirect:#}");
+    assert!(
+        said[0].contains("locks platform-specific builds of nokogiri 1.18.10"),
+        "{}",
+        said[0]
+    );
 }
 
 /// The gem fixture as the root of a Bazel workspace whose rules_ruby hub

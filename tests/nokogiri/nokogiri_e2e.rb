@@ -62,7 +62,6 @@ require "open3"
 require "optparse"
 require "rbconfig"
 require "tmpdir"
-require_relative "patch_service"
 
 RB_CONST = "SOCKET_PATCH_E2E_RB"
 C_CONST = "SOCKET_PATCH_E2E_C"
@@ -111,10 +110,6 @@ class NokogiriE2E
       @opts.fetch(:scenarios).each { |name| scenario(name) }
       puts "PASS: #{@checks} checks on nokogiri #{@version} (#{@shape}), #{ruby_label}"
     ensure
-      if @patch_service
-        puts "patch service requests:", @patch_service.requests.map { |r| "  " + r.join(" ") } if ENV["E2E_DEBUG"]
-        @patch_service.stop
-      end
       FileUtils.rm_rf(root) unless @opts[:work]
     end
   end
@@ -501,148 +496,8 @@ class NokogiriE2E
         now["libxml_patches"].include?(LIBXML2_PATCH) &&
           (@baseline["libxml_patches"] - now["libxml_patches"]).empty?
       end
-    when "hosted" then delivered("hosted")
-    when "vendored" then delivered("vendored")
     else raise Failure, "unknown scenario #{name}"
     end
-  end
-
-  # ---- hosted and vendored mode --------------------------------------------
-  #
-  # Both deliver a patched gem through Bundler instead of patching the
-  # installed one. For a precompiled install the lock names one platform gem
-  # per platform, so what is delivered is a patched platform gem for each
-  # (PatchService repacks the real ones). The scenario scans, then installs
-  # the result from a fresh checkout with the lock frozen, as CI and a
-  # deploy do, and asks the Ruby there what it loaded.
-
-  def lock_path
-    File.join(@proj, "Gemfile.lock")
-  end
-
-  # The platform tokens of the nokogiri entries the lock pins.
-  def locked_platforms
-    File.read(lock_path).scan(/^    nokogiri \(#{Regexp.escape(@version)}-([^)\s]+)\)$/).flatten.uniq
-  end
-
-  def patch_service
-    @patch_service ||= PatchService.new(
-      "nokogiri", @version, locked_platforms, UUID, GHSA, File.join(File.dirname(@proj), "patch-service"),
-      "\nmodule Nokogiri\n  #{RB_CONST} = 1\nend\n"
-    )
-  end
-
-  # The CLI against the stand-in patch service.
-  def sp_service(*args)
-    env = { "SOCKET_NO_CONFIG" => "1", "SOCKET_NO_UPDATE_CHECK" => "1", "SOCKET_TELEMETRY_DISABLED" => "1" }
-    # `--patch-server-url`: a hosted reference in the lock counts only on a
-    # Socket host or the one the run is told is the patch server, and this
-    # one is on loopback.
-    args += ["--api-url", patch_service.url, "--org", PatchService::ORG, "--api-token", "fake",
-             "--patch-server-url", patch_service.url]
-    started = Time.now
-    out, err, status = Open3.capture3(base_env.merge(env), @bin, *args, :chdir => @proj)
-    [status.exitstatus || -1, out, err, Time.now - started]
-  end
-
-  # Run the block with `dir` as the project: Bundler and the probe follow.
-  def in_project(dir)
-    was = @proj
-    @proj = dir
-    yield
-  ensure
-    @proj = was
-  end
-
-  # A checkout of what the scan left to commit, with nothing installed.
-  def fresh_checkout(extra = [])
-    dir = File.join(File.dirname(@proj), "checkout")
-    FileUtils.rm_rf(dir)
-    FileUtils.mkdir_p(dir)
-    (%w[Gemfile Gemfile.lock probe.rb .bundle] + extra).each do |entry|
-      from = File.join(@proj, entry)
-      FileUtils.cp_r(from, File.join(dir, entry)) if File.exist?(from)
-    end
-    dir
-  end
-
-  def delivered(mode)
-    return skip("the lock pins no platform gem of nokogiri: nothing here is specific to a precompiled install") if locked_platforms.empty?
-    return skip("needs a gem home of its own (--gem-home project)") unless project_home?
-    service = patch_service
-    service.bring_up
-    gemfile, lock = File.read(File.join(@proj, "Gemfile")), File.read(lock_path)
-    platforms = locked_platforms
-
-    code, stdout, stderr, secs = sp_service("scan", "--mode", mode, "--yes", "--json")
-    check(code.zero?, "`scan --mode #{mode}` succeeds (#{secs.round}s)", "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
-    # What the scan warned about, for a later check that fails because of it.
-    scan_said = begin
-      JSON.pretty_generate(JSON.parse(stdout).fetch("warnings", []))
-    rescue JSON::ParserError
-      tail(stdout)
-    end + tail(stderr)
-    rewritten = File.read(lock_path)
-    check(rewritten != lock, "it rewires the lock", tail(stdout) + tail(stderr))
-    if mode == "hosted"
-      section = rewritten[/^GEM\n  remote: #{Regexp.escape(service.index_url)}\n  specs:\n((?:    .*\n)+)/, 1].to_s
-      missing = platforms.reject { |p| section.include?("    nokogiri (#{@version}-#{p})\n") }
-      check(missing.empty?, "every platform gem of nokogiri now comes from the patch registry",
-            "not moved: #{missing.inspect}\n#{rewritten}")
-      platforms.each do |p|
-        next unless rewritten.include?("\nCHECKSUMS\n")
-        check(rewritten.include?("  nokogiri (#{@version}-#{p}) sha256=#{service.sha256_of(p)}\n"),
-              "the lock pins the patched #{p} gem's checksum", rewritten[/^CHECKSUMS\n(?:  .*\n)+/])
-      end
-    else
-      vendored = Dir.glob(File.join(@proj, ".socket", "vendor", "gem", "**", "*.gemspec"))
-      check(vendored.size >= platforms.size, "a patched gem is vendored for each of #{platforms.size} platforms",
-            vendored.inspect)
-      check(rewritten =~ /^PATH\n  remote: \.socket\/vendor\/gem\//, "the lock takes nokogiri from the vendored path", rewritten)
-      # From here on nothing may need the patch service.
-      service.take_down
-      service.forget_requests
-    end
-
-    checkout = fresh_checkout(mode == "vendored" ? [".socket"] : [])
-    in_project(checkout) do
-      code, out = bundle_install("BUNDLE_FROZEN" => "true")
-      check(code.zero?, "a fresh checkout installs with the lock frozen", tail(out))
-      check(File.read(lock_path) == rewritten, "and the install leaves the lock as it was")
-      now = probe
-      check(now[RB_CONST] == 1, "Ruby there loads the patched nokogiri", JSON.pretty_generate(now))
-      check(now["binary_sha256"] == @baseline["binary_sha256"], "with the precompiled binary, nothing compiled")
-      check(now["smoke"] == @baseline["smoke"], "and nokogiri parses, queries, transforms and validates")
-      if mode == "vendored"
-        check(now["loaded_from"].to_s.include?("/.socket/vendor/"), "from the vendored tree", now["loaded_from"].inspect)
-        asked = service.requests.reject { |_, _, status| status == 200 }
-        check(asked.empty?, "without asking the patch service for anything", asked.inspect)
-      end
-    end
-    FileUtils.rm_rf(checkout)
-
-    # The project itself, after one more `bundle install`.
-    bundle_install!
-    check(probe[RB_CONST] == 1, "the scanned project loads the patched nokogiri too", scan_said)
-    service.bring_up
-    code, stdout, stderr, = sp_service("vex", "--product", PRODUCT, "--output", File.join(@proj, "vex.json"))
-    statuses = begin
-      JSON.parse(File.read(File.join(@proj, "vex.json"))).fetch("statements", [])
-          .select { |st| st.to_s.include?("pkg:gem/nokogiri@#{@version}") }.map { |st| st["status"] }
-    rescue StandardError
-      []
-    end
-    check(code.zero? && statuses == ["not_affected"], "`vex` attests the patch",
-          "exit #{code} #{statuses.inspect}\n#{tail(stdout)}#{tail(stderr)}")
-
-    code, stdout, stderr, = sp_service("rollback")
-    check(code.zero?, "`rollback` succeeds", "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
-    check(File.read(lock_path) == lock, "the lock is byte for byte what it was",
-          "expected:\n#{lock}\ngot:\n#{File.read(lock_path)}")
-    check(File.read(File.join(@proj, "Gemfile")) == gemfile, "and so is the Gemfile")
-    check(!File.exist?(File.join(@proj, ".socket", "vendor", "gem")), "nothing vendored is left") if mode == "vendored"
-    bundle_install!
-    check(probe == @baseline, "after `bundle install`, Ruby loads what it loaded before the patch")
   end
 
   def skip(why)
@@ -903,7 +758,6 @@ result = {
   "version" => Nokogiri::VERSION,
   "binary" => binary && File.basename(File.dirname(binary)) + "/" + File.basename(binary),
   "binary_sha256" => binary && Digest::SHA256.file(binary).hexdigest,
-  "loaded_from" => $LOADED_FEATURES.grep(%r{/nokogiri\.rb\z}).first,
   "jars" => jars,
   "libxml_source" => lx["source"],
   "libxml_loaded" => lx["loaded"],
@@ -954,8 +808,7 @@ parser = OptionParser.new do |o|
        "where Bundler installs: project (default: `vendor/bundle`, by the project's own Bundler",
        "config) or ambient (wherever this environment's Bundler and RubyGems settings say, which",
        "in an official Ruby image is /usr/local/bundle; only for a throwaway environment)") { |v| opts[:gem_home] = v }
-  o.on("--scenarios LIST", Array, "of ruby,c,libxml2 (default: all three, agent mode) and hosted,vendored",
-       "(a scan against a stand-in patch service that serves repacked platform gems)") { |v| opts[:scenarios] = v }
+  o.on("--scenarios LIST", Array, "of ruby,c,libxml2 (default: all three)") { |v| opts[:scenarios] = v }
   o.on("--rails VERSION", "also install this Rails (a Gemfile requirement, for example '~> 7.1.0') and check",
        "that a booted application sanitizes HTML through the patched nokogiri") { |v| opts[:rails] = v }
   o.on("--bundle-setting KEY=VALUE", "one more Bundler setting for the install, for example",

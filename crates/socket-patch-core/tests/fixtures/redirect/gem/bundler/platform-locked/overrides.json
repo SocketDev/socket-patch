@@ -12,17 +12,7 @@
       "identifiers": {
         "name": "nokogiri",
         "version": "1.18.10",
-        "gemChecksumSha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-        "gemPlatforms": [
-          {
-            "platform": "arm64-darwin",
-            "gemChecksumSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-          },
-          {
-            "platform": "x86_64-linux-gnu",
-            "gemChecksumSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-          }
-        ]
+        "gemChecksumSha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
       }
     },
     "integrity": {
