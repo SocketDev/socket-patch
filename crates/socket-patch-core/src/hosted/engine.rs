@@ -2719,7 +2719,9 @@ pub struct Rewritten {
     /// list it was created with and nothing else. A rewrite only carries
     /// writes, so the caller deletes the file once they have landed (the
     /// CLI after its commit; the in-memory engine reports it among the
-    /// deleted files instead of the changed ones).
+    /// deleted files instead of the changed ones). Never set where a Bazel
+    /// hub reads, or may read, a lock of the project
+    /// ([`CandidateFiles::pnpm_bazel`]): its `data` can name the file.
     pub pnpm_workspace_emptied: bool,
     /// In memory only: the trust auto-config would write through a
     /// symlinked `pnpm-workspace.yaml`.
@@ -3647,8 +3649,13 @@ async fn rewrite_once(
         npm_allow_remote(view, &files, &rewrite, &overrides, &options);
     npm_warnings.extend(npm_allow_scripts(&files, &rewrite, &overrides));
     // Only while the emptied file is the one this run writes.
+    // And only where no Bazel hub reads, or may read, a lock of the
+    // project: the `data` of such a hub can name the file, and a build
+    // that is handed a missing file fails. The file then stays as the
+    // `packages` list it was created with.
+    let hub = pnpm_bazel.reader.is_some() || pnpm_bazel.hidden.is_some();
     let pnpm_workspace_emptied =
-        (workspace_emptied && pnpm_config_write.is_none()) || trust_emptied;
+        !hub && ((workspace_emptied && pnpm_config_write.is_none()) || trust_emptied);
     if let Some((text, edits)) = pnpm_config_write {
         rewrite.files.insert(PNPM_WORKSPACE_REL.to_string(), text);
         // Appended last, after the lock edits they serve. v5 keeps no hosted
@@ -14000,6 +14007,42 @@ snapshots:
                 granted.len(),
                 warning_codes(&done)
             );
+        }
+    }
+
+    /// A hosted run does not delete a pnpm-workspace.yaml under a hub that
+    /// reads, or may read, a lock of the project: the hub's `data` can name
+    /// the file, and a build that is handed a missing file fails. The
+    /// entries that no lock uses still go, and what a routed run created is
+    /// left as its `packages` list, not flagged for deletion. Without a hub
+    /// the same run deletes the file.
+    #[tokio::test]
+    async fn an_emptied_workspace_file_stays_under_a_hub_that_reads_a_lock() {
+        const PLAIN: &str = "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      \
+             is-number:\n        specifier: 7.0.0\n        version: 7.0.0\n\npackages:\n  \
+             is-number@7.0.0:\n    resolution: {integrity: sha512-UPSTREAM==}\n\n\
+             snapshots:\n  is-number@7.0.0: {}\n";
+        let origins = || vec!["https://patch.test".to_string()];
+        let mut project = pnpm12_project(&PLAIN.replace(
+            "importers:\n",
+            &format!("overrides:\n  left-pad@1.3.0: {LEFT_PAD_ALIAS}:1.3.0\n\nimporters:\n"),
+        ));
+        project.insert_text(PNPM_WORKSPACE_REL, left_pad_routed_workspace());
+        let view = ProjectView::Memory(&project);
+        let alone = pnpm_rewrite_from(&view, &[], true, false, &no_env, origins()).await;
+        assert!(alone.pnpm_workspace_emptied);
+
+        // The hub reads the lock and lists the file; it runs no pnpm.
+        for call in [
+            "pnpm_lock = \"//:pnpm-lock.yaml\", data = [\"//:pnpm-workspace.yaml\"]",
+            "pnpm_lock = LOCK, data = FILES",
+        ] {
+            project.insert_text("MODULE.bazel", rules_js_hub(call));
+            let view = ProjectView::Memory(&project);
+            let done = pnpm_rewrite_from(&view, &[], true, false, &no_env, origins()).await;
+            assert_eq!(lock_of(&done), Some(PLAIN), "{call}");
+            assert_eq!(workspace_of(&done), Some("packages:\n  - '.'\n"), "{call}");
+            assert!(!done.pnpm_workspace_emptied, "{call}");
         }
     }
 
