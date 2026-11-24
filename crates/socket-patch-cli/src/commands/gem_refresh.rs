@@ -1330,7 +1330,12 @@ async fn is_unpatched(dir: &Path, record: &PatchRecord) -> bool {
         return false;
     }
     for (name, info) in &record.files {
-        if verify_file_patch(dir, name, info).await.status != VerifyStatus::Ready {
+        let verified = verify_file_patch(dir, name, info).await;
+        // `Ready` also covers a file the patch adds that is there with
+        // other content (apply overwrites it): only its absence proves
+        // the copy never got it.
+        let added_but_present = info.before_hash.is_empty() && verified.current_hash.is_some();
+        if verified.status != VerifyStatus::Ready || added_but_present {
             return false;
         }
     }
@@ -1587,6 +1592,64 @@ async fn refresh_restored(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2214: what proves an installed gem never got its patch. Each record
+    /// file is at its `beforeHash`, or the patch adds it and it is absent.
+    #[tokio::test]
+    async fn is_unpatched_needs_every_record_file_in_its_pre_patch_state() {
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes as hash;
+        use socket_patch_core::manifest::schema::PatchFileInfo;
+
+        let record = |files: &[(&str, &[u8], &[u8])]| PatchRecord {
+            uuid: "u".into(),
+            exported_at: String::new(),
+            files: files
+                .iter()
+                .map(|(name, before, after)| {
+                    let info = PatchFileInfo {
+                        before_hash: if before.is_empty() {
+                            String::new()
+                        } else {
+                            hash(before)
+                        },
+                        after_hash: hash(after),
+                    };
+                    (name.to_string(), info)
+                })
+                .collect(),
+            vulnerabilities: Default::default(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("a.rb"), b"before").unwrap();
+        let changed = record(&[("a.rb", b"before", b"after")]);
+        let with_added = record(&[("a.rb", b"before", b"after"), ("new.rb", b"", b"added")]);
+
+        assert!(is_unpatched(dir, &changed).await);
+        assert!(
+            is_unpatched(dir, &with_added).await,
+            "the added file is absent"
+        );
+        assert!(!is_unpatched(dir, &record(&[])).await, "no file, no proof");
+
+        // The added file is there, with the patch's content or any other.
+        for leftover in [&b"added"[..], b"something else"] {
+            std::fs::write(dir.join("new.rb"), leftover).unwrap();
+            assert!(!is_unpatched(dir, &with_added).await, "{leftover:?}");
+        }
+        std::fs::remove_file(dir.join("new.rb")).unwrap();
+
+        // The changed file is patched, edited or gone.
+        for content in [&b"after"[..], b"edited"] {
+            std::fs::write(dir.join("a.rb"), content).unwrap();
+            assert!(!is_unpatched(dir, &changed).await, "{content:?}");
+        }
+        std::fs::remove_file(dir.join("a.rb")).unwrap();
+        assert!(!is_unpatched(dir, &changed).await, "a missing file");
+    }
 
     fn policy(root: &Path, enabled: bool, shared: bool, dry_run: bool) -> Policy {
         Policy {
