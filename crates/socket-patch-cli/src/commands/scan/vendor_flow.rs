@@ -1078,6 +1078,7 @@ async fn run_vendor_interactive_path(
                 println!("{line}");
             }
             print_gc_vendored_line(&gc);
+            super::gc::print_gc_registry_lines(&gc, false);
         }
     }
     code

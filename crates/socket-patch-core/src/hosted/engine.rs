@@ -11,8 +11,9 @@
 //! 3. (caller) the apply lock and the vendored→hosted takeover.
 //! 4. [`read_candidate_files`] → [`wheel_targets`] → (caller) wheel metadata,
 //!    and [`yarn_berry_manifest_targets`] → (caller) served npm manifests.
-//! 5. [`rewrite`] — the rewriters, the pnpm `trustLockfile` and npm
-//!    `allow-remote` auto-configs, and the per-ecosystem confirmation.
+//! 5. [`rewrite`] — the rewriters, the pnpm named-registry /
+//!    `trustLockfile` and npm `allow-remote` auto-configs, and the
+//!    per-ecosystem confirmation.
 //! 6. [`guard`] — the symlink / unreadable-file refusal before any write.
 //!
 //! Nothing here writes, spawns, reads the environment or touches the
@@ -28,6 +29,7 @@ use crate::constants::npm_family::VLT_HIDDEN_LOCK_REL;
 use crate::crawlers::maven_selection::MavenSelection;
 use crate::formats::cargo::source_replacement::CratesIoSource;
 use crate::formats::governing_locks::PYPI_REQUIREMENTS;
+use crate::formats::pnpm::RegistryRoutePins;
 use crate::patch::redirect::npmrc::{
     effective_omit_lockfile_registry_resolved, effective_replace_registry_host,
     plan_npmrc_allow_remote_with, replace_registry_host_rewrites, NpmrcPlan, OuterAllowRemote,
@@ -50,15 +52,20 @@ use super::guidance::{
     npm_allow_remote_env_set_detail, npm_allow_remote_manual_detail,
     npm_allow_remote_outer_set_detail, npm_allow_remote_unreadable_detail,
     npm_allow_remote_user_set_detail, npm_lock_url_needles, npm_omit_lockfile_resolved_detail,
-    npm_replace_registry_host_detail, plan_workspace_trust, pnpm_heal_root,
+    npm_replace_registry_host_detail, plan_workspace_trust, pnpm_heal_root, pnpm_hosted_pins,
     pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag, pnpm_lock_version_major,
+    pnpm_registry_already_detail, pnpm_registry_blocked_note, pnpm_registry_configured_detail,
+    pnpm_registry_unrouted_note, pnpm_registry_unserved_reason,
     pnpm_root_only_workspace_breaks_add, pnpm_trust_configured_detail,
     pnpm_trust_keyless_members_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
     pnpm_trust_not_needed_detail, pnpm_trust_policy_preamble, pnpm_trust_rush_detail,
     pnpm_trust_scaffolded_detail, pnpm_trust_workspace_unreadable_detail,
     pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
-    TrustPlan, NPM_LOCKS, NPM_OMIT_LOCKFILE_RESOLVED_CODE, NPM_REPLACE_REGISTRY_HOST_CODE,
+    strip_cli_trust, RegistryWrite, TrustLeftover, TrustPlan, NPM_LOCKS,
+    NPM_OMIT_LOCKFILE_RESOLVED_CODE, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_REGISTRY_PIN_HINT,
     PNPM_TRUST_RUSH_MIXED_NOTE, PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL,
+    REDIRECT_PNPM_LOCK_OVERRIDE_EDIT_KIND, REDIRECT_PNPM_REGISTRY_ALIAS_EDIT_KIND,
+    REDIRECT_PNPM_WORKSPACE_OVERRIDE_EDIT_KIND, REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
     REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
@@ -337,7 +344,7 @@ pub fn build_candidates(
             .and_then(|o| crate::patch::redirect::grant_token_path_segment(&o.index_url, sel_uuid))
             .or_else(|| crate::patch::redirect::grant_token_path_segment(&url, sel_uuid))
             .unwrap_or_default();
-        let dep = DepOverride {
+        let mut dep = DepOverride {
             ecosystem,
             name,
             namespace: None,
@@ -345,9 +352,13 @@ pub fn build_candidates(
             token,
             patch_uuid: sel_uuid.clone(),
             artifact_url: url,
+            npm_registry_url: reference.npm_registry_url.clone(),
             registry_override: reference.registry_override.clone(),
             integrity,
         };
+        // A registry address pnpm could not route the artifact URL to
+        // reads as not served: the pin then takes the `trustLockfile` path.
+        dep.npm_registry_url = grant::npm_registry_url(&dep).map(str::to_string);
         // The served purl is printed and recorded as it is: a line break in
         // one would forge a line of the run's output.
         let checked = if purl.chars().any(|c| c.is_whitespace() || c.is_control()) {
@@ -493,6 +504,13 @@ fn mirror_unsupported(ecosystem: &str) -> Option<&'static str> {
 ///   reach the patch server.
 /// * A candidate whose mirrored URLs the grant gate refuses is skipped
 ///   with [`MIRROR_URL_REFUSED`].
+/// * An npm candidate's registry address (`npm_registry_url`) is not
+///   moved: the document the patch server answers there names the tarball
+///   on the patch server itself, which a mirror cannot rewrite, so pnpm
+///   could not verify a mirrored tarball against it. The mirrored tarball
+///   is then no file of that address, which is what keeps the pin off the
+///   pnpm registry route ([`crate::patch::redirect::grant::npm_registry_url`])
+///   and on `trustLockfile`.
 ///
 /// `patch_server_origins` must hold the mirror's base: it is how the grant
 /// gate takes a plain-`http` mirror, and how every reader recognizes the
@@ -897,6 +915,13 @@ pub struct CandidateFiles {
     /// `files`, and the rewrite reports this instead of a redirect or a
     /// "no lockfile" hint.
     pub pnpm_refusal: Option<RewriteWarning>,
+    /// What the Bazel workspace of the project says of its pnpm locks
+    /// ([`crate::bazel::pnpm::hubs`]), asked once, here, where the files
+    /// are read: whether a hub keeps the root lock out of the run (then
+    /// also [`Self::pnpm_refusal`]), and whether one reads a lock, which
+    /// then is not routed through a named registry. The rewrite plans
+    /// from this alone and reads nothing of Bazel itself.
+    pub pnpm_bazel: crate::bazel::pnpm::Hubs,
 }
 
 impl CandidateFiles {
@@ -1673,12 +1698,12 @@ pub async fn read_candidate_files_in(
             // A hub stands against a pin in the root lock it reads, not
             // against the members' own locks, which no hub of this answer
             // reads: they are read and pinned as without it.
-            let hidden = bazel_hides_pnpm_workspace(view, &out).await;
+            let root = out.files.contains_key(ROOT_PNPM_LOCKS[0]);
             read_pnpm_member_locks(view, unreadable, &mut out).await;
-            if let Some(hidden) = hidden {
-                withhold_root_pnpm_locks(&mut out, hidden);
-            }
+            read_pnpm_bazel(view, root, &mut out).await;
         }
+    } else {
+        read_pnpm_route_locks(view, unreadable, &mut out).await;
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "gem") {
         keep_bundler_loaded_gem_files(view, candidates, &mut out).await;
@@ -1797,8 +1822,20 @@ async fn read_pnpm_member_locks(
     unreadable: &BTreeSet<String>,
     out: &mut CandidateFiles,
 ) {
-    use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
-    match member_locks(view).await {
+    let listing = crate::utils::pnpm_workspace::member_locks(view).await;
+    take_pnpm_member_locks(view, unreadable, out, listing).await;
+}
+
+/// [`read_pnpm_member_locks`] for members that were listed already
+/// (`listing`): the listing globs the workspace, and a run does it once.
+async fn take_pnpm_member_locks(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    out: &mut CandidateFiles,
+    listing: crate::utils::pnpm_workspace::MemberLocks,
+) {
+    use crate::utils::pnpm_workspace::MemberLocks;
+    match listing {
         MemberLocks::Shared => {}
         MemberLocks::PerMember(keys) => {
             for key in keys {
@@ -1826,6 +1863,82 @@ async fn read_pnpm_member_locks(
     }
 }
 
+/// For a run with no npm patch: the members' own locks and what Bazel says
+/// of the pnpm locks, read as a run with a patch reads them, when the
+/// project holds something of a registry route ([`pnpm_route`]). Such a
+/// run still tidies what is left of a route ([`pnpm_prune`]), and every
+/// lock the workspace file governs has a say in what is left. And a root
+/// lock that a run with a patch leaves to a Bazel hub is not rewritten by
+/// one without, so what a scan does to the files does not turn on what it
+/// was granted.
+///
+/// Something of a route is an entry of ours in the root
+/// pnpm-workspace.yaml, or a lock that keys a release by a registry of
+/// ours or records an override of ours: the root lock or, in a workspace
+/// that keeps one lock per member, a member's own, which can be the only
+/// file that still holds any of it. Read from the bytes alone, with every
+/// address of the registry's shape taken for a patch server's; what is
+/// ours is settled when the route is. A project that holds none is read
+/// no further, and no Bazel file is read for it.
+///
+/// The members are listed once, for the question and for the read, and a
+/// lock is parsed only when its bytes name a route.
+async fn read_pnpm_route_locks(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    out: &mut CandidateFiles,
+) {
+    use crate::formats::pnpm::named_registries::{holds_ours, Owned};
+    use crate::formats::pnpm::registry_alias::holds_route;
+    use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
+
+    let workspace = view.read_text(PNPM_WORKSPACE_REL).await.ok();
+    let owned = Owned::of(workspace.as_deref(), &|_| true);
+    let root = out.files.get(ROOT_PNPM_LOCKS[0]);
+    let in_root = workspace
+        .as_deref()
+        .is_some_and(|text| holds_ours(text, &owned))
+        || root.is_some_and(|lock| holds_route(lock, &owned));
+    // Without a workspace file there are no members to list.
+    let listing = match workspace {
+        Some(_) => member_locks(view).await,
+        None => MemberLocks::Shared,
+    };
+    if !in_root && !member_lock_holds_route(view, &listing, &owned).await {
+        return;
+    }
+    let root = root.is_some();
+    take_pnpm_member_locks(view, unreadable, out, listing).await;
+    read_pnpm_bazel(view, root, out).await;
+}
+
+/// Whether a member's own lock of `listing` holds something of a registry
+/// route. Members that cannot be listed name none: only a project whose
+/// root files hold a route is told that its member locks could not be
+/// read.
+async fn member_lock_holds_route(
+    view: &ProjectView<'_>,
+    listing: &crate::utils::pnpm_workspace::MemberLocks,
+    owned: &crate::formats::pnpm::named_registries::Owned,
+) -> bool {
+    use crate::formats::pnpm::registry_alias::holds_route;
+    use crate::utils::pnpm_workspace::MemberLocks;
+
+    let MemberLocks::PerMember(keys) = listing else {
+        return false;
+    };
+    for key in keys {
+        if view
+            .read_text(key)
+            .await
+            .is_ok_and(|lock| holds_route(&lock, owned))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Leave the root pnpm lock out and record why (see
 /// [`CandidateFiles::pnpm_refusal`]).
 fn refuse_pnpm_members(out: &mut CandidateFiles, why: String) {
@@ -1850,21 +1963,36 @@ fn refuse_git_branch_locks(
     withhold_root_pnpm_locks(out, git_branch_lock_refusal(branch));
 }
 
-/// The refusal for a project whose `pnpm-lock.yaml` a rules_js hub of its
-/// Bazel workspace keeps up to date with a pnpm that would not read the
-/// `trustLockfile: true` a hosted pin needs ([`crate::bazel::pnpm::hidden`]):
-/// the build would fail on the pinned lock, so the caller leaves the root
-/// locks out and the run refuses every pin in them (see
-/// [`withhold_root_pnpm_locks`]). Nothing of Bazel is read for a project
-/// without that lock.
-async fn bazel_hides_pnpm_workspace(
-    view: &ProjectView<'_>,
-    out: &CandidateFiles,
-) -> Option<RewriteWarning> {
-    if !out.files.contains_key(ROOT_PNPM_LOCKS[0]) {
-        return None;
+/// Ask the Bazel workspace of the project about its pnpm locks, once
+/// ([`CandidateFiles::pnpm_bazel`]): the root lock (`root`: whether
+/// `pnpm-lock.yaml` was read, before the members' locks were) and the
+/// members' own.
+///
+/// Where a rules_js hub keeps the root lock up to date with a pnpm that
+/// would not read the `trustLockfile: true` a hosted pin needs
+/// ([`crate::bazel::pnpm::Hubs::hidden`]), the build would fail on the
+/// pinned lock: the root locks are left out and the run refuses every pin
+/// in them (see [`withhold_root_pnpm_locks`]). That answer is about a pin
+/// in the root lock, so a project without that lock gets none, and nothing
+/// of Bazel is read for a project with no pnpm lock at all: both are
+/// decided where the answer is read ([`crate::bazel::pnpm::hubs`]).
+async fn read_pnpm_bazel(view: &ProjectView<'_>, root: bool, out: &mut CandidateFiles) {
+    let hubs = crate::bazel::pnpm::hubs(view, root, &out.pnpm_member_lock_keys).await;
+    if let Some(hidden) = hubs.hidden.clone() {
+        withhold_root_pnpm_locks(out, hidden);
     }
-    crate::bazel::pnpm::hidden(view).await
+    out.pnpm_bazel = hubs;
+}
+
+/// Whether a hosted scan leaves the root pnpm lock of the project of
+/// `view` to a Bazel hub ([`crate::bazel::pnpm::Hubs::hidden`]), for a
+/// caller that reads no other file: the answer [`read_candidate_files`]
+/// gets, with the root lock read as it reads it, so that a scan which
+/// crawls nothing and one which crawls a package decide alike.
+pub async fn pnpm_root_lock_left_to_bazel(view: &ProjectView<'_>) -> Option<RewriteWarning> {
+    let mut out = CandidateFiles::default();
+    let root = out.read(view, &BTreeSet::new(), ROOT_PNPM_LOCKS[0]).await;
+    crate::bazel::pnpm::hubs(view, root, &[]).await.hidden
 }
 
 /// The root pnpm locks (see [`withhold_root_pnpm_locks`]).
@@ -1874,7 +2002,7 @@ const ROOT_PNPM_LOCKS: [&str; 2] = ["pnpm-lock.yaml", "shrinkwrap.yaml"];
 /// with `refusal` (see [`CandidateFiles::pnpm_refusal`]): a branch lock
 /// (#556), pnpm's `lockfile` setting off (#1074, where pnpm reads no
 /// lock at all; member locks are never read then), or a Bazel hub that
-/// would fail on a pin in the root lock ([`bazel_hides_pnpm_workspace`];
+/// would fail on a pin in the root lock ([`read_pnpm_bazel`];
 /// the members' own locks are read all the same). In memory the root
 /// lock is dropped from the link and unreadable lists too: it is not
 /// written.
@@ -2577,9 +2705,28 @@ pub struct Rewritten {
     pub pnpm_warnings: Vec<RewriteWarning>,
     pub npm_warnings: Vec<RewriteWarning>,
     /// Human mode: this run touched nothing pnpm-related (no lock spliced,
-    /// trust already configured), so the full guidance shrinks to a
-    /// one-line reminder.
+    /// trust or the named registries already configured), so the full
+    /// guidance shrinks to a one-line reminder.
     pub pnpm_rerun_only: bool,
+    /// The run's pnpm guidance is the named-registry one: every hosted pin
+    /// of the governing pnpm locks is routed through a registry
+    /// pnpm-workspace.yaml declares, so `trustLockfile` is not what
+    /// installs rely on.
+    pub pnpm_named_registries: bool,
+    /// What a routed project is told of a release the route may reach
+    /// ([`crate::hosted::guidance::pnpm_registry_in_range_note`]): part of
+    /// the pnpm guidance's detail, and kept apart for a caller that shows
+    /// a shorter guidance on a run that changed nothing.
+    pub pnpm_route_note: Option<String>,
+    /// The pnpm-workspace.yaml this run writes is what is left of a file a
+    /// hosted run created once nothing is routed any more: the `packages`
+    /// list it was created with and nothing else. A rewrite only carries
+    /// writes, so the caller deletes the file once they have landed (the
+    /// CLI after its commit; the in-memory engine reports it among the
+    /// deleted files instead of the changed ones). Never set where a Bazel
+    /// hub reads, or may read, a lock of the project
+    /// ([`CandidateFiles::pnpm_bazel`]): its `data` can name the file.
+    pub pnpm_workspace_emptied: bool,
     /// In memory only: the trust auto-config would write through a
     /// symlinked `pnpm-workspace.yaml`.
     pub(crate) workspace_symlinked: bool,
@@ -3203,10 +3350,30 @@ async fn rewrite_once(
         gradle_unreadable,
         gem_refusal,
         pnpm_refusal,
+        pnpm_bazel,
     } = read;
     // The rewriters' override slice — materialized ONCE, after the last
     // candidate filter, so it can never disagree with `candidates`.
     let overrides: Vec<DepOverride> = candidates.iter().map(|c| c.dep.clone()).collect();
+    // Before any rewriter reads a lock: keys an unreleased build spelled
+    // through a registry under one of its names are respelled.
+    let mut files = files;
+    // A root lock that a Bazel hub keeps out of the run records the
+    // overrides of the workspace file like every other governing lock, and
+    // is not written: the route is then left as it is, in the locks that
+    // were read too.
+    let respelled = if pnpm_bazel.hidden.is_some() {
+        Respelled::default()
+    } else {
+        respell_earlier_route(
+            view,
+            &mut files,
+            &pnpm_member_lock_keys,
+            &rush_lock_keys,
+            &overrides,
+            &options,
+        )
+    };
     let bun_lockb = bun_lockb_present(view);
     let binary_bun = !bun_text_lock_drives(view) && bun_lockb;
     let binary_content = if binary_bun && overrides.iter().any(|o| o.ecosystem == "npm") {
@@ -3290,6 +3457,13 @@ async fn rewrite_once(
         );
         (files, rewrite)
     };
+    // A respelled lock is written even when no rewriter changed it since.
+    for key in respelled.keys {
+        if let Some(text) = files.get(&key) {
+            rewrite.files.entry(key).or_insert_with(|| text.clone());
+        }
+    }
+    rewrite.edits.splice(0..0, respelled.edits);
     // The Maven rewriter's respelling of `.mvn/maven.config` is a courtesy,
     // never the reason a run is refused or fails: where the file cannot be
     // replaced (a symbolic link, which the guard refuses for every write;
@@ -3445,7 +3619,27 @@ async fn rewrite_once(
         ));
     }
 
-    let (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked) = pnpm_trust(
+    // Settled first: the route decides the shape of the governing locks.
+    let route = pnpm_route(
+        view,
+        &files,
+        &pnpm_member_lock_keys,
+        &mut rewrite,
+        &rush_lock_keys,
+        &overrides,
+        &options,
+        &pnpm_bazel,
+    );
+    let workspace_emptied = route.emptied;
+    let PnpmTrust {
+        warnings: pnpm_warnings,
+        config_write: pnpm_config_write,
+        rerun_only: pnpm_rerun_only,
+        workspace_symlinked,
+        named_registries: pnpm_named_registries,
+        route_note: pnpm_route_note,
+        emptied: trust_emptied,
+    } = pnpm_trust(
         view,
         &files,
         &pnpm_member_lock_keys,
@@ -3453,15 +3647,24 @@ async fn rewrite_once(
         &rush_lock_keys,
         &overrides,
         &options,
+        route,
     );
     let (mut npm_warnings, npmrc_config_write) =
         npm_allow_remote(view, &files, &rewrite, &overrides, &options);
     npm_warnings.extend(npm_allow_scripts(&files, &rewrite, &overrides));
-    if let Some((text, edit)) = trust_config_write {
+    // Only while the emptied file is the one this run writes.
+    // And only where no Bazel hub reads, or may read, a lock of the
+    // project: the `data` of such a hub can name the file, and a build
+    // that is handed a missing file fails. The file then stays as the
+    // `packages` list it was created with.
+    let hub = pnpm_bazel.reader.is_some() || pnpm_bazel.hidden.is_some();
+    let pnpm_workspace_emptied =
+        !hub && ((workspace_emptied && pnpm_config_write.is_none()) || trust_emptied);
+    if let Some((text, edits)) = pnpm_config_write {
         rewrite.files.insert(PNPM_WORKSPACE_REL.to_string(), text);
-        // Appended last, after the lock edits it serves. v5 keeps no hosted
+        // Appended last, after the lock edits they serve. v5 keeps no hosted
         // ledger, so nothing replays these edits; the order is write order.
-        rewrite.edits.push(edit);
+        rewrite.edits.extend(edits);
     }
     if let Some((text, edit)) = npmrc_config_write {
         rewrite.files.insert(NPMRC_REL.to_string(), text);
@@ -3493,12 +3696,35 @@ async fn rewrite_once(
         pnpm_warnings,
         npm_warnings,
         pnpm_rerun_only,
+        pnpm_named_registries,
+        pnpm_route_note,
+        pnpm_workspace_emptied,
         workspace_symlinked,
         final_discovery: None,
     }
 }
 
 type ConfigWrite = Option<(String, FileEdit)>;
+
+/// What [`pnpm_trust`] settles for a run.
+#[derive(Default)]
+struct PnpmTrust {
+    warnings: Vec<RewriteWarning>,
+    /// The new pnpm-workspace.yaml and the edits that make it.
+    config_write: Option<(String, Vec<FileEdit>)>,
+    /// See [`Rewritten::pnpm_rerun_only`].
+    rerun_only: bool,
+    /// See [`Rewritten::workspace_symlinked`].
+    workspace_symlinked: bool,
+    /// See [`Rewritten::pnpm_named_registries`].
+    named_registries: bool,
+    /// See [`Rewritten::pnpm_route_note`].
+    route_note: Option<String>,
+    /// The run took a route out of a workspace file hosted mode created
+    /// and plans no other setting for it: `config_write` is the file's
+    /// bare `packages` list ([`Rewritten::pnpm_workspace_emptied`]).
+    emptied: bool,
+}
 
 /// pnpm >=11 enforces a lockfile supply-chain policy: it compares each
 /// resolution's tarball URL against the registry's published metadata and
@@ -3516,15 +3742,26 @@ type ConfigWrite = Option<(String, FileEdit)>;
 /// root pnpm-lock.yaml, or a workspace member's own lock under
 /// `sharedWorkspaceLockfile: false`, #492) and its lockfileVersion is >= 9
 /// (5.x/6.0 locks mean pnpm 7/8, which have neither the policy nor the
-/// flag and get their own guidance), the run
-/// auto-ensures `trustLockfile: true` in pnpm-workspace.yaml. The same
-/// auto-config re-engages on a run that spliced NOTHING when a governing v9
-/// lock already carries a granted hosted artifact URL (HEAL-ON-RERUN). The
-/// key always goes to the root pnpm-workspace.yaml, the only one pnpm reads
-/// for every member.
+/// flag and get their own guidance), the run configures the root
+/// pnpm-workspace.yaml, the only one pnpm reads for every member, so
+/// pnpm >=11 installs the lock. The same auto-config re-engages on a run
+/// that spliced NOTHING when a governing v9 lock already carries a granted
+/// hosted artifact URL (HEAL-ON-RERUN).
+///
+/// NAMED REGISTRIES, when `route` ([`pnpm_route`]) settled on them: every
+/// hosted tarball of the governing locks is routed through the patch
+/// server's one-package registry of its patch, which pnpm-workspace.yaml
+/// declares and overrides the release with, so pnpm's verification stays
+/// on for the whole lock and a command that resolves again keeps the
+/// patched package. The route has already put the locks in that shape;
+/// what is left here is the workspace file and the warning.
+///
+/// TRUST, otherwise: the run auto-ensures `trustLockfile: true`, which
+/// switches the verification off for every entry.
 /// pnpm <=10 ignores the key; the per-entry sha512 pin still fails closed
 /// on tampered bytes. An explicit user `trustLockfile: <non-true>` is
-/// RESPECTED (never flipped), and `--no-trust-lockfile-config` opts out.
+/// RESPECTED (never flipped), and `--no-trust-lockfile-config` opts out of
+/// either write.
 /// Rush common/subspace locks (`rush_lock_keys`) are excluded from the
 /// write: rush runs pnpm in common/temp with a pnpm-workspace.yaml it
 /// generates, which never reads the repo-root one. When every spliced lock
@@ -3541,21 +3778,25 @@ fn pnpm_trust(
     rush_lock_keys: &[String],
     overrides: &[DepOverride],
     options: &RewriteOptions<'_>,
-) -> (Vec<RewriteWarning>, ConfigWrite, bool, bool) {
-    let mut pnpm_warnings: Vec<RewriteWarning> = Vec::new();
-    let mut trust_config_write: ConfigWrite = None;
-    let mut pnpm_rerun_only = false;
-    let mut workspace_symlinked = false;
+    route: PnpmRoute,
+) -> PnpmTrust {
+    use crate::formats::pnpm::named_registries::Plan;
+
+    let mut out = PnpmTrust::default();
+    // A lock the route only tidied (no hosted pin of this run in it) was
+    // not spliced: it needs no trust and no warning.
+    let spliced = |key: &str| rewrite.files.contains_key(key) && !route.pruned.contains(key);
     // pnpm locks spliced THIS run (any depth — the rewriter is
     // basename-generalized).
     let (spliced_keys, mut pnpm_lock_texts): (Vec<&String>, Vec<&String>) = rewrite
         .files
         .iter()
         .filter(|(key, _)| {
-            std::path::Path::new(key)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|name| matches!(name, "pnpm-lock.yaml" | "shrinkwrap.yaml"))
+            spliced(key)
+                && std::path::Path::new(key)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| matches!(name, "pnpm-lock.yaml" | "shrinkwrap.yaml"))
         })
         .unzip();
     // Rush locks spliced this run. The heal and takeover roots below are
@@ -3564,16 +3805,7 @@ fn pnpm_trust(
         .iter()
         .filter(|key| rush_lock_keys.contains(key))
         .count();
-    // The locks pnpm installs the project from: the root lock, plus each
-    // member's own under `sharedWorkspaceLockfile: false` (#492). A Rush
-    // lock is never one: rush installs it from common/temp. The root lock
-    // is the one pnpm reads (N11): `shrinkwrap.yaml` under a pnpm 1 / 2
-    // pin, so a stray `pnpm-lock.yaml` never drives the heal or the trust
-    // config.
-    let governing: Vec<&str> = std::iter::once(crate::formats::pnpm::plan::root_lock(files))
-        .chain(member_lock_keys.iter().map(String::as_str))
-        .filter(|key| !rush_lock_keys.iter().any(|rush| rush == key))
-        .collect();
+    let governing = governing_pnpm_locks(files, member_lock_keys, rush_lock_keys);
     // HEAL-ON-RERUN: a governing v9 lock that ALREADY carries a granted
     // hosted artifact URL (spliced by an earlier run) still plans the trust
     // config even though this run spliced nothing — so a project that
@@ -3583,9 +3815,7 @@ fn pnpm_trust(
     // no-op.
     let heal_locks: Vec<&String> = governing
         .iter()
-        .filter_map(|key| {
-            pnpm_heal_root(rewrite.files.contains_key(*key), files.get(*key), overrides)
-        })
+        .filter_map(|key| pnpm_heal_root(spliced(key), files.get(*key), overrides))
         .collect();
     let spliced_pnpm_locks = pnpm_lock_texts.len();
     pnpm_lock_texts.extend(heal_locks.iter().copied());
@@ -3603,12 +3833,7 @@ fn pnpm_trust(
         }
     }
     if pnpm_lock_texts.is_empty() {
-        return (
-            pnpm_warnings,
-            trust_config_write,
-            pnpm_rerun_only,
-            workspace_symlinked,
-        );
+        return out;
     }
     // Name only the hosts whose artifact URL actually landed in a touched
     // pnpm lock's final text (spliced this run, or the already-redirected
@@ -3642,6 +3867,7 @@ fn pnpm_trust(
     let governing_lock_v9 = heal_locks.iter().copied().any(is_v9)
         || governing
             .iter()
+            .filter(|key| spliced(key))
             .filter_map(|key| rewrite.files.get(*key))
             .any(is_v9);
     // Every touched pnpm lock is a KNOWN legacy (5.x/6.0) format, where
@@ -3653,13 +3879,85 @@ fn pnpm_trust(
             || pnpm_is_shrinkwrap_lock(text)
     });
     let rush_only = spliced_rush > 0 && spliced_rush == pnpm_lock_texts.len();
+    // A governing v9 lock is what either auto-config serves, and what the
+    // route was settled for. In a workspace member with its own lock the
+    // settings live in the workspace root's file, which this run never
+    // writes.
+    debug_assert_eq!(
+        route.engaged,
+        governing_lock_v9 && !all_locks_legacy && !rush_only
+    );
+    let PnpmRoute {
+        member_root,
+        workspace: root_workspace,
+        registry,
+        blocked,
+        pin_hint,
+        unrouted,
+        kept,
+        ..
+    } = route;
+    // What a routed project is told of a release the route may reach.
+    out.route_note = registry
+        .as_ref()
+        .and_then(|route| crate::hosted::guidance::pnpm_registry_in_range_note(&route.also_locked));
     let detail = if all_locks_legacy {
         pnpm_trust_legacy_detail(&server)
     } else if rush_only {
         pnpm_trust_rush_detail(&server)
+    } else if let Some(registry) = registry {
+        let (_, symlinked) = root_workspace.unwrap_or_else(|| read_workspace(view));
+        out.named_registries = true;
+        out.workspace_symlinked = symlinked;
+        let (text, changes, write) = match registry.plan {
+            Plan::Create(text, changes) => (text, changes, RegistryWrite::Created),
+            Plan::Scaffold(text, changes) => (text, changes, RegistryWrite::Scaffolded),
+            Plan::Edit(text, changes) => (text, changes, RegistryWrite::Merged),
+            // [`pnpm_route`] keeps a file it cannot edit on the trust path.
+            Plan::InSync | Plan::Unsupported(_) => {
+                (String::new(), Vec::new(), RegistryWrite::Merged)
+            }
+        };
+        if changes.is_empty() {
+            out.rerun_only = spliced_pnpm_locks == 0;
+            pnpm_registry_already_detail(&server, registry.trust)
+        } else {
+            let mut edits = Vec::new();
+            if registry.trust == TrustLeftover::Removed {
+                edits.push(FileEdit {
+                    path: PNPM_WORKSPACE_REL.into(),
+                    kind: REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND.into(),
+                    action: "removed".into(),
+                    key: Some("trustLockfile".into()),
+                    original: Some(serde_json::json!("true")),
+                    new: None,
+                });
+            }
+            edits.extend(workspace_route_edits(
+                changes,
+                write == RegistryWrite::Created,
+            ));
+            out.config_write = Some((text, edits));
+            pnpm_registry_configured_detail(&server, write, registry.trust, options.dry_run)
+        }
+    } else if kept {
+        // The route of an earlier run, left as it is for a Bazel hub: it
+        // is what verifies the hosted entries, so the file is not written.
+        let (workspace, _) = root_workspace.unwrap_or_else(|| read_workspace(view));
+        let leftover = match workspace {
+            Ok(Some(text))
+                if matches!(plan_workspace_trust(Some(&text)), TrustPlan::AlreadyTrue) =>
+            {
+                TrustLeftover::Left
+            }
+            _ => TrustLeftover::None,
+        };
+        out.named_registries = true;
+        out.rerun_only = spliced_pnpm_locks == 0;
+        pnpm_registry_already_detail(&server, leftover)
     } else if !governing_lock_v9 || !options.trust_lockfile_config {
         pnpm_trust_manual_guidance(&server)
-    } else if let Some(root_file) = governing_workspace(view) {
+    } else if let Some(root_file) = member_root {
         // A workspace member with its own lock: pnpm reads `trustLockfile`
         // only from the workspace root's file, and a nested one would be
         // ignored (#880). The governing-root pre-check refused every root
@@ -3684,7 +3982,7 @@ fn pnpm_trust(
                 .map(|text| plan_workspace_trust(Some(&text)))
             {
                 Some(TrustPlan::AlreadyTrue) => {
-                    pnpm_rerun_only = spliced_pnpm_locks == 0;
+                    out.rerun_only = spliced_pnpm_locks == 0;
                     pnpm_trust_already_true_detail(&server, &root_file)
                 }
                 Some(TrustPlan::UserSet(value)) => {
@@ -3694,8 +3992,28 @@ fn pnpm_trust(
             }
         }
     } else {
-        let (workspace, symlinked) = read_workspace(view);
-        workspace_symlinked = symlinked;
+        let (workspace, symlinked) = root_workspace.unwrap_or_else(|| read_workspace(view));
+        out.workspace_symlinked = symlinked;
+        // An earlier run's registry routing came back out of the locks:
+        // the trust key goes into the file without its two maps, and that
+        // file is written whether or not the key is.
+        let unrouted_file = match &unrouted {
+            Some(Ok(Some(unrouted))) => Some(unrouted.clone()),
+            _ => None,
+        };
+        // A file hosted mode created holds nothing of the user's once the
+        // route is out of it: its `packages` list is the scaffold the route
+        // came with. Whether the project should have a workspace file at
+        // all is then decided as for a project with none (no file for one
+        // pinned to pnpm 9.0–10.4, #734; none under a `trustLockfile`
+        // variable of the environment).
+        let created = unrouted_file
+            .as_ref()
+            .is_some_and(|unrouted| unrouted.created);
+        let workspace = match &unrouted_file {
+            Some(unrouted) => workspace.map(|_| Some(unrouted.text.clone())),
+            None => workspace,
+        };
         let trust_edit = |action: &str| FileEdit {
             path: PNPM_WORKSPACE_REL.into(),
             kind: REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND.into(),
@@ -3711,9 +4029,10 @@ fn pnpm_trust(
         let pinned_pre_10_5 = match &workspace {
             Ok(text)
                 if !symlinked
-                    && text
-                        .as_deref()
-                        .is_none_or(crate::formats::pnpm::workspace::is_keyless) =>
+                    && (created
+                        || text
+                            .as_deref()
+                            .is_none_or(crate::formats::pnpm::workspace::is_keyless)) =>
             {
                 root_only_workspace_breaks_add(view)
             }
@@ -3727,7 +4046,7 @@ fn pnpm_trust(
             && !symlinked
             && matches!(&workspace, Ok(Some(text)) if crate::formats::pnpm::workspace::is_keyless(text))
             && lock_lists_members(view);
-        match workspace {
+        let detail = match workspace {
             Ok(_) if keyless_members => pnpm_trust_keyless_members_detail(&server, options.dry_run),
             Ok(_) if pinned_pre_10_5.is_some() => pnpm_trust_not_needed_detail(
                 &server,
@@ -3750,19 +4069,19 @@ fn pnpm_trust(
             Err(e) => pnpm_trust_workspace_unreadable_detail(&server, &e),
             Ok(ws_existing) => match plan_workspace_trust(ws_existing.as_deref()) {
                 TrustPlan::Create(text) => {
-                    trust_config_write = Some((text, trust_edit("created")));
+                    out.config_write = Some((text, vec![trust_edit("created")]));
                     pnpm_trust_configured_detail(&server, true, options.dry_run)
                 }
                 TrustPlan::Append(text) => {
-                    trust_config_write = Some((text, trust_edit("added")));
+                    out.config_write = Some((text, vec![trust_edit("added")]));
                     pnpm_trust_configured_detail(&server, false, options.dry_run)
                 }
                 TrustPlan::Scaffold(text) => {
-                    trust_config_write = Some((text, trust_edit("added")));
+                    out.config_write = Some((text, vec![trust_edit("added")]));
                     pnpm_trust_scaffolded_detail(&server, options.dry_run)
                 }
                 TrustPlan::AlreadyTrue => {
-                    pnpm_rerun_only = spliced_pnpm_locks == 0;
+                    out.rerun_only = spliced_pnpm_locks == 0;
                     let detail = pnpm_trust_already_true_detail(&server, PNPM_WORKSPACE_REL);
                     // The root-only scaffold an earlier run created (4.x and
                     // early v5 did so whatever the pnpm), in a project pinned
@@ -3783,8 +4102,40 @@ fn pnpm_trust(
                     pnpm_trust_workspace_unsupported_detail(&server, &why)
                 }
             },
+        };
+        if let Some(unrouted) = unrouted_file {
+            let planned = out.config_write.take();
+            // Nothing else is planned for a file the route created: what is
+            // written back is its bare scaffold, the caller's to delete.
+            out.emptied = unrouted.created && planned.is_none();
+            let (text, mut edits) = planned.unwrap_or((unrouted.text, Vec::new()));
+            edits.splice(0..0, unrouted.edits);
+            out.config_write = Some((text, edits));
         }
+        detail
     };
+    // What a project that qualifies for the registry route is told about
+    // staying on trust.
+    let notes: Vec<String> = [
+        (!blocked.is_empty()).then(|| match kept {
+            true => crate::hosted::guidance::pnpm_registry_kept_note(&blocked),
+            false => pnpm_registry_blocked_note(&blocked),
+        }),
+        unrouted.as_ref().map(|outcome| {
+            pnpm_registry_unrouted_note(
+                outcome.as_ref().map(|_| ()).map_err(String::as_str),
+                options.dry_run,
+            )
+        }),
+        pin_hint.then(|| PNPM_REGISTRY_PIN_HINT.to_string()),
+        out.route_note.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let detail = notes.iter().fold(detail, |detail, note| {
+        format!("{}. {note}", detail.trim_end_matches('.'))
+    });
     // The `--store` spelling only matters to pnpm 1–4, so it is named only
     // when a touched lock may be that old.
     let store_note = if pnpm_lock_texts
@@ -3817,13 +4168,1332 @@ fn pnpm_trust(
             detail.trim_end_matches('.')
         )
     };
-    pnpm_warnings.push(warning("redirect_pnpm_trust_lockfile", message));
-    (
-        pnpm_warnings,
-        trust_config_write,
-        pnpm_rerun_only,
-        workspace_symlinked,
+    out.warnings
+        .push(warning("redirect_pnpm_trust_lockfile", message));
+    out
+}
+
+/// The locks pnpm installs the project from: the root lock, plus each
+/// member's own under `sharedWorkspaceLockfile: false` (#492). A Rush lock
+/// is never one: rush installs it from common/temp. The root lock is the
+/// one pnpm reads (N11): `shrinkwrap.yaml` under a pnpm 1 / 2 pin, so a
+/// stray `pnpm-lock.yaml` never drives the heal or the workspace config.
+/// What [`respell_earlier_route`] changed: the governing locks it
+/// respelled (their new text is in the files map), and the edits.
+#[derive(Default)]
+struct Respelled {
+    keys: Vec<String>,
+    edits: Vec<FileEdit>,
+}
+
+/// MIGRATION, before any rewriter reads a lock. An unreleased build keyed
+/// a routed release through a registry under another name: the whole
+/// patch UUID (`left-pad@socket-patch-<uuid>:1.3.0`), or one registry for
+/// the project (`left-pad@socket:1.3.0`, `socket-patch`, either with a
+/// number). The lock readers take only a registry named `socket-<hex>`
+/// for hosted mode's on sight; those other names are as likely a registry
+/// of the project's own, whose release is not the npm one, and nothing of
+/// the user's may be repointed. They are ours only where the workspace
+/// file proves it ([`crate::formats::pnpm::named_registries::Owned`]): a
+/// declaration at an address that build wrote, on a patch server.
+///
+/// With that proof, each such key of a governing lock is respelled under
+/// the name its patch gives the registry today (the patch is the one the
+/// entry's tarball is served for), so that every later step reads one
+/// shape. The workspace file is left to the route, which replaces what is
+/// ours in it. Without the proof, or when a lock cannot be respelled
+/// whole, the lock is left as it is.
+fn respell_earlier_route(
+    view: &ProjectView<'_>,
+    files: &mut BTreeMap<String, String>,
+    member_lock_keys: &[String],
+    rush_lock_keys: &[String],
+    overrides: &[DepOverride],
+    options: &RewriteOptions<'_>,
+) -> Respelled {
+    use crate::formats::pnpm::named_registries::{is_current_alias, Address, Owned};
+    use crate::formats::pnpm::registry_alias::{AliasPin, OverrideLock, Pinned};
+    use crate::formats::pnpm::PnpmLock;
+
+    let mut out = Respelled::default();
+    // `--no-trust-lockfile-config` keeps the workspace file as it is, and
+    // the locks with it.
+    if !options.trust_lockfile_config || governing_workspace(view).is_some() {
+        return out;
+    }
+    let (Ok(Some(workspace)), false) = read_workspace(view) else {
+        return out;
+    };
+    let owned = Owned::of(Some(&workspace), &|origin| {
+        is_patch_server(origin, overrides, options)
+    });
+    let governing: Vec<String> = governing_pnpm_locks(files, member_lock_keys, rush_lock_keys)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    for key in governing {
+        let Some(text) = files.get(&key).cloned() else {
+            continue;
+        };
+        if pnpm_lock_version_major(&text) != Some(9) {
+            continue;
+        }
+        let Ok(mut lock) = OverrideLock::parse(&text, &owned) else {
+            continue;
+        };
+        let earlier: Vec<_> = lock
+            .aliased()
+            .into_iter()
+            .filter(|pin| !is_current_alias(&pin.alias))
+            .collect();
+        if earlier.is_empty() {
+            continue;
+        }
+        let parsed = PnpmLock::parse(&text);
+        let respell = |lock: &mut OverrideLock| -> Option<Vec<FileEdit>> {
+            let mut edits = Vec::new();
+            for pin in &earlier {
+                let entry = format!("{}@{}:{}", pin.name, pin.alias, pin.version);
+                let resolution = parsed
+                    .packages()
+                    .iter()
+                    .find(|package| package.key == entry)?
+                    .resolution
+                    .as_ref()?;
+                let (tarball, integrity) = (resolution.tarball()?, resolution.integrity()?);
+                // The patch the entry is pinned to: the one its tarball's
+                // directory is named after.
+                let patch = Address::parse(&tarball[..=tarball.rfind('/')?])?;
+                let alias = owned.name_for(&patch.uuid, &BTreeSet::new())?;
+                let pinned = lock.pin(&AliasPin {
+                    name: &pin.name,
+                    version: &pin.version,
+                    alias: &alias,
+                    integrity,
+                    tarball,
+                });
+                if let Pinned::Rewritten { from } = pinned.ok()? {
+                    edits.push(FileEdit {
+                        path: key.clone(),
+                        kind: REDIRECT_PNPM_REGISTRY_ALIAS_EDIT_KIND.into(),
+                        action: "rewritten".into(),
+                        key: Some(pin.key()),
+                        original: Some(serde_json::Value::String(from)),
+                        new: Some(serde_json::Value::String(format!(
+                            "{}@{alias}:{}",
+                            pin.name, pin.version
+                        ))),
+                    });
+                }
+            }
+            lock.finish().ok()?;
+            Some(edits)
+        };
+        let Some(edits) = respell(&mut lock) else {
+            continue;
+        };
+        if let Some(respelled) = lock.render() {
+            files.insert(key.clone(), respelled);
+            out.keys.push(key);
+            out.edits.extend(edits);
+        }
+    }
+    out
+}
+
+fn governing_pnpm_locks<'a>(
+    files: &BTreeMap<String, String>,
+    member_lock_keys: &'a [String],
+    rush_lock_keys: &[String],
+) -> Vec<&'a str> {
+    std::iter::once(crate::formats::pnpm::plan::root_lock(files))
+        .chain(member_lock_keys.iter().map(String::as_str))
+        .filter(|key| !rush_lock_keys.iter().any(|rush| rush == key))
+        .collect()
+}
+
+/// The edits behind a pnpm-workspace.yaml change of the registry route,
+/// one per entry of either map.
+fn workspace_route_edits(
+    changes: Vec<crate::formats::pnpm::named_registries::Change>,
+    created: bool,
+) -> impl Iterator<Item = FileEdit> {
+    use crate::formats::pnpm::named_registries::MapKind;
+    changes.into_iter().map(move |change| {
+        let action = match (&change.from, &change.to) {
+            _ if created => "created",
+            (None, _) => "added",
+            (Some(_), Some(_)) => "rewritten",
+            (Some(_), None) => "removed",
+        };
+        FileEdit {
+            path: PNPM_WORKSPACE_REL.into(),
+            kind: match change.map {
+                MapKind::Registry => REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                MapKind::Override => REDIRECT_PNPM_WORKSPACE_OVERRIDE_EDIT_KIND,
+            }
+            .into(),
+            action: action.into(),
+            key: Some(change.key),
+            original: change.from.map(serde_json::Value::String),
+            new: change.to.map(serde_json::Value::String),
+        }
+    })
+}
+
+/// How a run gets the hosted pins of its governing pnpm locks past pnpm's
+/// lockfile verification ([`pnpm_route`]).
+#[derive(Default)]
+struct PnpmRoute {
+    /// A governing lockfileVersion >= 9 lock holds a granted hosted
+    /// tarball (spliced by this run or an earlier one): the run configures
+    /// pnpm-workspace.yaml one way or the other.
+    engaged: bool,
+    /// The ancestor pnpm-workspace.yaml that governs this project's pnpm
+    /// settings, when the project is a workspace member with its own lock.
+    member_root: Option<std::path::PathBuf>,
+    /// The root pnpm-workspace.yaml as [`read_workspace`] read it, when
+    /// the project's own file is the one pnpm reads.
+    workspace: Option<(std::io::Result<Option<String>>, bool)>,
+    /// The registry route, taken: the governing locks are in its shape.
+    registry: Option<RegistryRoute>,
+    /// What keeps a project the patch service offers the registry route
+    /// to on `trustLockfile`, each as a clause.
+    blocked: Vec<String>,
+    /// Only the missing pnpm pin keeps the project on `trustLockfile`.
+    pin_hint: bool,
+    /// An earlier run took the registry route and this one does not: the
+    /// workspace file without that route's entries (`None` when it held
+    /// none), or why the governing locks could not be put back in the
+    /// plain shape.
+    unrouted: Option<Result<Option<Unrouted>, String>>,
+    /// The governing locks a run that touches no hosted pnpm pin tidied
+    /// ([`pnpm_prune`]): rewritten, but not for a pin that needs trust.
+    pruned: BTreeSet<String>,
+    /// That tidying left a workspace file a run created with nothing but
+    /// its `packages` list ([`Rewritten::pnpm_workspace_emptied`]).
+    emptied: bool,
+    /// A Bazel hub keeps the root lock out of the run, so the route of an
+    /// earlier run is left as it is (`unrouted` says so), and it is all
+    /// the governing locks hold: every hosted tarball in them is under a
+    /// key of its registry, which pnpm verifies it through. The workspace
+    /// file then needs nothing from this run and is left byte for byte,
+    /// without a `trustLockfile` that would switch the verification off
+    /// for every entry of a project still on per-package registries.
+    ///
+    /// Not so where the route stays because a lock could not be converted
+    /// back: that project no longer qualifies for the route (a pnpm that
+    /// does not read it, say), and the trust key is what it falls back on.
+    kept: bool,
+}
+
+/// Whether a governing lock (`texts`, by key, as the run leaves them)
+/// records a Socket-hosted tarball under a plain key: a pin that pnpm takes
+/// only with `trustLockfile`. One under a key that names a registry of
+/// ours (`leaf@socket-58f14d5a:1.0.0`) is verified through that registry.
+/// Read with the tolerant lock reader, so that a lock the route's edits
+/// cannot read still answers.
+fn holds_trust_pin(
+    texts: &[(&str, &String)],
+    overrides: &[DepOverride],
+    owned: &crate::formats::pnpm::named_registries::Owned,
+) -> bool {
+    use crate::formats::pnpm::PnpmLock;
+
+    let hosted = |tarball: &str| {
+        overrides
+            .iter()
+            .any(|o| o.ecosystem == "npm" && o.artifact_url == tarball)
+            || crate::origin::hosted_shape_uuid(tarball).is_some()
+    };
+    // The registry a key spells its version through, as
+    // [`OverrideLock::aliased`](crate::formats::pnpm::registry_alias::OverrideLock::aliased)
+    // reads it.
+    let routed = |key: &str| {
+        let version = key
+            .get(1..)
+            .and_then(|rest| rest.find('@'))
+            .map(|at| at + 2);
+        version
+            .and_then(|at| key[at..].split_once(':'))
+            .is_some_and(|(registry, _)| owned.alias(registry))
+    };
+    texts.iter().any(|(_, text)| {
+        PnpmLock::parse(text).packages().iter().any(|package| {
+            let tarball = package.resolution.as_ref().and_then(|r| r.tarball());
+            tarball.is_some_and(hosted) && !routed(package.key)
+        })
+    })
+}
+
+/// The registry route's pnpm-workspace.yaml edit.
+struct RegistryRoute {
+    plan: crate::formats::pnpm::named_registries::Plan,
+    /// What becomes of a `trustLockfile: true` in the file.
+    trust: TrustLeftover,
+    /// Routed releases a governing lock also holds a newer release of,
+    /// within the routed one's caret range: `(name, version, the other
+    /// versions)` ([`crate::hosted::guidance::pnpm_registry_in_range_note`]).
+    also_locked: Vec<(String, String, Vec<String>)>,
+}
+
+/// pnpm-workspace.yaml once an earlier run's registry route is taken back
+/// out of it.
+#[derive(Clone)]
+pub(crate) struct Unrouted {
+    pub(crate) text: String,
+    pub(crate) edits: Vec<FileEdit>,
+    /// The file held nothing but what hosted mode created it with: without
+    /// the route it is the `packages` scaffold alone, and a caller that
+    /// deletes files deletes it.
+    pub(crate) created: bool,
+}
+
+/// Why a run stays on `trustLockfile`.
+enum RouteBlock {
+    /// The project is not one the registry route is for, or the patch
+    /// service offers it none: today's trust path, with nothing to add.
+    NotEligible,
+    /// Eligible but for a pnpm pin.
+    Unpinned,
+    /// Eligible, and `--no-trust-lockfile-config` keeps the workspace file
+    /// from being written.
+    OptedOut,
+    /// Eligible but for what these clauses name.
+    Because(Vec<String>),
+}
+
+/// Whether `origin` (`http(s)://host[:port]`) is a patch server's:
+/// Socket's own, one the operator configured, or the one a grant of this
+/// run is served from. A grant moved onto a patch mirror
+/// ([`mirror_candidates`]) names the mirror in its artifact URL, and the
+/// rest of a mirror's host is not a patch server; its registry address
+/// still names the patch server it came from.
+fn is_patch_server(origin: &str, overrides: &[DepOverride], options: &RewriteOptions<'_>) -> bool {
+    let on = |url: &str| {
+        url.strip_prefix(origin)
+            .is_some_and(|rest| rest.starts_with('/'))
+    };
+    crate::origin::on_patch_server_origin(origin, &options.patch_server_origins)
+        || overrides.iter().any(|o| {
+            o.ecosystem == "npm"
+                && ((on(&o.artifact_url)
+                    && !crate::origin::on_mirror(&o.artifact_url, &options.patch_server_origins))
+                    || o.npm_registry_url.as_deref().is_some_and(on))
+        })
+}
+
+/// Settle how the hosted pins of the governing pnpm locks get past pnpm's
+/// lockfile verification, and put the locks in that route's shape.
+///
+/// THE REGISTRY ROUTE. The patch service answers the npm registry
+/// document of each patch under the directory the patch's tarball is
+/// served from: an address that is fixed for the life of the patch.
+/// Declared in pnpm-workspace.yaml as a named registry (`socket-<id>`,
+/// the first digits of the patch UUID), it is what pnpm verifies the lock
+/// entry against; named by an override of the patched release
+/// (`name@version` → `socket-<id>:version`), it is also where pnpm
+/// resolves the package whenever it resolves again, so `pnpm add`,
+/// `update` and `dedupe` keep the patched tarball. pnpm writes such a
+/// release under its own key (`name@socket-<id>:version`) and records the
+/// override in the lock, so the route rewrites every governing lock to
+/// exactly what pnpm would write
+/// ([`OverrideLock`](crate::formats::pnpm::registry_alias::OverrideLock)):
+/// a lock that only named the patched tarball would be out of date to
+/// pnpm the moment the override exists.
+///
+/// It is taken only when all of this holds; anything short keeps the run
+/// on `trustLockfile`, the locks in the plain shape the rewriters left:
+///
+/// * the project's own root pnpm-workspace.yaml is the file pnpm reads
+///   (not a workspace member with its own lock), and every governing lock
+///   is lockfileVersion 9 (a Rush lock is never governing);
+/// * every hosted tarball of those locks has a registry: this run was
+///   granted it with a registry address ([`pnpm_hosted_pins`]), or an
+///   earlier run routed it, this run was not granted it, and the project's
+///   files still route it ([`kept_route`]), so a scan of part of a
+///   project leaves the rest routed. A lock half routed would fail to
+///   install. A patch service that gives no pin an address offers no
+///   route, and the run is today's, byte for byte (unless an earlier run
+///   routed the project, which is then told why it leaves the route);
+/// * the project's pnpm pins prove pnpm 11.20 or newer
+///   ([`pnpm_route_pins`]): older releases write another lock for the same
+///   override. No pin at all is told what a pin would change
+///   ([`PNPM_REGISTRY_PIN_HINT`]);
+/// * the workspace file can be read, is not a keyless file the lock was
+///   installed from as a multi-package workspace (#1096), is a shape a
+///   line splice can extend, and leaves each registry a name
+///   ([`Owned::name_for`](crate::formats::pnpm::named_registries::Owned::name_for));
+/// * no override of the user's targets a patched package (pnpm applies one
+///   override per dependency, so ours would lose or displace it), each
+///   lock is one the override edits were captured against, and no package
+///   version is pinned to two patches ([`release_with_two_patches`]);
+/// * the workspace file may be written, or needs no write
+///   (`--no-trust-lockfile-config`);
+/// * no rules_js hub of a Bazel workspace reads a governing lock
+///   ([`crate::bazel::pnpm::Reader`]): the pnpm such a hub runs with
+///   `update_pnpm_lock` may not see the workspace file, or be too old to
+///   read its registries.
+///
+/// Whatever keeps a project the service offers the route to off it is
+/// said in the warning ([`pnpm_registry_blocked_note`]), the pins without
+/// an address by name: `trustLockfile` switches the verification off for
+/// the whole lock.
+///
+/// Nothing of the route outlives its use. A project an earlier run routed
+/// and that no longer qualifies is put back whole: the locks in the plain
+/// shape, the workspace file without the route's entries
+/// ([`pnpm_unroute`]). And a run that touches no hosted pnpm pin at all
+/// still takes out what no lock references any more ([`pnpm_prune`]); a
+/// workspace file a run created is then deleted rather than left as a bare
+/// `packages` list ([`Rewritten::pnpm_workspace_emptied`]).
+/// Neither under `--no-trust-lockfile-config`, which leaves the file, and
+/// so the locks, as they are; and neither while a Bazel hub keeps the root
+/// lock out of the run ([`crate::bazel::pnpm::Hubs::hidden`]): that lock
+/// records the overrides too and is not written, so the route stays as it
+/// is in the file and in the locks that were read.
+///
+/// `bazel` is what the Bazel workspace says of these locks, read with the
+/// files ([`CandidateFiles::pnpm_bazel`]): nothing of Bazel is read here.
+#[allow(clippy::too_many_arguments)]
+fn pnpm_route(
+    view: &ProjectView<'_>,
+    files: &BTreeMap<String, String>,
+    member_lock_keys: &[String],
+    rewrite: &mut RewriteResult,
+    rush_lock_keys: &[String],
+    overrides: &[DepOverride],
+    options: &RewriteOptions<'_>,
+    bazel: &crate::bazel::pnpm::Hubs,
+) -> PnpmRoute {
+    use crate::formats::pnpm::named_registries::Owned;
+
+    let root_withheld = bazel.hidden.is_some();
+
+    let mut route = PnpmRoute::default();
+    let governing = governing_pnpm_locks(files, member_lock_keys, rush_lock_keys);
+    let is_v9 = |text: &String| pnpm_lock_version_major(text).is_some_and(|major| major >= 9);
+    // Every governing lock as the rewriters left it.
+    let texts: Vec<(&str, String)> = governing
+        .iter()
+        .filter_map(|key| {
+            let text = rewrite.files.get(*key).or_else(|| files.get(*key))?;
+            Some((*key, text.clone()))
+        })
+        .collect();
+    if texts.is_empty() {
+        return route;
+    }
+    // The gate of the trust auto-config (see [`pnpm_trust`]).
+    route.engaged = governing.iter().any(|key| match rewrite.files.get(*key) {
+        Some(text) => is_v9(text),
+        None => pnpm_heal_root(false, files.get(*key), overrides).is_some(),
+    });
+    route.member_root = governing_workspace(view);
+    if route.member_root.is_some() {
+        return route;
+    }
+    let (workspace, symlinked) = read_workspace(view);
+    let owned = Owned::of(
+        workspace.as_ref().ok().and_then(|text| text.as_deref()),
+        &|origin| is_patch_server(origin, overrides, options),
+    );
+    let put_back = |rewrite: &mut RewriteResult, cleaned: Cleaned| {
+        let mut keys = BTreeSet::new();
+        for (key, text) in cleaned.locks {
+            keys.insert(key.clone());
+            rewrite.files.insert(key, text);
+        }
+        rewrite.edits.extend(cleaned.lock_edits);
+        (keys, cleaned.workspace)
+    };
+    if !route.engaged {
+        // No hosted pin of this run in these locks: nothing to configure,
+        // but what an earlier run routed and no lock holds any more goes.
+        if let (true, false, Ok(existing)) =
+            (options.trust_lockfile_config, root_withheld, &workspace)
+        {
+            if let Some(pruned) = pnpm_prune(&texts, existing.as_deref(), &owned) {
+                let (keys, workspace) = put_back(rewrite, pruned);
+                route.pruned = keys;
+                if let Some(Unrouted {
+                    text,
+                    edits,
+                    created,
+                }) = workspace
+                {
+                    rewrite.files.insert(PNPM_WORKSPACE_REL.to_string(), text);
+                    rewrite.edits.extend(edits);
+                    route.emptied = created;
+                }
+            }
+        }
+        return route;
+    }
+    // A project an earlier run routed is told why it leaves the route,
+    // whatever the patch service offers now.
+    let was_routed = {
+        use crate::formats::pnpm::named_registries::holds_ours;
+        use crate::formats::pnpm::registry_alias::holds_route;
+        matches!(&workspace, Ok(Some(text)) if holds_ours(text, &owned))
+            || texts.iter().any(|(_, text)| holds_route(text, &owned))
+    };
+    match pnpm_registry_route(
+        view, &texts, &workspace, symlinked, &owned, was_routed, overrides, options, bazel,
+    ) {
+        Ok(routed) => {
+            for (key, text) in routed.locks {
+                rewrite.files.insert(key, text);
+            }
+            rewrite.edits.extend(routed.edits);
+            route.registry = Some(routed.route);
+        }
+        Err(block) => {
+            let opted_out = matches!(block, RouteBlock::OptedOut);
+            match block {
+                RouteBlock::NotEligible | RouteBlock::OptedOut => {}
+                RouteBlock::Unpinned => route.pin_hint = options.trust_lockfile_config,
+                RouteBlock::Because(why) => route.blocked = why,
+            }
+            if let (true, false, Ok(existing)) =
+                (options.trust_lockfile_config, opted_out, &workspace)
+            {
+                route.unrouted = if root_withheld {
+                    // The root lock is not written, so nothing of the
+                    // route is taken out of the file or of the other locks.
+                    was_routed.then(|| {
+                        Err(crate::hosted::guidance::PNPM_REGISTRY_ROOT_WITHHELD.to_string())
+                    })
+                } else {
+                    pnpm_unroute(view, &texts, existing.as_deref(), &owned)
+                        .map(|outcome| outcome.map(|unrouted| put_back(rewrite, unrouted).1))
+                };
+            }
+            // The project stays routed as it was (the opt-out, a workspace
+            // file that cannot be read, a lock that could not be converted
+            // back): a release it routes stays on the patch it is routed to.
+            if !matches!(route.unrouted, Some(Ok(_))) {
+                let held = hold_routed_releases(files, rewrite, &governing, &owned);
+                if !held.is_empty() {
+                    rewrite.warnings.push(warning(
+                        REDIRECT_PNPM_REGISTRY_HELD,
+                        pnpm_registry_held_detail(&held, !options.trust_lockfile_config),
+                    ));
+                }
+                // Left as it is for a Bazel hub, and nothing else to
+                // serve: no trust key. The root lock that the hub keeps out
+                // of the run is a governing lock like the others, and is
+                // read for this one question: a plain pin in it, from
+                // before the hub was there, needs the key as it did.
+                if root_withheld && matches!(route.unrouted, Some(Err(_))) {
+                    let root = read_advisory_text(view, ROOT_PNPM_LOCKS[0]);
+                    let mut left: Vec<(&str, &String)> = governing
+                        .iter()
+                        .filter_map(|key| {
+                            let text = rewrite.files.get(*key).or_else(|| files.get(*key))?;
+                            Some((*key, text))
+                        })
+                        .collect();
+                    left.extend(root.as_ref().map(|text| (ROOT_PNPM_LOCKS[0], text)));
+                    route.kept = !holds_trust_pin(&left, overrides, &owned);
+                }
+            }
+        }
+    }
+    route.workspace = Some((workspace, symlinked));
+    route
+}
+
+/// Warning code: a release the project routes through its patch's registry
+/// has a newer patch, which this run could not move it to because it does
+/// not update pnpm-workspace.yaml. The release is left on the patch it is
+/// routed to, whole.
+pub const REDIRECT_PNPM_REGISTRY_HELD: &str = "redirect_pnpm_registry_held";
+
+/// The [`REDIRECT_PNPM_REGISTRY_HELD`] detail for `releases`
+/// (`name@version`, sorted); `opted_out` under
+/// `--no-trust-lockfile-config`.
+fn pnpm_registry_held_detail(releases: &[String], opted_out: bool) -> String {
+    let (names, stays, it_is, its, it) = match releases {
+        [one] => (one.clone(), "stays", "it is", "its", "it"),
+        many => (many.join(", "), "stay", "they are", "their", "them"),
+    };
+    let why = if opted_out {
+        format!(
+            "--no-trust-lockfile-config keeps {PNPM_WORKSPACE_REL}, which names the registry, \
+             from being updated; re-run without the flag to move {it} to the newer patch"
+        )
+    } else {
+        format!(
+            "{PNPM_WORKSPACE_REL}, which names the registry, was not updated by this run; \
+             the next run that can update it moves {it} to the newer patch"
+        )
+    };
+    format!(
+        "{names} {stays} on the patch {it_is} routed to: {its} newer patch is served from \
+         another registry, and {why}"
     )
+}
+
+/// Put back the resolution of every release a governing lock keys by a
+/// registry of ours and whose resolution the rewriters changed in this
+/// run, for a run that leaves the project routed as it was. The registry
+/// in the key, the override and the workspace file's declaration are the
+/// old patch's: a new patch's tarball under them is one that registry does
+/// not vouch for, so pnpm refuses the lock, and its next resolve fetches
+/// the old patch again. The release stays on the patch it is routed to,
+/// and is not confirmed. Returns the releases held (`name@version`).
+fn hold_routed_releases(
+    files: &BTreeMap<String, String>,
+    rewrite: &mut RewriteResult,
+    governing: &[&str],
+    owned: &crate::formats::pnpm::named_registries::Owned,
+) -> Vec<String> {
+    use crate::formats::pnpm::registry_alias::{AliasPin, OverrideLock, Pinned};
+    use crate::formats::pnpm::PnpmLock;
+
+    let mut held: BTreeSet<String> = BTreeSet::new();
+    for key in governing {
+        let (Some(before), Some(after)) = (files.get(*key), rewrite.files.get(*key)) else {
+            continue;
+        };
+        let Ok(mut lock) = OverrideLock::parse(after, owned) else {
+            continue;
+        };
+        let was = PnpmLock::parse(before);
+        let mut here: Vec<String> = Vec::new();
+        for pin in lock.aliased() {
+            let entry = format!("{}@{}:{}", pin.name, pin.alias, pin.version);
+            let Some(resolution) = was
+                .packages()
+                .iter()
+                .find(|package| package.key == entry)
+                .and_then(|package| package.resolution.as_ref())
+            else {
+                continue;
+            };
+            let (Some(tarball), Some(integrity)) = (resolution.tarball(), resolution.integrity())
+            else {
+                continue;
+            };
+            let restored = lock.pin(&AliasPin {
+                name: &pin.name,
+                version: &pin.version,
+                alias: &pin.alias,
+                integrity,
+                tarball,
+            });
+            if matches!(restored, Ok(Pinned::Rewritten { .. })) {
+                here.push(pin.key());
+            }
+        }
+        if here.is_empty() || lock.finish().is_err() {
+            continue;
+        }
+        match lock.render() {
+            Some(text) if text != *before => {
+                rewrite.files.insert((*key).to_string(), text);
+            }
+            _ => {
+                rewrite.files.remove(*key);
+            }
+        }
+        rewrite.edits.retain(|edit| {
+            !(edit.path == *key
+                && edit.kind == "redirect_pnpm_resolution"
+                && edit.key.as_deref().is_some_and(|instance| {
+                    here.iter().any(|release| {
+                        instance
+                            .strip_prefix(release.as_str())
+                            .is_some_and(|rest| rest.is_empty() || rest.starts_with('('))
+                    })
+                }))
+        });
+        held.extend(here);
+    }
+    held.into_iter().collect()
+}
+
+/// Whether hosted mode routed the pnpm project at `project_root` through
+/// the patch server's named registry, or left something of that route
+/// behind: the workspace file holds an entry of ours, or a lock keys a
+/// release by a registry of ours or records an override of ours (the root
+/// lock, or a member's own in a workspace that keeps one lock per member).
+/// A caller asks before it decides what to read and lock; what is ours is
+/// settled when the route is ([`pnpm_route`]).
+///
+/// Asked by every command that may tidy a route, of projects that mostly
+/// never had one, so it reads as little as answers: the workspace file
+/// first, which settles it for a routed project; the root lock only then;
+/// the members' locks, listed once, only where the workspace keeps one
+/// lock per member; and no lock is parsed unless its bytes name a route.
+pub async fn pnpm_route_present(project_root: &std::path::Path) -> bool {
+    use crate::formats::pnpm::named_registries::{holds_ours, Owned};
+    use crate::formats::pnpm::registry_alias::holds_route;
+    use crate::utils::fs::read_regular_to_string;
+    use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
+
+    let workspace = read_regular_to_string(&project_root.join(PNPM_WORKSPACE_REL))
+        .await
+        .ok();
+    let owned = Owned::of(workspace.as_deref(), &|_| true);
+    if workspace
+        .as_deref()
+        .is_some_and(|text| holds_ours(text, &owned))
+    {
+        return true;
+    }
+    let root_lock = read_regular_to_string(&project_root.join(ROOT_PNPM_LOCKS[0])).await;
+    if root_lock.is_ok_and(|lock| holds_route(&lock, &owned)) {
+        return true;
+    }
+    // Without a workspace file there are no members to list.
+    if workspace.is_none() {
+        return false;
+    }
+    let view = ProjectView::Disk(project_root);
+    let listing = member_locks(&view).await;
+    matches!(listing, MemberLocks::PerMember(_))
+        && member_lock_holds_route(&view, &listing, &owned).await
+}
+
+/// The registry route, planned: the governing locks it changes, the edits
+/// that make them, and the workspace file's.
+struct Routed {
+    locks: Vec<(String, String)>,
+    edits: Vec<FileEdit>,
+    route: RegistryRoute,
+}
+
+/// Plan the registry route over the governing locks (`texts`, by key, as
+/// the rewriters left them), or say why the run stays on `trustLockfile`
+/// (see [`pnpm_route`]). Nothing is written here.
+#[allow(clippy::too_many_arguments)]
+fn pnpm_registry_route(
+    view: &ProjectView<'_>,
+    texts: &[(&str, String)],
+    workspace: &std::io::Result<Option<String>>,
+    symlinked: bool,
+    owned: &crate::formats::pnpm::named_registries::Owned,
+    was_routed: bool,
+    overrides: &[DepOverride],
+    options: &RewriteOptions<'_>,
+    bazel: &crate::bazel::pnpm::Hubs,
+) -> Result<Routed, RouteBlock> {
+    use crate::formats::pnpm::named_registries::{self, HostedOverride, Plan, Wanted};
+    use crate::formats::pnpm::registry_alias::{AliasPin, OverrideLock, Pinned};
+    use crate::formats::pnpm::workspace::is_keyless;
+    use crate::hosted::guidance::RoutedPin;
+
+    if !texts
+        .iter()
+        .all(|(_, text)| pnpm_lock_version_major(text) == Some(9))
+    {
+        return Err(RouteBlock::NotEligible);
+    }
+    let because =
+        |subject: &str, why: String| RouteBlock::Because(vec![format!("{subject} {why}")]);
+    // The hosted tarballs of each lock, each with the registry it is routed
+    // through: the one this run's grant names, or, for a release an earlier
+    // run routed that this run was not granted, the one the workspace file
+    // already declares for it ([`kept_route`]).
+    let listed = workspace
+        .as_ref()
+        .ok()
+        .and_then(|text| text.as_deref())
+        .map(|text| named_registries::routes(text, owned))
+        .unwrap_or_default();
+    let mut pins: Vec<(&str, Vec<RoutedPin>)> = Vec::new();
+    let mut kept: BTreeMap<String, String> = BTreeMap::new();
+    let mut unserved: Vec<String> = Vec::new();
+    // Pins on a patch mirror: no registry serves a mirrored tarball
+    // ([`crate::patch::redirect::grant::npm_registry_url`]).
+    let mut mirrored: Vec<String> = Vec::new();
+    for (key, text) in texts {
+        let hosted = pnpm_hosted_pins(text, overrides).map_err(|why| because(key, why))?;
+        let mut routed = hosted.routed;
+        for pin in hosted.unserved {
+            match kept_route(&pin, &listed) {
+                Some((alias, route)) => {
+                    // The registry keeps its name, unless an unreleased
+                    // build gave it: that one is renamed like a granted
+                    // pin's.
+                    if named_registries::is_current_alias(&alias) {
+                        kept.insert(route.uuid.clone(), alias);
+                    }
+                    routed.push(route);
+                }
+                None if crate::origin::on_mirror(&pin.tarball, &options.patch_server_origins) => {
+                    mirrored.push(pin.release())
+                }
+                None => unserved.push(pin.release()),
+            }
+        }
+        pins.push((*key, routed));
+    }
+    for names in [&mut unserved, &mut mirrored] {
+        names.sort();
+        names.dedup();
+    }
+    // No pin has an address: the patch service offers this project no
+    // route (or the locks hold no hosted tarball), and the run is today's.
+    // Unless an earlier run routed the project: it leaves the route, and
+    // is told what for.
+    if pins.iter().all(|(_, routed)| routed.is_empty()) && !was_routed {
+        return Err(RouteBlock::NotEligible);
+    }
+    let mut blocked = Vec::new();
+    if !unserved.is_empty() {
+        blocked.push(pnpm_registry_unserved_reason(&unserved));
+    }
+    if !mirrored.is_empty() {
+        blocked.push(crate::hosted::guidance::pnpm_registry_mirrored_reason(
+            &mirrored,
+        ));
+    }
+    let pinned = pnpm_route_pins(view);
+    if pinned == RegistryRoutePins::NotProven {
+        blocked.push(
+            "the project's pnpm pins (package.json `packageManager`, \
+             `devEngines.packageManager`, `engines.pnpm`, and the installed \
+             node_modules/.modules.yaml) do not prove pnpm 11.20 or later"
+                .to_string(),
+        );
+    }
+    // What the Bazel workspace says of these locks. A lock that a rules_js
+    // hub reads keeps the pin the Bazel legs build
+    // ([`crate::bazel::pnpm::Reader`]). And where a hub keeps the root lock
+    // out of the run, the locks that were read are not routed either,
+    // whatever was read of the hub: the overrides would have to be
+    // recorded in the root lock too, and it is not written. Said only
+    // here, to a project the patch service offers the route to.
+    match (&bazel.reader, &bazel.hidden) {
+        (Some(reader), _) => {
+            blocked.push(crate::hosted::guidance::pnpm_registry_bazel_reason(reader))
+        }
+        (None, Some(_)) => {
+            blocked.push(crate::hosted::guidance::PNPM_REGISTRY_BAZEL_WITHHELD.to_string())
+        }
+        (None, None) => {}
+    }
+    if !blocked.is_empty() {
+        return Err(RouteBlock::Because(blocked));
+    }
+    if pins.iter().all(|(_, routed)| routed.is_empty()) {
+        return Err(RouteBlock::NotEligible);
+    }
+    if pinned == RegistryRoutePins::Unpinned {
+        return Err(RouteBlock::Unpinned);
+    }
+    let existing = match workspace {
+        Ok(existing) => existing.as_deref(),
+        Err(e) => {
+            return Err(because(
+                PNPM_WORKSPACE_REL,
+                format!("could not be read ({e})"),
+            ))
+        }
+    };
+    // A keyless file the lock was installed from as a multi-package
+    // workspace: only pnpm <= 10.4 reads one that way, and the root-only
+    // scaffold would drop those members (#1096).
+    if !symlinked && existing.is_some_and(is_keyless) && lock_lists_members(view) {
+        return Err(because(
+            PNPM_WORKSPACE_REL,
+            "has no keys while pnpm-lock.yaml lists workspace members".to_string(),
+        ));
+    }
+    let names: BTreeSet<&str> = pins
+        .iter()
+        .flat_map(|(_, routed)| routed.iter().map(|pin| pin.name.as_str()))
+        .collect();
+    if let Some(why) =
+        existing.and_then(|text| named_registries::competing_override(text, owned, &names))
+    {
+        return Err(because(PNPM_WORKSPACE_REL, why));
+    }
+
+    if let Some(release) = release_with_two_patches(&pins) {
+        return Err(RouteBlock::Because(vec![format!(
+            "the pnpm locks pin {release} to more than one patch, and an override routes \
+             a package version to one registry"
+        )]));
+    }
+    // Each patch's registry, under its name: the one the file already
+    // routes a release this run was not granted through, else the name
+    // the patch's UUID gives it among the project's patches.
+    let uuids: BTreeSet<&str> = pins
+        .iter()
+        .flat_map(|(_, routed)| routed.iter().map(|pin| pin.uuid.as_str()))
+        .collect();
+    let mut wanted = Wanted::default();
+    let mut alias_of: BTreeMap<&str, String> = BTreeMap::new();
+    for pin in pins.iter().flat_map(|(_, routed)| routed) {
+        if alias_of.contains_key(pin.uuid.as_str()) {
+            continue;
+        }
+        let alias = match kept.get(&pin.uuid) {
+            Some(alias) => alias.clone(),
+            None => owned.name_for(&pin.uuid, &uuids).ok_or_else(|| {
+                because(
+                    PNPM_WORKSPACE_REL,
+                    format!(
+                        "already declares registries of its own under every name the \
+                         registry of {}@{} could take",
+                        pin.name, pin.version
+                    ),
+                )
+            })?,
+        };
+        wanted.registries.insert(alias.clone(), pin.address.clone());
+        alias_of.insert(pin.uuid.as_str(), alias);
+    }
+
+    // The locks, in the shape pnpm writes for the overrides.
+    let mut locks = Vec::new();
+    let mut edits = Vec::new();
+    let mut all: BTreeMap<String, HostedOverride> = BTreeMap::new();
+    for ((key, text), (_, routed)) in texts.iter().zip(&pins) {
+        let mut lock = OverrideLock::parse(text, owned).map_err(|why| because(key, why))?;
+        for pin in routed {
+            let alias = &alias_of[pin.uuid.as_str()];
+            let route = HostedOverride {
+                name: pin.name.clone(),
+                version: pin.version.clone(),
+                alias: alias.clone(),
+            };
+            let release = route.key();
+            let pinned = lock
+                .pin(&AliasPin {
+                    name: &pin.name,
+                    version: &pin.version,
+                    alias,
+                    integrity: &pin.integrity,
+                    tarball: &pin.tarball,
+                })
+                .map_err(|why| because(key, why))?;
+            match pinned {
+                Pinned::InPlace => {}
+                Pinned::Absent => {
+                    return Err(because(
+                        key,
+                        format!("holds {release} under a key the registry routing cannot move"),
+                    ))
+                }
+                Pinned::Rewritten { from } => edits.push(FileEdit {
+                    path: (*key).to_string(),
+                    kind: REDIRECT_PNPM_REGISTRY_ALIAS_EDIT_KIND.into(),
+                    action: "rewritten".into(),
+                    key: Some(release.clone()),
+                    original: Some(serde_json::Value::String(from)),
+                    new: Some(serde_json::Value::String(format!(
+                        "{}@{}",
+                        pin.name,
+                        route.value()
+                    ))),
+                }),
+            }
+            if all.get(&release).is_some_and(|other| *other != route) {
+                return Err(RouteBlock::Because(vec![format!(
+                    "the pnpm locks pin {release} to different patches"
+                )]));
+            }
+            wanted.route(&route);
+            all.insert(release, route);
+        }
+        lock.finish().map_err(|why| because(key, why))?;
+        // A release the lock keys by a registry of ours without a hosted
+        // tarball to show for it is no pin of this run.
+        if let Some(stray) = lock
+            .aliased()
+            .into_iter()
+            .find(|pin| !all.contains_key(&pin.key()))
+        {
+            return Err(because(
+                key,
+                format!(
+                    "routes {} through `{}` without a hosted tarball of this run",
+                    stray.key(),
+                    stray.alias
+                ),
+            ));
+        }
+        locks.push((*key, lock));
+    }
+    // pnpm records the workspace file's overrides in every lock it
+    // governs, a member's own lock that holds no patched package included.
+    let all: Vec<HostedOverride> = all.into_values().collect();
+    for (key, lock) in &mut locks {
+        let before = lock.overrides();
+        lock.set_overrides(&all);
+        edits.extend(lock_override_edits(key, &before, &lock.overrides()));
+    }
+
+    // The file the two maps go into: the project's, less the trust key an
+    // earlier run provably wrote (when the file may be written at all).
+    let untrusted = existing
+        .filter(|_| options.trust_lockfile_config)
+        .and_then(strip_cli_trust);
+    let trust = match (
+        &untrusted,
+        existing.map(|text| plan_workspace_trust(Some(text))),
+    ) {
+        (Some(_), _) => TrustLeftover::Removed,
+        (None, Some(TrustPlan::AlreadyTrue)) => TrustLeftover::Left,
+        (None, _) => TrustLeftover::None,
+    };
+    let plan = named_registries::plan(untrusted.as_deref().or(existing), &wanted, owned);
+    if let Plan::Unsupported(why) = plan {
+        return Err(because(PNPM_WORKSPACE_REL, why));
+    }
+    if !options.trust_lockfile_config && plan != Plan::InSync {
+        return Err(RouteBlock::OptedOut);
+    }
+    Ok(Routed {
+        locks: locks
+            .into_iter()
+            .filter_map(|(key, lock)| Some((key.to_string(), lock.render()?)))
+            .collect(),
+        edits,
+        route: RegistryRoute {
+            plan,
+            trust,
+            also_locked: also_locked_in_range(texts, &all),
+        },
+    })
+}
+
+/// The routed releases (`routed`) a governing lock (`texts`) also holds
+/// another release of on the default registry, newer and within the routed
+/// release's caret range (the same major, or the same minor below 1.0):
+/// `(name, version, the other versions)`, sorted. The override that routes
+/// `name@version` applies to every dependency whose range admits that
+/// version, which a lock does not record for a transitive dependent, so
+/// the dependent locked on such a release may move to the patched one when
+/// pnpm next resolves.
+fn also_locked_in_range(
+    texts: &[(&str, String)],
+    routed: &[crate::formats::pnpm::named_registries::HostedOverride],
+) -> Vec<(String, String, Vec<String>)> {
+    use crate::formats::pnpm::{pnpm_registry_key, range_admits, PnpmDocument, PnpmLock};
+
+    let mut found: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for (_, text) in texts {
+        let lock = PnpmLock::parse(text);
+        for package in lock.packages_of(PnpmDocument::Project) {
+            let Some((name, version)) = pnpm_registry_key(package.key) else {
+                continue;
+            };
+            if routed
+                .iter()
+                .any(|pin| pin.name == name && pin.version == version)
+            {
+                continue;
+            }
+            for pin in routed.iter().filter(|pin| pin.name == name) {
+                if range_admits(&format!("^{}", pin.version), version) == Some(true) {
+                    found
+                        .entry((pin.name.clone(), pin.version.clone()))
+                        .or_default()
+                        .insert(version.to_string());
+                }
+            }
+        }
+    }
+    found
+        .into_iter()
+        .map(|((name, version), others)| (name, version, others.into_iter().collect()))
+        .collect()
+}
+
+/// A release an earlier run routed, kept on its route by a run that was not
+/// granted it: a scan of part of a project, or any grant for fewer patches
+/// than the locks pin, says nothing about the others, and must not put the
+/// whole lock back on `trustLockfile`.
+///
+/// The release keeps the registry the files already route it through, with
+/// its name and address as written. That holds when the lock keys it by a
+/// registry of ours (`pin.registry`), the workspace file routes it
+/// (`listed`: its overrides of ours, each with the address of the registry
+/// it names), and that address is the directory the pin's tarball is
+/// served from. The registry is answered under the name the workspace file
+/// gives it: where the lock spells another (a key respelled from an
+/// unreleased build's name, [`respell_earlier_route`]), the route settles
+/// on one. A pin this run WAS granted without an address is never kept:
+/// the grant says the patch service serves it no registry.
+fn kept_route(
+    pin: &crate::hosted::guidance::UnservedPin,
+    listed: &[(
+        crate::formats::pnpm::named_registries::HostedOverride,
+        String,
+    )],
+) -> Option<(String, crate::hosted::guidance::RoutedPin)> {
+    use crate::formats::pnpm::named_registries::Address;
+
+    if pin.granted {
+        return None;
+    }
+    pin.registry.as_deref()?;
+    let (route, address) = listed
+        .iter()
+        .find(|(route, _)| route.name == pin.name && route.version == pin.version)?;
+    Address::serves(address, &pin.tarball).then_some(())?;
+    Some((
+        route.alias.clone(),
+        crate::hosted::guidance::RoutedPin {
+            name: pin.name.clone(),
+            version: pin.version.clone(),
+            integrity: pin.integrity.clone(),
+            tarball: pin.tarball.clone(),
+            uuid: Address::parse(address)?.uuid,
+            address: address.clone(),
+        },
+    ))
+}
+
+/// The release (`name@version`) the hosted pins of the governing locks pin
+/// to two different patches, if any. An override routes a package version
+/// to one registry, and each registry serves one patch, so such a project
+/// is not routed.
+fn release_with_two_patches(
+    pins: &[(&str, Vec<crate::hosted::guidance::RoutedPin>)],
+) -> Option<String> {
+    let mut patches: BTreeMap<(&str, &str), &str> = BTreeMap::new();
+    pins.iter()
+        .flat_map(|(_, routed)| routed)
+        .find(|pin| {
+            let patch = patches
+                .entry((pin.name.as_str(), pin.version.as_str()))
+                .or_insert(pin.uuid.as_str());
+            *patch != pin.uuid
+        })
+        .map(|pin| format!("{}@{}", pin.name, pin.version))
+}
+
+/// The edits behind a change of a pnpm lock's `overrides:` section
+/// (`before` → `after`, as `(key, value)` entries).
+fn lock_override_edits(
+    lock: &str,
+    before: &[(String, String)],
+    after: &[(String, String)],
+) -> Vec<FileEdit> {
+    let value = |entries: &[(String, String)], key: &str| {
+        entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, value)| value.clone())
+    };
+    let keys: BTreeSet<&str> = before
+        .iter()
+        .chain(after)
+        .map(|(key, _)| key.as_str())
+        .collect();
+    keys.into_iter()
+        .filter_map(|key| {
+            let (from, to) = (value(before, key), value(after, key));
+            let action = match (&from, &to) {
+                (None, Some(_)) => "added",
+                (Some(_), None) => "removed",
+                (Some(from), Some(to)) if from != to => "rewritten",
+                _ => return None,
+            };
+            Some(FileEdit {
+                path: lock.to_string(),
+                kind: REDIRECT_PNPM_LOCK_OVERRIDE_EDIT_KIND.into(),
+                action: action.into(),
+                key: Some(key.to_string()),
+                original: from.map(serde_json::Value::String),
+                new: to.map(serde_json::Value::String),
+            })
+        })
+        .collect()
+}
+
+/// What taking a registry route (or what is left of one) out of a project
+/// changes.
+pub(crate) struct Cleaned {
+    pub(crate) locks: Vec<(String, String)>,
+    pub(crate) lock_edits: Vec<FileEdit>,
+    /// The workspace file without the route's entries; `None` when it
+    /// holds none of them.
+    pub(crate) workspace: Option<Unrouted>,
+}
+
+/// pnpm-workspace.yaml (`existing`) keeping, of the registry route, only
+/// what the governing locks still key (`routed`). A rewrite only carries
+/// writes, so a file the route created is written back as its `packages`
+/// scaffold (the one the trust key goes after), and [`Unrouted::created`]
+/// tells the caller, which deletes the file when nothing else goes into it
+/// ([`Rewritten::pnpm_workspace_emptied`]).
+fn workspace_without_route(
+    existing: &str,
+    owned: &crate::formats::pnpm::named_registries::Owned,
+    routed: &[crate::formats::pnpm::named_registries::HostedOverride],
+) -> Option<Unrouted> {
+    use crate::formats::pnpm::named_registries::{self, Plan, Unwound, Wanted};
+    use crate::formats::pnpm::workspace::PACKAGES_SCAFFOLD;
+
+    let mut created = false;
+    let (text, changes) = match named_registries::unwind(existing, owned, routed) {
+        Unwound::Unchanged => return None,
+        Unwound::Rewrite(text, changes) => (text, changes),
+        Unwound::Delete => {
+            created = true;
+            let eol = if existing.contains("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let scaffold = PACKAGES_SCAFFOLD
+                .iter()
+                .map(|line| format!("{line}{eol}"))
+                .collect();
+            let changes = match named_registries::plan(Some(existing), &Wanted::default(), owned) {
+                Plan::Edit(_, changes) => changes,
+                _ => Vec::new(),
+            };
+            (scaffold, changes)
+        }
+    };
+    Some(Unrouted {
+        text,
+        edits: workspace_route_edits(changes, false).collect(),
+        created,
+    })
+}
+
+/// Put a project an earlier run routed through the patch server's
+/// registry back on the plain shape, for a run that stays on
+/// `trustLockfile`: every governing lock (`texts`) loses its registry
+/// keys and its record of the overrides, and pnpm-workspace.yaml
+/// (`existing`) the route's entries. A direct dependency's specifier
+/// comes back from the importer's package.json, the only place that still
+/// has it.
+///
+/// `None` when nothing of a route is there; `Err` (why) leaves locks and
+/// file as they are, since half of the route would not install.
+fn pnpm_unroute(
+    view: &ProjectView<'_>,
+    texts: &[(&str, String)],
+    existing: Option<&str>,
+    owned: &crate::formats::pnpm::named_registries::Owned,
+) -> Option<Result<Cleaned, String>> {
+    use crate::formats::pnpm::named_registries;
+    use crate::formats::pnpm::registry_alias::{manifest_specifier, names_a_route, OverrideLock};
+
+    let mut locks: Vec<(&str, OverrideLock)> = Vec::new();
+    for (key, text) in texts {
+        match OverrideLock::parse(text, owned) {
+            Ok(lock) => locks.push((*key, lock)),
+            // A lock these edits cannot read may still key a release by a
+            // registry of ours: with the route gone from the workspace
+            // file beside it, it would not install.
+            Err(why) if names_a_route(text) => return Some(Err(format!("{key} {why}"))),
+            Err(_) => {}
+        }
+    }
+    let routed = locks.iter().any(|(_, lock)| lock.holds_route());
+    if !routed && !existing.is_some_and(|text| named_registries::holds_ours(text, owned)) {
+        return None;
+    }
+    let mut lock_edits = Vec::new();
+    for (key, lock) in &mut locks {
+        let dir = key.rfind('/').map_or("", |at| &key[..=at]);
+        let specifier = |importer: &str, name: &str| {
+            let importer = match importer {
+                "." => String::new(),
+                nested => format!("{nested}/"),
+            };
+            let manifest = read_advisory_text(view, &format!("{dir}{importer}package.json"))?;
+            manifest_specifier(&manifest, name)
+        };
+        let before = lock.overrides();
+        let moved = match lock.unpin(&|_| true, &specifier).and_then(|moved| {
+            lock.finish()?;
+            Ok(moved)
+        }) {
+            Ok(moved) => moved,
+            Err(why) => return Some(Err(format!("{key} {why}"))),
+        };
+        lock.set_overrides(&[]);
+        lock_edits.extend(moved.into_iter().map(|pin| FileEdit {
+            path: (*key).to_string(),
+            kind: REDIRECT_PNPM_REGISTRY_ALIAS_EDIT_KIND.into(),
+            action: "rewritten".into(),
+            key: Some(pin.key()),
+            original: Some(serde_json::Value::String(format!(
+                "{}@{}",
+                pin.name,
+                pin.value()
+            ))),
+            new: Some(serde_json::Value::String(pin.key())),
+        }));
+        lock_edits.extend(lock_override_edits(key, &before, &lock.overrides()));
+    }
+    Some(Ok(Cleaned {
+        locks: locks
+            .into_iter()
+            .filter_map(|(key, lock)| Some((key.to_string(), lock.render()?)))
+            .collect(),
+        lock_edits,
+        workspace: existing.and_then(|text| workspace_without_route(text, owned, &[])),
+    }))
+}
+
+/// Take out what is left of a registry route that no governing lock
+/// (`texts`) references any more: an override of ours for a release no
+/// lock keys by a registry of ours (in the workspace file and in each
+/// lock's record of it), and a registry of ours no lock key names. For a
+/// run that touches no hosted pnpm pin, and for the commands that
+/// reconcile a project without asking the patch service
+/// ([`crate::patch::redirect::upstream::sweep_pnpm_registry_route`]): a
+/// package that left the lock, an interrupted run, a workspace file that
+/// is gone (`existing` is `None`). A release a lock still routes keeps its
+/// override and its registry as they are.
+pub(crate) fn pnpm_prune(
+    texts: &[(&str, String)],
+    existing: Option<&str>,
+    owned: &crate::formats::pnpm::named_registries::Owned,
+) -> Option<Cleaned> {
+    use crate::formats::pnpm::named_registries::HostedOverride;
+    use crate::formats::pnpm::registry_alias::{names_a_route, OverrideLock};
+
+    // A lock these edits cannot read may still key a release by a registry
+    // of ours, or record an override of ours: everything stays.
+    let unread = |text: &String| OverrideLock::parse(text, owned).is_err() && names_a_route(text);
+    if texts.iter().any(|(_, text)| unread(text)) {
+        return None;
+    }
+    let mut locks: Vec<(&str, OverrideLock)> = texts
+        .iter()
+        .filter_map(|(key, text)| Some((*key, OverrideLock::parse(text, owned).ok()?)))
+        .collect();
+    let routed: BTreeSet<HostedOverride> =
+        locks.iter().flat_map(|(_, lock)| lock.aliased()).collect();
+    let routed: Vec<HostedOverride> = routed.into_iter().collect();
+    let stale = |pin: &HostedOverride| !routed.iter().any(|kept| kept.key() == pin.key());
+    let workspace = existing.and_then(|text| workspace_without_route(text, owned, &routed));
+    let orphaned = workspace.is_some()
+        || locks
+            .iter()
+            .any(|(_, lock)| lock.routed_overrides().iter().any(stale));
+    if !orphaned {
+        return None;
+    }
+    let mut lock_edits = Vec::new();
+    for (key, lock) in &mut locks {
+        let before = lock.overrides();
+        lock.prune_overrides(&|pin| !stale(pin));
+        lock_edits.extend(lock_override_edits(key, &before, &lock.overrides()));
+    }
+    Some(Cleaned {
+        locks: locks
+            .into_iter()
+            .filter_map(|(key, lock)| Some((key.to_string(), lock.render()?)))
+            .collect(),
+        lock_edits,
+        workspace,
+    })
 }
 
 /// The trust detail for a settings file (`file`) that already carries
@@ -3902,6 +5572,17 @@ fn pnpm_trust_env_set_detail(server: &str, source: &str) -> String {
          the variable or set it to `true` wherever the project installs, or re-run \
          the scan with `--mode vendored`. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
         pnpm_trust_policy_preamble(server),
+    )
+}
+
+/// What the project's pnpm pins say about the registry route's floor (see
+/// [`crate::formats::pnpm::registry_route_pins`]), read from the files
+/// [`root_only_workspace_breaks_add`] reads.
+fn pnpm_route_pins(view: &ProjectView<'_>) -> RegistryRoutePins {
+    let read = |rel: &str| read_advisory_text(view, rel);
+    crate::formats::pnpm::registry_route_pins(
+        read(crate::hosted::memory::select::NPM_MANIFEST_REL).as_deref(),
+        read("node_modules/.modules.yaml").as_deref(),
     )
 }
 
@@ -4789,6 +6470,7 @@ mod tests {
             token: GRANT.into(),
             patch_uuid: PATCH_UUID.into(),
             artifact_url,
+            npm_registry_url: None,
             registry_override: None,
             integrity: crate::patch::redirect::Integrity::default(),
         }
@@ -5681,6 +7363,7 @@ mod tests {
                 artifact_url:
                     "https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/uuid/left-pad-1.3.0.tgz"
                         .into(),
+                npm_registry_url: None,
                 registry_override: None,
                 integrity: Integrity::default(),
             },
@@ -5729,6 +7412,7 @@ mod tests {
                 token: "tok".into(),
                 patch_uuid: "uuid".into(),
                 artifact_url: url.into(),
+                npm_registry_url: None,
                 registry_override: None,
                 integrity: Integrity::default(),
             },
@@ -5784,6 +7468,7 @@ mod tests {
                 token: "tok".into(),
                 patch_uuid: "uuid".into(),
                 artifact_url: url.into(),
+                npm_registry_url: None,
                 registry_override: None,
                 integrity: Integrity {
                     yarn_berry10c0: Some(format!("10c0/{}", "7".repeat(128))),
@@ -5865,6 +7550,7 @@ mod tests {
                 token: FIXTURE_TOKEN.into(),
                 patch_uuid: FIXTURE_UUID.into(),
                 artifact_url: left_pad_url(),
+                npm_registry_url: None,
                 registry_override: None,
                 integrity: Integrity {
                     sha512: Some("sha512-PATCHED==".into()),
@@ -6551,6 +8237,2932 @@ snapshots:
         }
     }
 
+    // ── pnpm named registry ──────────────────────────────────────────────
+
+    /// The names of the registries of the fixtures' patches: `socket-` and
+    /// the first eight digits of each patch's UUID.
+    const LEFT_PAD_ALIAS: &str = "socket-77777777";
+    const IS_NUMBER_ALIAS: &str = "socket-88888888";
+
+    /// The registry address of the patch served at `tarball`: the
+    /// directory the tarball is in.
+    fn registry_address(tarball: &str) -> String {
+        tarball[..=tarball.rfind('/').expect("a tarball URL")].to_string()
+    }
+
+    /// The address the reference result of the left-pad patch carries.
+    fn left_pad_registry_url() -> String {
+        registry_address(&left_pad_url())
+    }
+
+    /// [`left_pad_candidate`] as a patch service that serves registry
+    /// documents grants it.
+    fn left_pad_registry_candidate() -> Candidate {
+        let mut candidate = left_pad_candidate();
+        candidate.dep.npm_registry_url = Some(left_pad_registry_url());
+        candidate
+    }
+
+    const IS_NUMBER_UUID: &str = "88888888-8888-4888-8888-888888888888";
+
+    fn is_number_url() -> String {
+        format!(
+            "https://patch.test/patch/npm/is-number/7.0.0/{FIXTURE_TOKEN}/{IS_NUMBER_UUID}/is-number-7.0.0.tgz"
+        )
+    }
+
+    /// A second pin of the same lock; `registry` as the patch service
+    /// gives it a registry address or not.
+    fn is_number_candidate(registry: bool) -> Candidate {
+        let mut candidate = left_pad_candidate();
+        candidate.purl = "pkg:npm/is-number@7.0.0".into();
+        candidate.dep.name = "is-number".into();
+        candidate.dep.version = "7.0.0".into();
+        candidate.dep.patch_uuid = IS_NUMBER_UUID.into();
+        candidate.dep.artifact_url = is_number_url();
+        candidate.dep.npm_registry_url = registry.then(|| registry_address(&is_number_url()));
+        candidate
+    }
+
+    const TWO_PACKAGE_V9_LOCK: &str = "lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      is-number:
+        specifier: 7.0.0
+        version: 7.0.0
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+
+packages:
+  is-number@7.0.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+
+snapshots:
+  is-number@7.0.0: {}
+
+  left-pad@1.3.0: {}
+";
+
+    /// The workspace file's declaration of the registry `alias` of the
+    /// patch served at `tarball`.
+    fn registry_line(alias: &str, tarball: &str) -> String {
+        format!("  {alias}: {}", registry_address(tarball))
+    }
+
+    fn left_pad_registry_line() -> String {
+        registry_line(LEFT_PAD_ALIAS, &left_pad_url())
+    }
+
+    fn is_number_registry_line() -> String {
+        registry_line(IS_NUMBER_ALIAS, &is_number_url())
+    }
+
+    /// The override that routes the left-pad release to its registry, as
+    /// pnpm-workspace.yaml holds it.
+    const LEFT_PAD_OVERRIDE: &str = "  'left-pad@1.3.0': 'socket-77777777:1.3.0'";
+    const IS_NUMBER_OVERRIDE: &str = "  'is-number@7.0.0': 'socket-88888888:7.0.0'";
+
+    /// The workspace file a registry run creates for the left-pad pin.
+    fn left_pad_routed_workspace() -> String {
+        format!(
+            "packages:\n  - '.'\nnamedRegistries:\n{}\noverrides:\n{LEFT_PAD_OVERRIDE}\n",
+            left_pad_registry_line()
+        )
+    }
+
+    /// The workspace file a registry run creates for both pins.
+    fn two_package_routed_workspace() -> String {
+        format!(
+            "packages:\n  - '.'\nnamedRegistries:\n{}\n{}\noverrides:\n{IS_NUMBER_OVERRIDE}\n{LEFT_PAD_OVERRIDE}\n",
+            left_pad_registry_line(),
+            is_number_registry_line()
+        )
+    }
+
+    /// [`LEFT_PAD_V9_LOCK`] as pnpm writes it for that workspace file.
+    fn left_pad_routed_lock() -> String {
+        format!(
+            "lockfileVersion: '9.0'\n\noverrides:\n  left-pad@1.3.0: {LEFT_PAD_ALIAS}:1.3.0\n\n\
+             importers:\n  .:\n    dependencies:\n      left-pad:\n        \
+             specifier: {LEFT_PAD_ALIAS}:1.3.0\n        version: {LEFT_PAD_ALIAS}:1.3.0\n\n\
+             packages:\n  left-pad@{LEFT_PAD_ALIAS}:1.3.0:\n    \
+             resolution: {{integrity: sha512-PATCHED==, tarball: {}}}\n\n\
+             snapshots:\n  left-pad@{LEFT_PAD_ALIAS}:1.3.0: {{}}\n",
+            left_pad_url()
+        )
+    }
+
+    /// [`TWO_PACKAGE_V9_LOCK`] with both releases routed.
+    fn two_package_routed_lock() -> String {
+        format!(
+            "lockfileVersion: '9.0'\n\noverrides:\n  is-number@7.0.0: {IS_NUMBER_ALIAS}:7.0.0\n  \
+             left-pad@1.3.0: {LEFT_PAD_ALIAS}:1.3.0\n\n\
+             importers:\n  .:\n    dependencies:\n      is-number:\n        \
+             specifier: {IS_NUMBER_ALIAS}:7.0.0\n        version: {IS_NUMBER_ALIAS}:7.0.0\n      left-pad:\n        \
+             specifier: {LEFT_PAD_ALIAS}:1.3.0\n        version: {LEFT_PAD_ALIAS}:1.3.0\n\n\
+             packages:\n  is-number@{IS_NUMBER_ALIAS}:7.0.0:\n    \
+             resolution: {{integrity: sha512-PATCHED==, tarball: {}}}\n\n  left-pad@{LEFT_PAD_ALIAS}:1.3.0:\n    \
+             resolution: {{integrity: sha512-PATCHED==, tarball: {}}}\n\n\
+             snapshots:\n  is-number@{IS_NUMBER_ALIAS}:7.0.0: {{}}\n\n  left-pad@{LEFT_PAD_ALIAS}:1.3.0: {{}}\n",
+            is_number_url(),
+            left_pad_url()
+        )
+    }
+
+    /// A manifest that proves a pnpm hosted mode routes patched packages
+    /// through the registry for, and says what the project asks for.
+    const PNPM_12_MANIFEST: &str = r#"{"name":"app","packageManager":"pnpm@12.22.0","dependencies":{"left-pad":"1.3.0","is-number":"7.0.0"}}"#;
+
+    /// A project pinned to pnpm 12 whose root lock is `lock`.
+    fn pnpm12_project(lock: &str) -> MemoryProject {
+        let mut project = MemoryProject::new();
+        project.insert_text("pnpm-lock.yaml", lock);
+        project.insert_text("package.json", PNPM_12_MANIFEST);
+        project
+    }
+
+    /// One pnpm rewrite of `view` for `candidates`: `config` is the trust
+    /// auto-config switch (`--no-trust-lockfile-config` turns it off).
+    async fn pnpm_rewrite(
+        view: &ProjectView<'_>,
+        candidates: &[Candidate],
+        config: bool,
+        dry_run: bool,
+        env: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+    ) -> Rewritten {
+        pnpm_rewrite_from(view, candidates, config, dry_run, env, Vec::new()).await
+    }
+
+    /// [`pnpm_rewrite`] for a run configured with `origins`: its patch
+    /// server and, as a mirror's entry, its patch mirror.
+    async fn pnpm_rewrite_from(
+        view: &ProjectView<'_>,
+        candidates: &[Candidate],
+        config: bool,
+        dry_run: bool,
+        env: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        origins: Vec<String>,
+    ) -> Rewritten {
+        let read = read_candidate_files(view, &BTreeSet::new(), candidates).await;
+        pnpm_rewrite_read(view, read, candidates, config, dry_run, env, origins).await
+    }
+
+    /// [`pnpm_rewrite_from`] over files that were read already.
+    #[allow(clippy::too_many_arguments)]
+    async fn pnpm_rewrite_read(
+        view: &ProjectView<'_>,
+        read: CandidateFiles,
+        candidates: &[Candidate],
+        config: bool,
+        dry_run: bool,
+        env: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        origins: Vec<String>,
+    ) -> Rewritten {
+        let outer = OuterAllowRemote::default;
+        let options = RewriteOptions {
+            dry_run,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: config,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
+            maven_selection: &no_maven_selection,
+            pnpm_env: env,
+            blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: origins,
+            prior_discovery: None,
+        };
+        rewrite(view, read, candidates, BTreeMap::new(), options).await
+    }
+
+    /// The default run over an in-memory project.
+    async fn registry_rewrite(project: &MemoryProject, candidates: &[Candidate]) -> Rewritten {
+        pnpm_rewrite(
+            &ProjectView::Memory(project),
+            candidates,
+            true,
+            false,
+            &no_env,
+        )
+        .await
+    }
+
+    fn workspace_of(done: &Rewritten) -> Option<&str> {
+        done.rewrite
+            .files
+            .get(PNPM_WORKSPACE_REL)
+            .map(String::as_str)
+    }
+
+    fn lock_of(done: &Rewritten) -> Option<&str> {
+        done.rewrite.files.get("pnpm-lock.yaml").map(String::as_str)
+    }
+
+    /// `(kind, action, key)` of each edit of `path`.
+    fn edits_of<'d>(done: &'d Rewritten, path: &str) -> Vec<(&'d str, &'d str, Option<&'d str>)> {
+        done.rewrite
+            .edits
+            .iter()
+            .filter(|e| e.path == path)
+            .map(|e| (e.kind.as_str(), e.action.as_str(), e.key.as_deref()))
+            .collect()
+    }
+
+    fn workspace_edits(done: &Rewritten) -> Vec<(&str, &str, Option<&str>)> {
+        edits_of(done, PNPM_WORKSPACE_REL)
+    }
+
+    /// `project` as the run left it: its files with the rewritten ones on
+    /// top.
+    fn after(project: &MemoryProject, done: &Rewritten) -> MemoryProject {
+        let mut next = project.clone();
+        for (rel, text) in &done.rewrite.files {
+            next.insert_text(rel.as_str(), text.as_str());
+        }
+        next
+    }
+
+    /// The trust detail with `note` where a note goes: before the reinstall
+    /// advice.
+    fn noted(detail: &str, note: &str) -> String {
+        let noted = detail.replacen(
+            "After a lock-only change,",
+            &format!("{note}. After a lock-only change,"),
+            1,
+        );
+        assert_ne!(noted, detail);
+        noted
+    }
+
+    /// What a trust warning says of the registry route it did not take.
+    fn blocked(why: &str) -> String {
+        format!(
+            "Per-package registry verification was not set up because {why}; the hosted \
+             patches rely on `trustLockfile` instead"
+        )
+    }
+
+    const NOT_PROVEN: &str = "the project's pnpm pins (package.json `packageManager`, \
+                              `devEngines.packageManager`, `engines.pnpm`, and the installed \
+                              node_modules/.modules.yaml) do not prove pnpm 11.20 or later";
+
+    /// The candidates a scan is granted for a `pnpm-registry-overrides`
+    /// golden case; `registry` as the patch service gives them a registry
+    /// address or not.
+    fn golden_candidates(case: &str, registry: bool) -> Vec<Candidate> {
+        use crate::formats::pnpm::registry_alias::fixtures;
+        use crate::patch::redirect::Integrity;
+        fixtures::patches(case)
+            .into_iter()
+            .map(|patch| {
+                let (namespace, name) = match patch.name.split_once('/') {
+                    Some((scope, name)) => (Some(scope.to_string()), name.to_string()),
+                    None => (None, patch.name.clone()),
+                };
+                Candidate {
+                    purl: format!(
+                        "pkg:npm/{}@{}",
+                        patch.name.replace('@', "%40"),
+                        patch.version
+                    ),
+                    dep: DepOverride {
+                        ecosystem: "npm".into(),
+                        name,
+                        namespace,
+                        version: patch.version,
+                        token: "22222222-2222-4222-8222-222222222222".into(),
+                        patch_uuid: patch.uuid,
+                        artifact_url: patch.artifact_url,
+                        npm_registry_url: registry.then_some(patch.npm_registry_url),
+                        registry_override: None,
+                        integrity: Integrity {
+                            sha512: Some(patch.sha512),
+                            ..Default::default()
+                        },
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// A golden case's project, as pnpm locked it before any patch, with
+    /// the install record of a pnpm the registry route is taken for. On
+    /// disk: a workspace's members are found there.
+    fn golden_project(case: &str) -> tempfile::TempDir {
+        use crate::formats::pnpm::registry_alias::fixtures;
+        let project = tempfile::tempdir().unwrap();
+        for (rel, text) in fixtures::project(case) {
+            write_rel(project.path(), &rel, &text);
+        }
+        write_rel(
+            project.path(),
+            "node_modules/.modules.yaml",
+            "packageManager: pnpm@12.22.0\n",
+        );
+        project
+    }
+
+    /// Write what a run rewrote.
+    fn commit(root: &std::path::Path, done: &Rewritten) {
+        for (rel, text) in &done.rewrite.files {
+            write_rel(root, rel, text);
+        }
+    }
+
+    async fn golden_rewrite(root: &std::path::Path, candidates: &[Candidate]) -> Rewritten {
+        pnpm_rewrite(&ProjectView::Disk(root), candidates, true, false, &no_env).await
+    }
+
+    /// The locks of a golden case, each as `(path, pnpm's routed lock)`.
+    fn golden_locks(case: &str) -> Vec<(String, String)> {
+        use crate::formats::pnpm::registry_alias::fixtures;
+        fixtures::locks(case)
+            .into_iter()
+            .map(|rel| {
+                let lock = fixtures::read(case, &format!("expected/{rel}")).expect("a lock");
+                (rel, lock)
+            })
+            .collect()
+    }
+
+    /// THE GOLDEN GATE: for every project real pnpm locked, the scan writes
+    /// the pnpm-lock.yaml files and the pnpm-workspace.yaml that pnpm 11.20
+    /// through 12.22 produce for the routed patches, byte for byte: from an
+    /// unpatched project and from one an earlier run left on
+    /// `trustLockfile`. Every pin is confirmed and attributed, and a second
+    /// run changes nothing.
+    #[tokio::test]
+    async fn the_registry_route_writes_what_pnpm_writes() {
+        use crate::formats::pnpm::registry_alias::fixtures;
+        for case in fixtures::cases() {
+            let candidates = golden_candidates(&case, true);
+            let locks = golden_locks(&case);
+            let workspace = fixtures::read(&case, "expected/pnpm-workspace.yaml").expect("ws");
+            let users_file = fixtures::read(&case, "project/pnpm-workspace.yaml").is_some();
+            let assert_routed = |done: &Rewritten, from: &str| {
+                for (rel, lock) in &locks {
+                    assert_eq!(
+                        done.rewrite.files.get(rel).map(String::as_str),
+                        Some(lock.as_str()),
+                        "{case} {rel} ({from})"
+                    );
+                }
+                assert!(done.pnpm_named_registries, "{case} ({from})");
+                assert_eq!(done.confirmed.len(), candidates.len(), "{case} ({from})");
+                assert!(
+                    done.unattributed.is_empty(),
+                    "{case} ({from}): {:?}",
+                    done.unattributed
+                );
+            };
+
+            let fresh = golden_project(&case);
+            let done = golden_rewrite(fresh.path(), &candidates).await;
+            assert_routed(&done, "fresh");
+            assert_eq!(workspace_of(&done), Some(workspace.as_str()), "{case}");
+            assert!(
+                guard(&ProjectView::Disk(fresh.path()), &done, &candidates).is_none(),
+                "{case}"
+            );
+            let detail = pnpm_trust_detail(&done);
+            assert!(!detail.contains("trustLockfile"), "{case}: {detail}");
+            commit(fresh.path(), &done);
+            let again = golden_rewrite(fresh.path(), &candidates).await;
+            assert!(
+                again.rewrite.files.is_empty(),
+                "{case}: a second run rewrote {:?}",
+                again.rewrite.files.keys()
+            );
+            assert!(again.rewrite.edits.is_empty(), "{case}");
+            assert!(
+                again.pnpm_rerun_only && again.pnpm_named_registries,
+                "{case}"
+            );
+            assert_eq!(again.confirmed.len(), candidates.len(), "{case}");
+
+            // An earlier run on a patch service that gave no address.
+            let trusted = golden_project(&case);
+            let on_trust = golden_rewrite(trusted.path(), &golden_candidates(&case, false)).await;
+            assert!(!on_trust.pnpm_named_registries, "{case}");
+            assert!(
+                workspace_of(&on_trust).is_some_and(|text| text.contains("trustLockfile: true")),
+                "{case}"
+            );
+            commit(trusted.path(), &on_trust);
+            let done = golden_rewrite(trusted.path(), &candidates).await;
+            assert_routed(&done, "from trust");
+            if users_file {
+                // The key may be the user's: it stays, and the run says so.
+                assert_eq!(
+                    workspace_of(&done).map(|text| text.replace("trustLockfile: true\n", "")),
+                    Some(workspace.clone()),
+                    "{case} (from trust)"
+                );
+                assert!(
+                    pnpm_trust_detail(&done).contains("was left untouched"),
+                    "{case}"
+                );
+            } else {
+                assert_eq!(
+                    workspace_of(&done),
+                    Some(workspace.as_str()),
+                    "{case} (from trust)"
+                );
+                assert!(pnpm_trust_detail(&done).contains("was removed"), "{case}");
+            }
+        }
+    }
+
+    /// The shapes real pnpm does not lock as a respelling keep the run on
+    /// `trustLockfile`, exactly the run a patch service with no registry
+    /// gets, and the warning says which shape it was.
+    #[tokio::test]
+    async fn a_lock_pnpm_would_not_respell_stays_on_trust() {
+        use crate::formats::pnpm::registry_alias::fixtures;
+        for (case, why) in fixtures::refused() {
+            let project = golden_project(&case);
+            let baseline = golden_rewrite(project.path(), &golden_candidates(&case, false)).await;
+            let done = golden_rewrite(project.path(), &golden_candidates(&case, true)).await;
+            assert!(!done.pnpm_named_registries, "{case}");
+            assert_eq!(done.rewrite.files, baseline.rewrite.files, "{case}");
+            assert_eq!(done.rewrite.edits, baseline.rewrite.edits, "{case}");
+            let detail = pnpm_trust_detail(&done);
+            assert!(
+                detail.contains("Per-package registry verification was not set up because")
+                    && detail.contains(&why),
+                "{case}: {detail}"
+            );
+        }
+    }
+
+    /// Every pin of the governing lock has a registry address: the run
+    /// routes each patched release through the registry and writes no
+    /// `trustLockfile`, so pnpm's verification stays on. The warning says
+    /// so, keeps the cautions that are still true, and drops the
+    /// whole-lock tradeoff note.
+    #[tokio::test]
+    async fn patched_releases_are_routed_when_every_pin_has_an_address() {
+        let root = pnpm12_project(LEFT_PAD_V9_LOCK);
+        let candidates = [left_pad_registry_candidate()];
+        let done = registry_rewrite(&root, &candidates).await;
+        assert_eq!(lock_of(&done), Some(left_pad_routed_lock().as_str()));
+        assert_eq!(
+            workspace_of(&done),
+            Some(left_pad_routed_workspace().as_str())
+        );
+        assert_eq!(
+            workspace_edits(&done),
+            [
+                (
+                    REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                    "created",
+                    Some(LEFT_PAD_ALIAS)
+                ),
+                (
+                    REDIRECT_PNPM_WORKSPACE_OVERRIDE_EDIT_KIND,
+                    "created",
+                    Some("left-pad@1.3.0")
+                ),
+            ]
+        );
+        assert_eq!(
+            edits_of(&done, "pnpm-lock.yaml"),
+            [
+                (
+                    "redirect_pnpm_resolution",
+                    "rewritten",
+                    Some("left-pad@1.3.0")
+                ),
+                (
+                    REDIRECT_PNPM_REGISTRY_ALIAS_EDIT_KIND,
+                    "rewritten",
+                    Some("left-pad@1.3.0")
+                ),
+                (
+                    REDIRECT_PNPM_LOCK_OVERRIDE_EDIT_KIND,
+                    "added",
+                    Some("left-pad@1.3.0")
+                ),
+            ]
+        );
+        assert!(done.pnpm_named_registries);
+        assert!(!done.pnpm_rerun_only);
+        assert_eq!(done.confirmed.len(), 1);
+        assert!(guard(&ProjectView::Memory(&root), &done, &candidates).is_none());
+        let detail = pnpm_trust_detail(&done);
+        for said in [
+            "repointed at the hosted patch server (patch.test)",
+            "a new pnpm-workspace.yaml now declares the patch server's registry of each patched package",
+            "(`namedRegistries`, the `socket-<id>` entries, one per patch)",
+            "(`overrides`, `<name>@<version>` to `socket-<id>:<version>`)",
+            "pnpm >=11.20 verifies those entries against their registry",
+            "keeps them when it resolves again (`pnpm add`, `update`, `dedupe`)",
+            "commit the file alongside the lock",
+            "lockfile verification stays on",
+            "ERR_PNPM_TARBALL_URL_MISMATCH",
+            "ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION",
+            "pnpm clean --lockfile",
+            "--store-dir <new-empty-directory>",
+            "socket-patch vex",
+        ] {
+            assert!(detail.contains(said), "{said}: {detail}");
+        }
+        for unsaid in [
+            "trustLockfile",
+            "ALL lockfile entries",
+            "--trust-lockfile",
+            FIXTURE_TOKEN,
+        ] {
+            assert!(!detail.contains(unsaid), "{unsaid}: {detail}");
+        }
+
+        // A re-run over what the run wrote changes nothing.
+        let written = after(&root, &done);
+        let again = registry_rewrite(&written, &candidates).await;
+        assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.files);
+        assert!(again.rewrite.edits.is_empty(), "{:?}", again.rewrite.edits);
+        assert!(again.pnpm_rerun_only && again.pnpm_named_registries);
+        assert_eq!(again.confirmed.len(), 1);
+        let detail = pnpm_trust_detail(&again);
+        assert!(
+            detail.contains("already declares the patch server's registry"),
+            "{detail}"
+        );
+        assert!(!detail.contains("trustLockfile"), "{detail}");
+
+        // A dry run says what it would do.
+        let dry = pnpm_rewrite(
+            &ProjectView::Memory(&root),
+            &candidates,
+            true,
+            true,
+            &no_env,
+        )
+        .await;
+        assert_eq!(lock_of(&dry), lock_of(&done));
+        assert!(
+            pnpm_trust_detail(&dry)
+                .contains("a new pnpm-workspace.yaml would declare the patch server's registry"),
+            "{}",
+            pnpm_trust_detail(&dry)
+        );
+
+        // Two pins: each has its own registry, and its override names it.
+        let two = pnpm12_project(TWO_PACKAGE_V9_LOCK);
+        let done = registry_rewrite(
+            &two,
+            &[left_pad_registry_candidate(), is_number_candidate(true)],
+        )
+        .await;
+        assert_eq!(lock_of(&done), Some(two_package_routed_lock().as_str()));
+        assert_eq!(
+            workspace_of(&done),
+            Some(two_package_routed_workspace().as_str())
+        );
+    }
+
+    /// THE MIXED CASE: one pin the patch service gave no registry address
+    /// keeps the whole run on `trustLockfile`, with no `namedRegistries`
+    /// and no `overrides`, exactly as a run with no address at all; a lock
+    /// half routed would fail to install on pnpm >= 11. The warning names
+    /// the package that forced it: trust switches verification off for
+    /// every entry.
+    #[tokio::test]
+    async fn one_pin_without_an_address_keeps_the_run_on_trust_and_is_named() {
+        let root = pnpm12_project(TWO_PACKAGE_V9_LOCK);
+        let before =
+            registry_rewrite(&root, &[left_pad_candidate(), is_number_candidate(false)]).await;
+        assert_eq!(
+            workspace_of(&before),
+            Some("packages:\n  - '.'\ntrustLockfile: true\n")
+        );
+        assert!(
+            !pnpm_trust_detail(&before).contains("Per-package registry verification"),
+            "a patch service that gives no pin an address says nothing of a route"
+        );
+        let mixed = registry_rewrite(
+            &root,
+            &[left_pad_registry_candidate(), is_number_candidate(false)],
+        )
+        .await;
+        assert_eq!(mixed.rewrite.files, before.rewrite.files);
+        assert_eq!(mixed.rewrite.edits, before.rewrite.edits);
+        assert!(!mixed.pnpm_named_registries);
+        assert_eq!(
+            workspace_edits(&mixed),
+            [(
+                REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+                "created",
+                Some("trustLockfile")
+            )]
+        );
+        for text in mixed.rewrite.files.values() {
+            assert!(
+                !text.contains("namedRegistries")
+                    && !text.contains("overrides:")
+                    && !text.contains("@socket-"),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            pnpm_trust_detail(&mixed),
+            noted(
+                pnpm_trust_detail(&before),
+                &blocked("the patch service gave no registry address for is-number@7.0.0")
+            )
+        );
+
+        // A pin an earlier run left on the patch server, which this run was
+        // not granted, has no address either, and is named the same way.
+        let pinned = after(&root, &before);
+        let mut without_trust = pinned.clone();
+        without_trust.insert_text(PNPM_WORKSPACE_REL, "packages:\n  - 'apps/*'\n");
+        let one = registry_rewrite(&without_trust, &[left_pad_registry_candidate()]).await;
+        assert_eq!(
+            workspace_of(&one),
+            Some("packages:\n  - 'apps/*'\ntrustLockfile: true\n")
+        );
+        assert!(!one.pnpm_named_registries);
+        assert!(
+            pnpm_trust_detail(&one).contains(&blocked(
+                "the patch service gave no registry address for is-number@7.0.0"
+            )),
+            "{}",
+            pnpm_trust_detail(&one)
+        );
+        assert_eq!(
+            lock_of(&one),
+            None,
+            "both pins are already in the trust shape"
+        );
+    }
+
+    /// A patched release of the partial-grant fixtures: `(name, version,
+    /// patch uuid)`. Its registry is named after the first eight digits of
+    /// the patch UUID.
+    type Granted = (&'static str, &'static str, &'static str);
+    const DEBUG_RELEASE: Granted = ("debug", "4.3.4", "d0000000-0000-4000-8000-00000000000d");
+    const MS_RELEASE: Granted = ("ms", "2.1.2", "e0000000-0000-4000-8000-00000000000e");
+    const QS_RELEASE: Granted = ("qs", "6.11.0", "f0000000-0000-4000-8000-00000000000f");
+    /// The patch that supersedes [`MS_RELEASE`]'s.
+    const MS_REPLACEMENT: Granted = ("ms", "2.1.2", "c1111111-1111-4111-8111-11111111111c");
+
+    fn granted_url((name, version, uuid): Granted) -> String {
+        format!(
+            "https://patch.test/patch/npm/{name}/{version}/{FIXTURE_TOKEN}/{uuid}/{name}-{version}.tgz"
+        )
+    }
+
+    fn granted_alias((_, _, uuid): Granted) -> String {
+        format!("socket-{}", &uuid[..8])
+    }
+
+    /// The grant of `release`, with its registry address.
+    fn granted_candidate(release: Granted) -> Candidate {
+        let (name, version, uuid) = release;
+        let mut candidate = left_pad_candidate();
+        candidate.purl = format!("pkg:npm/{name}@{version}");
+        candidate.dep.name = name.into();
+        candidate.dep.version = version.into();
+        candidate.dep.patch_uuid = uuid.into();
+        candidate.dep.artifact_url = granted_url(release);
+        candidate.dep.npm_registry_url = Some(registry_address(&granted_url(release)));
+        candidate
+    }
+
+    /// A pnpm 12 project that depends on the three releases, as a hosted
+    /// scan granted all three routed it.
+    async fn three_routed_releases() -> MemoryProject {
+        let releases = [DEBUG_RELEASE, MS_RELEASE, QS_RELEASE];
+        let mut lock =
+            "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n".to_string();
+        for (name, version, ..) in releases {
+            lock.push_str(&format!(
+                "      {name}:\n        specifier: {version}\n        version: {version}\n"
+            ));
+        }
+        lock.push_str("\npackages:\n");
+        for (name, version, ..) in releases {
+            lock.push_str(&format!(
+                "  {name}@{version}:\n    resolution: {{integrity: sha512-UPSTREAM==}}\n\n"
+            ));
+        }
+        lock.push_str("snapshots:\n");
+        for (name, version, ..) in releases {
+            lock.push_str(&format!("  {name}@{version}: {{}}\n\n"));
+        }
+        let mut root = MemoryProject::new();
+        root.insert_text("pnpm-lock.yaml", lock.trim_end().to_string() + "\n");
+        root.insert_text(
+            "package.json",
+            r#"{"name":"app","packageManager":"pnpm@12.22.0","dependencies":{"debug":"4.3.4","ms":"2.1.2","qs":"6.11.0"}}"#,
+        );
+        let all = releases.map(granted_candidate);
+        let done = registry_rewrite(&root, &all).await;
+        assert!(done.pnpm_named_registries, "{:?}", done.pnpm_warnings);
+        let routed = after(&root, &done);
+        let workspace = routed.text(PNPM_WORKSPACE_REL).expect("a workspace file");
+        for release in releases {
+            assert!(
+                workspace.contains(&registry_line(
+                    &granted_alias(release),
+                    &granted_url(release)
+                )),
+                "{workspace}"
+            );
+        }
+        routed
+    }
+
+    /// A RUN GRANTED ONLY PART OF THE PROJECT'S PATCHES (a scan of one
+    /// subtree of a monorepo with one root lock, any filtered grant) leaves
+    /// the rest routed. The releases it was not granted keep the registry
+    /// the files already route them through (its name, its address, the
+    /// override), so nothing is rewritten: not a byte of the lock or of
+    /// the workspace file changes, and lockfile verification stays on.
+    #[tokio::test]
+    async fn a_run_granted_one_package_leaves_the_others_routed() {
+        let routed = three_routed_releases().await;
+        for granted in [DEBUG_RELEASE, MS_RELEASE, QS_RELEASE] {
+            let done = registry_rewrite(&routed, &[granted_candidate(granted)]).await;
+            assert!(
+                done.rewrite.files.is_empty(),
+                "{}: {:?}",
+                granted.0,
+                done.rewrite.files
+            );
+            assert!(done.rewrite.edits.is_empty(), "{:?}", done.rewrite.edits);
+            assert!(done.pnpm_named_registries, "{:?}", done.pnpm_warnings);
+            assert_eq!(done.confirmed.len(), 1);
+            let detail = pnpm_trust_detail(&done);
+            assert!(
+                !detail.contains("trustLockfile") && !detail.contains("no registry address"),
+                "{detail}"
+            );
+        }
+    }
+
+    /// A release this run was not granted that an unreleased build routed
+    /// through a registry named by the whole patch UUID stays routed, and
+    /// moves to the registry's short name with the granted one: no run
+    /// leaves an earlier name behind.
+    #[tokio::test]
+    async fn an_ungranted_release_under_an_earlier_name_is_renamed() {
+        let legacy = format!("socket-patch-{FIXTURE_UUID}");
+        let mut project =
+            pnpm12_project(&two_package_routed_lock().replace(LEFT_PAD_ALIAS, &legacy));
+        project.insert_text(
+            PNPM_WORKSPACE_REL,
+            two_package_routed_workspace().replace(LEFT_PAD_ALIAS, &legacy),
+        );
+        let granted = [is_number_candidate(true)];
+        let done = registry_rewrite(&project, &granted).await;
+        assert!(done.pnpm_named_registries, "{:?}", done.pnpm_warnings);
+        assert_eq!(lock_of(&done), Some(two_package_routed_lock().as_str()));
+        // The renamed registry goes after the one that stays.
+        assert_eq!(
+            workspace_of(&done),
+            Some(
+                format!(
+                    "packages:\n  - '.'\nnamedRegistries:\n{}\n{}\noverrides:\n{IS_NUMBER_OVERRIDE}\n{LEFT_PAD_OVERRIDE}\n",
+                    is_number_registry_line(),
+                    left_pad_registry_line()
+                )
+                .as_str()
+            )
+        );
+        let again = registry_rewrite(&after(&project, &done), &granted).await;
+        assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.files);
+    }
+
+    /// The same partial run with a patch that supersedes the granted
+    /// package's: only that package changes. Its registry is the new
+    /// patch's, under the new patch's name, so its override, its lock keys
+    /// and its tarball move to it and the replaced patch's registry goes;
+    /// the other two releases, their overrides and their registries are
+    /// byte for byte.
+    #[tokio::test]
+    async fn a_run_granted_one_replaced_patch_changes_only_that_package() {
+        let routed = three_routed_releases().await;
+        let done = registry_rewrite(&routed, &[granted_candidate(MS_REPLACEMENT)]).await;
+        assert!(done.pnpm_named_registries, "{:?}", done.pnpm_warnings);
+        let (old, new) = (granted_alias(MS_RELEASE), granted_alias(MS_REPLACEMENT));
+        assert_eq!(
+            lock_of(&done),
+            Some(
+                routed
+                    .text("pnpm-lock.yaml")
+                    .unwrap()
+                    .replace(&granted_url(MS_RELEASE), &granted_url(MS_REPLACEMENT))
+                    .replace(&format!("{old}:"), &format!("{new}:"))
+                    .as_str()
+            )
+        );
+        // The replaced patch's registry line goes and the new patch's is
+        // added after the registries that stay; nothing else of the file
+        // moves.
+        let before = routed.text(PNPM_WORKSPACE_REL).unwrap();
+        let expected = before
+            .replace(
+                &format!("{}\n", registry_line(&old, &granted_url(MS_RELEASE))),
+                "",
+            )
+            .replace(
+                "overrides:\n",
+                &format!(
+                    "{}\noverrides:\n",
+                    registry_line(&new, &granted_url(MS_REPLACEMENT))
+                ),
+            )
+            .replace(&format!("'{old}:2.1.2'"), &format!("'{new}:2.1.2'"));
+        assert_eq!(workspace_of(&done), Some(expected.as_str()));
+        assert_eq!(
+            workspace_edits(&done),
+            [
+                (
+                    REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                    "removed",
+                    Some(old.as_str())
+                ),
+                (
+                    REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                    "added",
+                    Some(new.as_str())
+                ),
+                (
+                    REDIRECT_PNPM_WORKSPACE_OVERRIDE_EDIT_KIND,
+                    "rewritten",
+                    Some("ms@2.1.2")
+                ),
+            ]
+        );
+        // A re-run of the same partial grant changes nothing.
+        let again =
+            registry_rewrite(&after(&routed, &done), &[granted_candidate(MS_REPLACEMENT)]).await;
+        assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.files);
+    }
+
+    /// THE GENUINE FALLBACK of a partial run: a routed release the run was
+    /// not granted that the files no longer route (its registry's line is
+    /// gone, or declared somewhere its tarball is not served from) has no
+    /// address from anywhere. The project goes back to `trustLockfile`
+    /// whole, and the warning names that release alone: the other
+    /// ungranted release, still routed by the files, is not what forced
+    /// it. A release this run WAS granted without an address is never kept
+    /// either: the grant says the patch service serves it no registry.
+    #[tokio::test]
+    async fn an_ungranted_release_the_files_do_not_route_goes_back_to_trust() {
+        let routed = three_routed_releases().await;
+        let workspace = routed.text(PNPM_WORKSPACE_REL).unwrap();
+        let qs_line = format!(
+            "{}\n",
+            registry_line(&granted_alias(QS_RELEASE), &granted_url(QS_RELEASE))
+        );
+        for unrouted in [
+            // The registry's declaration is gone.
+            workspace.replace(&qs_line, ""),
+            // The override that routes the release is gone.
+            workspace.replace("  'qs@6.11.0': 'socket-f0000000:6.11.0'\n", ""),
+        ] {
+            assert_ne!(unrouted, workspace);
+            let mut project = routed.clone();
+            project.insert_text(PNPM_WORKSPACE_REL, unrouted.clone());
+            let done = registry_rewrite(&project, &[granted_candidate(DEBUG_RELEASE)]).await;
+            assert!(!done.pnpm_named_registries, "{unrouted}");
+            let written = workspace_of(&done).expect("the workspace file is rewritten");
+            assert!(
+                written.contains("trustLockfile: true") && !written.contains("socket-"),
+                "{written}"
+            );
+            let lock = lock_of(&done).expect("the lock is put back");
+            assert!(
+                !lock.contains("@socket-") && !lock.contains("overrides:"),
+                "{lock}"
+            );
+            for release in [DEBUG_RELEASE, MS_RELEASE, QS_RELEASE] {
+                assert!(lock.contains(&granted_url(release)), "{lock}");
+            }
+            let detail = pnpm_trust_detail(&done);
+            assert!(
+                detail.contains(&blocked(
+                    "the patch service gave no registry address for qs@6.11.0"
+                )),
+                "{detail}"
+            );
+            assert!(!detail.contains("ms@2.1.2"), "{detail}");
+        }
+
+        // Granted, with no address: the grant overrules what the files route.
+        let mut no_address = granted_candidate(MS_RELEASE);
+        no_address.dep.npm_registry_url = None;
+        let done = registry_rewrite(&routed, &[no_address]).await;
+        assert!(!done.pnpm_named_registries);
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains(&blocked(
+                "the patch service gave no registry address for ms@2.1.2"
+            )),
+            "{detail}"
+        );
+    }
+
+    /// The base of the patch mirror of the mirror tests.
+    const MIRROR_BASE: &str = "https://repo.example/artifactory/socket-patch";
+
+    /// `candidates` as a run given `--patch-mirror-url` holds them: each
+    /// tarball moved onto the mirror.
+    fn onto_the_mirror(candidates: Vec<Candidate>, origins: &[String]) -> Vec<Candidate> {
+        let mirror = crate::patch::redirect::mirror::PatchMirror::parse(MIRROR_BASE).unwrap();
+        let (mut skipped, mut warnings) = (Vec::new(), Vec::new());
+        let (mirrored, _) =
+            mirror_candidates(candidates, &mirror, origins, &mut skipped, &mut warnings);
+        assert!(skipped.is_empty() && warnings.is_empty(), "{warnings:?}");
+        mirrored
+    }
+
+    /// A PATCH MIRROR. A run given `--patch-mirror-url` pins each tarball
+    /// on the mirror. The registry address of the grant stays the patch
+    /// server's, whose document names the tarball there, so the mirrored
+    /// tarball is no file of it: the pin has no registry, and the project
+    /// takes `trustLockfile` exactly as before the registry route existed,
+    /// with nothing said of registries.
+    #[tokio::test]
+    async fn a_pin_on_a_patch_mirror_has_no_registry_and_stays_on_trust() {
+        let origins = vec![
+            "https://patch.test".to_string(),
+            crate::origin::mirror_entry(MIRROR_BASE),
+        ];
+        let mirrored = onto_the_mirror(vec![left_pad_registry_candidate()], &origins);
+        let dep = &mirrored[0].dep;
+        assert!(dep.artifact_url.starts_with(MIRROR_BASE), "{dep:?}");
+        assert_eq!(
+            dep.npm_registry_url.as_deref(),
+            Some(left_pad_registry_url().as_str()),
+            "the address is the patch server's, as granted"
+        );
+        assert_eq!(crate::patch::redirect::grant::npm_registry_url(dep), None);
+
+        let root = pnpm12_project(LEFT_PAD_V9_LOCK);
+        let done = pnpm_rewrite_from(
+            &ProjectView::Memory(&root),
+            &mirrored,
+            true,
+            false,
+            &no_env,
+            origins.clone(),
+        )
+        .await;
+        assert!(!done.pnpm_named_registries, "{:?}", done.pnpm_warnings);
+        assert_eq!(done.confirmed.len(), 1);
+        assert_eq!(
+            workspace_of(&done),
+            Some("packages:\n  - '.'\ntrustLockfile: true\n")
+        );
+        let lock = lock_of(&done).expect("the lock");
+        assert!(
+            lock.contains(&format!("tarball: {}", dep.artifact_url))
+                && lock.contains("\n  left-pad@1.3.0:\n")
+                && !lock.contains("overrides:"),
+            "{lock}"
+        );
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            !detail.contains("registry verification") && !detail.contains("namedRegistries"),
+            "{detail}"
+        );
+    }
+
+    /// TURNING A MIRROR ON over a project an earlier run routed: the pins
+    /// move onto the mirror, where no registry serves them, so the run
+    /// takes the whole route out and the project is byte for byte the one
+    /// a mirror run makes from scratch. The registries it removes are on
+    /// the patch server, which the run still knows for one: as its
+    /// configured server, or, when only the mirror was configured, from
+    /// the registry address its grant carries. The warning names the
+    /// mirror as what kept the project off the route.
+    #[tokio::test]
+    async fn turning_a_patch_mirror_on_takes_a_routed_project_off_the_route() {
+        let root = pnpm12_project(LEFT_PAD_V9_LOCK);
+        let routed = registry_rewrite(&root, &[left_pad_registry_candidate()]).await;
+        assert!(routed.pnpm_named_registries);
+        let routed = after(&root, &routed);
+        for server in ["https://patch.test", "https://patch.socket.dev"] {
+            let origins = vec![server.to_string(), crate::origin::mirror_entry(MIRROR_BASE)];
+            let mirrored = onto_the_mirror(vec![left_pad_registry_candidate()], &origins);
+            let rewrite = |project: MemoryProject| {
+                let (mirrored, origins) = (mirrored.clone(), origins.clone());
+                async move {
+                    pnpm_rewrite_from(
+                        &ProjectView::Memory(&project),
+                        &mirrored,
+                        true,
+                        false,
+                        &no_env,
+                        origins,
+                    )
+                    .await
+                }
+            };
+            let fresh = rewrite(root.clone()).await;
+            let done = rewrite(routed.clone()).await;
+            assert!(!done.pnpm_named_registries, "{server}");
+            assert_eq!(done.confirmed.len(), 1, "{server}");
+            assert_eq!(lock_of(&done), lock_of(&fresh), "{server}");
+            assert_eq!(
+                workspace_of(&done),
+                Some("packages:\n  - '.'\ntrustLockfile: true\n"),
+                "{server}"
+            );
+            let detail = pnpm_trust_detail(&done);
+            assert!(
+                detail.contains(
+                    "Per-package registry verification was not set up because the patch \
+                     mirror serves no registry for left-pad@1.3.0"
+                ) && !detail.contains("gave no registry address"),
+                "{server}: {detail}"
+            );
+            let removed: Vec<(&'static str, String)> =
+                crate::hosted::guidance::pnpm_registry_entries_removed(&done.rewrite.edits)
+                    .into_iter()
+                    .map(|entry| (entry.kind.as_str(), entry.key))
+                    .collect();
+            assert!(
+                removed.contains(&("registry", LEFT_PAD_ALIAS.to_string()))
+                    && removed.contains(&("override", "left-pad@1.3.0".to_string())),
+                "{server}: {removed:?}"
+            );
+            let again = rewrite(after(&routed, &done)).await;
+            assert!(again.rewrite.files.is_empty(), "{server}");
+        }
+    }
+
+    /// A run with a mirror configured that is granted nothing still tidies
+    /// what a departed package left of a route: the registry is on the
+    /// configured patch server, not under the mirror's base, and is the
+    /// CLI's as before. A registry of the same shape that a person
+    /// declared on the mirror's host is not on a patch server, and stays.
+    #[tokio::test]
+    async fn a_run_with_a_patch_mirror_still_tidies_a_route() {
+        const PLAIN: &str = "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      \
+             is-number:\n        specifier: 7.0.0\n        version: 7.0.0\n\npackages:\n  \
+             is-number@7.0.0:\n    resolution: {integrity: sha512-UPSTREAM==}\n\n\
+             snapshots:\n  is-number@7.0.0: {}\n";
+        let origins = vec![
+            "https://patch.test".to_string(),
+            crate::origin::mirror_entry(MIRROR_BASE),
+        ];
+        let users = format!(
+            "  socket-99999999: {MIRROR_BASE}/patch/npm/x/1.0.0/{FIXTURE_TOKEN}/99999999-9999-4999-8999-999999999999/\n"
+        );
+        let mut project = pnpm12_project(&PLAIN.replace(
+            "importers:\n",
+            &format!("overrides:\n  left-pad@1.3.0: {LEFT_PAD_ALIAS}:1.3.0\n\nimporters:\n"),
+        ));
+        project.insert_text(
+            PNPM_WORKSPACE_REL,
+            format!(
+                "packages:\n  - 'apps/*'\nnamedRegistries:\n{users}{}\noverrides:\n{LEFT_PAD_OVERRIDE}\n",
+                left_pad_registry_line()
+            ),
+        );
+        let done = pnpm_rewrite_from(
+            &ProjectView::Memory(&project),
+            &[],
+            true,
+            false,
+            &no_env,
+            origins,
+        )
+        .await;
+        assert_eq!(
+            workspace_of(&done),
+            Some(format!("packages:\n  - 'apps/*'\nnamedRegistries:\n{users}").as_str())
+        );
+        assert_eq!(lock_of(&done), Some(PLAIN));
+    }
+
+    /// A run that leaves the route takes it out of every governing lock
+    /// and of the workspace file together, or not at all. A lock the
+    /// route's edits cannot read (mixed line endings here) still keys its
+    /// release by the registry: stripping the registry and the override
+    /// from the workspace file beside it would leave a lock pnpm cannot
+    /// install. The project stays routed, and the warning says the lock
+    /// could not be converted back and why.
+    #[tokio::test]
+    async fn a_lock_the_edits_cannot_read_keeps_the_route_it_still_uses() {
+        let root = pnpm12_project(LEFT_PAD_V9_LOCK);
+        let routed = registry_rewrite(&root, &[left_pad_registry_candidate()]).await;
+        assert!(routed.pnpm_named_registries);
+        let mut project = after(&root, &routed);
+        let mixed = left_pad_routed_lock().replacen('\n', "\r\n", 1);
+        project.insert_text("pnpm-lock.yaml", mixed.as_str());
+
+        // The grant lost its registry address: the run leaves the route.
+        let done = registry_rewrite(&project, &[left_pad_candidate()]).await;
+        let workspace = workspace_of(&done).unwrap_or(&routed.rewrite.files[PNPM_WORKSPACE_REL]);
+        for kept in [left_pad_registry_line().as_str(), LEFT_PAD_OVERRIDE] {
+            assert!(workspace.contains(kept), "{kept}:\n{workspace}");
+        }
+        assert_eq!(lock_of(&done), None, "the lock is left as it is");
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("could not be converted back")
+                && detail.contains("mixes CRLF and LF line endings"),
+            "{detail}"
+        );
+    }
+
+    /// THE MIXED CASE ON A RE-RUN: a project in registry mode whose next
+    /// scan has a pin without an address goes back to trust whole, in that
+    /// run: every registry key of the lock back to the plain one, the
+    /// lock's record of the overrides and both maps of the workspace file
+    /// gone. What is left is byte for byte the project a trust run makes.
+    #[tokio::test]
+    async fn a_routed_project_goes_back_to_trust_when_a_pin_loses_its_address() {
+        let root = pnpm12_project(TWO_PACKAGE_V9_LOCK);
+        let trust =
+            registry_rewrite(&root, &[left_pad_candidate(), is_number_candidate(false)]).await;
+        let routed = registry_rewrite(
+            &root,
+            &[left_pad_registry_candidate(), is_number_candidate(true)],
+        )
+        .await;
+        assert!(routed.pnpm_named_registries);
+        let routed = after(&root, &routed);
+
+        let candidates = [left_pad_registry_candidate(), is_number_candidate(false)];
+        let done = registry_rewrite(&routed, &candidates).await;
+        assert!(!done.pnpm_named_registries);
+        assert_eq!(lock_of(&done), lock_of(&trust));
+        assert_eq!(
+            workspace_of(&done),
+            Some("packages:\n  - '.'\ntrustLockfile: true\n")
+        );
+        assert_eq!(done.confirmed.len(), 2);
+        assert_eq!(
+            workspace_edits(&done),
+            [
+                (
+                    REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                    "removed",
+                    Some(LEFT_PAD_ALIAS)
+                ),
+                (
+                    REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                    "removed",
+                    Some(IS_NUMBER_ALIAS)
+                ),
+                (
+                    REDIRECT_PNPM_WORKSPACE_OVERRIDE_EDIT_KIND,
+                    "removed",
+                    Some("is-number@7.0.0")
+                ),
+                (
+                    REDIRECT_PNPM_WORKSPACE_OVERRIDE_EDIT_KIND,
+                    "removed",
+                    Some("left-pad@1.3.0")
+                ),
+                (
+                    REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+                    "added",
+                    Some("trustLockfile")
+                ),
+            ]
+        );
+        assert_eq!(
+            edits_of(&done, "pnpm-lock.yaml"),
+            [
+                (
+                    REDIRECT_PNPM_REGISTRY_ALIAS_EDIT_KIND,
+                    "rewritten",
+                    Some("is-number@7.0.0")
+                ),
+                (
+                    REDIRECT_PNPM_REGISTRY_ALIAS_EDIT_KIND,
+                    "rewritten",
+                    Some("left-pad@1.3.0")
+                ),
+                (
+                    REDIRECT_PNPM_LOCK_OVERRIDE_EDIT_KIND,
+                    "removed",
+                    Some("is-number@7.0.0")
+                ),
+                (
+                    REDIRECT_PNPM_LOCK_OVERRIDE_EDIT_KIND,
+                    "removed",
+                    Some("left-pad@1.3.0")
+                ),
+            ]
+        );
+        let detail = pnpm_trust_detail(&done);
+        for said in [
+            blocked("the patch service gave no registry address for is-number@7.0.0"),
+            "An earlier run routed the hosted patches through a named registry".to_string(),
+            "those entries were removed and the lockfile keys that named the registry put back"
+                .to_string(),
+            "`trustLockfile: true` was merged into".to_string(),
+        ] {
+            assert!(detail.contains(&said), "{said}: {detail}");
+        }
+        // What is left is a trust project: a re-run changes nothing.
+        let back = after(&routed, &done);
+        let again = registry_rewrite(&back, &candidates).await;
+        assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.files);
+        assert!(!pnpm_trust_detail(&again).contains("An earlier run"));
+
+        // A dry run reports the same removals, and the engine writes
+        // nothing either way.
+        let dry = pnpm_rewrite(
+            &ProjectView::Memory(&routed),
+            &candidates,
+            true,
+            true,
+            &no_env,
+        )
+        .await;
+        assert_eq!(dry.rewrite.files, done.rewrite.files);
+        assert_eq!(dry.rewrite.edits, done.rewrite.edits);
+        assert!(
+            pnpm_trust_detail(&dry).contains("those entries would be removed"),
+            "{}",
+            pnpm_trust_detail(&dry)
+        );
+
+        // A user's file keeps its own lines, with the trust key after them.
+        let users = "packages:\n  - 'apps/*'\nnamedRegistries:\n  corp: https://npm.corp.example/\noverrides:\n  lodash: ^4.17.21\n";
+        let mut users_project = pnpm12_project(TWO_PACKAGE_V9_LOCK);
+        users_project.insert_text(PNPM_WORKSPACE_REL, users);
+        let users_routed = after(
+            &users_project,
+            &registry_rewrite(
+                &users_project,
+                &[left_pad_registry_candidate(), is_number_candidate(true)],
+            )
+            .await,
+        );
+        let done = registry_rewrite(&users_routed, &candidates).await;
+        assert_eq!(
+            workspace_of(&done),
+            Some(format!("{users}trustLockfile: true\n").as_str())
+        );
+        assert_eq!(lock_of(&done), lock_of(&trust));
+    }
+
+    /// `--no-trust-lockfile-config` keeps the workspace file from being
+    /// written, and a lock in the routed shape installs only with the
+    /// file's overrides: the run stays on the trust path, exactly as one
+    /// with no address. A project already routed needs no write and is
+    /// left routed.
+    #[tokio::test]
+    async fn the_opt_out_keeps_an_unrouted_project_on_trust() {
+        let root = pnpm12_project(LEFT_PAD_V9_LOCK);
+        let opted_out = |project: MemoryProject, candidate: Candidate| async move {
+            pnpm_rewrite(
+                &ProjectView::Memory(&project),
+                &[candidate],
+                false,
+                false,
+                &no_env,
+            )
+            .await
+        };
+        let done = opted_out(root.clone(), left_pad_registry_candidate()).await;
+        let plain = opted_out(root.clone(), left_pad_candidate()).await;
+        assert_eq!(done.rewrite.files, plain.rewrite.files);
+        assert_eq!(done.rewrite.edits, plain.rewrite.edits);
+        assert_eq!(done.pnpm_warnings, plain.pnpm_warnings);
+        assert_eq!(workspace_of(&done), None);
+        assert!(!done.pnpm_named_registries);
+        assert!(pnpm_trust_detail(&done).contains("pnpm install --trust-lockfile"));
+        assert!(!lock_of(&done).is_some_and(|lock| lock.contains("@socket-")));
+
+        // Routed by an earlier run: nothing to write, nothing to undo.
+        let routed = after(
+            &root,
+            &registry_rewrite(&root, &[left_pad_registry_candidate()]).await,
+        );
+        let again = opted_out(routed.clone(), left_pad_registry_candidate()).await;
+        assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.files);
+        assert!(again.pnpm_rerun_only && again.pnpm_named_registries);
+        assert!(pnpm_trust_detail(&again).contains("already declares"));
+        // A routed project the opted-out run can no longer keep routed (the
+        // grant has no address now) is left as it is: the file is not the
+        // run's to edit, and the lock goes with the file.
+        let stuck = opted_out(routed, left_pad_candidate()).await;
+        assert!(stuck.rewrite.files.is_empty(), "{:?}", stuck.rewrite.files);
+        assert!(!stuck.pnpm_named_registries);
+    }
+
+    /// `--no-trust-lockfile-config` and a routed release whose patch was
+    /// superseded. The new patch has a registry of its own, which the run
+    /// may not declare: the file is not its to edit. Repointing the lock
+    /// entry alone would leave the old patch's registry key, override and
+    /// declaration over the new patch's tarball, which pnpm refuses to
+    /// install (the registry does not vouch for it) and undoes at its next
+    /// resolve. The release stays on the patch it is routed to, whole: no
+    /// file changes, the new patch is not confirmed, and the run says how
+    /// to move it.
+    #[tokio::test]
+    async fn the_opt_out_leaves_a_routed_release_on_the_patch_it_is_routed_to() {
+        const NEXT: &str = "66666666-6666-4666-8666-666666666666";
+        let root = pnpm12_project(LEFT_PAD_V9_LOCK);
+        let routed = after(
+            &root,
+            &registry_rewrite(&root, &[left_pad_registry_candidate()]).await,
+        );
+        let mut next = left_pad_registry_candidate();
+        next.dep.patch_uuid = NEXT.into();
+        next.dep.artifact_url = left_pad_url().replace(FIXTURE_UUID, NEXT);
+        next.dep.npm_registry_url = Some(registry_address(&next.dep.artifact_url));
+        for dry_run in [true, false] {
+            let done = pnpm_rewrite(
+                &ProjectView::Memory(&routed),
+                std::slice::from_ref(&next),
+                false,
+                dry_run,
+                &no_env,
+            )
+            .await;
+            assert!(
+                done.rewrite.files.is_empty(),
+                "dry_run={dry_run}: {:?}",
+                done.rewrite.files
+            );
+            assert!(done.rewrite.edits.is_empty(), "{:?}", done.rewrite.edits);
+            assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+            let held: Vec<&str> = done
+                .rewrite
+                .warnings
+                .iter()
+                .filter(|w| w.code == REDIRECT_PNPM_REGISTRY_HELD)
+                .map(|w| w.detail.as_str())
+                .collect();
+            assert_eq!(
+                held,
+                [
+                    "left-pad@1.3.0 stays on the patch it is routed to: its newer patch is served \
+                  from another registry, and --no-trust-lockfile-config keeps \
+                  pnpm-workspace.yaml, which names the registry, from being updated; re-run \
+                  without the flag to move it to the newer patch"
+                ],
+                "dry_run={dry_run}"
+            );
+        }
+        // Without the opt-out the same grant moves the release.
+        let moved = registry_rewrite(&routed, &[next]).await;
+        assert!(lock_of(&moved).is_some_and(|lock| lock.contains(NEXT)));
+        assert_eq!(moved.confirmed.len(), 1);
+    }
+
+    /// A workspace file hosted mode created holds nothing of the user's.
+    /// When a run takes the route back out of it, what is left is the
+    /// file's `packages` scaffold, and that is no file of the user's
+    /// either: the run plans the project's settings as for a project with
+    /// no workspace file. For a project now pinned to pnpm 9.0 to 10.4,
+    /// which never read `trustLockfile` and refuse `pnpm add` in a
+    /// root-only workspace, that means no file at all: the scaffold is
+    /// written back bare and flagged for deletion, never topped up with a
+    /// key those releases do not read.
+    #[tokio::test]
+    async fn leaving_the_route_does_not_keep_the_file_the_route_created() {
+        let candidates = [left_pad_registry_candidate()];
+        let root = pnpm12_project(LEFT_PAD_V9_LOCK);
+        let first = registry_rewrite(&root, &candidates).await;
+        assert_eq!(
+            workspace_of(&first),
+            Some(left_pad_routed_workspace().as_str()),
+            "the route creates the file"
+        );
+        let routed = after(&root, &first);
+
+        // Pinned to a pnpm that reads no `trustLockfile`.
+        let mut older = routed.clone();
+        older.insert_text(
+            "package.json",
+            r#"{"name":"app","dependencies":{"left-pad":"1.3.0"},"packageManager":"pnpm@10.2.0"}"#,
+        );
+        let done = registry_rewrite(&older, &candidates).await;
+        assert!(!done.pnpm_named_registries);
+        assert_eq!(
+            workspace_of(&done),
+            Some("packages:\n  - '.'\n"),
+            "nothing is added to what the route created"
+        );
+        assert!(
+            done.pnpm_workspace_emptied,
+            "the created file is the caller's to delete"
+        );
+        let lock = lock_of(&done).expect("the lock, back in the plain shape");
+        assert!(
+            lock.contains("\n  left-pad@1.3.0:\n") && !lock.contains("overrides:"),
+            "{lock}"
+        );
+        assert!(
+            pnpm_trust_detail(&done).contains("does not read `trustLockfile`"),
+            "{}",
+            pnpm_trust_detail(&done)
+        );
+
+        // Pinned to a pnpm that needs the key: the file is the one a
+        // trust run creates, and it is not flagged.
+        let mut gated = routed.clone();
+        gated.insert_text(
+            "package.json",
+            r#"{"name":"app","dependencies":{"left-pad":"1.3.0"},"packageManager":"pnpm@11.10.0"}"#,
+        );
+        let done = registry_rewrite(&gated, &candidates).await;
+        assert_eq!(
+            workspace_of(&done),
+            Some("packages:\n  - '.'\ntrustLockfile: true\n")
+        );
+        assert!(!done.pnpm_workspace_emptied);
+
+        // A file of the user's keeps its bytes and gets the key, whatever
+        // the pin: it is theirs, and is never deleted.
+        let users = "packages:\n  - 'apps/*'\n";
+        let mut owned = pnpm12_project(LEFT_PAD_V9_LOCK);
+        owned.insert_text(PNPM_WORKSPACE_REL, users);
+        let mut routed = after(&owned, &registry_rewrite(&owned, &candidates).await);
+        routed.insert_text(
+            "package.json",
+            r#"{"name":"app","dependencies":{"left-pad":"1.3.0"},"packageManager":"pnpm@10.2.0"}"#,
+        );
+        let done = registry_rewrite(&routed, &candidates).await;
+        assert_eq!(
+            workspace_of(&done),
+            Some(format!("{users}trustLockfile: true\n").as_str())
+        );
+        assert!(!done.pnpm_workspace_emptied);
+    }
+
+    /// HEAL-ON-RERUN: a lock an earlier (opted-out, or interrupted) run
+    /// already redirected is routed by a re-run that splices nothing.
+    #[tokio::test]
+    async fn a_rerun_routes_a_lock_an_earlier_run_redirected() {
+        let root = pnpm12_project(LEFT_PAD_V9_LOCK);
+        let candidates = [left_pad_registry_candidate()];
+        let first = pnpm_rewrite(
+            &ProjectView::Memory(&root),
+            &candidates,
+            false,
+            false,
+            &no_env,
+        )
+        .await;
+        let redirected = after(&root, &first);
+        let healed = registry_rewrite(&redirected, &candidates).await;
+        assert_eq!(lock_of(&healed), Some(left_pad_routed_lock().as_str()));
+        assert_eq!(
+            workspace_of(&healed),
+            Some(left_pad_routed_workspace().as_str())
+        );
+        assert!(!healed.pnpm_rerun_only);
+        assert_eq!(healed.confirmed.len(), 1);
+    }
+
+    /// A `trustLockfile: true` an earlier run wrote (the file is exactly
+    /// what that run creates, or a keyless file plus the lines it splices)
+    /// goes in the run that routes the pins, in the file's own line
+    /// ending: the project ends with pnpm's verification back on.
+    #[tokio::test]
+    async fn a_trust_key_an_earlier_run_wrote_is_replaced() {
+        let candidates = [left_pad_registry_candidate()];
+        let maps = format!(
+            "namedRegistries:\n{}\noverrides:\n{LEFT_PAD_OVERRIDE}\n",
+            left_pad_registry_line()
+        );
+        for (before, want) in [
+            (
+                "packages:\n  - '.'\ntrustLockfile: true\n".to_string(),
+                format!("packages:\n  - '.'\n{maps}"),
+            ),
+            (
+                "packages:\r\n  - '.'\r\ntrustLockfile: true\r\n".to_string(),
+                format!("packages:\n  - '.'\n{maps}").replace('\n', "\r\n"),
+            ),
+            (
+                "# team settings\npackages:\n  - '.'\ntrustLockfile: true\n".to_string(),
+                format!("# team settings\npackages:\n  - '.'\n{maps}"),
+            ),
+        ] {
+            let mut root = pnpm12_project(LEFT_PAD_V9_LOCK);
+            root.insert_text(PNPM_WORKSPACE_REL, before.as_str());
+            let done = registry_rewrite(&root, &candidates).await;
+            assert_eq!(workspace_of(&done), Some(want.as_str()), "{before:?}");
+            assert_eq!(
+                workspace_edits(&done),
+                [
+                    (
+                        REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+                        "removed",
+                        Some("trustLockfile")
+                    ),
+                    (
+                        REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                        "added",
+                        Some(LEFT_PAD_ALIAS)
+                    ),
+                    (
+                        REDIRECT_PNPM_WORKSPACE_OVERRIDE_EDIT_KIND,
+                        "added",
+                        Some("left-pad@1.3.0")
+                    ),
+                ],
+                "{before:?}"
+            );
+            let detail = pnpm_trust_detail(&done);
+            assert!(
+                detail.contains(
+                    "The `trustLockfile: true` an earlier socket-patch run wrote there was removed"
+                ),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("verifies the whole lockfile again"),
+                "{detail}"
+            );
+            // What is left is the file a registry run creates or splices.
+            let again = registry_rewrite(&after(&root, &done), &candidates).await;
+            assert!(again.rewrite.files.is_empty(), "{before:?}");
+        }
+    }
+
+    /// A `trustLockfile` the file's bytes do not prove an earlier run wrote
+    /// is the user's: `true` stays, and the warning says the hosted patches
+    /// no longer need it; any other value no longer stands in the way of
+    /// anything. A `pnpm_config_trust_lockfile` variable is irrelevant to a
+    /// routed package too.
+    #[tokio::test]
+    async fn a_users_trust_key_is_left_alone() {
+        fn off(var: &str) -> Option<String> {
+            (var == "pnpm_config_trust_lockfile").then(|| "false".to_string())
+        }
+        let candidates = [left_pad_registry_candidate()];
+        let maps = format!(
+            "namedRegistries:\n{}\noverrides:\n{LEFT_PAD_OVERRIDE}\n",
+            left_pad_registry_line()
+        );
+        for (user, left) in [
+            ("packages:\n  - 'apps/*'\ntrustLockfile: true\n", true),
+            ("trustLockfile: true\npackages:\n  - '.'\n", true),
+            ("packages:\n  - '.'\ntrustLockfile: false\n", false),
+            ("packages:\n  - 'apps/*'\n", false),
+        ] {
+            for env in [no_env as fn(&str) -> Option<String>, off] {
+                let mut root = pnpm12_project(LEFT_PAD_V9_LOCK);
+                root.insert_text(PNPM_WORKSPACE_REL, user);
+                let done =
+                    pnpm_rewrite(&ProjectView::Memory(&root), &candidates, true, false, &env).await;
+                assert_eq!(
+                    workspace_of(&done),
+                    Some(format!("{user}{maps}").as_str()),
+                    "{user:?}"
+                );
+                let detail = pnpm_trust_detail(&done);
+                assert!(
+                    detail.contains("the existing pnpm-workspace.yaml now declares"),
+                    "{detail}"
+                );
+                assert_eq!(
+                    detail.contains(
+                        "also sets `trustLockfile: true`, which the hosted patches no longer need"
+                    ),
+                    left,
+                    "{user:?}: {detail}"
+                );
+                assert!(!detail.contains("respected"), "{detail}");
+                assert!(!detail.contains("pnpm_config_trust_lockfile"), "{detail}");
+            }
+        }
+    }
+
+    /// CLEANUP, a package that left the lock (removed, or upgraded to a
+    /// release with no patch): its override goes from the workspace file
+    /// and from the lock's record, and its registry goes with it, in the
+    /// run that routes the pins that remain.
+    #[tokio::test]
+    async fn a_package_that_left_the_lock_takes_its_route_with_it() {
+        let root = pnpm12_project(TWO_PACKAGE_V9_LOCK);
+        let both = [left_pad_registry_candidate(), is_number_candidate(true)];
+        let routed = after(&root, &registry_rewrite(&root, &both).await);
+        // The user removed is-number, and pnpm rewrote the lock: its
+        // entries are gone, the override it was configured with is still
+        // recorded.
+        let mut removed = routed.clone();
+        removed.insert_text(
+            "pnpm-lock.yaml",
+            left_pad_routed_lock().replace(
+                "overrides:\n",
+                &format!("overrides:\n  is-number@7.0.0: {IS_NUMBER_ALIAS}:7.0.0\n"),
+            ),
+        );
+        let done = registry_rewrite(&removed, &[left_pad_registry_candidate()]).await;
+        assert_eq!(lock_of(&done), Some(left_pad_routed_lock().as_str()));
+        assert_eq!(
+            workspace_of(&done),
+            Some(left_pad_routed_workspace().as_str())
+        );
+        assert_eq!(
+            workspace_edits(&done),
+            [
+                (
+                    REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                    "removed",
+                    Some(IS_NUMBER_ALIAS)
+                ),
+                (
+                    REDIRECT_PNPM_WORKSPACE_OVERRIDE_EDIT_KIND,
+                    "removed",
+                    Some("is-number@7.0.0")
+                ),
+            ]
+        );
+        assert_eq!(
+            edits_of(&done, "pnpm-lock.yaml"),
+            [(
+                REDIRECT_PNPM_LOCK_OVERRIDE_EDIT_KIND,
+                "removed",
+                Some("is-number@7.0.0")
+            )]
+        );
+        assert!(done.pnpm_named_registries);
+        // A dry run reports the same removals.
+        let dry = pnpm_rewrite(
+            &ProjectView::Memory(&removed),
+            &[left_pad_registry_candidate()],
+            true,
+            true,
+            &no_env,
+        )
+        .await;
+        assert_eq!(dry.rewrite.files, done.rewrite.files);
+        assert_eq!(dry.rewrite.edits, done.rewrite.edits);
+    }
+
+    /// CLEANUP by a run the patch service grants nothing: a release an
+    /// earlier run routed stays routed (a patch missing from one search is
+    /// not a withdrawn one), and what the package that left the lock had
+    /// goes: its override, the lock's record of it, and its registry,
+    /// which no lock key names any more. A dry run reports the same.
+    #[tokio::test]
+    async fn a_run_with_no_grant_still_drops_what_a_departed_package_left() {
+        let workspace = |registries: &[String], overrides: &[&str]| {
+            format!(
+                "packages:\n  - 'apps/*'\nnamedRegistries:\n{}\noverrides:\n{}\n",
+                registries.join("\n"),
+                overrides.join("\n")
+            )
+        };
+        let mut root = pnpm12_project(&left_pad_routed_lock().replace(
+            "overrides:\n",
+            &format!("overrides:\n  is-number@7.0.0: {IS_NUMBER_ALIAS}:7.0.0\n"),
+        ));
+        root.insert_text(
+            PNPM_WORKSPACE_REL,
+            workspace(
+                &[left_pad_registry_line(), is_number_registry_line()],
+                &[IS_NUMBER_OVERRIDE, LEFT_PAD_OVERRIDE],
+            ),
+        );
+        // The run is granted nothing the lock holds (the grant of a
+        // package the lock dropped is what names the fixtures' patch
+        // server to it).
+        let granted = [is_number_candidate(true)];
+        let done = registry_rewrite(&root, &granted).await;
+        assert_eq!(lock_of(&done), Some(left_pad_routed_lock().as_str()));
+        assert_eq!(
+            workspace_of(&done),
+            Some(workspace(&[left_pad_registry_line()], &[LEFT_PAD_OVERRIDE]).as_str())
+        );
+        assert_eq!(
+            workspace_edits(&done),
+            [
+                (
+                    REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                    "removed",
+                    Some(IS_NUMBER_ALIAS)
+                ),
+                (
+                    REDIRECT_PNPM_WORKSPACE_OVERRIDE_EDIT_KIND,
+                    "removed",
+                    Some("is-number@7.0.0")
+                ),
+            ]
+        );
+        assert_eq!(
+            edits_of(&done, "pnpm-lock.yaml"),
+            [(
+                REDIRECT_PNPM_LOCK_OVERRIDE_EDIT_KIND,
+                "removed",
+                Some("is-number@7.0.0")
+            )]
+        );
+        let entries: Vec<(&'static str, String)> =
+            crate::hosted::guidance::pnpm_registry_entries_removed(&done.rewrite.edits)
+                .into_iter()
+                .map(|entry| (entry.kind.as_str(), entry.key))
+                .collect();
+        assert_eq!(
+            entries,
+            [
+                ("lockOverride", "is-number@7.0.0".to_string()),
+                ("registry", IS_NUMBER_ALIAS.to_string()),
+                ("override", "is-number@7.0.0".to_string()),
+            ]
+        );
+        assert!(done.pnpm_warnings.is_empty(), "{:?}", done.pnpm_warnings);
+        let dry = pnpm_rewrite(&ProjectView::Memory(&root), &granted, true, true, &no_env).await;
+        assert_eq!(dry.rewrite.files, done.rewrite.files);
+        assert_eq!(dry.rewrite.edits, done.rewrite.edits);
+        // Nothing is left to tidy.
+        let again = registry_rewrite(&after(&root, &done), &granted).await;
+        assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.files);
+    }
+
+    /// CLEANUP, with no hosted pin of this run left in the lock at all:
+    /// the run still takes out what no lock references, and no trust key
+    /// or warning goes in its place. A project file of the user's is back
+    /// to their bytes; the file a run created is written back as its
+    /// `packages` scaffold and marked emptied, which is what has the
+    /// caller delete it (a rewrite carries writes only).
+    #[tokio::test]
+    async fn orphans_of_a_route_go_on_the_next_scan() {
+        const UNROUTED: &str = "lockfileVersion: '9.0'\n\noverrides:\n  left-pad@1.3.0: socket-77777777:1.3.0\n\n\
+             importers:\n  .:\n    dependencies:\n      is-number:\n        specifier: 7.0.0\n        \
+             version: 7.0.0\n\npackages:\n  is-number@7.0.0:\n    resolution: {integrity: sha512-UPSTREAM==}\n\n\
+             snapshots:\n  is-number@7.0.0: {}\n";
+        // left-pad was routed, then left the lock; the run is granted a
+        // patch for a package the lock does not hold.
+        let candidates = [left_pad_registry_candidate()];
+        for (workspace, want) in [
+            (left_pad_routed_workspace(), "packages:\n  - '.'\n".to_string()),
+            (
+                format!(
+                    "packages:\n  - 'apps/*'\nnamedRegistries:\n  corp: https://npm.corp.example/\n{}\n\
+                     overrides:\n  lodash: ^4.17.21\n{LEFT_PAD_OVERRIDE}\n",
+                    left_pad_registry_line()
+                ),
+                "packages:\n  - 'apps/*'\nnamedRegistries:\n  corp: https://npm.corp.example/\n\
+                 overrides:\n  lodash: ^4.17.21\n"
+                    .to_string(),
+            ),
+        ] {
+            let mut root = pnpm12_project(UNROUTED);
+            root.insert_text(PNPM_WORKSPACE_REL, workspace.as_str());
+            let done = registry_rewrite(&root, &candidates).await;
+            assert_eq!(workspace_of(&done), Some(want.as_str()), "{workspace}");
+            assert_eq!(
+                done.pnpm_workspace_emptied,
+                want == "packages:\n  - '.'\n",
+                "only the file a run created is the caller's to delete: {workspace}"
+            );
+            assert_eq!(
+                lock_of(&done),
+                Some(
+                    UNROUTED
+                        .replace("overrides:\n  left-pad@1.3.0: socket-77777777:1.3.0\n\n", "")
+                        .as_str()
+                )
+            );
+            assert_eq!(
+                workspace_edits(&done),
+                [
+                    (
+                        REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                        "removed",
+                        Some(LEFT_PAD_ALIAS)
+                    ),
+                    (
+                        REDIRECT_PNPM_WORKSPACE_OVERRIDE_EDIT_KIND,
+                        "removed",
+                        Some("left-pad@1.3.0")
+                    ),
+                ]
+            );
+            assert!(done.pnpm_warnings.is_empty(), "{:?}", done.pnpm_warnings);
+            assert!(!done.pnpm_named_registries);
+            // Nothing is left to tidy.
+            let again = registry_rewrite(&after(&root, &done), &candidates).await;
+            assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.files);
+            // The opt-out leaves the file, and so the lock, alone.
+            let opted_out = pnpm_rewrite(
+                &ProjectView::Memory(&root),
+                &candidates,
+                false,
+                false,
+                &no_env,
+            )
+            .await;
+            assert!(opted_out.rewrite.files.is_empty());
+        }
+
+        // The workspace file is gone altogether: the lock's record of the
+        // override still goes.
+        let mut root = pnpm12_project(UNROUTED);
+        root.insert_text("package.json", PNPM_12_MANIFEST);
+        let done = registry_rewrite(&root, &candidates).await;
+        assert_eq!(workspace_of(&done), None);
+        assert_eq!(
+            lock_of(&done),
+            Some(
+                UNROUTED
+                    .replace(
+                        "overrides:\n  left-pad@1.3.0: socket-77777777:1.3.0\n\n",
+                        ""
+                    )
+                    .as_str()
+            )
+        );
+
+        // An interrupted or older run's leftovers beside live pins: a stale
+        // override, a spare registry, the registries of an unreleased
+        // build. The user's own entries stay byte for byte.
+        let root = pnpm12_project(TWO_PACKAGE_V9_LOCK);
+        let both = [left_pad_registry_candidate(), is_number_candidate(true)];
+        let mut littered = after(&root, &registry_rewrite(&root, &both).await);
+        littered.insert_text(
+            PNPM_WORKSPACE_REL,
+            format!(
+                "packages:\n  - 'apps/*'\nnamedRegistries:\n  corp: https://npm.corp.example/ # ours\n\
+                 \x20 socket-99999999: https://patch.test/patch/npm/gone/1.0.0/tok/99999999-9999-4999-8999-999999999999/\n\
+                 \x20 socket-patch-66666666-6666-4666-8666-666666666666: https://patch.test/patch/npm/old/1.0.0/tok/66666666-6666-4666-8666-666666666666/\n{}\n{}\n\
+                 overrides:\n  lodash: ^4.17.21\n  'gone@1.0.0': 'socket-99999999:1.0.0'\n{IS_NUMBER_OVERRIDE}\n{LEFT_PAD_OVERRIDE}\n",
+                left_pad_registry_line(),
+                is_number_registry_line()
+            ),
+        );
+        let done = registry_rewrite(&littered, &both).await;
+        assert_eq!(
+            workspace_of(&done),
+            Some(
+                format!(
+                    "packages:\n  - 'apps/*'\nnamedRegistries:\n  corp: https://npm.corp.example/ # ours\n{}\n{}\n\
+                     overrides:\n  lodash: ^4.17.21\n{IS_NUMBER_OVERRIDE}\n{LEFT_PAD_OVERRIDE}\n",
+                    left_pad_registry_line(),
+                    is_number_registry_line()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            workspace_edits(&done),
+            [
+                (
+                    REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                    "removed",
+                    Some("socket-99999999")
+                ),
+                (
+                    REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                    "removed",
+                    Some("socket-patch-66666666-6666-4666-8666-666666666666")
+                ),
+                (
+                    REDIRECT_PNPM_WORKSPACE_OVERRIDE_EDIT_KIND,
+                    "removed",
+                    Some("gone@1.0.0")
+                ),
+            ]
+        );
+        // The lock was already as pnpm writes it: nothing to change there.
+        assert_eq!(lock_of(&done), None);
+        assert!(done.pnpm_named_registries);
+    }
+
+    /// CLEANUP, a patch that supersedes the one a release is routed to
+    /// (a new patch uuid, so a new tarball and a new registry): the
+    /// registry is the new patch's, under the new patch's name, so the
+    /// override and the lock's keys are renamed to it and the old
+    /// registry goes. Nothing is added beside what was there.
+    #[tokio::test]
+    async fn a_superseding_patch_renames_the_registry() {
+        const NEXT: &str = "66666666-6666-4666-8666-666666666666";
+        const NEXT_ALIAS: &str = "socket-66666666";
+        let root = pnpm12_project(LEFT_PAD_V9_LOCK);
+        let first = registry_rewrite(&root, &[left_pad_registry_candidate()]).await;
+        let routed = after(&root, &first);
+        let mut next = left_pad_registry_candidate();
+        next.dep.patch_uuid = NEXT.into();
+        next.dep.artifact_url = left_pad_url().replace(FIXTURE_UUID, NEXT);
+        next.dep.npm_registry_url = Some(registry_address(&next.dep.artifact_url));
+        let renamed = |text: String| {
+            text.replace(FIXTURE_UUID, NEXT)
+                .replace(LEFT_PAD_ALIAS, NEXT_ALIAS)
+        };
+        let done = registry_rewrite(&routed, &[next.clone()]).await;
+        assert_eq!(
+            lock_of(&done),
+            Some(renamed(left_pad_routed_lock()).as_str())
+        );
+        assert_eq!(
+            workspace_of(&done),
+            Some(renamed(left_pad_routed_workspace()).as_str())
+        );
+        assert_eq!(
+            workspace_edits(&done),
+            [
+                (
+                    REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                    "removed",
+                    Some(LEFT_PAD_ALIAS)
+                ),
+                (
+                    REDIRECT_PNPM_WORKSPACE_REGISTRY_EDIT_KIND,
+                    "added",
+                    Some(NEXT_ALIAS)
+                ),
+                (
+                    REDIRECT_PNPM_WORKSPACE_OVERRIDE_EDIT_KIND,
+                    "rewritten",
+                    Some("left-pad@1.3.0")
+                ),
+            ]
+        );
+        assert_eq!(
+            edits_of(&done, "pnpm-lock.yaml"),
+            [
+                (
+                    "redirect_pnpm_resolution",
+                    "rewritten",
+                    Some("left-pad@1.3.0")
+                ),
+                (
+                    REDIRECT_PNPM_REGISTRY_ALIAS_EDIT_KIND,
+                    "rewritten",
+                    Some("left-pad@1.3.0")
+                ),
+                (
+                    REDIRECT_PNPM_LOCK_OVERRIDE_EDIT_KIND,
+                    "rewritten",
+                    Some("left-pad@1.3.0")
+                ),
+            ]
+        );
+        assert_eq!(done.confirmed.len(), 1);
+        // Nothing of the replaced patch is reported as cleaned up one by
+        // one but its registry: the release is still routed.
+        let removed: Vec<(&'static str, String)> =
+            crate::hosted::guidance::pnpm_registry_entries_removed(&done.rewrite.edits)
+                .into_iter()
+                .map(|entry| (entry.kind.as_str(), entry.key))
+                .collect();
+        assert_eq!(removed, [("registry", LEFT_PAD_ALIAS.to_string())]);
+        let again = registry_rewrite(&after(&routed, &done), &[next]).await;
+        assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.files);
+    }
+
+    /// The one registry of a whole project, as an unreleased build
+    /// addressed it.
+    const EARLIER_SET_ADDRESS: &str =
+        "https://patch.test/patch/npm/~/11111111111141118111.22222222222242228222/";
+
+    /// MIGRATION: a shape an unreleased build of this feature wrote for
+    /// the left-pad pin ends as the registry of the patch under its short
+    /// name and the short override, with nothing of the earlier shape
+    /// left, and a second run changes nothing. Once the package has left
+    /// the lock, the same shape is removed whole.
+    ///
+    /// `alias` at `address` is the registry that build declared, `users`
+    /// the registry lines of the user's own beside it, and `value` the
+    /// override value it wrote (`None` for a build that wrote no override
+    /// and left the lock naming only the tarball).
+    async fn an_earlier_shape_is_converted_and_removed(
+        alias: &str,
+        address: &str,
+        users: &str,
+        value: Option<&str>,
+    ) {
+        let candidates = [left_pad_registry_candidate()];
+        let registries = format!("namedRegistries:\n{users}  {alias}: {address}\n");
+        let overrides = value
+            .map(|value| format!("overrides:\n  'left-pad@1.3.0': '{value}'\n"))
+            .unwrap_or_default();
+
+        // The package is still locked: the shape is converted.
+        let lock = match value {
+            None => {
+                let plain = pnpm12_project(LEFT_PAD_V9_LOCK);
+                lock_of(&registry_rewrite(&plain, &[left_pad_candidate()]).await)
+                    .expect("the lock that names the tarball")
+                    .to_string()
+            }
+            Some(value) => {
+                let short = format!("{LEFT_PAD_ALIAS}:1.3.0");
+                left_pad_routed_lock()
+                    .replace(
+                        &format!("left-pad@1.3.0: {short}"),
+                        &format!("left-pad@1.3.0: {value}"),
+                    )
+                    .replace(
+                        &format!("specifier: {short}"),
+                        &format!("specifier: {value}"),
+                    )
+                    .replace(&short, &format!("{alias}:1.3.0"))
+            }
+        };
+        let mut project = pnpm12_project(&lock);
+        project.insert_text(
+            PNPM_WORKSPACE_REL,
+            format!("packages:\n  - '.'\n{registries}{overrides}"),
+        );
+        let done = registry_rewrite(&project, &candidates).await;
+        assert_eq!(
+            lock_of(&done),
+            Some(left_pad_routed_lock().as_str()),
+            "{alias}"
+        );
+        assert_eq!(
+            workspace_of(&done),
+            Some(
+                format!(
+                    "packages:\n  - '.'\nnamedRegistries:\n{users}{}\noverrides:\n{LEFT_PAD_OVERRIDE}\n",
+                    left_pad_registry_line()
+                )
+                .as_str()
+            ),
+            "{alias}"
+        );
+        assert!(done.pnpm_named_registries, "{alias}");
+        assert_eq!(done.confirmed.len(), 1, "{alias}");
+        let again = registry_rewrite(&after(&project, &done), &candidates).await;
+        assert!(again.rewrite.files.is_empty(), "{alias}");
+
+        // The package left the lock: a run that routes nothing removes
+        // the shape, and the user's file is theirs again.
+        const PLAIN: &str = "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      \
+             is-number:\n        specifier: 7.0.0\n        version: 7.0.0\n\npackages:\n  \
+             is-number@7.0.0:\n    resolution: {integrity: sha512-UPSTREAM==}\n\n\
+             snapshots:\n  is-number@7.0.0: {}\n";
+        let recorded = match value {
+            Some(value) => PLAIN.replace(
+                "importers:\n",
+                &format!("overrides:\n  left-pad@1.3.0: {value}\n\nimporters:\n"),
+            ),
+            None => PLAIN.to_string(),
+        };
+        let users_file = match users {
+            "" => "packages:\n  - 'apps/*'\n".to_string(),
+            users => format!("packages:\n  - 'apps/*'\nnamedRegistries:\n{users}"),
+        };
+        let mut project = pnpm12_project(&recorded);
+        project.insert_text(
+            PNPM_WORKSPACE_REL,
+            format!("packages:\n  - 'apps/*'\n{registries}{overrides}"),
+        );
+        let done = registry_rewrite(&project, &candidates).await;
+        assert_eq!(workspace_of(&done), Some(users_file.as_str()), "{alias}");
+        // (A lock with no record of the route is not rewritten.)
+        assert_eq!(lock_of(&done).unwrap_or(&recorded), PLAIN, "{alias}");
+        assert!(!done.pnpm_named_registries, "{alias}");
+        let again = registry_rewrite(&after(&project, &done), &candidates).await;
+        assert!(again.rewrite.files.is_empty(), "{alias}");
+    }
+
+    /// A registry per patch named by the whole UUID, with no override and
+    /// a lock that only names the tarball.
+    #[tokio::test]
+    async fn an_earlier_registry_per_patch_with_no_override_is_converted() {
+        an_earlier_shape_is_converted_and_removed(
+            &format!("socket-patch-{FIXTURE_UUID}"),
+            &left_pad_registry_url(),
+            "",
+            None,
+        )
+        .await;
+    }
+
+    /// A registry per patch named by the whole UUID, with the override
+    /// value `<alias>:<version>` and the lock keyed by that registry.
+    #[tokio::test]
+    async fn an_earlier_registry_per_patch_with_a_short_override_is_converted() {
+        let alias = format!("socket-patch-{FIXTURE_UUID}");
+        an_earlier_shape_is_converted_and_removed(
+            &alias,
+            &left_pad_registry_url(),
+            "",
+            Some(&format!("{alias}:1.3.0")),
+        )
+        .await;
+    }
+
+    /// A registry per patch named by the whole UUID, with the override
+    /// value `<alias>:<name>@<version>` and the lock keyed by that
+    /// registry.
+    #[tokio::test]
+    async fn an_earlier_registry_per_patch_with_a_long_override_is_converted() {
+        let alias = format!("socket-patch-{FIXTURE_UUID}");
+        an_earlier_shape_is_converted_and_removed(
+            &alias,
+            &left_pad_registry_url(),
+            "",
+            Some(&format!("{alias}:left-pad@1.3.0")),
+        )
+        .await;
+    }
+
+    /// One registry for the whole project, `socket`.
+    #[tokio::test]
+    async fn an_earlier_project_registry_named_socket_is_converted() {
+        an_earlier_shape_is_converted_and_removed(
+            "socket",
+            EARLIER_SET_ADDRESS,
+            "",
+            Some("socket:1.3.0"),
+        )
+        .await;
+    }
+
+    /// One registry for the whole project, `socket-patch`: the name that
+    /// build took where the user had a registry `socket`, which stays.
+    #[tokio::test]
+    async fn an_earlier_project_registry_named_socket_patch_is_converted() {
+        an_earlier_shape_is_converted_and_removed(
+            "socket-patch",
+            EARLIER_SET_ADDRESS,
+            "  socket: https://npm.corp.example/\n",
+            Some("socket-patch:1.3.0"),
+        )
+        .await;
+    }
+
+    /// One registry for the whole project under a numbered name
+    /// (`socket-2`), beside the user's `socket` and `socket-patch`, which
+    /// stay.
+    #[tokio::test]
+    async fn an_earlier_numbered_project_registry_is_converted() {
+        an_earlier_shape_is_converted_and_removed(
+            "socket-2",
+            EARLIER_SET_ADDRESS,
+            "  socket: https://npm.corp.example/\n  socket-patch: https://npm.work.example/\n",
+            Some("socket-2:1.3.0"),
+        )
+        .await;
+    }
+
+    /// Two patches whose UUIDs start with the same eight digits: both
+    /// registries take four more, so each name still tells its patch, and
+    /// a registry of the user's under a name ours would take makes ours
+    /// longer too.
+    #[tokio::test]
+    async fn a_registry_name_that_is_taken_gets_more_digits() {
+        const SHARES: &str = "77777777-1111-4111-8111-111111111111";
+        let mut twin = is_number_candidate(true);
+        twin.dep.patch_uuid = SHARES.into();
+        twin.dep.artifact_url = is_number_url().replace(IS_NUMBER_UUID, SHARES);
+        twin.dep.npm_registry_url = Some(registry_address(&twin.dep.artifact_url));
+        let root = pnpm12_project(TWO_PACKAGE_V9_LOCK);
+        let candidates = [left_pad_registry_candidate(), twin.clone()];
+        let done = registry_rewrite(&root, &candidates).await;
+        assert!(done.pnpm_named_registries, "{:?}", done.pnpm_warnings);
+        assert_eq!(
+            workspace_of(&done),
+            Some(
+                format!(
+                    "packages:\n  - '.'\nnamedRegistries:\n{}\n{}\noverrides:\n  \
+                     'is-number@7.0.0': 'socket-777777771111:7.0.0'\n  \
+                     'left-pad@1.3.0': 'socket-777777777777:1.3.0'\n",
+                    registry_line("socket-777777771111", &twin.dep.artifact_url),
+                    registry_line("socket-777777777777", &left_pad_url()),
+                )
+                .as_str()
+            )
+        );
+        let lock = lock_of(&done).expect("the lock");
+        for key in [
+            "\n  is-number@socket-777777771111:7.0.0:\n",
+            "\n  left-pad@socket-777777777777:1.3.0:\n",
+        ] {
+            assert!(lock.contains(key), "{key}: {lock}");
+        }
+        let again = registry_rewrite(&after(&root, &done), &candidates).await;
+        assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.files);
+
+        // The user's own registry under the short name.
+        let users = "packages:\n  - 'apps/*'\nnamedRegistries:\n  socket-77777777: https://npm.corp.example/\n";
+        let mut project = pnpm12_project(LEFT_PAD_V9_LOCK);
+        project.insert_text(PNPM_WORKSPACE_REL, users);
+        let done = registry_rewrite(&project, &[left_pad_registry_candidate()]).await;
+        assert_eq!(
+            workspace_of(&done),
+            Some(
+                format!(
+                    "{users}{}\noverrides:\n  'left-pad@1.3.0': 'socket-777777777777:1.3.0'\n",
+                    registry_line("socket-777777777777", &left_pad_url())
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            lock_of(&done),
+            Some(
+                left_pad_routed_lock()
+                    .replace(LEFT_PAD_ALIAS, "socket-777777777777")
+                    .as_str()
+            )
+        );
+    }
+
+    /// ANOTHER VERSION IN RANGE. The override that routes a release is
+    /// keyed `name@version`, and pnpm applies it to every dependency whose
+    /// range admits that version. A lock records what a transitive
+    /// dependent resolved, not the range it asked through, so the scan
+    /// cannot tell a dependent locked on a newer release of the package
+    /// (through `^1.0.0`) from one that must have it. It routes the patched
+    /// release, leaves the other one as locked, and says what pnpm may do
+    /// with it: a note in the route's guidance that names the package and
+    /// both versions. Only a newer release the patched one's caret range
+    /// admits is named (same major; same minor below 1.0).
+    #[tokio::test]
+    async fn a_newer_release_in_range_of_a_routed_one_is_noted() {
+        // `pinned` asks for left-pad 1.3.0 exactly, `ranged` through a
+        // range and is locked on `other`. Laid out as pnpm writes a lock.
+        let lock = |other: &str| {
+            format!(
+                "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      \
+                 pinned:\n        specifier: 1.0.0\n        version: 1.0.0\n      \
+                 ranged:\n        specifier: 1.0.0\n        version: 1.0.0\n\n\
+                 packages:\n\n  left-pad@1.3.0:\n    resolution: {{integrity: sha512-UPSTREAM==}}\n\n  \
+                 left-pad@{other}:\n    resolution: {{integrity: sha512-OTHER==}}\n\n  \
+                 pinned@1.0.0:\n    resolution: {{integrity: sha512-PINNED==}}\n\n  \
+                 ranged@1.0.0:\n    resolution: {{integrity: sha512-RANGED==}}\n\n\
+                 snapshots:\n\n  left-pad@1.3.0: {{}}\n\n  left-pad@{other}: {{}}\n\n  \
+                 pinned@1.0.0:\n    dependencies:\n      left-pad: 1.3.0\n\n  \
+                 ranged@1.0.0:\n    dependencies:\n      left-pad: {other}\n"
+            )
+        };
+        let project = |other: &str| {
+            let mut project = pnpm12_project(&lock(other));
+            project.insert_text(
+                "package.json",
+                r#"{"name":"app","packageManager":"pnpm@12.22.0","dependencies":{"pinned":"1.0.0","ranged":"1.0.0"}}"#,
+            );
+            project
+        };
+        const NOTE: &str = "pnpm-lock.yaml also locks left-pad at 1.9.0, which a range that \
+             admits 1.3.0 may admit too: a package that depends on left-pad through such a \
+             range moves to the patched left-pad@1.3.0 the next time pnpm resolves (`pnpm \
+             add`, `update`, `dedupe`), because the override that routes a release applies to \
+             every range that admits it";
+        let candidates = [left_pad_registry_candidate()];
+        let root = project("1.9.0");
+        let done = registry_rewrite(&root, &candidates).await;
+        assert!(done.pnpm_named_registries, "{:?}", done.pnpm_warnings);
+        assert_eq!(done.confirmed.len(), 1);
+        let routed = lock_of(&done).expect("the routed lock");
+        assert!(
+            routed.contains("\n  left-pad@1.9.0:\n")
+                && routed.contains("      left-pad: 1.9.0\n")
+                && routed.contains("      left-pad: socket-77777777:1.3.0\n"),
+            "the other release stays as locked:\n{routed}"
+        );
+        assert!(
+            pnpm_trust_detail(&done).contains(NOTE),
+            "{}",
+            pnpm_trust_detail(&done)
+        );
+        assert_eq!(done.pnpm_route_note.as_deref(), Some(NOTE));
+        // The note is the state's, not the run's: a re-run that changes
+        // nothing still carries it.
+        let again = registry_rewrite(&after(&root, &done), &candidates).await;
+        assert!(again.rewrite.files.is_empty());
+        assert_eq!(again.pnpm_route_note.as_deref(), Some(NOTE));
+
+        // Not in the patched release's caret range: another major, an
+        // older release, a prerelease.
+        for other in ["2.0.0", "1.2.9", "1.4.0-beta.1"] {
+            let done = registry_rewrite(&project(other), &candidates).await;
+            assert!(done.pnpm_named_registries, "{other}");
+            assert_eq!(done.pnpm_route_note, None, "{other}");
+            assert!(!pnpm_trust_detail(&done).contains("also locks"), "{other}");
+        }
+    }
+
+    /// THE USER'S OWN REGISTRY. A project may name a registry of its own
+    /// `socket`, `socket-patch` or `socket-2`, and lock a release from it
+    /// as `left-pad@socket:1.3.0`. That release is the user's package from
+    /// the user's registry, whatever npm's left-pad@1.3.0 is: a run granted
+    /// a patch for npm's release must not read the entry as that release,
+    /// must not repoint it at a patched tarball, and must not confirm a
+    /// pin. Not a byte of the lock or of the workspace file changes, with
+    /// or without a registry address on the grant.
+    #[tokio::test]
+    async fn a_release_from_a_registry_of_the_users_is_never_repointed() {
+        for name in ["socket", "socket-patch", "socket-2", "socket-patch-3"] {
+            let lock = format!(
+                "lockfileVersion: '9.0'\n\noverrides:\n  left-pad@1.3.0: {name}:1.3.0\n\n\
+                 importers:\n  .:\n    dependencies:\n      left-pad:\n        \
+                 specifier: {name}:1.3.0\n        version: {name}:1.3.0\n\n\
+                 packages:\n  left-pad@{name}:1.3.0:\n    \
+                 resolution: {{integrity: sha512-CORP==, tarball: https://npm.corp.example/left-pad/-/left-pad-1.3.0.tgz}}\n\n\
+                 snapshots:\n  left-pad@{name}:1.3.0: {{}}\n"
+            );
+            let workspace = format!(
+                "packages:\n  - '.'\nnamedRegistries:\n  {name}: https://npm.corp.example/\n\
+                 overrides:\n  'left-pad@1.3.0': '{name}:1.3.0'\n"
+            );
+            for candidate in [left_pad_registry_candidate(), left_pad_candidate()] {
+                let mut project = pnpm12_project(&lock);
+                project.insert_text(PNPM_WORKSPACE_REL, workspace.as_str());
+                let done = registry_rewrite(&project, &[candidate]).await;
+                assert_eq!(lock_of(&done), None, "{name}: the user's entry is theirs");
+                assert_eq!(workspace_of(&done), None, "{name}");
+                assert!(done.confirmed.is_empty(), "{name}: {:?}", done.confirmed);
+                assert!(!done.pnpm_named_registries, "{name}");
+            }
+        }
+    }
+
+    /// What keeps a project the patch service offers the registry route
+    /// to off it is said in the warning, and the run is the trust run it
+    /// would have been: an override of the user's for a patched package, a
+    /// lock the override edits were not captured against, a workspace file
+    /// a splice cannot extend.
+    #[tokio::test]
+    async fn what_blocks_the_registry_route_is_said() {
+        let candidates = [left_pad_registry_candidate()];
+        let trust_run = |project: MemoryProject| async move {
+            registry_rewrite(&project, &[left_pad_candidate()]).await
+        };
+
+        // An override of the user's for the patched package, or a map this
+        // reader cannot follow: pnpm applies one override per dependency.
+        for (user, why) in [
+            (
+                "packages:\n  - 'apps/*'\noverrides:\n  left-pad: 1.3.0\n",
+                "pnpm-workspace.yaml overrides `left-pad` itself",
+            ),
+            (
+                "packages:\n  - 'apps/*'\noverrides:\n  'left-pad@1.3.0': 1.3.1\n",
+                "pnpm-workspace.yaml overrides `left-pad@1.3.0` itself",
+            ),
+            (
+                "packages:\n  - 'apps/*'\noverrides:\n  'app>left-pad@^1': 1.3.1\n",
+                "pnpm-workspace.yaml overrides `app>left-pad@^1` itself",
+            ),
+            (
+                "packages:\n  - 'apps/*'\noverrides: {lodash: ^4.17.21}\n",
+                "pnpm-workspace.yaml sets `overrides` on one line (a flow-style map or a scalar)",
+            ),
+            (
+                "packages:\n  - 'apps/*'\nnamedRegistries: {corp: https://npm.corp.example/}\n",
+                "pnpm-workspace.yaml sets `namedRegistries` on one line (a flow-style map or a scalar)",
+            ),
+        ] {
+            let mut root = pnpm12_project(LEFT_PAD_V9_LOCK);
+            root.insert_text(PNPM_WORKSPACE_REL, user);
+            let baseline = trust_run(root.clone()).await;
+            let done = registry_rewrite(&root, &candidates).await;
+            assert!(!done.pnpm_named_registries, "{user:?}");
+            assert_eq!(done.rewrite.files, baseline.rewrite.files, "{user:?}");
+            assert_eq!(done.rewrite.edits, baseline.rewrite.edits, "{user:?}");
+            assert_eq!(
+                workspace_of(&done),
+                Some(format!("{user}trustLockfile: true\n").as_str()),
+                "{user:?}"
+            );
+            assert_eq!(
+                pnpm_trust_detail(&done),
+                noted(pnpm_trust_detail(&baseline), &blocked(why)),
+                "{user:?}"
+            );
+        }
+        // An override of another package is no obstacle, nor are
+        // registries of the user's: a `socket` of theirs, with an override
+        // that uses it, stays theirs beside ours.
+        let mut root = pnpm12_project(LEFT_PAD_V9_LOCK);
+        let users = "packages:\n  - 'apps/*'\nnamedRegistries:\n  socket: https://npm.corp.example/\noverrides:\n  lodash: ^4.17.21\n  'theirs@2.0.0': 'socket:2.0.0'\n";
+        root.insert_text(PNPM_WORKSPACE_REL, users);
+        let done = registry_rewrite(&root, &candidates).await;
+        assert!(done.pnpm_named_registries);
+        assert_eq!(
+            workspace_of(&done),
+            Some(
+                format!(
+                    "packages:\n  - 'apps/*'\nnamedRegistries:\n  socket: https://npm.corp.example/\n{}\n\
+                     overrides:\n  lodash: ^4.17.21\n  'theirs@2.0.0': 'socket:2.0.0'\n{LEFT_PAD_OVERRIDE}\n",
+                    left_pad_registry_line()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(lock_of(&done), Some(left_pad_routed_lock().as_str()));
+
+        // A workspace file no splice can extend: the trust path says so
+        // itself, and nothing is written.
+        for (user, why) in [
+            (
+                "{packages: ['.']}\n",
+                "pnpm-workspace.yaml is a flow-style YAML document",
+            ),
+            (
+                "packages:\n  - '.'\n---\nother: 1\n",
+                "pnpm-workspace.yaml holds more than one YAML document",
+            ),
+        ] {
+            let mut root = pnpm12_project(LEFT_PAD_V9_LOCK);
+            root.insert_text(PNPM_WORKSPACE_REL, user);
+            let baseline = trust_run(root.clone()).await;
+            let done = registry_rewrite(&root, &candidates).await;
+            assert_eq!(workspace_of(&done), None, "{user:?}");
+            assert_eq!(done.rewrite.files, baseline.rewrite.files, "{user:?}");
+            let detail = pnpm_trust_detail(&done);
+            assert!(detail.contains(&blocked(why)), "{why}: {detail}");
+            assert!(detail.contains("it was left untouched"), "{detail}");
+        }
+
+        // A lock the override edits were not captured against. Here: the
+        // importer asks for the release through a dist-tag, which pnpm
+        // would not override; and a copy patched with `pnpm patch`.
+        for (lock, why) in [
+            (
+                LEFT_PAD_V9_LOCK.replace("specifier: 1.3.0", "specifier: latest"),
+                "pnpm-lock.yaml locks left-pad@1.3.0 for importer `.` through the specifier \
+                 `latest`, which pnpm would not override",
+            ),
+            (
+                LEFT_PAD_V9_LOCK.replace(
+                    "  left-pad@1.3.0: {}",
+                    "  left-pad@1.3.0(patch_hash=abc): {}",
+                ),
+                "pnpm-lock.yaml holds a patched copy of left-pad@1.3.0 \
+                 (`left-pad@1.3.0(patch_hash=abc)`)",
+            ),
+        ] {
+            let root = pnpm12_project(&lock);
+            let baseline = trust_run(root.clone()).await;
+            let done = registry_rewrite(&root, &candidates).await;
+            assert!(!done.pnpm_named_registries, "{why}");
+            assert_eq!(done.rewrite.files, baseline.rewrite.files, "{why}");
+            assert_eq!(done.rewrite.edits, baseline.rewrite.edits, "{why}");
+            assert_eq!(
+                pnpm_trust_detail(&done),
+                noted(pnpm_trust_detail(&baseline), &blocked(why)),
+                "{why}"
+            );
+        }
+    }
+
+    /// Patched packages are routed through the registry only for a project
+    /// whose pnpm pins prove pnpm 11.20 or newer: older releases write
+    /// another lock for the same override. A project pinned to an older
+    /// pnpm (or to a range that reaches one, or by pins that disagree) gets
+    /// today's `trustLockfile` write, byte for byte, and is told its pins
+    /// are why. So does a project with no pin, whose warning adds what a
+    /// pin would change.
+    #[tokio::test]
+    async fn the_registry_route_needs_a_project_pinned_to_pnpm_11_20() {
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        enum Want {
+            Routed,
+            Trust,
+            TrustWithHint,
+        }
+        let candidates = [left_pad_registry_candidate()];
+        const TRUST: &str = "packages:\n  - '.'\ntrustLockfile: true\n";
+        const HINT: &str = "Pinning pnpm 11.20 or later (for example with package.json \
+                            `packageManager`) and re-running the scan switches the project \
+                            to per-package registry verification instead of `trustLockfile`";
+        let mut unpinned = MemoryProject::new();
+        unpinned.insert_text("pnpm-lock.yaml", LEFT_PAD_V9_LOCK);
+        // A patch service that gives no address: today's run, and nothing
+        // said of a route or a pin (neither would change anything).
+        let baseline = registry_rewrite(&unpinned, &[left_pad_candidate()]).await;
+        assert_eq!(workspace_of(&baseline), Some(TRUST));
+        let baseline_detail = pnpm_trust_detail(&baseline);
+        assert!(
+            !baseline_detail.contains("Pinning pnpm")
+                && !baseline_detail.contains("registry verification"),
+            "{baseline_detail}"
+        );
+        let hinted_detail = noted(baseline_detail, HINT);
+        let not_proven_detail = noted(baseline_detail, &blocked(NOT_PROVEN));
+        for (manifest, modules_yaml, want) in [
+            // No pin at all.
+            (None, None, Want::TrustWithHint),
+            (Some(r#"{"name":"app"}"#), None, Want::TrustWithHint),
+            (
+                Some(r#"{"packageManager":"npm@11.0.0"}"#),
+                None,
+                Want::TrustWithHint,
+            ),
+            // A pin below 11.20, or a range that reaches below it.
+            (
+                Some(r#"{"packageManager":"pnpm@11.19.0"}"#),
+                None,
+                Want::Trust,
+            ),
+            (
+                Some(r#"{"packageManager":"pnpm@11.10.0"}"#),
+                None,
+                Want::Trust,
+            ),
+            (
+                Some(r#"{"packageManager":"pnpm@10.34.6"}"#),
+                None,
+                Want::Trust,
+            ),
+            (Some(r#"{"engines":{"pnpm":">=11"}}"#), None, Want::Trust),
+            (Some(r#"{"engines":{"pnpm":"^11"}}"#), None, Want::Trust),
+            (None, Some("packageManager: pnpm@11.15.0\n"), Want::Trust),
+            (
+                Some(r#"{"devEngines":{"packageManager":{"name":"pnpm"}}}"#),
+                None,
+                Want::Trust,
+            ),
+            // Mixed pins: one below the floor, one above.
+            (
+                Some(r#"{"packageManager":"pnpm@12.4.2","engines":{"pnpm":"11"}}"#),
+                None,
+                Want::Trust,
+            ),
+            (
+                Some(r#"{"packageManager":"pnpm@12.4.2"}"#),
+                Some("packageManager: pnpm@11.15.0\n"),
+                Want::Trust,
+            ),
+            // Every pin proves 11.20 or newer.
+            (
+                Some(r#"{"packageManager":"pnpm@11.20.0"}"#),
+                None,
+                Want::Routed,
+            ),
+            (
+                Some(r#"{"packageManager":"pnpm@11.28.13"}"#),
+                None,
+                Want::Routed,
+            ),
+            (
+                Some(r#"{"packageManager":"pnpm@12.0.0"}"#),
+                None,
+                Want::Routed,
+            ),
+            (
+                Some(r#"{"engines":{"pnpm":"^11.20.0"}}"#),
+                None,
+                Want::Routed,
+            ),
+            (
+                Some(r#"{"engines":{"pnpm":">=11.20"}}"#),
+                None,
+                Want::Routed,
+            ),
+            (Some(r#"{"engines":{"pnpm":">=12"}}"#), None, Want::Routed),
+            (
+                Some(r#"{"packageManager":"pnpm@13.1.0+sha512.abc"}"#),
+                None,
+                Want::Routed,
+            ),
+            (None, Some("packageManager: pnpm@12.22.0\n"), Want::Routed),
+            (
+                Some(r#"{"packageManager":"pnpm@11.28.13"}"#),
+                Some("packageManager: pnpm@12.22.0\n"),
+                Want::Routed,
+            ),
+        ] {
+            let mut root = unpinned.clone();
+            if let Some(manifest) = manifest {
+                root.insert_text("package.json", manifest);
+            }
+            if let Some(modules_yaml) = modules_yaml {
+                root.insert_text("node_modules/.modules.yaml", modules_yaml);
+            }
+            let done = registry_rewrite(&root, &candidates).await;
+            let case = format!("{manifest:?} {modules_yaml:?}");
+            assert_eq!(done.pnpm_named_registries, want == Want::Routed, "{case}");
+            if want == Want::Routed {
+                assert_eq!(
+                    workspace_of(&done),
+                    Some(left_pad_routed_workspace().as_str()),
+                    "{case}"
+                );
+                assert_eq!(
+                    lock_of(&done),
+                    Some(left_pad_routed_lock().as_str()),
+                    "{case}"
+                );
+                assert!(!pnpm_trust_detail(&done).contains("Pinning pnpm"), "{case}");
+                continue;
+            }
+            // Exactly what a grant with no registry address gets.
+            assert_eq!(done.rewrite.files, baseline.rewrite.files, "{case}");
+            assert_eq!(done.rewrite.edits, baseline.rewrite.edits, "{case}");
+            let detail = pnpm_trust_detail(&done);
+            if want == Want::TrustWithHint {
+                assert_eq!(detail, hinted_detail, "{case}");
+            } else {
+                assert_eq!(detail, not_proven_detail, "{case}");
+            }
+        }
+
+        // The hint rides whatever the trust path says of an unpinned
+        // project: here, a file that already trusts the lock.
+        let mut trusted = unpinned.clone();
+        trusted.insert_text(
+            PNPM_WORKSPACE_REL,
+            "packages:\n  - 'apps/*'\ntrustLockfile: true\n",
+        );
+        let done = registry_rewrite(&trusted, &candidates).await;
+        assert_eq!(workspace_of(&done), None);
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("already carries `trustLockfile: true`") && detail.contains(HINT),
+            "{detail}"
+        );
+        // Nor does the opted-out run say it: it writes nothing either way.
+        let opted_out = |candidate: Candidate| {
+            let unpinned = unpinned.clone();
+            async move {
+                let done = pnpm_rewrite(
+                    &ProjectView::Memory(&unpinned),
+                    &[candidate],
+                    false,
+                    false,
+                    &no_env,
+                )
+                .await;
+                pnpm_trust_detail(&done).to_string()
+            }
+        };
+        let detail = opted_out(left_pad_registry_candidate()).await;
+        assert!(detail.contains("pnpm install --trust-lockfile"), "{detail}");
+        assert_eq!(detail, opted_out(left_pad_candidate()).await);
+        // One pin without an address: a pnpm pin would change nothing, so
+        // nothing is said of one; and a pin below the floor is said beside
+        // the missing address.
+        let mut two = MemoryProject::new();
+        two.insert_text("pnpm-lock.yaml", TWO_PACKAGE_V9_LOCK);
+        let mixed = [left_pad_registry_candidate(), is_number_candidate(false)];
+        let done = registry_rewrite(&two, &mixed).await;
+        assert!(!pnpm_trust_detail(&done).contains("Pinning pnpm"));
+        two.insert_text("package.json", r#"{"packageManager":"pnpm@11.10.0"}"#);
+        let done = registry_rewrite(&two, &mixed).await;
+        assert!(
+            pnpm_trust_detail(&done).contains(&blocked(&format!(
+                "the patch service gave no registry address for is-number@7.0.0, and {NOT_PROVEN}"
+            ))),
+            "{}",
+            pnpm_trust_detail(&done)
+        );
+
+        // A project pinned to pnpm 9.0–10.4 keeps its own rule (#734): no
+        // file, and the trust path's reason beside ours.
+        let mut pnpm9 = unpinned.clone();
+        pnpm9.insert_text("package.json", r#"{"packageManager":"pnpm@9.15.9"}"#);
+        let done = registry_rewrite(&pnpm9, &candidates).await;
+        assert_eq!(workspace_of(&done), None);
+        assert!(!done.pnpm_named_registries);
+        assert!(pnpm_trust_detail(&done).contains("does not read `trustLockfile`"));
+    }
+
+    /// A project an earlier run routed and whose pnpm pin then moved below
+    /// the floor is put back on the trust path whole: the lock is the one
+    /// a trust run writes, and so is the workspace file. When the lock
+    /// cannot be converted, lock and file stay routed, and the warning
+    /// says so.
+    #[tokio::test]
+    async fn a_routed_project_that_no_longer_qualifies_is_put_back() {
+        let candidates = [left_pad_registry_candidate()];
+        let root = pnpm12_project(LEFT_PAD_V9_LOCK);
+        let routed = after(&root, &registry_rewrite(&root, &candidates).await);
+        let trust = registry_rewrite(&root, &[left_pad_candidate()]).await;
+        let trust_lock = lock_of(&trust).expect("the trust lock");
+        const TRUST: &str = "packages:\n  - '.'\ntrustLockfile: true\n";
+        assert_eq!(workspace_of(&trust), Some(TRUST));
+        const PUT_BACK: &str = "An earlier run routed the hosted patches through a named registry";
+
+        let mut older = routed.clone();
+        older.insert_text(
+            "package.json",
+            r#"{"name":"app","dependencies":{"left-pad":"1.3.0"},"packageManager":"pnpm@11.10.0"}"#,
+        );
+        let done = registry_rewrite(&older, &candidates).await;
+        assert!(!done.pnpm_named_registries);
+        assert_eq!(lock_of(&done), Some(trust_lock));
+        assert_eq!(workspace_of(&done), Some(TRUST));
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains(PUT_BACK)
+                && detail.contains("were removed")
+                && detail.contains(&blocked(NOT_PROVEN)),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("`trustLockfile: true` was merged into"),
+            "{detail}"
+        );
+        // The put-back project is a trust project: a re-run changes nothing.
+        let again = registry_rewrite(&after(&older, &done), &candidates).await;
+        assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.files);
+        assert!(!pnpm_trust_detail(&again).contains(PUT_BACK));
+
+        // The importer's package.json no longer says what it asked for: the
+        // lock cannot be converted, so lock and file stay routed, and the
+        // warning says so.
+        let mut silent = routed.clone();
+        silent.insert_text(
+            "package.json",
+            r#"{"name":"app","packageManager":"pnpm@11.10.0"}"#,
+        );
+        let done = registry_rewrite(&silent, &candidates).await;
+        assert_eq!(lock_of(&done), None);
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("the lockfile could not be converted back")
+                && detail.contains("whose package.json does not say which version it asks for"),
+            "{detail}"
+        );
+        assert_eq!(
+            workspace_of(&done),
+            Some(format!("{}trustLockfile: true\n", left_pad_routed_workspace()).as_str())
+        );
+    }
+
+    /// The rules that keep the trust auto-config from writing a workspace
+    /// file keep the registry route out too: Rush and legacy locks keep
+    /// their own guidance, and a keyless file with workspace members
+    /// (#1096) gets no file.
+    #[tokio::test]
+    async fn the_registry_route_respects_what_the_trust_write_respects() {
+        let candidates = [left_pad_registry_candidate()];
+
+        let mut rush = MemoryProject::new();
+        rush.insert_text("rush.json", r#"{ "rushVersion": "5.100.0" }"#);
+        rush.insert_text("package.json", PNPM_12_MANIFEST);
+        rush.insert_text(RUSH_COMMON_LOCK_REL, LEFT_PAD_V9_LOCK);
+        let done = registry_rewrite(&rush, &candidates).await;
+        let lock = &done.rewrite.files[RUSH_COMMON_LOCK_REL];
+        assert!(!lock.contains("socket:"), "{lock}");
+        assert_eq!(workspace_of(&done), None);
+        assert!(!done.pnpm_named_registries);
+        assert!(pnpm_trust_detail(&done).contains("pnpm_config_trust_lockfile=true rush install"));
+
+        let legacy = pnpm12_project(
+            "lockfileVersion: 5.4\n\nspecifiers:\n  left-pad: 1.3.0\n\ndependencies:\n  left-pad: 1.3.0\n\n\
+             packages:\n\n  /left-pad/1.3.0:\n    resolution: {integrity: sha512-UPSTREAM==}\n    dev: false\n",
+        );
+        let done = registry_rewrite(&legacy, &candidates).await;
+        assert!(done.rewrite.files.contains_key("pnpm-lock.yaml"));
+        assert_eq!(workspace_of(&done), None);
+        assert!(!done.pnpm_named_registries);
+        assert!(pnpm_trust_detail(&done).contains("no trust step exists or is needed"));
+
+        let mut keyless = pnpm12_project(&LEFT_PAD_V9_LOCK.replace(
+            "\npackages:\n",
+            "\n  packages/a:\n    dependencies:\n      left-pad:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n",
+        ));
+        keyless.insert_text(PNPM_WORKSPACE_REL, "# no keys yet\n");
+        let done = registry_rewrite(&keyless, &candidates).await;
+        assert_eq!(workspace_of(&done), None);
+        assert!(!done.pnpm_named_registries);
+        let lock = lock_of(&done).expect("the lock");
+        assert!(!lock.contains("socket:"), "{lock}");
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("has no keys and pnpm-lock.yaml lists workspace members")
+                && detail.contains(&blocked(
+                    "pnpm-workspace.yaml has no keys while pnpm-lock.yaml lists workspace members"
+                )),
+            "{detail}"
+        );
+
+        // A keyless file with no members gets the scaffold with the maps.
+        let mut comments = pnpm12_project(LEFT_PAD_V9_LOCK);
+        comments.insert_text(PNPM_WORKSPACE_REL, "# no keys yet\n");
+        let done = registry_rewrite(&comments, &candidates).await;
+        assert_eq!(
+            workspace_of(&done),
+            Some(format!("# no keys yet\n{}", left_pad_routed_workspace()).as_str())
+        );
+        assert!(pnpm_trust_detail(&done).contains("with the root-only `packages: ['.']`"));
+
+        // In memory, a symlinked workspace file is refused, not written
+        // through.
+        let mut linked = pnpm12_project(LEFT_PAD_V9_LOCK);
+        linked.insert(PNPM_WORKSPACE_REL, MemoryEntry::Symlink);
+        let done = registry_rewrite(&linked, &candidates).await;
+        let refusal = guard(&ProjectView::Memory(&linked), &done, &candidates)
+            .expect("a symlinked workspace file is refused");
+        assert_eq!(refusal.code, SYMLINK_REFUSAL);
+    }
+
+    /// An override routes a package version to one registry, and a registry
+    /// serves one patch: one release pinned to two patches (two locks
+    /// pinned to different patches of it) keeps the project off the route,
+    /// the release named. The same pin in several locks is one patch.
+    #[test]
+    fn a_release_pinned_to_two_patches_is_named() {
+        use crate::hosted::guidance::RoutedPin;
+        let pin = |name: &str, uuid: &str| {
+            let address = format!("https://patch.test/patch/npm/{name}/1.0.0/tok/{uuid}/");
+            RoutedPin {
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                integrity: "sha512-X==".to_string(),
+                tarball: format!("{address}{name}-1.0.0.tgz"),
+                uuid: uuid.to_string(),
+                address,
+            }
+        };
+        let shared = [
+            ("pnpm-lock.yaml", vec![pin("leaf", FIXTURE_UUID)]),
+            (
+                "packages/a/pnpm-lock.yaml",
+                vec![pin("leaf", FIXTURE_UUID), pin("mid", IS_NUMBER_UUID)],
+            ),
+        ];
+        assert_eq!(release_with_two_patches(&shared), None);
+        let split = [
+            ("pnpm-lock.yaml", vec![pin("leaf", FIXTURE_UUID)]),
+            (
+                "packages/a/pnpm-lock.yaml",
+                vec![pin("mid", IS_NUMBER_UUID), pin("leaf", IS_NUMBER_UUID)],
+            ),
+        ];
+        assert_eq!(
+            release_with_two_patches(&split),
+            Some("leaf@1.0.0".to_string())
+        );
+        assert_eq!(release_with_two_patches(&[]), None);
+    }
+
+    /// The grant → candidate step carries the registry address only when
+    /// it is the directory the patch's tarball is served from, named by
+    /// the patch's UUID; anything else reads as no address, and the pin
+    /// takes the trust path.
+    #[test]
+    fn a_registry_address_is_carried_only_when_it_routes_the_artifact() {
+        let url = left_pad_url();
+        let selected = vec![(
+            "pkg:npm/left-pad@1.3.0".to_string(),
+            FIXTURE_UUID.to_string(),
+        )];
+        let carried = |npm_registry_url: serde_json::Value| {
+            let mut refs: HashMap<String, PackageVendorResult> = HashMap::new();
+            let mut grant = serde_json::json!({
+                "status": "granted",
+                "url": url,
+                "purl": "pkg:npm/left-pad@1.3.0",
+                "artifacts": [{"kind": "tarball", "url": url,
+                               "integrity": {"sha512": "sha512-PATCHED=="}}],
+                "registryOverride": null
+            });
+            if !npm_registry_url.is_null() {
+                grant["npmRegistryUrl"] = npm_registry_url;
+            }
+            refs.insert(FIXTURE_UUID.into(), reference(grant));
+            candidates_of(&selected, &refs)[0]
+                .dep
+                .npm_registry_url
+                .clone()
+        };
+        let address = left_pad_registry_url();
+        assert_eq!(
+            address,
+            format!("https://patch.test/patch/npm/left-pad/1.3.0/{FIXTURE_TOKEN}/{FIXTURE_UUID}/")
+        );
+        assert_eq!(carried(serde_json::json!(address)), Some(address.clone()));
+        // A patch service that gives no address omits the field.
+        assert_eq!(carried(serde_json::Value::Null), None);
+        let without_slash = address.trim_end_matches('/').to_string();
+        let above = format!("https://patch.test/patch/npm/left-pad/1.3.0/{FIXTURE_TOKEN}/");
+        let other_patch = address.replace(FIXTURE_UUID, IS_NUMBER_UUID);
+        for unusable in [
+            "",
+            "https://",
+            "https://patch.test",
+            "https://patch.test/",
+            // The address an unreleased patch service gave a whole project.
+            "https://patch.test/patch/npm/~/77777777777747778777/",
+            // Not the directory of the tarball: no final `/`, a directory
+            // above it, another patch's, another origin or scheme.
+            without_slash.as_str(),
+            above.as_str(),
+            other_patch.as_str(),
+            &address.replace("patch.test", "other.test"),
+            &address.replace("https://", "http://"),
+            &format!("{address} "),
+            &address.replace("https://", "ftp://"),
+        ] {
+            assert_eq!(carried(serde_json::json!(unusable)), None, "{unusable:?}");
+        }
+        // The artifact URL itself is not a registry.
+        assert_eq!(carried(serde_json::json!(url)), None);
+        // Another ecosystem's grant carries none.
+        let mut pypi = left_pad_registry_candidate().dep;
+        pypi.ecosystem = "pypi".into();
+        assert_eq!(crate::patch::redirect::grant::npm_registry_url(&pypi), None);
+    }
+
     /// REGRESSION (#367), binary lock: a `bun.lockb`-only project's root
     /// manifest is read for its `patchedDependencies`, and a package the
     /// project patches itself with `bun patch` keeps its registry record,
@@ -6572,6 +11184,7 @@ snapshots:
                 artifact_url: format!(
                     "https://patch.test/patch/npm/is-number/7.0.0/{FIXTURE_TOKEN}/{FIXTURE_UUID}/is-number-7.0.0.tgz"
                 ),
+                npm_registry_url: None,
                 registry_override: None,
                 integrity: Integrity {
                     sha512: Some(format!("sha512-{}==", "A".repeat(86))),
@@ -6671,6 +11284,7 @@ snapshots:
                 token: "tok".into(),
                 patch_uuid: uuid.into(),
                 artifact_url: format!("https://patch.test/{name}-{version}.tgz"),
+                npm_registry_url: None,
                 registry_override: None,
                 integrity: Integrity {
                     sha512: Some(format!("sha512-{}==", "A".repeat(86))),
@@ -6932,6 +11546,7 @@ snapshots:
                 artifact_url: format!(
                     "https://patch.test/patch-registry/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/gems/rails-7.0.0.gem"
                 ),
+                npm_registry_url: None,
                 registry_override: Some(RegistryOverride {
                     kind: "rubygems-compact-index".into(),
                     index_url: format!(
@@ -6966,6 +11581,7 @@ snapshots:
                 artifact_url: format!(
                     "https://patch.socket.dev/patch/maven/com.socketfixture/victim/1.10.0/{token}/{GRADLE_UUID}/victim-1.10.0-socket.4d5e6f70.jar"
                 ),
+                npm_registry_url: None,
                 registry_override: Some(RegistryOverride {
                     kind: "maven2".into(),
                     index_url: format!(
@@ -8050,6 +12666,7 @@ snapshots:
                 artifact_url: format!(
                     "{base}/flat/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
                 ),
+                npm_registry_url: None,
                 registry_override: Some(RegistryOverride {
                     kind: "nuget-v3".into(),
                     index_url: format!("{base}/index.json"),
@@ -8944,6 +13561,105 @@ snapshots:
         assert!(again.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
     }
 
+    /// Members' own locks are governing locks: with a registry served for
+    /// the pin, the root workspace file (the one pnpm reads for every
+    /// member) routes it, the user's lines intact, and no trust key goes
+    /// in. pnpm records the file's overrides in every lock it governs, so
+    /// the root lock, which holds no patched package, gets the record too.
+    /// A re-run over routed member locks heals a missing workspace edit.
+    #[tokio::test]
+    async fn member_locks_are_routed_through_the_root_workspace_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+        write_member_workspace(tmp.path(), ws);
+        write_rel(
+            tmp.path(),
+            "package.json",
+            r#"{"name":"root","private":true,"packageManager":"pnpm@12.22.0"}"#,
+        );
+        write_rel(
+            tmp.path(),
+            "packages/a/package.json",
+            r#"{"name":"a","dependencies":{"is-number":"7.0.0"}}"#,
+        );
+        let registry = registry_address(MEMBER_URL);
+        let mut candidates = is_number_candidates();
+        candidates[0].dep.npm_registry_url = Some(registry.clone());
+        let view = ProjectView::Disk(tmp.path());
+        let done = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        let alias = "socket-492a492a";
+        let record = "overrides:\n  is-number@7.0.0: socket-492a492a:7.0.0\n\nimporters:\n";
+        for key in MEMBER_KEYS.into_iter().chain(["pnpm-lock.yaml"]) {
+            let lock = done
+                .rewrite
+                .files
+                .get(key)
+                .unwrap_or_else(|| panic!("{key}: {:?}", done.rewrite.files.keys()));
+            assert!(lock.contains(record), "{key}: {lock}");
+        }
+        for key in MEMBER_KEYS {
+            let lock = &done.rewrite.files[key];
+            assert!(
+                lock.contains(&format!("  is-number@{alias}:7.0.0:\n")),
+                "{key}: {lock}"
+            );
+        }
+        let a = &done.rewrite.files[MEMBER_KEYS[0]];
+        assert!(
+            a.contains(&format!(
+                "        specifier: {alias}:7.0.0\n        version: {alias}:7.0.0\n"
+            )),
+            "{a}"
+        );
+        let routed = format!(
+            "{ws}namedRegistries:\n  {alias}: {registry}\noverrides:\n  \
+             'is-number@7.0.0': '{alias}:7.0.0'\n"
+        );
+        assert_eq!(workspace_of(&done), Some(routed.as_str()));
+        assert!(done.pnpm_named_registries);
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.confirmed);
+        assert_eq!(
+            done.rewrite.edits.last().map(|e| e.kind.as_str()),
+            Some(REDIRECT_PNPM_WORKSPACE_OVERRIDE_EDIT_KIND)
+        );
+
+        for (key, text) in &done.rewrite.files {
+            if key != PNPM_WORKSPACE_REL {
+                write_rel(tmp.path(), key, text);
+            }
+        }
+        let healed = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        assert_eq!(
+            healed.rewrite.files.keys().collect::<Vec<_>>(),
+            [PNPM_WORKSPACE_REL]
+        );
+        assert_eq!(workspace_of(&healed), Some(routed.as_str()));
+        write_rel(tmp.path(), PNPM_WORKSPACE_REL, &routed);
+        let again = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.files);
+        assert!(again.pnpm_rerun_only);
+
+        // The project stops qualifying: every lock and the file go back.
+        write_rel(
+            tmp.path(),
+            "package.json",
+            r#"{"name":"root","private":true,"packageManager":"pnpm@10.34.6"}"#,
+        );
+        let back = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        assert_eq!(
+            workspace_of(&back),
+            Some(format!("{ws}trustLockfile: true\n").as_str())
+        );
+        for key in MEMBER_KEYS.into_iter().chain(["pnpm-lock.yaml"]) {
+            let lock = &back.rewrite.files[key];
+            assert!(!lock.contains("@socket-"), "{key}: {lock}");
+            assert!(!lock.contains("overrides:"), "{key}: {lock}");
+        }
+        assert_eq!(back.rewrite.files["pnpm-lock.yaml"], ROOT_ONLY_LOCK);
+        assert!(back.rewrite.files[MEMBER_KEYS[0]]
+            .contains("        specifier: 7.0.0\n        version: 7.0.0\n"));
+    }
+
     /// A Bazel hub that stands against a pin in the root lock
     /// ([`crate::bazel::pnpm`]) reads that lock alone. The members' own
     /// locks are read and pinned as without it; the root lock is left out.
@@ -8984,6 +13700,709 @@ snapshots:
             "{:?}",
             warning_codes(&done)
         );
+    }
+
+    use crate::bazel::pnpm::fixtures::{rules_js_hub, HIDING_HUB_CALL};
+
+    /// A pnpm lock that a rules_js hub of the Bazel workspace reads is not
+    /// routed through a named registry, whatever the patch service offers
+    /// and whatever pnpm the project pins: with `update_pnpm_lock` the hub
+    /// runs a pnpm of its own, which sees pnpm-workspace.yaml only where the
+    /// call lists it and may be too old to read its registries, and no
+    /// Bazel leg builds a routed lock that way. The project gets the files of a
+    /// run that is offered no registry, byte for byte, which the Bazel legs
+    /// build, and the warning names the call. A hub that reads another lock
+    /// changes nothing. A project routed before the hub was there leaves
+    /// the route whole: the locks and the workspace file together.
+    #[tokio::test]
+    async fn a_lock_that_a_bazel_hub_reads_is_not_routed() {
+        let candidates = [left_pad_registry_candidate()];
+        let users = "# the project's own\npackages:\n  - '.'\n";
+        let hubs = [
+            // Read by the lock reader of rules_js alone.
+            "pnpm_lock = \"//:pnpm-lock.yaml\"",
+            // Kept up to date by a pnpm that is shown the workspace file.
+            "pnpm_lock = \"//:pnpm-lock.yaml\", data = [\"//:pnpm-workspace.yaml\"], \
+             update_pnpm_lock = True",
+            // A lock that is not written out may be this one.
+            "pnpm_lock = LOCK",
+        ];
+        for call in hubs {
+            let mut project = pnpm12_project(LEFT_PAD_V9_LOCK);
+            project.insert_text(PNPM_WORKSPACE_REL, users);
+            project.insert_text("MODULE.bazel", rules_js_hub(call));
+            let unoffered = registry_rewrite(&project, &[left_pad_candidate()]).await;
+            let done = registry_rewrite(&project, &candidates).await;
+            assert!(!done.pnpm_named_registries, "{call}");
+            assert_eq!(done.rewrite.files, unoffered.rewrite.files, "{call}");
+            assert_eq!(
+                workspace_of(&done),
+                Some(format!("{users}trustLockfile: true\n").as_str()),
+                "{call}"
+            );
+            let lock = lock_of(&done).expect("the lock, pinned");
+            assert!(
+                lock.contains(&format!("tarball: {}", left_pad_url()))
+                    && !lock.contains("@socket-")
+                    && !lock.contains("overrides:"),
+                "{call}: {lock}"
+            );
+            assert_eq!(done.confirmed.len(), 1, "{call}");
+            assert!(
+                !warning_codes(&done).contains(&crate::bazel::pnpm::HIDDEN),
+                "{call}"
+            );
+            let detail = pnpm_trust_detail(&done);
+            assert!(
+                detail.contains(
+                    "Per-package registry verification was not set up because a Bazel hub \
+                     reads the pnpm lock (MODULE.bazel:3), and a lock that a hub reads is not \
+                     routed yet: the pnpm a hub runs for `update_pnpm_lock` may not read the \
+                     registries in pnpm-workspace.yaml; the hosted patches rely on \
+                     `trustLockfile` instead"
+                ),
+                "{call}: {detail}"
+            );
+            // Not offered a registry, the run says nothing of the hub.
+            assert!(
+                !pnpm_trust_detail(&unoffered).contains("Bazel"),
+                "{call}: {}",
+                pnpm_trust_detail(&unoffered)
+            );
+        }
+
+        let mut elsewhere = pnpm12_project(LEFT_PAD_V9_LOCK);
+        elsewhere.insert_text(
+            "MODULE.bazel",
+            rules_js_hub("pnpm_lock = \"//tools:pnpm-lock.yaml\""),
+        );
+        let done = registry_rewrite(&elsewhere, &candidates).await;
+        assert!(done.pnpm_named_registries);
+        assert_eq!(
+            workspace_of(&done),
+            Some(left_pad_routed_workspace().as_str())
+        );
+
+        let mut root = pnpm12_project(LEFT_PAD_V9_LOCK);
+        root.insert_text(PNPM_WORKSPACE_REL, users);
+        let first = registry_rewrite(&root, &candidates).await;
+        assert!(first.pnpm_named_registries);
+        let mut routed = after(&root, &first);
+        routed.insert_text("MODULE.bazel", rules_js_hub(hubs[0]));
+        let done = registry_rewrite(&routed, &candidates).await;
+        assert!(!done.pnpm_named_registries);
+        assert_eq!(
+            workspace_of(&done),
+            Some(format!("{users}trustLockfile: true\n").as_str())
+        );
+        let lock = lock_of(&done).expect("the lock, back in the plain shape");
+        assert!(
+            lock.contains("\n  left-pad@1.3.0:\n")
+                && lock.contains(&format!("tarball: {}", left_pad_url()))
+                && !lock.contains("@socket-")
+                && !lock.contains("overrides:"),
+            "{lock}"
+        );
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("a Bazel hub reads the pnpm lock (MODULE.bazel:3)")
+                && detail.contains("An earlier run routed the hosted patches"),
+            "{detail}"
+        );
+    }
+
+    /// In a Bazel workspace the route is taken only where it is certain
+    /// that no hub reads a governing lock. A hub the reader cannot see
+    /// leaves that open: one of a `WORKSPACE` file that brings in rules_js,
+    /// one in a file that
+    /// `MODULE.bazel` includes and that was not handed in, one behind a
+    /// proxy of the extension that is handed to something else. Each keeps
+    /// the project on the pin of a run that is offered no registry, and
+    /// the warning names what was not read. A workspace that was read
+    /// whole and has no hub of the lock is routed.
+    #[tokio::test]
+    async fn a_hub_the_reader_may_not_have_seen_blocks_the_route() {
+        let candidates = [left_pad_registry_candidate()];
+        let workspace_hub =
+            "load(\"@aspect_rules_js//npm:repositories.bzl\", \"npm_translate_lock\")\n\
+             npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\", \
+             update_pnpm_lock = True)\n";
+        let cases: [(&str, &str, &str); 3] = [
+            (
+                "WORKSPACE",
+                workspace_hub,
+                "(WORKSPACE:1: it brings in rules_js",
+            ),
+            (
+                "MODULE.bazel",
+                "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+                 include(\"//tools:npm.MODULE.bazel\")\n",
+                "(tools/npm.MODULE.bazel: ",
+            ),
+            (
+                "MODULE.bazel",
+                "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+                 npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+                 hubs(npm)\n",
+                "(MODULE.bazel:3: ",
+            ),
+        ];
+        for (file, text, named) in cases {
+            let mut project = pnpm12_project(LEFT_PAD_V9_LOCK);
+            project.insert_text(file, text);
+            let unoffered = registry_rewrite(&project, &[left_pad_candidate()]).await;
+            let done = registry_rewrite(&project, &candidates).await;
+            assert!(!done.pnpm_named_registries, "{file}: {text}");
+            assert_eq!(done.rewrite.files, unoffered.rewrite.files, "{file}");
+            assert_eq!(done.confirmed.len(), 1, "{file}");
+            let detail = pnpm_trust_detail(&done);
+            let said = format!("because a Bazel hub may read the pnpm lock {named}");
+            assert!(detail.contains(&said), "{file}: {detail}");
+            assert!(
+                !pnpm_trust_detail(&unoffered).contains("Bazel"),
+                "{file}: {}",
+                pnpm_trust_detail(&unoffered)
+            );
+        }
+
+        // Read whole, and no hub of this lock: a workspace with no rules_js
+        // at all, whose `WORKSPACE` file names it and fetches something
+        // else.
+        let mut plain = pnpm12_project(LEFT_PAD_V9_LOCK);
+        plain.insert_text(
+            "MODULE.bazel",
+            "bazel_dep(name = \"rules_java\", version = \"8.0.0\")\n",
+        );
+        plain.insert_text(
+            "WORKSPACE",
+            "workspace(name = \"app\")\n\
+             http_archive(name = \"other\", urls = [\"https://example.test/o.tgz\"])\n",
+        );
+        let done = registry_rewrite(&plain, &candidates).await;
+        assert!(done.pnpm_named_registries);
+        assert_eq!(
+            workspace_of(&done),
+            Some(left_pad_routed_workspace().as_str())
+        );
+    }
+
+    /// A project below the root of its Bazel workspace is told where the
+    /// hub's call is: in a file of that root, which a run in the project's
+    /// directory has no file of that name beside. The warning says that its
+    /// paths are from the root of the Bazel workspace, for a call and for
+    /// what was not read alike.
+    #[tokio::test]
+    async fn a_project_below_the_bazel_root_is_told_where_the_hub_is() {
+        let candidates = [left_pad_registry_candidate()];
+        let from = ", with paths from the root of the Bazel workspace)";
+        for (module, said) in [
+            (
+                rules_js_hub("pnpm_lock = \"//apps/web:pnpm-lock.yaml\""),
+                format!("a Bazel hub reads the pnpm lock (MODULE.bazel:3{from}"),
+            ),
+            (
+                "include(\"//tools:npm.MODULE.bazel\")\n".to_string(),
+                format!(
+                    "a Bazel hub may read the pnpm lock (tools/npm.MODULE.bazel: it does not \
+                     exist; MODULE.bazel:1 includes it{from}"
+                ),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_rel(tmp.path(), ".git/HEAD", "ref: refs/heads/main\n");
+            write_rel(tmp.path(), "MODULE.bazel", &module);
+            write_rel(tmp.path(), "apps/web/package.json", PNPM_12_MANIFEST);
+            write_rel(tmp.path(), "apps/web/pnpm-lock.yaml", LEFT_PAD_V9_LOCK);
+            let project = tmp.path().join("apps/web");
+            let done = golden_rewrite(&project, &candidates).await;
+            assert!(!done.pnpm_named_registries, "{module}");
+            let detail = pnpm_trust_detail(&done);
+            assert!(detail.contains(&said), "{module}: {detail}");
+        }
+    }
+
+    /// Where a hub hides pnpm-workspace.yaml from the pnpm 11 it runs
+    /// ([`crate::bazel::pnpm::hidden`]), that answer comes first, while the
+    /// files are read: the root lock is not part of the run, so nothing is
+    /// pinned in it and nothing routed, with a registry offered or not.
+    /// A project routed before the hub was there keeps its lock and its
+    /// workspace file exactly as they are, in step with each other, on a
+    /// run with its patch and on one that is granted nothing.
+    #[tokio::test]
+    async fn a_lock_that_a_bazel_hub_withholds_is_neither_pinned_nor_routed() {
+        let candidates = [left_pad_registry_candidate()];
+        let hub = rules_js_hub(HIDING_HUB_CALL);
+        let mut fresh = pnpm12_project(LEFT_PAD_V9_LOCK);
+        fresh.insert_text("MODULE.bazel", hub.as_str());
+        let done = registry_rewrite(&fresh, &candidates).await;
+        assert!(
+            done.rewrite.files.is_empty(),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+        assert!(!done.pnpm_named_registries);
+        assert!(
+            warning_codes(&done).contains(&crate::bazel::pnpm::HIDDEN),
+            "{:?}",
+            warning_codes(&done)
+        );
+
+        let root = pnpm12_project(LEFT_PAD_V9_LOCK);
+        let first = registry_rewrite(&root, &candidates).await;
+        assert!(first.pnpm_named_registries);
+        let mut routed = after(&root, &first);
+        routed.insert_text("MODULE.bazel", hub.as_str());
+        for granted in [&candidates[..], &[]] {
+            let done = pnpm_rewrite_from(
+                &ProjectView::Memory(&routed),
+                granted,
+                true,
+                false,
+                &no_env,
+                vec!["https://patch.test".to_string()],
+            )
+            .await;
+            assert!(
+                done.rewrite.files.is_empty() && done.rewrite.edits.is_empty(),
+                "{} granted: {:?}",
+                granted.len(),
+                done.rewrite.files.keys()
+            );
+            assert!(!done.pnpm_workspace_emptied);
+        }
+    }
+
+    /// What a run does with a lock that it leaves to a Bazel hub does not
+    /// turn on whether it was granted an npm patch. The project was routed,
+    /// its routed dependency left the lock, and the hub lists the
+    /// pnpm-workspace.yaml the route created: a run that took the unused
+    /// entries out would delete that file under the call that names it. A
+    /// run with a patch for another package leaves the root lock to the
+    /// hub and changes nothing; so does a run that is granted nothing.
+    #[tokio::test]
+    async fn a_run_granted_no_npm_patch_leaves_the_lock_to_the_hub_too() {
+        const PLAIN: &str = "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      \
+             is-number:\n        specifier: 7.0.0\n        version: 7.0.0\n\npackages:\n  \
+             is-number@7.0.0:\n    resolution: {integrity: sha512-UPSTREAM==}\n\n\
+             snapshots:\n  is-number@7.0.0: {}\n";
+        let origins = || vec!["https://patch.test".to_string()];
+        let mut project = pnpm12_project(&PLAIN.replace(
+            "importers:\n",
+            &format!("overrides:\n  left-pad@1.3.0: {LEFT_PAD_ALIAS}:1.3.0\n\nimporters:\n"),
+        ));
+        project.insert_text(PNPM_WORKSPACE_REL, left_pad_routed_workspace());
+        // Without a hub the unused route goes, and the file with it.
+        let view = ProjectView::Memory(&project);
+        let tidied = pnpm_rewrite_from(&view, &[], true, false, &no_env, origins()).await;
+        assert_eq!(lock_of(&tidied), Some(PLAIN));
+        assert!(tidied.pnpm_workspace_emptied);
+
+        project.insert_text(
+            "MODULE.bazel",
+            rules_js_hub(
+                "pnpm_lock = \"//:pnpm-lock.yaml\", data = [\"//:pnpm-workspace.yaml\"], \
+                 update_pnpm_lock = True",
+            ),
+        );
+        let view = ProjectView::Memory(&project);
+        let with = [is_number_candidate(true)];
+        for granted in [&with[..], &[]] {
+            let done = pnpm_rewrite_from(&view, granted, true, false, &no_env, origins()).await;
+            assert!(
+                done.rewrite.files.is_empty(),
+                "{} granted: {:?}",
+                granted.len(),
+                done.rewrite.files.keys()
+            );
+            assert!(!done.pnpm_workspace_emptied, "{} granted", granted.len());
+            assert!(
+                warning_codes(&done).contains(&crate::bazel::pnpm::HIDDEN),
+                "{} granted: {:?}",
+                granted.len(),
+                warning_codes(&done)
+            );
+        }
+    }
+
+    /// A hosted run does not delete a pnpm-workspace.yaml under a hub that
+    /// reads, or may read, a lock of the project: the hub's `data` can name
+    /// the file, and a build that is handed a missing file fails. The
+    /// entries that no lock uses still go, and what a routed run created is
+    /// left as its `packages` list, not flagged for deletion. Without a hub
+    /// the same run deletes the file.
+    #[tokio::test]
+    async fn an_emptied_workspace_file_stays_under_a_hub_that_reads_a_lock() {
+        const PLAIN: &str = "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      \
+             is-number:\n        specifier: 7.0.0\n        version: 7.0.0\n\npackages:\n  \
+             is-number@7.0.0:\n    resolution: {integrity: sha512-UPSTREAM==}\n\n\
+             snapshots:\n  is-number@7.0.0: {}\n";
+        let origins = || vec!["https://patch.test".to_string()];
+        let mut project = pnpm12_project(&PLAIN.replace(
+            "importers:\n",
+            &format!("overrides:\n  left-pad@1.3.0: {LEFT_PAD_ALIAS}:1.3.0\n\nimporters:\n"),
+        ));
+        project.insert_text(PNPM_WORKSPACE_REL, left_pad_routed_workspace());
+        let view = ProjectView::Memory(&project);
+        let alone = pnpm_rewrite_from(&view, &[], true, false, &no_env, origins()).await;
+        assert!(alone.pnpm_workspace_emptied);
+
+        // The hub reads the lock and lists the file; it runs no pnpm.
+        for call in [
+            "pnpm_lock = \"//:pnpm-lock.yaml\", data = [\"//:pnpm-workspace.yaml\"]",
+            "pnpm_lock = LOCK, data = FILES",
+        ] {
+            project.insert_text("MODULE.bazel", rules_js_hub(call));
+            let view = ProjectView::Memory(&project);
+            let done = pnpm_rewrite_from(&view, &[], true, false, &no_env, origins()).await;
+            assert_eq!(lock_of(&done), Some(PLAIN), "{call}");
+            assert_eq!(workspace_of(&done), Some("packages:\n  - '.'\n"), "{call}");
+            assert!(!done.pnpm_workspace_emptied, "{call}");
+        }
+    }
+
+    /// Whether a route that is left as it is needs no trust key is asked of
+    /// every governing lock, the root lock that a hub keeps out of the run
+    /// among them. A plain hosted pin there, from before the hub hid the
+    /// workspace file, is one pnpm takes only with `trustLockfile`: the run
+    /// writes the key as it did before, and does not report the project as
+    /// settled on its registries.
+    #[tokio::test]
+    async fn a_plain_pin_in_the_withheld_root_lock_still_gets_its_trust_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+        write_member_workspace(tmp.path(), ws);
+        write_rel(
+            tmp.path(),
+            "package.json",
+            r#"{"name":"root","private":true,"packageManager":"pnpm@12.22.0"}"#,
+        );
+        write_rel(
+            tmp.path(),
+            "packages/a/package.json",
+            r#"{"name":"a","dependencies":{"is-number":"7.0.0"}}"#,
+        );
+        let mut candidates = is_number_candidates();
+        candidates[0].dep.npm_registry_url = Some(registry_address(MEMBER_URL));
+        let view = ProjectView::Disk(tmp.path());
+        let routed = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        assert!(routed.pnpm_named_registries);
+        commit(tmp.path(), &routed);
+        // The root lock pins the release in the plain shape.
+        let plain = format!(
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      is-number:\n        \
+             specifier: 7.0.0\n        version: 7.0.0\n\npackages:\n\n  is-number@7.0.0:\n    \
+             resolution: {{integrity: sha512-PATCHED==, tarball: {MEMBER_URL}}}\n\n\
+             snapshots:\n\n  is-number@7.0.0: {{}}\n"
+        );
+        write_rel(tmp.path(), "pnpm-lock.yaml", &plain);
+        write_rel(tmp.path(), "MODULE.bazel", &rules_js_hub(HIDING_HUB_CALL));
+
+        let done = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        let routed_ws = &routed.rewrite.files[PNPM_WORKSPACE_REL];
+        assert_eq!(
+            workspace_of(&done),
+            Some(format!("{routed_ws}trustLockfile: true\n").as_str())
+        );
+        assert!(!done.pnpm_named_registries);
+    }
+
+    /// The members' own locks beside a root lock that a hub withholds are
+    /// pinned as main pins them, on `trustLockfile`, also where the patch
+    /// service offers a registry and the project pins pnpm 12: the route's
+    /// overrides are recorded in every lock pnpm-workspace.yaml governs,
+    /// the root lock among them, and that one is not written. The warning
+    /// says a hub reads the lock. Members an earlier run routed stay routed
+    /// as they were: nothing of the route leaves the workspace file or the
+    /// members' locks while the root lock keeps its record of it.
+    #[tokio::test]
+    async fn member_locks_beside_a_root_lock_that_a_bazel_hub_withholds_are_not_routed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+        write_member_workspace(tmp.path(), ws);
+        write_rel(
+            tmp.path(),
+            "package.json",
+            r#"{"name":"root","private":true,"packageManager":"pnpm@12.22.0"}"#,
+        );
+        write_rel(
+            tmp.path(),
+            "packages/a/package.json",
+            r#"{"name":"a","dependencies":{"is-number":"7.0.0"}}"#,
+        );
+        let mut candidates = is_number_candidates();
+        candidates[0].dep.npm_registry_url = Some(registry_address(MEMBER_URL));
+        let view = ProjectView::Disk(tmp.path());
+
+        // Routed, as without Bazel.
+        let routed = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        assert!(routed.pnpm_named_registries);
+        let all = MEMBER_KEYS.into_iter().chain(["pnpm-lock.yaml"]);
+        assert!(all
+            .clone()
+            .all(|key| routed.rewrite.files.contains_key(key)));
+
+        // The hub, in the project as it was: pinned, not routed.
+        write_rel(tmp.path(), "MODULE.bazel", &rules_js_hub(HIDING_HUB_CALL));
+        let done = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        assert!(!done.pnpm_named_registries);
+        assert!(!done.rewrite.files.contains_key("pnpm-lock.yaml"));
+        for key in MEMBER_KEYS {
+            let lock = &done.rewrite.files[key];
+            assert!(
+                lock.contains(&format!("tarball: {MEMBER_URL}"))
+                    && !lock.contains("@socket-")
+                    && !lock.contains("overrides:"),
+                "{key}: {lock}"
+            );
+        }
+        assert_eq!(
+            workspace_of(&done),
+            Some(format!("{ws}trustLockfile: true\n").as_str())
+        );
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.confirmed);
+        assert!(warning_codes(&done).contains(&crate::bazel::pnpm::HIDDEN));
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("a Bazel hub reads the pnpm lock (MODULE.bazel:3)"),
+            "{detail}"
+        );
+
+        // The hub, in the project the first run routed: every lock and the
+        // workspace file stay as that run wrote them, byte for byte. The
+        // registries still verify the routed releases, so no
+        // `trustLockfile` is added, which would switch that off.
+        commit(tmp.path(), &routed);
+        for granted in [&candidates[..], &[]] {
+            let origins = vec!["https://patch.example".to_string()];
+            let done = pnpm_rewrite_from(&view, granted, true, false, &no_env, origins).await;
+            assert!(
+                done.rewrite.files.is_empty() && done.rewrite.edits.is_empty(),
+                "{} granted: {:?}",
+                granted.len(),
+                done.rewrite.files.keys()
+            );
+        }
+        let done = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        assert!(done.pnpm_named_registries && done.pnpm_rerun_only);
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.confirmed);
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains(
+                "Per-package registry verification would not be set up for this project now, \
+                 because a Bazel hub reads the pnpm lock (MODULE.bazel:3)"
+            ) && detail.contains("what an earlier run set up was left as it is")
+                && detail.contains("could not be converted back (the root pnpm lock"),
+            "{detail}"
+        );
+        assert!(!detail.contains("rely on `trustLockfile`"), "{detail}");
+
+        // A new pin beside the routed one is in the plain shape, which pnpm
+        // takes only with `trustLockfile`: that run writes the key, after
+        // the route's entries, and leaves the routed release routed.
+        write_rel(
+            tmp.path(),
+            "packages/b/package.json",
+            r#"{"name":"b","dependencies":{"left-pad":"1.3.0"}}"#,
+        );
+        write_rel(tmp.path(), MEMBER_KEYS[1], LEFT_PAD_V9_LOCK);
+        let mut both = candidates.clone();
+        both.push(left_pad_registry_candidate());
+        let origins = vec!["https://patch.example".to_string()];
+        let done = pnpm_rewrite_from(&view, &both, true, false, &no_env, origins).await;
+        let routed_ws = &routed.rewrite.files[PNPM_WORKSPACE_REL];
+        assert_eq!(
+            workspace_of(&done),
+            Some(format!("{routed_ws}trustLockfile: true\n").as_str())
+        );
+        assert_eq!(
+            done.rewrite.files.keys().collect::<Vec<_>>(),
+            [MEMBER_KEYS[1], PNPM_WORKSPACE_REL]
+        );
+        assert!(
+            done.rewrite.files[MEMBER_KEYS[1]].contains(&format!("tarball: {}", left_pad_url()))
+        );
+    }
+
+    /// What is left of a route can be in a member's own lock alone, with the
+    /// root pnpm-workspace.yaml and the root lock holding nothing of it (the
+    /// golden workspace `member-locks`, the route taken out by hand
+    /// everywhere but in one member's lock). The probe that decides whether
+    /// a command looks for a route at all finds it there. A run that is
+    /// granted nothing then takes out a record no lock uses any more, and
+    /// leaves a release a member's lock still routes as it is; a run that
+    /// is granted the patch puts the whole route back around that lock.
+    #[tokio::test]
+    async fn what_a_route_left_in_a_members_own_lock_is_found() {
+        use crate::formats::pnpm::registry_alias::fixtures;
+        const CASE: &str = "member-locks";
+        const A: &str = "packages/a/pnpm-lock.yaml";
+        const B: &str = "packages/b/pnpm-lock.yaml";
+        let expected =
+            |rel: &str| fixtures::read(CASE, &format!("expected/{rel}")).expect("a file");
+        let pristine: BTreeMap<String, String> = fixtures::project(CASE).into_iter().collect();
+        let origins = || vec!["https://patch.test".to_string()];
+        let project = |routed: &str| {
+            let project = golden_project(CASE);
+            write_rel(project.path(), routed, &expected(routed));
+            project
+        };
+
+        // Never routed: nothing to look for.
+        let plain = golden_project(CASE);
+        assert!(!pnpm_route_present(plain.path()).await);
+
+        // A record that no lock of the workspace uses any more.
+        let stale = project(B);
+        assert!(pnpm_route_present(stale.path()).await);
+        let view = ProjectView::Disk(stale.path());
+        let done = pnpm_rewrite_from(&view, &[], true, false, &no_env, origins()).await;
+        assert_eq!(
+            done.rewrite.files.keys().collect::<Vec<_>>(),
+            [B],
+            "{:?}",
+            done.rewrite.edits
+        );
+        assert_eq!(done.rewrite.files[B], pristine[B]);
+
+        // A release a member's lock still routes.
+        let kept = project(A);
+        assert!(pnpm_route_present(kept.path()).await);
+        let view = ProjectView::Disk(kept.path());
+        let done = pnpm_rewrite_from(&view, &[], true, false, &no_env, origins()).await;
+        assert!(
+            done.rewrite.files.is_empty(),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        let healed = golden_rewrite(kept.path(), &golden_candidates(CASE, true)).await;
+        assert!(healed.pnpm_named_registries);
+        commit(kept.path(), &healed);
+        for rel in ["pnpm-workspace.yaml", "pnpm-lock.yaml", A, B] {
+            assert_eq!(
+                std::fs::read_to_string(kept.path().join(rel)).unwrap(),
+                expected(rel),
+                "{rel}"
+            );
+        }
+    }
+
+    /// The plan takes what Bazel says of the pnpm locks from the files as
+    /// they were read ([`CandidateFiles::pnpm_bazel`]) and reads nothing of
+    /// Bazel itself. A root lock that a hub keeps out of the run blocks the
+    /// route by that alone, also where no call was read as the hub's: the
+    /// members' own locks are pinned on `trustLockfile`, and the warning
+    /// says the root lock is why. A pnpm refusal of another kind is no
+    /// such answer.
+    #[tokio::test]
+    async fn a_root_lock_kept_out_of_the_run_blocks_the_route_by_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+        write_member_workspace(tmp.path(), ws);
+        write_rel(
+            tmp.path(),
+            "package.json",
+            r#"{"name":"root","private":true,"packageManager":"pnpm@12.22.0"}"#,
+        );
+        write_rel(
+            tmp.path(),
+            "packages/a/package.json",
+            r#"{"name":"a","dependencies":{"is-number":"7.0.0"}}"#,
+        );
+        let mut candidates = is_number_candidates();
+        candidates[0].dep.npm_registry_url = Some(registry_address(MEMBER_URL));
+        let view = ProjectView::Disk(tmp.path());
+        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        // No Bazel workspace: nothing was read of one.
+        assert_eq!(read.pnpm_bazel, crate::bazel::pnpm::Hubs::default());
+        let hidden = RewriteWarning {
+            code: crate::bazel::pnpm::HIDDEN.into(),
+            detail: "a hub keeps pnpm-lock.yaml up to date".into(),
+        };
+        let mut withheld = read.clone();
+        withhold_root_pnpm_locks(&mut withheld, hidden.clone());
+        withheld.pnpm_bazel.hidden = Some(hidden);
+        let done = pnpm_rewrite_read(
+            &view,
+            withheld,
+            &candidates,
+            true,
+            false,
+            &no_env,
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            !done.pnpm_named_registries,
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        for key in MEMBER_KEYS {
+            let lock = &done.rewrite.files[key];
+            assert!(
+                lock.contains(&format!("tarball: {MEMBER_URL}"))
+                    && !lock.contains("@socket-")
+                    && !lock.contains("overrides:"),
+                "{key}: {lock}"
+            );
+        }
+        assert_eq!(
+            workspace_of(&done),
+            Some(format!("{ws}trustLockfile: true\n").as_str())
+        );
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains(crate::hosted::guidance::PNPM_REGISTRY_BAZEL_WITHHELD),
+            "{detail}"
+        );
+
+        // The same files without that answer are routed.
+        let done =
+            pnpm_rewrite_read(&view, read, &candidates, true, false, &no_env, Vec::new()).await;
+        assert!(done.pnpm_named_registries);
+    }
+
+    /// A run that is granted no patch tidies a route from every lock the
+    /// workspace file governs. Members' own locks that still route a
+    /// release keep the override and the registry they use: the root lock,
+    /// which holds no patched package, is not the only one asked.
+    #[tokio::test]
+    async fn a_run_granted_nothing_keeps_what_the_members_own_locks_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+        write_member_workspace(tmp.path(), ws);
+        write_rel(
+            tmp.path(),
+            "package.json",
+            r#"{"name":"root","private":true,"packageManager":"pnpm@12.22.0"}"#,
+        );
+        write_rel(
+            tmp.path(),
+            "packages/a/package.json",
+            r#"{"name":"a","dependencies":{"is-number":"7.0.0"}}"#,
+        );
+        let mut candidates = is_number_candidates();
+        candidates[0].dep.npm_registry_url = Some(registry_address(MEMBER_URL));
+        let view = ProjectView::Disk(tmp.path());
+        let routed = pnpm_rewrite(&view, &candidates, true, false, &no_env).await;
+        assert!(routed.pnpm_named_registries);
+        commit(tmp.path(), &routed);
+
+        let origins = vec!["https://patch.example".to_string()];
+        let done = pnpm_rewrite_from(&view, &[], true, false, &no_env, origins.clone()).await;
+        assert!(
+            done.rewrite.files.is_empty(),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        assert!(done.rewrite.edits.is_empty());
+
+        // Once no member's lock routes the release, the route goes whole.
+        write_rel(tmp.path(), MEMBER_KEYS[0], &v9_member_lock(true));
+        write_rel(tmp.path(), MEMBER_KEYS[1], &v9_member_lock(false));
+        let done = pnpm_rewrite_from(&view, &[], true, false, &no_env, origins).await;
+        assert_eq!(workspace_of(&done), Some(ws));
+        assert_eq!(lock_of(&done), Some(ROOT_ONLY_LOCK));
     }
 
     #[tokio::test]

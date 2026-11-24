@@ -1,0 +1,41 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+overrides:
+  other: 1.0.0
+
+importers:
+
+  .:
+    dependencies:
+      mid:
+        specifier: 1.0.0
+        version: 1.0.0
+      other:
+        specifier: 1.0.0
+        version: 1.0.0
+
+packages:
+
+  leaf@1.0.0:
+    resolution: {integrity: sha512-iuZ2dEUwKbJuRnXq78FAd95+hAtb2Y+tujnKMgcQFHj+5DKBz46Mo578ZeRnXrP8kRoNqCyWTAjJFw5m88RRFg==}
+    engines: {node: '>=8'}
+
+  mid@1.0.0:
+    resolution: {integrity: sha512-KgTAgictdFo5Wq2/+mO75142wnayvsOHEaj9y43h9CO4tJGffqGKaBhp6QSgTEV6F1jcrpF7pxXhj6+x8ZnViA==}
+
+  other@1.0.0:
+    resolution: {integrity: sha512-xHnSAbJF4ryxPDMX7+xocyTzv/SXhQ52Jd8kvReD3cYCwJvHDTHlLszgHzS69s0UZcHLtS55pIle/9oXvJytHQ==}
+
+snapshots:
+
+  leaf@1.0.0: {}
+
+  mid@1.0.0:
+    dependencies:
+      leaf: 1.0.0
+
+  other@1.0.0: {}
