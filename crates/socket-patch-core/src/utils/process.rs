@@ -424,8 +424,13 @@ pub fn kill_builds_on_interrupt() {
 
 /// One pass of [`kill_builds_on_interrupt`] over the process group `pgid`:
 /// SIGKILL it (once: `killed` remembers the group), reap its leader when
-/// it has exited, and say whether no process of the group is left.
-/// Async-signal-safe.
+/// it has exited, and say whether no process of the group is left and the
+/// leader is reaped. Async-signal-safe.
+///
+/// The leader is this process's own child, so a wait for it is the one
+/// certain sign that it is dead. The group probe alone is not: macOS stops
+/// counting an exiting process in its group before its parent can wait
+/// for it, so the probe can find nobody while the leader is still going.
 #[cfg(unix)]
 fn end_build_group(pgid: i32, killed: &mut i32) -> bool {
     // SAFETY: plain syscalls on a process group this process created and
@@ -435,15 +440,17 @@ fn end_build_group(pgid: i32, killed: &mut i32) -> bool {
             libc::kill(-pgid, libc::SIGKILL);
             *killed = pgid;
         }
+        // `waitpid(WNOHANG)` answers 0 only for a child that has not
+        // exited yet. Any other answer means the leader is reaped: by
+        // this call, or (ECHILD) by an earlier pass or the build's thread.
         let mut status = 0;
-        libc::waitpid(pgid, &mut status, libc::WNOHANG);
+        let mut reaped = libc::waitpid(pgid, &mut status, libc::WNOHANG) != 0;
         let gone = libc::kill(-pgid, 0) != 0;
-        if gone {
-            // Where a zombie no longer counts as a member of its group
-            // (macOS), the leader may have died since the wait above.
-            libc::waitpid(pgid, &mut status, libc::WNOHANG);
+        if gone && !reaped {
+            // The leader may have died since the wait above.
+            reaped = libc::waitpid(pgid, &mut status, libc::WNOHANG) != 0;
         }
-        gone
+        gone && reaped
     }
 }
 
@@ -1229,7 +1236,7 @@ pub(crate) mod tests {
         assert!(gone, "the build's compiler {compiler} is still there");
         assert!(
             child.try_wait().is_err(),
-            "the pass reaped the build's child itself"
+            "the pass left the build's child unreaped"
         );
     }
 
