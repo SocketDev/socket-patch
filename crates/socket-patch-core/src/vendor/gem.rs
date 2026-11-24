@@ -140,6 +140,10 @@ use crate::formats::gem::{
 
 pub(crate) mod bazel;
 
+/// The code of the advisory a run gives for a gem it vendored for a Bazel
+/// hub, whose build alone installs it.
+pub const BAZEL_FILE_SOURCE: &str = bazel::ADVISORY;
+
 pub(super) const GEMFILE: &str = "Gemfile";
 pub(super) const GEMFILE_LOCK: &str = "Gemfile.lock";
 

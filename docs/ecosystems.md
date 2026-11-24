@@ -3110,6 +3110,12 @@ nothing is written, and the message names it:
   and 9.2.0 fixed it (read, not run). A checkout that names no release, or one that is not
   three numbers (`latest`, `8.x`), is declined: 9.1.0 may build it, or a release to come.
   What the environment of a machine names (`USE_BAZEL_VERSION` in a shell) is not seen.
+- **No rc file of the checkout takes the download from Bazel's own downloader.** `.bazelrc`
+  and the files it imports name none of `--experimental_remote_downloader` (a remote
+  downloader is handed the URL in the place of Bazel's own), `--repository_disable_download`
+  and `--vendor_dir` (a hub pinned in a vendor directory keeps the gems it has), however the
+  option is set, and each of those files can be read. An rc file of the machine or of the
+  home directory, and the command line, are not seen.
 - **The project is the root of the Bazel workspace.** Bazel opens the URL from the root, and
   the committed gem lies under the project.
 - **The workspace is read with certainty**: its module files are, no `WORKSPACE` file
@@ -3160,10 +3166,11 @@ committed gem to the patch, by its patched files, and to the sha256 of the ledge
 `repair` downloads it again. `vendor --revert`, `rollback` and `remove` take the source off
 the `Gemfile`, put the lock's entry back into its section where Bundler sorts it, with its
 `DEPENDENCIES` entry and its `CHECKSUMS` line as they were, and delete the directory of the
-patch: byte for byte for a lock whose entries are in Bundler's own order. A pair whose
-`source:` or `GEM` section is no longer what the run wrote is left alone with the gem
-(`vendor_lock_entry_drifted`); the gem's `CHECKSUMS` line is put back as it was whatever
-it holds by then. A newer patch of the gem takes the source over in place, and a vendored
+patch: byte for byte for a lock whose entries are in Bundler's own order. A file of the two
+that names the source nowhere has been put back already, by hand or by git, and the other
+goes back by itself. A file that still names it and whose `source:` or `GEM` section is no
+longer what the run wrote leaves both alone with the gem (`vendor_lock_entry_drifted`); the
+gem's `CHECKSUMS` line is put back as it was whatever it holds by then. A newer patch of the gem takes the source over in place, and a vendored
 scan takes over a hosted pin of the gem. `list` and `vex` show the gem as vendored; `vex`
 says `not_affected` of it, and the flow below holds that document to the patched build.
 `vex` holds the committed gem to its patched files; only `vendor --check` holds it to its

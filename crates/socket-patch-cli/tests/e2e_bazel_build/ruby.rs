@@ -830,7 +830,11 @@ fn committed_for_the_hub(cell: &Cell, scan: &Ran, served: &Served, before: &Tree
 ///   vendored --yes` declines the gem: it exits 1, names the call of
 ///   `MODULE.bazel` that reads the lock, the missing release, hosted mode
 ///   and the switch, writes nothing and downloads no gem. The same two
-///   Bazel commands print the unpatched marker, and change no file.
+///   Bazel commands print the unpatched marker, and change no file. With
+///   `--allow-vendored-in-bazel` the command writes the unpacked copy named
+///   by its path, as in every other project, and the same build fails in
+///   `bundle install`, where the path names nothing: the failure the
+///   decline is for. `vendor --revert` puts every file and the build back.
 /// - (c) With the release of this Bazel in `.bazelversion`, the same
 ///   command vendors the gem: it writes the three files of
 ///   [`file_source_by_hand`], byte for byte, with its ledger, and says
@@ -865,13 +869,40 @@ fn vendored_bundle_fetch() {
 
     // (a) The unpatched build.
     let before = cell.builds_unpatched(&served.unpatched);
-    let upstream_fetches = standin.asked(&served.upstream_route);
 
     // (b) No release is named: declined, with nothing written and nothing
     // of the patch fetched. The same build passes, on the upstream gem.
     cell.declined(&run(&cell, &VENDORED), &DECLINED, 1, "failed", &before);
     assert_eq!(standin.asked(&served.artifact_route), 0, "{test}");
     cell.builds_patched(&before, &served.unpatched);
+
+    // What the decline is for: on the user's word the command writes the
+    // copy of every other project, named by its path, and the same build
+    // fails where rules_ruby runs Bundler, in a repository of Bazel's that
+    // does not hold that path. Bundler breaks its message at the width of
+    // its console, so it is compared without white space. The undo, which
+    // takes no switch, puts every file and the build back.
+    {
+        let scan = run(&cell, &[&VENDORED[..], &[ALLOW]].concat());
+        assert_eq!(scan.code, 0, "{test}: {}", scan.dump);
+        let copy = format!(".socket/vendor/gem/{uuid}/{NAME}-{VERSION}");
+        let lock = String::from_utf8(cell.tree()["Gemfile.lock"].clone()).expect("a text file");
+        let section = format!("PATH\n  remote: {copy}\n  specs:\n    {NAME} ({VERSION})\n\n");
+        assert!(lock.starts_with(&section), "{test}: Gemfile.lock:\n{lock}");
+        let build = cell.bazel("build", &[CONSUMER]);
+        let squeezed = |text: &str| text.split_whitespace().collect::<String>();
+        let stderr = squeezed(&build.stderr());
+        let missing = squeezed(&format!("{copy}` does not exist."));
+        assert!(
+            !build.ok() && stderr.contains("Runningbundleinstall") && stderr.contains(&missing),
+            "{test}: the build did not fail on the path of the copy ({missing:?}):\n{}",
+            build.dump()
+        );
+        let undo = run(&cell, &["vendor", "--revert", "--yes"]);
+        cell.undone(&undo, "removed", &before, &served.unpatched);
+    }
+    // The build after the undo fetched the upstream gem once more.
+    let upstream_fetches = standin.asked(&served.upstream_route);
 
     // (c) The release is named: the gem, its ledger, and the two files
     // that name it. The document of that run and the one of `vex` say so,
@@ -1163,7 +1194,7 @@ fn a_gem_is_declined_where_the_committed_gem_is_not_known_to_build() {
     };
     let (first_unheld, second_unheld) = (unheld(15), unheld(28));
     type Edit<'a> = &'a dyn Fn(&Cell);
-    let cases: [(Edit, &str); 9] = [
+    let cases: [(Edit, &str); 10] = [
         (
             &|cell| cell.write(".bazelversion", "9.1.0\n"),
             "Bazel 9.1.0 fails on such a URL",
@@ -1206,6 +1237,11 @@ fn a_gem_is_declined_where_the_committed_gem_is_not_known_to_build() {
                 )
             },
             "a `WORKSPACE` file of the workspace defines repositories",
+        ),
+        (
+            &|cell| cell.write(".bazelrc", "build --repository_disable_download\n"),
+            ".bazelrc:1 names `--repository_disable_download`, under which Bazel may not read the \
+             committed gem",
         ),
     ];
     for (edit, why) in cases {

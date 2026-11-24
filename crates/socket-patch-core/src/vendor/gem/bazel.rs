@@ -58,7 +58,7 @@ use super::{
 };
 use crate::api::client::PlannedDownload;
 use crate::bazel::built::{hub_calls, lock_text, reader};
-use crate::bazel::rc::{declared_release, Release};
+use crate::bazel::rc::{declared_release, mentions, Release};
 use crate::bazel::starlark::Value as Starlark;
 use crate::bazel::workspace::{disk, Doubt, Tag, Workspace};
 use crate::bazel::BazelRoot;
@@ -104,8 +104,8 @@ const ENTRY_LEFT: &str = "vendor_gem_bazel_checksum_left";
 /// what `Gemfile.lock` held before it followed (`original`: the `remote` of
 /// the section the gem came from, its `dependency` entry and its `checksum`
 /// line, each as the lock spelled it, the last two only where it had one).
-const GEMFILE_KIND: &str = "gemfile_file_source";
-const LOCK_KIND: &str = "gemfile_lock_file_source";
+pub(crate) const GEMFILE_KIND: &str = "gemfile_file_source";
+pub(crate) const LOCK_KIND: &str = "gemfile_lock_file_source";
 
 /// The calls of the hub that read the `Gemfile` and the lock of a project
 /// for which a gem committed as its archive is known to build ([`gate`]).
@@ -140,7 +140,8 @@ fn named(tag: &Tag<'_>) -> String {
 ///   the `Gemfile` or the lock of the project reads both, with
 ///   `gem_checksums` that are written out.
 /// - The checkout names a Bazel release whose downloader opens such a URL
-///   ([`opens_file_urls`]).
+///   ([`opens_file_urls`]), and no rc file of it takes the download from
+///   that downloader ([`reads_the_checkout`]).
 /// - The lock names a Bundler that the hub is known to build such a source
 ///   with ([`bundler_builds`]).
 pub(crate) async fn gate(root: &BazelRoot) -> Result<Hub, String> {
@@ -203,6 +204,7 @@ fn read(dir: &Path, project: &Path) -> Result<Hub, String> {
         return Err("no `ruby.bundle_fetch` call is seen to read Gemfile and Gemfile.lock".into());
     }
     opens_file_urls(declared_release(&view))?;
+    reads_the_checkout(mentions(&view, &KEEPS_BAZEL_OFF))?;
     let unread = || "Gemfile.lock cannot be read".to_string();
     let lock = lock_text(dir, GEMFILE_LOCK).ok_or_else(unread)?;
     bundler_builds(&lock)?;
@@ -228,6 +230,33 @@ fn bundler_builds(lock: &str) -> Result<(), String> {
              Bundler is known to build such a source"
                 .into(),
         ),
+    }
+}
+
+/// The options of an rc file under which Bazel may not read the committed
+/// gem: a remote downloader is handed the URL in the place of Bazel's own
+/// (read in Bazel's source: 9.3.2 keeps a `file:` URL to itself, 7.7.2 does
+/// not), a build that may not download fetches nothing, and a hub pinned in
+/// a vendor directory keeps the gems it has. None was built.
+const KEEPS_BAZEL_OFF: [&str; 3] = [
+    "experimental_remote_downloader",
+    "repository_disable_download",
+    "vendor_dir",
+];
+
+/// Whether the rc files of the checkout leave the download of the gem to
+/// Bazel's own downloader, by what [`mentions`] found of
+/// [`KEEPS_BAZEL_OFF`] in them. An option that is named counts however it
+/// is set, and so does an rc file that cannot be read.
+fn reads_the_checkout(found: Result<Vec<(String, usize, String)>, String>) -> Result<(), String> {
+    match found.map(|found| found.into_iter().next()) {
+        Ok(None) => Ok(()),
+        Ok(Some((file, line, word))) => Err(format!(
+            "{file}:{line} names `{word}`, under which Bazel may not read the committed gem"
+        )),
+        Err(file) => Err(format!(
+            "the rc file {file} cannot be read, and may keep Bazel from reading the committed gem"
+        )),
     }
 }
 
@@ -517,6 +546,11 @@ pub(super) async fn vendor(
             return Some(*outcome);
         }
     }
+    // Dry run or not, before anything is downloaded: a directory that git
+    // ignores holds no gem a clone would have.
+    if let Some((code, detail)) = ignored_root_refusal(project, &site.dir).await {
+        return Some(refused(code, detail));
+    }
     if let Some(refusal) = service_offline_conflict(service) {
         return Some(refusal);
     }
@@ -555,7 +589,8 @@ pub(super) async fn vendor(
                 Err(warning) => {
                     return declined(format!(
                         "Gemfile and Gemfile.lock cannot name the committed gem as hosted mode \
-                         names a patch registry ({}: {})",
+                         names a patch registry, and for the reason a hosted run gives ({}: {}); \
+                         the way on that reason names is the one of a hosted run",
                         warning.code, warning.detail
                     ))
                 }
@@ -568,9 +603,6 @@ pub(super) async fn vendor(
     }
 
     // ── the gem, where rules_ruby asks the source for it ─────────────────
-    if let Some((code, detail)) = ignored_root_refusal(project, &site.dir).await {
-        return Some(refused(code, detail));
-    }
     let uuid_dir = prelude.uuid_dir.as_path();
     // A gem whose pair was in place keeps what it has.
     let fresh = plan.is_some();
@@ -689,10 +721,10 @@ fn records(name: &str, source: &str, edits: &[FileEdit]) -> Vec<WiringRecord> {
 /// Revert the entry of a gem committed as its archive: the `Gemfile` loses
 /// the source, the lock's entry goes back to the section it came from with
 /// its `DEPENDENCIES` entry and its `CHECKSUMS` line, and the directory of
-/// the patch is removed. The two files go back together or not at all: a
-/// pair that no longer holds what [`vendor`] wrote is left alone
-/// (`vendor_lock_entry_drifted`) with the gem, and one that names the
-/// source nowhere has been put back already.
+/// the patch is removed. A file that names the source nowhere has been put
+/// back already, and the other goes back by itself; a file that names it
+/// and no longer holds what [`vendor`] wrote leaves both alone
+/// (`vendor_lock_entry_drifted`) with the gem.
 pub(super) async fn revert(
     entry: &VendorEntry,
     project: &Path,
@@ -716,8 +748,17 @@ pub(super) async fn revert(
     let before = before.and_then(|w| w.original.as_ref());
     match (&texts[0], &texts[1]) {
         (Some(lock), Some(gemfile)) if lock.contains(&source) || gemfile.contains(&source) => {
-            let lock = before.and_then(|b| unwire_lock(lock, &name, &version, &source, b));
-            match (lock, unwire_gemfile(gemfile, &name, &source)) {
+            // A file that names the source nowhere has been put back
+            // already: the other one goes back by itself.
+            let lock = match lock.contains(&source) {
+                true => before.and_then(|b| unwire_lock(lock, &name, &version, &source, b)),
+                false => Some(lock.clone()),
+            };
+            let gemfile = match gemfile.contains(&source) {
+                true => unwire_gemfile(gemfile, &name, &source),
+                false => Some(gemfile.clone()),
+            };
+            match (lock, gemfile) {
                 (Some(lock), Some(gemfile)) => {
                     for (file, text) in [(GEMFILE_LOCK, lock), (GEMFILE, gemfile)] {
                         if let Ok(Some(file)) = files.text(file).await {
@@ -960,7 +1001,7 @@ ruby.bundle_fetch(name = "bundle", gemfile = "//:Gemfile", gemfile_lock = "//:Ge
         let pinned = |sums: &str| MODULE.replace(lock_arg, &format!("{lock_arg}, {sums}"));
         let bundler = |version: &str| lock().replace("   2.6.9", &format!("   {version}"));
         let unnamed = "names no Bazel release as three numbers";
-        let cases: [(&str, String, &str); 15] = [
+        let cases: [(&str, String, &str); 18] = [
             (".bazelversion", String::new(), unnamed),
             (".bazelversion", "latest\n".into(), unnamed),
             (".bazelversion", "9.3.2rc1\n".into(), unnamed),
@@ -1023,6 +1064,22 @@ ruby.bundle_fetch(name = "bundle", gemfile = "//:Gemfile", gemfile_lock = "//:Ge
                 GEMFILE_LOCK,
                 String::new(),
                 "Gemfile.lock names no Bundler (`BUNDLED WITH`)",
+            ),
+            (
+                ".bazelrc",
+                "build --experimental_remote_downloader=grpcs://cache.example\n".into(),
+                ".bazelrc:1 names `--experimental_remote_downloader=grpcs://cache.example`, under \
+                 which Bazel may not read the committed gem",
+            ),
+            (
+                ".bazelrc",
+                "build \"--copt\n".into(),
+                "the rc file .bazelrc:1 cannot be read",
+            ),
+            (
+                ".bazelrc",
+                "common --vendor_dir=third_party/bazel\n".into(),
+                ".bazelrc:1 names `--vendor_dir=third_party/bazel`",
             ),
         ];
         for (file, text, why) in cases {
@@ -1368,13 +1425,7 @@ ruby.bundle_fetch(name = "bundle", gemfile = "//:Gemfile", gemfile_lock = "//:Ge
         fs::write(root.join(GEMFILE_LOCK), &drifted).unwrap();
         assert!(kept(&reverted(&entry, &root).await));
         assert_eq!(read(GEMFILE_LOCK), drifted);
-        // The Gemfile lost the source and the lock did not.
         fs::write(root.join(GEMFILE_LOCK), &wired).unwrap();
-        fs::write(root.join(GEMFILE), GEMFILE_TEXT).unwrap();
-        let outcome = reverted(&entry, &root).await;
-        let drifted = |w: &VendorWarning| w.code == "vendor_lock_entry_drifted";
-        assert!(outcome.warnings.iter().any(drifted) && read(GEMFILE_LOCK) == wired);
-        fs::write(root.join(GEMFILE), &gemfile).unwrap();
         // A record that names another gem's line, or more than one line.
         for (key, line) in [
             ("checksum", format!("ast (1.0.0) sha256={}", sum('e'))),
@@ -1398,6 +1449,29 @@ ruby.bundle_fetch(name = "bundle", gemfile = "//:Gemfile", gemfile_lock = "//:Ge
             "{outcome:?}"
         );
         assert!(!root.join(".socket/vendor").exists());
+        // One of the two put back by hand: the other goes back by itself,
+        // and the gem goes.
+        for by_hand in [GEMFILE, GEMFILE_LOCK] {
+            let (_tmp, root) = checkout(MODULE, &[]);
+            let entry = wire(&root, "rack", "2.2.3", UUID);
+            let before = match by_hand {
+                GEMFILE => GEMFILE_TEXT.to_string(),
+                _ => lock(),
+            };
+            fs::write(root.join(by_hand), before).unwrap();
+            let outcome = reverted(&entry, &root).await;
+            assert!(
+                outcome.success && outcome.warnings.is_empty(),
+                "{by_hand}: {outcome:?}"
+            );
+            let read = |file: &str| fs::read_to_string(root.join(file)).unwrap();
+            assert_eq!(
+                [read(GEMFILE), read(GEMFILE_LOCK)],
+                [GEMFILE_TEXT.to_string(), lock()],
+                "{by_hand}"
+            );
+            assert!(!root.join(".socket/vendor").exists(), "{by_hand}");
+        }
     }
 
     /// A committed gem is held to the patch by the files in it.
