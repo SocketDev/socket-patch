@@ -1233,6 +1233,43 @@ pub(crate) mod tests {
         );
     }
 
+    /// A pass does not call a group gone while the build's own child is
+    /// still to be reaped. macOS stops counting an exiting process in its
+    /// group before its parent can wait for it; a child that leads no
+    /// group puts a pass in the same state on every Unix: the group probe
+    /// finds nobody, and the child is not waitable.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupt_pass_waits_for_the_leader_the_group_probe_missed() {
+        let mut build = Command::new("sleep");
+        build
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = build.spawn().unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+
+        let mut killed = 0;
+        let gone = end_build_group(pid, &mut killed);
+        // The child is in the test's group, so the pass did not signal it.
+        child.kill().unwrap();
+        assert!(!gone, "the pass called a group gone over its live leader");
+
+        let start = Instant::now();
+        while !end_build_group(pid, &mut killed) {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the killed child {pid} was never reaped"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            child.try_wait().is_err(),
+            "the pass called the group gone with its leader unreaped"
+        );
+    }
+
     /// Spawn failure → None. The binary name is intentionally one
     /// that should never be on PATH.
     #[test]
