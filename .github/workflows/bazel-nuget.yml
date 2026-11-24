@@ -46,11 +46,13 @@ on:
     # version and folder helpers that every one of those files calls.
     # patch/sidecars/nuget.rs is what agent mode does to a package in
     # NuGet's folder beyond its files. Last, the VEX code: `vex/` of the
-    # core and the files of the `vex` command. The agent flow holds the
-    # exact document socket-patch writes about its build, so a change to
-    # how a document is built or worded starts the legs of every ecosystem.
-    # Nothing else that another ecosystem's flow owns is here: any other
-    # change to one ecosystem starts that ecosystem's legs only.
+    # core, the files of the `vex` command, and what `vex` makes of the tag
+    # (bazel/built.rs, which says what the hub of each ecosystem builds).
+    # The agent flow holds the exact document socket-patch writes about its
+    # build, so a change to how a document is built or worded starts the
+    # legs of every ecosystem. Nothing else that another ecosystem's flow
+    # owns is here: any other change to one ecosystem starts that
+    # ecosystem's legs only.
     #
     # What it does not cover: shared engine code. The hosted rewrite itself
     # is there (`rewrite_nuget` in patch/redirect/mod.rs, the file of every
@@ -76,6 +78,7 @@ on:
       - 'crates/socket-patch-core/src/vex/discover/nuget.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/nuget.rs'
       - 'crates/socket-patch-cli/src/commands/scan/hosted/nuget.rs'
+      - 'crates/socket-patch-core/src/bazel/built.rs'
       - 'crates/socket-patch-core/src/bazel/mod.rs'
       - 'crates/socket-patch-core/src/bazel/nuget.rs'
       - 'crates/socket-patch-core/src/bazel/starlark.rs'
@@ -106,6 +109,7 @@ on:
       - 'crates/socket-patch-core/src/vex/discover/nuget.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/nuget.rs'
       - 'crates/socket-patch-cli/src/commands/scan/hosted/nuget.rs'
+      - 'crates/socket-patch-core/src/bazel/built.rs'
       - 'crates/socket-patch-core/src/bazel/mod.rs'
       - 'crates/socket-patch-core/src/bazel/nuget.rs'
       - 'crates/socket-patch-core/src/bazel/starlark.rs'

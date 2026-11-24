@@ -74,8 +74,9 @@
 //! copy of the package in NuGet's global packages folder, where the user's
 //! `dotnet restore` unpacked it. No build of Bazel's reads that folder, so
 //! the build is the unpatched one before the command and after it. The flow
-//! asserts that, and what every form of `vex` says of the package meanwhile
-//! (see "Known gaps").
+//! asserts that, and that every form of `vex` says so meanwhile: the
+//! package is affected ([`affected`]), unless `vex` is told that the
+//! installed tree is what ships (`--no-bazel`).
 //!
 //! Both markers are read from what Bazel built, and each holds an id made
 //! for the run. Bazel's downloader keeps every file it fetches in the
@@ -137,7 +138,7 @@
 //!
 //! # Known gaps
 //!
-//! Four outcomes the flows assert are gaps of the product, not its
+//! Three outcomes the flows assert are gaps of the product, not its
 //! contract. Each is asserted as the release has it, and marked
 //! `KNOWN GAP` there with what a fix would change in this test:
 //!
@@ -149,11 +150,6 @@
 //!   while Bazel builds the patched package (c).
 //! - Bazel prints the access token of the grant, in a warning for each
 //!   package of the lock that the Socket source does not hold (c).
-//! - After agent mode, `scan --mode agent --vex`, `apply --vex`, `vex` and
-//!   `vex --no-verify` each write a document that says the package is not
-//!   affected, through the patch, while Bazel builds the unpatched package:
-//!   `vex` reads the copy in NuGet's folder and not what the hub builds
-//!   from (the agent flow).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -166,8 +162,8 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
 use crate::envelope::{codes_in, event_triples};
 use crate::harness::{
-    cell_without_bazel, changed, fixture_path, rewrite, Cell, Claim, Fixture, How, Ran, StandIn,
-    Tree, CONSUMER, NOTHING,
+    cell_without_bazel, changed, fixture_path, rewrite, with_vex, Cell, Claim, Fixture, How, Ran,
+    StandIn, Tree, CONSUMER, NOTHING,
 };
 use crate::hosted_memory_common::{read_tree, Patch, ORG};
 
@@ -1064,6 +1060,27 @@ impl Restored {
     }
 }
 
+/// What every form of `vex` has to say of the package while `patch` is in
+/// NuGet's folder alone and the hub of the checkout of `cell` builds it
+/// from the lock: the whole action statement of the document, which the
+/// run warning repeats. It names the lock, the call and its line, hosted
+/// mode, which [`hosted_from_lock`] builds patched, with what it needs of
+/// the hub, and the option for a repository that ships the installed tree.
+fn affected(cell: &Cell, patch: &Patched) -> Vec<String> {
+    let module = text(&cell.tree(), MODULE);
+    let call = module.lines().position(|line| line == "nuget.from_lock(");
+    vec![format!(
+        "Bazel builds this package from {LOCK} (`nuget.from_lock`, {MODULE}:{}), which does not \
+         name Socket patch {}: the patch is only in the installed copy. Run `socket-patch scan \
+         --mode hosted` in the directory of that lock to pin the patch there (the call has to \
+         name the project's nuget.config, `nuget_config`). If what you ship is the installed \
+         tree and not what Bazel builds, pass `--no-bazel` (`--vex-no-bazel` on scan, apply and \
+         vendor).",
+        call.expect("a hub") + 1,
+        patch.uuid
+    )]
+}
+
 /// Agent mode beside the hub, which builds the package from the lock.
 ///
 /// - (a) `bazel build` and `bazel run //:consumer` print the unpatched
@@ -1072,13 +1089,15 @@ impl Restored {
 ///   `dotnet restore` ([`restored`]). `scan --mode agent --yes` patches the
 ///   assembly of the package there and writes nothing into the checkout
 ///   but its `.socket` directory, and `apply` passes
-///   ([`Cell::patches_outside`]). KNOWN GAP: both, `vex` and
-///   `vex --no-verify` write a document that says the package is not
-///   affected, through the patch.
-/// - (c) The same two Bazel commands print the unpatched marker again, and
-///   change no file: the hub has Bazel download the package the lock pins,
-///   and no build reads NuGet's folder. So the documents of (b) are false
-///   for what Bazel builds.
+///   ([`Cell::patches_outside`]). Both, `vex` and `vex --no-verify` exit 0
+///   and write a document that says the package is affected, with what to
+///   do about it ([`affected`]).
+/// - (c) The same two Bazel commands print the unpatched marker again, as
+///   the documents said, and change no file: the hub has Bazel download
+///   the package the lock pins, and no build reads NuGet's folder.
+///   `vex --no-bazel` says not affected, through the patch: its document
+///   then speaks of NuGet's folder, for a repository that ships what
+///   `dotnet` built from it, and not of the Bazel build.
 /// - (d) A second machine prints the unpatched marker too. Its Bazel has
 ///   built nothing and evaluates the hub anew, with the patched folder
 ///   named in its environment ([`Cell::builds_anew`]); the build of (c)
@@ -1103,16 +1122,19 @@ fn agent_from_lock() {
         "{test}: the build did not fetch the upstream package from the stand-in"
     );
 
-    // (b) Agent mode patches the copy in NuGet's folder. KNOWN GAP: every
-    // document says the package is not affected. Once `vex` reads the hub,
-    // the claim is `Claim::unbuilt`, with the call and the lock it names.
+    // (b) Agent mode patches the copy in NuGet's folder, and every
+    // document says the package is affected.
     let assembly = machine.assembly();
     let run = |cell: &Cell, args: &[&str]| socket_patch(cell, standin, machine.home.path(), args);
-    let claim = Claim::new(&purl, &patch.uuid, How::Agent);
+    let names = affected(&cell, patch);
+    let claim = Claim::unbuilt(&purl, &patch.uuid, &names);
     let patched = cell.patches_outside(run, &assembly, &patch.package.assembly, &claim);
 
     // (c) The build is the one of (a): Bazel never reads the patched copy.
+    // Told that the installed tree is what ships, `vex` attests that tree.
     cell.builds(&unpatched);
+    let shipped = |cell: &Cell, args: &[&str]| run(cell, &[args, &["--no-bazel"]].concat());
+    cell.stands_alone(shipped, &Claim::new(&purl, &patch.uuid, How::Agent), true);
     assert_eq!(changed(&patched, &cell.tree()), NOTHING, "{test}");
 
     // (d) Nor does a Bazel that evaluates the hub anew read it.
@@ -1120,8 +1142,9 @@ fn agent_from_lock() {
 
     println!(
         "{test}: Bazel {release} built {unpatched:?} before and after `scan --mode agent` \
-         patched {}, and on a second machine; (KNOWN GAP) every form of `vex` said the package \
-         is not affected; {:?}",
+         patched {}, and on a second machine; every form of `vex` said the package is affected, \
+         in the words {names:?}, and `vex --no-bazel` said it is not affected in the installed \
+         tree; {:?}",
         assembly.display(),
         started.elapsed()
     );
@@ -1410,6 +1433,83 @@ fn the_pin_is_written_where_the_hub_takes_it() {
             assert!(detail.contains(words), "{said}");
         }
     }
+}
+
+/// Without a Bazel: a checkout of the fixture for a new run of agent mode
+/// ([`restored`]), with the `MODULE.bazel` of its era at the root.
+fn restored_checkout() -> (Cell, Restored) {
+    let mut cell = cell_without_bazel("9.3.2");
+    for part in ["common", "e9"] {
+        for (rel, bytes) in read_tree(&fixture_path(FIXTURE.dir).join(part)) {
+            cell.write(&rel, bytes);
+        }
+    }
+    cell.write(".git/HEAD", "ref: refs/heads/main\n");
+    let machine = restored(&mut cell);
+    (cell, machine)
+}
+
+/// Without a Bazel: step (b) of [`agent_from_lock`] in a checkout of the
+/// fixture, where `MODULE.bazel` hands the lock to rules_csharp. Then what
+/// the document says to do: `scan --mode hosted --yes` pins the patch in
+/// the two files the hub names, and its document and the one of `vex` say
+/// not affected, through the pin.
+#[test]
+fn an_installed_package_is_affected_beside_a_hub_that_reads_the_lock() {
+    let (cell, machine) = restored_checkout();
+    let (standin, patch) = (&machine.standin, &machine.patch);
+    let purl = machine.upstream.purl();
+    let run = |cell: &Cell, args: &[&str]| socket_patch(cell, standin, machine.home.path(), args);
+    let names = affected(&cell, patch);
+    let claim = Claim::unbuilt(&purl, &patch.uuid, &names);
+    cell.patches_outside(run, &machine.assembly(), &patch.package.assembly, &claim);
+
+    let document = cell.document("hosted");
+    let scan = run(&cell, &[&SCAN[..], &with_vex(&document)].concat());
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{}", scan.dump);
+    let claim = Claim::new(&purl, &patch.uuid, How::Hosted);
+    cell.wrote_in_run(&scan, &document, &claim);
+    cell.stands_alone(run, &claim, true);
+}
+
+/// Without a Bazel: what stays the statement of a project without Bazel
+/// while the patch is in NuGet's folder alone
+/// ([`Cell::keeps_its_statement`]). The hubs that decide nothing: one over
+/// the lock of another directory, one whose `nuget_config` is not written
+/// out, one whose call may not run, and one with a second call, for the
+/// lock of another project, whose `nuget_config` names the patch:
+/// rules_csharp makes one hub of both calls, which may build the patched
+/// package through that project's pin.
+#[test]
+fn an_installed_package_is_attested_where_no_hub_is_shown_to_build_it() {
+    let (cell, machine) = restored_checkout();
+    let (standin, patch) = (&machine.standin, &machine.patch);
+    let (purl, home) = (machine.upstream.purl(), machine.home.path());
+    let run = |cell: &Cell, args: &[&str]| socket_patch(cell, standin, home, args);
+    let names = affected(&cell, patch);
+    let claim = Claim::unbuilt(&purl, &patch.uuid, &names);
+    let patched = cell.patches_outside(run, &machine.assembly(), &patch.package.assembly, &claim);
+
+    let gives = |args: &[&str], document: &Path| {
+        on_machine(standin, home, |api, env| {
+            cell.gives(api, args, env, document)
+        })
+    };
+    // The config of another project, which hosted mode pinned the patch in.
+    let pinned = format!("<add key=\"socket-patch\" value=\"{}\" />\n", patch.index());
+    cell.write("pinned.config", pinned);
+    let module = text(&patched, MODULE);
+    let undecided = [
+        module.replace("\"//:", "\"//third_party:"),
+        module.replace(NAMES_CONFIG, "    nuget_config = CONFIG,\n"),
+        module.replace("nuget.from_lock(", "ENABLED and nuget.from_lock("),
+        format!(
+            "{module}nuget.from_lock(\n    nuget_config = \"//:pinned.config\",\n    \
+             packages_lock_json = \"//third_party:{LOCK}\",\n)\n"
+        ),
+    ];
+    let installed = Claim::new(&purl, &patch.uuid, How::Agent);
+    cell.keeps_its_statement(run, gives, &installed, &undecided);
 }
 
 /// Without a Bazel, what stays fixed now that no id and no sum is

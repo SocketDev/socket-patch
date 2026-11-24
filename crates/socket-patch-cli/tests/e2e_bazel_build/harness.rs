@@ -1467,6 +1467,44 @@ impl Cell {
         left
     }
 
+    /// What stays the statement of a project without Bazel in this
+    /// checkout, after [`Cell::patches_outside`] under a hub that builds
+    /// the package from the project's lock. With `--no-bazel`, and with
+    /// each of `undecided` as its `MODULE.bazel`, whose files do not show
+    /// such a hub, `vex` attests the package as `installed` says, through
+    /// the patch. And what it gives a script and a person is what it gives
+    /// in the same checkout without its `MODULE.bazel`: the exit code,
+    /// both streams and the document. `gives` is [`Cell::gives`] of this
+    /// cell with the Socket API and the environment of `run`.
+    pub fn keeps_its_statement(
+        &self,
+        run: impl Fn(&Cell, &[&str]) -> Ran,
+        gives: impl Fn(&[&str], &Path) -> Value,
+        installed: &Claim,
+        undecided: &[String],
+    ) {
+        let shipped = |cell: &Cell, args: &[&str]| run(cell, &[args, &["--no-bazel"]].concat());
+        self.stands_alone(shipped, installed, true);
+        let document = self.document("undecided");
+        let vex = vex(&document);
+        let mut given = vec![gives(&[&vex[..], &["--no-bazel"]].concat(), &document)];
+        let module = self.path("MODULE.bazel");
+        let hub = std::fs::read_to_string(&module).expect("MODULE.bazel");
+        for other in undecided {
+            assert_ne!(*other, hub, "{}", self.test);
+            self.write("MODULE.bazel", other);
+            self.stands_alone(&run, installed, true);
+            given.push(gives(&vex, &document));
+        }
+        std::fs::remove_file(&module).expect("MODULE.bazel");
+        self.stands_alone(&run, installed, true);
+        let without_bazel = gives(&vex, &document);
+        for (at, given) in given.iter().enumerate() {
+            assert_eq!(*given, without_bazel, "{}: the run {at}", self.test);
+        }
+        println!("`vex` in a checkout without MODULE.bazel:\n{without_bazel:#}");
+    }
+
     /// The stand-alone `vex` of a checkout that holds no patch any more,
     /// through `run`: it exits `code` with the error `error` and leaves no
     /// document, and says that it removed the one [`Cell::stands_alone`]

@@ -89,8 +89,9 @@
 //! or a `cargo build` of the user unpacked it. No build of Bazel's reads a
 //! cargo home: the hub has Bazel download the crate file the lock pins. So
 //! the build is the unpatched one before the command and after it. The flow
-//! asserts that, and what every form of `vex` says of the crate meanwhile
-//! (see "Known gaps").
+//! asserts that, and that every form of `vex` says so meanwhile: the crate
+//! is affected ([`affected`]), unless `vex` is told that the installed tree
+//! is what ships (`--no-bazel`).
 //!
 //! The two releases also differ in the home of the hub's cargo
 //! ([`cargo_env`]). rules_rust 0.75.0 gives it a directory inside the
@@ -201,17 +202,6 @@
 //! without a Bazel
 //! ([`only_the_build_file_of_cargo_bazel_is_no_change_of_a_vendored_copy`],
 //! [`the_vendored_crates_get_a_bazelignore_line_where_a_crate_hub_builds_them`]).
-//!
-//! # Known gaps
-//!
-//! One assertion of the agent flow holds what is wrong today, with every
-//! ruleset, and is marked `KNOWN GAP` there with what a fix changes in this
-//! test: `scan --mode agent --vex`, `apply --vex`, `vex` and
-//! `vex --no-verify` each write a document that says the crate is not
-//! affected, through the patch, while Bazel builds the unpatched crate.
-//! `vex` reads the copy in the cargo home and not what the hub builds from.
-//! A fix makes the document say that the crate is affected, and name the
-//! call of `MODULE.bazel` that builds it from the lock.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -223,8 +213,8 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
 use crate::envelope::{codes_in, event_for, has_event};
 use crate::harness::{
-    cell_without_bazel, changed, fixture_path, Cell, Claim, Fixture, How, Ran, Release, StandIn,
-    Tree, CONSUMER, NOTHING, REPO_CACHE,
+    cell_without_bazel, changed, fixture_path, with_vex, Cell, Claim, Fixture, How, Ran, Release,
+    StandIn, Tree, CONSUMER, NOTHING, REPO_CACHE,
 };
 use crate::hosted_memory_common::{Patch, ORG};
 
@@ -1762,6 +1752,26 @@ fn fetched(home: &Path, upstream: &Package) -> PathBuf {
     library
 }
 
+/// What every form of `vex` has to say of the crate while its patch is in
+/// the cargo home alone and the hub of `module`, the text of the checkout's
+/// `MODULE.bazel`, builds it from the lock: the whole action statement of
+/// the document, which the run warning repeats. It names the lock, the call
+/// and its line, the two modes that a flow of this file builds patched,
+/// with what hosted mode needs of the hub, and the option for a repository
+/// that ships the installed tree.
+fn affected(module: &str, patch: &Patched) -> Vec<String> {
+    vec![format!(
+        "Bazel builds this package from {LOCK} (`crate.from_cargo`, {}), which does not name \
+         Socket patch {}: the patch is only in the installed copy. Run `socket-patch scan --mode \
+         hosted` in the directory of that lock to pin the patch there (the call has to name the \
+         project's cargo config, `cargo_config`), or `socket-patch scan --mode vendored` to \
+         commit a patched copy of the crate. If what you ship is the installed tree and not what \
+         Bazel builds, pass `--no-bazel` (`--vex-no-bazel` on scan, apply and vendor).",
+        hub_at(module),
+        patch.uuid
+    )]
+}
+
 /// Agent mode beside a hub that builds the crate from the lock.
 ///
 /// - (a) `bazel build` and `bazel run //:consumer` print the unpatched
@@ -1770,13 +1780,15 @@ fn fetched(home: &Path, upstream: &Package) -> PathBuf {
 ///   `cargo fetch` or `cargo build`. `scan --mode agent --yes` patches the
 ///   library of that copy and writes nothing into the checkout but its
 ///   `.socket` directory, and `apply` passes
-///   ([`Cell::patches_outside`]). KNOWN GAP: both, `vex` and
-///   `vex --no-verify` write a document that says the crate is not
-///   affected, through the patch.
-/// - (c) The same two Bazel commands print the unpatched marker again, and
-///   change no file: the hub has Bazel download the crate file the lock
-///   pins, and no build reads a cargo home. So the documents of (b) are
-///   false for what Bazel builds.
+///   ([`Cell::patches_outside`]). Both, `vex` and `vex --no-verify` exit 0
+///   and write a document that says the crate is affected, with what to do
+///   about it ([`affected`]).
+/// - (c) The same two Bazel commands print the unpatched marker again, as
+///   the documents said, and change no file: the hub has Bazel download
+///   the crate file the lock pins, and no build reads a cargo home.
+///   `vex --no-bazel` says not affected, through the patch: its document
+///   then speaks of the cargo home, for a repository that ships what cargo
+///   built from it, and not of the Bazel build.
 /// - (d) A second machine prints the unpatched marker too. Its Bazel has
 ///   built nothing and evaluates the hub anew, with the patched cargo home
 ///   as the one of its environment ([`Cell::builds_anew`]); the build of
@@ -1796,16 +1808,19 @@ fn agent_from_cargo_with_config() {
     // (a) The unpatched build, with the upstream crate from the stand-in.
     builds_upstream(&cell, &standin, &upstream);
 
-    // (b) Agent mode patches the copy in the cargo home. KNOWN GAP: every
-    // document says the crate is not affected. Once `vex` reads the hub,
-    // the claim is `Claim::unbuilt`, with the call and the lock it names.
+    // (b) Agent mode patches the copy in the cargo home, and every
+    // document says the crate is affected.
     let library = fetched(home.path(), &upstream);
     let run = |cell: &Cell, args: &[&str]| socket_patch_at(cell, &standin, home.path(), args);
-    let claim = Claim::new(PURL, &patch.uuid, How::Agent);
+    let names = affected(&text(&cell.tree(), MODULE), &patch);
+    let claim = Claim::unbuilt(PURL, &patch.uuid, &names);
     let patched = cell.patches_outside(run, &library, &patch.package.lib_rs, &claim);
 
     // (c) The build is the one of (a): Bazel never reads the patched copy.
+    // Told that the installed tree is what ships, `vex` attests that tree.
     cell.builds(&upstream.marker);
+    let shipped = |cell: &Cell, args: &[&str]| run(cell, &[args, &["--no-bazel"]].concat());
+    cell.stands_alone(shipped, &Claim::new(PURL, &patch.uuid, How::Agent), true);
     assert_eq!(changed(&patched, &cell.tree()), NOTHING, "{test}");
 
     // (d) Nor does a Bazel that evaluates the hub anew read it.
@@ -1813,12 +1828,91 @@ fn agent_from_cargo_with_config() {
 
     println!(
         "{test}: Bazel {release} built {:?} before and after `scan --mode agent` patched {}, \
-         and on a second machine; (KNOWN GAP) every form of `vex` said the crate is not \
-         affected; {:?}",
+         and on a second machine; every form of `vex` said the crate is affected, in the words \
+         {names:?}, and `vex --no-bazel` said it is not affected in the installed tree; {:?}",
         upstream.marker,
         library.display(),
         started.elapsed()
     );
+}
+
+/// Without a Bazel: a checkout of the fixture's Cargo project whose
+/// `MODULE.bazel` is `module`, a cargo home that holds the crate
+/// ([`fetched`]), the stand-in of the run, and a patch of the crate granted
+/// to agent mode.
+fn fetched_checkout(module: &str) -> (Cell, tempfile::TempDir, StandIn, Package, Patched) {
+    let (upstream, patch) = (Package::upstream(), Patched::new());
+    let standin = registry(&upstream);
+    grant_installed(&standin, &upstream, &patch);
+    let cell = checkout("", &upstream, &[(MODULE, module)]);
+    (cell, cargo_home(), standin, upstream, patch)
+}
+
+/// Without a Bazel: step (b) of [`agent_from_cargo_with_config`] in a
+/// checkout of the fixture, where `MODULE.bazel` hands the lock to
+/// rules_rust, by either name of the file that defines the extension. Then
+/// each of the two modes the document names, in a checkout of its own: the
+/// scan of that mode pins or vendors the crate, and its document and the
+/// one of `vex` say not affected, through that mode.
+#[test]
+fn an_installed_crate_is_affected_beside_a_hub_that_reads_the_lock() {
+    let named = module_naming_config();
+    let older = named.replace("universe:extensions.bzl", "universe:extension.bzl");
+    assert_ne!(older, named);
+    let ways = [
+        (&named, "hosted", How::Hosted),
+        (&older, "vendored", How::Vendored),
+    ];
+    for (module, mode, how) in ways {
+        let (cell, home, standin, upstream, patch) = fetched_checkout(module);
+        let library = fetched(home.path(), &upstream);
+        let run = |cell: &Cell, args: &[&str]| socket_patch_at(cell, &standin, home.path(), args);
+        let names = affected(module, &patch);
+        let claim = Claim::unbuilt(PURL, &patch.uuid, &names);
+        cell.patches_outside(run, &library, &patch.package.lib_rs, &claim);
+
+        // What the document says to do ends in one that says not affected.
+        let document = cell.document(mode);
+        let scan = ["scan", "--mode", mode, "--yes"];
+        let scan = run(&cell, &[&scan[..], &with_vex(&document)].concat());
+        assert_eq!(scan.envelope["summary"]["applied"], 1, "{}", scan.dump);
+        let claim = Claim::new(PURL, &patch.uuid, how);
+        cell.wrote_in_run(&scan, &document, &claim);
+        cell.stands_alone(run, &claim, true);
+    }
+}
+
+/// Without a Bazel: what stays the statement of a project without Bazel
+/// while the patch is in the cargo home alone
+/// ([`Cell::keeps_its_statement`]). The hubs that decide nothing: one over
+/// the Cargo files of another directory, one with a cargo-bazel lock, one
+/// that names no `Cargo.lock`, and one whose call may not run.
+#[test]
+fn an_installed_crate_is_attested_where_no_hub_is_shown_to_build_it() {
+    let named = module_naming_config();
+    let (cell, home, standin, upstream, patch) = fetched_checkout(&named);
+    let library = fetched(home.path(), &upstream);
+    let run = |cell: &Cell, args: &[&str]| socket_patch_at(cell, &standin, home.path(), args);
+    let names = affected(&named, &patch);
+    let claim = Claim::unbuilt(PURL, &patch.uuid, &names);
+    cell.patches_outside(run, &library, &patch.package.lib_rs, &claim);
+
+    let (origin, index) = hosts(&standin);
+    let at_home = home.path().to_string_lossy();
+    let told = env(&origin, &index, &at_home);
+    let gives = |args: &[&str], document: &Path| cell.gives(&origin, args, &told, document);
+    let lock = "    cargo_lockfile = \"//:Cargo.lock\",\n";
+    let undecided = [
+        named.replace("\"//:", "\"//third_party:"),
+        named.replace(
+            lock,
+            &format!("{lock}    lockfile = \"//:cargo-bazel-lock.json\",\n"),
+        ),
+        named.replace(lock, ""),
+        named.replace("crate.from_cargo(", "ENABLED and crate.from_cargo("),
+    ];
+    let installed = Claim::new(PURL, &patch.uuid, How::Agent);
+    cell.keeps_its_statement(run, gives, &installed, &undecided);
 }
 
 /// Without a Bazel: the Cargo project of the fixture in a checkout of its

@@ -56,11 +56,14 @@ on:
     # scan. That file also holds the npm, Composer and Go parts of the
     # gate, so a change to those starts the Cargo legs too. The globs name
     # that one crate, so no bench fixture is here. Last, the VEX code:
-    # `vex/` of the core and the files of the `vex` command. The agent flow
-    # holds the exact document socket-patch writes about its build, so a
-    # change to how a document is built or worded starts the legs of every
-    # ecosystem. Nothing else that another ecosystem's flow owns is here:
-    # any other change to one ecosystem starts that ecosystem's legs only.
+    # `vex/` of the core, the files of the `vex` command, and of `bazel/`
+    # of the core the reader of the workspace files (mod.rs, starlark.rs,
+    # workspace.rs, and rc.rs, which bazel/cargo.rs reads) and built.rs,
+    # which says what a hub builds. The agent flow holds the exact
+    # document socket-patch writes about its build, so a change to how a
+    # document is built or worded starts the legs of every ecosystem.
+    # Nothing else that another ecosystem's flow owns is here: any other
+    # change to one ecosystem starts that ecosystem's legs only.
     #
     # What it does not cover: shared engine code (patch/redirect/mod.rs,
     # the rest of vendor/, hosted/, the rest of commands/, the apply engine
@@ -80,6 +83,11 @@ on:
       - 'crates/socket-patch-core/src/**/*cargo*'
       - 'crates/socket-patch-core/src/**/*cargo*/**'
       - 'crates/socket-patch-core/src/patch/user_patches.rs'
+      - 'crates/socket-patch-core/src/bazel/built.rs'
+      - 'crates/socket-patch-core/src/bazel/mod.rs'
+      - 'crates/socket-patch-core/src/bazel/rc.rs'
+      - 'crates/socket-patch-core/src/bazel/starlark.rs'
+      - 'crates/socket-patch-core/src/bazel/workspace.rs'
       - 'crates/socket-patch-core/src/vex/**'
       - 'crates/socket-patch-cli/src/commands/vex*.rs'
   push:
@@ -101,6 +109,11 @@ on:
       - 'crates/socket-patch-core/src/**/*cargo*'
       - 'crates/socket-patch-core/src/**/*cargo*/**'
       - 'crates/socket-patch-core/src/patch/user_patches.rs'
+      - 'crates/socket-patch-core/src/bazel/built.rs'
+      - 'crates/socket-patch-core/src/bazel/mod.rs'
+      - 'crates/socket-patch-core/src/bazel/rc.rs'
+      - 'crates/socket-patch-core/src/bazel/starlark.rs'
+      - 'crates/socket-patch-core/src/bazel/workspace.rs'
       - 'crates/socket-patch-core/src/vex/**'
       - 'crates/socket-patch-cli/src/commands/vex*.rs'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
