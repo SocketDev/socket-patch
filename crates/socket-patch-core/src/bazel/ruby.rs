@@ -47,7 +47,8 @@
 //!   string: beside such a tag, Bazel 8 and 9 build from the tag and the
 //!   file is a leftover. Which Bazel runs is not known here, so they count
 //!   on every release, also where Bazel no longer reads the file. In that
-//!   file `workspace(name = "shop")` makes `@shop//` the main repository.
+//!   file `workspace(name = "shop")` makes `@shop//` the main repository,
+//!   and `@__main__//` is that repository where no name is given.
 //! - An entry that is an empty string holds nothing: rules_ruby hands
 //!   Bazel no sha256 for it.
 //!
@@ -131,7 +132,14 @@ fn held(workspace: &Workspace, lock: &str) -> Vec<Held> {
             .iter()
             .filter(free)
             .find(|call| call.callee == "workspace");
-        let own = naming.and_then(|call| call.arg("name"));
+        // Without a name Bazel calls the main repository `__main__`; one
+        // that `**` may pass is not known.
+        let (main, unknown) = (Value::Str("__main__".into()), Value::Other);
+        let own = match naming {
+            Some(call) if call.unpacks() => Some(call.arg("name").unwrap_or(&unknown)),
+            Some(call) => Some(call.arg("name").unwrap_or(&main)),
+            None => Some(&main),
+        };
         let fetches = legacy.calls.iter().filter(free);
         let fetches = fetches.filter(|call| call.callee == "rb_bundle_fetch");
         calls.extend(
@@ -494,6 +502,11 @@ mod tests {
                 false,
             ),
             ("", "@shop//:Gemfile.lock", false),
+            // Bazel's own name for a main repository that is not named.
+            ("", "@__main__//:Gemfile.lock", true),
+            ("workspace()\n", "@__main__//:Gemfile.lock", true),
+            ("", "@__main__//svc:Gemfile.lock", false),
+            ("workspace(**kw)\n", "@other//:Gemfile.lock", true),
             // A name the file binds is not the call that names it.
             (
                 "workspace = other\nworkspace(name = \"shop\")\n",
