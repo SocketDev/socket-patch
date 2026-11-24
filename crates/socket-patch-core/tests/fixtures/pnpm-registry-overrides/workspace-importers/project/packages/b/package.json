@@ -1,0 +1,11 @@
+{
+  "name": "b",
+  "version": "1.0.0",
+  "private": true,
+  "optionalDependencies": {
+    "leaf": "~1.0.0"
+  },
+  "dependencies": {
+    "host": "^1.0.0"
+  }
+}

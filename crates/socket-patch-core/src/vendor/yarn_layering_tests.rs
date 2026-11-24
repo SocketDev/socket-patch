@@ -136,6 +136,7 @@ fn hosted_override() -> DepOverride {
         token: TOKEN.to_string(),
         patch_uuid: UUID.to_string(),
         artifact_url: HOSTED_URL.to_string(),
+        npm_registry_url: None,
         registry_override: None,
         integrity: Integrity {
             sha512: Some(HOSTED_SRI.to_string()),
@@ -924,6 +925,7 @@ async fn berry_hosted_redirect_leaves_builtin_patch_entries_untouched() {
         token: TOKEN.to_string(),
         patch_uuid: UUID.to_string(),
         artifact_url: hosted_url.clone(),
+        npm_registry_url: None,
         registry_override: None,
         integrity: Integrity {
             yarn_berry10c0: Some(
@@ -1003,6 +1005,7 @@ async fn berry_hosted_redirect_of_builtin_patched_package_skips_patch_entry() {
         token: TOKEN.to_string(),
         patch_uuid: UUID.to_string(),
         artifact_url: hosted_url.clone(),
+        npm_registry_url: None,
         registry_override: None,
         integrity: Integrity {
             yarn_berry10c0: Some(format!("10c0/{}", "f".repeat(128))),

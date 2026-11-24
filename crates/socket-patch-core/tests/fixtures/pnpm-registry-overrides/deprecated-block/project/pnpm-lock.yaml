@@ -1,0 +1,42 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      mid:
+        specifier: 1.0.0
+        version: 1.0.0
+      old-notes:
+        specifier: 1.0.0
+        version: 1.0.0
+
+packages:
+
+  leaf@1.0.0:
+    resolution: {integrity: sha512-iuZ2dEUwKbJuRnXq78FAd95+hAtb2Y+tujnKMgcQFHj+5DKBz46Mo578ZeRnXrP8kRoNqCyWTAjJFw5m88RRFg==}
+    engines: {node: '>=8'}
+
+  mid@1.0.0:
+    resolution: {integrity: sha512-KgTAgictdFo5Wq2/+mO75142wnayvsOHEaj9y43h9CO4tJGffqGKaBhp6QSgTEV6F1jcrpF7pxXhj6+x8ZnViA==}
+
+  old-notes@1.0.0:
+    resolution: {integrity: sha512-oPISxHBghL0bBO0UX6/0cOhQPv7uUgg2VFC6h4naS37cmkjTI2dtLjug8hvEydVy5d4kEk7y4zaRLcozKXGUtw==}
+    deprecated: |-
+      use something else
+      second line: with a colon
+        indented third
+
+snapshots:
+
+  leaf@1.0.0: {}
+
+  mid@1.0.0:
+    dependencies:
+      leaf: 1.0.0
+
+  old-notes@1.0.0: {}

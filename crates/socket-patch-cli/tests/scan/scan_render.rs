@@ -37,8 +37,11 @@ fn scan_offline_human_path_errors_on_stderr() {
     );
 }
 
-/// `scan --mode hosted --prune`: the no-GC warning fires BEFORE the crawl,
-/// so an empty project suffices (no network at all).
+/// `scan --mode hosted --prune`: the warning that the flag sweeps no
+/// `.socket/` state in this mode fires BEFORE the crawl, so an empty
+/// project suffices (no network at all). It no longer claims the flag has
+/// no effect: hosted mode's own state, the pnpm registry entries, is
+/// cleaned up on every hosted run.
 #[test]
 fn scan_hosted_prune_human_warns_prune_is_ignored() {
     let tmp = tempfile::tempdir().unwrap();
@@ -48,8 +51,10 @@ fn scan_hosted_prune_human_warns_prune_is_ignored() {
         "hosted --prune stays accepted (never a usage error)"
     );
     assert!(
-        stderr.contains("Warning: --prune has no effect with --mode hosted"),
-        "the ignored-prune warning must reach stderr; got {stderr:?}"
+        stderr.contains("Warning: --prune sweeps no `.socket/` state with --mode hosted")
+            && stderr.contains("already removes the pnpm registry entries")
+            && !stderr.contains("no effect"),
+        "the prune warning must reach stderr; got {stderr:?}"
     );
 }
 

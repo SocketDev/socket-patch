@@ -354,8 +354,9 @@ lists it.
 | `remove <NAME\|PURL\|UUID>` | Restore and remove matching patches; a name or versionless PURL selects every recorded version |
 | `report <UUID\|PURL\|NAME>...` | Tell Socket that a patch broke the build, the tests or the application |
 | `vendor --revert` | Undo vendoring from its recorded edits and remove the vendored artifacts |
-| `repair` | Restore missing or corrupt agent patch data and vendored artifacts using existing records, and clean unused data |
+| `repair` | Restore missing or corrupt agent patch data and vendored artifacts using existing records, and clean unused data, including the pnpm registry entries of hosted patches that no lockfile uses any more |
 | `scan --mode agent --prune` | Patch discovered packages and remove records for dependencies that left the project |
+| `scan` (hosted mode) | Also removes, on every run, the pnpm registry entries of hosted patches that are no longer needed |
 
 `show` reads the patch from the patch service and changes nothing. In a terminal it
 opens the patch full-screen: the fixes, what Socket measured (exploits blocked, tests
@@ -396,6 +397,13 @@ Use `--dry-run` to preview. `rollback --preserve-state` and
 and artifacts for later reuse. Hosted pins have no local state to preserve.
 `remove --skip-rollback` removes tracking without restoring installed files and
 cannot be combined with `--preserve-state`.
+
+Hosted mode keeps its state in the lockfiles, so there is no `.socket/` data for
+`--prune` to sweep in that mode (`scan --mode hosted --prune` says so). What a
+hosted patch adds beside the lock, its `socket-<id>` named registry and its
+override in a pnpm project, is cleaned up automatically once no lockfile uses it: by every
+hosted `scan`, by `repair` (offline, from the files alone), and by `scan --prune`
+in the other modes. See [pnpm hosted mode](ecosystems.md) for the details.
 
 Hosted reversal resolves original registry entries; it does not replay saved file
 snapshots. It needs upstream access and can refuse an unsupported or drifted entry.

@@ -4921,8 +4921,10 @@ async fn scan_updates_reports_superseding_patch_for_a_lock_pinned_project() {
 /// hosted terminals return before the GC blocks, so a bot migrating its sync
 /// job from `--mode agent --prune` would otherwise stop pruning forever with
 /// exit 0 and no signal. The envelope must carry an explicit
-/// `redirect_prune_ignored` warning (and, unchanged, no `gc` object —
-/// hosted mode runs no GC).
+/// `redirect_prune_ignored` warning, and no `gc` object: hosted mode
+/// sweeps no `.socket/` state, and this npm project holds no pnpm registry
+/// route whose cleanup `gc` would count (see
+/// `in_process_pnpm_registry_cleanup.rs`).
 #[tokio::test]
 #[serial]
 async fn hosted_prune_emits_explicit_ignored_warning() {

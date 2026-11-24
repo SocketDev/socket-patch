@@ -12,6 +12,7 @@ pub(crate) mod lock_cli;
 pub(crate) mod measured;
 pub(crate) mod projects_below;
 pub(crate) mod pypi_reinstall;
+pub(crate) mod registry_gc;
 pub mod remove;
 pub mod repair;
 pub mod report;

@@ -118,6 +118,12 @@ pub struct GcReport {
     pub removed_diff_archives: usize,
     pub removed_package_archives: usize,
     pub bytes_freed: u64,
+    /// Entries of hosted mode's pnpm registry route that no lockfile uses
+    /// any more and the run took out of pnpm-workspace.yaml and the pnpm
+    /// locks (`repair`, `scan --prune`; see `commands::registry_gc`), each
+    /// one also an event. They are lines of project files, not artifacts:
+    /// [`Self::total_removed`] and `bytes_freed` leave them out.
+    pub removed_registry_entries: usize,
 }
 
 impl GcReport {
@@ -139,6 +145,7 @@ impl GcReport {
                 .flatten()
                 .map(|r| r.bytes_freed)
                 .sum(),
+            removed_registry_entries: 0,
         }
     }
 
@@ -1336,6 +1343,7 @@ mod tests {
                 "removedDiffArchives": 0,
                 "removedPackageArchives": 1,
                 "bytesFreed": 34,
+                "removedRegistryEntries": 0,
             })
         );
         let mut env = Envelope::new(Command::Remove);

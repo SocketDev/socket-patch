@@ -1853,6 +1853,7 @@ mod tests {
             token: TOKEN.into(),
             patch_uuid: uuid.into(),
             artifact_url,
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha512: Some(SRI.into()),

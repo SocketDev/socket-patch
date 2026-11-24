@@ -20,6 +20,7 @@ fn six(uuid: &str) -> DepOverride {
         artifact_url: format!(
             "https://patch.socket.dev/patch/pypi/six/1.16.0/11111111-1111-4111-8111-111111111111/{uuid}/six-1.16.0-py2.py3-none-any.whl"
         ),
+        npm_registry_url: None,
         registry_override: None,
         integrity: Integrity {
             sha256: Some("c".repeat(64)),

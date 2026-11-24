@@ -56,6 +56,19 @@
 //! reachable registry metadata) and the manual `--trust-lockfile` flag
 //! recovers.
 //!
+//! THE REGISTRY ROUTE: when every grant carries a registry address and the
+//! project's pnpm pins prove pnpm >= 11.20, the scan routes each patched
+//! package through the named registry of its patch (`namedRegistries` plus
+//! `overrides` in pnpm-workspace.yaml, and the lock in the shape pnpm
+//! writes for them) instead of trusting the lock. The pnpm@12 and pnpm@11
+//! legs prove it against the real pnpm with no network beyond two loopback
+//! servers: pnpm re-locks the scan's files without changing a byte, a
+//! fresh checkout frozen-installs the patched bytes with lockfile
+//! verification on, `pnpm add` / `update` / `dedupe` keep a peer-dependent
+//! hosted package, and after each cleanup (a rollback of one package, a
+//! re-scan, the fall back to `trustLockfile`, a full rollback) the
+//! workspace file and the lock still agree, which a frozen install proves.
+//!
 //! Two synthetic legs need no pnpm at all (hermetic wiremock, never ignored),
 //! pinning the rewrite grammar against byte-accurate locks captured from the
 //! 2026-08-18 pnpm matrix sweep: a v5.4 lock (`/name/version:` key) and a v6
@@ -104,6 +117,8 @@ const GHSA: &str = "GHSA-redirect-pnpm";
 const PNPM_PRIMARY: &str = "pnpm@10";
 const PNPM_SECONDARY: &str = "pnpm@9";
 const PNPM_TERTIARY: &str = "pnpm@11";
+/// The first major hosted mode declares named registries for.
+const PNPM_NAMED_REGISTRY: &str = "pnpm@12";
 const PNPM_LEGACY_V5: &str = "pnpm@7";
 const PNPM_LEGACY_V6: &str = "pnpm@8";
 /// left-pad@1.3.0's registry integrity, byte-accurate from the matrix legs'
@@ -1217,6 +1232,1787 @@ async fn pnpm11_zero_touch_frozen_install_lands_patched_bytes_via_auto_trust_con
     let (fresh, ci) = fresh_checkout_install(&fx, PNPM_TERTIARY, "pnpm11-zero-touch", &[], true);
     assert_marker_landed(&fresh, &fx.patched, &ci, "pnpm11 zero-touch");
     assert_fixture_manifestless_vex(&fx, &fresh, "pnpm11 zero-touch");
+}
+
+// ── the registry route, against a real pnpm ─────────────────────────────
+
+/// A synthetic package of the registry-route legs: its name, and the
+/// manifest fields beyond `name` and `version` (every one at 1.0.0).
+struct RoutePackage {
+    name: &'static str,
+    fields: serde_json::Value,
+}
+
+/// The packages the default registry of the registry-route legs serves:
+/// `peer-user` has a peer dependency and a dependency of its own (the
+/// shape a bare registry declaration loses on `pnpm add`), `leaf` is
+/// reached only through other packages, `extra` is there to be added.
+fn route_packages() -> Vec<RoutePackage> {
+    let package = |name, fields| RoutePackage { name, fields };
+    vec![
+        package("leaf", serde_json::json!({})),
+        package(
+            "mid",
+            serde_json::json!({"dependencies": {"leaf": "^1.0.0"}}),
+        ),
+        package("host", serde_json::json!({})),
+        package(
+            "peer-user",
+            serde_json::json!({
+                "peerDependencies": {"host": "^1.0.0"},
+                "dependencies": {"leaf": "^1.0.0"}
+            }),
+        ),
+        package("extra", serde_json::json!({})),
+    ]
+}
+
+const ROUTE_VERSION: &str = "1.0.0";
+
+/// One hosted patch of the registry-route legs.
+struct RoutePatch {
+    name: &'static str,
+    uuid: &'static str,
+    /// The grant the patched tarball is served under.
+    token: &'static str,
+}
+
+const ROUTE_PATCHES: [RoutePatch; 2] = [
+    RoutePatch {
+        name: "leaf",
+        uuid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        token: "1eaf1eaf-1eaf-41ea-8f1e-af1eaf1eaf1e",
+    },
+    RoutePatch {
+        name: "peer-user",
+        uuid: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        token: "9ee29ee2-9ee2-49ee-829e-e29ee29ee29e",
+    },
+];
+
+impl RoutePatch {
+    fn purl(&self) -> String {
+        format!("pkg:npm/{}@{ROUTE_VERSION}", self.name)
+    }
+
+    /// The directory the patch is served from, which is its registry.
+    fn registry_path(&self) -> String {
+        format!(
+            "/patch/npm/{}/{ROUTE_VERSION}/{}/{}/",
+            self.name, self.token, self.uuid
+        )
+    }
+
+    fn tarball_path(&self) -> String {
+        format!("{}{}-{ROUTE_VERSION}.tgz", self.registry_path(), self.name)
+    }
+
+    /// The name of the patch's registry: `socket-` and the first eight
+    /// digits of the patch UUID.
+    fn alias(&self) -> String {
+        format!("socket-{}", &self.uuid[..8])
+    }
+
+    /// The `namedRegistries` line of the patch on `server`.
+    fn registry_line(&self, server: &MockServer) -> String {
+        format!(
+            "  {}: {}{}\n",
+            self.alias(),
+            server.uri(),
+            self.registry_path()
+        )
+    }
+
+    /// The workspace file's `overrides` line of the patch.
+    fn override_line(&self) -> String {
+        format!(
+            "  '{}@{ROUTE_VERSION}': '{}:{ROUTE_VERSION}'\n",
+            self.name,
+            self.alias()
+        )
+    }
+
+    /// The lock's record of that override.
+    fn lock_override(&self) -> String {
+        format!(
+            "  {}@{ROUTE_VERSION}: {}:{ROUTE_VERSION}\n",
+            self.name,
+            self.alias()
+        )
+    }
+
+    /// How the lock spells the patched release once routed.
+    fn routed_version(&self) -> String {
+        format!("{}:{ROUTE_VERSION}", self.alias())
+    }
+
+    /// The advisory the patch fixes.
+    fn advisory(&self) -> String {
+        format!("GHSA-route-{}", self.name)
+    }
+}
+
+fn route_index(name: &str, patched: bool) -> String {
+    let marker = if patched { MARKER } else { "" };
+    format!("{marker}module.exports = '{name}'\n")
+}
+
+/// The tarball of a synthetic package at [`ROUTE_VERSION`].
+fn route_tgz(package: &RoutePackage, patched: bool) -> Vec<u8> {
+    route_tgz_of(package, ROUTE_VERSION, patched)
+}
+
+/// The tarball of `version` of a synthetic package.
+fn route_tgz_of(package: &RoutePackage, version: &str, patched: bool) -> Vec<u8> {
+    let mut manifest = serde_json::json!({"name": package.name, "version": version});
+    for (key, value) in package.fields.as_object().into_iter().flatten() {
+        manifest[key] = value.clone();
+    }
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    ));
+    for (name, bytes) in [
+        (
+            "package/package.json",
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        ),
+        (
+            "package/index.js",
+            route_index(package.name, patched).into_bytes(),
+        ),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, bytes.as_slice())
+            .unwrap();
+    }
+    builder.into_inner().unwrap().finish().unwrap()
+}
+
+/// The fields a registry lists for [`ROUTE_VERSION`] of a synthetic
+/// package.
+fn route_version_document(
+    package: &RoutePackage,
+    tarball: &str,
+    bytes: &[u8],
+) -> serde_json::Value {
+    route_version_document_of(package, ROUTE_VERSION, tarball, bytes)
+}
+
+/// The fields a registry lists for `version` of a synthetic package.
+fn route_version_document_of(
+    package: &RoutePackage,
+    version: &str,
+    tarball: &str,
+    bytes: &[u8],
+) -> serde_json::Value {
+    let mut document = serde_json::json!({
+        "name": package.name,
+        "version": version,
+        "dist": {
+            "tarball": tarball,
+            "integrity": format!("sha512-{}", sha512_sri_b64(bytes)),
+        }
+    });
+    for (key, value) in package.fields.as_object().into_iter().flatten() {
+        document[key] = value.clone();
+    }
+    document
+}
+
+/// The release of `peer-user` past the patched one: the default registry
+/// lists it too (never as `latest`), and no patch is hosted for it.
+const ROUTE_NEXT_VERSION: &str = "2.0.0";
+
+/// The default registry: every synthetic package, as npm serves one (the
+/// packument, the tarball, and the version document the upstream restore
+/// reads).
+async fn mount_route_registry(registry: &MockServer) {
+    for package in route_packages() {
+        let releases: &[&str] = match package.name {
+            "peer-user" => &[ROUTE_VERSION, ROUTE_NEXT_VERSION],
+            _ => &[ROUTE_VERSION],
+        };
+        mount_registry_package(registry, &package, releases, ROUTE_VERSION).await;
+    }
+}
+
+/// One package of a default registry: `releases` of it, `latest` its
+/// `latest` dist-tag.
+async fn mount_registry_package(
+    registry: &MockServer,
+    package: &RoutePackage,
+    releases: &[&str],
+    latest: &str,
+) {
+    let name = package.name;
+    let published = "2020-01-01T00:00:00.000Z";
+    let mut versions = serde_json::Map::new();
+    let mut time = serde_json::json!({"created": published, "modified": published});
+    for version in releases {
+        let bytes = route_tgz_of(package, version, false);
+        let tarball = format!("{}/{name}/-/{name}-{version}.tgz", registry.uri());
+        let document = route_version_document_of(package, version, &tarball, &bytes);
+        versions.insert(version.to_string(), document.clone());
+        time[*version] = published.into();
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}/{version}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(document))
+            .mount(registry)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}/-/{name}-{version}.tgz")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(bytes, "application/octet-stream"),
+            )
+            .mount(registry)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path(format!("/{name}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": name,
+            "dist-tags": {"latest": latest},
+            "versions": versions,
+            "time": time,
+        })))
+        .mount(registry)
+        .await;
+}
+
+/// pnpm for one registry-route leg, with a metadata cache of the leg's own
+/// (`cache`). The mock servers of this file come from a pool, so a later
+/// leg can be served on a port an earlier leg's registry had, and pnpm
+/// keeps what a registry answered by host and port and trusts it for an
+/// exact version: on the shared cache a leg would resolve packages from
+/// another leg's registry and never ask its own.
+fn route_pnpm(cache: &Path, cwd: &Path, pm: &str, args: &[&str]) -> Output {
+    let mut cmd = corepack_command(cwd, pm, args, false);
+    cmd.env("XDG_CACHE_HOME", cache);
+    cmd.output().expect("failed to run corepack")
+}
+
+/// The reference result of the route patches; each of `addressed` carries
+/// its registry address, the others none.
+fn route_reference(server: &MockServer, addressed: &[&str]) -> serde_json::Value {
+    let packages = route_packages();
+    let mut results = serde_json::Map::new();
+    for patch in &ROUTE_PATCHES {
+        let package = packages.iter().find(|p| p.name == patch.name).unwrap();
+        let url = format!("{}{}", server.uri(), patch.tarball_path());
+        let sri = format!("sha512-{}", sha512_sri_b64(&route_tgz(package, true)));
+        let registry = addressed
+            .contains(&patch.name)
+            .then(|| format!("{}{}", server.uri(), patch.registry_path()));
+        results.insert(
+            patch.uuid.to_string(),
+            serde_json::json!({
+                "status": "granted",
+                "url": url,
+                "purl": patch.purl(),
+                "artifacts": [{"kind": "tarball", "url": url, "integrity": {"sha512": sri}}],
+                "registryOverride": null,
+                "npmRegistryUrl": registry,
+            }),
+        );
+    }
+    serde_json::json!({ "results": results })
+}
+
+/// The patch server, on its own origin as in production: the Socket API
+/// for the two patches, each patched tarball at its granted URL, and in
+/// the same directory the document of the patched package, with the
+/// package's own dependency fields; any other name there is a 404.
+async fn mount_route_patch_server(server: &MockServer) {
+    let packages = route_packages();
+    let listed: Vec<serde_json::Value> = ROUTE_PATCHES
+        .iter()
+        .map(|patch| {
+            serde_json::json!({
+                "purl": patch.purl(),
+                "patches": [{
+                    "uuid": patch.uuid, "purl": patch.purl(), "tier": "free",
+                    "cveIds": [], "ghsaIds": [], "severity": "high",
+                    "title": "registry route fixture"
+                }]
+            })
+        })
+        .collect();
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": listed,
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(route_reference(server, &["leaf", "peer-user"])),
+        )
+        .mount(server)
+        .await;
+    for patch in &ROUTE_PATCHES {
+        let package = packages.iter().find(|p| p.name == patch.name).unwrap();
+        let patched = route_tgz(package, true);
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                "^/v0/orgs/{ORG}/patches/by-package/.*{}.*$",
+                patch.name
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "patches": [{
+                    "uuid": patch.uuid, "purl": patch.purl(),
+                    "publishedAt": "2026-01-01T00:00:00Z",
+                    "description": "x", "license": "MIT", "tier": "free",
+                    "vulnerabilities": {}
+                }],
+                "canAccessPaidPatches": false,
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/view/{}", patch.uuid)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": patch.uuid,
+                "purl": patch.purl(),
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "files": {
+                    "package/index.js": {
+                        "beforeHash": compute_git_sha256_from_bytes(
+                            route_index(patch.name, false).as_bytes()
+                        ),
+                        "afterHash": compute_git_sha256_from_bytes(
+                            route_index(patch.name, true).as_bytes()
+                        ),
+                    }
+                },
+                "vulnerabilities": {
+                    patch.advisory(): {
+                        "cves": [],
+                        "summary": "registry route fixture",
+                        "severity": "high",
+                        "description": "d"
+                    }
+                },
+                "description": "x", "license": "MIT", "tier": "free"
+            })))
+            .mount(server)
+            .await;
+        let tarball = format!("{}{}", server.uri(), patch.tarball_path());
+        Mock::given(method("GET"))
+            .and(path(patch.tarball_path()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(patched.clone(), "application/octet-stream"),
+            )
+            .mount(server)
+            .await;
+        // The patch's own registry: the one document, beside the tarball.
+        Mock::given(method("GET"))
+            .and(path(format!("{}{}", patch.registry_path(), patch.name)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": patch.name,
+                "dist-tags": {"latest": ROUTE_VERSION},
+                "versions": {
+                    ROUTE_VERSION: route_version_document(package, &tarball, &patched)
+                },
+            })))
+            .mount(server)
+            .await;
+    }
+}
+
+/// The index.js a pnpm install left for `name`, reached through
+/// `through` (a direct dependency of the project that depends on it), or
+/// directly when `through` is `name` itself.
+fn installed_index(root: &Path, through: &str, name: &str) -> String {
+    let direct = root.join("node_modules").join(through);
+    let dir = if through == name {
+        direct
+    } else {
+        // pnpm links a package's dependencies beside it in the store.
+        direct
+            .canonicalize()
+            .expect("an installed dependency")
+            .parent()
+            .unwrap()
+            .join(name)
+    };
+    std::fs::read_to_string(dir.join("index.js"))
+        .unwrap_or_else(|e| panic!("{name} via {through}: {e}"))
+}
+
+/// THE REGISTRY ROUTE against a real pnpm, with no network beyond two
+/// loopback servers (a default registry of synthetic packages, and the
+/// patch server on its own origin).
+///
+/// The scan routes a package with a peer dependency and a transitive
+/// leaf, each through the named registry of its patch. Then, with the
+/// real pnpm:
+///
+/// * `pnpm install --lockfile-only` over the scan's files changes not a
+///   byte of the lock: it is the lock pnpm writes for that workspace file;
+/// * a fresh checkout frozen-installs from an empty store with no flags
+///   and no `trustLockfile`, and lands the patched bytes of both;
+/// * `vex` attests both patches from that install: lockfile discovery
+///   reads the lock's registry keys, and the installed files verify;
+/// * `pnpm add`, `pnpm update`, `pnpm dedupe` and `pnpm install
+///   --fix-lockfile` keep both packages routed and patched (a bare
+///   registry declaration loses the peer-dependent one on pnpm 12.19+);
+/// * after each cleanup, pnpm-workspace.yaml and the lock still agree,
+///   which a frozen install from an empty store proves: `rollback` of one
+///   package; the re-scan that routes it again; the fall back to
+///   `trustLockfile` when a grant loses its registry address; and
+///   `rollback` of everything, which leaves the pristine lock and no
+///   workspace file.
+async fn registry_route_survives_resolution_and_cleans_up(pm: &str, tag: &str) {
+    if !has_corepack_pm(pm) {
+        println!("SKIP {tag}: `corepack {pm}` unavailable");
+        return;
+    }
+    let registry = MockServer::start().await;
+    mount_route_registry(&registry).await;
+    let server = MockServer::start().await;
+    mount_route_patch_server(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("pnpm-cache");
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"app","version":"1.0.0","private":true,"dependencies":{"host":"1.0.0","mid":"1.0.0","peer-user":"1.0.0"}}"#,
+    )
+    .unwrap();
+    let npmrc = format!("registry={}/\n", registry.uri());
+    std::fs::write(proj.join(".npmrc"), &npmrc).unwrap();
+    let store = |label: &str| format!("--store-dir={}", tmp.path().join(label).display());
+    let chatter = |out: &Output| {
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let install = route_pnpm(&cache, &proj, pm, &["install", &store("store-fixture")]);
+    if !install.status.success() {
+        assert!(
+            !pnpm_required(),
+            "fixture install failed:\n{}",
+            chatter(&install)
+        );
+        println!("SKIP {tag}: fixture install failed:\n{}", chatter(&install));
+        return;
+    }
+    let lock_path = proj.join("pnpm-lock.yaml");
+    let ws_path = proj.join("pnpm-workspace.yaml");
+    let read = |path: &Path| std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
+    let lock_before = read(&lock_path);
+    assert!(!ws_path.exists(), "the fixture has no workspace file");
+
+    let scan = || {
+        let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &proj, &server.uri(), &[]);
+        assert_eq!(
+            code, 0,
+            "scan failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        parse_envelope(&stdout)
+    };
+    let [leaf, peer_user] = &ROUTE_PATCHES;
+    // The workspace file a scan leaves, with the patches in that order.
+    let workspace_of = |patches: &[&RoutePatch]| {
+        let registries: String = patches.iter().map(|p| p.registry_line(&server)).collect();
+        let overrides: String = patches.iter().map(|p| p.override_line()).collect();
+        format!("packages:\n  - '.'\nnamedRegistries:\n{registries}overrides:\n{overrides}")
+    };
+    let routed_workspace = workspace_of(&[leaf, peer_user]);
+    let assert_routed = |lock: &str, names: &[&str], when: &str| {
+        for patch in &ROUTE_PATCHES {
+            // The `packages:` entry: its key, then its resolution.
+            let entry = |key: String| lock.contains(&format!("\n  {key}:\n    resolution: "));
+            let routed = entry(format!("{}@{}", patch.name, patch.routed_version()));
+            let plain = entry(format!("{}@1.0.0", patch.name));
+            let want = names.contains(&patch.name);
+            assert_eq!(
+                (routed, plain),
+                (want, !want),
+                "{tag} {when}: {} must be {}:\n{lock}",
+                patch.name,
+                if want {
+                    "routed"
+                } else {
+                    "on the default registry"
+                }
+            );
+        }
+    };
+    // A fresh checkout of what is committed, installed frozen from an
+    // empty store; `patched` are the packages whose bytes must be the
+    // patch's.
+    let frozen_install = |label: &str, patched: &[&str]| {
+        let fresh = tmp.path().join(format!("fresh-{label}"));
+        std::fs::create_dir_all(&fresh).unwrap();
+        for file in ["package.json", "pnpm-lock.yaml", ".npmrc"] {
+            std::fs::copy(proj.join(file), fresh.join(file)).unwrap();
+        }
+        if ws_path.exists() {
+            std::fs::copy(&ws_path, fresh.join("pnpm-workspace.yaml")).unwrap();
+        }
+        let out = route_pnpm(
+            &cache,
+            &fresh,
+            pm,
+            &[
+                "install",
+                "--frozen-lockfile",
+                &store(&format!("store-{label}")),
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "{tag} {label}: the frozen install must accept the lock and the workspace \
+             file as they are.\n{}",
+            chatter(&out)
+        );
+        for (through, name) in [("peer-user", "peer-user"), ("mid", "leaf")] {
+            let index = installed_index(&fresh, through, name);
+            assert_eq!(
+                index.starts_with(MARKER),
+                patched.contains(&name),
+                "{tag} {label}: {name} installed as:\n{index}"
+            );
+        }
+        fresh
+    };
+
+    // ── the scan routes both packages ──
+    let env = scan();
+    assert!(
+        !warning_codes(&env).contains(&"redirect_pnpm_entry_not_found".to_string()),
+        "{env}"
+    );
+    assert_eq!(read(&ws_path), routed_workspace, "{tag}");
+    let routed_lock = read(&lock_path);
+    assert_routed(&routed_lock, &["leaf", "peer-user"], "after the scan");
+    for said in [
+        format!(
+            "overrides:\n{}{}\n",
+            leaf.lock_override(),
+            peer_user.lock_override()
+        ),
+        format!(
+            "specifier: {routed}\n        version: {routed}(host@1.0.0)\n",
+            routed = peer_user.routed_version()
+        ),
+        format!("      leaf: {}\n", leaf.routed_version()),
+    ] {
+        assert!(routed_lock.contains(&said), "{tag}: {said}\n{routed_lock}");
+    }
+
+    // ── pnpm writes the same lock for that workspace file ──
+    // A copy of what is committed, re-locked by pnpm itself: not a byte of
+    // the scan's lock changes.
+    let pnpm_agrees = |label: &str| {
+        let agree = tmp.path().join(format!("agree-{label}"));
+        std::fs::create_dir_all(&agree).unwrap();
+        for file in [
+            "package.json",
+            "pnpm-lock.yaml",
+            "pnpm-workspace.yaml",
+            ".npmrc",
+        ] {
+            std::fs::copy(proj.join(file), agree.join(file)).unwrap();
+        }
+        let relock = route_pnpm(
+            &cache,
+            &agree,
+            pm,
+            &[
+                "install",
+                "--lockfile-only",
+                &store(&format!("store-agree-{label}")),
+            ],
+        );
+        assert!(
+            relock.status.success(),
+            "{tag} {label}:\n{}",
+            chatter(&relock)
+        );
+        assert_eq!(
+            read(&agree.join("pnpm-lock.yaml")),
+            read(&lock_path),
+            "{tag} {label}: the scan's lock is the one pnpm resolves from the workspace file"
+        );
+    };
+    pnpm_agrees("routed");
+
+    // ── a fresh checkout installs it, and resolving again keeps it ──
+    let fresh = frozen_install("routed", &["leaf", "peer-user"]);
+    let asked = server.received_requests().await.unwrap_or_default();
+    for patch in &ROUTE_PATCHES {
+        let document = format!("{}{}", patch.registry_path(), patch.name);
+        assert!(
+            asked.iter().any(|request| request.url.path() == document),
+            "{tag}: pnpm must have verified {} against its named registry",
+            patch.name
+        );
+    }
+    let (code, stdout, stderr) = run_socket(
+        &fresh,
+        &[
+            "vex",
+            "--product",
+            "pkg:npm/app@1.0.0",
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--patch-server-url",
+            &server.uri(),
+        ],
+    );
+    assert_eq!(code, 0, "{tag}: verified VEX failed: {stdout}\n{stderr}");
+    let vex: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let attested: Vec<(&str, &str)> = vex["statements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|statement| {
+            Some((
+                statement["vulnerability"]["name"].as_str()?,
+                statement["status"].as_str()?,
+            ))
+        })
+        .collect();
+    for patch in &ROUTE_PATCHES {
+        assert!(
+            attested.contains(&(patch.advisory().as_str(), "not_affected")),
+            "{tag}: {} must be attested from the routed lock: {vex}",
+            patch.name
+        );
+    }
+    for (step, args) in [
+        ("add", vec!["add", "extra@1.0.0"]),
+        ("update", vec!["update"]),
+        ("dedupe", vec!["dedupe"]),
+        ("install --fix-lockfile", vec!["install", "--fix-lockfile"]),
+    ] {
+        let mut args = args;
+        let flag = store("store-routed");
+        args.push(&flag);
+        let out = route_pnpm(&cache, &fresh, pm, &args);
+        // The first pnpm 12 releases have no `--fix-lockfile`.
+        if step == "install --fix-lockfile"
+            && !out.status.success()
+            && chatter(&out).contains("unexpected argument '--fix-lockfile'")
+        {
+            println!("SKIP {tag} pnpm {step}: this pnpm has no such flag");
+            continue;
+        }
+        assert!(
+            out.status.success(),
+            "{tag} pnpm {step}:\n{}",
+            chatter(&out)
+        );
+        let lock = read(&fresh.join("pnpm-lock.yaml"));
+        assert_routed(
+            &lock,
+            &["leaf", "peer-user"],
+            &format!("after `pnpm {step}`"),
+        );
+        assert!(
+            lock.contains(&format!(
+                "{}{}",
+                server.uri(),
+                ROUTE_PATCHES[1].tarball_path()
+            )),
+            "{tag} pnpm {step}: the peer-dependent package keeps its patched tarball:\n{lock}"
+        );
+        for (through, name) in [("peer-user", "peer-user"), ("mid", "leaf")] {
+            assert!(
+                installed_index(&fresh, through, name).starts_with(MARKER),
+                "{tag} pnpm {step}: {name} must stay patched"
+            );
+        }
+    }
+    assert!(
+        read(&fresh.join("pnpm-lock.yaml")).contains("\n  extra@1.0.0:"),
+        "{tag}: `pnpm add` added its package"
+    );
+
+    // ── every cleanup leaves the two files agreeing ──
+    let unwind = vec![
+        ("SOCKET_PATCH_SERVER_URL".to_string(), server.uri()),
+        ("SOCKET_NPM_REGISTRY".to_string(), registry.uri()),
+    ];
+    let rollback = |targets: &[&str]| {
+        let mut args = vec!["rollback"];
+        args.extend_from_slice(targets);
+        args.extend_from_slice(&["--yes", "--json", "--cwd", proj.to_str().unwrap()]);
+        let (code, stdout, stderr) = run_socket_env(&proj, &args, &unwind);
+        assert_eq!(
+            code, 0,
+            "{tag} rollback {targets:?} failed: {stdout}\n{stderr}"
+        );
+    };
+
+    // One package rolled back: its registry and its override leave both
+    // files at once.
+    rollback(&[&leaf.purl()]);
+    let lock = read(&lock_path);
+    assert_routed(&lock, &["peer-user"], "after the rollback of leaf");
+    assert!(
+        lock.contains(&format!("overrides:\n{}\n", peer_user.lock_override())),
+        "{tag}:\n{lock}"
+    );
+    assert_eq!(
+        read(&ws_path),
+        workspace_of(&[peer_user]),
+        "{tag}: after the rollback of leaf"
+    );
+    frozen_install("one-rolled-back", &["peer-user"]);
+
+    // The re-scan routes it again, its registry and its override after
+    // the ones that stayed, in the file and in the lock's record alike:
+    // pnpm re-locks that without changing a byte either.
+    scan();
+    assert_routed(
+        &read(&lock_path),
+        &["leaf", "peer-user"],
+        "after the re-scan",
+    );
+    assert_eq!(
+        read(&ws_path),
+        workspace_of(&[peer_user, leaf]),
+        "{tag}: re-scan"
+    );
+    pnpm_agrees("rescanned");
+    frozen_install("rescanned", &["leaf", "peer-user"]);
+
+    // A grant loses its registry address: the whole project goes back to
+    // `trustLockfile`, with nothing of the route left, and the warning
+    // names the package.
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(route_reference(&server, &["peer-user"])),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let env = scan();
+    assert_eq!(
+        read(&ws_path),
+        "packages:\n  - '.'\ntrustLockfile: true\n",
+        "{tag}: the fall back to trust"
+    );
+    let lock = read(&lock_path);
+    assert_routed(&lock, &[], "after the fall back to trust");
+    assert!(
+        !lock.contains("@socket-") && !lock.contains("overrides:"),
+        "{tag}:\n{lock}"
+    );
+    assert!(
+        env.to_string()
+            .contains("the patch service gave no registry address for leaf@1.0.0"),
+        "{tag}: {env}"
+    );
+    frozen_install("trust", &["leaf", "peer-user"]);
+
+    // Everything rolled back: the pristine lock, and no workspace file.
+    rollback(&[]);
+    assert_eq!(read(&lock_path), lock_before, "{tag}: rollback");
+    assert!(
+        !ws_path.exists(),
+        "{tag}: the file the scan created is gone"
+    );
+    frozen_install("rolled-back", &[]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm installs (~90s); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm12_registry_route_survives_resolution_and_cleans_up() {
+    registry_route_survives_resolution_and_cleans_up(PNPM_NAMED_REGISTRY, "pnpm12-route").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm installs (~90s); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm11_registry_route_survives_resolution_and_cleans_up() {
+    registry_route_survives_resolution_and_cleans_up(PNPM_TERTIARY, "pnpm11-route").await;
+}
+
+/// CLEANUP OF THE REGISTRY ROUTE against a real pnpm: once a hosted patch
+/// is no longer needed, `scan` and `repair` take every unused entry of the
+/// route out, and what they leave is a project pnpm installs frozen.
+///
+/// A project a hosted scan routed (a peer-dependent package and a
+/// transitive leaf, both patched) is checked out once per case, changed
+/// with the real pnpm the way a user would, and cleaned:
+///
+/// * the dependency is removed (`pnpm remove`), then `scan`, `repair
+///   --offline` and `scan --prune` each;
+/// * the dependency is upgraded past the patched release (`pnpm add
+///   <name>@2.0.0`), then `scan` and `repair --offline` each;
+/// * every patched dependency is removed while an unpatched one stays,
+///   then `scan` and `repair --offline` each: no alias, no override of
+///   ours and no registry key is left, and the workspace file the routed
+///   scan created is deleted;
+/// * the patch of one package is withdrawn, then of both, then `scan`.
+///
+/// Every command first runs with `--dry-run`, which must leave both files
+/// byte for byte. After every wet run pnpm-workspace.yaml and the lock are
+/// compared with what is expected, pnpm re-locks them without changing a
+/// byte (the lock is the one pnpm writes for that workspace file), and a
+/// fresh checkout installs with `--frozen-lockfile` from an empty store.
+/// `scan` and `repair` must leave the same bytes: `repair` reads the files
+/// alone, with no patch service to reach.
+async fn registry_route_is_cleaned_up_when_a_patch_is_not_needed(pm: &str, tag: &str) {
+    if !has_corepack_pm(pm) {
+        println!("SKIP {tag}: `corepack {pm}` unavailable");
+        return;
+    }
+    let registry = MockServer::start().await;
+    mount_route_registry(&registry).await;
+    let server = MockServer::start().await;
+    mount_route_patch_server(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("pnpm-cache");
+    let chatter = |out: &Output| {
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let store = |label: &str| format!("--store-dir={}", tmp.path().join(label).display());
+    let read = |path: &Path| std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
+    const FILES: [&str; 4] = [
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        ".npmrc",
+    ];
+    // The committed files of `from`, in a new directory.
+    let copy_of = |from: &Path, label: &str| {
+        let to = tmp.path().join(label);
+        std::fs::create_dir_all(&to).unwrap();
+        for file in FILES {
+            if from.join(file).exists() {
+                std::fs::copy(from.join(file), to.join(file)).unwrap();
+            }
+        }
+        to
+    };
+    // The lock and the workspace file (`None` when there is none).
+    let state = |dir: &Path| {
+        let ws = dir.join("pnpm-workspace.yaml");
+        (
+            read(&dir.join("pnpm-lock.yaml")),
+            ws.exists().then(|| read(&ws)),
+        )
+    };
+    let pnpm = |dir: &Path, label: &str, args: &[&str]| {
+        let flag = store(&format!("store-{label}"));
+        let mut args = args.to_vec();
+        args.push(&flag);
+        let out = route_pnpm(&cache, dir, pm, &args);
+        assert!(
+            out.status.success(),
+            "{tag} {label}: pnpm {args:?}:\n{}",
+            chatter(&out)
+        );
+    };
+
+    // ── the routed project ──
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"app","version":"1.0.0","private":true,"dependencies":{"host":"1.0.0","mid":"1.0.0","peer-user":"1.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join(".npmrc"),
+        format!("registry={}/\n", registry.uri()),
+    )
+    .unwrap();
+    let install = route_pnpm(&cache, &proj, pm, &["install", &store("store-fixture")]);
+    if !install.status.success() {
+        assert!(
+            !pnpm_required(),
+            "fixture install failed:\n{}",
+            chatter(&install)
+        );
+        println!("SKIP {tag}: fixture install failed:\n{}", chatter(&install));
+        return;
+    }
+    let pristine_lock = read(&proj.join("pnpm-lock.yaml"));
+    let env = vec![
+        ("SOCKET_PATCH_SERVER_URL".to_string(), server.uri()),
+        ("SOCKET_NPM_REGISTRY".to_string(), registry.uri()),
+    ];
+    let api = server.uri();
+    // `scan --mode hosted --json [extra]`, and `repair --offline --json
+    // [extra]` pointed at an API address nothing listens on.
+    let scan = |dir: &Path, extra: &[&str]| {
+        let mut args = vec![
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            dir.to_str().unwrap(),
+            "--api-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ];
+        args.extend_from_slice(extra);
+        let (code, stdout, stderr) = run_socket_env(dir, &args, &env);
+        assert_eq!(
+            code, 0,
+            "{tag}: scan {extra:?} failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        parse_envelope(&stdout)
+    };
+    let repair = |dir: &Path, extra: &[&str]| {
+        let mut args = vec![
+            "repair",
+            "--offline",
+            "--json",
+            "--cwd",
+            dir.to_str().unwrap(),
+            "--api-url",
+            "http://127.0.0.1:9",
+        ];
+        args.extend_from_slice(extra);
+        let (code, stdout, stderr) = run_socket_env(dir, &args, &env);
+        assert_eq!(
+            code, 0,
+            "{tag}: repair {extra:?} failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        parse_envelope(&stdout)
+    };
+    // How many registry entries the envelope reports as `action`.
+    let reported = |doc: &serde_json::Value, action: &str| {
+        doc["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| e["errorCode"] == "registry_entry_unused" && e["action"] == action)
+            .count()
+    };
+    scan(&proj, &[]);
+    let (routed_lock, routed_ws) = state(&proj);
+    let [leaf, peer_user] = &ROUTE_PATCHES;
+    let workspace_of = |patches: &[&RoutePatch]| {
+        let registries: String = patches.iter().map(|p| p.registry_line(&server)).collect();
+        let overrides: String = patches.iter().map(|p| p.override_line()).collect();
+        format!("packages:\n  - '.'\nnamedRegistries:\n{registries}overrides:\n{overrides}")
+    };
+    assert_eq!(
+        routed_ws.as_deref(),
+        Some(workspace_of(&[leaf, peer_user]).as_str()),
+        "{tag}: the routed project"
+    );
+    let leaf_only = workspace_of(&[leaf]);
+    // What the lock says of each patch once only leaf is routed.
+    let leaf_routed = format!("\n  leaf@{}:\n    resolution: ", leaf.routed_version());
+    let leaf_recorded = format!("overrides:\n{}\n", leaf.lock_override());
+    let peer_user_key = format!("peer-user@{}", peer_user.routed_version());
+    let peer_user_recorded = peer_user.lock_override();
+
+    // A checkout of the routed project with its dependencies installed,
+    // then changed by `change` (pnpm arguments) as a user would.
+    let checkout = |label: &str, change: &[&str]| {
+        let dir = copy_of(&proj, label);
+        pnpm(&dir, label, &["install", "--frozen-lockfile"]);
+        if !change.is_empty() {
+            pnpm(&dir, label, change);
+        }
+        dir
+    };
+    // What a cleanup must leave: pnpm re-locks it without changing a byte,
+    // and a fresh checkout installs frozen from an empty store, with the
+    // patched bytes exactly where `patched` says (`(through, name, patched)`).
+    let verified_by_pnpm = |dir: &Path, label: &str, installed: &[(&str, &str, bool)]| {
+        let agree = copy_of(dir, &format!("agree-{label}"));
+        pnpm(
+            &agree,
+            &format!("agree-{label}"),
+            &["install", "--lockfile-only"],
+        );
+        assert_eq!(
+            read(&agree.join("pnpm-lock.yaml")),
+            read(&dir.join("pnpm-lock.yaml")),
+            "{tag} {label}: the cleaned lock is the one pnpm resolves from the workspace file"
+        );
+        let fresh = copy_of(dir, &format!("fresh-{label}"));
+        pnpm(
+            &fresh,
+            &format!("fresh-{label}"),
+            &["install", "--frozen-lockfile"],
+        );
+        for (through, name, patched) in installed {
+            let index = installed_index(&fresh, through, name);
+            assert_eq!(
+                index.starts_with(MARKER),
+                *patched,
+                "{tag} {label}: {name} installed as:\n{index}"
+            );
+        }
+    };
+    // A dry run of `command` lists `entries` removals and leaves both
+    // files byte for byte; the wet run lists the same and returns what it
+    // left.
+    let cleaned = |dir: &Path,
+                   label: &str,
+                   command: &dyn Fn(&Path, &[&str]) -> serde_json::Value,
+                   extra: &[&str],
+                   entries: usize| {
+        let before = state(dir);
+        let mut dry = extra.to_vec();
+        dry.push("--dry-run");
+        let doc = command(dir, &dry);
+        assert_eq!(reported(&doc, "verified"), entries, "{tag} {label}: {doc}");
+        assert_eq!(
+            state(dir),
+            before,
+            "{tag} {label}: a dry run writes nothing"
+        );
+        let doc = command(dir, extra);
+        assert_eq!(reported(&doc, "removed"), entries, "{tag} {label}: {doc}");
+        assert!(!dir.join(".socket").exists(), "{tag} {label}: no residue");
+        (state(dir), doc)
+    };
+
+    // ── the dependency was removed ──
+    // peer-user is gone from the lock; leaf is still there through mid.
+    type Cleaner<'a> = &'a dyn Fn(&Path, &[&str]) -> serde_json::Value;
+    let removed_installs = [("mid", "leaf", true)];
+    let mut removed_states = Vec::new();
+    let removed_cases: [(&str, Cleaner, &[&str]); 3] = [
+        ("removed-scan", &scan, &[]),
+        ("removed-repair", &repair, &[]),
+        ("removed-prune", &scan, &["--prune"]),
+    ];
+    for (label, command, extra) in removed_cases {
+        let dir = checkout(label, &["remove", "peer-user"]);
+        let (lock, ws) = state(&dir);
+        assert_eq!(
+            ws, routed_ws,
+            "{tag} {label}: pnpm leaves the workspace file"
+        );
+        assert!(
+            !lock.contains(&peer_user_key) && lock.contains(&peer_user_recorded),
+            "{tag} {label}: pnpm dropped the release and still records its override:\n{lock}"
+        );
+        // The patch's registry, its override, and the lock's record of it.
+        let ((lock, ws), doc) = cleaned(&dir, label, command, extra, 3);
+        assert_eq!(ws.as_deref(), Some(leaf_only.as_str()), "{tag} {label}");
+        assert!(
+            lock.contains(&leaf_recorded)
+                && !lock.contains("peer-user")
+                && lock.contains(&leaf_routed),
+            "{tag} {label}:\n{lock}"
+        );
+        // `repair` and `--prune` count what they removed in `gc`; a plain
+        // hosted scan reports no `gc`.
+        match label {
+            "removed-scan" => assert!(doc.get("gc").is_none(), "{tag}: {doc}"),
+            _ => assert_eq!(doc["gc"]["removedRegistryEntries"], 3, "{tag}: {doc}"),
+        }
+        verified_by_pnpm(&dir, label, &removed_installs);
+        removed_states.push((lock, ws));
+    }
+    assert!(
+        removed_states
+            .iter()
+            .all(|state| *state == removed_states[0]),
+        "{tag}: scan, repair and scan --prune leave the same bytes"
+    );
+
+    // ── the dependency was upgraded past the patched release ──
+    let upgrade = format!("peer-user@{ROUTE_NEXT_VERSION}");
+    let upgraded_installs = [("peer-user", "peer-user", false), ("mid", "leaf", true)];
+    let mut upgraded_states = Vec::new();
+    let upgraded_cases: [(&str, Cleaner); 2] =
+        [("upgraded-scan", &scan), ("upgraded-repair", &repair)];
+    for (label, command) in upgraded_cases {
+        let dir = checkout(label, &["add", &upgrade]);
+        let (lock, _) = state(&dir);
+        assert!(
+            lock.contains(&format!("\n  peer-user@{ROUTE_NEXT_VERSION}:\n"))
+                && !lock.contains(&peer_user_key)
+                && lock.contains(&peer_user_recorded),
+            "{tag} {label}: pnpm resolved the later release from the default registry:\n{lock}"
+        );
+        let ((lock, ws), _) = cleaned(&dir, label, command, &[], 3);
+        assert_eq!(ws.as_deref(), Some(leaf_only.as_str()), "{tag} {label}");
+        assert!(
+            lock.contains(&leaf_recorded)
+                && !lock.contains("peer-user@1.0.0")
+                && lock.contains(&format!("\n  peer-user@{ROUTE_NEXT_VERSION}:\n")),
+            "{tag} {label}:\n{lock}"
+        );
+        verified_by_pnpm(&dir, label, &upgraded_installs);
+        upgraded_states.push((lock, ws));
+    }
+    assert_eq!(
+        upgraded_states[0], upgraded_states[1],
+        "{tag}: scan and repair leave the same bytes"
+    );
+
+    // ── no patched dependency is left ──
+    // `host`, which has no patch, is still installed and crawled. The file
+    // the routed scan created goes with the last of the route, whichever
+    // command takes it out.
+    let none_cases: [(&str, Cleaner); 2] = [("none-scan", &scan), ("none-repair", &repair)];
+    for (label, command) in none_cases {
+        let dir = checkout(label, &["remove", "peer-user", "mid"]);
+        // Two registries, two overrides, and the lock's record of both.
+        let ((lock, ws), _) = cleaned(&dir, label, command, &[], 6);
+        assert_eq!(
+            ws, None,
+            "{tag} {label}: the workspace file the route created is gone"
+        );
+        assert!(
+            !lock.contains("socket") && !lock.contains("overrides:"),
+            "{tag} {label}: no registry key and no override record is left:\n{lock}"
+        );
+        verified_by_pnpm(&dir, label, &[]);
+    }
+
+    // ── the patch of one package was withdrawn ──
+    // The search no longer lists it, and the reference endpoint says so.
+    let listed = |patches: &[&RoutePatch]| -> Vec<serde_json::Value> {
+        patches
+            .iter()
+            .map(|patch| {
+                serde_json::json!({
+                    "purl": patch.purl(),
+                    "patches": [{
+                        "uuid": patch.uuid, "purl": patch.purl(), "tier": "free",
+                        "cveIds": [], "ghsaIds": [], "severity": "high",
+                        "title": "registry route fixture"
+                    }]
+                })
+            })
+            .collect()
+    };
+    let withdraw = |granted: Vec<&'static RoutePatch>, priority: u8| {
+        let mut results = route_reference(&server, &["leaf", "peer-user"]);
+        for patch in &ROUTE_PATCHES {
+            if !granted.iter().any(|kept| kept.uuid == patch.uuid) {
+                results["results"][patch.uuid] = serde_json::json!({"status": "withdrawn"});
+            }
+        }
+        let batch = serde_json::json!({
+            "packages": listed(&granted),
+            "canAccessPaidPatches": false,
+        });
+        let server = &server;
+        async move {
+            Mock::given(method("POST"))
+                .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(results))
+                .with_priority(priority)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(batch))
+                .with_priority(priority)
+                .mount(server)
+                .await;
+        }
+    };
+    withdraw(vec![leaf], 2).await;
+    let dir = checkout("withdrawn-one", &[]);
+    let before = state(&dir);
+    assert_eq!(before, (routed_lock.clone(), routed_ws.clone()));
+    scan(&dir, &["--dry-run"]);
+    assert_eq!(state(&dir), before, "{tag}: a dry run writes nothing");
+    scan(&dir, &[]);
+    let (lock, ws) = state(&dir);
+    assert_eq!(
+        ws.as_deref(),
+        Some(leaf_only.as_str()),
+        "{tag} withdrawn-one"
+    );
+    assert!(
+        lock.contains(&leaf_recorded)
+            && !lock.contains(&peer_user_key)
+            && lock.contains("\n  peer-user@1.0.0:\n    resolution: ")
+            && lock.contains(&leaf_routed),
+        "{tag} withdrawn-one: the withdrawn release is back on the registry:\n{lock}"
+    );
+    verified_by_pnpm(
+        &dir,
+        "withdrawn-one",
+        &[("peer-user", "peer-user", false), ("mid", "leaf", true)],
+    );
+
+    // ── every patch was withdrawn ──
+    withdraw(Vec::new(), 1).await;
+    let dir = checkout("withdrawn-all", &[]);
+    let before = state(&dir);
+    scan(&dir, &["--dry-run"]);
+    assert_eq!(state(&dir), before, "{tag}: a dry run writes nothing");
+    scan(&dir, &[]);
+    assert_eq!(
+        state(&dir),
+        (pristine_lock.clone(), None),
+        "{tag} withdrawn-all: the pristine lock, and no workspace file"
+    );
+    verified_by_pnpm(
+        &dir,
+        "withdrawn-all",
+        &[("peer-user", "peer-user", false), ("mid", "leaf", false)],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm installs (~3min); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm12_registry_route_is_cleaned_up_when_a_patch_is_not_needed() {
+    registry_route_is_cleaned_up_when_a_patch_is_not_needed(PNPM_NAMED_REGISTRY, "pnpm12-cleanup")
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm installs (~3min); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm11_registry_route_is_cleaned_up_when_a_patch_is_not_needed() {
+    registry_route_is_cleaned_up_when_a_patch_is_not_needed(PNPM_TERTIARY, "pnpm11-cleanup").await;
+}
+
+/// WHAT PNPM DOES WITH A NEWER RELEASE IN RANGE of a routed one, measured
+/// with a real pnpm (the transitive half of the override's reach).
+///
+/// Two packages depend on `leaf`: one asks for exactly 1.0.0, the other
+/// for `^1.0.0` and is locked on 1.5.0. Only 1.0.0 has a patch. The scan
+/// routes leaf@1.0.0 and leaves the dependent on 1.5.0 as locked (a lock
+/// does not record the range a transitive dependent asked through), and
+/// notes that pnpm may move it. Then, with the real pnpm:
+///
+/// * a frozen install, a plain `pnpm install` and `pnpm install
+///   --lockfile-only` take the scan's lock as it is, byte for byte: the
+///   dependent keeps 1.5.0;
+/// * `pnpm update` and `pnpm dedupe` apply the override to the `^1.0.0`
+///   range: leaf@1.5.0 leaves the lock and the dependent installs the
+///   patched 1.0.0;
+/// * `pnpm add <another package>` does the same on pnpm 11.20 to 11.28 and
+///   leaves the dependent on 1.5.0 on pnpm 12.
+///
+/// The routed release itself is kept by every one of them.
+///
+/// The leg also pins why an override of the user's cannot hide outside
+/// pnpm-workspace.yaml on these releases: `pnpm.overrides` and
+/// `resolutions` in package.json are not read (no `overrides:` reaches
+/// the lock, and the dependency resolves as without them).
+async fn registry_route_reaches_a_newer_release_in_range(pm: &str, tag: &str) {
+    if !has_corepack_pm(pm) {
+        println!("SKIP {tag}: `corepack {pm}` unavailable");
+        return;
+    }
+    let registry = MockServer::start().await;
+    let package = |name, fields| RoutePackage { name, fields };
+    mount_registry_package(
+        &registry,
+        &package("leaf", serde_json::json!({})),
+        &[ROUTE_VERSION, "1.5.0"],
+        "1.5.0",
+    )
+    .await;
+    for (name, range) in [("pinned-user", "1.0.0"), ("ranged-user", "^1.0.0")] {
+        mount_registry_package(
+            &registry,
+            &package(name, serde_json::json!({"dependencies": {"leaf": range}})),
+            &[ROUTE_VERSION],
+            ROUTE_VERSION,
+        )
+        .await;
+    }
+    mount_registry_package(
+        &registry,
+        &package("extra", serde_json::json!({})),
+        &[ROUTE_VERSION],
+        ROUTE_VERSION,
+    )
+    .await;
+    let server = MockServer::start().await;
+    mount_route_patch_server(&server).await;
+    let leaf = &ROUTE_PATCHES[0];
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("pnpm-cache");
+    let store = |label: &str| format!("--store-dir={}", tmp.path().join(label).display());
+    let chatter = |out: &Output| {
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let read = |path: &Path| std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
+    let npmrc = format!("registry={}/\n", registry.uri());
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"app","version":"1.0.0","private":true,"dependencies":{"pinned-user":"1.0.0","ranged-user":"1.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(proj.join(".npmrc"), &npmrc).unwrap();
+    let install = route_pnpm(&cache, &proj, pm, &["install", &store("store-fixture")]);
+    if !install.status.success() {
+        assert!(
+            !pnpm_required(),
+            "fixture install failed:\n{}",
+            chatter(&install)
+        );
+        println!("SKIP {tag}: fixture install failed:\n{}", chatter(&install));
+        return;
+    }
+    let lock_path = proj.join("pnpm-lock.yaml");
+    let entry = |lock: &str, key: &str| lock.contains(&format!("\n  {key}:\n    resolution: "));
+    let plain = read(&lock_path);
+    assert!(
+        entry(&plain, "leaf@1.0.0") && entry(&plain, "leaf@1.5.0"),
+        "{tag}: the fixture locks both releases:\n{plain}"
+    );
+
+    // ── the scan routes 1.0.0 and leaves 1.5.0 as locked, with a note ──
+    let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &proj, &server.uri(), &[]);
+    assert_eq!(code, 0, "{tag}: scan failed.\n{stdout}\n{stderr}");
+    let env = parse_envelope(&stdout);
+    let routed = read(&lock_path);
+    let routed_key = format!("leaf@{}", leaf.routed_version());
+    assert!(
+        entry(&routed, &routed_key)
+            && entry(&routed, "leaf@1.5.0")
+            && !entry(&routed, "leaf@1.0.0"),
+        "{tag}: after the scan:\n{routed}"
+    );
+    assert!(
+        env.to_string().contains(
+            "pnpm-lock.yaml also locks leaf at 1.5.0, which a range that admits 1.0.0 may admit too"
+        ),
+        "{tag}: the scan notes the release in range: {env}"
+    );
+
+    // A person who scans again, with nothing to change, is given the
+    // one-line reminder and the note with it: it is the project's state.
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    );
+    assert_eq!(code, 0, "{tag}: re-scan failed.\n{stdout}\n{stderr}");
+    let said = stderr.replace('\n', " ");
+    let said = said.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        said.contains("already routes them through a named registry")
+            && said.contains("also locks leaf at 1.5.0"),
+        "{tag}: the reminder carries the note:\n{stderr}"
+    );
+    assert_eq!(
+        read(&lock_path),
+        routed,
+        "{tag}: the re-scan changes nothing"
+    );
+
+    // A copy of what is committed, with real pnpm run over it.
+    let checkout = |label: &str| {
+        let dir = tmp.path().join(label);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in [
+            "package.json",
+            "pnpm-lock.yaml",
+            "pnpm-workspace.yaml",
+            ".npmrc",
+        ] {
+            std::fs::copy(proj.join(file), dir.join(file)).unwrap();
+        }
+        dir
+    };
+    let pnpm = |dir: &Path, label: &str, args: &[&str]| {
+        let flag = store(&format!("store-{label}"));
+        let mut args = args.to_vec();
+        args.push(&flag);
+        let out = route_pnpm(&cache, dir, pm, &args);
+        assert!(
+            out.status.success(),
+            "{tag} {label}: pnpm {args:?}:\n{}",
+            chatter(&out)
+        );
+    };
+
+    // ── a frozen install takes the lock as it is ──
+    let frozen = checkout("frozen");
+    pnpm(&frozen, "frozen", &["install", "--frozen-lockfile"]);
+    assert!(
+        installed_index(&frozen, "pinned-user", "leaf").starts_with(MARKER),
+        "{tag}: the dependent on 1.0.0 gets the patched bytes"
+    );
+    assert_eq!(
+        installed_index(&frozen, "ranged-user", "leaf"),
+        route_index("leaf", false),
+        "{tag}: the dependent locked on 1.5.0 gets 1.5.0"
+    );
+    assert_eq!(
+        read(&frozen.join("pnpm-lock.yaml")),
+        routed,
+        "{tag}: frozen"
+    );
+
+    // ── what each resolving command does with the release in range ──
+    // `Some(true)`: the dependent on `^1.0.0` moves to the patched release;
+    // `None`: the scan's lock is taken byte for byte. `pnpm add` of another
+    // package moves it on pnpm 11 and was measured to leave it on pnpm
+    // 12.0.0 through 12.22.0, which a later pnpm 12 may change: there the
+    // outcome is printed, not asserted.
+    let add = (pm == PNPM_TERTIARY).then_some(true);
+    for (label, args, moves) in [
+        ("relock", vec!["install", "--lockfile-only"], None),
+        ("install", vec!["install"], None),
+        ("add", vec!["add", "extra@1.0.0"], add),
+        ("update", vec!["update"], Some(true)),
+        ("dedupe", vec!["dedupe"], Some(true)),
+    ] {
+        let dir = checkout(label);
+        if label != "relock" {
+            pnpm(&dir, label, &["install", "--frozen-lockfile"]);
+        }
+        pnpm(&dir, label, &args);
+        let lock = read(&dir.join("pnpm-lock.yaml"));
+        let command = args.join(" ");
+        println!(
+            "MEASURED {tag} `pnpm {command}`: leaf@1.5.0 {}; lock {}",
+            if entry(&lock, "leaf@1.5.0") {
+                "kept"
+            } else {
+                "gone"
+            },
+            if lock == routed {
+                "unchanged"
+            } else {
+                "changed"
+            },
+        );
+        assert!(
+            entry(&lock, &routed_key),
+            "{tag} `pnpm {command}`: the routed release stays routed:\n{lock}"
+        );
+        match moves {
+            None if label == "add" => {}
+            None => assert_eq!(
+                lock, routed,
+                "{tag} `pnpm {command}`: the scan's lock is taken as it is"
+            ),
+            Some(moved) => {
+                assert_eq!(
+                    !entry(&lock, "leaf@1.5.0"),
+                    moved,
+                    "{tag} `pnpm {command}`: leaf@1.5.0 must be {}:\n{lock}",
+                    if moved { "gone" } else { "kept" }
+                );
+                assert_eq!(
+                    installed_index(&dir, "ranged-user", "leaf").starts_with(MARKER),
+                    moved,
+                    "{tag} `pnpm {command}`: what the dependent on ^1.0.0 installs"
+                );
+            }
+        }
+        assert!(
+            installed_index_or_none(&dir, "pinned-user", "leaf")
+                .is_none_or(|index| index.starts_with(MARKER)),
+            "{tag} `pnpm {command}`: the dependent on 1.0.0 stays patched"
+        );
+    }
+
+    // ── pnpm no longer reads overrides from package.json ──
+    let manifest_overrides = tmp.path().join("manifest-overrides");
+    std::fs::create_dir_all(&manifest_overrides).unwrap();
+    std::fs::write(
+        manifest_overrides.join("package.json"),
+        r#"{"name":"app","version":"1.0.0","private":true,"dependencies":{"ranged-user":"1.0.0"},"pnpm":{"overrides":{"leaf":"1.0.0"}},"resolutions":{"leaf":"1.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(manifest_overrides.join(".npmrc"), &npmrc).unwrap();
+    pnpm(
+        &manifest_overrides,
+        "manifest-overrides",
+        &["install", "--lockfile-only"],
+    );
+    let lock = read(&manifest_overrides.join("pnpm-lock.yaml"));
+    assert!(
+        !lock.contains("\noverrides:\n")
+            && entry(&lock, "leaf@1.5.0")
+            && !entry(&lock, "leaf@1.0.0"),
+        "{tag}: package.json `pnpm.overrides` and `resolutions` are not read, so the lock \
+         records no override and the range resolves as without them:\n{lock}"
+    );
+}
+
+/// [`installed_index`], or `None` where nothing is installed (a
+/// lockfile-only run).
+fn installed_index_or_none(root: &Path, through: &str, name: &str) -> Option<String> {
+    root.join("node_modules")
+        .join(through)
+        .exists()
+        .then(|| installed_index(root, through, name))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm installs (~1min); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm12_registry_route_reaches_a_newer_release_in_range() {
+    registry_route_reaches_a_newer_release_in_range(PNPM_NAMED_REGISTRY, "pnpm12-in-range").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm installs (~1min); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm11_registry_route_reaches_a_newer_release_in_range() {
+    registry_route_reaches_a_newer_release_in_range(PNPM_TERTIARY, "pnpm11-in-range").await;
+}
+
+/// A PROJECT ROUTED BEFORE ITS BAZEL WORKSPACE GOT A RULES_JS HUB, with a
+/// real pnpm. Hosted mode does not route a lock that a hub reads, so the
+/// next scan has to settle the project one of two ways, and a frozen
+/// install has to pass afterwards wherever pnpm reads the workspace file:
+///
+/// * the hub keeps the lock up to date with a pnpm 11 that does not see
+///   pnpm-workspace.yaml: the scan leaves the lock to the hub
+///   (`redirect_pnpm_bazel_workspace_hidden`) and the route with it, every
+///   byte of the lock and of the workspace file as it was, so pnpm still
+///   installs the patched release through its registry;
+/// * the hub only reads the lock: the scan leaves the route whole, the
+///   registry and the override out of the workspace file, the `overrides:`
+///   record and the registry keys out of the lock, in one run, and pins the
+///   release on `trustLockfile`, which pnpm installs frozen and patched.
+async fn registry_route_is_left_for_a_bazel_hub_added_later(pm: &str, tag: &str) {
+    if !has_corepack_pm(pm) {
+        println!("SKIP {tag}: `corepack {pm}` unavailable");
+        return;
+    }
+    let registry = MockServer::start().await;
+    let package = |name, fields| RoutePackage { name, fields };
+    mount_registry_package(
+        &registry,
+        &package("leaf", serde_json::json!({})),
+        &[ROUTE_VERSION],
+        ROUTE_VERSION,
+    )
+    .await;
+    mount_registry_package(
+        &registry,
+        &package(
+            "pinned-user",
+            serde_json::json!({"dependencies": {"leaf": "1.0.0"}}),
+        ),
+        &[ROUTE_VERSION],
+        ROUTE_VERSION,
+    )
+    .await;
+    let server = MockServer::start().await;
+    mount_route_patch_server(&server).await;
+    let leaf = &ROUTE_PATCHES[0];
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("pnpm-cache");
+    let store = |label: &str| format!("--store-dir={}", tmp.path().join(label).display());
+    let chatter = |out: &Output| {
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let read = |path: &Path| std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"app","version":"1.0.0","private":true,"dependencies":{"pinned-user":"1.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join(".npmrc"),
+        format!("registry={}/\n", registry.uri()),
+    )
+    .unwrap();
+    let install = route_pnpm(&cache, &proj, pm, &["install", &store("store-fixture")]);
+    if !install.status.success() {
+        assert!(
+            !pnpm_required(),
+            "fixture install failed:\n{}",
+            chatter(&install)
+        );
+        println!("SKIP {tag}: fixture install failed:\n{}", chatter(&install));
+        return;
+    }
+    let entry = |lock: &str, key: &str| lock.contains(&format!("\n  {key}:\n    resolution: "));
+    let routed_key = format!("leaf@{}", leaf.routed_version());
+    let files = |dir: &Path| {
+        (
+            read(&dir.join("pnpm-lock.yaml")),
+            read(&dir.join("pnpm-workspace.yaml")),
+        )
+    };
+
+    // ── an earlier run routed the project ──
+    let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &proj, &server.uri(), &[]);
+    assert_eq!(code, 0, "{tag}: scan failed.\n{stdout}\n{stderr}");
+    let (routed_lock, routed_workspace) = files(&proj);
+    assert!(
+        entry(&routed_lock, &routed_key)
+            && routed_lock.contains("\noverrides:\n")
+            && routed_workspace.contains("namedRegistries:")
+            && !routed_workspace.contains("trustLockfile"),
+        "{tag}: the first scan routes the release:\n{routed_lock}\n{routed_workspace}"
+    );
+
+    let checkout = |from: &Path, label: &str| {
+        let dir = tmp.path().join(label);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in [
+            "package.json",
+            "pnpm-lock.yaml",
+            "pnpm-workspace.yaml",
+            ".npmrc",
+        ] {
+            std::fs::copy(from.join(file), dir.join(file)).unwrap();
+        }
+        dir
+    };
+    let frozen = |dir: &Path, label: &str| {
+        let flag = store(&format!("store-{label}"));
+        let out = route_pnpm(&cache, dir, pm, &["install", "--frozen-lockfile", &flag]);
+        assert!(
+            out.status.success(),
+            "{tag} {label}: a frozen install:\n{}",
+            chatter(&out)
+        );
+    };
+    // The hub of the Bazel workspace, its `npm.npm_translate_lock` on line 3.
+    let hub = |more: &str| {
+        format!(
+            "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+             npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+             npm.npm_translate_lock(pnpm_lock = \"//:pnpm-lock.yaml\"{more})\n\
+             pnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
+             pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")\n"
+        )
+    };
+
+    // ── a hub that hides the workspace file from its pnpm 11 ──
+    let hidden = checkout(&proj, "hidden");
+    frozen(&hidden, "hidden");
+    std::fs::write(
+        hidden.join("MODULE.bazel"),
+        hub(", update_pnpm_lock = True"),
+    )
+    .unwrap();
+    let before = files(&hidden);
+    let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &hidden, &server.uri(), &[]);
+    assert_eq!(code, 0, "{tag}: scan failed.\n{stdout}\n{stderr}");
+    let env = parse_envelope(&stdout);
+    assert!(
+        env.to_string()
+            .contains("redirect_pnpm_bazel_workspace_hidden"),
+        "{tag}: the scan leaves the lock to the hub: {env}"
+    );
+    assert_eq!(
+        files(&hidden),
+        before,
+        "{tag}: the route stays as it was, the lock and the workspace file alike"
+    );
+    assert!(entry(&before.0, &routed_key), "{tag}:\n{}", before.0);
+    let hidden_fresh = checkout(&hidden, "hidden-fresh");
+    frozen(&hidden_fresh, "hidden-fresh");
+    assert!(
+        installed_index(&hidden_fresh, "pinned-user", "leaf").starts_with(MARKER),
+        "{tag}: the routed release still installs patched"
+    );
+
+    // ── a hub that reads the lock ──
+    std::fs::write(proj.join("MODULE.bazel"), hub("")).unwrap();
+    let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &proj, &server.uri(), &[]);
+    assert_eq!(code, 0, "{tag}: scan failed.\n{stdout}\n{stderr}");
+    let env = parse_envelope(&stdout);
+    let (lock, workspace) = files(&proj);
+    assert!(
+        entry(&lock, "leaf@1.0.0")
+            && !lock.contains("@socket-")
+            && !lock.contains("\noverrides:\n")
+            && lock.contains(&leaf.tarball_path()),
+        "{tag}: the lock is back in the plain shape, pinned:\n{lock}"
+    );
+    assert_eq!(
+        workspace, "packages:\n  - '.'\ntrustLockfile: true\n",
+        "{tag}: the route's entries leave the workspace file with the lock's"
+    );
+    assert!(
+        env.to_string()
+            .contains("a Bazel hub reads the pnpm lock (MODULE.bazel:3)"),
+        "{tag}: the warning names the call: {env}"
+    );
+    let left = checkout(&proj, "left");
+    frozen(&left, "left");
+    assert!(
+        installed_index(&left, "pinned-user", "leaf").starts_with(MARKER),
+        "{tag}: the pinned release installs patched"
+    );
+    assert_eq!(
+        read(&left.join("pnpm-lock.yaml")),
+        lock,
+        "{tag}: pnpm takes the lock as the scan left it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm installs (~1min); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm12_registry_route_is_left_for_a_bazel_hub_added_later() {
+    registry_route_is_left_for_a_bazel_hub_added_later(PNPM_NAMED_REGISTRY, "pnpm12-bazel-hub")
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm installs (~1min); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm11_registry_route_is_left_for_a_bazel_hub_added_later() {
+    registry_route_is_left_for_a_bazel_hub_added_later(PNPM_TERTIARY, "pnpm11-bazel-hub").await;
 }
 
 /// #1074: with pnpm's `lockfile` setting off, pnpm neither reads nor
