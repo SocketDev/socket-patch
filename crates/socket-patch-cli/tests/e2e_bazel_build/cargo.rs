@@ -913,13 +913,18 @@ fn every_target(cell: &Cell) -> Vec<String> {
 
 /// Whether the commands that analyse every target of the checkout of
 /// `cell` pass: `bazel cquery //...` and `bazel query 'deps(//...)'`, which
-/// agree. One that fails has met a repository of the hub, which the main
-/// repository does not see.
+/// agree. One that fails has met a repository that the build file in the
+/// copy names and the main repository does not see: one of the hub, or
+/// `platforms`. Bazel names the first one it meets, and which one that is
+/// differs from run to run.
 fn analyses(cell: &Cell) -> bool {
     let runs = [("cquery", "//..."), ("query", "deps(//...)")];
     let runs = runs.map(|(command, targets)| cell.bazel(command, &[targets]));
     for run in &runs {
-        let unseen = run.stderr().contains("No repository visible as '@crates__");
+        let stderr = run.stderr();
+        let unseen = ["@crates__", "@platforms'"]
+            .iter()
+            .any(|repo| stderr.contains(&format!("No repository visible as '{repo}")));
         assert_ne!(run.ok(), unseen, "{}: {}", cell.test, run.dump());
     }
     assert_eq!(runs[0].ok(), runs[1].ok(), "{}", cell.test);
