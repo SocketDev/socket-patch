@@ -142,14 +142,23 @@ pub async fn hidden(view: &ProjectView<'_>) -> Option<RewriteWarning> {
 /// pnpm it runs.
 ///
 /// Hosted mode asks before it routes a patched release through a named
-/// registry of pnpm-workspace.yaml, which only pnpm 11.20 and later read
-/// such a lock with. A hub reads the lock with the lock reader of rules_js,
-/// and with `update_pnpm_lock` with a pnpm of its own, in a directory that
-/// holds the lock, the `package.json` files and the `data` of the call.
-/// Without the workspace file there, pnpm 11.28.13 and 12.22.0 reject a
-/// routed lock (`ERR_PNPM_MISSING_NAMED_REGISTRY`, measured with
-/// `pnpm install --lockfile-only`), and no Bazel build has been run on a
-/// routed lock. So such a project keeps the pin that the Bazel legs build.
+/// registry of pnpm-workspace.yaml, and keeps such a project on the pin
+/// that the Bazel legs build.
+///
+/// The lock reader of rules_js is not what holds the route back: it takes
+/// a routed lock (measured on macOS: rules_js 3.6.0 on Bazel 9.3.2 builds
+/// one, a hub without `update_pnpm_lock`, and the packages it builds hold
+/// the patched bytes; so does rules_js 2.9.3 on Bazel 8.8.2). The pnpm of
+/// a hub with `update_pnpm_lock` is: it runs in a directory that holds the
+/// lock, the `package.json` files and the `data` of the call, so it sees
+/// the registries only where the call lists pnpm-workspace.yaml, and
+/// without them pnpm 11.28.13 and 12.22.0 reject a routed lock
+/// (`ERR_PNPM_MISSING_NAMED_REGISTRY`, measured with
+/// `pnpm install --lockfile-only`). It may also be older than the pnpm
+/// 11.20 that reads such a lock: rules_js picks a pnpm 10 where the
+/// workspace states none. No Bazel leg builds a routed lock with
+/// `update_pnpm_lock` yet, and a hub can turn that attribute on at any
+/// time, so the answer is the same for every hub that reads the lock.
 pub fn reads_lock(view: &ProjectView<'_>, locks: &[&str]) -> Option<String> {
     match *view {
         ProjectView::Memory(project) => reader(&memory(project), "", locks),

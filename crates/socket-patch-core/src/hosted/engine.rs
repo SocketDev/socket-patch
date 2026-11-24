@@ -4322,9 +4322,9 @@ fn is_patch_server(origin: &str, overrides: &[DepOverride], options: &RewriteOpt
 /// * the workspace file may be written, or needs no write
 ///   (`--no-trust-lockfile-config`);
 /// * no rules_js hub of a Bazel workspace reads a governing lock
-///   ([`crate::bazel::pnpm::reads_lock`]): what such a build makes of a
-///   routed lock is not known, and a pnpm it runs may not see the workspace
-///   file.
+///   ([`crate::bazel::pnpm::reads_lock`]): the pnpm such a hub runs with
+///   `update_pnpm_lock` may not see the workspace file, or be too old to
+///   read its registries.
 ///
 /// Whatever keeps a project the service offers the route to off it is
 /// said in the warning ([`pnpm_registry_blocked_note`]), the pins without
@@ -4718,8 +4718,8 @@ fn pnpm_registry_route(
                 .to_string(),
         );
     }
-    // A rules_js hub of the Bazel workspace reads the lock, and what it
-    // makes of a routed one is not known ([`crate::bazel::pnpm::reads_lock`]).
+    // A rules_js hub of the Bazel workspace reads the lock: the project
+    // keeps the pin the Bazel legs build ([`crate::bazel::pnpm::reads_lock`]).
     // Asked only here, of a project the patch service offers the route to.
     let mut read_by_bazel: Vec<&str> = texts.iter().map(|(key, _)| *key).collect();
     if !read_by_bazel.contains(&ROOT_PNPM_LOCKS[0]) {
@@ -13386,10 +13386,10 @@ snapshots:
 
     /// A pnpm lock that a rules_js hub of the Bazel workspace reads is not
     /// routed through a named registry, whatever the patch service offers
-    /// and whatever pnpm the project pins: the hub reads the lock with the
-    /// lock reader of rules_js, and with `update_pnpm_lock` with a pnpm that
-    /// sees pnpm-workspace.yaml only where the call lists it, and no Bazel
-    /// build has been run on a routed lock. The project gets the files of a
+    /// and whatever pnpm the project pins: with `update_pnpm_lock` the hub
+    /// runs a pnpm of its own, which sees pnpm-workspace.yaml only where the
+    /// call lists it and may be too old to read its registries, and no
+    /// Bazel leg builds a routed lock that way. The project gets the files of a
     /// run that is offered no registry, byte for byte, which the Bazel legs
     /// build, and the warning names the call. A hub that reads another lock
     /// changes nothing. A project routed before the hub was there leaves
@@ -13436,7 +13436,10 @@ snapshots:
             assert!(
                 detail.contains(
                     "Per-package registry verification was not set up because a Bazel hub \
-                     reads the pnpm lock (MODULE.bazel:3)"
+                     reads the pnpm lock (MODULE.bazel:3), and a lock that a hub reads is not \
+                     routed yet: the pnpm a hub runs for `update_pnpm_lock` may not read the \
+                     registries in pnpm-workspace.yaml; the hosted patches rely on \
+                     `trustLockfile` instead"
                 ),
                 "{call}: {detail}"
             );

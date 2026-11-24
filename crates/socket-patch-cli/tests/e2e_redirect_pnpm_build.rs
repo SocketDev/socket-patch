@@ -2806,6 +2806,215 @@ async fn pnpm11_registry_route_reaches_a_newer_release_in_range() {
     registry_route_reaches_a_newer_release_in_range(PNPM_TERTIARY, "pnpm11-in-range").await;
 }
 
+/// A PROJECT ROUTED BEFORE ITS BAZEL WORKSPACE GOT A RULES_JS HUB, with a
+/// real pnpm. Hosted mode does not route a lock that a hub reads, so the
+/// next scan has to settle the project one of two ways, and a frozen
+/// install has to pass afterwards wherever pnpm reads the workspace file:
+///
+/// * the hub keeps the lock up to date with a pnpm 11 that does not see
+///   pnpm-workspace.yaml: the scan leaves the lock to the hub
+///   (`redirect_pnpm_bazel_workspace_hidden`) and the route with it, every
+///   byte of the lock and of the workspace file as it was, so pnpm still
+///   installs the patched release through its registry;
+/// * the hub only reads the lock: the scan leaves the route whole, the
+///   registry and the override out of the workspace file, the `overrides:`
+///   record and the registry keys out of the lock, in one run, and pins the
+///   release on `trustLockfile`, which pnpm installs frozen and patched.
+async fn registry_route_is_left_for_a_bazel_hub_added_later(pm: &str, tag: &str) {
+    if !has_corepack_pm(pm) {
+        println!("SKIP {tag}: `corepack {pm}` unavailable");
+        return;
+    }
+    let registry = MockServer::start().await;
+    let package = |name, fields| RoutePackage { name, fields };
+    mount_registry_package(
+        &registry,
+        &package("leaf", serde_json::json!({})),
+        &[ROUTE_VERSION],
+        ROUTE_VERSION,
+    )
+    .await;
+    mount_registry_package(
+        &registry,
+        &package(
+            "pinned-user",
+            serde_json::json!({"dependencies": {"leaf": "1.0.0"}}),
+        ),
+        &[ROUTE_VERSION],
+        ROUTE_VERSION,
+    )
+    .await;
+    let server = MockServer::start().await;
+    mount_route_patch_server(&server).await;
+    let leaf = &ROUTE_PATCHES[0];
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("pnpm-cache");
+    let store = |label: &str| format!("--store-dir={}", tmp.path().join(label).display());
+    let chatter = |out: &Output| {
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let read = |path: &Path| std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"app","version":"1.0.0","private":true,"dependencies":{"pinned-user":"1.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join(".npmrc"),
+        format!("registry={}/\n", registry.uri()),
+    )
+    .unwrap();
+    let install = route_pnpm(&cache, &proj, pm, &["install", &store("store-fixture")]);
+    if !install.status.success() {
+        assert!(
+            !pnpm_required(),
+            "fixture install failed:\n{}",
+            chatter(&install)
+        );
+        println!("SKIP {tag}: fixture install failed:\n{}", chatter(&install));
+        return;
+    }
+    let entry = |lock: &str, key: &str| lock.contains(&format!("\n  {key}:\n    resolution: "));
+    let routed_key = format!("leaf@{}", leaf.routed_version());
+    let files = |dir: &Path| {
+        (
+            read(&dir.join("pnpm-lock.yaml")),
+            read(&dir.join("pnpm-workspace.yaml")),
+        )
+    };
+
+    // ── an earlier run routed the project ──
+    let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &proj, &server.uri(), &[]);
+    assert_eq!(code, 0, "{tag}: scan failed.\n{stdout}\n{stderr}");
+    let (routed_lock, routed_workspace) = files(&proj);
+    assert!(
+        entry(&routed_lock, &routed_key)
+            && routed_lock.contains("\noverrides:\n")
+            && routed_workspace.contains("namedRegistries:")
+            && !routed_workspace.contains("trustLockfile"),
+        "{tag}: the first scan routes the release:\n{routed_lock}\n{routed_workspace}"
+    );
+
+    let checkout = |from: &Path, label: &str| {
+        let dir = tmp.path().join(label);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in [
+            "package.json",
+            "pnpm-lock.yaml",
+            "pnpm-workspace.yaml",
+            ".npmrc",
+        ] {
+            std::fs::copy(from.join(file), dir.join(file)).unwrap();
+        }
+        dir
+    };
+    let frozen = |dir: &Path, label: &str| {
+        let flag = store(&format!("store-{label}"));
+        let out = route_pnpm(&cache, dir, pm, &["install", "--frozen-lockfile", &flag]);
+        assert!(
+            out.status.success(),
+            "{tag} {label}: a frozen install:\n{}",
+            chatter(&out)
+        );
+    };
+    // The hub of the Bazel workspace, its `npm.npm_translate_lock` on line 3.
+    let hub = |more: &str| {
+        format!(
+            "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+             npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+             npm.npm_translate_lock(pnpm_lock = \"//:pnpm-lock.yaml\"{more})\n\
+             pnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
+             pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")\n"
+        )
+    };
+
+    // ── a hub that hides the workspace file from its pnpm 11 ──
+    let hidden = checkout(&proj, "hidden");
+    frozen(&hidden, "hidden");
+    std::fs::write(
+        hidden.join("MODULE.bazel"),
+        hub(", update_pnpm_lock = True"),
+    )
+    .unwrap();
+    let before = files(&hidden);
+    let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &hidden, &server.uri(), &[]);
+    assert_eq!(code, 0, "{tag}: scan failed.\n{stdout}\n{stderr}");
+    let env = parse_envelope(&stdout);
+    assert!(
+        env.to_string()
+            .contains("redirect_pnpm_bazel_workspace_hidden"),
+        "{tag}: the scan leaves the lock to the hub: {env}"
+    );
+    assert_eq!(
+        files(&hidden),
+        before,
+        "{tag}: the route stays as it was, the lock and the workspace file alike"
+    );
+    assert!(entry(&before.0, &routed_key), "{tag}:\n{}", before.0);
+    let hidden_fresh = checkout(&hidden, "hidden-fresh");
+    frozen(&hidden_fresh, "hidden-fresh");
+    assert!(
+        installed_index(&hidden_fresh, "pinned-user", "leaf").starts_with(MARKER),
+        "{tag}: the routed release still installs patched"
+    );
+
+    // ── a hub that reads the lock ──
+    std::fs::write(proj.join("MODULE.bazel"), hub("")).unwrap();
+    let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &proj, &server.uri(), &[]);
+    assert_eq!(code, 0, "{tag}: scan failed.\n{stdout}\n{stderr}");
+    let env = parse_envelope(&stdout);
+    let (lock, workspace) = files(&proj);
+    assert!(
+        entry(&lock, "leaf@1.0.0")
+            && !lock.contains("@socket-")
+            && !lock.contains("\noverrides:\n")
+            && lock.contains(&leaf.tarball_path()),
+        "{tag}: the lock is back in the plain shape, pinned:\n{lock}"
+    );
+    assert_eq!(
+        workspace, "packages:\n  - '.'\ntrustLockfile: true\n",
+        "{tag}: the route's entries leave the workspace file with the lock's"
+    );
+    assert!(
+        env.to_string()
+            .contains("a Bazel hub reads the pnpm lock (MODULE.bazel:3)"),
+        "{tag}: the warning names the call: {env}"
+    );
+    let left = checkout(&proj, "left");
+    frozen(&left, "left");
+    assert!(
+        installed_index(&left, "pinned-user", "leaf").starts_with(MARKER),
+        "{tag}: the pinned release installs patched"
+    );
+    assert_eq!(
+        read(&left.join("pnpm-lock.yaml")),
+        lock,
+        "{tag}: pnpm takes the lock as the scan left it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm installs (~1min); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm12_registry_route_is_left_for_a_bazel_hub_added_later() {
+    registry_route_is_left_for_a_bazel_hub_added_later(PNPM_NAMED_REGISTRY, "pnpm12-bazel-hub")
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm installs (~1min); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm11_registry_route_is_left_for_a_bazel_hub_added_later() {
+    registry_route_is_left_for_a_bazel_hub_added_later(PNPM_TERTIARY, "pnpm11-bazel-hub").await;
+}
+
 /// #1074: with pnpm's `lockfile` setting off, pnpm neither reads nor
 /// writes `pnpm-lock.yaml` and installs the upstream package from the
 /// registry, so a hosted pin in the committed lock patches nothing. Over a

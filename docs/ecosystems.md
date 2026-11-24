@@ -2238,15 +2238,20 @@ package. rules_js asks for this `data` itself (`docs/pnpm.md`, "update_pnpm_lock
 can route a patched release through a named registry of `pnpm-workspace.yaml` in place of
 `trustLockfile` (see pnpm above). It never does for a lock that a rules_js hub reads: one
 that an `npm.npm_translate_lock` names in a plain string, the root lock or a member's own,
-or a call whose `pnpm_lock` is not written out, whatever else the call says. The hub reads
-the lock with the lock reader of rules_js, and with `update_pnpm_lock` with a pnpm that
-sees `pnpm-workspace.yaml` only where the call lists it. Run as the hub runs it
-(`pnpm install --lockfile-only` beside the lock and `package.json`, without the workspace
-file), pnpm 11.28.13 and 12.22.0 reject a routed lock (`ERR_PNPM_MISSING_NAMED_REGISTRY`,
-measured), and no Bazel build has been run on a routed lock. So such a project is pinned
-exactly as it is on a patch service that offers no registry, which is the pin the Bazel
-legs build, and the `redirect_pnpm_trust_lockfile` warning names the call ("… because a
-Bazel hub reads the pnpm lock (MODULE.bazel:7) …"). A project that was routed before the
+or a call whose `pnpm_lock` is not written out, whatever else the call says. The lock
+reader of rules_js is not the reason: it takes a routed lock (measured on macOS: rules_js
+3.6.0 on Bazel 9.3.2 builds one for a hub without `update_pnpm_lock`, and the packages it
+builds hold the patched bytes; rules_js 2.9.3 on Bazel 8.8.2 does too). The pnpm that a
+hub runs with `update_pnpm_lock` is. It sees `pnpm-workspace.yaml` only where the call
+lists it, and it may be older than pnpm 11.20: rules_js picks a pnpm 10 where the
+workspace states none. Run as the hub runs it (`pnpm install --lockfile-only` beside the
+lock and `package.json`, without the workspace file), pnpm 11.28.13 and 12.22.0 reject a
+routed lock (`ERR_PNPM_MISSING_NAMED_REGISTRY`, measured). No Bazel test leg builds a
+routed lock with `update_pnpm_lock` yet, so for now every such project is pinned exactly
+as it is on a patch service that offers no registry, which is the pin the Bazel legs
+build, and the `redirect_pnpm_trust_lockfile` warning names the call ("… because a Bazel
+hub reads the pnpm lock (MODULE.bazel:7), and a lock that a hub reads is not routed
+yet …"). A project that was routed before the
 hub was there leaves the route on its next scan, the lock and the workspace file together.
 Where hosted mode writes nothing for the root lock (the hub above), a route of an earlier
 run is left exactly as it is, in the workspace file and in every lock, and a

@@ -3888,10 +3888,9 @@ async fn hosted_registry_route_needs_a_pnpm_11_20_pin() {
 }
 
 /// A lock that a rules_js hub of the project's Bazel workspace reads is
-/// not routed, also with a registry address and a pnpm 12 pin. The hub
-/// reads the lock with the lock reader of rules_js (and with
-/// `update_pnpm_lock` with a pnpm of its own), and only a lock that names
-/// the patch server's tarball is known to build there. The run writes what
+/// not routed, also with a registry address and a pnpm 12 pin. The pnpm a
+/// hub runs with `update_pnpm_lock` may not read the registries, so the
+/// project keeps the pin the Bazel legs build. The run writes what
 /// a patch service that offers no registry gets, the warning names the
 /// call, and `rollback` gives the user's file and the lock back.
 #[tokio::test]

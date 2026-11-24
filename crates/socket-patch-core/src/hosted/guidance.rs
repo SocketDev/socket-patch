@@ -543,15 +543,17 @@ pub fn pnpm_registry_mirrored_reason(packages: &[String]) -> String {
 
 /// The clause for a project whose pnpm lock a rules_js hub of its Bazel
 /// workspace reads (`call`: the file and line of the
-/// `npm.npm_translate_lock`, [`crate::bazel::pnpm::reads_lock`]). The hub
-/// reads the lock without pnpm, and with `update_pnpm_lock` with a pnpm
-/// that sees only the lock, the `package.json` files and the `data` of the
-/// call: one that does not see the registries rejects a routed lock, and
-/// no Bazel build has been run on one. The lock stays as the Bazel build
-/// is known to take it.
+/// `npm.npm_translate_lock`, [`crate::bazel::pnpm::reads_lock`]). What
+/// holds the route back is the pnpm such a hub runs with
+/// `update_pnpm_lock`, which sees the registries only where the call lists
+/// pnpm-workspace.yaml and may be older than pnpm 11.20; the lock reader
+/// of rules_js takes a routed lock. The project keeps the pin that the
+/// Bazel legs build.
 pub fn pnpm_registry_bazel_reason(call: &str) -> String {
     format!(
-        "a Bazel hub reads the pnpm lock ({call}), and its build is only known to take a          lock that names the patch server's tarball: a pnpm it runs sees          {PNPM_WORKSPACE_REL} only where the hub lists it"
+        "a Bazel hub reads the pnpm lock ({call}), and a lock that a hub reads is not routed \
+         yet: the pnpm a hub runs for `update_pnpm_lock` may not read the registries in \
+         {PNPM_WORKSPACE_REL}"
     )
 }
 
