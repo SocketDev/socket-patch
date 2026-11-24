@@ -541,10 +541,12 @@ pub async fn revert_maven_opts(
     opts: RevertOpts,
 ) -> RevertOutcome {
     let dry_run = opts.dry_run;
-    // The entry of the patch in the block of a Bazel workspace goes first:
-    // the directory it names is removed only once nothing names it.
-    let unit = match unwire_hub(entry, project_root, dry_run).await {
-        Ok(unit) => unit,
+    // The entry of the patch in the block of a Bazel workspace is checked
+    // first and written once the rest of the revert succeeded, and the
+    // directory it names is removed only once nothing names it: a revert
+    // that is refused or fails leaves the block as it was.
+    let hub = match unwire_hub(entry, project_root).await {
+        Ok(hub) => hub,
         Err(why) => return RevertOutcome::failed(why),
     };
     // Routed only when EVERY record is a JVM kind; the JVM revert validates
@@ -552,8 +554,16 @@ pub async fn revert_maven_opts(
     // access (state.json is tamper-able).
     if super::jvm::apply::is_jvm_entry(entry) {
         let mut outcome = super::jvm::apply::revert(project_root, entry, opts).await;
+        let Some((unit, unwired)) = hub.filter(|_| outcome.success && !dry_run) else {
+            return outcome;
+        };
+        if let Err(why) = write_unwired(project_root, &unwired).await {
+            outcome.success = false;
+            outcome.error = Some(why);
+            return outcome;
+        }
         // The hub's directory is no tree of that revert.
-        let unit = unit.filter(|_| outcome.success && !dry_run && !opts.keep_artifact);
+        let unit = Some(unit).filter(|_| !opts.keep_artifact);
         if let Some(unit) = unit.map(|unit| project_root.join(unit)) {
             let top = project_root.join(crate::constants::SOCKET_DIR);
             if let Err(e) = crate::utils::socket_dir::remove_tree_and_prune(&unit, &top).await {
@@ -610,6 +620,16 @@ pub async fn revert_maven_opts(
         }
     }
 
+    if let Some((_, unwired)) = hub.filter(|_| !dry_run) {
+        if let Err(why) = write_unwired(project_root, &unwired).await {
+            return RevertOutcome {
+                kept_artifact: false,
+                success: false,
+                warnings,
+                error: Some(why),
+            };
+        }
+    }
     let outcome = RevertOutcome {
         kept_artifact: false,
         success: true,
@@ -622,25 +642,36 @@ pub async fn revert_maven_opts(
     revert::finish(outcome, project_root, &uuid_dir_rel, opts, policy).await
 }
 
-/// Takes the vendored entry of `entry`'s patch out of the block that
+/// The text of `MODULE.bazel` at the project root, `None` where there is
+/// no such file. Any other failure to read it is an error: a file that
+/// cannot be read may still name the directory of a vendored patch.
+async fn read_module(project_root: &Path) -> Result<Option<String>, String> {
+    use crate::bazel::maven::FILE;
+    match read_regular_to_string(&project_root.join(FILE)).await {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{FILE} cannot be read: {e}")),
+    }
+}
+
+/// What taking the vendored entry of `entry`'s patch out of the block that
 /// `MODULE.bazel` at the project root holds for the hubs of a Bazel
-/// workspace ([`crate::bazel::maven`]), when it holds one, and gives the
-/// directory the entry named. A file that names that directory in any
-/// other way (a block that was changed by hand) fails the revert before
-/// anything is removed: the build would stop at a directory that is gone.
-/// A dry run writes nothing.
+/// workspace ([`crate::bazel::maven`]) leaves, when it holds one: the
+/// directory the entry named and the text [`write_unwired`] writes. A
+/// file that names that directory in any other way (a block that was
+/// changed by hand), or one that cannot be read, fails the revert before
+/// anything is written or removed: the build would stop at a directory
+/// that is gone. Nothing is written here.
 async fn unwire_hub(
     entry: &VendorEntry,
     project_root: &Path,
-    dry_run: bool,
-) -> Result<Option<String>, String> {
+) -> Result<Option<(String, String)>, String> {
     use crate::bazel::maven::{without, Patch, FILE};
     let Some(unit) = vendor_uuid_dir_rel("maven", &entry.uuid) else {
         return Ok(None);
     };
-    let module = project_root.join(FILE);
-    let text = match read_regular_to_string(&module).await {
-        Ok(text) if text.contains(&unit) => text,
+    let text = match read_module(project_root).await? {
+        Some(text) if text.contains(&unit) => text,
         _ => return Ok(None),
     };
     let ours = |patch: &Patch| patch.uuid == entry.uuid && patch.unit().is_some();
@@ -652,12 +683,15 @@ async fn unwire_hub(
              then run the command again"
         ));
     };
-    if !dry_run {
-        atomic_write_bytes_preserving_mode(&module, unwired.as_bytes())
-            .await
-            .map_err(|e| format!("cannot write {FILE}: {e}"))?;
-    }
-    Ok(Some(unit))
+    Ok(Some((unit, unwired)))
+}
+
+/// Writes `unwired`, the text [`unwire_hub`] gave, to `MODULE.bazel`.
+async fn write_unwired(project_root: &Path, unwired: &str) -> Result<(), String> {
+    use crate::bazel::maven::FILE;
+    atomic_write_bytes_preserving_mode(&project_root.join(FILE), unwired.as_bytes())
+        .await
+        .map_err(|e| format!("cannot write {FILE}: {e}"))
 }
 
 /// After `repair` put back the jar of a patch that only a hub takes:
@@ -669,8 +703,8 @@ pub(crate) async fn restore_hub_files(
     project_root: &Path,
     entry: &VendorEntry,
 ) -> Result<(), String> {
-    use crate::bazel::maven::{entries, unit_files, Patch, FILE};
-    let text = read_regular_to_string(&project_root.join(FILE)).await;
+    use crate::bazel::maven::{entries, unit_files, Patch};
+    let text = read_module(project_root).await?;
     let ours = |patch: &Patch| patch.uuid == entry.uuid && patch.unit().is_some();
     let patch = entries(&text.unwrap_or_default()).into_iter().find(ours);
     let files = patch.and_then(|patch| unit_files(&patch, Vec::new()));
@@ -708,8 +742,7 @@ pub async fn check_hub(project_root: &Path, entry: &VendorEntry) -> Result<(), S
     let Some(unit) = vendor_uuid_dir_rel("maven", &entry.uuid) else {
         return Ok(());
     };
-    let text = read_regular_to_string(&project_root.join(FILE)).await;
-    let text = text.unwrap_or_default();
+    let text = read_module(project_root).await?.unwrap_or_default();
     let ours = |patch: &Patch| patch.uuid == entry.uuid && patch.unit().is_some();
     let Some(patch) = entries(&text).into_iter().find(ours) else {
         let made = read_regular_to_bytes(&project_root.join(&unit).join(REPO)).await;
@@ -5882,9 +5915,123 @@ mod tests {
         // Without the file, or without the directory's name in it, the
         // undo is the one it was.
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(unwire_hub(&entry, tmp.path(), false).await, Ok(None));
+        assert_eq!(unwire_hub(&entry, tmp.path()).await, Ok(None));
         std::fs::write(tmp.path().join(FILE), module).unwrap();
-        assert_eq!(unwire_hub(&entry, tmp.path(), false).await, Ok(None));
+        assert_eq!(unwire_hub(&entry, tmp.path()).await, Ok(None));
+    }
+
+    /// A `MODULE.bazel` that is there but cannot be read (here, not UTF-8)
+    /// may still name the directory of the hub's jar: the undo, the check
+    /// and the repair fail on it instead of taking it for a file that is
+    /// not there, and the directory stays.
+    #[tokio::test]
+    async fn an_unreadable_module_file_is_no_missing_one() {
+        use crate::bazel::maven::{with_patch, Patch, FILE};
+        let uuid = "0e77a000-0000-4000-8000-0000000000a1";
+        let module = "bazel_dep(name = \"rules_jvm_external\", version = \"7.2\")\n";
+        let patch = Patch {
+            group: "g".to_string(),
+            artifact: "a".to_string(),
+            version: "1".to_string(),
+            uuid: uuid.to_string(),
+            sha256: String::new(),
+            url: String::new(),
+        };
+        let (unit, jar) = (patch.unit().unwrap(), patch.jar().unwrap());
+        let wired = with_patch(module, "@rules_jvm_external//:extensions.bzl", patch).unwrap();
+        let mut unreadable = wired.into_bytes();
+        unreadable.extend_from_slice(b"# \xff\n");
+        let artifact = VendorArtifact {
+            yarn_berry10c0: None,
+            path: jar.clone(),
+            sha256: String::new(),
+            size: None,
+            platform_locked: None,
+            file_inventory: None,
+        };
+        let purl = "pkg:maven/g/a@1".to_string();
+        let mut entry = VendorEntry::new("maven".into(), purl, uuid.into(), artifact, Vec::new());
+        entry.flavor = Some(HUB_FLAVOR.to_string());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(&unit).join("file")).unwrap();
+        std::fs::write(root.join(&jar), b"jar").unwrap();
+        std::fs::write(root.join(FILE), &unreadable).unwrap();
+
+        let outcome = revert_maven(&entry, root, false).await;
+        assert!(!outcome.success, "{outcome:?}");
+        let why = outcome.error.unwrap_or_default();
+        assert!(
+            why.contains(FILE) && why.contains("cannot be read"),
+            "{why}"
+        );
+        assert!(root.join(&jar).exists());
+        assert_eq!(std::fs::read(root.join(FILE)).unwrap(), unreadable);
+
+        let why = check_hub(root, &entry).await.unwrap_err();
+        assert!(why.contains("cannot be read"), "{why}");
+        let why = restore_hub_files(root, &entry).await.unwrap_err();
+        assert!(why.contains("cannot be read"), "{why}");
+        assert!(!root.join(&unit).join(crate::bazel::maven::REPO).exists());
+    }
+
+    /// The block keeps the entry of the patch when the JVM revert it goes
+    /// with is refused: the directory it names stays, so the entry must
+    /// too, and a later undo still finds and removes both.
+    #[tokio::test]
+    async fn a_refused_jvm_revert_leaves_the_hub_entry() {
+        use crate::bazel::maven::{with_patch, Patch, FILE};
+        let uuid = "0e77a000-0000-4000-8000-0000000000a1";
+        let module = "bazel_dep(name = \"rules_jvm_external\", version = \"7.2\")\n";
+        let patch = Patch {
+            group: "g".to_string(),
+            artifact: "a".to_string(),
+            version: "1".to_string(),
+            uuid: uuid.to_string(),
+            sha256: String::new(),
+            url: String::new(),
+        };
+        let (unit, jar) = (patch.unit().unwrap(), patch.jar().unwrap());
+        let wired = with_patch(module, "@rules_jvm_external//:extensions.bzl", patch).unwrap();
+        let artifact = VendorArtifact {
+            yarn_berry10c0: None,
+            path: jar.clone(),
+            sha256: String::new(),
+            size: None,
+            platform_locked: None,
+            file_inventory: None,
+        };
+        // A tree record at a path vendoring never writes: the JVM revert
+        // refuses it before touching the disk.
+        let tree = WiringRecord {
+            file: "elsewhere/a.jar".to_string(),
+            kind: super::super::jvm::TREE_KIND.to_string(),
+            action: WiringAction::Added,
+            key: None,
+            original: None,
+            new: None,
+        };
+        let purl = "pkg:maven/g/a@1".to_string();
+        let entry = VendorEntry::new("jvm".into(), purl, uuid.into(), artifact, vec![tree]);
+        assert!(super::super::jvm::apply::is_jvm_entry(&entry));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(&unit).join("file")).unwrap();
+        std::fs::write(root.join(&jar), b"jar").unwrap();
+        std::fs::write(root.join(FILE), &wired).unwrap();
+
+        let outcome = revert_maven(&entry, root, false).await;
+        assert!(!outcome.success, "{outcome:?}");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("refusing revert")),
+            "{outcome:?}"
+        );
+        assert_eq!(std::fs::read_to_string(root.join(FILE)).unwrap(), wired);
+        assert!(root.join(&jar).exists());
+        assert!(unwire_hub(&entry, root).await.unwrap().is_some());
     }
 
     /// A hosted run that put its entry in the place of a vendored one
