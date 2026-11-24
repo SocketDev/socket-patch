@@ -1855,6 +1855,11 @@ async fn selection_filter_prefers_the_single_advisory_patch_for_the_one_needed_a
         "the unreachable critical is left alone"
     );
     assert_eq!(
+        alpha["mergePendingIds"],
+        json!([]),
+        "the merged patch is published and the filter passed it over: nothing waits on one"
+    );
+    assert_eq!(
         doc["policy"]["counts"]["filtered"], 0,
         "{:#}",
         doc["policy"]

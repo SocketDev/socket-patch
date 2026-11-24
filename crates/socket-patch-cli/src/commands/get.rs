@@ -4,7 +4,7 @@ use socket_patch_core::api::client::{
     build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
     is_fallback_candidate, ApiClient, ApiError,
 };
-use socket_patch_core::api::ranking::cmp_search_results;
+use socket_patch_core::api::ranking::{cmp_search_results, severity_order};
 use socket_patch_core::api::types::{
     PatchResponse, PatchSearchResult, SearchResponse, VulnerabilityResponse,
 };
@@ -554,6 +554,142 @@ fn format_selected_patches(selected: &[PatchSearchResult], color: bool) -> Strin
     out
 }
 
+/// Warning code (`--json`): the patch a `get` selected leaves advisories
+/// that another patch the account can download fixes. The merged patch
+/// that fixes them together is not published yet.
+pub(crate) const MERGED_PATCH_PENDING: &str = "merged_patch_pending";
+
+/// The selected patches whose package is waiting on a merged patch, as
+/// `(purl, ids)` in purl order: the advisories (by CVE, or by their own id
+/// when they have none) that the other `candidates` for the same purl fix
+/// and the selected patch does not. `candidates` are the patches the
+/// account can download. A package waits when they fix more advisories
+/// between them than any one of them does: Socket publishes one patch that
+/// fixes a package version's advisories together, after the single patches
+/// it combines, and that one is not among them yet. Without `paid` access
+/// only critical advisories count: the free tier's merged patch combines a
+/// package version's critical fixes, and a free patch for a lesser
+/// advisory is never part of one.
+///
+/// The release variants of a package (a wheel and its sdist) are one
+/// package here, and it waits only for what every selected variant leaves:
+/// the run installs one of them, and this is asked before it is known
+/// which.
+fn merge_pending(
+    candidates: &[PatchSearchResult],
+    selected: &[PatchSearchResult],
+    paid: bool,
+) -> Vec<(String, Vec<String>)> {
+    use std::collections::{BTreeMap, BTreeSet};
+    // Per package: how it is shown, and the ids every variant seen so far
+    // leaves waiting.
+    let mut pending: BTreeMap<String, (String, BTreeSet<&str>)> = BTreeMap::new();
+    for patch in selected {
+        // What each advisory the candidates fix is shown as.
+        let mut offered: BTreeMap<&str, &[String]> = BTreeMap::new();
+        let group = || candidates.iter().filter(|c| c.purl == patch.purl);
+        for candidate in group() {
+            for (advisory, vuln) in &candidate.vulnerabilities {
+                if paid || severity_order(Some(&vuln.severity)) == 0 {
+                    offered.entry(advisory).or_insert(&vuln.cves);
+                }
+            }
+        }
+        let merged = group().any(|candidate| {
+            let fixes = &candidate.vulnerabilities;
+            offered.keys().all(|advisory| fixes.contains_key(*advisory))
+        });
+        let ids: BTreeSet<&str> = offered
+            .iter()
+            .filter(|(advisory, _)| !merged && !patch.vulnerabilities.contains_key(**advisory))
+            .flat_map(|(advisory, cves)| match cves.is_empty() {
+                true => vec![*advisory],
+                false => cves.iter().map(String::as_str).collect(),
+            })
+            .collect();
+        match pending.entry(PurlKey::new(&patch.purl).into_string()) {
+            std::collections::btree_map::Entry::Occupied(mut package) => {
+                package.get_mut().1.retain(|id| ids.contains(id));
+            }
+            std::collections::btree_map::Entry::Vacant(package) => {
+                let shown = normalize_purl(strip_purl_qualifiers(&patch.purl)).into_owned();
+                package.insert((shown, ids));
+            }
+        }
+    }
+    let mut pending: Vec<(String, Vec<String>)> = pending
+        .into_values()
+        .filter(|(_, ids)| !ids.is_empty())
+        .map(|(purl, ids)| (purl, ids.into_iter().map(str::to_string).collect()))
+        .collect();
+    pending.sort();
+    pending
+}
+
+/// What [`merge_pending`] found, for one package: the `--json` warning's
+/// detail.
+fn merge_pending_detail(purl: &str, ids: &[String]) -> String {
+    format!(
+        "the merged patch for {purl} is not ready yet: Socket is still processing it. {} \
+         unpatched until then; run `socket-patch scan` again later to apply it",
+        match ids {
+            [id] => format!("{id} stays"),
+            ids => format!("{} stay", ids.join(", ")),
+        }
+    )
+}
+
+/// How many waiting packages [`merge_pending_note`] names before it
+/// counts the rest.
+const MERGE_PENDING_NAMED: usize = 5;
+
+/// What a `get` prints when packages it patched are waiting on a merged
+/// patch ([`merge_pending`]): `scan`'s two closing lines, with the
+/// packages and what each one leaves unpatched between them. Short lines,
+/// so that a terminal does not wrap them. Ends with a newline.
+///
+/// ```text
+/// 1 merged patch is not ready yet: Socket is still processing it.
+///   pkg:npm/crypto-js@3.1.2: CVE-2023-46233 unpatched until then
+/// Run `socket-patch scan` again later to apply it.
+/// ```
+fn merge_pending_note(pending: &[(String, Vec<String>)], color: bool) -> Option<String> {
+    if pending.is_empty() {
+        return None;
+    }
+    let one = pending.len() == 1;
+    let mut out = format!(
+        "{} {} not ready yet: Socket is still processing {}.\n",
+        crate::ui::paint(&pending.len().to_string(), "1;33", color),
+        if one {
+            "merged patch is"
+        } else {
+            "merged patches are"
+        },
+        if one { "it" } else { "them" },
+    );
+    for (purl, ids) in pending.iter().take(MERGE_PENDING_NAMED) {
+        out.push_str(&format!(
+            "  {purl}: {} unpatched until then\n",
+            ids.join(", ")
+        ));
+    }
+    if pending.len() > MERGE_PENDING_NAMED {
+        let more = pending.len() - MERGE_PENDING_NAMED;
+        out.push_str(&format!(
+            "  and {}\n",
+            crate::ui::plural(more, "more package", "more packages")
+        ));
+    }
+    let hint = format!(
+        "Run `socket-patch scan` again later to apply {}.",
+        if one { "it" } else { "them" }
+    );
+    out.push_str(&crate::ui::dim(&hint, color));
+    out.push('\n');
+    Some(out)
+}
+
 /// Number of distinct purls among skip records.
 fn distinct_skip_purls(skips: &[PatchEvent]) -> usize {
     let purls: std::collections::BTreeSet<&str> = skips
@@ -926,6 +1062,11 @@ async fn filter_to_installed_purls(
         let hosted = mode == super::scan::ScanMode::Hosted;
         let supplement = super::scan::project_lockfile_supplement(&ctx, &[], None, hosted).await;
         pnp_diags = supplement.unsupported;
+        // What was not read of a Bazel workspace's Maven hubs says nothing
+        // of patches that are for no Maven artifact.
+        let maven = accessible.iter().any(|p| p.purl.starts_with("pkg:maven/"));
+        let hub = socket_patch_core::bazel::maven::HUB_NOT_READ;
+        pnp_diags.retain(|diag| maven || diag.code != hub);
         if mode != super::scan::ScanMode::Agent {
             present.extend(supplement.entries.iter().map(|e| PurlKey::new(&e.purl)));
             // A hosted run's supplement also names the gems the lock
@@ -1771,6 +1912,24 @@ pub async fn run(args: GetArgs) -> i32 {
     {
         print!("{}", format_selected_patches(&selected, color));
     }
+    // The selection fixes less than the candidates do between them: the
+    // merged patch is not published yet. Say so, and that it is coming.
+    let waiting = merge_pending(
+        &accessible,
+        &selected,
+        search_response.can_access_paid_patches,
+    );
+    if !quiet {
+        if let Some(note) = merge_pending_note(&waiting, color) {
+            println!("{note}");
+        }
+    }
+    narrow_warnings.extend(waiting.iter().map(|(purl, ids)| {
+        (
+            MERGED_PATCH_PENDING.to_string(),
+            merge_pending_detail(purl, ids),
+        )
+    }));
 
     // Agent wet runs and vendored runs narrow variants in their download
     // engines. Hosted runs and agent previews need the same narrowing here.
@@ -4340,6 +4499,140 @@ mod tests {
         m.insert("GHSA-2".to_string(), vuln(&["CVE-1"], "low", ""));
         assert_eq!(vuln_labels(&m), vec!["CVE-1", "CVE-2"]);
         assert!(vuln_labels(&HashMap::new()).is_empty());
+    }
+
+    /// A candidate for `purl` fixing `advisories` (`(advisory id, cves)`).
+    fn candidate(purl: &str, uuid: &str, advisories: &[(&str, &[&str])]) -> PatchSearchResult {
+        PatchSearchResult {
+            uuid: uuid.to_string(),
+            purl: purl.to_string(),
+            published_at: String::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: "free".to_string(),
+            vulnerabilities: advisories
+                .iter()
+                .map(|(id, cves)| ((*id).to_string(), vuln(cves, "critical", "")))
+                .collect(),
+        }
+    }
+
+    /// Two patches the account can download fix two advisories of one
+    /// package and none fixes both: whichever is selected, the other
+    /// advisory waits on the merged patch, and the note says that patch is
+    /// still being processed. A candidate that fixes both ends the wait.
+    #[test]
+    fn merge_pending_names_what_waits_on_a_merged_patch() {
+        const PURL: &str = "pkg:npm/crypto-js@3.1.2";
+        let a = candidate(PURL, "a", &[("GHSA-a", &["CVE-1"])]);
+        let b = candidate(PURL, "b", &[("GHSA-b", &[])]);
+        let other = candidate("pkg:npm/other@1.0.0", "o", &[("GHSA-o", &["CVE-9"])]);
+        let candidates = [a.clone(), b.clone(), other.clone()];
+        let one = std::slice::from_ref;
+
+        let waiting = merge_pending(&candidates, &[a.clone(), other.clone()], false);
+        assert_eq!(
+            waiting,
+            vec![(PURL.to_string(), vec!["GHSA-b".to_string()])]
+        );
+        assert_eq!(
+            merge_pending_note(&waiting, false).as_deref(),
+            Some(
+                "1 merged patch is not ready yet: Socket is still processing it.\n  \
+                 pkg:npm/crypto-js@3.1.2: GHSA-b unpatched until then\n\
+                 Run `socket-patch scan` again later to apply it.\n"
+            )
+        );
+        assert_eq!(
+            merge_pending(&candidates, one(&b), false),
+            vec![(PURL.to_string(), vec!["CVE-1".to_string()])]
+        );
+
+        // The free tier's merged patch combines the critical fixes: a free
+        // patch for a lesser advisory waits on nothing without paid
+        // access, and on the merged patch of them all with it.
+        let mut lesser = candidate(PURL, "h", &[("GHSA-h", &["CVE-7"])]);
+        for vuln in lesser.vulnerabilities.values_mut() {
+            vuln.severity = "HIGH".to_string();
+        }
+        let with_lesser = [a.clone(), lesser];
+        assert!(merge_pending(&with_lesser, one(&a), false).is_empty());
+        assert_eq!(
+            merge_pending(&with_lesser, one(&a), true),
+            vec![(PURL.to_string(), vec!["CVE-7".to_string()])]
+        );
+
+        // The merged patch is among the candidates: nothing waits, whether
+        // or not it is the one selected.
+        let merged = candidate(PURL, "m", &[("GHSA-a", &["CVE-1"]), ("GHSA-b", &[])]);
+        let with_merged = [a.clone(), b, merged.clone()];
+        assert!(merge_pending(&with_merged, &[merged], false).is_empty());
+        assert!(merge_pending(&with_merged, one(&a), false).is_empty());
+        // The release variants of one package are named once, however
+        // their purls spell the name.
+        const WHEEL: &str = "pkg:pypi/foo@1.0?artifact_id=whl";
+        const SDIST: &str = "pkg:pypi/Foo@1.0?artifact_id=tar-gz";
+        let variants = [
+            candidate(WHEEL, "w1", &[("GHSA-a", &["CVE-1"])]),
+            candidate(WHEEL, "w2", &[("GHSA-b", &["CVE-2"])]),
+            candidate(SDIST, "s1", &[("GHSA-a", &["CVE-1"])]),
+            candidate(SDIST, "s2", &[("GHSA-b", &["CVE-2"])]),
+        ];
+        let both = [variants[0].clone(), variants[2].clone()];
+        assert_eq!(
+            merge_pending(&variants, &both, false),
+            vec![("pkg:pypi/foo@1.0".to_string(), vec!["CVE-2".to_string()])]
+        );
+        // One variant already has its merged patch: the run may install
+        // that one, so nothing is said to wait.
+        let wheel_merged = candidate(
+            WHEEL,
+            "wm",
+            &[("GHSA-a", &["CVE-1"]), ("GHSA-b", &["CVE-2"])],
+        );
+        let mut with_merged = variants.to_vec();
+        with_merged.push(wheel_merged.clone());
+        let mixed = [wheel_merged, variants[2].clone()];
+        assert!(merge_pending(&with_merged, &mixed, false).is_empty());
+        // One candidate for the package (a CVE search finds only the
+        // patches that name the CVE): nothing is known to wait.
+        assert!(merge_pending(one(&a), one(&a), false).is_empty());
+        assert_eq!(merge_pending_note(&[], false), None);
+
+        // Several packages are listed, the first few by name.
+        let many: Vec<(String, Vec<String>)> = (1..=7)
+            .map(|n| (format!("pkg:npm/p{n}@1.0.0"), vec![format!("CVE-{n}")]))
+            .collect();
+        assert_eq!(
+            merge_pending_note(&many[..2], false).as_deref(),
+            Some(
+                "2 merged patches are not ready yet: Socket is still processing them.\n  \
+                 pkg:npm/p1@1.0.0: CVE-1 unpatched until then\n  \
+                 pkg:npm/p2@1.0.0: CVE-2 unpatched until then\n\
+                 Run `socket-patch scan` again later to apply them.\n"
+            )
+        );
+        let note = merge_pending_note(&many, false).unwrap();
+        assert!(
+            note.starts_with("7 merged patches are not ready yet"),
+            "{note}"
+        );
+        assert!(
+            note.contains(
+                "  pkg:npm/p5@1.0.0: CVE-5 unpatched until then\n  and 2 more packages\n"
+            ),
+            "{note}"
+        );
+        assert!(!note.contains("p6"), "{note}");
+        assert_eq!(
+            merge_pending_detail(
+                "pkg:npm/b@1.0.0",
+                &["CVE-2".to_string(), "CVE-3".to_string()]
+            ),
+            "the merged patch for pkg:npm/b@1.0.0 is not ready yet: Socket is still \
+             processing it. CVE-2, CVE-3 stay unpatched until then; run `socket-patch scan` \
+             again later to apply it"
+        );
     }
 
     #[test]
