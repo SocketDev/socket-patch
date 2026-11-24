@@ -1062,6 +1062,11 @@ async fn filter_to_installed_purls(
         let hosted = mode == super::scan::ScanMode::Hosted;
         let supplement = super::scan::project_lockfile_supplement(&ctx, &[], None, hosted).await;
         pnp_diags = supplement.unsupported;
+        // What was not read of a Bazel workspace's Maven hubs says nothing
+        // of patches that are for no Maven artifact.
+        let maven = accessible.iter().any(|p| p.purl.starts_with("pkg:maven/"));
+        let hub = socket_patch_core::bazel::maven::HUB_NOT_READ;
+        pnp_diags.retain(|diag| maven || diag.code != hub);
         if mode != super::scan::ScanMode::Agent {
             present.extend(supplement.entries.iter().map(|e| PurlKey::new(&e.purl)));
             // A hosted run's supplement also names the gems the lock

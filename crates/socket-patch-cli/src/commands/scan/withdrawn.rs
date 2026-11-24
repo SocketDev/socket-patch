@@ -43,6 +43,15 @@ use crate::json_envelope::{Envelope, PatchAction, PatchEvent, RunWarning};
 /// `reason` code on the `rolledBack` event of a pin the sweep restored.
 pub(super) const PATCH_WITHDRAWN: &str = "patch_withdrawn";
 
+/// `reason` code on the `rolledBack` event of an entry that the sweep took
+/// out of the block in the `MODULE.bazel` of a Bazel workspace because no
+/// pinned rules_jvm_external hub fetches its jar any more
+/// ([`socket_patch_core::bazel::maven::HubJars::stale`]), and what a
+/// message says of such a patch.
+pub(super) const MAVEN_BAZEL_ENTRY_STALE: &str = "maven_bazel_entry_stale";
+const STALE: &str = "is for a jar that no pinned rules_jvm_external hub of the Bazel workspace \
+                     fetches any more, so Bazel stops at its entry in MODULE.bazel";
+
 /// Warning: a withdrawn pin could not be restored upstream (the restore
 /// refused it, the restored files could not be written, or the apply lock
 /// was held). The pin is unchanged; the detail names the remedy. The one
@@ -159,17 +168,20 @@ pub(super) fn pins_in_scope(
         .collect()
 }
 
-/// Check `pins` against the reference endpoint and restore the withdrawn
-/// ones upstream (see the module docs). A wet restore runs under the apply
-/// lock, released before the hosted rewrite takes it again.
-pub(super) async fn sweep(
+/// A pin the sweep restores, the `reason` code of its event, and what is
+/// said of its patch.
+type Gone = (HostedPin, &'static str, String);
+
+/// The pins of `pins` whose patch the reference endpoint says is gone for
+/// good. A lookup that fails is a warning of `out`, and keeps every pin.
+async fn withdrawn(
     common: &GlobalArgs,
     api_client: &ApiClient,
     pins: &[HostedPin],
-) -> WithdrawnSweep {
-    let mut out = WithdrawnSweep::default();
+    out: &mut WithdrawnSweep,
+) -> Vec<Gone> {
     if pins.is_empty() {
-        return out;
+        return Vec::new();
     }
     let uuids: Vec<String> = pins
         .iter()
@@ -198,27 +210,61 @@ pub(super) async fn sweep(
                      still published ({e}); every pin was kept, re-run to check again"
                 ),
             );
-            return out;
+            return Vec::new();
         }
     };
     // A uuid the response leaves out is not known to be gone: kept.
-    let gone: Vec<(HostedPin, String)> = pins
+    let gone = pins
         .iter()
         .filter_map(|pin| {
             let status = &references.get(&pin.uuid)?.status;
-            is_gone(status).then(|| (pin.clone(), status.clone()))
+            let why = format!("is no longer published ({status})");
+            is_gone(status).then(|| (pin.clone(), PATCH_WITHDRAWN, why))
         })
         .collect();
     out.references = Some(KnownReferences::settled(&uuids, references));
+    gone
+}
+
+/// `gone` and the pins of `stale` after it. A stale pin whose patch is
+/// withdrawn too is in `gone` already, with every file that holds it: it
+/// is restored, and reported, once.
+fn with_stale(mut gone: Vec<Gone>, stale: &[HostedPin]) -> Vec<Gone> {
+    let known = |pin: &&HostedPin| {
+        let same = |(gone, ..): &Gone| (&gone.purl, &gone.uuid) == (&pin.purl, &pin.uuid);
+        !gone.iter().any(same)
+    };
+    let stale: Vec<_> = stale.iter().filter(known).cloned().collect();
+    gone.extend(
+        stale
+            .into_iter()
+            .map(|pin| (pin, MAVEN_BAZEL_ENTRY_STALE, STALE.to_string())),
+    );
+    gone
+}
+
+/// Check `pins` against the reference endpoint and restore the withdrawn
+/// ones upstream (see the module docs), and with them the pins of `stale`,
+/// which are asked about nowhere: the entries of a Bazel workspace's block
+/// that the build stops at. A wet restore runs under the apply lock,
+/// released before the hosted rewrite takes it again.
+pub(super) async fn sweep(
+    common: &GlobalArgs,
+    api_client: &ApiClient,
+    pins: &[HostedPin],
+    stale: &[HostedPin],
+) -> WithdrawnSweep {
+    let mut out = WithdrawnSweep::default();
+    let gone = withdrawn(common, api_client, pins, &mut out).await;
+    let gone = with_stale(gone, stale);
     if gone.is_empty() {
         return out;
     }
 
     if !common.json && !common.silent {
-        for (pin, status) in &gone {
+        for (pin, _, why) in &gone {
             eprintln!(
-                "Note: patch {} for {} is no longer published ({status}); restoring its \
-                 upstream registry entry",
+                "Note: patch {} for {} {why}; restoring its upstream registry entry",
                 pin.uuid, pin.purl
             );
         }
@@ -238,14 +284,13 @@ pub(super) async fn sweep(
             }
             Err(err) => {
                 let (_, message) = crate::commands::lock_cli::lock_failure(&err, timeout);
-                for (pin, status) in &gone {
+                for (pin, _, why) in &gone {
                     out.warn(
                         common,
                         REDIRECT_WITHDRAWN_RESTORE_FAILED,
                         format!(
-                            "{} is pinned to patch {}, which is no longer published \
-                             ({status}), but it was not restored: {message}; re-run, or run \
-                             `socket-patch rollback {}`",
+                            "{} is pinned to patch {}, which {why}, but it was not restored: \
+                             {message}; re-run, or run `socket-patch rollback {}`",
                             pin.purl,
                             pin.uuid,
                             crate::ui::shell_word(&pin.purl)
@@ -257,7 +302,7 @@ pub(super) async fn sweep(
         }
     };
 
-    let to_restore: Vec<HostedPin> = gone.iter().map(|(pin, _)| pin.clone()).collect();
+    let to_restore: Vec<HostedPin> = gone.iter().map(|(pin, ..)| pin.clone()).collect();
     // The scan's own client, for a patch record the gem leg may need.
     let run_client = crate::args::RunApiClient::new_with(Some(api_client.clone()));
     let leg =
@@ -269,7 +314,7 @@ pub(super) async fn sweep(
     } else {
         PatchAction::RolledBack
     };
-    for (pin, status) in &gone {
+    for (pin, code, why) in &gone {
         if !leg.reverted.iter().any(|p| p == &pin.purl) {
             continue;
         }
@@ -282,10 +327,9 @@ pub(super) async fn sweep(
             PatchEvent::new(action, pin.purl.as_str())
                 .with_uuid(pin.uuid.as_str())
                 .with_reason(
-                    PATCH_WITHDRAWN,
+                    *code,
                     format!(
-                        "patch {} is no longer published ({status}); the pin {verb} to the \
-                         upstream registry entry",
+                        "patch {} {why}; the pin {verb} to the upstream registry entry",
                         pin.uuid
                     ),
                 ),
@@ -298,7 +342,7 @@ pub(super) async fn sweep(
         // so it kept every pin that was not refused on its own.
         let subject = if key == crate::commands::hosted_unwind::WRITE_FAILURE_KEY {
             gone.iter()
-                .map(|(pin, _)| pin.purl.as_str())
+                .map(|(pin, ..)| pin.purl.as_str())
                 .filter(|purl| !leg.failed.iter().any(|(refused, _)| refused == purl))
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -362,6 +406,28 @@ mod tests {
         let pins = vec![pin("pkg:npm/b@2.0.0", "u2")];
         assert!(pins_in_scope(&pins, ["pkg:npm/b@2.0.1"]).is_empty());
         assert!(pins_in_scope(&pins, Vec::<String>::new()).is_empty());
+    }
+
+    #[test]
+    fn a_stale_pin_that_is_withdrawn_too_is_taken_once() {
+        let both = HostedPin {
+            files: vec!["MODULE.bazel".to_string(), "pom.xml".to_string()],
+            ..pin("pkg:maven/g/a@1.0", "u1")
+        };
+        let stale = [
+            pin("pkg:maven/g/a@1.0", "u1"),
+            pin("pkg:maven/g/b@2.0", "u2"),
+        ];
+        let gone = vec![(both.clone(), PATCH_WITHDRAWN, "is gone".to_string())];
+        let taken: Vec<_> = with_stale(gone, &stale)
+            .into_iter()
+            .map(|(pin, code, _)| (pin, code))
+            .collect();
+        let expected = [
+            (both, PATCH_WITHDRAWN),
+            (stale[1].clone(), MAVEN_BAZEL_ENTRY_STALE),
+        ];
+        assert_eq!(taken, expected);
     }
 
     #[test]

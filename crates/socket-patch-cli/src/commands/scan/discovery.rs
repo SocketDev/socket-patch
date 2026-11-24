@@ -9,11 +9,14 @@ use socket_patch_core::api::ranking::{batch_supersedes, cmp_batch_infos, severit
 use socket_patch_core::api::types::{
     BatchPackagePatches, BatchPatchInfo, PatchResponse, PatchSearchResult,
 };
+use socket_patch_core::bazel::maven::HubJars;
+use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::purl_key::PurlKey;
-use socket_patch_core::vendor::lock_inventory::LockfileEntry;
+use socket_patch_core::vendor::lock_inventory::{LockfileEntry, UnsupportedNpmLayout};
 use socket_patch_core::vendor::VendorState;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -48,7 +51,14 @@ pub(crate) struct LockfileSupplement {
     /// npm layouts the lockfile inventory REFUSED (Plug'n'Play loaders).
     /// Scan surfaces these as refusal warnings: under PnP the installed-tree
     /// crawl is empty too, so otherwise the project scans as a silent no-op.
-    pub(crate) unsupported: Vec<socket_patch_core::vendor::lock_inventory::UnsupportedNpmLayout>,
+    /// Also what a hosted run did not read of the hubs of a Bazel workspace
+    /// ([`hub_jars`]).
+    pub(crate) unsupported: Vec<UnsupportedNpmLayout>,
+    /// The entries of the block in `MODULE.bazel` whose jar no hub of the
+    /// Bazel workspace fetches any more ([`hub_jars`]), as hosted pins of
+    /// that file alone: Bazel stops at each, so a hosted scan takes them
+    /// out (`withdrawn::sweep`).
+    pub(crate) stale_hub_pins: Vec<HostedPin>,
 }
 
 /// Inventory the project's lockfile(s) and fabricate crawl entries for
@@ -68,7 +78,8 @@ pub(crate) struct LockfileSupplement {
 /// (1.18.10-arm64-darwin)`: no one `.gem` stands for it, so it cannot be
 /// vendored from the lock, and an in-place patch needs the installed copy).
 /// Hosted mode redirects such a gem to its per-platform prebuilds from the
-/// lock alone, so a hosted supplement names it too.
+/// lock alone, so a hosted supplement names it too. It also names the jars
+/// of [`hub_jars`], and what was not read of the hubs joins `unsupported`.
 pub(crate) async fn lockfile_supplement(
     ctx: &crate::commands::context::ProjectContext<'_>,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
@@ -84,7 +95,21 @@ pub(crate) async fn lockfile_supplement(
     out.unsupported = locks.unsupported.clone();
     let entries = &locks.entries;
     let platform_gems = ctx.gem_platform_only_purls().await;
-    if entries.is_empty() && platform_gems.is_empty() {
+    let HubJars {
+        jars,
+        unread,
+        stale,
+    } = hub_jars(common, hosted).await;
+    out.unsupported
+        .extend(unread.map(|(code, detail)| UnsupportedNpmLayout { code, detail }));
+    let files = vec![socket_patch_core::bazel::maven::FILE.to_string()];
+    let pin = |(purl, uuid)| HostedPin {
+        purl,
+        uuid,
+        files: files.clone(),
+    };
+    out.stale_hub_pins = stale.into_iter().map(pin).collect();
+    if entries.is_empty() && platform_gems.is_empty() && jars.is_empty() {
         return out;
     }
     // Only a hosted supplement names a platform-only gem that has no
@@ -92,11 +117,25 @@ pub(crate) async fn lockfile_supplement(
     let resolved = entries
         .iter()
         .map(|entry| entry.purl.as_str())
-        .chain(platform_gems.iter().filter(|_| hosted).map(String::as_str));
+        .chain(platform_gems.iter().filter(|_| hosted).map(String::as_str))
+        .chain(jars.iter().map(String::as_str));
     (out.packages, out.purls) = lockfile_only_packages(resolved, crawled, only, &common.cwd);
     out.entries = entries.clone();
     out.platform_gems = platform_gems;
     out
+}
+
+/// The purls of the jars that the pinned rules_jvm_external hubs of a Bazel
+/// workspace fetch when `--cwd` is its root, what was not read of its hubs
+/// and the entries of its block that are stale
+/// ([`socket_patch_core::bazel::maven::hub_jars`]). Only for a hosted run
+/// with Maven in scope: no other mode patches a hub. The callers are runs
+/// of a project, never of the global installs.
+pub(crate) async fn hub_jars(common: &GlobalArgs, hosted: bool) -> HubJars {
+    if !hosted || !common.ecosystem_selected(Ecosystem::Maven) {
+        return HubJars::default();
+    }
+    socket_patch_core::bazel::maven::hub_jars(&common.cwd).await
 }
 
 /// The packages `resolved` (the purls the project's lockfiles resolve) with
