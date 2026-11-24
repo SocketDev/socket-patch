@@ -53,6 +53,7 @@ and keeps working through v5.x.
 | **Supported** | The default. Covered by CI. A regression is a release blocker. |
 | **Beta** | Works for the build shapes documented on this page and is tested in CI. Some shapes outside them are refused, and the open issues for that ecosystem describe shapes that are patched incompletely. Preview with `--dry-run` and confirm with a real build before you commit the result. |
 | **Legacy** | A format that the package manager itself has retired. socket-patch keeps reading and writing it in v5 and still fixes its bugs, but adds no new features for it. Prefer the upgrade path in the table below. |
+| **Experimental** | New, and tested in CI only on the build shapes its section lists. What a command does, what it writes and how it words a refusal can change in any v5.x release, and a regression is not a release blocker. Preview with `--dry-run` and confirm with a real build before you commit the result. |
 | **Not supported** | Refused with an error code that names the remedy. |
 
 | Ecosystem / format | agent | vendored | hosted |
@@ -67,6 +68,7 @@ and keeps working through v5.x.
 | Gradle | Supported, with the [`files-2.1` advisories](#gradle) | Beta (Gradle 6.8+) | Beta (Gradle 6.8+) |
 | sbt / Mill / scala-cli | Beta | Beta (sbt and scala-cli directory builds; Mill is not wired) | Beta (Mill and scala-cli get manual snippets only) |
 | Deno | Supported | Not supported | Not supported |
+| A project that Bazel builds, every ecosystem | Not supported, and not refused: it runs as it does without Bazel, and the section says why that is no patch of the build | Experimental, for the ecosystems that [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported) lists | Experimental, the same |
 
 **Hosted and vendored Maven and Gradle are Beta in v5.** Each wiring is built to fail
 closed: hosted mode and vendored Maven pin a Socket-only `-socket.<hex8>` version, and
@@ -1980,6 +1982,15 @@ the repository list, so it is left as a
   names the cause and its remedy.
 
 ## Bazel workspaces: what is supported
+
+**Support for projects that Bazel builds is experimental** (see the
+[v5 support tiers](#v5-support-tiers)). It is new, each ruleset is an integration of its own,
+and a Bazel build fails late: a command can exit 0 and the build after it can still fail or
+take the unpatched package where a workspace is written in a way this page does not list.
+So what the commands do under Bazel, the files they write and the words of their refusals
+can change in any v5.x release. After a command, build with Bazel before you commit the
+result. None of it applies to a project that is in no Bazel workspace: there socket-patch
+does what the rest of this page says.
 
 A Bazel build takes each package from what a ruleset reads in the checkout (a lock, a call in
 `MODULE.bazel`), in a repository of Bazel's own, and not from the copies a package manager
