@@ -132,6 +132,7 @@ fn granted(purl: &str, uuid: &str, (url, sha256): (&str, &str)) -> Option<DepOve
         token: String::new(),
         patch_uuid: uuid.to_string(),
         artifact_url: url.to_string(),
+        npm_registry_url: None,
         registry_override: None,
         integrity: Integrity {
             sha256: Some(sha256.to_string()),

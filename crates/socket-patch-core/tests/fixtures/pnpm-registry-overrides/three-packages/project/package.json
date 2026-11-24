@@ -1,0 +1,10 @@
+{
+  "name": "app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@scope/direct": "1.0.0",
+    "peer-user": "1.0.0",
+    "host": "1.0.0"
+  }
+}

@@ -3670,6 +3670,7 @@ async fn the_hosted_rewriters_own_output_reinventories() {
             sha256: Some("c".repeat(64)),
             ..Default::default()
         },
+        npm_registry_url: None,
         registry_override: None,
     };
     let rewritten = rewrite_registry_redirect(

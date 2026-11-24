@@ -43,13 +43,17 @@ pub const NOT_UPDATED: &str = "bazelrc_not_updated";
 const COMMENT: &str = "# socket-patch: the committed copy of a patched wheel, for Bazel's \
                        downloads (to opt out, comment out the next line)";
 
+/// What every line of [`sync`] is about, for the one comment line they
+/// share.
+const WHEEL: &str = "wheel";
+
 /// How a line of [`sync`] starts: the directory follows, from the Bazel
 /// root.
 const OPTION: &str = "common --distdir=";
 
 const LINES: Kept = Kept {
     file: ".bazelrc",
-    comment: COMMENT,
+    comment: |_| COMMENT.to_string(),
     // Only the line itself: a `--distdir` above the copy's is not searched
     // below itself.
     covers: |old, line| {
@@ -121,27 +125,31 @@ pub fn sync(root: &BazelRoot, dirs: &[String], add: bool) -> Result<Option<PathB
     // The lines to have, and the lines the file has for a directory of
     // this project that is gone.
     let wanted = |old: &[u8]| {
-        let mut wanted: Vec<_> = dirs.iter().map(|dir| (line(dir), exists(dir))).collect();
+        // A copy that is there gets its line only from a run that adds.
+        let state = |dir: &str| exists(dir).filter(|there| add || !there);
+        let mut wanted: Vec<_> = (dirs.iter())
+            .map(|dir| (line(dir), state(dir), WHEEL))
+            .collect();
         let lines = old.split_inclusive(|byte| *byte == b'\n').map(content);
         for had in lines.filter_map(|had| std::str::from_utf8(had).ok()) {
             let dir = had.strip_prefix(&line(""));
             let dir = dir.filter(|dir| dir.starts_with(".socket/vendor/pypi/"));
             let gone = dir.is_some_and(|dir| exists(dir) == Some(false));
-            if gone && !wanted.iter().any(|(line, _)| line == had) {
-                wanted.push((had.to_string(), Some(false)));
+            if gone && !wanted.iter().any(|(line, ..)| line == had) {
+                wanted.push((had.to_string(), Some(false), WHEEL));
             }
         }
         wanted
     };
-    let edit = |old: &[u8]| edited(&LINES, old, &wanted(old), add);
-    let (shown, failed, old) = match update(&LINES, &root.dir, &edit) {
-        Ok(changed) => return Ok(changed),
+    let mut edit = |old: &[u8]| edited(&LINES, old, &wanted(old));
+    let (shown, failed, old) = match update(&LINES, &root.dir, &mut edit) {
+        Ok(changed) => return Ok(changed.map(|(file, ..)| file)),
         Err(failed) => failed,
     };
     let missing: Vec<String> = wanted(&old)
         .iter()
-        .filter(|(line, exists)| add && *exists == Some(true) && !settled(&LINES, &old, line))
-        .map(|(line, _)| format!("`{line}`"))
+        .filter(|(line, exists, _)| *exists == Some(true) && !settled(&LINES, &old, line))
+        .map(|(line, ..)| format!("`{line}`"))
         .collect();
     let advice = if !missing.is_empty() {
         format!(
