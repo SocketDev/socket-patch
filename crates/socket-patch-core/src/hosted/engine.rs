@@ -13675,6 +13675,75 @@ snapshots:
         );
     }
 
+    /// In a Bazel workspace the route is taken only where it is certain
+    /// that no hub reads a governing lock. A hub the reader cannot see
+    /// leaves that open: one a `WORKSPACE` file defines, one in a file that
+    /// `MODULE.bazel` includes and that was not handed in, one behind a
+    /// proxy of the extension that is handed to something else. Each keeps
+    /// the project on the pin of a run that is offered no registry, and
+    /// the warning names what was not read. A workspace that was read
+    /// whole and has no hub of the lock is routed.
+    #[tokio::test]
+    async fn a_hub_the_reader_may_not_have_seen_blocks_the_route() {
+        let candidates = [left_pad_registry_candidate()];
+        let workspace_hub =
+            "load(\"@aspect_rules_js//npm:repositories.bzl\", \"npm_translate_lock\")\n\
+             npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\", \
+             update_pnpm_lock = True)\n";
+        let cases: [(&str, &str, &str); 3] = [
+            (
+                "WORKSPACE",
+                workspace_hub,
+                "(WORKSPACE defines repositories of its own",
+            ),
+            (
+                "MODULE.bazel",
+                "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+                 include(\"//tools:npm.MODULE.bazel\")\n",
+                "(tools/npm.MODULE.bazel: ",
+            ),
+            (
+                "MODULE.bazel",
+                "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+                 npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+                 hubs(npm)\n",
+                "(MODULE.bazel:3: ",
+            ),
+        ];
+        for (file, text, named) in cases {
+            let mut project = pnpm12_project(LEFT_PAD_V9_LOCK);
+            project.insert_text(file, text);
+            let unoffered = registry_rewrite(&project, &[left_pad_candidate()]).await;
+            let done = registry_rewrite(&project, &candidates).await;
+            assert!(!done.pnpm_named_registries, "{file}: {text}");
+            assert_eq!(done.rewrite.files, unoffered.rewrite.files, "{file}");
+            assert_eq!(done.confirmed.len(), 1, "{file}");
+            let detail = pnpm_trust_detail(&done);
+            let said = format!("because a Bazel hub may read the pnpm lock {named}");
+            assert!(detail.contains(&said), "{file}: {detail}");
+            assert!(
+                !pnpm_trust_detail(&unoffered).contains("Bazel"),
+                "{file}: {}",
+                pnpm_trust_detail(&unoffered)
+            );
+        }
+
+        // Read whole, and no hub of this lock: a workspace with no rules_js
+        // at all, and one whose `WORKSPACE` file only names it.
+        let mut plain = pnpm12_project(LEFT_PAD_V9_LOCK);
+        plain.insert_text(
+            "MODULE.bazel",
+            "bazel_dep(name = \"rules_java\", version = \"8.0.0\")\n",
+        );
+        plain.insert_text("WORKSPACE", "workspace(name = \"app\")\n");
+        let done = registry_rewrite(&plain, &candidates).await;
+        assert!(done.pnpm_named_registries);
+        assert_eq!(
+            workspace_of(&done),
+            Some(left_pad_routed_workspace().as_str())
+        );
+    }
+
     /// Where a hub hides pnpm-workspace.yaml from the pnpm 11 it runs
     /// ([`crate::bazel::pnpm::hidden`]), that answer comes first, while the
     /// files are read: the root lock is not part of the run, so nothing is

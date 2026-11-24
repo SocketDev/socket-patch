@@ -2368,7 +2368,15 @@ package. rules_js asks for this `data` itself (`docs/pnpm.md`, "update_pnpm_lock
 can route a patched release through a named registry of `pnpm-workspace.yaml` in place of
 `trustLockfile` (see pnpm above). It never does for a lock that a rules_js hub reads: one
 that an `npm.npm_translate_lock` names in a plain string, the root lock or a member's own,
-or a call whose `pnpm_lock` is not written out, whatever else the call says. The lock
+or a call whose `pnpm_lock` is not written out, whatever else the call says. In a Bazel
+workspace it takes the route only where it is certain that no hub reads the lock, so what
+the reader could not see counts as a hub that may: a file that `MODULE.bazel` includes and
+that is missing or unreadable, a use of the extension that is not a plain call of a tag,
+and a `WORKSPACE` file that says more than `workspace(...)`, whose repositories are not
+looked through. Unlike the answer above, which passes over what it cannot see so that no
+project loses a patch, declining the route costs nothing: the project gets the same pin as
+before, and the warning names what was not read ("… because a Bazel hub may read the pnpm
+lock (WORKSPACE defines repositories of its own, …) …"). The lock
 reader of rules_js is not the reason: it takes a routed lock (measured on macOS: rules_js
 3.6.0 on Bazel 9.3.2 builds one for a hub without `update_pnpm_lock`, and the packages it
 builds hold the patched bytes; rules_js 2.9.3 on Bazel 8.8.2 does too). The pnpm that a
@@ -2448,9 +2456,10 @@ build fails as above. Not read either is a `trustLockfile` that reaches the pnpm
 build another way (`pnpm_config_trust_lockfile` in Bazel's environment): hosted mode
 withholds there as well. Not read either: a hub that names the lock of a workspace member
 (`pnpm_lock = "//packages/a:pnpm-lock.yaml"`), which is pinned as without Bazel. The
-in-memory engine reads the `MODULE.bazel` beside the lock and gives the answer of a checkout
-with the same files; it sees no file that one includes, no Bazel root above the project and
-no `MODULE.bazel.lock`, and a `pnpm_version_from` file that is not among the project's own
+in-memory engine reads the Bazel files beside the lock (`MODULE.bazel`, the
+`*.MODULE.bazel` files it can include and the `WORKSPACE` files) and gives the answer of a
+checkout with the same files; it sees no Bazel root above the project and no
+`MODULE.bazel.lock`, and a `pnpm_version_from` file that is not among the project's own
 manifests reads there as a release that is not written out, so a lock that a checkout pins
 can be left as it is in memory. Nor does hosted mode look at `--no-trust-lockfile-config`
 when it decides this: see the known problems of

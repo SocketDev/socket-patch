@@ -54,9 +54,10 @@
 //! the pnpm 11 of the tag `pnpm` under the name `eleven`).
 //!
 //! In memory the workspace is the project's own files: path selection
-//! asks for the `MODULE.bazel` beside a `pnpm-lock.yaml`, and the answer is
-//! the one of a checkout with the same files. A hub in a file that one
-//! includes, and a Bazel root above the project, are not seen there. A
+//! asks for the `MODULE.bazel` beside a `pnpm-lock.yaml`, for the files
+//! one can include and for the `WORKSPACE` files, and the answer is the
+//! one of a checkout with the same files. A Bazel root above the project
+//! is not seen there. A
 //! `pnpm_version_from` file that was not handed in (one outside the
 //! project's own manifests) and `MODULE.bazel.lock` are not there either:
 //! the first reads as a release that is not written out, so a lock that a
@@ -74,7 +75,7 @@
 
 use super::rc::ModuleLock;
 use super::starlark::{Arg, Call, How, Value};
-use super::workspace::{disk, Entry, Extension, Label, Repo, Workspace};
+use super::workspace::{disk, Doubt, Entry, Extension, Label, Repo, Workspace};
 use crate::formats::text::strip_bom;
 use crate::hosted::guidance::{is_trust_scaffold, plan_workspace_trust, TrustPlan};
 use crate::patch::redirect::RewriteWarning;
@@ -147,6 +148,18 @@ pub enum Reader {
     /// The call (`MODULE.bazel:7`) that names one of the locks in a plain
     /// string, or whose `pnpm_lock` is not written out as one, which may.
     Call(String),
+    /// No such call was read, and the workspace was not read whole: what
+    /// could not be read of it, where a hub may be. A doubt of the reader
+    /// ([`Workspace::doubts`], the doubts of the hub's tags) as `file:line:
+    /// why`, or the `WORKSPACE` file that says more than `workspace(...)`
+    /// ([`Workspace::legacy`]), whose repositories no tag lists.
+    ///
+    /// [`Hubs::hidden`] passes over what was not seen, because withholding
+    /// there would take a patch from projects that are patched today. Not
+    /// taking the route costs no patch: the project gets the pin it gets
+    /// today. So the route is taken only where it is certain that no hub
+    /// reads a lock.
+    Unseen(String),
 }
 
 /// What the Bazel workspace the project of `view` is in says of its pnpm
@@ -208,7 +221,7 @@ enum Named {
     File(Label),
     /// Another repository's file, or no lock at all.
     Elsewhere,
-    /// Not written out as a plain string: it may be any lock.
+    /// Not written out as a label in a plain string: it may be any lock.
     Unwritten,
 }
 
@@ -217,7 +230,8 @@ fn names(ws: &Workspace, call: &Call) -> Named {
     match call.arg("pnpm_lock") {
         Some(Value::Str(label)) => match ws.label(label) {
             Some(label) if label.repo == Repo::Main => Named::File(label),
-            _ => Named::Elsewhere,
+            Some(_) => Named::Elsewhere,
+            None => Named::Unwritten,
         },
         Some(_) => Named::Unwritten,
         None if call.unpacks() => Named::Unwritten,
@@ -229,7 +243,7 @@ fn names(ws: &Workspace, call: &Call) -> Named {
 /// `project` of the workspace `ws`.
 fn reader(ws: &Workspace, project: &str, locks: &[String]) -> Option<Reader> {
     let hubs = ws.tags(&extension("npm"), "npm_translate_lock");
-    hubs.calls.iter().find_map(|tag| {
+    let call = hubs.calls.iter().find_map(|tag| {
         let reads = match names(ws, tag.call) {
             Named::File(label) => locks
                 .iter()
@@ -238,7 +252,26 @@ fn reader(ws: &Workspace, project: &str, locks: &[String]) -> Option<Reader> {
             Named::Unwritten => true,
         };
         reads.then(|| Reader::Call(format!("{}:{}", tag.file, tag.call.line)))
-    })
+    });
+    if call.is_some() {
+        return call;
+    }
+    // No call that was read reads a lock. That is the answer only where
+    // every call was read.
+    let doubt = |doubt: &Doubt| match doubt.line {
+        0 => format!("{}: {}", doubt.file, doubt.why),
+        line => format!("{}:{line}: {}", doubt.file, doubt.why),
+    };
+    if let Some(unread) = ws.doubts.first().or(hubs.doubts.first()) {
+        return Some(Reader::Unseen(doubt(unread)));
+    }
+    match &ws.legacy {
+        Some(Ok((file, _))) => Some(Reader::Unseen(format!(
+            "{file} defines repositories of its own, and a hub among them is not looked for"
+        ))),
+        Some(Err(unread)) => Some(Reader::Unseen(doubt(unread))),
+        None => None,
+    }
 }
 
 /// The text of [`Hubs::hidden`] for the project in the directory `project`
@@ -1179,6 +1212,83 @@ mod tests {
         );
         let none = |_: &str| Entry::Absent;
         assert_eq!(answer(&none, "", &[LOCK.to_string()]), Hubs::default());
+    }
+
+    /// Where no call that was read reads the lock, the answer is "no hub
+    /// reads it" only if the workspace was read whole. A file that
+    /// `MODULE.bazel` includes and that is not there, a proxy of the
+    /// extension that is handed to something else, and a `WORKSPACE` file
+    /// that says more than `workspace(...)` each leave a hub that may read
+    /// the lock, and say what was not read. A call that does read the lock
+    /// is named first. A workspace that is read whole, with a hub of
+    /// another lock or with no rules_js at all, has no reader.
+    #[test]
+    fn what_the_reader_may_not_have_seen_counts_as_a_hub_that_may_read_the_lock() {
+        let reader = |files: &[(&str, &str)]| {
+            let view = |path: &str| match files.iter().find(|(name, _)| *name == path) {
+                Some((_, text)) => Entry::Text(text.to_string()),
+                None => Entry::Absent,
+            };
+            answer(&view, "", &[LOCK.to_string()]).reader
+        };
+        let unseen = |files: &[(&str, &str)]| match reader(files) {
+            Some(Reader::Unseen(what)) => what,
+            other => panic!("{files:?}: {other:?}"),
+        };
+        let elsewhere = module("pnpm_lock = \"//tools:pnpm-lock.yaml\"", ELEVEN);
+        assert_eq!(reader(&[("MODULE.bazel", &elsewhere)]), None);
+        let java = "bazel_dep(name = \"rules_java\", version = \"8.0.0\")\n";
+        assert_eq!(reader(&[("MODULE.bazel", java)]), None);
+
+        // A file that is included and not there.
+        let including = format!("{elsewhere}include(\"//tools:npm.MODULE.bazel\")\n");
+        let what = unseen(&[("MODULE.bazel", &including)]);
+        assert!(
+            what.starts_with("tools/npm.MODULE.bazel: ") && what.contains("MODULE.bazel:7"),
+            "{what}"
+        );
+        // The same file, there: read, and its hub is the reader.
+        let hub = "npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+                   npm.npm_translate_lock(pnpm_lock = \"//:pnpm-lock.yaml\")\n";
+        assert_eq!(
+            reader(&[
+                ("MODULE.bazel", &including),
+                ("tools/npm.MODULE.bazel", hub)
+            ]),
+            Some(Reader::Call("tools/npm.MODULE.bazel:2".to_string()))
+        );
+        // A proxy of the extension that is not only called.
+        let handed = format!("{elsewhere}register(npm)\n");
+        let what = unseen(&[("MODULE.bazel", &handed)]);
+        assert!(what.starts_with("MODULE.bazel:7: "), "{what}");
+        // The file of the older system, beside module files or alone.
+        let rule = "npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n";
+        for files in [
+            &[("MODULE.bazel", elsewhere.as_str()), ("WORKSPACE", rule)][..],
+            &[("WORKSPACE.bazel", rule)],
+        ] {
+            let what = unseen(files);
+            let file = files.last().expect("a file").0;
+            assert_eq!(
+                what,
+                format!(
+                    "{file} defines repositories of its own, and a hub among them is not \
+                     looked for"
+                )
+            );
+        }
+        // One that only names the workspace defines none.
+        let named = "workspace(name = \"app\")\n";
+        assert_eq!(
+            reader(&[("MODULE.bazel", &elsewhere), ("WORKSPACE", named)]),
+            None
+        );
+        // A lock that is no label may be any.
+        let odd = module("pnpm_lock = \"//:a:b\"", ELEVEN);
+        assert_eq!(
+            reader(&[("MODULE.bazel", &odd)]),
+            Some(Reader::Call("MODULE.bazel:4".to_string()))
+        );
     }
 
     /// A checkout and a project in memory with the same files get the same

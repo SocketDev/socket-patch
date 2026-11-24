@@ -542,7 +542,8 @@ pub fn pnpm_registry_mirrored_reason(packages: &[String]) -> String {
 }
 
 /// The clause for a project whose pnpm lock a rules_js hub of its Bazel
-/// workspace reads ([`crate::bazel::pnpm::Reader`]). What holds the route
+/// workspace reads, or may read where the workspace could not be read
+/// whole ([`crate::bazel::pnpm::Reader`]). What holds the route
 /// back is the pnpm such a hub runs with `update_pnpm_lock`, which sees the
 /// registries only where the call lists pnpm-workspace.yaml and may be
 /// older than pnpm 11.20; the lock reader of rules_js takes a routed lock.
@@ -551,6 +552,7 @@ pub fn pnpm_registry_bazel_reason(reader: &crate::bazel::pnpm::Reader) -> String
     use crate::bazel::pnpm::Reader;
     let hub = match reader {
         Reader::Call(call) => format!("a Bazel hub reads the pnpm lock ({call})"),
+        Reader::Unseen(what) => format!("a Bazel hub may read the pnpm lock ({what})"),
     };
     format!(
         "{hub}, and a lock that a hub reads is not routed yet: the pnpm a hub runs for \
