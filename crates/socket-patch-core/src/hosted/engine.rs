@@ -1449,11 +1449,28 @@ pub async fn read_candidate_files_in(
     // dependencies of their own: a member's direct `cfg-if = "1"` must be
     // pinned alongside the root's, or the redirected lock entry is
     // unsatisfiable. Keyed `<dir>/Cargo.toml` for the cargo rewriter.
-    if out.files.contains_key("Cargo.toml") && candidates.iter().any(|c| c.dep.ecosystem == "cargo")
-    {
+    let cargo = candidates.iter().any(|c| c.dep.ecosystem == "cargo");
+    if out.files.contains_key("Cargo.toml") && cargo {
         for rel in crate::utils::cargo_workspace::member_manifests_in(view).await {
             out.read(view, unreadable, &rel).await;
         }
+    }
+    // In a Bazel workspace on disk a rules_rust hub may run cargo over
+    // these files without the cargo config that defines the registry of a
+    // pin. What stands against a pin is read from the checkout here and
+    // rides a synthetic key to the cargo rewriter. A project in no Bazel
+    // workspace, or one that no such hub is seen to read, gets none, and
+    // its run is the one it was.
+    if let Some(root) = view.disk_root().filter(|_| cargo) {
+        use crate::bazel::cargo::{unread, KEY};
+        let member = |rel: &&String| crate::patch::redirect::is_cargo_member_manifest_key(rel);
+        let mut files = vec!["Cargo.lock".to_string(), "Cargo.toml".to_string()];
+        files.extend(out.files.keys().filter(member).cloned());
+        let config = crate::patch::redirect::cargo_config_key(&out.files);
+        let root = root.to_path_buf();
+        let read = crate::utils::fs::run_blocking(move || unread(&root, &files, config));
+        out.files
+            .extend(read.await.map(|why| (KEY.to_string(), why)));
     }
 
     // Go: the workspace in effect decides which version a replace must pin,
@@ -6744,6 +6761,83 @@ snapshots:
             );
             assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
         }
+    }
+
+    /// In a Bazel workspace on disk the read of a run with a cargo
+    /// candidate hands the rewriter what stands against a pin: the hub
+    /// that reads the project's manifests, a member's among them, and not
+    /// the config the rewriter writes, which is the legacy file where the
+    /// project has one. Nothing is handed over in no Bazel workspace, for a
+    /// hub that names that config, or to a run without a cargo candidate.
+    #[tokio::test]
+    async fn a_bazel_hub_without_the_cargo_config_rides_to_the_cargo_rewriter() {
+        use crate::bazel::cargo::KEY;
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |rel: &str, text: &str| {
+            let path = tmp.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let hub = |attributes: &str| {
+            format!(
+                "bazel_dep(name = \"rules_rust\", version = \"0.75.0\")\ncrate = use_extension(\
+                 \"@rules_rust//crate_universe:extensions.bzl\", \"crate\")\n\
+                 crate.from_cargo({attributes})\n"
+            )
+        };
+        write("Cargo.toml", "[workspace]\nmembers = [\"member\"]\n");
+        write(
+            "member/Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n",
+        );
+        let cargo = Candidate {
+            purl: "pkg:cargo/serde@1.0.190".into(),
+            dep: grant_dep("cargo", "https://patch.test/serde-1.0.190.crate".into()),
+        };
+        let view = ProjectView::Disk(tmp.path());
+        let handed = |candidate: &Candidate| {
+            let candidates = [candidate.clone()];
+            async move {
+                let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+                read.files.get(KEY).cloned()
+            }
+        };
+        assert_eq!(handed(&cargo).await, None, "no Bazel workspace");
+
+        write(
+            "MODULE.bazel",
+            &hub("manifests = [\"//member:Cargo.toml\"]"),
+        );
+        let why = handed(&cargo).await.expect("the hub reads a member");
+        assert!(
+            why.starts_with("the rules_rust hub at MODULE.bazel:3 reads"),
+            "{why}"
+        );
+        assert!(why.contains("without .cargo/config.toml, where"), "{why}");
+
+        let root = "manifests = [\"//:Cargo.toml\"]";
+        write("MODULE.bazel", &hub(root));
+        assert!(handed(&cargo).await.is_some(), "the hub reads the root");
+        let lock = "cargo_lockfile = \"//:Cargo.lock\", manifests = [\"//x:Cargo.toml\"]";
+        write("MODULE.bazel", &hub(lock));
+        assert!(handed(&cargo).await.is_some(), "the hub reads the lock");
+        write("MODULE.bazel", &hub(root));
+        assert_eq!(
+            handed(&left_pad_candidate()).await,
+            None,
+            "no cargo candidate"
+        );
+        let named = format!("{root}, cargo_config = \"//:.cargo/config.toml\"");
+        write("MODULE.bazel", &hub(&named));
+        assert_eq!(handed(&cargo).await, None, "the hub names the config");
+        write(".cargo/config", "");
+        let why = handed(&cargo)
+            .await
+            .expect("the rewriter writes the legacy file");
+        assert!(
+            why.contains("is not the label of .cargo/config as one string"),
+            "{why}"
+        );
     }
 
     fn gem_candidate() -> Candidate {
