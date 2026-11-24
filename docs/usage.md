@@ -299,8 +299,8 @@ any file, so it also attests an agent-mode patch whose files are unpatched or mi
 It never does so silently: the run warns how many statements it emitted that way, and
 each one ends its impact statement with `; not verified on disk`.
 
-In a Bazel workspace the document describes what Bazel builds from the project's lock, and
-says `affected` of a package whose patch is only in the installed copy (see
+In a Bazel workspace (experimental) the document describes what Bazel builds from the
+project's lock, and says `affected` of a package whose patch is only in the installed copy (see
 [Bazel workspaces: VEX](ecosystems.md#bazel-workspaces-vex)). `--no-bazel` (`--vex-no-bazel`
 on `scan`, `apply` and `vendor`, or `SOCKET_VEX_NO_BAZEL` in the environment) makes it describe
 what the package manager installed; use it when the installed tree is what you ship.
@@ -339,6 +339,8 @@ scala-cli resolve into (restart a running sbt server, Bloop or Metals after
 [ecosystem caveats](ecosystems.md) before using agent mode in shared environments.
 The removed `setup` command is covered in the [migration guide](migrating-to-v5.md).
 
+What socket-patch does in a Bazel workspace is experimental
+([Bazel workspaces: what is supported](ecosystems.md#bazel-workspaces-what-is-supported)).
 Agent mode is not supported for a package that Bazel builds: Bazel takes its packages from
 what its rulesets read, and runs no `socket-patch apply`. Use hosted mode there, or vendored
 mode where [Bazel workspaces: what is supported](ecosystems.md#bazel-workspaces-what-is-supported)
