@@ -2049,6 +2049,23 @@ fn rewrite_cargo(
     rewrite_cargo_with(files, overrides, &CratesIoSource::Registry, result);
 }
 
+/// The cargo config the cargo rewriter writes for a project with `files`,
+/// from the project: the one the project's cargo reads.
+///
+/// Cargo reads the LEGACY extensionless `.cargo/config` in preference to
+/// `config.toml` when both exist (it warns about the duplicate), so a
+/// managed `[registries.…]` block written to `config.toml` there is
+/// silently inert and the `registry = "socket-patch-…"` the rewriter puts
+/// in Cargo.toml then names an undefined registry. Same preference
+/// `vendor::cargo_config::config_path` applies on the vendor path.
+pub(crate) fn cargo_config_key(files: &BTreeMap<String, String>) -> &'static str {
+    if files.contains_key(".cargo/config") {
+        ".cargo/config"
+    } else {
+        ".cargo/config.toml"
+    }
+}
+
 /// [`rewrite_cargo`] with `cargo_outer`: where the cargo configs read for a
 /// build in the project (its own, every parent directory's and
 /// `$CARGO_HOME`'s) take crates.io from. The project's own config is also
@@ -2114,17 +2131,7 @@ fn rewrite_cargo_with(
         .get("Cargo.lock")
         .cloned()
         .map(|t| CargoHostedLock::new(to_lf("Cargo.lock", t)));
-    // Cargo reads the LEGACY extensionless `.cargo/config` in preference to
-    // `config.toml` when both exist (it warns about the duplicate), so a
-    // managed `[registries.…]` block written to `config.toml` there is
-    // silently inert and the `registry = "socket-patch-…"` this rewriter puts
-    // in Cargo.toml then names an undefined registry. Same preference
-    // `vendor::cargo_config::config_path` applies on the vendor path.
-    let cargo_config_key = if files.contains_key(".cargo/config") {
-        ".cargo/config"
-    } else {
-        ".cargo/config.toml"
-    };
+    let cargo_config_key = cargo_config_key(files);
     let mut cargo_config = files
         .get(cargo_config_key)
         .cloned()
@@ -2475,6 +2482,21 @@ fn rewrite_cargo_with(
         // 3. Plan the managed `[registries.…]` block (never fails; `None`
         // when a healthy block is already wired in).
         let config_plan = plan_cargo_config(&cargo_config, cargo_config_key, &reg, index_url);
+
+        // In a Bazel workspace, a rules_rust hub that reads these files
+        // and not the config would fail on the pin, and `bazel build` with
+        // it ([`crate::bazel::cargo`]): nothing is written for the crate.
+        // A pin that is in place already stays what it was.
+        let writes = config_plan.is_some()
+            || toml_plans.iter().any(|(_, plan)| plan.changed)
+            || matches!(lock_commit, LockCommit::Write(_));
+        if let Some(why) = files.get(crate::bazel::cargo::KEY).filter(|_| writes) {
+            result.warnings.push(RewriteWarning {
+                code: crate::bazel::cargo::UNREAD.into(),
+                detail: format!("{}@{}: {why}", dep.name, dep.version),
+            });
+            continue;
+        }
 
         // COMMIT — everything planned, nothing can fail past this point, so
         // the three files change together or not at all. Edit order matches
@@ -19855,6 +19877,82 @@ mod tests {
         let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// In a Bazel workspace whose rules_rust hub would not read the config
+    /// that defines the pin's registry, the engine hands the reason in
+    /// under [`crate::bazel::cargo::KEY`]: a crate the rewriter would pin
+    /// is skipped with it and nothing is written. A refusal of the
+    /// rewriter's own answers first, under its own code, and a pin that an
+    /// earlier run left in place stays confirmed, with no warning and no
+    /// write, exactly as without the key.
+    #[test]
+    fn cargo_pin_is_withheld_for_a_bazel_hub_that_does_not_read_the_config() {
+        use crate::bazel::cargo::{KEY, UNREAD};
+        let toml = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                    [dependencies]\nserde = \"1.0.190\"\n";
+        let plain = cargo_files(toml);
+        let pinned = rewrite_registry_redirect(&plain, &[cargo_sparse_override()]);
+        assert_eq!(pinned.files.len(), 3, "{:?}", pinned.files.keys());
+        let codes = |r: &RewriteResult| -> Vec<String> {
+            r.warnings.iter().map(|w| w.code.clone()).collect()
+        };
+
+        let mut hub = plain.clone();
+        hub.insert(
+            KEY.to_string(),
+            "the hub at MODULE.bazel:4 is in the way".into(),
+        );
+        let r = rewrite_registry_redirect(&hub, &[cargo_sparse_override()]);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert!(r.confirmed_cargo_uuids.is_empty());
+        assert_eq!(codes(&r), [UNREAD]);
+        let detail = &r.warnings[0].detail;
+        assert_eq!(
+            detail,
+            "serde@1.0.190: the hub at MODULE.bazel:4 is in the way"
+        );
+
+        // Each file the rewriter would write is enough to withhold: a
+        // project without a lock (config and manifest), a pin whose
+        // registry the config no longer defines (config), and a config
+        // that defines it already (manifest and lock). Without the key
+        // each is written.
+        let config = ".cargo/config.toml";
+        let (mut lockless, mut undefined, mut defined) = (hub.clone(), hub.clone(), hub.clone());
+        lockless.remove("Cargo.lock");
+        undefined.extend(pinned.files.clone());
+        undefined.remove(config);
+        defined.insert(config.to_string(), pinned.files[config].clone());
+        for mut files in [lockless, undefined, defined] {
+            let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+            assert!(r.confirmed_cargo_uuids.is_empty());
+            assert_eq!(codes(&r), [UNREAD]);
+            files.remove(KEY);
+            let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(!r.files.is_empty() && r.warnings.is_empty(), "{files:?}");
+        }
+
+        // The rewriter's own refusal: the crate is in the lock and in no
+        // manifest.
+        let mut undeclared = hub.clone();
+        let other = toml.replace("serde = \"1.0.190\"", "itoa = \"1\"");
+        undeclared.insert("Cargo.toml".to_string(), other);
+        let r = rewrite_registry_redirect(&undeclared, &[cargo_sparse_override()]);
+        assert_eq!(codes(&r), ["redirect_cargo_toml_dep_not_found"]);
+
+        // The three files as the earlier run left them.
+        let mut again = hub.clone();
+        again.extend(pinned.files.clone());
+        let with = rewrite_registry_redirect(&again, &[cargo_sparse_override()]);
+        again.remove(KEY);
+        let without = rewrite_registry_redirect(&again, &[cargo_sparse_override()]);
+        for r in [&with, &without] {
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+            assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+            assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+        }
     }
 
     /// #455 review: the offline source may come from outside the project
