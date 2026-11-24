@@ -383,8 +383,9 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   the whole lock. When the patch service gave at least one pin a registry
   address, the warning names what kept the project off the registry route: the
   packages that have no address (one is enough), pnpm pins that do not prove
-  11.20, an override of yours for a patched package, a workspace file or a
-  lock entry the edit cannot follow. A project with no pnpm pin is told that
+  11.20, a Bazel hub that reads the lock
+  ([Bazel workspaces: npm](#bazel-workspaces-npm)), an override of yours for a
+  patched package, a workspace file or a lock entry the edit cannot follow. A project with no pnpm pin is told that
   pinning pnpm 11.20 or later (for example with `packageManager`) and
   re-running the scan switches it to the registry route (not under
   `--no-trust-lockfile-config`, which writes neither setting). The key goes in
@@ -2232,6 +2233,26 @@ npm.npm_translate_lock(
 
 Run the command again after that: it pins the lock, and the next build takes the patched
 package. rules_js asks for this `data` itself (`docs/pnpm.md`, "update_pnpm_lock").
+
+**No named registries for a lock that a hub reads.** For pnpm 11.20 and later hosted mode
+can route a patched release through a named registry of `pnpm-workspace.yaml` in place of
+`trustLockfile` (see pnpm above). It never does for a lock that a rules_js hub reads: one
+that an `npm.npm_translate_lock` names in a plain string, the root lock or a member's own,
+or a call whose `pnpm_lock` is not written out, whatever else the call says. The hub reads
+the lock with the lock reader of rules_js, and with `update_pnpm_lock` with a pnpm that
+sees `pnpm-workspace.yaml` only where the call lists it. Run as the hub runs it
+(`pnpm install --lockfile-only` beside the lock and `package.json`, without the workspace
+file), pnpm 11.28.13 and 12.22.0 reject a routed lock (`ERR_PNPM_MISSING_NAMED_REGISTRY`,
+measured), and no Bazel build has been run on a routed lock. So such a project is pinned
+exactly as it is on a patch service that offers no registry, which is the pin the Bazel
+legs build, and the `redirect_pnpm_trust_lockfile` warning names the call ("… because a
+Bazel hub reads the pnpm lock (MODULE.bazel:7) …"). A project that was routed before the
+hub was there leaves the route on its next scan, the lock and the workspace file together.
+Where hosted mode writes nothing for the root lock (the hub above), a route of an earlier
+run is left exactly as it is, in the workspace file and in every lock, and a
+`pnpm-workspace.yaml` that holds nothing but such a route counts as a file that holds only
+what hosted mode writes. `repair`, `scan --prune` with no mode, `rollback` and `remove`
+settle a route from the lockfiles alone and work as without Bazel.
 
 The file the hub lists has to be one that a pin and its undo leave standing, so hosted mode
 also writes nothing for a hub that lists it in two cases, and the warning then names what

@@ -3887,6 +3887,61 @@ async fn hosted_registry_route_needs_a_pnpm_11_20_pin() {
     }
 }
 
+/// A lock that a rules_js hub of the project's Bazel workspace reads is
+/// not routed, also with a registry address and a pnpm 12 pin. The hub
+/// reads the lock with the lock reader of rules_js (and with
+/// `update_pnpm_lock` with a pnpm of its own), and only a lock that names
+/// the patch server's tarball is known to build there. The run writes what
+/// a patch service that offers no registry gets, the warning names the
+/// call, and `rollback` gives the user's file and the lock back.
+#[tokio::test]
+#[serial]
+async fn hosted_registry_route_is_not_taken_for_a_lock_a_bazel_hub_reads() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_registry_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pinned_pnpm_project(tmp.path());
+    let own = "# the project's own\n";
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    std::fs::write(&ws_path, own).unwrap();
+    std::fs::write(
+        tmp.path().join("MODULE.bazel"),
+        "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+         npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+         npm.npm_translate_lock(pnpm_lock = \"//:pnpm-lock.yaml\")\n",
+    )
+    .unwrap();
+    let lock_path = tmp.path().join("pnpm-lock.yaml");
+    let pristine = read(&lock_path);
+
+    let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(
+        read(&ws_path),
+        format!("{own}packages:\n  - '.'\ntrustLockfile: true\n")
+    );
+    let lock = read(&lock_path);
+    assert!(
+        lock.contains(HOSTED_URL) && !lock.contains("@socket-") && !lock.contains("overrides:"),
+        "{lock}"
+    );
+    let texts = warning_texts(&doc);
+    assert!(
+        texts.contains(
+            "Per-package registry verification was not set up because a Bazel hub reads the \
+             pnpm lock (MODULE.bazel:3)"
+        ),
+        "{doc}"
+    );
+
+    let code = rollback_hosted(tmp.path(), &server).await;
+    assert_eq!(code, 0, "rollback must restore the pnpm pin");
+    assert_eq!(read(&lock_path), pristine);
+    assert_eq!(read(&ws_path), own);
+}
+
 /// `--dry-run` with a registry address: nothing lands on disk, the
 /// workspace file is reported as would-be-rewritten, and the warning says
 /// what the run would declare.

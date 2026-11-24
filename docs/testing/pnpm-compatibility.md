@@ -186,6 +186,17 @@ The registry's version documents are dated by the upstream release of the
 version, or carry no date when it is unknown, so pnpm's default one-day
 `minimumReleaseAge` does not hold back a freshly published patch.
 
+### A routed lock without its workspace file
+
+A routed lock needs the `pnpm-workspace.yaml` that declares its registries. Measured with
+pnpm 11.28.13 and 12.22.0: `pnpm install --lockfile-only` in a directory that holds the
+routed lock and `package.json` and no workspace file fails with
+`ERR_PNPM_MISSING_NAMED_REGISTRY` ("has registry prefix 'socket-…:', which is not declared
+by the registries setting") and leaves the lock as it is. That directory is what a
+rules_js hub of a Bazel workspace gives the pnpm it runs for `update_pnpm_lock` when the
+hub does not list the file, so the scan does not take the route for a lock that a hub
+reads (see "Bazel workspaces: npm" in [ecosystems](../ecosystems.md)).
+
 ### Tests
 
 `pnpm12_registry_route_survives_resolution_and_cleans_up` and its pnpm 11

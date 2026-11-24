@@ -209,6 +209,68 @@ async fn a_dependency_that_left_the_lock_takes_its_entries() {
     }
 }
 
+/// A rules_js hub of a Bazel workspace that keeps the lock up to date with
+/// a pnpm 11 that does not see pnpm-workspace.yaml: hosted mode pins
+/// nothing in that lock ([`crate::bazel::pnpm::hidden`]).
+const HIDING_HUB: &str = "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+    npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+    npm.npm_translate_lock(pnpm_lock = \"//:pnpm-lock.yaml\", update_pnpm_lock = True)\n\
+    pnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
+    pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")\n";
+
+/// The sweep reads the lockfiles alone and pins nothing, so a Bazel hub
+/// that hosted mode leaves the lock to changes nothing about it: in a
+/// project routed before the hub was there, what a departed dependency
+/// left goes from the workspace file and from the lock's record together,
+/// exactly as in the same project without its `MODULE.bazel`.
+#[tokio::test]
+async fn a_bazel_hub_changes_nothing_about_the_sweep() {
+    let project = |hub: bool| {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = format!(
+            "packages:\n  - 'apps/*'\n{}",
+            maps(&[leaf_registry(), mid_registry()], &[LEAF, MID])
+        );
+        write(dir.path(), "pnpm-workspace.yaml", &workspace);
+        write(
+            dir.path(),
+            "pnpm-lock.yaml",
+            &lock(&[LEAF, MID], &[LEAF_ROUTED]),
+        );
+        if hub {
+            write(dir.path(), "MODULE.bazel", HIDING_HUB);
+        }
+        dir
+    };
+    let (plain, hubbed) = (project(false), project(true));
+    let view = crate::vendor::lock_inventory::ProjectView::Disk(hubbed.path());
+    assert!(
+        crate::bazel::pnpm::hidden(&view).await.is_some(),
+        "the hub is one hosted mode leaves the lock to"
+    );
+    for dry_run in [true, false] {
+        let without = sweep(plain.path(), dry_run).await;
+        let with = sweep(hubbed.path(), dry_run).await;
+        assert_eq!(removed(&with), removed(&without), "dry run: {dry_run}");
+        assert_eq!(removed(&with).len(), 3, "dry run: {dry_run}");
+        assert_eq!(with.files, without.files);
+        for rel in ["pnpm-workspace.yaml", "pnpm-lock.yaml"] {
+            assert_eq!(read(hubbed.path(), rel), read(plain.path(), rel), "{rel}");
+        }
+    }
+    assert_eq!(
+        read(hubbed.path(), "pnpm-workspace.yaml").unwrap(),
+        format!(
+            "packages:\n  - 'apps/*'\n{}",
+            maps(&[leaf_registry()], &[LEAF])
+        )
+    );
+    assert_eq!(
+        read(hubbed.path(), "pnpm-lock.yaml").unwrap(),
+        lock(&[LEAF], &[LEAF_ROUTED])
+    );
+}
+
 /// With no release routed any more nothing of the route is left: every
 /// registry, every override of ours and the locks' records go. A file
 /// hosted mode created is deleted; a file of the user's is back to their

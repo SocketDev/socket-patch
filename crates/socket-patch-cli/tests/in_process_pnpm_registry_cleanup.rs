@@ -1510,6 +1510,89 @@ async fn remove_and_rollback_take_a_package_and_its_registry_out() {
     }
 }
 
+// ── a Bazel workspace ────────────────────────────────────────────────────
+
+/// A rules_js hub that keeps the project's pnpm lock up to date with a
+/// pnpm 11 that does not see pnpm-workspace.yaml: hosted mode pins nothing
+/// in that lock (`redirect_pnpm_bazel_workspace_hidden`).
+const HIDING_HUB: &str = "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+    npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+    npm.npm_translate_lock(pnpm_lock = \"//:pnpm-lock.yaml\", update_pnpm_lock = True)\n\
+    pnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
+    pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")\n";
+
+/// A project routed before its Bazel workspace got such a hub. A hosted
+/// scan leaves the lock to the hub, so it takes nothing of the route out
+/// either: the workspace file and the lock stay as they were, in step with
+/// each other, and the warning says why nothing was rewritten. The
+/// commands that settle a route from the lockfiles alone pin nothing, and
+/// work as without the hub, the file and the lock's record together:
+/// `repair`, `scan --prune` with no mode, `remove` and `rollback`.
+#[tokio::test]
+async fn cleanup_in_a_bazel_workspace_whose_hub_hides_the_workspace_file() {
+    let hub = |root: &Path| std::fs::write(root.join("MODULE.bazel"), HIDING_HUB).unwrap();
+    let server = MockServer::start().await;
+    mock_api(&server, &[&KEPT], &[]).await;
+
+    for extra in [&[][..], &["--prune"]] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (workspace, lock_text) = departed_project(root, "removed");
+        hub(root);
+        let (code, doc) = scan_hosted(root, &server, extra);
+        assert_eq!(code, Some(0), "{extra:?}: {doc}");
+        let warned = doc["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "redirect_pnpm_bazel_workspace_hidden");
+        assert!(warned, "{extra:?}: {doc}");
+        assert_eq!(entries(&doc, "removed"), [], "{extra:?}: {doc}");
+        assert_unchanged(root, &workspace, &lock_text, "the lock is left to the hub");
+    }
+
+    for command in ["repair", "scan --prune"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        departed_project(root, "removed");
+        hub(root);
+        let (code, doc) = match command {
+            "repair" => repair_offline(root, &[]),
+            _ => run_json(&mut scan_command(root, &server, &["--prune", "--json"])),
+        };
+        assert_eq!(code, Some(0), "{command}: {doc}");
+        assert_eq!(entries(&doc, "removed"), gone_entries(), "{command}: {doc}");
+        assert_eq!(doc["gc"]["removedRegistryEntries"], 3, "{command}: {doc}");
+        assert_gone_cleaned(root, "removed");
+    }
+
+    let registry = MockServer::start().await;
+    mock_api(&registry, &[], &[]).await;
+    for command in ["remove", "rollback"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_project(
+            root,
+            &[GONE.upstream(), KEPT.upstream()],
+            Some(&created(&[&KEPT, &GONE])),
+            &lock(&both_recorded(), &[GONE.routed(), KEPT.routed()]),
+        );
+        hub(root);
+        let (code, doc) = unwind(root, &registry, command, &[&GONE.purl()]);
+        assert_eq!(code, Some(0), "{command}: {doc}");
+        assert_eq!(
+            read(root, "pnpm-workspace.yaml").unwrap(),
+            created(&[&KEPT]),
+            "{command}: the override and the registry go with the package"
+        );
+        assert_eq!(
+            read(root, "pnpm-lock.yaml").unwrap(),
+            lock(&[KEPT.recorded()], &[GONE.upstream(), KEPT.routed()]),
+            "{command}"
+        );
+    }
+}
+
 // ── what a person is told ────────────────────────────────────────────────
 
 /// (4) Without `--json` each removal is a line, in `repair` and in a

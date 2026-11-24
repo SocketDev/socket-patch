@@ -541,6 +541,28 @@ pub fn pnpm_registry_mirrored_reason(packages: &[String]) -> String {
     )
 }
 
+/// The clause for a project whose pnpm lock a rules_js hub of its Bazel
+/// workspace reads (`call`: the file and line of the
+/// `npm.npm_translate_lock`, [`crate::bazel::pnpm::reads_lock`]). The hub
+/// reads the lock without pnpm, and with `update_pnpm_lock` with a pnpm
+/// that sees only the lock, the `package.json` files and the `data` of the
+/// call: one that does not see the registries rejects a routed lock, and
+/// no Bazel build has been run on one. The lock stays as the Bazel build
+/// is known to take it.
+pub fn pnpm_registry_bazel_reason(call: &str) -> String {
+    format!(
+        "a Bazel hub reads the pnpm lock ({call}), and its build is only known to take a          lock that names the patch server's tarball: a pnpm it runs sees          {PNPM_WORKSPACE_REL} only where the hub lists it"
+    )
+}
+
+/// The reason a route an earlier run set up is left as it is where a
+/// Bazel hub keeps the root pnpm lock out of the run
+/// ([`crate::bazel::pnpm::hidden`]): that lock records the overrides of
+/// pnpm-workspace.yaml too, and taking them out of the file alone would
+/// leave the two apart.
+pub const PNPM_REGISTRY_ROOT_WITHHELD: &str =
+    "the root pnpm lock, which records the same overrides, is left as it is for the Bazel hub";
+
 /// The note a routed project gets when a governing lock also holds a
 /// newer release of a routed package that the routed release's caret
 /// range admits (`also_locked`: the routed `(name, version)` and those
