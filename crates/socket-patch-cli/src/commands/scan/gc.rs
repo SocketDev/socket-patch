@@ -421,12 +421,13 @@ async fn keep_patched_cargo_copies(
     prunable.retain(|p| !kept.contains(p));
     kept.into_iter()
         .map(|purl| {
+            let word = crate::ui::shell_word(&purl);
             (
                 "cargo_cache_patch_kept",
                 format!(
                     "kept {purl}: the project no longer resolves it, but its copy in the \
                      shared Cargo registry cache is still patched (or could not be \
-                     read to tell); run `socket-patch rollback {purl}` (with `--global` \
+                     read to tell); run `socket-patch rollback {word}` (with `--global` \
                      when a `cargo vendor` dir hides the registry cache) to restore \
                      that copy and drop the entry"
                 ),
@@ -460,12 +461,13 @@ async fn keep_patched_pypi_copies(
     prunable.retain(|p| !kept.contains(p));
     kept.into_iter()
         .map(|purl| {
+            let word = crate::ui::shell_word(&purl);
             (
                 "pypi_installed_patch_kept",
                 format!(
                     "kept {purl}: the scan no longer reports it as one of the project's \
                      packages, but an installed copy is still patched (or could not be \
-                     read to tell); run `socket-patch rollback {purl}` (with `--global` \
+                     read to tell); run `socket-patch rollback {word}` (with `--global` \
                      when the copy is in another interpreter or a tool's environment) \
                      to restore that copy and drop the entry"
                 ),

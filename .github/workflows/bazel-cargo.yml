@@ -3,7 +3,8 @@ name: Bazel patch compatibility (Cargo)
 # The Cargo flows of the real-Bazel tests (`cargo::` in `e2e_bazel_build`):
 # hosted and vendored mode for a crate that rules_rust's crate_universe
 # resolves from a Cargo workspace (`crate.from_cargo`, with the project's
-# cargo config and no cargo-bazel lock), on each Bazel release below.
+# cargo config and no cargo-bazel lock), and hosted mode on the hub that
+# names no cargo config, on each Bazel release below.
 # bazel-compatibility.yml holds the legs and what every ecosystem shares;
 # this file says when the Cargo legs run and on which releases.
 #
@@ -22,13 +23,15 @@ name: Bazel patch compatibility (Cargo)
 # No leg asks crates.io about the crate under test. cargo-bazel's cargo
 # reads no downloader config, so the test's workspace names a mirror of
 # crates.io in its `.cargo/config.toml`, the loopback stand-in, and the
-# crate has a name crates.io cannot hold. A crate file under test passes
-# through the repository cache as well: Bazel's downloader fetches it and
-# keeps it under its sha256. So a test builds the upstream crate file and
-# each patched one anew, with an id of the run in the library, and writes
-# the upstream checksum into the Cargo.lock of its workspace copy. No cache
-# holds a crate file of the run, and the test counts the requests for the
-# upstream one.
+# crate has a name crates.io cannot hold. The flow of the hub without a
+# cargo config names the mirror in the cargo home of the test instead, which
+# that hub's cargo is run with (`CARGO_BAZEL_ISOLATED=false`). A crate file
+# under test passes through the repository cache as well: Bazel's
+# downloader fetches it and keeps it under its sha256. So a test builds the
+# upstream crate file and each patched one anew, with an id of the run in
+# the library, and writes the upstream checksum into the Cargo.lock of its
+# workspace copy. No cache holds a crate file of the run, and the test
+# counts the requests for the upstream one.
 #
 # Not required for merge: no `merge_group` trigger, and no job here is a
 # `needs` of ci.yml's `ci-ok`.
