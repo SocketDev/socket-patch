@@ -2878,10 +2878,7 @@ impl StaleHostedGems {
         }
         let bare_scan_is_hosted = !purls.is_empty()
             && !common.is_global()
-            && matches!(
-                crate::commands::mode_from_project_state(common).await,
-                Ok(crate::commands::scan::ScanMode::Hosted)
-            );
+            && crate::commands::bare_scan_is_hosted(common).await;
         Self {
             purls,
             bare_scan_is_hosted,
