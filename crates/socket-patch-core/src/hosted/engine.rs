@@ -1677,7 +1677,13 @@ pub async fn read_candidate_files_in(
                 withhold_root_pnpm_locks(&mut out, hidden);
             }
         }
-    } else if names_pnpm_route(view, &out).await {
+    } else if names_pnpm_route(
+        view,
+        view.read_text(PNPM_WORKSPACE_REL).await.ok().as_deref(),
+        out.files.get(ROOT_PNPM_LOCKS[0]).map(String::as_str),
+    )
+    .await
+    {
         // A run with no npm patch still tidies what is left of a registry
         // route ([`pnpm_prune`]), and every lock the workspace file governs
         // has a say in what is left: the members' own locks are read for
@@ -1800,27 +1806,47 @@ async fn read_pnpm_member_locks(
     }
 }
 
-/// Whether the root pnpm-workspace.yaml or the root lock of `out` names
-/// something of a registry route ([`pnpm_route`]), from the bytes alone
-/// and with every address of the registry's shape taken for a patch
-/// server's, as [`pnpm_route_present`] asks it of a checkout. What is ours
-/// is settled when the route is.
-async fn names_pnpm_route(view: &ProjectView<'_>, out: &CandidateFiles) -> bool {
+/// Whether the pnpm project of `view` holds something of a registry route
+/// ([`pnpm_route`]): its root pnpm-workspace.yaml (`workspace`) holds an
+/// entry of ours, or a lock keys a release by a registry of ours or records
+/// an override of ours. The lock is the root one (`root_lock`) or, in a
+/// workspace that keeps one lock per member (`sharedWorkspaceLockfile:
+/// false`), a member's own: what is left of a route can be in such a lock
+/// alone, with nothing of it in the root files.
+///
+/// Read from the bytes alone, with every address of the registry's shape
+/// taken for a patch server's. What is ours is settled when the route is.
+/// Members that cannot be listed name nothing: only a project whose root
+/// files hold a route is told that its member locks could not be read.
+async fn names_pnpm_route(
+    view: &ProjectView<'_>,
+    workspace: Option<&str>,
+    root_lock: Option<&str>,
+) -> bool {
     use crate::formats::pnpm::named_registries::{holds_ours, Owned};
-    use crate::formats::pnpm::registry_alias::names_a_route;
+    use crate::formats::pnpm::registry_alias::OverrideLock;
+    use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
 
-    if out
-        .files
-        .get(ROOT_PNPM_LOCKS[0])
-        .is_some_and(|lock| names_a_route(lock))
-    {
+    let owned = Owned::of(workspace, &|_| true);
+    if workspace.is_some_and(|text| holds_ours(text, &owned)) {
         return true;
     }
-    let workspace = view.read_text(PNPM_WORKSPACE_REL).await.ok();
-    let owned = Owned::of(workspace.as_deref(), &|_| true);
-    workspace
-        .as_deref()
-        .is_some_and(|text| holds_ours(text, &owned))
+    let routes = |lock: &str| {
+        OverrideLock::parse(lock, &owned)
+            .is_ok_and(|lock| !lock.aliased().is_empty() || !lock.routed_overrides().is_empty())
+    };
+    if root_lock.is_some_and(routes) {
+        return true;
+    }
+    let MemberLocks::PerMember(keys) = member_locks(view).await else {
+        return false;
+    };
+    for key in keys {
+        if view.read_text(&key).await.is_ok_and(|lock| routes(&lock)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Leave the root pnpm lock out and record why (see
@@ -4589,31 +4615,27 @@ fn hold_routed_releases(
 
 /// Whether hosted mode routed the pnpm project at `project_root` through
 /// the patch server's named registry, or left something of that route
-/// behind: its root lock keys a release by a registry of ours or records an
-/// override of ours, or its workspace file holds an entry of ours. Read
-/// from the bytes alone, with every address of the registry's shape taken
-/// for a patch server's. A caller asks before it decides what to read and
-/// lock; what is ours is settled when the route is ([`pnpm_route`]).
+/// behind: a lock keys a release by a registry of ours or records an
+/// override of ours (the root lock, or a member's own in a workspace that
+/// keeps one lock per member), or the workspace file holds an entry of
+/// ours ([`names_pnpm_route`]). A caller asks before it decides what to
+/// read and lock; what is ours is settled when the route is
+/// ([`pnpm_route`]).
 pub async fn pnpm_route_present(project_root: &std::path::Path) -> bool {
-    use crate::formats::pnpm::named_registries::{holds_ours, Owned};
-    use crate::formats::pnpm::registry_alias::OverrideLock;
     use crate::utils::fs::read_regular_to_string;
 
     let workspace = read_regular_to_string(&project_root.join(PNPM_WORKSPACE_REL))
         .await
         .ok();
-    let owned = Owned::of(workspace.as_deref(), &|_| true);
-    if workspace
-        .as_deref()
-        .is_some_and(|text| holds_ours(text, &owned))
-    {
-        return true;
-    }
-    read_regular_to_string(&project_root.join("pnpm-lock.yaml"))
+    let root_lock = read_regular_to_string(&project_root.join(ROOT_PNPM_LOCKS[0]))
         .await
-        .ok()
-        .and_then(|lock| OverrideLock::parse(&lock, &owned).ok())
-        .is_some_and(|lock| !lock.aliased().is_empty() || !lock.routed_overrides().is_empty())
+        .ok();
+    names_pnpm_route(
+        &ProjectView::Disk(project_root),
+        workspace.as_deref(),
+        root_lock.as_deref(),
+    )
+    .await
 }
 
 /// The registry route, planned: the governing locks it changes, the edits
@@ -13632,6 +13654,69 @@ snapshots:
             detail.contains("could not be converted back (the root pnpm lock"),
             "{detail}"
         );
+    }
+
+    /// What is left of a route can be in a member's own lock alone, with the
+    /// root pnpm-workspace.yaml and the root lock holding nothing of it (the
+    /// golden workspace `member-locks`, the route taken out by hand
+    /// everywhere but in one member's lock). The probe that decides whether
+    /// a command looks for a route at all finds it there. A run that is
+    /// granted nothing then takes out a record no lock uses any more, and
+    /// leaves a release a member's lock still routes as it is; a run that
+    /// is granted the patch puts the whole route back around that lock.
+    #[tokio::test]
+    async fn what_a_route_left_in_a_members_own_lock_is_found() {
+        use crate::formats::pnpm::registry_alias::fixtures;
+        const CASE: &str = "member-locks";
+        const A: &str = "packages/a/pnpm-lock.yaml";
+        const B: &str = "packages/b/pnpm-lock.yaml";
+        let expected =
+            |rel: &str| fixtures::read(CASE, &format!("expected/{rel}")).expect("a file");
+        let pristine: BTreeMap<String, String> = fixtures::project(CASE).into_iter().collect();
+        let origins = || vec!["https://patch.test".to_string()];
+        let project = |routed: &str| {
+            let project = golden_project(CASE);
+            write_rel(project.path(), routed, &expected(routed));
+            project
+        };
+
+        // Never routed: nothing to look for.
+        let plain = golden_project(CASE);
+        assert!(!pnpm_route_present(plain.path()).await);
+
+        // A record that no lock of the workspace uses any more.
+        let stale = project(B);
+        assert!(pnpm_route_present(stale.path()).await);
+        let view = ProjectView::Disk(stale.path());
+        let done = pnpm_rewrite_from(&view, &[], true, false, &no_env, origins()).await;
+        assert_eq!(
+            done.rewrite.files.keys().collect::<Vec<_>>(),
+            [B],
+            "{:?}",
+            done.rewrite.edits
+        );
+        assert_eq!(done.rewrite.files[B], pristine[B]);
+
+        // A release a member's lock still routes.
+        let kept = project(A);
+        assert!(pnpm_route_present(kept.path()).await);
+        let view = ProjectView::Disk(kept.path());
+        let done = pnpm_rewrite_from(&view, &[], true, false, &no_env, origins()).await;
+        assert!(
+            done.rewrite.files.is_empty(),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        let healed = golden_rewrite(kept.path(), &golden_candidates(CASE, true)).await;
+        assert!(healed.pnpm_named_registries);
+        commit(kept.path(), &healed);
+        for rel in ["pnpm-workspace.yaml", "pnpm-lock.yaml", A, B] {
+            assert_eq!(
+                std::fs::read_to_string(kept.path().join(rel)).unwrap(),
+                expected(rel),
+                "{rel}"
+            );
+        }
     }
 
     /// A run that is granted no patch tidies a route from every lock the

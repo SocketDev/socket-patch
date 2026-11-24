@@ -1510,6 +1510,98 @@ async fn remove_and_rollback_take_a_package_and_its_registry_out() {
     }
 }
 
+// ── members' own locks ───────────────────────────────────────────────────
+
+/// A file of the golden project `member-locks`, a workspace that keeps one
+/// lock per member (`sharedWorkspaceLockfile: false`): under `project/` as
+/// pnpm locked it, under `expected/` as the scan routed it.
+fn member_golden(rel: &str) -> String {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../socket-patch-core/tests/fixtures/pnpm-registry-overrides/member-locks");
+    std::fs::read_to_string(dir.join(rel))
+        .unwrap_or_else(|e| panic!("{rel}: {e}"))
+        .replace("\r\n", "\n")
+}
+
+const MEMBER_FILES: [&str; 7] = [
+    "package.json",
+    "pnpm-workspace.yaml",
+    "pnpm-lock.yaml",
+    "packages/a/package.json",
+    "packages/a/pnpm-lock.yaml",
+    "packages/b/package.json",
+    "packages/b/pnpm-lock.yaml",
+];
+
+/// That workspace with the route taken out by hand everywhere but in
+/// `routed`, which are as the scan wrote them.
+fn member_project(root: &Path, routed: &[&str]) {
+    for rel in MEMBER_FILES {
+        let from = match routed.contains(&rel) {
+            true => "expected",
+            false => "project",
+        };
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, member_golden(&format!("{from}/{rel}"))).unwrap();
+    }
+}
+
+/// What is left of a route can be in a member's own lock alone, with the
+/// root pnpm-workspace.yaml and the root lock holding nothing of it. The
+/// commands that tidy a route look there too: `repair`, `scan --prune` and
+/// a hosted scan that crawls no package each take out a lock's record of an
+/// override that no lock of the workspace uses any more, and the project is
+/// then the one pnpm locked, byte for byte. A release a member's lock
+/// still routes is no leftover: none of the three restores a pin, so its
+/// key and its record stay as they are.
+#[tokio::test]
+async fn cleanup_finds_what_a_route_left_in_a_members_own_lock() {
+    const A: &str = "packages/a/pnpm-lock.yaml";
+    const B: &str = "packages/b/pnpm-lock.yaml";
+    let server = MockServer::start().await;
+    mock_api(&server, &[], &[]).await;
+    let run = |command: &str, root: &Path| match command {
+        "repair" => repair_offline(root, &[]),
+        "scan --prune" => run_json(&mut scan_command(root, &server, &["--prune", "--json"])),
+        _ => scan_hosted(root, &server, &[]),
+    };
+    for command in ["repair", "scan --prune", "scan --mode hosted"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        member_project(root, &[B]);
+        let (code, doc) = run(command, root);
+        assert_eq!(code, Some(0), "{command}: {doc}");
+        assert_eq!(
+            entries(&doc, "removed"),
+            [entry(B, "lockOverride", "leaf@1.0.0")],
+            "{command}: {doc}"
+        );
+        for rel in MEMBER_FILES {
+            assert_eq!(
+                read(root, rel).unwrap(),
+                member_golden(&format!("project/{rel}")),
+                "{command}: {rel}"
+            );
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        member_project(root, &[A]);
+        let (code, doc) = run(command, root);
+        assert_eq!(code, Some(0), "{command}: {doc}");
+        assert_eq!(entries(&doc, "removed"), [], "{command}: {doc}");
+        for rel in MEMBER_FILES {
+            let from = if rel == A { "expected" } else { "project" };
+            assert_eq!(
+                read(root, rel).unwrap(),
+                member_golden(&format!("{from}/{rel}")),
+                "{command}: {rel}"
+            );
+        }
+    }
+}
+
 // ── a Bazel workspace ────────────────────────────────────────────────────
 
 /// A rules_js hub that keeps the project's pnpm lock up to date with a
