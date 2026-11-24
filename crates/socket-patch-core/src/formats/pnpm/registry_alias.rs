@@ -343,6 +343,15 @@ impl OverrideLock {
             .collect()
     }
 
+    /// Whether the lock holds something of a registry route: a release it
+    /// keys by a registry of ours ([`Self::aliased`]), or a record of an
+    /// override that routes one there ([`Self::routed_overrides`]). A lock
+    /// can hold the second alone: pnpm records the workspace file's
+    /// overrides in every lock it governs.
+    pub(crate) fn holds_route(&self) -> bool {
+        !self.aliased().is_empty() || !self.routed_overrides().is_empty()
+    }
+
     /// The lock's importers, as it keys them (`.`, `packages/a`).
     pub(crate) fn importers(&self) -> Vec<String> {
         self.blocks("importers")

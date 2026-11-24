@@ -3108,9 +3108,7 @@ pub(crate) async fn sweep_registry_route(
                 || root
                     .as_deref()
                     .and_then(|text| OverrideLock::parse(text, &owned).ok())
-                    .is_some_and(|lock| {
-                        !lock.aliased().is_empty() || !lock.routed_overrides().is_empty()
-                    });
+                    .is_some_and(|lock| lock.holds_route());
             return match routed {
                 true => Err(why),
                 false => Ok((Vec::new(), unknown_hosts)),

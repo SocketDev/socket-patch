@@ -1881,10 +1881,8 @@ async fn names_pnpm_route(
     if workspace.is_some_and(|text| holds_ours(text, &owned)) {
         return true;
     }
-    let routes = |lock: &str| {
-        OverrideLock::parse(lock, &owned)
-            .is_ok_and(|lock| !lock.aliased().is_empty() || !lock.routed_overrides().is_empty())
-    };
+    let routes =
+        |lock: &str| OverrideLock::parse(lock, &owned).is_ok_and(|lock| lock.holds_route());
     if root_lock.is_some_and(routes) {
         return true;
     }
@@ -4499,9 +4497,7 @@ fn pnpm_route(
         use crate::formats::pnpm::registry_alias::OverrideLock;
         matches!(&workspace, Ok(Some(text)) if holds_ours(text, &owned))
             || texts.iter().any(|(_, text)| {
-                OverrideLock::parse(text, &owned).is_ok_and(|lock| {
-                    !lock.aliased().is_empty() || !lock.routed_overrides().is_empty()
-                })
+                OverrideLock::parse(text, &owned).is_ok_and(|lock| lock.holds_route())
             })
     };
     match pnpm_registry_route(
@@ -5216,9 +5212,7 @@ fn pnpm_unroute(
             Err(_) => {}
         }
     }
-    let routed = locks
-        .iter()
-        .any(|(_, lock)| !lock.aliased().is_empty() || !lock.routed_overrides().is_empty());
+    let routed = locks.iter().any(|(_, lock)| lock.holds_route());
     if !routed && !existing.is_some_and(|text| named_registries::holds_ours(text, owned)) {
         return None;
     }
