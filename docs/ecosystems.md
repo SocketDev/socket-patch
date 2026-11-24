@@ -21,7 +21,7 @@ below is about what a package manager installs and builds.
 | npm (`npm`) — pnpm / yarn / berry / bun / vlt | ✅ any install layout, vlt's `node_modules/.vlt` store included (every store copy, copy-on-write) | ✅ seven lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun text `bun.lock` lockfileVersion 0/1/2/3 and native binary `bun.lockb` revisions 1/2/3 (binary locks stay binary; text workspace vendoring requires lockfileVersion 2 — see [Bun compatibility](testing/bun-compatibility.md)), vlt `vlt-lock.json` lockfileVersion 0/1 (patched package directories for direct dependencies of the root or a workspace member; transitive targets refused — see [vlt notes](#npm-vlt-notes)). Rush monorepos on pnpm 9 and newer are wired through `pnpm-config.json` and each directly-depending project's `package.json` — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun, vlt (`vlt-lock.json` without `lockfileVersion`, 0 or 1) — pnpm, berry, bun and vlt carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) and [vlt notes](#npm-vlt-notes) |
 | PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ in place | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; Pipenv 2023.7.9+ exports the vendored wheel without a hash, so `pipenv requirements --hash` output fails pip's hash-checking mode — `pypi_pipenv_hash_export_unsupported`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
 | pixi (`pypi`) — the Python packages of a pixi project, from conda channels or PyPI | ✅ in place, in every environment under `.pixi/envs`: PyPI wheels and pure-Python conda packages (compiled conda packages are not supported yet and are skipped) — see [PyPI: pixi projects](#pypi-pixi-projects) | ❌ refused (`pypi_no_requirements` / `pypi_pyproject_only`, which name agent mode) | ❌ nothing rewritten (`redirect_pypi_pixi_project` names agent mode) |
-| Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum); needs cargo 1.68+ (sparse registries) — a project whose `rust-version` or `rust-toolchain[.toml]` declares an older cargo is refused (`redirect_cargo_old_cargo`), use `--mode vendored`; direct dependencies only — a crate another dependency also pulls in is refused, use `--mode vendored`; a crate the user overrides with `[patch]` (path, git or another registry) is refused too, the override is left alone; a `cargo vendor` or `cargo local-registry` project (crates.io replaced by an on-disk source in the project's, a parent directory's or `$CARGO_HOME`'s `.cargo/config*`) is refused, use agent mode; with no `Cargo.lock` the graph is unknown, so only a project whose sole dependency is the patched crate is redirected |
+| Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum); needs cargo 1.68+ (sparse registries) — a project whose `rust-version` or `rust-toolchain[.toml]` declares an older cargo is refused (`redirect_cargo_old_cargo`), use `--mode vendored`; direct dependencies only — a crate another dependency also pulls in is refused, use `--mode vendored`; a crate the user overrides with `[patch]` (path, git or another registry) is refused too, the override is left alone; a `cargo vendor` or `cargo local-registry` project (crates.io replaced by an on-disk source in the project's, a parent directory's or `$CARGO_HOME`'s `.cargo/config*`) is refused, use agent mode; with no `Cargo.lock` the graph is unknown, so only a project whose sole dependency is the patched crate is redirected; in a Bazel workspace a crate is not pinned while a rules_rust hub reads the project's Cargo files without its cargo config (`redirect_cargo_bazel_config_unread`), see [Bazel workspaces: Cargo](#bazel-workspaces-cargo) |
 | RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (a CRLF `Gemfile.lock`, as a `core.autocrlf` checkout leaves it, is edited and reverted in its own line ending, and a lock mixing CRLF and LF fails closed; a gem locked as precompiled platform gems is vendored from prebuilt patched platform gems, see [Ruby gems: native extensions](#ruby-gems-native-extensions); `Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write) | ✅ a `source:` option on the gem's own declaration, the lock converged to match (see [Ruby gems: hosted mode](#ruby-gems-hosted-mode)) — edits `gems.rb` + `gems.locked` or `Gemfile` + `Gemfile.lock`, whichever the project holds (a `Gemfile` + `gems.rb` twin is refused with `redirect_gem_twin_manifest_ambiguous`: bundler 1.x loads the `Gemfile`, bundler ≥ 2 loads `gems.rb`, and nothing in the project says which bundler installs it; bundler 4's `BUNDLE_LOCKFILE` (environment, app config or global config) naming any other lock is refused with `redirect_gem_bundle_lockfile_unsupported`, as is vendoring with `gemfile_not_loaded`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from `.bundle/config` (which outranks the environment, as in bundler), the environment, or the global `~/.bundle/config` / `$BUNDLE_USER_CONFIG` (lowest, as in bundler) is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); a Bundler all-source, exact-source or hostname mirror in app config or the scan environment can capture the patch registry, so the redirect is refused with `redirect_gem_mirror_overrides_source` without printing mirror URLs (scope mirrors to `mirror.https://rubygems.org`; user-global config and mirrors set only in a later install environment are not inspected); the `CHECKSUMS` pin needs bundler ≥ 2.6 (an older lock is still pinned by source and installs frozen; the run says once, with `redirect_gem_no_checksums_section`, that it cannot record the checksums); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is replaced with the verified patched gem when it is the project's own, else flagged `redirect_gem_stale_install` with the remedy (see "Ruby gems: gems already installed" below and CLI_CONTRACT.md's "Gem stale-install guard") |
 | Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [Go notes](#go-directory-replaces-and-gosum). Paid hosted patches are unsupported; `redirect_golang_unsupported` names the vendored remedy |
 | Maven (`maven`) — Maven and Gradle | ✅ in place in every copy the build consumes: each `~/.m2` copy it reads and each Gradle `files-2.1` copy; `~/.m2` `.sha1`/`.md5` sidecars are rewritten, Gradle copies get advisories; jar-member records swap in the patch service's whole jar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) | ✅ suffixed Maven repository (`<version>-socket.<hex8>` pin + `.mvn/maven.config` + fallback file repository) for every pom root, single-module or reactor, or Gradle 6.8+ same-GAV repository with settings wiring and SHA-256 checks (a root with both `pom.xml` and a Gradle build wires both); see [JVM vendoring](design/maven-vendoring.md) and [Gradle](#gradle) | ✅ fail-closed by a Socket-only `<version>-socket.<hex8>` suffix: pom projects get a pinned `<version>` (`${property}` versions are refused); Gradle 6.8+ builds get an owned settings script, lock-entry rewrites and a resolution tripwire — see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) |
@@ -1963,13 +1963,19 @@ fails until one that may has rewritten it.
 
 Known problems. In each of these a command exits 0 today and the next Bazel build fails:
 
-- **Vendored mode for PyPI, RubyGems, NuGet and Composer.** The path of the committed copy
-  means nothing where Bazel runs: rules_python takes it for a package name, rules_ruby's
-  `bundle install` does not find it (`The path ... does not exist`), rules_csharp reads it as
-  a URL (`Bad URL`, or a crash of Bazel 9.3.2), and a Composer that Bazel runs elsewhere
-  reports `Source path ... is not found`. Run `socket-patch vendor --revert`, then
-  `socket-patch scan --mode hosted`. Of these builds a test of this repository runs the PyPI
-  one; the others were measured by hand on the three Bazel releases.
+- **Vendored mode for PyPI, RubyGems and NuGet.** The path of the committed copy means
+  nothing where Bazel runs: rules_python takes it for a package name, rules_ruby's
+  `bundle install` does not find it (`The path ... does not exist`), and rules_csharp reads
+  it as a URL (`Bad URL`, or a crash of Bazel 9.3.2). Run `socket-patch vendor --revert`,
+  then `socket-patch scan --mode hosted`. Of these builds a test of this repository runs the
+  PyPI one; the others were measured by hand on the three Bazel releases.
+- **Vendored mode for Composer, where its refusal is lifted or does not apply.** In a Bazel
+  workspace vendored mode declines a Composer package:
+  [Bazel workspaces: Composer](#bazel-workspaces-composer) has the refusal, what lifts it and
+  the cases it does not see. In those cases the command exits 0, and a Composer that a Bazel
+  rule runs in another directory fails the build with `Source path ... is not found`. Run
+  `socket-patch vendor --revert`, then `socket-patch scan --mode hosted`. A test of this
+  repository builds that failure on the three Bazel releases.
 - **Hosted Cargo on a hub without `cargo_config`**, which is the hub as the rules_rust README
   shows it: the hub's cargo does not see the patch registry that `.cargo/config.toml` defines
   (`registry index was not found in any configuration`). Add
@@ -2312,6 +2318,146 @@ Limits:
   ledger that cannot be read, or one that git ignores).
 - `socket-patch vex` looks at the hub only for the block's entries: a patch that only the
   `pom.xml` pin or a patched jar attests is attested, although the Bazel build does not have it.
+
+## Bazel workspaces: Cargo
+
+A crate_universe hub of rules_rust (`crate.from_cargo` in `MODULE.bazel`, `crates_repository`
+in a `WORKSPACE` file) builds its crates from the `Cargo.toml` files and the `Cargo.lock` it
+names. Its tool, cargo-bazel, links what stands beside each of those `Cargo.toml` files into a
+directory of its own, writes a root manifest of its own there and runs cargo there. Of the
+cargo configs of the checkout that cargo gets one: the file the hub names as `cargo_config`,
+and none when the hub names none (rules_rust 0.56.0 and 0.75.0). The hub of the rules_rust
+README names none.
+
+Hosted mode pins a crate in three files: it defines a registry in the project's
+`.cargo/config.toml`, names it on the dependency in `Cargo.toml`
+(`registry = "socket-patch-<uuid>"`) and repoints the entry of `Cargo.lock`. On a hub with
+`cargo_config = "//:.cargo/config.toml"` the next `bazel build` builds the patched crate, and
+vendored mode builds patched there too (both tested on real Bazel 9.3.2 and 8.8.2 with
+rules_rust 0.75.0 and on 7.7.2 with 0.56.0, for a hub without a cargo-bazel lock).
+
+A hub that reads the manifest and not that config fails on the pin, and every `bazel build`
+that needs the hub fails with it:
+
+```
+error: failed to parse manifest at .../Cargo.toml
+Caused by:
+  registry index was not found in any configuration: `socket-patch-<uuid>`
+```
+
+So in a Bazel workspace `scan --mode hosted` and `get --mode hosted` write no pin for a crate
+while such a hub is in the way. Nothing is written for the crate, it is `skipped`
+(`redirect_unconfirmed`), the exit code is 0 as for the other crates hosted mode leaves out,
+and one warning per crate says why (`redirect_cargo_bazel_config_unread`):
+
+```
+Warning: cfg-if@1.0.4: the rules_rust hub at MODULE.bazel:10 reads the Cargo files of this project, and it names no `cargo_config`. cargo-bazel hands the cargo it runs no cargo config but the one its hub names, and without .cargo/config.toml, where hosted mode defines the patch registry, that cargo fails on the pinned Cargo.toml (`registry index was not found in any configuration`) and `bazel build` with it; dependency skipped (nothing rewritten). Commit .cargo/config.toml (where the project has none, create it with a comment line in it: `rollback` deletes a config it leaves empty, and a hub that names a missing file fails), give the hub `cargo_config = "//:.cargo/config.toml"`, the label of that file as one string, and run this command again; or use `--mode vendored`, which commits the patched crate and needs no registry
+```
+
+The two ways on, both tested on the hub of the README on the three releases, from the refused
+scan to the patched build:
+
+- Commit `.cargo/config.toml` and give the hub the attribute, then run the same command: it
+  pins the crate, and the build is the patched one. The file comes first. A project that has
+  none creates it with a comment line in it: a hub that names a missing file fails, and
+  `rollback` deletes a cargo config it leaves empty, which a comment line prevents. The
+  warning writes the label in the package of the hub's own labels: for a hub that names
+  `//:svc/app/Cargo.toml` it is `//:svc/app/.cargo/config.toml`.
+- Use `--mode vendored`. It commits the patched crate under `.socket/vendor/cargo`, points a
+  `[patch.crates-io]` entry at it and needs no registry.
+
+Where the reason is a line that may hide a hub, the hub that is seen may name the config
+already, and there may be no other. The warning then names that line and no attribute:
+
+```
+Warning: cfg-if@1.0.4: MODULE.bazel:17: `crate` is used other than to call a tag, so a rules_rust hub that socket-patch cannot read may take the Cargo files of this project. [...] dependency skipped (nothing rewritten). Write that line as the call of a tag (`crate.from_cargo(...)`) or as `use_repo(...)` and run this command again: it then pins the crate, or names the hub that is in the way; or use `--mode vendored`, which commits the patched crate and needs no registry
+```
+
+A hub that names the config is still in the way while that file is there and holds nothing
+but white space. The pin would be written into it, a later `rollback` would delete the file it
+leaves empty, and the hub would fail on the missing file. The warning asks for a comment line:
+
+```
+Warning: cfg-if@1.0.4: the rules_rust hub at MODULE.bazel:10 reads the Cargo files of this project and names .cargo/config.toml, which holds nothing: the `rollback` of a pin deletes a cargo config it leaves empty, and the hub then fails on the missing file, and `bazel build` with it; dependency skipped (nothing rewritten). Put a comment line in .cargo/config.toml and run this command again; or use `--mode vendored`, which commits the patched crate and needs no registry
+```
+
+A vendored crate that a hosted scan would take over stays vendored and patched
+(`redirect_takeover_kept_vendored`). A pin that an earlier run wrote stays as it is: the
+command reports it applied, as before, and writes nothing. On such a hub that build is
+failing already: give the hub the attribute, or `socket-patch rollback`.
+
+Everything is read from the checkout, and nothing is evaluated: `MODULE.bazel` and the files
+it includes, for the `from_cargo` tags of the `crate` extension of rules_rust
+(`//crate_universe:extensions.bzl`, and `extension.bzl`, which hands it on) under whatever
+name the file gives the ruleset and the extension; the `WORKSPACE` file, for calls of
+`crates_repository`, also under the name a `load` of that file gives the rule; `.bazeliskrc`
+and `.bazelversion`, for the Bazel release; and the cargo config a hub names, for whether it
+holds anything.
+
+- A hub concerns the project when a label of its `cargo_lockfile` or its `manifests` is the
+  project's `Cargo.lock`, its `Cargo.toml` or the `Cargo.toml` of a workspace member below
+  it. `@<name of the root module>//` is the checkout, and so is `@<name>//` in a `WORKSPACE`
+  file whose `workspace(name = "<name>")` says so. Where that name is not written out as a
+  string, any `@name//` label of a lock or a manifest may be the checkout, and none is taken
+  for the checkout as a `cargo_config`. A label of another repository is no file of the
+  project.
+- A hub that concerns the project is in the way unless its `cargo_config` is one string, the
+  label of the config hosted mode writes: the project's `.cargo/config.toml`, or its
+  `.cargo/config` where the project has that file. Another config is not enough, whatever it
+  holds: the registry is defined in the project's own, and the settings of the other file
+  belong there. A list of one label is not one string.
+- A reading that is not certain withholds the pin where a hub, or a use of the extension
+  through a name bound to it, is seen: a patch that waits for one line of yours weighs less
+  than a build that fails.
+  - A `cargo_lockfile` or `manifests` that is not written out as a string or a list of strings
+    (a constant, a concatenation, an attribute left to `**`): the hub may read the project's
+    files. Its warning says "may read".
+  - A `cargo_config` that is not written out as one string is not taken for the right file.
+  - A call that is not a statement of its own (in a conditional, in a comprehension) counts:
+    it may run.
+  - A use of the extension that may hide a call (the name bound to it used for anything but
+    a tag or `use_repo`): a hub that cannot be read may take the project's files. The warning
+    names the line to rewrite.
+  - A `crates_repository` of the `WORKSPACE` file counts when no `crate.from_cargo` hub of the
+    module files concerns the project, unless `.bazeliskrc` or `.bazelversion` names Bazel
+    9.0.0 or later, which never reads that file. Bazel 7 reads it beside the module files, and
+    Bazel 8 when it is told to. So a `WORKSPACE` file that a move to Bzlmod left behind can
+    withhold a pin on Bazel 8 where the module files make no hub for the project: give its
+    call the attribute, or delete the call.
+- Nothing changes where no hub is seen to concern the project: in no Bazel workspace (the rule
+  is under [Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore)), in a workspace
+  without a crate_universe hub, for a hub that names the config, for a hub whose labels are all
+  written out and name other files (another project of the checkout, another repository), and
+  for a tag of the same name of another ruleset. The run is then the one it was: the same
+  output, and the same files byte for byte.
+
+Limits:
+
+- Not seen, so that the run is the one it was and a hub without the config fails as before:
+  - a hub that another Bazel module declares;
+  - a `crates_repository` inside a `.bzl` file that the `WORKSPACE` file loads, or called
+    under a name that no `load` of the `WORKSPACE` file gives it;
+  - where no hub is seen: a tag called on `use_extension(...)` itself, with no name bound to
+    it; a `MODULE.bazel` that cannot be read (a link that leads out of the Bazel root, a file
+    past the reader's bounds); and what else the module files hide from every reading (a file
+    they include that cannot be read, a `use_extension` that is not written out);
+  - what Bazel is told by flags and rc files. None is read, in the checkout or outside it:
+    `--noenable_bzlmod` has Bazel read the `WORKSPACE` file in place of module files that make
+    a hub;
+  - a Bazel root above a project that is in no git checkout: there only the project's own
+    directory is looked at for a workspace file.
+- Not read: a project the in-memory hosted engine rewrites. It is handed the project's files
+  and reads no Bazel file, so its run is the one it was.
+- Not looked at: `crate.from_specs` hubs, which take no `Cargo.toml`, and `crates_vendor`
+  targets.
+- A hub with a cargo-bazel lock (`lockfile`) asks for a repin after every change of
+  `Cargo.lock`, a pin of either mode included (`CARGO_BAZEL_REPIN=true bazel build ...`). That
+  is the ruleset's own rule, and this check does not look at it.
+- `socket-patch vex` attests a hosted pin from the three files alone. It does not look at the
+  hub.
+- A hub that names a cargo config which is not there yet gets the pin, which creates the
+  file. A later `rollback` deletes the file again, and the hub fails on the missing file as it
+  did before the pin. Create the file with a comment line in it first.
 
 ## Cargo: shared registry cache
 
@@ -3168,7 +3314,11 @@ platform gem of the build that is installed). The same holds for a gem that agen
 before `scan --mode vendored` (or `get --mode vendored`) took it over: the unwind reinstalls the
 upstream gem over the patched files in the project's own gem home, and warns about a copy it
 leaves (a shared gem home, `--no-gem-install-refresh`). A gem that was only ever vendored still
-has the upstream build installed, and its unwind changes nothing in the gem home.
+has the upstream build installed, and its unwind changes nothing in the gem home. When
+`rollback` can prove that (the installed copy's archive in the gem home is the upstream gem
+from rubygems.org, and the files the patch changes are unpatched), it does not count the gem in
+its "keeps its patched bytes in installed trees" note or its `reinstall_required` warning:
+there is nothing to reinstall.
 
 Nothing is changed when the patched gem cannot be downloaded or verified: the run still exits 0
 and warns (`redirect_gem_stale_install`), naming the files to remove by hand. `--dry-run` only
