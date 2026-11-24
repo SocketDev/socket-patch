@@ -752,7 +752,8 @@ fn a_gem_that_the_hub_holds_to_its_upstream_sha256_is_left_alone() {
          patched, change `{NAME}-{VERSION}` to `{patched}` there, or delete the gem from the dict"
     );
     assert!(detail.contains(&stays), "{}", scan.dump);
-    assert!(detail.contains("`socket-patch rollback`"), "{}", scan.dump);
+    let undo_one = format!("`socket-patch rollback pkg:gem/{NAME}@{VERSION}`");
+    assert!(detail.contains(&undo_one), "{}", scan.dump);
     assert!(!detail.contains("redirect skipped"), "{}", scan.dump);
     assert_eq!(changed(&earlier, &cell.tree()), NOTHING, "{}", scan.dump);
     let undo = run(&cell, &["rollback", "--yes"]);

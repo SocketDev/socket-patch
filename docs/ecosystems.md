@@ -3530,7 +3530,8 @@ What is read, and what is not:
   warning that says the pin is left as it is, and still counts the gem as hosted, because
   the pin is in the lock; `--vex` attests it for the same reason, which is not true of that
   build. Change the entry and run the scan again, or take the pin out with
-  `socket-patch rollback`, as the warning says.
+  `socket-patch rollback pkg:gem/<name>@<version>`, as the warning says (a bare `rollback`
+  would unwind every patch of the project).
 
 ## Bazel workspaces: VEX
 

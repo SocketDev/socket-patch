@@ -280,12 +280,16 @@ pub fn stands_against(
             ),
             false => String::new(),
         };
+        // The pin is named as `rollback` selects it, by the gem's base purl:
+        // a bare `rollback` would unwind every patch of the project.
         let (left, to, undo) = match pinned {
-            false => ("redirect skipped", "patch it", ""),
+            false => ("redirect skipped", "patch it", String::new()),
             true => (
                 "the pin an earlier run wrote is left as it is",
                 "build it patched",
-                "; or take that pin out with `socket-patch rollback`",
+                format!(
+                    "; or take that pin out with `socket-patch rollback pkg:gem/{name}@{version}`"
+                ),
             ),
         };
         return Some(format!(
@@ -615,7 +619,7 @@ mod tests {
              it is (nothing rewritten). To build it patched, change `a-1.0` to `99` there, or \
              delete the gem from the dict (Bundler holds it to the CHECKSUMS section of \
              Gemfile.lock), and re-run the hosted scan; or take that pin out with \
-             `socket-patch rollback`. A later `rollback` does not touch the call: put the old \
+             `socket-patch rollback pkg:gem/a@1.0`. A later `rollback` does not touch the call: put the old \
              sha256 back in a changed entry then"
         );
         // Without the section of the lock nothing but the entry holds the
