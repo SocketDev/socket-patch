@@ -26,7 +26,7 @@ below is about what a package manager installs and builds.
 | Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [Go notes](#go-directory-replaces-and-gosum). Paid hosted patches are unsupported; `redirect_golang_unsupported` names the vendored remedy |
 | Maven (`maven`) — Maven and Gradle | ✅ in place in every copy the build consumes: each `~/.m2` copy it reads and each Gradle `files-2.1` copy; `~/.m2` `.sha1`/`.md5` sidecars are rewritten, Gradle copies get advisories; jar-member records swap in the patch service's whole jar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) | ✅ suffixed Maven repository (`<version>-socket.<hex8>` pin + `.mvn/maven.config` + fallback file repository) for every pom root, single-module or reactor, or Gradle 6.8+ same-GAV repository with settings wiring and SHA-256 checks (a root with both `pom.xml` and a Gradle build wires both); see [JVM vendoring](design/maven-vendoring.md) and [Gradle](#gradle) | ✅ fail-closed by a Socket-only `<version>-socket.<hex8>` suffix: pom projects get a pinned `<version>` (`${property}` versions are refused); Gradle 6.8+ builds get an owned settings script, lock-entry rewrites and a resolution tripwire — see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) |
 | sbt / Mill / scala-cli (`maven`) | ✅ Coursier caches (sbt 1.3+, sbt 2, Mill, scala-cli) and Ivy caches (sbt 0.13–1.2, `useCoursier := false`) patched in place, Coursier checksum sidecars resynced — see [Scala build tools](#scala-build-tools-sbt-mill-scala-cli) | ✅ sbt 0.13.18+: generated `socket-patch-vendor.sbt` over the committed suffixed `.socket/vendor/maven2` tree; scala-cli directory builds: owned `socket-patch.scala` + same-GAV `.socket/vendor/coursier` tree (Linux / macOS); Mill: not wired (agent or hosted guidance) | ✅ sbt 0.13.18+: one generated `socket-patch.sbt`, gated on sbt's own `sbt update` records; Mill / scala-cli: paste-able snippets only (`redirect_mill_manual_snippet`, `redirect_scala_cli_manual_snippet`) |
-| NuGet (`nuget`) | ✅ in-place patching deletes `.nupkg.metadata` and advises on the `.nupkg.sha512` tamper-evidence sidecar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed folder feed (its `.gitignore` re-includes the nupkg against `*.nupkg` rules) + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats) |
+| NuGet (`nuget`) | ✅ in-place patching deletes `.nupkg.metadata` and advises on the `.nupkg.sha512` tamper-evidence sidecar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed folder feed (its `.gitignore` re-includes the nupkg against `*.nupkg` rules) + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats). In a Bazel workspace whose rules_csharp `nuget.from_lock` hub would not take the pin (it reads the lock and not that `nuget.config`, or has the package from a lock the run does not re-pin), nothing is written (`redirect_bazel_nuget_config_undeclared`, `redirect_bazel_nuget_lock_not_repinned`); see [Bazel workspaces: NuGet](#bazel-workspaces-nuget) |
 | Composer (`composer`) | ✅ in place (`vendor/`) | ✅ `composer.lock` `dist: path` rewrite; declined in a Bazel workspace, see [Bazel workspaces: Composer](#bazel-workspaces-composer) | ✅ `composer.lock` dist url + shasum rewrite; the entry's `source` and `dist.mirrors` are removed. See [composer-compatibility.md](testing/composer-compatibility.md) |
 | Deno (`deno`) | ✅ in place (the only mode for Deno) | ❌ refused (`vendor_unsupported_ecosystem`) | ❌ not supported |
 
@@ -1478,6 +1478,127 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   warning; the feed + source mapping still force the patched copy).
 
 * **NuGet package signatures.** The server constructs the patched `.nupkg` and removes invalidated upstream signatures. The CLI verifies and stores the served archive without repacking it. Vendoring uses a folder feed with source mapping; installations requiring signed packages need an appropriate server artifact and signing policy.
+
+## Bazel workspaces: NuGet
+
+rules_csharp's `nuget.from_lock` tag (in `MODULE.bazel`) downloads every package of a
+`packages.lock.json` and fails the build on a file that does not match the lock's `contentHash`.
+All the `nuget.from_lock` tags of a workspace make one hub (rules_csharp 0.5.0):
+
+- It has one list of package sources, which it asks before nuget.org. Each tag in turn puts
+  its `feeds` in the place of that list, and then the sources of the `nuget.config` it names
+  as `nuget_config`. So the last tag that has either decides.
+- It holds a package to the `contentHash` of the first lock that names it.
+
+Hosted mode re-pins the `contentHash` of a patched package in the project's locks and names the
+Socket source of the patch in the project's `nuget.config`. A hub that reads a re-pinned lock
+and not that file downloads the upstream package and refuses it. A hub that reads the file and
+has the package from a lock the run did not re-pin downloads the patched package and refuses
+that. Either way the next `bazel build` fails with "the downloaded package does not match its
+contentHash in packages.lock.json".
+
+So `scan --mode hosted` and `get --mode hosted` read the tags, and write nothing for a NuGet
+package that the hub would not take: no `nuget.config`, no re-pinned lock. The package is
+`skipped` (`redirect_unconfirmed`), the run exits 0 as for any other package hosted mode does
+not pin, and one warning per package names the tag by its file and line and the way on.
+
+### The hub does not read the config
+
+`redirect_bazel_nuget_config_undeclared`. The common case is a tag that names no
+`nuget_config`, and the warning names the attribute to put on it:
+
+```starlark
+nuget.from_lock(
+    nuget_config = "//:nuget.config",
+    packages_lock_json = "//:packages.lock.json",
+)
+```
+
+With the attribute, the same command names the Socket source in that `nuget.config`, which it
+creates where the project has none, and re-pins the lock, and the next build takes the patched
+package from the Socket source (rules_csharp 0.5.0 on Bazel 9.3.2, 8.8.2 and 7.7.2). That
+build updates `MODULE.bazel.lock`, which records the two files: commit all three with
+`MODULE.bazel`. The label is the one of the project's own config, in the package of the lock's
+label: the file of NuGet's spellings (`nuget.config`, `NuGet.config`, `NuGet.Config`) that the
+project directory holds, as the directory spells it, or `nuget.config` where it holds none.
+Where the tag does not name its lock as a label in a plain string, or the config lies outside
+the package of that label, the warning names the file and leaves the label to you.
+
+The other cases, each with its own way on in the warning:
+
+- **The tag that decides names another file.** Where that file is a NuGet config in a directory
+  above the project, as with one `nuget.config` for several projects, run the command in that
+  directory (`--cwd`): hosted mode then writes the file the tag reads. Otherwise put the
+  attribute on that tag and name in the project's config the package sources of the other file
+  that the build needs, because the hub takes its sources from one file.
+- **The tag that decides has `feeds` and no `nuget_config`.** Put the attribute on it and name
+  its feeds in the project's config: the sources of a `nuget_config` stand in the place of
+  `feeds`.
+- **A tag has `feeds`, and the config names no package source.** A config without a source
+  leaves the `feeds` of the tags as they are; the first source in it takes their place. So
+  hosted mode does not name the Socket source there until the config names those feeds: name
+  them and run the command again.
+- **A tag is not written out:** it stands in a comprehension or a condition, passes `**`, or
+  has a `nuget_config` that is a constant or an expression. socket-patch evaluates nothing, so
+  it cannot tell which file the hub reads, and a build that may break outranks a patch that is
+  missed and explained. Write the tag as a call of its own, with the attribute in a plain
+  string.
+
+### Another lock holds the package
+
+`redirect_bazel_nuget_lock_not_repinned`. A hosted run re-pins the locks of the projects in the
+directory it runs in. Where another tag reads a lock outside that run which holds the package
+at the same version with another `contentHash`, and the hub reads that lock first, the hub
+would hold the patched package to the upstream `contentHash`. Hosted mode then writes nothing
+for the package and names the tag and the lock. Run the command in a directory above both
+locks (`--cwd`) that holds a solution file or a `nuget.config`, which is what makes hosted mode
+look for projects below it: there it re-pins the lock of every project. Where the tags are in
+more than one file their order is not known, and such a lock stands against the pin wherever
+its tag is; a lock that cannot be read counts as one that holds the package. So does the lock
+of a tag that does not name it as a label in a plain string, beside a tag that names a lock of
+the project: the warning says to write that label out.
+
+### What is read, and what is not
+
+The tags are read from the checkout: the root `MODULE.bazel` and the files it includes, under
+whatever name the file gives the `nuget` extension of `rules_csharp`, and the locks the tags
+name. Nothing is evaluated and no Bazel is run.
+
+- **Nothing changes** for a project in no Bazel workspace (the rule is under
+  [Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore)), for one that restores
+  into no lock file, and for one whose locks no `nuget.from_lock` call names, which Bazel does
+  not build. A tag whose `packages_lock_json` is not a label in a plain string may name any
+  lock, and counts as one that names the project's where no tag names a lock of the project.
+  Nothing changes either for a package that no lock of the project which a tag reads holds:
+  the hub does not build it from this project.
+- **Hosted mode writes** when every `nuget.from_lock` is a call of its own and the last one
+  that has a `nuget_config` or `feeds` names the project's config as a label in a plain string
+  (`//:nuget.config`, `@//:nuget.config`, or with the root module's own name; in another case
+  too, unless the directory holds both spellings, or one that is not NuGet's on a disk that
+  does not fold case, beside which hosted mode writes a file of its own). Where the tags are
+  in more than one file,
+  every tag that has either must name the config. A tag that reads another lock and names the
+  config serves, unless its lock holds the package as above.
+- **A part of `MODULE.bazel` that socket-patch cannot read** (a `bazel_dep` whose name is an
+  expression, an `include` it cannot follow) can hide a tag and changes nothing else: where
+  the tags that are read show that the hub reads the config, hosted mode writes.
+- **Not seen:** a tag of another Bazel module, whose sources and locks the hub takes as well; a
+  tag that an unreadable part of `MODULE.bazel` hides; a lock in another repository; what the
+  command line or an rc file tells Bazel; and what a directory of `local_package_dirs` holds.
+  The hub asks those directories before every source, so with the upstream package in one the
+  build fails on a re-pinned lock (measured on Bazel 9.3.2). The warning says so in a workspace
+  that has the attribute; where the tags show that the hub reads the config, hosted mode
+  writes as it does without Bazel.
+- **Not covered:** a release of rules_csharp after 0.5.0 that gives each `name` of
+  `nuget.from_lock` a hub of its own, where the two rules above hold per name and the tags are
+  still read as one hub; a Bazel workspace below the directory of the run, whose tags are not
+  read while the locks of its projects are re-pinned with the others; a project below the root
+  of a workspace that is in no git checkout, because a workspace is looked for only up to the
+  root of the project's checkout; and a project whose own locks no tag reads while a tag names
+  its `nuget.config` and reads another lock that holds the package. Hosted mode writes in each
+  as it does without Bazel.
+- A pin that an earlier release wrote in such a workspace stays in the two files: `socket-patch
+  rollback` takes it out, and the attribute makes the build read it.
 
 ## Gradle
 

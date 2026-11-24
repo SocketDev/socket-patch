@@ -1551,6 +1551,26 @@ pub async fn read_candidate_files_in(
             crate::patch::redirect::NUGET_LOCKS_KEY.to_string(),
             lines.join("\n"),
         );
+        // In a Bazel workspace a rules_csharp hub reads those locks, with
+        // the locks of its other tags, and takes its package sources from
+        // the config the rewriter writes only when a tag names it. What
+        // the hub makes of the project is read from the checkout here and
+        // rides a synthetic key, for the rewriter to judge each package.
+        // A project in no Bazel workspace, or whose locks no tag reads,
+        // gets none, and its run is the one it was. The root is the raw
+        // one: which files of the workspace this reads is not known
+        // beforehand, so a recording gives up instead of listing them.
+        if let Some(root) = view.disk_root() {
+            use crate::bazel::nuget::{withheld, WITHHELD_KEY};
+            let config = crate::patch::redirect::nuget_config_path(&out.files);
+            let locks = lines.iter().filter_map(|line| line.strip_prefix("lock\t"));
+            let locks: Vec<String> = locks.map(String::from).collect();
+            let root = root.to_path_buf();
+            let read = move || withheld(&root, config, &locks);
+            let read = crate::utils::fs::run_blocking(read).await;
+            out.files
+                .extend(read.map(|hub| (WITHHELD_KEY.to_string(), hub)));
+        }
     }
 
     for path in view.python_lock_paths() {
