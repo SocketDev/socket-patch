@@ -57,8 +57,11 @@ Follow any reinstall warning from the CLI: some package managers reuse cached
 upstream packages. Agent mode needs installed packages; sbt and scala-cli need
 resolution records first. See the [ecosystem notes](docs/ecosystems.md).
 
-Free patches need no token. For organization patches, set `SOCKET_API_TOKEN` or
-use the separate Socket CLI's `socket login`. See [configuration](docs/configuration.md).
+The free tier needs no token. It includes every patch for a critical vulnerability,
+merged patches included: when a package version has several critical vulnerabilities,
+the patch that fixes them together is free too. Patches for the other severities need
+a paid Socket plan: set `SOCKET_API_TOKEN` or use the separate Socket CLI's
+`socket login`. See [free and paid patches](docs/configuration.md#free-and-paid-patches).
 A scan with no available patches does **not** mean the project has no vulnerabilities.
 
 ## Patch modes
