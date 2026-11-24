@@ -21,7 +21,8 @@
 //! as they are. [`jars`] are the patches of a run that a hub can take,
 //! [`site`] says for each whether its entry may be written, [`rewrite`]
 //! writes it, [`pins`] reads the block for `list`, `rollback`, `remove`
-//! and `vex`, and [`without`] takes an entry out.
+//! and `vex`, and [`without`] takes an entry out. [`hub_jars`] are the
+//! jars a hosted scan looks for patches of: those the pinned hubs fetch.
 //! The block is recognised by its text alone: one that is not, byte for
 //! byte, what socket-patch writes for its entries was changed by hand, and
 //! is neither written to nor trusted.
@@ -38,9 +39,10 @@
 //! Bazel without a hub, and what a flag or an rc file outside the checkout
 //! tells Bazel.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
+use std::rc::Rc;
 
 use super::block::{self, Found, END};
 use super::rc::{declared_release, mentions, ModuleLock};
@@ -52,7 +54,7 @@ use crate::patch::redirect::{
 };
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::fs::run_blocking;
-use crate::utils::purl::{parse_maven_purl, purl_qualifier};
+use crate::utils::purl::{build_maven_purl, parse_maven_purl, purl_qualifier};
 use crate::vendor::jvm::layout::artifact_path;
 
 /// The extension whose tags make a hub.
@@ -68,6 +70,10 @@ pub const HUB_UNPATCHED: &str = "maven_bazel_hub_unpatched";
 /// The warning for an artifact when the hubs of the workspace cannot be
 /// read: a hub may build it.
 pub const UNREADABLE: &str = "maven_bazel_unreadable";
+/// The warning of a hosted run that looks for the packages of a project
+/// ([`hub_jars`]) when not every hub of the workspace could be read: the
+/// jars of a hub that was not read are not among them.
+pub const HUB_NOT_READ: &str = "maven_bazel_hub_not_read";
 
 /// The warnings of a hosted run for a jar that a hub builds, or may
 /// build, and whose entry it does not write. Each says why, and that the
@@ -113,8 +119,12 @@ const RULESETS: [&str; 10] = [
 /// What a doubt about a hub without a lock ends with.
 const NO_LOCK: &str = "has no `lock_file`";
 
-/// The largest lock that is read.
+/// The largest lock that is read, each lock once for every hub that names
+/// it, and how many bytes of locks a scan takes its packages from in one
+/// workspace ([`hub_jars`]): the first lock that does not fit is the last
+/// one read.
 const MAX_LOCK: usize = 16 << 20;
+const MAX_LOCKS: usize = 4 * MAX_LOCK;
 
 /// The tags that make a hub of their `name` or add to it, `install`
 /// first: the ruleset's `private/extensions/maven.bzl` has `artifact` at
@@ -466,7 +476,7 @@ pub(super) fn asked(ws: &Workspace, module: &str) -> Asked {
 /// What the hubs of a workspace build: read once, asked per artifact.
 #[derive(Debug)]
 pub struct Hubs {
-    pinned: Vec<(Hub, Lock)>,
+    pinned: Vec<(Hub, Rc<Lock>)>,
     /// The `override` tags of the root module: the [`target`] each
     /// replaces (`None`: its `coordinates` are no string, so any), and
     /// where it is. The tag's `name` is not asked for: the ruleset at 6.5
@@ -483,6 +493,11 @@ pub struct Hubs {
     edited: Option<usize>,
     /// What the root says of the release of the ruleset.
     asked: Asked,
+    /// Whether the workspace has to do with the ruleset: a call of a file
+    /// that was read names it, its `WORKSPACE` file calls `maven_install`,
+    /// or a `maven_install.json` lies at the root. In another workspace a
+    /// doubt is about no hub ([`hub_jars`]).
+    ruleset: bool,
 }
 
 impl Hubs {
@@ -493,6 +508,17 @@ impl Hubs {
     /// `maven_install` or cannot be read while Bazel may read it (the
     /// workspace names no release, or one before 9) are doubts.
     pub fn read(view: &dyn Fn(&str) -> Entry, locks: &dyn Fn(&str) -> Entry) -> Hubs {
+        Hubs::read_within(view, locks, usize::MAX)
+    }
+
+    /// [`Hubs::read`] with at most `room` bytes of locks in all: the lock
+    /// that does not fit is a doubt, and so is every lock after it, which
+    /// is not read.
+    fn read_within(
+        view: &dyn Fn(&str) -> Entry,
+        locks: &dyn Fn(&str) -> Entry,
+        mut room: usize,
+    ) -> Hubs {
         // The block is socket-patch's own: the workspace is read without
         // it, as the user wrote it, and with every line where it was. A
         // block that was changed by hand is read like any other text.
@@ -534,17 +560,38 @@ impl Hubs {
         });
         let overrides = overrides.collect();
         let (mut pinned, mut lockless) = (Vec::new(), None);
+        let mut read_locks = HashMap::new();
+        let past = || {
+            let bound = MAX_LOCKS >> 20;
+            Err(format!(
+                "the locks of the workspace are larger than {bound} MiB in all"
+            ))
+        };
         for hub in hubs {
             // Where a doubt about its lock is: the lock, or the tag.
             let (file, line) = match &hub.lock {
                 Some(lock) => (lock.clone(), 0),
                 None => (hub.file.clone(), hub.line),
             };
-            let lock = match hub.lock.as_deref().map(locks) {
+            let lock = match &hub.lock {
                 None => Err(format!("hub \"{}\" {NO_LOCK}", hub.name)),
-                Some(Entry::Text(text)) => Lock::parse(&text),
-                Some(Entry::Absent) => Err("it does not exist".to_string()),
-                Some(Entry::Unreadable(why)) => Err(format!("it cannot be read: {why}")),
+                Some(path) => {
+                    let parsed = || match (room > 0).then(|| locks(path)) {
+                        None => past(),
+                        Some(Entry::Text(text)) if text.len() > room => {
+                            room = 0;
+                            past()
+                        }
+                        Some(Entry::Text(text)) => {
+                            room -= text.len();
+                            Lock::parse(&text).map(Rc::new)
+                        }
+                        Some(Entry::Absent) => Err("it does not exist".to_string()),
+                        Some(Entry::Unreadable(why)) => Err(format!("it cannot be read: {why}")),
+                    };
+                    let lock = read_locks.entry(path.clone()).or_insert_with(parsed);
+                    lock.clone()
+                }
             };
             match lock {
                 Ok(lock) => pinned.push((hub, lock)),
@@ -555,8 +602,16 @@ impl Hubs {
                 }
             }
         }
+        let module = Value::Str(EXTENSION.module.to_string());
+        let names =
+            |call: &Call| [call.arg("name"), call.arg("module_name")].contains(&Some(&module));
+        let named = ws
+            .files
+            .iter()
+            .any(|(_, file)| file.calls.iter().any(names));
+        let calls = matches!(ws.legacy, Some(Ok(_)));
         let before_9 = || declared_release(view).is_none_or(|release| release < (9, 0, 0));
-        doubts.extend(match ws.legacy.filter(|_| before_9()) {
+        let legacy = match ws.legacy.filter(|_| before_9()) {
             Some(Ok((file, read))) => {
                 // By its own name, or by one that a `load` gives it.
                 let symbol = Value::Str("maven_install".to_string());
@@ -575,7 +630,10 @@ impl Hubs {
                 })
             }
             unread => unread.and_then(Result::err),
-        });
+        };
+        let ruleset =
+            named || (calls && legacy.is_some()) || view("maven_install.json") != Entry::Absent;
+        doubts.extend(legacy);
         Hubs {
             pinned,
             overrides,
@@ -584,6 +642,7 @@ impl Hubs {
             block,
             edited,
             asked,
+            ruleset,
         }
     }
 
@@ -826,13 +885,17 @@ type Declined = (&'static str, String);
 const KEEPS: &str = "socket-patch wrote nothing to MODULE.bazel for it, so the Bazel build keeps \
                      the upstream jar";
 
+/// Where a doubt is: its file, with its line when it is about one.
+fn at(doubt: &Doubt) -> String {
+    match doubt.line {
+        0 => doubt.file.clone(),
+        line => format!("{}:{line}", doubt.file),
+    }
+}
+
 /// Why no entry is written for a jar that a hub may build.
 fn unknown(doubt: &Doubt, kind: Kind) -> Declined {
-    let Doubt { file, line, why } = doubt;
-    let at = match line {
-        0 => file.clone(),
-        line => format!("{file}:{line}"),
-    };
+    let (at, why) = (at(doubt), &doubt.why);
     match kind {
         Kind::Unpinned(hub) => {
             let why = format!(
@@ -1243,6 +1306,83 @@ pub fn pins(root: &Path, module: &str) -> Result<Vec<Pin>, String> {
     Ok(hubs.block.iter().map(pin).collect())
 }
 
+/// What a hosted scan takes from the hubs of a Bazel workspace
+/// ([`hub_jars`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct HubJars {
+    /// The purl of each plain jar that a pinned hub fetches, at the
+    /// version its lock holds.
+    pub jars: Vec<String>,
+    /// The warning ([`HUB_NOT_READ`]) for the first thing that was not
+    /// read.
+    pub unread: Option<(&'static str, String)>,
+    /// The entries of the block whose jar no pinned hub fetches any more,
+    /// when every hub was read: the purl and the id of the patch of each.
+    /// Bazel stops at such an entry.
+    pub stale: Vec<(String, String)>,
+}
+
+/// What a hosted run takes for packages of `project` beside the ones it
+/// finds installed, when `project` is the root of a Bazel workspace: the
+/// purl of each plain jar that a pinned hub fetches, at the version its
+/// lock holds. That is the version Bazel builds, whatever a `pom.xml`
+/// beside the hub selects. With them, one warning ([`HUB_NOT_READ`]) for
+/// the first thing that was not read: no jar is guessed for a hub without
+/// a lock, or for one whose tags or lock cannot be read. In a workspace
+/// that has nothing to do with the ruleset there is no hub to read, and
+/// no warning. And the entries of the block that are stale, for the run
+/// to take out. Nothing for a project below the root, where no entry is
+/// written either, and for one in no Bazel workspace.
+pub async fn hub_jars(project: &Path) -> HubJars {
+    let project = project.to_path_buf();
+    run_blocking(move || hub_jars_blocking(&project)).await
+}
+
+fn hub_jars_blocking(project: &Path) -> HubJars {
+    let root = super::bazel_root(project).filter(|root| root.project.as_os_str().is_empty());
+    let Some(root) = root else {
+        return HubJars::default();
+    };
+    let locks = disk_up_to(&root.dir, MAX_LOCK);
+    let hubs = Hubs::read_within(&disk(&root.dir), &locks, MAX_LOCKS);
+    // Each lock once, however many hubs name it.
+    let (mut purls, mut seen) = (BTreeSet::new(), HashSet::new());
+    let locks = hubs.pinned.iter().map(|(_, lock)| lock);
+    let locks = locks.filter(|lock| seen.insert(Rc::as_ptr(lock)));
+    for (key, jar) in locks.flat_map(|lock| &lock.jars) {
+        let (group, artifact) = key.split_once(':').unwrap_or_default();
+        if jar.fetched {
+            purls.insert(build_maven_purl(group, artifact, &jar.version));
+        }
+    }
+    let unread = hubs.doubt().filter(|_| hubs.ruleset).map(|(doubt, kind)| {
+        let pin = match kind {
+            Kind::Unpinned(hub) => format!(
+                ". Give the hub a `lock_file` and pin it (`REPIN=1 bazel run @{hub}//:pin`)"
+            ),
+            Kind::Unread | Kind::Overridden => String::new(),
+        };
+        let detail = format!(
+            "{}: {}, so socket-patch does not know every Maven artifact that Bazel builds here \
+             through a rules_jvm_external hub: it looks for patches of the ones in the hub \
+             locks it read, and of no other{pin}",
+            at(doubt),
+            doubt.why
+        );
+        (HUB_NOT_READ, detail)
+    });
+    let stale =
+        |patch: &&Patch| hubs.built(&patch.group, &patch.artifact, &patch.version) == Built::No;
+    let stale = hubs.block.iter().filter(stale);
+    HubJars {
+        jars: purls.into_iter().collect(),
+        unread,
+        stale: stale
+            .map(|patch| (patch.purl(), patch.uuid.clone()))
+            .collect(),
+    }
+}
+
 /// The warnings for the patches `purls` of a command that ran in
 /// `project`: a code and a detail for each Maven jar that a hub of the
 /// project's Bazel workspace builds ([`HUB_UNPATCHED`]) or may build
@@ -1288,14 +1428,12 @@ fn notices_blocking(project: &Path, mut purls: Vec<String>) -> Vec<(&'static str
                 );
                 (HUB_UNPATCHED, detail)
             }
-            Built::Unknown(Doubt { file, line, why }, _) => {
-                let at = match line {
-                    0 => file.clone(),
-                    line => format!("{file}:{line}"),
-                };
+            Built::Unknown(doubt, _) => {
                 let detail = format!(
                     "socket-patch could not tell whether Bazel takes this artifact from \
-                     a rules_jvm_external hub: {at}: {why}"
+                     a rules_jvm_external hub: {}: {}",
+                    at(doubt),
+                    doubt.why
                 );
                 (UNREADABLE, detail)
             }
@@ -2135,6 +2273,238 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
         assert_eq!(notices_blocking(broken.path(), Vec::new()), []);
     }
 
+    /// What the warning for a hub that was not read says after where and
+    /// why.
+    const NOT_READ: &str = "so socket-patch does not know every Maven artifact that Bazel builds \
+                            here through a rules_jvm_external hub: it looks for patches of the \
+                            ones in the hub locks it read, and of no other";
+
+    #[test]
+    fn a_hosted_scan_takes_the_plain_jars_that_pinned_hubs_fetch() {
+        let netty = |artifact| format!("pkg:maven/io.netty/netty-tcnative-{artifact}@2.0.61.Final");
+        let netty = [netty("boringssl-static"), netty("classes")];
+        let netty: Vec<&str> = netty.iter().map(String::as_str).collect();
+        let sqlite = "pkg:maven/com.almworks.sqlite4java/sqlite4java@1.0.392";
+        let local = LOCK_SKIPS.replace(
+            "\"version\": \"3\"",
+            "\"m2local\": true, \"version\": \"3\"",
+        );
+        // A version and an artifact that no repository can be named for:
+        // the run that finds a patch of one says so (`maven_bazel_artifact`).
+        let odd = r#"{"artifacts": {
+            "a.b:c": {"shasums": {"jar": "00"}, "version": "1.0+local"},
+            "a.b:d@e": {"shasums": {"jar": "11"}, "version": "1.0"},
+            "a.b:f": {"shasums": {"jar": "22"}, "version": "1.0"}},
+          "repositories": {"https://repo.example/": ["a.b:c", "a.b:d@e", "a.b:f"]},
+          "version": "3"}"#;
+        let odd_jars =
+            ["c@1.0+local", "d@e@1.0", "f@1.0"].map(|jar| format!("pkg:maven/a.b/{jar}"));
+        let two =
+            format!("{PINNED}maven.install(name = \"tools\", lock_file = \"//:tools.json\")\n");
+        let lockless = format!("{PINNED}maven.install(name = \"tools\")\n");
+        let (v2, v3) = (lock_69(), lock_72());
+        // A lock larger than the 1 MiB of a Starlark file.
+        let large = lock_72() + &" ".repeat(1 << 20);
+        let main = "maven_install.json";
+        let pin = ". Give the hub a `lock_file` and pin it (`REPIN=1 bazel run @tools//:pin`)";
+        // A file the reader cannot have, in a workspace with a hub and in
+        // one that names no ruleset of Maven's.
+        let gone = "more.MODULE.bazel: it does not exist; MODULE.bazel";
+        let more = format!("{PINNED}include(\"//:more.MODULE.bazel\")\n");
+        let go = "bazel_dep(name = \"rules_go\", version = \"0.50.1\")\n\
+                  include(\"//:more.MODULE.bazel\")\n";
+        // The block of an earlier run, for netty's jar.
+        let entry = patch("netty-tcnative-classes", NETTY_UUID);
+        let patched = with_patch(PINNED, LABEL, entry).expect("a block");
+        let patched_lockless = format!("{patched}\nmaven.install(name = \"tools\")\n");
+        let rows: [(&str, &[(&str, &str)], Vec<&str>, Option<String>, bool); 19] = [
+            // The jar without a classifier of each artifact, in each format.
+            (PINNED, &[(main, &v2)], netty.clone(), None, false),
+            (PINNED, &[(main, &v3)], netty.clone(), None, false),
+            (PINNED, &[(main, &large)], netty.clone(), None, false),
+            // Not one the lock skips or has no sum of, not another
+            // packaging, and not one that no repository lists,
+            (PINNED, &[(main, LOCK_SKIPS)], vec![sqlite], None, false),
+            // unless the hub takes it from the Maven local repository.
+            (
+                PINNED,
+                &[(main, &local)],
+                vec![sqlite, "pkg:maven/org.example/unlisted@1.0"],
+                None,
+                false,
+            ),
+            (
+                PINNED,
+                &[(main, odd)],
+                odd_jars.iter().map(String::as_str).collect(),
+                None,
+                false,
+            ),
+            // Every pinned hub, and a jar that two of them fetch once.
+            (
+                &two,
+                &[(main, &v3), ("tools.json", LOCK_SKIPS)],
+                [&[sqlite], &netty[..]].concat(),
+                None,
+                false,
+            ),
+            (
+                &two,
+                &[(main, &v3), ("tools.json", &v2)],
+                netty.clone(),
+                None,
+                false,
+            ),
+            // What was not read is said, once, and guessed at nowhere:
+            // the hubs that were read still count.
+            (
+                &lockless,
+                &[(main, &v3)],
+                netty.clone(),
+                Some(format!(
+                    "MODULE.bazel:9: hub \"tools\" has no `lock_file`, {NOT_READ}{pin}"
+                )),
+                false,
+            ),
+            (
+                &two,
+                &[(main, &v3)],
+                netty.clone(),
+                Some(format!("tools.json: it does not exist, {NOT_READ}")),
+                false,
+            ),
+            (
+                PINNED,
+                &[],
+                vec![],
+                Some(format!("maven_install.json: it does not exist, {NOT_READ}")),
+                false,
+            ),
+            (
+                &more,
+                &[],
+                vec![],
+                Some(format!("{gone}:9 includes it, {NOT_READ}")),
+                false,
+            ),
+            // Not in a workspace that has nothing to do with the ruleset:
+            // what its reader could not have is about no hub. A lock at
+            // the root says that it may have one, and so does a
+            // `maven_install` of its `WORKSPACE` file.
+            (go, &[], vec![], None, false),
+            (
+                go,
+                &[(main, &v3)],
+                vec![],
+                Some(format!("{gone}:2 includes it, {NOT_READ}")),
+                false,
+            ),
+            (
+                "module(name = \"app\")\n",
+                &[("WORKSPACE", "maven_install(artifacts = [])\n")],
+                vec![],
+                Some(format!(
+                    "WORKSPACE:1: a `maven_install` of a WORKSPACE file is not read, {NOT_READ}"
+                )),
+                false,
+            ),
+            // An entry of the block is stale once every hub was read and
+            // none fetches its jar at that version any more.
+            (&patched, &[(main, &v3)], netty.clone(), None, false),
+            (&patched, &[(main, LOCK_SKIPS)], vec![sqlite], None, true),
+            (
+                &patched_lockless,
+                &[(main, LOCK_SKIPS)],
+                vec![sqlite],
+                Some(format!(
+                    "MODULE.bazel:32: hub \"tools\" has no `lock_file`, {NOT_READ}{pin}"
+                )),
+                false,
+            ),
+            (
+                &patched,
+                &[],
+                vec![],
+                Some(format!("maven_install.json: it does not exist, {NOT_READ}")),
+                false,
+            ),
+        ];
+        for (module, locks, jars, unread, stale) in rows {
+            let dir = project(&[&[("MODULE.bazel", module)], locks].concat());
+            let expected = HubJars {
+                jars: jars.into_iter().map(String::from).collect(),
+                unread: unread.map(|detail| (HUB_NOT_READ, detail)),
+                stale: Vec::from_iter(stale.then(|| (NETTY_PURL.into(), NETTY_UUID.into()))),
+            };
+            assert_eq!(hub_jars_blocking(dir.path()), expected, "{module}");
+        }
+        // Only for the root of a workspace, where an entry is written:
+        // not below it, whatever its hubs are, and not without one.
+        for module in [PINNED, &lockless] {
+            let dir = project(&[("MODULE.bazel", module), (main, &v3)]);
+            assert!(!hub_jars_blocking(dir.path()).jars.is_empty(), "{module}");
+            let below = dir.path().join("services/billing");
+            std::fs::create_dir_all(&below).unwrap();
+            assert_eq!(hub_jars_blocking(&below), HubJars::default(), "{module}");
+        }
+        let plain = project(&[("pom.xml", "<project/>"), (main, &v3)]);
+        assert_eq!(hub_jars_blocking(plain.path()), HubJars::default());
+    }
+
+    /// A lock is read once for all the hubs that name it. A scan takes
+    /// the locks of one workspace within a bound: the lock past it is a
+    /// doubt, like one that is too large by itself, and no lock after it
+    /// is read. Every other reader takes them all, as before.
+    #[test]
+    fn the_locks_of_a_workspace_are_read_once_and_within_a_bound() {
+        let hub = |name: &str, lock: &str| {
+            format!("maven.install(name = \"{name}\", lock_file = \"//:{lock}.json\")\n")
+        };
+        let hubs = [
+            ("a", "a"),
+            ("b", "a"),
+            ("c", "c"),
+            ("d", "d"),
+            ("e", "e"),
+            ("f", "f"),
+        ];
+        let module = hubs
+            .iter()
+            .fold(PINNED.to_string(), |module, (name, lock)| {
+                module + &hub(name, lock)
+            });
+        let full = lock_72() + &" ".repeat(MAX_LOCK - lock_72().len());
+        let asked = std::cell::RefCell::new(Vec::new());
+        let view = |path: &str| {
+            asked.borrow_mut().push(path.to_string());
+            match path {
+                "MODULE.bazel" => Entry::Text(module.clone()),
+                "maven_install.json" | "f.json" => Entry::Text(lock_72()),
+                "a.json" | "c.json" | "d.json" | "e.json" => Entry::Text(full.clone()),
+                _ => Entry::Absent,
+            }
+        };
+        let names = |(hub, _): &(Hub, Rc<Lock>)| hub.name.clone();
+        let read = Hubs::read_within(&view, &view, MAX_LOCKS);
+        let pinned: Vec<String> = read.pinned.iter().map(names).collect();
+        assert_eq!(pinned, ["maven", "a", "b", "c", "d"]);
+        let doubt = read.doubt.expect("a doubt");
+        let why = "the locks of the workspace are larger than 64 MiB in all";
+        assert_eq!((doubt.file.as_str(), doubt.why.as_str()), ("e.json", why));
+        let times = |lock: &str| asked.borrow().iter().filter(|path| *path == lock).count();
+        assert_eq!(
+            ["a.json", "c.json", "e.json", "f.json"].map(times),
+            [1, 1, 1, 0]
+        );
+
+        asked.borrow_mut().clear();
+        let read = Hubs::read(&view, &view);
+        let pinned: Vec<String> = read.pinned.iter().map(names).collect();
+        assert_eq!(pinned, ["maven", "a", "b", "c", "d", "e", "f"]);
+        assert!(read.doubt.is_none());
+        assert_eq!(["a.json", "e.json", "f.json"].map(times), [1, 1, 1]);
+    }
+
     // The block, and what a hosted run writes of it.
 
     const NETTY_UUID: &str = "0e77a000-0000-4000-8000-0000000000a1";
@@ -2409,7 +2779,7 @@ override_repo(
         let hubs = |module: &str| {
             let files = [("MODULE.bazel", module), ("maven_install.json", &lock)];
             let read = read(&files);
-            let hub = |(hub, _): &(Hub, Lock)| format!("{} {}:{}", hub.name, hub.file, hub.line);
+            let hub = |(hub, _): &(Hub, _)| format!("{} {}:{}", hub.name, hub.file, hub.line);
             let hubs: Vec<String> = read.pinned.iter().map(hub).collect();
             (hubs, read.doubt, built(&files))
         };

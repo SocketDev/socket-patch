@@ -1683,6 +1683,36 @@ pub async fn read_candidate_files_in(
     if candidates.iter().any(|c| c.dep.ecosystem == "gem") {
         keep_bundler_loaded_gem_files(view, candidates, &mut out).await;
         read_gemspecs(view, unreadable, &mut out).await;
+        // In a Bazel workspace a rules_ruby hub can hold a gem of the lock
+        // to a sha256 of its own (`gem_checksums`), which a redirect leaves
+        // on the upstream archive. What the calls that may read the lock
+        // hold is read here and rides a synthetic key to the gem rewriter:
+        // from the checkout on disk, and in memory from the files handed
+        // over, where the project's directory is the Bazel root. A project
+        // in no Bazel workspace, or whose lock no such call may read, gets
+        // none, and its run is the one it was.
+        let (_, lock) = crate::patch::redirect::gem_pair(&out.files);
+        if out.files.contains_key(lock) {
+            use crate::bazel::ruby::{handed, handed_on_disk, KEY};
+            use crate::bazel::workspace::Entry;
+            use crate::vendor::lock_inventory::MemoryEntry;
+            let held = match view {
+                ProjectView::Memory(project) => {
+                    let file = |path: &str| match project.get(path) {
+                        Some(MemoryEntry::Text(text)) => Entry::Text(text.to_string()),
+                        None => Entry::Absent,
+                        Some(_) => Entry::Unreadable("it was not handed over as text".into()),
+                    };
+                    handed(&file, lock)
+                }
+                _ => {
+                    let root = view.disk_root().expect("a disk view has a root");
+                    let root = root.to_path_buf();
+                    crate::utils::fs::run_blocking(move || handed_on_disk(&root, lock)).await
+                }
+            };
+            out.files.extend(held.map(|held| (KEY.to_string(), held)));
+        }
     }
     // A Gradle build: every script, catalog and lock file its script graph
     // reaches, for the hosted Gradle planner.
@@ -8120,6 +8150,81 @@ snapshots:
         let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
         let done = rewrite(view, read.clone(), &candidates, BTreeMap::new(), options).await;
         (read, done)
+    }
+
+    /// In a Bazel workspace the read of a run with a gem candidate hands
+    /// the gem rewriter what the rules_ruby calls that may read the lock
+    /// hold in `gem_checksums`, from a checkout and from the same files in
+    /// memory alike, and a gem that a call holds to another sha256 than the
+    /// patched archive's is left as it is. In no Bazel workspace, beside a
+    /// call that reads another lock and with the patched sha256 in the
+    /// entry, the run is the one it is without Bazel.
+    #[tokio::test]
+    async fn gem_checksums_of_a_bazel_hub_ride_to_the_gem_rewriter() {
+        use crate::bazel::ruby::{KEY, PINNED};
+        let module = |lock: &str, sum: &str| {
+            format!(
+                "bazel_dep(name = \"rules_ruby\", version = \"1.0.0-rc2\")\n\
+                 ruby = use_extension(\"@rules_ruby//ruby:extensions.bzl\", \"ruby\")\n\
+                 ruby.bundle_fetch(gemfile_lock = \"{lock}\", gem_checksums = \
+                 {{\"rails-7.0.0\": \"{sum}\"}})\n"
+            )
+        };
+        let (upstream, patched) = ("1".repeat(64), "f".repeat(64));
+        // A file over the size the reader takes is read on neither side.
+        let large = "#".repeat(crate::bazel::starlark::MAX_BYTES);
+        let large = module("//:Gemfile.lock", &upstream) + &large;
+        // The `MODULE.bazel`, whether its call is handed over, and whether
+        // the gem is left as it is.
+        for (module, handed, left) in [
+            (None, false, false),
+            (Some(module("//:Gemfile.lock", &upstream)), true, true),
+            (Some(module("//:Gemfile.lock", &patched)), true, false),
+            (Some(large), false, false),
+            (
+                Some(module("//other:Gemfile.lock", &upstream)),
+                false,
+                false,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut p = MemoryProject::new();
+            let module = module.as_deref().map(|module| ("MODULE.bazel", module));
+            for (rel, text) in [("Gemfile", GEMFILE), ("Gemfile.lock", GEM_LOCK)]
+                .into_iter()
+                .chain(module)
+            {
+                std::fs::write(tmp.path().join(rel), text).unwrap();
+                p.insert_text(rel, text);
+            }
+            let (on_disk, disk) = gem_rewrite_in(&ProjectView::Disk(tmp.path())).await;
+            let (in_memory, memory) = gem_rewrite(&p).await;
+            let module = module.map(|(_, module)| &module[..module.len().min(200)]);
+            assert_eq!(
+                on_disk.files.get(KEY),
+                in_memory.files.get(KEY),
+                "{module:?}"
+            );
+            assert_eq!(on_disk.files.contains_key(KEY), handed, "{module:?}");
+            assert!(disk.rewrite == memory.rewrite, "{module:?}");
+            assert_eq!(disk.confirmed, memory.confirmed, "{module:?}");
+            let pinned = |w: &RewriteWarning| w.code == PINNED;
+            assert_eq!(disk.rewrite.warnings.iter().any(pinned), left, "{module:?}");
+            assert_eq!(disk.confirmed.is_empty(), left, "{module:?}");
+            assert_eq!(disk.rewrite.files.is_empty(), left, "{module:?}");
+        }
+        // In memory a file that was not handed over as text is there, and
+        // unread: Bazel takes `WORKSPACE.bazel` before `WORKSPACE`, so the
+        // call of the second is not what it builds from.
+        let rule = "rb_bundle_fetch(gemfile_lock = \"//:Gemfile.lock\", gem_checksums = {})\n";
+        let mut p = MemoryProject::new();
+        for (rel, text) in [("Gemfile", GEMFILE), ("Gemfile.lock", GEM_LOCK)] {
+            p.insert_text(rel, text);
+        }
+        p.insert_text("WORKSPACE", rule);
+        assert!(gem_rewrite(&p).await.0.files.contains_key(KEY));
+        p.insert_present("WORKSPACE.bazel");
+        assert!(!gem_rewrite(&p).await.0.files.contains_key(KEY));
     }
 
     /// A gem locked as precompiled platform builds, with a prebuild for

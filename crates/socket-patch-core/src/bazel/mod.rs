@@ -17,6 +17,7 @@ pub mod maven;
 pub mod nuget;
 pub mod pnpm;
 pub mod rc;
+pub mod ruby;
 pub mod starlark;
 pub mod workspace;
 
