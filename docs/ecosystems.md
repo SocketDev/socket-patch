@@ -2370,11 +2370,13 @@ projects too. What the sections below then do for it:
 - Maven: a warning per patch when a rules_jvm_external hub builds the artifact, or may.
 - VEX: a package is attested `affected` when a hub call names the project's lock.
 
-`SOCKET_NO_BAZEL=1` in the environment switches all of it off (`1`, `true`, `yes` or `on`, as
-for the other switches that are read from the environment alone; an empty or any other value
-does not). Every command then does what it does for a project in no Bazel workspace: the same
-files, the same output, the same exit code, and no word about the variable. The in-memory
-engine asks its host for no Bazel file. There is no flag for it: `vex --no-bazel` is the VEX
+`SOCKET_NO_BAZEL=1` in the environment switches all of it off (`1`, `true`, `yes`, `on`, `y`
+or `t`, in any case, as for the other switches that are read from the environment alone; an
+empty or any other value does not). Every command then does what it does for a project in no
+Bazel workspace: the same files, the same output, the same exit code, and no word about the
+variable. The in-memory engine asks its host for no Bazel file. A program that socket-patch
+starts inherits the variable, so a socket-patch which that program starts (a hook of a
+package manager) does the same. There is no flag for it: `vex --no-bazel` is the VEX
 step's own option and switches nothing else off. Set it only for a project that Bazel does
 not build. For one that Bazel builds, what it switches off is what keeps a command that exits
 0 from leaving a build that fails.
@@ -2648,7 +2650,10 @@ repository has no known name is a package too: a patch found for it gets no entr
   ruleset: a call in `MODULE.bazel` or a file it includes names `rules_jvm_external`, the
   `WORKSPACE` file calls `maven_install`, or a `maven_install.json` lies at the Bazel root. In
   another Bazel workspace a file that cannot be read is about no hub, and the scan is the one
-  without the workspace.
+  without the workspace. The block of hosted mode in `MODULE.bazel` is a fourth such sign. A
+  hub that is declared only in a file that could not be read, in a workspace with none of
+  the four, is not scanned, and the scan does not say so: `get <purl> --mode hosted` and
+  `apply` warn there (`maven_bazel_unreadable` below).
 - **How much is read.** A scan takes its packages from up to 64 MiB of hub locks in one
   workspace. The first lock that does not fit is not taken, no lock after it is read, and the
   warning above names it ("the locks of the workspace are larger than 64 MiB in all"). That
@@ -2737,12 +2742,14 @@ artifact:
   reasons above that concern reading the hubs. The warning names the file, the line and the
   reason.
 - Nothing is said, in any mode, of a jar that no hub fetches in a workspace that has nothing
-  to do with the ruleset (the three signs under "What was not read" above) and whose files
-  were all read: there an `include` of a file that does not exist, and a statement the reader
-  does not follow, are about no hub, and the run is the one without the workspace. A file that
-  is there and was not read as a whole (not UTF-8, over 1 MiB, a link out of the workspace,
-  text the reader cannot parse, a `WORKSPACE` file that cannot be read) may be the one that
-  names the ruleset, and keeps the warning.
+  to do with the ruleset (the four signs under "What was not read" above) and whose files
+  were all read: there an `include` of a file that does not exist, and a statement other than
+  an `include` that the reader does not follow, are about no hub, and the run is the one
+  without the workspace. A file that is there and was not read as a whole (not UTF-8, over
+  1 MiB, a link out of the workspace, text the reader cannot parse, a `WORKSPACE` file that
+  cannot be read) may be the one that names the ruleset, and keeps the warning. So does the
+  file of an `include` that the reader does not follow: Bazel 9 takes
+  `include("//:x.MODULE.bazel", dev_dependency = True)`, and that file is not read.
 - Nothing is said for a jar the block patches, under `--global`, and by a `vendor` whose
   `--ecosystems` leaves Maven out.
 
@@ -3350,8 +3357,11 @@ checkout, holds a regular file `MODULE.bazel`, `REPO.bazel`, `WORKSPACE` or `WOR
 counts as the directory lists it: a file `workspace` or `Module.bazel` is none, also on a disk
 that folds case, where a lookup of `WORKSPACE` finds it. Bazel itself takes such a file on a
 disk that folds case, so a workspace whose file is spelled in another case gets nothing of
-what socket-patch does for Bazel: give the file Bazel's spelling. No project is in one for a
-run with
+what socket-patch does for Bazel: give the file Bazel's spelling. The files of a workspace
+are read by the same rule: beside a `MODULE.bazel`, a file `workspace` is no `WORKSPACE`
+file, and gives no warning. A release before this rule took such a file for a workspace file
+and may have written a pair into the `.bazelignore` beside it: that pair still goes with its
+copy, and none is added there. No project is in a Bazel workspace for a run with
 [`SOCKET_NO_BAZEL=1`](#bazel-workspaces-a-project-that-bazel-does-not-build), which adds no
 line and still takes away the pair of a copy that is gone. The checkout
 is the one the `socket.yml` lookup takes for the repository root: on Unix its `.git` belongs to

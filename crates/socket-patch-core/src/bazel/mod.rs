@@ -20,14 +20,23 @@ pub const WORKSPACE_FILES: [&str; 4] =
 /// project is in a Bazel workspace: for a project that sits in such a
 /// checkout and that Bazel does not build. It is read from the environment
 /// alone, in the words of every such switch
-/// ([`env_truthy`](crate::utils::socket_cli_config::env_truthy)), and a
-/// run that honours it says nothing.
+/// ([`env_truthy`](crate::utils::socket_cli_config::env_truthy): `1`,
+/// `true`, `yes`, `on`, `y` or `t`, in any case), and a run that honours
+/// it says nothing.
+///
+/// A child process inherits it
+/// ([`CHILD_ENV_SCRUB`](crate::utils::process::CHILD_ENV_SCRUB) does not
+/// list it): it is the user's word about the checkout, no credential and
+/// no flag of this run, and a socket-patch that a spawned program starts
+/// there has to give the same run.
 pub const OFF_ENV: &str = "SOCKET_NO_BAZEL";
 
 /// Whether the user switched the Bazel support off ([`OFF_ENV`]). Then
-/// [`bazel_root`] finds no workspace, and what judges a workspace from
-/// files handed to it, without that lookup, asks this first. What an
-/// earlier run wrote for Bazel is still listed and undone.
+/// [`bazel_root`] finds no workspace on disk, the view of files handed
+/// over in memory holds none ([`workspace::memory`]), and the in-memory
+/// path selection asks for none ([`ruby::is_workspace_file`]): one gate
+/// for each way a workspace is come by, so that what judges one need not
+/// ask. What an earlier run wrote for Bazel is still listed and undone.
 pub fn off() -> bool {
     crate::utils::socket_cli_config::env_truthy(OFF_ENV)
 }
@@ -67,34 +76,65 @@ pub struct BazelRoot {
 /// above a project outside one, is read, and no file is written there.
 /// None for a user who switched the Bazel support off ([`off`]).
 pub fn bazel_root(project: &Path) -> Option<BazelRoot> {
-    (!off()).then(|| root_of(project)).flatten()
+    (!off()).then(|| roots_of(project).0).flatten()
 }
 
-/// [`bazel_root`] whatever the switch says: for the one caller that takes
-/// away what an earlier run wrote for Bazel ([`ignore::sync`]).
-pub(crate) fn root_of(project: &Path) -> Option<BazelRoot> {
+/// The roots of the project at `project` whatever the switch says, for the
+/// one caller that takes away what an earlier run wrote for Bazel
+/// ([`ignore::sync`]): the root [`bazel_root`] finds without the switch,
+/// and the root that a release found which took a workspace file by a stat
+/// alone, where that is another directory. Such a release wrote there, so
+/// what it wrote is undone there.
+pub(crate) fn roots_of(project: &Path) -> (Option<BazelRoot>, Option<BazelRoot>) {
     let dirs = search_dirs(project);
-    root_in(&dirs, repo_at_end_of(dirs.clone()))
+    roots_in(&dirs, repo_at_end_of(dirs.clone()))
 }
 
-/// [`root_of`] for the walk `dirs`, which ended at the checkout `repo`.
-fn root_in(dirs: &[PathBuf], repo: Option<GitRepo>) -> Option<BazelRoot> {
+/// [`roots_of`] for the walk `dirs`, which ended at the checkout `repo`.
+/// The second root is the first directory, before the first, whose
+/// workspace file the disk answers for under another spelling only.
+fn roots_in(dirs: &[PathBuf], repo: Option<GitRepo>) -> (Option<BazelRoot>, Option<BazelRoot>) {
     let within = repo.filter(|repo| repo.trusted).map_or(1, |_| dirs.len());
-    let at = dirs.iter().take(within).position(|dir| {
-        let file = |name: &str| std::fs::metadata(dir.join(name)).is_ok_and(|meta| meta.is_file());
-        // Asked only once the stat found a file, so a directory with none
-        // costs what it did. One that cannot be listed keeps the stat's word.
-        let listed = |name: &str| match std::fs::read_dir(dir) {
-            Ok(entries) => entries.flatten().any(|entry| entry.file_name() == name),
-            Err(_) => true,
-        };
-        let marks = |name| file(name) && listed(name);
-        WORKSPACE_FILES.into_iter().any(marks)
-    })?;
-    Some(BazelRoot {
-        dir: dirs[at].clone(),
-        project: dirs[0].strip_prefix(&dirs[at]).ok()?.to_path_buf(),
-    })
+    let root = |at: usize| {
+        let project = dirs[0].strip_prefix(&dirs[at]).ok()?.to_path_buf();
+        let dir = dirs[at].clone();
+        Some(BazelRoot { dir, project })
+    };
+    let mut folded = None;
+    for (at, dir) in dirs.iter().take(within).enumerate() {
+        match marked(dir) {
+            Some(true) => return (root(at), folded.and_then(root)),
+            Some(false) => folded = folded.or(Some(at)),
+            None => {}
+        }
+    }
+    (None, folded.and_then(root))
+}
+
+/// Whether `dir` holds a workspace file. `None` when no stat finds a
+/// regular file under one of [`WORKSPACE_FILES`]: four stats, which is all
+/// a directory with none costs. Else whether one of the names found is the
+/// name of a file there ([`listed`]), and not only a spelling the disk
+/// answers to.
+fn marked(dir: &Path) -> Option<bool> {
+    let file = |name: &&str| std::fs::metadata(dir.join(name)).is_ok_and(|meta| meta.is_file());
+    let found: Vec<&str> = WORKSPACE_FILES.iter().copied().filter(file).collect();
+    (!found.is_empty()).then(|| listed(dir, &found))
+}
+
+/// Whether `dir` lists an entry under exactly one of `names`, each of which
+/// a stat found there. Where the disk has nothing under a name in lower
+/// case, which no name of a workspace file is, the stat was of that very
+/// name and nothing is listed: so it is on every disk that tells the cases
+/// apart. Else the directory is listed, once for all the names. One that
+/// cannot be listed keeps the stat's word.
+pub(crate) fn listed(dir: &Path, names: &[&str]) -> bool {
+    let folds = |name: &&str| std::fs::symlink_metadata(dir.join(name.to_lowercase())).is_ok();
+    if !names.iter().any(folds) {
+        return true;
+    }
+    let named = |entry: std::fs::DirEntry| names.iter().any(|name| entry.file_name() == *name);
+    std::fs::read_dir(dir).map_or(true, |entries| entries.flatten().any(named))
 }
 
 #[cfg(test)]
@@ -184,6 +224,51 @@ mod tests {
         }
     }
 
+    /// What the undo of a `.bazelignore` pair is given ([`roots_of`]): the
+    /// root of today, and the root a release found that took a workspace
+    /// file by a stat alone, where that is another directory. On a disk
+    /// that folds case a file `workspace` marked such a root, and what
+    /// that release wrote is there; on a disk that tells the cases apart
+    /// no stat finds the file, and there is no such root.
+    #[test]
+    fn the_root_a_stat_alone_found_is_given_beside_the_root_of_today() {
+        let (_tmp, base) = tree(&["repo/.git", "repo/svc/app"], &["repo/svc/workspace"]);
+        let (repo, svc) = (base.join("repo"), base.join("repo/svc"));
+        let app = svc.join("app");
+        let folds = fs::metadata(svc.join("WORKSPACE")).is_ok();
+        println!("a file named `workspace`: the disk folds case: {folds}");
+        let found = |project: &Path| {
+            let (root, before) = roots_of(project);
+            let before = before.map(|root| (root.dir, root.project));
+            (root.map(|root| root.dir), before)
+        };
+        let before = folds.then(|| (svc.clone(), PathBuf::from("app")));
+        assert_eq!(found(&app), (None, before.clone()));
+        assert_eq!(bazel_root(&app), None);
+        // Below a root of today it is still where that release wrote.
+        fs::write(repo.join("MODULE.bazel"), "").unwrap();
+        assert_eq!(found(&app), (Some(repo.clone()), before));
+        assert_eq!(root(&app), Some(repo));
+        // A directory that holds a file under its own name is the one
+        // root, on either disk, whatever else it holds.
+        fs::write(svc.join("REPO.bazel"), "").unwrap();
+        assert_eq!(found(&app), (Some(svc.clone()), None));
+        assert_eq!(found(&svc), (Some(svc), None));
+    }
+
+    /// A name is listed as the directory spells it, and a directory is
+    /// only asked where the disk answers to the name in the other case.
+    #[test]
+    fn a_name_counts_as_the_directory_lists_it() {
+        let (_tmp, base) = tree(&[], &["MODULE.bazel", "workspace"]);
+        assert!(listed(&base, &["MODULE.bazel"]));
+        assert!(listed(&base, &["WORKSPACE", "MODULE.bazel"]));
+        assert!(!listed(&base, &["WORKSPACE"]));
+        assert!(!listed(&base, &["WORKSPACE", "REPO.bazel"]));
+        // Nothing under the name in either case: the stat's word stands.
+        assert!(listed(&base, &["WORKSPACE.bazel"]));
+    }
+
     /// A directory that may be searched and not listed, as a directory of
     /// another user above the project can be: the stat finds the file, the
     /// names cannot be read, and the file counts as it did.
@@ -231,7 +316,8 @@ mod tests {
         let found = |trusted: Option<bool>| {
             let repo = repo_at_end_of(dirs.clone()).expect("the checkout");
             let repo = trusted.map(|trusted| GitRepo { trusted, ..repo });
-            root_in(&dirs, repo).map(|found| (found.dir, found.project))
+            let found = roots_in(&dirs, repo).0;
+            found.map(|found| (found.dir, found.project))
         };
         assert_eq!(found(Some(true)), Some((base, PathBuf::from("job/proj"))));
         for none in [Some(false), None] {

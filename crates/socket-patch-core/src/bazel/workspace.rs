@@ -40,6 +40,7 @@ use std::path::{Component, Path};
 use super::starlark::{self, Bound, Call, File, How, Value, MAX_BYTES, MAX_TOKENS};
 use crate::utils::fs::open_regular_file_sync;
 use crate::utils::group_commit;
+use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject};
 
 /// How many files of one workspace are asked for, beside the names of its
 /// `WORKSPACE` file, and how many bytes are read in all.
@@ -79,6 +80,13 @@ pub enum Entry {
 /// and each path when it is asked for, so this holds for a tree that no
 /// other process changes meanwhile: one that swaps a directory for a link
 /// between the two steps of a read is not seen.
+///
+/// `MODULE.bazel` and the names of the `WORKSPACE` file at the root are
+/// there only under the name the root lists them by, as for the lookup of
+/// the root ([`super::listed`]): on a disk that folds case a file
+/// `workspace` beside a `MODULE.bazel` is no `WORKSPACE` file. Every other
+/// path is opened as the disk answers to it, which is how Bazel reads the
+/// file a label names.
 pub fn disk(root: &Path) -> impl Fn(&str) -> Entry + '_ {
     disk_up_to(root, MAX_BYTES)
 }
@@ -97,6 +105,10 @@ pub fn disk_up_to(root: &Path, max: usize) -> impl Fn(&str) -> Entry + '_ {
                 }
             }
             let real = std::fs::canonicalize(top.join(path))?;
+            let named = path == "MODULE.bazel" || LEGACY.contains(&path);
+            if named && !super::listed(top, &[path]) {
+                return Err(ErrorKind::NotFound.into());
+            }
             if !real.starts_with(top) {
                 return Err(std::io::Error::other("it leads out of the Bazel workspace"));
             }
@@ -119,6 +131,19 @@ pub fn disk_up_to(root: &Path, max: usize) -> impl Fn(&str) -> Entry + '_ {
                 _ => unreadable(&e.to_string()),
             },
         }
+    }
+}
+
+/// The view of the files handed over in memory, for a project that is its
+/// own Bazel root. It holds none for a user who switched the Bazel support
+/// off ([`super::off`]): whatever judges a workspace from this view then
+/// finds none, as [`super::bazel_root`] finds none on disk.
+pub fn memory(project: &MemoryProject) -> impl Fn(&str) -> Entry + '_ {
+    let off = super::off();
+    move |path| match project.get(path).filter(|_| !off) {
+        Some(MemoryEntry::Text(text)) => Entry::Text(text.to_string()),
+        Some(_) => Entry::Unreadable("it was not handed in as text".to_string()),
+        None => Entry::Absent,
     }
 }
 
@@ -283,10 +308,12 @@ pub struct Workspace {
     /// them. The first 1,024 are kept.
     pub doubts: Vec<Doubt>,
     /// Whether a file that is there was not read as a whole: one that
-    /// cannot be read or parsed, and one past a bound, which is not asked
-    /// for. What such a file says is not known, the name of a ruleset
-    /// included. A file that an `include` names and that does not exist
-    /// says nothing, and is none.
+    /// cannot be read or parsed, one past a bound, which is not asked for,
+    /// and the file of an `include` that is not followed, which may be
+    /// there (9.3.2 takes `dev_dependency` as a second argument, and such
+    /// a file is not read). What such a file says is not known, the name
+    /// of a ruleset included. A file that an `include` names and that does
+    /// not exist says nothing, and is none.
     pub unread: bool,
     /// The file of the older `WORKSPACE` system at the Bazel root, when
     /// it says more than `workspace(...)`: its name (`WORKSPACE.bzlmod`,
@@ -490,6 +517,7 @@ impl Workspace {
                     });
                     let label = label.and_then(|label| Label::parse(label, ""));
                     includes.extend(label.iter().map(|label| (label.path(), call.line)));
+                    self.unread |= label.is_none();
                     label.is_some()
                 }
                 "module" | "bazel_dep" => self.name(call),
@@ -1865,6 +1893,80 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
         // The root file, and a workspace with none.
         assert!(Workspace::read(&|_| Entry::Unreadable("no".to_string())).unread);
         assert!(!Workspace::read(&|_| Entry::Absent).unread);
+        // An `include` that is not followed names a file that may be there
+        // and is never asked for: 9.3.2 takes the first of these.
+        for unfollowed in [
+            "include('//:a.MODULE.bazel', dev_dependency = True)\n",
+            "include(NAME)\n",
+            "x = include('//:a.MODULE.bazel')\n",
+        ] {
+            let asked = std::cell::Cell::new(false);
+            let ws = Workspace::read(&|path| match path {
+                "MODULE.bazel" => Entry::Text(unfollowed.to_string()),
+                "a.MODULE.bazel" => {
+                    asked.set(true);
+                    Entry::Text("x = 1\n".to_string())
+                }
+                _ => Entry::Absent,
+            });
+            assert!(ws.unread && !asked.get(), "{unfollowed}");
+            assert_eq!(ws.doubts.len(), 1, "{unfollowed}");
+        }
+        // A statement that is no `include` leaves no file unread.
+        let load = "load('//:defs.bzl', 'deps')\n";
+        let view = |path: &str| match path {
+            "MODULE.bazel" => Entry::Text(load.to_string()),
+            _ => Entry::Absent,
+        };
+        let ws = Workspace::read(&view);
+        assert!(!ws.unread && ws.doubts.len() == 1, "{:?}", ws.doubts);
+    }
+
+    /// On disk a workspace file is there only under the name its directory
+    /// lists it by ([`disk`]): on a disk that folds case a file `workspace`
+    /// answers for `WORKSPACE`, and beside a `MODULE.bazel` it is no file
+    /// of the older system to read, or to fail on. A file under the exact
+    /// name is read on either kind of disk, and so is a file that a label
+    /// names in another case, as Bazel reads it. The test asks the disk
+    /// which of the two it runs on and says so.
+    #[test]
+    fn a_workspace_file_is_read_only_under_the_name_the_root_lists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let hub = "bazel_dep(name = \"rules_python\", version = \"1.4.1\")\n\
+                   include(\"//:More.MODULE.bazel\")\n";
+        std::fs::write(root.join("MODULE.bazel"), hub).unwrap();
+        std::fs::write(root.join("more.MODULE.bazel"), "x = 1\n").unwrap();
+        std::fs::write(root.join("workspace"), "notes, and no Starlark (\n").unwrap();
+        let folds = std::fs::metadata(root.join("WORKSPACE")).is_ok();
+        println!("a file named `workspace`: the disk folds case: {folds}");
+        let ws = Workspace::read(&disk(root));
+        assert!(ws.legacy.is_none(), "{:?}", ws.legacy);
+        // The included file is the one the disk answers with.
+        assert_eq!((ws.files.len(), ws.unread), (1 + usize::from(folds), false));
+        assert_eq!(ws.doubts.len(), usize::from(!folds), "{:?}", ws.doubts);
+        // Under its own name the file of the older system is read.
+        if !folds {
+            std::fs::write(root.join("WORKSPACE"), "f(\n").unwrap();
+            assert!(matches!(Workspace::read(&disk(root)).legacy, Some(Err(_))));
+        }
+        // A `MODULE.bazel` under another spelling alone is none.
+        std::fs::remove_file(root.join("MODULE.bazel")).unwrap();
+        std::fs::write(root.join("Module.bazel"), hub).unwrap();
+        assert_eq!(Workspace::read(&disk(root)).files.len(), 0);
+    }
+
+    /// The view of files handed over in memory holds what was handed over,
+    /// a file that is no text as one that cannot be read.
+    #[test]
+    fn the_view_of_a_project_in_memory_holds_its_files() {
+        let mut project = MemoryProject::new();
+        project.insert_text("MODULE.bazel", "x = 1\n");
+        project.insert_present("WORKSPACE");
+        let view = memory(&project);
+        assert_eq!(view("MODULE.bazel"), Entry::Text("x = 1\n".to_string()));
+        assert!(matches!(view("WORKSPACE"), Entry::Unreadable(_)));
+        assert_eq!(view("WORKSPACE.bazel"), Entry::Absent);
     }
 
     #[test]

@@ -88,6 +88,19 @@ fn unread_other() -> Files {
     vec![("MODULE.bazel", module)]
 }
 
+/// The workspace of another ruleset beside a file `workspace` that is no
+/// Starlark: a note, a file of another tool. On a disk that folds case
+/// that file answers for `WORKSPACE`, and it is no file of the older
+/// system for all that: a workspace file is read under the name the
+/// directory lists it by.
+fn other_beside_a_stray_file() -> Files {
+    let notes = "notes on the workspace (never closed\n".to_string();
+    vec![
+        ("MODULE.bazel", OTHER_HUB.to_string()),
+        ("workspace", notes),
+    ]
+}
+
 /// A lock of format 3 as a pin of [`HUB`] writes it when another Bazel
 /// module adds to the hub named `maven` too, which the real-Bazel flows do
 /// not build: the jar of each of `jars`, an artifact of the group and its
@@ -436,7 +449,8 @@ fn a_maven_project_no_hub_builds_reports_as_without_bazel() {
             !args.contains(&"--dry-run"),
             "{args:?}: {without:?}"
         );
-        for bazel in [&other, &elsewhere, &unread_other()] {
+        let stray = other_beside_a_stray_file();
+        for bazel in [&other, &elsewhere, &unread_other(), &stray] {
             let beside = machine.run(bazel, true, args);
             assert_eq!(beside, without, "{args:?} beside {:?}", bazel[0].1);
         }
@@ -510,10 +524,13 @@ fn a_hub_that_pins_the_artifact_adds_one_warning_and_nothing_else() {
 /// have and no hub that holds the artifact: each command says that it
 /// could not tell whether a hub builds the jar, and does what it does
 /// without Bazel. One such workspace names the ruleset of a Maven hub and
-/// includes a file that does not exist. The other names only another
-/// ruleset's and includes a file that is there and cannot be parsed, which
-/// may be the one that names it. With an include that does not exist,
-/// that other workspace says nothing
+/// includes a file that does not exist. The others name only another
+/// ruleset's and leave a file unread that is there, and may be the one
+/// that names it: one includes a file that cannot be parsed, and one has
+/// an `include` the reader does not follow (Bazel 9 takes
+/// `dev_dependency` there), with the hub of the artifact and all that
+/// names the ruleset in the file it would read. With an include that does
+/// not exist, that other workspace says nothing
 /// ([`a_maven_project_no_hub_builds_reports_as_without_bazel`]).
 #[test]
 fn a_workspace_that_may_hold_a_hub_and_is_not_read_adds_one_warning() {
@@ -522,14 +539,32 @@ fn a_workspace_that_may_hold_a_hub_and_is_not_read_adds_one_warning() {
     let named = vec![("MODULE.bazel", named.to_string())];
     let mut open = unread_other();
     open.push(("more.MODULE.bazel", "maven.install(\n".to_string()));
+    let dev = "include(\"//java:deps.MODULE.bazel\", dev_dependency = True)\n";
+    let hub = HUB.replace("//:maven_install", "//java:maven_install");
+    let dev = vec![
+        ("MODULE.bazel", format!("{OTHER_HUB}{dev}")),
+        ("java/deps.MODULE.bazel", hub),
+        (
+            "java/maven_install.json",
+            lock(&[("consumer", "2.0"), ("victim", "1.10.0")]),
+        ),
+    ];
+    let included = |why: &str| format!("more.MODULE.bazel{why} includes it");
     let rows = [
-        (named, ": it does not exist; MODULE.bazel:2"),
-        (open, ":1: a bracket is never closed; MODULE.bazel:6"),
+        (named, included(": it does not exist; MODULE.bazel:2")),
+        (
+            open,
+            included(":1: a bracket is never closed; MODULE.bazel:6"),
+        ),
+        (
+            dev,
+            "MODULE.bazel:6: this `include` cannot be read".to_string(),
+        ),
     ];
     for (bazel, why) in rows {
         let unread = format!(
             "socket-patch could not tell whether Bazel takes this artifact from a \
-             rules_jvm_external hub: more.MODULE.bazel{why} includes it"
+             rules_jvm_external hub: {why}"
         );
         adds_one_warning(&bazel, &|args| match args[0] {
             "get" => ("maven_bazel_unreadable", declined(&unread)),
@@ -558,9 +593,10 @@ fn the_switch_makes_a_run_beside_a_hub_the_run_without_bazel() {
 }
 
 /// The words that set the switch are those of every switch that is read
-/// from the environment alone: `1`, `true`, `yes` and `on`, in any case
-/// and with blanks around them. No other value sets it, an empty one
-/// included: the run is then the run without the variable, to the byte.
+/// from the environment alone: `1`, `true`, `yes`, `on`, `y` and `t`, in
+/// any case and with blanks around them. No other value sets it, an empty
+/// one included: the run is then the run without the variable, to the
+/// byte.
 #[test]
 fn the_switch_takes_the_words_of_the_other_switches_and_no_other() {
     let machine = Machine::start();
@@ -574,11 +610,16 @@ fn the_switch_takes_the_words_of_the_other_switches_and_no_other() {
         ("TRUE", &without),
         (" Yes ", &without),
         ("on", &without),
+        ("y", &without),
+        ("T", &without),
         ("", &beside),
         ("0", &beside),
         ("false", &beside),
         ("off", &beside),
         ("2", &beside),
+        ("n", &beside),
+        ("f", &beside),
+        ("yes!", &beside),
     ];
     for (value, expected) in values {
         machine.make(&pinned(), true, true);

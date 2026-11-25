@@ -70,7 +70,10 @@ const MARK: &str = "# socket-patch:";
 /// written, and that lookup is all the call costs. For a user who switched
 /// the Bazel support off ([`super::off`]) no pair is added, as outside one;
 /// the pair of a directory that is gone still goes, so that the undo of a
-/// copy an earlier run made is whole.
+/// copy an earlier run made is whole. For the same reason it goes from the
+/// file at the root an earlier release found too, where that is another
+/// directory ([`super::roots_of`]: one with a workspace file under another
+/// spelling, which is no root any more): no pair is added there.
 ///
 /// The pair follows the directory, not the `replace`: a rollback that
 /// keeps the copy on disk keeps its BUILD files in the workspace too.
@@ -87,7 +90,14 @@ const MARK: &str = "# socket-patch:";
 /// has done its work either way.
 pub async fn sync(project: &Path, go: bool, cargo: bool) -> Result<Option<Changed>, String> {
     let (project, adds) = (project.to_path_buf(), !super::off());
-    run_blocking(move || sync_blocking(&project, go && adds, cargo && adds)).await
+    run_blocking(move || {
+        let (root, before) = super::roots_of(&project);
+        let undone = before.map_or(Ok(None), |root| sync_at(&root, false, false));
+        let synced = root.map_or(Ok(None), |root| sync_at(&root, go && adds, cargo && adds));
+        // What the root of today has to say comes first.
+        synced.transpose().or(undone.transpose()).transpose()
+    })
+    .await
 }
 
 /// The file [`sync`] changed, and the copies its changed lines are about.
@@ -111,11 +121,9 @@ pub(crate) fn ignores(root: &BazelRoot, dir: &Path) -> bool {
     file.is_ok_and(|file| covers(&file, dir.trim_end_matches('/')))
 }
 
-fn sync_blocking(project: &Path, go: bool, cargo: bool) -> Result<Option<Changed>, String> {
-    let Some(root) = super::root_of(project) else {
-        return Ok(None);
-    };
-    let from_root = from_root(&root, Path::new(""));
+/// [`sync`] for the file at `root`.
+fn sync_at(root: &BazelRoot, go: bool, cargo: bool) -> Result<Option<Changed>, String> {
+    let from_root = from_root(root, Path::new(""));
     let project = root.dir.join(&root.project);
     // `None`: it cannot be told (a directory above it that may not be
     // searched). Only a directory that is not found is gone.
@@ -136,7 +144,7 @@ fn sync_blocking(project: &Path, go: bool, cargo: bool) -> Result<Option<Changed
     let mut under_a_hub = |wanted: &mut [(String, Option<bool>, &'static str); 3], text: &[u8]| {
         for ((.., crates), (line, state, _)) in COPIES.iter().zip(wanted.iter_mut()) {
             let adds = *crates && *state == Some(true) && !settled(text, line);
-            if adds && !*hub.get_or_insert_with(|| cargo_bazel::hub(&root)) {
+            if adds && !*hub.get_or_insert_with(|| cargo_bazel::hub(root)) {
                 *state = None;
             }
         }
@@ -843,6 +851,58 @@ mod tests {
             fs::read_to_string(root.join(".bazelignore")).unwrap(),
             pair(PATCHES)
         );
+    }
+
+    /// A checkout whose only workspace file is spelled in another case.
+    /// On a disk that folds case, a release that took the file by a stat
+    /// alone took the checkout for a Bazel workspace and wrote its pairs
+    /// there. The checkout is none any more, and what that release wrote
+    /// is still undone: the pair of a copy that is gone goes, and the file
+    /// with its last pair. No pair is added for a copy that is there. On a
+    /// disk that tells the cases apart no release found a root, and
+    /// nothing is touched. The test asks the disk which it runs on.
+    #[tokio::test]
+    async fn a_pair_at_the_root_an_earlier_release_found_still_goes() {
+        let (_tmp, root, project) = project("", VENDOR);
+        fs::remove_file(root.join("MODULE.bazel")).unwrap();
+        fs::write(root.join("Module.bazel"), "").unwrap();
+        let folds = fs::metadata(root.join("MODULE.bazel")).is_ok();
+        println!("a file named `Module.bazel`: the disk folds case: {folds}");
+        assert_eq!(crate::bazel::bazel_root(&project), None);
+        // The copy in `VENDOR` is there, and the one of `PATCHES` is gone.
+        let file = root.join(".bazelignore");
+        let old = format!("node_modules\n{}", pair(PATCHES));
+        fs::write(&file, &old).unwrap();
+        let (said, left) = match folds {
+            true => (changed(&root), "node_modules\n".to_string()),
+            false => (Ok(None), old),
+        };
+        assert_eq!(sync(&project).await, said);
+        assert_eq!(fs::read_to_string(&file).unwrap(), left);
+        assert_eq!(sync(&project).await, Ok(None), "a second run");
+        assert_eq!(fs::read_to_string(&file).unwrap(), left);
+    }
+
+    /// Such a checkout below a Bazel root of today: the pair of a copy
+    /// that is there is written to the file at that root, and the pair an
+    /// earlier release wrote one directory nearer goes from the file
+    /// there, which Bazel does not read.
+    #[tokio::test]
+    async fn the_root_of_today_gets_the_pair_and_the_older_root_loses_its_own() {
+        let (_tmp, root, project) = project("svc/app", VENDOR);
+        let svc = root.join("svc");
+        fs::write(svc.join("workspace"), "").unwrap();
+        let folds = fs::metadata(svc.join("WORKSPACE")).is_ok();
+        let older = svc.join(".bazelignore");
+        let wrote = pair("app/.socket/go-patches");
+        fs::write(&older, &wrote).unwrap();
+        assert_eq!(sync(&project).await, changed(&root));
+        assert_eq!(
+            fs::read_to_string(root.join(".bazelignore")).unwrap(),
+            pair("svc/app/.socket/vendor/golang")
+        );
+        assert_eq!(fs::read_to_string(&older).ok(), (!folds).then_some(wrote));
+        assert_eq!(sync(&project).await, Ok(None), "a second run");
     }
 
     /// A copy directory that cannot be probed, here below a directory that

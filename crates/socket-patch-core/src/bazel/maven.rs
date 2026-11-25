@@ -474,9 +474,10 @@ pub struct Hubs {
     asked: Asked,
     /// Whether the workspace has to do with the ruleset: a call of a file
     /// that was read names it, its `WORKSPACE` file calls `maven_install`,
-    /// or a `maven_install.json` lies at the root. In another workspace a
-    /// doubt is about no hub ([`hub_jars`]; [`Hubs::built`] unless
-    /// `unread`).
+    /// a `maven_install.json` lies at the root, or the root `MODULE.bazel`
+    /// holds the block, which is written for a hub alone. In another
+    /// workspace a doubt is about no hub ([`hub_jars`]; [`Hubs::built`]
+    /// unless `unread`).
     ruleset: bool,
     /// Whether a file that is there was not read as a whole, and may be the
     /// one that names the ruleset ([`Workspace::unread`]), or the
@@ -617,8 +618,13 @@ impl Hubs {
             }
             unread => unread.and_then(Result::err),
         };
-        let ruleset =
-            named || (calls && legacy.is_some()) || view("maven_install.json") != Entry::Absent;
+        // The block is an entry for a hub, written or changed by hand: of
+        // its entries nothing is said as a fact while a doubt stands.
+        let ours = !block.is_empty() || edited.is_some();
+        let ruleset = named
+            || ours
+            || (calls && legacy.is_some())
+            || view("maven_install.json") != Entry::Absent;
         let unread = ws.unread || legacy.is_some();
         doubts.extend(legacy);
         Hubs {
@@ -1379,7 +1385,13 @@ pub struct HubJars {
 /// the first thing that was not read: no jar is guessed for a hub without
 /// a lock, or for one whose tags or lock cannot be read. In a workspace
 /// that has nothing to do with the ruleset there is no hub to read, and
-/// no warning. And the entries of the block that are stale, for the run
+/// no warning: also where a file of it that is there was not read as a
+/// whole, which [`Hubs::built`] takes for a workspace that may have to do
+/// with it. That warning is one per patch of a Maven jar. This one would
+/// be one per hosted scan, whatever the project holds, and make the root
+/// a project of the scan, in every checkout with such a file: so a hub
+/// that only such a file declares is not scanned, and the scan does not
+/// say so. And the entries of the block that are stale, for the run
 /// to take out. Nothing for a project below the root, where no entry is
 /// written either, and for one in no Bazel workspace.
 pub async fn hub_jars(project: &Path) -> HubJars {
@@ -1421,10 +1433,10 @@ fn hub_jars_blocking(project: &Path) -> HubJars {
         (HUB_NOT_READ, detail)
     });
     // Only when every hub was read: one that was not may fetch the jar.
-    let stale = |patch: &&Patch| {
-        let fetched = hubs.built(&patch.group, &patch.artifact, &patch.version);
-        hubs.doubt().is_none() && fetched == Built::No
-    };
+    // The block makes the workspace one of the ruleset, so beside a doubt
+    // the answer for its entries is never `No`.
+    let stale =
+        |patch: &&Patch| hubs.built(&patch.group, &patch.artifact, &patch.version) == Built::No;
     let stale = hubs.block.iter().filter(stale);
     HubJars {
         jars: purls.into_iter().collect(),
@@ -2222,6 +2234,59 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
         assert_eq!(built(&files), said);
         let said = format!("MODULE.bazel:1: {why}");
         assert_eq!(built(&[("MODULE.bazel", open)]), said);
+        // An `include` that is not followed: 9.3.2 takes `dev_dependency`,
+        // and the file, with the hub and all that names the ruleset in it,
+        // is not read.
+        let dev = "include(\"//java:deps.MODULE.bazel\", dev_dependency = True)\n";
+        let said = "MODULE.bazel:2: this `include` cannot be read";
+        let root = go.replace(include, dev);
+        let (hub, lock) = (PINNED.replace("//:maven", "//java:maven"), lock_72());
+        let files = [
+            ("MODULE.bazel", root.as_str()),
+            ("java/deps.MODULE.bazel", hub.as_str()),
+            ("java/maven_install.json", lock.as_str()),
+        ];
+        assert_eq!(built(&files), said);
+        assert_eq!(built(&files[..1]), said, "the file may be there");
+    }
+
+    /// The block of the root `MODULE.bazel` is written for a hub alone, so
+    /// a workspace that holds it has to do with the ruleset, whatever else
+    /// names it: while something was not read, nothing is said of an entry
+    /// as a fact. Lockfile discovery says that it could not tell whether a
+    /// hub takes the jar, a hosted scan warns and takes no entry out, and
+    /// a jar that no hub fetches is not known to be built by none. Only
+    /// with everything read is an entry whose jar no hub fetches stale.
+    #[test]
+    fn an_entry_of_the_block_is_not_called_stale_while_a_doubt_stands() {
+        let [_, _, ours] = sample(NETTY_UUID);
+        let block = ours.strip_prefix(PINNED).expect("the block follows");
+        let go = "bazel_dep(name = \"rules_go\", version = \"0.50.1\")\n";
+        let doubtful = format!("{go}load(\"//:defs.bzl\", \"deps\")\n{block}");
+        let doubt = "MODULE.bazel:2: this `load` cannot be read";
+        let unbuilt = |module: &str| {
+            let dir = project(&[("MODULE.bazel", module)]);
+            let read = pins(dir.path(), module).expect("the block is ours");
+            assert_eq!(read.len(), 1, "{read:?}");
+            let unbuilt = read.into_iter().next().and_then(|pin| pin.unbuilt);
+            (
+                unbuilt.expect("no hub was read"),
+                hub_jars_blocking(dir.path()),
+            )
+        };
+        let (why, scanned) = unbuilt(&doubtful);
+        assert!(why.contains(doubt) && !why.contains("any more"), "{why}");
+        assert_eq!(scanned.stale, [], "{scanned:?}");
+        let (code, said) = scanned.unread.expect("what the scan did not read");
+        assert!(code == HUB_NOT_READ && said.starts_with(doubt), "{said}");
+        assert_eq!(built(&[("MODULE.bazel", &doubtful)]), doubt);
+        // Without the block the same doubt is about no hub.
+        let without = doubtful.replace(block, "");
+        assert_eq!(built(&[("MODULE.bazel", &without)]), "no");
+        // With every statement read the entry is stale, as a fact.
+        let (why, scanned) = unbuilt(&format!("{go}{block}"));
+        assert!(why.contains("any more"), "{why}");
+        assert_eq!((scanned.stale.len(), scanned.unread), (1, None));
     }
 
     /// A project directory with the files `files`, in a checkout of its
@@ -2519,9 +2584,16 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
                 Some(format!("maven_install.json: it does not exist, {NOT_READ}")),
                 false,
             ),
-            // Not where something was not read, although no warning says
-            // so there: the file that was not read may hold the hub.
-            (&orphan, &[], vec![], None, false),
+            // Not where something was not read: the file that was not
+            // read may hold the hub. The block is that workspace's sign of
+            // the ruleset, so the scan says what it did not read.
+            (
+                &orphan,
+                &[],
+                vec![],
+                Some(format!("{gone}:2 includes it, {NOT_READ}")),
+                false,
+            ),
         ];
         for (module, locks, jars, unread, stale) in rows {
             let dir = project(&[&[("MODULE.bazel", module)], locks].concat());

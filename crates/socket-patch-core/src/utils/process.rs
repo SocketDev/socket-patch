@@ -50,6 +50,13 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The CLI's flag bindings are listed here because core runs the
 /// children; `socket-patch-cli`'s `args` tests fail when a binding is
 /// missing.
+///
+/// A switch of the user's own that no flag binds and that holds no
+/// credential is not listed, and a child inherits it: `SOCKET_NO_CONFIG`,
+/// `SOCKET_NO_UPDATE_CHECK`, and `SOCKET_NO_BAZEL`
+/// ([`crate::bazel::OFF_ENV`]), which says of the checkout that Bazel
+/// does not build it. A socket-patch that a spawned program starts there
+/// (a hook of a package manager) has to honour it as this run does.
 pub const CHILD_ENV_SCRUB: &[&str] = &[
     // The Socket API token, under each name a Socket tool reads it from
     // (this CLI, socket-cli and its legacy spellings, the Python CLI, the
@@ -122,9 +129,6 @@ pub const CHILD_ENV_SCRUB: &[&str] = &[
     "SOCKET_VEX_NO_BAZEL",
     "SOCKET_VEX_DOC_ID",
     "SOCKET_VEX_COMPACT",
-    // The switch for a project that Bazel does not build, read from the
-    // environment alone (`bazel::OFF_ENV`).
-    "SOCKET_NO_BAZEL",
     // Socket-specific service URLs read from the environment alone.
     "SOCKET_NPM_REGISTRY",
     "SOCKET_PYPI_JSON_API",
@@ -1475,11 +1479,19 @@ pub(crate) mod tests {
 
     /// The scrub list names every accepted socket-cli alias and its
     /// canonical name, each once, and nothing but `SOCKET_*` names: a proxy
-    /// or registry credential of the package manager's is never on it. It
-    /// names the switch that no flag binds as well.
+    /// or registry credential of the package manager's is never on it. Nor
+    /// is the switch for a project that Bazel does not build: a child
+    /// inherits it, so that a socket-patch it starts gives the same run.
     #[test]
     fn the_scrub_list_covers_the_peer_aliases_and_only_socket_names() {
-        assert!(CHILD_ENV_SCRUB.contains(&crate::bazel::OFF_ENV));
+        assert!(!CHILD_ENV_SCRUB.contains(&crate::bazel::OFF_ENV));
+        let mut inherits = command_for(Path::new("/x/git"));
+        inherits.env(crate::bazel::OFF_ENV, "1");
+        scrub_child_env(&mut inherits);
+        let kept = |(name, value): (&std::ffi::OsStr, Option<&std::ffi::OsStr>)| {
+            name == crate::bazel::OFF_ENV && value == Some(std::ffi::OsStr::new("1"))
+        };
+        assert!(inherits.get_envs().any(kept));
         for (canonical, alias) in crate::utils::env_compat::PEER_ENV_ALIASES {
             for name in [canonical, alias] {
                 assert!(

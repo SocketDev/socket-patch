@@ -170,14 +170,14 @@ fn classify(
     }
     // Beside a gem lock, the files of a Bazel workspace at this root: they
     // say whether a rules_ruby hub holds a gem of the lock to a sha256 of
-    // its own (`bazel::ruby`). Not for a user who switched the Bazel
-    // support off: no file is then asked for that nothing judges, and the
-    // selection is the one of the tree without its Bazel files.
+    // its own (`bazel::ruby`). None of them for a user who switched the
+    // Bazel support off (`is_workspace_file`): no file is then asked for
+    // that nothing judges, and the selection is the one of the tree
+    // without its Bazel files.
     let locks = ["Gemfile.lock", "gems.locked"];
     if gems
         && locks.iter().any(|lock| root_files.contains(lock))
         && crate::bazel::ruby::is_workspace_file(rel)
-        && !crate::bazel::off()
     {
         return Some(Need::Text);
     }
@@ -186,10 +186,9 @@ fn classify(
     // a named registry, which is done only where every file that can hold
     // a hub was read ([`crate::bazel::pnpm`]). Beside a pnpm-workspace.yaml
     // too: a workspace that keeps one lock per member can have no lock at
-    // its root, and a hub can read a member's own. Not for a user who
-    // switched the Bazel support off, as beside a gem lock.
+    // its root, and a hub can read a member's own.
     let pnpm = root_files.contains("pnpm-lock.yaml") || root_files.contains(PNPM_WORKSPACE_REL);
-    if pnpm && crate::bazel::ruby::is_workspace_file(rel) && !crate::bazel::off() {
+    if pnpm && crate::bazel::ruby::is_workspace_file(rel) {
         return Some(Need::Text);
     }
     if !rel.contains('/') {
