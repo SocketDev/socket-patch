@@ -528,6 +528,12 @@ fn reinstall_command(files: &[PathBuf], with_dirs: bool) -> String {
 const GEM_DIR_REMOVED: &str = "The gem directory is removed too: `bundle install` does not \
      replace a copy that has no gemspec or is in the gem home of another Ruby";
 
+/// Why a remedy removes the gem dir of a copy whose gem home is beside
+/// another Ruby's, after the remedy.
+const BESIDE_ANOTHER_RUBY: &str = "The gem directory is removed too: its gem home is beside \
+     another Ruby's, and `bundle install` replaces a copy only in the gem home of the Ruby that \
+     runs it";
+
 /// `action` after `hint` (which ends mid-sentence), or as a sentence of
 /// its own when there is none.
 fn after_hint(hint: &str, action: &str) -> String {
@@ -2503,6 +2509,93 @@ mod tests {
         assert!(
             bullet.contains("Re-run `socket-patch scan` to retry, or run `rm -f "),
             "{bullet}"
+        );
+    }
+
+    /// #2242: a stale copy in a gem home beside another Ruby's
+    /// (`vendor/bundle/ruby/3.2.0` next to `ruby/3.3.0`), left before any
+    /// Ruby was asked which tree it installs into: the refresh is turned
+    /// off, the patched gem could not be had, or the native rebuild is
+    /// turned off. `bundle install` replaces the copy only when the Ruby
+    /// that runs it owns that tree, so the remedy removes the gem dir too,
+    /// which works with either Ruby. The re-run it names is unchanged.
+    #[tokio::test]
+    async fn a_copy_beside_another_rubys_tree_is_removed_with_its_gem_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("vendor/bundle/ruby/3.2.0");
+        let gem = installed("json", &home, true);
+        let (dir, _) = gem.installed.clone().unwrap();
+        let spec = home.join("specifications/json-1.0.0.gemspec");
+        let rm_rf = format!(
+            "run `rm -rf {} {} && bundle install`",
+            dir.display(),
+            spec.display()
+        );
+        let rm_f = format!("run `rm -f {} ", spec.display());
+        let off = policy(tmp.path(), false, false, false);
+        let on = policy(tmp.path(), true, false, false);
+        let disabled = pass(std::slice::from_ref(&gem), &off).await;
+        let offline = pass(std::slice::from_ref(&gem), &on).await;
+        let no_rebuild = failed_for(
+            &gem,
+            "it builds a native extension, and --no-gem-native-rebuild is set",
+        );
+        let cases = [
+            (
+                &disabled,
+                &off,
+                "Re-run without `--no-gem-install-refresh`, or ",
+            ),
+            (&offline, &on, "Re-run `socket-patch scan` to retry, or "),
+            (&no_rebuild, &on, "Re-run `socket-patch scan` to retry, or "),
+        ];
+        let bullet_of = |pass: &Attempt, policy: &Policy, direction: Direction| {
+            let out = report(direction, std::slice::from_ref(&gem), pass, policy);
+            let detail = out.warnings[0].1.clone();
+            (out.summary.unwrap().bullets[0].clone(), detail)
+        };
+
+        // The only Ruby tree of its bundle path: the remedy it was.
+        for (pass, policy, retry) in cases {
+            let (bullet, _) = bullet_of(pass, policy, Direction::Patched);
+            assert!(bullet.contains(&format!("{retry}{rm_f}")), "{bullet}");
+            assert!(!bullet.contains("rm -rf"), "{bullet}");
+        }
+
+        // A directory beside it that is no gem home changes nothing.
+        std::fs::create_dir_all(home.with_file_name("notes")).unwrap();
+        let (bullet, _) = bullet_of(&disabled, &off, Direction::Patched);
+        assert!(bullet.contains(&rm_f), "{bullet}");
+
+        // The tree of another Ruby beside it.
+        let other = home.with_file_name("3.3.0");
+        std::fs::create_dir_all(other.join("gems")).unwrap();
+        std::fs::create_dir_all(other.join("specifications")).unwrap();
+        for (pass, policy, retry) in cases {
+            let (bullet, detail) = bullet_of(pass, policy, Direction::Patched);
+            assert!(bullet.contains(&format!("{retry}{rm_rf}")), "{bullet}");
+            assert!(bullet.contains(BESIDE_ANOTHER_RUBY), "{bullet}");
+            let removed = format!(
+                "{retry}remove {}, {} and run `bundle install`. {BESIDE_ANOTHER_RUBY}",
+                dir.display(),
+                spec.display()
+            );
+            assert!(detail.contains(&removed), "{detail}");
+
+            // An unwind names no re-run, and the same paths.
+            let (bullet, _) = bullet_of(pass, policy, Direction::Upstream);
+            assert!(bullet.contains(&format!("R{}", &rm_rf[1..])), "{bullet}");
+            assert!(!bullet.contains("Re-run"), "{bullet}");
+        }
+
+        // A copy patched in place keeps its gem dir: only the archive
+        // beside it is stale.
+        let mut in_place = gem.clone();
+        in_place.in_place = true;
+        let detail = stale_detail(Direction::Patched, &in_place, Some(&Why::Disabled));
+        assert!(
+            !detail.contains(&format!("remove {}", dir.display())),
+            "{detail}"
         );
     }
 
