@@ -14,7 +14,7 @@ use crate::common::{binary, git_sha256, sha256_hex};
 
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 

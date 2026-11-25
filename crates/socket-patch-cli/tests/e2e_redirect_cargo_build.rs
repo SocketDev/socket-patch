@@ -73,7 +73,6 @@ use common::{binary, hermetic, hermetic_command, sha256_hex};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use sha2::{Digest, Sha256};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};

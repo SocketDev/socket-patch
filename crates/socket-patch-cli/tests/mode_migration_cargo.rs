@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use base64::Engine as _;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};

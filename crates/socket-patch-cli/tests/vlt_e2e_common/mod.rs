@@ -37,7 +37,7 @@ use std::sync::OnceLock;
 
 use base64::Engine as _;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha512};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 

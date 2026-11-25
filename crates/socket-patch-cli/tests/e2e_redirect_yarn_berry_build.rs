@@ -56,7 +56,6 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-
 const ORG: &str = "test-org";
 const DEP: &str = "left-pad";
 const DEP_VERSION: &str = "1.3.0";

@@ -29,7 +29,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256, git_sha256_file, has_command, hermetic};
+use common::{binary, git_sha256_file, has_command, hermetic};
 
 use std::path::Path;
 use std::process::{Command, Output};
