@@ -417,6 +417,13 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   upgrading to pnpm >=11. When no pin says which pnpm runs, the file is
   created, and pnpm 9.0–10.4 then need `pnpm add -w <pkg>`. Vendored mode
   follows the same rule for its `overrides:` mirror.
+  Known limit on Windows: in a project that has a `pnpm-workspace.yaml` (the
+  one the CLI created counts), pnpm 11 started from a directory spelled with
+  an 8.3 short name (`C:\Users\LONGNA~1\app`) records what `pnpm add`,
+  `pnpm remove` and `pnpm update` change under a second `importers:` entry of
+  the lock, keyed `../…`, and leaves the project's own entry (`.`) as it was;
+  this is pnpm's own behaviour, and running pnpm from the directory's long
+  name (`C:\Users\longname\app`) avoids it.
   **Vendored build approvals (#1597):** pnpm 10.34.2+ and 11.5.3+ match
   `allowBuilds` / `onlyBuiltDependencies` against the id a package installs
   as, and a vendored package installs as `name@file:.socket/vendor/npm/…`.
