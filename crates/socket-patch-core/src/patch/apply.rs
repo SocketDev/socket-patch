@@ -108,6 +108,70 @@ impl<'a> PatchSources<'a> {
     }
 }
 
+/// Why a package's patch did not apply: a stable code for the `cause` of
+/// a failed `--json` event and the `code` its telemetry reports. Never
+/// carries a name, path or version.
+///
+/// [`Unclassified`](Self::Unclassified) is a failure whose path sets no
+/// cause, kept as its own value so that share can be measured and the
+/// path named. New causes may be added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ApplyFailureCause {
+    /// A file matches neither the patch's original nor its patched hash:
+    /// a different build of the version, or a local edit.
+    HashMismatch,
+    /// A file the patch changes is not in the installed copy.
+    FileNotFound,
+    /// The patch names a path outside the package directory.
+    UnsafePath,
+    /// The copy is in a store other projects share (pnpm's global virtual
+    /// store, PDM's cache): patching it would patch them too.
+    SharedStore,
+    /// A conda build of the package the patch cannot be applied to.
+    CondaBuild,
+    /// The patched content is not in the blob store and could not be read.
+    BlobMissing,
+    /// A blob's content does not hash to its name.
+    BlobCorrupt,
+    /// Staging or committing a file failed (permissions, disk, a lock).
+    WriteFailed,
+    /// An ecosystem's checksum or metadata files could not be brought in
+    /// line with the patched files.
+    SidecarFailed,
+    /// No release variant in the manifest matches the installed one (a
+    /// wheel, platform gem or Maven classifier).
+    NoMatchingVariant,
+    /// A failure under a stable code of its own: a refusal before writing
+    /// (a Gradle build that verifies dependencies, a native gem that cannot
+    /// be rebuilt here, …) or a native rebuild that failed.
+    Coded(&'static str),
+    /// A failure on a path that sets no cause.
+    Unclassified,
+}
+
+impl ApplyFailureCause {
+    /// The code: snake_case, the names `apply --check` uses for the same
+    /// states where it has one (`hash_mismatch`, `file_not_found`,
+    /// `no_matching_variant`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HashMismatch => "hash_mismatch",
+            Self::FileNotFound => "file_not_found",
+            Self::UnsafePath => "unsafe_path",
+            Self::SharedStore => "shared_store",
+            Self::CondaBuild => "conda_build",
+            Self::BlobMissing => "blob_missing",
+            Self::BlobCorrupt => "blob_corrupt",
+            Self::WriteFailed => "write_failed",
+            Self::SidecarFailed => "sidecar_failed",
+            Self::NoMatchingVariant => "no_matching_variant",
+            Self::Coded(code) => code,
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
 /// Result of applying patches to a single package.
 #[derive(Debug, Clone)]
 pub struct ApplyResult {
@@ -133,6 +197,27 @@ pub struct ApplyResult {
     /// Surfaced in the CLI JSON envelope under
     /// `Envelope.sidecars[]` (top-level, not per-event).
     pub sidecar: Option<crate::patch::sidecars::SidecarRecord>,
+    /// Why the package failed, set by the path that failed it. Read it
+    /// through [`ApplyResult::failure_cause`], which names a failure that
+    /// set none.
+    pub cause: Option<ApplyFailureCause>,
+}
+
+impl ApplyResult {
+    /// Why this package failed; `None` when it did not. A failure that set
+    /// no cause is [`ApplyFailureCause::Unclassified`]: it is never guessed
+    /// from `files_verified`, which a later step (a rebuild, a `--force`
+    /// skip) can leave describing something other than what failed.
+    pub fn failure_cause(&self) -> Option<ApplyFailureCause> {
+        (!self.success).then(|| self.cause.unwrap_or(ApplyFailureCause::Unclassified))
+    }
+
+    /// Fail the result with `cause` and `error`.
+    fn fail(&mut self, cause: ApplyFailureCause, error: String) {
+        self.success = false;
+        self.cause = Some(cause);
+        self.error = Some(error);
+    }
 }
 
 /// A patch's files in file-name order: the verify and write loops walk
@@ -1425,7 +1510,11 @@ impl crate::patch::store_copies::CopyFold for ApplyResult {
         self.success
     }
 
-    fn mark_failed(&mut self) {
+    fn mark_failed(&mut self, copy: &Self) {
+        // The first failure names the package's cause.
+        if self.success {
+            self.cause = copy.failure_cause();
+        }
         self.success = false;
     }
 
@@ -1621,6 +1710,7 @@ async fn apply_package_patch_at(
         applied_via: HashMap::new(),
         error: None,
         sidecar: None,
+        cause: None,
     };
 
     // A package dir that resolves into a store other projects link to
@@ -1635,7 +1725,7 @@ async fn apply_package_patch_at(
     )
     .await
     {
-        result.error = Some(store.refusal("patch"));
+        result.fail(ApplyFailureCause::SharedStore, store.refusal("patch"));
         return result;
     }
 
@@ -1659,6 +1749,7 @@ async fn apply_package_patch_at(
                     // A compiled build is one a command skips, with this
                     // text as its warning. Any other refusal fails the
                     // copy on every run, so it says how to drop the record.
+                    result.cause = Some(ApplyFailureCause::CondaBuild);
                     result.error = Some(if build.unsupported(pkg_path).is_some() {
                         refused
                     } else {
@@ -1685,9 +1776,12 @@ async fn apply_package_patch_at(
         // disk write — NOT skippable by `--force`, since a path escape is never
         // a legitimate patch target.
         if !is_safe_relative_subpath(normalize_file_path(file_name)) {
-            result.error = Some(format!(
-                "Refusing patch with unsafe file path (escapes package directory): {file_name}"
-            ));
+            result.fail(
+                ApplyFailureCause::UnsafePath,
+                format!(
+                    "Refusing patch with unsafe file path (escapes package directory): {file_name}"
+                ),
+            );
             return result;
         }
 
@@ -1741,10 +1835,14 @@ async fn apply_package_patch_at(
                         .message
                         .clone()
                         .unwrap_or_else(|| format!("{:?}", verify_result.status));
-                    result.error = Some(format!(
-                        "Cannot apply patch: {} - {}",
-                        verify_result.file, msg
-                    ));
+                    result.fail(
+                        if verify_result.status == VerifyStatus::NotFound {
+                            ApplyFailureCause::FileNotFound
+                        } else {
+                            ApplyFailureCause::HashMismatch
+                        },
+                        format!("Cannot apply patch: {} - {}", verify_result.file, msg),
+                    );
                     result.files_verified.push(verify_result);
                     return result;
                 }
@@ -1807,7 +1905,8 @@ async fn apply_package_patch_at(
             )
             .await;
             if let Some(why) = result.sidecar.as_ref().and_then(|s| s.fixup_failure()) {
-                result.error = Some(why.to_string());
+                let why = why.to_string();
+                result.fail(ApplyFailureCause::SidecarFailed, why);
                 return result;
             }
         }
@@ -1886,12 +1985,15 @@ async fn apply_package_patch_at(
                 });
             }
         }
-        result.error = Some(format!(
-            "Cannot apply patch: {}{}{}",
-            e.file.map(|file| format!("{file} - ")).unwrap_or_default(),
-            e.source,
-            not_restored_note(&e.not_restored)
-        ));
+        result.fail(
+            ApplyFailureCause::WriteFailed,
+            format!(
+                "Cannot apply patch: {}{}{}",
+                e.file.map(|file| format!("{file} - ")).unwrap_or_default(),
+                e.source,
+                not_restored_note(&e.not_restored)
+            ),
+        );
     };
 
     // Stage every file that needs writing before the first is renamed into
@@ -1918,31 +2020,33 @@ async fn apply_package_patch_at(
         // vendor flows stage there, so vendoring writes no `.socket/blobs`
         // entries), then the on-disk blob, which must hold the bytes its
         // name promises.
-        let patched_content: Cow<'_, [u8]> =
-            if let Some(bytes) = sources.mem_blobs.and_then(|m| m.get(&file_info.after_hash)) {
-                Cow::Borrowed(bytes.as_slice())
-            } else {
-                let blob = read_blob(sources.blobs_path, &file_info.after_hash)
-                    .await
-                    .and_then(|bytes| {
-                        let hash = compute_git_sha256_from_bytes(&bytes);
-                        if hash == file_info.after_hash {
-                            return Ok(bytes);
-                        }
-                        Err(corrupt_blob_error(
-                            &sources.blobs_path.join(&file_info.after_hash),
-                            &hash,
-                        ))
-                    });
-                match blob {
-                    Ok(bytes) => Cow::Owned(bytes),
-                    Err(msg) => {
-                        abort_package(write).await;
-                        result.error = Some(format!("Cannot apply patch: {file_name} - {msg}"));
-                        return result;
+        let patched_content: Cow<'_, [u8]> = if let Some(bytes) =
+            sources.mem_blobs.and_then(|m| m.get(&file_info.after_hash))
+        {
+            Cow::Borrowed(bytes.as_slice())
+        } else {
+            let blob = read_blob(sources.blobs_path, &file_info.after_hash)
+                .await
+                .map_err(|msg| (ApplyFailureCause::BlobMissing, msg))
+                .and_then(|bytes| {
+                    let hash = compute_git_sha256_from_bytes(&bytes);
+                    if hash == file_info.after_hash {
+                        return Ok(bytes);
                     }
+                    Err((
+                        ApplyFailureCause::BlobCorrupt,
+                        corrupt_blob_error(&sources.blobs_path.join(&file_info.after_hash), &hash),
+                    ))
+                });
+            match blob {
+                Ok(bytes) => Cow::Owned(bytes),
+                Err((cause, msg)) => {
+                    abort_package(write).await;
+                    result.fail(cause, format!("Cannot apply patch: {file_name} - {msg}"));
+                    return result;
                 }
-            };
+            }
+        };
 
         // A bin npm installed with an LF shebang gets the patched bytes in
         // that form too (see `npm_bin`).
@@ -1959,7 +2063,10 @@ async fn apply_package_patch_at(
             Ok(write) => write,
             Err(e) => {
                 abort_package(write).await;
-                result.error = Some(format!("Cannot apply patch: {file_name} - {e}"));
+                result.fail(
+                    ApplyFailureCause::WriteFailed,
+                    format!("Cannot apply patch: {file_name} - {e}"),
+                );
                 return result;
             }
         };
@@ -2034,7 +2141,10 @@ async fn apply_package_patch_at(
                         not_restored_note(&not_restored)
                     )
                 };
-                result.error = Some(format!("Cannot apply patch: {message}"));
+                result.fail(
+                    ApplyFailureCause::SidecarFailed,
+                    format!("Cannot apply patch: {message}"),
+                );
                 result.sidecar = Some(fixup_failed_record(package_key, message));
                 return result;
             }
@@ -2119,6 +2229,99 @@ pub(crate) async fn read_blob_entry(blob_path: &Path) -> std::io::Result<Vec<u8>
 mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+
+    fn result_with(success: bool, statuses: &[VerifyStatus]) -> ApplyResult {
+        ApplyResult {
+            package_key: "pkg:npm/a@1.0.0".to_string(),
+            package_path: "/tmp/a".to_string(),
+            success,
+            files_verified: statuses
+                .iter()
+                .map(|&status| VerifyResult {
+                    file: "package/index.js".to_string(),
+                    status,
+                    message: None,
+                    current_hash: None,
+                    expected_hash: None,
+                    target_hash: None,
+                })
+                .collect(),
+            files_patched: Vec::new(),
+            applied_via: HashMap::new(),
+            error: None,
+            sidecar: None,
+            cause: None,
+        }
+    }
+
+    /// A success has no cause; a failure that set none is `unclassified`,
+    /// whatever its files say; a set cause wins.
+    #[test]
+    fn failure_cause_is_the_one_set_never_a_guess() {
+        assert_eq!(
+            result_with(true, &[VerifyStatus::HashMismatch]).failure_cause(),
+            None
+        );
+        assert_eq!(
+            result_with(false, &[VerifyStatus::Ready, VerifyStatus::HashMismatch]).failure_cause(),
+            Some(ApplyFailureCause::Unclassified)
+        );
+        assert_eq!(
+            result_with(false, &[VerifyStatus::NotFound]).failure_cause(),
+            Some(ApplyFailureCause::Unclassified)
+        );
+        assert_eq!(
+            result_with(false, &[VerifyStatus::Ready]).failure_cause(),
+            Some(ApplyFailureCause::Unclassified)
+        );
+        let mut set = result_with(false, &[VerifyStatus::HashMismatch]);
+        set.cause = Some(ApplyFailureCause::WriteFailed);
+        assert_eq!(set.failure_cause(), Some(ApplyFailureCause::WriteFailed));
+    }
+
+    /// A store copy that fails fails its package under the copy's cause.
+    #[test]
+    fn a_failed_store_copy_gives_its_package_its_cause() {
+        use crate::patch::store_copies::CopyFold;
+        let mut primary = result_with(true, &[VerifyStatus::Ready]);
+        let mut copy = result_with(false, &[VerifyStatus::Ready]);
+        copy.cause = Some(ApplyFailureCause::BlobCorrupt);
+        primary.mark_failed(&copy);
+        assert!(!primary.success);
+        assert_eq!(
+            primary.failure_cause(),
+            Some(ApplyFailureCause::BlobCorrupt)
+        );
+        // A second failed copy does not replace the first one's cause.
+        let mut other = result_with(false, &[VerifyStatus::HashMismatch]);
+        other.cause = None;
+        primary.mark_failed(&other);
+        assert_eq!(
+            primary.failure_cause(),
+            Some(ApplyFailureCause::BlobCorrupt)
+        );
+    }
+
+    /// Every cause has its own code.
+    #[test]
+    fn failure_cause_codes_are_distinct() {
+        let all = [
+            ApplyFailureCause::HashMismatch,
+            ApplyFailureCause::FileNotFound,
+            ApplyFailureCause::UnsafePath,
+            ApplyFailureCause::SharedStore,
+            ApplyFailureCause::CondaBuild,
+            ApplyFailureCause::BlobMissing,
+            ApplyFailureCause::BlobCorrupt,
+            ApplyFailureCause::WriteFailed,
+            ApplyFailureCause::SidecarFailed,
+            ApplyFailureCause::NoMatchingVariant,
+            ApplyFailureCause::Coded("gradle_copy_unexpected_bytes"),
+            ApplyFailureCause::Unclassified,
+        ];
+        let codes: std::collections::HashSet<&str> = all.iter().map(|c| c.as_str()).collect();
+        assert_eq!(codes.len(), all.len());
+    }
 
     #[test]
     fn test_normalize_file_path_with_prefix() {
@@ -4618,6 +4821,7 @@ mod tests {
             applied_via: HashMap::new(),
             error: None,
             sidecar: None,
+            cause: None,
         };
 
         let mut primary = clean();
