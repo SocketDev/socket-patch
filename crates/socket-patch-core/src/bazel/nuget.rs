@@ -1769,7 +1769,8 @@ pub(crate) mod tests {
     /// that has to do with the ruleset, and a file that is there and was
     /// not read as a whole declines it in any workspace: that file may be
     /// the one that names the ruleset. A doubt in a workspace of other
-    /// rulesets whose files were all read is about no hub.
+    /// rulesets whose files were all read is about no hub, and a
+    /// `WORKSPACE` file is never one of those files.
     #[test]
     fn a_tag_that_may_be_hidden_declines_where_none_is_found() {
         let lock = ["packages.lock.json".to_string()];
@@ -1811,7 +1812,29 @@ pub(crate) mod tests {
                     includes it";
         assert_eq!(gated(&files), declined(says));
         let says = "MODULE.bazel: it cannot be read: it is not UTF-8";
-        assert_eq!(gated(&[(FILE, binary)]), declined(says));
+        assert_eq!(gated(&[(FILE, binary.clone())]), declined(says));
+        // A `WORKSPACE` file hides no tag: rules_csharp has no form for
+        // that file, and what the reader makes of it is kept apart from
+        // its doubts. One that cannot be read, and one that defines
+        // something, decline nothing where no tag is found and change
+        // nothing beside a tag, whether the Bazel the checkout names reads
+        // such a file (7.7.2) or not (9.3.2).
+        let bare = [(FILE, text(&module("")))];
+        let wired = [
+            (FILE, text(&module(WIRED))),
+            ("MODULE.bazel.lock", text(SELECTED)),
+            ("nuget.config", text(CONFIG)),
+        ];
+        for release in ["9.3.2\n", "7.7.2\n"] {
+            for legacy in [binary.clone(), text("nuget_repo(name = \"nuget\")\n")] {
+                let beside = [("WORKSPACE", legacy), (".bazelversion", text(release))];
+                let read = gated(&[&bare[..], &beside].concat());
+                assert_eq!(read, Vendored::Plain, "{release}");
+                let read = gated(&[&wired[..], &beside].concat());
+                let block = Vendored::Block(feeds(None, &[NUGET_ORG]));
+                assert_eq!(read, block, "{release}");
+            }
+        }
     }
 
     #[test]
