@@ -89,10 +89,11 @@ pub(super) fn rewrite(
 }
 
 /// Whether `value` is a Socket-issued hosted reference for `dep`: the shared
-/// recognizer ([`replaceable_hosted_pin`]) accepts it on the grant's own
-/// origin (patch.socket.dev, or a `--patch-server-url` host, path prefix
-/// included), and it names this package and version. Such an entry is ours
-/// to rotate; anything else is a user's or a fork's source.
+/// recognizer ([`replaceable_hosted_pin`]) accepts it on Socket's patch
+/// server, or on the grant's own origin under the base the grant is served
+/// from (a path-prefixed `--patch-server-url` deployment's prefix, a patch
+/// mirror's base), and it names this package and version. Such an entry is
+/// ours to rotate; anything else is a user's or a fork's source.
 fn owned_url(value: &str, dep: &DepOverride) -> bool {
     replaceable_hosted_pin(value, &dep.artifact_url, &dep.name, &dep.version)
 }

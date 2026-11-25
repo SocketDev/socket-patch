@@ -1161,7 +1161,19 @@ mod tests {
                     rewrite(&user, "six", "1.16.0", ArtifactSource::Url(&mirrored_b)).is_err(),
                     "{own} must stay a user source"
                 );
+                // The uv.lock / pylock.toml direct-URL takeover asks the same
+                // question.
+                assert!(
+                    !same_hosted_artifact(&own, &mirrored_b, "six", "1.16.0"),
+                    "{own}"
+                );
             }
+        }
+        for ours in [mirrored_a.as_str(), OWN_A] {
+            assert!(
+                same_hosted_artifact(ours, &mirrored_b, "six", "1.16.0"),
+                "{ours}"
+            );
         }
     }
 
