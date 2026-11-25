@@ -1025,7 +1025,10 @@ async fn engine(
         )
         .await;
         lock.narrow(&mut state.offers);
-        let asked: BTreeSet<String> = lock.reference_uuids(&state.offers).into_iter().collect();
+        let asked: BTreeSet<String> = lock
+            .reference_uuids(&state.offers, &recorded)
+            .into_iter()
+            .collect();
         let mut gem_builds = HashMap::new();
         if !asked.is_empty() {
             let (found, failed) = discover::fetch_references(&provider, &asked).await;

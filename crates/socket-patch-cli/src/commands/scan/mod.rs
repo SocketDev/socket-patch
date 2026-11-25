@@ -603,7 +603,7 @@ async fn discover_selected(
         let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(scope.cwd);
         let lock = GemLock::read(&view, offers.unfiltered.keys().map(String::as_str)).await;
         lock.narrow(&mut offers);
-        let uuids = lock.reference_uuids(&offers);
+        let uuids = lock.reference_uuids(&offers, scope.recorded);
         if !uuids.is_empty() {
             // The fix of such a gem is settled here, once, and the writers
             // follow it. A failed lookup settles nothing, and a selection

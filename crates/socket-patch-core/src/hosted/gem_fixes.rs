@@ -299,19 +299,32 @@ impl GemLock {
     }
 
     /// The uuids whose package references [`Self::choose`] reads (module
-    /// docs, step 2): every patch a run may take for a build the lock
-    /// names, of each gem it names as platform builds. Sorted. Empty for a
-    /// project with no such gem, which then costs no request.
-    pub fn reference_uuids(&self, offers: &Offers) -> Vec<String> {
+    /// docs, step 2), of each gem the lock names as platform builds: every
+    /// patch a run may take for a build the lock names, and what the
+    /// project records for the gem (`recorded`). The recorded patch says
+    /// which fix the project is on, also when it is no longer among the
+    /// offers (its platform left the lock, or a filter refuses it now);
+    /// for a gem with something recorded, every offer of a locked build is
+    /// asked about, refused ones too, since a recorded fix is kept whole.
+    /// Sorted. Empty for a project with no such gem, which then costs no
+    /// request.
+    pub fn reference_uuids(&self, offers: &Offers, recorded: &RecordedIndex) -> Vec<String> {
         let mut uuids: Vec<String> = Vec::new();
         for (gem, purls) in self.platform_locked(offers) {
             let locked = &self.gems[&gem];
+            let base = crate::utils::purl::build_gem_purl(&gem.0, &gem.1);
+            let pinned = recorded.uuids(&base);
             for (platform, purl) in purls {
                 if !locked.names(platform.as_deref()) {
                     continue;
                 }
                 uuids.extend(Self::admitted(offers, purl).iter().map(|o| o.uuid.clone()));
+                if !pinned.is_empty() {
+                    let every = offers.unfiltered.get(purl).into_iter().flatten();
+                    uuids.extend(every.map(|offer| offer.uuid.clone()));
+                }
             }
+            uuids.extend(pinned.iter().cloned());
         }
         uuids.sort();
         uuids.dedup();
@@ -388,8 +401,16 @@ impl GemLock {
             // of a locked build, some ledger or lockfile pin records.
             let base = crate::utils::purl::build_gem_purl(&gem.0, &gem.1);
             let pinned = recorded.uuids(&base);
+            // What the project records is one uuid for every build (the
+            // registry in its lock, the directory it is vendored under): a
+            // patch of one fix, read from that patch's own reference, so
+            // it is known also when the patch is no longer on offer.
+            let recorded_fix: Option<String> = pinned
+                .first()
+                .map(|uuid| family_of(uuid, references).to_string());
             let on = complete.iter().copied().find(|family| {
-                pinned.iter().any(|uuid| uuid == family)
+                recorded_fix.as_deref() == Some(*family)
+                    || pinned.iter().any(|uuid| uuid == family)
                     || builds.iter().any(|(_, patches)| {
                         patches
                             .iter()
@@ -422,20 +443,45 @@ impl GemLock {
                 (None, Some(first)) => Some(first),
                 (None, None) => Some(complete[0]),
             };
-            // What the project records for the gem is one uuid for every
-            // build (the registry in its lock, the directory it is
-            // vendored under): a patch of one fix. A build's row is
-            // already in place when what the run takes for it is of that
-            // fix, and a move to another fix otherwise, whether or not a
-            // fix was settled above.
-            let recorded_fix: Option<String> = pinned
-                .first()
-                .map(|uuid| family_of(uuid, references).to_string());
+            // A recorded package keeps its patch where no filter admits
+            // another: the fix the project is on is kept whole, its
+            // patches of the locked builds with it, also the ones a filter
+            // refuses now (a raised severity floor). Left to the ranking,
+            // the one recorded patch would be kept alone and the gem
+            // judged as a fix with no patch for its builds.
+            let kept: Vec<(&str, &PatchSearchResult)> = match (&fix, recorded_fix.as_deref()) {
+                (None, Some(recorded_fix)) => {
+                    let of_fix = |purl: &str| {
+                        let offered = offers.unfiltered.get(purl).into_iter().flatten();
+                        offered.into_iter().find(|offer| {
+                            usable(&offer.uuid, references)
+                                && family_of(&offer.uuid, references) == recorded_fix
+                        })
+                    };
+                    let found: Vec<(&str, &PatchSearchResult)> = builds
+                        .iter()
+                        .filter_map(|(purl, _)| Some((*purl, of_fix(purl)?)))
+                        .collect();
+                    match found.len() == builds.len() && covered.len() == named {
+                        true => found,
+                        false => Vec::new(),
+                    }
+                }
+                _ => Vec::new(),
+            };
+            // A build's row is already in place when what the run takes
+            // for it is of the recorded fix, and a move to another fix
+            // otherwise, whether or not a fix was settled above.
             for (purl, patches) in &builds {
-                let member = fix.and_then(|fix| {
-                    let member = patches.iter().find(|(_, family)| *family == fix)?;
-                    Some(member.0)
-                });
+                let member = fix
+                    .and_then(|fix| {
+                        let member = patches.iter().find(|(_, family)| *family == fix)?;
+                        Some(member.0)
+                    })
+                    .or_else(|| {
+                        let kept = kept.iter().find(|(kept, _)| kept == purl)?;
+                        Some(kept.1)
+                    });
                 if let Some(member) = member {
                     chosen.push((purl.to_string(), member.clone()));
                 }
@@ -462,10 +508,19 @@ impl GemLock {
             // fix is then no newer patch for the project.
             if !locked.ruby {
                 for (_, purl) in purls.iter().filter(|(platform, _)| platform.is_none()) {
-                    let source = fix.and_then(|fix| {
-                        let mut admitted = Self::admitted(offers, purl).into_iter();
-                        admitted.find(|offer| offer.uuid == fix)
-                    });
+                    let source = match (fix, kept.is_empty()) {
+                        (Some(fix), _) => {
+                            let mut admitted = Self::admitted(offers, purl).into_iter();
+                            admitted.find(|offer| offer.uuid == fix)
+                        }
+                        // The kept fix's source patch, refused or not.
+                        (None, false) => {
+                            let mut offered = offers.unfiltered.get(*purl).into_iter().flatten();
+                            offered
+                                .find(|offer| Some(offer.uuid.as_str()) == recorded_fix.as_deref())
+                        }
+                        (None, true) => None,
+                    };
                     if let Some(source) = source {
                         chosen.push((purl.to_string(), source.clone()));
                     }
@@ -587,7 +642,7 @@ pub async fn settle(
         .map(|patch| (patch.purl.clone(), patch.clone()))
         .collect();
     lock.narrow(&mut offers);
-    let uuids = lock.reference_uuids(&offers);
+    let uuids = lock.reference_uuids(&offers, &RecordedIndex::default());
     let mut unsettled = None;
     if !uuids.is_empty() {
         match api_client.fetch_registry_references(&uuids).await {
@@ -742,7 +797,9 @@ mod tests {
         refuse(&mut offers, &fix_a());
         let lock = lock_of(&PLATFORM_ONLY, &offers).await;
         lock.narrow(&mut offers);
-        assert!(lock.reference_uuids(&offers).is_empty());
+        assert!(lock
+            .reference_uuids(&offers, &RecordedIndex::default())
+            .is_empty());
         let classes = lock.choose(&mut offers, &both_fixes(), &RecordedIndex::default());
         assert!(offers.selected.is_empty(), "{:?}", uuids_of(&offers));
         assert!(classes.is_empty());
@@ -757,7 +814,10 @@ mod tests {
         refuse(&mut offers, &fix_a());
         let lock = lock_of(&PLATFORM_ONLY, &offers).await;
         lock.narrow(&mut offers);
-        assert_eq!(lock.reference_uuids(&offers), [B_LINUX, B_DARWIN]);
+        assert_eq!(
+            lock.reference_uuids(&offers, &RecordedIndex::default()),
+            [B_LINUX, B_DARWIN]
+        );
         lock.choose(&mut offers, &both_fixes(), &RecordedIndex::default());
         let mut taken = uuids_of(&offers);
         taken.sort_unstable();
@@ -774,6 +834,94 @@ mod tests {
         let mut taken = uuids_of(&offers);
         taken.sort_unstable();
         assert_eq!(taken, [SRC_B, B_LINUX, B_DARWIN]);
+    }
+
+    /// The fix the project is on is read from the recorded patch itself,
+    /// so it is known when that patch is no longer on offer. The lock took
+    /// the gem from the registry of fix A's darwin patch; darwin has left
+    /// the lock since, and a tying fix B ranks first for what is left. The
+    /// recorded patch is asked about with the offers, the project stays on
+    /// fix A, and the build's row is in place.
+    #[tokio::test]
+    async fn the_recorded_fix_is_known_when_its_patch_is_no_longer_offered() {
+        // Fix B ties with fix A and leads on the paid tier, which ranks a
+        // patch first and never makes it a newer one.
+        let tying_b = [
+            patch(SRC_B, RUBY, "2026-01-01T00:00:00Z", &["GHSA-a"]),
+            patch(B_LINUX, LINUX, "2026-01-02T00:00:00Z", &["GHSA-a"]),
+        ]
+        .map(|mut patch| {
+            patch.tier = "paid".to_string();
+            patch
+        });
+        let all: Vec<PatchSearchResult> = fix_a().into_iter().chain(tying_b).collect();
+        let mut offers = offers_from_results(&all, true);
+        let lock = lock_of(&["nokogiri (1.19.3-x86_64-linux-gnu)"], &offers).await;
+        lock.narrow(&mut offers);
+        assert!(
+            !offers.unfiltered.contains_key(DARWIN),
+            "darwin left the lock"
+        );
+        assert_eq!(
+            offers.selected[LINUX].uuid, B_LINUX,
+            "premise: B ranks first"
+        );
+        let on_darwin = RecordedIndex::new(
+            None,
+            &[("pkg:gem/nokogiri@1.19.3".to_string(), A_DARWIN.to_string())],
+        );
+        let asked = lock.reference_uuids(&offers, &on_darwin);
+        assert!(asked.contains(&A_DARWIN.to_string()), "{asked:?}");
+        let classes = lock.choose(&mut offers, &both_fixes(), &on_darwin);
+        assert_eq!(
+            offers.selected[LINUX].uuid, A_LINUX,
+            "the project stays on fix A"
+        );
+        assert_eq!(offers.selected[RUBY].uuid, SRC_A);
+        assert_eq!(classes.get(LINUX), Some(&Recorded::Same));
+        assert_eq!(classes.get(RUBY), Some(&Recorded::Same));
+    }
+
+    /// A recorded package keeps its patch where no filter admits another:
+    /// the fix a gem is on is kept whole. With the severity floor raised
+    /// above it, the policy keeps the one recorded patch selected and
+    /// refuses the patches of the builds; left alone, that one patch would
+    /// be judged as a fix with no patch for the locked builds on every
+    /// scan. The builds' patches of the recorded fix stay with it.
+    #[tokio::test]
+    async fn a_recorded_fix_is_kept_whole_under_a_raised_floor() {
+        let mut offers = offers_from_results(&fix_a(), true);
+        for patch in fix_a() {
+            offers.refused.insert((patch.purl, patch.uuid));
+        }
+        // What the policy leaves: the recorded patch, by itself.
+        offers.selected.retain(|purl, _| purl == RUBY);
+        let lock = lock_of(&PLATFORM_ONLY, &offers).await;
+        lock.narrow(&mut offers);
+        let on_a = RecordedIndex::new(
+            None,
+            &[("pkg:gem/nokogiri@1.19.3".to_string(), SRC_A.to_string())],
+        );
+        let asked = lock.reference_uuids(&offers, &on_a);
+        assert!(
+            asked.contains(&A_LINUX.to_string()) && asked.contains(&A_DARWIN.to_string()),
+            "{asked:?}"
+        );
+        let classes = lock.choose(&mut offers, &both_fixes(), &on_a);
+        let mut taken = uuids_of(&offers);
+        taken.sort_unstable();
+        assert_eq!(taken, [SRC_A, A_LINUX, A_DARWIN]);
+        assert!(classes.values().all(|class| *class == Recorded::Same));
+        assert_eq!(classes.len(), 3);
+
+        // Nothing recorded: the filter holds, and the gem stays out.
+        let mut offers = offers_from_results(&fix_a(), true);
+        for patch in fix_a() {
+            offers.refused.insert((patch.purl, patch.uuid));
+        }
+        offers.selected.clear();
+        lock.choose(&mut offers, &both_fixes(), &RecordedIndex::default());
+        assert!(offers.selected.is_empty());
     }
 
     /// A run that cannot read which fix the patches belong to settles
@@ -877,7 +1025,11 @@ mod tests {
             true,
         );
         let lock = lock_of(&["nokogiri (1.19.3)"], &offers).await;
-        assert!(lock.reference_uuids(&offers).is_empty(), "no request");
+        assert!(
+            lock.reference_uuids(&offers, &RecordedIndex::default())
+                .is_empty(),
+            "no request"
+        );
         lock.narrow(&mut offers);
         let kept: Vec<&str> = offers.selected.keys().map(String::as_str).collect();
         assert_eq!(kept, [RUBY]);
@@ -912,7 +1064,7 @@ mod tests {
         let lock = lock_of(&PLATFORM_ONLY, &offers).await;
         lock.narrow(&mut offers);
         assert_eq!(
-            lock.reference_uuids(&offers),
+            lock.reference_uuids(&offers, &RecordedIndex::default()),
             [A_LINUX, A_DARWIN, B_LINUX, B_DARWIN],
             "the ruby gem is not locked: its patches' references are not needed"
         );
@@ -1104,7 +1256,10 @@ mod tests {
             &offers,
         )
         .await;
-        assert_eq!(lock.reference_uuids(&offers), [SRC_A, A_LINUX, SRC_B]);
+        assert_eq!(
+            lock.reference_uuids(&offers, &RecordedIndex::default()),
+            [SRC_A, A_LINUX, SRC_B]
+        );
         let references = granted(&[(SRC_A, None), (SRC_B, None), (A_LINUX, Some(SRC_A))]);
         assert_eq!(offers.selected[RUBY].uuid, SRC_B, "the newer ruby patch");
         lock.choose(&mut offers, &references, &RecordedIndex::default());
