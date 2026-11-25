@@ -4249,7 +4249,8 @@ scan cannot move every locked build together:
   a registry that has no gem for it;
 - the locked builds are patched by different fixes and no one fix covers them all. Bundler takes
   a gem from one source;
-- the patch registry does not serve what the lock would pin, or could not be read.
+- the patch registry does not serve what the lock would pin, could not be read, or was not read
+  by the run. A gem is never pinned to a registry the run did not look at.
 
 The warning names the builds the lock holds and which of these is the case. Remove the platform
 from the lock if the project does not need it (`bundle lock --remove-platform <platform>`) and
