@@ -15,7 +15,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256, hermetic};
+use common::{binary, git_sha256_file, hermetic};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -41,11 +41,6 @@ fn has_python3() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-fn git_sha256_file(path: &Path) -> String {
-    let content = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    git_sha256(&content)
 }
 
 /// Run the CLI binary with the given args, setting `cwd` as the working dir.

@@ -9,11 +9,6 @@
 //! The apply-flow test runs against a wiremock API (same fixture shape
 //! as `scan_sync_e2e.rs`) so the full human-mode scan→select→download→
 //! apply pipeline is exercised without the network.
-//!
-//! Stderr assertions ignore the "No SOCKET_API_TOKEN set" client
-//! warning: it's printed unconditionally by
-//! `get_api_client_with_overrides` in core for every command and is
-//! out of scope for `scan`'s `--silent` gating.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -61,21 +56,6 @@ fn run_scan(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
     )
-}
-
-/// Non-error stderr lines: drop the unconditional core API-token warning
-/// (both its lead line and its "Got: ... Continuing anyway" continuation)
-/// and blank lines, keep everything else.
-fn stderr_chatter(stderr: &str) -> Vec<String> {
-    stderr
-        .lines()
-        .filter(|l| {
-            !l.contains("SOCKET_API_TOKEN")
-                && !l.contains("Continuing anyway")
-                && !l.trim().is_empty()
-        })
-        .map(|l| l.to_string())
-        .collect()
 }
 
 /// Mount the three endpoints the human-mode apply flow hits: batch
@@ -171,10 +151,9 @@ fn scan_silent_no_packages_produces_no_output() {
         stdout.trim().is_empty(),
         "--silent must produce no stdout; got {stdout:?}"
     );
-    let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter.is_empty(),
-        "--silent must produce no stderr chatter on success; got {chatter:?}"
+        stderr.is_empty(),
+        "--silent must produce no stderr chatter on success; got {stderr:?}"
     );
 
     // Control run: the same scenario WITHOUT --silent must print the
@@ -228,10 +207,9 @@ async fn scan_silent_apply_flow_produces_no_output_but_still_applies() {
         stdout.trim().is_empty(),
         "--silent must produce no stdout; got {stdout:?}"
     );
-    let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter.is_empty(),
-        "--silent must produce no stderr chatter on success; got {chatter:?}"
+        stderr.is_empty(),
+        "--silent must produce no stderr chatter on success; got {stderr:?}"
     );
 
     // Silent suppresses output, not the mutation: the patch must have
@@ -392,10 +370,9 @@ async fn scan_vendor_silent_gc_prints_nothing() {
         "--silent must produce no stdout (regression: the vendor path's \
          GC line printed unconditionally); got {stdout:?}"
     );
-    let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter.is_empty(),
-        "--silent must produce no stderr chatter on success; got {chatter:?}"
+        stderr.is_empty(),
+        "--silent must produce no stderr chatter on success; got {stderr:?}"
     );
 
     // Silent suppresses output, not the work: the prune and the vendoring

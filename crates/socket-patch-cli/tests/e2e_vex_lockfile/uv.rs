@@ -39,6 +39,7 @@
 //! Plus the embedded entry points (`scan --mode hosted --vex`, `scan --mode vendored
 //! --vex`, `apply --vex`).
 
+use crate::common::sha256_hex;
 use crate::vex_e2e_common;
 
 use std::collections::HashMap;
@@ -78,10 +79,6 @@ const PATCHED: &[u8] = b"# vexfixture pristine\nSOCKET_PATCHED = 1\n";
 const ORG: &str = "test-org";
 /// The PEP 723 script a script lock belongs to.
 const SCRIPT: &str = "tool.py";
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
 
 fn base_purl(version: &str) -> String {
     format!("pkg:pypi/{PKG}@{version}")

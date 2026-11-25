@@ -42,8 +42,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::git_sha256;
-use common::hermetic;
+use common::{cache_env, git_sha256, has_command, hermetic};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -52,8 +51,6 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -108,17 +105,6 @@ fn has_corepack_pm(pm: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-fn has_command(cmd: &str) -> bool {
-    let mut probe = Command::new(cmd);
-    probe.arg("--version");
-    cache_env::isolate(&mut probe);
-    probe
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok()
 }
 
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {

@@ -20,7 +20,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256, hermetic};
+use common::{binary, git_sha256, git_sha256_file, has_command, hermetic};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -43,22 +43,6 @@ const GEM_PURL: &str = "pkg:gem/activestorage@5.2.0?platform=ruby";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn has_command(cmd: &str) -> bool {
-    let mut probe = Command::new(cmd);
-    probe.arg("--version");
-    cache_env::isolate(&mut probe);
-    probe
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
-}
-
-fn git_sha256_file(path: &Path) -> String {
-    let content = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    git_sha256(&content)
-}
 
 /// Run the binary with the hermetic `SOCKET_*` environment (no token, so the
 /// scans take the public-proxy path `--proxy-url` pins). The gem crawler

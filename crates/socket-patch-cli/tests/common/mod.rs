@@ -13,7 +13,6 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -155,13 +154,8 @@ pub fn sha256_hex(content: &[u8]) -> String {
 
 // ── Toolchain runners ─────────────────────────────────────────────────
 
-/// Run `npm` in `cwd`, panic on non-zero exit with full output.
-pub fn npm_run(cwd: &Path, args: &[&str]) {
-    run_toolchain(cwd, "npm", args, &[]);
-}
-
-/// Run `pnpm` in `cwd`. Same shape as `npm_run`; `extra_env` lets
-/// the caller force store-dir overrides etc.
+/// Run `pnpm` in `cwd`, panicking on a non-zero exit with full output;
+/// `extra_env` lets the caller force store-dir overrides etc.
 pub fn pnpm_run(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) {
     run_toolchain(cwd, "pnpm", args, extra_env);
 }
@@ -425,13 +419,4 @@ pub fn write_blob(socket_dir: &Path, hash: &str, content: &[u8]) {
     let blobs = socket_dir.join("blobs");
     std::fs::create_dir_all(&blobs).expect("create .socket/blobs");
     std::fs::write(blobs.join(hash), content).expect("write blob");
-}
-
-/// Map a slice of `(env-var-name, env-var-value)` tuples into a
-/// HashMap for callers that want a stable container.
-pub fn env_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-        .collect()
 }

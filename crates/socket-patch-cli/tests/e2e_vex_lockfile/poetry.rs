@@ -38,6 +38,7 @@
 //!      installed pristine → `not_applied`; a pin-less entry needs an
 //!      installed tree.
 
+use crate::common::sha256_hex;
 use crate::vex_e2e_common;
 
 use std::collections::HashMap;
@@ -85,10 +86,6 @@ fn purl() -> String {
 /// The artifact-qualified purl the patch API files pypi patches under.
 fn api_purl() -> String {
     format!("pkg:pypi/{PKG}@{VER}?artifact_id=py2-py3-none-any-whl")
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
 }
 
 // ── the committed Poetry locks ──────────────────────────────────────────
