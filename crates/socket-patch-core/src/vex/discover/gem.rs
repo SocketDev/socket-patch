@@ -572,21 +572,24 @@ pub(crate) fn gemfile_source_block_pins(gemfile: &str, uuid: &str, gem_name: Opt
 }
 
 /// Whether hosted `remote` is the patch's compact-index root:
-/// `…/patch-registry/gem/<token>/<uuid>[/]`, `uuid` the LAST path level,
-/// no query or fragment.
+/// `…/patch-registry/gem/<token>/<uuid>[/]`, `uuid` the LAST path level
+/// but for a snapshot level (`…/<uuid>/s/<n>[/]`), no query or fragment.
 fn is_patch_registry_index(remote: &str, uuid: &str) -> bool {
     patch_registry_uuid(remote).is_some_and(|u| u == uuid)
 }
 
 /// The patch uuid of a compact-index root
 /// `…/patch-registry/gem/<token>/<uuid>[/]` (no query or fragment): its
-/// last path level.
+/// last path level, or the one before a snapshot level
+/// (`…/<uuid>/s/<n>[/]`: the registry as it stood when the patch service
+/// made the reference).
 fn patch_registry_uuid(remote: &str) -> Option<String> {
     let url = reqwest::Url::parse(remote).ok()?;
     if url.query().is_some() || url.fragment().is_some() {
         return None;
     }
-    let segments: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
+    let (root, _) = crate::patch::redirect::split_gem_snapshot(url.path());
+    let segments: Vec<&str> = root.split('/').filter(|s| !s.is_empty()).collect();
     match segments.as_slice() {
         [.., "patch-registry", "gem", token, last] if !token.is_empty() => Some(last.to_string()),
         _ => None,
@@ -1207,6 +1210,37 @@ mod tests {
         let out = run(&p).await;
         assert!(out.refs.is_empty(), "{:#?}", out.refs);
         assert!(out.unlocked_pins.is_empty(), "{:#?}", out.unlocked_pins);
+    }
+
+    /// A registry URL may end in a snapshot level (`…/<uuid>/s/<n>`): the
+    /// patch is still the one its uuid level names. Anything else after
+    /// the uuid is no registry root.
+    #[test]
+    fn a_registry_url_with_a_snapshot_names_the_same_patch() {
+        let root = index(UUID_A);
+        for url in [
+            root.clone(),
+            root.trim_end_matches('/').to_string(),
+            format!("{root}s/3"),
+            format!("{root}s/3/"),
+            format!("{root}s/41/"),
+        ] {
+            assert_eq!(
+                super::patch_registry_uuid(&url).as_deref(),
+                Some(UUID_A),
+                "{url}"
+            );
+            assert!(super::is_patch_registry_index(&url, UUID_A), "{url}");
+        }
+        for url in [
+            format!("{root}s/"),
+            format!("{root}s/03/"),
+            format!("{root}s/3/info/rails"),
+            format!("{root}gems/rails-7.0.0.gem"),
+            format!("{root}s/3?x=1"),
+        ] {
+            assert!(!super::is_patch_registry_index(&url, UUID_A), "{url}");
+        }
     }
 
     /// Only the shape the rewriter writes, in the manifest bundler loads.

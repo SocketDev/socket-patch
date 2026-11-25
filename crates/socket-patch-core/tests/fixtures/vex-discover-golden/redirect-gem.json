@@ -62,7 +62,7 @@
         "artifact_rel": null,
         "locked_integrity": "Sha256Hex(\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\")",
         "integrity_required": true,
-        "url": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/",
+        "url": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/s/4/",
         "lockfile_basis_ok": true
       }
     ],
@@ -107,7 +107,7 @@
         "artifact_rel": null,
         "locked_integrity": "Sha256Hex(\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\")",
         "integrity_required": true,
-        "url": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/",
+        "url": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/s/4/",
         "lockfile_basis_ok": true
       }
     ],

@@ -609,14 +609,20 @@ async fn gem_edge_shapes_round_trip() {
     }
 }
 
-/// [`gem_override`] with a prebuild for each of `platforms`: the patch
-/// registry serves a patched platform gem for it too.
+/// [`gem_override`] with a patched build for each of `platforms`: the
+/// patch registry lists a patched platform gem for it, with a patch of its
+/// own.
 fn gem_override_prebuilt(name: &str, version: &str, platforms: &[&str]) -> serde_json::Value {
     let mut overrides = gem_override(name, version);
-    overrides[0]["registryOverride"]["identifiers"]["gemPlatforms"] = platforms
+    overrides[0]["registryOverride"]["identifiers"]["gemBuilds"] = platforms
         .iter()
-        .map(|platform| {
-            serde_json::json!({"platform": platform, "gemChecksumSha256": "ab".repeat(32)})
+        .enumerate()
+        .map(|(at, platform)| {
+            serde_json::json!({
+                "platform": platform,
+                "gemChecksumSha256": "ab".repeat(32),
+                "patchUuid": format!("77777777-7777-4777-8777-00000000000{at}"),
+            })
         })
         .collect();
     overrides

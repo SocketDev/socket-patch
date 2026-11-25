@@ -135,6 +135,100 @@ pub fn unconfirmed_candidates(
         .collect()
 }
 
+/// Skip reason of a gem the Bundler lock names as precompiled platform
+/// builds, left on its upstream registry because the patch registry has no
+/// patched build yet for any platform the lock names: moving it would gain
+/// nothing. Not a warning. The gem moves on a later run, once the patch
+/// service lists a patched build for one of those platforms.
+pub const GEM_NO_PATCHED_BUILD: &str = "redirect_gem_no_patched_build";
+
+/// Code of the uncounted event of one locked platform build of a hosted
+/// gem that the patch registry serves as upstream's own gem (no patched
+/// build yet): that platform installs what it installed before, and is
+/// neither counted nor attested as patched.
+pub const GEM_UPSTREAM_BUILD_KEPT: &str = "gem_upstream_build_kept";
+
+/// The skips of the gems a rewrite left on their upstream registry because
+/// no locked build of them is patched yet
+/// ([`RewriteResult::gem_unpatched`]), one per candidate, in candidate
+/// order: a host adds them to its skips, so the gem is reported under
+/// [`GEM_NO_PATCHED_BUILD`] and not as a patch nothing pins.
+pub fn gem_unpatched_skips(candidates: &[Candidate], rewrite: &RewriteResult) -> Vec<SkippedPatch> {
+    candidates
+        .iter()
+        .filter_map(|c| {
+            let platforms = rewrite.gem_unpatched.get(&c.dep.patch_uuid)?;
+            let detail = format!(
+                "{} {}: no patched build yet for {}; left on its upstream registry",
+                c.dep.name,
+                c.dep.version,
+                platforms.join(", ")
+            );
+            Some(SkippedPatch {
+                detail: Some(detail),
+                ..SkippedPatch::new(&c.purl, &c.dep.patch_uuid, GEM_NO_PATCHED_BUILD)
+            })
+        })
+        .collect()
+}
+
+/// One thing a hosted run reports for a confirmed pin: the pin itself, or,
+/// for a gem the lock names as platform builds, one per locked build
+/// ([`pin_reports`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinReport {
+    /// What is reported: the pin's purl, or
+    /// `pkg:gem/<name>@<version>?platform=<platform>` for a platform gem.
+    pub purl: String,
+    /// The patch in place for it. `None` for a platform gem the patch
+    /// registry serves as upstream's own (no patched build yet): it is
+    /// reported ([`GEM_UPSTREAM_BUILD_KEPT`]) and never counted or
+    /// attested as patched.
+    pub uuid: Option<String>,
+    /// For a build of a gem locked as platform builds: the gem patch's
+    /// uuid, the one pin all its builds go by.
+    pub gem_fix: Option<String>,
+    /// For such a build: its platform (`None` for the ruby-platform gem).
+    pub platform: Option<String>,
+    /// For such a build: whether this run put its patched build in place.
+    pub newly_patched: bool,
+}
+
+/// What a hosted run reports for its confirmed pins (`(purl, uuid)`): each
+/// pin once, except a gem the lock names as platform builds
+/// ([`RewriteResult::gem_builds`]), which is reported per locked build:
+/// each patched build under its own patch, each build that keeps
+/// upstream's gem with no patch. The pins stay what every other step works
+/// with (one per package); this is the one place they become per-build
+/// outcomes, for the disk host and the in-memory engine alike.
+pub fn pin_reports(confirmed: &[(String, String)], rewrite: &RewriteResult) -> Vec<PinReport> {
+    let mut reports = Vec::with_capacity(confirmed.len());
+    for (purl, uuid) in confirmed {
+        let Some(builds) = rewrite.gem_builds.get(uuid) else {
+            reports.push(PinReport {
+                purl: purl.clone(),
+                uuid: Some(uuid.clone()),
+                gem_fix: None,
+                platform: None,
+                newly_patched: false,
+            });
+            continue;
+        };
+        let base = crate::utils::purl::strip_purl_qualifiers(purl);
+        reports.extend(builds.iter().map(|build| PinReport {
+            purl: match &build.platform {
+                Some(platform) => format!("{base}?platform={platform}"),
+                None => purl.clone(),
+            },
+            uuid: build.patch_uuid.clone(),
+            gem_fix: Some(uuid.clone()),
+            platform: build.platform.clone(),
+            newly_patched: build.newly_patched,
+        }));
+    }
+    reports
+}
+
 /// A selected patch that was not redirected, and why (the `skipped[]`
 /// entries of the `redirect` block).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7201,7 +7295,7 @@ mod tests {
                         "identifiers": {
                             "name": "nokogiri", "version": "1.18.10",
                             "gemChecksumSha256": "a".repeat(64),
-                            "gemPlatforms": [
+                            "gemBuilds": [
                                 {"platform": "arm64-darwin", "gemChecksumSha256": "not-a-digest"}
                             ]
                         }
@@ -12940,14 +13034,17 @@ snapshots:
             .as_mut()
             .unwrap()
             .identifiers
-            .gem_platforms = ["arm64-darwin", "x86_64-linux-gnu"]
-            .iter()
-            .zip(["a", "b"])
-            .map(|(platform, digit)| GemPlatformChecksum {
-                platform: platform.to_string(),
-                gem_checksum_sha256: digit.repeat(64),
-            })
-            .collect();
+            .gem_builds = Some(
+            ["arm64-darwin", "x86_64-linux-gnu"]
+                .iter()
+                .zip(["a", "b"])
+                .map(|(platform, digit)| GemPlatformChecksum {
+                    platform: platform.to_string(),
+                    gem_checksum_sha256: digit.repeat(64),
+                    patch_uuid: Some(format!("77777777-7777-4777-8777-77777777777{digit}")),
+                })
+                .collect(),
+        );
         let lock = format!(
             "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0-arm64-darwin)\n    rails \
              (7.0.0-x86_64-linux-gnu)\n\nPLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\nDEPENDENCIES\n  \
@@ -12965,6 +13062,32 @@ snapshots:
             done.confirmed,
             [("pkg:gem/rails@7.0.0".to_string(), FIXTURE_UUID.to_string())]
         );
+        // The one pin is reported per locked build, each under its own
+        // patch, and both as newly patched.
+        let reported: Vec<(String, Option<String>, bool)> =
+            pin_reports(&done.confirmed, &done.rewrite)
+                .into_iter()
+                .map(|report| {
+                    assert_eq!(report.gem_fix.as_deref(), Some(FIXTURE_UUID));
+                    (report.purl, report.uuid, report.newly_patched)
+                })
+                .collect();
+        assert_eq!(
+            reported,
+            [
+                (
+                    "pkg:gem/rails@7.0.0?platform=arm64-darwin".to_string(),
+                    Some("77777777-7777-4777-8777-77777777777a".to_string()),
+                    true
+                ),
+                (
+                    "pkg:gem/rails@7.0.0?platform=x86_64-linux-gnu".to_string(),
+                    Some("77777777-7777-4777-8777-77777777777b".to_string()),
+                    true
+                ),
+            ]
+        );
+        assert!(gem_unpatched_skips(std::slice::from_ref(&candidate), &done.rewrite).is_empty());
         let written = &done.rewrite.files["Gemfile.lock"];
         assert!(
             written.contains(
@@ -12986,10 +13109,77 @@ snapshots:
         for (rel, text) in &done.rewrite.files {
             p.insert_text(rel, text.as_str());
         }
-        let (_, again) = gem_rewrite_of(&ProjectView::Memory(&p), vec![candidate]).await;
+        let (_, again) = gem_rewrite_of(&ProjectView::Memory(&p), vec![candidate.clone()]).await;
         assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.edits);
         assert_eq!(again.confirmed, done.confirmed);
         assert!(again.unattributed.is_empty(), "{:?}", again.unattributed);
+        let again_reports = pin_reports(&again.confirmed, &again.rewrite);
+        assert_eq!(again_reports.len(), 2);
+        assert!(again_reports.iter().all(|report| !report.newly_patched));
+
+        // A pin of any other package is reported as it is.
+        let npm = [("pkg:npm/a@1.0.0".to_string(), "u".to_string())];
+        let [plain] = pin_reports(&npm, &done.rewrite)
+            .try_into()
+            .expect("one report");
+        assert_eq!(
+            (plain.purl.as_str(), plain.uuid.as_deref()),
+            ("pkg:npm/a@1.0.0", Some("u"))
+        );
+        assert!(plain.gem_fix.is_none());
+
+        // A registry that serves upstream's gem for one platform: that
+        // build is reported with no patch. With none patched, the gem
+        // stays where it is, and is skipped under its own quiet code.
+        let listing = |patched: &[bool]| {
+            let mut candidate = candidate.clone();
+            let ids = &mut candidate
+                .dep
+                .registry_override
+                .as_mut()
+                .unwrap()
+                .identifiers;
+            for (build, patched) in ids.gem_builds.as_mut().unwrap().iter_mut().zip(patched) {
+                if !patched {
+                    build.patch_uuid = None;
+                }
+            }
+            candidate
+        };
+        let mut fresh = MemoryProject::new();
+        fresh.insert_text("Gemfile", GEMFILE);
+        fresh.insert_text("Gemfile.lock", lock.as_str());
+        let one = listing(&[true, false]);
+        let (_, mixed) = gem_rewrite_of(&ProjectView::Memory(&fresh), vec![one]).await;
+        assert_eq!(mixed.confirmed, done.confirmed);
+        let patched: Vec<bool> = pin_reports(&mixed.confirmed, &mixed.rewrite)
+            .iter()
+            .map(|report| report.uuid.is_some())
+            .collect();
+        assert_eq!(patched, [true, false]);
+        let none = listing(&[false, false]);
+        let (_, left) = gem_rewrite_of(&ProjectView::Memory(&fresh), vec![none.clone()]).await;
+        assert!(left.rewrite.files.is_empty() && left.confirmed.is_empty());
+        assert!(
+            left.rewrite.warnings.is_empty(),
+            "{:?}",
+            left.rewrite.warnings
+        );
+        let [skip] = gem_unpatched_skips(std::slice::from_ref(&none), &left.rewrite)
+            .try_into()
+            .expect("one skip");
+        assert_eq!(skip.reason, GEM_NO_PATCHED_BUILD);
+        assert_eq!(
+            skip.detail.as_deref(),
+            Some(
+                "rails 7.0.0: no patched build yet for arm64-darwin, x86_64-linux-gnu; left on \
+                 its upstream registry"
+            )
+        );
+        assert!(
+            unconfirmed_candidates(std::slice::from_ref(&none), &left.confirmed, &[skip])
+                .is_empty()
+        );
     }
 
     /// #390: `bundle config set --local gemfile Gemfile.next` makes bundler

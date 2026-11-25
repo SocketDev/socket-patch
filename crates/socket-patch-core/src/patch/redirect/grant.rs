@@ -267,11 +267,13 @@ fn check_registry_override(ov: &RegistryOverride, origins: &[String]) -> Result<
             return Err(bad(what, "64 hex digits"));
         }
     }
-    // A prebuild's platform and sha256 are spelled into `Gemfile.lock`
+    // A platform gem's platform and sha256 are spelled into `Gemfile.lock`
     // (`name (version-<platform>) sha256=<hex>`) and its platform into the
     // gem file name a refresh downloads. One entry per platform: two would
-    // leave which sha256 the lock pins to their order.
-    for (at, prebuild) in ids.gem_platforms.iter().enumerate() {
+    // leave which sha256 the lock pins to their order. The patch of a
+    // patched build is reported and attested by its uuid.
+    let gem_builds = ids.gem_builds.as_deref().unwrap_or_default();
+    for (at, prebuild) in gem_builds.iter().enumerate() {
         let platform = prebuild.platform.as_str();
         if !is_plain_gem_token(platform)
             || platform.len() > MAX_COORDINATE
@@ -283,11 +285,15 @@ fn check_registry_override(ov: &RegistryOverride, origins: &[String]) -> Result<
         if !is_hex(&prebuild.gem_checksum_sha256, 64) {
             return Err(bad("gem platform checksum", "64 hex digits"));
         }
-        if ids.gem_platforms[..at]
+        if gem_builds[..at]
             .iter()
             .any(|earlier| earlier.platform == platform)
         {
             return Err(bad("gem platform list", "one entry per platform"));
+        }
+        let patch = prebuild.patch_uuid.as_deref();
+        if patch.is_some_and(|uuid| !crate::patch::path_safety::is_canonical_uuid(uuid)) {
+            return Err(bad("gem platform patch", "a patch uuid"));
         }
     }
     for (what, digest) in [
@@ -633,15 +639,17 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .identifiers
-                .gem_platforms = list
-                .iter()
-                .map(
-                    |(platform, sha)| crate::patch::redirect::GemPlatformChecksum {
-                        platform: platform.to_string(),
-                        gem_checksum_sha256: sha.clone(),
-                    },
-                )
-                .collect();
+                .gem_builds = Some(
+                list.iter()
+                    .map(
+                        |(platform, sha)| crate::patch::redirect::GemPlatformChecksum {
+                            platform: platform.to_string(),
+                            gem_checksum_sha256: sha.clone(),
+                            patch_uuid: None,
+                        },
+                    )
+                    .collect(),
+            );
             match field {
                 None => assert_eq!(check(&dep, &[]), Ok(())),
                 Some(field) => {

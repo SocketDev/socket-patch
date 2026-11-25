@@ -5,7 +5,7 @@
     "action": "added",
     "key": "nokogiri",
     "original": "gem \"nokogiri\", \"1.18.10\"",
-    "new": "gem \"nokogiri\", \"1.18.10\", source: \"https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/\""
+    "new": "gem \"nokogiri\", \"1.18.10\", source: \"https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/s/4/\""
   },
   {
     "path": "Gemfile.lock",
@@ -37,6 +37,6 @@
     "action": "rewritten",
     "key": "nokogiri",
     "original": "https://rubygems.org/",
-    "new": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/"
+    "new": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/s/4/"
   }
 ]

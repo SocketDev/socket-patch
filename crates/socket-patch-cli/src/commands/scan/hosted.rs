@@ -1032,7 +1032,7 @@ async fn refresh_stale_gems(
             .iter()
             .filter(|o| o.ecosystem == "gem" && o.name == name && o.version == version)
             .filter_map(|o| o.registry_override.as_ref())
-            .flat_map(|ro| &ro.identifiers.gem_platforms)
+            .flat_map(|ro| ro.identifiers.gem_builds.iter().flatten())
             .filter(|prebuild| Some(prebuild.platform.as_str()) == platform)
             .map(|prebuild| prebuild.gem_checksum_sha256.to_ascii_lowercase())
             .collect();
@@ -2345,7 +2345,7 @@ async fn run_redirect_selected_untracked(
         let prebuilds = o
             .registry_override
             .iter()
-            .flat_map(|ro| &ro.identifiers.gem_platforms)
+            .flat_map(|ro| ro.identifiers.gem_builds.iter().flatten())
             .map(|prebuild| prebuild.gem_checksum_sha256.clone());
         for sha in sha.into_iter().chain(prebuilds) {
             gem_artifact_shas
