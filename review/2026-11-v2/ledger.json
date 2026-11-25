@@ -1,0 +1,52 @@
+{
+  "discussion": 1830,
+  "discussion_url": "https://github.com/SocketDev/socket-patch/discussions/1830",
+  "discussion_node_id": "D_kwDOQS_zEM4AqpO5",
+  "register_comment_id": "DC_kwDOQS_zEM4BJgmp",
+  "register_comment_url": "https://github.com/SocketDev/socket-patch/discussions/1830#discussioncomment-19270057",
+  "started_at_main": "b291caa",
+  "previous_thread": {
+    "discussion": 560,
+    "archive": "review/2026-10-v1/"
+  },
+  "routines": {
+    "audit-core": {
+      "name": "socket-patch arch audit: core",
+      "cron": "40 0,6,12,18 * * *"
+    },
+    "audit-cli-tests": {
+      "name": "socket-patch arch audit: CLI and tests",
+      "cron": "40 3,9,15,21 * * *"
+    },
+    "refactor": {
+      "name": "socket-patch arch refactor",
+      "cron": "55 */2 * * *"
+    }
+  },
+  "doc_targets": {
+    "doc/01-summary.md": {
+      "kind": "discussion_body",
+      "id": "D_kwDOQS_zEM4AqpO5"
+    },
+    "doc/02-mechanisms.md": {
+      "kind": "comment",
+      "id": "DC_kwDOQS_zEM4BJgmr"
+    },
+    "doc/03-duplication.md": {
+      "kind": "comment",
+      "id": "DC_kwDOQS_zEM4BJgmu"
+    },
+    "doc/04-structure.md": {
+      "kind": "comment",
+      "id": "DC_kwDOQS_zEM4BJgmv"
+    },
+    "doc/05-tests.md": {
+      "kind": "comment",
+      "id": "DC_kwDOQS_zEM4BJgmz"
+    },
+    "doc/06-history.md": {
+      "kind": "comment",
+      "id": "DC_kwDOQS_zEM4BJgm1"
+    }
+  }
+}

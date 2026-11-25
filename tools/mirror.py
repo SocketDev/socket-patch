@@ -29,7 +29,7 @@ ROW = re.compile(r'^\|\s*([A-Z][0-9]+)\s*\|')
 RENDER_TIME = re.compile(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC(?= \(ledger `)')
 ENTRY_MARKER = re.compile(r'<!-- arch-audit-entry: (\S+) -->')
 ORDER = ['fixed', 'partly fixed', 'already fixed', 'in PR', 'filed', 'decision pending', 'carried', 'to verify',
-         'rejected', 'handed off', 'other', 'missing']
+         'rejected', 'out of charter', 'handed off', 'other', 'missing']
 warnings = []
 
 
@@ -71,6 +71,7 @@ class Tree:
 # upstream` as fixed.
 STATUS_PREFIXES = [('already fixed', 'already fixed'), ('to verify', 'to verify'), ('carried', 'carried'),
                    ('handed off', 'handed off'), ('not a defect', 'rejected'),
+                   ('out of charter', 'out of charter'),
                    ('decision', 'decision pending'), ('decide', 'decision pending'),
                    ('rejected', 'rejected'), ('in pr', 'in PR'), ('partly fixed', 'partly fixed'),
                    ('fixed', 'fixed'),
