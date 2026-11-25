@@ -306,13 +306,13 @@ const TARGETED: &[(&[&str], &str, &str)] = &[
     ),
 ];
 
-/// A project holding `ledger` as its vendor ledger and, when given,
-/// `manifest` as its manifest.
-fn ledger_project(ledger: &str, manifest: Option<&str>) -> tempfile::TempDir {
+/// A project whose vendor ledger is whatever `seed` puts at
+/// `.socket/vendor/state.json` and, when given, `manifest` as its manifest.
+fn ledger_project(seed: &dyn Fn(&Path), manifest: Option<&str>) -> tempfile::TempDir {
     project_root(&|root| {
         let vendor = root.join(".socket/vendor");
         std::fs::create_dir_all(&vendor).unwrap();
-        std::fs::write(vendor.join("state.json"), ledger).unwrap();
+        seed(&vendor.join("state.json"));
         if let Some(manifest) = manifest {
             std::fs::write(root.join(".socket/manifest.json"), manifest).unwrap();
         }
@@ -327,24 +327,25 @@ fn run_targeted(tmp: &tempfile::TempDir, argv: &[&str]) -> (i32, serde_json::Val
     (exit, v)
 }
 
-/// "No patch matches" is a statement about every store. A vendor ledger
-/// that cannot be read may hold the target (vendored mode keeps no
-/// manifest, so the ledger is a vendored project's only record of its
-/// patches), so a target that matches nothing in the stores that could be
-/// read fails with the ledger's error on every command that takes one,
-/// and never as "not found". With or without a manifest beside the ledger.
-#[test]
-fn a_target_is_never_not_found_while_the_vendor_ledger_is_unreadable() {
+/// Every [`TARGETED`] command over a ledger `seed` makes unreadable, with
+/// no manifest, an empty one and one holding another package's patch
+/// beside it: each must fail with the ledger's error.
+fn assert_ledger_error_on_every_targeted_command(seed: &dyn Fn(&Path)) {
     let mut wrong: Vec<String> = Vec::new();
     for manifest in [None, Some(r#"{"patches":{}}"#), Some(OTHER_MANIFEST)] {
         for (argv, command, _) in TARGETED {
-            let tmp = ledger_project(CONFLICTED_LEDGER, manifest);
+            let tmp = ledger_project(seed, manifest);
+            let ledger = tmp.path().join(".socket/vendor/state.json");
+            let before = std::fs::read_link(&ledger)
+                .map(|to| to.into_os_string().into_encoded_bytes())
+                .or_else(|_| std::fs::read(&ledger))
+                .unwrap();
             let (exit, v) = run_targeted(&tmp, argv);
             assert_eq!(exit, 1, "{argv:?}: {v}");
             assert_eq!(v["command"], *command, "{argv:?}: {v}");
             let code = v["error"]["code"].as_str().unwrap_or_default();
             let message = v["error"]["message"].as_str().unwrap_or_default();
-            if code != "vendor_state_unreadable" || !message.contains("state.json") {
+            if code != "vendor_state_unreadable" {
                 wrong.push(format!(
                     "{} (manifest: {}): {code}: {message}",
                     argv.join(" "),
@@ -357,11 +358,19 @@ fn a_target_is_never_not_found_while_the_vendor_ledger_is_unreadable() {
                 continue;
             }
             assert_eq!(v["status"], "error", "{argv:?}: {v}");
-            assert_eq!(
-                std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")).unwrap(),
-                CONFLICTED_LEDGER,
-                "{argv:?}: the ledger is left as it was"
-            );
+            // `remove` and `rollback` name the file and the target that
+            // was not looked up in it (`report` has its own wording).
+            if *command != "report" {
+                assert!(
+                    message.contains(".socket/vendor/state.json") && message.contains(argv[1]),
+                    "{argv:?}: {message}"
+                );
+            }
+            let after = std::fs::read_link(&ledger)
+                .map(|to| to.into_os_string().into_encoded_bytes())
+                .or_else(|_| std::fs::read(&ledger))
+                .unwrap();
+            assert_eq!(after, before, "{argv:?}: the ledger is left as it was");
         }
     }
     assert!(
@@ -371,13 +380,42 @@ fn a_target_is_never_not_found_while_the_vendor_ledger_is_unreadable() {
     );
 }
 
+/// "No patch matches" is a statement about every store. A vendor ledger
+/// that cannot be read may hold the target (vendored mode keeps no
+/// manifest, so the ledger is a vendored project's only record of its
+/// patches), so a target that matches nothing in the stores that could be
+/// read fails with the ledger's error on every command that takes one,
+/// and never as "not found". With or without a manifest beside the ledger.
+#[test]
+fn a_target_is_never_not_found_while_the_vendor_ledger_is_unreadable() {
+    assert_ledger_error_on_every_targeted_command(&|ledger| {
+        std::fs::write(ledger, CONFLICTED_LEDGER).unwrap()
+    });
+}
+
+/// The same for a ledger that cannot even be stat'd (a symlink to itself
+/// fails with ELOOP): that is unreadable, not "no ledger", as #998 settled
+/// for the manifest. With no manifest beside it, `remove` and `rollback`
+/// used to probe for the ledger, take the error for absence and report a
+/// project with no patches.
+#[cfg(unix)]
+#[test]
+fn a_target_is_never_not_found_while_the_vendor_ledger_cannot_be_stat() {
+    assert_ledger_error_on_every_targeted_command(&|ledger| {
+        std::os::unix::fs::symlink("state.json", ledger).unwrap()
+    });
+}
+
 /// The control: with every store readable, a target none of them holds
 /// keeps each command's own "not found" code.
 #[test]
 fn a_target_no_readable_store_holds_keeps_its_not_found_code() {
     for manifest in [None, Some(OTHER_MANIFEST)] {
         for (argv, command, not_found) in TARGETED {
-            let tmp = ledger_project(OTHER_LEDGER, manifest);
+            let tmp = ledger_project(
+                &|ledger| std::fs::write(ledger, OTHER_LEDGER).unwrap(),
+                manifest,
+            );
             let (exit, v) = run_targeted(&tmp, argv);
             assert_eq!(exit, 1, "{argv:?}: {v}");
             assert_eq!(v["command"], *command, "{argv:?}: {v}");

@@ -1661,26 +1661,6 @@ async fn track_unstarted(
     track_patch_rollback_failed(code, error, rollback_run(args, 0), &[], telemetry).await;
 }
 
-/// Fail a run whose target selected nothing in the stores that could be
-/// read, when the vendor ledger was not one of them: the ledger may hold
-/// the target, so the run ends on its load error
-/// (`vendor_state_unreadable`, exit 1) and never on "not found".
-async fn fail_unsearched_ledger(
-    args: &RollbackArgs,
-    err: &std::io::Error,
-    telemetry: &TelemetryAuth,
-) -> i32 {
-    let error = crate::json_envelope::vendor_ledger_load_error(err);
-    track_unstarted(args, &error.code, &error.message, telemetry).await;
-    emit_rollback_error(
-        args.common.json,
-        args.common.dry_run,
-        &error.code,
-        &error.message,
-    );
-    1
-}
-
 /// The most patches a rollback's report hint names: past this the
 /// command no longer fits a line, and the run was not about one patch.
 const REPORT_HINT_MAX_PATCHES: usize = 3;
@@ -1989,10 +1969,13 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             return 1;
         }
     };
+    // Only a missing ledger is "no ledger": one that cannot even be stat'd
+    // goes on to the load below, which reports it.
     let vendor_ledger_exists = project_state
-        && tokio::fs::metadata(ledger_root.join(".socket/vendor/state.json"))
-            .await
-            .is_ok();
+        && !matches!(
+            tokio::fs::try_exists(ledger_root.join(".socket/vendor/state.json")).await,
+            Ok(false)
+        );
     // The hosted pins the lockfiles wire (read-only discovery; the restore
     // re-reads every file under the lock before it writes).
     let hosted_inventory = if project_state {
@@ -2303,28 +2286,30 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
         vendor_scope.extend(found.vendor.into_iter().map(|(k, _)| k));
         hosted_scope.extend(pins.into_iter().map(|pin| pin.purl));
         if !matched {
-            // In no store that could be read. The ledger could not be, and
-            // may hold it: that is the ledger's error, not `patch_not_found`.
-            if let Err(e) = &vendor_state_result {
-                return fail_unsearched_ledger(&args, e, &telemetry).await;
-            }
-            let hint = if matches!(id.kind(), TargetKind::Purl | TargetKind::Uuid) {
-                String::new()
-            } else {
-                format!(" (to target a directory instead, use ./{id} or {id}/**)")
+            // In no store that could be read. A ledger that could not be
+            // may hold it: its error then, not `patch_not_found`.
+            let error = match &vendor_state_result {
+                Err(e) => crate::json_envelope::vendor_ledger_load_error(e, Some(&id.to_string())),
+                Ok(_) => {
+                    let hint = if matches!(id.kind(), TargetKind::Purl | TargetKind::Uuid) {
+                        String::new()
+                    } else {
+                        format!(" (to target a directory instead, use ./{id} or {id}/**)")
+                    };
+                    EnvelopeError::new(
+                        "patch_not_found",
+                        format!("No patch found matching identifier: {id}{hint}"),
+                    )
+                }
             };
-            let msg = format!("No patch found matching identifier: {id}{hint}");
-            track_unstarted(&args, "patch_not_found", &msg, &telemetry).await;
+            track_unstarted(&args, &error.code, &error.message, &telemetry).await;
             if args.common.json {
-                let mut env = error_envelope(
-                    args.common.dry_run,
-                    EnvelopeError::new("patch_not_found", msg),
-                );
+                let mut env = error_envelope(args.common.dry_run, error);
                 env.warnings
                     .extend(below.unmatched(&args.common).await.warnings());
                 println!("{}", env.to_pretty_json());
             } else {
-                eprintln!("Error: {msg}");
+                eprintln!("Error: {}", crate::ui::sentence_case(&error.message));
                 below.unmatched(&args.common).await.print();
             }
             return 1;
@@ -2383,22 +2368,26 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             .find(|(idx, _)| !matched_patterns.contains(idx))
         {
             // The candidates left out the entries of a ledger that could
-            // not be read, so the pattern may select one of them.
-            if let Err(e) = &vendor_state_result {
-                return fail_unsearched_ledger(&args, e, &telemetry).await;
-            }
-            let msg = format!(
-                "path pattern matched no patched packages: {} (path targets select \
-                 installed copies; patches for uninstalled packages are reachable by \
-                 identifier or an unscoped rollback)",
-                unmatched.1
-            );
-            track_unstarted(&args, "path_glob_no_match", &msg, &telemetry).await;
+            // not be read, and the pattern may select one of them: the
+            // ledger's error then, not `path_glob_no_match`.
+            let error = match &vendor_state_result {
+                Err(e) => crate::json_envelope::vendor_ledger_load_error(e, Some(unmatched.1)),
+                Ok(_) => EnvelopeError::new(
+                    "path_glob_no_match",
+                    format!(
+                        "path pattern matched no patched packages: {} (path targets select \
+                         installed copies; patches for uninstalled packages are reachable by \
+                         identifier or an unscoped rollback)",
+                        unmatched.1
+                    ),
+                ),
+            };
+            track_unstarted(&args, &error.code, &error.message, &telemetry).await;
             emit_rollback_error(
                 args.common.json,
                 args.common.dry_run,
-                "path_glob_no_match",
-                &msg,
+                &error.code,
+                &error.message,
             );
             return 1;
         }

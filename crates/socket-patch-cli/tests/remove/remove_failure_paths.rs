@@ -139,6 +139,67 @@ fn remove_corrupt_vendor_ledger_fails_closed_json() {
     );
 }
 
+/// "Before any mutation" covers the installed tree too. The refusal used
+/// to come after the in-place rollback: the patched file was put back to
+/// its original bytes, and the run then failed with no event and
+/// `rolledBack: 0`, the manifest still recording the patch.
+#[test]
+fn remove_corrupt_vendor_ledger_restores_no_installed_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let purl = "pkg:npm/__covgap_vsl_installed__@1.0.0";
+    let (original, patched) = (&b"original bytes\n"[..], &b"patched bytes\n"[..]);
+    let (before, after) = (
+        crate::common::git_sha256(original),
+        crate::common::git_sha256(patched),
+    );
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    std::fs::write(socket.join("blobs").join(&before), original).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        format!(
+            r#"{{"patches":{{"{purl}":{{
+  "uuid":"23232323-2323-4232-8232-232323232323","exportedAt":"2024-01-01T00:00:00Z",
+  "files":{{"package/a.js":{{"beforeHash":"{before}","afterHash":"{after}"}}}},
+  "vulnerabilities":{{}},"description":"covgap","license":"MIT","tier":"free"}}}}}}"#
+        ),
+    )
+    .unwrap();
+    let manifest_before = read_bytes(&socket.join("manifest.json"));
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"proj","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let pkg = root.join("node_modules/__covgap_vsl_installed__");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"__covgap_vsl_installed__","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(pkg.join("a.js"), patched).unwrap();
+    std::fs::create_dir_all(socket.join("vendor")).unwrap();
+    std::fs::write(socket.join("vendor/state.json"), "{{{").unwrap();
+
+    let (code, stdout, stderr) = run_remove(root, &[purl, "--json", "--yes", "--offline"], &[]);
+    assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    let v = parse_json_envelope(&stdout);
+    assert_eq!(
+        v["error"]["code"], "vendor_state_unreadable",
+        "envelope={v}"
+    );
+    assert_eq!(
+        read_bytes(&pkg.join("a.js")),
+        patched,
+        "the installed file must be left patched: the run reports nothing rolled back; \
+         envelope={v}"
+    );
+    assert_eq!(v["summary"]["rolledBack"], 0, "envelope={v}");
+    assert_eq!(read_bytes(&socket.join("manifest.json")), manifest_before);
+}
+
 // ---------------------------------------------------------------------------
 // 3. Vendor revert hard failure aborts before the manifest mutation
 //    (main flow + ledger-only twin)

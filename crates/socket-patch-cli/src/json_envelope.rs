@@ -663,15 +663,24 @@ pub(crate) fn manifest_load_error_code(err: &std::io::Error) -> &'static str {
 
 /// The top-level error of a `remove` or `rollback` that cannot go on
 /// without the vendor ledger, which exists but could not be loaded. One
-/// mapping for both, and for both of their reasons: the run is about to
-/// change what the ledger records, or its target selected nothing in the
-/// stores that could be read. The second is never "not found": that is a
-/// statement about every store, and the ledger is a vendored project's
-/// only record of its patches.
-pub(crate) fn vendor_ledger_load_error(err: &std::io::Error) -> EnvelopeError {
+/// mapping for both commands and both of their reasons:
+///
+/// - `remove` is about to act on records the ledger may also hold
+///   (`unmatched` is `None`);
+/// - the run's target selected nothing in the stores that could be read
+///   (`unmatched` is that target). That is never "not found", which is a
+///   statement about every store: the ledger is a vendored project's only
+///   record of its patches, so it may hold the target.
+pub(crate) fn vendor_ledger_load_error(
+    err: &std::io::Error,
+    unmatched: Option<&str>,
+) -> EnvelopeError {
+    let lookup = unmatched.map_or_else(String::new, |target| {
+        format!(" to look up {target}, which matches nothing else in the project")
+    });
     EnvelopeError::new(
         "vendor_state_unreadable",
-        format!("cannot read .socket/vendor/state.json: {err}"),
+        format!("cannot read .socket/vendor/state.json{lookup}: {err}"),
     )
 }
 
