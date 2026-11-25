@@ -42,7 +42,9 @@
 //! In every state a `CHECKSUMS` entry is re-pinned to the upstream sha256
 //! from the rubygems.org compact index (`info/<name>`, what bundler itself
 //! records; other upstream remotes are refused: their index may need
-//! credentials and is not the default registry) — each platform build's
+//! credentials and is not the default registry, unless `SOCKET_RUBYGEMS_URL`
+//! names that very server, which then stands in for rubygems.org, #2230)
+//! — each platform build's
 //! entry to that build's own sha256, the index's `<version>-<platform>`
 //! line — and the `DEPENDENCIES`
 //! source pin (`name (…)!`) loses its `!` — unless the declaration sits
@@ -1058,8 +1060,10 @@ fn lock_checksum(lock: &str, name: &str, token: &str) -> Option<String> {
 /// fails every install against the restored upstream checksum (#1260).
 /// The upstream sha is the restored lock's `CHECKSUMS` entry, else the
 /// rubygems.org compact index (already fetched when the restore re-pinned
-/// `CHECKSUMS`). Read-only, like scan's guard: the file is named, never
-/// deleted.
+/// `CHECKSUMS`) for a gem the lock resolves from rubygems.org
+/// ([`rubygems_locked`]); the archive of a gem from another gem server
+/// with no `CHECKSUMS` entry is named as one that could not be checked.
+/// Read-only, like scan's guard: the file is named, never deleted.
 async fn stale_cache_warning(
     root: &std::path::Path,
     purl: &str,
@@ -1076,6 +1080,14 @@ async fn stale_cache_warning(
     let got = crate::vendor::file_sha256_hex(&archive).await;
     let upstream = match lock.and_then(|l| lock_checksum(l, name, token)) {
         Some(sha) => Ok(sha),
+        // The registry is asked only about a gem that is its own: one the
+        // lock resolves from another gem server is not named to it, and
+        // its answer for a gem of that name would be another gem's (#2230).
+        None if lock.is_some_and(|l| !rubygems_locked(l, name, token)) => Err(
+            "the lock pins no CHECKSUMS sha256 for it and resolves it from a gem server \
+             other than the gem registry"
+                .to_string(),
+        ),
         None => client.rubygems_sha256(name, token).await,
     };
     let fix = "delete it, then run `bundle cache` to cache the upstream gem in its place \
@@ -1408,10 +1420,26 @@ async fn restore_one(
                 LockEdit::Done(next) => next,
                 LockEdit::NeedsSha { remote, tokens } => {
                     let remote = remote.ok_or("its upstream GEM remote is ambiguous")?;
-                    if !same_remote(&remote, RUBYGEMS_REMOTE) {
+                    // rubygems.org, or the server `SOCKET_RUBYGEMS_URL`
+                    // names in its place (a private mirror, #2230): the
+                    // sha256 below is read from that one.
+                    if !super::is_rubygems_remote(&remote) {
+                        let server = crate::utils::redact::strip_url_userinfo(&remote);
+                        let server = server.trim_end_matches('/');
+                        // The setting is refused for a server reached over
+                        // plain http ([`super::rubygems_secure_base`]): it
+                        // is no way out for that one.
+                        let setting = match crate::utils::http::insecure_transport(server) {
+                            Some(_) => String::new(),
+                            None => format!(
+                                " unless a re-run with `SOCKET_RUBYGEMS_URL={server}` names \
+                                 that server as the gem registry (with its credentials in the \
+                                 URL if it needs them)"
+                            ),
+                        };
                         return Err(format!(
-                            "its upstream GEM remote {remote} is not rubygems.org, so its CHECKSUMS \
-                             sha256 cannot be re-derived"
+                            "its upstream GEM remote {server} is not rubygems.org, so its CHECKSUMS \
+                             sha256 cannot be re-derived{setting}"
                         ));
                     }
                     // One `info/<name>` document lists every build.

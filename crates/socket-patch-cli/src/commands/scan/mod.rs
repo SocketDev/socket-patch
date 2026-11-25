@@ -34,8 +34,8 @@ use std::path::{Path, PathBuf};
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{
-    crawl_ecosystems_with_npm, crawl_ecosystems_with_npm_roots, find_package_paths_for_path_scope,
-    partition_purls,
+    boxed, crawl_ecosystems_with_npm, crawl_ecosystems_with_npm_roots,
+    find_package_paths_for_path_scope, partition_purls,
 };
 use crate::json_envelope::{
     usage_error, Command as JsonCommand, Envelope, EnvelopeError, PatchAction, PatchEvent,
@@ -2173,15 +2173,10 @@ async fn run_scan(
     report: &mut report::Run,
 ) -> i32 {
     let mut unchecked = 0usize;
-    let code = Box::pin(scan_project(
-        args,
-        invocation,
-        explicit,
-        ahead,
-        &mut unchecked,
-        report,
-    ))
-    .await;
+    // Built by `boxed`, not by a `Box::pin` here, which would make the
+    // future of a whole scan a temporary of this frame first.
+    let code =
+        boxed(|| scan_project(args, invocation, explicit, ahead, &mut unchecked, report)).await;
     if unchecked > 0 && code == 0 {
         1
     } else {
@@ -3676,21 +3671,26 @@ async fn scan_project(
             if let Some(sweep) = withdrawn_sweep {
                 sweep.record_into(&mut env);
             }
-            return run_redirect(
-                &args,
-                &api_client,
-                &all_packages_with_patches,
-                can_access_paid_patches,
-                &policy,
-                env,
-                npm_crawl.as_ref(),
-                &recorded,
-                lookup_incomplete,
-                &mut stage,
-                prior_discovery,
-                sweep_references,
-                prune,
-            )
+            // The hosted flow's future embeds the whole hosted engine:
+            // awaited in line it lay in the poll frame of a scan in every
+            // mode. `boxed` leaves this frame one pointer.
+            return boxed(|| {
+                run_redirect(
+                    &args,
+                    &api_client,
+                    &all_packages_with_patches,
+                    can_access_paid_patches,
+                    &policy,
+                    env,
+                    npm_crawl.as_ref(),
+                    &recorded,
+                    lookup_incomplete,
+                    &mut stage,
+                    prior_discovery,
+                    sweep_references,
+                    prune,
+                )
+            })
             .await;
         }
 

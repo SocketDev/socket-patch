@@ -46,13 +46,15 @@ below is about what a package manager installs and builds.
 
 The matrix above lists what each mode handles. This table says how much that support
 is worth for v5.x. v5 removes no format or mode: everything in the matrix works in v5.0
-and keeps working through v5.x.
+and keeps working through v5.x. The Experimental tier is the exception: what it covers is
+new in v5.x and can change.
 
 | Tier | Meaning |
 |---|---|
 | **Supported** | The default. Covered by CI. A regression is a release blocker. |
 | **Beta** | Works for the build shapes documented on this page and is tested in CI. Some shapes outside them are refused, and the open issues for that ecosystem describe shapes that are patched incompletely. Preview with `--dry-run` and confirm with a real build before you commit the result. |
 | **Legacy** | A format that the package manager itself has retired. socket-patch keeps reading and writing it in v5 and still fixes its bugs, but adds no new features for it. Prefer the upgrade path in the table below. |
+| **Experimental** | New, and tested in CI only on the build shapes its section lists. What a command does, what it writes and how it words a refusal can change in any v5.x release, and a regression is not a release blocker. Preview with `--dry-run` and confirm with a real build before you commit the result. |
 | **Not supported** | Refused with an error code that names the remedy. |
 
 | Ecosystem / format | agent | vendored | hosted |
@@ -67,6 +69,7 @@ and keeps working through v5.x.
 | Gradle | Supported, with the [`files-2.1` advisories](#gradle) | Beta (Gradle 6.8+) | Beta (Gradle 6.8+) |
 | sbt / Mill / scala-cli | Beta | Beta (sbt and scala-cli directory builds; Mill is not wired) | Beta (Mill and scala-cli get manual snippets only) |
 | Deno | Supported | Not supported | Not supported |
+| A project in a Bazel workspace: everything socket-patch does differently there, `vex` included (see [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported)) | No tier: agent mode is not for a Bazel build | Experimental where that section's table says Supported; elsewhere what the table says | Experimental, the same |
 
 **Hosted and vendored Maven and Gradle are Beta in v5.** Each wiring is built to fail
 closed: hosted mode and vendored Maven pin a Socket-only `-socket.<hex8>` version, and
@@ -96,7 +99,10 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   and do not make a format refuse that v5.0 accepts. Bug fixes can still refuse a
   specific input that would otherwise produce a wrong result. Each refusal has an error
   code and a remedy.
-- **A tier can move up** (Beta to Supported) in any release. A move down, or a new
+- **The Experimental tier is outside that rule.** What it covers was not in v5.0. A v5.x
+  release can change what its commands do, write, refuse and report there, and says so in
+  the release notes.
+- **A tier can move up** (Experimental to Beta, Beta to Supported) in any release. A move down, or a new
   Legacy entry, is announced in the release notes and on this page.
 - **Removing write support for a Legacy format** can happen only in a major release.
   The removed path becomes a refusal with an error code and a re-lock remedy. socket-patch
@@ -1637,6 +1643,8 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
 
 ## Bazel workspaces: NuGet
 
+*Experimental: see [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported).*
+
 rules_csharp's `nuget.from_lock` tag (in `MODULE.bazel`) downloads every package of a
 `packages.lock.json` and fails the build on a file that does not match the lock's `contentHash`.
 All the `nuget.from_lock` tags of a workspace make one hub (rules_csharp 0.5.0):
@@ -2142,6 +2150,18 @@ the repository list, so it is left as a
 
 ## Bazel workspaces: what is supported
 
+**Everything socket-patch does differently because a project is in a Bazel workspace is
+experimental** (see the [v5 support tiers](#v5-support-tiers)): the modes this section
+describes, what `vex` says there, the `.bazelignore` lines, and the refusals and warnings
+that only a Bazel workspace brings, also for a project in the workspace that Bazel does not
+build. It is new, each ruleset is an integration of its own, and a Bazel build fails late:
+a command can exit 0 and the build after it can still fail or take the unpatched package,
+in any shape the table below does not list as Supported (the known problems name some). So
+what the commands do there, the files they write and the words of their refusals can
+change in any v5.x release. After a command, build with Bazel before you commit the result.
+None of it applies to a project that is in no Bazel workspace: there socket-patch does what
+the rest of this page says.
+
 A Bazel build takes each package from what a ruleset reads in the checkout (a lock, a call in
 `MODULE.bazel`), in a repository of Bazel's own, and not from the copies a package manager
 installed. So the [matrix at the top](#mode--ecosystem-matrix) does not carry over to a
@@ -2343,6 +2363,8 @@ And three that concern neither:
 
 ## Bazel workspaces: npm
 
+*Experimental: see [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported).*
+
 aspect_rules_js reads the pnpm lock itself, so a hosted pin in `pnpm-lock.yaml` is what the
 build links, and no pnpm runs. One wiring differs. With `update_pnpm_lock = True` on
 `npm.npm_translate_lock`, rules_js runs a pnpm of its own during the build whenever the lock
@@ -2489,6 +2511,8 @@ when it decides this: see the known problems of
 [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported).
 
 ## Bazel workspaces: Maven
+
+*Experimental: see [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported).*
 
 A rules_jvm_external hub (`maven.install` in `MODULE.bazel`) builds the jars that its own lock,
 `maven_install.json`, names, each at the sha256 the lock holds. It reads no `pom.xml` and no
@@ -2859,6 +2883,8 @@ Limits:
 
 ## Bazel workspaces: Cargo
 
+*Experimental: see [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported).*
+
 A crate_universe hub of rules_rust (`crate.from_cargo` in `MODULE.bazel`, `crates_repository`
 in a `WORKSPACE` file) builds its crates from the `Cargo.toml` files and the `Cargo.lock` it
 names. Its tool, cargo-bazel, links what stands beside each of those `Cargo.toml` files into a
@@ -3203,6 +3229,8 @@ version = "1.0.4+socket.<uuid>"
 
 ## Bazel workspaces: the build file in a vendored crate
 
+*Experimental: see [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported).*
+
 A rules_rust crate hub (`crate.from_cargo`) builds a vendored crate from its copy under
 `.socket/vendor/cargo`: the build after `scan --mode vendored` is the patched one, with no
 repin. From rules_rust 0.59.0 on, the hub's tool, cargo-bazel, also writes a `BUILD.bazel`
@@ -3406,6 +3434,8 @@ with the command that does, and
 | `go_requirements_out_of_sync` | The patched module's own `go.mod` requires a dependency at a version above the one the project's `go.mod` lists (agent and vendored modes; `apply` also reports a requirement the patch added). The default `-mod=readonly` build fails with "updates to go.mod needed" or "missing go.sum entry" | `go mod tidy`, then commit `go.mod` and `go.sum` |
 
 ### Bazel workspaces: `.bazelignore`
+
+*Experimental: see [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported).*
 
 In a Bazel workspace the module copies of vendored and agent mode are directories that Bazel
 and gazelle walk like any other. A BUILD file in a copy (one the module ships, or the one
@@ -3706,6 +3736,8 @@ The implemented hosted shape and fresh-checkout behavior are exercised by
 
 ## Bazel workspaces: Composer
 
+*Experimental: see [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported).*
+
 No Bazel ruleset builds PHP or takes Composer packages, so a PHP project in a Bazel workspace
 brings its packages into the build with a few lines of its own: a repository rule or a genrule
 that runs `composer install` from the committed `composer.lock`, or a committed `vendor/` tree
@@ -3962,6 +3994,28 @@ that deletes it, `gem cleanup`): with no archive to compare, the installed files
 against the patch itself, in both directions. If the patch can't be looked up during a `rollback`
 or `remove`, the copy is left alone and the run warns (`upstream_gem_stale_install`), naming the
 files to remove before `bundle install`.
+
+A project whose `Gemfile` names a private gem server as its source (`source
+"https://gems.example.com"`) locks its gems under that server, not rubygems.org. `rollback` and
+`remove` do not ask a server they were not told about, so for such a gem:
+
+- On a lock with a `CHECKSUMS` section they need the upstream gem's sha256 to restore the lock, and
+  refuse until `SOCKET_RUBYGEMS_URL` names that server (its credentials go in the URL, and are
+  never printed):
+
+  ```sh
+  SOCKET_RUBYGEMS_URL=https://gems.example.com socket-patch rollback pkg:gem/rack@3.1.8
+  ```
+
+  The checksum is then read from the server's compact index (`info/<name>`), the `Gemfile` and
+  lock come back byte for byte, and the installed copy is replaced with the upstream gem
+  downloaded from that server.
+- On a lock without `CHECKSUMS` (Bundler 2.5 and older) the pair is restored without the setting.
+  Nothing then gives the upstream gem's sha256, so the installed copy is checked against the patch
+  itself: a copy that still holds the patched build is left as it is and named by
+  `upstream_gem_stale_install`, with the files to remove before `bundle install` (Bundler keeps
+  the copy otherwise). With the setting, the copy is replaced as above.
+
 Vendoring a gem that was hosted (`vendor`, `scan --mode vendored`) leaves the installed copies as
 they are: Bundler loads the vendored copy from then on. When that vendored gem is later unwound
 (`rollback`, `remove`, `vendor --revert`), Bundler loads the installed copy again, so the unwind
@@ -4198,6 +4252,8 @@ restores the original sources and build.
 
 ## Bazel workspaces: RubyGems
 
+*Experimental: see [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported).*
+
 rules_ruby's `ruby.bundle_fetch` tag (in `MODULE.bazel`) downloads every gem of its
 `gemfile_lock` with Bazel's downloader. Its `gem_checksums` names a sha256 per gem, under
 `<name>-<version>` (the words of the gem's line in the lock, so `<version>-<platform>` for a
@@ -4294,6 +4350,8 @@ What is read, and what is not:
   would unwind every patch of the project).
 
 ## Bazel workspaces: VEX
+
+*Experimental: see [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported).*
 
 `vex` and `--vex` read what socket-patch wrote and what the project's own package manager
 installed. In a Bazel workspace (the Bazel root of the section on `.bazelignore` above) they
