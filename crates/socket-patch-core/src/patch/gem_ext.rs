@@ -2400,6 +2400,12 @@ fn home_minor(copy: &GemCopy) -> Option<String> {
     }
 }
 
+/// How the reason of a native rebuild that found no Ruby owning the
+/// installed copy starts ([`find_ruby`]'s error). The copy is in a gem
+/// home no candidate Ruby installs into, so a `bundle install` run with
+/// one of them does not replace it either: a remedy checks for this.
+pub const NO_OWNING_RUBY: &str = "no Ruby owning this install was found";
+
 /// Find the Ruby that owns `copy`'s install. Each candidate is asked where
 /// it builds extensions for the gem home, and what it is
 /// ([`RubyRun::ExtensionsDir`]), which loads nothing of the gem. `Err`
@@ -2508,10 +2514,7 @@ async fn find_ruby(
             facts,
         });
     }
-    Err(format!(
-        "no Ruby owning this install was found ({})",
-        reasons.join("; ")
-    ))
+    Err(format!("{NO_OWNING_RUBY} ({})", reasons.join("; ")))
 }
 
 /// A `.gem` RubyGems installed into a stage home ([`install_staged`]).
@@ -7072,6 +7075,7 @@ mod tests {
         preflight.candidates = vec![fake_ruby(&other, "q")];
         let why = find_fresh_ruby(&copy, &env, &preflight).await.unwrap_err();
         assert!(why.contains("another Ruby's"), "{why}");
+        assert!(why.contains(NO_OWNING_RUBY), "{why}");
     }
 
     /// A gem with no extension dir, or whose require path leaves the gem

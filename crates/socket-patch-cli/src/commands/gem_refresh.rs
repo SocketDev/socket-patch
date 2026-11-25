@@ -383,6 +383,67 @@ fn files_to_remove(gem: &StaleGem) -> Vec<PathBuf> {
     files
 }
 
+/// Whether no gem home lists the gem dir `<home>/gems/<leaf>`: neither
+/// `specifications/<leaf>.gemspec` nor the default gem's entry under
+/// `specifications/default/` is there. Only "not found" says so.
+fn gemspec_is_gone(gem_dir: &Path) -> bool {
+    let Some(spec) = home_spec(gem_dir) else {
+        return false;
+    };
+    let gone = |path: &Path| matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+    gone(&spec) && !socket_patch_core::crawlers::ruby_crawler::is_default_gem_copy(gem_dir)
+}
+
+/// Why `bundle install` cannot be counted on to replace a copy once its
+/// gemspec and archive are removed (#2242).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outlives {
+    /// No Ruby the run found installs into the copy's gem home (the tree
+    /// of an earlier Ruby, `vendor/bundle/ruby/3.2.0`). `bundle install`
+    /// installs into the gem home of the Ruby that runs it, so the gem dir
+    /// would stay behind with no gemspec.
+    ForeignRuby,
+    /// The gemspec is gone already: the gem dir is what is left of an
+    /// install, and nothing puts a gem back over it.
+    NoGemspec,
+}
+
+/// Whether the remedy for `gem`'s installed copy has to remove the gem
+/// dir itself, and why. Only a copy a refresh failed on, never one left
+/// alone (a shared home, `--no-gem-install-refresh`) or patched in place.
+fn outlives_reinstall(gem: &StaleGem, why: Option<&Why>) -> Option<Outlives> {
+    let (Some((dir, _)), false, Some(Why::Failed(reason))) = (&gem.installed, gem.in_place, why)
+    else {
+        return None;
+    };
+    if gemspec_is_gone(dir) {
+        Some(Outlives::NoGemspec)
+    } else if reason.contains(socket_patch_core::patch::gem_ext::NO_OWNING_RUBY) {
+        Some(Outlives::ForeignRuby)
+    } else {
+        None
+    }
+}
+
+/// What the remedy for a copy left for `why` removes, and whether a gem
+/// dir is among it: [`files_to_remove`], behind the gem dir where
+/// `bundle install` would not replace it ([`outlives_reinstall`]). Such a
+/// remedy names only what is on disk: it is offered again after the old
+/// one removed the files.
+fn remedy_paths(gem: &StaleGem, why: Option<&Why>) -> (Vec<PathBuf>, bool) {
+    let files = files_to_remove(gem);
+    let (Some(_), Some((dir, _))) = (outlives_reinstall(gem, why), &gem.installed) else {
+        return (files, false);
+    };
+    let mut paths = vec![dir.clone()];
+    paths.extend(
+        files
+            .into_iter()
+            .filter(|path| std::fs::symlink_metadata(path).is_ok()),
+    );
+    (paths, true)
+}
+
 /// What the upstream archive beside an in-place patch does once the lock
 /// pins the patched gem.
 const IN_PLACE_REINSTALL: &str = "`bundle pristine` and `bundle install --redownload` reinstall \
@@ -399,8 +460,17 @@ fn display_list(paths: &[PathBuf]) -> String {
 
 /// How a refresh that did not happen is retried. An unwind can't be: its
 /// first run removed the wiring a second one would look for.
-fn retry_hint(direction: Direction, why: Option<&Why>) -> &'static str {
+///
+/// `outlives` is why the copies the hint is for outlive a reinstall, when
+/// every one of them does: a gem dir with no gemspec fails a re-run the
+/// same way, and a copy no Ruby owns needs its Ruby found first.
+fn retry_hint(direction: Direction, why: Option<&Why>, outlives: Option<Outlives>) -> &'static str {
     match (why, direction) {
+        (Some(Why::Failed(_)), Direction::Patched) if outlives == Some(Outlives::NoGemspec) => "",
+        (Some(Why::Failed(_)), Direction::Patched) if outlives == Some(Outlives::ForeignRuby) => {
+            "Re-run `socket-patch scan` with the Ruby that installed the gem first on `PATH` \
+             to retry, or "
+        }
         (Some(Why::Disabled), Direction::Patched) => {
             "Re-run without `--no-gem-install-refresh`, or "
         }
@@ -434,11 +504,17 @@ fn shell_word(path: &Path) -> String {
 }
 
 /// The `rm -f … && bundle install` that makes Bundler fetch again the gems
-/// `files` belong to.
-fn reinstall_command(files: &[PathBuf]) -> String {
+/// `files` belong to; `rm -rf` where a gem dir is among them
+/// ([`remedy_paths`]).
+fn reinstall_command(files: &[PathBuf], with_dirs: bool) -> String {
     let words: Vec<String> = files.iter().map(|path| shell_word(path)).collect();
-    format!("rm -f {} && bundle install", words.join(" "))
+    let rm = if with_dirs { "rm -rf" } else { "rm -f" };
+    format!("{rm} {} && bundle install", words.join(" "))
 }
+
+/// Why a remedy removes a gem dir, after the remedy.
+const GEM_DIR_REMOVED: &str = "The gem directory is removed too: `bundle install` does not \
+     replace a copy that has no gemspec or is in the gem home of another Ruby";
 
 /// `action` after `hint` (which ends mid-sentence), or as a sentence of
 /// its own when there is none.
@@ -485,7 +561,7 @@ pub(crate) fn stale_detail(direction: Direction, gem: &StaleGem, why: Option<&Wh
                 "{held}, which was not replaced{}. {IN_PLACE_REINSTALL}. {}",
                 reason(why),
                 after_hint(
-                    retry_hint(direction, why),
+                    retry_hint(direction, why, None),
                     &format!(
                         "remove {} and run `bundle install`",
                         display_list(&files_to_remove(gem))
@@ -525,19 +601,24 @@ pub(crate) fn stale_detail(direction: Direction, gem: &StaleGem, why: Option<&Wh
                 ),
             }
         ),
-        Some((dir, _)) => format!(
-            "{purl} {switched}, but its {stale} install at {} was not refreshed{}, and \
-             {reuse}. {}",
-            dir.display(),
-            reason(why),
-            after_hint(
-                retry_hint(direction, why),
-                &format!(
-                    "remove {} and run `bundle install`",
-                    display_list(&files_to_remove(gem))
-                )
-            ),
-        ),
+        Some((dir, _)) => {
+            let (paths, with_dir) = remedy_paths(gem, why);
+            format!(
+                "{purl} {switched}, but its {stale} install at {} was not refreshed{}, and \
+                 {reuse}. {}{}",
+                dir.display(),
+                reason(why),
+                after_hint(
+                    retry_hint(direction, why, outlives_reinstall(gem, why)),
+                    &format!("remove {} and run `bundle install`", display_list(&paths))
+                ),
+                if with_dir {
+                    format!(". {GEM_DIR_REMOVED}")
+                } else {
+                    String::new()
+                },
+            )
+        }
         None => format!(
             "{purl} {switched}, but Bundler's cache dir still holds its {stale} archive at \
              {}, which was not replaced{}. Bundler installs from that dir before it fetches, \
@@ -548,7 +629,7 @@ pub(crate) fn stale_detail(direction: Direction, gem: &StaleGem, why: Option<&Wh
                 .display(),
             reason(why),
             after_hint(
-                retry_hint(direction, why),
+                retry_hint(direction, why, None),
                 "delete it and run `bundle cache`"
             ),
         ),
@@ -811,14 +892,29 @@ pub(crate) fn report(
             Direction::Upstream => format!(
                 "{why}To install {them} for this project only, run `{LOCAL_PATH_REMEDY}`. To \
                  replace the shared {copies}, run `{}`; {}.",
-                reinstall_command(&shared_files),
+                reinstall_command(&shared_files, false),
                 other_projects_cost(shared_gems)
             ),
         });
     }
     for (why, gems) in &local {
-        let files: Vec<PathBuf> = gems.iter().flat_map(|gem| files_to_remove(gem)).collect();
-        let reinstall = format!("run `{}`", reinstall_command(&files));
+        let (mut files, mut with_dirs) = (Vec::new(), false);
+        for gem in gems {
+            let (paths, with_dir) = remedy_paths(gem, Some(why));
+            files.extend(paths);
+            with_dirs |= with_dir;
+        }
+        // The hint of a copy that outlives a reinstall, when all do, for
+        // the same reason: else a plain re-run still does something.
+        let outlives = gems
+            .iter()
+            .map(|gem| outlives_reinstall(gem, Some(why)))
+            .reduce(|all, one| if all == one { all } else { None })
+            .flatten();
+        let mut reinstall = format!("run `{}`", reinstall_command(&files, with_dirs));
+        if with_dirs {
+            reinstall.push_str(&format!(". {GEM_DIR_REMOVED}"));
+        }
         let names = labels(gems.iter().map(|gem| gem.purl.as_str()));
         bullets.push(match why {
             Why::Unverified(_) => format!(
@@ -829,7 +925,7 @@ pub(crate) fn report(
             _ => format!(
                 "Not refreshed{}: {names}. {}.",
                 reason(Some(why)),
-                after_hint(retry_hint(direction, Some(why)), &reinstall),
+                after_hint(retry_hint(direction, Some(why), outlives), &reinstall),
             ),
         });
     }
