@@ -959,6 +959,39 @@ async fn gem_transitive_append_round_trips_unless_unprovable() {
     );
 }
 
+/// #2230: a project whose `source` names a private gem mirror locks its
+/// gems under that remote. `SOCKET_RUBYGEMS_URL` set to the same server is
+/// the registry's stand-in for the restore too, so the `CHECKSUMS` entry
+/// is re-pinned from that server's compact index and the pair is the
+/// pre-scan pair byte for byte. The lock names the server without the
+/// credentials the setting may carry.
+#[tokio::test]
+#[serial]
+async fn gem_mirror_named_by_socket_rubygems_url_round_trips() {
+    let gemfile = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\ngem \"puma\"\n";
+    let case = synthetic(
+        "mirror-upstream",
+        &[("Gemfile", gemfile), ("Gemfile.lock", GEM_LOCK)],
+        gem_override("rails", "7.0.0"),
+    );
+    let server = gem_mock(&case).await;
+    let mirror = server.uri();
+    let mut case = case;
+    case.edit_both("Gemfile", |t| t.replace("https://rubygems.org", &mirror));
+    case.edit_both("Gemfile.lock", |t| {
+        t.replace("https://rubygems.org/", &format!("{mirror}/"))
+    });
+    for base in [
+        mirror.clone(),
+        format!("{mirror}/"),
+        mirror.replace("http://", "http://user:token@"),
+    ] {
+        let _env = EnvGuard::set("SOCKET_RUBYGEMS_URL", &base);
+        let (after, statuses) = run_case(&case).await;
+        assert_round_trip(&case, &after, &statuses);
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn gem_refusals_leave_everything_hosted() {
@@ -994,6 +1027,14 @@ async fn gem_refusals_leave_everything_hosted() {
         "Gemfile Gemfile.lock",
         "not rubygems.org",
     );
+    // The refusal names the setting that reads such a server (#2230).
+    match &statuses[0].1 {
+        PinStatus::Refused(why) => assert!(
+            why.contains("SOCKET_RUBYGEMS_URL=https://gems.example.com"),
+            "{why}"
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
     // Two upstream sections, neither singled out.
     let mut ambiguous = case.clone_with("ambiguous-upstream");
     ambiguous.edit_both("Gemfile.lock", |t| {

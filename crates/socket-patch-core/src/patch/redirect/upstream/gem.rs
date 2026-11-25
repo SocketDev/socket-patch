@@ -42,7 +42,9 @@
 //! In every state a `CHECKSUMS` entry is re-pinned to the upstream sha256
 //! from the rubygems.org compact index (`info/<name>`, what bundler itself
 //! records; other upstream remotes are refused: their index may need
-//! credentials and is not the default registry) — each platform build's
+//! credentials and is not the default registry, unless `SOCKET_RUBYGEMS_URL`
+//! names that very server, which then stands in for rubygems.org, #2230)
+//! — each platform build's
 //! entry to that build's own sha256, the index's `<version>-<platform>`
 //! line — and the `DEPENDENCIES`
 //! source pin (`name (…)!`) loses its `!` — unless the declaration sits
@@ -1408,10 +1410,17 @@ async fn restore_one(
                 LockEdit::Done(next) => next,
                 LockEdit::NeedsSha { remote, tokens } => {
                     let remote = remote.ok_or("its upstream GEM remote is ambiguous")?;
-                    if !same_remote(&remote, RUBYGEMS_REMOTE) {
+                    // rubygems.org, or the server `SOCKET_RUBYGEMS_URL`
+                    // names in its place (a private mirror, #2230): the
+                    // sha256 below is read from that one.
+                    if !super::is_rubygems_remote(&remote) {
+                        let server = crate::utils::redact::strip_url_userinfo(&remote);
+                        let server = server.trim_end_matches('/');
                         return Err(format!(
-                            "its upstream GEM remote {remote} is not rubygems.org, so its CHECKSUMS \
-                             sha256 cannot be re-derived"
+                            "its upstream GEM remote {server} is not rubygems.org, so its CHECKSUMS \
+                             sha256 cannot be re-derived unless a re-run with \
+                             `SOCKET_RUBYGEMS_URL={server}` names that server as the gem \
+                             registry (with its credentials in the URL if it needs them)"
                         ));
                     }
                     // One `info/<name>` document lists every build.
