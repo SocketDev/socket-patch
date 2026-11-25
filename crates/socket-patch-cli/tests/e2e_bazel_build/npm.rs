@@ -88,6 +88,17 @@
 //! and that every hub which hides nothing leaves the run as it is without
 //! Bazel.
 //!
+//! Three more flows are that hub with the user's `pnpm-workspace.yaml` in
+//! its `data` and pnpm 11 stated in each way socket-patch reads as written
+//! out ([`Stated`]), for a patch whose registry the patch service offers
+//! ([`keeps_the_lock_up_to_date_where_a_registry_is_offered`]): hosted mode
+//! does not route the lock, pins it with `trustLockfile: true` in the file
+//! the hub lists, says the hub is why, and the build is the patched one.
+//! The last flow is that hub and a scan that is told not to write the
+//! setting ([`hosted_update_pnpm_lock_without_the_trust_setting`]): the
+//! scan passes and pins the lock, and the pnpm that Bazel runs rejects it,
+//! so the build fails until `rollback`.
+//!
 //! A marker is read from what Bazel built. Bazel's downloader keeps every
 //! file it fetches in the repository cache, under its checksum, and hands it
 //! out again without a request; the tests of a leg share that cache, and CI
@@ -1168,6 +1179,201 @@ fn hosted_update_pnpm_lock_on_pnpm_10() {
          brought {:?} back; {:?}",
         upstream.marker,
         patch.package.marker,
+        upstream.marker,
+        started.elapsed()
+    );
+}
+
+/// How a workspace states the pnpm that a hub runs, in the three ways
+/// socket-patch reads as written out.
+#[derive(Clone, Copy, Debug)]
+enum Stated {
+    /// `pnpm.pnpm(name = "pnpm", pnpm_version = "11.28.10")`.
+    Version,
+    /// `pnpm.pnpm(name = "pnpm", pnpm_version_from = "//:package.json")`,
+    /// and the `packageManager` of that file.
+    PackageManager,
+    /// `use_pnpm = "@eleven//:package/bin/pnpm.cjs"` on the hub, the
+    /// repository of a tag of that name.
+    Label,
+}
+
+const EVERY_WAY: [Stated; 3] = [Stated::Version, Stated::PackageManager, Stated::Label];
+
+/// The hub of [`keeps_the_lock_up_to_date`] with [`PNPM_11`], in the
+/// checkout of `cell`, as one whose pnpm reads the workspace file: a
+/// `pnpm-workspace.yaml` of the user's own in its `data`
+/// ([`lists_the_workspace_file`]), and its pnpm stated as `stated` says.
+fn lists_the_file_and_states(cell: &Cell, stated: Stated) {
+    lists_the_workspace_file(cell);
+    let module = text(&cell.tree(), MODULE);
+    let version = format!("pnpm.pnpm(name = \"pnpm\", pnpm_version = \"{PNPM_11}\")\n");
+    let tag = format!("{version}use_repo(pnpm, \"pnpm\")\n");
+    assert_eq!(module.matches(&tag).count(), 1, "{}: {module}", cell.test);
+    let module = match stated {
+        Stated::Version => return,
+        Stated::PackageManager => {
+            let manifest = text(&cell.tree(), "package.json");
+            let private = "  \"private\": true,\n";
+            assert_eq!(manifest.matches(private).count(), 1, "{manifest}");
+            let pin = format!("{private}  \"packageManager\": \"pnpm@{PNPM_11}\",\n");
+            cell.write("package.json", manifest.replace(private, &pin));
+            let from = "pnpm.pnpm(name = \"pnpm\", pnpm_version_from = \"//:package.json\")\n";
+            module.replace(&version, from)
+        }
+        Stated::Label => {
+            let (lock, named) = (lock_line(), tag.replace("\"pnpm\"", "\"eleven\""));
+            let entry = format!("{lock}    use_pnpm = \"@eleven//:package/bin/pnpm.cjs\",\n");
+            module.replace(&tag, &named).replace(&lock, &entry)
+        }
+    };
+    cell.write(MODULE, module);
+}
+
+/// Hosted mode on a hub that keeps the lock up to date with pnpm 11
+/// ([`open_updating`]), lists a `pnpm-workspace.yaml` of the user's own as
+/// `data` and states that pnpm as `stated` says
+/// ([`lists_the_file_and_states`]). The patch service offers the patch's
+/// registry and the checkout proves pnpm 12, as in
+/// [`hosted_npm_translate_lock`].
+///
+/// - (a) The first build prints the unpatched marker.
+/// - (b) `scan --mode hosted --yes` does not route the lock: it pins the
+///   entry of the package to the patched tarball, writes
+///   `trustLockfile: true` under the user's comment, and says the hub is
+///   why no registry was set up.
+/// - (c) The same build prints the patched marker ([`builds_pinned`]).
+/// - (d) `rollback --yes` leaves the checkout of before the scan, the
+///   user's file included, and the build prints the unpatched marker
+///   ([`rolls_back`]).
+fn keeps_the_lock_up_to_date_where_a_registry_is_offered(test: &str, stated: Stated) {
+    let started = Instant::now();
+    let Some((cell, standin, upstream)) = open_updating(test, Some(PNPM_11)) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    lists_the_file_and_states(&cell, stated);
+    let patch = Patched::new();
+    let record = record(&upstream, &patch);
+    grant_as(&standin, &patch, &patch.package.tarball, &record, true);
+    proves_pnpm_12(&cell);
+
+    // (a) The unpatched build, by a hub that ran its pnpm.
+    let before = builds_upstream(&cell, &standin, &upstream);
+
+    // (b) The one command of hosted mode.
+    let scan = socket_patch(&cell, &standin, &["scan", "--mode", "hosted", "--yes"]);
+    let written = [LOCK, "pnpm-workspace.yaml"];
+    let pinned = cell.pinned_by(&scan, PURL, &patch.uuid, &before, &written);
+    let workspace = format!("{OWN_WORKSPACE}{TRUSTING_WORKSPACE}");
+    assert_eq!(text(&pinned, "pnpm-workspace.yaml"), workspace, "{test}");
+    let lock = text(&pinned, LOCK);
+    assert!(!lock.contains("@socket-"), "{test}: {lock}");
+    let warned = scan.envelope["warnings"].to_string();
+    assert!(warned.contains(HUB_READS_THE_LOCK), "{test}: {}", scan.dump);
+
+    // (c) The patched build, and (d) the undo.
+    builds_pinned(&cell, &standin, &patch, &pinned);
+    rolls_back(&cell, &standin, &before, &upstream.marker);
+
+    println!(
+        "{test}: Bazel {release} built {:?} with pnpm {PNPM_11} ({stated:?}) keeping the lock \
+         up to date and pnpm-workspace.yaml in the hub's `data`; `scan --mode hosted` was \
+         offered a registry, pinned the lock with `trustLockfile` and the build printed {:?}; \
+         `rollback` brought {:?} back; {:?}",
+        upstream.marker,
+        patch.package.marker,
+        upstream.marker,
+        started.elapsed()
+    );
+}
+
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn hosted_update_pnpm_lock_with_a_registry_by_version() {
+    let test = "npm::hosted_update_pnpm_lock_with_a_registry_by_version";
+    keeps_the_lock_up_to_date_where_a_registry_is_offered(test, Stated::Version);
+}
+
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn hosted_update_pnpm_lock_with_a_registry_by_package_manager() {
+    let test = "npm::hosted_update_pnpm_lock_with_a_registry_by_package_manager";
+    keeps_the_lock_up_to_date_where_a_registry_is_offered(test, Stated::PackageManager);
+}
+
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn hosted_update_pnpm_lock_with_a_registry_by_label() {
+    let test = "npm::hosted_update_pnpm_lock_with_a_registry_by_label";
+    keeps_the_lock_up_to_date_where_a_registry_is_offered(test, Stated::Label);
+}
+
+/// The option that keeps hosted mode from writing to `pnpm-workspace.yaml`.
+const NO_SETTING: &str = "--no-trust-lockfile-config";
+
+/// What the `redirect_pnpm_trust_lockfile` warning of a scan under
+/// [`NO_SETTING`] says of the lock it pinned.
+const REJECTED: &str = "pnpm >=11 rejects the rewritten lock";
+
+/// What the pnpm 11 of a hub fails the build with on a pinned lock that
+/// no `trustLockfile: true` covers.
+const MISMATCH: &str = "ERR_PNPM_TARBALL_URL_MISMATCH";
+
+/// Hosted mode told not to write the setting ([`NO_SETTING`]), on the hub
+/// of [`keeps_the_lock_up_to_date_where_a_registry_is_offered`] with the
+/// pnpm stated by its version.
+///
+/// - (a) The first build prints the unpatched marker.
+/// - (b) `scan --mode hosted --yes --no-trust-lockfile-config` passes and
+///   pins the lock, and that file alone: the user's `pnpm-workspace.yaml`
+///   gets no `trustLockfile: true`. The warning says that pnpm 11 rejects
+///   such a lock.
+/// - (c) The build fails: the pnpm that Bazel runs rejects the lock
+///   ([`MISMATCH`]).
+/// - (d) `rollback --yes` restores the lock, and the build prints the
+///   unpatched marker again.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn hosted_update_pnpm_lock_without_the_trust_setting() {
+    let test = "npm::hosted_update_pnpm_lock_without_the_trust_setting";
+    let started = Instant::now();
+    let Some((cell, standin, upstream)) = open_updating(test, Some(PNPM_11)) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    lists_the_file_and_states(&cell, Stated::Version);
+    let patch = Patched::new();
+    let record = record(&upstream, &patch);
+    grant_as(&standin, &patch, &patch.package.tarball, &record, true);
+    proves_pnpm_12(&cell);
+
+    // (a) The unpatched build.
+    let before = builds_upstream(&cell, &standin, &upstream);
+
+    // (b) The scan pins the lock and leaves the user's file as it is.
+    let told = ["scan", "--mode", "hosted", "--yes", NO_SETTING];
+    let scan = socket_patch(&cell, &standin, &told);
+    let pinned = cell.pinned_by(&scan, PURL, &patch.uuid, &before, &[LOCK]);
+    assert!(text(&pinned, LOCK).contains(&patch.route), "{test}");
+    let warned = scan.envelope["warnings"].to_string();
+    assert!(warned.contains(REJECTED), "{test}: {}", scan.dump);
+
+    // (c) The pnpm that Bazel runs rejects the pinned lock.
+    let build = cell.bazel("build", &[CONSUMER]);
+    let rejected = !build.ok() && build.stderr().contains(MISMATCH);
+    assert!(rejected, "{test}: {}", build.dump());
+    assert_eq!(changed(&pinned, &cell.tree()), NOTHING, "{test}");
+
+    // (d) The undo.
+    let undo = socket_patch(&cell, &standin, &["rollback", "--yes"]);
+    cell.undone(&undo, "rolledBack", &before, &upstream.marker);
+
+    println!(
+        "{test}: Bazel {release} built {:?} with pnpm {PNPM_11} keeping the lock up to date; \
+         `scan --mode hosted {NO_SETTING}` pinned the lock without `trustLockfile`, and the \
+         build failed with {MISMATCH}; `rollback` brought {:?} back; {:?}",
+        upstream.marker,
         upstream.marker,
         started.elapsed()
     );
@@ -2327,6 +2533,83 @@ fn a_listed_workspace_file_has_to_hold_the_setting_and_a_line_of_the_users_own()
         let before = cell.tree();
         let scan = hosted_scan(&cell, &standin, "", &["--yes"]);
         pinned_nothing(&cell, &scan, &before, &names_the_hub(&cell), &way_on);
+    }
+}
+
+/// Without a Bazel: the scan of
+/// [`keeps_the_lock_up_to_date_where_a_registry_is_offered`], for the pnpm
+/// of the hub stated in each of the three ways. Beside the hub hosted mode
+/// does not route the lock through the registry it is offered: it writes
+/// the two files of a trust pin, the setting under the user's comment and
+/// the package under its plain key; a second scan names the hub's call
+/// and changes nothing; and `rollback` gives every file back.
+#[test]
+fn a_hub_that_keeps_the_lock_up_to_date_stays_on_the_trust_pin_where_a_registry_is_offered() {
+    for stated in EVERY_WAY {
+        let (mut cell, standin, patch, _) = checkout_granted("", false, true);
+        cell.test = format!("{stated:?}");
+        let test = &cell.test;
+        std::fs::remove_dir_all(cell.path("node_modules")).expect("the tree");
+        proves_pnpm_12(&cell);
+        keeps_the_lock_up_to_date(&cell, Some(PNPM_11));
+        lists_the_file_and_states(&cell, stated);
+        let before = cell.tree();
+
+        let pinned = pins_the_lock(&cell, &standin, &patch);
+        let written = [LOCK, "pnpm-workspace.yaml"];
+        assert_eq!(changed(&before, &pinned), written, "{test}");
+        let workspace = format!("{OWN_WORKSPACE}{TRUSTING_WORKSPACE}");
+        assert_eq!(text(&pinned, "pnpm-workspace.yaml"), workspace, "{test}");
+        let lock = text(&pinned, LOCK);
+        let plain = lock.contains(&patch.route) && !lock.contains("@socket-");
+        assert!(plain && !lock.contains("\noverrides:"), "{test}: {lock}");
+
+        let hosted = ["scan", "--mode", "hosted", "--yes"];
+        let again = socket_patch(&cell, &standin, &hosted);
+        assert_eq!(again.code, 0, "{test}: {}", again.dump);
+        let warned = again.envelope["warnings"].to_string();
+        assert!(
+            warned.contains(HUB_READS_THE_LOCK),
+            "{test}: {}",
+            again.dump
+        );
+        assert_eq!(changed(&pinned, &cell.tree()), NOTHING, "{test}");
+
+        let undo = socket_patch(&cell, &standin, &["rollback", "--yes"]);
+        assert_eq!(undo.code, 0, "{test}: {}", undo.dump);
+        assert_eq!(changed(&before, &cell.tree()), NOTHING, "{test}");
+    }
+}
+
+/// Without a Bazel: the scan of
+/// [`hosted_update_pnpm_lock_without_the_trust_setting`], which is told
+/// not to write the setting, beside a hub that keeps the lock up to date
+/// and lists the user's `pnpm-workspace.yaml`, with pnpm 11 and with a
+/// pnpm 10. Either way the scan passes and pins the lock, leaves the
+/// user's file as it is, and warns that pnpm 11 rejects such a lock.
+#[test]
+fn a_scan_told_not_to_write_the_setting_pins_the_lock_beside_a_hub() {
+    for pnpm in [PNPM_11, "10.34.9"] {
+        let (mut cell, standin, patch, _) = checkout_granted("", false, true);
+        cell.test = format!("pnpm {pnpm}");
+        let test = &cell.test;
+        std::fs::remove_dir_all(cell.path("node_modules")).expect("the tree");
+        proves_pnpm_12(&cell);
+        keeps_the_lock_up_to_date(&cell, Some(pnpm));
+        lists_the_workspace_file(&cell);
+        let before = cell.tree();
+
+        let scan = hosted_scan(&cell, &standin, "", &["--yes", NO_SETTING]);
+        let said = &scan.dump;
+        assert_eq!(scan.code, 0, "{test}: {said}");
+        assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
+        let pinned = cell.tree();
+        assert_eq!(changed(&before, &pinned), [LOCK], "{test}: {said}");
+        assert!(text(&pinned, LOCK).contains(&patch.route), "{test}");
+        let warnings = &scan.envelope["warnings"];
+        let rejected = warnings.to_string().contains(REJECTED);
+        assert!(rejected, "{test}: {said}");
+        assert!(!codes_in(warnings).contains(&HIDDEN.to_string()), "{said}");
     }
 }
 
