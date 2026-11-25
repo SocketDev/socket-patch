@@ -1702,7 +1702,11 @@ const LISTING_HUB: &str = "bazel_dep(name = \"aspect_rules_js\", version = \"3.6
 /// the lock, with none, and with nothing crawled at all, it rewrites
 /// neither the lock nor pnpm-workspace.yaml, and says why. Before, only
 /// the first left the files: the other two took the unused entries out, and
-/// with the last of them the file that the hub's `data` names.
+/// with the last of them the file that the hub's `data` names. The last
+/// hub lists a file that holds a line of the user's own, which is left to
+/// the hub by a scan that is told not to write to it
+/// (`--no-trust-lockfile-config`): the pnpm of the hub would reject a pin
+/// that such a scan adds.
 #[tokio::test]
 async fn a_hosted_scan_leaves_a_lock_to_its_bazel_hub_whatever_it_is_granted() {
     let granting = MockServer::start().await;
@@ -1716,7 +1720,12 @@ async fn a_hosted_scan_leaves_a_lock_to_its_bazel_hub_whatever_it_is_granted() {
             .iter()
             .any(|w| w["code"] == "redirect_pnpm_bazel_workspace_hidden")
     };
-    for hub in [HIDING_HUB, LISTING_HUB] {
+    let told: &[&str] = &["--no-trust-lockfile-config"];
+    for (hub, extra) in [
+        (HIDING_HUB, &[][..]),
+        (LISTING_HUB, &[]),
+        (LISTING_HUB, told),
+    ] {
         for (granted, server, installed) in [
             ("a patch", &granting, true),
             ("no patch", &empty, true),
@@ -1724,12 +1733,16 @@ async fn a_hosted_scan_leaves_a_lock_to_its_bazel_hub_whatever_it_is_granted() {
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path();
-            let (workspace, lock_text) = departed_project(root, "removed");
+            let (mut workspace, lock_text) = departed_project(root, "removed");
+            if !extra.is_empty() {
+                workspace.insert_str(0, "# the project's own\n");
+                std::fs::write(root.join("pnpm-workspace.yaml"), &workspace).unwrap();
+            }
             if !installed {
                 std::fs::remove_dir_all(root.join("node_modules")).unwrap();
             }
             std::fs::write(root.join("MODULE.bazel"), hub).unwrap();
-            let (code, doc) = scan_hosted(root, server, &[]);
+            let (code, doc) = scan_hosted(root, server, extra);
             assert_eq!(code, Some(0), "{granted}: {doc}");
             assert_eq!(entries(&doc, "removed"), [], "{granted}: {doc}");
             assert_unchanged(root, &workspace, &lock_text, granted);
@@ -1792,6 +1805,68 @@ async fn a_hub_of_a_root_lock_that_is_not_there_stands_against_no_cleanup() {
             "crawled {crawled}: {doc}"
         );
         assert_eq!(read(root, B).as_deref(), Some(BARE), "crawled {crawled}");
+    }
+}
+
+/// A scan that crawls nothing adds no pin: what it does beside a hub is
+/// to take out what a route left and no lock uses, in the lock and in
+/// pnpm-workspace.yaml together. So it does that also where it is told not
+/// to write the setting (`--no-trust-lockfile-config`) beside a hub that
+/// lists a file of the user's own: the pnpm of that hub would reject a pin
+/// such a scan adds, and this one adds none. The lock it leaves is the
+/// one without the record, byte for byte, and nothing is said of Bazel.
+/// A hub that hides the file is still left its lock, as a scan that crawls
+/// a package leaves it.
+#[tokio::test]
+async fn a_scan_that_crawls_nothing_tidies_beside_a_listing_hub_also_under_the_option() {
+    const BARE: &str = "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n";
+    const OWN: &str = "# the project's own\n";
+    let server = MockServer::start().await;
+    mock_api(&server, &[], &[]).await;
+    let record = "overrides:\n  leaf@1.0.0: socket-11111111:1.0.0\n\nimporters:\n";
+    let routed = BARE.replace("importers:\n", record);
+    let told: &[&str] = &["--no-trust-lockfile-config"];
+    for (case, hub, extra, tidied) in [
+        ("told", LISTING_HUB, told, true),
+        ("not told", LISTING_HUB, &[][..], true),
+        ("hidden, told", HIDING_HUB, told, false),
+        ("hidden", HIDING_HUB, &[], false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (rel, text) in [
+            ("package.json", r#"{"name":"app","private":true}"#),
+            ("pnpm-workspace.yaml", OWN),
+            ("pnpm-lock.yaml", routed.as_str()),
+            ("MODULE.bazel", hub),
+        ] {
+            std::fs::write(root.join(rel), text).unwrap();
+        }
+        let (code, doc) = scan_hosted(root, &server, extra);
+        assert_eq!(code, Some(0), "{case}: {doc}");
+        assert_eq!(doc["scannedPackages"].as_u64(), Some(0), "{case}: {doc}");
+        let warned = doc["warnings"].to_string();
+        assert_eq!(
+            warned.contains("redirect_pnpm_bazel_workspace_hidden"),
+            !tidied,
+            "{case}: {doc}"
+        );
+        let removed = match tidied {
+            true => vec![entry("pnpm-lock.yaml", "lockOverride", "leaf@1.0.0")],
+            false => Vec::new(),
+        };
+        assert_eq!(entries(&doc, "removed"), removed, "{case}: {doc}");
+        let kept = if tidied { BARE } else { routed.as_str() };
+        assert_eq!(
+            read(root, "pnpm-lock.yaml").as_deref(),
+            Some(kept),
+            "{case}: {doc}"
+        );
+        assert_eq!(
+            read(root, "pnpm-workspace.yaml").as_deref(),
+            Some(OWN),
+            "{case}"
+        );
     }
 }
 

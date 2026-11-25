@@ -272,12 +272,21 @@ pub struct Tag<'a> {
     /// file included with `dev_dependency`, which 9.3.2 takes, is not
     /// read at all.
     pub dev_dependency: Option<bool>,
+    /// Whether that proxy was made with `isolate = True`: such a use has
+    /// tags and repositories of its own, apart from the use of the
+    /// extension that every module shares. `None` when that argument is
+    /// not written as `True` or `False`.
+    pub isolate: Option<bool>,
 }
 
 /// The calls of one tag of one extension in a workspace.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Tags<'a> {
     pub calls: Vec<Tag<'a>>,
+    /// The `use_repo` and `inject_repo` calls that take a proxy of the
+    /// extension, by its name, as their first argument: each as a tag is,
+    /// with the use its proxy was made by.
+    pub handed: Vec<Tag<'a>>,
     /// Why there may be other calls of this extension than these, beyond
     /// what [`Workspace::doubts`] says of every answer. Empty: the
     /// extension's proxies are only ever called and handed to `use_repo`
@@ -325,7 +334,7 @@ pub struct Workspace {
     /// The module behind each repository name a `bazel_dep` gives.
     deps: BTreeMap<String, String>,
     /// What [`handed`] finds in each of `files`.
-    handed: Vec<BTreeSet<(usize, usize)>>,
+    handed: Vec<BTreeMap<(usize, usize), usize>>,
 }
 
 /// The functions a proxy may be handed to. `override_repo` is none: it
@@ -339,15 +348,17 @@ const TAKE_A_PROXY: [&str; 2] = ["use_repo", "inject_repo"];
 const PREDECLARED: [&str; 4] = ["bazel_dep", "include", "module", "use_extension"];
 
 /// The bytes of the first argument of each `use_repo` and `inject_repo`
-/// of `file`. To be the whole of one is the one use of a proxy, besides
-/// calling a tag on it, that is read.
-fn handed(file: &File) -> BTreeSet<(usize, usize)> {
-    let takes = |call: &&Call| call.bind.is_none() && TAKE_A_PROXY.contains(&call.callee.as_str());
-    let first = |call: &Call| {
+/// of `file`, with the call: an index into [`File::calls`]. To be the
+/// whole of one is the one use of a proxy, besides calling a tag on it,
+/// that is read.
+fn handed(file: &File) -> BTreeMap<(usize, usize), usize> {
+    let takes = |call: &Call| call.bind.is_none() && TAKE_A_PROXY.contains(&call.callee.as_str());
+    let first = |(at, call): (usize, &Call)| {
         let first = call.args.first().filter(|arg| arg.how == How::Positional);
-        first.map(|arg| (arg.span.start, arg.span.end))
+        let first = first.filter(|_| takes(call));
+        first.map(|arg| ((arg.span.start, arg.span.end), at))
     };
-    file.calls.iter().filter(takes).filter_map(first).collect()
+    file.calls.iter().enumerate().filter_map(first).collect()
 }
 
 fn string(value: Option<&Value>) -> Option<&str> {
@@ -520,7 +531,7 @@ impl Workspace {
                 // The proxy gets a name, goes to `use_repo`, or is dropped.
                 "use_extension" => {
                     let span = (call.span.start, call.span.end);
-                    let placed = call.whole || handed.contains(&span);
+                    let placed = call.whole || handed.contains_key(&span);
                     placed && extension(call).is_some()
                 }
                 // Bazel takes none here, and what it binds is not followed.
@@ -640,19 +651,19 @@ impl Workspace {
         let mut tags = Tags::default();
         for ((path, file), handed) in self.files.iter().zip(&self.handed) {
             // The `use_extension` calls that ask for the extension, and
-            // whether each makes a dev dependency. Each call is looked at
-            // once, however many names it has.
+            // whether each makes a dev dependency and an isolated use. Each
+            // call is looked at once, however many names it has.
             let mut asked = BTreeMap::new();
             for (at, call) in file.calls.iter().enumerate() {
                 let asks = call.bind.is_none() && call.callee == "use_extension";
                 if asks && self.asks_for(call, extension) {
-                    let dev = match call.arg("dev_dependency") {
+                    let said = |name| match call.arg(name) {
                         None => Some(false),
-                        Some(Value::Name(dev)) if dev == "True" => Some(true),
-                        Some(Value::Name(dev)) if dev == "False" => Some(false),
+                        Some(Value::Name(said)) if said == "True" => Some(true),
+                        Some(Value::Name(said)) if said == "False" => Some(false),
                         Some(_) => None,
                     };
-                    asked.insert(at, dev);
+                    asked.insert(at, (said("dev_dependency"), said("isolate")));
                 }
             }
             if asked.is_empty() {
@@ -662,9 +673,15 @@ impl Workspace {
             let mut proxies = BTreeMap::new();
             for (at, bind) in file.binds.iter().enumerate() {
                 if let Bound::Call(call) = bind.to {
-                    proxies.extend(asked.get(&call).map(|dev| (at, *dev)));
+                    proxies.extend(asked.get(&call).map(|said| (at, *said)));
                 }
             }
+            let of = |call, (dev_dependency, isolate)| Tag {
+                file: path,
+                call,
+                dev_dependency,
+                isolate,
+            };
             let mut doubt = |line, why: String| {
                 if tags.doubts.len() < MAX_DOUBTS {
                     let file = path.clone();
@@ -672,22 +689,23 @@ impl Workspace {
                 }
             };
             for used in &file.uses {
-                let proxy = used.bind.is_some_and(|bind| proxies.contains_key(&bind));
-                if proxy && !handed.contains(&(used.at, used.at + used.name.len())) {
-                    let why = format!("`{}` is used other than to call a tag", used.name);
-                    doubt(used.line, why);
+                let Some(said) = used.bind.and_then(|bind| proxies.get(&bind)) else {
+                    continue;
+                };
+                match handed.get(&(used.at, used.at + used.name.len())) {
+                    Some(call) => tags.handed.push(of(&file.calls[*call], *said)),
+                    None => {
+                        let why = format!("`{}` is used other than to call a tag", used.name);
+                        doubt(used.line, why);
+                    }
                 }
             }
             for call in &file.calls {
-                let Some(dev) = call.bind.and_then(|bind| proxies.get(&bind)) else {
+                let Some(said) = call.bind.and_then(|bind| proxies.get(&bind)) else {
                     continue;
                 };
                 match call.callee.split('.').collect::<Vec<_>>()[..] {
-                    [_, name] if name == tag => tags.calls.push(Tag {
-                        file: path,
-                        call,
-                        dev_dependency: *dev,
-                    }),
+                    [_, name] if name == tag => tags.calls.push(of(call, *said)),
                     [_, _] => {}
                     _ => doubt(call.line, format!("`{}` is no call of a tag", call.callee)),
                 }
@@ -1400,6 +1418,15 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
         let tags = ws.tags(&NPM, "npm_translate_lock");
         assert_eq!(sites(&tags), ["MODULE.bazel:2", "MODULE.bazel:7"]);
         assert_eq!((&ws.doubts, &tags.doubts), (&vec![], &vec![]));
+        // The calls that take the proxy by a name are listed, in the order
+        // of the file: not the one that takes the `use_extension` itself.
+        let handed = |tag: &Tag| format!("{}:{}", tag.call.callee, tag.call.line);
+        assert_eq!(
+            tags.handed.iter().map(handed).collect::<Vec<_>>(),
+            ["use_repo:3", "use_repo:4", "inject_repo:5", "use_repo:8"]
+        );
+        // And none of another extension's proxy.
+        assert_eq!(ws.tags(&PIP, "parse").handed, []);
     }
 
     #[test]
@@ -1758,6 +1785,31 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
             ));
             let tags = ws.tags(&PIP, "parse");
             assert_eq!(tags.calls[0].dev_dependency, want, "{written}");
+            assert_eq!(tags.doubts, [], "{written}");
+        }
+    }
+
+    /// `isolate` is told as `dev_dependency` is, and a call that takes the
+    /// proxy is told both of the use its proxy was made by, as a tag is.
+    #[test]
+    fn isolate_is_told_when_it_is_written_out_and_a_handed_proxy_has_its_use() {
+        for (written, want) in [
+            ("", Some(false)),
+            (", isolate = False", Some(false)),
+            (", isolate = True", Some(true)),
+            (", isolate = ISOLATED", None),
+        ] {
+            let ws = module(&format!(
+                "pip = use_extension('@rules_python//python/extensions:pip.bzl', 'pip', \
+                 dev_dependency = True{written})\n\
+                 pip.parse()\nuse_repo(pip, 'hub')\n"
+            ));
+            let tags = ws.tags(&PIP, "parse");
+            assert_eq!(tags.handed[0].call.callee, "use_repo", "{written}");
+            for tag in [tags.calls[0], tags.handed[0]] {
+                let said = (tag.dev_dependency, tag.isolate);
+                assert_eq!(said, (Some(true), want), "{written}");
+            }
             assert_eq!(tags.doubts, [], "{written}");
         }
     }

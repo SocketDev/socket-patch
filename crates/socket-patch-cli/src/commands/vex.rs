@@ -1916,17 +1916,13 @@ const BAZEL_NOT_IN_BUILD: &str = "vex_bazel_not_in_build";
 const AFFECTED_REASON: &str = "attested as affected, not as patched: Bazel does not build the \
     patched copy of this package; the run warning names what it builds from";
 
-/// The closing sentence of the action statement, and so of the run warning,
-/// of a package that is affected because its patch is in the installed copy
-/// alone.
-const INSTALLED_TREE_SHIPS: &str = "If what you ship is the installed tree and not what Bazel \
-    builds, pass `--no-bazel` (`--vex-no-bazel` on scan, apply and vendor).";
-
 /// In a Bazel workspace, a hub of aspect_rules_js, rules_python,
-/// rules_ruby, rules_rust or rules_csharp builds a package from the lock a
-/// workspace file names, never from the copy a package manager installed,
-/// and rules_python builds nothing from a line that points at a copy under
-/// `.socket/vendor` ([`socket_patch_core::bazel::built`]). A patch that is
+/// rules_ruby, rules_rust, rules_csharp or rules_jvm_external builds a
+/// package from the lock a workspace file names, never from the copy a
+/// package manager installed (a jar of the Maven local repository only at
+/// the lock's sha256), and rules_python builds nothing from a line
+/// that points at a copy under `.socket/vendor`
+/// ([`socket_patch_core::bazel::built`]). A patch that is
 /// only in such a copy is in no build of Bazel's, so its package is not
 /// attested as patched: it leaves `outcome.applied` and is returned with
 /// what to do about it, for statements that say `affected`
@@ -1941,6 +1937,10 @@ const INSTALLED_TREE_SHIPS: &str = "If what you ship is the installed tree and n
 /// be read with certainty: the statement stays the one of a project
 /// without Bazel. So is a patch whose record names no advisory: no run
 /// writes a statement for it, and it is left out for that reason alone.
+/// A Maven patch is asked about whichever mode recorded it: no file of a
+/// project decides what a rules_jvm_external hub fetches, so a pin of a
+/// `pom.xml` or a Gradle file, and a copy vendored for such a build, are
+/// in the Bazel build only through an entry of the root `MODULE.bazel`.
 ///
 /// With `--no-bazel` / `--vex-no-bazel` (`params.no_bazel`) the user has
 /// said that the document is about the installed tree, which is what the
@@ -1969,7 +1969,8 @@ async fn unbuilt_by_bazel(
         let cached = plan.vendor_entries.get(purl);
         let cached = cached
             .is_some_and(|entry| socket_patch_core::vendor::pypi_distdir::line_of(entry).is_some());
-        let pinned = cached || plan.hosted.contains_key(purl);
+        let hosted = plan.hosted.contains_key(purl) && !purl.starts_with(MAVEN);
+        let pinned = cached || hosted;
         let judged = !pinned && !record.vulnerabilities.is_empty();
         judged.then(|| Patched {
             purl: purl.clone(),
@@ -1995,20 +1996,28 @@ async fn unbuilt_by_bazel(
     affected
 }
 
+/// The start of a Maven purl.
+const MAVEN: &str = "pkg:maven/";
+
 /// The action statement for `package`, whose patch Bazel does not build:
 /// what `call` builds the package from, and what to run so that the build
 /// holds the patch. For an installed copy that is the hub's own remedy
 /// ([`Unbuilt::remedy`]). Hosted and vendored mode write in the project
-/// they run in, so it names the directory of the lock.
+/// they run in, so it names the directory of the lock, and for a Maven jar
+/// the Bazel root, where the patch of a hub is written, or what keeps
+/// those modes from writing it.
 ///
 /// For an installed copy it ends with the way out of a repository that
 /// ships the installed tree and keeps the hub for something else: the
 /// option, in both spellings, since the statement is the same whichever
-/// command wrote the document. Not for a committed PyPI copy: there the
+/// command wrote the document. A Maven patch has the same statement in
+/// every mode, a committed copy included, in words that hold for each:
+/// the patch is in what Maven or Gradle builds from, and that build is
+/// what such a repository ships. Not for a committed PyPI copy: there the
 /// build is broken or takes the registry's package, and the installed tree
 /// is not the patched one either.
 fn bazel_build_action(package: &Patched, call: &Unbuilt) -> String {
-    let Patched { uuid, pins, .. } = package;
+    let Patched { purl, uuid, pins } = package;
     let Unbuilt {
         call: tag,
         file,
@@ -2016,11 +2025,20 @@ fn bazel_build_action(package: &Patched, call: &Unbuilt) -> String {
         lock,
         remedy,
     } = call;
-    match pins {
+    let maven = purl.starts_with(MAVEN);
+    let (only, ships) = match maven {
+        true => (
+            "what Maven or Gradle builds from",
+            "what Maven or Gradle builds",
+        ),
+        false => ("the installed copy", "the installed tree"),
+    };
+    match pins.as_ref().filter(|_| !maven) {
         None => format!(
             "Bazel builds this package from {lock} (`{tag}`, {file}:{line}), which does not \
-             name Socket patch {uuid}: the patch is only in the installed copy. {remedy} \
-             {INSTALLED_TREE_SHIPS}"
+             name Socket patch {uuid}: the patch is only in {only}. {remedy} If what you ship \
+             is {ships} and not what Bazel builds, pass `--no-bazel` (`--vex-no-bazel` on scan, \
+             apply and vendor)."
         ),
         Some(_) => format!(
             "Bazel builds no package from the line of {lock} that points at the copy of Socket \

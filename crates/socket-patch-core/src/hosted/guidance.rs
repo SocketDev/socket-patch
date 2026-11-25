@@ -553,22 +553,26 @@ pub fn pnpm_registry_mirrored_reason(packages: &[String]) -> String {
 }
 
 /// The clause for a project whose pnpm lock a rules_js hub of its Bazel
-/// workspace reads, or may read where the workspace could not be read
-/// whole ([`crate::bazel::pnpm::Reader`]). What holds the route
-/// back is the pnpm such a hub runs with `update_pnpm_lock`, which sees the
-/// registries only where the call lists pnpm-workspace.yaml and may be
-/// older than pnpm 11.20; the lock reader of rules_js takes a routed lock.
-/// The project keeps the pin that the Bazel legs build.
-pub fn pnpm_registry_bazel_reason(reader: &crate::bazel::pnpm::Reader) -> String {
+/// workspace reads in a shape whose build of a routed lock is not known,
+/// or may read where the workspace could not be read whole
+/// ([`crate::bazel::pnpm::Reader`]): what kept the hub off the route, and
+/// the two shapes that are routed. `None` for a hub that takes a routed
+/// lock.
+pub fn pnpm_registry_bazel_reason(reader: &crate::bazel::pnpm::Reader) -> Option<String> {
     use crate::bazel::pnpm::Reader;
     let hub = match reader {
-        Reader::Call(call) => format!("a Bazel hub reads the pnpm lock ({call})"),
-        Reader::Unseen(what) => format!("a Bazel hub may read the pnpm lock ({what})"),
+        Reader::Takes(_) => return None,
+        Reader::Call(call, why) => format!("a Bazel hub reads the pnpm lock ({call}), and {why}"),
+        Reader::Unseen(what) => {
+            format!("a Bazel hub may read the pnpm lock ({what}), in a shape that was not read")
+        }
     };
-    format!(
-        "{hub}, and a lock that a hub reads is not routed yet: the pnpm a hub runs for \
-         `update_pnpm_lock` may not read the registries in {PNPM_WORKSPACE_REL}"
-    )
+    Some(format!(
+        "{hub}: a lock that a hub reads is routed only where the call of the hub passes nothing \
+         but `name`, `pnpm_lock`, `data`, `update_pnpm_lock` and `use_pnpm`, and either leaves \
+         `update_pnpm_lock` off, or lists {PNPM_WORKSPACE_REL} in its `data` and states a pnpm \
+         of 11.20 or later"
+    ))
 }
 
 /// The clause for a project whose root pnpm lock a Bazel hub keeps out of

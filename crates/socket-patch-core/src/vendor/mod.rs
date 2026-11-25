@@ -20,7 +20,7 @@
 //! | gem      | gem dir (+gemspec)  | Gemfile `path:` + Gemfile.lock PATH pair       |
 //! | pypi     | rebuilt wheel       | per manifest flavor: uv, poetry, pdm, pipenv, requirements ([`pypi`] routes) |
 //! | maven    | patched jar         | suffixed `<version>-socket.<hex8>` tree under `.socket/vendor/maven2` + pom pin, `.mvn/maven.config` (or Gradle / sbt / scala-cli wiring) ([`maven_repo`] routes to [`jvm`]) |
-//! | nuget    | rebuilt nupkg       | folder feed + `nuget.config` + `packages.lock.json` pin ([`nuget_feed`]) |
+//! | nuget    | rebuilt nupkg       | folder feed + `nuget.config` + `packages.lock.json` pin, and under a rules_csharp hub a block in the root `MODULE.bazel` ([`nuget_feed`]) |
 //!
 //! npm requests route through [`npm_flavor`], which content-sniffs the
 //! project's lockfile (not just file presence) and dispatches to the

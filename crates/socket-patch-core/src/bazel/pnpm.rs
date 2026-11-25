@@ -21,6 +21,18 @@
 //! written out, keep it up to date, not list the `pnpm-workspace.yaml`
 //! beside it, and run a pnpm that may be 11 or later.
 //!
+//! Told not to write to that file (`--no-trust-lockfile-config`), hosted
+//! mode writes no setting for such a pnpm to read, so a hub that lists the
+//! file gets nothing either unless the file holds `trustLockfile: true`
+//! already ([`Hubs::unset`]). That answer is about a pin: a scan that
+//! crawls nothing adds none, and takes out what a route left as it does
+//! without Bazel.
+//!
+//! The same read says whether a lock may be routed through the named
+//! registries of `pnpm-workspace.yaml` in place of that setting
+//! ([`Hubs::reader`]): only where every call that reads it is written out
+//! in a shape whose build takes a routed lock ([`Reader`]).
+//!
 //! A hub that lists the file is passed over only where the pin would be
 //! one the build takes and an undo leaves standing. It is not where hosted
 //! mode does not write the setting to the file (the file sets
@@ -53,6 +65,29 @@
 //! repository rule, can be any pnpm (the first measured: Bazel 9.3.2 runs
 //! the pnpm 11 of the tag `pnpm` under the name `eleven`).
 //!
+//! The route asks for more than the pin does, because a release that is
+//! taken for 11.20 or later and is not the one the hub runs loses the
+//! patch or fails the build: the repository has to be one of the use of
+//! the pnpm extension that every module shares ([`Pnpm::Stated`]). A
+//! `use_repo` on another extension's proxy can take a repository of the
+//! same name as a tag, a use with `isolate` has tags and repositories of
+//! its own, and an `inject_repo` on the extension is not read: each keeps
+//! the hub off the route and changes nothing for the pin. Only a `use_repo`
+//! on a name of the extension's proxy is followed for it. And the release
+//! has to be the hub's in every build: a use of the extension with
+//! `dev_dependency` is one whose tags Bazel drops under
+//! `--ignore_dev_dependency` (`ModuleFileGlobals.useExtension` at 7.7.2,
+//! 8.8.2 and 9.3.2), and the hub then runs the pnpm that rules_js picks.
+//! So a release that such a use states does not count for the route. Nor
+//! does one whose tag Bazel may not run as it is written: a tag that is
+//! no statement of its own (behind a condition, in a comprehension) may
+//! not run, and one whose `name` is not written out in a plain string may
+//! make another repository. The `use_repo` that takes the repository and
+//! the call of the hub itself have to be statements of their own as well.
+//! The pin reads each of these as it is written, as it did, and builds
+//! either way: its setting is in the file the hub lists, for whichever
+//! pnpm asks for it.
+//!
 //! In memory the workspace is the project's own files: path selection
 //! asks for the `MODULE.bazel` beside a `pnpm-lock.yaml` or a
 //! `pnpm-workspace.yaml`, for the files one can include and for the
@@ -63,7 +98,8 @@
 //! `pnpm_version_from` file that was not handed in (one outside the
 //! project's own manifests) and `MODULE.bazel.lock` are not there either:
 //! the first reads as a release that is not written out, so a lock that a
-//! checkout pins can be left as it is in memory.
+//! checkout pins can be left as it is in memory, and one that a checkout
+//! routes can be pinned there.
 //!
 //! What is not written out counts against writing, because a broken build
 //! outranks a missed patch that a warning explains: an `update_pnpm_lock`
@@ -75,9 +111,11 @@
 //! ([`Workspace::doubts`], a `WORKSPACE` file) withholds nothing: a
 //! project whose lock no listed call names is left as it is.
 
+use std::cell::OnceCell;
+
 use super::rc::ModuleLock;
 use super::starlark::{Arg, Call, File, How, Value};
-use super::workspace::{disk, memory, Doubt, Entry, Extension, Label, Repo, Workspace};
+use super::workspace::{disk, memory, Doubt, Entry, Extension, Label, Repo, Tag, Tags, Workspace};
 use crate::formats::text::strip_bom;
 use crate::hosted::guidance::{is_trust_scaffold, plan_workspace_trust, TrustPlan};
 use crate::patch::redirect::RewriteWarning;
@@ -110,41 +148,74 @@ pub struct Hubs {
     /// module docs): hosted mode then writes nothing for the root pnpm
     /// lock.
     pub hidden: Option<RewriteWarning>,
+    /// That warning for a run that is told not to write to
+    /// `pnpm-workspace.yaml` (`--no-trust-lockfile-config`), where
+    /// [`Self::hidden`] is none: the hub lists the file, its pnpm may be
+    /// 11 or later, and the file does not hold `trustLockfile: true`,
+    /// which this run would not write. The pin would be one that the pnpm
+    /// of the build rejects, so such a run writes nothing for the root
+    /// lock either ([`Self::hides`]).
+    pub unset: Option<RewriteWarning>,
     /// The hub that reads one of the project's pnpm locks ([`Reader`]):
-    /// hosted mode then routes none of them through a named registry.
+    /// hosted mode then routes them through named registries only where
+    /// the build of every such hub takes a routed lock.
     pub reader: Option<Reader>,
+}
+
+impl Hubs {
+    /// The warning with which a run leaves the root lock as it is: one
+    /// that writes its setting to `pnpm-workspace.yaml` (`writes`), or one
+    /// that is told not to.
+    pub fn hides(&self, writes: bool) -> Option<&RewriteWarning> {
+        let unset = self.unset.as_ref().filter(|_| !writes);
+        self.hidden.as_ref().or(unset)
+    }
 }
 
 /// A rules_js hub that reads a pnpm lock of the project.
 ///
 /// Hosted mode asks before it routes a patched release through a named
-/// registry of pnpm-workspace.yaml, and keeps such a project on the pin
-/// that the Bazel legs build, whatever else the call says: with or without
-/// `update_pnpm_lock`, and whatever pnpm it runs.
+/// registry of pnpm-workspace.yaml. It does where the build of every hub
+/// that reads a lock takes a routed lock ([`Self::Takes`]), and keeps the
+/// project on the pin with `trustLockfile` everywhere else, where the
+/// warning says what kept the hub off the route.
 ///
-/// The lock reader of rules_js is not what holds the route back: it takes
-/// a routed lock (measured on macOS: rules_js 3.6.0 on Bazel 9.3.2 builds
-/// one, a hub without `update_pnpm_lock`, and the packages it builds hold
-/// the patched bytes; so does rules_js 2.9.3 on Bazel 8.8.2). The pnpm of
-/// a hub with `update_pnpm_lock` is: it runs in a directory that holds the
-/// lock, the `package.json` files and the `data` of the call, so it sees
-/// the registries only where the call lists pnpm-workspace.yaml, and
-/// without them pnpm 11.28.13 and 12.22.0 reject a routed lock
-/// (`ERR_PNPM_MISSING_NAMED_REGISTRY`, measured with
-/// `pnpm install --lockfile-only`). It may also be older than the pnpm
-/// 11.20 that reads such a lock: rules_js picks a pnpm 10 where the
-/// workspace states none. No Bazel leg builds a routed lock with
-/// `update_pnpm_lock` yet, and a hub can turn that attribute on at any
-/// time, so the answer is the same for every hub that reads the lock.
+/// Two shapes of a call take one, for a project at the root of the Bazel
+/// workspace whose root lock is its one pnpm lock, which the call names in
+/// a plain string, and which is a statement of its own that passes
+/// nothing but the attributes those calls had ([`BUILT`]) (measured on
+/// Bazel 9.3.2, 8.8.2 and 7.7.2 with rules_js 3.6.0: the build holds the
+/// patched bytes, a second build changes no file, and `rollback` brings
+/// the upstream build back):
+///
+/// - No `update_pnpm_lock`, or `False`: no pnpm runs, and the lock reader
+///   of rules_js builds a routed lock.
+/// - `update_pnpm_lock = True`, a `data` that lists the pnpm-workspace.yaml
+///   beside the lock, and a pnpm that the root module states as a release
+///   of 11.20.0 or later, in a repository of the use of the pnpm extension
+///   that every module shares, by no use that is a dev dependency and in
+///   tags that Bazel runs as they are written ([`release`]). That pnpm
+///   runs in a directory that holds the lock, the `package.json` files and
+///   the `data` of the call, reads the registries there, and writes the
+///   lock back as it is. Without the file it fails the build
+///   (`ERR_PNPM_MISSING_NAMED_REGISTRY`). A pnpm below 11.20 builds the
+///   routed lock as long as it does not resolve again; once a
+///   `package.json` asks for another package, pnpm 11.19.0 puts the
+///   upstream release back and pnpm 10.34.9 fails the build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reader {
     /// The call (`MODULE.bazel:7`) that names one of the locks in a plain
     /// string, or whose `pnpm_lock` is not written out as one, which may.
-    /// For a project below the Bazel root the text says that its paths are
+    /// With what keeps it off the route, as a clause of the warning. For
+    /// a project below the Bazel root the text says that its paths are
     /// from that root, here and in [`Self::Unseen`], as the warning of
     /// [`Hubs::hidden`] does: a run in the project's directory has no file
     /// of that name beside it.
-    Call(String),
+    Call(String, String),
+    /// Every call that reads a lock was read, and each is in a shape whose
+    /// build takes a routed lock: the first of them. The workspace file
+    /// still has to stay where it is, for the `data` that may name it.
+    Takes(String),
     /// No such call was read, and the workspace was not read whole: what
     /// could not be read of it, where a hub may be. A doubt of the reader
     /// ([`Workspace::doubts`], the doubts of the hub's tags) as `file:line:
@@ -155,8 +226,8 @@ pub enum Reader {
     /// [`Hubs::hidden`] passes over what was not seen, because withholding
     /// there would take a patch from projects that are patched today. Not
     /// taking the route costs no patch: the project gets the pin it gets
-    /// today. So the route is taken only where it is certain that no hub
-    /// reads a lock.
+    /// today. So the route is taken only where it is certain which hubs
+    /// read a lock, also beside a call that takes a routed one.
     ///
     /// Certain of the files that were read, that is. On disk those are the
     /// files of the Bazel workspace the project is in. In memory they are
@@ -182,7 +253,7 @@ pub async fn hubs(view: &ProjectView<'_>, root: bool, members: &[String]) -> Hub
     locks.extend(members.iter().cloned());
     let mut hubs = read(view, &locks).await;
     if !root {
-        hubs.hidden = None;
+        (hubs.hidden, hubs.unset) = (None, None);
     }
     hubs
 }
@@ -226,12 +297,28 @@ pub async fn hidden(view: &ProjectView<'_>) -> Option<RewriteWarning> {
 /// root, empty for the root) of the workspace behind `view`.
 fn answer(view: &dyn Fn(&str) -> Entry, project: &str, locks: &[String]) -> Hubs {
     let ws = Workspace::read(view);
-    let hidden = judge(&ws, view, project).map(|detail| RewriteWarning {
+    let hubs = ws.tags(&extension("npm"), "npm_translate_lock");
+    // What the three answers ask for is read once, when the first of them
+    // does: the pnpm-workspace.yaml beside the lock, and the pnpm of a hub.
+    let beside = OnceCell::new();
+    let beside = || beside.get_or_init(|| view(&below(project, SETTINGS)));
+    let read: Vec<_> = hubs.calls.iter().map(|_| OnceCell::new()).collect();
+    let pnpm = |at: usize| read[at].get_or_init(|| release(&ws, view, hubs.calls[at].call));
+    let warning = |detail| RewriteWarning {
         code: HIDDEN.into(),
         detail,
-    });
-    let reader = reader(&ws, project, locks);
-    Hubs { hidden, reader }
+    };
+    let said = |writes| judge(&ws, &beside, project, &hubs, &pnpm, writes).map(warning);
+    let hidden = said(true);
+    let unset = match hidden {
+        Some(_) => None,
+        None => said(false),
+    };
+    Hubs {
+        hidden,
+        unset,
+        reader: reader(&ws, project, locks, &hubs, &pnpm),
+    }
 }
 
 /// A path of the project in the directory `project`, from the Bazel root.
@@ -276,26 +363,144 @@ fn names(ws: &Workspace, call: &Call) -> Named {
     }
 }
 
+/// Whether the `data` of the hub `call` lists `settings`, the
+/// pnpm-workspace.yaml beside its lock: `None` where it does, else whether
+/// `data` is written out, so that the label is one to add to it.
+fn unlisted(ws: &Workspace, call: &Call, settings: &str) -> Option<bool> {
+    let main = |label: &str| ws.label(label).filter(|label| label.repo == Repo::Main);
+    let listed = |label: &String| main(label).is_some_and(|label| label.path() == settings);
+    match call.arg("data") {
+        Some(Value::List(labels)) if labels.iter().any(listed) => None,
+        Some(Value::List(_)) => Some(true),
+        None => Some(!call.unpacks()),
+        _ => Some(false),
+    }
+}
+
+/// The attributes of the calls that were built with a routed lock
+/// ([`Reader`]). Any other can change what the hub makes of the lock. A
+/// routed lock has the patched release under another version
+/// (`socket-<id>:1.0.0`), so a `patches` entry that is keyed by the
+/// package's name and version names no package of it, and rules_js fails
+/// the build on such an entry (3.6.0, `npm_translate_lock_helpers.bzl`;
+/// measured on Bazel 9.3.2, 8.8.2 and 7.7.2). With `npm_package_lock`,
+/// `yarn_lock` or `preupdate` a pnpm writes the lock anew, which no build
+/// was run for.
+const BUILT: [&str; 5] = ["name", "pnpm_lock", "data", "update_pnpm_lock", "use_pnpm"];
+
+/// What keeps the hub `call`, which reads the lock `named`, off the route
+/// through named registries, as a clause of the warning: `None` for the
+/// two shapes whose build takes a routed lock ([`Reader`]). `several`: the
+/// project has other pnpm locks than its root lock. `pnpm`: the pnpm the
+/// hub runs ([`release`]).
+fn off_route<'a>(
+    ws: &Workspace,
+    project: &str,
+    call: &Call,
+    named: &Named,
+    several: bool,
+    pnpm: &dyn Fn() -> &'a Pnpm,
+) -> Option<String> {
+    let settings = below(project, SETTINGS);
+    match named {
+        Named::File(lock) if lock.path() == below(project, LOCK) => {}
+        Named::File(_) => return Some("the lock it reads is a workspace member's own".into()),
+        _ => return Some("its `pnpm_lock` is not written out in a plain string".into()),
+    }
+    if !project.is_empty() {
+        return Some("the project is not at the root of the Bazel workspace".into());
+    }
+    // The route records its overrides in every lock of the project, and
+    // the pnpm of a hub resolves beside the one lock its call names.
+    if several {
+        return Some(
+            "the project has workspace members with pnpm locks of their own, a layout that no \
+             routed lock was built with"
+                .into(),
+        );
+    }
+    // Behind a condition or in a comprehension it may not run as it is
+    // written, which is no shape that a routed lock was built with.
+    if !call.whole {
+        return Some("it is not a statement of its own, so it may not run as it is written".into());
+    }
+    let unbuilt = call.args.iter().find_map(|arg| match &arg.how {
+        How::Keyword(name) if BUILT.contains(&name.as_str()) => None,
+        How::Keyword(name) => Some(format!(
+            "its `{name}` is an attribute that no routed lock was built with"
+        )),
+        _ => Some("it passes arguments that are not written out".into()),
+    });
+    if unbuilt.is_some() {
+        return unbuilt;
+    }
+    match call.arg("update_pnpm_lock") {
+        Some(Value::Name(written)) if written == "False" => return None,
+        None => return None,
+        Some(Value::Name(written)) if written == "True" => {}
+        _ => return Some("its `update_pnpm_lock` is not written out as `True` or `False`".into()),
+    }
+    if unlisted(ws, call, &settings).is_some() {
+        return Some(format!(
+            "its `data` is not written out as a list of strings that holds `//:{settings}`"
+        ));
+    }
+    let stated = match pnpm() {
+        Pnpm::Stated(_, version, Some(unshown)) => {
+            return Some(format!(
+                "the pnpm it runs for `update_pnpm_lock` is not shown to be the one the root \
+                 module states (pnpm {version}): {unshown}"
+            ))
+        }
+        // A release in full: a prerelease of 11.20.0 is older than it, and
+        // a number of fewer parts is none that a build was run with.
+        Pnpm::Stated(numbers, version, _) if *numbers >= (11, 20, 0) => {
+            let (major, minor, patch) = numbers;
+            if *version == format!("{major}.{minor}.{patch}") {
+                return None;
+            }
+            format!(" (pnpm {version}, which is not a release of three numbers)")
+        }
+        Pnpm::Stated(_, version, _) => format!(" (pnpm {version})"),
+        _ => String::new(),
+    };
+    Some(format!(
+        "the pnpm it runs for `update_pnpm_lock` is not stated as 11.20 or later{stated}"
+    ))
+}
+
 /// [`Hubs::reader`] for the locks `locks` of the project in the directory
-/// `project` of the workspace `ws`.
-fn reader(ws: &Workspace, project: &str, locks: &[String]) -> Option<Reader> {
-    let hubs = ws.tags(&extension("npm"), "npm_translate_lock");
+/// `project` of the workspace `ws`: of its hubs `hubs`, each of which runs
+/// the pnpm that `pnpm` gives for its place in that list.
+fn reader<'a>(
+    ws: &Workspace,
+    project: &str,
+    locks: &[String],
+    hubs: &Tags,
+    pnpm: &dyn Fn(usize) -> &'a Pnpm,
+) -> Option<Reader> {
     let from = from_root(project);
-    let call = hubs.calls.iter().find_map(|tag| {
-        let reads = match names(ws, tag.call) {
+    let mut takes = None;
+    for (at, tag) in hubs.calls.iter().enumerate() {
+        let named = names(ws, tag.call);
+        let reads = match &named {
             Named::File(label) => locks
                 .iter()
                 .any(|lock| label.path() == below(project, lock)),
             Named::Elsewhere => false,
             Named::Unwritten => true,
         };
-        reads.then(|| Reader::Call(format!("{}:{}{from}", tag.file, tag.call.line)))
-    });
-    if call.is_some() {
-        return call;
+        if !reads {
+            continue;
+        }
+        let call = format!("{}:{}{from}", tag.file, tag.call.line);
+        match off_route(ws, project, tag.call, &named, locks.len() > 1, &|| pnpm(at)) {
+            Some(why) => return Some(Reader::Call(call, why)),
+            None => takes = takes.or(Some(Reader::Takes(call))),
+        }
     }
-    // No call that was read reads a lock. That is the answer only where
-    // every call was read.
+    // No call that was read keeps the lock off the route. That is the
+    // answer only where every call was read.
     let doubt = |doubt: &Doubt| match doubt.line {
         0 => format!("{}: {}{from}", doubt.file, doubt.why),
         line => format!("{}:{line}: {}{from}", doubt.file, doubt.why),
@@ -313,6 +518,7 @@ fn reader(ws: &Workspace, project: &str, locks: &[String]) -> Option<Reader> {
         Some(Err(unread)) => Some(Reader::Unseen(doubt(unread))),
         None => None,
     }
+    .or(takes)
 }
 
 /// The line on which the file of the older `WORKSPACE` system brings in
@@ -351,13 +557,21 @@ fn brings_in_rules_js(legacy: &File) -> Option<usize> {
 }
 
 /// The text of [`Hubs::hidden`] for the project in the directory `project`
-/// (from the Bazel root, empty for the root) of the workspace `ws`, whose
-/// other files are read through `view`.
-fn judge(ws: &Workspace, view: &dyn Fn(&str) -> Entry, project: &str) -> Option<String> {
+/// (from the Bazel root, empty for the root) of the workspace `ws`: for a
+/// run that writes its setting to pnpm-workspace.yaml (`writes`), or for
+/// one that is told not to ([`Hubs::unset`]). `beside` reads that file,
+/// and `pnpm` the pnpm of a hub, by its place in `hubs` ([`release`]).
+fn judge<'a>(
+    ws: &Workspace,
+    beside: &dyn Fn() -> &'a Entry,
+    project: &str,
+    hubs: &Tags,
+    pnpm: &dyn Fn(usize) -> &'a Pnpm,
+    writes: bool,
+) -> Option<String> {
     let (lock, settings) = (below(project, LOCK), below(project, SETTINGS));
-    let main = |label: &str| ws.label(label).filter(|label| label.repo == Repo::Main);
-    let hubs = ws.tags(&extension("npm"), "npm_translate_lock");
-    for (file, call) in hubs.calls.iter().map(|tag| (tag.file, tag.call)) {
+    for (at, tag) in hubs.calls.iter().enumerate() {
+        let (file, call) = (tag.file, tag.call);
         let named = match names(ws, call) {
             Named::File(named) if named.path() == lock => named,
             _ => continue,
@@ -371,15 +585,7 @@ fn judge(ws: &Workspace, view: &dyn Fn(&str) -> Entry, project: &str) -> Option<
                 "its `update_pnpm_lock` is not written out as `True` or `False`",
             ),
         };
-        let listed = |label: &String| main(label).is_some_and(|label| label.path() == settings);
-        // `None`: the call lists the file. Else whether its `data` is
-        // written out, so that the label is one to add to it.
-        let written = match call.arg("data") {
-            Some(Value::List(labels)) if labels.iter().any(listed) => None,
-            Some(Value::List(_)) => Some(true),
-            None => Some(!call.unpacks()),
-            _ => Some(false),
-        };
+        let written = unlisted(ws, call, &settings);
         // What the file needs before a pin in the lock is one the build
         // takes and an undo leaves standing.
         let own = format!(
@@ -387,13 +593,13 @@ fn judge(ws: &Workspace, view: &dyn Fn(&str) -> Entry, project: &str) -> Option<
              removes one that holds only what hosted mode writes, and the call would then name a \
              missing file)"
         );
-        let (fix, unset) = match view(&settings) {
+        let (fix, unset) = match beside() {
             Entry::Absent => (Some(own), false),
-            Entry::Text(text) => match plan_workspace_trust(Some(&text)) {
+            Entry::Text(text) => match plan_workspace_trust(Some(text)) {
                 TrustPlan::UserSet(value) => (
                     Some(format!(
-                        "set `trustLockfile: true` in {settings} (it says `trustLockfile: \
-                         {value}`, which hosted mode leaves as it is)"
+                        "set `trustLockfile: true` in {settings} or take the line out (it says \
+                         `trustLockfile: {value}`, which hosted mode leaves as it is)"
                     )),
                     true,
                 ),
@@ -404,15 +610,28 @@ fn judge(ws: &Workspace, view: &dyn Fn(&str) -> Entry, project: &str) -> Option<
                     )),
                     true,
                 ),
-                _ if removed_with_the_pin(&text) => (Some(own), false),
-                _ => (None, false),
+                _ if removed_with_the_pin(text) => (Some(own), false),
+                TrustPlan::AlreadyTrue => (None, false),
+                _ if writes => (None, false),
+                // Told not to write to the file, the run leaves it
+                // without the setting. Said so that it holds for a caller
+                // that is no command line.
+                _ => (
+                    Some(format!(
+                        "let hosted mode write to {settings} (this run was told not to, which \
+                         is `--no-trust-lockfile-config` on the command line, so it writes \
+                         neither the setting nor the registries that take its place) or set \
+                         `trustLockfile: true` there yourself"
+                    )),
+                    true,
+                ),
             },
             Entry::Unreadable(_) => (None, false),
         };
         if written.is_none() && fix.is_none() {
             continue;
         }
-        let Some(pnpm) = release(ws, view, call) else {
+        let Some(pnpm) = pnpm(at).may_reject() else {
             continue;
         };
         // The label of the file beside the lock, in the lock's own package.
@@ -499,33 +718,103 @@ fn removed_with_the_pin(text: &str) -> bool {
     }
 }
 
-/// The pnpm that the hub `hub` runs, when it may be 11 or later: the newest
-/// release a tag of its repository states, or that one is not written out,
-/// or the one a release of rules_js picks whose choice is not known (the
-/// module docs). `None` when all that is stated is older, and when nothing
-/// is and [`picks_an_older_pnpm`].
-fn release(ws: &Workspace, view: &dyn Fn(&str) -> Entry, hub: &Call) -> Option<String> {
-    let unread = "a pnpm whose release is not written out as a version (it may be 11 or later)";
+/// The pnpm that a hub runs, as far as the workspace states it.
+enum Pnpm {
+    /// The newest release that the tags of its repository state, each of
+    /// them read as a version: its numbers, and as it is written. And
+    /// what keeps it from being shown as the pnpm the hub runs in every
+    /// build, which the route asks for ([`ELSEWHERE`], [`ASIDE`],
+    /// [`UNNAMED`], [`DROPPED`]): none where it is shown.
+    Stated((u64, u64, u64), String, Option<&'static str>),
+    /// One that may be 11 or later, in the words of a warning: a release
+    /// that is not written out, or the one a release of rules_js picks
+    /// whose choice is not known (the module docs).
+    May(String),
+    /// The one rules_js picks where nothing is stated, which is older than
+    /// 11 ([`picks_an_older_pnpm`]).
+    Older,
+}
+
+impl Pnpm {
+    /// The pnpm in the words of a warning, when it may be 11 or later and
+    /// so reject a pinned lock: `None` for one that is known to be older.
+    fn may_reject(&self) -> Option<String> {
+        match self {
+            Pnpm::Stated((11.., ..), version, _) => Some(format!("pnpm {version}")),
+            Pnpm::Stated(..) | Pnpm::Older => None,
+            Pnpm::May(what) => Some(what.clone()),
+        }
+    }
+}
+
+/// Why a stated release is not shown to be the pnpm of the hub: its
+/// repository may be another than the one the tags make.
+const ELSEWHERE: &str = "its repository is not taken from the pnpm extension as every module \
+                         uses it, or that extension has an isolated use or an `inject_repo`";
+
+/// Why a stated release is not the pnpm of the hub for certain: Bazel may
+/// not run the tag that states it, or the tag may make another repository,
+/// and the hub then runs the pnpm that rules_js picks.
+const ASIDE: &str = "a tag that states a release for it is not a statement of its own, so it \
+                     may not run as it is written";
+const UNNAMED: &str = "a tag that states a release for it has a `name` that is not written out \
+                       in a plain string, so it may make another repository";
+
+/// Why a stated release is not the pnpm of the hub in every build: without
+/// the tag the hub runs the pnpm that rules_js picks.
+const DROPPED: &str = "a use of the pnpm extension with `dev_dependency` states a release for \
+                       it, and Bazel drops such a use under `--ignore_dev_dependency`";
+
+/// The pnpm that the hub `hub` runs ([`Pnpm`]).
+fn release(ws: &Workspace, view: &dyn Fn(&str) -> Entry, hub: &Call) -> Pnpm {
+    let unread = || {
+        Pnpm::May(
+            "a pnpm whose release is not written out as a version (it may be 11 or later)".into(),
+        )
+    };
+    // Whether `call` names the repository `repo` by position.
+    let named = |repo: &String, call: &Call| {
+        let is = |arg: &Arg| arg.how == How::Positional && arg.value == Value::Str(repo.clone());
+        call.args.iter().any(is)
+    };
     // Whether a `use_repo` takes the repository `repo` under that very name.
     let taken = |repo: &String| {
         let takes = |call: &&Call| call.bind.is_none() && call.callee == "use_repo";
-        let named = |arg: &Arg| arg.how == How::Positional && arg.value == Value::Str(repo.clone());
         let calls = ws.files.iter().flat_map(|(_, file)| &file.calls);
-        calls.filter(takes).any(|call| call.args.iter().any(named))
+        calls.filter(takes).any(|call| named(repo, call))
     };
     let repo = match hub.arg("use_pnpm") {
         None if !hub.unpacks() => "pnpm".to_string(),
         Some(Value::Str(label)) => match ws.label(label).map(|label| label.repo) {
             Some(Repo::Apparent(repo)) if taken(&repo) => repo,
-            _ => return Some(unread.to_string()),
+            _ => return unread(),
         },
-        _ => return Some(unread.to_string()),
+        _ => return unread(),
     };
     let tags = ws.tags(&extension("pnpm"), "pnpm");
+    // For the route: the repository is one of the shared use, which the
+    // hub runs by default and a `use_repo` of that use takes by its name.
+    let handed = |callee: &'static str| {
+        let calls = tags.handed.iter();
+        calls.filter(move |taken| taken.call.callee == callee)
+    };
+    let by_name =
+        |taken: &Tag| taken.isolate == Some(false) && taken.call.whole && named(&repo, taken.call);
+    let mut shared = hub.arg("use_pnpm").is_none() || handed("use_repo").any(by_name);
+    shared &= handed("inject_repo").next().is_none();
+    // And no use that is a dev dependency states a release for it: Bazel
+    // drops the tags of such a use under `--ignore_dev_dependency`.
+    let mut dropped = false;
+    // And every tag that states a release for it runs as it is written,
+    // and makes this repository: the first that may not is why.
+    let mut unsure = None;
     // Without a tag, the repository `pnpm` is the one rules_js makes.
     let (mut newest, mut made) = (None::<((u64, u64, u64), String)>, repo == "pnpm");
     let mut read = tags.doubts.is_empty();
-    for call in tags.calls.iter().map(|tag| tag.call) {
+    for tag in &tags.calls {
+        let call = tag.call;
+        // A tag of an isolated use makes a repository of that use alone.
+        shared &= tag.isolate == Some(false);
         match call.arg("name") {
             None if !call.unpacks() && repo != "pnpm" => continue,
             Some(Value::Str(name)) if *name != repo => continue,
@@ -551,6 +840,13 @@ fn release(ws: &Workspace, view: &dyn Fn(&str) -> Entry, hub: &Call) -> Option<S
             }
             _ => None,
         };
+        dropped |= tag.dev_dependency != Some(false);
+        let plain = match call.arg("name") {
+            None => !call.unpacks(),
+            name => matches!(name, Some(Value::Str(_))),
+        };
+        let uncertain = (!call.whole).then_some(ASIDE);
+        unsure = unsure.or(uncertain).or((!plain).then_some(UNNAMED));
         // The numbers of a release: rules_js runs the newest of several.
         let numbers = |version: &String| {
             let release = version.split(['-', '+']).next().unwrap_or(version);
@@ -567,15 +863,23 @@ fn release(ws: &Workspace, view: &dyn Fn(&str) -> Entry, hub: &Call) -> Option<S
             None => read = false,
         }
     }
+    let unshown = match (shared, dropped) {
+        (false, _) => Some(ELSEWHERE),
+        (true, _) if unsure.is_some() => unsure,
+        (true, true) => Some(DROPPED),
+        (true, false) => None,
+    };
     match newest {
-        Some(((major, ..), version)) if major >= 11 => Some(format!("pnpm {version}")),
-        _ if !read || !made => Some(unread.to_string()),
-        Some(_) => None,
-        None if picks_an_older_pnpm(ws, view) => None,
-        None => Some(
+        // A tag that states a release also makes the repository.
+        Some((numbers, version)) if read => Pnpm::Stated(numbers, version, unshown),
+        Some(((11.., ..), version)) => Pnpm::May(format!("pnpm {version}")),
+        Some(_) => unread(),
+        None if !read || !made => unread(),
+        None if picks_an_older_pnpm(ws, view) => Pnpm::Older,
+        None => Pnpm::May(
             "the pnpm that aspect_rules_js picks itself, at a release of the ruleset whose \
              choice is not known here (it may be 11 or later)"
-                .to_string(),
+                .into(),
         ),
     }
 }
@@ -677,14 +981,24 @@ mod tests {
     /// The tag that states the pnpm of that build.
     const ELEVEN: &str = "pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")";
 
-    /// [`judge`] for the project in `project` of the workspace that holds
-    /// `files` and nothing else.
-    fn said(files: &[(&str, &str)], project: &str) -> Option<String> {
-        let view = |path: &str| match files.iter().find(|(name, _)| *name == path) {
+    /// The files `files`, and nothing else, as a workspace is read.
+    fn holding<'a>(files: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Entry + 'a {
+        |path| match files.iter().find(|(name, _)| *name == path) {
             Some((_, text)) => Entry::Text(text.to_string()),
             None => Entry::Absent,
-        };
-        judge(&Workspace::read(&view), &view, project)
+        }
+    }
+
+    /// The text of [`Hubs::hidden`] for the project in `project` of the
+    /// workspace that holds `files` and nothing else.
+    fn said(files: &[(&str, &str)], project: &str) -> Option<String> {
+        answered(files, project).hidden.map(|hidden| hidden.detail)
+    }
+
+    /// [`answer`] about the root lock of that project.
+    fn answered(files: &[(&str, &str)], project: &str) -> Hubs {
+        let view = holding(files);
+        answer(&view, project, &[LOCK.to_string()])
     }
 
     /// [`said`] for the root project of a workspace with `module` and a
@@ -758,8 +1072,8 @@ mod tests {
         // the label alone the next run would still pin nothing.
         let off = "packages:\n  - '.'\ntrustLockfile: false\n";
         let said = said_of(&[("MODULE.bazel", &module), (SETTINGS, off)]);
-        let set = "set `trustLockfile: true` in pnpm-workspace.yaml (it says `trustLockfile: \
-                   false`, which hosted mode leaves as it is)";
+        let set = "set `trustLockfile: true` in pnpm-workspace.yaml or take the line out (it \
+                   says `trustLockfile: false`, which hosted mode leaves as it is)";
         assert_eq!(said, format!("{reason} — {set}, {way_on}"));
         let flow = said_of(&[("MODULE.bazel", &module), (SETTINGS, "{packages: ['.']}\n")]);
         let write = " — write `trustLockfile: true` to pnpm-workspace.yaml yourself (hosted \
@@ -817,8 +1131,8 @@ mod tests {
              pnpm-lock.yaml was not rewritten — "
         );
         let off = with(ELEVEN, Some("# mine\ntrustLockfile: false\n")).expect("withheld");
-        let set = "set `trustLockfile: true` in pnpm-workspace.yaml (it says `trustLockfile: \
-                   false`, which hosted mode leaves as it is) and re-run";
+        let set = "set `trustLockfile: true` in pnpm-workspace.yaml or take the line out (it \
+                   says `trustLockfile: false`, which hosted mode leaves as it is) and re-run";
         assert_eq!(off, format!("{unset}{set}"));
         let flow = with(ELEVEN, Some("{packages: ['.']}\n")).expect("withheld");
         let write = "write `trustLockfile: true` to pnpm-workspace.yaml yourself (hosted mode \
@@ -1272,47 +1586,674 @@ mod tests {
         assert_eq!(hub("//:pnpm-lock.yaml", ""), None, "the lock of the root");
     }
 
-    /// [`Hubs::reader`] names the call of a hub that reads one of the locks
-    /// asked about, whatever else the call says, and a call whose lock is
-    /// not written out, which may be one of them. A hub that reads another
-    /// lock, another repository's, or no hub at all is no reader.
+    /// [`Hubs::reader`] for the locks `locks` of the project in `project`
+    /// of the workspace whose root module has the hub `hub` and the lines
+    /// `pnpm`, beside a `pnpm-workspace.yaml` of the user's own.
+    fn reads(hub: &str, pnpm: &str, project: &str, locks: &[&str]) -> Option<Reader> {
+        let module = module(hub, pnpm);
+        let settings = below(project, SETTINGS);
+        let files = [("MODULE.bazel", module.as_str()), (&settings, "# own\n")];
+        let view = holding(&files);
+        let locks: Vec<String> = locks.iter().map(|lock| lock.to_string()).collect();
+        answer(&view, project, &locks).reader
+    }
+
+    /// The hub of a build that takes a routed lock with a pnpm of its own:
+    /// it keeps the root lock up to date and lists the workspace file.
+    const LISTING: &str = "pnpm_lock = \"//:pnpm-lock.yaml\", update_pnpm_lock = True, \
+                           data = [\"//:pnpm-workspace.yaml\"]";
+    /// The arguments of a `use_extension` of the pnpm extension.
+    const PNPM_EXTENSION: &str = "\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\"";
+
+    /// The two shapes of a hub whose build takes a routed lock
+    /// ([`Reader::Takes`]): one that runs no pnpm, and one whose pnpm sees
+    /// the workspace file and is stated as 11.20 or later, in each way a
+    /// release is read as written out. Another repository's lock, another
+    /// project's and a workspace with no hub have no reader at all.
     #[test]
-    fn a_hub_reads_the_lock_it_names_whatever_else_it_says() {
-        let reads = |hub: &str, project: &str, locks: &[&str]| {
-            let module = module(hub, ELEVEN);
-            let view = |path: &str| match path {
-                "MODULE.bazel" => Entry::Text(module.clone()),
-                _ => Entry::Absent,
-            };
-            let locks: Vec<String> = locks.iter().map(|lock| lock.to_string()).collect();
-            answer(&view, project, &locks).reader
-        };
-        let call = Some(Reader::Call("MODULE.bazel:4".to_string()));
-        let listed = format!("{HUB}, data = [\"//:pnpm-workspace.yaml\"]");
-        for hub in [LOCKED, HUB, listed.as_str(), "pnpm_lock = LOCK", "**hub"] {
-            assert_eq!(reads(hub, "", &[LOCK]), call, "{hub}");
+    fn a_hub_takes_a_routed_lock_in_the_two_shapes_that_were_built() {
+        let takes = Some(Reader::Takes("MODULE.bazel:4".to_string()));
+        let off = format!("{LOCKED}, update_pnpm_lock = False");
+        let unlisted_off = format!("{LOCKED}, data = DATA");
+        let named_hub = format!("name = \"npm\", {LOCKED}");
+        for hub in [LOCKED, off.as_str(), unlisted_off.as_str(), &named_hub] {
+            // No pnpm runs, whatever the workspace states of one.
+            for pnpm in ["", ELEVEN, "pnpm.pnpm(pnpm_version = \"10.34.9\")"] {
+                assert_eq!(reads(hub, pnpm, "", &[LOCK]), takes, "{hub}: {pnpm}");
+            }
         }
-        // The lock of a member, and a project below the Bazel root.
+        let by_label = format!("{LISTING}, use_pnpm = \"@eleven//:package/bin/pnpm.cjs\"");
+        let named = "pnpm.pnpm(name = \"eleven\", pnpm_version = \"11.28.10\")\n\
+                     use_repo(pnpm, \"eleven\")";
+        for (hub, pnpm) in [
+            (LISTING, ELEVEN),
+            (LISTING, "pnpm.pnpm(pnpm_version = \"11.20.0\")"),
+            (LISTING, "pnpm.pnpm(pnpm_version = \"12.17.0\")"),
+            // The newest of two is the one rules_js runs.
+            (
+                LISTING,
+                "pnpm.pnpm(pnpm_version = \"10.34.9\")\npnpm.pnpm(pnpm_version = \"11.20.0\")",
+            ),
+            (by_label.as_str(), named),
+            // A use that says it is not isolated is the one every module
+            // shares, as Bazel takes it.
+            (
+                by_label.as_str(),
+                &format!(
+                    "same = use_extension({PNPM_EXTENSION}, isolate = False)\n\
+                     same.pnpm(name = \"eleven\", pnpm_version = \"11.28.10\")\n\
+                     use_repo(same, \"eleven\")"
+                ),
+            ),
+        ] {
+            assert_eq!(reads(hub, pnpm, "", &[LOCK]), takes, "{hub}: {pnpm}");
+        }
+        // By the `packageManager` of the file the tag names.
+        let from = module(
+            LISTING,
+            "pnpm.pnpm(pnpm_version_from = \"//:package.json\")",
+        );
+        let pinned = |pin: &str| {
+            let manifest = format!("{{\"packageManager\": \"{pin}\"}}");
+            let files = [
+                ("MODULE.bazel", from.as_str()),
+                ("package.json", manifest.as_str()),
+                (SETTINGS, "# own\n"),
+            ];
+            answered(&files, "").reader
+        };
+        assert_eq!(pinned("pnpm@11.28.10+sha512.abc"), takes);
+        assert!(matches!(
+            pinned("pnpm@11.19.0"),
+            Some(Reader::Call(_, why)) if why.ends_with("(pnpm 11.19.0)")
+        ));
+
+        // No reader: the lock of another repository, of another project,
+        // of a member that was not asked about, and no hub.
         let member = "pnpm_lock = \"//packages/a:pnpm-lock.yaml\"";
-        assert_eq!(reads(member, "", &[LOCK]), None);
-        assert_eq!(
-            reads(member, "", &[LOCK, "packages/a/pnpm-lock.yaml"]),
-            call
-        );
-        // Its call is in a file of the Bazel root, not of the project.
-        let from_root = "MODULE.bazel:4, with paths from the root of the Bazel workspace";
-        assert_eq!(
-            reads(member, "packages/a", &[LOCK]),
-            Some(Reader::Call(from_root.to_string()))
-        );
-        assert_eq!(reads(LOCKED, "packages/a", &[LOCK]), None);
-        // Another repository's lock, and a workspace with no hub.
-        assert_eq!(
-            reads("pnpm_lock = \"@other//:pnpm-lock.yaml\"", "", &[LOCK]),
-            None
-        );
+        for (hub, project) in [
+            ("pnpm_lock = \"@other//:pnpm-lock.yaml\"", ""),
+            (LOCKED, "packages/a"),
+            (member, ""),
+        ] {
+            assert_eq!(reads(hub, ELEVEN, project, &[LOCK]), None, "{hub}");
+        }
         let none = |_: &str| Entry::Absent;
         assert_eq!(answer(&none, "", &[LOCK.to_string()]), Hubs::default());
+    }
+
+    /// Every other hub that reads a lock keeps it off the route, and
+    /// [`Reader::Call`] says what did, after the place of the call: what
+    /// is not written out, a pnpm that is not stated as 11.20 or later, a
+    /// `data` without the workspace file, the lock of a member, and a
+    /// project below the root of the Bazel workspace, whose text also says
+    /// where its paths are from. One such call is enough beside one that
+    /// takes a routed lock.
+    #[test]
+    fn what_keeps_a_hub_off_the_route_is_named() {
+        let unlisted = "its `data` is not written out as a list of strings that holds \
+                        `//:pnpm-workspace.yaml`";
+        let unstated = "the pnpm it runs for `update_pnpm_lock` is not stated as 11.20 or later";
+        let other = format!("{HUB}, data = [\"//web:pnpm-workspace.yaml\"]");
+        let named = format!("{LISTING}, use_pnpm = \"@eleven//:package/bin/pnpm.cjs\"");
+        let cases = [
+            (
+                "pnpm_lock = LOCK",
+                ELEVEN,
+                "its `pnpm_lock` is not written out in a plain string",
+            ),
+            (
+                "**hub",
+                ELEVEN,
+                "its `pnpm_lock` is not written out in a plain string",
+            ),
+            (
+                "pnpm_lock = \"//:pnpm-lock.yaml\", update_pnpm_lock = UP",
+                ELEVEN,
+                "its `update_pnpm_lock` is not written out as `True` or `False`",
+            ),
+            // A `**` may pass any attribute, also beside one that is off.
+            (
+                "pnpm_lock = \"//:pnpm-lock.yaml\", **MORE",
+                ELEVEN,
+                "it passes arguments that are not written out",
+            ),
+            (
+                "pnpm_lock = \"//:pnpm-lock.yaml\", update_pnpm_lock = False, **MORE",
+                ELEVEN,
+                "it passes arguments that are not written out",
+            ),
+            (HUB, ELEVEN, unlisted),
+            (other.as_str(), ELEVEN, unlisted),
+            (
+                "pnpm_lock = \"//:pnpm-lock.yaml\", update_pnpm_lock = True, data = DATA",
+                ELEVEN,
+                unlisted,
+            ),
+            (LISTING, "", unstated),
+            (LISTING, "pnpm.pnpm(pnpm_version = \"latest\")", unstated),
+            (
+                LISTING,
+                "pnpm.pnpm(pnpm_version_from = \"//:package.json\")",
+                unstated,
+            ),
+            // A tag whose release is not read may ask for any.
+            (
+                LISTING,
+                "pnpm.pnpm(pnpm_version = \"11.28.10\")\npnpm.pnpm(pnpm_version = PNPM)",
+                unstated,
+            ),
+            // The repository is the one of the tag `pnpm`, under a name
+            // the reader does not follow.
+            (
+                named.as_str(),
+                "pnpm.pnpm(pnpm_version = \"11.28.10\")\nuse_repo(pnpm, eleven = \"pnpm\")",
+                unstated,
+            ),
+        ];
+        for (hub, pnpm, why) in cases {
+            let call = Reader::Call("MODULE.bazel:4".to_string(), why.to_string());
+            assert_eq!(reads(hub, pnpm, "", &[LOCK]), Some(call), "{hub}: {pnpm}");
+        }
+        // A release in full, 11.20.0 or later: a prerelease of it is older,
+        // and a number of fewer parts is none that a build was run with.
+        let short = "which is not a release of three numbers";
+        for (release, said) in [
+            ("11.19.0", "11.19.0".to_string()),
+            ("10.34.9", "10.34.9".to_string()),
+            ("11", "11".to_string()),
+            ("11.20", format!("11.20, {short}")),
+            ("12", format!("12, {short}")),
+            ("11.20.0-rc.1", format!("11.20.0-rc.1, {short}")),
+            ("12.0.0-alpha.3", format!("12.0.0-alpha.3, {short}")),
+        ] {
+            let pnpm = format!("pnpm.pnpm(pnpm_version = \"{release}\")");
+            let why = format!("{unstated} (pnpm {said})");
+            let call = Reader::Call("MODULE.bazel:4".to_string(), why);
+            assert_eq!(reads(LISTING, &pnpm, "", &[LOCK]), Some(call), "{release}");
+        }
+
+        // What else a call says: only the attributes of the calls that
+        // were built keep a hub on the route, whether it runs a pnpm or
+        // not. A `patches` that is keyed by a version names no package of
+        // a routed lock, and the other three have a pnpm write the lock.
+        let patches = "patches = {\"left-pad@1.3.0\": [\"//:own.patch\"]}";
+        for (more, name) in [
+            (patches, "patches"),
+            (
+                "npm_package_lock = \"//:package-lock.json\"",
+                "npm_package_lock",
+            ),
+            ("yarn_lock = \"//:yarn.lock\"", "yarn_lock"),
+            ("preupdate = [\"//:fix.js\"]", "preupdate"),
+            ("npmrc = \"//:.npmrc\"", "npmrc"),
+            ("bins = {\"left-pad@1.3.0\": [\"pad=./bin.js\"]}", "bins"),
+        ] {
+            let why = format!("its `{name}` is an attribute that no routed lock was built with");
+            for hub in [LOCKED, LISTING] {
+                let call = Reader::Call("MODULE.bazel:4".to_string(), why.clone());
+                let hub = format!("{hub}, {more}");
+                assert_eq!(reads(&hub, ELEVEN, "", &[LOCK]), Some(call), "{hub}");
+            }
+        }
+        // The warning names every attribute that was built.
+        let call = Reader::Call("MODULE.bazel:4".to_string(), String::new());
+        let reason = crate::hosted::guidance::pnpm_registry_bazel_reason(&call).expect("a clause");
+        for name in BUILT {
+            assert!(reason.contains(&format!("`{name}`")), "{name}: {reason}");
+        }
+
+        // The pnpm a tag states is the one the hub runs only where its
+        // repository is one of the use of the pnpm extension that every
+        // module shares. A repository of another extension under the name
+        // of a tag, an isolated use with tags of its own and an
+        // `inject_repo` on the extension keep the hub off the route.
+        let unshown = "the pnpm it runs for `update_pnpm_lock` is not shown to be the one the \
+                       root module states (pnpm 11.28.10): its repository is not taken from the \
+                       pnpm extension as every module uses it, or that extension has an isolated \
+                       use or an `inject_repo`";
+        let by_label =
+            |repo: &str| format!("{LISTING}, use_pnpm = \"@{repo}//:package/bin/pnpm.cjs\"");
+        let other = "other = use_extension(\"//:ext.bzl\", \"other\")";
+        let isolated = format!("iso = use_extension({PNPM_EXTENSION}, isolate = True)");
+        for (case, hub, pnpm) in [
+            (
+                "another extension's `pnpm`",
+                by_label("pnpm"),
+                format!("{ELEVEN}\n{other}\nuse_repo(other, \"pnpm\")"),
+            ),
+            (
+                "another extension's repository under the name of a tag",
+                by_label("eleven"),
+                format!(
+                    "pnpm.pnpm(name = \"eleven\", pnpm_version = \"11.28.10\")\n{other}\n\
+                     use_repo(other, \"eleven\")"
+                ),
+            ),
+            // Only a name of a proxy is followed, and an `isolate` that is
+            // not written out as `False` counts as an isolated use.
+            (
+                "the use of the extension as it stands",
+                by_label("eleven"),
+                format!(
+                    "pnpm.pnpm(name = \"eleven\", pnpm_version = \"11.28.10\")\n\
+                     use_repo(use_extension({PNPM_EXTENSION}), \"eleven\")"
+                ),
+            ),
+            (
+                "a use that may be isolated",
+                by_label("eleven"),
+                format!(
+                    "same = use_extension({PNPM_EXTENSION}, isolate = ISOLATE)\n\
+                     same.pnpm(name = \"eleven\", pnpm_version = \"11.28.10\")\n\
+                     use_repo(same, \"eleven\")"
+                ),
+            ),
+            (
+                "a tag of an isolated use",
+                LISTING.to_string(),
+                format!("{isolated}\niso.pnpm(pnpm_version = \"11.28.10\")"),
+            ),
+            (
+                "a repository of an isolated use",
+                by_label("pnpm"),
+                format!(
+                    "{isolated}\niso.pnpm(pnpm_version = \"11.28.10\")\nuse_repo(iso, \"pnpm\")"
+                ),
+            ),
+            (
+                "a repository that only an isolated use takes",
+                by_label("eleven"),
+                format!(
+                    "pnpm.pnpm(name = \"eleven\", pnpm_version = \"11.28.10\")\n{isolated}\n\
+                     use_repo(iso, \"eleven\")"
+                ),
+            ),
+            (
+                "a repository that is injected",
+                LISTING.to_string(),
+                format!("{ELEVEN}\ninject_repo(pnpm, \"tools\")"),
+            ),
+        ] {
+            let call = Reader::Call("MODULE.bazel:4".to_string(), unshown.to_string());
+            assert_eq!(reads(&hub, &pnpm, "", &[LOCK]), Some(call), "{case}");
+        }
+        // An `override_repo` on the extension leaves its release unread.
+        let overridden = format!("{ELEVEN}\noverride_repo(pnpm, pnpm = \"mine\")");
+        let call = Reader::Call("MODULE.bazel:4".to_string(), unstated.to_string());
+        assert_eq!(reads(LISTING, &overridden, "", &[LOCK]), Some(call));
+        // None of this changes what a pin is withheld for: the pnpm 11 of
+        // each is one that may reject it, as before.
+        for pnpm in [
+            format!("{ELEVEN}\n{other}\nuse_repo(other, \"pnpm\")"),
+            format!("{isolated}\niso.pnpm(pnpm_version = \"11.28.10\")"),
+        ] {
+            let said = root(HUB, &pnpm).expect("withheld");
+            assert!(
+                said.contains("has Bazel run pnpm 11.28.10 to keep"),
+                "{said}"
+            );
+        }
+
+        // Nor does a release that a use of the extension states as a dev
+        // dependency count: under `--ignore_dev_dependency` Bazel drops
+        // the tag, and the hub runs the pnpm that rules_js picks. Written
+        // as `True` or not written out, on the one use or beside a use
+        // that every build has.
+        let dropped = "the pnpm it runs for `update_pnpm_lock` is not shown to be the one the \
+                       root module states (pnpm 11.28.10): a use of the pnpm extension with \
+                       `dev_dependency` states a release for it, and Bazel drops such a use \
+                       under `--ignore_dev_dependency`";
+        let dev = |how: &str| {
+            format!(
+                "dev = use_extension({PNPM_EXTENSION}, dev_dependency = {how})\n\
+                 dev.pnpm(pnpm_version = \"11.28.10\")"
+            )
+        };
+        let on_the_one_use = module(LISTING, ELEVEN).replace(
+            &format!("pnpm = use_extension({PNPM_EXTENSION})"),
+            &format!("pnpm = use_extension({PNPM_EXTENSION}, dev_dependency = True)"),
+        );
+        assert_ne!(on_the_one_use, module(LISTING, ELEVEN));
+        let files = [
+            ("MODULE.bazel", on_the_one_use.as_str()),
+            (SETTINGS, "# own\n"),
+        ];
+        let call = Reader::Call("MODULE.bazel:4".to_string(), dropped.to_string());
+        assert_eq!(answered(&files, "").reader, Some(call.clone()));
+        for (case, pnpm) in [
+            ("a dev dependency", dev("True")),
+            ("one that may be", dev("DEV")),
+            (
+                "beside a use that every build has",
+                format!("pnpm.pnpm(pnpm_version = \"11.20.0\")\n{}", dev("True")),
+            ),
+        ] {
+            assert_eq!(
+                reads(LISTING, &pnpm, "", &[LOCK]),
+                Some(call.clone()),
+                "{case}"
+            );
+            // A hub that runs no pnpm is routed whatever a tag states, and
+            // the pin is withheld for such a release as it was.
+            assert!(
+                matches!(reads(LOCKED, &pnpm, "", &[LOCK]), Some(Reader::Takes(_))),
+                "{case}"
+            );
+            let said = root(HUB, &pnpm).expect("withheld");
+            assert!(
+                said.contains("has Bazel run pnpm 11.28.10 to keep"),
+                "{case}: {said}"
+            );
+        }
+        // A use that says it is none, and a dev tag that states no release
+        // or makes another repository, change nothing.
+        for pnpm in [
+            dev("False"),
+            format!(
+                "{ELEVEN}\ndev = use_extension({PNPM_EXTENSION}, dev_dependency = True)\n\
+                 dev.pnpm(name = \"pnpm\")\ndev.pnpm(name = \"ten\", pnpm_version = \"10.34.9\")"
+            ),
+        ] {
+            assert!(
+                matches!(reads(LISTING, &pnpm, "", &[LOCK]), Some(Reader::Takes(_))),
+                "{pnpm}"
+            );
+        }
+
+        // Nor does a release count that a tag states which Bazel may not
+        // run as it is written. A tag behind a condition or in a
+        // comprehension may not run at all, and one whose `name` is not
+        // written out in a plain string, or may come from a `**`, may make
+        // another repository: the hub then runs the pnpm that rules_js
+        // picks, as it does under a dev dependency. Alone or beside a tag
+        // that is plain.
+        let shown = |why: &str| {
+            let why = format!(
+                "the pnpm it runs for `update_pnpm_lock` is not shown to be the one the root \
+                 module states (pnpm 11.28.10): {why}"
+            );
+            Some(Reader::Call("MODULE.bazel:4".to_string(), why))
+        };
+        let aside = "a tag that states a release for it is not a statement of its own, so it may \
+                     not run as it is written";
+        let unnamed = "a tag that states a release for it has a `name` that is not written out \
+                       in a plain string, so it may make another repository";
+        let eleven = "pnpm.pnpm(pnpm_version = \"11.28.10\")";
+        for (case, pnpm, why) in [
+            (
+                "behind a condition",
+                format!("{eleven} if False else None"),
+                aside,
+            ),
+            ("behind an `and`", format!("ON and {eleven}"), aside),
+            (
+                "in a comprehension",
+                format!("[{eleven} for _ in ONCE]"),
+                aside,
+            ),
+            (
+                "beside a plain tag of an older release",
+                format!("pnpm.pnpm(pnpm_version = \"10.34.9\")\nON and {eleven}"),
+                aside,
+            ),
+            (
+                "a name that is a name",
+                "pnpm.pnpm(name = NAME, pnpm_version = \"11.28.10\")".to_string(),
+                unnamed,
+            ),
+            (
+                "a name that `**` may pass",
+                "pnpm.pnpm(pnpm_version = \"11.28.10\", **MORE)".to_string(),
+                unnamed,
+            ),
+            (
+                "a name that is a name, beside a plain tag",
+                format!(
+                    "pnpm.pnpm(pnpm_version = \"11.20.0\")\n{}",
+                    eleven.replace("(", "(name = NAME, ")
+                ),
+                unnamed,
+            ),
+        ] {
+            assert_eq!(reads(LISTING, &pnpm, "", &[LOCK]), shown(why), "{case}");
+            // A hub that runs no pnpm is routed whatever a tag states.
+            assert!(
+                matches!(reads(LOCKED, &pnpm, "", &[LOCK]), Some(Reader::Takes(_))),
+                "{case}"
+            );
+            // The pin reads such a tag as it is written, as before: a pnpm
+            // 11 that the hub hides the file from withholds it.
+            let said = root(HUB, &pnpm).expect("withheld");
+            assert!(
+                said.contains("has Bazel run pnpm 11.28.10 to keep"),
+                "{case}: {said}"
+            );
+        }
+        // A tag that may not run and states no release, or makes another
+        // repository by a plain name, changes nothing.
+        for more in [
+            "ON and pnpm.pnpm(name = \"pnpm\")",
+            "ON and pnpm.pnpm(name = \"ten\", pnpm_version = \"10.34.9\")",
+        ] {
+            let pnpm = format!("{ELEVEN}\n{more}");
+            assert!(
+                matches!(reads(LISTING, &pnpm, "", &[LOCK]), Some(Reader::Takes(_))),
+                "{more}"
+            );
+        }
+        // The `use_repo` that takes the repository of a `use_pnpm` has to
+        // run as it is written too: behind a condition, another may take
+        // the name.
+        let taken = "pnpm.pnpm(name = \"eleven\", pnpm_version = \"11.28.10\")\n\
+                     ON and use_repo(pnpm, \"eleven\")";
+        let call = Reader::Call("MODULE.bazel:4".to_string(), unshown.to_string());
+        assert_eq!(reads(&by_label("eleven"), taken, "", &[LOCK]), Some(call));
+        // And so has the call of the hub itself, in either shape: one that
+        // may not run is no shape that a routed lock was built with.
+        for hub in [LOCKED, LISTING] {
+            let module = module(hub, ELEVEN).replace(
+                "\nnpm.npm_translate_lock(",
+                "\nON and npm.npm_translate_lock(",
+            );
+            assert_ne!(module, self::module(hub, ELEVEN));
+            let files = [("MODULE.bazel", module.as_str()), (SETTINGS, "# own\n")];
+            let call = Reader::Call(
+                "MODULE.bazel:4".to_string(),
+                "it is not a statement of its own, so it may not run as it is written".to_string(),
+            );
+            assert_eq!(answered(&files, "").reader, Some(call), "{hub}");
+        }
+
+        // The lock of a member, by a hub that runs no pnpm.
+        let member = "pnpm_lock = \"//packages/a:pnpm-lock.yaml\"";
+        let own = Reader::Call(
+            "MODULE.bazel:4".to_string(),
+            "the lock it reads is a workspace member's own".to_string(),
+        );
+        let locks = [LOCK, "packages/a/pnpm-lock.yaml"];
+        assert_eq!(reads(member, ELEVEN, "", &locks), Some(own));
+        // The root lock, beside the members' own
+        // (`sharedWorkspaceLockfile: false`): the route records its
+        // overrides in every lock, and no build was run of a hub that reads
+        // one of several. Whichever of the two shapes the call is in.
+        let several = Reader::Call(
+            "MODULE.bazel:4".to_string(),
+            "the project has workspace members with pnpm locks of their own, a layout that no \
+             routed lock was built with"
+                .to_string(),
+        );
+        for hub in [LOCKED, LISTING] {
+            assert_eq!(
+                reads(hub, ELEVEN, "", &locks),
+                Some(several.clone()),
+                "{hub}"
+            );
+        }
+        // A project below the Bazel root: its call is in a file of that
+        // root, not of the project.
+        let below_root = Reader::Call(
+            "MODULE.bazel:4, with paths from the root of the Bazel workspace".to_string(),
+            "the project is not at the root of the Bazel workspace".to_string(),
+        );
+        assert_eq!(
+            reads(member, ELEVEN, "packages/a", &[LOCK]),
+            Some(below_root)
+        );
+
+        // Two hubs of the one lock: the one that is off the route decides,
+        // whichever comes first.
+        let two = |first: &str, second: &str| {
+            let module = module(first, ELEVEN);
+            let module = format!("{module}npm.npm_translate_lock({second})\n");
+            answered(&[("MODULE.bazel", &module), (SETTINGS, "# own\n")], "").reader
+        };
+        assert!(matches!(two(LOCKED, LOCKED), Some(Reader::Takes(_))));
+        for (first, second, line) in [(LOCKED, HUB, 7), (HUB, LOCKED, 4)] {
+            let call = Reader::Call(format!("MODULE.bazel:{line}"), unlisted.to_string());
+            assert_eq!(two(first, second), Some(call), "{first}");
+        }
+    }
+
+    /// The pin reads a tag that Bazel may not run as it is written as the
+    /// tag is written, as it did before the route looked at such tags: a
+    /// pnpm 11 that the hub hides the file from withholds the pin, and a
+    /// pnpm 10 withholds none. Taking the release of such a tag for one
+    /// that is not written out would withhold the second pin too, which
+    /// main writes.
+    #[test]
+    fn a_tag_that_may_not_run_as_written_changes_no_pin() {
+        for tag in [
+            "ON and pnpm.pnpm(pnpm_version = \"{}\")",
+            "pnpm.pnpm(name = NAME, pnpm_version = \"{}\")",
+            "pnpm.pnpm(pnpm_version = \"{}\", **MORE)",
+        ] {
+            let said = root(HUB, &tag.replace("{}", "11.28.10")).expect("withheld");
+            assert!(
+                said.contains("has Bazel run pnpm 11.28.10 to keep"),
+                "{tag}: {said}"
+            );
+            assert_eq!(root(HUB, &tag.replace("{}", "10.34.9")), None, "{tag}");
+        }
+    }
+
+    /// A run that is told not to write to `pnpm-workspace.yaml` gives the
+    /// pnpm of a hub no setting to read ([`Hubs::unset`]). Where a hub
+    /// lists a file of the user's own that would take the setting, such a
+    /// run is told to write nothing for the root lock, and what to do; a
+    /// run that writes the setting is told nothing. A file that holds the
+    /// setting already, a pnpm 10 and a hub that runs no pnpm withhold
+    /// nothing from either, and a hub that hides the file withholds from
+    /// both alike.
+    #[test]
+    fn a_run_told_not_to_write_the_setting_leaves_the_lock_of_a_listing_hub() {
+        let asked = |hub: &str, pnpm: &str, settings: &str| {
+            let module = module(hub, pnpm);
+            answered(&[("MODULE.bazel", &module), (SETTINGS, settings)], "")
+        };
+        let hubs = asked(LISTING, ELEVEN, "# own\n");
+        assert_eq!(hubs.hidden, None);
+        assert_eq!(hubs.hides(true), None);
+        let unset = hubs.hides(false).expect("withheld");
+        assert_eq!(unset.code, HIDDEN);
+        assert_eq!(
+            unset.detail,
+            "MODULE.bazel:4: this `npm.npm_translate_lock` has Bazel run pnpm 11.28.10 to keep \
+             pnpm-lock.yaml up to date (`update_pnpm_lock`), and hosted mode does not write \
+             `trustLockfile: true` to the pnpm-workspace.yaml that its `data` lists. Without \
+             that setting pnpm 11 and later reject a lock that names the patch server \
+             (ERR_PNPM_TARBALL_URL_MISMATCH): `bazel build` would fail; pnpm-lock.yaml was not \
+             rewritten — let hosted mode write to pnpm-workspace.yaml (this run was told not \
+             to, which is `--no-trust-lockfile-config` on the command line, so it writes \
+             neither the setting nor the registries that take its place) or set \
+             `trustLockfile: true` there yourself and re-run"
+        );
+        // The hub still takes a routed lock: a run that writes is routed.
+        assert!(matches!(hubs.reader, Some(Reader::Takes(_))));
+
+        let ten = "pnpm.pnpm(pnpm_version = \"10.34.9\")";
+        for (case, hub, pnpm, settings) in [
+            (
+                "the setting is there",
+                LISTING,
+                ELEVEN,
+                "# own\ntrustLockfile: true\n",
+            ),
+            ("pnpm 10", LISTING, ten, "# own\n"),
+            ("the pnpm rules_js picks", LISTING, "", "# own\n"),
+            ("no pnpm runs", LOCKED, ELEVEN, "# own\n"),
+        ] {
+            let hubs = asked(hub, pnpm, settings);
+            assert_eq!(
+                (hubs.hides(true), hubs.hides(false)),
+                (None, None),
+                "{case}"
+            );
+        }
+        // Hidden from the pnpm of the hub: the one warning for both runs.
+        for (hub, settings) in [(HUB, "# own\n"), (LISTING, "trustLockfile: false\n")] {
+            let hubs = asked(hub, ELEVEN, settings);
+            assert!(hubs.hidden.is_some() && hubs.unset.is_none(), "{hub}");
+            assert_eq!(hubs.hides(false), hubs.hidden.as_ref(), "{hub}");
+        }
+        // Two hubs of the one lock. The first that leaves the file without
+        // the setting is the answer for the run that is told not to write,
+        // and a later one that hides the file is the answer for both.
+        let two = |second: &str| {
+            let module = module(LISTING, ELEVEN);
+            let module = format!("{module}npm.npm_translate_lock({second})\n");
+            answered(&[("MODULE.bazel", &module), (SETTINGS, "# own\n")], "")
+        };
+        let both = two(LISTING);
+        assert_eq!(both.hidden, None);
+        let first = both.unset.expect("withheld").detail;
+        assert!(first.starts_with("MODULE.bazel:4: "), "{first}");
+        let hiding = two(HUB);
+        let hidden = hiding.hidden.expect("withheld").detail;
+        assert!(hidden.starts_with("MODULE.bazel:7: "), "{hidden}");
+        assert_eq!(hiding.unset, None);
+    }
+
+    /// One answer asks for each file once, whichever of its three parts
+    /// needs it: the `pnpm-workspace.yaml` beside the lock, the
+    /// `package.json` that a tag takes its release from, and
+    /// `MODULE.bazel.lock`, which says what rules_js picks where no tag
+    /// states a release and can be several MiB.
+    #[test]
+    fn one_answer_asks_for_each_file_once() {
+        let from = "pnpm.pnpm(pnpm_version_from = \"//:package.json\")";
+        let eleven = "{\"packageManager\": \"pnpm@11.28.10\"}";
+        for (pnpm, manifest, want) in [(from, eleven, [1, 1, 0]), ("", "{}", [1, 0, 1])] {
+            let module = module(LISTING, pnpm);
+            let files = [
+                ("MODULE.bazel", module.as_str()),
+                (SETTINGS, "# own\n"),
+                ("package.json", manifest),
+                ("MODULE.bazel.lock", "{}"),
+            ];
+            let (held, asked) = (holding(&files), std::cell::RefCell::new(Vec::new()));
+            let view = |path: &str| {
+                asked.borrow_mut().push(path.to_string());
+                held(path)
+            };
+            let hubs = answer(&view, "", &[LOCK.to_string()]);
+            // Every part was asked: the pin of a run that writes the
+            // setting, the one of a run that does not, and the route.
+            assert_eq!(hubs.hidden, None, "{pnpm}");
+            assert_eq!(hubs.unset.is_some(), !pnpm.is_empty(), "{pnpm}");
+            assert_eq!(
+                matches!(hubs.reader, Some(Reader::Takes(_))),
+                !pnpm.is_empty(),
+                "{pnpm}"
+            );
+            let asked = asked.borrow();
+            let times = |file: &str| asked.iter().filter(|path| *path == file).count();
+            assert_eq!(
+                [SETTINGS, "package.json", "MODULE.bazel.lock"].map(times),
+                want,
+                "{pnpm}: {asked:?}"
+            );
+        }
     }
 
     /// Where no call that was read reads the lock, the answer is "no hub
@@ -1349,7 +2290,8 @@ mod tests {
             what.starts_with("tools/npm.MODULE.bazel: ") && what.contains("MODULE.bazel:7"),
             "{what}"
         );
-        // The same file, there: read, and its hub is the reader.
+        // The same file, there: read, and its hub is the reader, in a
+        // shape that takes a routed lock.
         let hub = "npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
                    npm.npm_translate_lock(pnpm_lock = \"//:pnpm-lock.yaml\")\n";
         assert_eq!(
@@ -1357,8 +2299,17 @@ mod tests {
                 ("MODULE.bazel", &including),
                 ("tools/npm.MODULE.bazel", hub)
             ]),
-            Some(Reader::Call("tools/npm.MODULE.bazel:2".to_string()))
+            Some(Reader::Takes("tools/npm.MODULE.bazel:2".to_string()))
         );
+        // Beside a call that takes a routed lock, what was not read still
+        // counts: a hub in it may read the lock in another shape.
+        let taking = module(LOCKED, ELEVEN);
+        let beside = format!("{taking}include(\"//tools:npm.MODULE.bazel\")\n");
+        let what = unseen(&[("MODULE.bazel", &beside)]);
+        assert!(what.starts_with("tools/npm.MODULE.bazel: "), "{what}");
+        let rule = "npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n";
+        let what = unseen(&[("MODULE.bazel", &taking), ("WORKSPACE", rule)]);
+        assert!(what.starts_with("WORKSPACE:1: it brings in"), "{what}");
         // A proxy of the extension that is not only called.
         let handed = format!("{elsewhere}register(npm)\n");
         let what = unseen(&[("MODULE.bazel", &handed)]);
@@ -1427,10 +2378,10 @@ mod tests {
         );
         // A lock that is no label may be any.
         let odd = module("pnpm_lock = \"//:a:b\"", ELEVEN);
-        assert_eq!(
+        assert!(matches!(
             reader(&[("MODULE.bazel", &odd)]),
-            Some(Reader::Call("MODULE.bazel:4".to_string()))
-        );
+            Some(Reader::Call(call, _)) if call == "MODULE.bazel:4"
+        ));
     }
 
     /// A checkout and a project in memory with the same files get the same
@@ -1461,17 +2412,31 @@ mod tests {
         assert_eq!(hidden(&ProjectView::Memory(&project)).await, Some(on_disk));
         // One read answers both questions, on disk and in memory alike.
         let disk = hubs(&ProjectView::Disk(dir.path()), true, &[]).await;
-        assert_eq!(
-            disk.reader,
-            Some(Reader::Call("MODULE.bazel:4".to_string()))
-        );
+        assert!(matches!(
+            &disk.reader,
+            Some(Reader::Call(call, _)) if call == "MODULE.bazel:4"
+        ));
         assert_eq!(disk.hidden, hidden(&ProjectView::Disk(dir.path())).await);
         assert_eq!(hubs(&ProjectView::Memory(&project), true, &[]).await, disk);
         // No root lock: nothing to keep out of a run, and the call is
-        // still the reader of a member's lock. No pnpm lock: nothing asked.
+        // still the reader of a member's lock, which a hub of the root lock
+        // keeps off the route. No pnpm lock: nothing asked.
         let member = ["packages/a/pnpm-lock.yaml".to_string()];
         let lockless = hubs(&ProjectView::Memory(&project), false, &member).await;
-        assert_eq!((lockless.hidden, lockless.reader), (None, disk.reader));
+        assert_eq!(lockless.hidden, None);
+        assert!(matches!(
+            &lockless.reader,
+            Some(Reader::Call(call, why))
+                if call == "MODULE.bazel:4" && why.starts_with("the project has workspace members")
+        ));
+        // The same of a run that is told not to write the setting.
+        let listing = self::module(LISTING, ELEVEN);
+        for (name, text) in [("MODULE.bazel", listing.as_str()), (SETTINGS, "# own\n")] {
+            project.insert_text(name, text);
+        }
+        let view = ProjectView::Memory(&project);
+        assert!(hubs(&view, true, &member).await.hides(false).is_some());
+        assert_eq!(hubs(&view, false, &member).await.hides(false), None);
         let none = hubs(&ProjectView::Memory(&project), false, &[]).await;
         assert_eq!(none, Hubs::default());
     }
