@@ -9631,11 +9631,11 @@ fn rewrite_gem(
                         result.warnings.push(RewriteWarning {
                             code: GEM_MEMBER_REGISTRY.into(),
                             detail: format!(
-                                "{name} {version} takes the patch registry of its `{platform}` \
-                                 gem's patch ({anchor}) as its source: the patch its builds were \
-                                 built from ({fix}) is not available to this run, and every patch \
-                                 registry of a fix serves every build of it. The `source:` in \
-                                 {gemfile_name} names that registry, so the line changes if \
+                                "{lock_name} takes {name} {version} from the patch registry of \
+                                 its `{platform}` gem's patch ({anchor}): the patch its builds \
+                                 were built from ({fix}) is not available to this run, and every \
+                                 patch registry of a fix serves every build of it. The `source:` \
+                                 in {gemfile_name} names that registry, so the line changes if \
                                  `{platform}` leaves {lock_name}",
                                 name = dep.name,
                                 version = dep.version,
@@ -24099,11 +24099,11 @@ mod tests {
         assert_eq!(warning_codes(&r), [GEM_MEMBER_REGISTRY]);
         assert_eq!(
             r.warnings[0].detail,
-            "nokogiri 1.18.10 takes the patch registry of its `arm64-darwin` gem's patch \
-             (uuid-arm64-darwin) as its source: the patch its builds were built from (uuid) is \
-             not available to this run, and every patch registry of a fix serves every build of \
-             it. The `source:` in Gemfile names that registry, so the line changes if \
-             `arm64-darwin` leaves Gemfile.lock"
+            "Gemfile.lock takes nokogiri 1.18.10 from the patch registry of its `arm64-darwin` \
+             gem's patch (uuid-arm64-darwin): the patch its builds were built from (uuid) is not \
+             available to this run, and every patch registry of a fix serves every build of it. \
+             The `source:` in Gemfile names that registry, so the line changes if `arm64-darwin` \
+             leaves Gemfile.lock"
         );
         assert!(
             gemfile.contains(&format!("source: \"{on_arm}\"")),

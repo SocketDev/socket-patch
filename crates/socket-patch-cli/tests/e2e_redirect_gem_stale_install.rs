@@ -3330,10 +3330,11 @@ async fn gem_hosted_scan_without_the_source_patch_takes_a_builds_registry() {
     assert_eq!(
         *detail,
         format!(
-            "{DEP} {DEP_VERSION} takes the patch registry of its `{first}` gem's patch ({anchor}) \
-             as its source: the patch its builds were built from ({UUID}) is not available to \
-             this run, and every patch registry of a fix serves every build of it. The `source:` \
-             in Gemfile names that registry, so the line changes if `{first}` leaves Gemfile.lock"
+            "Gemfile.lock takes {DEP} {DEP_VERSION} from the patch registry of its `{first}` \
+             gem's patch ({anchor}): the patch its builds were built from ({UUID}) is not \
+             available to this run, and every patch registry of a fix serves every build of it. \
+             The `source:` in Gemfile names that registry, so the line changes if `{first}` \
+             leaves Gemfile.lock"
         )
     );
     let (gemfile, moved) = pair();
