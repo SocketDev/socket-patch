@@ -23,6 +23,469 @@ a version without a non-empty section in this file.
 
 ## [Unreleased]
 
+## [5.2.0] — 2026-11-25
+
+### Added
+
+- **Bazel workspaces (experimental).**
+  - **Support for projects in a Bazel workspace is new and experimental.** A
+    project is in a Bazel workspace when its directory, or one above it up to
+    the root of its git checkout, holds `MODULE.bazel`, `REPO.bazel`,
+    `WORKSPACE` or `WORKSPACE.bazel`. There socket-patch now reads the
+    workspace's module files (never running Bazel) so that a patch does not
+    leave a Bazel build broken or silently unpatched. Everything in this group
+    is experimental: it is tested in CI only on the build shapes the docs
+    list, and what a command does, writes or says in a Bazel workspace can
+    change in any 5.x release. Agent mode is not supported for a project that
+    Bazel builds. `docs/ecosystems.md` ("Bazel workspaces: what is supported")
+    has a table by ecosystem and mode, and lists the known cases where a
+    command exits 0 and the next Bazel build still fails or takes the
+    unpatched package; build with Bazel before you commit a result. Nothing
+    changes for a project outside a Bazel workspace (#2188, #2205, #2222).
+  - **Maven under rules_jvm_external.** Hosted `get` and `scan` run at the
+    Bazel root patch a Maven artifact that a pinned hub (`maven_install.json`)
+    builds: one managed block in `MODULE.bazel` (`override_repo`, Bazel 7.4.0
+    or later) makes the hub build the patched jar at its sha256, and
+    `rollback` / `remove` take the block out byte for byte. A hosted scan
+    finds the jars a pinned hub builds, also in a tree with no `pom.xml`, and
+    takes out an entry the hub's lock has moved past (`rolledBack`, reason
+    `maven_bazel_entry_stale`). Vendored mode (`vendor`, `scan --mode
+    vendored`, `get --mode vendored`) commits the patched jar under
+    `.socket/vendor/maven/<uuid>/` as a local repository and adds one entry to
+    `MODULE.bazel`, so the build needs no patch host. Where a hub still builds
+    an artifact that a patch of the run does not reach, `get`, `scan`,
+    `vendor` and `apply` warn `maven_bazel_hub_unpatched` (or
+    `maven_bazel_unreadable` when a file cannot be read) (#2157, #2163, #2191,
+    #2207).
+  - **Go.** Vendored mode names socket-patch's module copies in the Bazel
+    root's `.bazelignore` (creating the file when it is missing), under a
+    `# socket-patch:` comment line, so the build stays patched after
+    `bazel run //:gazelle` and `bazel build //...` passes. Commenting the
+    line out declines it. The module copies of agent mode get the same line
+    so that they cannot break the workspace, though agent mode is not
+    supported for a Bazel build (#2123).
+  - **Hosted pins a ruleset would reject are withheld.** Where hosted `scan`
+    and `get` used to exit 0 and leave a `bazel build` that fails, they now
+    write nothing for the package, report it `skipped` (exit 0), and warn with
+    the call's file and line and what to change: a Cargo crate while a
+    rules_rust `crate_universe` hub reads the project's Cargo files without
+    the cargo config hosted mode writes
+    (`redirect_cargo_bazel_config_unread`); a NuGet package while a
+    rules_csharp `nuget.from_lock` hub does not take its sources from the
+    project's `nuget.config` (`redirect_bazel_nuget_config_undeclared`); a gem
+    while a rules_ruby `ruby.bundle_fetch` call holds it to another sha256 in
+    `gem_checksums` (`redirect_bazel_gem_checksums_pinned`); and a pnpm lock
+    that an `npm.npm_translate_lock` call has pnpm 11 or later keep up to date
+    (`update_pnpm_lock`) without listing `pnpm-workspace.yaml` in its `data`
+    (`redirect_pnpm_bazel_workspace_hidden`) (#2189, #2192, #2210, #2213).
+  - **Composer.** Vendored mode declines a Composer package it would newly
+    vendor in a Bazel workspace (`vendor_composer_bazel_workspace`, exit 1,
+    nothing written), because a ruleset that installs from the lock fails on
+    the vendored path. The new `--allow-vendored-in-bazel` flag (env
+    `SOCKET_ALLOW_VENDORED_IN_BAZEL`) lifts the refusal. Hosted mode is not
+    affected (#2186).
+  - **Cargo vendored mode.** Under a rules_rust crate hub, a vendored crate no
+    longer breaks `bazel cquery //...` and `bazel query 'deps(//...)'`, and
+    `vendor --check`, `vex`, `repair` and a repeated `scan --mode vendored`
+    accept the `BUILD.bazel` that cargo-bazel writes into the copy instead of
+    taking the crate for a changed one (#2190).
+  - **VEX.** `vex` and `--vex` attest a package as `affected`, with what to
+    run, where a Bazel module hub builds it from a lock that does not carry
+    the patch: aspect_rules_js (`npm.npm_translate_lock`), rules_python
+    (`pip.parse`), rules_ruby (`ruby.bundle_fetch`), rules_rust
+    (`crate.from_cargo`) and rules_csharp (`nuget.from_lock`). Before, a patch
+    that was only in the installed copy was attested `not_affected`. The run
+    warns `vex_bazel_not_in_build` and `vex --json` reports the package as
+    skipped, not verified. A repository that ships the installed tree rather
+    than what Bazel builds passes `--no-bazel` (`--vex-no-bazel` on `scan`,
+    `apply` and `vendor`; env `SOCKET_VEX_NO_BAZEL`) (#2159, #2224).
+- **RubyGems.**
+  - **Gems locked as precompiled platform gems (such as nokogiri) in hosted
+    and vendored mode, on MRI and JRuby.** A `Gemfile.lock` that pins a gem
+    only as platform builds (`nokogiri (1.18.10-x86_64-linux-gnu)`, …, or
+    `java` on JRuby) can now be patched in hosted and vendored mode where
+    Socket's backend serves a patched build of every platform the lock names.
+    Hosted mode moves every platform entry into the patch registry's `GEM`
+    section and writes each platform's sha256 into `CHECKSUMS`; `rollback`,
+    `remove` and a withdrawn patch put every entry back on its upstream
+    sha256, and the installed-copy refresh judges each platform build on its
+    own. Vendored mode unpacks each patched platform gem, verified against the
+    digest the service states, under
+    `.socket/vendor/gem/<uuid>/<name>-<version>/<platform>/` with a stub
+    gemspec behind one Bundler `path:` source, so nothing is compiled. Where a
+    platform has no patched build, hosted mode leaves the lock alone and
+    reports the skip as before, and vendored mode skips the gem with
+    `vendor_prebuilt_platform_pending` and exits 0 (#2150, #2154).
+  - **Agent mode rebuilds native extensions from the source gem, precompiled
+    gems included.** A patch to a native build input of a gem (`ext/**`,
+    `patches/**`, `ports/**`, build scripts) now takes effect by a real
+    rebuild. `apply` takes the gem's ruby-platform source gem from the gem
+    home's `cache/`, or downloads it from rubygems.org (or
+    `SOCKET_RUBYGEMS_URL`) over https and only at the sha256 the registry's
+    compact index records, checks that it is the installed gem's own source,
+    patches and builds it with RubyGems' builder in a stage directory, and
+    installs the result. For a precompiled platform gem the rebuilt binary is
+    grafted over the one Ruby loads. Before, such a patch was refused, or
+    reported applied while Ruby kept loading the old binary. A gem from a
+    private source is never downloaded, `rollback` restores the original
+    binaries byte for byte, and `--dry-run`, `apply --check` and `vex` still
+    start no Ruby. A rebuild needs a C toolchain and the libraries the gem
+    builds against, and can take a minute (#2098, #2112).
+  - **Agent mode applies gem patches on JRuby.** For the `java` build of a
+    gem, `apply` writes the files of a ruby-platform patch that the copy holds
+    and skips the C build inputs the java gem does not ship, the same tree
+    hosted mode installs. A patch that only changes such inputs is `skipped`
+    with `not_in_platform_build` and counts as in sync. A patch that changes
+    Java sources (`.java`, `pom.xml`, `build.gradle`, …) cannot rebuild the
+    gem's jars and is reported incomplete (see Changed) (#2155).
+- **npm family.**
+  - **Vendored mode works in Rush monorepos** on pnpm 9 or later, subspaces
+    included; every Rush repository used to be refused with
+    `vendor_rush_unsupported`. Locks get paths relative to the folder Rush
+    installs from, transitive dependents get parent-scoped `globalOverrides`
+    in `pnpm-config.json`, and a direct dependent's `package.json` spec moves
+    to `file:` (named by `vendor_rush_package_json_edited`), so the patch
+    survives `rush install`, `rush update` and `rush update --full`. `vendor
+    --revert`, `remove`, `vex`, `vendor --check` and takeover to and from
+    hosted mode work on the result. A Rush repo on npm or yarn, pnpm 8 and
+    older locks, and shapes Rush would reject are refused before anything is
+    written (#2134).
+- **PyPI.**
+  - **pixi projects.** The environments pixi installs under `.pixi/envs/` are
+    found without activation, so `scan --mode agent`, `apply` and `vex` patch
+    and attest them; `scan --global` reads `pixi global` tool environments. A
+    conda-built copy takes a PyPI patch only when it is a pure-Python build
+    whose replaced files all have the PyPI release's bytes; a compiled conda
+    package is never patched, whatever the flags, and is skipped with a
+    `conda_build_not_pypi_release` warning (`N not supported` in the summary)
+    without failing the run. Hosted mode still changes nothing in a pixi
+    project, and now says how to patch it in agent mode
+    (`redirect_pypi_pixi_project`) (#2166, #2183).
+- **JVM.**
+  - **Hosted mode patches Maven reactors and `${property}` versions.** `scan
+    --mode hosted` used to read only the root `pom.xml`, and refused a
+    multi-module reactor and any declaration whose version is a `${property}`.
+    It now plans them as vendored mode does: a module's declaration of the
+    base version is rewritten where it stands, a module that reaches it
+    transitively gets a `<dependencyManagement>` pin in the highest pom whose
+    modules all select it, a property only the patched artifact reads takes
+    the patched version, and a shared property is left alone while the one
+    declaration takes the literal version. `list`, `vex` and `rollback` read
+    every pom involved. A reactor that cannot be planned is still refused,
+    with the reason, and nothing written (#2114).
+- **General.**
+  - **`socket-patch report`** tells Socket that a patch broke something:
+    `socket-patch report <purl|name|uuid> [--reason build|tests|runtime|other]
+    [--message <text>]`. It sends one `patch_reported` event with each
+    selected patch's UUID, ecosystem and mode, the reason and the message (on
+    one line, with URL credentials and the home directory redacted, at most
+    1,000 characters), and no package name, path or file content. A report the
+    endpoint does not take fails the run (`report_not_sent`, exit 1), and
+    `--dry-run` prints the report and sends nothing. A targeted `rollback` of
+    one to three patches at a terminal ends with the command to report them
+    (#2193).
+  - **`socket-patch show <patch>`** prints a patch: the advisories it fixes,
+    what Socket measured about it, the files it changes and each file's diff
+    (`--file` to pick files, `--json` for the metadata). On a terminal it
+    opens full-screen, and a row of `list` opens the same page. On a terminal
+    `list` is now a full-screen table that fills in advisories, severity and
+    measurements from the patch service; pipes, `--yes` and `--verbose` keep
+    the printed listing (#2153).
+  - **A merged patch that is not published yet is named.** When a package
+    version has several advisories and the merged patch that fixes them
+    together is not ready, `scan` counts the advisories it leaves as `await a
+    merged patch` instead of `need a package upgrade` and says to run `scan`
+    again later; `get` prints the same. `scan --json` lists them in the new
+    `packages[].mergePendingIds` key, and `get --json` carries one
+    `merged_patch_pending` warning per package (#2220).
+  - **Experimental: a patch mirror for hosted mode behind an internal artifact
+    host.** `SOCKET_PATCH_MIRROR_URL` (or `--patch-mirror-url`, hidden from
+    `--help`) names a caching proxy of Socket's patch server, such as an
+    Artifactory generic remote repository, and hosted mode then writes its
+    pins under that base with the same path and integrity. Each new mirrored
+    pin is checked with one `HEAD` first (`SOCKET_PATCH_MIRROR_AUTHORIZATION`
+    authenticates it); Cargo and NuGet are skipped with
+    `redirect_mirror_unsupported`. `list`, `vex`, `rollback`, `remove`,
+    `vendor` and `repair` read a pin under the mirror as a hosted patch. The
+    setting, its variables and its `redirect_mirror_*` codes are experimental
+    and outside the semver policy, and `socket.yml` cannot set it. For every
+    hosted run, mirror or not, a pin of the same patch on a host the run was
+    not given is left alone (`redirect_pin_on_unconfigured_host`) (#2180).
+  - **`scan --selection-filter <FILE>`** (env `SOCKET_SELECTION_FILTER`),
+    hidden from `--help`: a versioned JSON file (`"version": 1`) that tells
+    one scan which paths, packages and advisories it need not patch, and which
+    advisories are reachable, for tools that drive socket-patch. Its format is
+    described in `docs/selection-filter.md` and versioned on its own rather
+    than by the CLI's semver policy (#2062).
+
+### Changed
+
+- **General.**
+  - **Reworked terminal output for `scan`, `get`, `rollback`, `list` and
+    `vex`.** `scan` prints one row per patched package (severity, advisories,
+    what Socket measured about the patch, advisories left unpatched) and then
+    the run's totals once, including what is left to patch and why and an
+    estimate of the upgrade work the patches stand in for. The packages a
+    project patches itself are one note instead of a warning each (`--verbose`
+    lists them). Status lines carry an activity mark on a terminal. `get`
+    shows the measurements of the patches it lists, `rollback` lists what it
+    restored once, and `vex` groups the patches it leaves out by reason and
+    says how to get them installed. `--json` envelopes, warnings and events
+    are unchanged (#2153).
+  - **Plain output in an AI coding agent's terminal.** A command run by an AI
+    coding agent (recognized by a variable it sets, such as `AI_AGENT`,
+    `CLAUDECODE`, `CURSOR_AGENT`, `CODEX_SANDBOX` or `GEMINI_CLI`) gets the
+    output a pipe gets, on a pseudo-terminal too: no status line, color,
+    full-screen `list` or `show`, or arrow-key menu. `SOCKET_PLAIN=0` keeps
+    the terminal output, and `SOCKET_PLAIN=1` asks for the plain output
+    anywhere. Typed yes/no confirmations are still asked (#2153).
+  - **Telemetry names the patches a run acted on.** Events about patches
+    (`patch_applied`, `patch_vendored`, `patch_fetched`, `patch_removed`,
+    `patch_rolled_back` and their failures) now carry up to 50 `{uuid,
+    ecosystem, mode, outcome, code}` entries in `metadata.patches`, with
+    `patches_truncated`, per-outcome counts and the distinct ecosystems and
+    modes; a patch UUID identifies the package version it is for, and no
+    package name, path or file list is sent. Every failure event carries an
+    `error_code`, and every event's `context` carries `channel` (`npm`,
+    `cargo`, `homebrew`, `pypi`, `launcher_cache` or `standalone`), the
+    install channel and never the path. Counts that were wrong or missing are
+    fixed: `scan` and `get` report agent-mode downloads, `vendor --revert`
+    reports what it takes out, vendor events carry `mode` and the command the
+    user ran, rollback events carry `dry_run` and `targeted`, `remove` sends
+    one event per run, and `removed_count` counts patches taken out rather
+    than manifest records (#2178).
+  - **The free tier is defined, and paid-only advisories are counted as
+    such.** The README and docs now say what the free tier is: every patch for
+    a critical vulnerability, merged patches included. An advisory on a
+    patched package that only a paid patch fixes now counts as `needs a paid
+    Socket plan` instead of `needs a package upgrade` (#2220).
+  - The CLI contract's semver policy now says that a subcommand or flag which
+    `--help` does not show and the contract does not describe can change or be
+    removed in any release (#2095).
+- **RubyGems.**
+  - **A gem patch that is written but not in effect fails the run.** When a
+    native build exits cleanly without compiling anything the patch changes (a
+    gem built against the system's libxml2, a build script that downloads its
+    binary, a library the build finds and keeps), or a JRuby patch changes
+    Java sources, `apply` writes the patch's files, never attests the copy,
+    and exits 1 with one `Error:` line that names the sources missing from the
+    compiled code (`native_extension_not_rebuilt`). Before, such a build was
+    taken for a build of the patch, attested by `vex`, and the run exited 0
+    (#2108, #2136, #2155).
+  - Hosted `scan` and `get` say that a newly wired gem is held at the patched
+    version (its only source serves no other, so `bundle outdated` drops it
+    and `bundle update` cannot move it), and how to move it to a newer release
+    (#2074).
+- **npm family.**
+  - **Hosted pnpm pins go through one named registry per patch.** On pnpm
+    11.20 and later, a hosted scan routes each patched release to the patch
+    server through a `namedRegistries` entry (`socket-<8 hex digits of the
+    patch UUID>`) and an override in `pnpm-workspace.yaml`, and writes the
+    lock as pnpm does for that configuration. pnpm verifies those entries
+    itself, so no `trustLockfile: true` is written, and the patch survives
+    `pnpm add`, `pnpm update` and `pnpm dedupe`; as with any pnpm override, a
+    dependency whose range admits the patched version stays at it until the
+    next scan. Older pnpm, Rush projects, mirrored pins, locks a Bazel hub
+    reads and lock shapes the route cannot write stay on `trustLockfile`, with
+    a warning that names the reason. Every hosted scan, `repair`, `scan
+    --prune`, `rollback`, `remove` and a switch to vendored mode take out the
+    entries of a patch that is gone (`registry_entry_unused`,
+    `gc.removedRegistryEntries`), and a registry the user wrote is never
+    touched (#2167).
+- **PyPI.**
+  - **A project with no environment of its own scans only its own packages.**
+    A project with a Python marker and no venv fell back to every interpreter
+    on the machine and to tool environments (`uv tool`, pipx, the Poetry
+    installer), and offered their packages as the project's. It now reads only
+    the interpreter on `PATH` (asked from the project directory, so a version
+    manager's shim follows `.python-version`) and, from a shared interpreter,
+    keeps the packages the project declares and what they require. An
+    interpreter on `PATH` inside a venv or a non-base conda environment is
+    read as the project's environment. `--global` is unchanged. A package only
+    pre-installed in a system Python (`pip`, `setuptools`), or installed with
+    an interpreter other than the one on `PATH`, is no longer offered by a
+    project scan (#2170).
+- **JVM.**
+  - **A Maven patch is pinned only where Maven already selects its base
+    version.** Hosted and vendored scans could change which version of a
+    dependency a build resolves (a downgrade, a forced upgrade, a version only
+    an excluded path or another project's cache held) and exit 0. socket-patch
+    now models Maven 3's dependency mediation per module from the poms and the
+    local repository, without running Maven. A version no module selects is
+    not pinned (`redirect_maven_version_not_selected`; vendored
+    `vendor_maven_version_not_selected`, a `skipped` event, exit 0) and the
+    run names the version Maven selects instead; when the selection cannot be
+    told for certain (a missing pom, a profile, a Maven 4 build) no new pin is
+    written (`redirect_maven_selection_undetermined`). A declaration that
+    already names the base version is still rewritten, and agent mode is
+    unchanged (#2100).
+  - **Hosted Maven does not wire a pin behind a mirror that would take its
+    repository.** Before writing anything, a hosted scan reads the Maven
+    settings that machine's builds use (user and global `settings.xml`, `-s` /
+    `-gs` from `MAVEN_ARGS` or `.mvn/maven.config`, a project
+    `.mvn/settings.xml`) and applies Maven's `<mirrorOf>` rule to the
+    repository the pin would add. When a mirror would take it over, nothing is
+    written for the dependency and `redirect_maven_mirror_captures_repository`
+    names the mirror, its settings file and the ways forward; when an earlier
+    run's wiring is already there, it says how to take it out. A refused or
+    skipped Maven dependency now touches no file, and the warnings say what
+    the run wrote (#2135, #2165).
+
+### Fixed
+
+- **RubyGems.**
+  - Installed copies after an unwind: `rollback`, `remove` and `vendor
+    --revert` of a vendored gem now put the upstream gem back in an installed
+    copy that a hosted scan or agent mode had patched, also for platform gems,
+    and name a copy they may not replace with `upstream_gem_stale_install`
+    (#2113, #2122, #2175). A hosted unwind judges a copy in a gem home with no
+    `cache/` by its patch record instead of skipping it silently (#2130), and
+    works behind a private gem server named by `SOCKET_RUBYGEMS_URL` (#2233).
+    Hosted rollback checks and downloads the upstream gem over https only
+    (#2112).
+  - A hosted scan over a gem that agent mode had patched in place replaces the
+    upstream `.gem` left in the gem home's `cache/`, which `bundle pristine`
+    and `bundle install --redownload` would have reinstalled from (#2103).
+  - Vendored mode: a gem the `Gemfile` does not declare is added with
+    `require: false`, so `Bundler.require` no longer loads it at boot; blocks
+    written by 5.1 gain the option when the gem is re-vendored (#2097). A gem
+    version the lock does not resolve (one Ruby ships, or another project
+    installed in a shared gem home) is skipped with
+    `vendor_gem_version_not_locked` instead of failing the run (#2079).
+    Un-vendoring a gem beside a hosted one puts its spec back in the right
+    `GEM` section of `Gemfile.lock` (#2102). A hosted gem whose patch was
+    superseded is vendored at the newer patch instead of failing as not
+    installed (#2143).
+  - In-place native rebuilds: `rollback` restores the libraries a gem builds
+    into its own tree (scrypt, digest-crc), `apply --check` and `vex` stop
+    attesting once one changes, and a failed build puts the whole tree back
+    (#2108). A gem whose build script uses up a file it ships (argon2) can be
+    rebuilt (#2161). A failed build shows its cause (the last 30 lines,
+    without mkmf's option list) and names what a precompiled gem's rebuild
+    needs, printed once (#2128). `scan --mode agent` and `get --mode agent`
+    honour `--no-gem-native-rebuild` (#2073).
+  - `apply` finds an installed gem that ships no `lib/` directory and no
+    gemspec of its own (cassandra-web) (#2185). `vex` and `apply --check` no
+    longer count the leftover directory of an uninstalled gem build (#2124).
+    An installed gem that matches no variant of its patch is reported as
+    `no_matching_variant` with `bundle pristine <gem>` as the remedy, instead
+    of "not installed" (#2237).
+  - Messages and remedies: vendored refusals name their way out (#2127); a
+    gemspec-only gem's remedy no longer suggests `--mode vendored`, which
+    refuses it too (#2160); a Gemfile with several top-level `source` lines
+    gets a warning that names that cause and a remedy that works (#2164); an
+    unwind's warning for a shared gem home names the files to remove instead
+    of a re-run that cannot work (#2156); a native gem rollback's progress
+    line says it builds "from its upstream gem" (#2172); `rollback` of a gem
+    that was only vendored no longer says installed trees keep patched bytes
+    (#2215); `vex` names a remedy that works for a hosted gem whose installed
+    copy is still upstream (#2221); and `vex` describes how to clear a
+    vendored gem's leftover registry copy (#2081).
+  - A hosted or vendored scan that refuses a gem locked only as platform
+    builds counts its advisories as left to patch instead of printing "Nothing
+    left to patch." (#2187).
+- **npm family.**
+  - Bun: `bun.lock` version 3 (Bun 1.4.0 and later) is read; the dependencies
+    of a `bundleDependencies` copy are no longer rewired, vendored or
+    attested, since Bun installs them from the parent's tarball; a
+    `package.json` with comments or trailing commas is read as Bun reads it; a
+    package Bun trusts by default (`sqlite3`, `sharp`) with no
+    `trustedDependencies` is left unpatched with the way to patch it
+    (`redirect_bun_default_trust_skipped`, `vendor_bun_default_trust_refused`)
+    instead of breaking its install script; a revert with both `bun.lock` and
+    `bun.lockb` restores the lock Bun installs from; and `vendor --check` and
+    `vex` check the lock's integrity pin and the tarball's layout (#2120).
+  - A project whose pnpm workspace pattern names only the root (`'.'`) no
+    longer has every npm package skipped as project-patched when a symlink at
+    the root leads to a directory with a `package.json` (such as Bazel's
+    `bazel-<dir>` link) (#2121).
+  - A pnpm package that depends on a project-patched package is no longer
+    itself treated as patched by the project, so it gets Socket patches again
+    (#2153).
+- **PyPI.**
+  - A Poetry or PDM project whose lock resolves no packages and that installs
+    from `requirements.txt` is vendored through `requirements.txt` instead of
+    being refused with a remedy that rewrites the same empty lock (#2229).
+  - `rollback` undoes the vendoring of a PDM 0.x dependency declared with
+    extras (#2060).
+- **Go.**
+  - A module with no `go.sum` is scanned for its `go.mod` requires only,
+    instead of every module left in `GOMODCACHE` (#2169).
+- **Cargo.**
+  - A lock source whose URL only contains crates.io's host
+    (`sparse+https://index.crates.io.evil.example/`) is no longer taken for
+    crates.io, and crates.io spelled the way cargo treats as the same source
+    (a trailing `/`, `.git`, host case) is accepted. `vex` remedies name a
+    lock entry by its source so the `cargo update -p` / `cargo tree -i`
+    commands run, and a stale entry from another registry is recognised
+    (#2131).
+  - Workspace `exclude` is read the way cargo reads it (a literal path
+    prefix), so a member that is also listed in `exclude` is still a member
+    for `vex` and hosted mode, and a run from an excluded directory under a
+    `.` member is not treated as its own root (#2077).
+  - Hosted `remove` gives back a `.cargo/config.toml` that had no final
+    newline byte for byte (#2078).
+- **JVM.**
+  - The Maven Trusted Checksums line that hosted mode writes into
+    `.mvn/maven.config` no longer stops Maven 3.9.2 to 3.9.8 from starting a
+    build run with `-f` from outside the project. It uses
+    `${maven.multiModuleProjectDirectory}` unless the project declares Maven
+    4, and any hosted scan rewrites a line an earlier release wrote (#2145).
+  - Agent and vendored mode read jars with limits of their own (200,000
+    entries, 1 GiB inflated per pass), so large jars such as `hive-exec` can
+    be patched, and compare a patched jar with the original member by member,
+    every member the JVM would load included. `-Dmaven.repo.local` in
+    `.mvn/maven.config` is honoured, a mismatch refusal carries
+    `jvm_agent_service_jar_mismatch`, and `rollback` of an already-patched
+    `~/.m2` copy can fetch the original from the registry (#2132).
+  - A signed provider jar (such as Bouncy Castle's `bcprov`) that the patch
+    service patched and signed again is accepted in agent and vendored mode
+    (#2137).
+- **General.**
+  - A bare agent-mode `scan` from a monorepo root now warns
+    `projects_not_scanned`, naming the project directories below it that keep
+    their own install directory, instead of reporting success or "No packages
+    found" (#2126).
+  - In agent mode, a `scan` or `get` that replaces a recorded patch with one
+    that does not change every file of the old one rolls the old patch back
+    first, so no file stays patched without a record; when it cannot, the
+    replacement is refused (`replaced_patch_not_restored`, exit 1) (#2119).
+  - Commands that messages print (`rollback <purl>` remedies, prune notes, the
+    stale-pin note) name a purl that works in a shell: quoted where needed,
+    and the base purl where `rollback` selects a pin by it (#2204).
+  - When socket-patch is a container's PID 1, a stop signal (`docker stop`)
+    now ends it at once with exit status 128 plus the signal number, instead
+    of waiting out the grace period; the CLI contract lists it under exit
+    codes (#2095).
+  - `--update` recognizes a `cargo install` binary on Windows or under a
+    symlinked home directory and refuses to replace it in place, as documented
+    (#2178).
+
+### Maintenance
+
+- Tests on real Bazel in CI for hosted and vendored flows of every ecosystem
+  (#2107, #2109, #2110, #2111, #2139, #2140, #2146, #2147, #2227), Maven flows
+  against the live patch service and the undo of a shared pin (#2118, #2171),
+  and hermetic unit and integration tests kept off the host's npm, yarn,
+  Python, Bundler, Go, Composer and Hatch environment (#2054, #2055, #2056,
+  #2057, #2063, #2064, #2065, #2066, #2067).
+- Other CI, test, docs and refactor work with no change in behavior: #2058,
+  #2061, #2071, #2099, #2116, #2141, #2142, #2148, #2173, #2176, #2179,
+  #2206, #2209, #2217, #2218, #2225, #2234, #2239.
+
+### Performance
+
+- **General.**
+  - Scans start and finish sooner: a hosted scan paints its first line at
+    once, a scan of several project directories crawls them together and asks
+    the patch service about each package once for the run, and `vex` fetches
+    patch records without their file contents. On a 17-directory pnpm monorepo
+    a hosted scan of all directories drops from about 20 s to about 12 s and
+    `vex` from 12.7 s to about 5 s (#2153).
+- **Cargo.**
+  - A hosted Cargo scan parses `Cargo.lock` once instead of several times per
+    patched crate (#2138).
+
 ## [5.1.0] — 2026-11-06
 
 ### Added
