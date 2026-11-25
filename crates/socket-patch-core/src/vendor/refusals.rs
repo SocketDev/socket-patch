@@ -27,10 +27,11 @@
 //!    ([`bazel_workspace_refusals`]), unless the user allowed it
 //!    ([`ALLOW_IN_BAZEL_ENV`]): a Composer project in one
 //!    (`vendor_composer_bazel_workspace`), unless the lock already names
-//!    the patch's copy; and a NuGet package of a project whose lock a
-//!    rules_csharp hub reads, where the block that makes the hub take the
-//!    copy cannot be shown to work (`vendor_nuget_bazel_workspace`), unless
-//!    `nuget.config` already names the patch's folder.
+//!    a vendored copy in `packages` or in the package's section; and a
+//!    NuGet package of a project whose lock a rules_csharp hub reads,
+//!    where the block that makes the hub take the copy cannot be shown to
+//!    work (`vendor_nuget_bazel_workspace`), unless `nuget.config` already
+//!    names the patch's folder.
 //! 8. a Maven jar that only a rules_jvm_external hub of a Bazel workspace
 //!    builds and whose entry cannot be written there (the `maven_bazel_*`
 //!    codes of [`crate::bazel::maven`]), from the same dispatch.
