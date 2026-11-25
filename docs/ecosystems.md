@@ -3962,6 +3962,7 @@ A project whose `Gemfile` names a private gem server as its source (`source
   itself: a copy that still holds the patched build is left as it is and named by
   `upstream_gem_stale_install`, with the files to remove before `bundle install` (Bundler keeps
   the copy otherwise). With the setting, the copy is replaced as above.
+
 Vendoring a gem that was hosted (`vendor`, `scan --mode vendored`) leaves the installed copies as
 they are: Bundler loads the vendored copy from then on. When that vendored gem is later unwound
 (`rollback`, `remove`, `vendor --revert`), Bundler loads the installed copy again, so the unwind

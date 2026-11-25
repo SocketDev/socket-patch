@@ -1035,6 +1035,24 @@ async fn gem_refusals_leave_everything_hosted() {
         ),
         other => panic!("expected a refusal, got {other:?}"),
     }
+    // A server reached over plain http is one the setting refuses: the
+    // refusal does not name it as the way out.
+    let mut plain = foreign.clone_with("foreign-upstream-http");
+    plain.edit_both("Gemfile.lock", |t| {
+        t.replace("https://gems.example.com/", "http://gems.example.com/")
+    });
+    let (after, statuses) = gem_run(&plain).await;
+    assert_refused(
+        &plain,
+        &after,
+        &statuses,
+        "Gemfile Gemfile.lock",
+        "http://gems.example.com is not rubygems.org",
+    );
+    match &statuses[0].1 {
+        PinStatus::Refused(why) => assert!(!why.contains("SOCKET_RUBYGEMS_URL"), "{why}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
     // Two upstream sections, neither singled out.
     let mut ambiguous = case.clone_with("ambiguous-upstream");
     ambiguous.edit_both("Gemfile.lock", |t| {

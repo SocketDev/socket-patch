@@ -3877,6 +3877,13 @@ async fn hosted_unwind_names_a_patched_install_from_a_mirror_without_checksums()
         let tmp = tempfile::tempdir().unwrap();
         let proj = tmp.path().join("proj");
         let gem_dir = mirror_project(&proj, MIRROR, None);
+        // The project commits its bundler cache.
+        let committed = proj
+            .join("vendor")
+            .join("cache")
+            .join(format!("{DEP}-{DEP_VERSION}.gem"));
+        std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+        std::fs::write(&committed, real_gem(UPSTREAM_LIB)).unwrap();
         let pair = |name: &str| std::fs::read_to_string(proj.join(name)).unwrap();
         let (gemfile, lock) = (pair("Gemfile"), pair("Gemfile.lock"));
         let uri = server.uri();
@@ -3908,9 +3915,26 @@ async fn hosted_unwind_names_a_patched_install_from_a_mirror_without_checksums()
                 left[0]
             );
         }
+        // The archive in Bundler's cache dir is named too, as one nothing
+        // could check: the registry is not asked about another remote's gem.
+        let cached = details_with_code(&env, "upstream_gem_stale_cache");
+        assert_eq!(cached.len(), 1, "offline={offline}: {env}");
         assert!(
-            gem_downloads_since(&server, asked_before).await.is_empty(),
-            "offline={offline}: rubygems.org is not asked for another remote's gem"
+            cached[0].contains(committed.to_str().unwrap())
+                && cached[0].contains("could not be checked against the upstream sha256"),
+            "offline={offline}: {}",
+            cached[0]
+        );
+        let asked_registry = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .skip(asked_before)
+            .any(|request| request.url.path().starts_with("/upstream/"));
+        assert!(
+            !asked_registry,
+            "offline={offline}: rubygems.org is not asked about another remote's gem"
         );
     }
 }
