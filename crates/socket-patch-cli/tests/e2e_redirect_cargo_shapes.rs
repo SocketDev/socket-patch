@@ -693,7 +693,7 @@ async fn run_shape(shape: Shape) -> Option<()> {
         .unwrap()
         .iter()
         .flat_map(|st| st["products"].as_array().unwrap().clone())
-        .flat_map(|p| p["subcomponents"].as_array().unwrap().clone())
+        .flat_map(|p| p["subcomponents"].as_array().cloned().unwrap_or_default())
         .map(|c| c["@id"].as_str().unwrap().to_string())
         .collect();
     attested.sort();

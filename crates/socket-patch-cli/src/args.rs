@@ -437,7 +437,10 @@ pub struct GlobalArgs {
     /// it when the build does find the copy, or does not take the
     /// project's packages from that lock. A PyPI package is then written
     /// by its path also where vendored mode would commit its wheel as a
-    /// download cache of Bazel. Other subcommands accept it silently.
+    /// download cache of Bazel. Without it a gem is committed for a
+    /// rules_ruby hub as an archive that the hub builds, where that is
+    /// known to build; with it every gem is vendored by its path. Other
+    /// subcommands accept it silently.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long = "allow-vendored-in-bazel",

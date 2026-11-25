@@ -90,7 +90,8 @@ fn mode_of(event: &PatchEvent, default: &'static str) -> &'static str {
 /// * Several events for one patch (one per installed copy, or a download
 ///   and then an apply) fold into the one that says most: see
 ///   [`outcome_of`]. The `code` is that event's `errorCode`, and only a
-///   failure or a skip has one.
+///   failure or a skip has one; a failure with a `cause` (an apply's,
+///   under the generic `apply_failed`) reports the cause instead.
 pub(crate) fn patch_outcomes<'a>(
     events: impl IntoIterator<Item = &'a PatchEvent>,
     default_mode: &'static str,
@@ -107,9 +108,11 @@ pub(crate) fn patch_outcomes<'a>(
             continue;
         };
         let mode = mode_of(event, default_mode);
-        let code = matches!(event.action, PatchAction::Failed | PatchAction::Skipped)
-            .then(|| event.error_code.clone())
-            .flatten();
+        let code = match event.action {
+            PatchAction::Failed => event.cause.clone().or_else(|| event.error_code.clone()),
+            PatchAction::Skipped => event.error_code.clone(),
+            _ => None,
+        };
         let entry = PatchOutcome {
             uuid: uuid.clone(),
             ecosystem: purl.map(ecosystem_of).unwrap_or_default(),

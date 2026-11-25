@@ -263,7 +263,21 @@ socket-patch vex --json --output socket.vex.json
 
 The document marks vulnerabilities covered by verified Socket patches as
 `not_affected`. It does not assess other vulnerabilities. A VEX-aware scanner must
-be configured to consume the resulting file.
+be configured to consume the resulting file:
+
+```sh
+trivy fs --vex socket.vex.json --show-suppressed .
+grype dir:. --vex socket.vex.json --show-suppressed
+```
+
+Each statement names the project as its product, with the patched packages as its
+subcomponents, and names each patched package again as a product of its own, which
+is how Trivy and Grype look a finding up. A gem built for a platform is also named
+as Trivy reports it (`name@version`) and as Grype and Syft report it
+(`name@version-platform`). A form that would also stand for an unpatched copy, or a
+copy the document leaves out, is left out, so the scanner keeps reporting that copy.
+Scanners match a package wherever they find it, so use the document only on the
+project it was made for.
 
 | Patch mode | Evidence used by VEX |
 | --- | --- |

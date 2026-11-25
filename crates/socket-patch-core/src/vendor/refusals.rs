@@ -30,7 +30,8 @@
 //!    vendored copy in `packages` or in the package's section, and a PyPI
 //!    or RubyGems project whose lock a hub of the workspace reads
 //!    (`vendor_pypi_bazel_hub`, `vendor_gem_bazel_hub`), unless that lock
-//!    already names the patch's copy;
+//!    already names the patch's copy, or the gem can be committed for the
+//!    hub as its archive ([`gem::bazel`]);
 //! 8. a Maven jar that only a rules_jvm_external hub of a Bazel workspace
 //!    builds and whose entry cannot be written there (the `maven_bazel_*`
 //!    codes of [`crate::bazel::maven`]), from the same dispatch.

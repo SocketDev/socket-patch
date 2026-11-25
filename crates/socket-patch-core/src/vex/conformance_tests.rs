@@ -701,12 +701,10 @@ fn fixtures_carry_subcomponents_so_at_id_walks_have_teeth() {
     // produces subcomponents. If a future fixture edit dropped them,
     // those tests would pass vacuously. Pin the precondition directly.
     for st in &sample_doc().statements {
-        for p in &st.products {
-            assert!(
-                !p.subcomponents.is_empty(),
-                "sample_doc product must carry >=1 subcomponent"
-            );
-        }
+        assert!(
+            !st.products[0].subcomponents.is_empty(),
+            "sample_doc project product must carry >=1 subcomponent"
+        );
     }
     let merged = merged_doc();
     assert!(
@@ -794,12 +792,21 @@ fn an_affected_statement_carries_an_action_statement_and_no_justification() {
             }
             assert_eq!(st.timestamp.as_deref(), Some(doc.timestamp.as_str()));
             assert!(!st.vulnerability.name.is_empty());
-            let [product] = &st.products[..] else {
-                panic!("not one product: {json}");
+            let [product, packages @ ..] = &st.products[..] else {
+                panic!("no product: {json}");
             };
             assert_eq!(product.id, "pkg:npm/test-app@1.0.0");
             assert!(!product.subcomponents.is_empty());
             assert!(product.subcomponents.iter().all(|sub| !sub.id.is_empty()));
+            let named: Vec<&str> = packages.iter().map(|p| p.id.as_str()).collect();
+            for sub in &product.subcomponents {
+                assert!(
+                    named.contains(&sub.id.as_str()),
+                    "package {} is named as a product of its own: {json}",
+                    sub.id
+                );
+            }
+            assert!(packages.iter().all(|p| p.subcomponents.is_empty()));
             let reserved = ["justification", "impact_statement"];
             match st.status {
                 Status::Affected => {

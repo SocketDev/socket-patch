@@ -1,5 +1,8 @@
 //! PyPI and RubyGems vendored mode for a project whose lock a Bazel hub
-//! reads: declined unless the user allows it.
+//! reads: declined unless the user allows it, or the package is a gem that
+//! can be committed for the hub as its archive ([`super::gem::bazel`]), or
+//! a wheel that can be committed as a download cache of Bazel
+//! ([`super::pypi_distdir`]).
 //!
 //! rules_python's `pip.parse` and rules_ruby's `ruby.bundle_fetch` build
 //! the packages of a lock in repositories of Bazel's own. Vendored mode
@@ -42,6 +45,8 @@ use crate::crawlers::Ecosystem;
 use crate::utils::env_compat::env_flag;
 use crate::utils::fs::run_blocking;
 use crate::utils::pnpm_workspace::without_verbatim_prefix;
+use crate::utils::purl::parse_gem_purl;
+use crate::vendor::gem::bazel as gem_hub;
 use crate::vendor::path::vendor_uuid_dir_rel;
 use crate::vendor::refusals::ALLOW_IN_BAZEL_ENV;
 
@@ -65,11 +70,18 @@ pub async fn refusals<'a>(
 }
 
 /// What stands between vendored mode and a list of files of a project
-/// ([`standing`]): the words of the refusal, the text of the lock the hub
-/// reads where a call names one, and whether one names, with certainty, a
-/// file of the list itself (and not one that brings it in with `-r`).
-/// `None` where nothing does.
-type Standing = Option<(String, Option<String>, bool)>;
+/// ([`standing`]): what was read of the workspace, the text of the lock the
+/// hub reads where a call names one, whether one names, with certainty, a
+/// file of the list itself (and not one that brings it in with `-r`), and
+/// for a call that names a gem's files whether a gem can be committed for
+/// it as its archive ([`gem_hub::gate`]). `None` where nothing stands in
+/// the way.
+type Standing = Option<(
+    String,
+    Option<String>,
+    bool,
+    Option<Result<gem_hub::Hub, String>>,
+)>;
 
 /// What the refusal says after its own words where a wheel could be a
 /// download cache of Bazel ([`super::pypi_distdir`]) and is not made one:
@@ -133,12 +145,12 @@ async fn refusals_unless<'a>(
         let at = match asked.iter().position(|(of, _)| *of == list) {
             Some(at) => at,
             None => {
-                let stands = standing(&root, purls, ruleset, hosted, list.1.clone()).await;
+                let stands = standing(&root, purls, ruleset, list.1.clone()).await;
                 asked.push((list, stands));
                 asked.len() - 1
             }
         };
-        let Some((detail, lock, named)) = &asked[at].1 else {
+        let Some((reads, lock, named, gem)) = &asked[at].1 else {
             continue;
         };
         // A lock names the copy of a patch by the copy's directory, outside
@@ -183,11 +195,34 @@ async fn refusals_unless<'a>(
         if wired {
             continue;
         }
+        // A gem is committed as its archive where the hub is known to
+        // build that: only where it is not is the gem declined.
+        let committed = gem.as_ref().map(|hub| {
+            let (name, version) = parse_gem_purl(purl).unwrap_or_default();
+            let hub = hub.as_ref().map_err(String::clone)?;
+            hub.declines(&name, &version).map_or(Ok(()), Err)
+        });
+        let fails = match committed {
+            Some(Ok(())) => continue,
+            Some(Err(why)) => format!(
+                "vendored mode commits the patched gem for such a call and names it by a \
+                 relative `file:` URL, which is not known to build here: {why}"
+            ),
+            None => format!(
+                "vendored mode makes the lock name the patched copy by a path under \
+                 .socket/vendor, and {ruleset} fails the build on such a lock"
+            ),
+        };
+        let detail = format!(
+            "{reads}; {fails}; use `--mode hosted`, which names the patched package by a URL \
+             that {ruleset} fetches{hosted}, or pass `--allow-vendored-in-bazel` if no build \
+             takes the packages of this project from {ruleset}"
+        );
         // A wheel is committed as a download cache of Bazel where the
         // checkout shows that the build takes it; elsewhere the refusal
         // says why not.
         if code != PYPI_CODE || !*named {
-            refused.push((*purl, code, detail.clone()));
+            refused.push((*purl, code, detail));
             continue;
         }
         let gate = super::pypi_distdir::gate(project, &root, files, (purl, uuid));
@@ -236,13 +271,11 @@ pub(super) async fn download_cache(
 }
 
 /// The [`Standing`] of the files `locks` of the project of `root`, for the
-/// packages of `ruleset` (purls of the type `purls`), whose hosted pin is
-/// built `hosted`.
+/// packages of `ruleset` (purls of the type `purls`).
 async fn standing(
     root: &BazelRoot,
     purls: &'static str,
     ruleset: &str,
-    hosted: &str,
     locks: Vec<String>,
 ) -> Standing {
     // The root is canonical: on Windows that spelling has a prefix no user
@@ -250,7 +283,7 @@ async fn standing(
     let at = without_verbatim_prefix(root.dir.clone());
     let at = at.display();
     let own: Vec<String> = locks.iter().map(|lock| from_root(root, lock)).collect();
-    let (reads, lock, named) = match reader(root, purls, locks).await? {
+    let (reads, lock, named, gem) = match reader(root, purls, locks).await? {
         Ok(Unbuilt {
             call,
             file,
@@ -267,8 +300,12 @@ async fn standing(
             // Read as a lock of the workspace is: within its bound, and
             // not through a link that leads out of the Bazel root.
             let dir = root.dir.clone();
-            let text = run_blocking(move || lock_text(&dir, &lock)).await;
-            (reads, text, named)
+            let lock = run_blocking(move || lock_text(&dir, &lock)).await;
+            let gem = match purls {
+                "gem" => Some(gem_hub::gate(root).await),
+                _ => None,
+            };
+            (reads, lock, named, gem)
         }
         Err(Doubt { file, line, why }) => {
             let line = match line {
@@ -279,17 +316,10 @@ async fn standing(
                 "the files of the Bazel workspace at {at} cannot be read with certainty, so a \
                  call of {ruleset} may name a lock of this project ({file}{line}: {why})"
             );
-            (reads, None, false)
+            (reads, None, false, None)
         }
     };
-    let detail = format!(
-        "{reads}; vendored mode makes the lock name the patched copy by a path under \
-         .socket/vendor, and {ruleset} fails the build on such a lock; use `--mode hosted`, \
-         which names the patched package by a URL that {ruleset} fetches{hosted}, or pass \
-         `--allow-vendored-in-bazel` if no build takes the packages of this project from \
-         {ruleset}"
-    );
-    Some((detail, lock, named))
+    Some((reads, lock, named, gem))
 }
 
 #[cfg(test)]
@@ -364,7 +394,7 @@ ruby.bundle_fetch(name = "bundle", gemfile = "//api:Gemfile", gemfile_lock = "//
                 [
                     "`ruby.bundle_fetch` (MODULE.bazel:4)",
                     "names api/Gemfile.lock; ",
-                    "and rules_ruby fails the build",
+                    "which is not known to build here: the project is not the root",
                 ],
             ),
         ] {

@@ -33,9 +33,10 @@ on:
     # discovery, the lock inventory, the Ruby crawler (it says which lock
     # Bundler loads), the upstream restore of `rollback`, the stale-install
     # guard that those commands end with, the vendored backend
-    # (vendor/gem.rs), and the refusal of vendored mode beside a hub that
-    # reads the lock (vendor/bazel_hub.rs), which vendor/refusals.rs hands
-    # to every command.
+    # (vendor/gem.rs, and vendor/gem/ for the gem it commits for a hub),
+    # and the refusal of vendored mode beside a hub that reads the lock
+    # (vendor/bazel_hub.rs), which vendor/refusals.rs hands to every
+    # command.
     # Last, the VEX code: `vex/` of the core, the files of the `vex`
     # command, and `bazel/` of the core, which reads the workspace files and
     # decides whether Bazel builds what was patched. Every flow holds the
@@ -73,6 +74,7 @@ on:
       - 'crates/socket-patch-core/src/patch/redirect/upstream/gem.rs'
       - 'crates/*/src/**/gem_refresh.rs'
       - 'crates/socket-patch-core/src/vendor/gem.rs'
+      - 'crates/socket-patch-core/src/vendor/gem/**'
       - 'crates/socket-patch-core/src/vendor/bazel_hub.rs'
       - 'crates/socket-patch-core/src/vendor/refusals.rs'
       - 'crates/socket-patch-core/src/bazel/**'
@@ -101,6 +103,7 @@ on:
       - 'crates/socket-patch-core/src/patch/redirect/upstream/gem.rs'
       - 'crates/*/src/**/gem_refresh.rs'
       - 'crates/socket-patch-core/src/vendor/gem.rs'
+      - 'crates/socket-patch-core/src/vendor/gem/**'
       - 'crates/socket-patch-core/src/vendor/bazel_hub.rs'
       - 'crates/socket-patch-core/src/vendor/refusals.rs'
       - 'crates/socket-patch-core/src/bazel/**'

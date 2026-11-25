@@ -8199,7 +8199,7 @@ fn gem_dependency_entry(lock: &str, line_no: usize) -> &str {
 /// and the lock resolves it from a `GEM` section naming that remote, with a
 /// source-pinned `DEPENDENCIES` entry. Bundler refuses any other pair under
 /// frozen / deployment mode, so a plan that fails this is never committed.
-fn gem_pair_agrees(
+pub(crate) fn gem_pair_agrees(
     manifest: &str,
     lock: &str,
     dep: &DepOverride,
@@ -8386,12 +8386,14 @@ fn plan_gem_redirect(
             }
             // Bundler allows ONE source per gem: an option that already
             // picks one (`git:`, `path:`, another `source:`) cannot take
-            // the Socket source beside it. When the blocking `path:` is
+            // the Socket source beside it. When the blocking `path:` (or
+            // the `source:` of a gem committed for a Bazel hub) is
             // socket-patch's OWN vendored wiring, prescribe the eject path
             // instead of leaving the user to puzzle over their own Gemfile.
             if let Some(spelling) = decl.source_selecting() {
                 let socket_vendored = decl.args.iter().any(|arg| {
-                    matches!(&arg.kind, ArgKind::Option { key, .. } if key == "path")
+                    let ours = |key: &str| key == "path" || key == "source";
+                    matches!(&arg.kind, ArgKind::Option { key, .. } if ours(key))
                         && gf[arg.start..arg.end].contains(".socket/vendor/")
                 });
                 return Err(refuse(
@@ -8830,6 +8832,27 @@ fn plan_gem_redirect(
         unchecked,
         prior: prior_url.is_some(),
     })
+}
+
+/// The pair edit of hosted mode for the gem `dep` with `source` in the place
+/// of the patch registry's URL and `sha256` as the sum of the gem's archive:
+/// `Gemfile` and `Gemfile.lock` as the edit leaves them, and its edits.
+/// Vendored mode writes it for a gem whose lock a Bazel hub reads
+/// ([`crate::vendor::gem::bazel`]), with a relative `file:` URL of the
+/// checkout as `source`.
+pub(crate) fn plan_gem_source(
+    gemfile: &str,
+    lock: &str,
+    dep: &DepOverride,
+    source: &str,
+    sha256: &str,
+) -> Result<(String, String, Vec<FileEdit>), RewriteWarning> {
+    let sums = [(dep.version.clone(), sha256.to_string())];
+    let (files, names) = (BTreeMap::new(), ("Gemfile", "Gemfile.lock"));
+    let (gemfile, layout) = (Some(gemfile), lock_layout(lock));
+    let layout = layout.as_ref();
+    let plan = plan_gem_redirect(&files, dep, source, &sums, gemfile, lock, names, layout)?;
+    Ok((plan.gemfile, plan.lock, plan.staged.edits))
 }
 
 /// The Bundler manifest and lock that the gem rewriter edits among `files`:
