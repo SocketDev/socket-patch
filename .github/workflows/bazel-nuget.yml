@@ -2,8 +2,9 @@ name: Bazel patch compatibility (NuGet)
 
 # The NuGet flows of the real-Bazel tests (`nuget::` in `e2e_bazel_build`):
 # hosted mode for a package that rules_csharp's `nuget.from_lock` reads from
-# `packages.lock.json` and `nuget.config`, and for a tag that names no
-# `nuget_config`, on each Bazel release below.
+# `packages.lock.json` and `nuget.config`, for a tag that names no
+# `nuget_config`, and agent mode for the copy of the package in NuGet's
+# global packages folder, on each Bazel release below.
 # bazel-compatibility.yml holds the legs and what every ecosystem shares;
 # this file says when the NuGet legs run and on which releases.
 #
@@ -27,34 +28,41 @@ name: Bazel patch compatibility (NuGet)
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    # What a pull request run covers: the NuGet flow and its fixture, the
+    # What a pull request run covers: the NuGet flows and their fixture, the
     # harness and the workflows that run it, the Bazel installer and its
     # pins, and the NuGet files of the product that `scan --mode hosted`,
-    # `vex` and `rollback` run through in the fixture, each by its own
-    # path: the readers of `packages.lock.json` and `nuget.config` and the
-    # `contentHash` of a package (formats/nuget), the NuGet crawler, which
-    # finds a package in the global packages folder, the reader of the
-    # NuGet settings a project inherits (vendor/nuget_config.rs), the
-    # discovery of a hosted pin in the two files, the upstream restore of
-    # `rollback`, and the hosted scan's check of that folder. Then what
-    # reads the tag in `MODULE.bazel`: the reader of the workspace files,
-    # which every ecosystem's flow shares (bazel/mod.rs, starlark.rs and
-    # workspace.rs), and what hosted mode makes of the tag (bazel/nuget.rs).
+    # `scan --mode agent`, `vex` and `rollback` run through in the fixture,
+    # each by its own path: the readers of `packages.lock.json` and
+    # `nuget.config` and the `contentHash` of a package (formats/nuget), the
+    # NuGet crawler, which finds a package in the global packages folder,
+    # the reader of the NuGet settings a project inherits
+    # (vendor/nuget_config.rs), the discovery of a hosted pin in the two
+    # files, the upstream restore of `rollback`, and the hosted scan's check
+    # of that folder. Then what reads the tag in `MODULE.bazel`: the reader
+    # of the workspace files, which every ecosystem's flow shares
+    # (bazel/mod.rs, starlark.rs and workspace.rs), and what hosted mode
+    # makes of the tag (bazel/nuget.rs).
     # vendor/nuget_feed.rs is the vendored backend; it is here for the
     # version and folder helpers that every one of those files calls.
-    # Nothing else that another ecosystem's flow owns is here, so any other
-    # change to one ecosystem starts that ecosystem's legs only.
+    # patch/sidecars/nuget.rs is what agent mode does to a package in
+    # NuGet's folder beyond its files. Last, the VEX code: `vex/` of the
+    # core, the files of the `vex` command, and what `vex` makes of the tag
+    # (bazel/built.rs, which says what the hub of each ecosystem builds).
+    # The agent flow holds the exact document socket-patch writes about its
+    # build, so a change to how a document is built or worded starts the
+    # legs of every ecosystem. Nothing else that another ecosystem's flow
+    # owns is here: any other change to one ecosystem starts that
+    # ecosystem's legs only.
     #
     # What it does not cover: shared engine code. The hosted rewrite itself
     # is there (`rewrite_nuget` in patch/redirect/mod.rs, the file of every
     # ecosystem's rewriter), and so are patch/redirect/grant.rs,
-    # hosted/engine.rs, commands/scan/hosted.rs and the rest of vex/, the
-    # shared test helpers and the toolchain files. A change to one of those
-    # gets its run on the push to main (when the file is in the list below)
-    # or in the nightly run, not on the pull request: that is the price of
-    # not running every ecosystem's legs on every shared change. The flow
-    # does not run agent mode (patch/sidecars/nuget.rs), which is in neither
-    # list. On demand, workflow_dispatch runs the legs on any branch.
+    # hosted/engine.rs, commands/scan/hosted.rs, the apply engine of agent
+    # mode, the shared test helpers and the toolchain files. A change to
+    # one of those gets its run on the push to main (when the file is in
+    # the list below) or in the nightly run, not on the pull request: that
+    # is the price of not running every ecosystem's legs on every shared
+    # change. On demand, workflow_dispatch runs the legs on any branch.
     paths:
       - '.github/workflows/bazel-nuget.yml'
       - '.github/workflows/bazel-compatibility.yml'
@@ -70,18 +78,22 @@ on:
       - 'crates/socket-patch-core/src/vex/discover/nuget.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/nuget.rs'
       - 'crates/socket-patch-cli/src/commands/scan/hosted/nuget.rs'
+      - 'crates/socket-patch-core/src/bazel/built.rs'
       - 'crates/socket-patch-core/src/bazel/mod.rs'
       - 'crates/socket-patch-core/src/bazel/nuget.rs'
       - 'crates/socket-patch-core/src/bazel/starlark.rs'
       - 'crates/socket-patch-core/src/bazel/workspace.rs'
+      - 'crates/socket-patch-core/src/patch/sidecars/nuget.rs'
+      - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-cli/src/commands/vex*.rs'
   push:
     branches: [main]
     # The pull request paths, and what only a push to main covers: the
     # root of the test target (it changes when an ecosystem's module is
     # added; ci.yml builds the target and runs its hermetic tests on every
-    # pull request), the shared engine code and test helpers the flow runs
-    # through, `vex`, whose verdicts the flow asserts, and the toolchain
-    # files. A main push outside this list waits for the nightly run below.
+    # pull request), the shared engine code and test helpers the flows run
+    # through, and the toolchain files. A main push outside this list waits
+    # for the nightly run below.
     paths:
       - '.github/workflows/bazel-nuget.yml'
       - '.github/workflows/bazel-compatibility.yml'
@@ -97,14 +109,17 @@ on:
       - 'crates/socket-patch-core/src/vex/discover/nuget.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/nuget.rs'
       - 'crates/socket-patch-cli/src/commands/scan/hosted/nuget.rs'
+      - 'crates/socket-patch-core/src/bazel/built.rs'
       - 'crates/socket-patch-core/src/bazel/mod.rs'
       - 'crates/socket-patch-core/src/bazel/nuget.rs'
       - 'crates/socket-patch-core/src/bazel/starlark.rs'
       - 'crates/socket-patch-core/src/bazel/workspace.rs'
+      - 'crates/socket-patch-core/src/patch/sidecars/nuget.rs'
+      - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-cli/src/commands/vex*.rs'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
       - 'crates/socket-patch-core/src/patch/redirect/**'
       - 'crates/socket-patch-core/src/hosted/**'
-      - 'crates/socket-patch-core/src/vex/**'
       - 'crates/socket-patch-cli/src/commands/**'
       - 'crates/socket-patch-cli/tests/common/**'
       - 'crates/socket-patch-cli/tests/hosted_memory_common/**'

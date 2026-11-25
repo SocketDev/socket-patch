@@ -1922,14 +1922,14 @@ const AFFECTED_REASON: &str = "attested as affected, not as patched: Bazel does 
 const INSTALLED_TREE_SHIPS: &str = "If what you ship is the installed tree and not what Bazel \
     builds, pass `--no-bazel` (`--vex-no-bazel` on scan, apply and vendor).";
 
-/// In a Bazel workspace, a hub of aspect_rules_js, rules_python or
-/// rules_ruby builds a package from the lock a workspace file names, never
-/// from the copy a package manager installed, and rules_python builds
-/// nothing from a line that points at a copy under `.socket/vendor`
-/// ([`socket_patch_core::bazel::built`]). A patch that is only in such a
-/// copy is in no build of Bazel's, so its package is not attested as
-/// patched: it leaves `outcome.applied` and is returned with what to do
-/// about it, for statements that say `affected`
+/// In a Bazel workspace, a hub of aspect_rules_js, rules_python,
+/// rules_ruby, rules_rust or rules_csharp builds a package from the lock a
+/// workspace file names, never from the copy a package manager installed,
+/// and rules_python builds nothing from a line that points at a copy under
+/// `.socket/vendor` ([`socket_patch_core::bazel::built`]). A patch that is
+/// only in such a copy is in no build of Bazel's, so its package is not
+/// attested as patched: it leaves `outcome.applied` and is returned with
+/// what to do about it, for statements that say `affected`
 /// ([`build_document_with_affected`]). A run warning tells a person the
 /// same. Nothing is omitted for this, so a document is always written.
 /// The package also leaves `outcome.vendored_out_of_sync`: that warning
@@ -1991,8 +1991,9 @@ async fn unbuilt_by_bazel(
 
 /// The action statement for `package`, whose patch Bazel does not build:
 /// what `call` builds the package from, and what to run so that the build
-/// holds the patch. Hosted mode pins a patch in the lock of the project it
-/// runs in, so the remedy names the directory of the lock.
+/// holds the patch. For an installed copy that is the hub's own remedy
+/// ([`Unbuilt::remedy`]). Hosted and vendored mode write in the project
+/// they run in, so it names the directory of the lock.
 ///
 /// For an installed copy it ends with the way out of a repository that
 /// ships the installed tree and keeps the hub for something else: the
@@ -2007,13 +2008,13 @@ fn bazel_build_action(package: &Patched, call: &Unbuilt) -> String {
         file,
         line,
         lock,
+        remedy,
     } = call;
     match pins {
         None => format!(
             "Bazel builds this package from {lock} (`{tag}`, {file}:{line}), which does not \
-             name Socket patch {uuid}: the patch is only in the installed copy. Run \
-             `socket-patch scan --mode hosted` in the directory of that lock to pin the patch \
-             there. {INSTALLED_TREE_SHIPS}"
+             name Socket patch {uuid}: the patch is only in the installed copy. {remedy} \
+             {INSTALLED_TREE_SHIPS}"
         ),
         Some(_) => format!(
             "Bazel builds no package from the line of {lock} that points at the copy of Socket \
