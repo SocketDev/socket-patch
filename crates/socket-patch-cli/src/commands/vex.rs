@@ -335,10 +335,10 @@ pub(crate) struct VexGenError {
     /// Patches omitted by verification, populated only for the
     /// `no_applicable_patches` case (so callers can list them).
     pub failed: Vec<FailedPatch>,
-    /// The purls in `failed` that a hosted pin wires. What gets such a
-    /// package installed depends on its package manager (see
-    /// [`StaleHostedGems`]).
-    pub hosted: Vec<String>,
+    /// The purls in `failed` that a hosted pin wires, each with the uuid
+    /// of the patch the pin delivers. What gets such a package installed
+    /// depends on its package manager (see [`StaleHostedGems`]).
+    pub hosted: Vec<(String, String)>,
     /// Advisories raised before the failure (already printed in human
     /// mode) — for `no_applicable_patches` often the only explanation of a
     /// `vendor_unwired` / `redirect_unwired` omission (the lockfile-discovery
@@ -1477,8 +1477,10 @@ async fn generate_vex(
             let hosted = outcome
                 .failed
                 .iter()
-                .filter(|f| plan.hosted.contains_key(&f.purl))
-                .map(|f| f.purl.clone())
+                .filter_map(|f| {
+                    let wiring = plan.hosted.get(&f.purl)?;
+                    Some((f.purl.clone(), wiring.uuid.clone()))
+                })
                 .collect();
             return Err(VexGenError {
                 code: "no_applicable_patches",
@@ -2839,8 +2841,11 @@ fn omission_lines(failed: &[FailedPatch], verbose: bool) -> Vec<String> {
 /// replaces such a copy.
 #[derive(Debug, Default)]
 struct StaleHostedGems {
-    /// The purls omitted as `not_applied` that are gems on a hosted pin
-    /// with no manifest record (`apply` patches a recorded one in place).
+    /// The purls omitted as `not_applied` that are gems on a hosted pin,
+    /// but for a gem the manifest records under the pin's own patch:
+    /// `apply` patches that one in place. A record of another patch (an
+    /// agent-mode record the hosted pin superseded) does not count, since
+    /// `apply` would install that patch's files and not the pin's.
     purls: Vec<String>,
     /// Whether a `scan` with no `--mode` runs in hosted mode here, the one
     /// mode that replaces the copies. It does not where the project also
@@ -2851,31 +2856,38 @@ struct StaleHostedGems {
 }
 
 impl StaleHostedGems {
-    /// Those among `failed`, of which `hosted` are on a hosted pin. The
-    /// project's state is read only when there is such a gem.
+    /// Those among `failed`, of which `hosted` are on a hosted pin (purl
+    /// and the pin's patch uuid). The project's state is read only when
+    /// there is such a gem.
     async fn among(
         common: &GlobalArgs,
         manifest_path: &Path,
         failed: &[FailedPatch],
-        hosted: &[String],
+        hosted: &[(String, String)],
     ) -> Self {
-        let mut purls: Vec<String> = failed
+        let mut gems: Vec<&(String, String)> = hosted
             .iter()
-            .filter(|f| {
-                f.reason == "not_applied"
-                    && f.purl.starts_with("pkg:gem/")
-                    && hosted.contains(&f.purl)
+            .filter(|(purl, _)| {
+                purl.starts_with("pkg:gem/")
+                    && failed
+                        .iter()
+                        .any(|f| f.reason == "not_applied" && &f.purl == purl)
             })
-            .map(|f| f.purl.clone())
             .collect();
-        if purls.is_empty() {
+        if gems.is_empty() {
             return Self::default();
         }
         if let Ok(Some(manifest)) =
             socket_patch_core::manifest::operations::read_manifest(manifest_path).await
         {
-            purls.retain(|purl| !manifest.patches.contains_key(purl));
+            gems.retain(|(purl, uuid)| {
+                manifest
+                    .patches
+                    .get(purl)
+                    .is_none_or(|record| !record.uuid.eq_ignore_ascii_case(uuid))
+            });
         }
+        let purls: Vec<String> = gems.into_iter().map(|(purl, _)| purl.clone()).collect();
         let bare_scan_is_hosted = !purls.is_empty()
             && !common.is_global()
             && crate::commands::bare_scan_is_hosted(common).await;
@@ -3409,12 +3421,13 @@ mod tests {
             failed("pkg:gem/json@2.7.0", "hash_mismatch"),
             failed("pkg:npm/a@1.0.0", "not_applied"),
         ];
-        let hosted: Vec<String> = [
+        const PIN: &str = "11111111-1111-4111-8111-111111111111";
+        let hosted: Vec<(String, String)> = [
             "pkg:gem/rack@2.2.8",
             "pkg:gem/json@2.7.0",
             "pkg:npm/a@1.0.0",
         ]
-        .map(String::from)
+        .map(|purl| (purl.to_string(), PIN.to_string()))
         .to_vec();
 
         // No patch state beside the lock: a bare scan is a hosted one.
@@ -3428,9 +3441,9 @@ mod tests {
 
         // An agent-mode record of another package: the bare scan keeps
         // agent mode, which replaces no gem.
-        let record = |purl: &str| {
+        let record = |purl: &str, uuid: &str| {
             serde_json::json!({ "patches": { purl: {
-                "uuid": "11111111-1111-4111-8111-111111111111",
+                "uuid": uuid,
                 "exportedAt": "2026-01-01T00:00:00Z",
                 "files": {},
                 "vulnerabilities": {},
@@ -3441,16 +3454,26 @@ mod tests {
             .to_string()
         };
         std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
-        std::fs::write(&manifest_path, record("pkg:npm/b@1.0.0")).unwrap();
+        std::fs::write(&manifest_path, record("pkg:npm/b@1.0.0", PIN)).unwrap();
         let gems = StaleHostedGems::among(&common, &manifest_path, &failures, &hosted).await;
         assert_eq!(gems.purls, ["pkg:gem/rack@2.2.8"]);
         assert!(!gems.bare_scan_is_hosted);
 
-        // A record of the gem itself: `apply` patches it in place, so it
-        // keeps the general remedy.
-        std::fs::write(&manifest_path, record("pkg:gem/rack@2.2.8")).unwrap();
+        // A record of the gem under the pin's own patch: `apply` patches
+        // it in place, so it keeps the general remedy.
+        std::fs::write(&manifest_path, record("pkg:gem/rack@2.2.8", PIN)).unwrap();
         let gems = StaleHostedGems::among(&common, &manifest_path, &failures, &hosted).await;
         assert!(gems.purls.is_empty() && !gems.bare_scan_is_hosted);
+
+        // A record of the gem under another patch, which the hosted pin
+        // superseded: `apply` would install that patch's files, so the gem
+        // still gets the gem remedy (the files to remove: the manifest
+        // makes a scan with no `--mode` an agent one).
+        let superseded = "22222222-2222-4222-8222-222222222222";
+        std::fs::write(&manifest_path, record("pkg:gem/rack@2.2.8", superseded)).unwrap();
+        let gems = StaleHostedGems::among(&common, &manifest_path, &failures, &hosted).await;
+        assert_eq!(gems.purls, ["pkg:gem/rack@2.2.8"]);
+        assert!(!gems.bare_scan_is_hosted);
     }
 
     #[test]
