@@ -287,6 +287,9 @@ async fn refuse_templated_pin(
 ///    it (#1368), and with no `Pipfile.lock` it refuses
 ///    `pypi_pipenv_pylock_unsupported` (#912);
 /// 3. `poetry.lock` → poetry;  4. `pdm.lock` → pdm;  5. `Pipfile.lock` → pipenv;
+///    a lone `poetry.lock` / `pdm.lock` that resolves no packages, beside a
+///    `requirements.txt`, is skipped: the requirements file is the install
+///    source (#1114);
 /// 6. lock-less `[tool.uv]`/`[tool.poetry]`/`[tool.pdm]`/`Pipfile` →
 ///    `<tool>_no_lockfile` refusal unless requirements.txt exists;
 /// 7. `requirements.txt` → requirements;
@@ -326,6 +329,25 @@ async fn detect_pypi_flavor(
             tool_locks.push(lock);
         }
     }
+    // #1114: a lone poetry.lock / pdm.lock that resolves no packages
+    // installs nothing, so a `requirements.txt` beside it is the install
+    // source, as the lock inventory reads it. Wiring the lock refused a
+    // package scan had offered from `requirements.txt`. With no
+    // `requirements.txt` the lock still routes to its tool, whose refusal
+    // names it; beside another tool lock the presence order stands. The
+    // read is of a regular file only, so a FIFO planted as the lock still
+    // reaches its backend's guarded load.
+    let packageless_lock = match tool_locks[..] {
+        [lock @ ("poetry.lock" | "pdm.lock")] => {
+            exists(PYPI_REQUIREMENTS).await
+                && read_regular_to_string(&project_root.join(lock))
+                    .await
+                    .is_ok_and(|text| {
+                        super::lock_inventory::pypi::tool_lock_resolves_nothing(&text)
+                    })
+        }
+        _ => false,
+    };
     let governing = pypi_governing_tool_lock(|lock| tool_locks.contains(&lock));
     let has_uv_lock = governing == Some("uv.lock");
     let has_pipfile = exists("Pipfile").await;
@@ -461,6 +483,12 @@ async fn detect_pypi_flavor(
             ));
         }
         return Ok((PypiFlavor::PythonLocks, warnings));
+    }
+    // #1114: past the standalone locks, which rank above a tool lock
+    // whatever it holds, the package-less lock is no install source.
+    let governing = governing.filter(|_| !packageless_lock);
+    if packageless_lock {
+        present.clear();
     }
     if has_uv_lock {
         present.extend(additional_locks.iter().map(String::as_str));
@@ -4073,6 +4101,10 @@ mod tests {
     const ORIG: &[u8] = b"class Six:\n    pass\n";
     const PATCHED: &[u8] = b"class Six:\n    pass\n# SOCKET-PATCH-MARKER\n";
 
+    /// A poetry.lock / pdm.lock that resolves a package: one that resolves
+    /// none does not govern beside a `requirements.txt` (#1114).
+    const TOOL_LOCK_WITH_SIX: &str = "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\n";
+
     async fn touch(root: &Path, name: &str, content: &str) {
         tokio::fs::write(root.join(name), content).await.unwrap();
     }
@@ -4119,8 +4151,8 @@ mod tests {
             );
         }
         for (lock, content, flavor) in [
-            ("poetry.lock", "", PypiFlavor::Poetry),
-            ("pdm.lock", "", PypiFlavor::Pdm),
+            ("poetry.lock", TOOL_LOCK_WITH_SIX, PypiFlavor::Poetry),
+            ("pdm.lock", TOOL_LOCK_WITH_SIX, PypiFlavor::Pdm),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             touch(tmp.path(), lock, content).await;
@@ -4170,7 +4202,7 @@ mod tests {
             ("pylock.toml", pylock.as_str()),
             ("uv.lock", "version = 1\n"),
             ("Pipfile.lock", "{}"),
-            ("poetry.lock", ""),
+            ("poetry.lock", TOOL_LOCK_WITH_SIX),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             // The repository every path of the fixture lives in.
@@ -4468,6 +4500,121 @@ mod tests {
                     && w.detail.contains("requirements.txt")),
                 "{case}: {warnings:?}"
             );
+        }
+    }
+
+    /// #1114: a `poetry.lock` or `pdm.lock` that resolves no packages (what
+    /// the tool writes for a project that declares no dependencies) is not
+    /// the install source of a package `requirements.txt` holds. The lock
+    /// inventory reads `requirements.txt` there, so the router must wire it
+    /// too: routing to the tool lock refused a package scan had offered.
+    #[tokio::test]
+    async fn packageless_tool_lock_beside_requirements_routes_to_requirements() {
+        for (lock, content, marker) in [
+            (
+                "poetry.lock",
+                "package = []\n\n[metadata]\nlock-version = \"2.0\"\n",
+                "[tool.poetry]\nname = \"app\"\n",
+            ),
+            (
+                "poetry.lock",
+                "[metadata]\nlock-version = \"2.0\"\n",
+                "[tool.poetry]\nname = \"app\"\n",
+            ),
+            (
+                "pdm.lock",
+                "[metadata]\ngroups = [\"default\"]\nlock_version = \"4.5.0\"\n",
+                "[tool.pdm]\ndistribution = false\n",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), lock, content).await;
+            touch(tmp.path(), "pyproject.toml", marker).await;
+            touch(tmp.path(), "requirements.txt", "six==1.16.0\n").await;
+
+            let inventory = crate::vendor::lock_inventory::inventory_project(tmp.path()).await;
+            assert_eq!(
+                inventory.iter().map(|e| &*e.purl).collect::<Vec<_>>(),
+                ["pkg:pypi/six@1.16.0"],
+                "{lock}: the inventory reads requirements.txt"
+            );
+            for target in [Some(("six", "1.16.0")), None] {
+                let (selected, warnings) = detect_pypi_flavor(tmp.path(), target).await.unwrap();
+                assert_eq!(
+                    selected,
+                    PypiFlavor::Requirements,
+                    "{lock} {target:?}: the router must agree with the inventory"
+                );
+                assert!(
+                    warnings.is_empty(),
+                    "{lock} {target:?}: nothing installs from the package-less lock: \
+                     {warnings:?}"
+                );
+            }
+        }
+    }
+
+    /// The limits of the #1114 rule: a package-less tool lock still governs
+    /// when `requirements.txt` is absent (the tool's own refusal names the
+    /// lock, where "there is no poetry.lock" would be false), when another
+    /// tool lock is present (the lock-over-lock order stays the presence
+    /// table every mode shares), and when it does not parse (it cannot be
+    /// shown to resolve nothing).
+    #[tokio::test]
+    async fn packageless_tool_lock_governs_without_a_requirements_fallback() {
+        const EMPTY: &str = "package = []\n\n[metadata]\nlock-version = \"2.0\"\n";
+        for (lock, flavor) in [
+            ("poetry.lock", PypiFlavor::Poetry),
+            ("pdm.lock", PypiFlavor::Pdm),
+        ] {
+            // Alone, beside its own marker.
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), lock, EMPTY).await;
+            touch(
+                tmp.path(),
+                "pyproject.toml",
+                "[tool.poetry]\nname = \"app\"\n\n[tool.pdm]\ndistribution = false\n",
+            )
+            .await;
+            let (selected, _) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                .await
+                .unwrap();
+            assert_eq!(selected, flavor, "{lock} alone");
+
+            // Beside another tool lock, requirements.txt or not.
+            touch(tmp.path(), "Pipfile.lock", "{}").await;
+            touch(tmp.path(), "requirements.txt", "six==1.16.0\n").await;
+            let (selected, _) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                .await
+                .unwrap();
+            assert_eq!(selected, flavor, "{lock} beside Pipfile.lock");
+
+            // A standalone lock pinning the package still outranks it, as
+            // it outranks a populated tool lock: a `Pipfile` beside them
+            // does not turn the pylock into Pipenv's.
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), lock, EMPTY).await;
+            touch(tmp.path(), "Pipfile", "[packages]\nsix = \"*\"\n").await;
+            touch(tmp.path(), "requirements.txt", "six==1.16.0\n").await;
+            touch(
+                tmp.path(),
+                "pylock.toml",
+                &PIPENV_PYLOCK.replace("pipenv", "pip"),
+            )
+            .await;
+            let (selected, _) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                .await
+                .unwrap();
+            assert_eq!(selected, PypiFlavor::PythonLocks, "{lock} beside a pylock");
+
+            // Unparseable, beside requirements.txt.
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), lock, "[[package]\nname = ").await;
+            touch(tmp.path(), "requirements.txt", "six==1.16.0\n").await;
+            let (selected, _) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                .await
+                .unwrap();
+            assert_eq!(selected, flavor, "unparseable {lock}");
         }
     }
 
