@@ -3752,6 +3752,7 @@ override_repo(
                 file,
                 call,
                 dev_dependency: Some(false),
+                isolate: Some(false),
             };
             proxy(&ws, &tag)
         };

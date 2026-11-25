@@ -110,9 +110,10 @@ struct Project {
 /// A gem lock beside a rules_ruby hub that holds the gem to its upstream
 /// sha256, a pnpm lock beside a rules_js hub that hides
 /// `pnpm-workspace.yaml` from pnpm 11, and a pnpm lock that a rules_js hub
-/// reads, in a project that proves pnpm 12 and is offered the patch's
-/// registry. Each starts its patch API: a test holds the variable before
-/// it asks for them.
+/// reads in a call that no routed lock was built with (it has a `patches`
+/// entry of its own), in a project that proves pnpm 12 and is offered the
+/// patch's registry. Each starts its patch API: a test holds the variable
+/// before it asks for them.
 async fn projects() -> Vec<Project> {
     let ruby = format!(
         "bazel_dep(name = \"rules_ruby\", version = \"1.0.0-rc2\")\n\
@@ -129,11 +130,15 @@ async fn projects() -> Vec<Project> {
               pnpm_lock = \"//:pnpm-lock.yaml\",\n    update_pnpm_lock = True,\n)\n\
               pnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
               pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")\n";
-    // A hub that only reads the lock: its call is on line 4.
+    // A hub that reads the lock and patches the package itself, which
+    // keeps the lock off the route (one that only reads the lock is routed
+    // as without Bazel): its call is on line 4.
     let reads = "module(name = \"app\")\n\
                  bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
                  npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
-                 npm.npm_translate_lock(name = \"npm\", pnpm_lock = \"//:pnpm-lock.yaml\")\n";
+                 npm.npm_translate_lock(\n    name = \"npm\",\n    \
+                 pnpm_lock = \"//:pnpm-lock.yaml\",\n    \
+                 patches = {\"left-pad@1.3.0\": [\"//:own.patch\"]},\n)\n";
     let own: [(&str, &[u8]); 2] = [
         ("pnpm-workspace.yaml", b"# own\npackages:\n  - '.'\n"),
         ("package.json", br#"{ "name": "root", "private": true }"#),
@@ -203,10 +208,11 @@ async fn projects() -> Vec<Project> {
 /// Without the variable, whatever the shell of the test run exports: the
 /// engine leaves the gem lock and the pnpm lock of the hub that hides
 /// `pnpm-workspace.yaml` as they are and says why; the lock that a hub
-/// only reads is pinned and not routed through the patch's registry, and
-/// the engine says that the hub is why. Its selection asks for the
-/// `MODULE.bazel` of each, and for every file of a Bazel workspace beside
-/// a pnpm lock, a `pnpm-workspace.yaml` or a gem lock.
+/// reads in a call no routed lock was built with is pinned and not routed
+/// through the patch's registry, and the engine says that the hub is why.
+/// Its selection asks for the `MODULE.bazel` of each, and for every file
+/// of a Bazel workspace beside a pnpm lock, a `pnpm-workspace.yaml` or a
+/// gem lock.
 #[tokio::test]
 #[serial_test::serial]
 async fn a_hub_keeps_the_engine_from_pinning_or_routing() {

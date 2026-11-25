@@ -2807,19 +2807,22 @@ async fn pnpm11_registry_route_reaches_a_newer_release_in_range() {
 }
 
 /// A PROJECT ROUTED BEFORE ITS BAZEL WORKSPACE GOT A RULES_JS HUB, with a
-/// real pnpm. Hosted mode does not route a lock that a hub reads, so the
-/// next scan has to settle the project one of two ways, and a frozen
-/// install has to pass afterwards wherever pnpm reads the workspace file:
+/// real pnpm. Hosted mode routes a lock that a hub reads only where the
+/// build of that hub takes a routed lock, so under any other hub the next
+/// scan has to settle the project one of two ways, and a frozen install
+/// has to pass afterwards wherever pnpm reads the workspace file:
 ///
 /// * the hub keeps the lock up to date with a pnpm 11 that does not see
 ///   pnpm-workspace.yaml: the scan leaves the lock to the hub
 ///   (`redirect_pnpm_bazel_workspace_hidden`) and the route with it, every
 ///   byte of the lock and of the workspace file as it was, so pnpm still
 ///   installs the patched release through its registry;
-/// * the hub only reads the lock: the scan leaves the route whole, the
-///   registry and the override out of the workspace file, the `overrides:`
-///   record and the registry keys out of the lock, in one run, and pins the
-///   release on `trustLockfile`, which pnpm installs frozen and patched.
+/// * the hub keeps the lock up to date with a pnpm 10, which reads no
+///   registry of the workspace file it is shown: the scan leaves the route
+///   whole, the registry and the override out of the workspace file, the
+///   `overrides:` record and the registry keys out of the lock, in one
+///   run, and pins the release on `trustLockfile`, which pnpm installs
+///   frozen and patched.
 async fn registry_route_is_left_for_a_bazel_hub_added_later(pm: &str, tag: &str) {
     if !has_corepack_pm(pm) {
         println!("SKIP {tag}: `corepack {pm}` unavailable");
@@ -2965,8 +2968,10 @@ async fn registry_route_is_left_for_a_bazel_hub_added_later(pm: &str, tag: &str)
         "{tag}: the routed release still installs patched"
     );
 
-    // ── a hub that reads the lock ──
-    std::fs::write(proj.join("MODULE.bazel"), hub("")).unwrap();
+    // ── a hub whose pnpm reads no registry of the workspace file ──
+    let listing = ", update_pnpm_lock = True, data = [\"//:pnpm-workspace.yaml\"]";
+    let older = hub(listing).replace("11.28.10", "10.34.9");
+    std::fs::write(proj.join("MODULE.bazel"), older).unwrap();
     let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &proj, &server.uri(), &[]);
     assert_eq!(code, 0, "{tag}: scan failed.\n{stdout}\n{stderr}");
     let env = parse_envelope(&stdout);

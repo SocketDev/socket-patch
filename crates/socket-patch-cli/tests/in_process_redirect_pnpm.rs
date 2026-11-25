@@ -3888,14 +3888,22 @@ async fn hosted_registry_route_needs_a_pnpm_11_20_pin() {
 }
 
 /// A lock that a rules_js hub of the project's Bazel workspace reads is
-/// not routed, also with a registry address and a pnpm 12 pin. The pnpm a
-/// hub runs with `update_pnpm_lock` may not read the registries, so the
-/// project keeps the pin the Bazel legs build. The run writes what
-/// a patch service that offers no registry gets, the warning names the
-/// call, and `rollback` gives the user's file and the lock back.
+/// routed where the build of that hub takes a routed lock, and keeps the
+/// pin with `trustLockfile` where it may not. The hub here keeps the lock
+/// up to date and lists the user's pnpm-workspace.yaml; what differs is
+/// the pnpm it runs.
+///
+/// With the pnpm rules_js picks, a pnpm 10 that reads no registry of the
+/// file, the run writes what a patch service that offers no registry
+/// gets, and the warning names the call and what kept it off the route.
+/// Once the workspace states pnpm 11.28.10 the next run moves the project
+/// to the route, and the setting the earlier run wrote goes; a second run
+/// changes nothing. Without that tag again the next run leaves the route
+/// whole, and with it the one after takes it again. `rollback` gives the
+/// user's file and the lock back from either.
 #[tokio::test]
 #[serial]
-async fn hosted_registry_route_is_not_taken_for_a_lock_a_bazel_hub_reads() {
+async fn hosted_registry_route_under_a_bazel_hub_follows_what_its_build_takes() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_registry_reference(&server).await;
@@ -3905,40 +3913,99 @@ async fn hosted_registry_route_is_not_taken_for_a_lock_a_bazel_hub_reads() {
     let own = "# the project's own\n";
     let ws_path = tmp.path().join("pnpm-workspace.yaml");
     std::fs::write(&ws_path, own).unwrap();
-    std::fs::write(
-        tmp.path().join("MODULE.bazel"),
-        "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
-         npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
-         npm.npm_translate_lock(pnpm_lock = \"//:pnpm-lock.yaml\")\n",
-    )
-    .unwrap();
+    let hub = |pnpm: &str| {
+        let module = format!(
+            "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+             npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+             npm.npm_translate_lock(pnpm_lock = \"//:pnpm-lock.yaml\", update_pnpm_lock = True, \
+             data = [\"//:pnpm-workspace.yaml\"])\n\
+             pnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n{pnpm}"
+        );
+        std::fs::write(tmp.path().join("MODULE.bazel"), module).unwrap();
+    };
+    let eleven = "pnpm.pnpm(name = \"pnpm\", pnpm_version = \"11.28.10\")\n";
     let lock_path = tmp.path().join("pnpm-lock.yaml");
     let pristine = read(&lock_path);
+    let trusting = format!("{own}packages:\n  - '.'\ntrustLockfile: true\n");
+    let routed = format!("{own}packages:\n  - '.'\n{}", route_maps());
+    let scan = || {
+        let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+        assert_eq!(code, Some(0), "{doc}");
+        (read(&ws_path), read(&lock_path), warning_texts(&doc))
+    };
 
-    let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
-    assert_eq!(code, Some(0), "{doc}");
-    assert_eq!(
-        read(&ws_path),
-        format!("{own}packages:\n  - '.'\ntrustLockfile: true\n")
-    );
-    let lock = read(&lock_path);
+    // The pnpm of the hub is not stated: pinned with `trustLockfile`.
+    hub("");
+    let (workspace, pinned, texts) = scan();
+    assert_eq!(workspace, trusting);
     assert!(
-        lock.contains(HOSTED_URL) && !lock.contains("@socket-") && !lock.contains("overrides:"),
-        "{lock}"
+        pinned.contains(HOSTED_URL)
+            && !pinned.contains("@socket-")
+            && !pinned.contains("overrides:"),
+        "{pinned}"
     );
-    let texts = warning_texts(&doc);
     assert!(
         texts.contains(
             "Per-package registry verification was not set up because a Bazel hub reads the \
-             pnpm lock (MODULE.bazel:3)"
+             pnpm lock (MODULE.bazel:3), and the pnpm it runs for `update_pnpm_lock` is not \
+             stated as 11.20 or later: a lock that a hub reads is routed only where the call \
+             of the hub passes nothing but `name`, `pnpm_lock`, `data`, `update_pnpm_lock` and \
+             `use_pnpm`, and either leaves `update_pnpm_lock` off, or lists pnpm-workspace.yaml \
+             in its `data` and states a pnpm of 11.20 or later"
         ),
-        "{doc}"
+        "{texts}"
     );
-
     let code = rollback_hosted(tmp.path(), &server).await;
     assert_eq!(code, 0, "rollback must restore the pnpm pin");
+    assert_eq!(
+        (read(&lock_path), read(&ws_path)),
+        (pristine.clone(), own.to_string())
+    );
+    assert_eq!(scan(), (trusting.clone(), pinned.clone(), texts));
+
+    // Stated as 11.28.10: the project moves to the route, and stays.
+    hub(eleven);
+    for run in ["moves to the route", "changes nothing"] {
+        let (workspace, lock, texts) = scan();
+        assert_eq!(
+            (workspace, lock),
+            (routed.clone(), routed_fixture_lock()),
+            "{run}"
+        );
+        assert!(!texts.contains("Bazel"), "{run}: {texts}");
+    }
+
+    // The tag goes: the route goes whole, the lock and the file together.
+    hub("");
+    let (workspace, lock, texts) = scan();
+    assert_eq!((workspace, lock), (trusting, pinned.clone()));
+    assert!(
+        texts.contains("a Bazel hub reads the pnpm lock (MODULE.bazel:3)")
+            && texts.contains("An earlier run routed the hosted patches"),
+        "{texts}"
+    );
+
+    hub(eleven);
+    assert_eq!(
+        (scan().0, read(&lock_path)),
+        (routed, routed_fixture_lock())
+    );
+    let code = rollback_hosted(tmp.path(), &server).await;
+    assert_eq!(code, 0, "rollback must restore the routed pin");
     assert_eq!(read(&lock_path), pristine);
     assert_eq!(read(&ws_path), own);
+
+    // Routed before the hub was there, in a file the run created: under
+    // a hub that states a pnpm 10 the route goes and the file, which the
+    // hub lists, stays.
+    for file in [&ws_path, &tmp.path().join("MODULE.bazel")] {
+        std::fs::remove_file(file).unwrap();
+    }
+    assert_eq!(scan().1, routed_fixture_lock());
+    hub("pnpm.pnpm(name = \"pnpm\", pnpm_version = \"10.34.9\")\n");
+    let (workspace, lock, _) = scan();
+    assert_eq!(workspace, "packages:\n  - '.'\ntrustLockfile: true\n");
+    assert_eq!(lock, pinned);
 }
 
 /// `--dry-run` with a registry address: nothing lands on disk, the

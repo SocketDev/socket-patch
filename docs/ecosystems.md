@@ -389,7 +389,7 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   the whole lock. When the patch service gave at least one pin a registry
   address, the warning names what kept the project off the registry route: the
   packages that have no address (one is enough), pnpm pins that do not prove
-  11.20, a Bazel hub that reads the lock
+  11.20, a Bazel hub that reads the lock in a shape that is not routed
   ([Bazel workspaces: npm](#bazel-workspaces-npm)), an override of yours for a
   patched package, a workspace file or a lock entry the edit cannot follow. A project with no pnpm pin is told that
   pinning pnpm 11.20 or later (for example with `packageManager`) and
@@ -2404,9 +2404,13 @@ What the table was tested with:
   on 7.4.0. Every row is a workspace under Bzlmod (`MODULE.bazel`): nothing is tested for
   dependencies that a `WORKSPACE` file declares.
 - **npm**: aspect_rules_js 3.6.0, `npm.npm_translate_lock(pnpm_lock = "//:pnpm-lock.yaml")`
-  without `update_pnpm_lock`, and a lock of `lockfileVersion: '9.0'`. Hosted mode also with
-  `update_pnpm_lock = True`, where rules_js runs a pnpm of its own: with the pnpm it picks
-  itself (10.34.9) and no `data`, and with pnpm 11.28.10 and `pnpm-workspace.yaml` in `data`.
+  without `update_pnpm_lock`, and a lock of `lockfileVersion: '9.0'`. Hosted mode there both
+  with the pin it writes beside `trustLockfile: true` and with the lock it routes through a
+  named registry, and with that pin beside a `patches` entry of the hub for the package.
+  Hosted mode also with `update_pnpm_lock = True`, where rules_js runs a
+  pnpm of its own: with the pnpm it picks itself (10.34.9) and no `data`, and with pnpm
+  11.28.10 and `pnpm-workspace.yaml` in `data`, pinned and routed, that pnpm stated by
+  `pnpm_version`, by `pnpm_version_from` and by a `use_pnpm` label.
   [Bazel workspaces: npm](#bazel-workspaces-npm) says what hosted mode does on such a hub.
 - **PyPI**: rules_python 2.5.0-rc4, `pip.parse(requirements_lock = "//:requirements.txt")`,
   and a root `requirements.txt` with hashes.
@@ -2516,13 +2520,6 @@ Known problems. In each of these a command exits 0 today and the next Bazel buil
   the lock has one), or run `socket-patch rollback`.
 - **Vendored npm on a hub with `update_pnpm_lock = True`** (measured with pnpm 9 and 10):
   the pnpm that Bazel runs does not see `.socket/vendor`. Use hosted mode there.
-- **Hosted npm on such a hub with a pnpm of 11 or later, when hosted mode is told not to
-  write `trustLockfile: true`** (`--no-trust-lockfile-config`): the lock is pinned, with the
-  warning that pnpm 11 rejects it, and the pnpm that Bazel runs does
-  (`ERR_PNPM_TARBALL_URL_MISMATCH`; measured by hand with the option on Bazel 9.3.2). Run
-  `socket-patch rollback`, and scan again without the option. A `trustLockfile: false` of
-  the project's own is not this case: hosted mode pins nothing beside it (see
-  [Bazel workspaces: npm](#bazel-workspaces-npm)).
 - **`rollback` of a hosted npm pin on such a hub that an earlier release wrote, where the
   `pnpm-workspace.yaml` the hub lists holds only what hosted mode writes**: the undo removes
   the file, and the call then names a missing one. Put the file back with a comment line in
@@ -2559,6 +2556,16 @@ In these a command exits 0 and the Bazel build passes on the unpatched package:
 - **Hosted PyPI, when `pip.parse` takes the requirements of the build's platform from
   another file** than the one socket-patch rewrote (`requirements_by_platform`,
   `requirements_linux` and its siblings).
+- **Hosted npm on Bazel 7, where the hub has a `patches` entry for the package** and Bazel
+  has built the package before. For such a package rules_js unpacks the tarball when it
+  fetches it and hands the build a directory (3.6.0, read in its source; without the entry
+  it hands over the tarball), and Bazel 7 does not look into a source directory. So after
+  the scan Bazel 7 fetches the patched tarball and keeps the output it built from the
+  upstream one, and after `rollback` it keeps the patched output the same way. Run
+  `bazel clean` after the scan and after `rollback`. A machine that has not built the
+  package builds the patched one, and so do Bazel 8 and 9. `vex` reads the lock and says
+  `not_affected` in the meantime. A test builds this on Bazel 7.7.2. rules_js unpacks a
+  package with lifecycle hooks the same way, which was not measured.
 
 [Bazel workspaces: VEX](#bazel-workspaces-vex) lists what the document says in such cases.
 
@@ -2604,8 +2611,9 @@ projects too. What the sections below then do for it:
   hub, the jars that vendored mode keeps for a rules_jvm_external hub
   ([Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore)).
 - npm: hosted mode writes nothing for a root pnpm lock whose rules_js hub may hide
-  `pnpm-workspace.yaml` from its pnpm, and does not route a pnpm lock that a hub reads, or
-  may read, through a named registry ([Bazel workspaces: npm](#bazel-workspaces-npm)).
+  `pnpm-workspace.yaml` from its pnpm, and routes a pnpm lock that a hub reads, or may read,
+  through a named registry only where the hub's build takes a routed lock
+  ([Bazel workspaces: npm](#bazel-workspaces-npm)).
 - Hosted mode leaves a crate, a NuGet package or a gem unpinned, with a warning, when a hub
   call of the workspace may read the project's lock and is not written out plainly.
 - Maven: hosted and vendored mode patch a pinned rules_jvm_external hub that builds the
@@ -2701,36 +2709,119 @@ npm.npm_translate_lock(
 Run the command again after that: it pins the lock, and the next build takes the patched
 package. rules_js asks for this `data` itself (`docs/pnpm.md`, "update_pnpm_lock").
 
-**No named registries for a lock that a hub reads.** For pnpm 11.20 and later hosted mode
+**Named registries for a lock that a hub reads.** For pnpm 11.20 and later hosted mode
 can route a patched release through a named registry of `pnpm-workspace.yaml` in place of
-`trustLockfile` (see pnpm above). It never does for a lock that a rules_js hub reads: one
-that an `npm.npm_translate_lock` names in a plain string, the root lock or a member's own,
-or a call whose `pnpm_lock` is not written out, whatever else the call says. In a Bazel
-workspace it takes the route only where it is certain that no hub reads the lock, so what
-the reader could not see counts as a hub that may: a file that `MODULE.bazel` includes and
-that is missing or unreadable, a use of the extension that is not a plain call of a tag,
-and a `WORKSPACE` file that cannot be read or that brings in rules_js (a `load` from
-`@aspect_rules_js`, a `load` of `npm_translate_lock`, or a call of that rule), whose
-repositories are not looked through. A `WORKSPACE` file that is about something else
-blocks nothing. Unlike the answer above, which passes over what it cannot see so that no
-project loses a patch, declining the route costs nothing: the project gets the same pin as
-before, and the warning names what was not read ("… because a Bazel hub may read the pnpm
-lock (WORKSPACE:3: it brings in rules_js, …) …"). The lock
-reader of rules_js is not the reason: it takes a routed lock (measured on macOS: rules_js
-3.6.0 on Bazel 9.3.2 builds one for a hub without `update_pnpm_lock`, and the packages it
-builds hold the patched bytes; rules_js 2.9.3 on Bazel 8.8.2 does too). The pnpm that a
-hub runs with `update_pnpm_lock` is. It sees `pnpm-workspace.yaml` only where the call
-lists it, and it may be older than pnpm 11.20: rules_js picks a pnpm 10 where the
-workspace states none. Run as the hub runs it (`pnpm install --lockfile-only` beside the
-lock and `package.json`, without the workspace file), pnpm 11.28.13 and 12.22.0 reject a
-routed lock (`ERR_PNPM_MISSING_NAMED_REGISTRY`, measured). No Bazel test leg builds a
-routed lock with `update_pnpm_lock` yet, so for now every such project is pinned exactly
-as it is on a patch service that offers no registry, which is the pin the Bazel legs
-build, and the `redirect_pnpm_trust_lockfile` warning names the call ("… because a Bazel
-hub reads the pnpm lock (MODULE.bazel:7), and a lock that a hub reads is not routed
-yet …"). For a project below the Bazel root it says, as the warning above does, that its
-paths are from that root. A project that was routed before the
-hub was there leaves the route on its next scan, the lock and the workspace file together.
+`trustLockfile` (see pnpm above). For a lock that a rules_js hub reads it does so in two
+shapes of the hub, in which a build took the routed lock on Bazel 9.3.2, 8.8.2 and 7.7.2
+with rules_js 3.6.0: the build holds the patched package, a second build changes no file,
+and `rollback` brings the upstream build and the files of before back. The project has to
+be at the root of the Bazel workspace and have one pnpm lock, the root one, and every call
+that reads it has to name it in a plain string, pass nothing but the attributes of the
+calls that were built (`name`, `pnpm_lock`, `data`, `update_pnpm_lock`, `use_pnpm`), and
+be one of the two:
+
+- **A hub that runs no pnpm**: the call has no `update_pnpm_lock`, or `False`. The lock
+  reader of rules_js builds a routed lock as it builds a pinned one, and a build that may
+  update nothing passes right after the scan.
+- **A hub whose pnpm reads the registries**: `update_pnpm_lock = True`, a `data` that
+  lists the `pnpm-workspace.yaml` beside the lock, and a pnpm that the root module states
+  as a release of 11.20.0 or later, in one of the ways the list below reads (`pnpm_version`,
+  `pnpm_version_from`, a `use_pnpm` that is followed to a tag). That pnpm asks the patch's
+  registry about the package and writes the lock back as it is. The first build after the
+  scan rewrites the hashes under `.aspect/`, as after any change of the lock. Measured
+  with pnpm 11.20.0, 11.28.10 and 12.17.0; a test builds 11.28.10 stated in each of the
+  three ways.
+
+Under such a hub the scan routes the lock exactly as it does for the same project without
+Bazel, its files and its messages, and `rollback` undoes it the same way. One file is the
+exception: where the `pnpm-workspace.yaml` that a hub of the second shape lists says
+`trustLockfile: false`, or is YAML that a line cannot be added to, hosted mode writes
+nothing, as before (see the cases below), although a routed lock needs no setting. Take
+the `trustLockfile: false` out, or set it to `true`, and scan again. Every other hub
+keeps the project on the pin with `trustLockfile: true`, exactly as on a patch service
+that offers no registry, and the `redirect_pnpm_trust_lockfile` warning names the call and
+what kept it off the route ("…
+because a Bazel hub reads the pnpm lock (MODULE.bazel:7), and the pnpm it runs for
+`update_pnpm_lock` is not stated as 11.20 or later (pnpm 11.19.0): a lock that a hub reads
+is routed only where the call of the hub passes nothing but `name`, `pnpm_lock`, `data`,
+`update_pnpm_lock` and `use_pnpm`, and either leaves `update_pnpm_lock` off, or lists
+pnpm-workspace.yaml in its `data` and states a pnpm of 11.20 or later …"). What keeps a
+hub off the route:
+
+- A `pnpm_lock` that is not written out in a plain string, or that names a workspace
+  member's own lock, and a project below the root of the Bazel workspace: no build of
+  these was run.
+- A project that keeps a lock per workspace member (`sharedWorkspaceLockfile: false`),
+  whichever of its locks the hub names ("… and the project has workspace members with pnpm
+  locks of their own, a layout that no routed lock was built with …"). The route records
+  its overrides in every lock of the project, and the pnpm of a hub resolves in a directory
+  that holds the one lock its call names: no build of that was run either.
+- Any other attribute on the call than the five above, and a `*` or `**`, which may pass
+  one ("… and its `patches` is an attribute that no routed lock was built with …"). A
+  routed lock holds the patched release under another version (`socket-<id>:1.0.0`), so a
+  `patches` entry that is keyed by the package's name and version names no package of it,
+  and rules_js fails the build on such an entry (``Patch file key … does not match any
+  npm packages``, measured on the three Bazel releases); the pin keeps the package's key
+  and builds, which a test holds (for Bazel 7 see the known problems of
+  [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported)). With
+  `npm_package_lock`, `yarn_lock` or `preupdate` a pnpm writes the lock anew, and the
+  other attributes that are keyed by a name and a version (`bins`, `lifecycle_hooks`,
+  `package_visibility`, `public_hoist_packages`, `replace_packages`,
+  `custom_postinstalls`) would stop naming the package: none of these was built with a
+  routed lock. Nor was any other attribute, `npmrc` and `verify_node_modules_ignored`
+  among them, so a hub with one keeps the pin until a build is run for it.
+- An `update_pnpm_lock` that is not written out as `True` or `False`.
+- A `data` that is not a list of strings that holds the label of the file. The pnpm of
+  such a hub fails the build on a routed lock (`ERR_PNPM_MISSING_NAMED_REGISTRY`, measured
+  on the three Bazel releases with pnpm 11.28.10).
+- A pnpm that is not stated as 11.20 or later: the one rules_js picks, one stated in a way
+  that is no version, and an older one. With the file listed such a pnpm builds the routed
+  lock only until it resolves again. Once a `package.json` asks for another package, pnpm
+  11.19.0 puts the upstream release back in the lock without a word, and pnpm 10.34.9
+  fails the build (`ERR_PNPM_SPEC_NOT_SUPPORTED_BY_ANY_RESOLVER`); pnpm 11.20.0, 11.28.10
+  and 12.17.0 keep the patched release (measured on Bazel 9.3.2). A prerelease
+  (`11.20.0-rc.1`) and a number of fewer than three parts (`11.20`) do not count as stated
+  either.
+- A pnpm that is not shown to be the one the root module states. The route takes a stated
+  release for the pnpm of the hub only where its repository is one of the use of the pnpm
+  extension that every module shares: the hub has no `use_pnpm`, or a `use_repo` on the
+  name of a proxy of that extension takes the repository by its name. A `use_repo` on
+  another extension's proxy can take a repository under the name of a `pnpm.pnpm` tag, a
+  use of the extension with `isolate = True`, or with an `isolate` that is not written
+  out, has tags and repositories of its own, and an `inject_repo` on the extension is not
+  read. Nor does a release count that a use of the extension with `dev_dependency` states
+  ("… a use of the pnpm extension with `dev_dependency` states a release for it, and Bazel
+  drops such a use under `--ignore_dev_dependency` …"): a build under that option has no
+  such tag (read in Bazel's source at 7.7.2, 8.8.2 and 9.3.2; not built), so its hub runs
+  the pnpm that rules_js picks, a pnpm 10 at 3.6.0, which builds a routed lock only until
+  it resolves again. The pin is not held to any of this: for it such a release counts as
+  it did, and it builds with either pnpm, because its setting is in the file the hub
+  lists.
+- A call that Bazel may not run as it is written: the hub's own, the `use_repo` that takes
+  its pnpm, or a `pnpm.pnpm` tag that states the release, where the call is no statement of
+  its own (behind a condition, in a comprehension), and such a tag whose `name` is not
+  written out in a plain string, which may make another repository ("… a tag that states a
+  release for it is not a statement of its own, so it may not run as it is written …").
+  The hub can then run the pnpm that rules_js picks. The pin reads each of these calls as
+  it is written, as before.
+
+The route is taken only where it is certain which hubs read the lock, so what the reader
+could not see counts as a hub that may read it in another shape, also beside a call in one
+of the two: a file that `MODULE.bazel` includes and that is missing or unreadable, a use
+of the extension that is not a plain call of a tag, and a `WORKSPACE` file that cannot be
+read or that brings in rules_js (a `load` from `@aspect_rules_js`, a `load` of
+`npm_translate_lock`, or a call of that rule), whose repositories are not looked through.
+A `WORKSPACE` file that is about something else blocks nothing. Unlike the answer above,
+which passes over what it cannot see so that no project loses a patch, declining the route
+costs nothing: the project gets the same pin as before, and the warning names what was not
+read ("… because a Bazel hub may read the pnpm lock (WORKSPACE:3: it brings in rules_js,
+…), in a shape that was not read …"). For a project below the Bazel root the warning says,
+as the one above does, that its paths are from that root. A project that was routed and
+whose hub is no longer in one of the two shapes leaves the route on its next scan, the
+lock and the workspace file together. One that was pinned and whose hub now is in one
+moves to the route, and a `trustLockfile: true` that the earlier run wrote goes as it does
+without Bazel.
+
 Where hosted mode writes nothing for the root lock (the hub above), a route of an earlier
 run is left exactly as it is, in the workspace file and in every lock, and a
 `pnpm-workspace.yaml` that holds nothing but such a route counts as a file that holds only
@@ -2745,7 +2836,7 @@ comment line in the file first, as the warning of a hosted scan says; a hosted s
 never deletes the file under a hub that reads, or may read, the lock.
 
 The file the hub lists has to be one that a pin and its undo leave standing, so hosted mode
-also writes nothing for a hub that lists it in two cases, and the warning then names what
+also writes nothing for a hub that lists it in three cases, and the warning then names what
 the file needs and no label:
 
 - **The file would hold only what hosted mode writes**: there is none, or it is empty, or
@@ -2758,14 +2849,31 @@ the file needs and no label:
 - **Hosted mode does not write the setting to the file**: it says `trustLockfile: false`
   (or any value but `true`), which hosted mode leaves as it is, or it is YAML that a line
   cannot be added to (a flow-style root, several documents). The pnpm of the hub would read
-  the file and still reject the lock. Set `trustLockfile: true` in it yourself.
+  the file and still reject the lock. Set `trustLockfile: true` in it yourself, or take a
+  `trustLockfile: false` out: hosted mode then writes the setting with a pin, and none
+  where it routes the lock. This case comes before the route, so it holds also where the
+  lock would be routed.
+- **Hosted mode is told not to write to the file** (`--no-trust-lockfile-config`), and the
+  file does not hold `trustLockfile: true` already. The option keeps the setting out of
+  the file, and the registries of the route with it, so the pin would be one that the pnpm
+  of the hub rejects (`ERR_PNPM_TARBALL_URL_MISMATCH`, measured on the three Bazel
+  releases with pnpm 11.28.10). Drop the option, or set `trustLockfile: true` in the file
+  yourself. A project that an earlier run routed is not this case as long as the file
+  holds the route of every pin: the run then has nothing to write there and needs no
+  setting, and it reports the packages as applied, as it does without Bazel (a test builds
+  it). Where it would have to add to the route, it writes nothing and warns as above. A
+  scan under the option that crawls nothing is not this case either: it adds no pin, so it
+  takes out what a route left and no lock uses, in the lock and in the file together, as
+  it does without Bazel, and says nothing of the hub. A hub that runs no pnpm, or one that
+  is known to be older than 11, is pinned under the option as it is without Bazel: no pnpm
+  of the build asks for the setting.
 
 Hosted mode withholds when one call names the project's `pnpm-lock.yaml` in a plain string
 and all three hold for it:
 
 - `update_pnpm_lock` is `True`, or is not written out as `True` or `False`.
 - `data` is not a list of strings that holds the label of the `pnpm-workspace.yaml` beside
-  the lock, or it is and the file is one of the two cases above.
+  the lock, or it is and the file is one of the three cases above.
 - The pnpm it runs is stated as 11 or later, or in a way that is no version (`latest`, a
   constant, a `package.json` that cannot be read). That pnpm is the repository `use_pnpm`
   names, `@pnpm` without one, and a `pnpm.pnpm` tag of that `name` states its release: in
@@ -2783,7 +2891,8 @@ and all three hold for it:
   A `use_pnpm` is followed to such a tag only where a `use_repo` takes its repository by
   position, under the tag's own name. One that names a repository `use_repo` renames
   (`use_repo(pnpm, eleven = "pnpm")`, which runs the pnpm of the tag `pnpm`), or a
-  repository of another extension or rule, is read as no version.
+  repository of another extension or rule under a name that no tag has, is read as no
+  version.
 
 What is not written out counts against writing, because a failing build is worse than a
 patch that a warning explains. So a hub whose `data` is a constant gets no new hosted pin
@@ -2810,9 +2919,7 @@ project, for the pin and for the route through a named registry alike (a project
 directory of a Bazel workspace is routed in memory where a checkout is not), and no
 `MODULE.bazel.lock`, and a `pnpm_version_from` file that is not among the project's own
 manifests reads there as a release that is not written out, so a lock that a checkout pins
-can be left as it is in memory. Nor does hosted mode look at `--no-trust-lockfile-config`
-when it decides this: see the known problems of
-[Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported).
+can be left as it is in memory, and one that a checkout routes can be pinned there.
 
 ## Bazel workspaces: Maven
 
