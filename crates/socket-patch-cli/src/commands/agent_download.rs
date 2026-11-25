@@ -776,7 +776,7 @@ pub(crate) const REPLACED_PATCH_NOT_RESTORED: &str = "replaced_patch_not_restore
 /// How to get the original files of the package `purl` back, as the start
 /// of a sentence. `bundle install` keeps an installed gem as it is, edits
 /// included, so a gem names the commands that reinstall it.
-fn reinstall_remedy(purl: &str) -> String {
+pub(crate) fn reinstall_remedy(purl: &str) -> String {
     match strip_purl_qualifiers(purl)
         .strip_prefix("pkg:gem/")
         .and_then(|rest| rest.split('@').next())

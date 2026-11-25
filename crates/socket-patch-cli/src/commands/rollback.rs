@@ -273,6 +273,45 @@ fn format_rollback_failures(results: &[RollbackResult], cwd: &Path) -> Vec<Strin
         lines.push("Failed to roll back:".to_string());
         lines.extend(failed);
     }
+    lines.extend(format_neither_content_remedy(results));
+    lines
+}
+
+/// The ways out of a failed copy with a file that holds neither side of
+/// its patch (`HashMismatch`): a rollback fails on it on every run, and
+/// nothing socket-patch has can restore it. Reinstalling the package puts
+/// the original files back (a gem names its own command: `bundle install`
+/// keeps an installed gem as it is), after which the rollback goes
+/// through; `remove --skip-rollback` drops the record instead. Empty
+/// when no failed copy has such a file.
+fn format_neither_content_remedy(results: &[RollbackResult]) -> Vec<String> {
+    let reinstall: std::collections::BTreeSet<String> = results
+        .iter()
+        .filter(|r| {
+            !r.success
+                && r.files_verified
+                    .iter()
+                    .any(|f| f.status == VerifyRollbackStatus::HashMismatch)
+        })
+        .map(|r| crate::commands::agent_download::reinstall_remedy(&r.package_key))
+        .collect();
+    if reinstall.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        String::new(),
+        "A file that holds neither content cannot be restored from here:".to_string(),
+    ];
+    lines.extend(
+        reinstall.iter().map(|remedy| {
+            format!("  {remedy} to get the original files back, then roll back again.")
+        }),
+    );
+    lines.push(
+        "  Or drop the record and leave the files as they are: \
+         `socket-patch remove <purl> --skip-rollback`."
+            .to_string(),
+    );
     lines
 }
 

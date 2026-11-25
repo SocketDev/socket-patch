@@ -1,5 +1,6 @@
-//! How `apply` and `apply --check` report an INSTALLED gem whose files
-//! match no release variant of the manifest (#2231).
+//! How `apply`, `apply --check`, `rollback` and `remove` report an
+//! INSTALLED gem whose files match no release variant of the manifest
+//! (#2231).
 //!
 //! A gem edited in place (`bundle open`, a debug line) or rebuilt by a
 //! private gem server holds bytes the patch was not made for. A qualified
@@ -16,7 +17,11 @@
 //!   * `--json` carries one `failed` / `no_matching_variant` event keyed
 //!     by the base purl, the code `apply --check` already gives the copy;
 //!   * `apply --check` does not offer `socket-patch apply` as the remedy,
-//!     since `apply` leaves the copy as it is.
+//!     since `apply` leaves the copy as it is;
+//!   * `rollback` and `remove` still refuse the copy (its content is
+//!     neither side of the patch), but do not say it was "modified after
+//!     patching" (it was never patched), and `rollback` names the two
+//!     ways out: `bundle pristine <gem>`, or `remove --skip-rollback`.
 //!
 //! All offline: the real binary over a synthetic `vendor/bundle` tree.
 
@@ -119,13 +124,16 @@ fn edited_gem_is_reported_as_installed_with_other_content() {
     );
     for wrong in [
         "not installed on this host",
-        "not found on disk",
+        "1 not found on disk",
         "no matching installed package",
         "lockfile",
     ] {
         assert!(!out.contains(wrong), "must not say {wrong:?}: {out}");
     }
-    assert!(out.contains("1 failed"), "{out}");
+    assert!(
+        out.contains("1 failed, 0 not found on disk"),
+        "the copy counts as failed, not as absent: {out}"
+    );
 }
 
 /// `--json`: the copy is one `failed` / `no_matching_variant` event keyed
@@ -206,7 +214,11 @@ fn check_keeps_the_apply_remedy_for_a_drift_apply_heals() {
         "22312231-2231-4231-8231-223122312232",
         one_file("lib/rake.rb", pristine, &patched),
     );
-    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
     stage_blob(tmp.path(), &git_sha256(&patched), &patched);
 
     let (code, _stdout, stderr) = run_gem(
@@ -218,4 +230,50 @@ fn check_keeps_the_apply_remedy_for_a_drift_apply_heals() {
     assert!(stderr.contains("pkg:gem/rake@13.0.0"), "{stderr}");
     assert!(stderr.contains("to regenerate them"), "{stderr}");
     assert!(stderr.contains("`bundle pristine rack`"), "{stderr}");
+}
+
+/// `rollback` cannot tell whether the file was patched, so it refuses,
+/// without claiming it was, and names the ways out. After the first one
+/// (the published file back in place) the rollback goes through.
+#[test]
+fn rollback_names_the_ways_out_of_a_copy_it_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = edited_gem_project(tmp.path());
+    // The before blob, so the refusal is the file's content alone.
+    stage_blob(tmp.path(), &git_sha256(GEM_PRISTINE), GEM_PRISTINE);
+    let rollback = ["rollback", "--offline", "--yes", "--ecosystems", "gem"];
+
+    let (code, stdout, stderr) = run_gem(tmp.path(), &rollback, &[]);
+    let out = format!("{stdout}{stderr}");
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(std::fs::read(&file).unwrap(), GEM_LOCAL, "{out}");
+    assert!(
+        !out.contains("modified after patching"),
+        "the file was never patched: {out}"
+    );
+    assert!(
+        out.contains("neither the patched nor the original content"),
+        "{out}"
+    );
+    assert!(out.contains("`bundle pristine rack`"), "{out}");
+    assert!(
+        out.contains("`socket-patch remove <purl> --skip-rollback`"),
+        "{out}"
+    );
+
+    // `remove` refuses for the same reason, in the same words.
+    let (code, stdout, stderr) = run_gem(
+        tmp.path(),
+        &["remove", GEM_QUALIFIED_PURL, "--offline", "--yes"],
+        &[],
+    );
+    let out = format!("{stdout}{stderr}");
+    assert_eq!(code, 1, "{out}");
+    assert!(!out.contains("modified after patching"), "{out}");
+    assert!(out.contains("--skip-rollback"), "{out}");
+
+    // What `bundle pristine rack` does: the published file is back.
+    std::fs::write(&file, GEM_PRISTINE).unwrap();
+    let (code, stdout, stderr) = run_gem(tmp.path(), &rollback, &[]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
 }
