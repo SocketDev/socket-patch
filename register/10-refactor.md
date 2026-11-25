@@ -9,18 +9,21 @@ _Last updated 2026-11-25 · 3 runs under this charter · `main` at da012af when 
 | PR | Issue | State |
 |---|---|---|
 | #2250 | #2249 (`remove` / `rollback <target>` said "No patch found" over an unreadable vendor ledger) | ready, awaiting review |
-| #2246 | #1910 (the prune GC's keep cause and failure reason) | ready, awaiting review. On merge: remove `agent:claimed` from #1910, which stays open for L21 and L22. |
-| #2241 | #1959 (T55 slice 1) | ready. From the old charter: it deletes test-helper copies that agree, so it isn't a real-problem PR. A maintainer decides whether it merges. Don't extend it, and take no further T55 slices. |
 
-While three are open, a run opens no PR and verifies leads instead (step 3).
+At three open, a run opens no PR and verifies leads instead (step 3).
 
 **Next PR when a slot opens**, in this order. Each has a failing test or mutation on `main` in its issue:
 1. #2254: one file (`vlt_heal.rs`), which no open PR changes.
 2. #1982: three Gradle test files, which no open routine PR changes.
-3. #2253: after #2246 merges, since it changes the same two files (`vendor.rs`, `scan/gc.rs`).
+3. #2253: unblocked, #2246 merged. It changes the same two files (`vendor.rs`, `scan/gc.rs`).
 
 ### Merged
-_None under this charter. The 2026-10/11 sweep PRs are listed in `review/2026-11-v2/register/90-refactor.md`._
+| PR | Fixed |
+|---|---|
+| #2246 | `scan --prune` called a keep for a file that still installs from the artifact a drift, and dropped a failed revert's reason (part of #1910). Merged 2026-11-25 as ddf322a |
+| #2241 | old charter, no defect: test-helper copies replaced by `tests/common`'s (#1959, T55 slice 1). Take no further T55 slices |
+
+The 2026-10/11 sweep PRs are listed in `review/2026-11-v2/register/90-refactor.md`.
 
 ### Leads
 L01 to L18 came from the previous thread's automated audits and the later rows from this routine's runs. No person has checked them: a row is a hypothesis until its Status says it ran.
@@ -53,7 +56,7 @@ Issues looked at:
 
 | Issue | Status |
 |---|---|
-| #1910 | in PR #2246; the rest is L21 and L22 |
+| #1910 | fixed in part (#2246), claim released; the rest is L21 and L22 |
 | #2249 | in PR #2250 |
 | #2253 | filed this thread (L23, L24): `scan --prune` and `vendor --json` say nothing about a ledger they could not read |
 | #2254 | filed this thread (L04): the vlt heal's "could not check" text is the hosted one after a rollback or takeover |
