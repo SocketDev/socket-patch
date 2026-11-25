@@ -185,7 +185,7 @@ fn human_verbose_hash_mismatch_details() {
         "the humanized status label must print; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("message: File has been modified after patching"),
+        stdout.contains("message: File holds neither the patched nor the original content"),
         "the verbose message line must print; stdout=\n{stdout}"
     );
     assert!(
@@ -353,7 +353,9 @@ fn dry_run_failure_prints_reason_once() {
         "the dry run must carry the failure section; stdout=\n{stdout}"
     );
     assert_eq!(
-        combined.matches("modified after patching").count(),
+        combined
+            .matches("neither the patched nor the original content")
+            .count(),
         1,
         "the reason must appear exactly once; stdout=\n{stdout}\nstderr=\n{stderr}"
     );

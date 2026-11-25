@@ -1514,7 +1514,7 @@ async fn yarn_classic_hosted_pin_beside_a_git_copy_rolls_back() {
 // hosted scan pinned the same `name@version` to a SUPERSEDING patch (the
 // fixture's UUID, B) and left record A in place. After a reinstall the tree
 // holds B's bytes, which are neither of A's sides, so restoring A in place
-// would fail "modified after patching". The hosted leg owns that package
+// would fail on a hash mismatch. The hosted leg owns that package
 // now: rollback and remove restore the lock, drop the superseded record
 // with a warning, and exit 0.
 

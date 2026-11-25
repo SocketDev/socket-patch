@@ -30,8 +30,10 @@
 //! `status`, event actions and `errorCode`s) and the bytes on disk. The
 //! human wording of each case lives in `apply_render.rs` (#1089); both
 //! files share the fixtures in `apply_fixture.rs`. In `--json` a no-matching-variant miss
-//! shows as exit 1 with `status: partialFailure` and no `applied` or
-//! `failed` event for the base.
+//! shows as exit 1 with `status: partialFailure`, no `applied` event and
+//! one `failed` / `no_matching_variant` event keyed by the base purl
+//! (#2231; what else the run says of such a copy is pinned in
+//! `gem_unmatched_copy_reporting.rs`).
 
 use crate::apply_fixture::{
     gem_multi_variant_fixture, gem_singleton_mismatch_fixture, gem_wrong_platform_fixture,
@@ -43,6 +45,26 @@ use crate::common::envelope::{
     parse_json_envelope,
 };
 use crate::common::git_sha256;
+
+/// The base purl of the nokogiri fixtures' records.
+const NOKOGIRI_BASE_PURL: &str = "pkg:gem/nokogiri@1.16.5";
+
+/// No variant was attempted on the installed copy: the base has one
+/// `failed` event, coded `no_matching_variant` (#2231). The code tells
+/// this miss apart from a variant that was tried and refused
+/// (`apply_failed`), and the copy, being installed, is never a
+/// `package_not_installed` skip.
+fn assert_no_variant_failure(v: &serde_json::Value) {
+    assert_eq!(event_purls(v, "failed"), [NOKOGIRI_BASE_PURL], "{v:#}");
+    assert!(
+        has_event(v, "failed", "no_matching_variant", NOKOGIRI_BASE_PURL),
+        "{v:#}"
+    );
+    assert!(
+        !event_codes(v).iter().any(|c| c == "package_not_installed"),
+        "{v:#}"
+    );
+}
 
 /// The per-file warning code of a default-policy overwrite.
 const OVERWRITTEN: &str = "content_mismatch_overwritten";
@@ -165,9 +187,7 @@ fn qualified_singleton_wrong_platform_fails_closed() {
     assert_envelope_invariants(&v, "apply");
     assert_eq!(v["status"], "partialFailure", "{v:#}");
     assert!(event_purls(&v, "applied").is_empty(), "{v:#}");
-    // No variant was attempted, so no `failed` event either: that tells
-    // this miss apart from a variant that was tried and refused.
-    assert!(event_purls(&v, "failed").is_empty(), "{v:#}");
+    assert_no_variant_failure(&v);
     assert!(
         !event_codes(&v).iter().any(|c| c == OVERWRITTEN),
         "a wrong-distribution record must never be surfaced as a \
@@ -242,9 +262,7 @@ fn multi_variant_none_matching_still_fails_closed() {
     assert_envelope_invariants(&v, "apply");
     assert_eq!(v["status"], "partialFailure", "{v:#}");
     assert!(event_purls(&v, "applied").is_empty(), "{v:#}");
-    // No variant was attempted, so no `failed` event either: that tells
-    // this miss apart from a variant that was tried and refused.
-    assert!(event_purls(&v, "failed").is_empty(), "{v:#}");
+    assert_no_variant_failure(&v);
     assert!(!event_codes(&v).iter().any(|c| c == OVERWRITTEN), "{v:#}");
     let after = std::fs::read(&file).expect("read file");
     assert_eq!(
