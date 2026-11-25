@@ -31,6 +31,9 @@
 //!    rules_csharp hub reads, where the block that makes the hub take the
 //!    copy cannot be shown to work (`vendor_nuget_bazel_workspace`), unless
 //!    `nuget.config` already names the patch's folder.
+//! 8. a Maven jar that only a rules_jvm_external hub of a Bazel workspace
+//!    builds and whose entry cannot be written there (the `maven_bazel_*`
+//!    codes of [`crate::bazel::maven`]), from the same dispatch.
 //!
 //! Each check lives in its backend's module; this one only dispatches and
 //! scopes them.
@@ -115,8 +118,12 @@ fn is_cargo(purl: &str) -> bool {
 /// vendored entry point takes this one answer: [`vendor_refusals`] hands it
 /// to a scan, a `get` and a `vendor`, and the eject of hosted pins asks it
 /// before it fetches or restores anything. A refusal of this kind for
-/// another ecosystem belongs here: Composer's and NuGet's are the two
-/// today.
+/// another ecosystem belongs here: Composer's, NuGet's and Maven's are the
+/// three today. Composer's and NuGet's are the ones the user's word lifts.
+/// Maven's is not lifted: vendored mode patches a pinned
+/// rules_jvm_external hub, and where the hub is the only build of a patch
+/// and no entry can be shown to work for it
+/// ([`super::maven_repo::hub_refusals`]), there is nothing else to write.
 pub async fn bazel_workspace_refusals<'a>(
     project_root: &Path,
     candidates: &[(&'a str, &str)],
@@ -127,6 +134,20 @@ pub async fn bazel_workspace_refusals<'a>(
     };
     let mut refused = composer_lock::bazel::refusals(project_root, &of(Ecosystem::Composer)).await;
     refused.extend(nuget_feed::bazel_refusals(project_root, &of(Ecosystem::Nuget)).await);
+    let maven = of(Ecosystem::Maven);
+    if !maven.is_empty() {
+        let owned = |(purl, uuid): &(&str, &str)| (purl.to_string(), uuid.to_string());
+        let owned: Vec<(String, String)> = maven.iter().map(owned).collect();
+        let root = project_root.to_path_buf();
+        // The hubs are read from the files of the checkout: off the runtime.
+        let read = move || super::maven_repo::hub_refusals(&root, &owned);
+        let declined = crate::utils::fs::run_blocking(read).await;
+        let named = |(purl, (code, why)): (String, (&'static str, String))| {
+            let (purl, _) = maven.iter().find(|(candidate, _)| *candidate == purl)?;
+            Some((*purl, code, why))
+        };
+        refused.extend(declined.into_iter().filter_map(named));
+    }
     refused
 }
 

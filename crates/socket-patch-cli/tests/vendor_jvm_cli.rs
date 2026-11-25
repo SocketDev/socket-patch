@@ -1695,8 +1695,11 @@ fn gradle_vendor_395_repair_refuses_a_linked_gradle_tree() {
 }
 
 /// A rules_jvm_external hub of a Bazel workspace builds the jar its own
-/// lock pins, not the vendored one. `vendor` beside such a hub warns once
-/// for each jar the hub builds, in the envelope or as a line a person
+/// lock pins, not the one vendored for Maven. Here nothing in the checkout
+/// says which Bazel builds it, so `vendor` writes no entry for the hub
+/// ([`vendor_gives_a_pinned_bazel_hub_the_patched_jar`] is the checkout
+/// where it does): beside such a hub it warns once for each jar the hub
+/// builds, with the reason, in the envelope or as a line a person
 /// reads, and its events and every file it writes are those of the same
 /// run without the workspace. A hub that does not build a vendored jar
 /// adds nothing.
@@ -1742,14 +1745,13 @@ fn a_bazel_hub_that_builds_a_vendored_jar_adds_one_warning_and_nothing_else() {
     let (events, tree, warnings) = vendor(Some(lock("foo")));
     assert_eq!((&events, &tree), (&without.0, &without.1));
     let detail = format!(
-        "{0}: Bazel takes this artifact from maven_install.json (hub \"maven\", `maven.install` \
-         at MODULE.bazel:3), which pins the upstream jar, and this command does not patch a \
-         rules_jvm_external hub: the Bazel build stays unpatched whatever it did for another \
-         build of the checkout. `socket-patch get {0} --mode hosted` at the Bazel root patches \
-         a pinned hub",
+        "{0}: no file of the checkout says that Bazel 7.4.0 or later builds it, and an older \
+         Bazel fails on the `override_repo` an entry needs: name the release in `.bazelversion`. \
+         socket-patch wrote nothing to MODULE.bazel for it, so the Bazel build keeps the \
+         upstream jar",
         purl("foo")
     );
-    let warning = serde_json::json!({ "code": "maven_bazel_hub_unpatched", "detail": detail });
+    let warning = serde_json::json!({ "code": "maven_bazel_release", "detail": detail });
     assert_eq!(warnings, [without.2, vec![warning]].concat());
     // A person reads it once, on stderr, and not under `--silent`; a
     // program reads it in the envelope alone.
@@ -1800,15 +1802,24 @@ fn a_bazel_hub_that_builds_a_vendored_jar_adds_one_warning_and_nothing_else() {
     assert_eq!(others(Some(lock("foo"))), others(None));
 }
 
-/// Vendored mode patches no rules_jvm_external hub, and takes none over.
-/// The entry that hosted mode keeps for a jar in the block of
-/// `MODULE.bazel` is a hosted pin of that jar, and `vendor` and `vendor
+/// Beside a Maven build, vendored mode ejects no hosted patch of a
+/// rules_jvm_external hub. The entry that hosted mode keeps for a jar in
+/// the block of `MODULE.bazel` is a hosted pin of that jar, and where
+/// vendored mode writes no entry for the hub, `vendor` and `vendor
 /// --revert` leave it as it is: the Bazel build keeps the patched jar.
 /// Everything else is the run without the workspace, and nothing is said
-/// of a hub that the block patches. That holds for an entry alone, and
-/// for one whose patch a hosted run also pinned in the poms of the
-/// reactor: `vendor` takes the poms' part of that pin over, as it does
-/// without the workspace.
+/// of a hub that the block patches. That holds for an entry alone, and for
+/// one whose patch a hosted run also pinned in the poms of the reactor:
+/// `vendor` takes the poms' part of that pin over, as it does without the
+/// workspace.
+///
+/// A hub that vendored mode can patch gets the vendored entry in the place
+/// of the hosted one in the run that vendors the same patch for the Maven
+/// build: one entry for the jar, which `vendor --revert` takes out.
+///
+/// In a checkout that only Bazel builds, the hub is the build `vendor`
+/// patches: its entry takes the place of the hosted one, and where it can
+/// write none the hosted entry stays and nothing is written.
 #[test]
 fn vendor_leaves_the_hosted_entry_of_a_bazel_hub_in_place() {
     let module = format!(
@@ -1942,4 +1953,675 @@ override_repo(
             assert_eq!(beside.3.as_deref(), Some(module.as_bytes()), "{in_poms}");
         }
     }
+
+    // A hub that vendored mode can patch, beside the Maven build that the
+    // run vendors the patch for (a patch of the manifest, and one that the
+    // poms pin too): the vendored entry is in the place of the hosted one,
+    // and the undo of the vendoring takes it out.
+    for in_poms in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+        pinned_hub(root, "foo");
+        write(root, "proj/MODULE.bazel", module.as_bytes());
+        let records = match in_poms {
+            true => {
+                pin_poms(root);
+                serve_record(root)
+            }
+            false => nowhere.clone(),
+        };
+        let held = || std::fs::read_to_string(root.join("proj/MODULE.bazel")).unwrap();
+        ok(root, &["vendor", "--proxy-url", &records]);
+        assert_eq!(held(), format!("{HUB_MODULE}\n{FOO_BLOCK}"), "{in_poms}");
+        assert!(hosted(root).is_empty(), "{in_poms}");
+        ok(root, &["vendor", "--revert", "--proxy-url", &records]);
+        assert_eq!(held(), HUB_MODULE, "{in_poms}");
+    }
+
+    for declined in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+        only_bazel(root);
+        pinned_hub(root, "foo");
+        write(root, "proj/MODULE.bazel", module.as_bytes());
+        // Nothing says which Bazel builds the checkout.
+        for gone in ["proj/.bazelversion", "proj/MODULE.bazel.lock"] {
+            if declined {
+                std::fs::remove_file(root.join(gone)).unwrap();
+            }
+        }
+        let (records, before) = (serve_record(root), snapshot(root));
+        let (code, env) = socket(root, &["vendor", "--proxy-url", &records]);
+        let (failed, after) = (&env["events"][0], snapshot(root));
+        let pins = usize::from(declined);
+        assert_eq!(code, Some(pins as i32), "{declined}: {env}");
+        let entry = [serde_json::json!(["MODULE.bazel"])];
+        assert_eq!(hosted(root), entry[..pins], "{declined}: {env}");
+        if declined {
+            assert_eq!(failed["errorCode"], "maven_bazel_release", "{env}");
+            let left = "socket-patch left the entry that MODULE.bazel holds for it as it is";
+            let why = failed["error"].as_str().unwrap_or_default();
+            assert!(why.ends_with(left), "{env}");
+            assert_eq!(after, before, "{env}");
+        } else {
+            let vendored = format!("{HUB_MODULE}\n{FOO_BLOCK}");
+            let held = after["MODULE.bazel"].as_deref();
+            assert_eq!(held, Some(vendored.as_bytes()), "{env}");
+        }
+    }
+}
+
+/// The module file of a checkout whose hub is pinned, and the files that
+/// say which Bazel builds it and which release of the ruleset Bazel
+/// selected: the checkout vendored mode writes its entry for.
+const HUB_MODULE: &str = "bazel_dep(name = \"rules_jvm_external\", version = \"7.2\")\n\
+                          maven = use_extension(\"@rules_jvm_external//:extensions.bzl\", \"maven\")\n\
+                          maven.install(lock_file = \"//:maven_install.json\")\n";
+
+fn pinned_hub(root: &Path, artifact: &str) {
+    let lock = format!(
+        "{{\"artifacts\": {{\"org.example:{artifact}\": {{\"shasums\": {{\"jar\": \"00\"}}, \
+         \"version\": \"1.0\"}}}}, \"repositories\": {{\"https://repo.example/maven2/\": \
+         [\"org.example:{artifact}\"]}}, \"version\": \"3\"}}\n"
+    );
+    let bcr = "https://bcr.bazel.build/modules/rules_jvm_external";
+    let module_lock = format!(
+        "{{\"lockFileVersion\": 13, \"registryFileHashes\": {{\"{bcr}/7.2/MODULE.bazel\": \"1\", \
+         \"{bcr}/7.2/source.json\": \"2\"}}}}\n"
+    );
+    write(root, "proj/MODULE.bazel", HUB_MODULE.as_bytes());
+    write(root, "proj/maven_install.json", lock.as_bytes());
+    write(root, "proj/.bazelversion", b"7.7.2\n");
+    write(root, "proj/MODULE.bazel.lock", module_lock.as_bytes());
+}
+
+/// The fixture without its Maven build: a checkout that only Bazel builds.
+fn only_bazel(root: &Path) {
+    for gone in ["proj/pom.xml", "proj/a/pom.xml"] {
+        std::fs::remove_file(root.join(gone)).unwrap();
+    }
+    std::fs::remove_dir(root.join("proj/a")).unwrap();
+    std::fs::remove_dir_all(root.join("proj/.mvn")).unwrap();
+}
+
+/// The directory vendored mode keeps for the hub's jar of `foo`, the
+/// block that names it, with its last line break, and the pair of
+/// `.bazelignore`.
+const FOO_UNIT: &str = ".socket/vendor/maven/1d3c1fd2-7b4e-4c1a-9f0e-2a3b4c5d6e7f";
+const FOO_BLOCK: &str = r#"# >>> socket-patch: Maven patches for Bazel (managed block: socket-patch writes and removes it) >>>
+socket_patch_local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
+
+socket_patch_maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+
+# pkg:maven/org.example/foo@1.0, Socket patch 1d3c1fd2-7b4e-4c1a-9f0e-2a3b4c5d6e7f
+socket_patch_local_repository(
+    name = "socket_patch_org_example_foo_1_0",
+    path = ".socket/vendor/maven/1d3c1fd2-7b4e-4c1a-9f0e-2a3b4c5d6e7f",
+)
+
+# If Bazel stops at the next line ("does not generate repository"), the hub's lock no longer pins
+# org.example:foo at 1.0: run `socket-patch rollback pkg:maven/org.example/foo@1.0`.
+# Do not change it to inject_repo(): the build would pass without the patch.
+override_repo(
+    socket_patch_maven,
+    org_example_foo_1_0 = "socket_patch_org_example_foo_1_0",
+)
+# <<< socket-patch <<<
+"#;
+const JARS_IGNORED: &str =
+    "# socket-patch: patched Maven jars for a Bazel hub, not Bazel packages \
+                            (to opt out, comment out the next line)\n.socket/vendor/maven\n";
+
+/// Vendored mode patches a pinned rules_jvm_external hub: `vendor` commits
+/// the patched jar in a directory of its own, which the block at the end
+/// of `MODULE.bazel` puts in the place of the hub's repository, and names
+/// the directory in `.bazelignore`. That holds in a checkout only Bazel
+/// builds, where the hub's jar is the vendored artifact, and beside a
+/// Maven build, which is vendored exactly as without the workspace.
+/// `vendor --check` fails for a committed jar that is not the patched one
+/// and for a BUILD file that is not the one written; `list` and `vex` see
+/// the patch; `vendor --revert` and `rollback` restore every byte.
+#[test]
+fn vendor_gives_a_pinned_bazel_hub_the_patched_jar() {
+    for alone in [true, false] {
+        // Without the workspace: what the Maven build alone gets.
+        let without = tempfile::tempdir().unwrap();
+        fixture(without.path(), Shape::Reactor, &[("foo", FOO_UUID)]);
+        let maven_alone = (!alone).then(|| {
+            let env = ok(without.path(), &["vendor"]);
+            (
+                events(&env),
+                env["warnings"].clone(),
+                snapshot(without.path()),
+            )
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+        if alone {
+            only_bazel(root);
+        }
+        pinned_hub(root, "foo");
+        let pristine = snapshot(root);
+        let read = |rel: &str| std::fs::read(root.join("proj").join(rel)).ok();
+        let text = |rel: &str| read(rel).map(|bytes| String::from_utf8(bytes).unwrap());
+
+        // A dry run says what would be vendored and writes nothing.
+        let env = ok(root, &["vendor", "--dry-run"]);
+        assert_eq!(env["warnings"], serde_json::Value::Null, "{alone}: {env}");
+        assert_eq!(snapshot(root), pristine, "{alone}");
+
+        let env = ok(root, &["vendor"]);
+        assert_eq!(env["summary"]["applied"], 1, "{alone}: {env}");
+        assert_eq!(env["warnings"], serde_json::Value::Null, "{alone}: {env}");
+        let module = text("MODULE.bazel").unwrap();
+        assert_eq!(module, format!("{HUB_MODULE}\n{FOO_BLOCK}"), "{alone}");
+        assert_eq!(
+            text(".bazelignore").as_deref(),
+            Some(JARS_IGNORED),
+            "{alone}"
+        );
+        let build = "filegroup(\n    name = \"file\",\n    srcs = [\"foo-1.0.jar\"],\n    \
+                     visibility = [\"//visibility:public\"],\n)\n";
+        let unit = |rel: &str| format!("{FOO_UNIT}/{rel}");
+        assert_eq!(text(&unit("file/BUILD.bazel")).as_deref(), Some(build));
+        assert_eq!(text(&unit(".gitignore")).as_deref(), Some("!*\n"));
+        let repo = text(&unit("REPO.bazel")).unwrap();
+        assert!(repo.lines().all(|line| line.starts_with("# ")), "{repo}");
+        let patched = jar(b"NOTICE foo\nPATCHED\n");
+        let committed = read(&unit("file/foo-1.0.jar")).unwrap();
+        let notice = |jar: &[u8]| {
+            let mut zip = zip::ZipArchive::new(std::io::Cursor::new(jar)).unwrap();
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut zip.by_name(MEMBER).unwrap(), &mut text).unwrap();
+            text
+        };
+        assert_eq!(notice(&committed), notice(&patched), "{alone}");
+        // The ledger: the hub's jar as the artifact of a patch that only
+        // the hub takes, and the Maven tree's beside a Maven build.
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&read(".socket/vendor/state.json").unwrap()).unwrap();
+        let entry = &ledger["entries"][purl("foo")];
+        let recorded = [
+            &entry["ecosystem"],
+            &entry["flavor"],
+            &entry["artifact"]["path"],
+        ];
+        let hub = [
+            serde_json::json!("maven"),
+            serde_json::json!("bazel"),
+            serde_json::json!(unit("file/foo-1.0.jar")),
+        ];
+        match alone {
+            true => assert_eq!(recorded, hub.each_ref(), "{ledger}"),
+            false => assert_eq!(entry["ecosystem"], "jvm", "{ledger}"),
+        }
+        // Beside the Maven build: its events, and every file but those of
+        // the hub, are the ones of the run without the workspace.
+        if let Some((events_alone, warnings, tree)) = &maven_alone {
+            assert_eq!((&events(&env), &env["warnings"]), (events_alone, warnings));
+            let mut beside = snapshot(root);
+            let of_the_hub = |rel: &String| {
+                rel.starts_with(".socket/vendor/maven/")
+                    || [
+                        "MODULE.bazel",
+                        "MODULE.bazel.lock",
+                        "maven_install.json",
+                        ".bazelversion",
+                        ".bazelignore",
+                    ]
+                    .contains(&rel.as_str())
+            };
+            beside.retain(|rel, _| !of_the_hub(rel));
+            assert_eq!(&beside, tree);
+        }
+        let vendored = snapshot(root);
+
+        // A second run changes nothing, and the audit passes.
+        let again = ok(root, &["vendor"]);
+        let in_sync = (
+            purl("foo"),
+            "skipped".to_string(),
+            "already_vendored".to_string(),
+        );
+        assert_eq!(events(&again), [in_sync], "{alone}: {again}");
+        assert_eq!(snapshot(root), vendored, "{alone}");
+        let (code, check) = socket(root, &["vendor", "--check"]);
+        assert_eq!(code, Some(0), "{alone}: {check}");
+        // And `repair` finds nothing to do: the directory that `MODULE.bazel`
+        // names is the ledger entry's, also where that entry is the Maven
+        // build's.
+        let repaired = ok(root, &["repair"]);
+        assert_eq!(snapshot(root), vendored, "{alone}: {repaired}");
+        // `list` and `vex` see the patch.
+        let (_, list) = socket(root, &["list"]);
+        assert_eq!(list["events"][0]["purl"], purl("foo"), "{alone}: {list}");
+        let vex = root.join("vex.json");
+        let document = [
+            "vex",
+            "-O",
+            vex.to_str().unwrap(),
+            "--product",
+            "pkg:generic/x@1",
+        ];
+        ok(root, &document);
+        let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&vex).unwrap()).unwrap();
+        assert_eq!(doc["statements"][0]["status"], "not_affected", "{doc}");
+
+        // A committed jar that is not the patched one, one that carries
+        // the file of the patch beside a member the patched jar has not,
+        // and a BUILD file that names another jar: the audit fails for
+        // each, and names it.
+        let held = std::io::Cursor::new(committed.clone());
+        let mut grown = zip::ZipWriter::new_append(held).unwrap();
+        let plain = zip::write::SimpleFileOptions::default();
+        grown.start_file("other/Other.class", plain).unwrap();
+        let grown = grown.finish().unwrap().into_inner();
+        assert_eq!(notice(&grown), notice(&patched));
+        let planted = grown.clone();
+        for (rel, other) in [
+            ("file/foo-1.0.jar", jar(b"NOTICE foo\n")),
+            ("file/foo-1.0.jar", grown),
+            (
+                "file/BUILD.bazel",
+                build.replace("foo-1.0", "other").into_bytes(),
+            ),
+        ] {
+            let held = read(&unit(rel)).unwrap();
+            write(root, &format!("proj/{}", unit(rel)), &other);
+            let (code, check) = socket(root, &["vendor", "--check"]);
+            assert_eq!(code, Some(1), "{alone} {rel}: {check}");
+            let failed = &check["events"][0];
+            assert_eq!(failed["errorCode"], "vendor_check_failed", "{rel}: {check}");
+            if !alone || rel.ends_with("BUILD.bazel") {
+                let why = failed["reason"].as_str().unwrap_or_default();
+                assert!(why.contains(&unit(rel)), "{alone} {rel}: {check}");
+            }
+            write(root, &format!("proj/{}", unit(rel)), &held);
+        }
+        // A `MODULE.bazel` without the entry, one whose block was changed
+        // by hand, and a lock that no longer pins the jar at the version of
+        // the patch: the Bazel build takes another jar or stops, and the
+        // audit says which, with a remedy that works.
+        let rollback = format!("run `socket-patch rollback {}`", purl("foo"));
+        let lock = text("maven_install.json").unwrap();
+        let bumped = lock.replace("\"version\": \"1.0\"", "\"version\": \"1.1\"");
+        let edited = module.replace("# Do not change", "# Do change");
+        for (file, held, other, why) in [
+            (
+                "MODULE.bazel",
+                &module,
+                HUB_MODULE,
+                "MODULE.bazel no longer names",
+            ),
+            ("MODULE.bazel", &module, &edited, "changed by hand"),
+            ("maven_install.json", &lock, &bumped, rollback.as_str()),
+        ] {
+            assert_ne!(held.as_str(), other, "{file}");
+            write(root, &format!("proj/{file}"), other.as_bytes());
+            let (code, check) = socket(root, &["vendor", "--check"]);
+            assert_eq!(code, Some(1), "{alone} {why}: {check}");
+            let reason = check["events"][0]["reason"].as_str().unwrap_or_default();
+            assert!(reason.contains(why), "{alone} {why}: {check}");
+            // The hub was the only build of the patch: `vendor` has nothing
+            // to vendor it for, and names the same remedy.
+            if alone && file == "maven_install.json" {
+                let (code, env) = socket(root, &["vendor"]);
+                let failed = &env["events"][0];
+                assert_eq!(code, Some(1), "{env}");
+                assert_eq!(failed["errorCode"], "vendor_jvm_shape_unsupported", "{env}");
+                let error = failed["error"].as_str().unwrap_or_default();
+                assert!(error.ends_with(why), "{env}");
+            }
+            write(root, &format!("proj/{file}"), held.as_bytes());
+        }
+        assert_eq!(snapshot(root), vendored, "{alone}");
+
+        // Beside a Maven build `vex` hashes the jar of the Maven tree, as
+        // it does without the workspace: one that is not the patched jar
+        // is not attested, whatever the hub's copy holds.
+        if !alone {
+            let tree = format!("{FOO_MAVEN_TREE}/foo-1.0-socket.1d3c1fd2.jar");
+            let held = std::fs::read(root.join(&tree)).unwrap();
+            write(root, &tree, &jar(b"NOTICE foo\n"));
+            let (_, env) = socket(root, &document);
+            assert_eq!(env["summary"]["verified"], 0, "{env}");
+            write(root, &tree, &held);
+        }
+
+        // A directory that is lost whole comes back with every file: by
+        // `repair` where its jar is the vendored artifact, and by the next
+        // `vendor` beside a Maven build, which gives the hub the jar of the
+        // Maven tree again. That run also drops the directory an earlier
+        // patch of the jar left behind, which nothing names any more.
+        std::fs::remove_dir_all(root.join("proj").join(FOO_UNIT)).unwrap();
+        let stale = ".socket/vendor/maven/0e77a000-0000-4000-8000-0000000000a1";
+        if !alone {
+            write(
+                root,
+                &format!("proj/{stale}/REPO.bazel"),
+                b"# an earlier patch\n",
+            );
+            write(root, &format!("proj/{stale}/file/foo-1.0.jar"), b"jar");
+        }
+        let (code, check) = socket(root, &["vendor", "--check"]);
+        assert_eq!(code, Some(1), "{alone}: {check}");
+        let back = ok(root, if alone { &["repair"] } else { &["vendor"] });
+        assert!(!root.join("proj").join(stale).exists(), "{alone}: {back}");
+        if !alone {
+            let rebuilt = (
+                purl("foo"),
+                "skipped".to_string(),
+                "vendor_artifact_rebuilt".to_string(),
+            );
+            assert!(events(&back).contains(&rebuilt), "{back}");
+        }
+        let now = snapshot(root);
+        let differ: Vec<&String> = now
+            .keys()
+            .chain(vendored.keys())
+            .filter(|rel| now.get(*rel) != vendored.get(*rel))
+            .collect();
+        assert_eq!(differ, Vec::<&String>::new(), "{alone}: {back}");
+
+        // The undo, by each command: every byte and directory of before.
+        // `rollback` and `remove` also drop the patch from the run's
+        // manifest, which is no file of the comparison and is put back.
+        // The same after the hub's lock moved on, where Bazel stops at the
+        // entry: the undo takes the stale entry out with its directory,
+        // which no scan does.
+        let manifest = root.join("proj/.socket/manifest.json");
+        let patches = std::fs::read(&manifest).unwrap();
+        let foo = purl("foo");
+        let undos = [
+            &["vendor", "--revert"][..],
+            &["rollback", &foo],
+            &["remove", &foo],
+        ];
+        for (undo, stale) in undos
+            .iter()
+            .flat_map(|undo| [(*undo, false), (*undo, true)])
+        {
+            std::fs::write(&manifest, &patches).unwrap();
+            ok(root, &["vendor"]);
+            assert_eq!(snapshot(root), vendored, "{alone} {undo:?}");
+            if stale {
+                write(root, "proj/maven_install.json", bumped.as_bytes());
+            }
+            let undone = ok(root, undo);
+            write(root, "proj/maven_install.json", lock.as_bytes());
+            assert_eq!(snapshot(root), pristine, "{alone} {undo:?} {stale}");
+            // No installed tree holds the jar of a hub: nothing is said of
+            // a package-manager install for a patch that only the hub took.
+            let warned = undone["warnings"].as_array().cloned().unwrap_or_default();
+            let reinstall = |warning: &serde_json::Value| warning["code"] == "reinstall_required";
+            assert!(
+                !alone || !warned.iter().any(reinstall),
+                "{undo:?}: {undone}"
+            );
+        }
+
+        // A jar that waits at the hub's path with no ledger entry is not
+        // taken for the vendored one, although it carries the patch's
+        // file: the run fetches the patch's own jar over it.
+        if alone {
+            std::fs::write(&manifest, &patches).unwrap();
+            write(
+                root,
+                &format!("proj/{}", unit("file/foo-1.0.jar")),
+                &planted,
+            );
+            ok(root, &["vendor"]);
+            let taken = read(&unit("file/foo-1.0.jar")).unwrap();
+            assert_eq!(taken, committed, "the planted jar was vendored");
+            ok(root, &["vendor", "--revert"]);
+            assert_eq!(snapshot(root), pristine);
+        }
+
+        // What a person reads: every file of the hub among those to commit,
+        // the step that takes the jar where the hub is the only build, and
+        // after the undo no step of a package manager.
+        std::fs::write(&manifest, &patches).unwrap();
+        let said = |args: &[&str]| {
+            let out = spawn(root, args, false);
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            assert!(out.status.success(), "{args:?}: {stdout}");
+            stdout
+        };
+        let (commit, step) = match alone {
+            true => (
+                "Commit MODULE.bazel, .bazelignore and .socket/vendor/ to",
+                "Run `bazel build //...` so the build resolves the vendored artifacts \
+                 (MODULE.bazel names their directory)",
+            ),
+            false => (
+                "Commit MODULE.bazel, .bazelignore, .socket/vendor/ and the updated lockfiles",
+                "Reinstall from the updated lockfile",
+            ),
+        };
+        let vendoring = said(&["vendor"]);
+        assert!(
+            vendoring.contains(commit) && vendoring.contains(step),
+            "{alone}: {vendoring}"
+        );
+        let reverting = said(&["vendor", "--revert"]);
+        assert!(
+            reverting.contains("Reverted 1 vendored package.") && !reverting.contains("resync"),
+            "{alone}: {reverting}"
+        );
+        assert_eq!(snapshot(root), pristine, "{alone}");
+    }
+}
+
+/// Beside a Maven build the undo edits the files of two builds: the poms
+/// and `.mvn/maven.config` of Maven, and `MODULE.bazel`. They are written
+/// together. Where one of them cannot be replaced (its directory takes no
+/// new file), the undo fails and every file, the vendored tree, the hub's
+/// directory and the ledger are as they were, whichever build the file is
+/// of: `MODULE.bazel` and the root pom in the project directory, or the
+/// pom of the module in its own. Once every file can be written, the same
+/// undo restores every byte.
+#[cfg(unix)]
+#[test]
+fn an_undo_that_cannot_write_a_file_of_either_build_changes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+    pinned_hub(root, "foo");
+    let pristine = snapshot(root);
+    ok(root, &["vendor"]);
+    let vendored = snapshot(root);
+    let manifest = root.join("proj/.socket/manifest.json");
+    let patches = std::fs::read(&manifest).unwrap();
+    let foo = purl("foo");
+    let mode = |dir: &str, mode| {
+        std::fs::set_permissions(root.join(dir), std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    let undos = [
+        &["vendor", "--revert"][..],
+        &["rollback", &foo],
+        &["remove", &foo],
+    ];
+    for dir in ["proj", "proj/a"] {
+        mode(dir, 0o555);
+        let probe = root.join(dir).join("probe");
+        if std::fs::write(&probe, b"").is_ok() {
+            eprintln!("skipping: permission bits not enforced (running as root?)");
+            std::fs::remove_file(probe).unwrap();
+            return mode(dir, 0o755);
+        }
+        let ran = undos.map(|undo| {
+            let (code, env) = socket(root, undo);
+            let left = snapshot(root);
+            std::fs::write(&manifest, &patches).unwrap();
+            (undo, code, env, left)
+        });
+        mode(dir, 0o755);
+        for (undo, code, env, left) in ran {
+            assert_eq!(code, Some(1), "{dir} {undo:?}: {env}");
+            let changed: std::collections::BTreeSet<&String> = (left.keys().chain(vendored.keys()))
+                .filter(|rel| left.get(*rel) != vendored.get(*rel))
+                .collect();
+            assert!(
+                changed.is_empty(),
+                "{dir} {undo:?} changed {changed:?}: {env}"
+            );
+            let why = env.to_string();
+            assert!(
+                why.contains("every file is as it was"),
+                "{dir} {undo:?}: {env}"
+            );
+        }
+    }
+    ok(root, &["vendor", "--revert"]);
+    assert_eq!(snapshot(root), pristine);
+}
+
+/// The files of that undo are replaced one after the other, under a
+/// journal that names them all. A run that ends between two of them (here
+/// it is killed there) has removed nothing, and leaves the journal: the
+/// next command finishes the replacement before it does anything else, and
+/// the undo run again removes the tree, the hub's directory, which no file
+/// names any more, and the ledger entry.
+#[test]
+fn an_undo_killed_between_two_files_is_finished_by_the_next_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+    pinned_hub(root, "foo");
+    let pristine = snapshot(root);
+    let manifest = root.join("proj/.socket/manifest.json");
+    let patches = std::fs::read(&manifest).unwrap();
+    let foo = purl("foo");
+    let tree = FOO_MAVEN_TREE.strip_prefix("proj/").unwrap();
+    for point in [
+        "group_commit_journal",
+        "group_commit_file@1",
+        "group_commit_file@3",
+    ] {
+        std::fs::write(&manifest, &patches).unwrap();
+        ok(root, &["vendor"]);
+        let (mut cmd, _fixture) = command(root, &["rollback", &foo], true);
+        let killed = cmd.env("SOCKET_PATCH_FAILPOINT", point).output().unwrap();
+        assert_eq!(killed.status.code(), Some(86), "{point}: {killed:?}");
+        let left = snapshot(root);
+        for kept in [
+            ".socket/vendor/.commit-journal.json".to_string(),
+            ".socket/vendor/state.json".to_string(),
+            format!("{FOO_UNIT}/file/foo-1.0.jar"),
+            format!("{tree}/foo-1.0-socket.1d3c1fd2.jar"),
+        ] {
+            assert!(left.contains_key(&kept), "{point}: {kept} is gone");
+        }
+        let undone = ok(root, &["rollback", &foo]);
+        assert_eq!(snapshot(root), pristine, "{point}: {undone}");
+    }
+}
+
+/// Beside a Maven build the hub's directory must survive the commit, as
+/// every vendored artifact must: where a rule of the checkout ignores it,
+/// the run vendors for the Maven build, writes nothing for the hub and
+/// says why. An entry that names a directory git leaves out would fail
+/// the Bazel build of every other checkout.
+#[test]
+fn vendor_beside_a_maven_build_skips_a_hub_directory_that_git_ignores() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+    pinned_hub(root, "foo");
+    let proj = root.join("proj");
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&proj)
+        .output();
+    if !init.is_ok_and(|out| out.status.success()) {
+        return;
+    }
+    write(root, "proj/.gitignore", b".socket/vendor/maven/\n");
+    let env = ok(root, &["vendor"]);
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    let said = (
+        purl("foo"),
+        "skipped".to_string(),
+        "maven_bazel_hub_unpatched".to_string(),
+    );
+    assert!(events(&env).contains(&said), "{env}");
+    let module = std::fs::read_to_string(proj.join("MODULE.bazel")).unwrap();
+    assert_eq!(module, HUB_MODULE, "{env}");
+    assert!(!proj.join(".socket/vendor/maven").exists(), "{env}");
+}
+
+/// Where vendored mode cannot show that an entry would work, it writes
+/// none, with the code a hosted run gives the same checkout. In a checkout
+/// only Bazel builds that is the failure of the patch, and nothing is
+/// written; beside a Maven build it is a warning
+/// ([`a_bazel_hub_that_builds_a_vendored_jar_adds_one_warning_and_nothing_else`]).
+/// An option about downloads stands against a hosted entry and not against
+/// a jar in the checkout. A jar no hub builds is refused as before.
+#[test]
+fn vendor_declines_for_a_hub_it_cannot_patch() {
+    let checkout = |artifact: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), Shape::Reactor, &[("foo", FOO_UUID)]);
+        only_bazel(tmp.path());
+        pinned_hub(tmp.path(), artifact);
+        tmp
+    };
+    let keeps = "socket-patch wrote nothing to MODULE.bazel for it, so the Bazel build keeps the \
+                 upstream jar";
+    // Nothing says which Bazel builds the checkout.
+    let tmp = checkout("foo");
+    let root = tmp.path();
+    for gone in ["proj/.bazelversion", "proj/MODULE.bazel.lock"] {
+        std::fs::remove_file(root.join(gone)).unwrap();
+    }
+    let before = snapshot(root);
+    let (code, env) = socket(root, &["vendor"]);
+    assert_eq!(code, Some(1), "{env}");
+    let why = format!(
+        "no file of the checkout says that Bazel 7.4.0 or later builds it, and an older \
+         Bazel fails on the `override_repo` an entry needs: name the release in `.bazelversion`. \
+         {keeps}"
+    );
+    let failed = (
+        purl("foo"),
+        "failed".to_string(),
+        "maven_bazel_release".to_string(),
+    );
+    assert_eq!(events(&env), [failed], "{env}");
+    assert_eq!(env["events"][0]["error"], why, "{env}");
+    assert_eq!(env["warnings"], serde_json::Value::Null, "{env}");
+    // A person reads the purl once, before the reason.
+    let out = spawn(root, &["vendor"], false);
+    let line = format!("Error: Cannot vendor {}: {why}\n", purl("foo"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.matches(&line).count(), 1, "{stderr}");
+    assert_eq!(snapshot(root), before);
+
+    // An option that leaves the entry without effect declines, and one
+    // about downloads does not.
+    let tmp = checkout("foo");
+    let root = tmp.path();
+    write(root, "proj/.bazelrc", b"common --ignore_dev_dependency\n");
+    let (code, env) = socket(root, &["vendor"]);
+    assert_eq!(code, Some(1), "{env}");
+    assert_eq!(
+        env["events"][0]["errorCode"], "maven_bazel_no_effect",
+        "{env}"
+    );
+    write(
+        root,
+        "proj/.bazelrc",
+        b"common --repository_disable_download\n",
+    );
+    let env = ok(root, &["vendor"]);
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+
+    // No hub builds the jar: the refusal of a tree without a JVM build.
+    let tmp = checkout("other");
+    assert_refused(tmp.path(), "no_build_file", "no pom.xml");
 }

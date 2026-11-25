@@ -56,6 +56,11 @@ pub(super) struct GcSummary {
     /// reinstall advisories, and `manifest_invalid` / `manifest_unreadable`
     /// when the manifest half could not load the manifest.
     warnings: Vec<(&'static str, String)>,
+    /// The entries of hosted mode's pnpm registry route that no lockfile
+    /// uses any more, taken out (or, in preview mode, to take out) of
+    /// pnpm-workspace.yaml and the pnpm locks. `None` when the project
+    /// holds nothing of a route, so that half did not run.
+    registry: Option<Vec<socket_patch_core::hosted::guidance::RegistryEntry>>,
 }
 
 impl GcSummary {
@@ -98,6 +103,25 @@ impl GcSummary {
         }
     }
 
+    /// Run the registry-route half (see `commands::registry_gc`) when the
+    /// project holds something of a route: from the lockfiles alone, so it
+    /// is safe whatever the crawl found. A wet pass runs under the pass's
+    /// apply lock. `route` is the pass's one answer to whether the project
+    /// holds any.
+    async fn sweep_registry(
+        &mut self,
+        common: &GlobalArgs,
+        preview: bool,
+        route: &mut crate::commands::registry_gc::RouteProbe,
+    ) {
+        if !route.present(common).await {
+            return;
+        }
+        let swept = crate::commands::registry_gc::sweep(common, preview).await;
+        self.warnings.extend(swept.warnings);
+        self.registry = Some(swept.entries);
+    }
+
     /// Fold a vendored-state GC pass into this summary: purl lists sorted,
     /// its failed post-revert rewrites join `warnings`.
     fn absorb_vendor_gc(&mut self, v: VendorGcSummary) {
@@ -126,8 +150,10 @@ impl GcSummary {
     /// entry whose revert failed a `skipped` / `vendor_revert_failed` event
     /// (a GC revert failure never fails the run, so it is not a `failed`
     /// event). The orphan `.socket/vendor/<eco>/<uuid>` dirs swept are
-    /// counted in the top-level `removedVendorOrphanDirs`, and the pass's
-    /// warnings join the top-level `warnings`. A pass that could not run
+    /// counted in the top-level `removedVendorOrphanDirs`, each entry of a
+    /// pnpm registry route the pass took out is an artifact-level `removed`
+    /// (`verified`) event counted in `gc.removedRegistryEntries`, and the
+    /// pass's warnings join the top-level `warnings`. A pass that could not run
     /// (lock held, lock I/O) records only a `gc_skipped` warning and no
     /// `gc`.
     pub(super) fn record_into(&self, env: &mut Envelope, preview: bool) {
@@ -180,11 +206,12 @@ impl GcSummary {
                     .with_details(vendored()),
             );
         }
-        env.set_gc(GcReport::from_passes(
-            Some(&self.blobs),
-            Some(&self.diffs),
-            Some(&self.packages),
-        ));
+        let registry = self.registry.as_deref().unwrap_or_default();
+        crate::commands::registry_gc::record(env, registry, preview);
+        env.set_gc(GcReport {
+            removed_registry_entries: registry.len(),
+            ..GcReport::from_passes(Some(&self.blobs), Some(&self.diffs), Some(&self.packages))
+        });
         env.set_extra(
             "removedVendorOrphanDirs",
             serde_json::json!(self.vendor_orphan_dirs),
@@ -252,17 +279,19 @@ pub(super) async fn run_apply_gc(
     // on and reports it, as the locked read's load error or, when
     // `.socket/` itself is unusable, as the lock failure.
     let has_manifest = manifest_exists(manifest_path).await.unwrap_or(true);
-    if !has_manifest && !has_ledger(common).await {
+    let mut route = crate::commands::registry_gc::RouteProbe::default();
+    if !has_manifest && !has_ledger(common).await && !route.present(common).await {
         return GcSummary::default();
     }
 
-    // One acquire for both halves: flock is per open file description, so
+    // One acquire for every half: flock is per open file description, so
     // a nested acquire in the vendored half would read as a live holder.
     let guard = match lock(common, socket_dir) {
         Ok(g) => g,
         Err(skipped) => return *skipped,
     };
     let mut gc = apply_gc_locked(common, manifest_path, socket_dir, scanned_purls, vendored).await;
+    gc.sweep_registry(common, false, &mut route).await;
     gc.note_commit_recovery(common, &guard);
     gc
 }
@@ -481,10 +510,13 @@ pub(super) async fn run_vendor_only_gc(
     manifest_path: &Path,
     socket_dir: &Path,
 ) -> GcSummary {
+    let mut route = crate::commands::registry_gc::RouteProbe::default();
     if common.dry_run {
-        return GcSummary::vendor_only(run_vendor_gc(common, manifest_path, true).await);
+        let mut gc = GcSummary::vendor_only(run_vendor_gc(common, manifest_path, true).await);
+        gc.sweep_registry(common, true, &mut route).await;
+        return gc;
     }
-    if !has_ledger(common).await {
+    if !has_ledger(common).await && !route.present(common).await {
         return GcSummary::default();
     }
     let guard = match lock(common, socket_dir) {
@@ -492,13 +524,70 @@ pub(super) async fn run_vendor_only_gc(
         Err(skipped) => return *skipped,
     };
     let mut gc = GcSummary::vendor_only(run_vendor_gc(common, manifest_path, false).await);
+    gc.sweep_registry(common, false, &mut route).await;
     gc.note_commit_recovery(common, &guard);
     gc
+}
+
+/// The registry-route half of the GC alone (see `commands::registry_gc`),
+/// for a hosted scan whose crawl found nothing: the hosted rewrite, which
+/// takes the unused entries out on every other run, does not run there.
+/// `None` when the project holds nothing of a route. A wet pass takes the
+/// apply lock like [`run_apply_gc`]; `--dry-run` previews.
+pub(super) async fn run_registry_only_gc(
+    common: &GlobalArgs,
+    socket_dir: &Path,
+    hosted: bool,
+) -> Option<GcSummary> {
+    let mut route = crate::commands::registry_gc::RouteProbe::default();
+    if !route.present(common).await {
+        return None;
+    }
+    let mut gc = GcSummary::default();
+    // A hosted scan writes nothing for a root pnpm lock that a Bazel hub
+    // would fail on a pin in, whatever it was granted: it takes nothing
+    // of a route out there either, and says what it says with a patch.
+    if hosted {
+        let root = common.project_root();
+        let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&root);
+        let hidden = socket_patch_core::hosted::engine::pnpm_root_lock_left_to_bazel(&view);
+        if let Some(hidden) = hidden.await {
+            gc.warnings
+                .push((socket_patch_core::bazel::pnpm::HIDDEN, hidden.detail));
+            return Some(gc);
+        }
+    }
+    if common.dry_run {
+        gc.sweep_registry(common, true, &mut route).await;
+        return Some(gc);
+    }
+    let guard = match lock(common, socket_dir) {
+        Ok(g) => g,
+        Err(skipped) => return Some(*skipped),
+    };
+    gc.sweep_registry(common, false, &mut route).await;
+    gc.note_commit_recovery(common, &guard);
+    Some(gc)
 }
 
 /// Dry-run preview of the apply-mode GC pass. Same summary as
 /// [`run_apply_gc`] (what the pass would remove), with no mutation.
 async fn preview_apply_gc(
+    common: &GlobalArgs,
+    manifest_path: &Path,
+    socket_dir: &Path,
+    scanned_purls: &HashSet<String>,
+    vendored: &HashSet<PurlKey>,
+) -> GcSummary {
+    let mut gc =
+        preview_artifact_gc(common, manifest_path, socket_dir, scanned_purls, vendored).await;
+    let mut route = crate::commands::registry_gc::RouteProbe::default();
+    gc.sweep_registry(common, true, &mut route).await;
+    gc
+}
+
+/// The manifest, artifact and vendored halves of [`preview_apply_gc`].
+async fn preview_artifact_gc(
     common: &GlobalArgs,
     manifest_path: &Path,
     socket_dir: &Path,
@@ -679,6 +768,55 @@ pub(super) fn print_human_gc(gc: &GcSummary, preview: bool) {
     let prefix = if preview { "[dry-run] " } else { "" };
     for line in format_gc_vendored_lines(gc) {
         println!("{prefix}{line}");
+    }
+    print_gc_registry_lines(gc, preview);
+}
+
+/// The registry-route half's lines: the entries taken out (`preview`:
+/// that would be), one each under a headline.
+pub(super) fn print_gc_registry_lines(gc: &GcSummary, preview: bool) {
+    let entries = gc.registry.as_deref().unwrap_or_default();
+    for line in crate::commands::registry_gc::lines(entries, preview) {
+        println!("{line}");
+    }
+}
+
+impl GcSummary {
+    /// The entries of a pnpm registry route the pass took out (or would).
+    pub(super) fn registry_entries(&self) -> &[socket_patch_core::hosted::guidance::RegistryEntry] {
+        self.registry.as_deref().unwrap_or_default()
+    }
+
+    /// The files the registry-route half rewrote or deleted (or would),
+    /// sorted.
+    pub(super) fn registry_files(&self) -> Vec<String> {
+        let files: std::collections::BTreeSet<&str> = self
+            .registry_entries()
+            .iter()
+            .map(|entry| entry.file.as_str())
+            .collect();
+        files.into_iter().map(str::to_string).collect()
+    }
+
+    /// Whether the registry-route half ran (the project held a route).
+    pub(super) fn swept_registry(&self) -> bool {
+        self.registry.is_some()
+    }
+
+    /// The registry-route half's warnings and what kept the pass from
+    /// running, as run warnings: for a caller that records the entries
+    /// itself (a hosted scan, which reports no `.socket/` sweep).
+    pub(super) fn run_warnings(&self) -> Vec<crate::json_envelope::RunWarning> {
+        let skipped = self.skipped.iter().map(|(code, message)| {
+            crate::json_envelope::RunWarning::new(GC_SKIPPED, format!("{message} ({code})"))
+        });
+        skipped
+            .chain(
+                self.warnings
+                    .iter()
+                    .map(|(code, detail)| crate::json_envelope::RunWarning::new(*code, detail)),
+            )
+            .collect()
     }
 }
 

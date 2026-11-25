@@ -232,8 +232,164 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   which pnpm applies through `overrides` without a lock; `vex` attests such a
   vendored pin only while the override map that pnpm reads still routes the
   package to its artifact, and omits it otherwise (`vex_lock_not_read`).
-  For 9.0 root or member locks, the CLI configures `trustLockfile: true` in
-  the root `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
+  pnpm >=11 checks every lock entry that records a tarball URL against a
+  registry, so a hosted pin needs a setting in the root `pnpm-workspace.yaml`.
+  For 9.0 root or member locks the CLI writes one of two, unless opted out
+  with `--no-trust-lockfile-config`.
+  **The registry route.** The patch service answers an npm registry document
+  for each patch, in the directory the patch's tarball is served from. That
+  directory is the patch's registry address: it never changes for the life of
+  the patch and answers for that one package only. When every hosted pin of
+  those locks has such an address (the patch service granted it one in this
+  run, or an earlier run routed the pin and the files still route it), and
+  every pnpm pin of the project (the same sources as the pnpm 9.0–10.4 rule
+  below, at least one present) proves pnpm 11.20 or newer, the CLI declares
+  one named registry per patch and routes each patched release to its own:
+
+  ```yaml
+  namedRegistries:
+    socket-1417d719: https://patch.socket.dev/patch/npm/@a2ui/web_core/0.9.2/<token>/1417d719-…/
+    socket-58f14d5a: https://patch.socket.dev/patch/npm/picomatch/2.3.1/<token>/58f14d5a-…/
+  overrides:
+    '@a2ui/web_core@0.9.2': 'socket-1417d719:0.9.2'
+    'picomatch@2.3.1': 'socket-58f14d5a:2.3.1'
+  ```
+
+  The declaration lets pnpm verify the patched entries against the patch
+  server while it keeps verifying every other entry, so nothing is trusted
+  blindly. The override makes pnpm resolve the package there whenever it
+  resolves again, so `pnpm add`, `pnpm update` and `pnpm dedupe` keep the
+  patched tarball. pnpm writes an overridden release under its own key
+  (`picomatch@socket-58f14d5a:2.3.1`) and records the overrides in the lock,
+  so the CLI rewrites `pnpm-lock.yaml` to exactly that shape; a real pnpm
+  re-locks it without changing a byte. Commit both files.
+
+  A registry is named after its patch: `socket-` and the first eight hex
+  digits of the patch UUID. If two patches of the project start with the same
+  eight digits, or the project already has a registry of its own under that
+  name, the name takes four more digits at a time until it is free.
+
+  When a patch is replaced by a newer one for the same release, the new patch
+  has a new UUID, so its registry has a new name and a new address. The next
+  scan then changes the `namedRegistries` line, the override's value and, in
+  the lock, the `overrides:` record and every key and reference of that
+  release (`picomatch@socket-58f14d5a:2.3.1` becomes
+  `picomatch@socket-<new id>:2.3.1`), along with the tarball and its
+  integrity. Expect that diff, and commit it like any other scan result.
+
+  What is yours stays yours. Your own `namedRegistries` and `overrides`
+  entries are kept byte for byte, including a registry of yours named
+  `socket` or one that happens to have a name of the CLI's shape: a registry
+  is the CLI's only when its name is `socket-` plus the leading digits of a
+  patch UUID and its address is that patch's directory on the patch server.
+  If you override a package the CLI would route (by any selector for that
+  package), your override is left alone and the run uses `trustLockfile`
+  instead, and says so. A package you install from a registry of your own
+  is yours whatever the registry is called: `leaf@socket:1.0.0` from a
+  registry you named `socket` is never taken for npm's `leaf@1.0.0`.
+
+  The route is cleaned up automatically when a patch is no longer needed, so
+  nothing of it is left for you to delete. Cleanup is per patch: a patch's
+  registry, its override and the lock's record of that override go together.
+  They are unused once no lockfile resolves that release through the
+  registry: you removed the dependency, upgraded it past the patched release,
+  the patch was withdrawn or replaced, you ran `remove`, or the project left
+  hosted mode. These commands take unused entries out:
+
+  - `socket-patch scan` in hosted mode, on every run and with no extra flag.
+    It drops the registry and the override of a package that left the lock
+    from the workspace file and the lock together, and restores a withdrawn
+    patch's release to the public registry.
+  - `socket-patch repair`, in its cleanup phase. It reads only
+    `pnpm-workspace.yaml` and the pnpm locks, so it works offline
+    (`repair --offline`) and in CI without a token. It cannot know that a
+    patch was withdrawn; that is the next scan's to restore.
+    `repair --download-only` skips the cleanup.
+    If your patches come from a patch server other than Socket's own, tell
+    this command and `scan --prune` which one with `--patch-server-url`
+    (or `SOCKET_PATCH_SERVER_URL`): they have no patch service answer to
+    recognise it by. Without it they leave that server's registries
+    alone, and say so, naming the host and that setting.
+  - `socket-patch scan --prune` in any other mode or with no `--mode`, in the
+    same pass that prunes `.socket/`.
+  - `rollback`, `remove` and a switch to `--mode vendored`, for the packages
+    they restore: the lock keys, the importer specifiers and the upstream
+    resolution come back, and the package's registry, its override and the
+    lock's record of it go in the same run. Other patches are not touched.
+
+  `--prune` with `--mode hosted` adds nothing to remove: hosted mode keeps no
+  `.socket/` state, which is what the flag sweeps in the other modes (the run
+  says so), and the registry entries already go on every hosted scan. With
+  the flag, `--json` output also counts them in `gc.removedRegistryEntries`.
+
+  Every one of these lists what it removes (one line per entry, or one
+  `registry_entry_unused` event under `--json`), and `--dry-run` lists the
+  same and writes nothing. A registry's address is never printed, because it
+  contains your access token for the patch. The workspace file and the lock
+  always change together, so `pnpm install --frozen-lockfile` keeps passing.
+  With several locks under one workspace file
+  (`sharedWorkspaceLockfile: false`) an entry goes only when none of them
+  uses it. Your own registries and overrides are never touched. A
+  `pnpm-workspace.yaml` the CLI created is deleted, by whichever of these
+  commands takes the last of the route out, once nothing else is in it; a
+  file of yours gets its own bytes back. If a later scan finds that the
+  project no longer qualifies (for example a new patch that has no registry
+  address yet), it converts the project back to `trustLockfile` in the same
+  run rather than leave a lock that is half routed. A scan that is granted
+  only some of the project's patches (a scan of one subtree, a search that
+  lists fewer patches) does not do that: the packages it was not granted stay
+  routed as they are.
+
+  Switching the project to agent mode (`scan --mode agent`) does not undo
+  hosted patches: the lockfile keeps installing them through their
+  registries, so the route stays too, and the run warns
+  `hosted_wiring_retained` with the packages it concerns. To leave hosted
+  mode, run `socket-patch rollback` (or `remove <package>`), or switch with
+  `scan --mode vendored`; each takes the pins and their route out together.
+  Anything left unused afterwards is removed by `repair` or `scan --prune`.
+
+  Two things to know before you rely on the route. While a release is
+  routed, its override holds every dependent whose range admits the patched
+  version at exactly that version, so `pnpm update` does not move the package
+  past it until a later scan finds a patch for the newer release or you run
+  `socket-patch remove <package>`. It also reaches a dependent that is
+  locked on a newer release today: if one package needs `leaf` at exactly
+  the patched `1.0.0` and another asks for `^1.0.0` and is locked on `1.5.0`,
+  the scan routes `1.0.0`, leaves the other on `1.5.0`, and tells you so in
+  a note; the next `pnpm update` or `pnpm dedupe` (and `pnpm add` on pnpm
+  11) then moves that package to the patched `1.0.0` as well. Installs from
+  the committed lock are not affected. And two lock shapes stay on
+  `trustLockfile`, because pnpm 11 and pnpm 12 lock them differently or
+  resolve them around an override: a package installed both with and without
+  the patched release as its peer, and a patched release that is another
+  package's optional peer.
+
+  A `trustLockfile: true` that an earlier run wrote is removed in the run that
+  takes the route, when the file is still exactly what that run wrote (the
+  file it creates, or a comments-only file plus the lines it adds); any other
+  one is left alone, and the warning says the hosted patches no longer need
+  it. A `trustLockfile: false` or a `pnpm_config_trust_lockfile` variable does
+  not matter here. An address is only ever declared as a named registry: it
+  answers for its one patched package and nothing else. Its version document
+  is dated by the upstream release (or undated when that is unknown), so
+  pnpm's default `minimumReleaseAge` does not hold back a new patch. A pin
+  proves pnpm 11.20 when the lowest version it admits is 11.20 or higher
+  (`11.28.13`, `^11.20.0`, `>=12`). Older pnpm 11 releases write a different
+  lock for the same override, and a registry declaration without the override
+  loses patched packages when pnpm resolves again (the measurements are in
+  [pnpm hosted compatibility](testing/pnpm-compatibility.md)).
+  **`trustLockfile: true`.** In every other case the CLI configures
+  `trustLockfile: true`, which switches pnpm's lockfile verification off for
+  the whole lock. When the patch service gave at least one pin a registry
+  address, the warning names what kept the project off the registry route: the
+  packages that have no address (one is enough), pnpm pins that do not prove
+  11.20, a Bazel hub that reads the lock
+  ([Bazel workspaces: npm](#bazel-workspaces-npm)), an override of yours for a
+  patched package, a workspace file or a lock entry the edit cannot follow. A project with no pnpm pin is told that
+  pinning pnpm 11.20 or later (for example with `packageManager`) and
+  re-running the scan switches it to the registry route (not under
+  `--no-trust-lockfile-config`, which writes neither setting). The key goes in
+  the root `pnpm-workspace.yaml` unless
   explicitly disabled by the project or, for pnpm >=11, by a
   `pnpm_config_trust_lockfile=false` environment variable the scan runs with
   (pnpm reads it ahead of the file, so nothing is written and the warning names
@@ -241,9 +397,8 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   `true` or `false` (pnpm 12 trims surrounding spaces first, pnpm 11 does
   not); any other value (empty, `null`, `undefined`, `0`) is ignored for the
   file, so the CLI ignores it too and writes the key.
-  pnpm >=11 needs this for hosted URLs.
   This skips registry re-verification for the whole lock; tarball integrity
-  remains enforced. pnpm <=10 does not need the setting. An existing
+  remains enforced. pnpm <=10 needs neither setting. For both, an existing
   `pnpm-workspace.yaml` with no keys (empty or only comments) gets the
   root-only `packages:` list with the key, because pnpm 8–10.4 refuse a
   workspace file that has keys but no `packages`. When the lock lists
@@ -770,8 +925,9 @@ On pnpm >=11 a repointed lock does not install under Rush's default flow: `rush 
 either fails (`ERR_PNPM_TARBALL_URL_MISMATCH` /
 `ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION`) or, on pnpm 11, exits 0 after silently
 re-resolving the patched entries to the upstream registry. Rush runs pnpm in `common/temp`
-with a `pnpm-workspace.yaml` it generates, so the `trustLockfile` auto-config is not written
-in a Rush repo; the `redirect_pnpm_trust_lockfile` warning gives the Rush remedy instead
+with a `pnpm-workspace.yaml` it generates, so neither the registry route nor
+`trustLockfile` are written in a Rush repo; the `redirect_pnpm_trust_lockfile` warning gives
+the Rush remedy instead
 (verified with Rush 5.180.0):
 
 - pnpm 12: install with `pnpm_config_trust_lockfile=true rush install` (set it in CI too).
@@ -1967,6 +2123,11 @@ classifier jars the tree serves, get a checksum. Refusals use `vendor_jvm_shape_
 vendored jars from the commit; a rule that ignores `.socket/` itself is refused
 (`vendor_artifact_gitignored`) before anything is written.
 
+In a Bazel workspace whose rules_jvm_external hub builds the artifact from a lock, vendored
+mode also commits the jar for that hub, and it is the only thing it does in a checkout that
+has no Maven, Gradle, sbt or scala-cli build: see
+[Bazel workspaces: Maven](#bazel-workspaces-maven).
+
 ### VEX
 
 `vex` re-hashes every copy a build may load: the `~/.m2` copies it reads, every
@@ -2156,7 +2317,7 @@ workspace and that Bazel does not build keeps the matrix at the top.
 | Cargo: rules_rust `crate.from_cargo` over `Cargo.lock` | Supported with `cargo_config` on the hub | Supported | Not supported | Supported with a hosted or vendored patch |
 | NuGet: rules_csharp `nuget.from_lock` over `packages.lock.json` | Supported with `nuget_config` on the tag | Supported with the Bazel release in `.bazelversion` | Not supported | Supported with a vendored patch, or a hosted one and no restored copy on the machine |
 | Composer: a rule of your own that runs `composer install` from `composer.lock` | Supported | Not supported | Not supported | Supported with a hosted patch |
-| Maven: rules_jvm_external `maven.install` with a `lock_file` | Supported with Bazel 7.4.0 or later | Not supported | Not supported | Supported with a hosted patch |
+| Maven: rules_jvm_external `maven.install` with a `lock_file` | Supported with Bazel 7.4.0 or later | Supported with Bazel 7.4.0 or later | Not supported | Supported with a hosted or vendored patch |
 
 These words are the table's own, not the [v5 support tiers](#v5-support-tiers). In
 particular "Not supported" does not mean that the command refuses: in several cells it runs,
@@ -2164,11 +2325,11 @@ exits 0 and leaves a build that fails (the known problems below). What a cell sa
 
 - **Supported**, for hosted and vendored mode: after the one command of the mode
   (`scan --mode hosted` or `scan --mode vendored`; for Maven
-  `get <purl> --mode hosted` at the Bazel root), the next `bazel build` takes the patched
-  package with no other step, and the undo (`rollback`, `vendor --revert`) brings the
-  upstream build back. The one exception is a build that may not update Bazel's own lock
-  (see below). A test builds exactly that on a real Bazel, for the shape the list below
-  names.
+  `get <purl> --mode hosted` or `get <purl> --mode vendored` at the Bazel root), the next
+  `bazel build` takes the patched package with no other step, and the undo (`rollback`,
+  `vendor --revert`) brings the upstream build back. The one exception is a build that may
+  not update Bazel's own lock (see below). A test builds exactly that on a real Bazel, for
+  the shape the list below names.
 - **Not supported**: socket-patch promises nothing about what a Bazel build holds after the
   mode ran, so do not use it for a package that Bazel builds. In most of these cells the
   patch does not reach the build, or the build breaks (see the known problems below).
@@ -2178,9 +2339,9 @@ exits 0 and leaves a build that fails (the known problems below). What a cell sa
   is one of the limits.
 - **Supported with a condition**, for VEX: under the condition the cell names, the document
   says `not_affected` of a package the Bazel build takes patched, and a test holds it to
-  that (for Maven a test without Bazel). It does not say `affected` of a package whose patch
-  is in no build of Bazel's, one that is only in an installed copy, say: of that package it
-  still says `not_affected`. Do not publish that document. For Maven,
+  that (for a hosted Maven patch a test without Bazel). It does not say `affected` of a
+  package whose patch is in no build of Bazel's, one that is only in an installed copy, say:
+  of that package it still says `not_affected`. Do not publish that document. For Maven,
   [Bazel workspaces: Maven](#bazel-workspaces-maven) says what `vex` checks of the hub before
   it attests an entry.
 
@@ -2239,7 +2400,10 @@ What the table was tested with:
   its `vendor/` tree for Bazel to read is not one of the two.
 - **Maven**: rules_jvm_external 7.2 (Bazel 9), 6.9 (Bazel 8) and 6.5 (Bazel 7), a hub with a
   `lock_file`. [Bazel workspaces: Maven](#bazel-workspaces-maven) says what the command
-  writes and when it declines; `scan` does not find a hub's artifacts yet.
+  writes and when it declines; a hosted `scan` at the Bazel root finds a hub's artifacts, a
+  vendored one does not. Vendored mode keeps the committed jar out of Bazel's packages with
+  [`.bazelignore`](#bazel-workspaces-bazelignore). Bazel checks no digest of that jar when
+  it builds: `socket-patch vendor --check` does, so run it in CI.
 
 A ruleset, a release of one or a way of calling it that the list does not name is not tested.
 Treat it as not supported until a build after the command has shown you the patched package.
@@ -2392,6 +2556,49 @@ npm.npm_translate_lock(
 Run the command again after that: it pins the lock, and the next build takes the patched
 package. rules_js asks for this `data` itself (`docs/pnpm.md`, "update_pnpm_lock").
 
+**No named registries for a lock that a hub reads.** For pnpm 11.20 and later hosted mode
+can route a patched release through a named registry of `pnpm-workspace.yaml` in place of
+`trustLockfile` (see pnpm above). It never does for a lock that a rules_js hub reads: one
+that an `npm.npm_translate_lock` names in a plain string, the root lock or a member's own,
+or a call whose `pnpm_lock` is not written out, whatever else the call says. In a Bazel
+workspace it takes the route only where it is certain that no hub reads the lock, so what
+the reader could not see counts as a hub that may: a file that `MODULE.bazel` includes and
+that is missing or unreadable, a use of the extension that is not a plain call of a tag,
+and a `WORKSPACE` file that cannot be read or that brings in rules_js (a `load` from
+`@aspect_rules_js`, a `load` of `npm_translate_lock`, or a call of that rule), whose
+repositories are not looked through. A `WORKSPACE` file that is about something else
+blocks nothing. Unlike the answer above, which passes over what it cannot see so that no
+project loses a patch, declining the route costs nothing: the project gets the same pin as
+before, and the warning names what was not read ("… because a Bazel hub may read the pnpm
+lock (WORKSPACE:3: it brings in rules_js, …) …"). The lock
+reader of rules_js is not the reason: it takes a routed lock (measured on macOS: rules_js
+3.6.0 on Bazel 9.3.2 builds one for a hub without `update_pnpm_lock`, and the packages it
+builds hold the patched bytes; rules_js 2.9.3 on Bazel 8.8.2 does too). The pnpm that a
+hub runs with `update_pnpm_lock` is. It sees `pnpm-workspace.yaml` only where the call
+lists it, and it may be older than pnpm 11.20: rules_js picks a pnpm 10 where the
+workspace states none. Run as the hub runs it (`pnpm install --lockfile-only` beside the
+lock and `package.json`, without the workspace file), pnpm 11.28.13 and 12.22.0 reject a
+routed lock (`ERR_PNPM_MISSING_NAMED_REGISTRY`, measured). No Bazel test leg builds a
+routed lock with `update_pnpm_lock` yet, so for now every such project is pinned exactly
+as it is on a patch service that offers no registry, which is the pin the Bazel legs
+build, and the `redirect_pnpm_trust_lockfile` warning names the call ("… because a Bazel
+hub reads the pnpm lock (MODULE.bazel:7), and a lock that a hub reads is not routed
+yet …"). For a project below the Bazel root it says, as the warning above does, that its
+paths are from that root. A project that was routed before the
+hub was there leaves the route on its next scan, the lock and the workspace file together.
+Where hosted mode writes nothing for the root lock (the hub above), a route of an earlier
+run is left exactly as it is, in the workspace file and in every lock, and a
+`pnpm-workspace.yaml` that holds nothing but such a route counts as a file that holds only
+what hosted mode writes. That holds for every hosted scan, whatever it was granted: one
+with a patch for a package of the lock, one with none and one that crawled nothing all
+leave the files and give the same warning. `repair`, `scan --prune` with no mode,
+`rollback` and `remove` settle a route from the lockfiles alone and work as without Bazel.
+They read no Bazel file, for this route as for any other hosted pin: under a hub whose
+`data` lists a `pnpm-workspace.yaml` that a routed scan created, they still delete that
+file with the last of the route, and the build is then handed a missing file. Put a
+comment line in the file first, as the warning of a hosted scan says; a hosted scan itself
+never deletes the file under a hub that reads, or may read, the lock.
+
 The file the hub lists has to be one that a pin and its undo leave standing, so hosted mode
 also writes nothing for a hub that lists it in two cases, and the warning then names what
 the file needs and no label:
@@ -2451,9 +2658,12 @@ build fails as above. Not read either is a `trustLockfile` that reaches the pnpm
 build another way (`pnpm_config_trust_lockfile` in Bazel's environment): hosted mode
 withholds there as well. Not read either: a hub that names the lock of a workspace member
 (`pnpm_lock = "//packages/a:pnpm-lock.yaml"`), which is pinned as without Bazel. The
-in-memory engine reads the `MODULE.bazel` beside the lock and gives the answer of a checkout
-with the same files; it sees no file that one includes, no Bazel root above the project and
-no `MODULE.bazel.lock`, and a `pnpm_version_from` file that is not among the project's own
+in-memory engine reads the Bazel files beside the lock or beside a `pnpm-workspace.yaml`
+(`MODULE.bazel`, the `*.MODULE.bazel` files it can include and the `WORKSPACE` files) and
+gives the answer of a checkout with the same files; it sees no Bazel root above the
+project, for the pin and for the route through a named registry alike (a project in a
+directory of a Bazel workspace is routed in memory where a checkout is not), and no
+`MODULE.bazel.lock`, and a `pnpm_version_from` file that is not among the project's own
 manifests reads there as a release that is not written out, so a lock that a checkout pins
 can be left as it is in memory. Nor does hosted mode look at `--no-trust-lockfile-config`
 when it decides this: see the known problems of
@@ -2530,6 +2740,94 @@ to the `)` of its `override_repo`, and the entries stand in the order of their r
   and `list` refuse (`hosted_wiring_contested`) and name `git checkout -- MODULE.bazel`. A
   block is socket-patch's when it is, byte for byte, what socket-patch writes for the patches
   it names, in one kind of line break.
+
+Vendored mode patches a pinned hub through the same block, with the jar in the checkout.
+`socket-patch get <purl> --mode vendored`, `scan --mode vendored` and `vendor`, run at the Bazel
+root, download the patched jar once, from Socket's patch service, and write:
+
+```
+.socket/vendor/maven/<patch uuid>/REPO.bazel          # makes the directory a Bazel repository
+.socket/vendor/maven/<patch uuid>/file/BUILD.bazel    # one public filegroup named `file`
+.socket/vendor/maven/<patch uuid>/file/<artifact>-<version>.jar
+.socket/vendor/maven/<patch uuid>/.gitignore          # `!*`: a `*.jar` rule must not drop the jar
+```
+
+and, in the block, an entry whose repository is that directory:
+
+```starlark
+socket_patch_local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
+
+# pkg:maven/<group>/<artifact>@<version>, Socket patch <uuid>
+socket_patch_local_repository(
+    name = "socket_patch_<repository>",
+    path = ".socket/vendor/maven/<uuid>",
+)
+```
+
+with the same comment and `override_repo` as a hosted entry. The hub takes the jar of a
+repository by its target `//file`, which is what the BUILD file gives it. Bazel's
+`local_repository` (in `@bazel_tools` at 7.4.0, 7.7.2, 8.8.2 and 9.3.2) links to the directory
+where it is, by its path from the workspace root: nothing is downloaded or copied, the
+repository cache holds no copy of the jar, and a checkout builds patched with no host to ask.
+
+- **What changes.** `MODULE.bazel`, the directory, one line of `.bazelignore` (below) and the
+  vendor ledger, `.socket/vendor/state.json`. Commit all of it. `MODULE.bazel.lock` and
+  `maven_install.json` stay as they are, as in hosted mode. No token is written anywhere.
+- **`.bazelignore`.** A BUILD file under `.socket` is a package of the workspace (`bazel query
+  //...` lists `//.socket/vendor/maven/<uuid>/file:file`), so the command names
+  `.socket/vendor/maven` in the root's `.bazelignore`, under a comment line of its own, by the
+  rules of [Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore). The build is the
+  same with the line and without it.
+- **Nothing checks the jar at build time.** An `http_file` checks a sha256; a repository over a
+  directory has none to check, and Bazel builds whatever jar is committed there. The check is
+  `socket-patch vendor --check`. It fails when the jar that Bazel builds is not, byte for byte,
+  the vendored jar whose sha256 the ledger records; when `REPO.bazel` or `file/BUILD.bazel` is
+  not the file socket-patch wrote; when the block no longer names the directory, or was changed
+  by hand; and when the entry is one a build stops at or may pass without (no pinned hub takes
+  the jar at that version any more, for which it names `socket-patch rollback <purl>`, or an
+  rc file switches the entry off). Run it in CI. `socket-patch vex` hashes the same jar before
+  it attests the patch. A later `vendor` takes the committed jar as it is only when the ledger
+  records its bytes: any other jar at that path, also one that carries the patch's files, is
+  replaced by the patch's own. `socket-patch repair` puts back a jar that is lost or changed,
+  and with it the other files of a directory that was lost whole.
+- **One entry per jar.** A vendored run puts its entry in the place of a hosted one for the
+  same jar, and a hosted run in the place of a vendored one. The hosted run removes what
+  vendored mode kept for the hub: the directory, its `.bazelignore` line and, for a patch that
+  only the hub took, the ledger entry. Neither leaves both. Beside a Maven build the vendored
+  tree of that build stays through a hosted run, as it does without the workspace. The entry
+  of a later patch of the jar takes the place of the earlier one in the same way: the run
+  that writes it removes each directory under `.socket/vendor/maven` that `MODULE.bazel` no
+  longer names and no ledger entry records (`cleanup_failed` when it cannot).
+- **A project that Maven or Gradle builds too.** That build is vendored exactly as without the
+  workspace (the suffixed tree under `.socket/vendor/maven2`, the pom pin, and so on), and the
+  hub gets a copy of the same jar in its own directory. The ledger entry is the Maven or
+  Gradle one, and the hub's copy is that entry's jar byte for byte: `vendor --check` holds the
+  copy to the same sha256, and the entry of the block to the rules above. A later `vendor`
+  that finds the copy missing or changed, or the entry gone, writes them again and says so
+  (`vendor_artifact_rebuilt`). The hub's directory has to survive the commit like the tree
+  beside it: where a rule of the checkout makes git ignore it, the run writes nothing for
+  the hub and warns `maven_bazel_hub_unpatched` with that rule.
+- **The undo.** `vendor --revert`, `rollback` and `remove` take the entry out, then the
+  directory, and the `.bazelignore` line goes with the last directory: every file is the one of
+  before, byte for byte, but for a `.bazelignore` that was an empty file of yours, which is
+  deleted with the last line, as for the Go lines. A `MODULE.bazel` that names the directory
+  outside an entry of the block (a block changed by hand) fails the undo before anything is
+  removed, because Bazel stops at a `local_repository` whose directory is gone.
+  Beside a Maven or Gradle build the undo writes that build's files and `MODULE.bazel`
+  together: one that cannot be written fails the undo with every file as it was, and the
+  vendored tree, the hub's directory and the ledger entry go only after all of them are
+  written. A run that is killed between two of those files has removed nothing and leaves
+  `.socket/vendor/.commit-journal.json`: the next socket-patch command in the project
+  finishes the files from it, and the undo run again removes the rest.
+- **Where no entry can be written**, the reasons and codes are those of hosted mode below,
+  but for `maven_bazel_download`: the jar is in the checkout, so an option about downloads
+  does not stand against it. In a tree only Bazel builds the patch then fails with that code
+  (exit 1, as a vendored refusal does) and nothing is written; beside a Maven or Gradle build
+  that was vendored, it is a warning with that code and the patch is `applied`. A `vendor`
+  over a hosted entry it would not replace is refused whole, before it asks any service, and
+  the entry stays (`kept hosted: ...`). `--allow-vendored-in-bazel` does not lift these
+  declines: they say that no entry could be shown to work, and there is nothing else to
+  write for a hub.
 
 Everything is read from the checkout: the root `MODULE.bazel` and the files it includes, for
 the tags of the `maven` extension of `rules_jvm_external` under whatever name the file gives
@@ -2642,13 +2940,18 @@ project below the root, whose warning names the file as "the MODULE.bazel at the
 | `maven_bazel_release` | The Bazel or the ruleset release is not known to be one the block works with. Bazel: `.bazeliskrc` or `.bazelversion` names a release before 7.4.0, or neither names a release of three numbers and `MODULE.bazel.lock` is missing or older than the format Bazel 7.5.0 writes (add a `.bazelversion`). Ruleset: `MODULE.bazel.lock` does not hold the `source.json` of exactly one rules_jvm_external release (build once), that release is not one of 6.4 to 7.2 (update socket-patch), or the lock holds another release than `MODULE.bazel` now takes: an older one than its `bazel_dep` asks for, or any other than the one a `single_version_override` of the ruleset pins (build once). Versions are compared as Bazel compares them (`7.2` is below `7.2.1`). The `bazel_dep` line alone is not taken: Bazel can select a newer release, and a `single_version_override` with a version that the lock agrees with can pin an older one. An `archive_override`, `git_override`, `local_path_override` or `multiple_version_override` of the ruleset, and a `single_version_override` whose version is no plain string, leave the release unknown: the warning names the override's line. |
 | `maven_bazel_artifact` | The repository of this jar has no known name (a character other than letters, digits, `.`, `_` and `-` in its group, artifact or version), the lock lists no repository for the jar (it comes from the Maven local repository under `m2local`), or the patch comes without its served version or a sha256. |
 | `maven_bazel_no_effect` | The build would pass on the upstream jar with the block in place: the root has a `maven.override` for the artifact, or an rc file of the checkout names `--ignore_dev_dependency` without switching it off, or names `enable_bzlmod` other than switched on (`--noenable_bzlmod`, `--enable_bzlmod=false`, and Bazel's other words for it: `0`, `no`, `f`, `n`, in any case) while the checkout names no Bazel 9 or later. |
-| `maven_bazel_download` | An rc file of the checkout names a downloader config, `--repository_disable_download` or `--vendor_dir`: Bazel may not be able to download the patched jar. |
+| `maven_bazel_download` | Hosted mode only. An rc file of the checkout names a downloader config, `--repository_disable_download` or `--vendor_dir`: Bazel may not be able to download the patched jar. Vendored mode keeps the jar in the checkout. |
 
-Vendored and agent mode patch no hub, and leave the block as it is. A vendored run that takes
-the hosted pin of a `pom.xml` or Gradle build over (`vendor`, `scan` / `get --mode vendored`),
-and `vendor --revert`, keep the hub's entry: the Bazel build stays on the patched jar until
-`rollback` or `remove` takes the entry out. A `vendor` or an `apply` that has a Maven patch
-(also `get` and `scan` in those modes) reads the same files and says when a hub builds the
+A vendored run that writes no entry for a jar a hub builds leaves the block as it is: a hosted
+entry that is there stays, and the Bazel build keeps the patched jar. Beside a Maven or Gradle
+build it warns, once per artifact, with the code and the reason of the table, or with
+`maven_bazel_hub_unpatched` when it could have written the entry and vendored nothing for the
+package (the Maven or Gradle build failed first). It also warns `maven_bazel_no_effect` for
+an entry that is there and that the checkout leaves without effect: the Bazel build takes the
+upstream jar past it. A dry run warns of the declines alone.
+
+Agent mode patches no hub, and leaves the block as it is. An `apply` that has a Maven patch
+(also `get` and `scan` in agent mode) reads the same files and says when a hub builds the
 artifact:
 
 - `maven_bazel_hub_unpatched`: a pinned hub fetches the jar of the artifact at the patch's
@@ -2673,14 +2976,30 @@ read, the `WORKSPACE` file counts as one Bazel may read, and the Bazel release i
 Limits:
 
 - Not patched: a hub without a lock, a `maven_install` of a `WORKSPACE` file, Bazel before
-  7.4.0, rules_jvm_external before 6.4 or after 7.2, and a hub in vendored or agent mode. Each
-  is said as above.
+  7.4.0, rules_jvm_external before 6.4 or after 7.2, and a hub in agent mode. Each is said as
+  above.
+- Vendored mode, beside a Maven or Gradle build: the hub gets its jar only in a run that
+  vendored the patch for that build. An artifact that the build does not use at the patch's
+  version (`vendor_maven_version_not_selected`) and the hub does is skipped as before; hosted
+  mode patches that hub. A `vendor` there does not eject a hosted pin that only the block
+  wires: the entry stays hosted, unless the same run vendors that patch for the Maven or
+  Gradle build (a patch of the manifest, or a pin that the build's own files hold too). The
+  hub's entry is then the vendored one, and `vendor --revert` takes it out. And
+  `socket-patch vex` hashes the jar of the Maven or Gradle tree, as before, not the hub's copy
+  of it, which `vendor --check` holds to the same bytes.
 - Not looked at: a patch of a jar with a classifier, or of another packaging than `jar`. A lock
   names the plain jar by group and artifact alone, so such a patch gets no entry and no word
   about the hub: the run is the one without the workspace.
-- A stale entry is taken out by a hosted `scan` at the Bazel root, by `rollback` and by
-  `remove`. `get <purl> --mode hosted` pins the purl it is given and leaves a stale entry of
-  another release where it is, so the build still stops there until one of those three ran.
+- A hosted `scan` at the Bazel root finds the artifacts of the pinned hubs and takes a stale
+  entry of hosted mode out; `rollback` and `remove` take out a stale entry of either mode.
+  `get <purl> --mode hosted` pins the purl it is given and leaves a stale entry of another
+  release where it is, so the build still stops there until one of those three ran.
+- A vendored `scan` does not look for the artifacts of a hub: it vendors a hub's jar when the
+  package is one it found elsewhere (a `pom.xml`, a Gradle build). `get <purl> --mode vendored`
+  takes any purl, and `vendor` takes the patches of a manifest and, in a checkout that only
+  Bazel builds, the hosted patches of the block: there a hosted `scan` and then `vendor`
+  vendor what the hubs build. No scan takes a stale entry of vendored mode out: `vendor
+  --check` names it, and `rollback` or `remove` take it out with its directory.
 - The in-memory hosted engine (GitHub App) reads no hub and writes no block.
 - Not seen: a hub or a `maven.override` that another Bazel module declares (its hub takes the
   root's entry where it pins the same version, so an entry that is stale for the root's hubs
@@ -2695,10 +3014,10 @@ Limits:
   `.bazelversion`.
 - A scanner that reads only `maven_install.json` keeps reporting the advisory: the lock names
   the upstream version on purpose. The patch shows in `MODULE.bazel` and in `socket-patch vex`.
-- A vendored or agent `get` that fails before it patches anything says what it said before: in
-  a tree that only Bazel builds those are `vendor_jvm_shape_unsupported` and
-  `package_not_installed`. So does a `vendor` that is refused before it vendors anything (a
-  ledger that cannot be read, or one that git ignores).
+- An agent `get` that fails before it patches anything says what it said before: in a tree
+  that only Bazel builds that is `package_not_installed`. A vendored `get` of a jar that no hub
+  builds there fails with `vendor_jvm_shape_unsupported`, as before. So does a `vendor` that is
+  refused before it vendors anything (a ledger that cannot be read, or one that git ignores).
 - `socket-patch vex` looks at the hub only for the block's entries: a patch that only the
   `pom.xml` pin or a patched jar attests is attested, although the Bazel build does not have it.
 
@@ -3307,6 +3626,15 @@ When the file cannot be written (a symbolic link or a directory in its place, a 
 directory, a read-only file, which is neither replaced nor deleted), the command still succeeds
 and warns `bazelignore_not_updated` with the line to add, or, for a copy that is gone, that its
 two lines can be deleted.
+
+The same commands keep one more pair by the same rules, for Maven: while
+`<project>/.socket/vendor/maven` exists, which holds the jars vendored mode commits for a
+rules_jvm_external hub ([Bazel workspaces: Maven](#bazel-workspaces-maven)), the file names it
+under the comment line
+`# socket-patch: patched Maven jars for a Bazel hub, not Bazel packages (to opt out, comment out the next line)`.
+A command whose `--ecosystems` leaves `maven` out adds no such line. The opt-out, the removal
+and the warning are as above; a command that changed the file for it says `Updated <path>` or
+`Removed <path>` with what the line is for.
 
 Side effects and limits:
 

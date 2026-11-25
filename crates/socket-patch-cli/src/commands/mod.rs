@@ -12,6 +12,7 @@ pub(crate) mod lock_cli;
 pub(crate) mod measured;
 pub(crate) mod projects_below;
 pub(crate) mod pypi_reinstall;
+pub(crate) mod registry_gc;
 pub mod remove;
 pub mod repair;
 pub mod report;
@@ -55,13 +56,14 @@ pub(crate) fn project_state_in_scope(common: &crate::args::GlobalArgs) -> bool {
 }
 
 /// In a Bazel workspace the root's `.bazelignore` names the directories of
-/// the project's patched Go module copies, and of the vendored crates a
-/// crate hub builds, so that Bazel and gazelle read no package there
+/// the project's patched Go module copies, of the vendored crates a crate
+/// hub builds, and of the patched Maven jars that vendored mode keeps for a
+/// rules_jvm_external hub, so that Bazel and gazelle read no package there
 /// (`socket_patch_core::bazel::ignore`). A command that can write or
 /// remove such a copy calls this once, after the last step that can change
 /// a copy or take one back and before it gives up its apply lock. Nothing
 /// is done in a dry run or a `--global` run, and a run whose `--ecosystems`
-/// leaves `golang` or `cargo` out only takes away that ecosystem's pair of
+/// leaves `golang`, `cargo` or `maven` out only takes away that ecosystem's pair of
 /// a copy that is gone. So does the prune pass of a scan, which comes here
 /// after its scan has (`adds` false) and can only have removed a copy: a
 /// file it cannot write is left to the next command's warning.
@@ -73,7 +75,7 @@ pub(crate) async fn sync_bazelignore(
     adds: bool,
 ) -> Vec<crate::json_envelope::RunWarning> {
     use socket_patch_core::bazel::ignore;
-    use socket_patch_core::crawlers::Ecosystem::{Cargo, Golang};
+    use socket_patch_core::crawlers::Ecosystem::{Cargo, Golang, Maven};
     let mut warnings = Vec::new();
     if common.dry_run || common.is_global() {
         return warnings;
@@ -85,9 +87,10 @@ pub(crate) async fn sync_bazelignore(
         projects.push(common.project_root());
     }
     let (loud, mut told) = (!common.json && !common.silent, Vec::new());
-    let [go, cargo] = [Golang, Cargo].map(|eco| adds && common.ecosystem_selected(eco));
+    let [go, cargo, maven] =
+        [Golang, Cargo, Maven].map(|eco| adds && common.ecosystem_selected(eco));
     for project in projects {
-        match ignore::sync(&project, go, cargo).await {
+        match ignore::sync(&project, go, cargo, maven).await {
             Ok(Some((file, copies))) if loud => {
                 // A root that both projects are under is named once for
                 // each kind of copy whose lines changed there.
@@ -134,24 +137,31 @@ pub(crate) async fn sync_bazelignore(
 ///
 /// With `tell`, a human run is told here, as [`sync_bazelignore`] tells
 /// it. A command that prints the warnings of its run itself passes
-/// `false`.
+/// `false`. A `vendored` run patches a pinned hub itself: it is warned of
+/// the jars it wrote no entry for, each with the reason.
 pub(crate) async fn bazel_maven_notices<'a>(
     common: &crate::args::GlobalArgs,
     purls: impl Iterator<Item = &'a str>,
     tell: bool,
+    vendored: bool,
 ) -> Vec<crate::json_envelope::RunWarning> {
     if common.is_global() {
         return Vec::new();
     }
     let purls = purls.map(str::to_string).collect();
-    let said = socket_patch_core::bazel::maven::notices(&common.cwd, purls).await;
+    use socket_patch_core::bazel::maven::{notices, HUB_UNPATCHED};
+    let said = notices(&common.cwd, purls, vendored).await;
+    // A vendored dry run wrote no entry for any jar: the ones it would
+    // write are not unpatched.
+    let would_write = |code: &str| vendored && common.dry_run && code == HUB_UNPATCHED;
+    let said = said.into_iter().filter(|(code, _)| !would_write(code));
     let warning = |(code, detail): (&str, String)| {
         if tell && !common.json && !common.silent {
             eprintln!("Warning: {detail}");
         }
         crate::json_envelope::RunWarning::new(code, detail)
     };
-    said.into_iter().map(warning).collect()
+    said.map(warning).collect()
 }
 
 /// The vendor-ledger keys (`ledger`, the project's

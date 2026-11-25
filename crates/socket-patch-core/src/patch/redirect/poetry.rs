@@ -261,6 +261,7 @@ mod equivalence_tests {
             token: String::new(),
             patch_uuid: format!("00000000-0000-4000-8000-{uuid:012}"),
             artifact_url: format!("https://patch.socket.dev/patch/pypi/{name}/{uuid}/{wheel}"),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha256: sha256.map(str::to_string),

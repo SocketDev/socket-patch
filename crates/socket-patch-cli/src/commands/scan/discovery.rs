@@ -129,8 +129,9 @@ pub(crate) async fn lockfile_supplement(
 /// workspace fetch when `--cwd` is its root, what was not read of its hubs
 /// and the entries of its block that are stale
 /// ([`socket_patch_core::bazel::maven::hub_jars`]). Only for a hosted run
-/// with Maven in scope: no other mode patches a hub. The callers are runs
-/// of a project, never of the global installs.
+/// with Maven in scope: a vendored scan does not look for a hub's jars,
+/// and patches the hub of a package it found elsewhere. The callers are
+/// runs of a project, never of the global installs.
 pub(crate) async fn hub_jars(common: &GlobalArgs, hosted: bool) -> HubJars {
     if !hosted || !common.ecosystem_selected(Ecosystem::Maven) {
         return HubJars::default();
