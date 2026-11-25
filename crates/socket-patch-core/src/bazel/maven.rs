@@ -54,7 +54,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::rc::Rc;
 
-use super::rc::{declared_release, mentions, ModuleLock};
+use super::rc::{declared_release, mentions, reads_workspace_file, ModuleLock};
 use super::starlark::{Bound, Call, How, Value};
 use super::workspace::{disk, disk_up_to, Doubt, Entry, Extension, Repo, Tag, Workspace};
 use crate::formats::maven::is_variant;
@@ -510,8 +510,9 @@ pub struct Hubs {
     /// or about the `WORKSPACE` file that is not read while Bazel may read
     /// it.
     unread: Option<Doubt>,
-    /// Whether a `WORKSPACE` file of the root defines anything
-    /// ([`Workspace::legacy`]), which is what a Bazel before 7.0 builds.
+    /// Whether a `WORKSPACE` file that the Bazel of the checkout may read
+    /// ([`reads_workspace_file`]) defines anything ([`Workspace::legacy`]),
+    /// which is what a Bazel before 7.0 builds.
     legacy: bool,
 }
 
@@ -626,9 +627,12 @@ impl Hubs {
             .files
             .iter()
             .any(|(_, file)| file.calls.iter().any(names));
-        let (calls, defined) = (matches!(ws.legacy, Some(Ok(_))), ws.legacy.is_some());
-        let before_9 = || declared_release(view).is_none_or(|release| release < (9, 0, 0));
-        let legacy = match ws.legacy.filter(|_| before_9()) {
+        let calls = matches!(ws.legacy, Some(Ok(_)));
+        // The file as the Bazel of the checkout may read it: one rule for
+        // the doubt about a `maven_install` and for [`Hubs::legacy`].
+        let read = ws.legacy.filter(|_| reads_workspace_file(view));
+        let defined = read.is_some();
+        let legacy = match read {
             Some(Ok((file, read))) => {
                 // By its own name, or by one that a `load` gives it.
                 let symbol = Value::Str("maven_install".to_string());
