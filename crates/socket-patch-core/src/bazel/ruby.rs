@@ -86,9 +86,12 @@ pub type Held = (String, Option<BTreeMap<String, String>>);
 
 /// Whether the reader asks for the file `path` of a workspace, by its path
 /// from the Bazel root: `MODULE.bazel`, a file that one can include, and
-/// the names of the `WORKSPACE` file.
+/// the names of the `WORKSPACE` file. For a user who switched the Bazel
+/// support off ([`super::off`]) it asks for none: the in-memory path
+/// selection, which goes by this, then asks its host for no Bazel file.
 pub fn is_workspace_file(path: &str) -> bool {
-    path == "MODULE.bazel" || path.ends_with(".MODULE.bazel") || LEGACY.contains(&path)
+    let named = path == "MODULE.bazel" || path.ends_with(".MODULE.bazel");
+    (named || LEGACY.contains(&path)) && !super::off()
 }
 
 /// Whether `call` reads the lock at `lock`, a path from the Bazel root.
