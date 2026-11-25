@@ -2320,6 +2320,73 @@ async fn refresh_replaces_a_stale_project_install_and_its_archives() {
     );
 }
 
+/// #2242: what the `rm -f <gemspec> <archive> && bundle install` remedy
+/// left in the tree of an earlier Ruby (`vendor/bundle/ruby/3.2.0` beside
+/// the `ruby/3.3.0` the project now installs into): the unpatched gem dir,
+/// with no gemspec and no archive. `bundle install` never replaces it, and
+/// a re-scan cannot refresh it. The scan's remedy is then the directory
+/// itself, and following it leaves nothing to warn about.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gem_dir_left_without_its_gemspec_is_named_as_the_thing_to_remove() {
+    let server = MockServer::start().await;
+    let patched = real_gem(PATCHED_LIB);
+    mount_api_for(&server, None, &sha256_of(&patched)).await;
+    serve_patched_gem(&server, patched.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_manifest_pair(&proj);
+    // The running Ruby's tree holds the patched gem already.
+    let home = project_home(&proj);
+    let current = install_real_gem(&home, PATCHED_LIB);
+    // The earlier Ruby's tree, after the old remedy.
+    let old_home = home.with_file_name("3.2.0");
+    let leftover = install_real_gem(&old_home, UPSTREAM_LIB);
+    let leaf = format!("{DEP}-{DEP_VERSION}");
+    std::fs::remove_file(
+        old_home
+            .join("specifications")
+            .join(format!("{leaf}.gemspec")),
+    )
+    .unwrap();
+    std::fs::remove_file(old_home.join("cache").join(format!("{leaf}.gem"))).unwrap();
+
+    let uri = server.uri();
+    let args = scan_args(&proj, &uri, &[]);
+    let (code, _, stderr) = common::run_with_env(&proj, &args, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    let command = format!("Run `rm -rf {} && bundle install`", shell_word(&leftover));
+    assert!(stderr.contains(&command), "{stderr}");
+    assert!(
+        !stderr.contains("Re-run `socket-patch scan`") && !stderr.contains("rm -f "),
+        "no retry that fails the same way, no file that is not there:\n{stderr}"
+    );
+    assert_eq!(installed_lib(&leftover), UPSTREAM_LIB, "left as it was");
+
+    let args = scan_args(&proj, &uri, &["--json"]);
+    let (code, stdout, stderr) = common::run_with_env(&proj, &args, &[]);
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    let stale = stale_warnings(&env);
+    assert_eq!(stale.len(), 1, "{env}");
+    assert!(
+        stale[0].contains(&format!(
+            "Remove {} and run `bundle install`",
+            leftover.display()
+        )),
+        "{stale:?}"
+    );
+
+    // The remedy's `rm -rf` (its `bundle install` has nothing to install:
+    // the running Ruby's tree is complete).
+    std::fs::remove_dir_all(&leftover).unwrap();
+    let args = scan_args(&proj, &uri, &[]);
+    let (code, _, stderr) = common::run_with_env(&proj, &args, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(!stderr.contains("still unpatched"), "{stderr}");
+    assert_eq!(installed_lib(&current), PATCHED_LIB);
+}
+
 /// #2219: the machine that did not run the scan. A teammate pulls the
 /// hosted `Gemfile` / `Gemfile.lock` onto a checkout whose gems are already
 /// installed (or CI restores a `vendor/bundle` cache): Bundler keeps the
