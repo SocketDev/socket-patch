@@ -206,3 +206,272 @@ fn directory_manifest_verdict_does_not_depend_on_spelling() {
         );
     }
 }
+
+// ── a target the unreadable vendor ledger may hold ──────────────────────
+
+/// A vendor ledger a merge left conflict markers in: both branches
+/// vendored a package, and git could not join the two entries.
+const CONFLICTED_LEDGER: &str = r#"{
+  "version": 2,
+  "entries": {
+<<<<<<< HEAD
+    "pkg:npm/x@1.0.0": {
+=======
+    "pkg:npm/y@2.0.0": {
+>>>>>>> vendor-y
+      "ecosystem": "npm"
+    }
+  }
+}
+"#;
+
+/// A readable ledger holding one entry, of another package.
+const OTHER_LEDGER: &str = r#"{
+  "version": 1,
+  "entries": {
+    "pkg:npm/other@2.0.0": {
+      "ecosystem": "npm",
+      "basePurl": "pkg:npm/other@2.0.0",
+      "uuid": "22222222-2222-4222-8222-222222222222",
+      "artifact": { "path": ".socket/vendor/npm/22222222-2222-4222-8222-222222222222/package.tgz" },
+      "detached": true,
+      "wiring": []
+    }
+  }
+}
+"#;
+
+/// A manifest holding one patch, of another package.
+const OTHER_MANIFEST: &str = r#"{"patches":{"pkg:npm/other@2.0.0":{
+  "uuid":"22222222-2222-4222-8222-222222222222","exportedAt":"2026-01-01T00:00:00Z",
+  "files":{},"vulnerabilities":{},"description":"d","license":"MIT","tier":"free"}}}"#;
+
+/// `(argv, envelope command, the code of a target no store holds)`: every
+/// command that takes a target and looks it up in the project's stores.
+const TARGETED: &[(&[&str], &str, &str)] = &[
+    (
+        &["remove", "pkg:npm/x@1.0.0", "--json", "--yes"],
+        "remove",
+        "not_found",
+    ),
+    (
+        &["remove", "x", "--json", "--yes", "--dry-run"],
+        "remove",
+        "not_found",
+    ),
+    (
+        &[
+            "remove",
+            "11111111-1111-4111-8111-111111111111",
+            "--json",
+            "--yes",
+        ],
+        "remove",
+        "not_found",
+    ),
+    (
+        &["rollback", "pkg:npm/x@1.0.0", "--json", "--offline"],
+        "rollback",
+        "patch_not_found",
+    ),
+    (
+        &["rollback", "x", "--json", "--offline", "--dry-run"],
+        "rollback",
+        "patch_not_found",
+    ),
+    (
+        &[
+            "rollback",
+            "11111111-1111-4111-8111-111111111111",
+            "--json",
+            "--offline",
+        ],
+        "rollback",
+        "patch_not_found",
+    ),
+    (
+        &["rollback", "./node_modules/x", "--json", "--offline"],
+        "rollback",
+        "path_glob_no_match",
+    ),
+    (
+        &["report", "pkg:npm/x@1.0.0", "--json", "--dry-run"],
+        "report",
+        "patch_not_found",
+    ),
+    (
+        &["report", "x", "--json", "--dry-run"],
+        "report",
+        "patch_not_found",
+    ),
+];
+
+/// A project whose vendor ledger is whatever `seed` puts at
+/// `.socket/vendor/state.json` and, when given, `manifest` as its manifest.
+fn ledger_project(seed: &dyn Fn(&Path), manifest: Option<&str>) -> tempfile::TempDir {
+    project_root(&|root| {
+        let vendor = root.join(".socket/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        seed(&vendor.join("state.json"));
+        if let Some(manifest) = manifest {
+            std::fs::write(root.join(".socket/manifest.json"), manifest).unwrap();
+        }
+    })
+}
+
+fn run_targeted(tmp: &tempfile::TempDir, argv: &[&str]) -> (i32, serde_json::Value) {
+    let (exit, stdout, stderr) = run(tmp.path(), argv, &[]);
+    let v = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("{argv:?}: stdout must be one JSON document ({e}): {stdout:?}\nstderr={stderr}")
+    });
+    (exit, v)
+}
+
+/// Every [`TARGETED`] command over a ledger `seed` makes unreadable, with
+/// no manifest, an empty one and one holding another package's patch
+/// beside it: each must fail with the ledger's error.
+fn assert_ledger_error_on_every_targeted_command(seed: &dyn Fn(&Path)) {
+    let mut wrong: Vec<String> = Vec::new();
+    for manifest in [None, Some(r#"{"patches":{}}"#), Some(OTHER_MANIFEST)] {
+        for (argv, command, _) in TARGETED {
+            let tmp = ledger_project(seed, manifest);
+            let ledger = tmp.path().join(".socket/vendor/state.json");
+            let before = std::fs::read_link(&ledger)
+                .map(|to| to.into_os_string().into_encoded_bytes())
+                .or_else(|_| std::fs::read(&ledger))
+                .unwrap();
+            let (exit, v) = run_targeted(&tmp, argv);
+            assert_eq!(exit, 1, "{argv:?}: {v}");
+            assert_eq!(v["command"], *command, "{argv:?}: {v}");
+            let code = v["error"]["code"].as_str().unwrap_or_default();
+            let message = v["error"]["message"].as_str().unwrap_or_default();
+            if code != "vendor_state_unreadable" {
+                wrong.push(format!(
+                    "{} (manifest: {}): {code}: {message}",
+                    argv.join(" "),
+                    match manifest {
+                        None => "none",
+                        Some(m) if m.contains("other") => "another package's patch",
+                        Some(_) => "empty",
+                    },
+                ));
+                continue;
+            }
+            assert_eq!(v["status"], "error", "{argv:?}: {v}");
+            // `remove` and `rollback` name the file and the target that
+            // was not looked up in it (`report` has its own wording).
+            if *command != "report" {
+                assert!(
+                    message.contains(".socket/vendor/state.json") && message.contains(argv[1]),
+                    "{argv:?}: {message}"
+                );
+            }
+            let after = std::fs::read_link(&ledger)
+                .map(|to| to.into_os_string().into_encoded_bytes())
+                .or_else(|_| std::fs::read(&ledger))
+                .unwrap();
+            assert_eq!(after, before, "{argv:?}: the ledger is left as it was");
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the vendor ledger could not be read, so these targets were never looked up in it:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// "No patch matches" is a statement about every store. A vendor ledger
+/// that cannot be read may hold the target (vendored mode keeps no
+/// manifest, so the ledger is a vendored project's only record of its
+/// patches), so a target that matches nothing in the stores that could be
+/// read fails with the ledger's error on every command that takes one,
+/// and never as "not found". With or without a manifest beside the ledger.
+#[test]
+fn a_target_is_never_not_found_while_the_vendor_ledger_is_unreadable() {
+    assert_ledger_error_on_every_targeted_command(&|ledger| {
+        std::fs::write(ledger, CONFLICTED_LEDGER).unwrap()
+    });
+}
+
+/// The same for a ledger that cannot even be stat'd (a symlink to itself
+/// fails with ELOOP): that is unreadable, not "no ledger", as #998 settled
+/// for the manifest. With no manifest beside it, `remove` and `rollback`
+/// used to probe for the ledger, take the error for absence and report a
+/// project with no patches.
+#[cfg(unix)]
+#[test]
+fn a_target_is_never_not_found_while_the_vendor_ledger_cannot_be_stat() {
+    assert_ledger_error_on_every_targeted_command(&|ledger| {
+        std::os::unix::fs::symlink("state.json", ledger).unwrap()
+    });
+}
+
+/// `rollback <name>` keeps its "to target a directory instead" hint when
+/// the ledger is what failed, and the hint stays with the target. After
+/// the ledger's own error it read as part of it: `… key must be a string
+/// at line 4 column 1 (to target a directory instead, use ./x or x/**)`.
+#[test]
+fn rollback_puts_the_directory_hint_ahead_of_the_ledger_error() {
+    let tmp = ledger_project(
+        &|ledger| std::fs::write(ledger, CONFLICTED_LEDGER).unwrap(),
+        None,
+    );
+    let hint = "(to target a directory instead, use ./x or x/**)";
+
+    let (exit, v) = run_targeted(&tmp, &["rollback", "x", "--json", "--offline", "--dry-run"]);
+    assert_eq!(exit, 1, "{v}");
+    assert_eq!(v["error"]["code"], "vendor_state_unreadable", "{v}");
+    let message = v["error"]["message"].as_str().unwrap();
+    let (target, ledger_error) = message
+        .split_once(&format!(" {hint}: "))
+        .unwrap_or_else(|| panic!("the hint ends the clause about the target: {message}"));
+    assert!(target.contains("to look up x"), "{message}");
+    assert!(ledger_error.contains("state.json"), "{message}");
+    assert_eq!(message.matches(hint).count(), 1, "{message}");
+
+    // A PURL is never a directory, so it carries no hint.
+    let (exit, v) = run_targeted(
+        &tmp,
+        &["rollback", "pkg:npm/x@1.0.0", "--json", "--offline"],
+    );
+    assert_eq!(exit, 1, "{v}");
+    assert_eq!(v["error"]["code"], "vendor_state_unreadable", "{v}");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(!message.contains("to target a directory"), "{message}");
+}
+
+/// `repair` takes no target, and probed for the ledger the same way: with
+/// no manifest, one it could not stat was a project with nothing to
+/// repair (`manifest_not_found`).
+#[cfg(unix)]
+#[test]
+fn repair_reports_a_vendor_ledger_it_cannot_stat() {
+    let tmp = ledger_project(
+        &|ledger| std::os::unix::fs::symlink("state.json", ledger).unwrap(),
+        None,
+    );
+    let (exit, v) = run_targeted(&tmp, &["repair", "--json", "--offline"]);
+    assert_eq!(exit, 1, "{v}");
+    assert_eq!(
+        v["events"][0]["errorCode"], "vendor_state_unreadable",
+        "{v}"
+    );
+}
+
+/// The control: with every store readable, a target none of them holds
+/// keeps each command's own "not found" code.
+#[test]
+fn a_target_no_readable_store_holds_keeps_its_not_found_code() {
+    for manifest in [None, Some(OTHER_MANIFEST)] {
+        for (argv, command, not_found) in TARGETED {
+            let tmp = ledger_project(
+                &|ledger| std::fs::write(ledger, OTHER_LEDGER).unwrap(),
+                manifest,
+            );
+            let (exit, v) = run_targeted(&tmp, argv);
+            assert_eq!(exit, 1, "{argv:?}: {v}");
+            assert_eq!(v["command"], *command, "{argv:?}: {v}");
+            assert_eq!(v["error"]["code"], *not_found, "{argv:?}: {v}");
+        }
+    }
+}

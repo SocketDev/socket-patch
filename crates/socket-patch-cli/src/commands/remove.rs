@@ -334,6 +334,28 @@ async fn track_failed(
     }
 }
 
+/// Refuse the run with the vendor ledger's load error
+/// (`vendor_state_unreadable`, exit 1), before anything is changed.
+/// `patches` are the manifest records the target matched, for the event;
+/// when it matched nothing anywhere, `unmatched` is the target.
+async fn refuse_unreadable_ledger(
+    args: &RemoveArgs,
+    err: &std::io::Error,
+    unmatched: Option<&str>,
+    patches: &[PatchOutcome],
+    telemetry: &TelemetryAuth,
+) -> i32 {
+    let error = crate::json_envelope::vendor_ledger_load_error(err, unmatched, "");
+    track_failed(args, &error.code, &error.message, patches, telemetry).await;
+    emit_error_envelope(
+        args.common.json,
+        args.common.dry_run,
+        &error.code,
+        error.message,
+    );
+    1
+}
+
 /// The `mode: "vendored"` / `"hosted"` tag of a patch event.
 fn mode_details(mode: &str) -> serde_json::Value {
     serde_json::json!({ "mode": mode })
@@ -533,10 +555,13 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // restore retires them from the manifest.
     let hosted_pins: Vec<HostedPin> = hosted_inventory.unwindable();
     if manifest_missing {
-        let vendor_ledger_exists = project_state
-            && tokio::fs::metadata(args.common.project_root().join(VENDOR_STATE_REL))
-                .await
-                .is_ok();
+        // Only a missing ledger is "no ledger": with one that cannot even
+        // be stat'd the run goes on, and its first read under
+        // `.socket/vendor/` (the lock's journal check, else the load
+        // below) reports the failure.
+        let ledger = args.common.project_root().join(VENDOR_STATE_REL);
+        let vendor_ledger_exists =
+            project_state && !matches!(tokio::fs::try_exists(&ledger).await, Ok(false));
         if !vendor_ledger_exists && hosted_pins.is_empty() {
             // Contested hosted wiring is still hosted state: name it
             // instead of reporting a bare project.
@@ -652,9 +677,9 @@ pub async fn run(args: RemoveArgs) -> i32 {
 
     // The vendor ledger, loaded ONCE under the lock: it scopes the nested
     // rollback (vendor-owned purls are not restored in place) and drives
-    // the vendored leg. An unreadable ledger degrades to "nothing vendored"
-    // for the rollback and fails closed at the vendored leg — exactly where
-    // the run is about to mutate vendored state.
+    // the vendored leg. An unreadable ledger refuses the run before either
+    // (below), except a removal that only restores hosted pins, which the
+    // lockfiles record.
     let vendor_state_result = if project_state {
         load_state(&args.common.project_root()).await
     } else {
@@ -722,22 +747,25 @@ pub async fn run(args: RemoveArgs) -> i32 {
     if matching.is_empty() {
         // Ledger-only entries (vendored mode keeps no manifest record) —
         // `remove` is their per-purl exit path (alongside `vendor
-        // --revert`'s all-at-once). An unreadable ledger falls through to
-        // `not_found`: nothing is mutated on that path.
-        if let Ok(state) = vendor_state_result {
-            let ledger_matches = vendor_entries_matching(&state, None, &target);
-            if !ledger_matches.is_empty() {
-                return remove_ledger_only(
-                    &args,
-                    &target,
-                    ledger_matches,
-                    state,
-                    &telemetry,
-                    commit_recovery,
-                )
-                .await;
+        // --revert`'s all-at-once).
+        let ledger_unread = match vendor_state_result {
+            Ok(state) => {
+                let ledger_matches = vendor_entries_matching(&state, None, &target);
+                if !ledger_matches.is_empty() {
+                    return remove_ledger_only(
+                        &args,
+                        &target,
+                        ledger_matches,
+                        state,
+                        &telemetry,
+                        commit_recovery,
+                    )
+                    .await;
+                }
+                None
             }
-        }
+            Err(e) => Some(e),
+        };
 
         // Hosted-only patches likewise have no manifest entry — their
         // lockfile pins are their only persistence, and `remove` is their
@@ -754,6 +782,14 @@ pub async fn run(args: RemoveArgs) -> i32 {
             .await;
         }
 
+        // The target is in no store that could be read. The ledger could
+        // not be, and may hold it: that is the ledger's error, not
+        // `not_found`.
+        if let Some(e) = ledger_unread {
+            let unmatched = Some(args.identifier.as_str());
+            return refuse_unreadable_ledger(&args, &e, unmatched, &[], &telemetry).await;
+        }
+
         let msg = format!("No patch found matching identifier: {}", args.identifier);
         track_failed(&args, "not_found", &msg, &[], &telemetry).await;
         if args.common.json {
@@ -767,6 +803,18 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
         return 1;
     }
+
+    // An unreadable ledger is a hard error before any mutation. The
+    // in-place rollback below needs it to leave vendor-owned purls alone,
+    // and the vendored leg cannot know what it would leave wired; restoring
+    // files first and failing after would report nothing of what changed.
+    let mut vendor_state = match vendor_state_result {
+        Ok(state) => state,
+        Err(e) => {
+            let failed = matched_patches(OUTCOME_FAILED, "vendor_state_unreadable");
+            return refuse_unreadable_ledger(&args, &e, None, &failed, &telemetry).await;
+        }
+    };
 
     // A record no crawler of this CLI can look for (a newer CLI's
     // ecosystem, a key that is not a purl) cannot be rolled back here, and
@@ -842,10 +890,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         let (vendored, hosted) = if args.skip_rollback {
             (0, 0)
         } else {
-            let vendored = vendor_state_result
-                .as_ref()
-                .map(|st| vendor_entries_matching(st, Some(&manifest), &target).len())
-                .unwrap_or(0);
+            let vendored = vendor_entries_matching(&vendor_state, Some(&manifest), &target).len();
             let hosted = hosted_pins_matching(&hosted_pins, &target, &matched_keys).len();
             (vendored, hosted)
         };
@@ -867,15 +912,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // ── nested in-place rollback ────────────────────────────────────────
     // Vendor-owned purls are excluded from the in-place restore (the
     // vendored leg below reverts them) unless their Cargo shared-cache copy
-    // still carries an agent-mode patch; an unreadable ledger degrades to
-    // "nothing vendored" here and fails closed at that leg. Under global
-    // scope the project's ledger still owns its own NuGet install.
+    // still carries an agent-mode patch. Under global scope the project's
+    // ledger still owns its own NuGet install.
     // The identifier is the scope, so `--ecosystems` does not narrow it.
     let vendored_keys: HashSet<PurlKey> = if project_state {
-        vendor_state_result
-            .as_ref()
-            .map(socket_patch_core::vendor::VendorState::purl_keys)
-            .unwrap_or_default()
+        vendor_state.purl_keys()
     } else {
         crate::commands::vendor_owned_keys(
             &GlobalArgs {
@@ -1085,33 +1126,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // must not see them dropped from the ledger — its before-blob gate
     // would demand blobs the vendor flow never downloaded) and BEFORE the
     // manifest mutation, so a revert failure aborts with the manifest
-    // intact (mirroring the `rollback_failed` contract). A corrupt ledger
-    // is a hard error: we are about to mutate and cannot know what we
-    // would leave wired. `--skip-rollback` ("don't touch my tree") skips
-    // the revert too — the wiring stays until `vendor --revert` / a later
-    // `remove` undoes it (a manifest-tracked entry is also reconcile-reverted
-    // by the next `vendor` run; detached entries never are).
-    let mut vendor_state = match vendor_state_result {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = format!("cannot read .socket/vendor/state.json: {e}");
-            track_failed(
-                &args,
-                "vendor_state_unreadable",
-                &msg,
-                &matched_patches(OUTCOME_FAILED, "vendor_state_unreadable"),
-                &telemetry,
-            )
-            .await;
-            emit_error_envelope(
-                args.common.json,
-                args.common.dry_run,
-                "vendor_state_unreadable",
-                msg,
-            );
-            return 1;
-        }
-    };
+    // intact (mirroring the `rollback_failed` contract). `--skip-rollback`
+    // ("don't touch my tree") skips the revert too — the wiring stays until
+    // `vendor --revert` / a later `remove` undoes it (a manifest-tracked
+    // entry is also reconcile-reverted by the next `vendor` run; detached
+    // entries never are).
     let vendored_matches = vendor_entries_matching(&vendor_state, Some(&manifest), &target);
     let mut vendor_leg = RemoveVendorLeg {
         skipped: project_owned,

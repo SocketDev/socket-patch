@@ -1969,10 +1969,14 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             return 1;
         }
     };
+    // Only a missing ledger is "no ledger": with one that cannot even be
+    // stat'd the run goes on, and its first read under `.socket/vendor/`
+    // (the lock's journal check, else the load below) reports the failure.
     let vendor_ledger_exists = project_state
-        && tokio::fs::metadata(ledger_root.join(".socket/vendor/state.json"))
-            .await
-            .is_ok();
+        && !matches!(
+            tokio::fs::try_exists(ledger_root.join(".socket/vendor/state.json")).await,
+            Ok(false)
+        );
     // The hosted pins the lockfiles wire (read-only discovery; the restore
     // re-reads every file under the lock before it writes).
     let hosted_inventory = if project_state {
@@ -2288,18 +2292,26 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             } else {
                 format!(" (to target a directory instead, use ./{id} or {id}/**)")
             };
-            let msg = format!("No patch found matching identifier: {id}{hint}");
-            track_unstarted(&args, "patch_not_found", &msg, &telemetry).await;
+            // In no store that could be read. A ledger that could not be
+            // may hold it: its error then, not `patch_not_found`. Either
+            // way the hint ends what is said about the target.
+            let error = match &vendor_state_result {
+                Err(e) => {
+                    crate::json_envelope::vendor_ledger_load_error(e, Some(&id.to_string()), &hint)
+                }
+                Ok(_) => EnvelopeError::new(
+                    "patch_not_found",
+                    format!("No patch found matching identifier: {id}{hint}"),
+                ),
+            };
+            track_unstarted(&args, &error.code, &error.message, &telemetry).await;
             if args.common.json {
-                let mut env = error_envelope(
-                    args.common.dry_run,
-                    EnvelopeError::new("patch_not_found", msg),
-                );
+                let mut env = error_envelope(args.common.dry_run, error);
                 env.warnings
                     .extend(below.unmatched(&args.common).await.warnings());
                 println!("{}", env.to_pretty_json());
             } else {
-                eprintln!("Error: {msg}");
+                eprintln!("Error: {}", crate::ui::sentence_case(&error.message));
                 below.unmatched(&args.common).await.print();
             }
             return 1;
@@ -2357,18 +2369,27 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             .enumerate()
             .find(|(idx, _)| !matched_patterns.contains(idx))
         {
-            let msg = format!(
-                "path pattern matched no patched packages: {} (path targets select \
-                 installed copies; patches for uninstalled packages are reachable by \
-                 identifier or an unscoped rollback)",
-                unmatched.1
-            );
-            track_unstarted(&args, "path_glob_no_match", &msg, &telemetry).await;
+            // The candidates left out the entries of a ledger that could
+            // not be read, and the pattern may select one of them: the
+            // ledger's error then, not `path_glob_no_match`.
+            let error = match &vendor_state_result {
+                Err(e) => crate::json_envelope::vendor_ledger_load_error(e, Some(unmatched.1), ""),
+                Ok(_) => EnvelopeError::new(
+                    "path_glob_no_match",
+                    format!(
+                        "path pattern matched no patched packages: {} (path targets select \
+                         installed copies; patches for uninstalled packages are reachable by \
+                         identifier or an unscoped rollback)",
+                        unmatched.1
+                    ),
+                ),
+            };
+            track_unstarted(&args, &error.code, &error.message, &telemetry).await;
             emit_rollback_error(
                 args.common.json,
                 args.common.dry_run,
-                "path_glob_no_match",
-                &msg,
+                &error.code,
+                &error.message,
             );
             return 1;
         }
