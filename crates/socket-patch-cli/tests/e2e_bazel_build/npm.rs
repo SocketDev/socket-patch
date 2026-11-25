@@ -1725,11 +1725,12 @@ fn vex_says(cell: &Cell, standin: &StandIn, name: &str) -> (Value, Vec<Value>, [
 }
 
 /// The statement of a document of the fixture's product about the package
-/// `id` and the advisory of the fixture's patches, without its status.
+/// `id` and the advisory of the fixture's patches, without its status. The
+/// package follows the product as a product of its own.
 fn about(id: &Value) -> Value {
     json!({
         "vulnerability": { "name": "GHSA-test-aaaa-bbbb", "aliases": ["CVE-2024-0001"] },
-        "products": [{ "@id": PRODUCT, "subcomponents": [{ "@id": id }] }],
+        "products": [{ "@id": PRODUCT, "subcomponents": [{ "@id": id }] }, { "@id": id }],
     })
 }
 
