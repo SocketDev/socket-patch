@@ -2683,10 +2683,11 @@ async fn run_eject(
 }
 
 /// The no-manifest warning when the vendor ledger cannot be read either.
+/// It names no `repair`: that stops at the same ledger.
 fn no_manifest_ledger_unreadable(err: &str) -> String {
     format!(
         "Warning: No manifest to vendor from, and the vendor ledger could not be read: \
-         {err}\n  Run `socket-patch repair` to check the vendored artifacts."
+         {err}\n  Restore .socket/vendor/state.json from version control."
     )
 }
 
@@ -2697,7 +2698,7 @@ fn no_manifest_ledger_unreadable_warning(err: &str) -> RunWarning {
         "vendor_state_unreadable",
         format!(
             "no manifest to vendor from, and the vendor ledger could not be read: {err}; \
-             run `socket-patch repair` to check the vendored artifacts"
+             restore .socket/vendor/state.json from version control"
         ),
     )
 }
@@ -5819,14 +5820,16 @@ pub(crate) async fn run_vendor_gc(
 }
 
 /// What a prune reports for a vendor ledger it could not read: the code
-/// `rollback`, `list` and `apply` report it with.
+/// `rollback`, `list` and `apply` report it with. The error can quote the
+/// committed ledger, and a human run prints the detail.
 fn gc_ledger_unreadable(e: &std::io::Error) -> (&'static str, String) {
     (
         "vendor_state_unreadable",
         format!(
-            "cannot read .socket/vendor/state.json: {e}; the prune did not check the \
+            "cannot read .socket/vendor/state.json: {}; the prune did not check the \
              vendored entries or sweep orphan vendor dirs (restore the ledger from \
-             version control)"
+             version control)",
+            crate::ui::printable(&e.to_string())
         ),
     )
 }
@@ -7866,6 +7869,20 @@ mod gc_tests {
             .contains_key(PURL));
     }
 
+    /// The ledger's error can quote the committed file, and a human run
+    /// prints the warning: it carries no control character.
+    #[test]
+    fn gc_ledger_unreadable_is_printable() {
+        let e = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "corrupt state.json: unknown variant `\u{1b}]0;owned\u{7}`",
+        );
+        let (code, detail) = gc_ledger_unreadable(&e);
+        assert_eq!(code, "vendor_state_unreadable");
+        assert!(!detail.chars().any(char::is_control), "{detail:?}");
+        assert!(detail.contains("unknown variant `]0;owned`"), "{detail}");
+    }
+
     /// The GC body is lock-free and runs under the CALLER's guard: with the
     /// apply lock held by the caller (as `scan --prune`'s `run_apply_gc`
     /// holds it), a dry pass lists and a wet pass reclaims — the held lock
@@ -8246,8 +8263,15 @@ mod scope_and_hint_tests {
         assert_eq!(
             no_manifest_ledger_unreadable("corrupt .socket/vendor/state.json: expected value"),
             "Warning: No manifest to vendor from, and the vendor ledger could not be read: \
-             corrupt .socket/vendor/state.json: expected value\n  Run `socket-patch repair` \
-             to check the vendored artifacts."
+             corrupt .socket/vendor/state.json: expected value\n  Restore \
+             .socket/vendor/state.json from version control."
+        );
+        let json = no_manifest_ledger_unreadable_warning("corrupt x: expected value");
+        assert_eq!(json.code, "vendor_state_unreadable");
+        assert_eq!(
+            json.detail,
+            "no manifest to vendor from, and the vendor ledger could not be read: corrupt x: \
+             expected value; restore .socket/vendor/state.json from version control"
         );
     }
 

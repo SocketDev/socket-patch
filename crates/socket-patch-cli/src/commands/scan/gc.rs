@@ -296,13 +296,13 @@ pub(super) async fn run_apply_gc(
     vendored: &HashSet<PurlKey>,
 ) -> GcSummary {
     // Existence gate BEFORE the lock: `acquire` creates `.socket/`, and a
-    // pristine checkout with neither a manifest nor a ledger must not gain
-    // one. A manifest that cannot be stated is not absent: the pass goes
+    // pristine checkout with neither a manifest nor vendored state must not
+    // gain one. A manifest that cannot be stated is not absent: the pass goes
     // on and reports it, as the locked read's load error or, when
     // `.socket/` itself is unusable, as the lock failure.
     let has_manifest = manifest_exists(manifest_path).await.unwrap_or(true);
     let mut route = crate::commands::registry_gc::RouteProbe::default();
-    if !has_manifest && !has_ledger(common).await && !route.present(common).await {
+    if !has_manifest && !has_vendored_state(common).await && !route.present(common).await {
         return GcSummary::default();
     }
 
@@ -399,13 +399,17 @@ async fn keep_project_entries(common: &GlobalArgs, prunable: &mut Vec<String>) {
     prunable.retain(|purl| !accounted.contains(&PurlKey::new(purl)));
 }
 
-/// Whether the vendored-state ledger of the manifest's project may be
-/// there. Checked before the lock, whose acquire would create `.socket/`.
-/// Only a ledger known to be missing is "no ledger": one that cannot be
-/// stat'd goes on to the read that reports it, like the manifest above.
-async fn has_ledger(common: &GlobalArgs) -> bool {
+/// Whether the manifest's project may hold vendored state: the ledger's
+/// directory, `.socket/vendor/`, which holds the artifacts too (a lost
+/// ledger leaves them, and the pass reports the ones still installed
+/// from). Checked before the lock, whose acquire would create `.socket/`.
+/// Only a directory known to be missing is "nothing vendored": one that
+/// cannot be stat'd goes on to the read that reports it, like the manifest
+/// above.
+async fn has_vendored_state(common: &GlobalArgs) -> bool {
     let ledger = common.project_root().join(VENDOR_STATE_REL);
-    !matches!(tokio::fs::try_exists(&ledger).await, Ok(false))
+    let dir = ledger.parent().expect("the ledger has a directory");
+    !matches!(tokio::fs::try_exists(dir).await, Ok(false))
 }
 
 /// Take the apply lock for a wet pass. Both halves are read-modify-writes
@@ -539,7 +543,7 @@ pub(super) async fn run_vendor_only_gc(
         gc.sweep_registry(common, true, &mut route).await;
         return gc;
     }
-    if !has_ledger(common).await && !route.present(common).await {
+    if !has_vendored_state(common).await && !route.present(common).await {
         return GcSummary::default();
     }
     let guard = match lock(common, socket_dir) {
@@ -2005,16 +2009,22 @@ mod tests {
     /// still installs from it, and the pass says so, as `vendor --revert`,
     /// `rollback` and `remove` do: the lockfile and the ledger disagree,
     /// and a clean summary would hide that. With no ledger entry at all the
-    /// pass sweeps nothing, and reports the same.
+    /// pass sweeps nothing, and reports the same: with a manifest, and
+    /// (the shape of a vendored project that lost its ledger) without one,
+    /// where the wet pass must not stop at its existence gate.
     #[tokio::test]
     async fn gc_reports_an_orphan_dir_a_project_file_still_installs_from() {
         const UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-9e0f1a2b3c4d";
         let unit = format!(".socket/vendor/pypi/{UUID}");
 
-        for dry_run in [true, false] {
+        for (dry_run, with_manifest) in [(true, true), (false, true), (true, false), (false, false)]
+        {
             let tmp = tempfile::tempdir().unwrap();
             let (manifest_path, socket_dir, _) =
                 seed_manifest_with_blob(tmp.path(), "pkg:npm/still-here@1.0.0", &"e".repeat(64));
+            if !with_manifest {
+                std::fs::remove_file(&manifest_path).unwrap();
+            }
             let wheel = tmp
                 .path()
                 .join(&unit)
@@ -2057,26 +2067,27 @@ mod tests {
                 .await
             };
 
+            let case = format!("dry_run={dry_run}, with_manifest={with_manifest}");
             let json = recorded(&gc, dry_run);
             assert_eq!(
                 warning_codes(&json),
                 ["vendor_orphan_still_wired"],
-                "dry_run={dry_run}: {json}"
+                "{case}: {json}"
             );
             let detail = json["warnings"][0]["detail"].as_str().unwrap();
-            assert!(detail.contains(&unit), "dry_run={dry_run}: {detail}");
+            assert!(detail.contains(&unit), "{case}: {detail}");
             assert!(
                 !detail.contains("revert"),
-                "dry_run={dry_run}: a prune is not a revert, and `vendor --revert` would \
-                 un-vendor the whole project: {detail}"
+                "{case}: a prune is not a revert, and `vendor --revert` would un-vendor \
+                 the whole project: {detail}"
             );
             assert_eq!(
                 format_gc_vendored_lines(&gc),
                 [format!("GC: {detail}.")],
-                "dry_run={dry_run}"
+                "{case}"
             );
-            assert_eq!(json["removedVendorOrphanDirs"], 0, "dry_run={dry_run}");
-            assert!(wheel.is_file() && loose.is_dir(), "dry_run={dry_run}");
+            assert_eq!(json["removedVendorOrphanDirs"], 0, "{case}");
+            assert!(wheel.is_file() && loose.is_dir(), "{case}");
         }
     }
 

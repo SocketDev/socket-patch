@@ -277,13 +277,6 @@ async fn human_missing_manifest_with_ledger_names_the_tracked_entries() {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// 2. pnpm committables hint (pnpm >=11 workspace-file portability)
-// ─────────────────────────────────────────────────────────────────────
-
-/// A pnpm project (lockfileVersion 9.0): package.json + pnpm-lock.yaml +
-/// installed node_modules/left-pad + the same staged `.socket` blob as the
-/// npm fixture. The lock grammar mirrors core's pnpm_lock spike fixtures.
 /// Plain vendor with no manifest and a ledger that cannot be read (a merge
 /// conflict left in the committed file): still the exit-0 no-op, and both
 /// modes say that the ledger was not read. Under `--json` the envelope was
@@ -301,6 +294,12 @@ fn missing_manifest_with_an_unreadable_ledger_says_so_in_both_modes() {
         stderr.contains("the vendor ledger could not be read: corrupt "),
         "{stderr}"
     );
+    // `repair` stops at the same ledger: the remedy is the file itself.
+    assert!(
+        stderr.contains("Restore .socket/vendor/state.json from version control")
+            && !stderr.contains("repair"),
+        "{stderr}"
+    );
 
     let (code, stdout, stderr) = human_vendor(&fx, &["--json"]);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
@@ -314,11 +313,19 @@ fn missing_manifest_with_an_unreadable_ledger_says_so_in_both_modes() {
     assert_eq!(codes, ["vendor_state_unreadable"], "{env:#}");
     let detail = warnings[0]["detail"].as_str().unwrap();
     assert!(
-        detail.contains("the vendor ledger could not be read: corrupt "),
+        detail.contains("the vendor ledger could not be read: corrupt ")
+            && detail.ends_with("restore .socket/vendor/state.json from version control"),
         "{detail}"
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// 2. pnpm committables hint (pnpm >=11 workspace-file portability)
+// ─────────────────────────────────────────────────────────────────────
+
+/// A pnpm project (lockfileVersion 9.0): package.json + pnpm-lock.yaml +
+/// installed node_modules/left-pad + the same staged `.socket` blob as the
+/// npm fixture. The lock grammar mirrors core's pnpm_lock spike fixtures.
 fn pnpm_fixture() -> NpmFixture {
     let fx = npm_fixture();
     std::fs::remove_file(fx.lock_path()).unwrap();

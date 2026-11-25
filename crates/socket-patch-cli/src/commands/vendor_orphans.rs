@@ -129,10 +129,12 @@ pub(crate) fn orphan_still_wired(unit: &vendor::path::SweptVendorDir) -> VendorW
 }
 
 /// [`orphan_still_wired`] for `scan --prune`, which was not asked to revert
-/// anything: the restored entry is the whole remedy, and "revert again"
-/// would read as `vendor --revert`, which un-vendors the project.
+/// anything: "revert again" would read as `vendor --revert`, which
+/// un-vendors the project. The ledger may not have lost an entry either
+/// (a file that was left pointing at a patch the project has since
+/// replaced), so the other way out is named too.
 pub(crate) fn orphan_still_wired_by_prune(unit: &vendor::path::SweptVendorDir) -> VendorWarning {
-    still_wired(unit, "")
+    still_wired(unit, ", or point the lockfile back at the registry release")
 }
 
 fn still_wired(unit: &vendor::path::SweptVendorDir, then: &str) -> VendorWarning {
