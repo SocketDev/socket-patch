@@ -55,7 +55,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use super::block::{self, Found, END};
-use super::rc::{declared_release, mentions, ModuleLock};
+use super::rc::{declared_release, mentions, reads_workspace_file, ModuleLock};
 use super::starlark::{Bound, Call, How, Value};
 use super::workspace::{disk, disk_up_to, Doubt, Entry, Extension, Repo, Tag, Workspace};
 use crate::formats::maven::is_variant;
@@ -630,8 +630,7 @@ impl Hubs {
         }
         let named = names(&ws, EXTENSION.module);
         let calls = matches!(ws.legacy, Some(Ok(_)));
-        let before_9 = || declared_release(view).is_none_or(|release| release < (9, 0, 0));
-        let legacy = match ws.legacy.filter(|_| before_9()) {
+        let legacy = match ws.legacy.filter(|_| reads_workspace_file(view)) {
             Some(Ok((file, read))) => {
                 // By its own name, or by one that a `load` gives it.
                 let symbol = Value::Str("maven_install".to_string());

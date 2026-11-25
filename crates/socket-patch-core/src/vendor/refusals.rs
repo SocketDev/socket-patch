@@ -25,13 +25,16 @@
 //!    (`vendor_maven_version_not_selected`, a skip too);
 //! 7. what rests on the Bazel workspace of the project
 //!    ([`bazel_workspace_refusals`]), unless the user allowed it
-//!    ([`ALLOW_IN_BAZEL_ENV`]): a Composer project in one
+//!    ([`ALLOW_IN_BAZEL_ENV`]): any Composer project in one
 //!    (`vendor_composer_bazel_workspace`), unless the lock already names
-//!    a vendored copy in `packages` or in the package's section; and a
-//!    NuGet package of a project whose lock a rules_csharp hub reads,
-//!    where the block that makes the hub take the copy cannot be shown to
-//!    work (`vendor_nuget_bazel_workspace`), unless `nuget.config` already
-//!    names the patch's folder.
+//!    a vendored copy in `packages` or in the package's section; a PyPI
+//!    or RubyGems project whose lock a hub of the workspace reads
+//!    (`vendor_pypi_bazel_hub`, `vendor_gem_bazel_hub`), unless that lock
+//!    already names the patch's copy; and a NuGet package of a project
+//!    whose lock a rules_csharp hub reads, where the block that makes the
+//!    hub take the copy cannot be shown to work
+//!    (`vendor_nuget_bazel_workspace`), unless `nuget.config` already
+//!    names the patch's folder;
 //! 8. a Maven jar that only a rules_jvm_external hub of a Bazel workspace
 //!    builds and whose entry cannot be written there (the `maven_bazel_*`
 //!    codes of [`crate::bazel::maven`]), from the same dispatch.
@@ -49,7 +52,8 @@ use crate::patch::redirect::upstream::HostedPin;
 use crate::utils::purl_key::PurlKey;
 use crate::vendor::state::{lookup_entry, VendorEntry};
 use crate::vendor::{
-    bun_lock, composer_lock, gem, lock_inventory, npm_flavor, npm_lock, nuget_feed, vlt_lock,
+    bazel_hub, bun_lock, composer_lock, gem, lock_inventory, npm_flavor, npm_lock, nuget_feed,
+    vlt_lock,
 };
 
 /// The vendor ledger as the refusals consume it: the caller's own load
@@ -119,11 +123,14 @@ fn is_cargo(purl: &str) -> bool {
 /// vendored entry point takes this one answer: [`vendor_refusals`] hands it
 /// to a scan, a `get` and a `vendor`, and the eject of hosted pins asks it
 /// before it fetches or restores anything. A refusal of this kind for
-/// another ecosystem belongs here: Composer's, NuGet's and Maven's are the
-/// three today. Composer's and NuGet's are the ones the user's word lifts.
-/// Maven's is not lifted: vendored mode patches a pinned
-/// rules_jvm_external hub, and where the hub is the only build of a patch
-/// and no entry can be shown to work for it
+/// another ecosystem belongs here. The user's word lifts the one of any
+/// Composer project ([`composer_lock::bazel::refusals`]), the one of a
+/// PyPI or RubyGems project whose lock a hub of the workspace reads
+/// ([`bazel_hub::refusals`]) and the one of a NuGet package of a
+/// rules_csharp hub ([`nuget_feed::bazel_refusals`]). Maven's is not
+/// lifted: vendored mode patches a pinned rules_jvm_external hub, and
+/// where the hub is the only build of a patch and no entry can be shown to
+/// work for it
 /// ([`super::maven_repo::hub_refusals`]), there is nothing else to write.
 pub async fn bazel_workspace_refusals<'a>(
     project_root: &Path,
@@ -134,6 +141,7 @@ pub async fn bazel_workspace_refusals<'a>(
         candidates.iter().filter(named).copied().collect()
     };
     let mut refused = composer_lock::bazel::refusals(project_root, &of(Ecosystem::Composer)).await;
+    refused.extend(bazel_hub::refusals(project_root, candidates).await);
     refused.extend(nuget_feed::bazel_refusals(project_root, &of(Ecosystem::Nuget)).await);
     let maven = of(Ecosystem::Maven);
     if !maven.is_empty() {
@@ -526,6 +534,39 @@ mod tests {
         assert_eq!(got[one].code, "vendor_nuget_bazel_workspace");
         assert!(!refusal_is_benign(got[one].code));
         let elsewhere = module.replace("//:packages", "//api:packages");
+        std::fs::write(tmp.path().join("MODULE.bazel"), elsewhere).unwrap();
+        assert!(run(tmp.path(), &pairs, Ok(&empty)).await.is_empty());
+    }
+
+    /// A project whose requirements a hub of its Bazel workspace reads:
+    /// every PyPI candidate is refused with the one answer of the project,
+    /// and no candidate of an ecosystem whose hub the workspace does not
+    /// call. The switch is read from the environment, so the test holds it
+    /// unset.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_candidates_of_a_lock_that_a_bazel_hub_reads_are_refused() {
+        let _unset = crate::test_env::EnvGuard::unset(ALLOW_IN_BAZEL_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, other) = ("pkg:pypi/a@1.0.0", "pkg:pypi/b@2.0.0");
+        let pairs = [(one, UUID), (other, OTHER_UUID), ("pkg:gem/x@1.0.0", UUID)];
+        let empty = HashMap::new();
+        let module = "pip = use_extension(\"@rules_python//python/extensions:pip.bzl\", \"pip\")\n\
+                      pip.parse(requirements_lock = \"//:requirements.txt\")\n";
+        std::fs::write(tmp.path().join("MODULE.bazel"), module).unwrap();
+        // The file a run for either package would write.
+        std::fs::write(tmp.path().join("requirements.txt"), "").unwrap();
+        let got = run(tmp.path(), &pairs, Ok(&empty)).await;
+        assert_eq!(got.keys().collect::<Vec<_>>(), [one, other]);
+        assert_eq!(got[one].code, "vendor_pypi_bazel_hub");
+        assert_eq!(got[one], got[other]);
+        assert!(!refusal_is_benign(got[one].code));
+        // The same answer is the eject's, and a hub that reads another
+        // file refuses nothing.
+        let asked = bazel_workspace_refusals(tmp.path(), &pairs).await;
+        let asked: Vec<_> = asked.iter().map(|(purl, code, _)| (*purl, *code)).collect();
+        assert_eq!(asked, [(one, got[one].code), (other, got[one].code)]);
+        let elsewhere = module.replace("//:requirements.txt", "//:requirements_lock.txt");
         std::fs::write(tmp.path().join("MODULE.bazel"), elsewhere).unwrap();
         assert!(run(tmp.path(), &pairs, Ok(&empty)).await.is_empty());
     }

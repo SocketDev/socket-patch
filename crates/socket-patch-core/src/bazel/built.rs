@@ -16,10 +16,12 @@
 //! 2.5.0-rc4 takes the path for the name of a project and fails the build
 //! of everything the hub serves (Bazel 9.3.2, 8.8.2 and 7.7.2). rules_js
 //! does build a vendored tarball, and rules_rust a vendored crate.
-//! rules_csharp builds a vendored package through the block that vendored
-//! mode keeps in `MODULE.bazel` ([`super::nuget`]), which is not read
-//! here. What rules_ruby does with a vendored gem no test here builds, so
-//! it is not judged.
+//! rules_ruby 1.0.0-rc2 fails the build on a vendored gem (same three
+//! releases) unless the call lists every file of the copy among its
+//! `srcs`, which it copies beside the Gemfile: `srcs` is not read here, so
+//! a vendored gem is not judged. rules_csharp builds a vendored package
+//! through the block that vendored mode keeps in `MODULE.bazel`
+//! ([`super::nuget`]), which is not read here either.
 //!
 //! [`unbuilt`] names, for a patched package, the call that builds it from a
 //! file without its patch. It says so only when the files of the workspace
@@ -71,8 +73,26 @@
 //! [`super::nuget`] say that to hosted mode, and the caller hands over no
 //! package that has one.
 //!
+//! [`reader`] answers the question vendored mode asks before it writes:
+//! does a call of the hub name a file that the run would make point at a
+//! copy under `.socket/vendor`? Where [`unbuilt`] says nothing when it is
+//! in doubt, this one says so, because there a wrong "no" breaks a build.
+//! Every call of the hub counts, also one that may not run, and so does a
+//! call of a `WORKSPACE` file that passes one of the hub's files, which is
+//! how the older form of the ruleset is called there (`pip_parse`,
+//! `rb_bundle_fetch`). A `WORKSPACE` file counts unless the checkout names
+//! a Bazel release of 9 or later, which never reads one
+//! ([`workspace_as_built`]): there it holds no call and is no doubt,
+//! whatever it says. And where something of the workspace cannot be read
+//! with certainty and a call of the hub may be behind it, the answer is
+//! that doubt: the workspace calls the hub, or a file that was read names
+//! its ruleset, or the root module file or the `WORKSPACE` file could not
+//! be read at all. A file with one byte that is not UTF-8 is such a file,
+//! and Bazel builds it.
+//!
 //! Not looked at: what a `--override_repository` or an rc file changes,
-//! BUILD files, and hubs of other rulesets.
+//! BUILD files, the `.bzl` files a `WORKSPACE` file loads, and hubs of
+//! other rulesets.
 //!
 //! [`Tags::doubts`]: super::workspace::Tags::doubts
 
@@ -83,8 +103,10 @@ use std::path::{Component, Path};
 
 use aho_corasick::AhoCorasick;
 
-use super::starlark::{Call, Value};
-use super::workspace::{disk, Extension, Repo, Tag, Workspace};
+use super::rc::reads_workspace_file;
+use super::starlark::{Call, File, Value};
+use super::workspace::{disk, Doubt, Entry, Extension, Repo, Tag, Workspace};
+use super::BazelRoot;
 use crate::formats::cargo::CargoLock;
 use crate::formats::gem::locked_specs;
 use crate::formats::nuget::lock::{nuget_lock_entries, parse_lock};
@@ -138,7 +160,8 @@ struct Hub {
     extensions: &'static [Extension<'static>],
     tag: &'static str,
     /// The attributes that name such a file: a label, or a dict with a
-    /// label as each key.
+    /// label as each key. `uv_lock` is one for [`reader`] alone: [`judge`]
+    /// passes over a call that has it.
     files: &'static [&'static str],
     /// The attributes with which a call can take its packages from a file
     /// that is not read here, whatever its lock lists.
@@ -155,8 +178,8 @@ struct Hub {
     nested: bool,
     /// Whether a call of the tag may build a package from a line that
     /// points at a copy under `.socket/vendor`: rules_js and rules_rust
-    /// do, rules_csharp does through the block of vendored mode, and of
-    /// rules_ruby no test here has shown that it does not.
+    /// do, rules_ruby does when the call lists the files of the copy, and
+    /// rules_csharp does through the block of vendored mode.
     builds_vendored: bool,
     /// The attributes that name a file beside the lock, where a pin in
     /// the lock does not name its patch. The calls of such a tag make one
@@ -212,6 +235,7 @@ const HUBS: [Hub; 5] = [
             "requirements_darwin",
             "requirements_linux",
             "requirements_windows",
+            "uv_lock",
         ],
         // rules_python 2.2.0 and later.
         elsewhere: &["uv_lock"],
@@ -325,14 +349,192 @@ pub async fn unbuilt(project: &Path, packages: Vec<Patched>) -> Vec<Option<Unbui
         };
         let workspace = Workspace::read(&disk(&root.dir));
         let read = |file: &str| lock_text(&root.dir, file);
-        // Bazel has `/` between the parts of a path on every system.
-        let parts = root.project.components();
-        let parts: Vec<_> = parts
-            .map(|part| part.as_os_str().to_string_lossy())
-            .collect();
-        judge(&workspace, &parts.join("/"), &read, &packages)
+        judge(&workspace, &slashed(&root.project), &read, &packages)
     })
     .await
+}
+
+/// `path` with `/` between its parts, as Bazel has it on every system.
+fn slashed(path: &Path) -> String {
+    let parts = path.components();
+    let parts: Vec<_> = parts
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect();
+    parts.join("/")
+}
+
+/// What stands between vendored mode and the locks of a project
+/// ([`reader`]). `Ok`: this call of the hub names one of them, `lock`.
+/// `Err`: this is why the files of the workspace are not read with
+/// certainty, where a call of the hub that names such a lock may be behind
+/// that.
+pub type Reader = Result<Unbuilt, Doubt>;
+
+/// The call of the workspace `root` that hands Bazel one of `locks`: files
+/// of the project in that workspace, each by its path from the project,
+/// which vendored mode would rewrite for a package of `ecosystem` (the type
+/// of its purls), or the doubt that leaves that open. A requirements file
+/// that a call names hands Bazel each file its `-r` includes reach as
+/// well, and is then the file returned. `None` when the
+/// calls of the hub are read with certainty and name other files, and when
+/// nothing shows that the workspace may call it: no call of the hub and no
+/// file that names its ruleset, with a root module file and a `WORKSPACE`
+/// file that were read or are not there. A `WORKSPACE` file that the Bazel
+/// of the checkout does not read is not there ([`workspace_as_built`]).
+pub async fn reader(
+    root: &BazelRoot,
+    ecosystem: &'static str,
+    locks: Vec<String>,
+) -> Option<Reader> {
+    let (dir, project) = (root.dir.clone(), slashed(&root.project));
+    run_blocking(move || {
+        let read = |file: &str| lock_text(&dir, file);
+        let workspace = workspace_as_built(&disk(&dir));
+        reads(&workspace, &project, ecosystem, &locks, &read)
+    })
+    .await
+}
+
+/// The workspace of `view` as the Bazel that the checkout names reads it:
+/// without its `WORKSPACE` file ([`Workspace::legacy`]) where that Bazel
+/// reads none, which is a release of 9 or later
+/// ([`reads_workspace_file`]). A checkout that names an older release, or
+/// none as three numbers, keeps the file: a Bazel 7 or 8 may build it.
+///
+/// For a question whose wrong "yes" costs a run that worked: a
+/// `WORKSPACE` file that a migration left behind can still name a lock,
+/// and stands in no build's way.
+pub(crate) fn workspace_as_built(view: &dyn Fn(&str) -> Entry) -> Workspace {
+    let mut workspace = Workspace::read(view);
+    if !reads_workspace_file(view) {
+        workspace.legacy = None;
+    }
+    workspace
+}
+
+/// The path from the Bazel root `root` of `file`, a path from its project.
+pub(crate) fn from_root(root: &BazelRoot, file: &str) -> String {
+    below(&slashed(&root.project), file)
+}
+
+/// [`reader`] for the workspace `workspace` and the project in its
+/// directory `project` (empty: the root itself), with `read` for the text
+/// of a file of the workspace.
+fn reads(
+    workspace: &Workspace,
+    project: &str,
+    ecosystem: &str,
+    locks: &[String],
+    read: &dyn Fn(&str) -> Option<String>,
+) -> Option<Reader> {
+    let hub = HUBS.iter().find(|hub| hub.ecosystem == ecosystem)?;
+    let tags = |extension| workspace.tags(extension, hub.tag);
+    let tags: Vec<_> = hub.extensions.iter().map(tags).collect();
+    let tag = format!("{}.{}", hub.extensions[0].name, hub.tag);
+    let tagged = tags.iter().flat_map(|tags| &tags.calls);
+    let tagged = tagged.map(|at| (at.file, at.call, tag.as_str()));
+    // In a `WORKSPACE` file, the calls that pass one of the hub's files.
+    let legacy = workspace
+        .legacy
+        .as_ref()
+        .and_then(|read| read.as_ref().ok());
+    let passes = |call: &&Call| hub.files.iter().any(|file| call.arg(file).is_some());
+    let legacy = legacy.into_iter().flat_map(|(name, file)| {
+        // `workspace(name = "shop")` makes `@shop//` the main repository
+        // for the labels of that file.
+        let main = file.calls.iter().find_map(workspace_name);
+        let calls = file.calls.iter().filter(passes);
+        calls.map(move |call| (name.as_str(), call, call.callee.as_str(), main))
+    });
+    let tagged = tagged.map(|(file, call, name)| (file, call, name, None));
+    let mut doubt = tags.iter().find_map(|tags| tags.doubts.first()).cloned();
+    let mut called = doubt.is_some();
+    for (file, call, name, main) in tagged.chain(legacy) {
+        called = true;
+        let own = |lock: &String| locks.iter().any(|own| below(project, own) == *lock);
+        let named = files(workspace, call, hub.files, main);
+        // A requirements file that brings one of the locks in with `-r`
+        // hands the hub that lock as well.
+        let includes = |lock: &&String| ecosystem == "pypi" && includes_one(lock, &own, read);
+        let found = named.iter().find(|lock| own(lock));
+        if let Some(lock) = found.or_else(|| named.iter().find(includes)) {
+            return Some(Ok(Unbuilt {
+                call: name.to_string(),
+                file: file.to_string(),
+                line: call.line,
+                lock: lock.clone(),
+                remedy: hub.remedy,
+            }));
+        }
+        let written = |file: &&str| {
+            let value = call.arg(file);
+            matches!(value, None | Some(Value::Str(_) | Value::Dict(_)))
+        };
+        if doubt.is_none() && (call.unpacks() || !hub.files.iter().all(written)) {
+            doubt = Some(Doubt {
+                file: file.to_string(),
+                line: call.line,
+                why: format!("the files `{name}` names are not all written out"),
+            });
+        }
+    }
+    // What could not be read of the workspace may hide a call of the hub
+    // where the hub is seen to be called, where a file that was read names
+    // its ruleset (as a dependency, or by the file of its extension under
+    // any name of the repository), and where the root module file was not
+    // read at all. So may a `WORKSPACE` file that could not be read.
+    let names = |call: &Call| match (call.callee.as_str(), call.arg("name"), call.positional(0)) {
+        ("bazel_dep", Some(Value::Str(name)), _) => {
+            let ruleset = |extension: &Extension| name == extension.module;
+            hub.extensions.iter().any(ruleset)
+        }
+        ("use_extension", _, Some(Value::Str(file))) => {
+            let defines = |extension: &Extension| file.ends_with(extension.file);
+            hub.extensions.iter().any(defines)
+        }
+        _ => false,
+    };
+    let named = |(_, file): &(String, File)| file.calls.iter().any(names);
+    let may = || called || workspace.files.is_empty() || workspace.files.iter().any(named);
+    let hidden = || workspace.doubts.first().filter(|_| may());
+    let unread = || workspace.legacy.as_ref()?.as_ref().err();
+    doubt.or_else(|| hidden().or_else(unread).cloned()).map(Err)
+}
+
+/// Whether the requirements file `start` (a path from the Bazel root)
+/// brings in a file for which `own` holds, through its `-r` includes and
+/// theirs, each read with `read`. An include that cannot be read brings in
+/// nothing that can be seen.
+fn includes_one(
+    start: &str,
+    own: &dyn Fn(&String) -> bool,
+    read: &dyn Fn(&str) -> Option<String>,
+) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![start.to_string()];
+    while let Some(file) = stack.pop() {
+        if !seen.insert(file.clone()) {
+            continue;
+        }
+        let Some(text) = read(&file) else {
+            continue;
+        };
+        for include in crate::vendor::pypi_requirements::requirements_includes(&file, &text) {
+            if own(&include) {
+                return true;
+            }
+            stack.push(include);
+        }
+    }
+    false
+}
+
+/// The name a `workspace(name = ...)` call gives the main repository.
+fn workspace_name(call: &Call) -> Option<&str> {
+    match (call.callee.as_str(), call.arg("name")) {
+        ("workspace", Some(Value::Str(name))) => Some(name.as_str()),
+        _ => None,
+    }
 }
 
 /// The most of a lock that is read: the lock of a large pnpm workspace has
@@ -346,7 +548,7 @@ const MAX_LOCK: u64 = 64 << 20;
 /// workspace. `None` for that, for what is no file (a directory, which
 /// Windows does not even open, like any other) or not UTF-8, and for a
 /// file over [`MAX_LOCK`].
-fn lock_text(root: &Path, file: &str) -> Option<String> {
+pub(crate) fn lock_text(root: &Path, file: &str) -> Option<String> {
     let path = root.join(file);
     let mut bytes = Vec::new();
     let plain = |part| matches!(part, Component::Normal(_));
@@ -396,7 +598,7 @@ fn judge(
         // does not give as a plain label of the main repository, or may
         // pass unseen, may name any.
         let plain = |value: &Value| match value {
-            Value::Str(label) => file(workspace, label),
+            Value::Str(label) => file(workspace, label, None),
             _ => None,
         };
         let beside = |tag: &Tag| {
@@ -421,7 +623,7 @@ fn judge(
         let named = |call: &Call| hub.elsewhere.iter().any(|name| call.arg(name).is_some());
         let elsewhere = |call: &Call| call.unpacks() || named(call);
         for tag in calls().filter(|tag| tag.call.whole && !elsewhere(tag.call)) {
-            for lock in files(workspace, tag.call, hub.files) {
+            for lock in files(workspace, tag.call, hub.files, None) {
                 for &at in &ours {
                     let package = &packages[at];
                     let unpatched = match &package.pins {
@@ -477,8 +679,15 @@ fn judge(
 
 /// The files of the main repository that `call` names under `attributes`,
 /// each by its path from the Bazel root. An attribute that is not written
-/// out as a string, or as a dict with strings as keys, names none.
-fn files(workspace: &Workspace, call: &Call, attributes: &[&str]) -> Vec<String> {
+/// out as a string, or as a dict with strings as keys, names none. `main`
+/// is the name a `WORKSPACE` file gives the main repository, for a call of
+/// that file: `@<main>//` is then the main repository too.
+fn files(
+    workspace: &Workspace,
+    call: &Call,
+    attributes: &[&str],
+    main: Option<&str>,
+) -> Vec<String> {
     let mut labels: Vec<&str> = Vec::new();
     for attribute in attributes {
         match call.arg(attribute) {
@@ -489,8 +698,10 @@ fn files(workspace: &Workspace, call: &Call, attributes: &[&str]) -> Vec<String>
             _ => {}
         }
     }
-    let main = labels.iter().filter_map(|label| file(workspace, label));
-    main.collect()
+    let ours = labels
+        .iter()
+        .filter_map(|label| file(workspace, label, main));
+    ours.collect()
 }
 
 /// The path from the Bazel root of `file`, a path from the project in the
@@ -504,11 +715,17 @@ fn below(project: &str, file: &str) -> String {
 }
 
 /// The file of the main repository that `label` names, by its path from
-/// the Bazel root.
-fn file(workspace: &Workspace, label: &str) -> Option<String> {
-    let label = workspace.label(label);
-    let label = label.filter(|label| label.repo == Repo::Main);
-    label.map(|label| label.path())
+/// the Bazel root. `main` is the name a `WORKSPACE` file gives the main
+/// repository, for a label of that file: `@<main>//` is then the main
+/// repository too.
+fn file(workspace: &Workspace, label: &str, main: Option<&str>) -> Option<String> {
+    let label = workspace.label(label)?;
+    let ours = match &label.repo {
+        Repo::Main => true,
+        Repo::Apparent(repo) => main == Some(repo.as_str()),
+        Repo::Canonical(_) => false,
+    };
+    ours.then(|| label.path())
 }
 
 /// Whether the workspace's file `lock` lies in a directory below the
@@ -1283,6 +1500,315 @@ replace = "swapped 3.0.0"
         ] {
             assert_eq!(npm(none), "", "{none}");
         }
+    }
+
+    /// What [`reads`] says of the locks `locks` of the project in
+    /// `project`, in the workspace of `files`: `call file:line lock`, or
+    /// `? file:line why` for a doubt. A file whose text starts with
+    /// [`UNREADABLE`] is one that cannot be read, for the reason after it.
+    fn reader_of(files: &[(&str, &str)], project: &str, ecosystem: &str, locks: &[&str]) -> String {
+        let text = |path: &str| files.iter().find(|(name, _)| *name == path);
+        let workspace = workspace_as_built(&|path| match text(path) {
+            Some((_, text)) => match text.strip_prefix(UNREADABLE) {
+                Some(why) => Entry::Unreadable(why.to_string()),
+                None => Entry::Text(text.to_string()),
+            },
+            None => Entry::Absent,
+        });
+        let locks: Vec<String> = locks.iter().map(|lock| lock.to_string()).collect();
+        let read = |path: &str| text(path).map(|(_, text)| text.to_string());
+        match reads(&workspace, project, ecosystem, &locks, &read) {
+            Some(Ok(by)) => format!("{} {}:{} {}", by.call, by.file, by.line, by.lock),
+            Some(Err(doubt)) => format!("? {}:{} {}", doubt.file, doubt.line, doubt.why),
+            None => String::new(),
+        }
+    }
+
+    /// The shop with `new` in the place of `old` in its root module.
+    fn shop_with(old: &str, new: &str) -> Vec<(&'static str, &'static str)> {
+        let root = ROOT.replace(old, new);
+        assert_ne!(root, ROOT, "{old}");
+        with("MODULE.bazel", Box::leak(root.into_boxed_str()))
+    }
+
+    const UNREADABLE: &str = "unreadable: ";
+    const PIP: &str = "    requirements_lock = \"//api:requirements.txt\",\n";
+    const UNWRITTEN: &str = "the files `pip.parse` names are not all written out";
+
+    /// A call of the hub that names a file vendored mode would rewrite is
+    /// found, under each attribute, and a project whose files no call
+    /// names has none.
+    #[test]
+    fn the_call_that_reads_a_lock_of_the_project_is_found() {
+        let pypi = |project, locks: &[&str]| reader_of(&SHOP, project, "pypi", locks);
+        let api = "pip.parse MODULE.bazel:15 api/requirements.txt";
+        assert_eq!(pypi("api", &["requirements.txt"]), api);
+        assert_eq!(pypi("api", &["base.txt", "./requirements.txt"]), api);
+        let darwin = "pip.parse MODULE.bazel:20 tools/requirements_darwin.txt";
+        assert_eq!(
+            pypi("tools", &["uv.lock", "requirements_darwin.txt"]),
+            darwin
+        );
+        let gem = |project, locks: &[&str]| reader_of(&SHOP, project, "gem", locks);
+        let lock = "ruby.bundle_fetch billing/ruby.MODULE.bazel:2 billing/Gemfile.lock";
+        assert_eq!(gem("billing", &["Gemfile", "Gemfile.lock"]), lock);
+        let gemfile = "ruby.bundle_fetch billing/ruby.MODULE.bazel:2 billing/Gemfile";
+        assert_eq!(gem("billing", &["Gemfile"]), gemfile);
+        // A call that may not run counts, and so does a `uv_lock`.
+        let looped = "[pip.parse(requirements_lock = \"//api:requirements.txt\") for v in V]\n";
+        let files = shop_with(
+            "pip.parse(\n    hub_name = \"pypi\",",
+            &format!("{looped}pip.parse("),
+        );
+        let looped = "pip.parse MODULE.bazel:15 api/requirements.txt";
+        assert_eq!(
+            reader_of(&files, "api", "pypi", &["requirements.txt"]),
+            looped
+        );
+        let files = shop_with(PIP, "    uv_lock = \"//api:uv.lock\",\n");
+        let uv = "pip.parse MODULE.bazel:15 api/uv.lock";
+        assert_eq!(reader_of(&files, "api", "pypi", &["uv.lock"]), uv);
+
+        // Other files of the project, another project, a file of another
+        // repository, another ecosystem, and one without a hub.
+        assert_eq!(pypi("api", &["requirements-dev.txt", "uv.lock"]), "");
+        assert_eq!(pypi("mobile", &["requirements.txt"]), "");
+        assert_eq!(pypi("", &["requirements.txt"]), "");
+        assert_eq!(pypi("api/worker", &["requirements.txt"]), "");
+        let files = shop_with(
+            "\"//api:requirements.txt\"",
+            "\"@other//api:requirements.txt\"",
+        );
+        assert_eq!(reader_of(&files, "api", "pypi", &["requirements.txt"]), "");
+        assert_eq!(gem("api", &["requirements.txt"]), "");
+        assert_eq!(reader_of(&SHOP, "api", "cargo", &["requirements.txt"]), "");
+    }
+
+    /// A requirements file a call names that brings a lock of the project
+    /// in with `-r`, directly or through another include, hands the hub
+    /// that lock: the call is found, with the file it names. An include
+    /// that reaches no lock of the project, or a Gemfile, is not.
+    #[test]
+    fn a_hub_file_that_includes_a_lock_of_the_project_is_found() {
+        let parent = "api/requirements.txt";
+        let mut files = with(parent, "-r requirements/all.txt\n");
+        files.push(("api/requirements/all.txt", "-r ../base.txt\n-r dev.txt\n"));
+        files.push(("api/requirements/dev.txt", "-r all.txt\n"));
+        let api = "pip.parse MODULE.bazel:15 api/requirements.txt";
+        assert_eq!(reader_of(&files, "api", "pypi", &["base.txt"]), api);
+        let all = ["requirements/all.txt"];
+        assert_eq!(reader_of(&files, "api", "pypi", &all), api);
+        assert_eq!(reader_of(&files, "api", "pypi", &["other.txt"]), "");
+        let mut files = with("billing/Gemfile.lock", "-r Gemfile.other\n");
+        files.push(("billing/Gemfile", "-r Gemfile.other\n"));
+        assert_eq!(reader_of(&files, "billing", "gem", &["Gemfile.other"]), "");
+    }
+
+    /// Where the workspace calls the hub and what a call names cannot be
+    /// read, the answer is the doubt, for every project. A doubt of a
+    /// workspace that does not call the hub is none.
+    #[test]
+    fn a_hub_that_is_not_read_with_certainty_is_a_doubt() {
+        let pypi = |files: &[(&str, &str)], project| {
+            reader_of(files, project, "pypi", &["requirements.txt"])
+        };
+        let unwritten = format!("? MODULE.bazel:15 {UNWRITTEN}");
+        for argument in ["    requirements_lock = LOCK,\n", "    **COMMON\n"] {
+            let files = shop_with(PIP, argument);
+            assert_eq!(pypi(&files, "api"), unwritten, "{argument}");
+            assert_eq!(pypi(&files, "mobile"), unwritten, "{argument}");
+            // A call that names a lock of the project is the answer all
+            // the same.
+            let darwin = "pip.parse MODULE.bazel:20 tools/requirements_darwin.txt";
+            let named = reader_of(&files, "tools", "pypi", &["requirements_darwin.txt"]);
+            assert_eq!(named, darwin, "{argument}");
+        }
+        // The proxy is handed on: other calls of the hub may be made.
+        let handed = with(
+            "MODULE.bazel",
+            Box::leak(format!("{ROOT}print(pip)\n").into_boxed_str()),
+        );
+        let said = "? MODULE.bazel:31 `pip` is used other than to call a tag";
+        assert_eq!(pypi(&handed, "mobile"), said);
+        assert_eq!(
+            pypi(&handed, "api"),
+            "pip.parse MODULE.bazel:15 api/requirements.txt"
+        );
+        assert_eq!(reader_of(&handed, "mobile", "gem", &["Gemfile"]), "");
+
+        // A file of the workspace is missing: it may hold a call of the
+        // Python hub, which is called, and one of the Ruby hub, which is
+        // not seen while the root names its ruleset.
+        let missing: Vec<_> = SHOP
+            .into_iter()
+            .filter(|(name, _)| !name.ends_with("ruby.MODULE.bazel"))
+            .collect();
+        let hidden = "? billing/ruby.MODULE.bazel:0 it does not exist; MODULE.bazel:30 includes it";
+        assert_eq!(pypi(&missing, "mobile"), hidden);
+        let gem = reader_of(&missing, "billing", "gem", &["Gemfile", "Gemfile.lock"]);
+        assert_eq!(gem, hidden);
+    }
+
+    /// A file that cannot be read may hold a call of a hub that no file
+    /// shows. Bazel builds one with a byte that is not UTF-8, so the answer
+    /// is a doubt where the root module file or the `WORKSPACE` file is
+    /// such a file, and where another is while a file that was read names
+    /// the ruleset. A doubt of a workspace that names neither ruleset is
+    /// none.
+    #[test]
+    fn a_file_that_cannot_be_read_may_hold_a_call_of_the_hub() {
+        let asked = |files: &[(&str, &str)], ecosystem| {
+            reader_of(files, "svc", ecosystem, &["requirements.txt", "Gemfile"])
+        };
+        let unread = "unreadable: it is not UTF-8";
+        let why = "it cannot be read: it is not UTF-8";
+        let root = [("MODULE.bazel", unread)];
+        for ecosystem in ["pypi", "gem"] {
+            assert_eq!(asked(&root, ecosystem), format!("? MODULE.bazel:0 {why}"));
+        }
+        // An included file, under a root that names the Python ruleset: as
+        // a dependency, or by the file of its extension under a name that
+        // the unread file gives the repository.
+        let include = "include(\"//py:deps.MODULE.bazel\")\n";
+        let said = format!("? py/deps.MODULE.bazel:0 {why}; MODULE.bazel:2 includes it");
+        for names in [
+            "bazel_dep(name = \"rules_python\", version = \"2.5.0-rc4\")\n",
+            "pip = use_extension(\"@py//python/extensions:pip.bzl\", \"pip\")\n",
+        ] {
+            let root = format!("{names}{include}");
+            let files = [
+                ("MODULE.bazel", root.as_str()),
+                ("py/deps.MODULE.bazel", unread),
+            ];
+            assert_eq!(asked(&files, "pypi"), said, "{names}");
+            assert_eq!(asked(&files, "gem"), "", "{names}");
+        }
+        let neither = "bazel_dep(name = \"rules_go\", version = \"0.65.0\")\n";
+        let root = format!("{neither}{include}");
+        let files = [
+            ("MODULE.bazel", root.as_str()),
+            ("py/deps.MODULE.bazel", unread),
+        ];
+        assert_eq!(
+            (asked(&files, "pypi"), asked(&files, "gem")),
+            Default::default()
+        );
+        // The `WORKSPACE` file, beside a `MODULE.bazel` that is read or
+        // alone.
+        let module = ("MODULE.bazel", "module(name = \"shop\")\n");
+        for files in [
+            vec![module, ("WORKSPACE.bazel", unread)],
+            vec![("WORKSPACE", unread)],
+        ] {
+            let said = format!("? {}:0 {why}", files.last().unwrap().0);
+            for ecosystem in ["pypi", "gem"] {
+                assert_eq!(asked(&files, ecosystem), said);
+            }
+        }
+    }
+
+    /// A call of a `WORKSPACE` file that passes one of the hub's files is
+    /// a call of the ruleset's older form, with or without a `MODULE.bazel`.
+    #[test]
+    fn a_workspace_file_that_names_the_lock_counts() {
+        let legacy = "load(\"@rules_python//python:pip.bzl\", \"pip_parse\")\n\
+            pip_parse(\n    name = \"pypi\",\n    requirements_lock = \"//svc:requirements.txt\",\n)\n\
+            rb_bundle_fetch(name = \"bundle\", gemfile = \"//svc:Gemfile\", gemfile_lock = LOCK)\n\
+            http_archive(name = \"x\", requirements = \"//other:requirements.txt\")\n";
+        for files in [with("WORKSPACE", legacy), vec![("WORKSPACE.bazel", legacy)]] {
+            let name = files.last().unwrap().0;
+            let asked =
+                |project, ecosystem, locks: &[&str]| reader_of(&files, project, ecosystem, locks);
+            let pip = format!("pip_parse {name}:2 svc/requirements.txt");
+            assert_eq!(asked("svc", "pypi", &["requirements.txt"]), pip);
+            assert_eq!(asked("other", "pypi", &["requirements.txt"]), "");
+            let gemfile = format!("rb_bundle_fetch {name}:6 svc/Gemfile");
+            assert_eq!(asked("svc", "gem", &["Gemfile", "Gemfile.lock"]), gemfile);
+            let doubt =
+                format!("? {name}:6 the files `rb_bundle_fetch` names are not all written out");
+            assert_eq!(asked("other", "gem", &["Gemfile", "Gemfile.lock"]), doubt);
+        }
+        // A file that calls neither says nothing of them.
+        let rule = "http_archive(name = \"x\", urls = [LOCK])\n";
+        let files = [("WORKSPACE", rule)];
+        assert_eq!(reader_of(&files, "svc", "pypi", &["requirements.txt"]), "");
+        // The name the file gives the main repository names it in a label
+        // of that file; without that call the label is another
+        // repository's.
+        let call =
+            "pip_parse(name = \"pypi\", requirements_lock = \"@shop//svc:requirements.txt\")\n";
+        let named = format!("workspace(name = \"shop\")\n{call}");
+        let files = [("WORKSPACE", named.as_str())];
+        let pip = "pip_parse WORKSPACE:2 svc/requirements.txt";
+        assert_eq!(reader_of(&files, "svc", "pypi", &["requirements.txt"]), pip);
+        let files = [("WORKSPACE", call)];
+        assert_eq!(reader_of(&files, "svc", "pypi", &["requirements.txt"]), "");
+    }
+
+    /// A `WORKSPACE` file is not read by a Bazel of 9 or later. Where the
+    /// checkout names such a release, a call of that file that names the
+    /// lock is no reader of it, one that is not written out is no doubt,
+    /// and neither is a file that cannot be read. A checkout that names an
+    /// older release, none, or something that is no release keeps all
+    /// three, and a call of a module file counts under every release.
+    #[test]
+    fn a_workspace_file_counts_unless_the_checkout_names_bazel_9_or_later() {
+        let module = ("MODULE.bazel", "module(name = \"shop\")\n");
+        let legacy = "pip_parse(name = \"pypi\", requirements_lock = \"//svc:requirements.txt\")\n\
+            rb_bundle_fetch(name = \"bundle\", gemfile = \"//svc:Gemfile\", gemfile_lock = LOCK)\n";
+        let asked = |files: &[(&str, &str)], project, ecosystem| {
+            let locks: &[&str] = match ecosystem {
+                "pypi" => &["requirements.txt"],
+                _ => &["Gemfile", "Gemfile.lock"],
+            };
+            reader_of(files, project, ecosystem, locks)
+        };
+        let pip = "pip_parse WORKSPACE:1 svc/requirements.txt";
+        let gemfile = "rb_bundle_fetch WORKSPACE:2 svc/Gemfile";
+        let unwritten = "? WORKSPACE:2 the files `rb_bundle_fetch` names are not all written out";
+        let unread = "? WORKSPACE:0 it cannot be read: it is not UTF-8";
+        // What names the release, and whether the file then counts.
+        let rows: [(&[(&str, &str)], bool); 9] = [
+            (&[], true),
+            (&[(".bazelversion", "7.7.2\n")], true),
+            (&[(".bazelversion", "8.8.2\n")], true),
+            (&[(".bazelversion", "latest\n")], true),
+            (&[(".bazelversion", "9.3.2rc1\n")], true),
+            (&[(".bazelversion", "9.0.0\n")], false),
+            (&[(".bazelversion", "9.3.2\n")], false),
+            (&[(".bazelversion", "10.0.0\n")], false),
+            (
+                &[
+                    (".bazeliskrc", "USE_BAZEL_VERSION=8.8.2\n"),
+                    (".bazelversion", "9.3.2\n"),
+                ],
+                true,
+            ),
+        ];
+        for (release, counts) in rows {
+            let with = |workspace: &'static str| {
+                let mut files = vec![module, ("WORKSPACE", workspace)];
+                files.extend_from_slice(release);
+                files
+            };
+            let said = |yes: &str| counts.then_some(yes).unwrap_or_default().to_string();
+            let files = with(legacy);
+            assert_eq!(asked(&files, "svc", "pypi"), said(pip), "{release:?}");
+            assert_eq!(asked(&files, "svc", "gem"), said(gemfile), "{release:?}");
+            let other = asked(&files, "other", "gem");
+            assert_eq!(other, said(unwritten), "{release:?}");
+            let files = with("unreadable: it is not UTF-8");
+            for ecosystem in ["pypi", "gem"] {
+                assert_eq!(asked(&files, "svc", ecosystem), said(unread), "{release:?}");
+            }
+        }
+        // A call of a module file is the hub's under Bazel 9 as under any.
+        let mut files = SHOP.to_vec();
+        files.push(("WORKSPACE", legacy));
+        files.push((".bazelversion", "9.3.2\n"));
+        let api = "pip.parse MODULE.bazel:15 api/requirements.txt";
+        assert_eq!(asked(&files, "api", "pypi"), api);
+        assert_eq!(asked(&files, "svc", "pypi"), "");
     }
 
     #[test]

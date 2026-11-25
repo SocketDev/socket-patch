@@ -1,10 +1,10 @@
-//! Hosted mode for a gem that comes through rules_ruby's
+//! Hosted and vendored mode for a gem that comes through rules_ruby's
 //! `ruby.bundle_fetch(gemfile = "//:Gemfile", gemfile_lock = "//:Gemfile.lock")`
 //! under Bzlmod, where `MODULE.bazel` gives no `gem_checksums` and
 //! `Gemfile.lock` has a `CHECKSUMS` section.
 //!
-//! One flow, on the Bazel the run is given ([`FIXTURE`] says which ruleset
-//! goes with its release), in a fresh output base:
+//! The hosted flow, on the Bazel the run is given ([`FIXTURE`] says which
+//! ruleset goes with its release), in a fresh output base:
 //!
 //! - (a) `bazel build` and `bazel run //:consumer` print the unpatched
 //!   marker, and Bazel fetched the upstream gem from the stand-in.
@@ -33,6 +33,17 @@
 //! same scan pins the gem and the build is the patched one. Two tests
 //! without a Bazel hold the command to the same in the fixture's checkout,
 //! with what a person reads and the calls that stand against nothing.
+//!
+//! Vendored mode would commit the unpacked patched gem under
+//! `.socket/vendor/gem` and make `Gemfile` and `Gemfile.lock` name it by
+//! its path from the project, and rules_ruby runs `bundle install` in a
+//! repository of Bazel's that holds the two files and not the copy. So in
+//! this checkout, where the hub reads both files, the command declines the
+//! gem and writes nothing ([`vendored_bundle_fetch`]): the build stays the
+//! unpatched one. With `--allow-vendored-in-bazel` it does what it did
+//! before it declined, and the build fails until `vendor --revert` has put
+//! the two files back. Hosted mode, which the refusal names, then patches
+//! the build.
 //!
 //! Both markers are read from what Bazel built, and each holds an id made
 //! for the run, so no cache of an earlier run can supply either gem. The
@@ -68,20 +79,25 @@
 //! sends the two gems and the patch host to the stand-in. It is there from
 //! the first build on, and step (c) changes no flag. Bundler itself (the
 //! `bundler` gem the lock's `BUNDLED WITH` names) is not rewritten and comes
-//! from rubygems.org.
+//! from rubygems.org. Vendored mode downloads the patched gem itself, from
+//! the patch host: the commands of that mode are told that the stand-in is
+//! that host (`SOCKET_PATCH_SERVER_URL`).
 
 use std::io::Write as _;
 use std::time::Instant;
 
+use base64::Engine as _;
 use serde_json::json;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
+
+use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
 use crate::envelope::{codes_in, event_for};
 use crate::harness::{
-    cell_without_bazel, changed, fixture_path, rewrite, with_vex, Cell, Claim, Fixture, How, Ran,
-    StandIn, Tree, CONSUMER, NOTHING,
+    cell_without_bazel, changed, fixture_path, rewrite, with_vex, Cell, Claim, Declined, Fixture,
+    How, Ran, StandIn, Tree, ALLOW, CONSUMER, NOTHING, VENDORED,
 };
-use crate::hosted_memory_common::{read_tree, Patch};
+use crate::hosted_memory_common::{read_tree, Patch, ORG};
 
 /// The sha256 of `bytes` in lowercase hex, as a `Gemfile.lock` and the gem
 /// index spell a sum.
@@ -168,11 +184,34 @@ fn gem(name: &str, source: &str) -> Vec<u8> {
     ])
 }
 
+/// The one file of the fixture's gem.
+const LIB: &str = "lib/sp_victim.rb";
+
+/// What that file holds in the gem whose consumer prints `status` after
+/// `OUT: `.
+fn source(status: &str) -> String {
+    format!("module SpVictim\n  STATUS = \"{status}\"\nend\n")
+}
+
 /// The fixture's gem, with the text its consumer prints after `OUT: `.
 fn victim(status: &str) -> Vec<u8> {
-    gem(
-        NAME,
-        &format!("module SpVictim\n  STATUS = \"{status}\"\nend\n"),
+    gem(NAME, &source(status))
+}
+
+/// The specification the patch service serves beside a patched gem, which
+/// vendored mode keeps in the copy: what RubyGems prints for the one of
+/// [`gem`] (`Gem::Specification#to_ruby`).
+fn stub() -> String {
+    format!(
+        "# -*- encoding: utf-8 -*-\n# stub: {NAME} {VERSION} ruby lib\n\n\
+         Gem::Specification.new do |s|\n\
+         \x20 s.name = \"{NAME}\".freeze\n\
+         \x20 s.version = \"{VERSION}\".freeze\n\
+         \x20 s.require_paths = [\"lib\".freeze]\n\
+         \x20 s.authors = [\"socket-patch\".freeze]\n\
+         \x20 s.files = [\"{LIB}\".freeze]\n\
+         \x20 s.summary = \"a test fixture\".freeze\n\
+         end\n"
     )
 }
 
@@ -208,67 +247,59 @@ fn gem_route(base: &str, name: &str) -> String {
     format!("/{base}/gems/{name}-{VERSION}.gem")
 }
 
-/// The Socket API on `standin`: one free patch of the fixture's gem, granted
-/// as the gem `patched`, with the artifact `url` (which hosted mode does not
-/// fetch) and the patch registry `index`.
-fn grant(standin: &StandIn, uuid: &str, url: &str, index: &str, patched: &[u8]) {
-    let sum = sha256_hex(patched);
-    let reference = json!({
-        "status": "granted",
-        "url": url,
-        "purl": PURL,
-        "artifacts": [{ "kind": "tarball", "url": url, "integrity": { "sha256": sum } }],
-        "registryOverride": {
-            "kind": "rubygems-compact-index",
-            "indexUrl": index,
-            "identifiers": { "name": NAME, "version": VERSION, "gemChecksumSha256": sum },
-        },
-    });
-    let patch = Patch {
-        purl: PURL.to_string(),
-        uuid: uuid.to_string(),
-        reference,
-    };
-    standin.api(&[patch]);
+/// A sum of `bytes` as a grant spells the one vendored mode holds a
+/// download to.
+fn sha512_sri(bytes: &[u8]) -> String {
+    let digest = base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes));
+    format!("sha512-{digest}")
 }
 
-/// What a flow serves on its stand-in and builds: the upstream gem and the
-/// patched gem, one gem with two texts in its one file, each with an id
-/// that is new for every run. The grant names the patch host as production
-/// does, with a token and the patch id in the paths of the artifact and of
-/// the patch registry.
+/// What a flow builds from and patches with: the fixture's two gems as one
+/// run has them, and one patch of [`NAME`], on a stand-in. Each gem of
+/// [`NAME`] holds an id that is new for every run.
 struct Served {
     standin: StandIn,
     /// The id of the patch.
     uuid: String,
-    /// The line the consumer prints from the upstream gem, and from the
+    /// The line the consumer prints for the upstream gem, and for the
     /// patched one.
     unpatched: String,
     patched: String,
     upstream_gem: Vec<u8>,
     patched_gem: Vec<u8>,
     neighbour_gem: Vec<u8>,
-    /// The patch registry of the grant, and the routes of the gem on
-    /// rubygems.org and on that registry.
+    /// The patch registry of the grant.
     index: String,
+    /// The routes of the stand-in for the upstream gem and for the patched
+    /// one, as Bazel fetches them.
     upstream_route: String,
     patched_route: String,
+    /// The route of the patched gem as vendored mode downloads it.
+    artifact_route: String,
 }
 
 impl Served {
-    /// Starts the stand-in, and sends the downloads of `cell`'s Bazel to it.
-    fn start(cell: &mut Cell) -> Served {
-        let run = uuid::Uuid::new_v4().to_string();
-        let uuid = uuid::Uuid::new_v4().to_string();
-        let token = uuid::Uuid::new_v4().to_string();
-        let patched_gem = victim(&format!("PATCHED {uuid}"));
-        let upstream_gem = victim(&format!("PRISTINE {run}"));
+    /// The stand-in of a flow in `cell`, whose lock then pins the two
+    /// upstream gems of this run, which only the stand-in has.
+    ///
+    /// The grant names the patch host as production does, with a token and
+    /// the patch id in the paths of its artifacts and of the patch
+    /// registry: the patched gem and its specification, which vendored
+    /// mode downloads, and the registry hosted mode writes into the lock.
+    /// The record of the patch holds the hashes of the file it changes.
+    ///
+    /// Bazel's downloads of the fixture's two gems on rubygems.org and of
+    /// anything on the patch host go to the stand-in, under the route
+    /// prefix of the host. A URL of the patch host that no rule rewrote is
+    /// refused, so no download of Bazel's reaches the real one.
+    fn to(cell: &mut Cell) -> Served {
+        let [run, uuid, token] = [(); 3].map(|()| uuid::Uuid::new_v4().to_string());
+        let (pristine, fixed) = (format!("PRISTINE {run}"), format!("PATCHED {uuid}"));
+        let (upstream_gem, patched_gem) = (victim(&pristine), victim(&fixed));
         let neighbour_gem = neighbour();
         let registry = format!("{PATCH_HOST}/patch-registry/gem/{token}/{uuid}");
         let index = format!("https://{registry}/");
-        let artifact = format!(
-            "https://{PATCH_HOST}/patch/gem/{NAME}/{VERSION}/{token}/{uuid}/{NAME}-{VERSION}.gem"
-        );
+        let artifacts = format!("/patch/gem/{NAME}/{VERSION}/{token}/{uuid}/{NAME}-{VERSION}");
         let (upstream_route, patched_route) =
             (gem_route(RUBYGEMS, NAME), gem_route(&registry, NAME));
 
@@ -277,15 +308,56 @@ impl Served {
         standin.serve(5, &upstream_route, &upstream_gem);
         standin.serve(5, &gem_route(RUBYGEMS, NEIGHBOUR), &neighbour_gem);
         standin.serve(5, &patched_route, &patched_gem);
-        // What `rollback` reads to restore the upstream `CHECKSUMS` line: the
-        // gem's file of the compact index, one line per version.
+        // What `rollback` reads to restore the upstream `CHECKSUMS` line:
+        // the gem's file of the compact index, one line per version.
         let info = format!("---\n{VERSION} |checksum:{}\n", sha256_hex(&upstream_gem));
         standin.serve(5, &format!("/{RUBYGEMS}/info/{NAME}"), info.as_bytes());
-        grant(&standin, &uuid, &artifact, &index, &patched_gem);
-        // Bazel's downloads of the fixture's two gems on rubygems.org and of
-        // anything on the patch host go to the stand-in, under the route
-        // prefix of the host. A URL of the patch host that no rule rewrote is
-        // refused, so no download of Bazel's reaches the real one.
+
+        let sum = sha256_hex(&patched_gem);
+        let url = |file: &str| format!("https://{PATCH_HOST}{artifacts}.{file}");
+        let stub = stub();
+        standin.serve(5, &format!("{artifacts}.gem"), &patched_gem);
+        standin.serve(5, &format!("{artifacts}.gemspec"), stub.as_bytes());
+        let reference = json!({
+            "status": "granted",
+            "url": url("gem"),
+            "purl": PURL,
+            "artifacts": [{
+                "kind": "tarball",
+                "url": url("gem"),
+                "integrity": { "sha256": sum, "sha512": sha512_sri(&patched_gem) },
+            }, {
+                "kind": "gem-stub-gemspec",
+                "url": url("gemspec"),
+                "integrity": { "sha512": sha512_sri(stub.as_bytes()) },
+            }],
+            "registryOverride": {
+                "kind": "rubygems-compact-index",
+                "indexUrl": index,
+                "identifiers": { "name": NAME, "version": VERSION, "gemChecksumSha256": sum },
+            },
+        });
+        standin.api(&[Patch {
+            purl: PURL.to_string(),
+            uuid: uuid.clone(),
+            reference,
+        }]);
+        let hash = |status: &str| compute_git_sha256_from_bytes(source(status).as_bytes());
+        let record = json!({
+            "uuid": uuid,
+            "purl": PURL,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": { LIB: { "beforeHash": hash(&pristine), "afterHash": hash(&fixed) } },
+            "vulnerabilities": { "GHSA-test-aaaa-bbbb": {
+                "cves": ["CVE-2024-0001"], "summary": "s", "severity": "high", "description": "d",
+            }},
+            "description": "fixture",
+            "license": "MIT",
+            "tier": "free",
+        });
+        let record_route = format!("/v0/orgs/{ORG}/patches/view/{uuid}");
+        standin.serve(1, &record_route, record.to_string().as_bytes());
+
         let gems = |name: &str| rewrite(&format!("{RUBYGEMS}/gems/{name}-"), &origin);
         cell.route_downloads(&[
             gems(NAME),
@@ -293,26 +365,36 @@ impl Served {
             rewrite(&format!("{PATCH_HOST}/"), &origin),
             format!("block {PATCH_HOST}"),
         ]);
+        cell.write("Gemfile.lock", lock_pinning(&neighbour_gem, &upstream_gem));
         Served {
             standin,
-            unpatched: format!("OUT: PRISTINE {run}"),
-            patched: format!("OUT: PATCHED {uuid}"),
             uuid,
+            unpatched: format!("OUT: {pristine}"),
+            patched: format!("OUT: {fixed}"),
             upstream_gem,
             patched_gem,
             neighbour_gem,
             index,
             upstream_route,
             patched_route,
+            artifact_route: format!("{artifacts}.gem"),
         }
     }
 }
 
-/// `socket-patch <args>` in `cell`, against `standin`.
-fn socket_patch_at(standin: &StandIn, cell: &Cell, args: &[&str]) -> Ran {
+/// `socket-patch <args>` in `cell`, with `standin` as the Socket API and as
+/// rubygems.org, and with the variables `env` as well.
+fn run(standin: &StandIn, cell: &Cell, args: &[&str], env: &[(&str, &str)]) -> Ran {
     let origin = standin.origin();
     let rubygems = format!("{origin}/{RUBYGEMS}");
-    cell.socket_patch(&origin, args, &[("SOCKET_RUBYGEMS_URL", rubygems.as_str())])
+    let env = [&[("SOCKET_RUBYGEMS_URL", rubygems.as_str())], env].concat();
+    cell.socket_patch(&origin, args, &env)
+}
+
+/// `text` without its white space: a line a terminal may have wrapped, or a
+/// message Bundler broke at the width of its console.
+fn squeezed(text: &str) -> String {
+    text.split_whitespace().collect()
 }
 
 /// The flow of the module docs.
@@ -325,6 +407,7 @@ fn hosted_bundle_fetch() {
         return;
     };
     let release = cell.release().to_string();
+
     let Served {
         standin,
         uuid,
@@ -332,17 +415,15 @@ fn hosted_bundle_fetch() {
         patched,
         upstream_gem,
         patched_gem,
-        neighbour_gem,
         index,
         upstream_route,
         patched_route,
-    } = Served::start(&mut cell);
+        ..
+    } = Served::to(&mut cell);
     let origin = standin.origin();
-    let socket_patch = |cell: &Cell, args: &[&str]| socket_patch_at(&standin, cell, args);
+    let socket_patch = |cell: &Cell, args: &[&str]| run(&standin, cell, args, &[]);
 
-    // (a) The unpatched build. The lock of the checkout pins the two
-    // upstream gems of this run, which only the stand-in has.
-    cell.write("Gemfile.lock", lock_pinning(&neighbour_gem, &upstream_gem));
+    // (a) The unpatched build, from the upstream gem of this run.
     let before = cell.builds_unpatched(&unpatched);
     let upstream_fetches = standin.asked(&upstream_route);
     assert!(
@@ -558,9 +639,9 @@ fn hosted_bundle_fetch_gem_checksums() {
         return;
     };
     let release = cell.release().to_string();
-    let served = Served::start(&mut cell);
+    let served = Served::to(&mut cell);
     let standin = &served.standin;
-    let socket_patch = |cell: &Cell, args: &[&str]| socket_patch_at(standin, cell, args);
+    let socket_patch = |cell: &Cell, args: &[&str]| run(standin, cell, args, &[]);
     let (other, upstream, patched) = (
         sha256_hex(&served.neighbour_gem),
         sha256_hex(&served.upstream_gem),
@@ -569,11 +650,7 @@ fn hosted_bundle_fetch_gem_checksums() {
     let files = ["Gemfile", "Gemfile.lock"];
 
     // (a) The unpatched build, with the two upstream gems pinned in the
-    // lock and in the call.
-    cell.write(
-        "Gemfile.lock",
-        lock_pinning(&served.neighbour_gem, &served.upstream_gem),
-    );
+    // lock, as `Served::to` left it, and in the call.
     let held = module_pinning(&[(NEIGHBOUR, &other), (NAME, &upstream)]);
     cell.write("MODULE.bazel", &held);
     let before = cell.builds_unpatched(&served.unpatched);
@@ -646,11 +723,147 @@ fn hosted_bundle_fetch_gem_checksums() {
     );
 }
 
+/// The code under which vendored mode declines a gem whose Gemfile or lock
+/// a hub of the workspace reads, and what a refusal has to name in the
+/// fixture's checkout: the hub's call with its line in `MODULE.bazel`, and
+/// the file it reads.
+const DECLINED: Declined = Declined {
+    purl: PURL,
+    code: "vendor_gem_bazel_hub",
+    names: &[
+        "`ruby.bundle_fetch` (MODULE.bazel:15)",
+        "names Gemfile.lock; ",
+    ],
+};
+
+/// The variables of a command of vendored mode, which downloads the
+/// patched gem from the patch host: the stand-in at `origin` is that host.
+fn patch_host(origin: &str) -> [(&str, &str); 1] {
+    [("SOCKET_PATCH_SERVER_URL", origin)]
+}
+
+/// Vendored mode beside a hub that reads the Gemfile and its lock.
+///
+/// - (a) `bazel build` and `bazel run //:consumer` print the unpatched
+///   marker.
+/// - (b) `socket-patch scan --mode vendored --yes` declines the gem: it
+///   exits 1, names the call of `MODULE.bazel` that reads the lock, hosted
+///   mode and the switch, writes nothing and downloads no gem. The same
+///   two Bazel commands print the unpatched marker, and change no file.
+/// - (c) With `--allow-vendored-in-bazel` the command does what it did
+///   before it declined: it passes and reports the gem vendored. It
+///   commits the unpacked patched gem, with its specification and its
+///   ledger, under `.socket/vendor`, and makes the declaration of
+///   `Gemfile` and a `PATH` section of `Gemfile.lock` name that copy by
+///   its path from the project. The same `bazel build` fails: rules_ruby
+///   copies `Gemfile` and `Gemfile.lock` into a repository of Bazel's and
+///   runs `bundle install` there, where the path names nothing. `vex`
+///   attests the gem as patched all the same: it reads the committed
+///   copy, and what rules_ruby builds from one is not judged.
+/// - (d) `socket-patch vendor --revert`, which takes no switch: every file
+///   of the checkout is the one of before, and the build prints the
+///   unpatched marker again.
+/// - (e) Hosted mode, which the refusal names: the same two Bazel commands
+///   print the patched marker.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn vendored_bundle_fetch() {
+    let test = "ruby::vendored_bundle_fetch";
+    let started = Instant::now();
+    let Some(mut cell) = Cell::open(test, &FIXTURE) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let served = Served::to(&mut cell);
+    let (standin, uuid) = (&served.standin, served.uuid.as_str());
+    let origin = standin.origin();
+    let vendoring = |args: &[&str]| run(standin, &cell, args, &patch_host(&origin));
+
+    // (a) The unpatched build.
+    let before = cell.builds_unpatched(&served.unpatched);
+
+    // (b) The one command of vendored mode: declined, with nothing written
+    // and nothing of the patch fetched. The same build passes, on the
+    // upstream gem.
+    cell.declined(&vendoring(&VENDORED), &DECLINED, 1, "failed", &before);
+    assert_eq!(standin.asked(&served.artifact_route), 0, "{test}");
+    cell.builds_patched(&before, &served.unpatched);
+
+    // (c) On the user's word: the copy, its ledger, and the two files that
+    // name it.
+    let scan = vendoring(&[&VENDORED[..], &[ALLOW]].concat());
+    let said = &scan.dump;
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
+    let vendored = cell.tree();
+    let kept = format!(".socket/vendor/gem/{uuid}");
+    let copy = format!("{kept}/{NAME}-{VERSION}");
+    let mut written = vec![
+        format!("{kept}/socket-patch.vendor.json"),
+        format!("{copy}/{LIB}"),
+        format!("{copy}/{NAME}.gemspec"),
+        ".socket/vendor/state.json".to_string(),
+        "Gemfile".to_string(),
+        "Gemfile.lock".to_string(),
+    ];
+    written.sort();
+    assert_eq!(changed(&before, &vendored), written, "{test}: {said}");
+    let patched_source = source(&format!("PATCHED {uuid}"));
+    let lib = &vendored[&format!("{copy}/{LIB}")];
+    assert_eq!(*lib, patched_source.as_bytes(), "{test}");
+    let text = |rel: &str| String::from_utf8(vendored[rel].clone()).expect("a text file");
+    let (gemfile, lock) = (text("Gemfile"), text("Gemfile.lock"));
+    let declaration = format!("gem \"{NAME}\", \"{VERSION}\", path: \"{copy}\"");
+    let declared = gemfile.lines().filter(|line| *line == declaration).count();
+    assert_eq!(declared, 1, "{test}: Gemfile:\n{gemfile}");
+    let section = format!("PATH\n  remote: {copy}\n  specs:\n    {NAME} ({VERSION})\n\n");
+    assert!(lock.starts_with(&section), "{test}: Gemfile.lock:\n{lock}");
+
+    // The same build fails where rules_ruby runs Bundler, on the path of
+    // the copy, and changes no file of the checkout. Bundler breaks the
+    // message at the width of its console, so it is compared without white
+    // space.
+    let build = cell.bazel("build", &[CONSUMER]);
+    let stderr = squeezed(&build.stderr());
+    let missing = squeezed(&format!("{copy}` does not exist."));
+    assert!(
+        !build.ok() && stderr.contains("Runningbundleinstall") && stderr.contains(&missing),
+        "{test}: the build did not fail on the path of the copy ({missing:?}):\n{}",
+        build.dump()
+    );
+    assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{test}");
+    let socket_patch = |cell: &Cell, args: &[&str]| run(standin, cell, args, &[]);
+    cell.stands_alone(socket_patch, &Claim::new(PURL, uuid, How::Vendored), true);
+
+    // (d) The undo: every file is the one of before, and so is the build.
+    let undo = socket_patch(&cell, &["vendor", "--revert", "--yes"]);
+    cell.undone(&undo, "removed", &before, &served.unpatched);
+
+    // (e) The remedy the refusal names: hosted mode patches the build.
+    let scan = socket_patch(&cell, &["scan", "--mode", "hosted", "--yes"]);
+    let pinned = cell.pinned_by(&scan, PURL, uuid, &before, &["Gemfile", "Gemfile.lock"]);
+    cell.builds_patched(&pinned, &served.patched);
+
+    println!(
+        "{test}: Bazel {release} built {:?}; `scan --mode vendored` declined ({}), wrote \
+         nothing, and the build stayed the same; with {ALLOW} it wrote {copy} and pointed \
+         Gemfile and Gemfile.lock at it, and the next build failed (Bundler: The path ... does \
+         not exist) while `vex` attested the gem; `vendor --revert` restored all {} files and \
+         the build; `scan --mode hosted` built {:?}; {:?}",
+        served.unpatched,
+        DECLINED.code,
+        before.len(),
+        served.patched,
+        started.elapsed()
+    );
+}
+
 /// Without a Bazel: the fixture in a checkout of its own, with the lock
 /// that pins the two upstream gems of `served` and `module` as its
 /// `MODULE.bazel`; `None` leaves the checkout without one, in no Bazel
 /// workspace.
-fn checkout(served: &Served, module: Option<&str>) -> Cell {
+fn checkout_with(served: &Served, module: Option<&str>) -> Cell {
     let cell = cell_without_bazel("9.3.2");
     for part in ["common", "e9"] {
         for (rel, bytes) in read_tree(&fixture_path(FIXTURE.dir).join(part)) {
@@ -669,9 +882,163 @@ fn checkout(served: &Served, module: Option<&str>) -> Cell {
     cell
 }
 
-/// `text` without its white space: a line a terminal may have wrapped.
-fn unspaced(text: &str) -> String {
-    text.split_whitespace().collect()
+/// Without a Bazel: the fixture in a checkout of its own, as it is, whose
+/// lock pins the gems of the stand-in that comes with it.
+fn checkout() -> (Cell, Served) {
+    let served = Served::to(&mut cell_without_bazel("9.3.2"));
+    let module = fixture_path(FIXTURE.dir).join("e9/MODULE.bazel");
+    let module = std::fs::read_to_string(module).expect("the fixture's MODULE.bazel");
+    (checkout_with(&served, Some(&module)), served)
+}
+
+/// Without a Bazel: in the fixture's checkout, where the hub reads the
+/// Gemfile and its lock, every command that would vendor the gem declines
+/// it, writes nothing and fetches no gem. On the user's word vendored mode
+/// goes on, and a later run without it passes and writes nothing: the lock
+/// the hub reads already names the copy.
+#[test]
+fn every_command_that_would_vendor_declines_beside_a_hub_that_reads_the_lock() {
+    let (cell, served) = checkout();
+    let standin = &served.standin;
+    let origin = standin.origin();
+    let run = |cell: &Cell, args: &[&str], env: &[(&str, &str)]| {
+        run(
+            standin,
+            cell,
+            args,
+            &[&patch_host(&origin)[..], env].concat(),
+        )
+    };
+    let module = String::from_utf8(cell.tree()["MODULE.bazel"].clone()).expect("a text file");
+    let called = module.lines().nth(14);
+    assert_eq!(called, Some("ruby.bundle_fetch("), "{}", DECLINED.names[0]);
+    let before = cell.tree();
+    cell.declines_every_vendoring(run, &DECLINED);
+    assert_eq!(standin.asked(&served.artifact_route), 0);
+    let undo = run(&cell, &["rollback", "--yes"], &[]);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", undo.dump);
+    cell.vendors_on_the_users_word(run, &DECLINED);
+}
+
+/// Without a Bazel: the refusal is the project's whose files a hub reads,
+/// and no other's. In a workspace whose hub reads the files of another
+/// project, and in no workspace at all, vendored mode vendors the gem as
+/// it did, with no switch. Where the files the hub is given are not
+/// written out in `MODULE.bazel`, the gem is declined, and the refusal
+/// names the call and the reason.
+#[test]
+fn vendored_mode_goes_on_where_no_hub_reads_the_lock() {
+    let own = [
+        "gemfile = \"//:Gemfile\"",
+        "gemfile_lock = \"//:Gemfile.lock\"",
+    ];
+    let reads = |cell: &Cell, files: [&str; 2]| {
+        let module = String::from_utf8(cell.tree()["MODULE.bazel"].clone()).expect("a text file");
+        let other = module.replace(own[0], files[0]).replace(own[1], files[1]);
+        assert_ne!(other, module);
+        cell.write("MODULE.bazel", other);
+    };
+    let scan = |cell: &Cell, served: &Served| {
+        let origin = served.standin.origin();
+        run(&served.standin, cell, &VENDORED, &patch_host(&origin))
+    };
+    let vendors = |cell: &Cell, served: &Served| {
+        let scan = scan(cell, served);
+        assert_eq!(scan.code, 0, "{}", scan.dump);
+        assert_eq!(scan.envelope["summary"]["applied"], 1, "{}", scan.dump);
+    };
+    let (cell, served) = checkout();
+    reads(
+        &cell,
+        [
+            "gemfile = \"//svc:Gemfile\"",
+            "gemfile_lock = \"//svc:Gemfile.lock\"",
+        ],
+    );
+    vendors(&cell, &served);
+    let (cell, served) = checkout();
+    std::fs::remove_file(cell.path("MODULE.bazel")).expect("MODULE.bazel");
+    vendors(&cell, &served);
+
+    // Files that are not written out: the hub may read any.
+    let (cell, served) = checkout();
+    reads(&cell, ["gemfile = GEMFILE", "gemfile_lock = LOCK"]);
+    let package = Declined {
+        names: &[
+            "(MODULE.bazel:15: the files `ruby.bundle_fetch` names",
+            "cannot be read with certainty",
+        ],
+        ..DECLINED
+    };
+    let before = cell.tree();
+    cell.declined(&scan(&cell, &served), &package, 1, "failed", &before);
+}
+
+/// Without a Bazel: a `WORKSPACE` file that a migration left behind still
+/// hands the Gemfile and its lock to the ruleset's older rule, beside a
+/// `MODULE.bazel` whose hub reads the files of another project. Bazel 9
+/// never reads a `WORKSPACE` file, so where the checkout names a release of
+/// 9 or later the gem is vendored as it is without that file. Where it
+/// names an older release, none, or one that is no release, a Bazel that
+/// reads the file may build the checkout: the gem is declined, and the
+/// refusal names the call of the `WORKSPACE` file.
+#[test]
+fn a_workspace_file_counts_unless_the_checkout_names_bazel_9_or_later() {
+    let legacy = "rb_bundle_fetch(\n    name = \"bundle\",\n    gemfile = \"//:Gemfile\",\n    \
+                  gemfile_lock = \"//:Gemfile.lock\",\n)\n";
+    // The fixture's checkout with a hub that reads the files of another
+    // project, the `WORKSPACE` file where it is `kept`, and what names
+    // the Bazel release.
+    let retained = |release: Option<&str>, kept: bool| {
+        let (cell, served) = checkout();
+        let module = String::from_utf8(cell.tree()["MODULE.bazel"].clone()).expect("a text file");
+        let other = module.replace("\"//:Gemfile", "\"//svc:Gemfile");
+        assert_ne!(other, module);
+        cell.write("MODULE.bazel", other);
+        if kept {
+            cell.write("WORKSPACE", legacy);
+        }
+        if let Some(release) = release {
+            cell.write(".bazelversion", format!("{release}\n"));
+        }
+        (cell, served)
+    };
+    let scan = |cell: &Cell, served: &Served| {
+        let origin = served.standin.origin();
+        run(&served.standin, cell, &VENDORED, &patch_host(&origin))
+    };
+    // A run that vendors the gem by its path, and the files it writes,
+    // with the id of the patch left out of their names.
+    let vendors = |cell: &Cell, served: &Served| -> Vec<String> {
+        let before = cell.tree();
+        let ran = scan(cell, served);
+        assert_eq!(ran.code, 0, "{}", ran.dump);
+        assert_eq!(ran.envelope["summary"]["applied"], 1, "{}", ran.dump);
+        let after = cell.tree();
+        let copy = format!(".socket/vendor/gem/{}/{NAME}-{VERSION}", served.uuid);
+        let lock = String::from_utf8_lossy(&after["Gemfile.lock"]);
+        let section = format!("PATH\n  remote: {copy}\n");
+        assert!(lock.starts_with(&section), "{lock}");
+        let written = changed(&before, &after).into_iter();
+        written
+            .map(|path| path.replace(&served.uuid, "<id>"))
+            .collect()
+    };
+    let (cell, served) = retained(Some("9.3.2"), false);
+    let written = vendors(&cell, &served);
+    for release in ["9.3.2", "9.0.0", "10.0.0"] {
+        let (cell, served) = retained(Some(release), true);
+        assert_eq!(vendors(&cell, &served), written, "{release}");
+    }
+    let package = Declined {
+        names: &["`rb_bundle_fetch` (WORKSPACE:1)", "names Gemfile.lock; "],
+        ..DECLINED
+    };
+    for release in [Some("7.7.2"), Some("8.8.2"), None, Some("latest")] {
+        let (cell, served) = retained(release, true);
+        let before = cell.tree();
+        cell.declined(&scan(&cell, &served), &package, 1, "failed", &before);
+    }
 }
 
 /// Without a Bazel: steps (b), (d) and (f) of
@@ -682,8 +1049,8 @@ fn unspaced(text: &str) -> String {
 /// `MODULE.bazel`, and `rollback` restores them and leaves the call.
 #[test]
 fn a_gem_that_the_hub_holds_to_its_upstream_sha256_is_left_alone() {
-    let served = Served::start(&mut cell_without_bazel("9.3.2"));
-    let run = |cell: &Cell, args: &[&str]| socket_patch_at(&served.standin, cell, args);
+    let served = Served::to(&mut cell_without_bazel("9.3.2"));
+    let run = |cell: &Cell, args: &[&str]| run(&served.standin, cell, args, &[]);
     let (other, upstream, patched) = (
         sha256_hex(&served.neighbour_gem),
         sha256_hex(&served.upstream_gem),
@@ -691,13 +1058,13 @@ fn a_gem_that_the_hub_holds_to_its_upstream_sha256_is_left_alone() {
     );
     let hosted = ["scan", "--mode", "hosted", "--yes"];
     let files = ["Gemfile", "Gemfile.lock"];
-    let plain = checkout(&served, None);
+    let plain = checkout_with(&served, None);
     let before = plain.tree();
     let scan = run(&plain, &hosted);
     let plain = plain.pinned_by(&scan, PURL, &served.uuid, &before, &files);
 
     let held = module_pinning(&[(NEIGHBOUR, &other), (NAME, &upstream)]);
-    let cell = checkout(&served, Some(&held));
+    let cell = checkout_with(&served, Some(&held));
     let before = cell.tree();
     let warned = left_alone(&cell, &run(&cell, &hosted), &before);
     assert_eq!(way_on(&warned), (patched.as_str(), true), "{warned}");
@@ -725,8 +1092,8 @@ fn a_gem_that_the_hub_holds_to_its_upstream_sha256_is_left_alone() {
         "  {PURL}: no lockfile entry pinning it could be rewritten (see the warning below)"
     );
     assert!(stderr.lines().any(|line| line == unpinned), "{said}");
-    let warning = unspaced(&format!("Warning: {warned}"));
-    assert!(unspaced(&stderr).contains(&warning), "{said}");
+    let warning = squeezed(&format!("Warning: {warned}"));
+    assert!(squeezed(&stderr).contains(&warning), "{said}");
     assert_eq!(changed(&before, &cell.tree()), NOTHING, "{said}");
 
     // A pin that an earlier release wrote beside the entry stays: the scan
@@ -785,10 +1152,10 @@ fn a_gem_that_the_hub_holds_to_its_upstream_sha256_is_left_alone() {
 /// the call. Without the variable it leaves the gem alone there.
 #[test]
 fn the_switch_makes_a_hosted_scan_the_one_of_a_checkout_without_bazel() {
-    let served = Served::start(&mut cell_without_bazel("9.3.2"));
+    let served = Served::to(&mut cell_without_bazel("9.3.2"));
     let sums = [&served.neighbour_gem, &served.upstream_gem].map(|gem| sha256_hex(gem));
     let held = module_pinning(&[(NEIGHBOUR, &sums[0]), (NAME, &sums[1])]);
-    let cell = checkout(&served, Some(&held));
+    let cell = checkout_with(&served, Some(&held));
     let origin = served.standin.origin();
     let rubygems = format!("{origin}/{RUBYGEMS}");
     let env = [("SOCKET_RUBYGEMS_URL", rubygems.as_str())];
@@ -797,6 +1164,23 @@ fn the_switch_makes_a_hosted_scan_the_one_of_a_checkout_without_bazel() {
     let said = left_alone[0]["stdout"].as_str().expect("an envelope");
     let envelope: serde_json::Value = serde_json::from_str(said).expect("an envelope");
     assert_eq!(codes_in(&envelope["warnings"]), [HELD], "{left_alone:#}");
+}
+
+/// Without a Bazel: with `SOCKET_NO_BAZEL=1` vendored mode vendors the gem
+/// whose lock the hub reads, as it does in the same checkout without its
+/// `MODULE.bazel`, to the byte. Without the variable it declines the gem
+/// there.
+#[test]
+fn the_switch_makes_vendored_mode_the_one_of_a_checkout_without_bazel() {
+    let (cell, served) = checkout();
+    let origin = served.standin.origin();
+    let rubygems = format!("{origin}/{RUBYGEMS}");
+    let env = [
+        ("SOCKET_RUBYGEMS_URL", rubygems.as_str()),
+        patch_host(&origin)[0],
+    ];
+    let declined = cell.off_is_without_bazel(&origin, &VENDORED, &env, &["MODULE.bazel"]);
+    assert_eq!(declined[0]["code"], 1, "{declined:#}");
 }
 
 /// Without a Bazel: what else a call can say, each as the `MODULE.bazel`
@@ -809,8 +1193,8 @@ fn the_switch_makes_a_hosted_scan_the_one_of_a_checkout_without_bazel() {
 /// `MODULE.bazel`.
 #[test]
 fn a_call_stands_against_a_gem_only_where_it_may_hold_it() {
-    let served = Served::start(&mut cell_without_bazel("9.3.2"));
-    let run = |cell: &Cell, args: &[&str]| socket_patch_at(&served.standin, cell, args);
+    let served = Served::to(&mut cell_without_bazel("9.3.2"));
+    let run = |cell: &Cell, args: &[&str]| run(&served.standin, cell, args, &[]);
     let (upstream, patched) = (
         sha256_hex(&served.upstream_gem),
         sha256_hex(&served.patched_gem),
@@ -820,7 +1204,7 @@ fn a_call_stands_against_a_gem_only_where_it_may_hold_it() {
     let held = module_pinning(&[(NAME, &upstream)]);
 
     // A lock that Bundler holds no gem to.
-    let cell = checkout(&served, Some(&held));
+    let cell = checkout_with(&served, Some(&held));
     let lock = lock_pinning(&served.neighbour_gem, &served.upstream_gem);
     let (unchecked, _) = lock.split_once("CHECKSUMS\n").expect("the section");
     cell.write(
@@ -835,7 +1219,7 @@ fn a_call_stands_against_a_gem_only_where_it_may_hold_it() {
     let (calls, _) = held.split_once("    gem_checksums = {").expect("the dict");
     let unread = format!("{calls}    gem_checksums = HELD,\n)\n");
     let unread = unread.replace("ruby.bundle_fetch(", "HELD = {}\n\nruby.bundle_fetch(");
-    let cell = checkout(&served, Some(&unread));
+    let cell = checkout_with(&served, Some(&unread));
     let before = cell.tree();
     let scan = run(&cell, &hosted);
     let warned = codes_in(&scan.envelope["warnings"]);
@@ -849,7 +1233,7 @@ fn a_call_stands_against_a_gem_only_where_it_may_hold_it() {
     assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", scan.dump);
 
     // Nothing stands against the gem: as without a `MODULE.bazel`.
-    let plain = checkout(&served, None);
+    let plain = checkout_with(&served, None);
     let before = plain.tree();
     let scan = run(&plain, &hosted);
     let plain = plain.pinned_by(&scan, PURL, &served.uuid, &before, &files);
@@ -858,7 +1242,7 @@ fn a_call_stands_against_a_gem_only_where_it_may_hold_it() {
     let unheld = std::fs::read_to_string(unheld).expect("the fixture's MODULE.bazel");
     for module in [elsewhere, unheld] {
         assert!(module.contains("ruby.bundle_fetch("), "{module}");
-        let cell = checkout(&served, Some(&module));
+        let cell = checkout_with(&served, Some(&module));
         let before = cell.tree();
         let scan = run(&cell, &hosted);
         let pinned = cell.pinned_by(&scan, PURL, &served.uuid, &before, &files);
