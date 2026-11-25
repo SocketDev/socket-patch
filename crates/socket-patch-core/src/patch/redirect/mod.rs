@@ -419,6 +419,16 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub confirmed_gem_uuids: std::collections::BTreeSet<String>,
+    /// For each of [`Self::confirmed_gem_uuids`]: the uuid of the patch
+    /// whose registry the lock names as the gem's one source (the registry
+    /// of any patch of a fix serves every build of it). That is the fix's
+    /// source patch, or the patch of one locked build where the source is
+    /// not available. Lockfile discovery reads that one uuid for the gem.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")
+    )]
+    pub gem_anchor_uuids: std::collections::BTreeMap<String, String>,
     /// Gem patch uuids the lock has no build for: a patch of a platform it
     /// does not name, the ruby gem's patch beside a lock of platform
     /// builds only (its registry may still be the gem's source), a patch
@@ -1007,6 +1017,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         confirmed_bazel_maven_uuids,
         gem_family_uuids,
         confirmed_gem_uuids,
+        gem_anchor_uuids,
         gem_idle_uuids,
     } = delta;
     result.files.extend(files);
@@ -1069,6 +1080,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         .extend(confirmed_bazel_maven_uuids);
     result.gem_family_uuids.extend(gem_family_uuids);
     result.confirmed_gem_uuids.extend(confirmed_gem_uuids);
+    result.gem_anchor_uuids.extend(gem_anchor_uuids);
     result.gem_idle_uuids.extend(gem_idle_uuids);
 }
 
@@ -8918,12 +8930,72 @@ fn gem_patch_sha256(dep: &DepOverride) -> Option<String> {
         .or_else(|| dep.integrity.sha256.clone())
 }
 
+/// Warning code of a gem locked as platform builds that takes the registry
+/// of one locked build's patch as its source, because the patch its builds
+/// were built from is not available to the run. The gem is moved all the
+/// same; the warning says which registry it is on and what follows.
+pub const GEM_MEMBER_REGISTRY: &str = "redirect_gem_member_registry";
+
+/// The patch whose registry a gem locked as platform builds takes as its
+/// one source. The registry of any patch of a fix lists and serves every
+/// gem of the fix, so any of them works; the choice only decides which URL
+/// the manifest and the lock carry. In order:
+///
+/// 1. the patch whose registry `lock` already takes the gem from, when it
+///    is the fix's source patch or the patch of a build the lock still
+///    names: a pair that works is not rewritten for another URL of the
+///    same fix (so a gem that was moved while the source patch was not
+///    available stays where it is when that patch turns up later);
+/// 2. the fix's source patch (`source`), where the run has it: its
+///    registry is the same whichever platforms the lock names;
+/// 3. the patch of the first build the lock names (`of_builds`: the
+///    lock's order, platforms sorted as Bundler sorts them).
+fn gem_anchor<'a>(
+    lock: &crate::formats::gem::GemfileLock<'_>,
+    source: Option<&'a DepOverride>,
+    of_builds: &[&'a DepOverride],
+) -> &'a DepOverride {
+    let eligible = || source.into_iter().chain(of_builds.iter().copied());
+    let (name, version) = (of_builds[0].name.as_str(), of_builds[0].version.as_str());
+    // The remotes of the `GEM` sections that list the gem at this version.
+    let remotes: Vec<&str> = lock
+        .gem_sections()
+        .filter(|section| {
+            let mut specs = section.specs.iter().filter_map(|line| line.parsed);
+            specs.any(|spec| spec.name == name && spec.version == version)
+        })
+        .flat_map(|section| section.remote_bases())
+        .collect();
+    let in_use = eligible().find(|dep| {
+        let Some(ov) = registry_override_of_kind(dep, "rubygems-compact-index") else {
+            return false;
+        };
+        let index_url = ov.index_url.trim_end_matches('/');
+        let Ok(registry) =
+            regex::Regex::new(&format!("^{}$", gem_index_url_pattern(dep, index_url)))
+        else {
+            return false;
+        };
+        let own = format!("/{}", dep.patch_uuid);
+        remotes
+            .iter()
+            .any(|remote| remote.ends_with(&own) && registry.is_match(remote))
+    });
+    in_use.or(source).unwrap_or(of_builds[0])
+}
+
 /// How a gem locked as platform builds is pinned ([`gem_family_pins`]).
 struct GemFamilyPins<'a> {
-    /// The source patch of the fix: its registry becomes the gem's one
-    /// source. It stays the same whichever platforms the lock names, so
-    /// the manifest's `source:` URL does not change when one is added.
-    source: &'a DepOverride,
+    /// The patch whose registry becomes the gem's one source
+    /// ([`gem_anchor`]): the fix's source patch where the run has it. Its
+    /// registry stays the same whichever platforms the lock names, so the
+    /// manifest's `source:` URL does not change when one is added.
+    anchor: &'a DepOverride,
+    /// The platform of the anchor and the fix's uuid, when the anchor is
+    /// the patch of a locked build because the fix's source patch is not
+    /// available to the run: said once, as
+    /// [`GEM_MEMBER_REGISTRY`].
+    member_anchor: Option<(&'a str, &'a str)>,
     /// `(token, sha256)` per build the lock names, each from the patch of
     /// that build.
     checksums: Vec<(String, String)>,
@@ -8933,8 +9005,8 @@ struct GemFamilyPins<'a> {
 
 /// The pins of a gem the lock names as platform builds (`builds`), from the
 /// patches handed in for that gem version (`group`): one patch per locked
-/// build, all of one fix ([`gem_family`]), and the source patch of that
-/// fix. `Err` is the `redirect_gem_platform_unsupported` warning of a gem
+/// build, all of one fix ([`gem_family`]), and the patch whose registry
+/// the gem takes as its source ([`gem_anchor`]). `Err` is the `redirect_gem_platform_unsupported` warning of a gem
 /// that cannot be moved (`redirect_gem_missing_sha256` for a patch that
 /// states no sha256 for its gem), with nothing planned for it:
 ///
@@ -8943,13 +9015,13 @@ struct GemFamilyPins<'a> {
 /// * no one fix has a patch for every locked build. Among several that do,
 ///   the fix of the ruby-platform gem's patch is taken (the one the
 ///   selection rules rank first), else the first handed in;
-/// * the source patch of the fix is not among `group`;
 /// * the fix's registry, where the engine read it
 ///   (`index_documents`, see [`GEM_INDEX_KEY`]), does not list a locked
 ///   build with the sha256 its patch states, or could not be read;
 /// * `merged`: a bundler before 2.2 wrote the lock.
 fn gem_family_pins<'a>(
     group: &[&'a DepOverride],
+    lock: &crate::formats::gem::GemfileLock<'_>,
     builds: &crate::formats::gem::LockedBuilds<'_>,
     merged: bool,
     lock_name: &str,
@@ -9058,14 +9130,10 @@ fn gem_family_pins<'a>(
             fixes.join("; "),
         )));
     };
-    let Some(source) = group.iter().copied().find(|dep| dep.patch_uuid == family) else {
-        return Err(skipped(format!(
-            "the patch its builds were built from ({family}) is not available to this run, \
-             and that patch's registry is the gem's source"
-        )));
-    };
     let mut checksums: Vec<(String, String)> = Vec::with_capacity(ids.len());
     let mut members: Vec<&'a str> = Vec::with_capacity(ids.len());
+    // The patch of each locked build, in the lock's order.
+    let mut of_builds: Vec<&'a DepOverride> = Vec::with_capacity(ids.len());
     for (id, patches) in ids.iter().zip(&patched) {
         let Some(member) = patches
             .iter()
@@ -9087,11 +9155,18 @@ fn gem_family_pins<'a>(
         };
         checksums.push((id.token(), sha256));
         members.push(member.patch_uuid.as_str());
+        of_builds.push(member);
     }
+    let source = group.iter().copied().find(|dep| dep.patch_uuid == family);
+    let anchor = gem_anchor(lock, source, &of_builds);
+    let member_anchor = match (source, gem_platform(anchor)) {
+        (None, Some(platform)) => Some((platform, family)),
+        _ => None,
+    };
     // What the registry lists, where the engine read it: the lock is about
     // to pin each build to a sha256, and a build the registry does not
     // serve with exactly that one fails `bundle install` on its platform.
-    let listed = registry_override_of_kind(source, "rubygems-compact-index")
+    let listed = registry_override_of_kind(anchor, "rubygems-compact-index")
         .and_then(|ov| index_documents.get(&gem_index_info_url(&ov.index_url, name)));
     match listed {
         None => {}
@@ -9123,7 +9198,8 @@ fn gem_family_pins<'a>(
         }
     }
     Ok(GemFamilyPins {
-        source,
+        anchor,
+        member_anchor,
         checksums,
         members,
     })
@@ -9155,6 +9231,48 @@ fn gem_already_hosted(lock: &crate::formats::gem::GemfileLock<'_>, group: &[&Dep
                 .remote_bases()
                 .any(|remote| registries.iter().any(|registry| registry.is_match(remote)))
     })
+}
+
+/// The compact-index documents the gem rewriter checks a lock of platform
+/// builds against ([`gem_index_documents`]), sorted: `<index>/info/<gem>`
+/// of the registry each such gem among `overrides` is about to take as its
+/// source ([`gem_anchor`]). None for a gem the rewriter will leave alone
+/// (a locked build with no patch, builds of different fixes), and none for
+/// a gem locked as its ruby-platform gem alone.
+pub fn gem_index_urls(files: &BTreeMap<String, String>, overrides: &[&DepOverride]) -> Vec<String> {
+    let (_, lock_name) = gem_pair(files);
+    let Some(lock) = files.get(lock_name) else {
+        return Vec::new();
+    };
+    // Read as the rewriter reads it.
+    let parsed = crate::formats::gem::parse(lock);
+    let merged = matches!(lock_layout(lock), Some(LockLayout::Merged(_)));
+    let mut groups: Vec<Vec<&DepOverride>> = Vec::new();
+    for dep in overrides.iter().filter(|dep| dep.ecosystem == "gem") {
+        let same = |group: &&mut Vec<&DepOverride>| {
+            group[0].name == dep.name && group[0].version == dep.version
+        };
+        match groups.iter_mut().find(same) {
+            Some(group) => group.push(dep),
+            None => groups.push(vec![dep]),
+        }
+    }
+    let unread = BTreeMap::new();
+    let mut urls: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for group in &groups {
+        let (name, version) = (group[0].name.as_str(), group[0].version.as_str());
+        let builds = parsed.locked_builds(name, version);
+        if builds.platforms.is_empty() {
+            continue;
+        }
+        let Ok(pins) = gem_family_pins(group, &parsed, &builds, merged, lock_name, &unread) else {
+            continue;
+        };
+        if let Some(ov) = registry_override_of_kind(pins.anchor, "rubygems-compact-index") {
+            urls.insert(gem_index_info_url(&ov.index_url, name));
+        }
+    }
+    urls.into_iter().collect()
 }
 
 fn rewrite_gem(
@@ -9293,7 +9411,10 @@ fn rewrite_gem(
                     .gem_idle_uuids
                     .extend(unnamed.map(|dep| dep.patch_uuid.clone()));
                 let merged = matches!(layout, Some(LockLayout::Merged(_)));
-                match gem_family_pins(group, builds, merged, lock_name, &index_documents) {
+                let Some(parsed) = handed_in.as_ref() else {
+                    continue;
+                };
+                match gem_family_pins(group, parsed, builds, merged, lock_name, &index_documents) {
                     Ok(family) => Some(family),
                     Err(mut warning) => {
                         // A lock an earlier run moved stays as it is, and
@@ -9322,7 +9443,7 @@ fn rewrite_gem(
         // ruby gem's own patch. A patch of a platform gem never moves the
         // ruby-platform entry: its registry serves no such gem.
         let dep: &DepOverride = match (&family, ruby_patch) {
-            (Some(family), _) => family.source,
+            (Some(family), _) => family.anchor,
             (None, Some(dep)) => dep,
             (None, None) if builds.as_ref().is_some_and(|builds| builds.ruby) => {
                 result.gem_idle_uuids.extend(uuids());
@@ -9498,7 +9619,30 @@ fn rewrite_gem(
                         family.members.iter().map(|uuid| uuid.to_string()).collect();
                     let lent = uuids().filter(|uuid| !pinned.contains(uuid));
                     result.gem_idle_uuids.extend(lent);
+                    for uuid in &pinned {
+                        result
+                            .gem_anchor_uuids
+                            .insert(uuid.clone(), dep.patch_uuid.clone());
+                    }
                     result.confirmed_gem_uuids.extend(pinned);
+                    // The source patch is not available: the gem is on the
+                    // registry of one build's patch, and the reader is told.
+                    if let Some((platform, fix)) = family.member_anchor {
+                        result.warnings.push(RewriteWarning {
+                            code: GEM_MEMBER_REGISTRY.into(),
+                            detail: format!(
+                                "{name} {version} takes the patch registry of its `{platform}` \
+                                 gem's patch ({anchor}) as its source: the patch its builds were \
+                                 built from ({fix}) is not available to this run, and every patch \
+                                 registry of a fix serves every build of it. The `source:` in \
+                                 {gemfile_name} names that registry, so the line changes if \
+                                 `{platform}` leaves {lock_name}",
+                                name = dep.name,
+                                version = dep.version,
+                                anchor = dep.patch_uuid,
+                            ),
+                        });
+                    }
                 }
             }
             Err(warning) => result.warnings.push(warning),
@@ -23930,26 +24074,128 @@ mod tests {
         assert_eq!(r.gem_idle_uuids, uuid_set(&["uuid", "z", "z-arm64-darwin"]));
     }
 
-    /// The registry of the fix's source patch is the gem's source, so that
-    /// patch must be at hand: builds whose source this run could not use
-    /// stay where they are.
+    /// The registry of a build's own patch, as `gem_build_patch` names it.
+    fn build_registry(platform: &str) -> String {
+        format!("https://patch.test/gem/tok-{platform}/uuid-{platform}/")
+    }
+
+    /// Without the fix's source patch (it is not offered to the run) the
+    /// gem is moved all the same: the registry of any patch of a fix
+    /// serves every build, so the patch of the first locked build lends
+    /// its registry, and a warning says so. Each build is still pinned to
+    /// its own patch's sha256, and the pin they all go by is that patch's.
     #[test]
-    fn gem_builds_without_their_source_patch_are_skipped() {
-        let lock = nokogiri_lock(&["arm64-darwin"], false, true);
-        let fix = gem_fix("nokogiri", "1.18.10", &[("arm64-darwin", &"a".repeat(64))]);
-        let (_, after, r) = gem_redirect_fix(NOKOGIRI_GEMFILE, &lock, &fix[1..]);
-        assert_eq!(after, lock);
-        let [warning] = r.warnings.as_slice() else {
-            panic!("one warning: {:?}", r.warnings);
-        };
-        assert_eq!(warning.code, "redirect_gem_platform_unsupported");
-        assert!(
-            warning.detail.contains(
-                "the patch its builds were built from (uuid) is not available to this run"
-            ),
-            "{}",
-            warning.detail
+    fn gem_builds_without_their_source_patch_take_a_builds_registry() {
+        let (arm, linux) = ("a".repeat(64), "b".repeat(64));
+        let platforms = ["arm64-darwin", "x86_64-linux-gnu"];
+        let lock = nokogiri_lock(&platforms, false, true);
+        let fix = gem_fix(
+            "nokogiri",
+            "1.18.10",
+            &[("arm64-darwin", &arm), ("x86_64-linux-gnu", &linux)],
         );
+        let on_arm = build_registry("arm64-darwin");
+        let (gemfile, moved, r) = gem_redirect_fix(NOKOGIRI_GEMFILE, &lock, &fix[1..]);
+        assert_eq!(warning_codes(&r), [GEM_MEMBER_REGISTRY]);
+        assert_eq!(
+            r.warnings[0].detail,
+            "nokogiri 1.18.10 takes the patch registry of its `arm64-darwin` gem's patch \
+             (uuid-arm64-darwin) as its source: the patch its builds were built from (uuid) is \
+             not available to this run, and every patch registry of a fix serves every build of \
+             it. The `source:` in Gemfile names that registry, so the line changes if \
+             `arm64-darwin` leaves Gemfile.lock"
+        );
+        assert!(
+            gemfile.contains(&format!("source: \"{on_arm}\"")),
+            "{gemfile}"
+        );
+        assert!(
+            moved.contains(&format!(
+                "GEM\n  remote: {on_arm}\n  specs:\n    nokogiri (1.18.10-arm64-darwin)\n      \
+                 racc (~> 1.4)\n    nokogiri (1.18.10-x86_64-linux-gnu)\n"
+            )),
+            "{moved}"
+        );
+        for (platform, sha) in [("arm64-darwin", &arm), ("x86_64-linux-gnu", &linux)] {
+            assert!(
+                moved.contains(&format!("  nokogiri (1.18.10-{platform}) sha256={sha}\n")),
+                "{moved}"
+            );
+        }
+        let members = ["uuid-arm64-darwin", "uuid-x86_64-linux-gnu"];
+        assert_eq!(r.confirmed_gem_uuids, uuid_set(&members));
+        assert_eq!(
+            r.gem_anchor_uuids,
+            members
+                .iter()
+                .map(|uuid| (uuid.to_string(), "uuid-arm64-darwin".to_string()))
+                .collect()
+        );
+
+        // A re-run is a no-op, and says the same.
+        let (gemfile_again, lock_again, again) = gem_redirect_fix(&gemfile, &moved, &fix[1..]);
+        assert_eq!(
+            (gemfile_again, lock_again),
+            (gemfile.clone(), moved.clone())
+        );
+        assert!(again.edits.is_empty(), "{:?}", again.edits);
+        assert_eq!(warning_codes(&again), [GEM_MEMBER_REGISTRY]);
+
+        // The source patch turns up later: the pair works, so it stays on
+        // the registry it is on. Nothing is written and nothing is said.
+        let (gemfile_later, lock_later, later) = gem_redirect_fix(&gemfile, &moved, &fix);
+        assert_eq!(
+            (gemfile_later, lock_later),
+            (gemfile.clone(), moved.clone())
+        );
+        assert!(later.edits.is_empty(), "{:?}", later.edits);
+        assert!(later.warnings.is_empty(), "{:?}", later.warnings);
+        assert_eq!(later.confirmed_gem_uuids, uuid_set(&members));
+        assert_eq!(later.gem_idle_uuids, uuid_set(&["uuid"]));
+        assert_eq!(
+            later.gem_anchor_uuids["uuid-x86_64-linux-gnu"],
+            "uuid-arm64-darwin"
+        );
+
+        // The platform whose patch lends the registry leaves the lock: the
+        // gem goes to the source patch's registry where the run has it,
+        // else to the registry of the first build still locked.
+        let without_arm = moved
+            .replace(
+                "    nokogiri (1.18.10-arm64-darwin)\n      racc (~> 1.4)\n",
+                "",
+            )
+            .replace("PLATFORMS\n  arm64-darwin\n", "PLATFORMS\n")
+            .replace(
+                &format!("  nokogiri (1.18.10-arm64-darwin) sha256={arm}\n"),
+                "",
+            );
+        assert!(
+            !without_arm.contains("(1.18.10-arm64-darwin)"),
+            "{without_arm}"
+        );
+        let on_linux = build_registry("x86_64-linux-gnu");
+        for (deps, registry, warned) in [
+            (&fix[..], GEM_TEST_URL.to_string(), false),
+            (&fix[2..], on_linux, true),
+        ] {
+            let (gemfile_after, lock_after, r) = gem_redirect_fix(&gemfile, &without_arm, deps);
+            assert_eq!(
+                gemfile_after,
+                gemfile.replace(&on_arm, &registry),
+                "the `source:` follows the registry"
+            );
+            assert_eq!(lock_after, without_arm.replace(&on_arm, &registry));
+            assert_eq!(
+                warning_codes(&r),
+                if warned {
+                    vec![GEM_MEMBER_REGISTRY]
+                } else {
+                    Vec::<&str>::new()
+                }
+            );
+            assert_eq!(r.confirmed_gem_uuids, uuid_set(&["uuid-x86_64-linux-gnu"]));
+        }
     }
 
     /// Where the engine read what the fix's registry lists

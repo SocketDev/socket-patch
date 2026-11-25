@@ -168,7 +168,8 @@ async fn mount_patch_api_with(
 /// platform gem in `builds`. Every patch's registry lists every gem of the
 /// fix. `unusable`: `(platform, status)` of the platform patches whose
 /// package reference answers that status (`pending_build`, `withdrawn`)
-/// with nothing to install, and which the registries then do not list.
+/// with nothing to install, and which the registries then do not list;
+/// the platform `ruby` names the fix's source patch.
 async fn mount_fix_api(
     server: &MockServer,
     uuid: &str,
@@ -240,9 +241,10 @@ async fn mount_fix_api(
             Some(platform) => format!("{DEP_VERSION}-{platform}"),
             None => DEP_VERSION.to_string(),
         };
+        // `ruby` names the source patch, the ruby gem's.
         let status = unusable
             .iter()
-            .find(|(unusable, _)| Some(*unusable) == *platform)
+            .find(|(unusable, _)| *unusable == platform.unwrap_or("ruby"))
             .map(|(_, status)| *status);
         if let Some(status) = status {
             results.insert(patch_uuid.clone(), serde_json::json!({ "status": status }));
@@ -3260,6 +3262,126 @@ async fn gem_hosted_get_takes_every_locked_build_of_the_fix() {
             "{asked}: {env}"
         );
     }
+}
+
+/// The fix's source patch is not offered to the run, while the patch of
+/// every locked build is: the gem is moved all the same, through the
+/// registry of the first locked build's own patch (any patch registry of a
+/// fix serves every build of it), each build pinned to its own patch, and
+/// a warning says which registry that is and what follows. Once the source
+/// patch is offered, a re-scan leaves the working pair as it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_scan_without_the_source_patch_takes_a_builds_registry() {
+    let ruby_sha = sha256_of(&real_gem(PATCHED_LIB));
+    let builds = [
+        (PLATFORM, sha256_of(&real_gem_for(PATCHED_LIB, PLATFORM))),
+        (
+            OTHER_PLATFORM,
+            sha256_of(&real_gem_for(PATCHED_LIB, OTHER_PLATFORM)),
+        ),
+    ];
+    let server = MockServer::start().await;
+    mount_fix_api(
+        &server,
+        UUID,
+        PATCHED_LIB,
+        None,
+        &ruby_sha,
+        &builds,
+        &[("ruby", "forbidden")],
+    )
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("Gemfile"),
+        format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join("Gemfile.lock"),
+        platform_lock(&"1".repeat(64), &"2".repeat(64)),
+    )
+    .unwrap();
+    let pair = || {
+        (
+            std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+            std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
+        )
+    };
+    // The first locked build, as Bundler sorts the platforms.
+    let first = PLATFORM.min(OTHER_PLATFORM);
+    let anchor = platform_patch_uuid(UUID, first);
+    let registry = format!("{}/patch-registry/gem/{TOKEN}/{anchor}/", server.uri());
+
+    let (code, stdout, stderr) = hosted_scan_json(&proj, &server.uri());
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    assert_eq!(hosted_pinned(&env), 2, "one pin per locked build: {env}");
+    assert!(
+        warnings_with_code(&env, "redirect_gem_platform_unsupported").is_empty(),
+        "{env}"
+    );
+    let said = warnings_with_code(&env, "redirect_gem_member_registry");
+    let [detail] = said.as_slice() else {
+        panic!("one member-registry warning: {env}");
+    };
+    assert_eq!(
+        *detail,
+        format!(
+            "{DEP} {DEP_VERSION} takes the patch registry of its `{first}` gem's patch ({anchor}) \
+             as its source: the patch its builds were built from ({UUID}) is not available to \
+             this run, and every patch registry of a fix serves every build of it. The `source:` \
+             in Gemfile names that registry, so the line changes if `{first}` leaves Gemfile.lock"
+        )
+    );
+    let (gemfile, moved) = pair();
+    assert!(
+        gemfile.contains(&format!("source: \"{registry}\"")),
+        "{gemfile}"
+    );
+    assert!(
+        moved.contains(&format!(
+            "  remote: {registry}\n  specs:\n    {DEP} ({DEP_VERSION}-{PLATFORM})\n    {DEP} \
+             ({DEP_VERSION}-{OTHER_PLATFORM})\n"
+        )),
+        "{moved}"
+    );
+    for (platform, sha) in &builds {
+        assert!(
+            moved.contains(&format!(
+                "  {DEP} ({DEP_VERSION}-{platform}) sha256={sha}\n"
+            )),
+            "{moved}"
+        );
+    }
+
+    // A re-scan without the source patch changes nothing and says the same.
+    let (code, stdout, stderr) = hosted_scan_json(&proj, &server.uri());
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    assert_eq!(pair(), (gemfile.clone(), moved.clone()), "{env}");
+    assert_eq!(hosted_pinned(&env), 2, "{env}");
+    assert_eq!(
+        warnings_with_code(&env, "redirect_gem_member_registry").len(),
+        1,
+        "{env}"
+    );
+
+    // The source patch is offered now: the pair works, and stays as it is.
+    server.reset().await;
+    mount_api_with(&server, None, &ruby_sha, &builds).await;
+    let (code, stdout, stderr) = hosted_scan_json(&proj, &server.uri());
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    assert_eq!(pair(), (gemfile, moved), "nothing is rewritten: {env}");
+    assert_eq!(hosted_pinned(&env), 2, "{env}");
+    assert!(
+        warnings_with_code(&env, "redirect_gem_member_registry").is_empty()
+            && warnings_with_code(&env, "redirect_gem_platform_unsupported").is_empty(),
+        "{env}"
+    );
 }
 
 /// A pair that already takes the gem from its patch registry, as an

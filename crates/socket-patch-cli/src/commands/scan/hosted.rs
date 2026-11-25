@@ -2310,17 +2310,15 @@ async fn run_redirect_selected_untracked(
 
     let rewrite = &done.rewrite;
     // For each patch this run pinned a platform build of a gem to: the
-    // uuid the lock names for that gem, the source patch of the fix (its
-    // registry is the gem's one source). Lockfile discovery reads that one
-    // uuid, so the in-run VEX and the "already hosted" count go by it.
-    let gem_fixes: std::collections::HashMap<String, String> = candidates
+    // uuid the lock names for that gem, the patch whose registry is the
+    // gem's one source (the fix's source patch, or one build's own where
+    // that one is not available). Lockfile discovery reads that one uuid,
+    // so the in-run VEX and the "already hosted" count go by it.
+    let gem_fixes: std::collections::HashMap<String, String> = rewrite
+        .gem_anchor_uuids
         .iter()
-        .filter(|c| rewrite.confirmed_gem_uuids.contains(&c.dep.patch_uuid))
-        .map(|c| {
-            let fix = socket_patch_core::patch::redirect::gem_family(&c.dep);
-            (c.dep.patch_uuid.clone(), fix.to_string())
-        })
-        .filter(|(uuid, fix)| uuid != fix)
+        .filter(|(uuid, anchor)| uuid != anchor)
+        .map(|(uuid, anchor)| (uuid.clone(), anchor.clone()))
         .collect();
     // Paths whose existence the commit below changes as discovery's reads
     // around the overlaid view (directory listings) see the disk: written

@@ -2459,35 +2459,9 @@ pub fn gem_index_targets(
     candidates: &[Candidate],
     files: &BTreeMap<String, String>,
 ) -> Vec<String> {
-    use crate::patch::redirect::{gem_family, gem_index_info_url, gem_pair, gem_platform};
-    let Some(lock) = files.get(gem_pair(files).1) else {
-        return Vec::new();
-    };
-    // Read as the gem rewriter reads it.
-    let parsed = crate::formats::gem::parse(lock);
-    let gems = || candidates.iter().filter(|c| c.dep.ecosystem == "gem");
-    let mut urls: BTreeSet<String> = BTreeSet::new();
-    for candidate in gems() {
-        let dep = &candidate.dep;
-        let builds = parsed.locked_builds(&dep.name, &dep.version);
-        let names_build = match gem_platform(dep) {
-            Some(platform) => builds.platforms.contains(platform),
-            None => builds.ruby,
-        };
-        if builds.platforms.is_empty() || !names_build {
-            continue;
-        }
-        let source = gems().find(|c| {
-            c.dep.patch_uuid == gem_family(dep)
-                && c.dep.name == dep.name
-                && c.dep.version == dep.version
-        });
-        let index = source.and_then(|c| c.dep.registry_override.as_ref());
-        if let Some(index) = index {
-            urls.insert(gem_index_info_url(&index.index_url, &dep.name));
-        }
-    }
-    urls.into_iter().collect()
+    // The rewriter's own choice of fix and of registry.
+    let deps: Vec<&DepOverride> = candidates.iter().map(|c| &c.dep).collect();
+    crate::patch::redirect::gem_index_urls(files, &deps)
 }
 
 /// Hand the documents of [`gem_index_targets`] to the gem rewriter: each
@@ -3407,17 +3381,13 @@ async fn unattributed_pins(
     };
     // A gem locked as platform builds is pinned to one patch per build,
     // and the lock names the registry of one patch for all of them (the
-    // fix's source): discovery reads that pin, so each build's patch is
-    // judged by it.
-    let pinned_as: HashMap<&str, &str> = candidates
+    // fix's source patch, or one build's own): discovery reads that pin,
+    // so each build's patch is judged by it.
+    let pinned_as: HashMap<&str, &str> = done
+        .rewrite
+        .gem_anchor_uuids
         .iter()
-        .filter(|c| done.rewrite.confirmed_gem_uuids.contains(&c.dep.patch_uuid))
-        .map(|c| {
-            (
-                c.dep.patch_uuid.as_str(),
-                crate::patch::redirect::gem_family(&c.dep),
-            )
-        })
+        .map(|(uuid, anchor)| (uuid.as_str(), anchor.as_str()))
         .collect();
     let vetoed = done
         .confirmed

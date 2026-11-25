@@ -686,11 +686,23 @@ async fn gem_platform_builds_round_trip() {
         )
         .replace("  nokogiri (= 1.18.10)\n", "");
     let overrides = || gem_fix_overrides("nokogiri", "1.18.10", &platforms);
+    // The fix without its source patch: the builds go to the registry of
+    // the first locked build's own patch, and come back the same way.
+    let without_source = || {
+        let mut members = overrides();
+        members.as_array_mut().unwrap().remove(0);
+        members
+    };
     let cases = [
         synthetic(
             "platform-builds",
             &[("Gemfile", gemfile), ("Gemfile.lock", GEM_PLATFORM_LOCK)],
             overrides(),
+        ),
+        synthetic(
+            "platform-builds-no-source",
+            &[("Gemfile", gemfile), ("Gemfile.lock", GEM_PLATFORM_LOCK)],
+            without_source(),
         ),
         synthetic(
             "platform-builds-no-checksums",
@@ -725,11 +737,17 @@ async fn gem_platform_builds_round_trip() {
         } else {
             "Gemfile.lock"
         }];
+        // The registry of the fix's source patch, or of the first build's
+        // own patch where the fix comes without its source.
+        let index = match case.dir.display().to_string().contains("no-source") {
+            true => GEM_INDEX.replace(GEM_UUID, &format!("{}00", &GEM_UUID[..GEM_UUID.len() - 2])),
+            false => GEM_INDEX.to_string(),
+        };
         assert!(
             hosted.contains(&format!(
-                "  remote: {GEM_INDEX}\n  specs:\n    nokogiri (1.18.10"
+                "  remote: {index}\n  specs:\n    nokogiri (1.18.10"
             )) || hosted.contains(&format!(
-                "  remote: {GEM_INDEX}\r\n  specs:\r\n    nokogiri (1.18.10"
+                "  remote: {index}\r\n  specs:\r\n    nokogiri (1.18.10"
             )),
             "{}: the rewrite moved the builds:\n{hosted}",
             case.dir.display()
