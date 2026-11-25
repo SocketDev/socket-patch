@@ -2320,6 +2320,151 @@ async fn refresh_replaces_a_stale_project_install_and_its_archives() {
     );
 }
 
+/// #2219: the machine that did not run the scan. A teammate pulls the
+/// hosted `Gemfile` / `Gemfile.lock` onto a checkout whose gems are already
+/// installed (or CI restores a `vendor/bundle` cache): Bundler keeps the
+/// upstream copy, and standalone `vex` is the one command that notices.
+/// Its remedy must be one that works. "Reinstall from the lockfile" does
+/// not: `bundle install` changes nothing, and `bundle pristine` on Bundler
+/// 2.6+ removes the gems and then fails on the lock's checksum. So `vex`
+/// names the scan, and the scan it names, with no `--mode`, replaces the
+/// installed copy without touching the committed pair, after which `vex`
+/// attests the gem.
+#[tokio::test(flavor = "multi_thread")]
+async fn standalone_vex_sends_a_stale_hosted_gem_to_the_scan_that_replaces_it() {
+    use vex_e2e_common::{assert_attested, assert_not_attested, run_vex, Marker, VexRun};
+    let server = MockServer::start().await;
+    let patched = real_gem(PATCHED_LIB);
+    mount_api_for(&server, None, &sha256_of(&patched)).await;
+    serve_patched_gem(&server, patched.clone()).await;
+    let uri = server.uri();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Machine A: scan and commit the pair.
+    let a = tmp.path().join("a");
+    std::fs::create_dir_all(&a).unwrap();
+    write_manifest_pair(&a);
+    let (code, _, stderr) = common::run_with_env(&a, &scan_args(&a, &uri, &[]), &[]);
+    assert_eq!(code, 0, "{stderr}");
+
+    // Machine B: the same commit over gems installed before it.
+    let proj = tmp.path().join("b");
+    std::fs::create_dir_all(&proj).unwrap();
+    for file in ["Gemfile", "Gemfile.lock"] {
+        std::fs::copy(a.join(file), proj.join(file)).unwrap();
+    }
+    let pair = |proj: &Path| {
+        ["Gemfile", "Gemfile.lock"].map(|file| std::fs::read_to_string(proj.join(file)).unwrap())
+    };
+    let committed = pair(&proj);
+    assert!(
+        committed[1].contains("/patch-registry/gem/"),
+        "the lock pulled onto machine B names the patch registry:\n{}",
+        committed[1]
+    );
+    let home = project_home(&proj);
+    let gem_dir = install_real_gem(&home, UPSTREAM_LIB);
+
+    let bin = vex_e2e_common::binary();
+    let run = |human: bool| VexRun {
+        api_url: Some(uri.clone()),
+        api_token: Some("fake".into()),
+        org: Some(ORG.into()),
+        patch_server_url: Some(uri.clone()),
+        product: Some("pkg:gem/app@1.0.0".into()),
+        human,
+        ..VexRun::default()
+    };
+    let out = run_vex(&bin, &proj, &run(false));
+    assert_eq!(out.code, Some(1), "{out}");
+    assert_not_attested(&out.envelope, PURL, "not_applied");
+
+    let out = run_vex(&bin, &proj, &run(true));
+    assert_eq!(out.code, Some(1), "{out}");
+    assert!(
+        out.stderr
+            .contains("Run `socket-patch scan` to replace the installed copies")
+            && out.stderr.contains("`bundle pristine`")
+            && out.stderr.contains("--gem-refresh-shared"),
+        "the remedy for an installed hosted gem is the scan:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("Reinstall from the lockfile")
+            && !out.stderr.contains("socket-patch apply"),
+        "no remedy that leaves or breaks the install:\n{}",
+        out.stderr
+    );
+    assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB, "vex writes nothing");
+
+    // The same checkout with an agent-mode patch of another package: a
+    // scan with no `--mode` keeps agent mode there and replaces no gem, so
+    // the hint names the files to remove, not a scan.
+    let mixed = tmp.path().join("mixed");
+    std::fs::create_dir_all(&mixed).unwrap();
+    for file in ["Gemfile", "Gemfile.lock"] {
+        std::fs::copy(a.join(file), mixed.join(file)).unwrap();
+    }
+    install_real_gem(&project_home(&mixed), UPSTREAM_LIB);
+    common::write_minimal_manifest(
+        &mixed.join(".socket"),
+        "pkg:npm/left-pad@1.3.0",
+        "22222222-2222-4222-8222-222222222222",
+        &[],
+    );
+    let out = run_vex(&bin, &mixed, &run(true));
+    assert_eq!(out.code, Some(1), "{out}");
+    assert!(
+        out.stderr
+            .contains("Remove each gem's `specifications/<name>-<version>.gemspec`")
+            && out.stderr.contains(
+                "Other projects may load a gem home outside the project, so for one run \
+                 `bundle config set --local path vendor/bundle && bundle install` instead",
+            ),
+        "a mixed-mode project is told which files to remove:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("Run `socket-patch scan`")
+            && !out.stderr.contains("Reinstall from the lockfile"),
+        "no scan that would keep agent mode, and no reinstall:\n{}",
+        out.stderr
+    );
+
+    // The scan the hint names: no `--mode`, the project's own.
+    let args = [
+        "scan",
+        "--yes",
+        "--cwd",
+        proj.to_str().expect("utf8 tmp path"),
+        "--api-url",
+        &uri,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+    ];
+    let (code, stdout, stderr) = common::run_with_env(&proj, &args, &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "{stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read(home.join("cache").join(format!("{DEP}-{DEP_VERSION}.gem"))).unwrap(),
+        patched,
+        "the archive every reinstall uses is the patched one"
+    );
+    assert_eq!(pair(&proj), committed, "the committed pair is untouched");
+
+    let out = run_vex(&bin, &proj, &run(false));
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_attested(
+        out.doc(),
+        PURL,
+        UUID,
+        Marker::Redirected,
+        &[(GHSA, &["CVE-2026-4444"])],
+    );
+}
+
 /// The machine's platform in the platform-build arm, and one the lock also
 /// names (another machine's).
 const PLATFORM: &str = "arm64-darwin";
@@ -3819,6 +3964,221 @@ async fn hosted_unwind_leaves_an_upstream_install_in_a_pruned_home_alone() {
         gem_downloads_since(&server, asked_before).await.is_empty(),
         "no gem was downloaded"
     );
+}
+
+/// A project whose `Gemfile` names a private gem mirror as its source
+/// (`source "<mirror>"`), so the lock resolves the gem from that remote,
+/// with the gem installed from it. `checksum` is the sha256 the lock's
+/// `CHECKSUMS` section pins for the gem (Bundler 2.6 and later); `None`
+/// writes a lock without the section. Returns the installed gem dir.
+fn mirror_project(proj: &Path, mirror: &str, checksum: Option<&str>) -> PathBuf {
+    std::fs::create_dir_all(proj).unwrap();
+    std::fs::write(
+        proj.join("Gemfile"),
+        format!("source \"{mirror}\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\n"),
+    )
+    .unwrap();
+    let checksums = checksum
+        .map(|sha| format!("CHECKSUMS\n  {DEP} ({DEP_VERSION}) sha256={sha}\n\n"))
+        .unwrap_or_default();
+    std::fs::write(
+        proj.join("Gemfile.lock"),
+        format!(
+            "GEM\n  remote: {mirror}/\n  specs:\n    {DEP} ({DEP_VERSION})\n\n\
+             PLATFORMS\n  ruby\n\nDEPENDENCIES\n  {DEP} (= {DEP_VERSION})\n\n\
+             {checksums}BUNDLED WITH\n   2.6.9\n"
+        ),
+    )
+    .unwrap();
+    install_real_gem(&project_home(proj), UPSTREAM_LIB)
+}
+
+/// #2230: a hosted gem the lock resolves from a private mirror, under a
+/// lock without `CHECKSUMS`. The unwind restores the pair, and nothing
+/// gives the upstream gem's sha256, so the patched archive in the gem home
+/// says nothing about the installed copy. The copy is judged by the pin's
+/// patch record like one with no archive: the patched build the scan put
+/// there is named with the files to remove (`bundle install` and `bundle
+/// pristine` keep it otherwise), and offline it is named as a copy that
+/// could not be checked. Neither is passed over in silence.
+#[tokio::test(flavor = "multi_thread")]
+async fn hosted_unwind_names_a_patched_install_from_a_mirror_without_checksums() {
+    const MIRROR: &str = "https://gems.example.test";
+    for (offline, needles) in [
+        (false, ["its patched install at", "run `bundle install`"]),
+        (
+            true,
+            [
+                "could not be checked against the upstream gem",
+                "nothing gives the sha256 of its upstream gem and `--offline` is set, so its \
+                 patch record was not fetched",
+            ],
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let patched = real_gem(PATCHED_LIB);
+        mount_api_for(&server, None, &sha256_of(&patched)).await;
+        serve_patched_gem(&server, patched.clone()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let gem_dir = mirror_project(&proj, MIRROR, None);
+        // The project commits its bundler cache.
+        let committed = proj
+            .join("vendor")
+            .join("cache")
+            .join(format!("{DEP}-{DEP_VERSION}.gem"));
+        std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+        std::fs::write(&committed, real_gem(UPSTREAM_LIB)).unwrap();
+        let pair = |name: &str| std::fs::read_to_string(proj.join(name)).unwrap();
+        let (gemfile, lock) = (pair("Gemfile"), pair("Gemfile.lock"));
+        let uri = server.uri();
+        let (code, _, stderr) =
+            common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "premise: refreshed");
+        let home = project_home(&proj);
+        let before = snapshot(&home);
+        let asked_before = server.received_requests().await.unwrap().len();
+
+        let mut args = vec!["rollback", "--yes", "--json"];
+        if offline {
+            args.push("--offline");
+        }
+        let (code, stdout, stderr) = unwind_run(&proj, &uri, &args);
+        let env: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("offline={offline}: not JSON: {e}\n{stdout}\n{stderr}"));
+        assert_eq!(code, 0, "offline={offline}: {env}\n{stderr}");
+        assert_eq!(pair("Gemfile"), gemfile, "offline={offline}");
+        assert_eq!(pair("Gemfile.lock"), lock, "offline={offline}");
+        assert_eq!(snapshot(&home), before, "offline={offline}: left as it is");
+        let left = details_with_code(&env, "upstream_gem_stale_install");
+        assert_eq!(left.len(), 1, "offline={offline}: reported: {env}");
+        for needle in needles.into_iter().chain([PURL, gem_dir.to_str().unwrap()]) {
+            assert!(
+                left[0].contains(needle),
+                "offline={offline}: missing {needle:?}: {}",
+                left[0]
+            );
+        }
+        // The archive in Bundler's cache dir is named too, as one nothing
+        // could check: the registry is not asked about another remote's gem.
+        let cached = details_with_code(&env, "upstream_gem_stale_cache");
+        assert_eq!(cached.len(), 1, "offline={offline}: {env}");
+        assert!(
+            cached[0].contains(committed.to_str().unwrap())
+                && cached[0].contains("could not be checked against the upstream sha256"),
+            "offline={offline}: {}",
+            cached[0]
+        );
+        let asked_registry = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .skip(asked_before)
+            .any(|request| request.url.path().starts_with("/upstream/"));
+        assert!(
+            !asked_registry,
+            "offline={offline}: rubygems.org is not asked about another remote's gem"
+        );
+    }
+}
+
+/// The record judges, it does not assume (#2230): an installed copy from a
+/// private mirror that is still the upstream gem (the scan was told not to
+/// refresh it) gets no warning after the unwind.
+#[tokio::test(flavor = "multi_thread")]
+async fn hosted_unwind_leaves_an_upstream_install_from_a_mirror_alone() {
+    let server = MockServer::start().await;
+    let patched = real_gem(PATCHED_LIB);
+    mount_api_for(&server, None, &sha256_of(&patched)).await;
+    serve_patched_gem(&server, patched.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let gem_dir = mirror_project(&proj, "https://gems.example.test", None);
+    let uri = server.uri();
+    let flags = ["--json", "--no-gem-install-refresh"];
+    let (code, _, stderr) = common::run_with_env(&proj, &scan_args(&proj, &uri, &flags), &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB, "premise");
+
+    let (code, stdout, stderr) = unwind_run(&proj, &uri, &["rollback", "--yes", "--json"]);
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}\n{stderr}"));
+    assert_eq!(code, 0, "{env}\n{stderr}");
+    assert!(
+        details_with_code(&env, "upstream_gem_stale_install").is_empty(),
+        "{env}"
+    );
+}
+
+/// #2230: on a lock with `CHECKSUMS`, a hosted gem from a private mirror
+/// can be unwound. The restore reads the gem's upstream sha256 from the
+/// mirror's own compact index when `SOCKET_RUBYGEMS_URL` names that
+/// server: the pair is the pre-scan pair byte for byte and the installed
+/// copy is the upstream gem again. Without the setting the unwind refuses,
+/// changes nothing and names the setting.
+#[tokio::test(flavor = "multi_thread")]
+async fn hosted_unwind_restores_a_mirror_gem_when_the_registry_setting_names_the_mirror() {
+    for command in HOSTED_UNWINDS {
+        let server = MockServer::start().await;
+        let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+        mount_api_for(&server, None, &sha256_of(&patched)).await;
+        serve_patched_gem(&server, patched.clone()).await;
+        // The mirror: the mock's `/upstream` tree.
+        serve_upstream_gem(&server, &upstream).await;
+        let uri = server.uri();
+        let mirror = format!("{uri}/upstream");
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let gem_dir = mirror_project(&proj, &mirror, Some(&sha256_of(&upstream)));
+        let pair = |name: &str| std::fs::read_to_string(proj.join(name)).unwrap();
+        let (gemfile, lock) = (pair("Gemfile"), pair("Gemfile.lock"));
+        let (code, _, stderr) =
+            common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "premise: refreshed");
+        let (hosted_gemfile, hosted_lock) = (pair("Gemfile"), pair("Gemfile.lock"));
+        assert!(hosted_lock.contains("/patch-registry/"), "{hosted_lock}");
+
+        // rubygems.org (here: another stand-in) is not the lock's remote.
+        let mut args = command.to_vec();
+        args.push("--json");
+        let elsewhere = format!("{uri}/elsewhere");
+        let (code, stdout, stderr) = unwind_run_with_registry(&proj, &uri, &args, &elsewhere);
+        assert_ne!(code, 0, "{command:?}: {stdout}\n{stderr}");
+        let said = format!("{stdout}\n{stderr}");
+        for needle in [
+            "is not rubygems.org",
+            &format!("`SOCKET_RUBYGEMS_URL={mirror}`"),
+            "git checkout -- Gemfile Gemfile.lock",
+        ] {
+            assert!(
+                said.contains(needle),
+                "{command:?}: missing {needle:?}: {said}"
+            );
+        }
+        assert_eq!(pair("Gemfile"), hosted_gemfile, "{command:?}: refused");
+        assert_eq!(pair("Gemfile.lock"), hosted_lock, "{command:?}: refused");
+        assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "{command:?}: refused");
+
+        // The setting names the mirror: the remedy the refusal gave.
+        let (code, stdout, stderr) = unwind_run_with_registry(&proj, &uri, &args, &mirror);
+        let env: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("{command:?}: not JSON: {e}\n{stdout}\n{stderr}"));
+        assert_eq!(code, 0, "{command:?}: {env}\n{stderr}");
+        assert_eq!(pair("Gemfile"), gemfile, "{command:?}");
+        assert_eq!(pair("Gemfile.lock"), lock, "{command:?}");
+        assert_eq!(
+            installed_lib(&gem_dir),
+            UPSTREAM_LIB,
+            "{command:?}: the upstream gem is back: {env}"
+        );
+        assert!(
+            details_with_code(&env, "upstream_gem_stale_install").is_empty(),
+            "{command:?}: nothing is left on the patched build: {env}"
+        );
+    }
 }
 
 /// The vendored half of the patch API for the fixture's patch: the grant

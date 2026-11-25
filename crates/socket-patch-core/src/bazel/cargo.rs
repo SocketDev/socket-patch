@@ -90,7 +90,7 @@ pub const UNREAD: &str = "redirect_cargo_bazel_config_unread";
 /// The module extension whose `from_cargo` tag makes a hub, by the two
 /// files that define it at rules_rust 0.56.0 and 0.75.0: `extension.bzl`
 /// hands on the `crate` of `extensions.bzl`.
-const EXTENSIONS: [Extension<'static>; 2] = [
+pub(super) const EXTENSIONS: [Extension<'static>; 2] = [
     Extension {
         module: "rules_rust",
         file: "//crate_universe:extensions.bzl",

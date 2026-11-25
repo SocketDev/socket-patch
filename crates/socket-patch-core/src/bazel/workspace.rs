@@ -40,6 +40,7 @@ use std::path::{Component, Path};
 use super::starlark::{self, Bound, Call, File, How, Value, MAX_BYTES, MAX_TOKENS};
 use crate::utils::fs::open_regular_file_sync;
 use crate::utils::group_commit;
+use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject};
 
 /// How many files of one workspace are asked for, beside the names of its
 /// `WORKSPACE` file, and how many bytes are read in all.
@@ -119,6 +120,19 @@ pub fn disk_up_to(root: &Path, max: usize) -> impl Fn(&str) -> Entry + '_ {
                 _ => unreadable(&e.to_string()),
             },
         }
+    }
+}
+
+/// The view of the files handed over in memory, for a project that is its
+/// own Bazel root. It holds none for a user who switched the Bazel support
+/// off ([`super::off`]): whatever judges a workspace from this view then
+/// finds none, as [`super::bazel_root`] finds none on disk.
+pub fn memory(project: &MemoryProject) -> impl Fn(&str) -> Entry + '_ {
+    let off = super::off();
+    move |path| match project.get(path).filter(|_| !off) {
+        Some(MemoryEntry::Text(text)) => Entry::Text(text.to_string()),
+        Some(_) => Entry::Unreadable("it was not handed in as text".to_string()),
+        None => Entry::Absent,
     }
 }
 
@@ -282,6 +296,14 @@ pub struct Workspace {
     /// doubt about every answer of [`Self::tags`], which does not repeat
     /// them. The first 1,024 are kept.
     pub doubts: Vec<Doubt>,
+    /// The first doubt about a file that is there and was not read as a
+    /// whole: one that cannot be read or parsed, one past a bound, which
+    /// is not asked for, and the file of an `include` that is not
+    /// followed, which may be there (9.3.2 takes `dev_dependency` as a
+    /// second argument, and such a file is not read). What such a file
+    /// says is not known, the name of a ruleset included. A file that an
+    /// `include` names and that does not exist says nothing, and is none.
+    pub unread: Option<Doubt>,
     /// The file of the older `WORKSPACE` system at the Bazel root, when
     /// it says more than `workspace(...)`: its name (`WORKSPACE.bzlmod`,
     /// else `WORKSPACE.bazel`, else `WORKSPACE`, as Bazel takes one) and
@@ -395,17 +417,19 @@ impl Workspace {
             if ws.files.len() + failed.len() == MAX_FILES {
                 let why =
                     format!("it is one more than the {MAX_FILES} files that are asked for{by}");
-                ws.doubt(&path, 0, why);
+                ws.left_unread(&path, 0, why);
                 break;
             }
             // What is wrong with the file, and on which line of it: 0 for
             // the file as a whole.
-            let file = match view(&path) {
+            let entry = view(&path);
+            let there = entry != Entry::Absent;
+            let file = match entry {
                 Entry::Absent if includer.is_none() => break,
                 Entry::Absent => Err((0, "it does not exist".to_string())),
                 Entry::Unreadable(why) => Err((0, format!("it cannot be read: {why}"))),
                 Entry::Text(text) if text.len() > budget => {
-                    ws.doubt(&path, 0, format!("{OVER_TOTAL}{by}"));
+                    ws.left_unread(&path, 0, format!("{OVER_TOTAL}{by}"));
                     break;
                 }
                 Entry::Text(text) => {
@@ -415,7 +439,10 @@ impl Workspace {
             };
             match file {
                 Err((line, why)) => {
-                    ws.doubt(&path, line, format!("{why}{by}"));
+                    match there {
+                        true => ws.left_unread(&path, line, format!("{why}{by}")),
+                        false => ws.doubt(&path, line, format!("{why}{by}")),
+                    }
                     failed.insert(path);
                 }
                 Ok(file) => {
@@ -452,6 +479,14 @@ impl Workspace {
             let (file, why) = (file.to_string(), why.into());
             self.doubts.push(Doubt { file, line, why });
         }
+    }
+
+    /// [`Self::doubt`] about a file that is there and is not read as a
+    /// whole: the first of them is kept as such ([`Self::unread`]).
+    fn left_unread(&mut self, file: &str, line: usize, why: impl Into<String>) {
+        let (file, why) = (file.to_string(), why.into());
+        self.doubt(&file, line, why.as_str());
+        self.unread.get_or_insert(Doubt { file, line, why });
     }
 
     /// Takes from `file` what it says of the workspace itself: the names
@@ -494,7 +529,11 @@ impl Workspace {
             };
             if !read {
                 let why = format!("this `{}` cannot be read", call.callee);
-                self.doubt(path, call.line, why);
+                // The file of an `include` that is not followed may be there.
+                match call.callee == "include" {
+                    true => self.left_unread(path, call.line, why),
+                    false => self.doubt(path, call.line, why),
+                }
             }
         }
         for used in &file.uses {
@@ -1831,6 +1870,83 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
         assert_eq!(ws.tags(&PIP, "parse"), Tags::default());
     }
 
+    /// A file that is there and is not read as a whole is told from one
+    /// that an include names and that does not exist: what the first says
+    /// is not known ([`Workspace::unread`]), and its doubt is kept as the
+    /// one about such a file, whatever doubt came before it.
+    #[test]
+    fn a_file_that_is_there_and_not_read_is_told_from_one_that_is_missing() {
+        // The file that the second line of the root includes, after a
+        // statement that the reader does not follow.
+        let root = "load('//:defs.bzl', 'deps')\ninclude('//:a.MODULE.bazel')\n";
+        let unread = |included: Entry| {
+            let view = |path: &str| match path {
+                "MODULE.bazel" => Entry::Text(root.to_string()),
+                "a.MODULE.bazel" => included.clone(),
+                _ => Entry::Absent,
+            };
+            let ws = Workspace::read(&view);
+            let first = doubts(&ws.doubts[..1]);
+            assert_eq!(first, ["MODULE.bazel:1: this `load` cannot be read"]);
+            ws.unread.map(|doubt| (doubt.file, doubt.line))
+        };
+        assert_eq!(unread(Entry::Absent), None);
+        assert_eq!(unread(Entry::Text("x = 1\n".to_string())), None);
+        // One that includes itself was read.
+        let cycle = "include('//:a.MODULE.bazel')\n";
+        assert_eq!(unread(Entry::Text(cycle.to_string())), None);
+        let (binary, open) = ("it is not UTF-8", "x = 'never closed\n");
+        let at = |line| Some(("a.MODULE.bazel".to_string(), line));
+        assert_eq!(unread(Entry::Unreadable(binary.to_string())), at(0));
+        assert_eq!(unread(Entry::Text(open.to_string())), at(1));
+        // The root file, and a workspace with none.
+        let no_root = Workspace::read(&|_| Entry::Unreadable("no".to_string()));
+        let file = no_root.unread.map(|doubt| doubt.file);
+        assert_eq!(file.as_deref(), Some("MODULE.bazel"));
+        assert_eq!(Workspace::read(&|_| Entry::Absent).unread, None);
+        // An `include` that is not followed names a file that may be there
+        // and is never asked for: 9.3.2 takes the first of these.
+        for unfollowed in [
+            "include('//:a.MODULE.bazel', dev_dependency = True)\n",
+            "include(NAME)\n",
+            "x = include('//:a.MODULE.bazel')\n",
+        ] {
+            let asked = std::cell::Cell::new(false);
+            let ws = Workspace::read(&|path| match path {
+                "MODULE.bazel" => Entry::Text(unfollowed.to_string()),
+                "a.MODULE.bazel" => {
+                    asked.set(true);
+                    Entry::Text("x = 1\n".to_string())
+                }
+                _ => Entry::Absent,
+            });
+            assert_eq!(ws.unread.as_ref(), ws.doubts.first(), "{unfollowed}");
+            assert!(!asked.get(), "{unfollowed}");
+            assert_eq!(ws.doubts.len(), 1, "{unfollowed}");
+        }
+        // A statement that is no `include` leaves no file unread.
+        let load = "load('//:defs.bzl', 'deps')\n";
+        let view = |path: &str| match path {
+            "MODULE.bazel" => Entry::Text(load.to_string()),
+            _ => Entry::Absent,
+        };
+        let ws = Workspace::read(&view);
+        assert_eq!((ws.unread, ws.doubts.len()), (None, 1));
+    }
+
+    /// The view of files handed over in memory holds what was handed over,
+    /// a file that is no text as one that cannot be read.
+    #[test]
+    fn the_view_of_a_project_in_memory_holds_its_files() {
+        let mut project = MemoryProject::new();
+        project.insert_text("MODULE.bazel", "x = 1\n");
+        project.insert_present("WORKSPACE");
+        let view = memory(&project);
+        assert_eq!(view("MODULE.bazel"), Entry::Text("x = 1\n".to_string()));
+        assert!(matches!(view("WORKSPACE"), Entry::Unreadable(_)));
+        assert_eq!(view("WORKSPACE.bazel"), Entry::Absent);
+    }
+
     #[test]
     fn the_files_of_a_workspace_are_bounded() {
         // 300 files in a chain: the first 256 are read, and no other is
@@ -1849,6 +1965,8 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
         let want = "256.MODULE.bazel:0: it is one more than the 256 files that are asked for; \
                     255.MODULE.bazel:1 includes it";
         assert_eq!(doubts(&ws.doubts), [want]);
+        // The file past the bound may be there.
+        assert_eq!(ws.unread.as_ref(), ws.doubts.first());
         // Nine files of nearly 1 MiB: the ninth is past 8 MiB.
         let big = format!("#{}\n", "x".repeat(MAX_BYTES - 64));
         let ws = Workspace::read(&|path| match path {
@@ -1862,6 +1980,8 @@ use_repo(go_deps, "com_github_google_uuid", "org_golang_x_net")
         let want = "8.MODULE.bazel:0: the files of the workspace are larger than 8 MiB in all; \
                     MODULE.bazel:9 includes it";
         assert_eq!(doubts(&ws.doubts), [want]);
+        // The ninth file is there.
+        assert_eq!(ws.unread.as_ref(), ws.doubts.first());
         // The `WORKSPACE` file is one of the files of the workspace.
         let (file, why) = ("WORKSPACE.bzlmod".to_string(), OVER_TOTAL.to_string());
         assert_eq!(ws.legacy, Some(Err(Doubt { file, line: 0, why })));

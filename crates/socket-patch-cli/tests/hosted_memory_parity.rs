@@ -15,6 +15,13 @@ mod common;
 
 use common::*;
 
+/// The core unit tests' env guard, compiled into this test binary too: the
+/// engine runs in this process, and reads `SOCKET_NO_BAZEL` from it.
+#[allow(dead_code)]
+#[path = "../../socket-patch-core/src/test_env.rs"]
+mod test_env;
+use test_env::EnvGuard;
+
 struct Case {
     /// Fixture dir under `crates/socket-patch-core/tests/fixtures/redirect`.
     fixture: &'static str,
@@ -304,9 +311,12 @@ async fn parity_gemfile_platform_prebuilds() {
 /// sha256 of the upstream archive there, the checkout and the engine write
 /// no file and say why in the same words. With the one of the patched
 /// archive both write what they write without Bazel. The engine is given
-/// the files that path selection asks for.
+/// the files that path selection asks for. It judges the hub unless
+/// `SOCKET_NO_BAZEL` is set, so the test holds the variable unset.
 #[tokio::test]
+#[serial_test::serial]
 async fn parity_gem_checksums_of_a_bazel_hub_through_selection() {
+    let _unset = EnvGuard::unset("SOCKET_NO_BAZEL");
     let dir = fixtures_root().join("redirect/gem/bundler/basic");
     let server = MockServer::start().await;
     let patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
@@ -1588,9 +1598,13 @@ async fn parity_pnpm_member_branch_lock_refusal() {
 /// engines refuse every pnpm pin with the same warning, nothing written.
 /// Path selection asks for the `MODULE.bazel` beside the lock. With a
 /// file of the user's own listed both engines pin the lock; with a listed
-/// file that the undo of the pin would remove both pin nothing.
+/// file that the undo of the pin would remove both pin nothing. The engine
+/// judges the hub unless `SOCKET_NO_BAZEL` is set, so the test holds the
+/// variable unset.
 #[tokio::test]
+#[serial_test::serial]
 async fn parity_pnpm_bazel_hub_that_hides_the_workspace_file() {
+    let _unset = EnvGuard::unset("SOCKET_NO_BAZEL");
     let lock =
         String::from_utf8(read_fixture("redirect/npm/pnpm/basic/input/pnpm-lock.yaml")).unwrap();
     let module = |data: &str| {

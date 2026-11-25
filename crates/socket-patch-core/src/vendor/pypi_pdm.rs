@@ -1499,8 +1499,8 @@ distribution = false
     }
 
     /// A FIFO planted as `pdm.lock` (or `pyproject.toml`) must not wedge the
-    /// load: `detect_pypi_flavor`'s routing probes are metadata-only (a FIFO
-    /// stats fine, and the pdm route short-circuits before detection's own
+    /// load: `detect_pypi_flavor`'s routing probes are metadata-only or read
+    /// regular files only (a FIFO stats fine, and the pdm route short-circuits before detection's own
     /// guarded pyproject read), so the backend's raw `read_to_string`
     /// open(2) is the FIRST open — it waits for a writer that never comes,
     /// wedging every pdm-project vendor run indefinitely. Same

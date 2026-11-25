@@ -56,6 +56,19 @@ pub(crate) fn global_scope_arg(common: &GlobalArgs) -> Option<String> {
     }
 }
 
+/// How to get the original files of the package `purl` back, as the start
+/// of a sentence. `bundle install` keeps an installed gem as it is, edits
+/// included, so a gem names the commands that reinstall it.
+pub(crate) fn reinstall_remedy(purl: &str) -> String {
+    match socket_patch_core::utils::purl::strip_purl_qualifiers(purl)
+        .strip_prefix("pkg:gem/")
+        .and_then(|rest| rest.split('@').next())
+    {
+        Some(gem) => format!("Run `bundle pristine {gem}` (or `gem pristine {gem}`)"),
+        None => "Reinstall the package".to_string(),
+    }
+}
+
 /// The flags that pick WHICH tree a run acts on, as a pasteable suffix
 /// (leading space, empty for a default run): `--cwd`, `--manifest-path`,
 /// `-g` / `--global-prefix` and `--ecosystems`, each only when it differs

@@ -56,12 +56,13 @@ fn env_non_empty(name: &str) -> Option<String> {
 /// — including unset and empty — is false. `pub` so the CLI shares this one
 /// vocabulary instead of re-declaring it.
 pub fn env_truthy(name: &str) -> bool {
+    truthy(&std::env::var(name).unwrap_or_default())
+}
+
+/// [`env_truthy`] for a value that was read already.
+pub fn truthy(value: &str) -> bool {
     matches!(
-        std::env::var(name)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
+        value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on" | "y" | "t"
     )
 }

@@ -619,10 +619,17 @@ const IMPLICIT_B_POM: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 
 /// #622: Maven 4 builds `a` and `b` of a 4.1.0 root that lists no
 /// `<subprojects>`. Vendoring must plan them as the reactor (suffixed
-/// version in `a`, the root pinned), so the developer's own warm `~/.m2`
-/// build, which already holds Central's 1.10.0, resolves the patched jar,
-/// and so does a fresh offline checkout. Before the fix the root was a
-/// reactor of one: `a` kept the base version and built Central's jar.
+/// version in `a`, the fallback repository in the root), so the
+/// developer's own warm `~/.m2` build, which already holds Central's
+/// 1.10.0, resolves the patched jar, and so does a fresh offline checkout.
+/// Before the fix the root was a reactor of one: `a` kept the base version
+/// and built Central's jar.
+///
+/// The root takes no pin (#2158): what a Maven 4 build selects is not
+/// modelled, and a pin is written only where the selection is certain.
+/// `a` declares the base version itself, so it is rewritten where it
+/// stands and `b` follows it. For the same reason `vex` withholds its
+/// statement: it cannot tell that the root and `b` resolve no other copy.
 #[test]
 #[ignore = "real Maven + Maven Central (fixture); run with --ignored"]
 fn maven_reactor_implicit_subprojects_warm_and_offline_build_and_revert() {
@@ -684,9 +691,23 @@ fn maven_reactor_implicit_subprojects_warm_and_offline_build_and_revert() {
         "the discovered module's declaration is suffixed"
     );
     assert_eq!(text(&vendored["b/pom.xml"]), IMPLICIT_B_POM);
+    let root_pom = text(&vendored["pom.xml"]);
     assert!(
-        text(&vendored["pom.xml"]).contains(&format!("<version>{SV}</version>")),
-        "the root is pinned"
+        root_pom.contains("<id>socket-patch-vendor</id>"),
+        "the root names the fallback repository:\n{root_pom}"
+    );
+    assert!(
+        !root_pom.contains("-socket."),
+        "the root takes no pin, a Maven 4 selection is not certain:\n{root_pom}"
+    );
+    assert!(
+        env["events"].as_array().unwrap().iter().any(|event| {
+            event["errorCode"] == "vendor_jvm_degraded"
+                && event["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.starts_with("reason: selection_undetermined:"))
+        }),
+        "the run says why no pin was written: {env}"
     );
 
     // The developer's own tree: `~/.m2` still holds Central's 1.10.0.
@@ -698,20 +719,39 @@ fn maven_reactor_implicit_subprojects_warm_and_offline_build_and_revert() {
         let _ = std::fs::remove_dir_all(proj.join(dir));
     }
 
-    let (code, doc, stderr) = socket_in(
+    let vex_doc = root.join("vex.json");
+    let (code, env, stderr) = socket_in(
         &proj,
         &m2,
         None,
         &[
             "vex",
+            "--json",
+            "--output",
+            vex_doc.to_str().unwrap(),
             "--cwd",
             proj.to_str().unwrap(),
             "--product",
             "pkg:maven/com.example/root@1.0.0",
         ],
     );
-    assert_eq!(code, Some(0), "vex: {doc}\n{stderr}");
-    assert_eq!(doc["statements"][0]["status"], "not_affected", "{doc}");
+    // `vex` attests only where every module that may resolve the base
+    // version is wired. On a Maven 4 build no module's selection can be
+    // told, and the root and `b` carry neither a pin nor a declaration,
+    // so the statement is withheld (a missed attestation, never a false
+    // one) although both modules build the patched jar.
+    assert_eq!(code, Some(1), "vex: {env}\n{stderr}");
+    assert_eq!(env["error"]["code"], "no_applicable_patches", "{env}");
+    assert!(
+        env["warnings"].as_array().unwrap().iter().any(|warning| {
+            warning["code"] == "vendor_jvm_shape_unsupported"
+                && warning["detail"].as_str().is_some_and(|detail| {
+                    detail.contains("is not wired in every module") && detail.contains("Maven 4")
+                })
+        }),
+        "the run names the module that may build unpatched: {env}"
+    );
+    assert!(!vex_doc.exists(), "no VEX document is written: {env}");
     let (code, env, stderr) = socket_in(
         &proj,
         &m2,

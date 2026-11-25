@@ -49,6 +49,14 @@ impl VerifyRollbackResult {
     }
 }
 
+/// The message of a file that holds neither side of its patch
+/// ([`VerifyRollbackStatus::HashMismatch`]). Such a file cannot be told
+/// apart: it may have been patched and then changed, or changed (or
+/// built from other sources) and never patched, so the text claims
+/// neither, and names no cause.
+pub const NEITHER_CONTENT: &str =
+    "File holds neither the patched nor the original content. Cannot safely roll back.";
+
 /// Result of rolling back patches for a single package.
 #[derive(Debug, Clone)]
 pub struct RollbackResult {
@@ -144,7 +152,7 @@ pub async fn verify_file_rollback(
         // A hash failure (directory/FIFO planted at the path, unreadable
         // file, dangling symlink target) is the same unverifiable state as a
         // stat failure above and must fail closed with the real error — a
-        // swallowed error would misreport "modified after patching" with a
+        // swallowed error would misreport a content mismatch with a
         // fabricated empty hash, and would compare equal to an empty
         // `after_hash`, wrongly clearing the entry for deletion.
         let current_hash = match compute_file_git_sha256(&filepath).await {
@@ -180,9 +188,7 @@ pub async fn verify_file_rollback(
         return VerifyRollbackResult {
             file: file_name.to_string(),
             status: VerifyRollbackStatus::HashMismatch,
-            message: Some(
-                "File has been modified after patching. Cannot safely roll back.".to_string(),
-            ),
+            message: Some(NEITHER_CONTENT.to_string()),
             current_hash: Some(current_hash),
             expected_hash: Some(file_info.after_hash.clone()),
             target_hash: None,
@@ -333,9 +339,7 @@ pub async fn verify_file_rollback(
         return VerifyRollbackResult {
             file: file_name.to_string(),
             status: VerifyRollbackStatus::HashMismatch,
-            message: Some(
-                "File has been modified after patching. Cannot safely roll back.".to_string(),
-            ),
+            message: Some(NEITHER_CONTENT.to_string()),
             current_hash: Some(current_hash),
             expected_hash: Some(file_info.after_hash.clone()),
             target_hash: Some(file_info.before_hash.clone()),
@@ -1112,7 +1116,7 @@ mod tests {
         let result =
             verify_file_rollback(pkg_dir.path(), "index.js", &file_info, blobs_dir.path()).await;
         assert_eq!(result.status, VerifyRollbackStatus::HashMismatch);
-        assert!(result.message.unwrap().contains("modified after patching"));
+        assert_eq!(result.message.as_deref(), Some(NEITHER_CONTENT));
     }
 
     #[tokio::test]

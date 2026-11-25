@@ -1050,6 +1050,21 @@ impl Cell {
         );
     }
 
+    /// [`Cell::builds`] on a second machine ([`Cell::twin`]) that has no
+    /// lock of Bazel's either: its Bazel has fetched and built nothing and
+    /// holds no record of a hub, so it evaluates every hub anew, with the
+    /// `repo_env` of this cell. A warm rebuild here proves nothing of what
+    /// lies outside the checkout: Bazel does not look there again. This
+    /// cell goes before the second one builds, unless it holds the
+    /// repository cache (no [`REPO_CACHE`]): a flow keeps one output base
+    /// at a time.
+    pub fn builds_anew(self, marker: &str) {
+        let twin = self.twin();
+        let _first = var(REPO_CACHE).is_none().then_some(self);
+        std::fs::remove_file(twin.path("MODULE.bazel.lock")).expect("Bazel's lock");
+        twin.builds(marker);
+    }
+
     /// Step (a) of a flow: the build prints `marker`, and Bazel wrote its
     /// lock. Gives the files of the checkout, that lock among them.
     pub fn builds_unpatched(&self, marker: &str) -> Tree {
@@ -1232,6 +1247,140 @@ impl Cell {
             json!({ "code": out.status.code(), "stdout": stdout, "stderr": stderr, "document": written })
         };
         json!([run(&["--json"]), run(&[])])
+    }
+
+    /// What of the workspace copy its regular files ([`Cell::tree`]) do not
+    /// make anew, each by its path from the copy: a link, a directory that
+    /// holds nothing, a file with a permission bit to run it, and whatever
+    /// is neither a file nor a directory.
+    fn not_made_by_its_files(&self) -> Vec<String> {
+        use std::os::unix::fs::PermissionsExt;
+        fn walk(dir: &Path, odd: &mut Vec<PathBuf>) {
+            let entries = std::fs::read_dir(dir).expect("a directory of the copy");
+            let entries: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+            if entries.is_empty() {
+                odd.push(dir.to_path_buf());
+            }
+            for path in entries {
+                let meta = std::fs::symlink_metadata(&path).expect("an entry of the copy");
+                if meta.is_dir() {
+                    walk(&path, odd);
+                } else if !meta.is_file() || meta.permissions().mode() & 0o111 != 0 {
+                    odd.push(path);
+                }
+            }
+        }
+        let (base, mut odd) = (&self.scratch.workspace, Vec::new());
+        walk(base, &mut odd);
+        odd.retain(|path| path != base);
+        let shown = |path: &PathBuf| match path.strip_prefix(base) {
+            Ok(from) => from.display().to_string(),
+            Err(_) => path.display().to_string(),
+        };
+        let mut odd: Vec<String> = odd.iter().map(shown).collect();
+        odd.sort();
+        odd
+    }
+
+    /// The workspace copy with the files `files` and nothing else: every
+    /// file as a new one, with the permission bits of any new file, and no
+    /// directory but those the files are in.
+    fn remake(&self, files: &Tree) {
+        let entries = std::fs::read_dir(&self.scratch.workspace).expect("the workspace copy");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let gone = match entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                true => std::fs::remove_dir_all(&path),
+                false => std::fs::remove_file(&path),
+            };
+            gone.unwrap_or_else(|e| panic!("remove {}: {e}", path.display()));
+        }
+        for (rel, bytes) in files {
+            self.write(rel, bytes);
+        }
+    }
+
+    /// `SOCKET_NO_BAZEL=1` makes `socket-patch <args>` in this checkout the
+    /// run of the same checkout without its Bazel files `bazel`, to a
+    /// script (`--json`) and to a person: the exit code, both streams byte
+    /// for byte, and every file the run left but those ([`undated`]). Each
+    /// run starts in the checkout as it is now, made anew from its regular
+    /// files, and the checkout is left so. A checkout that those files do
+    /// not make anew is refused, with what it holds beside them
+    /// ([`Cell::not_made_by_its_files`]): a link, an empty directory or an
+    /// executable file would be gone from the second run on, and the runs
+    /// would not start alike. The run without the Bazel files passes.
+    /// Without the variable the same command gives something else in the
+    /// workspace, which is what this gives: the comparison is of a run that
+    /// the workspace changes.
+    pub fn off_is_without_bazel(
+        &self,
+        api: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        bazel: &[&str],
+    ) -> Value {
+        self.without_and_beside(api, args, env, bazel).1
+    }
+
+    /// [`Cell::off_is_without_bazel`], with what the run without the Bazel
+    /// files gave before what the run beside them gave: for a test that
+    /// also holds what the run with the variable did, which is the first.
+    pub fn without_and_beside(
+        &self,
+        api: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        bazel: &[&str],
+    ) -> (Value, Value) {
+        let odd = self.not_made_by_its_files();
+        assert_eq!(
+            odd,
+            Vec::<String>::new(),
+            "{}: the regular files of this checkout do not make it anew",
+            self.test
+        );
+        let files = self.tree();
+        let mut plain = files.clone();
+        plain.retain(|rel, _| !bazel.contains(&rel.as_str()));
+        let gives = |start: &Tree, env: &[(&str, &str)]| {
+            let run = |form: &[&str]| {
+                self.remake(start);
+                let mut cmd = self.socket_patch_command(api, &[args, form].concat(), env);
+                let out = cmd.output().expect("spawn socket-patch");
+                let text = |bytes: Vec<u8>| String::from_utf8_lossy(&bytes).into_owned();
+                let mut left = undated(&self.tree());
+                left.retain(|rel, _| !bazel.contains(&rel.as_str()));
+                let left: BTreeMap<String, String> = left
+                    .into_iter()
+                    .map(|(rel, bytes)| (rel, text(bytes)))
+                    .collect();
+                json!({
+                    "code": out.status.code(),
+                    "stdout": text(out.stdout),
+                    "stderr": text(out.stderr),
+                    "files": left,
+                })
+            };
+            json!([run(&["--json"]), run(&[])])
+        };
+        let off = [env, &[("SOCKET_NO_BAZEL", "1")]].concat();
+        let without = gives(&plain, env);
+        let (switched, beside) = (gives(&files, &off), gives(&files, env));
+        self.remake(&files);
+        let test = &self.test;
+        let codes = [&without[0]["code"], &without[1]["code"]];
+        assert_eq!(
+            codes,
+            [&json!(0), &json!(0)],
+            "{test}: {args:?}: {without:#}"
+        );
+        assert_eq!(switched, without, "{test}: {args:?} with SOCKET_NO_BAZEL=1");
+        assert_ne!(
+            beside, without,
+            "{test}: {args:?} is no other run in the workspace"
+        );
+        (without, beside)
     }
 
     /// Where a flow has `socket-patch` write the VEX document `name`:
@@ -1435,6 +1584,87 @@ impl Cell {
         assert_eq!(there, here, "{test}: the two checkouts word it apart");
     }
 
+    /// Agent mode in this checkout, through `run`, for a package that its
+    /// package manager keeps outside the checkout, where `installed` is a
+    /// file of that copy: `scan --mode agent --yes` gives the file the text
+    /// `patched`, from the record of the patch, and writes nothing into the
+    /// checkout but its own `.socket` directory, and the `apply` of a later
+    /// run passes. Then what the two say with `--vex`, and what `vex` and
+    /// `vex --no-verify` say: all four pass and write one document, which
+    /// says `claim`. Gives the files of the checkout.
+    pub fn patches_outside(
+        &self,
+        run: impl Fn(&Cell, &[&str]) -> Ran,
+        installed: &Path,
+        patched: &str,
+        claim: &Claim,
+    ) -> Tree {
+        let test = &self.test;
+        let before = self.tree();
+        let in_run = self.document("in-run");
+        let agent = ["scan", "--mode", "agent", "--yes"];
+        let scan = run(self, &[&agent[..], &with_vex(&in_run)].concat());
+        let said = &scan.dump;
+        assert_eq!(scan.code, 0, "{test}: {said}");
+        assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
+        assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
+        let left = self.tree();
+        let mut wrote = changed(&before, &left);
+        wrote.retain(|file| !file.starts_with(".socket/"));
+        assert_eq!(wrote, NOTHING, "{test}: {said}");
+        let holds = std::fs::read_to_string(installed).unwrap_or_default();
+        assert_eq!(holds, patched, "{test}: {}", installed.display());
+
+        let again = self.document("apply");
+        let apply = run(self, &[&["apply"][..], &with_vex(&again)].concat());
+        let status = &apply.envelope["status"];
+        assert_eq!(*status, "success", "{test}: {}", apply.dump);
+        self.wrote_in_run(&scan, &in_run, claim);
+        self.wrote_in_run(&apply, &again, claim);
+        self.stands_alone(&run, claim, true);
+        self.stands_alone(&run, claim, false);
+        assert_eq!(changed(&left, &self.tree()), NOTHING, "{test}");
+        left
+    }
+
+    /// What stays the statement of a project without Bazel in this
+    /// checkout, after [`Cell::patches_outside`] under a hub that builds
+    /// the package from the project's lock. With `--no-bazel`, and with
+    /// each of `undecided` as its `MODULE.bazel`, whose files do not show
+    /// such a hub, `vex` attests the package as `installed` says, through
+    /// the patch. And what it gives a script and a person is what it gives
+    /// in the same checkout without its `MODULE.bazel`: the exit code,
+    /// both streams and the document. `gives` is [`Cell::gives`] of this
+    /// cell with the Socket API and the environment of `run`.
+    pub fn keeps_its_statement(
+        &self,
+        run: impl Fn(&Cell, &[&str]) -> Ran,
+        gives: impl Fn(&[&str], &Path) -> Value,
+        installed: &Claim,
+        undecided: &[String],
+    ) {
+        let shipped = |cell: &Cell, args: &[&str]| run(cell, &[args, &["--no-bazel"]].concat());
+        self.stands_alone(shipped, installed, true);
+        let document = self.document("undecided");
+        let vex = vex(&document);
+        let mut given = vec![gives(&[&vex[..], &["--no-bazel"]].concat(), &document)];
+        let module = self.path("MODULE.bazel");
+        let hub = std::fs::read_to_string(&module).expect("MODULE.bazel");
+        for other in undecided {
+            assert_ne!(*other, hub, "{}", self.test);
+            self.write("MODULE.bazel", other);
+            self.stands_alone(&run, installed, true);
+            given.push(gives(&vex, &document));
+        }
+        std::fs::remove_file(&module).expect("MODULE.bazel");
+        self.stands_alone(&run, installed, true);
+        let without_bazel = gives(&vex, &document);
+        for (at, given) in given.iter().enumerate() {
+            assert_eq!(*given, without_bazel, "{}: the run {at}", self.test);
+        }
+        println!("`vex` in a checkout without MODULE.bazel:\n{without_bazel:#}");
+    }
+
     /// The stand-alone `vex` of a checkout that holds no patch any more,
     /// through `run`: it exits `code` with the error `error` and leaves no
     /// document, and says that it removed the one [`Cell::stands_alone`]
@@ -1609,6 +1839,51 @@ fn a_downloader_config_is_named_by_the_option_of_the_release() {
             assert!(!file.starts_with(&cell.scratch.workspace), "{release}");
         }
         assert_ne!(cell.scratch.downloads, twin.scratch.downloads, "{release}");
+    }
+}
+
+/// Without a Bazel: the comparison of a run with the switch
+/// ([`Cell::off_is_without_bazel`]) makes the checkout anew from its
+/// regular files before each run, so it refuses a checkout that holds
+/// what those files do not carry. A link, an empty directory and an
+/// executable file are each named, and no run is started.
+#[test]
+fn a_checkout_its_files_do_not_make_anew_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let cell = cell_without_bazel("9.3.2");
+    cell.write("MODULE.bazel", "");
+    cell.write("dir/file", "x");
+    assert_eq!(cell.not_made_by_its_files(), NOTHING);
+    std::os::unix::fs::symlink("file", cell.path("dir/link")).expect("a link");
+    std::fs::create_dir(cell.path("empty")).expect("a directory");
+    cell.write("run.sh", "#!/bin/sh\n");
+    let runs = std::fs::Permissions::from_mode(0o755);
+    std::fs::set_permissions(cell.path("run.sh"), runs).expect("the permission bits");
+    let odd = ["dir/link", "empty", "run.sh"];
+    assert_eq!(cell.not_made_by_its_files(), odd);
+    let compare = || cell.off_is_without_bazel("http://127.0.0.1:9", &["list"], &[], &[]);
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(compare));
+    assert!(refused.is_err(), "it ran in a checkout it cannot make anew");
+    // Nothing was made anew: the three are where they were.
+    assert_eq!(cell.not_made_by_its_files(), odd);
+    // Each one alone is enough.
+    for (keep, gone) in [(0, [1, 2]), (1, [0, 2]), (2, [0, 1])] {
+        let other = cell_without_bazel("9.3.2");
+        other.write("dir/file", "x");
+        std::os::unix::fs::symlink("file", other.path("dir/link")).expect("a link");
+        std::fs::create_dir(other.path("empty")).expect("a directory");
+        other.write("run.sh", "#!/bin/sh\n");
+        let runs = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(other.path("run.sh"), runs).expect("the permission bits");
+        for at in gone {
+            let path = other.path(odd[at]);
+            let removed = match path.is_dir() && !path.is_symlink() {
+                true => std::fs::remove_dir(&path),
+                false => std::fs::remove_file(&path),
+            };
+            removed.expect("remove it");
+        }
+        assert_eq!(other.not_made_by_its_files(), [odd[keep]]);
     }
 }
 
