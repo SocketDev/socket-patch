@@ -21,8 +21,8 @@
 //! that every Socket module was fetched from it.
 //!
 //! Legs: npm, pnpm, yarn classic, yarn berry, Bun, vlt, pip, uv, PDM,
-//! Pipenv, Bundler and Go. There is no Composer leg: Socket publishes no
-//! Composer patch yet, so there is nothing to pin.
+//! Pipenv, Bundler and Go. There is no Composer leg: no Composer patch
+//! was available to test with, so there is nothing to pin.
 //!
 //! ## Configuration
 //!
