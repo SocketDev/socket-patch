@@ -2683,11 +2683,13 @@ async fn run_eject(
 }
 
 /// The no-manifest warning when the vendor ledger cannot be read either.
-/// It names no `repair`: that stops at the same ledger.
+/// It names no `repair`: that stops at the same ledger. The error can
+/// quote the committed ledger.
 fn no_manifest_ledger_unreadable(err: &str) -> String {
     format!(
         "Warning: No manifest to vendor from, and the vendor ledger could not be read: \
-         {err}\n  Restore .socket/vendor/state.json from version control."
+         {}\n  Restore .socket/vendor/state.json from version control.",
+        crate::ui::printable(err)
     )
 }
 
@@ -8265,6 +8267,11 @@ mod scope_and_hint_tests {
             "Warning: No manifest to vendor from, and the vendor ledger could not be read: \
              corrupt .socket/vendor/state.json: expected value\n  Restore \
              .socket/vendor/state.json from version control."
+        );
+        assert!(
+            !no_manifest_ledger_unreadable("unknown variant `\u{1b}]0;owned\u{7}`")
+                .contains(['\u{1b}', '\u{7}']),
+            "the ledger's error is printed without its control characters"
         );
         let json = no_manifest_ledger_unreadable_warning("corrupt x: expected value");
         assert_eq!(json.code, "vendor_state_unreadable");

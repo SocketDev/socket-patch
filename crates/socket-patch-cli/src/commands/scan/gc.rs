@@ -1972,36 +1972,40 @@ mod tests {
         }
     }
 
-    /// Only a ledger that is not there is "no ledger". One that cannot even
-    /// be stat'd (a symlink to itself) takes the pass past its existence
-    /// gate, with no manifest beside it, to the read that reports it.
+    /// Only a `.socket/vendor/` that is not there is "nothing vendored".
+    /// With no manifest beside it, a ledger that cannot be read (a symlink
+    /// to itself) and a vendor directory that cannot even be stat'd (the
+    /// same) both take the pass past its existence gate to the step that
+    /// reports them: the ledger's load, and the lock's own check of
+    /// `.socket/vendor/`.
     #[cfg(unix)]
     #[tokio::test]
-    async fn gc_takes_only_a_missing_ledger_for_no_ledger() {
-        let tmp = tempfile::tempdir().unwrap();
-        let socket_dir = tmp.path().join(".socket");
-        let ledger = tmp.path().join(VENDOR_STATE_REL);
-        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink("state.json", &ledger).unwrap();
-        let manifest_path = socket_dir.join("manifest.json");
-        let common = gc_common(tmp.path());
+    async fn gc_takes_only_a_missing_vendor_dir_for_nothing_vendored() {
+        for (looped, code) in [
+            (VENDOR_STATE_REL, "vendor_state_unreadable"),
+            (".socket/vendor", GC_SKIPPED),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let socket_dir = tmp.path().join(".socket");
+            let looped_path = tmp.path().join(looped);
+            std::fs::create_dir_all(looped_path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(looped_path.file_name().unwrap(), &looped_path).unwrap();
+            let manifest_path = socket_dir.join("manifest.json");
+            let common = gc_common(tmp.path());
 
-        let full = run_apply_gc(
-            &common,
-            &manifest_path,
-            &socket_dir,
-            &HashSet::new(),
-            &no_vendored(),
-        )
-        .await;
-        let vendor_only = run_vendor_only_gc(&common, &manifest_path, &socket_dir).await;
-        for (pass, gc) in [("full", full), ("vendor-only", vendor_only)] {
-            let json = recorded(&gc, false);
-            assert_eq!(
-                warning_codes(&json),
-                ["vendor_state_unreadable"],
-                "{pass}: {json}"
-            );
+            let full = run_apply_gc(
+                &common,
+                &manifest_path,
+                &socket_dir,
+                &HashSet::new(),
+                &no_vendored(),
+            )
+            .await;
+            let vendor_only = run_vendor_only_gc(&common, &manifest_path, &socket_dir).await;
+            for (pass, gc) in [("full", full), ("vendor-only", vendor_only)] {
+                let json = recorded(&gc, false);
+                assert_eq!(warning_codes(&json), [code], "{looped}, {pass}: {json}");
+            }
         }
     }
 
@@ -2080,6 +2084,15 @@ mod tests {
                 !detail.contains("revert"),
                 "{case}: a prune is not a revert, and `vendor --revert` would un-vendor \
                  the whole project: {detail}"
+            );
+            // The other way out is complete: this pass deletes no dir
+            // without a ledger entry, so the detail does not leave one.
+            assert!(
+                detail.ends_with(
+                    "or point the lockfile back at the registry release and delete the \
+                     directory)"
+                ),
+                "{case}: {detail}"
             );
             assert_eq!(
                 format_gc_vendored_lines(&gc),
