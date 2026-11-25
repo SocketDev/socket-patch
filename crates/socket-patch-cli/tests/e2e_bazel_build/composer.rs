@@ -1608,17 +1608,21 @@ fn a_project_vendored_by_an_earlier_release_is_not_declined_a_newer_patch() {
 
 /// Without a Bazel: a regular file named `workspace`, in lower case, at
 /// the root of a checkout that has no Bazel file. On a disk that folds
-/// case it is what a lookup of `WORKSPACE` finds, and it is no Bazel
-/// workspace file all the same: the directory lists it under another name
-/// than Bazel's. So the project is vendored on either disk. The test asks
-/// the disk which of the two it runs on and says so.
+/// case it is what a lookup of `WORKSPACE` finds, and vendored mode
+/// declines the project; on a disk that does not, the project is vendored.
+/// The test asks the disk which of the two it runs on and says so.
 #[test]
-fn a_file_named_workspace_in_lower_case_makes_no_bazel_workspace() {
+fn a_file_named_workspace_in_lower_case_declines_where_the_disk_folds_case() {
     let (flow, patch) = checkout(&["workspace"]);
     let before = flow.cell.tree();
     let folds = flow.cell.path("WORKSPACE").is_file();
-    vendors(&flow, API, &patch, &before, &[]);
-    println!("a file named `workspace`: vendored, on a disk that folds case: {folds}");
+    if folds {
+        declines(&flow, API, &VENDORED, 1, "failed", &before);
+    } else {
+        vendors(&flow, API, &patch, &before, &[]);
+    }
+    let ran = ["does not fold case: vendored", "folds case: declined"][usize::from(folds)];
+    println!("a file named `workspace`: the disk {ran}");
 }
 
 /// Without a Bazel: with `SOCKET_NO_BAZEL=1` vendored mode is not declined

@@ -88,19 +88,6 @@ fn unread_other() -> Files {
     vec![("MODULE.bazel", module)]
 }
 
-/// The workspace of another ruleset beside a file `workspace` that is no
-/// Starlark: a note, a file of another tool. On a disk that folds case
-/// that file answers for `WORKSPACE`, and it is no file of the older
-/// system for all that: a workspace file is read under the name the
-/// directory lists it by.
-fn other_beside_a_stray_file() -> Files {
-    let notes = "notes on the workspace (never closed\n".to_string();
-    vec![
-        ("MODULE.bazel", OTHER_HUB.to_string()),
-        ("workspace", notes),
-    ]
-}
-
 /// A lock of format 3 as a pin of [`HUB`] writes it when another Bazel
 /// module adds to the hub named `maven` too, which the real-Bazel flows do
 /// not build: the jar of each of `jars`, an artifact of the group and its
@@ -449,8 +436,7 @@ fn a_maven_project_no_hub_builds_reports_as_without_bazel() {
             !args.contains(&"--dry-run"),
             "{args:?}: {without:?}"
         );
-        let stray = other_beside_a_stray_file();
-        for bazel in [&other, &elsewhere, &unread_other(), &stray] {
+        for bazel in [&other, &elsewhere, &unread_other()] {
             let beside = machine.run(bazel, true, args);
             assert_eq!(beside, without, "{args:?} beside {:?}", bazel[0].1);
         }

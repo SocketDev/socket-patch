@@ -4,8 +4,10 @@
 //! files without their `MODULE.bazel`, and its path selection asks the
 //! host for what it asks for the tree without its Bazel files.
 //!
-//! The one test sets the variable for its own process, which is why it has
-//! a test target to itself: no other test reads the environment beside it.
+//! The engine reads the variable from the environment of its process, so
+//! each test holds it through the guard, set or unset, before any server
+//! starts, and the two run one after the other. The target is theirs
+//! alone: no other test reads the environment beside them.
 
 use std::collections::BTreeMap;
 
@@ -17,6 +19,15 @@ mod common;
 
 use common::*;
 use socket_patch_cli::hosted_memory::{select_paths, PathSelection, SelectOptions, TreeEntryInput};
+
+/// The core unit tests' env guard, compiled into this test binary too.
+#[allow(dead_code)]
+#[path = "../../socket-patch-core/src/test_env.rs"]
+mod test_env;
+use test_env::EnvGuard;
+
+/// The switch for a project that Bazel does not build.
+const OFF: &str = "SOCKET_NO_BAZEL";
 
 /// The files of a tree, by path.
 type Files = BTreeMap<String, Vec<u8>>;
@@ -83,23 +94,26 @@ fn trees_with_bazel_files() -> Vec<(Files, Files)> {
         .collect()
 }
 
+/// One project of the tests: what it is, the patch API that serves its
+/// patch, its files without and with the `MODULE.bazel`, what the warnings
+/// say beside the hub, and whether the patch service offers the patch's
+/// registry (the directory its tarball is served from).
+struct Project {
+    row: String,
+    server: MockServer,
+    plain: Files,
+    beside: Files,
+    said: &'static str,
+    offered: bool,
+}
+
 /// A gem lock beside a rules_ruby hub that holds the gem to its upstream
-/// sha256, and a pnpm lock beside a rules_js hub that hides
-/// `pnpm-workspace.yaml` from pnpm 11: the engine leaves each as it is
-/// and says why. A pnpm lock that a rules_js hub reads, in a project that
-/// proves pnpm 12 and is offered the patch's registry: the engine pins it
-/// and does not route it through that registry, and says that the hub is
-/// why. Its selection asks for the `MODULE.bazel` of each, and for every
-/// file of a Bazel workspace beside a pnpm lock, a `pnpm-workspace.yaml`
-/// or a gem lock.
-///
-/// With `SOCKET_NO_BAZEL=1` it pins each, and says, what it does for the
-/// same files without the `MODULE.bazel`, so the third lock is routed, and
-/// the selection is the one of the tree without its Bazel files: no file
-/// is fetched, and counted against a session's limits, that nothing
-/// judges.
-#[tokio::test]
-async fn the_switch_makes_the_engine_pin_as_without_the_bazel_file() {
+/// sha256, a pnpm lock beside a rules_js hub that hides
+/// `pnpm-workspace.yaml` from pnpm 11, and a pnpm lock that a rules_js hub
+/// reads, in a project that proves pnpm 12 and is offered the patch's
+/// registry. Each starts its patch API: a test holds the variable before
+/// it asks for them.
+async fn projects() -> Vec<Project> {
     let ruby = format!(
         "bazel_dep(name = \"rules_ruby\", version = \"1.0.0-rc2\")\n\
          ruby = use_extension(\"@rules_ruby//ruby:extensions.bzl\", \"ruby\")\n\
@@ -132,8 +146,7 @@ async fn the_switch_makes_the_engine_pin_as_without_the_bazel_file() {
         ),
     ];
     // The fixture, the files added to it, its `MODULE.bazel`, what the
-    // warnings say beside the hub, and whether the patch service offers
-    // the patch's registry (the directory its tarball is served from).
+    // warnings say beside the hub, and whether the registry is offered.
     let rows = [
         (
             "redirect/gem/bundler/basic",
@@ -157,7 +170,7 @@ async fn the_switch_makes_the_engine_pin_as_without_the_bazel_file() {
             true,
         ),
     ];
-    let mut runs = Vec::new();
+    let mut projects = Vec::new();
     for (fixture, more, module, said, offered) in rows {
         let dir = fixtures_root().join(fixture);
         let server = MockServer::start().await;
@@ -174,40 +187,75 @@ async fn the_switch_makes_the_engine_pin_as_without_the_bazel_file() {
         }
         let mut beside = plain.clone();
         beside.insert("MODULE.bazel".to_string(), module.as_bytes().to_vec());
-        let (changed, redirect) = pins(&server, &beside).await;
+        let row = format!("{fixture}, {said}");
+        projects.push(Project {
+            row,
+            server,
+            plain,
+            beside,
+            said,
+            offered,
+        });
+    }
+    projects
+}
+
+/// Without the variable, whatever the shell of the test run exports: the
+/// engine leaves the gem lock and the pnpm lock of the hub that hides
+/// `pnpm-workspace.yaml` as they are and says why; the lock that a hub
+/// only reads is pinned and not routed through the patch's registry, and
+/// the engine says that the hub is why. Its selection asks for the
+/// `MODULE.bazel` of each, and for every file of a Bazel workspace beside
+/// a pnpm lock, a `pnpm-workspace.yaml` or a gem lock.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_hub_keeps_the_engine_from_pinning_or_routing() {
+    let _unset = EnvGuard::unset(OFF);
+    for project in projects().await {
+        let Project { row, said, .. } = &project;
+        let (changed, redirect) = pins(&project.server, &project.beside).await;
         // Beside the hub nothing is pinned, or, where the hub only keeps
         // the lock off the registry, the lock is pinned and not routed.
         let pinned = changed.contains_key("pnpm-lock.yaml");
-        let row = format!("{fixture}, {said}");
-        assert_eq!(pinned, offered, "{row}: {}", describe(&changed));
+        assert_eq!(pinned, project.offered, "{row}: {}", describe(&changed));
         assert!(!routed(&changed), "{row}: {}", describe(&changed));
-        assert_eq!(changed.is_empty(), !offered, "{row}");
+        assert_eq!(changed.is_empty(), !project.offered, "{row}");
         let warned = redirect["warnings"].to_string();
         assert!(warned.contains(said), "{row}: {redirect:#}");
-        let asked = selection(&beside).fetch_text;
+        let asked = selection(&project.beside).fetch_text;
         assert!(asked.iter().any(|path| path == "MODULE.bazel"), "{asked:?}");
-        runs.push((row, server, plain, beside, offered));
     }
-    let trees = trees_with_bazel_files();
-    for (plain, beside) in &trees {
+    for (plain, beside) in &trees_with_bazel_files() {
         let asked = selection(beside).fetch_text;
         for file in beside.keys().filter(|file| !plain.contains_key(*file)) {
             assert!(asked.contains(file), "{file}: {asked:?}");
         }
     }
+}
 
-    std::env::set_var("SOCKET_NO_BAZEL", "1");
-    for (row, server, plain, beside, offered) in &runs {
-        let without = pins(server, plain).await;
+/// With `SOCKET_NO_BAZEL=1` the engine pins each, and says, what it does
+/// for the same files without the `MODULE.bazel`, so the third lock is
+/// routed, and the selection is the one of the tree without its Bazel
+/// files: no file is fetched, and counted against a session's limits, that
+/// nothing judges.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_switch_makes_the_engine_pin_as_without_the_bazel_file() {
+    let _set = EnvGuard::set(OFF, "1");
+    for project in projects().await {
+        let Project { row, server, .. } = &project;
+        let without = pins(server, &project.plain).await;
         assert!(!without.0.is_empty(), "{row}: {:#}", without.1);
         // The route is taken where it is offered: the offer is live, and
         // the hub was what stood against it.
-        assert_eq!(routed(&without.0), *offered, "{row}: {:#}", without.1);
+        let offered = project.offered;
+        assert_eq!(routed(&without.0), offered, "{row}: {:#}", without.1);
         assert!(!without.1.to_string().contains("Bazel"), "{row}");
-        assert_eq!(pins(server, beside).await, without, "{row}");
-        assert_eq!(selection(beside), selection(plain), "{row}");
+        assert_eq!(pins(server, &project.beside).await, without, "{row}");
+        let asked = selection(&project.beside);
+        assert_eq!(asked, selection(&project.plain), "{row}");
     }
-    for (plain, beside) in &trees {
+    for (plain, beside) in &trees_with_bazel_files() {
         assert_eq!(selection(beside), selection(plain), "{:?}", plain.keys());
     }
 }

@@ -83,7 +83,9 @@ Empty environment values are treated as unset.
   for a project that sits in a checkout with a Bazel workspace file and that
   Bazel does not build. Every command then treats the project as one in no
   Bazel workspace. It takes `1`, `true`, `yes`, `on`, `y` or `t`, has no flag, and
-  is inherited by the programs socket-patch starts. See
+  is inherited by the programs socket-patch starts. It is for the whole run:
+  set it for runs in that project's directory, not for a run over a checkout
+  that also holds projects Bazel builds. See
   [Bazel workspaces: a project that Bazel does not build](ecosystems.md#bazel-workspaces-a-project-that-bazel-does-not-build).
 - `--offline` prohibits network access. `scan` and `get` require the patch API
   and refuse offline operation. Other commands can use locally available state;

@@ -489,10 +489,11 @@ pub struct Hubs {
     /// workspace a doubt is about no hub ([`hub_jars`]; [`Hubs::built`]
     /// unless `unread`).
     ruleset: bool,
-    /// Whether a file that is there was not read as a whole, and may be the
-    /// one that names the ruleset ([`Workspace::unread`]), or the
-    /// `WORKSPACE` file is not read while Bazel may read it.
-    unread: bool,
+    /// The doubt about a file that is there and was not read as a whole,
+    /// and may be the one that names the ruleset ([`Workspace::unread`]),
+    /// or about the `WORKSPACE` file that is not read while Bazel may read
+    /// it.
+    unread: Option<Doubt>,
 }
 
 impl Hubs {
@@ -635,7 +636,7 @@ impl Hubs {
             || ours
             || (calls && legacy.is_some())
             || view("maven_install.json") != Entry::Absent;
-        let unread = ws.unread || legacy.is_some();
+        let unread = ws.unread.clone().or_else(|| legacy.clone());
         doubts.extend(legacy);
         Hubs {
             pinned,
@@ -666,8 +667,12 @@ impl Hubs {
         let named = Some(target(&format!("{group}:{artifact}")));
         let over = |(of, _): &&(Option<String>, Doubt)| of.is_none() || *of == named;
         match self.overrides.iter().find(over) {
+            // The doubt that makes the answer: the first one in a workspace
+            // that has to do with the ruleset, else the one about the file
+            // that was not read, which another doubt may stand before.
             _ if by.is_empty() => {
-                let doubt = self.doubt().filter(|_| self.ruleset || self.unread);
+                let unread = || Some((self.unread.as_ref()?, Kind::Unread));
+                let doubt = self.doubt().filter(|_| self.ruleset).or_else(unread);
                 doubt.map_or(Built::No, |(doubt, kind)| Built::Unknown(doubt, kind))
             }
             Some((Some(_), tag)) => Built::Unknown(tag, Kind::Overridden),
@@ -2483,6 +2488,19 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
         ];
         assert_eq!(built(&files), said);
         assert_eq!(built(&files[..1]), said, "the file may be there");
+        // The doubt that is named is the one that made the answer. A
+        // statement the reader does not follow comes first and is about no
+        // hub; the file that was not read is, and once it reads nothing is.
+        let load = "load(\"//:defs.bzl\", \"deps\")\n";
+        let root = format!("{load}{go}");
+        let files = [("MODULE.bazel", root.as_str()), ("more.MODULE.bazel", open)];
+        let said = format!("more.MODULE.bazel:1: {why}; MODULE.bazel:3 includes it");
+        assert_eq!(built(&files), said);
+        let read = [files[0], ("more.MODULE.bazel", "x = 1\n")];
+        assert_eq!(built(&read), "no");
+        // The same for a `WORKSPACE` file that cannot be read.
+        let files = [("MODULE.bazel", load), ("WORKSPACE", open)];
+        assert_eq!(built(&files), format!("WORKSPACE:1: {why}"));
     }
 
     /// The block of the root `MODULE.bazel` is written for a hub alone, so

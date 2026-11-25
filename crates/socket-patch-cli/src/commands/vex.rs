@@ -4033,8 +4033,12 @@ mod bazel_tests {
     /// project's, changes nothing. Nor does a run with `--vex-no-bazel`,
     /// whose document is about the installed tree: the step returns before
     /// it asks about a package, and every set it was given is as it was.
+    /// The lookup of the workspace reads `SOCKET_NO_BAZEL` from the
+    /// environment, so the test holds it unset.
     #[tokio::test]
+    #[serial_test::serial]
     async fn the_bazel_step_finds_what_no_hub_builds_in_a_project_run_only() {
+        let _unset = crate::test_env::EnvGuard::unset(socket_patch_core::bazel::OFF_ENV);
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         let module = "module(name = \"shop\")\n\

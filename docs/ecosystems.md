@@ -2395,6 +2395,12 @@ step's own option and switches nothing else off. Set it only for a project that 
 not build. For one that Bazel builds, what it switches off is what keeps a command that exits
 0 from leaving a build that fails, or one that is not patched.
 
+The variable is for the whole run, and whether Bazel builds a project is a fact of each
+project. A bare `scan` covers every project of a checkout, so with the variable set a project
+that Bazel does build is treated the same: it loses every guard above, and the run still
+exits 0. Set it for runs in the directory of the project that Bazel does not build, not for a
+run over a checkout that also holds projects Bazel builds. There is no setting per project.
+
 A Maven patch shows what that means. With the variable set, `vendor` beside a Maven or Gradle
 build vendors for that build alone, as in a checkout without the workspace file: it edits the
 poms, writes the tree under `.socket/vendor/`, exits 0, writes nothing for a hub and says
@@ -3494,17 +3500,13 @@ line all the same, so that they cannot break the workspace.
 
 A project is in a Bazel workspace when its directory, or one above it up to the root of its git
 checkout, holds a regular file `MODULE.bazel`, `REPO.bazel`, `WORKSPACE` or `WORKSPACE.bazel`
-(the names Bazel itself looks for); the nearest such directory is the Bazel root. The name
-counts as the directory lists it: a file `workspace` or `Module.bazel` is none, also on a disk
-that folds case, where a lookup of `WORKSPACE` finds it. Bazel itself takes such a file on a
-disk that folds case, so a workspace whose file is spelled in another case gets nothing of
-what socket-patch does for Bazel: give the file Bazel's spelling. The files of a workspace
-are read by the same rule: beside a `MODULE.bazel`, a file `workspace` is no `WORKSPACE`
-file, and gives no warning. A release before this rule took such a file for a workspace file
-and may have written a pair into the `.bazelignore` beside it: that pair still goes with its
-copy, and none is added there. No project is in a Bazel workspace for a run with
-[`SOCKET_NO_BAZEL=1`](#bazel-workspaces-a-project-that-bazel-does-not-build), which adds no
-line and still takes away the pair of a copy that is gone. The checkout
+(the names Bazel itself looks for); the nearest such directory is the Bazel root. On a disk
+that folds case a regular file named `workspace` or `Module.bazel` counts too, as it does for
+Bazel itself;
+[`SOCKET_NO_BAZEL=1`](#bazel-workspaces-a-project-that-bazel-does-not-build) is the way out
+for a checkout where such a file is no workspace. No project is in a Bazel workspace for a
+run with that variable, which adds no line and still takes away the pair of a copy that is
+gone. The checkout
 is the one the `socket.yml` lookup takes for the repository root: on Unix its `.git` belongs to
 you, to root, or to the user `sudo` ran for (a root process takes any owner's). A project in no
 such checkout is looked for in its own directory only: nothing above it is read or written. In
