@@ -167,6 +167,207 @@ pub fn root_only_workspace_breaks_add(
     })
 }
 
+/// The oldest pnpm hosted mode routes a patched package through a named
+/// registry for ([`registry_route_pins`]).
+pub const REGISTRY_ROUTE_FLOOR: (u64, u64) = (11, 20);
+
+/// What a project's pnpm pins say about [`REGISTRY_ROUTE_FLOOR`]
+/// ([`registry_route_pins`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryRoutePins {
+    /// Every pin the project carries (at least one) admits only pnpm 11.20
+    /// or newer.
+    Proven,
+    /// The project carries no pnpm pin: nothing says which pnpm installs
+    /// it.
+    Unpinned,
+    /// A pin admits an older pnpm, or does not parse.
+    NotProven,
+}
+
+/// Whether the project's pnpm pins prove that every pnpm that installs it
+/// is 11.20 or newer, the releases hosted mode routes a patched package
+/// through a named registry for.
+///
+/// pnpm verifies a lock entry against a named registry from 11.10 on, but
+/// a declared registry alone does not keep the entry: a command that
+/// resolves again (`pnpm add`, `update`, `dedupe`) asks the default
+/// registry and puts the upstream tarball back. Which entries survive
+/// `pnpm add` under a bare declaration depends on the release and on the
+/// package (11.10.0–11.28.13 drop them; 12.0.0–12.16.0 keep them;
+/// 12.19.0–12.22.0 drop one whose subtree has peer dependencies), and none
+/// survives `update` or `dedupe`. So the scan also overrides the release
+/// with its registry (`name@version` → `socket-<id>:version`), which
+/// makes pnpm resolve it there every time, and writes the lock pnpm
+/// writes for that override ([`super::registry_alias`]). pnpm 11.20.0,
+/// 11.25.0, 11.28.13, 12.0.0, 12.4.2, 12.10.0, 12.16.0, 12.19.0, 12.21.0
+/// and 12.22.0 write that lock byte for byte alike and keep the routed
+/// entries across `add`, `update`, `dedupe` and `install --fix-lockfile`
+/// (12.0.0 has no such flag); 11.10.0 and 11.15.0 write another lock for
+/// the same override. Anything short of proof of 11.20 leaves the project
+/// on `trustLockfile`. The measurements are in
+/// `docs/testing/pnpm-compatibility.md`.
+///
+/// The evidence is every pin [`root_only_workspace_breaks_add`] reads. A
+/// pin proves the floor when the lowest version it admits is 11.20 or
+/// higher ([`range_floor`]): an exact version, `^11.20.0`, `>=12.4`,
+/// `12 || 13`. A range that reaches below it (`>=11`, `^11`), one that
+/// does not parse, or pins that disagree prove nothing.
+pub fn registry_route_pins(
+    package_json: Option<&str>,
+    modules_yaml: Option<&str>,
+) -> RegistryRoutePins {
+    let pins = pnpm_pins(package_json, modules_yaml);
+    if pins.is_empty() {
+        RegistryRoutePins::Unpinned
+    } else if pins
+        .iter()
+        .all(|(_, spec)| range_floor(spec).is_some_and(|floor| floor >= REGISTRY_ROUTE_FLOOR))
+    {
+        RegistryRoutePins::Proven
+    } else {
+        RegistryRoutePins::NotProven
+    }
+}
+
+/// The lowest `(major, minor)` a version range admits: the lowest floor of
+/// its `||` alternatives. `None` for a range this reader cannot follow,
+/// which a caller must not take for a floor.
+fn range_floor(spec: &str) -> Option<MajorMinor> {
+    spec.split("||")
+        .map(alternative_floor)
+        .try_fold(None::<MajorMinor>, |lowest, floor| {
+            let floor = floor?;
+            Some(Some(lowest.map_or(floor, |lowest| lowest.min(floor))))
+        })
+        .flatten()
+}
+
+/// The comparators of one `||` alternative, an operator that stands apart
+/// from its version (`>= 12`) joined to it; `None` for an empty alternative
+/// or a dangling operator.
+fn comparators(alternative: &str) -> Option<Vec<String>> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut operator = "";
+    for word in alternative.split_whitespace() {
+        if matches!(word, ">=" | ">" | "<=" | "<" | "=" | "^" | "~") {
+            if !operator.is_empty() {
+                return None;
+            }
+            operator = word;
+        } else {
+            tokens.push(format!("{operator}{word}"));
+            operator = "";
+        }
+    }
+    (operator.is_empty() && !tokens.is_empty()).then_some(tokens)
+}
+
+/// The floor of one `||` alternative: its comparators all hold, so the
+/// highest of their floors. A version ([`version_span`]: exact, `^`, `~`,
+/// wildcard), `>=` and `>` give one (`>` is read as `>=`, which is never
+/// too high), `<` and `<=` give none, and `A - B` starts at `A`.
+fn alternative_floor(alternative: &str) -> Option<MajorMinor> {
+    let tokens = comparators(alternative)?;
+    if let [low, dash, high] = tokens.as_slice() {
+        if dash == "-" {
+            version_span(high)?;
+            return version_span(low).map(|(floor, _)| floor);
+        }
+    }
+    let mut floor = (0, 0);
+    for token in &tokens {
+        let lower = token.strip_prefix(">=").or_else(|| token.strip_prefix('>'));
+        let upper = token.strip_prefix("<=").or_else(|| token.strip_prefix('<'));
+        let (this, _) = version_span(lower.or(upper).unwrap_or(token))?;
+        if upper.is_none() {
+            floor = floor.max(this);
+        }
+    }
+    Some(floor)
+}
+
+/// Whether the npm range `spec` admits the exact release `version`: what
+/// decides if pnpm applies a `name@version` override to a dependency that
+/// asks for `spec` (it intersects the two). `None` when either cannot be
+/// read here, which a caller must not take for an answer: a tag, a
+/// `workspace:` / `catalog:` / `npm:` specifier, a URL, or a prerelease on
+/// either side (npm matches those by rules of their own).
+pub(crate) fn range_admits(spec: &str, version: &str) -> Option<bool> {
+    let plain = |text: &str| !text.contains(['-', '+']);
+    let release = version_bounds(version)
+        .filter(|(lo, hi)| lo == hi && plain(version))?
+        .0;
+    let mut admitted = false;
+    for alternative in spec.split("||") {
+        let tokens = comparators(alternative)?;
+        let hyphen = match tokens.as_slice() {
+            [low, dash, high] if dash == "-" => Some((low, high)),
+            _ => None,
+        };
+        let this = if let Some((low, high)) = hyphen {
+            if !plain(low) || !plain(high) {
+                return None;
+            }
+            version_bounds(low)?.0 <= release && release <= version_bounds(high)?.1
+        } else {
+            let mut all = true;
+            for token in &tokens {
+                if !plain(token) {
+                    return None;
+                }
+                if matches!(token.as_str(), "*" | "x" | "X") {
+                    continue;
+                }
+                let bounds = |text: &str| version_bounds(text);
+                all &= if let Some(rest) = token.strip_prefix(">=") {
+                    release >= bounds(rest)?.0
+                } else if let Some(rest) = token.strip_prefix('>') {
+                    release > bounds(rest)?.1
+                } else if let Some(rest) = token.strip_prefix("<=") {
+                    release <= bounds(rest)?.1
+                } else if let Some(rest) = token.strip_prefix('<') {
+                    release < bounds(rest)?.0
+                } else {
+                    let (lo, hi) = bounds(token)?;
+                    lo <= release && release <= hi
+                };
+            }
+            all
+        };
+        admitted |= this;
+    }
+    Some(admitted)
+}
+
+/// Whether pnpm applies an override keyed `name@version` to a dependency
+/// that asks for `spec`. pnpm intersects the two as semver ranges, and a
+/// specifier that is no semver range (a dist-tag, `workspace:`, `npm:`,
+/// `file:`, `link:`, a git or tarball URL) intersects nothing, so the
+/// dependency is left alone. `None` when this reader cannot tell: a
+/// `catalog:` specifier (pnpm reads the catalog's range instead) or a
+/// range [`range_admits`] cannot follow.
+pub(crate) fn override_applies(spec: &str, version: &str) -> Option<bool> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Some(true);
+    }
+    if spec.starts_with("catalog:") {
+        return None;
+    }
+    let first = spec.chars().next().unwrap_or_default();
+    let tag = first.is_ascii_alphabetic()
+        && !matches!(spec, "x" | "X")
+        && !(first == 'v' && spec[1..].starts_with(|c: char| c.is_ascii_digit()))
+        && spec
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if tag || spec.contains([':', '/']) {
+        return Some(false);
+    }
+    range_admits(spec, version)
+}
+
 /// Whether the pnpm the project runs matches build decisions against a
 /// vendored `file:` id (see [`matches_file_ids`]): `Some(true)` when every
 /// pin that parses admits only such a release, `Some(false)` when every one
@@ -352,6 +553,194 @@ mod tests {
         // engines.pnpm.
         assert!(breaks(Some(r#"{"engines":{"pnpm":"~9.15.0"}}"#), None));
         assert!(!breaks(Some(r#"{"engines":{"pnpm":">=9"}}"#), None));
+    }
+
+    /// A patched package is routed through a named registry only on proof
+    /// of pnpm 11.20 or newer: every pin present (at least one) admits
+    /// nothing older. No pin at all is told apart from a pin that proves
+    /// nothing.
+    #[test]
+    fn the_registry_route_floor_is_proven_only_by_every_pin() {
+        use RegistryRoutePins::{NotProven, Proven, Unpinned};
+        for pkg in [
+            r#"{"packageManager":"pnpm@11.20.0"}"#,
+            r#"{"packageManager":"pnpm@11.28.13"}"#,
+            r#"{"packageManager":"pnpm@12.0.0"}"#,
+            r#"{"packageManager":"pnpm@12.22.0+sha512.abc=="}"#,
+            r#"{"packageManager":"pnpm@13.0.1"}"#,
+            r#"{"engines":{"pnpm":"^11.20.0"}}"#,
+            r#"{"engines":{"pnpm":"~11.25.0"}}"#,
+            r#"{"engines":{"pnpm":">=11.20"}}"#,
+            r#"{"engines":{"pnpm":">=11.20.0 <13"}}"#,
+            r#"{"engines":{"pnpm":"^12.4.0"}}"#,
+            r#"{"engines":{"pnpm":"12"}}"#,
+            r#"{"engines":{"pnpm":">=12"}}"#,
+            r#"{"engines":{"pnpm":">=12.4.0"}}"#,
+            r#"{"engines":{"pnpm":">12"}}"#,
+            r#"{"engines":{"pnpm":">=12 <14"}}"#,
+            r#"{"engines":{"pnpm":">= 12.4.0 <14"}}"#,
+            r#"{"engines":{"pnpm":"12 || 13"}}"#,
+            r#"{"engines":{"pnpm":"^11.20.0 || ^12.0.0"}}"#,
+            r#"{"engines":{"pnpm":"^12.0.0 || >=13.2"}}"#,
+            r#"{"engines":{"pnpm":"11.20.0 - 13.5.0"}}"#,
+            r#"{"devEngines":{"packageManager":{"name":"pnpm","version":"~12.4.2"}}}"#,
+        ] {
+            assert_eq!(registry_route_pins(Some(pkg), None), Proven, "{pkg}");
+        }
+        assert_eq!(
+            registry_route_pins(None, Some("packageManager: pnpm@12.22.0\n")),
+            Proven
+        );
+        assert_eq!(
+            registry_route_pins(
+                Some(r#"{"packageManager":"pnpm@11.28.13"}"#),
+                Some(r#"{"packageManager":"pnpm@12.22.0"}"#)
+            ),
+            Proven
+        );
+        // No pin: nothing says which pnpm installs the project.
+        for pkg in [
+            None,
+            Some(r#"{"name":"app"}"#),
+            Some(r#"{"packageManager":"yarn@4.5.0"}"#),
+            Some("not json"),
+        ] {
+            assert_eq!(registry_route_pins(pkg, None), Unpinned, "{pkg:?}");
+        }
+        for (pkg, modules) in [
+            // An older pnpm, or a range that reaches one.
+            (Some(r#"{"packageManager":"pnpm@11.19.4"}"#), None),
+            (Some(r#"{"packageManager":"pnpm@11.10.0"}"#), None),
+            (Some(r#"{"packageManager":"pnpm@10.34.6"}"#), None),
+            (Some(r#"{"engines":{"pnpm":">=11"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":"^11"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":"11"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":"^11.19.0"}}"#), None),
+            // `>11.19` is read as `>=11.19`: never too high a floor.
+            (Some(r#"{"engines":{"pnpm":">11.19"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":">=11.10 <13"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":"11 || 12"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":"<13"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":"11.0.0 - 12.5.0"}}"#), None),
+            // A range this reader cannot follow.
+            (Some(r#"{"engines":{"pnpm":"*"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":"latest"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":">= >=12"}}"#), None),
+            (Some(r#"{"engines":{"pnpm":"12 ||"}}"#), None),
+            (
+                Some(r#"{"devEngines":{"packageManager":{"name":"pnpm"}}}"#),
+                None,
+            ),
+            // Pins that disagree: the install record lags the manifest, or
+            // the manifest's own pins differ.
+            (
+                Some(r#"{"packageManager":"pnpm@12.4.2"}"#),
+                Some("packageManager: pnpm@11.15.0\n"),
+            ),
+            (
+                Some(r#"{"packageManager":"pnpm@12.4.2","engines":{"pnpm":"^11.0.0"}}"#),
+                None,
+            ),
+            (None, Some("packageManager: pnpm@11.15.0\n")),
+        ] {
+            assert_eq!(
+                registry_route_pins(pkg, modules),
+                NotProven,
+                "{pkg:?} {modules:?}"
+            );
+        }
+    }
+
+    /// What pnpm's override match needs: does a dependency's range admit
+    /// the patched release? Anything this reader cannot follow is `None`.
+    #[test]
+    fn range_admits_reads_plain_npm_ranges() {
+        for (spec, version, want) in [
+            ("1.0.0", "1.0.0", Some(true)),
+            ("=1.0.0", "1.0.0", Some(true)),
+            ("^1.0.0", "1.4.2", Some(true)),
+            ("^1.5.0", "1.4.2", Some(false)),
+            ("^0.9.0", "0.9.2", Some(true)),
+            ("^0.9.0", "0.10.0", Some(false)),
+            ("~1.0.0", "1.0.9", Some(true)),
+            ("~1.0.0", "1.1.0", Some(false)),
+            ("1.x", "1.9.9", Some(true)),
+            ("2", "1.9.9", Some(false)),
+            ("*", "3.0.0", Some(true)),
+            (">=1.2.0 <2", "1.9.9", Some(true)),
+            (">=1.2.0 <2", "2.0.0", Some(false)),
+            (">1.2", "1.2.9", Some(false)),
+            (">1.2", "1.3.0", Some(true)),
+            ("<=1.2", "1.2.9", Some(true)),
+            ("^1.0.0 || ^2.0.0", "2.3.1", Some(true)),
+            ("^1.0.0 || ^3.0.0", "2.3.1", Some(false)),
+            ("1.0.0 - 1.5.0", "1.5.0", Some(true)),
+            ("1.0.0 - 1.5", "1.5.9", Some(true)),
+            ("1.0.0 - 1.5.0", "1.5.1", Some(false)),
+            (">=1 <3 <2", "1.5.0", Some(true)),
+            // Not plain npm ranges, or not a plain release.
+            ("latest", "1.0.0", None),
+            ("", "1.0.0", None),
+            ("workspace:*", "1.0.0", None),
+            ("catalog:", "1.0.0", None),
+            ("npm:other@^1.0.0", "1.0.0", None),
+            ("^1.0.0-beta.1", "1.0.0", None),
+            ("^1.0.0", "1.0.0-rc.1", None),
+            ("^1.0.0", "1.0", None),
+            (">=", "1.0.0", None),
+        ] {
+            assert_eq!(range_admits(spec, version), want, "{spec:?} {version:?}");
+        }
+    }
+
+    #[test]
+    fn override_applies_only_to_semver_ranges() {
+        for (spec, want) in [
+            ("^1.0.0", Some(true)),
+            ("", Some(true)),
+            ("*", Some(true)),
+            ("v1.4.2", Some(true)),
+            ("^2.0.0", Some(false)),
+            ("latest", Some(false)),
+            ("next-major", Some(false)),
+            ("workspace:*", Some(false)),
+            ("npm:other@^1.0.0", Some(false)),
+            ("link:../leaf", Some(false)),
+            ("file:../leaf.tgz", Some(false)),
+            ("github:user/leaf", Some(false)),
+            ("user/leaf", Some(false)),
+            ("https://example.test/leaf.tgz", Some(false)),
+            ("catalog:", None),
+            ("catalog:default", None),
+            ("^1.0.0-beta.1", None),
+        ] {
+            assert_eq!(override_applies(spec, "1.4.2"), want, "{spec:?}");
+        }
+    }
+
+    #[test]
+    fn range_floor_is_the_lowest_version_a_range_admits() {
+        for (spec, floor) in [
+            ("12.4.2", Some((12, 4))),
+            ("^12.4.0", Some((12, 4))),
+            ("12", Some((12, 0))),
+            (">=12", Some((12, 0))),
+            (">12.3.0", Some((12, 3))),
+            (">=12.4 <14", Some((12, 4))),
+            (">=11 >=12.1", Some((12, 1))),
+            ("^12 || ^11.28", Some((11, 28))),
+            ("11.5.0 - 12", Some((11, 5))),
+            ("<13", Some((0, 0))),
+            ("<=12.4.0 >=12", Some((12, 0))),
+            ("", None),
+            ("*", None),
+            (">=", None),
+            ("12 - ", None),
+            ("12 - x - 13", None),
+            (">=12 || nope", None),
+        ] {
+            assert_eq!(range_floor(spec), floor, "{spec:?}");
+        }
     }
 
     #[test]

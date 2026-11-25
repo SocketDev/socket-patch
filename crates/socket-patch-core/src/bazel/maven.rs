@@ -23,6 +23,16 @@
 //! writes it, [`pins`] reads the block for `list`, `rollback`, `remove`
 //! and `vex`, and [`without`] takes an entry out. [`hub_jars`] are the
 //! jars a hosted scan looks for patches of: those the pinned hubs fetch.
+//!
+//! Vendored mode patches a pinned hub through the same block. Its entry
+//! names no host: the repository is a directory of the checkout,
+//! `.socket/vendor/maven/<patch id>` ([`Patch::unit`]), which holds the
+//! patched jar and the two files that make the directory a repository
+//! with the one target the hub takes a jar by ([`unit_files`]), and which
+//! Bazel's `local_repository` links to, where it is. Bazel checks no digest
+//! of such a directory: `socket-patch vendor --check` holds the committed
+//! jar to the patch.
+//!
 //! The block is recognised by its text alone: one that is not, byte for
 //! byte, what socket-patch writes for its entries was changed by hand, and
 //! is neither written to nor trusted.
@@ -674,15 +684,39 @@ pub struct Patch {
     pub artifact: String,
     pub version: String,
     pub uuid: String,
-    /// The sha256 of the patched jar, which Bazel checks its download by.
+    /// The sha256 of the patched jar, which Bazel checks its download by,
+    /// and the URL of that jar on the patch host. Both are empty in the
+    /// entry of vendored mode, whose jar is in the checkout
+    /// ([`Patch::unit`]).
     pub sha256: String,
     pub url: String,
 }
+
+/// The directory of the checkout that holds the directory of each patch
+/// that vendored mode keeps for a hub, and the file that makes such a
+/// directory a repository.
+pub const UNITS: &str = ".socket/vendor/maven";
+pub const REPO: &str = "REPO.bazel";
 
 impl Patch {
     pub fn purl(&self) -> String {
         let (group, artifact) = (&self.group, &self.artifact);
         format!("pkg:maven/{group}/{artifact}@{}", self.version)
+    }
+
+    /// The directory of a vendored entry, from the Bazel root, which is
+    /// the repository of its jar. `None` for the entry of hosted mode.
+    pub fn unit(&self) -> Option<String> {
+        self.url
+            .is_empty()
+            .then(|| format!("{UNITS}/{}", self.uuid))
+    }
+
+    /// The patched jar in [`Patch::unit`], under the name of the upstream
+    /// jar.
+    pub fn jar(&self) -> Option<String> {
+        let (unit, artifact, version) = (self.unit()?, &self.artifact, &self.version);
+        Some(format!("{unit}/file/{artifact}-{version}.jar"))
     }
 
     fn repository(&self) -> String {
@@ -714,13 +748,23 @@ fn render(label: &str, patches: &[Patch]) -> String {
         let (name, purl, uuid) = (patch.repository(), patch.purl(), &patch.uuid);
         let (sha256, url) = (&patch.sha256, &patch.url);
         let file = artifact_path(group, artifact, version, None, "jar");
+        let repository = match patch.unit() {
+            Some(unit) => format!(
+                "socket_patch_local_repository(\n    \
+                 name = \"socket_patch_{name}\",\n    \
+                 path = \"{unit}\",\n)"
+            ),
+            None => format!(
+                "socket_patch_http_file(\n    \
+                 name = \"socket_patch_{name}\",\n    \
+                 downloaded_file_path = \"v1/{file}\",\n    \
+                 sha256 = \"{sha256}\",\n    \
+                 urls = [\"{url}\"],\n)"
+            ),
+        };
         format!(
             "# {purl}, Socket patch {uuid}\n\
-             socket_patch_http_file(\n    \
-             name = \"socket_patch_{name}\",\n    \
-             downloaded_file_path = \"v1/{file}\",\n    \
-             sha256 = \"{sha256}\",\n    \
-             urls = [\"{url}\"],\n)\n\n\
+             {repository}\n\n\
              # If Bazel stops at the next line (\"does not generate repository\"), the hub's \
              lock no longer pins\n\
              # {group}:{artifact} at {version}: run `socket-patch rollback {purl}`.\n\
@@ -731,10 +775,26 @@ fn render(label: &str, patches: &[Patch]) -> String {
     };
     let mut patches: Vec<&Patch> = patches.iter().collect();
     patches.sort_by_key(|patch| patch.repository());
+    // The rule of each kind of entry there is, hosted first.
+    let rules = [
+        ("http", "http_file", false),
+        ("local", "local_repository", true),
+    ];
+    let used = |(_, _, vendored): &&(&str, &str, bool)| {
+        patches
+            .iter()
+            .any(|patch| patch.url.is_empty() == *vendored)
+    };
+    let rule = |(file, rule, _): &(&str, &str, bool)| {
+        format!(
+            "socket_patch_{rule} = use_repo_rule(\
+             \"@bazel_tools//tools/build_defs/repo:{file}.bzl\", \"{rule}\")\n"
+        )
+    };
+    let rules: String = rules.iter().filter(used).map(rule).collect();
     let entries: Vec<String> = patches.into_iter().map(entry).collect();
     format!(
-        "{BEGIN}\nsocket_patch_http_file = use_repo_rule(\
-         \"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_file\")\n\n\
+        "{BEGIN}\n{rules}\n\
          socket_patch_maven = use_extension(\"{label}\", \"maven\")\n\n{}{END}",
         entries.join("\n")
     )
@@ -763,13 +823,20 @@ fn parse(body: &str) -> Option<(String, Vec<Patch>)> {
             let below = lines.get(at + 1..)?.iter().take(6);
             below.copied().find_map(|line| between(line, open, close))
         };
+        // The entry of vendored mode names a directory, and nothing of
+        // a host: which directory, [`find`] holds it to.
+        let hosted = field("    path = \"", "\",").is_none();
+        let of_host = |open: &str, close: &str| match hosted {
+            true => field(open, close),
+            false => Some(String::new()),
+        };
         patches.push(Patch {
             group: group.to_string(),
             artifact: artifact.to_string(),
             version: version.to_string(),
             uuid: uuid.to_string(),
-            sha256: field("    sha256 = \"", "\",")?,
-            url: field("    urls = [\"", "\"],")?,
+            sha256: of_host("    sha256 = \"", "\",")?,
+            url: of_host("    urls = [\"", "\"],")?,
         });
     }
     Some((label, patches))
@@ -833,7 +900,7 @@ fn find(text: &str) -> Block {
 /// of a file with both). A file whose last line has no line break gets a
 /// block without one, so that [`without`] can tell. `None` when the block
 /// that is there was changed by hand.
-fn with_patch(module: &str, label: &str, patch: Patch) -> Option<String> {
+pub fn with_patch(module: &str, label: &str, patch: Patch) -> Option<String> {
     let (at, mut patches) = match find(module) {
         Block::Edited(_) => return None,
         Block::None => (None, Vec::new()),
@@ -848,6 +915,97 @@ fn with_patch(module: &str, label: &str, patch: Patch) -> Option<String> {
         Some(at) => format!("{}{block}{}", &module[..at.start], &module[at.end..]),
         None if ended => format!("{module}{eol}{block}{eol}"),
         None => format!("{module}{eol}{eol}{block}"),
+    })
+}
+
+/// The patches of the block of `module`: none when it has no block, or one
+/// that was changed by hand.
+pub fn entries(module: &str) -> Vec<Patch> {
+    match find(module) {
+        Block::Ours(_, _, patches) => patches,
+        _ => Vec::new(),
+    }
+}
+
+/// The files of a vendored entry's directory ([`Patch::unit`]), each by
+/// its path from the Bazel root: the file that makes the directory a
+/// repository, the package `file` with the one target `file`, by which a
+/// hub takes the jar of the repository it fetches (`@<repository>//file`
+/// in the ruleset's `private/dependency_tree_parser.bzl` at 6.5, 6.9 and
+/// 7.2), the jar, and a `.gitignore` that takes back a rule of the
+/// checkout that ignores jars, so that git commits this one. `None` for
+/// the entry of hosted mode.
+pub fn unit_files(patch: &Patch, jar: Vec<u8>) -> Option<[(String, Vec<u8>); 4]> {
+    let (unit, path) = (patch.unit()?, patch.jar()?);
+    let name = path.rsplit('/').next().unwrap_or_default();
+    let (purl, uuid) = (patch.purl(), &patch.uuid);
+    let repo = format!(
+        "# The jar of {purl} with Socket patch {uuid}, which the block of\n\
+         # socket-patch in MODULE.bazel puts in the place of the one a hub fetches.\n\
+         # `socket-patch vendor --check` holds the jar to the patch.\n"
+    );
+    let build = format!(
+        "filegroup(\n    name = \"file\",\n    srcs = [\"{name}\"],\n    \
+         visibility = [\"//visibility:public\"],\n)\n"
+    );
+    Some([
+        (format!("{unit}/{REPO}"), repo.into_bytes()),
+        (format!("{unit}/file/BUILD.bazel"), build.into_bytes()),
+        (path, jar),
+        (format!("{unit}/.gitignore"), b"!*\n".to_vec()),
+    ])
+}
+
+/// What a decline says after its reason: what the block of `file` holds
+/// for the jar, when `held` is the id of the patch of its entry there,
+/// after a run for the patch `uuid` wrote nothing for the reason `code`.
+fn left(held: Option<&str>, uuid: &str, code: &str, file: &str) -> String {
+    match held {
+        None => KEEPS.to_string(),
+        Some(held) if held == uuid && code == NO_EFFECT => format!(
+            "socket-patch left the entry that {file} holds for it as it is, and while that \
+             stands the entry has no effect: the Bazel build keeps the upstream jar"
+        ),
+        Some(held) if held == uuid => {
+            format!("socket-patch left the entry that {file} holds for it as it is")
+        }
+        Some(held) => format!(
+            "socket-patch wrote nothing to {file} for it: the entry of patch {held} remains \
+             there, and where the block is in effect the Bazel build takes that patch's jar"
+        ),
+    }
+}
+
+/// What a vendored run in `project` writes to the block for the patch
+/// `uuid` of `purl`: the label and the entry, or the code of a decline and
+/// what the run says of it (the detail of the patch's refusal, which names
+/// the purl itself). `None` for a patch whose jar no hub builds or may
+/// build, in no Bazel workspace, and for a jar with a classifier or of
+/// another packaging: such a run is the one it was.
+pub fn vendored(
+    project: &Path,
+    purl: &str,
+    uuid: &str,
+) -> Option<Result<(String, Patch), Declined>> {
+    let (group, artifact, version) = parse_maven_purl(purl).filter(|_| plain(purl))?;
+    let [group, artifact, version] = [group, artifact, version].map(|part| part.to_string());
+    let jar: Jar = (uuid.to_string(), group, artifact, version);
+    let (_, entry, held) = verdicts(project, None, std::slice::from_ref(&jar), true).pop()?;
+    let (uuid, group, artifact, version) = jar;
+    let patch = Patch {
+        group,
+        artifact,
+        version,
+        uuid,
+        sha256: String::new(),
+        url: String::new(),
+    };
+    Some(match entry {
+        Ok(label) => Ok((label, patch)),
+        Err((code, why)) => {
+            let ends = left(held.as_deref(), &patch.uuid, code, FILE);
+            Err((code, format!("{why}. {ends}")))
+        }
     })
 }
 
@@ -904,7 +1062,7 @@ pub type Site = BTreeMap<String, Verdict>;
 pub type Jar = (String, String, String, String);
 
 /// A code of this module, and why.
-type Declined = (&'static str, String);
+pub type Declined = (&'static str, String);
 
 /// What a warning says after the reason, when the block holds no entry
 /// for the jar.
@@ -1008,6 +1166,7 @@ fn settings(
     view: &dyn Fn(&str) -> Entry,
     locks: &dyn Fn(&str) -> Entry,
     asked: &Asked,
+    vendored: bool,
 ) -> Result<(), Declined> {
     let link = std::fs::symlink_metadata(root.join(FILE)).is_ok_and(|meta| meta.is_symlink());
     if link {
@@ -1061,7 +1220,15 @@ fn settings(
             "{FILE} asks for {module} {wanted} and MODULE.bazel.lock holds {selected}: build once \
              so that Bazel updates its lock"
         ),
-        (_, [_]) => return rc(view, release).into_iter().next().map_or(Ok(()), Err),
+        // The jar of a vendored entry is in the checkout: no option about
+        // downloads stands against it.
+        (_, [_]) => {
+            let against = |(code, _): &Declined| !vendored || *code != DOWNLOAD;
+            return rc(view, release)
+                .into_iter()
+                .find(against)
+                .map_or(Ok(()), Err);
+        }
         _ => format!(
             "MODULE.bazel.lock does not say which release of {module} Bazel selected, and the \
              name of a jar's repository depends on it: build once so that Bazel writes its lock"
@@ -1135,8 +1302,9 @@ pub fn jars<'a>(patches: impl Iterator<Item = (&'a str, &'a DepOverride)>) -> Ve
     patches.filter_map(jar).collect()
 }
 
-/// What a hosted run in `project` may write for each of `jars`: read once
-/// per run from the checkout. `module` is the text of the project's own
+/// What a hosted run in `project` may write for each of `jars`, or with
+/// `vendored` a vendored one: read once per run from the checkout.
+/// `module` is the text of the project's own
 /// `MODULE.bazel` as the run has it, when it has read it. Empty for a
 /// project in no Bazel workspace and when no hub builds, or may build,
 /// any of the jars: nothing changes for such a run. An entry is written
@@ -1144,8 +1312,26 @@ pub fn jars<'a>(patches: impl Iterator<Item = (&'a str, &'a DepOverride)>) -> Ve
 /// lock, or one that could not be read, may build the upstream jar beside
 /// the hub that would get the patched one. A project below the root gets
 /// no entry: the root is read all the same, for what its block holds.
-pub fn site(project: &Path, module: Option<&str>, jars: &[Jar]) -> Site {
-    let mut site = Site::new();
+pub fn site(project: &Path, module: Option<&str>, jars: &[Jar], vendored: bool) -> Site {
+    let verdict = |(uuid, entry, held): (String, Result<String, Declined>, _)| {
+        let entry = entry.map_err(|(code, why)| (code.to_string(), why));
+        (uuid, Verdict { entry, held })
+    };
+    let read = verdicts(project, module, jars, vendored).into_iter();
+    read.map(verdict).collect()
+}
+
+/// [`site`], with the code of a decline as this module has it: for each
+/// jar that a hub builds or may build, the id of its patch, the label to
+/// write its entry under or why none is written, and the id of the patch
+/// whose entry the block holds for the jar.
+fn verdicts(
+    project: &Path,
+    module: Option<&str>,
+    jars: &[Jar],
+    vendored: bool,
+) -> Vec<(String, Result<String, Declined>, Option<String>)> {
+    let mut site = Vec::new();
     let Some(root) = super::bazel_root(project) else {
         return site;
     };
@@ -1172,19 +1358,17 @@ pub fn site(project: &Path, module: Option<&str>, jars: &[Jar]) -> Site {
                 Err((NOT_AT_ROOT, why))
             }
             Built::Yes(_) => hubs.label(group, artifact, version).and_then(|label| {
-                let all = workspace
-                    .get_or_insert_with(|| settings(&root.dir, &view, &locks, &hubs.asked));
+                let all = workspace.get_or_insert_with(|| {
+                    settings(&root.dir, &view, &locks, &hubs.asked, vendored)
+                });
                 all.clone().map(|()| label)
             }),
         };
         let jar = |patch: &&Patch| {
             (&patch.group, &patch.artifact, &patch.version) == (group, artifact, version)
         };
-        let verdict = Verdict {
-            entry: entry.map_err(|(code, why)| (code.to_string(), why)),
-            held: hubs.block.iter().find(jar).map(|patch| patch.uuid.clone()),
-        };
-        site.insert(uuid.clone(), verdict);
+        let held = hubs.block.iter().find(jar).map(|patch| patch.uuid.clone());
+        site.push((uuid.clone(), entry, held));
     }
     site
 }
@@ -1267,22 +1451,18 @@ pub fn rewrite(
         // pin, or the entry of another patch, which is not this run's to
         // take out. An entry that the reason of the decline leaves without
         // effect is no pin: the patch is not reported as applied for it.
-        let ends = match verdict.held.as_deref() {
-            None => KEEPS.to_string(),
-            Some(held) if held == dep.patch_uuid && code == NO_EFFECT => format!(
-                "socket-patch left the entry that {file} holds for it as it is, and while that \
-                 stands the entry has no effect: the Bazel build keeps the upstream jar"
-            ),
-            Some(held) if held == dep.patch_uuid => {
-                let uuid = dep.patch_uuid.clone();
-                result.confirmed_bazel_maven_uuids.insert(uuid);
-                format!("socket-patch left the entry that {file} holds for it as it is")
-            }
-            Some(held) => format!(
-                "socket-patch wrote nothing to {file} for it: the entry of patch {held} remains \
-                 there, and where the block is in effect the Bazel build takes that patch's jar"
-            ),
-        };
+        let held = verdict.held.as_deref();
+        // A vendored entry of the same patch is not this run's pin: the
+        // run wrote nothing, and the checkout stays a vendored one.
+        let vendored = |patch: &Patch| patch.uuid == dep.patch_uuid && patch.unit().is_some();
+        let vendored = files
+            .get(FILE)
+            .is_some_and(|text| entries(text).iter().any(vendored));
+        if held == Some(&dep.patch_uuid) && code != NO_EFFECT && !vendored {
+            let uuid = dep.patch_uuid.clone();
+            result.confirmed_bazel_maven_uuids.insert(uuid);
+        }
+        let ends = left(held, &dep.patch_uuid, &code, &file);
         let detail = format!("{purl}: {why}. {ends}");
         result.warnings.push(RewriteWarning { code, detail });
     }
@@ -1302,6 +1482,9 @@ pub struct Pin {
     /// a build takes the patched jar, or fails.
     pub unbuilt: Option<String>,
 }
+
+/// How [`Pin::unbuilt`] ends for an entry that only the undo takes out.
+pub const STOPS: &str = "so Bazel stops at its entry";
 
 /// The patches in the block of `module`, the text of the `MODULE.bazel`
 /// at the Bazel root `root`, or why the block is no record of any: it was
@@ -1334,8 +1517,7 @@ pub fn pins(root: &Path, module: &str) -> Result<Vec<Pin>, String> {
             Built::Yes(_) => off.clone(),
             Built::Unknown(doubt, kind) => Some(unknown(doubt, kind).1),
             Built::No => Some(format!(
-                "no pinned hub takes {group}:{artifact} at {version} any more, so Bazel stops \
-                 at its entry"
+                "no pinned hub takes {group}:{artifact} at {version} any more, {STOPS}"
             )),
         };
         let patch = patch.clone();
@@ -1354,9 +1536,12 @@ pub struct HubJars {
     /// The warning ([`HUB_NOT_READ`]) for the first thing that was not
     /// read.
     pub unread: Option<(&'static str, String)>,
-    /// The entries of the block whose jar no pinned hub fetches any more,
-    /// when every hub was read: the purl and the id of the patch of each.
-    /// Bazel stops at such an entry.
+    /// The entries of hosted mode in the block whose jar no pinned hub
+    /// fetches any more, when every hub was read: the purl and the id of
+    /// the patch of each. Bazel stops at such an entry. An entry of
+    /// vendored mode in that state is not among them: its directory and
+    /// its ledger entry are vendored mode's to take out, which `rollback`,
+    /// `remove` and `vendor --revert` do, and `vendor --check` names it.
     pub stale: Vec<(String, String)>,
 }
 
@@ -1368,9 +1553,9 @@ pub struct HubJars {
 /// the first thing that was not read: no jar is guessed for a hub without
 /// a lock, or for one whose tags or lock cannot be read. In a workspace
 /// that has nothing to do with the ruleset there is no hub to read, and
-/// no warning. And the entries of the block that are stale, for the run
-/// to take out. Nothing for a project below the root, where no entry is
-/// written either, and for one in no Bazel workspace.
+/// no warning. And the entries of hosted mode in the block that are
+/// stale, for the run to take out. Nothing for a project below the root,
+/// where no entry is written either, and for one in no Bazel workspace.
 pub async fn hub_jars(project: &Path) -> HubJars {
     let project = project.to_path_buf();
     run_blocking(move || hub_jars_blocking(&project)).await
@@ -1409,8 +1594,10 @@ fn hub_jars_blocking(project: &Path) -> HubJars {
         );
         (HUB_NOT_READ, detail)
     });
-    let stale =
-        |patch: &&Patch| hubs.built(&patch.group, &patch.artifact, &patch.version) == Built::No;
+    let stale = |patch: &&Patch| {
+        patch.unit().is_none()
+            && hubs.built(&patch.group, &patch.artifact, &patch.version) == Built::No
+    };
     let stale = hubs.block.iter().filter(stale);
     HubJars {
         jars: purls.into_iter().collect(),
@@ -1426,16 +1613,59 @@ fn hub_jars_blocking(project: &Path) -> HubJars {
 /// project's Bazel workspace builds ([`HUB_UNPATCHED`]) or may build
 /// ([`UNREADABLE`]). Nothing for a project in no Bazel workspace, and
 /// nothing is looked for without a Maven purl among them.
-pub async fn notices(project: &Path, purls: Vec<String>) -> Vec<(&'static str, String)> {
+///
+/// A `vendored` run patches a hub: its warnings are for the jars whose
+/// entry the block does not hold after it, each with the reason vendored
+/// mode writes none ([`site`]), under the code a hosted run gives it.
+pub async fn notices(
+    project: &Path,
+    purls: Vec<String>,
+    vendored: bool,
+) -> Vec<(&'static str, String)> {
     let project = project.to_path_buf();
-    run_blocking(move || notices_blocking(&project, purls)).await
+    run_blocking(move || notices_blocking(&project, purls, vendored)).await
 }
 
-fn notices_blocking(project: &Path, mut purls: Vec<String>) -> Vec<(&'static str, String)> {
+fn notices_blocking(
+    project: &Path,
+    mut purls: Vec<String>,
+    vendored: bool,
+) -> Vec<(&'static str, String)> {
     purls.sort();
     purls.dedup();
     let jar = |purl| Some((purl, parse_maven_purl(purl).filter(|_| plain(purl))?));
     let jars: Vec<_> = purls.iter().map(String::as_str).filter_map(jar).collect();
+    if vendored {
+        // A warning names the purl: it stands where a run has the patch's id.
+        let by_purl = |(purl, (group, artifact, version)): &(&str, _)| -> Jar {
+            let [group, artifact, version] = [group, artifact, version].map(ToString::to_string);
+            (purl.to_string(), group, artifact, version)
+        };
+        let jars: Vec<Jar> = jars.iter().map(by_purl).collect();
+        let said = |(purl, entry, held): (String, Result<String, Declined>, Option<String>)| {
+            let (code, why) = match (held, entry) {
+                // The entry is there and the checkout leaves it without
+                // effect (an rc file that switches the block off, an
+                // override of the jar): the build takes the upstream jar
+                // past it, which is said as a hosted run says it.
+                (Some(held), Err((code, why))) if code == NO_EFFECT => {
+                    let ends = left(Some(&held), &held, code, FILE);
+                    return Some((code, format!("{purl}: {why}. {ends}")));
+                }
+                // Any other entry stands: the hub takes its jar.
+                (Some(_), _) => return None,
+                (None, Err(declined)) => declined,
+                (None, Ok(_)) => {
+                    let why = "a rules_jvm_external hub of the Bazel workspace builds this \
+                               artifact from its lock, and this run vendored nothing for it";
+                    (HUB_UNPATCHED, why.to_string())
+                }
+            };
+            Some((code, format!("{purl}: {why}. {KEEPS}")))
+        };
+        let read = verdicts(project, None, &jars, true).into_iter();
+        return read.filter_map(said).collect();
+    }
     let root = (!jars.is_empty()).then(|| super::bazel_root(project));
     let Some(root) = root.flatten() else {
         return Vec::new();
@@ -1584,6 +1814,11 @@ use_repo(maven, "maven")
   "version": "3"
 }
 "#;
+
+    /// [`super::notices_blocking`] for a run that patches no hub.
+    fn notices_blocking(project: &Path, purls: Vec<String>) -> Vec<(&'static str, String)> {
+        super::notices_blocking(project, purls, false)
+    }
 
     /// The view of the files `files`, held in memory.
     fn view<'a>(files: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Entry + 'a {
@@ -2475,6 +2710,13 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
             };
             assert_eq!(hub_jars_blocking(dir.path()), expected, "{module}");
         }
+        // A stale entry of vendored mode is not on the list: a hosted run
+        // has no way to take its directory and its ledger entry with it.
+        let mut vendored = patch("netty-tcnative-classes", NETTY_UUID);
+        (vendored.sha256, vendored.url) = (String::new(), String::new());
+        let module = with_patch(PINNED, LABEL, vendored).expect("a block");
+        let dir = project(&[("MODULE.bazel", &module), (main, LOCK_SKIPS)]);
+        assert!(hub_jars_blocking(dir.path()).stale.is_empty());
         // Only for the root of a workspace, where an entry is written:
         // not below it, whatever its hubs are, and not without one.
         for module in [PINNED, &lockless] {
@@ -2867,7 +3109,7 @@ override_repo(
     /// What [`site`] says of netty's jar in the checkout: `write <label>`,
     /// `<code>: <why>`, or `-`.
     fn verdict(dir: &Path) -> String {
-        match site(dir, None, &netty_jar()).remove(NETTY_UUID) {
+        match site(dir, None, &netty_jar(), false).remove(NETTY_UUID) {
             None => "-".to_string(),
             Some(Verdict { entry, held }) => {
                 assert_eq!(held, None);
@@ -2973,13 +3215,16 @@ override_repo(
         // A jar that no hub fetches has no verdict at all, and neither has
         // any jar outside a Bazel workspace.
         let elsewhere = checkout(&[("maven_install.json", LOCK_SKIPS)]);
-        assert_eq!(site(elsewhere.path(), None, &netty_jar()), Site::new());
+        assert_eq!(
+            site(elsewhere.path(), None, &netty_jar(), false),
+            Site::new()
+        );
         let plain = project(&[("pom.xml", "<project/>")]);
-        assert_eq!(site(plain.path(), None, &netty_jar()), Site::new());
+        assert_eq!(site(plain.path(), None, &netty_jar(), false), Site::new());
         // The text the run has of `MODULE.bazel` is the one that is read.
         let lockless = PINNED.replace("    lock_file = \"//:maven_install.json\",\n", "");
         let dir = checkout(&[]);
-        let said = site(dir.path(), Some(&lockless), &netty_jar());
+        let said = site(dir.path(), Some(&lockless), &netty_jar(), false);
         let declined = |verdict: &Verdict| verdict.entry.is_err();
         assert!(said.values().next().is_some_and(declined), "{said:?}");
     }
@@ -3353,7 +3598,7 @@ override_repo(
         let ours = with_patch(PINNED, LABEL, netty()).expect("a block");
         std::fs::write(dir.path().join("MODULE.bazel"), &ours).unwrap();
         for project in [dir.path(), below.as_path()] {
-            let held = site(project, None, &netty_jar()).remove(NETTY_UUID);
+            let held = site(project, None, &netty_jar(), false).remove(NETTY_UUID);
             let held = held.and_then(|verdict| verdict.held);
             assert_eq!(held.as_deref(), Some(NETTY_UUID), "{project:?}");
         }
@@ -3363,7 +3608,12 @@ override_repo(
             "\"version\": \"2.0.61+b\"\n    }\n  }",
         );
         let dir = checkout(&[("maven_install.json", &odd)]);
-        let said = site(dir.path(), None, &jar("netty-tcnative-classes", "2.0.61+b"));
+        let said = site(
+            dir.path(),
+            None,
+            &jar("netty-tcnative-classes", "2.0.61+b"),
+            false,
+        );
         let Some(Err((code, why))) = said.values().next().map(|verdict| &verdict.entry) else {
             panic!("{said:?}");
         };
@@ -3620,6 +3870,13 @@ override_repo(
                 (0, pinned.to_vec())
             );
         }
+        // A vendored entry of the same patch is not the hosted run's pin:
+        // the run wrote nothing, and the patch is not confirmed as hosted.
+        let vendored = with_patch(PINNED, LABEL, vendored_netty()).expect("a block");
+        let files = candidates(Some(&vendored), Err((RELEASE, "why")), Some(NETTY_UUID));
+        let result = ran(&files, &[granted()]);
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert_eq!((result.files.len(), confirmed(&result)), (0, vec![]));
         // An entry that the reason of the decline leaves without effect (an
         // rc file that switches the block off, an override of the jar) is
         // not this patch's pin: the build takes the upstream jar, and the
@@ -3750,6 +4007,225 @@ override_repo(
         );
         assert_eq!(said, Err(why));
         assert_eq!(pins(checkout(&[]).path(), PINNED), Ok(vec![]));
+    }
+
+    /// [`netty`] as vendored mode keeps it: no host, and a directory.
+    fn vendored_netty() -> Patch {
+        Patch {
+            sha256: String::new(),
+            url: String::new(),
+            ..netty()
+        }
+    }
+
+    /// The entry of [`vendored_netty`], between the proxy of the block and
+    /// its `override_repo`, which are those of [`BLOCK`].
+    const VENDORED_ENTRY: &str = r#"socket_patch_local_repository(
+    name = "socket_patch_io_netty_netty_tcnative_classes_2_0_61_Final",
+    path = ".socket/vendor/maven/0e77a000-0000-4000-8000-0000000000a1",
+)
+"#;
+
+    /// The entry of vendored mode names the directory of the patch, under
+    /// a rule of its own, and nothing of a host. A block holds an entry of
+    /// either mode for a jar, never both, and binds the rule of each mode
+    /// it has an entry of, hosted first.
+    #[test]
+    fn a_vendored_entry_names_the_directory_of_its_patch() {
+        let local = "socket_patch_local_repository = use_repo_rule(\
+                     \"@bazel_tools//tools/build_defs/repo:local.bzl\", \"local_repository\")\n";
+        let (http, hosted) = {
+            let from = BLOCK.find("socket_patch_http_file(").expect("the entry");
+            let to = BLOCK.find("\n# If Bazel stops").expect("its end");
+            let rule = BLOCK.lines().nth(1).expect("the rule");
+            (format!("{rule}\n"), &BLOCK[from..to])
+        };
+        let block = BLOCK.replace(&http, local).replace(hosted, VENDORED_ENTRY);
+        assert_eq!(render(LABEL, &[vendored_netty()]), block);
+        assert_eq!(
+            parse(&block),
+            Some((LABEL.to_string(), vec![vendored_netty()]))
+        );
+        let ours = vendored_netty();
+        let unit = ".socket/vendor/maven/0e77a000-0000-4000-8000-0000000000a1";
+        let jar = format!("{unit}/file/netty-tcnative-classes-2.0.61.Final.jar");
+        assert_eq!(
+            (ours.unit(), ours.jar()),
+            (Some(unit.to_string()), Some(jar.clone()))
+        );
+        assert_eq!((netty().unit(), netty().jar()), (None, None));
+        // Its directory: the jar, the two files that make it a repository
+        // with the target a hub takes the jar by, and what keeps the jar
+        // in a commit.
+        let files = unit_files(&ours, b"jar".to_vec()).expect("a vendored entry");
+        let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+        let named = ["REPO.bazel", "file/BUILD.bazel", "", ".gitignore"].map(|file| match file {
+            "" => jar.clone(),
+            file => format!("{unit}/{file}"),
+        });
+        assert_eq!(names, named);
+        let text = |at: usize| String::from_utf8(files[at].1.clone()).expect("text");
+        assert!(
+            text(0).lines().all(|line| line.starts_with("# ")),
+            "{}",
+            text(0)
+        );
+        let build = "filegroup(\n    name = \"file\",\n    srcs = \
+                     [\"netty-tcnative-classes-2.0.61.Final.jar\"],\n    visibility = \
+                     [\"//visibility:public\"],\n)\n";
+        assert_eq!(
+            (text(1), text(2), text(3)),
+            (build.into(), "jar".into(), "!*\n".into())
+        );
+        assert_eq!(unit_files(&netty(), Vec::new()), None);
+
+        // One entry per jar: the other mode's takes its place, and with
+        // the last entry the file is the one of before, to the byte.
+        for module in modules() {
+            let vendored = with_patch(&module, LABEL, vendored_netty()).expect("a block");
+            let hosted = with_patch(&module, LABEL, netty()).expect("a block");
+            assert_eq!(
+                with_patch(&hosted, LABEL, vendored_netty()).as_ref(),
+                Some(&vendored)
+            );
+            assert_eq!(
+                with_patch(&vendored, LABEL, netty()).as_ref(),
+                Some(&hosted)
+            );
+            assert_eq!(entries(&vendored), [vendored_netty()], "{module:?}");
+            let out = without(&vendored, &mut |_| true);
+            assert_eq!(out.as_deref(), Some(module.as_str()), "{module:?}");
+        }
+        // Beside the hosted entry of another jar: both rules, hosted first.
+        let other = patch("netty-tcnative-boringssl-static", OTHER_UUID);
+        let both = render(LABEL, &[vendored_netty(), other.clone()]);
+        let rules: Vec<&str> = both
+            .lines()
+            .filter(|line| line.contains("use_repo_rule("))
+            .collect();
+        assert_eq!(rules, [http.trim_end(), local.trim_end()], "{both}");
+        assert_eq!(
+            parse(&both),
+            Some((LABEL.to_string(), vec![other, vendored_netty()]))
+        );
+        // A block that names another directory for the patch is not the
+        // one socket-patch writes.
+        let moved = with_patch(PINNED, LABEL, vendored_netty()).expect("a block");
+        let moved = moved.replace("0000000000a1\",", "0000000000b2\",");
+        assert!(matches!(find(&moved), Block::Edited(_)), "{moved}");
+        assert_eq!(entries(&moved), []);
+    }
+
+    /// What vendored mode writes for a patch is decided as for hosted
+    /// mode, with one difference: its jar is in the checkout, so an option
+    /// about downloads does not stand against it.
+    #[test]
+    fn a_vendored_entry_is_declined_as_a_hosted_one_but_for_downloads() {
+        let verdict = |dir: &Path, vendored: bool| {
+            let verdict = site(dir, None, &netty_jar(), vendored).remove(NETTY_UUID);
+            match verdict.expect("a hub builds the jar").entry {
+                Ok(label) => format!("write {label}"),
+                Err((code, _)) => code,
+            }
+        };
+        let write = format!("write {LABEL}");
+        for (rc, hosted, vendored) in [
+            ("", write.as_str(), write.as_str()),
+            (
+                "common --experimental_downloader_config=mirror.cfg\n",
+                DOWNLOAD,
+                &write,
+            ),
+            ("build --repository_disable_download\n", DOWNLOAD, &write),
+            ("common --vendor_dir=third_party\n", DOWNLOAD, &write),
+            ("common --ignore_dev_dependency\n", NO_EFFECT, NO_EFFECT),
+            (
+                "common --vendor_dir=v\ncommon --noenable_bzlmod\n",
+                DOWNLOAD,
+                NO_EFFECT,
+            ),
+        ] {
+            let dir = checkout(&[(".bazelrc", rc)]);
+            let said = (verdict(dir.path(), false), verdict(dir.path(), true));
+            assert_eq!(said, (hosted.to_string(), vendored.to_string()), "{rc:?}");
+        }
+
+        // The one patch of a vendored run: the label and the entry, or the
+        // decline with what the block holds for the jar.
+        let dir = checkout(&[]);
+        let read = |dir: &Path, purl: &str| super::vendored(dir, purl, NETTY_UUID);
+        assert_eq!(
+            read(dir.path(), NETTY_PURL),
+            Some(Ok((LABEL.to_string(), vendored_netty())))
+        );
+        let no_bazel = checkout(&[(".bazelrc", "common --ignore_dev_dependency\n")]);
+        let (code, why) = read(no_bazel.path(), NETTY_PURL)
+            .expect("a hub")
+            .expect_err("off");
+        assert_eq!(code, NO_EFFECT);
+        assert!(
+            why.starts_with(".bazelrc:1 names") && why.ends_with(KEEPS),
+            "{why}"
+        );
+        // Beside the entry of this patch, which stays, and of another.
+        for (uuid, ends) in [
+            (
+                NETTY_UUID,
+                "has no effect: the Bazel build keeps the upstream jar",
+            ),
+            (OTHER_UUID, "the Bazel build takes that patch's jar"),
+        ] {
+            let held = patch("netty-tcnative-classes", uuid);
+            let module = with_patch(PINNED, LABEL, held).expect("a block");
+            std::fs::write(no_bazel.path().join(FILE), module).unwrap();
+            let (_, why) = read(no_bazel.path(), NETTY_PURL)
+                .expect("a hub")
+                .expect_err("off");
+            assert!(why.ends_with(ends), "{why}");
+        }
+        // A jar no hub builds, a jar with a classifier, and a project in
+        // no Bazel workspace: nothing of the hub lane.
+        let other = "pkg:maven/io.netty/netty-all@4.1.0";
+        let classified = format!("{NETTY_PURL}?classifier=linux-x86_64");
+        assert_eq!(read(dir.path(), other), None);
+        assert_eq!(read(dir.path(), &classified), None);
+        assert_eq!(read(project(&[]).path(), NETTY_PURL), None);
+    }
+
+    /// A vendored run is warned of the jars a hub builds that it wrote no
+    /// entry for: with the reason, under the code a hosted run gives, or
+    /// that nothing was vendored for a jar it could have patched. Nothing
+    /// is said of a jar whose entry the block holds.
+    #[test]
+    fn a_vendored_run_is_warned_of_the_jars_it_wrote_no_entry_for() {
+        let said = |dir: &Path| super::notices_blocking(dir, vec![NETTY_PURL.to_string()], true);
+        let dir = checkout(&[]);
+        let nothing = format!(
+            "{NETTY_PURL}: a rules_jvm_external hub of the Bazel workspace builds this artifact \
+             from its lock, and this run vendored nothing for it. {KEEPS}"
+        );
+        assert_eq!(said(dir.path()), [(HUB_UNPATCHED, nothing)]);
+        let declined = checkout(&[(".bazelrc", "common --ignore_dev_dependency\n")]);
+        let warned = said(declined.path());
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert_eq!(warned[0].0, NO_EFFECT);
+        assert!(warned[0].1.ends_with(KEEPS), "{warned:?}");
+        for held in [vendored_netty(), netty()] {
+            let module = with_patch(PINNED, LABEL, held).expect("a block");
+            std::fs::write(dir.path().join(FILE), &module).unwrap();
+            assert_eq!(said(dir.path()), []);
+            // The same entry in a checkout whose rc file switches the block
+            // off: the build takes the upstream jar past it, and the run
+            // says so although the entry is there.
+            std::fs::write(declined.path().join(FILE), module).unwrap();
+            let warned = said(declined.path());
+            assert_eq!(warned.len(), 1, "{warned:?}");
+            assert_eq!(warned[0].0, NO_EFFECT);
+            let ends = "left the entry that MODULE.bazel holds for it as it is, and while that \
+                        stands the entry has no effect: the Bazel build keeps the upstream jar";
+            assert!(warned[0].1.ends_with(ends), "{warned:?}");
+        }
+        assert_eq!(said(project(&[]).path()), []);
     }
 
     /// A jar that the block patches is not said to be unpatched.

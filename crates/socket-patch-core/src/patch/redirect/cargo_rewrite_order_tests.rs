@@ -33,6 +33,7 @@ fn patch_of(name: &str, version: &str, uuid: &str, index_url: String) -> DepOver
         token: "tok".into(),
         patch_uuid: uuid.into(),
         artifact_url: format!("https://patch.test/{name}-{version}.crate"),
+        npm_registry_url: None,
         registry_override: Some(RegistryOverride {
             kind: "cargo-sparse".into(),
             index_url,

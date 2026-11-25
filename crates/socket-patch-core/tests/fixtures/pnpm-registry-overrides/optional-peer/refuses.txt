@@ -1,0 +1,1 @@
+host@1.0.0 as an optional peer of opt-peers@1.0.0

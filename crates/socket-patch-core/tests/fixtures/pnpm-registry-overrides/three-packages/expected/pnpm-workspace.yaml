@@ -1,0 +1,10 @@
+packages:
+  - '.'
+namedRegistries:
+  socket-11111111: https://patch.test/patch/npm/@scope/direct/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/
+  socket-22222222: https://patch.test/patch/npm/peer-user/1.0.0/22222222-2222-4222-8222-222222222222/22222222-2222-4222-8222-222222222222/
+  socket-33333333: https://patch.test/patch/npm/leaf/1.0.0/22222222-2222-4222-8222-222222222222/33333333-3333-4333-8333-333333333333/
+overrides:
+  '@scope/direct@1.0.0': 'socket-11111111:1.0.0'
+  'leaf@1.0.0': 'socket-33333333:1.0.0'
+  'peer-user@1.0.0': 'socket-22222222:1.0.0'

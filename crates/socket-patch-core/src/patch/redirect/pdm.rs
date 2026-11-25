@@ -204,7 +204,7 @@ mod tests {
             patch_uuid: "e828efa5-5c6d-43f3-9909-03f5ac232b98".into(),
             artifact_url: "https://patch.socket.dev/patch/pypi/urllib3/1.26.18/7e52b8b6-53f2-4dc8-860a-1ae7ebd8be0e/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl".into(),
             integrity: Integrity { sha256: Some("a".repeat(64)), ..Default::default() },
-            namespace: None, token: "token".into(), registry_override: None,
+            namespace: None, token: "token".into(), npm_registry_url: None, registry_override: None,
         }
     }
 
@@ -332,6 +332,7 @@ mod equivalence_tests {
             token: String::new(),
             patch_uuid: "e828efa5-5c6d-43f3-9909-03f5ac232b98".into(),
             artifact_url: format!("https://patch.socket.dev/patch/pypi/{name}/{url_tail}"),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha256: Some(sha256.into()),
@@ -444,6 +445,7 @@ mod parse_reuse_equivalence_tests {
                             token: String::new(),
                             patch_uuid: format!("00000000-0000-4000-8000-{n:012}"),
                             artifact_url: url,
+                            npm_registry_url: None,
                             registry_override: None,
                             integrity: Integrity {
                                 sha256: Some(sha),
@@ -505,6 +507,7 @@ mod parse_reuse_equivalence_tests {
                         version: "1.26.18".into(),
                         token: String::new(),
                         patch_uuid: format!("00000000-0000-4000-8000-{n:012}"),
+                        npm_registry_url: None,
                         registry_override: None,
                         integrity: Integrity {
                             sha256: Some("a".repeat(64)),

@@ -307,6 +307,7 @@ fn pypi_dep(name: &str, uuid: &str) -> DepOverride {
         token: String::new(),
         patch_uuid: uuid.into(),
         artifact_url: format!("https://patch.test/{name}-1.0.0-py3-none-any.whl"),
+        npm_registry_url: None,
         registry_override: None,
         integrity: Integrity {
             sha256: Some("a".repeat(64)),

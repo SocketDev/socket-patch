@@ -175,6 +175,7 @@ mod tests {
             token: String::new(),
             patch_uuid: version.into(),
             artifact_url: format!("https://patch.example.test/{version}/minimist-{version}.tgz"),
+            npm_registry_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha512: Some(format!(

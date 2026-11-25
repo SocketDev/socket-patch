@@ -29,6 +29,9 @@ pub struct RepairArgs {
     /// Only download missing artifacts; skip the cleanup phase.
     /// Incompatible with `--offline`.
     //
+    // The cleanup phase is the `.socket/` sweeps and the registry-entry
+    // cleanup (`commands::registry_gc`).
+    //
     // clap's default bool parser rejects `SOCKET_DOWNLOAD_ONLY=1`.
     #[arg(
         long = "download-only",
@@ -113,11 +116,24 @@ pub async fn run(args: RepairArgs) -> i32 {
                 .common
                 .project_root()
                 .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
-            let hosted = tokio::fs::metadata(&legacy_ledger).await.is_ok()
+            // What is left of a pnpm registry route is hosted state too: a
+            // project whose patched packages all left its lock still holds
+            // the route's entries, which the cleanup phase takes out.
+            let route = !args.download_only
+                && crate::commands::registry_gc::route_present(&args.common).await;
+            let hosted = route
+                || tokio::fs::metadata(&legacy_ledger).await.is_ok()
                 || !crate::commands::hosted_inventory(&args.common, &args.common.project_root())
                     .await
                     .is_empty();
             if hosted {
+                let registry = match route {
+                    true => match hosted_registry_cleanup(&args).await {
+                        Ok(cleanup) => Some(cleanup),
+                        Err(code) => return code,
+                    },
+                    false => None,
+                };
                 let msg = HOSTED_ONLY_REASON;
                 if args.common.json {
                     let mut env = Envelope::new(Command::Repair);
@@ -126,10 +142,23 @@ pub async fn run(args: RepairArgs) -> i32 {
                         PatchEvent::artifact(PatchAction::Skipped)
                             .with_reason("redirect_only_project", msg),
                     );
+                    if let Some((swept, commit_recovery)) = registry {
+                        record_registry_cleanup(&mut env, &swept, args.common.dry_run);
+                        env.set_gc(GcReport {
+                            removed_registry_entries: swept.entries.len(),
+                            ..GcReport::default()
+                        });
+                        env.warnings.extend(commit_recovery);
+                    }
                     crate::ui::print_json(&env.to_value());
-                } else if !args.common.silent {
-                    // The JSON reason keeps its period-less text.
-                    println!("{msg}.");
+                } else {
+                    if let Some((swept, _)) = &registry {
+                        print_registry_cleanup(&args.common, swept, false);
+                    }
+                    if !args.common.silent {
+                        // The JSON reason keeps its period-less text.
+                        println!("{msg}.");
+                    }
                 }
                 return 0;
             }
@@ -274,6 +303,83 @@ pub async fn run(args: RepairArgs) -> i32 {
             1
         }
     }
+}
+
+/// The cleanup phase of a project whose only patch state is hosted: what
+/// is left of a pnpm registry route that no lockfile uses any more goes
+/// (see [`crate::commands::registry_gc`]). Answers the sweep and what
+/// taking the lock did about an interrupted run's commit; `Err` is the
+/// exit code after a lock failure, already reported.
+///
+/// The sweep is previewed first, so a project with nothing to take out
+/// (and every dry run) takes no lock and gains no `.socket/`.
+async fn hosted_registry_cleanup(
+    args: &RepairArgs,
+) -> Result<
+    (
+        crate::commands::registry_gc::RegistryGc,
+        Option<crate::json_envelope::RunWarning>,
+    ),
+    i32,
+> {
+    use crate::commands::registry_gc::sweep;
+
+    let preview = sweep(&args.common, true).await;
+    if args.common.dry_run || preview.entries.is_empty() {
+        return Ok((preview, None));
+    }
+    let manifest_path = args.common.resolved_manifest_path();
+    let socket_dir = crate::args::socket_dir_of(&manifest_path, &args.common.cwd);
+    let lock = acquire_or_emit(
+        &socket_dir,
+        Command::Repair,
+        args.common.json,
+        false,
+        Duration::from_secs(args.common.lock_timeout.unwrap_or(0)),
+    )?;
+    let swept = sweep(&args.common, false).await;
+    Ok((
+        swept,
+        crate::commands::lock_cli::commit_recovery_warning(&lock),
+    ))
+}
+
+/// The registry cleanup in `env`: one event per entry taken out, and the
+/// sweep's warnings.
+fn record_registry_cleanup(
+    env: &mut Envelope,
+    swept: &crate::commands::registry_gc::RegistryGc,
+    dry_run: bool,
+) {
+    crate::commands::registry_gc::record(env, &swept.entries, dry_run);
+    for (code, detail) in &swept.warnings {
+        env.warn(*code, detail.clone());
+    }
+}
+
+/// The registry cleanup for a person: the entries taken out on stdout
+/// (after a blank line when `separated`), the sweep's warnings on stderr
+/// (even under `--silent`: they are why something was not cleaned).
+/// Returns whether stdout gained a line.
+fn print_registry_cleanup(
+    common: &GlobalArgs,
+    swept: &crate::commands::registry_gc::RegistryGc,
+    separated: bool,
+) -> bool {
+    for (_, detail) in &swept.warnings {
+        eprintln!("Warning: {detail}");
+    }
+    let lines = crate::commands::registry_gc::lines(&swept.entries, common.dry_run);
+    if common.silent || lines.is_empty() {
+        return false;
+    }
+    if separated {
+        println!();
+    }
+    for line in lines {
+        println!("{line}");
+    }
+    true
 }
 
 /// Aggregate counts surfaced by `repair_inner` for telemetry use.
@@ -748,6 +854,20 @@ async fn repair_inner(
             println!("{}", format_cleanup_summary(&results, args.common.dry_run));
         }
     }
+    // The cleanup phase also takes out what is left of hosted mode's pnpm
+    // registry route that no lockfile uses any more (a project can hold
+    // agent or vendored patches beside hosted ones). From the lockfiles
+    // alone, under the lock this run holds; `--download-only` skips it
+    // with the rest of the phase.
+    if !args.download_only && crate::commands::registry_gc::route_present(&args.common).await {
+        let swept = crate::commands::registry_gc::sweep(&args.common, args.common.dry_run).await;
+        record_registry_cleanup(&mut env, &swept, args.common.dry_run);
+        gc.get_or_insert_with(GcReport::default)
+            .removed_registry_entries = swept.entries.len();
+        if !args.common.json {
+            stdout_started |= print_registry_cleanup(&args.common, &swept, stdout_started);
+        }
+    }
 
     if !quiet {
         // The blank separator goes to the same stream as the final line,
@@ -1133,6 +1253,7 @@ mod tests {
                 removed_diff_archives: 0,
                 removed_package_archives: 0,
                 bytes_freed: orphan_bytes.len() as u64,
+                removed_registry_entries: 0,
             })
         );
         assert_eq!(env.summary.bytes_freed, orphan_bytes.len() as u64);
@@ -1234,6 +1355,7 @@ mod tests {
                 removed_diff_archives: 2,
                 removed_package_archives: 2,
                 bytes_freed: counts.bytes_freed,
+                removed_registry_entries: 0,
             })
         );
         assert_eq!(env.summary.removed, 0, "the carrier bumps no counter");

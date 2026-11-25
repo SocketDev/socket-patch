@@ -213,6 +213,12 @@ fn accepted_hosted_url(url: &str, extra_origins: &[String]) -> Option<(reqwest::
     (socket_host || configured).then_some((parsed, socket_host))
 }
 
+/// Whether `origin` (`http(s)://host[:port]`) is a patch server's: Socket's
+/// own or one of `extra_origins`, by [`hosted_patch_uuid`]'s origin rules.
+pub(crate) fn on_patch_server_origin(origin: &str, extra_origins: &[String]) -> bool {
+    accepted_hosted_url(&format!("{origin}/"), extra_origins).is_some()
+}
+
 /// EVERY canonical-uuid path segment of a url on an accepted origin
 /// ([`hosted_patch_uuid`]'s origin rules), in path order (the grant token
 /// first when it is uuid-shaped, the patch uuid last), or `None` when `url`
@@ -275,6 +281,21 @@ pub(crate) fn on_configured_origin(url: &reqwest::Url, origins: &[String]) -> bo
                 && (!mirror || under_base_path(url.path(), o.path()))
         })
     })
+}
+
+/// Whether `url` is at or below the base of a patch mirror among `origins`
+/// (a [`mirror_entry`]): a reference a run moved onto the mirror, as
+/// opposed to one on a patch server.
+pub(crate) fn on_mirror(url: &str, origins: &[String]) -> bool {
+    let mirrors: Vec<String> = origins
+        .iter()
+        .filter(|entry| entry_url(entry).1)
+        .cloned()
+        .collect();
+    !mirrors.is_empty()
+        && normalized_hosted_url(url)
+            .and_then(|text| reqwest::Url::parse(&text).ok())
+            .is_some_and(|parsed| on_configured_origin(&parsed, &mirrors))
 }
 
 /// Whether `path` is `base` or below it, a whole segment at a time. A base

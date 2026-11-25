@@ -163,6 +163,12 @@ fn patch_view() -> Value {
 /// patch over `PURL`, plus the npm registry's version document the
 /// upstream restore re-resolves the pristine entry from.
 async fn mock_api(server: &MockServer) {
+    mock_api_with(server, None).await;
+}
+
+/// [`mock_api`]; with `registry`, the grant carries that registry address,
+/// as a patch service that answers registry documents gives it.
+async fn mock_api_with(server: &MockServer, registry: Option<&str>) {
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -206,7 +212,8 @@ async fn mock_api(server: &MockServer) {
                         "url": HOSTED_URL,
                         "integrity": { "sha512": PATCHED_SHA512 }
                     }],
-                    "registryOverride": null
+                    "registryOverride": null,
+                    "npmRegistryUrl": registry
                 }
             }
         })))
@@ -642,6 +649,87 @@ async fn two_document_lock_takes_over_both_ways() {
     assert!(!lock.contains(".socket/vendor"), "{lock}");
     let pkg = std::fs::read_to_string(root.join("package.json")).unwrap();
     assert!(!pkg.contains(".socket/vendor"), "{pkg}");
+    assert!(!root.join(".socket/vendor/npm").exists(), "{env:#}");
+}
+
+/// A project hosted mode routed through the patch's named registry (a
+/// registry address on the grant, a pnpm pin that proves 11.20+) takes
+/// over both ways with nothing of the route left behind.
+/// Hosted → vendored: the registry, the override, the lock's record of it
+/// and its `socket-<id>:` keys all go before the release is vendored; the file
+/// the route created does not outlive it. Vendored → hosted: the project
+/// is byte for byte the routed one again.
+#[tokio::test(flavor = "multi_thread")]
+async fn routed_project_takes_over_both_ways_and_leaves_nothing_behind() {
+    const ALIAS: &str = "socket-9f6b2c4e";
+    const REGISTRY: &str = "https://patch.socket.dev/patch/npm/left-pad/1.3.0/55555555-5555-4555-8555-555555555555/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/";
+    let server = MockServer::start().await;
+    mock_api_with(&server, Some(REGISTRY)).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_pnpm_project(root, Shape::Plain);
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{"name":"c","version":"1.0.0","private":true,"packageManager":"pnpm@12.22.0","dependencies":{{"{NAME}":"{VERSION}"}}}}"#
+        ),
+    )
+    .unwrap();
+    let read = |file: &str| std::fs::read_to_string(root.join(file)).unwrap();
+
+    let (code, env) = run_mode(root, &server.uri(), "scan", "hosted", &[]);
+    assert_eq!(code, 0, "{env:#}");
+    let workspace = read("pnpm-workspace.yaml");
+    assert_eq!(
+        workspace,
+        format!(
+            "packages:\n  - '.'\nnamedRegistries:\n  {ALIAS}: {REGISTRY}\noverrides:\n  '{NAME}@{VERSION}': '{ALIAS}:{VERSION}'\n"
+        ),
+        "{env:#}"
+    );
+    let routed = read("pnpm-lock.yaml");
+    for said in [
+        format!("overrides:\n  {NAME}@{VERSION}: {ALIAS}:{VERSION}\n"),
+        format!("        specifier: {ALIAS}:{VERSION}\n        version: {ALIAS}:{VERSION}\n"),
+        format!("\n  {NAME}@{ALIAS}:{VERSION}:\n    resolution: {{integrity: {PATCHED_SHA512}, tarball: {HOSTED_URL}}}\n"),
+        format!("\n  {NAME}@{ALIAS}:{VERSION}: {{}}\n"),
+    ] {
+        assert!(routed.contains(&said), "{said}\n{routed}");
+    }
+
+    let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &[]);
+    assert_eq!(
+        exit, 0,
+        "the takeover of a routed pin must succeed: {env:#}"
+    );
+    assert!(
+        has_event_code(&env, "vendor_takeover_reverted_redirect"),
+        "{env:#}"
+    );
+    let lock = read("pnpm-lock.yaml");
+    assert!(!lock.contains(HOSTED_URL), "{lock}");
+    assert!(!lock.contains(ALIAS), "no registry key is left:\n{lock}");
+    assert!(
+        lock.contains(&format!("{NAME}@file:.socket/vendor/npm/{UUID}/")),
+        "the lock must point at the vendored artifact:\n{lock}"
+    );
+    let vendored_ws = std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap_or_default();
+    for ours in ["namedRegistries", ALIAS, "patch.socket.dev"] {
+        assert!(
+            !vendored_ws.contains(ours),
+            "{ours} must not outlive the route:\n{vendored_ws}"
+        );
+    }
+
+    let (exit, env) = run_mode(root, &server.uri(), "scan", "hosted", &[]);
+    assert_eq!(exit, 0, "{env:#}");
+    assert!(
+        has_event_code(&env, "redirect_takeover_reverted_vendored"),
+        "{env:#}"
+    );
+    assert_eq!(hosted_pin_count(&env), 1, "{env:#}");
+    assert_eq!(read("pnpm-lock.yaml"), routed, "{env:#}");
+    assert_eq!(read("pnpm-workspace.yaml"), workspace, "{env:#}");
     assert!(!root.join(".socket/vendor/npm").exists(), "{env:#}");
 }
 

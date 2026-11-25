@@ -189,13 +189,16 @@ async fn scan_vendor_references_folding(
 /// ([`registry::VENDORED`]: `nuget.config`, `pom.xml` and `hatch.toml`
 /// included), vlt importer manifests, a Rush repository's locks, configs
 /// and project manifests, the Python
-/// locks the root lists (and their scripts) and the requirements `-r`
-/// include tree. Sorted and deduplicated; entries need not exist.
+/// locks the root lists (and their scripts), the requirements `-r`
+/// include tree, and the `MODULE.bazel` whose block names the directory of
+/// a jar vendored for a hub of a Bazel workspace. Sorted and deduplicated;
+/// entries need not exist.
 async fn wiring_files(project_root: &Path) -> Vec<String> {
     let mut files: Vec<String> = registry::paths_with(registry::VENDORED)
         .into_iter()
         .map(str::to_string)
         .collect();
+    files.push(socket_patch_core::bazel::maven::FILE.to_string());
     files.extend(vendor::vlt_lock::vlt_importer_package_jsons(project_root).await);
     files.extend(vendor::rush_wiring_files(project_root).await);
     if let Ok(paths) = socket_patch_core::utils::python_lock::python_lock_paths(project_root) {
@@ -272,10 +275,15 @@ pub(crate) async fn unledgered_vendor_references(
         .await
         .into_iter()
         .filter(|(eco, uuid, _)| {
+            // A JVM entry owns the `maven/<uuid>` unit of its patch too
+            // (the jar that a hub of a Bazel workspace builds).
+            let owns = |entry: &vendor::VendorEntry| {
+                vendor::jvm::layout::ledger_ecosystem(&entry.ecosystem) == eco
+            };
             !state
                 .entries
                 .values()
-                .any(|entry| entry.ecosystem == *eco && entry.uuid == *uuid)
+                .any(|entry| owns(entry) && entry.uuid == *uuid)
         })
         .collect()
 }
@@ -756,10 +764,15 @@ impl VendoredBackend<'_> {
         // ── Lockfile references no ledger entry owns ─────────────────────
         // Reported, never re-synthesized: the pre-vendor originals a revert
         // replays are not recoverable from the rewired lockfile.
+        // A JVM entry owns the `maven/<uuid>` unit of its patch too, which
+        // `MODULE.bazel` names for a hub of a Bazel workspace.
         let covered: HashSet<(String, String)> = state
             .entries
             .values()
-            .map(|e| (e.ecosystem.clone(), e.uuid.clone()))
+            .map(|e| {
+                let eco = vendor::jvm::layout::ledger_ecosystem(&e.ecosystem);
+                (eco.to_string(), e.uuid.clone())
+            })
             .collect();
         for (eco, uuid, path) in req.references {
             if covered.contains(&(eco.clone(), uuid.clone())) || !ecosystem_in_scope(common, eco) {
@@ -1017,6 +1030,7 @@ mod tests {
                 token: String::new(),
                 patch_uuid: uuid.into(),
                 artifact_url: format!("./.socket/vendor/npm/{uuid}/minimist-1.2.2.tgz"),
+                npm_registry_url: None,
                 registry_override: None,
                 integrity: Integrity {
                     sha512: Some(format!("sha512-{}", "A".repeat(86) + "==")),
