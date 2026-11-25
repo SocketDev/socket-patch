@@ -130,6 +130,11 @@ struct PatchTelemetryContext {
     /// [`InstallChannel::id`]: crate::update::channel::InstallChannel::id
     #[serde(skip_serializing_if = "Option::is_none")]
     channel: Option<&'static str>,
+    /// Whether the run is in CI ([`running_in_ci`]): `CI` or
+    /// `GITHUB_ACTIONS` set. A flag, never which provider or which job.
+    ///
+    /// [`running_in_ci`]: crate::utils::socket_cli_config::running_in_ci
+    ci: bool,
 }
 
 /// Error details for telemetry events.
@@ -241,6 +246,7 @@ fn build_telemetry_context(command: &str) -> PatchTelemetryContext {
         arch: std::env::consts::ARCH.to_string(),
         command: command.to_string(),
         channel: install_channel(),
+        ci: crate::utils::socket_cli_config::running_in_ci(),
     }
 }
 
@@ -2145,7 +2151,10 @@ mod tests {
         // where the binary cannot read its own path.
         match install_channel() {
             Some(channel) => {
-                assert_eq!(ctx, ["arch", "channel", "command", "platform", "version"]);
+                assert_eq!(
+                    ctx,
+                    ["arch", "channel", "ci", "command", "platform", "version"]
+                );
                 assert_eq!(v["context"]["channel"], channel);
                 assert!(
                     [
@@ -2160,8 +2169,9 @@ mod tests {
                     "unexpected channel id {channel}"
                 );
             }
-            None => assert_eq!(ctx, ["arch", "command", "platform", "version"]),
+            None => assert_eq!(ctx, ["arch", "ci", "command", "platform", "version"]),
         }
+        assert!(v["context"]["ci"].is_boolean(), "{v:#}");
         assert_eq!(v["error"]["type"], "Error");
         assert_eq!(v["error"]["message"], "boom");
         assert_eq!(v["metadata"]["patches_count"], 2);
