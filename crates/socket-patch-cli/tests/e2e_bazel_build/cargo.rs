@@ -172,10 +172,12 @@
 //!   the same.
 //! - Bazel would read that file as a package of the user's workspace. The
 //!   crate has a dependency ([`DEP`]), so the file names a repository of
-//!   the hub, which the main repository does not see, and the commands
-//!   that analyse every target fail on it: `bazel cquery //...` and
-//!   `bazel query 'deps(//...)'` ([`analyses`]). The line that the scan
-//!   wrote into `.bazelignore` keeps the copies out of Bazel's packages:
+//!   the hub, which the main repository does not see, as it does not see
+//!   `platforms`, which the file names too. The commands that analyse
+//!   every target fail on the first of the two that Bazel meets:
+//!   `bazel cquery //...` and `bazel query 'deps(//...)'` ([`analyses`]).
+//!   The line that the scan wrote into `.bazelignore` keeps the copies out
+//!   of Bazel's packages:
 //!   `//...` is the user's own target ([`every_target`]), both commands
 //!   pass, and the build is the patched one, because the hub reads the
 //!   copy by its path, not as a package. A user who comments the line out
@@ -872,15 +874,42 @@ fn every_target(cell: &Cell) -> Vec<String> {
     targets
 }
 
+/// Whether `stderr` says that the main repository does not see a
+/// repository that the build file in the copy names: one of the hub, or
+/// `platforms`. Bazel names the first one it meets, and which one that is
+/// differs from run to run. The same words about another repository's view
+/// are another failure.
+fn unseen(stderr: &str) -> bool {
+    (stderr.split("No repository visible as '@").skip(1))
+        .filter_map(|rest| rest.split_once("' from main repository"))
+        .any(|(repo, _)| {
+            !repo.contains('\'') && (repo == "platforms" || repo.starts_with("crates__"))
+        })
+}
+
+/// [`unseen`] takes the two messages Bazel was seen to print, and neither
+/// another repository's name nor another repository's view.
+#[test]
+fn an_unseen_repository_is_one_the_copy_names_and_the_main_repository_misses() {
+    let said = |repo: &str, from: &str| {
+        format!("ERROR: no such package: No repository visible as '@{repo}' from {from}\n")
+    };
+    assert!(unseen(&said("platforms", "main repository")));
+    assert!(unseen(&said("crates__dep-1.0.0", "main repository")));
+    assert!(!unseen(&said("rules_cc", "main repository")));
+    assert!(!unseen(&said("platforms", "repository '@@rules_rust+'")));
+    assert!(!unseen("Loading: 0 packages loaded\n"));
+}
+
 /// Whether the commands that analyse every target of the checkout of
 /// `cell` pass: `bazel cquery //...` and `bazel query 'deps(//...)'`, which
-/// agree. One that fails has met a repository of the hub, which the main
-/// repository does not see.
+/// agree. One that fails has met a repository that the build file in the
+/// copy names and the main repository does not see ([`unseen`]).
 fn analyses(cell: &Cell) -> bool {
     let runs = [("cquery", "//..."), ("query", "deps(//...)")];
     let runs = runs.map(|(command, targets)| cell.bazel(command, &[targets]));
     for run in &runs {
-        let unseen = run.stderr().contains("No repository visible as '@crates__");
+        let unseen = unseen(&run.stderr());
         assert_ne!(run.ok(), unseen, "{}: {}", cell.test, run.dump());
     }
     assert_eq!(runs[0].ok(), runs[1].ok(), "{}", cell.test);
@@ -1194,8 +1223,9 @@ fn vendored_from_cargo_with_config() {
     // package: `//...` is the consumer alone, and the commands that analyse
     // every target pass. A user who comments the line out has the package
     // back, where the ruleset writes the build file: `//...` names targets
-    // there, those commands fail on the repository of the dependency, and
-    // the file Bazel now reads is a change of the copy again.
+    // there, those commands fail on a repository that the file names and
+    // the main repository does not see, and the file Bazel now reads is a
+    // change of the copy again.
     assert_eq!(every_target(&cell), [CONSUMER], "{test}");
     assert!(analyses(&cell), "{test}: under the line of the scan");
     cell.write(".bazelignore", DECLINED);
