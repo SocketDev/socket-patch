@@ -19,14 +19,21 @@
 //! both fails the same way (Bazel 9.3.2). So every Composer project in a
 //! Bazel workspace is declined, and the user's word is the one exception.
 //!
-//! What is declined is the write of that path. A package whose lock entry
-//! already names the copy of the same patch is let through: the run leaves
-//! the lock as it is, so a project that was vendored before (by an earlier
-//! release, or with the flag) keeps passing its in-sync runs.
+//! What is declined is the first such path that a rule may install. A
+//! package is let through when `packages` of the lock already names a copy
+//! under `.socket/vendor/composer`, or when the section that holds the
+//! package does: an earlier release vendored there, or the user allowed
+//! it. Either no Bazel rule installs from that lock, and then vendored
+//! mode works there as it did before this refusal existed; or one does,
+//! and its build already fails on a path in a section it installs, which
+//! one more path there does not change. The section matters because a rule
+//! may install with `--no-dev`, which reads `packages` alone: a copy that
+//! only `packages-dev` names breaks no such build, so it lets through the
+//! packages of `packages-dev` and no other.
 
 use std::path::Path;
 
-use crate::formats::composer::composer_lock_packages;
+use crate::formats::composer::{composer_lock_packages, ComposerLockPackage};
 use crate::utils::env_compat::env_flag;
 use crate::utils::fs::{read_regular_to_string, run_blocking};
 use crate::utils::pnpm_workspace::without_verbatim_prefix;
@@ -43,8 +50,9 @@ pub const CODE: &str = "vendor_composer_bazel_workspace";
 /// declines in the project at `project`, each with [`CODE`] and the detail.
 /// It declines a project in a Bazel workspace
 /// ([`crate::bazel::bazel_root`]) unless the user allowed it
-/// ([`ALLOW_IN_BAZEL_ENV`]), and lets through a package the lock already
-/// names by the copy of that patch. Read-only: it looks for the root, reads
+/// ([`ALLOW_IN_BAZEL_ENV`]), and lets through a package when `packages` of
+/// the lock, or the section that holds the package, already names a
+/// vendored copy (the module docs). Read-only: it looks for the root, reads
 /// the lock, and starts no program.
 pub async fn refusals<'a>(
     project: &Path,
@@ -74,28 +82,39 @@ async fn refusals_unless<'a>(
          Bazel rule that runs `composer install` anywhere else does not find it, and the \
          build fails; use `--mode hosted`, which names the patched archive by a URL that \
          Composer fetches from any directory, or pass `--allow-vendored-in-bazel` if \
-         Composer only runs in the project's directory",
+         Composer only runs in the project's directory (a package is not declined where \
+         `packages` of composer.lock, or the section that holds the package, already names \
+         a vendored copy)",
         without_verbatim_prefix(root.dir).display()
     );
-    // A lock that cannot be read wires nothing: the backend says so itself.
+    // A lock that cannot be read names no copy.
     let lock = match read_regular_to_string(&project.join(COMPOSER_LOCK)).await {
         Ok(text) => LOCK_MEMO
             .parse(text.as_bytes(), || parse_json_text(&text))
             .ok(),
         Err(_) => None,
     };
-    let wired = |purl: &str, uuid: &str| {
-        let (Some(lock), Some(((vendor, name), _))) = (&lock, parse_composer_purl(purl)) else {
-            return false;
+    let entries = lock.as_ref().map(|lock| composer_lock_packages(lock));
+    let entries = entries.unwrap_or_default();
+    // The sections that name a vendored copy: a rule that installs one of
+    // them fails already.
+    let copy = |entry: &&ComposerLockPackage| {
+        let copy = entry.dist_vendor_path();
+        copy.is_some_and(|copy| copy.eco == "composer")
+    };
+    let vendored: Vec<&str> = entries.iter().filter(copy).map(|e| e.section).collect();
+    let through = |purl: &str| {
+        let name = parse_composer_purl(purl).map(|((vendor, name), _)| format!("{vendor}/{name}"));
+        let held = |entry: &ComposerLockPackage| {
+            let named = entry.name.zip(name.as_deref());
+            let named = named.is_some_and(|(a, b)| a.eq_ignore_ascii_case(b));
+            named && vendored.contains(&entry.section)
         };
-        let pkg = format!("{vendor}/{name}");
-        composer_lock_packages(lock)
-            .into_iter()
-            .any(|p| p.name.is_some_and(|n| n.eq_ignore_ascii_case(&pkg)) && p.wired_to(uuid))
+        vendored.contains(&"packages") || entries.iter().any(held)
     };
     candidates
         .iter()
-        .filter(|(purl, uuid)| !wired(purl, uuid))
+        .filter(|(purl, _)| !through(purl))
         .map(|(purl, _)| (*purl, CODE, detail.clone()))
         .collect()
 }
@@ -142,6 +161,7 @@ mod tests {
                     &*format!("the Bazel workspace at {},", shown.display()),
                     "`--mode hosted`",
                     "`--allow-vendored-in-bazel`",
+                    "(a package is not declined where `packages` of composer.lock, or the section",
                 ];
                 assert!(named.iter().all(|part| detail.contains(part)), "{detail}");
                 // The user's word lifts it.
@@ -154,35 +174,68 @@ mod tests {
         assert!(declined(&api, &one).await.is_empty());
     }
 
-    /// A package the lock already names by the copy of the same patch is
-    /// let through: the run would leave the lock as it is. Another patch of
-    /// that package, another package, and a lock that holds the registry
-    /// entry or cannot be read are declined.
+    /// A package is let through where `packages` of the lock names a
+    /// vendored Composer copy, or the section that holds the package does:
+    /// the package of that copy, a newer patch of it and another package.
+    /// A copy that only `packages-dev` names lets through no package of
+    /// `packages`, the one section a rule that installs with `--no-dev`
+    /// reads, and none that the lock does not hold. A lock that names no
+    /// copy declines all: one of registry entries, the copy of a sibling
+    /// project, a copy of another ecosystem's, and one that cannot be read
+    /// or is not there.
     #[tokio::test]
-    async fn a_package_the_lock_already_wires_to_the_patch_is_let_through() {
+    async fn a_package_is_let_through_where_its_section_names_a_vendored_copy() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path();
         fs::write(project.join("MODULE.bazel"), "").unwrap();
         let other = "pkg:composer/acme/gadget@2.0.0";
-        let candidates = [(PURL, UUID), (other, UUID)];
-        let lock = |dist: serde_json::Value| {
-            let entries = serde_json::json!([
-                { "name": "Acme/Widget", "version": "1.0.0", "dist": dist },
-                { "name": "acme/gadget", "version": "2.0.0",
-                  "dist": { "type": "zip", "url": "https://registry.example/gadget.zip" } },
-            ]);
-            let text = serde_json::json!({ "packages": entries, "packages-dev": [] });
+        let absent = "pkg:composer/acme/absent@3.0.0";
+        let candidates = [
+            (PURL, UUID),
+            (PURL, OTHER_UUID),
+            (other, UUID),
+            (absent, UUID),
+        ];
+        let all = [PURL, PURL, other, absent];
+        // The lock with `Acme/Widget` at `url` in the section `widget`, and
+        // the registry's `acme/gadget` in the section `gadget`.
+        let lock = |widget: &str, url: &str, gadget: &str| {
+            let mut text = serde_json::json!({ "packages": [], "packages-dev": [] });
+            let registry = serde_json::json!({ "name": "acme/gadget", "version": "2.0.0",
+                "dist": { "type": "zip", "url": "https://registry.example/gadget.zip" } });
+            let named = serde_json::json!({ "name": "Acme/Widget", "version": "1.0.0",
+                "dist": { "type": "path", "url": url, "reference": UUID } });
+            text[gadget].as_array_mut().unwrap().push(registry);
+            text[widget].as_array_mut().unwrap().push(named);
             fs::write(project.join("composer.lock"), text.to_string()).unwrap();
         };
         let copy = format!(".socket/vendor/composer/{UUID}/acme/widget@1.0.0");
-        lock(serde_json::json!({ "type": "path", "url": copy, "reference": UUID }));
-        assert_eq!(declined(project, &candidates).await, [other]);
-        assert_eq!(declined(project, &[(PURL, OTHER_UUID)]).await, [PURL]);
-        lock(serde_json::json!({ "type": "zip", "url": "https://registry.example/widget.zip" }));
-        assert_eq!(declined(project, &candidates).await, [PURL, other]);
+        let (prod, dev) = ("packages", "packages-dev");
+        let rows: [(&str, &str, &[&str]); 4] = [
+            (prod, prod, &[]),
+            (prod, dev, &[]),
+            (dev, dev, &[absent]),
+            (dev, prod, &[other, absent]),
+        ];
+        for (widget, gadget, expected) in rows {
+            lock(widget, &copy, gadget);
+            let said = declined(project, &candidates).await;
+            assert_eq!(said, expected, "the copy in {widget}, gadget in {gadget}");
+        }
+        let not_one = [
+            "https://registry.example/widget.zip".to_string(),
+            format!("../{copy}"),
+            copy.replace("/composer/", "/npm/"),
+        ];
+        for url in not_one {
+            for section in [prod, dev] {
+                lock(section, &url, section);
+                assert_eq!(declined(project, &candidates).await, all, "{url} {section}");
+            }
+        }
         fs::write(project.join("composer.lock"), "{").unwrap();
-        assert_eq!(declined(project, &candidates).await, [PURL, other]);
+        assert_eq!(declined(project, &candidates).await, all);
         fs::remove_file(project.join("composer.lock")).unwrap();
-        assert_eq!(declined(project, &candidates).await, [PURL, other]);
+        assert_eq!(declined(project, &candidates).await, all);
     }
 }

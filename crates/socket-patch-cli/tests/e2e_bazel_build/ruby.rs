@@ -779,6 +779,26 @@ fn a_gem_that_the_hub_holds_to_its_upstream_sha256_is_left_alone() {
     }
 }
 
+/// Without a Bazel: with `SOCKET_NO_BAZEL=1` a hosted scan pins the gem
+/// that the hub holds to its upstream sha256, as it does in the same
+/// checkout without its `MODULE.bazel`, to the byte, and says nothing of
+/// the call. Without the variable it leaves the gem alone there.
+#[test]
+fn the_switch_makes_a_hosted_scan_the_one_of_a_checkout_without_bazel() {
+    let served = Served::start(&mut cell_without_bazel("9.3.2"));
+    let sums = [&served.neighbour_gem, &served.upstream_gem].map(|gem| sha256_hex(gem));
+    let held = module_pinning(&[(NEIGHBOUR, &sums[0]), (NAME, &sums[1])]);
+    let cell = checkout(&served, Some(&held));
+    let origin = served.standin.origin();
+    let rubygems = format!("{origin}/{RUBYGEMS}");
+    let env = [("SOCKET_RUBYGEMS_URL", rubygems.as_str())];
+    let hosted = ["scan", "--mode", "hosted", "--yes"];
+    let left_alone = cell.off_is_without_bazel(&origin, &hosted, &env, &["MODULE.bazel"]);
+    let said = left_alone[0]["stdout"].as_str().expect("an envelope");
+    let envelope: serde_json::Value = serde_json::from_str(said).expect("an envelope");
+    assert_eq!(codes_in(&envelope["warnings"]), [HELD], "{left_alone:#}");
+}
+
 /// Without a Bazel: what else a call can say, each as the `MODULE.bazel`
 /// of the fixture's checkout. A lock without a `CHECKSUMS` section leaves
 /// the gem as it is too, and its warning does not offer to delete the gem
