@@ -31,6 +31,7 @@ use socket_patch_core::vex::{
 };
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
+use crate::commands::vex_grype;
 use crate::commands::vex_sources::{
     self, Plan, RunApiClient, Sources, GO_WORKSPACE_OVERRIDE, RECORD_MISMATCH, RECORD_UNAVAILABLE,
     REDIRECT_UNWIRED, VENDOR_UNWIRED, WIRING_CONFLICT,
@@ -117,6 +118,22 @@ pub struct VexArgs {
         value_parser = parse_bool_flag,
     )]
     pub compact: bool,
+
+    /// List the document in this Grype config's `vex-documents`, so a plain
+    /// `grype dir:.` reads it (`.grype.yaml` when given without a path).
+    /// Needs `--output`. The config names the document relative to its own
+    /// directory; run Grype there. A run that leaves no document at
+    /// `--output` takes the entry out again, since Grype fails a scan whose
+    /// listed document is missing. A config it cannot edit with certainty is
+    /// left alone, with a warning.
+    #[arg(
+        long = "grype-config",
+        env = "SOCKET_VEX_GRYPE_CONFIG",
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = ".grype.yaml"
+    )]
+    pub grype_config: Option<PathBuf>,
 }
 
 /// VEX-generation knobs embedded into `apply`, `vendor` and `scan` via `--vex`.
@@ -405,6 +422,17 @@ pub async fn run(args: VexArgs) -> i32 {
         );
     }
 
+    // Grype reads the document from a file, never from stdout.
+    if args.grype_config.is_some() && output.is_none() {
+        return crate::json_envelope::usage_error(
+            Command::Vex,
+            args.common.json,
+            args.common.dry_run,
+            "grype_config_requires_output",
+            "--grype-config requires --output (Grype reads the VEX document from a file)",
+        );
+    }
+
     // `-o` is `--org`, `-O` is `--output`: a file-shaped org slug is almost
     // certainly a mistyped `-O` (the document then silently went to stdout).
     let mut run_warnings: Vec<RunWarning> = Vec::new();
@@ -448,9 +476,19 @@ pub async fn run(args: VexArgs) -> i32 {
     match generate_vex_from_manifest_path(&common, &params, &manifest_path).await {
         Ok(mut summary) => {
             run_warnings.append(&mut summary.warnings);
+            let grype = match (&args.grype_config, &output) {
+                (Some(config), Some(path)) => {
+                    Some(vex_grype::list_document(config, path, params.dry_run).await)
+                }
+                _ => None,
+            };
+            let grype_warning = grype.as_ref().and_then(|g| g.warning.clone());
+            if let Some(warning) = &grype_warning {
+                run_warnings.push(warning.clone());
+            }
             summary.warnings = run_warnings;
             if args.common.json {
-                emit_envelope_success(&summary, params.dry_run);
+                emit_envelope_success(&summary, params.dry_run, grype.as_ref());
             } else if !args.common.silent {
                 let count = summary.statements;
                 match &output {
@@ -462,6 +500,13 @@ pub async fn run(args: VexArgs) -> i32 {
                     }
                     None => eprintln!("{}", format_vex_emitted(count, summary.affected)),
                 }
+                if let Some(line) = grype.as_ref().and_then(|g| g.human_line()) {
+                    println!("{line}");
+                }
+                // After the summary, so it reads as about the config.
+                if let Some(warning) = &grype_warning {
+                    print_warnings(&args.common, std::slice::from_ref(warning));
+                }
             }
             0
         }
@@ -471,6 +516,22 @@ pub async fn run(args: VexArgs) -> i32 {
         // telemetry, so these emit-only sinks must not re-track.
         Err(mut e) => {
             run_warnings.append(&mut e.warnings);
+            // No document is left at `--output`: an entry naming it would
+            // fail every Grype scan.
+            if let (Some(config), Some(path)) = (&args.grype_config, &output) {
+                if let Some(grype) =
+                    vex_grype::unlist_missing_document(config, path, params.dry_run).await
+                {
+                    if let Some(warning) = grype.warning.clone() {
+                        print_warnings(&args.common, std::slice::from_ref(&warning));
+                        run_warnings.push(warning);
+                    } else if !args.common.json && !args.common.silent {
+                        if let Some(line) = grype.human_line() {
+                            eprintln!("{line}");
+                        }
+                    }
+                }
+            }
             // Nothing to attest at `--cwd`: when scan patched the project
             // directories below it instead, name them and their run.
             let below = match e.code {
@@ -2973,7 +3034,11 @@ fn omission_reason_message(reason: &str) -> String {
     format!("patch omitted from VEX: {}", omission_phrase(reason))
 }
 
-fn emit_envelope_success(summary: &VexWriteSummary, dry_run: bool) {
+fn emit_envelope_success(
+    summary: &VexWriteSummary,
+    dry_run: bool,
+    grype: Option<&vex_grype::GrypeConfigOutcome>,
+) {
     let mut env = Envelope::new(Command::Vex);
     env.dry_run = dry_run;
     for st in &summary.doc.statements {
@@ -3005,6 +3070,9 @@ fn emit_envelope_success(summary: &VexWriteSummary, dry_run: bool) {
         env.mark_partial_failure();
     }
     env.warnings = summary.warnings.clone();
+    if let Some(grype) = grype {
+        env.set_extra("grypeConfig", grype.to_json());
+    }
     println!("{}", env.to_pretty_json());
 }
 

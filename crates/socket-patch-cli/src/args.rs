@@ -850,6 +850,7 @@ pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_VEX_NO_BAZEL",
     "SOCKET_VEX_DOC_ID",
     "SOCKET_VEX_COMPACT",
+    "SOCKET_VEX_GRYPE_CONFIG",
 ];
 
 /// Remove exported-but-empty flag-bound env vars before clap parses, so

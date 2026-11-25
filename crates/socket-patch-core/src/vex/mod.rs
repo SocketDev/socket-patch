@@ -19,6 +19,7 @@
 
 pub mod build;
 pub mod discover;
+pub mod grype_config;
 pub mod product;
 pub mod schema;
 pub mod time;
