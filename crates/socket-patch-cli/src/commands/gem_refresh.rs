@@ -159,7 +159,7 @@ impl Policy {
             return Err(Why::Disabled);
         }
         if !self.shared && !resolves_inside(&self.root, path) {
-            return Err(Why::Failed(
+            return Err(Why::OutOfTree(
                 match direction {
                     Direction::Patched => {
                         "it is outside the project directory; `--gem-refresh-shared` refreshes \
@@ -193,6 +193,9 @@ pub(crate) enum Why {
     Disabled,
     /// The refresh was tried, or could not be.
     Failed(String),
+    /// The copy resolves outside the project directory and was left alone
+    /// for it: no refresh was tried.
+    OutOfTree(String),
     /// Nothing says which build the copy holds: the sha256 of the wanted
     /// gem could not be had, for this reason. It is not known to be stale,
     /// and not known not to be.
@@ -390,16 +393,22 @@ fn gemspec_is_gone(gem_dir: &Path) -> bool {
     let Some(spec) = home_spec(gem_dir) else {
         return false;
     };
-    let gone = |path: &Path| matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
-    gone(&spec) && !socket_patch_core::crawlers::ruby_crawler::is_default_gem_copy(gem_dir)
+    let default = spec.parent().zip(spec.file_name());
+    let Some(default) = default.map(|(specs, name)| specs.join("default").join(name)) else {
+        return false;
+    };
+    [spec, default].iter().all(|path| {
+        matches!(std::fs::metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 /// Why `bundle install` cannot be counted on to replace a copy once its
 /// gemspec and archive are removed (#2242).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outlives {
-    /// No Ruby the run found installs into the copy's gem home (the tree
-    /// of an earlier Ruby, `vendor/bundle/ruby/3.2.0`). `bundle install`
+    /// A Ruby the run asked installs this gem somewhere else than the
+    /// copy's gem home (the tree of an earlier Ruby,
+    /// `vendor/bundle/ruby/3.2.0`). `bundle install`
     /// installs into the gem home of the Ruby that runs it, so the gem dir
     /// would stay behind with no gemspec.
     ForeignRuby,
@@ -410,7 +419,8 @@ enum Outlives {
 
 /// Whether the remedy for `gem`'s installed copy has to remove the gem
 /// dir itself, and why. Only a copy a refresh failed on, never one left
-/// alone (a shared home, `--no-gem-install-refresh`) or patched in place.
+/// alone (a shared home, a path outside the project,
+/// `--no-gem-install-refresh`) or patched in place.
 fn outlives_reinstall(gem: &StaleGem, why: Option<&Why>) -> Option<Outlives> {
     let (Some((dir, _)), false, Some(Why::Failed(reason))) = (&gem.installed, gem.in_place, why)
     else {
@@ -418,7 +428,7 @@ fn outlives_reinstall(gem: &StaleGem, why: Option<&Why>) -> Option<Outlives> {
     };
     if gemspec_is_gone(dir) {
         Some(Outlives::NoGemspec)
-    } else if reason.contains(socket_patch_core::patch::gem_ext::NO_OWNING_RUBY) {
+    } else if reason.contains(socket_patch_core::patch::gem_ext::OWNED_BY_ANOTHER_RUBY) {
         Some(Outlives::ForeignRuby)
     } else {
         None
@@ -474,7 +484,9 @@ fn retry_hint(direction: Direction, why: Option<&Why>, outlives: Option<Outlives
         (Some(Why::Disabled), Direction::Patched) => {
             "Re-run without `--no-gem-install-refresh`, or "
         }
-        (Some(Why::Failed(_)), Direction::Patched) => "Re-run `socket-patch scan` to retry, or ",
+        (Some(Why::Failed(_) | Why::OutOfTree(_)), Direction::Patched) => {
+            "Re-run `socket-patch scan` to retry, or "
+        }
         _ => "",
     }
 }
@@ -528,7 +540,9 @@ fn after_hint(hint: &str, action: &str) -> String {
 
 fn reason(why: Option<&Why>) -> String {
     match why {
-        Some(Why::Failed(reason) | Why::Unverified(reason)) => format!(" ({reason})"),
+        Some(Why::Failed(reason) | Why::OutOfTree(reason) | Why::Unverified(reason)) => {
+            format!(" ({reason})")
+        }
         Some(Why::Disabled) => " (`--no-gem-install-refresh` is set)".to_string(),
         _ => String::new(),
     }
@@ -549,7 +563,11 @@ pub(crate) fn stale_detail(direction: Direction, gem: &StaleGem, why: Option<&Wh
             dir.display(),
             archive.display()
         );
-        return if !project_local && !matches!(why, Some(Why::Disabled | Why::Failed(_))) {
+        return if !project_local
+            && !matches!(
+                why,
+                Some(Why::Disabled | Why::Failed(_) | Why::OutOfTree(_))
+            ) {
             format!(
                 "{held}. {IN_PLACE_REINSTALL}. Other projects may load that shared gem home, so \
                  it was left alone. Install the {wanted} gem for this project only with \
@@ -585,22 +603,29 @@ pub(crate) fn stale_detail(direction: Direction, gem: &StaleGem, why: Option<&Wh
                 )
             ),
         ),
-        Some((dir, false)) if !matches!(why, Some(Why::Disabled | Why::Failed(_))) => format!(
-            "{purl} {switched}, but the shared gem home still holds its {stale} install at \
+        Some((dir, false))
+            if !matches!(
+                why,
+                Some(Why::Disabled | Why::Failed(_) | Why::OutOfTree(_))
+            ) =>
+        {
+            format!(
+                "{purl} {switched}, but the shared gem home still holds its {stale} install at \
              {}, and {reuse}. Other projects may load that gem home, so it was left alone. \
              Install the {wanted} gem for this project only with `{LOCAL_PATH_REMEDY}`, or {}",
-            dir.display(),
-            match direction {
-                Direction::Patched => {
-                    "re-run with `--gem-refresh-shared` to replace the shared copy".to_string()
+                dir.display(),
+                match direction {
+                    Direction::Patched => {
+                        "re-run with `--gem-refresh-shared` to replace the shared copy".to_string()
+                    }
+                    Direction::Upstream => format!(
+                        "replace the shared copy: remove {} and run `bundle install` ({})",
+                        display_list(&files_to_remove(gem)),
+                        other_projects_cost(1)
+                    ),
                 }
-                Direction::Upstream => format!(
-                    "replace the shared copy: remove {} and run `bundle install` ({})",
-                    display_list(&files_to_remove(gem)),
-                    other_projects_cost(1)
-                ),
-            }
-        ),
+            )
+        }
         Some((dir, _)) => {
             let (paths, with_dir) = remedy_paths(gem, why);
             format!(

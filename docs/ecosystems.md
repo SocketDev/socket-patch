@@ -4149,8 +4149,8 @@ to the patched `gems/nokogiri-1.16.0/`. RubyGems and Bundler load a gem by its
 that installed it. When the scan finds no such Ruby, its warning names the gem directory to
 remove as well (`rm -rf <gem directory> <gemspec> <archive> && bundle install`), so no unpatched
 copy is left behind whichever Ruby runs `bundle install`; to keep the tree, re-run the scan with
-that Ruby first on `PATH`. A gem directory that already lost its gemspec and is the only copy of
-that gem version in its gem home is reported the same way: the warning names the directory to
+that Ruby first on `PATH`. A gem directory that already lost its gemspec, and that the scan
+tried and failed to replace, is reported the same way: the warning names the directory to
 remove, and no re-run, which could not replace it.
 
 Gems in a gem home **outside** the project (the system gems, `~/.gem`, an rbenv or asdf home) are

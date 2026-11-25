@@ -2400,11 +2400,12 @@ fn home_minor(copy: &GemCopy) -> Option<String> {
     }
 }
 
-/// How the reason of a native rebuild that found no Ruby owning the
-/// installed copy starts ([`find_ruby`]'s error). The copy is in a gem
-/// home no candidate Ruby installs into, so a `bundle install` run with
-/// one of them does not replace it either: a remedy checks for this.
-pub const NO_OWNING_RUBY: &str = "no Ruby owning this install was found";
+/// How a candidate Ruby that answered, and builds this gem's extension
+/// somewhere else than where the installed one is, ends its line in
+/// [`find_ruby`]'s error. The copy is then in a gem home that Ruby does
+/// not install into, so a `bundle install` run with it does not replace
+/// the copy either: a remedy checks for this.
+pub const OWNED_BY_ANOTHER_RUBY: &str = "(another Ruby's)";
 
 /// Find the Ruby that owns `copy`'s install. Each candidate is asked where
 /// it builds extensions for the gem home, and what it is
@@ -2460,7 +2461,7 @@ async fn find_ruby(
         let disowned = match platform {
             None if installed.iter().any(|d| same_path(d, &extension_dir)) => None,
             None => Some(format!(
-                "{} builds into {}, but the installed extension is {} (another Ruby's)",
+                "{} builds into {}, but the installed extension is {} {OWNED_BY_ANOTHER_RUBY}",
                 ruby.display(),
                 extension_dir.display(),
                 installed
@@ -2514,7 +2515,10 @@ async fn find_ruby(
             facts,
         });
     }
-    Err(format!("{NO_OWNING_RUBY} ({})", reasons.join("; ")))
+    Err(format!(
+        "no Ruby owning this install was found ({})",
+        reasons.join("; ")
+    ))
 }
 
 /// A `.gem` RubyGems installed into a stage home ([`install_staged`]).
@@ -7075,7 +7079,7 @@ mod tests {
         preflight.candidates = vec![fake_ruby(&other, "q")];
         let why = find_fresh_ruby(&copy, &env, &preflight).await.unwrap_err();
         assert!(why.contains("another Ruby's"), "{why}");
-        assert!(why.contains(NO_OWNING_RUBY), "{why}");
+        assert!(why.contains(OWNED_BY_ANOTHER_RUBY), "{why}");
     }
 
     /// A gem with no extension dir, or whose require path leaves the gem
