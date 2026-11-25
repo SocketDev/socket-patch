@@ -2473,6 +2473,11 @@ What an earlier run wrote for Bazel is still listed and undone with the variable
 - The `.bazelignore` lines: no pair is added, and the pair of a copy that is gone is removed
   by the command that removed the copy (`rollback`, `remove`, `vendor --revert`, `repair`, a
   scan).
+- A PyPI wheel committed as a download cache
+  ([Bazel workspaces: PyPI vendored mode as a download cache](#bazel-workspaces-pypi-vendored-mode-as-a-download-cache)):
+  `list` shows it as vendored and `vendor --check` holds it to the patch. `vendor --revert`,
+  `rollback` and `remove` put the pin of `requirements.txt` back, remove the wheel and take
+  its line out of the `.bazelrc` at the Bazel root. No line is added.
 
 ## Bazel workspaces: npm
 

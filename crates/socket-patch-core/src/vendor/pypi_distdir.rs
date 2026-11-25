@@ -382,10 +382,13 @@ pub(super) fn notice(name: &str, version: &str, wheel: &str) -> VendorWarning {
 /// directory of each ledger entry of the form has its line while it
 /// exists. Without `add`, and with a ledger that cannot be read, lines are
 /// only taken away. Outside a Bazel workspace nothing is read or written,
-/// and that lookup is all the call costs.
+/// and that lookup is all the call costs. For a user who switched the
+/// Bazel support off ([`crate::bazel::off`]) no line is added, as outside
+/// one; the line of a directory that is gone still goes, so that the undo
+/// of a download cache an earlier run wrote is whole.
 pub async fn sync_bazelrc(project: &Path, add: bool) -> Result<Option<PathBuf>, String> {
-    let dir = project.to_path_buf();
-    let Some(root) = run_blocking(move || crate::bazel::bazel_root(&dir)).await else {
+    let (dir, add) = (project.to_path_buf(), add && !crate::bazel::off());
+    let Some(root) = run_blocking(move || crate::bazel::root_of(&dir)).await else {
         return Ok(None);
     };
     let state = load_state(project).await.unwrap_or_default();

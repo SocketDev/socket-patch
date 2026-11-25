@@ -1962,6 +1962,42 @@ fn the_switch_makes_a_download_cache_the_vendoring_of_a_checkout_without_bazel()
     }
 }
 
+/// Without a Bazel: what an earlier run wrote for Bazel is still listed
+/// and undone with `SOCKET_NO_BAZEL=1`. A run without the variable commits
+/// the download cache and its line of `.bazelrc`. With the variable, `list`
+/// shows a vendored package and `vendor --check` holds its wheel to the
+/// patch, and each of `vendor --revert`, `rollback` and `remove` takes the
+/// wheel, the pin and the line away: the checkout is the one before the
+/// run, to the byte.
+#[test]
+fn the_switch_still_takes_the_line_of_a_download_cache_away() {
+    let with = Vendoring::new();
+    let cell = checkout(&with);
+    cell.write(LOCK, bazel_lock(28, "2.5.0-rc4"));
+    let before = cell.tree();
+    let off = [("SOCKET_NO_BAZEL", "1")];
+    let undos: [&[&str]; 3] = [
+        &["vendor", "--revert", "--yes"],
+        &["rollback", "--yes"],
+        &["remove", PURL, "--yes"],
+    ];
+    for undo in undos {
+        let (_, vendored) = caches(&cell, &with, &before);
+        let list = with.run_with(&cell, &["list"], &off);
+        let listed = list.envelope.to_string();
+        let as_vendored = listed.contains("\"vendored\"") && !listed.contains("\"hosted\"");
+        assert!(as_vendored, "{}", list.dump);
+        let check = with.run_with(&cell, &["vendor", "--check"], &off);
+        assert_eq!(check.code, 0, "{}", check.dump);
+        assert_eq!(check.envelope["summary"]["verified"], 1, "{}", check.dump);
+        assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{}", check.dump);
+        let ran = with.run_with(&cell, undo, &off);
+        assert_eq!(ran.code, 0, "{undo:?}: {}", ran.dump);
+        let undone = changed(&before, &cell.tree());
+        assert_eq!(undone, NOTHING, "{undo:?}: {}", ran.dump);
+    }
+}
+
 /// Without a Bazel: the fixture's directories are those of its table, and
 /// the workflow runs each release on its era. The fixture holds no
 /// `requirements.txt`: every era names the one the test writes, which pins
