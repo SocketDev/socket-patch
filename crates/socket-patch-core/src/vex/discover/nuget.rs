@@ -22,11 +22,12 @@
 //! | writer | `value` | mode | version from | pin |
 //! |---|---|---|---|---|
 //! | `patch::redirect::rewrite_nuget` (`scan --mode hosted`) | `https://patch.socket.dev/patch-registry/nuget/<token>/<uuid>/index.json` ([`DiscoverCtx::hosted_uuid`], must equal the key's uuid) | Hosted | every `packages.lock.json` entry for the id (`dependencies.<tfm>.<id>.resolved`, id case-insensitive) | its `contentHash` |
-//! | `vendor::nuget_feed` (`vendor`, `scan --mode vendored`) | `.socket/vendor/nuget/<uuid>` ([`vendor_uuid_dir`], must be the nuget dir of the key's uuid) | Vendored | the feed's single `<idLower>.<version>.nupkg` (the patched version), else every locked `resolved` as above | `contentHash` when locked |
+//! | `vendor::nuget_feed` (`vendor`, `scan --mode vendored`) | `.socket/vendor/nuget/<uuid>` ([`vendor_uuid_dir`], must be the nuget dir of the key's uuid), or `<idLower>/<version>` below it for a package of a rules_csharp hub | Vendored | the feed's single `<idLower>.<version>.nupkg` (the patched version), else every locked `resolved` as above | `contentHash` when locked |
 //!
 //! The vendored artifact is `.socket/vendor/nuget/<uuid>/<idLower>.
 //! <versionNorm>.nupkg` ([`nupkg_leaf`], the writer's own stable leaf:
-//! lowercased id, version through the SAME `normalize_nuget_version`) — the exact
+//! lowercased id, version through the SAME `normalize_nuget_version`), in
+//! the directory the source's value names — the exact
 //! `VendorArtifact::path` the ledger records, which the CLI's liveness check
 //! compares verbatim. The feed dir is listed for the patched version (one
 //! nupkg for the mapped id; its name is split at the KNOWN id, not guessed
@@ -597,7 +598,15 @@ async fn emit(
         value,
         id,
     } = src;
-    if let Some((eco, dir_uuid)) = vendor_uuid_dir(value) {
+    // The folder of a patch, or the one below it where a rules_csharp hub
+    // has the package (`<idLower>/<version>`), which vendored mode names
+    // for a package of such a hub.
+    let folder = vendor_uuid_dir(value).map(|(eco, uuid)| (eco, uuid, String::new()));
+    let folder = folder.or_else(|| {
+        let below = vendor_ref(value)?;
+        Some((below.eco, below.uuid, format!("{}/", below.leaf)))
+    });
+    if let Some((eco, dir_uuid, below)) = folder {
         if eco != "nuget" || dir_uuid != *uuid {
             // The value is this project's vendor tree, so the key names a
             // Socket patch too — rejected (discover rule 11).
@@ -612,7 +621,7 @@ async fn emit(
             );
             return;
         }
-        emit_vendored(ctx, cfg_rel, src, lock, out).await;
+        emit_vendored(ctx, cfg_rel, src, &below, lock, out).await;
         return;
     }
     match ctx.hosted_uuid(value) {
@@ -735,10 +744,13 @@ fn emit_hosted(
 /// lock's entries at it, if any — and a lock entry at any other version is
 /// reported through [`other_versions`], never as a ref of its own (no
 /// artifact serves it). Without one, the lock's versions are the refs.
+/// `below` is where the feed lies under the folder of the patch: empty,
+/// or a path with a `/` at its end.
 async fn emit_vendored(
     ctx: &DiscoverCtx<'_>,
     cfg_rel: &str,
     src: &SocketSource,
+    below: &str,
     lock: &Lock,
     out: &mut Discovery,
 ) {
@@ -753,7 +765,7 @@ async fn emit_vendored(
     let serves = format!("the vendored feed {VENDOR_DIR}/nuget/{}", src.uuid);
     // (purl version, artifact leaf, integrity, other versions)
     let mut rows: Vec<(String, String, Option<LockIntegrity>, Option<OtherVersion>)> = Vec::new();
-    let leaves = feed_leaves(ctx, &src.uuid, &id_lower).await;
+    let leaves = feed_leaves(ctx, &src.uuid, below, &id_lower).await;
     if let [(leaf, version)] = leaves.as_slice() {
         let norm = normalize_nuget_version(version);
         match locks {
@@ -803,7 +815,7 @@ async fn emit_vendored(
         return;
     }
     for (version, leaf, integrity, other) in rows {
-        let artifact = format!("{VENDOR_DIR}/nuget/{}/{leaf}", src.uuid);
+        let artifact = format!("{VENDOR_DIR}/nuget/{}/{below}{leaf}", src.uuid);
         let (Some(purl), Some(vref)) = (
             simple_purl("nuget", &src.id, &version),
             vendor_ref(&artifact),
@@ -828,16 +840,23 @@ async fn emit_vendored(
 }
 
 /// `(leaf, version)` of every regular `<id>.<version>.nupkg` in the vendored
-/// feed dir (id compared case-insensitively, version digit-leading and in
-/// NuGet's version charset), sorted.
-async fn feed_leaves(ctx: &DiscoverCtx<'_>, uuid: &str, id_lower: &str) -> Vec<(String, String)> {
-    // `uuid` passed the canonical grammar (socket_patch_name_uuid), so the
-    // join cannot escape `.socket/vendor/nuget/`.
+/// feed dir, `below` under the folder of the patch (id compared
+/// case-insensitively, version digit-leading and in NuGet's version
+/// charset), sorted.
+async fn feed_leaves(
+    ctx: &DiscoverCtx<'_>,
+    uuid: &str,
+    below: &str,
+    id_lower: &str,
+) -> Vec<(String, String)> {
+    // `uuid` passed the canonical grammar (socket_patch_name_uuid) and
+    // `below` is a traversal-safe path ([`vendor_ref`]), so the join cannot
+    // escape `.socket/vendor/nuget/`.
     // The vendored feed is a dir of packages: only a disk has one.
     let Some(root) = ctx.disk_root() else {
         return Vec::new();
     };
-    let dir = root.join(VENDOR_DIR).join("nuget").join(uuid);
+    let dir = root.join(VENDOR_DIR).join("nuget").join(uuid).join(below);
     let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
         return Vec::new();
     };
@@ -1063,6 +1082,37 @@ mod tests {
             Some(LockIntegrity::Sri(format!("sha512-{HASH}")))
         );
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    /// The folder a package of a rules_csharp hub lies in, below the folder
+    /// of the patch: the ref names the nupkg there. The folder of another
+    /// patch is rejected, as for the folder itself.
+    #[tokio::test]
+    async fn vendored_below_the_folder_of_the_patch_for_a_hub() {
+        let below = format!("{}/newtonsoft.json/13.0.3", feed(UUID_A));
+        let p = Project::new();
+        let wired = |value: &str| {
+            config(
+                &[ORG, (&socket_key(UUID_A), value)],
+                &[("nuget.org", "*"), (&socket_key(UUID_A), "Newtonsoft.Json")],
+            )
+        };
+        p.write("nuget.config", wired(&below));
+        let entries = [("net8.0", "Newtonsoft.Json", "13.0.3", Some(HASH))];
+        p.write("packages.lock.json", lock(&entries));
+        let nupkg = format!("{below}/newtonsoft.json.13.0.3.nupkg");
+        p.write(&nupkg, "PK");
+        let out = run(&p).await;
+        assert_eq!(out.refs.len(), 1, "{:?}", out.diagnostics);
+        assert_eq!(out.refs[0].artifact_rel.as_deref(), Some(nupkg.as_str()));
+        assert_eq!(out.refs[0].mode, WiringMode::Vendored);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+
+        let other = format!("{}/newtonsoft.json/13.0.3", feed(UUID_B));
+        p.write("nuget.config", wired(&other));
+        let out = run(&p).await;
+        assert!(out.refs.is_empty(), "{:?}", out.refs);
+        assert_eq!(out.diagnostics[0].code, DIAG_REF_INVALID);
     }
 
     /// The leaf uses the writer's version normalization (4th zero segment

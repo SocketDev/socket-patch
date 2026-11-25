@@ -26,7 +26,7 @@ below is about what a package manager installs and builds.
 | Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [Go notes](#go-directory-replaces-and-gosum). Paid hosted patches are unsupported; `redirect_golang_unsupported` names the vendored remedy |
 | Maven (`maven`) — Maven and Gradle | ✅ in place in every copy the build consumes: each `~/.m2` copy it reads and each Gradle `files-2.1` copy; `~/.m2` `.sha1`/`.md5` sidecars are rewritten, Gradle copies get advisories; jar-member records swap in the patch service's whole jar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) | ✅ suffixed Maven repository (`<version>-socket.<hex8>` pin + `.mvn/maven.config` + fallback file repository) for every pom root, single-module or reactor, or Gradle 6.8+ same-GAV repository with settings wiring and SHA-256 checks (a root with both `pom.xml` and a Gradle build wires both); see [JVM vendoring](design/maven-vendoring.md) and [Gradle](#gradle) | ✅ fail-closed by a Socket-only `<version>-socket.<hex8>` suffix: pom projects get a pinned `<version>` (`${property}` versions are refused); Gradle 6.8+ builds get an owned settings script, lock-entry rewrites and a resolution tripwire — see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) |
 | sbt / Mill / scala-cli (`maven`) | ✅ Coursier caches (sbt 1.3+, sbt 2, Mill, scala-cli) and Ivy caches (sbt 0.13–1.2, `useCoursier := false`) patched in place, Coursier checksum sidecars resynced — see [Scala build tools](#scala-build-tools-sbt-mill-scala-cli) | ✅ sbt 0.13.18+: generated `socket-patch-vendor.sbt` over the committed suffixed `.socket/vendor/maven2` tree; scala-cli directory builds: owned `socket-patch.scala` + same-GAV `.socket/vendor/coursier` tree (Linux / macOS); Mill: not wired (agent or hosted guidance) | ✅ sbt 0.13.18+: one generated `socket-patch.sbt`, gated on sbt's own `sbt update` records; Mill / scala-cli: paste-able snippets only (`redirect_mill_manual_snippet`, `redirect_scala_cli_manual_snippet`) |
-| NuGet (`nuget`) | ✅ in-place patching deletes `.nupkg.metadata` and advises on the `.nupkg.sha512` tamper-evidence sidecar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed folder feed (its `.gitignore` re-includes the nupkg against `*.nupkg` rules) + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats). In a Bazel workspace whose rules_csharp `nuget.from_lock` hub would not take the pin (it reads the lock and not that `nuget.config`, or has the package from a lock the run does not re-pin), nothing is written (`redirect_bazel_nuget_config_undeclared`, `redirect_bazel_nuget_lock_not_repinned`); see [Bazel workspaces: NuGet](#bazel-workspaces-nuget) |
+| NuGet (`nuget`) | ✅ in-place patching deletes `.nupkg.metadata` and advises on the `.nupkg.sha512` tamper-evidence sidecar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed folder feed (its `.gitignore` re-includes the nupkg against `*.nupkg` rules) + `packageSourceMapping` + `packages.lock.json` contentHash pin. In a Bazel workspace whose rules_csharp `nuget.from_lock` reads the project's lock, also a block in the root `MODULE.bazel`, or the package is declined (`vendor_nuget_bazel_workspace`); see [Bazel workspaces: NuGet](#vendored-mode-under-a-rules_csharp-hub) | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats). In a Bazel workspace whose rules_csharp `nuget.from_lock` hub would not take the pin (it reads the lock and not that `nuget.config`, or has the package from a lock the run does not re-pin), nothing is written (`redirect_bazel_nuget_config_undeclared`, `redirect_bazel_nuget_lock_not_repinned`); see [Bazel workspaces: NuGet](#bazel-workspaces-nuget) |
 | Composer (`composer`) | ✅ in place (`vendor/`) | ✅ `composer.lock` `dist: path` rewrite; declined in a Bazel workspace, see [Bazel workspaces: Composer](#bazel-workspaces-composer) | ✅ `composer.lock` dist url + shasum rewrite; the entry's `source` and `dist.mirrors` are removed. See [composer-compatibility.md](testing/composer-compatibility.md) |
 | Deno (`deno`) | ✅ in place (the only mode for Deno) | ❌ refused (`vendor_unsupported_ecosystem`) | ❌ not supported |
 
@@ -1763,6 +1763,184 @@ name. Nothing is evaluated and no Bazel is run.
   as it does without Bazel.
 - A pin that an earlier release wrote in such a workspace stays in the two files: `socket-patch
   rollback` takes it out, and the attribute makes the build read it.
+- **A package of the project is vendored.** The block of vendored mode (below) is the hub's
+  last tag, and its `feeds` stand in the place of the config's sources. Hosted mode then
+  writes nothing for another package of the project and says so: vendor that package too, or
+  take the vendored ones out and run the command again.
+
+### Vendored mode under a rules_csharp hub
+
+Vendored mode commits the patched package under `.socket/vendor/nuget/<uuid>/`, names that
+folder as a package source in `nuget.config`, and re-pins the lock. NuGet takes a folder as a
+source. The hub reads the same line as the URL of a feed: after a vendored run that exited 0,
+the next `bazel build` crashed Bazel 9.3.2 in the module extension and failed on 8.8.2 and
+7.7.2 with `Bad URL: .socket/vendor/nuget/...`.
+
+So in the root of a Bazel workspace whose `nuget.from_lock` reads the project's lock, `scan
+--mode vendored`, `get --mode vendored` and `vendor` write three things differently:
+
+- The package lies where a feed of the hub has one:
+  `.socket/vendor/nuget/<uuid>/<id>/<version>/<id>.<version>.nupkg`, with the id in lower case.
+  It is the one copy.
+- `nuget.config` names that directory, `.socket/vendor/nuget/<uuid>/<id>/<version>`, so
+  `dotnet restore` outside Bazel takes the same file.
+- One block is appended to the root `MODULE.bazel`, after one blank line:
+
+```starlark
+# >>> socket-patch: NuGet patches for Bazel (managed block: socket-patch writes and removes it) >>>
+socket_patch_nuget = use_extension("@rules_csharp//csharp:extensions.bzl", "nuget")
+socket_patch_nuget.from_lock(
+    feeds = [
+        "file:.socket/vendor/nuget/<uuid>",
+        "https://api.nuget.org/v3/index.json",
+    ],
+    packages_lock_json = "//:packages.lock.json",
+)
+# <<< socket-patch <<<
+```
+
+The block is a second `nuget.from_lock` of the same hub, after every tag of yours, so its
+`feeds` are the ones the hub asks: first the folder of each vendored patch, which Bazel reads
+from the root of the workspace, then the sources the hub had without the block (those of your
+tag's `nuget_config`, or else its `feeds`). It carries the label of your `use_extension`, your
+`packages_lock_json`, and your hub's `name` where the tag gives one. No call of yours is
+edited, and nothing is written to `.bazelrc` or `.bazelignore`: the folder holds no BUILD
+file, and `bazel query //...` lists what it listed.
+
+The build then takes the committed package and asks no host for it: with the patch host
+unreachable, from a new output base, with the package in no repository cache (rules_csharp
+0.5.0 on Bazel 9.3.2, 8.8.2 and 7.7.2). A committed package that is changed or missing fails
+the build, over the lock's `contentHash` or the sha256 that `MODULE.bazel.lock` records; it is
+never replaced by the upstream package. The one exception is a machine whose repository cache
+holds the package under the sha256 that `MODULE.bazel.lock` records: Bazel builds the cached
+file there, which is the patched one, and does not read the folder. `vendor --check` catches a
+changed or missing copy on every machine. Commit `.socket/vendor`, `nuget.config`, the lock
+and `MODULE.bazel` together.
+
+`vendor --revert`, `rollback` and `remove` take the folder of a patch out of the block, and
+the block goes with its last folder: `MODULE.bazel` is then byte for byte what it was. With
+one vendored patch every other file is too. With several, `nuget.config` can keep the source
+mapping that the first of them created, as it does without Bazel: `vendor --revert` and
+`rollback` leave it, and so does `remove` in the order the patches were vendored.
+
+A block that was changed by hand is not taken out, and then nothing is: the three commands
+fail (`revert_failed`, `vendor_revert_failed`), name the line of the block and leave every
+file as it is. With the lock restored beside such a block, the hub would hold the committed
+package to the upstream `contentHash` and the build would fail. Put the block back as
+socket-patch wrote it, or delete it, and run the command again.
+
+A `nuget.config` that was written anew since the vendored run, and still names the folder, is
+left as it is with a warning (`vendor_lock_entry_drifted`), as without Bazel. Its lock pin and
+its package stay with it, and so does the block: the hub takes the package through the block
+alone, and `dotnet restore` and the Bazel build both keep the patched package.
+
+`vendor --check`, `list` and `vex` see the package as any vendored NuGet package. A later
+vendored run keeps the block in step with your tag: a source you add to `nuget.config`
+reaches the hub once socket-patch has run again. A later patch of the same package takes the
+place of the earlier one's folder in the block.
+
+**Where it declines.** The block is written only where the checkout shows that it works.
+Elsewhere every command that would vendor the package reports it `failed` with
+`vendor_nuget_bazel_workspace` and exits 1; it downloads nothing and writes nothing, and a
+package that is pinned hosted stays pinned. With `--dry-run`, `scan` and `get` list the package
+and exit 0. The message names the reason, with the file and line where there is one, and
+`--mode hosted`. The reasons:
+
+- The project is not the root of its Bazel workspace, or another Bazel workspace lies above
+  it in the checkout.
+- The workspace has more than one `nuget.from_lock`, or socket-patch cannot read with
+  certainty which tags it has.
+- The tag is not a call of its own with every argument written out, or it is called on a
+  `use_extension` that is isolated or a dev dependency.
+- The tag has `local_package_dirs`: the hub asks those directories before every feed, and
+  with the upstream package in one the build fails on the re-pinned lock. Or it has `netrc`
+  or `auth_patterns`, which the block was not built with.
+- Its `nuget_config` cannot be read, or a package source cannot stand in a string.
+- The tag has `feeds` and names a `nuget_config` that has no package source. Vendored mode
+  names its folder in that file, and rules_csharp takes the sources of a `nuget_config` in
+  place of `feeds`: a later run would write the block without those feeds. Name the feeds in
+  the file.
+- `MODULE.bazel.lock` does not show that Bazel selected rules_csharp 0.5.0. Build once, so
+  that Bazel writes its lock.
+- The checkout does not name Bazel 9.3.2, 8.8.2 or 7.7.2 in `.bazelversion` or `.bazeliskrc`.
+  The block rests on Bazel reading a relative `file:` URL from the root of the workspace,
+  which Bazel does not document, and Bazel 9.1.0 has other code for such a URL than its
+  neighbours. So no other release is taken, and a checkout that names none is declined.
+- An rc file of the checkout names `--repository_disable_download` or `--vendor_dir`, or a
+  directory at the root is a vendor directory of Bazel's (it holds `VENDOR.bazel`).
+- An rc file of the checkout names a remote downloader (`--experimental_remote_downloader`),
+  which takes no `file:` feed. By Bazel's source, 7.7.2 hands it the folder, which it cannot
+  read, and 8.8.2 and 9.3.2 download every package of the lock without it. That is read and
+  not built.
+- `MODULE.bazel` is a symbolic link, or its block was changed by hand.
+- `MODULE.bazel` holds the block, and the `nuget.from_lock` it was written beside is gone.
+  The block is a `nuget.from_lock` of the hub itself: it still hands the lock to
+  rules_csharp, with the folders of the packages vendored before as its feeds, and a package
+  vendored now would not be among them. Put the tag back, or take the vendored packages out
+  with `socket-patch vendor --revert`, and run the command again.
+- No tag that reads the lock is found, and one may be hidden. `MODULE.bazel`, or a file it
+  includes, is there and is not read as a whole: a link that leads out of the workspace, a
+  file over 1 MiB, one that is not UTF-8 or cannot be parsed, an `include` that is not
+  followed. Or the workspace names rules_csharp, and a part of those files cannot be read
+  with certainty: an `include` of a file that does not exist, a use of the extension that is
+  no call of a tag. A hub that such a part declares does not get the package, and its build
+  fails: on the upstream package, which no longer matches the re-pinned lock, or on the
+  folder that `nuget.config` names, which it reads as a URL. The message names what could
+  not be read.
+- A lock spells the package's version otherwise than NuGet writes it (`1.2.3.0` for `1.2.3`).
+  The hub asks its feeds for the version as the lock spells it, and the folder of the patch
+  holds the version as `dotnet restore` writes it. Run `dotnet restore`, which rewrites the
+  lock.
+
+`--allow-vendored-in-bazel` (or `SOCKET_ALLOW_VENDORED_IN_BAZEL=1`) lifts the decline. The
+package is then vendored as in a project without Bazel, which the hub does not take: that is
+for a project whose lock a tag names and which Bazel does not build. A package that was
+vendored that way, or by an earlier release, stays as it is on later runs, without a block;
+`vendor --revert` and a new vendored run give it the layout above.
+
+Nothing changes for a NuGet project in no Bazel workspace, and for one whose locks neither a
+`nuget.from_lock` nor the block reads, where no tag can be hidden: the package lies in the
+folder of the patch, and no line of `MODULE.bazel` is written. That includes a workspace that
+does not name rules_csharp and whose files are all read as a whole: a part of them that
+cannot be read with certainty is then about no hub. For a project that Bazel does not build
+and that is declined all the same, pass `--allow-vendored-in-bazel`, or set
+[`SOCKET_NO_BAZEL`](#bazel-workspaces-a-project-that-bazel-does-not-build).
+
+**Limits.**
+
+- The block works in the root module only. In a workspace that depends on this one as a
+  module, Bazel reads the folder from the other root and the build fails. Hosted mode works
+  there.
+- A module this workspace depends on may have a `nuget.from_lock` of its own with
+  `nuget_config` or `feeds`. The hub takes that tag after the block and drops the block's
+  feeds, and the build fails on the re-pinned lock. Hosted mode fails the same way there.
+- A build with `--nofetch` in an output base that built the unpatched project, and a build
+  from a vendor directory made before the patch (`--vendor_dir` with `--nofetch`), build the
+  unpatched package and exit 0, with a warning of Bazel's. Such a build still rewrites
+  `MODULE.bazel.lock` to the pins of the patched package. Fetch again, or run `bazel vendor`
+  again. socket-patch sees `--vendor_dir` and `--repository_disable_download` in an rc file
+  and a vendor directory at the root of the workspace; it does not see `--nofetch`, in an rc
+  file or on a command line.
+- A checkout that is deleted and made again at the same path under a running Bazel server
+  does not find the committed package until the server has restarted (`bazel shutdown`). The
+  build fails; it does not take the upstream package.
+- `MODULE.bazel.lock` is stale right after the run, as after a hosted run: a build with
+  `--lockfile_mode=error` fails until a build that may update the lock has run and the lock
+  is committed. That build needs a registry for the other packages and no patch host.
+- When the module extension runs, Bazel prints three `WARNING: Download from file:...` lines
+  for every other package of the lock, which the folder does not hold, for each vendored
+  patch.
+- A source you add to `nuget.config` reaches the hub only after socket-patch has run again.
+- An earlier release of socket-patch does not know the layout or the block. On a checkout
+  that this one vendored, its `vendor --check` fails (`vendor_check_failed`), its vendored
+  run writes a second copy of the package in the folder of the patch, and its
+  `vendor --revert` exits 0, restores the lock and leaves the block and the package: the Bazel
+  build then fails on the lock's `contentHash` (measured on Bazel 9.3.2). Undo with the
+  release that vendored.
+- Measured on macOS arm64, with packages that carry no signature.
+
+[`e2e_bazel_build/nuget.rs`](../crates/socket-patch-cli/tests/e2e_bazel_build/nuget.rs) runs
+the vendored flow on a real Bazel: `nuget::vendored_from_lock`.
 
 ## Gradle
 
@@ -2175,7 +2353,7 @@ workspace and that Bazel does not build keeps the matrix at the top.
 | Go: gazelle `go_deps.from_file` over `go.mod` | Supported | Supported | Not supported | Supported with a hosted or vendored patch |
 | RubyGems: rules_ruby `ruby.bundle_fetch` over `Gemfile.lock` | Supported with no `gem_checksums` on the call, or with one written out in the call that does not name the gem or holds it to the patched gem's sha256 | Not supported | Not supported | Supported |
 | Cargo: rules_rust `crate.from_cargo` over `Cargo.lock` | Supported with `cargo_config` on the hub | Supported | Not supported | Supported |
-| NuGet: rules_csharp `nuget.from_lock` over `packages.lock.json` | Supported with `nuget_config` on the tag | Not supported | Not supported | Supported; for a hosted patch, with no restored copy on the machine |
+| NuGet: rules_csharp `nuget.from_lock` over `packages.lock.json` | Supported with `nuget_config` on the tag | Supported with the Bazel release in `.bazelversion` | Not supported | Supported; for a hosted patch, with no restored copy on the machine |
 | Composer: a rule of your own that runs `composer install` from `composer.lock` | Supported | Not supported | Not supported | Supported with a hosted patch |
 | Maven: rules_jvm_external `maven.install` with a `lock_file` | Supported with Bazel 7.4.0 or later | Supported with Bazel 7.4.0 or later | Not supported | Supported |
 
@@ -2258,7 +2436,13 @@ What the table was tested with:
   `packages_lock_json = "//:packages.lock.json"` and `nuget_config = "//:nuget.config"`.
   `scan` finds a NuGet package only where a restore unpacked it (NuGet's global packages
   folder, a folder that an `obj/project.assets.json` records, or a `packages` folder): on a
-  machine where only Bazel ever ran it finds none, exits 0 and writes nothing.
+  machine where only Bazel ever ran it finds none, exits 0 and writes nothing. Vendored mode
+  was tested for that one tag, with the project at the root of the workspace, a
+  `.bazelversion` that names one of the three releases, and the `MODULE.bazel.lock` of a
+  build. It keeps a block in `MODULE.bazel` there, and where the checkout does not show that
+  the block works it declines the package and writes nothing:
+  [Bazel workspaces: NuGet](#vendored-mode-under-a-rules_csharp-hub) has the block, every
+  reason to decline and the limits.
 - **Composer**: no ruleset builds PHP, so the two shapes are rules a project writes itself: a
   repository rule that runs `composer install` from the committed `composer.lock` and takes
   the lock with `rctx.read`, and a genrule that runs it in a build action. Composer 2 and PHP
@@ -2284,10 +2468,6 @@ fails until one that may has rewritten it.
 
 Known problems. In each of these a command exits 0 today and the next Bazel build fails:
 
-- **Vendored mode for NuGet.** The path of the committed copy means nothing where Bazel
-  runs: rules_csharp reads it as a URL (`Bad URL`, or a crash of Bazel 9.3.2). Run
-  `socket-patch vendor --revert`, then `socket-patch scan --mode hosted`. Measured by hand on
-  the three Bazel releases; no test of this repository runs that build.
 - **Vendored mode for Composer, where its refusal is lifted or does not apply.** In a Bazel
   workspace vendored mode declines a Composer package:
   [Bazel workspaces: Composer](#bazel-workspaces-composer) has the refusal, what lifts it and
@@ -2295,6 +2475,18 @@ Known problems. In each of these a command exits 0 today and the next Bazel buil
   rule runs in another directory fails the build with `Source path ... is not found`. Run
   `socket-patch vendor --revert`, then `socket-patch scan --mode hosted`. A test of this
   repository builds that failure on the three Bazel releases.
+- **Vendored mode for NuGet, where its refusal is lifted or does not see the cause.** For a
+  package of a rules_csharp hub, vendored mode keeps a block in `MODULE.bazel` or declines:
+  [Bazel workspaces: NuGet](#vendored-mode-under-a-rules_csharp-hub) has both. With
+  `--allow-vendored-in-bazel`, and for a package that an earlier release vendored, the folder
+  stands in `nuget.config` alone, rules_csharp reads it as a URL, and the build fails
+  (`Bad URL`, or a crash of Bazel 9.3.2; measured on the three Bazel releases). Run
+  `socket-patch vendor --revert`, then `socket-patch scan --mode vendored` without the
+  switch, or `--mode hosted`. With the block, the build fails in two shapes that the checkout
+  does not show: a workspace that depends on this one as a module, and a module this one
+  depends on that has a `nuget.from_lock` with sources of its own. It also fails after the
+  `vendor --revert` of an earlier release, which leaves the block and the package beside the
+  restored lock: undo with the release that vendored.
 - **A hosted Cargo pin that is already in the files, on a hub without `cargo_config`**, which
   is the hub as the rules_rust README shows it: the hub's cargo does not see the patch
   registry that `.cargo/config.toml` defines
@@ -2352,6 +2544,12 @@ In these a command exits 0 and the Bazel build passes on the unpatched package:
 - **Hosted NuGet on a machine without a restore.** `scan` reads no package out of
   `packages.lock.json`, so where only Bazel ever ran it finds none and writes nothing. Run it
   where `dotnet restore` has run.
+- **Vendored NuGet in a build that may not fetch.** `--nofetch` in an output base that built
+  the unpatched project, and `--vendor_dir` with `--nofetch` over a vendor directory made
+  before the patch, build the package Bazel already has, with a warning of Bazel's. Fetch
+  again, or run `bazel vendor` again. Vendored mode declines where it sees a vendor directory
+  at the root of the workspace or `--vendor_dir` in an rc file; it does not see `--nofetch`,
+  in an rc file or on a command line.
 - **Go, when another Bazel module of the build requires a higher version** of the patched
   module: gazelle builds that version and drops the replacement. With
   `go_deps.config(check_direct_dependencies = "error")` and the module required directly in
@@ -2404,6 +2602,11 @@ projects too. What the sections below then do for it:
 - PyPI and RubyGems: vendored mode is declined where a hub call of the workspace reads the
   project's lock, or may read it
   ([Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode)).
+- NuGet: for a package whose lock a rules_csharp `nuget.from_lock` reads, vendored mode
+  keeps a block in the root `MODULE.bazel`, or declines the package where it cannot show
+  that the block works. It also declines a package whose lock such a tag may read, behind a
+  part of the workspace files that is not read
+  ([Bazel workspaces: NuGet](#vendored-mode-under-a-rules_csharp-hub)).
 - Go, Cargo and Maven: the `.bazelignore` at the Bazel root gets two lines for each kind of
   copy under `.socket` that a run wrote: the Go module copies, the vendored crates of a crate
   hub, the jars that vendored mode keeps for a rules_jvm_external hub
@@ -2464,6 +2667,11 @@ What an earlier run wrote for Bazel is still listed and undone with the variable
   Beside a Maven or Gradle build the hub's directory is a copy that only a `vendor` run
   without the variable writes: one that was lost stays lost, `vendor --check` names it, and
   the undo still takes its entry out.
+- The block that vendored mode keeps there for the NuGet packages of a rules_csharp hub
+  ([Bazel workspaces: NuGet](#vendored-mode-under-a-rules_csharp-hub)): `vendor --revert`,
+  `rollback` and `remove` take the folder of a patch out of it, and the block with its last
+  folder, as they do without the variable. No folder is added: a vendored run writes a
+  package as in a checkout without the workspace file.
 - The `.bazelignore` lines: no pair is added, and the pair of a copy that is gone is removed
   by the command that removed the copy (`rollback`, `remove`, `vendor --revert`, `repair`, a
   scan).
@@ -4009,6 +4217,9 @@ write for any package it would decline because the project is in a Bazel workspa
 build may not find the vendored copy. PyPI and RubyGems have such a refusal too, for a project
 whose lock a hub of the workspace reads: see
 [Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode).
+So has NuGet, for a package of a rules_csharp hub whose block cannot be shown to work
+(`vendor_nuget_bazel_workspace`, see
+[Bazel workspaces: NuGet](#vendored-mode-under-a-rules_csharp-hub)).
 
 `vendor --revert` is never declined. Neither is a package of a project that uses vendored
 mode already, by a release before this refusal or with the flag:
@@ -4860,11 +5071,12 @@ patched:
 - **A PyPI patch committed under `.socket/vendor`** (vendored mode), when such a call names
   the file that points at the copy. rules_python 2.5.0-rc4 takes the path of the line for
   the name of a project, and the build of everything the hub serves fails (same three
-  releases). A vendored npm tarball is built by rules_js and a vendored crate by rules_rust,
-  and each keeps its statement. So do a vendored gem and a vendored NuGet package, for
-  other reasons: rules_ruby builds a gem only when the call lists every file of the copy
-  among its `srcs`, which is not read, and no test here runs the build of a NuGet package
-  yet, so nothing is said of either.
+  releases). A vendored npm tarball is built by rules_js, a vendored crate by rules_rust and
+  a vendored NuGet package by rules_csharp, through the block that vendored mode keeps in
+  `MODULE.bazel`, and each keeps its statement. `vex` does not read that block: a vendored
+  NuGet package keeps its statement without it too (the list at the end of this section).
+  So does a vendored gem, for another reason: rules_ruby builds a gem only when the call
+  lists every file of the copy among its `srcs`, which is not read, so nothing is said of it.
   Vendored mode declines a PyPI package and a gem by default where the hub reads the file
   ([Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode)),
   so this is the state of a project vendored with `--allow-vendored-in-bazel` or by an
@@ -5066,11 +5278,12 @@ Three more flows hold the document of `vex` to their patched build on the same r
 after a hosted scan: Cargo through rules_rust's `crate.from_cargo` with `cargo_config` (and
 after a vendored scan), Composer through a rule or a genrule of the project's own that runs
 `composer install` from the lock, and NuGet through rules_csharp's `nuget.from_lock` with
-`nuget_config`, on a machine whose NuGet folder does not hold the package. For Cargo and
-NuGet a flow of agent mode holds the documents to the unpatched build as well: the run
-(`--vex`), `vex` and `vex --no-verify` each write one `affected` statement, and
-`vex --no-bazel` one `not_affected` statement. For these, and for a Maven entry in
-`MODULE.bazel`,
+`nuget_config`, on a machine whose NuGet folder does not hold the package (and after a
+vendored scan that kept its block in `MODULE.bazel`, on the machine that restored the
+project as well: `vex` reads the committed package). For Cargo and NuGet a flow of agent
+mode holds the documents to the unpatched build as well: the run (`--vex`), `vex` and
+`vex --no-verify` each write one `affected` statement, and `vex --no-bazel` one
+`not_affected` statement. For these, and for a Maven entry in `MODULE.bazel`,
 [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported) says what the
 document does not show.
 
@@ -5121,9 +5334,13 @@ the build is broken):
   is listed. Measured on the three releases: the build fails, and the statement still says
   `not_affected`. Vendored mode declines such a gem by default, so this is the state of a
   project vendored with `--allow-vendored-in-bazel` or by an earlier release.
-- **Vendored mode for NuGet** beside `nuget.from_lock`. rules_csharp 0.5.0 reads the path of
-  the committed copy as a URL. Measured by hand, where the build fails; no test runs it yet,
-  so the statement is left as it is.
+- **Vendored mode for NuGet** beside `nuget.from_lock`, where the package is vendored and
+  `MODULE.bazel` does not hold its block: a run with `--allow-vendored-in-bazel`, a package
+  that an earlier release vendored, a block that was taken out by hand. rules_csharp 0.5.0
+  then reads the path of the committed copy as a URL. `vex` reads
+  `nuget.config`, the lock and the committed package, and not the block. Measured for the
+  first two, where the build fails. With the block in place, a build that may not fetch
+  (`--nofetch`) can build the unpatched package while the statement says `not_affected`.
 - **A vendored package whose own files the hub does not read**, while the lock the hub does
   read still lists the registry's package: a uv or Poetry project vendored through
   `pyproject.toml` and its lock while `pip.parse` reads a requirements file exported before;

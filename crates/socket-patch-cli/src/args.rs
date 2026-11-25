@@ -430,13 +430,15 @@ pub struct GlobalArgs {
     /// a package by default: a Composer package
     /// (`vendor_composer_bazel_workspace`), whose lock names the copy by a
     /// path that a Bazel rule running `composer install` in another
-    /// directory does not find, and a PyPI or RubyGems package whose lock
-    /// a rules_python or rules_ruby hub of the workspace reads
+    /// directory does not find; a PyPI or RubyGems package whose lock a
+    /// rules_python or rules_ruby hub of the workspace reads
     /// (`vendor_pypi_bazel_hub`, `vendor_gem_bazel_hub`), which builds
-    /// nothing from a lock that names a copy under `.socket/vendor`. Pass
-    /// it when the build does find the copy, or does not take the
-    /// project's packages from that lock. Other subcommands accept it
-    /// silently.
+    /// nothing from a lock that names a copy under `.socket/vendor`; and a
+    /// NuGet package of a rules_csharp hub where the `MODULE.bazel` block
+    /// that makes the hub take the copy cannot be shown to work
+    /// (`vendor_nuget_bazel_workspace`). Pass it when the build does find
+    /// the copy, does not take the project's packages from that lock, or
+    /// does not build the project. Other subcommands accept it silently.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long = "allow-vendored-in-bazel",

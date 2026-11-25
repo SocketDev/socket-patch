@@ -19,8 +19,9 @@
 //! rules_ruby 1.0.0-rc2 fails the build on a vendored gem (same three
 //! releases) unless the call lists every file of the copy among its
 //! `srcs`, which it copies beside the Gemfile: `srcs` is not read here, so
-//! a vendored gem is not judged. What rules_csharp does with a vendored
-//! package no test here builds, so that is not judged either.
+//! a vendored gem is not judged. rules_csharp builds a vendored package
+//! through the block that vendored mode keeps in `MODULE.bazel`
+//! ([`super::nuget`]), which is not read here either.
 //!
 //! A sixth, rules_jvm_external, takes each jar that the lock of a hub pins
 //! (`maven.install`) at the lock's sha256: from a repository of the lock,
@@ -194,7 +195,7 @@ struct Hub {
     /// Whether a call of the tag may build a package from a line that
     /// points at a copy under `.socket/vendor`: rules_js and rules_rust
     /// do, rules_ruby does when the call lists the files of the copy, and
-    /// of rules_csharp no test here has shown that it does not.
+    /// rules_csharp does through the block of vendored mode.
     builds_vendored: bool,
     /// The attributes that name a file beside the lock, where a pin in
     /// the lock does not name its patch. The calls of such a tag make one

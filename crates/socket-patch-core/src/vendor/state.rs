@@ -1297,6 +1297,7 @@ async fn wiring_file_refusal(rec: &WiringRecord, project_root: &Path) -> Option<
             one_of(&crate::patch::redirect::NUGET_CONFIG_FILE_NAMES)
         }
         "nuget_lock_entry" => super::nuget_feed::ledger_lock_file_refusal(project_root, file),
+        super::nuget_feed::BAZEL_WIRING_KIND => one_of(&[crate::bazel::nuget::FILE]),
         "maven_pom_repository" => one_of(&[super::jvm::layout::POM_FILE]),
         // The JVM kinds: `jvm::apply` checks each record's path against its
         // kind before it reads anything. Any other kind is a newer build's.
@@ -2809,6 +2810,7 @@ mod tests {
             ("nuget", "nuget_config_source", "NuGet.Config"),
             ("nuget", "nuget_lock_entry", "src/App/packages.lock.json"),
             ("nuget", "nuget_lock_entry", "packages.App.lock.json"),
+            ("nuget", "nuget_bazel_feed", "MODULE.bazel"),
             ("maven", "maven_pom_repository", "pom.xml"),
         ];
         for (ecosystem, kind, file) in passes {
@@ -2844,6 +2846,8 @@ mod tests {
             ("nuget", "nuget_config_source", "Directory.Build.props"),
             ("nuget", "nuget_lock_entry", "tools/build.json"),
             ("nuget", "nuget_lock_entry", ".config/packages.lock.json"),
+            ("nuget", "nuget_bazel_feed", "BUILD.bazel"),
+            ("nuget", "nuget_bazel_feed", "svc/MODULE.bazel"),
             ("maven", "maven_pom_repository", "module/pom.xml"),
         ];
         for (ecosystem, kind, file) in refused {
