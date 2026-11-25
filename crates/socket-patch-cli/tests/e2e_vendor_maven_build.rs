@@ -860,7 +860,28 @@ mod mediation {
         assert_eq!(code, Some(0), "revert: {env}\n{stderr}");
         assert_eq!(read_poms(&proj), pristine, "the revert restores every pom");
         assert!(!proj.join(".socket/vendor/maven2").exists(), "{env}");
-        assert!(!proj.join(".mvn").exists(), "{env}");
+        assert_no_vendor_residue_in_mvn(&mvn, &proj, &env);
+    }
+
+    /// Nothing the vendor run wrote is left under `.mvn`. Maven 4 keeps
+    /// its project-local repository in `.mvn/target/`: that is the
+    /// build's, the revert leaves it, and it is the only entry allowed
+    /// (#2158). Maven 3 writes nothing there, so `.mvn` itself must go.
+    fn assert_no_vendor_residue_in_mvn(mvn: &Mvn, proj: &Path, env: &serde_json::Value) {
+        let dot_mvn = proj.join(".mvn");
+        if mvn.major() < 4 {
+            assert!(!dot_mvn.exists(), "{env}");
+            return;
+        }
+        let left: Vec<_> = match std::fs::read_dir(&dot_mvn) {
+            Ok(entries) => entries
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| name != "target")
+                .collect(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => panic!("{}: {err}", dot_mvn.display()),
+        };
+        assert!(left.is_empty(), ".mvn still holds {left:?}: {env}");
     }
 
     /// A pin in a shared parent must go once a module below it resolves
@@ -1011,7 +1032,7 @@ mod mediation {
             fixture::module_pom("c", fixture::VICTIM, fixture::BASE),
             "c/pom.xml"
         );
-        assert!(!proj.join(".mvn").exists(), "{env}");
+        assert_no_vendor_residue_in_mvn(&mvn, &proj, &env);
     }
 
     fn skip_of<'e>(env: &'e serde_json::Value) -> Option<&'e serde_json::Value> {
