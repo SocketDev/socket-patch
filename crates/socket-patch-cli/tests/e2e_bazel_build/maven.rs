@@ -49,6 +49,29 @@
 //!   (`maven_bazel_no_effect`), and the build prints that target's marker
 //!   before and after.
 //!
+//! - [`a_vendored_patch_in_a_tree_only_bazel_builds`]: vendored mode in the
+//!   checkout without a `pom.xml`. `socket-patch get <purl> --mode vendored
+//!   --yes` downloads the patched jar once, from Socket's patch service,
+//!   and commits it: the jar and the two files that make its directory a
+//!   Bazel repository under `.socket/vendor/maven/<patch id>`, the block of
+//!   [`vendored_block`] in `MODULE.bazel`, which puts that directory in the
+//!   place of the hub's repository, the directory's line in `.bazelignore`
+//!   and the vendor ledger. The same build prints the marker of the patched
+//!   jar and asks no host for it; `bazel query //...` lists no package
+//!   under `.socket`; a `--lockfile_mode=error` build passes; `vex` attests
+//!   the patch. `vendor --check` passes, and fails for a committed jar
+//!   that is not the patched one, which Bazel builds all the same: nothing
+//!   checks a directory at build time. A second machine, with the
+//!   stand-in stopped, builds the patched jar from the checkout alone, and
+//!   the repository cache holds no copy of it. `vendor --revert` puts
+//!   every file back byte for byte, and the upstream build with them.
+//! - [`a_hub_goes_from_hosted_to_vendored_and_back`]: after the hosted
+//!   command, `socket-patch vendor` puts the vendored entry in the place
+//!   of the hosted one, and the build takes the jar of the checkout; the
+//!   hosted command then takes the vendored entry, its directory and its
+//!   ledger entry out again, and the checkout is the one the first hosted
+//!   command left; `rollback` undoes a vendored patch to the byte.
+//!
 //! A command that writes the block gives no warning. One that does not
 //! gives one, in the place of "no pom.xml", with the reason and the words
 //! that the Bazel build keeps the upstream jar. The lock each ruleset
@@ -96,14 +119,19 @@
 use std::io::Write as _;
 use std::time::Instant;
 
+use base64::Engine as _;
+
 use serde_json::{json, Value};
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use socket_patch_core::bazel::maven::{Lock, Pinned as Jar};
+use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes as git_sha256;
 
 use crate::envelope::{event_for, event_triples};
-use crate::harness::{changed, rewrite, Cell, Fixture, Ran, StandIn, Tree, CONSUMER, NOTHING};
-use crate::hosted_memory_common::Patch;
+use crate::harness::{
+    changed, rewrite, Cell, Claim, Fixture, How, Ran, StandIn, Tree, CONSUMER, NOTHING,
+};
+use crate::hosted_memory_common::{Patch, ORG};
 
 /// The workspace the tests build, and the ruleset each Bazel release
 /// builds it with. One era per way the ruleset names an artifact's
@@ -241,6 +269,9 @@ struct Granted {
     /// stand-in.
     url: String,
     route: String,
+    /// The route of the same jar as vendored mode downloads it: the path of
+    /// the grant's own URL for it on the patch host.
+    archive: String,
     /// What `//:consumer` prints with the patched jar.
     marker: String,
 }
@@ -251,7 +282,12 @@ struct Granted {
 /// on `standin` answers with `tampered`, or with the jar the grant pins.
 /// Gives the patch for the API of the stand-in too, which takes every
 /// patch it grants in one call ([`StandIn::api`]).
-fn grant(standin: &StandIn, version: &str, tampered: Option<&[u8]>) -> (Granted, Patch) {
+///
+/// Vendored mode downloads that jar from the grant's own URL for it, whose
+/// host a flow sends to the stand-in, and holds it to the record of the
+/// patch, which the stand-in serves: the one file that differs from the
+/// upstream jar of the run `run` at that version.
+fn grant(standin: &StandIn, run: &str, version: &str, tampered: Option<&[u8]>) -> (Granted, Patch) {
     let uuid = uuid::Uuid::new_v4().to_string();
     let token = uuid::Uuid::new_v4().to_string();
     let purl = format!("pkg:maven/{GROUP}/{VICTIM}@{version}");
@@ -261,9 +297,12 @@ fn grant(standin: &StandIn, version: &str, tampered: Option<&[u8]>) -> (Granted,
     let file = repo_path(VICTIM, &suffixed, "jar");
     let route = format!("/{registry}/{file}");
     standin.serve(5, &route, tampered.unwrap_or(&jar));
-    let artifact = format!(
-        "https://{PATCH_HOST}/patch/maven/{GROUP}/{VICTIM}/{version}/{token}/{uuid}/{VICTIM}-{suffixed}.jar"
-    );
+    let archive =
+        format!("/patch/maven/{GROUP}/{VICTIM}/{version}/{token}/{uuid}/{VICTIM}-{suffixed}.jar");
+    standin.serve(5, &archive, &jar);
+    let artifact = format!("https://{PATCH_HOST}{archive}");
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let sha512 = format!("sha512-{}", b64(&Sha512::digest(&jar)));
     let reference = json!({
         "status": "granted",
         "url": artifact,
@@ -271,7 +310,7 @@ fn grant(standin: &StandIn, version: &str, tampered: Option<&[u8]>) -> (Granted,
         "artifacts": [{
             "kind": "tarball",
             "url": artifact,
-            "integrity": { "sha256": sha256_hex(&jar) },
+            "integrity": { "sha256": sha256_hex(&jar), "sha512": sha512 },
         }],
         "registryOverride": {
             "kind": "maven2",
@@ -291,11 +330,37 @@ fn grant(standin: &StandIn, version: &str, tampered: Option<&[u8]>) -> (Granted,
         uuid: uuid.clone(),
         reference,
     };
+    // The upstream jar of a run prints its release from the bump on.
+    let upstream = match version {
+        VERSION => format!("PRISTINE {run}\n"),
+        _ => format!("PRISTINE {version} {run}\n"),
+    };
+    let patched = format!("PATCHED {uuid}\n");
+    let record = json!({
+        "uuid": uuid,
+        "purl": patch.purl,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": { MARKER: {
+            "beforeHash": git_sha256(upstream.as_bytes()),
+            "afterHash": git_sha256(patched.as_bytes()),
+            "blobContent": b64(patched.as_bytes()),
+            "beforeBlobContent": b64(upstream.as_bytes()),
+        }},
+        "vulnerabilities": { "GHSA-test-aaaa-bbbb": {
+            "cves": ["CVE-2024-0001"], "summary": "s", "severity": "high", "description": "d",
+        }},
+        "description": "fixture",
+        "license": "MIT",
+        "tier": "free",
+    });
+    let view = format!("/v0/orgs/{ORG}/patches/view/{uuid}");
+    standin.serve(1, &view, record.to_string().as_bytes());
     let granted = Granted {
         version: version.to_string(),
         sha256: sha256_hex(&jar),
         url: format!("https://{registry}/{file}"),
         route,
+        archive,
         marker: format!("OUT: PATCHED {uuid}"),
         uuid,
     };
@@ -403,8 +468,8 @@ impl Pinned {
             &jar(&[]),
             Some((VICTIM, VERSION)),
         );
-        let (patch, first) = grant(&standin, VERSION, None);
-        let (next, second) = grant(&standin, BUMPED, None);
+        let (patch, first) = grant(&standin, &run, VERSION, None);
+        let (next, second) = grant(&standin, &run, BUMPED, None);
         standin.api(&[first, second]);
 
         // The checkout: the hub's repository is the stand-in, the lock is
@@ -503,6 +568,14 @@ impl Pinned {
             ("COURSIER_CACHE", &coursier),
         ];
         cell.socket_patch(&standin.origin(), args, &env)
+    }
+
+    /// `socket-patch <args>` for a command of vendored mode, which downloads
+    /// the patched jar from the URL the grant has for it on the patch host:
+    /// that host is the stand-in here.
+    fn vendored(&self, args: &[&str]) -> Ran {
+        let origin = self.standin.origin();
+        self.socket_patch(&[args, &["--patch-server-url", &origin]].concat())
     }
 
     /// The command where it writes no entry for the hub, in a tree without
@@ -619,7 +692,7 @@ impl Pinned {
         let mut twin = self.cell.twin();
         let rogue = StandIn::start();
         let tampered = victim("TAMPERED");
-        let (other, served) = grant(&rogue, VERSION, Some(&tampered));
+        let (other, served) = grant(&rogue, &self.run, VERSION, Some(&tampered));
         rogue.api(&[served]);
         let host = format!("{PATCH_HOST}/");
         twin.route_downloads(&[
@@ -914,6 +987,307 @@ fn a_version_bump_of_the_patched_artifact() {
         flow.cell.release(),
         flow.upstream,
         flow.next.marker,
+        flow.started.elapsed()
+    );
+}
+
+/// The command of vendored mode.
+const VENDORED: [&str; 5] = ["get", PURL, "--mode", "vendored", "--yes"];
+/// The pair that keeps the directory of the committed jars out of the
+/// packages of the workspace, as the `.bazelignore` the command creates.
+const JARS_IGNORED: &str =
+    "# socket-patch: patched Maven jars for a Bazel hub, not Bazel packages \
+                            (to opt out, comment out the next line)\n.socket/vendor/maven\n";
+
+/// The block of `MODULE.bazel` for `patch` in vendored mode, with its last
+/// line break: the repository is the directory of the patch in the
+/// checkout, and no host is named.
+fn vendored_block(patch: &Granted) -> String {
+    let uuid = &patch.uuid;
+    format!(
+        r#"# >>> socket-patch: Maven patches for Bazel (managed block: socket-patch writes and removes it) >>>
+socket_patch_local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
+
+socket_patch_maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+
+# {PURL}, Socket patch {uuid}
+socket_patch_local_repository(
+    name = "socket_patch_{REPOSITORY}",
+    path = ".socket/vendor/maven/{uuid}",
+)
+
+# If Bazel stops at the next line ("does not generate repository"), the hub's lock no longer pins
+# {GROUP}:{VICTIM} at {VERSION}: run `socket-patch rollback {PURL}`.
+# Do not change it to inject_repo(): the build would pass without the patch.
+override_repo(
+    socket_patch_maven,
+    {REPOSITORY} = "socket_patch_{REPOSITORY}",
+)
+# <<< socket-patch <<<
+"#
+    )
+}
+
+impl Pinned {
+    /// The committed jar of the patch, from the checkout.
+    fn committed_jar(&self) -> String {
+        let uuid = &self.patch.uuid;
+        format!(".socket/vendor/maven/{uuid}/file/{VICTIM}-{VERSION}.jar")
+    }
+
+    /// A finished command of vendored mode, `ran`, in a checkout whose
+    /// files were `before`: it vendored the one patch and warned of
+    /// nothing, and wrote the directory of the patch with the jar the
+    /// grant pins, the block after one blank line, the line of
+    /// `.bazelignore` and the ledger, and no other file. Gives the files of
+    /// the checkout.
+    fn vendored_by(&self, ran: &Ran, before: &Tree) -> Tree {
+        let (test, said) = (&self.cell.test, &ran.dump);
+        assert_eq!(ran.code, 0, "{test}: {said}");
+        assert_eq!(ran.envelope["status"], "success", "{test}: {said}");
+        assert_eq!(ran.envelope["summary"]["applied"], 1, "{test}: {said}");
+        assert_eq!(ran.envelope["warnings"], Value::Null, "{test}: {said}");
+        let unit = format!(".socket/vendor/maven/{}", self.patch.uuid);
+        let written = [
+            ".bazelignore".to_string(),
+            format!("{unit}/.gitignore"),
+            format!("{unit}/REPO.bazel"),
+            format!("{unit}/file/BUILD.bazel"),
+            self.committed_jar(),
+            ".socket/vendor/state.json".to_string(),
+            MODULE.to_string(),
+        ];
+        let vendored = self.cell.tree();
+        assert_eq!(changed(before, &vendored), written, "{test}: {said}");
+        let text =
+            |tree: &Tree, file: &str| String::from_utf8(tree[file].clone()).expect("a text file");
+        let with_block = format!("{}\n{}", text(before, MODULE), vendored_block(&self.patch));
+        assert_eq!(text(&vendored, MODULE), with_block, "{test}: {said}");
+        assert_eq!(text(&vendored, ".bazelignore"), JARS_IGNORED, "{test}");
+        let build = format!(
+            "filegroup(\n    name = \"file\",\n    srcs = [\"{VICTIM}-{VERSION}.jar\"],\n    \
+             visibility = [\"//visibility:public\"],\n)\n"
+        );
+        assert_eq!(text(&vendored, &written[3]), build, "{test}");
+        let jar = sha256_hex(&vendored[&written[4]]);
+        assert_eq!(jar, self.patch.sha256, "{test}: not the jar the grant pins");
+        vendored
+    }
+
+    /// The build of a vendored checkout: it prints the marker of the
+    /// patched jar and changes no file of `vendored`, Bazel's lock
+    /// included; a `--lockfile_mode=error` build passes; and no jar was
+    /// asked of the patch host or of the hub's repository for it.
+    fn builds_the_committed_jar(&self, vendored: &Tree) {
+        let test = &self.cell.test;
+        let asked = |route: &String| self.standin.asked(route);
+        let before = [&self.patch.route, &self.upstream_route].map(asked);
+        self.cell.builds_patched(vendored, &self.patch.marker);
+        let after = [&self.patch.route, &self.upstream_route].map(asked);
+        assert_eq!(after, before, "{test}: the build fetched a jar");
+        assert_eq!(after[0], 0, "{test}: the patch host was asked for the jar");
+    }
+}
+
+/// Vendored mode in a checkout that only Bazel builds: the command commits
+/// the patched jar and the block that puts its directory in the place of
+/// the hub's repository, the build is patched from the checkout alone, the
+/// audit holds the committed jar to the patch, and the undo puts every
+/// file back.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn a_vendored_patch_in_a_tree_only_bazel_builds() {
+    let test = "maven::a_vendored_patch_in_a_tree_only_bazel_builds";
+    let Some(flow) = Pinned::open(test, false, &|_, _| {}) else {
+        return;
+    };
+    let before = flow.builds_upstream();
+    // As in hosted mode: nothing in the checkout of a Bazel before 7.5.0
+    // says that it has `override_repo`, and the command then fails for
+    // the reason a hosted run warns of, before it downloads the patch
+    // (the failure is the first event of the purl), and writes nothing.
+    if flow.cell.numbers() < (7, 5, 0) {
+        let get = flow.vendored(&VENDORED);
+        let said = &get.dump;
+        assert_eq!(get.code, 1, "{test}: {said}");
+        let failed = event_for(&get.envelope, PURL);
+        let why = format!("{NO_RELEASE}. {KEEPS}");
+        assert_eq!(
+            (&failed["action"], &failed["errorCode"], &failed["error"]),
+            (&json!("failed"), &json!("maven_bazel_release"), &json!(why)),
+            "{test}: {said}"
+        );
+        assert_eq!(
+            changed(&before, &flow.cell.tree()),
+            NOTHING,
+            "{test}: {said}"
+        );
+    }
+    let before = flow.names_its_bazel();
+
+    let get = flow.vendored(&VENDORED);
+    let vendored = flow.vendored_by(&get, &before);
+    let downloads = flow.standin.asked(&flow.patch.archive);
+    assert_eq!(
+        downloads, 1,
+        "{test}: the jar comes from the patch service, once"
+    );
+    flow.builds_the_committed_jar(&vendored);
+
+    // The directory of the jar is no package of the workspace.
+    let query = flow.cell.bazel("query", &["//..."]);
+    let listed = query.stdout();
+    assert!(
+        query.ok() && listed.lines().any(|line| line == CONSUMER),
+        "{test}: {}",
+        query.dump()
+    );
+    let under_socket: Vec<&str> = listed.lines().filter(|l| l.contains(".socket")).collect();
+    assert_eq!(under_socket, NOTHING, "{test}: {}", query.dump());
+
+    // `list` and `vex` see the patch, as they see a hosted one.
+    let run = |cell: &Cell, args: &[&str]| flow.socket_patch_in(cell, &flow.standin, args);
+    let list = flow.socket_patch(&["list"]);
+    let listed = event_for(&list.envelope, PURL);
+    assert_eq!(
+        (&listed["uuid"], &listed["details"]["mode"]),
+        (&json!(flow.patch.uuid), &json!("vendored")),
+        "{test}: {}",
+        list.dump
+    );
+    let claim = Claim::new(PURL, &flow.patch.uuid, How::Vendored);
+    flow.cell.stands_alone(run, &claim, true);
+
+    // The audit passes for the committed jar, and fails for another one,
+    // which Bazel builds all the same: no digest of a directory is
+    // checked at build time.
+    let audit = |passes: bool| {
+        let check = flow.socket_patch(&["vendor", "--check"]);
+        let said = &check.dump;
+        let event = event_for(&check.envelope, PURL);
+        let expected = match passes {
+            true => (0, "verified", "vendor_check_ok"),
+            false => (1, "failed", "vendor_check_failed"),
+        };
+        let found = (check.code, &event["action"], &event["errorCode"]);
+        assert_eq!(
+            found,
+            (expected.0, &json!(expected.1), &json!(expected.2)),
+            "{test}: {said}"
+        );
+    };
+    audit(true);
+    let jar = flow.committed_jar();
+    flow.cell
+        .write(&jar, victim(&format!("CHANGED {}", flow.run)));
+    audit(false);
+    flow.cell.builds(&format!("OUT: CHANGED {}", flow.run));
+    flow.cell.write(&jar, &vendored[&jar]);
+    audit(true);
+    assert_eq!(changed(&vendored, &flow.cell.tree()), NOTHING, "{test}");
+
+    // A second machine with the checkout, and no host to ask: the
+    // stand-in is stopped, the output base is new, and the repository
+    // cache, which the machines share, holds the hub's own jars and no
+    // copy of the patched one.
+    let twin = flow.cell.twin();
+    let Pinned {
+        cell,
+        standin,
+        patch,
+        upstream,
+        started,
+        ..
+    } = flow;
+    let origin = standin.stop();
+    twin.builds(&patch.marker);
+    let lock = std::fs::read_to_string(twin.path("maven_install.json")).expect("the lock");
+    let lock = Lock::parse(&lock).expect("the lock");
+    let fetched = lock
+        .plain_jar(GROUP, VICTIM)
+        .and_then(|jar| jar.jar_sha256.clone());
+    let fetched = fetched.expect("the sha256 of the upstream jar");
+    assert_eq!(
+        (twin.cached(&fetched), twin.cached(&patch.sha256)),
+        (true, false),
+        "{test}: the repository cache holds the hub's jar, and not the patched one"
+    );
+    drop(twin);
+
+    // The undo: every file is the one of before, and so is the build.
+    let undo = cell.socket_patch(&origin, &["vendor", "--revert", "--yes"], &[]);
+    cell.undone(&undo, "removed", &before, &upstream);
+    println!(
+        "{test}: Bazel {} built {upstream:?}, then {:?} from the jar `get --mode vendored` \
+         committed under .socket/vendor/maven, also on a second machine with no host to ask; \
+         `bazel query //...` listed no package there, a `--lockfile_mode=error` build passed, \
+         `vendor --check` failed for a changed jar, which Bazel built; `vendor --revert` \
+         restored all {} files and the first build; {:?}",
+        cell.release(),
+        patch.marker,
+        before.len(),
+        started.elapsed()
+    );
+}
+
+/// From hosted mode to vendored mode and back: one entry for the jar at
+/// every step, and the checkout of the hosted command again at the end of
+/// the way back.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn a_hub_goes_from_hosted_to_vendored_and_back() {
+    let test = "maven::a_hub_goes_from_hosted_to_vendored_and_back";
+    let Some(flow) = Pinned::open(test, false, &|_, _| {}) else {
+        return;
+    };
+    flow.builds_upstream();
+    let before = flow.names_its_bazel();
+    let hosted = flow.pins(&before, &[MODULE]);
+
+    // `vendor` takes the hosted patch over: its entry is the only one.
+    let eject = flow.vendored(&["vendor"]);
+    let vendored = flow.vendored_by(&eject, &before);
+    flow.builds_the_committed_jar(&vendored);
+
+    // And back: the hosted command takes the vendored entry, its
+    // directory, its line and its ledger entry out, and says so.
+    let back = flow.socket_patch(&["get", PURL, "--mode", "hosted", "--yes"]);
+    let said = &back.dump;
+    assert_eq!(back.code, 0, "{test}: {said}");
+    assert_eq!(back.envelope["summary"]["applied"], 1, "{test}: {said}");
+    let warned: Vec<&str> = back.envelope["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|warning| warning["code"].as_str())
+        .collect();
+    assert_eq!(
+        warned,
+        ["redirect_takeover_reverted_vendored"],
+        "{test}: {said}"
+    );
+    assert_eq!(
+        changed(&hosted, &flow.cell.tree()),
+        NOTHING,
+        "{test}: {said}"
+    );
+    flow.builds_patched(&hosted);
+
+    // Vendored again, by the command of the mode, and undone by `rollback`.
+    let again = flow.vendored(&VENDORED);
+    let same = flow.vendored_by(&again, &before);
+    assert_eq!(changed(&vendored, &same), NOTHING, "{test}");
+    let undo = flow.socket_patch(&["rollback", "--yes"]);
+    flow.cell
+        .undone(&undo, "rolledBack", &before, &flow.upstream);
+    println!(
+        "{test}: Bazel {} built {:?}, then {:?} from the checkout after `vendor` took the \
+         hosted entry over, and from the patch host after `get --mode hosted` took the \
+         vendored one over; `rollback` restored all {} files and the first build; {:?}",
+        flow.cell.release(),
+        flow.upstream,
+        flow.patch.marker,
+        before.len(),
         flow.started.elapsed()
     );
 }

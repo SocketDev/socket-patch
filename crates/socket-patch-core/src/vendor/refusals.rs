@@ -29,7 +29,10 @@
 //!    copy: any Composer project (`vendor_composer_bazel_workspace`), and a
 //!    PyPI or RubyGems project whose lock a hub of the workspace reads
 //!    (`vendor_pypi_bazel_hub`, `vendor_gem_bazel_hub`), but a gem that
-//!    can be committed for the hub as its archive ([`gem::bazel`]).
+//!    can be committed for the hub as its archive ([`gem::bazel`]);
+//! 8. a Maven jar that only a rules_jvm_external hub of a Bazel workspace
+//!    builds and whose entry cannot be written there (the `maven_bazel_*`
+//!    codes of [`crate::bazel::maven`]), from the same dispatch.
 //!
 //! Each check lives in its backend's module; this one only dispatches and
 //! scopes them.
@@ -118,9 +121,13 @@ fn is_composer(purl: &str) -> bool {
 /// vendored entry point takes this one answer: [`vendor_refusals`] hands it
 /// to a scan, a `get` and a `vendor`, and the eject of hosted pins asks it
 /// before it fetches or restores anything. A refusal of this kind for
-/// another ecosystem belongs here. Today: any Composer project
-/// ([`composer_lock::bazel::refusals`]), and a PyPI or RubyGems project
-/// whose lock a hub of the workspace reads ([`bazel_hub::refusals`]).
+/// another ecosystem belongs here. The user's word lifts the one of any
+/// Composer project ([`composer_lock::bazel::refusals`]) and the one of a
+/// PyPI or RubyGems project whose lock a hub of the workspace reads
+/// ([`bazel_hub::refusals`]). Maven's is not lifted: vendored mode patches
+/// a pinned rules_jvm_external hub, and where the hub is the only build of
+/// a patch and no entry can be shown to work for it
+/// ([`super::maven_repo::hub_refusals`]), there is nothing else to write.
 pub async fn bazel_workspace_refusals<'a>(
     project_root: &Path,
     candidates: &[(&'a str, &str)],
@@ -132,6 +139,21 @@ pub async fn bazel_workspace_refusals<'a>(
         .collect();
     let mut refused = composer_lock::bazel::refusals(project_root, &composer).await;
     refused.extend(bazel_hub::refusals(project_root, candidates).await);
+    let maven = |(purl, _): &&(&str, &str)| Ecosystem::from_purl(purl) == Some(Ecosystem::Maven);
+    let maven: Vec<(&'a str, &str)> = candidates.iter().filter(maven).copied().collect();
+    if !maven.is_empty() {
+        let owned = |(purl, uuid): &(&str, &str)| (purl.to_string(), uuid.to_string());
+        let owned: Vec<(String, String)> = maven.iter().map(owned).collect();
+        let root = project_root.to_path_buf();
+        // The hubs are read from the files of the checkout: off the runtime.
+        let read = move || super::maven_repo::hub_refusals(&root, &owned);
+        let declined = crate::utils::fs::run_blocking(read).await;
+        let named = |(purl, (code, why)): (String, (&'static str, String))| {
+            let (purl, _) = maven.iter().find(|(candidate, _)| *candidate == purl)?;
+            Some((*purl, code, why))
+        };
+        refused.extend(declined.into_iter().filter_map(named));
+    }
     refused
 }
 

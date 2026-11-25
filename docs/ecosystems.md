@@ -1963,6 +1963,11 @@ classifier jars the tree serves, get a checksum. Refusals use `vendor_jvm_shape_
 vendored jars from the commit; a rule that ignores `.socket/` itself is refused
 (`vendor_artifact_gitignored`) before anything is written.
 
+In a Bazel workspace whose rules_jvm_external hub builds the artifact from a lock, vendored
+mode also commits the jar for that hub, and it is the only thing it does in a checkout that
+has no Maven, Gradle, sbt or scala-cli build: see
+[Bazel workspaces: Maven](#bazel-workspaces-maven).
+
 ### VEX
 
 `vex` re-hashes every copy a build may load: the `~/.m2` copies it reads, every
@@ -2152,7 +2157,7 @@ workspace and that Bazel does not build keeps the matrix at the top.
 | Cargo: rules_rust `crate.from_cargo` over `Cargo.lock` | Supported with `cargo_config` on the hub | Supported | Not supported | Supported with a hosted or vendored patch |
 | NuGet: rules_csharp `nuget.from_lock` over `packages.lock.json` | Supported with `nuget_config` on the tag | Not supported | Not supported | Supported with no restored copy on the machine |
 | Composer: a rule of your own that runs `composer install` from `composer.lock` | Supported | Not supported | Not supported | Supported with a hosted patch |
-| Maven: rules_jvm_external `maven.install` with a `lock_file` | Supported with Bazel 7.4.0 or later | Not supported | Not supported | Supported with a hosted patch |
+| Maven: rules_jvm_external `maven.install` with a `lock_file` | Supported with Bazel 7.4.0 or later | Supported with Bazel 7.4.0 or later | Not supported | Supported with a hosted or vendored patch |
 
 These words are the table's own, not the [v5 support tiers](#v5-support-tiers). In
 particular "Not supported" does not mean that the command refuses: in several cells it runs,
@@ -2160,11 +2165,11 @@ exits 0 and leaves a build that fails (the known problems below). What a cell sa
 
 - **Supported**, for hosted and vendored mode: after the one command of the mode
   (`scan --mode hosted` or `scan --mode vendored`; for Maven
-  `get <purl> --mode hosted` at the Bazel root), the next `bazel build` takes the patched
-  package with no other step, and the undo (`rollback`, `vendor --revert`) brings the
-  upstream build back. The one exception is a build that may not update Bazel's own lock
-  (see below). A test builds exactly that on a real Bazel, for the shape the list below
-  names.
+  `get <purl> --mode hosted` or `get <purl> --mode vendored` at the Bazel root), the next
+  `bazel build` takes the patched package with no other step, and the undo (`rollback`,
+  `vendor --revert`) brings the upstream build back. The one exception is a build that may
+  not update Bazel's own lock (see below). A test builds exactly that on a real Bazel, for
+  the shape the list below names.
 - **Not supported**: socket-patch promises nothing about what a Bazel build holds after the
   mode ran, so do not use it for a package that Bazel builds. In most of these cells the
   patch does not reach the build, or the build breaks (see the known problems below).
@@ -2183,9 +2188,9 @@ exits 0 and leaves a build that fails (the known problems below). What a cell sa
   with `--allow-vendored-in-bazel` is one of the limits.
 - **Supported with a condition**, for VEX: under the condition the cell names, the document
   says `not_affected` of a package the Bazel build takes patched, and a test holds it to
-  that (for Maven a test without Bazel). It does not say `affected` of a package whose patch
-  is in no build of Bazel's, one that is only in an installed copy, say: of that package it
-  still says `not_affected`. Do not publish that document. For Maven,
+  that (for a hosted Maven patch a test without Bazel). It does not say `affected` of a
+  package whose patch is in no build of Bazel's, one that is only in an installed copy, say:
+  of that package it still says `not_affected`. Do not publish that document. For Maven,
   [Bazel workspaces: Maven](#bazel-workspaces-maven) says what `vex` checks of the hub before
   it attests an entry.
 
@@ -2243,7 +2248,10 @@ What the table was tested with:
   its `vendor/` tree for Bazel to read is not one of the two.
 - **Maven**: rules_jvm_external 7.2 (Bazel 9), 6.9 (Bazel 8) and 6.5 (Bazel 7), a hub with a
   `lock_file`. [Bazel workspaces: Maven](#bazel-workspaces-maven) says what the command
-  writes and when it declines; `scan` does not find a hub's artifacts yet.
+  writes and when it declines; a hosted `scan` at the Bazel root finds a hub's artifacts, a
+  vendored one does not. Vendored mode keeps the committed jar out of Bazel's packages with
+  [`.bazelignore`](#bazel-workspaces-bazelignore). Bazel checks no digest of that jar when
+  it builds: `socket-patch vendor --check` does, so run it in CI.
 
 A ruleset, a release of one or a way of calling it that the list does not name is not tested.
 Treat it as not supported until a build after the command has shown you the patched package.
@@ -2585,6 +2593,94 @@ to the `)` of its `override_repo`, and the entries stand in the order of their r
   block is socket-patch's when it is, byte for byte, what socket-patch writes for the patches
   it names, in one kind of line break.
 
+Vendored mode patches a pinned hub through the same block, with the jar in the checkout.
+`socket-patch get <purl> --mode vendored`, `scan --mode vendored` and `vendor`, run at the Bazel
+root, download the patched jar once, from Socket's patch service, and write:
+
+```
+.socket/vendor/maven/<patch uuid>/REPO.bazel          # makes the directory a Bazel repository
+.socket/vendor/maven/<patch uuid>/file/BUILD.bazel    # one public filegroup named `file`
+.socket/vendor/maven/<patch uuid>/file/<artifact>-<version>.jar
+.socket/vendor/maven/<patch uuid>/.gitignore          # `!*`: a `*.jar` rule must not drop the jar
+```
+
+and, in the block, an entry whose repository is that directory:
+
+```starlark
+socket_patch_local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
+
+# pkg:maven/<group>/<artifact>@<version>, Socket patch <uuid>
+socket_patch_local_repository(
+    name = "socket_patch_<repository>",
+    path = ".socket/vendor/maven/<uuid>",
+)
+```
+
+with the same comment and `override_repo` as a hosted entry. The hub takes the jar of a
+repository by its target `//file`, which is what the BUILD file gives it. Bazel's
+`local_repository` (in `@bazel_tools` at 7.4.0, 7.7.2, 8.8.2 and 9.3.2) links to the directory
+where it is, by its path from the workspace root: nothing is downloaded or copied, the
+repository cache holds no copy of the jar, and a checkout builds patched with no host to ask.
+
+- **What changes.** `MODULE.bazel`, the directory, one line of `.bazelignore` (below) and the
+  vendor ledger, `.socket/vendor/state.json`. Commit all of it. `MODULE.bazel.lock` and
+  `maven_install.json` stay as they are, as in hosted mode. No token is written anywhere.
+- **`.bazelignore`.** A BUILD file under `.socket` is a package of the workspace (`bazel query
+  //...` lists `//.socket/vendor/maven/<uuid>/file:file`), so the command names
+  `.socket/vendor/maven` in the root's `.bazelignore`, under a comment line of its own, by the
+  rules of [Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore). The build is the
+  same with the line and without it.
+- **Nothing checks the jar at build time.** An `http_file` checks a sha256; a repository over a
+  directory has none to check, and Bazel builds whatever jar is committed there. The check is
+  `socket-patch vendor --check`. It fails when the jar that Bazel builds is not, byte for byte,
+  the vendored jar whose sha256 the ledger records; when `REPO.bazel` or `file/BUILD.bazel` is
+  not the file socket-patch wrote; when the block no longer names the directory, or was changed
+  by hand; and when the entry is one a build stops at or may pass without (no pinned hub takes
+  the jar at that version any more, for which it names `socket-patch rollback <purl>`, or an
+  rc file switches the entry off). Run it in CI. `socket-patch vex` hashes the same jar before
+  it attests the patch. A later `vendor` takes the committed jar as it is only when the ledger
+  records its bytes: any other jar at that path, also one that carries the patch's files, is
+  replaced by the patch's own. `socket-patch repair` puts back a jar that is lost or changed,
+  and with it the other files of a directory that was lost whole.
+- **One entry per jar.** A vendored run puts its entry in the place of a hosted one for the
+  same jar, and a hosted run in the place of a vendored one. The hosted run removes what
+  vendored mode kept for the hub: the directory, its `.bazelignore` line and, for a patch that
+  only the hub took, the ledger entry. Neither leaves both. Beside a Maven build the vendored
+  tree of that build stays through a hosted run, as it does without the workspace. The entry
+  of a later patch of the jar takes the place of the earlier one in the same way: the run
+  that writes it removes each directory under `.socket/vendor/maven` that `MODULE.bazel` no
+  longer names and no ledger entry records (`cleanup_failed` when it cannot).
+- **A project that Maven or Gradle builds too.** That build is vendored exactly as without the
+  workspace (the suffixed tree under `.socket/vendor/maven2`, the pom pin, and so on), and the
+  hub gets a copy of the same jar in its own directory. The ledger entry is the Maven or
+  Gradle one, and the hub's copy is that entry's jar byte for byte: `vendor --check` holds the
+  copy to the same sha256, and the entry of the block to the rules above. A later `vendor`
+  that finds the copy missing or changed, or the entry gone, writes them again and says so
+  (`vendor_artifact_rebuilt`). The hub's directory has to survive the commit like the tree
+  beside it: where a rule of the checkout makes git ignore it, the run writes nothing for
+  the hub and warns `maven_bazel_hub_unpatched` with that rule.
+- **The undo.** `vendor --revert`, `rollback` and `remove` take the entry out, then the
+  directory, and the `.bazelignore` line goes with the last directory: every file is the one of
+  before, byte for byte, but for a `.bazelignore` that was an empty file of yours, which is
+  deleted with the last line, as for the Go lines. A `MODULE.bazel` that names the directory
+  outside an entry of the block (a block changed by hand) fails the undo before anything is
+  removed, because Bazel stops at a `local_repository` whose directory is gone.
+  Beside a Maven or Gradle build the undo writes that build's files and `MODULE.bazel`
+  together: one that cannot be written fails the undo with every file as it was, and the
+  vendored tree, the hub's directory and the ledger entry go only after all of them are
+  written. A run that is killed between two of those files has removed nothing and leaves
+  `.socket/vendor/.commit-journal.json`: the next socket-patch command in the project
+  finishes the files from it, and the undo run again removes the rest.
+- **Where no entry can be written**, the reasons and codes are those of hosted mode below,
+  but for `maven_bazel_download`: the jar is in the checkout, so an option about downloads
+  does not stand against it. In a tree only Bazel builds the patch then fails with that code
+  (exit 1, as a vendored refusal does) and nothing is written; beside a Maven or Gradle build
+  that was vendored, it is a warning with that code and the patch is `applied`. A `vendor`
+  over a hosted entry it would not replace is refused whole, before it asks any service, and
+  the entry stays (`kept hosted: ...`). `--allow-vendored-in-bazel` does not lift these
+  declines: they say that no entry could be shown to work, and there is nothing else to
+  write for a hub.
+
 Everything is read from the checkout: the root `MODULE.bazel` and the files it includes, for
 the tags of the `maven` extension of `rules_jvm_external` under whatever name the file gives
 the ruleset and the extension (a hub is the `install`, `artifact` and `from_toml` tags of one
@@ -2696,13 +2792,18 @@ project below the root, whose warning names the file as "the MODULE.bazel at the
 | `maven_bazel_release` | The Bazel or the ruleset release is not known to be one the block works with. Bazel: `.bazeliskrc` or `.bazelversion` names a release before 7.4.0, or neither names a release of three numbers and `MODULE.bazel.lock` is missing or older than the format Bazel 7.5.0 writes (add a `.bazelversion`). Ruleset: `MODULE.bazel.lock` does not hold the `source.json` of exactly one rules_jvm_external release (build once), that release is not one of 6.4 to 7.2 (update socket-patch), or the lock holds another release than `MODULE.bazel` now takes: an older one than its `bazel_dep` asks for, or any other than the one a `single_version_override` of the ruleset pins (build once). Versions are compared as Bazel compares them (`7.2` is below `7.2.1`). The `bazel_dep` line alone is not taken: Bazel can select a newer release, and a `single_version_override` with a version that the lock agrees with can pin an older one. An `archive_override`, `git_override`, `local_path_override` or `multiple_version_override` of the ruleset, and a `single_version_override` whose version is no plain string, leave the release unknown: the warning names the override's line. |
 | `maven_bazel_artifact` | The repository of this jar has no known name (a character other than letters, digits, `.`, `_` and `-` in its group, artifact or version), the lock lists no repository for the jar (it comes from the Maven local repository under `m2local`), or the patch comes without its served version or a sha256. |
 | `maven_bazel_no_effect` | The build would pass on the upstream jar with the block in place: the root has a `maven.override` for the artifact, or an rc file of the checkout names `--ignore_dev_dependency` without switching it off, or names `enable_bzlmod` other than switched on (`--noenable_bzlmod`, `--enable_bzlmod=false`, and Bazel's other words for it: `0`, `no`, `f`, `n`, in any case) while the checkout names no Bazel 9 or later. |
-| `maven_bazel_download` | An rc file of the checkout names a downloader config, `--repository_disable_download` or `--vendor_dir`: Bazel may not be able to download the patched jar. |
+| `maven_bazel_download` | Hosted mode only. An rc file of the checkout names a downloader config, `--repository_disable_download` or `--vendor_dir`: Bazel may not be able to download the patched jar. Vendored mode keeps the jar in the checkout. |
 
-Vendored and agent mode patch no hub, and leave the block as it is. A vendored run that takes
-the hosted pin of a `pom.xml` or Gradle build over (`vendor`, `scan` / `get --mode vendored`),
-and `vendor --revert`, keep the hub's entry: the Bazel build stays on the patched jar until
-`rollback` or `remove` takes the entry out. A `vendor` or an `apply` that has a Maven patch
-(also `get` and `scan` in those modes) reads the same files and says when a hub builds the
+A vendored run that writes no entry for a jar a hub builds leaves the block as it is: a hosted
+entry that is there stays, and the Bazel build keeps the patched jar. Beside a Maven or Gradle
+build it warns, once per artifact, with the code and the reason of the table, or with
+`maven_bazel_hub_unpatched` when it could have written the entry and vendored nothing for the
+package (the Maven or Gradle build failed first). It also warns `maven_bazel_no_effect` for
+an entry that is there and that the checkout leaves without effect: the Bazel build takes the
+upstream jar past it. A dry run warns of the declines alone.
+
+Agent mode patches no hub, and leaves the block as it is. An `apply` that has a Maven patch
+(also `get` and `scan` in agent mode) reads the same files and says when a hub builds the
 artifact:
 
 - `maven_bazel_hub_unpatched`: a pinned hub fetches the jar of the artifact at the patch's
@@ -2727,14 +2828,30 @@ read, the `WORKSPACE` file counts as one Bazel may read, and the Bazel release i
 Limits:
 
 - Not patched: a hub without a lock, a `maven_install` of a `WORKSPACE` file, Bazel before
-  7.4.0, rules_jvm_external before 6.4 or after 7.2, and a hub in vendored or agent mode. Each
-  is said as above.
+  7.4.0, rules_jvm_external before 6.4 or after 7.2, and a hub in agent mode. Each is said as
+  above.
+- Vendored mode, beside a Maven or Gradle build: the hub gets its jar only in a run that
+  vendored the patch for that build. An artifact that the build does not use at the patch's
+  version (`vendor_maven_version_not_selected`) and the hub does is skipped as before; hosted
+  mode patches that hub. A `vendor` there does not eject a hosted pin that only the block
+  wires: the entry stays hosted, unless the same run vendors that patch for the Maven or
+  Gradle build (a patch of the manifest, or a pin that the build's own files hold too). The
+  hub's entry is then the vendored one, and `vendor --revert` takes it out. And
+  `socket-patch vex` hashes the jar of the Maven or Gradle tree, as before, not the hub's copy
+  of it, which `vendor --check` holds to the same bytes.
 - Not looked at: a patch of a jar with a classifier, or of another packaging than `jar`. A lock
   names the plain jar by group and artifact alone, so such a patch gets no entry and no word
   about the hub: the run is the one without the workspace.
-- A stale entry is taken out by a hosted `scan` at the Bazel root, by `rollback` and by
-  `remove`. `get <purl> --mode hosted` pins the purl it is given and leaves a stale entry of
-  another release where it is, so the build still stops there until one of those three ran.
+- A hosted `scan` at the Bazel root finds the artifacts of the pinned hubs and takes a stale
+  entry of hosted mode out; `rollback` and `remove` take out a stale entry of either mode.
+  `get <purl> --mode hosted` pins the purl it is given and leaves a stale entry of another
+  release where it is, so the build still stops there until one of those three ran.
+- A vendored `scan` does not look for the artifacts of a hub: it vendors a hub's jar when the
+  package is one it found elsewhere (a `pom.xml`, a Gradle build). `get <purl> --mode vendored`
+  takes any purl, and `vendor` takes the patches of a manifest and, in a checkout that only
+  Bazel builds, the hosted patches of the block: there a hosted `scan` and then `vendor`
+  vendor what the hubs build. No scan takes a stale entry of vendored mode out: `vendor
+  --check` names it, and `rollback` or `remove` take it out with its directory.
 - The in-memory hosted engine (GitHub App) reads no hub and writes no block.
 - Not seen: a hub or a `maven.override` that another Bazel module declares (its hub takes the
   root's entry where it pins the same version, so an entry that is stale for the root's hubs
@@ -2749,10 +2866,10 @@ Limits:
   `.bazelversion`.
 - A scanner that reads only `maven_install.json` keeps reporting the advisory: the lock names
   the upstream version on purpose. The patch shows in `MODULE.bazel` and in `socket-patch vex`.
-- A vendored or agent `get` that fails before it patches anything says what it said before: in
-  a tree that only Bazel builds those are `vendor_jvm_shape_unsupported` and
-  `package_not_installed`. So does a `vendor` that is refused before it vendors anything (a
-  ledger that cannot be read, or one that git ignores).
+- An agent `get` that fails before it patches anything says what it said before: in a tree
+  that only Bazel builds that is `package_not_installed`. A vendored `get` of a jar that no hub
+  builds there fails with `vendor_jvm_shape_unsupported`, as before. So does a `vendor` that is
+  refused before it vendors anything (a ledger that cannot be read, or one that git ignores).
 - `socket-patch vex` looks at the hub only for the block's entries: a patch that only the
   `pom.xml` pin or a patched jar attests is attested, although the Bazel build does not have it.
 
@@ -3362,6 +3479,15 @@ When the file cannot be written (a symbolic link or a directory in its place, a 
 directory, a read-only file, which is neither replaced nor deleted), the command still succeeds
 and warns `bazelignore_not_updated` with the line to add, or, for a copy that is gone, that its
 two lines can be deleted.
+
+The same commands keep one more pair by the same rules, for Maven: while
+`<project>/.socket/vendor/maven` exists, which holds the jars vendored mode commits for a
+rules_jvm_external hub ([Bazel workspaces: Maven](#bazel-workspaces-maven)), the file names it
+under the comment line
+`# socket-patch: patched Maven jars for a Bazel hub, not Bazel packages (to opt out, comment out the next line)`.
+A command whose `--ecosystems` leaves `maven` out adds no such line. The opt-out, the removal
+and the warning are as above; a command that changed the file for it says `Updated <path>` or
+`Removed <path>` with what the line is for.
 
 Side effects and limits:
 
