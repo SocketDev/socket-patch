@@ -1,14 +1,19 @@
 name: Bazel patch compatibility (Maven)
 
 # The Maven flows of the real-Bazel tests (`maven::` in `e2e_bazel_build`):
-# a hosted patch of an artifact in a workspace whose rules_jvm_external hub
-# builds that artifact from a pinned lock, on each Bazel release below. The
+# a hosted and a vendored patch of an artifact in a workspace whose
+# rules_jvm_external hub builds that artifact from a pinned lock, on each
+# Bazel release below. The
 # patch is one block in MODULE.bazel that puts a repository with the
 # patched jar in the place of the hub's own (`override_repo`): the flows
 # hold the block's text, the patched build and its sha256 check, the undo,
 # a hosted scan that finds the artifact in the hub's lock, a version bump
-# of the patched artifact, and a hub the block cannot patch.
-# bazel-compatibility.yml holds the legs and what every ecosystem
+# of the patched artifact, and a hub the block cannot patch. In vendored
+# mode that repository is a directory of the checkout with the committed
+# jar: the flows hold the build from the checkout alone with no host to
+# ask, the audit of the committed jar, the undo, and the way from hosted
+# to vendored and back. bazel-compatibility.yml holds the legs and what
+# every ecosystem
 # shares; this file says when the Maven legs run and on which releases.
 #
 # Each major release has an era of its own, because the ruleset decides
@@ -58,11 +63,14 @@ on:
     # pom walk under it (the hosted lane pins only where Maven selects the
     # patch's version), the crawler that says where the Maven local
     # repository is, lock discovery and the upstream restore of `rollback`
-    # (for a pom and for the block of MODULE.bazel), and what socket-patch
-    # reads and writes only in a Bazel workspace (`bazel/`: the hubs of
-    # MODULE.bazel, their locks and the block). Nothing another ecosystem's
-    # flow owns is here, so a change to one ecosystem starts that
-    # ecosystem's legs only.
+    # (for a pom and for the block of MODULE.bazel), the vendored Maven
+    # backend, which writes the hub's jar and its entry, the dispatch that
+    # hands a vendored command the hub's declines (vendor/refusals.rs), and what
+    # socket-patch reads and writes only in a Bazel workspace (`bazel/`: the
+    # hubs of MODULE.bazel, their locks and the block). Nothing another
+    # ecosystem's flow owns is here but that dispatch, which the Composer
+    # legs watch too, so a change to one ecosystem starts that ecosystem's
+    # legs only.
     #
     # What it does not cover: shared engine code (`rewrite_maven_pom` is in
     # patch/redirect/mod.rs, the file of every ecosystem's rewriter; hosted/,
@@ -88,6 +96,8 @@ on:
       - 'crates/socket-patch-core/src/vex/discover/bazel_maven.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/maven.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/bazel_maven.rs'
+      - 'crates/socket-patch-core/src/vendor/maven_repo.rs'
+      - 'crates/socket-patch-core/src/vendor/refusals.rs'
       - 'crates/socket-patch-core/src/bazel/**'
   push:
     branches: [main]
@@ -114,6 +124,8 @@ on:
       - 'crates/socket-patch-core/src/vex/discover/bazel_maven.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/maven.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/bazel_maven.rs'
+      - 'crates/socket-patch-core/src/vendor/maven_repo.rs'
+      - 'crates/socket-patch-core/src/vendor/refusals.rs'
       - 'crates/socket-patch-core/src/bazel/**'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
       - 'crates/socket-patch-core/src/patch/redirect/**'

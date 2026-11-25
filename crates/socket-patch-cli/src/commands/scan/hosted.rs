@@ -2284,6 +2284,19 @@ async fn run_redirect_selected_untracked(
         ));
         return 1;
     }
+    // A hosted entry that took the place of a vendored one in the block of
+    // a Bazel hub leaves the directory of that entry without a reader.
+    let mut unit_warnings: Vec<RunWarning> = Vec::new();
+    if let (false, Some(module), Ok(state)) = (
+        common.dry_run,
+        rewrite.files.get(socket_patch_core::bazel::maven::FILE),
+        &vendor_state,
+    ) {
+        let left =
+            socket_patch_core::vendor::maven_repo::drop_unnamed_units(&common.cwd, module, state);
+        let warning = |detail| RunWarning::new("cleanup_failed", detail);
+        unit_warnings.extend(left.await.into_iter().map(warning));
+    }
     // A pnpm-workspace.yaml a hosted run created, which this run emptied of
     // its registry route: deleted, not left as a bare `packages` list. The
     // rewrite carries writes only, so the file goes once they have landed.
@@ -2635,6 +2648,7 @@ async fn run_redirect_selected_untracked(
     warnings.extend(vlt_stale.warnings.iter().map(run_warning_of));
     warnings.extend(takeover_pre_warnings.iter().map(run_warning_of));
     warnings.extend(takeover_warnings.iter().cloned());
+    warnings.extend(unit_warnings);
     warnings.extend(prune_warnings.iter().cloned());
     warnings.extend(workspace_warning);
 

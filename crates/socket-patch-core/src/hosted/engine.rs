@@ -1775,9 +1775,10 @@ pub async fn read_candidate_files_in(
     if let Some(root) = view.disk_root().filter(|_| !jars.is_empty()) {
         use crate::bazel::maven::{site, FILE, SITE_KEY};
         let (root, module) = (root.to_path_buf(), view.read_text(FILE).await.ok());
-        let (read, module) =
-            crate::utils::fs::run_blocking(move || (site(&root, module.as_deref(), &jars), module))
-                .await;
+        let (read, module) = crate::utils::fs::run_blocking(move || {
+            (site(&root, module.as_deref(), &jars, false), module)
+        })
+        .await;
         if !read.is_empty() {
             out.files
                 .extend(module.map(|module| (FILE.to_string(), module)));
