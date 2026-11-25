@@ -115,10 +115,14 @@ pub struct Candidate {
 /// reason). Candidate order. The disk and memory paths both report these
 /// as the `unpinned` rows of the `redirect` block, and the disk path's
 /// human output lists them as "Not hosted".
+///
+/// `quiet` are the candidates with nothing in the project to pin
+/// ([`quiet_candidates`]): they are not reported at all.
 pub fn unconfirmed_candidates(
     candidates: &[Candidate],
     confirmed: &[(String, String)],
     skipped: &[SkippedPatch],
+    quiet: &BTreeSet<String>,
 ) -> Vec<(String, String)> {
     candidates
         .iter()
@@ -128,7 +132,32 @@ pub fn unconfirmed_candidates(
                 .any(|(purl, uuid)| *purl == c.purl && *uuid == c.dep.patch_uuid)
         })
         .filter(|c| !skipped.iter().any(|s| s.uuid == c.dep.patch_uuid))
+        .filter(|c| !quiet.contains(&c.dep.patch_uuid))
         .map(|c| (c.purl.clone(), c.dep.patch_uuid.clone()))
+        .collect()
+}
+
+/// The uuids of the candidates that have nothing in the project to pin,
+/// which a run neither confirms nor reports as left unpinned:
+///
+/// * a gem patch the Bundler lock has no build for
+///   ([`RewriteResult::gem_idle_uuids`]): the patch of a platform the lock
+///   does not name, or the source patch of a fix whose registry a lock of
+///   platform builds takes as its source;
+/// * a candidate the run did not select (`selected`: the run's
+///   `(purl, uuid)` selection): the source patch of a gem fix, which
+///   [`build_candidates`] adds for its registry.
+pub fn quiet_candidates(
+    candidates: &[Candidate],
+    selected: &[(String, String)],
+    rewrite: &RewriteResult,
+) -> BTreeSet<String> {
+    let selected: HashSet<&str> = selected.iter().map(|(_, uuid)| uuid.as_str()).collect();
+    candidates
+        .iter()
+        .map(|c| c.dep.patch_uuid.as_str())
+        .filter(|uuid| rewrite.gem_idle_uuids.contains(*uuid) || !selected.contains(uuid))
+        .map(str::to_string)
         .collect()
 }
 
@@ -273,125 +302,224 @@ pub fn build_candidates(
     skipped: &mut Vec<SkippedPatch>,
     warnings: &mut Vec<RewriteWarning>,
 ) -> Vec<Candidate> {
-    use crate::patch::redirect::grant::{self, Flaw};
     let mut candidates = Vec::new();
     for (sel_purl, sel_uuid) in selected {
-        let Some(reference) = references.get(sel_uuid) else {
-            skipped.push(SkippedPatch::new(sel_purl, sel_uuid, "not_found"));
-            continue;
-        };
-        if reference.status != "granted" && reference.status != "reused" {
-            skipped.push(SkippedPatch::new(sel_purl, sel_uuid, &reference.status));
-            continue;
-        }
-        let purl = reference.purl.as_deref().unwrap_or(sel_purl);
-        let Some((ecosystem, name, version)) = purl_parts(purl) else {
-            skipped.push(SkippedPatch::new(purl, sel_uuid, "bad_purl"));
-            continue;
-        };
-        let Some(url) = reference.url.clone() else {
-            skipped.push(SkippedPatch::new(purl, sel_uuid, "no_url"));
-            continue;
-        };
-        let mut integrity = reference
-            .artifacts
-            .iter()
-            .flatten()
-            .find(|a| a.kind == "tarball")
-            .map(|a| a.integrity.clone())
-            .unwrap_or_default();
-        // The yarn-berry cache zip carries the `yarnBerry10c0` checksum the
-        // berry rewriter pins (berry verifies the zip, not the tarball).
-        // Merge it in; the zip URL itself is never read.
-        let berry_zip = reference
-            .artifacts
-            .iter()
-            .flatten()
-            .find(|a| a.kind == "yarn-berry-zip");
-        if let Some(c) = berry_zip.and_then(|a| a.integrity.yarn_berry10c0.clone()) {
-            integrity.yarn_berry10c0 = Some(c);
-        }
-        // goproxy: the hosted-Go hash pair rides the override's
-        // identifiers (the tarball's dirhashH1 is the original-path
-        // flavor, kept for vendor-mode verification); the golang rewriter
-        // reads the normalized integrity, so merge — the gopatch-flavor zip
-        // h1 REPLACES dirhashH1 here. Only both together: a half-merged
-        // pair would trip the rewriter's fail-closed integrity check by
-        // design.
-        if let Some(ov) = reference
-            .registry_override
-            .as_ref()
-            .filter(|o| o.kind == "goproxy")
-        {
-            if let (Some(zip_h1), Some(gomod_h1)) = (
-                ov.identifiers.go_zip_dirhash_h1.clone(),
-                ov.identifiers.go_mod_h1.clone(),
-            ) {
-                integrity.dirhash_h1 = Some(zip_h1);
-                integrity.go_mod_h1 = Some(gomod_h1);
+        match candidate_of(sel_purl, sel_uuid, references, patch_server_origins) {
+            Ok(candidate) => candidates.push(candidate),
+            Err(refused) => {
+                let (skip, warned) = *refused;
+                warnings.extend(warned);
+                skipped.push(skip);
             }
         }
-        // The grant token is never a top-level reference field — it only
-        // rides the URLs the reference endpoint hands back, as the path
-        // level before the patch uuid. Recover it so the rewriters'
-        // rotation-idempotency guards (which wildcard the token path level
-        // of a previously-written URL) don't depend on it being derivable
-        // from the URL alone (with an empty token the gem guard does not
-        // recognise the `source:` a previous scan wrote as its own).
-        let token = reference
-            .registry_override
-            .as_ref()
-            .and_then(|o| crate::patch::redirect::grant_token_path_segment(&o.index_url, sel_uuid))
-            .or_else(|| crate::patch::redirect::grant_token_path_segment(&url, sel_uuid))
-            .unwrap_or_default();
-        let mut dep = DepOverride {
-            ecosystem,
-            name,
-            namespace: None,
-            version,
-            token,
-            patch_uuid: sel_uuid.clone(),
-            artifact_url: url,
-            npm_registry_url: reference.npm_registry_url.clone(),
-            registry_override: reference.registry_override.clone(),
-            integrity,
+    }
+    // A gem fix has one patch per platform gem, and the registry of its
+    // source patch is the one Bundler source of them all. A selection of
+    // platform patches alone (a lock with no ruby-platform entry) does not
+    // hold that patch, so it joins the candidates for its registry: it
+    // pins nothing and is never reported (see [`gem_family_sources`]). A
+    // source whose reference is not usable is left out, and the gem
+    // rewriter then leaves the gem alone and says why.
+    for source in gem_family_sources(&candidates) {
+        let member = |c: &&Candidate| {
+            crate::patch::redirect::gem_family(&c.dep) == source && c.dep.patch_uuid != source
         };
-        // A registry address pnpm could not route the artifact URL to
-        // reads as not served: the pin then takes the `trustLockfile` path.
-        dep.npm_registry_url = grant::npm_registry_url(&dep).map(str::to_string);
-        // The served purl is printed and recorded as it is: a line break in
-        // one would forge a line of the run's output.
-        let checked = if purl.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            Err(Flaw::Malformed(
-                "its package URL holds whitespace".to_string(),
-            ))
-        } else {
-            grant::check(&dep, patch_server_origins)
-        };
-        if let Err(flaw) = checked {
-            let (code, reason) = match flaw {
-                Flaw::Malformed(reason) => (GRANT_MALFORMED, reason),
-                Flaw::InsecureUrl(reason) => (GRANT_INSECURE_URL, reason),
-            };
-            // Keyed and worded by the selection's purl, the spelling the
-            // project's own files gave: the served one is what failed.
-            let detail = format!(
-                "{sel_purl}: the patch server's reference for it was refused ({reason}); \
-                 nothing was written for it, so it stays unpatched"
-            );
-            warnings.push(warning(code, detail.clone()));
-            skipped.push(SkippedPatch {
-                detail: Some(detail),
-                ..SkippedPatch::new(sel_purl, sel_uuid, code)
-            });
+        let Some(purl) = candidates.iter().find(member).map(|c| {
+            format!(
+                "{}?platform=ruby",
+                crate::utils::purl::strip_purl_qualifiers(&c.purl)
+            )
+        }) else {
             continue;
+        };
+        if let Ok(candidate) = candidate_of(&purl, &source, references, patch_server_origins) {
+            candidates.push(candidate);
         }
-        candidates.push(Candidate {
-            purl: purl.to_string(),
-            dep,
-        });
     }
     candidates
+}
+
+/// The source patches of the gem fixes among `candidates` that are not
+/// candidates themselves: each a uuid some platform gem's patch was built
+/// from (`rebuiltFromUuid`), sorted. The run asks the patch API for their
+/// references too ([`missing_gem_sources`]), and [`build_candidates`] adds
+/// the ones it can use.
+fn gem_family_sources(candidates: &[Candidate]) -> Vec<String> {
+    let held: HashSet<&str> = candidates
+        .iter()
+        .map(|c| c.dep.patch_uuid.as_str())
+        .collect();
+    let sources: BTreeSet<String> = candidates
+        .iter()
+        .filter(|c| c.dep.ecosystem == "gem")
+        .map(|c| crate::patch::redirect::gem_family(&c.dep))
+        .filter(|source| !held.contains(source))
+        .map(str::to_string)
+        .collect();
+    sources.into_iter().collect()
+}
+
+/// The uuids the run must still ask the patch API about before
+/// [`build_candidates`]: the source patch of each gem fix `references`
+/// names (`rebuiltFromUuid`) and holds no answer for, sorted. One more
+/// reference request when there are any, none otherwise: a lock of
+/// platform builds alone selects no ruby-platform patch, and the registry
+/// of the fix's source patch is still the gem's source.
+pub fn missing_gem_sources(references: &HashMap<String, PackageVendorResult>) -> Vec<String> {
+    let sources: BTreeSet<String> = references
+        .values()
+        .filter(|reference| reference.status == "granted" || reference.status == "reused")
+        .filter(|reference| {
+            reference
+                .purl
+                .as_deref()
+                .is_some_and(|purl| purl.starts_with("pkg:gem/"))
+        })
+        .filter_map(|reference| reference.rebuilt_from_uuid.clone())
+        .filter(|source| {
+            crate::patch::path_safety::is_canonical_uuid(source) && !references.contains_key(source)
+        })
+        .collect();
+    sources.into_iter().collect()
+}
+
+/// The candidate of one reference grant ([`build_candidates`]), or why
+/// there is none: the skip to record and, for a grant refused for its
+/// shape, its warning.
+fn candidate_of(
+    sel_purl: &str,
+    sel_uuid: &str,
+    references: &HashMap<String, PackageVendorResult>,
+    patch_server_origins: &[String],
+) -> Result<Candidate, Box<(SkippedPatch, Option<RewriteWarning>)>> {
+    use crate::patch::redirect::grant::{self, Flaw};
+    let skip =
+        |purl: &str, reason: &str| Box::new((SkippedPatch::new(purl, sel_uuid, reason), None));
+    let Some(reference) = references.get(sel_uuid) else {
+        return Err(skip(sel_purl, "not_found"));
+    };
+    if reference.status != "granted" && reference.status != "reused" {
+        return Err(skip(sel_purl, &reference.status));
+    }
+    let purl = reference.purl.as_deref().unwrap_or(sel_purl);
+    let Some((ecosystem, name, version)) = purl_parts(purl) else {
+        return Err(skip(purl, "bad_purl"));
+    };
+    let Some(url) = reference.url.clone() else {
+        return Err(skip(purl, "no_url"));
+    };
+    let mut integrity = reference
+        .artifacts
+        .iter()
+        .flatten()
+        .find(|a| a.kind == "tarball")
+        .map(|a| a.integrity.clone())
+        .unwrap_or_default();
+    // The yarn-berry cache zip carries the `yarnBerry10c0` checksum the
+    // berry rewriter pins (berry verifies the zip, not the tarball).
+    // Merge it in; the zip URL itself is never read.
+    let berry_zip = reference
+        .artifacts
+        .iter()
+        .flatten()
+        .find(|a| a.kind == "yarn-berry-zip");
+    if let Some(c) = berry_zip.and_then(|a| a.integrity.yarn_berry10c0.clone()) {
+        integrity.yarn_berry10c0 = Some(c);
+    }
+    // goproxy: the hosted-Go hash pair rides the override's
+    // identifiers (the tarball's dirhashH1 is the original-path
+    // flavor, kept for vendor-mode verification); the golang rewriter
+    // reads the normalized integrity, so merge — the gopatch-flavor zip
+    // h1 REPLACES dirhashH1 here. Only both together: a half-merged
+    // pair would trip the rewriter's fail-closed integrity check by
+    // design.
+    if let Some(ov) = reference
+        .registry_override
+        .as_ref()
+        .filter(|o| o.kind == "goproxy")
+    {
+        if let (Some(zip_h1), Some(gomod_h1)) = (
+            ov.identifiers.go_zip_dirhash_h1.clone(),
+            ov.identifiers.go_mod_h1.clone(),
+        ) {
+            integrity.dirhash_h1 = Some(zip_h1);
+            integrity.go_mod_h1 = Some(gomod_h1);
+        }
+    }
+    // The grant token is never a top-level reference field — it only
+    // rides the URLs the reference endpoint hands back, as the path
+    // level before the patch uuid. Recover it so the rewriters'
+    // rotation-idempotency guards (which wildcard the token path level
+    // of a previously-written URL) don't depend on it being derivable
+    // from the URL alone (with an empty token the gem guard does not
+    // recognise the `source:` a previous scan wrote as its own).
+    let token = reference
+        .registry_override
+        .as_ref()
+        .and_then(|o| crate::patch::redirect::grant_token_path_segment(&o.index_url, sel_uuid))
+        .or_else(|| crate::patch::redirect::grant_token_path_segment(&url, sel_uuid))
+        .unwrap_or_default();
+    let mut dep = DepOverride {
+        ecosystem,
+        name,
+        namespace: None,
+        version,
+        token,
+        patch_uuid: sel_uuid.to_string(),
+        artifact_url: url,
+        npm_registry_url: reference.npm_registry_url.clone(),
+        registry_override: reference.registry_override.clone(),
+        integrity,
+    };
+    // A registry address pnpm could not route the artifact URL to
+    // reads as not served: the pin then takes the `trustLockfile` path.
+    dep.npm_registry_url = grant::npm_registry_url(&dep).map(str::to_string);
+    // A gem patch is the patch of one platform gem, which its package URL
+    // names, and says which patch it was built from. Both are the
+    // reference's to say, never the override's own fields.
+    let is_gem = dep.ecosystem == "gem";
+    if let Some(ov) = dep.registry_override.as_mut() {
+        let platform = crate::utils::purl::purl_qualifier(purl, "platform")
+            .or_else(|| crate::utils::purl::purl_qualifier(sel_purl, "platform"))
+            .filter(|platform| !platform.is_empty() && !platform.eq_ignore_ascii_case("ruby"));
+        ov.identifiers.gem_platform = platform.filter(|_| is_gem).map(str::to_string);
+        ov.identifiers.gem_rebuilt_from_uuid = reference
+            .rebuilt_from_uuid
+            .clone()
+            .filter(|source| is_gem && !source.is_empty() && source != sel_uuid);
+    }
+    // The served purl is printed and recorded as it is: a line break in
+    // one would forge a line of the run's output.
+    let checked = if purl.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        Err(Flaw::Malformed(
+            "its package URL holds whitespace".to_string(),
+        ))
+    } else {
+        grant::check(&dep, patch_server_origins)
+    };
+    if let Err(flaw) = checked {
+        let (code, reason) = match flaw {
+            Flaw::Malformed(reason) => (GRANT_MALFORMED, reason),
+            Flaw::InsecureUrl(reason) => (GRANT_INSECURE_URL, reason),
+        };
+        // Keyed and worded by the selection's purl, the spelling the
+        // project's own files gave: the served one is what failed.
+        let detail = format!(
+            "{sel_purl}: the patch server's reference for it was refused ({reason}); \
+             nothing was written for it, so it stays unpatched"
+        );
+        return Err(Box::new((
+            SkippedPatch {
+                detail: Some(detail.clone()),
+                ..SkippedPatch::new(sel_purl, sel_uuid, code)
+            },
+            Some(warning(code, detail)),
+        )));
+    }
+    Ok(Candidate {
+        purl: purl.to_string(),
+        dep,
+    })
 }
 
 /// Skip reason and warning code of a patch whose ecosystem cannot be served
@@ -2318,6 +2446,72 @@ async fn read_gemspecs(
     );
 }
 
+/// The compact-index documents the gem rewriter checks a lock of platform
+/// builds against, sorted: `<index>/info/<gem>` of the registry of each gem
+/// fix whose patches cover a build that the Bundler lock among `files`
+/// names as a platform build. That registry becomes the gem's one source,
+/// and the lock pins each build to the sha256 its own patch states: the
+/// document says whether the registry serves exactly that. One small
+/// request per such gem, none for a gem locked as its ruby-platform gem
+/// alone. The caller reads them (from the patch server, also for a
+/// mirrored candidate) and hands the answers to [`record_gem_index`].
+pub fn gem_index_targets(
+    candidates: &[Candidate],
+    files: &BTreeMap<String, String>,
+) -> Vec<String> {
+    use crate::patch::redirect::{gem_family, gem_index_info_url, gem_pair, gem_platform};
+    let Some(lock) = files.get(gem_pair(files).1) else {
+        return Vec::new();
+    };
+    // Read as the gem rewriter reads it.
+    let parsed = crate::formats::gem::parse(lock);
+    let gems = || candidates.iter().filter(|c| c.dep.ecosystem == "gem");
+    let mut urls: BTreeSet<String> = BTreeSet::new();
+    for candidate in gems() {
+        let dep = &candidate.dep;
+        let builds = parsed.locked_builds(&dep.name, &dep.version);
+        let names_build = match gem_platform(dep) {
+            Some(platform) => builds.platforms.contains(platform),
+            None => builds.ruby,
+        };
+        if builds.platforms.is_empty() || !names_build {
+            continue;
+        }
+        let source = gems().find(|c| {
+            c.dep.patch_uuid == gem_family(dep)
+                && c.dep.name == dep.name
+                && c.dep.version == dep.version
+        });
+        let index = source.and_then(|c| c.dep.registry_override.as_ref());
+        if let Some(index) = index {
+            urls.insert(gem_index_info_url(&index.index_url, &dep.name));
+        }
+    }
+    urls.into_iter().collect()
+}
+
+/// Hand the documents of [`gem_index_targets`] to the gem rewriter: each
+/// URL with the text read from it, or why it could not be read.
+pub fn record_gem_index(read: &mut CandidateFiles, documents: &[(String, Result<String, String>)]) {
+    if documents.is_empty() {
+        return;
+    }
+    let listed: serde_json::Map<String, serde_json::Value> = documents
+        .iter()
+        .map(|(url, document)| {
+            let value = match document {
+                Ok(body) => serde_json::json!({ "body": body }),
+                Err(why) => serde_json::json!({ "error": why }),
+            };
+            (url.clone(), value)
+        })
+        .collect();
+    read.files.insert(
+        crate::patch::redirect::GEM_INDEX_KEY.to_string(),
+        serde_json::Value::Object(listed).to_string(),
+    );
+}
+
 /// The pypi wheels whose metadata a native lock rewrite needs, in
 /// candidate order: `(override, sha256)` of every `.whl` artifact some
 /// `uv.lock` / PEP 723 script lock would rewrite. Each native lock is
@@ -3211,12 +3405,30 @@ async fn unattributed_pins(
             .collect(),
         _ => BTreeSet::new(),
     };
+    // A gem locked as platform builds is pinned to one patch per build,
+    // and the lock names the registry of one patch for all of them (the
+    // fix's source): discovery reads that pin, so each build's patch is
+    // judged by it.
+    let pinned_as: HashMap<&str, &str> = candidates
+        .iter()
+        .filter(|c| done.rewrite.confirmed_gem_uuids.contains(&c.dep.patch_uuid))
+        .map(|c| {
+            (
+                c.dep.patch_uuid.as_str(),
+                crate::patch::redirect::gem_family(&c.dep),
+            )
+        })
+        .collect();
     let vetoed = done
         .confirmed
         .iter()
         .filter(|(purl, uuid)| {
-            !attributed.contains(uuid.as_str())
-                && contested.contains(uuid.as_str())
+            let pin = pinned_as
+                .get(uuid.as_str())
+                .copied()
+                .unwrap_or(uuid.as_str());
+            !attributed.contains(pin)
+                && contested.contains(pin)
                 && !done.rewrite.bundled_skipped_uuids.contains(uuid)
                 && !done.rewrite.alias_skipped_entries.contains_key(uuid)
                 && !exempt.contains(uuid)
@@ -5902,6 +6114,9 @@ fn confirm(
         // report: the URL in a block that was changed by hand pins nothing.
         .filter(|(name, _)| name.as_str() != crate::bazel::maven::FILE)
         .filter(|(name, _)| !crate::patch::redirect::sbt::is_synthetic_key(name))
+        // What a patch registry lists, read for the gem rewriter: its key
+        // holds the registry's URL and pins nothing.
+        .filter(|(name, _)| name.as_str() != crate::patch::redirect::GEM_INDEX_KEY)
         .map(|(name, content)| (name.as_str(), rewrite.files.get(name).unwrap_or(content)))
         .chain(
             rewrite
@@ -5937,6 +6152,18 @@ fn confirm(
                 || rewrite.refused_bun_uuids.contains(uuid)
                 || rewrite.refused_npm_uuids.contains(uuid)
             {
+                return ProbeStep::Decided(false);
+            }
+            // A gem the lock names as platform builds has one patch per
+            // build and one registry for all of them (the fix's source
+            // patch's), so the gem rewriter's own report says which build
+            // is pinned to which patch: the registry URL in the lock
+            // proves nothing about one of them. A gem patch the lock has
+            // no build for pins nothing.
+            if rewrite.gem_family_uuids.contains(uuid) {
+                return ProbeStep::Decided(rewrite.confirmed_gem_uuids.contains(uuid));
+            }
+            if rewrite.gem_idle_uuids.contains(uuid) {
                 return ProbeStep::Decided(false);
             }
             // An sbt build's Maven pins are confirmed by the sbt rewriter's
@@ -7092,70 +7319,230 @@ mod tests {
         );
     }
 
-    /// One reference response answers for a whole batch. A prebuild entry
-    /// that IS a platform and a checksum, but not in the shape the lock
-    /// takes, fails the grant it rides in and no other: the gem is skipped
-    /// with the field named, and the other package keeps its candidate.
+    /// A granted reference of a patch of the gem nokogiri 1.19.3: the
+    /// patch of the platform gem `platform` (`None`: of the ruby gem),
+    /// built from `source` when given.
+    fn gem_reference(
+        uuid: &str,
+        platform: Option<&str>,
+        source: Option<&str>,
+    ) -> PackageVendorResult {
+        let suffix = platform.map(|p| format!("-{p}")).unwrap_or_default();
+        reference(serde_json::json!({
+            "status": "granted",
+            "url": format!("https://patch.example/patch/gem/t/{uuid}/nokogiri-1.19.3{suffix}.gem"),
+            "purl": format!("pkg:gem/nokogiri@1.19.3?platform={}", platform.unwrap_or("ruby")),
+            "rebuiltFromUuid": source,
+            "artifacts": [
+                {"kind": "tarball", "url": null, "integrity": {"sha256": "a".repeat(64)}},
+                {"kind": "gem-stub-gemspec", "url": null, "integrity": {}}
+            ],
+            "registryOverride": {
+                "kind": "rubygems-compact-index",
+                "indexUrl": format!("https://patch.example/patch-registry/gem/t/{uuid}/"),
+                "identifiers": {
+                    "name": "nokogiri", "version": "1.19.3",
+                    "gemChecksumSha256": "a".repeat(64)
+                }
+            }
+        }))
+    }
+
+    const GEM_SOURCE: &str = "5e6f7081-92a3-4b4c-8d5e-6f708192a3b4";
+    const GEM_LINUX: &str = "5e6f7081-92a3-4b4c-8d5e-6f708192a3b5";
+    const GEM_DARWIN: &str = "5e6f7081-92a3-4b4c-8d5e-6f708192a3b6";
+
+    /// Each platform gem of a fix has a patch of its own. A candidate says
+    /// which gem its patch is of (the reference's package URL) and which
+    /// patch it was built from (`rebuiltFromUuid`); nothing an override's
+    /// own identifiers say about either is taken.
     #[test]
-    fn a_wrong_gem_prebuild_fails_only_its_own_grant() {
-        const GEM: &str = "pkg:gem/nokogiri@1.18.10";
-        const NPM: &str = "pkg:npm/c@1";
-        const GEM_UUID: &str = "5e6f7081-92a3-4b4c-8d5e-6f708192a3b4";
+    fn gem_candidates_carry_their_platform_and_the_patch_they_were_built_from() {
+        use crate::patch::redirect::{gem_family, gem_platform};
+        let mut source = gem_reference(GEM_SOURCE, None, None);
+        // Identifiers that claim what only the reference may say.
+        let ids = &mut source.registry_override.as_mut().unwrap().identifiers;
+        ids.gem_platform = Some("java".into());
+        ids.gem_rebuilt_from_uuid = Some(GEM_DARWIN.into());
         let refs = HashMap::from([
+            (GEM_SOURCE.to_string(), source),
             (
-                GEM_UUID.to_string(),
-                reference(serde_json::json!({
-                    "status": "granted",
-                    "url": format!("https://patch.example/patch/gem/t/{GEM_UUID}/nokogiri-1.18.10.gem"),
-                    "purl": GEM,
-                    "artifacts": [{"kind": "tarball", "url": null, "integrity": {
-                        "sha256": "a".repeat(64)
-                    }}],
-                    "registryOverride": {
-                        "kind": "rubygems-compact-index",
-                        "indexUrl": format!("https://patch.example/patch-registry/gem/t/{GEM_UUID}/"),
-                        "identifiers": {
-                            "name": "nokogiri", "version": "1.18.10",
-                            "gemChecksumSha256": "a".repeat(64),
-                            "gemPlatforms": [
-                                {"platform": "arm64-darwin", "gemChecksumSha256": "not-a-digest"}
-                            ]
-                        }
-                    }
-                })),
-            ),
-            (
-                PATCH_UUID.to_string(),
-                reference(serde_json::json!({
-                    "status": "granted",
-                    "url": format!("https://patch.example/patch/npm/c/1/tok/{PATCH_UUID}/c-1.tgz"),
-                    "purl": NPM,
-                    "artifacts": [{"kind": "tarball", "url": null, "integrity": {
-                        "sha512": "sha512-x", "sha1": "a".repeat(40)
-                    }}],
-                    "registryOverride": null
-                })),
+                GEM_LINUX.to_string(),
+                gem_reference(GEM_LINUX, Some("x86_64-linux-gnu"), Some(GEM_SOURCE)),
             ),
         ]);
         let selected = vec![
-            (GEM.to_string(), GEM_UUID.to_string()),
-            (NPM.to_string(), PATCH_UUID.to_string()),
+            (
+                "pkg:gem/nokogiri@1.19.3?platform=ruby".to_string(),
+                GEM_SOURCE.to_string(),
+            ),
+            (
+                "pkg:gem/nokogiri@1.19.3?platform=x86_64-linux-gnu".to_string(),
+                GEM_LINUX.to_string(),
+            ),
         ];
         let (mut skipped, mut warnings) = (Vec::new(), Vec::new());
         let candidates = build_candidates(&selected, &refs, &[], &mut skipped, &mut warnings);
-        let kept: Vec<&str> = candidates.iter().map(|c| c.purl.as_str()).collect();
-        assert_eq!(kept, [NPM], "{skipped:?}");
-        assert_eq!(skipped.len(), 1, "{skipped:?}");
-        assert_eq!(
-            (skipped[0].purl.as_str(), skipped[0].reason.as_str()),
-            (GEM, GRANT_MALFORMED)
+        assert!(skipped.is_empty() && warnings.is_empty(), "{skipped:?}");
+        let [source, linux] = candidates.as_slice() else {
+            panic!("two candidates: {candidates:?}");
+        };
+        assert_eq!(gem_platform(&source.dep), None);
+        assert_eq!(gem_family(&source.dep), GEM_SOURCE);
+        assert_eq!(gem_platform(&linux.dep), Some("x86_64-linux-gnu"));
+        assert_eq!(gem_family(&linux.dep), GEM_SOURCE);
+        assert!(missing_gem_sources(&refs).is_empty());
+    }
+
+    /// A lock of platform builds alone selects no patch of the ruby gem,
+    /// and the registry of the fix's source patch is still the gem's one
+    /// source: the run asks for that patch's reference too, and it joins
+    /// the candidates. It was not selected, so it is never reported: not
+    /// as pinned, and not as left unpinned. A source the run cannot use
+    /// joins nothing.
+    #[test]
+    fn the_source_patch_of_a_gem_fix_joins_the_candidates_for_its_registry() {
+        use crate::patch::redirect::gem_family;
+        let mut refs = HashMap::from([
+            (
+                GEM_LINUX.to_string(),
+                gem_reference(GEM_LINUX, Some("x86_64-linux-gnu"), Some(GEM_SOURCE)),
+            ),
+            (
+                GEM_DARWIN.to_string(),
+                gem_reference(GEM_DARWIN, Some("arm64-darwin"), Some(GEM_SOURCE)),
+            ),
+        ]);
+        let selected = vec![
+            (
+                "pkg:gem/nokogiri@1.19.3?platform=arm64-darwin".to_string(),
+                GEM_DARWIN.to_string(),
+            ),
+            (
+                "pkg:gem/nokogiri@1.19.3?platform=x86_64-linux-gnu".to_string(),
+                GEM_LINUX.to_string(),
+            ),
+        ];
+        assert_eq!(missing_gem_sources(&refs), [GEM_SOURCE]);
+        let build = |refs: &HashMap<String, PackageVendorResult>| {
+            let (mut skipped, mut warnings) = (Vec::new(), Vec::new());
+            let candidates = build_candidates(&selected, refs, &[], &mut skipped, &mut warnings);
+            assert!(skipped.is_empty() && warnings.is_empty(), "{skipped:?}");
+            candidates
+        };
+        // Without the source's reference there are the two builds alone.
+        assert_eq!(build(&refs).len(), 2);
+
+        refs.insert(
+            GEM_SOURCE.to_string(),
+            gem_reference(GEM_SOURCE, None, None),
         );
+        assert!(missing_gem_sources(&refs).is_empty());
+        let candidates = build(&refs);
+        let uuids: Vec<&str> = candidates
+            .iter()
+            .map(|c| c.dep.patch_uuid.as_str())
+            .collect();
+        assert_eq!(uuids, [GEM_DARWIN, GEM_LINUX, GEM_SOURCE]);
+        assert!(candidates.iter().all(|c| gem_family(&c.dep) == GEM_SOURCE));
+        assert_eq!(candidates[2].purl, "pkg:gem/nokogiri@1.19.3?platform=ruby");
+        let quiet = quiet_candidates(&candidates, &selected, &RewriteResult::default());
+        assert_eq!(quiet, BTreeSet::from([GEM_SOURCE.to_string()]));
+        assert_eq!(
+            unconfirmed_candidates(&candidates, &[], &[], &quiet).len(),
+            2,
+            "the two builds are reported; the source is not"
+        );
+
+        // A withdrawn source: the builds stand alone, and the gem rewriter
+        // leaves the gem where it is.
+        refs.insert(
+            GEM_SOURCE.to_string(),
+            reference(serde_json::json!({ "status": "withdrawn" })),
+        );
+        assert_eq!(build(&refs).len(), 2);
+    }
+
+    /// One reference response answers for a whole batch. What a response
+    /// still carries of the retired platform fields is read past, in any
+    /// shape, and fails no grant: the gem's reference is the ruby gem's
+    /// patch. A platform or a source uuid that is not in the shape the
+    /// run prints fails the grant it rides in and no other.
+    #[test]
+    fn a_wrong_gem_field_fails_only_its_own_grant() {
+        const NPM: &str = "pkg:npm/c@1";
+        let mut retired = serde_json::to_value(serde_json::json!({
+            "status": "granted",
+            "url": format!("https://patch.example/patch/gem/t/{GEM_SOURCE}/nokogiri-1.19.3.gem"),
+            "purl": "pkg:gem/nokogiri@1.19.3?platform=ruby",
+            "artifacts": [
+                {"kind": "tarball", "url": null, "integrity": {"sha256": "a".repeat(64)}},
+                {"kind": "gem-platform", "platform": "arm64-darwin", "url": null}
+            ],
+            "registryOverride": {
+                "kind": "rubygems-compact-index",
+                "indexUrl": format!("https://patch.example/patch-registry/gem/t/{GEM_SOURCE}/"),
+                "identifiers": {
+                    "name": "nokogiri", "version": "1.19.3",
+                    "gemChecksumSha256": "a".repeat(64),
+                    "gemPlatforms": [
+                        {"platform": "arm64-darwin", "gemChecksumSha256": "not-a-digest"}
+                    ]
+                }
+            }
+        }))
+        .unwrap();
+        let npm = reference(serde_json::json!({
+            "status": "granted",
+            "url": format!("https://patch.example/patch/npm/c/1/tok/{PATCH_UUID}/c-1.tgz"),
+            "purl": NPM,
+            "artifacts": [{"kind": "tarball", "url": null, "integrity": {
+                "sha512": "sha512-x", "sha1": "a".repeat(40)
+            }}],
+            "registryOverride": null
+        }));
+        let run = |gem: serde_json::Value, gem_purl: &str| {
+            let refs = HashMap::from([
+                (GEM_SOURCE.to_string(), reference(gem)),
+                (PATCH_UUID.to_string(), npm.clone()),
+            ]);
+            let selected = vec![
+                (gem_purl.to_string(), GEM_SOURCE.to_string()),
+                (NPM.to_string(), PATCH_UUID.to_string()),
+            ];
+            let (mut skipped, mut warnings) = (Vec::new(), Vec::new());
+            let candidates = build_candidates(&selected, &refs, &[], &mut skipped, &mut warnings);
+            let kept: Vec<String> = candidates.iter().map(|c| c.purl.clone()).collect();
+            (kept, skipped)
+        };
+        let ruby = "pkg:gem/nokogiri@1.19.3?platform=ruby";
+        let (kept, skipped) = run(retired.clone(), ruby);
+        assert_eq!(kept, [ruby, NPM], "{skipped:?}");
+        assert!(skipped.is_empty(), "{skipped:?}");
+
+        retired["rebuiltFromUuid"] = serde_json::json!("not-a-uuid");
+        let (kept, skipped) = run(retired.clone(), ruby);
+        assert_eq!(kept, [NPM], "{skipped:?}");
+        assert_eq!(skipped[0].reason, GRANT_MALFORMED);
         assert!(
             skipped[0]
                 .detail
                 .as_deref()
                 .unwrap()
-                .contains("its gem platform checksum is not 64 hex digits"),
+                .contains("its source patch is not a patch UUID"),
+            "{skipped:?}"
+        );
+
+        retired["rebuiltFromUuid"] = serde_json::Value::Null;
+        retired["purl"] = serde_json::json!("pkg:gem/nokogiri@1.19.3?platform=21-darwin");
+        let (kept, skipped) = run(retired, "pkg:gem/nokogiri@1.19.3?platform=21-darwin");
+        assert_eq!(kept, [NPM], "{skipped:?}");
+        assert!(
+            skipped[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("its gem platform is not a plain platform name"),
             "{skipped:?}"
         );
     }
@@ -12840,30 +13227,43 @@ snapshots:
         assert!(!gem_rewrite(&p).await.0.files.contains_key(KEY));
     }
 
-    /// A gem locked as precompiled platform builds, with a prebuild for
-    /// each: the rewrite moves every build, and lockfile discovery (what
-    /// `vex`, `rollback` and `remove` read) attributes them to the one pin,
-    /// so the engine confirms it instead of dropping the rewrite as
-    /// unattributable. A second run over the result confirms the same pin
-    /// and writes nothing.
-    #[tokio::test]
-    async fn gem_platform_builds_are_confirmed_as_one_pin() {
-        use crate::patch::redirect::GemPlatformChecksum;
+    /// The patch of the platform gem `platform` of [`gem_candidate`]'s gem,
+    /// built from that candidate's patch: its own uuid, registry and
+    /// sha256 (`digit` repeated).
+    fn gem_build_candidate(platform: &str, uuid: &str, digit: &str) -> Candidate {
         let mut candidate = gem_candidate();
+        candidate.purl = format!("pkg:gem/rails@7.0.0?platform={platform}");
+        let dep = &mut candidate.dep;
+        dep.patch_uuid = uuid.to_string();
+        dep.artifact_url = format!(
+            "https://patch.test/patch-registry/gem/{FIXTURE_TOKEN}/{uuid}/gems/rails-7.0.0-{platform}.gem"
+        );
+        let ov = dep.registry_override.as_mut().unwrap();
+        ov.index_url = format!("https://patch.test/patch-registry/gem/{FIXTURE_TOKEN}/{uuid}/");
+        ov.identifiers.gem_checksum_sha256 = Some(digit.repeat(64));
+        ov.identifiers.gem_platform = Some(platform.to_string());
+        ov.identifiers.gem_rebuilt_from_uuid = Some(FIXTURE_UUID.to_string());
         candidate
-            .dep
-            .registry_override
-            .as_mut()
-            .unwrap()
-            .identifiers
-            .gem_platforms = ["arm64-darwin", "x86_64-linux-gnu"]
-            .iter()
-            .zip(["a", "b"])
-            .map(|(platform, digit)| GemPlatformChecksum {
-                platform: platform.to_string(),
-                gem_checksum_sha256: digit.repeat(64),
-            })
-            .collect();
+    }
+
+    const GEM_ARM_UUID: &str = "77777777-7777-4777-8777-77777777777a";
+    const GEM_LINUX_UUID: &str = "77777777-7777-4777-8777-77777777777b";
+
+    /// A gem locked as precompiled platform builds, with a patch of one fix
+    /// for each: the rewrite moves every build into the section of the
+    /// fix's source patch's registry, and each build's own patch is
+    /// confirmed. Lockfile discovery (what `vex`, `rollback` and `remove`
+    /// read) reads the builds as the one pin of that registry, so the
+    /// engine keeps the rewrite instead of dropping it as unattributable.
+    /// The source patch pins no build of this lock and is not confirmed. A
+    /// second run over the result confirms the same and writes nothing.
+    #[tokio::test]
+    async fn gem_platform_builds_are_confirmed_each_by_its_own_patch() {
+        let candidates = vec![
+            gem_candidate(),
+            gem_build_candidate("arm64-darwin", GEM_ARM_UUID, "a"),
+            gem_build_candidate("x86_64-linux-gnu", GEM_LINUX_UUID, "b"),
+        ];
         let lock = format!(
             "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0-arm64-darwin)\n    rails \
              (7.0.0-x86_64-linux-gnu)\n\nPLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\nDEPENDENCIES\n  \
@@ -12875,18 +13275,33 @@ snapshots:
         let mut p = MemoryProject::new();
         p.insert_text("Gemfile", GEMFILE);
         p.insert_text("Gemfile.lock", lock.as_str());
-        let (_, done) = gem_rewrite_of(&ProjectView::Memory(&p), vec![candidate.clone()]).await;
+        let (read, done) = gem_rewrite_of(&ProjectView::Memory(&p), candidates.clone()).await;
         assert!(done.unattributed.is_empty(), "{:?}", done.unattributed);
+        let builds = [
+            (
+                "pkg:gem/rails@7.0.0?platform=arm64-darwin".to_string(),
+                GEM_ARM_UUID.to_string(),
+            ),
+            (
+                "pkg:gem/rails@7.0.0?platform=x86_64-linux-gnu".to_string(),
+                GEM_LINUX_UUID.to_string(),
+            ),
+        ];
+        assert_eq!(done.confirmed, builds);
+        // The one registry the lock names is the source patch's.
         assert_eq!(
-            done.confirmed,
-            [("pkg:gem/rails@7.0.0".to_string(), FIXTURE_UUID.to_string())]
+            gem_index_targets(&candidates, &read.files),
+            [format!(
+                "https://patch.test/patch-registry/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/info/rails"
+            )]
         );
         let written = &done.rewrite.files["Gemfile.lock"];
         assert!(
-            written.contains(
-                "  specs:\n    rails (7.0.0-arm64-darwin)\n    rails (7.0.0-x86_64-linux-gnu)\n\nGEM\n  \
+            written.contains(&format!(
+                "GEM\n  remote: https://patch.test/patch-registry/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/\n  \
+                 specs:\n    rails (7.0.0-arm64-darwin)\n    rails (7.0.0-x86_64-linux-gnu)\n\nGEM\n  \
                  remote: https://rubygems.org/\n  specs:\n\nPLATFORMS"
-            ),
+            )),
             "{written}"
         );
         assert!(
@@ -12898,14 +13313,67 @@ snapshots:
             )),
             "{written}"
         );
+        for uuid in [GEM_ARM_UUID, GEM_LINUX_UUID] {
+            assert!(!written.contains(uuid), "no build's own registry is named");
+        }
+        // The source patch was selected here (the first candidate), has no
+        // build in this lock, and is neither confirmed nor left unpinned.
+        let selected: Vec<(String, String)> = candidates
+            .iter()
+            .map(|c| (c.purl.clone(), c.dep.patch_uuid.clone()))
+            .collect();
+        let quiet = quiet_candidates(&candidates, &selected, &done.rewrite);
+        assert_eq!(quiet, BTreeSet::from([FIXTURE_UUID.to_string()]));
+        assert!(unconfirmed_candidates(&candidates, &done.confirmed, &[], &quiet).is_empty());
 
         for (rel, text) in &done.rewrite.files {
             p.insert_text(rel, text.as_str());
         }
-        let (_, again) = gem_rewrite_of(&ProjectView::Memory(&p), vec![candidate]).await;
+        let (_, again) = gem_rewrite_of(&ProjectView::Memory(&p), candidates.clone()).await;
         assert!(again.rewrite.files.is_empty(), "{:?}", again.rewrite.edits);
         assert_eq!(again.confirmed, done.confirmed);
         assert!(again.unattributed.is_empty(), "{:?}", again.unattributed);
+
+        // What the registry lists decides: with one build missing from it,
+        // nothing is written and nothing is confirmed.
+        let mut p = MemoryProject::new();
+        p.insert_text("Gemfile", GEMFILE);
+        p.insert_text("Gemfile.lock", lock.as_str());
+        let view = ProjectView::Memory(&p);
+        let mut read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        let listed = gem_index_targets(&candidates, &read.files)
+            .into_iter()
+            .map(|url| {
+                let body = format!("---\n7.0.0-arm64-darwin |checksum:{}\n", "a".repeat(64));
+                (url, Ok(body))
+            })
+            .collect::<Vec<_>>();
+        record_gem_index(&mut read, &listed);
+        let outer = OuterAllowRemote::default;
+        let options = RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: true,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
+            maven_selection: &no_maven_selection,
+            pnpm_env: &no_env,
+            blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
+        };
+        let unserved = rewrite(&view, read, &candidates, BTreeMap::new(), options).await;
+        assert!(unserved.rewrite.files.is_empty());
+        assert!(unserved.confirmed.is_empty(), "{:?}", unserved.confirmed);
+        assert_eq!(
+            warning_codes(&unserved),
+            ["redirect_gem_platform_unsupported"]
+        );
     }
 
     /// #390: `bundle config set --local gemfile Gemfile.next` makes bundler

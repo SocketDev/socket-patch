@@ -160,6 +160,12 @@ pub(crate) struct Planned {
     /// `(artifact url, sha512)` of every npm tarball a yarn classic pin
     /// reads (its sha1, #558, and its package.json, #591).
     pub(crate) npm_classic: Vec<(String, String)>,
+    /// The compact-index documents the gem rewriter checks a lock of
+    /// platform builds against ([`engine::gem_index_targets`]).
+    pub(crate) gem_indexes: Vec<String>,
+    /// The uuids the run selected: a candidate outside them was added for
+    /// its registry alone ([`engine::quiet_candidates`]).
+    pub(crate) selected: Vec<(String, String)>,
 }
 
 /// Everything up to the wheel-metadata fetch. `unreadable` are the paths
@@ -226,6 +232,7 @@ pub(crate) async fn plan(
     .into_iter()
     .filter_map(|dep| Some((dep.artifact_url.clone(), dep.integrity.sha512.clone()?)))
     .collect();
+    let gem_indexes = engine::gem_index_targets(&candidates, &read.files);
     Ok(Planned {
         project,
         candidates,
@@ -235,6 +242,8 @@ pub(crate) async fn plan(
         wheels,
         npm_manifests,
         npm_classic,
+        gem_indexes,
+        selected: selected.to_vec(),
     })
 }
 
@@ -258,12 +267,14 @@ pub(crate) struct RewriteRefused {
 }
 
 /// Wheel metadata, served npm manifests and the served npm tarballs a
-/// yarn classic pin reads (each keyed by artifact URL) → the engine's
+/// yarn classic pin reads (each keyed by artifact URL), and what the gem
+/// patch registries list (`gem_indexes`, by document URL) → the engine's
 /// rewrite → the guard.
 pub(crate) async fn rewrite(
     planned: Planned,
     artifact_metadata: &BTreeMap<String, Result<Option<String>, String>>,
     artifact_classic: &BTreeMap<String, Result<HostedClassicArtifact, String>>,
+    gem_indexes: &BTreeMap<String, Result<String, String>>,
     options: StageOptions,
 ) -> Result<Rewritten, RewriteRefused> {
     let Planned {
@@ -271,11 +282,24 @@ pub(crate) async fn rewrite(
         mut candidates,
         mut skipped,
         pre_warnings,
-        read,
+        mut read,
         wheels,
         npm_manifests,
         npm_classic,
+        gem_indexes: gem_index_urls,
+        selected,
     } = planned;
+    let listed: Vec<(String, Result<String, String>)> = gem_index_urls
+        .into_iter()
+        .map(|url| {
+            let document = gem_indexes
+                .get(&url)
+                .cloned()
+                .unwrap_or_else(|| Err("it was not read".to_string()));
+            (url, document)
+        })
+        .collect();
+    engine::record_gem_index(&mut read, &listed);
     let skipped_before = skipped.clone();
     let mut python_metadata: BTreeMap<String, String> = BTreeMap::new();
     let mut unavailable: BTreeSet<String> = BTreeSet::new();
@@ -395,7 +419,9 @@ pub(crate) async fn rewrite(
         });
     }
     skipped.extend(done.unattributed.iter().cloned());
-    let unconfirmed = engine::unconfirmed_candidates(&candidates, &done.confirmed, &skipped);
+    let quiet = engine::quiet_candidates(&candidates, &selected, &done.rewrite);
+    let unconfirmed =
+        engine::unconfirmed_candidates(&candidates, &done.confirmed, &skipped, &quiet);
     Ok(Rewritten {
         project,
         skipped,

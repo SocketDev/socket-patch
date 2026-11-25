@@ -267,12 +267,11 @@ fn check_registry_override(ov: &RegistryOverride, origins: &[String]) -> Result<
             return Err(bad(what, "64 hex digits"));
         }
     }
-    // A prebuild's platform and sha256 are spelled into `Gemfile.lock`
-    // (`name (version-<platform>) sha256=<hex>`) and its platform into the
-    // gem file name a refresh downloads. One entry per platform: two would
-    // leave which sha256 the lock pins to their order.
-    for (at, prebuild) in ids.gem_platforms.iter().enumerate() {
-        let platform = prebuild.platform.as_str();
+    // The platform a gem patch is for is compared with the platforms
+    // `Gemfile.lock` names and is printed in a skip's detail; the patch it
+    // was built from is asked for by its uuid and printed there too. The
+    // ruby-platform gem's patch states no platform.
+    if let Some(platform) = ids.gem_platform.as_deref() {
         if !is_plain_gem_token(platform)
             || platform.len() > MAX_COORDINATE
             || !platform.starts_with(|c: char| c.is_ascii_alphabetic())
@@ -280,15 +279,9 @@ fn check_registry_override(ov: &RegistryOverride, origins: &[String]) -> Result<
         {
             return Err(bad("gem platform", "a plain platform name"));
         }
-        if !is_hex(&prebuild.gem_checksum_sha256, 64) {
-            return Err(bad("gem platform checksum", "64 hex digits"));
-        }
-        if ids.gem_platforms[..at]
-            .iter()
-            .any(|earlier| earlier.platform == platform)
-        {
-            return Err(bad("gem platform list", "one entry per platform"));
-        }
+    }
+    if served(&ids.gem_rebuilt_from_uuid).is_some_and(|s| !is_canonical_uuid(s)) {
+        return Err(bad("source patch", "a patch UUID"));
     }
     for (what, digest) in [
         ("Maven pom sha256", &ids.maven_pom_sha256),
@@ -603,45 +596,30 @@ mod tests {
             let reason = malformed(&dep);
             assert!(reason.starts_with(&format!("its {field} ")), "{reason}");
         }
-        // A gem patch's prebuilds: each platform and sha256 is written
-        // into the lock.
-        type Prebuilds = Vec<(&'static str, String)>;
-        let sha = "c".repeat(64);
-        let prebuilds: [(Option<&str>, Prebuilds); 6] = [
-            (
-                None,
-                vec![("x86_64-linux-gnu", sha.clone()), ("java", sha.clone())],
-            ),
-            (Some("gem platform "), vec![("ruby", sha.clone())]),
+        // A gem patch's platform is matched against the lock's and printed;
+        // the patch it was built from is asked for by its uuid.
+        let platforms: [(Option<&str>, Option<&str>, Option<&str>); 7] = [
+            (None, None, None),
+            (None, Some("x86_64-linux-gnu"), Some(UUID)),
+            (None, Some("java"), None),
+            (Some("gem platform "), Some("ruby"), None),
             (
                 Some("gem platform "),
-                vec![("arm64-darwin)\n  evil (1.0", sha.clone())],
+                Some("arm64-darwin)\n  evil (1.0"),
+                None,
             ),
-            (Some("gem platform "), vec![("21-darwin", sha.clone())]),
+            (Some("gem platform "), Some("21-darwin"), None),
             (
-                Some("gem platform checksum "),
-                vec![("arm64-darwin", "abc".to_string())],
-            ),
-            (
-                Some("gem platform list "),
-                vec![("arm64-darwin", sha.clone()), ("arm64-darwin", sha.clone())],
+                Some("source patch "),
+                Some("arm64-darwin"),
+                Some("not-a-uuid\n"),
             ),
         ];
-        for (field, list) in prebuilds {
+        for (field, platform, source) in platforms {
             let mut dep = maven();
-            dep.registry_override
-                .as_mut()
-                .unwrap()
-                .identifiers
-                .gem_platforms = list
-                .iter()
-                .map(
-                    |(platform, sha)| crate::patch::redirect::GemPlatformChecksum {
-                        platform: platform.to_string(),
-                        gem_checksum_sha256: sha.clone(),
-                    },
-                )
-                .collect();
+            let ids = &mut dep.registry_override.as_mut().unwrap().identifiers;
+            ids.gem_platform = platform.map(str::to_string);
+            ids.gem_rebuilt_from_uuid = source.map(str::to_string);
             match field {
                 None => assert_eq!(check(&dep, &[]), Ok(())),
                 Some(field) => {

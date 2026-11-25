@@ -75,7 +75,7 @@ use crate::policy::{
     PolicySource, Root, RootFile, SelectionPolicy, PATCHES_DISABLED, POLICY_FILE_NAMES,
 };
 use crate::rollout::stage::{
-    classify, lookup_incomplete, mark_pinned, offers_from_results, Offers, RecordedIndex, Row,
+    classify_with, lookup_incomplete, mark_pinned, offers_from_results, Offers, RecordedIndex, Row,
     Stage, ROLLOUT_DEFERRED,
 };
 use crate::utils::purl_key::PurlKey;
@@ -1000,6 +1000,10 @@ async fn engine(
             .is_some_and(|e| e.code == "patch_lookup_failed")
     });
     let roots_by_path: Vec<String> = states.iter().map(|s| s.root.clone()).collect();
+    // The package references read to settle the patches of platform-locked
+    // gems, by uuid.
+    let mut gem_references: HashMap<String, crate::api::types::PackageVendorResult> =
+        HashMap::new();
     for state in states.iter_mut() {
         if state.error.is_some() {
             continue;
@@ -1009,7 +1013,34 @@ async fn engine(
         };
         let recorded = memory_recorded(project, &state.root, &roots_by_path).await;
         stage.incomplete |= lookup_incomplete(&recorded, &state.failed_details, batch_failed);
-        let mut rows = classify(&state.offers, &recorded, &state.root);
+        // A gem the Bundler lock names as platform builds has one patch per
+        // build: the patches of platform gems it does not name leave the
+        // selection, and its builds take the patches of one fix
+        // (`gem_fixes`), as on disk. That reads the references of the
+        // patches on offer for those builds; a failed lookup settles
+        // nothing here and is reported by the run's own.
+        let lock = crate::hosted::gem_fixes::GemLock::read(
+            &ProjectView::Memory(project),
+            state.offers.unfiltered.keys().map(String::as_str),
+        )
+        .await;
+        lock.narrow(&mut state.offers);
+        let asked: BTreeSet<String> = lock.reference_uuids(&state.offers).into_iter().collect();
+        let mut gem_builds = HashMap::new();
+        if !asked.is_empty() {
+            let (found, failed) = discover::fetch_references(&provider, &asked).await;
+            if failed.is_empty() {
+                gem_builds = lock.choose(&mut state.offers, &found, &recorded);
+                gem_references.extend(found.into_iter().filter(|(uuid, reference)| {
+                    asked.contains(uuid)
+                        && matches!(
+                            reference.status.as_str(),
+                            "granted" | "reused" | "withdrawn" | "not_found" | "forbidden"
+                        )
+                }));
+            }
+        }
+        let mut rows = classify_with(&state.offers, &recorded, Some(&gem_builds), &state.root);
         for row in &mut rows {
             row.candidate.in_flight = options.in_flight.contains(&row.candidate.base_purl);
         }
@@ -1026,11 +1057,30 @@ async fn engine(
         .filter(|s| s.error.is_none())
         .flat_map(|s| s.selected.iter().map(|(_, u)| u.clone()))
         .collect();
-    let (references, failed_refs) = if uuids.is_empty() {
+    // The references read above to settle the gems' patches are not asked
+    // for again.
+    let unasked: BTreeSet<String> = uuids
+        .iter()
+        .filter(|uuid| !gem_references.contains_key(*uuid))
+        .cloned()
+        .collect();
+    let (mut references, failed_refs) = if unasked.is_empty() {
         (HashMap::new(), BTreeMap::new())
     } else {
-        discover::fetch_references(&provider, &uuids).await
+        discover::fetch_references(&provider, &unasked).await
     };
+    references.extend(gem_references);
+    // The source patch of a gem fix, where only its platform builds were
+    // selected: its registry is the gem's source (see
+    // `engine::missing_gem_sources`). A failed lookup leaves the gem
+    // alone, with the rewriter's warning.
+    let sources: BTreeSet<String> = crate::hosted::engine::missing_gem_sources(&references)
+        .into_iter()
+        .collect();
+    if !sources.is_empty() {
+        let (found, _) = discover::fetch_references(&provider, &sources).await;
+        references.extend(found);
+    }
     // Roots whose rows' eligibility is unknown: a reference failure that
     // hit only NEW rows of a capped run defers them instead of failing the
     // root (§5.2).
@@ -1129,6 +1179,16 @@ async fn engine(
         )
         .await
     };
+    let gem_index_urls: BTreeSet<String> = planned
+        .iter()
+        .flat_map(|(_, p)| p.gem_indexes.iter().cloned())
+        .collect();
+    let gem_indexes = discover::fetch_gem_indexes(
+        &provider,
+        &gem_index_urls,
+        options.limits.max_artifact_bytes,
+    )
+    .await;
     phases.mark("plan");
 
     let stage_options = StageOptions {
@@ -1144,7 +1204,15 @@ async fn engine(
         if stage.capped() {
             first_plans.insert(index, plan.clone());
         }
-        match stages::rewrite(plan, &artifact_metadata, &artifact_classic, stage_options).await {
+        match stages::rewrite(
+            plan,
+            &artifact_metadata,
+            &artifact_classic,
+            &gem_indexes,
+            stage_options,
+        )
+        .await
+        {
             Ok(done) => rewritten.push((index, done)),
             Err(RewriteRefused { refusal, skipped }) => {
                 states[index].skipped = skipped;
@@ -1231,7 +1299,14 @@ async fn engine(
                 .retain(|c| !root_deferred.contains(&c.dep.patch_uuid));
             plan.skipped
                 .extend(states[index].deferred.iter().map(deferred_skip));
-            match stages::rewrite(plan, &artifact_metadata, &artifact_classic, stage_options).await
+            match stages::rewrite(
+                plan,
+                &artifact_metadata,
+                &artifact_classic,
+                &gem_indexes,
+                stage_options,
+            )
+            .await
             {
                 Ok(done) => again.push((index, done)),
                 Err(RewriteRefused { refusal, skipped }) => {

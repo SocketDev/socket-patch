@@ -144,6 +144,16 @@ pub(crate) struct Sources {
     /// v5 hosted mode keeps no ledger, so [`plan`] fetches their records
     /// and files them as hosted records. Empty everywhere else.
     pub hosted_uuids: Vec<String>,
+    /// Embedded hosted `scan --vex` only: patch uuid → the uuid the
+    /// Bundler lock names, for each patch that run pinned a platform build
+    /// of a gem to. Each platform gem of a fix has a patch of its own, and
+    /// the lock names the registry of one patch (the fix's source) for all
+    /// of them, so lockfile discovery yields that one uuid. [`plan`] reads
+    /// its reference as the wiring of every patch mapped to it here: each
+    /// build is then attested by the patch that patched it. Empty
+    /// everywhere else: a standalone `vex` attests the pin by the patch
+    /// the lock names.
+    pub hosted_gem_fixes: HashMap<String, String>,
 }
 
 impl Sources {
@@ -557,6 +567,7 @@ pub(crate) async fn plan(
         mut redirect,
         discovery,
         hosted_uuids,
+        hosted_gem_fixes,
     } = sources;
     let mut notes = Vec::new();
     // The in-run hosted pins' records, filed under the API's purl like a
@@ -587,6 +598,12 @@ pub(crate) async fn plan(
 
     let mut gated: Vec<FailedPatch> = Vec::new();
     let mut cands = build_candidates(&manifest, &vendor, redirect.as_ref());
+    // A gem vendored as platform gems is one ledger entry and one wired
+    // directory, and each of its trees is the platform gem of a patch of
+    // its own: each is attested by that patch, through the directory's one
+    // lockfile reference.
+    let mut gem_fixes = hosted_gem_fixes;
+    expand_vendored_gem_builds(&mut cands, &mut gem_fixes);
     let conflicts = wiring_conflicts(&discovery);
     if !conflicts.is_empty() {
         // Gate every candidate for a conflicting package BEFORE anything can
@@ -627,7 +644,7 @@ pub(crate) async fn plan(
             });
         }
     }
-    let superseded = attach_discovered(&mut cands, &discovery, &vendor, &conflicts);
+    let superseded = attach_discovered(&mut cands, &discovery, &vendor, &conflicts, &gem_fixes);
     // Wired, but a build bypasses the pin (`Unattested`: a Gradle lock
     // above the hosted base resolves the newer upstream release, a pnpm
     // bundled copy, a deno.lock copy, an npm shrinkwrap with no
@@ -998,6 +1015,66 @@ fn build_candidates(
     .collect()
 }
 
+/// Replace the candidate of each gem vendored as platform gems
+/// ([`VendorEntry::gem_builds`]) with one candidate per platform gem: its
+/// own patch purl (`…?platform=<platform>`), patch uuid and record, all
+/// verified against the one vendored directory. `gem_fixes` gains each of
+/// those uuids, mapped to the uuid the directory (and its lockfile
+/// reference) is named after. A build the ledger holds no record for
+/// stays with the entry's own candidate, which is then kept.
+fn expand_vendored_gem_builds(cands: &mut Vec<Cand>, gem_fixes: &mut HashMap<String, String>) {
+    let mut expanded: Vec<Cand> = Vec::new();
+    let mut i = 0;
+    while i < cands.len() {
+        // The entry's own candidate (the patch the directory is named
+        // after), not a platform gem's that was given the entry below.
+        let own_uuid = cands[i].uuid.as_str();
+        let unit = cands[i]
+            .vendor_entry
+            .as_ref()
+            .filter(|entry| entry.ecosystem == "gem" && !entry.gem_builds.is_empty())
+            .filter(|entry| entry.uuid == own_uuid)
+            .filter(|entry| entry.gem_builds.iter().all(|built| built.record.is_some()))
+            .cloned();
+        let Some(entry) = unit else {
+            i += 1;
+            continue;
+        };
+        let lead = cands.remove(i);
+        let base = strip_purl_qualifiers(&entry.base_purl);
+        for built in &entry.gem_builds {
+            let key = format!("{base}?platform={}", built.platform);
+            gem_fixes.insert(built.uuid.clone(), entry.uuid.clone());
+            // A manifest record of the same platform gem keeps its key.
+            let own = cands
+                .iter_mut()
+                .chain(expanded.iter_mut())
+                .find(|c| PurlKey::qualified(&c.key) == PurlKey::qualified(&key));
+            match own {
+                Some(cand) => {
+                    if cand.uuid != built.uuid {
+                        cand.uuid = built.uuid.clone();
+                        cand.record = built.record.clone();
+                    }
+                    cand.vendor_entry = Some(entry.clone());
+                }
+                None => expanded.push(Cand {
+                    key,
+                    uuid: built.uuid.clone(),
+                    record: built.record.clone(),
+                    alts: Vec::new(),
+                    manifest_owned: lead.manifest_owned,
+                    redirected: false,
+                    vendor_entry: Some(entry.clone()),
+                    discovered: Vec::new(),
+                    lockfile_only: false,
+                }),
+            }
+        }
+    }
+    cands.extend(expanded);
+}
+
 /// Packages the discovered references wire to MORE than one patch uuid
 /// (any mix of modes and files), mapped to a human description of the
 /// disagreeing wiring (`<uuid> (<file>), …`) for the note.
@@ -1058,6 +1135,7 @@ fn attach_discovered(
     discovery: &Discovery,
     vendor: &VendorState,
     conflicts: &BTreeMap<String, String>,
+    gem_fixes: &HashMap<String, String>,
 ) -> Vec<(String, String, String)> {
     let mut groups: BTreeMap<&str, Vec<&PatchedRef>> = BTreeMap::new();
     for r in &discovery.refs {
@@ -1072,13 +1150,31 @@ fn attach_discovered(
         let idxs: Vec<usize> = (0..cands.len())
             .filter(|&i| PurlKey::same(&cands[i].key, pkg))
             .collect();
-        // Pass 1: the candidate already attests the wired uuid.
+        // Pass 1: the candidate already attests the wired uuid. A gem the
+        // lock names as platform builds is wired by one patch for every
+        // build (hosted: the registry of its fix's source patch; vendored:
+        // the directory named after it), each of which has a patch of its
+        // own (`gem_fixes`: `Sources::hosted_gem_fixes` and the vendor
+        // ledger's `gemBuilds`): the reference is the wiring of each of
+        // those patches.
         let mut unmatched: Vec<&PatchedRef> = Vec::new();
         for r in &refs {
             let mut matched = false;
             for &i in &idxs {
                 if cands[i].uuid == r.uuid {
                     cands[i].discovered.push((*r).clone());
+                    matched = true;
+                } else if gem_fixes.get(&cands[i].uuid) == Some(&r.uuid) {
+                    // A hosted reference stands for the build's own patch;
+                    // a vendored one keeps naming the directory it wires.
+                    let uuid = match r.mode {
+                        WiringMode::Hosted => cands[i].uuid.clone(),
+                        _ => r.uuid.clone(),
+                    };
+                    cands[i].discovered.push(PatchedRef {
+                        uuid,
+                        ..(*r).clone()
+                    });
                     matched = true;
                 }
             }
@@ -1712,6 +1808,7 @@ mod tests {
             redirect: Some(redirect),
             discovery: discovery(vec![hosted_ref("pkg:npm/x@1.0.0", U2, true)]),
             hosted_uuids: Vec::new(),
+            hosted_gem_fixes: HashMap::new(),
         };
         let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert_eq!(plan.view.patches["pkg:npm/x@1.0.0"].uuid, U2);
@@ -1768,6 +1865,7 @@ mod tests {
                 redirect: Some(redirect),
                 discovery: discovery(refs),
                 hosted_uuids: Vec::new(),
+                hosted_gem_fixes: HashMap::new(),
             };
             let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
             assert_eq!(plan.redirected, vec![key.to_string()], "{what}");
@@ -1792,6 +1890,7 @@ mod tests {
             redirect: None,
             discovery: discovery(vec![hosted_ref("pkg:npm/x@1.0.0", U2, true)]),
             hosted_uuids: Vec::new(),
+            hosted_gem_fixes: HashMap::new(),
         };
         let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert!(
@@ -1828,6 +1927,7 @@ mod tests {
             redirect: Some(redirect),
             discovery: discovery(vec![hosted_ref("pkg:npm/x@1.0.0", U1, true)]),
             hosted_uuids: Vec::new(),
+            hosted_gem_fixes: HashMap::new(),
         };
         let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert!(plan
@@ -1871,6 +1971,7 @@ mod tests {
                 hosted_ref("pkg:npm/y@1.0.0", U2, true),
             ]),
             hosted_uuids: Vec::new(),
+            hosted_gem_fixes: HashMap::new(),
         };
         let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert_eq!(plan.gated, vec![failed("pkg:npm/x@1.0.0", WIRING_CONFLICT)]);
@@ -1920,6 +2021,7 @@ mod tests {
             redirect: Some(redirect.clone()),
             discovery: Discovery::default(),
             hosted_uuids: Vec::new(),
+            hosted_gem_fixes: HashMap::new(),
         };
         let live = plan(
             &common(tmp.path()),
@@ -2038,6 +2140,7 @@ mod tests {
             redirect: Some(redirect.clone()),
             discovery,
             hosted_uuids: Vec::new(),
+            hosted_gem_fixes: HashMap::new(),
         };
 
         // Control — nothing recognized: the hosted ledger's own recorded
@@ -2125,6 +2228,7 @@ mod tests {
             redirect: Some(redirect),
             discovery: discovery(vec![hosted_ref("pkg:npm/x@1.0.0", U1, true)]),
             hosted_uuids: Vec::new(),
+            hosted_gem_fixes: HashMap::new(),
         };
         let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         let wiring = &plan.hosted["pkg:npm/x@1.0.0"];
@@ -2157,6 +2261,7 @@ mod tests {
             redirect: Some(redirect.clone()),
             discovery,
             hosted_uuids: Vec::new(),
+            hosted_gem_fixes: HashMap::new(),
         };
         let gated = plan(
             &common(tmp.path()),
@@ -2258,6 +2363,7 @@ mod tests {
             redirect: Some(redirect.clone()),
             discovery,
             hosted_uuids: Vec::new(),
+            hosted_gem_fixes: HashMap::new(),
         };
         let mut both = discovery(vec![
             go_ref(PURL, U1, "go.work"),
@@ -2310,6 +2416,7 @@ mod tests {
             redirect: Some(redirect),
             discovery: found,
             hosted_uuids: Vec::new(),
+            hosted_gem_fixes: HashMap::new(),
         };
         let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert_eq!(plan.hosted[PURL].uuid, U1);
@@ -2349,6 +2456,7 @@ mod tests {
                 redirect: Some(redirect),
                 discovery: found,
                 hosted_uuids: Vec::new(),
+                hosted_gem_fixes: HashMap::new(),
             },
             &[],
             &RunApiClient::new(),
@@ -2405,6 +2513,7 @@ mod tests {
                 redirect: None,
                 discovery: found,
                 hosted_uuids: Vec::new(),
+                hosted_gem_fixes: HashMap::new(),
             },
             &[],
             &RunApiClient::new(),
@@ -2455,6 +2564,7 @@ mod tests {
                 redirect: None,
                 discovery: found,
                 hosted_uuids: Vec::new(),
+                hosted_gem_fixes: HashMap::new(),
             },
             &[],
             &RunApiClient::new(),
@@ -2491,6 +2601,7 @@ mod tests {
             redirect: Some(redirect),
             discovery: Discovery::default(),
             hosted_uuids: Vec::new(),
+            hosted_gem_fixes: HashMap::new(),
         };
         let plan = plan(
             &common(tmp.path()),
@@ -2568,6 +2679,7 @@ mod tests {
                     // not a discovery input: the ledger fallback decides.
                     discovery: Discovery::default(),
                     hosted_uuids: Vec::new(),
+                    hosted_gem_fixes: HashMap::new(),
                 };
                 let plan = plan(&common(root), sources, &[], &RunApiClient::new()).await;
                 if gemfile_wired {

@@ -88,8 +88,9 @@
 //!   resolve ambiguously).
 //!
 //! **Platform builds.** A gem bundler locks as precompiled platform gems
-//! has one spec per platform, and the rewriter moves all of them (the
-//! patch registry serves a patched build, a "prebuild", for each):
+//! has one spec per platform, and the rewriter moves all of them to the
+//! registry of the fix's source patch (each platform gem has a patch of its
+//! own, and that registry serves the patched gem of every one):
 //!
 //! ```text
 //! GEM
@@ -111,8 +112,8 @@
 //! **Integrity.** `CHECKSUMS` `  name (version) sha256=<hex>` becomes
 //! [`Sha256Hex`](crate::vendor::lock_inventory::LockIntegrity::Sha256Hex).
 //! A pin of several builds is pinned only when `CHECKSUMS` has a sha256 for
-//! every one of them (each `name (version-<platform>)` entry holds its own
-//! prebuild's); the ref then carries the first build's.
+//! every one of them (each `name (version-<platform>)` entry holds the
+//! sha256 of its own patch's gem); the ref then carries the first build's.
 //! `integrity_required` is true iff the lock HAS a `CHECKSUMS` section: in
 //! that era (bundler ≥ 2.6) the rewriter only converges the lock after
 //! writing the patched gem's sha256, so a pin-less

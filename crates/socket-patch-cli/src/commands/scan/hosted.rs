@@ -623,8 +623,8 @@ fn stale_cache_gem(purl: &str, cache_path: &Path) -> StaleGem {
 ///   a project-local warning's delete list, or warned alone.
 /// * A gem locked as precompiled platform builds is installed as
 ///   `<name>-<version>-<platform>`, and cached under that name: each is
-///   judged the same way, against the patched artifacts of the gem, which
-///   include its prebuilds.
+///   judged the same way, against the patched gem of that platform's own
+///   patch.
 /// * Which copies are judged is the lock's to say: every build of the gem
 ///   the project's lock names is looked for under its own leaf, in every
 ///   gem home. A gem home can hold several builds of one version (the
@@ -717,6 +717,35 @@ async fn gem_stale_install_warnings(
         &stripped,
     )
     .await;
+    // The gems no lock names: the first installed copy stands for each.
+    let unlocked: Vec<bool> = named.iter().map(Vec::is_empty).collect();
+    // Each platform gem has a patch of its own: the patch of a platform
+    // gem judges that platform's copies, and the ruby gem's patch every
+    // build that no other candidate is the patch of.
+    let platform_of = socket_patch_core::hosted::gem_fixes::GemLock::platform_of;
+    let own_patch = |base: &str, platform: &str| {
+        candidates
+            .iter()
+            .zip(&stripped)
+            .any(|((purl, _, _), other)| {
+                other == base && platform_of(purl).as_deref() == Some(platform)
+            })
+    };
+    let named: Vec<Vec<socket_patch_core::formats::gem::GemBuild>> = named
+        .into_iter()
+        .zip(candidates.iter().zip(&stripped))
+        .map(|(builds, ((purl, _, _), base))| {
+            let judged = |build: &socket_patch_core::formats::gem::GemBuild| match (
+                platform_of(purl),
+                build.platform.as_deref(),
+            ) {
+                (Some(own), built) => built == Some(own.as_str()),
+                (None, Some(built)) => !own_patch(base, built),
+                (None, None) => true,
+            };
+            builds.into_iter().filter(judged).collect()
+        })
+        .collect();
     let leaves: Vec<String> = named
         .iter()
         .flatten()
@@ -724,8 +753,8 @@ async fn gem_stale_install_warnings(
         .collect();
     let unnamed: Vec<String> = stripped
         .iter()
-        .zip(&named)
-        .filter(|(_, builds)| builds.is_empty())
+        .zip(&unlocked)
+        .filter(|(_, unlocked)| **unlocked)
         .map(|(purl, _)| purl.clone())
         .collect();
     // Per home: each candidate's installed dirs.
@@ -741,8 +770,9 @@ async fn gem_stale_install_warnings(
             .into_iter();
         let dirs: Vec<Vec<std::path::PathBuf>> = named
             .iter()
-            .map(|builds| {
-                if builds.is_empty() {
+            .zip(&unlocked)
+            .map(|(builds, unlocked)| {
+                if *unlocked {
                     let pkg = first.next().flatten();
                     pkg.map(|pkg| pkg.path).into_iter().collect()
                 } else {
@@ -899,9 +929,9 @@ async fn gem_stale_install_warnings(
         let Some(want_shas) = gem_artifact_shas.get(&gem_sha_key(purl)) else {
             continue;
         };
-        let builds = match named[index].as_slice() {
-            [] => GemBuild::ruby(purl).into_iter().collect(),
-            builds => builds.to_vec(),
+        let builds = match unlocked[index] {
+            true => GemBuild::ruby(purl).into_iter().collect(),
+            false => named[index].clone(),
         };
         for cache_path in builds
             .iter()
@@ -1021,36 +1051,39 @@ async fn refresh_stale_gems(
     // The patched archive: what bundler itself would download from the
     // patch registry (`<index>/gems/<leaf>.gem`), else the grant's own
     // artifact, verified against the sha256 the lock pins. A platform
-    // build (`<name>-<version>-<platform>`) is the patch's prebuild for
-    // that platform, pinned by its own sha256; a platform gem declares no
-    // extensions, so replacing one builds nothing.
+    // build (`<name>-<version>-<platform>`) is the gem of that platform's
+    // own patch, pinned by its own sha256; a platform gem declares no
+    // extensions, so replacing one builds nothing. The registry of any
+    // patch of the fix serves every build of it; the build's own patch is
+    // asked first.
     let wanted = |gem: &StaleGem| {
         let (name, version) = gem_sha_key(&gem.purl);
         let build = GemBuild::of_leaf(&gem.purl, &gem.leaf);
         let platform = build.as_ref().and_then(|build| build.platform.as_deref());
-        let prebuilt: std::collections::BTreeSet<String> = overrides
-            .iter()
-            .filter(|o| o.ecosystem == "gem" && o.name == name && o.version == version)
-            .filter_map(|o| o.registry_override.as_ref())
-            .flat_map(|ro| &ro.identifiers.gem_platforms)
-            .filter(|prebuild| Some(prebuild.platform.as_str()) == platform)
-            .map(|prebuild| prebuild.gem_checksum_sha256.to_ascii_lowercase())
+        let of_gem = || {
+            overrides
+                .iter()
+                .filter(|o| o.ecosystem == "gem" && o.name == name && o.version == version)
+        };
+        let own =
+            |o: &&DepOverride| socket_patch_core::patch::redirect::gem_platform(o) == platform;
+        let of_build: std::collections::BTreeSet<String> = of_gem()
+            .filter(own)
+            .filter_map(gem_patch_sha256)
+            .map(|sha| sha.to_ascii_lowercase())
             .collect();
-        let sha256 = if prebuilt.is_empty() {
+        let sha256 = if of_build.is_empty() {
             gem_artifact_shas
                 .get(&(name.clone(), version.clone()))?
                 .iter()
                 .map(|sha| sha.to_ascii_lowercase())
                 .collect()
         } else {
-            prebuilt
+            of_build
         };
         let file = format!("{}.gem", gem.leaf);
         let mut urls: Vec<String> = Vec::new();
-        for o in overrides
-            .iter()
-            .filter(|o| o.ecosystem == "gem" && o.name == name && o.version == version)
-        {
+        for o in of_gem().filter(own).chain(of_gem().filter(|o| !own(o))) {
             // Downloaded from where the patch server serves them: a
             // mirrored reference names the operator's mirror, which may
             // want credentials this run does not have.
@@ -1137,6 +1170,15 @@ fn pipenv_probe_certain<'a>(
     socket_patch_core::patch::redirect::pipenv_lock_targets(files, &kept)
 }
 
+/// The sha256 of the `.gem` the gem patch `o` serves: its registry
+/// override's checksum, else its artifact's.
+fn gem_patch_sha256(o: &DepOverride) -> Option<String> {
+    o.registry_override
+        .as_ref()
+        .and_then(|ro| ro.identifiers.gem_checksum_sha256.clone())
+        .or_else(|| o.integrity.sha256.clone())
+}
+
 /// The `(name, version)` key the gem artifact-sha map uses — derived from
 /// the purl so overrides (which carry no purl) and confirmed purls meet on
 /// neutral ground.
@@ -1177,7 +1219,7 @@ pub(super) async fn run_redirect(
     // entries the run took out.
     prune: bool,
 ) -> i32 {
-    let discovered = match discover_selected(
+    let mut discovered = match discover_selected(
         api_client,
         all_packages_with_patches,
         can_access_paid_patches,
@@ -1186,6 +1228,10 @@ pub(super) async fn run_redirect(
         false,
         false,
         Some(&mut scan_result),
+        Some(super::GemFixScope {
+            cwd: &args.common.cwd,
+            recorded: &recorded.index,
+        }),
     )
     .await
     {
@@ -1201,6 +1247,7 @@ pub(super) async fn run_redirect(
             return code;
         }
     };
+    let gem_references = std::mem::take(&mut discovered.references);
     let rows = super::classified_rows(
         stage,
         &discovered,
@@ -1230,7 +1277,7 @@ pub(super) async fn run_redirect(
             stage,
             rows,
             prior,
-            references,
+            references: super::withdrawn::KnownReferences::with(references, gem_references),
             plan: Vec::new(),
             report: None,
         }),
@@ -1487,6 +1534,18 @@ async fn run_redirect_selected_untracked(
                 return 1;
             }
         };
+        // The source patch of a gem fix whose platform builds alone were
+        // selected (a lock with no ruby-platform entry): its registry is
+        // the gem's one source, so its reference is asked for too. One
+        // more request, and only then; a failed one leaves the gem as it
+        // is, with the gem rewriter's warning.
+        let mut references = references;
+        let sources = engine::missing_gem_sources(&references);
+        if !sources.is_empty() {
+            if let Ok(found) = api_client.fetch_registry_references(&sources).await {
+                references.extend(found);
+            }
+        }
         // Deferred rows need no reference: a failed lookup that only hit
         // them builds nothing (and records no `not_found` for them).
         if rollout
@@ -1987,6 +2046,20 @@ async fn run_redirect_selected_untracked(
             }
         }
     }
+    // A gem the lock names as platform builds is pinned to the registry of
+    // one fix, each build to the sha256 of its own patch: what that
+    // registry lists is read first (one small document per such gem), from
+    // the patch server also when the pin goes through a mirror.
+    let mut gem_indexes: Vec<(String, Result<String, String>)> = Vec::new();
+    for url in engine::gem_index_targets(&candidates, &read.files) {
+        status.set("Reading the gem patch registry");
+        let document = socket_patch_core::hosted::gem_index::fetch_gem_index(
+            api_client,
+            &mirror_sources.fetch_url(&url),
+        )
+        .await;
+        gem_indexes.push((url, document));
+    }
     status.finish();
     candidates.retain(|c| !unavailable_python_artifacts.contains(&c.dep.artifact_url));
     // The Pipfile.lock reference shape depends on the installing Pipenv
@@ -2093,6 +2166,8 @@ async fn run_redirect_selected_untracked(
         prior_discovery,
     }
     };
+    let mut read = read;
+    engine::record_gem_index(&mut read, &gem_indexes);
     // The rollout gate plans again without its deferred rows: keep what
     // the second pass needs.
     let second_pass = rollout
@@ -2161,12 +2236,13 @@ async fn run_redirect_selected_untracked(
                 &mut skipped,
             )
             .await;
-        let read = if candidates.is_empty() {
+        let mut read = if candidates.is_empty() {
             CandidateFiles::default()
         } else {
             engine::read_candidate_files(&view, &std::collections::BTreeSet::new(), &candidates)
                 .await
         };
+        engine::record_gem_index(&mut read, &gem_indexes);
         done = engine::rewrite(
             &view,
             read,
@@ -2233,6 +2309,19 @@ async fn run_redirect_selected_untracked(
     }
 
     let rewrite = &done.rewrite;
+    // For each patch this run pinned a platform build of a gem to: the
+    // uuid the lock names for that gem, the source patch of the fix (its
+    // registry is the gem's one source). Lockfile discovery reads that one
+    // uuid, so the in-run VEX and the "already hosted" count go by it.
+    let gem_fixes: std::collections::HashMap<String, String> = candidates
+        .iter()
+        .filter(|c| rewrite.confirmed_gem_uuids.contains(&c.dep.patch_uuid))
+        .map(|c| {
+            let fix = socket_patch_core::patch::redirect::gem_family(&c.dep);
+            (c.dep.patch_uuid.clone(), fix.to_string())
+        })
+        .filter(|(uuid, fix)| uuid != fix)
+        .collect();
     // Paths whose existence the commit below changes as discovery's reads
     // around the overlaid view (directory listings) see the disk: written
     // paths that are not a regular file there yet, and takeover-reverted
@@ -2328,26 +2417,16 @@ async fn run_redirect_selected_untracked(
     // refresh: nothing was rewritten, so nothing is stale yet.
     //
     // purl-coordinate → every PATCHED .gem artifact's sha256 (registry
-    // override identifier, tarball integrity fallback; one per platform
-    // variant, and one per prebuild: the patched platform gem a lock that
-    // names platform builds is pinned to) — judges the installed and
-    // committed archives, and verifies the archive a refresh installs.
+    // override identifier, tarball integrity fallback): one per patch of
+    // the gem version, and each platform gem a lock names has a patch of
+    // its own — judges the installed and committed archives, and verifies
+    // the archive a refresh installs.
     let mut gem_artifact_shas: std::collections::BTreeMap<
         (String, String),
         std::collections::BTreeSet<String>,
     > = std::collections::BTreeMap::new();
     for o in done.overrides.iter().filter(|o| o.ecosystem == "gem") {
-        let sha = o
-            .registry_override
-            .as_ref()
-            .and_then(|ro| ro.identifiers.gem_checksum_sha256.clone())
-            .or_else(|| o.integrity.sha256.clone());
-        let prebuilds = o
-            .registry_override
-            .iter()
-            .flat_map(|ro| &ro.identifiers.gem_platforms)
-            .map(|prebuild| prebuild.gem_checksum_sha256.clone());
-        for sha in sha.into_iter().chain(prebuilds) {
+        if let Some(sha) = gem_patch_sha256(o) {
             gem_artifact_shas
                 .entry((o.name.clone(), o.version.clone()))
                 .or_default()
@@ -2534,6 +2613,9 @@ async fn run_redirect_selected_untracked(
         // v5 keeps no hosted ledger: the in-run attestation fetches the
         // records of the pins this run confirmed.
         params.hosted_uuids = confirmed.iter().map(|(_, uuid)| uuid.clone()).collect();
+        // A gem the lock names as platform builds: each build is attested
+        // by its own patch, through the one pin the lock holds.
+        params.hosted_gem_fixes = gem_fixes.clone();
         // The gem intake gate withholds every gem file. VEX independently
         // rediscovers older pins too, so a candidate-only set would miss some
         // refused hosted gems. Keep their actual installed-byte verification,
@@ -2661,6 +2743,7 @@ async fn run_redirect_selected_untracked(
         &candidates,
         &confirmed,
         &skipped,
+        &engine::quiet_candidates(&candidates, selected, rewrite),
     );
     // Sent before the result prints: a consumer that closes stdout early
     // (SIGPIPE on the first write) must not lose it.
@@ -2771,14 +2854,27 @@ async fn run_redirect_selected_untracked(
                         .into_iter()
                         .map(|pin| pin.uuid)
                         .collect();
-                    confirmed
+                    let pinned = |uuid: &String| {
+                        in_place.contains(uuid)
+                            || gem_fixes
+                                .get(uuid)
+                                .is_some_and(|fix| in_place.contains(fix))
+                    };
+                    let already: Vec<(String, String)> = confirmed
                         .iter()
-                        .filter(|(_, uuid)| in_place.contains(uuid))
-                        .count()
+                        .filter(|(_, uuid)| pinned(uuid))
+                        .cloned()
+                        .collect();
+                    hosted_package_count(&already, &rewrite.confirmed_gem_uuids)
                 });
             println!(
                 "{}",
-                format_hosted_summary(confirmed.len(), already, human_files.len(), common.dry_run)
+                format_hosted_summary(
+                    hosted_package_count(&confirmed, &rewrite.confirmed_gem_uuids),
+                    already,
+                    human_files.len(),
+                    common.dry_run
+                )
             );
             // Under it, one row per package on a hosted patch: what the
             // patch fixes and how much it leaves unpatched. The same call
@@ -3474,6 +3570,25 @@ fn format_gem_hold_note(
          `bundle update {update_arg}`, {again}."
     ));
     Some(note)
+}
+
+/// How many packages the pins `confirmed` (`(purl, uuid)`) stand for: one
+/// each, except that the builds of one gem the lock names as platform
+/// builds are one package. Each of those builds is pinned to a patch of its
+/// own (`gem_builds`: the uuids of such pins), all through one source.
+fn hosted_package_count(
+    confirmed: &[(String, String)],
+    gem_builds: &std::collections::BTreeSet<String>,
+) -> usize {
+    let mut gems: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    confirmed
+        .iter()
+        .filter(|(purl, uuid)| {
+            // The first pin of a gem's builds counts for the gem.
+            !gem_builds.contains(uuid)
+                || gems.insert(socket_patch_core::utils::purl::strip_purl_qualifiers(purl))
+        })
+        .count()
 }
 
 /// [`format_redirect_summary`] for a run that confirmed `confirmed`
@@ -5732,6 +5847,34 @@ mod tests {
                 "3 packages are already on hosted patches; nothing to rewrite."
             );
         }
+    }
+
+    /// A gem the lock names as platform builds is pinned once per build,
+    /// each by its own patch, through one source: the summary counts it as
+    /// one package, beside every other pin.
+    #[test]
+    fn hosted_summary_counts_the_builds_of_one_gem_as_one_package() {
+        let pin = |purl: &str, uuid: &str| (purl.to_string(), uuid.to_string());
+        let confirmed = [
+            pin("pkg:gem/nokogiri@1.18.10?platform=arm64-darwin", "darwin"),
+            pin(
+                "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu",
+                "linux",
+            ),
+            pin("pkg:gem/rack@3.1.8", "rack"),
+            pin("pkg:gem/ffi@1.17.2?platform=arm64-darwin", "ffi-darwin"),
+            pin("pkg:gem/ffi@1.17.2", "ffi"),
+        ];
+        let builds: std::collections::BTreeSet<String> = ["darwin", "linux", "ffi-darwin", "ffi"]
+            .iter()
+            .map(|uuid| uuid.to_string())
+            .collect();
+        assert_eq!(super::hosted_package_count(&confirmed, &builds), 3);
+        // No gem pinned by build: one package per pin.
+        assert_eq!(
+            super::hosted_package_count(&confirmed, &Default::default()),
+            5
+        );
     }
 
     #[test]

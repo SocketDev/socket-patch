@@ -209,6 +209,7 @@ impl VexEmbedArgs {
             flag_prefix: "--vex-",
             npm_prior: None,
             hosted_uuids: Vec::new(),
+            hosted_gem_fixes: Default::default(),
             warnings_printed: Default::default(),
         }
     }
@@ -279,6 +280,13 @@ pub(crate) struct VexBuildParams {
     /// standalone `vex` finds them through the lockfiles instead). Empty
     /// everywhere else.
     pub hosted_uuids: Vec<String>,
+    /// Embedded hosted `scan --vex` only: for each patch this run pinned a
+    /// platform build of a gem to, the uuid the lock names for the gem
+    /// (the source patch of the fix, whose registry is the gem's one
+    /// source). The lock's one pin then attests every build's own patch
+    /// (see [`crate::commands::vex_sources::Sources::hosted_gem_fixes`]).
+    /// Empty everywhere else.
+    pub hosted_gem_fixes: std::collections::HashMap<String, String>,
     /// The run's API client (see [`RunApiClient`]): seeded by a host
     /// command, else built at most once when the plan must fetch records.
     /// Telemetry reads its route when it exists.
@@ -434,6 +442,7 @@ pub async fn run(args: VexArgs) -> i32 {
         flag_prefix: "--",
         npm_prior: None,
         hosted_uuids: Vec::new(),
+        hosted_gem_fixes: Default::default(),
         api_client: RunApiClient::new(),
         warnings_printed: Default::default(),
     };
@@ -2392,6 +2401,7 @@ async fn generate_vex_from_manifest_path_inner(
         discovery,
         // Their records join a pre-v5 ledger's as the hosted record source.
         hosted_uuids: params.hosted_uuids.clone(),
+        hosted_gem_fixes: params.hosted_gem_fixes.clone(),
     };
     if sources.is_empty() {
         // A discovery diagnostic (an unparseable lock, a rejected reference)
@@ -3825,6 +3835,7 @@ mod npm_prior_tests {
             flag_prefix: "--vex-",
             npm_prior: prior,
             hosted_uuids: Vec::new(),
+            hosted_gem_fixes: Default::default(),
             api_client: RunApiClient::new(),
             warnings_printed: Default::default(),
         };
