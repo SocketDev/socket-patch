@@ -1106,6 +1106,7 @@ pub async fn run(args: VendorArgs) -> i32 {
         // ledgers and lockfiles already wire. Same contract as `apply --vex`
         // with no manifest: nothing referenced anywhere keeps exit 0; any
         // other VEX failure flips the exit; a dry run skips generation.
+        //
         // An unreadable ledger is not "no entries": say so (stderr, or
         // `warnings[]` under --json) instead of the calm nothing-to-vendor
         // line.

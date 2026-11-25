@@ -8,7 +8,7 @@
 //! Modeled on `scan_vendor_e2e.rs` (mock API + real fixture through the
 //! built binary).
 
-use crate::common::envelope::parse_json_envelope;
+use crate::common::envelope::{parse_json_envelope, warning_codes};
 use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::Path;
@@ -106,14 +106,6 @@ async fn mount_empty_discovery(mock: &MockServer) {
         .await;
 }
 
-/// The codes of the envelope's run warnings.
-fn warning_codes(envelope: &serde_json::Value) -> Vec<&str> {
-    envelope["warnings"]
-        .as_array()
-        .map(|warnings| warnings.iter().filter_map(|w| w["code"].as_str()).collect())
-        .unwrap_or_default()
-}
-
 /// `scan --prune` on a fresh clone whose vendor ledger is corrupt: the
 /// vendored package's manifest entry and blob must survive the GC while the
 /// committed artifacts remain.
@@ -153,7 +145,9 @@ async fn corrupt_ledger_scan_prune_keeps_vendored_manifest_entry() {
     // …and it says that its vendored half did not run, and why, instead
     // of a clean pass.
     assert!(
-        warning_codes(&v).contains(&"vendor_state_unreadable"),
+        warning_codes(&v)
+            .iter()
+            .any(|code| code == "vendor_state_unreadable"),
         "the pass could not read the ledger and must say so; warnings={}",
         v["warnings"]
     );
@@ -208,7 +202,9 @@ async fn corrupt_ledger_scan_prune_of_an_empty_crawl_names_the_ledger() {
     let v = parse_json_envelope(stdout.trim());
     assert_eq!(v["scannedPackages"], 0, "{v:#}");
     assert!(
-        warning_codes(&v).contains(&"vendor_state_unreadable"),
+        warning_codes(&v)
+            .iter()
+            .any(|code| code == "vendor_state_unreadable"),
         "warnings={}",
         v["warnings"]
     );
