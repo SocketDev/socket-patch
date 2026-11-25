@@ -38,9 +38,8 @@ pub(super) struct GcSummary {
     /// due, but the lock entries drifted since vendoring (everything was
     /// retained), or the recorded wiring was restored while another project
     /// file still installs from the artifact (the artifact and the entries
-    /// were retained). Sorted. Always empty in preview mode (a keep is only
-    /// decided by a wet wiring replay), where such entries show in
-    /// `vendored_reverted`.
+    /// were retained). Sorted. Always empty in preview mode (which runs no
+    /// revert), where such entries show in `vendored_reverted`.
     vendored_kept: Vec<(String, KeepCause)>,
     /// Vendored entries whose wet revert failed, each with the backend's
     /// reason: the ledger entry and the artifacts were kept. Sorted.
@@ -752,7 +751,8 @@ pub(super) fn format_gc_vendored_lines(gc: &GcSummary) -> Vec<String> {
         let failed: Vec<String> = gc
             .vendored_failed
             .iter()
-            .map(|(purl, why)| format!("{purl} ({why})"))
+            // The reason can quote the committed ledger.
+            .map(|(purl, why)| format!("{purl} ({})", crate::ui::printable(why)))
             .collect();
         lines.push(format!(
             "GC: failed to revert {}: {}.",
@@ -1808,7 +1808,7 @@ mod tests {
             assert!(said.contains("point the file"), "{what}:\n{said}");
         }
         // The warning that names the file is the one `remove` and
-        // `rollback` raise, once.
+        // `rollback` raise, once, under the purl it is about.
         let codes: Vec<&str> = json["warnings"]
             .as_array()
             .unwrap()
@@ -1816,6 +1816,11 @@ mod tests {
             .map(|w| w["code"].as_str().unwrap())
             .collect();
         assert_eq!(codes, ["vendor_revert_residual_reference"], "{json:#}");
+        let detail = json["warnings"][0]["detail"].as_str().unwrap();
+        assert!(
+            detail.starts_with(&format!("{PURL}: kept .socket/vendor/pypi/{UUID}/: ")),
+            "{detail}"
+        );
         assert_eq!(json["events"][0]["errorCode"], "vendor_revert_kept");
     }
 
