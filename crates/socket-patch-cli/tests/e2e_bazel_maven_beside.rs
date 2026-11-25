@@ -264,6 +264,17 @@ impl Machine {
 
     /// Runs `socket-patch <args>` in the directory `proj` of the checkout.
     fn step_in(&self, proj: &std::path::Path, args: &[&str]) -> Ran {
+        self.step_with(proj, args, &[])
+    }
+
+    /// Runs `socket-patch <args>` in the checkout as it is, with the
+    /// switch for a project that Bazel does not build.
+    fn step_off(&self, args: &[&str]) -> Ran {
+        self.step_with(&self.root.join("proj"), args, &[("SOCKET_NO_BAZEL", "1")])
+    }
+
+    /// [`Machine::step_in`] with the variables `env` set as well.
+    fn step_with(&self, proj: &std::path::Path, args: &[&str], env: &[(&str, &str)]) -> Ran {
         let m2 = self.root.join("m2");
         let before = self.files();
 
@@ -295,6 +306,7 @@ impl Machine {
             .env("MAVEN_REPO_LOCAL", &m2)
             .env("GRADLE_USER_HOME", home.join("gradle"))
             .env("COURSIER_CACHE", home.join("coursier"))
+            .envs(env.iter().copied())
             .args(args)
             .args(["--org", ORG, "--api-token", "fake-token"])
             .args(["--api-url", &self.api.uri()]);
@@ -424,33 +436,31 @@ fn a_maven_project_no_hub_builds_reports_as_without_bazel() {
             !args.contains(&"--dry-run"),
             "{args:?}: {without:?}"
         );
-        for bazel in [&other, &elsewhere] {
+        for bazel in [&other, &elsewhere, &unread_other()] {
             let beside = machine.run(bazel, true, args);
             assert_eq!(beside, without, "{args:?} beside {:?}", bazel[0].1);
         }
     }
 }
 
-#[test]
-fn a_hub_that_pins_the_artifact_adds_one_warning_and_nothing_else() {
+/// Every command of [`COMMANDS`] in the checkout with the Bazel files
+/// `bazel` is the command of the same checkout without them, with one
+/// warning more: the code and the detail that `warning` gives for the
+/// command's arguments.
+fn adds_one_warning(bazel: &Files, warning: &dyn Fn(&[&str]) -> (&'static str, String)) {
     let machine = Machine::start();
-    let [plain, _, _, hub] = checkouts();
+    let [plain, ..] = checkouts();
     for args in COMMANDS {
         let (without, beside) = (
             machine.run(&plain, true, args),
-            machine.run(&hub, true, args),
+            machine.run(bazel, true, args),
         );
         assert_eq!(
             (beside.code, &beside.wrote),
             (without.code, &without.wrote),
             "{args:?}: {beside:?}"
         );
-        // An agent run patches no hub. A hosted run would, and says why it
-        // does not here: nothing in this checkout names its Bazel.
-        let (code, detail) = match args[0] {
-            "get" => ("maven_bazel_release", declined(NO_RELEASE)),
-            _ => ("maven_bazel_hub_unpatched", HUB_WARNING.to_string()),
-        };
+        let (code, detail) = warning(args);
         if args.contains(&"--json") {
             let (mut said, mut expected) = (beside.envelope(), without.envelope());
             let warning = json!({ "code": code, "detail": detail });
@@ -482,6 +492,148 @@ fn a_hub_that_pins_the_artifact_adds_one_warning_and_nothing_else() {
                 "{args:?}: {beside:?}"
             );
         }
+    }
+}
+
+#[test]
+fn a_hub_that_pins_the_artifact_adds_one_warning_and_nothing_else() {
+    let [.., hub] = checkouts();
+    // An agent run patches no hub. A hosted run would, and says why it
+    // does not here: nothing in this checkout names its Bazel.
+    adds_one_warning(&hub, &|args| match args[0] {
+        "get" => ("maven_bazel_release", declined(NO_RELEASE)),
+        _ => ("maven_bazel_hub_unpatched", HUB_WARNING.to_string()),
+    });
+}
+
+/// A workspace where a hub may be, with something its reader could not
+/// have and no hub that holds the artifact: each command says that it
+/// could not tell whether a hub builds the jar, and does what it does
+/// without Bazel. One such workspace names the ruleset of a Maven hub and
+/// includes a file that does not exist. The others name only another
+/// ruleset's and leave a file unread that is there, and may be the one
+/// that names it: one includes a file that cannot be parsed, and one has
+/// an `include` the reader does not follow (Bazel 9 takes
+/// `dev_dependency` there), with the hub of the artifact and all that
+/// names the ruleset in the file it would read. With an include that does
+/// not exist, that other workspace says nothing
+/// ([`a_maven_project_no_hub_builds_reports_as_without_bazel`]).
+#[test]
+fn a_workspace_that_may_hold_a_hub_and_is_not_read_adds_one_warning() {
+    let named = "bazel_dep(name = \"rules_jvm_external\", version = \"7.2\")\n\
+                 include(\"//:more.MODULE.bazel\")\n";
+    let named = vec![("MODULE.bazel", named.to_string())];
+    let mut open = unread_other();
+    open.push(("more.MODULE.bazel", "maven.install(\n".to_string()));
+    let dev = "include(\"//java:deps.MODULE.bazel\", dev_dependency = True)\n";
+    let hub = HUB.replace("//:maven_install", "//java:maven_install");
+    let dev = vec![
+        ("MODULE.bazel", format!("{OTHER_HUB}{dev}")),
+        ("java/deps.MODULE.bazel", hub),
+        (
+            "java/maven_install.json",
+            lock(&[("consumer", "2.0"), ("victim", "1.10.0")]),
+        ),
+    ];
+    let included = |why: &str| format!("more.MODULE.bazel{why} includes it");
+    let rows = [
+        (named, included(": it does not exist; MODULE.bazel:2")),
+        (
+            open,
+            included(":1: a bracket is never closed; MODULE.bazel:6"),
+        ),
+        (
+            dev,
+            "MODULE.bazel:6: this `include` cannot be read".to_string(),
+        ),
+    ];
+    for (bazel, why) in rows {
+        let unread = format!(
+            "socket-patch could not tell whether Bazel takes this artifact from a \
+             rules_jvm_external hub: {why}"
+        );
+        adds_one_warning(&bazel, &|args| match args[0] {
+            "get" => ("maven_bazel_unreadable", declined(&unread)),
+            _ => ("maven_bazel_unreadable", format!("{PURL}: {unread}")),
+        });
+    }
+}
+
+/// `SOCKET_NO_BAZEL=1`, the switch for a project that Bazel does not
+/// build: beside a pinned hub that builds the artifact, every command is
+/// the command of the checkout without its Bazel files, to the byte. An
+/// agent run gives no notice of the hub, a hosted run writes no block and
+/// says nothing of one, and a hosted scan takes no jar of the hub for a
+/// package. Without the variable each of them does.
+#[test]
+fn the_switch_makes_a_run_beside_a_hub_the_run_without_bazel() {
+    let machine = Machine::start();
+    let [plain, ..] = checkouts();
+    let rows = COMMANDS.map(|args| (true, args));
+    for (maven, args) in rows.into_iter().chain([(false, &SCAN[..])]) {
+        let without = machine.run(&plain, maven, args);
+        machine.make(&pinned(), maven, true);
+        assert_eq!(machine.step_off(args), without, "{args:?}");
+        assert_ne!(machine.run(&pinned(), maven, args), without, "{args:?}");
+    }
+}
+
+/// The words that set the switch are those of every switch that is read
+/// from the environment alone: `1`, `true`, `yes`, `on`, `y` and `t`, in
+/// any case and with blanks around them. No other value sets it, an empty
+/// one included: the run is then the run without the variable, to the
+/// byte.
+#[test]
+fn the_switch_takes_the_words_of_the_other_switches_and_no_other() {
+    let machine = Machine::start();
+    let [plain, ..] = checkouts();
+    let args = COMMANDS[0];
+    let without = machine.run(&plain, true, args);
+    let beside = machine.run(&pinned(), true, args);
+    assert_ne!(beside, without);
+    let values = [
+        ("true", &without),
+        ("TRUE", &without),
+        (" Yes ", &without),
+        ("on", &without),
+        ("y", &without),
+        ("T", &without),
+        ("", &beside),
+        ("0", &beside),
+        ("false", &beside),
+        ("off", &beside),
+        ("2", &beside),
+        ("n", &beside),
+        ("f", &beside),
+        ("yes!", &beside),
+    ];
+    for (value, expected) in values {
+        machine.make(&pinned(), true, true);
+        let proj = machine.root.join("proj");
+        let ran = machine.step_with(&proj, args, &[("SOCKET_NO_BAZEL", value)]);
+        assert_eq!(&ran, expected, "SOCKET_NO_BAZEL={value:?}");
+    }
+}
+
+/// What an earlier run wrote for a hub is listed and undone with the
+/// switch set: `list` reads the entry of the block as a hosted pin, and
+/// `rollback` and `remove` take the block out, to the byte.
+#[test]
+fn the_switch_leaves_the_block_of_an_earlier_run_listed_and_undone() {
+    let machine = Machine::start();
+    let undos: [&[&str]; 2] = [
+        &["rollback", "--yes", "--json"],
+        &["remove", PURL, "--yes", "--json"],
+    ];
+    for undo in undos {
+        machine.make(&pinned(), false, false);
+        assert_eq!(machine.step(COMMANDS[0]).wrote.len(), 1);
+        let list = machine.step_off(&["list", "--json"]).envelope();
+        let pinned_in = &event_for(&list, PURL)["details"]["lockfiles"];
+        assert_eq!(*pinned_in, json!(["MODULE.bazel"]), "{list:#}");
+        let undone = machine.step_off(undo);
+        let restored = String::from_utf8_lossy(&undone.wrote[MODULE]);
+        assert_eq!((undone.code, &*restored), (Some(0), HUB), "{undone:?}");
     }
 }
 
@@ -715,6 +867,54 @@ fn a_hosted_run_removes_the_jar_vendored_mode_kept_for_the_hub() {
             |path: &&String| path.contains(".socket/vendor") || path.ends_with("ignore");
         let kept: Vec<&String> = left.keys().filter(of_the_hub).collect();
         assert_eq!(kept, Vec::<&String>::new(), "{ran:?}");
+    }
+}
+
+/// With the switch, a hosted run leaves what vendored mode wrote for a hub
+/// alone as it is, as the same run does in the checkout without its
+/// workspace file: it has no build to pin the artifact in, so the patch
+/// stays vendored, with its entry of the block, its directory and its
+/// ledger entry. Without the variable the hosted entry takes the place of
+/// the vendored one.
+#[test]
+fn the_switch_leaves_a_vendored_entry_of_the_hub_to_a_hosted_run() {
+    let machine = Machine::start();
+    let proj = machine.root.join("proj");
+    // The ledger entry of a patch that only the hub takes: its artifact is
+    // the jar of the hub's directory, three bytes here, with their sha256.
+    let jar = format!(".socket/vendor/maven/{UUID}/file/victim-1.10.0.jar");
+    let sum = "0163f1eea7894350060624d315234d40c508ab251ba121714e234503045faadd";
+    let ledger = json!({ "version": 1, "entries": { PURL: {
+        "ecosystem": "maven",
+        "basePurl": PURL,
+        "uuid": UUID,
+        "artifact": { "path": jar, "sha256": sum, "size": 3 },
+        "wiring": [],
+        "flavor": "bazel",
+    } } });
+    let make = || {
+        vendored(&machine, false);
+        let state = proj.join(".socket/vendor/state.json");
+        std::fs::write(state, format!("{ledger:#}\n")).expect("the ledger");
+    };
+    for args in [COMMANDS[0], &SCAN[..]] {
+        make();
+        std::fs::remove_file(proj.join("MODULE.bazel")).expect("the workspace file");
+        let without = machine.step(args);
+        make();
+        let held = machine.files();
+        let off = machine.step_off(args);
+        assert_eq!(off, without, "{args:?}");
+        assert_eq!(machine.files(), held, "{args:?}");
+        let codes = warning_codes(&off.envelope());
+        let kept = codes
+            .iter()
+            .any(|code| code == "redirect_takeover_kept_vendored");
+        assert!(kept, "{args:?}: {off:?}");
+        make();
+        let beside = machine.step(args);
+        let module = String::from_utf8_lossy(&beside.wrote[MODULE]);
+        assert_eq!(module, format!("{HUB}\n{BLOCK}"), "{args:?}: {beside:?}");
     }
 }
 

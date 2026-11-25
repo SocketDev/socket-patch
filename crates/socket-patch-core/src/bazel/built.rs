@@ -1,22 +1,26 @@
 //! Whether the Bazel build of a workspace takes the copy of a package that
 //! socket-patch patched.
 //!
-//! Three rulesets hand the packages of an ecosystem to Bazel through one
+//! Five rulesets hand the packages of an ecosystem to Bazel through one
 //! tag of a module extension, a hub: aspect_rules_js reads a pnpm lock
 //! (`npm.npm_translate_lock`), rules_python reads requirements files
-//! (`pip.parse`) and rules_ruby reads a Gemfile and its lock
-//! (`ruby.bundle_fetch`). Each fetches what those files name into
+//! (`pip.parse`), rules_ruby reads a Gemfile and its lock
+//! (`ruby.bundle_fetch`), rules_rust reads a `Cargo.lock`
+//! (`crate.from_cargo`) and rules_csharp reads a `packages.lock.json`
+//! (`nuget.from_lock`). Each fetches what those files name into
 //! repositories of Bazel's own and builds from there. None of them reads
-//! what a package manager installed in the checkout (`node_modules`, a
-//! virtualenv, a gem home), so a patch that is only in such a copy is not
-//! in the build. And rules_python builds no package from a line that
-//! points at a copy committed under `.socket/vendor`: 2.5.0-rc4 takes the
-//! path for the name of a project and fails the build of everything the
-//! hub serves (Bazel 9.3.2, 8.8.2 and 7.7.2). rules_js does build a
-//! vendored tarball. rules_ruby 1.0.0-rc2 fails the build on a vendored
-//! gem (same three releases) unless the call lists every file of the copy
-//! among its `srcs`, which it copies beside the Gemfile: `srcs` is not
-//! read here, so a vendored gem is not judged.
+//! what a package manager installed (`node_modules`, a virtualenv, a gem
+//! home, a cargo home, NuGet's packages folder), so a patch that is only
+//! in such a copy is not in the build. And rules_python builds no package
+//! from a line that points at a copy committed under `.socket/vendor`:
+//! 2.5.0-rc4 takes the path for the name of a project and fails the build
+//! of everything the hub serves (Bazel 9.3.2, 8.8.2 and 7.7.2). rules_js
+//! does build a vendored tarball, and rules_rust a vendored crate.
+//! rules_ruby 1.0.0-rc2 fails the build on a vendored gem (same three
+//! releases) unless the call lists every file of the copy among its
+//! `srcs`, which it copies beside the Gemfile: `srcs` is not read here, so
+//! a vendored gem is not judged. What rules_csharp does with a vendored
+//! package no test here builds, so that is not judged either.
 //!
 //! [`unbuilt`] names, for a patched package, the call that builds it from a
 //! file without its patch. It says so only when the files of the workspace
@@ -33,15 +37,18 @@
 //! lists the same package (in a directory beside the project, below it, or
 //! above it without naming it) is the lock of another project, and says
 //! nothing of this one: a project of the checkout that Bazel does not
-//! build keeps what socket-patch says of it.
+//! build keeps what socket-patch says of it. A `packages.lock.json` below
+//! the project's directory is the project's own as well ([`Hub::nested`]).
 //!
 //! Only a call that is a statement of its own counts ([`Call::whole`]):
 //! it runs, once. One in a comprehension, behind an `and`, in a
 //! conditional or in the arguments of another call may never run, and is
 //! passed over. So is a call that passes `*` or `**`, whose arguments are
-//! not all written out, and a `pip.parse` with `uv_lock`: rules_python
-//! (2.2.0 and later) can take the packages of such a call from that file
-//! alone, which is not read here.
+//! not all written out, and one that can take its packages from a file
+//! that is not read here ([`Hub::elsewhere`]). A `crate.from_cargo` without
+//! `cargo_lockfile` names no lock, so nothing is said: rules_rust 0.75.0
+//! has its cargo resolve the manifests anew, and no file says which
+//! versions it builds.
 //!
 //! A lock is read like a file of the workspace ([`disk`]): never through a
 //! link that leads out of the Bazel root, although Bazel follows such a
@@ -50,7 +57,20 @@
 //! searched once for the patches of all the packages, and not kept. Of a
 //! pnpm lock the project documents are read, for their keys alone:
 //! rules_js links nothing of the document pnpm 11 keeps for its own
-//! configuration.
+//! configuration. Of a `Cargo.lock` the packages of a registry are read:
+//! the hub has Bazel download the crate file of each, and takes no other
+//! from a cargo home. A `packages.lock.json` never names a patch (a pin
+//! there is a hash, and its source is in `nuget.config`), and rules_csharp
+//! makes one hub of all its `nuget.from_lock` calls: the sources of the
+//! last call that has any serve every package, and the first lock that
+//! names a package pins it. So the config of every such call is searched
+//! with the lock ([`Hub::beside`]), and nothing is said of the hub when
+//! one of them is not a plain label of the main repository or a call
+//! passes `*` or `**`. The locks are still read one call at a time, and `feeds` and
+//! `local_package_dirs` are not read. Whether a hub takes a hosted pin of
+//! the project itself is not judged here: [`super::cargo`] and
+//! [`super::nuget`] say that to hosted mode, and the caller hands over no
+//! package that has one.
 //!
 //! [`reader`] answers the question vendored mode asks before it writes:
 //! does a call of the hub name a file that the run would make point at a
@@ -75,6 +95,7 @@
 //!
 //! [`Tags::doubts`]: super::workspace::Tags::doubts
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Component, Path};
@@ -83,9 +104,11 @@ use aho_corasick::AhoCorasick;
 
 use super::rc::reads_workspace_file;
 use super::starlark::{Call, File, Value};
-use super::workspace::{disk, Doubt, Entry, Extension, Repo, Workspace};
+use super::workspace::{disk, Doubt, Entry, Extension, Repo, Tag, Workspace};
 use super::BazelRoot;
+use crate::formats::cargo::CargoLock;
 use crate::formats::gem::locked_specs;
+use crate::formats::nuget::lock::{nuget_lock_entries, parse_lock};
 use crate::formats::pnpm::grammar::documents;
 use crate::formats::pnpm::workspace::lock_text_member_importers;
 use crate::formats::pnpm::{pnpm_registry_key, PnpmDocument, PnpmLock};
@@ -122,6 +145,9 @@ pub struct Unbuilt {
     /// installed copy the lock that lists the package, for a committed copy
     /// the file that points at it.
     pub lock: String,
+    /// What to run so that the build holds the patch of an installed copy
+    /// ([`Hub::remedy`]).
+    pub remedy: &'static str,
 }
 
 /// The tag of a module extension that names the files a ruleset builds the
@@ -129,33 +155,57 @@ pub struct Unbuilt {
 struct Hub {
     /// The type of the ecosystem's purls.
     ecosystem: &'static str,
-    extension: Extension<'static>,
+    /// The extension, by each file of the ruleset that defines it.
+    extensions: &'static [Extension<'static>],
     tag: &'static str,
     /// The attributes that name such a file: a label, or a dict with a
     /// label as each key. `uv_lock` is one for [`reader`] alone: [`judge`]
     /// passes over a call that has it.
     files: &'static [&'static str],
+    /// The attributes with which a call can take its packages from a file
+    /// that is not read here, whatever its lock lists.
+    elsewhere: &'static [&'static str],
     /// The packages a file lists plainly, each as its name and version.
     lists: fn(&str) -> Vec<(String, String)>,
     /// The directories below a file's own whose lock the file is as well,
     /// each from that directory: the members of a pnpm workspace.
     members: fn(&str) -> Vec<String>,
+    /// Whether a lock below the project's directory is the project's own
+    /// as well. A NuGet project is every project file below the directory
+    /// of a run, each with a lock beside it: agent mode patches what any of
+    /// them restored, and hosted mode pins in each of their locks.
+    nested: bool,
     /// Whether a call of the tag may build a package from a line that
-    /// points at a copy under `.socket/vendor`: rules_js does, and
-    /// rules_ruby does when the call lists the files of the copy.
+    /// points at a copy under `.socket/vendor`: rules_js and rules_rust
+    /// do, rules_ruby does when the call lists the files of the copy, and
+    /// of rules_csharp no test here has shown that it does not.
     builds_vendored: bool,
+    /// The attributes that name a file beside the lock, where a pin in
+    /// the lock does not name its patch. The calls of such a tag make one
+    /// hub, so the file of every call is searched with a lock for the id
+    /// of a patch.
+    beside: &'static [&'static str],
+    /// What to run so that the build holds a patch that is only in the
+    /// installed copy: the modes that a test builds patched on real Bazel
+    /// under this hub, with what hosted mode needs of the call.
+    remedy: &'static str,
 }
 
-const HUBS: [Hub; 3] = [
+/// Hosted mode, which pins a patch in the lock the hub reads.
+const HOSTED: &str = "Run `socket-patch scan --mode hosted` in the directory of that lock to pin \
+    the patch there.";
+
+const HUBS: [Hub; 5] = [
     Hub {
         ecosystem: "npm",
-        extension: Extension {
+        extensions: &[Extension {
             module: "aspect_rules_js",
             file: "//npm:extensions.bzl",
             name: "npm",
-        },
+        }],
         tag: "npm_translate_lock",
         files: &["pnpm_lock"],
+        elsewhere: &[],
         lists: |text| {
             let project = documents(text).into_iter();
             let project = project.filter(|(_, kind)| *kind == PnpmDocument::Project);
@@ -165,15 +215,18 @@ const HUBS: [Hub; 3] = [
             owned(keys.filter_map(|package| pnpm_registry_key(package.key)))
         },
         members: lock_text_member_importers,
+        nested: false,
         builds_vendored: true,
+        beside: &[],
+        remedy: HOSTED,
     },
     Hub {
         ecosystem: "pypi",
-        extension: Extension {
+        extensions: &[Extension {
             module: "rules_python",
             file: "//python/extensions:pip.bzl",
             name: "pip",
-        },
+        }],
         tag: "parse",
         files: &[
             "requirements_lock",
@@ -183,6 +236,8 @@ const HUBS: [Hub; 3] = [
             "requirements_windows",
             "uv_lock",
         ],
+        // rules_python 2.2.0 and later.
+        elsewhere: &["uv_lock"],
         lists: |text| {
             let lines = logical_lines(text);
             owned(
@@ -192,20 +247,71 @@ const HUBS: [Hub; 3] = [
             )
         },
         members: |_| Vec::new(),
+        nested: false,
         builds_vendored: false,
+        beside: &[],
+        remedy: HOSTED,
     },
     Hub {
         ecosystem: "gem",
-        extension: Extension {
+        extensions: &[Extension {
             module: "rules_ruby",
             file: "//ruby:extensions.bzl",
             name: "ruby",
-        },
+        }],
         tag: "bundle_fetch",
         files: &["gemfile_lock", "gemfile"],
+        elsewhere: &[],
         lists: |text| owned(locked_specs(text).into_iter()),
         members: |_| Vec::new(),
+        nested: false,
         builds_vendored: true,
+        beside: &[],
+        remedy: HOSTED,
+    },
+    Hub {
+        ecosystem: "cargo",
+        extensions: &super::cargo::EXTENSIONS,
+        tag: "from_cargo",
+        files: &["cargo_lockfile"],
+        // The lock of rules_rust's own tool, which a hub renders its crates
+        // from until a repin, and which is not held to the `Cargo.lock`
+        // (0.75.0).
+        elsewhere: &["lockfile"],
+        lists: |text| {
+            let lock = CargoLock::parse(text).ok();
+            let packages = lock.iter().flat_map(|lock| lock.packages());
+            let fetched = packages.filter(|package| package.is_from_registry());
+            let built = fetched.filter(|package| package.replace.is_none());
+            owned(built.map(|package| (package.name.as_str(), package.version.as_str())))
+        },
+        members: |_| Vec::new(),
+        nested: false,
+        builds_vendored: true,
+        beside: &[],
+        remedy: "Run `socket-patch scan --mode hosted` in the directory of that lock to pin \
+            the patch there (the call has to name the project's cargo config, \
+            `cargo_config`), or `socket-patch scan --mode vendored` to commit a patched copy \
+            of the crate.",
+    },
+    Hub {
+        ecosystem: "nuget",
+        extensions: &[super::nuget::EXTENSION],
+        tag: "from_lock",
+        files: &["packages_lock_json"],
+        elsewhere: &[],
+        lists: |text| {
+            let lock = parse_lock(text).ok();
+            let entries = lock.iter().flat_map(nuget_lock_entries);
+            owned(entries.map(|entry| (entry.id, entry.resolved)))
+        },
+        members: |_| Vec::new(),
+        nested: true,
+        builds_vendored: true,
+        beside: &["nuget_config"],
+        remedy: "Run `socket-patch scan --mode hosted` in the directory of that lock to pin \
+            the patch there (the call has to name the project's nuget.config, \
+            `nuget_config`).",
     },
 ];
 
@@ -321,9 +427,11 @@ fn reads(
     read: &dyn Fn(&str) -> Option<String>,
 ) -> Option<Reader> {
     let hub = HUBS.iter().find(|hub| hub.ecosystem == ecosystem)?;
-    let tags = workspace.tags(&hub.extension, hub.tag);
-    let tag = format!("{}.{}", hub.extension.name, hub.tag);
-    let tagged = tags.calls.iter().map(|at| (at.file, at.call, tag.as_str()));
+    let tags = |extension| workspace.tags(extension, hub.tag);
+    let tags: Vec<_> = hub.extensions.iter().map(tags).collect();
+    let tag = format!("{}.{}", hub.extensions[0].name, hub.tag);
+    let tagged = tags.iter().flat_map(|tags| &tags.calls);
+    let tagged = tagged.map(|at| (at.file, at.call, tag.as_str()));
     // In a `WORKSPACE` file, the calls that pass one of the hub's files.
     let legacy = workspace
         .legacy
@@ -338,7 +446,7 @@ fn reads(
         calls.map(move |call| (name.as_str(), call, call.callee.as_str(), main))
     });
     let tagged = tagged.map(|(file, call, name)| (file, call, name, None));
-    let mut doubt = tags.doubts.first().cloned();
+    let mut doubt = tags.iter().find_map(|tags| tags.doubts.first()).cloned();
     let mut called = doubt.is_some();
     for (file, call, name, main) in tagged.chain(legacy) {
         called = true;
@@ -354,6 +462,7 @@ fn reads(
                 file: file.to_string(),
                 line: call.line,
                 lock: lock.clone(),
+                remedy: hub.remedy,
             }));
         }
         let written = |file: &&str| {
@@ -374,8 +483,14 @@ fn reads(
     // any name of the repository), and where the root module file was not
     // read at all. So may a `WORKSPACE` file that could not be read.
     let names = |call: &Call| match (call.callee.as_str(), call.arg("name"), call.positional(0)) {
-        ("bazel_dep", Some(Value::Str(name)), _) => name == hub.extension.module,
-        ("use_extension", _, Some(Value::Str(file))) => file.ends_with(hub.extension.file),
+        ("bazel_dep", Some(Value::Str(name)), _) => {
+            let ruleset = |extension: &Extension| name == extension.module;
+            hub.extensions.iter().any(ruleset)
+        }
+        ("use_extension", _, Some(Value::Str(file))) => {
+            let defines = |extension: &Extension| file.ends_with(extension.file);
+            hub.extensions.iter().any(defines)
+        }
         _ => false,
     };
     let named = |(_, file): &(String, File)| file.calls.iter().any(names);
@@ -469,17 +584,44 @@ fn judge(
         if ours.is_empty() {
             continue;
         }
-        let tags = workspace.tags(&hub.extension, hub.tag);
-        if !tags.doubts.is_empty() {
+        let tags = |extension| workspace.tags(extension, hub.tag);
+        let tags: Vec<_> = hub.extensions.iter().map(tags).collect();
+        if tags.iter().any(|tags| !tags.doubts.is_empty()) {
             continue;
         }
+        let calls = || tags.iter().flat_map(|tags| &tags.calls);
+        // The files beside the locks, of every call of the tag: the calls
+        // with such a file make one hub (rules_csharp), where the file of
+        // one call says where the packages of every lock come from. So
+        // the file of any call may name the patch, and one that a call
+        // does not give as a plain label of the main repository, or may
+        // pass unseen, may name any.
+        let plain = |value: &Value| match value {
+            Value::Str(label) => file(workspace, label, None),
+            _ => None,
+        };
+        let beside = |tag: &Tag| {
+            let given = hub.beside.iter().filter_map(|name| tag.call.arg(name));
+            given.map(plain).collect::<Option<Vec<String>>>()
+        };
+        let beside: Option<Vec<Vec<String>>> = calls().map(beside).collect();
+        let unseen = !hub.beside.is_empty() && calls().any(|tag| tag.call.unpacks());
+        let Some(beside) = beside.filter(|_| !unseen) else {
+            continue;
+        };
+        // Their text, read when a lock first asks and once for the hub.
+        let beside = beside.concat();
+        let texts = || beside.iter().map(|file| read(file)).collect();
+        let configs: OnceCell<Option<String>> = OnceCell::new();
         // What a file lists, and which patches of the packages its text
-        // names: read when a package first asks and once for all the calls
-        // that name it, and the text is not kept. `None` for a file that
-        // is not the project's lock or cannot be read.
+        // names, with the text of the files beside it: read when a package
+        // first asks and once for all the calls that name it, and the
+        // text is not kept. `None` for a file that is not the project's
+        // lock, or when one of them cannot be read.
         let mut listed = HashMap::new();
-        let elsewhere = |call: &Call| call.unpacks() || call.arg("uv_lock").is_some();
-        for tag in (tags.calls.iter()).filter(|tag| tag.call.whole && !elsewhere(tag.call)) {
+        let named = |call: &Call| hub.elsewhere.iter().any(|name| call.arg(name).is_some());
+        let elsewhere = |call: &Call| call.unpacks() || named(call);
+        for tag in calls().filter(|tag| tag.call.whole && !elsewhere(tag.call)) {
             for lock in files(workspace, tag.call, hub.files, None) {
                 for &at in &ours {
                     let package = &packages[at];
@@ -490,13 +632,15 @@ fn judge(
                         }
                         None => {
                             let listed = listed.entry(lock.clone()).or_insert_with(|| {
-                                let member = from_lock(project, &lock)?;
-                                let text = read(&lock)?;
+                                let nested = hub.nested && inside(project, &lock);
+                                let member = from_lock(project, &lock).or(nested.then_some(""))?;
+                                let mut text = read(&lock)?;
                                 let named = || (hub.members)(&text).iter().any(|m| m == member);
                                 if !(member.is_empty() || named()) {
                                     return None;
                                 }
                                 let listed = (hub.lists)(&text).into_iter();
+                                text.push_str(configs.get_or_init(texts).as_deref()?);
                                 let key = |(name, version)| {
                                     PurlKey::new(&format!("pkg:{}/{name}@{version}", hub.ecosystem))
                                 };
@@ -518,10 +662,11 @@ fn judge(
                     };
                     if unpatched && found[at].is_none() {
                         found[at] = Some(Unbuilt {
-                            call: format!("{}.{}", hub.extension.name, hub.tag),
+                            call: format!("{}.{}", hub.extensions[0].name, hub.tag),
                             file: tag.file.to_string(),
                             line: tag.call.line,
                             lock: lock.clone(),
+                            remedy: hub.remedy,
                         });
                     }
                 }
@@ -552,16 +697,10 @@ fn files(
             _ => {}
         }
     }
-    let ours = |label: &&str| {
-        let label = workspace.label(label)?;
-        let ours = match &label.repo {
-            Repo::Main => true,
-            Repo::Apparent(repo) => main == Some(repo.as_str()),
-            Repo::Canonical(_) => false,
-        };
-        ours.then(|| label.path())
-    };
-    labels.iter().filter_map(ours).collect()
+    let ours = labels
+        .iter()
+        .filter_map(|label| file(workspace, label, main));
+    ours.collect()
 }
 
 /// The path from the Bazel root of `file`, a path from the project in the
@@ -572,6 +711,27 @@ fn below(project: &str, file: &str) -> String {
         "" => file.to_string(),
         project => format!("{project}/{file}"),
     }
+}
+
+/// The file of the main repository that `label` names, by its path from
+/// the Bazel root. `main` is the name a `WORKSPACE` file gives the main
+/// repository, for a label of that file: `@<main>//` is then the main
+/// repository too.
+fn file(workspace: &Workspace, label: &str, main: Option<&str>) -> Option<String> {
+    let label = workspace.label(label)?;
+    let ours = match &label.repo {
+        Repo::Main => true,
+        Repo::Apparent(repo) => main == Some(repo.as_str()),
+        Repo::Canonical(_) => false,
+    };
+    ours.then(|| label.path())
+}
+
+/// Whether the workspace's file `lock` lies in a directory below the
+/// directory `project`.
+fn inside(project: &str, lock: &str) -> bool {
+    let rest = lock.strip_prefix(project);
+    rest.is_some_and(|rest| project.is_empty() || rest.starts_with('/'))
 }
 
 /// The directory `project` from the directory of the workspace's file
@@ -822,10 +982,285 @@ use_repo(ruby, "bundle")
         assert_eq!(installed("web", "pkg:npm/right-pad@1.3.0"), "");
         assert_eq!(installed("api", "pkg:pypi/requests@2.31.0"), "");
         assert_eq!(installed("api", "pkg:pypi/idna@3.6"), "");
-        // An ecosystem without a hub here, and no purl at all.
+        // An ecosystem whose hub this workspace does not call, one without
+        // a hub, and no purl at all.
         assert_eq!(installed("web", "pkg:cargo/serde@1.0.0"), "");
         assert_eq!(installed("web", "pkg:golang/example.com/m@v1.0.0"), "");
         assert_eq!(installed("web", "left-pad"), "");
+    }
+
+    /// A workspace with the hubs of rules_rust and rules_csharp, each over
+    /// the lock of one directory.
+    const CRATES: &str = r#"module(name = "shop", version = "0.0.0")
+
+bazel_dep(name = "rules_rust", version = "0.75.0")
+bazel_dep(name = "rules_csharp", version = "0.5.0")
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//engine:Cargo.lock",
+    manifests = ["//engine:Cargo.toml"],
+)
+use_repo(crate, "crates")
+
+nuget = use_extension("@rules_csharp//csharp:extensions.bzl", "nuget")
+nuget.from_lock(
+    nuget_config = "//desk:nuget.config",
+    packages_lock_json = "//desk:packages.lock.json",
+)
+use_repo(nuget, "nuget")
+"#;
+
+    /// A registry crate, one of another registry, one from git, one from a
+    /// path, and one that a `[replace]` swaps out.
+    const CARGO_LOCK: &str = r#"version = 4
+
+[[package]]
+name = "engine"
+version = "0.1.0"
+dependencies = ["serde", "tokens", "fork", "local", "swapped"]
+
+[[package]]
+name = "serde"
+version = "1.0.200"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[[package]]
+name = "tokens"
+version = "0.3.0"
+source = "sparse+https://crates.example/index/"
+checksum = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[[package]]
+name = "fork"
+version = "2.0.0"
+source = "git+https://git.example/fork#0123456789abcdef0123456789abcdef01234567"
+
+[[package]]
+name = "local"
+version = "0.2.0"
+
+[[package]]
+name = "swapped"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+replace = "swapped 3.0.0"
+"#;
+
+    const NUGET_LOCK: &str = r#"{
+  "version": 1,
+  "dependencies": {
+    "net8.0": {
+      "Newtonsoft.Json": {
+        "type": "Direct",
+        "requested": "[13.0.3, )",
+        "resolved": "13.0.3",
+        "contentHash": "AAAA"
+      },
+      "Shop.Core": { "type": "Project" }
+    }
+  }
+}
+"#;
+
+    const NUGET_CONFIG: &str = "<configuration>\n  <packageSources>\n    <add key=\"nuget.org\" \
+        value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n</configuration>\n";
+
+    const BUILT: [(&str, &str); 4] = [
+        ("MODULE.bazel", CRATES),
+        ("engine/Cargo.lock", CARGO_LOCK),
+        ("desk/packages.lock.json", NUGET_LOCK),
+        ("desk/nuget.config", NUGET_CONFIG),
+    ];
+
+    const CARGO: &str = "crate.from_cargo MODULE.bazel:7 engine/Cargo.lock";
+    const NUGET: &str = "nuget.from_lock MODULE.bazel:15 desk/packages.lock.json";
+    const SERDE: &str = "pkg:cargo/serde@1.0.200";
+    const JSON: &str = "pkg:nuget/newtonsoft.json@13.0.3";
+
+    /// [`BUILT`] with `text` in the place of the file `path`, and with
+    /// `from` of that text replaced by `to`.
+    fn built_with(path: &str, from: &str, to: &str) -> Vec<(&'static str, &'static str)> {
+        let changed = |(name, text): (&'static str, &'static str)| match name == path {
+            true => {
+                assert!(text.contains(from), "{path}: no {from:?}");
+                let text: &'static str = Box::leak(text.replace(from, to).into_boxed_str());
+                (name, text)
+            }
+            false => (name, text),
+        };
+        BUILT.into_iter().map(changed).collect()
+    }
+
+    /// A crate in a cargo home and a package in NuGet's folder are not
+    /// what `crate.from_cargo` and `nuget.from_lock` build: each has Bazel
+    /// download what the lock of the project lists.
+    #[test]
+    fn an_installed_crate_or_nuget_package_is_not_what_a_hub_builds() {
+        let installed = |project, purl| said(&BUILT, project, purl, None);
+        // A crate of crates.io and one of another registry.
+        assert_eq!(installed("engine", SERDE), CARGO);
+        assert_eq!(installed("engine", "pkg:cargo/tokens@0.3.0"), CARGO);
+        // The id as the lock spells it and as NuGet's folder does, and a
+        // version with a fourth part.
+        assert_eq!(installed("desk", JSON), NUGET);
+        assert_eq!(
+            installed("desk", "pkg:nuget/Newtonsoft.Json@13.0.3.0"),
+            NUGET
+        );
+        // What the hub does not download: a crate from git, from a path or
+        // behind a `[replace]`, the workspace's own, a project reference.
+        for other in [
+            "pkg:cargo/fork@2.0.0",
+            "pkg:cargo/local@0.2.0",
+            "pkg:cargo/swapped@3.0.0",
+            "pkg:cargo/engine@0.1.0",
+            "pkg:cargo/serde@1.0.199",
+        ] {
+            assert_eq!(installed("engine", other), "", "{other}");
+        }
+        assert_eq!(installed("desk", "pkg:nuget/shop.core@1.0.0"), "");
+        assert_eq!(installed("desk", "pkg:nuget/newtonsoft.json@13.0.2"), "");
+        // The lock of another project: beside it, above it, below it.
+        for (project, purl) in [("desk", SERDE), ("", SERDE), ("engine/cli", SERDE)] {
+            assert_eq!(installed(project, purl), "", "{project:?}");
+        }
+        for project in ["engine", "desk/tests", "des"] {
+            assert_eq!(installed(project, JSON), "", "{project:?}");
+        }
+        // But a NuGet project is every project file below the directory of
+        // the run, each with its lock: the lock of `desk` is the root's.
+        assert_eq!(installed("", JSON), NUGET);
+        assert!(inside("shop", "shop/desk/packages.lock.json"));
+        assert!(!inside("shop/desk/tests", "shop/desk/packages.lock.json"));
+        // A copy committed under `.socket/vendor` is not judged.
+        let pins = ["Cargo.toml", "Cargo.lock"];
+        assert_eq!(said(&BUILT, "engine", SERDE, Some(&pins)), "");
+        let pins = ["nuget.config", "packages.lock.json"];
+        assert_eq!(said(&BUILT, "desk", JSON, Some(&pins)), "");
+    }
+
+    /// What to run is the hub's: hosted mode under every hub, with what it
+    /// needs of a `crate.from_cargo` and a `nuget.from_lock`, and vendored
+    /// mode for a crate, which alone of the two is built from a committed
+    /// copy.
+    #[test]
+    fn a_hub_names_the_modes_that_patch_what_it_builds() {
+        let remedy = |files: &[(&str, &str)], project: &str, purl: &str| {
+            let text = |path: &str| files.iter().find(|(name, _)| *name == path);
+            let workspace = Workspace::read(&|path| match text(path) {
+                Some((_, text)) => Entry::Text(text.to_string()),
+                None => Entry::Absent,
+            });
+            let package = Patched {
+                purl: purl.to_string(),
+                uuid: UUID.to_string(),
+                pins: None,
+            };
+            let read = |path: &str| text(path).map(|(_, text)| text.to_string());
+            let found = judge(&workspace, project, &read, &[package]).remove(0);
+            found.expect("a call that builds the package").remedy
+        };
+        assert_eq!(remedy(&SHOP, "web", "pkg:npm/left-pad@1.3.0"), HOSTED);
+        assert_eq!(remedy(&SHOP, "api", "pkg:pypi/flask-cors@4.0.0"), HOSTED);
+        assert_eq!(remedy(&SHOP, "billing", "pkg:gem/rack@2.2.8"), HOSTED);
+        let pins = HOSTED.trim_end_matches('.');
+        let cargo = remedy(&BUILT, "engine", SERDE);
+        let vendored = "), or `socket-patch scan --mode vendored` to commit";
+        let names = cargo.contains("`cargo_config`") && cargo.contains(vendored);
+        assert!(cargo.starts_with(pins) && names, "{cargo}");
+        let nuget = remedy(&BUILT, "desk", JSON);
+        let names = nuget.contains("`nuget_config`") && !nuget.contains("vendored");
+        assert!(nuget.starts_with(pins) && names, "{nuget}");
+    }
+
+    /// A call that names more than the lock: nothing is said where its
+    /// packages can come from a file that is not read, or where a file
+    /// beside the lock names the patch or cannot be read.
+    #[test]
+    fn a_crate_or_nuget_call_that_may_build_something_else_withholds_nothing() {
+        let lock = "    cargo_lockfile = \"//engine:Cargo.lock\",\n";
+        let cargo = |argument: &str| {
+            let files = built_with("MODULE.bazel", lock, &format!("{lock}    {argument},\n"));
+            said(&files, "engine", SERDE, None)
+        };
+        assert_eq!(
+            cargo("cargo_config = \"//engine:.cargo/config.toml\""),
+            CARGO
+        );
+        // The lock of rules_rust's own tool, and arguments not written out.
+        assert_eq!(cargo("lockfile = \"//engine:cargo-bazel-lock.json\""), "");
+        assert_eq!(cargo("**COMMON"), "");
+        // `manifests` alone names no lock.
+        let files = built_with("MODULE.bazel", lock, "");
+        assert_eq!(said(&files, "engine", SERDE, None), "");
+        // The extension by the older name of its file is the same one.
+        let files = built_with(
+            "MODULE.bazel",
+            "universe:extensions.bzl",
+            "universe:extension.bzl",
+        );
+        assert_eq!(said(&files, "engine", SERDE, None), CARGO);
+        // A lock that names the patch: the registry of a hosted pin.
+        let source = "registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"aaaa";
+        let pinned = format!("sparse+https://patch.example/{UUID}/index/\"\nchecksum = \"cccc");
+        let files = built_with("engine/Cargo.lock", source, &pinned);
+        assert_eq!(said(&files, "engine", SERDE, None), "");
+
+        let config = "    nuget_config = \"//desk:nuget.config\",\n";
+        let nuget = |files: &[(&str, &str)]| said(files, "desk", JSON, None);
+        assert_eq!(nuget(&BUILT), NUGET);
+        // No config: the hub asks nuget.org alone.
+        assert_eq!(nuget(&built_with("MODULE.bazel", config, "")), NUGET);
+        // The config names the patch: the source of a hosted pin, whose
+        // hash the lock holds without a word of it.
+        let org = "<add key=\"nuget.org\"";
+        let source =
+            format!("<add key=\"socket-patch-{UUID}\" value=\"https://h/x\" />\n    {org}");
+        let files = built_with("desk/nuget.config", org, &source);
+        assert_eq!(nuget(&files), "");
+        // The config is not named plainly, or is not there.
+        let computed = "    nuget_config = CONFIG,\n";
+        assert_eq!(nuget(&built_with("MODULE.bazel", config, computed)), "");
+        assert_eq!(nuget(&BUILT[..3]), "");
+
+        // rules_csharp makes one hub of every call: the config of the call
+        // for another project's lock may be the one this project's package
+        // comes through. Nothing is said when it names the patch, is not
+        // named plainly, or may be passed unseen.
+        let hosted: &'static str = Box::leak(NUGET_CONFIG.replace(org, &source).into_boxed_str());
+        let beside = |call: &str| {
+            let hub = "use_repo(nuget, \"nuget\")\n";
+            let call = format!("nuget.from_lock({call})\n{hub}");
+            let mut files = built_with("MODULE.bazel", hub, &call);
+            let till = [
+                ("till/packages.lock.json", NUGET_LOCK),
+                ("till/nuget.config", hosted),
+            ];
+            files.extend(till);
+            nuget(&files)
+        };
+        let lock = "packages_lock_json = \"//till:packages.lock.json\"";
+        assert_eq!(beside(lock), NUGET);
+        let upstream = format!("{lock}, nuget_config = \"//desk:nuget.config\"");
+        assert_eq!(beside(&upstream), NUGET);
+        for other in [
+            "nuget_config = \"//till:nuget.config\"",
+            "nuget_config = \"//till:missing.config\"",
+            "nuget_config = CONFIG",
+            "nuget_config = {\"//desk:nuget.config\": \"desk\"}",
+            "**TILL",
+        ] {
+            assert_eq!(beside(&format!("{lock}, {other}")), "", "{other}");
+        }
+
+        // A proxy that is handed on: a doubt on that hub alone, by either
+        // file of its extension.
+        let files = built_with("MODULE.bazel", CRATES, &format!("{CRATES}print(crate)\n"));
+        assert_eq!(said(&files, "engine", SERDE, None), "");
+        assert_eq!(said(&files, "desk", JSON, None), NUGET);
     }
 
     #[test]
@@ -994,16 +1429,17 @@ use_repo(ruby, "bundle")
             [
                 said(&files, "api", "pkg:pypi/flask-cors@4.0.0", None),
                 said(&files, "api", "pkg:pypi/requests@2.31.0", Some(&pins)),
+                said(&files, "tools", "pkg:pypi/idna@3.6", None),
             ]
         };
         let judged = "pip.parse MODULE.bazel:15 api/requirements.txt".to_string();
-        assert_eq!(pypi("quiet = False"), [judged.clone(), judged]);
+        // The other call of the hub is judged whatever this one passes.
+        let other = "pip.parse MODULE.bazel:21 tools/requirements_linux.txt".to_string();
+        let both = [judged.clone(), judged, other.clone()];
+        assert_eq!(pypi("quiet = False"), both);
         for elsewhere in ["uv_lock = \"//api:uv.lock\"", "**COMMON", "*LOCKS"] {
-            assert_eq!(
-                pypi(elsewhere),
-                [String::new(), String::new()],
-                "{elsewhere}"
-            );
+            let passed_over = [String::new(), String::new(), other.clone()];
+            assert_eq!(pypi(elsewhere), passed_over, "{elsewhere}");
         }
     }
 
@@ -1416,7 +1852,7 @@ use_repo(ruby, "bundle")
             pins,
         };
         let packages = vec![
-            package("pkg:cargo/serde@1.0.0", None),
+            package("pkg:golang/example.com/m@v1.0.0", None),
             package("pkg:npm/left-pad@1.3.0", None),
             package("pkg:npm/left-pad@1.2.0", None),
         ];

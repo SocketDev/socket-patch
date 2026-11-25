@@ -12,7 +12,7 @@
 //! 4. `rollback --silent` whose blob download fails (unreachable server)
 //!    exited 1 with zero output.
 //! 5. `rollback --silent` with a per-package failure (installed file
-//!    modified after patching — hash mismatch) exited 1 with zero output.
+//!    holding neither side of the patch — hash mismatch) exited 1 with zero output.
 //!
 //! Stderr assertions ignore the "No SOCKET_API_TOKEN set" client warning:
 //! it's printed by `get_api_client_with_overrides` in core for every ONLINE
@@ -224,7 +224,7 @@ fn rollback_silent_per_package_failure_keeps_error_output() {
     )
     .unwrap();
     // Locally modified: matches NEITHER hash — rollback must fail this
-    // package (HashMismatch, "modified after patching").
+    // package (HashMismatch, neither side of the patch).
     std::fs::write(pkg_dir.join("index.js"), b"user-edited-content\n").unwrap();
 
     let socket = tmp.path().join(".socket");

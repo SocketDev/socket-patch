@@ -290,6 +290,16 @@ Error: No applied patches with vulnerability metadata to attest.
 The patched packages are not installed yet: the installed copies still hold their original files. Reinstall from the lockfile (hosted or vendored patches) or run `socket-patch apply` (agent-mode patches), then run `socket-patch vex` again.
 ```
 
+For a hosted gem the last line names `socket-patch scan` instead of a reinstall.
+Bundler keeps a gem it has already installed, so a checkout that had its gems before
+it pulled the hosted `Gemfile.lock` still runs the upstream copies, and
+`bundle install`, `bundle install --redownload` and `bundle pristine` don't change
+that. The scan replaces the installed copies; see
+[Ruby gems: gems already installed](ecosystems.md#ruby-gems-gems-already-installed).
+In a project that also holds agent-mode or vendored patches, where a scan with no
+`--mode` is not a hosted one, the line names the files to remove before
+`bundle install` instead.
+
 `--verbose` prints a line per patch, and `--json` reports each one as its own
 `skipped` event. Warnings of one kind are folded the same way: the first in full,
 then a line naming the packages the rest are about.
@@ -299,8 +309,8 @@ any file, so it also attests an agent-mode patch whose files are unpatched or mi
 It never does so silently: the run warns how many statements it emitted that way, and
 each one ends its impact statement with `; not verified on disk`.
 
-In a Bazel workspace the document describes what Bazel builds from the project's lock, and
-says `affected` of a package whose patch is only in the installed copy (see
+In a Bazel workspace (experimental) the document describes what Bazel builds from the
+project's lock, and says `affected` of a package whose patch is only in the installed copy (see
 [Bazel workspaces: VEX](ecosystems.md#bazel-workspaces-vex)). `--no-bazel` (`--vex-no-bazel`
 on `scan`, `apply` and `vendor`, or `SOCKET_VEX_NO_BAZEL` in the environment) makes it describe
 what the package manager installed; use it when the installed tree is what you ship.
@@ -339,6 +349,8 @@ scala-cli resolve into (restart a running sbt server, Bloop or Metals after
 [ecosystem caveats](ecosystems.md) before using agent mode in shared environments.
 The removed `setup` command is covered in the [migration guide](migrating-to-v5.md).
 
+What socket-patch does in a Bazel workspace is experimental
+([Bazel workspaces: what is supported](ecosystems.md#bazel-workspaces-what-is-supported)).
 Agent mode is not supported for a package that Bazel builds: Bazel takes its packages from
 what its rulesets read, and runs no `socket-patch apply`. Use hosted mode there, or vendored
 mode where [Bazel workspaces: what is supported](ecosystems.md#bazel-workspaces-what-is-supported)

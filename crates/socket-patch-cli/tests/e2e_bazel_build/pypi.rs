@@ -1192,6 +1192,24 @@ fn a_workspace_file_counts_unless_the_checkout_names_bazel_9_or_later() {
     }
 }
 
+/// Without a Bazel: with `SOCKET_NO_BAZEL=1` vendored mode vendors the
+/// package whose requirements the hub reads, as it does in the same
+/// checkout without its `MODULE.bazel`, to the byte. Without the variable
+/// it declines the package there.
+#[test]
+fn the_switch_makes_vendored_mode_the_one_of_a_checkout_without_bazel() {
+    let with = Vendoring::new();
+    let cell = checkout(&with);
+    let origin = with.standin.origin();
+    let json_api = format!("{origin}/{INDEX}/pypi");
+    let env = [
+        ("SOCKET_PATCH_SERVER_URL", origin.as_str()),
+        ("SOCKET_PYPI_JSON_API", json_api.as_str()),
+    ];
+    let declined = cell.off_is_without_bazel(&origin, &VENDORED, &env, &["MODULE.bazel"]);
+    assert_eq!(declined[0]["code"], 1, "{declined:#}");
+}
+
 /// Without a Bazel: the fixture's directories are those of its table, and
 /// the workflow runs each release on its era. The fixture holds no
 /// `requirements.txt`: every era names the one the test writes, which pins
