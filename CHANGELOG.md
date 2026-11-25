@@ -99,6 +99,12 @@ a version without a non-empty section in this file.
     skipped, not verified. A repository that ships the installed tree rather
     than what Bazel builds passes `--no-bazel` (`--vex-no-bazel` on `scan`,
     `apply` and `vendor`; env `SOCKET_VEX_NO_BAZEL`) (#2159, #2224).
+  - **Projects that Bazel does not build are left as they were.** In a
+    checkout that holds a Bazel workspace file, a Composer project that is
+    already vendored is not declined, a workspace with no rules_jvm_external
+    hub adds no Maven warnings, and `SOCKET_NO_BAZEL=1` switches the Bazel
+    support off for the run, so every command does what it does in the same
+    checkout without the workspace file (#2228).
 - **RubyGems.**
   - **Gems locked as precompiled platform gems (such as nokogiri) in hosted
     and vendored mode, on MRI and JRuby.** A `Gemfile.lock` that pins a gem
@@ -221,6 +227,13 @@ a version without a non-empty section in this file.
 ### Changed
 
 - **General.**
+  - **`vex` names each patched package as a product of its own,** after the
+    project, so Trivy and Grype match a statement by the package's PURL and
+    the document suppresses their findings. A platform gem is also named the
+    way each scanner reports it (`pkg:gem/<name>@<version>` and, unless the
+    platform is `ruby`, `pkg:gem/<name>@<version>-<platform>`); a name that
+    would stand for packages with different statuses is left out. The
+    project's `subcomponents` are unchanged (#2243).
   - **Reworked terminal output for `scan`, `get`, `rollback`, `list` and
     `vex`.** `scan` prints one row per patched package (severity, advisories,
     what Socket measured about the patch, advisories left unpatched) and then
