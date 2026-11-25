@@ -3974,6 +3974,28 @@ that deletes it, `gem cleanup`): with no archive to compare, the installed files
 against the patch itself, in both directions. If the patch can't be looked up during a `rollback`
 or `remove`, the copy is left alone and the run warns (`upstream_gem_stale_install`), naming the
 files to remove before `bundle install`.
+
+A project whose `Gemfile` names a private gem server as its source (`source
+"https://gems.example.com"`) locks its gems under that server, not rubygems.org. `rollback` and
+`remove` do not ask a server they were not told about, so for such a gem:
+
+- On a lock with a `CHECKSUMS` section they need the upstream gem's sha256 to restore the lock, and
+  refuse until `SOCKET_RUBYGEMS_URL` names that server (its credentials go in the URL, and are
+  never printed):
+
+  ```sh
+  SOCKET_RUBYGEMS_URL=https://gems.example.com socket-patch rollback pkg:gem/rack@3.1.8
+  ```
+
+  The checksum is then read from the server's compact index (`info/<name>`), the `Gemfile` and
+  lock come back byte for byte, and the installed copy is replaced with the upstream gem
+  downloaded from that server.
+- On a lock without `CHECKSUMS` (Bundler 2.5 and older) the pair is restored without the setting.
+  Nothing then gives the upstream gem's sha256, so the installed copy is checked against the patch
+  itself: a copy that still holds the patched build is left as it is and named by
+  `upstream_gem_stale_install`, with the files to remove before `bundle install` (Bundler keeps
+  the copy otherwise). With the setting, the copy is replaced as above.
+
 Vendoring a gem that was hosted (`vendor`, `scan --mode vendored`) leaves the installed copies as
 they are: Bundler loads the vendored copy from then on. When that vendored gem is later unwound
 (`rollback`, `remove`, `vendor --revert`), Bundler loads the installed copy again, so the unwind
