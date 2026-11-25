@@ -3264,6 +3264,238 @@ async fn gem_hosted_get_takes_every_locked_build_of_the_fix() {
     }
 }
 
+/// `get` in hosted mode settles a platform-locked gem's fix BEFORE it says
+/// anything of its selection. Two fixes cover every locked build, and the
+/// per-purl ranking takes fix A for the ruby gem and one platform and fix
+/// B for the other platform (its patch there is the newer one). The run
+/// uses fix A for every build, so:
+///
+/// * the `Selected:` echo lists fix A's patch of that platform, the UUID
+///   the run pins, not the ranking's;
+/// * the merged-patch note is computed from that selection: every build
+///   is on fix A, so the gem waits for what fix B fixes. Computed from the
+///   ranking's mix it would find nothing every build leaves, and say
+///   nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_get_echoes_and_judges_the_settled_selection() {
+    const UUID_B: &str = "9b0c1d2e-3f4a-4b5c-8d6e-8f9a0b1c2d3e";
+    const FIXED_BY_A: &str = "GHSA-aaaa-aaaa-aaaa";
+    const FIXED_BY_B: &str = "GHSA-bbbb-bbbb-bbbb";
+    let server = MockServer::start().await;
+    let sha_of = |platform: Option<&str>| match platform {
+        Some(platform) => sha256_of(&real_gem_for(PATCHED_LIB, platform)),
+        None => sha256_of(&real_gem(PATCHED_LIB)),
+    };
+    // Each fix: its source patch and a patch per platform gem, with the
+    // date that ranks it within its purl (the newer one wins).
+    let fixes = [
+        (
+            UUID,
+            FIXED_BY_A,
+            [
+                (None, "2026-03-01T00:00:00Z"),
+                (Some(PLATFORM), "2026-03-01T00:00:00Z"),
+                (Some(OTHER_PLATFORM), "2026-01-01T00:00:00Z"),
+            ],
+        ),
+        (
+            UUID_B,
+            FIXED_BY_B,
+            [
+                (None, "2026-02-01T00:00:00Z"),
+                (Some(PLATFORM), "2026-02-01T00:00:00Z"),
+                (Some(OTHER_PLATFORM), "2026-04-01T00:00:00Z"),
+            ],
+        ),
+    ];
+    let uuid_of = |fix: &str, platform: Option<&str>| match platform {
+        Some(platform) => platform_patch_uuid(fix, platform),
+        None => fix.to_string(),
+    };
+    let mut found = Vec::new();
+    let mut results = serde_json::Map::new();
+    for (fix, advisory, gems) in &fixes {
+        let mut listed = String::from("---\n");
+        for (platform, published) in gems {
+            let uuid = uuid_of(fix, *platform);
+            let (purl, token) = match platform {
+                Some(platform) => (platform_purl(platform), format!("{DEP_VERSION}-{platform}")),
+                None => (PURL.to_string(), DEP_VERSION.to_string()),
+            };
+            let sha = sha_of(*platform);
+            listed.push_str(&format!("{token} |checksum:{sha}\n"));
+            found.push(serde_json::json!({
+                "uuid": uuid, "purl": purl, "publishedAt": published,
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": { *advisory: {
+                    "cves": [], "summary": "s", "severity": "critical", "description": "d"
+                }}
+            }));
+            let url = format!(
+                "{}/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{uuid}/{DEP}-{token}.gem",
+                server.uri()
+            );
+            results.insert(
+                uuid.clone(),
+                serde_json::json!({
+                    "status": "granted",
+                    "url": url,
+                    "purl": purl,
+                    "rebuiltFromUuid": platform.map(|_| *fix),
+                    "artifacts": [{
+                        "kind": "tarball", "url": url, "integrity": { "sha256": sha }
+                    }],
+                    "registryOverride": {
+                        "kind": "rubygems-compact-index",
+                        "indexUrl": format!(
+                            "{}/patch-registry/gem/{TOKEN}/{uuid}/",
+                            server.uri()
+                        ),
+                        "identifiers": {
+                            "name": DEP, "version": DEP_VERSION, "gemChecksumSha256": sha,
+                        },
+                    }
+                }),
+            );
+        }
+        // Every registry of a fix lists every gem of it.
+        for (platform, _) in gems {
+            let uuid = uuid_of(fix, *platform);
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/patch-registry/gem/{TOKEN}/{uuid}/info/{DEP}"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_string(listed.clone()))
+                .mount(&server)
+                .await;
+        }
+    }
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": found,
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_default();
+            let asked: serde_json::Map<String, serde_json::Value> = body["uuids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|uuid| uuid.as_str())
+                .filter_map(|uuid| Some((uuid.to_string(), results.get(uuid)?.clone())))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": asked }))
+        })
+        .mount(&server)
+        .await;
+
+    let (a_arm, a_linux, b_linux) = (
+        uuid_of(UUID, Some(PLATFORM)),
+        uuid_of(UUID, Some(OTHER_PLATFORM)),
+        uuid_of(UUID_B, Some(OTHER_PLATFORM)),
+    );
+    let uri = server.uri();
+    let get = |json: bool| {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("Gemfile"),
+            format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("Gemfile.lock"),
+            platform_lock(&"1".repeat(64), &"2".repeat(64)),
+        )
+        .unwrap();
+        let mut args = vec!["get", PURL, "--mode", "hosted", "--yes"];
+        if json {
+            args.push("--json");
+        }
+        let cwd = proj.to_str().unwrap().to_string();
+        args.extend([
+            "--cwd",
+            cwd.as_str(),
+            "--api-url",
+            uri.as_str(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ]);
+        let (code, stdout, stderr) = common::run_with_env(&proj, &args, &[]);
+        let lock = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
+        (code, stdout, stderr, lock)
+    };
+
+    // Human mode: the echo, and the note under it.
+    let (code, stdout, stderr, lock) = get(false);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let echo = stdout
+        .split_once("Selected:\n")
+        .and_then(|(_, rest)| rest.split_once("\n\n"))
+        .map(|(echo, _)| echo)
+        .unwrap_or_else(|| panic!("a `Selected:` block:\n{stdout}"));
+    // The echo shows each patch by the first group of its uuid, which is
+    // its fix's here: three lines of fix A, none of fix B (the ranking's
+    // pick for the other platform, premise below).
+    assert_ne!(a_linux[..8], b_linux[..8], "premise: the fixes show apart");
+    let lines: Vec<&str> = echo.lines().collect();
+    assert_eq!(lines.len(), 3, "the source patch and both builds:\n{echo}");
+    assert!(
+        lines.iter().all(|line| line.contains(&a_linux[..8]))
+            && !echo.contains(&b_linux[..8])
+            && echo.contains(&platform_purl(OTHER_PLATFORM)),
+        "the echo lists the patches the run uses:\n{echo}\nall of stdout:\n{stdout}"
+    );
+    let after_echo = stdout.split_once("Selected:\n").unwrap().1;
+    assert!(
+        after_echo.contains(FIXED_BY_B),
+        "the note names what the settled selection leaves:\n{stdout}"
+    );
+    // And those are the patches the lock is pinned to.
+    assert!(
+        lock.contains(&format!("/patch-registry/gem/{TOKEN}/{UUID}/\n"))
+            && lock.contains(&format!(
+                "  {DEP} ({DEP_VERSION}-{OTHER_PLATFORM}) sha256={}\n",
+                sha_of(Some(OTHER_PLATFORM))
+            )),
+        "{lock}"
+    );
+
+    // `--json`: the same selection in the events, the same note as a warning.
+    let (code, stdout, stderr, _) = get(true);
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    let mut pinned: Vec<&str> = env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["details"]["mode"] == "hosted" && e["action"] == "applied")
+        .filter_map(|e| e["uuid"].as_str())
+        .collect();
+    pinned.sort_unstable();
+    let mut expected = [a_arm.as_str(), a_linux.as_str()];
+    expected.sort_unstable();
+    assert_eq!(pinned, expected, "{env}");
+    let waiting = warnings_with_code(&env, "merged_patch_pending");
+    let [detail] = waiting.as_slice() else {
+        panic!("one merged-patch warning: {env}");
+    };
+    assert!(
+        detail.contains(FIXED_BY_B) && !detail.contains(FIXED_BY_A),
+        "{detail}"
+    );
+}
+
 /// With the rollout's budget spent, a gem locked as platform builds is
 /// deferred whole, its source patch included: nothing is written, the
 /// builds are reported as deferred, and the run gives no platform warning
