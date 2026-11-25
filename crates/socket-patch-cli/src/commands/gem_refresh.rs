@@ -415,23 +415,78 @@ enum Outlives {
     /// The gemspec is gone already: the gem dir is what is left of an
     /// install, and nothing puts a gem back over it.
     NoGemspec,
+    /// No Ruby was asked, and the copy's gem home is beside another
+    /// Ruby's (`vendor/bundle/ruby/3.2.0` next to `ruby/3.3.0`): the Ruby
+    /// that runs `bundle install` may install into the other one.
+    BesideAnotherRuby,
+}
+
+/// Whether the gem home of the gem dir `<home>/gems/<leaf>` has another
+/// Ruby's gem home beside it. Bundler and RubyGems keep one gem home per
+/// Ruby ABI under one directory, each named by the ABI version
+/// (`vendor/bundle/ruby/3.2.0`, `ruby/3.3.0`), and which of them
+/// `bundle install` fills is up to the Ruby that runs it. Two gem homes
+/// side by side under other names (`GEM_HOME`s someone picked) are not
+/// that.
+fn beside_another_gem_home(gem_dir: &Path) -> bool {
+    // `3.2.0`, `3.4.0+1` (a development Ruby), `9.4`.
+    let abi_named = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with(|c: char| c.is_ascii_digit())
+                    && name.contains('.')
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '.' || c == '+')
+            })
+    };
+    let Some(home) = gem_dir.parent().and_then(Path::parent) else {
+        return false;
+    };
+    if !abi_named(home) {
+        return false;
+    }
+    let Some(entries) = home
+        .parent()
+        .and_then(|homes| std::fs::read_dir(homes).ok())
+    else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let other = entry.path();
+        other.file_name() != home.file_name()
+            && abi_named(&other)
+            && other.join("gems").is_dir()
+            && other.join("specifications").is_dir()
+    })
 }
 
 /// Whether the remedy for `gem`'s installed copy has to remove the gem
-/// dir itself, and why. Only a copy a refresh failed on, never one left
-/// alone (a shared home, a path outside the project,
-/// `--no-gem-install-refresh`) or patched in place.
+/// dir itself, and why. Only a copy a refresh failed on or was turned off
+/// for (`--no-gem-install-refresh`), never one left alone for where it is
+/// (a shared home, a path outside the project) or patched in place.
+///
+/// A refresh that got as far as asking a Ruby says whose the copy is. One
+/// that stopped before (it is turned off, the gem could not be had, the
+/// native rebuild is turned off) does not, and then a gem home beside
+/// another Ruby's is reason enough: removing the gem dir is right
+/// whichever Ruby runs `bundle install`.
 fn outlives_reinstall(gem: &StaleGem, why: Option<&Why>) -> Option<Outlives> {
-    let (Some((dir, _)), false, Some(Why::Failed(reason))) = (&gem.installed, gem.in_place, why)
-    else {
+    let (Some((dir, _)), false) = (&gem.installed, gem.in_place) else {
         return None;
     };
-    if gemspec_is_gone(dir) {
-        Some(Outlives::NoGemspec)
-    } else if reason.contains(socket_patch_core::patch::gem_ext::OWNED_BY_ANOTHER_RUBY) {
-        Some(Outlives::ForeignRuby)
-    } else {
-        None
+    match why {
+        Some(Why::Failed(_)) if gemspec_is_gone(dir) => Some(Outlives::NoGemspec),
+        Some(Why::Failed(reason))
+            if reason.contains(socket_patch_core::patch::gem_ext::OWNED_BY_ANOTHER_RUBY) =>
+        {
+            Some(Outlives::ForeignRuby)
+        }
+        Some(Why::Failed(_) | Why::Disabled) if beside_another_gem_home(dir) => {
+            Some(Outlives::BesideAnotherRuby)
+        }
+        _ => None,
     }
 }
 
@@ -529,10 +584,23 @@ const GEM_DIR_REMOVED: &str = "The gem directory is removed too: `bundle install
      replace a copy that has no gemspec or is in the gem home of another Ruby";
 
 /// Why a remedy removes the gem dir of a copy whose gem home is beside
-/// another Ruby's, after the remedy.
-const BESIDE_ANOTHER_RUBY: &str = "The gem directory is removed too: its gem home is beside \
-     another Ruby's, and `bundle install` replaces a copy only in the gem home of the Ruby that \
-     runs it";
+/// another Ruby's ([`Outlives::BesideAnotherRuby`]), after the remedy.
+const BESIDE_ANOTHER_RUBY: &str = "The gem directory is removed too: `bundle install` replaces \
+     a copy only in the gem home of the Ruby that runs it, and more than one Ruby has a gem home \
+     here";
+
+/// Why a remedy removes a gem dir, after the remedy: `outlives` is why
+/// each of its copies that outlives a reinstall does.
+fn gem_dir_removed(outlives: impl IntoIterator<Item = Outlives>) -> &'static str {
+    if outlives
+        .into_iter()
+        .all(|one| one == Outlives::BesideAnotherRuby)
+    {
+        BESIDE_ANOTHER_RUBY
+    } else {
+        GEM_DIR_REMOVED
+    }
+}
 
 /// `action` after `hint` (which ends mid-sentence), or as a sentence of
 /// its own when there is none.
@@ -634,17 +702,18 @@ pub(crate) fn stale_detail(direction: Direction, gem: &StaleGem, why: Option<&Wh
         }
         Some((dir, _)) => {
             let (paths, with_dir) = remedy_paths(gem, why);
+            let outlives = outlives_reinstall(gem, why);
             format!(
                 "{purl} {switched}, but its {stale} install at {} was not refreshed{}, and \
                  {reuse}. {}{}",
                 dir.display(),
                 reason(why),
                 after_hint(
-                    retry_hint(direction, why, outlives_reinstall(gem, why)),
+                    retry_hint(direction, why, outlives),
                     &format!("remove {} and run `bundle install`", display_list(&paths))
                 ),
                 if with_dir {
-                    format!(". {GEM_DIR_REMOVED}")
+                    format!(". {}", gem_dir_removed(outlives))
                 } else {
                     String::new()
                 },
@@ -944,7 +1013,10 @@ pub(crate) fn report(
             .flatten();
         let mut reinstall = format!("run `{}`", reinstall_command(&files, with_dirs));
         if with_dirs {
-            reinstall.push_str(&format!(". {GEM_DIR_REMOVED}"));
+            let kinds = gems
+                .iter()
+                .filter_map(|gem| outlives_reinstall(gem, Some(why)));
+            reinstall.push_str(&format!(". {}", gem_dir_removed(kinds)));
         }
         let names = labels(gems.iter().map(|gem| gem.purl.as_str()));
         bullets.push(match why {
@@ -2562,8 +2634,12 @@ mod tests {
             assert!(!bullet.contains("rm -rf"), "{bullet}");
         }
 
-        // A directory beside it that is no gem home changes nothing.
-        std::fs::create_dir_all(home.with_file_name("notes")).unwrap();
+        // Nor does a directory beside it that is no Ruby's gem home: an
+        // empty ABI dir, a gem home under a name that is no ABI's.
+        std::fs::create_dir_all(home.with_file_name("3.1.0")).unwrap();
+        for part in ["gems", "specifications"] {
+            std::fs::create_dir_all(home.with_file_name("shared").join(part)).unwrap();
+        }
         let (bullet, _) = bullet_of(&disabled, &off, Direction::Patched);
         assert!(bullet.contains(&rm_f), "{bullet}");
 

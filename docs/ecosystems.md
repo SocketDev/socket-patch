@@ -4864,6 +4864,12 @@ that Ruby first on `PATH`. A gem directory that already lost its gemspec, and th
 tried and failed to replace, is reported the same way: the warning names the directory to
 remove, and no re-run, which could not replace it.
 
+A scan that stops before it asks a Ruby (`--no-gem-install-refresh`, `--no-gem-native-rebuild`,
+a patched gem it could not download) does not know which tree the Ruby on `PATH` installs into.
+When the stale copy's tree has another Ruby's beside it, the warning names the gem directory to
+remove there too, which leaves no unpatched copy whichever Ruby runs `bundle install`. With one
+tree only, the command stays `rm -f <gemspec> <archive> && bundle install`.
+
 Gems in a gem home **outside** the project (the system gems, `~/.gem`, an rbenv or asdf home) are
 not touched: another project on the machine may use the same copy. The run prints one warning
 naming them. Either install the project's gems into the project, where Bundler fetches the patched
