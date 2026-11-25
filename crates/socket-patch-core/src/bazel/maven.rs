@@ -1743,8 +1743,11 @@ fn command(group: &str, artifact: &str, version: &str) -> String {
 ///
 /// It is said only when it is certain of that hub, whatever is not known
 /// of another one: the hub and its lock were read and no `maven.override`
-/// names the artifact ([`Hubs::built`]), the block was not changed by
-/// hand, and it holds no entry of this patch for the jar. `None`
+/// names the artifact ([`Hubs::built`]), and the block holds no entry of
+/// this patch for the jar. A block that was changed by hand and still
+/// overrides a repository may hold one: the reader does not follow such
+/// a call, so no hub is read beside it. One that overrides nothing holds
+/// no entry, and no mode writes to it. `None`
 /// otherwise, and where the checkout does not say that Bazel reads
 /// `MODULE.bazel` as it stands: it names a Bazel before 7.0, or none
 /// while a `WORKSPACE` file defines something, or an rc file names an
@@ -1770,7 +1773,7 @@ pub fn upstream(root: &Path, patches: &[(&str, &str)]) -> Vec<Option<(Hub, Strin
     let release = declared_release(&view);
     let read = release.map_or(!hubs.legacy, |release| release >= (7, 0, 0));
     let off = || rc(&view, release).iter().any(|(code, _)| *code != DOWNLOAD);
-    if hubs.pinned.is_empty() || hubs.edited.is_some() || !read || off() {
+    if hubs.pinned.is_empty() || !read || off() {
         return none();
     }
     // What holds for every jar is asked once, as for a run that writes.
@@ -2717,7 +2720,9 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
             "there is no repository for an entry to replace",
         );
         // The block's entry of the patch is the jar Bazel takes, and a
-        // block that was changed by hand may hold one. The entry of another
+        // block that was changed by hand may hold one while it overrides
+        // a repository: what is left of one that overrides nothing holds
+        // none, and no mode writes to it. The entry of another
         // patch is not this one's: it is named, and the command replaces
         // it. An entry for another version is the entry of another jar.
         fn module(text: &str) -> [(&str, &str); 1] {
@@ -2726,6 +2731,9 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
         assert_eq!(said(&module(&patched), NETTY_PURL), nothing);
         let by_hand = patched.replace("# Do not change", "# Do change");
         assert_eq!(said(&module(&by_hand), NETTY_PURL), nothing);
+        let emptied = format!("{PINNED}\n{BEGIN}\n{END}\n");
+        let by_hand = "the block that socket-patch keeps there was changed by hand";
+        declined(&module(&emptied), UNREADABLE, by_hand);
         let another = patch("netty-tcnative-classes", OTHER_UUID);
         let another = with_patch(PINNED, LABEL, another).expect("a block");
         let names = format!(

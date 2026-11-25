@@ -2794,9 +2794,10 @@ with its reason ([Bazel workspaces: VEX](#bazel-workspaces-vex)). So the documen
 command that gave such a code still says `affected`. It is about the hub that fetches the
 jar, also beside another hub that was not read, where the first warning above is given.
 It stays `not_affected`, as without Bazel, where that hub is in doubt (an override of the
-artifact, a block that was changed by hand) and where the checkout does not say that Bazel
-reads `MODULE.bazel` as it stands (a Bazel before 7.0, a `WORKSPACE` file beside no named
-release, an rc file that names `enable_bzlmod` or `--ignore_dev_dependency`).
+artifact, a block that was changed by hand and still overrides a repository) and where the
+checkout does not say that Bazel reads `MODULE.bazel` as it stands (a Bazel before 7.0, a
+`WORKSPACE` file beside no named release, an rc file that names `enable_bzlmod` or
+`--ignore_dev_dependency`).
 
 The Bazel release is the one that `.bazeliskrc` (`USE_BAZEL_VERSION`) or else `.bazelversion`
 at the Bazel root names, read as bazelisk reads them: the last `USE_BAZEL_VERSION` line counts,
@@ -4350,7 +4351,9 @@ patched:
   `maven_install` of a `WORKSPACE` file, it is `affected`, as `apply` warns
   `maven_bazel_hub_unpatched` there. It stays `not_affected` where that hub itself is in
   doubt: its tags or its lock cannot be read, a `maven.override` names the artifact, or the
-  block was changed by hand and may hold an entry. It stays so too where the checkout does
+  block was changed by hand and still overrides a repository, so that it may hold an entry
+  (what is left of a block that overrides nothing holds none: the statement is `affected`,
+  and says that no mode writes to that block). It stays so too where the checkout does
   not say that Bazel reads `MODULE.bazel` as it stands: `.bazeliskrc` or `.bazelversion`
   names a Bazel before 7.0; neither names a release while a `WORKSPACE` file defines a
   repository; or an rc file of the checkout names `enable_bzlmod` other than switched on
