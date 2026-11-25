@@ -1441,9 +1441,29 @@ async fn assert_pnpm_workspace_parity_with_roots(
     trust_lockfile_config: bool,
     roots: &[&str],
 ) -> (Value, BTreeMap<String, Vec<u8>>) {
+    assert_pnpm_workspace_parity_granted(files, trust_lockfile_config, roots, false).await
+}
+
+/// [`assert_pnpm_workspace_parity_with_roots`]. With `registry`, the patch
+/// service also offers each patch's own registry: the directory its
+/// tarball is served from, which hosted mode can route a pnpm lock through.
+async fn assert_pnpm_workspace_parity_granted(
+    files: &BTreeMap<String, Vec<u8>>,
+    trust_lockfile_config: bool,
+    roots: &[&str],
+    registry: bool,
+) -> (Value, BTreeMap<String, Vec<u8>>) {
     let dir = fixtures_root().join("redirect/npm/pnpm/basic");
     let server = MockServer::start().await;
-    let patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
+    let mut patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
+    for patch in patches.iter_mut().filter(|_| registry) {
+        let url = patch.reference["url"]
+            .as_str()
+            .expect("a tarball")
+            .to_string();
+        let directory = &url[..=url.rfind('/').expect("the URL of a tarball")];
+        patch.reference["npmRegistryUrl"] = directory.into();
+    }
     mount_api(&server, &patches).await;
     let extra: &[&str] = if trust_lockfile_config {
         &[]
@@ -1635,6 +1655,84 @@ async fn parity_pnpm_bazel_hub_that_hides_the_workspace_file() {
     assert!(warned.contains(code), "{redirect:#}");
     assert!(
         warned.contains("put a comment line in pnpm-workspace.yaml"),
+        "{redirect:#}"
+    );
+}
+
+/// A rules_js hub that reads the pnpm lock, a patch whose registry the
+/// patch service offers and a project that proves pnpm 12: both engines
+/// give the one answer. A hub that runs no pnpm, and one whose pnpm 11
+/// reads the user's `pnpm-workspace.yaml`, have the lock routed through
+/// the registry. The same hub with a pnpm 10 keeps the pin with
+/// `trustLockfile: true`, and the warning says what kept it off the
+/// route. Told not to write to the workspace file, both engines write
+/// nothing beside the hub whose pnpm 11 would reject the pin, and say what
+/// to do.
+#[tokio::test]
+async fn parity_pnpm_bazel_hub_and_the_registry_route() {
+    let lock =
+        String::from_utf8(read_fixture("redirect/npm/pnpm/basic/input/pnpm-lock.yaml")).unwrap();
+    let module = |hub: &str, pnpm: &str| {
+        format!(
+            "bazel_dep(name = \"aspect_rules_js\", version = \"3.6.0\")\n\
+             npm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"npm\")\n\
+             npm.npm_translate_lock(pnpm_lock = \"//:pnpm-lock.yaml\"{hub})\n\
+             pnpm = use_extension(\"@aspect_rules_js//npm:extensions.bzl\", \"pnpm\")\n\
+             pnpm.pnpm(name = \"pnpm\", pnpm_version = \"{pnpm}\")\n"
+        )
+    };
+    let listing = ", update_pnpm_lock = True, data = [\"//:pnpm-workspace.yaml\"]";
+    let manifest = r#"{ "name": "root", "private": true, "packageManager": "pnpm@12.22.0" }"#;
+    let run = |module: String, trust: bool| {
+        let lock = lock.clone();
+        async move {
+            let extra = [
+                ("MODULE.bazel", module.as_str()),
+                ("package.json", manifest),
+            ];
+            let files = pnpm_workspace("# own\n", Some(&lock), &[], &extra);
+            assert_pnpm_workspace_parity_granted(&files, trust, &[""], true).await
+        }
+    };
+    let written = ["pnpm-lock.yaml", "pnpm-workspace.yaml"];
+    let workspace = |changed: &BTreeMap<String, Vec<u8>>| {
+        String::from_utf8(changed["pnpm-workspace.yaml"].clone()).unwrap()
+    };
+
+    for hub in ["", listing] {
+        let (redirect, changed) = run(module(hub, "11.28.10"), true).await;
+        assert_eq!(changed.keys().collect::<Vec<_>>(), written, "{hub}");
+        let workspace = workspace(&changed);
+        assert!(
+            workspace.contains("namedRegistries:") && !workspace.contains("trustLockfile"),
+            "{hub}: {workspace}"
+        );
+        assert!(
+            !redirect["warnings"].to_string().contains("Bazel"),
+            "{hub}: {redirect:#}"
+        );
+    }
+
+    let (redirect, changed) = run(module(listing, "10.34.9"), true).await;
+    assert_eq!(changed.keys().collect::<Vec<_>>(), written);
+    assert_eq!(
+        workspace(&changed),
+        "# own\npackages:\n  - '.'\ntrustLockfile: true\n"
+    );
+    assert!(
+        redirect["warnings"].to_string().contains(
+            "a Bazel hub reads the pnpm lock (MODULE.bazel:3), and the pnpm it runs for \
+             `update_pnpm_lock` is not stated as 11.20 or later (pnpm 10.34.9)"
+        ),
+        "{redirect:#}"
+    );
+
+    let (redirect, changed) = run(module(listing, "11.28.10"), false).await;
+    assert!(changed.is_empty(), "{}", describe(&changed));
+    let warned = redirect["warnings"].to_string();
+    assert!(
+        warned.contains("redirect_pnpm_bazel_workspace_hidden")
+            && warned.contains("drop `--no-trust-lockfile-config`"),
         "{redirect:#}"
     );
 }

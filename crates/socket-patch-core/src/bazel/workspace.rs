@@ -572,7 +572,7 @@ impl Workspace {
     }
 
     /// Whether the `use_extension` call `call` asks for `wanted`.
-    fn asks_for(&self, call: &Call, wanted: &Extension) -> bool {
+    pub(super) fn asks_for(&self, call: &Call, wanted: &Extension) -> bool {
         let Some((file, name)) = extension(call) else {
             return false;
         };

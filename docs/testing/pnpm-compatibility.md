@@ -194,11 +194,20 @@ routed lock and `package.json` and no workspace file fails with
 `ERR_PNPM_MISSING_NAMED_REGISTRY` ("has registry prefix 'socket-…:', which is not declared
 by the registries setting") and leaves the lock as it is. That directory is what a
 rules_js hub of a Bazel workspace gives the pnpm it runs for `update_pnpm_lock` when the
-hub does not list the file. The lock reader of rules_js itself takes a routed lock:
-measured on macOS, rules_js 3.6.0 on Bazel 9.3.2 builds one for a hub without
-`update_pnpm_lock`, with the patched bytes in the built packages, and rules_js 2.9.3 on
-Bazel 8.8.2 does too. Until a Bazel leg builds a routed lock with `update_pnpm_lock`, the
-scan does not take the route for a lock that a hub reads (see "Bazel workspaces: npm" in
+hub does not list the file, and a build of such a hub fails the same way (pnpm 11.28.10,
+rules_js 3.6.0 on Bazel 9.3.2, 8.8.2 and 7.7.2). The lock reader of rules_js itself takes
+a routed lock: on those three releases rules_js 3.6.0 builds one for a hub without
+`update_pnpm_lock`, with the patched bytes in the built packages (and, measured by hand,
+rules_js 2.9.3 on Bazel 8.8.2 does too). So does a hub with `update_pnpm_lock` that lists
+the file and runs pnpm 11.20.0, 11.28.10 or 12.17.0: that pnpm writes the lock back as it
+is, also after a `package.json` asks for another package. A pnpm below 11.20 does not
+survive that change: pnpm 11.19.0 puts the upstream release back and pnpm 10.34.9 fails
+(`ERR_PNPM_SPEC_NOT_SUPPORTED_BY_ANY_RESOLVER`). And a routed lock holds the patched
+release under another version, so a `patches` entry of the hub that is keyed by the
+package's name and version names no package of it, and rules_js fails the build (measured
+on the three releases). The scan therefore takes the route for a lock that a hub reads in
+those two shapes of the hub alone, and only where the call of the hub passes nothing but
+the attributes those builds had (see "Bazel workspaces: npm" in
 [ecosystems](../ecosystems.md)).
 
 ### Tests
@@ -229,10 +238,11 @@ no lock.
 twin route a project, add a rules_js hub to its `MODULE.bazel` and scan again,
 with no Bazel. Where the hub keeps the lock up to date with a pnpm 11 that
 does not see the workspace file, the scan changes neither file; where the hub
-only reads the lock, the scan takes the registry, the override, the lock's
-record and the registry keys out in one run and pins the release on
-`trustLockfile`. A fresh checkout frozen-installs the patched bytes from an
-empty store after either.
+keeps it up to date with a pnpm 10 that is shown the file, the scan takes the
+registry, the override, the lock's record and the registry keys out in one run
+and pins the release on `trustLockfile`. A fresh checkout frozen-installs the
+patched bytes from an empty store after either. (A hub that only reads the
+lock keeps the route now.)
 
 `pnpm12_registry_route_is_cleaned_up_when_a_patch_is_not_needed` and its pnpm
 11 twin run in the same suite, against the same two loopback servers. They

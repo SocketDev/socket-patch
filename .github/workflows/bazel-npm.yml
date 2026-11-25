@@ -2,7 +2,9 @@ name: Bazel patch compatibility (npm)
 
 # The npm flows of the real-Bazel tests (`npm::` in `e2e_bazel_build`):
 # hosted and vendored mode for a package that aspect_rules_js links from a
-# pnpm lock, agent mode for the copy of it in `node_modules`, and hosted
+# pnpm lock (hosted mode with the lock routed through the patch's registry,
+# pinned beside `trustLockfile: true`, and pinned beside a `patches` entry
+# of the hub), agent mode for the copy of it in `node_modules`, and hosted
 # mode on a hub that keeps the lock up to date with a pnpm of its own (a
 # pnpm 11, and the pnpm 10 that rules_js picks), that hub also for a patch
 # whose registry the patch service offers and for a scan that is told not
