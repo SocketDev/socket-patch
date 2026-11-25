@@ -16,12 +16,14 @@
 //! 2.5.0-rc4 takes the path for the name of a project and fails the build
 //! of everything the hub serves (Bazel 9.3.2, 8.8.2 and 7.7.2). rules_js
 //! does build a vendored tarball, and rules_rust a vendored crate.
-//! rules_ruby 1.0.0-rc2 fails the build on a vendored gem (same three
-//! releases) unless the call lists every file of the copy among its
-//! `srcs`, which it copies beside the Gemfile: `srcs` is not read here, so
-//! a vendored gem is not judged. rules_csharp builds a vendored package
-//! through the block that vendored mode keeps in `MODULE.bazel`
-//! ([`super::nuget`]), which is not read here either.
+//! rules_ruby 1.0.0-rc2 builds a gem that is committed as its archive and
+//! named by a `file:` source ([`crate::vendor::gem::bazel`]), and fails
+//! the build on one vendored by its path (same three releases) unless the
+//! call lists every file of the copy among its `srcs`, which it copies
+//! beside the Gemfile: `srcs` is not read here, so a vendored gem is not
+//! judged. rules_csharp builds a vendored package through the block that
+//! vendored mode keeps in `MODULE.bazel` ([`super::nuget`]), which is not
+//! read here either.
 //!
 //! A sixth, rules_jvm_external, takes each jar that the lock of a hub pins
 //! (`maven.install`) at the lock's sha256: from a repository of the lock,
@@ -194,8 +196,9 @@ struct Hub {
     nested: bool,
     /// Whether a call of the tag may build a package from a line that
     /// points at a copy under `.socket/vendor`: rules_js and rules_rust
-    /// do, rules_ruby does when the call lists the files of the copy, and
-    /// rules_csharp does through the block of vendored mode.
+    /// do, rules_ruby does for a gem committed as its archive, or when the
+    /// call lists the files of the copy, and rules_csharp does through the
+    /// block of vendored mode.
     builds_vendored: bool,
     /// The attributes that name a file beside the lock, where a pin in
     /// the lock does not name its patch. The calls of such a tag make one
@@ -542,6 +545,30 @@ fn reads(
     let hidden = || workspace.doubts.first().filter(|_| may());
     let unread = || workspace.legacy.as_ref()?.as_ref().err();
     doubt.or_else(|| hidden().or_else(unread).cloned()).map(Err)
+}
+
+/// The calls of the hub of `ecosystem` in the module files of `workspace`,
+/// each with the files of the main repository it names by a label that is
+/// written out (their paths from the Bazel root), and what leaves open
+/// whether these are all of them ([`Tags::doubts`]). No call of a
+/// `WORKSPACE` file is among them.
+///
+/// [`Tags::doubts`]: super::workspace::Tags::doubts
+pub(crate) fn hub_calls<'w>(
+    workspace: &'w Workspace,
+    ecosystem: &str,
+) -> (Vec<(Tag<'w>, Vec<String>)>, Vec<Doubt>) {
+    let Some(hub) = HUBS.iter().find(|hub| hub.ecosystem == ecosystem) else {
+        return Default::default();
+    };
+    let named = |tag: Tag<'w>| (tag, files(workspace, tag.call, hub.files, None));
+    let (mut calls, mut doubts) = (Vec::new(), Vec::new());
+    for extension in hub.extensions {
+        let tags = workspace.tags(extension, hub.tag);
+        calls.extend(tags.calls.into_iter().map(named));
+        doubts.extend(tags.doubts);
+    }
+    (calls, doubts)
 }
 
 /// Whether the requirements file `start` (a path from the Bazel root)

@@ -137,6 +137,10 @@ pub async fn verify_vendored_patch_record(
         .map_err(|e| e.to_string())??;
         return super::pypi_distribution::verify_members(&members, &entry.artifact.path, record);
     }
+    // A gem committed as its archive, for a Bazel hub.
+    if super::gem::bazel::is_archive(entry) {
+        return super::gem::bazel::verify(&artifact, record).await;
+    }
     let path_str = artifact.to_string_lossy();
     if path_str.ends_with(".jar") {
         let files = record.files.clone();
@@ -816,7 +820,7 @@ pub(crate) const MAX_HEALTH_HASH_BYTES: u64 = 512 * 1024 * 1024;
 /// audit with a million planted files.
 const MAX_INVENTORY_ENTRIES: usize = 10_000;
 
-/// Is this artifact path a single committed FILE (tarball/wheel/nupkg/jar)
+/// Is this artifact path a single committed FILE (tarball/wheel/nupkg/jar/gem)
 /// — whose whole-file drift check is the ledger `sha256` — as opposed to a
 /// dir-shaped copy whose counterpart is the `fileInventory`? One suffix
 /// rule shared by the health check, repair's fingerprint fill, and the
@@ -829,6 +833,7 @@ pub fn artifact_is_file_shaped(path: &str) -> bool {
         || norm.ends_with(".zip")
         || norm.ends_with(".nupkg")
         || norm.ends_with(".jar")
+        || super::gem::bazel::archive_path(&norm)
 }
 
 /// Full-file inventory of a dir-shaped artifact: every regular file under

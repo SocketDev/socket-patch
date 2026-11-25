@@ -30,7 +30,8 @@
 //!    a vendored copy in `packages` or in the package's section; a PyPI
 //!    or RubyGems project whose lock a hub of the workspace reads
 //!    (`vendor_pypi_bazel_hub`, `vendor_gem_bazel_hub`), unless that lock
-//!    already names the patch's copy; and a NuGet package of a project
+//!    already names the patch's copy, or the gem can be committed for the
+//!    hub as its archive ([`gem::bazel`]); and a NuGet package of a project
 //!    whose lock a rules_csharp hub reads, where the block that makes the
 //!    hub take the copy cannot be shown to work
 //!    (`vendor_nuget_bazel_workspace`), unless `nuget.config` already

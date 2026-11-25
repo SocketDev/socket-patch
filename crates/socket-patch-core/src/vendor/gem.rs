@@ -138,6 +138,12 @@ use crate::formats::gem::{
     is_plain_gem_token, listed_specs, split_checksum_entry, split_entry, GemfileLock,
 };
 
+pub(crate) mod bazel;
+
+/// The code of the advisory a run gives for a gem it vendored for a Bazel
+/// hub, whose build alone installs it.
+pub const BAZEL_FILE_SOURCE: &str = bazel::ADVISORY;
+
 pub(super) const GEMFILE: &str = "Gemfile";
 pub(super) const GEMFILE_LOCK: &str = "Gemfile.lock";
 
@@ -989,6 +995,9 @@ pub(crate) async fn service_preflight(
     let prelude = gem_prelude(purl, installed_path, project_root, record)
         .await
         .ok()?;
+    if let Some(planned) = bazel::preflight(purl, &prelude, project_root, record).await {
+        return planned;
+    }
     let asks = match prelude.lock_wired {
         true => !prelude.copy_ok,
         false => gem_edits(purl, &prelude).is_ok(),
@@ -1025,6 +1034,19 @@ pub async fn vendor_gem<'a>(
         Ok(prelude) => prelude,
         Err(outcome) => return outcome,
     };
+    // A gem whose lock a Bazel hub reads is committed as its archive.
+    let for_hub = bazel::vendor(
+        purl,
+        &prelude,
+        project_root,
+        record,
+        vendored_at,
+        dry_run,
+        service,
+    );
+    if let Some(outcome) = for_hub.await {
+        return outcome;
+    }
     let GemPrelude {
         name,
         version,
@@ -1428,17 +1450,13 @@ fn gem_entry(
 /// eval-able Ruby form a bundler path source loads.
 pub(crate) const GEM_STUB_ARTIFACT_KIND: &str = "gem-stub-gemspec";
 
-/// Download and verify the `.gem` and its stub gemspec, then atomically
-/// replace the copy. Missing, invalid, or native-extension stubs are refused.
-pub(super) async fn gem_service_copy(
+/// Download and verify the `.gem` and its stub gemspec. Missing, invalid, or
+/// native-extension stubs are refused.
+async fn gem_service_archive(
     service: Option<&VendorServiceConfig>,
     record: &PatchRecord,
     name: &str,
-    copy_dir: &Path,
-    uuid_dir: &Path,
-    unwind_uuid_dir: bool,
-    warnings: &mut Vec<VendorWarning>,
-) -> Result<(), Box<VendorOutcome>> {
+) -> Result<(super::service_fetch::VerifiedArchive, Vec<u8>), Box<VendorOutcome>> {
     let cfg = service
         .filter(|cfg| cfg.service_enabled())
         .ok_or_else(|| Box::new(super::service_fetch::required()))?;
@@ -1446,7 +1464,7 @@ pub(super) async fn gem_service_copy(
     let fetched = fetch_verified_archive(cfg, &record.uuid).await;
     let subject = format!(".gem for {name}");
     let policy = ServicePolicy::Refused;
-    let mut archive = policy.settle(fetched, ".gem", &subject)?;
+    let archive = policy.settle(fetched, ".gem", &subject)?;
 
     // Step 2: the stub gemspec the converter generated alongside the `.gem`.
     let stub = match fetch_verified_secondary(cfg, &archive, GEM_STUB_ARTIFACT_KIND).await {
@@ -1472,6 +1490,22 @@ pub(super) async fn gem_service_copy(
         }
     };
     refuse_unusable_stub(policy, name, name, &String::from_utf8_lossy(&stub))?;
+    Ok((archive, stub))
+}
+
+/// [`gem_service_archive`], then atomically replace the copy with the
+/// unpacked gem and its stub gemspec.
+pub(super) async fn gem_service_copy(
+    service: Option<&VendorServiceConfig>,
+    record: &PatchRecord,
+    name: &str,
+    copy_dir: &Path,
+    uuid_dir: &Path,
+    unwind_uuid_dir: bool,
+    warnings: &mut Vec<VendorWarning>,
+) -> Result<(), Box<VendorOutcome>> {
+    let (mut archive, stub) = gem_service_archive(service, record, name).await?;
+    let policy = ServicePolicy::Refused;
 
     // Extract the patched `.gem`'s data.tar.gz into a STAGE sibling, add the
     // stub as `<name>.gemspec` (a `.gem`'s data.tar.gz never carries one —
@@ -2098,6 +2132,11 @@ pub async fn revert_gem_opts(
              {uuid_dir_rel} and this state.json entry",
             entry.artifact.path
         ));
+    }
+
+    // A gem committed as its archive, for a Bazel hub.
+    if bazel::is_archive(entry) {
+        return bazel::revert(entry, project_root, &uuid_dir_rel, opts).await;
     }
 
     // Wiring is restored in reverse application order: lock first, Gemfile
@@ -7672,7 +7711,7 @@ mod tests {
     /// Build a `.gem` (uncompressed outer tar holding `data.tar.gz` +
     /// `metadata.gz`). `data_files` are the inner data.tar.gz entries at the
     /// root (no prefix dir), as a real `.gem` carries them.
-    fn make_gem(data_files: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(super) fn make_gem(data_files: &[(&str, &[u8])]) -> Vec<u8> {
         use std::io::Write as _;
         let mut data_tar = tar::Builder::new(Vec::new());
         for (rel, content) in data_files {
@@ -7716,15 +7755,26 @@ mod tests {
         gem_sha512: &str,
         stub: Option<(&[u8], &str)>,
     ) {
+        mount_gem_granted_as(server, UUID, gem_bytes, gem_sha512, stub).await;
+    }
+
+    /// [`mount_gem_granted`] for the patch `uuid`.
+    async fn mount_gem_granted_as(
+        server: &wiremock::MockServer,
+        uuid: &str,
+        gem_bytes: &[u8],
+        gem_sha512: &str,
+        stub: Option<(&[u8], &str)>,
+    ) {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
-        let gem_path = format!("/patch/gem/rack/3.2.6/tok/{UUID}/rack-3.2.6.gem");
+        let gem_path = format!("/patch/gem/rack/3.2.6/tok/{uuid}/rack-3.2.6.gem");
         let gem_url = format!("{}{gem_path}", server.uri());
         let mut artifacts = vec![serde_json::json!({
             "kind": "tarball", "url": gem_url,
             "integrity": { "sha512": gem_sha512 }
         })];
-        let stub_path = format!("/patch/gem/rack/3.2.6/tok/{UUID}/rack-3.2.6.gemspec");
+        let stub_path = format!("/patch/gem/rack/3.2.6/tok/{uuid}/rack-3.2.6.gemspec");
         if let Some((stub_bytes, stub_sha512)) = stub {
             let stub_url = format!("{}{stub_path}", server.uri());
             artifacts.push(serde_json::json!({
@@ -7740,7 +7790,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v0/orgs/acme/patches/package"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "results": { UUID: {
+                "results": { uuid: {
                     "status": "granted",
                     "url": gem_url,
                     "purl": PURL,
@@ -7831,6 +7881,177 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|w| w.code == "vendor_prebuilt_downloaded"));
+    }
+
+    /// A gem whose `Gemfile` and lock a Bazel hub reads is committed as its
+    /// archive ([`bazel`]): the pair names it by a `file:` source, a later
+    /// run is in sync, a gem that went missing is written again and held
+    /// to the lock, a newer patch takes the source over, and the revert
+    /// puts the pair back. A `gem_checksums` entry for other bytes declines
+    /// the gem once its bytes are known, with nothing written.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_gem_of_a_lock_a_bazel_hub_reads_is_committed_as_its_archive() {
+        let _unset = crate::test_env::EnvGuard::unset(super::super::refusals::ALLOW_IN_BAZEL_ENV);
+        let sums = "CHECKSUMS\n  puma (6.4.2) sha256=aa\n  rack (3.2.6) sha256=bb\n\nBUNDLED WITH";
+        // A Bundler that a hub was built with.
+        let lock = LOCK_DIRECT.replace("BUNDLED WITH", sums);
+        let lock = lock.replace("   2.5.22\n", "   2.6.9\n");
+        assert!(lock.ends_with("BUNDLED WITH\n   2.6.9\n"), "{lock}");
+        let (_tmp, root, _installed, blobs, record) = fixture(GEMFILE_DIRECT, &lock).await;
+        let module = "ruby = use_extension(\"@rules_ruby//ruby:extensions.bzl\", \"ruby\")\n\
+                      ruby.bundle_fetch(name = \"b\", gemfile = \"//:Gemfile\", gemfile_lock = \
+                      \"//:Gemfile.lock\"SUMS)\n";
+        let write = |file: &str, text: &str| std::fs::write(root.join(file), text).unwrap();
+        let read = |file: &str| std::fs::read_to_string(root.join(file)).unwrap();
+        write("MODULE.bazel", &module.replace("SUMS", ""));
+        write(".bazelversion", "8.8.2\n");
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let sum = crate::utils::digest::sha256_hex_of(&gem);
+        let server = wiremock::MockServer::start().await;
+        let stub = Some((SERVICE_STUB, sri_sha512(SERVICE_STUB)));
+        let stub = stub.as_ref().map(|(bytes, sri)| (*bytes, sri.as_str()));
+        mount_gem_granted(&server, &gem, &sri_sha512(&gem), stub).await;
+        let sources = PatchSources::blobs_only(&blobs);
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Service, false);
+        let run = |record: &PatchRecord, dry_run: bool, cfg: &VendorServiceConfig| {
+            let (record, cfg) = (record.clone(), cfg.clone());
+            let (root, sources) = (root.clone(), sources.clone());
+            async move {
+                let at = "2026-06-09T00:00:00Z";
+                let install = missing_install(&root);
+                crate::vendor::test_support::vendor_gem(
+                    PURL,
+                    &install,
+                    &root,
+                    &record,
+                    &sources,
+                    at,
+                    dry_run,
+                    false,
+                    Some(&cfg),
+                )
+                .await
+            }
+        };
+        let archive =
+            |uuid: &str| root.join(format!(".socket/vendor/gem/{uuid}/gems/rack-3.2.6.gem"));
+        let source = |uuid: &str| format!("file:.socket/vendor/gem/{uuid}/");
+
+        // An entry of the call for the upstream gem: declined, nothing
+        // written. A dry run says the same.
+        let pinned = format!(
+            ", gem_checksums = {{\"rack-3.2.6\": \"{}\"}}",
+            "c".repeat(64)
+        );
+        write("MODULE.bazel", &module.replace("SUMS", &pinned));
+        for dry_run in [true, false] {
+            let (code, detail) = unwrap_refused(run(&record, dry_run, &cfg).await);
+            assert_eq!(code, "vendor_gem_bazel_hub");
+            assert!(
+                detail.contains(&sum) && detail.contains("rack-3.2.6"),
+                "{detail}"
+            );
+            assert_eq!([read(GEMFILE), read(GEMFILE_LOCK)], [GEMFILE_DIRECT, &lock]);
+            assert!(!root.join(".socket").exists());
+        }
+        write("MODULE.bazel", &module.replace("SUMS", ""));
+
+        // A gem that does not hold the patched file is not committed.
+        let other = wiremock::MockServer::start().await;
+        let unpatched = make_gem(&[("lib/rack.rb", PRISTINE)]);
+        mount_gem_granted(&other, &unpatched, &sri_sha512(&unpatched), stub).await;
+        let unpatched = gem_service_cfg(&other.uri(), VendorSource::Service, false);
+        let (code, _) = unwrap_refused(run(&record, false, &unpatched).await);
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(!root.join(".socket").exists() && read(GEMFILE_LOCK) == lock);
+
+        // A dry run writes nothing; the run commits the gem and names it.
+        let (result, entry, _) = unwrap_done(run(&record, true, &cfg).await);
+        assert!(result.success && entry.is_none() && !root.join(".socket").exists());
+        let (result, entry, warnings) = unwrap_done(run(&record, false, &cfg).await);
+        let first = entry.expect("an entry");
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(std::fs::read(archive(UUID)).unwrap(), gem);
+        let rel = format!(".socket/vendor/gem/{UUID}/gems/rack-3.2.6.gem");
+        assert_eq!(
+            (first.artifact.path.as_str(), first.artifact.sha256.as_str()),
+            (rel.as_str(), sum.as_str())
+        );
+        let declared = format!("gem \"rack\", \"~> 3.1\", source: \"{}\"\n", source(UUID));
+        assert!(read(GEMFILE).ends_with(&declared), "{}", read(GEMFILE));
+        let section = format!(
+            "GEM\n  remote: {}\n  specs:\n    rack (3.2.6)\n      base64 (>= 0.1.0)\n\n",
+            source(UUID)
+        );
+        let wired = read(GEMFILE_LOCK);
+        assert!(wired.starts_with(&section), "{wired}");
+        assert!(wired.contains(&format!("  rack (~> 3.1)!\n\nCHECKSUMS\n  puma (6.4.2) sha256=aa\n  rack (3.2.6) sha256={sum}\n")), "{wired}");
+        assert!(
+            warnings.iter().any(|w| w.code == bazel::ADVISORY),
+            "{warnings:?}"
+        );
+        assert!(root
+            .join(format!(".socket/vendor/gem/{UUID}/.gitignore"))
+            .exists());
+
+        // In sync: nothing to record, nothing to say.
+        let (result, entry, warnings) = unwrap_done(run(&record, false, &cfg).await);
+        assert!(
+            result.success && entry.is_none() && warnings.is_empty(),
+            "{warnings:?}"
+        );
+
+        // The gem is gone: written again, with the pair as it is. One the
+        // lock does not pin is not written.
+        std::fs::remove_file(archive(UUID)).unwrap();
+        let (_, entry, warnings) = unwrap_done(run(&record, false, &cfg).await);
+        assert!(entry.is_some_and(|entry| entry.wiring.is_empty()));
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{warnings:?}"
+        );
+        assert_eq!(std::fs::read(archive(UUID)).unwrap(), gem);
+        assert_eq!(read(GEMFILE_LOCK), wired);
+        std::fs::remove_file(archive(UUID)).unwrap();
+        write(GEMFILE_LOCK, &wired.replace(&sum, &"d".repeat(64)));
+        let (code, detail) = unwrap_refused(run(&record, false, &cfg).await);
+        assert_eq!(code, "vendor_gem_bazel_hub");
+        assert!(
+            detail.contains("Gemfile.lock holds rack 3.2.6 to sha256"),
+            "{detail}"
+        );
+        assert!(!archive(UUID).exists());
+        write(GEMFILE_LOCK, &wired);
+        unwrap_done(run(&record, false, &cfg).await);
+
+        // A newer patch of the gem takes the source over, and its entry,
+        // with what the caller carries forward, reverts to the first pair.
+        let newer_gem = make_gem(&[("lib/rack.rb", PATCHED), ("lib/more.rb", b"more\n")]);
+        let newer = PatchRecord {
+            uuid: UUID2.to_string(),
+            ..record.clone()
+        };
+        let second = wiremock::MockServer::start().await;
+        mount_gem_granted_as(&second, UUID2, &newer_gem, &sri_sha512(&newer_gem), stub).await;
+        let cfg2 = gem_service_cfg(&second.uri(), VendorSource::Service, false);
+        let (result, entry, _) = unwrap_done(run(&newer, false, &cfg2).await);
+        assert!(result.success, "{:?}", result.error);
+        let mut entry = entry.expect("an entry");
+        assert_eq!(std::fs::read(archive(UUID2)).unwrap(), newer_gem);
+        let pair = read(GEMFILE) + &read(GEMFILE_LOCK);
+        assert!(
+            pair.contains(&source(UUID2)) && !pair.contains(&source(UUID)),
+            "{pair}"
+        );
+        crate::vendor::state::carry_forward_wiring(&first, &mut entry);
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(
+            outcome.success && outcome.warnings.is_empty(),
+            "{outcome:?}"
+        );
+        assert_eq!([read(GEMFILE), read(GEMFILE_LOCK)], [GEMFILE_DIRECT, &lock]);
+        assert!(!archive(UUID2).exists());
     }
 
     /// `service` mode + a `.gem` integrity mismatch hard-fails; nothing wired.

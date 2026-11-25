@@ -1283,8 +1283,10 @@ async fn wiring_file_refusal(rec: &WiringRecord, project_root: &Path) -> Option<
             super::pypi_requirements::ledger_file_refusal(project_root, file).await
         }
         // The rest.
-        "gemfile_line" => one_of(&["Gemfile"]),
-        "gemfile_lock_spec" | "gemfile_lock_checksum" => one_of(&["Gemfile.lock"]),
+        "gemfile_line" | super::gem::bazel::GEMFILE_KIND => one_of(&["Gemfile"]),
+        "gemfile_lock_spec" | "gemfile_lock_checksum" | super::gem::bazel::LOCK_KIND => {
+            one_of(&["Gemfile.lock"])
+        }
         "cargo_patch_entry" => one_of(&[
             super::cargo_manifest::CARGO_TOML,
             super::cargo_config::CONFIG_TOML,
@@ -2802,6 +2804,8 @@ mod tests {
             ("pypi", "requirements_line", "requirements/dev.txt"),
             ("gem", "gemfile_line", "Gemfile"),
             ("gem", "gemfile_lock_spec", "Gemfile.lock"),
+            ("gem", "gemfile_file_source", "Gemfile"),
+            ("gem", "gemfile_lock_file_source", "Gemfile.lock"),
             ("cargo", "cargo_patch_entry", "Cargo.toml"),
             ("cargo", "cargo_patch_entry", ".cargo/config.toml"),
             ("cargo", "cargo_lock_entry", "Cargo.lock"),
@@ -2840,6 +2844,8 @@ mod tests {
             ("pypi", "requirements_line", ".socket/vendor/notes.txt"),
             ("gem", "gemfile_line", "Rakefile"),
             ("gem", "gemfile_lock_spec", "Gemfile"),
+            ("gem", "gemfile_file_source", "Gemfile.lock"),
+            ("gem", "gemfile_lock_file_source", "MODULE.bazel"),
             ("cargo", "cargo_patch_entry", "build.rs"),
             ("golang", "go_replace", "main.go"),
             ("composer", "composer_lock_package", "composer.json"),

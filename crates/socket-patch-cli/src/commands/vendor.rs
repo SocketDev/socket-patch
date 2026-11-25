@@ -4797,7 +4797,16 @@ fn print_vendor_closing(
                 .iter()
                 .filter(|f| flavor_install_command(f).is_some())
                 .all(|f| JVM_TOOLS.contains(&f.as_str()));
-        let reinstall = if jvm_only {
+        // A gem committed for a rules_ruby hub is installed by the Bazel
+        // build alone: Bundler by itself fails on its source, which the
+        // warning of the run says.
+        let advisory = socket_patch_core::vendor::gem::BAZEL_FILE_SOURCE;
+        let for_bazel = |e: &&PatchEvent| e.error_code.as_deref() == Some(advisory);
+        let for_bazel = env.events.iter().filter(for_bazel).count();
+        let only_for_bazel = for_bazel > 0 && for_bazel == env.summary.applied as usize;
+        let reinstall = if only_for_bazel {
+            "Build with Bazel, which installs the committed gems".to_string()
+        } else if jvm_only {
             let cmds: Vec<String> = installs.iter().map(|c| format!("`{c}`")).collect();
             // The block of a hub is in a file of the checkout's own.
             let how = match installs == [HUB_BUILD] {
@@ -4815,6 +4824,12 @@ fn print_vendor_closing(
             format!("Run {} to update the installed tree", cmds.join(" and "))
         };
         let mut extra = Vec::new();
+        if for_bazel > 0 && !only_for_bazel {
+            extra.push(
+                "Build with Bazel as well: it alone installs the gems committed for its hub."
+                    .to_string(),
+            );
+        }
         if wired_flavors.contains("bun") && common.cwd.join("bun.lockb").exists() {
             extra.push(
                 "For binary Bun workspaces, also commit the workspace members' \

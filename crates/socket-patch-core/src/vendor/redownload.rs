@@ -163,7 +163,11 @@ pub async fn restore(
         {
             return Err("the downloaded artifact does not match the recorded size".into());
         }
-        if entry.artifact.path.ends_with(".jar") {
+        if super::gem::bazel::is_archive(entry) {
+            if !super::gem::bazel::carries(archive.bytes.clone(), &record.files).await {
+                return Err("the downloaded gem does not carry the patched files".into());
+            }
+        } else if entry.artifact.path.ends_with(".jar") {
             // A jar is read by name, case and all, by the JVM: the
             // installer-shaped strictness of the wheel reader (ASCII names,
             // no case-colliding pair) refuses obfuscated jars that hold
@@ -419,7 +423,8 @@ pub async fn restore(
     // Likewise a gem vendored as platform gems: only the artifact dir was
     // swapped in from the stage, and without the uuid dir's own metadata a
     // `*.so` / `*.bundle` rule drops the prebuilt binaries from the commit.
-    if entry.ecosystem == "gem" && !entry.gem_platforms.is_empty() {
+    let archive = super::gem::bazel::is_archive(entry);
+    if entry.ecosystem == "gem" && (archive || !entry.gem_platforms.is_empty()) {
         if let Some(rel) = super::path::vendor_uuid_dir_rel("gem", &entry.uuid) {
             super::gem::restore_uuid_metadata(&root.join(rel))
                 .await
