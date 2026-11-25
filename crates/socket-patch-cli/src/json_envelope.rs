@@ -380,6 +380,12 @@ pub struct PatchEvent {
     /// Underlying error message for `Failed` events.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Why a `Failed` apply event's patch did not apply, finer than its
+    /// `error_code` (which stays `apply_failed`): `hash_mismatch`,
+    /// `file_not_found`, `blob_missing`, `write_failed`,
+    /// `no_matching_variant`, … or `unclassified`. Omitted elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
     /// Command-specific additional fields. Consumers MUST NOT depend on
     /// the shape of this object — different subcommands attach different
     /// keys here, e.g. `list` (vulnerabilities, license, tier,
@@ -411,6 +417,7 @@ impl PatchEvent {
             reason: None,
             error_code: None,
             error: None,
+            cause: None,
             details: None,
         }
     }
@@ -447,6 +454,12 @@ impl PatchEvent {
     pub fn with_error(mut self, code: impl Into<String>, message: impl Into<String>) -> Self {
         self.error_code = Some(code.into());
         self.error = Some(message.into());
+        self
+    }
+
+    /// Attach the cause of a failed apply (see [`PatchEvent::cause`]).
+    pub fn with_cause(mut self, cause: impl Into<String>) -> Self {
+        self.cause = Some(cause.into());
         self
     }
 

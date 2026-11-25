@@ -661,6 +661,8 @@ impl PatchOutcome {
 /// * `patches`: at most [`MAX_REPORTED_PATCHES`] outcomes, and
 ///   `patches_truncated: true` when that cap dropped some;
 /// * `outcomes`: how many patches ended each way, over the whole run;
+/// * `failure_codes`: how many failed patches had each `code` (`none` for
+///   one without), over the whole run; absent when none failed;
 /// * `ecosystems`, `modes`: the distinct values, sorted, over the whole run.
 ///
 /// A run that named no patch adds nothing.
@@ -674,10 +676,16 @@ fn with_patches(mut metadata: serde_json::Value, patches: &[PatchOutcome]) -> se
         return metadata;
     }
     let mut outcomes: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut failure_codes: BTreeMap<&str, usize> = BTreeMap::new();
     let mut ecosystems: BTreeSet<&str> = BTreeSet::new();
     let mut modes: BTreeSet<&str> = BTreeSet::new();
     for patch in patches {
         *outcomes.entry(patch.outcome).or_default() += 1;
+        if patch.outcome == OUTCOME_FAILED {
+            *failure_codes
+                .entry(patch.code.as_deref().unwrap_or("none"))
+                .or_default() += 1;
+        }
         if !patch.ecosystem.is_empty() {
             ecosystems.insert(&patch.ecosystem);
         }
@@ -699,6 +707,9 @@ fn with_patches(mut metadata: serde_json::Value, patches: &[PatchOutcome]) -> se
     }
     add("patches", serde_json::json!(reported));
     add("outcomes", serde_json::json!(outcomes));
+    if !failure_codes.is_empty() {
+        add("failure_codes", serde_json::json!(failure_codes));
+    }
     add("ecosystems", serde_json::json!(ecosystems));
     add("modes", serde_json::json!(modes));
     metadata
@@ -2957,11 +2968,30 @@ mod tests {
         );
         assert_eq!(metadata["ecosystems"], serde_json::json!(["npm", "pypi"]));
         assert_eq!(metadata["modes"], serde_json::json!(["agent"]));
+        // Every failure is counted by code, the capped-off ones included.
+        assert_eq!(
+            metadata["failure_codes"],
+            serde_json::json!({ "hash_mismatch": failed })
+        );
 
         // Under the cap nothing is flagged.
         let short = with_patches(serde_json::json!({}), &patches[..3]);
         assert_eq!(short["patches"].as_array().unwrap().len(), 3);
         assert!(short.get("patches_truncated").is_none());
+        // No failure, no `failure_codes`.
+        assert!(short.get("failure_codes").is_none());
+        // A failure without a code is counted as `none`.
+        let uncoded = with_patches(
+            serde_json::json!({}),
+            &[outcome(
+                "00000000-0000-4000-8000-000000000000",
+                "npm",
+                MODE_AGENT,
+                OUTCOME_FAILED,
+                None,
+            )],
+        );
+        assert_eq!(uncoded["failure_codes"], serde_json::json!({ "none": 1 }));
         // No patch, no fields; and the event's own keys are never replaced.
         assert_eq!(
             with_patches(serde_json::json!({ "dry_run": true }), &[]),

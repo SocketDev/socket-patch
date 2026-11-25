@@ -137,7 +137,9 @@ Every event has these fields:
 A `scan` reports once for each project directory it scans. A failure event
 carries the subset of its row's fields known when it failed, plus `error_code`:
 the code the command's `--json` output reports (for example `patch_not_found`
-or `rollback_failed`). `patch_fetch_failed` reports `uuid` only when you asked
+or `rollback_failed`). A failed `apply` whose patch content could not be
+obtained reports that stage instead of `apply_failed`: `sources_download_failed`
+or `offline_missing_sources`. `patch_fetch_failed` reports `uuid` only when you asked
 for a patch by UUID. A command that stops on a usage error, or because another
 run holds the lock, reports nothing.
 
@@ -148,9 +150,10 @@ patch fails to apply, or is rolled back, far more often than the others:
 
 | Field | Value |
 | --- | --- |
-| `patches` | Up to 50 entries, failed ones first. Each is `{uuid, ecosystem, mode, outcome}`: the patch UUID, the ecosystem name (`npm`, `pypi`, …), the mode it was patched in (`agent`, `hosted`, `vendored`), and what the run did (`applied`, `downloaded`, `rolled_back`, `removed`, `verified` on a dry run, `skipped`, `failed`). A `skipped` or `failed` entry adds `code`, the reason code `--json` reports (for example `already_patched`) |
+| `patches` | Up to 50 entries, failed ones first. Each is `{uuid, ecosystem, mode, outcome}`: the patch UUID, the ecosystem name (`npm`, `pypi`, …), the mode it was patched in (`agent`, `hosted`, `vendored`), and what the run did (`applied`, `downloaded`, `rolled_back`, `removed`, `verified` on a dry run, `skipped`, `failed`). A `skipped` or `failed` entry adds `code`, the reason code `--json` reports (for example `already_patched`); a failed apply's entry uses the event's `cause` (for example `hash_mismatch`, `file_not_found`, `blob_missing`, `no_matching_variant`, `package_not_installed`) |
 | `patches_truncated` | `true` when the run acted on more than 50 patches |
 | `outcomes` | How many patches ended each way, over the whole run |
+| `failure_codes` | How many failed patches had each `code` (`none` for one without), over the whole run. Only when a patch failed |
 | `ecosystems`, `modes` | The distinct ecosystems and modes of those patches |
 
 A patch UUID is Socket's identifier for one patch, and each patch is for one

@@ -2085,11 +2085,7 @@ pub(crate) fn record_apply_outcome(
             .iter()
             .find(|f| apply_key_covers(&f.purl, purl))
         {
-            env.record(
-                PatchEvent::new(EventAction::Failed, purl.as_str())
-                    .with_uuid(uuid.as_str())
-                    .with_error(failure.code.as_str(), failure.error.as_str()),
-            );
+            env.record(failure.event(purl.as_str()).with_uuid(uuid.as_str()));
             failed_any = true;
         } else if let Some(skip) = report.skipped.iter().find(|skip| {
             !unsupported_copy(skip)
@@ -2188,8 +2184,7 @@ pub(crate) fn record_apply_outcome(
             continue;
         }
         appended.push(&failure.purl);
-        let mut event = PatchEvent::new(EventAction::Failed, failure.purl.as_str())
-            .with_error(failure.code.as_str(), failure.error.as_str());
+        let mut event = failure.event(failure.purl.as_str());
         if let Some(uuid) = uuid_of(&failure.purl) {
             event = event.with_uuid(uuid);
         }

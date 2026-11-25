@@ -170,6 +170,14 @@ A missing referenced diff does not remove that protection.
   so a `postinstall` apply never fails an install over them. The manifest is not
   changed, and a skipped entry is not reconciled away as dropped.
 - Skipped events carry a stable `errorCode` and a human-readable `reason`.
+- A failed `apply` event (standalone, or the nested apply of agent-mode `get` /
+  `scan`) keeps `errorCode: apply_failed` and adds `cause`, a stable code for why
+  the package's patch did not apply: `hash_mismatch` (a file matches neither the
+  original nor the patched bytes), `file_not_found`, `blob_missing`,
+  `blob_corrupt`, `write_failed`, `sidecar_failed`, `shared_store`,
+  `conda_build`, `unsafe_path`, `no_matching_variant`, a Maven refusal's own
+  code (for example `gradle_copy_unexpected_bytes` or `jvm_agent_service_required`),
+  or `unclassified` for a failure whose path names none. Route on `errorCode`; `cause` refines it and new values may be added.
   `user_patch_conflict` identifies project patch/replacement metadata and names
   its source; `vendored`, `already_patched`, and `package_not_installed` explain
   other apply skips. A conflict introduced after selection is still `skipped`

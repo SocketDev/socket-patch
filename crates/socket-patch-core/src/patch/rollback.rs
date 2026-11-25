@@ -496,7 +496,7 @@ impl crate::patch::store_copies::CopyFold for RollbackResult {
         self.success
     }
 
-    fn mark_failed(&mut self) {
+    fn mark_failed(&mut self, _copy: &Self) {
         self.success = false;
     }
 

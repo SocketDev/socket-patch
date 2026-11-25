@@ -5389,6 +5389,7 @@ fn untouched_result(package_key: &str, pkg_path: &Path, error: Option<String>) -
         applied_via: HashMap::new(),
         error,
         sidecar: None,
+        cause: None,
     }
 }
 

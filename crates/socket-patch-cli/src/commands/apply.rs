@@ -8,7 +8,8 @@ use socket_patch_core::crawlers::{
 use socket_patch_core::manifest::operations::{manifest_exists, read_manifest};
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{
-    apply_package_patch, verify_file_patch, ApplyResult, MismatchPolicy, PatchSources, VerifyStatus,
+    apply_package_patch, verify_file_patch, ApplyFailureCause, ApplyResult, MismatchPolicy,
+    PatchSources, VerifyStatus,
 };
 use socket_patch_core::patch::apply_lock::LockGuard;
 use socket_patch_core::patch::gem_ext;
@@ -322,6 +323,7 @@ async fn reconcile_local_go(
                 applied_via: HashMap::new(),
                 error: Some(error),
                 sidecar: None,
+                cause: None,
             }
         })
         .collect()
@@ -382,6 +384,7 @@ fn invalid_key_failures(args: &ApplyArgs, manifest_purls: &[String]) -> Vec<Appl
                 applied_via: HashMap::new(),
                 error: Some(error),
                 sidecar: None,
+                cause: None,
             }
         })
         .collect()
@@ -1219,14 +1222,16 @@ pub(crate) fn representative_file(
 /// for `Verified`, every file the engine confirmed could be patched.
 pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent {
     let purl = result.package_key.clone();
-    if !result.success {
-        return PatchEvent::new(PatchAction::Failed, purl).with_error(
-            "apply_failed",
-            result
-                .error
-                .clone()
-                .unwrap_or_else(|| "unknown error".to_string()),
-        );
+    if let Some(cause) = result.failure_cause() {
+        return PatchEvent::new(PatchAction::Failed, purl)
+            .with_error(
+                "apply_failed",
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".to_string()),
+            )
+            .with_cause(cause.as_str());
     }
 
     // A package managed by `socket-patch vendor` is skipped with its own
@@ -1598,12 +1603,26 @@ pub async fn run(args: ApplyArgs) -> i32 {
 
 /// One patch the nested apply failed: the manifest purl, a stable code
 /// (`apply_failed`, `package_not_installed`) and the error text — the same
-/// `errorCode` / `error` pair the standalone `apply --json` reports.
+/// `errorCode` / `error` pair the standalone `apply --json` reports, and
+/// the `cause` of an `apply_failed` one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ApplyFailure {
     pub purl: String,
     pub code: String,
     pub error: String,
+    pub cause: Option<&'static str>,
+}
+
+impl ApplyFailure {
+    /// The `failed` event the standalone `apply --json` would print.
+    pub(crate) fn event(&self, purl: &str) -> PatchEvent {
+        let event = PatchEvent::new(PatchAction::Failed, purl)
+            .with_error(self.code.as_str(), self.error.as_str());
+        match self.cause {
+            Some(cause) => event.with_cause(cause),
+            None => event,
+        }
+    }
 }
 
 /// What a run of [`run_locked`] reports back. `apply` itself only needs
@@ -1662,13 +1681,14 @@ fn collect_apply_failures(
 ) -> Vec<ApplyFailure> {
     let mut failures: Vec<ApplyFailure> = Vec::new();
     for r in results {
-        let (code, error) = match caveats.incomplete_of(r) {
-            Some(copy) => (gem_ext::NOT_REBUILT_REASON, copy.detail.clone()),
+        let (code, error, cause) = match caveats.incomplete_of(r) {
+            Some(copy) => (gem_ext::NOT_REBUILT_REASON, copy.detail.clone(), None),
             None if !r.success => (
                 "apply_failed",
                 r.error
                     .clone()
                     .unwrap_or_else(|| "unknown error".to_string()),
+                r.failure_cause().map(ApplyFailureCause::as_str),
             ),
             None => continue,
         };
@@ -1679,6 +1699,7 @@ fn collect_apply_failures(
             purl: r.package_key.clone(),
             code: code.to_string(),
             error,
+            cause,
         });
     }
     if !failures.is_empty() {
@@ -1689,6 +1710,7 @@ fn collect_apply_failures(
             code: "package_not_installed".to_string(),
             error: not_installed_detail(&purl).to_string(),
             purl,
+            cause: None,
         });
     }
     failures
@@ -1939,6 +1961,7 @@ pub(crate) async fn run_locked(
             lockfile_only,
             run_warnings,
             fallback_skips,
+            unreported,
             caveats,
             targeted,
             show_summary,
@@ -2367,7 +2390,19 @@ pub(crate) async fn run_locked(
             }
 
             // Track telemetry
-            let reported = reported_patches(&results, &caveats, args.common.dry_run, &patch_uuids);
+            let failures = if success {
+                Vec::new()
+            } else {
+                collect_apply_failures(&results, &caveats, &unmatched, &lockfile_only)
+            };
+            let reported = reported_patches(
+                &results,
+                &caveats,
+                &failures,
+                &unreported,
+                args.common.dry_run,
+                &patch_uuids,
+            );
             if success {
                 track_patch_applied(
                     telemetry_command(&args),
@@ -2380,7 +2415,7 @@ pub(crate) async fn run_locked(
             } else {
                 track_patch_apply_failed(
                     telemetry_command(&args),
-                    "apply_failed",
+                    run_failure_code(&run_warnings),
                     "One or more patches failed to apply",
                     args.common.dry_run,
                     &reported,
@@ -2417,11 +2452,6 @@ pub(crate) async fn run_locked(
                     ..ApplyRunReport::default()
                 };
             }
-            let failures = if success {
-                Vec::new()
-            } else {
-                collect_apply_failures(&results, &caveats, &unmatched, &lockfile_only)
-            };
             let run_error = if let Some(Err(e)) = &vex_result {
                 Some((e.code.to_string(), e.message.clone()))
             } else if failures.is_empty() {
@@ -2471,24 +2501,48 @@ fn telemetry_command(args: &ApplyArgs) -> &'static str {
 
 /// The patches an apply run acted on, as its telemetry names them: the
 /// run's per-package events ([`GemCaveats::event_of`], what `--json`
-/// prints), each under the patch its manifest record names.
+/// prints), the patches that failed the run by not being installed
+/// (`failures`), and the failures no result describes (`unreported`),
+/// each under the patch its manifest record names.
 ///
 /// A plain fn, so the events it builds stay off the async frame of `run`.
 fn reported_patches(
     results: &[ApplyResult],
     caveats: &GemCaveats,
+    failures: &[ApplyFailure],
+    unreported: &[(String, ApplyFailureCause)],
     dry_run: bool,
     patch_uuids: &HashMap<String, String>,
 ) -> Vec<socket_patch_core::telemetry::PatchOutcome> {
     let events: Vec<PatchEvent> = results
         .iter()
         .map(|result| caveats.event_of(result, dry_run))
+        .chain(
+            failures
+                .iter()
+                .filter(|f| f.code == "package_not_installed")
+                .map(|f| f.event(&f.purl)),
+        )
+        .chain(unreported.iter().map(|(purl, cause)| {
+            PatchEvent::new(PatchAction::Failed, purl.as_str()).with_cause(cause.as_str())
+        }))
         .collect();
     crate::telemetry_outcomes::patch_outcomes(
         &events,
         socket_patch_core::telemetry::MODE_AGENT,
         crate::telemetry_outcomes::uuid_lookup(patch_uuids),
     )
+}
+
+/// The `error_code` of a failed apply run's telemetry: the stage that
+/// kept it from patching anything (`sources_download_failed`,
+/// `offline_missing_sources`), else `apply_failed`, with each failed
+/// patch's own cause beside it.
+fn run_failure_code(run_warnings: &[RunWarning]) -> &str {
+    run_warnings
+        .iter()
+        .find(|w| is_stage_failure_code(&w.code))
+        .map_or("apply_failed", |w| w.code.as_str())
 }
 
 /// The one apply-failure exit: `apply_failed` telemetry, then the error
@@ -2564,6 +2618,7 @@ fn synthesize_vendor_owned_results(
             applied_via: HashMap::new(),
             error: None,
             sidecar: None,
+            cause: None,
         });
         matched.insert(purl);
     }
@@ -2613,6 +2668,10 @@ struct ApplyOutcome {
     /// (best-effort class): one non-fatal `Skipped` event each in the
     /// envelope, one gated stderr line each on the human path.
     fallback_skips: Vec<FallbackHomeSkip>,
+    /// Failures no result describes (no release variant matched the
+    /// installed copy, a Maven base refused as a whole), per manifest
+    /// purl: telemetry names them, as `results` name the rest.
+    unreported: Vec<(String, ApplyFailureCause)>,
     /// The gem copies whose apply succeeded with a caveat
     /// ([`gem_ext::GemCaveat`]): the ones with nothing of the patch in
     /// their build, and the ones whose patch is incomplete.
@@ -3165,6 +3224,7 @@ async fn apply_patches_inner(
                 lockfile_only: HashSet::new(),
                 run_warnings: vec![stage_failure_warning(args.common.offline)],
                 fallback_skips: Vec::new(),
+                unreported: Vec::new(),
                 caveats: GemCaveats::default(),
                 targeted: target_manifest_purls.len(),
                 show_summary: false,
@@ -3207,6 +3267,7 @@ async fn apply_patches_inner(
             lockfile_only: HashSet::new(),
             run_warnings: Vec::new(),
             fallback_skips: Vec::new(),
+            unreported: Vec::new(),
             caveats: GemCaveats::default(),
             targeted: 0,
             show_summary: false,
@@ -3281,6 +3342,7 @@ async fn apply_patches_inner(
         }
     }
     let mut fallback_skips: Vec<FallbackHomeSkip> = Vec::new();
+    let mut unreported: Vec<(String, ApplyFailureCause)> = Vec::new();
     let mut caveats = GemCaveats::default();
     let mut go_pristine_mods: HashMap<String, PathBuf> = HashMap::new();
 
@@ -3364,6 +3426,7 @@ async fn apply_patches_inner(
             lockfile_only,
             run_warnings,
             fallback_skips,
+            unreported,
             caveats: GemCaveats::default(),
             targeted: target_manifest_purls.len(),
             show_summary: true,
@@ -3477,6 +3540,7 @@ async fn apply_patches_inner(
                 };
                 let out = Box::pin(apply_maven_base(&maven)).await;
                 has_errors |= out.failed;
+                unreported.extend(out.unreported);
                 matched_manifest_purls.extend(out.matched);
                 run_warnings.extend(out.warnings);
                 if out.applied {
@@ -3895,6 +3959,13 @@ async fn apply_patches_inner(
                     // variant fails loudly instead of silently staying
                     // vulnerable behind a sibling copy's success.
                     has_errors = true;
+                    if !attempted {
+                        unreported.extend(
+                            variants
+                                .iter()
+                                .map(|v| (v.clone(), ApplyFailureCause::NoMatchingVariant)),
+                        );
+                    }
                     if !attempted && args.prints_errors() {
                         // No variant matched the installed distribution at all —
                         // the package on disk isn't any known release variant.
@@ -4055,6 +4126,7 @@ async fn apply_patches_inner(
         lockfile_only,
         run_warnings,
         fallback_skips,
+        unreported,
         caveats,
         targeted: target_manifest_purls.len(),
         show_summary: true,
@@ -4182,12 +4254,14 @@ struct MavenApplied {
     failed: bool,
     /// Some copy ended patched.
     applied: bool,
+    /// See [`ApplyOutcome::unreported`].
+    unreported: Vec<(String, ApplyFailureCause)>,
 }
 
 impl MavenApplied {
     /// A refusal of `purl` with nothing written: a Failed event carrying
     /// `code` and a run warning with the same code.
-    fn refuse(&mut self, purl: &str, path: &Path, code: &str, detail: String) {
+    fn refuse(&mut self, purl: &str, path: &Path, code: &'static str, detail: String) {
         self.results.push(ApplyResult {
             package_key: purl.to_string(),
             package_path: path.display().to_string(),
@@ -4197,6 +4271,7 @@ impl MavenApplied {
             applied_via: HashMap::new(),
             error: Some(format!("{code}: {detail}")),
             sidecar: None,
+            cause: Some(ApplyFailureCause::Refused(code)),
         });
         self.warn(code, detail);
         self.failed = true;
@@ -4312,6 +4387,12 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
             ),
         );
         out.failed = true;
+        out.unreported.extend(m.variants.iter().map(|v| {
+            (
+                v.clone(),
+                ApplyFailureCause::Refused("gradle_ro_cache_shadows"),
+            )
+        }));
     }
     if copies.consumed.is_empty() {
         if copies.read_only.is_empty() {
@@ -4570,6 +4651,11 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
     let gradle_only = copies.consumed.iter().all(|c| gradle_cache::expands(c));
     if !attempted && !out.failed && !gradle_only {
         out.failed = true;
+        out.unreported.extend(
+            m.variants
+                .iter()
+                .map(|v| (v.clone(), ApplyFailureCause::NoMatchingVariant)),
+        );
         if args.prints_errors() {
             eprintln!(
                 "{}",
@@ -5034,6 +5120,7 @@ mod tests {
             applied_via,
             error: None,
             sidecar: None,
+            cause: None,
         }
     }
 
@@ -5086,6 +5173,68 @@ mod tests {
         assert_eq!(v["action"], "failed");
         assert_eq!(v["errorCode"], "apply_failed");
         assert_eq!(v["error"], "hash mismatch");
+        // No cause was set and the verified file was ready.
+        assert_eq!(v["cause"], "unclassified");
+    }
+
+    /// Telemetry names the failures no package result describes (no
+    /// release variant matched, a Maven base refused as a whole) and the
+    /// patches that failed the run by not being installed, each under its
+    /// record's UUID and code.
+    #[test]
+    fn reported_patches_name_the_failures_with_no_result() {
+        let uuids = HashMap::from([
+            (
+                "pkg:pypi/w@1.0?artifact_id=a".to_string(),
+                "u-wheel".to_string(),
+            ),
+            ("pkg:maven/g/a@1.0".to_string(), "u-maven".to_string()),
+            ("pkg:npm/gone@1.0.0".to_string(), "u-gone".to_string()),
+        ]);
+        let failures = [ApplyFailure {
+            purl: "pkg:npm/gone@1.0.0".to_string(),
+            code: "package_not_installed".to_string(),
+            error: "No installed package matches this PURL".to_string(),
+            cause: None,
+        }];
+        let unreported = [
+            (
+                "pkg:pypi/w@1.0?artifact_id=a".to_string(),
+                ApplyFailureCause::NoMatchingVariant,
+            ),
+            (
+                "pkg:maven/g/a@1.0".to_string(),
+                ApplyFailureCause::Refused("gradle_ro_cache_shadows"),
+            ),
+        ];
+        let reported = reported_patches(
+            &[],
+            &GemCaveats::default(),
+            &failures,
+            &unreported,
+            false,
+            &uuids,
+        );
+        let named: Vec<(&str, &str, Option<&str>)> = reported
+            .iter()
+            .map(|p| (p.uuid.as_str(), p.outcome, p.code.as_deref()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("u-gone", "failed", Some("package_not_installed")),
+                ("u-wheel", "failed", Some("no_matching_variant")),
+                ("u-maven", "failed", Some("gradle_ro_cache_shadows")),
+            ]
+        );
+    }
+
+    /// A run stopped before patching anything reports that stage.
+    #[test]
+    fn run_failure_code_is_the_stage_that_stopped_the_run() {
+        assert_eq!(run_failure_code(&[]), "apply_failed");
+        let stage = RunWarning::new(SOURCES_DOWNLOAD_FAILED, "x");
+        assert_eq!(run_failure_code(&[stage]), SOURCES_DOWNLOAD_FAILED);
     }
 
     #[test]
@@ -5150,6 +5299,7 @@ mod tests {
             applied_via,
             error: None,
             sidecar: None,
+            cause: None,
         };
 
         let event = result_to_event(&result, false);
@@ -5191,6 +5341,7 @@ mod tests {
             applied_via: HashMap::new(),
             error: None,
             sidecar: None,
+            cause: None,
         }
     }
 
@@ -5335,6 +5486,7 @@ mod tests {
             applied_via,
             error: None,
             sidecar: None,
+            cause: None,
         };
         let event = result_to_event(&result, false);
         let v: serde_json::Value =
@@ -5578,6 +5730,7 @@ mod tests {
                 purl: GEM_PURL.to_string(),
                 code: "native_extension_not_rebuilt".to_string(),
                 error: "the patch's files were written, but not built".to_string(),
+                cause: None,
             }]
         );
         let (applied, skipped) =
@@ -5805,6 +5958,7 @@ mod tests {
             applied_via: HashMap::new(),
             error: None,
             sidecar: None,
+            cause: None,
         };
         let t = tally_results(std::slice::from_ref(&applied), &caveats);
         assert_eq!((t.applied, t.unsupported), (1, 1));
@@ -6176,6 +6330,7 @@ mod tests {
             applied_via: HashMap::new(),
             error: error.map(str::to_string),
             sidecar: None,
+            cause: None,
         }
     }
 
@@ -6196,11 +6351,13 @@ mod tests {
                     purl: "pkg:npm/a@1.0.0".to_string(),
                     code: "apply_failed".to_string(),
                     error: "Permission denied (os error 13)".to_string(),
+                    cause: Some("unclassified"),
                 },
                 ApplyFailure {
                     purl: "pkg:npm/b@1.0.0".to_string(),
                     code: "apply_failed".to_string(),
                     error: "unknown error".to_string(),
+                    cause: Some("unclassified"),
                 },
             ]
         );
@@ -6221,6 +6378,7 @@ mod tests {
                 purl: "pkg:npm/gone@1.0.0".to_string(),
                 code: "package_not_installed".to_string(),
                 error: "No installed package matches this PURL".to_string(),
+                cause: None,
             }],
             "a lockfile-resolved purl never fails the run (#403)"
         );
