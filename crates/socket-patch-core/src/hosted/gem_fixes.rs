@@ -455,15 +455,31 @@ impl GemLock {
                 classes.insert(purl.to_string(), class);
             }
             // The fix's source patch, for a lock that does not name the
-            // ruby gem: its registry is the gem's source.
-            if let (Some(fix), false) = (fix, locked.ruby) {
+            // ruby gem: its registry is the gem's source. Its row is
+            // judged like a build's: the lock may name the registry of a
+            // build's own patch (where the source patch was not available
+            // when the gem was moved), and the source patch of that same
+            // fix is then no newer patch for the project.
+            if !locked.ruby {
                 for (_, purl) in purls.iter().filter(|(platform, _)| platform.is_none()) {
-                    if let Some(source) = Self::admitted(offers, purl)
-                        .into_iter()
-                        .find(|offer| offer.uuid == fix)
-                    {
+                    let source = fix.and_then(|fix| {
+                        let mut admitted = Self::admitted(offers, purl).into_iter();
+                        admitted.find(|offer| offer.uuid == fix)
+                    });
+                    if let Some(source) = source {
                         chosen.push((purl.to_string(), source.clone()));
                     }
+                    let taken = source.or_else(|| offers.selected.get(*purl));
+                    let (Some(taken), Some(recorded_fix)) = (taken, recorded_fix.as_deref()) else {
+                        continue;
+                    };
+                    let class = match family_of(&taken.uuid, references) == recorded_fix {
+                        true => Recorded::Same,
+                        false => Recorded::Superseded {
+                            old_uuid: pinned[0].clone(),
+                        },
+                    };
+                    classes.insert(purl.to_string(), class);
                 }
             }
         }
@@ -817,6 +833,9 @@ mod tests {
         let mut offers = offers_from_results(&fix_b(), true);
         let classes = lock.choose(&mut offers, &both_fixes(), &on_member);
         assert_eq!(classes.get(LINUX), Some(&Recorded::Same));
+        // The fix's source patch, which lends nothing there and pins
+        // nothing, is no newer patch for the project either.
+        assert_eq!(classes.get(RUBY), Some(&Recorded::Same));
 
         // No fix covers every locked build: what the ranking takes for a
         // build is still judged by its fix.

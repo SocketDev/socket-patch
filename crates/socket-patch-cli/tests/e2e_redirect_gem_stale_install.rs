@@ -3431,8 +3431,34 @@ async fn gem_hosted_scan_without_the_source_patch_takes_a_builds_registry() {
         );
     }
 
+    // The re-scans name the patch server, so that the lock's pin on this
+    // loopback registry is read as the hosted pin it is.
+    let uri = server.uri();
+    let rescan = || {
+        common::run_with_env(
+            &proj,
+            &[
+                "scan",
+                "--mode",
+                "hosted",
+                "--json",
+                "--yes",
+                "--cwd",
+                proj.to_str().unwrap(),
+                "--api-url",
+                uri.as_str(),
+                "--patch-server-url",
+                uri.as_str(),
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+            ],
+            &[],
+        )
+    };
     // A re-scan without the source patch changes nothing and says the same.
-    let (code, stdout, stderr) = hosted_scan_json(&proj, &server.uri());
+    let (code, stdout, stderr) = rescan();
     let env = common::parse_json_envelope(&stdout);
     assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
     assert_eq!(pair(), (gemfile.clone(), moved.clone()), "{env}");
@@ -3442,15 +3468,25 @@ async fn gem_hosted_scan_without_the_source_patch_takes_a_builds_registry() {
         1,
         "{env}"
     );
+    assert_eq!(
+        env["updates"],
+        serde_json::json!([]),
+        "the gem is on its fix: no newer patch is announced: {env}"
+    );
 
     // The source patch is offered now: the pair works, and stays as it is.
     server.reset().await;
     mount_api_with(&server, None, &ruby_sha, &builds).await;
-    let (code, stdout, stderr) = hosted_scan_json(&proj, &server.uri());
+    let (code, stdout, stderr) = rescan();
     let env = common::parse_json_envelope(&stdout);
     assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
     assert_eq!(pair(), (gemfile, moved), "nothing is rewritten: {env}");
     assert_eq!(hosted_pinned(&env), 2, "{env}");
+    assert_eq!(
+        env["updates"],
+        serde_json::json!([]),
+        "the source patch of the same fix is no newer patch: {env}"
+    );
     assert!(
         warnings_with_code(&env, "redirect_gem_member_registry").is_empty()
             && warnings_with_code(&env, "redirect_gem_platform_unsupported").is_empty(),
