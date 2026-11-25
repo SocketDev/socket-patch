@@ -57,7 +57,7 @@ use super::{
     restore_uuid_metadata, GemPrelude, RevertFiles, GEMFILE, GEMFILE_LOCK, GEM_STUB_ARTIFACT_KIND,
 };
 use crate::api::client::PlannedDownload;
-use crate::bazel::built::{hub_calls, lock_text, reader};
+use crate::bazel::built::{hub_calls, lock_text, reader, workspace_as_built};
 use crate::bazel::rc::{declared_release, mentions, Release};
 use crate::bazel::starlark::Value as Starlark;
 use crate::bazel::workspace::{disk, Doubt, Tag, Workspace};
@@ -131,9 +131,10 @@ fn named(tag: &Tag<'_>) -> String {
 /// calls that read the two files, or why that is not known to build here.
 /// Read from the files of the checkout alone:
 ///
-/// - The workspace is read with certainty, and no `WORKSPACE` file defines
-///   a repository: every call that reads the two files is among the ones
-///   seen.
+/// - The workspace is read with certainty, and no `WORKSPACE` file that
+///   the Bazel of the checkout reads defines a repository
+///   ([`workspace_as_built`]): every call that reads the two files is
+///   among the ones seen.
 /// - The project is the root of the workspace, where Bazel opens the URL
 ///   from.
 /// - Each call of the hub writes out the files it reads, and one that reads
@@ -151,7 +152,7 @@ pub(crate) async fn gate(root: &BazelRoot) -> Result<Hub, String> {
 
 fn read(dir: &Path, project: &Path) -> Result<Hub, String> {
     let view = disk(dir);
-    let workspace = Workspace::read(&view);
+    let workspace = workspace_as_built(&view);
     let (calls, doubts) = hub_calls(&workspace, "gem");
     if let Some(doubt) = workspace.doubts.first().or(doubts.first()) {
         return Err(uncertain(doubt));
@@ -1002,7 +1003,7 @@ ruby.bundle_fetch(name = "bundle", gemfile = "//:Gemfile", gemfile_lock = "//:Ge
         let pinned = |sums: &str| MODULE.replace(lock_arg, &format!("{lock_arg}, {sums}"));
         let bundler = |version: &str| lock().replace("   2.6.9", &format!("   {version}"));
         let unnamed = "names no Bazel release as three numbers";
-        let cases: [(&str, String, &str); 18] = [
+        let cases: [(&str, String, &str); 17] = [
             (".bazelversion", String::new(), unnamed),
             (".bazelversion", "latest\n".into(), unnamed),
             (".bazelversion", "9.3.2rc1\n".into(), unnamed),
@@ -1015,11 +1016,6 @@ ruby.bundle_fetch(name = "bundle", gemfile = "//:Gemfile", gemfile_lock = "//:Ge
                 ".bazelversion",
                 "6.5.0\n".into(),
                 "not known to build on Bazel 6.5.0",
-            ),
-            (
-                "WORKSPACE",
-                "local_repository(name = \"x\", path = \"x\")\n".into(),
-                "a `WORKSPACE` file of the workspace defines repositories",
             ),
             (
                 "MODULE.bazel",
@@ -1091,6 +1087,19 @@ ruby.bundle_fetch(name = "bundle", gemfile = "//:Gemfile", gemfile_lock = "//:Ge
                 "{file} = {text:?}: {said:?}, not {why:?}"
             );
         }
+        // A `WORKSPACE` file that defines repositories stands against the
+        // gem where a Bazel that reads it may build the checkout, and not
+        // under the Bazel 9.3.2 this checkout names, which reads none.
+        let legacy = (
+            "WORKSPACE",
+            "local_repository(name = \"x\", path = \"x\")\n",
+        );
+        let (_tmp, root) = checkout(MODULE, &[legacy, (".bazelversion", "7.7.2\n")]);
+        let said = declined(&root).await.unwrap_or_default();
+        let why = "a `WORKSPACE` file of the workspace defines repositories";
+        assert!(said.contains(why), "{said:?}");
+        let (_tmp, root) = checkout(MODULE, &[legacy]);
+        assert_eq!(declined(&root).await, None, "under Bazel 9.3.2");
         // A call that reads the files of another project is none of this
         // one's, whatever it holds its gems to.
         let other = MODULE

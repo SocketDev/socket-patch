@@ -177,6 +177,9 @@ v5 keeps every lockfile format in the support matrix, including the ones the pac
 managers have retired. The [v5 support tiers](ecosystems.md#v5-support-tiers) say how
 mature each one is.
 
+- **Experimental:** what socket-patch does for a project in a Bazel workspace. It is new
+  in v5.x and can change in any v5.x release; see
+  [Bazel workspaces: what is supported](ecosystems.md#bazel-workspaces-what-is-supported).
 - **Beta:** Maven and Gradle in hosted and vendored mode, and sbt / Mill / scala-cli.
   They work for the documented build shapes. Run the build before you rely on the
   result or on a `--vex` document.

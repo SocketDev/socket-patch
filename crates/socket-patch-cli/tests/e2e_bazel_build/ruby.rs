@@ -1349,6 +1349,10 @@ fn a_gem_is_committed_for_the_hub_and_put_back() {
     same(&go(&["vendor", "--revert", "--yes"]), &before);
 }
 
+/// A `WORKSPACE` file that defines a repository, as a move to Bzlmod can
+/// leave one behind.
+const LEFT_BEHIND: &str = "local_repository(name = \"x\", path = \"x\")\n";
+
 /// Without a Bazel: each condition under which the committed gem is not
 /// known to build declines the gem, with nothing written and no gem
 /// fetched, and names the call, the lock and the condition. The lock's
@@ -1439,11 +1443,10 @@ fn a_gem_is_declined_where_the_committed_gem_is_not_known_to_build() {
             "the `gem_checksums` of `ruby.bundle_fetch` (MODULE.bazel:15) are not written out",
         ),
         (
+            // Under a Bazel that reads the file: 9.3.2 reads none.
             &|cell| {
-                cell.write(
-                    "WORKSPACE",
-                    "local_repository(name = \"x\", path = \"x\")\n",
-                )
+                cell.write(".bazelversion", "7.7.2\n");
+                cell.write("WORKSPACE", LEFT_BEHIND)
             },
             "a `WORKSPACE` file of the workspace defines repositories",
         ),
@@ -1465,6 +1468,15 @@ fn a_gem_is_declined_where_the_committed_gem_is_not_known_to_build() {
         cell.declined(&scan(&cell, &served), &package, 1, "failed", &before);
         assert_eq!(served.standin.asked(&served.artifact_route), 0, "{why}");
     }
+
+    // The same `WORKSPACE` file under the Bazel 9.3.2 the checkout names,
+    // which reads none: it stands against nothing, and the gem is
+    // committed for the hub.
+    let (cell, served) = checkout();
+    cell.write(".bazelversion", "9.3.2\n");
+    cell.write("WORKSPACE", LEFT_BEHIND);
+    let before = cell.tree();
+    committed_for_the_hub(&cell, &scan(&cell, &served), &served, &before);
 
     // An entry that holds the gem to the upstream bytes.
     let (cell, served) = checkout();
@@ -1581,6 +1593,73 @@ fn vendored_mode_goes_on_where_no_hub_reads_the_lock() {
     cell.declined(&scan(&cell, &served), &package, 1, "failed", &before);
 }
 
+/// Without a Bazel: a `WORKSPACE` file that a migration left behind still
+/// hands the Gemfile and its lock to the ruleset's older rule, beside a
+/// `MODULE.bazel` whose hub reads the files of another project. Bazel 9
+/// never reads a `WORKSPACE` file, so where the checkout names a release of
+/// 9 or later the gem is vendored as it is without that file. Where it
+/// names an older release, none, or one that is no release, a Bazel that
+/// reads the file may build the checkout: the gem is declined, and the
+/// refusal names the call of the `WORKSPACE` file.
+#[test]
+fn a_workspace_file_counts_unless_the_checkout_names_bazel_9_or_later() {
+    let legacy = "rb_bundle_fetch(\n    name = \"bundle\",\n    gemfile = \"//:Gemfile\",\n    \
+                  gemfile_lock = \"//:Gemfile.lock\",\n)\n";
+    // The fixture's checkout with a hub that reads the files of another
+    // project, the `WORKSPACE` file where it is `kept`, and what names
+    // the Bazel release.
+    let retained = |release: Option<&str>, kept: bool| {
+        let (cell, served) = checkout();
+        let module = String::from_utf8(cell.tree()["MODULE.bazel"].clone()).expect("a text file");
+        let other = module.replace("\"//:Gemfile", "\"//svc:Gemfile");
+        assert_ne!(other, module);
+        cell.write("MODULE.bazel", other);
+        if kept {
+            cell.write("WORKSPACE", legacy);
+        }
+        if let Some(release) = release {
+            cell.write(".bazelversion", format!("{release}\n"));
+        }
+        (cell, served)
+    };
+    let scan = |cell: &Cell, served: &Served| {
+        let origin = served.standin.origin();
+        run(&served.standin, cell, &VENDORED, &patch_host(&origin))
+    };
+    // A run that vendors the gem by its path, and the files it writes,
+    // with the id of the patch left out of their names.
+    let vendors = |cell: &Cell, served: &Served| -> Vec<String> {
+        let before = cell.tree();
+        let ran = scan(cell, served);
+        assert_eq!(ran.code, 0, "{}", ran.dump);
+        assert_eq!(ran.envelope["summary"]["applied"], 1, "{}", ran.dump);
+        let after = cell.tree();
+        let copy = format!(".socket/vendor/gem/{}/{NAME}-{VERSION}", served.uuid);
+        let lock = String::from_utf8_lossy(&after["Gemfile.lock"]);
+        let section = format!("PATH\n  remote: {copy}\n");
+        assert!(lock.starts_with(&section), "{lock}");
+        let written = changed(&before, &after).into_iter();
+        written
+            .map(|path| path.replace(&served.uuid, "<id>"))
+            .collect()
+    };
+    let (cell, served) = retained(Some("9.3.2"), false);
+    let written = vendors(&cell, &served);
+    for release in ["9.3.2", "9.0.0", "10.0.0"] {
+        let (cell, served) = retained(Some(release), true);
+        assert_eq!(vendors(&cell, &served), written, "{release}");
+    }
+    let package = Declined {
+        names: &["`rb_bundle_fetch` (WORKSPACE:1)", "names Gemfile.lock; "],
+        ..DECLINED
+    };
+    for release in [Some("7.7.2"), Some("8.8.2"), None, Some("latest")] {
+        let (cell, served) = retained(release, true);
+        let before = cell.tree();
+        cell.declined(&scan(&cell, &served), &package, 1, "failed", &before);
+    }
+}
+
 /// Without a Bazel: steps (b), (d) and (f) of
 /// [`hosted_bundle_fetch_gem_checksums`] in the fixture's checkout, with
 /// what a person reads of (b), and (b) again with `--dry-run` and with
@@ -1684,6 +1763,43 @@ fn a_gem_that_the_hub_holds_to_its_upstream_sha256_is_left_alone() {
         assert_eq!(undo.envelope["summary"]["rolledBack"], 1, "{}", undo.dump);
         assert_eq!(changed(&edited, &cell.tree()), NOTHING, "{}", undo.dump);
     }
+}
+
+/// Without a Bazel: with `SOCKET_NO_BAZEL=1` a hosted scan pins the gem
+/// that the hub holds to its upstream sha256, as it does in the same
+/// checkout without its `MODULE.bazel`, to the byte, and says nothing of
+/// the call. Without the variable it leaves the gem alone there.
+#[test]
+fn the_switch_makes_a_hosted_scan_the_one_of_a_checkout_without_bazel() {
+    let served = Served::to(&mut cell_without_bazel("9.3.2"));
+    let sums = [&served.neighbour_gem, &served.upstream_gem].map(|gem| sha256_hex(gem));
+    let held = module_pinning(&[(NEIGHBOUR, &sums[0]), (NAME, &sums[1])]);
+    let cell = checkout_with(&served, Some(&held));
+    let origin = served.standin.origin();
+    let rubygems = format!("{origin}/{RUBYGEMS}");
+    let env = [("SOCKET_RUBYGEMS_URL", rubygems.as_str())];
+    let hosted = ["scan", "--mode", "hosted", "--yes"];
+    let left_alone = cell.off_is_without_bazel(&origin, &hosted, &env, &["MODULE.bazel"]);
+    let said = left_alone[0]["stdout"].as_str().expect("an envelope");
+    let envelope: serde_json::Value = serde_json::from_str(said).expect("an envelope");
+    assert_eq!(codes_in(&envelope["warnings"]), [HELD], "{left_alone:#}");
+}
+
+/// Without a Bazel: with `SOCKET_NO_BAZEL=1` vendored mode vendors the gem
+/// whose lock the hub reads, as it does in the same checkout without its
+/// `MODULE.bazel`, to the byte. Without the variable it declines the gem
+/// there.
+#[test]
+fn the_switch_makes_vendored_mode_the_one_of_a_checkout_without_bazel() {
+    let (cell, served) = checkout();
+    let origin = served.standin.origin();
+    let rubygems = format!("{origin}/{RUBYGEMS}");
+    let env = [
+        ("SOCKET_RUBYGEMS_URL", rubygems.as_str()),
+        patch_host(&origin)[0],
+    ];
+    let declined = cell.off_is_without_bazel(&origin, &VENDORED, &env, &["MODULE.bazel"]);
+    assert_eq!(declined[0]["code"], 1, "{declined:#}");
 }
 
 /// Without a Bazel: what else a call can say, each as the `MODULE.bazel`

@@ -58,6 +58,17 @@ pub fn declared_release(view: &dyn Fn(&str) -> Entry) -> Option<Release> {
     }
 }
 
+/// Whether the Bazel that builds the checkout may read a `WORKSPACE` file
+/// ([`super::workspace::Workspace::legacy`]). Bazel 7 reads one beside
+/// `MODULE.bazel`, Bazel 8 when it is told to, and Bazel 9 and later
+/// never. So it does not where the checkout names a release of 9 or later
+/// ([`declared_release`]), and it may where the checkout names an older
+/// one or none: `latest`, a release candidate and a missing file name no
+/// release.
+pub fn reads_workspace_file(view: &dyn Fn(&str) -> Entry) -> bool {
+    declared_release(view).is_none_or(|release| release < (9, 0, 0))
+}
+
 /// What `MODULE.bazel.lock` says of the Bazel that wrote it and of the
 /// modules it selected. Bazel writes the file at a build, so a checkout
 /// that was built has it whether it is committed or not.
@@ -328,6 +339,32 @@ mod tests {
             _ => Entry::Text("7.7.2\n".to_string()),
         };
         assert_eq!(declared_release(&unreadable), None);
+    }
+
+    /// A `WORKSPACE` file may be read unless the checkout names a Bazel of
+    /// 9 or later: one that names an older release, none, or something
+    /// that is no release may be built by a Bazel that reads it.
+    #[test]
+    fn a_workspace_file_may_be_read_unless_bazel_9_or_later_is_named() {
+        let reads = |files: &[(&str, &str)]| {
+            reads_workspace_file(&|path| match files.iter().find(|(name, _)| *name == path) {
+                Some((_, text)) => Entry::Text(text.to_string()),
+                None => Entry::Absent,
+            })
+        };
+        for named in ["9.0.0", "9.3.2\n", "10.0.0\n"] {
+            assert!(!reads(&[(".bazelversion", named)]), "{named:?}");
+        }
+        let unnamed = ["8.8.2\n", "7.7.2\n", "", "latest\n", "9.x\n", "9.3.2rc1\n"];
+        for named in unnamed {
+            assert!(reads(&[(".bazelversion", named)]), "{named:?}");
+        }
+        assert!(reads(&[]));
+        // `.bazeliskrc` outranks `.bazelversion`, as for a launcher.
+        let rc = (".bazeliskrc", "USE_BAZEL_VERSION=9.3.2\n");
+        assert!(!reads(&[rc, (".bazelversion", "7.7.2\n")]));
+        let rc = (".bazeliskrc", "USE_BAZEL_VERSION=7.7.2\n");
+        assert!(reads(&[rc, (".bazelversion", "9.3.2\n")]));
     }
 
     /// The view of the files `files`, where a file whose text is `\0`

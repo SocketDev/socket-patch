@@ -360,7 +360,8 @@ fn home_spec(gem_dir: &Path) -> Option<PathBuf> {
 
 /// The local-path remedy: Bundler then installs every gem of the project
 /// into the project, from the source the lock names.
-const LOCAL_PATH_REMEDY: &str = "bundle config set --local path vendor/bundle && bundle install";
+pub(crate) const LOCAL_PATH_REMEDY: &str =
+    "bundle config set --local path vendor/bundle && bundle install";
 
 /// The files whose removal makes `bundle install` fetch the gem again: the
 /// installed copy's `specifications` entry and cached archive (Bundler
@@ -1108,8 +1109,11 @@ enum NoRecord {
     NotServed,
 }
 
-/// What judges the installed copies a hosted unwind's archive check cannot
-/// (#2092): those whose gem home keeps no readable `<home>/cache/<leaf>.gem`.
+/// What judges the installed copies a hosted unwind's archive check cannot:
+/// those whose gem home keeps no readable `<home>/cache/<leaf>.gem` (#2092),
+/// and those of a build nothing gives the upstream sha256 of, so that its
+/// archive says nothing (#2230: a gem from another remote, or `--offline`
+/// or a registry error, under a lock without `CHECKSUMS`).
 /// Nothing else tells such a copy from the patched build the hosted scan
 /// may have replaced it with, and no later `bundle install` replaces it.
 /// Each is judged on its own files, by the record of a patch its gem was
@@ -1157,8 +1161,11 @@ impl PinJudge<'_> {
     }
 
     /// The installed copies of `builds` (`(purl, leaf)`, the builds the
-    /// restored lock names for the pinned gems) with no readable archive in
-    /// their gem home: those that hold a pinned patch (stale), and those nothing
+    /// restored lock names for the pinned gems) that no archive judges:
+    /// one with no readable archive in its gem home, and one of a build
+    /// that is not in `by_archive` (the leaves the archive check has an
+    /// upstream sha256 for, or reports itself). Of those: the copies that
+    /// hold a pinned patch (stale), and those nothing
     /// could judge, each with why (the reason completes "could not be
     /// checked against the upstream gem (…)"). A copy is neither when a
     /// record judged it and found files that are not its patch's, and no
@@ -1167,6 +1174,7 @@ impl PinJudge<'_> {
     async fn probe(
         &mut self,
         builds: &[(String, String)],
+        by_archive: &BTreeSet<String>,
     ) -> (Vec<StaleGem>, Vec<(StaleGem, String)>) {
         use socket_patch_core::vendor::file_sha256_hex;
         use socket_patch_core::vex::verify::judge_installed_record;
@@ -1174,10 +1182,17 @@ impl PinJudge<'_> {
         let (mut stale, mut unjudged) = (Vec::new(), Vec::new());
         for copy in installed_builds(self.common, builds).await {
             // The same test as `stale_after_restore`'s: an archive it can
-            // hash is its to judge the copy by.
-            if file_sha256_hex(&copy.archive).await.is_some() {
+            // hash is its to judge the copy by, when it has the upstream
+            // sha256 to hold that archive against.
+            let archived = file_sha256_hex(&copy.archive).await.is_some();
+            if archived && by_archive.contains(&copy.leaf) {
                 continue;
             }
+            let unjudged_by_archive = if archived {
+                "nothing gives the sha256 of its upstream gem"
+            } else {
+                "its gem home has no archive of it"
+            };
             // Why the copy is not known to be free of a pinned patch: a pin
             // with no record, or a record whose files could not be read.
             let (mut patched, mut open) = (false, None);
@@ -1216,7 +1231,7 @@ impl PinJudge<'_> {
             match (patched, open) {
                 (true, _) => stale.push(gem),
                 (false, Some(why)) => {
-                    unjudged.push((gem, format!("its gem home has no archive of it and {why}")))
+                    unjudged.push((gem, format!("{unjudged_by_archive} and {why}")))
                 }
                 (false, None) => {}
             }
@@ -1484,11 +1499,13 @@ async fn refresh_restored(
     if shas.is_empty() && unverified.is_empty() && judged.is_empty() && pinned.is_empty() {
         return RestoreRefresh::default();
     }
-    // A hosted unwind's copies with no archive to judge them by: stale
-    // when they hold a pinned patch, reported when no record says (#2092).
+    // A hosted unwind's copies that no archive judges (none in the gem
+    // home, #2092; or no upstream sha256 to hold it against, #2230): stale
+    // when they hold a pinned patch, reported when no record says.
     let pinned_builds = build_leaves(&named, |purl| pinned.iter().any(|p| p == purl));
+    let by_archive: BTreeSet<String> = shas.keys().chain(unverified.keys()).cloned().collect();
     let (pin_stale, no_record) = match &mut pin_judge {
-        Some(judge) => judge.probe(&pinned_builds).await,
+        Some(judge) => judge.probe(&pinned_builds, &by_archive).await,
         None => Default::default(),
     };
     let pin_stale_any = !pin_stale.is_empty();
@@ -1543,7 +1560,7 @@ async fn refresh_restored(
         let mut still = stale_after_restore(common, &named, &shas, &judged, scope).await;
         // (A copy no record judged is not one the pass could change.)
         if let Some(judge) = pin_judge.as_mut().filter(|_| pin_stale_any) {
-            still.extend(judge.probe(&pinned_builds).await.0);
+            still.extend(judge.probe(&pinned_builds, &by_archive).await.0);
         }
         still
     } else {
@@ -2055,7 +2072,11 @@ mod tests {
             vec!["uuid-a".to_string(), "uuid-b".to_string()],
         )]);
         // `--offline`: only the records seeded below are there to judge by.
-        let probe = |tmp: &tempfile::TempDir, fetched: Vec<(&str, Option<PatchRecord>)>| {
+        // `sha_known`: whether the archive check has the upstream sha256 of
+        // the build (a `CHECKSUMS` entry, or the registry's answer).
+        let probe_as = |tmp: &tempfile::TempDir,
+                        fetched: Vec<(&str, Option<PatchRecord>)>,
+                        sha_known: bool| {
             let fetched = fetched
                 .into_iter()
                 .map(|(uuid, record)| (uuid, record.ok_or(NoRecord::NotServed)));
@@ -2078,11 +2099,16 @@ mod tests {
                     unreachable: false,
                 };
                 let builds = [(PURL.to_string(), "rack-1.0.0".to_string())];
-                let (stale, unjudged) = judge.probe(&builds).await;
+                let by_archive: BTreeSet<String> = sha_known
+                    .then(|| "rack-1.0.0".to_string())
+                    .into_iter()
+                    .collect();
+                let (stale, unjudged) = judge.probe(&builds, &by_archive).await;
                 assert!(api.get().is_none(), "an offline probe builds no client");
                 (stale.len(), unjudged)
             }
         };
+        let probe = |tmp: &tempfile::TempDir, fetched| probe_as(tmp, fetched, true);
         let (a, b) = (record("uuid-a", "patch a\n"), record("uuid-b", "patch b\n"));
         let both = || vec![("uuid-a", Some(a.clone())), ("uuid-b", Some(b.clone()))];
 
@@ -2138,6 +2164,26 @@ mod tests {
         let tmp = project("patch b\n", true);
         let (stale, unjudged) = probe(&tmp, both()).await;
         assert_eq!((stale, unjudged.len()), (0, 0));
+
+        // #2230: unless nothing gives the upstream sha256 to hold that
+        // archive against (a gem from a private mirror under a lock with
+        // no `CHECKSUMS`). The copy is then judged on its files like one
+        // with no archive: the patched build is stale, ...
+        let (stale, unjudged) = probe_as(&tmp, both(), false).await;
+        assert_eq!((stale, unjudged.len()), (1, 0));
+        // ... the upstream build is not, ...
+        let tmp = project("upstream\n", true);
+        let (stale, unjudged) = probe_as(&tmp, both(), false).await;
+        assert_eq!((stale, unjudged.len()), (0, 0));
+        // ... and one no record judges is reported, with a reason that
+        // does not say the archive is missing.
+        let (stale, unjudged) = probe_as(&tmp, vec![("uuid-b", Some(b.clone()))], false).await;
+        assert_eq!((stale, unjudged.len()), (0, 1));
+        assert_eq!(
+            unjudged[0].1,
+            "nothing gives the sha256 of its upstream gem and `--offline` is set, so its patch \
+             record was not fetched"
+        );
     }
 
     /// A project-local copy the refresh could not fix says why and names

@@ -367,6 +367,64 @@ fn stage_requirements(root: &Path) -> &'static [&'static str] {
     &["requirements.txt"]
 }
 
+/// #1114: a Poetry or PDM project that declares no dependencies has a lock
+/// with no packages, and installs its pins from requirements.txt. `vendor`
+/// wires requirements.txt and leaves the lock alone. Before the fix it
+/// routed to the tool lock and refused the package
+/// (`pypi_poetry_lock_package_missing` / `pypi_pdm_lock_package_missing`,
+/// "run `poetry lock` first", which writes the same empty lock again).
+#[tokio::test]
+async fn packageless_tool_lock_beside_requirements_vendors_requirements() {
+    for (lock, content, pyproject) in [
+        (
+            "poetry.lock",
+            "package = []\n\n[metadata]\nlock-version = \"2.1\"\npython-versions = \">=3.9\"\n",
+            "[tool.poetry]\nname = \"proj\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "pdm.lock",
+            "[metadata]\ngroups = [\"default\"]\nstrategy = [\"inherit_metadata\"]\n\
+             lock_version = \"4.5.0\"\n",
+            "[project]\nname = \"proj\"\nversion = \"0.1.0\"\n\n[tool.pdm]\n\
+             distribution = false\n",
+        ),
+    ] {
+        let (_tmp, root) = project();
+        std::fs::write(root.join(lock), content).unwrap();
+        std::fs::write(root.join("pyproject.toml"), pyproject).unwrap();
+        let files = stage_requirements(&root);
+        stage_manifest(&root);
+
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 0, "{lock}: vendor: {env:#}");
+        let requirements = std::fs::read_to_string(root.join(files[0])).unwrap();
+        assert!(
+            requirements.contains(&format!(".socket/vendor/pypi/{UUID}/"))
+                && requirements.contains("# socket-patch vendor: six==1.16.0"),
+            "{lock}: requirements.txt is wired: {requirements}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(lock)).unwrap(),
+            content,
+            "{lock}: the package-less lock is left alone"
+        );
+        let text = env.to_string();
+        assert!(
+            !text.contains("lock_package_missing") && !text.contains("pypi_multiple_lockfiles"),
+            "{lock}: {env:#}"
+        );
+
+        // The revert finds the wiring where vendor put it.
+        let (code, env) = run_cli(&root, &["vendor", "--revert"], &[]);
+        assert_eq!(code, 0, "{lock}: revert: {env:#}");
+        assert_eq!(
+            std::fs::read_to_string(root.join(files[0])).unwrap(),
+            "idna==3.7\nsix==1.16.0\n",
+            "{lock}: revert restores the pin"
+        );
+    }
+}
+
 /// #765: a vendored requirements.txt picks up a superseding patch. The
 /// manifest moves `six` from patch A to patch B (different patched bytes);
 /// the next `vendor` must re-wire the requirements line to B's wheel in

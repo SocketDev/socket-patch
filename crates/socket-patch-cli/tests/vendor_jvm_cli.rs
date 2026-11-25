@@ -2625,3 +2625,339 @@ fn vendor_declines_for_a_hub_it_cannot_patch() {
     let tmp = checkout("other");
     assert_refused(tmp.path(), "no_build_file", "no pom.xml");
 }
+
+/// What a run printed and how it ended: the exit code and both streams.
+type Said = (Option<i32>, String, String);
+
+/// [`spawn`], with `SOCKET_NO_BAZEL=1` when `off` is set: the switch for a
+/// project that Bazel does not build. The port of every loopback address
+/// is taken out of what the run printed: the download fixture listens on
+/// another one in every run.
+fn said(root: &Path, args: &[&str], json: bool, off: bool) -> Said {
+    let (mut cmd, _fixture) = command(root, args, json);
+    if off {
+        cmd.env("SOCKET_NO_BAZEL", "1");
+    }
+    let out = cmd.output().expect("run socket-patch");
+    let portless = |bytes: &[u8]| {
+        let text = String::from_utf8_lossy(bytes);
+        let mut parts = text.split("127.0.0.1:");
+        let mut said = parts.next().unwrap_or_default().to_string();
+        for part in parts {
+            said.push_str("127.0.0.1:");
+            said.push_str(part.trim_start_matches(|c: char| c.is_ascii_digit()));
+        }
+        said
+    };
+    (
+        out.status.code(),
+        portless(&out.stdout),
+        portless(&out.stderr),
+    )
+}
+
+/// Makes the checkout of [`pinned_hub`] anew under `root`, which every
+/// checkout of a test shares so that no path differs between two runs:
+/// beside the Maven build of the fixture, or with the hub `alone`.
+fn remake(root: &Path, alone: bool) {
+    for dir in ["proj", "m2"] {
+        let _ = std::fs::remove_dir_all(root.join(dir));
+    }
+    fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+    if alone {
+        only_bazel(root);
+    }
+    pinned_hub(root, "foo");
+}
+
+/// `SOCKET_NO_BAZEL=1`, the switch for a project that Bazel does not
+/// build: `vendor` of a Maven patch whose jar a pinned hub builds is the
+/// run of the same checkout without its `MODULE.bazel`, to the byte: the
+/// exit code, both streams, as a program and as a person reads them, and
+/// every file. In a checkout only Bazel builds that is the refusal of a
+/// tree without a JVM build. Beside a Maven build it is the vendoring of
+/// that build alone: nothing is written for the hub and nothing is said of
+/// it, so a Bazel build that is there after all keeps the upstream jar.
+/// Without the variable each run writes for the hub.
+///
+/// The same over what an earlier run left in the block, which stays as it
+/// is: the refusal says nothing of the hub's entry, a run that vendors for
+/// a Maven build which came later names no file of the hub among those to
+/// commit, and a hosted entry stays where it is: in a checkout only Bazel
+/// builds it is none that the run ejects.
+#[test]
+fn the_switch_makes_a_vendored_run_the_run_without_the_workspace_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let module = root.join("proj/MODULE.bazel");
+    // What a run said, the workspace file it left, and every other file.
+    let run = |args: &[&str], json: bool, off: bool| {
+        let said = said(root, args, json, off);
+        let mut tree = snapshot(root);
+        (said, tree.remove("MODULE.bazel").flatten(), tree)
+    };
+    // In the checkout that `prepare` makes: the run without the workspace
+    // file, which the run with the switch equals and leaves its own
+    // workspace file as it was, and the run without the variable, which
+    // is another one.
+    let three = |prepare: &dyn Fn(), args: &[&str], json: bool| {
+        prepare();
+        std::fs::remove_file(&module).unwrap();
+        let without = run(args, json, false);
+        prepare();
+        let held = std::fs::read(&module).unwrap();
+        let off = run(args, json, true);
+        assert_eq!((&off.0, &off.2), (&without.0, &without.2), "{args:?}");
+        assert_eq!(off.1.as_ref(), Some(&held), "{args:?}: {off:?}");
+        prepare();
+        let beside = run(args, json, false);
+        assert_ne!(beside, off, "{args:?}");
+        (without.0, beside)
+    };
+    let unit = format!("{FOO_UNIT}/file/foo-1.0.jar");
+    for (alone, json) in [(true, true), (true, false), (false, true), (false, false)] {
+        let (without, beside) = three(&|| remake(root, alone), &["vendor"], json);
+        assert_eq!(without.0, Some(i32::from(alone)), "{alone}: {without:?}");
+        assert!(beside.2.contains_key(&unit), "{alone} {json}: {beside:?}");
+    }
+
+    // A checkout only Bazel builds, which a run without the switch
+    // vendored for the hub: the refusal is the one of a tree without a
+    // JVM build, with no word of the entry, which stays.
+    let vendored = || {
+        remake(root, true);
+        ok(root, &["vendor"]);
+    };
+    let (without, beside) = three(&vendored, &["vendor"], true);
+    let refused: serde_json::Value = serde_json::from_str(&without.1).unwrap();
+    assert_eq!(without.0, Some(1), "{without:?}");
+    let why = refused["events"][0]["error"].as_str().unwrap_or_default();
+    assert!(why.ends_with("build at the project root"), "{without:?}");
+    assert_eq!(beside.0 .0, Some(0), "{beside:?}");
+
+    // A Maven build that came to that checkout later: the run vendors for
+    // it and names no file of the hub among those to commit.
+    let later = || {
+        remake(root, false);
+        let build = [
+            "proj/pom.xml",
+            "proj/a/pom.xml",
+            "proj/.mvn/wrapper/maven-wrapper.properties",
+        ];
+        let held = build.map(|rel| std::fs::read(root.join(rel)).unwrap());
+        only_bazel(root);
+        ok(root, &["vendor"]);
+        for (rel, bytes) in build.iter().zip(&held) {
+            write(root, rel, bytes);
+        }
+    };
+    let (without, beside) = three(&later, &["vendor"], false);
+    assert_eq!(without.0, Some(0), "{without:?}");
+    assert!(without.1.contains("Commit .socket/vendor/"), "{without:?}");
+    assert!(beside.0 .1.contains("Commit MODULE.bazel"), "{beside:?}");
+
+    // The hosted entry of the block stays as it is. In a checkout only
+    // Bazel builds it is no pin that the run ejects, whether the manifest
+    // holds its patch or not; without the variable the eject asks the API
+    // for the record of the patch. Beside a Maven build the run vendors
+    // the patch of the manifest for that build alone.
+    let hosted = FOO_BLOCK
+        .replace("local_repository", "http_file")
+        .replace(":local.bzl", ":http.bzl")
+        .replace(
+            &format!("    path = \"{FOO_UNIT}\",\n"),
+            &format!(
+                "    downloaded_file_path = \"v1/org/example/foo/1.0/foo-1.0.jar\",\n    sha256 = \
+                 \"{}\",\n    urls = [\"https://patch.socket.dev/patch-registry/maven/token/\
+                 {FOO_UUID}/maven2/org/example/foo/1.0-socket.1d3c1fd2/foo-1.0-socket.1d3c1fd2\
+                 .jar\"],\n",
+                "a".repeat(64)
+            ),
+        );
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let api = runtime.block_on(wiremock::MockServer::start());
+    let records = api.uri();
+    for (alone, in_manifest) in [(true, true), (true, false), (false, true)] {
+        let pinned = || {
+            remake(root, alone);
+            write(
+                root,
+                "proj/MODULE.bazel",
+                format!("{HUB_MODULE}\n{hosted}").as_bytes(),
+            );
+            let manifest = root.join("proj/.socket/manifest.json");
+            let patches = std::fs::read(&manifest).unwrap();
+            let patches: serde_json::Value = serde_json::from_slice(&patches).unwrap();
+            let mut view = patches["patches"][purl("foo")].clone();
+            view["purl"] = purl("foo").into();
+            view["publishedAt"] = view["exportedAt"].clone();
+            let record = wiremock::ResponseTemplate::new(200).set_body_json(view);
+            let asked =
+                wiremock::Mock::given(wiremock::matchers::method("GET")).respond_with(record);
+            runtime.block_on(api.reset());
+            runtime.block_on(asked.mount(&api));
+            if !in_manifest {
+                std::fs::write(&manifest, "{\"patches\": {}}").unwrap();
+            }
+            // The entry is a hosted pin of the jar.
+            let (_, list) = socket(root, &["list"]);
+            let pin = |event: &&serde_json::Value| {
+                event["purl"] == purl("foo") && event["details"]["mode"] == "hosted"
+            };
+            let pins = list["events"].as_array().unwrap().iter().filter(pin);
+            let files: Vec<_> = pins.map(|pin| &pin["details"]["lockfiles"]).collect();
+            assert_eq!(files, [&serde_json::json!(["MODULE.bazel"])], "{list}");
+        };
+        let args = ["vendor", "--proxy-url", &records];
+        let (without, _) = three(&pinned, &args, true);
+        let code = Some(i32::from(alone && in_manifest));
+        assert_eq!(without.0, code, "{alone} {in_manifest}: {without:?}");
+    }
+}
+
+/// What a run without the switch wrote for a hub is seen and undone with
+/// `SOCKET_NO_BAZEL=1`, all of it: the entry of the block, the directory
+/// of the jar, its pair of `.bazelignore` and the ledger entry, in a
+/// checkout only Bazel builds and beside a Maven build. `list`, `vex`,
+/// the audit and `repair` say what they say without the variable, also of
+/// an entry whose jar the hub's lock no longer pins; `repair` puts a
+/// directory that was lost whole back where its jar is the vendored
+/// artifact; and each undo says what it says without the variable and
+/// leaves the checkout as it was before the run, to the byte.
+///
+/// Beside a Maven build the hub's directory is a copy that only a run
+/// without the variable writes: one that was lost is named by the audit,
+/// stays lost through a `vendor` with the variable, and the undo still
+/// takes its entry out.
+#[test]
+fn the_switch_leaves_what_a_vendored_run_wrote_for_a_hub_seen_and_undone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let foo = purl("foo");
+    let vex = root.join("vex.json");
+    let document = [
+        "vex",
+        "-O",
+        vex.to_str().unwrap(),
+        "--product",
+        "pkg:generic/x@1",
+    ];
+    for alone in [true, false] {
+        // The checkout before a run without the switch, and after it.
+        let vendor = || {
+            remake(root, alone);
+            let _ = std::fs::remove_file(&vex);
+            let pristine = snapshot(root);
+            ok(root, &["vendor"]);
+            (pristine, snapshot(root))
+        };
+        // The hub's lock, moved on to another version of the jar.
+        let moved = || {
+            let lock = root.join("proj/maven_install.json");
+            let text = std::fs::read_to_string(&lock).unwrap();
+            let bumped = text.replace("\"version\": \"1.0\"", "\"version\": \"1.1\"");
+            assert_ne!(bumped, text);
+            std::fs::write(&lock, bumped).unwrap();
+            text
+        };
+        let (pristine, vendored) = vendor();
+        let written = [
+            ".bazelignore".to_string(),
+            ".socket/vendor/state.json".to_string(),
+            format!("{FOO_UNIT}/REPO.bazel"),
+            format!("{FOO_UNIT}/file/foo-1.0.jar"),
+        ];
+        for file in &written {
+            let (before, after) = (pristine.get(file), vendored.get(file));
+            assert!(before.is_none() && after.is_some(), "{alone}: {file}");
+        }
+        let block = format!("{HUB_MODULE}\n{FOO_BLOCK}");
+        let held = vendored["MODULE.bazel"].as_deref();
+        assert_eq!(held, Some(block.as_bytes()), "{alone}");
+
+        // Seen: each command says what it says without the variable, and
+        // changes nothing. `repair` has nothing to do and names no patch.
+        let seen: [&[&str]; 4] = [&["list"], &document, &["vendor", "--check"], &["repair"]];
+        for args in seen {
+            let without = said(root, args, true, false);
+            assert_eq!(snapshot(root), vendored, "{alone} {args:?}");
+            vendor();
+            let with = said(root, args, true, true);
+            assert_eq!(with, without, "{alone} {args:?}");
+            assert_eq!(with.0, Some(0), "{alone} {args:?}: {with:?}");
+            let named = with.1.contains(&foo);
+            assert_eq!(named, args != ["repair"], "{alone} {args:?}: {with:?}");
+            assert_eq!(snapshot(root), vendored, "{alone} {args:?}");
+        }
+        // The same of an entry whose jar the lock no longer pins, at which
+        // Bazel stops: the audit names the undo, and the patch of a hub
+        // alone is not attested.
+        let stale: [(&[&str], bool); 4] = [
+            (&["list"], false),
+            (&document, alone),
+            (&["vendor", "--check"], true),
+            (&["repair"], false),
+        ];
+        for (args, fails) in stale {
+            moved();
+            let without = said(root, args, true, false);
+            vendor();
+            moved();
+            let with = said(root, args, true, true);
+            assert_eq!(with, without, "{alone} {args:?}");
+            assert_eq!(with.0, Some(i32::from(fails)), "{alone} {args:?}: {with:?}");
+            vendor();
+        }
+        // A directory that was lost whole, where its jar is the vendored
+        // artifact: `repair` puts every file of it back. Beside a Maven
+        // build no run with the variable does: the audit names it, and the
+        // undo takes its entry out.
+        std::fs::remove_dir_all(root.join("proj").join(FOO_UNIT)).unwrap();
+        if alone {
+            let repaired = said(root, &["repair"], true, true);
+            assert_eq!(repaired.0, Some(0), "{repaired:?}");
+            assert_eq!(snapshot(root), vendored, "{repaired:?}");
+        } else {
+            let lost = snapshot(root);
+            let audit = said(root, &["vendor", "--check"], true, true);
+            assert_eq!(audit.0, Some(1), "{audit:?}");
+            assert!(audit.1.contains(FOO_UNIT), "{audit:?}");
+            let again = said(root, &["vendor"], true, true);
+            assert_eq!((again.0, snapshot(root)), (Some(0), lost), "{again:?}");
+            let undone = said(root, &["vendor", "--revert"], true, true);
+            assert_eq!((undone.0, snapshot(root)), (Some(0), pristine.clone()));
+        }
+
+        // Undone, by each command.
+        let undos: [&[&str]; 3] = [
+            &["vendor", "--revert"],
+            &["rollback", &foo],
+            &["remove", &foo],
+        ];
+        for (undo, stale) in undos
+            .iter()
+            .flat_map(|undo| [(*undo, false), (*undo, true)])
+        {
+            // Each run of the undo, in the checkout as a run without the
+            // switch left it, with the lock moved on for the run when
+            // `stale` is set.
+            let undone = |off: bool| {
+                vendor();
+                let lock = stale.then(moved);
+                let ran = said(root, undo, true, off);
+                if let Some(lock) = lock {
+                    write(root, "proj/maven_install.json", lock.as_bytes());
+                }
+                assert_eq!(
+                    snapshot(root),
+                    pristine,
+                    "{alone} {undo:?} {stale}: {ran:?}"
+                );
+                ran
+            };
+            let (without, with) = (undone(false), undone(true));
+            assert_eq!(with, without, "{alone} {undo:?} {stale}");
+            assert_eq!(with.0, Some(0), "{alone} {undo:?} {stale}: {with:?}");
+        }
+    }
+}

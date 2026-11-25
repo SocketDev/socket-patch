@@ -1908,8 +1908,8 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
     }
 
     /// A FIFO planted as `poetry.lock` (or `pyproject.toml`) must not wedge
-    /// the load: `detect_pypi_flavor`'s routing probes are metadata-only (a
-    /// FIFO stats fine, and the poetry route short-circuits before
+    /// the load: `detect_pypi_flavor`'s routing probes are metadata-only or
+    /// read regular files only (a FIFO stats fine, and the poetry route short-circuits before
     /// detection's own guarded pyproject read), so the backend's raw
     /// `read_to_string` open(2) is the FIRST open — it waits for a writer
     /// that never comes, wedging every poetry-project vendor run
