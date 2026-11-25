@@ -4577,7 +4577,6 @@ pub(crate) async fn vendor_records_reusing(
                 total,
             ));
             // Where this candidate's own outcome lands among the events.
-            let outcome_at = env.events.len();
             let outcome = dispatch_vendor_one(
                 candidate,
                 candidate_source,
@@ -4612,6 +4611,10 @@ pub(crate) async fn vendor_records_reusing(
 
             let outcome =
                 keep_older_vendored_patch(outcome, &state, candidate, &record.uuid, common).await;
+            // Where the candidate's outcome event goes: each arm below
+            // records it first. Advisories about the candidate may sit
+            // before it (a takeover's restore is said above) and after it.
+            let outcome_event_at = env.events.len();
             match outcome {
                 None => {
                     env.record(
@@ -4778,10 +4781,11 @@ pub(crate) async fn vendor_records_reusing(
             // candidate itself (the patch the directory is named after)
             // keeps the event only when no platform gem has a patch here.
             let members = gem_units.members(candidate, records);
-            let lead_at = env.events[outcome_at..]
-                .iter()
-                .position(|event| event.purl.as_deref() == Some(candidate.as_str()))
-                .map(|at| outcome_at + at);
+            let lead_at = env
+                .events
+                .get(outcome_event_at)
+                .filter(|event| event.purl.as_deref() == Some(candidate.as_str()))
+                .map(|_| outcome_event_at);
             if let (Some(at), false) = (lead_at, members.is_empty()) {
                 let outcome = env.events[at].clone();
                 for (nth, (member, uuid)) in members.into_iter().enumerate() {

@@ -7377,6 +7377,38 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
         let (code, stdout, stderr) =
             run_socket_env(&fx.proj, &argv, &[("SOCKET_RUBYGEMS_URL", &upstream)]);
         assert_eq!(code, 0, "takeover:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        // The takeover says once that it restored the hosted pin, and
+        // reports the vendoring per platform gem, each under its own
+        // patch: the restore's advisory names the same purl and comes
+        // first, and is not what each platform gem is reported as.
+        let taken: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("takeover --json is not JSON: {e}\nstdout:\n{stdout}"));
+        let events = |code: Option<&str>, action: &str| -> Vec<(String, String)> {
+            let mut found: Vec<(String, String)> = taken["events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|e| e["action"] == action && e["details"]["mode"] == "vendored")
+                .filter(|e| code.is_none_or(|code| e["errorCode"] == code))
+                .map(|e| {
+                    let field = |key: &str| e[key].as_str().unwrap_or_default().to_string();
+                    (field("purl"), field("uuid"))
+                })
+                .collect();
+            found.sort();
+            found
+        };
+        let mut vendored: Vec<(String, String)> = platforms
+            .iter()
+            .map(|p| (format!("{PURL}?platform={p}"), platform_uuid(p)))
+            .collect();
+        vendored.sort();
+        assert_eq!(events(None, "applied"), vendored, "{taken}");
+        assert_eq!(
+            events(Some("vendor_takeover_reverted_redirect"), "skipped").len(),
+            1,
+            "the restore is said once: {taken}"
+        );
         // Each platform's tree is recorded with its own patch.
         let ledger: serde_json::Value = serde_json::from_slice(
             &std::fs::read(fx.proj.join(".socket/vendor/state.json")).expect("vendor ledger"),
