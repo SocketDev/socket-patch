@@ -1034,7 +1034,8 @@ mod tests {
         let mut offers = offers_from_results(&results, true);
         let lock = lock_of(&PLATFORM_ONLY, &offers).await;
         let classes = lock.choose(&mut offers, &references, &recorded);
-        assert_eq!(classes.len(), 2);
+        // Both builds, and the source patch that lends its registry.
+        assert_eq!(classes.len(), 3);
         assert!(classes.values().all(|class| *class == Recorded::Same));
 
         // A second fix, as severe, with as many advisories, and older.
