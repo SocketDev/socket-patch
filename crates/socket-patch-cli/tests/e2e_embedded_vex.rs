@@ -176,7 +176,12 @@ fn assert_not_affected_statement(
     );
 
     let products = stmt["products"].as_array().expect("statement.products");
-    assert_eq!(products.len(), 1, "exactly one product per statement");
+    assert_eq!(
+        products.len(),
+        2,
+        "the project, then the patched package as a product of its own"
+    );
+    assert_eq!(products[1]["@id"], expect_subcomponent);
     assert_eq!(
         products[0]["@id"], expect_product,
         "product comes from --vex-product"

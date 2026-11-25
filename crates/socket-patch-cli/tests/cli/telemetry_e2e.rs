@@ -1610,6 +1610,152 @@ async fn apply_reports_the_patches_it_applied() {
     assert_eq!(only_patch(again)["code"], "already_patched");
 }
 
+/// Run `apply` on a project `prepare` broke, expect it to fail, and return
+/// the one `patch_apply_failed` event and the `--json` envelope.
+async fn failed_apply(
+    prepare: impl FnOnce(&Path),
+    mock: &MockServer,
+) -> (serde_json::Value, serde_json::Value) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_agent_project(tmp.path(), ORIGINAL);
+    prepare(tmp.path());
+
+    let (code, stdout, stderr) = run_cmd(tmp.path(), &mock.uri(), "apply", &[], &[]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let envelope: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("--json output ({e}):\n{stdout}"));
+
+    let bodies = telemetry_bodies(mock).await;
+    let failed: Vec<&serde_json::Value> = bodies
+        .iter()
+        .filter(|b| b["event_type"] == "patch_apply_failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "{bodies:#?}");
+    (failed[0].clone(), envelope)
+}
+
+/// The failed event of a run whose one patch failed with `cause`: the
+/// patch is named under that code, the run counts it, and the envelope's
+/// failed event carries the same cause beside the generic `apply_failed`.
+fn assert_failed_with(event: &serde_json::Value, envelope: &serde_json::Value, cause: &str) {
+    assert_eq!(event["metadata"]["error_code"], "apply_failed", "{event:#}");
+    assert_eq!(
+        only_patch(event),
+        &serde_json::json!({
+            "uuid": PATCHED_UUID,
+            "ecosystem": "npm",
+            "mode": "agent",
+            "outcome": "failed",
+            "code": cause,
+        })
+    );
+    assert_eq!(
+        event["metadata"]["failure_codes"],
+        serde_json::json!({ cause: 1 }),
+        "{event:#}"
+    );
+    assert!(!event.to_string().contains("tpkg"), "{event:#}");
+
+    let failed: Vec<&serde_json::Value> = envelope["events"]
+        .as_array()
+        .expect("events[]")
+        .iter()
+        .filter(|e| e["action"] == "failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "{envelope:#}");
+    assert_eq!(failed[0]["errorCode"], "apply_failed", "{envelope:#}");
+    assert_eq!(failed[0]["cause"], cause, "{envelope:#}");
+}
+
+/// A file that matches neither side of the patch fails it as
+/// `hash_mismatch`, not the bare `apply_failed`.
+#[tokio::test]
+async fn a_hash_mismatch_is_reported_as_such() {
+    let mock = telemetry_only_mock().await;
+    let (event, envelope) = failed_apply(
+        |root| std::fs::write(root.join("node_modules/tpkg/index.js"), b"edited\n").unwrap(),
+        &mock,
+    )
+    .await;
+    assert_failed_with(&event, &envelope, "hash_mismatch");
+}
+
+/// A patched file missing from the installed copy: `file_not_found`.
+#[tokio::test]
+async fn a_missing_file_is_reported_as_such() {
+    let mock = telemetry_only_mock().await;
+    let (event, envelope) = failed_apply(
+        |root| std::fs::remove_file(root.join("node_modules/tpkg/index.js")).unwrap(),
+        &mock,
+    )
+    .await;
+    assert_failed_with(&event, &envelope, "file_not_found");
+}
+
+/// A blob whose bytes do not hash to its name: `blob_corrupt`.
+#[tokio::test]
+async fn a_corrupt_blob_is_reported_as_such() {
+    let mock = telemetry_only_mock().await;
+    let (event, envelope) = failed_apply(
+        |root| {
+            let blob = root
+                .join(".socket/blobs")
+                .join(crate::common::git_sha256(PATCHED));
+            std::fs::write(blob, b"not the patched bytes\n").unwrap();
+        },
+        &mock,
+    )
+    .await;
+    assert_failed_with(&event, &envelope, "blob_corrupt");
+}
+
+/// A manifest patch whose package is not installed (and that no lockfile
+/// names) fails the run as `package_not_installed`, though no package
+/// result exists for it.
+#[tokio::test]
+async fn a_patch_whose_package_is_not_installed_is_named() {
+    let mock = telemetry_only_mock().await;
+    let (event, _envelope) = failed_apply(
+        |root| std::fs::remove_dir_all(root.join("node_modules/tpkg")).unwrap(),
+        &mock,
+    )
+    .await;
+    assert_eq!(event["metadata"]["error_code"], "apply_failed", "{event:#}");
+    assert_eq!(only_patch(&event)["outcome"], "failed", "{event:#}");
+    assert_eq!(
+        only_patch(&event)["code"],
+        "package_not_installed",
+        "{event:#}"
+    );
+    assert_eq!(
+        event["metadata"]["failure_codes"],
+        serde_json::json!({ "package_not_installed": 1 }),
+        "{event:#}"
+    );
+}
+
+/// A run that could not get the patched content (the blob is gone and the
+/// download fails) reports the stage that stopped it as its `error_code`.
+#[tokio::test]
+async fn a_failed_download_is_the_runs_error_code() {
+    let mock = telemetry_only_mock().await;
+    let (event, _envelope) = failed_apply(
+        |root| {
+            std::fs::remove_file(
+                root.join(".socket/blobs")
+                    .join(crate::common::git_sha256(PATCHED)),
+            )
+            .unwrap()
+        },
+        &mock,
+    )
+    .await;
+    assert_eq!(
+        event["metadata"]["error_code"], "sources_download_failed",
+        "{event:#}"
+    );
+}
+
 /// A rollback names the patch it rolled back, and says whether the user
 /// asked for that patch or rolled the whole project back.
 #[tokio::test]

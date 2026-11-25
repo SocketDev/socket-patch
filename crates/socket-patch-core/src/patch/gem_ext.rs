@@ -5389,13 +5389,16 @@ fn untouched_result(package_key: &str, pkg_path: &Path, error: Option<String>) -
         applied_via: HashMap::new(),
         error,
         sidecar: None,
+        cause: None,
     }
 }
 
-fn refusal(package_key: &str, pkg_path: &Path, code: &str, detail: String) -> GemApplied {
+fn refusal(package_key: &str, pkg_path: &Path, code: &'static str, detail: String) -> GemApplied {
+    let mut result = untouched_result(package_key, pkg_path, Some(format!("{code}: {detail}")));
+    result.cause = Some(crate::patch::apply::ApplyFailureCause::Coded(code));
     GemApplied {
         caveat: None,
-        result: untouched_result(package_key, pkg_path, Some(format!("{code}: {detail}"))),
+        result,
         warning: Some((code.to_string(), detail)),
     }
 }
@@ -5520,7 +5523,7 @@ struct Job<'a> {
 }
 
 impl Job<'_> {
-    fn refuse(&self, code: &str, detail: String) -> GemApplied {
+    fn refuse(&self, code: &'static str, detail: String) -> GemApplied {
         refusal(self.package_key, self.pkg_path, code, detail)
     }
 
@@ -5638,6 +5641,9 @@ impl Job<'_> {
     ) -> GemApplied {
         revert_sources(self.pkg_path, originals, &result.files_patched).await;
         result.success = false;
+        result.cause = Some(crate::patch::apply::ApplyFailureCause::Coded(
+            BUILD_FAILED_CODE,
+        ));
         result.files_patched.clear();
         result.applied_via.clear();
         // What the written sources were advised about (`bundle install

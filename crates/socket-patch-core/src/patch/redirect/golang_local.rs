@@ -480,6 +480,7 @@ pub async fn apply_go_redirect<'a>(
         go_mod_edit::ensure_replace_entry(project_root, module, version, base_rel, false).await
     {
         result.success = false;
+        result.cause = Some(crate::patch::apply::ApplyFailureCause::WriteFailed);
         result.error = Some(format!("failed to update go.mod: {e}"));
         return result;
     }
@@ -957,6 +958,7 @@ async fn repair_root_go_mod_mirror(
         go_mod_edit::ensure_replace_entry(project_root, module, version, base_rel, false).await
     {
         result.success = false;
+        result.cause = Some(crate::patch::apply::ApplyFailureCause::WriteFailed);
         result.error = Some(format!("failed to update go.mod: {e}"));
     }
 }
