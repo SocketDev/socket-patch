@@ -25,10 +25,9 @@
 //! ```
 //!
 //! Unix only: Windows checkouts convert some fixtures' line endings (only
-//! `redirect/**`, `pdm-native/*.lock`, `pnpm-hosted/**` and `vlt-locks/**`
-//! among the corpus trees are `-text`),
-//! and I/O error texts differ, so the snapshot would describe different
-//! inputs. The Unix legs (Linux + macOS) pin the behavior.
+//! the corpus trees that `.gitattributes` marks `-text` are checked out as
+//! committed), and I/O error texts differ, so the snapshot would describe
+//! different inputs. The Unix legs (Linux + macOS) pin the behavior.
 //!
 //! [`discover_patched_refs`]: crate::vex::discover::discover_patched_refs
 #![cfg(not(windows))]

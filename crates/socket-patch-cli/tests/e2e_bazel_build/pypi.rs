@@ -1626,6 +1626,51 @@ fn a_download_cache_is_declined_where_the_workspace_does_not_show_that_it_works(
     assert_eq!(with.fetched(), 0);
 }
 
+/// Without a Bazel: the checkout of
+/// [`vendored_mode_commits_a_download_cache_where_the_workspace_shows_it_works`]
+/// with a `WORKSPACE` file that a move to Bzlmod left behind. Bazel 9
+/// never reads such a file: where the checkout names a release of 9, the
+/// download cache is written as it is without the file. Where it names an
+/// older release, or none, a Bazel that reads the file may build the
+/// checkout: the package is declined, the refusal names the file, and no
+/// wheel is fetched.
+#[test]
+fn a_workspace_file_stands_against_a_download_cache_unless_the_checkout_names_bazel_9() {
+    let with = Vendoring::new();
+    let left_behind = "local_repository(name = \"x\", path = \"x\")\n";
+    let kept = |release: Option<&str>| {
+        let cell = checkout(&with);
+        cell.write(LOCK, bazel_lock(28, "2.5.0-rc4"));
+        cell.write("WORKSPACE", left_behind);
+        if let Some(release) = release {
+            cell.write(".bazelversion", format!("{release}\n"));
+        }
+        cell
+    };
+    for release in [Some("8.8.2"), Some("7.7.2"), None] {
+        let cell = kept(release);
+        let names = refusal_names(&cell);
+        let package = Declined {
+            purl: PURL,
+            code: DECLINED,
+            names: &[
+                &names[0],
+                "is written only where the checkout shows",
+                "a WORKSPACE file defines repositories beside MODULE.bazel",
+            ],
+        };
+        let before = cell.tree();
+        cell.declined(&with.run(&cell, &VENDORED), &package, 1, "failed", &before);
+    }
+    assert_eq!(with.fetched(), 0);
+    for (release, fetched) in [("9.3.2", 1), ("9.0.0", 2)] {
+        let cell = kept(Some(release));
+        let before = cell.tree();
+        caches(&cell, &with, &before);
+        assert_eq!(with.fetched(), fetched, "{release}");
+    }
+}
+
 /// Without a Bazel: a run that fails after it fetched the wheel keeps a
 /// copy that an earlier run committed. The pin of the registry is back in
 /// `requirements.txt`, as after a relock, so the run vendors the package
@@ -1799,6 +1844,122 @@ fn vendored_mode_goes_on_where_no_hub_reads_the_requirements() {
     };
     let before = cell.tree();
     cell.declined(&with.run(&cell, &VENDORED), &package, 1, "failed", &before);
+}
+
+/// Without a Bazel: a `WORKSPACE` file that a migration left behind still
+/// hands `requirements.txt` to the ruleset's older rule, beside a
+/// `MODULE.bazel` whose hub reads another file. Bazel 9 never reads a
+/// `WORKSPACE` file, so where the checkout names a release of 9 or later
+/// the package is vendored as it is without that file. Where it names an
+/// older release, none, or one that is no release, a Bazel that reads the
+/// file may build the checkout: the package is declined, and the refusal
+/// names the call of the `WORKSPACE` file.
+#[test]
+fn a_workspace_file_counts_unless_the_checkout_names_bazel_9_or_later() {
+    let with = Vendoring::new();
+    let own = format!("\"//:{REQUIREMENTS}\"");
+    let legacy = format!("pip_parse(\n    name = \"pypi\",\n    requirements_lock = {own},\n)\n");
+    // The fixture's checkout with a hub that reads another file, the
+    // `WORKSPACE` file where it is `kept`, and what names the Bazel
+    // release.
+    let retained = |release: Option<&str>, kept: bool| {
+        let cell = checkout(&with);
+        let module = String::from_utf8(cell.tree()["MODULE.bazel"].clone()).expect("a text file");
+        let other = module.replace(&own, "\"//:requirements_lock.txt\"");
+        assert_ne!(other, module);
+        cell.write("MODULE.bazel", other);
+        if kept {
+            cell.write("WORKSPACE", &legacy);
+        }
+        if let Some(release) = release {
+            cell.write(".bazelversion", format!("{release}\n"));
+        }
+        cell
+    };
+    // A run that vendors the wheel: the files it writes, and the
+    // requirements it leaves.
+    let vendors = |cell: &Cell| {
+        let before = cell.tree();
+        let scan = with.run(cell, &VENDORED);
+        assert_eq!(scan.code, 0, "{}", scan.dump);
+        assert_eq!(scan.envelope["summary"]["applied"], 1, "{}", scan.dump);
+        let after = cell.tree();
+        (changed(&before, &after), after[REQUIREMENTS].clone())
+    };
+    let written = vendors(&retained(Some("9.3.2"), false));
+    let line = String::from_utf8_lossy(&written.1);
+    assert!(line.contains("./.socket/vendor/pypi/"), "{line}");
+    for release in ["9.3.2", "9.0.0", "10.0.0"] {
+        let kept = vendors(&retained(Some(release), true));
+        assert!(kept == written, "{release}");
+    }
+    let names = format!("names {REQUIREMENTS}; ");
+    let package = Declined {
+        purl: PURL,
+        code: DECLINED,
+        names: &["`pip_parse` (WORKSPACE:1)", &names],
+    };
+    for release in [Some("7.7.2"), Some("8.8.2"), None, Some("latest")] {
+        let cell = retained(release, true);
+        let before = cell.tree();
+        cell.declined(&with.run(&cell, &VENDORED), &package, 1, "failed", &before);
+    }
+}
+
+/// Without a Bazel: with `SOCKET_NO_BAZEL=1` vendored mode vendors the
+/// package whose requirements the hub reads, as it does in the same
+/// checkout without its `MODULE.bazel`, to the byte. Without the variable
+/// it declines the package there.
+#[test]
+fn the_switch_makes_vendored_mode_the_one_of_a_checkout_without_bazel() {
+    let with = Vendoring::new();
+    let cell = checkout(&with);
+    let origin = with.standin.origin();
+    let json_api = format!("{origin}/{INDEX}/pypi");
+    let env = [
+        ("SOCKET_PATCH_SERVER_URL", origin.as_str()),
+        ("SOCKET_PYPI_JSON_API", json_api.as_str()),
+    ];
+    let declined = cell.off_is_without_bazel(&origin, &VENDORED, &env, &["MODULE.bazel"]);
+    assert_eq!(declined[0]["code"], 1, "{declined:#}");
+}
+
+/// Without a Bazel: the switch is for the download cache as well. In the
+/// checkout where vendored mode commits one, `SOCKET_NO_BAZEL=1` makes it
+/// vendor the package as it does in the same checkout without its
+/// `MODULE.bazel` and the lock a build wrote, to the byte: by a path line
+/// of `requirements.txt`, with the `.bazelrc` as it was. Without the
+/// variable the run commits the download cache there, with its line.
+#[test]
+fn the_switch_makes_a_download_cache_the_vendoring_of_a_checkout_without_bazel() {
+    let with = Vendoring::new();
+    let cell = checkout(&with);
+    cell.write(LOCK, bazel_lock(28, "2.5.0-rc4"));
+    let rc = String::from_utf8(cell.tree()[".bazelrc"].clone()).expect("a text file");
+    let origin = with.standin.origin();
+    let json_api = format!("{origin}/{INDEX}/pypi");
+    let env = [
+        ("SOCKET_PATCH_SERVER_URL", origin.as_str()),
+        ("SOCKET_PYPI_JSON_API", json_api.as_str()),
+    ];
+    let bazel = ["MODULE.bazel", LOCK];
+    let (plain, cached) = cell.without_and_beside(&origin, &VENDORED, &env, &bazel);
+    let dir = format!(".socket/vendor/pypi/{}", with.uuid);
+    for (run, line, lines) in [
+        (&plain, format!("./{dir}/"), rc.clone()),
+        (
+            &cached,
+            format!("{NAME} @ {}{}", with.origin, with.route),
+            format!("{rc}{CACHE_COMMENT}\ncommon --distdir={dir}\n"),
+        ),
+    ] {
+        for form in [&run[0], &run[1]] {
+            assert_eq!(form["code"], 0, "{form:#}");
+            let pinned = form["files"][REQUIREMENTS].as_str().expect(REQUIREMENTS);
+            assert!(pinned.contains(&line), "{line}: {form:#}");
+            assert_eq!(form["files"][".bazelrc"], lines, "{form:#}");
+        }
+    }
 }
 
 /// Without a Bazel: the fixture's directories are those of its table, and

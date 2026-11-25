@@ -5546,6 +5546,131 @@ async fn gem_hosted_unwind_restores_an_install_whose_home_cache_was_pruned() {
     }
 }
 
+/// #2230 against a real Bundler: the project's `Gemfile` names a private
+/// gem server as its source, so the lock (with `CHECKSUMS`) resolves the gem
+/// from that remote, not rubygems.org. The unwind refuses to guess the
+/// upstream sha256 and names `SOCKET_RUBYGEMS_URL`; with the setting naming
+/// that server it reads the checksum from the server's compact index, hands
+/// the pre-scan pair back byte for byte and puts the upstream gem back, so
+/// `bundle install` and `bundle pristine` both pass on the restored lock.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (CHECKSUMS lock: >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_unwind_restores_a_gem_from_a_private_gem_server() {
+    let Some(fx) = redirect_scanned_project(
+        "mirror-unwind",
+        Spelling::Gemfile,
+        true,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    let api = fx._server.uri();
+    let upstream = format!("{api}/upstream");
+    assert!(
+        String::from_utf8_lossy(&fx.pristine_lock).contains(&format!("remote: {upstream}/")),
+        "premise: the lock resolves the gem from the gem server"
+    );
+    for command in ["rollback", "remove"] {
+        let dir = stage_fresh_checkout(&fx, &format!("mirror-{command}"));
+        let install = bundle(&dir, &["install"]);
+        assert!(
+            install.status.success(),
+            "{command}: hosted install:\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        let installed = fresh_installed_lib(&dir, &format!("{DEP}-{DEP_VERSION}"), "vuln_gem.rb");
+        assert_eq!(
+            std::fs::read(&installed).unwrap(),
+            fx.patched,
+            "{command}: the patched gem is installed (test premise)"
+        );
+        let pair = || {
+            (
+                std::fs::read(dir.join(fx.gemfile_name)).unwrap(),
+                std::fs::read(dir.join(fx.lock_name)).unwrap(),
+            )
+        };
+        let hosted = pair();
+
+        let cwd = dir.to_str().expect("utf8 tmp path");
+        let mut argv = vec![command, PURL, "--json", "--cwd", cwd];
+        if command == "remove" {
+            argv.push("--yes");
+        }
+        argv.extend([
+            "--api-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--patch-server-url",
+            &api,
+        ]);
+        // The registry setting names another server: refused, nothing
+        // changed, and the refusal names the setting that works.
+        let elsewhere = format!("{api}/elsewhere");
+        let (code, stdout, stderr) =
+            run_socket_env(&dir, &argv, &[("SOCKET_RUBYGEMS_URL", &elsewhere)]);
+        assert_ne!(code, 0, "{command}:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            format!("{stdout}{stderr}").contains(&format!("`SOCKET_RUBYGEMS_URL={upstream}`")),
+            "{command}: the refusal names the setting:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            pair() == hosted,
+            "{command}: a refused unwind changes nothing"
+        );
+
+        let (code, stdout, stderr) =
+            run_socket_env(&dir, &argv, &[("SOCKET_RUBYGEMS_URL", &upstream)]);
+        let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!("{command}: not JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+        });
+        assert_eq!(code, 0, "{command}: {env}\nstderr:\n{stderr}");
+        let (gemfile, lock) = pair();
+        assert_eq!(
+            String::from_utf8_lossy(&gemfile),
+            String::from_utf8_lossy(&fx.pristine_gemfile),
+            "{command}: the Gemfile is the pre-scan one"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&lock),
+            String::from_utf8_lossy(&fx.pristine_lock),
+            "{command}: the lock is the pre-scan one"
+        );
+        assert_eq!(
+            std::fs::read(&installed).unwrap(),
+            orig_lib().into_bytes(),
+            "{command}: the installed gem is the upstream one again: {env}"
+        );
+        assert!(
+            !env.to_string().contains("upstream_gem_stale_install"),
+            "{command}: {env}"
+        );
+        // The restored project installs and reinstalls as it is.
+        for args in [&["install"][..], &["pristine"][..]] {
+            let run = bundle(&dir, args);
+            assert!(
+                run.status.success(),
+                "{command}: bundle {args:?} after the unwind:\n{}\n{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert_eq!(
+                std::fs::read(&installed).unwrap(),
+                orig_lib().into_bytes(),
+                "{command}: bundle {args:?} keeps the upstream bytes"
+            );
+        }
+    }
+}
+
 /// A warm project: the pre-redirect pair installed from the mock upstream
 /// into the project's `vendor/bundle`, as on a developer machine or a CI
 /// job with a restored bundle cache.

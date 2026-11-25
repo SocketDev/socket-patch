@@ -245,6 +245,16 @@ pub(crate) async fn bare_scan_looks_below(common: &crate::args::GlobalArgs) -> b
     )
 }
 
+/// Whether a bare `scan` at `--cwd` runs in hosted mode: the project's own
+/// state records no other mode ([`mode_from_project_state`]). Only a
+/// hosted scan replaces the stale installed copy of a hosted gem.
+pub(crate) async fn bare_scan_is_hosted(common: &crate::args::GlobalArgs) -> bool {
+    matches!(
+        mode_from_project_state(common).await,
+        Ok(scan::ScanMode::Hosted)
+    )
+}
+
 /// The mode a `scan`/`get` run with no `--mode` uses for the project
 /// (CLI_CONTRACT.md, Mode resolution): the mode the project's own patch
 /// state already records, so a bare run never converts the project to

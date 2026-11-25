@@ -25,10 +25,12 @@
 //!    (`vendor_maven_version_not_selected`, a skip too);
 //! 7. a project in a Bazel workspace whose build would not find the
 //!    vendored copy ([`bazel_workspace_refusals`]), unless the user allowed
-//!    it ([`ALLOW_IN_BAZEL_ENV`]) or the lock already names the patch's
-//!    copy: any Composer project (`vendor_composer_bazel_workspace`), and a
-//!    PyPI or RubyGems project whose lock a hub of the workspace reads
-//!    (`vendor_pypi_bazel_hub`, `vendor_gem_bazel_hub`);
+//!    it ([`ALLOW_IN_BAZEL_ENV`]): any Composer project
+//!    (`vendor_composer_bazel_workspace`), unless the lock already names a
+//!    vendored copy in `packages` or in the package's section, and a PyPI
+//!    or RubyGems project whose lock a hub of the workspace reads
+//!    (`vendor_pypi_bazel_hub`, `vendor_gem_bazel_hub`), unless that lock
+//!    already names the patch's copy;
 //! 8. a Maven jar that only a rules_jvm_external hub of a Bazel workspace
 //!    builds and whose entry cannot be written there (the `maven_bazel_*`
 //!    codes of [`crate::bazel::maven`]), from the same dispatch.

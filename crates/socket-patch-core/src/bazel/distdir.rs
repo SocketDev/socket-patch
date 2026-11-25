@@ -30,10 +30,11 @@
 
 use std::path::PathBuf;
 
+use super::built::workspace_as_built;
 use super::ignore::{content, edited, settled, update, Kept};
 use super::maven::{asked, known_release};
 use super::rc::{declared_release, mentions, ModuleLock};
-use super::workspace::{disk, disk_up_to, Entry, Workspace};
+use super::workspace::{disk, disk_up_to, Entry};
 use super::BazelRoot;
 
 /// The warning code of a `.bazelrc` that [`sync`] could not update.
@@ -174,7 +175,9 @@ pub fn sync(root: &BazelRoot, dirs: &[String], add: bool) -> Result<Option<PathB
 /// that holds the pin. `Ok` when they show all of it:
 ///
 /// - the hub hands Bazel `lock` and no other file of `locks`, in calls
-///   that are read with certainty ([`super::built::alone`]);
+///   that are read with certainty ([`super::built::alone`]), and no
+///   `WORKSPACE` file that the Bazel of the checkout reads is there
+///   ([`workspace_as_built`]);
 /// - Bazel selected a release of [`RULESETS`], by what `MODULE.bazel.lock`
 ///   says it selected and the root module asks for, as the Maven lane
 ///   reads its ruleset's ([`known_release`]);
@@ -219,7 +222,7 @@ pub fn ready(root: &BazelRoot, lock: &str, locks: &[String]) -> Result<(), Strin
     }
     let view = disk(&root.dir);
     let view: &dyn Fn(&str) -> Entry = &view;
-    let workspace = Workspace::read(view);
+    let workspace = workspace_as_built(view);
     let read = |file: &str| super::built::lock_text(&root.dir, file);
     let hub = ("requirements_lock", lock);
     super::built::alone(&workspace, root, "pypi", hub, locks, &read)?;
@@ -623,6 +626,17 @@ use_repo(pip, "pip")
         // with a byte that is not UTF-8.
         let legacy = ("WORKSPACE", "pip_parse(name = \"pip\")\n");
         declined(&[("MODULE.bazel", MODULE), good, legacy], "WORKSPACE");
+        // Bazel 9 reads no `WORKSPACE` file: where the checkout names it,
+        // the file stands against nothing. An older release reads it.
+        let module = ("MODULE.bazel", MODULE);
+        for release in ["9.0.0", "9.3.2"] {
+            let files = [module, good, legacy, (".bazelversion", release)];
+            assert_eq!(asked_of(&files), Ok(()), "{release}");
+        }
+        for release in ["7.7.2", "8.8.2"] {
+            let files = [module, good, legacy, (".bazelversion", release)];
+            declined(&files, "WORKSPACE");
+        }
         let (_tmp, root) = checkout("", &[good], &[]);
         fs::write(
             root.dir.join("MODULE.bazel"),

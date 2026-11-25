@@ -1536,7 +1536,15 @@ impl JvmScope {
 
 /// Box the future `make` returns, constructing it inside this (non-async)
 /// frame so the caller's poll frame only ever holds the pointer.
-fn boxed<'a, T, F, Fut>(make: F) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>
+///
+/// `Box::pin(big(..))` written in an async fn builds the future as a
+/// temporary in that fn's poll frame first, and a debug build keeps the
+/// room for it. Here the temporary is in a frame that is gone before
+/// anything is polled: never inlined, or it would be the caller's again.
+#[inline(never)]
+pub(crate) fn boxed<'a, T, F, Fut>(
+    make: F,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = T> + 'a,

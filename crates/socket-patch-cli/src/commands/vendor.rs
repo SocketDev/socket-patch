@@ -7885,8 +7885,12 @@ mod scope_and_hint_tests {
     /// where it can: that file is no file of the pin it restores. A pin
     /// of that entry alone is ejected only where the hub is the project's
     /// one build, and is none of the pins of a project that Maven builds.
+    /// Whether a hub is a build is read with `SOCKET_NO_BAZEL` from the
+    /// environment, so the test holds it unset.
     #[test]
+    #[serial_test::serial]
     fn a_takeover_leaves_the_entry_of_a_bazel_hub() {
+        let _unset = crate::test_env::EnvGuard::unset(socket_patch_core::bazel::OFF_ENV);
         let pin = |purl: &str, files: &[&str]| HostedPin {
             purl: purl.to_string(),
             uuid: "1d3c1fd2-7b4e-4c1a-9f0e-2a3b4c5d6e7f".to_string(),

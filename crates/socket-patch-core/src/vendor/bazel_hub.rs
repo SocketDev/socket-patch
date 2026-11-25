@@ -256,6 +256,7 @@ async fn standing(
             file,
             line,
             lock,
+            ..
         }) => {
             let reads =
                 format!("`{call}` ({file}:{line}) of the Bazel workspace at {at} names {lock}");
@@ -571,8 +572,14 @@ ruby.bundle_fetch(name = "bundle", gemfile = "//api:Gemfile", gemfile_lock = "//
         };
         assert_eq!(pypi().await, Some(PYPI_CODE));
         let unwritten = hub.replace("\"//api:requirements.txt\"", "LOCK");
+        // A lock that resolves the package. One that resolves none is no
+        // install source beside a `requirements.txt`, which is then what
+        // the run writes: the package is declined as without the lock.
+        let resolved = "[[package]]\nname = \"x\"\nversion = \"1.0.0\"\n";
         for lock in ["poetry.lock", "pdm.lock"] {
             fs::write(api.join(lock), "").unwrap();
+            assert_eq!(pypi().await, Some(PYPI_CODE), "{lock}, with no package");
+            fs::write(api.join(lock), resolved).unwrap();
             assert_eq!(pypi().await, None, "{lock}");
             fs::write(root.join("MODULE.bazel"), &unwritten).unwrap();
             assert_eq!(pypi().await, None, "{lock}, a hub in doubt");

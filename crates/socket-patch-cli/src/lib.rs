@@ -74,6 +74,12 @@ pub use socket_patch_core::hosted::memory as hosted_memory;
 pub mod json_envelope;
 pub mod path_scope;
 pub(crate) mod telemetry_outcomes;
+/// The core unit tests' env guard, compiled into this crate's unit tests
+/// too: a test that judges by a variable holds it through the guard.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../socket-patch-core/src/test_env.rs"]
+pub(crate) mod test_env;
 pub mod ui;
 pub mod update_notifier;
 
