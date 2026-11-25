@@ -270,23 +270,46 @@ pub fn hub_refusals(
     candidates.iter().filter_map(refused).collect()
 }
 
+/// Whether this run judges a hub where it does not come by one through
+/// the lookup: not for a user who switched the Bazel support off
+/// ([`crate::bazel::off`]). With the switch no hub is a build of the
+/// project: a run ejects no entry, gives no hub a copy and says nothing of
+/// one. The undo, the audit and `repair` do not ask: what an earlier run
+/// wrote stays theirs to see.
+fn judges_hubs() -> bool {
+    !crate::bazel::off()
+}
+
+/// The entries of the block in `MODULE.bazel` at the project root, for a
+/// run that judges a hub by them: `None` where it judges none
+/// ([`judges_hubs`]), asked before anything is read. No entry where the
+/// file is not there or holds no block.
+async fn judged_block(project_root: &Path) -> Option<Vec<crate::bazel::maven::Patch>> {
+    use crate::bazel::maven::{entries, FILE};
+    if !judges_hubs() {
+        return None;
+    }
+    let text = read_regular_to_string(&project_root.join(FILE)).await;
+    Some(text.map(|text| entries(&text)).unwrap_or_default())
+}
+
 /// Whether the hub of a Bazel workspace is the only build of the project
 /// that vendored mode can patch: a hosted pin that only the block of
 /// `MODULE.bazel` wires is ejected there. Elsewhere an eject leaves it,
 /// and the hub's entry changes only with a run that vendors the same patch
-/// for the Maven or Gradle build.
+/// for the Maven or Gradle build. The caller holds the pins of the block,
+/// which are read whatever the switch says, so nothing is read here.
 pub fn hub_alone(project_root: &Path) -> bool {
-    detect_shape(project_root) == super::jvm::Shape::Other
+    judges_hubs() && detect_shape(project_root) == super::jvm::Shape::Other
 }
 
 /// Whether the block of `MODULE.bazel` at the project root holds the
 /// vendored entry of the patch `uuid`: a hub builds the jar committed in
-/// the directory of that patch.
+/// the directory of that patch, which a run gave it or kept for it.
 pub async fn hub_wired(project_root: &Path, uuid: &str) -> bool {
-    use crate::bazel::maven::{entries, FILE};
-    let text = read_regular_to_string(&project_root.join(FILE)).await;
     let ours = |patch: &crate::bazel::maven::Patch| patch.uuid == uuid && patch.unit().is_some();
-    text.is_ok_and(|text| entries(&text).iter().any(ours))
+    let block = judged_block(project_root).await;
+    block.is_some_and(|block| block.iter().any(ours))
 }
 
 /// What the refusal of `purl` in a project without a JVM build ends with
@@ -294,10 +317,9 @@ pub async fn hub_wired(project_root: &Path, uuid: &str) -> bool {
 /// hub builds the jar at that version any more, so Bazel stops at the
 /// entry, and the undo is what takes it out.
 async fn stale_hub_entry(project_root: &Path, purl: &str) -> String {
-    use crate::bazel::maven::{entries, FILE};
-    let text = read_regular_to_string(&project_root.join(FILE)).await;
-    let held = text.is_ok_and(|text| entries(&text).iter().any(|patch| patch.purl() == purl));
-    match held {
+    use crate::bazel::maven::FILE;
+    let block = judged_block(project_root).await;
+    match block.is_some_and(|block| block.iter().any(|patch| patch.purl() == purl)) {
         true => format!(
             "; {FILE} holds an entry for it that no pinned hub takes any more, so Bazel stops \
              there: run `socket-patch rollback {purl}`"
