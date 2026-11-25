@@ -26,7 +26,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, cache_env, hermetic};
 
 use std::path::Path;
 use std::process::{Output, Stdio};
@@ -35,10 +35,6 @@ use sha2::{Digest, Sha512};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
-#[path = "common/hermetic.rs"]
-mod hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 use vex_e2e_common::{

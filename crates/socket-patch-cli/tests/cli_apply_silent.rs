@@ -15,10 +15,11 @@
 //! 4. `apply --check --silent` with real redirect drift exited 1 with zero
 //!    output (the OUT OF SYNC report was muted).
 //!
-//! The core client's "No SOCKET_API_TOKEN set" notice is printed only when
-//! an online `apply` builds its API client to download something (see
-//! `apply_prints_the_public_proxy_notice_only_when_it_fetches`), so the
-//! offline, `--check` and cached runs here never print it.
+//! The core client's "No SOCKET_API_TOKEN set" notice is an info notice,
+//! muted under `--silent` and `--json`, and is printed only when an online
+//! `apply` builds its API client (see
+//! `apply_prints_the_public_proxy_notice_only_when_it_fetches`), so these
+//! runs' stderr never holds it.
 
 #[path = "common/mod.rs"]
 mod common;
