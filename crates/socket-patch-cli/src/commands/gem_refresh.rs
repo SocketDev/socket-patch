@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use socket_patch_core::crawlers::ruby_crawler::is_default_gem_copy;
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::formats::gem::GemBuild;
 use socket_patch_core::manifest::schema::PatchRecord;
@@ -415,9 +416,10 @@ enum Outlives {
     /// The gemspec is gone already: the gem dir is what is left of an
     /// install, and nothing puts a gem back over it.
     NoGemspec,
-    /// No Ruby was asked, and the copy's gem home is beside another
-    /// Ruby's (`vendor/bundle/ruby/3.2.0` next to `ruby/3.3.0`): the Ruby
-    /// that runs `bundle install` may install into the other one.
+    /// Nothing says the copy is another Ruby's, but its gem home is
+    /// beside another Ruby's (`vendor/bundle/ruby/3.2.0` next to
+    /// `ruby/3.3.0`): the Ruby that runs `bundle install` may install into
+    /// the other one.
     BesideAnotherRuby,
 }
 
@@ -467,11 +469,13 @@ fn beside_another_gem_home(gem_dir: &Path) -> bool {
 /// for (`--no-gem-install-refresh`), never one left alone for where it is
 /// (a shared home, a path outside the project) or patched in place.
 ///
-/// A refresh that got as far as asking a Ruby says whose the copy is. One
-/// that stopped before (it is turned off, the gem could not be had, the
-/// native rebuild is turned off) does not, and then a gem home beside
-/// another Ruby's is reason enough: removing the gem dir is right
-/// whichever Ruby runs `bundle install`.
+/// A refresh that found the copy in a tree no Ruby it asked installs into
+/// says so. Any other (it is turned off, the gem could not be had, the
+/// native rebuild is turned off or failed) does not say which Ruby will
+/// run `bundle install`, and then a gem home beside another Ruby's is
+/// reason enough: removing the gem dir is right whichever Ruby that is.
+/// Not for a default gem, though: its gemspec stays under
+/// `specifications/default/`, so nothing would put the gem dir back.
 fn outlives_reinstall(gem: &StaleGem, why: Option<&Why>) -> Option<Outlives> {
     let (Some((dir, _)), false) = (&gem.installed, gem.in_place) else {
         return None;
@@ -483,7 +487,9 @@ fn outlives_reinstall(gem: &StaleGem, why: Option<&Why>) -> Option<Outlives> {
         {
             Some(Outlives::ForeignRuby)
         }
-        Some(Why::Failed(_) | Why::Disabled) if beside_another_gem_home(dir) => {
+        Some(Why::Failed(_) | Why::Disabled)
+            if beside_another_gem_home(dir) && !is_default_gem_copy(dir) =>
+        {
             Some(Outlives::BesideAnotherRuby)
         }
         _ => None,
@@ -2663,6 +2669,15 @@ mod tests {
             assert!(bullet.contains(&format!("R{}", &rm_rf[1..])), "{bullet}");
             assert!(!bullet.contains("Re-run"), "{bullet}");
         }
+
+        // A default gem keeps its gem dir: its entry under
+        // `specifications/default/` stays, so nothing would reinstall it.
+        std::fs::create_dir_all(home.join("specifications/default")).unwrap();
+        let default_spec = home.join("specifications/default/json-1.0.0.gemspec");
+        std::fs::write(&default_spec, "").unwrap();
+        let (bullet, _) = bullet_of(&disabled, &off, Direction::Patched);
+        assert!(bullet.contains(&rm_f), "{bullet}");
+        std::fs::remove_file(&default_spec).unwrap();
 
         // A copy patched in place keeps its gem dir: only the archive
         // beside it is stale.
