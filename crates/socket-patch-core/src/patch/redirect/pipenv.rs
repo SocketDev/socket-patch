@@ -575,6 +575,65 @@ mod tests {
         assert!(!rotation.is_empty());
         assert!(second.contains("/rotated/") && !second.contains("/tok/"));
     }
+
+    /// Under a patch mirror (`--patch-mirror-url`) the grant's URL sits in
+    /// one repository of an artifact host that serves the project's own
+    /// packages too. An earlier pin is ours to rotate only under the
+    /// mirror's base; a URL in the patch server's path shape in another
+    /// repository of that host, or one that leaves the base through `..`,
+    /// is the project's own source. A pin on Socket's patch server is
+    /// still ours and moves onto the mirror in place.
+    #[test]
+    fn owned_url_under_a_mirror_needs_the_mirror_base() {
+        let base = "https://repo.example/artifactory/socket-patch";
+        let tail = |token: &str| {
+            format!("patch/pypi/urllib3/1.26.18/{token}/patch-one/urllib3-1.26.18-py3-none-any.whl")
+        };
+        let mut dep = dependency("urllib3", "1.26.18", "patch-one");
+        let direct = dep.artifact_url.clone();
+        dep.artifact_url = format!("{base}/{}", tail("new"));
+        let earlier = format!("{base}/{}", tail("old"));
+        assert!(owned_url(&earlier, &dep));
+        assert!(owned_url(&direct, &dep), "the patch server is ours");
+        for own in [
+            format!(
+                "https://repo.example/artifactory/pypi-local/{}",
+                tail("old")
+            ),
+            format!(
+                "https://repo.example/artifactory/socket-patch-2/{}",
+                tail("old")
+            ),
+            format!("https://repo.example/{}", tail("old")),
+            format!("{base}/../pypi-local/{}", tail("old")),
+        ] {
+            assert!(!owned_url(&own, &dep), "{own}");
+        }
+
+        // Through the rewriter: the earlier mirrored pin and the pin on the
+        // patch server are rotated onto the grant; the fork is a conflict.
+        let pinned = |url: &str| {
+            let mut first = dep.clone();
+            first.artifact_url = url.to_string();
+            plan(&lock(), &first, None).unwrap().0
+        };
+        for ours in [earlier.as_str(), direct.as_str()] {
+            let (rewritten, edits) = plan(&pinned(ours), &dep, None).unwrap();
+            assert!(!edits.is_empty(), "{ours}");
+            assert!(
+                rewritten.contains(&dep.artifact_url) && !rewritten.contains(ours),
+                "{ours}"
+            );
+        }
+        let fork = format!(
+            "https://repo.example/artifactory/pypi-local/{}",
+            tail("old")
+        );
+        assert!(matches!(
+            plan(&pinned(&fork), &dep, None),
+            Err(PlanError::Conflict(_))
+        ));
+    }
 }
 
 #[cfg(test)]

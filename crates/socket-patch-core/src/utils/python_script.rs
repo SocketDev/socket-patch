@@ -1115,6 +1115,56 @@ mod tests {
         }
     }
 
+    /// Under a patch mirror (`--patch-mirror-url`) the grant's URL sits in
+    /// one repository of an artifact host that serves the project's own
+    /// packages too: a project or inline script re-pins an earlier source
+    /// under the mirror's base, or on Socket's patch server, and refuses
+    /// one in the patch server's path shape in another repository of that
+    /// host, or one that leaves the base through `..`.
+    #[test]
+    fn an_earlier_source_under_a_mirror_needs_the_mirror_base() {
+        let base = "https://repo.example/artifactory/socket-patch";
+        let mirrored_a = OWN_A.replace("https://patch.socket.dev", base);
+        let mirrored_b = OWN_B.replace("https://patch.socket.dev", base);
+        let project =
+            "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n";
+        let script = "# /// script\n# dependencies = [\"six==1.16.0\"]\n# ///\n";
+        type Rewrite = fn(&str, &str, &str, ArtifactSource<'_>) -> Result<Option<String>, String>;
+        let writers: [(&str, Rewrite); 2] = [
+            (project, rewrite_project_metadata),
+            (script, rewrite_script_metadata),
+        ];
+        for (original, rewrite) in writers {
+            for earlier in [mirrored_a.as_str(), OWN_A] {
+                let wired = rewrite(original, "six", "1.16.0", ArtifactSource::Url(earlier))
+                    .unwrap()
+                    .unwrap();
+                let repinned = rewrite(&wired, "six", "1.16.0", ArtifactSource::Url(&mirrored_b))
+                    .unwrap_or_else(|e| panic!("{earlier}: our earlier source refused: {e}"))
+                    .expect("re-pinned");
+                assert!(
+                    repinned.contains(&mirrored_b) && !repinned.contains(earlier),
+                    "{repinned}"
+                );
+            }
+            let wired = rewrite(original, "six", "1.16.0", ArtifactSource::Url(&mirrored_a))
+                .unwrap()
+                .unwrap();
+            for own in [
+                mirrored_a.replace("/socket-patch/", "/pypi-local/"),
+                mirrored_a.replace("/socket-patch/", "/socket-patch-2/"),
+                mirrored_a.replace("/artifactory/socket-patch/", "/"),
+                mirrored_a.replace("/socket-patch/", "/socket-patch/../pypi-local/"),
+            ] {
+                let user = wired.replace(&mirrored_a, &own);
+                assert!(
+                    rewrite(&user, "six", "1.16.0", ArtifactSource::Url(&mirrored_b)).is_err(),
+                    "{own} must stay a user source"
+                );
+            }
+        }
+    }
+
     /// A package declared in ANY project table (dependencies, an extra, a
     /// PEP 735 group, the legacy `[tool.uv] dev-dependencies`) is direct: its
     /// source needs no override. Anything else gets one.

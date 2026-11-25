@@ -607,6 +607,7 @@ async fn vendor(case: &Case, staged: &Staged) -> VendorOutcome {
         use_public_proxy: true,
         vendor_url: None,
         patch_server_url: None,
+        patch_server_origins: Vec::new(),
         offline: false,
     };
     vendor_npm_any(

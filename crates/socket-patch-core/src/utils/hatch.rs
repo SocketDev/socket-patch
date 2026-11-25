@@ -1108,6 +1108,44 @@ mod tests {
         }
     }
 
+    /// Under a patch mirror (`--patch-mirror-url`) an earlier direct
+    /// reference is ours only under the mirror's base (or on Socket's patch
+    /// server): one in the patch server's path shape in another repository
+    /// of the mirror's host is the project's own and must be reverted first.
+    #[test]
+    fn an_earlier_reference_under_a_mirror_needs_the_mirror_base() {
+        const BASE: &str = "https://repo.example/artifactory/socket-patch";
+        const TAIL: &str = "patch/pypi/six/1.16.0/11111111-1111-4111-8111-111111111111/aaaaaaaa-0000-4000-8000-000000000001/six-1.16.0-py2.py3-none-any.whl";
+        let current = format!(
+            "{BASE}/patch/pypi/six/1.16.0/22222222-2222-4222-8222-222222222222/aaaaaaaa-0000-4000-8000-000000000004/six-1.16.0-py2.py3-none-any.whl"
+        );
+        let declared = |url: &str| -> BTreeMap<String, String> {
+            [(
+                "pyproject.toml".to_string(),
+                format!("[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six @ {url}\"]\n"),
+            )]
+            .into_iter()
+            .collect()
+        };
+        for ours in [
+            format!("{BASE}/{TAIL}"),
+            format!("https://patch.socket.dev/{TAIL}"),
+        ] {
+            let edits = rewrite(&declared(&ours), "six", "1.16.0", &current)
+                .unwrap_or_else(|e| panic!("{ours}: our earlier reference refused: {e}"));
+            assert!(edits["pyproject.toml"].contains(&current), "{ours}");
+        }
+        for own in [
+            format!("https://repo.example/artifactory/pypi-local/{TAIL}"),
+            format!("{BASE}/../pypi-local/{TAIL}"),
+        ] {
+            assert!(
+                rewrite(&declared(&own), "six", "1.16.0", &current).is_err(),
+                "{own} must stay a user source"
+            );
+        }
+    }
+
     /// Hatch (via pip/uv) selects a release under PEP 440, so
     /// `==1.26.18.0` and `==01.26.18` are exact pins of 1.26.18.
     #[test]

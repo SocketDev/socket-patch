@@ -1321,6 +1321,7 @@ mod tests {
             use_public_proxy: true,
             vendor_url: None,
             patch_server_url: None,
+            patch_server_origins: Vec::new(),
             offline: true,
         };
         for service in [None, Some(&cfg)] {
@@ -1399,6 +1400,7 @@ mod tests {
             use_public_proxy: true,
             vendor_url: Some(server.uri()),
             patch_server_url: None,
+            patch_server_origins: Vec::new(),
             offline: false,
         };
         (server, cfg)

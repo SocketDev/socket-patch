@@ -200,10 +200,11 @@ pub(super) fn hash_export_warning(
 /// writing). Entries match by PEP 503 canonical NAME in every package
 /// category. Registry pins and existing vendored wheel identities
 /// must both match the selected patch version. `hosted_origins` are the
-/// run's `--patch-server-url` origins: a hosted reference on one of them
-/// (or on patch.socket.dev) is refused with the rollback remedy, any other
-/// file reference as user-declared. Production callers pass the ledger
-/// through [`check_target_guards_superseding`].
+/// run's patch-server origins (`--patch-server-url`, and a patch mirror's
+/// base as `crate::origin::mirror_entry` gives it): a hosted reference on
+/// one of them (or on patch.socket.dev) is refused with the rollback
+/// remedy, any other file reference as user-declared. Production callers
+/// pass the ledger through [`check_target_guards_superseding`].
 #[cfg(test)]
 pub(super) fn check_target_guards(
     p: &PipenvProject,
