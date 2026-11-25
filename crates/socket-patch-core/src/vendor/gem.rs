@@ -151,8 +151,8 @@ use crate::formats::gem::{
     is_plain_gem_token, listed_specs, split_checksum_entry, split_entry, GemfileLock,
 };
 
-const GEMFILE: &str = "Gemfile";
-const GEMFILE_LOCK: &str = "Gemfile.lock";
+pub(super) const GEMFILE: &str = "Gemfile";
+pub(super) const GEMFILE_LOCK: &str = "Gemfile.lock";
 
 /// Wiring-record discriminators (`key` is the gem name for all three).
 ///

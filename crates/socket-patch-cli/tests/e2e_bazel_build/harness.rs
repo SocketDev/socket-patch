@@ -158,6 +158,26 @@ const ADVISORY: &str = "GHSA-test-aaaa-bbbb";
 /// package is affected.
 pub const NOT_IN_BUILD: &str = "vex_bazel_not_in_build";
 
+/// The one command of vendored mode.
+pub const VENDORED: [&str; 4] = ["scan", "--mode", "vendored", "--yes"];
+
+/// The switch that lets vendored mode write for a package it declines
+/// because of the project's Bazel workspace, and the variable of the same
+/// meaning.
+pub const ALLOW: &str = "--allow-vendored-in-bazel";
+pub const ALLOW_ENV: &str = "SOCKET_ALLOW_VENDORED_IN_BAZEL";
+
+/// A package that vendored mode declines in a checkout, because a hub of
+/// the workspace reads a lock the run would rewrite.
+pub struct Declined<'a> {
+    pub purl: &'a str,
+    /// The error code of the refusal.
+    pub code: &'a str,
+    /// What the refusal has to name beside hosted mode and the switch: the
+    /// call with its file and line, and the lock.
+    pub names: &'a [&'a str],
+}
+
 /// The mode a flow patched its package in, which a document says after the
 /// patch id. Or [`How::Unbuilt`]: the patch is in a copy that Bazel does
 /// not build, and a document says the package is affected.
@@ -1126,6 +1146,120 @@ impl Cell {
         assert_eq!(changed(before, &self.tree()), NOTHING, "{test}");
     }
 
+    /// For a finished command of vendored mode where it declines
+    /// `package`: it ended with `exit` and reports the package as its one
+    /// event, `action` under the code of the refusal, in words that name
+    /// the call, the lock, hosted mode and the switch. No file of the
+    /// checkout differs from `before`.
+    pub fn declined(&self, ran: &Ran, package: &Declined, exit: i32, action: &str, before: &Tree) {
+        let (test, said) = (&self.test, &ran.dump);
+        assert_eq!(ran.code, exit, "{test}: {said}");
+        let [event] = events(&ran.envelope) else {
+            panic!("{test}: not one event: {said}");
+        };
+        let reported = [&event["purl"], &event["action"], &event["errorCode"]];
+        let expected = [package.purl, action, package.code];
+        assert_eq!(reported, expected, "{test}: {said}");
+        let why = event["error"].as_str().or(event["reason"].as_str());
+        let why = why.unwrap_or_default();
+        let switch = format!("`{ALLOW}`");
+        for name in package.names.iter().chain(&["`--mode hosted`", &switch]) {
+            assert!(why.contains(name), "{test}: no {name:?} in {why:?}");
+        }
+        assert_eq!(changed(before, &self.tree()), NOTHING, "{test}: {said}");
+    }
+
+    /// Without a Bazel, in this checkout where a hub reads the lock of
+    /// `package`: every command that would vendor the package declines it
+    /// and writes nothing. That is the scan, `get`, `vendor` for a patch
+    /// the manifest records and, where the package is pinned hosted, the
+    /// scan that would take the pin over and the `vendor` that would eject
+    /// it, so the pin stays. A dry run of the scan names the refusal and
+    /// passes; one of `vendor` fails as its run does. `run` runs
+    /// `socket-patch` here, with the variables it is given.
+    pub fn declines_every_vendoring(
+        &self,
+        run: impl Fn(&Cell, &[&str], &[(&str, &str)]) -> Ran,
+        package: &Declined,
+    ) {
+        let declines = |args: &[&str], exit: i32, action: &str, before: &Tree| {
+            let ran = run(self, args, &[]);
+            self.declined(&ran, package, exit, action, before);
+            ran
+        };
+        let before = self.tree();
+        let get = ["get", package.purl, "--mode", "vendored", "--yes"];
+        declines(&VENDORED, 1, "failed", &before);
+        declines(&get, 1, "failed", &before);
+        declines(
+            &[&VENDORED[..], &["--dry-run"]].concat(),
+            0,
+            "skipped",
+            &before,
+        );
+
+        let saved = run(self, &["get", package.purl, "--save-only", "--yes"], &[]);
+        assert_eq!(saved.code, 0, "{}", saved.dump);
+        let vendor = [["vendor", "--yes"], ["vendor", "--dry-run"]];
+        for vendor in &vendor {
+            declines(vendor, 1, "failed", &self.tree());
+        }
+        std::fs::remove_dir_all(self.path(".socket")).expect("remove .socket");
+
+        // The eject is refused whole, before it restores a pin, and so is
+        // its dry run.
+        let hosted = run(self, &["scan", "--mode", "hosted", "--yes"], &[]);
+        assert_eq!(hosted.envelope["summary"]["applied"], 1, "{}", hosted.dump);
+        let pinned = self.tree();
+        assert_ne!(changed(&before, &pinned), NOTHING, "{}", hosted.dump);
+        declines(&VENDORED, 1, "failed", &pinned);
+        for eject in &vendor {
+            let eject = declines(eject, 1, "failed", &pinned);
+            let refused = &eject.envelope["error"]["code"];
+            assert_eq!(*refused, "eject_refused", "{}", eject.dump);
+            let why = event_for(&eject.envelope, package.purl)["error"].as_str();
+            let kept = why.is_some_and(|why| why.starts_with("kept hosted: "));
+            assert!(kept, "{}", eject.dump);
+        }
+    }
+
+    /// Without a Bazel, in such a checkout: vendored mode goes on when the
+    /// user says so, with the switch or its variable. A later run without
+    /// either passes and writes nothing: the lock the hub reads already
+    /// names the copy of that patch, so the run is in sync, and so is a
+    /// scan that names no mode, which runs in vendored mode in a vendored
+    /// project. `vendor --revert` takes no switch: it puts every file back.
+    pub fn vendors_on_the_users_word(
+        &self,
+        run: impl Fn(&Cell, &[&str], &[(&str, &str)]) -> Ran,
+        package: &Declined,
+    ) {
+        let before = self.tree();
+        let reverts = |why: &str| {
+            let undo = run(self, &["vendor", "--revert", "--yes"], &[]);
+            assert_eq!(undo.code, 0, "{why}: {}", undo.dump);
+            assert_eq!(changed(&before, &self.tree()), NOTHING, "{why}");
+        };
+        let vendors = |args: &[&str], env: &[(&str, &str)]| {
+            let ran = run(self, args, env);
+            assert_eq!(ran.code, 0, "{}", ran.dump);
+            assert_eq!(ran.envelope["summary"]["applied"], 1, "{}", ran.dump);
+        };
+        vendors(&VENDORED, &[(ALLOW_ENV, "1")]);
+        reverts(ALLOW_ENV);
+        vendors(&[&VENDORED[..], &[ALLOW]].concat(), &[]);
+        let vendored = self.tree();
+        for in_sync in [&VENDORED[..], &["scan", "--yes"]] {
+            let again = run(self, in_sync, &[]);
+            let said = &again.dump;
+            assert_eq!(again.code, 0, "{in_sync:?}: {said}");
+            assert_eq!(again.envelope["status"], "success", "{in_sync:?}: {said}");
+            assert!(!said.contains(package.code), "{in_sync:?}: {said}");
+            assert_eq!(changed(&vendored, &self.tree()), NOTHING, "{in_sync:?}");
+        }
+        reverts(ALLOW);
+    }
+
     /// `socket-patch <args>` in the workspace copy, as a user in that
     /// directory runs it, against the Socket API at `api`. Its home and
     /// temp directory are the cell's, and every proxy is a closed port, so
@@ -1419,8 +1553,14 @@ impl Cell {
         let named = named.unwrap_or_default();
         let purl = normalize_purl(claim.purl);
         assert_eq!(normalize_purl(named), purl, "{test}: {text}");
-        let products = json!([{ "@id": PRODUCT, "subcomponents": [{ "@id": named }] }]);
-        assert_eq!(statement["products"], products, "{test}: {text}");
+        let project = json!({ "@id": PRODUCT, "subcomponents": [{ "@id": named }] });
+        assert_eq!(statement["products"][0], project, "{test}: {text}");
+        let products = statement["products"].as_array().map(Vec::as_slice);
+        let packages = products.unwrap_or_default().get(1..).unwrap_or_default();
+        assert!(
+            packages.iter().any(|p| p["@id"] == named),
+            "{test}: the package is a product of its own: {text}"
+        );
         let (uuid, how) = (claim.uuid, claim.how.words());
         if claim.affected() {
             assert_eq!(statement["status"], "affected", "{test}: {text}");
