@@ -1883,8 +1883,10 @@ and exit 0. The message names the reason, with the file and line where there is 
   file over 1 MiB, one that is not UTF-8 or cannot be parsed, an `include` that is not
   followed. Or the workspace names rules_csharp, and a part of those files cannot be read
   with certainty: an `include` of a file that does not exist, a use of the extension that is
-  no call of a tag. A hub that such a part declares reads the re-pinned lock, takes the
-  upstream package, and its build fails. The message names what could not be read.
+  no call of a tag. A hub that such a part declares does not get the package, and its build
+  fails: on the upstream package, which no longer matches the re-pinned lock, or on the
+  folder that `nuget.config` names, which it reads as a URL. The message names what could
+  not be read.
 - A lock spells the package's version otherwise than NuGet writes it (`1.2.3.0` for `1.2.3`).
   The hub asks its feeds for the version as the lock spells it, and the folder of the patch
   holds the version as `dotnet restore` writes it. Run `dotnet restore`, which rewrites the
