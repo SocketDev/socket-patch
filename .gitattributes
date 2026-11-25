@@ -22,6 +22,11 @@ crates/socket-patch-core/tests/fixtures/upstream/** -text
 # derive their CRLF variants from the LF bytes themselves.
 crates/socket-patch-core/tests/fixtures/pnpm-hosted/** -text
 
+# The registry route goldens are real pnpm output too: the tests compare
+# what the scan writes against them byte for byte, so they are checked
+# out exactly as committed.
+crates/socket-patch-core/tests/fixtures/pnpm-registry-overrides/** -text
+
 # Captured vlt locks are byte-real; CRLF variants are derived in the tests.
 crates/socket-patch-core/tests/fixtures/vlt-locks/** -text
 

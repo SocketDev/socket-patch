@@ -28,6 +28,7 @@ mod check_verifies_installed_tree;
 mod cli_gem_variant_mismatch_policy;
 mod e2e_safety_advisories;
 mod gem_stale_bundler_plugin;
+mod gem_unmatched_copy_reporting;
 mod gem_without_lib_dir;
 mod in_process_gem_config_warning;
 mod in_process_gem_fallback_home;
