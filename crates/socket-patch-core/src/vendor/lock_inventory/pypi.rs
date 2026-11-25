@@ -431,6 +431,17 @@ async fn inventory_poetry_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEnt
     Some(out)
 }
 
+/// Whether `text` is a poetry.lock / pdm.lock that parses and resolves no
+/// package: what the tool writes for a project that declares no
+/// dependencies. The inventory reads past such a lock to `requirements.txt`
+/// ([`inventory_pypi_locks_raw_in`]), and the vendored router wires
+/// `requirements.txt` instead of it by this same test (#1114). A lock that
+/// does not parse is not shown to resolve nothing.
+pub(crate) fn tool_lock_resolves_nothing(text: &str) -> bool {
+    crate::utils::lock_fragments::parse_lock(text)
+        .is_ok_and(|document| toml_package_coords(&document).is_empty())
+}
+
 /// `(canonical name, version, purl, table)` of every path-safe `[[package]]`
 /// of a poetry.lock / pdm.lock document.
 fn toml_package_coords(document: &Table) -> Vec<(String, String, String, &Table)> {
