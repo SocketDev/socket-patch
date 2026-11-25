@@ -609,16 +609,36 @@ async fn gem_edge_shapes_round_trip() {
     }
 }
 
-/// [`gem_override`] with a prebuild for each of `platforms`: the patch
-/// registry serves a patched platform gem for it too.
-fn gem_override_prebuilt(name: &str, version: &str, platforms: &[&str]) -> serde_json::Value {
+/// The patches of one fix of a gem: [`gem_override`] (the ruby gem's patch,
+/// the fix's source, whose registry [`GEM_INDEX`] serves every gem of the
+/// fix) and the patch of each platform gem in `platforms`, built from it,
+/// with a uuid, a registry and a sha256 of its own.
+fn gem_fix_overrides(name: &str, version: &str, platforms: &[&str]) -> serde_json::Value {
     let mut overrides = gem_override(name, version);
-    overrides[0]["registryOverride"]["identifiers"]["gemPlatforms"] = platforms
-        .iter()
-        .map(|platform| {
-            serde_json::json!({"platform": platform, "gemChecksumSha256": "ab".repeat(32)})
-        })
-        .collect();
+    let list = overrides.as_array_mut().unwrap();
+    for (n, platform) in platforms.iter().enumerate() {
+        let uuid = format!("{}{n:02}", &GEM_UUID[..GEM_UUID.len() - 2]);
+        let index = GEM_INDEX.replace(GEM_UUID, &uuid);
+        list.push(serde_json::json!({
+            "ecosystem": "gem",
+            "name": name,
+            "version": version,
+            "token": "11111111-1111-1111-1111-111111111111",
+            "patchUuid": uuid,
+            "artifactUrl": format!("{index}gems/{name}-{version}-{platform}.gem"),
+            "registryOverride": {
+                "kind": "rubygems-compact-index",
+                "indexUrl": index,
+                "identifiers": {
+                    "name": name, "version": version,
+                    "gemChecksumSha256": "ab".repeat(32),
+                    "gemPlatform": platform,
+                    "gemRebuiltFromUuid": GEM_UUID
+                }
+            },
+            "integrity": {"sha256": "ab".repeat(32)}
+        }));
+    }
     overrides
 }
 
@@ -626,14 +646,14 @@ fn gem_override_prebuilt(name: &str, version: &str, platforms: &[&str]) -> serde
 /// one entry per platform, and no ruby-platform `nokogiri (1.18.10)`.
 const GEM_PLATFORM_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    nokogiri (1.18.10-arm64-darwin)\n      racc (~> 1.4)\n    nokogiri (1.18.10-x86_64-linux-gnu)\n      racc (~> 1.4)\n    nokogiri-happymapper (0.10.0)\n    puma (6.0.0)\n      nio4r (~> 2.0)\n    racc (1.8.1)\n\nPLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\nDEPENDENCIES\n  nokogiri (= 1.18.10)\n  puma\n\nCHECKSUMS\n  nokogiri (1.18.10-arm64-darwin) sha256=4444444444444444444444444444444444444444444444444444444444444444\n  nokogiri (1.18.10-x86_64-linux-gnu) sha256=5555555555555555555555555555555555555555555555555555555555555555\n  nokogiri-happymapper (0.10.0) sha256=6666666666666666666666666666666666666666666666666666666666666666\n  puma (6.0.0) sha256=1111111111111111111111111111111111111111111111111111111111111111\n  racc (1.8.1) sha256=3333333333333333333333333333333333333333333333333333333333333333\n\nBUNDLED WITH\n  4.0.15\n";
 
-/// A gem locked as precompiled platform builds, redirected to its
-/// prebuilds and restored: every platform entry is back in the upstream
+/// A gem locked as precompiled platform builds, redirected to the patches
+/// of one fix (each build to its own) and restored: every platform entry is back in the upstream
 /// section where Bundler sorts it, the `DEPENDENCIES` pin (or added entry)
 /// is gone, and each `CHECKSUMS` entry is back on its own build's upstream
 /// sha256 — the pre-scan pair, byte for byte.
 #[tokio::test]
 #[serial]
-async fn gem_platform_prebuilds_round_trip() {
+async fn gem_platform_builds_round_trip() {
     let platforms = ["arm64-darwin", "x86_64-linux-gnu"];
     let gemfile =
         "source \"https://rubygems.org\"\n\ngem \"nokogiri\", \"1.18.10\"\ngem \"puma\"\n";
@@ -665,7 +685,7 @@ async fn gem_platform_prebuilds_round_trip() {
             "      nio4r (~> 2.0)\n      nokogiri (>= 1.18)\n",
         )
         .replace("  nokogiri (= 1.18.10)\n", "");
-    let overrides = || gem_override_prebuilt("nokogiri", "1.18.10", &platforms);
+    let overrides = || gem_fix_overrides("nokogiri", "1.18.10", &platforms);
     let cases = [
         synthetic(
             "platform-builds",
@@ -736,9 +756,9 @@ async fn gem_platform_prebuilds_round_trip() {
 /// that names the gem as platform builds and cannot be converged (here
 /// `DEPENDENCIES` sits before the `GEM` section): the MIXED state the
 /// rewriter keeps. The platform entries still resolve from rubygems.org, so
-/// a prebuild's sha256 on them would fail every `bundle install` on a
+/// a patched gem's sha256 on them would fail every `bundle install` on a
 /// checksum mismatch. The rewrite writes none, and the unwind hands the
-/// lock back byte for byte. A lock that does carry prebuild sha256s on such
+/// lock back byte for byte. A lock that does carry patched sha256s on such
 /// entries is put back on the upstream ones all the same: the restore
 /// re-pins a platform entry however the lock wires the gem.
 #[tokio::test]
@@ -755,8 +775,7 @@ async fn gem_platform_builds_on_a_mixed_lock_keep_their_upstream_checksums() {
     let block_gemfile = format!(
         "source \"https://rubygems.org\"\nsource \"{GEM_INDEX}\" do\n  gem \"nokogiri\", \"1.18.10\"\nend\ngem \"puma\"\n"
     );
-    let overrides =
-        gem_override_prebuilt("nokogiri", "1.18.10", &["arm64-darwin", "x86_64-linux-gnu"]);
+    let overrides = gem_fix_overrides("nokogiri", "1.18.10", &["arm64-darwin", "x86_64-linux-gnu"]);
     let pair = |lock: &str| {
         BTreeMap::from([
             ("Gemfile".to_string(), block_gemfile.clone()),
@@ -776,12 +795,12 @@ async fn gem_platform_builds_on_a_mixed_lock_keep_their_upstream_checksums() {
     );
 
     // The unwind, over the pair the rewrite left and over one whose
-    // platform entries hold prebuild sha256s: the pre-scan lock both times.
-    let prebuild = "ab".repeat(32);
-    let pinned_to_prebuilds = lock
-        .replace(&"4".repeat(64), &prebuild)
-        .replace(&"5".repeat(64), &prebuild);
-    assert_ne!(pinned_to_prebuilds, lock);
+    // platform entries hold patched sha256s: the pre-scan lock both times.
+    let patched = "ab".repeat(32);
+    let pinned_to_patches = lock
+        .replace(&"4".repeat(64), &patched)
+        .replace(&"5".repeat(64), &patched);
+    assert_ne!(pinned_to_patches, lock);
     let pin = HostedPin {
         purl: "pkg:gem/nokogiri@1.18.10".into(),
         uuid: GEM_UUID.into(),
@@ -789,7 +808,7 @@ async fn gem_platform_builds_on_a_mixed_lock_keep_their_upstream_checksums() {
     };
     for (label, hosted_lock) in [
         ("as-rewritten", &lock),
-        ("prebuild-pins", &pinned_to_prebuilds),
+        ("patched-pins", &pinned_to_patches),
     ] {
         let case = Case {
             dir: PathBuf::from(format!("synthetic/mixed-platform-builds-{label}")),

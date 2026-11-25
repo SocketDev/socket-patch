@@ -1,0 +1,66 @@
+[
+  {
+    "ecosystem": "gem",
+    "name": "nokogiri",
+    "version": "1.18.10",
+    "token": "11111111-1111-1111-1111-111111111111",
+    "patchUuid": "77777777-7777-7777-7777-777777777777",
+    "artifactUrl": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/gems/nokogiri-1.18.10.gem",
+    "registryOverride": {
+      "kind": "rubygems-compact-index",
+      "indexUrl": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/",
+      "identifiers": {
+        "name": "nokogiri",
+        "version": "1.18.10",
+        "gemChecksumSha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+      }
+    },
+    "integrity": {
+      "sha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    }
+  },
+  {
+    "ecosystem": "gem",
+    "name": "nokogiri",
+    "version": "1.18.10",
+    "token": "11111111-1111-1111-1111-111111111111",
+    "patchUuid": "77777777-7777-7777-7777-77777777777a",
+    "artifactUrl": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-77777777777a/gems/nokogiri-1.18.10-arm64-darwin.gem",
+    "registryOverride": {
+      "kind": "rubygems-compact-index",
+      "indexUrl": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-77777777777a/",
+      "identifiers": {
+        "name": "nokogiri",
+        "version": "1.18.10",
+        "gemChecksumSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "gemPlatform": "arm64-darwin",
+        "gemRebuiltFromUuid": "77777777-7777-7777-7777-777777777777"
+      }
+    },
+    "integrity": {
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  {
+    "ecosystem": "gem",
+    "name": "nokogiri",
+    "version": "1.18.10",
+    "token": "11111111-1111-1111-1111-111111111111",
+    "patchUuid": "77777777-7777-7777-7777-77777777777b",
+    "artifactUrl": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-77777777777b/gems/nokogiri-1.18.10-x86_64-linux-gnu.gem",
+    "registryOverride": {
+      "kind": "rubygems-compact-index",
+      "indexUrl": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-77777777777b/",
+      "identifiers": {
+        "name": "nokogiri",
+        "version": "1.18.10",
+        "gemChecksumSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "gemPlatform": "x86_64-linux-gnu",
+        "gemRebuiltFromUuid": "77777777-7777-7777-7777-777777777777"
+      }
+    },
+    "integrity": {
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  }
+]

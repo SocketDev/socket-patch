@@ -66,7 +66,14 @@ pub fn patches_from_overrides(overrides: &Path, rewrite_host: Option<&str>) -> V
                 _ => name,
             };
             let version = o["version"].as_str().unwrap();
-            let purl = format!("pkg:{eco}/{full}@{version}");
+            // A gem patch is the patch of one platform gem, which its
+            // package URL names; the ruby gem's is the bare one here.
+            let ids = &o["registryOverride"]["identifiers"];
+            let purl = match ids["gemPlatform"].as_str() {
+                Some(platform) => format!("pkg:{eco}/{full}@{version}?platform={platform}"),
+                None => format!("pkg:{eco}/{full}@{version}"),
+            };
+            let rebuilt_from = ids["gemRebuiltFromUuid"].clone();
             let uuid = o["patchUuid"].as_str().unwrap().to_string();
             let fix = |v: &Value| -> Value {
                 match (v.as_str(), rewrite_host) {
@@ -86,6 +93,16 @@ pub fn patches_from_overrides(overrides: &Path, rewrite_host: Option<&str>) -> V
             if let Some(index) = registry_override.get("indexUrl").cloned() {
                 registry_override["indexUrl"] = fix(&index);
             }
+            // The patch API states neither among an override's
+            // identifiers: the platform is in the package URL, the source
+            // patch in `rebuiltFromUuid`.
+            if let Some(ids) = registry_override
+                .get_mut("identifiers")
+                .and_then(Value::as_object_mut)
+            {
+                ids.remove("gemPlatform");
+                ids.remove("gemRebuiltFromUuid");
+            }
             Patch {
                 purl,
                 uuid,
@@ -93,6 +110,7 @@ pub fn patches_from_overrides(overrides: &Path, rewrite_host: Option<&str>) -> V
                     "status": "granted",
                     "url": url,
                     "purl": null,
+                    "rebuiltFromUuid": rebuilt_from,
                     "artifacts": artifacts,
                     "registryOverride": registry_override,
                 }),
@@ -146,6 +164,11 @@ impl Respond for ByPackage {
             .iter()
             .filter(|p| purl_key(&p.purl) == purl_key(&purl))
             .map(|p| {
+                // A release variant's record is keyed by its own purl.
+                let purl = match p.purl.contains('?') {
+                    true => &p.purl,
+                    false => &purl,
+                };
                 serde_json::json!({
                     "uuid": p.uuid, "purl": purl, "publishedAt": "2024-01-01T00:00:00Z",
                     "description": "fixture", "license": "MIT", "tier": "free",
@@ -217,6 +240,56 @@ pub async fn mount_api(server: &MockServer, patches: &[Patch]) {
         .respond_with(View(patches.to_vec()))
         .mount(server)
         .await;
+    mount_gem_registries(server, patches).await;
+}
+
+/// What the patch registry of each gem patch lists: `info/<gem>` names
+/// every patch of its fix (the patches built from one source patch, and
+/// that patch), one `<version>[-<platform>] |checksum:<sha256>` line each.
+async fn mount_gem_registries(server: &MockServer, patches: &[Patch]) {
+    let fix = |p: &Patch| -> String {
+        p.reference["rebuiltFromUuid"]
+            .as_str()
+            .unwrap_or(&p.uuid)
+            .to_string()
+    };
+    let gems: Vec<&Patch> = patches
+        .iter()
+        .filter(|p| p.purl.starts_with("pkg:gem/"))
+        .collect();
+    for patch in &gems {
+        let Some(index) = patch.reference["registryOverride"]["indexUrl"].as_str() else {
+            continue;
+        };
+        let Some(index_path) = index.strip_prefix(&server.uri()) else {
+            continue;
+        };
+        let ids = &patch.reference["registryOverride"]["identifiers"];
+        let (Some(name), Some(version)) = (ids["name"].as_str(), ids["version"].as_str()) else {
+            continue;
+        };
+        let mut body = String::from("---\n");
+        for member in gems.iter().filter(|m| fix(m) == fix(patch)) {
+            let member_ids = &member.reference["registryOverride"]["identifiers"];
+            let Some(sha) = member_ids["gemChecksumSha256"].as_str() else {
+                continue;
+            };
+            let platform = socket_patch_core::utils::purl::purl_qualifier(&member.purl, "platform");
+            let token = match platform {
+                Some(platform) => format!("{version}-{platform}"),
+                None => version.to_string(),
+            };
+            body.push_str(&format!("{token} |checksum:{sha}\n"));
+        }
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "{}/info/{name}",
+                index_path.trim_end_matches('/')
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+    }
 }
 
 pub fn client(server: &MockServer) -> Arc<dyn PatchApi> {

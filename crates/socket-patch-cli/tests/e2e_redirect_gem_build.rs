@@ -6961,107 +6961,24 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
     mount_build_index(&server, "/upstream", &upstream_builds).await;
     let registry_base = format!("/patch-registry/gem/{TOKEN}/{UUID}");
     let index_url = format!("{}{registry_base}/", server.uri());
+    // A fix is one patch per gem: the ruby gem's ([`UUID`], the source) and
+    // one per platform gem, built from it. The registry of any of them
+    // lists and serves every gem of the fix.
     mount_build_index(&server, &registry_base, &patched_builds).await;
-    Mock::given(method("POST"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "packages": [{
-                "purl": PURL,
-                "patches": [{
-                    "uuid": UUID, "purl": PURL, "tier": "free",
-                    "cveIds": [], "ghsaIds": [], "severity": "high",
-                    "title": "gem prebuild capstone fixture"
-                }]
-            }],
-            "canAccessPaidPatches": false,
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path_regex(format!(
-            "^/v0/orgs/{ORG}/patches/by-package/.+$"
-        )))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "patches": [{
-                "uuid": UUID, "purl": PURL,
-                "publishedAt": "2026-01-01T00:00:00Z",
-                "description": "x", "license": "MIT", "tier": "free",
-                "vulnerabilities": {}
-            }],
-            "canAccessPaidPatches": false,
-        })))
-        .mount(&server)
-        .await;
-    // The reference of a patch that has prebuilds: a `gem-platform`
-    // artifact per prebuild (with `platform`) and `gemPlatforms` in the
-    // override's identifiers.
-    let hosted_url = format!(
-        "{}/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.gem",
-        server.uri()
-    );
-    let ruby_sha = sha_of(&patched_builds, DEP_VERSION);
-    let mut artifacts = vec![serde_json::json!({
-        "kind": "tarball", "url": hosted_url, "integrity": { "sha256": ruby_sha }
-    })];
-    let mut gem_platforms = Vec::new();
     for platform in platforms {
-        let sha = sha_of(&patched_builds, &token(platform));
-        artifacts.push(serde_json::json!({
-            "kind": "gem-platform", "platform": platform,
-            "url": format!("{index_url}gems/{DEP}-{DEP_VERSION}-{platform}.gem"),
-            "contentType": "application/octet-stream", "sizeBytes": 4096,
-            "integrity": { "sha256": sha }
-        }));
-        gem_platforms.push(serde_json::json!({ "platform": platform, "gemChecksumSha256": sha }));
+        let base = format!("/patch-registry/gem/{TOKEN}/{}", platform_uuid(platform));
+        mount_build_index(&server, &base, &patched_builds).await;
     }
-    Mock::given(method("POST"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "results": {
-                UUID: {
-                    "status": "granted",
-                    "url": hosted_url,
-                    "purl": PURL,
-                    "artifacts": artifacts,
-                    "registryOverride": {
-                        "kind": "rubygems-compact-index",
-                        "indexUrl": index_url,
-                        "identifiers": {
-                            "name": DEP,
-                            "version": DEP_VERSION,
-                            "gemChecksumSha256": ruby_sha,
-                            "gemPlatforms": gem_platforms,
-                        }
-                    }
-                }
-            }
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "lib/vuln_gem.rb": {
-                    "beforeHash": compute_git_sha256_from_bytes(orig.as_bytes()),
-                    "afterHash": compute_git_sha256_from_bytes(patched.as_bytes()),
-                }
-            },
-            "vulnerabilities": {
-                GHSA: {
-                    "cves": ["CVE-2026-3333"],
-                    "summary": "gem redirect capstone vuln",
-                    "severity": "high",
-                    "description": "d"
-                }
-            },
-            "description": "x", "license": "MIT", "tier": "free"
-        })))
-        .mount(&server)
-        .await;
+    let ruby_sha = sha_of(&patched_builds, DEP_VERSION);
+    mount_gem_fix_api(
+        &server,
+        &patched_builds,
+        &platforms,
+        (&orig, &patched),
+        false,
+        5,
+    )
+    .await;
 
     // 1. The project, locked and installed by the real bundler.
     let proj = tmp.path().join("proj");
@@ -7164,7 +7081,36 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
     let env: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("scan --json is not JSON: {e}\nstdout:\n{stdout}"));
     assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(env["summary"]["applied"], 1, "one gem redirected: {env}");
+    // One pin per build the lock names, each under its own patch; the
+    // ruby-platform entry, where the lock has one, under the source patch.
+    let mut pinned: Vec<(String, String)> = env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["details"]["mode"] == "hosted" && e["action"] == "applied")
+        .map(|e| {
+            let field = |key: &str| e[key].as_str().unwrap_or_default().to_string();
+            (field("purl"), field("uuid"))
+        })
+        .collect();
+    pinned.sort();
+    let mut expected: Vec<(String, String)> = platforms
+        .iter()
+        .map(|p| (format!("{PURL}?platform={p}"), platform_uuid(p)))
+        .collect();
+    if ruby_entry {
+        expected.push((PURL.to_string(), UUID.to_string()));
+    }
+    expected.sort();
+    assert_eq!(
+        pinned, expected,
+        "each locked build is pinned by its own patch: {env}"
+    );
+    assert_eq!(
+        env["summary"]["applied"],
+        expected.len(),
+        "one applied event per locked build: {env}"
+    );
     let warning_codes: Vec<&str> = env["warnings"]
         .as_array()
         .into_iter()
@@ -7393,30 +7339,66 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
         std::fs::write(&path, as_committed(&text)).unwrap();
     }
     if takeover {
-        mount_vendored_platform_grant(&fx, &hosted_url, &patched_builds, &platforms).await;
-        let (code, stdout, stderr) = run_socket_env(
-            &fx.proj,
-            &[
-                "get",
-                UUID,
-                "--mode",
-                "vendored",
-                "--yes",
-                "--json",
-                "--cwd",
-                proj_str,
-                "--api-url",
-                &api,
-                "--org",
-                ORG,
-                "--api-token",
-                "fake",
-                "--patch-server-url",
-                &api,
-            ],
-            &[("SOCKET_RUBYGEMS_URL", &upstream)],
-        );
+        // From here on the references are the ones a vendored run takes:
+        // each gem's sha512 and its stub gemspec.
+        mount_gem_fix_api(
+            &fx._server,
+            &patched_builds,
+            &platforms,
+            (&orig, &patched),
+            true,
+            1,
+        )
+        .await;
+        // By the fix's source patch on one arm (`get <uuid>` takes the
+        // fix's patch of every locked build with it), by a scan on the
+        // other.
+        let by: &[&str] = match checksums_lock {
+            true => &["get", UUID],
+            false => &["scan"],
+        };
+        let mut argv = by.to_vec();
+        argv.extend([
+            "--mode",
+            "vendored",
+            "--yes",
+            "--json",
+            "--cwd",
+            proj_str,
+            "--api-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--patch-server-url",
+            &api,
+        ]);
+        let (code, stdout, stderr) =
+            run_socket_env(&fx.proj, &argv, &[("SOCKET_RUBYGEMS_URL", &upstream)]);
         assert_eq!(code, 0, "takeover:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        // Each platform's tree is recorded with its own patch.
+        let ledger: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fx.proj.join(".socket/vendor/state.json")).expect("vendor ledger"),
+        )
+        .unwrap();
+        let mut built: Vec<(String, String)> = ledger["entries"]
+            .as_object()
+            .into_iter()
+            .flat_map(|entries| entries.values())
+            .flat_map(|entry| entry["gemBuilds"].as_array().into_iter().flatten())
+            .map(|b| {
+                let field = |key: &str| b[key].as_str().unwrap_or_default().to_string();
+                (field("platform"), field("uuid"))
+            })
+            .collect();
+        built.sort();
+        let mut expected: Vec<(String, String)> = platforms
+            .iter()
+            .map(|p| (p.to_string(), platform_uuid(p)))
+            .collect();
+        expected.sort();
+        assert_eq!(built, expected, "the ledger's platform trees: {ledger}");
         let vendored_lock = std::fs::read_to_string(fx.proj.join("Gemfile.lock")).unwrap();
         assert!(
             vendored_lock.starts_with("PATH\n  remote: .socket/vendor/gem/"),
@@ -7560,90 +7542,437 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
     manifestless_vex_matrix(&fx, &fresh).await;
 }
 
-/// The grant of [`UUID`] as the patch service answers it once the patch has
-/// prebuilds a vendored run can take: the hosted reference
-/// [`platform_prebuilds_install_frozen_and_roll_back`] mounts, plus each
-/// prebuild's sha512 and its stub gemspec.
-async fn mount_vendored_platform_grant(
-    fx: &RedirectFixture,
-    hosted_url: &str,
+/// A lock that gains a platform after the gem moved to its patch registry,
+/// against the REAL bundler:
+///
+///   1. the project locks the gem as this machine's platform gem alone, and
+///      the hosted scan moves that one entry to the registry of the fix's
+///      source patch, pinned to its own patch's sha256;
+///   2. `bundle lock --add-platform <foreign>`: bundler resolves the gem
+///      from its one source, the patch registry, which serves every gem of
+///      the fix, and adds the foreign platform gem's entry itself, with
+///      that gem's sha256. The Gemfile is not touched, and the lock gains
+///      exactly that entry (its spec lines, its `PLATFORMS` line, its
+///      `CHECKSUMS` line);
+///   3. the next scan leaves both files byte for byte as bundler wrote
+///      them (the Gemfile's `source:` is the source patch's registry
+///      whichever platforms the lock names) and reports the new build
+///      under its own patch.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6 for the CHECKSUMS lock); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_lock_gaining_a_platform_keeps_the_gemfile_line() {
+    let Some(bundler) =
+        bundler_e2e::gate("e2e_redirect_gem_build", "platform-gained", (2, 6), &|c| {
+            cache_env::isolate(c);
+        })
+    else {
+        return;
+    };
+    let (own, foreign) = own_and_foreign_platform();
+    let platforms = [own.as_str(), foreign.as_str()];
+    let tmp = tempfile::tempdir().unwrap();
+    let stage = tmp.path().join("gem-stage");
+    let (orig, patched) = (build_marked(orig_lib()), build_marked(patched_lib()));
+    let builds_of = |tag: &str, lib: &str| -> Vec<IndexBuild> {
+        [None, Some(own.as_str()), Some(foreign.as_str())]
+            .into_iter()
+            .map(|platform| IndexBuild {
+                name: DEP,
+                token: match platform {
+                    Some(p) => format!("{DEP_VERSION}-{p}"),
+                    None => DEP_VERSION.to_string(),
+                },
+                deps: vec![format!("{TRANSITIVE}:>= 0")],
+                gem: build_gem_build(&stage, tag, platform, lib),
+            })
+            .collect()
+    };
+    let mut upstream_builds = builds_of("orig", &orig);
+    let patched_builds = builds_of("patched", &patched);
+    let token = |platform: &str| format!("{DEP_VERSION}-{platform}");
+    let patched_sha = |platform: &str| {
+        let build = patched_builds.iter().find(|b| b.token == token(platform));
+        sha256_hex(&build.expect("build").gem)
+    };
+
+    let server = MockServer::start().await;
+    upstream_builds.push(IndexBuild {
+        name: TRANSITIVE,
+        token: "1.0.0".to_string(),
+        deps: vec![],
+        gem: build_gem(&stage, TRANSITIVE, "1.0.0", "tiny_dep.rb", TINY_LIB, &[]),
+    });
+    mount_build_index(&server, "/upstream", &upstream_builds).await;
+    let registry_base = format!("/patch-registry/gem/{TOKEN}/{UUID}");
+    let index_url = format!("{}{registry_base}/", server.uri());
+    mount_build_index(&server, &registry_base, &patched_builds).await;
+    for platform in platforms {
+        let base = format!("/patch-registry/gem/{TOKEN}/{}", platform_uuid(platform));
+        mount_build_index(&server, &base, &patched_builds).await;
+    }
+    mount_gem_fix_api(
+        &server,
+        &patched_builds,
+        &platforms,
+        (&orig, &patched),
+        false,
+        5,
+    )
+    .await;
+
+    // 1. The project, locked for this machine's platform alone.
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("Gemfile"),
+        format!("source \"{}/upstream\"\n\ngem \"{DEP}\"\n", server.uri()),
+    )
+    .unwrap();
+    let bundle_ok = |args: &[&str]| {
+        let out = bundle(&proj, args);
+        assert!(
+            out.status.success(),
+            "bundle {args:?} failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    };
+    let config_args = bundler.config_local_args("path", "vendor/bundle");
+    let config_args: Vec<&str> = config_args.iter().map(String::as_str).collect();
+    bundle_ok(&config_args);
+    bundle_ok(&["install"]);
+    let read_lock = || std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
+    // Bundler adds platforms by itself where every locked gem has a gem
+    // for them (4.0.15 locks `x86_64-linux` beside this machine's, and
+    // `ruby`): the fixture starts from this machine's platform alone.
+    for platform in ["ruby", foreign.as_str()] {
+        if read_lock().contains(&format!("\n  {platform}\n")) {
+            bundle_ok(&["lock", "--remove-platform", platform]);
+        }
+    }
+    bundle_ok(&["lock", "--add-checksums"]);
+    let pristine_gemfile = std::fs::read_to_string(proj.join("Gemfile")).unwrap();
+    let pristine_lock = read_lock();
+    let entries = |lock: &str| lock.matches(&format!("    {DEP} (")).count();
+    assert!(
+        pristine_lock.contains(&format!("    {DEP} ({})\n", token(&own)))
+            && entries(&pristine_lock) == 1
+            && pristine_lock.contains("\nCHECKSUMS\n"),
+        "the fixture lock must pin this machine's platform gem alone:\n{pristine_lock}"
+    );
+
+    let api = server.uri();
+    let proj_str = proj.to_str().expect("utf8 tmp path");
+    let scan = || {
+        let (code, stdout, stderr) = run_socket(
+            &proj,
+            &[
+                "scan",
+                "--mode",
+                "hosted",
+                "--json",
+                "--yes",
+                "--cwd",
+                proj_str,
+                "--api-url",
+                &api,
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+            ],
+        );
+        assert_eq!(
+            code, 0,
+            "scan failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let env: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("scan --json is not JSON: {e}\nstdout:\n{stdout}"));
+        assert!(
+            !stdout.contains("redirect_gem_platform_unsupported"),
+            "every locked build has a patch of the fix: {env}"
+        );
+        // `(purl, uuid)` of each hosted pin the run reports.
+        let mut pinned: Vec<(String, String)> = env["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| {
+                e["details"]["mode"] == "hosted"
+                    && (e["action"] == "applied" || e["action"] == "verified")
+            })
+            .map(|e| {
+                let field = |key: &str| e[key].as_str().unwrap_or_default().to_string();
+                (field("purl"), field("uuid"))
+            })
+            .collect();
+        pinned.sort();
+        pinned
+    };
+    let pin_of = |platform: &str| {
+        (
+            format!("{PURL}?platform={platform}"),
+            platform_uuid(platform),
+        )
+    };
+
+    // The scan moves the one locked build, by its own patch, to the
+    // registry of the patch it was built from.
+    assert_eq!(scan(), [pin_of(&own)]);
+    let gemfile = std::fs::read_to_string(proj.join("Gemfile")).unwrap();
+    assert_eq!(
+        gemfile,
+        with_source_option(&pristine_gemfile, &format!("gem \"{DEP}\""), &index_url),
+        "the Gemfile names the registry of the fix's source patch"
+    );
+    let lock = read_lock();
+    let section_of = |lock: &str| -> String {
+        lock.split("\n\n")
+            .find(|section| section.contains(&format!("remote: {index_url}")))
+            .unwrap_or_else(|| panic!("no patch-registry GEM section:\n{lock}"))
+            .to_string()
+    };
+    assert!(
+        entries(&lock) == 1
+            && section_of(&lock).contains(&format!("    {DEP} ({})\n", token(&own)))
+            && lock.contains(&format!(
+                "  {DEP} ({}) sha256={}\n",
+                token(&own),
+                patched_sha(&own)
+            )),
+        "the locked build sits under the patch registry, pinned to its own patch:\n{lock}"
+    );
+
+    // 2. Bundler adds the foreign platform from the gem's one source.
+    bundle_ok(&["lock", "--add-platform", &foreign]);
+    let gained = read_lock();
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+        gemfile,
+        "adding a platform leaves the Gemfile alone"
+    );
+    let added: Vec<&str> = gained
+        .lines()
+        .filter(|line| !lock.lines().any(|had| had == *line))
+        .collect();
+    let lost: Vec<&str> = lock
+        .lines()
+        .filter(|line| !gained.lines().any(|has| has == *line))
+        .collect();
+    assert_eq!(
+        added,
+        [
+            format!("    {DEP} ({})", token(&foreign)),
+            format!("  {foreign}"),
+            format!(
+                "  {DEP} ({}) sha256={}",
+                token(&foreign),
+                patched_sha(&foreign)
+            ),
+        ],
+        "the lock gains the one entry, from the patch registry:\n{gained}"
+    );
+    assert_eq!(lost, Vec::<&str>::new(), "and loses nothing:\n{gained}");
+    assert_eq!(
+        section_of(&gained).matches(&format!("    {DEP} (")).count(),
+        2,
+        "both builds sit under the patch registry:\n{gained}"
+    );
+
+    // 3. The next scan changes neither file and reports both builds, each
+    //    under its own patch.
+    let mut both = vec![pin_of(&own), pin_of(&foreign)];
+    both.sort();
+    assert_eq!(scan(), both);
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+        gemfile,
+        "the Gemfile line is unchanged"
+    );
+    assert_eq!(read_lock(), gained, "the lock is as bundler wrote it");
+}
+
+/// The uuid of the patch of the platform gem `platform` of the fix whose
+/// source patch is [`UUID`]: each platform gem has a patch of its own.
+fn platform_uuid(platform: &str) -> String {
+    let tail = platform
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    format!("{}{:012x}", &UUID[..24], tail & 0xffff_ffff_ffff)
+}
+
+/// The patches API of one fix of [`DEP`]: the patch of the ruby gem
+/// ([`UUID`], the fix's source) and the patch of each platform gem in
+/// `platforms` ([`platform_uuid`]), built from it. Each patch is found
+/// under its own purl (`?platform=<platform>`), and its reference is a gem
+/// patch's: a `tarball`, its registry and its sha256. With `vendorable`,
+/// the references also state each gem's sha512 and serve a stub gemspec,
+/// which a vendored run takes. `(orig, patched)` are the lib's two texts,
+/// for the patch views. `priority`: the mocks' wiremock priority (lower
+/// wins), so a later mount can take over from an earlier one.
+async fn mount_gem_fix_api(
+    server: &MockServer,
     patched_builds: &[IndexBuild],
     platforms: &[&str],
+    (orig, patched): (&str, &str),
+    vendorable: bool,
+    priority: u8,
 ) {
-    let server = &fx._server;
     let gem_of = |token: &str| {
         let build = patched_builds
             .iter()
             .find(|b| b.name == DEP && b.token == token);
         &build.expect("build").gem
     };
-    let ruby_gem = gem_of(DEP_VERSION);
-    let ruby_sha = sha256_hex(ruby_gem);
-    let stubs = format!("/artifacts/{UUID}");
-    let mut served = vec![(
-        format!("{DEP}-{DEP_VERSION}.gemspec"),
-        stub_gemspec(ruby_gem),
-    )];
-    let mut artifacts = vec![
-        serde_json::json!({
-            "kind": "tarball", "url": hosted_url,
-            "integrity": { "sha512": sri(ruby_gem), "sha256": ruby_sha }
-        }),
-        serde_json::json!({
-            "kind": "gem-stub-gemspec",
-            "url": format!("{}{stubs}/{DEP}-{DEP_VERSION}.gemspec", server.uri()),
-            "integrity": { "sha512": sri(&served[0].1) }
-        }),
-    ];
-    let mut gem_platforms = Vec::new();
+    // `(purl, uuid, token)` of each patch, the source first.
+    let mut patches: Vec<(String, String, String)> =
+        vec![(PURL.to_string(), UUID.to_string(), DEP_VERSION.to_string())];
     for platform in platforms {
-        let leaf = format!("{DEP}-{DEP_VERSION}-{platform}");
-        let gem = gem_of(&format!("{DEP_VERSION}-{platform}"));
-        let stub = stub_gemspec(gem);
-        let sha = sha256_hex(gem);
-        artifacts.push(serde_json::json!({
-            "kind": "gem-platform", "platform": platform,
-            "url": format!("{}gems/{leaf}.gem", fx.index_url),
-            "contentType": "application/octet-stream", "sizeBytes": gem.len(),
-            "integrity": { "sha512": sri(gem), "sha256": sha }
-        }));
-        artifacts.push(serde_json::json!({
-            "kind": "gem-platform-stub-gemspec", "platform": platform,
-            "url": format!("{}{stubs}/{leaf}.gemspec", server.uri()),
-            "integrity": { "sha512": sri(&stub) }
-        }));
-        gem_platforms.push(serde_json::json!({ "platform": platform, "gemChecksumSha256": sha }));
-        served.push((format!("{leaf}.gemspec"), stub));
+        patches.push((
+            format!("{PURL}?platform={platform}"),
+            platform_uuid(platform),
+            format!("{DEP_VERSION}-{platform}"),
+        ));
+    }
+    let listed: Vec<serde_json::Value> = patches
+        .iter()
+        .map(|(purl, uuid, _)| {
+            serde_json::json!({
+                "uuid": uuid, "purl": purl, "tier": "free",
+                "cveIds": [], "ghsaIds": [], "severity": "high",
+                "title": "gem platform capstone fixture"
+            })
+        })
+        .collect();
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{ "purl": PURL, "patches": listed }],
+            "canAccessPaidPatches": false,
+        })))
+        .with_priority(priority)
+        .mount(server)
+        .await;
+    let found: Vec<serde_json::Value> = patches
+        .iter()
+        .map(|(purl, uuid, _)| {
+            serde_json::json!({
+                "uuid": uuid, "purl": purl,
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            })
+        })
+        .collect();
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": found,
+            "canAccessPaidPatches": false,
+        })))
+        .with_priority(priority)
+        .mount(server)
+        .await;
+    let mut results = serde_json::Map::new();
+    for (purl, uuid, token) in &patches {
+        let gem = gem_of(token);
+        let leaf = format!("{DEP}-{token}");
+        let url = format!(
+            "{}/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{uuid}/{leaf}.gem",
+            server.uri()
+        );
+        let mut artifacts = vec![serde_json::json!({
+            "kind": "tarball", "url": url,
+            "integrity": { "sha256": sha256_hex(gem) }
+        })];
+        if vendorable {
+            artifacts[0]["integrity"]["sha512"] = serde_json::json!(sri(gem));
+            let stub = stub_gemspec(gem);
+            let stub_path = format!("/artifacts/{uuid}/{leaf}.gemspec");
+            artifacts.push(serde_json::json!({
+                "kind": "gem-stub-gemspec",
+                "url": format!("{}{stub_path}", server.uri()),
+                "integrity": { "sha512": sri(&stub) }
+            }));
+            Mock::given(method("GET"))
+                .and(path(stub_path))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(stub))
+                .mount(server)
+                .await;
+            // The patched gem itself, where its reference says it is.
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{uuid}/{leaf}.gem"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(gem.clone()))
+                .mount(server)
+                .await;
+        }
+        results.insert(
+            uuid.clone(),
+            serde_json::json!({
+                "status": "granted",
+                "url": url,
+                "purl": purl,
+                "rebuiltFromUuid": (uuid.as_str() != UUID).then_some(UUID),
+                "artifacts": artifacts,
+                "registryOverride": {
+                    "kind": "rubygems-compact-index",
+                    "indexUrl": format!("{}/patch-registry/gem/{TOKEN}/{uuid}/", server.uri()),
+                    "identifiers": {
+                        "name": DEP,
+                        "version": DEP_VERSION,
+                        "gemChecksumSha256": sha256_hex(gem),
+                    }
+                }
+            }),
+        );
     }
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/package")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "results": {
-                UUID: {
-                    "status": "granted",
-                    "url": hosted_url,
-                    "purl": PURL,
-                    "artifacts": artifacts,
-                    "registryOverride": {
-                        "kind": "rubygems-compact-index",
-                        "indexUrl": fx.index_url,
-                        "identifiers": {
-                            "name": DEP,
-                            "version": DEP_VERSION,
-                            "gemChecksumSha256": ruby_sha,
-                            "gemPlatforms": gem_platforms,
-                        }
-                    }
-                }
-            }
-        })))
-        .with_priority(1)
+        .respond_with(move |request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_default();
+            let asked: serde_json::Map<String, serde_json::Value> = body["uuids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|uuid| uuid.as_str())
+                .filter_map(|uuid| Some((uuid.to_string(), results.get(uuid)?.clone())))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": asked }))
+        })
+        .with_priority(priority)
         .mount(server)
         .await;
-    for (leaf, bytes) in served {
+    for (purl, uuid, _) in &patches {
         Mock::given(method("GET"))
-            .and(path(format!("{stubs}/{leaf}")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": uuid,
+                "purl": purl,
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "files": {
+                    "lib/vuln_gem.rb": {
+                        "beforeHash": compute_git_sha256_from_bytes(orig.as_bytes()),
+                        "afterHash": compute_git_sha256_from_bytes(patched.as_bytes()),
+                    }
+                },
+                "vulnerabilities": {
+                    GHSA: {
+                        "cves": ["CVE-2026-3333"],
+                        "summary": "gem redirect capstone vuln",
+                        "severity": "high",
+                        "description": "d"
+                    }
+                },
+                "description": "x", "license": "MIT", "tier": "free"
+            })))
+            .with_priority(priority)
             .mount(server)
             .await;
     }

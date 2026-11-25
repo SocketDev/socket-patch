@@ -584,6 +584,14 @@ class NokogiriE2E
     end + tail(stderr)
     rewritten = File.read(lock_path)
     check(rewritten != lock, "it rewires the lock", tail(stdout) + tail(stderr))
+    # Each platform gem has a patch of its own: the run reports every
+    # locked platform under that patch.
+    reported = events(stdout).select { |e| %w[applied verified].include?(e["action"]) }
+                             .map { |e| [e["purl"].to_s[/[?&]platform=([^&]+)/, 1], e["uuid"]] }
+    unreported = platforms.reject { |p| reported.include?([p, service.uuid_of(p)]) }
+    check(unreported.empty?, "it reports each platform gem under that platform's own patch",
+          "not reported: #{unreported.inspect}
+#{reported.inspect}")
     if mode == "hosted"
       section = rewritten[/^GEM\n  remote: #{Regexp.escape(service.index_url)}\n  specs:\n((?:    .*\n)+)/, 1].to_s
       missing = platforms.reject { |p| section.include?("    nokogiri (#{@version}-#{p})\n") }
@@ -598,7 +606,13 @@ class NokogiriE2E
       vendored = Dir.glob(File.join(@proj, ".socket", "vendor", "gem", "**", "*.gemspec"))
       check(vendored.size >= platforms.size, "a patched gem is vendored for each of #{platforms.size} platforms",
             vendored.inspect)
-      check(rewritten =~ /^PATH\n  remote: \.socket\/vendor\/gem\//, "the lock takes nokogiri from the vendored path", rewritten)
+      check(rewritten =~ /^PATH\n  remote: \.socket\/vendor\/gem\/#{Regexp.escape(service.uuid)}\//,
+            "the lock takes nokogiri from the vendored path of the fix's source patch", rewritten)
+      ledger = JSON.parse(File.read(File.join(@proj, ".socket", "vendor", "state.json")))
+      built = ledger.fetch("entries", {}).values.flat_map { |entry| entry.fetch("gemBuilds", []) }
+                    .map { |b| [b["platform"], b["uuid"]] }
+      check(built.sort == platforms.map { |p| [p, service.uuid_of(p)] }.sort,
+            "the ledger records each platform's tree with its own patch", built.inspect)
       # From here on nothing may need the patch service.
       service.take_down
       service.forget_requests

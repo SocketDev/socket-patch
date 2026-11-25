@@ -300,10 +300,51 @@ async fn parity_gemfile() {
 /// A gem the lock resolves only as precompiled platform builds. The lock
 /// inventory has no ruby-platform entry to list it by, so both hosted
 /// engines find it through the lock's platform specs (nothing is
-/// installed here), and both move every build to its prebuild.
+/// installed here). Each platform gem has a patch of its own: both engines
+/// take the fix that covers every locked build, wire its source patch's
+/// registry and report each build's own patch.
 #[tokio::test]
-async fn parity_gemfile_platform_prebuilds() {
-    assert_parity(case("gem/bundler/platform-prebuilds")).await;
+async fn parity_gemfile_platform_builds() {
+    let redirect = assert_parity(case("gem/bundler/platform-builds")).await;
+    let pinned: Vec<(&str, &str)> = redirect["patches"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["action"] == "pinned")
+        .filter_map(|p| Some((p["purl"].as_str()?, p["uuid"].as_str()?)))
+        .collect();
+    assert_eq!(
+        pinned,
+        [
+            (
+                "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin",
+                "77777777-7777-7777-7777-77777777777a"
+            ),
+            (
+                "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu",
+                "77777777-7777-7777-7777-77777777777b"
+            ),
+        ],
+        "each build is reported under its own patch: {redirect}"
+    );
+    // The fix's source patch lends its registry and is not reported.
+    assert_eq!(redirect["patches"].as_array().map(Vec::len), Some(2));
+}
+
+/// The same lock with a patch for one of the two builds only, and with
+/// the builds patched by two different fixes: neither engine changes a
+/// file, and both say why.
+#[tokio::test]
+async fn parity_gemfile_platform_builds_that_cannot_move() {
+    for fixture in [
+        "gem/bundler/platform-build-missing",
+        "gem/bundler/platform-builds-two-fixes",
+        "gem/bundler/platform-retired-fields",
+    ] {
+        let mut case = case(fixture);
+        case.expect_redirect = false;
+        assert_parity(case).await;
+    }
 }
 
 /// The gem fixture as the root of a Bazel workspace whose rules_ruby hub

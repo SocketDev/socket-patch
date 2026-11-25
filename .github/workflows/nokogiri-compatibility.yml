@@ -55,15 +55,16 @@ name: nokogiri patch compatibility
 # The `hosted` legs run the script's hosted scenario instead: a hosted scan
 # of a lock that pins nokogiri as platform gems, against a stand-in for the
 # patch service (tests/nokogiri/patch_service.rb) that serves a patched build
-# of each real platform gem; then a frozen install from a fresh checkout,
-# `vex` and a byte-identical `rollback`. On JRuby the platform is `java`.
+# of each real platform gem, each as a patch of its own built from the ruby
+# gem's patch, whose registry serves them all; then a frozen install from a
+# fresh checkout, `vex` and a byte-identical `rollback`. On JRuby the
+# platform is `java`.
 #
 # The `vendored` legs run the script's vendored scenario instead: a vendored
-# scan of a lock that pins nokogiri as platform gems, against a stand-in for
-# the patch service (tests/nokogiri/patch_service.rb) that serves a patched
-# build of each real platform gem; then a frozen install from a fresh
-# checkout with the service unreachable, `vex` and a `rollback` to the lock
-# as it was. On JRuby the platform is `java`.
+# scan of a lock that pins nokogiri as platform gems, against the same
+# stand-in; then a frozen install from a fresh checkout with the service
+# unreachable, `vex` and a `rollback` to the lock as it was. On JRuby the
+# platform is `java`.
 #
 # Every leg downloads gems from rubygems.org, and a rebuild of a precompiled
 # install downloads the source gem and `mini_portile2` from it too.
@@ -90,6 +91,9 @@ on:
       - 'crates/socket-patch-core/src/patch/redirect/grant.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/gem.rs'
       - 'crates/socket-patch-cli/src/commands/gem_refresh.rs'
+      # Which patches a run takes for a gem locked as platform gems.
+      - 'crates/socket-patch-core/src/hosted/gem_fixes.rs'
+      - 'crates/socket-patch-core/src/hosted/gem_index.rs'
       # Vendored mode's gem backend.
       - 'crates/socket-patch-core/src/vendor/gem.rs'
       - 'crates/socket-patch-core/src/vendor/verify.rs'
