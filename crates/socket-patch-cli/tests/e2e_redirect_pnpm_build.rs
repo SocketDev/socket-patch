@@ -217,7 +217,10 @@ fn corepack_command(cwd: &Path, pm: &str, args: &[&str], registry_retries: bool)
             }
         })
         .collect();
-    cmd.args(&args).current_dir(cwd);
+    // pnpm is handed the spelling of its directory that it resolves itself,
+    // or it keys the project in the lock by the path between the two.
+    cmd.args(&args);
+    hermetic::start_in(&mut cmd, cwd);
     if !registry_retries
         && args.first().is_some_and(|arg| arg == "install")
         && pm

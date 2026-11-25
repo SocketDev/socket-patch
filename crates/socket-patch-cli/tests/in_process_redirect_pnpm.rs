@@ -1549,9 +1549,7 @@ async fn hosted_scan_workspace_yaml_overrides_member_npmrc() {
 /// The workspace root as refusals and warnings name it: canonical (Windows
 /// expands 8.3 names) without the verbatim `\\?\` prefix.
 fn member_root(tmp: &tempfile::TempDir) -> std::path::PathBuf {
-    socket_patch_core::utils::pnpm_workspace::without_verbatim_prefix(
-        std::fs::canonicalize(tmp.path()).unwrap(),
-    )
+    hermetic::os_spelling(tmp.path())
 }
 
 /// Every redirect warning's text, unescaped: a JSON dump doubles each

@@ -71,7 +71,7 @@ pub fn java_path(path: &Path) -> PathBuf {
 /// `path` canonicalized (a symlinked macOS temp dir resolved, so the
 /// evidence sbt writes names the paths the CLI reads), in Java's spelling.
 pub fn canonical(path: &Path) -> PathBuf {
-    java_path(&std::fs::canonicalize(path).expect("canonicalize"))
+    crate::common::hermetic::os_spelling(path)
 }
 
 /// The `file:` URL of the directory `dir`: `file:///C:/x` on Windows (a

@@ -16,7 +16,8 @@
 //! PTY suites use [`pty_command`] / [`pty_binary_command`], which carry the
 //! same environment onto a `portable_pty::CommandBuilder`.
 //! Package-manager children the same tests spawn get [`scrub_socket_vars`]
-//! plus whichever [`Extra`] scrubs their tool needs.
+//! plus whichever [`Extra`] scrubs their tool needs, and are started in
+//! their project with [`start_in`].
 //!
 //! Files that don't need the rest of `common` pull this in on its own with
 //! `#[path = "common/hermetic.rs"] mod hermetic;`.
@@ -203,6 +204,28 @@ pub fn tool_command(name: &str) -> Command {
         socket_patch_core::utils::process::resolve_tool(name)
             .map_or_else(|| name.into(), std::path::PathBuf::into_os_string),
     )
+}
+
+/// `dir` in the one spelling the operating system gives it: every link
+/// resolved and, on Windows, every 8.3 short name expanded, without the
+/// verbatim `\\?\` prefix `canonicalize` adds there (Java rejects it, and
+/// no tool prints it). `dir` must exist: a test creates a directory before
+/// it names it, so one that cannot be resolved stops the test here.
+pub fn os_spelling(dir: &Path) -> std::path::PathBuf {
+    let canonical = std::fs::canonicalize(dir)
+        .unwrap_or_else(|e| panic!("cannot resolve the directory {}: {e}", dir.display()));
+    socket_patch_core::utils::pnpm_workspace::without_verbatim_prefix(canonical)
+}
+
+/// Start `cmd`, a package manager, in `dir` as [`os_spelling`] spells it:
+/// its working directory and the root it resolves from it must be one
+/// string. pnpm 11 keys a project in the lock by the path from
+/// `fs.realpath.native(cwd)` (links resolved, 8.3 short names expanded) to
+/// `fs.realpathSync(cwd)` (links resolved, a short name left as spelled),
+/// and `pnpm add`, `remove` and `update` write a second importer when the
+/// two differ, as they do under a temp directory spelled with a short name.
+pub fn start_in<'a>(cmd: &'a mut Command, dir: &Path) -> &'a mut Command {
+    cmd.current_dir(os_spelling(dir))
 }
 
 /// [`command`] for a PTY child: the same hermetic environment on a
