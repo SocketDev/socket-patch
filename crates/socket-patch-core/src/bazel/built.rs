@@ -19,6 +19,20 @@
 //! rules_ruby does with a vendored gem and rules_csharp with a vendored
 //! package no test here builds, so neither is judged.
 //!
+//! A sixth, rules_jvm_external, takes each jar that the lock of a hub pins
+//! (`maven.install`) at the lock's sha256: from a repository of the lock,
+//! or under `m2local` from the Maven local repository, where a jar that
+//! agent mode patched no longer has that sha256. Its hubs are not in the
+//! table below: [`super::maven`] reads them for hosted and vendored mode,
+//! which patch a hub through a block of the root `MODULE.bazel` and not
+//! through its lock, and the same reader answers here
+//! ([`super::maven::upstream`]): for a jar patched in the installed copy,
+//! whatever project of the workspace it was patched from, when every hub
+//! was read and the block holds no entry for it. What counts as read is
+//! that reader's to say, and the next paragraph is about the table alone:
+//! a `WORKSPACE` file puts a Maven hub in doubt only by a `maven_install`
+//! call that Bazel may read.
+//!
 //! [`unbuilt`] names, for a patched package, the call that builds it from a
 //! file without its patch. It says so only when the files of the workspace
 //! show it: the reader's answer is certain ([`Workspace::doubts`] and the
@@ -123,8 +137,8 @@ pub struct Unbuilt {
     /// the file that points at it.
     pub lock: String,
     /// What to run so that the build holds the patch of an installed copy
-    /// ([`Hub::remedy`]).
-    pub remedy: &'static str,
+    /// ([`Hub::remedy`]; for a Maven jar the command names the package).
+    pub remedy: String,
 }
 
 /// The tag of a module extension that names the files a ruleset builds the
@@ -311,7 +325,8 @@ fn ecosystem(purl: &str) -> Option<String> {
 pub async fn unbuilt(project: &Path, packages: Vec<Patched>) -> Vec<Option<Unbuilt>> {
     let hub = |package: &Patched| {
         let of = ecosystem(&package.purl);
-        HUBS.iter().any(|hub| of.as_deref() == Some(hub.ecosystem))
+        let known = |hub: &Hub| of.as_deref() == Some(hub.ecosystem);
+        of.as_deref() == Some("maven") || HUBS.iter().any(known)
     };
     if !packages.iter().any(hub) {
         return vec![None; packages.len()];
@@ -328,9 +343,42 @@ pub async fn unbuilt(project: &Path, packages: Vec<Patched>) -> Vec<Option<Unbui
         let parts: Vec<_> = parts
             .map(|part| part.as_os_str().to_string_lossy())
             .collect();
-        judge(&workspace, &parts.join("/"), &read, &packages)
+        let mut found = judge(&workspace, &parts.join("/"), &read, &packages);
+        jars(&root.dir, &packages, &mut found);
+        found
     })
     .await
+}
+
+/// [`unbuilt`] for the Maven jars among `packages` that are patched in an
+/// installed copy, in the workspace at `root`: into `found`, the
+/// `maven.install` of the pinned hub that fetches the upstream jar
+/// ([`super::maven::upstream`]), with the command that patches such a hub.
+/// A flow builds it patched on real Bazel in hosted and in vendored mode.
+/// That command writes no entry where it cannot show that one works (an
+/// older Bazel, an rc file, a jar of the Maven local repository) and then
+/// warns with a code of [`super::maven`]. The remedy says so, because the
+/// pin such a run leaves in a `pom.xml` is attested all the same.
+fn jars(root: &Path, packages: &[Patched], found: &mut [Option<Unbuilt>]) {
+    let installed = |at: &usize| packages[*at].pins.is_none();
+    let installed: Vec<usize> = (0..packages.len()).filter(installed).collect();
+    let purls: Vec<&str> = installed.iter().map(|at| &*packages[*at].purl).collect();
+    let hubs = super::maven::upstream(root, &purls);
+    for (at, hub) in installed.into_iter().zip(hubs) {
+        let Some(hub) = hub else { continue };
+        let purl = &packages[at].purl;
+        found[at] = Some(Unbuilt {
+            call: "maven.install".to_string(),
+            file: hub.file,
+            line: hub.line,
+            lock: hub.lock.unwrap_or_default(),
+            remedy: format!(
+                "Run `socket-patch get {purl} --mode hosted` at the Bazel root to patch the \
+                 hub, or with `--mode vendored` to commit the patched jar (a `maven_bazel_*` \
+                 warning of that run means that the Bazel build keeps the upstream jar)."
+            ),
+        });
+    }
 }
 
 /// The most of a lock that is read: the lock of a large pnpm workspace has
@@ -463,7 +511,7 @@ fn judge(
                             file: tag.file.to_string(),
                             line: tag.call.line,
                             lock: lock.clone(),
-                            remedy: hub.remedy,
+                            remedy: hub.remedy.to_string(),
                         });
                     }
                 }
@@ -1356,6 +1404,48 @@ replace = "swapped 3.0.0"
             [None, None, None]
         );
         assert_eq!(unbuilt(&root.join("api"), vendored).await, [None]);
+    }
+
+    /// A Maven jar that is patched in the installed copy, in a project of a
+    /// workspace whose pinned hub fetches that jar: the `maven.install` and
+    /// the lock of the hub, with the command of the two modes that patch
+    /// it, which names the package, and what tells that the command wrote
+    /// no entry. Nothing for a committed copy, which
+    /// vendored mode gives the hub, nor once the block holds the jar's
+    /// entry.
+    #[tokio::test]
+    async fn an_installed_jar_is_not_what_a_pinned_hub_fetches() {
+        let [module, lock, patched] = super::super::maven::tests::sample(UUID);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("services/billing")).unwrap();
+        std::fs::write(root.join("MODULE.bazel"), module).unwrap();
+        std::fs::write(root.join("maven_install.json"), lock).unwrap();
+        let netty = "pkg:maven/io.netty/netty-tcnative-classes@2.0.61.Final";
+        let package = |pins: Option<Vec<String>>| Patched {
+            purl: netty.to_string(),
+            uuid: UUID.to_string(),
+            pins,
+        };
+        let packages = vec![package(None), package(Some(vec!["pom.xml".to_string()]))];
+        let fetched = Unbuilt {
+            call: "maven.install".to_string(),
+            file: "MODULE.bazel".to_string(),
+            line: 4,
+            lock: "maven_install.json".to_string(),
+            remedy: format!(
+                "Run `socket-patch get {netty} --mode hosted` at the Bazel root to patch the \
+                 hub, or with `--mode vendored` to commit the patched jar (a `maven_bazel_*` \
+                 warning of that run means that the Bazel build keeps the upstream jar)."
+            ),
+        };
+        for project in ["", "services/billing"] {
+            let found = unbuilt(&root.join(project), packages.clone()).await;
+            assert_eq!(found, [Some(fetched.clone()), None], "{project}");
+        }
+        std::fs::write(root.join("MODULE.bazel"), patched).unwrap();
+        assert_eq!(unbuilt(&root, packages).await, [None, None]);
     }
 
     /// On disk a lock is read as a file of the workspace is: through a

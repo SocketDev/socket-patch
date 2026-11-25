@@ -1909,10 +1909,12 @@ const INSTALLED_TREE_SHIPS: &str = "If what you ship is the installed tree and n
     builds, pass `--no-bazel` (`--vex-no-bazel` on scan, apply and vendor).";
 
 /// In a Bazel workspace, a hub of aspect_rules_js, rules_python,
-/// rules_ruby, rules_rust or rules_csharp builds a package from the lock a
-/// workspace file names, never from the copy a package manager installed,
-/// and rules_python builds nothing from a line that points at a copy under
-/// `.socket/vendor` ([`socket_patch_core::bazel::built`]). A patch that is
+/// rules_ruby, rules_rust, rules_csharp or rules_jvm_external builds a
+/// package from the lock a workspace file names, never from the copy a
+/// package manager installed (a jar of the Maven local repository only at
+/// the lock's sha256), and rules_python builds nothing from a line
+/// that points at a copy under `.socket/vendor`
+/// ([`socket_patch_core::bazel::built`]). A patch that is
 /// only in such a copy is in no build of Bazel's, so its package is not
 /// attested as patched: it leaves `outcome.applied` and is returned with
 /// what to do about it, for statements that say `affected`
@@ -1979,7 +1981,8 @@ async fn unbuilt_by_bazel(
 /// what `call` builds the package from, and what to run so that the build
 /// holds the patch. For an installed copy that is the hub's own remedy
 /// ([`Unbuilt::remedy`]). Hosted and vendored mode write in the project
-/// they run in, so it names the directory of the lock.
+/// they run in, so it names the directory of the lock, and for a Maven jar
+/// the Bazel root, where the patch of a hub is written.
 ///
 /// For an installed copy it ends with the way out of a repository that
 /// ships the installed tree and keeps the hub for something else: the

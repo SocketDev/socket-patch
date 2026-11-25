@@ -74,9 +74,12 @@
 //! - [`an_agent_patch_beside_a_pinned_hub`]: agent mode in a checkout that
 //!   Maven builds too. `scan --mode agent --yes` puts the patched jar in
 //!   the Maven local repository and patches no hub: the build prints the
-//!   upstream marker before and after. The document of the run, of
+//!   upstream marker before and after, and the document of the run, of
 //!   `apply`, of `vex` and of `vex --no-verify` says that the artifact is
-//!   not affected, which is false for what Bazel builds (KNOWN GAP).
+//!   affected, with the lock and the `maven.install` Bazel builds it from
+//!   and the command that patches the hub. After that command, the hosted
+//!   one, the build prints the marker of the patched jar and `vex` says
+//!   not affected.
 //!
 //! A command that writes the block gives no warning. One that does not
 //! gives one, in the place of "no pom.xml", with the reason and the words
@@ -123,6 +126,7 @@
 //! Java embedded in Bazel.
 
 use std::io::Write as _;
+use std::path::Path;
 use std::time::Instant;
 
 use base64::Engine as _;
@@ -135,8 +139,8 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes as git_sh
 
 use crate::envelope::{codes_in, event_for, event_triples};
 use crate::harness::{
-    cell_without_bazel, changed, fixture_path, rewrite, Cell, Claim, Fixture, How, Ran, StandIn,
-    Tree, CONSUMER, NOTHING,
+    cell_without_bazel, changed, fixture_path, rewrite, with_vex, Cell, Claim, Fixture, How, Ran,
+    StandIn, Tree, CONSUMER, NOTHING,
 };
 use crate::hosted_memory_common::{Patch, ORG};
 
@@ -587,14 +591,20 @@ impl Pinned {
     /// `standin`, with the directories of [`Pinned::tools`] in the place of
     /// the machine's.
     fn socket_patch_in(&self, cell: &Cell, standin: &StandIn, args: &[&str]) -> Ran {
-        let dir = |name: &str| self.tools.path().join(name).to_string_lossy().into_owned();
-        let (m2, gradle, coursier) = (dir("m2"), dir("gradle"), dir("coursier"));
-        let env = [
-            ("MAVEN_REPO_LOCAL", m2.as_str()),
-            ("GRADLE_USER_HOME", &gradle),
-            ("COURSIER_CACHE", &coursier),
-        ];
+        let tools = self.tools_env();
+        let env = tools.each_ref().map(|(name, dir)| (*name, dir.as_str()));
         cell.socket_patch(&standin.origin(), args, &env)
+    }
+
+    /// The directories of [`Pinned::tools`], each as the variable that
+    /// puts it in the place of the machine's.
+    fn tools_env(&self) -> [(&'static str, String); 3] {
+        let dir = |name: &str| self.tools.path().join(name).to_string_lossy().into_owned();
+        [
+            ("MAVEN_REPO_LOCAL", dir("m2")),
+            ("GRADLE_USER_HOME", dir("gradle")),
+            ("COURSIER_CACHE", dir("coursier")),
+        ]
     }
 
     /// `socket-patch <args>` for a command of vendored mode, which downloads
@@ -1397,7 +1407,10 @@ impl Pinned {
     /// Without a Bazel: the checkout of [`Pinned::open`] beside a `pom.xml`,
     /// in a workspace copy that no Bazel has built in. No ruleset pins it,
     /// so the lock is written here: the two artifacts under the stand-in's
-    /// repository, in the format the ruleset of Bazel 9.3.2 writes.
+    /// repository, in the format the ruleset of Bazel 9.3.2 writes. And no
+    /// Bazel leaves its own lock, so what hosted and vendored mode read
+    /// before they write an entry is written here too: the Bazel release,
+    /// and the release of the ruleset that Bazel selected.
     fn unbuilt() -> Pinned {
         let cell = cell_without_bazel("9.3.2");
         let module = fixture_path(FIXTURE.dir).join("e9").join(MODULE);
@@ -1415,7 +1428,32 @@ impl Pinned {
             "version": "3",
         });
         flow.cell.write("maven_install.json", format!("{lock:#}\n"));
+        let selected = "https://bcr.bazel.build/modules/rules_jvm_external/7.2/source.json";
+        let lock = json!({ "lockFileVersion": 13, "registryFileHashes": { selected: "0" } });
+        flow.cell.write("MODULE.bazel.lock", format!("{lock:#}\n"));
+        flow.cell.write(".bazelversion", "9.3.2\n");
         flow
+    }
+
+    /// What every document of a patch that is only in the installed jar
+    /// says, as its action statement and in the warning of its run: the
+    /// lock of the hub, the call and its line, the command of the two modes
+    /// that patch a pinned hub with what tells that it wrote no entry, and
+    /// the option for a repository that ships the installed tree.
+    fn affected(&self) -> Vec<String> {
+        let module = std::fs::read_to_string(self.cell.path(MODULE)).expect(MODULE);
+        let call = module.lines().position(|line| line == "maven.install(");
+        vec![format!(
+            "Bazel builds this package from maven_install.json (`maven.install`, {MODULE}:{}), \
+             which does not name Socket patch {}: the patch is only in the installed copy. Run \
+             `socket-patch get {PURL} --mode hosted` at the Bazel root to patch the hub, or with \
+             `--mode vendored` to commit the patched jar (a `maven_bazel_*` warning of that run \
+             means that the Bazel build keeps the upstream jar). If what you ship is the \
+             installed tree and not what Bazel builds, pass `--no-bazel` (`--vex-no-bazel` on \
+             scan, apply and vendor).",
+            call.expect("the hub") + 1,
+            self.patch.uuid
+        )]
     }
 
     /// Agent mode in the checkout ([`Cell::patches_outside`]). The victim's
@@ -1447,14 +1485,14 @@ impl Pinned {
 ///   repository and warns that it patches no hub, and `apply` passes
 ///   ([`Pinned::patches_the_installed_jar`]). Both, `vex` and
 ///   `vex --no-verify` exit 0 and write a document that says the artifact
-///   is not affected, through the patch.
-/// - (c) The same two Bazel commands print the upstream marker again and
-///   change no file: the hub fetches the jar its lock pins, at the lock's
-///   sha256, and no build reads the Maven local repository.
-///
-/// KNOWN GAP: the documents of (b) are false for what Bazel builds. A fix
-/// makes each say that the artifact is affected, with what Bazel builds it
-/// from and the command that patches the hub.
+///   is affected, with what to do about it ([`Pinned::affected`]).
+/// - (c) The same two Bazel commands print the upstream marker again, as
+///   the documents said, and change no file: the hub fetches the jar its
+///   lock pins, at the lock's sha256, and no build reads the Maven local
+///   repository.
+/// - (d) The hosted command the documents name pins the Maven build and
+///   the hub. The same build prints the marker of the patched jar, and
+///   `vex` says not affected, through the hosted patch.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
 fn an_agent_patch_beside_a_pinned_hub() {
@@ -1464,32 +1502,125 @@ fn an_agent_patch_beside_a_pinned_hub() {
     };
     // (a) The upstream build, with the jar from the stand-in.
     flow.builds_upstream();
+    flow.names_its_bazel();
 
-    // (b) Agent mode patches the installed jar. KNOWN GAP: every document
-    // says not affected.
-    let claim = Claim::new(PURL, &flow.patch.uuid, How::Agent);
+    // (b) Agent mode patches the installed jar, and every document says
+    // the artifact is affected.
+    let names = flow.affected();
+    let claim = Claim::unbuilt(PURL, &flow.patch.uuid, &names);
     let patched = flow.patches_the_installed_jar(&claim);
 
     // (c) The build is the one of (a): Bazel never reads the patched jar.
     flow.cell.builds(&flow.upstream);
     assert_eq!(changed(&patched, &flow.cell.tree()), NOTHING, "{test}");
+
+    // (d) What the documents say to run: the build is patched, and the
+    // document says so.
+    let pinned = flow.pins(&patched, &PINNED);
+    flow.builds_patched(&pinned);
+    let run = |cell: &Cell, args: &[&str]| flow.socket_patch_in(cell, &flow.standin, args);
+    let hosted = Claim::new(PURL, &flow.patch.uuid, How::Hosted);
+    flow.cell.stands_alone(run, &hosted, true);
     println!(
         "{test}: Bazel {} built {:?} before and after `scan --mode agent` patched {VICTIM}-\
-         {VERSION}.jar in the Maven local repository; every form of `vex` said the artifact is \
-         not affected (KNOWN GAP); {:?}",
+         {VERSION}.jar in the Maven local repository, and every form of `vex` said the artifact \
+         is affected, in the words {names:?}; after `get --mode hosted` it built {:?} and `vex` \
+         said not affected; {:?}",
         flow.cell.release(),
         flow.upstream,
+        flow.patch.marker,
         flow.started.elapsed()
     );
 }
 
 /// Without a Bazel: step (b) of [`an_agent_patch_beside_a_pinned_hub`] in a
-/// checkout whose hub is pinned ([`Pinned::unbuilt`]). KNOWN GAP, as there.
+/// checkout whose hub is pinned ([`Pinned::unbuilt`]). Then each of the two
+/// modes the document names, in a checkout of its own: the command pins or
+/// vendors the artifact for the Maven build and for the hub, with no
+/// warning about the hub, and `vex` says not affected, through that mode.
+///
+/// And each where the command writes no entry, in a checkout that names a
+/// Bazel without `override_repo`: the documents of agent mode are the
+/// same, and the command pins or vendors for the Maven build alone and
+/// warns `maven_bazel_release`, which is what the action statement says to
+/// look for. KNOWN LIMIT: `vex` then attests the Maven build's patch as
+/// not affected although the hub still fetches the upstream jar, as it
+/// does without the agent patch before it (the list of what is still wrong
+/// in docs/ecosystems.md, "Bazel workspaces: VEX").
 #[test]
-fn an_installed_jar_is_attested_beside_a_hub_that_fetches_its_own() {
+fn an_installed_jar_is_affected_beside_a_hub_that_fetches_its_own() {
+    let modes = [("hosted", How::Hosted), ("vendored", How::Vendored)];
+    let releases: [(&str, &[&str]); 2] = [("9.3.2", &[]), ("7.3.0", &["maven_bazel_release"])];
+    let each = |(mode, how)| releases.map(|(bazel, declined)| (mode, how, bazel, declined));
+    for (mode, how, bazel, declined) in modes.into_iter().flat_map(each) {
+        let flow = Pinned::unbuilt();
+        flow.cell.write(".bazelversion", format!("{bazel}\n"));
+        let names = flow.affected();
+        let claim = Claim::unbuilt(PURL, &flow.patch.uuid, &names);
+        flow.patches_the_installed_jar(&claim);
+
+        let get = flow.vendored(&["get", PURL, "--mode", mode, "--yes"]);
+        assert_eq!(get.envelope["summary"]["applied"], 1, "{}", get.dump);
+        let mut warned = codes_in(&get.envelope["warnings"]);
+        warned.retain(|code| code.starts_with("maven_bazel_"));
+        let module = std::fs::read_to_string(flow.cell.path(MODULE)).expect(MODULE);
+        let entry = module.contains(&format!("Socket patch {}", flow.patch.uuid));
+        let expected = (declined.join(" "), declined.is_empty());
+        assert_eq!((warned.join(" "), entry), expected, "{}", get.dump);
+        let run = |cell: &Cell, args: &[&str]| flow.socket_patch_in(cell, &flow.standin, args);
+        flow.cell
+            .stands_alone(run, &Claim::new(PURL, &flow.patch.uuid, how), true);
+    }
+}
+
+/// Without a Bazel: what stays the statement of a project without Bazel
+/// while the patch is in the installed jar alone
+/// ([`Cell::keeps_its_statement`]). The hubs of which nothing is said: one
+/// that has no lock, a pinned one beside one that has none, one with a
+/// `maven.override` of the artifact, and one whose call may not run. And
+/// what a person reads of an `apply` beside the hub that fetches the jar:
+/// the warning and the count of the statement, and nothing under
+/// `--silent`.
+#[test]
+fn an_installed_jar_is_attested_where_no_hub_is_shown_to_fetch_its_own() {
     let flow = Pinned::unbuilt();
-    let claim = Claim::new(PURL, &flow.patch.uuid, How::Agent);
+    let names = flow.affected();
+    let claim = Claim::unbuilt(PURL, &flow.patch.uuid, &names);
     flow.patches_the_installed_jar(&claim);
+
+    let (origin, tools) = (flow.standin.origin(), flow.tools_env());
+    let told = tools.each_ref().map(|(name, dir)| (*name, dir.as_str()));
+    let document = flow.cell.document("person");
+    let warned = format!(
+        "Warning: {PURL}: the VEX document says affected. {}",
+        names[0]
+    );
+    let loud = [&["apply"][..], &with_vex(&document)].concat();
+    let silent = [&loud[..], &["--silent"]].concat();
+    for apply in [loud, silent] {
+        flow.cell
+            .tells_a_person(&origin, &apply, &told, &document, &claim, &warned);
+    }
+
+    let module = std::fs::read_to_string(flow.cell.path(MODULE)).expect(MODULE);
+    let lock = "    lock_file = \"//:maven_install.json\",\n";
+    let more = "maven.artifact(\n    name = \"more\",\n    artifact = \"gson\",\n    group = \
+                \"com.google.code.gson\",\n    version = \"2.8.9\",\n)\n";
+    let own = format!(
+        "maven.override(\n    name = \"{HUB}\",\n    coordinates = \"{GROUP}:{VICTIM}\",\n    \
+         target = \"//own:victim\",\n)\n"
+    );
+    let undecided = [
+        module.replace(lock, ""),
+        format!("{module}{more}"),
+        format!("{module}{own}"),
+        module.replace("maven.install(", "ENABLED and maven.install("),
+    ];
+    let run = |cell: &Cell, args: &[&str]| flow.socket_patch_in(cell, &flow.standin, args);
+    let gives = |args: &[&str], document: &Path| flow.cell.gives(&origin, args, &told, document);
+    let installed = Claim::new(PURL, &flow.patch.uuid, How::Agent);
+    flow.cell
+        .keeps_its_statement(run, gives, &installed, &undecided);
 }
 
 /// Without a Bazel: the fixture's directories and the legs of its workflow

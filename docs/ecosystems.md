@@ -2157,7 +2157,7 @@ workspace and that Bazel does not build keeps the matrix at the top.
 | Cargo: rules_rust `crate.from_cargo` over `Cargo.lock` | Supported with `cargo_config` on the hub | Supported | Not supported | Supported |
 | NuGet: rules_csharp `nuget.from_lock` over `packages.lock.json` | Supported with `nuget_config` on the tag | Not supported | Not supported | Supported; for a hosted patch, with no restored copy on the machine |
 | Composer: a rule of your own that runs `composer install` from `composer.lock` | Supported | Not supported | Not supported | Supported with a hosted patch |
-| Maven: rules_jvm_external `maven.install` with a `lock_file` | Supported with Bazel 7.4.0 or later | Supported with Bazel 7.4.0 or later | Not supported | Supported with a hosted or vendored patch |
+| Maven: rules_jvm_external `maven.install` with a `lock_file` | Supported with Bazel 7.4.0 or later | Supported with Bazel 7.4.0 or later | Not supported | Supported |
 
 These words are the table's own, not the [v5 support tiers](#v5-support-tiers). In
 particular "Not supported" does not mean that the command refuses: in several cells it runs,
@@ -2178,14 +2178,15 @@ exits 0 and leaves a build that fails (the known problems below). What a cell sa
   [Bazel workspaces: VEX](#bazel-workspaces-vex) has the cases and the limits; a vendored gem
   is one of the limits. The NuGet cell names another: of a hosted patch `vex` writes no
   document on a machine whose NuGet folder still holds the unpatched package (the last list
-  below).
+  below). For Maven,
+  [Bazel workspaces: Maven](#bazel-workspaces-maven) says what `vex` checks of the hub before
+  it attests an entry, and that it attests a patch that only the Maven or Gradle build
+  holds.
 - **Supported with a condition**, for VEX: under the condition the cell names, the document
   says `not_affected` of a package the Bazel build takes patched, and a test holds it to
-  that (for a hosted Maven patch a test without Bazel). It does not say `affected` of a
+  that. It does not say `affected` of a
   package whose patch is in no build of Bazel's, one that is only in an installed copy, say:
-  of that package it still says `not_affected`. Do not publish that document. For Maven,
-  [Bazel workspaces: Maven](#bazel-workspaces-maven) says what `vex` checks of the hub before
-  it attests an entry.
+  of that package it still says `not_affected`. Do not publish that document.
 
 **Agent mode is not supported for Bazel builds, in any ecosystem.** Agent mode is made for
 the copies a package manager installed: `socket-patch apply` patches them after each install.
@@ -2783,6 +2784,16 @@ artifact:
 - Nothing is said for a jar the block patches, under `--global`, and by a `vendor` whose
   `--ecosystems` leaves Maven out.
 
+`socket-patch vex` and `--vex` say `affected` of an artifact that agent mode patched in an
+installed jar while a pinned hub fetches the jar at that version and the block holds no
+entry for it: the statement names the lock, the `maven.install` and its line, and the
+command of hosted and of vendored mode that patches the hub
+([Bazel workspaces: VEX](#bazel-workspaces-vex)). It says so only when every hub was read.
+Where one was not, the statement stays `not_affected`, as without Bazel, also beside the
+first warning above. The command it names patches the hub only where it writes an entry:
+where it gives a code of the table above instead, the hub stays as it is, and the statement
+of the pin that the command left in the `pom.xml` is `not_affected` (the last limit below).
+
 The Bazel release is the one that `.bazeliskrc` (`USE_BAZEL_VERSION`) or else `.bazelversion`
 at the Bazel root names, read as bazelisk reads them: the last `USE_BAZEL_VERSION` line counts,
 without the blanks around the name and the value, and an empty one leaves it to the first line
@@ -2836,8 +2847,10 @@ Limits:
   that only Bazel builds that is `package_not_installed`. A vendored `get` of a jar that no hub
   builds there fails with `vendor_jvm_shape_unsupported`, as before. So does a `vendor` that is
   refused before it vendors anything (a ledger that cannot be read, or one that git ignores).
-- `socket-patch vex` looks at the hub only for the block's entries: a patch that only the
-  `pom.xml` pin or a patched jar attests is attested, although the Bazel build does not have it.
+- `socket-patch vex` looks at the hub for the block's entries and for a jar that agent mode
+  patched (above): a patch that only a `pom.xml` or Gradle pin, or the vendored tree of
+  such a build, attests is attested, although the Bazel build does not have it. That is the
+  state a hosted or vendored command leaves where it writes no entry for the hub.
 
 ## Bazel workspaces: Cargo
 
@@ -4279,7 +4292,7 @@ What is read, and what is not:
 
 `vex` and `--vex` read what socket-patch wrote and what the project's own package manager
 installed. In a Bazel workspace (the Bazel root of the section on `.bazelignore` above) they
-also read `MODULE.bazel` and the files it includes, for the calls of five rulesets that hand
+also read `MODULE.bazel` and the files it includes, for the calls of six rulesets that hand
 a lock to Bazel:
 
 | Call | Files it names |
@@ -4289,11 +4302,15 @@ a lock to Bazel:
 | rules_ruby `ruby.bundle_fetch` | `gemfile_lock`, `gemfile` |
 | rules_rust `crate.from_cargo` | `cargo_lockfile` |
 | rules_csharp `nuget.from_lock` | `packages_lock_json` |
+| rules_jvm_external `maven.install` | `lock_file` |
 
 Each of them builds a package from what those files name, in a repository of Bazel's own,
 and never from `node_modules`, a virtualenv, a gem home, a cargo home or NuGet's packages
-folder. So two kinds of patch are in no build of Bazel's, and the document says of their
-package that it is `affected`, not that it is patched:
+folder. A rules_jvm_external hub takes a jar from the Maven local repository only when its
+lock has `m2local` and lists the jar under no repository, and then at the lock's sha256
+too, so not the jar as agent mode patched it. So three kinds of patch are in no build of
+Bazel's, and the document says of their package that it is `affected`, not that it is
+patched:
 
 - **A patch in the installed copy** (agent mode) of an npm, PyPI, RubyGems, Cargo or NuGet
   package, when such a call names the project's own lock and that lock lists the package at
@@ -4313,6 +4330,25 @@ package that it is `affected`, not that it is patched:
   0.56.0 and for rules_csharp 0.5.0: the build prints the unpatched package before
   `scan --mode agent` and after it; for rules_rust and rules_csharp also on a second machine
   that has built nothing and has the patched cargo home or NuGet folder.
+- **A patch in an installed jar** (agent mode) of a Maven artifact, when a pinned hub (the
+  `maven.install` tags of one name, with a `lock_file`) fetches the plain jar of that
+  artifact at that version, and the block that hosted and vendored mode keep in the root
+  `MODULE.bazel` holds no entry for the jar. The lock of a hub is no project's own, and no
+  `pom.xml` or Gradle file decides what a hub fetches: the statement is the same from every
+  project of the workspace, whichever build tool installed the jar. The hubs are read as
+  [Bazel workspaces: Maven](#bazel-workspaces-maven) says, and every hub has to be read:
+  beside a hub without a `lock_file`, a tag or a lock that cannot be read, a
+  `maven.override` of the artifact, a `maven_install` of a `WORKSPACE` file that Bazel may
+  read or a block that was changed by hand, the statement stays `not_affected`, also where
+  `apply` warns `maven_bazel_hub_unpatched`.
+  A jar that a hub takes from the Maven local repository under `m2local` counts as fetched:
+  the hub holds that file to the lock's sha256, which the patched jar does not have (read
+  from the ruleset's source at 7.2 and 6.5; no test builds it). The sha256 of the lock is
+  not compared with the patch: a lock that pins the very bytes of the patched jar would
+  still read as `affected`.
+  Measured on Bazel 9.3.2 and 7.7.2 for rules_jvm_external 7.2 and 6.5, with a lock that
+  lists the jar under a repository: the build prints the upstream jar before
+  `scan --mode agent` and after it.
 - **A PyPI patch committed under `.socket/vendor`** (vendored mode), when such a call names
   the file that points at the copy. rules_python 2.5.0-rc4 takes the path of the line for
   the name of a project, and the build of everything the hub serves fails (same three
@@ -4362,6 +4398,30 @@ A test without Bazel runs each of those scans after agent mode, and the document
 `not_affected`; the patched build after a hosted or a vendored scan is tested on real Bazel
 from a checkout that agent mode has not touched.
 
+For a Maven artifact the action statement names the command of the two modes that patch a
+pinned hub. It names the package, and it runs at the Bazel root, where the patch of a hub is
+written:
+
+```
+Run `socket-patch get pkg:maven/<group>/<artifact>@<version> --mode hosted` at the Bazel root to patch the hub, or with `--mode vendored` to commit the patched jar (a `maven_bazel_*` warning of that run means that the Bazel build keeps the upstream jar).
+```
+
+The words in brackets are a condition of the command. It writes its entry for the hub only
+where it can show from the checkout that the entry works: Bazel 7.4.0 or later, a known
+release of the ruleset, no rc file that switches the entry off, a jar that a repository of
+the lock lists, a hub on a `use_extension` that is not isolated (the table of codes in
+[Bazel workspaces: Maven](#bazel-workspaces-maven)). Where it cannot, it gives a
+`maven_bazel_*` warning, and beside a `pom.xml` or a Gradle build it exits 0 and has still
+pinned or vendored the patch for that build. `vex` then attests that patch and says
+`not_affected`, which is wrong for the Bazel build: the hub fetches the upstream jar as
+before (the list at the end of this section). Read the warnings of the command before you
+trust the next document.
+
+A test without Bazel runs each of the two after agent mode. Where the command writes its
+entry it gives no such warning, and `vex` then says `not_affected`. In a checkout that names
+Bazel 7.3.0 it writes none and warns `maven_bazel_release`. The hosted one is run on real
+Bazel after agent mode as well: the build prints the patched jar.
+
 A run tells a person the same in a warning (`vex_bazel_not_in_build`, one per package):
 
 ```
@@ -4386,9 +4446,12 @@ lock. A repository that ships what its package manager installed (a container im
 with `pnpm install` and `socket-patch apply`, say) and keeps the hub for something else, such
 as its tests, says so with `--no-bazel` on `vex`, with `--vex-no-bazel` on `scan`, `apply` and
 `vendor`, or with `SOCKET_VEX_NO_BAZEL=1` in the environment. The Bazel workspace is then not
-read: the document describes the installed tree, and it, the warnings, the exit code and
-every line of the run are those of the same checkout without its Bazel files. The option
-changes nothing outside a Bazel workspace.
+read for the document: it describes the installed tree, and it, the warnings about it, the
+exit code and every line that `vex` prints are those of the same checkout without its Bazel
+files. The option is about the document alone. What `scan`, `apply` and `vendor` themselves
+do and say in a Bazel workspace stays: an agent run beside a pinned rules_jvm_external hub
+still warns `maven_bazel_hub_unpatched`. The option changes nothing outside a Bazel
+workspace.
 
 Nothing changes where the files do not show such a call: outside a Bazel workspace, in a
 `--global` run, for a hosted pin, for a project whose own lock no call names, and wherever
@@ -4417,12 +4480,28 @@ is not read at all. In each of these the document is the one of a
 project without Bazel. Flags outside the committed files (`--override_repository`, an rc
 file) and BUILD files are not read either.
 
+A Maven jar differs in one of these, the `WORKSPACE` file. Its hubs are read as
+[Bazel workspaces: Maven](#bazel-workspaces-maven) says: there such a file counts only when
+it calls `maven_install` or cannot be read, and only while `.bazeliskrc` or `.bazelversion`
+names no Bazel 9 or later. So beside a `WORKSPACE` file that defines other repositories,
+and on Bazel 9 beside any, a jar that a pinned hub fetches is `affected`. In the other cases
+the document of a Maven jar is the one of a project without Bazel as well (a lock of a hub
+is read up to 16 MiB), and also when no pinned hub fetches the jar at that version, when
+the block holds an entry for it, and when any hub of the workspace is not read with
+certainty (the list of the jar above).
+
 Three more things change no statement. A call counts only when it is a statement of its own,
 which Bazel runs once: one in a comprehension, behind an `and`, in a conditional or in the
 arguments of another call may never run. Of a pnpm lock the project documents are read: a
 package that only the document pnpm 11 keeps for its own configuration lists is not one
 rules_js links. And a patch whose record names no advisory gets no statement from any run,
 so it is not looked at here: a run over such a patch alone ends as it does without Bazel.
+
+Only a patch that the run found in place is looked at. Where the installed copy on the
+machine is missing or is not the patched one, `vex` ends as it does without Bazel: no
+statement for that package, and exit 1 (`no_applicable_patches`) when it was the only one,
+although the hub builds the upstream package all the same. `vex --no-verify`, which attests
+the record, says `affected` there. Measured by hand, without Bazel, for a Maven jar.
 
 The document and the build are tested to agree on real Bazel 9.3.2, 8.8.2 and
 7.7.2 for four shapes, all under Bzlmod: Go through gazelle's
@@ -4453,6 +4532,12 @@ NuGet a flow of agent mode holds the documents to the unpatched build as well: t
 [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported) says what the
 document does not show.
 
+For Maven, through rules_jvm_external's `maven.install` with a `lock_file`, a flow of agent
+mode beside a `pom.xml` holds the documents to the unpatched build on Bazel 9.3.2 and 7.7.2:
+the run (`--vex`), `apply --vex`, `vex` and `vex --no-verify` each write one `affected`
+statement. After the hosted command the build is the patched one, and `vex` writes one
+`not_affected` statement. `vex --no-bazel` is tested without Bazel.
+
 For no other Bazel shape do these pages say that the document and the build agree, and in
 these the document is still wrong (`not_affected` while Bazel builds the unpatched package, or while
 the build is broken):
@@ -4473,6 +4558,15 @@ the build is broken):
   file at the root defines something, or the workspace has no `MODULE.bazel`. Measured for
   rules_js, rules_rust and rules_csharp, which build from the lock and never read the
   patched copy.
+- **Agent mode beside rules_jvm_external**, wherever the statement does not say `affected`
+  above: a hub of the workspace is not read with certainty, or the jar reaches Bazel in a
+  way that [Bazel workspaces: Maven](#bazel-workspaces-maven) lists as not seen (a hub of
+  another Bazel module, a `maven_install` inside a function of a `.bzl` file).
+- **Hosted and vendored mode for Maven, where the run wrote no entry for the hub** (the
+  `maven_bazel_*` warnings) and pinned or vendored the patch for a `pom.xml` or a Gradle
+  build: the hub builds the upstream jar. The command that an `affected` statement names
+  ends here where it declines. A test without Bazel holds both modes to it, in a checkout
+  that names Bazel 7.3.0.
 - **Vendored mode for PyPI**, where the workspace is not read with certainty: a
   `WORKSPACE` file that defines something, no `MODULE.bazel`, a call that is not a statement
   of its own, a file that is not given as a plain string label. And where the line that

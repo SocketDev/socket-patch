@@ -674,6 +674,15 @@ impl Hubs {
             (built, _) => built,
         }
     }
+
+    /// Whether the block holds an entry for the jar of `group:artifact` at
+    /// `version`: Bazel takes that entry's jar in the place of a hub's.
+    fn patches(&self, group: &str, artifact: &str, version: &str) -> bool {
+        let jar = |patch: &Patch| {
+            (&*patch.group, &*patch.artifact, &*patch.version) == (group, artifact, version)
+        };
+        self.block.iter().any(jar)
+    }
 }
 
 /// One patch in the block: the jar that takes the place of the one a hub
@@ -1673,13 +1682,10 @@ fn notices_blocking(
     let hubs = Hubs::read(&disk(&root.dir), &disk_up_to(&root.dir, MAX_LOCK));
     let mut said = Vec::new();
     for (purl, (group, artifact, version)) in jars {
-        let in_block = |patch: &Patch| {
-            (&*patch.group, &*patch.artifact, &*patch.version) == (&*group, &*artifact, &*version)
-        };
         let (code, detail) = match hubs.built(&group, &artifact, &version) {
             Built::No => continue,
             // Bazel takes the jar of the block's entry.
-            Built::Yes(_) if hubs.block.iter().any(in_block) => continue,
+            Built::Yes(_) if hubs.patches(&group, &artifact, &version) => continue,
             Built::Yes(by) => {
                 let from = |(hub, _): &(&Hub, &Pinned)| {
                     let (lock, name) = (hub.lock.as_deref().unwrap_or_default(), &hub.name);
@@ -1709,6 +1715,37 @@ fn notices_blocking(
         said.push((code, format!("{purl}: {detail}")));
     }
     said
+}
+
+/// For each of `purls`, patched in the copy a build tool installed: the
+/// pinned hub of the workspace at the Bazel root `root` that fetches the
+/// plain jar of that artifact at that version, the first of them. Bazel
+/// then takes the jar at the sha256 the lock of that hub pins: from a
+/// repository, or under `m2local` from the Maven local repository, where
+/// the patched jar is not one of that sha256. The lock's sha256 is not
+/// compared with the patch: a lock that pins the patched jar's bytes is
+/// read as any other. It is said only when it is certain: every hub was
+/// read ([`Hubs::sure`]), and the block holds no entry for the jar, which
+/// Bazel would take in its place. `None` otherwise, and for what is no
+/// plain jar of a Maven artifact; without one among `purls` nothing is
+/// read.
+pub fn upstream(root: &Path, purls: &[&str]) -> Vec<Option<Hub>> {
+    let jar = |purl| parse_maven_purl(purl).filter(|_| plain(purl));
+    let jars: Vec<_> = purls.iter().copied().map(jar).collect();
+    if jars.iter().all(Option::is_none) {
+        return vec![None; purls.len()];
+    }
+    let hubs = Hubs::read(&disk(root), &disk_up_to(root, MAX_LOCK));
+    let fetched = jars.into_iter().map(|jar| {
+        let (group, artifact, version) = jar?;
+        let Built::Yes(by) = hubs.sure(&group, &artifact, &version) else {
+            return None;
+        };
+        let patched = hubs.patches(&group, &artifact, &version);
+        let hub = by.first().filter(|_| !patched);
+        hub.map(|(hub, _)| (*hub).clone())
+    });
+    fetched.collect()
 }
 
 #[cfg(test)]
@@ -2543,6 +2580,67 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
         let others = others.map(String::from).to_vec();
         assert_eq!(notices_blocking(broken.path(), others), []);
         assert_eq!(notices_blocking(broken.path(), Vec::new()), []);
+    }
+
+    /// [`upstream`] names the hub of an installed jar only where that is
+    /// certain: a pinned hub fetches the plain jar at that version, every
+    /// hub was read, and the block holds no entry for the jar.
+    #[test]
+    fn an_installed_jar_is_upstream_where_a_pinned_hub_surely_fetches_it() {
+        let [_, lock, patched] = sample("7a11e000-0000-4000-8000-0000000000b1");
+        let said = |module: &str, more: &[(&str, &str)], purl: &str| {
+            let pinned = [("MODULE.bazel", module), ("maven_install.json", &lock)];
+            let dir = project(&[&pinned[..], more].concat());
+            let hub = |hub: Hub| {
+                let lock = hub.lock.unwrap_or_default();
+                format!("{} {}:{} {lock}", hub.name, hub.file, hub.line)
+            };
+            let found = upstream(dir.path(), &["pkg:npm/left-pad@1.3.0", purl]);
+            assert_eq!((found.len(), &found[0]), (2, &None), "{purl}");
+            found[1].clone().map(hub).unwrap_or_default()
+        };
+        let fetched = "maven MODULE.bazel:4 maven_install.json";
+        assert_eq!(said(PINNED, &[], NETTY_PURL), fetched);
+        // Also a jar that no repository of the lock lists: under `m2local`
+        // the hub takes it from the Maven local repository, at that sha256.
+        let local = lock.replace("\"repositories\"", "\"m2local\": true, \"mirrors\"");
+        let local = [("maven_install.json", local.as_str())];
+        assert_eq!(said(PINNED, &local, NETTY_PURL), fetched);
+        // Not another version, a classifier or a packaging of the jar.
+        let others = [
+            NETTY_PURL.replace("61", "62"),
+            format!("{NETTY_PURL}?classifier=sources"),
+            format!("{NETTY_PURL}?type=aar"),
+        ];
+        for purl in others {
+            assert_eq!(said(PINNED, &[], &purl), "", "{purl}");
+        }
+        // The block's entry is the jar Bazel takes, and a block that was
+        // changed by hand may hold one. An entry for another version of
+        // the artifact is the entry of another jar.
+        assert_eq!(said(&patched, &[], NETTY_PURL), "");
+        let by_hand = patched.replace("# Do not change", "# Do change");
+        assert_eq!(said(&by_hand, &[], NETTY_PURL), "");
+        let mut earlier = patch("netty-tcnative-classes", OTHER_UUID);
+        earlier.version = "2.0.60.Final".to_string();
+        let earlier = with_patch(PINNED, LABEL, earlier).expect("a block");
+        assert_eq!(said(&earlier, &[], NETTY_PURL), fetched);
+        // Beside the hub that fetches the jar: a hub without a lock, an
+        // override of the jar, and a `WORKSPACE` file that Bazel may read.
+        let lockless = "maven.artifact(name = 'more', artifact = 'a', group = 'g', version = '1')";
+        let over = "maven.override(coordinates = 'io.netty:netty-tcnative-classes', target = ':a')";
+        for more in [lockless, over] {
+            let module = format!("{PINNED}{more}\n");
+            assert_eq!(said(&module, &[], NETTY_PURL), "", "{more}");
+        }
+        let legacy = ("WORKSPACE", "maven_install(artifacts = [])\n");
+        assert_eq!(said(PINNED, &[legacy], NETTY_PURL), "");
+        let bazel_9 = [legacy, (".bazelversion", "9.3.2\n")];
+        assert_eq!(said(PINNED, &bazel_9, NETTY_PURL), fetched);
+        // A `WORKSPACE` file that defines another repository is about no
+        // hub, whatever Bazel reads it.
+        let other = ("WORKSPACE", "http_archive(name = 'zlib', urls = [])\n");
+        assert_eq!(said(PINNED, &[other], NETTY_PURL), fetched);
     }
 
     /// What the warning for a hub that was not read says after where and
