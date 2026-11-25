@@ -334,16 +334,20 @@ async fn detect_pypi_flavor(
     // source, as the lock inventory reads it. Wiring the lock refused a
     // package scan had offered from `requirements.txt`. With no
     // `requirements.txt` the lock still routes to its tool, whose refusal
-    // names it; beside another tool lock the presence order stands.
-    if let [lock @ ("poetry.lock" | "pdm.lock")] = tool_locks[..] {
-        if exists(PYPI_REQUIREMENTS).await
-            && read_regular_to_string(&project_root.join(lock))
-                .await
-                .is_ok_and(|text| super::lock_inventory::pypi::tool_lock_resolves_nothing(&text))
-        {
-            tool_locks.clear();
+    // names it; beside another tool lock the presence order stands. The
+    // read is of a regular file only, so a FIFO planted as the lock still
+    // reaches its backend's guarded load.
+    let packageless_lock = match tool_locks[..] {
+        [lock @ ("poetry.lock" | "pdm.lock")] => {
+            exists(PYPI_REQUIREMENTS).await
+                && read_regular_to_string(&project_root.join(lock))
+                    .await
+                    .is_ok_and(|text| {
+                        super::lock_inventory::pypi::tool_lock_resolves_nothing(&text)
+                    })
         }
-    }
+        _ => false,
+    };
     let governing = pypi_governing_tool_lock(|lock| tool_locks.contains(&lock));
     let has_uv_lock = governing == Some("uv.lock");
     let has_pipfile = exists("Pipfile").await;
@@ -479,6 +483,12 @@ async fn detect_pypi_flavor(
             ));
         }
         return Ok((PypiFlavor::PythonLocks, warnings));
+    }
+    // #1114: past the standalone locks, which rank above a tool lock
+    // whatever it holds, the package-less lock is no install source.
+    let governing = governing.filter(|_| !packageless_lock);
+    if packageless_lock {
+        present.clear();
     }
     if has_uv_lock {
         present.extend(additional_locks.iter().map(String::as_str));
@@ -4578,6 +4588,24 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(selected, flavor, "{lock} beside Pipfile.lock");
+
+            // A standalone lock pinning the package still outranks it, as
+            // it outranks a populated tool lock: a `Pipfile` beside them
+            // does not turn the pylock into Pipenv's.
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), lock, EMPTY).await;
+            touch(tmp.path(), "Pipfile", "[packages]\nsix = \"*\"\n").await;
+            touch(tmp.path(), "requirements.txt", "six==1.16.0\n").await;
+            touch(
+                tmp.path(),
+                "pylock.toml",
+                &PIPENV_PYLOCK.replace("pipenv", "pip"),
+            )
+            .await;
+            let (selected, _) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                .await
+                .unwrap();
+            assert_eq!(selected, PypiFlavor::PythonLocks, "{lock} beside a pylock");
 
             // Unparseable, beside requirements.txt.
             let tmp = tempfile::tempdir().unwrap();
