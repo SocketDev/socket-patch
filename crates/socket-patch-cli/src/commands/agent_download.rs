@@ -677,6 +677,111 @@ pub(crate) fn sort_by_purl(patches: &mut [PatchSearchResult]) {
     patches.sort_by(|a, b| a.purl.cmp(&b.purl).then_with(|| a.uuid.cmp(&b.uuid)));
 }
 
+/// The other patches of the fix that the gem patch `uuid` (found under
+/// `purl`) belongs to, for the builds of the gem that the Bundler lock at
+/// `cwd` names: empty unless the lock names the gem as platform builds.
+///
+/// Each platform gem of a fix has a patch of its own, with its own uuid,
+/// built from the patch of the ruby gem (the fix's source, whose registry
+/// and vendored directory every build shares), and Bundler takes a gem
+/// from one source. So a run that names one patch of such a gem (`get
+/// <uuid>`, the eject of a hosted pin) needs the fix's patch of every
+/// locked build, and its source patch. The fix of a patch is what its
+/// package reference states (`rebuiltFromUuid`, else the patch itself):
+/// this costs one search and one reference request, and nothing for any
+/// other patch. When either lookup fails the answer is empty, and the run
+/// says which locked builds it has no patch for.
+pub(crate) async fn gem_fix_siblings(
+    cwd: &Path,
+    api_client: &ApiClient,
+    use_public_proxy: bool,
+    purl: &str,
+    uuid: &str,
+) -> Vec<PatchSearchResult> {
+    use socket_patch_core::hosted::gem_fixes::GemLock;
+    let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(cwd);
+    let lock = GemLock::read(&view, std::iter::once(purl)).await;
+    if lock.platforms_of(purl).is_empty() {
+        return Vec::new();
+    }
+    let package = socket_patch_core::utils::purl::strip_purl_qualifiers(purl);
+    let Ok(found) = api_client.search_patches_by_package(package).await else {
+        return Vec::new();
+    };
+    // The patches of the builds the lock names (the ruby gem's included),
+    // which this run may take.
+    let mut others: Vec<PatchSearchResult> = lock
+        .narrow_selected(found.patches)
+        .into_iter()
+        .filter(|other| other.uuid != uuid)
+        .filter(|other| !(other.tier == "paid" && use_public_proxy))
+        .collect();
+    if others.is_empty() {
+        return others;
+    }
+    let uuids: Vec<String> = std::iter::once(uuid.to_string())
+        .chain(others.iter().map(|other| other.uuid.clone()))
+        .collect();
+    let Ok(references) = api_client.fetch_registry_references(&uuids).await else {
+        return Vec::new();
+    };
+    let fix_of = |uuid: &str| -> String {
+        references
+            .get(uuid)
+            .and_then(|reference| reference.rebuilt_from_uuid.clone())
+            .filter(|source| !source.is_empty())
+            .unwrap_or_else(|| uuid.to_string())
+    };
+    let fix = fix_of(uuid);
+    let asked_platform = GemLock::platform_of(purl);
+    others.retain(|other| {
+        fix_of(&other.uuid) == fix && GemLock::platform_of(&other.purl) != asked_platform
+    });
+    sort_by_purl(&mut others);
+    others
+}
+
+/// `selected` (one patch per purl, among `candidates`), settled for the gems
+/// the Bundler lock at `cwd` names as platform builds: patches of platform
+/// gems the lock does not name leave it, and every locked build of a gem
+/// takes its patch from one fix
+/// ([`GemLock::choose`](socket_patch_core::hosted::gem_fixes::GemLock::choose):
+/// the fix the ruby gem's ranking puts first among those with a patch for
+/// every locked build). `scan` settles its selection the same way; this is
+/// for a run that names its packages (`get` in hosted and vendored mode).
+/// One reference request, and none for a project with no such gem. When it
+/// fails, the selection is only narrowed to the builds the lock names.
+pub(crate) async fn settle_gem_fixes(
+    cwd: &Path,
+    api_client: &ApiClient,
+    candidates: &[PatchSearchResult],
+    selected: Vec<PatchSearchResult>,
+) -> Vec<PatchSearchResult> {
+    use socket_patch_core::hosted::gem_fixes::GemLock;
+    let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(cwd);
+    let lock = GemLock::read(&view, candidates.iter().map(|patch| patch.purl.as_str())).await;
+    if lock.is_empty() {
+        return selected;
+    }
+    // Every candidate is one this run may take: the tier filter ran.
+    let mut offers = socket_patch_core::rollout::stage::offers_from_results(candidates, true);
+    offers.selected = selected
+        .iter()
+        .map(|patch| (patch.purl.clone(), patch.clone()))
+        .collect();
+    lock.narrow(&mut offers);
+    let uuids = lock.reference_uuids(&offers);
+    if !uuids.is_empty() {
+        if let Ok(references) = api_client.fetch_registry_references(&uuids).await {
+            let recorded = socket_patch_core::rollout::stage::RecordedIndex::default();
+            lock.choose(&mut offers, &references, &recorded);
+        }
+    }
+    let mut settled: Vec<PatchSearchResult> = offers.selected.into_values().collect();
+    sort_by_purl(&mut settled);
+    settled
+}
+
 /// Which state store the shared fetch loop classifies each selected patch
 /// against — the one non-presentational difference between the vendored
 /// and agent download engines.
@@ -1276,9 +1381,7 @@ pub(crate) fn detached_ledger_record<'a>(
     let RecordStore::Ledger(entries) = store else {
         return None;
     };
-    lookup_entry(entries, purl)
-        .filter(|e| e.detached && e.uuid == uuid)
-        .and_then(|e| e.record.as_ref())
+    socket_patch_core::vendor::detached_record_at(entries, purl, uuid)
 }
 
 /// The fetch loop both download engines share: installed-release
@@ -1305,14 +1408,39 @@ pub(crate) async fn fetch_selected_patches(
     // once selection (and get's confirm prompt) is done.
     let mut status = crate::ui::StatusLine::stderr(params.json, params.silent);
     status.set("Preparing download");
-    let (selected, warnings, views) = filter_to_installed_releases(
-        selected,
+    // Vendored mode commits what the project's Bundler lock names, on
+    // every platform it names: the patches of a gem the lock names go by
+    // its builds (each platform gem has a patch of its own), not by the
+    // one copy installed on this machine.
+    let (locked_gems, selected): (Vec<PatchSearchResult>, Vec<PatchSearchResult>) =
+        if matches!(store, RecordStore::Ledger(_)) {
+            let cwd = params.crawler_options().cwd;
+            let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&cwd);
+            let lock = socket_patch_core::hosted::gem_fixes::GemLock::read(
+                &view,
+                selected.iter().map(|patch| patch.purl.as_str()),
+            )
+            .await;
+            let (gems, rest): (Vec<_>, Vec<_>) = selected
+                .iter()
+                .cloned()
+                .partition(|patch| lock.names_gem(&patch.purl));
+            (lock.narrow_selected(gems), rest)
+        } else {
+            (Vec::new(), selected.to_vec())
+        };
+    let (mut selected, warnings, views) = filter_to_installed_releases(
+        &selected,
         params.all_releases,
         &params.crawler_options(),
         quiet,
         api_client,
     )
     .await;
+    if !locked_gems.is_empty() {
+        selected.extend(locked_gems);
+        sort_by_purl(&mut selected);
+    }
     // Agent mode writes into the installed copies. A patch no copy can
     // take, because conda built each of them as something other than the
     // pure-Python PyPI release, is left out here instead of being recorded
@@ -1479,12 +1607,14 @@ pub(crate) async fn fetch_selected_patches(
             RecordStore::Manifest(manifest) => {
                 decide_patch_action(manifest, &patch.purl, &patch.uuid)
             }
-            RecordStore::Ledger(entries) => match lookup_entry(entries, &patch.purl) {
-                Some(entry) if entry.uuid != patch.uuid => PatchAction::Updated {
-                    old_uuid: entry.uuid.clone(),
-                },
-                _ => PatchAction::Added,
-            },
+            RecordStore::Ledger(entries) => {
+                match socket_patch_core::vendor::vendored_uuid(entries, &patch.purl) {
+                    Some(old) if old != patch.uuid => PatchAction::Updated {
+                        old_uuid: old.to_string(),
+                    },
+                    _ => PatchAction::Added,
+                }
+            }
         };
         if action == PatchAction::Skipped {
             // No line of its own: the caller has listed the patch, and the

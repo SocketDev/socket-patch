@@ -1473,7 +1473,23 @@ pub async fn run(args: GetArgs) -> i32 {
                     &telemetry,
                 )
                 .await;
-                let selected = vec![search_result_from_response(&patch)];
+                // Hosted and vendored mode change what Bundler installs: a
+                // gem the lock names as platform builds moves on every
+                // platform or on none.
+                let selected = if mode == super::scan::ScanMode::Agent {
+                    vec![search_result_from_response(&patch)]
+                } else {
+                    status.set("Reading the project's locked gems...");
+                    let selected = with_gem_fix_builds(
+                        &args.common.cwd,
+                        &api_client,
+                        use_public_proxy,
+                        &patch,
+                    )
+                    .await;
+                    status.finish();
+                    selected
+                };
                 let user_patch_warnings =
                     match super::user_patches::check(&args.common, [&patch.purl]).await {
                         Ok(warnings) => {
@@ -1931,11 +1947,44 @@ pub async fn run(args: GetArgs) -> i32 {
         )
     }));
 
+    // Hosted and vendored mode change what Bundler installs: a gem the lock
+    // names as platform builds takes one fix for every locked build.
+    let selected = if mode == super::scan::ScanMode::Agent {
+        selected
+    } else {
+        crate::commands::agent_download::settle_gem_fixes(
+            &args.common.cwd,
+            &api_client,
+            &accessible,
+            selected,
+        )
+        .await
+    };
+
     // Agent wet runs and vendored runs narrow variants in their download
     // engines. Hosted runs and agent previews need the same narrowing here.
     let agent_preview = args.common.dry_run && mode == super::scan::ScanMode::Agent;
     let selected = if agent_preview || mode == super::scan::ScanMode::Hosted {
-        let (selected, variant_warnings, _) = filter_to_installed_releases(
+        // A hosted run pins what the project's Bundler lock names, on
+        // every platform it names: the patches of a gem the lock names go
+        // by its builds (each platform gem has a patch of its own), not by
+        // the one copy installed on this machine.
+        let (locked_gems, selected) = if mode == super::scan::ScanMode::Hosted {
+            let view =
+                socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&args.common.cwd);
+            let lock = socket_patch_core::hosted::gem_fixes::GemLock::read(
+                &view,
+                selected.iter().map(|patch| patch.purl.as_str()),
+            )
+            .await;
+            let (gems, rest): (Vec<_>, Vec<_>) = selected
+                .into_iter()
+                .partition(|patch| lock.names_gem(&patch.purl));
+            (lock.narrow_selected(gems), rest)
+        } else {
+            (Vec::new(), selected)
+        };
+        let (mut selected, variant_warnings, _) = filter_to_installed_releases(
             &selected,
             args.all_releases,
             &args.common.crawler_options(),
@@ -1948,6 +1997,10 @@ pub async fn run(args: GetArgs) -> i32 {
                 .into_iter()
                 .map(|w| (RELEASE_NARROWING.to_string(), w)),
         );
+        if !locked_gems.is_empty() {
+            selected.extend(locked_gems);
+            crate::commands::agent_download::sort_by_purl(&mut selected);
+        }
         selected
     } else {
         selected
@@ -2488,6 +2541,33 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         patch_server_url: args.common.patch_server_url.clone(),
         patch_mirror_url: args.common.patch_mirror_url.clone(),
     }
+}
+
+/// What `get <uuid>` selects for `patch` in hosted and vendored mode: the
+/// patch itself and, for a gem the project's Bundler lock names as platform
+/// builds, the other patches of its fix that the lock has a build for
+/// ([`crate::commands::agent_download::gem_fix_siblings`]). Asking for one
+/// patch of such a gem is asking for its fix: a run that changes what
+/// Bundler installs moves every locked build or none.
+async fn with_gem_fix_builds(
+    cwd: &Path,
+    api_client: &ApiClient,
+    use_public_proxy: bool,
+    patch: &PatchResponse,
+) -> Vec<PatchSearchResult> {
+    let mut selected = vec![search_result_from_response(patch)];
+    selected.extend(
+        crate::commands::agent_download::gem_fix_siblings(
+            cwd,
+            api_client,
+            use_public_proxy,
+            &patch.purl,
+            &patch.uuid,
+        )
+        .await,
+    );
+    crate::commands::agent_download::sort_by_purl(&mut selected);
+    selected
 }
 
 /// `get … --mode hosted`: hand the selected (purl, uuid) pairs to scan's

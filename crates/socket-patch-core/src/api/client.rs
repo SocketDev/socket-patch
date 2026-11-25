@@ -1683,19 +1683,21 @@ impl ApiClient {
     }
 
     /// Step 1 of [`Self::fetch_vendor_package`] on its own: what the
-    /// service lists for the patch besides its archive (the per-platform
-    /// gem prebuilds and their stub gemspecs), each with its host-rewritten
-    /// URL and sha512, and NO archive download. A backend that takes only
-    /// those artifacts learns here which exist. Same grant, statuses, retry
-    /// ladder and circuit breaker as the full fetch; a uuid the attached
-    /// plan names is answered from its reference batch.
+    /// service says of the patch without its archive: the patch it was
+    /// built from and the artifacts it serves besides the archive, each
+    /// with its host-rewritten URL and sha512. NO archive download. The gem
+    /// backend asks this of the patch of each platform gem a lock names,
+    /// to learn whether every one of them can be vendored before it
+    /// downloads any. Same grant, statuses, retry ladder and circuit
+    /// breaker as the full fetch; a uuid the attached plan names is
+    /// answered from its reference batch.
     pub(crate) async fn fetch_vendor_reference(
         &self,
         uuid: &str,
         free_only: bool,
         vendor_url: Option<&str>,
         patch_server_url: Option<&str>,
-    ) -> VendorServiceOutcome<Vec<SecondaryArtifact>> {
+    ) -> VendorServiceOutcome<VendorReference> {
         if let Some(refused) = self.vendor_request_refused(uuid) {
             return VendorServiceOutcome::Failed(refused);
         }
@@ -1705,10 +1707,10 @@ impl ApiClient {
         {
             Ok(result) => (
                 reference_miss(&result.status).unwrap_or_else(|| {
-                    VendorServiceOutcome::Ready(served_secondary_artifacts(
-                        &result,
-                        patch_server_url,
-                    ))
+                    VendorServiceOutcome::Ready(VendorReference {
+                        rebuilt_from_uuid: result.rebuilt_from_uuid.clone(),
+                        artifacts: served_secondary_artifacts(&result, patch_server_url),
+                    })
                 }),
                 false,
             ),
@@ -2405,14 +2407,22 @@ pub(crate) struct FetchedVendorPackage {
     pub prestaged: crate::vendor::prestage::Prestaged,
 }
 
+/// What the service says of a patch without its archive
+/// ([`ApiClient::fetch_vendor_reference`]).
+#[derive(Debug, Clone)]
+pub(crate) struct VendorReference {
+    /// The uuid of the patch this one was built from (`rebuiltFromUuid`);
+    /// `None` for a patch that is itself a source.
+    pub rebuilt_from_uuid: Option<String>,
+    /// The served artifacts besides the archive.
+    pub artifacts: Vec<SecondaryArtifact>,
+}
+
 /// A non-tarball served artifact reference (e.g. `gem-stub-gemspec`): its kind,
 /// final download URL, and sha512 SRI. Bytes are fetched + verified on demand.
 #[derive(Debug, Clone)]
 pub(crate) struct SecondaryArtifact {
     pub kind: String,
-    /// The gem platform a `gem-platform` / `gem-platform-stub-gemspec`
-    /// artifact is for; `None` on every other kind.
-    pub platform: Option<String>,
     pub url: String,
     /// Normalized `sha512-<b64>` of the artifact bytes.
     pub integrity_sri: String,
@@ -2517,7 +2527,7 @@ fn reference_miss<T>(status: &str) -> Option<VendorServiceOutcome<T>> {
 }
 
 /// The served artifacts of a granted reference OTHER than the archive (the
-/// gem path-source stub gemspec, the per-platform gem prebuilds, …) — their
+/// gem path-source stub gemspec, …) — their
 /// host-rewritten URL + normalized sha512 — so a backend that needs one can
 /// download + verify it lazily. Each is skipped unless it carries both a
 /// url and a sha512.
@@ -2542,7 +2552,6 @@ fn served_secondary_artifacts(
         };
         secondary_artifacts.push(SecondaryArtifact {
             kind: a.kind.clone(),
-            platform: a.platform.clone(),
             url,
             integrity_sri: normalize_sha512_sri(sha512),
             prefetched: None,

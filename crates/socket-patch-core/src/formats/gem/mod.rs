@@ -409,6 +409,45 @@ pub fn locked_gem_builds(lock: &str, purls: &[String]) -> Vec<Vec<GemBuild>> {
         .collect()
 }
 
+/// The builds the Bundler lock text `lock` resolves each gem of `purls` to,
+/// read from every source section: the `GEM` sections, and `PATH` / `GIT` /
+/// `PLUGIN SOURCE` too. A gem vendored as platform gems holds one entry
+/// per platform in a `PATH` section, and those are still the builds the
+/// project installs: a run that selects patches for the project's builds
+/// asks this, where [`locked_gem_builds`] answers which builds a registry
+/// serves. Element `i` answers `purls[i]`, the ruby-platform gem first.
+pub fn resolved_gem_builds(lock: &str, purls: &[String]) -> Vec<Vec<GemBuild>> {
+    let lock = crate::utils::line_endings::to_lf(lock);
+    let parsed = parse(&lock);
+    purls
+        .iter()
+        .map(|purl| {
+            let Some((name, version)) = gem_coordinates(purl) else {
+                return Vec::new();
+            };
+            let mut builds = LockedBuilds::default();
+            let specs = parsed
+                .sections
+                .iter()
+                .flat_map(|section| section.specs.iter().filter_map(|line| line.parsed))
+                .filter(|spec| spec.name == name && spec.version == version);
+            for spec in specs {
+                match spec.platform {
+                    Some(platform) => {
+                        builds.platforms.insert(platform);
+                    }
+                    None => builds.ruby = true,
+                }
+            }
+            builds
+                .ids(&name, &version)
+                .iter()
+                .map(GemBuild::of)
+                .collect()
+        })
+        .collect()
+}
+
 impl<'t> GemfileLock<'t> {
     /// Parse a lock text ([`parse`]).
     pub fn parse(text: &'t str) -> Self {
@@ -916,6 +955,26 @@ mod tests {
                 vec![],
                 vec![],
             ]
+        );
+        // What the project resolves, in whichever section: the `PATH`
+        // section's platform entry too (a gem vendored as platform gems).
+        let resolved: Vec<Vec<String>> = resolved_gem_builds(&text, &purls)
+            .into_iter()
+            .map(|builds| builds.into_iter().map(|build| build.leaf).collect())
+            .collect();
+        assert_eq!(
+            resolved,
+            [
+                vec![
+                    "nokogiri-1.18.10-aarch64-linux-musl".to_string(),
+                    "nokogiri-1.18.10-arm64-darwin".to_string(),
+                    "nokogiri-1.18.10-x86_64-linux-gnu".to_string()
+                ],
+                vec![],
+                vec![],
+                vec![],
+            ],
+            "every section's specs, and no CHECKSUMS entry"
         );
         let purl = "pkg:gem/nokogiri@1.18.10";
         assert_eq!(

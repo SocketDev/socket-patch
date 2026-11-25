@@ -104,6 +104,22 @@ impl KnownReferences {
         KnownReferences(results)
     }
 
+    /// `known`, with the settled answers of `results` (a reference
+    /// response, by the uuid asked about) added: the references a scan read
+    /// to settle the patches of platform-locked gems. `None` when neither
+    /// holds an answer.
+    pub(crate) fn with(
+        known: Option<Self>,
+        results: HashMap<String, PackageVendorResult>,
+    ) -> Option<Self> {
+        let asked: Vec<String> = results.keys().cloned().collect();
+        let mut answers = Self::settled(&asked, results).0;
+        if let Some(known) = known {
+            answers.extend(known.0);
+        }
+        (!answers.is_empty()).then_some(KnownReferences(answers))
+    }
+
     /// The uuids in `uuids` with no known answer.
     pub(crate) fn unknown(&self, uuids: &[String]) -> Vec<String> {
         uuids

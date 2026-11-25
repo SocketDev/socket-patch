@@ -17,6 +17,7 @@ use socket_patch_core::crawlers::ruby_crawler::{
     config_path_ignored_warning, stale_plugin_registration_warning,
 };
 use socket_patch_core::crawlers::Ecosystem;
+use socket_patch_core::hosted::gem_fixes::GemLock;
 use socket_patch_core::ledgers::merge_ledger_records_for_updates;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{
@@ -553,6 +554,14 @@ async fn embed_vex_human(
 /// `false, false`). `json_warnings` is the JSON callers' envelope: a
 /// partial failure adds one [`PATCH_DETAILS_FAILED`] warning per failed
 /// package to it, and [`Discovered::failed`] lists each failed purl.
+///
+/// `gem_fixes` is given by a run that changes what Bundler installs (hosted
+/// and vendored mode): the selection is then settled for the gems the
+/// project's Bundler lock names as platform builds, each of which has a
+/// patch of its own ([`GemLock`]). Patches of platform gems the lock does
+/// not name leave it, and every locked build of a gem takes the patch of
+/// one fix. That reads the package references of the patches on offer for
+/// those builds: one request, and none for a project with no such gem.
 #[allow(clippy::too_many_arguments)]
 async fn discover_selected(
     api_client: &socket_patch_core::api::client::ApiClient,
@@ -563,6 +572,7 @@ async fn discover_selected(
     warn: bool,
     detail_error_line: bool,
     json_warnings: Option<&mut Envelope>,
+    gem_fixes: Option<GemFixScope<'_>>,
 ) -> Result<Discovered, (i32, String)> {
     let (all_search_results, failures) =
         fetch_patch_details(api_client, packages, show_progress, warn).await;
@@ -583,7 +593,25 @@ async fn discover_selected(
     // Some queries failed, some succeeded: a `--json` run has no stderr
     // warning (`warn` is human-only), so each failed package becomes a
     // run-level `warnings[]` entry — never a silent drop from the envelope.
-    let offers = select_accessible(all_search_results, can_access_paid_patches, policy);
+    let mut offers = select_accessible(all_search_results, can_access_paid_patches, policy);
+    // `Some` for a run that settles the builds of a gem together.
+    let mut gem_builds = gem_fixes.is_some().then(HashMap::new);
+    let mut references = HashMap::new();
+    if let Some(scope) = gem_fixes {
+        let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(scope.cwd);
+        let lock = GemLock::read(&view, offers.unfiltered.keys().map(String::as_str)).await;
+        lock.narrow(&mut offers);
+        let uuids = lock.reference_uuids(&offers);
+        if !uuids.is_empty() {
+            // A failed lookup settles nothing here: the selection stays as
+            // ranked, and the mode's own reference lookup reports it.
+            if let Ok(found) = api_client.fetch_registry_references(&uuids).await {
+                gem_builds = Some(lock.choose(&mut offers, &found, scope.recorded));
+                references = found;
+                references.retain(|uuid, _| uuids.contains(uuid));
+            }
+        }
+    }
     if let Some(env) = json_warnings {
         for (purl, e) in &failures {
             env.warn(
@@ -597,7 +625,17 @@ async fn discover_selected(
         offers,
         failed: failures,
         paid_access: can_access_paid_patches,
+        gem_builds,
+        references,
     })
+}
+
+/// What [`discover_selected`] settles the patches of platform-locked gems
+/// by: the project (its Bundler lock) and what is recorded for it.
+#[derive(Clone, Copy)]
+struct GemFixScope<'a> {
+    cwd: &'a std::path::Path,
+    recorded: &'a rollout::RecordedIndex,
 }
 
 /// [`discover_selected`]'s result: the offers, each failed detail query
@@ -608,6 +646,14 @@ struct Discovered {
     offers: rollout::Offers,
     failed: Vec<(String, String)>,
     paid_access: bool,
+    /// How the rows of the builds of a gem are classified, by patch purl,
+    /// where [`GemLock::choose`] decided them together. `None` for a run
+    /// that does not settle them (agent mode, a report-only scan): its
+    /// rows are classified each by its own purl.
+    gem_builds: Option<HashMap<String, socket_patch_core::rollout::Recorded>>,
+    /// The package references read to settle them, by uuid: a hosted run
+    /// asks only about the selected uuids these do not answer.
+    references: HashMap<String, socket_patch_core::api::types::PackageVendorResult>,
 }
 
 impl Discovered {
@@ -658,7 +704,12 @@ fn classified_rows(
         .map(|(purl, _)| purl.clone())
         .collect();
     stage.incomplete = rollout::lookup_incomplete(&recorded.index, &failed, batch_failed);
-    let rows = rollout::classify(&discovered.offers, &recorded.index, &stage.project);
+    let rows = rollout::classify_with(
+        &discovered.offers,
+        &recorded.index,
+        discovered.gem_builds.as_ref(),
+        &stage.project,
+    );
     if let Some(env) = result {
         let updates = offer_updates(&rows, discovered, recorded, packages);
         env.set_extra("updates", serde_json::Value::Array(updates_json(&updates)));
@@ -3728,6 +3779,7 @@ async fn scan_project(
                 false,
                 false,
                 Some(&mut env),
+                None,
             )
             .await
             {
@@ -3759,6 +3811,7 @@ async fn scan_project(
                 false,
                 false,
                 Some(&mut env),
+                None,
             )
             .await
             {
@@ -4011,6 +4064,9 @@ async fn scan_project(
     // of the packages it patched under its result line, and counts the
     // rest as left to patch.
     let mut plan = Vec::new();
+    // The package references read to settle the patches of platform-locked
+    // gems, for the hosted flow to reuse.
+    let mut gem_references = HashMap::new();
     let rows: Vec<rollout::Row> = if !fetch_details {
         plan = report::plan(
             &all_packages_with_patches,
@@ -4034,10 +4090,16 @@ async fn scan_project(
             !silent,
             !hosted,
             None,
+            // Hosted and vendored runs change what Bundler installs.
+            (hosted || vendor).then_some(GemFixScope {
+                cwd: &args.common.cwd,
+                recorded: &recorded.index,
+            }),
         )
         .await
         {
-            Ok(discovered) => {
+            Ok(mut discovered) => {
+                gem_references = std::mem::take(&mut discovered.references);
                 let rows = classified_rows(
                     &mut stage,
                     &discovered,
@@ -4116,7 +4178,7 @@ async fn scan_project(
                 stage: &mut stage,
                 rows,
                 prior: prior_discovery,
-                references: sweep_references,
+                references: withdrawn::KnownReferences::with(sweep_references, gem_references),
                 plan,
                 report: Some(report),
             }),
