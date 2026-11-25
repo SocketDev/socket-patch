@@ -180,17 +180,6 @@ fn has_corepack_pm(pm: &str) -> bool {
     ok
 }
 
-/// `dir` as the operating system spells it: every link resolved and, on
-/// Windows, every 8.3 short name expanded, without the verbatim `\\?\`
-/// prefix `canonicalize` adds there. A directory that cannot be resolved
-/// is returned as given, so a child started in it fails as it would have.
-fn os_spelling(dir: &Path) -> PathBuf {
-    std::fs::canonicalize(dir).map_or_else(
-        |_| dir.to_path_buf(),
-        socket_patch_core::utils::pnpm_workspace::without_verbatim_prefix,
-    )
-}
-
 fn corepack(cwd: &Path, pm: &str, args: &[&str]) -> Output {
     corepack_with_retries(cwd, pm, args, false)
 }
@@ -228,16 +217,10 @@ fn corepack_command(cwd: &Path, pm: &str, args: &[&str], registry_retries: bool)
             }
         })
         .collect();
-    // pnpm gets its working directory in the operating system's spelling.
-    // pnpm 11 keeps the project directory as the process was given it and
-    // resolves the workspace root (the directory of a pnpm-workspace.yaml,
-    // where the lock is) through the operating system. The temp directory
-    // of a hosted Windows runner is under an 8.3 short name
-    // (`C:\Users\RUNNER~1\...`), so the two spelled one directory
-    // differently: `pnpm remove` and `pnpm add` then recorded the project
-    // as a second importer (`../../RUNNER~1/.../proj`) and left the root
-    // importer `.`, with the dependency they were to change, as it was.
-    cmd.args(&args).current_dir(os_spelling(cwd));
+    // pnpm is handed the spelling of its directory that it resolves itself,
+    // or it keys the project in the lock by the path between the two.
+    cmd.args(&args);
+    hermetic::start_in(&mut cmd, cwd);
     if !registry_retries
         && args.first().is_some_and(|arg| arg == "install")
         && pm
