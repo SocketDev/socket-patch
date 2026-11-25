@@ -29,7 +29,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256, hermetic};
+use common::{binary, git_sha256, git_sha256_file, has_command, hermetic};
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -63,17 +63,6 @@ const FAKE_OLD_UUID: &str = "11111111-1111-4111-8111-111111111111";
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn has_command(cmd: &str) -> bool {
-    let mut probe = Command::new(cmd);
-    probe.arg("--version");
-    cache_env::isolate(&mut probe);
-    probe
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
-}
-
 /// These e2e tests are `#[ignore]`d and only execute when explicitly
 /// requested (`--ignored`) — at which point npm is a hard prerequisite, not
 /// an optional one. A silent `return` on missing npm would let the entire
@@ -85,11 +74,6 @@ fn require_npm() {
         "npm not found on PATH; the e2e_scan suite requires npm. \
          Install npm before running with --ignored."
     );
-}
-
-fn git_sha256_file(path: &Path) -> String {
-    let content = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    git_sha256(&content)
 }
 
 fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {

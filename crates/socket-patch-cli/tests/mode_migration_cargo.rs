@@ -40,7 +40,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::{binary, git_sha256, sha256_hex};
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -123,10 +123,6 @@ fn assert_build_ok(tag: &str, out: &Output) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
 }
 
 fn stage_patch(proj: &Path, purl: &str, before: &[u8], after: &[u8]) {

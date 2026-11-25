@@ -10,7 +10,7 @@
 //! byte-for-byte on real `bundle lock` output (bundler 4.0.15).
 
 use crate::common::envelope::{events, parse_json_envelope};
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, sha256_hex};
 
 use std::path::{Path, PathBuf};
 
@@ -28,10 +28,6 @@ const ENCODED: &str = "pkg%3Anpm%2Fleft-pad%401.3.0";
 const BEFORE: &[u8] = b"before\n";
 const AFTER: &[u8] = b"after\n";
 const AFTER_B64: &str = "YWZ0ZXIK";
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
 
 fn sri_of(bytes: &[u8]) -> String {
     use base64::Engine as _;

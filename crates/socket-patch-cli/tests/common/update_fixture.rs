@@ -334,7 +334,6 @@ pub struct FakeReleaseBuilder {
     omit_assets: Vec<String>,
     truncate: Vec<(String, usize)>,
     metadata_delay: Option<Duration>,
-    asset_delay: Option<Duration>,
     expect_resolves: Option<u64>,
     expect_sums: Option<u64>,
     expect_asset_downloads: Option<u64>,
@@ -354,13 +353,6 @@ impl FakeReleaseBuilder {
             asset_name_for_current_target(),
             archive_for_current_target(binary_bytes),
         ));
-        self
-    }
-
-    /// Add a raw pre-built asset (exotic shapes: garbage archives, other
-    /// targets).
-    pub fn raw_asset(mut self, filename: &str, bytes: Vec<u8>) -> Self {
-        self.assets.push((filename.to_string(), bytes));
         self
     }
 
@@ -397,11 +389,6 @@ impl FakeReleaseBuilder {
 
     pub fn delay_metadata(mut self, d: Duration) -> Self {
         self.metadata_delay = Some(d);
-        self
-    }
-
-    pub fn delay_asset(mut self, d: Duration) -> Self {
-        self.asset_delay = Some(d);
         self
     }
 
@@ -527,13 +514,7 @@ impl FakeReleaseBuilder {
                 .and(urlpath(format!(
                     "/SocketDev/socket-patch/releases/download/v{ver}/{name}"
                 )))
-                .respond_with({
-                    let mut resp = ResponseTemplate::new(200).set_body_bytes(body);
-                    if let Some(d) = self.asset_delay {
-                        resp = resp.set_delay(d);
-                    }
-                    resp
-                });
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body));
             if let Some(n) = self.expect_asset_downloads {
                 asset_mock = asset_mock.expect(n);
             }

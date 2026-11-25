@@ -15,7 +15,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256, hermetic};
+use common::{binary, git_sha256, git_sha256_file, has_command, hermetic};
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -38,22 +38,6 @@ const AFTER_HASH: &str = "ec956dcafb886f14315570bf3981d44aa12c561716abb46eed8b06
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn has_command(cmd: &str) -> bool {
-    let mut probe = Command::new(cmd);
-    probe.arg("--version");
-    cache_env::isolate(&mut probe);
-    probe
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
-}
-
-fn git_sha256_file(path: &Path) -> String {
-    let content = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    git_sha256(&content)
-}
 
 /// Run the CLI binary with the given args, setting `cwd` as the working dir.
 /// Returns `(exit_code, stdout, stderr)`.
