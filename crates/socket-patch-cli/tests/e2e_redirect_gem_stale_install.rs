@@ -3264,6 +3264,79 @@ async fn gem_hosted_get_takes_every_locked_build_of_the_fix() {
     }
 }
 
+/// With the rollout's budget spent, a gem locked as platform builds is
+/// deferred whole, its source patch included: nothing is written, the
+/// builds are reported as deferred, and the run gives no platform warning
+/// for a gem that was only deferred.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_scan_defers_a_platform_gem_whole() {
+    let ruby_sha = sha256_of(&real_gem(PATCHED_LIB));
+    let builds = [
+        (PLATFORM, sha256_of(&real_gem_for(PATCHED_LIB, PLATFORM))),
+        (
+            OTHER_PLATFORM,
+            sha256_of(&real_gem_for(PATCHED_LIB, OTHER_PLATFORM)),
+        ),
+    ];
+    let server = MockServer::start().await;
+    mount_api_with(&server, None, &ruby_sha, &builds).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let gemfile = format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\n");
+    let lock = platform_lock(&"1".repeat(64), &"2".repeat(64));
+    std::fs::write(proj.join("Gemfile"), &gemfile).unwrap();
+    std::fs::write(proj.join("Gemfile.lock"), &lock).unwrap();
+    let uri = server.uri();
+    let (code, stdout, stderr) = common::run_with_env(
+        &proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--max-new-patches",
+            "0",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            uri.as_str(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+        &[],
+    );
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    assert_eq!(hosted_pinned(&env), 0, "{env}");
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
+        lock
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+        gemfile
+    );
+    assert!(
+        warnings_with_code(&env, "redirect_gem_platform_unsupported").is_empty(),
+        "a deferred gem has every patch it needs: {env}"
+    );
+    let deferred: Vec<&str> = env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["action"] == "skipped" && e["errorCode"] == "rollout_deferred")
+        .filter_map(|e| e["purl"].as_str())
+        .collect();
+    assert!(
+        !deferred.is_empty() && deferred.iter().all(|purl| purl.starts_with(PURL)),
+        "the gem's builds are reported as deferred: {env}"
+    );
+}
+
 /// The fix's source patch is not offered to the run, while the patch of
 /// every locked build is: the gem is moved all the same, through the
 /// registry of the first locked build's own patch (any patch registry of a
