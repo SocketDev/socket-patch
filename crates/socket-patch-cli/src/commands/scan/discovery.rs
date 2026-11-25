@@ -389,6 +389,12 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
                 return None;
             }
             let pkg = crawled.iter().find(|c| PurlKey::same(&c.purl, base))?;
+            // A platform gem's patch says what that platform's gem holds:
+            // the one copy installed here is another platform's for every
+            // other build the lock names, and differs from them by design.
+            if !gem_patch_is_of_copy(&patch.purl, &pkg.path) {
+                return None;
+            }
             // The same predicate as the download phase's ledger
             // idempotency skip: its no-fetch set and this one must be
             // the same set.
@@ -1039,8 +1045,49 @@ pub(crate) async fn nested_project_skips(
     (skipped, warnings)
 }
 
+/// Whether the installed copy at `copy` is the gem that the patch purl
+/// `patch_purl` is a patch of. Always for a patch of a ruby-platform gem
+/// (and of any other ecosystem); for a platform gem's patch
+/// (`?platform=<platform>`), only a copy installed as that platform's gem
+/// (`<name>-<version>-<platform>`).
+fn gem_patch_is_of_copy(patch_purl: &str, copy: &std::path::Path) -> bool {
+    let Some(platform) = socket_patch_core::utils::purl::gem_platform_qualifier(patch_purl) else {
+        return true;
+    };
+    let Some(leaf) = copy.file_name().and_then(|leaf| leaf.to_str()) else {
+        return false;
+    };
+    // `None` for a purl that is no gem's: its qualifier is not ours to read.
+    match socket_patch_core::formats::gem::GemBuild::ruby(patch_purl) {
+        None => true,
+        Some(_) => socket_patch_core::formats::gem::GemBuild::of_leaf(patch_purl, leaf)
+            .is_some_and(|build| build.platform.as_deref() == Some(platform)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// A platform gem's patch is compared only with a copy of its own
+    /// platform: on an x86_64 machine the aarch64 patch of the same lock
+    /// has no copy here, and must not be held against the x86_64 one.
+    #[test]
+    fn a_platform_gems_patch_is_compared_with_its_own_platform_only() {
+        let copy = |leaf: &str| std::path::PathBuf::from("/home/gems").join(leaf);
+        let x86 = copy("nokogiri-1.18.10-x86_64-linux-gnu");
+        let ruby = copy("nokogiri-1.18.10");
+        let patch = |platform: &str| format!("pkg:gem/nokogiri@1.18.10?platform={platform}");
+        assert!(gem_patch_is_of_copy(&patch("x86_64-linux-gnu"), &x86));
+        assert!(!gem_patch_is_of_copy(&patch("aarch64-linux-gnu"), &x86));
+        assert!(!gem_patch_is_of_copy(&patch("x86_64-linux-gnu"), &ruby));
+        // The ruby gem's patch, and any other ecosystem's, as before.
+        assert!(gem_patch_is_of_copy(&patch("ruby"), &x86));
+        assert!(gem_patch_is_of_copy("pkg:gem/nokogiri@1.18.10", &ruby));
+        assert!(gem_patch_is_of_copy(
+            "pkg:pypi/numpy@2.4.4?platform=aarch64-linux-gnu",
+            &copy("numpy")
+        ));
+    }
+
     use super::*;
     use socket_patch_core::api::types::BatchPatchInfo;
     use socket_patch_core::ledgers::merge_ledger_records_for_updates;
