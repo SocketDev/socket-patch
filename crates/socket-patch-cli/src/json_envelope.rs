@@ -671,12 +671,17 @@ pub(crate) fn manifest_load_error_code(err: &std::io::Error) -> &'static str {
 ///   (`unmatched` is that target). That is never "not found", which is a
 ///   statement about every store: the ledger is a vendored project's only
 ///   record of its patches, so it may hold the target.
+///
+/// `hint` is the caller's parenthesis about that target (`rollback`'s "to
+/// target a directory instead"), or empty. It stays with the target, ahead
+/// of the ledger's own error: after it, the hint reads as part of it.
 pub(crate) fn vendor_ledger_load_error(
     err: &std::io::Error,
     unmatched: Option<&str>,
+    hint: &str,
 ) -> EnvelopeError {
     let lookup = unmatched.map_or_else(String::new, |target| {
-        format!(" to look up {target}, which matches nothing else in the project")
+        format!(" to look up {target}, which matches nothing else in the project{hint}")
     });
     EnvelopeError::new(
         "vendor_state_unreadable",

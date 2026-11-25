@@ -345,7 +345,7 @@ async fn refuse_unreadable_ledger(
     patches: &[PatchOutcome],
     telemetry: &TelemetryAuth,
 ) -> i32 {
-    let error = crate::json_envelope::vendor_ledger_load_error(err, unmatched);
+    let error = crate::json_envelope::vendor_ledger_load_error(err, unmatched, "");
     track_failed(args, &error.code, &error.message, patches, telemetry).await;
     emit_error_envelope(
         args.common.json,

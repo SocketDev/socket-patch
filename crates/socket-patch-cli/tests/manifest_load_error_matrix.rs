@@ -406,6 +406,40 @@ fn a_target_is_never_not_found_while_the_vendor_ledger_cannot_be_stat() {
     });
 }
 
+/// `rollback <name>` keeps its "to target a directory instead" hint when
+/// the ledger is what failed, and the hint stays with the target. After
+/// the ledger's own error it read as part of it: `… key must be a string
+/// at line 4 column 1 (to target a directory instead, use ./x or x/**)`.
+#[test]
+fn rollback_puts_the_directory_hint_ahead_of_the_ledger_error() {
+    let tmp = ledger_project(
+        &|ledger| std::fs::write(ledger, CONFLICTED_LEDGER).unwrap(),
+        None,
+    );
+    let hint = "(to target a directory instead, use ./x or x/**)";
+
+    let (exit, v) = run_targeted(&tmp, &["rollback", "x", "--json", "--offline", "--dry-run"]);
+    assert_eq!(exit, 1, "{v}");
+    assert_eq!(v["error"]["code"], "vendor_state_unreadable", "{v}");
+    let message = v["error"]["message"].as_str().unwrap();
+    let (target, ledger_error) = message
+        .split_once(&format!(" {hint}: "))
+        .unwrap_or_else(|| panic!("the hint ends the clause about the target: {message}"));
+    assert!(target.contains("to look up x"), "{message}");
+    assert!(ledger_error.contains("state.json"), "{message}");
+    assert_eq!(message.matches(hint).count(), 1, "{message}");
+
+    // A PURL is never a directory, so it carries no hint.
+    let (exit, v) = run_targeted(
+        &tmp,
+        &["rollback", "pkg:npm/x@1.0.0", "--json", "--offline"],
+    );
+    assert_eq!(exit, 1, "{v}");
+    assert_eq!(v["error"]["code"], "vendor_state_unreadable", "{v}");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(!message.contains("to target a directory"), "{message}");
+}
+
 /// `repair` takes no target, and probed for the ledger the same way: with
 /// no manifest, one it could not stat was a project with nothing to
 /// repair (`manifest_not_found`).

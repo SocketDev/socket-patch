@@ -2293,15 +2293,17 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 format!(" (to target a directory instead, use ./{id} or {id}/**)")
             };
             // In no store that could be read. A ledger that could not be
-            // may hold it: its error then, not `patch_not_found`.
-            let mut error = match &vendor_state_result {
-                Err(e) => crate::json_envelope::vendor_ledger_load_error(e, Some(&id.to_string())),
+            // may hold it: its error then, not `patch_not_found`. Either
+            // way the hint ends what is said about the target.
+            let error = match &vendor_state_result {
+                Err(e) => {
+                    crate::json_envelope::vendor_ledger_load_error(e, Some(&id.to_string()), &hint)
+                }
                 Ok(_) => EnvelopeError::new(
                     "patch_not_found",
-                    format!("No patch found matching identifier: {id}"),
+                    format!("No patch found matching identifier: {id}{hint}"),
                 ),
             };
-            error.message.push_str(&hint);
             track_unstarted(&args, &error.code, &error.message, &telemetry).await;
             if args.common.json {
                 let mut env = error_envelope(args.common.dry_run, error);
@@ -2371,7 +2373,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             // not be read, and the pattern may select one of them: the
             // ledger's error then, not `path_glob_no_match`.
             let error = match &vendor_state_result {
-                Err(e) => crate::json_envelope::vendor_ledger_load_error(e, Some(unmatched.1)),
+                Err(e) => crate::json_envelope::vendor_ledger_load_error(e, Some(unmatched.1), ""),
                 Ok(_) => EnvelopeError::new(
                     "path_glob_no_match",
                     format!(
