@@ -1802,6 +1802,127 @@ fn the_switch_makes_vendored_mode_the_one_of_a_checkout_without_bazel() {
     assert_eq!(declined[0]["code"], 1, "{declined:#}");
 }
 
+/// Without a Bazel: the switch is for the gem committed for a hub as well.
+/// In the checkout where vendored mode commits the gem as its archive,
+/// `SOCKET_NO_BAZEL=1` makes it vendor the gem as it does in the same
+/// checkout without its `MODULE.bazel`, to the byte: the unpacked copy,
+/// which the lock names by its path, and no archive. Without the variable
+/// the run commits the gem for the hub there.
+#[test]
+fn the_switch_makes_a_gem_for_the_hub_the_vendoring_of_a_checkout_without_bazel() {
+    let (cell, served) = checkout();
+    cell.write(".bazelversion", "9.3.2\n");
+    let origin = served.standin.origin();
+    let rubygems = format!("{origin}/{RUBYGEMS}");
+    let env = [
+        ("SOCKET_RUBYGEMS_URL", rubygems.as_str()),
+        patch_host(&origin)[0],
+    ];
+    let (plain, for_the_hub) = cell.without_and_beside(&origin, &VENDORED, &env, &["MODULE.bazel"]);
+    let uuid = served.uuid.as_str();
+    let copy = format!("PATH\n  remote: .socket/vendor/gem/{uuid}/{NAME}-{VERSION}\n");
+    let source = format!("file:.socket/vendor/gem/{uuid}/");
+    let archive = committed_gem(uuid);
+    for (run, committed) in [(&plain, false), (&for_the_hub, true)] {
+        for form in [&run[0], &run[1]] {
+            assert_eq!(form["code"], 0, "{form:#}");
+            let files = &form["files"];
+            let lock = files["Gemfile.lock"].as_str().expect("Gemfile.lock");
+            let gemfile = files["Gemfile"].as_str().expect("Gemfile");
+            assert_eq!(lock.starts_with(&copy), !committed, "{form:#}");
+            assert_eq!(gemfile.contains(&source), committed, "{form:#}");
+            assert_eq!(files[archive.as_str()].is_string(), committed, "{form:#}");
+        }
+    }
+}
+
+/// Every code a run names in its envelope: of its events, its warnings and
+/// the warnings of its events, in the order they stand.
+fn named_codes(envelope: &serde_json::Value) -> Vec<String> {
+    let mut codes = Vec::new();
+    let mut left = vec![envelope];
+    while let Some(value) = left.pop() {
+        match value {
+            serde_json::Value::Array(items) => left.extend(items.iter().rev()),
+            serde_json::Value::Object(fields) => {
+                for (key, value) in fields.iter().rev() {
+                    match value.as_str() {
+                        Some(code) if key == "code" || key == "errorCode" => {
+                            codes.push(code.to_string())
+                        }
+                        _ => left.push(value),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    codes
+}
+
+/// Without a Bazel: what an earlier run wrote for Bazel is still listed
+/// and undone with `SOCKET_NO_BAZEL=1`. A run without the variable commits
+/// the gem for the hub. With the variable, `list` shows a vendored gem and
+/// `vendor --check` holds the committed gem to the patch, and each of
+/// `vendor --revert`, `rollback` and `remove` puts every file back, to the
+/// byte: the `Gemfile`, its lock, the committed gem and the ledger. It
+/// names the codes it names without the variable: none in the fixture's
+/// checkout, and the entry it leaves in the call where the call's
+/// `gem_checksums` hold the gem to the patched one.
+#[test]
+fn the_switch_still_undoes_a_gem_committed_for_the_hub() {
+    let (cell, served) = checkout();
+    cell.write(".bazelversion", "9.3.2\n");
+    let standin = &served.standin;
+    let origin = standin.origin();
+    let go = |args: &[&str], env: &[(&str, &str)]| {
+        let env = [&patch_host(&origin)[..], env].concat();
+        run(standin, &cell, args, &env)
+    };
+    let off = [("SOCKET_NO_BAZEL", "1")];
+    let undos: [&[&str]; 3] = [
+        &["vendor", "--revert", "--yes"],
+        &["rollback", "--yes"],
+        &["remove", PURL, "--yes"],
+    ];
+    // The fixture's call, and the same call with a `gem_checksums` that
+    // holds the gem to the sha256 of the patched one.
+    let lock = "    gemfile_lock = \"//:Gemfile.lock\",\n";
+    let module = String::from_utf8(cell.tree()["MODULE.bazel"].clone()).expect("a text file");
+    assert!(module.contains(lock), "{module}");
+    let sum = sha256_hex(&served.patched_gem);
+    let held = format!("{lock}    gem_checksums = {{\"{NAME}-{VERSION}\": \"{sum}\"}},\n");
+    let held = module.replace(lock, &held);
+    for (module, left) in [(&module, false), (&held, true)] {
+        cell.write("MODULE.bazel", module);
+        let before = cell.tree();
+        for undo in undos {
+            let vendored = committed_for_the_hub(&cell, &go(&VENDORED, &[]), &served, &before);
+            let list = go(&["list"], &off);
+            let listed = list.envelope.to_string();
+            let as_vendored = listed.contains("\"vendored\"") && !listed.contains("\"hosted\"");
+            assert!(as_vendored, "{}", list.dump);
+            let check = go(&["vendor", "--check"], &off);
+            assert_eq!(check.code, 0, "{}", check.dump);
+            assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{}", check.dump);
+
+            // The undo without the variable, for what it names.
+            let plain = go(undo, &[]);
+            assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", plain.dump);
+            committed_for_the_hub(&cell, &go(&VENDORED, &[]), &served, &before);
+            let switched = go(undo, &off);
+            assert_eq!(switched.code, 0, "{undo:?}: {}", switched.dump);
+            let undone = changed(&before, &cell.tree());
+            assert_eq!(undone, NOTHING, "{undo:?}: {}", switched.dump);
+            let names = named_codes(&switched.envelope);
+            let without = named_codes(&plain.envelope);
+            assert_eq!(names, without, "{undo:?}: {}", switched.dump);
+            let says = names.contains(&ENTRY_LEFT.to_string());
+            assert_eq!(says, left, "{undo:?}: {}", switched.dump);
+        }
+    }
+}
+
 /// Without a Bazel: what else a call can say, each as the `MODULE.bazel`
 /// of the fixture's checkout. A lock without a `CHECKSUMS` section leaves
 /// the gem as it is too, and its warning does not offer to delete the gem

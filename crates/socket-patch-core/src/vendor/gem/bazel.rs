@@ -799,8 +799,10 @@ pub(super) async fn revert(
 /// whose `gem_checksums` still hold the gem `key` (`<name>-<version>`) to
 /// `sha256`, the one of the committed gem ([`ENTRY_LEFT`]). Read apart from
 /// [`gate`]: the entry fails the build whatever else the checkout says.
+/// And read whatever the switch says ([`crate::bazel::off`]): the undo of
+/// what an earlier run wrote for Bazel says what it says without it.
 fn entry_left(project: &Path, key: &str, sha256: &str) -> Option<VendorWarning> {
-    let root = crate::bazel::bazel_root(project)?;
+    let root = crate::bazel::root_of(project)?;
     let workspace = Workspace::read(&disk(&root.dir));
     let holds = |tag: &Tag<'_>| match tag.call.arg("gem_checksums") {
         Some(Starlark::Dict(sums)) => sums.iter().any(|(gem, sum)| {

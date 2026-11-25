@@ -93,8 +93,8 @@ pub fn bazel_root(project: &Path) -> Option<BazelRoot> {
     (!off()).then(|| root_of(project)).flatten()
 }
 
-/// [`bazel_root`] whatever the switch says: for the one caller that takes
-/// away what an earlier run wrote for Bazel ([`ignore::sync`]).
+/// [`bazel_root`] whatever the switch says: for the callers that take
+/// away, or say what is left of, what an earlier run wrote for Bazel.
 pub(crate) fn root_of(project: &Path) -> Option<BazelRoot> {
     let dirs = search_dirs(project);
     root_in(&dirs, repo_at_end_of(dirs.clone()))

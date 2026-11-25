@@ -2426,6 +2426,9 @@ projects too. What the sections below then do for it:
 
 - Composer: vendored mode is declined until the lock names a vendored copy
   ([Bazel workspaces: Composer](#bazel-workspaces-composer)).
+- RubyGems: where a `ruby.bundle_fetch` call reads the project's `Gemfile` and lock and the
+  checkout shows that it builds, vendored mode commits the gem as its archive, for the hub
+  ([Bazel workspaces: RubyGems vendored mode](#bazel-workspaces-rubygems-vendored-mode)).
 - PyPI and RubyGems: vendored mode is declined where a hub call of the workspace reads the
   project's lock, or may read it
   ([Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode)).
@@ -2486,6 +2489,12 @@ What an earlier run wrote for Bazel is still listed and undone with the variable
   Beside a Maven or Gradle build the hub's directory is a copy that only a `vendor` run
   without the variable writes: one that was lost stays lost, `vendor --check` names it, and
   the undo still takes its entry out.
+- A gem committed for a rules_ruby hub
+  ([Bazel workspaces: RubyGems vendored mode](#bazel-workspaces-rubygems-vendored-mode)):
+  `list` shows it as vendored and `vendor --check` holds it to the patch. `vendor --revert`,
+  `rollback` and `remove` put the `Gemfile` and its lock back and remove the committed gem,
+  and warn as they do without the variable where the `gem_checksums` of a call still hold
+  the gem to the patched one. No gem is committed this way.
 - The `.bazelignore` lines: no pair is added, and the pair of a copy that is gone is removed
   by the command that removed the copy (`rollback`, `remove`, `vendor --revert`, `repair`, a
   scan).
