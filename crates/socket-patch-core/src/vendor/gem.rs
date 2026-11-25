@@ -1842,12 +1842,16 @@ async fn stage_platform_builds(
     let led_by = patches
         .iter()
         .position(|patch| patch.record.uuid == record.uuid);
+    // A lead whose own reference is not ready (its gem is still being
+    // built, say) is that platform's problem alone: the fix is then what
+    // the first ready platform names, and each platform is judged by it.
+    let named = |reference: &ServiceArtifact<ServedArtifacts>| match reference {
+        ServiceArtifact::Ready(served) => served.rebuilt_from_uuid.clone(),
+        _ => None,
+    };
     let fix: Option<String> = match led_by {
         None => Some(record.uuid.clone()),
-        Some(lead) => match &references[lead] {
-            ServiceArtifact::Ready(served) => served.rebuilt_from_uuid.clone(),
-            _ => None,
-        },
+        Some(lead) => named(&references[lead]).or_else(|| references.iter().find_map(named)),
     };
     let mut missing: Vec<(&str, String)> = Vec::new();
     let mut ready: Vec<&str> = Vec::new();
@@ -13367,6 +13371,47 @@ mod tests {
             let (result, _, _) = unwrap_done(again);
             assert!(result.success, "{:?}", result.error);
             assert_eq!(ts::request_count(&server).await, asked);
+            assert_eq!(ts::tree_snapshot(&root), before);
+        }
+
+        /// A leading platform patch whose own gem is still being built is
+        /// that platform's wait alone: the other platforms, whose patches
+        /// are ready and of one fix, are not called patches of another fix.
+        #[tokio::test]
+        async fn a_leading_platform_patch_that_is_not_ready_is_named_alone() {
+            const LEAD: &str = "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin";
+            let (_tmp, root, record) = project(&lock(None)).await;
+            let pending = Served {
+                gem: None,
+                ..served(DARWIN)
+            };
+            let (_server, cfg) = service(UUID, &[pending, served(LINUX)]).await;
+            let records = build_records(&record);
+            let builds: Vec<GemBuildPatch<'_>> = records
+                .iter()
+                .map(|(platform, record)| GemBuildPatch { platform, record })
+                .collect();
+            let before = ts::tree_snapshot(&root);
+            let outcome = vendor_as(
+                LEAD,
+                &root,
+                &not_installed(&root),
+                &records[0].1,
+                &builds,
+                &cfg,
+                false,
+            )
+            .await;
+            let (code, detail) = unwrap_refused(outcome);
+            assert_eq!(code, "vendor_prebuilt_platform_pending", "{detail}");
+            assert!(
+                detail.contains(
+                    "(`arm64-darwin`: its patched gem is still being built; `x86_64-linux-gnu` \
+                     has one)"
+                ),
+                "{detail}"
+            );
+            assert!(!detail.contains("another fix"), "{detail}");
             assert_eq!(ts::tree_snapshot(&root), before);
         }
 
