@@ -21,7 +21,10 @@
 //! rewritten files) stays with the caller.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 
+use futures_util::future::Either;
 use serde::{Deserialize, Serialize};
 
 use crate::api::types::PackageVendorResult;
@@ -918,10 +921,15 @@ pub struct CandidateFiles {
     /// What the Bazel workspace of the project says of its pnpm locks
     /// ([`crate::bazel::pnpm::hubs`]), asked once, here, where the files
     /// are read: whether a hub keeps the root lock out of the run (then
-    /// also [`Self::pnpm_refusal`]), and whether one reads a lock, which
-    /// then is not routed through a named registry. The rewrite plans
-    /// from this alone and reads nothing of Bazel itself.
-    pub pnpm_bazel: crate::bazel::pnpm::Hubs,
+    /// also [`Self::pnpm_refusal`]; for a run that is told not to write to
+    /// pnpm-workspace.yaml the rewrite decides it, from
+    /// [`crate::bazel::pnpm::Hubs::unset`]), and whether one reads a lock
+    /// in a shape that is not routed through a named registry. The rewrite
+    /// plans from this alone and reads nothing of Bazel itself.
+    ///
+    /// In a box, so that these files are no larger for what it holds: a
+    /// scan in any mode builds the futures that hold them on its stack.
+    pub pnpm_bazel: Box<crate::bazel::pnpm::Hubs>,
 }
 
 impl CandidateFiles {
@@ -1977,7 +1985,7 @@ async fn read_pnpm_bazel(view: &ProjectView<'_>, root: bool, out: &mut Candidate
     if let Some(hidden) = hubs.hidden.clone() {
         withhold_root_pnpm_locks(out, hidden);
     }
-    out.pnpm_bazel = hubs;
+    *out.pnpm_bazel = hubs;
 }
 
 /// Whether a hosted scan leaves the root pnpm lock of the project of
@@ -1985,6 +1993,12 @@ async fn read_pnpm_bazel(view: &ProjectView<'_>, root: bool, out: &mut Candidate
 /// caller that reads no other file: the answer [`read_candidate_files`]
 /// gets, with the root lock read as it reads it, so that a scan which
 /// crawls nothing and one which crawls a package decide alike.
+///
+/// Not [`crate::bazel::pnpm::Hubs::unset`], whatever the caller was told
+/// of pnpm-workspace.yaml: that answer stands against a pin which the
+/// pnpm of the hub would reject, and this caller adds none. It takes out
+/// what no lock uses, in the lock and in the file together, and the file
+/// that answer is about holds a line of the user's own, so it stays.
 pub async fn pnpm_root_lock_left_to_bazel(view: &ProjectView<'_>) -> Option<RewriteWarning> {
     let mut out = CandidateFiles::default();
     let root = out.read(view, &BTreeSet::new(), ROOT_PNPM_LOCKS[0]).await;
@@ -2920,7 +2934,7 @@ pub async fn rewrite(
     let mut kept: Vec<Candidate> = candidates.to_vec();
     let mut unattributed: Vec<SkippedPatch> = Vec::new();
     loop {
-        let mut done = rewrite_once(
+        let mut done = rewrite_pass(
             view,
             read.clone(),
             &kept,
@@ -3327,6 +3341,72 @@ pub const REDIRECT_COPY_UNPATCHED: &str = "redirect_copy_unpatched";
 /// `skipped[].reason` of a candidate whose pin lockfile discovery would not
 /// attribute (see [`rewrite`]).
 pub const REDIRECT_UNATTRIBUTABLE: &str = "redirect_unattributable";
+
+/// One pass of [`rewrite`]: [`rewrite_once`], or [`rewrite_told`] for a
+/// run that is told not to write to pnpm-workspace.yaml beside a Bazel hub
+/// whose pnpm asks for a setting there
+/// ([`crate::bazel::pnpm::Hubs::unset`]).
+///
+/// No `async fn`, so that the second, which holds two passes, is built and
+/// boxed on this frame, which is gone before anything is polled. An
+/// `async fn` builds each future it awaits on its own poll frame first,
+/// also where the branch is not taken, and keeps what it clones for it in
+/// its own future: under every hosted rewrite, and in every future a
+/// scan builds on its stack to hold this one.
+fn rewrite_pass<'a>(
+    view: &'a ProjectView<'a>,
+    read: CandidateFiles,
+    candidates: &'a [Candidate],
+    python_metadata: BTreeMap<String, String>,
+    options: RewriteOptions<'a>,
+) -> Either<
+    impl Future<Output = Rewritten> + 'a,
+    Pin<Box<dyn Future<Output = Rewritten> + Send + 'a>>,
+> {
+    let told = read.pnpm_bazel.hides(options.trust_lockfile_config);
+    match told.filter(|_| read.pnpm_bazel.hidden.is_none()).cloned() {
+        None => Either::Left(rewrite_once(
+            view,
+            read,
+            candidates,
+            python_metadata,
+            options,
+        )),
+        Some(unset) => Either::Right(Box::pin(rewrite_told(
+            view,
+            read,
+            candidates,
+            python_metadata,
+            options,
+            unset,
+        ))),
+    }
+}
+
+/// A pass for a run that is told not to write to pnpm-workspace.yaml and
+/// so gives the pnpm of a Bazel hub no setting to read, where that pnpm
+/// asks for one (`unset`: [`crate::bazel::pnpm::Hubs::unset`]). The root
+/// lock is kept out of the pass as it is where the hub hides the file. Not
+/// where the pass ends routed without that, as it does in a project whose
+/// file holds the route of every pin already: a routed lock needs no
+/// setting, and the pass is the one of the same project without Bazel.
+async fn rewrite_told(
+    view: &ProjectView<'_>,
+    mut read: CandidateFiles,
+    candidates: &[Candidate],
+    python_metadata: BTreeMap<String, String>,
+    options: RewriteOptions<'_>,
+    unset: RewriteWarning,
+) -> Rewritten {
+    let (asked, metadata) = (read.clone(), python_metadata.clone());
+    let routed = rewrite_once(view, asked, candidates, metadata, options.clone()).await;
+    if routed.pnpm_named_registries {
+        return routed;
+    }
+    read.pnpm_bazel.hidden = Some(unset.clone());
+    withhold_root_pnpm_locks(&mut read, unset);
+    rewrite_once(view, read, candidates, python_metadata, options).await
+}
 
 async fn rewrite_once(
     view: &ProjectView<'_>,
@@ -4526,10 +4606,11 @@ fn is_patch_server(origin: &str, overrides: &[DepOverride], options: &RewriteOpt
 ///   version is pinned to two patches ([`release_with_two_patches`]);
 /// * the workspace file may be written, or needs no write
 ///   (`--no-trust-lockfile-config`);
-/// * no rules_js hub of a Bazel workspace reads a governing lock
-///   ([`crate::bazel::pnpm::Reader`]): the pnpm such a hub runs with
-///   `update_pnpm_lock` may not see the workspace file, or be too old to
-///   read its registries.
+/// * every rules_js hub of a Bazel workspace that reads a governing lock
+///   is one whose build takes a routed lock
+///   ([`crate::bazel::pnpm::Reader::Takes`]): the pnpm another hub runs
+///   with `update_pnpm_lock` may not see the workspace file, or be too
+///   old to read its registries.
 ///
 /// Whatever keeps a project the service offers the route to off it is
 /// said in the warning ([`pnpm_registry_blocked_note`]), the pins without
@@ -4957,16 +5038,19 @@ fn pnpm_registry_route(
         );
     }
     // What the Bazel workspace says of these locks. A lock that a rules_js
-    // hub reads keeps the pin the Bazel legs build
+    // hub reads is routed where the build of that hub takes a routed lock,
+    // and keeps the pin with `trustLockfile` elsewhere
     // ([`crate::bazel::pnpm::Reader`]). And where a hub keeps the root lock
     // out of the run, the locks that were read are not routed either,
     // whatever was read of the hub: the overrides would have to be
     // recorded in the root lock too, and it is not written. Said only
     // here, to a project the patch service offers the route to.
-    match (&bazel.reader, &bazel.hidden) {
-        (Some(reader), _) => {
-            blocked.push(crate::hosted::guidance::pnpm_registry_bazel_reason(reader))
-        }
+    let hub = bazel.reader.as_ref();
+    match (
+        hub.and_then(crate::hosted::guidance::pnpm_registry_bazel_reason),
+        &bazel.hidden,
+    ) {
+        (Some(reason), _) => blocked.push(reason),
         (None, Some(_)) => {
             blocked.push(crate::hosted::guidance::PNPM_REGISTRY_BAZEL_WITHHELD.to_string())
         }
@@ -13700,69 +13784,271 @@ snapshots:
 
     use crate::bazel::pnpm::fixtures::{rules_js_hub, HIDING_HUB_CALL};
 
-    /// A pnpm lock that a rules_js hub of the Bazel workspace reads is not
-    /// routed through a named registry, whatever the patch service offers
-    /// and whatever pnpm the project pins: with `update_pnpm_lock` the hub
-    /// runs a pnpm of its own, which sees pnpm-workspace.yaml only where the
-    /// call lists it and may be too old to read its registries, and no
-    /// Bazel leg builds a routed lock that way. The project gets the files of a
-    /// run that is offered no registry, byte for byte, which the Bazel legs
-    /// build, and the warning names the call. A hub that reads another lock
-    /// changes nothing. A project routed before the hub was there leaves
-    /// the route whole: the locks and the workspace file together.
+    /// The two hubs whose build takes a routed lock
+    /// ([`crate::bazel::pnpm::Reader::Takes`]): one that leaves the lock
+    /// to the lock reader of rules_js, and one that keeps it up to date
+    /// with a pnpm 11.20 or later that is shown the workspace file.
+    const ROUTED_HUBS: [&str; 2] = [
+        "pnpm_lock = \"//:pnpm-lock.yaml\"",
+        "pnpm_lock = \"//:pnpm-lock.yaml\", data = [\"//:pnpm-workspace.yaml\"], \
+         update_pnpm_lock = True",
+    ];
+
+    /// What hosted mode puts on the stack of a scan in any mode stays as
+    /// small as it is without the answers about Bazel. A debug build
+    /// builds every future on the poll frame of the function that awaits
+    /// it, also in a branch that is not taken, and a scan that applies a
+    /// patch in place is within a few KiB of the 2 MiB a test thread has:
+    /// the candidate files hold the answers behind one pointer, and a
+    /// pass of the rewrite is one `rewrite_once` beside the pointer to
+    /// the two passes of a run under `--no-trust-lockfile-config`, which
+    /// are not built in line.
+    #[test]
+    fn the_bazel_answers_cost_a_scan_one_pointer_and_a_pass_no_second_rewrite() {
+        use std::mem::{size_of, size_of_val};
+        let word = size_of::<usize>();
+        assert_eq!(size_of_val(&CandidateFiles::default().pnpm_bazel), word);
+        // Eight collections of three words, two warnings of six, the pointer.
+        assert!(size_of::<CandidateFiles>() <= 37 * word);
+
+        let project = MemoryProject::new();
+        let view = ProjectView::Memory(&project);
+        let outer = OuterAllowRemote::default;
+        let options = || RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: false,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
+            maven_selection: &no_maven_selection,
+            pnpm_env: &no_env,
+            blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
+        };
+        let read = CandidateFiles::default;
+        let once = rewrite_once(&view, read(), &[], BTreeMap::new(), options());
+        let pass = rewrite_pass(&view, read(), &[], BTreeMap::new(), options());
+        assert!(matches!(pass, Either::Left(_)));
+        assert!(size_of_val(&pass) <= size_of_val(&once) + 2 * word);
+        // The run that is told not to write, beside a hub that asks for
+        // the setting: its two passes are behind a pointer.
+        let mut told = read();
+        told.pnpm_bazel.unset = Some(warning(crate::bazel::pnpm::HIDDEN, "unset"));
+        let pass = rewrite_pass(&view, told, &[], BTreeMap::new(), options());
+        assert!(matches!(pass, Either::Right(_)));
+    }
+
+    /// A pnpm lock that such a hub reads is routed through a named
+    /// registry exactly as it is without Bazel: the files of the run are
+    /// those of the same project without its `MODULE.bazel`, byte for byte,
+    /// and nothing is said of Bazel. A project that an earlier run pinned
+    /// with `trustLockfile` moves to the route, and the setting that run
+    /// wrote goes, as without Bazel. A second run changes nothing. Told
+    /// not to write to pnpm-workspace.yaml, the run leaves the lock that a
+    /// pnpm of the build would reject and says what to do, and pins the
+    /// one that no pnpm of the build reads, as it does today.
     #[tokio::test]
-    async fn a_lock_that_a_bazel_hub_reads_is_not_routed() {
+    async fn a_lock_that_a_bazel_hub_reads_is_routed_where_its_build_takes_one() {
         let candidates = [left_pad_registry_candidate()];
         let users = "# the project's own\npackages:\n  - '.'\n";
+        let mut plain = pnpm12_project(LEFT_PAD_V9_LOCK);
+        plain.insert_text(PNPM_WORKSPACE_REL, users);
+        let without = registry_rewrite(&plain, &candidates).await;
+        assert!(without.pnpm_named_registries);
+        for call in ROUTED_HUBS {
+            let mut project = plain.clone();
+            project.insert_text("MODULE.bazel", rules_js_hub(call));
+            let done = registry_rewrite(&project, &candidates).await;
+            assert!(done.pnpm_named_registries, "{call}");
+            assert_eq!(done.rewrite.files, without.rewrite.files, "{call}");
+            assert_eq!(done.confirmed.len(), 1, "{call}");
+            let said = format!("{:?}", done.pnpm_warnings);
+            assert!(!said.contains("Bazel"), "{call}: {said}");
+            assert_eq!(
+                pnpm_trust_detail(&done),
+                pnpm_trust_detail(&without),
+                "{call}"
+            );
+
+            // Pinned with `trustLockfile` by a run that was offered no
+            // registry: the next run takes the route and the setting goes.
+            let pinned = registry_rewrite(&project, &[left_pad_candidate()]).await;
+            let trusting = format!("{users}trustLockfile: true\n");
+            assert_eq!(workspace_of(&pinned), Some(trusting.as_str()), "{call}");
+            let moved = registry_rewrite(&after(&project, &pinned), &candidates).await;
+            assert!(moved.pnpm_named_registries, "{call}");
+            assert_eq!(moved.rewrite.files, without.rewrite.files, "{call}");
+
+            let again = registry_rewrite(&after(&project, &done), &candidates).await;
+            assert!(again.pnpm_named_registries, "{call}");
+            assert!(again.rewrite.files.is_empty(), "{call}");
+            assert_eq!(again.confirmed.len(), 1, "{call}");
+        }
+
+        // `--no-trust-lockfile-config`.
+        let told = |project: MemoryProject| async move {
+            let view = ProjectView::Memory(&project);
+            pnpm_rewrite(
+                &view,
+                &[left_pad_registry_candidate()],
+                false,
+                false,
+                &no_env,
+            )
+            .await
+        };
+        let mut read_by_pnpm = plain.clone();
+        read_by_pnpm.insert_text("MODULE.bazel", rules_js_hub(ROUTED_HUBS[1]));
+        let left = told(read_by_pnpm.clone()).await;
+        assert!(left.rewrite.files.is_empty(), "{:?}", left.rewrite.files);
+        assert!(left.confirmed.is_empty(), "{:?}", left.confirmed);
+        let hidden = left.rewrite.warnings.iter();
+        let hidden: Vec<_> = hidden
+            .filter(|w| w.code == crate::bazel::pnpm::HIDDEN)
+            .collect();
+        assert!(
+            matches!(&hidden[..], [w] if w.detail.contains("this run was told not to, which is")),
+            "{:?}",
+            left.rewrite.warnings
+        );
+        // Routed by an earlier run: the file holds the route already, so
+        // the run writes nothing to it, needs no setting, and is the one
+        // of the same project without Bazel.
+        let routed = registry_rewrite(&read_by_pnpm, &candidates).await;
+        let kept = told(after(&read_by_pnpm, &routed)).await;
+        let plain_kept = told(after(&plain, &without)).await;
+        assert!(kept.pnpm_named_registries && plain_kept.pnpm_named_registries);
+        assert!(kept.rewrite.files.is_empty(), "{:?}", kept.rewrite.files);
+        assert_eq!(kept.confirmed.len(), 1);
+        assert!(!warning_codes(&kept).contains(&crate::bazel::pnpm::HIDDEN));
+        assert_eq!(pnpm_trust_detail(&kept), pnpm_trust_detail(&plain_kept));
+        // The setting is there already: pinned, as without the option.
+        let trusted = format!("{users}trustLockfile: true\n");
+        read_by_pnpm.insert_text(PNPM_WORKSPACE_REL, trusted.as_str());
+        let pinned = told(read_by_pnpm).await;
+        assert_eq!(pinned.confirmed.len(), 1);
+        assert!(lock_of(&pinned).is_some_and(|lock| lock.contains(&left_pad_url())));
+        // No pnpm of the build reads the lock: pinned as it is today.
+        let mut read_by_rules_js = plain.clone();
+        read_by_rules_js.insert_text("MODULE.bazel", rules_js_hub(ROUTED_HUBS[0]));
+        let pinned = told(read_by_rules_js).await;
+        assert_eq!(pinned.confirmed.len(), 1);
+        assert_eq!(
+            pinned.rewrite.files.keys().collect::<Vec<_>>(),
+            ["pnpm-lock.yaml"]
+        );
+        assert!(!warning_codes(&pinned).contains(&crate::bazel::pnpm::HIDDEN));
+    }
+
+    /// A pnpm lock that a hub reads in any other shape is not routed,
+    /// whatever the patch service offers and whatever pnpm the project
+    /// pins: the hub may run a pnpm that does not see pnpm-workspace.yaml,
+    /// or one too old to read its registries. The project gets the files
+    /// of a run that is offered no registry, byte for byte, and the
+    /// warning names the call and what kept it off the route. A hub that
+    /// reads another lock changes nothing. A project that was routed
+    /// before its hub left those shapes leaves the route whole: the locks
+    /// and the workspace file together.
+    #[tokio::test]
+    async fn a_lock_that_a_bazel_hub_reads_in_another_shape_is_not_routed() {
+        let candidates = [left_pad_registry_candidate()];
+        let users = "# the project's own\npackages:\n  - '.'\n";
+        // The pnpm of the second hub is below 11.20.
+        let older = rules_js_hub(ROUTED_HUBS[1]).replace("11.28.10", "11.19.0");
+        assert!(older.contains("pnpm_version = \"11.19.0\""), "{older}");
+        // It is stated by a use of the extension that a build can drop.
+        let dev = rules_js_hub(ROUTED_HUBS[1]).replace(
+            "\"pnpm\")\npnpm.pnpm(",
+            "\"pnpm\", dev_dependency = True)\npnpm.pnpm(",
+        );
+        assert!(dev.contains("dev_dependency = True"), "{dev}");
+        // It is stated by a tag that may not run as it is written.
+        let aside = rules_js_hub(ROUTED_HUBS[1]).replace("\npnpm.pnpm(", "\nON and pnpm.pnpm(");
+        assert!(aside.contains("\nON and pnpm.pnpm("), "{aside}");
         let hubs = [
-            // Read by the lock reader of rules_js alone.
-            "pnpm_lock = \"//:pnpm-lock.yaml\"",
-            // Kept up to date by a pnpm that is shown the workspace file.
-            "pnpm_lock = \"//:pnpm-lock.yaml\", data = [\"//:pnpm-workspace.yaml\"], \
-             update_pnpm_lock = True",
-            // A lock that is not written out may be this one.
-            "pnpm_lock = LOCK",
+            (
+                aside,
+                "the pnpm it runs for `update_pnpm_lock` is not shown to be the one the root \
+                 module states (pnpm 11.28.10): a tag that states a release for it is not a \
+                 statement of its own, so it may not run as it is written",
+            ),
+            (
+                dev,
+                "the pnpm it runs for `update_pnpm_lock` is not shown to be the one the root \
+                 module states (pnpm 11.28.10): a use of the pnpm extension with \
+                 `dev_dependency` states a release for it, and Bazel drops such a use under \
+                 `--ignore_dev_dependency`",
+            ),
+            (
+                // A lock that is not written out may be this one.
+                rules_js_hub("pnpm_lock = LOCK"),
+                "its `pnpm_lock` is not written out in a plain string",
+            ),
+            (
+                older.clone(),
+                "the pnpm it runs for `update_pnpm_lock` is not stated as 11.20 or later (pnpm \
+                 11.19.0)",
+            ),
+            (
+                rules_js_hub(&ROUTED_HUBS[1].replace("= True", "= UPDATE")),
+                "its `update_pnpm_lock` is not written out as `True` or `False`",
+            ),
+            (
+                // A hub that runs no pnpm and says more than the calls
+                // that were built: its entry names the package by a
+                // version that a routed lock does not have.
+                rules_js_hub(&format!(
+                    "{}, patches = {{\"left-pad@1.3.0\": [\"//:own.patch\"]}}",
+                    ROUTED_HUBS[0]
+                )),
+                "its `patches` is an attribute that no routed lock was built with",
+            ),
         ];
-        for call in hubs {
+        for (module, why) in &hubs {
             let mut project = pnpm12_project(LEFT_PAD_V9_LOCK);
             project.insert_text(PNPM_WORKSPACE_REL, users);
-            project.insert_text("MODULE.bazel", rules_js_hub(call));
+            project.insert_text("MODULE.bazel", module.as_str());
             let unoffered = registry_rewrite(&project, &[left_pad_candidate()]).await;
             let done = registry_rewrite(&project, &candidates).await;
-            assert!(!done.pnpm_named_registries, "{call}");
-            assert_eq!(done.rewrite.files, unoffered.rewrite.files, "{call}");
+            assert!(!done.pnpm_named_registries, "{why}");
+            assert_eq!(done.rewrite.files, unoffered.rewrite.files, "{why}");
             assert_eq!(
                 workspace_of(&done),
                 Some(format!("{users}trustLockfile: true\n").as_str()),
-                "{call}"
+                "{why}"
             );
             let lock = lock_of(&done).expect("the lock, pinned");
             assert!(
                 lock.contains(&format!("tarball: {}", left_pad_url()))
                     && !lock.contains("@socket-")
                     && !lock.contains("overrides:"),
-                "{call}: {lock}"
+                "{why}: {lock}"
             );
-            assert_eq!(done.confirmed.len(), 1, "{call}");
+            assert_eq!(done.confirmed.len(), 1, "{why}");
             assert!(
                 !warning_codes(&done).contains(&crate::bazel::pnpm::HIDDEN),
-                "{call}"
+                "{why}"
             );
             let detail = pnpm_trust_detail(&done);
-            assert!(
-                detail.contains(
-                    "Per-package registry verification was not set up because a Bazel hub \
-                     reads the pnpm lock (MODULE.bazel:3), and a lock that a hub reads is not \
-                     routed yet: the pnpm a hub runs for `update_pnpm_lock` may not read the \
-                     registries in pnpm-workspace.yaml; the hosted patches rely on \
-                     `trustLockfile` instead"
-                ),
-                "{call}: {detail}"
+            let said = format!(
+                "Per-package registry verification was not set up because a Bazel hub reads \
+                 the pnpm lock (MODULE.bazel:3), and {why}: a lock that a hub reads is routed \
+                 only where the call of the hub passes nothing but `name`, `pnpm_lock`, `data`, \
+                 `update_pnpm_lock` and `use_pnpm`, and either leaves `update_pnpm_lock` off, or \
+                 lists pnpm-workspace.yaml in its `data` and states a pnpm of 11.20 or later; \
+                 the hosted patches rely on `trustLockfile` instead"
             );
+            assert!(detail.contains(&said), "{why}: {detail}");
             // Not offered a registry, the run says nothing of the hub.
             assert!(
                 !pnpm_trust_detail(&unoffered).contains("Bazel"),
-                "{call}: {}",
+                "{why}: {}",
                 pnpm_trust_detail(&unoffered)
             );
         }
@@ -13779,12 +14065,15 @@ snapshots:
             Some(left_pad_routed_workspace().as_str())
         );
 
+        // Routed under a hub that takes a routed lock, which then states
+        // an older pnpm.
         let mut root = pnpm12_project(LEFT_PAD_V9_LOCK);
         root.insert_text(PNPM_WORKSPACE_REL, users);
+        root.insert_text("MODULE.bazel", rules_js_hub(ROUTED_HUBS[1]));
         let first = registry_rewrite(&root, &candidates).await;
         assert!(first.pnpm_named_registries);
         let mut routed = after(&root, &first);
-        routed.insert_text("MODULE.bazel", rules_js_hub(hubs[0]));
+        routed.insert_text("MODULE.bazel", older.as_str());
         let done = registry_rewrite(&routed, &candidates).await;
         assert!(!done.pnpm_named_registries);
         assert_eq!(
@@ -13854,6 +14143,8 @@ snapshots:
             let detail = pnpm_trust_detail(&done);
             let said = format!("because a Bazel hub may read the pnpm lock {named}");
             assert!(detail.contains(&said), "{file}: {detail}");
+            let shapes = "), in a shape that was not read: a lock that a hub reads is routed only";
+            assert!(detail.contains(shapes), "{file}: {detail}");
             assert!(
                 !pnpm_trust_detail(&unoffered).contains("Bazel"),
                 "{file}: {}",
@@ -14103,6 +14394,55 @@ snapshots:
         assert!(!done.pnpm_named_registries);
     }
 
+    /// The members' own locks beside a root lock that a hub reads are not
+    /// routed where the hub is one whose build takes a routed lock either:
+    /// the route records its overrides in every lock that
+    /// pnpm-workspace.yaml governs, and no build was run of a hub that
+    /// reads one lock of several. The project gets the files of a run that
+    /// is offered no registry, byte for byte, and the warning says why.
+    #[tokio::test]
+    async fn a_hub_of_the_root_lock_keeps_a_project_with_member_locks_off_the_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+        write_member_workspace(tmp.path(), ws);
+        write_rel(
+            tmp.path(),
+            "package.json",
+            r#"{"name":"root","private":true,"packageManager":"pnpm@12.22.0"}"#,
+        );
+        write_rel(
+            tmp.path(),
+            "packages/a/package.json",
+            r#"{"name":"a","dependencies":{"is-number":"7.0.0"}}"#,
+        );
+        let mut offered = is_number_candidates();
+        offered[0].dep.npm_registry_url = Some(registry_address(MEMBER_URL));
+        let view = ProjectView::Disk(tmp.path());
+        for call in ROUTED_HUBS {
+            write_rel(tmp.path(), "MODULE.bazel", &rules_js_hub(call));
+            let unoffered =
+                pnpm_rewrite(&view, &is_number_candidates(), true, false, &no_env).await;
+            let done = pnpm_rewrite(&view, &offered, true, false, &no_env).await;
+            assert!(!done.pnpm_named_registries, "{call}");
+            assert_eq!(done.rewrite.files, unoffered.rewrite.files, "{call}");
+            assert_eq!(
+                workspace_of(&done),
+                Some(format!("{ws}trustLockfile: true\n").as_str()),
+                "{call}"
+            );
+            assert_eq!(done.confirmed.len(), 1, "{call}: {:?}", done.confirmed);
+            let detail = pnpm_trust_detail(&done);
+            assert!(
+                detail.contains(
+                    "because a Bazel hub reads the pnpm lock (MODULE.bazel:3), and the project \
+                     has workspace members with pnpm locks of their own, a layout that no routed \
+                     lock was built with: a lock that a hub reads is routed only where"
+                ),
+                "{call}: {detail}"
+            );
+        }
+    }
+
     /// The members' own locks beside a root lock that a hub withholds are
     /// pinned as main pins them, on `trustLockfile`, also where the patch
     /// service offers a registry and the project pins pnpm 12: the route's
@@ -14310,7 +14650,7 @@ snapshots:
         let view = ProjectView::Disk(tmp.path());
         let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
         // No Bazel workspace: nothing was read of one.
-        assert_eq!(read.pnpm_bazel, crate::bazel::pnpm::Hubs::default());
+        assert_eq!(*read.pnpm_bazel, crate::bazel::pnpm::Hubs::default());
         let hidden = RewriteWarning {
             code: crate::bazel::pnpm::HIDDEN.into(),
             detail: "a hub keeps pnpm-lock.yaml up to date".into(),

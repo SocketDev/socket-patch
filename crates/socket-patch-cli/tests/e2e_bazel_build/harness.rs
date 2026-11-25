@@ -968,6 +968,21 @@ impl Cell {
         self.downloads = Some(rules.to_vec());
     }
 
+    /// Take the file whose sha256 is `sha256` out of the repository cache,
+    /// which the tests of a leg and every twin share: whether it was
+    /// there. Bazel then has to fetch that file again from where its URLs
+    /// lead, as on a machine that never had it.
+    pub fn uncache(&self, sha256: &str) -> bool {
+        let cache = &self.scratch.repository_cache;
+        let entry = cache.join("content_addressable/sha256").join(sha256);
+        let held = entry.join("file").is_file();
+        if held {
+            std::fs::remove_dir_all(&entry)
+                .unwrap_or_else(|e| panic!("remove {}: {e}", entry.display()));
+        }
+        held
+    }
+
     /// Whether the repository cache of this cell, which its twins share,
     /// holds a download with the sha256 `sha256`: what Bazel's downloader
     /// keeps of a file it fetched under a checksum.
@@ -1726,7 +1741,7 @@ impl Cell {
 
     /// Agent mode in this checkout, through `run`, for a package that its
     /// package manager keeps outside the checkout, where `installed` is a
-    /// file of that copy: `scan --mode agent --yes` gives the file the text
+    /// file of that copy: `scan --mode agent --yes` gives the file the bytes
     /// `patched`, from the record of the patch, and writes nothing into the
     /// checkout but its own `.socket` directory, and the `apply` of a later
     /// run passes. Then what the two say with `--vex`, and what `vex` and
@@ -1736,7 +1751,7 @@ impl Cell {
         &self,
         run: impl Fn(&Cell, &[&str]) -> Ran,
         installed: &Path,
-        patched: &str,
+        patched: impl AsRef<[u8]>,
         claim: &Claim,
     ) -> Tree {
         let test = &self.test;
@@ -1752,8 +1767,9 @@ impl Cell {
         let mut wrote = changed(&before, &left);
         wrote.retain(|file| !file.starts_with(".socket/"));
         assert_eq!(wrote, NOTHING, "{test}: {said}");
-        let holds = std::fs::read_to_string(installed).unwrap_or_default();
-        assert_eq!(holds, patched, "{test}: {}", installed.display());
+        let holds = std::fs::read(installed).unwrap_or_default();
+        let (at, shown) = (installed.display(), String::from_utf8_lossy(&holds));
+        assert!(holds == patched.as_ref(), "{test}: {at} holds:\n{shown}");
 
         let again = self.document("apply");
         let apply = run(self, &[&["apply"][..], &with_vex(&again)].concat());
