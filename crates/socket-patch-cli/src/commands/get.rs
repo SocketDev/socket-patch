@@ -1952,8 +1952,8 @@ pub async fn run(args: GetArgs) -> i32 {
     let selected = if mode == super::scan::ScanMode::Agent {
         selected
     } else {
-        crate::commands::agent_download::settle_gem_fixes(
-            &args.common.cwd,
+        socket_patch_core::hosted::gem_fixes::settle(
+            &socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&args.common.cwd),
             &api_client,
             &accessible,
             selected,
@@ -2546,7 +2546,7 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
 /// What `get <uuid>` selects for `patch` in hosted and vendored mode: the
 /// patch itself and, for a gem the project's Bundler lock names as platform
 /// builds, the other patches of its fix that the lock has a build for
-/// ([`crate::commands::agent_download::gem_fix_siblings`]). Asking for one
+/// ([`socket_patch_core::hosted::gem_fixes::fix_siblings`]). Asking for one
 /// patch of such a gem is asking for its fix: a run that changes what
 /// Bundler installs moves every locked build or none.
 async fn with_gem_fix_builds(
@@ -2557,8 +2557,8 @@ async fn with_gem_fix_builds(
 ) -> Vec<PatchSearchResult> {
     let mut selected = vec![search_result_from_response(patch)];
     selected.extend(
-        crate::commands::agent_download::gem_fix_siblings(
-            cwd,
+        socket_patch_core::hosted::gem_fixes::fix_siblings(
+            &socket_patch_core::vendor::lock_inventory::ProjectView::Disk(cwd),
             api_client,
             use_public_proxy,
             &patch.purl,

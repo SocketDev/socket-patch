@@ -2234,8 +2234,8 @@ async fn run_eject(
         if !records.contains_key(&pin.purl) {
             continue;
         }
-        let siblings = crate::commands::agent_download::gem_fix_siblings(
-            &common.cwd,
+        let siblings = socket_patch_core::hosted::gem_fixes::fix_siblings(
+            &socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&common.cwd),
             &client,
             use_public_proxy,
             &pin.purl,

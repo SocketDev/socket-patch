@@ -405,6 +405,106 @@ impl GemLock {
     }
 }
 
+/// Patches in a fixed order: by purl, then uuid.
+fn sort_by_purl(patches: &mut [PatchSearchResult]) {
+    patches.sort_by(|a, b| a.purl.cmp(&b.purl).then_with(|| a.uuid.cmp(&b.uuid)));
+}
+
+/// The other patches of the fix that the gem patch `uuid` (found under
+/// `purl`) belongs to, for the builds of the gem that the Bundler lock of
+/// `view`'s project names: empty unless the lock names the gem as platform
+/// builds.
+///
+/// Each platform gem of a fix has a patch of its own, with its own uuid,
+/// built from the patch of the ruby gem (the fix's source, whose registry
+/// and vendored directory every build shares), and Bundler takes a gem
+/// from one source. So a run that names one patch of such a gem (`get
+/// <uuid>`, the eject of a hosted pin) needs the fix's patch of every
+/// locked build, and its source patch. The fix of a patch is what its
+/// package reference states (`rebuiltFromUuid`, else the patch itself):
+/// this costs one search and one reference request, and nothing for any
+/// other patch. `free_only`: the run can take free patches alone (it goes
+/// through the public proxy). When either lookup fails the answer is
+/// empty, and the run says which locked builds it has no patch for.
+pub async fn fix_siblings(
+    view: &ProjectView<'_>,
+    api_client: &crate::api::client::ApiClient,
+    free_only: bool,
+    purl: &str,
+    uuid: &str,
+) -> Vec<PatchSearchResult> {
+    let lock = GemLock::read(view, std::iter::once(purl)).await;
+    if lock.platforms_of(purl).is_empty() {
+        return Vec::new();
+    }
+    let package = crate::utils::purl::strip_purl_qualifiers(purl);
+    let Ok(found) = api_client.search_patches_by_package(package).await else {
+        return Vec::new();
+    };
+    // The patches of the builds the lock names (the ruby gem's included),
+    // which this run may take.
+    let mut others: Vec<PatchSearchResult> = lock
+        .narrow_selected(found.patches)
+        .into_iter()
+        .filter(|other| other.uuid != uuid)
+        .filter(|other| !(other.tier == "paid" && free_only))
+        .collect();
+    if others.is_empty() {
+        return others;
+    }
+    let uuids: Vec<String> = std::iter::once(uuid.to_string())
+        .chain(others.iter().map(|other| other.uuid.clone()))
+        .collect();
+    let Ok(references) = api_client.fetch_registry_references(&uuids).await else {
+        return Vec::new();
+    };
+    let fix = family_of(uuid, &references).to_string();
+    let asked_platform = GemLock::platform_of(purl);
+    others.retain(|other| {
+        family_of(&other.uuid, &references) == fix
+            && GemLock::platform_of(&other.purl) != asked_platform
+    });
+    sort_by_purl(&mut others);
+    others
+}
+
+/// `selected` (one patch per purl, among `candidates`, every one of which
+/// the run may take), settled for the gems the Bundler lock of `view`'s
+/// project names as platform builds: patches of platform gems the lock
+/// does not name leave it, and every locked build of a gem takes its patch
+/// from one fix ([`GemLock::choose`]: the fix the ruby gem's ranking puts
+/// first among those with a patch for every locked build). `scan` settles
+/// its selection the same way; this is for a run that names its packages
+/// (`get` in hosted and vendored mode). One reference request, and none
+/// for a project with no such gem. When it fails, the selection is only
+/// narrowed to the builds the lock names.
+pub async fn settle(
+    view: &ProjectView<'_>,
+    api_client: &crate::api::client::ApiClient,
+    candidates: &[PatchSearchResult],
+    selected: Vec<PatchSearchResult>,
+) -> Vec<PatchSearchResult> {
+    let lock = GemLock::read(view, candidates.iter().map(|patch| patch.purl.as_str())).await;
+    if lock.is_empty() {
+        return selected;
+    }
+    let mut offers = crate::rollout::stage::offers_from_results(candidates, true);
+    offers.selected = selected
+        .iter()
+        .map(|patch| (patch.purl.clone(), patch.clone()))
+        .collect();
+    lock.narrow(&mut offers);
+    let uuids = lock.reference_uuids(&offers);
+    if !uuids.is_empty() {
+        if let Ok(references) = api_client.fetch_registry_references(&uuids).await {
+            lock.choose(&mut offers, &references, &RecordedIndex::default());
+        }
+    }
+    let mut settled: Vec<PatchSearchResult> = offers.selected.into_values().collect();
+    sort_by_purl(&mut settled);
+    settled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
