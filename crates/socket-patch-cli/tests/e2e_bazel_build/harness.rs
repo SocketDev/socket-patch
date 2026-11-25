@@ -1434,8 +1434,14 @@ impl Cell {
         let named = named.unwrap_or_default();
         let purl = normalize_purl(claim.purl);
         assert_eq!(normalize_purl(named), purl, "{test}: {text}");
-        let products = json!([{ "@id": PRODUCT, "subcomponents": [{ "@id": named }] }]);
-        assert_eq!(statement["products"], products, "{test}: {text}");
+        let project = json!({ "@id": PRODUCT, "subcomponents": [{ "@id": named }] });
+        assert_eq!(statement["products"][0], project, "{test}: {text}");
+        let products = statement["products"].as_array().map(Vec::as_slice);
+        let packages = products.unwrap_or_default().get(1..).unwrap_or_default();
+        assert!(
+            packages.iter().any(|p| p["@id"] == named),
+            "{test}: the package is a product of its own: {text}"
+        );
         let (uuid, how) = (claim.uuid, claim.how.words());
         if claim.affected() {
             assert_eq!(statement["status"], "affected", "{test}: {text}");

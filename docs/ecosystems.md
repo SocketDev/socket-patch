@@ -4715,7 +4715,7 @@ package that it is `affected`, not that it is patched:
   nothing is said of it.
 
 Each advisory of such a patch gets a statement of the package's own with the status
-`affected`. It names that package alone under the product, and its `action_statement` says
+`affected`. It names that package alone under the product (and as a product of its own), and its `action_statement` says
 what Bazel builds the package from and what to run so that the build holds the patch. It
 has no `justification` and no `impact_statement`. Packages that share an advisory are not
 merged into one such statement, so each action statement is about one package; the
@@ -4726,7 +4726,8 @@ merged into one such statement, so each action statement is about one package; t
   "vulnerability": { "name": "GHSA-xxxx-xxxx-xxxx", "aliases": ["CVE-2024-0001"] },
   "timestamp": "2026-11-19T15:14:47Z",
   "products": [
-    { "@id": "pkg:npm/shop@1.0.0", "subcomponents": [{ "@id": "pkg:npm/left-pad@1.3.0" }] }
+    { "@id": "pkg:npm/shop@1.0.0", "subcomponents": [{ "@id": "pkg:npm/left-pad@1.3.0" }] },
+    { "@id": "pkg:npm/left-pad@1.3.0" }
   ],
   "status": "affected",
   "action_statement": "Bazel builds this package from pnpm-lock.yaml (`npm.npm_translate_lock`, MODULE.bazel:6), which does not name Socket patch 7a11e000-...: the patch is only in the installed copy. Run `socket-patch scan --mode hosted` in the directory of that lock to pin the patch there. If what you ship is the installed tree and not what Bazel builds, pass `--no-bazel` (`--vex-no-bazel` on scan, apply and vendor)."
