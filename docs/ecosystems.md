@@ -3793,6 +3793,14 @@ a file of the package's project that the vendored run for that package would poi
 | rules_ruby `ruby.bundle_fetch` | `gemfile_lock`, `gemfile` | `Gemfile`, `Gemfile.lock` |
 | any call of the `WORKSPACE` file that passes one of those attributes (`pip_parse`, `rb_bundle_fetch`) | the same; a label `@<name>//...` names the main repository where the file says `workspace(name = "<name>")` | the same |
 
+The `WORKSPACE` file counts unless the checkout names a Bazel release of 9 or later, which
+never reads one: a file that a move to Bzlmod left behind can still name the lock, and
+stands in no build's way. The release is the one `.bazelversion` names, or
+`USE_BAZEL_VERSION` in `.bazeliskrc`, and only three numbers name one (`9.3.2`). With an
+older release, with `latest` or a release candidate, and with neither file, the
+`WORKSPACE` file counts, because a Bazel 7 or 8 may build the checkout. Where it does not
+count, it is no reason to decline and no doubt, whatever it holds.
+
 Which files a run writes depends on the tool that locks the Python project, as in the matrix
 at the top:
 
@@ -3825,14 +3833,15 @@ read its lock. That is:
 - a module file that is missing or cannot be read, or a statement of one that cannot be
   read, where the workspace calls the hub or a file that was read names its ruleset (a
   `bazel_dep` on rules_python or rules_ruby, or a `use_extension` of the hub's `.bzl` file);
-- a root `MODULE.bazel` or a `WORKSPACE` file that cannot be read at all.
+- a root `MODULE.bazel` that cannot be read at all, or a `WORKSPACE` file that cannot be
+  and counts (see above).
 
 A file cannot be read here when one byte of it is not UTF-8 (a name in a comment is enough),
 or when it is larger than 1 MiB; Bazel builds both. Going on there can leave a broken build
 behind a command that exited 0; declining costs a vendored run, which the switch below brings
 back. A workspace whose root `MODULE.bazel` and `WORKSPACE` file were read (or are not
-there), and in which no file that was read calls the hub or names its ruleset, is never
-declined for it, whatever else cannot be read.
+there, or the `WORKSPACE` file does not count), and in which no file that was read calls
+the hub or names its ruleset, is never declined for it, whatever else cannot be read.
 
 **What you see.** Every command that would vendor the package reports it `failed` with
 `vendor_pypi_bazel_hub` or `vendor_gem_bazel_hub` and exits 1: `scan --mode vendored`,
@@ -3865,10 +3874,11 @@ unpatched package from its own file, as before.
 
 Vendored mode goes on when you say so, with `--allow-vendored-in-bazel` or
 `SOCKET_ALLOW_VENDORED_IN_BAZEL=1`: for a hub that no build of yours uses, for a `WORKSPACE`
-file that your Bazel no longer reads (Bazel 9 never reads it, Bazel 8 only with
-`--enable_workspace`), or for a `ruby.bundle_fetch` to which you add every file of the
-vendored gem as `srcs`, which rules_ruby copies beside the Gemfile (no test here builds
-that). socket-patch checks none of these. It is the switch of
+file that your Bazel does not read while the checkout does not say so (Bazel 8 reads it
+only with `--enable_workspace`; for Bazel 9, naming the release in `.bazelversion` is
+enough, and no switch is needed), or for a `ruby.bundle_fetch` to which you add every file
+of the vendored gem as `srcs`, which rules_ruby copies beside the Gemfile (no test here
+builds that). socket-patch checks none of these. It is the switch of
 [Bazel workspaces: Composer](#bazel-workspaces-composer).
 
 `vendor --revert` is never declined. Neither is a package that is already vendored: where
@@ -3896,13 +3906,16 @@ Limits:
   another tag or another ruleset that reads the same file under Bzlmod (rules_ruby's older
   `ruby.bundle`, rules_pycross, aspect_rules_py), a `WORKSPACE` call that hides its
   arguments behind `**`, the `pip_install(requirements = ...)` of an older rules_python in a
-  `WORKSPACE` file, a Bazel root that the lookup does not reach, and a hub whose call
-  and whose `bazel_dep` are both in an included file that cannot be read, while the files
-  that were read name neither.
+  `WORKSPACE` file, a Bazel root that the lookup does not reach, a `WORKSPACE` file of a
+  checkout that names Bazel 9 or later while an older Bazel builds it (`USE_BAZEL_VERSION`
+  in the environment outranks both files and is not read), and a hub whose call and whose
+  `bazel_dep` are both in an included file that cannot be read, while the files that were
+  read name neither.
 - Declined although the build would pass: a `WORKSPACE` file that names the lock while the
-  Bazel in use does not read that file, a hub call that never runs, and a workspace that
-  does not use the ruleset while its root `MODULE.bazel` or its `WORKSPACE` file cannot be
-  read here, or while a file that was read names the ruleset and another cannot be read.
+  Bazel in use does not read that file and the checkout names no release of 9 or later, a
+  hub call that never runs, and a workspace that does not use the ruleset while its root
+  `MODULE.bazel` or its `WORKSPACE` file cannot be read here, or while a file that was read
+  names the ruleset and another cannot be read.
 - Declined although the run would write nothing to the file the call names: a package that
   is already vendored where the file that names its copy is not the one the call names (a
   requirements file that the named one includes with `-r`; the `Gemfile` when the call names

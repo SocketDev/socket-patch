@@ -974,6 +974,73 @@ fn vendored_mode_goes_on_where_no_hub_reads_the_lock() {
     cell.declined(&scan(&cell, &served), &package, 1, "failed", &before);
 }
 
+/// Without a Bazel: a `WORKSPACE` file that a migration left behind still
+/// hands the Gemfile and its lock to the ruleset's older rule, beside a
+/// `MODULE.bazel` whose hub reads the files of another project. Bazel 9
+/// never reads a `WORKSPACE` file, so where the checkout names a release of
+/// 9 or later the gem is vendored as it is without that file. Where it
+/// names an older release, none, or one that is no release, a Bazel that
+/// reads the file may build the checkout: the gem is declined, and the
+/// refusal names the call of the `WORKSPACE` file.
+#[test]
+fn a_workspace_file_counts_unless_the_checkout_names_bazel_9_or_later() {
+    let legacy = "rb_bundle_fetch(\n    name = \"bundle\",\n    gemfile = \"//:Gemfile\",\n    \
+                  gemfile_lock = \"//:Gemfile.lock\",\n)\n";
+    // The fixture's checkout with a hub that reads the files of another
+    // project, the `WORKSPACE` file where it is `kept`, and what names
+    // the Bazel release.
+    let retained = |release: Option<&str>, kept: bool| {
+        let (cell, served) = checkout();
+        let module = String::from_utf8(cell.tree()["MODULE.bazel"].clone()).expect("a text file");
+        let other = module.replace("\"//:Gemfile", "\"//svc:Gemfile");
+        assert_ne!(other, module);
+        cell.write("MODULE.bazel", other);
+        if kept {
+            cell.write("WORKSPACE", legacy);
+        }
+        if let Some(release) = release {
+            cell.write(".bazelversion", format!("{release}\n"));
+        }
+        (cell, served)
+    };
+    let scan = |cell: &Cell, served: &Served| {
+        let origin = served.standin.origin();
+        run(&served.standin, cell, &VENDORED, &patch_host(&origin))
+    };
+    // A run that vendors the gem by its path, and the files it writes,
+    // with the id of the patch left out of their names.
+    let vendors = |cell: &Cell, served: &Served| -> Vec<String> {
+        let before = cell.tree();
+        let ran = scan(cell, served);
+        assert_eq!(ran.code, 0, "{}", ran.dump);
+        assert_eq!(ran.envelope["summary"]["applied"], 1, "{}", ran.dump);
+        let after = cell.tree();
+        let copy = format!(".socket/vendor/gem/{}/{NAME}-{VERSION}", served.uuid);
+        let lock = String::from_utf8_lossy(&after["Gemfile.lock"]);
+        let section = format!("PATH\n  remote: {copy}\n");
+        assert!(lock.starts_with(&section), "{lock}");
+        let written = changed(&before, &after).into_iter();
+        written
+            .map(|path| path.replace(&served.uuid, "<id>"))
+            .collect()
+    };
+    let (cell, served) = retained(Some("9.3.2"), false);
+    let written = vendors(&cell, &served);
+    for release in ["9.3.2", "9.0.0", "10.0.0"] {
+        let (cell, served) = retained(Some(release), true);
+        assert_eq!(vendors(&cell, &served), written, "{release}");
+    }
+    let package = Declined {
+        names: &["`rb_bundle_fetch` (WORKSPACE:1)", "names Gemfile.lock; "],
+        ..DECLINED
+    };
+    for release in [Some("7.7.2"), Some("8.8.2"), None, Some("latest")] {
+        let (cell, served) = retained(release, true);
+        let before = cell.tree();
+        cell.declined(&scan(&cell, &served), &package, 1, "failed", &before);
+    }
+}
+
 /// Without a Bazel: steps (b), (d) and (f) of
 /// [`hosted_bundle_fetch_gem_checksums`] in the fixture's checkout, with
 /// what a person reads of (b), and (b) again with `--dry-run` and with

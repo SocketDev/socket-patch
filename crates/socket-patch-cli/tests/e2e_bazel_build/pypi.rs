@@ -1132,6 +1132,66 @@ fn vendored_mode_goes_on_where_no_hub_reads_the_requirements() {
     cell.declined(&with.run(&cell, &VENDORED), &package, 1, "failed", &before);
 }
 
+/// Without a Bazel: a `WORKSPACE` file that a migration left behind still
+/// hands `requirements.txt` to the ruleset's older rule, beside a
+/// `MODULE.bazel` whose hub reads another file. Bazel 9 never reads a
+/// `WORKSPACE` file, so where the checkout names a release of 9 or later
+/// the package is vendored as it is without that file. Where it names an
+/// older release, none, or one that is no release, a Bazel that reads the
+/// file may build the checkout: the package is declined, and the refusal
+/// names the call of the `WORKSPACE` file.
+#[test]
+fn a_workspace_file_counts_unless_the_checkout_names_bazel_9_or_later() {
+    let with = Vendoring::new();
+    let own = format!("\"//:{REQUIREMENTS}\"");
+    let legacy = format!("pip_parse(\n    name = \"pypi\",\n    requirements_lock = {own},\n)\n");
+    // The fixture's checkout with a hub that reads another file, the
+    // `WORKSPACE` file where it is `kept`, and what names the Bazel
+    // release.
+    let retained = |release: Option<&str>, kept: bool| {
+        let cell = checkout(&with);
+        let module = String::from_utf8(cell.tree()["MODULE.bazel"].clone()).expect("a text file");
+        let other = module.replace(&own, "\"//:requirements_lock.txt\"");
+        assert_ne!(other, module);
+        cell.write("MODULE.bazel", other);
+        if kept {
+            cell.write("WORKSPACE", &legacy);
+        }
+        if let Some(release) = release {
+            cell.write(".bazelversion", format!("{release}\n"));
+        }
+        cell
+    };
+    // A run that vendors the wheel: the files it writes, and the
+    // requirements it leaves.
+    let vendors = |cell: &Cell| {
+        let before = cell.tree();
+        let scan = with.run(cell, &VENDORED);
+        assert_eq!(scan.code, 0, "{}", scan.dump);
+        assert_eq!(scan.envelope["summary"]["applied"], 1, "{}", scan.dump);
+        let after = cell.tree();
+        (changed(&before, &after), after[REQUIREMENTS].clone())
+    };
+    let written = vendors(&retained(Some("9.3.2"), false));
+    let line = String::from_utf8_lossy(&written.1);
+    assert!(line.contains("./.socket/vendor/pypi/"), "{line}");
+    for release in ["9.3.2", "9.0.0", "10.0.0"] {
+        let kept = vendors(&retained(Some(release), true));
+        assert!(kept == written, "{release}");
+    }
+    let names = format!("names {REQUIREMENTS}; ");
+    let package = Declined {
+        purl: PURL,
+        code: DECLINED,
+        names: &["`pip_parse` (WORKSPACE:1)", &names],
+    };
+    for release in [Some("7.7.2"), Some("8.8.2"), None, Some("latest")] {
+        let cell = retained(release, true);
+        let before = cell.tree();
+        cell.declined(&with.run(&cell, &VENDORED), &package, 1, "failed", &before);
+    }
+}
+
 /// Without a Bazel: the fixture's directories are those of its table, and
 /// the workflow runs each release on its era. The fixture holds no
 /// `requirements.txt`: every era names the one the test writes, which pins

@@ -59,7 +59,10 @@
 //! Every call of the hub counts, also one that may not run, and so does a
 //! call of a `WORKSPACE` file that passes one of the hub's files, which is
 //! how the older form of the ruleset is called there (`pip_parse`,
-//! `rb_bundle_fetch`). And where something of the workspace cannot be read
+//! `rb_bundle_fetch`). A `WORKSPACE` file counts unless the checkout names
+//! a Bazel release of 9 or later, which never reads one
+//! ([`workspace_as_built`]): there it holds no call and is no doubt,
+//! whatever it says. And where something of the workspace cannot be read
 //! with certainty and a call of the hub may be behind it, the answer is
 //! that doubt: the workspace calls the hub, or a file that was read names
 //! its ruleset, or the root module file or the `WORKSPACE` file could not
@@ -78,8 +81,9 @@ use std::path::{Component, Path};
 
 use aho_corasick::AhoCorasick;
 
+use super::rc::reads_workspace_file;
 use super::starlark::{Call, File, Value};
-use super::workspace::{disk, Doubt, Extension, Repo, Workspace};
+use super::workspace::{disk, Doubt, Entry, Extension, Repo, Workspace};
 use super::BazelRoot;
 use crate::formats::gem::locked_specs;
 use crate::formats::pnpm::grammar::documents;
@@ -268,7 +272,8 @@ pub type Reader = Result<Unbuilt, Doubt>;
 /// calls of the hub are read with certainty and name other files, and when
 /// nothing shows that the workspace may call it: no call of the hub and no
 /// file that names its ruleset, with a root module file and a `WORKSPACE`
-/// file that were read or are not there.
+/// file that were read or are not there. A `WORKSPACE` file that the Bazel
+/// of the checkout does not read is not there ([`workspace_as_built`]).
 pub async fn reader(
     root: &BazelRoot,
     ecosystem: &'static str,
@@ -277,15 +282,27 @@ pub async fn reader(
     let (dir, project) = (root.dir.clone(), slashed(&root.project));
     run_blocking(move || {
         let read = |file: &str| lock_text(&dir, file);
-        reads(
-            &Workspace::read(&disk(&dir)),
-            &project,
-            ecosystem,
-            &locks,
-            &read,
-        )
+        let workspace = workspace_as_built(&disk(&dir));
+        reads(&workspace, &project, ecosystem, &locks, &read)
     })
     .await
+}
+
+/// The workspace of `view` as the Bazel that the checkout names reads it:
+/// without its `WORKSPACE` file ([`Workspace::legacy`]) where that Bazel
+/// reads none, which is a release of 9 or later
+/// ([`reads_workspace_file`]). A checkout that names an older release, or
+/// none as three numbers, keeps the file: a Bazel 7 or 8 may build it.
+///
+/// For a question whose wrong "yes" costs a run that worked: a
+/// `WORKSPACE` file that a migration left behind can still name a lock,
+/// and stands in no build's way.
+pub(crate) fn workspace_as_built(view: &dyn Fn(&str) -> Entry) -> Workspace {
+    let mut workspace = Workspace::read(view);
+    if !reads_workspace_file(view) {
+        workspace.legacy = None;
+    }
+    workspace
 }
 
 /// The path from the Bazel root `root` of `file`, a path from its project.
@@ -1054,7 +1071,7 @@ use_repo(ruby, "bundle")
     /// [`UNREADABLE`] is one that cannot be read, for the reason after it.
     fn reader_of(files: &[(&str, &str)], project: &str, ecosystem: &str, locks: &[&str]) -> String {
         let text = |path: &str| files.iter().find(|(name, _)| *name == path);
-        let workspace = Workspace::read(&|path| match text(path) {
+        let workspace = workspace_as_built(&|path| match text(path) {
             Some((_, text)) => match text.strip_prefix(UNREADABLE) {
                 Some(why) => Entry::Unreadable(why.to_string()),
                 None => Entry::Text(text.to_string()),
@@ -1289,6 +1306,72 @@ use_repo(ruby, "bundle")
         assert_eq!(reader_of(&files, "svc", "pypi", &["requirements.txt"]), pip);
         let files = [("WORKSPACE", call)];
         assert_eq!(reader_of(&files, "svc", "pypi", &["requirements.txt"]), "");
+    }
+
+    /// A `WORKSPACE` file is not read by a Bazel of 9 or later. Where the
+    /// checkout names such a release, a call of that file that names the
+    /// lock is no reader of it, one that is not written out is no doubt,
+    /// and neither is a file that cannot be read. A checkout that names an
+    /// older release, none, or something that is no release keeps all
+    /// three, and a call of a module file counts under every release.
+    #[test]
+    fn a_workspace_file_counts_unless_the_checkout_names_bazel_9_or_later() {
+        let module = ("MODULE.bazel", "module(name = \"shop\")\n");
+        let legacy = "pip_parse(name = \"pypi\", requirements_lock = \"//svc:requirements.txt\")\n\
+            rb_bundle_fetch(name = \"bundle\", gemfile = \"//svc:Gemfile\", gemfile_lock = LOCK)\n";
+        let asked = |files: &[(&str, &str)], project, ecosystem| {
+            let locks: &[&str] = match ecosystem {
+                "pypi" => &["requirements.txt"],
+                _ => &["Gemfile", "Gemfile.lock"],
+            };
+            reader_of(files, project, ecosystem, locks)
+        };
+        let pip = "pip_parse WORKSPACE:1 svc/requirements.txt";
+        let gemfile = "rb_bundle_fetch WORKSPACE:2 svc/Gemfile";
+        let unwritten = "? WORKSPACE:2 the files `rb_bundle_fetch` names are not all written out";
+        let unread = "? WORKSPACE:0 it cannot be read: it is not UTF-8";
+        // What names the release, and whether the file then counts.
+        let rows: [(&[(&str, &str)], bool); 9] = [
+            (&[], true),
+            (&[(".bazelversion", "7.7.2\n")], true),
+            (&[(".bazelversion", "8.8.2\n")], true),
+            (&[(".bazelversion", "latest\n")], true),
+            (&[(".bazelversion", "9.3.2rc1\n")], true),
+            (&[(".bazelversion", "9.0.0\n")], false),
+            (&[(".bazelversion", "9.3.2\n")], false),
+            (&[(".bazelversion", "10.0.0\n")], false),
+            (
+                &[
+                    (".bazeliskrc", "USE_BAZEL_VERSION=8.8.2\n"),
+                    (".bazelversion", "9.3.2\n"),
+                ],
+                true,
+            ),
+        ];
+        for (release, counts) in rows {
+            let with = |workspace: &'static str| {
+                let mut files = vec![module, ("WORKSPACE", workspace)];
+                files.extend_from_slice(release);
+                files
+            };
+            let said = |yes: &str| counts.then_some(yes).unwrap_or_default().to_string();
+            let files = with(legacy);
+            assert_eq!(asked(&files, "svc", "pypi"), said(pip), "{release:?}");
+            assert_eq!(asked(&files, "svc", "gem"), said(gemfile), "{release:?}");
+            let other = asked(&files, "other", "gem");
+            assert_eq!(other, said(unwritten), "{release:?}");
+            let files = with("unreadable: it is not UTF-8");
+            for ecosystem in ["pypi", "gem"] {
+                assert_eq!(asked(&files, "svc", ecosystem), said(unread), "{release:?}");
+            }
+        }
+        // A call of a module file is the hub's under Bazel 9 as under any.
+        let mut files = SHOP.to_vec();
+        files.push(("WORKSPACE", legacy));
+        files.push((".bazelversion", "9.3.2\n"));
+        let api = "pip.parse MODULE.bazel:15 api/requirements.txt";
+        assert_eq!(asked(&files, "api", "pypi"), api);
+        assert_eq!(asked(&files, "svc", "pypi"), "");
     }
 
     #[test]
