@@ -6,9 +6,7 @@
 _Last updated 2026-11-25 · 4 runs under this charter · `main` at 9a2a946 when examined._
 
 ### In flight
-| PR | Issue | State |
-|---|---|---|
-| #2250 | #2249 (`remove` / `rollback <target>` said "No patch found" over an unreadable vendor ledger) | ready: approved, its review thread resolved, in the merge queue since 21:22Z |
+None open.
 
 **Next PR**, most harm first. Each has a failing test, probe or mutation on `main` in its issue:
 1. #2253: a false success. Fix L21 (#1910) in the same PR: it is the same function, `run_vendor_gc`.
@@ -19,7 +17,8 @@ _Last updated 2026-11-25 · 4 runs under this charter · `main` at 9a2a946 when 
 ### Merged
 | PR | Fixed |
 |---|---|
-| #2246 | `scan --prune` called a keep for a file that still installs from the artifact a drift, and dropped a failed revert's reason (part of #1910). Merged 2026-11-25 as ddf322a |
+| #2250 | `remove <target>` and `rollback <target>` said "No patch found" over an unreadable vendor ledger, `remove` restored files before refusing, and a ledger that could not be stat'd read as none (#2249). Merged 2026-11-25 as ff949a3 |
+| #2246 | `scan --prune` called a keep for a file that still installs from the artifact a drift, and dropped a failed revert's reason (part of #1910). Merged as ddf322a |
 | #2241 | old charter, no defect: test-helper copies replaced by `tests/common`'s. Take no further T55 slices |
 
 The 2026-10/11 sweep PRs are listed in `review/2026-11-v2/register/90-refactor.md`.
@@ -69,7 +68,7 @@ Issues looked at:
 | Area | Date | `main` | Found |
 |---|---|---|---|
 | `scan --prune` vendored GC, the vendored revert classification, core `utils/redact.rs`, `utils/npm_range.rs`, the repository-root walks | 2026-11-25 | 332b3e8 | #2246 |
-| an unreadable vendor ledger on every command that reads it | 2026-11-25 | 0a391c1, da012af | #2250, then #2253 (`scan --prune`, `vendor --json`) |
+| an unreadable vendor ledger on every command that reads it | 2026-11-25 | 0a391c1, da012af | #2250 (merged), then #2253 (`scan --prune`, `vendor --json`) |
 | `--json` / `--silent` output of 19 commands over 5 small projects (285 runs) | 2026-11-25 | 0a391c1 | clean: one JSON document under `--json`, nothing under `--silent` |
 | Gradle derived-copy checks (CLI `apply.rs`, core `jvm_jar.rs`, `gradle_cache.rs`) | 2026-11-25 | 0a391c1 | L19 holds by reading; nothing a real cache triggers |
 | vlt heal, the gem stale-install guard over platform builds, the three Gradle `--global-prefix` suites | 2026-11-25 | da012af | #2254; the guard is clean; #1982 confirmed (`scan --global-prefix` is covered; `apply`, `vex` and `rollback` are not) |
