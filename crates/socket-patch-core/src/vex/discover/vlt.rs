@@ -85,7 +85,6 @@ use crate::constants::npm_family::{VLT_CONFIG, VLT_LOCK};
 use crate::patch::redirect::hosted_url_names;
 use crate::patch::redirect::vlt::{discarding_lock_codes, discarding_lock_detail};
 use crate::utils::digest::is_sri_pin;
-use crate::utils::purl::percent_decode_purl_component;
 use crate::vendor::lock_inventory::vlt::{vlt_lock_model, VltLockNode};
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::vlt_bundled::store_bundled_copies;
@@ -347,7 +346,7 @@ fn classify_registry(ctx: &DiscoverCtx<'_>, node: &VltLockNode) -> Classified {
             node.name
         ));
     }
-    if !hosted_url_names(url, name, version) || !embedded_identity_agrees(url, name, version) {
+    if !hosted_url_names(url, name, version) || !embedded_identity_agrees(ctx, url, name, version) {
         return invalid(format!(
             "{key}: {url:?} is not an artifact of {name}@{version} (its leaf must be the \
              package's own <name>-<version>.tgz and its path must embed that name and \
@@ -381,17 +380,13 @@ fn classify_registry(ctx: &DiscoverCtx<'_>, node: &VltLockNode) -> Classified {
 /// <token>/<uuid>/<leaf>`, the name spelled over one or more segments,
 /// each percent-decoded) embeds `name@version`. The token-only
 /// `/patch/npm/<token>/<uuid>/<leaf>` shape embeds neither and agrees; any
-/// other path does not.
-fn embedded_identity_agrees(url: &str, name: &str, version: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
+/// other path does not. The path is the one the patch server serves, read
+/// below a patch mirror's base or a deployment's path prefix
+/// ([`DiscoverCtx::hosted_served_path`]).
+fn embedded_identity_agrees(ctx: &DiscoverCtx<'_>, url: &str, name: &str, version: &str) -> bool {
+    let Some(segments) = ctx.hosted_served_path(url) else {
         return false;
     };
-    let Some(segments) = parsed.path_segments() else {
-        return false;
-    };
-    let segments: Vec<String> = segments
-        .map(|s| percent_decode_purl_component(s).into_owned())
-        .collect();
     let Some(rest) = segments
         .strip_prefix(&["patch".to_string(), "npm".to_string()])
         .filter(|rest| rest.len() == 3 || rest.len() >= 5)
@@ -526,6 +521,58 @@ mod tests {
             assert_eq!(r.url.as_deref(), Some(hosted.as_str()));
             assert!(out.diagnostics.is_empty(), "{id}: {:?}", out.diagnostics);
         }
+    }
+
+    /// A pin a mirror run wrote sits under the mirror's base
+    /// (`<base>/patch/npm/<name>/<version>/…`): the name and version it
+    /// embeds are read below the base, so the node is the hosted ref it is.
+    /// Without the mirror configured the same url is on no patch host.
+    #[tokio::test]
+    async fn a_pin_under_a_patch_mirror_base_is_a_hosted_ref() {
+        let base = "http://127.0.0.1:8081/artifactory/socket-patch";
+        let mirrored = url(UUID_A, "left-pad-1.3.0.tgz").replace("https://patch.socket.dev", base);
+        let text = lock(
+            Some(1),
+            &[node(
+                "~npm~left-pad@1.3.0",
+                "left-pad",
+                Some(SRI),
+                Some(&mirrored),
+            )],
+        );
+        let p = Project::new().with_origin(&crate::origin::mirror_entry(base));
+        p.write("vlt-lock.json", &text);
+        let out = p.run(|c, o| Box::pin(super::extract(c, o))).await;
+        assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+
+        // The name or version the mirrored path embeds must still agree.
+        let other = mirrored.replace("/left-pad/1.3.0/", "/left-pad/1.2.0/");
+        let text = lock(
+            Some(1),
+            &[node(
+                "~npm~left-pad@1.3.0",
+                "left-pad",
+                Some(SRI),
+                Some(&other),
+            )],
+        );
+        let p = Project::new().with_origin(&crate::origin::mirror_entry(base));
+        p.write("vlt-lock.json", &text);
+        let out = p.run(|c, o| Box::pin(super::extract(c, o))).await;
+        assert!(out.refs.is_empty(), "{:?}", out.refs);
+
+        let out = discover(&lock(
+            Some(1),
+            &[node(
+                "~npm~left-pad@1.3.0",
+                "left-pad",
+                Some(SRI),
+                Some(&mirrored),
+            )],
+        ))
+        .await;
+        assert!(out.refs.is_empty(), "{:?}", out.refs);
     }
 
     fn lock_with_options(version: &str, options: &str, nodes: &[String]) -> String {

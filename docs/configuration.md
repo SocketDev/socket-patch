@@ -74,8 +74,9 @@ Empty environment values are treated as unset.
 - `SOCKET_PATCH_MIRROR_URL` (experimental) names a mirror of Socket's patch
   server, such as an Artifactory remote repository, for builds that may only
   fetch from an internal host. Hosted mode then pins patches under that base,
-  and every command reads the pins there. Set it wherever Socket Patch runs
-  for the project; a repository file cannot set it. It is for Socket
+  and every command reads the pins there (a Go build also lists the base
+  first in `GOPROXY`). Set it wherever Socket Patch runs for the project; a
+  repository file cannot set it. It is for Socket
   Enterprise customers and may change in any release: ask Socket for the
   setup guide. The rules are in the
   [CLI contract](../crates/socket-patch-cli/CLI_CONTRACT.md#patch-mirror-experimental).

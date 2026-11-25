@@ -2289,6 +2289,11 @@ impl<'a> DiscoverCtx<'a> {
         self.origin.hosted_uuid(url)
     }
 
+    /// [`OriginPolicy::hosted_served_path`] under this run's origins.
+    pub(crate) fn hosted_served_path(&self, url: &str) -> Option<Vec<String>> {
+        self.origin.hosted_served_path(url)
+    }
+
     /// [`OriginPolicy::locate`] under this run's origins.
     pub(crate) fn locate(&self, s: &str, opts: LocateOpts) -> Located {
         self.origin.locate(s, opts)

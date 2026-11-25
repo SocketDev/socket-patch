@@ -112,22 +112,51 @@ const GO_SERVE_ROOT: &str = "gopatch";
 /// first in the path; an operator's deployment may sit under a path prefix
 /// (`prefixed`), where the first such level counts.
 fn served_tail<'a>(segments: &'a [&'a str], prefixed: bool) -> Option<&'a [&'a str]> {
+    let (_, start) = served_level(segments, prefixed)?;
+    segments.get(start..)
+}
+
+/// Where [`served_tail`]'s level sits in `segments`: the index of its root
+/// (`patch`, `patch-registry`, `gopatch`) and the index of the first segment
+/// below it.
+fn served_level(segments: &[&str], prefixed: bool) -> Option<(usize, usize)> {
     let tail_at = |i: usize| {
         let root = *segments.get(i)?;
         if root == GO_SERVE_ROOT {
-            Some(i + 1)
+            Some((i, i + 1))
         } else if SERVE_ROOTS.contains(&root) && ECOSYSTEM_DIRS.contains(segments.get(i + 1)?) {
-            Some(i + 2)
+            Some((i, i + 2))
         } else {
             None
         }
     };
-    let start = if prefixed {
-        (0..segments.len()).find_map(tail_at)?
+    if prefixed {
+        (0..segments.len()).find_map(tail_at)
     } else {
-        tail_at(0)?
-    };
-    segments.get(start..)
+        tail_at(0)
+    }
+}
+
+/// The path of a Socket-HOSTED `url` as the patch server itself serves it:
+/// its percent-decoded segments from the serve level on (`patch`, `npm`,
+/// `<name>`, …), with the path prefix of an operator's deployment or of a
+/// patch mirror's base dropped. `None` for a url [`hosted_patch_uuid`]
+/// does not accept. A reader that checks what a hosted path embeds reads
+/// this, never the url's own path, which under a mirror starts with the
+/// mirror's base (`/artifactory/socket-patch/patch/npm/…`).
+pub(crate) fn hosted_served_path(url: &str, extra_origins: &[String]) -> Option<Vec<String>> {
+    use crate::utils::purl::percent_decode_purl_component;
+
+    hosted_patch_uuid(url, extra_origins)?;
+    let (parsed, socket_host) = accepted_hosted_url(url, extra_origins)?;
+    let segments: Vec<&str> = parsed.path_segments()?.collect();
+    let (root, _) = served_level(&segments, !socket_host)?;
+    Some(
+        segments[root..]
+            .iter()
+            .map(|segment| percent_decode_purl_component(segment).into_owned())
+            .collect(),
+    )
 }
 
 /// `url` normalized the way [`hosted_patch_url_uuids`] reads it: `\/`
@@ -475,6 +504,11 @@ impl<'a> OriginPolicy<'a> {
             }
         }
         hosted_patch_uuid(url, self.origins)
+    }
+
+    /// [`hosted_served_path`] under this policy's origins.
+    pub(crate) fn hosted_served_path(&self, url: &str) -> Option<Vec<String>> {
+        hosted_served_path(url, self.origins)
     }
 
     /// Classify `s` (see [`Located`]).
