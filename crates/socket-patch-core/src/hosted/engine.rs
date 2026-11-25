@@ -21,7 +21,10 @@
 //! rewritten files) stays with the caller.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 
+use futures_util::future::Either;
 use serde::{Deserialize, Serialize};
 
 use crate::api::types::PackageVendorResult;
@@ -923,7 +926,10 @@ pub struct CandidateFiles {
     /// [`crate::bazel::pnpm::Hubs::unset`]), and whether one reads a lock
     /// in a shape that is not routed through a named registry. The rewrite
     /// plans from this alone and reads nothing of Bazel itself.
-    pub pnpm_bazel: crate::bazel::pnpm::Hubs,
+    ///
+    /// In a box, so that these files are no larger for what it holds: a
+    /// scan in any mode builds the futures that hold them on its stack.
+    pub pnpm_bazel: Box<crate::bazel::pnpm::Hubs>,
 }
 
 impl CandidateFiles {
@@ -1984,7 +1990,7 @@ async fn read_pnpm_bazel(view: &ProjectView<'_>, root: bool, out: &mut Candidate
     if let Some(hidden) = hubs.hidden.clone() {
         withhold_root_pnpm_locks(out, hidden);
     }
-    out.pnpm_bazel = hubs;
+    *out.pnpm_bazel = hubs;
 }
 
 /// Whether a hosted scan leaves the root pnpm lock of the project of
@@ -2933,7 +2939,7 @@ pub async fn rewrite(
     let mut kept: Vec<Candidate> = candidates.to_vec();
     let mut unattributed: Vec<SkippedPatch> = Vec::new();
     loop {
-        let mut done = rewrite_once(
+        let mut done = rewrite_pass(
             view,
             read.clone(),
             &kept,
@@ -3341,6 +3347,72 @@ pub const REDIRECT_COPY_UNPATCHED: &str = "redirect_copy_unpatched";
 /// attribute (see [`rewrite`]).
 pub const REDIRECT_UNATTRIBUTABLE: &str = "redirect_unattributable";
 
+/// One pass of [`rewrite`]: [`rewrite_once`], or [`rewrite_told`] for a
+/// run that is told not to write to pnpm-workspace.yaml beside a Bazel hub
+/// whose pnpm asks for a setting there
+/// ([`crate::bazel::pnpm::Hubs::unset`]).
+///
+/// No `async fn`, so that the second, which holds two passes, is built and
+/// boxed on this frame, which is gone before anything is polled. An
+/// `async fn` builds each future it awaits on its own poll frame first,
+/// also where the branch is not taken, and keeps what it clones for it in
+/// its own future: under every hosted rewrite, and in every future a
+/// scan builds on its stack to hold this one.
+fn rewrite_pass<'a>(
+    view: &'a ProjectView<'a>,
+    read: CandidateFiles,
+    candidates: &'a [Candidate],
+    python_metadata: BTreeMap<String, String>,
+    options: RewriteOptions<'a>,
+) -> Either<
+    impl Future<Output = Rewritten> + 'a,
+    Pin<Box<dyn Future<Output = Rewritten> + Send + 'a>>,
+> {
+    let told = read.pnpm_bazel.hides(options.trust_lockfile_config);
+    match told.filter(|_| read.pnpm_bazel.hidden.is_none()).cloned() {
+        None => Either::Left(rewrite_once(
+            view,
+            read,
+            candidates,
+            python_metadata,
+            options,
+        )),
+        Some(unset) => Either::Right(Box::pin(rewrite_told(
+            view,
+            read,
+            candidates,
+            python_metadata,
+            options,
+            unset,
+        ))),
+    }
+}
+
+/// A pass for a run that is told not to write to pnpm-workspace.yaml and
+/// so gives the pnpm of a Bazel hub no setting to read, where that pnpm
+/// asks for one (`unset`: [`crate::bazel::pnpm::Hubs::unset`]). The root
+/// lock is kept out of the pass as it is where the hub hides the file. Not
+/// where the pass ends routed without that, as it does in a project whose
+/// file holds the route of every pin already: a routed lock needs no
+/// setting, and the pass is the one of the same project without Bazel.
+async fn rewrite_told(
+    view: &ProjectView<'_>,
+    mut read: CandidateFiles,
+    candidates: &[Candidate],
+    python_metadata: BTreeMap<String, String>,
+    options: RewriteOptions<'_>,
+    unset: RewriteWarning,
+) -> Rewritten {
+    let (asked, metadata) = (read.clone(), python_metadata.clone());
+    let routed = rewrite_once(view, asked, candidates, metadata, options.clone()).await;
+    if routed.pnpm_named_registries {
+        return routed;
+    }
+    read.pnpm_bazel.hidden = Some(unset.clone());
+    withhold_root_pnpm_locks(&mut read, unset);
+    rewrite_once(view, read, candidates, python_metadata, options).await
+}
+
 async fn rewrite_once(
     view: &ProjectView<'_>,
     read: CandidateFiles,
@@ -3348,26 +3420,6 @@ async fn rewrite_once(
     python_metadata: BTreeMap<String, String>,
     options: RewriteOptions<'_>,
 ) -> Rewritten {
-    // Told not to write to pnpm-workspace.yaml, the run gives the pnpm of
-    // a Bazel hub no setting to read: where that pnpm asks for one, the
-    // root lock is kept out of this run as it is where the hub hides the
-    // file ([`crate::bazel::pnpm::Hubs::unset`]). Not where the run ends
-    // routed, as it does in a project whose file holds the route of every
-    // pin already: a routed lock needs no setting, and the run is the one
-    // of the same project without Bazel.
-    let mut read = read;
-    let unset = read.pnpm_bazel.hides(options.trust_lockfile_config);
-    if let (None, Some(unset)) = (&read.pnpm_bazel.hidden, unset.cloned()) {
-        let mut asked = read.clone();
-        asked.pnpm_bazel.unset = None;
-        let (metadata, options) = (python_metadata.clone(), options.clone());
-        let routed = Box::pin(rewrite_once(view, asked, candidates, metadata, options)).await;
-        if routed.pnpm_named_registries {
-            return routed;
-        }
-        read.pnpm_bazel.hidden = Some(unset.clone());
-        withhold_root_pnpm_locks(&mut read, unset);
-    }
     let CandidateFiles {
         files,
         rush_lock_keys,
@@ -13747,6 +13799,56 @@ snapshots:
          update_pnpm_lock = True",
     ];
 
+    /// What hosted mode puts on the stack of a scan in any mode stays as
+    /// small as it is without the answers about Bazel. A debug build
+    /// builds every future on the poll frame of the function that awaits
+    /// it, also in a branch that is not taken, and a scan that applies a
+    /// patch in place is within a few KiB of the 2 MiB a test thread has:
+    /// the candidate files hold the answers behind one pointer, and a
+    /// pass of the rewrite is one `rewrite_once` beside the pointer to
+    /// the two passes of a run under `--no-trust-lockfile-config`, which
+    /// are not built in line.
+    #[test]
+    fn the_bazel_answers_cost_a_scan_one_pointer_and_a_pass_no_second_rewrite() {
+        use std::mem::{size_of, size_of_val};
+        let word = size_of::<usize>();
+        assert_eq!(size_of_val(&CandidateFiles::default().pnpm_bazel), word);
+        // Eight collections of three words, two warnings of six, the pointer.
+        assert!(size_of::<CandidateFiles>() <= 37 * word);
+
+        let project = MemoryProject::new();
+        let view = ProjectView::Memory(&project);
+        let outer = OuterAllowRemote::default;
+        let options = || RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: false,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
+            cargo_outer: &no_cargo_outer,
+            maven_selection: &no_maven_selection,
+            pnpm_env: &no_env,
+            blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
+        };
+        let read = CandidateFiles::default;
+        let once = rewrite_once(&view, read(), &[], BTreeMap::new(), options());
+        let pass = rewrite_pass(&view, read(), &[], BTreeMap::new(), options());
+        assert!(matches!(pass, Either::Left(_)));
+        assert!(size_of_val(&pass) <= size_of_val(&once) + 2 * word);
+        // The run that is told not to write, beside a hub that asks for
+        // the setting: its two passes are behind a pointer.
+        let mut told = read();
+        told.pnpm_bazel.unset = Some(warning(crate::bazel::pnpm::HIDDEN, "unset"));
+        let pass = rewrite_pass(&view, told, &[], BTreeMap::new(), options());
+        assert!(matches!(pass, Either::Right(_)));
+    }
+
     /// A pnpm lock that such a hub reads is routed through a named
     /// registry exactly as it is without Bazel: the files of the run are
     /// those of the same project without its `MODULE.bazel`, byte for byte,
@@ -14544,7 +14646,7 @@ snapshots:
         let view = ProjectView::Disk(tmp.path());
         let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
         // No Bazel workspace: nothing was read of one.
-        assert_eq!(read.pnpm_bazel, crate::bazel::pnpm::Hubs::default());
+        assert_eq!(*read.pnpm_bazel, crate::bazel::pnpm::Hubs::default());
         let hidden = RewriteWarning {
             code: crate::bazel::pnpm::HIDDEN.into(),
             detail: "a hub keeps pnpm-lock.yaml up to date".into(),
