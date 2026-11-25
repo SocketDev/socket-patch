@@ -17,10 +17,23 @@
 //! vulnerability ID, of its own, after the `not_affected` one of the same
 //! ID. Such statements are not merged, so that the action statement of
 //! each is about one subcomponent.
+//!
+//! Each statement also names every one of its packages as a product of
+//! its own, after the project. Trivy and Grype look a finding up by the
+//! package's PURL and never match the project, so without these a
+//! scanner suppresses nothing. A package is named by its PURL and, for a
+//! gem built for a platform, by the forms those scanners report it under
+//! ([`scanner_forms`]). A form that stands for packages with different
+//! statuses for one vulnerability, under its ID or any alias (a patched
+//! and an unpatched build of one gem, or a build whose patch the
+//! document leaves out), is left out, so the scanner keeps reporting the
+//! finding. That holds for a package's own PURL too.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use crate::crawlers::Ecosystem;
 use crate::manifest::schema::PatchManifest;
+use crate::utils::purl::{percent_decode_purl_component, purl_qualifier, strip_purl_qualifiers};
 use crate::vex::schema::{
     Document, Justification, Product, Statement, Status, Subcomponent, Vulnerability,
     OPENVEX_CONTEXT_V0_2_0,
@@ -230,8 +243,68 @@ pub fn build_document_with(
         return None;
     }
 
+    // (vulnerability ID or alias, package form) -> the statuses the form
+    // stands for: `true` for unpatched, `false` for `not_affected`.
+    // Scanners match a statement by its name or any alias, so a form is
+    // judged under each of them.
+    let mut form_statuses: HashMap<(String, String), BTreeSet<bool>> = HashMap::new();
+    let mut mark = |ids: &[&str], purl: &str, unpatched: bool| {
+        for id in ids {
+            for form in package_forms(purl) {
+                form_statuses
+                    .entry((id.to_string(), form))
+                    .or_default()
+                    .insert(unpatched);
+            }
+        }
+    };
+    for ((vuln_id, affected), group) in &grouped {
+        let ids = vuln_ids(vuln_id, &group.aliases);
+        for purl in &group.subcomponents {
+            mark(&ids, purl, affected.is_some());
+        }
+    }
+    // A record the document leaves out (its check failed, or nothing
+    // attested it) is a copy that may be unpatched.
+    for (purl, record) in &manifest.patches {
+        if applied_set.contains(purl.as_str()) || actions.contains_key(purl.as_str()) {
+            continue;
+        }
+        for (vuln_id, info) in &record.vulnerabilities {
+            mark(&vuln_ids(vuln_id, &info.cves), purl, true);
+        }
+    }
+    let package_products: Vec<Vec<Product>> = grouped
+        .iter()
+        .map(|((vuln_id, _), group)| {
+            let ids = vuln_ids(vuln_id, &group.aliases);
+            let forms: BTreeSet<String> = group
+                .subcomponents
+                .iter()
+                .flat_map(|purl| package_forms(purl))
+                .filter(|form| {
+                    *form != opts.product_id
+                        && ids.iter().all(|id| {
+                            form_statuses
+                                .get(&(id.to_string(), form.clone()))
+                                .is_some_and(|statuses| statuses.len() == 1)
+                        })
+                })
+                .collect();
+            forms
+                .into_iter()
+                .map(|id| Product {
+                    id,
+                    identifiers: None,
+                    hashes: None,
+                    subcomponents: Vec::new(),
+                })
+                .collect()
+        })
+        .collect();
+
     let mut statements = Vec::with_capacity(grouped.len());
-    for ((vuln_id, affected), group) in grouped {
+    for (((vuln_id, affected), group), packages) in grouped.into_iter().zip(package_products) {
         let subcomponents = group
             .subcomponents
             .into_iter()
@@ -273,12 +346,14 @@ pub fn build_document_with(
             },
             timestamp: Some(timestamp.clone()),
             last_updated: None,
-            products: vec![Product {
+            products: std::iter::once(Product {
                 id: opts.product_id.clone(),
                 identifiers: None,
                 hashes: None,
                 subcomponents,
-            }],
+            })
+            .chain(packages)
+            .collect(),
             status,
             supplier: None,
             justification,
@@ -298,6 +373,42 @@ pub fn build_document_with(
         tooling: opts.tooling.clone(),
         statements,
     })
+}
+
+/// A vulnerability's ID followed by its aliases.
+fn vuln_ids<'a>(id: &'a str, aliases: impl IntoIterator<Item = &'a String>) -> Vec<&'a str> {
+    std::iter::once(id)
+        .chain(aliases.into_iter().map(String::as_str))
+        .collect()
+}
+
+/// `purl` and the forms scanners report the same package under.
+fn package_forms(purl: &str) -> impl Iterator<Item = String> {
+    std::iter::once(purl.to_string()).chain(scanner_forms(purl))
+}
+
+/// The other forms Trivy, Grype and Syft report a gem built for a
+/// platform under: Trivy without the platform, and Grype and Syft as
+/// `name@version-platform` (no suffix for `ruby`). Other ecosystems'
+/// qualifiers name a different artifact (a Maven classifier, a PyPI
+/// file), so they get no extra form.
+fn scanner_forms(purl: &str) -> Vec<String> {
+    if Ecosystem::from_purl(purl) != Some(Ecosystem::Gem) {
+        return Vec::new();
+    }
+    let Some(platform) = purl_qualifier(purl, "platform") else {
+        return Vec::new();
+    };
+    let base = strip_purl_qualifiers(purl);
+    if !base.contains('@') {
+        return Vec::new();
+    }
+    let platform = percent_decode_purl_component(platform);
+    let mut forms = vec![base.to_string()];
+    if !platform.is_empty() && platform != "ruby" {
+        forms.push(format!("{base}-{platform}"));
+    }
+    forms
 }
 
 #[derive(Default)]
@@ -416,11 +527,198 @@ mod tests {
             st.justification,
             Some(Justification::InlineMitigationsAlreadyExist)
         );
-        assert_eq!(st.products.len(), 1);
+        assert_eq!(st.products.len(), 2);
         assert_eq!(st.products[0].id, "pkg:npm/app@1.0.0");
         assert_eq!(st.products[0].subcomponents.len(), 1);
         assert_eq!(st.products[0].subcomponents[0].id, "pkg:npm/lodash@4.0.0");
+        assert_eq!(st.products[1].id, "pkg:npm/lodash@4.0.0");
+        assert!(st.products[1].subcomponents.is_empty());
         assert!(st.impact_statement.as_ref().unwrap().contains("u1"));
+    }
+
+    fn product_ids(st: &Statement) -> Vec<&str> {
+        st.products.iter().map(|p| p.id.as_str()).collect()
+    }
+
+    #[test]
+    fn native_gem_is_named_in_every_scanner_form() {
+        let purl = "pkg:gem/nokogiri@1.13.9?platform=x86_64-linux";
+        let mut manifest = PatchManifest::new();
+        manifest
+            .patches
+            .insert(purl.to_string(), record("u1", vec![("GHSA-aaaa", vec![])]));
+        let doc = build_plain(&manifest, &[purl.to_string()]).unwrap();
+        assert_eq!(
+            product_ids(&doc.statements[0]),
+            vec![
+                "pkg:npm/app@1.0.0",
+                "pkg:gem/nokogiri@1.13.9",
+                "pkg:gem/nokogiri@1.13.9-x86_64-linux",
+                purl,
+            ]
+        );
+    }
+
+    #[test]
+    fn ruby_platform_gem_gets_no_platform_suffix() {
+        let purl = "pkg:gem/nokogiri@1.13.9?platform=ruby";
+        let mut manifest = PatchManifest::new();
+        manifest
+            .patches
+            .insert(purl.to_string(), record("u1", vec![("GHSA-aaaa", vec![])]));
+        let doc = build_plain(&manifest, &[purl.to_string()]).unwrap();
+        assert_eq!(
+            product_ids(&doc.statements[0]),
+            vec!["pkg:npm/app@1.0.0", "pkg:gem/nokogiri@1.13.9", purl]
+        );
+    }
+
+    #[test]
+    fn shared_form_is_left_out_when_one_build_is_affected() {
+        let linux = "pkg:gem/nokogiri@1.13.9?platform=x86_64-linux";
+        let darwin = "pkg:gem/nokogiri@1.13.9?platform=arm64-darwin";
+        let mut manifest = PatchManifest::new();
+        for purl in [linux, darwin] {
+            manifest
+                .patches
+                .insert(purl.to_string(), record("u1", vec![("GHSA-aaaa", vec![])]));
+        }
+        let affected = vec![(darwin.to_string(), "Rebuild it.".to_string())];
+        let doc = build_affected(&manifest, &[linux.to_string()], &affected).unwrap();
+        assert_eq!(doc.statements.len(), 2);
+        for st in &doc.statements {
+            assert!(
+                !product_ids(st).contains(&"pkg:gem/nokogiri@1.13.9"),
+                "{:?} must not name the form both builds share",
+                st.status
+            );
+        }
+        let patched = doc
+            .statements
+            .iter()
+            .find(|st| st.status == Status::NotAffected)
+            .unwrap();
+        assert_eq!(
+            product_ids(patched),
+            vec![
+                "pkg:npm/app@1.0.0",
+                "pkg:gem/nokogiri@1.13.9-x86_64-linux",
+                linux,
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_form_is_kept_when_every_build_is_patched() {
+        let linux = "pkg:gem/nokogiri@1.13.9?platform=x86_64-linux";
+        let darwin = "pkg:gem/nokogiri@1.13.9?platform=arm64-darwin";
+        let mut manifest = PatchManifest::new();
+        for purl in [linux, darwin] {
+            manifest
+                .patches
+                .insert(purl.to_string(), record("u1", vec![("GHSA-aaaa", vec![])]));
+        }
+        let doc = build_plain(&manifest, &[linux.to_string(), darwin.to_string()]).unwrap();
+        assert_eq!(doc.statements.len(), 1);
+        assert!(product_ids(&doc.statements[0]).contains(&"pkg:gem/nokogiri@1.13.9"));
+    }
+
+    #[test]
+    fn shared_form_is_left_out_when_another_build_is_not_attested() {
+        // The darwin build's check failed, so it is not in `applied`: the
+        // document says nothing of it, and Trivy would read the shared
+        // form as covering it.
+        let linux = "pkg:gem/nokogiri@1.13.9?platform=x86_64-linux";
+        let darwin = "pkg:gem/nokogiri@1.13.9?platform=arm64-darwin";
+        let mut manifest = PatchManifest::new();
+        for purl in [linux, darwin] {
+            manifest
+                .patches
+                .insert(purl.to_string(), record("u1", vec![("GHSA-aaaa", vec![])]));
+        }
+        let doc = build_plain(&manifest, &[linux.to_string()]).unwrap();
+        assert_eq!(
+            product_ids(&doc.statements[0]),
+            vec![
+                "pkg:npm/app@1.0.0",
+                "pkg:gem/nokogiri@1.13.9-x86_64-linux",
+                linux,
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_form_is_judged_under_every_alias() {
+        // One CVE, recorded under a different GHSA for each build.
+        let linux = "pkg:gem/nokogiri@1.13.9?platform=x86_64-linux";
+        let darwin = "pkg:gem/nokogiri@1.13.9?platform=arm64-darwin";
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            linux.to_string(),
+            record("u1", vec![("GHSA-aaaa", vec!["CVE-2024-1"])]),
+        );
+        manifest.patches.insert(
+            darwin.to_string(),
+            record("u2", vec![("GHSA-bbbb", vec!["CVE-2024-1"])]),
+        );
+        let affected = vec![(darwin.to_string(), "Rebuild it.".to_string())];
+        let doc = build_affected(&manifest, &[linux.to_string()], &affected).unwrap();
+        for st in &doc.statements {
+            assert!(
+                !product_ids(st).contains(&"pkg:gem/nokogiri@1.13.9"),
+                "{} must not name the form both builds share",
+                st.vulnerability.name
+            );
+        }
+    }
+
+    #[test]
+    fn percent_encoded_platform_is_decoded() {
+        let purl = "pkg:gem/ffi@1.17.0?platform=x64%2Dmingw-ucrt";
+        let mut manifest = PatchManifest::new();
+        manifest
+            .patches
+            .insert(purl.to_string(), record("u1", vec![("GHSA-aaaa", vec![])]));
+        let doc = build_plain(&manifest, &[purl.to_string()]).unwrap();
+        assert!(product_ids(&doc.statements[0]).contains(&"pkg:gem/ffi@1.17.0-x64-mingw-ucrt"));
+    }
+
+    #[test]
+    fn other_qualifiers_get_no_extra_form() {
+        let purl =
+            "pkg:maven/io.netty/netty-transport-native-epoll@4.1.100.Final?classifier=linux-x86_64";
+        let mut manifest = PatchManifest::new();
+        manifest
+            .patches
+            .insert(purl.to_string(), record("u1", vec![("GHSA-aaaa", vec![])]));
+        let doc = build_plain(&manifest, &[purl.to_string()]).unwrap();
+        assert_eq!(
+            product_ids(&doc.statements[0]),
+            vec!["pkg:npm/app@1.0.0", purl]
+        );
+    }
+
+    #[test]
+    fn product_override_naming_the_package_is_not_repeated() {
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/lodash@4.0.0".to_string(),
+            record("u1", vec![("GHSA-aaaa", vec![])]),
+        );
+        let mut o = opts();
+        o.product_id = "pkg:npm/lodash@4.0.0".to_string();
+        let doc = build_document(
+            &manifest,
+            &["pkg:npm/lodash@4.0.0".to_string()],
+            &[],
+            &[],
+            &o,
+        )
+        .unwrap();
+        assert_eq!(
+            product_ids(&doc.statements[0]),
+            vec!["pkg:npm/lodash@4.0.0"]
+        );
     }
 
     #[test]

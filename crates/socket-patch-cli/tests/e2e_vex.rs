@@ -181,11 +181,13 @@ fn no_verify_emits_valid_openvex() {
     assert_eq!(s0["justification"], "inline_mitigations_already_exist");
 
     let products = s0["products"].as_array().unwrap();
-    assert_eq!(products.len(), 1);
+    assert_eq!(products.len(), 2);
     assert_eq!(products[0]["@id"], "pkg:npm/test-app@1.0.0");
     let subs = products[0]["subcomponents"].as_array().unwrap();
     assert_eq!(subs.len(), 1);
     assert_eq!(subs[0]["@id"], "pkg:npm/lodash@4.17.20");
+    assert_eq!(products[1]["@id"], "pkg:npm/lodash@4.17.20");
+    assert!(products[1].get("subcomponents").is_none());
 
     maybe_validate_with_vexctl(&stdout);
 }
