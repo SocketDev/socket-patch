@@ -82,6 +82,25 @@ fn comment(what: &str) -> String {
 /// leaves both lines alone.
 const MARK: &str = "# socket-patch:";
 
+/// The lines socket-patch keeps in one file at a Bazel root, each under a
+/// comment line of its own. They are added and taken away in one way for
+/// `.bazelignore` and for the `.bazelrc` of [`super::distdir`].
+pub(super) struct Kept {
+    /// The name of the file at the Bazel root.
+    pub(super) file: &'static str,
+    /// The line above a line written, which starts with [`MARK`], for
+    /// what the line's entry says it is about.
+    pub(super) comment: fn(&str) -> String,
+    /// Whether a line of the file's text already does what a line would.
+    pub(super) covers: fn(&[u8], &str) -> bool,
+}
+
+const IGNORED: Kept = Kept {
+    file: ".bazelignore",
+    comment,
+    covers,
+};
+
 /// Make the `.bazelignore` at the Bazel root of `project` agree with the
 /// copies of the project: for each of `.socket/vendor/golang`,
 /// `.socket/go-patches`, `.socket/vendor/cargo` and `.socket/vendor/maven`
@@ -177,64 +196,38 @@ fn sync_blocking(
     let mut hub = None;
     let mut under_a_hub = |wanted: &mut [(String, Option<bool>, &'static str); 4], text: &[u8]| {
         for ((.., of), (line, state, _)) in COPIES.iter().zip(wanted.iter_mut()) {
-            let adds = *of == Of::Crates && *state == Some(true) && !settled(text, line);
+            let adds = *of == Of::Crates && *state == Some(true) && !settled(&IGNORED, text, line);
             if adds && !*hub.get_or_insert_with(|| cargo_bazel::hub(&root)) {
                 *state = None;
             }
         }
     };
 
-    let file = root.dir.join(".bazelignore");
-    let read = || match read_regular_to_bytes_sync(&file) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        read => read,
+    let mut edit = |text: &[u8]| {
+        under_a_hub(&mut wanted, text);
+        edited(&IGNORED, text, &wanted)
     };
-    // Most runs find nothing to change, and take no lock to find that. A
-    // file that cannot be read is an edit only with a copy to name in it.
-    let unlocked = read().unwrap_or_default();
-    under_a_hub(&mut wanted, &unlocked);
-    if edited(&unlocked, &wanted) == unlocked {
-        return Ok(None);
-    }
-    let _lock = lock(&root.dir);
-    let (old, unreadable) = match read() {
-        Ok(old) => (old, None),
-        Err(e) => (Vec::new(), Some(e)),
-    };
-    under_a_hub(&mut wanted, &old);
-    let new = edited(&old, &wanted);
-    // The root is canonical: on Windows that spelling has a prefix no user
-    // types and no tool prints.
-    let shown = crate::utils::pnpm_workspace::without_verbatim_prefix(file.clone());
-    let failed = match unreadable {
-        Some(e) => e,
-        None if new == old => return Ok(None),
-        // The target of a link is not the workspace's file to change, and
-        // a replacement would turn the link into a regular file.
-        None if crate::utils::containment::is_link(&file) => std::io::Error::other(
-            "it is a symbolic link, which socket-patch does not write through",
-        ),
-        None => match write(&file, &old, &new) {
-            Ok(()) => {
-                // Whose lines the file has more or fewer of than before.
-                let lines = |text: &[u8], line: &str| {
-                    let is = |l: &&[u8]| content(l) == line.as_bytes();
-                    text.split(|byte| *byte == b'\n').filter(is).count()
-                };
-                let differs = |line: &str| lines(&old, line) != lines(&new, line);
-                let whose = wanted.iter().filter(|(line, ..)| differs(line));
-                let mut whose: Vec<_> = whose.map(|(.., what)| *what).collect();
-                whose.dedup();
-                return Ok(Some((shown, whose)));
-            }
-            Err(e) => e,
-        },
+    let (shown, failed, old) = match update(&IGNORED, &root.dir, &mut edit) {
+        Ok(None) => return Ok(None),
+        Ok(Some((shown, old, new))) => {
+            // Whose lines the file has more or fewer of than before.
+            let lines = |text: &[u8], line: &str| {
+                let is = |l: &&[u8]| content(l) == line.as_bytes();
+                text.split(|byte| *byte == b'\n').filter(is).count()
+            };
+            let differs = |line: &str| lines(&old, line) != lines(&new, line);
+            let whose = wanted.iter().filter(|(line, ..)| differs(line));
+            let mut whose: Vec<_> = whose.map(|(.., what)| *what).collect();
+            whose.dedup();
+            return Ok(Some((shown, whose)));
+        }
+        Err(failed) => failed,
     };
     // A missing line is what the user has to act on. A pair that stays
     // behind for a directory that is gone ignores nothing.
     let missing: Vec<String> = wanted
         .iter()
-        .filter(|(line, state, _)| *state == Some(true) && !settled(&old, line))
+        .filter(|(line, state, _)| *state == Some(true) && !settled(&IGNORED, &old, line))
         .map(|(line, ..)| format!("`{line}`"))
         .collect();
     let advice = if !missing.is_empty() {
@@ -255,7 +248,56 @@ fn sync_blocking(
     ))
 }
 
-/// The lock of the `.bazelignore` at `root`, which a process holds from its
+/// The file [`update`] changed, what it held and what it holds now.
+pub(super) type Written = (PathBuf, Vec<u8>, Vec<u8>);
+
+/// Make the file of `kept` at the Bazel root `root` hold what `edit` makes
+/// of its bytes, under a lock of the root ([`lock`]). `Ok(Some)` is the
+/// file, when it was changed, with what it held and what it holds now.
+/// `Err` is the file, why it could not be read or written (it may be a
+/// link, which socket-patch does not write through), and what it held.
+pub(super) fn update(
+    kept: &Kept,
+    root: &Path,
+    edit: &mut dyn FnMut(&[u8]) -> Vec<u8>,
+) -> Result<Option<Written>, (PathBuf, std::io::Error, Vec<u8>)> {
+    let file = root.join(kept.file);
+    let read = || match read_regular_to_bytes_sync(&file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        read => read,
+    };
+    // Most runs find nothing to change, and take no lock to find that. A
+    // file that cannot be read is an edit only with a line to add to it.
+    let unlocked = read().unwrap_or_default();
+    if edit(&unlocked) == unlocked {
+        return Ok(None);
+    }
+    let _lock = lock(root);
+    let (old, unreadable) = match read() {
+        Ok(old) => (old, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    let new = edit(&old);
+    // The root is canonical: on Windows that spelling has a prefix no user
+    // types and no tool prints.
+    let shown = crate::utils::pnpm_workspace::without_verbatim_prefix(file.clone());
+    let failed = match unreadable {
+        Some(e) => e,
+        None if new == old => return Ok(None),
+        // The target of a link is not the workspace's file to change, and
+        // a replacement would turn the link into a regular file.
+        None if crate::utils::containment::is_link(&file) => std::io::Error::other(
+            "it is a symbolic link, which socket-patch does not write through",
+        ),
+        None => match write(&file, &old, &new) {
+            Ok(()) => return Ok(Some((shown, old, new))),
+            Err(e) => e,
+        },
+    };
+    Err((shown, failed, old))
+}
+
+/// The lock of the file at `root`, which a process holds from its
 /// read of the file to its write: without it, a pair that one project adds
 /// between the read and the replacement of another project's removal is
 /// lost. It is an advisory lock on the root directory itself, so that no
@@ -301,7 +343,7 @@ fn write(file: &Path, old: &[u8], new: &[u8]) -> std::io::Result<()> {
 }
 
 /// A line of the file without its line break (`\n`, or `\r\n`).
-fn content(line: &[u8]) -> &[u8] {
+pub(super) fn content(line: &[u8]) -> &[u8] {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     line.strip_suffix(b"\r").unwrap_or(line)
 }
@@ -326,10 +368,10 @@ fn covers(old: &[u8], path: &str) -> bool {
 }
 
 /// Whether `old` needs no pair for the directory `path`: a line covers it
-/// ([`covers`]), or the user declined the pair by commenting its path line
-/// out: a [`MARK`] line, then a line of `#`, any blanks, and the [`plain`]
-/// path.
-fn settled(old: &[u8], path: &str) -> bool {
+/// ([`Kept::covers`]), or the user declined the pair by commenting its
+/// path line out: a [`MARK`] line, then a line of `#`, any blanks, and the
+/// [`plain`] path.
+pub(super) fn settled(kept: &Kept, old: &[u8], path: &str) -> bool {
     let lines: Vec<&[u8]> = (old.split_inclusive(|byte| *byte == b'\n'))
         .map(content)
         .collect();
@@ -338,7 +380,7 @@ fn settled(old: &[u8], path: &str) -> bool {
         pair[0].starts_with(MARK.as_bytes())
             && commented.is_some_and(|rest| plain(rest.trim_ascii_start()) == path.as_bytes())
     };
-    covers(old, path) || lines.windows(2).any(declined)
+    (kept.covers)(old, path) || lines.windows(2).any(declined)
 }
 
 /// `old` as [`sync`] leaves it for `wanted`, the line of each directory,
@@ -350,7 +392,7 @@ fn settled(old: &[u8], path: &str) -> bool {
 /// the pair and none after it, and loses that one (the comment line's own)
 /// with a pair that ends the file that way, so that the file without the
 /// pair is the file of before, byte for byte.
-fn edited(old: &[u8], wanted: &[(String, Option<bool>, &str)]) -> Vec<u8> {
+pub(super) fn edited(kept: &Kept, old: &[u8], wanted: &[(String, Option<bool>, &str)]) -> Vec<u8> {
     let gone = |line: &[u8]| {
         wanted
             .iter()
@@ -376,10 +418,10 @@ fn edited(old: &[u8], wanted: &[(String, Option<bool>, &str)]) -> Vec<u8> {
     }
     let nl = crate::utils::line_endings::terminator(&String::from_utf8_lossy(old));
     for (line, exists, what) in wanted {
-        if *exists != Some(true) || settled(&new, line) {
+        if *exists != Some(true) || settled(kept, &new, line) {
             continue;
         }
-        let comment = comment(what);
+        let comment = (kept.comment)(what);
         let pair = match new.is_empty() || new.ends_with(b"\n") {
             true => format!("{comment}{nl}{line}{nl}"),
             false => format!("{nl}{comment}{nl}{line}"),
@@ -406,7 +448,7 @@ mod tests {
     fn edit(old: &str, vendor: bool, patches: bool) -> String {
         let wanted = [(VENDOR, vendor), (PATCHES, patches)];
         let wanted = wanted.map(|(line, exists)| (line.to_string(), Some(exists), "Go module"));
-        String::from_utf8(edited(old.as_bytes(), &wanted)).unwrap()
+        String::from_utf8(edited(&IGNORED, old.as_bytes(), &wanted)).unwrap()
     }
 
     fn pair(line: &str) -> String {
@@ -610,8 +652,8 @@ mod tests {
                 assert_eq!(other, format!("{declined}{}", pair(PATCHES)));
                 assert_eq!(edit(&other, vendor, false), declined);
             }
-            assert!(settled(declined.as_bytes(), VENDOR));
-            assert!(!settled(declined.as_bytes(), PATCHES));
+            assert!(settled(&IGNORED, declined.as_bytes(), VENDOR));
+            assert!(!settled(&IGNORED, declined.as_bytes(), PATCHES));
         }
         // No "no": without the comment line above it (a commented-out
         // one included), or not that path.

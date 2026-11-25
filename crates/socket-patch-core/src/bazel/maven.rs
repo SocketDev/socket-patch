@@ -508,6 +508,40 @@ pub(super) fn asked(ws: &Workspace, module: &str) -> Asked {
     }
 }
 
+/// Why the release of the ruleset `module` that Bazel builds with is not
+/// one of `known`: by the one release `lock` (`MODULE.bazel.lock`) says
+/// Bazel selected, where the root module (`asked`) has not asked for
+/// another since. `Ok` when it is one. `so` is what hangs on the release,
+/// for the two reasons that it cannot be told, and `beyond` what to say of
+/// a release outside `known`. A lock that holds another release than the
+/// root now takes is stale ([`Asked::stale`]).
+pub(super) fn known_release(
+    asked: &Asked,
+    lock: &ModuleLock,
+    module: &str,
+    known: &[&str],
+    so: &str,
+    beyond: &dyn Fn(&str) -> String,
+) -> Result<(), String> {
+    let wanted = asked.wanted();
+    Err(match (asked, &lock.selected(module)[..]) {
+        (Asked::Unknown(at), _) => format!(
+            "{at} of {module} socket-patch cannot tell which release of the ruleset Bazel \
+             builds with{so}"
+        ),
+        (_, [selected]) if !known.contains(selected) => beyond(selected),
+        (_, [selected]) if asked.stale(selected) => format!(
+            "{FILE} asks for {module} {wanted} and MODULE.bazel.lock holds {selected}: build once \
+             so that Bazel updates its lock"
+        ),
+        (_, [_]) => return Ok(()),
+        _ => format!(
+            "MODULE.bazel.lock does not say which release of {module} Bazel selected{so}: build \
+             once so that Bazel writes its lock"
+        ),
+    })
+}
+
 /// What the hubs of a workspace build: read once, asked per artifact.
 #[derive(Debug)]
 pub struct Hubs {
@@ -1182,7 +1216,7 @@ fn rc(view: &dyn Fn(&str) -> Entry, release: Option<super::rc::Release>) -> Vec<
         };
         Some((code, format!("{file}:{line} names `{word}`, {why}")))
     };
-    match mentions(view, &flags) {
+    match mentions(view, &flags, false) {
         Ok(found) => found.into_iter().filter_map(against).collect(),
         Err(file) => {
             let why = format!("the rc file {file} cannot be read, and may switch an entry off");
@@ -1227,35 +1261,26 @@ fn settings(
         }
         _ => {}
     }
-    let (module, wanted) = (EXTENSION.module, asked.wanted());
-    let why = match (asked, &lock.selected(module)[..]) {
-        (Asked::Unknown(at), _) => format!(
-            "{at} of {module} socket-patch cannot tell which release of the ruleset Bazel \
-             builds with, and the name of a jar's repository depends on it"
-        ),
-        (_, [selected]) if !RULESETS.contains(selected) => format!(
+    let module = EXTENSION.module;
+    let so = ", and the name of a jar's repository depends on it";
+    let beyond = |selected: &str| {
+        format!(
             "Bazel selected {module} {selected}, and how the ruleset names the repository of a \
              jar is known for its releases 6.4 to 7.2: update socket-patch"
-        ),
-        (_, [selected]) if asked.stale(selected) => format!(
-            "{FILE} asks for {module} {wanted} and MODULE.bazel.lock holds {selected}: build once \
-             so that Bazel updates its lock"
-        ),
+        )
+    };
+    match known_release(asked, &lock, module, &RULESETS, so, &beyond) {
         // The jar of a vendored entry is in the checkout: no option about
         // downloads stands against it.
-        (_, [_]) => {
+        Ok(()) => {
             let against = |(code, _): &Declined| !vendored || *code != DOWNLOAD;
-            return rc(view, release)
+            rc(view, release)
                 .into_iter()
                 .find(against)
-                .map_or(Ok(()), Err);
+                .map_or(Ok(()), Err)
         }
-        _ => format!(
-            "MODULE.bazel.lock does not say which release of {module} Bazel selected, and the \
-             name of a jar's repository depends on it: build once so that Bazel writes its lock"
-        ),
-    };
-    Err((RELEASE, why))
+        Err(why) => Err((RELEASE, why)),
+    }
 }
 
 impl Hubs {

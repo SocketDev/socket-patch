@@ -205,7 +205,7 @@ fn read(dir: &Path, project: &Path) -> Result<Hub, String> {
         return Err("no `ruby.bundle_fetch` call is seen to read Gemfile and Gemfile.lock".into());
     }
     opens_file_urls(declared_release(&view))?;
-    reads_the_checkout(mentions(&view, &KEEPS_BAZEL_OFF))?;
+    reads_the_checkout(mentions(&view, &KEEPS_BAZEL_OFF, false))?;
     let unread = || "Gemfile.lock cannot be read".to_string();
     let lock = lock_text(dir, GEMFILE_LOCK).ok_or_else(unread)?;
     bundler_builds(&lock)?;

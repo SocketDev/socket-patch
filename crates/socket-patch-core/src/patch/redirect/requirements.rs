@@ -200,7 +200,7 @@ fn line_requirement(text: &str) -> Option<Requirement<'_>> {
     parse_requirement(code.trim_end().trim_end_matches('\\'))
 }
 
-pub(super) fn rewrite(
+pub(crate) fn rewrite(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
     result: &mut RewriteResult,

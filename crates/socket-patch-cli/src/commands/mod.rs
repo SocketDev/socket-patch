@@ -59,23 +59,28 @@ pub(crate) fn project_state_in_scope(common: &crate::args::GlobalArgs) -> bool {
 /// the project's patched Go module copies, of the vendored crates a crate
 /// hub builds, and of the patched Maven jars that vendored mode keeps for a
 /// rules_jvm_external hub, so that Bazel and gazelle read no package there
-/// (`socket_patch_core::bazel::ignore`). A command that can write or
-/// remove such a copy calls this once, after the last step that can change
-/// a copy or take one back and before it gives up its apply lock. Nothing
-/// is done in a dry run or a `--global` run, and a run whose `--ecosystems`
-/// leaves `golang`, `cargo` or `maven` out only takes away that ecosystem's pair of
-/// a copy that is gone. So does the prune pass of a scan, which comes here
-/// after its scan has (`adds` false) and can only have removed a copy: a
-/// file it cannot write is left to the next command's warning.
+/// (`socket_patch_core::bazel::ignore`), and the root's `.bazelrc` names
+/// the directory of each patched wheel that vendored mode committed as a
+/// download cache of Bazel, so that the build takes the wheel from there
+/// (`socket_patch_core::vendor::pypi_distdir`). A command that can write
+/// or remove such a copy calls this once, after the last step that can
+/// change a copy or take one back and before it gives up its apply lock.
+/// Nothing is done in a dry run or a `--global` run, and a run whose
+/// `--ecosystems` leaves `golang`, `cargo`, `maven` or `pypi` out only takes away
+/// that ecosystem's pair of a copy that is gone. So does the prune pass of
+/// a scan, which comes here after its scan has (`adds` false) and can only
+/// have removed a copy: a file it cannot write is left to the next
+/// command's warning.
 ///
-/// A human run is told here that the file changed, or why it could not be;
+/// A human run is told here that a file changed, or why it could not be;
 /// the result is that warning again, for the command's envelope.
 pub(crate) async fn sync_bazelignore(
     common: &crate::args::GlobalArgs,
     adds: bool,
 ) -> Vec<crate::json_envelope::RunWarning> {
-    use socket_patch_core::bazel::ignore;
-    use socket_patch_core::crawlers::Ecosystem::{Cargo, Golang, Maven};
+    use socket_patch_core::bazel::{distdir, ignore};
+    use socket_patch_core::crawlers::Ecosystem::{Cargo, Golang, Maven, Pypi};
+    use socket_patch_core::vendor::pypi_distdir::sync_bazelrc;
     let mut warnings = Vec::new();
     if common.dry_run || common.is_global() {
         return warnings;
@@ -87,13 +92,14 @@ pub(crate) async fn sync_bazelignore(
         projects.push(common.project_root());
     }
     let (loud, mut told) = (!common.json && !common.silent, Vec::new());
-    let [go, cargo, maven] =
-        [Golang, Cargo, Maven].map(|eco| adds && common.ecosystem_selected(eco));
+    let [go, cargo, maven, pypi] =
+        [Golang, Cargo, Maven, Pypi].map(|eco| adds && common.ecosystem_selected(eco));
     for project in projects {
-        match ignore::sync(&project, go, cargo, maven).await {
-            Ok(Some((file, copies))) if loud => {
-                // A root that both projects are under is named once for
-                // each kind of copy whose lines changed there.
+        // For each file that changed: the line a person is told, and what
+        // that line is told once by.
+        let copies = ignore::sync(&project, go, cargo, maven).await;
+        let copies = copies.map(|changed| {
+            changed.map(|(file, copies)| {
                 let (shown, copies) = (file.display(), copies.join(" and "));
                 let line = match file.exists() {
                     true => format!(
@@ -104,21 +110,47 @@ pub(crate) async fn sync_bazelignore(
                         format!("Removed {shown}: no patched {copies} copy is left under .socket")
                     }
                 };
-                if !told.contains(&line) {
+                // A root that both projects are under is named once for
+                // each kind of copy whose lines changed there.
+                (line.clone(), line)
+            })
+        });
+        let wheels = sync_bazelrc(&project, pypi).await.map(|changed| {
+            changed.map(|file| {
+                let shown = file.display();
+                let line = match file.exists() {
+                    true => format!(
+                        "Updated {shown}: the lines that make Bazel take patched wheels from \
+                         .socket/vendor/pypi"
+                    ),
+                    false => format!(
+                        "Removed {shown}: no patched wheel is left under .socket/vendor/pypi for \
+                         Bazel to take"
+                    ),
+                };
+                // A root that both projects are under is named once.
+                (shown.to_string(), line)
+            })
+        });
+        let synced = [
+            (copies, ignore::NOT_UPDATED),
+            (wheels, distdir::NOT_UPDATED),
+        ];
+        for (synced, not_updated) in synced {
+            match synced {
+                Ok(Some((once, line))) if loud && !told.contains(&once) => {
                     println!("{line}");
-                    told.push(line);
+                    told.push(once);
                 }
-            }
-            Err(detail) if adds => {
-                if loud {
-                    eprintln!("Warning: {detail}");
+                Err(detail) if adds => {
+                    if loud {
+                        eprintln!("Warning: {detail}");
+                    }
+                    let warning = crate::json_envelope::RunWarning::new(not_updated, detail);
+                    warnings.push(warning);
                 }
-                warnings.push(crate::json_envelope::RunWarning::new(
-                    ignore::NOT_UPDATED,
-                    detail,
-                ));
+                _ => {}
             }
-            _ => {}
         }
     }
     warnings

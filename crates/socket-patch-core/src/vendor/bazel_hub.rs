@@ -1,6 +1,8 @@
 //! PyPI and RubyGems vendored mode for a project whose lock a Bazel hub
 //! reads: declined unless the user allows it, or the package is a gem that
-//! can be committed for the hub as its archive ([`super::gem::bazel`]).
+//! can be committed for the hub as its archive ([`super::gem::bazel`]), or
+//! a wheel that can be committed as a download cache of Bazel
+//! ([`super::pypi_distdir`]).
 //!
 //! rules_python's `pip.parse` and rules_ruby's `ruby.bundle_fetch` build
 //! the packages of a lock in repositories of Bazel's own. Vendored mode
@@ -69,10 +71,24 @@ pub async fn refusals<'a>(
 
 /// What stands between vendored mode and a list of files of a project
 /// ([`standing`]): what was read of the workspace, the text of the lock the
-/// hub reads where a call names one, and for a call that names a gem's
-/// files whether a gem can be committed for it as its archive
-/// ([`gem_hub::gate`]). `None` where nothing stands in the way.
-type Standing = Option<(String, Option<String>, Option<Result<gem_hub::Hub, String>>)>;
+/// hub reads where a call names one, whether one names, with certainty, a
+/// file of the list itself (and not one that brings it in with `-r`), and
+/// for a call that names a gem's files whether a gem can be committed for
+/// it as its archive ([`gem_hub::gate`]). `None` where nothing stands in
+/// the way.
+type Standing = Option<(
+    String,
+    Option<String>,
+    bool,
+    Option<Result<gem_hub::Hub, String>>,
+)>;
+
+/// What the refusal says after its own words where a wheel could be a
+/// download cache of Bazel ([`super::pypi_distdir`]) and is not made one:
+/// the reason follows.
+const NO_CACHE: &str = "the form that rules_python does build, the patched wheel committed as a \
+                        download cache of Bazel, is written only where the checkout shows that \
+                        it works, and not here";
 
 /// What rules_ruby builds of a hosted pin: the `sha256` of a gem that the
 /// call lists holds the build to the registry's gem.
@@ -108,6 +124,14 @@ async fn refusals_unless<'a>(
         // The files a hub can be given that the run for this package would
         // point at a copy. With none, no hub stands in its way.
         let locks = match Ecosystem::from_purl(purl) {
+            // A wheel that already is a download cache: nothing to write.
+            Some(Ecosystem::Pypi)
+                if super::pypi_distdir::in_sync(project, purl, uuid)
+                    .await
+                    .is_some() =>
+            {
+                continue
+            }
             Some(Ecosystem::Pypi) => super::pypi::hub_files(project, purl).await,
             Some(Ecosystem::Gem) => [super::gem::GEMFILE, super::gem::GEMFILE_LOCK]
                 .map(String::from)
@@ -126,7 +150,7 @@ async fn refusals_unless<'a>(
                 asked.len() - 1
             }
         };
-        let Some((reads, lock, gem)) = &asked[at].1 else {
+        let Some((reads, lock, named, gem)) = &asked[at].1 else {
             continue;
         };
         // A lock names the copy of a patch by the copy's directory, outside
@@ -194,9 +218,56 @@ async fn refusals_unless<'a>(
              that {ruleset} fetches{hosted}, or pass `--allow-vendored-in-bazel` if no build \
              takes the packages of this project from {ruleset}"
         );
-        refused.push((*purl, code, detail));
+        // A wheel is committed as a download cache of Bazel where the
+        // checkout shows that the build takes it; elsewhere the refusal
+        // says why not.
+        if code != PYPI_CODE || !*named {
+            refused.push((*purl, code, detail));
+            continue;
+        }
+        let gate = super::pypi_distdir::gate(project, &root, files, (purl, uuid));
+        if let Err(why) = gate.await {
+            refused.push((*purl, code, format!("{detail}; {NO_CACHE}: {why}")));
+        }
     }
     refused
+}
+
+/// How the run for the PyPI package `purl` of `project` and its patch
+/// `uuid` writes the wheel as a download cache of Bazel
+/// ([`super::pypi_distdir`]): `Some(Some(pin))` when it already is one,
+/// pinned at that path and sha256, and `Some(None)` when the run makes it
+/// one, which is where [`refusals`] lets the package through for that.
+/// `None` for every other package: one that the user allowed
+/// ([`ALLOW_IN_BAZEL_ENV`]) is written as it is without Bazel.
+///
+/// `Err` is the refusal of [`refusals`], asked again where the lock is
+/// about to be written: a run that takes a hosted pin over has put the
+/// registry's pin back since the run was let through, and that pin may be
+/// one the form is not written for.
+pub(super) async fn download_cache(
+    project: &Path,
+    purl: &str,
+    uuid: &str,
+) -> Result<Option<Option<(String, String)>>, (&'static str, String)> {
+    if let Some(pin) = super::pypi_distdir::in_sync(project, purl, uuid).await {
+        return Ok(Some(Some(pin)));
+    }
+    if let Some((_, code, why)) = refusals(project, &[(purl, uuid)]).await.pop() {
+        return Err((code, why));
+    }
+    let dir = project.to_path_buf();
+    let root = run_blocking(move || crate::bazel::bazel_root(&dir)).await;
+    let Some(root) = root.filter(|_| !env_flag(ALLOW_IN_BAZEL_ENV)) else {
+        return Ok(None);
+    };
+    let locks = super::pypi::hub_files(project, purl).await;
+    // As in [`standing`]: a call that names a file of the project itself.
+    let own = |lock: &String| locks.iter().any(|own| from_root(&root, own) == *lock);
+    let named = !locks.is_empty()
+        && matches!(reader(&root, "pypi", locks.clone()).await, Some(Ok(read)) if own(&read.lock));
+    let gate = super::pypi_distdir::gate(project, &root, &locks, (purl, uuid));
+    Ok((named && gate.await.is_ok()).then_some(None))
 }
 
 /// The [`Standing`] of the files `locks` of the project of `root`, for the
@@ -211,7 +282,8 @@ async fn standing(
     // types and no tool prints.
     let at = without_verbatim_prefix(root.dir.clone());
     let at = at.display();
-    let (reads, lock, gem) = match reader(root, purls, locks).await? {
+    let own: Vec<String> = locks.iter().map(|lock| from_root(root, lock)).collect();
+    let (reads, lock, named, gem) = match reader(root, purls, locks).await? {
         Ok(Unbuilt {
             call,
             file,
@@ -221,6 +293,10 @@ async fn standing(
         }) => {
             let reads =
                 format!("`{call}` ({file}:{line}) of the Bazel workspace at {at} names {lock}");
+            // A file that only brings a file of the project in with `-r` is
+            // none the run writes: no build through it is shown to take a
+            // committed copy, so it does not count as named.
+            let named = own.contains(&lock);
             // Read as a lock of the workspace is: within its bound, and
             // not through a link that leads out of the Bazel root.
             let dir = root.dir.clone();
@@ -229,7 +305,7 @@ async fn standing(
                 "gem" => Some(gem_hub::gate(root).await),
                 _ => None,
             };
-            (reads, lock, gem)
+            (reads, lock, named, gem)
         }
         Err(Doubt { file, line, why }) => {
             let line = match line {
@@ -240,10 +316,10 @@ async fn standing(
                 "the files of the Bazel workspace at {at} cannot be read with certainty, so a \
                  call of {ruleset} may name a lock of this project ({file}{line}: {why})"
             );
-            (reads, None, None)
+            (reads, None, false, None)
         }
     };
-    Some((reads, lock, gem))
+    Some((reads, lock, named, gem))
 }
 
 #[cfg(test)]
@@ -462,6 +538,9 @@ ruby.bundle_fetch(name = "bundle", gemfile = "//api:Gemfile", gemfile_lock = "//
         let (code, detail) = declined(&root.join("api"), Ecosystem::Pypi).await;
         assert_eq!(code, PYPI_CODE);
         assert!(detail.contains("names api/all.txt; "), "{detail}");
+        // No build through the including file is shown to take a committed
+        // wheel, so the download cache is not even asked about.
+        assert!(!detail.contains(NO_CACHE), "{detail}");
         // Without the include, the hub reads a file the run leaves alone.
         fs::write(root.join("api/all.txt"), "y==1.0.0\n").unwrap();
         assert_eq!(asked(&root.join("api"), Ecosystem::Pypi, false).await, None);

@@ -438,7 +438,9 @@ pub struct GlobalArgs {
     /// that makes the hub take the copy cannot be shown to work
     /// (`vendor_nuget_bazel_workspace`). Pass it when the build does find
     /// the copy, does not take the project's packages from that lock, or
-    /// does not build the project. Without it a gem is committed for a
+    /// does not build the project. A PyPI package is then written by its
+    /// path also where vendored mode would commit its wheel as a download
+    /// cache of Bazel. Without it a gem is committed for a
     /// rules_ruby hub as an archive that the hub builds, where that is
     /// known to build; with it every gem is vendored by its path. Other
     /// subcommands accept it silently.

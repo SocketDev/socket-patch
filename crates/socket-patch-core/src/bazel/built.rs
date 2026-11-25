@@ -547,6 +547,86 @@ fn reads(
     doubt.or_else(|| hidden().or_else(unread).cloned()).map(Err)
 }
 
+/// Why the files of `workspace` do not show, with certainty, that the hub
+/// of `ecosystem` hands Bazel `lock` and no other file of `locks`, each a
+/// file of the project of `root` by its path from the project: `lock`
+/// under `attribute` alone, in calls that run. `Ok` when they show it,
+/// which takes what [`unbuilt`] takes: no doubt about the workspace or
+/// about the hub, no `WORKSPACE` file in `workspace` (the caller reads it
+/// with [`workspace_as_built`], which leaves out one that the Bazel of the
+/// checkout does not read), and every call of the hub written out, and
+/// none that names a requirements file which brings a file of `locks` in
+/// with `-r` (each read with `read`).
+///
+/// This is what vendored mode asks before it writes a form that only a
+/// build through that one file takes ([`super::distdir`]): a call that
+/// hands Bazel another file of the project for some platform builds from
+/// a file the run does not write.
+pub(crate) fn alone(
+    workspace: &Workspace,
+    root: &BazelRoot,
+    ecosystem: &str,
+    (attribute, lock): (&str, &str),
+    locks: &[String],
+    read: &dyn Fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    let project = slashed(&root.project);
+    let Some(hub) = HUBS.iter().find(|hub| hub.ecosystem == ecosystem) else {
+        return Err(format!("no hub of {ecosystem} packages is known"));
+    };
+    let tags = |extension| workspace.tags(extension, hub.tag);
+    let tags: Vec<_> = hub.extensions.iter().map(tags).collect();
+    let doubt = tags.iter().find_map(|tags| tags.doubts.first());
+    if let Some(Doubt { file, line, why }) = workspace.doubts.first().or(doubt) {
+        return Err(format!("{file}:{line}: {why}"));
+    }
+    if workspace.legacy.is_some() {
+        let why = "a WORKSPACE file defines repositories beside MODULE.bazel, and what it does \
+                   with the packages of the hub is not read";
+        return Err(why.to_string());
+    }
+    let tag = format!("{}.{}", hub.extensions[0].name, hub.tag);
+    for at in tags.iter().flat_map(|tags| &tags.calls) {
+        let (call, place) = (at.call, format!("`{tag}` ({}:{})", at.file, at.call.line));
+        let given = hub.files.iter().filter(|file| call.arg(file).is_some());
+        let written = |value: &Value| matches!(value, Value::Str(_) | Value::Dict(_));
+        if call.unpacks()
+            || !given
+                .clone()
+                .all(|file| call.arg(file).is_some_and(written))
+        {
+            return Err(format!("the files {place} names are not all written out"));
+        }
+        let named = files(workspace, call, hub.files, None);
+        let own = |file: &String| locks.iter().any(|own| below(&project, own) == *file);
+        if !named.iter().any(own) {
+            // A requirements file that brings one of them in with `-r`
+            // hands the hub that file as well, in whatever order the
+            // calls are written.
+            let includes = |file: &String| ecosystem == "pypi" && includes_one(file, &own, read);
+            if let Some(file) = named.iter().find(|file| includes(file)) {
+                return Err(format!(
+                    "{place} names {file}, which brings a file of this project in with `-r`: \
+                     no build through such a file is shown to take the committed copy"
+                ));
+            }
+            continue;
+        }
+        if !call.whole {
+            return Err(format!(
+                "{place} may not run: it is no statement of its own"
+            ));
+        }
+        if !given.eq([&attribute]) || named != [below(&project, lock)] {
+            return Err(format!(
+                "{place} names more than `{attribute} = \"{lock}\"`, the one file that holds \
+                 the pin"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The calls of the hub of `ecosystem` in the module files of `workspace`,
 /// each with the files of the main repository it names by a label that is
 /// written out (their paths from the Bazel root), and what leaves open

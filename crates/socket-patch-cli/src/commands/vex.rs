@@ -1964,7 +1964,13 @@ async fn unbuilt_by_bazel(
     }
     let patched = |purl: &String| {
         let record = plan.view.patches.get(purl)?;
-        let pinned = plan.hosted.contains_key(purl) && !purl.starts_with(MAVEN);
+        // A wheel committed as a download cache of Bazel is pinned in the
+        // file the hub reads as a hosted pin is: by its URL and sha256.
+        let cached = plan.vendor_entries.get(purl);
+        let cached = cached
+            .is_some_and(|entry| socket_patch_core::vendor::pypi_distdir::line_of(entry).is_some());
+        let hosted = plan.hosted.contains_key(purl) && !purl.starts_with(MAVEN);
+        let pinned = cached || hosted;
         let judged = !pinned && !record.vulnerabilities.is_empty();
         judged.then(|| Patched {
             purl: purl.clone(),

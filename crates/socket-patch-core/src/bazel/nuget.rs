@@ -847,7 +847,7 @@ fn feeds(
         "vendor_dir",
         "remote_downloader",
     ];
-    match mentions(files, &words) {
+    match mentions(files, &words, false) {
         Ok(named) => named
             .into_iter()
             .next()

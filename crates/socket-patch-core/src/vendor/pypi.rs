@@ -637,6 +637,10 @@ enum WiringPlan {
     /// beside it is wired too (#1758).
     PythonLocks(super::pypi_lock::PythonLocks, bool),
     Requirements,
+    /// `requirements.txt` beside a Bazel hub that reads it: the line holds
+    /// the wheel by its URL, and Bazel takes the committed copy
+    /// ([`super::pypi_distdir`]).
+    BazelCache,
     /// Re-wire the vendor lines an OLDER patch uuid's ledger entry recorded
     /// to this uuid in place (#765).
     RequirementsRewire(Box<VendorEntry>),
@@ -1220,14 +1224,30 @@ async fn pypi_prelude<'p>(
             }
         }
         PypiFlavor::Requirements => {
-            match preflight_requirements(project_root, &canon_name, version, &record.uuid).await {
-                Ok(RequirementsTarget::InSync { pin }) => {
-                    wired_pin = pin;
+            // Beside a Bazel hub that reads the file, the wheel is a
+            // download cache of Bazel, or already is (its pin).
+            let cache = super::bazel_hub::download_cache(project_root, base, &record.uuid).await;
+            match cache.map_err(|(code, detail)| refused(code, detail))? {
+                Some(Some(pin)) => {
+                    wired_pin = Some(pin);
                     WiringPlan::InSync
                 }
-                Ok(RequirementsTarget::Fresh) => WiringPlan::Requirements,
-                Ok(RequirementsTarget::Rewire { prev }) => WiringPlan::RequirementsRewire(prev),
-                Err((code, detail)) => return Err(refused(code, detail)),
+                Some(None) => WiringPlan::BazelCache,
+                None => {
+                    match preflight_requirements(project_root, &canon_name, version, &record.uuid)
+                        .await
+                    {
+                        Ok(RequirementsTarget::InSync { pin }) => {
+                            wired_pin = pin;
+                            WiringPlan::InSync
+                        }
+                        Ok(RequirementsTarget::Fresh) => WiringPlan::Requirements,
+                        Ok(RequirementsTarget::Rewire { prev }) => {
+                            WiringPlan::RequirementsRewire(prev)
+                        }
+                        Err((code, detail)) => return Err(refused(code, detail)),
+                    }
+                }
             }
         }
         PypiFlavor::Poetry => {
@@ -1555,7 +1575,9 @@ async fn pypi_prelude<'p>(
         None
     };
 
-    let reused_wheel = if !in_sync {
+    // The line of a download cache holds the URL of the wheel, which only
+    // a fetch gives.
+    let reused_wheel = if !in_sync && !matches!(plan, WiringPlan::BazelCache) {
         fresh_reuse_wheel(
             base,
             project_root,
@@ -1635,6 +1657,17 @@ fn sibling_lock(flavor: PypiFlavor) -> Option<(&'static str, &'static str)> {
         )),
         PypiFlavor::Poetry | PypiFlavor::Pdm | PypiFlavor::Requirements | PypiFlavor::Hatch => None,
     }
+}
+
+/// Whether the project wires the package `purl` through its requirements
+/// files alone ([`PypiFlavor::Requirements`]): no lock of a tool holds it.
+pub(super) async fn pins_in_requirements_alone(project_root: &Path, purl: &str) -> bool {
+    let Some((name, version)) = parse_pypi_purl(strip_purl_qualifiers(purl)) else {
+        return false;
+    };
+    let name = canonicalize_pypi_name(&name);
+    let flavor = detect_pypi_flavor(project_root, Some((&name, &version))).await;
+    matches!(flavor, Ok((PypiFlavor::Requirements, _)))
 }
 
 /// The files of the project that a vendored run for `purl` may point at the
@@ -2112,10 +2145,16 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         Err(outcome) => return outcome,
     };
     let version = version.as_str();
-    let reused = reused_wheel.is_some();
+    // A download cache is fetched again for its URL, into the directory an
+    // earlier run may have committed: that wheel stays when this run fails,
+    // as a reused one does.
+    let reused = reused_wheel.is_some()
+        || (matches!(plan, WiringPlan::BazelCache)
+            && uuid_dir_has_wheel(&project_root.join(&uuid_dir_rel)).await);
 
     let AcquiredWheel {
         wheel_name,
+        url,
         rel_wheel,
         result,
         artifact,
@@ -2458,6 +2497,22 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         )
         .await
         .map(|wiring| (wiring, MetaSlot::None)),
+        WiringPlan::BazelCache => super::pypi_distdir::wire(
+            project_root,
+            base,
+            &record.uuid,
+            (&wheel_name, &url, &artifact.sha256_hex),
+            &hosted_origins,
+        )
+        .await
+        .map(|wiring| {
+            warnings.push(super::pypi_distdir::notice(
+                &canon_name,
+                version,
+                &rel_wheel,
+            ));
+            (wiring, MetaSlot::None)
+        }),
         WiringPlan::RequirementsRewire(prev) => rewire_requirements(
             project_root,
             &prev,
@@ -3960,6 +4015,7 @@ async fn fresh_reuse_wheel(
     };
     let abs = project_root.join(&art.rel_path);
     Some(AcquiredWheel {
+        url: String::new(),
         rel_wheel: art.rel_path.clone(),
         result: already_patched_result(base, &abs, &record.files),
         artifact: Some(WheelArtifact {
@@ -3985,6 +4041,9 @@ fn reusable_wheel_leaf(leaf: &str, canon_name: &str, version: &str) -> bool {
 
 struct AcquiredWheel {
     wheel_name: String,
+    /// Where the wheel was fetched from; empty for a committed wheel that
+    /// is reused.
+    url: String,
     rel_wheel: String,
     result: ApplyResult,
     /// `None` on a dry run.
@@ -4115,6 +4174,7 @@ async fn try_pypi_service_wheel(
     };
     warnings.push(archive.downloaded_warning(format_args!("the wheel for {base}")));
     Ok(Box::new(AcquiredWheel {
+        url: archive.source_url.clone(),
         rel_wheel,
         result: if dry_run {
             super::common::preview_result(base, &dest, &record.files)

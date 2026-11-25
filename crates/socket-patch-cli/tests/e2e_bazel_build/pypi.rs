@@ -42,18 +42,26 @@
 //! id made for the run, so no cache of an earlier run can supply it. The
 //! flow asserts the VEX document of its patch as `main.rs` says.
 //!
-//! Vendored mode would commit the patched wheel and point the package's
-//! line of `requirements.txt` at it, and rules_python builds no wheel from
-//! such a line. So in this checkout, where the hub reads that file, the
-//! command declines the package and writes nothing
-//! ([`vendored_pip_parse`]): the build stays the unpatched one. With
-//! `--allow-vendored-in-bazel` it does what it did before it declined, and
-//! the build fails until `vendor --revert` has put the pin back. The flow
+//! Vendored mode as it is without Bazel would commit the patched wheel and
+//! point the package's line of `requirements.txt` at it, and rules_python
+//! builds no wheel from such a line. So where the hub reads that file and
+//! the checkout does not show that the other form works, the command
+//! declines the package and writes nothing ([`vendored_pip_parse`]): the
+//! build stays the unpatched one. With `--allow-vendored-in-bazel` it
+//! writes the path line, and the build fails until `vendor --revert` has
+//! put the pin back. The flow
 //! asserts that; that every form of `vex` meanwhile writes a document that
 //! says the package is affected, and names the call of `MODULE.bazel` that
 //! reads the file; that the revert brings the unpatched build back; and
 //! that hosted mode, which the refusal and the document name, ends in the
 //! patched build and in a document that says not affected.
+//!
+//! The vendored copy that rules_python does build is in
+//! [`vendored_download_cache`]: hosted mode's pin, the patched wheel
+//! committed where a `--distdir` line of `.bazelrc` makes Bazel look for
+//! its downloads, and so a build that needs no patch host. Vendored mode
+//! writes that where the checkout shows that it works, which the fixture
+//! does once Bazel has built in it, and declines elsewhere.
 //!
 //! One loopback server stands in for four hosts. The Socket API and the
 //! patch host answer at their own paths; `pypi.org` (the project pages of
@@ -97,6 +105,7 @@ use sha2::{Digest, Sha512};
 
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
+use crate::envelope::{all_codes, event_for, find_event};
 use crate::harness::{
     cell_without_bazel, changed, fixture_path, rewrite, with_vex, Cell, Claim, Declined, Fixture,
     How, Ran, StandIn, Tree, ALLOW, CONSUMER, NOTHING, VENDORED,
@@ -264,8 +273,19 @@ fn grant(standin: &StandIn, uuid: &str, pinned: &Wheel) -> String {
 
 /// [`grant`] with `integrity` as the sums the grant names for the wheel.
 fn grant_by(standin: &StandIn, uuid: &str, pinned: &Wheel, integrity: Value) -> String {
+    grant_at(standin, (uuid, uuid), pinned, integrity)
+}
+
+/// [`grant_by`] for the patch `uuid`, at a URL that names the id `level`
+/// where a patch host names the patch.
+fn grant_at(
+    standin: &StandIn,
+    (uuid, level): (&str, &str),
+    pinned: &Wheel,
+    integrity: Value,
+) -> String {
     let filename = pinned.filename();
-    let route = format!("/patch/pypi/{NAME}/{VERSION}/grant-token/{uuid}/{filename}");
+    let route = format!("/patch/pypi/{NAME}/{VERSION}/grant-token/{level}/{filename}");
     let url = format!("{}{route}", standin.origin());
     let reference = json!({
         "status": "granted",
@@ -570,13 +590,22 @@ fn hosted_pip_parse() {
 /// hashes of the module it changes. Vendored mode holds the wheel it
 /// downloads to that record.
 struct Vendoring {
+    /// The index, and with [`Vendoring::new`] the Socket API and the patch
+    /// host as well.
     standin: StandIn,
+    /// With [`Vendoring::apart`], the Socket API and the patch host on a
+    /// server of their own, until [`Vendoring::stop`].
+    host: Option<StandIn>,
+    /// The origin of the Socket API and the patch host.
+    origin: String,
     /// The id of the run and of its patch.
     uuid: String,
     wheels: [Wheel; 2],
     patched: Wheel,
     /// The route of the patched wheel on the stand-in's patch host.
     route: String,
+    /// The sums the grant names for the patched wheel.
+    sums: Value,
     /// The record of the patch, as the API serves it.
     record: Value,
 }
@@ -591,19 +620,31 @@ fn vendored_line(copy: &str, wheel: &Wheel) -> String {
 
 impl Vendoring {
     fn new() -> Vendoring {
+        Vendoring::on(None)
+    }
+
+    /// [`Vendoring::new`] with the Socket API and the patch host on a
+    /// server of their own, which a flow can stop while the index goes on
+    /// answering.
+    fn apart() -> Vendoring {
+        Vendoring::on(Some(StandIn::start()))
+    }
+
+    fn on(host: Option<StandIn>) -> Vendoring {
         let uuid = uuid::Uuid::new_v4().to_string();
         let wheels = upstream(&uuid);
         let marker = format!("PATCHED {uuid}");
         let patched = package(&marker, &uuid);
-        let standin = StandIn::start();
-        wheels.iter().for_each(|wheel| publish(&standin, wheel));
-        standin.serve(5, OTHER_PROJECTS, NO_FILES.as_bytes());
+        let index = StandIn::start();
+        wheels.iter().for_each(|wheel| publish(&index, wheel));
+        index.serve(5, OTHER_PROJECTS, NO_FILES.as_bytes());
+        let standin = host.as_ref().unwrap_or(&index);
         // Vendored mode downloads the wheel itself, and takes it only by
         // its sha512.
         let sha512 =
             base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&patched.bytes));
         let sums = json!({ "sha256": patched.sha256, "sha512": format!("sha512-{sha512}") });
-        let route = grant_by(&standin, &uuid, &patched, sums);
+        let route = grant_by(standin, &uuid, &patched, sums.clone());
         standin.serve(5, &route, &patched.bytes);
         let hash = |marker: &str| compute_git_sha256_from_bytes(module(marker, &uuid).as_bytes());
         let record = json!({
@@ -623,12 +664,16 @@ impl Vendoring {
         });
         let record_route = format!("/v0/orgs/{ORG}/patches/view/{uuid}");
         standin.serve(1, &record_route, record.to_string().as_bytes());
+        let origin = standin.origin();
         Vendoring {
-            standin,
+            standin: index,
+            host,
+            origin,
             uuid,
             wheels,
             patched,
             route,
+            sums,
             record,
         }
     }
@@ -641,13 +686,26 @@ impl Vendoring {
 
     /// [`Vendoring::run`] with the variables `more` as well.
     fn run_with(&self, cell: &Cell, args: &[&str], more: &[(&str, &str)]) -> Ran {
-        let origin = self.standin.origin();
-        let json_api = format!("{origin}/{INDEX}/pypi");
+        let origin = &self.origin;
+        let json_api = format!("{}/{INDEX}/pypi", self.standin.origin());
         let env = [
             ("SOCKET_PATCH_SERVER_URL", origin.as_str()),
             ("SOCKET_PYPI_JSON_API", json_api.as_str()),
         ];
-        cell.socket_patch(&origin, args, &[&env[..], more].concat())
+        cell.socket_patch(origin, args, &[&env[..], more].concat())
+    }
+
+    /// How often the patched wheel was asked for at the patch host.
+    fn fetched(&self) -> usize {
+        let host = self.host.as_ref().unwrap_or(&self.standin);
+        host.asked(&self.route)
+    }
+
+    /// Stop the patch host of [`Vendoring::apart`], and the Socket API
+    /// with it: the index goes on answering.
+    fn stop(&mut self) {
+        let host = self.host.take().expect("a host apart from the index");
+        host.stop();
     }
 }
 
@@ -757,30 +815,20 @@ fn pins(cell: &Cell, with: &Vendoring, before: &Tree) {
     cell.stands_alone(run, &claim, true);
 }
 
-/// Vendored mode where it declines: `socket-patch <args>` in `cell` ends
-/// with `exit` and reports the package under [`DECLINED`], as the one event
-/// `action`, in words that name the hub's call, the file it reads, hosted
-/// mode and the switch. No file of the checkout differs from `before`.
-fn declines(cell: &Cell, with: &Vendoring, args: &[&str], exit: i32, action: &str, before: &Tree) {
-    let names = refusal_names(cell);
-    let package = Declined {
-        purl: PURL,
-        code: DECLINED,
-        names: &names.each_ref().map(String::as_str),
-    };
-    cell.declined(&with.run(cell, args), &package, exit, action, before);
-}
-
-/// Vendored mode beside a hub that reads `requirements.txt`.
+/// Vendored mode beside a hub that reads `requirements.txt`, where the
+/// checkout does not show that Bazel takes a committed wheel.
 ///
 /// - (a) `bazel build` and `bazel run //:consumer` print the unpatched
 ///   marker.
-/// - (b) `scan --mode vendored --yes` declines the package: it exits 1,
-///   names the call of `MODULE.bazel` that reads the file, hosted mode and
-///   the switch, writes nothing and downloads no wheel. The same two Bazel
-///   commands print the unpatched marker, and change no file.
-/// - (c) With `--allow-vendored-in-bazel` the command does what it did
-///   before it declined ([`vendors_the_wheel`]): it commits the patched
+/// - (b) The checkout loses Bazel's lock, as a clone of a repository that
+///   does not commit it has none: nothing says which rules_python Bazel
+///   selected. `scan --mode vendored --yes` declines the package: it exits
+///   1, names the call of `MODULE.bazel` that reads the file, hosted mode,
+///   the switch and that reason, writes nothing and downloads no wheel.
+///   The same two Bazel commands print the unpatched marker, and leave the
+///   files of step (a).
+/// - (c) With `--allow-vendored-in-bazel` the command writes what it
+///   writes without Bazel ([`vendors_the_wheel`]): it commits the patched
 ///   wheel and points the package's line of `requirements.txt` at it. It
 ///   passes, and it and every other form of `vex` write a document that
 ///   says the package is affected: each names the call of `MODULE.bazel`
@@ -810,10 +858,21 @@ fn vendored_pip_parse() {
     // (a) The unpatched build.
     let before = cell.builds_unpatched(UNPATCHED);
 
-    // (b) The one command of vendored mode: declined, with nothing written
-    // and nothing of the patch fetched. The same build passes, on the
-    // upstream package.
-    declines(&cell, &with, &VENDORED, 1, "failed", &before);
+    // (b) The one command of vendored mode, without Bazel's lock:
+    // declined, with nothing written and nothing of the patch fetched. The
+    // same build passes, on the upstream package, and writes the lock of
+    // before.
+    std::fs::remove_file(cell.path(LOCK)).expect("remove Bazel's lock");
+    let unlocked = cell.tree();
+    let declined = with.run(&cell, &VENDORED);
+    let [call, file] = refusal_names(&cell);
+    let unshown = "does not say which release of rules_python Bazel selected";
+    let package = Declined {
+        purl: PURL,
+        code: DECLINED,
+        names: &[&call, &file, unshown],
+    };
+    cell.declined(&declined, &package, 1, "failed", &unlocked);
     assert_eq!(with.standin.asked(&with.route), 0, "{test}");
     cell.builds_patched(&before, UNPATCHED);
 
@@ -851,11 +910,136 @@ fn vendored_pip_parse() {
     cell.stands_alone(run, &claim, true);
 
     println!(
-        "{test}: Bazel {release} built {UNPATCHED:?}; `scan --mode vendored` declined \
-         ({DECLINED}), wrote nothing, and the build stayed {UNPATCHED:?}; with {ALLOW} it \
+        "{test}: Bazel {release} built {UNPATCHED:?}; without Bazel's lock `scan --mode \
+         vendored` declined ({DECLINED}), wrote nothing, and the build stayed {UNPATCHED:?}; \
+         with {ALLOW} it \
          vendored the wheel and the build failed ({named}), while every form of `vex` said the \
          package is affected; after `vendor --revert` it built {UNPATCHED:?} again, and after \
          `scan --mode hosted` {marker:?}, and `vex` said it is not affected; {:?}",
+        started.elapsed()
+    );
+}
+
+/// The comment line above a `--distdir` line of `.bazelrc`.
+const CACHE_COMMENT: &str = "# socket-patch: the committed copy of a patched wheel, for \
+    Bazel's downloads (to opt out, comment out the next line)";
+
+/// Give the checkout of `cell` a `--distdir` of the user's own: a
+/// directory of downloads, and its line at the end of `.bazelrc`.
+fn has_a_distdir_of_its_own(cell: &Cell) {
+    cell.write("third_party/distfiles/notes.txt", "downloads of our own\n");
+    let rc = String::from_utf8(cell.tree()[".bazelrc"].clone()).expect("a text file");
+    cell.write(
+        ".bazelrc",
+        format!("{rc}common --distdir=third_party/distfiles\n"),
+    );
+}
+
+/// Vendored mode beside a hub that reads `requirements.txt`, where the
+/// checkout shows that Bazel takes a committed wheel: the patched wheel as
+/// a download cache of Bazel. The checkout has a `--distdir` of the user's
+/// own in its `.bazelrc` from the start.
+///
+/// - (a) `bazel build` and `bazel run //:consumer` print the unpatched
+///   marker.
+/// - (b) `scan --mode vendored --yes` passes ([`caches`]). It writes the
+///   three files that this flow wrote by hand before the command did
+///   ([`cached_by_hand`]), byte for byte: the line of `requirements.txt`
+///   as hosted mode writes it, the wheel under
+///   `.socket/vendor/pypi/<uuid>/`, and
+///   `common --distdir=.socket/vendor/pypi/<uuid>` under a comment line at
+///   the end of `.bazelrc`, after the lines the checkout had. It fetched the
+///   wheel once, and Bazel's repository cache does not hold it.
+///   `vendor --check` passes, and `vex` attests the package as vendored.
+///   The patch host is then stopped, and the Socket API with it. The index
+///   goes on answering, since a hub asks it about the other packages.
+/// - (c) On a second machine (a new output base), with one byte of the
+///   committed copy changed: `vendor --check` fails, and so does the
+///   build. Bazel passes over a copy whose sha256 is not the pin's, and
+///   asks the patch host, which does not answer.
+/// - (d) On a third machine, with the copy as it was committed: a build
+///   from a sub-directory passes, and the two Bazel commands print the
+///   patched marker, although the patch host is stopped. The repository
+///   cache holds the wheel afterwards, and Bazel changed no file of the
+///   checkout but its own lock, as in hosted mode.
+/// - (e) `vendor --revert --yes`, with the patch host still stopped, puts
+///   every file back, the `.bazelrc` with its own lines among them, and the
+///   two Bazel commands print the unpatched marker again.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn vendored_download_cache() {
+    let test = "pypi::vendored_download_cache";
+    let started = Instant::now();
+    let Some(mut cell) = Cell::open(test, &FIXTURE) else {
+        return;
+    };
+    let release = cell.release().to_string();
+    let mut with = Vendoring::apart();
+    cell.route_downloads(&downloads(&with.standin.origin(), &with.wheels));
+    cell.write(REQUIREMENTS, requirements(&with.wheels));
+    has_a_distdir_of_its_own(&cell);
+    let marker = format!("OUT: PATCHED {}", with.uuid);
+    let sha256 = with.patched.sha256.clone();
+
+    // (a) The unpatched build.
+    let before = cell.builds_unpatched(UNPATCHED);
+
+    // (b) The one command of vendored mode, and what it says of the copy.
+    let (copy, cached) = caches(&cell, &with, &before);
+    assert_eq!(with.fetched(), 1, "{test}: the wheel is fetched once");
+    assert!(
+        !cell.cached(&sha256),
+        "{test}: the repository cache holds it"
+    );
+    let check = with.run(&cell, &["vendor", "--check"]);
+    assert_eq!(check.code, 0, "{test}: {}", check.dump);
+    let run = |cell: &Cell, args: &[&str]| with.run(cell, args);
+    cell.stands_alone(run, &Claim::new(PURL, &with.uuid, How::Vendored), true);
+    assert_eq!(changed(&cached, &cell.tree()), NOTHING, "{test}");
+    with.stop();
+
+    // (c) One changed byte, on a machine that has built nothing. The
+    // message names the URL of the pin; a console may break it.
+    let twin = cell.twin();
+    let mut bytes = with.patched.bytes.clone();
+    bytes[0] ^= 1;
+    twin.write(&copy, bytes);
+    let check = with.run(&twin, &["vendor", "--check"]);
+    assert_eq!(check.code, 1, "{test}: {}", check.dump);
+    let build = twin.bazel("build", &[CONSUMER]);
+    let squeezed = |text: &str| text.split_whitespace().collect::<String>();
+    assert!(
+        !build.ok() && squeezed(&build.stderr()).contains(&squeezed(&with.route)),
+        "{test}: the build with a changed copy did not fail on the download of the wheel:\n{}",
+        build.dump()
+    );
+    assert!(!twin.cached(&sha256), "{test}: {}", build.dump());
+    drop(twin);
+
+    // (d) The copy as committed, on a machine that has built nothing: its
+    // first Bazel command runs below the root.
+    let twin = cell.twin();
+    std::fs::create_dir(twin.path("sub")).expect("create sub");
+    let below = twin.bazel_below("sub", "build", &[CONSUMER]);
+    assert!(below.ok(), "{test}: {}", below.dump());
+    twin.builds(&marker);
+    assert!(twin.cached(&sha256), "{test}: Bazel did not keep the wheel");
+    let recorded = cell.numbers() >= (8, 5, 0);
+    let bazel_rewrites: &[&str] = if recorded { &[LOCK] } else { &[] };
+    assert_eq!(changed(&cached, &twin.tree()), bazel_rewrites, "{test}");
+    drop(twin);
+
+    // (e) The undo, which needs no host.
+    let undo = with.run(&cell, &["vendor", "--revert", "--yes"]);
+    cell.undone(&undo, "removed", &before, UNPATCHED);
+
+    println!(
+        "{test}: Bazel {release} built {UNPATCHED:?}; `scan --mode vendored` committed {copy}, \
+         pinned it by its URL and wrote `common --distdir` to .bazelrc; with the patch host \
+         stopped, a new output base failed on a copy with one changed byte, which `vendor \
+         --check` named, and built {marker:?} from the copy as committed, from a sub-directory \
+         too, with no request for the wheel; Bazel rewrote {bazel_rewrites:?} itself; `vendor \
+         --revert` put every file back and the build printed {UNPATCHED:?}; {:?}",
         started.elapsed()
     );
 }
@@ -1029,6 +1213,536 @@ fn every_command_that_would_vendor_declines_beside_a_hub_that_reads_the_requirem
     let undo = with.run(&cell, &["rollback", "--yes"]);
     assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", undo.dump);
     cell.vendors_on_the_users_word(run, &package);
+}
+
+/// What vendored mode reads of the `MODULE.bazel.lock` that a build writes:
+/// the version of the lock, and the release of rules_python that Bazel
+/// selected. The checkout of [`checkout`] has no such file: no Bazel has
+/// built there.
+fn bazel_lock(version: u32, rules_python: &str) -> String {
+    let source = format!("https://bcr.bazel.build/modules/rules_python/{rules_python}/source.json");
+    json!({ "lockFileVersion": version, "registryFileHashes": { source: "sha256-x" } }).to_string()
+}
+
+/// The files of a checkout that holds the patch of `with` as a download
+/// cache, beside those of `before`, as a person writes them by hand: the
+/// line of `requirements.txt` that hosted mode writes, the patched wheel
+/// under `.socket/vendor/pypi/<uuid>`, by the name its URL ends in, and
+/// at the end of `.bazelrc` a comment line and the line that makes that
+/// directory one Bazel looks in before it downloads. Bazel takes a file
+/// from there by the name of the download and its sha256, which the pin
+/// holds. Gives the path of the wheel and the three files.
+fn cached_by_hand(with: &Vendoring, before: &Tree) -> (String, [(String, Vec<u8>); 3]) {
+    let dir = format!(".socket/vendor/pypi/{}", with.uuid);
+    let copy = format!("{dir}/{}", with.patched.filename());
+    let [dependency, _] = &with.wheels;
+    let direct = format!("{NAME} @ {}{}", with.origin, with.route);
+    let pinned = format!(
+        "{}{direct} --hash=sha256:{}\n",
+        dependency.requirement(),
+        with.patched.sha256
+    );
+    let rc = String::from_utf8_lossy(&before[".bazelrc"]);
+    let rc = format!("{rc}{CACHE_COMMENT}\ncommon --distdir={dir}\n");
+    let files = [
+        (".bazelrc".to_string(), rc.into_bytes()),
+        (copy.clone(), with.patched.bytes.clone()),
+        (REQUIREMENTS.to_string(), pinned.into_bytes()),
+    ];
+    (copy, files)
+}
+
+/// The one command of vendored mode in the checkout of `cell`, where the
+/// hub reads `requirements.txt` and the workspace shows that Bazel takes a
+/// committed wheel: `scan --mode vendored --yes` passes, and writes the
+/// files of [`cached_by_hand`], byte for byte, with what vendored mode
+/// keeps beside every wheel and its ledger. It says in a warning what the
+/// form does not do. Gives the path of the wheel and the files of the
+/// checkout.
+fn caches(cell: &Cell, with: &Vendoring, before: &Tree) -> (String, Tree) {
+    let test = &cell.test;
+    let scan = with.run(cell, &VENDORED);
+    let said = &scan.dump;
+    assert_eq!(scan.code, 0, "{test}: {said}");
+    assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{test}: {said}");
+    let vendored = cell.tree();
+    let (copy, by_hand) = cached_by_hand(with, before);
+    let dir = format!(".socket/vendor/pypi/{}", with.uuid);
+    let written = [
+        ".bazelrc".to_string(),
+        format!("{dir}/.gitattributes"),
+        format!("{dir}/.gitignore"),
+        format!("{dir}/socket-patch.vendor.json"),
+        copy.clone(),
+        ".socket/vendor/state.json".to_string(),
+        REQUIREMENTS.to_string(),
+    ];
+    assert_eq!(changed(before, &vendored), written, "{test}: {said}");
+    for (file, bytes) in by_hand {
+        assert!(
+            vendored[&file] == bytes,
+            "{test}: {file} is not the file written by hand:\n{}\n{said}",
+            String::from_utf8_lossy(&vendored[&file])
+        );
+    }
+    let warned = all_codes(&scan.envelope).contains(&CACHE_NOTICE.to_string());
+    assert!(warned, "{test}: no {CACHE_NOTICE}: {said}");
+    (copy, vendored)
+}
+
+/// The code of the warning with which a run says what a download cache
+/// does not do.
+const CACHE_NOTICE: &str = "vendor_pypi_bazel_download_cache";
+
+/// Without a Bazel: the fixture's checkout as a build leaves it, where the
+/// hub reads `requirements.txt`, Bazel selected the rules_python of the
+/// fixture and no rc file names a downloader setting. `scan --mode
+/// vendored` commits the patched wheel as a download cache of Bazel
+/// ([`caches`]). A later run, with the mode or without, with the switch or
+/// without, passes and writes nothing. `vendor --check` holds the wheel to
+/// the patch: it passes, and fails on one changed byte. `list` and `vex`
+/// show a vendored package, and `vex` attests it as not affected. Each of
+/// `vendor --revert`, `rollback` and `remove` puts every file back: the
+/// pin, and the `.bazelrc` with the lines of the user.
+#[test]
+fn vendored_mode_commits_a_download_cache_where_the_workspace_shows_it_works() {
+    let with = Vendoring::new();
+    let cell = checkout(&with);
+    cell.write(LOCK, bazel_lock(28, "2.5.0-rc4"));
+    let before = cell.tree();
+    let run = |cell: &Cell, args: &[&str]| with.run(cell, args);
+    let (copy, vendored) = caches(&cell, &with, &before);
+    assert_eq!(with.fetched(), 1);
+
+    for later in [
+        &VENDORED[..],
+        &["scan", "--yes"],
+        &[&VENDORED[..], &[ALLOW]].concat(),
+    ] {
+        let scan = run(&cell, later);
+        assert_eq!(scan.code, 0, "{}", scan.dump);
+        assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{}", scan.dump);
+    }
+    assert_eq!(with.fetched(), 1);
+
+    let check = run(&cell, &["vendor", "--check"]);
+    assert_eq!(check.code, 0, "{}", check.dump);
+    assert_eq!(check.envelope["summary"]["verified"], 1, "{}", check.dump);
+    let mut bytes = with.patched.bytes.clone();
+    bytes[0] ^= 1;
+    cell.write(&copy, bytes);
+    let check = run(&cell, &["vendor", "--check"]);
+    assert_eq!(check.code, 1, "{}", check.dump);
+    let failed = event_for(&check.envelope, PURL);
+    assert_eq!(failed["errorCode"], "vendor_check_failed", "{}", check.dump);
+    cell.write(&copy, &with.patched.bytes);
+
+    let list = run(&cell, &["list"]);
+    let listed = list.envelope.to_string();
+    assert!(listed.contains("\"vendored\""), "{}", list.dump);
+    assert!(!listed.contains("\"hosted\""), "{}", list.dump);
+    let claim = Claim::new(PURL, &with.uuid, How::Vendored);
+    cell.stands_alone(run, &claim, true);
+    cell.stands_alone(run, &claim, false);
+    assert_eq!(changed(&vendored, &cell.tree()), NOTHING);
+
+    // The line the run wrote, changed by hand (a comment after it, its hash
+    // on a line of its own, a second blank): the next run declines the
+    // package before it fetches anything, so the committed wheel, its line
+    // of `.bazelrc` and the changed line all stay.
+    let wrote = String::from_utf8(vendored[REQUIREMENTS].clone()).expect("a text file");
+    let line = wrote.lines().last().expect("the line of the package");
+    let names = refusal_names(&cell);
+    let changed_by_hand = Declined {
+        purl: PURL,
+        code: DECLINED,
+        names: &[
+            &names[0],
+            "has been changed since",
+            "`socket-patch vendor --revert`",
+        ],
+    };
+    for by_hand in [
+        format!("{line}  # checked"),
+        line.replace(" --hash", " \\\n    --hash"),
+        line.replacen(' ', "  ", 1),
+    ] {
+        assert_ne!(by_hand, line);
+        cell.write(REQUIREMENTS, wrote.replace(line, &by_hand));
+        let kept = cell.tree();
+        let scan = run(&cell, &VENDORED);
+        cell.declined(&scan, &changed_by_hand, 1, "failed", &kept);
+    }
+    assert_eq!(with.fetched(), 1);
+    cell.write(REQUIREMENTS, &wrote);
+
+    let undos: [&[&str]; 3] = [
+        &["vendor", "--revert", "--yes"],
+        &["rollback", "--yes"],
+        &["remove", PURL, "--yes"],
+    ];
+    for undo in undos {
+        let ran = run(&cell, undo);
+        assert_eq!(ran.code, 0, "{}", ran.dump);
+        let undone = changed(&before, &cell.tree());
+        assert_eq!(undone, NOTHING, "{undo:?}: {}", ran.dump);
+        caches(&cell, &with, &before);
+    }
+
+    // Hosted mode takes the package over: the pin stays, and the copy and
+    // its line of `.bazelrc` go. Vendored mode takes it back.
+    let hosted = run(&cell, &["scan", "--mode", "hosted", "--yes"]);
+    assert_eq!(hosted.code, 0, "{}", hosted.dump);
+    let (_, by_hand) = cached_by_hand(&with, &before);
+    let [_, _, (_, pinned)] = by_hand;
+    let taken = cell.tree();
+    assert_eq!(changed(&before, &taken), [REQUIREMENTS], "{}", hosted.dump);
+    assert!(taken[REQUIREMENTS] == pinned, "{}", hosted.dump);
+    let listed = run(&cell, &["list"]).envelope.to_string();
+    assert!(listed.contains("\"hosted\"") && !listed.contains("\"vendored\""));
+    caches(&cell, &with, &before);
+
+    // A user who comments the line out has declined it: a later run adds
+    // none, and the undo leaves those two lines of the user.
+    let line = format!("common --distdir=.socket/vendor/pypi/{}", with.uuid);
+    let rc = String::from_utf8(vendored[".bazelrc"].clone()).expect("a text file");
+    let declined = rc.replace(&line, &format!("# {line}"));
+    assert_ne!(declined, rc);
+    cell.write(".bazelrc", &declined);
+    let kept = cell.tree();
+    let scan = run(&cell, &VENDORED);
+    assert_eq!(scan.code, 0, "{}", scan.dump);
+    assert_eq!(changed(&kept, &cell.tree()), NOTHING, "{}", scan.dump);
+    let undo = run(&cell, &["vendor", "--revert", "--yes"]);
+    assert_eq!(undo.code, 0, "{}", undo.dump);
+    let undone = cell.tree();
+    assert_eq!(changed(&before, &undone), [".bazelrc"], "{}", undo.dump);
+    assert!(undone[".bazelrc"] == declined.as_bytes(), "{}", undo.dump);
+}
+
+/// Without a Bazel: a newer patch of a package that is a download cache
+/// replaces the older one. The line names the newer wheel, the older
+/// directory and its line of `.bazelrc` are gone, and the undo still puts
+/// back the pin of before the first patch.
+#[test]
+fn a_newer_patch_replaces_the_download_cache_of_the_older_one() {
+    let (older, newer) = (Vendoring::new(), Vendoring::new());
+    let cell = checkout(&older);
+    cell.write(LOCK, bazel_lock(28, "2.5.0-rc4"));
+    let before = cell.tree();
+    caches(&cell, &older, &before);
+
+    let scan = newer.run(&cell, &VENDORED);
+    assert_eq!(scan.code, 0, "{}", scan.dump);
+    let replaced = cell.tree();
+    let (copy, by_hand) = cached_by_hand(&newer, &before);
+    for (file, bytes) in by_hand {
+        // The line pins the dependency as the checkout does: the wheels
+        // of the first run.
+        let bytes = match file == REQUIREMENTS {
+            true => {
+                let [dependency, _] = &older.wheels;
+                let direct = format!("{NAME} @ {}{}", newer.origin, newer.route);
+                let sha256 = &newer.patched.sha256;
+                let pin = format!(
+                    "{}{direct} --hash=sha256:{sha256}\n",
+                    dependency.requirement()
+                );
+                pin.into_bytes()
+            }
+            false => bytes,
+        };
+        assert!(
+            replaced[&file] == bytes,
+            "{file}:\n{}\n{}",
+            String::from_utf8_lossy(&replaced[&file]),
+            scan.dump
+        );
+    }
+    let of_older = |file: &&String| file.contains(&older.uuid);
+    let left: Vec<&String> = replaced.keys().filter(of_older).collect();
+    assert!(left.is_empty() && replaced.contains_key(&copy), "{left:?}");
+    let rc = String::from_utf8_lossy(&replaced[".bazelrc"]);
+    assert!(!rc.contains(&older.uuid), "{rc}");
+
+    let undo = newer.run(&cell, &["vendor", "--revert", "--yes"]);
+    assert_eq!(undo.code, 0, "{}", undo.dump);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", undo.dump);
+}
+
+/// Without a Bazel: where the checkout does not show that Bazel takes a
+/// committed wheel, vendored mode declines the package as before, says
+/// why, writes nothing and fetches no wheel. Each checkout is the one of
+/// [`vendored_mode_commits_a_download_cache_where_the_workspace_shows_it_works`]
+/// but for one thing: a rules_python or a Bazel it is not shown for, an rc
+/// file that names a downloader setting or imports a file from outside the
+/// checkout, a `.bazelrc` that is read-only, a hub that hands Bazel
+/// another file of the project as well, a pin without a hash, and a lock
+/// of a tool beside the requirements.
+#[test]
+fn a_download_cache_is_declined_where_the_workspace_does_not_show_that_it_works() {
+    let with = Vendoring::new();
+    let files = checkout(&with).tree();
+    let text = |file: &str| String::from_utf8(files[file].clone()).expect("a text file");
+    let own = format!("requirements_lock = \"//:{REQUIREMENTS}\"");
+    let more = format!("{own},\n    requirements_windows = \"//:win.txt\"");
+    let downloads = "common --downloader_config=ci/downloads.cfg\n";
+    let unhashed = requirements(&with.wheels).replace(" \\\n    --hash=sha256:", "  # ");
+    // The package held by a URL that is the user's own, not one of a patch.
+    let own_url = requirements(&with.wheels).replace(
+        &format!("{NAME}=={VERSION}"),
+        &format!(
+            "{NAME} @ https://files.example/{}",
+            with.wheels[1].filename()
+        ),
+    );
+    // What each checkout has that the one of the test above has not, and
+    // what the refusal says of it.
+    let cases = || -> [(&str, &str, String); 8] {
+        [
+            (
+                "which .bazelrc:6 imports from outside the checkout",
+                ".bazelrc",
+                text(".bazelrc") + "try-import /etc/bazel/site.bazelrc\n",
+            ),
+            (
+                "Bazel selected rules_python 2.4.6",
+                LOCK,
+                bazel_lock(28, "2.4.6"),
+            ),
+            (
+                "name the release in `.bazelversion`",
+                LOCK,
+                bazel_lock(29, "2.5.0-rc4"),
+            ),
+            (
+                "the checkout names Bazel 10.0.0",
+                ".bazelversion",
+                "10.0.0\n".to_string(),
+            ),
+            (
+                ".bazelrc:6 names `--downloader_config=ci/downloads.cfg`",
+                ".bazelrc",
+                text(".bazelrc") + downloads,
+            ),
+            (
+                "names more than `requirements_lock = \"requirements.txt\"`",
+                "MODULE.bazel",
+                text("MODULE.bazel").replace(&own, &more),
+            ),
+            (
+                "requirements.txt pins no hashes",
+                REQUIREMENTS,
+                unhashed.clone(),
+            ),
+            (
+                "a tool's lock of this project holds the package",
+                "uv.lock",
+                "version = 1\n".to_string(),
+            ),
+        ]
+    };
+    for (why, file, content) in cases() {
+        let cell = checkout(&with);
+        cell.write(LOCK, bazel_lock(28, "2.5.0-rc4"));
+        assert!(
+            files.get(file) != Some(&content.clone().into_bytes()),
+            "{file}"
+        );
+        cell.write(file, content);
+        let names = refusal_names(&cell);
+        let package = Declined {
+            purl: PURL,
+            code: DECLINED,
+            names: &[&names[0], "is written only where the checkout shows", why],
+        };
+        let before = cell.tree();
+        cell.declined(&with.run(&cell, &VENDORED), &package, 1, "failed", &before);
+        // The dry run names it too.
+        let dry = with.run(&cell, &[&VENDORED[..], &["--dry-run"]].concat());
+        cell.declined(&dry, &package, 0, "skipped", &before);
+    }
+    // A `.bazelrc` that takes no line, where this user cannot write a
+    // read-only file (root can).
+    let cell = checkout(&with);
+    cell.write(LOCK, bazel_lock(28, "2.5.0-rc4"));
+    let rc = cell.path(".bazelrc");
+    let mut bits = std::fs::metadata(&rc).expect(".bazelrc").permissions();
+    bits.set_readonly(true);
+    std::fs::set_permissions(&rc, bits).expect("make .bazelrc read-only");
+    if std::fs::OpenOptions::new().append(true).open(&rc).is_err() {
+        let names = refusal_names(&cell);
+        let package = Declined {
+            purl: PURL,
+            code: DECLINED,
+            names: &[&names[0], ".bazelrc is read-only"],
+        };
+        let before = cell.tree();
+        cell.declined(&with.run(&cell, &VENDORED), &package, 1, "failed", &before);
+    }
+    assert_eq!(with.fetched(), 0);
+
+    // The package held by a URL of the user's own. No scan finds a package
+    // in such a line; `get` is given the release, and declines it before
+    // it fetches anything.
+    let cell = checkout(&with);
+    cell.write(LOCK, bazel_lock(28, "2.5.0-rc4"));
+    cell.write(REQUIREMENTS, own_url);
+    let names = refusal_names(&cell);
+    let package = Declined {
+        purl: PURL,
+        code: DECLINED,
+        names: &[
+            &names[0],
+            "is written only where the checkout shows",
+            "names the package by a URL of its own",
+        ],
+    };
+    let before = cell.tree();
+    let get = ["get", PURL, "--mode", "vendored", "--yes"];
+    cell.declined(&with.run(&cell, &get), &package, 1, "failed", &before);
+    assert_eq!(with.fetched(), 0);
+
+    // A hosted pin of a requirement that the form is not written for: the
+    // run that would take it over is let through to put the registry's pin
+    // back, and declines once it sees that pin. The hosted pin stays.
+    let cell = checkout(&with);
+    cell.write(LOCK, bazel_lock(28, "2.5.0-rc4"));
+    let [(_, _, _), .., (unhashed, _, pins), _] = cases();
+    cell.write(REQUIREMENTS, pins);
+    let hosted = with.run(&cell, &["scan", "--mode", "hosted", "--yes"]);
+    assert_eq!(hosted.envelope["summary"]["applied"], 1, "{}", hosted.dump);
+    let pinned = cell.tree();
+    let taken = with.run(&cell, &VENDORED);
+    let declined = find_event(&taken.envelope, "failed", Some(DECLINED));
+    let why = declined["error"].as_str().unwrap_or_default();
+    assert!(
+        taken.code == 1 && declined["purl"] == PURL && why.contains(unhashed),
+        "{}",
+        taken.dump
+    );
+    assert_eq!(changed(&pinned, &cell.tree()), NOTHING, "{}", taken.dump);
+    assert_eq!(with.fetched(), 0);
+}
+
+/// Without a Bazel: the checkout of
+/// [`vendored_mode_commits_a_download_cache_where_the_workspace_shows_it_works`]
+/// with a `WORKSPACE` file that a move to Bzlmod left behind. Bazel 9
+/// never reads such a file: where the checkout names a release of 9, the
+/// download cache is written as it is without the file. Where it names an
+/// older release, or none, a Bazel that reads the file may build the
+/// checkout: the package is declined, the refusal names the file, and no
+/// wheel is fetched.
+#[test]
+fn a_workspace_file_stands_against_a_download_cache_unless_the_checkout_names_bazel_9() {
+    let with = Vendoring::new();
+    let left_behind = "local_repository(name = \"x\", path = \"x\")\n";
+    let kept = |release: Option<&str>| {
+        let cell = checkout(&with);
+        cell.write(LOCK, bazel_lock(28, "2.5.0-rc4"));
+        cell.write("WORKSPACE", left_behind);
+        if let Some(release) = release {
+            cell.write(".bazelversion", format!("{release}\n"));
+        }
+        cell
+    };
+    for release in [Some("8.8.2"), Some("7.7.2"), None] {
+        let cell = kept(release);
+        let names = refusal_names(&cell);
+        let package = Declined {
+            purl: PURL,
+            code: DECLINED,
+            names: &[
+                &names[0],
+                "is written only where the checkout shows",
+                "a WORKSPACE file defines repositories beside MODULE.bazel",
+            ],
+        };
+        let before = cell.tree();
+        cell.declined(&with.run(&cell, &VENDORED), &package, 1, "failed", &before);
+    }
+    assert_eq!(with.fetched(), 0);
+    for (release, fetched) in [("9.3.2", 1), ("9.0.0", 2)] {
+        let cell = kept(Some(release));
+        let before = cell.tree();
+        caches(&cell, &with, &before);
+        assert_eq!(with.fetched(), fetched, "{release}");
+    }
+}
+
+/// Without a Bazel: a run that fails after it fetched the wheel keeps a
+/// copy that an earlier run committed. The pin of the registry is back in
+/// `requirements.txt`, as after a relock, so the run vendors the package
+/// again. It asks another service, which grants the patch as a wheel at a
+/// URL that names another id where a patch host names the patch: no line
+/// is written for such a URL. The wheel, its ledger entry and its line of
+/// `.bazelrc` stay; only the time in the note beside the wheel is new.
+#[test]
+fn a_run_that_fails_after_the_fetch_keeps_the_committed_wheel() {
+    let with = Vendoring::new();
+    let cell = checkout(&with);
+    cell.write(LOCK, bazel_lock(28, "2.5.0-rc4"));
+    let before = cell.tree();
+    caches(&cell, &with, &before);
+    cell.write(REQUIREMENTS, &before[REQUIREMENTS]);
+    let relocked = cell.tree();
+
+    let other = StandIn::start();
+    let level = uuid::Uuid::new_v4().to_string();
+    let ids = (with.uuid.as_str(), level.as_str());
+    let route = grant_at(&other, ids, &with.patched, with.sums.clone());
+    other.serve(5, &route, &with.patched.bytes);
+    let record = format!("/v0/orgs/{ORG}/patches/view/{}", with.uuid);
+    other.serve(1, &record, with.record.to_string().as_bytes());
+    let origin = other.origin();
+    let scan = cell.socket_patch(
+        &origin,
+        &VENDORED,
+        &[("SOCKET_PATCH_SERVER_URL", origin.as_str())],
+    );
+    let said = scan.envelope.to_string();
+    assert!(
+        scan.code == 1 && said.contains("that names the patch on a patch host"),
+        "{}",
+        scan.dump
+    );
+    assert_eq!(other.asked(&route), 1, "{}", scan.dump);
+    let note = format!(".socket/vendor/pypi/{}/socket-patch.vendor.json", with.uuid);
+    let mut left = changed(&relocked, &cell.tree());
+    left.retain(|file| *file != note);
+    assert_eq!(left, NOTHING, "{}", scan.dump);
+}
+
+/// Without a Bazel: a project below the Bazel root, whose `requirements.txt`
+/// the hub reads. The line of `.bazelrc` is written at the Bazel root and
+/// names the directory from there, and the undo takes it away.
+#[test]
+fn a_project_below_the_bazel_root_gets_its_line_in_the_root_s_rc_file() {
+    let with = Vendoring::new();
+    let cell = checkout(&with);
+    cell.write(LOCK, bazel_lock(13, "2.5.0-rc4"));
+    std::fs::remove_file(cell.path(REQUIREMENTS)).expect(REQUIREMENTS);
+    cell.write(&format!("svc/{REQUIREMENTS}"), requirements(&with.wheels));
+    let own = format!("\"//:{REQUIREMENTS}\"");
+    let module = String::from_utf8(cell.tree()["MODULE.bazel"].clone()).expect("a text file");
+    let label = format!("\"//svc:{REQUIREMENTS}\"");
+    cell.write("MODULE.bazel", module.replace(&own, &label));
+    let before = cell.tree();
+
+    let scan = with.run(&cell, &[&VENDORED[..], &["--cwd", "svc"]].concat());
+    assert_eq!(scan.envelope["summary"]["applied"], 1, "{}", scan.dump);
+    let vendored = cell.tree();
+    let dir = format!("svc/.socket/vendor/pypi/{}", with.uuid);
+    let rc = String::from_utf8_lossy(&before[".bazelrc"]);
+    let rc = format!("{rc}{CACHE_COMMENT}\ncommon --distdir={dir}\n");
+    assert_eq!(String::from_utf8_lossy(&vendored[".bazelrc"]), rc);
+    assert!(vendored.contains_key(&format!("{dir}/{}", with.patched.filename())));
+    assert!(!vendored.contains_key("svc/.bazelrc"));
+
+    let undo = with.run(&cell, &["vendor", "--revert", "--yes", "--cwd", "svc"]);
+    assert_eq!(undo.code, 0, "{}", undo.dump);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", undo.dump);
 }
 
 /// Without a Bazel: the refusal is for a run that would write a file a hub
@@ -1208,6 +1922,80 @@ fn the_switch_makes_vendored_mode_the_one_of_a_checkout_without_bazel() {
     ];
     let declined = cell.off_is_without_bazel(&origin, &VENDORED, &env, &["MODULE.bazel"]);
     assert_eq!(declined[0]["code"], 1, "{declined:#}");
+}
+
+/// Without a Bazel: the switch is for the download cache as well. In the
+/// checkout where vendored mode commits one, `SOCKET_NO_BAZEL=1` makes it
+/// vendor the package as it does in the same checkout without its
+/// `MODULE.bazel` and the lock a build wrote, to the byte: by a path line
+/// of `requirements.txt`, with the `.bazelrc` as it was. Without the
+/// variable the run commits the download cache there, with its line.
+#[test]
+fn the_switch_makes_a_download_cache_the_vendoring_of_a_checkout_without_bazel() {
+    let with = Vendoring::new();
+    let cell = checkout(&with);
+    cell.write(LOCK, bazel_lock(28, "2.5.0-rc4"));
+    let rc = String::from_utf8(cell.tree()[".bazelrc"].clone()).expect("a text file");
+    let origin = with.standin.origin();
+    let json_api = format!("{origin}/{INDEX}/pypi");
+    let env = [
+        ("SOCKET_PATCH_SERVER_URL", origin.as_str()),
+        ("SOCKET_PYPI_JSON_API", json_api.as_str()),
+    ];
+    let bazel = ["MODULE.bazel", LOCK];
+    let (plain, cached) = cell.without_and_beside(&origin, &VENDORED, &env, &bazel);
+    let dir = format!(".socket/vendor/pypi/{}", with.uuid);
+    for (run, line, lines) in [
+        (&plain, format!("./{dir}/"), rc.clone()),
+        (
+            &cached,
+            format!("{NAME} @ {}{}", with.origin, with.route),
+            format!("{rc}{CACHE_COMMENT}\ncommon --distdir={dir}\n"),
+        ),
+    ] {
+        for form in [&run[0], &run[1]] {
+            assert_eq!(form["code"], 0, "{form:#}");
+            let pinned = form["files"][REQUIREMENTS].as_str().expect(REQUIREMENTS);
+            assert!(pinned.contains(&line), "{line}: {form:#}");
+            assert_eq!(form["files"][".bazelrc"], lines, "{form:#}");
+        }
+    }
+}
+
+/// Without a Bazel: what an earlier run wrote for Bazel is still listed
+/// and undone with `SOCKET_NO_BAZEL=1`. A run without the variable commits
+/// the download cache and its line of `.bazelrc`. With the variable, `list`
+/// shows a vendored package and `vendor --check` holds its wheel to the
+/// patch, and each of `vendor --revert`, `rollback` and `remove` takes the
+/// wheel, the pin and the line away: the checkout is the one before the
+/// run, to the byte.
+#[test]
+fn the_switch_still_takes_the_line_of_a_download_cache_away() {
+    let with = Vendoring::new();
+    let cell = checkout(&with);
+    cell.write(LOCK, bazel_lock(28, "2.5.0-rc4"));
+    let before = cell.tree();
+    let off = [("SOCKET_NO_BAZEL", "1")];
+    let undos: [&[&str]; 3] = [
+        &["vendor", "--revert", "--yes"],
+        &["rollback", "--yes"],
+        &["remove", PURL, "--yes"],
+    ];
+    for undo in undos {
+        let (_, vendored) = caches(&cell, &with, &before);
+        let list = with.run_with(&cell, &["list"], &off);
+        let listed = list.envelope.to_string();
+        let as_vendored = listed.contains("\"vendored\"") && !listed.contains("\"hosted\"");
+        assert!(as_vendored, "{}", list.dump);
+        let check = with.run_with(&cell, &["vendor", "--check"], &off);
+        assert_eq!(check.code, 0, "{}", check.dump);
+        assert_eq!(check.envelope["summary"]["verified"], 1, "{}", check.dump);
+        assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{}", check.dump);
+        let ran = with.run_with(&cell, undo, &off);
+        assert_eq!(ran.code, 0, "{undo:?}: {}", ran.dump);
+        let undone = changed(&before, &cell.tree());
+        assert_eq!(undone, NOTHING, "{undo:?}: {}", ran.dump);
+    }
 }
 
 /// Without a Bazel: the fixture's directories are those of its table, and

@@ -154,13 +154,18 @@ fn words(line: &str) -> Option<Vec<String>> {
 /// absolute is one Bazel opens from where it runs: it is read from the
 /// Bazel root. An rc file that is there and cannot be read, a line that
 /// [`words`] does not read, and one file more than the bound are an error:
-/// the path, with the line.
+/// the path, with the line. For a caller that needs `all` the files the
+/// checkout brings in, so is an import of an absolute path, which is a
+/// file outside the checkout and is not read: its path, and where it is
+/// imported.
 ///
-/// Not seen: the rc files of the machine and of the home directory, an
-/// import of an absolute path, and the command line.
+/// Not seen: the rc files of the machine and of the home directory, the
+/// command line, a file that an import names and the checkout does not
+/// have and, without `all`, an import of an absolute path.
 pub fn mentions(
     view: &dyn Fn(&str) -> Entry,
     flags: &[&str],
+    all: bool,
 ) -> Result<Vec<(String, usize, String)>, String> {
     let (mut todo, mut read) = (vec![".bazelrc".to_string()], Vec::new());
     let mut found = Vec::new();
@@ -200,7 +205,12 @@ pub fn mentions(
                     };
                     let inside = path.strip_prefix("%workspace%/");
                     let path = inside.map_or(&*path, |path| path.trim_start_matches('/'));
-                    todo.extend((!Path::new(path).has_root()).then(|| path.to_string()));
+                    if !Path::new(path).has_root() {
+                        todo.push(path.to_string());
+                    } else if all {
+                        let from = format!("which {file}:{at} imports from outside the checkout,");
+                        return Err(format!("{path}, {from}"));
+                    }
                 }
                 _ => {
                     let names = |word: &String| flags.iter().any(|flag| word.contains(flag));
@@ -484,7 +494,7 @@ mod tests {
     #[test]
     fn an_option_is_found_in_the_rc_files_of_the_workspace() {
         let flags = ["enable_bzlmod", "vendor_dir"];
-        let found = |files: &[(&str, &str)]| mentions(&view(files), &flags);
+        let found = |files: &[(&str, &str)]| mentions(&view(files), &flags, false);
         let at = |file: &str, line, word: &str| (file.to_string(), line, word.to_string());
         assert_eq!(found(&[]), Ok(vec![]));
         let rc = "# common --noenable_bzlmod\n\
@@ -524,6 +534,13 @@ mod tests {
             at("tools/more.bazelrc", 1, "--vendor_dir=v"),
         ];
         assert_eq!(found(&files), Ok(expected));
+        // For a caller that needs all of them, the absolute one is a file
+        // that may hold anything.
+        let outside = "/etc/bazel.bazelrc, which .bazelrc:6 imports from outside the checkout,";
+        assert_eq!(
+            mentions(&view(&files), &flags, true),
+            Err(outside.to_string())
+        );
         // The path of an import is a word like any other (line 126 / 148):
         // without its quotes, joined over a line break, and `%workspace%/`
         // joined to the root however many `/` follow it (`JoinPath`,

@@ -1023,6 +1023,14 @@ impl Cell {
         Run::of(cmd).unwrap_or_else(|why| panic!("{}: {why}", self.test))
     }
 
+    /// [`Cell::bazel`] from the directory `dir` of the workspace copy, as a
+    /// user who works below the root runs it.
+    pub fn bazel_below(&self, dir: &str, command: &str, args: &[&str]) -> Run {
+        let mut cmd = self.command("update", command, args);
+        cmd.current_dir(self.path(dir));
+        Run::of(cmd).unwrap_or_else(|why| panic!("{}: {why}", self.test))
+    }
+
     /// `bazel build --lockfile_mode=error <targets>`: passes only when
     /// `MODULE.bazel.lock` already holds what the build resolves.
     fn frozen_build(&self, targets: &[&str]) -> Run {
