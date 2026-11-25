@@ -71,6 +71,12 @@
 //!   hosted command then takes the vendored entry, its directory and its
 //!   ledger entry out again, and the checkout is the one the first hosted
 //!   command left; `rollback` undoes a vendored patch to the byte.
+//! - [`an_agent_patch_beside_a_pinned_hub`]: agent mode in a checkout that
+//!   Maven builds too. `scan --mode agent --yes` puts the patched jar in
+//!   the Maven local repository and patches no hub: the build prints the
+//!   upstream marker before and after. The document of the run, of
+//!   `apply`, of `vex` and of `vex --no-verify` says that the artifact is
+//!   not affected, which is false for what Bazel builds (KNOWN GAP).
 //!
 //! A command that writes the block gives no warning. One that does not
 //! gives one, in the place of "no pom.xml", with the reason and the words
@@ -127,9 +133,10 @@ use sha2::{Digest, Sha256, Sha512};
 use socket_patch_core::bazel::maven::{Lock, Pinned as Jar};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes as git_sha256;
 
-use crate::envelope::{event_for, event_triples};
+use crate::envelope::{codes_in, event_for, event_triples};
 use crate::harness::{
-    changed, rewrite, Cell, Claim, Fixture, How, Ran, StandIn, Tree, CONSUMER, NOTHING,
+    cell_without_bazel, changed, fixture_path, rewrite, Cell, Claim, Fixture, How, Ran, StandIn,
+    Tree, CONSUMER, NOTHING,
 };
 use crate::hosted_memory_common::{Patch, ORG};
 
@@ -431,15 +438,68 @@ struct Pinned {
 }
 
 impl Pinned {
-    /// Step 0 of every flow: the fixture's checkout for `test`, with a
+    /// Step 0 of every flow: the fixture's checkout for `test`
+    /// ([`Pinned::laid_out`]), pinned by the ruleset against its stand-in.
+    /// `None` when no Bazel runs here.
+    fn open(test: &str, maven: bool, prepare: &dyn Fn(&Cell, &mut String)) -> Option<Pinned> {
+        let flow = Pinned::laid_out(Cell::open(test, &FIXTURE)?, maven, prepare);
+        let (cell, repository) = (&flow.cell, flow.repository());
+
+        // The ruleset's own relock. The lock it writes holds the victim,
+        // which `MODULE.bazel` does not name, at the sha256 of this run's
+        // jar, in the format of the era.
+        let pin = cell.bazel_env("run", &[&format!("@{HUB}//:pin")], &[("REPIN", "1")]);
+        assert!(pin.ok(), "{test}: {}", pin.dump());
+        let lock = std::fs::read_to_string(cell.path("maven_install.json")).expect("the lock");
+        let raw: Value = serde_json::from_str(&lock).expect("the lock is JSON");
+        // Nothing else is in it: no other Bazel module added to the hub,
+        // and its one repository is the stand-in.
+        let keys = |of: &str| {
+            let map = raw[of].as_object().expect("a map of the lock");
+            map.keys().map(String::as_str).collect::<Vec<_>>().join(" ")
+        };
+        assert_eq!(
+            (keys("artifacts"), keys("repositories")),
+            (
+                format!("{GROUP}:consumer {GROUP}:{VICTIM}"),
+                format!("{repository}/")
+            ),
+            "{test}: {raw:#}"
+        );
+        let lock = Lock::parse(&lock).unwrap_or_else(|why| panic!("{test}: {why}:\n{lock}"));
+        let format = if cell.numbers() >= (9, 0, 0) { 3 } else { 2 };
+        let jar = Jar {
+            version: VERSION.to_string(),
+            jar_sha256: Some(sha256_hex(&flow.upstream_jar())),
+            fetched: true,
+        };
+        assert_eq!(
+            (lock.format, lock.plain_jar(GROUP, VICTIM)),
+            (format, Some(&jar)),
+            "{test}: {lock:?}"
+        );
+        Some(flow)
+    }
+
+    /// The repository of the hub: the stand-in's.
+    fn repository(&self) -> String {
+        format!("{}/{UPSTREAM}", self.standin.origin())
+    }
+
+    /// The upstream jar of the victim that the stand-in serves.
+    fn upstream_jar(&self) -> Vec<u8> {
+        victim(&format!("PRISTINE {}", self.run))
+    }
+
+    /// The checkout `cell` of the fixture before its hub is pinned, with a
     /// `pom.xml` that declares the victim when `maven` is set and with
     /// what `prepare` adds to its files and to the text of `MODULE.bazel`,
-    /// pinned by the ruleset against a stand-in that has the two
-    /// artifacts, the patched jar and the grant of its patch. `None` when
-    /// no Bazel runs here.
-    fn open(test: &str, maven: bool, prepare: &dyn Fn(&Cell, &mut String)) -> Option<Pinned> {
+    /// against a stand-in that has the two artifacts, the patched jar and
+    /// the grant of its patch. The lock is the empty file the ruleset's
+    /// documentation starts from.
+    fn laid_out(mut cell: Cell, maven: bool, prepare: &dyn Fn(&Cell, &mut String)) -> Pinned {
         let started = Instant::now();
-        let mut cell = Cell::open(test, &FIXTURE)?;
+        let test = cell.test.clone();
         // The cache of the Coursier that pins. Before 7.2 the ruleset
         // leaves the choice to Coursier, which without this takes the home
         // directory from the system, whatever `HOME` says.
@@ -493,41 +553,8 @@ impl Pinned {
             std::fs::write(&file, bytes).expect("write the local repository");
         }
 
-        // The ruleset's own relock. The lock it writes holds the victim,
-        // which `MODULE.bazel` does not name, at the sha256 of this run's
-        // jar, in the format of the era.
-        let pin = cell.bazel_env("run", &[&format!("@{HUB}//:pin")], &[("REPIN", "1")]);
-        assert!(pin.ok(), "{test}: {}", pin.dump());
-        let lock = std::fs::read_to_string(cell.path("maven_install.json")).expect("the lock");
-        let raw: Value = serde_json::from_str(&lock).expect("the lock is JSON");
-        // Nothing else is in it: no other Bazel module added to the hub,
-        // and its one repository is the stand-in.
-        let keys = |of: &str| {
-            let map = raw[of].as_object().expect("a map of the lock");
-            map.keys().map(String::as_str).collect::<Vec<_>>().join(" ")
-        };
-        assert_eq!(
-            (keys("artifacts"), keys("repositories")),
-            (
-                format!("{GROUP}:consumer {GROUP}:{VICTIM}"),
-                format!("{repository}/")
-            ),
-            "{test}: {raw:#}"
-        );
-        let lock = Lock::parse(&lock).unwrap_or_else(|why| panic!("{test}: {why}:\n{lock}"));
-        let format = if cell.numbers() >= (9, 0, 0) { 3 } else { 2 };
-        let jar = Jar {
-            version: VERSION.to_string(),
-            jar_sha256: Some(sha256_hex(&upstream_jar)),
-            fetched: true,
-        };
-        assert_eq!(
-            (lock.format, lock.plain_jar(GROUP, VICTIM)),
-            (format, Some(&jar)),
-            "{test}: {lock:?}"
-        );
         let upstream = format!("OUT: PRISTINE {run}");
-        Some(Pinned {
+        Pinned {
             cell,
             standin,
             tools,
@@ -537,7 +564,7 @@ impl Pinned {
             upstream,
             upstream_route: format!("/{UPSTREAM}/{}", repo_path(VICTIM, VERSION, "jar")),
             started,
-        })
+        }
     }
 
     /// Step 1: the build prints the upstream marker, from a jar Bazel
@@ -574,8 +601,18 @@ impl Pinned {
     /// the patched jar from the URL the grant has for it on the patch host:
     /// that host is the stand-in here.
     fn vendored(&self, args: &[&str]) -> Ran {
+        self.serviced(&self.cell, args)
+    }
+
+    /// [`Pinned::vendored`] in the checkout `cell`. Agent mode takes the
+    /// patched jar from that URL as well.
+    fn serviced(&self, cell: &Cell, args: &[&str]) -> Ran {
         let origin = self.standin.origin();
-        self.socket_patch(&[args, &["--patch-server-url", &origin]].concat())
+        self.socket_patch_in(
+            cell,
+            &self.standin,
+            &[args, &["--patch-server-url", &origin]].concat(),
+        )
     }
 
     /// The command where it writes no entry for the hub, in a tree without
@@ -1350,6 +1387,109 @@ fn the_users_own_override_of_the_artifact() {
         flow.cell.release(),
         flow.started.elapsed()
     );
+}
+
+/// The warning of an agent run for an artifact that a pinned hub fetches:
+/// the command patches no hub.
+const HUB_UNPATCHED: &str = "maven_bazel_hub_unpatched";
+
+impl Pinned {
+    /// Without a Bazel: the checkout of [`Pinned::open`] beside a `pom.xml`,
+    /// in a workspace copy that no Bazel has built in. No ruleset pins it,
+    /// so the lock is written here: the two artifacts under the stand-in's
+    /// repository, in the format the ruleset of Bazel 9.3.2 writes.
+    fn unbuilt() -> Pinned {
+        let cell = cell_without_bazel("9.3.2");
+        let module = fixture_path(FIXTURE.dir).join("e9").join(MODULE);
+        cell.write(MODULE, std::fs::read(module).expect(MODULE));
+        cell.write(".git/HEAD", "ref: refs/heads/main\n");
+        let flow = Pinned::laid_out(cell, true, &|_, _| {});
+        let sums = |jar: &[u8]| json!({ "jar": sha256_hex(jar) });
+        let keys = [format!("{GROUP}:consumer"), format!("{GROUP}:{VICTIM}")];
+        let lock = json!({
+            "artifacts": {
+                &keys[0]: { "shasums": sums(&jar(&[])), "version": "2.0" },
+                &keys[1]: { "shasums": sums(&flow.upstream_jar()), "version": VERSION },
+            },
+            "repositories": { format!("{}/", flow.repository()): keys },
+            "version": "3",
+        });
+        flow.cell.write("maven_install.json", format!("{lock:#}\n"));
+        flow
+    }
+
+    /// Agent mode in the checkout ([`Cell::patches_outside`]). The victim's
+    /// jar is in the Maven local repository, as a Maven build of the
+    /// checkout's `pom.xml` leaves it: `scan --mode agent --yes` puts the
+    /// jar of the patch service in its place and writes nothing into the
+    /// checkout but its `.socket` directory, and each of the four
+    /// documents says `claim`. A later `apply` warns that it patches no hub
+    /// ([`HUB_UNPATCHED`]). Gives the files of the checkout.
+    fn patches_the_installed_jar(&self, claim: &Claim) -> Tree {
+        let test = &self.cell.test;
+        let installed = self.tools.path().join("m2");
+        let installed = installed.join(repo_path(VICTIM, VERSION, "jar"));
+        let patched = victim(&format!("PATCHED {}", self.patch.uuid));
+        let run = |cell: &Cell, args: &[&str]| self.serviced(cell, args);
+        let left = self.cell.patches_outside(run, &installed, &patched, claim);
+        let apply = self.serviced(&self.cell, &["apply"]);
+        let warned = codes_in(&apply.envelope["warnings"]);
+        assert_eq!(warned, [HUB_UNPATCHED], "{test}: {}", apply.dump);
+        left
+    }
+}
+
+/// Agent mode beside a pinned hub that fetches the artifact.
+///
+/// - (a) `bazel build` and `bazel run //:consumer` print the upstream
+///   marker.
+/// - (b) `scan --mode agent --yes` patches the jar in the Maven local
+///   repository and warns that it patches no hub, and `apply` passes
+///   ([`Pinned::patches_the_installed_jar`]). Both, `vex` and
+///   `vex --no-verify` exit 0 and write a document that says the artifact
+///   is not affected, through the patch.
+/// - (c) The same two Bazel commands print the upstream marker again and
+///   change no file: the hub fetches the jar its lock pins, at the lock's
+///   sha256, and no build reads the Maven local repository.
+///
+/// KNOWN GAP: the documents of (b) are false for what Bazel builds. A fix
+/// makes each say that the artifact is affected, with what Bazel builds it
+/// from and the command that patches the hub.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn an_agent_patch_beside_a_pinned_hub() {
+    let test = "maven::an_agent_patch_beside_a_pinned_hub";
+    let Some(flow) = Pinned::open(test, true, &|_, _| {}) else {
+        return;
+    };
+    // (a) The upstream build, with the jar from the stand-in.
+    flow.builds_upstream();
+
+    // (b) Agent mode patches the installed jar. KNOWN GAP: every document
+    // says not affected.
+    let claim = Claim::new(PURL, &flow.patch.uuid, How::Agent);
+    let patched = flow.patches_the_installed_jar(&claim);
+
+    // (c) The build is the one of (a): Bazel never reads the patched jar.
+    flow.cell.builds(&flow.upstream);
+    assert_eq!(changed(&patched, &flow.cell.tree()), NOTHING, "{test}");
+    println!(
+        "{test}: Bazel {} built {:?} before and after `scan --mode agent` patched {VICTIM}-\
+         {VERSION}.jar in the Maven local repository; every form of `vex` said the artifact is \
+         not affected (KNOWN GAP); {:?}",
+        flow.cell.release(),
+        flow.upstream,
+        flow.started.elapsed()
+    );
+}
+
+/// Without a Bazel: step (b) of [`an_agent_patch_beside_a_pinned_hub`] in a
+/// checkout whose hub is pinned ([`Pinned::unbuilt`]). KNOWN GAP, as there.
+#[test]
+fn an_installed_jar_is_attested_beside_a_hub_that_fetches_its_own() {
+    let flow = Pinned::unbuilt();
+    let claim = Claim::new(PURL, &flow.patch.uuid, How::Agent);
+    flow.patches_the_installed_jar(&claim);
 }
 
 /// Without a Bazel: the fixture's directories and the legs of its workflow
