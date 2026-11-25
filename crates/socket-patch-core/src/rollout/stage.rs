@@ -188,16 +188,6 @@ impl RecordedIndex {
             .map(|(_, uuid)| uuid)
     }
 
-    /// Whether what [`Self::uuids`] answers for `purl` is recorded for a
-    /// qualifier twin of it alone: another release variant of the package
-    /// (another gem platform, a wheel beside an sdist), not `purl` itself
-    /// in any spelling.
-    fn recorded_for_a_twin(&self, purl: &str) -> bool {
-        !self.exact.contains_key(purl)
-            && !self.qualified.contains_key(&PurlKey::qualified(purl))
-            && self.by_base.contains_key(&PurlKey::new(purl))
-    }
-
     /// Whether any patch is recorded for `purl`'s base purl.
     pub fn records_package(&self, purl: &str) -> bool {
         self.by_base.contains_key(&PurlKey::new(purl)) || self.unlocked_uuid(purl).is_some()
@@ -208,13 +198,6 @@ impl RecordedIndex {
 /// the merged view (manifest > hosted pins > vendor ledger).
 pub fn classify(offers: &Offers, recorded: &RecordedIndex, project: &str) -> Vec<Row> {
     classify_with(offers, recorded, None, project)
-}
-
-/// Whether `purl` is the patch purl of a platform gem
-/// (`pkg:gem/<name>@<version>?platform=<platform>`, not `ruby`).
-fn is_platform_gem_purl(purl: &str) -> bool {
-    Ecosystem::from_purl(purl) == Some(Ecosystem::Gem)
-        && crate::utils::purl::gem_platform_qualifier(purl).is_some()
 }
 
 /// [`classify`] for a run that changes what Bundler installs (hosted and
@@ -328,7 +311,10 @@ pub fn lookup_incomplete(
 /// each belongs to (the uuid of the patch it was built from). The pin of a
 /// gem locked as platform builds names one patch for every build, so a
 /// platform build's row is in place exactly when its patch is of the
-/// pinned patch's fix, and a move to another fix otherwise.
+/// pinned patch's fix, and a move to another fix otherwise. The same goes
+/// for the row of the fix's source patch: the pin may name the registry of
+/// a build's own patch (a gem moved while the source patch was not
+/// available), and the source patch of that fix is then no newer patch.
 pub fn mark_pinned(
     rows: &mut [Row],
     pins: &[crate::patch::redirect::upstream::HostedPin],
@@ -343,8 +329,7 @@ pub fn mark_pinned(
     for row in rows.iter_mut().filter(|r| r.candidate.recorded.is_new()) {
         let uuids = index.uuids(&row.candidate.purl);
         let selected = row.candidate.uuid.to_ascii_lowercase();
-        let same_fix = is_platform_gem_purl(&row.candidate.purl)
-            && index.recorded_for_a_twin(&row.candidate.purl)
+        let same_fix = Ecosystem::from_purl(&row.candidate.purl) == Some(Ecosystem::Gem)
             && uuids.iter().any(|pin| fix_of(pin) == fix_of(&selected));
         if uuids.contains(&selected) || same_fix {
             row.candidate.recorded = Recorded::Same;
@@ -743,6 +728,21 @@ mod tests {
                 old_uuid: "source-b".to_string()
             }
         );
+        // The lock names a build's own registry (the source patch was not
+        // available when the gem was moved): the fix's source patch, which
+        // only lends its registry, is no newer patch for the project.
+        let source_row = offers_from_results(
+            &[offer(
+                "pkg:gem/nokogiri@1.18.10?platform=ruby",
+                "source-a",
+                "2026-01-01T00:00:00Z",
+                &["high"],
+            )],
+            true,
+        );
+        let mut rows = classify(&source_row, &RecordedIndex::default(), "");
+        mark_pinned(&mut rows, &[pin("darwin-of-a")], &fixes);
+        assert_eq!(rows[0].candidate.recorded, Recorded::Same);
         // The fix is not known: never called in place on a guess.
         assert_eq!(
             marked("source-a", &HashMap::new()),
