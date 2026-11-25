@@ -246,9 +246,15 @@ fn pinned(env: &serde_json::Value) -> Vec<String> {
 }
 
 fn has_command(program: &str) -> bool {
+    has_command_with(program, "--version")
+}
+
+/// [`has_command`] for a tool whose version probe is not `--version`
+/// (`go version`).
+fn has_command_with(program: &str, probe_arg: &str) -> bool {
     let mut probe = pm_command(program);
     probe
-        .arg("--version")
+        .arg(probe_arg)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     cache_env::isolate(&mut probe);
@@ -260,6 +266,11 @@ fn has_command(program: &str) -> bool {
 fn pm_command(program: &str) -> Command {
     let mut cmd = hermetic::tool_command(program);
     hermetic::scrub_socket_vars(&mut cmd);
+    if program == "bun" {
+        // `BUN_CONFIG_REGISTRY`, `BUN_CONFIG_TOKEN` and `npm_config_*`
+        // would change what bun locks.
+        cache_env::scrub_ambient_bun_tool_env(&mut cmd);
+    }
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Bundle]);
     for key in [
         "NPM_CONFIG_REGISTRY",
@@ -993,7 +1004,7 @@ fn vlt_installs_the_patch_through_artifactory() {
     let _ = std::fs::remove_dir_all(fx.proj.join("node_modules"));
     let refused = vlt(&["ci"], "cold-a");
     assert!(
-        !refused.status.success(),
+        !refused.status.success() && dump(&refused).contains("401"),
         "{LEG}: an install with no credentials must be refused:\n{}",
         dump(&refused)
     );
@@ -1244,7 +1255,7 @@ fn pdm_installs_the_patch_through_artifactory() {
     let sync = ["sync", "--no-self"];
     let refused = pdm(&sync, "cold-a", &[]);
     assert!(
-        !refused.status.success(),
+        !refused.status.success() && dump(&refused).contains("401"),
         "{LEG}: an install with no credentials must be refused:\n{}",
         dump(&refused)
     );
@@ -1318,7 +1329,7 @@ fn pipenv_installs_the_patch_through_artifactory() {
     let _ = std::fs::remove_dir_all(fx.proj.join(".venv"));
     let refused = pipenv(&["sync"], "cold-a", &[]);
     assert!(
-        !refused.status.success(),
+        !refused.status.success() && dump(&refused).contains("401"),
         "{LEG}: an install with no credentials must be refused:\n{}",
         dump(&refused)
     );
@@ -1586,8 +1597,7 @@ fn go_fetches_the_patched_modules_through_an_anonymous_repository() {
     let Some(base) = setting("SOCKET_PATCH_ARTIFACTORY_E2E_ANON_BASE") else {
         soft_skip!(LEG, "SOCKET_PATCH_ARTIFACTORY_E2E_ANON_BASE is not set");
     };
-    let probe = tool(Path::new("."), "go", &["version"], &[]);
-    if !probe.status.success() {
+    if !has_command_with("go", "version") {
         soft_skip!(LEG, "`go` is not on PATH");
     }
     let fx = fixture();

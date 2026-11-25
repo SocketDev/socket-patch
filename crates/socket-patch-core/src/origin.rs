@@ -144,13 +144,23 @@ fn served_level(segments: &[&str], prefixed: bool) -> Option<(usize, usize)> {
 /// does not accept. A reader that checks what a hosted path embeds reads
 /// this, never the url's own path, which under a mirror starts with the
 /// mirror's base (`/artifactory/socket-patch/patch/npm/…`).
+///
+/// Under a mirror the serve level is the first segment below the base, so
+/// a base that itself holds a `gopatch` or `patch/<eco>` segment is never
+/// read as the level.
 pub(crate) fn hosted_served_path(url: &str, extra_origins: &[String]) -> Option<Vec<String>> {
     use crate::utils::purl::percent_decode_purl_component;
 
     hosted_patch_uuid(url, extra_origins)?;
     let (parsed, socket_host) = accepted_hosted_url(url, extra_origins)?;
     let segments: Vec<&str> = parsed.path_segments()?.collect();
-    let (root, _) = served_level(&segments, !socket_host)?;
+    let root = match mirror_base_depth(&parsed, extra_origins) {
+        Some(depth) => {
+            let below = segments.get(depth..)?;
+            depth + served_level(below, false)?.0
+        }
+        None => served_level(&segments, !socket_host)?.0,
+    };
     Some(
         segments[root..]
             .iter()
@@ -325,6 +335,22 @@ pub(crate) fn on_mirror(url: &str, origins: &[String]) -> bool {
         && normalized_hosted_url(url)
             .and_then(|text| reqwest::Url::parse(&text).ok())
             .is_some_and(|parsed| on_configured_origin(&parsed, &mirrors))
+}
+
+/// The number of path segments of the deepest patch mirror base among
+/// `origins` (a [`mirror_entry`]) that `url` is at or below, or `None` when
+/// it is under no mirror's base.
+fn mirror_base_depth(url: &reqwest::Url, origins: &[String]) -> Option<usize> {
+    origins
+        .iter()
+        .filter(|entry| entry_url(entry).1)
+        .filter(|entry| on_configured_origin(url, std::slice::from_ref(*entry)))
+        .filter_map(|entry| reqwest::Url::parse(entry_url(entry).0).ok())
+        .map(|base| {
+            base.path_segments()
+                .map_or(0, |s| s.filter(|seg| !seg.is_empty()).count())
+        })
+        .max()
 }
 
 /// Whether `path` is `base` or below it, a whole segment at a time. A base
@@ -1447,6 +1473,43 @@ mod tests {
         assert_eq!(
             hosted_base_path("https://repo.example/m/gopatch/u").as_deref(),
             Some("/m/")
+        );
+    }
+
+    /// The served path drops a mirror's base, even one that holds a
+    /// serve-level name itself, and the patch server's path is read as is.
+    #[test]
+    fn hosted_served_path_starts_below_the_mirror_base() {
+        let tail = format!("patch/npm/left-pad/1.3.0/tok/{UUID}/left-pad-1.3.0.tgz");
+        let want: Vec<String> = tail.split('/').map(str::to_string).collect();
+        assert_eq!(
+            hosted_served_path(&format!("https://patch.socket.dev/{tail}"), &[]),
+            Some(want.clone())
+        );
+        for base in [
+            "http://art.example/artifactory/socket-patch",
+            "http://art.example/artifactory/gopatch",
+            "http://art.example/patch/npm",
+            "http://art.example",
+        ] {
+            let origins = [mirror_entry(base)];
+            assert_eq!(
+                hosted_served_path(&format!("{base}/{tail}"), &origins),
+                Some(want.clone()),
+                "{base}"
+            );
+        }
+        // Below a mirror's base, the serve level must come first.
+        let base = "http://art.example/artifactory/socket-patch";
+        let origins = [mirror_entry(base)];
+        assert_eq!(
+            hosted_served_path(&format!("{base}/extra/{tail}"), &origins),
+            None
+        );
+        // Not under the base: not hosted at all.
+        assert_eq!(
+            hosted_served_path(&format!("http://art.example/other/{tail}"), &origins),
+            None
         );
     }
 }
