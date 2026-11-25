@@ -205,9 +205,8 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str]) -> Output {
         })
         .collect();
     let mut cmd = pnpm_command(pm);
-    cmd.args(&args)
-        .current_dir(cwd)
-        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+    cmd.args(&args).env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+    hermetic::start_in(&mut cmd, cwd);
     hermetic::scrub_socket_vars(&mut cmd);
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Pnpm]);
     // After the scrub: it strips ambient `PNPM_*` and `npm_config_*`, which

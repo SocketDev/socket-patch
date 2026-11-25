@@ -417,6 +417,13 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   upgrading to pnpm >=11. When no pin says which pnpm runs, the file is
   created, and pnpm 9.0–10.4 then need `pnpm add -w <pkg>`. Vendored mode
   follows the same rule for its `overrides:` mirror.
+  Known limit on Windows: in a project that has a `pnpm-workspace.yaml` (the
+  one the CLI created counts), pnpm 11 started from a directory spelled with
+  an 8.3 short name (`C:\Users\LONGNA~1\app`) records what `pnpm add`,
+  `pnpm remove` and `pnpm update` change under a second `importers:` entry of
+  the lock, keyed `../…`, and leaves the project's own entry (`.`) as it was;
+  this is pnpm's own behaviour, and running pnpm from the directory's long
+  name (`C:\Users\longname\app`) avoids it.
   **Vendored build approvals (#1597):** pnpm 10.34.2+ and 11.5.3+ match
   `allowBuilds` / `onlyBuiltDependencies` against the id a package installs
   as, and a vendored package installs as `name@file:.socket/vendor/npm/…`.
@@ -5021,6 +5028,16 @@ a precompiled build to the `ruby` platform build, `gems/nokogiri-1.16.0-x86_64-l
 to the patched `gems/nokogiri-1.16.0/`. RubyGems and Bundler load a gem by its
 `specifications/` entry, so nothing loads that directory, and `socket-patch vex` and
 `apply --check` don't count it as an installed copy. `bundle clean --force` deletes it.
+
+`bundle install` installs into the gem home of the Ruby that runs it. After a Ruby upgrade
+`vendor/bundle` can still hold the tree of the earlier Ruby (`vendor/bundle/ruby/3.2.0` next to
+`ruby/3.3.0`), and a gem with a native extension in that tree can only be rebuilt by the Ruby
+that installed it. When the scan finds no such Ruby, its warning names the gem directory to
+remove as well (`rm -rf <gem directory> <gemspec> <archive> && bundle install`), so no unpatched
+copy is left behind whichever Ruby runs `bundle install`; to keep the tree, re-run the scan with
+that Ruby first on `PATH`. A gem directory that already lost its gemspec, and that the scan
+tried and failed to replace, is reported the same way: the warning names the directory to
+remove, and no re-run, which could not replace it.
 
 Gems in a gem home **outside** the project (the system gems, `~/.gem`, an rbenv or asdf home) are
 not touched: another project on the machine may use the same copy. The run prints one warning

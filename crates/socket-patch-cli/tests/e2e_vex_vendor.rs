@@ -41,6 +41,7 @@ const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 
 #[path = "common/mod.rs"]
 mod common;
+use common::sha256_hex;
 
 /// CLI invocation through the shared hermetic builder (same rationale as
 /// `e2e_vex.rs`: explicit flags must be the sole source of truth).
@@ -734,13 +735,6 @@ fn tampered_detached_artifact_omitted() {
 // ──────────────────────────────────────────────────────────────────────
 // 6. cross-ecosystem matrix — every vendor-backend ecosystem attests
 // ──────────────────────────────────────────────────────────────────────
-
-/// Plain sha256 hex of `bytes` — the ledger's whole-file hash for
-/// file-shaped artifacts (tarballs / wheels / nupkgs / jars).
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(bytes))
-}
 
 /// Write a single-member `.tgz` (the npm artifact shape) at `dest` and
 /// return its bytes for the ledger sha256.

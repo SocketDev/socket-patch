@@ -5442,18 +5442,20 @@ pub(crate) struct VendorGcSummary {
     /// (b) entries whose package left the lockfile dependency graph —
     /// reverted, and their manifest entries dropped.
     pub unused_reverted: Vec<String>,
-    /// Entries a wet revert drift-kept ([`RevertOutcome::kept_artifact`]):
-    /// the backend left the drifted lock alone, so artifacts, ledger entry
-    /// and (in (b)) manifest records were all retained — nothing reclaimed.
-    /// Always empty on dry runs: backends detect drift only during a wet
-    /// wiring replay, so the preview still lists such entries as revertable.
-    pub kept: Vec<String>,
+    /// Entries a wet revert kept ([`RevertOutcome::kept_artifact`]), each
+    /// with why: the backend left a drifted lock alone, or restored the
+    /// recorded wiring while another project file still installs from the
+    /// artifact. Artifacts, ledger entry and (in (b)) manifest records were
+    /// all retained — nothing reclaimed. Always empty on dry runs: the
+    /// preview runs no revert, so it still lists such entries as
+    /// revertable.
+    pub kept: Vec<(String, KeepCause)>,
     /// (c) orphan uuid dirs (no owning ledger entry) swept.
     pub orphan_dirs: usize,
-    /// Entries (ledger keys) that could not be reverted — kept in the
-    /// ledger, nothing reclaimed. Only purls; the pass-level outcomes below
-    /// have their own fields.
-    pub failed: Vec<String>,
+    /// Entries (ledger keys) that could not be reverted, each with the
+    /// backend's reason — kept in the ledger, nothing reclaimed. The
+    /// pass-level outcomes below have their own fields.
+    pub failed: Vec<(String, String)>,
     /// Post-revert rewrites that failed: `("vendor_state_write_failed" |
     /// "manifest_write_failed", <detail>)`. The reverts themselves already
     /// happened on disk; the stale record is what the caller must report.
@@ -5465,7 +5467,8 @@ pub(crate) struct VendorGcSummary {
     /// `vendor_vlt_reinstall_required`, and, for a manifest-dropped PyPI
     /// entry under pip, PDM, uv or Pipenv, `vendor_pypi_reinstall_required`
     /// (#477). Every other reverting command surfaces these, and the GC
-    /// must not drop them.
+    /// must not drop them. Also the `vendor_revert_residual_reference`
+    /// warning of an entry kept for one: it names the file to fix.
     pub advisories: Vec<(&'static str, String)>,
 }
 
@@ -5475,7 +5478,9 @@ pub(crate) struct VendorGcSummary {
 /// revert's other warnings are routine for a prune and stay out:
 /// `vendor_lock_entry_removed` is the normal leg-(b) case (the dependency
 /// was uninstalled), and a drift keep is already reported through
-/// `keptVendoredEntries` and its own `GC: kept …` line.
+/// `keptVendoredEntries` and its own `GC: kept …` line. A keep for a
+/// residual reference forwards the warning that names the file
+/// ([`VendorGcSummary::note_unreclaimed`]).
 const GC_FORWARDED_ADVISORIES: &[&str] = &[
     socket_patch_core::vendor::bun_lock::REINSTALL_REQUIRED,
     socket_patch_core::vendor::vlt_lock::REINSTALL_REQUIRED,
@@ -5485,10 +5490,12 @@ const GC_FORWARDED_ADVISORIES: &[&str] = &[
 
 impl VendorGcSummary {
     /// Keep a revert's reinstall advisories. Only a revert that actually
-    /// restored the lock (succeeded, not drift-kept) can leave a stale
-    /// installed copy behind.
+    /// restored the lock can leave a stale installed copy behind: one that
+    /// succeeded and was not drift-kept. A keep for a residual reference
+    /// restored it too.
     fn take_advisories(&mut self, outcome: &RevertOutcome) {
-        if !outcome.success || outcome.kept_artifact {
+        let drift_kept = outcome.kept_artifact && KeepCause::of(outcome) == KeepCause::Drift;
+        if !outcome.success || drift_kept {
             return;
         }
         self.advisories.extend(
@@ -5498,6 +5505,39 @@ impl VendorGcSummary {
                 .filter(|w| GC_FORWARDED_ADVISORIES.contains(&w.code))
                 .map(|w| (w.code, w.detail.clone())),
         );
+    }
+
+    /// File a wet revert of `purl` that reclaimed nothing: a failure with
+    /// the backend's reason, or a keep with its cause, classified as for
+    /// `remove` and `rollback` ([`KeepCause::of`]). A keep for a residual
+    /// reference carries the warning that names the file still installing
+    /// from the artifact, without which its remedy cannot be followed; the
+    /// purl leads its detail, since the backend names only the uuid dir.
+    /// `false` when the revert went through.
+    fn note_unreclaimed(&mut self, purl: &str, outcome: &RevertOutcome) -> bool {
+        if !outcome.success {
+            let why = outcome.error.clone();
+            self.failed.push((
+                purl.to_string(),
+                why.unwrap_or_else(|| "unknown error".into()),
+            ));
+            return true;
+        }
+        if !outcome.kept_artifact {
+            return false;
+        }
+        let cause = KeepCause::of(outcome);
+        if cause == KeepCause::Reference {
+            self.advisories.extend(
+                outcome
+                    .warnings
+                    .iter()
+                    .filter(|w| w.code == vendor::RESIDUAL_REFERENCE_CODE)
+                    .map(|w| (w.code, format!("{purl}: {}", w.detail))),
+            );
+        }
+        self.kept.push((purl.to_string(), cause));
+        true
     }
 }
 /// The manifest keys an unused vendored `entry`, stored under ledger key
@@ -5532,12 +5572,12 @@ pub(crate) fn unused_vendored_manifest_keys<V>(
 ///     prune + blob sweep reclaims the rest in the same pass;
 /// (c) sweep orphan uuid dirs.
 ///
-/// A drift-skipped revert ([`RevertOutcome::kept_artifact`]) keeps the
-/// ledger entry — and, in (b), the purl's manifest records — exactly like
-/// every other `dispatch_revert_one` caller; the kept purl is reported in
-/// [`VendorGcSummary::kept`] so `scan --prune` can explain it. Wet-only: a
-/// dry [`dispatch_revert_one`] returns before the wiring replay that
-/// detects drift.
+/// A revert that kept its artifact ([`RevertOutcome::kept_artifact`]: a
+/// drifted lock, or another project file that still installs from it)
+/// keeps the ledger entry — and, in (b), the purl's manifest records —
+/// exactly like every other `dispatch_revert_one` caller; the kept purl is
+/// reported with its cause in [`VendorGcSummary::kept`] so `scan --prune`
+/// can explain it. Wet-only: the dry pass runs no revert.
 ///
 /// Detached entries — every `scan`/`get --mode vendored` entry — are exempt
 /// from (a) alone: they are never manifest-tracked, so "absent from the
@@ -5617,14 +5657,10 @@ pub(crate) async fn run_vendor_gc(
                 .await;
             }
             out.take_advisories(&outcome);
-            if !outcome.success {
-                out.failed.push(purl);
-            } else if outcome.kept_artifact {
-                // Drift-skip keep: the ledger entry must survive too (which
-                // also shields the uuid dir from the (c) orphan sweep), and
-                // the purl is reported as kept, never as reverted.
-                out.kept.push(purl);
-            } else {
+            // A kept artifact: the ledger entry must survive too (which
+            // also shields the uuid dir from the (c) orphan sweep), and
+            // the purl is reported as kept, never as reverted.
+            if !out.note_unreclaimed(&purl, &outcome) {
                 state.entries.remove(&purl);
                 ledger_dirty = true;
                 out.dropped_reverted.push(purl);
@@ -5665,16 +5701,11 @@ pub(crate) async fn run_vendor_gc(
         }
         let outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
         out.take_advisories(&outcome);
-        if !outcome.success {
-            out.failed.push(purl);
-            continue;
-        }
-        if outcome.kept_artifact {
-            // Drift-skip keep, same gate as (a) — and the purl's manifest
-            // records must survive too: pruning them would make the next
-            // `vendor` reconcile re-revert an entry whose backing record is
-            // gone.
-            out.kept.push(purl);
+        // A kept artifact, same gate as (a) — and the purl's manifest
+        // records must survive too: pruning them would make the next
+        // `vendor` reconcile re-revert an entry whose backing record is
+        // gone.
+        if out.note_unreclaimed(&purl, &outcome) {
             continue;
         }
         state.entries.remove(&purl);
@@ -7476,7 +7507,7 @@ mod gc_tests {
         assert!(out.failed.is_empty(), "a keep is not a failure: {out:?}");
         assert_eq!(
             out.kept,
-            vec![PURL.to_string()],
+            vec![(PURL.to_string(), KeepCause::Drift)],
             "the drift-keep must be COUNTED — scan --prune's only signal \
              that the entry its preview listed was deliberately not \
              reclaimed: {out:?}"
@@ -7522,7 +7553,7 @@ mod gc_tests {
         assert!(out.failed.is_empty(), "a keep is not a failure: {out:?}");
         assert_eq!(
             out.kept,
-            vec![PURL.to_string()],
+            vec![(PURL.to_string(), KeepCause::Drift)],
             "the drift-keep must be COUNTED — scan --prune's only signal \
              that the entry its preview listed was deliberately not \
              reclaimed: {out:?}"
@@ -7775,10 +7806,61 @@ mod gc_tests {
         );
     }
 
+    /// What the pass keeps of a kept revert follows from why it was kept.
+    /// A keep for a residual reference restored the lock: its reinstall
+    /// advisory stands, and the warning that names the file is carried
+    /// under the purl. A drift keep restored nothing and repeats nothing.
+    #[test]
+    fn a_kept_revert_is_filed_by_its_cause() {
+        use socket_patch_core::vendor::vlt_lock::REINSTALL_REQUIRED;
+        let dir = format!(".socket/vendor/npm/{UUID}");
+        let reinstall = || VendorWarning::new(REINSTALL_REQUIRED, "run `vlt ci`");
+
+        let mut reference = RevertOutcome::ok();
+        reference.warnings.push(reinstall());
+        reference.warnings.push(VendorWarning::new(
+            vendor::RESIDUAL_REFERENCE_CODE,
+            format!("kept {dir}/: apps/web/package.json still names it"),
+        ));
+        reference.keep_artifact_for_reference(&dir);
+        let mut out = VendorGcSummary::default();
+        out.take_advisories(&reference);
+        assert!(out.note_unreclaimed(PURL, &reference));
+        assert_eq!(out.kept, vec![(PURL.to_string(), KeepCause::Reference)]);
+        assert_eq!(
+            out.advisories,
+            vec![
+                (REINSTALL_REQUIRED, "run `vlt ci`".to_string()),
+                (
+                    vendor::RESIDUAL_REFERENCE_CODE,
+                    format!("{PURL}: kept {dir}/: apps/web/package.json still names it"),
+                ),
+            ]
+        );
+
+        let mut drift = RevertOutcome::ok();
+        drift.warnings.push(reinstall());
+        drift.warnings.push(VendorWarning::new(
+            "vendor_lock_entry_drifted",
+            "node_modules/left-pad was re-resolved",
+        ));
+        drift.keep_artifact(&dir);
+        let mut out = VendorGcSummary::default();
+        out.take_advisories(&drift);
+        assert!(out.note_unreclaimed(PURL, &drift));
+        assert_eq!(out.kept, vec![(PURL.to_string(), KeepCause::Drift)]);
+        assert!(out.advisories.is_empty(), "{out:?}");
+
+        // A revert that went through is neither kept nor failed.
+        let mut out = VendorGcSummary::default();
+        assert!(!out.note_unreclaimed(PURL, &RevertOutcome::ok()));
+        assert!(out.kept.is_empty() && out.failed.is_empty(), "{out:?}");
+    }
+
     /// (a) revert FAILURE accounting: a ledger entry whose ecosystem has no
     /// revert backend (a tampered/hand-edited state.json) lands in
-    /// `out.failed`, is KEPT in the ledger, and is excluded from pass (b)
-    /// (no double count).
+    /// `out.failed` with the backend's reason, is KEPT in the ledger, and
+    /// is excluded from pass (b) (no double count).
     #[tokio::test]
     async fn vendor_gc_failed_dropped_revert_keeps_entry() {
         let (tmp, common, manifest_path) = gc_fixture(false).await;
@@ -7790,7 +7872,14 @@ mod gc_tests {
         save_state(tmp.path(), &state).await.unwrap();
 
         let out = run_vendor_gc(&common, &manifest_path, false).await;
-        assert_eq!(out.failed, vec![PURL.to_string()], "{out:?}");
+        assert_eq!(
+            out.failed,
+            vec![(
+                PURL.to_string(),
+                "this build has no vendor backend for ecosystem `frobnicate`".to_string()
+            )],
+            "{out:?}"
+        );
         assert!(out.dropped_reverted.is_empty(), "{out:?}");
         assert!(
             out.unused_reverted.is_empty(),
@@ -7824,7 +7913,16 @@ mod gc_tests {
         save_state(tmp.path(), &state).await.unwrap();
 
         let out = run_vendor_gc(&common, &manifest_path, false).await;
-        assert_eq!(out.failed, vec![PURL.to_string()], "{out:?}");
+        assert_eq!(
+            out.failed,
+            vec![(
+                PURL.to_string(),
+                "refusing revert: `deadbeef` is not a canonical patch uuid (tampered \
+                 state.json?)"
+                    .to_string()
+            )],
+            "{out:?}"
+        );
         assert!(out.unused_reverted.is_empty(), "{out:?}");
         assert!(out.dropped_reverted.is_empty(), "{out:?}");
         assert!(

@@ -44,6 +44,7 @@
 #[path = "../prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
+use crate::common::sha256_hex;
 use crate::vex_e2e_common;
 
 use std::collections::HashMap;
@@ -405,11 +406,6 @@ fn write_vendor_ledger(
         ".socket/vendor/state.json",
         serde_json::to_string_pretty(&state).unwrap(),
     );
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(bytes))
 }
 
 /// A zip-family artifact (`.jar` / `.nupkg`) holding `members`.

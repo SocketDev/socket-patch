@@ -37,7 +37,7 @@ use std::sync::OnceLock;
 
 use base64::Engine as _;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha512};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1276,13 +1276,9 @@ pub fn sha512_sri(bytes: &[u8]) -> String {
     )
 }
 
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
 // Not every includer uses it.
 #[allow(unused_imports)]
-pub use common::git_sha256;
+pub use common::{git_sha256, sha256_hex};
 
 /// A dir vlt (rc.14) renames an old tree to and deletes in the background.
 pub fn is_vlt_delete_staging(name: &std::ffi::OsStr) -> bool {

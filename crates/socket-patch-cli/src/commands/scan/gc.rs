@@ -15,6 +15,7 @@ use std::time::Duration;
 use crate::args::GlobalArgs;
 use crate::commands::lock_cli::{acquire_with_status, lock_failure};
 use crate::commands::vendor::{run_vendor_gc, VendorGcSummary};
+use crate::commands::vendored_backend::KeepCause;
 use crate::json_envelope::{Envelope, GcReport, PatchAction, PatchEvent};
 use crate::ui::{plural, sweep_failure};
 
@@ -33,14 +34,17 @@ pub(super) struct GcSummary {
     /// their patch is gone from the manifest or their dependency left the
     /// lockfile graph. Sorted.
     vendored_reverted: Vec<String>,
-    /// Vendored entries the wet pass drift-kept: a revert was due, but the
-    /// lock entries drifted since vendoring, so everything was retained.
-    /// Sorted. Always empty in preview mode (drift is only detected by a
-    /// wet wiring replay), where such entries show in `vendored_reverted`.
-    vendored_kept: Vec<String>,
-    /// Vendored entries whose wet revert failed: the ledger entry and the
-    /// artifacts were kept. Sorted. Always empty in preview mode.
-    vendored_failed: Vec<String>,
+    /// Vendored entries the wet pass kept, each with why: a revert was
+    /// due, but the lock entries drifted since vendoring (everything was
+    /// retained), or the recorded wiring was restored while another project
+    /// file still installs from the artifact (the artifact and the entries
+    /// were retained). Sorted. Always empty in preview mode (which runs no
+    /// revert), where such entries show in `vendored_reverted`.
+    vendored_kept: Vec<(String, KeepCause)>,
+    /// Vendored entries whose wet revert failed, each with the backend's
+    /// reason: the ledger entry and the artifacts were kept. Sorted.
+    /// Always empty in preview mode.
+    vendored_failed: Vec<(String, String)>,
     /// Orphan `.socket/vendor/<eco>/<uuid>` dirs swept (or sweepable).
     vendor_orphan_dirs: usize,
     /// Set when a wet pass could not take the apply lock and so skipped
@@ -53,7 +57,8 @@ pub(super) struct GcSummary {
     /// written (`manifest_write_failed`: nothing was pruned or swept), and
     /// orphan sweeps that could not finish (`cleanup_failed`: the removed
     /// counts above are what it did reclaim). Also the vendored reverts'
-    /// reinstall advisories, and `manifest_invalid` / `manifest_unreadable`
+    /// reinstall advisories, the `vendor_revert_residual_reference` of an
+    /// entry kept for one, and `manifest_invalid` / `manifest_unreadable`
     /// when the manifest half could not load the manifest.
     warnings: Vec<(&'static str, String)>,
     /// The entries of hosted mode's pnpm registry route that no lockfile
@@ -132,7 +137,7 @@ impl GcSummary {
             .collect();
         self.vendored_reverted.sort();
         self.vendored_kept = v.kept;
-        self.vendored_kept.sort();
+        self.vendored_kept.sort_by(|a, b| a.0.cmp(&b.0));
         self.vendored_failed = v.failed;
         self.vendored_failed.sort();
         self.warnings.extend(v.write_failures);
@@ -146,9 +151,10 @@ impl GcSummary {
     /// (`verified` on a preview) with `details.manifest: true`, each
     /// reverted vendored entry a `removed` (`verified`) event with
     /// `errorCode: "vendor_reverted"` and `details.mode: "vendored"`, each
-    /// drift-kept entry a `skipped` / `vendor_revert_kept` event, and each
-    /// entry whose revert failed a `skipped` / `vendor_revert_failed` event
-    /// (a GC revert failure never fails the run, so it is not a `failed`
+    /// kept entry a `skipped` / `vendor_revert_kept` event whose reason is
+    /// the keep's cause, and each entry whose revert failed a `skipped` /
+    /// `vendor_revert_failed` event whose reason carries the backend's (a
+    /// GC revert failure never fails the run, so it is not a `failed`
     /// event). The orphan `.socket/vendor/<eco>/<uuid>` dirs swept are
     /// counted in the top-level `removedVendorOrphanDirs`, each entry of a
     /// pnpm registry route the pass took out is an artifact-level `removed`
@@ -184,24 +190,32 @@ impl GcSummary {
                     .with_details(vendored()),
             );
         }
-        for purl in &self.vendored_kept {
+        for (purl, cause) in &self.vendored_kept {
+            let detail = match cause {
+                KeepCause::Drift => "lock entries were re-resolved since vendoring, so the \
+                                     artifact and the manifest/ledger entries were retained"
+                    .to_string(),
+                KeepCause::Reference => format!(
+                    "{}; the artifact and the manifest/ledger entries were retained — {}",
+                    cause.reason(),
+                    cause.remedy(PRUNE_AGAIN)
+                ),
+            };
             env.record(
                 PatchEvent::new(PatchAction::Skipped, purl.as_str())
-                    .with_reason(
-                        "vendor_revert_kept",
-                        "lock entries were re-resolved since vendoring, so the artifact \
-                         and the manifest/ledger entries were retained",
-                    )
+                    .with_reason("vendor_revert_kept", detail)
                     .with_details(vendored()),
             );
         }
-        for purl in &self.vendored_failed {
+        for (purl, why) in &self.vendored_failed {
             env.record(
                 PatchEvent::new(PatchAction::Skipped, purl.as_str())
                     .with_reason(
                         "vendor_revert_failed",
-                        "the prune GC could not revert this vendored entry; its ledger \
-                         entry and artifacts were kept",
+                        format!(
+                            "the prune GC could not revert this vendored entry ({why}); its \
+                             ledger entry and artifacts were kept"
+                        ),
                     )
                     .with_details(vendored()),
             );
@@ -221,6 +235,10 @@ impl GcSummary {
         }
     }
 }
+
+/// What finishes a revert the pass kept for a residual reference, once the
+/// file named by its warning is fixed ([`KeepCause::remedy`]).
+const PRUNE_AGAIN: &str = "re-run `scan --prune`";
 
 /// Warning code: a requested GC pass could not run (another run holds the
 /// apply lock, or the lock file could not be opened); nothing was swept.
@@ -701,22 +719,41 @@ pub(super) fn format_gc_vendored_lines(gc: &GcSummary) -> Vec<String> {
     // `--dry-run` preview (which cannot see drift and lists the entry as
     // revertable), so they always earn the same remediation hint every
     // other drift-keep caller prints.
-    if !gc.vendored_kept.is_empty() {
+    let kept = |cause: KeepCause| gc.vendored_kept.iter().filter(|(_, c)| *c == cause).count();
+    let drifted = kept(KeepCause::Drift);
+    if drifted > 0 {
         lines.push(format!(
             "GC: kept {}: lock entries were re-resolved since vendoring, so their \
              artifacts and manifest/ledger entries were retained; undo the drift and \
              re-run `vendor --revert` to finish.",
             plural(
-                gc.vendored_kept.len(),
+                drifted,
                 "drifted vendored entry",
                 "drifted vendored entries"
             ),
         ));
     }
-    // A failed revert leaves the entry and its artifacts in place; the
-    // backend's own error was printed as it happened, so name what was
-    // not reclaimed.
+    // Not a drift: the recorded wiring was restored, and the warning above
+    // names the file that still installs from the artifact.
+    let referenced = kept(KeepCause::Reference);
+    if referenced > 0 {
+        lines.push(format!(
+            "GC: kept {}: {}; {}.",
+            plural(referenced, "vendored entry", "vendored entries"),
+            KeepCause::Reference.reason(),
+            KeepCause::Reference.remedy(PRUNE_AGAIN),
+        ));
+    }
+    // A failed revert leaves the entry and its artifacts in place: name
+    // what was not reclaimed, and why (nothing else prints the backend's
+    // error).
     if !gc.vendored_failed.is_empty() {
+        let failed: Vec<String> = gc
+            .vendored_failed
+            .iter()
+            // The reason can quote the committed ledger.
+            .map(|(purl, why)| format!("{purl} ({})", crate::ui::printable(why)))
+            .collect();
         lines.push(format!(
             "GC: failed to revert {}: {}.",
             plural(
@@ -724,7 +761,7 @@ pub(super) fn format_gc_vendored_lines(gc: &GcSummary) -> Vec<String> {
                 "vendored entry",
                 "vendored entries"
             ),
-            gc.vendored_failed.join(", "),
+            failed.join(", "),
         ));
     }
     lines
@@ -1620,7 +1657,7 @@ mod tests {
         );
         assert_eq!(
             gc.vendored_kept,
-            vec![PURL.to_string()],
+            vec![(PURL.to_string(), KeepCause::Drift)],
             "the keep must be counted — the only signal that the entry the \
              preview listed as revertable was deliberately not reclaimed"
         );
@@ -1660,6 +1697,187 @@ mod tests {
         assert!(uuid_dir.exists(), "kept artifacts must survive the sweep");
     }
 
+    /// A requirements project whose `six` patch left the manifest: the
+    /// vendored wheel line is still in `requirements.txt`, and
+    /// `requirements-prod.txt` (an export the revert does not own) installs
+    /// from the same wheel. Returns the manifest path and `.socket/`.
+    async fn seed_dropped_pypi_entry_with_an_export(
+        root: &Path,
+        purl: &str,
+        uuid: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use socket_patch_core::vendor::state::{VendorArtifact, WiringAction, WiringRecord};
+        use socket_patch_core::vendor::{VendorEntry, VendorState};
+
+        let (manifest_path, socket_dir, _) =
+            seed_manifest_with_blob(root, "pkg:npm/still-here@1.0.0", &"e".repeat(64));
+        let wheel = format!(".socket/vendor/pypi/{uuid}/six-1.16.0-py2.py3-none-any.whl");
+        let line = format!("./{wheel}");
+        std::fs::write(root.join("requirements.txt"), format!("{line}\n")).unwrap();
+        std::fs::write(root.join("requirements-prod.txt"), format!("{line}\n")).unwrap();
+        std::fs::create_dir_all(root.join(&wheel).parent().unwrap()).unwrap();
+        std::fs::write(root.join(&wheel), b"wheel").unwrap();
+        let mut state = VendorState::default();
+        state.entries.insert(
+            purl.to_string(),
+            VendorEntry {
+                flavor: Some("requirements".into()),
+                ..VendorEntry::new(
+                    "pypi".into(),
+                    purl.into(),
+                    uuid.into(),
+                    VendorArtifact {
+                        yarn_berry10c0: None,
+                        path: wheel,
+                        sha256: String::new(),
+                        size: None,
+                        platform_locked: None,
+                        file_inventory: None,
+                    },
+                    vec![WiringRecord {
+                        file: "requirements.txt".into(),
+                        kind: "requirements_line".into(),
+                        action: WiringAction::Rewritten,
+                        key: Some("requirements.txt:1".into()),
+                        original: Some(serde_json::json!(["six==1.16.0"])),
+                        new: Some(serde_json::json!(line)),
+                    }],
+                )
+            },
+        );
+        socket_patch_core::vendor::save_state(root, &state)
+            .await
+            .unwrap();
+        (manifest_path, socket_dir)
+    }
+
+    /// A revert that restored its recorded wiring but kept the wheel
+    /// because another project file still installs from it is a keep, not
+    /// a drift (#1184): the pass names that file and the way out, as
+    /// `remove` and `rollback` do, and never says the lock was re-resolved.
+    #[tokio::test]
+    async fn apply_gc_names_the_file_that_still_installs_a_kept_wheel() {
+        const PURL: &str = "pkg:pypi/six@1.16.0";
+        const UUID: &str = "11111111-1111-4111-8111-111111111111";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest_path, socket_dir) =
+            seed_dropped_pypi_entry_with_an_export(tmp.path(), PURL, UUID).await;
+        let gc = run_apply_gc(
+            &gc_common(tmp.path()),
+            &manifest_path,
+            &socket_dir,
+            &scanned(&["pkg:npm/still-here@1.0.0"]),
+            &no_vendored(),
+        )
+        .await;
+
+        // The recorded wiring was restored; the wheel and the ledger entry
+        // stay for the export that still installs from it.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("requirements.txt")).unwrap(),
+            "six==1.16.0\n"
+        );
+        assert!(tmp
+            .path()
+            .join(format!(".socket/vendor/pypi/{UUID}"))
+            .is_dir());
+        assert!(socket_patch_core::vendor::load_state(tmp.path())
+            .await
+            .unwrap()
+            .entries
+            .contains_key(PURL));
+        assert!(gc.vendored_reverted.is_empty(), "{gc:?}");
+        assert_eq!(
+            gc.vendored_kept,
+            vec![(PURL.to_string(), KeepCause::Reference)]
+        );
+
+        let lines = format_gc_vendored_lines(&gc).join("\n");
+        let json = recorded(&gc, false);
+        let said_json = json.to_string();
+        for (what, said) in [("human", &lines), ("--json", &said_json)] {
+            assert!(
+                said.contains("requirements-prod.txt"),
+                "{what}: the file that still installs from the wheel is not named:\n{said}"
+            );
+            assert!(
+                !said.contains("re-resolved") && !said.contains("drift"),
+                "{what}: nothing drifted, the recorded wiring was restored:\n{said}"
+            );
+            assert!(said.contains("point the file"), "{what}:\n{said}");
+        }
+        // The warning that names the file is the one `remove` and
+        // `rollback` raise, once, under the purl it is about.
+        let codes: Vec<&str> = json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["code"].as_str().unwrap())
+            .collect();
+        assert_eq!(codes, ["vendor_revert_residual_reference"], "{json:#}");
+        let detail = json["warnings"][0]["detail"].as_str().unwrap();
+        assert!(
+            detail.starts_with(&format!("{PURL}: kept .socket/vendor/pypi/{UUID}/: ")),
+            "{detail}"
+        );
+        assert_eq!(json["events"][0]["errorCode"], "vendor_revert_kept");
+    }
+
+    /// A revert the backend refused is reported with the backend's reason,
+    /// in both outputs: nothing else prints it.
+    #[tokio::test]
+    async fn apply_gc_says_why_a_vendored_revert_failed() {
+        const PURL: &str = "pkg:pypi/six@1.16.0";
+        const UUID: &str = "11111111-1111-4111-8111-111111111111";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest_path, socket_dir) =
+            seed_dropped_pypi_entry_with_an_export(tmp.path(), PURL, UUID).await;
+        // A ledger entry of an ecosystem with no revert backend (a
+        // hand-edited state.json).
+        let mut state = socket_patch_core::vendor::load_state(tmp.path())
+            .await
+            .unwrap();
+        state.entries.get_mut(PURL).unwrap().ecosystem = "frobnicate".into();
+        socket_patch_core::vendor::save_state(tmp.path(), &state)
+            .await
+            .unwrap();
+        let gc = run_apply_gc(
+            &gc_common(tmp.path()),
+            &manifest_path,
+            &socket_dir,
+            &scanned(&["pkg:npm/still-here@1.0.0"]),
+            &no_vendored(),
+        )
+        .await;
+
+        assert_eq!(
+            format_gc_vendored_lines(&gc),
+            [
+                "GC: failed to revert 1 vendored entry: pkg:pypi/six@1.16.0 (this build has no \
+              vendor backend for ecosystem `frobnicate`)."
+            ]
+        );
+        let json = recorded(&gc, false);
+        assert_eq!(
+            json["events"],
+            serde_json::json!([{
+                "action": "skipped", "purl": PURL, "errorCode": "vendor_revert_failed",
+                "reason": "the prune GC could not revert this vendored entry (this build has \
+                           no vendor backend for ecosystem `frobnicate`); its ledger entry \
+                           and artifacts were kept",
+                "details": {"mode": "vendored"},
+            }]),
+            "{json:#}"
+        );
+        assert!(socket_patch_core::vendor::load_state(tmp.path())
+            .await
+            .unwrap()
+            .entries
+            .contains_key(PURL));
+    }
+
     /// A pass recorded into a fresh `scan` envelope, serialized.
     fn recorded(gc: &GcSummary, preview: bool) -> serde_json::Value {
         let mut env = Envelope::new(crate::json_envelope::Command::Scan);
@@ -1678,8 +1896,14 @@ mod tests {
         const LOCK_MARKER: &str = "another socket-patch process is operating in this directory";
         let mut gc = GcSummary::default();
         gc.absorb_vendor_gc(VendorGcSummary {
-            kept: vec!["pkg:npm/b@1.0.0".into(), "pkg:npm/a@1.0.0".into()],
-            failed: vec!["pkg:npm/d@1.0.0".into(), "pkg:npm/c@1.0.0".into()],
+            kept: vec![
+                ("pkg:npm/b@1.0.0".into(), KeepCause::Reference),
+                ("pkg:npm/a@1.0.0".into(), KeepCause::Drift),
+            ],
+            failed: vec![
+                ("pkg:npm/d@1.0.0".into(), "cannot read d.lock".into()),
+                ("pkg:npm/c@1.0.0".into(), "cannot read c.lock".into()),
+            ],
             dropped_reverted: vec!["pkg:npm/e@1.0.0".into()],
             orphan_dirs: 2,
             write_failures: vec![(
@@ -1692,7 +1916,10 @@ mod tests {
         gc.pruned = vec!["pkg:npm/gone@1.0.0".into()];
         assert_eq!(
             gc.vendored_kept,
-            vec!["pkg:npm/a@1.0.0".to_string(), "pkg:npm/b@1.0.0".to_string()],
+            vec![
+                ("pkg:npm/a@1.0.0".to_string(), KeepCause::Drift),
+                ("pkg:npm/b@1.0.0".to_string(), KeepCause::Reference),
+            ],
             "absorb must sort, like every other purl list"
         );
         let json = recorded(&gc, false);
@@ -1726,6 +1953,25 @@ mod tests {
             serde_json::json!({"manifest": true})
         );
         assert_eq!(json["events"][1]["details"]["mode"], "vendored");
+        // Each keep says its own cause, and each failure the backend's.
+        assert_eq!(
+            json["events"][2]["reason"],
+            "lock entries were re-resolved since vendoring, so the artifact and the \
+             manifest/ledger entries were retained"
+        );
+        assert_eq!(
+            json["events"][3]["reason"],
+            "a project file still installs from the vendored artifact (see \
+             vendor_revert_residual_reference); the recorded wiring was restored; the \
+             artifact and the manifest/ledger entries were retained — point the file named \
+             by vendor_revert_residual_reference back at the registry release (or re-export \
+             it from the restored lock), then re-run `scan --prune`"
+        );
+        assert_eq!(
+            json["events"][4]["reason"],
+            "the prune GC could not revert this vendored entry (cannot read c.lock); its \
+             ledger entry and artifacts were kept"
+        );
         assert_eq!(json["summary"]["removed"], 2);
         assert_eq!(json["summary"]["skipped"], 4);
         assert_eq!(
@@ -1774,8 +2020,9 @@ mod tests {
 
     /// The human GC vocabulary the contract pins (`GC: skipped:
     /// <message>.`, one `GC: <detail>.` per warning, the reverted/swept
-    /// counts, the drift-keep hint, `GC: failed to revert N vendored
-    /// entry/entries: …`), rendered in order; a clean pass prints nothing.
+    /// counts, the drift-keep hint, the keep for a file that still installs
+    /// from an artifact, `GC: failed to revert N vendored entry/entries: …`
+    /// with each reason), rendered in order; a clean pass prints nothing.
     #[test]
     fn gc_vendored_lines_render_the_contract_vocabulary() {
         assert!(format_gc_vendored_lines(&GcSummary::default()).is_empty());
@@ -1788,7 +2035,10 @@ mod tests {
             ..Default::default()
         };
         gc.absorb_vendor_gc(VendorGcSummary {
-            failed: vec!["pkg:npm/d@1.0.0".into(), "pkg:npm/c@1.0.0".into()],
+            failed: vec![
+                ("pkg:npm/d@1.0.0".into(), "cannot read d.lock".into()),
+                ("pkg:npm/c@1.0.0".into(), "cannot read c.lock".into()),
+            ],
             write_failures: vec![("manifest_write_failed", "could not update manifest".into())],
             ..Default::default()
         });
@@ -1799,13 +2049,14 @@ mod tests {
                  directory."
                     .to_string(),
                 "GC: could not update manifest.".to_string(),
-                "GC: failed to revert 2 vendored entries: pkg:npm/c@1.0.0, pkg:npm/d@1.0.0."
+                "GC: failed to revert 2 vendored entries: pkg:npm/c@1.0.0 (cannot read \
+                 c.lock), pkg:npm/d@1.0.0 (cannot read d.lock)."
                     .to_string(),
             ]
         );
 
         let one = GcSummary::vendor_only(VendorGcSummary {
-            failed: vec!["pkg:npm/c@1.0.0".into()],
+            failed: vec![("pkg:npm/c@1.0.0".into(), "cannot read c.lock".into())],
             unused_reverted: vec!["pkg:npm/e@1.0.0".into()],
             orphan_dirs: 1,
             ..Default::default()
@@ -1814,12 +2065,17 @@ mod tests {
             format_gc_vendored_lines(&one),
             vec![
                 "GC: reverted 1 vendored entry; swept 1 orphan vendor dir.".to_string(),
-                "GC: failed to revert 1 vendored entry: pkg:npm/c@1.0.0.".to_string(),
+                "GC: failed to revert 1 vendored entry: pkg:npm/c@1.0.0 (cannot read c.lock)."
+                    .to_string(),
             ]
         );
 
         let many = GcSummary::vendor_only(VendorGcSummary {
-            kept: vec!["pkg:npm/a@1.0.0".into(), "pkg:npm/b@1.0.0".into()],
+            kept: vec![
+                ("pkg:npm/a@1.0.0".into(), KeepCause::Drift),
+                ("pkg:npm/b@1.0.0".into(), KeepCause::Drift),
+                ("pkg:pypi/c@1.0.0".into(), KeepCause::Reference),
+            ],
             orphan_dirs: 2,
             ..Default::default()
         });
@@ -1830,6 +2086,12 @@ mod tests {
                 "GC: kept 2 drifted vendored entries: lock entries were re-resolved since \
                  vendoring, so their artifacts and manifest/ledger entries were retained; \
                  undo the drift and re-run `vendor --revert` to finish."
+                    .to_string(),
+                "GC: kept 1 vendored entry: a project file still installs from the vendored \
+                 artifact (see vendor_revert_residual_reference); the recorded wiring was \
+                 restored; point the file named by vendor_revert_residual_reference back at \
+                 the registry release (or re-export it from the restored lock), then re-run \
+                 `scan --prune`."
                     .to_string(),
             ]
         );

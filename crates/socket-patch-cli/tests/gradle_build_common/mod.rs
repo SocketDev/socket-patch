@@ -103,21 +103,7 @@ pub fn gradle_skip(suite: &str, why: &str) {
 /// Keep a canonical root for symlinked macOS temp directories, but use the
 /// ordinary drive/UNC spelling when handing paths to Maven and Gradle.
 pub fn fixture_root(tmp: &tempfile::TempDir) -> PathBuf {
-    strip_verbatim(tmp.path().canonicalize().unwrap())
-}
-
-/// `\\?\C:\x` → `C:\x` and `\\?\UNC\h\s` → `\\h\s`; identity elsewhere.
-pub fn strip_verbatim(path: PathBuf) -> PathBuf {
-    #[cfg(windows)]
-    if let Some(text) = path.to_str() {
-        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-            return format!(r"\\{rest}").into();
-        }
-        if let Some(rest) = text.strip_prefix(r"\\?\") {
-            return rest.into();
-        }
-    }
-    path
+    crate::common::hermetic::os_spelling(tmp.path())
 }
 
 pub fn ok(out: &Output) -> bool {

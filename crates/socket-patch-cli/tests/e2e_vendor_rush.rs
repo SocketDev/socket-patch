@@ -96,9 +96,8 @@ fn has_command(cmd: &str) -> bool {
 fn rush(root: &Path, global: &Path, args: &[&str]) -> Output {
     let package = format!("@microsoft/rush@{RUSH_VERSION}");
     let mut cmd = hermetic::tool_command("npm");
-    cmd.args(["x", "-y", package.as_str(), "--"])
-        .args(args)
-        .current_dir(root);
+    cmd.args(["x", "-y", package.as_str(), "--"]).args(args);
+    hermetic::start_in(&mut cmd, root);
     hermetic::scrub_socket_vars(&mut cmd);
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Pnpm]);
     cache_env::isolate(&mut cmd);

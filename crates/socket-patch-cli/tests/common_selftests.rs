@@ -690,3 +690,48 @@ mod jvm_env_selftests {
         assert_eq!(home, Some(stand_in_home().join(".gradle")));
     }
 }
+
+// ── hermetic: where a package manager is started ───────────────────────
+mod start_in_selftests {
+    use crate::common::hermetic;
+    use std::process::Command;
+
+    /// A package manager is started in the directory under the one name
+    /// the operating system gives it: a link on the way is resolved, no
+    /// verbatim prefix is left, and spelling that name again changes nothing.
+    #[test]
+    fn a_tool_is_started_in_the_directory_as_the_os_spells_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let spelled = hermetic::os_spelling(&real);
+        assert!(
+            !spelled.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            spelled.display()
+        );
+        assert_eq!(
+            std::fs::canonicalize(&spelled).unwrap(),
+            std::fs::canonicalize(&real).unwrap()
+        );
+        assert_eq!(hermetic::os_spelling(&spelled), spelled);
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert_eq!(hermetic::os_spelling(&link), spelled);
+        }
+        let mut cmd = Command::new("pnpm");
+        hermetic::start_in(&mut cmd, &real);
+        assert_eq!(cmd.get_current_dir(), Some(spelled.as_path()));
+    }
+
+    /// A directory the test never created stops it where the tool would
+    /// have been started, not later in whatever the tool did not write.
+    #[test]
+    #[should_panic(expected = "cannot resolve the directory")]
+    fn a_directory_that_is_not_there_stops_the_test() {
+        let tmp = tempfile::tempdir().unwrap();
+        hermetic::start_in(&mut Command::new("pnpm"), &tmp.path().join("missing"));
+    }
+}

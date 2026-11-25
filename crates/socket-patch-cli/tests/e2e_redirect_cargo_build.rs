@@ -68,12 +68,11 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, hermetic, hermetic_command};
+use common::{binary, hermetic, hermetic_command, sha256_hex};
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use sha2::{Digest, Sha256};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -130,10 +129,6 @@ fn cargo(cwd: &Path, args: &[&str], cargo_home: &Path) -> Output {
         .args(args)
         .output()
         .expect("failed to run cargo")
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
 }
 
 /// The locked version of `name` in Cargo.lock (first `[[package]]` match).

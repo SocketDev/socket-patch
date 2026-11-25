@@ -26,7 +26,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, cache_env, hermetic};
 
 use std::path::Path;
 use std::process::{Output, Stdio};
@@ -35,10 +35,6 @@ use sha2::{Digest, Sha512};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
-#[path = "common/hermetic.rs"]
-mod hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 use vex_e2e_common::{
@@ -108,7 +104,8 @@ fn has_command(cmd: &str) -> bool {
 
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = hermetic::tool_command("corepack");
-    cmd.arg(pm).args(args).current_dir(cwd);
+    cmd.arg(pm).args(args);
+    hermetic::start_in(&mut cmd, cwd);
     hermetic::scrub_socket_vars(&mut cmd);
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     cmd.env_remove("npm_config_store_dir")
@@ -653,7 +650,8 @@ async fn rush_hosted_real_rush_update_install() {
         let mut full = vec!["x", "-y", rush_pkg.as_str()];
         full.extend_from_slice(args);
         let mut cmd = hermetic::tool_command("npm");
-        cmd.args(&full).current_dir(root);
+        cmd.args(&full);
+        hermetic::start_in(&mut cmd, root);
         hermetic::scrub_socket_vars(&mut cmd);
         hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
         cmd.env_remove("npm_config_store_dir")

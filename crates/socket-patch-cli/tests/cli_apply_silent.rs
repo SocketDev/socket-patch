@@ -15,14 +15,11 @@
 //! 4. `apply --check --silent` with real redirect drift exited 1 with zero
 //!    output (the OUT OF SYNC report was muted).
 //!
-//! Stderr assertions ignore the "No SOCKET_API_TOKEN set" client warning:
-//! it's printed by `get_api_client_with_overrides` in core when an ONLINE
-//! command builds its API client (offline runs suppress it) and is out of
-//! scope for `apply`'s `--silent` gating. `apply` builds that client only
-//! when it has something to download — see
-//! `apply_prints_the_public_proxy_notice_only_when_it_fetches` — so the
-//! no-manifest hook path, `--check` and a fully cached apply never print
-//! it at all.
+//! The core client's "No SOCKET_API_TOKEN set" notice is an info notice,
+//! muted under `--silent` and `--json`, and is printed only when an online
+//! `apply` builds its API client (see
+//! `apply_prints_the_public_proxy_notice_only_when_it_fetches`), so these
+//! runs' stderr never holds it.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -42,21 +39,6 @@ fn run_apply(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
     )
-}
-
-/// Non-error stderr lines: drop the unconditional core API-token warning
-/// (both its lead line and its "Got: ... Continuing anyway" continuation)
-/// and blank lines, keep everything else.
-fn stderr_chatter(stderr: &str) -> Vec<String> {
-    stderr
-        .lines()
-        .filter(|l| {
-            !l.contains("SOCKET_API_TOKEN")
-                && !l.contains("Continuing anyway")
-                && !l.trim().is_empty()
-        })
-        .map(|l| l.to_string())
-        .collect()
 }
 
 fn write_corrupt_manifest(root: &Path) {
@@ -176,9 +158,8 @@ fn apply_silent_unreadable_manifest_keeps_error_output() {
         stdout.trim().is_empty(),
         "silent human mode writes errors to stderr, not stdout: {stdout}"
     );
-    let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter.iter().any(|l| l.contains("Error")),
+        stderr.contains("Error"),
         "--silent must keep the error output (errors only, never nothing); \
          stderr was: {stderr:?}"
     );
@@ -193,11 +174,8 @@ fn apply_check_silent_unreadable_manifest_keeps_error_output() {
 
     let (code, _stdout, stderr) = run_apply(tmp.path(), &["--check", "--silent"]);
     assert_eq!(code, 1, "unreadable manifest must fail closed: {stderr}");
-    let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter
-            .iter()
-            .any(|l| l.contains("could not read the manifest")),
+        stderr.contains("could not read the manifest"),
         "--check --silent must keep the fail-closed error output; \
          stderr was: {stderr:?}"
     );
@@ -233,9 +211,8 @@ fn apply_check_silent_drift_keeps_error_output() {
         code, 1,
         "missing go-patches copy must report drift: {stderr}"
     );
-    let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter.iter().any(|l| l.contains("OUT OF SYNC")),
+        stderr.contains("OUT OF SYNC"),
         "--check --silent must keep the drift error output; stderr was: {stderr:?}"
     );
 }

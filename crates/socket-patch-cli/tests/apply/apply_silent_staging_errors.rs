@@ -24,21 +24,6 @@
 use crate::apply_fixture::{run_apply, write_sourceless_npm_patches};
 use crate::common::envelope::{codes_in, json_string, parse_json_envelope};
 
-/// Non-error stderr lines: drop the unconditional core API-token warning
-/// (both its lead line and its "Got: ... Continuing anyway" continuation)
-/// and blank lines, keep everything else.
-fn stderr_chatter(stderr: &str) -> Vec<String> {
-    stderr
-        .lines()
-        .filter(|l| {
-            !l.contains("SOCKET_API_TOKEN")
-                && !l.contains("Continuing anyway")
-                && !l.trim().is_empty()
-        })
-        .map(|l| l.to_string())
-        .collect()
-}
-
 /// A guaranteed-unreachable local endpoint: bind an ephemeral port, then
 /// release it, so every request fails fast with connection-refused.
 fn dead_endpoint() -> String {
@@ -65,9 +50,8 @@ fn apply_silent_offline_missing_source_keeps_error_output() {
         stdout.trim().is_empty(),
         "silent human mode writes errors to stderr, not stdout: {stdout}"
     );
-    let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter.iter().any(|l| l.contains("no local source")),
+        stderr.contains("no local source"),
         "--silent must keep the offline no-source error (errors only, \
          never nothing); stderr was: {stderr:?}"
     );
@@ -102,16 +86,13 @@ fn apply_silent_online_download_failure_keeps_error_output() {
         stdout.trim().is_empty(),
         "silent human mode writes errors to stderr, not stdout: {stdout}"
     );
-    let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter
-            .iter()
-            .any(|l| l.contains("could not be downloaded")),
+        stderr.contains("could not be downloaded"),
         "--silent must keep the download-failure error (errors only, \
          never nothing); stderr was: {stderr:?}"
     );
     assert!(
-        chatter.iter().any(|l| l.contains("Failed to download")),
+        stderr.contains("Failed to download"),
         "--silent must keep the per-blob failure reasons with the error; \
          stderr was: {stderr:?}"
     );
@@ -155,9 +136,8 @@ fn apply_json_offline_missing_source_keeps_stderr_clean() {
         0,
         "the bail must not stage anything into .socket/blobs"
     );
-    let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter.is_empty(),
+        stderr.is_empty(),
         "--json suppresses the staging diagnostics on stderr (the \
          envelope is the machine channel); stderr was: {stderr:?}"
     );

@@ -22,25 +22,10 @@ use crate::common::envelope::{find_event, parse_json_envelope};
 use crate::common::hermetic;
 use crate::npm_fixture::{dead_endpoint, patch_record, PURL, REG_RESOLVED};
 
-/// Non-error stderr lines: drop the unconditional core API-token warning
-/// (both its lead line and its "Got: ... Continuing anyway" continuation)
-/// and blank lines, keep everything else.
-fn stderr_chatter(stderr: &str) -> Vec<String> {
+/// Whether some stderr line is the per-patch error for [`PURL`].
+fn has_patch_error_line(stderr: &str) -> bool {
     stderr
         .lines()
-        .filter(|l| {
-            !l.contains("SOCKET_API_TOKEN")
-                && !l.contains("Continuing anyway")
-                && !l.trim().is_empty()
-        })
-        .map(|l| l.to_string())
-        .collect()
-}
-
-/// Whether some stderr line is the per-patch error for [`PURL`].
-fn has_patch_error_line(chatter: &[String]) -> bool {
-    chatter
-        .iter()
         .any(|l| l.starts_with("Error:") && l.contains(PURL))
 }
 
@@ -132,7 +117,7 @@ fn vendor_silent_offline_missing_source_keeps_error_output() {
         "silent human mode writes errors to stderr, not stdout: {stdout}"
     );
     assert!(
-        has_patch_error_line(&stderr_chatter(&stderr)),
+        has_patch_error_line(&stderr),
         "--silent must keep the per-patch error line (errors only, never \
          nothing); stderr was: {stderr:?}"
     );
@@ -152,7 +137,7 @@ fn vendor_silent_online_fetch_failure_keeps_error_output() {
         "silent human mode writes errors to stderr, not stdout: {stdout}"
     );
     assert!(
-        has_patch_error_line(&stderr_chatter(&stderr)),
+        has_patch_error_line(&stderr),
         "--silent must keep the per-patch error line (errors only, never \
          nothing); stderr was: {stderr:?}"
     );
@@ -171,9 +156,8 @@ fn vendor_json_online_fetch_failure_keeps_stderr_clean() {
     let v = parse_json_envelope(&stdout);
     let failed = find_event(&v, "failed", Some("apply_failed"));
     assert_eq!(failed["purl"], PURL, "{v}");
-    let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter.is_empty(),
+        stderr.is_empty(),
         "--json keeps the error lines off stderr (the envelope is the \
          machine channel); stderr was: {stderr:?}"
     );
