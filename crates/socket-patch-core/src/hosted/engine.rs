@@ -13968,7 +13968,16 @@ snapshots:
             "\"pnpm\", dev_dependency = True)\npnpm.pnpm(",
         );
         assert!(dev.contains("dev_dependency = True"), "{dev}");
+        // It is stated by a tag that may not run as it is written.
+        let aside = rules_js_hub(ROUTED_HUBS[1]).replace("\npnpm.pnpm(", "\nON and pnpm.pnpm(");
+        assert!(aside.contains("\nON and pnpm.pnpm("), "{aside}");
         let hubs = [
+            (
+                aside,
+                "the pnpm it runs for `update_pnpm_lock` is not shown to be the one the root \
+                 module states (pnpm 11.28.10): a tag that states a release for it is not a \
+                 statement of its own, so it may not run as it is written",
+            ),
             (
                 dev,
                 "the pnpm it runs for `update_pnpm_lock` is not shown to be the one the root \

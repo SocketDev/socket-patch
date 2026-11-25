@@ -2583,6 +2583,13 @@ hub off the route:
   it resolves again. The pin is not held to any of this: for it such a release counts as
   it did, and it builds with either pnpm, because its setting is in the file the hub
   lists.
+- A call that Bazel may not run as it is written: the hub's own, the `use_repo` that takes
+  its pnpm, or a `pnpm.pnpm` tag that states the release, where the call is no statement of
+  its own (behind a condition, in a comprehension), and such a tag whose `name` is not
+  written out in a plain string, which may make another repository ("… a tag that states a
+  release for it is not a statement of its own, so it may not run as it is written …").
+  The hub can then run the pnpm that rules_js picks. The pin reads each of these calls as
+  it is written, as before.
 
 The route is taken only where it is certain which hubs read the lock, so what the reader
 could not see counts as a hub that may read it in another shape, also beside a call in one
