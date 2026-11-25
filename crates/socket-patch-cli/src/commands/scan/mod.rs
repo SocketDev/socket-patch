@@ -596,6 +596,8 @@ async fn discover_selected(
     let mut offers = select_accessible(all_search_results, can_access_paid_patches, policy);
     // `Some` for a run that settles the builds of a gem together.
     let mut gem_builds = gem_fixes.is_some().then(HashMap::new);
+    // Said when the gems of such a run could not be settled.
+    let mut unsettled: Option<String> = None;
     let mut references = HashMap::new();
     if let Some(scope) = gem_fixes {
         let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(scope.cwd);
@@ -603,20 +605,42 @@ async fn discover_selected(
         lock.narrow(&mut offers);
         let uuids = lock.reference_uuids(&offers);
         if !uuids.is_empty() {
-            // A failed lookup settles nothing here: the selection stays as
-            // ranked, and the mode's own reference lookup reports it.
-            if let Ok(found) = api_client.fetch_registry_references(&uuids).await {
-                gem_builds = Some(lock.choose(&mut offers, &found, scope.recorded));
-                references = found;
-                references.retain(|uuid, _| uuids.contains(uuid));
+            // The fix of such a gem is settled here, once, and the writers
+            // follow it. A failed lookup settles nothing, and a selection
+            // ranked purl by purl is no decision to write from: the gem is
+            // left as it is, and the run says so.
+            match api_client.fetch_registry_references(&uuids).await {
+                Ok(found) => {
+                    gem_builds = Some(lock.choose(&mut offers, &found, scope.recorded));
+                    references = found;
+                    references.retain(|uuid, _| uuids.contains(uuid));
+                }
+                Err(error) => {
+                    let left = lock.unsettle(&mut offers);
+                    if !left.is_empty() {
+                        unsettled = Some(socket_patch_core::hosted::gem_fixes::unsettled_detail(
+                            &left,
+                            &error.to_string(),
+                        ));
+                    }
+                }
             }
         }
+    }
+    if let (Some(detail), true, true) = (&unsettled, warn, json_warnings.is_none()) {
+        eprintln!("Warning: {detail}");
     }
     if let Some(env) = json_warnings {
         for (purl, e) in &failures {
             env.warn(
                 PATCH_DETAILS_FAILED,
                 format!("could not fetch details for {purl}: {e}"),
+            );
+        }
+        if let Some(detail) = &unsettled {
+            env.warn(
+                socket_patch_core::hosted::gem_fixes::GEM_FIX_UNSETTLED,
+                detail.as_str(),
             );
         }
         policy.fold_into_envelope(env);

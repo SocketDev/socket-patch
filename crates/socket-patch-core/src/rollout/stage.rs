@@ -85,6 +85,7 @@ pub fn offers_from_results(results: &[PatchSearchResult], can_access_paid: bool)
         unfiltered,
         selected,
         withheld: BTreeSet::new(),
+        refused: BTreeSet::new(),
     }
 }
 
@@ -213,8 +214,7 @@ pub fn classify(offers: &Offers, recorded: &RecordedIndex, project: &str) -> Vec
 /// (`pkg:gem/<name>@<version>?platform=<platform>`, not `ruby`).
 fn is_platform_gem_purl(purl: &str) -> bool {
     Ecosystem::from_purl(purl) == Some(Ecosystem::Gem)
-        && crate::utils::purl::purl_qualifier(purl, "platform")
-            .is_some_and(|platform| !platform.is_empty() && !platform.eq_ignore_ascii_case("ruby"))
+        && crate::utils::purl::gem_platform_qualifier(purl).is_some()
 }
 
 /// [`classify`] for a run that changes what Bundler installs (hosted and
@@ -223,17 +223,11 @@ fn is_platform_gem_purl(purl: &str) -> bool {
 /// [`GemLock::choose`](crate::hosted::gem_fixes::GemLock::choose)). Each
 /// platform gem of a fix has a patch of its own, and such a project records
 /// one uuid for the gem (the registry its lock names, the directory it is
-/// vendored under), so the rows of one gem's builds are classified
-/// together.
-///
-/// Where that decision has no answer for a row (the patch API could not
-/// say which fix a patch belongs to), a platform gem's row is ALREADY when
-/// the only recorded patch is one of another build of the gem and is not
-/// among the row's own offers: that record is no earlier patch of this
-/// build, so it is not what the selection would replace.
-///
-/// `None`: a run that settles nothing (agent mode, a report-only scan).
-/// Every row is then classified by its own purl, as [`classify`] does.
+/// vendored under), so only the fix a patch belongs to says whether a
+/// build's row is in place or a move to another fix: a row decided there
+/// takes that class. Every other row, and every row of a run that settles
+/// nothing (`None`: agent mode, a report-only scan), is classified by its
+/// own purl, as [`classify`] does.
 pub fn classify_with(
     offers: &Offers,
     recorded: &RecordedIndex,
@@ -250,17 +244,11 @@ pub fn classify_with(
                 .get(purl)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let another_builds = || {
-                gem_builds.is_some()
-                    && is_platform_gem_purl(purl)
-                    && recorded.recorded_for_a_twin(purl)
-                    && !offered.iter().any(|p| uuids.contains(&p.uuid))
-            };
             let (class, writer) = if let Some(class) = gem_builds.and_then(|g| g.get(purl)) {
                 (class.clone(), selected.clone())
             } else if uuids.is_empty() {
                 (Recorded::None, selected.clone())
-            } else if uuids.contains(&selected.uuid) || another_builds() {
+            } else if uuids.contains(&selected.uuid) {
                 (Recorded::Same, selected.clone())
             } else {
                 let old = uuids[0].clone();
@@ -335,21 +323,30 @@ pub fn lookup_incomplete(
 ///
 /// [`HostedPin::discover`]: crate::patch::redirect::upstream::HostedPin::discover
 /// [`dep_origins`]: crate::patch::redirect::upstream::dep_origins
-pub fn mark_pinned(rows: &mut [Row], pins: &[crate::patch::redirect::upstream::HostedPin]) {
+///
+/// `gem_fixes`: for the gem patches the run holds a reference of, the fix
+/// each belongs to (the uuid of the patch it was built from). The pin of a
+/// gem locked as platform builds names one patch for every build, so a
+/// platform build's row is in place exactly when its patch is of the
+/// pinned patch's fix, and a move to another fix otherwise.
+pub fn mark_pinned(
+    rows: &mut [Row],
+    pins: &[crate::patch::redirect::upstream::HostedPin],
+    gem_fixes: &HashMap<String, String>,
+) {
     let pairs: Vec<(String, String)> = pins
         .iter()
         .map(|p| (p.purl.clone(), p.uuid.to_ascii_lowercase()))
         .collect();
     let index = RecordedIndex::new(None, &pairs);
+    let fix_of = |uuid: &str| gem_fixes.get(uuid).map_or(uuid, String::as_str).to_string();
     for row in rows.iter_mut().filter(|r| r.candidate.recorded.is_new()) {
         let uuids = index.uuids(&row.candidate.purl);
         let selected = row.candidate.uuid.to_ascii_lowercase();
-        // The pin of a gem names one patch for every build of it (the
-        // fix's source): the row of a platform build is not an upgrade
-        // from that patch.
-        let another_builds = is_platform_gem_purl(&row.candidate.purl)
-            && index.recorded_for_a_twin(&row.candidate.purl);
-        if uuids.contains(&selected) || (another_builds && !uuids.is_empty()) {
+        let same_fix = is_platform_gem_purl(&row.candidate.purl)
+            && index.recorded_for_a_twin(&row.candidate.purl)
+            && uuids.iter().any(|pin| fix_of(pin) == fix_of(&selected));
+        if uuids.contains(&selected) || same_fix {
             row.candidate.recorded = Recorded::Same;
         } else if let Some(old) = uuids.first() {
             row.candidate.recorded = Recorded::Superseded {
@@ -671,14 +668,14 @@ mod tests {
     }
 
     /// Each platform gem of a fix has a patch of its own, and a hosted or
-    /// vendored project records one uuid for the gem. A run that settles
-    /// the builds of a gem together classifies a platform gem's row by
-    /// what was settled; where nothing was, the record of another build is
-    /// no earlier patch of this one. A run that settles nothing (agent
-    /// mode, a report-only scan) classifies every row by its own purl, as
-    /// it always did.
+    /// vendored project records one uuid for the gem. Only the fix a patch
+    /// belongs to says whether a build's row is in place: a run that
+    /// settles the builds of a gem classifies the row by what was settled,
+    /// and every other row, like every row of a run that settles nothing,
+    /// by its own purl. A row is never called in place only because some
+    /// other build of the gem has a patch recorded.
     #[test]
-    fn a_platform_gems_row_is_no_upgrade_from_another_builds_patch() {
+    fn a_platform_gems_row_is_classified_by_its_fix_or_by_its_own_purl() {
         let ruby = "pkg:gem/nokogiri@1.18.10?platform=ruby";
         let darwin = "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin";
         let stored = manifest(&[(ruby, "source")]);
@@ -694,41 +691,63 @@ mod tests {
             let row = rows.iter().find(|row| row.candidate.purl == purl);
             row.expect("row").candidate.recorded.clone()
         };
-        // Settling nothing: the row is compared with the gem's one record.
-        let rows = classify(&offers, &recorded, "");
-        assert_eq!(class_of(&rows, ruby), Recorded::Same);
-        assert_eq!(
-            class_of(&rows, darwin),
-            Recorded::Superseded {
-                old_uuid: "source".to_string()
-            }
-        );
-        // Settling, with no answer for the gem: already in place.
-        let rows = classify_with(&offers, &recorded, Some(&HashMap::new()), "");
-        assert_eq!(class_of(&rows, ruby), Recorded::Same);
-        assert_eq!(class_of(&rows, darwin), Recorded::Same);
+        let moved = Recorded::Superseded {
+            old_uuid: "source".to_string(),
+        };
+        // Nothing settled for the row: compared with the gem's one record.
+        for settled in [None, Some(HashMap::new())] {
+            let rows = classify_with(&offers, &recorded, settled.as_ref(), "");
+            assert_eq!(class_of(&rows, ruby), Recorded::Same);
+            assert_eq!(class_of(&rows, darwin), moved);
+        }
         // Settled: what was decided for the build.
-        let settled = HashMap::from([(
-            darwin.to_string(),
-            Recorded::Superseded {
-                old_uuid: "older".to_string(),
-            },
-        )]);
+        let settled = HashMap::from([(darwin.to_string(), Recorded::Same)]);
         let rows = classify_with(&offers, &recorded, Some(&settled), "");
+        assert_eq!(class_of(&rows, darwin), Recorded::Same);
+    }
+
+    /// A pin found by the second discovery pass names one patch for every
+    /// build of a gem: a platform build's row is in place when its patch is
+    /// of the pinned patch's fix, and a move to another fix otherwise.
+    #[test]
+    fn a_discovered_gem_pin_marks_a_build_by_its_fix() {
+        let darwin = "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin";
+        let offers = offers_from_results(
+            &[offer(
+                darwin,
+                "darwin-of-a",
+                "2026-01-02T00:00:00Z",
+                &["high"],
+            )],
+            true,
+        );
+        let pin = |uuid: &str| HostedPin {
+            purl: "pkg:gem/nokogiri@1.18.10".into(),
+            uuid: uuid.into(),
+            files: vec!["Gemfile.lock".into()],
+        };
+        let fixes = HashMap::from([("darwin-of-a".to_string(), "source-a".to_string())]);
+        let marked = |pinned: &str, fixes: &HashMap<String, String>| {
+            let mut rows = classify(&offers, &RecordedIndex::default(), "");
+            mark_pinned(&mut rows, &[pin(pinned)], fixes);
+            rows[0].candidate.recorded.clone()
+        };
+        // Pinned to the source patch of the build's own fix: in place.
+        assert_eq!(marked("source-a", &fixes), Recorded::Same);
+        // Pinned to the build's own patch (a build's registry): in place.
+        assert_eq!(marked("darwin-of-a", &fixes), Recorded::Same);
+        // Pinned to another fix: a move, named as one.
         assert_eq!(
-            class_of(&rows, darwin),
+            marked("source-b", &fixes),
             Recorded::Superseded {
-                old_uuid: "older".to_string()
+                old_uuid: "source-b".to_string()
             }
         );
-        // The build's own record is compared as any package's.
-        let stored = manifest(&[(darwin, "earlier")]);
-        let recorded = RecordedIndex::new(Some(&stored), &[]);
-        let rows = classify_with(&offers, &recorded, Some(&HashMap::new()), "");
+        // The fix is not known: never called in place on a guess.
         assert_eq!(
-            class_of(&rows, darwin),
+            marked("source-a", &HashMap::new()),
             Recorded::Superseded {
-                old_uuid: "earlier".to_string()
+                old_uuid: "source-a".to_string()
             }
         );
     }
@@ -800,6 +819,7 @@ mod tests {
             )]),
             selected: BTreeMap::from([(purl.to_string(), selected.clone())]),
             withheld: BTreeSet::new(),
+            refused: BTreeSet::new(),
         };
         let recorded = manifest(&[(purl, "old")]);
         let index = RecordedIndex::new(Some(&recorded), &[]);
@@ -885,6 +905,7 @@ mod tests {
                 uuid: "aaaaaaaa-1111-4111-8111-00000000000a".into(),
                 files: vec!["package-lock.json".into()],
             }],
+            &HashMap::new(),
         );
         assert_eq!(rows[0].candidate.recorded, Recorded::Same);
         assert_eq!(rows[1].candidate.recorded, Recorded::None);
@@ -910,6 +931,7 @@ mod tests {
                 uuid: "AAAAAAAA-2222-4222-8222-00000000000A".into(),
                 files: vec!["package-lock.json".into()],
             }],
+            &HashMap::new(),
         );
         assert_eq!(
             rows[0].candidate.recorded,

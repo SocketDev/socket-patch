@@ -127,7 +127,7 @@ use crate::patch::path_safety::is_safe_single_segment;
 use crate::patch::redirect::gem_line_tail_blocks_edit;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::line_endings::{self, to_lf, LineEndings};
-use crate::utils::purl::{build_gem_purl, parse_gem_purl, purl_qualifier};
+use crate::utils::purl::{build_gem_purl, parse_gem_purl};
 
 use super::common::{
     already_patched_result, cleanup_failed_stage, copy_matches_after_hashes, done, failed_result,
@@ -558,8 +558,8 @@ async fn gem_prelude(
     // the platform patches of a gem the lock pins as platform gems, which
     // one of them leads where the ruby gem's patch is not available), and
     // never by itself.
-    if let Some(platform) = purl_qualifier(purl, "platform") {
-        if !platform.is_empty() && !platform.eq_ignore_ascii_case("ruby") && builds.is_empty() {
+    if let Some(platform) = crate::utils::purl::gem_platform_qualifier(purl) {
+        if builds.is_empty() {
             return Err(refused(
                 "platform_gem_unsupported",
                 format!(

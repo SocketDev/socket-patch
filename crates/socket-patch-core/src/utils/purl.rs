@@ -118,6 +118,16 @@ pub fn purl_qualifier<'a>(purl: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+/// The platform of the platform gem a purl's `platform` qualifier names:
+/// `Some("arm64-darwin")` for `pkg:gem/nokogiri@1.18.10?platform=arm64-darwin`,
+/// `None` for the ruby-platform gem (`?platform=ruby`, an empty value, or
+/// no qualifier). The one reading of "is this a platform gem's purl"; it
+/// does not check the purl's type.
+pub fn gem_platform_qualifier(purl: &str) -> Option<&str> {
+    purl_qualifier(purl, "platform")
+        .filter(|platform| !platform.is_empty() && !platform.eq_ignore_ascii_case("ruby"))
+}
+
 /// The display spelling of a purl's release: `?qualifiers` and `#subpath`
 /// stripped, then percent-decoded per component ([`normalize_purl`]).
 ///

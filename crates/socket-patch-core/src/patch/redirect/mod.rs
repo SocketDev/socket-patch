@@ -8924,7 +8924,7 @@ fn gem_index_documents(
 
 /// The sha256 of the `.gem` the patch `dep` serves: its registry override's
 /// checksum, else its artifact's.
-fn gem_patch_sha256(dep: &DepOverride) -> Option<String> {
+pub fn gem_patch_sha256(dep: &DepOverride) -> Option<String> {
     registry_override_of_kind(dep, "rubygems-compact-index")
         .and_then(|ov| ov.identifiers.gem_checksum_sha256.clone())
         .or_else(|| dep.integrity.sha256.clone())

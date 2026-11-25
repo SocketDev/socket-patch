@@ -194,6 +194,14 @@ pub fn cmp_batch_infos(a: &BatchPatchInfo, b: &BatchPatchInfo) -> Ordering {
     rank_batch_info(a).cmp(&rank_batch_info(b))
 }
 
+/// Order a patch selection the way every other collection in the JSON
+/// envelope is ordered: by purl, uuid breaking a tie (a release-variant
+/// base can keep several qualified purls, and `--all-releases` can keep
+/// several patches for one purl).
+pub fn sort_by_purl(patches: &mut [PatchSearchResult]) {
+    patches.sort_by(|a, b| a.purl.cmp(&b.purl).then_with(|| a.uuid.cmp(&b.uuid)));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

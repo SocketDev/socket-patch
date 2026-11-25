@@ -137,6 +137,41 @@ pub fn unconfirmed_candidates(
         .collect()
 }
 
+/// The fix each gem patch among `candidates` belongs to, by patch uuid: the
+/// uuid of the patch it was built from, or its own
+/// ([`gem_family`](crate::patch::redirect::gem_family)).
+pub fn gem_fixes_of(candidates: &[Candidate]) -> HashMap<String, String> {
+    candidates
+        .iter()
+        .filter(|c| c.dep.ecosystem == "gem")
+        .map(|c| {
+            let fix = crate::patch::redirect::gem_family(&c.dep);
+            (
+                c.dep.patch_uuid.to_ascii_lowercase(),
+                fix.to_ascii_lowercase(),
+            )
+        })
+        .collect()
+}
+
+/// Take the candidates a rollout deferred out of `candidates`, each fix
+/// whole. A gem fix has one patch per platform gem, and its source patch
+/// only lends the registry: it has no row of its own to defer, and left
+/// behind alone it would be judged as a fix with no patch for the locked
+/// builds. So every patch of a gem version goes with a deferred one.
+pub fn drop_deferred(candidates: &mut Vec<Candidate>, deferred: impl Fn(&Candidate) -> bool) {
+    let gems: HashSet<(String, String)> = candidates
+        .iter()
+        .filter(|c| c.dep.ecosystem == "gem" && deferred(c))
+        .map(|c| (c.dep.name.clone(), c.dep.version.clone()))
+        .collect();
+    candidates.retain(|c| {
+        let of_deferred_gem =
+            c.dep.ecosystem == "gem" && gems.contains(&(c.dep.name.clone(), c.dep.version.clone()));
+        !deferred(c) && !of_deferred_gem
+    });
+}
+
 /// The uuids of the candidates that have nothing in the project to pin,
 /// which a run neither confirms nor reports as left unpinned:
 ///
@@ -479,9 +514,8 @@ fn candidate_of(
     // reference's to say, never the override's own fields.
     let is_gem = dep.ecosystem == "gem";
     if let Some(ov) = dep.registry_override.as_mut() {
-        let platform = crate::utils::purl::purl_qualifier(purl, "platform")
-            .or_else(|| crate::utils::purl::purl_qualifier(sel_purl, "platform"))
-            .filter(|platform| !platform.is_empty() && !platform.eq_ignore_ascii_case("ruby"));
+        let platform = crate::utils::purl::gem_platform_qualifier(purl)
+            .or_else(|| crate::utils::purl::gem_platform_qualifier(sel_purl));
         ov.identifiers.gem_platform = platform.filter(|_| is_gem).map(str::to_string);
         ov.identifiers.gem_rebuilt_from_uuid = reference
             .rebuilt_from_uuid
@@ -13214,6 +13248,45 @@ snapshots:
         ov.identifiers.gem_platform = Some(platform.to_string());
         ov.identifiers.gem_rebuilt_from_uuid = Some(FIXTURE_UUID.to_string());
         candidate
+    }
+
+    /// A rollout that defers the builds of a gem defers its fix whole: the
+    /// source patch has no row to defer, and alone it would be rewritten
+    /// as a fix with no patch for the locked builds. Other candidates stay.
+    #[test]
+    fn a_deferred_gem_fix_leaves_the_candidates_whole() {
+        let arm = "77777777-7777-4777-8777-0000000000aa";
+        let linux = "77777777-7777-4777-8777-0000000000bb";
+        let mut other = gem_candidate();
+        other.purl = "pkg:gem/rack@3.1.8".to_string();
+        other.dep.name = "rack".to_string();
+        other.dep.version = "3.1.8".to_string();
+        other.dep.patch_uuid = "77777777-7777-4777-8777-0000000000cc".to_string();
+        let all = || {
+            vec![
+                gem_candidate(),
+                gem_build_candidate("arm64-darwin", arm, "a"),
+                gem_build_candidate("x86_64-linux-gnu", linux, "b"),
+                other.clone(),
+            ]
+        };
+        let left = |deferred: &[&str]| -> Vec<String> {
+            let mut candidates = all();
+            drop_deferred(&mut candidates, |c| {
+                deferred.contains(&c.dep.patch_uuid.as_str())
+            });
+            candidates.into_iter().map(|c| c.dep.patch_uuid).collect()
+        };
+        // The builds are deferred: the source goes with them.
+        assert_eq!(left(&[arm, linux]), [other.dep.patch_uuid.as_str()]);
+        // One deferred build takes the fix: no half of it is rewritten.
+        assert_eq!(left(&[linux]), [other.dep.patch_uuid.as_str()]);
+        // Another package's deferral leaves the gem alone.
+        assert_eq!(
+            left(&[other.dep.patch_uuid.as_str()]),
+            [FIXTURE_UUID, arm, linux]
+        );
+        assert_eq!(left(&[]).len(), 4);
     }
 
     const GEM_ARM_UUID: &str = "77777777-7777-4777-8777-77777777777a";

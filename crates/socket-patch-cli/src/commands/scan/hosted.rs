@@ -1170,14 +1170,7 @@ fn pipenv_probe_certain<'a>(
     socket_patch_core::patch::redirect::pipenv_lock_targets(files, &kept)
 }
 
-/// The sha256 of the `.gem` the gem patch `o` serves: its registry
-/// override's checksum, else its artifact's.
-fn gem_patch_sha256(o: &DepOverride) -> Option<String> {
-    o.registry_override
-        .as_ref()
-        .and_then(|ro| ro.identifiers.gem_checksum_sha256.clone())
-        .or_else(|| o.integrity.sha256.clone())
-}
+use socket_patch_core::patch::redirect::gem_patch_sha256;
 
 /// The `(name, version)` key the gem artifact-sha map uses — derived from
 /// the purl so overrides (which carry no purl) and confirmed purls meet on
@@ -1669,7 +1662,11 @@ async fn run_redirect_selected_untracked(
                         view, &origins,
                     )
                     .await;
-                super::rollout::mark_pinned(&mut gate.rows, &pins);
+                super::rollout::mark_pinned(
+                    &mut gate.rows,
+                    &pins,
+                    &engine::gem_fixes_of(&candidates),
+                );
             }
         }
     }
@@ -2208,7 +2205,9 @@ async fn run_redirect_selected_untracked(
         let deferred = gate.stage.deferred_keys();
         skipped.extend(gate.stage.deferred_skips());
         let before = candidates.len();
-        candidates.retain(|c| !deferred.contains(&(sel_purl(c), c.dep.patch_uuid.clone())));
+        engine::drop_deferred(&mut candidates, |c| {
+            deferred.contains(&(sel_purl(c), c.dep.patch_uuid.clone()))
+        });
         if candidates.len() != before {
             done = crate::ui::busy(
                 common,

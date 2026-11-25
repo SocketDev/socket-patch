@@ -1914,6 +1914,33 @@ pub async fn run(args: GetArgs) -> i32 {
         Err(code) => return code,
     };
 
+    // Hosted and vendored mode change what Bundler installs: a gem the lock
+    // names as platform builds takes one fix for every locked build.
+    // Settled before anything is said of the selection, so that what is
+    // printed as chosen, and what is reported as waiting for a merged
+    // patch, is the selection the run uses.
+    let selected = if mode == super::scan::ScanMode::Agent {
+        selected
+    } else {
+        let (settled, unsettled) = socket_patch_core::hosted::gem_fixes::settle(
+            &socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&args.common.cwd),
+            &api_client,
+            &accessible,
+            selected,
+        )
+        .await;
+        if let Some(detail) = unsettled {
+            if !quiet {
+                eprintln!("Warning: {detail}");
+            }
+            narrow_warnings.push((
+                socket_patch_core::hosted::gem_fixes::GEM_FIX_UNSETTLED.to_string(),
+                detail,
+            ));
+        }
+        settled
+    };
+
     // The candidates can hold several patches per package and the pick
     // was made without the user (paid auto-pick, `--yes`, non-TTY): say
     // which will be installed. A menu pick is not echoed back, and paid
@@ -1946,20 +1973,6 @@ pub async fn run(args: GetArgs) -> i32 {
             merge_pending_detail(purl, ids),
         )
     }));
-
-    // Hosted and vendored mode change what Bundler installs: a gem the lock
-    // names as platform builds takes one fix for every locked build.
-    let selected = if mode == super::scan::ScanMode::Agent {
-        selected
-    } else {
-        socket_patch_core::hosted::gem_fixes::settle(
-            &socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&args.common.cwd),
-            &api_client,
-            &accessible,
-            selected,
-        )
-        .await
-    };
 
     // Agent wet runs and vendored runs narrow variants in their download
     // engines. Hosted runs and agent previews need the same narrowing here.

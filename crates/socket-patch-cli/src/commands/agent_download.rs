@@ -669,13 +669,7 @@ pub(crate) async fn filter_to_installed_releases(
     (kept, warnings, views)
 }
 
-/// Order a patch selection the way every other collection in the JSON
-/// envelope is ordered: by purl, uuid breaking a tie (a release-variant
-/// base can keep several qualified purls, and `--all-releases` can keep
-/// several patches for one purl).
-pub(crate) fn sort_by_purl(patches: &mut [PatchSearchResult]) {
-    patches.sort_by(|a, b| a.purl.cmp(&b.purl).then_with(|| a.uuid.cmp(&b.uuid)));
-}
+pub(crate) use socket_patch_core::api::ranking::sort_by_purl;
 
 /// Which state store the shared fetch loop classifies each selected patch
 /// against — the one non-presentational difference between the vendored

@@ -46,8 +46,28 @@ use crate::api::types::{PackageVendorResult, PatchSearchResult};
 use crate::policy::Offers;
 use crate::rollout::stage::RecordedIndex;
 use crate::rollout::Recorded;
-use crate::utils::purl::{purl_parts, purl_qualifier};
+use crate::utils::purl::{gem_platform_qualifier, purl_parts};
 use crate::vendor::lock_inventory::ProjectView;
+
+/// Warning code of a run that left a gem locked as platform builds out of
+/// its selection because it could not read which fix the gem's patches
+/// belong to ([`GemLock::unsettle`]).
+pub const GEM_FIX_UNSETTLED: &str = "gem_fix_unsettled";
+
+/// The detail of [`GEM_FIX_UNSETTLED`] for the gems `left` out (`name
+/// version` each), with `why` the lookup failed.
+pub fn unsettled_detail(left: &[String], why: &str) -> String {
+    let (verb, pronoun) = match left.len() {
+        1 => ("is", "it"),
+        _ => ("are", "they"),
+    };
+    format!(
+        "could not read which fix the platform patches of {} belong to ({why}); a gem locked \
+         as platform builds takes every build from one fix, so {pronoun} {verb} left as \
+         {pronoun} {verb} by this run. Run it again",
+        left.join(", ")
+    )
+}
 
 /// The builds of one gem version a Bundler lock names.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -90,9 +110,7 @@ fn gem_of(purl: &str) -> Option<((String, String), Option<String>)> {
     if ecosystem != "gem" {
         return None;
     }
-    let platform = purl_qualifier(purl, "platform")
-        .filter(|platform| !platform.is_empty() && !platform.eq_ignore_ascii_case("ruby"))
-        .map(str::to_string);
+    let platform = gem_platform_qualifier(purl).map(str::to_string);
     Some(((name, version), platform))
 }
 
@@ -208,19 +226,23 @@ impl GemLock {
     }
 
     /// The offers a run may take for each patch purl of `offers`: all but
-    /// the ones a selection filter withholds, best first.
+    /// the ones a policy filter does not admit (withheld, or below the
+    /// severity floor), best first, with the filter's own winner for the
+    /// purl ahead of the rest (it may prefer a smaller patch over the
+    /// top-ranked one).
     fn admitted<'o>(offers: &'o Offers, purl: &str) -> Vec<&'o PatchSearchResult> {
-        offers
-            .unfiltered
-            .get(purl)
-            .into_iter()
-            .flatten()
-            .filter(|offer| {
-                !offers
-                    .withheld
-                    .contains(&(purl.to_string(), offer.uuid.clone()))
-            })
-            .collect()
+        let refused = |offer: &&PatchSearchResult| {
+            let key = (purl.to_string(), offer.uuid.clone());
+            offers.withheld.contains(&key) || offers.refused.contains(&key)
+        };
+        let ranked = offers.unfiltered.get(purl).into_iter().flatten();
+        let mut admitted: Vec<&PatchSearchResult> = ranked.filter(|o| !refused(o)).collect();
+        let winner = offers.selected.get(purl);
+        if let Some(at) = winner.and_then(|w| admitted.iter().position(|o| o.uuid == w.uuid)) {
+            let winner = admitted.remove(at);
+            admitted.insert(0, winner);
+        }
+        admitted
     }
 
     /// The gems of `offers` the lock names as platform builds, each with
@@ -244,6 +266,36 @@ impl GemLock {
             }
         }
         gems
+    }
+
+    /// Leave every gem the lock names as platform builds out of the
+    /// selection: for a run that could not read which fix their patches
+    /// belong to. The fix is settled once, by [`Self::choose`], and the
+    /// writers follow it; a selection ranked purl by purl can take a
+    /// build's patch from one fix and another's from the next, or move a
+    /// project to a fix it would not have been moved to, so such a gem is
+    /// left as it is until a run can settle it. Returns each gem left
+    /// out, as `name version`.
+    pub fn unsettle(&self, offers: &mut Offers) -> Vec<String> {
+        let gems: Vec<((String, String), Vec<String>)> = self
+            .platform_locked(offers)
+            .into_iter()
+            .map(|(gem, purls)| {
+                let purls = purls.into_iter().map(|(_, purl)| purl.to_string());
+                (gem, purls.collect())
+            })
+            .collect();
+        let mut left = Vec::new();
+        for ((name, version), purls) in gems {
+            let mut selected = false;
+            for purl in purls {
+                selected |= offers.selected.remove(&purl).is_some();
+            }
+            if selected {
+                left.push(format!("{name} {version}"));
+            }
+        }
+        left
     }
 
     /// The uuids whose package references [`Self::choose`] reads (module
@@ -270,12 +322,13 @@ impl GemLock {
     /// builds (module docs, step 3), by the package `references` of
     /// [`Self::reference_uuids`]: `offers.selected` then holds that fix's
     /// patch for each locked build (and its source patch for the ruby gem
-    /// when that one is on offer). Returns how the row of each locked
-    /// build is classified, by patch purl, for a gem the project already
-    /// has a fix recorded for (`recorded`): [`Recorded::Same`] when the
-    /// chosen fix is that one, else an upgrade from it. A gem with nothing
-    /// recorded, or with no fix that covers every locked build, has no
-    /// entry and is classified purl by purl as any package is.
+    /// when that one is on offer). Only offers a policy filter admits are
+    /// taken ([`Self::admitted`]), so a gem the filter leaves out stays
+    /// out. Returns how the row of each locked build is classified, by
+    /// patch purl, for a gem the project already has a patch recorded for
+    /// (`recorded`): [`Recorded::Same`] when what the run takes for the
+    /// build is of the recorded fix, else a move from it. A gem with
+    /// nothing recorded has no entry and is classified as any package is.
     pub fn choose(
         &self,
         offers: &mut Offers,
@@ -307,22 +360,18 @@ impl GemLock {
                 .filter(|(platform, _)| locked.names(platform.as_deref()))
                 .map(|(platform, _)| platform.as_deref())
                 .collect();
-            if covered.len() < named {
-                continue;
-            }
             // The fixes with a patch for every locked build, in the order
             // they come.
             let mut complete: Vec<&str> = Vec::new();
-            for (_, family) in builds.iter().flat_map(|(_, patches)| patches) {
-                let everywhere = builds
-                    .iter()
-                    .all(|(_, patches)| patches.iter().any(|(_, f)| f == family));
-                if everywhere && !complete.contains(family) {
-                    complete.push(family);
+            if covered.len() == named {
+                for (_, family) in builds.iter().flat_map(|(_, patches)| patches) {
+                    let everywhere = builds
+                        .iter()
+                        .all(|(_, patches)| patches.iter().any(|(_, f)| f == family));
+                    if everywhere && !complete.contains(family) {
+                        complete.push(family);
+                    }
                 }
-            }
-            if complete.is_empty() {
-                continue;
             }
             // The ruby gem's patches, best first: a fix is named by its
             // source patch, which is one of them.
@@ -364,32 +413,50 @@ impl GemLock {
                 (Some(newer), Some(older)) => search_result_supersedes(newer, older),
                 _ => false,
             };
-            let fix = match (on, first_ranked) {
-                (Some(on), Some(first)) if on != first && supersedes(first, on) => first,
-                (Some(on), _) => on,
-                (None, Some(first)) => first,
-                (None, None) => complete[0],
+            // `None`: no fix covers every locked build, and the selection
+            // stays as it is ranked.
+            let fix: Option<&str> = match (on, first_ranked) {
+                _ if complete.is_empty() => None,
+                (Some(on), Some(first)) if on != first && supersedes(first, on) => Some(first),
+                (Some(on), _) => Some(on),
+                (None, Some(first)) => Some(first),
+                (None, None) => Some(complete[0]),
             };
+            // What the project records for the gem is one uuid for every
+            // build (the registry in its lock, the directory it is
+            // vendored under): a patch of one fix. A build's row is
+            // already in place when what the run takes for it is of that
+            // fix, and a move to another fix otherwise, whether or not a
+            // fix was settled above.
+            let recorded_fix: Option<String> = pinned
+                .first()
+                .map(|uuid| family_of(uuid, references).to_string());
             for (purl, patches) in &builds {
-                let Some((member, _)) = patches.iter().find(|(_, family)| *family == fix) else {
+                let member = fix.and_then(|fix| {
+                    let member = patches.iter().find(|(_, family)| *family == fix)?;
+                    Some(member.0)
+                });
+                if let Some(member) = member {
+                    chosen.push((purl.to_string(), member.clone()));
+                }
+                let taken = member.or_else(|| offers.selected.get(*purl));
+                let (Some(taken), Some(recorded_fix)) = (taken, recorded_fix.as_deref()) else {
                     continue;
                 };
-                chosen.push((purl.to_string(), (*member).clone()));
-                let class = match on {
-                    Some(on) if on == fix => Recorded::Same,
-                    Some(on) => Recorded::Superseded {
+                let class = match family_of(&taken.uuid, references) == recorded_fix {
+                    true => Recorded::Same,
+                    false => Recorded::Superseded {
                         old_uuid: patches
                             .iter()
-                            .find(|(_, family)| *family == on)
-                            .map_or_else(|| on.to_string(), |(offer, _)| offer.uuid.clone()),
+                            .find(|(_, family)| *family == recorded_fix)
+                            .map_or_else(|| pinned[0].clone(), |(offer, _)| offer.uuid.clone()),
                     },
-                    None => continue,
                 };
                 classes.insert(purl.to_string(), class);
             }
             // The fix's source patch, for a lock that does not name the
             // ruby gem: its registry is the gem's source.
-            if !locked.ruby {
+            if let (Some(fix), false) = (fix, locked.ruby) {
                 for (_, purl) in purls.iter().filter(|(platform, _)| platform.is_none()) {
                     if let Some(source) = Self::admitted(offers, purl)
                         .into_iter()
@@ -405,10 +472,7 @@ impl GemLock {
     }
 }
 
-/// Patches in a fixed order: by purl, then uuid.
-fn sort_by_purl(patches: &mut [PatchSearchResult]) {
-    patches.sort_by(|a, b| a.purl.cmp(&b.purl).then_with(|| a.uuid.cmp(&b.uuid)));
-}
+use crate::api::ranking::sort_by_purl;
 
 /// The other patches of the fix that the gem patch `uuid` (found under
 /// `purl`) belongs to, for the builds of the gem that the Bundler lock of
@@ -434,6 +498,18 @@ pub async fn fix_siblings(
     uuid: &str,
 ) -> Vec<PatchSearchResult> {
     let lock = GemLock::read(view, std::iter::once(purl)).await;
+    fix_siblings_in(&lock, api_client, free_only, purl, uuid).await
+}
+
+/// [`fix_siblings`] against a lock already read (for `purl` among others):
+/// a run that asks for several gems reads the lock once.
+pub async fn fix_siblings_in(
+    lock: &GemLock,
+    api_client: &crate::api::client::ApiClient,
+    free_only: bool,
+    purl: &str,
+    uuid: &str,
+) -> Vec<PatchSearchResult> {
     if lock.platforms_of(purl).is_empty() {
         return Vec::new();
     }
@@ -476,17 +552,18 @@ pub async fn fix_siblings(
 /// first among those with a patch for every locked build). `scan` settles
 /// its selection the same way; this is for a run that names its packages
 /// (`get` in hosted and vendored mode). One reference request, and none
-/// for a project with no such gem. When it fails, the selection is only
-/// narrowed to the builds the lock names.
+/// for a project with no such gem. When it fails, those gems leave the
+/// selection ([`GemLock::unsettle`]) and the second value is what to say
+/// ([`GEM_FIX_UNSETTLED`]).
 pub async fn settle(
     view: &ProjectView<'_>,
     api_client: &crate::api::client::ApiClient,
     candidates: &[PatchSearchResult],
     selected: Vec<PatchSearchResult>,
-) -> Vec<PatchSearchResult> {
+) -> (Vec<PatchSearchResult>, Option<String>) {
     let lock = GemLock::read(view, candidates.iter().map(|patch| patch.purl.as_str())).await;
     if lock.is_empty() {
-        return selected;
+        return (selected, None);
     }
     let mut offers = crate::rollout::stage::offers_from_results(candidates, true);
     offers.selected = selected
@@ -495,14 +572,23 @@ pub async fn settle(
         .collect();
     lock.narrow(&mut offers);
     let uuids = lock.reference_uuids(&offers);
+    let mut unsettled = None;
     if !uuids.is_empty() {
-        if let Ok(references) = api_client.fetch_registry_references(&uuids).await {
-            lock.choose(&mut offers, &references, &RecordedIndex::default());
+        match api_client.fetch_registry_references(&uuids).await {
+            Ok(references) => {
+                lock.choose(&mut offers, &references, &RecordedIndex::default());
+            }
+            Err(error) => {
+                let left = lock.unsettle(&mut offers);
+                if !left.is_empty() {
+                    unsettled = Some(unsettled_detail(&left, &error.to_string()));
+                }
+            }
         }
     }
     let mut settled: Vec<PatchSearchResult> = offers.selected.into_values().collect();
     sort_by_purl(&mut settled);
-    settled
+    (settled, unsettled)
 }
 
 #[cfg(test)]
@@ -589,6 +675,157 @@ mod tests {
         "nokogiri (1.19.3-arm64-darwin)",
         "nokogiri (1.19.3-x86_64-linux-gnu)",
     ];
+
+    fn fix_a() -> Vec<PatchSearchResult> {
+        vec![
+            patch(SRC_A, RUBY, "2026-01-01T00:00:00Z", &["GHSA-a"]),
+            patch(A_LINUX, LINUX, "2026-01-02T00:00:00Z", &["GHSA-a"]),
+            patch(A_DARWIN, DARWIN, "2026-01-02T00:00:00Z", &["GHSA-a"]),
+        ]
+    }
+
+    fn fix_b() -> Vec<PatchSearchResult> {
+        vec![
+            patch(SRC_B, RUBY, "2025-01-01T00:00:00Z", &["GHSA-a"]),
+            patch(B_LINUX, LINUX, "2025-01-02T00:00:00Z", &["GHSA-a"]),
+            patch(B_DARWIN, DARWIN, "2025-01-02T00:00:00Z", &["GHSA-a"]),
+        ]
+    }
+
+    fn both_fixes() -> HashMap<String, PackageVendorResult> {
+        granted(&[
+            (A_LINUX, Some(SRC_A)),
+            (A_DARWIN, Some(SRC_A)),
+            (B_LINUX, Some(SRC_B)),
+            (B_DARWIN, Some(SRC_B)),
+        ])
+    }
+
+    fn uuids_of(offers: &Offers) -> Vec<&str> {
+        offers.selected.values().map(|p| p.uuid.as_str()).collect()
+    }
+
+    /// A policy filter holds for a fix as a whole. A fix whose patches the
+    /// filter does not admit (below the severity floor, withheld) is never
+    /// taken: a gem the filter leaves out stays out, with no reference
+    /// asked for, and beside an admitted fix only that one is taken, even
+    /// where the refused one ranks first. Among admitted fixes the filter's
+    /// own winner goes first.
+    #[tokio::test]
+    async fn a_fix_the_policy_does_not_admit_is_never_taken() {
+        let refuse = |offers: &mut Offers, patches: &[PatchSearchResult]| {
+            for patch in patches {
+                offers
+                    .refused
+                    .insert((patch.purl.clone(), patch.uuid.clone()));
+            }
+        };
+        // The one fix is below the floor: the policy selected nothing.
+        let mut offers = offers_from_results(&fix_a(), true);
+        offers.selected.clear();
+        refuse(&mut offers, &fix_a());
+        let lock = lock_of(&PLATFORM_ONLY, &offers).await;
+        lock.narrow(&mut offers);
+        assert!(lock.reference_uuids(&offers).is_empty());
+        let classes = lock.choose(&mut offers, &both_fixes(), &RecordedIndex::default());
+        assert!(offers.selected.is_empty(), "{:?}", uuids_of(&offers));
+        assert!(classes.is_empty());
+
+        // Fix A ranks first and is refused; fix B is admitted and selected.
+        let all: Vec<PatchSearchResult> = fix_a().into_iter().chain(fix_b()).collect();
+        let mut offers = offers_from_results(&all, true);
+        offers.selected = fix_b()
+            .into_iter()
+            .map(|patch| (patch.purl.clone(), patch))
+            .collect();
+        refuse(&mut offers, &fix_a());
+        let lock = lock_of(&PLATFORM_ONLY, &offers).await;
+        lock.narrow(&mut offers);
+        assert_eq!(lock.reference_uuids(&offers), [B_LINUX, B_DARWIN]);
+        lock.choose(&mut offers, &both_fixes(), &RecordedIndex::default());
+        let mut taken = uuids_of(&offers);
+        taken.sort_unstable();
+        assert_eq!(taken, [SRC_B, B_LINUX, B_DARWIN]);
+
+        // Both admitted, and the filter prefers B (its winner per purl):
+        // B is taken, though A ranks first.
+        let mut offers = offers_from_results(&all, true);
+        offers.selected = fix_b()
+            .into_iter()
+            .map(|patch| (patch.purl.clone(), patch))
+            .collect();
+        lock.choose(&mut offers, &both_fixes(), &RecordedIndex::default());
+        let mut taken = uuids_of(&offers);
+        taken.sort_unstable();
+        assert_eq!(taken, [SRC_B, B_LINUX, B_DARWIN]);
+    }
+
+    /// A run that cannot read which fix the patches belong to settles
+    /// nothing, and writes from no half decision: the gem's patches leave
+    /// the selection (the ranking alone could take one build's patch from
+    /// each fix), other packages stay, and the gem is named.
+    #[tokio::test]
+    async fn an_unsettled_gem_leaves_the_selection() {
+        let other = "pkg:gem/rack@3.1.8";
+        let mut all: Vec<PatchSearchResult> = fix_a().into_iter().chain(fix_b()).collect();
+        all.push(patch(JAVA, other, "2026-01-01T00:00:00Z", &["GHSA-r"]));
+        let mut offers = offers_from_results(&all, true);
+        let lock = lock_of(&PLATFORM_ONLY, &offers).await;
+        lock.narrow(&mut offers);
+        let left = lock.unsettle(&mut offers);
+        assert_eq!(left, ["nokogiri 1.19.3"]);
+        let kept: Vec<&str> = offers.selected.keys().map(String::as_str).collect();
+        assert_eq!(kept, [other]);
+        assert_eq!(
+            unsettled_detail(&left, "timed out"),
+            "could not read which fix the platform patches of nokogiri 1.19.3 belong to (timed \
+             out); a gem locked as platform builds takes every build from one fix, so it is \
+             left as it is by this run. Run it again"
+        );
+        // Nothing selected for the gem: nothing to say.
+        assert!(lock.unsettle(&mut offers).is_empty());
+    }
+
+    /// A build's row is in place only when what the run takes for it is of
+    /// the fix the project records. A project on fix A whose platform
+    /// patches are no longer on offer, beside a fix B that covers every
+    /// locked build, is being moved: every row says so, and names A.
+    #[tokio::test]
+    async fn a_move_to_another_fix_is_classified_as_a_move() {
+        let base = "pkg:gem/nokogiri@1.19.3".to_string();
+        let on_a = RecordedIndex::new(None, &[(base.clone(), SRC_A.to_string())]);
+        let moved = Recorded::Superseded {
+            old_uuid: SRC_A.to_string(),
+        };
+        let mut offers = offers_from_results(&fix_b(), true);
+        let lock = lock_of(&PLATFORM_ONLY, &offers).await;
+        lock.narrow(&mut offers);
+        let classes = lock.choose(&mut offers, &both_fixes(), &on_a);
+        assert_eq!(classes.get(LINUX), Some(&moved));
+        assert_eq!(classes.get(DARWIN), Some(&moved));
+
+        // On fix B already: in place.
+        let on_b = RecordedIndex::new(None, &[(base.clone(), SRC_B.to_string())]);
+        let mut offers = offers_from_results(&fix_b(), true);
+        let classes = lock.choose(&mut offers, &both_fixes(), &on_b);
+        assert_eq!(classes.get(LINUX), Some(&Recorded::Same));
+        assert_eq!(classes.get(DARWIN), Some(&Recorded::Same));
+
+        // On a build's own registry of fix B (its source was not available
+        // when the gem was moved): in place too.
+        let on_member = RecordedIndex::new(None, &[(base, B_DARWIN.to_string())]);
+        let mut offers = offers_from_results(&fix_b(), true);
+        let classes = lock.choose(&mut offers, &both_fixes(), &on_member);
+        assert_eq!(classes.get(LINUX), Some(&Recorded::Same));
+
+        // No fix covers every locked build: what the ranking takes for a
+        // build is still judged by its fix.
+        let partial: Vec<PatchSearchResult> = fix_b().into_iter().take(2).collect();
+        let mut offers = offers_from_results(&partial, true);
+        let classes = lock.choose(&mut offers, &both_fixes(), &on_a);
+        assert_eq!(classes.get(LINUX), Some(&moved));
+        assert_eq!(classes.get(DARWIN), None);
+    }
 
     /// The patches of platform gems the lock does not name leave the
     /// selection; the ruby gem's patch stays, also for a lock of platform

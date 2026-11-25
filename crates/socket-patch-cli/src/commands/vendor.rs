@@ -2261,20 +2261,50 @@ async fn run_eject(
     // platform gem has a patch of its own: the eject vendors those with it.
     // A platform patch that cannot be read is left out, and the plan below
     // then keeps the gem hosted, naming the platform.
-    for pin in pins.iter().filter(|pin| pin.purl.starts_with("pkg:gem/")) {
-        if !records.contains_key(&pin.purl) {
-            continue;
+    // The lock is read once for all of them, and the lookups run together.
+    let gem_pins: Vec<&HostedPin> = pins
+        .iter()
+        .filter(|pin| pin.purl.starts_with("pkg:gem/") && records.contains_key(&pin.purl))
+        .collect();
+    let gem_lock = {
+        use socket_patch_core::hosted::gem_fixes::GemLock;
+        let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&common.cwd);
+        GemLock::read(&view, gem_pins.iter().map(|pin| pin.purl.as_str())).await
+    };
+    let at_once = socket_patch_core::utils::concurrent::api_concurrency_for(
+        client.uses_public_proxy(),
+        gem_pins.len(),
+    );
+    let mut siblings: Vec<socket_patch_core::api::types::PatchSearchResult> = Vec::new();
+    {
+        let mut found = std::pin::pin!(ordered_concurrent(gem_pins.iter(), at_once, |pin| {
+            let (client, gem_lock) = (&client, &gem_lock);
+            async move {
+                socket_patch_core::hosted::gem_fixes::fix_siblings_in(
+                    gem_lock,
+                    client,
+                    use_public_proxy,
+                    &pin.purl,
+                    &pin.uuid,
+                )
+                .await
+            }
+        }));
+        while let Some(of_pin) = found.next().await {
+            siblings.extend(of_pin);
         }
-        let siblings = socket_patch_core::hosted::gem_fixes::fix_siblings(
-            &socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&common.cwd),
-            &client,
-            use_public_proxy,
-            &pin.purl,
-            &pin.uuid,
-        )
-        .await;
-        for sibling in siblings {
-            if let Ok(Some(patch)) = client.fetch_patch(&sibling.uuid).await {
+    }
+    {
+        let at_once = socket_patch_core::utils::concurrent::api_concurrency_for(
+            client.uses_public_proxy(),
+            siblings.len(),
+        );
+        let mut views = std::pin::pin!(ordered_concurrent(siblings.iter(), at_once, |sibling| {
+            let client = &client;
+            async move { client.fetch_patch(&sibling.uuid).await }
+        }));
+        while let Some(view) = views.next().await {
+            if let Ok(Some(patch)) = view {
                 let (purl, record) =
                     socket_patch_core::manifest::records::record_from_patch_response(&patch);
                 records.entry(purl).or_insert(record);
@@ -2289,7 +2319,7 @@ async fn run_eject(
             .push(purl.clone());
     }
     // A hosted gem has no vendored copy to stay with.
-    let gem_units = GemUnits::of(&common.cwd, &mut eject_groups, &records, &HashMap::new()).await;
+    let gem_units = GemUnits::with_lock(&gem_lock, &mut eject_groups, &records, &HashMap::new());
 
     // All or nothing: a record the API cannot serve refuses the whole eject
     // before anything is touched, so every package stays hosted.
@@ -3444,6 +3474,18 @@ impl GemUnits {
         }
         let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(cwd);
         let lock = GemLock::read(&view, gems.iter().map(|base| base.as_str())).await;
+        GemUnits::with_lock(&lock, variant_groups, records, ledger)
+    }
+
+    /// [`Self::of`] against a lock already read for the gems of
+    /// `variant_groups`.
+    fn with_lock(
+        lock: &socket_patch_core::hosted::gem_fixes::GemLock,
+        variant_groups: &mut HashMap<String, Vec<String>>,
+        records: &HashMap<String, PatchRecord>,
+        ledger: &HashMap<String, vendor::VendorEntry>,
+    ) -> GemUnits {
+        use socket_patch_core::hosted::gem_fixes::GemLock;
         let mut units = GemUnits::default();
         for (base, candidates) in variant_groups.iter_mut() {
             let platforms = lock.platforms_of(base);

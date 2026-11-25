@@ -833,8 +833,7 @@ pub fn lookup_gem_build<'a>(
     if Ecosystem::from_purl(purl) != Some(Ecosystem::Gem) {
         return None;
     }
-    let platform = crate::utils::purl::purl_qualifier(purl, "platform")
-        .filter(|platform| !platform.is_empty() && !platform.eq_ignore_ascii_case("ruby"))?;
+    let platform = crate::utils::purl::gem_platform_qualifier(purl)?;
     let base = PurlKey::qualified(crate::utils::purl::strip_purl_qualifiers(purl));
     let (_, entry) = entries
         .iter()

@@ -828,6 +828,12 @@ pub struct Offers {
     /// them gives way to the selection, whatever it ranks
     /// ([`crate::rollout::stage::classify`]).
     pub withheld: BTreeSet<(String, String)>,
+    /// The offers no filter admits, as `(purl, uuid)`: the withheld ones
+    /// and the ones below the severity floor. A step that picks another
+    /// offer of a purl than the winner (a gem fix is taken whole, for
+    /// every build the lock names) picks among the rest only, so every
+    /// filter holds for what it picks. Empty without a policy.
+    pub refused: BTreeSet<(String, String)>,
 }
 
 /// Whether a `--package` spec names the package at `purl`: a purl spec

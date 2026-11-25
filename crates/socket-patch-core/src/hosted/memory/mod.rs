@@ -1038,6 +1038,18 @@ async fn engine(
                             "granted" | "reused" | "withdrawn" | "not_found" | "forbidden"
                         )
                 }));
+            } else {
+                // Nothing settled: such a gem is left as it is (see
+                // `GemLock::unsettle`), and the run says so.
+                let left = lock.unsettle(&mut state.offers);
+                if !left.is_empty() {
+                    let why = failed.values().next().cloned().unwrap_or_default();
+                    warnings.push(EngineWarning::new(
+                        crate::hosted::gem_fixes::GEM_FIX_UNSETTLED,
+                        crate::hosted::gem_fixes::unsettled_detail(&left, &why),
+                        Some(state.root.as_str()),
+                    ));
+                }
             }
         }
         let mut rows = classify_with(&state.offers, &recorded, Some(&gem_builds), &state.root);
@@ -1140,7 +1152,11 @@ async fn engine(
             &origins,
         )
         .await;
-        mark_pinned(&mut states[*index].rows, &pins);
+        mark_pinned(
+            &mut states[*index].rows,
+            &pins,
+            &crate::hosted::engine::gem_fixes_of(&plan.candidates),
+        );
     }
     let wheels: BTreeSet<(String, String)> = planned
         .iter()
@@ -1295,8 +1311,9 @@ async fn engine(
                 again.push((index, done));
                 continue;
             };
-            plan.candidates
-                .retain(|c| !root_deferred.contains(&c.dep.patch_uuid));
+            crate::hosted::engine::drop_deferred(&mut plan.candidates, |c| {
+                root_deferred.contains(&c.dep.patch_uuid)
+            });
             plan.skipped
                 .extend(states[index].deferred.iter().map(deferred_skip));
             match stages::rewrite(

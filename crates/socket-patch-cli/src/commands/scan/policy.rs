@@ -683,6 +683,11 @@ impl ScanPolicy {
                 }
                 offers.selected.insert(purl.clone(), group[i].clone());
             }
+            for (i, offer) in group.iter().enumerate() {
+                if admits(i).is_err() {
+                    offers.refused.insert((purl.clone(), offer.uuid.clone()));
+                }
+            }
             for (offer, reason) in group.iter().zip(withheld) {
                 if reason.is_some() {
                     offers.withheld.insert((purl.clone(), offer.uuid.clone()));
@@ -1156,6 +1161,42 @@ mod tests {
                 (field("uuid"), field("reason"), field("detail"))
             })
             .collect()
+    }
+
+    /// What a later step may pick instead of the winner (a gem fix is taken
+    /// whole, for every build the lock names) is told which offers no
+    /// filter admits: the ones below the severity floor and the withheld
+    /// ones. Without that, a package the floor leaves out could be picked
+    /// back in.
+    #[test]
+    fn offers_name_what_no_filter_admits() {
+        let high = offer(B1, &[(HIGH, "high")]);
+        let critical = offer(A1, &[(CRIT, "critical")]);
+        let floor = "version: 2\npatches:\n  minSeverity: critical\n";
+        // Below the floor, alone: nothing selected, and the offer refused.
+        let policy = filtered_policy(floor, r#"{"version": 1}"#, None);
+        let offers = policy.select(vec![high.clone()]);
+        assert!(offers.selected.is_empty());
+        assert_eq!(
+            offers.refused,
+            BTreeSet::from([(ALPHA.to_string(), B1.to_string())])
+        );
+        // Beside an admitted one: only the one below the floor is refused.
+        let offers = policy.select(vec![high.clone(), critical.clone()]);
+        assert_eq!(offers.selected[ALPHA].uuid, A1);
+        assert_eq!(
+            offers.refused,
+            BTreeSet::from([(ALPHA.to_string(), B1.to_string())])
+        );
+        // A withheld offer is refused too, and no policy refuses nothing.
+        let policy = filtered_policy("", &unreachable(CRIT), None);
+        let offers = policy.select(vec![critical.clone(), high.clone()]);
+        assert_eq!(
+            offers.refused,
+            BTreeSet::from([(ALPHA.to_string(), A1.to_string())])
+        );
+        let plain = filtered_policy("", r#"{"version": 1}"#, None);
+        assert!(plain.select(vec![critical, high]).refused.is_empty());
     }
 
     /// The filter never changes how patches rank: a merged patch that fixes
