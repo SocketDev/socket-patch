@@ -753,7 +753,7 @@ fn feeds(
     let (Some(lock), name) = (string("packages_lock_json")?, string("name")?) else {
         return Err(format!("{here} {written}"));
     };
-    let Some(label) = proxy(ws, tag).filter(|_| tag.dev_dependency == Some(false)) else {
+    let Some(label) = (proxy(ws, tag).ok()).filter(|_| tag.dev_dependency == Some(false)) else {
         return Err(format!(
             "{here} is called on a `use_extension` that is isolated, a dev dependency or not \
              written plainly, which a block of its own does not share"

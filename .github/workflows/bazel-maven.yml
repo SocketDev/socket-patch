@@ -12,7 +12,11 @@ name: Bazel patch compatibility (Maven)
 # mode that repository is a directory of the checkout with the committed
 # jar: the flows hold the build from the checkout alone with no host to
 # ask, the audit of the committed jar, the undo, and the way from hosted
-# to vendored and back. bazel-compatibility.yml holds the legs and what
+# to vendored and back. Agent mode patches the jar in the Maven local
+# repository and no hub: its flow holds the build to the upstream jar,
+# every VEX document to `affected` with the command that patches the hub,
+# and after that command the build and the document to the patched jar.
+# bazel-compatibility.yml holds the legs and what
 # every ecosystem
 # shares; this file says when the Maven legs run and on which releases.
 #
@@ -62,7 +66,7 @@ on:
     # rewriter's index of a pom, the model of what Maven selects with the
     # pom walk under it (the hosted lane pins only where Maven selects the
     # patch's version), the crawler that says where the Maven local
-    # repository is, lock discovery and the upstream restore of `rollback`
+    # repository is, the upstream restore of `rollback`
     # (for a pom and for the block of MODULE.bazel), the vendored Maven
     # backend, which writes the hub's jar and its entry, the dispatch that
     # hands a vendored command the hub's declines (vendor/refusals.rs), and what
@@ -70,7 +74,12 @@ on:
     # hubs of MODULE.bazel, their locks and the block). Nothing another
     # ecosystem's flow owns is here but that dispatch, which the Composer
     # legs watch too, so a change to one ecosystem starts that ecosystem's
-    # legs only.
+    # legs only. Last, what the agent flow runs through: the three files
+    # with which agent mode patches a jar, and the VEX code (`vex/` of the
+    # core, where lock discovery is too, and the files of the `vex`
+    # command). That flow holds the exact
+    # document socket-patch writes about its build, so a change to how a
+    # document is built or worded starts the legs of every ecosystem.
     #
     # What it does not cover: shared engine code (`rewrite_maven_pom` is in
     # patch/redirect/mod.rs, the file of every ecosystem's rewriter; hosted/,
@@ -92,13 +101,16 @@ on:
       - 'crates/socket-patch-core/src/crawlers/maven_selection.rs'
       - 'crates/socket-patch-core/src/crawlers/maven_scope.rs'
       - 'crates/socket-patch-core/src/crawlers/maven_crawler.rs'
-      - 'crates/socket-patch-core/src/vex/discover/maven.rs'
-      - 'crates/socket-patch-core/src/vex/discover/bazel_maven.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/maven.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/bazel_maven.rs'
       - 'crates/socket-patch-core/src/vendor/maven_repo.rs'
       - 'crates/socket-patch-core/src/vendor/refusals.rs'
       - 'crates/socket-patch-core/src/bazel/**'
+      - 'crates/socket-patch-core/src/patch/jvm_jar.rs'
+      - 'crates/socket-patch-core/src/patch/jar_members.rs'
+      - 'crates/socket-patch-core/src/patch/jar_manifest.rs'
+      - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-cli/src/commands/vex*.rs'
   push:
     branches: [main]
     # The pull request paths, and what only a push to main covers: the
@@ -120,13 +132,15 @@ on:
       - 'crates/socket-patch-core/src/crawlers/maven_selection.rs'
       - 'crates/socket-patch-core/src/crawlers/maven_scope.rs'
       - 'crates/socket-patch-core/src/crawlers/maven_crawler.rs'
-      - 'crates/socket-patch-core/src/vex/discover/maven.rs'
-      - 'crates/socket-patch-core/src/vex/discover/bazel_maven.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/maven.rs'
       - 'crates/socket-patch-core/src/patch/redirect/upstream/bazel_maven.rs'
       - 'crates/socket-patch-core/src/vendor/maven_repo.rs'
       - 'crates/socket-patch-core/src/vendor/refusals.rs'
       - 'crates/socket-patch-core/src/bazel/**'
+      - 'crates/socket-patch-core/src/patch/jvm_jar.rs'
+      - 'crates/socket-patch-core/src/patch/jar_members.rs'
+      - 'crates/socket-patch-core/src/patch/jar_manifest.rs'
+      - 'crates/socket-patch-core/src/vex/**'
       - 'crates/socket-patch-cli/tests/e2e_bazel_build/main.rs'
       - 'crates/socket-patch-core/src/patch/redirect/**'
       - 'crates/socket-patch-core/src/hosted/**'
