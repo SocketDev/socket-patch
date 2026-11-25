@@ -2501,9 +2501,13 @@ fn telemetry_command(args: &ApplyArgs) -> &'static str {
 
 /// The patches an apply run acted on, as its telemetry names them: the
 /// run's per-package events ([`GemCaveats::event_of`], what `--json`
-/// prints), the patches that failed the run by not being installed
-/// (`failures`), and the failures no result describes (`unreported`),
-/// each under the patch its manifest record names.
+/// prints), the failures no result describes (`unreported`, once each,
+/// leaving out a record another copy applied), and the patches that failed
+/// the run by not being installed (`failures`), each under the patch its
+/// manifest record names.
+///
+/// `unreported` comes before `failures`: a copy no release variant matches
+/// leaves its variants unmatched too, and that copy is installed.
 ///
 /// A plain fn, so the events it builds stay off the async frame of `run`.
 fn reported_patches(
@@ -2514,18 +2518,29 @@ fn reported_patches(
     dry_run: bool,
     patch_uuids: &HashMap<String, String>,
 ) -> Vec<socket_patch_core::telemetry::PatchOutcome> {
+    let applied: HashSet<&str> = results
+        .iter()
+        .filter(|r| r.success)
+        .map(|r| r.package_key.as_str())
+        .collect();
+    let mut named: HashSet<&str> = HashSet::new();
+    let unreported: Vec<PatchEvent> = unreported
+        .iter()
+        .filter(|(purl, _)| !applied.contains(purl.as_str()) && named.insert(purl.as_str()))
+        .map(|(purl, cause)| {
+            PatchEvent::new(PatchAction::Failed, purl.as_str()).with_cause(cause.as_str())
+        })
+        .collect();
     let events: Vec<PatchEvent> = results
         .iter()
         .map(|result| caveats.event_of(result, dry_run))
+        .chain(unreported)
         .chain(
             failures
                 .iter()
-                .filter(|f| f.code == "package_not_installed")
+                .filter(|f| f.code == "package_not_installed" && !named.contains(f.purl.as_str()))
                 .map(|f| f.event(&f.purl)),
         )
-        .chain(unreported.iter().map(|(purl, cause)| {
-            PatchEvent::new(PatchAction::Failed, purl.as_str()).with_cause(cause.as_str())
-        }))
         .collect();
     crate::telemetry_outcomes::patch_outcomes(
         &events,
@@ -4271,7 +4286,7 @@ impl MavenApplied {
             applied_via: HashMap::new(),
             error: Some(format!("{code}: {detail}")),
             sidecar: None,
-            cause: Some(ApplyFailureCause::Refused(code)),
+            cause: Some(ApplyFailureCause::Coded(code)),
         });
         self.warn(code, detail);
         self.failed = true;
@@ -4387,10 +4402,10 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
             ),
         );
         out.failed = true;
-        out.unreported.extend(m.variants.iter().map(|v| {
+        out.unreported.extend(variants.iter().map(|v| {
             (
-                v.clone(),
-                ApplyFailureCause::Refused("gradle_ro_cache_shadows"),
+                (*v).clone(),
+                ApplyFailureCause::Coded("gradle_ro_cache_shadows"),
             )
         }));
     }
@@ -4652,9 +4667,9 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
     if !attempted && !out.failed && !gradle_only {
         out.failed = true;
         out.unreported.extend(
-            m.variants
+            variants
                 .iter()
-                .map(|v| (v.clone(), ApplyFailureCause::NoMatchingVariant)),
+                .map(|v| ((*v).clone(), ApplyFailureCause::NoMatchingVariant)),
         );
         if args.prints_errors() {
             eprintln!(
@@ -4738,6 +4753,7 @@ async fn check_derived_copies(
             list(&stale)
         );
         result.success = false;
+        result.cause = Some(ApplyFailureCause::Coded("gradle_transform_copy_stale"));
         result.error = Some(format!("gradle_transform_copy_stale: {detail}"));
         out.warn("gradle_transform_copy_stale", detail);
     }
@@ -5204,7 +5220,7 @@ mod tests {
             ),
             (
                 "pkg:maven/g/a@1.0".to_string(),
-                ApplyFailureCause::Refused("gradle_ro_cache_shadows"),
+                ApplyFailureCause::Coded("gradle_ro_cache_shadows"),
             ),
         ];
         let reported = reported_patches(
@@ -5222,11 +5238,52 @@ mod tests {
         assert_eq!(
             named,
             [
-                ("u-gone", "failed", Some("package_not_installed")),
                 ("u-wheel", "failed", Some("no_matching_variant")),
                 ("u-maven", "failed", Some("gradle_ro_cache_shadows")),
+                ("u-gone", "failed", Some("package_not_installed")),
             ]
         );
+    }
+
+    /// A copy no variant matches leaves its variants unmatched too: they
+    /// are reported as not matching (the copy is installed), not as not
+    /// installed; once each however many copies missed; and never a
+    /// variant another copy applied.
+    #[test]
+    fn an_unmatched_variant_is_not_reported_as_not_installed() {
+        let wheel = "pkg:pypi/w@1.0?artifact_id=a".to_string();
+        let other = "pkg:pypi/w@1.0?artifact_id=b".to_string();
+        let uuids = HashMap::from([
+            (wheel.clone(), "u-a".to_string()),
+            (other.clone(), "u-b".to_string()),
+        ]);
+        let failures = [ApplyFailure {
+            purl: wheel.clone(),
+            code: "package_not_installed".to_string(),
+            error: "No installed package matches this PURL".to_string(),
+            cause: None,
+        }];
+        let unreported = [
+            (wheel.clone(), ApplyFailureCause::NoMatchingVariant),
+            (other.clone(), ApplyFailureCause::NoMatchingVariant),
+            (wheel.clone(), ApplyFailureCause::NoMatchingVariant),
+        ];
+        let mut applied_b = failed_result(&other, None);
+        applied_b.success = true;
+        let reported = reported_patches(
+            &[applied_b],
+            &GemCaveats::default(),
+            &failures,
+            &unreported,
+            false,
+            &uuids,
+        );
+        let failed: Vec<(&str, Option<&str>)> = reported
+            .iter()
+            .filter(|p| p.outcome == "failed")
+            .map(|p| (p.uuid.as_str(), p.code.as_deref()))
+            .collect();
+        assert_eq!(failed, [("u-a", Some("no_matching_variant"))]);
     }
 
     /// A run stopped before patching anything reports that stage.

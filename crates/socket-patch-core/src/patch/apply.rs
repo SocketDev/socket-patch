@@ -114,8 +114,9 @@ impl<'a> PatchSources<'a> {
 ///
 /// [`Unclassified`](Self::Unclassified) is a failure whose path sets no
 /// cause, kept as its own value so that share can be measured and the
-/// path named.
+/// path named. New causes may be added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ApplyFailureCause {
     /// A file matches neither the patch's original nor its patched hash:
     /// a different build of the version, or a local edit.
@@ -141,10 +142,10 @@ pub enum ApplyFailureCause {
     /// No release variant in the manifest matches the installed one (a
     /// wheel, platform gem or Maven classifier).
     NoMatchingVariant,
-    /// Refused before writing, under the refusal's own stable code (a
-    /// Gradle build that verifies dependencies, a cache copy with bytes
-    /// no variant was made for, …).
-    Refused(&'static str),
+    /// A failure under a stable code of its own: a refusal before writing
+    /// (a Gradle build that verifies dependencies, a native gem that cannot
+    /// be rebuilt here, …) or a native rebuild that failed.
+    Coded(&'static str),
     /// A failure on a path that sets no cause.
     Unclassified,
 }
@@ -165,7 +166,7 @@ impl ApplyFailureCause {
             Self::WriteFailed => "write_failed",
             Self::SidecarFailed => "sidecar_failed",
             Self::NoMatchingVariant => "no_matching_variant",
-            Self::Refused(code) => code,
+            Self::Coded(code) => code,
             Self::Unclassified => "unclassified",
         }
     }
@@ -196,29 +197,19 @@ pub struct ApplyResult {
     /// Surfaced in the CLI JSON envelope under
     /// `Envelope.sidecars[]` (top-level, not per-event).
     pub sidecar: Option<crate::patch::sidecars::SidecarRecord>,
-    /// Why the package failed, where the failing path knows. Read it
-    /// through [`ApplyResult::failure_cause`], which also covers a failure
-    /// that set none.
+    /// Why the package failed, set by the path that failed it. Read it
+    /// through [`ApplyResult::failure_cause`], which names a failure that
+    /// set none.
     pub cause: Option<ApplyFailureCause>,
 }
 
 impl ApplyResult {
     /// Why this package failed; `None` when it did not. A failure that set
-    /// no cause is named by the file that stopped it (the verify loop stops
-    /// at the first file it cannot patch), else
-    /// [`ApplyFailureCause::Unclassified`].
+    /// no cause is [`ApplyFailureCause::Unclassified`]: it is never guessed
+    /// from `files_verified`, which a later step (a rebuild, a `--force`
+    /// skip) can leave describing something other than what failed.
     pub fn failure_cause(&self) -> Option<ApplyFailureCause> {
-        if self.success {
-            return None;
-        }
-        Some(
-            self.cause
-                .unwrap_or_else(|| match self.files_verified.last().map(|v| v.status) {
-                    Some(VerifyStatus::HashMismatch) => ApplyFailureCause::HashMismatch,
-                    Some(VerifyStatus::NotFound) => ApplyFailureCause::FileNotFound,
-                    _ => ApplyFailureCause::Unclassified,
-                }),
-        )
+        (!self.success).then(|| self.cause.unwrap_or(ApplyFailureCause::Unclassified))
     }
 
     /// Fail the result with `cause` and `error`.
@@ -2263,21 +2254,21 @@ mod tests {
         }
     }
 
-    /// A success has no cause; a failure that set none is named by the
-    /// file that stopped it, else `unclassified`; a set cause wins.
+    /// A success has no cause; a failure that set none is `unclassified`,
+    /// whatever its files say; a set cause wins.
     #[test]
-    fn failure_cause_falls_back_to_the_file_that_stopped_the_apply() {
+    fn failure_cause_is_the_one_set_never_a_guess() {
         assert_eq!(
             result_with(true, &[VerifyStatus::HashMismatch]).failure_cause(),
             None
         );
         assert_eq!(
             result_with(false, &[VerifyStatus::Ready, VerifyStatus::HashMismatch]).failure_cause(),
-            Some(ApplyFailureCause::HashMismatch)
+            Some(ApplyFailureCause::Unclassified)
         );
         assert_eq!(
             result_with(false, &[VerifyStatus::NotFound]).failure_cause(),
-            Some(ApplyFailureCause::FileNotFound)
+            Some(ApplyFailureCause::Unclassified)
         );
         assert_eq!(
             result_with(false, &[VerifyStatus::Ready]).failure_cause(),
@@ -2325,7 +2316,7 @@ mod tests {
             ApplyFailureCause::WriteFailed,
             ApplyFailureCause::SidecarFailed,
             ApplyFailureCause::NoMatchingVariant,
-            ApplyFailureCause::Refused("gradle_copy_unexpected_bytes"),
+            ApplyFailureCause::Coded("gradle_copy_unexpected_bytes"),
             ApplyFailureCause::Unclassified,
         ];
         let codes: std::collections::HashSet<&str> = all.iter().map(|c| c.as_str()).collect();

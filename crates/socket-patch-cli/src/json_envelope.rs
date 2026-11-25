@@ -382,8 +382,8 @@ pub struct PatchEvent {
     pub error: Option<String>,
     /// Why a `Failed` apply event's patch did not apply, finer than its
     /// `error_code` (which stays `apply_failed`): `hash_mismatch`,
-    /// `file_not_found`, `blob_missing`, `write_failed`,
-    /// `no_matching_variant`, … or `unclassified`. Omitted elsewhere.
+    /// `file_not_found`, `blob_missing`, `write_failed`, a refusal's own
+    /// code, … or `unclassified`. Omitted elsewhere.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<String>,
     /// Command-specific additional fields. Consumers MUST NOT depend on

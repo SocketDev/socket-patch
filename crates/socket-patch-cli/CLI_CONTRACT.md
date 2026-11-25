@@ -175,9 +175,13 @@ A missing referenced diff does not remove that protection.
   the package's patch did not apply: `hash_mismatch` (a file matches neither the
   original nor the patched bytes), `file_not_found`, `blob_missing`,
   `blob_corrupt`, `write_failed`, `sidecar_failed`, `shared_store`,
-  `conda_build`, `unsafe_path`, `no_matching_variant`, a Maven refusal's own
-  code (for example `gradle_copy_unexpected_bytes` or `jvm_agent_service_required`),
-  or `unclassified` for a failure whose path names none. Route on `errorCode`; `cause` refines it and new values may be added.
+  `conda_build`, `unsafe_path`, a refusal's or a native rebuild's own code
+  (for example `gradle_copy_unexpected_bytes`, `jvm_agent_service_required`
+  or `native_extension_build_failed`), or `unclassified` for a failure whose
+  path names none. Route on `errorCode`; `cause` refines it and new values may
+  be added. A failure with no package event (a copy no release variant
+  matches, a Maven base refused as a whole) has no `cause` here; telemetry
+  reports it as `no_matching_variant` or the refusal's code.
   `user_patch_conflict` identifies project patch/replacement metadata and names
   its source; `vendored`, `already_patched`, and `package_not_installed` explain
   other apply skips. A conflict introduced after selection is still `skipped`
