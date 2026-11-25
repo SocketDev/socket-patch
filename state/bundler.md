@@ -37,7 +37,7 @@ A cell is `pass` with the Bundler versions and the date, `fail #N`, `n/a`, or `u
 | Lock with `RUBY VERSION`; Bundler upgraded after patching (`update --bundler`, `lock --add-checksums`, re-scan, rollback) | untested | pass 2.5.22 (11-24) | pass 2.5.22 to 4.x: rollback restores upstream entries and checksums (11-24) |
 | Git worktree, project path with a space and a non-ASCII letter | pass 4.0.18 (11-24) | pass 4.0.18 (11-24) | pass 4.0.18, `vex` finds the product from the origin (11-24) |
 | Experimental patch mirror (`--patch-mirror-url`) | n/a | `get --mode vendored` over a mirrored pin, rollback pass (11-24) | pass 4.0.18: 5 gems, frozen install, `pristine`, `vex`, `remove`, rollback byte-exact; without the setting a re-scan names it (11-24) |
-| Bundler 4.1 specifics (4.1.0 stable) | pass with an `OVERRIDES` lock, and on RubyGems 4.1 with a native rebuild (11-16) | pass with an `OVERRIDES` lock and the new default lock that lists the `ruby` variant beside platform builds (11-16) | pass with `OVERRIDES`, `global_gem_cache`, `cooldown`, RubyGems 4.1 native refresh (11-16); `CONTENT ADDRESSES` untested |
+| Bundler 4.1 specifics (4.1.0 stable) | pass with an `OVERRIDES` lock, and on RubyGems 4.1 with a native rebuild (11-16) | pass with an `OVERRIDES` lock and the new default lock (11-16) | pass with `OVERRIDES`, `global_gem_cache`, `cooldown` (11-16); `CONTENT ADDRESSES` untested |
 | Bundler 1.x (1.17.3 on Ruby 3.1.6; the docs refuse nothing) | pass (11-17) | pass, deployment copy (11-17) | pass: merged `GEM` section, deployment clone, `update` (11-17) |
 
 ## Backlog
