@@ -451,6 +451,15 @@ impl Asked {
     }
 }
 
+/// Whether a call of a file of `ws` that was read names the ruleset
+/// `module`: a `bazel_dep` of it, or an override.
+pub(super) fn names(ws: &Workspace, module: &str) -> bool {
+    let module = Value::Str(module.to_string());
+    let names = |call: &Call| [call.arg("name"), call.arg("module_name")].contains(&Some(&module));
+    let mut files = ws.files.iter();
+    files.any(|(_, file)| file.calls.iter().any(names))
+}
+
 /// What the root module of `ws` says of the release of the ruleset
 /// `module`: by its calls that name the ruleset, a `bazel_dep` and the
 /// overrides, which are the functions whose name ends in `_override`.
@@ -619,13 +628,7 @@ impl Hubs {
                 }
             }
         }
-        let module = Value::Str(EXTENSION.module.to_string());
-        let names =
-            |call: &Call| [call.arg("name"), call.arg("module_name")].contains(&Some(&module));
-        let named = ws
-            .files
-            .iter()
-            .any(|(_, file)| file.calls.iter().any(names));
+        let named = names(&ws, EXTENSION.module);
         let calls = matches!(ws.legacy, Some(Ok(_)));
         let before_9 = || declared_release(view).is_none_or(|release| release < (9, 0, 0));
         let legacy = match ws.legacy.filter(|_| before_9()) {

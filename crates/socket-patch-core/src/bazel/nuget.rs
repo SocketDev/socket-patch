@@ -51,7 +51,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::block::{self, Found, END};
-use super::maven::{asked, proxy, Asked};
+use super::maven::{asked, names, proxy, Asked};
 use super::rc::{declared_release, mentions, ModuleLock, Release};
 use super::starlark::{How, Value};
 use super::workspace::{disk, disk_up_to, Doubt, Entry, Extension, Repo, Tag, Tags, Workspace};
@@ -296,18 +296,28 @@ fn prefix(root: &BazelRoot) -> String {
 fn reads(ws: &Workspace, tag: &Tag, dir: &str, locks: &[String]) -> Option<Read> {
     let at = format!("{}:{}", tag.file, tag.call.line);
     match tag.call.arg("packages_lock_json") {
-        Some(Value::Str(label)) => {
-            let label = ws.label(label).filter(|label| label.repo == Repo::Main);
-            let path = label?.path();
-            let ours = |lock: &&String| path.eq_ignore_ascii_case(&format!("{dir}{lock}"));
-            Some(match locks.iter().find(ours) {
-                Some(lock) => Read::Ours(lock.clone()),
-                None => Read::Other(at, path, None),
-            })
-        }
+        Some(Value::Str(label)) => Some(match named(ws, label, dir, locks)? {
+            Ok(lock) => Read::Ours(lock.clone()),
+            Err(path) => Read::Other(at, path, None),
+        }),
         Some(_) => Some(Read::Any(at)),
         None => tag.call.unpacks().then_some(Read::Any(at)),
     }
+}
+
+/// The file of the checkout that the label `label` names: the lock of
+/// `locks` it is for the project in `dir`, or else its path from the Bazel
+/// root. `None`: it names no file of the main repository.
+fn named<'a>(
+    ws: &Workspace,
+    label: &str,
+    dir: &str,
+    locks: &'a [String],
+) -> Option<Result<&'a String, String>> {
+    let label = ws.label(label).filter(|label| label.repo == Repo::Main);
+    let path = label?.path();
+    let ours = |lock: &&String| path.eq_ignore_ascii_case(&format!("{dir}{lock}"));
+    Some(locks.iter().find(ours).ok_or(path))
 }
 
 /// [`withheld`] for the workspace `ws` and the project in its directory
@@ -533,10 +543,11 @@ pub struct Feeds {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Vendored {
     /// What it does without Bazel: the project is in no Bazel workspace,
-    /// or no `nuget.from_lock` reads a lock of it.
+    /// or no `nuget.from_lock` reads a lock of it and none that does can
+    /// be hidden.
     Plain,
-    /// Nothing: the hub reads a lock of the project, and this is why the
-    /// block cannot be shown to work.
+    /// Nothing: the hub reads a lock of the project, or may, and this is
+    /// why the block cannot be shown to work.
     Declined(String),
     /// It keeps the package where a feed of the hub has one, and its
     /// folder in the block.
@@ -560,6 +571,13 @@ pub enum Vendored {
 /// `VENDOR.bazel`); and `MODULE.bazel` is a file whose block, if it has
 /// one, is as socket-patch wrote it.
 ///
+/// A project whose lock no tag reads is vendored as without Bazel, unless
+/// a hub may read the lock all the same. That is declined too: a package
+/// in the folder of its patch alone is in no feed of such a hub, whose
+/// build then fails on the re-pinned lock. The block is there and the tag
+/// it was written beside is gone, so the block's own tag still hands the
+/// lock to the hub; or a tag may not have been read ([`gate`]).
+///
 /// Not seen: a tag of another Bazel module, whose sources the hub takes
 /// after the block's; a module that depends on this one, where Bazel reads
 /// the folder from another root; a vendor directory below the first level;
@@ -581,10 +599,24 @@ pub fn vendored(project: &Path, locks: &[String]) -> Vendored {
         _ => on_disk(path),
     };
     let files = disk_up_to(&root.dir, MAX_LOCK);
-    let feeds = match (
-        gate(&Workspace::read(&view), &files, &prefix(&root), locks),
-        &found,
-    ) {
+    let (ws, dir) = (Workspace::read(&view), prefix(&root));
+    let feeds = match (gate(&ws, &files, &dir, locks), &found) {
+        // The tag the block was written beside is gone, and the block's
+        // own still hands the lock to the hub: what the hub is to hold
+        // for another package is no longer known.
+        (Vendored::Plain, Block::Ours(at, kept, _))
+            if matches!(named(&ws, &kept.lock, &dir, locks), Some(Ok(_))) =>
+        {
+            let line = module[..at.start].matches('\n').count() + 1;
+            return Vendored::Declined(format!(
+                "{FILE}:{line}: the block that socket-patch keeps there still reads `{}` for the \
+                 hub, and the `nuget.from_lock` it was written beside is gone, so a package \
+                 vendored now would not be among the block's feeds: put that tag back, or take \
+                 the vendored packages out (`socket-patch vendor --revert`), and run this command \
+                 again",
+                kept.lock
+            ));
+        }
         (Vendored::Plain, _) => return Vendored::Plain,
         // Its tag reads as one of the user's: said as what it is.
         (_, Block::Edited(line)) => {
@@ -619,6 +651,15 @@ pub fn vendored(project: &Path, locks: &[String]) -> Vendored {
 /// [`vendored`] for the workspace `ws`, read without the block, and the
 /// project in its directory `dir` (empty, or with a `/` at its end), by
 /// what `files` holds beside it: before the checkout itself is looked at.
+///
+/// Where no tag that was read reads a lock of the project, one that was
+/// not read still may. A doubt of the reader declines the package in a
+/// workspace that has to do with the ruleset: a call of a file that was
+/// read names it ([`names`]), as the `bazel_dep` of every workspace does
+/// that uses the extension. In a workspace of other rulesets such a doubt
+/// is about no hub, and only a file that is there and was not read as a
+/// whole declines ([`Workspace::unread`]): it may be the one that names
+/// the ruleset.
 fn gate(ws: &Workspace, files: &dyn Fn(&str) -> Entry, dir: &str, locks: &[String]) -> Vendored {
     let tags = ws.tags(&EXTENSION, "from_lock");
     let mine = |tag: &&Tag| {
@@ -626,12 +667,32 @@ fn gate(ws: &Workspace, files: &dyn Fn(&str) -> Entry, dir: &str, locks: &[Strin
         matches!(read, Some(Read::Ours(_) | Read::Any(_)))
     };
     match tags.calls.iter().find(mine) {
-        None => Vendored::Plain,
+        // A tag that was not read may read the lock. The doubt that says
+        // so: the first one in a workspace that has to do with the
+        // ruleset, else the one about a file that was not read.
+        None => {
+            let first = ws.doubts.iter().chain(&tags.doubts).next();
+            let doubt = first.filter(|_| names(ws, EXTENSION.module));
+            let doubt = doubt.or(ws.unread.as_ref());
+            doubt.map_or(Vendored::Plain, |doubt| Vendored::Declined(unsure(doubt)))
+        }
         Some(tag) => match feeds(ws, files, &tags, tag, dir) {
             Ok(feeds) => Vendored::Block(feeds),
             Err(why) => Vendored::Declined(why),
         },
     }
+}
+
+/// What `doubt` of the reader stands against: the tags of the workspace
+/// are not all known.
+fn unsure(Doubt { file, line, why }: &Doubt) -> String {
+    let place = match line {
+        0 => file.clone(),
+        line => format!("{file}:{line}"),
+    };
+    format!(
+        "{place}: {why}, so socket-patch cannot tell which `nuget.from_lock` tags the workspace has"
+    )
 }
 
 /// What the block holds for the hub of `tag`, the tag of `tags` that reads
@@ -654,11 +715,8 @@ fn feeds(
              block was built for a project at the root alone"
         ));
     }
-    if let Some(Doubt { file, line, why }) = ws.doubts.iter().chain(&tags.doubts).next() {
-        return Err(format!(
-            "{}: {why}, so socket-patch cannot tell which `nuget.from_lock` tags the workspace has",
-            place(file, *line)
-        ));
+    if let Some(doubt) = ws.doubts.iter().chain(&tags.doubts).next() {
+        return Err(unsure(doubt));
     }
     if let Some(other) = tags.calls.iter().find(|other| *other != tag) {
         return Err(format!(
@@ -950,12 +1008,13 @@ pub fn without_folder(module: &str, folder: &str) -> Result<String, usize> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::super::starlark::MAX_BYTES;
     use super::super::workspace::Entry;
     use super::*;
 
     /// The tag of the fixture that hosted mode patches on a real Bazel, and
     /// the same tag without its `nuget_config`.
-    const WIRED: &str = r#"nuget.from_lock(
+    pub(crate) const WIRED: &str = r#"nuget.from_lock(
     nuget_config = "//:nuget.config",
     packages_lock_json = "//:packages.lock.json",
 )"#;
@@ -1695,13 +1754,64 @@ pub(crate) mod tests {
             BARE.replace("//:", "//api:"),
             BARE.replace("//:", "@other//:"),
             "nuget.from_lock()".to_string(),
-            // Also where the block could not be shown to work.
-            format!("{}\nMORE = [nuget]", BARE.replace("//:", "//api:")),
         ] {
             assert_eq!(gated(&rest, &[]), Vendored::Plain, "{rest}");
+            // Also where the block could not be shown to work.
             let unnamed = [(".bazelversion", None)];
             assert_eq!(gated(&rest, &unnamed), Vendored::Plain, "{rest}");
         }
+    }
+
+    /// What was not read may hide the tag that reads the lock, and a
+    /// package vendored as without Bazel is not among the feeds of that
+    /// hub: its build would fail on the re-pinned lock. So where no tag
+    /// is found, a doubt of the reader declines the package in a workspace
+    /// that has to do with the ruleset, and a file that is there and was
+    /// not read as a whole declines it in any workspace: that file may be
+    /// the one that names the ruleset. A doubt in a workspace of other
+    /// rulesets whose files were all read is about no hub.
+    #[test]
+    fn a_tag_that_may_be_hidden_declines_where_none_is_found() {
+        let lock = ["packages.lock.json".to_string()];
+        let gated = |files: &[(&str, Entry)]| {
+            let view = |path: &str| {
+                let found = files.iter().find(|(name, _)| *name == path);
+                found.map_or(Entry::Absent, |(_, entry)| entry.clone())
+            };
+            gate(&Workspace::read(&view), &view, "", &lock)
+        };
+        let text = |text: &str| Entry::Text(text.to_string());
+        let tells = "so socket-patch cannot tell which `nuget.from_lock` tags the workspace has";
+        let declined = |says: &str| Vendored::Declined(format!("{says}, {tells}"));
+        // In a workspace of the ruleset: a use of the proxy that may call
+        // a tag, and an included file that is not there.
+        let include = "include(\"//:more.MODULE.bazel\")";
+        let elsewhere = BARE.replace("//:", "//api:");
+        for (rest, says) in [
+            (
+                format!("{elsewhere}\nMORE = [nuget]"),
+                "MODULE.bazel:5: `nuget` is used other than to call a tag",
+            ),
+            (
+                include.to_string(),
+                "more.MODULE.bazel: it does not exist; MODULE.bazel:4 includes it",
+            ),
+        ] {
+            let read = gated(&[(FILE, text(&module(&rest)))]);
+            assert_eq!(read, declined(says), "{rest}");
+        }
+        // The same include where nothing names the ruleset.
+        let go = format!("bazel_dep(name = \"rules_go\", version = \"0.50.1\")\n{include}\n");
+        assert_eq!(gated(&[(FILE, text(&go))]), Vendored::Plain);
+        // A file that is there and is not read: the included one, and the
+        // root file itself.
+        let binary = Entry::Unreadable("it is not UTF-8".to_string());
+        let files = [(FILE, text(&go)), ("more.MODULE.bazel", binary.clone())];
+        let says = "more.MODULE.bazel: it cannot be read: it is not UTF-8; MODULE.bazel:2 \
+                    includes it";
+        assert_eq!(gated(&files), declined(says));
+        let says = "MODULE.bazel: it cannot be read: it is not UTF-8";
+        assert_eq!(gated(&[(FILE, binary)]), declined(says));
     }
 
     #[test]
@@ -2046,6 +2156,66 @@ socket_patch_nuget.from_lock(
             std::fs::rename(root.join(FILE), root.join("svc/module")).unwrap();
             std::os::unix::fs::symlink(root.join("svc/module"), root.join(FILE)).unwrap();
             declined("MODULE.bazel is a symbolic link");
+        }
+    }
+
+    /// A hub can read the lock while no tag of the checkout is found: the
+    /// tag is gone and the block that was written beside it still reads
+    /// the lock, or the root file cannot be read. Vendored as without
+    /// Bazel, a package would not be among the feeds of that hub, and its
+    /// build would fail on the re-pinned lock: the package is declined. A
+    /// project whose lock neither the tag nor the block reads is vendored
+    /// as without Bazel.
+    #[test]
+    fn a_hub_that_no_tag_of_the_checkout_shows_is_declined() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = base.join("repo");
+        let below = root.join("svc");
+        std::fs::create_dir_all(&below).unwrap();
+        std::fs::create_dir(base.join(".git")).unwrap();
+        let lock = ["packages.lock.json".to_string()];
+        let module = checkout(&root);
+        std::fs::write(root.join("nuget.config"), CONFIG).unwrap();
+        let Vendored::Block(read) = vendored(&root, &lock) else {
+            panic!("no block");
+        };
+        let declined = |why: &str| Vendored::Declined(why.to_string());
+
+        // The block of an earlier run, without the tag it was written
+        // beside.
+        let wired = with_folder(&module, &read, FOLDER_A, &[]).expect("a block");
+        let orphaned = wired.replace(WIRED, "");
+        assert_ne!(orphaned, wired);
+        std::fs::write(root.join(FILE), &orphaned).unwrap();
+        let says = "MODULE.bazel:7: the block that socket-patch keeps there still reads \
+                    `//:packages.lock.json` for the hub, and the `nuget.from_lock` it was written \
+                    beside is gone, so a package vendored now would not be among the block's \
+                    feeds: put that tag back, or take the vendored packages out (`socket-patch \
+                    vendor --revert`), and run this command again";
+        assert_eq!(vendored(&root, &lock), declined(says));
+        // The block reads the lock of the project at the root alone, with
+        // its tag and without it.
+        assert_eq!(vendored(&below, &lock), Vendored::Plain);
+        std::fs::write(root.join(FILE), &wired).unwrap();
+        assert_eq!(vendored(&below, &lock), Vendored::Plain);
+
+        // The root file is larger than the reader takes: for every project
+        // of the workspace.
+        let tells = "so socket-patch cannot tell which `nuget.from_lock` tags the workspace has";
+        let large = format!("{module}{}", "#\n".repeat(MAX_BYTES / 2));
+        std::fs::write(root.join(FILE), large).unwrap();
+        let says = format!("MODULE.bazel: it cannot be read: it is larger than 1 MiB, {tells}");
+        assert_eq!(vendored(&root, &lock), declined(&says));
+        assert_eq!(vendored(&below, &lock), declined(&says));
+        // Or it is a link that leads out of the workspace.
+        #[cfg(unix)]
+        {
+            std::fs::write(base.join("module"), &module).unwrap();
+            std::fs::remove_file(root.join(FILE)).unwrap();
+            std::os::unix::fs::symlink(base.join("module"), root.join(FILE)).unwrap();
+            let out = "MODULE.bazel: it cannot be read: it leads out of the Bazel workspace";
+            assert_eq!(vendored(&root, &lock), declined(&format!("{out}, {tells}")));
         }
     }
 

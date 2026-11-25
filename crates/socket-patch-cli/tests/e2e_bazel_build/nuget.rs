@@ -1348,13 +1348,17 @@ const SELECTED: &str = "{\"lockFileVersion\": 28, \"registryFileHashes\": {\
 ///
 /// Where the block cannot be shown to work, `scan` and `get` decline the
 /// package with exit 1 and write nothing, a dry run lists it and exits 0,
-/// and a person reads the reason. A pin of hosted mode stays: the scan
+/// and a person reads the reason. So it is where no tag of the checkout
+/// shows the hub: a module file that is not read may hold the tag, and a
+/// block without the tag it was written beside still hands the lock to
+/// the hub. A pin of hosted mode stays: the scan
 /// that would take it over and the `vendor` that would eject it are
 /// declined too, and where the block does work `vendor` ejects the pin
 /// into it. With `--allow-vendored-in-bazel`, or its variable, the package
-/// is vendored as without Bazel. With `SOCKET_NO_BAZEL=1` the run is the
-/// one of the same checkout without its Bazel files, to the byte, where
-/// the block works and where the package is declined.
+/// is vendored as without Bazel, whatever declined it. With
+/// `SOCKET_NO_BAZEL=1` the run is the one of the same checkout without its
+/// Bazel files, to the byte, where the block works and wherever the
+/// package is declined.
 #[test]
 fn vendored_mode_keeps_the_block_or_declines() {
     let test = "nuget::vendored_mode_keeps_the_block_or_declines";
@@ -1539,16 +1543,36 @@ fn vendored_mode_keeps_the_block_or_declines() {
 
     // Where the block cannot be shown to work: declined by every command
     // that would vendor, with nothing asked of the patch service. The
-    // last row is a tag with `feeds` beside a config without a source: the
-    // run would name its folder there, and the next one would take the
-    // sources of that file for the hub's in place of those feeds.
+    // fourth row is a tag with `feeds` beside a config without a source:
+    // the run would name its folder there, and the next one would take the
+    // sources of that file for the hub's in place of those feeds. The last
+    // two are hubs that no tag of the checkout shows. The module file is
+    // larger than socket-patch reads, so it may hold the tag; and the tag
+    // is gone, while the block of an earlier vendored run still hands the
+    // lock to the hub.
     let asked = standin.asked(&service);
+    let large = format!("{module}{}", "#\n".repeat(1 << 19));
+    let unread = "MODULE.bazel: it cannot be read: it is larger than 1 MiB, so socket-patch \
+                  cannot tell which `nuget.from_lock` tags the workspace has";
+    let tag =
+        format!("nuget.from_lock(\n{NAMES_CONFIG}    packages_lock_json = \"//:{LOCK}\",\n)\n");
+    let untagged = module.replace(&tag, "");
+    assert_ne!(untagged, module, "{test}");
+    let earlier = block(".socket/vendor/nuget/7e57ce11-0000-4000-8000-5184602cd3cc");
+    let orphaned = format!("{untagged}\n{earlier}");
+    let orphan = format!(
+        "MODULE.bazel:{}: the block that socket-patch keeps there still reads `//:{LOCK}` for the \
+         hub, and the `nuget.from_lock` it was written beside is gone, so a package vendored now \
+         would not be among the block's feeds: put that tag back, or take the vendored packages \
+         out (`socket-patch vendor --revert`), and run this command again",
+        untagged.lines().count() + 2
+    );
     let dirs = module.replace(NAMES_CONFIG, "    local_package_dirs = [\"/opt/nuget\"],\n");
     let fed =
         format!("    feeds = [\"https://nuget.private.example/v3/index.json\"],\n{NAMES_CONFIG}");
     let fed = module.replace(NAMES_CONFIG, &fed);
     let sourceless = "<configuration>\n  <packageSources>\n  </packageSources>\n</configuration>\n";
-    let rows: [(&str, Option<&str>, Option<&str>, &str); 4] = [
+    let rows: [(&str, Option<&str>, Option<&str>, &str); 6] = [
         (
             &module,
             None,
@@ -1574,6 +1598,8 @@ fn vendored_mode_keeps_the_block_or_declines() {
             "MODULE.bazel:9: this `nuget.from_lock` has `feeds`, and its `nuget_config` \
              `//:nuget.config` names no package source",
         ),
+        (&large, Some("9.3.2"), None, unread),
+        (&orphaned, Some("9.3.2"), None, &orphan),
     ];
     for (module, release, config, why) in rows {
         let cell = checkout(Some(module), release);
@@ -1643,9 +1669,15 @@ fn vendored_mode_keeps_the_block_or_declines() {
     assert_eq!(text(&ejected, MODULE), appended, "{test}: {}", eject.dump);
     assert!(!text(&ejected, CONFIG).contains(PATCH_HOST), "{test}");
 
-    // The user's word, as a flag and as its variable: as without Bazel.
-    for flag in [true, false] {
-        let cell = checkout(Some(&module), None);
+    // The user's word, as a flag and as its variable: as without Bazel,
+    // also where no tag of the checkout shows the hub.
+    let lifted: [(&str, Option<&str>); 3] = [
+        (&module, None),
+        (&large, Some("9.3.2")),
+        (&orphaned, Some("9.3.2")),
+    ];
+    for ((module, release), flag) in lifted.iter().flat_map(|row| [(*row, true), (*row, false)]) {
+        let cell = checkout(Some(module), release);
         let before = cell.tree();
         let ran = match flag {
             true => scan(&cell, &["--allow-vendored-in-bazel"]),
@@ -1663,10 +1695,17 @@ fn vendored_mode_keeps_the_block_or_declines() {
 
     // The switch for a project that Bazel does not build: the run of the
     // same checkout without its Bazel files, to the byte. Beside those
-    // files the run is another one: the block, or the package declined.
+    // files the run is another one: the block, or the package declined,
+    // also where no tag of the checkout shows the hub.
     let bazel = [MODULE, BAZEL_LOCK, BAZEL_VERSION];
-    for (release, code) in [(Some("9.3.2"), 0), (None, 1)] {
-        let cell = checkout(Some(&module), release);
+    let switched: [(&str, Option<&str>, i32); 4] = [
+        (&module, Some("9.3.2"), 0),
+        (&module, None, 1),
+        (&large, Some("9.3.2"), 1),
+        (&orphaned, Some("9.3.2"), 1),
+    ];
+    for (module, release, code) in switched {
+        let cell = checkout(Some(module), release);
         let origin = standin.origin();
         let args = [&VENDORED[..], &["--patch-server-url", &origin]].concat();
         let beside = on_machine(&standin, home.path(), |api, env| {

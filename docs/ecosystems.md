@@ -1873,6 +1873,18 @@ and exit 0. The message names the reason, with the file and line where there is 
   read, and 8.8.2 and 9.3.2 download every package of the lock without it. That is read and
   not built.
 - `MODULE.bazel` is a symbolic link, or its block was changed by hand.
+- `MODULE.bazel` holds the block, and the `nuget.from_lock` it was written beside is gone.
+  The block is a `nuget.from_lock` of the hub itself: it still hands the lock to
+  rules_csharp, with the folders of the packages vendored before as its feeds, and a package
+  vendored now would not be among them. Put the tag back, or take the vendored packages out
+  with `socket-patch vendor --revert`, and run the command again.
+- No tag that reads the lock is found, and one may be hidden. `MODULE.bazel`, or a file it
+  includes, is there and is not read as a whole: a link that leads out of the workspace, a
+  file over 1 MiB, one that is not UTF-8 or cannot be parsed, an `include` that is not
+  followed. Or the workspace names rules_csharp, and a part of those files cannot be read
+  with certainty: an `include` of a file that does not exist, a use of the extension that is
+  no call of a tag. A hub that such a part declares reads the re-pinned lock, takes the
+  upstream package, and its build fails. The message names what could not be read.
 - A lock spells the package's version otherwise than NuGet writes it (`1.2.3.0` for `1.2.3`).
   The hub asks its feeds for the version as the lock spells it, and the folder of the patch
   holds the version as `dotnet restore` writes it. Run `dotnet restore`, which rewrites the
@@ -1884,9 +1896,13 @@ for a project whose lock a tag names and which Bazel does not build. A package t
 vendored that way, or by an earlier release, stays as it is on later runs, without a block;
 `vendor --revert` and a new vendored run give it the layout above.
 
-Nothing changes for a NuGet project in no Bazel workspace, and for one whose locks no
-`nuget.from_lock` reads: the package lies in the folder of the patch, and no line of
-`MODULE.bazel` is written.
+Nothing changes for a NuGet project in no Bazel workspace, and for one whose locks neither a
+`nuget.from_lock` nor the block reads, where no tag can be hidden: the package lies in the
+folder of the patch, and no line of `MODULE.bazel` is written. That includes a workspace that
+does not name rules_csharp and whose files are all read as a whole: a part of them that
+cannot be read with certainty is then about no hub. For a project that Bazel does not build
+and that is declined all the same, pass `--allow-vendored-in-bazel`, or set
+[`SOCKET_NO_BAZEL`](#bazel-workspaces-a-project-that-bazel-does-not-build).
 
 **Limits.**
 
@@ -2576,7 +2592,8 @@ projects too. What the sections below then do for it:
   ([Bazel workspaces: Composer](#bazel-workspaces-composer)).
 - NuGet: for a package whose lock a rules_csharp `nuget.from_lock` reads, vendored mode
   keeps a block in the root `MODULE.bazel`, or declines the package where it cannot show
-  that the block works
+  that the block works. It also declines a package whose lock such a tag may read, behind a
+  part of the workspace files that is not read
   ([Bazel workspaces: NuGet](#vendored-mode-under-a-rules_csharp-hub)).
 - Go, Cargo and Maven: the `.bazelignore` at the Bazel root gets two lines for each kind of
   copy under `.socket` that a run wrote: the Go module copies, the vendored crates of a crate

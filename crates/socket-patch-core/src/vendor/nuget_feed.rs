@@ -7473,6 +7473,63 @@ mod tests {
         assert!(!root.join(&entry.artifact.path).exists());
     }
 
+    /// The tag of a hub is gone, and the block that was written beside it
+    /// still hands the lock to the hub, with the folder of the package
+    /// vendored before as its feed. Another patch is declined before
+    /// anything is asked for or written: in the folder of the patch alone
+    /// it would be in no feed of that hub. The package that is wired stays
+    /// as it is, with the same reason as a warning.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_block_whose_tag_is_gone_declines_another_patch() {
+        let _unset = crate::test_env::EnvGuard::unset(ALLOW_IN_BAZEL_ENV);
+        let (dir, blobs, installed, record) = fixture(true, Some(preexisting_cfg())).await;
+        let root = dir.path();
+        crate::bazel::nuget::tests::checkout(root);
+        let (first, _, _) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(first.success, "{:?}", first.error);
+        let wired = std::fs::read_to_string(root.join(MODULE_FILE)).unwrap();
+        let orphaned = wired.replace(crate::bazel::nuget::tests::WIRED, "");
+        assert_ne!(orphaned, wired);
+        std::fs::write(root.join(MODULE_FILE), orphaned).unwrap();
+        let before = hub_files(root);
+
+        let mut later = record.clone();
+        later.uuid = "33333333-3333-4333-8333-333333333333".to_string();
+        let (code, detail) =
+            unwrap_refused(run_vendor(root, &blobs, &installed, &later, false).await);
+        assert_eq!(code, VENDOR_DECLINED);
+        let says = "MODULE.bazel:7: the block that socket-patch keeps there still reads \
+                    `//:packages.lock.json` for the hub";
+        assert!(detail.starts_with(says), "{detail}");
+        for part in [
+            "put that tag back",
+            "`socket-patch vendor --revert`",
+            "`--allow-vendored-in-bazel`",
+        ] {
+            assert!(detail.contains(part), "{detail}");
+        }
+        assert_eq!(hub_files(root), before);
+        let folder = format!(".socket/vendor/nuget/{}", later.uuid);
+        assert!(!root.join(folder).exists(), "nothing is written");
+        assert!(service_preflight(PURL, root, &later).await.is_none());
+        let refused = bazel_refusals(root, &[(PURL, later.uuid.as_str())]).await;
+        assert_eq!(refused, [(PURL, VENDOR_DECLINED, detail)]);
+
+        let (again, rerecorded, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(again.success && rerecorded.is_none());
+        let warned: Vec<&VendorWarning> = warnings
+            .iter()
+            .filter(|w| w.code == VENDOR_DECLINED)
+            .collect();
+        assert!(
+            warned.len() == 1 && warned[0].detail.starts_with(says),
+            "{warnings:?}"
+        );
+        assert_eq!(hub_files(root), before);
+    }
+
     /// A config that the revert leaves wired (tooling wrote it anew, and
     /// it still names the folder) keeps its lock pin and its package, and
     /// so the block: the hub takes that package through the block alone.
