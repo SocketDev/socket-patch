@@ -1661,6 +1661,26 @@ async fn track_unstarted(
     track_patch_rollback_failed(code, error, rollback_run(args, 0), &[], telemetry).await;
 }
 
+/// Fail a run whose target selected nothing in the stores that could be
+/// read, when the vendor ledger was not one of them: the ledger may hold
+/// the target, so the run ends on its load error
+/// (`vendor_state_unreadable`, exit 1) and never on "not found".
+async fn fail_unsearched_ledger(
+    args: &RollbackArgs,
+    err: &std::io::Error,
+    telemetry: &TelemetryAuth,
+) -> i32 {
+    let error = crate::json_envelope::vendor_ledger_load_error(err);
+    track_unstarted(args, &error.code, &error.message, telemetry).await;
+    emit_rollback_error(
+        args.common.json,
+        args.common.dry_run,
+        &error.code,
+        &error.message,
+    );
+    1
+}
+
 /// The most patches a rollback's report hint names: past this the
 /// command no longer fits a line, and the run was not about one patch.
 const REPORT_HINT_MAX_PATCHES: usize = 3;
@@ -2283,6 +2303,11 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
         vendor_scope.extend(found.vendor.into_iter().map(|(k, _)| k));
         hosted_scope.extend(pins.into_iter().map(|pin| pin.purl));
         if !matched {
+            // In no store that could be read. The ledger could not be, and
+            // may hold it: that is the ledger's error, not `patch_not_found`.
+            if let Err(e) = &vendor_state_result {
+                return fail_unsearched_ledger(&args, e, &telemetry).await;
+            }
             let hint = if matches!(id.kind(), TargetKind::Purl | TargetKind::Uuid) {
                 String::new()
             } else {
@@ -2357,6 +2382,11 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             .enumerate()
             .find(|(idx, _)| !matched_patterns.contains(idx))
         {
+            // The candidates left out the entries of a ledger that could
+            // not be read, so the pattern may select one of them.
+            if let Err(e) = &vendor_state_result {
+                return fail_unsearched_ledger(&args, e, &telemetry).await;
+            }
             let msg = format!(
                 "path pattern matched no patched packages: {} (path targets select \
                  installed copies; patches for uninstalled packages are reachable by \

@@ -120,10 +120,19 @@ fn commands(f: &Fixture) -> Vec<(&'static str, Vec<String>)> {
             "repair",
             vec!["repair".into(), "--json".into(), "--offline".into()],
         ),
+        // No store holds the purl: `not_found`, unless the ledger that
+        // could hold it cannot be read.
+        (
+            "remove",
+            vec![
+                "remove".into(),
+                PURL.into(),
+                "--json".into(),
+                "--offline".into(),
+                "--yes".into(),
+            ],
+        ),
     ]
-    // `remove` reads the ledger only for the identifier it removes (an
-    // unmatched identifier is `not_found` whatever the ledger holds); its
-    // root is pinned both ways by `remove_never_modifies_the_cwd_ledger`.
 }
 
 fn run_named(f: &Fixture, argv: &[String]) -> Run {

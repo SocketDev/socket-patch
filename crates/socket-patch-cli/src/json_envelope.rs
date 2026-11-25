@@ -661,6 +661,20 @@ pub(crate) fn manifest_load_error_code(err: &std::io::Error) -> &'static str {
     }
 }
 
+/// The top-level error of a `remove` or `rollback` that cannot go on
+/// without the vendor ledger, which exists but could not be loaded. One
+/// mapping for both, and for both of their reasons: the run is about to
+/// change what the ledger records, or its target selected nothing in the
+/// stores that could be read. The second is never "not found": that is a
+/// statement about every store, and the ledger is a vendored project's
+/// only record of its patches.
+pub(crate) fn vendor_ledger_load_error(err: &std::io::Error) -> EnvelopeError {
+    EnvelopeError::new(
+        "vendor_state_unreadable",
+        format!("cannot read .socket/vendor/state.json: {err}"),
+    )
+}
+
 /// The JSON a self-enforced usage error prints under `--json`: a full
 /// [`Envelope`] with `status: "error"`.
 fn usage_error_json(

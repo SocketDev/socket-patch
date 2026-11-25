@@ -334,6 +334,26 @@ async fn track_failed(
     }
 }
 
+/// Refuse the run with the vendor ledger's load error
+/// (`vendor_state_unreadable`, exit 1); `patches` are the manifest records
+/// the target matched, for the event.
+async fn refuse_unreadable_ledger(
+    args: &RemoveArgs,
+    err: &std::io::Error,
+    patches: &[PatchOutcome],
+    telemetry: &TelemetryAuth,
+) -> i32 {
+    let error = crate::json_envelope::vendor_ledger_load_error(err);
+    track_failed(args, &error.code, &error.message, patches, telemetry).await;
+    emit_error_envelope(
+        args.common.json,
+        args.common.dry_run,
+        &error.code,
+        error.message,
+    );
+    1
+}
+
 /// The `mode: "vendored"` / `"hosted"` tag of a patch event.
 fn mode_details(mode: &str) -> serde_json::Value {
     serde_json::json!({ "mode": mode })
@@ -654,7 +674,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // rollback (vendor-owned purls are not restored in place) and drives
     // the vendored leg. An unreadable ledger degrades to "nothing vendored"
     // for the rollback and fails closed at the vendored leg — exactly where
-    // the run is about to mutate vendored state.
+    // the run is about to mutate vendored state — and for a target no
+    // other store holds, which it may.
     let vendor_state_result = if project_state {
         load_state(&args.common.project_root()).await
     } else {
@@ -722,22 +743,25 @@ pub async fn run(args: RemoveArgs) -> i32 {
     if matching.is_empty() {
         // Ledger-only entries (vendored mode keeps no manifest record) —
         // `remove` is their per-purl exit path (alongside `vendor
-        // --revert`'s all-at-once). An unreadable ledger falls through to
-        // `not_found`: nothing is mutated on that path.
-        if let Ok(state) = vendor_state_result {
-            let ledger_matches = vendor_entries_matching(&state, None, &target);
-            if !ledger_matches.is_empty() {
-                return remove_ledger_only(
-                    &args,
-                    &target,
-                    ledger_matches,
-                    state,
-                    &telemetry,
-                    commit_recovery,
-                )
-                .await;
+        // --revert`'s all-at-once).
+        let ledger_unread = match vendor_state_result {
+            Ok(state) => {
+                let ledger_matches = vendor_entries_matching(&state, None, &target);
+                if !ledger_matches.is_empty() {
+                    return remove_ledger_only(
+                        &args,
+                        &target,
+                        ledger_matches,
+                        state,
+                        &telemetry,
+                        commit_recovery,
+                    )
+                    .await;
+                }
+                None
             }
-        }
+            Err(e) => Some(e),
+        };
 
         // Hosted-only patches likewise have no manifest entry — their
         // lockfile pins are their only persistence, and `remove` is their
@@ -752,6 +776,13 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 &api_client,
             )
             .await;
+        }
+
+        // The target is in no store that could be read. The ledger could
+        // not be, and may hold it: that is the ledger's error, not
+        // `not_found`.
+        if let Some(e) = ledger_unread {
+            return refuse_unreadable_ledger(&args, &e, &[], &telemetry).await;
         }
 
         let msg = format!("No patch found matching identifier: {}", args.identifier);
@@ -1094,22 +1125,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let mut vendor_state = match vendor_state_result {
         Ok(s) => s,
         Err(e) => {
-            let msg = format!("cannot read .socket/vendor/state.json: {e}");
-            track_failed(
-                &args,
-                "vendor_state_unreadable",
-                &msg,
-                &matched_patches(OUTCOME_FAILED, "vendor_state_unreadable"),
-                &telemetry,
-            )
-            .await;
-            emit_error_envelope(
-                args.common.json,
-                args.common.dry_run,
-                "vendor_state_unreadable",
-                msg,
-            );
-            return 1;
+            let failed = matched_patches(OUTCOME_FAILED, "vendor_state_unreadable");
+            return refuse_unreadable_ledger(&args, &e, &failed, &telemetry).await;
         }
     };
     let vendored_matches = vendor_entries_matching(&vendor_state, Some(&manifest), &target);
