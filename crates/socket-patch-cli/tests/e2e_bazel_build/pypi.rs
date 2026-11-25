@@ -42,14 +42,18 @@
 //! id made for the run, so no cache of an earlier run can supply it. The
 //! flow asserts the VEX document of its patch as `main.rs` says.
 //!
-//! The vendored flow ([`vendored_pip_parse`]) commits the patched wheel and
-//! points the package's line of `requirements.txt` at it. rules_python
-//! builds no wheel from such a line: the build fails until
-//! `vendor --revert` has put the pin back. The flow asserts that; that
-//! every form of `vex` meanwhile writes a document that says the package
-//! is affected, and names the call of `MODULE.bazel` that reads the file;
-//! and that the revert and hosted mode, which the document names, end in
-//! the patched build and in a document that says not affected.
+//! Vendored mode would commit the patched wheel and point the package's
+//! line of `requirements.txt` at it, and rules_python builds no wheel from
+//! such a line. So in this checkout, where the hub reads that file, the
+//! command declines the package and writes nothing
+//! ([`vendored_pip_parse`]): the build stays the unpatched one. With
+//! `--allow-vendored-in-bazel` it does what it did before it declined, and
+//! the build fails until `vendor --revert` has put the pin back. The flow
+//! asserts that; that every form of `vex` meanwhile writes a document that
+//! says the package is affected, and names the call of `MODULE.bazel` that
+//! reads the file; that the revert brings the unpatched build back; and
+//! that hosted mode, which the refusal and the document name, ends in the
+//! patched build and in a document that says not affected.
 //!
 //! One loopback server stands in for four hosts. The Socket API and the
 //! patch host answer at their own paths; `pypi.org` (the project pages of
@@ -94,8 +98,8 @@ use sha2::{Digest, Sha512};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
 use crate::harness::{
-    cell_without_bazel, changed, fixture_path, rewrite, with_vex, Cell, Claim, Fixture, How, Ran,
-    StandIn, Tree, CONSUMER, NOTHING,
+    cell_without_bazel, changed, fixture_path, rewrite, with_vex, Cell, Claim, Declined, Fixture,
+    How, Ran, StandIn, Tree, ALLOW, CONSUMER, NOTHING, VENDORED,
 };
 use crate::hosted_memory_common::{read_tree, Patch, ORG};
 
@@ -571,6 +575,8 @@ struct Vendoring {
     uuid: String,
     wheels: [Wheel; 2],
     patched: Wheel,
+    /// The route of the patched wheel on the stand-in's patch host.
+    route: String,
     /// The record of the patch, as the API serves it.
     record: Value,
 }
@@ -622,6 +628,7 @@ impl Vendoring {
             uuid,
             wheels,
             patched,
+            route,
             record,
         }
     }
@@ -629,14 +636,37 @@ impl Vendoring {
     /// `socket-patch <args>` in `cell`, with the stand-in as the Socket
     /// API, the patch server and the index's JSON API.
     fn run(&self, cell: &Cell, args: &[&str]) -> Ran {
+        self.run_with(cell, args, &[])
+    }
+
+    /// [`Vendoring::run`] with the variables `more` as well.
+    fn run_with(&self, cell: &Cell, args: &[&str], more: &[(&str, &str)]) -> Ran {
         let origin = self.standin.origin();
         let json_api = format!("{origin}/{INDEX}/pypi");
         let env = [
             ("SOCKET_PATCH_SERVER_URL", origin.as_str()),
             ("SOCKET_PYPI_JSON_API", json_api.as_str()),
         ];
-        cell.socket_patch(&origin, args, &env)
+        cell.socket_patch(&origin, args, &[&env[..], more].concat())
     }
+}
+
+/// The code under which vendored mode declines a package whose
+/// requirements a hub of the workspace reads.
+const DECLINED: &str = "vendor_pypi_bazel_hub";
+
+/// The line of the `MODULE.bazel` of `cell` that calls the hub.
+fn hub_line(cell: &Cell) -> usize {
+    let module = String::from_utf8(cell.tree()["MODULE.bazel"].clone()).expect("a text file");
+    let above = module.lines().take_while(|line| *line != "pip.parse(");
+    above.count() + 1
+}
+
+/// What a refusal of vendored mode has to name in the checkout of `cell`:
+/// the hub's call with its line in `MODULE.bazel`, and the file it reads.
+fn refusal_names(cell: &Cell) -> [String; 2] {
+    let call = format!("`pip.parse` (MODULE.bazel:{})", hub_line(cell));
+    [call, format!("names {REQUIREMENTS}; ")]
 }
 
 /// What `socket-patch` has to name when it says that the package is
@@ -644,19 +674,18 @@ impl Vendoring {
 /// with its line in the `MODULE.bazel` of `cell`, and the two commands
 /// that patch what Bazel builds.
 fn names(cell: &Cell) -> Vec<String> {
-    let module = String::from_utf8(cell.tree()["MODULE.bazel"].clone()).expect("a text file");
-    let above = module.lines().take_while(|line| *line != "pip.parse(");
     vec![
         format!("the line of {REQUIREMENTS} that points at"),
-        format!("(`pip.parse`, MODULE.bazel:{})", above.count() + 1),
+        format!("(`pip.parse`, MODULE.bazel:{})", hub_line(cell)),
         "`socket-patch vendor --revert`, then `socket-patch scan --mode hosted`".to_string(),
     ]
 }
 
-/// Vendored mode in the checkout of `cell`, whose `requirements.txt` pins
-/// the wheels of `with`: `scan --mode vendored --yes` commits the patched
-/// wheel under `.socket/vendor/pypi` and points the package's line of
-/// `requirements.txt` at it. The command passes, and with `--vex` it
+/// Vendored mode on the user's word in the checkout of `cell`, whose
+/// `requirements.txt` pins the wheels of `with` and is read by the hub:
+/// `scan --mode vendored --yes --allow-vendored-in-bazel` commits the
+/// patched wheel under `.socket/vendor/pypi` and points the package's line
+/// of `requirements.txt` at it. The command passes, and with `--vex` it
 /// writes a document that says the package is affected; so do
 /// `apply --vex` and `vendor --vex`, and `vex` and `vex --no-verify`. Each
 /// names the call of `MODULE.bazel` that hands `requirements.txt` to
@@ -667,8 +696,10 @@ fn vendors_the_wheel(cell: &Cell, with: &Vendoring) -> Tree {
     let run = |cell: &Cell, args: &[&str]| with.run(cell, args);
 
     let in_run = cell.document("in-run");
-    let vendoring = ["scan", "--mode", "vendored", "--yes"];
-    let scan = run(cell, &[&vendoring[..], &with_vex(&in_run)].concat());
+    let scan = run(
+        cell,
+        &[&VENDORED[..], &[ALLOW], &with_vex(&in_run)].concat(),
+    );
     let said = &scan.dump;
     assert_eq!(scan.code, 0, "{test}: {said}");
     assert_eq!(scan.envelope["status"], "success", "{test}: {said}");
@@ -710,20 +741,13 @@ fn vendors_the_wheel(cell: &Cell, with: &Vendoring) -> Tree {
     vendored
 }
 
-/// What the document of an affected package tells the user to do, in the
-/// checkout of `cell` that vendored mode patched: `vendor --revert` puts
-/// every file back as it was in `before`, and `scan --mode hosted --yes`
-/// then pins the patch of `with` in `requirements.txt`. Its document and
-/// the one of `vex` attest the package, through the pin.
-fn reverts_and_pins(cell: &Cell, with: &Vendoring, before: &Tree) {
-    let test = &cell.test;
+/// The second thing the document of an affected package tells the user to
+/// do, in the checkout of `cell` whose files `vendor --revert` has put back
+/// as they were in `before`: `scan --mode hosted --yes` pins the patch of
+/// `with` in `requirements.txt`. Its document and the one of `vex` attest
+/// the package, through the pin.
+fn pins(cell: &Cell, with: &Vendoring, before: &Tree) {
     let run = |cell: &Cell, args: &[&str]| with.run(cell, args);
-    let undo = run(cell, &["vendor", "--revert", "--yes"]);
-    let said = &undo.dump;
-    assert_eq!(undo.code, 0, "{test}: {said}");
-    assert_eq!(undo.envelope["summary"]["removed"], 1, "{test}: {said}");
-    assert_eq!(changed(before, &cell.tree()), NOTHING, "{test}: {said}");
-
     let claim = Claim::new(PURL, &with.uuid, How::Hosted);
     let document = cell.document("hosted");
     let hosted = ["scan", "--mode", "hosted", "--yes"];
@@ -733,25 +757,43 @@ fn reverts_and_pins(cell: &Cell, with: &Vendoring, before: &Tree) {
     cell.stands_alone(run, &claim, true);
 }
 
+/// Vendored mode where it declines: `socket-patch <args>` in `cell` ends
+/// with `exit` and reports the package under [`DECLINED`], as the one event
+/// `action`, in words that name the hub's call, the file it reads, hosted
+/// mode and the switch. No file of the checkout differs from `before`.
+fn declines(cell: &Cell, with: &Vendoring, args: &[&str], exit: i32, action: &str, before: &Tree) {
+    let names = refusal_names(cell);
+    let package = Declined {
+        purl: PURL,
+        code: DECLINED,
+        names: &names.each_ref().map(String::as_str),
+    };
+    cell.declined(&with.run(cell, args), &package, exit, action, before);
+}
+
 /// Vendored mode beside a hub that reads `requirements.txt`.
 ///
 /// - (a) `bazel build` and `bazel run //:consumer` print the unpatched
 ///   marker.
-/// - (b) `scan --mode vendored --yes` commits the patched wheel and points
-///   the package's line of `requirements.txt` at it
-///   ([`vendors_the_wheel`]). The command passes, and it and every other
-///   form of `vex` write a document that says the package is affected:
-///   each names the call of `MODULE.bazel` that reads the file, and the
-///   way out.
-/// - (c) The same `bazel build` fails, as the document said it may:
-///   rules_python takes the path of that line for the name of a project
-///   and leaves the hub without a repository it can name. No build holds
-///   the patched wheel, and `vex` says affected again.
-/// - (d) What the document says to do ([`reverts_and_pins`]):
-///   `vendor --revert` puts every file back, `scan --mode hosted --yes`
-///   pins the patch in `requirements.txt`, the same two Bazel commands
-///   print the patched marker, and `vex` attests the package as not
-///   affected.
+/// - (b) `scan --mode vendored --yes` declines the package: it exits 1,
+///   names the call of `MODULE.bazel` that reads the file, hosted mode and
+///   the switch, writes nothing and downloads no wheel. The same two Bazel
+///   commands print the unpatched marker, and change no file.
+/// - (c) With `--allow-vendored-in-bazel` the command does what it did
+///   before it declined ([`vendors_the_wheel`]): it commits the patched
+///   wheel and points the package's line of `requirements.txt` at it. It
+///   passes, and it and every other form of `vex` write a document that
+///   says the package is affected: each names the call of `MODULE.bazel`
+///   that reads the file, and the way out. The same `bazel build` fails,
+///   as the document said it may: rules_python takes the path of that
+///   line for the name of a project and leaves the hub without a
+///   repository it can name. No build holds the patched wheel, and `vex`
+///   says affected again.
+/// - (d) What the document says to do: `vendor --revert` puts every file
+///   back, and the same two Bazel commands print the unpatched marker
+///   again. `scan --mode hosted --yes` then pins the patch in
+///   `requirements.txt` ([`pins`]), the two commands print the patched
+///   marker, and `vex` attests the package as not affected.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
 fn vendored_pip_parse() {
@@ -768,15 +810,28 @@ fn vendored_pip_parse() {
     // (a) The unpatched build.
     let before = cell.builds_unpatched(UNPATCHED);
 
-    // (b) Vendored mode commits the wheel, and says it is affected.
-    let vendored = vendors_the_wheel(&cell, &with);
+    // (b) The one command of vendored mode: declined, with nothing written
+    // and nothing of the patch fetched. The same build passes, on the
+    // upstream package.
+    declines(&cell, &with, &VENDORED, 1, "failed", &before);
+    assert_eq!(with.standin.asked(&with.route), 0, "{test}");
+    cell.builds_patched(&before, UNPATCHED);
 
-    // (c) The build fails on the line that names the committed wheel, and
-    // changes no file of the checkout.
+    // (c) On the user's word vendored mode commits the wheel, and says it
+    // is affected. The build fails on the line that names the committed
+    // wheel, and changes no file of the checkout: rules_python makes the
+    // name of a repository from the path, and Bazel takes no such name. A
+    // console may break the message, so it is compared without white space.
+    let vendored = vendors_the_wheel(&cell, &with);
     let build = cell.bazel("build", &[CONSUMER]);
-    let named = with.patched.filename().replace(['-', '.'], "_");
+    let named = format!(
+        "invalid user-provided repo name 'pip_311__/_socket/vendor/pypi/{}/{}'",
+        with.uuid.replace('-', "_"),
+        with.patched.filename().replace(['-', '.'], "_")
+    );
+    let squeezed = |text: &str| text.split_whitespace().collect::<String>();
     assert!(
-        !build.ok() && build.stderr().contains(&named),
+        !build.ok() && squeezed(&build.stderr()).contains(&squeezed(&named)),
         "{test}: the build did not fail on the vendored line ({named}):\n{}",
         build.dump()
     );
@@ -785,18 +840,22 @@ fn vendored_pip_parse() {
     let names = names(&cell);
     cell.stands_alone(run, &Claim::unbuilt(PURL, &with.uuid, &names), true);
 
-    // (d) The way out: the undo, then hosted mode, whose pin Bazel builds.
-    reverts_and_pins(&cell, &with, &before);
+    // (d) The way out: the undo, which brings the files and the build
+    // back, then hosted mode, whose pin Bazel builds.
+    let undo = run(&cell, &["vendor", "--revert", "--yes"]);
+    cell.undone(&undo, "removed", &before, UNPATCHED);
+    pins(&cell, &with, &before);
     let marker = format!("OUT: PATCHED {}", with.uuid);
     cell.builds(&marker);
     let claim = Claim::new(PURL, &with.uuid, How::Hosted);
     cell.stands_alone(run, &claim, true);
 
     println!(
-        "{test}: Bazel {release} built {UNPATCHED:?}, and failed to build after `scan --mode \
-         vendored`, while every form of `vex` said the package is affected; after `vendor \
-         --revert` and `scan --mode hosted` it built {marker:?}, and `vex` said it is not \
-         affected; {:?}",
+        "{test}: Bazel {release} built {UNPATCHED:?}; `scan --mode vendored` declined \
+         ({DECLINED}), wrote nothing, and the build stayed {UNPATCHED:?}; with {ALLOW} it \
+         vendored the wheel and the build failed ({named}), while every form of `vex` said the \
+         package is affected; after `vendor --revert` it built {UNPATCHED:?} again, and after \
+         `scan --mode hosted` {marker:?}, and `vex` said it is not affected; {:?}",
         started.elapsed()
     );
 }
@@ -815,14 +874,16 @@ fn checkout(with: &Vendoring) -> Cell {
     cell
 }
 
-/// Without a Bazel: steps (b) and (d) of [`vendored_pip_parse`] in the
+/// Without a Bazel: steps (c) and (d) of [`vendored_pip_parse`] in the
 /// fixture's checkout, where `MODULE.bazel` hands `requirements.txt` to
-/// rules_python. Between them, `scan --mode vendored --vex`, `vendor --vex`
-/// and `apply --vex` as a person runs them: each passes and writes the
-/// document, with the warning on stderr, the line that it wrote a document
-/// on stdout, and no error; with `--silent` each passes, writes the
-/// document and prints nothing. After them, `vendor --vex` moves the
-/// hosted pin into a committed copy again, and says affected again.
+/// rules_python, so a vendored run that writes the line has the switch.
+/// Between them, `scan --mode vendored --vex`, `vendor --vex` and
+/// `apply --vex` as a person runs them, with no switch, since the file
+/// already names the copy: each passes and writes the document, with the
+/// warning on stderr, the line that it wrote a document on stdout, and no
+/// error; with `--silent` each passes, writes the document and prints
+/// nothing. After them, `vendor --vex` moves the hosted pin into a
+/// committed copy again, and says affected again.
 #[test]
 fn a_vendored_wheel_is_affected_beside_a_hub_that_reads_the_requirements() {
     let with = Vendoring::new();
@@ -842,8 +903,7 @@ fn a_vendored_wheel_is_affected_beside_a_hub_that_reads_the_requirements() {
         names[0], with.uuid, names[1], names[2]
     );
     let claim = Claim::unbuilt(PURL, &with.uuid, &names);
-    let scan = ["scan", "--mode", "vendored", "--yes"];
-    for command in [&scan[..], &["vendor"], &["apply"]] {
+    for command in [&VENDORED[..], &["vendor"], &["apply"]] {
         let loud = [command, &with_vex(&document)].concat();
         cell.tells_a_person(&origin, &loud, &env, &document, &claim, &warned);
         let silent = [&loud[..], &["--silent"]].concat();
@@ -851,12 +911,15 @@ fn a_vendored_wheel_is_affected_beside_a_hub_that_reads_the_requirements() {
     }
     assert_eq!(changed(&vendored, &cell.tree()), NOTHING);
 
-    reverts_and_pins(&cell, &with, &before);
+    let undo = with.run(&cell, &["vendor", "--revert", "--yes"]);
+    assert_eq!(undo.envelope["summary"]["removed"], 1, "{}", undo.dump);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", undo.dump);
+    pins(&cell, &with, &before);
 
     // `vendor` in a checkout of hosted pins commits a copy of each: the
     // line of `requirements.txt` points at the wheel again.
     let ejected = cell.document("eject");
-    let eject = [&["vendor", "--yes"][..], &with_vex(&ejected)].concat();
+    let eject = [&["vendor", "--yes", ALLOW][..], &with_vex(&ejected)].concat();
     let eject = with.run(&cell, &eject);
     assert_eq!(eject.envelope["status"], "success", "{}", eject.dump);
     cell.wrote_in_run(&eject, &ejected, &claim);
@@ -864,11 +927,11 @@ fn a_vendored_wheel_is_affected_beside_a_hub_that_reads_the_requirements() {
     assert!(line.contains(".socket/vendor/pypi/"), "{line}");
 }
 
-/// Without a Bazel: `vendor --vex` in a checkout whose manifest records
-/// the patch, as agent mode leaves one. It commits the wheel, points
-/// `requirements.txt` at it, and passes; its document says the package is
-/// affected and names the call that reads the file, as the scan of
-/// [`vendors_the_wheel`] does.
+/// Without a Bazel: `vendor --vex` on the user's word in a checkout whose
+/// manifest records the patch, as agent mode leaves one. It commits the
+/// wheel, points `requirements.txt` at it, and passes; its document says
+/// the package is affected and names the call that reads the file, as the
+/// scan of [`vendors_the_wheel`] does.
 #[test]
 fn a_wheel_vendored_from_a_manifest_is_affected_beside_the_hub() {
     let with = Vendoring::new();
@@ -879,7 +942,7 @@ fn a_wheel_vendored_from_a_manifest_is_affected_beside_the_hub() {
     cell.write(".socket/manifest.json", manifest.to_string());
 
     let document = cell.document("vendor");
-    let vendor = [&["vendor", "--yes"][..], &with_vex(&document)].concat();
+    let vendor = [&["vendor", "--yes", ALLOW][..], &with_vex(&document)].concat();
     let vendor = with.run(&cell, &vendor);
     let line = String::from_utf8_lossy(&cell.tree()[REQUIREMENTS]).into_owned();
     assert!(
@@ -899,7 +962,8 @@ fn a_wheel_vendored_from_a_manifest_is_affected_beside_the_hub() {
 /// Without a Bazel: `vex` with a `--manifest-path` in another project
 /// attests that project, and asks the workspace about the files of that
 /// project. The checkout holds `svc`, where vendored mode pointed
-/// `requirements.txt` at the wheel, and `app`, where the command is run.
+/// `requirements.txt` at the wheel on the user's word, and `app`, where the
+/// command is run.
 /// While the hub reads the file of `svc`, the document says the package
 /// is affected and names that file. While it reads the file of `app`,
 /// which pins the same release, the wheel of `svc` is attested as
@@ -923,7 +987,7 @@ fn a_vendored_wheel_is_judged_by_the_files_of_the_manifest_s_project() {
         cell.write("MODULE.bazel", module.replace(&own, &label));
     };
     reads("svc");
-    let vendoring = ["scan", "--mode", "vendored", "--yes", "--cwd", "svc"];
+    let vendoring = [&VENDORED[..], &[ALLOW, "--cwd", "svc"]].concat();
     let scan = with.run(&cell, &vendoring);
     assert_eq!(scan.envelope["summary"]["applied"], 1, "{}", scan.dump);
 
@@ -941,6 +1005,209 @@ fn a_vendored_wheel_is_judged_by_the_files_of_the_manifest_s_project() {
     reads("app");
     let claim = Claim::new(PURL, &with.uuid, How::Vendored);
     cell.stands_alone(run, &claim, true);
+}
+
+/// Without a Bazel: in the fixture's checkout, where the hub reads
+/// `requirements.txt`, every command that would vendor the package declines
+/// it, writes nothing and fetches no wheel. On the user's word vendored
+/// mode goes on, and a later run without it passes and writes nothing: the
+/// file the hub reads already names the copy.
+#[test]
+fn every_command_that_would_vendor_declines_beside_a_hub_that_reads_the_requirements() {
+    let with = Vendoring::new();
+    let cell = checkout(&with);
+    let names = refusal_names(&cell);
+    let package = Declined {
+        purl: PURL,
+        code: DECLINED,
+        names: &names.each_ref().map(String::as_str),
+    };
+    let run = |cell: &Cell, args: &[&str], env: &[(&str, &str)]| with.run_with(cell, args, env);
+    let before = cell.tree();
+    cell.declines_every_vendoring(run, &package);
+    assert_eq!(with.standin.asked(&with.route), 0);
+    let undo = with.run(&cell, &["rollback", "--yes"]);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", undo.dump);
+    cell.vendors_on_the_users_word(run, &package);
+}
+
+/// Without a Bazel: the refusal is for a run that would write a file a hub
+/// reads, and for no other. In a workspace whose hub reads another file, in
+/// a project beside the one whose file it reads, and in no workspace at
+/// all, vendored mode vendors the package as it did, with no switch. So it
+/// does in a Poetry project beside a hub that reads the requirements file
+/// exported from its lock: the lock is wired alone, the file the hub reads
+/// stays as it is, and a later run passes. Where the file the hub is given
+/// is not written out in `MODULE.bazel`, and where `MODULE.bazel` has a
+/// byte that is not UTF-8 (Bazel takes such a file, and the call in it is
+/// not seen here), the package is declined, and the refusal names the
+/// place and the reason.
+#[test]
+fn vendored_mode_goes_on_where_no_hub_reads_the_requirements() {
+    let with = Vendoring::new();
+    let own = format!("\"//:{REQUIREMENTS}\"");
+    let module = |cell: &Cell| String::from_utf8(cell.tree()["MODULE.bazel"].clone()).unwrap();
+    let vendors = |cell: &Cell, args: &[&str]| {
+        let scan = with.run(cell, &[&VENDORED[..], args].concat());
+        assert_eq!(scan.code, 0, "{}", scan.dump);
+        assert_eq!(scan.envelope["summary"]["applied"], 1, "{}", scan.dump);
+    };
+    // Another file of the same project.
+    let cell = checkout(&with);
+    cell.write(
+        "MODULE.bazel",
+        module(&cell).replace(&own, "\"//:requirements_lock.txt\""),
+    );
+    vendors(&cell, &[]);
+    // The file of another project, and no workspace file at all.
+    let cell = checkout(&with);
+    cell.write(&format!("svc/{REQUIREMENTS}"), requirements(&with.wheels));
+    vendors(&cell, &["--cwd", "svc"]);
+    std::fs::remove_file(cell.path("MODULE.bazel")).expect("MODULE.bazel");
+    let undo = with.run(&cell, &["vendor", "--revert", "--yes", "--cwd", "svc"]);
+    assert_eq!(undo.code, 0, "{}", undo.dump);
+    vendors(&cell, &[]);
+    // A Poetry project, whose lock is the one file a run points at the
+    // copy. The hub reads the requirements file exported from it.
+    let cell = checkout(&with);
+    let [_, upstream] = &with.wheels;
+    let poetry = format!(
+        "[[package]]\nname = \"{NAME}\"\nversion = \"{VERSION}\"\ndescription = \"\"\n\
+         optional = false\npython-versions = \">=3.9\"\ngroups = [\"main\"]\nfiles = [\n    \
+         {{file = \"{}\", hash = \"sha256:{}\"}},\n]\n\n[metadata]\nlock-version = \"2.1\"\n\
+         python-versions = \">=3.9\"\ncontent-hash = \"{}\"\n",
+        upstream.filename(),
+        upstream.sha256,
+        upstream.sha256
+    );
+    cell.write("poetry.lock", poetry);
+    let project = format!(
+        "[tool.poetry]\nname = \"demo\"\nversion = \"0.1.0\"\ndescription = \"\"\n\
+         authors = []\npackage-mode = false\n\n[tool.poetry.dependencies]\n\
+         python = \">=3.9\"\n{NAME} = \"{VERSION}\"\n"
+    );
+    cell.write("pyproject.toml", project);
+    let before = cell.tree();
+    vendors(&cell, &[]);
+    let vendored = cell.tree();
+    assert!(vendored[REQUIREMENTS] == before[REQUIREMENTS]);
+    let lock = String::from_utf8_lossy(&vendored["poetry.lock"]);
+    assert!(lock.contains(".socket/vendor/pypi/"), "{lock}");
+    for later in [&VENDORED[..], &["scan", "--yes"]] {
+        let scan = with.run(&cell, later);
+        assert_eq!(scan.code, 0, "{}", scan.dump);
+        assert_eq!(changed(&vendored, &cell.tree()), NOTHING, "{}", scan.dump);
+    }
+
+    // A file that is not written out: the hub may read any.
+    let cell = checkout(&with);
+    cell.write("MODULE.bazel", module(&cell).replace(&own, "LOCK"));
+    let unread = format!(
+        "(MODULE.bazel:{}: the files `pip.parse` names",
+        hub_line(&cell)
+    );
+    let package = Declined {
+        purl: PURL,
+        code: DECLINED,
+        names: &[&unread, "cannot be read with certainty"],
+    };
+    let before = cell.tree();
+    cell.declined(&with.run(&cell, &VENDORED), &package, 1, "failed", &before);
+
+    // A file that cannot be read here: it may hold a call that reads any.
+    let cell = checkout(&with);
+    cell.write(
+        "MODULE.bazel",
+        [module(&cell).as_bytes(), b"# caf\xe9\n"].concat(),
+    );
+    let package = Declined {
+        purl: PURL,
+        code: DECLINED,
+        names: &[
+            "(MODULE.bazel: it cannot be read: it is not UTF-8)",
+            "cannot be read with certainty",
+        ],
+    };
+    let before = cell.tree();
+    cell.declined(&with.run(&cell, &VENDORED), &package, 1, "failed", &before);
+}
+
+/// Without a Bazel: a `WORKSPACE` file that a migration left behind still
+/// hands `requirements.txt` to the ruleset's older rule, beside a
+/// `MODULE.bazel` whose hub reads another file. Bazel 9 never reads a
+/// `WORKSPACE` file, so where the checkout names a release of 9 or later
+/// the package is vendored as it is without that file. Where it names an
+/// older release, none, or one that is no release, a Bazel that reads the
+/// file may build the checkout: the package is declined, and the refusal
+/// names the call of the `WORKSPACE` file.
+#[test]
+fn a_workspace_file_counts_unless_the_checkout_names_bazel_9_or_later() {
+    let with = Vendoring::new();
+    let own = format!("\"//:{REQUIREMENTS}\"");
+    let legacy = format!("pip_parse(\n    name = \"pypi\",\n    requirements_lock = {own},\n)\n");
+    // The fixture's checkout with a hub that reads another file, the
+    // `WORKSPACE` file where it is `kept`, and what names the Bazel
+    // release.
+    let retained = |release: Option<&str>, kept: bool| {
+        let cell = checkout(&with);
+        let module = String::from_utf8(cell.tree()["MODULE.bazel"].clone()).expect("a text file");
+        let other = module.replace(&own, "\"//:requirements_lock.txt\"");
+        assert_ne!(other, module);
+        cell.write("MODULE.bazel", other);
+        if kept {
+            cell.write("WORKSPACE", &legacy);
+        }
+        if let Some(release) = release {
+            cell.write(".bazelversion", format!("{release}\n"));
+        }
+        cell
+    };
+    // A run that vendors the wheel: the files it writes, and the
+    // requirements it leaves.
+    let vendors = |cell: &Cell| {
+        let before = cell.tree();
+        let scan = with.run(cell, &VENDORED);
+        assert_eq!(scan.code, 0, "{}", scan.dump);
+        assert_eq!(scan.envelope["summary"]["applied"], 1, "{}", scan.dump);
+        let after = cell.tree();
+        (changed(&before, &after), after[REQUIREMENTS].clone())
+    };
+    let written = vendors(&retained(Some("9.3.2"), false));
+    let line = String::from_utf8_lossy(&written.1);
+    assert!(line.contains("./.socket/vendor/pypi/"), "{line}");
+    for release in ["9.3.2", "9.0.0", "10.0.0"] {
+        let kept = vendors(&retained(Some(release), true));
+        assert!(kept == written, "{release}");
+    }
+    let names = format!("names {REQUIREMENTS}; ");
+    let package = Declined {
+        purl: PURL,
+        code: DECLINED,
+        names: &["`pip_parse` (WORKSPACE:1)", &names],
+    };
+    for release in [Some("7.7.2"), Some("8.8.2"), None, Some("latest")] {
+        let cell = retained(release, true);
+        let before = cell.tree();
+        cell.declined(&with.run(&cell, &VENDORED), &package, 1, "failed", &before);
+    }
+}
+
+/// Without a Bazel: with `SOCKET_NO_BAZEL=1` vendored mode vendors the
+/// package whose requirements the hub reads, as it does in the same
+/// checkout without its `MODULE.bazel`, to the byte. Without the variable
+/// it declines the package there.
+#[test]
+fn the_switch_makes_vendored_mode_the_one_of_a_checkout_without_bazel() {
+    let with = Vendoring::new();
+    let cell = checkout(&with);
+    let origin = with.standin.origin();
+    let json_api = format!("{origin}/{INDEX}/pypi");
+    let env = [
+        ("SOCKET_PATCH_SERVER_URL", origin.as_str()),
+        ("SOCKET_PYPI_JSON_API", json_api.as_str()),
+    ];
+    let declined = cell.off_is_without_bazel(&origin, &VENDORED, &env, &["MODULE.bazel"]);
+    assert_eq!(declined[0]["code"], 1, "{declined:#}");
 }
 
 /// Without a Bazel: the fixture's directories are those of its table, and

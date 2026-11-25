@@ -427,11 +427,16 @@ pub struct GlobalArgs {
     /// Vendored mode (`vendor`, `scan`/`get --mode vendored`): write for a
     /// package although the project is in a Bazel workspace, where the
     /// build may not find the vendored copy. Vendored mode declines such
-    /// a package by default; today that is a Composer package
+    /// a package by default: a Composer package
     /// (`vendor_composer_bazel_workspace`), whose lock names the copy by a
     /// path that a Bazel rule running `composer install` in another
-    /// directory does not find. Pass it when the build does find the
-    /// copy. Other subcommands accept it silently.
+    /// directory does not find, and a PyPI or RubyGems package whose lock
+    /// a rules_python or rules_ruby hub of the workspace reads
+    /// (`vendor_pypi_bazel_hub`, `vendor_gem_bazel_hub`), which builds
+    /// nothing from a lock that names a copy under `.socket/vendor`. Pass
+    /// it when the build does find the copy, or does not take the
+    /// project's packages from that lock. Other subcommands accept it
+    /// silently.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long = "allow-vendored-in-bazel",

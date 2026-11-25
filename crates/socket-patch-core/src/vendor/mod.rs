@@ -48,6 +48,7 @@
 pub mod path;
 pub mod state;
 
+pub mod bazel_hub;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub(crate) mod berry_zip;
 mod bun_binary;
