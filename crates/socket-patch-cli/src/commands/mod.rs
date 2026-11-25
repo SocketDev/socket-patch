@@ -56,8 +56,9 @@ pub(crate) fn project_state_in_scope(common: &crate::args::GlobalArgs) -> bool {
 }
 
 /// In a Bazel workspace the root's `.bazelignore` names the directories of
-/// the project's patched Go module copies, and of the vendored crates a
-/// crate hub builds, so that Bazel and gazelle read no package there
+/// the project's patched Go module copies, of the vendored crates a crate
+/// hub builds, and of the patched Maven jars that vendored mode keeps for a
+/// rules_jvm_external hub, so that Bazel and gazelle read no package there
 /// (`socket_patch_core::bazel::ignore`), and the root's `.bazelrc` names
 /// the directory of each patched wheel that vendored mode committed as a
 /// download cache of Bazel, so that the build takes the wheel from there
@@ -65,7 +66,7 @@ pub(crate) fn project_state_in_scope(common: &crate::args::GlobalArgs) -> bool {
 /// or remove such a copy calls this once, after the last step that can
 /// change a copy or take one back and before it gives up its apply lock.
 /// Nothing is done in a dry run or a `--global` run, and a run whose
-/// `--ecosystems` leaves `golang`, `cargo` or `pypi` out only takes away
+/// `--ecosystems` leaves `golang`, `cargo`, `maven` or `pypi` out only takes away
 /// that ecosystem's pair of a copy that is gone. So does the prune pass of
 /// a scan, which comes here after its scan has (`adds` false) and can only
 /// have removed a copy: a file it cannot write is left to the next
@@ -78,7 +79,7 @@ pub(crate) async fn sync_bazelignore(
     adds: bool,
 ) -> Vec<crate::json_envelope::RunWarning> {
     use socket_patch_core::bazel::{distdir, ignore};
-    use socket_patch_core::crawlers::Ecosystem::{Cargo, Golang, Pypi};
+    use socket_patch_core::crawlers::Ecosystem::{Cargo, Golang, Maven, Pypi};
     use socket_patch_core::vendor::pypi_distdir::sync_bazelrc;
     let mut warnings = Vec::new();
     if common.dry_run || common.is_global() {
@@ -91,11 +92,13 @@ pub(crate) async fn sync_bazelignore(
         projects.push(common.project_root());
     }
     let (loud, mut told) = (!common.json && !common.silent, Vec::new());
-    let [go, cargo, pypi] = [Golang, Cargo, Pypi].map(|eco| adds && common.ecosystem_selected(eco));
+    let [go, cargo, maven, pypi] =
+        [Golang, Cargo, Maven, Pypi].map(|eco| adds && common.ecosystem_selected(eco));
     for project in projects {
         // For each file that changed: the line a person is told, and what
         // that line is told once by.
-        let copies = ignore::sync(&project, go, cargo).await.map(|changed| {
+        let copies = ignore::sync(&project, go, cargo, maven).await;
+        let copies = copies.map(|changed| {
             changed.map(|(file, copies)| {
                 let (shown, copies) = (file.display(), copies.join(" and "));
                 let line = match file.exists() {
@@ -166,24 +169,31 @@ pub(crate) async fn sync_bazelignore(
 ///
 /// With `tell`, a human run is told here, as [`sync_bazelignore`] tells
 /// it. A command that prints the warnings of its run itself passes
-/// `false`.
+/// `false`. A `vendored` run patches a pinned hub itself: it is warned of
+/// the jars it wrote no entry for, each with the reason.
 pub(crate) async fn bazel_maven_notices<'a>(
     common: &crate::args::GlobalArgs,
     purls: impl Iterator<Item = &'a str>,
     tell: bool,
+    vendored: bool,
 ) -> Vec<crate::json_envelope::RunWarning> {
     if common.is_global() {
         return Vec::new();
     }
     let purls = purls.map(str::to_string).collect();
-    let said = socket_patch_core::bazel::maven::notices(&common.cwd, purls).await;
+    use socket_patch_core::bazel::maven::{notices, HUB_UNPATCHED};
+    let said = notices(&common.cwd, purls, vendored).await;
+    // A vendored dry run wrote no entry for any jar: the ones it would
+    // write are not unpatched.
+    let would_write = |code: &str| vendored && common.dry_run && code == HUB_UNPATCHED;
+    let said = said.into_iter().filter(|(code, _)| !would_write(code));
     let warning = |(code, detail): (&str, String)| {
         if tell && !common.json && !common.silent {
             eprintln!("Warning: {detail}");
         }
         crate::json_envelope::RunWarning::new(code, detail)
     };
-    said.into_iter().map(warning).collect()
+    said.map(warning).collect()
 }
 
 /// The vendor-ledger keys (`ledger`, the project's

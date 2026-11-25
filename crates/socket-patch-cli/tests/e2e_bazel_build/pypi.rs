@@ -627,7 +627,7 @@ impl Vendoring {
     /// server of their own, which a flow can stop while the index goes on
     /// answering.
     fn apart() -> Vendoring {
-        Vendoring::on(Some(StandIn::alone()))
+        Vendoring::on(Some(StandIn::start()))
     }
 
     fn on(host: Option<StandIn>) -> Vendoring {

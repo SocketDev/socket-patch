@@ -2753,6 +2753,15 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             let gc_bytes_freed = gc.map_or(0, |gc| gc.bytes_freed);
 
             // ── run-level warnings ───────────────────────────────────────
+            // The jar that vendored mode kept for a Bazel hub alone is in
+            // no installed tree: the next Bazel build takes the hub's own.
+            let of_hub = |key: &String| {
+                let flavor = socket_patch_core::vendor::maven_repo::HUB_FLAVOR;
+                let hub = |(k, e): &(String, socket_patch_core::vendor::VendorEntry)| {
+                    k == key && e.flavor.as_deref() == Some(flavor)
+                };
+                vendor_entries.iter().any(hub)
+            };
             let advised = ReinstallAdvised::of(
                 vendored_leg
                     .warnings
@@ -2775,6 +2784,7 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             let still_patched = vendored_leg
                 .reverted
                 .iter()
+                .filter(|key| !of_hub(key))
                 .chain(vendored_leg.preserved.iter())
                 .chain(hosted_leg.reverted.iter())
                 .filter(|key| {
