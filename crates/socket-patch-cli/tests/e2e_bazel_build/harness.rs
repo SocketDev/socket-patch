@@ -1726,7 +1726,7 @@ impl Cell {
 
     /// Agent mode in this checkout, through `run`, for a package that its
     /// package manager keeps outside the checkout, where `installed` is a
-    /// file of that copy: `scan --mode agent --yes` gives the file the text
+    /// file of that copy: `scan --mode agent --yes` gives the file the bytes
     /// `patched`, from the record of the patch, and writes nothing into the
     /// checkout but its own `.socket` directory, and the `apply` of a later
     /// run passes. Then what the two say with `--vex`, and what `vex` and
@@ -1736,7 +1736,7 @@ impl Cell {
         &self,
         run: impl Fn(&Cell, &[&str]) -> Ran,
         installed: &Path,
-        patched: &str,
+        patched: impl AsRef<[u8]>,
         claim: &Claim,
     ) -> Tree {
         let test = &self.test;
@@ -1752,8 +1752,9 @@ impl Cell {
         let mut wrote = changed(&before, &left);
         wrote.retain(|file| !file.starts_with(".socket/"));
         assert_eq!(wrote, NOTHING, "{test}: {said}");
-        let holds = std::fs::read_to_string(installed).unwrap_or_default();
-        assert_eq!(holds, patched, "{test}: {}", installed.display());
+        let holds = std::fs::read(installed).unwrap_or_default();
+        let (at, shown) = (installed.display(), String::from_utf8_lossy(&holds));
+        assert!(holds == patched.as_ref(), "{test}: {at} holds:\n{shown}");
 
         let again = self.document("apply");
         let apply = run(self, &[&["apply"][..], &with_vex(&again)].concat());
