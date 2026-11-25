@@ -139,6 +139,34 @@ fn a_run_that_leaves_no_document_takes_the_entry_out() {
     assert!(!out.status.success(), "{envelope}");
     assert!(!cwd.join(DOCUMENT).exists());
     assert_eq!(config(cwd), "vex-documents:\n");
+    assert_eq!(envelope["grypeConfig"]["change"], "removed", "{envelope}");
+}
+
+#[test]
+fn a_switch_value_in_the_env_names_the_default_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    write_manifest(cwd, &["pkg:npm/lodash@4.17.20"]);
+    let out = common::hermetic::binary_command()
+        .current_dir(cwd)
+        .env("SOCKET_VEX_GRYPE_CONFIG", "true")
+        .args([
+            "vex",
+            "--no-verify",
+            "--product",
+            "pkg:npm/test-app@1.0.0",
+            "--output",
+            DOCUMENT,
+        ])
+        .output()
+        .expect("invoke vex");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!cwd.join("true").exists());
+    assert_eq!(config(cwd), "vex-documents:\n  - socket.vex.json\n");
 }
 
 #[test]

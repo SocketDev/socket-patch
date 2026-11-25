@@ -21,6 +21,21 @@ use crate::json_envelope::RunWarning;
 /// The run warning for a config the run could not update.
 pub(crate) const GRYPE_CONFIG_NOT_UPDATED: &str = "grype_config_not_updated";
 
+/// The config `--grype-config` / `SOCKET_VEX_GRYPE_CONFIG` names. The other
+/// `SOCKET_VEX_*` variables are switches, so a switch value is read as one:
+/// `1` / `true` / `yes` names `.grype.yaml`, `0` / `false` / `no` none.
+pub(crate) fn config_path(value: Option<&Path>) -> Option<PathBuf> {
+    let value = value?;
+    match value.to_str().map(str::to_ascii_lowercase).as_deref() {
+        Some("1" | "true" | "yes") => Some(PathBuf::from(DEFAULT_CONFIG)),
+        Some("0" | "false" | "no") => None,
+        _ => Some(value.to_path_buf()),
+    }
+}
+
+/// The config a bare `--grype-config` names.
+pub(crate) const DEFAULT_CONFIG: &str = ".grype.yaml";
+
 /// What a run did to the Grype config.
 pub(crate) struct GrypeConfigOutcome {
     pub path: PathBuf,
@@ -112,8 +127,13 @@ pub(crate) async fn unlist_missing_document(
     if tokio::fs::symlink_metadata(output).await.is_ok() {
         return None;
     }
+    // A document this run could not have listed is not looked for.
     let entry = entry_for(config, output).ok()?;
-    let text = read_config(config).await.ok()??;
+    let text = match read_config(config).await {
+        Ok(Some(text)) => text,
+        Ok(None) => return None,
+        Err(why) => return Some(unchecked(config, entry, &why)),
+    };
     match remove_vex_document(&text, &entry) {
         Ok(GrypeConfigEdit::Unchanged) => None,
         Ok(GrypeConfigEdit::Write(_)) if dry_run => Some(outcome(config, entry, "would_remove")),
@@ -127,7 +147,7 @@ pub(crate) async fn unlist_missing_document(
                 )),
             }
         }
-        Err(why) => Some(stale_entry(config, entry, &why)),
+        Err(why) => Some(unchecked(config, entry, &why)),
     }
 }
 
@@ -181,6 +201,24 @@ fn stale_entry(config: &Path, entry: String, why: &str) -> GrypeConfigOutcome {
     }
 }
 
+/// A config the run could not check for `entry` after the document went.
+fn unchecked(config: &Path, entry: String, why: &str) -> GrypeConfigOutcome {
+    GrypeConfigOutcome {
+        path: config.to_path_buf(),
+        warning: Some(RunWarning {
+            code: GRYPE_CONFIG_NOT_UPDATED.to_string(),
+            detail: format!(
+                "{} was not checked for `{entry}`: it {why}. Grype fails a scan whose listed \
+                 document is missing, so remove `{entry}` from `{VEX_DOCUMENTS_KEY}` if it is \
+                 there.",
+                config.display()
+            ),
+        }),
+        entry: Some(entry),
+        change: "not_updated",
+    }
+}
+
 /// The config's text; `None` when there is no file.
 async fn read_config(config: &Path) -> Result<Option<String>, String> {
     match tokio::fs::symlink_metadata(config).await {
@@ -199,6 +237,16 @@ async fn read_config(config: &Path) -> Result<Option<String>, String> {
 /// with `/` separators. Grype resolves the list against the directory it
 /// runs in, so it is run from the config's directory.
 fn entry_for(config: &Path, output: &Path) -> Result<String, String> {
+    // `..` after a symlinked directory is resolved by the OS, not by the
+    // lexical fold below, so such a path could name another file.
+    for path in [config, output] {
+        if path.components().any(|c| c == Component::ParentDir) {
+            return Err(format!(
+                "is named with `..` (in {}), which this run does not resolve",
+                path.display()
+            ));
+        }
+    }
     let cwd = std::env::current_dir().map_err(|e| format!("has no base directory ({e})"))?;
     let dir = lexical(&cwd.join(config));
     let dir = dir.parent().map(Path::to_path_buf).unwrap_or(dir);
@@ -255,5 +303,10 @@ mod tests {
             "out/socket.vex.json"
         );
         assert!(entry_for(Path::new("sub/.grype.yaml"), Path::new("socket.vex.json")).is_err());
+        assert!(entry_for(
+            Path::new(".grype.yaml"),
+            Path::new("build/../socket.vex.json")
+        )
+        .is_err());
     }
 }

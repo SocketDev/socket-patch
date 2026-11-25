@@ -131,7 +131,7 @@ pub struct VexArgs {
         env = "SOCKET_VEX_GRYPE_CONFIG",
         value_name = "PATH",
         num_args = 0..=1,
-        default_missing_value = ".grype.yaml"
+        default_missing_value = vex_grype::DEFAULT_CONFIG
     )]
     pub grype_config: Option<PathBuf>,
 }
@@ -422,8 +422,9 @@ pub async fn run(args: VexArgs) -> i32 {
         );
     }
 
+    let grype_config = vex_grype::config_path(args.grype_config.as_deref());
     // Grype reads the document from a file, never from stdout.
-    if args.grype_config.is_some() && output.is_none() {
+    if grype_config.is_some() && output.is_none() {
         return crate::json_envelope::usage_error(
             Command::Vex,
             args.common.json,
@@ -476,7 +477,7 @@ pub async fn run(args: VexArgs) -> i32 {
     match generate_vex_from_manifest_path(&common, &params, &manifest_path).await {
         Ok(mut summary) => {
             run_warnings.append(&mut summary.warnings);
-            let grype = match (&args.grype_config, &output) {
+            let grype = match (&grype_config, &output) {
                 (Some(config), Some(path)) => {
                     Some(vex_grype::list_document(config, path, params.dry_run).await)
                 }
@@ -518,17 +519,19 @@ pub async fn run(args: VexArgs) -> i32 {
             run_warnings.append(&mut e.warnings);
             // No document is left at `--output`: an entry naming it would
             // fail every Grype scan.
-            if let (Some(config), Some(path)) = (&args.grype_config, &output) {
-                if let Some(grype) =
+            let grype = match (&grype_config, &output) {
+                (Some(config), Some(path)) => {
                     vex_grype::unlist_missing_document(config, path, params.dry_run).await
-                {
-                    if let Some(warning) = grype.warning.clone() {
-                        print_warnings(&args.common, std::slice::from_ref(&warning));
-                        run_warnings.push(warning);
-                    } else if !args.common.json && !args.common.silent {
-                        if let Some(line) = grype.human_line() {
-                            eprintln!("{line}");
-                        }
+                }
+                _ => None,
+            };
+            if let Some(grype) = &grype {
+                if let Some(warning) = grype.warning.clone() {
+                    print_warnings(&args.common, std::slice::from_ref(&warning));
+                    run_warnings.push(warning);
+                } else if !args.common.json && !args.common.silent {
+                    if let Some(line) = grype.human_line() {
+                        eprintln!("{line}");
                     }
                 }
             }
@@ -580,7 +583,15 @@ pub async fn run(args: VexArgs) -> i32 {
                 _ => (e.message, 2),
             };
             let gems = StaleHostedGems::among(&common, &manifest_path, &e.failed, &e.hosted).await;
-            emit_envelope_error(&args, e.code, &message, &e.failed, &gems, &run_warnings);
+            emit_envelope_error(
+                &args,
+                e.code,
+                &message,
+                &e.failed,
+                &gems,
+                &run_warnings,
+                grype.as_ref(),
+            );
             if !args.common.json {
                 below.print();
             }
@@ -2709,9 +2720,13 @@ fn emit_envelope_error(
     failures: &[FailedPatch],
     gems: &StaleHostedGems,
     warnings: &[RunWarning],
+    grype: Option<&vex_grype::GrypeConfigOutcome>,
 ) {
     if args.common.json {
         let mut env = Envelope::new(Command::Vex);
+        if let Some(grype) = grype {
+            env.set_extra("grypeConfig", grype.to_json());
+        }
         env.dry_run = args.common.dry_run;
         for f in failures {
             env.record(
