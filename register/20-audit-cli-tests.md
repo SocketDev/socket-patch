@@ -20,7 +20,7 @@ _Last updated 2026-11-02T16:20Z · main @ fd86ff2 · owner: audit-cli-tests_
 | T15 | 2 | Per-purl top-ranked selection 5× (get, scan/policy ×2, core rollout, core memory); socket.yml floor 3×; tier filter 4×. |  | to verify |
 | T16 | 2 | remove and rollback each render `VendorRevertStep` in their own loop; drifted on `--preserve-state --dry-run` (remove previews a full revert), go-undo warnings, drift-keep text and stop-at-first-failure. | #1861 | filed #1861 |
 | T17 | 2 | The "no manifest" gate is written 3× (remove, repair, rollback), drifted on vendor wiring, legacy state, hosted wiring, global scope and message. C74. |  | to verify |
-| T18 | 3 | `scan/discovery.rs` keeps a private `shell_word` beside `ui::shell_word`; it quotes POSIX-style on Windows and leaves `%` bare. | #1859 | in PR #1884 |
+| T18 | 3 | `scan/discovery.rs` keeps a private `shell_word` beside `ui::shell_word`; it quotes POSIX-style on Windows and leaves `%` bare. | #1859 | fixed (#1884) |
 | T19 | 3 | GC reporting differs past C79: repair records `cleanup_failed` as `Skipped` (others: warning), singular labels, and 4 human renderers. |  | to verify |
 | T20 | 3 | The "JSON envelope or stderr" error emit is hand-written ~6× (remove, rollback, repair ×3, list, scan) plus 4 open-coded rollback branches. Wants `json_envelope::emit_error`. | #1924 | filed #1924 |
 | T21 | 3 | The warning sink (`--json` → `warnings[]`, else stderr) is hand-rolled per command (list ×3, user_patches, withdrawn); withdrawn prints under `--silent`, the others don't; 40 `RunWarning {` literals vs 17 `RunWarning::new`. |  | to verify |
@@ -53,20 +53,20 @@ _Last updated 2026-11-02T16:20Z · main @ fd86ff2 · owner: audit-cli-tests_
 | T48 | 3 | vex_consumed re-derives core rules (Go hosted uuid suffix, Maven `-socket.{hex8}`, cargo registry prefix ×3, `PRODUCT_MANIFESTS`). Child of #855. |  | to verify |
 | T49 | 3 | vlt naming is crossed between CLI `vlt_preflight.rs`, core `redirect::vlt_preflight` and `vlt_heal.rs`; `redirect_vlt_reinstall_required` returns in 3 shapes. Part of T27/T05. |  | to verify |
 | T50 | 3 | Toolchain e2e gate `required()`/`skip()` hand-written per suite (15 / 8 defs); drifted: `=0` required for golang/sbt/npm/nuget/deno, not cargo/uv/bundler; docker accepts only `"1"`. | #1940 | filed #1940 |
-| T51 | 3 | 9 `tests/apply` suites re-write `apply_fixture`'s manifest/blob/package/gem/event helpers in the same binary. | #1941 | in PR #1944 |
-| T52 | 3 | PTY runner (openpty, spawn, feed, collect) copied 7× beside `common/pty_io.rs`; only 2 copies set `TERM`. | #1942, #1955 | in PR #1955 |
+| T51 | 3 | 9 `tests/apply` suites re-write `apply_fixture`'s manifest/blob/package/gem/event helpers in the same binary. | #1941 | fixed (#1944) |
+| T52 | 3 | PTY runner (openpty, spawn, feed, collect) copied 7× beside `common/pty_io.rs`; only 2 copies set `TERM`. | #1942, #1955 | fixed (#1955) |
 | T53 | 3 | `hermetic::command` removes `SOCKET_PROXY_URL`, so a fetch with no mock reaches the live public proxy: `apply_invariants` L355 does (executed). |  | to verify |
 | T54 | 3 | The `--json` reader ratchet (`envelope_helper_copies`) is name-based: misses 7 `fn envelope(` parsers; stale allowlist entries pass. Part of C32. | #1089 | to verify |
-| T55 | 3 | Suites that include `common` keep their own `has_command` ×9, `sha256_hex` ×16, `git_sha256_file`/`assert_run_ok` ×4, `npm_run` ×3; dead `stderr_chatter` filter (executed); `rollback_json` copies 4 envelope readers. | #1959 | filed #1959 |
-| T56 | 3 | Parse-suite env scrub written 4 ways (`EnvScrub` ×4, hand lists, `with_clean_env`, none); `SOCKET_JSON=true` fails 3 (executed). | #1956 | in PR #1978 |
+| T55 | 3 | Suites that include `common` keep their own `has_command` ×9, `sha256_hex` ×16, `git_sha256_file`/`assert_run_ok` ×4, `npm_run` ×3; dead `stderr_chatter` filter (executed); `rollback_json` copies 4 envelope readers. | #1959 | in PR #2241; slice 1 |
+| T56 | 3 | Parse-suite env scrub written 4 ways (`EnvScrub` ×4, hand lists, `with_clean_env`, none); `SOCKET_JSON=true` fails 3 (executed). | #1956 | fixed (#1978) |
 | T57 | 3 | The `cli_parse_<cmd>` suites re-pin flattened `GlobalArgs` one test per flag (~85 tests) beside `cli_global_args`' matrix; their field lists drift (apply/rollback `bool_flags` lack 5). Follows T56. |  | to verify |
 | T58 | 3 | 21 `tests/common` selftests run in each of ~104 includers (~2K redundant runs; 14 binaries include `cache_env` twice); the "no `cfg(test)` in integration crates" comment ×3 is false (executed). | #1957 | filed #1957 |
-| T59 | 3 | `hermetic::command` leaves `CLICOLOR_FORCE`/`NO_COLOR`/`COLUMNS`/`CI` ambient (executed); `HOSTILE_SEEDS` seed then remove the same list. | #1958, #1964 | in PR #1964 |
-| T60 | 3 | Docker suites copy their harness (`cov_docker_args` ×10, `skip_if_no_image` ×11 mostly ungated, `run_container` ×5, `assert_vex_agent_attested` ×8); CI exports REQUIRED only in the `sbt)` arm. | #1968, #1972 | in PR #1972 |
+| T59 | 3 | `hermetic::command` leaves `CLICOLOR_FORCE`/`NO_COLOR`/`COLUMNS`/`CI` ambient (executed); `HOSTILE_SEEDS` seed then remove the same list. | #1958, #1964 | fixed (#1964) |
+| T60 | 3 | Docker suites copy their harness (`cov_docker_args` ×10, `skip_if_no_image` ×11 mostly ungated, `run_container` ×5, `assert_vex_agent_attested` ×8); CI exports REQUIRED only in the `sbt)` arm. | #1968, #1972 | partly fixed (#1972); slice 1 |
 | T61 | 3 | `prebuilt_common::prepare_command` filters `--offline` out of vendor/repair args; 49 `"--offline"` calls in 16 suites run online, and comments claim offline runs. | #1969 | filed #1969 |
 | T62 | 3 | 8 of 9 docker agent suites serve a zero `beforeHash` and `apply --force`, so only the force path is proven (gem's doc says so); port gem's real-hash probe. | #1970 | filed #1970 |
 | T63 | 3 | Docker vendor capstones: `assert_vex_attested_from_host` ×4 checks only `(vendored)` beside `assert_attested`; `render` ×5; stage-3 bash ×5; 4 manifest-less VEX mechanisms. |  | to verify |
-| T64 | 3 | Test fs/scan plumbing copied: 38 recursive `copy_tree`/`copy_dir_recursive` (20 identical), `start_proxy`+`assert_proxy_served_scans` ×4, `hosted_pin_count` ×8 beside `envelope::hosted_pins`. | #1979, #1988 | in PR #1988; slice 1 |
+| T64 | 3 | Test fs/scan plumbing copied: 38 recursive `copy_tree`/`copy_dir_recursive` (20 identical), `start_proxy`+`assert_proxy_served_scans` ×4, `hosted_pin_count` ×8 beside `envelope::hosted_pins`. | #1979, #1988 | partly fixed (#1988); slice 1 |
 | T65 | 3 | Go e2e harness copied across 5 suites beside `golang_e2e_matrix`: `go()` ×4 (drifted on `GOFLAGS`/`GOWORK`), file-proxy publish+zip ×5, `ChmodGuard` ×2 (md5-identical), grant/sumdb mocks ×3. | #1980 | filed #1980 |
 | T66 | 3 | `hermetic` has no Go `Extra`: children inherit `GOFLAGS`/`GOENV`/`GOWORK`/`GOPATH`/`GOMODCACHE`; Go suites `set_var` unrestored; hosted-production golang/deno tests can't fail. | #1981 | filed #1981 |
 | T67 | 3 | Gradle `--global-prefix` tests pass without the flag: `isolate_cli`/`socket()` always set `GRADLE_USER_HOME`, which silences `gradle_user_home_differs` (executed); no test asserts the warning fires. | #1982 | filed #1982 |

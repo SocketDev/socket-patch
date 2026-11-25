@@ -3,7 +3,7 @@ _Last updated 2026-11-02T12:57Z · main @ cbbbdb9 · owner: audit-core_
 
 | ID | P | Problem | Issues | Status |
 |---|---|---|---|---|
-| A01 | 1 | Cargo config chain walked 3× (`source_replacement`, `cargo_build_cache`: wrong target dir, executed; `vendor/cargo_config`) plus 4 legacy-file picks. | #1832 | in PR #1849 |
+| A01 | 1 | Cargo config chain walked 3× (`source_replacement`, `cargo_build_cache`: wrong target dir, executed; `vendor/cargo_config`) plus 4 legacy-file picks. | #1832 | fixed (#1849) |
 | A02 | 1 | `cargo_workspace::wildcard_match` has no `[...]` classes (executed); one of three segment glob matchers. | #1833 | in PR #1866 |
 | A03 | 2 | GOMODCACHE/GOPATH default ×2 (`go_crawler`, `go_installed_tools`), drifted on empty GOPATH and home fallback. | #1834 | in PR #1876 |
 | A04 | 2 | Callers re-derive `utils::line_endings` (vendor/common, python_lock, lock_fragments) plus 3 `eol_eq` copies. | #814, #815 | filed #814; new sites added to the tracker's scope |
@@ -22,14 +22,14 @@ _Last updated 2026-11-02T12:57Z · main @ cbbbdb9 · owner: audit-core_
 | A17 | 3 | pnpm `packages:` membership refuses `{}[]` globs the shared matcher reads; hosted keeps a second reader. | #1846 | in PR #1863 |
 | A18 | 3 | "poetry.lock written before 1.4" ×2 while `poetry_lock::lock_writer_version` is dead. | #1847 | in PR #1865 |
 | A19 | 3 | Lexical `..` folding ×5 beside `utils::relpath` (maven_scope, cargo_crawler, hatch_env, python_script, `formats::nuget::lock::resolve_relative`, drifted on `C:x` and `x/..`). Unexecuted. |  | to verify |
-| A20 | 3 | URL credential stripping ×2: `redact::strip_url_credentials` is dead while VEX `@id` and upstream npm use `vex::product::strip_url_userinfo`; the copies differ on query and authority end. | #1848 | in PR #1923 |
+| A20 | 3 | URL credential stripping ×2: `redact::strip_url_credentials` is dead while VEX `@id` and upstream npm use `vex::product::strip_url_userinfo`; the copies differ on query and authority end. | #1848 | fixed (#1923) |
 | A21 | 3 | The walk to the enclosing `.git` is hand-written outside `repo_root` (core `patch/user_patches.rs` L49/L65, `governing_root.rs` L528, `hatch_workspace.rs` L101): no `GIT_CEILING_DIRECTORIES`, any `.git` file type. Unexecuted. |  | to verify |
 | A22 | 3 | uv settings-file choice and `no-binary` precedence ×2 (`python_script`, `redirect/upstream/uv.rs`); drifted on refusal labels. |  | to verify |
 | A23 | 3 | Hosted `redirect/requirements.rs` keeps its own logical-line lexer beside `utils::requirements`. |  | to verify |
 | A24 | 3 | "Is this our earlier hosted pin" ×2 (`python_lock::is_prior_hosted_url`, `python_script::same_hosted_artifact`). |  | to verify |
 | A25 | 3 | PEP 508 leading-name scanner ×3 (`vendor/common.rs` L602, `requirements.rs` L438, inline `python_lock.rs` L665, which skips `trim_start`); `canonicalize_pypi_name` still in `crawlers::python_crawler` (#883 closed). |  | to verify |
 | A26 | 3 | Civil-date math lives in three modules: `days_from_civil` twice (`api/date.rs` L48, `formats/cargo/floor.rs` L26) and its inverse in `vex/time.rs`, whose doc claims to be the only copy. | #1867 | filed #1867 |
-| A27 | 2 | `api/client.rs`: two near-copy serve GETs, 4 hand retry loops, two retry policies that disagree (executed). | #1869 | in PR #1870 |
+| A27 | 2 | `api/client.rs`: two near-copy serve GETs, 4 hand retry loops, two retry policies that disagree (executed). | #1869 | fixed (#1870) |
 | A28 | 3 | `api/` is not a leaf: `vendor_prefetch` belongs in `vendor/`; `client.rs` carries the pypi wheel gate; `api::types` imports `patch::redirect`. (#833). | #833 | to verify |
 | A29 | 3 | Four xorshift64* test RNGs; 7 `crawlers/*/oracle.rs` (~2.8K lines) keep pre-migration crawlers. | #1868 | in PR #1882; oracle deletion still to decide |
 | A30 | 2 | Maven `${…}` interpolation ×5 (`maven_crawler`, `formats::maven`, `maven_scope`, `maven_reactor` ×2); drifted on recursion, undefined names, and only `formats::maven` caps output length. | #1887 | filed #1887 |
@@ -56,7 +56,7 @@ _Last updated 2026-11-02T12:57Z · main @ cbbbdb9 · owner: audit-core_
 | A51 | 3 | FIFO test scaffolding ~25 `mkfifo` copies (nuget/cargo `make_fifo`+`within_deadline` byte-identical) beside `oracle_support::fifo`; reader-release helper ×3. |  | to verify |
 | A52 | 3 | `crawlers/pkg_managers` crawls nothing: `YarnEnv`/rc resolution belongs in `formats::yarn`, `YarnPnpLoader` in `vex`; root-linker read copied in `lock_inventory/view.rs`. Extends A08, E75. |  | to verify |
 | A53 | 2 | Bundler path tier rule ×2 in `ruby_crawler` (`bundler_sets_explicit_path` vs `bundler_path_tier`/`config_path_tier`) + 3 partial copies; discovery ignores a falsy `disable_shared_gems` (executed). | #1931 | in PR #1943 |
-| A54 | 2 | `gemspec_directives`/`dev_dependency_requirements` bypass `manifest::for_each_code_line`, so `=begin` blocks and heredocs are read as code (executed on copies). | #1932 | in PR #1936 |
+| A54 | 2 | `gemspec_directives`/`dev_dependency_requirements` bypass `manifest::for_each_code_line`, so `=begin` blocks and heredocs are read as code (executed on copies). | #1932 | fixed (#1936) |
 | A55 | 2 | "Is crates.io" ×4 (substring, exact, normalized, `[patch]` key); `CargoLock::entries` accepts `index.crates.io.evil.example` (executed). | #1933 | filed #1933 |
 | A56 | 2 | Hosted composer splices server url/sha1 via expanding `Regex::replace`, unvalidated and unescaped: lock stops parsing (executed). Extends A06. | #1934 | filed #1934 |
 | A57 | 3 | ~1.26K lines of Bundler settings in `ruby_crawler`, imported by `formats/gem`; `.bundle/config` key reader ×2 drifted; manifest-name list ×2. Extends E20. | #1935 | filed #1935 |

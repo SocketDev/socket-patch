@@ -1,47 +1,26 @@
 ### Refactor routine
-_Last updated 2026-11-02T15:45Z · main @ cbbbdb9_
+_Last updated 2026-11-25T15:40Z · main @ e685fb1_
 
 #### In flight
 | PR | Kind | Scope | State |
 |---|---|---|---|
-| #1842 | sweep | `cli/src/args.rs` | ready |
-| #1855 | sweep | `commands/{bun_preflight,composer_hints,context,fetch_stage}.rs` | ready; CI needs a re-run (Depot) |
-| #1849 | structural | A01 #1832: `utils/cargo_build_cache.rs` | ready; green |
-| #1864 | sweep | `commands/{hosted_bundle,hosted_unwind,list,lock_cli,mod,pypi_reinstall}.rs` | ready; green |
-| #1870 | structural | A27 #1869: `api/client.rs`, one serve GET and one vendor retry loop | ready; green |
-| #1875 | sweep | `commands/{remove,repair}.rs` | ready; green |
-| #1884 | sweep | `scan/discovery.rs` (+ T18 #1859; tests moved to core) | ready; green |
-| #1892 | sweep | `scan/gc.rs` | ready; green |
-| #1897 | sweep | `scan/hosted.rs` (all but `run_redirect_selected_untracked`, T24) | ready; green |
-| #1903 | sweep | `scan/hosted/{nuget,takeover}.rs` | ready; green |
-| #1907 | sweep | core `constants.rs`, 8 `utils/` files (`cargo_home`…`failpoint`) | ready; green |
-| #1914 | sweep | core `utils/{http,mod,hatch_workspace,hatch}.rs` | ready; green |
-| #1920 | sweep | core `utils/{notice,npm_range,package_manager,pep440,pipenv,purl}.rs` (+ `target.rs` callers) | ready; green |
-| #1923 | sweep + A20 #1848 | core `utils/{redact,repo_root,serde,toml_edit_ext,uri,uv_workspace}.rs` | ready; green |
-| #1929 | sweep | `commands/{update,user_patches,vendor_orphans,vlt_heal}.rs` | ready; green |
-| #1936 | structural | A54 #1932: `formats/gem/{gemspec,manifest}.rs`, `vex/product.rs` (`for_each_code_line` → `code_lines`) | ready; green |
-| #1939 | sweep | `commands/vendored_backend/{mod,repair}.rs` | ready; green |
-| #1944 | structural | T51 #1941: 11 `tests/apply` suites + `common/envelope.rs` onto `apply_fixture` (test-only, −635 net) | ready; `hosted-e2e` red on a live 403, not this diff |
-| #1955 | structural | T52 #1942: 7 PTY runners → `common/pty_io::{run,run_command}` (test-only, +172/−567) | ready; green |
-| #1948 | sweep | `commands/{vex_consumed,vex_sources}.rs` | ready; green |
-| #1961 | sweep | `cli/src/ui/{mod,prompt,status}.rs` (`test_support.rs` clean) | ready; green |
-| #1964 | structural | T59 #1958: `tests/common/hermetic.rs` color scrub; seeds → parent-env canary (test-only, +69/−82) | ready; green |
-| #1967 | sweep | `cli/src/{json_envelope,update_notifier,main,interrupt,path_scope}.rs` (path_scope tests only, #1864) | ready; green |
-| #1972 | structural | T60 #1968 slice 1: `tests/docker_common` + 15 `docker_e2e_*` suites (test-only, +260/−1,113) | ready; green |
-| #1975 | sweep | core `api/{blob_fetcher,date,retry,types}.rs` | ready; green |
-| #1978 | structural | T56 #1956: 9 `cli_parse_*`/`cli_global_args` suites onto `hermetic::try_parse` + new `common/clap_parse.rs` (test-only, +418/−1,471) | ready; green |
-| #1985 | sweep | `scan/{rollout,rollout_args,withdrawn}.rs` (+ core `rollout/stage.rs`) | ready; green |
-| #1988 | structural | T64 #1979 slice 1: `tests/common/{fs_tree,scan_proxy}.rs`; 28 copiers + 4 proxy copies deleted (test-only, +218/−589) | ready; green |
-| #1990 | sweep | core `utils/{python_lock,python_script}.rs` (+ `hosted/engine.rs` wheel gate, `vendor/pypi_uv.rs`, 2 lines of `redirect/mod.rs`) | ready; green |
+| #2241 | structural | T55 #1959 slice 1: `tests/` copies of `has_command` ×6, `git_sha256_file` ×4, `sha256_hex` ×9, `stderr_chatter` ×4, dead `common` helpers (test-only) | ready; CI running |
 
 #### Merged
-_None._
+All 29 PRs merged on 2026-11-02. Net lines (`src/` incl. inline tests / `tests/`):
+#1842 −326 · #1855 −113 · #1849 +62 · #1864 −140 · #1870 −21 · #1875 −218 · #1884 −156 · #1892 −269 · #1897 −151 · #1903 −29 · #1907 −128 · #1914 +26 · #1920 −297 · #1923 −105 · #1929 −36 · #1936 +24 · #1939 −54 · #1948 −38 · #1961 −155 · #1967 −250 · #1975 −494 · #1985 +3 · #1990 −305 (src −3,170); test-only #1944 −635 · #1955 −395 · #1964 −13 · #1972 −853 · #1978 −1,053 · #1988 −371 (tests −3,320).
 
 #### Queue
-Structural, scored `3·B + 2·U + 2·D + 2·C − risk`. Nothing merged since 2026-10-29, so most candidates ≥6 stay blocked: A30 #1887 (~8.7, #1886), T09 #1858 (~7, #1864/#1698), A41 #1899 (~6, #1891/#1829/#1906), A43 #1900 (~6, #1863/#1698), T01 #1835 / T25 #1877 (#1698), A53 #1931 / A57 #1935 (`ruby_crawler.rs`, #1882/#1895/#1943), A55 #1933 (`redirect/mod.rs`). Free test-only: T64 #1979 rest (copies held by 9 PRs; then a `shared_helper_copies` guard), T60 #1968 rest (~7, after #1972: CI REQUIRED export, `assert_api_exercised`, `GIT_SHA256_FN` ×3, bash summary greps), T61 #1969 (~6; `e2e_bun_lockb.rs` held by #1905), T50 #1940 (~7; land the suites not held by #1698/#1843/#1893/#1894), T55 #1959 (~7, ~35 files; `tests/apply` is #1944), T58 #1957 (~6).
-A26 #1867, A46 #1917, A44 #1918 score ~4.
+Structural, scored `3·B + 2·U + 2·D + 2·C − risk`, re-checked 2026-11-25 @ e685fb1:
+- A30 #1887: mostly done on `main` (`formats/maven/properties.rs` `interpolate_strict` serves scope, selection and reactor); left: `maven_crawler::{interpolate, interpolate_defined}` (one-level, Maven settings/`maven.config` semantics, not a dup) and the model-field lookup closure copied in `maven_scope`/`maven_selection` (~4).
+- T09 #1858 (~7): held by #2237 (`apply.rs`, `rollback.rs`, `agent_download.rs`).
+- T55 #1959 rest (~6): shared-module `sha256_hex` copies (`vex_pypi_real_common`, `vex_pipenv_pip_real`, `hosted_maven_common`, `jvm_fixture_repo`, `e2e_artifactory_mirror`) via `common/oracle.rs`; `rollback_json` → `envelope`; local `assert_run_ok`/`npm_run` (bound to each file's own `run`, and `common::run_toolchain` doesn't scrub `SOCKET_*`); held: `e2e_bazel_build/*`, `e2e_redirect_gem_build.rs`, `maven_build_common`, `rollback/cli_rollback_silent.rs`.
+- A74 #1974 (p1, ~5, risk M): `governing_root` membership model → `formats/npm_workspace.rs`; #1928/#1971 have merged.
+- A57 #1935 (p1): #1931 merged; check `ruby_crawler.rs` against open gem fix PRs.
+- T60 #1968 rest, T64 #1979 rest, T50 #1940, T58 #1957: re-check against `main`.
 
-Next sweep files, in order: `scan/policy.rs`, `scan/render.rs` after #1856/#1884; `api/vendor_prefetch.rs`, crawler rows (`fuzzy_match`, `listing`, `jvm_cache`, `ivy_cache`, `coursier_cache`, `gradle_cache`, `sbt_evidence`, `hatch_env` are free); `group_commit.rs` (2,163, region); `tests/apply/*` rows not covered by #1944 (their notes list fake tests). Held: `vlt_preflight.rs`, `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` (#1698); `rollback.rs` (#1864); `utils/fs.rs`, core `lib.rs` (#1891); `lock_fragments.rs`/`pdm_lock.rs` (#1898); `poetry_lock.rs` (#1865/#1898); `pnpm_workspace.rs` (#1863); `process.rs` (#1895); `go_env.rs` (#1876); `cargo_workspace.rs` (#1866). Leftovers from merged-pending sweeps: `socket_yml_args.rs` `min_severity` → `Option<u8>` + injected env (held by #1978/#1864), `cli_parse_scan` env subset test + `"1.5"` reject row (#1978), rollout `offer`/`manifest` fixtures in CLI+core → `test-fixtures` (#1985); `ui/text.rs` sweep and the text-shaping move out of `ui/mod.rs` (#1884), `StatusLine::stderr(json, silent)` → one `report` bool (scan/mod.rs, lock_cli.rs) (#1961); `toml_edit_ext` deletion and `uv_workspace` fold (#1923); 7 `build_*_purl` wrappers + `parse_jsr_purl`, purl's PurlKey asserts → `purl_key.rs`, pipenv `installed_major`'s `_root` (#1920); String `read_capped` wrapper, `lock_fragments`/`pdm_lock` `pub mod` → `pub(crate)` (#1914); `CargoCrawler::cargo_home`, `vendor/jvm` digest copies, async `fs::is_symlink` (#1907); `api_auth_fallback_warning` → `json_envelope` and `PlanNote` → `RunWarning` (#1698), `store_variants` test → core `npm_crawler.rs` (#1829/#1891/#1906/#1915) (#1948); `PathScope::matches` (rollback L1814 loop) → `bind` once, plus `BoundScope::matching_pattern_indices` for rollback's `raw()` re-parse with `expect` (#1864); `AppliedVia` one-variant mirror + `from_core` (apply.rs, #1698) (#1967); `check_python_lock_source_scope` is test-only (its caller in `redirect/mod.rs`, held by 7 PRs), `artifact_filename` ×4 (`pypi_locks::basename` also splits `\\`), `ancestor_uv_config_files` → `relpath` (A19), `PythonLockSession::plan`'s `text` arg → keep the rendering in the session (#1990).
+Next sweep files: re-derive from `coverage/files.tsv` against `main` (3 weeks of drift since 2026-11-02); `scan/policy.rs`, `scan/render.rs`, `api/vendor_prefetch.rs`, the free crawler rows, `group_commit.rs` (region).
+Leftovers from merged sweeps (all still to do): `socket_yml_args.rs` `min_severity` → `Option<u8>` + injected env (held by #1978/#1864), `cli_parse_scan` env subset test + `"1.5"` reject row (#1978), rollout `offer`/`manifest` fixtures in CLI+core → `test-fixtures` (#1985); `ui/text.rs` sweep and the text-shaping move out of `ui/mod.rs` (#1884), `StatusLine::stderr(json, silent)` → one `report` bool (scan/mod.rs, lock_cli.rs) (#1961); `toml_edit_ext` deletion and `uv_workspace` fold (#1923); 7 `build_*_purl` wrappers + `parse_jsr_purl`, purl's PurlKey asserts → `purl_key.rs`, pipenv `installed_major`'s `_root` (#1920); String `read_capped` wrapper, `lock_fragments`/`pdm_lock` `pub mod` → `pub(crate)` (#1914); `CargoCrawler::cargo_home`, `vendor/jvm` digest copies, async `fs::is_symlink` (#1907); `api_auth_fallback_warning` → `json_envelope` and `PlanNote` → `RunWarning` (#1698), `store_variants` test → core `npm_crawler.rs` (#1829/#1891/#1906/#1915) (#1948); `PathScope::matches` (rollback L1814 loop) → `bind` once, plus `BoundScope::matching_pattern_indices` for rollback's `raw()` re-parse with `expect` (#1864); `AppliedVia` one-variant mirror + `from_core` (apply.rs, #1698) (#1967); `check_python_lock_source_scope` is test-only (its caller in `redirect/mod.rs`, held by 7 PRs), `artifact_filename` ×4 (`pypi_locks::basename` also splits `\\`), `ancestor_uv_config_files` → `relpath` (A19), `PythonLockSession::plan`'s `text` arg → keep the rendering in the session (#1990).
 
 #### Notes
 - Want issues (output-changing, found in sweeps): `ui::shell_word` misses `"`/`%VAR%` on cmd; `scan/gc.rs` `has_ledger` probes `--cwd` but `run_vendor_gc` reads `project_root()` (C43); gem stale probe dedups by purl and drops the platform suffix; `hatch::require_pip_installer_documents` ignores the `envs` override; `npm_range_admits(">=", v)` admits all; npm `upstream_registry_fallback` leaks `?token=` (use `redact_urls_in`); `vlt_heal` swallows `load_state`/lock read errors; `strip_url_userinfo`'s scp branch keeps `u:p@`.
@@ -50,6 +29,7 @@ Next sweep files, in order: `scan/policy.rs`, `scan/render.rs` after #1856/#1884
 - `--cwd` defaults to `.`: absolutize before walking `ancestors()`; test via chdir under `#[serial]`.
 - `vendor/cargo_config.rs` (~L165-L190) has a third `.cargo/config` pick: fold into `config_layer_paths` when swept.
 - Build with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0` (disk). CI's clippy has no `--tests`.
+- A shallow clone hides merges: deepen (`git fetch --shallow-since=<date> origin main`) before grepping `main` for `(#N)`.
 - Root-sandbox failures that pass in CI: 2 chmod tests in `tests/repair`, and core `copy_tree` symlinked-root, `vlt_heal` unremovable-lock, `pypi_poetry`/`pypi_requirements` wire-failure tests.; `in_process_redirect`'s 3 chmod tests
 - The proxy refuses branch deletions: name branches right first time.
 - `run_redirect_selected` still takes `Option<Envelope>` keyed on `common.json`; making it a value touches `get.rs` (#1698) and T24.
