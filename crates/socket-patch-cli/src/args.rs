@@ -729,6 +729,7 @@ impl GlobalArgs {
             use_public_proxy,
             vendor_url: self.vendor_url.clone(),
             patch_server_url: self.patch_server_url.clone(),
+            patch_server_origins: crate::commands::hosted_unwind::patch_server_origins(self),
             offline: self.offline,
         }
     }

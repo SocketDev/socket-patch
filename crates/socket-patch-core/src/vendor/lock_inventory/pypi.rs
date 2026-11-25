@@ -192,19 +192,30 @@ pub(crate) fn hosted_pypi_reference(url: &str, origins: &[String]) -> Option<Hos
 /// `current` (the url this run selected) may replace — a rotated grant, or
 /// a superseding patch uuid for the same package and version (an UPGRADE
 /// row). Ours means [`hosted_pypi_reference`] recognizes it on Socket's
-/// patch server or `current`'s own origin, and its coordinates name the
-/// same package and version. A url on any other host, with userinfo, or for
-/// another release stays a user source.
+/// patch server, or on `current`'s own origin under the base `current` is
+/// served from ([`crate::origin::same_hosted_base`]), and its coordinates
+/// name the same package and version. A url on any other host, with
+/// userinfo, or for another release stays a user source.
+///
+/// The base matters under a patch mirror: `current` is then served from
+/// one repository of an artifact host that serves the project's own
+/// packages too, so a url in the patch server's path shape in another
+/// repository of that host is the project's own source, not an earlier pin.
 pub(crate) fn replaceable_hosted_pin(
     previous: &str,
     current: &str,
     name: &str,
     version: &str,
 ) -> bool {
-    hosted_pypi_reference(previous, &[current.to_string()]).is_some_and(|coords| {
-        canonicalize_pypi_name(&coords.name) == canonicalize_pypi_name(name)
-            && coords.version == version
-    })
+    hosted_pypi_reference(previous, &[])
+        .or_else(|| {
+            hosted_pypi_reference(previous, &[current.to_string()])
+                .filter(|_| crate::origin::same_hosted_base(previous, current))
+        })
+        .is_some_and(|coords| {
+            canonicalize_pypi_name(&coords.name) == canonicalize_pypi_name(name)
+                && coords.version == version
+        })
 }
 
 /// Inventory the pypi lock the project carries. Fetchable resolution
@@ -813,6 +824,62 @@ mod tests {
             plain
         );
         assert!(parse_pipfile_lock(&format!("\u{feff}\u{feff}{lock}")).is_err());
+    }
+
+    /// The one "is this earlier pin ours" rule the Pipenv, inline-script
+    /// and Hatch rewriters share. Under a patch mirror, whose host serves
+    /// the project's own packages too, a pin on the grant's host is ours
+    /// only under the base the grant is served from; one on Socket's patch
+    /// server is ours wherever the grant is served.
+    #[test]
+    fn replaceable_hosted_pin_under_a_mirror_needs_the_mirror_base() {
+        let leaf = "urllib3-1.26.18-py2.py3-none-any.whl";
+        let tail = |token: &str| format!("patch/pypi/urllib3/1.26.18/{token}/u1/{leaf}");
+        let base = "https://repo.example/artifactory/socket-patch";
+        let current = format!("{base}/{}", tail("new"));
+        let ours = |previous: &str| {
+            super::replaceable_hosted_pin(previous, &current, "urllib3", "1.26.18")
+        };
+        for previous in [
+            format!("{base}/{}", tail("old")),
+            format!("{base}/{}#sha256=00", tail("old")),
+            format!(
+                "HTTPS://Repo.Example:443/artifactory/socket-patch/{}",
+                tail("old")
+            ),
+            format!("https://patch.socket.dev/{}", tail("old")),
+        ] {
+            assert!(ours(&previous), "{previous}");
+        }
+        for previous in [
+            format!(
+                "https://repo.example/artifactory/pypi-local/{}",
+                tail("old")
+            ),
+            format!(
+                "https://repo.example/artifactory/socket-patch-2/{}",
+                tail("old")
+            ),
+            format!("https://repo.example/{}", tail("old")),
+            format!("{base}/../pypi-local/{}", tail("old")),
+            format!("{base}/%2e%2e/pypi-local/{}", tail("old")),
+            format!(
+                "https://other.example/artifactory/socket-patch/{}",
+                tail("old")
+            ),
+            format!("{base}/{}", tail("old")).replace("1.26.18", "1.26.17"),
+        ] {
+            assert!(!ours(&previous), "{previous}");
+        }
+        // Served from the root of its host (Socket's patch server, or a
+        // `--patch-server-url` deployment): the origin decides, as before.
+        let root = format!("http://127.0.0.1:4545/{}", tail("new"));
+        assert!(super::replaceable_hosted_pin(
+            &format!("http://127.0.0.1:4545/{}", tail("old")),
+            &root,
+            "urllib3",
+            "1.26.18"
+        ));
     }
 }
 

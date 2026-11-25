@@ -89,10 +89,11 @@ pub(super) fn rewrite(
 }
 
 /// Whether `value` is a Socket-issued hosted reference for `dep`: the shared
-/// recognizer ([`replaceable_hosted_pin`]) accepts it on the grant's own
-/// origin (patch.socket.dev, or a `--patch-server-url` host, path prefix
-/// included), and it names this package and version. Such an entry is ours
-/// to rotate; anything else is a user's or a fork's source.
+/// recognizer ([`replaceable_hosted_pin`]) accepts it on Socket's patch
+/// server, or on the grant's own origin under the base the grant is served
+/// from (a path-prefixed `--patch-server-url` deployment's prefix, a patch
+/// mirror's base), and it names this package and version. Such an entry is
+/// ours to rotate; anything else is a user's or a fork's source.
 fn owned_url(value: &str, dep: &DepOverride) -> bool {
     replaceable_hosted_pin(value, &dep.artifact_url, &dep.name, &dep.version)
 }
@@ -574,6 +575,65 @@ mod tests {
             plan(&first, &dep, None).expect("rotation on a path-prefixed origin");
         assert!(!rotation.is_empty());
         assert!(second.contains("/rotated/") && !second.contains("/tok/"));
+    }
+
+    /// Under a patch mirror (`--patch-mirror-url`) the grant's URL sits in
+    /// one repository of an artifact host that serves the project's own
+    /// packages too. An earlier pin is ours to rotate only under the
+    /// mirror's base; a URL in the patch server's path shape in another
+    /// repository of that host, or one that leaves the base through `..`,
+    /// is the project's own source. A pin on Socket's patch server is
+    /// still ours and moves onto the mirror in place.
+    #[test]
+    fn owned_url_under_a_mirror_needs_the_mirror_base() {
+        let base = "https://repo.example/artifactory/socket-patch";
+        let tail = |token: &str| {
+            format!("patch/pypi/urllib3/1.26.18/{token}/patch-one/urllib3-1.26.18-py3-none-any.whl")
+        };
+        let mut dep = dependency("urllib3", "1.26.18", "patch-one");
+        let direct = dep.artifact_url.clone();
+        dep.artifact_url = format!("{base}/{}", tail("new"));
+        let earlier = format!("{base}/{}", tail("old"));
+        assert!(owned_url(&earlier, &dep));
+        assert!(owned_url(&direct, &dep), "the patch server is ours");
+        for own in [
+            format!(
+                "https://repo.example/artifactory/pypi-local/{}",
+                tail("old")
+            ),
+            format!(
+                "https://repo.example/artifactory/socket-patch-2/{}",
+                tail("old")
+            ),
+            format!("https://repo.example/{}", tail("old")),
+            format!("{base}/../pypi-local/{}", tail("old")),
+        ] {
+            assert!(!owned_url(&own, &dep), "{own}");
+        }
+
+        // Through the rewriter: the earlier mirrored pin and the pin on the
+        // patch server are rotated onto the grant; the fork is a conflict.
+        let pinned = |url: &str| {
+            let mut first = dep.clone();
+            first.artifact_url = url.to_string();
+            plan(&lock(), &first, None).unwrap().0
+        };
+        for ours in [earlier.as_str(), direct.as_str()] {
+            let (rewritten, edits) = plan(&pinned(ours), &dep, None).unwrap();
+            assert!(!edits.is_empty(), "{ours}");
+            assert!(
+                rewritten.contains(&dep.artifact_url) && !rewritten.contains(ours),
+                "{ours}"
+            );
+        }
+        let fork = format!(
+            "https://repo.example/artifactory/pypi-local/{}",
+            tail("old")
+        );
+        assert!(matches!(
+            plan(&pinned(&fork), &dep, None),
+            Err(PlanError::Conflict(_))
+        ));
     }
 }
 

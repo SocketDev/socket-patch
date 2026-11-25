@@ -5898,6 +5898,7 @@ mod tests {
             use_public_proxy: false,
             vendor_url: None,
             patch_server_url: None,
+            patch_server_origins: Vec::new(),
             offline,
         }
     }

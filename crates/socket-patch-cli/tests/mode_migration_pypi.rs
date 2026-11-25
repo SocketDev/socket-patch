@@ -3413,6 +3413,154 @@ async fn pipenv_hosted_to_vendored_keeps_the_requirements_patched() {
     );
 }
 
+/// The path a patch mirror (an Artifactory remote repository of the patch
+/// server) is served under on its host.
+const MIRROR_PREFIX: &str = "/artifactory/socket-patch";
+
+/// The hosted → vendored takeover of a Pipenv project whose pins a hosted
+/// run wrote through a patch mirror (`--patch-mirror-url`): `vendor` with
+/// the same mirror reads the mirrored `Pipfile.lock` entry as the hosted
+/// pin it is, restores it and wires the vendored wheel, as it does a pin
+/// on the patch server.
+#[tokio::test]
+async fn pipenv_hosted_through_a_mirror_to_vendored() {
+    let (_tmp, root) = project();
+    stage_pipenv(&root);
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let mirror = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path_regex(format!("^{MIRROR_PREFIX}/patch/pypi/")))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mirror)
+        .await;
+    let base = format!("{}{MIRROR_PREFIX}", mirror.uri());
+    let mirrored_url = hosted_url.replace(&server.uri(), &base);
+
+    let uri = server.uri();
+    let mut args = hosted_scan_args(&uri);
+    args.extend(["--patch-mirror-url", &base]);
+    let (code, env) = run_cli(&root, &args, &[]);
+    assert_eq!(code, 0, "hosted scan through the mirror: {env:#}");
+    let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    assert!(
+        lock.contains(&mirrored_url),
+        "hosted mode pins Pipfile.lock through the mirror:\n{lock}\n{env:#}"
+    );
+
+    stage_manifest(&root);
+    prebuilt_common::mount_project(&server, &root).await;
+    mount_patch_view(&server).await;
+    // The mirror alone, as an operator runs it: no `--patch-server-url`.
+    let mut args = vec!["vendor", "--vendor-url", &uri, "--patch-mirror-url", &base];
+    args.extend(api_args(&uri));
+    let (code, env) = run_cli(&root, &args, &[]);
+    assert_eq!(code, 0, "vendor takeover through the mirror: {env:#}");
+    let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    assert!(
+        lock.contains(&format!(".socket/vendor/pypi/{UUID}/")) && !lock.contains(&base),
+        "Pipfile.lock is wired to the vendored wheel:\n{lock}\n{env:#}"
+    );
+}
+
+/// The mirror is matched by its base, never by its host alone: a
+/// `Pipfile.lock` entry in the patch server's path shape in another
+/// repository of the mirror's host is the project's own file reference.
+/// `vendor` with the mirror neither takes it over nor wires over it, and
+/// leaves the lock as it was.
+#[tokio::test]
+async fn pipenv_vendor_leaves_a_pin_elsewhere_on_the_mirrors_host_alone() {
+    let (_tmp, root) = project();
+    stage_pipenv(&root);
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let mirror = MockServer::start().await;
+    let base = format!("{}{MIRROR_PREFIX}", mirror.uri());
+    let fork = hosted_url.replace(
+        &server.uri(),
+        &format!("{}/artifactory/pypi-local", mirror.uri()),
+    );
+    let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    let mut doc: Value = serde_json::from_str(&lock).unwrap();
+    let six = doc["default"]["six"].as_object_mut().unwrap();
+    six.remove("version");
+    six.insert("file".into(), Value::String(fork.clone()));
+    let mut text = serde_json::to_string_pretty(&doc).unwrap();
+    text.push('\n');
+    std::fs::write(root.join("Pipfile.lock"), &text).unwrap();
+
+    stage_manifest(&root);
+    prebuilt_common::mount_project(&server, &root).await;
+    mount_patch_view(&server).await;
+    let uri = server.uri();
+    let mut args = vec!["vendor", "--vendor-url", &uri, "--patch-mirror-url", &base];
+    args.extend(api_args(&uri));
+    let (code, env) = run_cli(&root, &args, &[]);
+    assert_ne!(code, 0, "the fork is not taken over: {env:#}");
+    assert!(
+        env.to_string().contains("user-declared file reference"),
+        "the fork is the project's own source: {env:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("Pipfile.lock")).unwrap(),
+        text,
+        "the lock is left as it was"
+    );
+}
+
+/// A hosted run through a patch mirror takes over an earlier `Pipfile.lock`
+/// pin only under the mirror's base. One in the patch server's path shape
+/// for the same release in another repository of the mirror's host is the
+/// project's own source: the Pipenv rewriter refuses it
+/// (`redirect_pipenv_refused`) and the lock is left as it was. Before, it
+/// was taken for an earlier pin because it shared the grant's host.
+#[tokio::test]
+async fn pipenv_hosted_through_a_mirror_leaves_a_fork_on_its_host_alone() {
+    let (_tmp, root) = project();
+    stage_pipenv(&root);
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let mirror = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path_regex(format!("^{MIRROR_PREFIX}/patch/pypi/")))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mirror)
+        .await;
+    let base = format!("{}{MIRROR_PREFIX}", mirror.uri());
+    // Another patch uuid, so only the rewriter decides whether it is ours.
+    let fork = hosted_url
+        .replace(
+            &server.uri(),
+            &format!("{}/artifactory/pypi-local", mirror.uri()),
+        )
+        .replace(UUID, "6d4f2b3c-8e5a-4f7b-8c9d-2e3f4a5b6c7d");
+    let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    let mut doc: Value = serde_json::from_str(&lock).unwrap();
+    let six = doc["default"]["six"].as_object_mut().unwrap();
+    six.remove("version");
+    six.insert("file".into(), Value::String(fork.clone()));
+    let mut text = serde_json::to_string_pretty(&doc).unwrap();
+    text.push('\n');
+    std::fs::write(root.join("Pipfile.lock"), &text).unwrap();
+
+    let uri = server.uri();
+    let mut args = hosted_scan_args(&uri);
+    args.extend(["--patch-mirror-url", &base]);
+    let (_code, env) = run_cli(&root, &args, &[]);
+    assert!(
+        env["warnings"]
+            .as_array()
+            .is_some_and(|ws| ws.iter().any(|w| w["code"] == "redirect_pipenv_refused")),
+        "the fork is a foreign source: {env:#}"
+    );
+    assert_eq!(hosted_pinned(&env), 0, "{env:#}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("Pipfile.lock")).unwrap(),
+        text,
+        "the lock is left as it was"
+    );
+}
+
 /// `pip lock -r requirements.txt -o pylock.toml` (pip 26.2.2) over
 /// [`stage_pip_lock`]'s requirements.txt, byte for byte.
 const PIP_LOCK: &str = r#"lock-version = "1.0"

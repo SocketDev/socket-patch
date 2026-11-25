@@ -2113,10 +2113,11 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
     installed_sites: &InstalledSiteListings,
 ) -> VendorOutcome {
+    // The run's patch-server origins, its patch mirror's base included, as
+    // the takeover and the `scan` / `get` preview read them.
     let hosted_origins: Vec<String> = service
-        .and_then(|s| s.patch_server_url.clone())
-        .into_iter()
-        .collect();
+        .map(|s| s.patch_server_origins.clone())
+        .unwrap_or_default();
     let PypiPrelude {
         base,
         version,
@@ -6149,6 +6150,7 @@ wheels = [
             use_public_proxy: false,
             vendor_url: None,
             patch_server_url: None,
+            patch_server_origins: Vec::new(),
             offline,
         }
     }
@@ -7776,6 +7778,64 @@ wheels = [
             None,
         )
         .await
+    }
+
+    /// The Pipenv backend reads the run's patch-server origins from its
+    /// service config, a patch mirror's base (`--patch-mirror-url`)
+    /// included, as the takeover and the `scan` / `get` preview do. A live
+    /// pin under the mirror's base is socket-patch's own hosted pin, named
+    /// with the rollback remedy; one in the same shape in another
+    /// repository of the mirror's host is the project's own file reference.
+    /// Before, the backend counted only `--patch-server-url` and called the
+    /// mirrored pin user-declared.
+    #[tokio::test]
+    async fn pipenv_guard_reads_a_mirrored_pin_as_hosted_only_under_the_mirror_base() {
+        const BASE: &str = "https://repo.example/artifactory/socket-patch";
+        const TAIL: &str = "patch/pypi/six/1.16.0/grant/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/\
+             six-1.16.0-py2.py3-none-any.whl";
+        let mut cfg = pypi_service_cfg("http://127.0.0.1:9", VendorSource::default(), true);
+        cfg.patch_server_origins = vec![
+            "https://patch.socket.dev".to_string(),
+            crate::origin::mirror_entry(BASE),
+        ];
+        for (url, hosted) in [
+            (format!("{BASE}/{TAIL}"), true),
+            (
+                format!("https://repo.example/artifactory/pypi-local/{TAIL}"),
+                false,
+            ),
+            (format!("{BASE}/../pypi-local/{TAIL}"), false),
+        ] {
+            let fx = pipenv_e2e_fixture().await;
+            let lock = PIPENV_REGISTRY_LOCK
+                .replace(r#""version": "==1.16.0""#, &format!(r#""file": "{url}""#));
+            touch(&fx.root, "Pipfile.lock", &lock).await;
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let outcome = vendor_pypi_with_pipenv_version(
+                "pkg:pypi/six@1.16.0",
+                &fx.site_packages,
+                &fx.root,
+                &fx.record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                true,
+                false,
+                Some(&cfg),
+                &tokio::sync::OnceCell::new_with(Some(Some(2026))),
+                &InstalledSiteListings::default(),
+            )
+            .await;
+            let VendorOutcome::Refused { code, detail } = outcome else {
+                panic!("{url}: a live file reference is refused: {outcome:?}");
+            };
+            assert_eq!(code, "pypi_pipenv_source_already_exists", "{url}");
+            let expected = if hosted {
+                "HOSTED Socket patch"
+            } else {
+                "user-declared"
+            };
+            assert!(detail.contains(expected), "{url}: {detail}");
+        }
     }
 
     /// #612: `pipenv requirements > requirements.txt` beside Pipfile.lock is

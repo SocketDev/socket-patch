@@ -349,6 +349,12 @@ pub struct VendorServiceConfig {
     /// Optional override for the step-2 download host (rewrites the host of the
     /// server-returned absolute URL).
     pub patch_server_url: Option<String>,
+    /// The run's patch-server origins, as every hosted reader recognizes
+    /// them: the `--patch-server-url` deployment and a patch mirror's base
+    /// (`crate::origin::mirror_entry`, which holds only what is under that
+    /// base). A backend's guards name a hosted reference on one of them, or
+    /// on Socket's own patch server, as socket-patch's own hosted pin.
+    pub patch_server_origins: Vec<String>,
     /// Strict airgap — never contact the network.
     pub offline: bool,
 }
