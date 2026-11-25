@@ -1563,9 +1563,10 @@ const REJECTED: &str = "pnpm >=11 rejects the rewritten lock";
 
 /// What the warning of [`HIDDEN`] says to do where the scan was told not
 /// to write to the file the hub lists: its last words.
-const WAY_ON_UNSET: &str = " — drop `--no-trust-lockfile-config` (it keeps hosted mode from \
-    writing the setting, or the registries that take its place, to pnpm-workspace.yaml) or set \
-    `trustLockfile: true` there yourself and re-run";
+const WAY_ON_UNSET: &str = " — let hosted mode write to pnpm-workspace.yaml (this run was told \
+    not to, which is `--no-trust-lockfile-config` on the command line, so it writes neither the \
+    setting nor the registries that take its place) or set `trustLockfile: true` there yourself \
+    and re-run";
 
 /// Hosted mode told not to write to `pnpm-workspace.yaml`
 /// ([`NO_SETTING`]), on the hub of

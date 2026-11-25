@@ -2385,10 +2385,10 @@ can route a patched release through a named registry of `pnpm-workspace.yaml` in
 shapes of the hub, in which a build took the routed lock on Bazel 9.3.2, 8.8.2 and 7.7.2
 with rules_js 3.6.0: the build holds the patched package, a second build changes no file,
 and `rollback` brings the upstream build and the files of before back. The project has to
-be at the root of the Bazel workspace, and every call that reads one of its pnpm locks has
-to name the root `pnpm-lock.yaml` in a plain string, pass nothing but the attributes of
-the calls that were built (`name`, `pnpm_lock`, `data`, `update_pnpm_lock`, `use_pnpm`),
-and be one of the two:
+be at the root of the Bazel workspace and have one pnpm lock, the root one, and every call
+that reads it has to name it in a plain string, pass nothing but the attributes of the
+calls that were built (`name`, `pnpm_lock`, `data`, `update_pnpm_lock`, `use_pnpm`), and
+be one of the two:
 
 - **A hub that runs no pnpm**: the call has no `update_pnpm_lock`, or `False`. The lock
   reader of rules_js builds a routed lock as it builds a pinned one, and a build that may
@@ -2421,6 +2421,11 @@ hub off the route:
 - A `pnpm_lock` that is not written out in a plain string, or that names a workspace
   member's own lock, and a project below the root of the Bazel workspace: no build of
   these was run.
+- A project that keeps a lock per workspace member (`sharedWorkspaceLockfile: false`),
+  whichever of its locks the hub names ("… and the project has workspace members with pnpm
+  locks of their own, a layout that no routed lock was built with …"). The route records
+  its overrides in every lock of the project, and the pnpm of a hub resolves in a directory
+  that holds the one lock its call names: no build of that was run either.
 - Any other attribute on the call than the five above, and a `*` or `**`, which may pass
   one ("… and its `patches` is an attribute that no routed lock was built with …"). A
   routed lock holds the patched release under another version (`socket-<id>:1.0.0`), so a
@@ -2452,9 +2457,16 @@ hub off the route:
   extension that every module shares: the hub has no `use_pnpm`, or a `use_repo` on the
   name of a proxy of that extension takes the repository by its name. A `use_repo` on
   another extension's proxy can take a repository under the name of a `pnpm.pnpm` tag, a
-  use of the extension with `isolate` has tags and repositories of its own, and an
-  `inject_repo` on the extension is not read. The pin is not held to this: for it such a
-  release counts as it did.
+  use of the extension with `isolate = True`, or with an `isolate` that is not written
+  out, has tags and repositories of its own, and an `inject_repo` on the extension is not
+  read. Nor does a release count that a use of the extension with `dev_dependency` states
+  ("… a use of the pnpm extension with `dev_dependency` states a release for it, and Bazel
+  drops such a use under `--ignore_dev_dependency` …"): a build under that option has no
+  such tag (read in Bazel's source at 7.7.2, 8.8.2 and 9.3.2; not built), so its hub runs
+  the pnpm that rules_js picks, a pnpm 10 at 3.6.0, which builds a routed lock only until
+  it resolves again. The pin is not held to any of this: for it such a release counts as
+  it did, and it builds with either pnpm, because its setting is in the file the hub
+  lists.
 
 The route is taken only where it is certain which hubs read the lock, so what the reader
 could not see counts as a hub that may read it in another shape, also beside a call in one
@@ -2513,8 +2525,11 @@ the file needs and no label:
   holds the route of every pin: the run then has nothing to write there and needs no
   setting, and it reports the packages as applied, as it does without Bazel (a test builds
   it). Where it would have to add to the route, it writes nothing and warns as above. A
-  hub that runs no pnpm, or one that is known to be older than 11, is pinned under the
-  option as it is without Bazel: no pnpm of the build asks for the setting.
+  scan under the option that crawls nothing is not this case either: it adds no pin, so it
+  takes out what a route left and no lock uses, in the lock and in the file together, as
+  it does without Bazel, and says nothing of the hub. A hub that runs no pnpm, or one that
+  is known to be older than 11, is pinned under the option as it is without Bazel: no pnpm
+  of the build asks for the setting.
 
 Hosted mode withholds when one call names the project's `pnpm-lock.yaml` in a plain string
 and all three hold for it:

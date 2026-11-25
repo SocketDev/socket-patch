@@ -1732,7 +1732,10 @@ async fn parity_pnpm_bazel_hub_and_the_registry_route() {
     let warned = redirect["warnings"].to_string();
     assert!(
         warned.contains("redirect_pnpm_bazel_workspace_hidden")
-            && warned.contains("drop `--no-trust-lockfile-config`"),
+            && warned.contains(
+                "let hosted mode write to pnpm-workspace.yaml (this run was told not to, which \
+                 is `--no-trust-lockfile-config` on the command line"
+            ),
         "{redirect:#}"
     );
 }

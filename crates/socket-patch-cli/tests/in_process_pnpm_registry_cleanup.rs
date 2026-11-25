@@ -1808,50 +1808,65 @@ async fn a_hub_of_a_root_lock_that_is_not_there_stands_against_no_cleanup() {
     }
 }
 
-/// A scan that crawls nothing decides as one that crawls a package does,
-/// also where it is told not to write to pnpm-workspace.yaml
-/// (`--no-trust-lockfile-config`). The hub lists a file of the user's own,
-/// and the root lock still records the override of a route. Told so, the
-/// scan leaves the lock to the hub, whose pnpm would reject a pin it adds,
-/// and says why; without the option it tidies the record as elsewhere.
+/// A scan that crawls nothing adds no pin: what it does beside a hub is
+/// to take out what a route left and no lock uses, in the lock and in
+/// pnpm-workspace.yaml together. So it does that also where it is told not
+/// to write the setting (`--no-trust-lockfile-config`) beside a hub that
+/// lists a file of the user's own: the pnpm of that hub would reject a pin
+/// such a scan adds, and this one adds none. The lock it leaves is the
+/// one without the record, byte for byte, and nothing is said of Bazel.
+/// A hub that hides the file is still left its lock, as a scan that crawls
+/// a package leaves it.
 #[tokio::test]
-async fn a_scan_that_crawls_nothing_leaves_the_lock_to_a_listing_hub_under_the_option() {
+async fn a_scan_that_crawls_nothing_tidies_beside_a_listing_hub_also_under_the_option() {
     const BARE: &str = "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n";
+    const OWN: &str = "# the project's own\n";
     let server = MockServer::start().await;
     mock_api(&server, &[], &[]).await;
     let record = "overrides:\n  leaf@1.0.0: socket-11111111:1.0.0\n\nimporters:\n";
     let routed = BARE.replace("importers:\n", record);
-    for told in [true, false] {
+    let told: &[&str] = &["--no-trust-lockfile-config"];
+    for (case, hub, extra, tidied) in [
+        ("told", LISTING_HUB, told, true),
+        ("not told", LISTING_HUB, &[][..], true),
+        ("hidden, told", HIDING_HUB, told, false),
+        ("hidden", HIDING_HUB, &[], false),
+    ] {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         for (rel, text) in [
             ("package.json", r#"{"name":"app","private":true}"#),
-            ("pnpm-workspace.yaml", "# the project's own\n"),
+            ("pnpm-workspace.yaml", OWN),
             ("pnpm-lock.yaml", routed.as_str()),
-            ("MODULE.bazel", LISTING_HUB),
+            ("MODULE.bazel", hub),
         ] {
             std::fs::write(root.join(rel), text).unwrap();
         }
-        let extra: &[&str] = match told {
-            true => &["--no-trust-lockfile-config"],
-            false => &[],
-        };
         let (code, doc) = scan_hosted(root, &server, extra);
-        assert_eq!(code, Some(0), "told {told}: {doc}");
-        assert_eq!(
-            doc["scannedPackages"].as_u64(),
-            Some(0),
-            "told {told}: {doc}"
-        );
+        assert_eq!(code, Some(0), "{case}: {doc}");
+        assert_eq!(doc["scannedPackages"].as_u64(), Some(0), "{case}: {doc}");
         let warned = doc["warnings"].to_string();
         assert_eq!(
             warned.contains("redirect_pnpm_bazel_workspace_hidden"),
-            told,
-            "told {told}: {doc}"
+            !tidied,
+            "{case}: {doc}"
         );
-        let left = read(root, "pnpm-lock.yaml");
-        let kept = if told { routed.as_str() } else { BARE };
-        assert_eq!(left.as_deref(), Some(kept), "told {told}: {doc}");
+        let removed = match tidied {
+            true => vec![entry("pnpm-lock.yaml", "lockOverride", "leaf@1.0.0")],
+            false => Vec::new(),
+        };
+        assert_eq!(entries(&doc, "removed"), removed, "{case}: {doc}");
+        let kept = if tidied { BARE } else { routed.as_str() };
+        assert_eq!(
+            read(root, "pnpm-lock.yaml").as_deref(),
+            Some(kept),
+            "{case}: {doc}"
+        );
+        assert_eq!(
+            read(root, "pnpm-workspace.yaml").as_deref(),
+            Some(OWN),
+            "{case}"
+        );
     }
 }
 
