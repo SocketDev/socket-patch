@@ -1115,6 +1115,32 @@ fn a_project_in_no_bazel_workspace_gets_no_bazelignore() {
     }
 }
 
+/// Without a Bazel: with `SOCKET_NO_BAZEL=1` a run that keeps a copy of a
+/// Go module in a Bazel workspace writes no `.bazelignore` and says
+/// nothing of one: it is the run of the same checkout without its
+/// `MODULE.bazel`, to the byte, in vendored and in agent mode. What an
+/// earlier run wrote is still undone with the variable set: the revert of
+/// a copy takes its pair, and the file that was made for it, away.
+#[test]
+fn the_switch_adds_no_bazelignore_line_and_still_takes_one_away() {
+    let (cell, with) = (checkout("", "MODULE.bazel"), Patching::new(&[]));
+    let modcache = with.modcache.path().to_str().expect("a UTF-8 path");
+    let (origin, env) = (with.standin.origin(), [("GOMODCACHE", modcache)]);
+    let before = cell.tree();
+    for mode in [Kept::Vendored, Kept::Agent] {
+        let beside = cell.off_is_without_bazel(&origin, &mode.scan(), &env, &["MODULE.bazel"]);
+        let ignored = beside[0]["files"][".bazelignore"].as_str();
+        assert_eq!(ignored, Some(mode.ignored("").as_str()), "{beside:#}");
+    }
+
+    with.run(&cell, &Kept::Vendored.scan());
+    assert!(cell.tree().contains_key(".bazelignore"));
+    let off = [env[0], ("SOCKET_NO_BAZEL", "1")];
+    let undo = cell.socket_patch(&origin, &["vendor", "--revert", "--yes"], &off);
+    assert_eq!(undo.code, 0, "{}", undo.dump);
+    assert_eq!(changed(&before, &cell.tree()), NOTHING, "{}", undo.dump);
+}
+
 /// Without a Bazel: a project that is in no git checkout looks no further
 /// than its own directory. Below a Bazel root it is patched as anywhere
 /// else, and gets no line and no warning: nothing above it is read, not

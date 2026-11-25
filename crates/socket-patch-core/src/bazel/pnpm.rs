@@ -109,13 +109,13 @@ use std::cell::OnceCell;
 
 use super::rc::ModuleLock;
 use super::starlark::{Arg, Call, File, How, Value};
-use super::workspace::{disk, Doubt, Entry, Extension, Label, Repo, Tag, Tags, Workspace};
+use super::workspace::{disk, memory, Doubt, Entry, Extension, Label, Repo, Tag, Tags, Workspace};
 use crate::formats::text::strip_bom;
 use crate::hosted::guidance::{is_trust_scaffold, plan_workspace_trust, TrustPlan};
 use crate::patch::redirect::RewriteWarning;
 use crate::utils::fs::run_blocking;
 use crate::utils::package_manager::pinned_version;
-use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject, ProjectView};
+use crate::vendor::lock_inventory::ProjectView;
 
 /// The code of the warning with which hosted mode leaves a pnpm lock as it
 /// is because of such a hub.
@@ -130,15 +130,6 @@ fn extension(name: &'static str) -> Extension<'static> {
         module: "aspect_rules_js",
         file: "//npm:extensions.bzl",
         name,
-    }
-}
-
-/// The files of an in-memory project, as the workspace reader takes them.
-fn memory(project: &MemoryProject) -> impl Fn(&str) -> Entry + '_ {
-    |path| match project.get(path) {
-        Some(MemoryEntry::Text(text)) => Entry::Text(text.to_string()),
-        Some(_) => Entry::Unreadable("it was not handed in as text".to_string()),
-        None => Entry::Absent,
     }
 }
 
@@ -263,7 +254,9 @@ pub async fn hubs(view: &ProjectView<'_>, root: bool, members: &[String]) -> Hub
 /// locks `locks` (paths from the project): on disk the workspace of
 /// [`super::bazel_root`], read off the async runtime, in memory the
 /// project itself, whose files are all there is. Nothing outside a Bazel
-/// workspace.
+/// workspace, and nothing for a user who switched the Bazel support off:
+/// on disk no root is found then, and in memory the view holds no file
+/// ([`memory`]).
 async fn read(view: &ProjectView<'_>, locks: &[String]) -> Hubs {
     match *view {
         ProjectView::Memory(project) => answer(&memory(project), "", locks),

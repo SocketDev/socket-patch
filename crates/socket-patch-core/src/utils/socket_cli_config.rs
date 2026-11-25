@@ -56,14 +56,30 @@ fn env_non_empty(name: &str) -> Option<String> {
 /// — including unset and empty — is false. `pub` so the CLI shares this one
 /// vocabulary instead of re-declaring it.
 pub fn env_truthy(name: &str) -> bool {
+    truthy(&std::env::var(name).unwrap_or_default())
+}
+
+/// [`env_truthy`] for a value that was read already.
+pub fn truthy(value: &str) -> bool {
     matches!(
-        std::env::var(name)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
+        value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on" | "y" | "t"
     )
+}
+
+/// Whether this process runs in CI: `CI` set to anything but empty, `0` or
+/// `false` (the convention CI providers follow), or `GITHUB_ACTIONS` set.
+pub fn running_in_ci() -> bool {
+    ci_from(
+        std::env::var("CI").ok().as_deref(),
+        std::env::var("GITHUB_ACTIONS").ok().as_deref(),
+    )
+}
+
+/// [`running_in_ci`] over the two variables' values.
+pub fn ci_from(ci: Option<&str>, github_actions: Option<&str>) -> bool {
+    let ci = ci.unwrap_or_default().trim().to_ascii_lowercase();
+    (!ci.is_empty() && ci != "0" && ci != "false") || !github_actions.unwrap_or_default().is_empty()
 }
 
 /// `SOCKET_NO_CONFIG` — disable the socket-cli config fallback layer.
@@ -238,6 +254,19 @@ mod tests {
         base64::engine::general_purpose::STANDARD
             .encode(json)
             .into_bytes()
+    }
+
+    #[test]
+    fn ci_is_a_set_ci_or_github_actions() {
+        assert!(!ci_from(None, None));
+        for off in ["", " ", "0", "false", "FALSE"] {
+            assert!(!ci_from(Some(off), None), "CI={off:?}");
+        }
+        for on in ["1", "true", "woodpecker"] {
+            assert!(ci_from(Some(on), None), "CI={on:?}");
+        }
+        assert!(ci_from(None, Some("true")));
+        assert!(!ci_from(None, Some("")));
     }
 
     #[test]

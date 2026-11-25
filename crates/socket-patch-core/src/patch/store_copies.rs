@@ -32,7 +32,8 @@ pub(crate) trait CopyFold: Sized {
     /// The verb in a failed copy's note ("patch", "roll back").
     const VERB: &'static str;
     fn success(&self) -> bool;
-    fn mark_failed(&mut self);
+    /// Fail `self` because `copy` (one of its other copies) failed.
+    fn mark_failed(&mut self, copy: &Self);
     fn error_mut(&mut self) -> &mut Option<String>;
     /// Move `copy_result`'s per-file records into `self`, renaming each
     /// file with `qualify`.
@@ -71,6 +72,10 @@ where
 /// Merge one store copy's result into the primary's (see the module docs).
 pub(crate) fn fold<R: CopyFold>(result: &mut R, copy: &Path, mut copy_result: R) {
     let qualify = |file: &str| copy.join(normalize_file_path(file)).display().to_string();
+    // Before its files move: what failed the copy is read from it whole.
+    if !copy_result.success() {
+        result.mark_failed(&copy_result);
+    }
     result.extend_files(&mut copy_result, &qualify);
     let note = if copy_result.success() {
         match copy_result.error_mut().take() {
@@ -78,7 +83,6 @@ pub(crate) fn fold<R: CopyFold>(result: &mut R, copy: &Path, mut copy_result: R)
             _ => return,
         }
     } else {
-        result.mark_failed();
         format!(
             "store copy {} failed to {}: {}",
             copy.display(),

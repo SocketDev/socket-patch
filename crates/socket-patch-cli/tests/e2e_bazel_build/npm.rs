@@ -1999,7 +1999,8 @@ fn speaks_of_the_installed_tree(cell: &Cell, standin: &StandIn, patch: &Patched)
 /// of the same checkout without its `MODULE.bazel`, to a script and to a
 /// person: the exit code, both streams byte for byte, and what the document
 /// says. In that checkout, which is no Bazel workspace, the option changes
-/// nothing and no run remarks on it.
+/// nothing and no run remarks on it. `SOCKET_NO_BAZEL=1`, the switch for a
+/// project that Bazel does not build, gives each form that same run.
 #[test]
 fn the_option_makes_the_run_the_one_of_a_checkout_without_bazel() {
     let (cell, standin, patch, entry) = checkout("");
@@ -2036,18 +2037,24 @@ fn the_option_makes_the_run_the_one_of_a_checkout_without_bazel() {
             let ran = socket_patch(&cell, &standin, &with_option);
             cell.wrote_in_run(&ran, &document, &claim);
         }
-        beside_the_hub.push([gives(&with_option, &env[..2]), gives(args, &env)]);
+        let switched_off = [env[0], env[1], ("SOCKET_NO_BAZEL", "1")];
+        beside_the_hub.push([
+            gives(&with_option, &env[..2]),
+            gives(args, &env),
+            gives(args, &switched_off),
+        ]);
     }
 
     let patched = cell.tree();
     std::fs::remove_file(cell.path(MODULE)).expect(MODULE);
-    for ((args, option), [by_option, by_variable]) in forms.iter().zip(&beside_the_hub) {
+    for ((args, option), [by_option, by_variable, by_switch]) in forms.iter().zip(&beside_the_hub) {
         let without_bazel = gives(args, &env[..2]);
         assert_eq!(*by_option, without_bazel, "{args:?} {option}");
         assert_eq!(
             *by_variable, without_bazel,
             "{args:?}, SOCKET_VEX_NO_BAZEL=1"
         );
+        assert_eq!(*by_switch, without_bazel, "{args:?}, SOCKET_NO_BAZEL=1");
         let outside = gives(&[&args[..], &[*option]].concat(), &env[..2]);
         assert_eq!(outside, without_bazel, "{args:?} {option}, no {MODULE}");
         for run in without_bazel.as_array().into_iter().flatten() {
@@ -2215,11 +2222,12 @@ fn vex_says(cell: &Cell, standin: &StandIn, name: &str) -> (Value, Vec<Value>, [
 }
 
 /// The statement of a document of the fixture's product about the package
-/// `id` and the advisory of the fixture's patches, without its status.
+/// `id` and the advisory of the fixture's patches, without its status. The
+/// package follows the product as a product of its own.
 fn about(id: &Value) -> Value {
     json!({
         "vulnerability": { "name": "GHSA-test-aaaa-bbbb", "aliases": ["CVE-2024-0001"] },
-        "products": [{ "@id": PRODUCT, "subcomponents": [{ "@id": id }] }],
+        "products": [{ "@id": PRODUCT, "subcomponents": [{ "@id": id }] }, { "@id": id }],
     })
 }
 
@@ -2674,6 +2682,78 @@ fn a_lock_that_a_hub_reads_is_routed_where_the_hub_runs_no_pnpm() {
     let warned = scan.envelope["warnings"].to_string();
     let named = format!("{HUB_READS_THE_LOCK}{PATCHES_OF_THE_HUB}");
     assert!(warned.contains(&named), "{test}: {}", scan.dump);
+}
+
+/// Without a Bazel: with `SOCKET_NO_BAZEL=1` the hosted scan beside a hub
+/// that keeps the lock off the route, the one with a `patches` entry of
+/// [`a_lock_that_a_hub_reads_is_routed_where_the_hub_runs_no_pnpm`], is
+/// the scan of the same checkout without its `MODULE.bazel`, to the byte
+/// in exit code, both streams and every file it leaves: the lock is
+/// routed through the patch's registry, with the registry and the override
+/// in `pnpm-workspace.yaml`, and no run says a word of Bazel. Without the
+/// variable the scan keeps the lock on the trust pin and its warning names
+/// the hub's call and the attribute, as that test holds.
+#[test]
+fn the_switch_routes_a_lock_that_a_hub_reads_as_in_a_checkout_without_bazel() {
+    let (cell, standin, patch, _) = checkout_granted("", false, true);
+    let test = &cell.test;
+    std::fs::remove_dir_all(cell.path("node_modules")).expect("the tree");
+    proves_pnpm_12(&cell);
+    patches_the_package(&cell);
+    let origin = standin.origin();
+    let registry = format!("{origin}/{REGISTRY}");
+    let env = [
+        ("SOCKET_PATCH_SERVER_URL", origin.as_str()),
+        ("SOCKET_NPM_REGISTRY", registry.as_str()),
+    ];
+    let hosted = ["scan", "--mode", "hosted", "--yes"];
+    let (without, beside) = cell.without_and_beside(&origin, &hosted, &env, &[MODULE]);
+    let file = |run: &Value, rel: &str| run["files"][rel].as_str().unwrap_or_default().to_string();
+
+    // The run with the variable is the first of these, to the byte: routed.
+    let name = format!("socket-{}", &patch.uuid[..8]);
+    let key = format!("'{NAME}@{name}:{VERSION}':");
+    for run in without.as_array().expect("the two forms") {
+        let (lock, workspace) = (file(run, LOCK), file(run, "pnpm-workspace.yaml"));
+        assert!(
+            lock.contains(&key) && lock.contains("\noverrides:"),
+            "{test}: {lock}"
+        );
+        assert!(
+            workspace.contains("namedRegistries:")
+                && workspace.contains(&name)
+                && !workspace.contains("trustLockfile"),
+            "{test}: {workspace}"
+        );
+        for stream in ["stdout", "stderr"] {
+            let said = run[stream].as_str().expect("a stream");
+            assert!(!said.contains("Bazel"), "{test}: {stream}: {said}");
+        }
+    }
+
+    // Without the variable the hub decides: the trust pin, and the warning.
+    let entry = format!(
+        "  '{NAME}@{VERSION}':\n    resolution: {{integrity: {}, tarball: {origin}{}}}\n",
+        integrity(&patch.package.tarball),
+        patch.route
+    );
+    for run in beside.as_array().expect("the two forms") {
+        let lock = file(run, LOCK);
+        assert!(
+            lock.contains(&entry) && !lock.contains("@socket-") && !lock.contains("\noverrides:"),
+            "{test}: {lock}"
+        );
+        assert_eq!(
+            file(run, "pnpm-workspace.yaml"),
+            TRUSTING_WORKSPACE,
+            "{test}"
+        );
+    }
+    let said = beside[0]["stdout"].as_str().expect("an envelope");
+    let envelope: Value = serde_json::from_str(said).expect("an envelope");
+    let warned = envelope["warnings"].to_string();
+    let named = format!("{HUB_READS_THE_LOCK}{PATCHES_OF_THE_HUB}");
+    assert!(warned.contains(&named), "{test}: {beside:#}");
 }
 
 /// Without a Bazel: the two scans of [`hosted_update_pnpm_lock_on_pnpm_11`]
