@@ -23,7 +23,7 @@ use socket_patch_core::update::{
     self as core_update, detect_channel, is_newer, upgrade_hint, upgrade_hint_for, ChannelEnv,
     InstallChannel, UpdateEndpoints, UpdateTimeouts,
 };
-use socket_patch_core::utils::socket_cli_config::env_truthy;
+use socket_patch_core::utils::socket_cli_config::{env_truthy, running_in_ci};
 
 use crate::args::GlobalArgs;
 
@@ -104,20 +104,14 @@ fn should_check(ctx: &GuardCtx) -> Result<(), SkipReason> {
 impl GuardCtx {
     /// Capture the real environment + the parsed global flags.
     fn capture(common: &GlobalArgs) -> Self {
-        let ci = std::env::var("CI").unwrap_or_default();
         GuardCtx {
             opted_out: env_truthy("SOCKET_NO_UPDATE_CHECK"),
             offline: common.offline,
             silent: common.silent,
             json: common.json,
-            // `CI` set to anything non-empty except an explicit falsy counts;
-            // `GITHUB_ACTIONS` counts whenever non-empty. Deliberately short
-            // list — the TTY guard covers other vendors' runners anyway.
-            ci: (!ci.is_empty()
-                && !matches!(ci.trim().to_ascii_lowercase().as_str(), "0" | "false"))
-                || !std::env::var("GITHUB_ACTIONS")
-                    .unwrap_or_default()
-                    .is_empty(),
+            // Deliberately short list — the TTY guard covers other
+            // vendors' runners anyway.
+            ci: running_in_ci(),
             // The notice prints on stderr; stdout may be legitimately piped
             // (`list | jq`) in a perfectly interactive session.
             stderr_tty: crate::ui::attended(crate::ui::Stream::Stderr),
