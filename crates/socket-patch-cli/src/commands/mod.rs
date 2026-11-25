@@ -26,6 +26,7 @@ pub(crate) mod vendor_orphans;
 pub(crate) mod vendored_backend;
 pub mod vex;
 pub(crate) mod vex_consumed;
+pub(crate) mod vex_grype;
 pub(crate) mod vex_sources;
 pub(crate) mod vlt_heal;
 

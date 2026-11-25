@@ -279,6 +279,19 @@ copy the document leaves out, is left out, so the scanner keeps reporting that c
 Scanners match a package wherever they find it, so use the document only on the
 project it was made for.
 
+For Grype, `--grype-config` lists the document in the project's Grype config, so a
+plain `grype dir:.` reads it:
+
+```sh
+socket-patch vex --output socket.vex.json --grype-config
+```
+
+It creates `.grype.yaml` or adds `socket.vex.json` to its `vex-documents` list,
+leaving the rest of the file as it was. Run Grype from that directory. Grype fails a
+scan whose listed document is missing, so generate the document in CI before Grype
+runs, or commit it and regenerate it whenever the patches change; a run that ends
+with no document takes the entry out again.
+
 | Patch mode | Evidence used by VEX |
 | --- | --- |
 | Agent | Installed patched files, checked against the manifest's hashes |

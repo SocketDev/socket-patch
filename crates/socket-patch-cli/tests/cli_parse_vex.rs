@@ -50,6 +50,7 @@ struct Snap {
     no_bazel: bool,
     doc_id: Option<String>,
     compact: bool,
+    grype_config: Option<PathBuf>,
 }
 
 fn snapshot(a: &VexArgs) -> Snap {
@@ -61,6 +62,7 @@ fn snapshot(a: &VexArgs) -> Snap {
         no_bazel: a.no_bazel,
         doc_id: a.doc_id.clone(),
         compact: a.compact,
+        grype_config: a.grype_config.clone(),
     }
 }
 
@@ -74,6 +76,7 @@ fn expected_defaults() -> Snap {
         no_bazel: false,
         doc_id: None,
         compact: false,
+        grype_config: None,
     }
 }
 
@@ -227,4 +230,33 @@ fn no_vlt_install_cleanup_env_is_accepted_silently_by_vex() {
     let mut want = expected_defaults();
     want.common.no_vlt_install_cleanup = true;
     assert_eq!(snapshot(&a), want);
+}
+
+/// `--grype-config` without a value names `.grype.yaml`; with one, that path;
+/// `SOCKET_VEX_GRYPE_CONFIG` sets it like the flag.
+#[test]
+#[serial_test::serial]
+fn grype_config_takes_an_optional_path() {
+    for (args, env, want) in [
+        (
+            &["socket-patch", "vex", "--grype-config"][..],
+            None,
+            ".grype.yaml",
+        ),
+        (
+            &["socket-patch", "vex", "--grype-config", "ci/grype.yaml"][..],
+            None,
+            "ci/grype.yaml",
+        ),
+        (
+            &["socket-patch", "vex"][..],
+            Some(("SOCKET_VEX_GRYPE_CONFIG", "env.yaml")),
+            "env.yaml",
+        ),
+    ] {
+        let a = parse_vex(try_parse_with_env(env.as_slice(), args));
+        let mut expected = expected_defaults();
+        expected.grype_config = Some(PathBuf::from(want));
+        assert_eq!(snapshot(&a), expected, "{args:?}");
+    }
 }

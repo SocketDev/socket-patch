@@ -1253,6 +1253,7 @@ async fn apply_check_and_vex_see_unpatched_member_named_like_a_build_dir() {
             no_bazel: false,
             doc_id: None,
             compact: false,
+            grype_config: None,
         })
         .await;
         (code, std::fs::read_to_string(&vex_path).unwrap_or_default())
@@ -1325,6 +1326,7 @@ async fn apply_check_and_vex_see_unpatched_member_in_a_hidden_dir() {
             no_bazel: false,
             doc_id: None,
             compact: false,
+            grype_config: None,
         })
         .await;
         (code, std::fs::read_to_string(&vex_path).unwrap_or_default())

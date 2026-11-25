@@ -129,6 +129,7 @@ pub const CHILD_ENV_SCRUB: &[&str] = &[
     "SOCKET_VEX_NO_BAZEL",
     "SOCKET_VEX_DOC_ID",
     "SOCKET_VEX_COMPACT",
+    "SOCKET_VEX_GRYPE_CONFIG",
     // Socket-specific service URLs read from the environment alone.
     "SOCKET_NPM_REGISTRY",
     "SOCKET_PYPI_JSON_API",
