@@ -2357,20 +2357,26 @@ async fn generate_vex_with_cleanup(
 /// Removal errors are swallowed: the non-zero exit is the contract, the
 /// deletion is hygiene. Returns whether a document was actually removed.
 async fn remove_stale_vex_doc(path: &Path) -> bool {
+    is_openvex_doc(path).await && tokio::fs::remove_file(path).await.is_ok()
+}
+
+/// Whether `path` is a regular file holding an OpenVEX document (JSON whose
+/// `@context` names openvex.dev): the file a failed run removes. A dry run
+/// asks this to say what the real run would do.
+pub(crate) async fn is_openvex_doc(path: &Path) -> bool {
     // FIFO-safe read: `--vex` can name any path, and a plain read of a FIFO
     // there would block this failure path forever.
     let Ok(bytes) = socket_patch_core::utils::fs::read_regular_to_bytes(path).await else {
         return false;
     };
-    let is_openvex = serde_json::from_slice::<serde_json::Value>(&bytes)
+    serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
         .and_then(|v| {
             v.get("@context")
                 .and_then(|c| c.as_str())
                 .map(|c| c.contains("openvex.dev"))
         })
-        .unwrap_or(false);
-    is_openvex && tokio::fs::remove_file(path).await.is_ok()
+        .unwrap_or(false)
 }
 
 /// [`generate_vex_from_manifest_path`] without the failure-cleanup wrapper.

@@ -135,6 +135,16 @@ fn a_run_that_leaves_no_document_takes_the_entry_out() {
     // Nothing left to attest: the run removes the previous document, and
     // with it the entry Grype would fail on.
     write_manifest(cwd, &[]);
+    // A dry run keeps the document but says the entry would go with it.
+    let (out, envelope) = vex(cwd, &["--grype-config", "--dry-run"]);
+    assert!(!out.status.success(), "{envelope}");
+    assert!(cwd.join(DOCUMENT).exists());
+    assert_eq!(config(cwd), "vex-documents:\n  - socket.vex.json\n");
+    assert_eq!(
+        envelope["grypeConfig"]["change"], "would_remove",
+        "{envelope}"
+    );
+
     let (out, envelope) = vex(cwd, &["--grype-config"]);
     assert!(!out.status.success(), "{envelope}");
     assert!(!cwd.join(DOCUMENT).exists());

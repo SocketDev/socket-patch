@@ -213,16 +213,23 @@ fn strip_comment(value: &str) -> &str {
 }
 
 /// Whether two listed paths name the same file: `./a`, `a` and `b/../a`
-/// alike, with `\` read as `/`.
+/// alike, with `\` read as `/`. A leading `..` of a relative path stays,
+/// so `../a` is not `a`.
 fn same_path(a: &str, b: &str) -> bool {
     fn normal(path: &str) -> String {
         let path = path.replace('\\', "/");
+        let absolute = path.starts_with('/');
         let mut parts: Vec<&str> = Vec::new();
         for segment in path.split('/') {
             match segment {
                 "" | "." => {}
                 ".." => {
-                    parts.pop();
+                    if parts.last().is_some_and(|last| *last != "..") {
+                        parts.pop();
+                    } else if !absolute {
+                        // Nothing to climb out of: the path leaves its base.
+                        parts.push("..");
+                    }
                 }
                 other => parts.push(other),
             }
@@ -439,6 +446,26 @@ mod tests {
                 "vex-documents:\n  - 'vex docs/socket.vex.json'\n".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn a_parent_path_is_not_the_local_document() {
+        // `..` with nothing to climb out of leaves the base: the parent's
+        // document is another file.
+        let text = "vex-documents:\n  - ../socket.vex.json\n";
+        assert_eq!(
+            add_vex_document(Some(text), "socket.vex.json"),
+            Ok(GrypeConfigEdit::Write(
+                "vex-documents:\n  - ../socket.vex.json\n  - socket.vex.json\n".to_string()
+            ))
+        );
+        assert_eq!(
+            remove_vex_document(text, "socket.vex.json"),
+            Ok(GrypeConfigEdit::Unchanged)
+        );
+        assert!(same_path("a/../../b", "../b"));
+        assert!(!same_path("../../b", "../b"));
+        assert!(same_path("/../b", "/b"));
     }
 
     #[test]

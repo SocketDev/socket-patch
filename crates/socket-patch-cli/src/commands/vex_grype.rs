@@ -124,7 +124,11 @@ pub(crate) async fn unlist_missing_document(
     output: &Path,
     dry_run: bool,
 ) -> Option<GrypeConfigOutcome> {
-    if tokio::fs::symlink_metadata(output).await.is_ok() {
+    // A dry run leaves a stale document in place, so it asks whether the
+    // real run would have removed it.
+    if tokio::fs::symlink_metadata(output).await.is_ok()
+        && !(dry_run && crate::commands::vex::is_openvex_doc(output).await)
+    {
         return None;
     }
     // A document this run could not have listed is not looked for.
