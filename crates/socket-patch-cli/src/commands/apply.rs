@@ -1007,8 +1007,8 @@ fn describe_check_failure(reason: &str) -> &'static str {
 /// that reinstalls the published gem, and the `apply` (with the check's
 /// own scope) to run after it.
 fn no_variant_check_remedy(common: &GlobalArgs, base_purl: &str) -> String {
-    let then = format!("run `socket-patch apply{}`", crate::ui::scope_args(common));
-    match gem_pristine_remedy(base_purl, &then) {
+    let command = format!("socket-patch apply{}", crate::ui::scope_args(common));
+    match gem_pristine_remedy(base_purl, &format!("run `{command}`")) {
         Some(remedy) => format!("; `apply` leaves such a copy as it is. {remedy}"),
         None => "; `apply` leaves such a copy as it is".to_string(),
     }
@@ -3071,11 +3071,15 @@ impl IncompleteCopy {
 const NO_MATCHING_VARIANT: &str = "no_matching_variant";
 
 /// One installed copy `apply` left as it was because its files match no
-/// record of its release in the manifest: an edited copy, or another
-/// build of the version. The copy IS installed, so its records are not
-/// reported as `package_not_installed`; its failed [`ApplyResult`]
-/// (keyed by the base purl, the error naming the copy) is among the
-/// run's results, and this entry gives that result its own code.
+/// record of its release in the manifest and it holds one of them with
+/// other content: an edited copy, or another build of the version. The
+/// copy IS installed, so its records are not reported as
+/// `package_not_installed`; its failed [`ApplyResult`] (keyed by the base
+/// purl, the error naming the copy) is among the run's results, and this
+/// entry gives that result its own code.
+///
+/// The result stands for every record of the base, so the human summary
+/// counts ONE failed patch for it however many records the base has.
 struct NoVariantCopy {
     /// The base purl of the release.
     purl: String,
@@ -3963,31 +3967,37 @@ async fn apply_patches_inner(
                             .iter()
                             .filter_map(|v| manifest.patches.get(v).map(|p| (v.as_str(), &p.files)))
                             .collect();
-                        let reason = no_variant_reason(&base_purl, pkg_path, &records).await;
+                        let NoVariant {
+                            reason,
+                            other_content,
+                        } = no_variant_reason(&base_purl, pkg_path, &records).await;
                         if args.prints_errors() {
                             eprintln!("{}", format_patch_failure(&base_purl, &reason));
                         }
-                        // The copy is installed: the failure is its own
+                        // A copy holding a file of the patch with other
+                        // content is installed: the failure is its own
                         // result, and no record of the release is reported
                         // as not installed (as `apply --check` judges it).
-                        for (variant_purl, _) in &records {
-                            matched_manifest_purls.insert((*variant_purl).to_string());
+                        if other_content {
+                            for (variant_purl, _) in &records {
+                                matched_manifest_purls.insert((*variant_purl).to_string());
+                            }
+                            let path = pkg_path.display().to_string();
+                            caveats.no_variant.push(NoVariantCopy {
+                                purl: base_purl.clone(),
+                                path: path.clone(),
+                            });
+                            results.push(ApplyResult {
+                                package_key: base_purl.clone(),
+                                package_path: path,
+                                success: false,
+                                files_verified: Vec::new(),
+                                files_patched: Vec::new(),
+                                applied_via: HashMap::new(),
+                                error: Some(reason),
+                                sidecar: None,
+                            });
                         }
-                        let path = pkg_path.display().to_string();
-                        caveats.no_variant.push(NoVariantCopy {
-                            purl: base_purl.clone(),
-                            path: path.clone(),
-                        });
-                        results.push(ApplyResult {
-                            package_key: base_purl.clone(),
-                            package_path: path,
-                            success: false,
-                            files_verified: Vec::new(),
-                            files_patched: Vec::new(),
-                            applied_via: HashMap::new(),
-                            error: Some(reason),
-                            sidecar: None,
-                        });
                     }
                 }
             }
@@ -4921,8 +4931,14 @@ fn is_conda_refusal(result: &ApplyResult) -> bool {
 
 /// Why no release variant in the manifest matched the installed copy of
 /// `purl` at `pkg_path`, whose `records` are the manifest's for that
-/// release. The copy is installed, and the text says so: it names the
-/// copy and the file of it that holds neither side of any record.
+/// release, and whether the copy holds one of the patch's files with
+/// other content ([`NoVariant::other_content`]).
+///
+/// A copy with such a file is installed, and the text says so: it names
+/// the copy and the file that holds neither side of any record. A gem
+/// copy differs because it was edited after it was installed (which
+/// `bundle install` keeps) or because it is another build of the
+/// version; the text names the command that reinstalls the published gem.
 ///
 /// A Python copy in a conda prefix (a conda or pixi environment) is often
 /// a conda build, which is not always the PyPI release byte for byte: a
@@ -4932,66 +4948,52 @@ fn is_conda_refusal(result: &ApplyResult) -> bool {
 /// project may hold one per environment, and only offers the conda build
 /// as a cause, since pip and uv install PyPI wheels into a conda prefix
 /// too.
-///
-/// A gem copy differs because it was edited after it was installed (which
-/// `bundle install` keeps) or because it is another build of the version;
-/// the text names the command that reinstalls the published gem.
 async fn no_variant_reason(
     purl: &str,
     pkg_path: &Path,
     records: &[(&str, &HashMap<String, PatchFileInfo>)],
-) -> String {
-    let ecosystem = Ecosystem::from_purl(purl);
-    let python_copy_in_conda = ecosystem == Some(Ecosystem::Pypi)
-        && socket_patch_core::crawlers::pixi_env::conda_prefix_of(pkg_path).is_some();
-    if python_copy_in_conda {
-        return format!(
-            "no matching variant found: the copy in {} is in a conda environment and its \
-             files match none of the releases the patch was made for (a conda package can \
-             differ from the PyPI release it repackages), so it was left as it is",
-            pkg_path.display()
-        );
-    }
-    // The file each record is matched by, as the apply loop judged it.
-    let mut differs: std::collections::BTreeSet<String> = Default::default();
-    let mut missing: std::collections::BTreeSet<String> = Default::default();
+) -> NoVariant {
+    // The file each record is matched by, as the apply loop judged it,
+    // where the copy holds it with other content.
+    let mut differs: std::collections::BTreeSet<&str> = Default::default();
     for (key, files) in records {
         let telling = gem_ext::discriminating_files(pkg_path, key, files).await;
         let Some((name, info)) = representative_file(&telling) else {
             continue;
         };
-        let file = name.strip_prefix("package/").unwrap_or(name).to_string();
-        match verify_file_patch(pkg_path, name, info).await.status {
-            VerifyStatus::HashMismatch => {
-                differs.insert(file);
+        if verify_file_patch(pkg_path, name, info).await.status == VerifyStatus::HashMismatch {
+            // The record's own key outlives `telling`.
+            if let Some((name, _)) = files.get_key_value(name.as_str()) {
+                differs.insert(name.strip_prefix("package/").unwrap_or(name));
             }
-            VerifyStatus::NotFound => {
-                missing.insert(file);
-            }
-            VerifyStatus::Ready | VerifyStatus::AlreadyPatched => {}
         }
     }
-    let list = |files: &std::collections::BTreeSet<String>| {
-        files.iter().cloned().collect::<Vec<_>>().join(", ")
-    };
-    let what = if !differs.is_empty() {
-        format!(
-            "{} there holds neither the original nor the patched content of a release the \
-             patch was made for",
-            list(&differs)
-        )
-    } else if !missing.is_empty() {
-        format!(
-            "it does not hold {}, which the patch changes",
-            list(&missing)
-        )
-    } else {
-        "its files match none of the releases the patch was made for".to_string()
-    };
+    let other_content = !differs.is_empty();
+    let python_copy_in_conda = Ecosystem::from_purl(purl) == Some(Ecosystem::Pypi)
+        && socket_patch_core::crawlers::pixi_env::conda_prefix_of(pkg_path).is_some();
+    if python_copy_in_conda {
+        return NoVariant {
+            reason: format!(
+                "no matching variant found: the copy in {} is in a conda environment and its \
+                 files match none of the releases the patch was made for (a conda package can \
+                 differ from the PyPI release it repackages), so it was left as it is",
+                pkg_path.display()
+            ),
+            other_content,
+        };
+    }
+    if !other_content {
+        return NoVariant {
+            reason: "no matching variant found".to_string(),
+            other_content,
+        };
+    }
     let mut reason = format!(
-        "no matching variant found: the copy in {} is installed, but {what}, so it was \
-         left as it is",
-        pkg_path.display()
+        "no matching variant found: the copy in {} is installed, but {} there holds neither \
+         the original nor the patched content of a release the patch was made for, so it \
+         was left as it is",
+        pkg_path.display(),
+        differs.into_iter().collect::<Vec<_>>().join(", ")
     );
     if let Some(remedy) = gem_pristine_remedy(purl, "apply the patch again") {
         reason.push_str(&format!(
@@ -5000,7 +5002,22 @@ async fn no_variant_reason(
              {remedy}"
         ));
     }
-    reason
+    NoVariant {
+        reason,
+        other_content,
+    }
+}
+
+/// What [`no_variant_reason`] found of a copy no record matched.
+struct NoVariant {
+    /// The text after `Failed to patch <purl>: `.
+    reason: String,
+    /// The copy holds a file of the patch whose content is neither side of
+    /// any record: the package is installed there, edited or as another
+    /// build. `false` when the copy holds none of the files the records
+    /// are matched by (a qualified record cannot be told to belong to
+    /// such a copy, so it stays `package_not_installed`).
+    other_content: bool,
 }
 
 /// For a gem `purl`: how an edited copy gets the published gem's files

@@ -53,9 +53,9 @@ impl VerifyRollbackResult {
 /// ([`VerifyRollbackStatus::HashMismatch`]). Such a file cannot be told
 /// apart: it may have been patched and then changed, or changed (or
 /// built from other sources) and never patched, so the text claims
-/// neither.
-pub const NEITHER_CONTENT: &str = "File holds neither the patched nor the original content \
-     (it was changed outside socket-patch). Cannot safely roll back.";
+/// neither, and names no cause.
+pub const NEITHER_CONTENT: &str =
+    "File holds neither the patched nor the original content. Cannot safely roll back.";
 
 /// Result of rolling back patches for a single package.
 #[derive(Debug, Clone)]

@@ -280,9 +280,10 @@ fn format_rollback_failures(results: &[RollbackResult], cwd: &Path) -> Vec<Strin
 /// The ways out of a failed copy with a file that holds neither side of
 /// its patch (`HashMismatch`): a rollback fails on it on every run, and
 /// nothing socket-patch has can restore it. Reinstalling the package puts
-/// the original files back (a gem names its own command: `bundle install`
-/// keeps an installed gem as it is), after which the rollback goes
-/// through; `remove --skip-rollback` drops the record instead. Empty
+/// an edited copy's published files back (a gem names its own command:
+/// `bundle install` keeps an installed gem as it is), after which the
+/// rollback goes through; `remove --skip-rollback` drops the record
+/// instead, which is the way out for another build of the package. Empty
 /// when no failed copy has such a file.
 fn format_neither_content_remedy(results: &[RollbackResult]) -> Vec<String> {
     let reinstall: std::collections::BTreeSet<String> = results
@@ -293,20 +294,20 @@ fn format_neither_content_remedy(results: &[RollbackResult]) -> Vec<String> {
                     .iter()
                     .any(|f| f.status == VerifyRollbackStatus::HashMismatch)
         })
-        .map(|r| crate::commands::agent_download::reinstall_remedy(&r.package_key))
+        .map(|r| crate::ui::reinstall_remedy(&r.package_key))
         .collect();
     if reinstall.is_empty() {
         return Vec::new();
     }
     let mut lines = vec![
         String::new(),
-        "A file that holds neither content cannot be restored from here:".to_string(),
+        "A file that holds neither content was edited, or is another build's; nothing here \
+         can restore it:"
+            .to_string(),
     ];
-    lines.extend(
-        reinstall.iter().map(|remedy| {
-            format!("  {remedy} to get the original files back, then roll back again.")
-        }),
-    );
+    lines.extend(reinstall.iter().map(|remedy| {
+        format!("  {remedy} to get the published files back, then roll back again.")
+    }));
     lines.push(
         "  Or drop the record and leave the files as they are: \
          `socket-patch remove <purl> --skip-rollback`."
@@ -6812,7 +6813,7 @@ mod tests {
             false,
         );
         failed.success = false;
-        failed.error = Some("modified after patching".into());
+        failed.error = Some("holds neither content".into());
         let mut other = failed.clone();
         other.package_key = "pkg:npm/d@1".into();
         assert_eq!(
@@ -6824,8 +6825,15 @@ mod tests {
                 "  2 packages cannot be rolled back",
                 "",
                 "Failed to roll back:",
-                "  pkg:npm/c@1: modified after patching",
-                "  pkg:npm/d@1: modified after patching",
+                "  pkg:npm/c@1: holds neither content",
+                "  pkg:npm/d@1: holds neither content",
+                // The ways out, once for both packages.
+                "",
+                "A file that holds neither content was edited, or is another build's; nothing \
+                 here can restore it:",
+                "  Reinstall the package to get the published files back, then roll back again.",
+                "  Or drop the record and leave the files as they are: `socket-patch remove \
+                 <purl> --skip-rollback`.",
             ]
         );
         assert_eq!(format_rollback_dry_run_counts(&[], p).len(), 3);
@@ -6988,7 +6996,18 @@ mod tests {
         failed.error = Some("modified".into());
         assert_eq!(
             format_rollback_results(&[failed], Path::new("/p"), plain),
-            vec!["", "Failed to roll back:", "  pkg:npm/x@1: modified"]
+            vec![
+                "",
+                "Failed to roll back:",
+                "  pkg:npm/x@1: modified",
+                // Its file holds neither content: the ways out follow.
+                "",
+                "A file that holds neither content was edited, or is another build's; nothing \
+                 here can restore it:",
+                "  Reinstall the package to get the published files back, then roll back again.",
+                "  Or drop the record and leave the files as they are: `socket-patch remove \
+                 <purl> --skip-rollback`.",
+            ]
         );
         assert!(format_rollback_results(&[], Path::new("/p"), plain).is_empty());
     }

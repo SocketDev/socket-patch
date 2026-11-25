@@ -773,19 +773,6 @@ pub(crate) const ALREADY_IN_MANIFEST: &str = "already_in_manifest";
 /// could not be rolled back first (see [`roll_back_replaced_patches`]).
 pub(crate) const REPLACED_PATCH_NOT_RESTORED: &str = "replaced_patch_not_restored";
 
-/// How to get the original files of the package `purl` back, as the start
-/// of a sentence. `bundle install` keeps an installed gem as it is, edits
-/// included, so a gem names the commands that reinstall it.
-pub(crate) fn reinstall_remedy(purl: &str) -> String {
-    match strip_purl_qualifiers(purl)
-        .strip_prefix("pkg:gem/")
-        .and_then(|rest| rest.split('@').next())
-    {
-        Some(gem) => format!("Run `bundle pristine {gem}` (or `gem pristine {gem}`)"),
-        None => "Reinstall the package".to_string(),
-    }
-}
-
 /// Run warning for an installed copy a replaced patch was not rolled back
 /// in, because the copy holds none of that patch's bytes.
 pub(crate) const REPLACED_PATCH_NOT_ON_COPY: &str = "replaced_patch_not_on_copy";
@@ -826,7 +813,7 @@ impl ReplacedRollback {
                  run this command again."
             )
         } else {
-            let remedy = reinstall_remedy(purl);
+            let remedy = crate::ui::reinstall_remedy(purl);
             format!(
                 "the recorded patch {old} could not be rolled back first: {why}. That \
                  patch stays recorded and applied. {remedy} to get the original files \
@@ -1147,7 +1134,7 @@ pub(crate) async fn roll_back_replaced_patches(
                  applied stays as it is. {} to get the original files back.",
                 normalize_purl(&purl),
                 why.trim_end_matches('.'),
-                reinstall_remedy(&purl)
+                crate::ui::reinstall_remedy(&purl)
             ),
         ));
     }
