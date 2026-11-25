@@ -2368,14 +2368,20 @@ projects too. What the sections below then do for it:
 
 - Composer: vendored mode is declined until the lock names a vendored copy
   ([Bazel workspaces: Composer](#bazel-workspaces-composer)).
-- Go: the `.bazelignore` at the Bazel root gets two lines for the module copies under
-  `.socket` ([Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore)).
+- Go, Cargo and Maven: the `.bazelignore` at the Bazel root gets two lines for each kind of
+  copy under `.socket` that a run wrote: the Go module copies, the vendored crates of a crate
+  hub, the jars that vendored mode keeps for a rules_jvm_external hub
+  ([Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore)).
 - npm: hosted mode writes nothing for a root pnpm lock whose rules_js hub may hide
   `pnpm-workspace.yaml` from its pnpm, and does not route a pnpm lock that a hub reads, or
   may read, through a named registry ([Bazel workspaces: npm](#bazel-workspaces-npm)).
 - Hosted mode leaves a crate, a NuGet package or a gem unpinned, with a warning, when a hub
   call of the workspace may read the project's lock and is not written out plainly.
-- Maven: a warning per patch when a rules_jvm_external hub builds the artifact, or may.
+- Maven: hosted and vendored mode patch a pinned rules_jvm_external hub that builds the
+  artifact, with an entry in the root `MODULE.bazel` (vendored mode also commits the jar
+  under `.socket/vendor/maven/`), and a run that does not patch such a hub says so, per
+  patch, when the hub builds the artifact, or may
+  ([Bazel workspaces: Maven](#bazel-workspaces-maven)).
 - VEX: a package is attested `affected` when a hub call names the project's lock.
 
 `SOCKET_NO_BAZEL=1` in the environment switches all of it off (`1`, `true`, `yes`, `on`, `y`
@@ -2387,14 +2393,32 @@ starts inherits the variable, so a socket-patch which that program starts (a hoo
 package manager) does the same. There is no flag for it: `vex --no-bazel` is the VEX
 step's own option and switches nothing else off. Set it only for a project that Bazel does
 not build. For one that Bazel builds, what it switches off is what keeps a command that exits
-0 from leaving a build that fails.
+0 from leaving a build that fails, or one that is not patched.
+
+A Maven patch shows what that means. With the variable set, `vendor` beside a Maven or Gradle
+build vendors for that build alone, as in a checkout without the workspace file: it edits the
+poms, writes the tree under `.socket/vendor/`, exits 0, writes nothing for a hub and says
+nothing of one. A Bazel build that is there after all then keeps the upstream jar of a patch
+the run reported as vendored. In a checkout that only Bazel builds, `vendor` refuses the patch
+for want of a build (`vendor_jvm_shape_unsupported`), as in any tree without a `pom.xml` or a
+Gradle build, and a hosted run leaves it unpinned.
 
 What an earlier run wrote for Bazel is still listed and undone with the variable set:
 
-- The block that hosted mode keeps in the root `MODULE.bazel`
-  ([Bazel workspaces: Maven](#bazel-workspaces-maven)): `list`, `vex` and a scan read its
-  entries as hosted pins, and `rollback` and `remove` take them out. No entry is written, and
-  a hosted scan takes no stale entry out.
+- The block that hosted and vendored mode keep in the root `MODULE.bazel`
+  ([Bazel workspaces: Maven](#bazel-workspaces-maven)): `list`, `vex`, a scan, `vendor --check`
+  and `repair` read its entries as they do without the variable, an entry of hosted mode as a
+  hosted pin and one of vendored mode as the wiring of the jar committed under
+  `.socket/vendor/maven/<patch id>/`. An entry that no pinned hub takes any more still
+  attests nothing in `vex`, and `vendor --check` still names a vendored one. `rollback`
+  and `remove` take a hosted entry out; they and `vendor --revert` take a vendored entry out
+  with its directory and its ledger entry, and the checkout is as it was before the patch.
+  `repair` puts back a lost directory of a patch that only a hub takes. No entry is written or
+  replaced: `vendor` leaves a hosted entry where it is, a hosted run leaves a patch that
+  vendored mode keeps for a hub alone vendored, and a hosted scan takes no stale entry out.
+  Beside a Maven or Gradle build the hub's directory is a copy that only a `vendor` run
+  without the variable writes: one that was lost stays lost, `vendor --check` names it, and
+  the undo still takes its entry out.
 - The `.bazelignore` lines: no pair is added, and the pair of a copy that is gone is removed
   by the command that removed the copy (`rollback`, `remove`, `vendor --revert`, `repair`, a
   scan).

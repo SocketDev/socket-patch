@@ -275,18 +275,24 @@ pub fn hub_refusals(
 /// `MODULE.bazel` wires is ejected there. Elsewhere an eject leaves it,
 /// and the hub's entry changes only with a run that vendors the same patch
 /// for the Maven or Gradle build.
+///
+/// This, [`hub_wired`] and [`stale_hub_entry`] read no workspace file by
+/// the lookup, so each asks the switch for a project that Bazel does not
+/// build ([`crate::bazel::off`]) itself: with it no hub is a build of the
+/// project, a run gives no hub a copy, and a refusal says nothing of one.
+/// What the block holds stays as it is, for the undo.
 pub fn hub_alone(project_root: &Path) -> bool {
-    detect_shape(project_root) == super::jvm::Shape::Other
+    !crate::bazel::off() && detect_shape(project_root) == super::jvm::Shape::Other
 }
 
 /// Whether the block of `MODULE.bazel` at the project root holds the
 /// vendored entry of the patch `uuid`: a hub builds the jar committed in
-/// the directory of that patch.
+/// the directory of that patch, which a run gave it or kept for it.
 pub async fn hub_wired(project_root: &Path, uuid: &str) -> bool {
     use crate::bazel::maven::{entries, FILE};
     let text = read_regular_to_string(&project_root.join(FILE)).await;
     let ours = |patch: &crate::bazel::maven::Patch| patch.uuid == uuid && patch.unit().is_some();
-    text.is_ok_and(|text| entries(&text).iter().any(ours))
+    !crate::bazel::off() && text.is_ok_and(|text| entries(&text).iter().any(ours))
 }
 
 /// What the refusal of `purl` in a project without a JVM build ends with
@@ -297,7 +303,7 @@ async fn stale_hub_entry(project_root: &Path, purl: &str) -> String {
     use crate::bazel::maven::{entries, FILE};
     let text = read_regular_to_string(&project_root.join(FILE)).await;
     let held = text.is_ok_and(|text| entries(&text).iter().any(|patch| patch.purl() == purl));
-    match held {
+    match held && !crate::bazel::off() {
         true => format!(
             "; {FILE} holds an entry for it that no pinned hub takes any more, so Bazel stops \
              there: run `socket-patch rollback {purl}`"

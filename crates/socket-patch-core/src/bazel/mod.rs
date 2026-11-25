@@ -36,7 +36,10 @@ pub const OFF_ENV: &str = "SOCKET_NO_BAZEL";
 /// over in memory holds none ([`workspace::memory`]), and the in-memory
 /// path selection asks for none ([`ruby::is_workspace_file`]): one gate
 /// for each way a workspace is come by, so that what judges one need not
-/// ask. What an earlier run wrote for Bazel is still listed and undone.
+/// ask. The judgements of vendored mode that read the block of
+/// `MODULE.bazel` without the lookup ask here themselves
+/// ([`crate::vendor::maven_repo::hub_alone`]). What an earlier run wrote
+/// for Bazel is still listed and undone.
 pub fn off() -> bool {
     crate::utils::socket_cli_config::env_truthy(OFF_ENV)
 }

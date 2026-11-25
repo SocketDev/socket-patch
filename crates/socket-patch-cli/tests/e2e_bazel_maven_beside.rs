@@ -884,6 +884,54 @@ fn a_hosted_run_removes_the_jar_vendored_mode_kept_for_the_hub() {
     }
 }
 
+/// With the switch, a hosted run leaves what vendored mode wrote for a hub
+/// alone as it is, as the same run does in the checkout without its
+/// workspace file: it has no build to pin the artifact in, so the patch
+/// stays vendored, with its entry of the block, its directory and its
+/// ledger entry. Without the variable the hosted entry takes the place of
+/// the vendored one.
+#[test]
+fn the_switch_leaves_a_vendored_entry_of_the_hub_to_a_hosted_run() {
+    let machine = Machine::start();
+    let proj = machine.root.join("proj");
+    // The ledger entry of a patch that only the hub takes: its artifact is
+    // the jar of the hub's directory, three bytes here, with their sha256.
+    let jar = format!(".socket/vendor/maven/{UUID}/file/victim-1.10.0.jar");
+    let sum = "0163f1eea7894350060624d315234d40c508ab251ba121714e234503045faadd";
+    let ledger = json!({ "version": 1, "entries": { PURL: {
+        "ecosystem": "maven",
+        "basePurl": PURL,
+        "uuid": UUID,
+        "artifact": { "path": jar, "sha256": sum, "size": 3 },
+        "wiring": [],
+        "flavor": "bazel",
+    } } });
+    let make = || {
+        vendored(&machine, false);
+        let state = proj.join(".socket/vendor/state.json");
+        std::fs::write(state, format!("{ledger:#}\n")).expect("the ledger");
+    };
+    for args in [COMMANDS[0], &SCAN[..]] {
+        make();
+        std::fs::remove_file(proj.join("MODULE.bazel")).expect("the workspace file");
+        let without = machine.step(args);
+        make();
+        let held = machine.files();
+        let off = machine.step_off(args);
+        assert_eq!(off, without, "{args:?}");
+        assert_eq!(machine.files(), held, "{args:?}");
+        let codes = warning_codes(&off.envelope());
+        let kept = codes
+            .iter()
+            .any(|code| code == "redirect_takeover_kept_vendored");
+        assert!(kept, "{args:?}: {off:?}");
+        make();
+        let beside = machine.step(args);
+        let module = String::from_utf8_lossy(&beside.wrote[MODULE]);
+        assert_eq!(module, format!("{HUB}\n{BLOCK}"), "{args:?}: {beside:?}");
+    }
+}
+
 /// The Bazel files of a checkout, each with its text.
 type Files = Vec<(&'static str, String)>;
 
