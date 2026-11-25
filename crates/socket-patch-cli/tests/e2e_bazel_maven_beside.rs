@@ -824,6 +824,66 @@ fn a_pinned_hub_gets_its_block_and_the_undo_takes_it_out() {
     assert!(!person.stderr.contains("Warning: pkg:maven"), "{person:?}");
 }
 
+/// Makes the checkout of [`pinned`] as a vendored run left it for the hub:
+/// the block with the entry of vendored mode, the directory of the jar and
+/// its line of `.bazelignore`; with `maven`, beside a `pom.xml`.
+fn vendored(machine: &Machine, maven: bool) {
+    let unit = format!(".socket/vendor/maven/{UUID}");
+    let hosted = "socket_patch_http_file(\n";
+    let (head, entry) = BLOCK.split_once(hosted).expect("the entry");
+    let (_, tail) = entry.split_once(")\n").expect("its end");
+    let vendored = format!(
+        "{}socket_patch_local_repository(\n    name = \
+         \"socket_patch_dev_socket_fixture_victim_1_10_0\",\n    path = \"{unit}\",\n)\n{tail}",
+        head.replace(
+            "socket_patch_http_file = use_repo_rule(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_file\")",
+            "socket_patch_local_repository = use_repo_rule(\"@bazel_tools//tools/build_defs/repo:local.bzl\", \"local_repository\")",
+        )
+    );
+    let ignore = "# socket-patch: patched Maven jars for a Bazel hub, not Bazel packages (to opt \
+                  out, comment out the next line)\n.socket/vendor/maven\n";
+    machine.make(&pinned(), maven, false);
+    let proj = machine.root.join("proj");
+    std::fs::create_dir_all(proj.join(&unit).join("file")).expect("the directory");
+    for (path, text) in [
+        ("MODULE.bazel".to_string(), format!("{HUB}\n{vendored}")),
+        (".bazelignore".to_string(), ignore.to_string()),
+        (format!("{unit}/REPO.bazel"), "# a repository\n".to_string()),
+        (format!("{unit}/file/BUILD.bazel"), String::new()),
+        (format!("{unit}/file/victim-1.10.0.jar"), "jar".to_string()),
+    ] {
+        std::fs::write(proj.join(path), text).expect("write it");
+    }
+}
+
+/// A hosted run puts its entry in the place of the vendored one that the
+/// block holds for the jar, and removes what vendored mode kept for the
+/// hub: the directory of the jar, which nothing names any more, and its
+/// line of `.bazelignore`. Beside a Maven build no undo of a vendored
+/// patch does that, since the ledger entry there is the Maven build's.
+/// A hosted scan, which finds the jar in the hub's lock, does the same.
+#[test]
+fn a_hosted_run_removes_the_jar_vendored_mode_kept_for_the_hub() {
+    let machine = Machine::start();
+    for command in [COMMANDS[0], &SCAN[..]] {
+        vendored(&machine, true);
+        let ran = machine.step(command);
+        assert_eq!(ran.code, Some(0), "{ran:?}");
+        assert_eq!(ran.envelope()["warnings"], Value::Null, "{ran:?}");
+        let with_block = format!("{HUB}\n{BLOCK}");
+        assert_eq!(
+            String::from_utf8_lossy(&ran.wrote[MODULE]),
+            with_block,
+            "{ran:?}"
+        );
+        let left = machine.files();
+        let of_the_hub =
+            |path: &&String| path.contains(".socket/vendor") || path.ends_with("ignore");
+        let kept: Vec<&String> = left.keys().filter(of_the_hub).collect();
+        assert_eq!(kept, Vec::<&String>::new(), "{ran:?}");
+    }
+}
+
 /// The Bazel files of a checkout, each with its text.
 type Files = Vec<(&'static str, String)>;
 
@@ -1694,6 +1754,44 @@ fn a_hosted_scan_leaves_a_stale_entry_that_the_policy_filters() {
             (Some(0), &json!([]), &BTreeMap::new()),
             "{dir}: {scan:?}"
         );
+    }
+}
+
+/// The hub's lock moves on after a vendored patch, and Bazel stops at the
+/// entry as it does at a hosted one. A hosted scan leaves that entry: the
+/// directory of its jar and its ledger entry are vendored mode's, whose
+/// undo takes them out with it. The scan changes nothing of the hub and
+/// warns of no restore that failed, alone and beside a Maven build, which
+/// it pins as it does without the workspace.
+#[test]
+fn a_hosted_scan_leaves_a_stale_entry_of_vendored_mode() {
+    let machine = Machine::start();
+    let moved = lock(&[("consumer", "2.0"), ("victim", "1.11.0")]);
+    let of_the_hub = |machine: &Machine| -> BTreeMap<String, Vec<u8>> {
+        let hub = |path: &str| {
+            path.contains(".socket/vendor") || path.ends_with("ignore") || path == MODULE
+        };
+        let files = machine.files().into_iter();
+        files.filter(|(path, _)| hub(path)).collect()
+    };
+    for maven in [false, true] {
+        vendored(&machine, maven);
+        std::fs::write(machine.root.join("proj/maven_install.json"), &moved).expect("the lock");
+        let held = of_the_hub(&machine);
+        assert_eq!(held.len(), 5, "{held:?}");
+        for scan in [&[&SCAN[..], &["--dry-run"]].concat()[..], &SCAN] {
+            let scan = machine.step(scan);
+            let said = scan.envelope();
+            let pins = match maven {
+                true => vec![PURL.to_string()],
+                false => vec![],
+            };
+            let purls = event_triples(&said).into_iter().map(|(purl, ..)| purl);
+            assert_eq!(purls.collect::<Vec<_>>(), pins, "{maven}: {scan:?}");
+            let codes = warning_codes(&said);
+            assert_eq!((scan.code, codes), (Some(0), vec![]), "{maven}: {scan:?}");
+            assert_eq!(of_the_hub(&machine), held, "{maven}: {scan:?}");
+        }
     }
 }
 
