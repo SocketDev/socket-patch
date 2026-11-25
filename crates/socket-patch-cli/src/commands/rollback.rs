@@ -1969,8 +1969,9 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
             return 1;
         }
     };
-    // Only a missing ledger is "no ledger": one that cannot even be stat'd
-    // goes on to the load below, which reports it.
+    // Only a missing ledger is "no ledger": with one that cannot even be
+    // stat'd the run goes on, and its first read under `.socket/vendor/`
+    // (the lock's journal check, else the load below) reports the failure.
     let vendor_ledger_exists = project_state
         && !matches!(
             tokio::fs::try_exists(ledger_root.join(".socket/vendor/state.json")).await,
@@ -2286,22 +2287,21 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
         vendor_scope.extend(found.vendor.into_iter().map(|(k, _)| k));
         hosted_scope.extend(pins.into_iter().map(|pin| pin.purl));
         if !matched {
+            let hint = if matches!(id.kind(), TargetKind::Purl | TargetKind::Uuid) {
+                String::new()
+            } else {
+                format!(" (to target a directory instead, use ./{id} or {id}/**)")
+            };
             // In no store that could be read. A ledger that could not be
             // may hold it: its error then, not `patch_not_found`.
-            let error = match &vendor_state_result {
+            let mut error = match &vendor_state_result {
                 Err(e) => crate::json_envelope::vendor_ledger_load_error(e, Some(&id.to_string())),
-                Ok(_) => {
-                    let hint = if matches!(id.kind(), TargetKind::Purl | TargetKind::Uuid) {
-                        String::new()
-                    } else {
-                        format!(" (to target a directory instead, use ./{id} or {id}/**)")
-                    };
-                    EnvelopeError::new(
-                        "patch_not_found",
-                        format!("No patch found matching identifier: {id}{hint}"),
-                    )
-                }
+                Ok(_) => EnvelopeError::new(
+                    "patch_not_found",
+                    format!("No patch found matching identifier: {id}"),
+                ),
             };
+            error.message.push_str(&hint);
             track_unstarted(&args, &error.code, &error.message, &telemetry).await;
             if args.common.json {
                 let mut env = error_envelope(args.common.dry_run, error);

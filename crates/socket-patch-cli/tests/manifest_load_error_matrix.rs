@@ -406,6 +406,24 @@ fn a_target_is_never_not_found_while_the_vendor_ledger_cannot_be_stat() {
     });
 }
 
+/// `repair` takes no target, and probed for the ledger the same way: with
+/// no manifest, one it could not stat was a project with nothing to
+/// repair (`manifest_not_found`).
+#[cfg(unix)]
+#[test]
+fn repair_reports_a_vendor_ledger_it_cannot_stat() {
+    let tmp = ledger_project(
+        &|ledger| std::os::unix::fs::symlink("state.json", ledger).unwrap(),
+        None,
+    );
+    let (exit, v) = run_targeted(&tmp, &["repair", "--json", "--offline"]);
+    assert_eq!(exit, 1, "{v}");
+    assert_eq!(
+        v["events"][0]["errorCode"], "vendor_state_unreadable",
+        "{v}"
+    );
+}
+
 /// The control: with every store readable, a target none of them holds
 /// keeps each command's own "not found" code.
 #[test]

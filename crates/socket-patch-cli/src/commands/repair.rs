@@ -102,7 +102,9 @@ pub async fn run(args: RepairArgs) -> i32 {
             .common
             .project_root()
             .join(socket_patch_core::vendor::VENDOR_STATE_REL);
-        let mut has_vendor_traces = tokio::fs::metadata(&state_file).await.is_ok();
+        // Only a missing ledger is "no ledger": one that cannot even be
+        // stat'd is a trace, and the run's first read of it reports it.
+        let mut has_vendor_traces = !matches!(tokio::fs::try_exists(&state_file).await, Ok(false));
         if !has_vendor_traces {
             let refs = crate::commands::vendored_backend::repair::scan_vendor_references(
                 &args.common.project_root(),

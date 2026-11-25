@@ -555,8 +555,10 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // restore retires them from the manifest.
     let hosted_pins: Vec<HostedPin> = hosted_inventory.unwindable();
     if manifest_missing {
-        // Only a missing ledger is "no ledger": one that cannot even be
-        // stat'd goes on to the load below, which reports it.
+        // Only a missing ledger is "no ledger": with one that cannot even
+        // be stat'd the run goes on, and its first read under
+        // `.socket/vendor/` (the lock's journal check, else the load
+        // below) reports the failure.
         let ledger = args.common.project_root().join(VENDOR_STATE_REL);
         let vendor_ledger_exists =
             project_state && !matches!(tokio::fs::try_exists(&ledger).await, Ok(false));
