@@ -783,20 +783,35 @@ pub(crate) fn format_state_unreadable(err: &str) -> String {
     }
 }
 
-/// `details` key of the event that a platform gem's own patch gets beside
-/// the event of the gem it was vendored with (a gem the lock pins as
-/// platform gems is one vendored package, led by the patch its platform
-/// gems were built from): the uuid of that lead patch. Such an event
-/// repeats the package's outcome under one more patch, and no count of
-/// packages includes it.
+/// `details` key of the events of a gem vendored as platform gems: the
+/// uuid of the patch the gem was vendored through (the one its directory
+/// and ledger entry are named after). Such a gem is ONE vendored package
+/// with one event per platform gem, each under that gem's own patch and
+/// each counted in `summary`, as hosted mode counts them; the key ties
+/// those events together, so a count of packages takes them once.
 const GEM_FIX_DETAIL: &str = "gemFix";
 
-/// Whether `event` is one of those ([`GEM_FIX_DETAIL`]).
-fn of_gem_fix(event: &PatchEvent) -> bool {
-    event
-        .details
-        .as_ref()
-        .is_some_and(|details| details.get(GEM_FIX_DETAIL).is_some())
+/// How many of the events `counted` picks stand for a gem that an earlier
+/// one of them already stands for ([`GEM_FIX_DETAIL`]): what a count of
+/// events is over a count of packages.
+fn gem_fix_repeats(env: &Envelope, counted: impl Fn(&PatchEvent) -> bool) -> u32 {
+    let mut gems: HashSet<&str> = HashSet::new();
+    env.events
+        .iter()
+        .filter(|event| counted(event))
+        .filter_map(|event| event.details.as_ref()?.get(GEM_FIX_DETAIL)?.as_str())
+        .filter(|fix| !gems.insert(fix))
+        .count() as u32
+}
+
+/// How many packages `env` reports as vendored: its `applied` events, a
+/// gem vendored as platform gems once.
+fn vendored_packages(env: &Envelope) -> u32 {
+    env.summary
+        .applied
+        .saturating_sub(gem_fix_repeats(env, |event| {
+            event.action == PatchAction::Applied
+        }))
 }
 
 /// Per-outcome counts behind the human vendor summary line.
@@ -818,23 +833,23 @@ impl VendorTally {
     /// dry-run previews whose ledger entry already records the patch (the
     /// backends preview those as `verified`, like a fresh vendor).
     fn from_envelope(env: &Envelope, dry_run: bool, dry_in_sync: u32) -> Self {
-        // One per package: the event of a platform gem's own patch repeats
-        // the outcome of the package it was vendored with.
+        // Packages, not events: a gem vendored as platform gems has one
+        // event per platform gem and is one package.
+        let repeats = |action: PatchAction| gem_fix_repeats(env, |e| e.action == action);
         let code_count = |code: &str| {
-            env.events
-                .iter()
-                .filter(|e| !of_gem_fix(e))
-                .filter(|e| {
-                    e.action == PatchAction::Skipped && e.error_code.as_deref() == Some(code)
-                })
-                .count() as u32
+            let coded = |e: &PatchEvent| {
+                e.action == PatchAction::Skipped && e.error_code.as_deref() == Some(code)
+            };
+            let events = env.events.iter().filter(|e| coded(e)).count() as u32;
+            events.saturating_sub(gem_fix_repeats(env, coded))
         };
         let already_wet = code_count("already_vendored");
         let not_installed = code_count("package_not_installed");
         let vendored = if dry_run {
-            (env.summary.applied + env.summary.verified).saturating_sub(dry_in_sync)
+            (vendored_packages(env) + env.summary.verified)
+                .saturating_sub(repeats(PatchAction::Verified) + dry_in_sync)
         } else {
-            env.summary.applied
+            vendored_packages(env)
         };
         VendorTally {
             vendored,
@@ -843,8 +858,11 @@ impl VendorTally {
             skipped: env
                 .summary
                 .skipped
-                .saturating_sub(already_wet + not_installed),
-            failed: env.summary.failed,
+                .saturating_sub(repeats(PatchAction::Skipped) + already_wet + not_installed),
+            failed: env
+                .summary
+                .failed
+                .saturating_sub(repeats(PatchAction::Failed)),
         }
     }
 }
@@ -1543,7 +1561,20 @@ async fn run_check(args: &VendorArgs) -> i32 {
         if !args.common.json && (!args.common.silent || event.action == PatchAction::Failed) {
             println!("{}: {}", key, event.reason.as_deref().unwrap_or("verified"));
         }
-        env.record(event);
+        // A gem vendored as platform gems: the verdict of its directory,
+        // once per platform gem and under that gem's own patch.
+        if entry.ecosystem == "gem" && !entry.gem_builds.is_empty() {
+            let base = strip_purl_qualifiers(&entry.base_purl);
+            for built in &entry.gem_builds {
+                let mut event = event.clone();
+                event.purl = Some(format!("{base}?platform={}", built.platform));
+                event.uuid = Some(built.uuid.clone());
+                event.details = Some(serde_json::json!({ GEM_FIX_DETAIL: entry.uuid }));
+                env.record(event);
+            }
+        } else {
+            env.record(event);
+        }
     }
     // A gem vendored as platform gems is one ledger entry, the patch its
     // platform gems were built from, which records the patch of each
@@ -2257,7 +2288,8 @@ async fn run_eject(
             .or_default()
             .push(purl.clone());
     }
-    let gem_units = GemUnits::of(&common.cwd, &mut eject_groups, &records).await;
+    // A hosted gem has no vendored copy to stay with.
+    let gem_units = GemUnits::of(&common.cwd, &mut eject_groups, &records, &HashMap::new()).await;
 
     // All or nothing: a record the API cannot serve refuses the whole eject
     // before anything is touched, so every package stays hosted.
@@ -2867,7 +2899,14 @@ pub(crate) async fn track_outcomes_for_vendor(
         )
         .await;
     } else {
-        track_patch_vendored(command, env.summary.applied, dry_run, &patches, telemetry).await;
+        track_patch_vendored(
+            command,
+            vendored_packages(env),
+            dry_run,
+            &patches,
+            telemetry,
+        )
+        .await;
     }
 }
 
@@ -3381,16 +3420,19 @@ struct GemUnits {
 
 impl GemUnits {
     /// Group the gem `records` of each gem the lock at `cwd` pins as
-    /// platform gems, and take the platform patches out of `variant_groups`
-    /// (the candidates the vendor loop judges): the patch of a locked
-    /// platform is vendored with its unit's lead, and the patch of a
-    /// platform the lock does not name has nothing here to vendor. A gem
-    /// with no patch of its ruby gem among `records` has no lead: its
-    /// platform patches stay candidates, and the backend refuses each.
+    /// platform gems, and take the other patches of the gem out of
+    /// `variant_groups` (the candidates the vendor loop judges): the patch
+    /// of a locked platform is vendored with its unit's lead, and the patch
+    /// of a platform the lock does not name has nothing here to vendor.
+    /// The lead is the patch of the ruby gem where the run has it, else the
+    /// patch of the first locked platform; a gem already vendored
+    /// (`ledger`) keeps the lead it has while that patch is still one of
+    /// them, so its directory does not move.
     async fn of(
         cwd: &Path,
         variant_groups: &mut HashMap<String, Vec<String>>,
         records: &HashMap<String, PatchRecord>,
+        ledger: &HashMap<String, vendor::VendorEntry>,
     ) -> GemUnits {
         use socket_patch_core::hosted::gem_fixes::GemLock;
         let gems: Vec<&String> = variant_groups
@@ -3409,14 +3451,6 @@ impl GemUnits {
                 continue;
             }
             let of_platform = |purl: &String| GemLock::platform_of(purl);
-            let mut leads: Vec<&String> = candidates
-                .iter()
-                .filter(|purl| of_platform(purl).is_none() && records.contains_key(*purl))
-                .collect();
-            leads.sort();
-            let Some(lead) = leads.first().map(|lead| (*lead).clone()) else {
-                continue;
-            };
             let builds: Vec<(String, String)> = platforms
                 .iter()
                 .filter_map(|platform| {
@@ -3429,7 +3463,42 @@ impl GemUnits {
                     Some((platform.clone(), (*patches.first()?).clone()))
                 })
                 .collect();
-            candidates.retain(|purl| of_platform(purl).is_none());
+            // The patch the gem is vendored through, whose uuid names its
+            // directory. Any patch of the fix would do (each tree comes
+            // from its own platform's patch), so the choice only decides
+            // where the directory is. In order: the patch the ledger says
+            // the gem is vendored through, while it is still one of these
+            // (a copy that works is not moved); the patch of the ruby gem,
+            // which stays the same whichever platforms the lock names; and
+            // where that one is not available, the patch of the first
+            // platform the lock names.
+            let eligible = |purl: &&String| {
+                (of_platform(purl).is_none() && records.contains_key(*purl))
+                    || builds.iter().any(|(_, patch)| patch == *purl)
+            };
+            let vendored_through = ledger
+                .values()
+                .find(|entry| entry.ecosystem == "gem" && PurlKey::same(&entry.base_purl, base))
+                .map(|entry| entry.uuid.as_str());
+            let in_use = candidates
+                .iter()
+                .filter(eligible)
+                .find(|purl| vendored_through.is_some_and(|uuid| records[*purl].uuid == uuid));
+            let mut sources: Vec<&String> = candidates
+                .iter()
+                .filter(|purl| of_platform(purl).is_none() && records.contains_key(*purl))
+                .collect();
+            sources.sort();
+            let first_build = builds.first().map(|(_, patch)| patch);
+            let Some(lead) = in_use.or(sources.first().copied()).or(first_build).cloned() else {
+                continue;
+            };
+            // The other patches of the gem are vendored with the lead, or
+            // have nothing here to vendor: none is a candidate of its own.
+            match of_platform(&lead) {
+                Some(_) => candidates.retain(|purl| *purl == lead),
+                None => candidates.retain(|purl| of_platform(purl).is_none()),
+            }
             units.builds.insert(lead, builds);
         }
         units
@@ -3911,7 +3980,7 @@ pub(crate) async fn vendor_records_reusing(
     // its ruby gem, with the tree of each locked platform built from that
     // platform's patch (see `GemUnits`). The platform patches are not
     // candidates of their own.
-    let gem_units = GemUnits::of(&common.cwd, &mut variant_groups, records).await;
+    let gem_units = GemUnits::of(&common.cwd, &mut variant_groups, records, &state.entries).await;
 
     let mut matched: HashSet<String> = HashSet::new();
 
@@ -4660,22 +4729,25 @@ pub(crate) async fn vendor_records_reusing(
                     }
                 }
             }
-            // The platform gems of a gem vendored as platform gems share
-            // the outcome of the candidate they were vendored with: each
-            // gets an event under its own patch (uncounted: the package is
-            // counted once).
-            let shared = env.events[outcome_at..]
+            // A gem vendored as platform gems is reported per platform
+            // gem, as hosted mode reports it: the outcome of the candidate
+            // it was vendored through becomes one event per platform gem,
+            // each under that gem's own patch and each counted. The
+            // candidate itself (the patch the directory is named after)
+            // keeps the event only when no platform gem has a patch here.
+            let members = gem_units.members(candidate, records);
+            let lead_at = env.events[outcome_at..]
                 .iter()
-                .find(|event| event.purl.as_deref() == Some(candidate.as_str()))
-                .cloned();
-            if let Some(shared) = shared {
-                for (member, uuid) in gem_units.members(candidate, records) {
-                    let mut event = shared.clone();
+                .position(|event| event.purl.as_deref() == Some(candidate.as_str()))
+                .map(|at| outcome_at + at);
+            if let (Some(at), false) = (lead_at, members.is_empty()) {
+                let outcome = env.events[at].clone();
+                for (nth, (member, uuid)) in members.into_iter().enumerate() {
+                    let mut event = outcome.clone();
                     event.purl = Some(member);
                     event.uuid = Some(uuid);
-                    event.files = Vec::new();
-                    // The patch the package was vendored through: the event
-                    // is that package's outcome under one more patch.
+                    // The patch the gem was vendored through ties the
+                    // events of one gem together.
                     let mut details = event
                         .details
                         .take()
@@ -4683,7 +4755,10 @@ pub(crate) async fn vendor_records_reusing(
                         .unwrap_or_else(|| serde_json::json!({}));
                     details[GEM_FIX_DETAIL] = serde_json::json!(record.uuid);
                     event.details = Some(details);
-                    env.events.push(event);
+                    match nth {
+                        0 => env.events[at] = event,
+                        _ => env.record_at(at + nth, event),
+                    }
                 }
             }
             // The reverted hosted pin is gone either way: a vendored purl
@@ -8754,31 +8829,73 @@ mod ui_format_tests {
         );
     }
 
-    /// A gem vendored as platform gems is one package: the events its
-    /// platform gems' own patches get beside it (uncounted, tagged with the
-    /// patch the package was vendored through) add nothing to the tally.
+    /// A gem vendored as platform gems has one counted event per platform
+    /// gem, each under that gem's own patch, as in hosted mode. It is one
+    /// package all the same: the human tally takes the events of one gem
+    /// once, whatever their outcome.
     #[test]
     fn tally_counts_a_gem_vendored_as_platform_gems_once() {
-        let mut env = Envelope::new(Command::Vendor);
-        let lead = PatchEvent::new(
-            PatchAction::Skipped,
-            "pkg:gem/nokogiri@1.18.10?platform=ruby",
-        )
-        .with_uuid("source")
-        .with_reason("already_vendored", "in sync");
-        env.record(lead.clone());
-        for (platform, uuid) in [("arm64-darwin", "darwin"), ("x86_64-linux-gnu", "linux")] {
-            let mut event = lead.clone();
-            event.purl = Some(format!("pkg:gem/nokogiri@1.18.10?platform={platform}"));
-            event.uuid = Some(uuid.to_string());
-            event.details = Some(serde_json::json!({ GEM_FIX_DETAIL: "source" }));
-            env.events.push(event);
+        let builds = |env: &mut Envelope, event: &PatchEvent| {
+            for (platform, uuid) in [("arm64-darwin", "darwin"), ("x86_64-linux-gnu", "linux")] {
+                let mut event = event.clone();
+                event.purl = Some(format!("pkg:gem/nokogiri@1.18.10?platform={platform}"));
+                event.uuid = Some(uuid.to_string());
+                event.details = Some(serde_json::json!({ GEM_FIX_DETAIL: "source" }));
+                env.record(event);
+            }
+        };
+        let event = |action| PatchEvent::new(action, "pkg:gem/nokogiri@1.18.10?platform=ruby");
+        let cases = [
+            (
+                event(PatchAction::Skipped).with_reason("already_vendored", "in sync"),
+                tally(0, 1, 0, 0, 0),
+                "1 package is already vendored; nothing to do.",
+            ),
+            (
+                event(PatchAction::Applied),
+                tally(1, 0, 0, 0, 0),
+                "Vendored 1 package.",
+            ),
+            (
+                event(PatchAction::Skipped).with_reason("vendor_prebuilt_platform_pending", "x"),
+                tally(0, 0, 0, 1, 0),
+                "Vendored 0 packages; 1 skipped.",
+            ),
+            (
+                event(PatchAction::Failed).with_error("x", "y"),
+                tally(0, 0, 0, 0, 1),
+                "Vendored 0 packages; 1 failed.",
+            ),
+        ];
+        for (outcome, expected, line) in cases {
+            let mut alone = Envelope::new(Command::Vendor);
+            builds(&mut alone, &outcome);
+            let counted = VendorTally::from_envelope(&alone, false, 0);
+            assert_eq!(counted, expected, "{line}");
+            assert_eq!(format_vendor_summary(false, &counted), line);
+            // Each platform gem's event is counted in the summary.
+            let events = alone.summary.applied + alone.summary.skipped + alone.summary.failed;
+            assert_eq!(events, 2, "{line}");
+            // Another package beside the gem is counted by itself.
+            alone.record(PatchEvent::new(PatchAction::Applied, "pkg:gem/rack@3.1.8"));
+            let mut with_rack = expected;
+            with_rack.vendored += 1;
+            assert_eq!(
+                VendorTally::from_envelope(&alone, false, 0),
+                with_rack,
+                "{line}"
+            );
         }
-        let counted = VendorTally::from_envelope(&env, false, 0);
-        assert_eq!(counted, tally(0, 1, 0, 0, 0));
+        // A dry run previews each platform gem as `verified`.
+        let mut dry = Envelope::new(Command::Vendor);
+        builds(&mut dry, &event(PatchAction::Verified));
         assert_eq!(
-            format_vendor_summary(false, &counted),
-            "1 package is already vendored; nothing to do."
+            VendorTally::from_envelope(&dry, true, 0),
+            tally(1, 0, 0, 0, 0)
+        );
+        assert_eq!(
+            VendorTally::from_envelope(&dry, true, 1),
+            tally(0, 1, 0, 0, 0)
         );
     }
 

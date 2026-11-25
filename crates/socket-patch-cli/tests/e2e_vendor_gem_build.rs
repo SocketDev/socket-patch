@@ -3225,7 +3225,28 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
     );
     let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
+    // One applied event per platform gem, each under its own patch (the
+    // human summary counts the gem as one package).
+    assert_eq!(
+        env["summary"]["applied"],
+        platforms.len(),
+        "one applied event per platform gem: {env}"
+    );
+    let mut applied: Vec<(String, String)> = env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["action"] == "applied")
+        .map(|e| {
+            assert_eq!(e["details"]["gemFix"], UUID, "{e}");
+            let field = |key: &str| e[key].as_str().unwrap_or_default().to_string();
+            (field("purl"), field("uuid"))
+        })
+        .collect();
+    applied.sort();
+    let mut expected_events = fix_patches(UUID, &platforms)[1..].to_vec();
+    expected_events.sort();
+    assert_eq!(applied, expected_events, "{env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
     // The platform gems and their stubs are all that is downloaded: the
     // ruby gem of the source patch is not.
@@ -3578,6 +3599,96 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
         );
     }
     drop(source_only);
+
+    // The fix without its source patch (the ruby gem's patch is not
+    // offered to the run): the gem is vendored through the patch of the
+    // first locked platform, whose uuid names the directory. It stays
+    // there once the source patch turns up, and reverts like any other.
+    {
+        let sourceless = base.join("sourceless");
+        common::fs_tree::copy_tree(&proj, &sourceless);
+        let (code, stdout, stderr) = run_in(&sourceless, &["vendor", "--revert", "--json"], None);
+        assert_eq!(
+            code, 0,
+            "premise: revert.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            pair_of(&sourceless),
+            (gemfile_before.clone(), lock_before.clone())
+        );
+        let stage_in = |patches: &[(String, String)]| {
+            stage_patches_with_vuln(
+                &sourceless,
+                patches,
+                "lib/sockplat.rb",
+                PLAT_PRISTINE.as_bytes(),
+                patched.as_bytes(),
+            );
+        };
+        let fix = fix_patches(UUID, &platforms);
+        stage_in(&fix[1..]);
+        let lead = build_uuid(UUID, &sorted[0]);
+        let lead_dir = format!(".socket/vendor/gem/{lead}/{PLAT}-{PLAT_VERSION}");
+        let (code, stdout, stderr) = run_in(&sourceless, &["vendor", "--json"], Some(&server));
+        assert_eq!(
+            code, 0,
+            "vendoring without the source patch.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let env = parse_json_envelope(&stdout);
+        assert_eq!(env["summary"]["failed"], 0, "{env}");
+        assert_eq!(
+            env["summary"]["applied"],
+            platforms.len(),
+            "one applied event per platform gem: {env}"
+        );
+        for platform in &platforms {
+            let tree = sourceless.join(&lead_dir).join(platform);
+            assert_eq!(
+                std::fs::read_to_string(tree.join("lib/sockplat.rb")).unwrap(),
+                patched,
+                "{platform}: its tree sits under the first platform's patch"
+            );
+        }
+        let lock = std::fs::read_to_string(sourceless.join("Gemfile.lock")).unwrap();
+        assert!(
+            lock.starts_with(&format!("PATH\n  remote: {lead_dir}\n")),
+            "{lock}"
+        );
+        let (code, stdout, stderr) =
+            run_in(&sourceless, &["vendor", "--check", "--json"], Some(&server));
+        assert_eq!(code, 0, "check.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        // The source patch turns up: the copy works, and stays where it is.
+        let wired = pair_of(&sourceless);
+        let state_wired = std::fs::read(sourceless.join(".socket/vendor/state.json")).unwrap();
+        stage_in(&fix);
+        let (code, stdout, stderr) = run_in(&sourceless, &["vendor", "--json"], Some(&server));
+        assert_eq!(code, 0, "re-run.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        let env = parse_json_envelope(&stdout);
+        assert_eq!(env["summary"]["failed"], 0, "{env}");
+        assert_eq!(
+            env["summary"]["applied"], 0,
+            "nothing is vendored again: {env}"
+        );
+        assert_eq!(pair_of(&sourceless), wired, "{env}");
+        assert_eq!(
+            std::fs::read(sourceless.join(".socket/vendor/state.json")).unwrap(),
+            state_wired,
+            "{env}"
+        );
+        assert!(
+            !sourceless
+                .join(format!(".socket/vendor/gem/{UUID}"))
+                .exists(),
+            "the copy is not moved under the source patch"
+        );
+        let (code, stdout, stderr) = run_in(&sourceless, &["vendor", "--revert", "--json"], None);
+        assert_eq!(code, 0, "revert.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_eq!(
+            pair_of(&sourceless),
+            (gemfile_before.clone(), lock_before.clone())
+        );
+        assert!(!sourceless.join(".socket/vendor/gem").exists());
+    }
 
     // 5. FRESH CHECKOUT: only the committable files, and no patch service.
     let fresh = base.join("fresh");

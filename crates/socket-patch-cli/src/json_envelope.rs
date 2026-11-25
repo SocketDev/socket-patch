@@ -252,6 +252,17 @@ impl Envelope {
         self.events.push(event);
     }
 
+    /// [`Self::record`] with the event placed at `index` of `events`
+    /// instead of at their end: for an event that belongs beside one
+    /// already recorded.
+    pub fn record_at(&mut self, index: usize, event: PatchEvent) {
+        self.summary.bump(event.action);
+        if matches!(event.action, PatchAction::Failed) {
+            self.mark_partial_failure();
+        }
+        self.events.insert(index.min(self.events.len()), event);
+    }
+
     /// Re-tag every `Applied` event recorded at or after index `since` as
     /// `action` (`Skipped` or `Failed`) with `code` and `message`, keeping
     /// the summary in step: for packages a later step of the same run
