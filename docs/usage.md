@@ -272,11 +272,12 @@ grype dir:. --vex socket.vex.json --show-suppressed
 
 Each statement names the project as its product, with the patched packages as its
 subcomponents, and names each patched package again as a product of its own, which
-is how Trivy and Grype look a finding up. A package is named by its PURL and by the
-forms those scanners report it under: without qualifiers, and for a gem built for a
-platform, also as `name@version-platform`. A form that would also stand for an
-unpatched copy of the package in the same document is left out, so the scanner
-keeps reporting that copy.
+is how Trivy and Grype look a finding up. A gem built for a platform is also named
+as Trivy reports it (`name@version`) and as Grype and Syft report it
+(`name@version-platform`). A form that would also stand for an unpatched copy, or a
+copy the document leaves out, is left out, so the scanner keeps reporting that copy.
+Scanners match a package wherever they find it, so use the document only on the
+project it was made for.
 
 | Patch mode | Evidence used by VEX |
 | --- | --- |
