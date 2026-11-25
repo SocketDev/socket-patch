@@ -134,9 +134,10 @@ use socket_patch_core::vendor::refusals::refusal_is_benign;
 ///
 /// One unserved refusal is a skip with nothing to keep as well:
 /// [`vendor::VENDOR_PREBUILT_PLATFORM_PENDING`], a gem locked as platform
-/// gems whose prebuild for one of the locked platforms the service does
-/// not list. A prebuild is listed only once built, so the run cannot tell
-/// "not yet" from "never", and the project is exactly as it was.
+/// gems with no usable patch of the fix for one of the locked platforms.
+/// A platform's patch is listed only once it is published and built, so
+/// the run cannot tell "not yet" from "never", and the project is exactly
+/// as it was.
 ///
 /// [`Discovery::vendor_entry_live`]: socket_patch_core::vex::discover::Discovery::vendor_entry_live
 async fn keep_older_vendored_patch(
@@ -274,6 +275,7 @@ async fn takeover_dry_refusal(
     service: Option<&VendorServiceConfig>,
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
     installed_sites: &vendor::pypi::InstalledSiteListings,
+    gem_builds: &[vendor::gem::GemBuildPatch<'_>],
 ) -> Option<(&'static str, String)> {
     if !restored_text_previewable(restore) {
         return None;
@@ -307,6 +309,7 @@ async fn takeover_dry_refusal(
         service,
         pipenv_version,
         installed_sites,
+        gem_builds,
     ))
     .await;
     drop(probe);
@@ -359,6 +362,9 @@ pub(crate) async fn dispatch_vendor_one(
     service: Option<&VendorServiceConfig>,
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
     installed_sites: &vendor::pypi::InstalledSiteListings,
+    // gem: the patches of the platform gems of `purl`'s gem (see
+    // `GemUnits`); empty for every other purl.
+    gem_builds: &[vendor::gem::GemBuildPatch<'_>],
 ) -> Option<VendorOutcome> {
     let eco = ecosystem_dir_for_purl(purl)?;
     // Before any backend write: a linked vendor dir is never ours, and the
@@ -422,7 +428,21 @@ pub(crate) async fn dispatch_vendor_one(
             )
             .await
         }
-        "gem" => vend!(vendor::gem::vendor_gem, pkg_path),
+        "gem" => {
+            vendor::gem::vendor_gem_builds(
+                purl,
+                pkg_path,
+                project_root,
+                record,
+                gem_builds,
+                sources,
+                vendored_at,
+                dry_run,
+                force,
+                service,
+            )
+            .await
+        }
         "cargo" => vend!(vendor::cargo::vendor_cargo_crate, pkg_path),
         "golang" => vend!(vendor::golang::vendor_go_module, pkg_path),
         "composer" => vend!(vendor::composer_lock::vendor_composer, pkg_path),
@@ -763,6 +783,22 @@ pub(crate) fn format_state_unreadable(err: &str) -> String {
     }
 }
 
+/// `details` key of the event that a platform gem's own patch gets beside
+/// the event of the gem it was vendored with (a gem the lock pins as
+/// platform gems is one vendored package, led by the patch its platform
+/// gems were built from): the uuid of that lead patch. Such an event
+/// repeats the package's outcome under one more patch, and no count of
+/// packages includes it.
+const GEM_FIX_DETAIL: &str = "gemFix";
+
+/// Whether `event` is one of those ([`GEM_FIX_DETAIL`]).
+fn of_gem_fix(event: &PatchEvent) -> bool {
+    event
+        .details
+        .as_ref()
+        .is_some_and(|details| details.get(GEM_FIX_DETAIL).is_some())
+}
+
 /// Per-outcome counts behind the human vendor summary line.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct VendorTally {
@@ -782,9 +818,12 @@ impl VendorTally {
     /// dry-run previews whose ledger entry already records the patch (the
     /// backends preview those as `verified`, like a fresh vendor).
     fn from_envelope(env: &Envelope, dry_run: bool, dry_in_sync: u32) -> Self {
+        // One per package: the event of a platform gem's own patch repeats
+        // the outcome of the package it was vendored with.
         let code_count = |code: &str| {
             env.events
                 .iter()
+                .filter(|e| !of_gem_fix(e))
                 .filter(|e| {
                     e.action == PatchAction::Skipped && e.error_code.as_deref() == Some(code)
                 })
@@ -1506,11 +1545,21 @@ async fn run_check(args: &VendorArgs) -> i32 {
         }
         env.record(event);
     }
+    // A gem vendored as platform gems is one ledger entry, the patch its
+    // platform gems were built from, which records the patch of each
+    // platform's tree: the manifest records of those patches are vendored
+    // through that entry, and were checked with it above.
+    let built_through: HashSet<&str> = state
+        .entries
+        .values()
+        .flat_map(|entry| entry.gem_builds.iter().map(|built| built.uuid.as_str()))
+        .collect();
     let mut unledgered_uuids: HashSet<&str> = HashSet::new();
     for (key, record) in manifest
         .patches
         .iter()
         .filter(|(k, _)| !state.entries.contains_key(*k))
+        .filter(|(_, record)| !built_through.contains(record.uuid.as_str()))
     {
         unledgered_uuids.insert(record.uuid.as_str());
         if !args.common.json {
@@ -2176,6 +2225,40 @@ async fn run_eject(
         }
     }
 
+    // A gem the lock names as platform gems is pinned through the registry
+    // of its fix's source patch, the one uuid the lock holds, while each
+    // platform gem has a patch of its own: the eject vendors those with it.
+    // A platform patch that cannot be read is left out, and the plan below
+    // then keeps the gem hosted, naming the platform.
+    for pin in pins.iter().filter(|pin| pin.purl.starts_with("pkg:gem/")) {
+        if !records.contains_key(&pin.purl) {
+            continue;
+        }
+        let siblings = crate::commands::agent_download::gem_fix_siblings(
+            &common.cwd,
+            &client,
+            use_public_proxy,
+            &pin.purl,
+            &pin.uuid,
+        )
+        .await;
+        for sibling in siblings {
+            if let Ok(Some(patch)) = client.fetch_patch(&sibling.uuid).await {
+                let (purl, record) =
+                    socket_patch_core::manifest::records::record_from_patch_response(&patch);
+                records.entry(purl).or_insert(record);
+            }
+        }
+    }
+    let mut eject_groups: HashMap<String, Vec<String>> = HashMap::new();
+    for purl in records.keys().filter(|purl| purl.starts_with("pkg:gem/")) {
+        eject_groups
+            .entry(strip_purl_qualifiers(purl).to_string())
+            .or_default()
+            .push(purl.clone());
+    }
+    let gem_units = GemUnits::of(&common.cwd, &mut eject_groups, &records).await;
+
     // All or nothing: a record the API cannot serve refuses the whole eject
     // before anything is touched, so every package stays hosted.
     if !fetch_failures.is_empty() {
@@ -2269,6 +2352,9 @@ async fn run_eject(
             Some(&service),
             &pipenv_version,
             &installed_sites,
+            // The patches of the platform gems of a gem locked as
+            // platform gems, read above.
+            &gem_units.patches(&pin.purl, &records),
         )
         .await
         {
@@ -3275,6 +3361,114 @@ struct CandidateGates<'a> {
     refusals: &'a VendorRefusals,
     /// Whether the lockfiles still pin the purl hosted.
     hosted_pinned: &'a dyn Fn(&str) -> bool,
+    /// The gems vendored as platform gems: what is vendored for one is the
+    /// lock's to say, never the installed copy's.
+    gem_units: &'a GemUnits,
+}
+
+/// The gems of a vendor run that the project's Bundler lock pins as
+/// precompiled platform gems, each as one unit. Each platform gem of a fix
+/// has a patch of its own (`pkg:gem/<name>@<version>?platform=<platform>`),
+/// built from the patch of the ruby gem; the gem is vendored through that
+/// patch (the unit's lead, whose uuid names the vendored dir), with one
+/// tree per locked platform from that platform's patch.
+#[derive(Debug, Default)]
+struct GemUnits {
+    /// Lead purl → `(platform, patch purl)` of each platform gem the lock
+    /// names that this run has a patch for, in lock order.
+    builds: HashMap<String, Vec<(String, String)>>,
+}
+
+impl GemUnits {
+    /// Group the gem `records` of each gem the lock at `cwd` pins as
+    /// platform gems, and take the platform patches out of `variant_groups`
+    /// (the candidates the vendor loop judges): the patch of a locked
+    /// platform is vendored with its unit's lead, and the patch of a
+    /// platform the lock does not name has nothing here to vendor. A gem
+    /// with no patch of its ruby gem among `records` has no lead: its
+    /// platform patches stay candidates, and the backend refuses each.
+    async fn of(
+        cwd: &Path,
+        variant_groups: &mut HashMap<String, Vec<String>>,
+        records: &HashMap<String, PatchRecord>,
+    ) -> GemUnits {
+        use socket_patch_core::hosted::gem_fixes::GemLock;
+        let gems: Vec<&String> = variant_groups
+            .keys()
+            .filter(|base| base.starts_with("pkg:gem/"))
+            .collect();
+        if gems.is_empty() {
+            return GemUnits::default();
+        }
+        let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(cwd);
+        let lock = GemLock::read(&view, gems.iter().map(|base| base.as_str())).await;
+        let mut units = GemUnits::default();
+        for (base, candidates) in variant_groups.iter_mut() {
+            let platforms = lock.platforms_of(base);
+            if platforms.is_empty() {
+                continue;
+            }
+            let of_platform = |purl: &String| GemLock::platform_of(purl);
+            let mut leads: Vec<&String> = candidates
+                .iter()
+                .filter(|purl| of_platform(purl).is_none() && records.contains_key(*purl))
+                .collect();
+            leads.sort();
+            let Some(lead) = leads.first().map(|lead| (*lead).clone()) else {
+                continue;
+            };
+            let builds: Vec<(String, String)> = platforms
+                .iter()
+                .filter_map(|platform| {
+                    let mut patches: Vec<&String> = candidates
+                        .iter()
+                        .filter(|purl| of_platform(purl).as_deref() == Some(platform.as_str()))
+                        .filter(|purl| records.contains_key(*purl))
+                        .collect();
+                    patches.sort();
+                    Some((platform.clone(), (*patches.first()?).clone()))
+                })
+                .collect();
+            candidates.retain(|purl| of_platform(purl).is_none());
+            units.builds.insert(lead, builds);
+        }
+        units
+    }
+
+    /// Whether `purl` is the lead of a gem vendored as platform gems.
+    fn leads(&self, purl: &str) -> bool {
+        self.builds.contains_key(purl)
+    }
+
+    /// The patches of the platform gems of the unit `lead` leads (none for
+    /// any other purl), for the backend.
+    fn patches<'r>(
+        &'r self,
+        lead: &str,
+        records: &'r HashMap<String, PatchRecord>,
+    ) -> Vec<vendor::gem::GemBuildPatch<'r>> {
+        self.builds
+            .get(lead)
+            .into_iter()
+            .flatten()
+            .filter_map(|(platform, purl)| {
+                Some(vendor::gem::GemBuildPatch {
+                    platform: platform.as_str(),
+                    record: records.get(purl)?,
+                })
+            })
+            .collect()
+    }
+
+    /// `(patch purl, patch uuid)` of those platform patches.
+    fn members(&self, lead: &str, records: &HashMap<String, PatchRecord>) -> Vec<(String, String)> {
+        self.builds
+            .get(lead)
+            .into_iter()
+            .flatten()
+            .filter_map(|(_, purl)| Some((purl.clone(), records.get(purl)?.uuid.clone())))
+            .collect()
+    }
 }
 
 impl<'a> CandidateGates<'a> {
@@ -3298,8 +3492,11 @@ impl<'a> CandidateGates<'a> {
         // dir, so it only works when those files are EXTRACTED on disk.
         // Maven's patch targets live INSIDE the un-extracted jar and its
         // vendor takes the single main jar regardless, so it is skipped.
+        // Nor for a gem vendored as platform gems: the lock names the
+        // platforms, and the installed copy is one of them at most.
         let probe_applicable = group.is_variant_eco
-            && !matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Maven));
+            && !matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Maven))
+            && !self.gem_units.leads(candidate);
         // A deferred source was deferred because the ledger covers the
         // purl at this record's uuid: the variant the ledger vendored is
         // the installed one's by construction, so it answers the probe
@@ -3709,6 +3906,13 @@ pub(crate) async fn vendor_records_reusing(
         }
     }
 
+    // A gem the Bundler lock pins as platform gems: each platform gem has a
+    // patch of its own, and the gem is vendored once, through the patch of
+    // its ruby gem, with the tree of each locked platform built from that
+    // platform's patch (see `GemUnits`). The platform patches are not
+    // candidates of their own.
+    let gem_units = GemUnits::of(&common.cwd, &mut variant_groups, records).await;
+
     let mut matched: HashSet<String> = HashSet::new();
 
     // The lockfiles' hosted pins, for cross-mode takeovers: vendoring a purl
@@ -3803,6 +4007,7 @@ pub(crate) async fn vendor_records_reusing(
         refused: &fetch_failed,
         refusals: &refusals,
         hosted_pinned: &hosted_pinned,
+        gem_units: &gem_units,
     };
     // Candidates the loop refuses as `vendor_variant_ambiguous`, joined to
     // `fetch_failed` once the loop is done.
@@ -3905,6 +4110,12 @@ pub(crate) async fn vendor_records_reusing(
             } else {
                 pkg_source
             };
+            // A gem vendored as platform gems: the patch of each platform
+            // gem the lock names, vendored with this candidate.
+            let gem_builds = gem_units.patches(candidate, records);
+            for (member, _) in gem_units.members(candidate, records) {
+                matched.insert(member);
+            }
 
             // Cross-mode takeover: vendoring over a LIVE hosted pin must
             // first restore the upstream registry entry (v5 keeps no hosted
@@ -4087,6 +4298,7 @@ pub(crate) async fn vendor_records_reusing(
                         service,
                         &pipenv_version,
                         &installed_sites,
+                        &gem_builds,
                     )
                     .await
                     {
@@ -4253,6 +4465,8 @@ pub(crate) async fn vendor_records_reusing(
                 index + 1,
                 total,
             ));
+            // Where this candidate's own outcome lands among the events.
+            let outcome_at = env.events.len();
             let outcome = dispatch_vendor_one(
                 candidate,
                 candidate_source,
@@ -4265,6 +4479,7 @@ pub(crate) async fn vendor_records_reusing(
                 service,
                 &pipenv_version,
                 &installed_sites,
+                &gem_builds,
             )
             .await;
             status.finish();
@@ -4445,6 +4660,32 @@ pub(crate) async fn vendor_records_reusing(
                     }
                 }
             }
+            // The platform gems of a gem vendored as platform gems share
+            // the outcome of the candidate they were vendored with: each
+            // gets an event under its own patch (uncounted: the package is
+            // counted once).
+            let shared = env.events[outcome_at..]
+                .iter()
+                .find(|event| event.purl.as_deref() == Some(candidate.as_str()))
+                .cloned();
+            if let Some(shared) = shared {
+                for (member, uuid) in gem_units.members(candidate, records) {
+                    let mut event = shared.clone();
+                    event.purl = Some(member);
+                    event.uuid = Some(uuid);
+                    event.files = Vec::new();
+                    // The patch the package was vendored through: the event
+                    // is that package's outcome under one more patch.
+                    let mut details = event
+                        .details
+                        .take()
+                        .filter(serde_json::Value::is_object)
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    details[GEM_FIX_DETAIL] = serde_json::json!(record.uuid);
+                    event.details = Some(details);
+                    env.events.push(event);
+                }
+            }
             // The reverted hosted pin is gone either way: a vendored purl
             // is healed against its new wiring, a failed one against the
             // restored registry pin.
@@ -4494,11 +4735,14 @@ pub(crate) async fn vendor_records_reusing(
     let group = match group {
         Some(group) if eject_group => {
             let ledger = load_state(&common.cwd).await.ok();
+            // The patch of a platform gem is vendored as a tree of its
+            // fix's entry.
             let complete = !has_errors
                 && records.keys().all(|purl| {
-                    ledger
-                        .as_ref()
-                        .is_some_and(|l| lookup_entry(&l.entries, purl).is_some())
+                    ledger.as_ref().is_some_and(|l| {
+                        lookup_entry(&l.entries, purl).is_some()
+                            || vendor::lookup_gem_build(&l.entries, purl).is_some()
+                    })
                 });
             if complete {
                 Some(group)
@@ -5771,6 +6015,7 @@ mod dispatch_tests {
             Some(&service),
             &tokio::sync::OnceCell::new(),
             &Default::default(),
+            &[],
         )
         .await;
         // The backend itself may refuse (nothing is installed in the
@@ -5909,6 +6154,7 @@ mod plan_gate_tests {
         refused: &'a HashSet<String>,
     ) -> CandidateGates<'a> {
         static NONE: VendorRefusals = VendorRefusals::new();
+        static NO_GEM_UNITS: std::sync::OnceLock<GemUnits> = std::sync::OnceLock::new();
         CandidateGates {
             cwd: root,
             force: false,
@@ -5916,6 +6162,7 @@ mod plan_gate_tests {
             refused,
             refusals: &NONE,
             hosted_pinned: &|_| false,
+            gem_units: NO_GEM_UNITS.get_or_init(GemUnits::default),
         }
     }
 
@@ -8504,6 +8751,34 @@ mod ui_format_tests {
         assert_eq!(
             format_vendor_summary(true, &VendorTally::from_envelope(&dry, true, 3)),
             "All 3 packages are already vendored; nothing to do."
+        );
+    }
+
+    /// A gem vendored as platform gems is one package: the events its
+    /// platform gems' own patches get beside it (uncounted, tagged with the
+    /// patch the package was vendored through) add nothing to the tally.
+    #[test]
+    fn tally_counts_a_gem_vendored_as_platform_gems_once() {
+        let mut env = Envelope::new(Command::Vendor);
+        let lead = PatchEvent::new(
+            PatchAction::Skipped,
+            "pkg:gem/nokogiri@1.18.10?platform=ruby",
+        )
+        .with_uuid("source")
+        .with_reason("already_vendored", "in sync");
+        env.record(lead.clone());
+        for (platform, uuid) in [("arm64-darwin", "darwin"), ("x86_64-linux-gnu", "linux")] {
+            let mut event = lead.clone();
+            event.purl = Some(format!("pkg:gem/nokogiri@1.18.10?platform={platform}"));
+            event.uuid = Some(uuid.to_string());
+            event.details = Some(serde_json::json!({ GEM_FIX_DETAIL: "source" }));
+            env.events.push(event);
+        }
+        let counted = VendorTally::from_envelope(&env, false, 0);
+        assert_eq!(counted, tally(0, 1, 0, 0, 0));
+        assert_eq!(
+            format_vendor_summary(false, &counted),
+            "1 package is already vendored; nothing to do."
         );
     }
 

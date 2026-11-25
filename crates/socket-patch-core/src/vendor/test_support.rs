@@ -513,7 +513,11 @@ pub mod service_fixture;
 /// non-dry-run vendor in the backend suites, so each backend's real output
 /// (every ecosystem and lock flavor they cover) pins the verdict. `None`
 /// (no lock yet, so the next install decides) is allowed.
-async fn assert_fresh_vendor_in_use(root: &Path, outcome: &VendorOutcome, dry_run: bool) {
+pub(crate) async fn assert_fresh_vendor_in_use(
+    root: &Path,
+    outcome: &VendorOutcome,
+    dry_run: bool,
+) {
     let VendorOutcome::Done {
         result,
         entry: Some(entry),

@@ -317,13 +317,24 @@ pub struct VendorEntry {
     /// pypi/pipenv extras.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipenv: Option<PipenvMeta>,
-    /// gem: the platforms of a gem vendored as precompiled platform gems,
-    /// in `Gemfile.lock` order (`arm64-darwin`, `x86_64-linux-gnu`, …).
-    /// The artifact dir then holds one unpacked prebuild per platform, at
+    /// gem: the platform gems of a gem vendored as precompiled platform
+    /// gems, in `Gemfile.lock` order (`arm64-darwin`, `x86_64-linux-gnu`,
+    /// …), each with the patch its tree was built from. The artifact dir
+    /// then holds one unpacked patched platform gem per entry, at
     /// `<artifact>/<platform>/`, instead of the gem's own tree: bundler
     /// never builds a `path:` gem's extensions, so a gem the lock resolves
-    /// to platform gems is vendored as the patch service's prebuilt ones.
+    /// to platform gems is vendored as the patched platform gems. Each
+    /// platform gem of a fix has a patch of its own; the entry's `uuid`
+    /// (and the artifact dir's) is the fix's source patch, the ruby gem's.
     /// Empty for a gem vendored as its ruby-platform tree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gem_builds: Vec<GemBuildEntry>,
+    /// gem: the platforms of a gem that an earlier development build
+    /// vendored as precompiled platform gems, whose trees all came with
+    /// the ruby gem's patch (`uuid`) and so name no patch of their own.
+    /// Read only: such an entry still verifies against that one patch,
+    /// reverts, and is brought to [`Self::gem_builds`] by the next vendor
+    /// run that finds a patch for every platform. Never written.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gem_platforms: Vec<String>,
     /// True when vendored WITHOUT a manifest record — the posture of every
@@ -351,7 +362,46 @@ pub struct VendorEntry {
     pub record: Option<PatchRecord>,
 }
 
+/// One platform gem of a gem vendored as precompiled platform gems
+/// ([`VendorEntry::gem_builds`]): the tree `<artifact>/<platform>/`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GemBuildEntry {
+    /// `Gem::Platform#to_s` as `Gemfile.lock` spells it.
+    pub platform: String,
+    /// The patch of this platform gem: the one its tree was built from.
+    pub uuid: String,
+    /// The sha512 (SRI) of the patched platform `.gem` the tree was
+    /// unpacked from, as the patch service stated it and the download was
+    /// verified against.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gem_integrity: String,
+    /// The sha512 (SRI) of the stub gemspec the tree holds, likewise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gemspec_integrity: String,
+    /// That patch's record (afterHashes, vulnerabilities), embedded like
+    /// [`VendorEntry::record`]: what the tree is verified against and what
+    /// a VEX statement about this platform gem names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<PatchRecord>,
+}
+
 impl VendorEntry {
+    /// The platforms of a gem vendored as precompiled platform gems, in
+    /// lock order: [`Self::gem_builds`]', else the ones an earlier
+    /// development build recorded ([`Self::gem_platforms`]). Empty for
+    /// every other entry.
+    pub fn gem_tree_platforms(&self) -> Vec<&str> {
+        match self.gem_builds.is_empty() {
+            false => self
+                .gem_builds
+                .iter()
+                .map(|b| b.platform.as_str())
+                .collect(),
+            true => self.gem_platforms.iter().map(String::as_str).collect(),
+        }
+    }
+
     /// Create an entry with no ecosystem-specific metadata or embedded record.
     pub fn new(
         ecosystem: String,
@@ -374,6 +424,7 @@ impl VendorEntry {
             poetry: None,
             pdm: None,
             pipenv: None,
+            gem_builds: Vec::new(),
             gem_platforms: Vec::new(),
             detached: false,
             record: None,
@@ -766,6 +817,62 @@ pub fn lookup_entry_kv<'a>(
             })
             .min_by(|(a, _), (b, _)| a.cmp(b))
     })
+}
+
+/// The tree the ledger records for the platform gem that `purl` is a patch
+/// purl of (`pkg:gem/<name>@<version>?platform=<platform>`), with the entry
+/// that holds it: a gem vendored as platform gems is one entry, filed under
+/// the purl of the patch its platform gems were built from, which records
+/// the patch of each platform's tree ([`VendorEntry::gem_builds`]). `None`
+/// for any other purl, and for a platform the entry holds no tree of.
+pub fn lookup_gem_build<'a>(
+    entries: &'a HashMap<String, VendorEntry>,
+    purl: &str,
+) -> Option<(&'a VendorEntry, &'a GemBuildEntry)> {
+    if !purl.starts_with("pkg:gem/") {
+        return None;
+    }
+    let platform = crate::utils::purl::purl_qualifier(purl, "platform")
+        .filter(|platform| !platform.is_empty() && !platform.eq_ignore_ascii_case("ruby"))?;
+    let base = PurlKey::qualified(crate::utils::purl::strip_purl_qualifiers(purl));
+    let (_, entry) = entries
+        .iter()
+        .filter(|(_, entry)| entry.ecosystem == "gem" && !entry.gem_builds.is_empty())
+        .filter(|(_, entry)| PurlKey::qualified(&entry.base_purl) == base)
+        .min_by(|(a, _), (b, _)| a.cmp(b))?;
+    let built = entry.gem_builds.iter().find(|b| b.platform == platform)?;
+    Some((entry, built))
+}
+
+/// The uuid of the patch the ledger records as vendored for the patch purl
+/// `purl`: the patch of that platform's tree for the purl of a platform gem
+/// ([`lookup_gem_build`]), else the entry's own ([`lookup_entry`]).
+pub fn vendored_uuid<'a>(entries: &'a HashMap<String, VendorEntry>, purl: &str) -> Option<&'a str> {
+    match lookup_gem_build(entries, purl) {
+        Some((_, built)) => Some(built.uuid.as_str()),
+        None => lookup_entry(entries, purl).map(|entry| entry.uuid.as_str()),
+    }
+}
+
+/// The patch record a detached entry (one vendored with no manifest record)
+/// carries for the patch purl `purl` at exactly `uuid`: what a re-run reads
+/// in place of asking the patch API for the patch again. The record of a
+/// platform gem's patch is the one filed with its tree
+/// ([`lookup_gem_build`]).
+pub fn detached_record_at<'a>(
+    entries: &'a HashMap<String, VendorEntry>,
+    purl: &str,
+    uuid: &str,
+) -> Option<&'a PatchRecord> {
+    if let Some((entry, built)) = lookup_gem_build(entries, purl) {
+        return built
+            .record
+            .as_ref()
+            .filter(|_| entry.detached && built.uuid == uuid);
+    }
+    lookup_entry(entries, purl)
+        .filter(|entry| entry.detached && entry.uuid == uuid)
+        .and_then(|entry| entry.record.as_ref())
 }
 
 fn state_path(project_root: &Path) -> PathBuf {
@@ -1363,6 +1470,75 @@ mod tests {
                 })),
             }],
         )
+    }
+
+    /// A gem vendored as platform gems is one entry, filed under the patch
+    /// its platform gems were built from, that records the patch of each
+    /// platform's tree: the purl of a platform gem's patch resolves to that
+    /// tree's patch, and to nothing for a platform the entry holds no tree
+    /// of, an entry an earlier build wrote (it names no patch per platform)
+    /// or another gem.
+    #[test]
+    fn a_platform_gem_patch_is_looked_up_in_the_entry_of_its_fix() {
+        const BUILT: &str = "9f6b2c4e-1d3a-4f6b-8c2d-000000000001";
+        let record = |uuid: &str| PatchRecord {
+            uuid: uuid.to_string(),
+            exported_at: String::new(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: "free".to_string(),
+        };
+        let mut entry = sample_entry();
+        entry.ecosystem = "gem".into();
+        entry.base_purl = "pkg:gem/nokogiri@1.18.10".into();
+        entry.detached = true;
+        entry.record = Some(record(UUID));
+        entry.gem_builds = vec![GemBuildEntry {
+            platform: "arm64-darwin".into(),
+            uuid: BUILT.into(),
+            gem_integrity: String::new(),
+            gemspec_integrity: String::new(),
+            record: Some(record(BUILT)),
+        }];
+        let lead = "pkg:gem/nokogiri@1.18.10?platform=ruby";
+        let built = "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin";
+        let mut entries = HashMap::from([(lead.to_string(), entry.clone())]);
+
+        let (found, tree) = lookup_gem_build(&entries, built).expect("the tree's patch");
+        assert_eq!((found.uuid.as_str(), tree.uuid.as_str()), (UUID, BUILT));
+        assert_eq!(vendored_uuid(&entries, built), Some(BUILT));
+        assert_eq!(vendored_uuid(&entries, lead), Some(UUID));
+        assert_eq!(
+            detached_record_at(&entries, built, BUILT).map(|r| r.uuid.as_str()),
+            Some(BUILT)
+        );
+        assert_eq!(
+            detached_record_at(&entries, lead, UUID).map(|r| r.uuid.as_str()),
+            Some(UUID)
+        );
+        assert!(
+            detached_record_at(&entries, built, UUID).is_none(),
+            "the tree's own patch, not the entry's"
+        );
+        for other in [
+            "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu",
+            "pkg:gem/nokogiri@1.18.9?platform=arm64-darwin",
+            "pkg:gem/racc@1.18.10?platform=arm64-darwin",
+            "pkg:npm/nokogiri@1.18.10?platform=arm64-darwin",
+        ] {
+            assert!(lookup_gem_build(&entries, other).is_none(), "{other}");
+            assert_eq!(vendored_uuid(&entries, other), None, "{other}");
+        }
+        assert!(lookup_gem_build(&entries, lead).is_none());
+
+        // An entry an earlier development build wrote names platforms only.
+        let legacy = entries.get_mut(lead).expect("entry");
+        legacy.gem_builds.clear();
+        legacy.gem_platforms = vec!["arm64-darwin".into()];
+        assert!(lookup_gem_build(&entries, built).is_none());
+        assert_eq!(vendored_uuid(&entries, built), None);
     }
 
     /// A cargo entry migrated from the pre-v5 `.cargo/config.toml` wiring to
@@ -2630,6 +2806,7 @@ mod tests {
             poetry: None,
             pdm: None,
             pipenv: None,
+            gem_builds: Vec::new(),
             gem_platforms: Vec::new(),
         };
         let built = VendorEntry::npm(

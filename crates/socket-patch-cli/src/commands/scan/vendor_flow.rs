@@ -23,7 +23,7 @@ use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::telemetry::{track_patch_vendor_failed, TelemetryAuth};
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::refusals::{vendor_refusals, RefusalScope, VendorRefusal};
-use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
+use socket_patch_core::vendor::{load_state, save_state, VendorState};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
@@ -357,7 +357,10 @@ async fn preview_vendor_with(
     let mut rows: Vec<PreviewRow> = selected
         .iter()
         .map(|p| {
-            let verdict = match lookup_entry(&state.entries, &p.purl) {
+            // The patch of a platform gem is recorded with its tree, in
+            // the entry of the gem's fix.
+            let vendored = socket_patch_core::vendor::vendored_uuid(&state.entries, &p.purl);
+            let verdict = match vendored {
                 // Refusal takes priority: a preserved ledger can name this
                 // UUID even after rollback has removed its live wiring.
                 _ if refusals.contains_key(&p.purl) => {
@@ -372,9 +375,9 @@ async fn preview_vendor_with(
                     let (code, detail) = &pypi_refusals[&p.purl];
                     refuse(code, detail)
                 }
-                Some(e) if e.uuid == p.uuid => PreviewVerdict::AlreadyVendored,
-                Some(e) => PreviewVerdict::WouldRevendor {
-                    old_uuid: e.uuid.clone(),
+                Some(uuid) if uuid == p.uuid => PreviewVerdict::AlreadyVendored,
+                Some(uuid) => PreviewVerdict::WouldRevendor {
+                    old_uuid: uuid.to_string(),
                 },
                 None => PreviewVerdict::WouldVendor,
             };
@@ -836,6 +839,12 @@ async fn run_vendor_json_path(
         false,
         false,
         Some(&mut *env),
+        // Vendored mode changes what Bundler installs: one fix for every
+        // build of a gem the lock names as platform builds.
+        Some(super::GemFixScope {
+            cwd: &args.common.cwd,
+            recorded: &recorded.index,
+        }),
     )
     .await
     {
@@ -2450,7 +2459,8 @@ mod npm_lock_entry_refusal_tests {
             .to_string(),
         );
         let state = load_state(root).await.expect("the seeded ledger parses");
-        let entry = lookup_entry(&state.entries, LEFT_PAD).expect("seeded entry");
+        let entry = socket_patch_core::vendor::lookup_entry(&state.entries, LEFT_PAD)
+            .expect("seeded entry");
         assert!(entry.uuid == UUID && !entry.detached);
         let preview = preview_vendor_with(root, &[sel(LEFT_PAD)], &[], &HashMap::new()).await;
         match &preview.rows[0].verdict {

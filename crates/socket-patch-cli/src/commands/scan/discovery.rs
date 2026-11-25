@@ -365,7 +365,6 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
     use socket_patch_core::crawlers::gradle_cache;
     use socket_patch_core::manifest::schema::PatchFileInfo;
     use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
-    use socket_patch_core::vendor::lookup_entry;
 
     let mut mismatched: HashSet<String> = HashSet::new();
     let mut views: HashMap<String, PatchResponse> = HashMap::new();
@@ -393,10 +392,9 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
             // The same predicate as the download phase's ledger
             // idempotency skip: its no-fetch set and this one must be
             // the same set.
-            let embedded = vendor
-                .and_then(|entries| lookup_entry(entries, &patch.purl))
-                .filter(|e| e.detached && e.uuid == patch.uuid)
-                .and_then(|e| e.record.as_ref());
+            let embedded = vendor.and_then(|entries| {
+                socket_patch_core::vendor::detached_record_at(entries, &patch.purl, &patch.uuid)
+            });
             Some((pkg, embedded))
         })
         .collect();

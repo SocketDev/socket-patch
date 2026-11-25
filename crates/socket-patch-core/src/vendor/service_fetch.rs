@@ -112,19 +112,22 @@ pub(crate) fn downloaded_warning(
     )
 }
 
-/// What the patch service lists for a patch besides its archive, learned
+/// What the patch service says of a patch without its archive, learned
 /// from the package reference alone ([`fetch_served_artifacts`]): still
 /// unverified, and nothing of the patch is downloaded yet.
 #[derive(Debug)]
-pub(crate) struct ServedArtifacts(pub Vec<SecondaryArtifact>);
+pub(crate) struct ServedArtifacts {
+    /// The uuid of the patch this one was built from; `None` for a patch
+    /// that is itself a source.
+    pub rebuilt_from_uuid: Option<String>,
+    /// The artifacts the service lists besides the archive.
+    pub artifacts: Vec<SecondaryArtifact>,
+}
 
 impl ServedArtifacts {
-    /// The served artifact of `kind` for the gem platform `platform`, if
-    /// the service lists one.
-    pub(crate) fn platform(&self, kind: &str, platform: &str) -> Option<&SecondaryArtifact> {
-        self.0
-            .iter()
-            .find(|a| a.kind == kind && a.platform.as_deref() == Some(platform))
+    /// Whether the service lists an artifact of `kind` for the patch.
+    pub(crate) fn has(&self, kind: &str) -> bool {
+        self.artifacts.iter().any(|a| a.kind == kind)
     }
 }
 
@@ -202,10 +205,11 @@ pub(crate) async fn fetch_verified_archive(
     })
 }
 
-/// Ask the service which artifacts it serves for `uuid` besides the
-/// archive, without downloading the archive: the package reference names
-/// them. For a backend that vendors only those (a gem's per-platform
-/// prebuilds), so a patch that has none costs one request and no download.
+/// Ask the service what it says of the patch `uuid` without downloading
+/// its archive: the package reference names the patch it was built from
+/// and the artifacts it serves besides the archive. The gem backend asks
+/// this of the patch of each platform gem a lock names, so a gem that
+/// cannot be vendored on every locked platform costs no download.
 pub(crate) async fn fetch_served_artifacts(
     cfg: &VendorServiceConfig,
     uuid: &str,
@@ -222,9 +226,10 @@ pub(crate) async fn fetch_served_artifacts(
         )
         .await;
     match outcome {
-        VendorServiceOutcome::Ready(artifacts) => {
-            ServiceArtifact::Ready(ServedArtifacts(artifacts))
-        }
+        VendorServiceOutcome::Ready(reference) => ServiceArtifact::Ready(ServedArtifacts {
+            rebuilt_from_uuid: reference.rebuilt_from_uuid,
+            artifacts: reference.artifacts,
+        }),
         VendorServiceOutcome::Pending => ServiceArtifact::Pending,
         VendorServiceOutcome::Unavailable(reason) => ServiceArtifact::Unavailable(reason),
         VendorServiceOutcome::Failed(err) => ServiceArtifact::Failed(err.to_string()),
@@ -380,19 +385,6 @@ pub(crate) async fn fetch_verified_secondary(
     kind: &str,
 ) -> SecondaryArtifactResult {
     fetch_verified_artifact(cfg, archive.secondary.iter().find(|a| a.kind == kind)).await
-}
-
-/// [`fetch_verified_secondary`] for an artifact served once per gem
-/// platform (`gem-platform`, `gem-platform-stub-gemspec`): the one of
-/// `kind` whose `platform` is exactly `platform`, the token `Gemfile.lock`
-/// spells.
-pub(crate) async fn fetch_verified_platform_secondary(
-    cfg: &VendorServiceConfig,
-    served: &ServedArtifacts,
-    kind: &str,
-    platform: &str,
-) -> SecondaryArtifactResult {
-    fetch_verified_artifact(cfg, served.platform(kind, platform)).await
 }
 
 /// Download `artifact` and verify the bytes against its own sha512 SRI;
@@ -829,7 +821,6 @@ mod tests {
             secondary: vec![SecondaryArtifact {
                 prefetched: None,
                 kind: "gem-stub-gemspec".into(),
-                platform: None,
                 url: format!("{}/stub", server.uri()),
                 integrity_sri: PackedTarball::from_bytes(b"x").integrity,
             }],

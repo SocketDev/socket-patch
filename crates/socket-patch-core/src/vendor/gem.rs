@@ -59,16 +59,24 @@
 //! (`nokogiri (1.18.10-x86_64-linux-gnu)`, `nokogiri (1.18.10-arm64-darwin)`)
 //! and usually no plain `nokogiri (1.18.10)`. Such a gem cannot be vendored
 //! as its ruby-platform tree (the extensions would never be built), so it is
-//! vendored as the patch service's PREBUILDS — the patched platform gems —
-//! one unpacked tree per locked platform, each with the stub gemspec the
-//! service serves for it (verified against real bundler 4.0.15):
+//! vendored as the PATCHED PLATFORM GEMS: one unpacked tree per locked
+//! platform, each with the stub gemspec the service serves for it (verified
+//! against real bundler 4.0.15).
+//!
+//! Each platform gem of a fix has a patch of its own
+//! (`pkg:gem/<name>@<version>?platform=<platform>`), built from the patch
+//! of the ruby gem, the fix's SOURCE patch. The gem is vendored through
+//! that source patch: its uuid names the vendored dir, which therefore
+//! stays where it is when the lock gains or loses a platform, and the
+//! patch of each locked platform ([`GemBuildPatch`]) supplies that
+//! platform's tree, its own `tarball` and `gem-stub-gemspec`.
 //!
 //! ```text
-//! .socket/vendor/gem/<uuid>/<name>-<version>/<platform>/…        # the unpacked prebuild
-//! .socket/vendor/gem/<uuid>/<name>-<version>/<platform>/<name>.gemspec
+//! .socket/vendor/gem/<source uuid>/<name>-<version>/<platform>/…   # the unpacked patched platform gem
+//! .socket/vendor/gem/<source uuid>/<name>-<version>/<platform>/<name>.gemspec
 //!
 //! PATH
-//!   remote: .socket/vendor/gem/<uuid>/<name>-<version>
+//!   remote: .socket/vendor/gem/<source uuid>/<name>-<version>
 //!   specs:
 //!     <name> (<version>-<platform>)     # every platform block, verbatim
 //!       <dep> (<constraint>)
@@ -88,18 +96,23 @@
 //!   `.gitignore` (`!*`) and `.gitattributes` every backend that commits
 //!   binaries writes: they re-include the trees and keep a project filter
 //!   (a Git LFS rule, EOL conversion) off their bytes. A `.gitignore` a
-//!   prebuild ships inside its own tree would override that, so it is
+//!   platform gem ships inside its own tree would override that, so it is
 //!   emptied in the copy. A tree git would still not commit in full is
 //!   refused: wired without its binary, the gem would install everywhere
 //!   and fail to load;
-//! * every locked platform needs a prebuild. While the service lists none
-//!   for one of them the gem is left as it is and reported as a skip
-//!   ([`super::VENDOR_PREBUILT_PLATFORM_PENDING`]): a prebuild is listed
-//!   only once built, so the next run may find it. A plain
-//!   `<name> (<version>)` entry beside the platform ones (the ruby platform,
-//!   which no prebuilt tree serves) is refused with nothing written, and so
-//!   is a lock written by a bundler older than the layout was run against
-//!   (`PLATFORM_LAYOUT_MIN_BUNDLER`).
+//! * every locked platform needs a patch of the same fix: one built from
+//!   the source patch the gem is vendored through. While one of them has
+//!   none (not published yet, withdrawn, or of another fix) the gem is left
+//!   as it is and reported as a skip
+//!   ([`super::VENDOR_PREBUILT_PLATFORM_PENDING`]): the next run may find
+//!   it. A plain `<name> (<version>)` entry beside the platform ones (the
+//!   ruby platform, whose extensions bundler would never build) is refused
+//!   with nothing written, and so is a lock written by a bundler older than
+//!   the layout was run against (`PLATFORM_LAYOUT_MIN_BUNDLER`);
+//! * the ledger entry records, per platform, the patch its tree was built
+//!   from, the sha512 of the platform `.gem` and of the stub gemspec, and
+//!   that patch's record ([`super::state::GemBuildEntry`]): each tree is
+//!   verified against its own patch.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -126,12 +139,12 @@ use super::registry_fetch::{extract_gem_data, extract_on_blocking_pool};
 use super::revert::{self, KeepPolicy};
 use super::service_fetch::{
     claim_prestaged, downloaded_warning, fetch_served_artifacts, fetch_verified_archive,
-    fetch_verified_platform_secondary, fetch_verified_secondary, SecondaryArtifactResult,
-    ServedArtifacts, ServicePolicy,
+    fetch_verified_secondary, SecondaryArtifactResult, ServiceArtifact, ServicePolicy,
 };
 use super::source::PackageSource;
 use super::state::{
-    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
+    write_marker_or_warn, GemBuildEntry, VendorArtifact, VendorEntry, VendorMarker, WiringAction,
+    WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 use crate::formats::gem::{
@@ -210,10 +223,33 @@ struct GemPrelude {
     copy_ok: bool,
     /// The platforms the lock pins the gem for, in lock order, when it
     /// locks it as precompiled platform gems (see the module docs): the
-    /// copy is then one prebuild tree per platform. Empty for the plain
-    /// `name (version)` entry, vendored as the gem's own tree.
+    /// copy is then one patched platform gem's tree per platform. Empty
+    /// for the plain `name (version)` entry, vendored as the gem's own
+    /// tree.
     platforms: Vec<String>,
+    /// The in-sync copy was judged by what the ledger records for it, not
+    /// by the patches at hand: no patch of this fix is at hand for some
+    /// locked platform, and the committed trees still match what they
+    /// were vendored from ([`BUILDS_KEPT`]).
+    builds_kept: bool,
 }
+
+/// The patch of one platform gem of a gem the lock pins as platform gems:
+/// what [`vendor_gem_builds`] builds that platform's tree from (module
+/// docs). `record` is that patch's own record, the patch of
+/// `pkg:gem/<name>@<version>?platform=<platform>`.
+#[derive(Debug, Clone, Copy)]
+pub struct GemBuildPatch<'a> {
+    /// `Gem::Platform#to_s` as `Gemfile.lock` spells it.
+    pub platform: &'a str,
+    pub record: &'a PatchRecord,
+}
+
+/// Advisory of a re-run over a gem vendored as platform gems that finds no
+/// patch of the fix for one of the locked platforms any more (or not yet,
+/// for a copy an earlier development build vendored): the committed copy
+/// still matches what the ledger records for it and stays in force.
+pub const BUILDS_KEPT: &str = "vendor_gem_builds_kept";
 
 /// What `Gemfile.lock` resolves `name`@`version` to, read from every source
 /// section (`GEM`, `PATH`, `GIT`, `PLUGIN SOURCE`; a lock already vendored
@@ -444,6 +480,7 @@ async fn gem_prelude(
     installed_path: &Path,
     project_root: &Path,
     record: &PatchRecord,
+    builds: &[GemBuildPatch<'_>],
 ) -> Result<GemPrelude, VendorOutcome> {
     // ── coordinates ──────────────────────────────────────────────────────
     let Some((name, version)) = parse_gem_purl(purl) else {
@@ -501,8 +538,9 @@ async fn gem_prelude(
     //      key). RubyGems' default portable platform is `ruby`; a bare purl
     //      (no qualifier) is likewise the portable build. A *native* platform
     //      value (`x86_64-linux`, `arm64-darwin`, `java`, `x64-mingw32`, …)
-    //      names a patch of one platform's build and is refused: a patch's
-    //      prebuilds belong to its `ruby` record.
+    //      names the patch of one platform gem and is refused on its own:
+    //      the platform gems of a gem are vendored together, through the
+    //      patch of the ruby gem they were built from ([`GemBuildPatch`]).
     //   2. The resolved install dir's own name. A locally-installed native
     //      variant is `<name>-<version>-<platform>` even when the manifest
     //      purl looked portable (the crawler strips the suffix to the base
@@ -520,7 +558,7 @@ async fn gem_prelude(
             return Err(refused(
                 "platform_gem_unsupported",
                 format!(
-                    "`{name}@{version}` is a platform-specific gem build (`platform={platform}`); precompiled platform gems cannot be vendored portably. {}",
+                    "`{name}@{version}` `platform={platform}` is the patch of one platform gem; the platform gems of a gem are vendored together, through the patch of the ruby gem they were built from, and only for a gem Gemfile.lock pins as platform gems. {}",
                     platform_gem_remedy(name)
                 ),
             ));
@@ -664,6 +702,7 @@ async fn gem_prelude(
     let lock_wired =
         lock_text.split('\n').any(|l| l == remote_line) && gemfile_text.contains(&copy_rel);
     let mut copy_ok = false;
+    let mut builds_kept = false;
     if lock_wired {
         if lock_checksum_in_sync(&lock_text, name, version, &locked.platforms) {
             // Probe the copy only once the lock is known to be wired (the
@@ -680,15 +719,52 @@ async fn gem_prelude(
                         && stub_gemspec_valid(&copy_dir, name).await
                 }
                 platforms => {
-                    let inventory = recorded_inventory(project_root, &record.uuid, &copy_rel).await;
-                    platform_copy_intact(
-                        &copy_dir,
-                        name,
-                        platforms,
-                        &record.files,
-                        inventory.as_ref(),
-                    )
-                    .await
+                    let recorded = recorded_copy(project_root, &record.uuid, &copy_rel).await;
+                    let inventory = recorded
+                        .as_ref()
+                        .and_then(|entry| entry.artifact.file_inventory.as_ref());
+                    match locked_builds(platforms, builds) {
+                        // A patch for every locked platform is at hand:
+                        // the copy is in sync when it was built from
+                        // exactly those patches.
+                        Some(patches) => {
+                            let same = recorded.as_ref().is_some_and(|entry| {
+                                entry.gem_builds.len() == patches.len()
+                                    && patches.iter().all(|patch| {
+                                        entry.gem_builds.iter().any(|built| {
+                                            built.platform == patch.platform
+                                                && built.uuid == patch.record.uuid
+                                        })
+                                    })
+                            });
+                            let trees: Vec<(&str, &HashMap<String, PatchFileInfo>)> = patches
+                                .iter()
+                                .map(|patch| (patch.platform, &patch.record.files))
+                                .collect();
+                            same && platform_copy_intact(&copy_dir, name, &trees, inventory).await
+                        }
+                        // Not so: the copy is judged by what the ledger
+                        // records for it (the patch each tree was built
+                        // from; the one patch of an earlier development
+                        // build's entry), and stays in force while it
+                        // still matches. Nothing here could rebuild it.
+                        None => {
+                            let trees: Option<Vec<(&str, &HashMap<String, PatchFileInfo>)>> =
+                                recorded.as_ref().and_then(|entry| {
+                                    platforms
+                                        .iter()
+                                        .map(|platform| recorded_tree(entry, record, platform))
+                                        .collect()
+                                });
+                            builds_kept = match trees {
+                                Some(trees) => {
+                                    platform_copy_intact(&copy_dir, name, &trees, inventory).await
+                                }
+                                None => false,
+                            };
+                            builds_kept
+                        }
+                    }
                 }
             };
         } else {
@@ -740,7 +816,42 @@ async fn gem_prelude(
         lock_wired,
         copy_ok,
         platforms: locked.platforms,
+        builds_kept,
     })
+}
+
+/// The patch at hand for each of `platforms` (the lock's, in lock order),
+/// or `None` when one of them has none among `builds`.
+fn locked_builds<'b>(
+    platforms: &[String],
+    builds: &'b [GemBuildPatch<'b>],
+) -> Option<Vec<GemBuildPatch<'b>>> {
+    platforms
+        .iter()
+        .map(|platform| builds.iter().copied().find(|b| b.platform == platform))
+        .collect()
+}
+
+/// The platform `platform`'s tree of the copy `entry` records and the
+/// patched files it is held to: the files of the patch the ledger says the
+/// tree was built from, or, for an entry an earlier development build
+/// wrote (it names platforms and no patch of their own), the files of the
+/// one patch `record` the whole copy came with. `None` when the entry
+/// records no tree for that platform.
+fn recorded_tree<'e>(
+    entry: &'e VendorEntry,
+    record: &'e PatchRecord,
+    platform: &'e str,
+) -> Option<(&'e str, &'e HashMap<String, PatchFileInfo>)> {
+    if entry.gem_builds.is_empty() {
+        return entry
+            .gem_platforms
+            .iter()
+            .any(|p| p == platform)
+            .then_some((platform, &record.files));
+    }
+    let built = entry.gem_builds.iter().find(|b| b.platform == platform)?;
+    Some((platform, &built.record.as_ref()?.files))
 }
 
 /// The oldest bundler whose lock is wired to a directory of prebuilt
@@ -831,18 +942,14 @@ async fn stub_gemspec_valid(tree: &Path, name: &str) -> bool {
     }
 }
 
-/// The file inventory the vendor ledger records for the copy at
-/// `copy_rel` of the patch `uuid`: what vouches for the bytes of its
-/// prebuild trees once they are vendored (see [`verify_platform_tree`]).
-/// `None` when the ledger has no entry for that copy, records no inventory
-/// for it, or cannot be read.
+/// The ledger entry of the copy at `copy_rel` of the patch `uuid`: its
+/// file inventory is what vouches for the bytes of its platform trees once
+/// they are vendored (see [`verify_platform_tree`]), and its
+/// [`VendorEntry::gem_builds`] say which patch each tree was built from.
+/// `None` when the ledger has no entry for that copy or cannot be read.
 ///
 /// [`verify_platform_tree`]: super::verify::verify_platform_tree
-async fn recorded_inventory(
-    project_root: &Path,
-    uuid: &str,
-    copy_rel: &str,
-) -> Option<std::collections::BTreeMap<String, String>> {
+async fn recorded_copy(project_root: &Path, uuid: &str, copy_rel: &str) -> Option<VendorEntry> {
     let state = super::state::load_state_shared(project_root).await.ok()?;
     state
         .entries
@@ -850,11 +957,12 @@ async fn recorded_inventory(
         .find(|e| {
             e.ecosystem == "gem" && e.uuid == uuid && e.artifact.path.replace('\\', "/") == copy_rel
         })
-        .and_then(|e| e.artifact.file_inventory.clone())
+        .cloned()
 }
 
 /// The in-sync test of a copy vendored as platform gems: the tree of every
-/// locked platform is there, passes
+/// locked platform (`trees`: the platform and the patched files of the
+/// patch its tree is of) is there, passes
 /// [`super::verify::verify_platform_tree`] (every file of it is the one
 /// the ledger's `inventory` of the copy records; without an inventory it
 /// must hold a patched file) and has a valid stub gemspec. With an
@@ -864,11 +972,10 @@ async fn recorded_inventory(
 async fn platform_copy_intact(
     copy_dir: &Path,
     name: &str,
-    platforms: &[String],
-    files: &HashMap<String, PatchFileInfo>,
+    trees: &[(&str, &HashMap<String, PatchFileInfo>)],
     inventory: Option<&std::collections::BTreeMap<String, String>>,
 ) -> bool {
-    for platform in platforms {
+    for (platform, files) in trees {
         let tree = copy_dir.join(platform);
         let voucher = super::verify::TreeVoucher::Ledger(inventory);
         if super::verify::verify_platform_tree(&tree, files, voucher)
@@ -986,7 +1093,7 @@ pub(crate) async fn service_preflight(
     project_root: &Path,
     record: &PatchRecord,
 ) -> Option<crate::api::client::PlannedDownload> {
-    let prelude = gem_prelude(purl, installed_path, project_root, record)
+    let prelude = gem_prelude(purl, installed_path, project_root, record, &[])
         .await
         .ok()?;
     let asks = match prelude.lock_wired {
@@ -1014,6 +1121,41 @@ pub async fn vendor_gem<'a>(
     installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    vendor_gem_builds(
+        purl,
+        installed_dir,
+        project_root,
+        record,
+        &[],
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service,
+    )
+    .await
+}
+
+/// [`vendor_gem`] with the patches of the gem's platform gems (`builds`):
+/// for a gem the lock pins as precompiled platform gems, `record` is the
+/// patch of its ruby gem (the fix's source patch, whose uuid names the
+/// vendored dir) and each locked platform's tree is built from that
+/// platform's own patch in `builds` (module docs). A patch of a platform
+/// the lock does not name is not used. For a gem the lock pins as its
+/// ruby-platform gem alone, `builds` plays no part.
+#[allow(clippy::too_many_arguments)]
+pub async fn vendor_gem_builds<'a>(
+    purl: &str,
+    installed_dir: impl Into<PackageSource<'a>>,
+    project_root: &Path,
+    record: &PatchRecord,
+    builds: &[GemBuildPatch<'_>],
     _sources: &PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
@@ -1021,7 +1163,8 @@ pub async fn vendor_gem<'a>(
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
     let installed_dir = installed_dir.into();
-    let prelude = match gem_prelude(purl, installed_dir.path(), project_root, record).await {
+    let prelude = match gem_prelude(purl, installed_dir.path(), project_root, record, builds).await
+    {
         Ok(prelude) => prelude,
         Err(outcome) => return outcome,
     };
@@ -1039,6 +1182,7 @@ pub async fn vendor_gem<'a>(
         lock_wired,
         copy_ok,
         platforms,
+        builds_kept,
     } = &prelude;
     let (name, version) = (name.as_str(), version.as_str());
     let (copy_rel, uuid_dir, copy_dir) =
@@ -1068,6 +1212,23 @@ pub async fn vendor_gem<'a>(
                     ));
                 }
             }
+            if *builds_kept {
+                let missing: Vec<String> = platforms
+                    .iter()
+                    .filter(|platform| !builds.iter().any(|b| b.platform == *platform))
+                    .map(|platform| format!("`{platform}`"))
+                    .collect();
+                warnings.push(VendorWarning::new(
+                    BUILDS_KEPT,
+                    format!(
+                        "{name}@{version} stays vendored as it is at {copy_rel}: no patch of \
+                         this fix is available for {} now, and the committed platform gems \
+                         still match what they were vendored from. A later run brings the copy \
+                         up to date once every locked platform has a patch",
+                        missing.join(", ")
+                    ),
+                ));
+            }
             return done(
                 already_patched_result(purl, copy_dir, &record.files),
                 None,
@@ -1088,12 +1249,13 @@ pub async fn vendor_gem<'a>(
                 return refusal;
             }
             let mut warnings: Vec<VendorWarning> = Vec::new();
-            let result = match materialise_patched_copy(
+            let (result, built) = match materialise_patched_copy(
                 purl,
                 copy_dir,
                 uuid_dir,
                 name,
                 platforms,
+                builds,
                 record,
                 false, // live-wired: never unwind the uuid dir on failure
                 service,
@@ -1101,7 +1263,7 @@ pub async fn vendor_gem<'a>(
             )
             .await
             {
-                Ok(result) => result,
+                Ok(materialised) => materialised,
                 Err(outcome) => return rebuild_needs_every_prebuild(*outcome),
             };
             if !result.success {
@@ -1125,7 +1287,7 @@ pub async fn vendor_gem<'a>(
                 build_gem_purl(name, version),
                 record,
                 copy_rel.to_string(),
-                platforms,
+                built,
                 file_inventory,
                 Vec::new(),
             );
@@ -1145,7 +1307,7 @@ pub async fn vendor_gem<'a>(
         }
         let previewed = match platforms.as_slice() {
             [] => super::service_fetch::preview_service(service, record, extract_gem_data).await,
-            platforms => preview_platform_prebuilds(service, record, name, platforms).await,
+            platforms => preview_platform_builds(service, record, name, platforms, builds).await,
         };
         if let Err(outcome) = previewed {
             return match lock_wired {
@@ -1174,12 +1336,13 @@ pub async fn vendor_gem<'a>(
     if let Some(refusal) = service_offline_conflict(service) {
         return refusal;
     }
-    let mut result = match materialise_patched_copy(
+    let (mut result, built) = match materialise_patched_copy(
         purl,
         copy_dir,
         uuid_dir,
         name,
         platforms,
+        builds,
         record,
         true, // fresh vendor: nothing pre-existing worth keeping
         service,
@@ -1187,7 +1350,7 @@ pub async fn vendor_gem<'a>(
     )
     .await
     {
-        Ok(result) => result,
+        Ok(materialised) => materialised,
         Err(outcome) => return *outcome,
     };
     if !result.success {
@@ -1366,7 +1529,7 @@ pub async fn vendor_gem<'a>(
         base_purl,
         record,
         copy_rel.to_string(),
-        platforms,
+        built,
         file_inventory,
         wiring,
     );
@@ -1393,18 +1556,19 @@ fn rebuild_needs_every_prebuild(outcome: VendorOutcome) -> VendorOutcome {
 
 /// The ledger entry for a vendored gem copy: `wiring` is the Gemfile + lock
 /// records on a full vendor, empty on an artifact-only rebuild (see the hot
-/// path). `platforms` are the platform trees of a copy vendored as platform
-/// gems (empty for the gem's own tree).
+/// path). `builds` are the platform trees of a copy vendored as platform
+/// gems, each with the patch it was built from (empty for the gem's own
+/// tree).
 fn gem_entry(
     base_purl: String,
     record: &PatchRecord,
     copy_rel: String,
-    platforms: &[String],
+    builds: Vec<GemBuildEntry>,
     file_inventory: Option<std::collections::BTreeMap<String, String>>,
     wiring: Vec<WiringRecord>,
 ) -> VendorEntry {
     VendorEntry {
-        gem_platforms: platforms.to_vec(),
+        gem_builds: builds,
         ..VendorEntry::new(
             "gem".to_string(),
             base_purl,
@@ -1576,38 +1740,35 @@ fn refuse_unusable_stub(
     Ok(())
 }
 
-/// The patched platform gem the patch service built for one platform of a
-/// gem (a "prebuild": a drop-in for the upstream platform gem, with the
-/// patch's files replaced and the extension rebuilt), and the stub gemspec
-/// it serves for it — the per-platform twins of the `tarball` and
-/// [`GEM_STUB_ARTIFACT_KIND`] artifacts. Each names its platform, and a
-/// platform with no prebuild built has neither.
-pub(crate) const GEM_PLATFORM_ARTIFACT_KIND: &str = "gem-platform";
-pub(crate) const GEM_PLATFORM_STUB_ARTIFACT_KIND: &str = "gem-platform-stub-gemspec";
-
-/// How many platforms' prebuilds (a platform gem and its stub gemspec
+/// How many platforms' gems (a patched platform gem and its stub gemspec
 /// each) are downloaded at once.
 const PREBUILD_DOWNLOADS_AT_ONCE: usize = 4;
 
-/// Download and verify the prebuild of each of `platforms` and its stub
+/// Download and verify the patched gem of each of `platforms` and its stub
 /// gemspec, and unpack them into `stage`: `<stage>/<platform>/` holds the
-/// platform gem's files and `<name>.gemspec` (see the module docs).
+/// platform gem's files and `<name>.gemspec` (see the module docs). Each
+/// platform's gem is the `tarball` of that platform's own patch (`builds`),
+/// and its stub that patch's [`GEM_STUB_ARTIFACT_KIND`]; `record` is the
+/// fix's source patch, which every one of them must have been built from.
+/// The ruby gem of the source patch is never downloaded (bundler would
+/// have to build its extensions).
 ///
-/// Which prebuilds exist is read off the service's package reference
-/// alone; the ruby gem that reference also names is never downloaded
-/// (bundler would have to build its extensions). While the service lists
-/// no prebuild, or no stub, for one of `platforms`, nothing is downloaded
-/// and the gem is skipped ([`super::VENDOR_PREBUILT_PLATFORM_PENDING`]). A
-/// later failure leaves a partial `stage` for the caller to remove.
-/// Returns the run's advisories: the download, and the ignore files that
-/// were emptied.
-async fn stage_platform_prebuilds(
+/// Whether every locked platform can be vendored is settled first, from
+/// the package references alone: while one of `platforms` has no patch in
+/// `builds`, or its patch is not served yet, was built from another patch
+/// than `record`, or serves no stub, nothing is downloaded and the gem is
+/// skipped ([`super::VENDOR_PREBUILT_PLATFORM_PENDING`]). A later failure
+/// leaves a partial `stage` for the caller to remove. Returns the run's
+/// advisories (the download, and the ignore files that were emptied) and
+/// what the ledger records of each tree.
+async fn stage_platform_builds(
     cfg: &VendorServiceConfig,
     record: &PatchRecord,
     name: &str,
     platforms: &[String],
+    builds: &[GemBuildPatch<'_>],
     stage: &Path,
-) -> Result<Vec<VendorWarning>, Box<VendorOutcome>> {
+) -> Result<(Vec<VendorWarning>, Vec<GemBuildEntry>), Box<VendorOutcome>> {
     use futures_util::StreamExt as _;
     let policy = ServicePolicy::Refused;
     // SECURITY: a platform names a directory under the stage, and the
@@ -1618,82 +1779,128 @@ async fn stage_platform_prebuilds(
             format!("unsafe gem platform `{platform}` for `{name}`"),
         ));
     }
-    let listed = fetch_served_artifacts(cfg, &record.uuid).await;
-    let served = policy.settle(listed, "platform gem", &format!("platform gems for {name}"))?;
-
-    let missing: Vec<&str> = platforms
-        .iter()
-        .map(String::as_str)
-        .filter(|platform| {
-            served
-                .platform(GEM_PLATFORM_ARTIFACT_KIND, platform)
-                .is_none()
-                || served
-                    .platform(GEM_PLATFORM_STUB_ARTIFACT_KIND, platform)
-                    .is_none()
-        })
-        .collect();
-    if !missing.is_empty() {
-        let quoted = |platforms: &[&str]| {
-            platforms
-                .iter()
-                .map(|platform| format!("`{platform}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let built: Vec<&str> = platforms
+    let quoted = |platforms: &[&str]| {
+        platforms
             .iter()
-            .map(String::as_str)
-            .filter(|platform| !missing.contains(platform))
-            .collect();
-        let built = match built.as_slice() {
-            [] => "it has none of the locked platforms".to_string(),
-            built => format!("it has {}", quoted(built)),
+            .map(|platform| format!("`{platform}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // Not a failure: a platform's patch is published once it is built, so
+    // this is as likely "not yet" as "never", and nothing was touched.
+    let pending = |missing: Vec<(&str, String)>, ready: &[&str]| {
+        let have = match ready {
+            [] => "no locked platform has one".to_string(),
+            [one] => format!("`{one}` has one"),
+            ready => format!("{} have one", quoted(ready)),
         };
-        // Not a failure: a prebuild is listed only once it is built, so
-        // this is as likely "not yet" as "never", and nothing was touched.
-        return Err(Box::new(refused(
+        let why: Vec<String> = missing
+            .iter()
+            .map(|(platform, why)| format!("`{platform}`: {why}"))
+            .collect();
+        Box::new(refused(
             super::VENDOR_PREBUILT_PLATFORM_PENDING,
             format!(
-                "the patch service has no prebuilt platform gem of `{name}` for {} yet \
-                 ({built}); {GEMFILE_LOCK} locks {name} as precompiled platform gems and bundler \
-                 never builds a `path:` gem's extensions, so the patch is not vendored until \
-                 every locked platform has one",
-                quoted(&missing)
+                "no patch of this fix is available for every platform gem of `{name}` that \
+                 {GEMFILE_LOCK} locks ({}; {have}); bundler never builds a `path:` gem's \
+                 extensions, so the patch is not vendored until every locked platform has a \
+                 patched gem of the same fix",
+                why.join("; ")
             ),
-        )));
+        ))
+    };
+    let Some(patches) = locked_builds(platforms, builds) else {
+        let missing: Vec<(&str, String)> = platforms
+            .iter()
+            .filter(|platform| !builds.iter().any(|b| b.platform == *platform))
+            .map(|platform| (platform.as_str(), "no patch on offer".to_string()))
+            .collect();
+        let ready: Vec<&str> = platforms
+            .iter()
+            .map(String::as_str)
+            .filter(|platform| builds.iter().any(|b| b.platform == *platform))
+            .collect();
+        return Err(pending(missing, &ready));
+    };
+
+    // What the service says of each platform's patch, before any download.
+    let mut missing: Vec<(&str, String)> = Vec::new();
+    let mut ready: Vec<&str> = Vec::new();
+    for patch in &patches {
+        let why = match fetch_served_artifacts(cfg, &patch.record.uuid).await {
+            ServiceArtifact::Ready(served) => match served.rebuilt_from_uuid.as_deref() {
+                Some(source) if source == record.uuid => (!served.has(GEM_STUB_ARTIFACT_KIND))
+                    .then(|| "its patch serves no stub gemspec".to_string()),
+                Some(source) => Some(format!(
+                    "its patch {} belongs to another fix (it was built from {source})",
+                    patch.record.uuid
+                )),
+                None => Some(format!(
+                    "its patch {} was not built from this fix's patch",
+                    patch.record.uuid
+                )),
+            },
+            ServiceArtifact::Pending => Some("its patched gem is still being built".to_string()),
+            ServiceArtifact::Unavailable(reason) => {
+                Some(format!("its patched gem is not available ({reason})"))
+            }
+            failed => {
+                let subject = format!("platform gem for {name} ({})", patch.platform);
+                policy.settle(failed, "platform gem", &subject)?;
+                None
+            }
+        };
+        match why {
+            Some(why) => missing.push((patch.platform, why)),
+            None => ready.push(patch.platform),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(pending(missing, &ready));
     }
 
-    // The prebuilds, a few platforms at a time and taken in lock order.
-    let served = &served;
-    let mut downloads = std::pin::pin!(futures_util::stream::iter(platforms)
-        .map(|platform| async move {
-            let subject = format!("{name} ({platform})");
-            let gem = platform_artifact(
-                cfg,
-                served,
-                GEM_PLATFORM_ARTIFACT_KIND,
-                platform,
+    // The gems, a few platforms at a time and taken in lock order.
+    let mut downloads = std::pin::pin!(futures_util::stream::iter(&patches)
+        .map(|patch| async move {
+            let subject = format!("{name} ({})", patch.platform);
+            let fetched = fetch_verified_archive(cfg, &patch.record.uuid).await;
+            let archive = policy.settle(
+                fetched,
                 "platform gem",
-                &subject,
-            )
-            .await?;
-            let stub = platform_artifact(
-                cfg,
-                served,
-                GEM_PLATFORM_STUB_ARTIFACT_KIND,
-                platform,
-                "stub gemspec",
-                &subject,
-            )
-            .await?;
-            Ok::<_, Box<VendorOutcome>>((platform, subject, gem, stub))
+                &format!("platform gem for {subject}"),
+            )?;
+            let stub = match fetch_verified_secondary(cfg, &archive, GEM_STUB_ARTIFACT_KIND).await {
+                SecondaryArtifactResult::Ready(bytes) => bytes,
+                SecondaryArtifactResult::Absent => {
+                    return Err(policy.miss(format!(
+                        "the patch service served no stub gemspec for {subject}"
+                    )))
+                }
+                SecondaryArtifactResult::IntegrityMismatch(reason) => {
+                    return Err(policy.hard(
+                        "vendor_prebuilt_integrity_mismatch",
+                        format!(
+                            "prebuilt stub gemspec for {subject} failed integrity verification \
+                             ({reason}); refusing to vendor tampered bytes"
+                        ),
+                    ))
+                }
+                SecondaryArtifactResult::Failed(reason) => {
+                    return Err(policy.miss(format!(
+                        "could not fetch the stub gemspec for {subject} ({reason})"
+                    )))
+                }
+            };
+            Ok::<_, Box<VendorOutcome>>((patch, subject, archive, stub))
         })
         .buffered(PREBUILD_DOWNLOADS_AT_ONCE));
 
     let mut emptied: Vec<String> = Vec::new();
+    let mut built: Vec<GemBuildEntry> = Vec::with_capacity(patches.len());
+    let mut source_url = String::new();
     while let Some(downloaded) = downloads.next().await {
-        let (platform, subject, gem, stub) = downloaded?;
+        let (patch, subject, archive, stub) = downloaded?;
+        let platform = patch.platform;
         refuse_unusable_stub(policy, name, &subject, &String::from_utf8_lossy(&stub))?;
 
         let tree = stage.join(platform);
@@ -1703,18 +1910,28 @@ async fn stage_platform_prebuilds(
                 format!("cannot create {}: {e}", tree.display()),
             ));
         }
-        if let Err(e) = extract_on_blocking_pool(gem, &tree, extract_gem_data).await {
+        if source_url.is_empty() {
+            source_url.clone_from(&archive.source_url);
+        }
+        let gemspec_integrity = archive
+            .secondary
+            .iter()
+            .find(|a| a.kind == GEM_STUB_ARTIFACT_KIND)
+            .map(|a| a.integrity_sri.clone())
+            .unwrap_or_default();
+        let gem_integrity = archive.integrity_sri.clone();
+        if let Err(e) = extract_on_blocking_pool(archive.bytes, &tree, extract_gem_data).await {
             return Err(policy.hard(
                 "vendor_prebuilt_extract_failed",
-                format!("cannot extract the prebuilt platform gem for {subject}: {e}"),
+                format!("cannot extract the patched platform gem for {subject}: {e}"),
             ));
         }
-        match empty_shipped_gitignores(&tree, &record.files).await {
+        match empty_shipped_gitignores(&tree, &patch.record.files).await {
             Ok(files) => emptied.extend(files.into_iter().map(|file| format!("{platform}/{file}"))),
             Err(e) => {
                 return Err(policy.hard(
                     "vendor_prebuilt_write_failed",
-                    format!("cannot empty a `.gitignore` the prebuilt platform gem for {subject} ships: {e}"),
+                    format!("cannot empty a `.gitignore` the patched platform gem for {subject} ships: {e}"),
                 ));
             }
         }
@@ -1724,46 +1941,45 @@ async fn stage_platform_prebuilds(
                 format!("cannot write the stub gemspec for {subject} into the vendored dir: {e}"),
             ));
         }
-        // `gem` passed the service's digest for this platform above
-        // (`platform_artifact`), which is what vouches for a tree that
-        // ships none of the patched files: only one it does ship can
-        // contradict the patch.
+        // The gem passed the service's digest for this platform's patch
+        // above (`fetch_verified_archive`), which is what vouches for a
+        // tree that ships none of the patched files: only one it does ship
+        // can contradict the patch.
         let verified = super::verify::TreeVoucher::VerifiedDownload;
-        if super::verify::verify_platform_tree(&tree, &record.files, verified)
+        if super::verify::verify_platform_tree(&tree, &patch.record.files, verified)
             .await
             .is_err()
         {
             return Err(policy.miss(format!(
-                "prebuilt platform gem for {subject} does not carry the patch (a patched \
-                 file it ships is not the patched one)"
+                "patched platform gem for {subject} does not carry its patch (a patched file \
+                 it ships is not the patched one)"
             )));
         }
+        built.push(GemBuildEntry {
+            platform: platform.to_string(),
+            uuid: patch.record.uuid.clone(),
+            gem_integrity,
+            gemspec_integrity,
+            record: Some(patch.record.clone()),
+        });
     }
 
-    let source_url = platforms
-        .first()
-        .and_then(|platform| served.platform(GEM_PLATFORM_ARTIFACT_KIND, platform))
-        .map(|artifact| artifact.url.as_str())
-        .unwrap_or_default();
     let mut warnings = vec![downloaded_warning(
-        format_args!(
-            "{name} as prebuilt platform gems ({})",
-            platforms.join(", ")
-        ),
-        source_url,
+        format_args!("{name} as patched platform gems ({})", platforms.join(", ")),
+        &source_url,
     )];
     if !emptied.is_empty() {
         warnings.push(VendorWarning::new(
             GITIGNORE_NEUTRALIZED,
             format!(
-                "{name}: the prebuilt platform gems ship their own `.gitignore` ({}), whose \
+                "{name}: the patched platform gems ship their own `.gitignore` ({}), whose \
                  rules would keep git from committing files of the vendored trees; emptied in \
                  the vendored copy (commit it)",
                 super::npm_dir::summarize_rules(&emptied)
             ),
         ));
     }
-    Ok(warnings)
+    Ok((warnings, built))
 }
 
 /// The advisory of [`empty_shipped_gitignores`]: the vendored trees differ
@@ -1823,68 +2039,38 @@ async fn empty_shipped_gitignores(
     Ok(emptied)
 }
 
-/// One per-platform artifact of `kind` (`what`, for messages about
-/// `subject`), downloaded and verified against its served integrity like
-/// the ruby gem's stub: a mismatch is never vendored. The check is not
-/// optional: an artifact the service states no digest for is not listed
-/// at all, and for a prebuild that ships none of the patched files it is
-/// the only evidence that the tree is the patched build.
-async fn platform_artifact(
-    cfg: &VendorServiceConfig,
-    served: &ServedArtifacts,
-    kind: &str,
-    platform: &str,
-    what: &str,
-    subject: &str,
-) -> Result<Vec<u8>, Box<VendorOutcome>> {
-    let policy = ServicePolicy::Refused;
-    match fetch_verified_platform_secondary(cfg, served, kind, platform).await {
-        SecondaryArtifactResult::Ready(bytes) => Ok(bytes),
-        SecondaryArtifactResult::Absent => {
-            Err(policy.miss(format!("the patch service served no {what} for {subject}")))
-        }
-        SecondaryArtifactResult::IntegrityMismatch(reason) => Err(policy.hard(
-            "vendor_prebuilt_integrity_mismatch",
-            format!(
-                "prebuilt {what} for {subject} failed integrity verification ({reason}); \
-                 refusing to vendor tampered bytes"
-            ),
-        )),
-        SecondaryArtifactResult::Failed(reason) => Err(policy.miss(format!(
-            "could not fetch the {what} for {subject} ({reason})"
-        ))),
-    }
-}
-
 /// [`gem_service_copy`] for a gem the lock pins as platform gems: the copy
-/// is the verified prebuild of each of `platforms`, staged in full and then
-/// swapped into place, so a failure leaves any pre-existing (possibly
-/// live-wired) copy untouched and no husk behind. The uuid dir's git
-/// metadata is the caller's to write ([`restore_uuid_metadata`]):
-/// `copy_dir` may itself sit in a stage (`repair`'s restore).
+/// is the verified patched gem of each of `platforms`, each from its own
+/// patch in `builds`, staged in full and then swapped into place, so a
+/// failure leaves any pre-existing (possibly live-wired) copy untouched
+/// and no husk behind. The uuid dir's git metadata is the caller's to
+/// write ([`restore_uuid_metadata`]): `copy_dir` may itself sit in a stage
+/// (`repair`'s restore). Returns what the ledger records of each tree.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn gem_platform_service_copy(
     service: Option<&VendorServiceConfig>,
     record: &PatchRecord,
     name: &str,
     platforms: &[String],
+    builds: &[GemBuildPatch<'_>],
     copy_dir: &Path,
     uuid_dir: &Path,
     unwind_uuid_dir: bool,
     warnings: &mut Vec<VendorWarning>,
-) -> Result<(), Box<VendorOutcome>> {
+) -> Result<Vec<GemBuildEntry>, Box<VendorOutcome>> {
     let cfg = service
         .filter(|cfg| cfg.service_enabled())
         .ok_or_else(|| Box::new(super::service_fetch::required()))?;
     let stage = stage_dir_for(copy_dir);
     let _ = remove_tree(&stage).await;
-    let staged = match stage_platform_prebuilds(cfg, record, name, platforms, &stage).await {
-        Ok(staged) => staged,
-        Err(outcome) => {
-            cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-            return Err(outcome);
-        }
-    };
+    let (staged, built) =
+        match stage_platform_builds(cfg, record, name, platforms, builds, &stage).await {
+            Ok(staged) => staged,
+            Err(outcome) => {
+                cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
+                return Err(outcome);
+            }
+        };
     if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
         cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
         return Err(ServicePolicy::Refused.hard(
@@ -1893,7 +2079,37 @@ pub(super) async fn gem_platform_service_copy(
         ));
     }
     warnings.extend(staged);
-    Ok(())
+    Ok(built)
+}
+
+/// The patches a copy vendored as platform gems is restored from, as the
+/// ledger entry `entry` records them: the patch of each tree, with the
+/// record it was vendored with. `Err` says why the copy cannot be restored
+/// from the ledger alone: an entry an earlier development build wrote
+/// names platforms and no patch of their own.
+pub(super) fn recorded_builds(entry: &VendorEntry) -> Result<Vec<GemBuildPatch<'_>>, String> {
+    if entry.gem_builds.is_empty() {
+        return Err(
+            "this copy was vendored by an earlier build, which recorded no patch for its \
+             platform gems; run `socket-patch scan --mode vendored` to vendor it again (or \
+             restore the committed directory from version control)"
+                .to_string(),
+        );
+    }
+    entry
+        .gem_builds
+        .iter()
+        .map(|built| match &built.record {
+            Some(record) => Ok(GemBuildPatch {
+                platform: built.platform.as_str(),
+                record,
+            }),
+            None => Err(format!(
+                "the ledger holds no patch record for the `{}` platform gem",
+                built.platform
+            )),
+        })
+        .collect()
 }
 
 /// `<uuid>/.gitignore` of a gem vendored as platform gems: re-includes
@@ -1956,11 +2172,12 @@ async fn keep_platform_trees_committable(
 /// A dry run's check of a gem the lock pins as platform gems: the whole
 /// download, verification and unpacking of [`gem_platform_service_copy`],
 /// into a scratch directory.
-async fn preview_platform_prebuilds(
+async fn preview_platform_builds(
     service: Option<&VendorServiceConfig>,
     record: &PatchRecord,
     name: &str,
     platforms: &[String],
+    builds: &[GemBuildPatch<'_>],
 ) -> Result<(), Box<VendorOutcome>> {
     if let Some(outcome) = service_offline_conflict(service) {
         return Err(Box::new(outcome));
@@ -1970,15 +2187,17 @@ async fn preview_platform_prebuilds(
         .ok_or_else(|| Box::new(super::service_fetch::required()))?;
     let scratch = tempfile::tempdir()
         .map_err(|e| Box::new(refused("vendor_prebuilt_extract_failed", e.to_string())))?;
-    stage_platform_prebuilds(cfg, record, name, platforms, scratch.path())
+    stage_platform_builds(cfg, record, name, platforms, builds, scratch.path())
         .await
         .map(|_| ())
 }
 
 /// Acquire a verified service copy without replacing the prior copy on
-/// failure: the gem's own tree, or one prebuild tree per platform in
-/// `platforms` when the lock pins the gem as platform gems (with the uuid
-/// dir's git metadata, see [`restore_uuid_metadata`]).
+/// failure: the gem's own tree, or one patched platform gem's tree per
+/// platform in `platforms` when the lock pins the gem as platform gems,
+/// each from its own patch in `builds` (with the uuid dir's git metadata,
+/// see [`restore_uuid_metadata`]). Returns what the ledger records of
+/// those trees (none for the gem's own tree).
 #[allow(clippy::too_many_arguments)]
 async fn materialise_patched_copy(
     purl: &str,
@@ -1986,11 +2205,13 @@ async fn materialise_patched_copy(
     uuid_dir: &Path,
     name: &str,
     platforms: &[String],
+    builds: &[GemBuildPatch<'_>],
     record: &PatchRecord,
     unwind_uuid_dir: bool,
     service: Option<&VendorServiceConfig>,
     warnings: &mut Vec<VendorWarning>,
-) -> Result<ApplyResult, Box<VendorOutcome>> {
+) -> Result<(ApplyResult, Vec<GemBuildEntry>), Box<VendorOutcome>> {
+    let mut built = Vec::new();
     match platforms {
         [] => {
             gem_service_copy(
@@ -2005,11 +2226,12 @@ async fn materialise_patched_copy(
             .await?
         }
         platforms => {
-            gem_platform_service_copy(
+            built = gem_platform_service_copy(
                 service,
                 record,
                 name,
                 platforms,
+                builds,
                 copy_dir,
                 uuid_dir,
                 unwind_uuid_dir,
@@ -2031,7 +2253,7 @@ async fn materialise_patched_copy(
             }
         }
     }
-    Ok(already_patched_result(purl, copy_dir, &record.files))
+    Ok((already_patched_result(purl, copy_dir, &record.files), built))
 }
 
 /// Revert a gem vendor entry: restore the Gemfile line / delete the managed
@@ -11673,17 +11895,21 @@ mod tests {
             .into_bytes()
         }
 
-        /// What the patch service lists for one platform: its prebuild and
-        /// the stub gemspec (`None` leaves that artifact out of the answer),
-        /// and the sha512 it advertises for the prebuild when not its own.
+        /// The patch of one platform gem as the patch service has it: its
+        /// patched platform gem and the stub gemspec (`None` leaves that
+        /// artifact out of the answer), and the sha512 it advertises for
+        /// the gem when not its own.
         struct Served {
             platform: &'static str,
             gem: Option<Vec<u8>>,
             stub: Option<Vec<u8>>,
             gem_sha512: Option<String>,
+            /// The patch this one says it was built from, when not the
+            /// fix's source patch.
+            built_from: Option<&'static str>,
         }
 
-        /// `platform`'s prebuild: the patched Ruby file and the platform's
+        /// `platform`'s patch: the patched Ruby file and the platform's
         /// own binary, with its stub.
         fn served(platform: &'static str) -> Served {
             Served {
@@ -11691,78 +11917,120 @@ mod tests {
                 gem: Some(make_gem(&[(RB, RB_PATCHED), (SO, platform.as_bytes())])),
                 stub: Some(stub(platform)),
                 gem_sha512: None,
+                built_from: None,
             }
         }
 
-        /// A patch service answering for `uuid` with the patched ruby gem
-        /// and `prebuilds`, in the shape of the wire contract.
+        /// The uuid of the patch of the platform gem `platform` that was
+        /// built from the patch `source`: each platform gem of a fix has a
+        /// patch of its own.
+        fn build_uuid(source: &str, platform: &str) -> String {
+            let tail = match platform {
+                DARWIN => "da0000000001",
+                LINUX => "110000000002",
+                _ => "ee0000000003",
+            };
+            format!("{}{tail}", &source[..24])
+        }
+
+        /// A patch service answering for the fix whose source patch is
+        /// `uuid`: that patch (the patched ruby gem) and the patch of each
+        /// platform gem in `builds`, each a patch of its own in the shape
+        /// of the wire contract: a `tarball`, a `gem-stub-gemspec`, and
+        /// `rebuiltFromUuid`.
         async fn service(
             uuid: &str,
-            prebuilds: &[Served],
+            builds: &[Served],
         ) -> (wiremock::MockServer, VendorServiceConfig) {
             use wiremock::matchers::{method, path};
             use wiremock::{Mock, ResponseTemplate};
             let server = wiremock::MockServer::start().await;
-            let base = format!("/patch/gem/nokogiri/1.18.10/tok/{uuid}");
-            let mut artifacts = Vec::new();
-            let mut serve = |artifact: serde_json::Value, route: String, bytes: Vec<u8>| {
-                artifacts.push(artifact);
-                Mock::given(method("GET"))
-                    .and(path(route))
-                    .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
-            };
+            let mut results = serde_json::Map::new();
             let mut mocks = Vec::new();
+            let mut serve = |route: &str, bytes: Vec<u8>| {
+                mocks.push(
+                    Mock::given(method("GET"))
+                        .and(path(route.to_string()))
+                        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes)),
+                );
+            };
+            let base = format!("/patch/gem/nokogiri/1.18.10/tok/{uuid}");
             let ruby_gem = make_gem(&[(RB, RB_PATCHED), (C, &b"patched C\n"[..])]);
             let route = format!("{base}/nokogiri-1.18.10.gem");
-            mocks.push(serve(
+            results.insert(
+                uuid.to_string(),
                 serde_json::json!({
-                    "kind": "tarball", "url": format!("{}{route}", server.uri()),
-                    "integrity": { "sha512": sri_sha512(&ruby_gem) }
+                    "status": "granted",
+                    "purl": NOKO,
+                    "url": format!("{}{route}", server.uri()),
+                    "rebuiltFromUuid": null,
+                    "artifacts": [{
+                        "kind": "tarball", "url": format!("{}{route}", server.uri()),
+                        "integrity": { "sha512": sri_sha512(&ruby_gem) }
+                    }]
                 }),
-                route,
-                ruby_gem,
-            ));
-            for prebuild in prebuilds {
-                let platform = prebuild.platform;
+            );
+            serve(&route, ruby_gem);
+            for build in builds {
+                let platform = build.platform;
+                let member = build_uuid(uuid, platform);
+                let base = format!("/patch/gem/nokogiri/1.18.10/tok/{member}");
+                let mut artifacts = Vec::new();
                 let files = [
-                    ("gem-platform", "gem", &prebuild.gem, &prebuild.gem_sha512),
-                    (
-                        "gem-platform-stub-gemspec",
-                        "gemspec",
-                        &prebuild.stub,
-                        &None,
-                    ),
+                    ("tarball", "gem", &build.gem, &build.gem_sha512),
+                    ("gem-stub-gemspec", "gemspec", &build.stub, &None),
                 ];
                 for (kind, ext, bytes, sha512) in files {
                     let Some(bytes) = bytes else { continue };
                     let route = format!("{base}/nokogiri-1.18.10-{platform}.{ext}");
                     let sha512 = sha512.clone().unwrap_or_else(|| sri_sha512(bytes));
-                    mocks.push(serve(
-                        serde_json::json!({
-                            "kind": kind, "platform": platform,
-                            "url": format!("{}{route}", server.uri()),
-                            "contentType": "application/octet-stream",
-                            "sizeBytes": bytes.len(),
-                            "integrity": { "sha512": sha512 }
-                        }),
-                        route,
-                        bytes.clone(),
-                    ));
+                    artifacts.push(serde_json::json!({
+                        "kind": kind,
+                        "url": format!("{}{route}", server.uri()),
+                        "contentType": "application/octet-stream",
+                        "sizeBytes": bytes.len(),
+                        "integrity": { "sha512": sha512 }
+                    }));
+                    serve(&route, bytes.clone());
                 }
+                let gem_url = format!("{}{base}/nokogiri-1.18.10-{platform}.gem", server.uri());
+                results.insert(
+                    member,
+                    serde_json::json!({
+                        "status": if build.gem.is_some() { "granted" } else { "pending_build" },
+                        "purl": format!("pkg:gem/nokogiri@1.18.10?platform={platform}"),
+                        "url": build.gem.as_ref().map(|_| gem_url),
+                        "rebuiltFromUuid": build.built_from.unwrap_or(uuid),
+                        "artifacts": artifacts
+                    }),
+                );
             }
             for mock in mocks {
                 mock.mount(&server).await;
             }
+            // One answer per patch asked about: `not_found` for a patch
+            // the service does not have.
             Mock::given(method("POST"))
                 .and(path("/v0/orgs/acme/patches/package"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "results": { uuid: {
-                        "status": "granted",
-                        "purl": NOKO,
-                        "url": format!("{}{base}/nokogiri-1.18.10.gem", server.uri()),
-                        "artifacts": artifacts
-                    }}
-                })))
+                .respond_with(move |request: &wiremock::Request| {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&request.body).unwrap_or_default();
+                    let asked: serde_json::Map<String, serde_json::Value> = body["uuids"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|uuid| uuid.as_str())
+                        .map(|uuid| {
+                            let answer = results
+                                .get(uuid)
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!({ "status": "not_found" }));
+                            (uuid.to_string(), answer)
+                        })
+                        .collect();
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "results": asked }))
+                })
                 .mount(&server)
                 .await;
             let cfg = gem_service_cfg(&server.uri(), VendorSource::Service, false);
@@ -11774,6 +12042,22 @@ mod tests {
             root.join(".socket/vendor/.uninstalled")
         }
 
+        /// The records of the patches of the two platform gems the fixture
+        /// lock names, each built from `record`'s patch and patching the
+        /// same files of its own gem.
+        fn build_records(record: &PatchRecord) -> Vec<(&'static str, PatchRecord)> {
+            [DARWIN, LINUX]
+                .into_iter()
+                .map(|platform| {
+                    let build = PatchRecord {
+                        uuid: build_uuid(&record.uuid, platform),
+                        ..record.clone()
+                    };
+                    (platform, build)
+                })
+                .collect()
+        }
+
         async fn vendor(
             root: &Path,
             installed: &Path,
@@ -11781,20 +12065,40 @@ mod tests {
             cfg: &VendorServiceConfig,
             dry_run: bool,
         ) -> VendorOutcome {
+            let records = build_records(record);
+            let builds: Vec<GemBuildPatch<'_>> = records
+                .iter()
+                .map(|(platform, record)| GemBuildPatch { platform, record })
+                .collect();
+            vendor_with(root, installed, record, &builds, cfg, dry_run).await
+        }
+
+        /// [`vendor`] with the platform patches at hand named (`builds`).
+        async fn vendor_with(
+            root: &Path,
+            installed: &Path,
+            record: &PatchRecord,
+            builds: &[GemBuildPatch<'_>],
+            cfg: &VendorServiceConfig,
+            dry_run: bool,
+        ) -> VendorOutcome {
             let blobs = root.join("no-blobs");
             let sources = PatchSources::blobs_only(&blobs);
-            ts::vendor_gem(
+            let outcome = vendor_gem_builds(
                 NOKO,
                 installed,
                 root,
                 record,
+                builds,
                 &sources,
                 "2026-06-09T00:00:00Z",
                 dry_run,
                 false,
                 Some(cfg),
             )
-            .await
+            .await;
+            ts::assert_fresh_vendor_in_use(root, &outcome, dry_run).await;
+            outcome
         }
 
         async fn text(path: PathBuf) -> String {
@@ -11864,8 +12168,19 @@ mod tests {
                     vendored(&rel, bare.as_deref())
                 );
 
-                // The ledger entry.
-                assert_eq!(entry.gem_platforms, [DARWIN, LINUX]);
+                // The ledger entry: per platform, the patch its tree was
+                // built from, the sha512 of that patch's gem and stub, and
+                // its record. The entry itself is the fix's source patch.
+                assert_eq!(entry.gem_tree_platforms(), [DARWIN, LINUX]);
+                assert_eq!(entry.uuid, UUID);
+                assert!(entry.gem_platforms.is_empty());
+                for built in &entry.gem_builds {
+                    assert_eq!(built.uuid, build_uuid(UUID, &built.platform));
+                    assert!(built.gem_integrity.starts_with("sha512-"), "{built:?}");
+                    assert!(built.gemspec_integrity.starts_with("sha512-"), "{built:?}");
+                    let own = built.record.as_ref().expect("the platform patch's record");
+                    assert_eq!(own.uuid, built.uuid);
+                }
                 assert_eq!(entry.artifact.path, rel);
                 let inventory = entry.artifact.file_inventory.as_ref().expect("inventory");
                 let inventoried: Vec<&str> = inventory.keys().map(String::as_str).collect();
@@ -11919,7 +12234,7 @@ mod tests {
                 assert_eq!(saved, entry);
                 assert!(text(root.join(".socket/vendor/state.json"))
                     .await
-                    .contains("\"gemPlatforms\""));
+                    .contains("\"gemBuilds\""));
 
                 // Verification and discovery: one vendored reference.
                 assert_eq!(
@@ -11958,39 +12273,69 @@ mod tests {
             }
         }
 
-        /// Every locked platform needs a prebuild and its stub. While the
-        /// service lists none for one of them (it lists a prebuild only once
-        /// built), a dry run and a wet run both leave the gem alone under
-        /// the benign pending code: they name the gem and the platforms,
-        /// ask the service for the package reference and nothing else, and
-        /// write nothing.
+        /// Every locked platform needs a patch of the fix, with its gem and
+        /// its stub. While one of them has none (no patch of it at all, one
+        /// the service does not serve yet, one with no stub, one built from
+        /// another fix), a dry run and a wet run both leave the gem alone
+        /// under the benign pending code: they name the gem and what each
+        /// platform lacks, ask the service for the package references and
+        /// nothing else, and write nothing.
         #[tokio::test]
-        async fn a_locked_platform_without_a_prebuild_is_a_skip_that_downloads_nothing() {
-            let no_stub = || Served {
-                stub: None,
-                ..served(LINUX)
-            };
-            let cases: [(Vec<Served>, Vec<&str>); 3] = [
+        async fn a_locked_platform_without_a_patch_is_a_skip_that_downloads_nothing() {
+            let cases: [(Vec<Served>, Vec<&str>); 5] = [
                 (
                     Vec::new(),
                     vec![
-                        "of `nokogiri` for `arm64-darwin`, `x86_64-linux-gnu` yet",
-                        "none of the locked platforms",
+                        "`arm64-darwin`: its patched gem is not available (not_found)",
+                        "`x86_64-linux-gnu`: its patched gem is not available (not_found)",
+                        "no locked platform has one",
                     ],
                 ),
                 (
                     vec![served(DARWIN)],
-                    vec!["for `x86_64-linux-gnu` yet (it has `arm64-darwin`)"],
+                    vec![
+                        "(`x86_64-linux-gnu`: its patched gem is not available (not_found); \
+                         `arm64-darwin` has one)",
+                    ],
                 ),
                 (
-                    vec![served(DARWIN), no_stub()],
-                    vec!["for `x86_64-linux-gnu` yet ("],
+                    vec![
+                        served(DARWIN),
+                        Served {
+                            stub: None,
+                            ..served(LINUX)
+                        },
+                    ],
+                    vec!["`x86_64-linux-gnu`: its patch serves no stub gemspec"],
+                ),
+                (
+                    vec![
+                        served(DARWIN),
+                        Served {
+                            gem: None,
+                            ..served(LINUX)
+                        },
+                    ],
+                    vec!["`x86_64-linux-gnu`: its patched gem is still being built"],
+                ),
+                (
+                    vec![
+                        served(DARWIN),
+                        Served {
+                            built_from: Some(UUID_B),
+                            ..served(LINUX)
+                        },
+                    ],
+                    vec![
+                        "`x86_64-linux-gnu`: its patch ",
+                        " belongs to another fix (it was built from b0b0b0b0-0000-4000-8000-000000000002)",
+                    ],
                 ),
             ];
-            for (prebuilds, expected) in cases {
+            for (builds, expected) in cases {
                 let (_tmp, root, record) = project(&lock(Some(&checksums(&sha('a'), "")))).await;
                 let before = ts::tree_snapshot(&root);
-                let (server, cfg) = service(UUID, &prebuilds).await;
+                let (server, cfg) = service(UUID, &builds).await;
                 for dry_run in [true, false] {
                     let asked = ts::request_count(&server).await;
                     let (code, detail) = unwrap_refused(
@@ -11999,23 +12344,53 @@ mod tests {
                     assert_eq!(code, "vendor_prebuilt_platform_pending", "{detail}");
                     assert!(crate::vendor::is_unserved(code));
                     assert!(crate::vendor::refusals::refusal_is_benign(code));
+                    assert!(
+                        detail.starts_with(
+                            "no patch of this fix is available for every platform gem of \
+                             `nokogiri` that Gemfile.lock locks ("
+                        ),
+                        "{detail}"
+                    );
                     for text in &expected {
                         assert!(detail.contains(text), "{detail}");
                     }
                     assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
                     assert_eq!(
                         ts::request_count(&server).await,
-                        asked + 1,
-                        "the package reference is the one request: no gem is downloaded"
+                        asked + 2,
+                        "one package reference per platform's patch: no gem is downloaded"
                     );
                 }
             }
+
+            // A platform with no patch among the run's records: the service
+            // is not even asked.
+            let (_tmp, root, record) = project(&lock(None)).await;
+            let before = ts::tree_snapshot(&root);
+            let (server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            let records = build_records(&record);
+            let darwin = GemBuildPatch {
+                platform: records[0].0,
+                record: &records[0].1,
+            };
+            for builds in [&[darwin][..], &[][..]] {
+                let (code, detail) = unwrap_refused(
+                    vendor_with(&root, &not_installed(&root), &record, builds, &cfg, false).await,
+                );
+                assert_eq!(code, "vendor_prebuilt_platform_pending", "{detail}");
+                assert!(
+                    detail.contains("`x86_64-linux-gnu`: no patch on offer"),
+                    "{detail}"
+                );
+                assert_eq!(ts::tree_snapshot(&root), before);
+            }
+            assert_eq!(ts::request_count(&server).await, 0);
         }
 
-        /// A copy the lock is ALREADY wired to cannot wait for a prebuild.
-        /// When one of its trees is lost and the service does not list that
-        /// platform, the rebuild is the plain miss, a failure, dry run or
-        /// not, and what is left of the copy stays as it was.
+        /// A copy the lock is ALREADY wired to cannot wait for a patch.
+        /// When one of its trees is lost and the service does not serve the
+        /// patch of that platform, the rebuild is the plain miss, a failure,
+        /// dry run or not, and what is left of the copy stays as it was.
         #[tokio::test]
         async fn a_wired_copy_that_cannot_be_rebuilt_fails_instead_of_skipping() {
             let (_tmp, root, record) = project(&lock(None)).await;
@@ -12031,7 +12406,10 @@ mod tests {
                     vendor(&root, &not_installed(&root), &record, &cfg, dry_run).await,
                 );
                 assert_eq!(code, "vendor_prebuilt_required", "{detail}");
-                assert!(detail.contains("for `x86_64-linux-gnu` yet"), "{detail}");
+                assert!(
+                    detail.contains("`x86_64-linux-gnu`: its patched gem is not available"),
+                    "{detail}"
+                );
                 assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
             }
         }
@@ -12183,7 +12561,7 @@ mod tests {
             let (result, entry, _) =
                 unwrap_done(vendor(&root, &installed, &record, &cfg, false).await);
             assert!(result.success, "{:?}", result.error);
-            assert_eq!(entry.unwrap().gem_platforms, [DARWIN, LINUX]);
+            assert_eq!(entry.unwrap().gem_tree_platforms(), [DARWIN, LINUX]);
             let asked: Vec<String> = server
                 .received_requests()
                 .await
@@ -12199,8 +12577,17 @@ mod tests {
             );
             assert_eq!(
                 asked.len(),
-                5,
-                "the package reference, then a platform gem and its stub per platform: {asked:?}"
+                8,
+                "per platform: its patch's reference (all asked before any download), then \
+                 that patch's own fetch (its reference, its gem and its stub): {asked:?}"
+            );
+            assert_eq!(
+                asked[..2],
+                [
+                    "/v0/orgs/acme/patches/package",
+                    "/v0/orgs/acme/patches/package"
+                ],
+                "every platform is settled before a gem is downloaded: {asked:?}"
             );
             assert_eq!(
                 tokio::fs::read(root.join(rel(UUID)).join(LINUX).join(RB))
@@ -12238,7 +12625,7 @@ mod tests {
             let (result, entry, _) =
                 unwrap_done(vendor(&root, &installed, &record, &cfg, false).await);
             assert!(result.success, "{:?}", result.error);
-            assert_eq!(entry.unwrap().gem_platforms, [DARWIN, LINUX]);
+            assert_eq!(entry.unwrap().gem_tree_platforms(), [DARWIN, LINUX]);
         }
 
         /// A prebuild is verified against its served integrity like the ruby
@@ -12335,7 +12722,7 @@ mod tests {
                 check_vendored_artifact(&root, &bare, &record).await,
                 ArtifactHealth::Healthy
             );
-            bare.gem_platforms.clear();
+            bare.gem_builds.clear();
             assert_eq!(
                 check_vendored_artifact(&root, &bare, &record).await,
                 ArtifactHealth::Healthy
@@ -12395,7 +12782,7 @@ mod tests {
 
             // A platform the ledger names must be a plain directory name.
             let mut poisoned = entry.clone();
-            poisoned.gem_platforms = vec!["../x".to_string()];
+            poisoned.gem_builds[0].platform = "../x".to_string();
             assert_eq!(
                 check_vendored_artifact(&root, &poisoned, &record).await,
                 ArtifactHealth::Unverifiable {
@@ -12548,7 +12935,7 @@ mod tests {
                 "{warnings:?}"
             );
             let rebuilt = rebuilt.expect("a refreshed entry");
-            assert_eq!(rebuilt.gem_platforms, [DARWIN, LINUX]);
+            assert_eq!(rebuilt.gem_tree_platforms(), [DARWIN, LINUX]);
             assert!(rebuilt.wiring.is_empty(), "the first run's records ride on");
             assert_eq!(tokio::fs::read(tree.join(RB)).await.unwrap(), RB_PATCHED);
             assert_eq!(
@@ -12663,7 +13050,7 @@ mod tests {
             let (_server, cfg) = service(UUID_B, &[served(DARWIN), served(LINUX)]).await;
             let second = vendor_and_persist(&root, &record_b, &cfg).await;
             assert_eq!(second.uuid, UUID_B);
-            assert_eq!(second.gem_platforms, [DARWIN, LINUX]);
+            assert_eq!(second.gem_tree_platforms(), [DARWIN, LINUX]);
             assert_eq!(
                 text(root.join(GEMFILE_LOCK)).await,
                 vendored(&rel(UUID_B), Some(&checksums("", "")))
@@ -12880,6 +13267,175 @@ mod tests {
             assert!(detail.contains("`..`"), "{detail}");
             assert_eq!(ts::tree_snapshot(&root), before);
             assert_eq!(ts::request_count(&server).await, 0);
+        }
+
+        /// The vendored dir is named after the fix's source patch, so it
+        /// stays where it is when the lock gains a platform: the manifest
+        /// and the lock's `PATH` section are unchanged, the copy gains that
+        /// platform's tree from that platform's own patch, and the ledger
+        /// its record.
+        #[tokio::test]
+        async fn a_lock_that_gains_a_platform_keeps_its_vendored_dir() {
+            let darwin_only = |text: String| {
+                text.replace(
+                    "    nokogiri (1.18.10-x86_64-linux-gnu)\n      racc (~> 1.4)\n",
+                    "",
+                )
+                .replace("  arm64-darwin\n  x86_64-linux-gnu\n", "  arm64-darwin\n")
+            };
+            let (_tmp, root, record) = project(&darwin_only(lock(None))).await;
+            let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            // Both platforms' patches are at hand; the lock names one.
+            let first = vendor_and_persist(&root, &record, &cfg).await;
+            assert_eq!(first.gem_tree_platforms(), [DARWIN]);
+            assert!(!root.join(rel(UUID)).join(LINUX).exists());
+            let gemfile = text(root.join(GEMFILE)).await;
+            assert_eq!(
+                text(root.join(GEMFILE_LOCK)).await,
+                darwin_only(vendored(&rel(UUID), None))
+            );
+
+            // The lock gains the linux entry under the vendored section.
+            tokio::fs::write(root.join(GEMFILE_LOCK), vendored(&rel(UUID), None))
+                .await
+                .unwrap();
+            let (result, entry, warnings) =
+                unwrap_done(vendor(&root, &not_installed(&root), &record, &cfg, false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert!(
+                warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+                "{warnings:?}"
+            );
+            let entry = entry.expect("a refreshed entry");
+            assert_eq!(entry.gem_tree_platforms(), [DARWIN, LINUX]);
+            assert_eq!(entry.artifact.path, rel(UUID), "the same directory");
+            assert_eq!(
+                text(root.join(GEMFILE)).await,
+                gemfile,
+                "the same manifest line"
+            );
+            assert_eq!(
+                text(root.join(GEMFILE_LOCK)).await,
+                vendored(&rel(UUID), None),
+                "the lock is not edited again"
+            );
+            assert_eq!(
+                tokio::fs::read(root.join(rel(UUID)).join(LINUX).join(SO))
+                    .await
+                    .unwrap(),
+                LINUX.as_bytes()
+            );
+        }
+
+        /// A project an earlier development build vendored: its ledger
+        /// entry names the platforms and no patch of their own
+        /// (`gemPlatforms`), and every tree came with the ruby gem's patch.
+        /// Reading it does not fail, the copy still verifies against that
+        /// one patch, and revert restores the project byte for byte. A run
+        /// that has a patch for every locked platform rebuilds the copy from
+        /// those patches in the same directory and records them; a run that
+        /// has none leaves the copy in force and says so, with no request.
+        #[tokio::test]
+        async fn a_copy_an_earlier_build_vendored_is_kept_converted_and_reverted() {
+            let original = lock(Some(&checksums(&sha('a'), &sha('b'))));
+            let (_tmp, root, record) = project(&original).await;
+            let (server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            let entry = vendor_and_persist(&root, &record, &cfg).await;
+
+            // The entry as the earlier build wrote it.
+            let mut value = serde_json::to_value(&entry).unwrap();
+            let object = value.as_object_mut().unwrap();
+            assert!(object.remove("gemBuilds").is_some());
+            object.insert(
+                "gemPlatforms".to_string(),
+                serde_json::json!([DARWIN, LINUX]),
+            );
+            let legacy: VendorEntry =
+                serde_json::from_value(value).expect("the earlier shape still reads");
+            assert!(legacy.gem_builds.is_empty());
+            assert_eq!(legacy.gem_tree_platforms(), [DARWIN, LINUX]);
+            ts::persist(&root, NOKO, legacy.clone()).await;
+            assert!(text(root.join(".socket/vendor/state.json"))
+                .await
+                .contains("\"gemPlatforms\""));
+            assert_eq!(
+                check_vendored_artifact(&root, &legacy, &record).await,
+                ArtifactHealth::Healthy
+            );
+            // A restore from the ledger alone has no patch to ask for.
+            let why = recorded_builds(&legacy).unwrap_err();
+            assert!(
+                why.contains("run `socket-patch scan --mode vendored` to vendor it again"),
+                "{why}"
+            );
+
+            // No platform patch at hand: the copy stays, and the run says so.
+            let snapshot = ts::tree_snapshot(&root);
+            let requests = ts::request_count(&server).await;
+            for dry_run in [true, false] {
+                let (kept, refreshed, warnings) = unwrap_done(
+                    vendor_with(&root, &not_installed(&root), &record, &[], &cfg, dry_run).await,
+                );
+                assert!(kept.success, "{:?}", kept.error);
+                assert!(refreshed.is_none(), "the ledger entry is left as it is");
+                let said: Vec<&str> = warnings.iter().map(|w| w.code).collect();
+                assert_eq!(said, [BUILDS_KEPT], "{warnings:?}");
+                assert!(
+                    warnings[0].detail.contains(
+                        "no patch of this fix is available for `arm64-darwin`, \
+                         `x86_64-linux-gnu` now"
+                    ),
+                    "{}",
+                    warnings[0].detail
+                );
+                assert_eq!(ts::tree_snapshot(&root), snapshot, "dry_run={dry_run}");
+            }
+            assert_eq!(
+                ts::request_count(&server).await,
+                requests,
+                "nothing is asked"
+            );
+
+            // A patch for every locked platform: the copy is rebuilt from
+            // them where it is, and the ledger gains their records.
+            let pair = (
+                text(root.join(GEMFILE)).await,
+                text(root.join(GEMFILE_LOCK)).await,
+            );
+            let (result, converted, warnings) =
+                unwrap_done(vendor(&root, &not_installed(&root), &record, &cfg, false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert!(
+                warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+                "{warnings:?}"
+            );
+            let converted = converted.expect("a refreshed entry");
+            assert_eq!(converted.artifact.path, legacy.artifact.path);
+            assert_eq!(converted.gem_builds.len(), 2);
+            assert!(converted.gem_platforms.is_empty());
+            assert_eq!(
+                (
+                    text(root.join(GEMFILE)).await,
+                    text(root.join(GEMFILE_LOCK)).await
+                ),
+                pair,
+                "the pair edit stands"
+            );
+            ts::persist(&root, NOKO, converted).await;
+            let saved = crate::vendor::load_state(&root).await.unwrap().entries[NOKO].clone();
+            assert_eq!(saved.gem_builds.len(), 2);
+            assert!(
+                !saved.wiring.is_empty(),
+                "the first run's wiring records are carried forward"
+            );
+
+            // Revert from the earlier entry: both files byte for byte.
+            ts::persist(&root, NOKO, legacy.clone()).await;
+            let reverted = revert_gem(&legacy, &root, false).await;
+            assert!(reverted.success, "{:?}", reverted.error);
+            assert_eq!(text(root.join(GEMFILE)).await, GEMFILE_NOKO);
+            assert_eq!(text(root.join(GEMFILE_LOCK)).await, original);
+            assert!(!root.join(rel(UUID)).exists());
         }
 
         /// The lock edit on its own: the blocks move verbatim and in lock

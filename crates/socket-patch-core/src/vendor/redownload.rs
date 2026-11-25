@@ -249,8 +249,13 @@ pub async fn restore(
                 let (name, _) =
                     parse_gem_purl(&entry.base_purl).ok_or("invalid gem coordinates")?;
                 // A gem vendored as platform gems is restored from the
-                // prebuild of each platform the ledger names.
-                let copied = match entry.gem_platforms.as_slice() {
+                // patch of each platform gem the ledger names.
+                let platforms: Vec<String> = entry
+                    .gem_tree_platforms()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                let copied = match platforms.as_slice() {
                     [] => {
                         super::gem::gem_service_copy(
                             Some(service),
@@ -264,17 +269,20 @@ pub async fn restore(
                         .await
                     }
                     platforms => {
+                        let builds = super::gem::recorded_builds(entry)?;
                         super::gem::gem_platform_service_copy(
                             Some(service),
                             record,
                             &name,
                             platforms,
+                            &builds,
                             &stage,
                             uuid_dir,
                             true,
                             &mut warnings,
                         )
                         .await
+                        .map(|_| ())
                     }
                 };
                 copied.map_err(|outcome| detail(*outcome))?;
@@ -419,7 +427,7 @@ pub async fn restore(
     // Likewise a gem vendored as platform gems: only the artifact dir was
     // swapped in from the stage, and without the uuid dir's own metadata a
     // `*.so` / `*.bundle` rule drops the prebuilt binaries from the commit.
-    if entry.ecosystem == "gem" && !entry.gem_platforms.is_empty() {
+    if entry.ecosystem == "gem" && !entry.gem_tree_platforms().is_empty() {
         if let Some(rel) = super::path::vendor_uuid_dir_rel("gem", &entry.uuid) {
             super::gem::restore_uuid_metadata(&root.join(rel))
                 .await

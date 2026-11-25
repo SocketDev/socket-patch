@@ -82,7 +82,18 @@ pub(crate) fn checked_artifact_path(
     // Stale-vendor detection: the path-level uuid IS the staleness signal —
     // a patch update changes record.uuid, so an artifact still sitting at the
     // old uuid path must not attest the new patch.
-    if parts.uuid != record.uuid || entry.uuid != record.uuid {
+    //
+    // A gem vendored as platform gems holds one tree per platform, each the
+    // gem of a patch of its own (`gem_builds`), under the directory named
+    // after the patch they were built from (the entry's uuid): the record
+    // of a platform's patch is attested against that directory too.
+    let own = entry.uuid == record.uuid
+        || (entry.ecosystem == "gem"
+            && entry
+                .gem_builds
+                .iter()
+                .any(|built| built.uuid == record.uuid));
+    if parts.uuid != entry.uuid || !own {
         return Err("vendor_uuid_mismatch".to_string());
     }
     Ok(project_root.join(norm))
@@ -153,10 +164,28 @@ pub async fn verify_vendored_patch_record(
             // A gem vendored as precompiled platform gems: bundler loads
             // the tree of whichever platform it runs on, so every one of
             // them must carry the patch.
+            // Each tree is the platform gem of a patch of its own: it is
+            // held to the files of that patch, which the ledger embeds
+            // (`record`'s own when it is that patch). The trees of an entry
+            // that names no patch per platform (an earlier development
+            // build's, or one read off a lockfile) all came with the one
+            // patch `record`.
             Some(trees) => {
                 let voucher = TreeVoucher::Ledger(entry.artifact.file_inventory.as_ref());
-                for tree in &trees {
-                    verify_platform_tree(tree, &record.files, voucher).await?;
+                for (tree, platform) in &trees {
+                    let built = entry
+                        .gem_builds
+                        .iter()
+                        .find(|built| Some(built.platform.as_str()) == platform.as_deref());
+                    let files = match built {
+                        Some(built) if built.uuid == record.uuid => &record.files,
+                        Some(built) => match &built.record {
+                            Some(own) => &own.files,
+                            None => &record.files,
+                        },
+                        None => &record.files,
+                    };
+                    verify_platform_tree(tree, files, voucher).await?;
                 }
             }
             None => verify_dir_members(&artifact, record, cargo_uuid).await?,
@@ -276,21 +305,23 @@ async fn verify_dir_members(
 async fn gem_platform_trees(
     artifact: &Path,
     entry: &VendorEntry,
-) -> Result<Option<Vec<PathBuf>>, String> {
+) -> Result<Option<Vec<(PathBuf, Option<String>)>>, String> {
     if entry.ecosystem != "gem" {
         return Ok(None);
     }
-    if !entry.gem_platforms.is_empty() {
+    let platforms = entry.gem_tree_platforms();
+    if !platforms.is_empty() {
         // SECURITY: state.json is committed and tamper-able, and each
         // platform is about to name a directory that gets stat'd and hashed.
-        if !entry
-            .gem_platforms
+        if !platforms
             .iter()
             .all(|platform| super::gem::is_platform_dir_name(platform))
         {
             return Err("vendor_path_unsafe".to_string());
         }
-        let trees = entry.gem_platforms.iter().map(|p| artifact.join(p));
+        let trees = platforms
+            .iter()
+            .map(|p| (artifact.join(p), Some(p.to_string())));
         return Ok(Some(trees.collect()));
     }
     let Some((name, _)) = crate::utils::purl::parse_gem_purl(&entry.base_purl) else {
@@ -314,7 +345,7 @@ async fn gem_platform_trees(
         if child.file_type().await.is_ok_and(|t| t.is_dir())
             && is_file(child.path().join(&stub)).await
         {
-            trees.push(child.path());
+            trees.push((child.path(), None));
         }
     }
     trees.sort();
