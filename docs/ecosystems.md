@@ -2574,6 +2574,10 @@ projects too. What the sections below then do for it:
 
 - Composer: vendored mode is declined until the lock names a vendored copy
   ([Bazel workspaces: Composer](#bazel-workspaces-composer)).
+- NuGet: for a package whose lock a rules_csharp `nuget.from_lock` reads, vendored mode
+  keeps a block in the root `MODULE.bazel`, or declines the package where it cannot show
+  that the block works
+  ([Bazel workspaces: NuGet](#vendored-mode-under-a-rules_csharp-hub)).
 - Go, Cargo and Maven: the `.bazelignore` at the Bazel root gets two lines for each kind of
   copy under `.socket` that a run wrote: the Go module copies, the vendored crates of a crate
   hub, the jars that vendored mode keeps for a rules_jvm_external hub
@@ -2631,6 +2635,11 @@ What an earlier run wrote for Bazel is still listed and undone with the variable
   Beside a Maven or Gradle build the hub's directory is a copy that only a `vendor` run
   without the variable writes: one that was lost stays lost, `vendor --check` names it, and
   the undo still takes its entry out.
+- The block that vendored mode keeps there for the NuGet packages of a rules_csharp hub
+  ([Bazel workspaces: NuGet](#vendored-mode-under-a-rules_csharp-hub)): `vendor --revert`,
+  `rollback` and `remove` take the folder of a patch out of it, and the block with its last
+  folder, as they do without the variable. No folder is added: a vendored run writes a
+  package as in a checkout without the workspace file.
 - The `.bazelignore` lines: no pair is added, and the pair of a copy that is gone is removed
   by the command that removed the copy (`rollback`, `remove`, `vendor --revert`, `repair`, a
   scan).
@@ -4681,9 +4690,12 @@ package that it is `affected`, not that it is patched:
 - **A PyPI patch committed under `.socket/vendor`** (vendored mode), when such a call names
   the file that points at the copy. rules_python 2.5.0-rc4 takes the path of the line for
   the name of a project, and the build of everything the hub serves fails (same three
-  releases). A vendored npm tarball is built by rules_js and a vendored crate by rules_rust,
-  and each keeps its statement. So do a vendored gem and a vendored NuGet package, for
-  another reason: no test here runs the build of one yet, so nothing is said of it.
+  releases). A vendored npm tarball is built by rules_js, a vendored crate by rules_rust and
+  a vendored NuGet package by rules_csharp, through the block that vendored mode keeps in
+  `MODULE.bazel`, and each keeps its statement. `vex` does not read that block: a vendored
+  NuGet package keeps its statement without it too (the list at the end of this section).
+  So does a vendored gem, for another reason: no test here runs the build of one yet, so
+  nothing is said of it.
 
 Each advisory of such a patch gets a statement of the package's own with the status
 `affected`. It names that package alone under the product, and its `action_statement` says
@@ -4851,7 +4863,8 @@ the build is broken):
   it is.
 - **Vendored mode for NuGet** beside `nuget.from_lock`, where the package is vendored and
   `MODULE.bazel` does not hold its block: a run with `--allow-vendored-in-bazel`, a package
-  that an earlier release vendored, a block that was taken out by hand. `vex` reads
+  that an earlier release vendored, a block that was taken out by hand. rules_csharp 0.5.0
+  then reads the path of the committed copy as a URL. `vex` reads
   `nuget.config`, the lock and the committed package, and not the block. Measured for the
   first two, where the build fails. With the block in place, a build that may not fetch
   (`--nofetch`) can build the unpatched package while the statement says `not_affected`.

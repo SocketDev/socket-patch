@@ -15,9 +15,11 @@
 //! from a line that points at a copy committed under `.socket/vendor`:
 //! 2.5.0-rc4 takes the path for the name of a project and fails the build
 //! of everything the hub serves (Bazel 9.3.2, 8.8.2 and 7.7.2). rules_js
-//! does build a vendored tarball, and rules_rust a vendored crate. What
-//! rules_ruby does with a vendored gem and rules_csharp with a vendored
-//! package no test here builds, so neither is judged.
+//! does build a vendored tarball, and rules_rust a vendored crate.
+//! rules_csharp builds a vendored package through the block that vendored
+//! mode keeps in `MODULE.bazel` ([`super::nuget`]), which is not read
+//! here. What rules_ruby does with a vendored gem no test here builds, so
+//! it is not judged.
 //!
 //! [`unbuilt`] names, for a patched package, the call that builds it from a
 //! file without its patch. It says so only when the files of the workspace
@@ -153,8 +155,8 @@ struct Hub {
     nested: bool,
     /// Whether a call of the tag may build a package from a line that
     /// points at a copy under `.socket/vendor`: rules_js and rules_rust
-    /// do, and of rules_ruby and rules_csharp no test here has shown
-    /// that they do not.
+    /// do, rules_csharp does through the block of vendored mode, and of
+    /// rules_ruby no test here has shown that it does not.
     builds_vendored: bool,
     /// The attributes that name a file beside the lock, where a pin in
     /// the lock does not name its patch. The calls of such a tag make one

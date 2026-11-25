@@ -1,4 +1,4 @@
-//! Hosted and agent mode for a NuGet package that comes through
+//! Hosted, vendored and agent mode for a NuGet package that comes through
 //! rules_csharp's `nuget.from_lock(packages_lock_json = "//:packages.lock.json",
 //! nuget_config = "//:nuget.config")` under Bzlmod: the lock that
 //! `dotnet restore` writes beside a project, and a `nuget.config` whose one
@@ -1338,11 +1338,13 @@ const SELECTED: &str = "{\"lockFileVersion\": 28, \"registryFileHashes\": {\
 ///
 /// In the fixture's workspace it keeps the package where a feed of the hub
 /// has it and its block in `MODULE.bazel`; a second run changes nothing;
-/// `vendor --check` passes and `list` says what it says without Bazel; and
+/// `vendor --check` passes, `list` says what it says without Bazel and
+/// `vex` says not affected, through the committed copy; and
 /// `vendor --revert`, `rollback` and `remove` each put every file back
-/// byte for byte, the block with its one folder. Beside a block that was
-/// changed by hand no undo changes a file, and each says where the block
-/// is; with the block deleted by hand, the undo puts the rest back.
+/// byte for byte, the block with its one folder, also for a user who
+/// switched the Bazel support off (`SOCKET_NO_BAZEL`). Beside a block that
+/// was changed by hand no undo changes a file, and each says where the
+/// block is; with the block deleted by hand, the undo puts the rest back.
 ///
 /// Where the block cannot be shown to work, `scan` and `get` decline the
 /// package with exit 1 and write nothing, a dry run lists it and exits 0,
@@ -1350,7 +1352,9 @@ const SELECTED: &str = "{\"lockFileVersion\": 28, \"registryFileHashes\": {\
 /// that would take it over and the `vendor` that would eject it are
 /// declined too, and where the block does work `vendor` ejects the pin
 /// into it. With `--allow-vendored-in-bazel`, or its variable, the package
-/// is vendored as without Bazel.
+/// is vendored as without Bazel. With `SOCKET_NO_BAZEL=1` the run is the
+/// one of the same checkout without its Bazel files, to the byte, where
+/// the block works and where the package is declined.
 #[test]
 fn vendored_mode_keeps_the_block_or_declines() {
     let test = "nuget::vendored_mode_keeps_the_block_or_declines";
@@ -1428,6 +1432,7 @@ fn vendored_mode_keeps_the_block_or_declines() {
     // The fixture's workspace: the block, and every way to take it out.
     let hub = checkout(Some(&module), Some("9.3.2"));
     let before = hub.tree();
+    let bare = tempfile::tempdir().expect("create a .NET home");
     let undo: [&[&str]; 3] = [
         &["vendor", "--revert"],
         &["rollback", "--yes"],
@@ -1460,6 +1465,13 @@ fn vendored_mode_keeps_the_block_or_declines() {
         let (listed, as_without) = (list(&hub), list(&plain));
         assert_eq!(listed.envelope["events"][0]["details"]["mode"], "vendored");
         assert_eq!(listed.envelope, as_without.envelope, "{}", listed.dump);
+        // `vex` says not affected, through the committed copy: the hub
+        // builds that copy through the block, so the call that hands the
+        // lock to rules_csharp is no reason to say affected. It is asked
+        // on a machine that restored nothing, where it has nothing to
+        // warn of: NuGet's folder of `home` holds the unpatched copy.
+        let run = |cell: &Cell, args: &[&str]| socket_patch(cell, &standin, bare.path(), args);
+        hub.stands_alone(run, &Claim::new(&purl, &patch.uuid, How::Vendored), true);
         assert_eq!(changed(&vendored, &hub.tree()), NOTHING, "{test}: {undo:?}");
         let ran = socket_patch(&hub, &standin, home.path(), undo);
         assert_eq!(ran.code, 0, "{test}: {}", ran.dump);
@@ -1470,6 +1482,21 @@ fn vendored_mode_keeps_the_block_or_declines() {
             ran.dump
         );
     }
+    // The switch for a project that Bazel does not build leaves the undo
+    // on: with it the folder goes out of the block all the same.
+    let ran = scan(&hub, &[]);
+    assert_eq!(ran.code, 0, "{test}: {}", ran.dump);
+    let ran = on_machine(&standin, home.path(), |api, env| {
+        let env = [env, &[("SOCKET_NO_BAZEL", "1")]].concat();
+        hub.socket_patch(api, undo[0], &env)
+    });
+    assert_eq!(ran.code, 0, "{test}: {}", ran.dump);
+    assert_eq!(
+        changed(&before, &hub.tree()),
+        NOTHING,
+        "{test}: {}",
+        ran.dump
+    );
 
     // A block that was changed by hand keeps the folder of the patch, and
     // with the lock restored beside it the Bazel build would fail on the
@@ -1632,6 +1659,20 @@ fn vendored_mode_keeps_the_block_or_declines() {
         assert_eq!(ran.code, 0, "{test}: {}", ran.dump);
         assert_eq!(ran.envelope, without.envelope, "{test}: {}", ran.dump);
         assert_eq!(wrote(&cell, &before), as_before, "{test}: {}", ran.dump);
+    }
+
+    // The switch for a project that Bazel does not build: the run of the
+    // same checkout without its Bazel files, to the byte. Beside those
+    // files the run is another one: the block, or the package declined.
+    let bazel = [MODULE, BAZEL_LOCK, BAZEL_VERSION];
+    for (release, code) in [(Some("9.3.2"), 0), (None, 1)] {
+        let cell = checkout(Some(&module), release);
+        let origin = standin.origin();
+        let args = [&VENDORED[..], &["--patch-server-url", &origin]].concat();
+        let beside = on_machine(&standin, home.path(), |api, env| {
+            cell.off_is_without_bazel(api, &args, env, &bazel)
+        });
+        assert_eq!(beside[0]["code"], code, "{test}: {beside:#}");
     }
 }
 
