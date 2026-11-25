@@ -521,7 +521,11 @@ pub async fn run(args: VexArgs) -> i32 {
             // fail every Grype scan.
             let grype = match (&grype_config, &output) {
                 (Some(config), Some(path)) => {
-                    vex_grype::unlist_missing_document(config, path, params.dry_run).await
+                    // A dry run leaves a stale document in place, so it asks
+                    // whether the real run would have removed it.
+                    let stale_doc_kept = params.dry_run && is_openvex_doc(path).await;
+                    vex_grype::unlist_missing_document(config, path, params.dry_run, stale_doc_kept)
+                        .await
                 }
                 _ => None,
             };
@@ -2363,7 +2367,7 @@ async fn remove_stale_vex_doc(path: &Path) -> bool {
 /// Whether `path` is a regular file holding an OpenVEX document (JSON whose
 /// `@context` names openvex.dev): the file a failed run removes. A dry run
 /// asks this to say what the real run would do.
-pub(crate) async fn is_openvex_doc(path: &Path) -> bool {
+async fn is_openvex_doc(path: &Path) -> bool {
     // FIFO-safe read: `--vex` can name any path, and a plain read of a FIFO
     // there would block this failure path forever.
     let Ok(bytes) = socket_patch_core::utils::fs::read_regular_to_bytes(path).await else {

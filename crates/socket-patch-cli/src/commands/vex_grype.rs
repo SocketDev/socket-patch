@@ -119,16 +119,17 @@ pub(crate) async fn list_document(
 
 /// Take `output` out of the config at `config` when no document is left
 /// there. `None` when the document is still there, or nothing is to be done.
+///
+/// `stale_doc_kept` says a dry run left in place a stale document that the
+/// real run would remove: the config step then previews that removal
+/// although a file is still at `output`.
 pub(crate) async fn unlist_missing_document(
     config: &Path,
     output: &Path,
     dry_run: bool,
+    stale_doc_kept: bool,
 ) -> Option<GrypeConfigOutcome> {
-    // A dry run leaves a stale document in place, so it asks whether the
-    // real run would have removed it.
-    if tokio::fs::symlink_metadata(output).await.is_ok()
-        && !(dry_run && crate::commands::vex::is_openvex_doc(output).await)
-    {
+    if !stale_doc_kept && tokio::fs::symlink_metadata(output).await.is_ok() {
         return None;
     }
     // A document this run could not have listed is not looked for.
