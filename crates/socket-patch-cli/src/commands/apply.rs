@@ -2523,8 +2523,10 @@ fn telemetry_command(args: &ApplyArgs) -> &'static str {
 
 /// The patches an apply run acted on, as its telemetry names them: the
 /// run's per-package events ([`GemCaveats::event_of`], what `--json`
-/// prints), the failures no result describes (`unreported`, once each,
-/// leaving out a record another copy applied), and the patches that failed
+/// prints), the failures no result describes (`unreported`, once each; a
+/// record no copy matched is left out when another copy applied it, while
+/// a refusal of the whole base stands beside its applied copies), and the
+/// patches that failed
 /// the run by not being installed (`failures`), each under the patch its
 /// manifest record names.
 ///
@@ -2548,7 +2550,10 @@ fn reported_patches(
     let mut named: HashSet<&str> = HashSet::new();
     let unreported: Vec<PatchEvent> = unreported
         .iter()
-        .filter(|(purl, _)| !applied.contains(purl.as_str()) && named.insert(purl.as_str()))
+        .filter(|(purl, cause)| {
+            !(*cause == ApplyFailureCause::NoMatchingVariant && applied.contains(purl.as_str()))
+                && named.insert(purl.as_str())
+        })
         .map(|(purl, cause)| {
             PatchEvent::new(PatchAction::Failed, purl.as_str()).with_cause(cause.as_str())
         })
@@ -5457,6 +5462,29 @@ mod tests {
             .map(|p| (p.uuid.as_str(), p.code.as_deref()))
             .collect();
         assert_eq!(failed, [("u-a", Some("no_matching_variant"))]);
+
+        // A refusal of the whole base fails the run though its writable
+        // copies were patched: it is reported beside them.
+        let refused = [(
+            other.clone(),
+            ApplyFailureCause::Coded("gradle_ro_cache_shadows"),
+        )];
+        let mut applied_b = failed_result(&other, None);
+        applied_b.success = true;
+        let reported = reported_patches(
+            &[applied_b],
+            &GemCaveats::default(),
+            &[],
+            &refused,
+            false,
+            &uuids,
+        );
+        let failed: Vec<(&str, Option<&str>)> = reported
+            .iter()
+            .filter(|p| p.outcome == "failed")
+            .map(|p| (p.uuid.as_str(), p.code.as_deref()))
+            .collect();
+        assert_eq!(failed, [("u-b", Some("gradle_ro_cache_shadows"))]);
     }
 
     /// A run stopped before patching anything reports that stage.

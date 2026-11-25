@@ -124,7 +124,6 @@ Every event has these fields:
 | `context.platform`, `context.arch` | Operating system and CPU architecture (for example `linux`, `x86_64`) |
 | `context.command` | The subcommand (`scan`, `apply`, …) |
 | `context.channel` | How this copy of Socket Patch was installed: `npm`, `cargo`, `homebrew`, `pypi` or `launcher_cache` when the binary sits where that tool puts it, and `standalone` for anywhere else (the install script, a downloaded binary, a container image). It names the channel only, never the path, and is left out when the binary cannot read its own location |
-| `context.ci` | `true` when the run is in CI (the `CI` variable is set to anything but empty, `0` or `false`, or `GITHUB_ACTIONS` is set), else `false`. It never names the provider, the repository or the job |
 | `metadata` | The per-event fields in the table below, and nothing else |
 | `error.type`, `error.message` | Failure events only. URLs in the message are redacted (credentials, grant tokens, signed query values), your home directory is replaced by `~`, and a message longer than 1,000 characters is cut. The message can still quote a package name or a path in the project |
 
@@ -146,9 +145,7 @@ Every event has these fields:
 A `scan` reports once for each project directory it scans. A failure event
 carries the subset of its row's fields known when it failed, plus `error_code`:
 the code the command's `--json` output reports (for example `patch_not_found`
-or `rollback_failed`). A failed `apply` whose patch content could not be
-obtained reports that stage instead of `apply_failed`: `sources_download_failed`
-or `offline_missing_sources`. `patch_fetch_failed` reports `uuid` only when you asked
+or `rollback_failed`). `patch_fetch_failed` reports `uuid` only when you asked
 for a patch by UUID. A command that stops on a usage error, or because another
 run holds the lock, reports nothing.
 
@@ -159,10 +156,9 @@ patch fails to apply, or is rolled back, far more often than the others:
 
 | Field | Value |
 | --- | --- |
-| `patches` | Up to 50 entries, failed ones first. Each is `{uuid, ecosystem, mode, outcome}`: the patch UUID, the ecosystem name (`npm`, `pypi`, …), the mode it was patched in (`agent`, `hosted`, `vendored`), and what the run did (`applied`, `downloaded`, `rolled_back`, `removed`, `verified` on a dry run, `skipped`, `failed`). A `skipped` or `failed` entry adds `code`, the reason code `--json` reports (for example `already_patched`); a failed apply's entry uses the event's `cause` (for example `hash_mismatch`, `file_not_found`, `blob_missing`, `no_matching_variant`, `package_not_installed`) |
+| `patches` | Up to 50 entries, failed ones first. Each is `{uuid, ecosystem, mode, outcome}`: the patch UUID, the ecosystem name (`npm`, `pypi`, …), the mode it was patched in (`agent`, `hosted`, `vendored`), and what the run did (`applied`, `downloaded`, `rolled_back`, `removed`, `verified` on a dry run, `skipped`, `failed`). A `skipped` or `failed` entry adds `code`, the reason code `--json` reports (for example `already_patched`) |
 | `patches_truncated` | `true` when the run acted on more than 50 patches |
 | `outcomes` | How many patches ended each way, over the whole run |
-| `failure_codes` | How many failed patches had each `code` (`none` for one without), over the whole run. Only when a patch failed |
 | `ecosystems`, `modes` | The distinct ecosystems and modes of those patches |
 
 A patch UUID is Socket's identifier for one patch, and each patch is for one

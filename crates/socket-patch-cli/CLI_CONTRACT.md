@@ -170,18 +170,6 @@ A missing referenced diff does not remove that protection.
   so a `postinstall` apply never fails an install over them. The manifest is not
   changed, and a skipped entry is not reconciled away as dropped.
 - Skipped events carry a stable `errorCode` and a human-readable `reason`.
-- A failed `apply` event (standalone, or the nested apply of agent-mode `get` /
-  `scan`) keeps `errorCode: apply_failed` and adds `cause`, a stable code for why
-  the package's patch did not apply: `hash_mismatch` (a file matches neither the
-  original nor the patched bytes), `file_not_found`, `blob_missing`,
-  `blob_corrupt`, `write_failed`, `sidecar_failed`, `shared_store`,
-  `conda_build`, `unsafe_path`, a refusal's or a native rebuild's own code
-  (for example `gradle_copy_unexpected_bytes`, `jvm_agent_service_required`
-  or `native_extension_build_failed`), or `unclassified` for a failure whose
-  path names none. Route on `errorCode`; `cause` refines it and new values may
-  be added. A failure with no package event (a copy no release variant
-  matches, a Maven base refused as a whole) has no `cause` here; telemetry
-  reports it as `no_matching_variant` or the refusal's code.
   `user_patch_conflict` identifies project patch/replacement metadata and names
   its source; `vendored`, `already_patched`, and `package_not_installed` explain
   other apply skips. A conflict introduced after selection is still `skipped`
@@ -769,6 +757,8 @@ Every VEX statement's impact string records which patch-application mode persist
 **The installed tree (`--no-bazel`).** **Experimental** (Bazel workspaces). `--no-bazel` / `--vex-no-bazel` (and an ambient `SOCKET_VEX_NO_BAZEL`, read like `SOCKET_VEX_NO_VERIFY`: `1` or `true` sets it, an empty value does not) say that the document describes what the package manager installed, for a repository that ships that tree while a Bazel hub reads the same lock for something else, such as its tests. The Bazel workspace is then not read: no package is attested as `affected` for `vex_bazel_not_in_build`, and the document, the events, the warnings, the exit code and every printed line are those of the same checkout without its Bazel files. Without the option nothing changes, and outside a Bazel workspace the option changes nothing and is accepted silently. `--vex-no-bazel` is inert unless `--vex` is set.
 
 **Identifier overrides.** `--product` / `--vex-product` and `--doc-id` / `--vex-doc-id` are emitted with surrounding whitespace trimmed (a blank value means unset).
+
+**Statement products.** The first product of every statement is the project (`--product` or the detected one), with the statement's packages as its subcomponents; readers that walk `products[0].subcomponents` see every package. Each package then follows as a product of its own with no subcomponents, which is how Trivy and Grype look a finding up, under its PURL and, for a gem with a `platform` qualifier, under the forms those scanners report it by: `pkg:gem/<name>@<version>` (Trivy) and, unless the platform is `ruby`, `pkg:gem/<name>@<version>-<platform>` (Grype, Syft), with the platform percent-decoded. Other qualifiers name a different artifact (a Maven classifier, a PyPI file), so they get no extra form. A form, the package's own PURL included, is left out of every statement of a vulnerability when it would stand for packages of that vulnerability, under its ID or any alias, with different statuses: an `affected` package, or one whose patch record the document leaves out, against a `not_affected` one. It is also left out when it equals the project's identifier. A scanner matches a package product wherever it finds that package, so the document is only for the project it was made for.
 
 **No product to detect.** The product is read from the git `origin` remote, then from the name and version in `package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, `composer.json`, `pom.xml`, the root's single `.csproj` or its single `.gemspec`. An application with none of these (a Bundler or pip project in a directory that has no git remote) has no product, and the run stops with `product_undetected` (`vex`: exit 2; embedded `--vex`: the host command's exit 1). No product is assumed: a directory name is not an identity (one checkout is `app` in a container and `workspace` in CI, and unrelated projects share those names), so a document issued under it could be read as a statement about another project. The message says what detection read, names any of those files that exists without a usable name and version, and ends with the run's own flag and a value built from the directory name, ready to paste: `… Pass a name that identifies this project, for example: --product pkg:generic/my-app` (`--vex-product …` on an embedded run). A run started in the project directory says `the current directory` instead of `.`.
 
