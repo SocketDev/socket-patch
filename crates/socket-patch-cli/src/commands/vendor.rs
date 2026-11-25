@@ -54,7 +54,7 @@ use crate::commands::apply::{representative_file, result_to_event, variant_match
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendor_orphans::{
     orphan_label, orphan_removal_failed, orphan_removed_event, orphan_still_wired,
-    sweep_orphan_vendor_dirs,
+    orphan_still_wired_by_prune, sweep_orphan_vendor_dirs, OrphanSweep,
 };
 use crate::commands::vendored_backend::{
     ApplyRequest, KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
@@ -5470,6 +5470,12 @@ pub(crate) struct VendorGcSummary {
     /// must not drop them. Also the `vendor_revert_residual_reference`
     /// warning of an entry kept for one: it names the file to fix.
     pub advisories: Vec<(&'static str, String)>,
+    /// Vendored state the pass could not reconcile, as (`code`, `detail`):
+    /// `vendor_state_unreadable` when the ledger could not be read (the
+    /// pass then reverted and swept nothing), and one
+    /// `vendor_orphan_still_wired` per orphan uuid dir kept because a
+    /// project file still installs from it.
+    pub unreconciled: Vec<(&'static str, String)>,
 }
 
 /// The revert warnings `scan --prune` forwards into `gc.warnings[]`: only
@@ -5539,6 +5545,16 @@ impl VendorGcSummary {
         self.kept.push((purl.to_string(), cause));
         true
     }
+
+    /// Report the orphan uuid dirs `sweep` kept because a project file
+    /// still installs from them, as the sweep's other callers do.
+    fn note_still_wired(&mut self, sweep: &OrphanSweep) {
+        self.unreconciled
+            .extend(sweep.still_wired.iter().map(|unit| {
+                let warning = orphan_still_wired_by_prune(unit);
+                (warning.code, warning.detail)
+            }));
+    }
 }
 /// The manifest keys an unused vendored `entry`, stored under ledger key
 /// `purl`, owns: every key with the same [`PurlKey`] as the ledger key OR
@@ -5570,7 +5586,12 @@ pub(crate) fn unused_vendored_manifest_keys<V>(
 ///     discovery `vendor --check` and `vex` judge by; `None` keeps,
 ///     fail-safe) and drop their manifest entries so the caller's manifest
 ///     prune + blob sweep reclaims the rest in the same pass;
-/// (c) sweep orphan uuid dirs.
+/// (c) sweep orphan uuid dirs. One a project file still installs from is
+///     kept, with a `vendor_orphan_still_wired` warning. With no ledger
+///     entry to judge ownership by, (c) deletes nothing and only warns.
+///
+/// A ledger that cannot be read stops the pass before (a), with a
+/// `vendor_state_unreadable` warning ([`VendorGcSummary::unreconciled`]).
 ///
 /// A revert that kept its artifact ([`RevertOutcome::kept_artifact`]: a
 /// drifted lock, or another project file that still installs from it)
@@ -5606,11 +5627,22 @@ pub(crate) async fn run_vendor_gc(
     let common: &GlobalArgs = &rooted;
     let mut out = VendorGcSummary::default();
     let mut state = match load_state(&common.project_root()).await {
-        Ok(s) if !s.entries.is_empty() => s,
-        // No ledger (or unreadable): only the orphan sweep could apply, and
-        // without a trustworthy ledger it must not delete anything.
-        _ => return out,
+        Ok(state) => state,
+        // A ledger that cannot be read is not an empty one: nothing is
+        // reverted or swept without it, and the pass says why.
+        Err(e) => {
+            out.unreconciled.push(gc_ledger_unreadable(&e));
+            return out;
+        }
     };
+    if state.entries.is_empty() {
+        // No ledger entry: nothing to revert, and with no ledger to judge
+        // ownership by the sweep deletes nothing. A directory a project
+        // file still installs from is reported all the same.
+        let kept = sweep_orphan_vendor_dirs(&common.cwd, &state, /*dry_run=*/ true).await;
+        out.note_still_wired(&kept);
+        return out;
+    }
 
     // (a) manifest-dropped entries. Everything (a) touches is excluded from
     // (b), which would otherwise list/fail the same purl a second time on a
@@ -5753,6 +5785,7 @@ pub(crate) async fn run_vendor_gc(
     // One that could not be deleted is a `cleanup_failed` warning.
     let sweep = sweep_orphan_vendor_dirs(&common.cwd, &state, dry_run).await;
     out.orphan_dirs = sweep.removed.len();
+    out.note_still_wired(&sweep);
     for (unit, e) in &sweep.failed {
         let warning = orphan_removal_failed(unit, e);
         out.write_failures.push((warning.code, warning.detail));
@@ -5763,6 +5796,19 @@ pub(crate) async fn run_vendor_gc(
         crate::commands::sync_bazelignore(common, false).await;
     }
     out
+}
+
+/// What a prune reports for a vendor ledger it could not read: the code
+/// `rollback`, `list` and `apply` report it with.
+fn gc_ledger_unreadable(e: &std::io::Error) -> (&'static str, String) {
+    (
+        "vendor_state_unreadable",
+        format!(
+            "cannot read .socket/vendor/state.json: {e}; the prune did not check the \
+             vendored entries or sweep orphan vendor dirs (restore the ledger from \
+             version control)"
+        ),
+    )
 }
 
 /// Human-mode stderr line for a pass-level GC problem (the GC has no
@@ -7753,6 +7799,51 @@ mod gc_tests {
             .path()
             .join(format!(".socket/vendor/npm/{UUID}"))
             .exists());
+    }
+
+    /// (c) keeps an orphan dir a project file still installs from, and the
+    /// pass reports it: the sweep's other three callers do, and a summary
+    /// of zeros would hide that the lockfile and the ledger disagree.
+    #[tokio::test]
+    async fn vendor_gc_reports_an_orphan_dir_still_wired() {
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        let orphan_uuid = "1a2b3c4d-5e6f-4a1b-8c2d-9e0f1a2b3c4d";
+        let unit = format!(".socket/vendor/pypi/{orphan_uuid}");
+        let wheel = format!("{unit}/six-1.16.0-py2.py3-none-any.whl");
+        tokio::fs::create_dir_all(tmp.path().join(&unit))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join(&wheel), b"wheel")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("requirements.txt"), format!("./{wheel}\n"))
+            .await
+            .unwrap();
+
+        for dry_run in [true, false] {
+            let out = run_vendor_gc(&common, &manifest_path, dry_run).await;
+            assert_eq!(out.orphan_dirs, 0, "dry_run={dry_run}: {out:?}");
+            assert!(
+                tmp.path().join(&wheel).is_file(),
+                "dry_run={dry_run}: a wired orphan is never deleted"
+            );
+            let codes: Vec<&str> = out.unreconciled.iter().map(|(code, _)| *code).collect();
+            assert_eq!(
+                codes,
+                ["vendor_orphan_still_wired"],
+                "dry_run={dry_run}: {out:?}"
+            );
+            assert!(
+                out.unreconciled[0].1.contains(&unit),
+                "dry_run={dry_run}: {out:?}"
+            );
+        }
+        // The entry the ledger does own is untouched.
+        assert!(load_state(tmp.path())
+            .await
+            .unwrap()
+            .entries
+            .contains_key(PURL));
     }
 
     /// The GC body is lock-free and runs under the CALLER's guard: with the

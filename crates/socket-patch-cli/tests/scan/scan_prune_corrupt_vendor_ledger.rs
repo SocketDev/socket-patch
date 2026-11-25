@@ -106,6 +106,14 @@ async fn mount_empty_discovery(mock: &MockServer) {
         .await;
 }
 
+/// The codes of the envelope's run warnings.
+fn warning_codes(envelope: &serde_json::Value) -> Vec<&str> {
+    envelope["warnings"]
+        .as_array()
+        .map(|warnings| warnings.iter().filter_map(|w| w["code"].as_str()).collect())
+        .unwrap_or_default()
+}
+
 /// `scan --prune` on a fresh clone whose vendor ledger is corrupt: the
 /// vendored package's manifest entry and blob must survive the GC while the
 /// committed artifacts remain.
@@ -136,14 +144,18 @@ async fn corrupt_ledger_scan_prune_keeps_vendored_manifest_entry() {
     let v = parse_json_envelope(stdout.trim());
 
     // The GC must not report the vendored entry as pruned…
-    let pruned = v["gc"]["prunedManifestEntries"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let events = v["events"].as_array().cloned().unwrap_or_default();
     assert!(
-        !pruned.iter().any(|p| p == CARGO_PURL),
-        "corrupt ledger: the vendored entry must not be pruned; gc={}",
-        v["gc"]
+        !events.iter().any(|e| e["purl"] == CARGO_PURL),
+        "corrupt ledger: the vendored entry must not be pruned; events={}",
+        v["events"]
+    );
+    // …and it says that its vendored half did not run, and why, instead
+    // of a clean pass.
+    assert!(
+        warning_codes(&v).contains(&"vendor_state_unreadable"),
+        "the pass could not read the ledger and must say so; warnings={}",
+        v["warnings"]
     );
 
     // …the manifest entry must survive on disk…
@@ -164,4 +176,51 @@ async fn corrupt_ledger_scan_prune_keeps_vendored_manifest_entry() {
             .is_file(),
         "vendored entry's blob was swept"
     );
+}
+
+/// A corrupt ledger in a project where the crawl finds nothing (no
+/// manifest and no artifact to recover a package from): the manifest half
+/// of the prune is skipped there, and the vendored half, which runs for
+/// the entries the lock no longer wires, has no ledger to name them. The
+/// run says so, and leaves the ledger for the user to restore.
+#[tokio::test]
+async fn corrupt_ledger_scan_prune_of_an_empty_crawl_names_the_ledger() {
+    let mock = MockServer::start().await;
+    mount_empty_discovery(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join(".socket/vendor/state.json");
+    std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+    std::fs::write(&ledger, b"{\"entries\": {").unwrap();
+
+    let uri = mock.uri();
+    let auth = [
+        "--api-url",
+        &uri,
+        "--api-token",
+        "fake-token",
+        "--org",
+        ORG_SLUG,
+    ];
+    let mut json = vec!["scan", "--json", "--prune"];
+    json.extend(auth);
+    let (code, stdout, stderr) = run_cli(tmp.path(), &json);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v = parse_json_envelope(stdout.trim());
+    assert_eq!(v["scannedPackages"], 0, "{v:#}");
+    assert!(
+        warning_codes(&v).contains(&"vendor_state_unreadable"),
+        "warnings={}",
+        v["warnings"]
+    );
+
+    let mut human = vec!["scan", "--prune"];
+    human.extend(auth);
+    let (code, stdout, stderr) = run_cli(tmp.path(), &human);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.contains("GC: cannot read .socket/vendor/state.json: "),
+        "stdout={stdout}; stderr={stderr}"
+    );
+
+    assert_eq!(std::fs::read(&ledger).unwrap(), b"{\"entries\": {");
 }

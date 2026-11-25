@@ -3049,8 +3049,11 @@ async fn scan_project(
         // The manifest half of the GC is skipped on an empty crawl, but
         // reverting vendored entries the lock no longer wires asks the
         // lockfile, not the crawl: run that half alone, or a project whose
-        // last vendored dependency was removed could never reconcile.
-        let unwired_gc = if prune_reverts_unwired && !unwired_vendored.is_empty() {
+        // last vendored dependency was removed could never reconcile. A
+        // ledger that could not be read names no such entry, so the half
+        // runs for it too, and reports it.
+        let vendored_half = !unwired_vendored.is_empty() || vendor_state.is_err();
+        let unwired_gc = if prune_reverts_unwired && vendored_half {
             Some(gc::run_vendor_only_gc(&args.common, &manifest_path, &socket_dir).await)
         } else if (hosted || prune) && policy.writes_allowed() {
             // What is left of a pnpm registry route that no lockfile uses
