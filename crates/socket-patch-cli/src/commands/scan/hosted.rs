@@ -1146,11 +1146,51 @@ fn gem_sha_key(purl: &str) -> (String, String) {
         .unwrap_or_default()
 }
 
+/// Transient-frame boxed constructor for [`run_redirect`]. `scan_project`
+/// awaited the hosted flow in line, so the flow's future, which embeds the
+/// whole hosted engine, lay in the poll frame of a scan in every mode, an
+/// agent scan too. Built here, on a frame that is gone before anything is
+/// polled, it costs a scan one pointer (the 2 MiB stack of a test thread
+/// and the main thread's on Windows; same rationale as scan's `boxed_*`
+/// family).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn boxed_run_redirect<'a>(
+    args: &'a ScanArgs,
+    api_client: &'a socket_patch_core::api::client::ApiClient,
+    all_packages_with_patches: &'a [BatchPackagePatches],
+    can_access_paid_patches: bool,
+    policy: &'a super::policy::ScanPolicy,
+    scan_result: Envelope,
+    npm_prior: Option<&'a crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+    recorded: &'a super::rollout::RecordedState<'a>,
+    batch_failed: bool,
+    stage: &'a mut super::rollout::Stage,
+    prior: Option<super::rollout::Prior<'a>>,
+    references: Option<super::withdrawn::KnownReferences>,
+    prune: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
+    Box::pin(run_redirect(
+        args,
+        api_client,
+        all_packages_with_patches,
+        can_access_paid_patches,
+        policy,
+        scan_result,
+        npm_prior,
+        recorded,
+        batch_failed,
+        stage,
+        prior,
+        references,
+        prune,
+    ))
+}
+
 /// `scan --mode hosted --json`: select through `discover_selected`, then run
 /// [`run_redirect_selected`]. The human arm calls
 /// [`boxed_run_redirect_selected`] from `scan/mod.rs` directly.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_redirect(
+async fn run_redirect(
     args: &ScanArgs,
     api_client: &socket_patch_core::api::client::ApiClient,
     all_packages_with_patches: &[BatchPackagePatches],

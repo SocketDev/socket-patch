@@ -74,8 +74,8 @@ pub(crate) use self::discovery::{
     vendored_ledger_supplement as project_vendored_supplement,
 };
 use self::gc::gc_into;
+use self::hosted::boxed_run_redirect;
 pub(crate) use self::hosted::boxed_run_redirect_selected;
-use self::hosted::run_redirect;
 use self::vendor_flow::{
     boxed_vendor_interactive_path, boxed_vendor_json_path, partition_skipped_selected,
 };
@@ -3676,7 +3676,7 @@ async fn scan_project(
             if let Some(sweep) = withdrawn_sweep {
                 sweep.record_into(&mut env);
             }
-            return run_redirect(
+            return boxed_run_redirect(
                 &args,
                 &api_client,
                 &all_packages_with_patches,
