@@ -483,6 +483,36 @@ pub(super) async fn sibling_pin_wirable(root: &Path, canon_name: &str, version: 
         && refuse_symlinked(root, &rels).await.is_ok()
 }
 
+/// Whether a vendored run that wires a Pipenv, uv or Python lock for
+/// `canon_name` may write the requirements set beside it as well: a file of
+/// the set names the package. A pin of the release is wired with the lock
+/// ([`sibling_pin_wirable`]), a hosted pin is such a pin once a takeover
+/// has restored it, and a vendor line is re-wired by a later patch of the
+/// package. A set that does not name the package is never written.
+pub(super) async fn sibling_names_package(root: &Path, canon_name: &str) -> bool {
+    let names = |file: &ReqFile| {
+        names_package(&file.content, canon_name) || has_vendor_line(&file.content, canon_name)
+    };
+    let files = collect_requirements_files(root).await;
+    files.is_ok_and(|files| files.iter().any(names))
+}
+
+/// Whether a requirements file of the project names the package by a URL
+/// (`name @ https://...`), which is the form of a hosted pin. A lock that
+/// is wired alone leaves the requirements files as they are, but a run
+/// that takes a hosted pin over restores the line that holds it.
+pub(super) async fn sibling_names_package_by_url(root: &Path, canon_name: &str) -> bool {
+    let by_url = |file: &ReqFile| {
+        logical_lines(&file.content).into_iter().any(|ll| {
+            let text = strip_comment(&ll.text);
+            let named = requirement_name(text).map(canonicalize_pypi_name);
+            text.contains("://") && named.as_deref() == Some(canon_name)
+        })
+    };
+    let files = collect_requirements_files(root).await;
+    files.is_ok_and(|files| files.iter().any(by_url))
+}
+
 /// #1873: refuse a requirements line naming `canon_name` through a
 /// `${NAME}` pip expands where it runs (`six==${SIXV}`). What it installs
 /// is unknowable here, so the vendor neither rewrites it nor names the file

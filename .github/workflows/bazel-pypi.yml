@@ -41,7 +41,10 @@ on:
     # files and decides whether Bazel builds what was patched. Every flow
     # holds the exact document socket-patch writes about its build, patched
     # or not, so a change to how a document is built or worded
-    # starts the legs of every ecosystem. Nothing else that
+    # starts the legs of every ecosystem. `bazel/` also says which lock a
+    # hub reads, for the refusal of vendored mode beside such a hub
+    # (vendor/bazel_hub.rs), which vendor/refusals.rs hands to every
+    # command. Nothing else that
     # another ecosystem's flow owns is here, so any other change to one
     # ecosystem starts that ecosystem's legs only.
     #
@@ -71,9 +74,12 @@ on:
       - 'crates/socket-patch-core/src/utils/python_lock.rs'
       - 'crates/socket-patch-core/src/utils/requirements.rs'
       - 'crates/socket-patch-core/src/vendor/lock_inventory/pypi.rs'
+      - 'crates/socket-patch-core/src/vendor/pypi.rs'
       - 'crates/socket-patch-core/src/vendor/pypi_distribution.rs'
       - 'crates/socket-patch-core/src/vendor/pypi_requirements.rs'
       - 'crates/socket-patch-core/src/vendor/pypi_wheel.rs'
+      - 'crates/socket-patch-core/src/vendor/bazel_hub.rs'
+      - 'crates/socket-patch-core/src/vendor/refusals.rs'
       - 'crates/socket-patch-core/src/vex/discover/pypi_other.rs'
       - 'crates/socket-patch-core/src/bazel/**'
       - 'crates/socket-patch-core/src/vex/**'
@@ -105,9 +111,12 @@ on:
       - 'crates/socket-patch-core/src/utils/python_lock.rs'
       - 'crates/socket-patch-core/src/utils/requirements.rs'
       - 'crates/socket-patch-core/src/vendor/lock_inventory/pypi.rs'
+      - 'crates/socket-patch-core/src/vendor/pypi.rs'
       - 'crates/socket-patch-core/src/vendor/pypi_distribution.rs'
       - 'crates/socket-patch-core/src/vendor/pypi_requirements.rs'
       - 'crates/socket-patch-core/src/vendor/pypi_wheel.rs'
+      - 'crates/socket-patch-core/src/vendor/bazel_hub.rs'
+      - 'crates/socket-patch-core/src/vendor/refusals.rs'
       - 'crates/socket-patch-core/src/vex/discover/pypi_other.rs'
       - 'crates/socket-patch-core/src/bazel/**'
       - 'crates/socket-patch-core/src/vex/**'

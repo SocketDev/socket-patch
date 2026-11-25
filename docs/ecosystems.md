@@ -19,10 +19,10 @@ below is about what a package manager installs and builds.
 | Ecosystem | agent (`--mode agent`) | vendored (`--mode vendored`) | hosted (`--mode hosted`) |
 |-----------|------------------------|------------------------------|--------------------------|
 | npm (`npm`) — pnpm / yarn / berry / bun / vlt | ✅ any install layout, vlt's `node_modules/.vlt` store included (every store copy, copy-on-write) | ✅ seven lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun text `bun.lock` lockfileVersion 0/1/2/3 and native binary `bun.lockb` revisions 1/2/3 (binary locks stay binary; text workspace vendoring requires lockfileVersion 2 — see [Bun compatibility](testing/bun-compatibility.md)), vlt `vlt-lock.json` lockfileVersion 0/1 (patched package directories for direct dependencies of the root or a workspace member; transitive targets refused — see [vlt notes](#npm-vlt-notes)). Rush monorepos on pnpm 9 and newer are wired through `pnpm-config.json` and each directly-depending project's `package.json` — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun, vlt (`vlt-lock.json` without `lockfileVersion`, 0 or 1) — pnpm, berry, bun and vlt carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) and [vlt notes](#npm-vlt-notes) |
-| PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ in place | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; Pipenv 2023.7.9+ exports the vendored wheel without a hash, so `pipenv requirements --hash` output fails pip's hash-checking mode — `pypi_pipenv_hash_export_unsupported`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
+| PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ in place | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; Pipenv 2023.7.9+ exports the vendored wheel without a hash, so `pipenv requirements --hash` output fails pip's hash-checking mode — `pypi_pipenv_hash_export_unsupported`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). Declined where a rules_python hub of a Bazel workspace reads the file, see [Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode) | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
 | pixi (`pypi`) — the Python packages of a pixi project, from conda channels or PyPI | ✅ in place, in every environment under `.pixi/envs`: PyPI wheels and pure-Python conda packages (compiled conda packages are not supported yet and are skipped) — see [PyPI: pixi projects](#pypi-pixi-projects) | ❌ refused (`pypi_no_requirements` / `pypi_pyproject_only`, which name agent mode) | ❌ nothing rewritten (`redirect_pypi_pixi_project` names agent mode) |
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum); needs cargo 1.68+ (sparse registries) — a project whose `rust-version` or `rust-toolchain[.toml]` declares an older cargo is refused (`redirect_cargo_old_cargo`), use `--mode vendored`; direct dependencies only — a crate another dependency also pulls in is refused, use `--mode vendored`; a crate the user overrides with `[patch]` (path, git or another registry) is refused too, the override is left alone; a `cargo vendor` or `cargo local-registry` project (crates.io replaced by an on-disk source in the project's, a parent directory's or `$CARGO_HOME`'s `.cargo/config*`) is refused, use agent mode; with no `Cargo.lock` the graph is unknown, so only a project whose sole dependency is the patched crate is redirected; in a Bazel workspace a crate is not pinned while a rules_rust hub reads the project's Cargo files without its cargo config (`redirect_cargo_bazel_config_unread`), see [Bazel workspaces: Cargo](#bazel-workspaces-cargo) |
-| RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (a CRLF `Gemfile.lock`, as a `core.autocrlf` checkout leaves it, is edited and reverted in its own line ending, and a lock mixing CRLF and LF fails closed; a gem locked as precompiled platform gems is vendored from prebuilt patched platform gems, see [Ruby gems: native extensions](#ruby-gems-native-extensions); `Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write) | ✅ a `source:` option on the gem's own declaration, the lock converged to match (see [Ruby gems: hosted mode](#ruby-gems-hosted-mode)) — edits `gems.rb` + `gems.locked` or `Gemfile` + `Gemfile.lock`, whichever the project holds (a `Gemfile` + `gems.rb` twin is refused with `redirect_gem_twin_manifest_ambiguous`: bundler 1.x loads the `Gemfile`, bundler ≥ 2 loads `gems.rb`, and nothing in the project says which bundler installs it; bundler 4's `BUNDLE_LOCKFILE` (environment, app config or global config) naming any other lock is refused with `redirect_gem_bundle_lockfile_unsupported`, as is vendoring with `gemfile_not_loaded`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from `.bundle/config` (which outranks the environment, as in bundler), the environment, or the global `~/.bundle/config` / `$BUNDLE_USER_CONFIG` (lowest, as in bundler) is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); a Bundler all-source, exact-source or hostname mirror in app config or the scan environment can capture the patch registry, so the redirect is refused with `redirect_gem_mirror_overrides_source` without printing mirror URLs (scope mirrors to `mirror.https://rubygems.org`; user-global config and mirrors set only in a later install environment are not inspected); the `CHECKSUMS` pin needs bundler ≥ 2.6 (an older lock is still pinned by source and installs frozen; the run says once, with `redirect_gem_no_checksums_section`, that it cannot record the checksums); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is replaced with the verified patched gem when it is the project's own, else flagged `redirect_gem_stale_install` with the remedy (see "Ruby gems: gems already installed" below and CLI_CONTRACT.md's "Gem stale-install guard"). In a Bazel workspace whose rules_ruby call holds the gem to another sha256 in `gem_checksums`, or has a `gem_checksums` that is not written out in the call, nothing is written for it (`redirect_bazel_gem_checksums_pinned`); see [Bazel workspaces: RubyGems](#bazel-workspaces-rubygems) |
+| RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (a CRLF `Gemfile.lock`, as a `core.autocrlf` checkout leaves it, is edited and reverted in its own line ending, and a lock mixing CRLF and LF fails closed; a gem locked as precompiled platform gems is vendored from prebuilt patched platform gems, see [Ruby gems: native extensions](#ruby-gems-native-extensions); `Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write); declined where a rules_ruby hub of a Bazel workspace reads the pair, see [Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode) | ✅ a `source:` option on the gem's own declaration, the lock converged to match (see [Ruby gems: hosted mode](#ruby-gems-hosted-mode)) — edits `gems.rb` + `gems.locked` or `Gemfile` + `Gemfile.lock`, whichever the project holds (a `Gemfile` + `gems.rb` twin is refused with `redirect_gem_twin_manifest_ambiguous`: bundler 1.x loads the `Gemfile`, bundler ≥ 2 loads `gems.rb`, and nothing in the project says which bundler installs it; bundler 4's `BUNDLE_LOCKFILE` (environment, app config or global config) naming any other lock is refused with `redirect_gem_bundle_lockfile_unsupported`, as is vendoring with `gemfile_not_loaded`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from `.bundle/config` (which outranks the environment, as in bundler), the environment, or the global `~/.bundle/config` / `$BUNDLE_USER_CONFIG` (lowest, as in bundler) is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); a Bundler all-source, exact-source or hostname mirror in app config or the scan environment can capture the patch registry, so the redirect is refused with `redirect_gem_mirror_overrides_source` without printing mirror URLs (scope mirrors to `mirror.https://rubygems.org`; user-global config and mirrors set only in a later install environment are not inspected); the `CHECKSUMS` pin needs bundler ≥ 2.6 (an older lock is still pinned by source and installs frozen; the run says once, with `redirect_gem_no_checksums_section`, that it cannot record the checksums); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is replaced with the verified patched gem when it is the project's own, else flagged `redirect_gem_stale_install` with the remedy (see "Ruby gems: gems already installed" below and CLI_CONTRACT.md's "Gem stale-install guard"). In a Bazel workspace whose rules_ruby call holds the gem to another sha256 in `gem_checksums`, or has a `gem_checksums` that is not written out in the call, nothing is written for it (`redirect_bazel_gem_checksums_pinned`); see [Bazel workspaces: RubyGems](#bazel-workspaces-rubygems) |
 | Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [Go notes](#go-directory-replaces-and-gosum). Paid hosted patches are unsupported; `redirect_golang_unsupported` names the vendored remedy |
 | Maven (`maven`) — Maven and Gradle | ✅ in place in every copy the build consumes: each `~/.m2` copy it reads and each Gradle `files-2.1` copy; `~/.m2` `.sha1`/`.md5` sidecars are rewritten, Gradle copies get advisories; jar-member records swap in the patch service's whole jar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) | ✅ suffixed Maven repository (`<version>-socket.<hex8>` pin + `.mvn/maven.config` + fallback file repository) for every pom root, single-module or reactor, or Gradle 6.8+ same-GAV repository with settings wiring and SHA-256 checks (a root with both `pom.xml` and a Gradle build wires both); see [JVM vendoring](design/maven-vendoring.md) and [Gradle](#gradle) | ✅ fail-closed by a Socket-only `<version>-socket.<hex8>` suffix: pom projects get a pinned `<version>` (`${property}` versions are refused); Gradle 6.8+ builds get an owned settings script, lock-entry rewrites and a resolution tripwire — see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) |
 | sbt / Mill / scala-cli (`maven`) | ✅ Coursier caches (sbt 1.3+, sbt 2, Mill, scala-cli) and Ivy caches (sbt 0.13–1.2, `useCoursier := false`) patched in place, Coursier checksum sidecars resynced — see [Scala build tools](#scala-build-tools-sbt-mill-scala-cli) | ✅ sbt 0.13.18+: generated `socket-patch-vendor.sbt` over the committed suffixed `.socket/vendor/maven2` tree; scala-cli directory builds: owned `socket-patch.scala` + same-GAV `.socket/vendor/coursier` tree (Linux / macOS); Mill: not wired (agent or hosted guidance) | ✅ sbt 0.13.18+: one generated `socket-patch.sbt`, gated on sbt's own `sbt update` records; Mill / scala-cli: paste-able snippets only (`redirect_mill_manual_snippet`, `redirect_scala_cli_manual_snippet`) |
@@ -2193,6 +2193,11 @@ exits 0 and leaves a build that fails (the known problems below). What a cell sa
 - **Not supported**: socket-patch promises nothing about what a Bazel build holds after the
   mode ran, so do not use it for a package that Bazel builds. In most of these cells the
   patch does not reach the build, or the build breaks (see the known problems below).
+  Vendored mode for PyPI, RubyGems and Composer declines instead: the command exits 1 and
+  writes nothing. For PyPI and RubyGems that is where the call of the row reads a file the
+  run would rewrite
+  ([Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode)),
+  for Composer in every Bazel workspace ([Bazel workspaces: Composer](#bazel-workspaces-composer)).
 - **Supported**, for VEX: `socket-patch vex` and `--vex` say `not_affected` of a package the
   Bazel build takes patched, and `affected` of one whose patch Bazel does not build.
   [Bazel workspaces: VEX](#bazel-workspaces-vex) has the cases and the limits; a vendored gem
@@ -2274,12 +2279,10 @@ fails until one that may has rewritten it.
 
 Known problems. In each of these a command exits 0 today and the next Bazel build fails:
 
-- **Vendored mode for PyPI, RubyGems and NuGet.** The path of the committed copy means
-  nothing where Bazel runs: rules_python takes it for a package name, rules_ruby's
-  `bundle install` does not find it (`The path ... does not exist`), and rules_csharp reads
-  it as a URL (`Bad URL`, or a crash of Bazel 9.3.2). Run `socket-patch vendor --revert`,
-  then `socket-patch scan --mode hosted`. Of these builds a test of this repository runs the
-  PyPI one; the others were measured by hand on the three Bazel releases.
+- **Vendored mode for NuGet.** The path of the committed copy means nothing where Bazel
+  runs: rules_csharp reads it as a URL (`Bad URL`, or a crash of Bazel 9.3.2). Run
+  `socket-patch vendor --revert`, then `socket-patch scan --mode hosted`. Measured by hand on
+  the three Bazel releases; no test of this repository runs that build.
 - **Vendored mode for Composer, where its refusal is lifted or does not apply.** In a Bazel
   workspace vendored mode declines a Composer package:
   [Bazel workspaces: Composer](#bazel-workspaces-composer) has the refusal, what lifts it and
@@ -2390,6 +2393,9 @@ projects too. What the sections below then do for it:
 
 - Composer: vendored mode is declined until the lock names a vendored copy
   ([Bazel workspaces: Composer](#bazel-workspaces-composer)).
+- PyPI and RubyGems: vendored mode is declined where a hub call of the workspace reads the
+  project's lock, or may read it
+  ([Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode)).
 - Go, Cargo and Maven: the `.bazelignore` at the Bazel root gets two lines for each kind of
   copy under `.socket` that a run wrote: the Go module copies, the vendored crates of a crate
   hub, the jars that vendored mode keeps for a rules_jvm_external hub
@@ -3870,7 +3876,9 @@ project's directory, or where the build finds the copy all the same:
 
 socket-patch checks none of these. The switch is not Composer's alone: it lets vendored mode
 write for any package it would decline because the project is in a Bazel workspace, where the
-build may not find the vendored copy. The Composer refusal is the only such refusal today.
+build may not find the vendored copy. PyPI and RubyGems have such a refusal too, for a project
+whose lock a hub of the workspace reads: see
+[Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode).
 
 `vendor --revert` is never declined. Neither is a package of a project that uses vendored
 mode already, by a release before this refusal or with the flag:
@@ -3907,6 +3915,184 @@ Limits:
 
 [`e2e_bazel_build/composer.rs`](../crates/socket-patch-cli/tests/e2e_bazel_build/composer.rs)
 runs these flows on a real Bazel.
+
+## Bazel workspaces: PyPI and RubyGems vendored mode
+
+*Experimental: see [Bazel workspaces: what is supported](#bazel-workspaces-what-is-supported).*
+
+Two rulesets hand a lock of the checkout to Bazel through one call, a hub: rules_python's
+`pip.parse` reads requirements files, and rules_ruby's `ruby.bundle_fetch` reads a `Gemfile` and
+its lock. Each fetches what the file names into repositories of Bazel's own and builds from
+there. Vendored mode makes that file name the patched copy by a path under `.socket/vendor`,
+and neither ruleset builds from such a file:
+
+- **PyPI.** The package's line of `requirements.txt` becomes
+  `./.socket/vendor/pypi/<uuid>/<wheel> --hash=sha256:...`. rules_python 2.5.0-rc4 makes the
+  name of a repository from that path, and the build of everything the hub serves fails with
+  `invalid user-provided repo name 'pip_311__/_socket/vendor/pypi/<uuid>/<wheel>'`.
+- **RubyGems.** The gem's declaration in `Gemfile` gets a `path:` and its entry of
+  `Gemfile.lock` moves into a `PATH` section. rules_ruby 1.0.0-rc2 copies the two files into a
+  repository of Bazel's and runs `bundle install` there, which fails with
+  `The path .../.socket/vendor/gem/<uuid>/<name>-<version> does not exist.`
+
+Both were measured on Bazel 9.3.2, 8.8.2 and 7.7.2, after a `scan --mode vendored` that exited
+0 and reported the package vendored. So vendored mode now declines such a package, where the
+files of the workspace show that a hub reads the file it would rewrite.
+
+**What is read.** The project is in a Bazel workspace by the lookup of
+[Bazel workspaces: `.bazelignore`](#bazel-workspaces-bazelignore). There socket-patch reads
+`MODULE.bazel` and the files it includes, and the `WORKSPACE` file, as
+[Bazel workspaces: VEX](#bazel-workspaces-vex) describes; nothing is evaluated and no Bazel is
+run. A package is declined when one of these calls names, by a label written out as a string,
+a file of the package's project that the vendored run for that package would point at a copy:
+
+| Call | Attributes | Files of the project that count |
+|---|---|---|
+| rules_python `pip.parse` | `requirements_lock`, `requirements_by_platform`, `requirements_darwin`, `requirements_linux`, `requirements_windows`, `uv_lock` | `requirements.txt` and each file it includes with `-r` (in the project), as one set, where the run writes a requirements file; `uv.lock` in a uv project |
+| rules_ruby `ruby.bundle_fetch` | `gemfile_lock`, `gemfile` | `Gemfile`, `Gemfile.lock` |
+| any call of the `WORKSPACE` file that passes one of those attributes (`pip_parse`, `rb_bundle_fetch`) | the same; a label `@<name>//...` names the main repository where the file says `workspace(name = "<name>")` | the same |
+
+The `WORKSPACE` file counts unless the checkout names a Bazel release of 9 or later, which
+never reads one: a file that a move to Bzlmod left behind can still name the lock, and
+stands in no build's way. The release is the one `.bazelversion` names, or
+`USE_BAZEL_VERSION` in `.bazeliskrc`, and only three numbers name one (`9.3.2`). With an
+older release, with `latest` or a release candidate, and with neither file, the
+`WORKSPACE` file counts, because a Bazel 7 or 8 may build the checkout. Where it does not
+count, it is no reason to decline and no doubt, whatever it holds.
+
+Which files a run writes depends on the tool that locks the Python project, as in the matrix
+at the top:
+
+- A project with no tool lock is wired through its requirements files, and so is one
+  whose only tool lock is a `poetry.lock` or `pdm.lock` that resolves no package. They count
+  as one set: a package is declined when the hub reads any file of the set, also one that
+  does not pin it, because that file can bring in the rewritten one with `-r`.
+- A uv, Pipenv or PEP 751 lock is wired together with a pin of the same package in the
+  requirements files beside it. So those files count for a package they name, and not for
+  one they do not name.
+- A Poetry or PDM lock is wired alone. A hub that reads the requirements file exported from
+  it stands in no run's way, and the package is vendored as it is without Bazel. Bazel goes on
+  building the registry's package from that file; `socket-patch vex` does not say so yet (see
+  the limits of [Bazel workspaces: VEX](#bazel-workspaces-vex)). The one exception is a
+  requirements file that holds the package by a URL, which is what a hosted pin is: a
+  vendored run that takes the pin over restores that line, so the files count and the
+  package is declined.
+
+Every such call counts, also one that may not run (in a comprehension, behind an `and`). The
+refusal is for every package whose run would write a file the call names, since the lock is
+the project's, with one exception: a package that is already vendored (see below).
+
+**What an uncertain reading does.** Where something of the workspace's files cannot be read
+with certainty, and a call of the hub may be behind that, every package whose run would write
+one of the files above is declined, in every project of the workspace, because the call may
+read its lock. That is:
+
+- a call of the hub whose file is not a plain string (a constant, a concatenation), or one
+  that passes `*` or `**`;
+- a hub proxy that is handed to anything but `use_repo` or `inject_repo`;
+- a module file that is missing or cannot be read, or a statement of one that cannot be
+  read, where the workspace calls the hub or a file that was read names its ruleset (a
+  `bazel_dep` on rules_python or rules_ruby, or a `use_extension` of the hub's `.bzl` file);
+- a root `MODULE.bazel` that cannot be read at all, or a `WORKSPACE` file that cannot be
+  and counts (see above).
+
+A file cannot be read here when one byte of it is not UTF-8 (a name in a comment is enough),
+or when it is larger than 1 MiB; Bazel builds both. Going on there can leave a broken build
+behind a command that exited 0; declining costs a vendored run, which the switch below brings
+back. A workspace whose root `MODULE.bazel` and `WORKSPACE` file were read (or are not
+there, or the `WORKSPACE` file does not count), and in which no file that was read calls
+the hub or names its ruleset, is never declined for it, whatever else cannot be read.
+
+**What you see.** Every command that would vendor the package reports it `failed` with
+`vendor_pypi_bazel_hub` or `vendor_gem_bazel_hub` and exits 1: `scan --mode vendored`,
+`get --mode vendored` and `vendor`. It writes nothing and downloads no patch, and a
+package that is pinned hosted stays pinned (`vendor` reports `eject_refused`). With
+`--dry-run`, `scan` and `get` list the package as one the run would refuse and exit 0;
+`vendor --dry-run` reports the refusal and exits 1. The message names the call with its file
+and line, the lock, and the mode to use instead:
+
+```
+`pip.parse` (MODULE.bazel:15) of the Bazel workspace at /repo names requirements.txt; vendored mode makes the lock name the patched copy by a path under .socket/vendor, and rules_python fails the build on such a lock; use `--mode hosted`, which names the patched package by a URL that rules_python fetches, or pass `--allow-vendored-in-bazel` if no build takes the packages of this project from rules_python
+```
+
+For an uncertain reading the message names the file, the line and the reason where the
+call stands. Hosted mode pins the patch in the same file, as a wheel URL with its sha256 or
+as a gem source, and both rulesets build it: that is tested on the three Bazel releases, in
+the checkout where vendored mode was declined. For a gem that holds for a
+`ruby.bundle_fetch` without `gem_checksums`, as the message for a gem says. Where a
+`gem_checksums` of the call holds the gem to another sha256, or is not written out in the
+call, hosted mode writes nothing for the gem and its warning names the way on: see
+[Bazel workspaces: RubyGems](#bazel-workspaces-rubygems).
+
+**Where nothing changes.** A project in no Bazel workspace, a workspace that calls neither
+hub, and a package whose run writes no file that a call names are vendored as before, with
+the same output and the same files: a Python or Ruby project beside the one whose lock the
+hub reads, a Poetry or PDM project whose exported requirements file the hub reads, or a
+project that keeps a `requirements.txt` for pip while the hub reads a `requirements_lock.txt`
+that socket-patch does not rewrite. In the last two cases Bazel goes on building the
+unpatched package from its own file, as before.
+
+Vendored mode goes on when you say so, with `--allow-vendored-in-bazel` or
+`SOCKET_ALLOW_VENDORED_IN_BAZEL=1`: for a hub that no build of yours uses, for a `WORKSPACE`
+file that your Bazel does not read while the checkout does not say so (Bazel 8 reads it
+only with `--enable_workspace`; for Bazel 9, naming the release in `.bazelversion` is
+enough, and no switch is needed), or for a `ruby.bundle_fetch` to which you add every file
+of the vendored gem as `srcs`, which rules_ruby copies beside the Gemfile (no test here
+builds that). socket-patch checks none of these. It is the switch of
+[Bazel workspaces: Composer](#bazel-workspaces-composer).
+
+`vendor --revert` is never declined. Neither is a package that is already vendored: where
+the file that the call names already names the copy of the same patch
+(`.socket/vendor/pypi/<uuid>/`, `.socket/vendor/gem/<uuid>/`), a vendored run adds nothing to
+what the hub reads. So a project that was vendored with the switch, or by an earlier release,
+keeps passing its runs without the switch, a `scan` or `get` with no `--mode` included, which
+runs in vendored mode there. A new patch for that package, or another package, is declined
+until the run has the switch. Where the calls name more than one file of the project, each
+of them that holds the package has to name the copy: a `uv.lock` that was locked again
+beside a vendored requirements file does not, and the package is declined. Where the reading
+is uncertain no file is known to be the hub's, so nothing is let through: every vendored run
+there needs the switch.
+
+Passing such a run does not mean that the build is the patched one. A build that takes the
+project's packages from the hub fails on a vendored PyPI package, and on a vendored gem
+unless the call lists the copy's files. For a PyPI package `vex` says of that state that the
+package is `affected` ([Bazel workspaces: VEX](#bazel-workspaces-vex)); the way out is
+`vendor --revert`, then `scan --mode hosted`.
+
+Limits:
+
+- Not seen, so vendored mode goes on as before and the build can break: a hub call in a
+  `.bzl` file that a `WORKSPACE` file loads, a hub that another Bazel module declares,
+  another tag or another ruleset that reads the same file under Bzlmod (rules_ruby's older
+  `ruby.bundle`, rules_pycross, aspect_rules_py), a `WORKSPACE` call that hides its
+  arguments behind `**`, the `pip_install(requirements = ...)` of an older rules_python in a
+  `WORKSPACE` file, a Bazel root that the lookup does not reach, a `WORKSPACE` file of a
+  checkout that names Bazel 9 or later while an older Bazel builds it (`USE_BAZEL_VERSION`
+  in the environment outranks both files and is not read), and a hub whose call and whose
+  `bazel_dep` are both in an included file that cannot be read, while the files that were
+  read name neither.
+- Declined although the build would pass: a `WORKSPACE` file that names the lock while the
+  Bazel in use does not read that file and the checkout names no release of 9 or later, a
+  hub call that never runs, and a workspace that does not use the ruleset while its root
+  `MODULE.bazel` or its `WORKSPACE` file cannot be read here, or while a file that was read
+  names the ruleset and another cannot be read.
+- Declined although the run would write nothing to the file the call names: a package that
+  is already vendored where the file that names its copy is not the one the call names (a
+  requirements file that the named one includes with `-r`; the `Gemfile` when the call names
+  the lock too and the lock does not name the copy), any already vendored package where the
+  reading is uncertain, a package of a uv, Pipenv or PEP 751 project that the
+  requirements file names in a form that is not wired with the lock (a range, extras), and a
+  package of a project with no tool lock where the hub reads a file of the requirements set
+  that neither pins the package nor brings in the file that does.
+- Only the `Gemfile` spelling is looked for, as vendored mode wires no `gems.rb` project.
+- A `pip.parse` that names a `uv.lock` is declined by the rule above, not by a measurement:
+  no build was run on a vendored `uv.lock`.
+- `repair` is not gated: it replaces a damaged copy of a package that is vendored already,
+  and leaves the lock as it is.
+
+[`e2e_bazel_build/pypi.rs`](../crates/socket-patch-cli/tests/e2e_bazel_build/pypi.rs) and
+[`ruby.rs`](../crates/socket-patch-cli/tests/e2e_bazel_build/ruby.rs) run the refusal, the
+switch and hosted mode on a real Bazel.
 
 ## Ruby gems: hosted mode
 
@@ -4496,7 +4682,13 @@ package that it is `affected`, not that it is patched:
   the name of a project, and the build of everything the hub serves fails (same three
   releases). A vendored npm tarball is built by rules_js and a vendored crate by rules_rust,
   and each keeps its statement. So do a vendored gem and a vendored NuGet package, for
-  another reason: no test here runs the build of one yet, so nothing is said of it.
+  other reasons: rules_ruby builds a gem only when the call lists every file of the copy
+  among its `srcs`, which is not read, and no test here runs the build of a NuGet package
+  yet, so nothing is said of either.
+  Vendored mode declines a PyPI package and a gem by default where the hub reads the file
+  ([Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode)),
+  so this is the state of a project vendored with `--allow-vendored-in-bazel` or by an
+  earlier release.
 
 Each advisory of such a patch gets a statement of the package's own with the status
 `affected`. It names that package alone under the product (and as a product of its own), and its `action_statement` says
@@ -4659,9 +4851,10 @@ the build is broken):
   `-r`. Measured for PyPI, where the build fails.
 - **Vendored mode for RubyGems** beside `ruby.bundle_fetch`. rules_ruby 1.0.0-rc2 runs
   `bundle install` in a repository that holds the Gemfile, its lock and the files the call
-  lists as `srcs`, so the path of the copy does not exist there. Read from its source and
-  measured by hand, where the build fails; no test runs it yet, so the statement is left as
-  it is.
+  lists as `srcs`, so the path of the copy does not exist there unless every file of the copy
+  is listed. Measured on the three releases: the build fails, and the statement still says
+  `not_affected`. Vendored mode declines such a gem by default, so this is the state of a
+  project vendored with `--allow-vendored-in-bazel` or by an earlier release.
 - **Vendored mode for NuGet** beside `nuget.from_lock`. rules_csharp 0.5.0 reads the path of
   the committed copy as a URL. Measured by hand, where the build fails; no test runs it yet,
   so the statement is left as it is.

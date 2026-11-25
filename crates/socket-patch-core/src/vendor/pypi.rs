@@ -1637,6 +1637,51 @@ fn sibling_lock(flavor: PypiFlavor) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// The files of the project that a vendored run for `purl` may point at the
+/// patched copy and that a hub of a Bazel workspace can be given
+/// ([`super::bazel_hub`]), each by its path from the project. `uv.lock`
+/// where it governs. The requirements files where they are what is wired,
+/// and where they name the package beside a uv, Pipenv or Python lock,
+/// which is wired together with a pin of theirs
+/// ([`super::pypi_requirements::sibling_names_package`]). Beside a Poetry
+/// or PDM lock, which is wired alone, only where they hold the package by a
+/// URL: that is a hosted pin, which a run that takes it over restores
+/// ([`super::pypi_requirements::sibling_names_package_by_url`]). None for a
+/// project the router refuses, where nothing is written.
+///
+/// The requirements files are counted as one set, the file a hub names and
+/// the files it brings in with `-r` alike, and not only the files that pin
+/// the package: a file the hub reads can reach the rewritten one through an
+/// include.
+pub(super) async fn hub_files(project_root: &Path, purl: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    let Some((name, version)) = parse_pypi_purl(purl) else {
+        return files;
+    };
+    let name = canonicalize_pypi_name(&name);
+    let Ok((flavor, _)) = detect_pypi_flavor(project_root, Some((&name, &version))).await else {
+        return files;
+    };
+    let requirements = match flavor {
+        PypiFlavor::Requirements => true,
+        _ if sibling_lock(flavor).is_none() => {
+            super::pypi_requirements::sibling_names_package_by_url(project_root, &name).await
+        }
+        _ => super::pypi_requirements::sibling_names_package(project_root, &name).await,
+    };
+    if requirements {
+        // The walk names `requirements.txt` first; where it fails, that file
+        // alone stands for the set.
+        let root = || vec![crate::formats::governing_locks::PYPI_REQUIREMENTS.to_string()];
+        let included = super::requirements_include_names(project_root).await;
+        files = included.unwrap_or_else(|_| root());
+    }
+    if flavor == PypiFlavor::UvProject {
+        files.push("uv.lock".to_string());
+    }
+    files
+}
+
 /// How the sibling notes name the requirements file wired with `flavor`'s
 /// lock: an export of a Pipenv or uv lock, but the file a `pip lock`
 /// pylock was locked from (#1758).
