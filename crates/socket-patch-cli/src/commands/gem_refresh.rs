@@ -1683,10 +1683,14 @@ mod tests {
         }
     }
 
-    /// `<home>/gems/<name>-1.0.0` created on disk, as a stale gem.
+    /// `<home>/gems/<name>-1.0.0` created on disk with its
+    /// `specifications` entry, as a stale gem.
     fn installed(name: &str, home: &Path, project_local: bool) -> StaleGem {
         let dir = home.join("gems").join(format!("{name}-1.0.0"));
         std::fs::create_dir_all(&dir).unwrap();
+        let specs = home.join("specifications");
+        std::fs::create_dir_all(&specs).unwrap();
+        std::fs::write(specs.join(format!("{name}-1.0.0.gemspec")), "").unwrap();
         StaleGem {
             purl: format!("pkg:gem/{name}@1.0.0"),
             leaf: format!("{name}-1.0.0"),
@@ -2235,6 +2239,149 @@ mod tests {
             summary.bullets[0].ends_with(" && bundle install`."),
             "{}",
             summary.bullets[0]
+        );
+    }
+
+    /// A pass that left `gem`'s installed copy for `reason`.
+    fn failed_for(gem: &StaleGem, reason: &str) -> Attempt {
+        let (dir, _) = gem.installed.clone().unwrap();
+        Attempt {
+            left: BTreeMap::from([(dir, Why::Failed(reason.to_string()))]),
+            ..Attempt::default()
+        }
+    }
+
+    /// #2242: a native gem in the tree of a Ruby that is not on `PATH`
+    /// (`vendor/bundle/ruby/3.2.0` after an upgrade to Ruby 3.3).
+    /// `bundle install` installs into the running Ruby's gem home, so an
+    /// `rm -f` of the gemspec and archive leaves the gem dir where it is,
+    /// with no gemspec. The remedy removes the gem dir as well, and the
+    /// retry it names is one that can work.
+    #[tokio::test]
+    async fn a_copy_no_ruby_owns_is_removed_with_its_gem_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("vendor/bundle/ruby/3.2.0");
+        let gem = installed("json", &home, true);
+        let (dir, _) = gem.installed.clone().unwrap();
+        let spec = home.join("specifications/json-1.0.0.gemspec");
+        let cache = home.join("cache/json-1.0.0.gem");
+        std::fs::create_dir_all(home.join("cache")).unwrap();
+        std::fs::write(&cache, "").unwrap();
+        let reason = "its native extension could not be rebuilt: no Ruby owning this install \
+                      was found (/opt/ruby-3.3/bin/ruby builds into /p/ruby/3.2.0/extensions/\
+                      x86_64-linux/3.3.0/json-1.0.0, but the installed extension is /p/ruby/\
+                      3.2.0/extensions/x86_64-linux/3.2.0/json-1.0.0 (another Ruby's))";
+        let policy = policy(tmp.path(), true, false, false);
+        let command = format!(
+            "`rm -rf {} {} {} && bundle install`",
+            dir.display(),
+            spec.display(),
+            cache.display()
+        );
+
+        let pass = failed_for(&gem, reason);
+        let out = report(
+            Direction::Patched,
+            std::slice::from_ref(&gem),
+            &pass,
+            &policy,
+        );
+        let summary = out.summary.unwrap();
+        assert_eq!(summary.bullets.len(), 1);
+        let bullet = &summary.bullets[0];
+        assert!(bullet.contains(&command), "{bullet}");
+        assert!(
+            bullet.contains(
+                "Re-run `socket-patch scan` with the Ruby that installed the gem first on \
+                 `PATH` to retry, or run "
+            ),
+            "{bullet}"
+        );
+        assert!(
+            !bullet.contains("Re-run `socket-patch scan` to retry"),
+            "{bullet}"
+        );
+        let (code, detail) = &out.warnings[0];
+        assert_eq!(*code, "redirect_gem_stale_install");
+        let removed = format!(
+            "remove {}, {}, {} and run `bundle install`",
+            dir.display(),
+            spec.display(),
+            cache.display()
+        );
+        assert!(detail.contains(&removed), "{detail}");
+        assert!(
+            !detail.contains("Re-run `socket-patch scan` to retry"),
+            "{detail}"
+        );
+
+        // An unwind names no re-run, and the same paths.
+        let out = report(
+            Direction::Upstream,
+            std::slice::from_ref(&gem),
+            &pass,
+            &policy,
+        );
+        let bullet = &out.summary.unwrap().bullets[0];
+        assert!(bullet.contains(&format!("Run {command}")), "{bullet}");
+        assert!(!bullet.contains("Re-run"), "{bullet}");
+    }
+
+    /// #2242: a gem dir whose gemspec is already gone (what the `rm -f`
+    /// remedy left in another Ruby's tree). A re-run fails the same way
+    /// and the files of the old remedy are not there to remove: the
+    /// remedy is the gem dir, and what is still beside it.
+    #[tokio::test]
+    async fn a_gem_dir_without_its_gemspec_is_the_thing_to_remove() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("vendor/bundle/ruby/3.2.0");
+        let gem = installed("racc", &home, true);
+        let (dir, _) = gem.installed.clone().unwrap();
+        std::fs::remove_file(home.join("specifications/racc-1.0.0.gemspec")).unwrap();
+        let reason = "its installed gemspec is unreadable: No such file or directory (os error 2)";
+        let policy = policy(tmp.path(), true, false, false);
+        let pass = failed_for(&gem, reason);
+        let out = report(
+            Direction::Patched,
+            std::slice::from_ref(&gem),
+            &pass,
+            &policy,
+        );
+        let summary = out.summary.unwrap();
+        let bullet = &summary.bullets[0];
+        assert!(
+            bullet.contains(&format!(
+                "racc 1.0.0. Run `rm -rf {} && bundle install`",
+                dir.display()
+            )),
+            "{bullet}"
+        );
+        assert!(!bullet.contains("Re-run"), "{bullet}");
+        assert!(!bullet.contains(".gemspec"), "{bullet}");
+        let (_, detail) = &out.warnings[0];
+        assert!(
+            detail.contains(&format!(
+                "Remove {} and run `bundle install`",
+                dir.display()
+            )),
+            "{detail}"
+        );
+        assert!(!detail.contains("Re-run"), "{detail}");
+
+        // A default gem's entry is under `specifications/default/`: the
+        // copy is installed, and the remedy is the one it was.
+        std::fs::create_dir_all(home.join("specifications/default")).unwrap();
+        std::fs::write(home.join("specifications/default/racc-1.0.0.gemspec"), "").unwrap();
+        let out = report(
+            Direction::Patched,
+            std::slice::from_ref(&gem),
+            &pass,
+            &policy,
+        );
+        let bullet = &out.summary.unwrap().bullets[0];
+        assert!(
+            bullet.contains("Re-run `socket-patch scan` to retry, or run `rm -f "),
+            "{bullet}"
         );
     }
 
