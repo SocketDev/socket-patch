@@ -1106,10 +1106,12 @@ pub async fn run(args: VendorArgs) -> i32 {
         // ledgers and lockfiles already wire. Same contract as `apply --vex`
         // with no manifest: nothing referenced anywhere keeps exit 0; any
         // other VEX failure flips the exit; a dry run skips generation.
+        // An unreadable ledger is not "no entries": say so (stderr, or
+        // `warnings[]` under --json) instead of the calm nothing-to-vendor
+        // line.
+        let ledger = load_state(&args.common.cwd).await;
         if !args.common.json && !args.common.silent {
-            // An unreadable ledger is not "no entries": say so (stderr)
-            // instead of the calm nothing-to-vendor line.
-            match load_state(&args.common.cwd).await {
+            match &ledger {
                 Ok(state) => println!("{}", no_manifest_message(state.entries.len())),
                 Err(e) => eprintln!("{}", no_manifest_ledger_unreadable(&e.to_string())),
             }
@@ -1126,6 +1128,12 @@ pub async fn run(args: VendorArgs) -> i32 {
             env.status = Status::NoManifest;
             env.dry_run = args.common.dry_run;
             env.warnings.extend(commit_recovery);
+            env.warnings.extend(
+                ledger
+                    .as_ref()
+                    .err()
+                    .map(|e| no_manifest_ledger_unreadable_warning(&e.to_string())),
+            );
             match vex_result.as_ref() {
                 Some(ManifestlessVex::Written(summary)) => {
                     env.vex = Some(VexSummary {
@@ -2679,6 +2687,18 @@ fn no_manifest_ledger_unreadable(err: &str) -> String {
     format!(
         "Warning: No manifest to vendor from, and the vendor ledger could not be read: \
          {err}\n  Run `socket-patch repair` to check the vendored artifacts."
+    )
+}
+
+/// [`no_manifest_ledger_unreadable`] for the `--json` envelope, which
+/// would otherwise be a bare `noManifest`.
+fn no_manifest_ledger_unreadable_warning(err: &str) -> RunWarning {
+    RunWarning::new(
+        "vendor_state_unreadable",
+        format!(
+            "no manifest to vendor from, and the vendor ledger could not be read: {err}; \
+             run `socket-patch repair` to check the vendored artifacts"
+        ),
     )
 }
 

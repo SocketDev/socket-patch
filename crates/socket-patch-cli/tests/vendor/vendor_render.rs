@@ -284,6 +284,41 @@ async fn human_missing_manifest_with_ledger_names_the_tracked_entries() {
 /// A pnpm project (lockfileVersion 9.0): package.json + pnpm-lock.yaml +
 /// installed node_modules/left-pad + the same staged `.socket` blob as the
 /// npm fixture. The lock grammar mirrors core's pnpm_lock spike fixtures.
+/// Plain vendor with no manifest and a ledger that cannot be read (a merge
+/// conflict left in the committed file): still the exit-0 no-op, and both
+/// modes say that the ledger was not read. Under `--json` the envelope was
+/// a bare `noManifest`, the shape of a project with nothing vendored.
+#[test]
+fn missing_manifest_with_an_unreadable_ledger_says_so_in_both_modes() {
+    let fx = npm_fixture();
+    std::fs::remove_file(fx.manifest_path()).unwrap();
+    std::fs::create_dir_all(fx.vendor_dir()).unwrap();
+    std::fs::write(fx.state_path(), "{\n<<<<<<< HEAD\n").unwrap();
+
+    let (code, stdout, stderr) = human_vendor(&fx, &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("the vendor ledger could not be read: corrupt "),
+        "{stderr}"
+    );
+
+    let (code, stdout, stderr) = human_vendor(&fx, &["--json"]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let env: Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(env["status"], "noManifest", "{env:#}");
+    let warnings = env["warnings"].as_array().cloned().unwrap_or_default();
+    let codes: Vec<&str> = warnings
+        .iter()
+        .map(|w| w["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(codes, ["vendor_state_unreadable"], "{env:#}");
+    let detail = warnings[0]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("the vendor ledger could not be read: corrupt "),
+        "{detail}"
+    );
+}
+
 fn pnpm_fixture() -> NpmFixture {
     let fx = npm_fixture();
     std::fs::remove_file(fx.lock_path()).unwrap();
