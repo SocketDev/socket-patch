@@ -738,8 +738,26 @@ impl StandIn {
             .enable_all()
             .build()
             .expect("a runtime for the stand-in");
-        let server = runtime.block_on(MockServer::start());
+        // A server of its own, not one of wiremock's pool: it stops when
+        // the stand-in is dropped.
+        let server = runtime.block_on(MockServer::builder().start());
         StandIn { server, runtime }
+    }
+
+    /// Stops the server: nothing answers at its origin any more, which is
+    /// what this gives.
+    pub fn stop(self) -> String {
+        let origin = self.origin();
+        drop(self);
+        let address = origin.trim_start_matches("http://").to_string();
+        let answers = || std::net::TcpStream::connect(&address).is_ok();
+        for _ in 0..100 {
+            if !answers() {
+                return origin;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("the stand-in still answers at {origin}");
     }
 
     /// `http://127.0.0.1:<port>`.
@@ -948,6 +966,14 @@ impl Cell {
         std::fs::write(file, rules.join("\n") + "\n")
             .unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
         self.downloads = Some(rules.to_vec());
+    }
+
+    /// Whether the repository cache of this cell, which its twins share,
+    /// holds a download with the sha256 `sha256`: what Bazel's downloader
+    /// keeps of a file it fetched under a checksum.
+    pub fn cached(&self, sha256: &str) -> bool {
+        let files = self.scratch.repository_cache.join("content_addressable");
+        files.join("sha256").join(sha256).exists()
     }
 
     /// Write a file of the workspace copy.

@@ -1439,6 +1439,12 @@ async fn run_check(args: &VendorArgs) -> i32 {
                 Err(e) => failure = Some(e),
             }
         }
+        // The copy of the patch that a hub of a Bazel workspace builds,
+        // beside the artifact the entry records or as that artifact.
+        let hub = vendor::jvm::layout::ledger_ecosystem(&entry.ecosystem) == "maven";
+        if failure.is_none() && hub {
+            failure = vendor::maven_repo::check_hub(root, entry).await.err();
+        }
         // The npm check names the exact unwired lock entry, so it runs
         // before the generic liveness rule below.
         if failure.is_none() && entry.ecosystem == "npm" {
@@ -1739,31 +1745,46 @@ pub(crate) async fn gem_takeover_refusals_for<'a>(
     refusals
 }
 
-/// The hosted pins a vendored run takes over, of `pins`. Vendored mode
-/// patches no rules_jvm_external hub of a Bazel workspace, so the entry
-/// that hosted mode keeps for a pin in the block of the root
-/// `MODULE.bazel` is none of its wiring: the entry stays as it is, and the
-/// Bazel build keeps the patched jar. A pin that only such an entry wires
-/// is no takeover at all. `rollback` and `remove` take the entry out.
+/// The file of the block that hosted and vendored mode keep for the hubs
+/// of a Bazel workspace.
+use socket_patch_core::bazel::maven::FILE as BLOCK_FILE;
+
+/// The hosted pins whose upstream entry a vendored run restores before it
+/// vendors, of `pins`. The entry that hosted mode keeps for a pin in the
+/// block of the root `MODULE.bazel` is not restored: where vendored mode
+/// patches the hub, it puts its own entry in the place of that one, and
+/// where it cannot, the entry stays as it is and the Bazel build keeps the
+/// patched jar. A pin that only such an entry wires is no takeover at all.
 fn takeover_pins(pins: Vec<HostedPin>) -> Vec<HostedPin> {
     let beside_the_hub = |mut pin: HostedPin| {
-        pin.files
-            .retain(|file| file != socket_patch_core::bazel::maven::FILE);
+        pin.files.retain(|file| file != BLOCK_FILE);
         (!pin.files.is_empty()).then_some(pin)
     };
     pins.into_iter().filter_map(beside_the_hub).collect()
 }
 
-/// The hosted pins of an eject: those a vendored run takes over
-/// ([`takeover_pins`]) whose ecosystem `--ecosystems` selects.
+/// The hosted pins of an eject, of those whose ecosystem `--ecosystems`
+/// selects: the ones a vendored run takes over ([`takeover_pins`]), and,
+/// in a project whose only build is the hub of a Bazel workspace, the ones
+/// that only the block of `MODULE.bazel` wires, with that file: the eject
+/// takes the hosted entry out, as it restores any pin, and the vendored
+/// one takes its place in the same commit. Beside a Maven or Gradle build
+/// such a pin is none of the eject's: its entry stays hosted, unless the
+/// run vendors the same patch for that build (a patch of the manifest, or
+/// a pin that the build's own files hold too), which puts the vendored
+/// entry in its place.
 fn hosted_pins_in_scope(common: &GlobalArgs, pins: Vec<HostedPin>) -> Vec<HostedPin> {
-    takeover_pins(pins)
-        .into_iter()
-        .filter(|pin| {
-            socket_patch_core::utils::purl::purl_parts(&pin.purl)
-                .is_some_and(|(eco, _, _)| ecosystem_in_scope(common, &eco))
-        })
-        .collect()
+    let in_scope = |pin: &HostedPin| {
+        socket_patch_core::utils::purl::purl_parts(&pin.purl)
+            .is_some_and(|(eco, _, _)| ecosystem_in_scope(common, &eco))
+    };
+    let (of_the_block, mut pins): (Vec<HostedPin>, Vec<HostedPin>) =
+        pins.into_iter().partition(|pin| pin.files == [BLOCK_FILE]);
+    pins = takeover_pins(pins);
+    if !of_the_block.is_empty() && vendor::maven_repo::hub_alone(&common.cwd) {
+        pins.extend(of_the_block);
+    }
+    pins.into_iter().filter(in_scope).collect()
 }
 
 /// What a wet eject can touch, captured before it touches anything: every
@@ -2082,7 +2103,10 @@ async fn run_eject(
     let service = common.vendor_service_config(Some(client.clone()), use_public_proxy);
     // The refusals that rest on the Bazel workspace need no record and no
     // registry, so they are asked before either is fetched: the pins stay
-    // hosted whatever the network says.
+    // hosted whatever the network says. The hub of a Bazel workspace is
+    // asked about the checkout as it is here, where its hosted entry
+    // stands: the reason of an entry that vendored mode would not write
+    // then says that the hosted one stays.
     let pairs: Vec<(&str, &str)> = pins
         .iter()
         .map(|pin| (pin.purl.as_str(), pin.uuid.as_str()))
@@ -4399,6 +4423,12 @@ pub(crate) async fn vendor_records_reusing(
                         } else if let Some(tool) = jvm_wiring_tool(&entry.wiring) {
                             wired_flavors.insert(tool.to_string());
                         }
+                        // Beside this build, a hub of a Bazel workspace got a
+                        // copy of the jar: its files belong to the commit too.
+                        let jvm = vendor::jvm::apply::is_jvm_entry(&entry);
+                        if jvm && vendor::maven_repo::hub_wired(&common.cwd, &entry.uuid).await {
+                            wired_flavors.insert(HUB_BESIDE.to_string());
+                        }
                         let (save_failed, stale) = record_vendor_entry(
                             common, env, &mut state, candidate, entry, detached, record,
                         )
@@ -4683,10 +4713,18 @@ pub(crate) async fn vendor_records_reusing(
     }
 
     // A hub of a Bazel workspace builds the jar of its own lock, whatever
-    // this run vendored for the Maven or the Gradle build.
-    let vendored = vendorable.iter().map(String::as_str);
-    env.warnings
-        .extend(crate::commands::bazel_maven_notices(common, vendored, true).await);
+    // this run vendored for the Maven or the Gradle build: the jars it
+    // wrote no entry for. One refused for the hub alone has said why.
+    let refused = |purl: &&String| {
+        let hub = |code: &str| code.starts_with("maven_bazel_");
+        let about = |event: &&PatchEvent| event.purl.as_ref() == Some(*purl);
+        let mut events = env.events[events_start..].iter().filter(about);
+        events.any(|event| event.error_code.as_deref().is_some_and(hub))
+    };
+    let vendored = vendorable.iter().filter(|purl| !refused(purl));
+    let vendored: Vec<&str> = vendored.map(String::as_str).collect();
+    let notices = crate::commands::bazel_maven_notices(common, vendored.into_iter(), true, true);
+    env.warnings.extend(notices.await);
 
     // A rolled-back eject's summary would describe a vendoring that was
     // undone: the eject prints it itself once it knows the outcome (#1005).
@@ -4761,9 +4799,13 @@ fn print_vendor_closing(
                 .all(|f| JVM_TOOLS.contains(&f.as_str()));
         let reinstall = if jvm_only {
             let cmds: Vec<String> = installs.iter().map(|c| format!("`{c}`")).collect();
+            // The block of a hub is in a file of the checkout's own.
+            let how = match installs == [HUB_BUILD] {
+                true => format!("{BLOCK_FILE} names their directory"),
+                false => "the generated root file points it at .socket/vendor/".to_string(),
+            };
             format!(
-                "Run {} so the build resolves the vendored artifacts (the generated root \
-                 file points it at .socket/vendor/)",
+                "Run {} so the build resolves the vendored artifacts ({how})",
                 cmds.join(" and ")
             )
         } else if installs.is_empty() {
@@ -4842,8 +4884,18 @@ pub(crate) struct EjectCapture {
 }
 
 /// The pseudo-flavors of vendored JVM builds whose wiring is a generated
-/// root file rather than a lockfile.
-const JVM_TOOLS: &[&str] = &["sbt", "scala-cli"];
+/// root file rather than a lockfile, and the flavor of a patch that only
+/// the hub of a Bazel workspace takes, whose wiring is the block of
+/// `MODULE.bazel`.
+const JVM_TOOLS: &[&str] = &["sbt", "scala-cli", HUB_FLAVOR];
+use socket_patch_core::vendor::maven_repo::HUB_FLAVOR;
+
+/// Among the flavors a run wired: a hub of a Bazel workspace got a copy of
+/// a jar that the run vendored for a Maven or Gradle build. Its files are
+/// committed with that build's, and no step of its own follows.
+const HUB_BESIDE: &str = "bazel-hub-copy";
+/// What takes the committed jar of a hub: the next Bazel build.
+const HUB_BUILD: &str = "bazel build //...";
 
 /// `sbt` / `scala-cli` when `wiring` is that vendored backend's (a ledger
 /// entry of either records ecosystem `maven` and no flavor).
@@ -4887,6 +4939,9 @@ fn commit_hint(wired: &HashSet<String>, pnpm_workspace: bool) -> String {
     }
     if wired.contains("scala-cli") {
         roots.push(socket_patch_core::vendor::jvm::scala_cli::ROOT_FILE);
+    }
+    if wired.contains(HUB_FLAVOR) || wired.contains(HUB_BESIDE) {
+        roots.extend([BLOCK_FILE, ".bazelignore"]);
     }
     let lockfiles = wired.iter().any(|f| !JVM_TOOLS.contains(&f.as_str())) || roots.is_empty();
     match (roots.is_empty(), lockfiles) {
@@ -4937,6 +4992,8 @@ fn flavor_install_command(flavor: &str) -> Option<&'static str> {
         // Not an install: the JVM build re-resolves from the vendored tree.
         "sbt" => Some("sbt update"),
         "scala-cli" => Some("scala-cli compile --test ."),
+        // Nor here: the next Bazel build takes the jar of the checkout.
+        HUB_FLAVOR => Some(HUB_BUILD),
         _ => None,
     }
 }
@@ -4947,6 +5004,9 @@ fn flavor_install_command(flavor: &str) -> Option<&'static str> {
 fn flavor_revert_install_command(flavor: &str) -> Option<&'static str> {
     match flavor {
         "bun" => Some("bun install --force"),
+        // No tree holds the jar of a hub: the next Bazel build takes the
+        // hub's own, with nothing to resync.
+        HUB_FLAVOR => None,
         other => flavor_install_command(other),
     }
 }
@@ -7582,6 +7642,47 @@ mod gc_tests {
         );
     }
 
+    /// The directory of the jar that vendored mode keeps for the hub of a
+    /// Bazel workspace is the unit `maven/<uuid>` of its patch. Beside a
+    /// Maven or Gradle build the JVM ledger entry of that patch owns it, so
+    /// no sweep takes it for an orphan; without an entry it is kept while
+    /// `MODULE.bazel` names it, and goes once nothing does.
+    #[tokio::test]
+    async fn orphan_sweep_keeps_the_jar_of_a_bazel_hub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let uuid = "1a2b3c4d-5e6f-4a1b-8c2d-9e0f1a2b3c4d";
+        let unit = format!(".socket/vendor/maven/{uuid}");
+        let jar = root.join(&unit).join("file/a-1.jar");
+        std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+        std::fs::write(&jar, b"jar").unwrap();
+        let artifact = VendorArtifact {
+            yarn_berry10c0: None,
+            path: ".socket/vendor/maven2/g/a/1-socket.1a2b3c4d/a-1-socket.1a2b3c4d.jar".into(),
+            sha256: String::new(),
+            size: None,
+            platform_locked: None,
+            file_inventory: None,
+        };
+        let purl = "pkg:maven/g/a@1".to_string();
+        let entry = VendorEntry::new("jvm".into(), purl.clone(), uuid.into(), artifact, vec![]);
+        let mut owned = VendorState::default();
+        owned.entries.insert(purl, entry);
+        let sweep = sweep_orphan_vendor_dirs(root, &owned, false).await;
+        assert!(sweep.removed.is_empty() && sweep.still_wired.is_empty());
+        assert!(jar.is_file());
+
+        let named = format!("socket_patch_local_repository(\n    path = \"{unit}\",\n)\n");
+        std::fs::write(root.join("MODULE.bazel"), named).unwrap();
+        let sweep = sweep_orphan_vendor_dirs(root, &VendorState::default(), false).await;
+        assert_eq!((sweep.still_wired.len(), sweep.removed.len()), (1, 0));
+        assert!(jar.is_file());
+        std::fs::remove_file(root.join("MODULE.bazel")).unwrap();
+        let sweep = sweep_orphan_vendor_dirs(root, &VendorState::default(), false).await;
+        assert_eq!(sweep.removed.len(), 1);
+        assert!(!jar.exists());
+    }
+
     /// (c) uuid dirs with no owning ledger entry are swept (wet) / counted
     /// (dry).
     #[tokio::test]
@@ -7779,10 +7880,11 @@ mod gc_tests {
 mod scope_and_hint_tests {
     use super::*;
 
-    /// A vendored run takes over what wires a hosted pin in a build it
-    /// can vendor into, and never the entry of a Bazel hub: that file is
-    /// no file of the pin it restores, and a pin of that entry alone is
-    /// none of its pins.
+    /// A vendored run restores what wires a hosted pin in a build it can
+    /// vendor into, and never the entry of a Bazel hub, which it replaces
+    /// where it can: that file is no file of the pin it restores. A pin
+    /// of that entry alone is ejected only where the hub is the project's
+    /// one build, and is none of the pins of a project that Maven builds.
     #[test]
     fn a_takeover_leaves_the_entry_of_a_bazel_hub() {
         let pin = |purl: &str, files: &[&str]| HostedPin {
@@ -7802,7 +7904,14 @@ mod scope_and_hint_tests {
             pins[2].clone(),
         ];
         assert_eq!(takeover_pins(pins.clone()), taken);
-        let common = GlobalArgs::default();
+        let project = tempfile::tempdir().unwrap();
+        let common = GlobalArgs {
+            cwd: project.path().to_path_buf(),
+            ..GlobalArgs::default()
+        };
+        let alone = [taken.clone(), vec![pins[1].clone()]].concat();
+        assert_eq!(hosted_pins_in_scope(&common, pins.clone()), alone);
+        std::fs::write(project.path().join("pom.xml"), "<project/>").unwrap();
         assert_eq!(hosted_pins_in_scope(&common, pins), taken);
     }
 
@@ -7826,6 +7935,13 @@ mod scope_and_hint_tests {
             flavor_install_command("scala-cli"),
             Some("scala-cli compile --test .")
         );
+        // A patch of a Bazel hub alone: the block and the ignore file are
+        // what a commit must not leave out.
+        assert_eq!(flavor_install_command("bazel"), Some("bazel build //..."));
+        let wired: HashSet<String> = ["bazel".to_string()].into();
+        let hint = commit_hint(&wired, false);
+        let named = "MODULE.bazel, .bazelignore and .socket/vendor/ to make the patches portable";
+        assert!(hint.starts_with(named), "{hint}");
     }
 
     /// A Rush run wires three kinds of file, and a commit that leaves one
