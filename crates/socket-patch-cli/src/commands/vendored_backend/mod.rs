@@ -17,7 +17,7 @@ use std::path::Path;
 
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::vendor::{
-    save_state, RevertOpts, VendorServiceConfig, VendorState, VendorWarning,
+    save_state, RevertOpts, RevertOutcome, VendorServiceConfig, VendorState, VendorWarning,
 };
 
 use crate::args::GlobalArgs;
@@ -186,11 +186,7 @@ impl<'a> VendoredBackend<'a> {
             let step = if !outcome.success {
                 VendorRevertStep::Failed(outcome.error.unwrap_or_else(|| "unknown error".into()))
             } else if outcome.kept_artifact {
-                VendorRevertStep::Kept(if outcome.kept_for_residual_reference() {
-                    KeepCause::Reference
-                } else {
-                    KeepCause::Drift
-                })
+                VendorRevertStep::Kept(KeepCause::of(&outcome))
             } else if opts.dry_run {
                 VendorRevertStep::WouldRevert
             } else if opts.keep_artifact {
@@ -501,6 +497,15 @@ pub(crate) enum KeepCause {
 }
 
 impl KeepCause {
+    /// Why `outcome`, a revert that kept its artifact, kept it.
+    pub(crate) fn of(outcome: &RevertOutcome) -> Self {
+        if outcome.kept_for_residual_reference() {
+            KeepCause::Reference
+        } else {
+            KeepCause::Drift
+        }
+    }
+
     /// The per-entry reason, after "`<what>` kept".
     pub(crate) fn reason(self) -> &'static str {
         match self {
