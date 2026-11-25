@@ -8124,15 +8124,23 @@ pub fn grant_token_path_segment(url: &str, patch_uuid: &str) -> Option<String> {
 /// level, so the idempotency guard never silently degrades into the
 /// nesting-corruption failure mode when a caller forgets the token.
 pub(crate) fn gem_index_url_pattern(dep: &DepOverride, index_url: &str) -> String {
+    gem_index_url_pattern_of(dep, index_url, true)
+}
+
+/// [`gem_index_url_pattern`], with the patch uuid a wildcard only when
+/// `any_patch`: without it the pattern is the registry of this one patch,
+/// under any grant token.
+fn gem_index_url_pattern_of(dep: &DepOverride, index_url: &str, any_patch: bool) -> String {
     let mut url_pat = regex::escape(index_url);
     let derived_token = grant_token_path_segment(index_url, &dep.patch_uuid);
     let rotating = [
         Some(dep.token.as_str()),
         derived_token.as_deref(),
-        Some(dep.patch_uuid.as_str()),
+        any_patch.then_some(dep.patch_uuid.as_str()),
     ];
     for rotating in rotating.into_iter().flatten() {
-        if !rotating.is_empty() {
+        // The uuid itself is no token, whatever the caller put in `token`.
+        if !rotating.is_empty() && (any_patch || rotating != dep.patch_uuid) {
             url_pat = url_pat.replace(&regex::escape(&format!("/{rotating}/")), "/[^/\"]+/");
         }
     }
@@ -8896,17 +8904,18 @@ pub fn gem_index_info_url(index_url: &str, name: &str) -> String {
 }
 
 /// The documents of [`GEM_INDEX_KEY`], by URL: `Ok` the text, `Err` why it
-/// could not be read. Empty when the key is absent or is not such a map.
+/// could not be read. `None` when the key is absent: the caller read no
+/// registry at all (the rewrite by itself), and nothing is checked against
+/// one. A caller that reads them hands the key in every time, and a gem
+/// whose registry it holds no document for is then never pinned.
 fn gem_index_documents(
     files: &BTreeMap<String, String>,
-) -> BTreeMap<String, Result<String, String>> {
-    let Some(Value::Object(documents)) = files
-        .get(GEM_INDEX_KEY)
-        .and_then(|text| serde_json::from_str::<Value>(text).ok())
-    else {
-        return BTreeMap::new();
+) -> Option<BTreeMap<String, Result<String, String>>> {
+    let text = files.get(GEM_INDEX_KEY)?;
+    let Some(Value::Object(documents)) = serde_json::from_str::<Value>(text).ok() else {
+        return Some(BTreeMap::new());
     };
-    documents
+    let documents = documents
         .into_iter()
         .map(|(url, document)| {
             let read = match document.get("body").and_then(Value::as_str) {
@@ -8919,7 +8928,8 @@ fn gem_index_documents(
             };
             (url, read)
         })
-        .collect()
+        .collect();
+    Some(documents)
 }
 
 /// The sha256 of the `.gem` the patch `dep` serves: its registry override's
@@ -8970,18 +8980,43 @@ fn gem_anchor<'a>(
         let Some(ov) = registry_override_of_kind(dep, "rubygems-compact-index") else {
             return false;
         };
-        let index_url = ov.index_url.trim_end_matches('/');
-        let Ok(registry) =
-            regex::Regex::new(&format!("^{}$", gem_index_url_pattern(dep, index_url)))
-        else {
-            return false;
-        };
-        let own = format!("/{}", dep.patch_uuid);
         remotes
             .iter()
-            .any(|remote| remote.ends_with(&own) && registry.is_match(remote))
+            .any(|remote| is_own_gem_registry(dep, &ov.index_url, remote))
     });
     in_use.or(source).unwrap_or(of_builds[0])
+}
+
+/// Whether `remote` (a lock's `GEM` remote) is the registry of the patch
+/// `dep` itself, under any grant token: see [`gem_registry_matcher`].
+fn is_own_gem_registry(dep: &DepOverride, index_url: &str, remote: &str) -> bool {
+    gem_registry_matcher(dep, index_url, false)
+        .is_some_and(|registry| registry.is_match(&closed_url(remote)))
+}
+
+/// `url` with one trailing slash: the form in which the rotating segments
+/// of a registry URL (`/<token>/`, `/<uuid>/`) are whole path segments also
+/// where one of them ends the URL.
+fn closed_url(url: &str) -> String {
+    format!("{}/", url.trim_end_matches('/'))
+}
+
+/// A matcher of the registry URL of the patch `dep` (`index_url`), for a
+/// URL in the form of [`closed_url`]: the same recognition the manifest
+/// wiring uses ([`gem_index_url_pattern`]), which asks nothing of the
+/// URL's shape (a registry behind a patch mirror is recognised like any
+/// other). The grant token is a wildcard, since it rotates between runs.
+/// With `any_patch` the patch uuid is one too (the registry of any patch of
+/// the gem at that address); without it the matcher tells the registries
+/// of one fix's patches apart.
+fn gem_registry_matcher(
+    dep: &DepOverride,
+    index_url: &str,
+    any_patch: bool,
+) -> Option<regex::Regex> {
+    let index_url = closed_url(index_url);
+    let pattern = gem_index_url_pattern_of(dep, &index_url, any_patch);
+    regex::Regex::new(&format!("^{pattern}$")).ok()
 }
 
 /// How a gem locked as platform builds is pinned ([`gem_family_pins`]).
@@ -9025,7 +9060,7 @@ fn gem_family_pins<'a>(
     builds: &crate::formats::gem::LockedBuilds<'_>,
     merged: bool,
     lock_name: &str,
-    index_documents: &BTreeMap<String, Result<String, String>>,
+    index_documents: Option<&BTreeMap<String, Result<String, String>>>,
 ) -> Result<GemFamilyPins<'a>, RewriteWarning> {
     let (name, version) = (group[0].name.as_str(), group[0].version.as_str());
     // Every build the lock names, the ruby-platform one first.
@@ -9166,8 +9201,25 @@ fn gem_family_pins<'a>(
     // What the registry lists, where the engine read it: the lock is about
     // to pin each build to a sha256, and a build the registry does not
     // serve with exactly that one fails `bundle install` on its platform.
-    let listed = registry_override_of_kind(anchor, "rubygems-compact-index")
-        .and_then(|ov| index_documents.get(&gem_index_info_url(&ov.index_url, name)));
+    // `None`: the caller reads no registry. A caller that does must hold
+    // the document of this very registry: one it did not read is no
+    // evidence, and the gem is left where it is.
+    // (An anchor with no registry to name is reported where it is wired.)
+    let registry = registry_override_of_kind(anchor, "rubygems-compact-index");
+    let listed = match (index_documents, registry) {
+        (Some(documents), Some(ov)) => {
+            match documents.get(&gem_index_info_url(&ov.index_url, name)) {
+                Some(read) => Some(read),
+                None => {
+                    return Err(skipped(format!(
+                        "what the patch registry of fix {family} serves was not read, so \
+                         nothing says it serves every locked build"
+                    )));
+                }
+            }
+        }
+        _ => None,
+    };
     match listed {
         None => {}
         Some(Err(why)) => {
@@ -9216,8 +9268,7 @@ fn gem_already_hosted(lock: &crate::formats::gem::GemfileLock<'_>, group: &[&Dep
         .iter()
         .filter_map(|dep| {
             let ov = registry_override_of_kind(dep, "rubygems-compact-index")?;
-            let index_url = ov.index_url.trim_end_matches('/');
-            regex::Regex::new(&format!("^{}$", gem_index_url_pattern(dep, index_url))).ok()
+            gem_registry_matcher(dep, &ov.index_url, true)
         })
         .collect();
     lock.gem_sections().any(|section| {
@@ -9227,10 +9278,29 @@ fn gem_already_hosted(lock: &crate::formats::gem::GemfileLock<'_>, group: &[&Dep
             .filter_map(|line| line.parsed)
             .any(|spec| spec.name == name && spec.version == version);
         lists
-            && section
-                .remote_bases()
-                .any(|remote| registries.iter().any(|registry| registry.is_match(remote)))
+            && section.remote_bases().any(|remote| {
+                let remote = closed_url(remote);
+                registries.iter().any(|registry| registry.is_match(&remote))
+            })
     })
+}
+
+/// The gem patches by gem version, in the order they come: the one
+/// grouping of the gem rewriter and of the index lookup that precedes it
+/// ([`gem_index_urls`]), so that the registry that is read is the registry
+/// that is pinned.
+fn gem_groups<'a>(gems: impl Iterator<Item = &'a DepOverride>) -> Vec<Vec<&'a DepOverride>> {
+    let mut groups: Vec<Vec<&'a DepOverride>> = Vec::new();
+    for dep in gems.filter(|dep| dep.ecosystem == "gem") {
+        let same = |group: &&mut Vec<&'a DepOverride>| {
+            group[0].name == dep.name && group[0].version == dep.version
+        };
+        match groups.iter_mut().find(same) {
+            Some(group) => group.push(dep),
+            None => groups.push(vec![dep]),
+        }
+    }
+    groups
 }
 
 /// The compact-index documents the gem rewriter checks a lock of platform
@@ -9247,17 +9317,7 @@ pub fn gem_index_urls(files: &BTreeMap<String, String>, overrides: &[&DepOverrid
     // Read as the rewriter reads it.
     let parsed = crate::formats::gem::parse(lock);
     let merged = matches!(lock_layout(lock), Some(LockLayout::Merged(_)));
-    let mut groups: Vec<Vec<&DepOverride>> = Vec::new();
-    for dep in overrides.iter().filter(|dep| dep.ecosystem == "gem") {
-        let same = |group: &&mut Vec<&DepOverride>| {
-            group[0].name == dep.name && group[0].version == dep.version
-        };
-        match groups.iter_mut().find(same) {
-            Some(group) => group.push(dep),
-            None => groups.push(vec![dep]),
-        }
-    }
-    let unread = BTreeMap::new();
+    let groups = gem_groups(overrides.iter().copied());
     let mut urls: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for group in &groups {
         let (name, version) = (group[0].name.as_str(), group[0].version.as_str());
@@ -9265,7 +9325,8 @@ pub fn gem_index_urls(files: &BTreeMap<String, String>, overrides: &[&DepOverrid
         if builds.platforms.is_empty() {
             continue;
         }
-        let Ok(pins) = gem_family_pins(group, &parsed, &builds, merged, lock_name, &unread) else {
+        // The rewriter's own choice, before any registry is read.
+        let Ok(pins) = gem_family_pins(group, &parsed, &builds, merged, lock_name, None) else {
             continue;
         };
         if let Some(ov) = registry_override_of_kind(pins.anchor, "rubygems-compact-index") {
@@ -9362,16 +9423,7 @@ fn rewrite_gem(
     // The patches by gem version, in the order they were handed in. Each
     // platform gem of a fix has a patch of its own, so one gem version can
     // come with several: the lock says which of them it has a build for.
-    let mut groups: Vec<Vec<&DepOverride>> = Vec::new();
-    for dep in &gem {
-        let same = |group: &&mut Vec<&DepOverride>| {
-            group[0].name == dep.name && group[0].version == dep.version
-        };
-        match groups.iter_mut().find(same) {
-            Some(group) => group.push(dep),
-            None => groups.push(vec![dep]),
-        }
-    }
+    let groups = gem_groups(gem.iter().copied());
     let index_documents = gem_index_documents(files);
     for group in &groups {
         let uuids = || group.iter().map(|dep| dep.patch_uuid.clone());
@@ -9414,7 +9466,8 @@ fn rewrite_gem(
                 let Some(parsed) = handed_in.as_ref() else {
                     continue;
                 };
-                match gem_family_pins(group, parsed, builds, merged, lock_name, &index_documents) {
+                let read = index_documents.as_ref();
+                match gem_family_pins(group, parsed, builds, merged, lock_name, read) {
                     Ok(family) => Some(family),
                     Err(mut warning) => {
                         // A lock an earlier run moved stays as it is, and
@@ -24196,6 +24249,182 @@ mod tests {
             );
             assert_eq!(r.confirmed_gem_uuids, uuid_set(&["uuid-x86_64-linux-gnu"]));
         }
+    }
+
+    /// A registry is recognised as a patch's own by the URL the patch
+    /// service handed for it, under any grant token and in any shape: with
+    /// or without the closing slash, behind a patch mirror, and where the
+    /// patch uuid is not the last path segment. Another patch's registry
+    /// at the same address is not it.
+    #[test]
+    fn a_patchs_own_gem_registry_is_recognised_in_any_url_shape() {
+        let arm = gem_build_patch(
+            "nokogiri",
+            "1.18.10",
+            "arm64-darwin",
+            &"a".repeat(64),
+            "uuid",
+        );
+        let own = |index_url: &str, remote: &str| is_own_gem_registry(&arm, index_url, remote);
+        let served = build_registry("arm64-darwin");
+        assert!(own(&served, &served));
+        assert!(own(&served, served.trim_end_matches('/')));
+        assert!(own(
+            &served,
+            "https://patch.test/gem/an-older-grant/uuid-arm64-darwin"
+        ));
+        assert!(!own(&served, &build_registry("x86_64-linux-gnu")));
+        assert!(!own(&served, GEM_TEST_URL));
+        assert!(!own(&served, "https://rubygems.org"));
+        // Behind a mirror the path is the served one, under the mirror's base.
+        let mirrored =
+            "https://repo.example/artifactory/socket/gem/tok-arm64-darwin/uuid-arm64-darwin/";
+        assert!(own(
+            mirrored,
+            "https://repo.example/artifactory/socket/gem/rotated/uuid-arm64-darwin"
+        ));
+        assert!(!own(mirrored, &served), "another host is another registry");
+        // A registry whose address does not end in the patch uuid.
+        let nested = "https://repo.example/gems/tok-arm64-darwin/uuid-arm64-darwin/index/";
+        assert!(own(
+            nested,
+            "https://repo.example/gems/rotated/uuid-arm64-darwin/index"
+        ));
+        assert!(!own(
+            nested,
+            "https://repo.example/gems/rotated/uuid-x86_64-linux-gnu/index"
+        ));
+    }
+
+    /// The patches of [`gem_fix`] with every registry at an address that
+    /// does not end in the patch uuid (`…/<token>/<uuid>/index/`).
+    fn gem_fix_nested(builds: &[(&str, &str)]) -> Vec<DepOverride> {
+        let mut fix = gem_fix("nokogiri", "1.18.10", builds);
+        for dep in &mut fix {
+            let (token, uuid) = (dep.token.clone(), dep.patch_uuid.clone());
+            let ov = dep.registry_override.as_mut().expect("a gem registry");
+            ov.index_url = format!("https://repo.example/gems/{token}/{uuid}/index/");
+        }
+        fix
+    }
+
+    /// A gem moved to a build's registry stays there when the source patch
+    /// turns up, whatever the registry's address looks like: the rule reads
+    /// the patch's own URL, not the position of the uuid in it.
+    #[test]
+    fn gem_on_a_builds_registry_stays_whatever_the_url_shape() {
+        let (arm, linux) = ("a".repeat(64), "b".repeat(64));
+        let lock = nokogiri_lock(&["arm64-darwin", "x86_64-linux-gnu"], false, true);
+        let fix = gem_fix_nested(&[("arm64-darwin", &arm), ("x86_64-linux-gnu", &linux)]);
+        let (gemfile, moved, first) = gem_redirect_fix(NOKOGIRI_GEMFILE, &lock, &fix[1..]);
+        assert_eq!(warning_codes(&first), [GEM_MEMBER_REGISTRY]);
+        let on_arm = "https://repo.example/gems/tok-arm64-darwin/uuid-arm64-darwin/index/";
+        assert!(moved.contains(&format!("  remote: {on_arm}\n")), "{moved}");
+
+        let (gemfile_later, lock_later, later) = gem_redirect_fix(&gemfile, &moved, &fix);
+        assert_eq!((gemfile_later, lock_later), (gemfile, moved));
+        assert!(later.edits.is_empty(), "{:?}", later.edits);
+        assert!(later.warnings.is_empty(), "{:?}", later.warnings);
+        assert_eq!(
+            later.gem_anchor_uuids["uuid-x86_64-linux-gnu"],
+            "uuid-arm64-darwin"
+        );
+    }
+
+    /// A lock an earlier run moved is recognised as moved also when the
+    /// patch it was moved to is no longer among the run's patches (an
+    /// older fix): the registry is a patch registry of this gem under any
+    /// grant token and any patch uuid, and the skip says the lock is left
+    /// as it is.
+    #[test]
+    fn gem_lock_on_an_older_patchs_registry_is_known_as_hosted() {
+        let (arm, linux) = ("a".repeat(64), "b".repeat(64));
+        let platforms = ["arm64-darwin", "x86_64-linux-gnu"];
+        let fix = gem_fix("nokogiri", "1.18.10", &[("arm64-darwin", &arm)]);
+        let pins = [
+            ("1.18.10-arm64-darwin", arm.as_str()),
+            ("1.18.10-x86_64-linux-gnu", linux.as_str()),
+        ];
+        let older = "https://patch.test/gem/an-older-grant/an-older-patch/";
+        let lock =
+            nokogiri_lock_hosted(&platforms, false, Some(&pins)).replace(GEM_TEST_URL, older);
+        let gemfile =
+            NOKOGIRI_GEMFILE.replace("\"1.18.10\"", &format!("\"1.18.10\", source: \"{older}\""));
+        let (_, _, r) = gem_redirect_fix(&gemfile, &lock, &fix);
+        assert_eq!(warning_codes(&r), ["redirect_gem_platform_unsupported"]);
+        assert!(
+            r.warnings[0]
+                .detail
+                .contains("already takes nokogiri from a Socket patch registry"),
+            "{}",
+            r.warnings[0].detail
+        );
+        assert!(r.files.is_empty() && r.edits.is_empty());
+    }
+
+    /// The registry that is read is the registry that is pinned: the index
+    /// lookup and the rewriter decide the gem's registry with one function
+    /// over one grouping. Where the caller reads registries and holds no
+    /// document for the one the rewriter is about to pin (it read another,
+    /// or none), the gem is left alone: an unread registry is no evidence.
+    #[test]
+    fn gem_registry_that_was_not_read_is_never_pinned() {
+        let (arm, linux) = ("a".repeat(64), "b".repeat(64));
+        let platforms = ["arm64-darwin", "x86_64-linux-gnu"];
+        let fix = gem_fix(
+            "nokogiri",
+            "1.18.10",
+            &[("arm64-darwin", &arm), ("x86_64-linux-gnu", &linux)],
+        );
+        let lock = nokogiri_lock(&platforms, false, true);
+        let files = |documents: Option<Value>| {
+            let mut files = BTreeMap::from([
+                ("Gemfile".to_string(), NOKOGIRI_GEMFILE.to_string()),
+                ("Gemfile.lock".to_string(), lock.clone()),
+            ]);
+            if let Some(documents) = documents {
+                files.insert(GEM_INDEX_KEY.to_string(), documents.to_string());
+            }
+            files
+        };
+        let body = format!(
+            "---\n1.18.10-arm64-darwin racc:~> 1.4|checksum:{arm}\n\
+             1.18.10-x86_64-linux-gnu racc:~> 1.4|checksum:{linux}\n"
+        );
+        let of_source = gem_index_info_url(GEM_TEST_URL, "nokogiri");
+        let of_arm = gem_index_info_url(&build_registry("arm64-darwin"), "nokogiri");
+
+        // The lookup names the registry the rewriter takes: the source
+        // patch's with the whole fix, the first build's without it.
+        let whole: Vec<&DepOverride> = fix.iter().collect();
+        assert_eq!(gem_index_urls(&files(None), &whole), [of_source.clone()]);
+        assert_eq!(gem_index_urls(&files(None), &whole[1..]), [of_arm.clone()]);
+
+        // Read and pinned agree: the gem moves.
+        let read_arm = json!({ of_arm.clone(): { "body": body } });
+        let moved = rewrite_registry_redirect(&files(Some(read_arm)), &fix[1..]);
+        assert_eq!(warning_codes(&moved), [GEM_MEMBER_REGISTRY]);
+        assert_eq!(moved.confirmed_gem_uuids.len(), 2);
+
+        // The document of another registry of the fix, and no document.
+        for documents in [json!({ of_source.clone(): { "body": body } }), json!({})] {
+            let r = rewrite_registry_redirect(&files(Some(documents)), &fix[1..]);
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+            assert!(r.confirmed_gem_uuids.is_empty());
+            assert_eq!(warning_codes(&r), ["redirect_gem_platform_unsupported"]);
+            assert!(
+                r.warnings[0].detail.contains(
+                    "what the patch registry of fix uuid serves was not read, so nothing says \
+                     it serves every locked build; redirect skipped"
+                ),
+                "{}",
+                r.warnings[0].detail
+            );
+        }
+
+        // The rewrite by itself (no caller that reads registries) pins.
+        let alone = rewrite_registry_redirect(&files(None), &fix[1..]);
+        assert_eq!(alone.confirmed_gem_uuids.len(), 2);
     }
 
     /// Where the engine read what the fix's registry lists

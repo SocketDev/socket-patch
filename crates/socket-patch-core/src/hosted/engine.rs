@@ -2501,7 +2501,11 @@ pub fn gem_index_targets(
 /// Hand the documents of [`gem_index_targets`] to the gem rewriter: each
 /// URL with the text read from it, or why it could not be read.
 pub fn record_gem_index(read: &mut CandidateFiles, documents: &[(String, Result<String, String>)]) {
-    if documents.is_empty() {
+    // Handed in for every project with a Bundler lock, also with nothing
+    // read: the rewriter then knows that registries are read here, and
+    // pins no platform-locked gem whose registry's document it lacks.
+    let (_, lock_name) = crate::patch::redirect::gem_pair(&read.files);
+    if documents.is_empty() && !read.files.contains_key(lock_name) {
         return;
     }
     let listed: serde_json::Map<String, serde_json::Value> = documents
@@ -13383,7 +13387,7 @@ snapshots:
         p.insert_text("Gemfile", GEMFILE);
         p.insert_text("Gemfile.lock", lock.as_str());
         let view = ProjectView::Memory(&p);
-        let mut read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
         let listed = gem_index_targets(&candidates, &read.files)
             .into_iter()
             .map(|url| {
@@ -13391,32 +13395,48 @@ snapshots:
                 (url, Ok(body))
             })
             .collect::<Vec<_>>();
-        record_gem_index(&mut read, &listed);
-        let outer = OuterAllowRemote::default;
-        let options = RewriteOptions {
-            dry_run: false,
-            targets_pipenv_lock: false,
-            pipenv_major: None,
-            pipenv_unknown_detail: String::new(),
-            trust_lockfile_config: true,
-            npm_allow_remote_config: true,
-            npm_outer: &outer,
-            yarn_classic_outer: &OuterYarnMirror::default,
-            cargo_outer: &no_cargo_outer,
-            maven_selection: &no_maven_selection,
-            pnpm_env: &no_env,
-            blocking: false,
-            takeover_uuids: Default::default(),
-            patch_server_origins: Vec::new(),
-            prior_discovery: None,
-        };
-        let unserved = rewrite(&view, read, &candidates, BTreeMap::new(), options).await;
-        assert!(unserved.rewrite.files.is_empty());
-        assert!(unserved.confirmed.is_empty(), "{:?}", unserved.confirmed);
-        assert_eq!(
-            warning_codes(&unserved),
-            ["redirect_gem_platform_unsupported"]
-        );
+        // And so does a registry nothing was read from: the engine hands
+        // the rewriter its documents also when it has none, and a gem is
+        // never pinned to a registry that was not looked at.
+        for (listed, why) in [(listed, "it lists no"), (Vec::new(), "was not read")] {
+            let mut read = read.clone();
+            record_gem_index(&mut read, &listed);
+            assert!(read
+                .files
+                .contains_key(crate::patch::redirect::GEM_INDEX_KEY));
+            let outer = OuterAllowRemote::default;
+            let options = RewriteOptions {
+                dry_run: false,
+                targets_pipenv_lock: false,
+                pipenv_major: None,
+                pipenv_unknown_detail: String::new(),
+                trust_lockfile_config: true,
+                npm_allow_remote_config: true,
+                npm_outer: &outer,
+                yarn_classic_outer: &OuterYarnMirror::default,
+                cargo_outer: &no_cargo_outer,
+                maven_selection: &no_maven_selection,
+                pnpm_env: &no_env,
+                blocking: false,
+                takeover_uuids: Default::default(),
+                patch_server_origins: Vec::new(),
+                prior_discovery: None,
+            };
+            let unserved = rewrite(&view, read, &candidates, BTreeMap::new(), options).await;
+            assert!(unserved.rewrite.files.is_empty());
+            assert!(unserved.confirmed.is_empty(), "{:?}", unserved.confirmed);
+            assert_eq!(
+                warning_codes(&unserved),
+                ["redirect_gem_platform_unsupported"]
+            );
+            let detail = &unserved.rewrite.warnings[0].detail;
+            assert!(detail.contains(why), "{detail}");
+        }
+
+        // A project with no Bundler lock is handed nothing.
+        let mut bare = CandidateFiles::default();
+        record_gem_index(&mut bare, &[]);
+        assert!(bare.files.is_empty());
     }
 
     /// #390: `bundle config set --local gemfile Gemfile.next` makes bundler
