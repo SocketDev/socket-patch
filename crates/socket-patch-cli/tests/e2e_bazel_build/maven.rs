@@ -1616,6 +1616,48 @@ fn an_installed_jar_is_affected_beside_a_hub_that_fetches_its_own() {
     }
 }
 
+/// Without a Bazel: the entry of the patch in the block, and a hub that it
+/// does not reach. The hosted and the vendored command each write their
+/// entry for the hub, and `vex` says not affected. Then the hub's
+/// `use_extension` becomes an isolated one, which no `override_repo` of
+/// another usage reaches: `vex` says affected of the hub and its lock,
+/// says that the entry does not reach the hub, and gives the code and the
+/// reason of the warning with which each mode would decline now.
+#[test]
+fn an_entry_is_no_patch_of_a_hub_on_an_isolated_usage() {
+    for (mode, how) in [("hosted", How::Hosted), ("vendored", How::Vendored)] {
+        let flow = Pinned::unbuilt();
+        // The installed jar is the patched one, as agent mode leaves it: no
+        // document has a word about an installed tree that differs.
+        let installed = flow.tools.path().join("m2");
+        let installed = installed.join(repo_path(VICTIM, VERSION, "jar"));
+        let jar = victim(&format!("PATCHED {}", flow.patch.uuid));
+        std::fs::write(installed, jar).expect("the installed jar");
+        let get = flow.vendored(&["get", PURL, "--mode", mode, "--yes"]);
+        assert_eq!(get.envelope["summary"]["applied"], 1, "{}", get.dump);
+        let run = |cell: &Cell, args: &[&str]| flow.socket_patch_in(cell, &flow.standin, args);
+        let patched = Claim::new(PURL, &flow.patch.uuid, how);
+        flow.cell.stands_alone(run, &patched, true);
+
+        let module = std::fs::read_to_string(flow.cell.path(MODULE)).expect(MODULE);
+        let usage = "\"maven\")\nmaven.install(";
+        assert_eq!(module.matches(usage).count(), 1, "{module}");
+        let isolated = module.replace(usage, "\"maven\", isolate = True)\nmaven.install(");
+        flow.cell.write(MODULE, isolated);
+        let call = module.lines().position(|line| line == "maven.install(");
+        let remedy = format!(
+            "The entry that {MODULE} holds for this patch does not reach this hub. {NO_ENTRY} \
+             (`maven_bazel_unreadable`): {MODULE}:{}: a tag of hub \"{HUB}\" is called on a \
+             `use_extension` that is isolated or cannot be read, which no `override_repo` of \
+             another usage reaches.",
+            call.expect("the hub") + 1
+        );
+        let names = flow.affected(&remedy);
+        let unreached = Claim::unbuilt(PURL, &flow.patch.uuid, &names);
+        flow.cell.stands_alone(run, &unreached, true);
+    }
+}
+
 /// Without a Bazel: what stays the statement of a project without Bazel
 /// while the patch is in the installed jar alone
 /// ([`Cell::keeps_its_statement`]). The hubs of which nothing is said: one

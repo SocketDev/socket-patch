@@ -162,27 +162,37 @@ pub struct Hub {
     /// usage that cannot be read or is isolated: an `override_repo` on
     /// another usage does not reach the repositories of that one.
     pub proxy: Option<String>,
+    /// Whether that is certain: each of its tags is called on a
+    /// `use_extension` with `isolate = True`.
+    pub isolated: bool,
 }
 
 /// The label of the `use_extension` call behind the proxy that `tag` is
 /// called on, when that usage is shared with every other one of the
 /// extension (`isolate` is not given, or is `False`) and its label holds
-/// nothing a string of the block would have to escape.
-fn proxy(ws: &Workspace, tag: &Tag) -> Option<String> {
-    let (_, file) = ws.files.iter().find(|(path, _)| path == tag.file)?;
-    let Bound::Call(made) = file.binds.get(tag.call.bind?)?.to else {
-        return None;
+/// nothing a string of the block would have to escape. Otherwise, whether
+/// the usage is isolated for certain (`isolate = True`): one that cannot
+/// be read may be shared.
+fn proxy(ws: &Workspace, tag: &Tag) -> Result<String, bool> {
+    let made = || {
+        let (_, file) = ws.files.iter().find(|(path, _)| path == tag.file)?;
+        let Bound::Call(made) = file.binds.get(tag.call.bind?)?.to else {
+            return None;
+        };
+        file.calls.get(made)
     };
-    let made = file.calls.get(made)?;
-    let shared = match made.arg("isolate") {
-        None => true,
-        Some(Value::Name(isolate)) => isolate == "False",
-        Some(_) => false,
+    let made = made().ok_or(false)?;
+    let isolate = match made.arg("isolate") {
+        None => "False",
+        Some(Value::Name(isolate)) => isolate,
+        Some(_) => "",
     };
     let plain = |b: u8| b.is_ascii_alphanumeric() || b"@/:._-+~".contains(&b);
     match made.positional(0) {
-        Some(Value::Str(label)) if shared && label.bytes().all(plain) => Some(label.clone()),
-        _ => None,
+        Some(Value::Str(label)) if isolate == "False" && label.bytes().all(plain) => {
+            Ok(label.clone())
+        }
+        _ => Err(isolate == "True"),
     }
 }
 
@@ -245,17 +255,20 @@ pub fn hubs(ws: &Workspace) -> (Vec<Hub>, Vec<Doubt>) {
             }
         };
         let proxy = proxy(ws, tag);
+        let isolated = proxy == Err(true);
         let Some(hub) = hubs.iter_mut().find(|hub| hub.name == name) else {
             hubs.push(Hub {
                 name,
                 file,
                 line,
                 lock,
-                proxy,
+                proxy: proxy.ok(),
+                isolated,
             });
             continue;
         };
-        hub.proxy = hub.proxy.take().filter(|_| proxy.is_some());
+        hub.proxy = hub.proxy.take().filter(|_| proxy.is_ok());
+        hub.isolated &= isolated;
         if pins && hub.lock != lock {
             let (first, at) = (&hub.file, hub.line);
             let why = format!("this tag and the one at {first}:{at} name different locks");
@@ -1744,10 +1757,14 @@ fn command(group: &str, artifact: &str, version: &str) -> String {
 /// It is said only when it is certain of that hub, whatever is not known
 /// of another one: the hub and its lock were read and no `maven.override`
 /// names the artifact ([`Hubs::built`]), and the block holds no entry of
-/// this patch for the jar. A block that was changed by hand and still
-/// overrides a repository may hold one: the reader does not follow such
-/// a call, so no hub is read beside it. One that overrides nothing holds
-/// no entry, and no mode writes to it. `None`
+/// this patch for the jar, or one that does not reach a hub that fetches
+/// it. An `override_repo` of the block reaches no hub on an isolated
+/// usage ([`Hub::isolated`]), which keeps the jar of its lock and is the
+/// hub that is named then. Of a usage that cannot be read that is not
+/// certain, and the entry stands. A block that was changed by hand and
+/// still overrides a repository may hold an entry: the reader does not
+/// follow such a call, so no hub is read beside it. One that overrides
+/// nothing holds no entry, and no mode writes to it. `None`
 /// otherwise, and where the checkout does not say that Bazel reads
 /// `MODULE.bazel` as it stands: it names a Bazel before 7.0, or none
 /// while a `WORKSPACE` file defines something, or an rc file names an
@@ -1760,7 +1777,8 @@ fn command(group: &str, artifact: &str, version: &str) -> String {
 /// root, or why hosted and vendored mode write none there, with the code
 /// and in the words of their warning ([`verdicts`]). The entry of another
 /// patch is named first: Bazel takes that one's jar until the command has
-/// put this one's in its place.
+/// put this one's in its place. So is the entry of this patch that does
+/// not reach the hub.
 pub fn upstream(root: &Path, patches: &[(&str, &str)]) -> Vec<Option<(Hub, String)>> {
     let jar = |purl| parse_maven_purl(purl).filter(|_| plain(purl));
     let jars: Vec<_> = patches.iter().map(|&(purl, _)| jar(purl)).collect();
@@ -1784,7 +1802,10 @@ pub fn upstream(root: &Path, patches: &[(&str, &str)]) -> Vec<Option<(Hub, Strin
             return None;
         };
         let held = hubs.held(&group, &artifact, &version);
-        if held == Some(*uuid) {
+        // The entry of this patch is the jar of each hub its override
+        // reaches: not of one on an isolated usage.
+        let (own, unreached) = (held == Some(*uuid), by.iter().find(|(hub, _)| hub.isolated));
+        if own && unreached.is_none() {
             return None;
         }
         let entry = match hubs.sure(&group, &artifact, &version) {
@@ -1794,11 +1815,12 @@ pub fn upstream(root: &Path, patches: &[(&str, &str)]) -> Vec<Option<(Hub, Strin
                 workspace.get_or_insert_with(all).clone()
             }),
         };
-        let other = held.map_or_else(String::new, |held| {
-            format!(
+        let other = held.map_or_else(String::new, |held| match own {
+            true => format!("The entry that {FILE} holds for this patch does not reach this hub. "),
+            false => format!(
                 "{FILE} holds the entry of patch {held} for this jar, and where the block is \
                  in effect the Bazel build takes that patch's jar. "
-            )
+            ),
         });
         let remedy = match entry {
             Ok(()) => format!(
@@ -1810,7 +1832,8 @@ pub fn upstream(root: &Path, patches: &[(&str, &str)]) -> Vec<Option<(Hub, Strin
                 "{other}Hosted and vendored mode write no entry for this hub (`{code}`): {why}."
             ),
         };
-        Some((by[0].0.clone(), remedy))
+        let (hub, _) = unreached.filter(|_| own).unwrap_or(&by[0]);
+        Some(((*hub).clone(), remedy))
     });
     fetched.collect()
 }
@@ -2796,8 +2819,50 @@ jvm.artifact(group = "com.example", artifact = "a", version = "1")
         // entry reaches: the hub fetches the jar, and no mode patches it.
         let old = [(".bazelversion", "7.3.0\n")];
         declined(&old, RELEASE, "which Bazel has from 7.4.0");
-        let isolated = PINNED.replace("\"maven\")", "\"maven\", isolate = True)");
+        let usage = "\"maven\")";
+        let isolated = PINNED.replace(usage, "\"maven\", isolate = True)");
         declined(&module(&isolated), UNREADABLE, "reaches");
+        // Nor does the entry of the patch that the block holds reach such
+        // a hub: the hub keeps the jar of its lock, and the statement says
+        // that the entry is there. Of a usage that cannot be read that is
+        // not certain: the entry stands, as beside a shared usage.
+        let reaches = "which no `override_repo` of another usage reaches.";
+        let unreached = format!(
+            "The entry that MODULE.bazel holds for this patch does not reach this hub. Hosted \
+             and vendored mode write no entry for this hub (`{UNREADABLE}`): MODULE.bazel:4: a \
+             tag of hub \"maven\" is called on a `use_extension` that is isolated or cannot be \
+             read, {reaches}"
+        );
+        let held = patched.replacen(usage, "\"maven\", isolate = True)", 1);
+        assert_eq!(
+            said(&module(&held), NETTY_PURL),
+            (hub.to_string(), unreached)
+        );
+        let unread = patched.replacen(usage, "\"maven\", isolate = not SHARED)", 1);
+        assert_eq!(said(&module(&unread), NETTY_PURL), nothing);
+        // One of two hubs that fetch the jar is enough, and is the hub
+        // that is named: the entry patches the other one.
+        let second = "tools = use_extension('@rules_jvm_external//:extensions.bzl', 'maven', \
+                      isolate = True)\ntools.install(name = 'tools', lock_file = \
+                      '//:maven_install.json')\n";
+        let both = patched.replacen(PINNED, &format!("{PINNED}{second}"), 1);
+        let (named, remedy) = said(&module(&both), NETTY_PURL);
+        let line = PINNED.lines().count() + 2;
+        assert_eq!(
+            named,
+            format!("tools MODULE.bazel:{line} maven_install.json")
+        );
+        assert!(remedy.ends_with(reaches), "{remedy}");
+        let both = both.replace(", isolate = True", "");
+        assert_eq!(said(&module(&both), NETTY_PURL), nothing);
+        // A hub with a tag on a shared usage and one on an isolated usage
+        // is two hubs to Bazel, and the pinned one may be the shared one.
+        let mixed = second.replace(
+            "tools.install(name = 'tools', lock_file",
+            "tools.artifact(artifact",
+        );
+        let mixed = patched.replacen(PINNED, &format!("{PINNED}{mixed}"), 1);
+        assert_eq!(said(&module(&mixed), NETTY_PURL), nothing);
     }
 
     /// What the warning for a hub that was not read says after where and
@@ -3896,7 +3961,7 @@ override_repo(
                 call,
                 dev_dependency: Some(false),
             };
-            proxy(&ws, &tag)
+            proxy(&ws, &tag).ok()
         };
         for plain in [
             "@rje//:extensions.bzl",

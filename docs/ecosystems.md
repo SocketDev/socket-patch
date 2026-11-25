@@ -2811,7 +2811,8 @@ artifact:
 `socket-patch vex` and `--vex` say `affected` of an artifact whose patch the hub does not
 take, whichever mode holds it: an installed jar that agent mode patched, a pin of a
 `pom.xml` or a Gradle file, a copy vendored for such a build, while a pinned hub fetches
-the jar at that version and the block holds no entry of that patch for it. The statement
+the jar at that version and the block holds no entry of that patch for it, or holds one
+that does not reach the hub because the hub's `use_extension` is isolated. The statement
 names the lock, the `maven.install` and its line, and the command of hosted and of vendored
 mode that patches the hub or, where those modes write no entry, the code of the table above
 with its reason ([Bazel workspaces: VEX](#bazel-workspaces-vex)). So the document after a
@@ -4421,6 +4422,16 @@ patched:
   may be out of the build: neither is certain.
   The entry of another patch for the same jar is not this patch's: the statement is
   `affected`, and names that entry.
+  Nor is the entry of the patch itself in the build of a hub whose `use_extension` is an
+  isolated one (`isolate = True`). The block overrides a repository of the extension's
+  shared usage, which reaches no hub of an isolated one: the build passes and takes the
+  jar of the hub's lock (measured on Bazel 9.3.2, for a hub that became isolated after the
+  hosted command; Bazel takes `isolate` only under
+  `--experimental_isolated_extension_usages`). So the statement is `affected` for that
+  hub, also where another hub takes the entry, and says that the entry does not reach it.
+  Where the `use_extension` of a hub cannot be read (an `isolate` that is neither `True`
+  nor `False`, a label that is no plain string) it may be a shared one. That the entry
+  does not reach it is not certain, so the entry keeps its `not_affected`.
   A jar that a hub takes from the Maven local repository under `m2local` counts as fetched:
   the hub holds that file to the lock's sha256, which the patched jar does not have (read
   from the ruleset's source at 7.2 and 6.5; no test builds it). The sha256 of the lock is
@@ -4508,6 +4519,9 @@ command, which writes the entry with `--mode vendored`. When the block holds the
 another patch for the jar, the statement says so first, in the words of that warning
 ("MODULE.bazel holds the entry of patch <id> for this jar, and where the block is in effect
 the Bazel build takes that patch's jar"); the command puts its entry in that one's place.
+When it holds the entry of the patch itself and the hub is on an isolated `use_extension`,
+the statement says first that "the entry that MODULE.bazel holds for this patch does not
+reach this hub", and then why no mode writes one that does (`maven_bazel_unreadable`).
 
 A command that declines still pins or vendors the patch for a `pom.xml` or a Gradle build
 beside the hub, and exits 0. The next document says `affected` all the same: the patch is
@@ -4665,7 +4679,8 @@ the build is broken):
   rules_js, rules_rust and rules_csharp, which build from the lock and never read the
   patched copy.
 - **A Maven patch beside rules_jvm_external**, in any mode, wherever the statement does not
-  say `affected` above: the hub that fetches the jar is not read with certainty; the
+  say `affected` above: the hub that fetches the jar is not read with certainty (also a
+  hub whose `use_extension` cannot be read, beside an entry of the patch); the
   checkout does not say that Bazel reads `MODULE.bazel` as it stands (an rc file that names
   `enable_bzlmod` or `--ignore_dev_dependency`, a `WORKSPACE` file beside no named
   release); or the jar reaches Bazel in a way that
