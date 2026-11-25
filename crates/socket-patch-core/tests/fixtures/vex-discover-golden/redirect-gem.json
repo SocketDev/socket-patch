@@ -44,7 +44,7 @@
     "elsewhere": [],
     "live_claims": []
   },
-  "redirect/gem/bundler/platform-prebuild-missing/input": {
+  "redirect/gem/bundler/platform-build-missing/input": {
     "refs": [],
     "diagnostics": [],
     "recognized": [],
@@ -52,7 +52,7 @@
     "elsewhere": [],
     "live_claims": []
   },
-  "redirect/gem/bundler/platform-prebuilds/expected": {
+  "redirect/gem/bundler/platform-builds/expected": {
     "refs": [
       {
         "purl": "pkg:gem/nokogiri@1.18.10",
@@ -89,7 +89,7 @@
       }
     ]
   },
-  "redirect/gem/bundler/platform-prebuilds/input": {
+  "redirect/gem/bundler/platform-builds/input": {
     "refs": [],
     "diagnostics": [],
     "recognized": [],
@@ -97,7 +97,7 @@
     "elsewhere": [],
     "live_claims": []
   },
-  "redirect/gem/bundler/platform-prebuilds-rerun/input": {
+  "redirect/gem/bundler/platform-builds-rerun/input": {
     "refs": [
       {
         "purl": "pkg:gem/nokogiri@1.18.10",
@@ -133,5 +133,21 @@
         "purl": "pkg:gem/nokogiri@1.18.10"
       }
     ]
+  },
+  "redirect/gem/bundler/platform-builds-two-fixes/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/gem/bundler/platform-retired-fields/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
   }
 }

@@ -829,7 +829,8 @@ pub fn lookup_gem_build<'a>(
     entries: &'a HashMap<String, VendorEntry>,
     purl: &str,
 ) -> Option<(&'a VendorEntry, &'a GemBuildEntry)> {
-    if !purl.starts_with("pkg:gem/") {
+    use crate::crawlers::Ecosystem;
+    if Ecosystem::from_purl(purl) != Some(Ecosystem::Gem) {
         return None;
     }
     let platform = crate::utils::purl::purl_qualifier(purl, "platform")

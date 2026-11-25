@@ -212,7 +212,7 @@ pub fn classify(offers: &Offers, recorded: &RecordedIndex, project: &str) -> Vec
 /// Whether `purl` is the patch purl of a platform gem
 /// (`pkg:gem/<name>@<version>?platform=<platform>`, not `ruby`).
 fn is_platform_gem_purl(purl: &str) -> bool {
-    purl.starts_with("pkg:gem/")
+    Ecosystem::from_purl(purl) == Some(Ecosystem::Gem)
         && crate::utils::purl::purl_qualifier(purl, "platform")
             .is_some_and(|platform| !platform.is_empty() && !platform.eq_ignore_ascii_case("ruby"))
 }
