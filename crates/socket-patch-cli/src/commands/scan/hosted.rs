@@ -1218,7 +1218,7 @@ pub(super) async fn run_redirect(
         .iter()
         .map(|r| (r.writer.purl.clone(), r.writer.uuid.clone()))
         .collect();
-    run_redirect_selected(
+    boxed_run_redirect_selected(
         &args.common,
         &args.vex,
         prune,
