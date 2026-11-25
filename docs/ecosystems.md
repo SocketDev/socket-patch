@@ -2405,7 +2405,9 @@ projects too. What the sections below then do for it:
   under `.socket/vendor/maven/`), and a run that does not patch such a hub says so, per
   patch, when the hub builds the artifact, or may
   ([Bazel workspaces: Maven](#bazel-workspaces-maven)).
-- VEX: a package is attested `affected` when a hub call names the project's lock.
+- VEX: a package is attested `affected` when a hub call names the project's lock, and a
+  Maven artifact when a pinned rules_jvm_external hub fetches its jar, whichever project of
+  the workspace holds the patch ([Bazel workspaces: VEX](#bazel-workspaces-vex)).
 
 `SOCKET_NO_BAZEL=1` in the environment switches all of it off (`1`, `true`, `yes`, `on`, `y`
 or `t`, in any case, as for the other switches that are read from the environment alone; an
@@ -2983,7 +2985,9 @@ Limits:
 - `socket-patch vex` holds every Maven patch to the hubs (above), and a `maven_install.json`
   names no project. So a project of the workspace that Maven or Gradle builds and Bazel
   does not gets `affected` too, beside a hub that pins the same artifact at the same
-  version. `--no-bazel` is for the repository that ships what Maven or Gradle builds.
+  version. `--no-bazel` is for the repository that ships what Maven or Gradle builds, and
+  [`SOCKET_NO_BAZEL=1`](#bazel-workspaces-a-project-that-bazel-does-not-build) for the
+  project that Bazel does not build at all.
 
 ## Bazel workspaces: Cargo
 

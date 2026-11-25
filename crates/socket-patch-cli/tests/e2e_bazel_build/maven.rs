@@ -1668,7 +1668,8 @@ fn an_entry_is_no_patch_of_a_hub_on_an_isolated_usage() {
 /// `WORKSPACE` file that defines a repository; the release named is one
 /// before 7.0. And what a person reads of an `apply` beside the hub that
 /// fetches the jar: the warning and the count of the statement, and
-/// nothing under `--silent`.
+/// nothing under `--silent`. With `SOCKET_NO_BAZEL=1` that `apply` and its
+/// document are those of the checkout without its Bazel files.
 #[test]
 fn an_installed_jar_is_attested_where_no_hub_is_shown_to_fetch_its_own() {
     let flow = Pinned::unbuilt();
@@ -1689,6 +1690,19 @@ fn an_installed_jar_is_attested_where_no_hub_is_shown_to_fetch_its_own() {
         flow.cell
             .tells_a_person(&origin, &apply, &told, &document, &claim, &warned);
     }
+
+    // The switch for a project that Bazel does not build: with it the run
+    // is the one of the checkout without its Bazel files, which is not
+    // the run beside the hub.
+    let bazel = [
+        MODULE,
+        "MODULE.bazel.lock",
+        "maven_install.json",
+        ".bazelversion",
+    ];
+    let apply = [&["apply"][..], &with_vex(&document)].concat();
+    flow.cell
+        .off_is_without_bazel(&origin, &apply, &told, &bazel);
 
     let run = |cell: &Cell, args: &[&str]| flow.socket_patch_in(cell, &flow.standin, args);
     let installed = Claim::new(PURL, &flow.patch.uuid, How::Agent);
