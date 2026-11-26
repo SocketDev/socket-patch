@@ -99,9 +99,11 @@
 //! * every locked platform needs a patched build. While the fix's
 //!   reference names none for one of them (the patch registry serves
 //!   upstream's own gem for it, does not list it, or lists no platform gem
-//!   at all) the gem is left as it is and reported as a skip
-//!   ([`super::VENDOR_PREBUILT_PLATFORM_PENDING`]): a build is named only
-//!   once published, so the next run may find it. A plain
+//!   at all), or the patch it names for one is not served (it is still
+//!   being built, or the service does not grant it), the gem is left as it
+//!   is and reported as a skip
+//!   ([`super::VENDOR_PREBUILT_PLATFORM_PENDING`]): a build is named and
+//!   served only once published, so the next run may find it. A plain
 //!   `<name> (<version>)` entry beside the platform ones (the ruby platform,
 //!   which no prebuilt tree serves) is refused with nothing written, and so
 //!   is a lock written by a bundler older than the layout was run against
@@ -141,7 +143,7 @@ use super::revert::{self, KeepPolicy};
 use super::service_fetch::{
     claim_prestaged, downloaded_warning, fetch_served_reference, fetch_served_references,
     fetch_verified_archive, fetch_verified_artifact, fetch_verified_secondary,
-    SecondaryArtifactResult, ServicePolicy,
+    SecondaryArtifactResult, ServicePolicy, Unserved,
 };
 use super::source::PackageSource;
 use super::state::{
@@ -1803,21 +1805,49 @@ fn listed(items: &[&str]) -> String {
 /// A caller that knows the gem is hosted already says so in its place.
 pub const HOSTED_CAN_PATCH: &str = "; `scan --mode hosted` can patch the others now.";
 
-/// The one line for a gem left as it is because `missing` (locked
-/// platforms) have no patched build, while `patched` (the other locked
+/// The locked platforms of a gem that have no patched build to vendor, in
+/// lock order.
+#[derive(Default)]
+struct NoPatchedBuild<'a> {
+    /// None yet, as far as the service says: the gem patch's registry
+    /// serves upstream's own gem for the platform, does not list it, or
+    /// the patch of its build is still being built.
+    yet: Vec<&'a str>,
+    /// The gem patch names a patched build, and the service does not
+    /// grant this caller the patch of it.
+    unavailable: Vec<&'a str>,
+}
+
+impl NoPatchedBuild<'_> {
+    fn is_empty(&self) -> bool {
+        self.yet.is_empty() && self.unavailable.is_empty()
+    }
+}
+
+/// The one line for a gem left as it is because the locked platforms of
+/// `missing` have no patched build, while `patched` (the other locked
 /// platforms) have one. For a lock already wired to this patch's copy
 /// ([`Standing::Wired`]) the caller ends the line with what became of
 /// that copy ([`wired_copy_not_rebuilt`]); otherwise it is the whole
 /// line.
 fn no_patched_build_detail(
     gem: &str,
-    missing: &[&str],
+    missing: &NoPatchedBuild<'_>,
     patched: &[&str],
     standing: Standing,
 ) -> String {
     let lead = match standing {
         Standing::NotVendored => "is not vendored",
         Standing::Wired | Standing::EarlierPatch => "was not brought up to date",
+    };
+    let none = match (missing.yet.as_slice(), missing.unavailable.as_slice()) {
+        (yet, []) => format!("no patched build yet for {}", listed(yet)),
+        ([], unavailable) => format!("no patched build available for {}", listed(unavailable)),
+        (yet, unavailable) => format!(
+            "no patched build yet for {} and none available for {}",
+            listed(yet),
+            listed(unavailable)
+        ),
     };
     let have = match patched {
         [] => String::new(),
@@ -1832,29 +1862,40 @@ fn no_patched_build_detail(
         (Standing::NotVendored, true) => ".",
         (Standing::NotVendored, false) => HOSTED_CAN_PATCH,
     };
-    format!(
-        "{gem} {lead}: no patched build yet for {}{have}. Vendored mode needs every locked \
-         platform{tail}",
-        listed(missing)
-    )
+    format!("{gem} {lead}: {none}{have}. Vendored mode needs every locked platform{tail}")
+}
+
+/// The skip of a gem left as it is because locked platforms have no
+/// patched build ([`super::VENDOR_PREBUILT_PLATFORM_PENDING`]). Not a
+/// failure: a platform's patched build is named and served only once it
+/// is published, so this is as likely "not yet" as "never", and nothing
+/// was touched.
+fn no_patched_build(
+    trees: &PlatformTrees<'_>,
+    missing: &NoPatchedBuild<'_>,
+    patched: &[&str],
+) -> Box<VendorOutcome> {
+    Box::new(refused(
+        super::VENDOR_PREBUILT_PLATFORM_PENDING,
+        no_patched_build_detail(trees.gem, missing, patched, trees.standing),
+    ))
 }
 
 /// The patch of each of `platforms`' patched build, as the package
-/// reference of `record` (the gem's fix) names them, with the sha256 its
+/// reference of the gem's fix `uuid` names them, with the sha256 its
 /// registry lists for that platform gem: ONE request, and nothing
 /// downloaded. While a locked platform has no patched build (the registry
 /// serves upstream's own gem for it, does not list it, or lists no
-/// platform gem at all) the gem is skipped
-/// ([`super::VENDOR_PREBUILT_PLATFORM_PENDING`]).
+/// platform gem at all) the gem is skipped ([`no_patched_build`]).
 async fn locked_build_sources(
     cfg: &VendorServiceConfig,
-    record: &PatchRecord,
+    uuid: &str,
     name: &str,
     trees: &PlatformTrees<'_>,
     platforms: &[String],
 ) -> Result<Vec<BuildSource>, Box<VendorOutcome>> {
     let policy = ServicePolicy::Refused;
-    let reference = fetch_served_reference(cfg, &record.uuid).await;
+    let reference = fetch_served_reference(cfg, uuid).await;
     let served = policy.settle(
         reference,
         "platform gem",
@@ -1862,7 +1903,7 @@ async fn locked_build_sources(
     )?;
     let builds = served.gem_builds.as_deref().unwrap_or_default();
     let mut sources: Vec<BuildSource> = Vec::with_capacity(platforms.len());
-    let mut missing: Vec<&str> = Vec::new();
+    let mut missing = NoPatchedBuild::default();
     for platform in platforms {
         let build = builds.iter().find(|build| build.platform == *platform);
         match build.and_then(|build| Some((build, build.patch_uuid.as_deref()?))) {
@@ -1871,20 +1912,83 @@ async fn locked_build_sources(
                 uuid: uuid.to_string(),
                 pinned: BuildPin::Registry(build.gem_checksum_sha256.clone()),
             }),
-            None => missing.push(platform),
+            None => missing.yet.push(platform),
         }
     }
     if missing.is_empty() {
         return Ok(sources);
     }
-    // Not a failure: a platform's patched build is named only once it is
-    // published, so this is as likely "not yet" as "never", and nothing
-    // was touched.
     let patched: Vec<&str> = sources.iter().map(|s| s.platform.as_str()).collect();
-    Err(Box::new(refused(
-        super::VENDOR_PREBUILT_PLATFORM_PENDING,
-        no_patched_build_detail(trees.gem, &missing, &patched, trees.standing),
-    )))
+    Err(no_patched_build(trees, &missing, &patched))
+}
+
+/// One platform tree whose patch the service serves: its source, how
+/// messages name it (`<name> (<platform>)`), and the gem and the stub
+/// gemspec that patch's reference lists.
+type ServedBuild<'a> = (
+    &'a BuildSource,
+    String,
+    crate::api::client::SecondaryArtifact,
+    crate::api::client::SecondaryArtifact,
+);
+
+/// What the patch of each of `sources` serves, asked for in ONE request
+/// and with nothing downloaded: its patched platform gem and stub gemspec.
+///
+/// A patch the gem's fix names ([`BuildsFrom::Locked`]) that the service
+/// does not serve, because it is still being built or is not granted to
+/// this caller, leaves its platform without a patched build to vendor, as
+/// if the fix named none: the gem is skipped ([`no_patched_build`]). The
+/// trees of a ledger entry have nothing to wait for, so a patch of theirs
+/// that is not served is a miss, as is a patch the service does not answer
+/// for and a granted one that lists no gem or no stub.
+async fn served_builds<'a>(
+    cfg: &VendorServiceConfig,
+    name: &str,
+    trees: &PlatformTrees<'_>,
+    sources: &'a [BuildSource],
+) -> Result<Vec<ServedBuild<'a>>, Box<VendorOutcome>> {
+    let policy = ServicePolicy::Refused;
+    let uuids: Vec<String> = sources.iter().map(|source| source.uuid.clone()).collect();
+    let references = fetch_served_references(cfg, &uuids)
+        .await
+        .map_err(|reason| policy.miss(format!("patch service request failed ({reason})")))?;
+    let mut builds = Vec::with_capacity(sources.len());
+    let mut missing = NoPatchedBuild::default();
+    for (source, (reference, unserved)) in sources.iter().zip(references) {
+        if let (BuildsFrom::Locked(_), Some(unserved)) = (&trees.from, unserved) {
+            match unserved {
+                Unserved::Building => missing.yet.push(&source.platform),
+                Unserved::NotGranted => missing.unavailable.push(&source.platform),
+            }
+            continue;
+        }
+        let subject = format!("{name} ({})", source.platform);
+        let served = policy.settle(
+            reference,
+            "platform gem",
+            &format!("platform gem for {subject}"),
+        )?;
+        let Some(gem) = served.archive.clone() else {
+            return Err(policy.miss(format!(
+                "the patch service served no patched platform gem for {subject}"
+            )));
+        };
+        let Some(stub) = served.secondary(GEM_STUB_ARTIFACT_KIND).cloned() else {
+            return Err(policy.miss(format!(
+                "the patch service served no stub gemspec for {subject}"
+            )));
+        };
+        builds.push((source, subject, gem, stub));
+    }
+    if !missing.is_empty() {
+        let patched: Vec<&str> = builds
+            .iter()
+            .map(|(source, ..)| source.platform.as_str())
+            .collect();
+        return Err(no_patched_build(trees, &missing, &patched));
+    }
+    Ok(builds)
 }
 
 /// Download and verify the patched gem of each platform of `trees` and its
@@ -1897,7 +2001,8 @@ async fn locked_build_sources(
 ///
 /// The patches are named by the fix's package reference (one request,
 /// [`locked_build_sources`]) or by the ledger entry being restored, and
-/// their own references are asked for in ONE request more. Every download
+/// their own references are asked for in ONE request more
+/// ([`served_builds`]). Every download
 /// is verified against the digest its patch's reference states, and the
 /// gem also against the sha256 the fix's registry lists for that platform
 /// (or, on a restore, both against what the ledger recorded). A failure
@@ -1927,7 +2032,7 @@ async fn stage_platform_builds(
     }
     let sources: Vec<BuildSource> = match &trees.from {
         BuildsFrom::Locked(platforms) => {
-            locked_build_sources(cfg, record, name, trees, platforms).await?
+            locked_build_sources(cfg, &record.uuid, name, trees, platforms).await?
         }
         BuildsFrom::Recorded(builds) => builds
             .iter()
@@ -1942,32 +2047,7 @@ async fn stage_platform_builds(
             .collect(),
     };
 
-    // What each platform's patch serves, asked together and before any
-    // download.
-    let uuids: Vec<String> = sources.iter().map(|source| source.uuid.clone()).collect();
-    let references = fetch_served_references(cfg, &uuids)
-        .await
-        .map_err(|reason| policy.miss(format!("patch service request failed ({reason})")))?;
-    let mut builds = Vec::with_capacity(sources.len());
-    for (source, reference) in sources.iter().zip(references) {
-        let subject = format!("{name} ({})", source.platform);
-        let served = policy.settle(
-            reference,
-            "platform gem",
-            &format!("platform gem for {subject}"),
-        )?;
-        let Some(gem) = served.archive.clone() else {
-            return Err(policy.miss(format!(
-                "the patch service served no patched platform gem for {subject}"
-            )));
-        };
-        let Some(stub) = served.secondary(GEM_STUB_ARTIFACT_KIND).cloned() else {
-            return Err(policy.miss(format!(
-                "the patch service served no stub gemspec for {subject}"
-            )));
-        };
-        builds.push((source, subject, gem, stub));
-    }
+    let builds = served_builds(cfg, name, trees, &sources).await?;
 
     // The gems, a few platforms at a time and taken in lock order.
     let mut downloads = std::pin::pin!(futures_util::stream::iter(&builds)
@@ -12245,9 +12325,22 @@ mod tests {
             Unlisted,
         }
 
+        /// What the service answers for the reference of a platform's own
+        /// patch.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Own {
+            /// A grant, with the artifacts the patch serves.
+            Granted,
+            /// This `status`, which is no grant, and no artifact.
+            Status(&'static str),
+            /// Nothing: the response leaves the patch out.
+            LeftOut,
+        }
+
         /// What the patch service has for one platform gem: how the gem
-        /// patch's registry lists it, and what the platform's own patch
-        /// serves: the patched platform gem (its `tarball`) and the stub
+        /// patch's registry lists it, what the reference of the platform's
+        /// own patch answers, and what that patch serves: the patched
+        /// platform gem (its `tarball`) and the stub
         /// gemspec (`None` leaves that artifact out of the patch's
         /// reference), the sha512 that reference states for the gem when
         /// not its own, and the sha256 the registry lists for it when not
@@ -12255,6 +12348,7 @@ mod tests {
         struct Served {
             platform: &'static str,
             listed: Listed,
+            own: Own,
             gem: Option<Vec<u8>>,
             stub: Option<Vec<u8>>,
             gem_sha512: Option<String>,
@@ -12267,6 +12361,7 @@ mod tests {
             Served {
                 platform,
                 listed: Listed::Patched,
+                own: Own::Granted,
                 gem: Some(make_gem(&[(RB, RB_PATCHED), (SO, platform.as_bytes())])),
                 stub: Some(stub(platform)),
                 gem_sha512: None,
@@ -12331,6 +12426,17 @@ mod tests {
                         "platform": platform, "gemChecksumSha256": listed_sha256,
                         "patchUuid": own
                     })),
+                }
+                match build.own {
+                    Own::Granted => {}
+                    Own::LeftOut => continue,
+                    Own::Status(status) => {
+                        results.insert(
+                            own,
+                            serde_json::json!({ "status": status, "url": null, "artifacts": [] }),
+                        );
+                        continue;
+                    }
                 }
                 let mut artifacts = Vec::new();
                 if let Some(gem) = &build.gem {
@@ -12820,6 +12926,265 @@ mod tests {
                      x86_64-linux-gnu (arm64-darwin has one). Vendored mode needs every locked \
                      platform; its vendored copy is missing or damaged and cannot be rebuilt \
                      until then."
+                );
+                assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
+            }
+        }
+
+        /// `platform`'s patched build, with a patch of its own whose
+        /// reference answers `status`: no grant.
+        fn unserved(platform: &'static str, status: &'static str) -> Served {
+            Served {
+                own: Own::Status(status),
+                ..served(platform)
+            }
+        }
+
+        /// The references each run asks for when every locked platform is
+        /// named a patch: the gem patch's, then the platform patches' in
+        /// one request.
+        fn both_requests(uuid: &str) -> [Vec<String>; 2] {
+            [
+                vec![uuid.to_string()],
+                vec![build_uuid(uuid, DARWIN), build_uuid(uuid, LINUX)],
+            ]
+        }
+
+        /// A patched build the gem patch names, whose own patch the
+        /// service does not serve, is no build to vendor: none yet while
+        /// that patch is still being built (`pending_build`), none
+        /// available under any other status that is no grant. A dry run
+        /// and a wet run both leave the gem alone under the benign pending
+        /// code, with one line that names the platform: two requests (the
+        /// gem patch's reference, the platform patches' together), no
+        /// download and nothing written.
+        #[tokio::test]
+        async fn a_platform_patch_that_is_not_served_is_a_skip_that_downloads_nothing() {
+            const NEEDS: &str = "Vendored mode needs every locked platform";
+            const HOSTED: &str = "`scan --mode hosted` can patch the others now.";
+            let mut cases: Vec<(Vec<Served>, String)> = vec![
+                (
+                    vec![served(DARWIN), unserved(LINUX, "pending_build")],
+                    format!(
+                        "nokogiri@1.18.10 is not vendored: no patched build yet for \
+                         x86_64-linux-gnu (arm64-darwin has one). {NEEDS}; {HOSTED}"
+                    ),
+                ),
+                (
+                    vec![
+                        unserved(DARWIN, "pending_build"),
+                        unserved(LINUX, "forbidden"),
+                    ],
+                    format!(
+                        "nokogiri@1.18.10 is not vendored: no patched build yet for arm64-darwin \
+                         and none available for x86_64-linux-gnu. {NEEDS}."
+                    ),
+                ),
+            ];
+            let no_grant = [
+                "forbidden",
+                "not_found",
+                "withdrawn",
+                "build_failed",
+                "a_status_of_a_later_service",
+            ];
+            for status in no_grant {
+                cases.push((
+                    vec![unserved(DARWIN, status), served(LINUX)],
+                    format!(
+                        "nokogiri@1.18.10 is not vendored: no patched build available for \
+                         arm64-darwin (x86_64-linux-gnu has one). {NEEDS}; {HOSTED}"
+                    ),
+                ));
+            }
+            for (builds, line) in cases {
+                let (_tmp, root, record) = project(&lock(None)).await;
+                let before = ts::tree_snapshot(&root);
+                let (server, cfg) = service(UUID, &builds).await;
+                for dry_run in [true, false] {
+                    let (code, detail) = unwrap_refused(
+                        vendor(&root, &not_installed(&root), &record, &cfg, dry_run).await,
+                    );
+                    assert_eq!(code, "vendor_prebuilt_platform_pending", "{detail}");
+                    assert!(crate::vendor::refusals::refusal_is_benign(code));
+                    assert_eq!(detail, line);
+                    assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
+                }
+                assert_eq!(
+                    reference_requests(&server).await,
+                    [both_requests(UUID), both_requests(UUID)].concat(),
+                    "{line}"
+                );
+                assert_eq!(downloads(&server).await, Vec::<String>::new(), "{line}");
+            }
+        }
+
+        /// The same with a vendored copy in place, which stays in force
+        /// untouched: the copy of an earlier patch when a platform patch
+        /// of the newer one is not served, and this patch's own copy when
+        /// the lock gains a platform whose patch is not served. The line
+        /// says which.
+        #[tokio::test]
+        async fn an_unserved_platform_patch_leaves_a_vendored_copy_in_force() {
+            const JAVA: &str = "java";
+            for (status, none) in [
+                ("pending_build", "no patched build yet for"),
+                ("forbidden", "no patched build available for"),
+            ] {
+                let (_tmp, root, record_a) = project(&lock(None)).await;
+                let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+                vendor_and_persist(&root, &record_a, &cfg).await;
+
+                // A newer patch of the gem.
+                let before = ts::tree_snapshot(&root);
+                let record_b = PatchRecord {
+                    uuid: UUID_B.to_string(),
+                    ..record_a.clone()
+                };
+                let (server, cfg) =
+                    service(UUID_B, &[served(DARWIN), unserved(LINUX, status)]).await;
+                for dry_run in [true, false] {
+                    let (code, detail) = unwrap_refused(
+                        vendor(&root, &not_installed(&root), &record_b, &cfg, dry_run).await,
+                    );
+                    assert_eq!(code, "vendor_prebuilt_platform_pending", "{detail}");
+                    assert_eq!(
+                        detail,
+                        format!(
+                            "nokogiri@1.18.10 was not brought up to date: {none} \
+                             x86_64-linux-gnu (arm64-darwin has one). Vendored mode needs every \
+                             locked platform; its vendored copy of an earlier patch stays in \
+                             force as it is."
+                        )
+                    );
+                    assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
+                }
+                assert_eq!(downloads(&server).await, Vec::<String>::new());
+
+                // The same patch, once the lock names a third platform.
+                let lock_path = root.join(GEMFILE_LOCK);
+                let gained = text(lock_path.clone()).await.replace(
+                    "    nokogiri (1.18.10-x86_64-linux-gnu)\n",
+                    "    nokogiri (1.18.10-java)\n      racc (~> 1.4)\n    nokogiri (1.18.10-x86_64-linux-gnu)\n",
+                );
+                tokio::fs::write(&lock_path, &gained).await.unwrap();
+                let before = ts::tree_snapshot(&root);
+                let builds = [served(DARWIN), unserved(JAVA, status), served(LINUX)];
+                let (server, cfg) = service(UUID, &builds).await;
+                for dry_run in [true, false] {
+                    let (code, detail) = unwrap_refused(
+                        vendor(&root, &not_installed(&root), &record_a, &cfg, dry_run).await,
+                    );
+                    assert_eq!(code, "vendor_prebuilt_platform_pending", "{detail}");
+                    assert_eq!(
+                        detail,
+                        format!(
+                            "nokogiri@1.18.10 was not brought up to date: {none} java \
+                             (arm64-darwin and x86_64-linux-gnu have one). Vendored mode needs \
+                             every locked platform; its vendored copy stays in force as it is."
+                        )
+                    );
+                    assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
+                }
+                assert_eq!(downloads(&server).await, Vec::<String>::new());
+            }
+        }
+
+        /// What stays a failure. A copy the lock is ALREADY wired to that
+        /// lost a tree cannot wait for a platform patch that is not
+        /// served: its rebuild is the plain miss, dry run or not, and so
+        /// is a restore of the trees the ledger records, whose patches
+        /// have nothing to wait for.
+        #[tokio::test]
+        async fn an_unserved_platform_patch_fails_a_wired_copy_that_must_be_rebuilt() {
+            for (status, none, restore_says) in [
+                ("pending_build", "yet", "is still building"),
+                ("forbidden", "available", "Forbidden"),
+            ] {
+                let (_tmp, root, record) = project(&lock(None)).await;
+                let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+                let entry = vendor_and_persist(&root, &record, &cfg).await;
+                tokio::fs::remove_dir_all(root.join(rel(UUID)).join(LINUX))
+                    .await
+                    .unwrap();
+                let before = ts::tree_snapshot(&root);
+                let (_server, cfg) =
+                    service(UUID, &[served(DARWIN), unserved(LINUX, status)]).await;
+                for dry_run in [true, false] {
+                    let (code, detail) = unwrap_refused(
+                        vendor(&root, &not_installed(&root), &record, &cfg, dry_run).await,
+                    );
+                    assert_eq!(code, "vendor_prebuilt_required", "{detail}");
+                    assert!(!crate::vendor::refusals::refusal_is_benign(code));
+                    assert_eq!(
+                        detail,
+                        format!(
+                            "nokogiri@1.18.10 was not brought up to date: no patched build \
+                             {none} for x86_64-linux-gnu (arm64-darwin has one). Vendored mode \
+                             needs every locked platform; its vendored copy is missing or \
+                             damaged and cannot be rebuilt until then."
+                        )
+                    );
+                    assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
+                }
+                let failed = crate::vendor::redownload::restore(&root, &entry, &record, &cfg)
+                    .await
+                    .expect_err("a recorded tree whose patch is not served cannot be restored");
+                assert!(failed.starts_with("vendor_prebuilt_required: "), "{failed}");
+                assert!(failed.contains(restore_says), "{failed}");
+                assert_eq!(ts::tree_snapshot(&root), before, "restore");
+            }
+        }
+
+        /// What the skip does not cover: a response that leaves a platform
+        /// patch out says nothing of that patch, and once the references
+        /// are granted a download that fails is the miss it always was.
+        /// Both fail, with nothing written.
+        #[tokio::test]
+        async fn an_unanswered_platform_patch_or_a_failed_download_is_a_failure() {
+            let left_out = |platform: &'static str| Served {
+                own: Own::LeftOut,
+                ..served(platform)
+            };
+            // Left out beside one that is still being built: no skip.
+            for builds in [
+                vec![served(DARWIN), left_out(LINUX)],
+                vec![unserved(DARWIN, "pending_build"), left_out(LINUX)],
+            ] {
+                let (_tmp, root, record) = project(&lock(None)).await;
+                let before = ts::tree_snapshot(&root);
+                let (server, cfg) = service(UUID, &builds).await;
+                for dry_run in [true, false] {
+                    let (code, detail) = unwrap_refused(
+                        vendor(&root, &not_installed(&root), &record, &cfg, dry_run).await,
+                    );
+                    assert_eq!(code, "vendor_prebuilt_required", "{detail}");
+                    assert!(!crate::vendor::refusals::refusal_is_benign(code));
+                    assert!(detail.contains("missing a result"), "{detail}");
+                    assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
+                }
+                assert_eq!(downloads(&server).await, Vec::<String>::new());
+            }
+
+            let (_tmp, root, record) = project(&lock(None)).await;
+            let before = ts::tree_snapshot(&root);
+            let (server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path_regex(r"-x86_64-linux-gnu\.gem$"))
+                .respond_with(wiremock::ResponseTemplate::new(404))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            for dry_run in [true, false] {
+                let (code, detail) = unwrap_refused(
+                    vendor(&root, &not_installed(&root), &record, &cfg, dry_run).await,
+                );
+                assert_eq!(code, "vendor_prebuilt_required", "{detail}");
+                assert!(
+                    detail.contains(
+                        "could not fetch the patched platform gem for nokogiri (x86_64-linux-gnu)"
+                    ),
+                    "{detail}"
                 );
                 assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
             }

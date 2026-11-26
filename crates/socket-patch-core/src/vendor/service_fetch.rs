@@ -7,7 +7,7 @@
 //! (`IntegrityMismatch`), never a silent fallback to a wrong artifact. The
 //! backends own the placement: write the archive or extract it into a directory.
 
-use crate::api::client::{SecondaryArtifact, VendorReference, VendorServiceOutcome};
+use crate::api::client::{ApiError, SecondaryArtifact, VendorReference, VendorServiceOutcome};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::redirect::GemPlatformChecksum;
 use crate::vendor::lock_inventory::LockIntegrity;
@@ -243,13 +243,28 @@ pub(crate) async fn fetch_served_reference(
     served_reference(outcome)
 }
 
+/// Why the service does not serve one patch of a
+/// [`fetch_served_references`] batch, when it answered for that patch: the
+/// status of the patch's own reference, which says nothing of the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unserved {
+    /// `pending_build`: its artifact is still being built.
+    Building,
+    /// Any other status that is not a grant: `forbidden`, `not_found`,
+    /// `withdrawn`, `build_failed`, or one this build does not know.
+    NotGranted,
+}
+
 /// [`fetch_served_reference`] for several patches in ONE request: the
-/// answer for each of `uuids`, in their order. `Err` (a log reason) when
-/// the request itself failed, so nothing is known of any of them.
+/// answer for each of `uuids`, in their order, and with it whether the
+/// service answered that it does not serve that patch ([`Unserved`]). A
+/// patch the response leaves out is a failed answer, not an unserved one.
+/// `Err` (a log reason) when the request itself failed, so nothing is
+/// known of any of them.
 pub(crate) async fn fetch_served_references(
     cfg: &VendorServiceConfig,
     uuids: &[String],
-) -> Result<Vec<ServiceArtifact<ServedReference>>, String> {
+) -> Result<Vec<(ServiceArtifact<ServedReference>, Option<Unserved>)>, String> {
     let Some(client) = cfg.client.as_ref() else {
         return Err("vendor service not configured".to_string());
     };
@@ -262,7 +277,18 @@ pub(crate) async fn fetch_served_references(
         )
         .await
         .map_err(|e| e.to_string())?;
-    Ok(outcomes.into_iter().map(served_reference).collect())
+    let answered = outcomes.into_iter().map(|outcome| {
+        // Each outcome of a batch is read from that patch's `status`: a
+        // request the service refuses as a whole is the `Err` above.
+        let unserved = match &outcome {
+            VendorServiceOutcome::Pending => Some(Unserved::Building),
+            VendorServiceOutcome::Unavailable(_)
+            | VendorServiceOutcome::Failed(ApiError::Forbidden(_)) => Some(Unserved::NotGranted),
+            VendorServiceOutcome::Ready(_) | VendorServiceOutcome::Failed(_) => None,
+        };
+        (served_reference(outcome), unserved)
+    });
+    Ok(answered.collect())
 }
 
 fn served_reference(

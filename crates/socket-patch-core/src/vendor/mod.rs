@@ -730,9 +730,11 @@ pub const VENDOR_PREBUILT_REQUIRED: &str = "vendor_prebuilt_required";
 
 /// gem: `Gemfile.lock` pins the gem as precompiled platform gems and at
 /// least one of the locked platforms has no patched build: the gem
-/// patch's registry serves upstream's own gem for it, or does not list it.
-/// A patched build is named only once it is published, so "not yet" and
-/// "never" look the same from here: the package is left as it is and the
+/// patch's registry serves upstream's own gem for it or does not list it,
+/// or the patch it names for that build is not served (still being built,
+/// or not granted). A patched build is named and served only once it is
+/// published, so "not yet" and "never" look the same from here: the
+/// package is left as it is and the
 /// run does not fail because of it, whether or not an earlier vendored
 /// copy stays in force (the detail says which). A re-run vendors it once
 /// every locked platform has one.
