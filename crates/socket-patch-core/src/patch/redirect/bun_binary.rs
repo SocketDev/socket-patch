@@ -67,12 +67,15 @@ pub fn rewrite_bun_binary(content: &[u8], overrides: &[DepOverride], result: &mu
                 .collect();
             // A user URL / `file:` tarball record of this version installs
             // from its own resolution beside any redirected copy and stays
-            // unpatched (#497): never rewired, always reported.
+            // unpatched (#497): never rewired, always reported. An earlier
+            // pin of this very patch on another host is no such record
+            // (`is_same_patch_pin`).
             for p in packages.iter().filter(|p| {
                 p.name == name
                     && p.version.is_none()
                     && !matching.iter().any(|m| m.id == p.id)
                     && user_tarball_version(&name, &p.resolution) == Some(dep.version.as_str())
+                    && !super::is_same_patch_pin(&p.resolution, dep)
             }) {
                 skipped.push(RewriteWarning {
                     code: "redirect_bun_non_registry_entry_skipped".into(),
@@ -309,7 +312,11 @@ mod tests {
             ..dep("1.2.2")
         };
         let mut direct = RewriteResult::default();
-        rewrite_bun_binary(FIXTURE, &[on("https://patch.socket.dev", uuid)], &mut direct);
+        rewrite_bun_binary(
+            FIXTURE,
+            &[on("https://patch.socket.dev", uuid)],
+            &mut direct,
+        );
         assert!(direct.confirmed_bun_binary_uuids.contains(uuid));
         let pinned = direct.binary_files["bun.lockb"].clone();
 
@@ -320,7 +327,12 @@ mod tests {
         assert!(moved.binary_files.is_empty());
         assert!(moved.confirmed_bun_binary_uuids.is_empty());
         let codes: Vec<_> = moved.warnings.iter().map(|w| w.code.as_str()).collect();
-        assert_eq!(codes, ["redirect_bun_entry_not_found"], "{:?}", moved.warnings);
+        assert_eq!(
+            codes,
+            ["redirect_bun_entry_not_found"],
+            "{:?}",
+            moved.warnings
+        );
         assert!(moved.bundled_skipped_uuids.is_empty());
 
         let other = "99999999-9999-4999-8999-999999999999";

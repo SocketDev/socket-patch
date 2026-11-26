@@ -6616,7 +6616,15 @@ fn rewrite_bun_lock(
                 // this very version is installed from that spec beside the
                 // pinned copy and stays unpatched (#497, npm's #326): say so,
                 // and keep the in-run VEX from assuming the uuid patched.
-                if is_user_tarball_spec(spec, &fname, &dep.version) && spec != url_spec {
+                // An earlier pin of this very patch on another host is no
+                // such copy ([`is_same_patch_pin`]).
+                if is_user_tarball_spec(spec, &fname, &dep.version)
+                    && spec != url_spec
+                    && !spec
+                        .strip_prefix(fname.as_str())
+                        .and_then(|rest| rest.strip_prefix('@'))
+                        .is_some_and(|url| is_same_patch_pin(url, dep))
+                {
                     user_tarball_skipped = true;
                     result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
                     result.warnings.push(RewriteWarning {
@@ -6761,6 +6769,18 @@ pub(crate) fn is_prior_hosted_bun_spec(spec: &str, fname: &str, current_url: &st
         }
         _ => false,
     }
+}
+
+/// True when `url` is a hosted reference to `dep`'s own patch: a URL in the
+/// patch server's path shape, on any host, that names the patch's uuid. A
+/// Bun rewriter takes over an earlier pin only on the host it is writing
+/// ([`is_prior_hosted_bun_spec`]), so a run that writes a patch mirror
+/// meets the pin an earlier run wrote on the patch server as a URL it does
+/// not own. That copy is the patched one, not a user's tarball (#2279): it
+/// is left as it is and not reported unpatched. A URL in that shape naming
+/// another patch is not recognized here.
+pub(crate) fn is_same_patch_pin(url: &str, dep: &DepOverride) -> bool {
+    crate::origin::hosted_shape_uuid(url).as_deref() == Some(dep.patch_uuid.as_str())
 }
 
 // ── uv.lock ──────────────────────────────────────────────────────────────────
@@ -18788,11 +18808,15 @@ mod tests {
         let sha512 = format!("sha512-{}==", "A".repeat(86));
         let token = "22222222-2222-4222-8222-222222222222";
         let uuid = "11111111-1111-4111-8111-111111111111";
-        let served = |uuid: &str| format!("patch/npm/is-number/6.0.0/{token}/{uuid}/is-number-6.0.0.tgz");
+        let served =
+            |uuid: &str| format!("patch/npm/is-number/6.0.0/{token}/{uuid}/is-number-6.0.0.tgz");
         let ovr = npm_override(
             "is-number",
             "6.0.0",
-            &format!("https://repo.example/artifactory/socket-patch/{}", served(uuid)),
+            &format!(
+                "https://repo.example/artifactory/socket-patch/{}",
+                served(uuid)
+            ),
             &sha512,
         );
         assert_eq!(ovr.patch_uuid, uuid);
@@ -18825,7 +18849,10 @@ mod tests {
         rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
         assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
         assert_eq!(r.edits[0].key.as_deref(), Some("is-odd/is-number"));
-        assert!(r.files["bun.lock"].contains(&direct), "the direct pin is untouched");
+        assert!(
+            r.files["bun.lock"].contains(&direct),
+            "the direct pin is untouched"
+        );
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert!(r.bundled_skipped_uuids.is_empty());
 

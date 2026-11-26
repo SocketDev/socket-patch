@@ -88,10 +88,7 @@ impl Pkg {
         for (name, body) in [
             (
                 "package/package.json",
-                format!(
-                    r#"{{"name":"{}","version":"{}"}}"#,
-                    self.name, self.version
-                ),
+                format!(r#"{{"name":"{}","version":"{}"}}"#, self.name, self.version),
             ),
             (
                 "package/index.js",
@@ -510,14 +507,26 @@ async fn a_bun_pin_on_the_patch_server_is_named_and_not_called_unpatched() {
         };
 
         let direct = hosted_scan(tmp.path(), &api, &[], &[]);
-        assert_eq!(event(&direct.json(), BUN), applied(), "{lock}: {}", direct.stdout);
+        assert_eq!(
+            event(&direct.json(), BUN),
+            applied(),
+            "{lock}: {}",
+            direct.stdout
+        );
         let served = format!("{}{}", api.uri(), BUN.served_path());
-        assert!(holds(&served), "{lock}: the first run pins the patch server");
+        assert!(
+            holds(&served),
+            "{lock}: the first run pins the patch server"
+        );
         let pinned = std::fs::read(tmp.path().join(lock)).unwrap();
 
         let moved = hosted_scan(tmp.path(), &api, &["--patch-mirror-url", &base], &[]);
         let env = moved.json();
-        assert_eq!(event(&env, BUN), skipped("redirect_unconfirmed"), "{lock}: {env:#}");
+        assert_eq!(
+            event(&env, BUN),
+            skipped("redirect_unconfirmed"),
+            "{lock}: {env:#}"
+        );
         let codes = warning_codes(&env);
         assert!(
             codes.contains(&"redirect_mirror_pin_not_moved".to_string()),
@@ -544,7 +553,7 @@ async fn a_bun_pin_on_the_patch_server_is_named_and_not_called_unpatched() {
         );
         // `rollback` restores a bun.lock pin and refuses a bun.lockb one.
         assert_eq!(
-            not_moved.contains("socket-patch rollback"),
+            not_moved.contains(&format!("run `socket-patch rollback {}`", BUN.purl())),
             lock == "bun.lock",
             "{lock}: {not_moved}"
         );

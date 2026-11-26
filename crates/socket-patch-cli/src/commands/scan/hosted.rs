@@ -126,12 +126,23 @@ pub(crate) const MIRROR_PIN_NOT_MOVED: &str = "redirect_mirror_pin_not_moved";
 /// writing, so they leave a direct pin alone as a source the user chose.
 /// Without this the run would report such a patch with only the
 /// rewriter's own, unrelated-looking reason.
+///
+/// A binary `bun.lockb` is in no text of `files`: its pins are read from
+/// the URLs its records resolved from (`bun_binary_urls`). `rollback`
+/// refuses a `bun.lockb` pin, so the remedy there is the lock as it was
+/// before the pin.
 fn mirror_pins_not_moved(
     mirror_sources: &socket_patch_core::hosted::engine::MirrorSources,
     candidates: &[socket_patch_core::hosted::engine::Candidate],
     confirmed: &[(String, String)],
     files: &std::collections::BTreeMap<String, String>,
+    bun_binary_urls: &str,
 ) -> Vec<socket_patch_core::patch::redirect::RewriteWarning> {
+    const BUN_LOCKB: &str = "bun.lockb";
+    let texts = files
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .chain(std::iter::once((BUN_LOCKB, bun_binary_urls)));
     // By origin: an earlier pin of the patch may carry another grant token
     // in its path.
     let served: Vec<String> = mirror_sources
@@ -146,7 +157,7 @@ fn mirror_pins_not_moved(
         .filter(|c| mirrored.contains(c.dep.artifact_url.as_str()))
         .filter(|c| !confirmed.iter().any(|(_, uuid)| uuid == &c.dep.patch_uuid))
         .filter_map(|c| {
-            let (file, host) = files.iter().find_map(|(path, text)| {
+            let (file, host) = texts.clone().find_map(|(path, text)| {
                 socket_patch_core::vex::discover::hosted_host_in_text(
                     text,
                     &c.dep.patch_uuid,
@@ -154,18 +165,27 @@ fn mirror_pins_not_moved(
                 )
                 .map(|host| (path, host))
             })?;
-            Some(socket_patch_core::hosted::engine::warning(
-                MIRROR_PIN_NOT_MOVED,
+            let remedy = if file == BUN_LOCKB {
+                "restore bun.lockb to its content before the pin (from version control: \
+                 `socket-patch rollback` cannot restore a pin in a binary lock) and then run \
+                 this command again"
+                    .to_string()
+            } else {
                 format!(
-                    "{}: {file} pins it directly on {host}, and a pin in that file cannot be \
-                     moved onto the patch mirror {} in place, so it was left as it is; run \
-                     `socket-patch rollback {}` and then this command again",
-                    c.purl,
-                    mirror_sources.base(),
+                    "run `socket-patch rollback {}` and then this command again",
                     // As `rollback` selects a hosted pin: no qualifiers.
                     crate::ui::shell_word(socket_patch_core::utils::purl::strip_purl_qualifiers(
                         &c.purl
                     ))
+                )
+            };
+            Some(socket_patch_core::hosted::engine::warning(
+                MIRROR_PIN_NOT_MOVED,
+                format!(
+                    "{}: {file} pins it directly on {host}, and a pin in that file cannot be \
+                     moved onto the patch mirror {} in place, so it was left as it is; {remedy}",
+                    c.purl,
+                    mirror_sources.base(),
                 ),
             ))
         })
@@ -2184,6 +2204,7 @@ async fn run_redirect_selected_untracked(
         &candidates,
         &done.confirmed,
         &done.files,
+        &done.bun_binary_urls,
     ));
     let takeover::Finished {
         warnings: takeover_pre_warnings,
