@@ -1312,14 +1312,16 @@ impl PlatformGemPatch {
     /// is no fix of its own in `mode`, and the command that patches the
     /// gem there.
     fn not_taken(&self, mode: &str) -> String {
+        let gem = canonical_purl(&self.purl);
+        // Each command is spelled out whole, as a person would run it.
+        let run = match mode {
+            "vendored" => format!("Run `socket-patch get {gem} --mode vendored` instead"),
+            _ => format!("Run `socket-patch get {gem} --mode hosted` instead"),
+        };
         format!(
             "{} is the patch of {}'s {} build, which {mode} mode does not take by itself: it \
-             patches a gem through the gem's own patch. Run `socket-patch get {} --mode {mode}` \
-             instead",
-            self.uuid,
-            self.gem,
-            self.platform,
-            canonical_purl(&self.purl)
+             patches a gem through the gem's own patch. {run}",
+            self.uuid, self.gem, self.platform,
         )
     }
 }
