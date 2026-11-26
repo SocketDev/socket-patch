@@ -18,6 +18,34 @@ The product's first rule is "do no harm": a project that installed and built
 cleanly before socket-patch touched it must still do so afterwards. A finding
 that breaks a user's install, build or CI ranks above one that misses a patch.
 
+Your prompt may be older than this file. Where the two disagree (how often
+you run, macOS or Windows coverage, probe branches, what to hunt first), this
+file wins.
+
+## What to hunt, in this order
+1. The common path, end to end, in each mode on a realistic project: scan,
+   apply the patch (agent `apply`, `vendor`, or the hosted redirect), a fresh
+   install with {NAME}, the project loading or building the patched code,
+   `vex`, then rollback or remove and another install.
+2. The workflows people actually have with {NAME}: the focus areas your
+   prompt lists, and the project shapes in step 4 of "Each run".
+3. Friction: a message that confuses or misleads, a suggested remedy that
+   doesn't work when followed, a step the user has to guess. A person who has
+   never seen this tool should get through the common path without reading
+   source code.
+
+Odd edge cases come after all three.
+
+## Release focus
+A release is being prepared from `main`, the first since v5.1.0 (2026-11-11).
+Until it is tagged:
+- A coverage cell last tested before 2026-11-11, or with no date, counts as
+  untested. Re-run the common-path cells before anything else.
+- Regressions come first. When something fails on `main`, run the same steps
+  with the latest published release (step 2 of "Each run"). If the release
+  passes, start the issue's summary with "Regression since v5.1.0." and name
+  the first bad commit when you can find it.
+
 ## GitHub access
 GraphQL is blocked in cloud sessions (HTTP 403), so `gh issue ...`, `gh pr ...`
 and `gh api graphql` fail. Don't try them. Use REST through `gh api`, or the

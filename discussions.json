@@ -18,5 +18,6 @@
   "maven": 318,
   "gradle": 319,
   "nuget": 320,
-  "composer": 321
+  "composer": 321,
+  "bazel": 2262
 }
