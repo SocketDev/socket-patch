@@ -2876,9 +2876,12 @@ fn declaration_selects_source(text: &str, name: &str) -> bool {
     false
 }
 
-/// The way out of a platform-build refusal (#2091). Agent mode only: hosted
-/// mode refuses a precompiled build as well
-/// (`redirect_gem_platform_unsupported`).
+/// The way out of a platform-build refusal (#2091): agent mode, which
+/// patches a precompiled gem where it is installed. The refusals that
+/// carry it are of an installed copy the lock does not name as a platform
+/// build, and of the patch of one platform's build, which only agent mode
+/// applies. (Hosted mode patches a gem its lock names as platform builds
+/// through the patch registry.)
 fn platform_gem_remedy(name: &str) -> String {
     format!(
         "Patch {name} with `--mode agent`, which patches a precompiled gem where it is installed"

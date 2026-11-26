@@ -4935,9 +4935,10 @@ arm64-darwin.`
 
 VEX follows the builds. The scan's `--vex` attests each patched build under its own patch and
 writes an `affected` statement for a build that keeps upstream's gem. A later `socket-patch vex`
-reads the lock and asks the patch service which builds are patched (one request per such gem,
-and one more for a lock with no `CHECKSUMS` section): a build is attested as patched only when
-the lock installs exactly that patch's gem. When it cannot show that (`--offline`, a failed
+reads the lock and asks the patch service which builds are patched: one request for all such gems
+together, and one more per gem whose lock has no `CHECKSUMS` entry for a build. That is on top of
+the one request `vex` makes for the record of any hosted patch. A build is attested as patched only
+when the lock installs exactly that patch's gem. When it cannot show that (`--offline`, a failed
 request, a lock older than what the patch service lists now) it states the build as `affected`,
 with what to run to settle it, under the warning `vex_gem_build_unknown`. The run still succeeds.
 
@@ -4948,6 +4949,11 @@ refreshes the URL in both files, rewrites the one checksum that changed, and say
 ```text
 nokogiri 1.18.10: now also patched for arm64-darwin; already patched for x86_64-linux-gnu
 ```
+
+A lock with no `CHECKSUMS` section gets the same line. It does not record what a build was, so
+the scan asks the registry URL the lock names what it listed (one small request, made only when
+the URL changes). If that cannot be read, the line says `patched for` without telling which
+build is new.
 
 If a patched build is withdrawn, the registry stops serving it under the URL the lock names, and a
 fresh `bundle install` fails on that platform until the lock is refreshed. The next scan puts the
@@ -4977,6 +4983,16 @@ Three cases leave the gem as it is, with one plain line and no warning:
   registry has withdrawn is not patched today and would fail to install, so it does not hold the
   lock: when nothing is left to lose, the gem moves to the newer fix and that platform goes back
   to upstream's gem, as above. If the registry cannot be read, the lock stays.
+
+In the last two cases a lock that is on an earlier fix stays on it. If that fix has withdrawn one
+of its builds in the meantime, the platform would no longer install, so the scan brings the lock to
+the earlier fix's current listing: the withdrawn platform goes back to upstream's gem, the other
+platforms keep their patched builds, and both lines are printed:
+
+```text
+nokogiri 1.18.10: patched for x86_64-linux-gnu; upstream gem back for arm64-darwin (its patched build was withdrawn)
+nokogiri 1.18.10: the newer fix has no patched build for x86_64-linux-gnu yet; the lock stays on the patch it is on
+```
 
 A later scan moves the gem once the patched builds are there.
 
@@ -5137,15 +5153,15 @@ mode warns `redirect_gem_version_not_locked`, vendored mode reports a `skipped` 
 
 Vendored mode rewrites one top-level `gem` line to a `path:` source, and Bundler builds nothing
 for a path-sourced gem. It refuses a gem that doesn't fit and changes nothing for it; the other
-gems of the run are still vendored, and the run exits 1. These four refusals name another mode
-that can patch the gem:
+gems of the run are still vendored, and the run exits 1. Each of these four refusals names a
+way to patch the gem:
 
 | Code | The gem | What the error offers |
 |---|---|---|
 | `gemfile_declaration_not_editable` ("is indented") | is declared inside a block: `group :test do`, `platforms … do`, a conditional. Every Rails Gemfile declares its development and test gems this way. | Move the declaration to the top level (for a plain `group` block the error spells the option that replaces it, `group: :test`), or patch the gem with `--mode hosted`, which edits a declaration where it is. Inside a `source`, `git`, `github` or `path` block hosted mode refuses the gem too, and the error names `--mode agent`. |
 | `gemfile_declaration_not_editable` ("as a direct dependency") | is a direct dependency the Gemfile declares out of sight: in a gemspec (a gem library's development dependency), an `eval_gemfile`d file, a loop. | Declare it with one literal `gem "<name>"` line in the Gemfile (above `gemspec`, where the Gemfile has that directive), in place of any other `gem` call that declares it, or patch the gem with `--mode agent`. Hosted mode refuses a gem declared in those places too. |
 | `native_extensions_unsupported` | builds a native extension (puma, bootsnap). | `--mode hosted` or `--mode agent`. Both build the extension. Only `--mode agent` when the declaration picks the gem's source (a `source`, `git`, `github` or `path` block or option), which hosted mode refuses. |
-| `platform_gem_unsupported` | is installed as a precompiled platform build (`nokogiri-1.18.3-x86_64-linux-gnu`). | `--mode agent`. Hosted mode refuses a precompiled build too. |
+| `platform_gem_unsupported` | is a precompiled platform build in a shape a vendored directory cannot hold: the installed copy is a precompiled build (`nokogiri-1.18.3-x86_64-linux-gnu`) while the lock names the gem for the `ruby` platform alone; or the lock has the plain `nokogiri (1.18.10)` entry beside its platform gems; or the lock was written by a Bundler older than 2.3. A gem the lock pins as platform gems alone is vendored, see the next section. | The way out for its case: `--mode agent`, which patches the installed copy; `bundle lock --remove-platform ruby`; or a re-lock with Bundler 2.3 or later. `--mode hosted` patches the gem as well: a gem locked as platform gems through the patch registry (on a lock written by Bundler 2.2 or later), and one locked for the `ruby` platform alone like any other gem. |
 
 To patch one gem in another mode, name it: `socket-patch get <gem> --mode hosted`. A whole-project
 `scan --mode hosted` leaves vendored gems as they are, but it moves the vendored patches of the
