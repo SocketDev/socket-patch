@@ -5886,10 +5886,11 @@ async fn vendored_scan_skips_a_native_gem_that_holds_the_patch_in_hosted_mode() 
             &["scan", "--mode", "vendored", "--yes", "--json"],
         );
         let env = common::parse_json_envelope(&stdout);
-        assert_eq!(
-            gem_events(&env),
-            [format!("skipped/{PATCHED_IN_OTHER_MODE}")],
-            "{env}\nstderr:\n{stderr}"
+        let events = gem_events(&env);
+        assert!(
+            events.contains(&format!("skipped/{PATCHED_IN_OTHER_MODE}"))
+                && !events.iter().any(|e| e.starts_with("failed/")),
+            "{events:?}\n{env}\nstderr:\n{stderr}"
         );
         assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
         assert_eq!(env["status"], "success", "{env}");
@@ -5899,7 +5900,7 @@ async fn vendored_scan_skips_a_native_gem_that_holds_the_patch_in_hosted_mode() 
             .flatten()
             .find(|e| e["errorCode"] == PATCHED_IN_OTHER_MODE)
             .expect("the skip");
-        let why = skip["error"].as_str().unwrap_or_default();
+        let why = skip["reason"].as_str().unwrap_or_default();
         assert!(
             why.contains("hosted mode") && why.contains("native extension"),
             "{skip}"
@@ -5914,9 +5915,23 @@ async fn vendored_scan_skips_a_native_gem_that_holds_the_patch_in_hosted_mode() 
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     let shown = format!("{stdout}\n{stderr}");
     assert!(!shown.contains("Error"), "{shown}");
-    assert!(!shown.contains("left to patch"), "{shown}");
+    assert!(shown.contains("Nothing left to patch"), "{shown}");
     assert!(!shown.contains("failed"), "{shown}");
     assert!(shown.contains("patched in hosted mode"), "{shown}");
+    assert_eq!(read_pair(&proj), pair_before, "the hosted pin stays");
+
+    // `get --mode vendored` reads the same answer.
+    let (code, stdout, stderr) = unwind_run(
+        &proj,
+        &uri,
+        &["get", UUID, "--mode", "vendored", "--yes", "--json"],
+    );
+    let env = common::parse_json_envelope(&stdout);
+    assert!(
+        gem_events(&env).contains(&format!("skipped/{PATCHED_IN_OTHER_MODE}")),
+        "{env}\nstderr:\n{stderr}"
+    );
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
     assert_eq!(read_pair(&proj), pair_before, "the hosted pin stays");
 }
 
@@ -5967,7 +5982,7 @@ async fn vendored_scan_skips_a_native_gem_that_holds_the_patch_in_agent_mode() {
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     let shown = format!("{stdout}\n{stderr}");
     assert!(!shown.contains("Error"), "{shown}");
-    assert!(!shown.contains("left to patch"), "{shown}");
+    assert!(shown.contains("Nothing left to patch"), "{shown}");
     assert!(shown.contains("patched in agent mode"), "{shown}");
 }
 

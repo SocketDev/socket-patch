@@ -207,6 +207,70 @@ async fn keep_older_vendored_patch(
     })
 }
 
+/// The mode in which the gem `candidate` already holds the patch the run
+/// selected for it (`uuid`), for a gem the vendored backend refused for
+/// its native extension: `hosted` when the lock still pins that patch
+/// (`live_pin`, the candidate's hosted pin unless this run restored its
+/// upstream entry), `agent` when the manifest records it and the
+/// installed copy at `installed` holds it as agent mode leaves it (the
+/// verdict `vex` attests the gem by). `None` when it holds another patch
+/// or none: the refusal then stands.
+async fn gem_patch_held_in(
+    common: &GlobalArgs,
+    candidate: &str,
+    uuid: &str,
+    live_pin: Option<&HostedPin>,
+    installed: &Path,
+) -> Option<&'static str> {
+    if live_pin.is_some_and(|pin| pin.uuid == uuid) {
+        return Some("hosted");
+    }
+    let manifest = read_manifest(&common.resolved_manifest_path())
+        .await
+        .ok()
+        .flatten()?;
+    for (purl, record) in &manifest.patches {
+        if record.uuid == uuid
+            && PurlKey::same(purl, candidate)
+            && socket_patch_core::vex::verify::gem_copy_patched_in_place(purl, installed, record)
+                .await
+        {
+            return Some("agent");
+        }
+    }
+    None
+}
+
+/// A backend refusal as the run reports it: a gem refused for its native
+/// extension that already holds the selected patch in hosted or agent
+/// mode is the skip [`vendor::gem::GEM_PATCHED_IN_OTHER_MODE`] (#2269);
+/// every other refusal is itself.
+async fn settle_gem_refusal(
+    common: &GlobalArgs,
+    candidate: &str,
+    uuid: &str,
+    live_pin: Option<&HostedPin>,
+    installed: &Path,
+    code: &'static str,
+    detail: String,
+) -> (&'static str, String) {
+    if code != vendor::gem::NATIVE_EXTENSIONS_UNSUPPORTED {
+        return (code, detail);
+    }
+    match gem_patch_held_in(common, candidate, uuid, live_pin, installed).await {
+        Some(mode) => {
+            let purl = normalize_purl(candidate);
+            let name = socket_patch_core::utils::purl::purl_name_version(&purl)
+                .map_or(&*purl, |(name, _)| name);
+            (
+                vendor::gem::GEM_PATCHED_IN_OTHER_MODE,
+                vendor::gem::patched_in_other_mode_detail(name, mode, uuid),
+            )
+        }
+        None => (code, detail),
+    }
+}
+
 /// The `vendor_dir_symlink_unsupported` detail when `purl`'s vendor dir
 /// (`.socket/vendor`, its ecosystem dir, or the `uuid` unit) is a link.
 fn linked_vendor_dir_refusal(project_root: &Path, purl: &str, uuid: &str) -> Option<String> {
@@ -3922,6 +3986,9 @@ pub(crate) async fn vendor_records_reusing(
             // does not vendor the purl, and the advisories that only hold
             // once it does (see `TakeoverUndo`).
             let mut takeover_undo: Option<TakeoverUndo> = None;
+            // The candidate's hosted pin while the lock still holds it:
+            // gone once this run's restore of its upstream entry stands.
+            let mut live_pin = hosted_pin_of(candidate);
             if let Some(pin) = hosted_pin_of(candidate) {
                 let origins = crate::commands::hosted_unwind::patch_server_origins(common);
                 let restore_opts = socket_patch_core::patch::redirect::upstream::RestoreOptions {
@@ -4179,6 +4246,7 @@ pub(crate) async fn vendor_records_reusing(
                         takeover_undo = Some(undo);
                     } else {
                         undo.settle(env, common, candidate, &mut vlt_takeover_targets);
+                        live_pin = None;
                     }
                 }
             }
@@ -4279,6 +4347,7 @@ pub(crate) async fn vendor_records_reusing(
                     matches!(&outcome, Some(VendorOutcome::Done { entry, .. }) if entry.is_some());
                 if vendored || recorded || undo.savepoint.is_none() || group.is_none() {
                     undo.settle(env, common, candidate, &mut vlt_takeover_targets);
+                    live_pin = None;
                 } else {
                     undo.abandon(group.as_ref());
                 }
@@ -4296,6 +4365,16 @@ pub(crate) async fn vendor_records_reusing(
                     );
                 }
                 Some(VendorOutcome::Refused { code, detail }) => {
+                    let (code, detail) = settle_gem_refusal(
+                        common,
+                        candidate,
+                        &record.uuid,
+                        live_pin,
+                        pkg_source.path(),
+                        code,
+                        detail,
+                    )
+                    .await;
                     if refusal_is_benign(code) {
                         // An expected skip, not an error: informational.
                         if !common.silent && !common.json {
@@ -4767,7 +4846,11 @@ fn print_vendor_closing(
             .iter()
             .filter(|e| {
                 e.action == PatchAction::Applied
-                    || e.error_code.as_deref() == Some("already_vendored")
+                    || matches!(
+                        e.error_code.as_deref(),
+                        // In place before the run, here or in another mode.
+                        Some("already_vendored" | vendor::gem::GEM_PATCHED_IN_OTHER_MODE)
+                    )
             })
             .filter_map(|e| e.purl.as_deref())
             .collect();

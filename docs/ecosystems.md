@@ -5089,6 +5089,16 @@ other ecosystems (npm, PyPI, Cargo, Go, Composer, Gradle) to hosted mode. Once a
 patches of two modes, a `scan` with no `--mode` stops and asks which mode to use, so pass `--mode`
 on later runs.
 
+A later `scan --mode vendored` doesn't refuse a gem with a native extension again once it holds
+the selected patch in hosted or agent mode. It skips the gem with
+`vendor_gem_patched_in_other_mode`, a line that names the mode (`Skipping pkg:gem/json@2.9.1: json
+builds a native extension, which vendored mode cannot vendor; it stays patched in hosted mode
+(patch <uuid>)`), counts it as patched in the closing totals, and exits 0 when nothing else
+failed. The hosted pin or the agent-mode patch stays exactly as it was. The gem is refused again,
+and the run exits 1, when it holds no patch or a different one from the patch the scan selects
+(after the patch service published a newer one, say): `socket-patch get <gem> --mode hosted`
+brings it up to date.
+
 ## Ruby gems: native extensions
 
 Some gem fixes change only what a native extension is built from: its C sources

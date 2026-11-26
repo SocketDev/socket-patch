@@ -77,6 +77,9 @@ pub fn refusal_is_benign(code: &str) -> bool {
         // A gem version another project (or Ruby) put in the shared gem
         // home: this project doesn't lock it, so there is nothing to wire.
         || code == gem::GEM_VERSION_NOT_LOCKED
+        // A gem vendored mode cannot vendor that already holds the patch
+        // in the mode its refusal names.
+        || code == gem::GEM_PATCHED_IN_OTHER_MODE
         // An older vendored patch kept in force while the newer one is
         // unserved.
         || super::is_unserved(code)
@@ -452,6 +455,21 @@ pub async fn pristine_fetch_is_verifiable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2269: a native gem that already holds the patch in hosted or
+    /// agent mode is an expected skip; the refusal of one that does not
+    /// is still a failure.
+    #[test]
+    fn a_gem_patched_in_another_mode_is_a_skip_and_its_refusal_is_not() {
+        assert!(refusal_is_benign(gem::GEM_PATCHED_IN_OTHER_MODE));
+        assert!(!refusal_is_benign(gem::NATIVE_EXTENSIONS_UNSUPPORTED));
+        let detail = gem::patched_in_other_mode_detail("json", "hosted", "u-1");
+        assert!(
+            detail.contains("json builds a native extension")
+                && detail.contains("patched in hosted mode (patch u-1)"),
+            "{detail}"
+        );
+    }
     use crate::vendor::load_state;
 
     const UUID: &str = "22222222-2222-4222-8222-222222222222";

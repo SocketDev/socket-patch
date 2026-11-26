@@ -556,6 +556,18 @@ async fn verify_every_gem_copy(
     Ok(verdict)
 }
 
+/// Whether the installed gem copy at `pkg_path` holds `record`'s patch as
+/// agent mode leaves it: the files of the record the copy takes are all
+/// patched, there is at least one, and a native extension the record
+/// changes was rebuilt from them ([`verify_every_gem_copy`], the verdict
+/// `vex` and `apply --check` attest an agent-patched gem by).
+pub async fn gem_copy_patched_in_place(purl: &str, pkg_path: &Path, record: &PatchRecord) -> bool {
+    matches!(
+        verify_every_gem_copy(purl, &[pkg_path.to_path_buf()], record).await,
+        Ok(GemVerdict::Patched)
+    )
+}
+
 /// Why the installed copies of a gem pass ([`verify_every_gem_copy`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GemVerdict {
