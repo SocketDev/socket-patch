@@ -751,6 +751,18 @@ mod tests {
             Some(("2.8.11.rc1".to_string(), SHA_C.to_string()))
         );
         assert_eq!(pick_release(&info, "~> 3.0", &ruby), None);
+        // #2285: an index built with `gem generate_index` writes the
+        // digest as base64 (rack 3.2.9's line is the one it wrote), and
+        // the release is picked with the hex the download is checked by.
+        let base64 = "3.2.8 |checksum:AAAA\n\
+                      3.2.9 |checksum:gjXB0I8MRhvtz/RBO766iIFz5bCeEzKulRyY8O5GDcw=,ruby:>= 2.4.0\n";
+        assert_eq!(
+            pick_release(base64, "~> 3.2", &ruby),
+            Some((
+                "3.2.9".to_string(),
+                "8235c1d08f0c461bedcff4413bbeba888173e5b09e1332ae951c98f0ee460dcc".to_string()
+            ))
+        );
         // Several constraints on one line are joined by `&`.
         let ranged = format!("1.0.0 |checksum:{SHA_A},ruby:>= 2.0&< 3.0\n");
         assert_eq!(pick_release(&ranged, ">= 0", &ruby), None);
