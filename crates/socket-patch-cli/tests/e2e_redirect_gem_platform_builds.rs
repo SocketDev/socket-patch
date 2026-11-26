@@ -759,6 +759,104 @@ async fn a_platform_missing_from_the_list_is_waited_for_quietly() {
     assert_ne!(read(proj.path(), "Gemfile.lock"), lock(true));
 }
 
+/// The patch service also has a patch record per patched platform gem
+/// (`pkg:gem/<name>@<version>?platform=<platform>`), which a search
+/// returns beside the gem's own. Agent mode takes those; a hosted run
+/// patches the gem through its own patch alone. The platform gem's record
+/// is no selection of its own: one reference request for the one patch,
+/// no skip, and a later run offers no "newer patch".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_platform_gems_own_record_is_no_fix_of_its_own() {
+    let server = MockServer::start().await;
+    let platform_purl = format!("{PURL}?platform={LINUX}");
+    let listed = |uuid: &str, purl: &str| {
+        json!({
+            "uuid": uuid, "purl": purl, "tier": "free", "cveIds": [],
+            "ghsaIds": [GHSA], "severity": "high", "title": "platform gem fixture",
+        })
+    };
+    let found = |uuid: &str, purl: &str| {
+        json!({
+            "uuid": uuid, "purl": purl, "publishedAt": "2026-02-01T00:00:00Z",
+            "description": "x", "license": "MIT", "tier": "free",
+            "vulnerabilities": { GHSA: {
+                "cves": ["CVE-2026-5555"], "summary": "s", "severity": "high",
+                "description": "d",
+            }},
+        })
+    };
+    // Ahead of `mount_api`'s own answers: the gem's patch and the linux
+    // gem's, the latter published later (it would rank first).
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "packages": [{ "purl": PURL, "patches": [
+                listed(UUID, PURL), listed(LINUX_UUID, &platform_purl),
+            ]}],
+            "canAccessPaidPatches": false,
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "patches": [found(LINUX_UUID, &platform_purl), found(UUID, PURL)],
+            "canAccessPaidPatches": false,
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mount_api(&server, Some((&ONE_PATCHED[..], 4))).await;
+    let api = server.uri();
+
+    let proj = project(&lock(true));
+    let (code, env) = scan_json(proj.path(), &api, &[]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(
+        hosted_events(&env),
+        [
+            upstream_event(ARM),
+            patched_event("applied", LINUX, LINUX_UUID, true)
+        ],
+        "the gem is reported per build, and nothing is skipped: {env}"
+    );
+    let selected: Vec<&Value> = env["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|package| package["selectedUuids"].as_array().unwrap())
+        .collect();
+    assert_eq!(selected, [&json!(UUID)], "{env}");
+    let (references, _) = requests(&server).await;
+    assert_eq!(references, [[UUID.to_string()]], "one reference request");
+
+    // A later run: in place, and no patch is offered as newer.
+    let (code, env) = scan_json(proj.path(), &api, &[]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(env["updates"], json!([]), "{env}");
+    assert_eq!(env["rollout"]["counts"]["upgrade"], 0, "{env}");
+    assert_eq!(env["redirect"]["rewrittenFiles"], json!([]), "{env}");
+
+    // `get` for the gem takes the gem's own patch alone, too.
+    let fresh = project(&lock(true));
+    let (code, stdout, stderr) = hosted(fresh.path(), &api, &["get", PURL], &["--json"]);
+    let env: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not JSON ({e}):\n{stdout}\nstderr:\n{stderr}"));
+    assert_eq!(code, 0, "{env}\n{stderr}");
+    assert_eq!(
+        hosted_events(&env),
+        [
+            upstream_event(ARM),
+            patched_event("applied", LINUX, LINUX_UUID, true)
+        ],
+        "{env}"
+    );
+}
+
 /// `get <the gem's patch> --mode hosted` writes what `scan` writes and
 /// reports the gem per build the same way.
 #[tokio::test(flavor = "multi_thread")]

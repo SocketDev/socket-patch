@@ -135,9 +135,7 @@ pub(crate) async fn lockfile_supplement(
 /// there: a vendored selection leaves it out before anything is reported,
 /// downloaded or handed to the engine ([`drop_platform_gem_patches`]).
 pub(crate) fn is_platform_gem_patch(purl: &str) -> bool {
-    Ecosystem::from_purl(purl) == Some(Ecosystem::Gem)
-        && socket_patch_core::utils::purl::purl_qualifier(purl, "platform")
-            .is_some_and(|platform| !platform.is_empty() && !platform.eq_ignore_ascii_case("ruby"))
+    socket_patch_core::hosted::engine::is_platform_gem_patch(purl)
 }
 
 /// Take the patches of platform gems ([`is_platform_gem_patch`]) out of

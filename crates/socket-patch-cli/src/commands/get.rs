@@ -1716,11 +1716,15 @@ pub async fn run(args: GetArgs) -> i32 {
     search_response
         .patches
         .retain(|p| args.common.purl_ecosystem_selected(&p.purl));
-    // A vendored run patches a gem through the patch of the gem itself: the
-    // patch of one of its platform gems, which a search returns beside it,
-    // is no fix of its own there. (One named by its UUID is the caller's
-    // exact intent, and reaches the backend's own refusal.)
-    if mode == super::scan::ScanMode::Vendored {
+    // A hosted or a vendored run patches a gem through the patch of the
+    // gem itself: the patch of one of its platform gems, which a search
+    // returns beside it, is no fix of its own there. (One named by its
+    // UUID is the caller's exact intent, and reaches the backend's own
+    // refusal.)
+    if matches!(
+        mode,
+        super::scan::ScanMode::Vendored | super::scan::ScanMode::Hosted
+    ) {
         search_response
             .patches
             .retain(|p| !super::scan::is_platform_gem_patch(&p.purl));

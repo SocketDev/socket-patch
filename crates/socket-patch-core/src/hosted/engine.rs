@@ -135,6 +135,22 @@ pub fn unconfirmed_candidates(
         .collect()
 }
 
+/// Whether `purl` is the patch purl of one platform gem
+/// (`pkg:gem/<name>@<version>?platform=<platform>`, any platform but
+/// `ruby`): what an installed copy of that platform gem takes in place
+/// (agent mode).
+///
+/// A hosted or a vendored run patches a gem through the patch of the gem
+/// itself, whose package reference names the patched build of every
+/// platform. The patch of a platform gem is no fix of its own there: such
+/// a run leaves it out of what it selects, before anything is reported,
+/// looked up or written, so the gem is one package with one patch.
+pub fn is_platform_gem_patch(purl: &str) -> bool {
+    crate::crawlers::Ecosystem::from_purl(purl) == Some(crate::crawlers::Ecosystem::Gem)
+        && crate::utils::purl::purl_qualifier(purl, "platform")
+            .is_some_and(|platform| !platform.is_empty() && !platform.eq_ignore_ascii_case("ruby"))
+}
+
 /// Skip reason of a gem the Bundler lock names as precompiled platform
 /// builds, left on its upstream registry because the patch registry has no
 /// patched build yet for any platform the lock names: moving it would gain
