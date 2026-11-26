@@ -77,7 +77,8 @@ use self::gc::gc_into;
 pub(crate) use self::hosted::boxed_run_redirect_selected;
 use self::hosted::run_redirect;
 use self::vendor_flow::{
-    boxed_vendor_interactive_path, boxed_vendor_json_path, partition_skipped_selected,
+    boxed_vendor_interactive_path, boxed_vendor_json_path, classify_vendor,
+    partition_skipped_selected,
 };
 pub(crate) use self::vendor_flow::{boxed_vendor_step, preview_vendor, VendorStep};
 
@@ -4172,7 +4173,7 @@ async fn scan_project(
     let selected = if report_only {
         selected
     } else if vendor {
-        let preview = preview_vendor(&args.common, &selected).await;
+        let preview = classify_vendor(&args.common, &selected).await;
         let refused = preview.refused_purls();
         vendor_preview = Some(preview);
         stage.plan(&rows, |r| !refused.contains(&r.writer.purl));
@@ -4385,6 +4386,9 @@ async fn scan_project(
                 .take()
                 .expect("the vendored planning pass computed the preview");
             preview.retain_selected(&selected);
+            preview
+                .ask_platform_gems(&args.common, Some((&api_client, use_public_proxy)))
+                .await;
             Some(preview)
         } else {
             None

@@ -22,8 +22,12 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::telemetry::{track_patch_vendor_failed, TelemetryAuth};
 use socket_patch_core::utils::purl_key::PurlKey;
+use socket_patch_core::vendor::gem::LockedBuildsPreview;
 use socket_patch_core::vendor::refusals::{vendor_refusals, RefusalScope, VendorRefusal};
-use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
+use socket_patch_core::vendor::{
+    load_state, lookup_entry, save_state, GemBuildEntry, VendorOutcome, VendorState,
+    VENDOR_PREBUILT_PLATFORM_PENDING,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
@@ -107,9 +111,19 @@ pub(crate) struct PreviewRow {
     /// Symlinked wiring files the wet run's commit refuses to rename over
     /// (see [`symlinked_wiring_warnings`]); only on vendor/revendor rows.
     pub(crate) warnings: Vec<RunWarning>,
+    /// gem: the lockfiles pin the package hosted, so the wet run restores
+    /// its upstream entry before it vendors (a takeover).
+    pub(crate) hosted: bool,
+    /// gem: the platform gems the wet run would vendor for a gem
+    /// `Gemfile.lock` names as precompiled platform gems, each with its
+    /// own patch, once the patch service was asked
+    /// ([`VendorPreview::ask_platform_gems`]). Only on vendor/revendor
+    /// rows, which are then reported once per platform gem, as the wet
+    /// run reports them.
+    pub(crate) gem_builds: Vec<GemBuildEntry>,
 }
 
-/// The vendored dry-run preview, purl-sorted (see [`preview_vendor`]).
+/// The vendored dry-run preview, purl-sorted (see [`classify_vendor`]).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct VendorPreview {
     pub(crate) rows: Vec<PreviewRow>,
@@ -161,8 +175,11 @@ impl VendorPreview {
     /// `details.mode: "vendored"`: `verified` for a patch the wet run would
     /// vendor (`oldUuid` on a re-vendor), `skipped` / `already_vendored`
     /// for one in sync, and `skipped` with the preflight's code for one the
-    /// wet run would refuse (never a status or exit change). Each symlink
-    /// advisory joins the top-level `warnings`, prefixed with its purl.
+    /// wet run would refuse (never a status or exit change). A gem the wet
+    /// run would vendor as platform gems is one `verified` event per
+    /// platform gem, each under that gem's own patch, as the wet run
+    /// reports it. Each symlink advisory joins the top-level `warnings`,
+    /// prefixed with its purl.
     pub(crate) fn record_into(&self, env: &mut Envelope) {
         for row in &self.rows {
             let event = match &row.verdict {
@@ -184,15 +201,134 @@ impl VendorPreview {
                     PatchEvent::new(PatchAction::Verified, row.purl.as_str())
                 }
             };
-            env.record(tag_mode(
-                event.with_uuid(row.uuid.as_str()),
-                Some("vendored"),
-            ));
+            let event = event.with_uuid(row.uuid.as_str());
+            let events = match row.gem_builds.as_slice() {
+                [] => vec![event],
+                builds => {
+                    crate::commands::vendor::gem_build_events(&event, &row.purl, &row.uuid, builds)
+                }
+            };
+            for event in events {
+                env.record(tag_mode(event, Some("vendored")));
+            }
             env.warnings.extend(
                 row.warnings.iter().map(|w| {
                     RunWarning::new(w.code.as_str(), format!("{}: {}", row.purl, w.detail))
                 }),
             );
+        }
+    }
+
+    /// Ask the patch service what the wet run would do with each gem of
+    /// the preview that `Gemfile.lock` names as precompiled platform gems,
+    /// so a dry run says what the wet run does: vendored mode needs a
+    /// patched build of every locked platform, which the ledger cannot
+    /// tell. The requests are the ones the wet run's vendor step makes
+    /// before it downloads anything, for each such gem the wet run would
+    /// vendor or re-vendor: the package reference of the gem's patch and,
+    /// only where that names a patched build for every locked platform,
+    /// the references of those builds' patches in one request more (see
+    /// [`socket_patch_core::vendor::gem::preview_locked_builds`]). None is
+    /// made for any other row, and none under `--offline`. Nothing is
+    /// downloaded or written.
+    ///
+    /// A gem with a patched build of every locked platform keeps its
+    /// verdict and gains the platform gems it is reported by
+    /// ([`PreviewRow::gem_builds`]). Any other answer becomes the row's
+    /// would-refuse verdict, settled as the wet run's vendor step settles
+    /// the backend's refusal: a locked platform with no patched build is
+    /// that step's skip, with its one line, and a patch service that
+    /// could not say is the failure the wet run would end in, never a
+    /// promise to vendor.
+    ///
+    /// `client` is the run's API client, with whether it targets the
+    /// public proxy; a caller that holds none has one built from `common`,
+    /// once, and only when a gem is to be asked about.
+    pub(crate) async fn ask_platform_gems(
+        &mut self,
+        common: &GlobalArgs,
+        client: Option<(&ApiClient, bool)>,
+    ) {
+        let would_vendor = |row: &PreviewRow| {
+            matches!(
+                row.verdict,
+                PreviewVerdict::WouldVendor | PreviewVerdict::WouldRevendor { .. }
+            )
+        };
+        let candidates: Vec<&str> = self
+            .rows
+            .iter()
+            .filter(|row| would_vendor(row))
+            .map(|row| row.purl.as_str())
+            .collect();
+        let platform_gems: HashSet<String> =
+            socket_patch_core::vendor::gem::gems_locked_as_platform_gems(&common.cwd, &candidates)
+                .await
+                .into_iter()
+                .collect();
+        if platform_gems.is_empty() {
+            return;
+        }
+        let service = match (common.offline, client) {
+            // Offline, the backend refuses before it would ask.
+            (true, _) => common.vendor_service_config(None, false),
+            (false, Some((client, use_public_proxy))) => {
+                common.vendor_service_config(Some(client.clone()), use_public_proxy)
+            }
+            (false, None) => {
+                let (client, use_public_proxy) =
+                    socket_patch_core::api::client::get_api_client_with_overrides(
+                        common.api_client_overrides(),
+                    )
+                    .await;
+                common.vendor_service_config(Some(client), use_public_proxy)
+            }
+        };
+        let state = load_state(&common.cwd).await.unwrap_or_default();
+        for row in &mut self.rows {
+            if !would_vendor(row) || !platform_gems.contains(&row.purl) {
+                continue;
+            }
+            let asked = socket_patch_core::vendor::gem::preview_locked_builds(
+                &common.cwd,
+                &row.purl,
+                &row.uuid,
+                row.hosted,
+                Some(&service),
+            )
+            .await;
+            let (code, detail) = match asked {
+                None => continue,
+                Some(LockedBuildsPreview::Vendor(builds)) => {
+                    row.gem_builds = builds;
+                    continue;
+                }
+                Some(LockedBuildsPreview::Refused { code, detail }) => (code, detail),
+            };
+            // As the vendor loop settles the backend's refusal: an older
+            // vendored patch still in force keeps an unserved one a skip,
+            // and a gem that stays hosted says so.
+            let settled = crate::commands::vendor::keep_older_vendored_patch(
+                Some(VendorOutcome::Refused { code, detail }),
+                &state,
+                &row.purl,
+                &row.uuid,
+                common,
+            )
+            .await;
+            let Some(VendorOutcome::Refused { code, detail }) = settled else {
+                continue;
+            };
+            let detail = match row.hosted {
+                true => crate::commands::vendor::hosted_pending_detail(code, detail),
+                false => detail,
+            };
+            row.verdict = PreviewVerdict::WouldRefuse {
+                code: code.to_string(),
+                detail,
+            };
+            // The symlink advisories are for rows the wet run writes.
+            row.warnings.clear();
         }
     }
 
@@ -229,8 +365,9 @@ impl VendorPreview {
     /// (already vendored)` line for each in-sync row (stderr, the wet
     /// run's line and stream), a `[would-refuse]` line naming what the wet
     /// run would refuse and why (a `[skip]` line on stderr, as the wet run
-    /// prints it, when the refusal is an expected skip), and the symlink
-    /// advisories. Shared by
+    /// prints it, when the refusal is an expected skip; the one line of a
+    /// gem with a locked platform that has no patched build, as the wet
+    /// run's vendor step prints it), and the symlink advisories. Shared by
     /// `scan --mode vendored --dry-run` and `get … --mode vendored
     /// --dry-run` so the two cannot drift. Callers gate it on `--silent`.
     pub(crate) fn print_human(&self) {
@@ -248,7 +385,13 @@ impl VendorPreview {
         }
         for row in &self.rows {
             if let PreviewVerdict::WouldRefuse { code, detail } = &row.verdict {
-                if row.verdict.would_skip() == Some(true) {
+                if code == VENDOR_PREBUILT_PLATFORM_PENDING {
+                    // The wet run's line and stream: its vendor step's.
+                    eprintln!(
+                        "{}",
+                        crate::commands::vendor::format_skip(&row.purl, code, detail)
+                    );
+                } else if row.verdict.would_skip() == Some(true) {
                     // The wet run's line and stream.
                     eprintln!(
                         "{}",
@@ -269,8 +412,9 @@ impl VendorPreview {
     }
 }
 
-/// Dry-run preview for `scan --mode vendored` (and `get … --mode vendored
-/// --dry-run`): classify each selected patch against the vendor ledger
+/// The classification behind the dry-run preview of `scan --mode vendored`
+/// (and `get … --mode vendored --dry-run`): classify each selected patch
+/// against the vendor ledger
 /// without writing anything or touching the network beyond discovery
 /// (see [`PreviewVerdict`]): would-refuse for every purl the wet run
 /// refuses before any download
@@ -294,20 +438,43 @@ impl VendorPreview {
 /// shows as would-refuse never takes a `--max-new-patches` slot (#1908,
 /// #1976). Resolves the run's `--patch-server-url` origins and the gem
 /// takeover refusals itself.
-pub(crate) async fn preview_vendor(
+///
+/// A dry run then asks the patch service about the gems the lock names as
+/// platform gems ([`VendorPreview::ask_platform_gems`]), for the rows the
+/// plan left in the run: what the wet run learns in its vendor step,
+/// after the plan, is not the planning pass's to know.
+pub(crate) async fn classify_vendor(
     common: &GlobalArgs,
     selected: &[PatchSearchResult],
 ) -> VendorPreview {
     let origins = crate::commands::hosted_unwind::patch_server_origins(common);
-    let takeover = crate::commands::vendor::gem_takeover_preview_refusals(
+    let (takeover, hosted) = crate::commands::vendor::gem_takeover_preview_refusals(
         common,
         selected.iter().map(|p| p.purl.as_str()),
     )
     .await;
-    preview_vendor_with(&common.cwd, selected, &origins, &takeover).await
+    let mut preview = preview_vendor_with(&common.cwd, selected, &origins, &takeover).await;
+    for row in &mut preview.rows {
+        row.hosted = hosted.contains(&row.purl);
+    }
+    preview
 }
 
-/// [`preview_vendor`] over caller-resolved `origins` (the run's
+/// The whole dry-run preview of `get … --mode vendored`, which plans no
+/// rollout: [`classify_vendor`], then what the patch service says of the
+/// gems the lock names as platform gems
+/// ([`VendorPreview::ask_platform_gems`]), asked through an API client
+/// built from `common`.
+pub(crate) async fn preview_vendor(
+    common: &GlobalArgs,
+    selected: &[PatchSearchResult],
+) -> VendorPreview {
+    let mut preview = classify_vendor(common, selected).await;
+    preview.ask_platform_gems(common, None).await;
+    preview
+}
+
+/// [`classify_vendor`] over caller-resolved `origins` (the run's
 /// `--patch-server-url` origins) and `takeover_refusals` (keyed by the
 /// selected purl, each a would-refuse row); the unit tests seed both.
 async fn preview_vendor_with(
@@ -392,6 +559,8 @@ async fn preview_vendor_with(
                 uuid: p.uuid.clone(),
                 verdict,
                 warnings,
+                hosted: false,
+                gem_builds: Vec::new(),
             }
         })
         .collect();
@@ -856,7 +1025,7 @@ async fn run_vendor_json_path(
     // The planning pass: a patch the preflight refuses holds no slot (it
     // still reaches the engine, which reports the refusal).
     let writers = writers_of(&rows);
-    let mut preview = preview_vendor(&args.common, &writers).await;
+    let mut preview = classify_vendor(&args.common, &writers).await;
     let refused = preview.refused_purls();
     stage.plan(&rows, |r| !refused.contains(&r.writer.purl));
     let deferred = stage.deferred_keys();
@@ -867,10 +1036,14 @@ async fn run_vendor_json_path(
     finish_rollout_json(stage, env);
 
     if args.common.dry_run {
-        // No downloads, no backends: classify against the ledger
+        // No downloads, no backends: classify against the ledger, ask the
+        // patch service about the gems the lock names as platform gems,
         // and preview the GC, exactly like agent mode's dry run (and the
         // human arm, which previews the same GC through `finish_human`).
         preview.retain_selected(&selected);
+        preview
+            .ask_platform_gems(&args.common, Some((api_client, use_public_proxy)))
+            .await;
         preview.record_into(env);
         if prune {
             gc_into(
@@ -1682,6 +1855,72 @@ mod preview_tests {
         }
     }
 
+    /// A gem `Gemfile.lock` names as precompiled platform gems is vendored
+    /// only once every locked platform has a patched build, which the
+    /// ledger cannot tell and the patch service can. Offline the service
+    /// may not be asked: the row says the failure the wet run ends in,
+    /// never that the gem would be vendored, and nothing is requested (the
+    /// API of this run answers nowhere). A gem the lock names for the ruby
+    /// platform is not asked about, offline or not: its row stands.
+    #[tokio::test]
+    async fn an_offline_preview_never_promises_a_platform_locked_gem() {
+        const NOKO: &str = "pkg:gem/nokogiri@1.18.10?platform=ruby";
+        const RACK: &str = "pkg:gem/rack@3.2.6";
+        const NOKO_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+        const RACK_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d60";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Gemfile"),
+            "source \"https://rubygems.org\"\n\ngem \"nokogiri\"\ngem \"rack\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("Gemfile.lock"),
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    nokogiri \
+             (1.18.10-arm64-darwin)\n    nokogiri (1.18.10-x86_64-linux-gnu)\n    rack \
+             (3.2.6)\n\nPLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\nDEPENDENCIES\n  \
+             nokogiri\n  rack\n\nBUNDLED WITH\n   2.5.22\n",
+        )
+        .unwrap();
+        let common = crate::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            api_url: Some("http://127.0.0.1:9".to_string()),
+            proxy_url: Some("http://127.0.0.1:9".to_string()),
+            offline: true,
+            dry_run: true,
+            silent: true,
+            ..Default::default()
+        };
+        let selected = [sel(NOKO_UUID, NOKO), sel(RACK_UUID, RACK)];
+        let mut preview = super::classify_vendor(&common, &selected).await;
+        assert!(
+            preview
+                .rows
+                .iter()
+                .all(|row| matches!(row.verdict, PreviewVerdict::WouldVendor)),
+            "the ledger alone knows neither gem: {:?}",
+            preview.rows
+        );
+
+        preview.ask_platform_gems(&common, None).await;
+        let verdict = |purl: &str| {
+            let row = preview.rows.iter().find(|row| row.purl == purl);
+            row.unwrap_or_else(|| panic!("{purl}")).verdict.clone()
+        };
+        match verdict(NOKO) {
+            PreviewVerdict::WouldRefuse { code, detail } => {
+                assert_eq!(code, "vendor_service_offline_conflict", "{detail}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(verdict(RACK), PreviewVerdict::WouldVendor));
+        assert_eq!(preview.refused_count(), 1);
+        assert_eq!(
+            preview.landing_uuids(),
+            std::collections::HashSet::from([RACK_UUID])
+        );
+    }
+
     fn seed_entry(root: &Path, purl: &str, uuid: &str) {
         let vendor = root.join(".socket/vendor");
         std::fs::create_dir_all(&vendor).unwrap();
@@ -2093,14 +2332,14 @@ wheels = [
             silent: true,
             ..Default::default()
         };
-        let refused = super::preview_vendor(&common, &[sel(UUID, SIX)])
+        let refused = super::classify_vendor(&common, &[sel(UUID, SIX)])
             .await
             .refused_purls();
         assert!(refused.contains(SIX), "{refused:?}");
 
         // Control: without the setting the patch keeps its slot.
         std::fs::write(tmp.path().join("pyproject.toml"), UV_PYPROJECT).unwrap();
-        let refused = super::preview_vendor(&common, &[sel(UUID, SIX)])
+        let refused = super::classify_vendor(&common, &[sel(UUID, SIX)])
             .await
             .refused_purls();
         assert!(refused.is_empty(), "{refused:?}");
@@ -2471,7 +2710,7 @@ mod npm_lock_entry_refusal_tests {
                 cwd: root.to_path_buf(),
                 ..GlobalArgs::default()
             };
-            let refused = preview_vendor(&common, &[sel(LEFT_PAD), sel(IS_NUMBER)])
+            let refused = classify_vendor(&common, &[sel(LEFT_PAD), sel(IS_NUMBER)])
                 .await
                 .refused_purls();
             assert_eq!(

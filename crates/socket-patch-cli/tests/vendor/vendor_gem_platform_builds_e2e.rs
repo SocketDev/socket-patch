@@ -8,6 +8,7 @@
 //! each patched build, and each such patch serves that platform's gem
 //! (`tarball`) and stub gemspec. No Bundler runs here.
 
+use crate::common::envelope::find_event;
 use crate::common::{binary, git_sha256, hermetic, sha256_hex};
 
 use std::path::Path;
@@ -23,6 +24,8 @@ const VERSION: &str = "1.0.0";
 const PURL: &str = "pkg:gem/sockplatgem@1.0.0";
 /// The gem's patch: the patch of its ruby gem.
 const UUID: &str = "5eed0000-0000-4000-8000-000000000001";
+/// A later patch of the gem.
+const UUID_B: &str = "5eed0000-0000-4000-8000-000000000002";
 const DARWIN: &str = "arm64-darwin";
 const LINUX: &str = "x86_64-linux-gnu";
 const DARWIN_UUID: &str = "5eed0000-0000-4000-8000-0000000000da";
@@ -102,8 +105,13 @@ fn build_uuid(platform: &str) -> &'static str {
 
 /// The gem patch's record as the patch API's view serves it.
 fn patch_view() -> serde_json::Value {
+    patch_view_of(UUID)
+}
+
+/// [`patch_view`] for the gem patch `uuid`.
+fn patch_view_of(uuid: &str) -> serde_json::Value {
     serde_json::json!({
-        "uuid": UUID,
+        "uuid": uuid,
         "purl": format!("{PURL}?platform=ruby"),
         "publishedAt": "2026-01-01T00:00:00Z",
         "files": {
@@ -130,12 +138,41 @@ fn patch_view() -> serde_json::Value {
 /// A patch service where the platforms of `patched` have a patched build
 /// and those of `pass_through` are listed as upstream's own gem.
 async fn service(patched: &[&'static str], pass_through: &[&'static str]) -> MockServer {
+    let granted: Vec<(&'static str, Option<&'static str>)> =
+        patched.iter().map(|platform| (*platform, None)).collect();
+    service_of(UUID, &granted, pass_through).await
+}
+
+/// [`service`] for the gem patch `uuid`, where the reference of the patch
+/// of each patched build answers the status named beside its platform
+/// (which is no grant), or a grant when none is named.
+async fn service_of(
+    uuid: &'static str,
+    patched: &[(&'static str, Option<&'static str>)],
+    pass_through: &[&'static str],
+) -> MockServer {
+    // Hand the test's task back to the runtime once, which renews its tokio
+    // cooperative budget. A `MockServer` verifies its mocks when it is
+    // dropped, on a blocking executor of its own, and a task that has used
+    // up its budget never gets through that. Every mount, every read of
+    // the received requests and every server start spends some of it, and
+    // a test that only runs child processes in between never yields by
+    // itself.
+    tokio::task::yield_now().await;
     let server = MockServer::start().await;
     let mut results = serde_json::Map::new();
     let mut gem_builds = Vec::new();
-    for platform in patched {
+    for (platform, status) in patched {
         let own = build_uuid(platform);
         let (gem, gemspec) = (platform_gem(platform), stub(platform));
+        gem_builds.push(serde_json::json!({
+            "platform": platform, "gemChecksumSha256": sha256_hex(&gem), "patchUuid": own
+        }));
+        if let Some(status) = status {
+            let unserved = serde_json::json!({ "status": status, "url": null, "artifacts": [] });
+            results.insert(own.to_string(), unserved);
+            continue;
+        }
         let base = format!("/patch/gem/{NAME}/{VERSION}/tok/{own}/{NAME}-{VERSION}-{platform}");
         let mut artifacts = Vec::new();
         for (kind, ext, bytes) in [
@@ -154,9 +191,6 @@ async fn service(patched: &[&'static str], pass_through: &[&'static str]) -> Moc
                 .mount(&server)
                 .await;
         }
-        gem_builds.push(serde_json::json!({
-            "platform": platform, "gemChecksumSha256": sha256_hex(&gem), "patchUuid": own
-        }));
         results.insert(
             own.to_string(),
             serde_json::json!({
@@ -174,11 +208,11 @@ async fn service(patched: &[&'static str], pass_through: &[&'static str]) -> Moc
     gem_builds.sort_by_key(|build| build["platform"].as_str().map(str::to_string));
     let ruby_gem = make_gem(&[(LIB, PATCHED)]);
     let ruby_url = format!(
-        "{}/patch/gem/{NAME}/{VERSION}/tok/{UUID}/{NAME}-{VERSION}.gem",
+        "{}/patch/gem/{NAME}/{VERSION}/tok/{uuid}/{NAME}-{VERSION}.gem",
         server.uri()
     );
     results.insert(
-        UUID.to_string(),
+        uuid.to_string(),
         serde_json::json!({
             "status": "granted",
             "purl": format!("{PURL}?platform=ruby"),
@@ -187,7 +221,7 @@ async fn service(patched: &[&'static str], pass_through: &[&'static str]) -> Moc
                             "integrity": { "sha512": sri(&ruby_gem) } }],
             "registryOverride": {
                 "kind": "rubygems-compact-index",
-                "indexUrl": format!("{}/patch-registry/gem/tok/{UUID}/s/4", server.uri()),
+                "indexUrl": format!("{}/patch-registry/gem/tok/{uuid}/s/4", server.uri()),
                 "identifiers": {
                     "name": NAME, "version": VERSION,
                     "gemChecksumSha256": sha256_hex(&ruby_gem),
@@ -215,8 +249,8 @@ async fn service(patched: &[&'static str], pass_through: &[&'static str]) -> Moc
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(wm_path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(patch_view()))
+        .and(wm_path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(patch_view_of(uuid)))
         .mount(&server)
         .await;
     server
@@ -256,13 +290,19 @@ async fn downloads(server: &MockServer) -> Vec<String> {
 fn write_project(root: &Path) {
     std::fs::write(root.join("Gemfile"), GEMFILE).unwrap();
     std::fs::write(root.join("Gemfile.lock"), lock()).unwrap();
+    write_manifest(root, UUID);
+}
+
+/// The manifest record of the gem patch `uuid`, with its staged
+/// after-blob.
+fn write_manifest(root: &Path, uuid: &str) {
     let socket = root.join(".socket");
     std::fs::create_dir_all(socket.join("blobs")).unwrap();
     let view = patch_view();
     let manifest = serde_json::json!({
         "patches": {
             PURL: {
-                "uuid": UUID,
+                "uuid": uuid,
                 "exportedAt": "2026-01-01T00:00:00Z",
                 "files": {
                     LIB: {
@@ -1078,5 +1118,442 @@ async fn a_vendored_get_takes_the_gem_through_its_own_patch_alone() {
     assert!(
         !views.is_empty() && views.iter().all(|path| path.ends_with(UUID)),
         "only the gem's own record is downloaded: {views:?}"
+    );
+}
+
+/// The commands that vendor the gem, as a person runs them.
+const VENDOR_IT: &[&str] = &["vendor", "--vendor-source", "service"];
+const SCAN_IT: &[&str] = &["scan", "--mode", "vendored", "--yes"];
+const GET_IT: &[&str] = &["get", PURL, "--mode", "vendored", "--yes"];
+
+/// `command` with `more` appended.
+fn with<'a>(command: &[&'a str], more: &[&'a str]) -> Vec<&'a str> {
+    command.iter().chain(more).copied().collect()
+}
+
+/// A project for `command` with nothing vendored: `vendor` takes the patch
+/// from the manifest record, `scan` finds the gem installed and `get` is
+/// told it.
+fn fresh_project(command: &[&str]) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    match command[0] {
+        "vendor" => write_project(root),
+        other => {
+            std::fs::write(root.join("Gemfile"), GEMFILE).unwrap();
+            std::fs::write(root.join("Gemfile.lock"), lock()).unwrap();
+            if other == "scan" {
+                install_darwin_gem(root);
+            }
+        }
+    }
+    tmp
+}
+
+/// The Gemfile and the lock are as [`fresh_project`] wrote them, and no
+/// vendored artifact or ledger exists.
+fn assert_nothing_vendored(root: &Path) {
+    assert_eq!(
+        std::fs::read_to_string(root.join("Gemfile")).unwrap(),
+        GEMFILE
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("Gemfile.lock")).unwrap(),
+        lock()
+    );
+    assert!(!root.join(".socket/vendor").exists(), "nothing is written");
+}
+
+/// The lines of `stderr` that name the gem.
+fn said_of_the_gem(stderr: &str) -> Vec<&str> {
+    stderr.lines().filter(|line| line.contains(NAME)).collect()
+}
+
+/// The references a run asks for when every locked platform is named a
+/// patch: the gem patch's, then the platform patches' in one request.
+fn both_references(uuid: &str) -> [Vec<String>; 2] {
+    [
+        vec![uuid.to_string()],
+        vec![DARWIN_UUID.to_string(), LINUX_UUID.to_string()],
+    ]
+}
+
+/// `env` is a run that left the gem alone as the one counted, benign skip
+/// of a gem with a locked platform that has no patched build, worded
+/// `line`.
+fn assert_pending_skip(env: &serde_json::Value, line: &str) {
+    assert_eq!(env["status"], "success", "{env:#}");
+    for (count, n) in [
+        ("skipped", 1),
+        ("applied", 0),
+        ("verified", 0),
+        ("failed", 0),
+    ] {
+        assert_eq!(env["summary"][count], n, "summary.{count}: {env:#}");
+    }
+    let skipped: Vec<&serde_json::Value> = crate::common::envelope::events(env)
+        .iter()
+        .filter(|event| event["action"] == "skipped")
+        .collect();
+    assert_eq!(skipped.len(), 1, "{env:#}");
+    assert_eq!(
+        skipped[0]["errorCode"], "vendor_prebuilt_platform_pending",
+        "{env:#}"
+    );
+    assert_eq!(skipped[0]["reason"], line, "{env:#}");
+}
+
+/// Every way to run `command` over a fresh project against `server`, a
+/// dry run and a wet run, for a person and as `--json`, leaves the gem
+/// alone with the one `line` on stderr and the same counted benign skip:
+/// exit 0, no "would vendor", nothing written and nothing downloaded. Each
+/// of the four runs asks for `references` and nothing else.
+async fn assert_dry_and_wet_runs_skip_alike(
+    server: &MockServer,
+    command: &[&str],
+    line: &str,
+    references: &[Vec<String>],
+) {
+    let project = fresh_project(command);
+    let root = project.path();
+    let would = match command[0] {
+        "vendor" => "Would vendor 0 packages; 1 skipped.",
+        _ => {
+            "[dry-run] Would download and vendor 0 of 1 patch (1 would be skipped). No changes \
+             made."
+        }
+    };
+    for (dry_run, summary) in [(true, would), (false, "Vendored 0 packages; 1 skipped.")] {
+        let flags: &[&str] = if dry_run { &["--dry-run"] } else { &[] };
+        let args = with(command, flags);
+        let (code, stdout, stderr) = run(root, &args, &server.uri());
+        assert_eq!(code, 0, "{args:?}\n{stdout}\n{stderr}");
+        assert_eq!(said_of_the_gem(&stderr), [line], "{args:?}\n{stderr}");
+        assert!(stdout.contains(summary), "{args:?}\n{stdout}");
+        assert_nothing_vendored(root);
+
+        let args = with(&args, &["--json"]);
+        let (code, env, stderr) = run_json(root, &args, &server.uri());
+        assert_eq!(code, 0, "{args:?}\n{env:#}\n{stderr}");
+        assert_eq!(env["dryRun"], dry_run, "{env:#}");
+        assert_pending_skip(&env, line);
+        assert_nothing_vendored(root);
+    }
+    assert_eq!(
+        reference_requests(server).await,
+        [references, references, references, references].concat(),
+        "{command:?}: each run's requests"
+    );
+    assert_eq!(downloads(server).await, Vec::<String>::new(), "{command:?}");
+}
+
+/// Every dry run of a gem with a patched build of every locked platform
+/// says what the wet run does: it would vendor the gem, reported once per
+/// platform gem under that gem's own patch (`verified`, where the wet run
+/// reports `applied`), one package for a person, and nothing is written.
+/// `scan` and `get` ask for the references the wet run asks for and
+/// download nothing; `vendor --dry-run` goes on to download and verify the
+/// gems, as it does for every package.
+#[tokio::test]
+async fn every_dry_run_previews_a_fully_patched_gem_once_per_platform_gem() {
+    for command in [VENDOR_IT, SCAN_IT, GET_IT] {
+        let server = service(&[DARWIN, LINUX], &[]).await;
+        mount_search(&server).await;
+        let project = fresh_project(command);
+        let root = project.path();
+
+        let args = with(command, &["--dry-run", "--json"]);
+        let (code, dry, stderr) = run_json(root, &args, &server.uri());
+        assert_eq!(code, 0, "{args:?}\n{dry:#}\n{stderr}");
+        assert_eq!(dry["status"], "success", "{dry:#}");
+        assert_per_platform_gem(&dry, "verified", "");
+        for (count, n) in [
+            ("verified", 2),
+            ("applied", 0),
+            ("skipped", 0),
+            ("failed", 0),
+        ] {
+            assert_eq!(dry["summary"][count], n, "summary.{count}: {dry:#}");
+        }
+        assert_eq!(
+            reference_requests(&server).await,
+            both_references(UUID),
+            "{command:?}: the wet run's reference requests"
+        );
+        let downloaded = downloads(&server).await.len();
+        match command[0] {
+            "vendor" => assert_eq!(downloaded, 4, "a gem and a stub per platform, verified"),
+            _ => assert_eq!(downloaded, 0, "{command:?} downloads nothing"),
+        }
+        assert_nothing_vendored(root);
+
+        let args = with(command, &["--dry-run"]);
+        let (code, stdout, stderr) = run(root, &args, &server.uri());
+        assert_eq!(code, 0, "{args:?}\n{stdout}\n{stderr}");
+        let would = match command[0] {
+            "vendor" => "Would vendor 1 package.",
+            _ => "[dry-run] Would download and vendor 1 patch. No changes made.",
+        };
+        assert!(stdout.contains(would), "{args:?}\n{stdout}");
+        assert_eq!(said_of_the_gem(&stderr), Vec::<&str>::new(), "{stderr}");
+        assert_nothing_vendored(root);
+
+        let args = with(command, &["--json"]);
+        let (code, wet, stderr) = run_json(root, &args, &server.uri());
+        assert_eq!(code, 0, "{args:?}\n{wet:#}\n{stderr}");
+        assert_per_platform_gem(&wet, "applied", "");
+        assert_eq!(wet["summary"]["applied"], 2, "{wet:#}");
+        assert_eq!(
+            gem_events(&dry, "verified"),
+            gem_events(&wet, "applied"),
+            "{command:?}: the dry run names the platform gems the wet run vendors"
+        );
+        for platform in [DARWIN, LINUX] {
+            assert_eq!(
+                std::fs::read(tree(root, platform).join(LIB)).unwrap(),
+                PATCHED
+            );
+        }
+    }
+}
+
+/// Every dry run of a gem with a locked platform that has no patched build
+/// says what the wet run says, and neither claims to vendor it: the gem
+/// patch's reference lists upstream's own gem for the platform, so that
+/// one request is all a run makes.
+#[tokio::test]
+async fn every_dry_run_says_the_wet_runs_line_for_a_platform_with_no_patched_build() {
+    let line = format!(
+        "{NAME}@{VERSION} is not vendored: no patched build yet for {DARWIN} ({LINUX} has one). \
+         Vendored mode needs every locked platform; `scan --mode hosted` can patch the others now."
+    );
+    for command in [VENDOR_IT, SCAN_IT, GET_IT] {
+        let server = service(&[LINUX], &[DARWIN]).await;
+        mount_search(&server).await;
+        assert_dry_and_wet_runs_skip_alike(&server, command, &line, &[vec![UUID.to_string()]])
+            .await;
+    }
+}
+
+/// A patched build the gem patch names, whose own patch is not served, is
+/// no failure: still being built (`pending_build`) the platform has no
+/// patched build yet, and not granted (`forbidden`) none available. Every
+/// command, dry run or not, says so in the same one line and leaves the
+/// gem alone. Each run learns it from the platform patches' references,
+/// its second request, before it downloads anything.
+#[tokio::test]
+async fn a_platform_patch_that_is_not_served_is_the_same_skip_in_every_dry_and_wet_run() {
+    for (status, none) in [
+        ("pending_build", "no patched build yet for"),
+        ("forbidden", "no patched build available for"),
+    ] {
+        let line = format!(
+            "{NAME}@{VERSION} is not vendored: {none} {DARWIN} ({LINUX} has one). Vendored mode \
+             needs every locked platform; `scan --mode hosted` can patch the others now."
+        );
+        for command in [VENDOR_IT, SCAN_IT, GET_IT] {
+            let server = service_of(UUID, &[(DARWIN, Some(status)), (LINUX, None)], &[]).await;
+            mount_search(&server).await;
+            assert_dry_and_wet_runs_skip_alike(&server, command, &line, &both_references(UUID))
+                .await;
+        }
+    }
+}
+
+/// A newer patch of a gem already vendored, with a platform patch that is
+/// not served: the vendored copy of the earlier patch stays wired and
+/// untouched, the run exits 0, and its one line says that copy stays in
+/// force, in a dry run as in a wet one.
+#[tokio::test]
+async fn an_unserved_platform_patch_keeps_the_vendored_copy_of_an_earlier_patch() {
+    let server = service(&[DARWIN, LINUX], &[]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_project(root);
+    let (code, env, stderr) = run_json(root, VENDOR, &server.uri());
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    let read = |file: &str| std::fs::read_to_string(root.join(file)).unwrap();
+    let vendored = (read("Gemfile"), read("Gemfile.lock"), ledger(root));
+    write_manifest(root, UUID_B);
+
+    for (status, none) in [
+        ("pending_build", "no patched build yet for"),
+        ("forbidden", "no patched build available for"),
+    ] {
+        let newer = service_of(UUID_B, &[(DARWIN, Some(status)), (LINUX, None)], &[]).await;
+        let line = format!(
+            "{NAME}@{VERSION} was not brought up to date: {none} {DARWIN} ({LINUX} has one). \
+             Vendored mode needs every locked platform; its vendored copy of an earlier patch \
+             stays in force as it is."
+        );
+        for flags in [&["--dry-run"][..], &[]] {
+            let args = with(VENDOR_IT, flags);
+            let (code, stdout, stderr) = run(root, &args, &newer.uri());
+            assert_eq!(code, 0, "{args:?}\n{stdout}\n{stderr}");
+            assert_eq!(said_of_the_gem(&stderr), [line.as_str()], "{stderr}");
+            let args = with(&args, &["--json"]);
+            let (code, env, stderr) = run_json(root, &args, &newer.uri());
+            assert_eq!(code, 0, "{args:?}\n{env:#}\n{stderr}");
+            assert_pending_skip(&env, &line);
+        }
+        assert_eq!(downloads(&newer).await, Vec::<String>::new());
+        assert_eq!(
+            (read("Gemfile"), read("Gemfile.lock"), ledger(root)),
+            vendored,
+            "{status}: the earlier patch stays wired and recorded"
+        );
+        for platform in [DARWIN, LINUX] {
+            assert_eq!(
+                std::fs::read(tree(root, platform).join(SO)).unwrap(),
+                platform.as_bytes()
+            );
+        }
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID_B}")).exists());
+    }
+}
+
+/// What stays a failure when a platform patch is not served. A copy the
+/// lock is already wired to, with a damaged tree, cannot wait: its restore
+/// from the patches the ledger records fails, and the copy stays as it
+/// was. An eject of the gem's hosted pin is all-or-nothing: it is refused
+/// whole and the lock stays hosted, byte for byte.
+#[tokio::test]
+async fn an_unserved_platform_patch_still_fails_a_damaged_wired_copy_and_an_eject() {
+    for (status, none, restore_says) in [
+        (
+            "pending_build",
+            "no patched build yet for",
+            "is still building",
+        ),
+        ("forbidden", "no patched build available for", "Forbidden"),
+    ] {
+        let server = service(&[DARWIN, LINUX], &[]).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_project(root);
+        let (code, env, stderr) = run_json(root, VENDOR, &server.uri());
+        assert_eq!(code, 0, "{env:#}\n{stderr}");
+        std::fs::write(tree(root, LINUX).join(SO), b"another binary").unwrap();
+        let unserved = service_of(UUID, &[(DARWIN, Some(status)), (LINUX, None)], &[]).await;
+        let (code, env, stderr) = run_json(root, VENDOR, &unserved.uri());
+        assert_eq!(code, 1, "{env:#}\n{stderr}");
+        let failed = find_event(&env, "failed", Some("vendor_redownload_failed"));
+        let why = failed["error"].as_str().unwrap_or_default();
+        assert!(why.contains(restore_says), "{failed:#}");
+        assert_eq!(
+            std::fs::read(tree(root, LINUX).join(SO)).unwrap(),
+            b"another binary",
+            "the copy stays as it was"
+        );
+        assert_eq!(downloads(&unserved).await, Vec::<String>::new());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (gemfile, lock) = write_hosted_project(root);
+        let (code, env, stderr) = run_json(root, VENDOR, &unserved.uri());
+        assert_eq!(code, 1, "{env:#}\n{stderr}");
+        assert_eq!(env["error"]["code"], "eject_refused", "{env:#}");
+        let failed = find_event(&env, "failed", Some("vendor_prebuilt_required"));
+        assert_eq!(
+            failed["error"],
+            format!(
+                "{NAME}@{VERSION} is not vendored: {none} {DARWIN} ({LINUX} has one). Vendored \
+                 mode needs every locked platform; the gem stays hosted."
+            )
+            .as_str(),
+            "{failed:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Gemfile")).unwrap(),
+            gemfile
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Gemfile.lock")).unwrap(),
+            lock
+        );
+        assert!(!root.join(".socket/vendor").exists());
+        assert_eq!(downloads(&unserved).await, Vec::<String>::new());
+    }
+}
+
+/// `scan --mode vendored` over a lock that pins the gem hosted, while a
+/// locked platform has no patched build (the registry serves upstream's
+/// own gem for it, or the patch of its build is still being built): the
+/// dry run and the wet run both say the gem stays hosted, and it does,
+/// byte for byte.
+#[tokio::test]
+async fn a_takeover_of_a_hosted_gem_with_an_unpatched_platform_stays_hosted_dry_or_wet() {
+    let line = format!(
+        "{NAME}@{VERSION} is not vendored: no patched build yet for {DARWIN} ({LINUX} has one). \
+         Vendored mode needs every locked platform; the gem stays hosted."
+    );
+    let pass_through = service(&[LINUX], &[DARWIN]).await;
+    let building = service_of(UUID, &[(DARWIN, Some("pending_build")), (LINUX, None)], &[]).await;
+    for server in [pass_through, building] {
+        mount_search(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (gemfile, lock) = write_hosted_project(root);
+        install_darwin_gem(root);
+        for flags in [&["--dry-run"][..], &[]] {
+            let args = with(SCAN_IT, flags);
+            let (code, stdout, stderr) = run(root, &args, &server.uri());
+            assert_eq!(code, 0, "{args:?}\n{stdout}\n{stderr}");
+            assert_eq!(said_of_the_gem(&stderr), [line.as_str()], "{stderr}");
+            let args = with(&args, &["--json"]);
+            let (code, env, stderr) = run_json(root, &args, &server.uri());
+            assert_eq!(code, 0, "{args:?}\n{env:#}\n{stderr}");
+            assert_pending_skip(&env, &line);
+            assert_eq!(
+                std::fs::read_to_string(root.join("Gemfile")).unwrap(),
+                gemfile
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("Gemfile.lock")).unwrap(),
+                lock
+            );
+            assert!(!root.join(".socket/vendor/gem").exists());
+        }
+        assert_eq!(downloads(&server).await, Vec::<String>::new());
+    }
+}
+
+/// Offline, the patch service may not be asked, so no dry run promises to
+/// vendor the gem. `vendor --dry-run --offline` ends as the wet run does,
+/// in the same failure, and `scan` and `get` refuse `--offline` outright.
+/// No request is made.
+#[tokio::test]
+async fn an_offline_dry_run_asks_nothing_and_promises_nothing() {
+    let server = service(&[DARWIN, LINUX], &[]).await;
+    mount_search(&server).await;
+    let project = fresh_project(VENDOR_IT);
+    let root = project.path();
+    for flags in [&["--offline", "--dry-run"][..], &["--offline"]] {
+        let args = with(VENDOR_IT, flags);
+        let (code, stdout, stderr) = run(root, &args, &server.uri());
+        assert_eq!(code, 1, "{args:?}\n{stdout}\n{stderr}");
+        assert!(!stdout.contains("vendor 1 package"), "{stdout}");
+        let args = with(&args, &["--json"]);
+        let (code, env, stderr) = run_json(root, &args, &server.uri());
+        assert_eq!(code, 1, "{args:?}\n{env:#}\n{stderr}");
+        assert_eq!(
+            gem_events(&env, "failed"),
+            [(PURL, "", "", "", "vendor_service_offline_conflict")],
+            "{env:#}"
+        );
+        assert_eq!(env["summary"]["verified"], 0, "{env:#}");
+        assert_nothing_vendored(root);
+    }
+    for command in [SCAN_IT, GET_IT] {
+        let project = fresh_project(command);
+        let args = with(command, &["--offline", "--dry-run", "--json"]);
+        let (code, env, stderr) = run_json(project.path(), &args, &server.uri());
+        assert_ne!(code, 0, "{args:?}\n{env:#}\n{stderr}");
+        assert_eq!(env["error"]["code"], "offline_unsupported", "{env:#}");
+    }
+    assert_eq!(
+        server.received_requests().await.unwrap_or_default().len(),
+        0,
+        "offline"
     );
 }

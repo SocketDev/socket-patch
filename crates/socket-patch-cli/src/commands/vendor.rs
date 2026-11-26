@@ -141,7 +141,7 @@ use socket_patch_core::vendor::refusals::refusal_is_benign;
 /// any, stays in force.
 ///
 /// [`Discovery::vendor_entry_live`]: socket_patch_core::vex::discover::Discovery::vendor_entry_live
-async fn keep_older_vendored_patch(
+pub(crate) async fn keep_older_vendored_patch(
     outcome: Option<VendorOutcome>,
     state: &VendorState,
     purl: &str,
@@ -311,6 +311,7 @@ async fn takeover_dry_refusal(
         service,
         pipenv_version,
         installed_sites,
+        &mut Vec::new(),
     ))
     .await;
     drop(probe);
@@ -349,7 +350,9 @@ fn restored_text_previewable(
 /// Dispatch one purl to its ecosystem backend. `pkg_path` is the crawler's
 /// installed location (site-packages root for pypi, the package dir
 /// otherwise), when available. Returns `None` for purls with no vendor
-/// backend in this build.
+/// backend in this build. `gem_preview` receives the platform gems a dry
+/// run found the wet run would vendor for a gem locked as platform gems
+/// (see [`vendor::gem::vendor_gem_previewing`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_vendor_one(
     purl: &str,
@@ -363,6 +366,7 @@ pub(crate) async fn dispatch_vendor_one(
     service: Option<&VendorServiceConfig>,
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
     installed_sites: &vendor::pypi::InstalledSiteListings,
+    gem_preview: &mut Vec<vendor::GemBuildEntry>,
 ) -> Option<VendorOutcome> {
     let eco = ecosystem_dir_for_purl(purl)?;
     // Before any backend write: a linked vendor dir is never ours, and the
@@ -426,7 +430,21 @@ pub(crate) async fn dispatch_vendor_one(
             )
             .await
         }
-        "gem" => vend!(vendor::gem::vendor_gem, pkg_path),
+        "gem" => {
+            vendor::gem::vendor_gem_previewing(
+                purl,
+                pkg_path,
+                project_root,
+                record,
+                sources,
+                vendored_at,
+                dry_run,
+                force,
+                service,
+                gem_preview,
+            )
+            .await
+        }
         "cargo" => vend!(vendor::cargo::vendor_cargo_crate, pkg_path),
         "golang" => vend!(vendor::golang::vendor_go_module, pkg_path),
         "composer" => vend!(vendor::composer_lock::vendor_composer, pkg_path),
@@ -729,7 +747,7 @@ pub(crate) fn format_advisory(code: &str, detail: &str, verbose: bool) -> Option
 /// `Skipping <purl>: <detail>`. The detail of a gem with a locked platform
 /// that has no patched build ([`vendor::VENDOR_PREBUILT_PLATFORM_PENDING`])
 /// names the gem itself and is the whole line.
-fn format_skip(purl: &str, code: &str, detail: &str) -> String {
+pub(crate) fn format_skip(purl: &str, code: &str, detail: &str) -> String {
     if code == vendor::VENDOR_PREBUILT_PLATFORM_PENDING {
         // The one line of the gem, on stderr: wrapped for a person at a
         // terminal, as the hosted line of such a gem is.
@@ -743,7 +761,7 @@ fn format_skip(purl: &str, code: &str, detail: &str) -> String {
 /// The detail of [`vendor::VENDOR_PREBUILT_PLATFORM_PENDING`] for a gem the
 /// lockfile pins hosted: the pin stays, so the line says that instead of
 /// naming hosted mode as the way to patch the other platforms.
-fn hosted_pending_detail(code: &str, detail: String) -> String {
+pub(crate) fn hosted_pending_detail(code: &str, detail: String) -> String {
     if code != vendor::VENDOR_PREBUILT_PLATFORM_PENDING {
         return detail;
     }
@@ -809,7 +827,7 @@ const GEM_PLATFORM_DETAIL: &str = "platform";
 /// of `builds`: each names that platform gem
 /// (`pkg:gem/<name>@<version>?platform=<platform>`) and its own patch,
 /// and `details` ties it to the gem's patch `fix`.
-fn gem_build_events(
+pub(crate) fn gem_build_events(
     event: &PatchEvent,
     base_purl: &str,
     fix: &str,
@@ -1844,25 +1862,33 @@ async fn gem_takeover_refusal(
 
 /// [`gem_takeover_refusal`] for the dry-run preview of `scan` / `get
 /// --mode vendored`: each selected gem purl the lockfiles still pin hosted
-/// whose takeover the wet run would refuse, keyed by the selected purl.
-/// Nothing is written (the restore is resolved as a dry run).
+/// whose takeover the wet run would refuse, keyed by the selected purl,
+/// and with them every selected gem purl the lockfiles pin hosted (the
+/// ones the wet run takes over). Nothing is written (the restore is
+/// resolved as a dry run).
 pub(crate) async fn gem_takeover_preview_refusals<'a>(
     common: &GlobalArgs,
     purls: impl Iterator<Item = &'a str>,
-) -> HashMap<String, (&'static str, String)> {
+) -> (HashMap<String, (&'static str, String)>, HashSet<String>) {
     let gems: Vec<&str> = purls.filter(|p| p.starts_with("pkg:gem/")).collect();
     if gems.is_empty() {
-        return HashMap::new();
+        return (HashMap::new(), HashSet::new());
     }
     let pins = HostedPin::all(&crate::commands::discover_wiring(common, &common.cwd).await);
-    gem_takeover_refusals_for(
+    let hosted = gems
+        .iter()
+        .filter(|purl| pins.iter().any(|pin| PurlKey::same(&pin.purl, purl)))
+        .map(|purl| purl.to_string())
+        .collect();
+    let refusals = gem_takeover_refusals_for(
         &common.cwd,
         gems.into_iter(),
         &pins,
         common.offline,
         crate::commands::hosted_unwind::patch_server_origins(common),
     )
-    .await
+    .await;
+    (refusals, hosted)
 }
 
 /// [`gem_takeover_preview_refusals`] over already-discovered hosted `pins`:
@@ -4435,6 +4461,7 @@ pub(crate) async fn vendor_records_reusing(
                 index + 1,
                 total,
             ));
+            let mut gem_preview: Vec<vendor::GemBuildEntry> = Vec::new();
             let outcome = dispatch_vendor_one(
                 candidate,
                 candidate_source,
@@ -4447,6 +4474,7 @@ pub(crate) async fn vendor_records_reusing(
                 service,
                 &pipenv_version,
                 &installed_sites,
+                &mut gem_preview,
             )
             .await;
             status.finish();
@@ -4469,12 +4497,14 @@ pub(crate) async fn vendor_records_reusing(
             let outcome =
                 keep_older_vendored_patch(outcome, &state, candidate, &record.uuid, common).await;
             // The trees of a gem vendored as platform gems, for its events
-            // below: the ones this run wrote, else the ones the ledger
-            // records for this patch (an in-sync re-run writes none).
+            // below: the ones this run wrote, or a dry run found the wet
+            // run would write, else the ones the ledger records for this
+            // patch (an in-sync re-run writes none).
             let gem_builds: Vec<vendor::GemBuildEntry> = match &outcome {
                 Some(VendorOutcome::Done {
                     entry: Some(entry), ..
                 }) => entry.gem_builds.clone(),
+                _ if !gem_preview.is_empty() => gem_preview,
                 _ => lookup_entry(&state.entries, candidate)
                     .filter(|entry| entry.ecosystem == "gem" && entry.uuid == record.uuid)
                     .map(|entry| entry.gem_builds.clone())
@@ -6039,6 +6069,7 @@ mod dispatch_tests {
             Some(&service),
             &tokio::sync::OnceCell::new(),
             &Default::default(),
+            &mut Vec::new(),
         )
         .await;
         // The backend itself may refuse (nothing is installed in the
