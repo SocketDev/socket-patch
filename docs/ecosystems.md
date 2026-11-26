@@ -5089,6 +5089,18 @@ other ecosystems (npm, PyPI, Cargo, Go, Composer, Gradle) to hosted mode. Once a
 patches of two modes, a `scan` with no `--mode` stops and asks which mode to use, so pass `--mode`
 on later runs.
 
+A later `scan --mode vendored` doesn't refuse a gem with a native extension again once it holds
+the selected patch in hosted or agent mode: `Gemfile.lock` pins the patch hosted, or the manifest
+records it for agent mode, and every installed copy of the gem holds it. It skips the gem with
+`vendor_gem_patched_in_other_mode`, a line that names the mode (`Skipping pkg:gem/json@2.9.1: json
+builds a native extension, which vendored mode cannot vendor; it stays patched in hosted mode
+(patch <uuid>)`), counts it as patched in the closing totals, and exits 0 when nothing else
+failed. The hosted pin or the agent-mode patch stays exactly as it was. The gem is refused again,
+and the run exits 1, when it holds no patch, when it holds a different one from the patch the scan
+selects (after the patch service published a newer one, say), or when an installed copy doesn't
+hold the patch yet (a hosted pin whose gem was not reinstalled). Patch the gem again in the mode
+it is in, as the refusal says, and the next vendored scan skips it.
+
 ## Ruby gems: native extensions
 
 Some gem fixes change only what a native extension is built from: its C sources

@@ -5810,3 +5810,250 @@ async fn vendored_takeover_of_a_superseded_native_gem_names_the_extension() {
     );
     assert!(!proj.join(".socket").join("vendor").exists());
 }
+
+// ── a gem vendored mode refuses, patched in the mode its refusal names ──
+
+/// The skip of a gem vendored mode cannot vendor that already holds the
+/// selected patch in hosted or agent mode.
+const PATCHED_IN_OTHER_MODE: &str = "vendor_gem_patched_in_other_mode";
+
+/// Make the installed fixture gem one that builds a native extension, as
+/// its gemspec in `home` declares it.
+fn declare_native_extension(home: &Path) {
+    let spec = home
+        .join("specifications")
+        .join(format!("{DEP}-{DEP_VERSION}.gemspec"));
+    let text = std::fs::read_to_string(&spec).unwrap();
+    assert!(text.contains("  s.require_paths"), "premise: {text}");
+    std::fs::write(
+        &spec,
+        text.replace(
+            "  s.require_paths",
+            "  s.extensions = [\"ext/probe/extconf.rb\".freeze]\n  s.require_paths",
+        ),
+    )
+    .unwrap();
+}
+
+/// The Gemfile and the lock of `proj`.
+fn read_pair(proj: &Path) -> (String, String) {
+    (
+        std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+        std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
+    )
+}
+
+/// The patch API of [`UUID`] with its vendored artifacts and the upstream
+/// gem, and a project whose pair locks the fixture gem. Returns the gem
+/// home.
+async fn vendorable_project(server: &MockServer, proj: &Path) -> PathBuf {
+    let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+    mount_api_for(server, None, &sha256_of(&patched)).await;
+    serve_patched_gem(server, patched.clone()).await;
+    serve_upstream_gem(server, &upstream).await;
+    mount_vendored_grant(server, &patched).await;
+    std::fs::create_dir_all(proj).unwrap();
+    write_manifest_pair(proj);
+    project_home(proj)
+}
+
+/// #2269: vendored mode refuses a gem that builds a native extension and
+/// names hosted mode as the way to patch it. Once the gem holds the same
+/// patch in hosted mode, a later `scan --mode vendored` has nothing left
+/// to do for it: the gem is a skip that says where its patch is, the run
+/// exits 0, the closing totals count the gem as patched, and the hosted
+/// pin stays as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_scan_skips_a_native_gem_that_holds_the_patch_in_hosted_mode() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let home = vendorable_project(&server, &proj).await;
+    let gem_dir = install_real_gem(&home, UPSTREAM_LIB);
+    let uri = server.uri();
+    let (code, _, stderr) = common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+    assert_eq!(code, 0, "hosted scan:\n{stderr}");
+    std::fs::write(proj.join("Gemfile.lock"), converged_lock(&uri)).unwrap();
+    assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "premise");
+    declare_native_extension(&home);
+    let pair_before = read_pair(&proj);
+    let home_before = snapshot(&home);
+
+    for _ in 0..2 {
+        let (code, stdout, stderr) = unwind_run(
+            &proj,
+            &uri,
+            &["scan", "--mode", "vendored", "--yes", "--json"],
+        );
+        let env = common::parse_json_envelope(&stdout);
+        let events = gem_events(&env);
+        assert!(
+            events.contains(&format!("skipped/{PATCHED_IN_OTHER_MODE}"))
+                && !events.iter().any(|e| e.starts_with("failed/")),
+            "{events:?}\n{env}\nstderr:\n{stderr}"
+        );
+        assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+        assert_eq!(env["status"], "success", "{env}");
+        let skip = env["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|e| e["errorCode"] == PATCHED_IN_OTHER_MODE)
+            .expect("the skip");
+        let why = skip["reason"].as_str().unwrap_or_default();
+        assert!(
+            why.contains("hosted mode") && why.contains("native extension"),
+            "{skip}"
+        );
+        assert_eq!(read_pair(&proj), pair_before, "the hosted pin stays");
+        assert!(!proj.join(".socket").join("vendor").exists());
+        assert!(snapshot(&home) == home_before, "the install is untouched");
+    }
+
+    // A human run: no error, and nothing of the gem is left to patch.
+    let (code, stdout, stderr) = unwind_run(&proj, &uri, &["scan", "--mode", "vendored", "--yes"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let shown = format!("{stdout}\n{stderr}");
+    assert!(!shown.contains("Error"), "{shown}");
+    assert!(shown.contains("Nothing left to patch"), "{shown}");
+    assert!(!shown.contains("failed"), "{shown}");
+    assert!(shown.contains("patched in hosted mode"), "{shown}");
+    assert_eq!(read_pair(&proj), pair_before, "the hosted pin stays");
+
+    // `get --mode vendored` reads the same answer.
+    let (code, stdout, stderr) = unwind_run(
+        &proj,
+        &uri,
+        &["get", UUID, "--mode", "vendored", "--yes", "--json"],
+    );
+    let env = common::parse_json_envelope(&stdout);
+    assert!(
+        gem_events(&env).contains(&format!("skipped/{PATCHED_IN_OTHER_MODE}")),
+        "{env}\nstderr:\n{stderr}"
+    );
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    assert_eq!(read_pair(&proj), pair_before, "the hosted pin stays");
+}
+
+/// #2269, the agent half: the same gem patched in place by agent mode
+/// (the manifest records the patch and the installed copy holds it) is a
+/// skip of the vendored scan, and its manifest record stays. (The scan's
+/// dry run previews no native-extension refusal, so it is not held to
+/// this.)
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_scan_skips_a_native_gem_that_holds_the_patch_in_agent_mode() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let home = vendorable_project(&server, &proj).await;
+    let gem_dir = agent_patched_install(&proj, &home);
+    declare_native_extension(&home);
+    let uri = server.uri();
+    let pair_before = read_pair(&proj);
+    let manifest_path = proj.join(".socket").join("manifest.json");
+    let manifest_before = std::fs::read_to_string(&manifest_path).unwrap();
+
+    for extra in ["first run", "second run"] {
+        let args = ["scan", "--mode", "vendored", "--yes", "--json"];
+        let (code, stdout, stderr) = unwind_run(&proj, &uri, &args);
+        let env = common::parse_json_envelope(&stdout);
+        let events = gem_events(&env);
+        assert!(
+            events.contains(&format!("skipped/{PATCHED_IN_OTHER_MODE}"))
+                && !events.iter().any(|e| e.starts_with("failed/")),
+            "{extra:?}: {events:?}\n{env}\nstderr:\n{stderr}"
+        );
+        assert_eq!(code, 0, "{extra:?}: {env}\nstderr:\n{stderr}");
+        assert!(
+            env.to_string().contains("patched in agent mode"),
+            "{extra:?}: {env}"
+        );
+        assert_eq!(read_pair(&proj), pair_before, "{extra:?}");
+        assert!(!proj.join(".socket").join("vendor").exists(), "{extra:?}");
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            manifest_before,
+            "{extra:?}: the agent record stays"
+        );
+        assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "{extra:?}");
+    }
+
+    let (code, stdout, stderr) = unwind_run(&proj, &uri, &["scan", "--mode", "vendored", "--yes"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let shown = format!("{stdout}\n{stderr}");
+    assert!(!shown.contains("Error"), "{shown}");
+    assert!(shown.contains("Nothing left to patch"), "{shown}");
+    assert!(shown.contains("patched in agent mode"), "{shown}");
+}
+
+/// The other side of #2269: a native gem that does not hold the patch
+/// everywhere is still refused, and the run still fails. None of these
+/// counts as patched: an upstream install with no record; a manifest
+/// record whose patch is not in the installed copy; a patched copy beside
+/// an unpatched one in the tree of another Ruby (`vex` and `apply
+/// --check` judge every copy); a hosted pin whose installed copy is still
+/// the upstream gem.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_scan_still_refuses_a_native_gem_that_is_not_patched() {
+    for case in [
+        "no record",
+        "record not applied",
+        "one of two copies unpatched",
+        "hosted pin over an upstream install",
+    ] {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let home = vendorable_project(&server, &proj).await;
+        let uri = server.uri();
+        let (gem_dir, left) = match case {
+            "no record" => (install_real_gem(&home, UPSTREAM_LIB), UPSTREAM_LIB),
+            "record not applied" => {
+                let gem_dir = agent_patched_install(&proj, &home);
+                std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), UPSTREAM_LIB)
+                    .unwrap();
+                (gem_dir, UPSTREAM_LIB)
+            }
+            "one of two copies unpatched" => {
+                let other = home.with_file_name("3.2.0");
+                install_real_gem(&other, UPSTREAM_LIB);
+                declare_native_extension(&other);
+                (agent_patched_install(&proj, &home), PATCHED_LIB)
+            }
+            _ => {
+                let gem_dir = install_real_gem(&home, UPSTREAM_LIB);
+                let (code, _, stderr) =
+                    common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+                assert_eq!(code, 0, "{case}: hosted scan:\n{stderr}");
+                std::fs::write(proj.join("Gemfile.lock"), converged_lock(&uri)).unwrap();
+                // The gem as it is before the pinned build is installed.
+                std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), UPSTREAM_LIB)
+                    .unwrap();
+                (gem_dir, UPSTREAM_LIB)
+            }
+        };
+        declare_native_extension(&home);
+        let pair_before = read_pair(&proj);
+
+        let (code, stdout, stderr) = unwind_run(
+            &proj,
+            &uri,
+            &["scan", "--mode", "vendored", "--yes", "--json"],
+        );
+        let env = common::parse_json_envelope(&stdout);
+        let events = gem_events(&env);
+        assert!(
+            events
+                .iter()
+                .any(|e| e == "failed/native_extensions_unsupported"),
+            "{case}: {events:?}\n{env}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !env.to_string().contains(PATCHED_IN_OTHER_MODE),
+            "{case}: {env}"
+        );
+        assert_ne!(code, 0, "{case}: {env}");
+        assert_eq!(read_pair(&proj), pair_before, "{case}");
+        assert_eq!(installed_lib(&gem_dir), left, "{case}");
+    }
+}

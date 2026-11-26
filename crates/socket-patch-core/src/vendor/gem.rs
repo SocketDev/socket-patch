@@ -318,6 +318,31 @@ fn version_not_locked_detail(name: &str, version: &str) -> String {
     )
 }
 
+/// Refusal code of a gem that builds a native extension and is locked for
+/// the `ruby` platform alone, as its installed gemspec or the stub the
+/// patch service serves declares it: Bundler builds nothing for a
+/// path-sourced gem, and the refusal names the modes that do build the
+/// extension ([`native_extensions_remedy`]).
+pub const NATIVE_EXTENSIONS_UNSUPPORTED: &str = "native_extensions_unsupported";
+
+/// Skip code of a gem refused with [`NATIVE_EXTENSIONS_UNSUPPORTED`] that
+/// already holds the selected patch in a mode the refusal names: the
+/// lock pins that patch hosted, or the manifest records it for agent
+/// mode, and every installed copy holds it. An expected skip, not a
+/// failure: the remedy the refusal
+/// offers is already in place, and a run that asked for it again would
+/// fail every time (#2269).
+pub const GEM_PATCHED_IN_OTHER_MODE: &str = "vendor_gem_patched_in_other_mode";
+
+/// The detail of a [`GEM_PATCHED_IN_OTHER_MODE`] skip of the gem `name`,
+/// which holds the patch `uuid` in `mode` (`hosted` or `agent`).
+pub fn patched_in_other_mode_detail(name: &str, mode: &str, uuid: &str) -> String {
+    format!(
+        "{name} builds a native extension, which vendored mode cannot vendor; it stays patched \
+         in {mode} mode (patch {uuid})"
+    )
+}
+
 /// The refusals the backend raises for the gem purls of `purls` from
 /// `Gemfile.lock` alone, each with its purl, decided before the patch
 /// service is asked for anything:
@@ -653,7 +678,7 @@ async fn gem_prelude(
     if let Some(text) = local_stub.as_ref().filter(|_| locked.platforms.is_empty()) {
         if gemspec_declares_extensions(text) {
             return Err(refused(
-                "native_extensions_unsupported",
+                NATIVE_EXTENSIONS_UNSUPPORTED,
                 format!(
                     "{leaf}.gemspec declares native extensions; bundler does not build extensions for path-sourced gems. {}",
                     native_extensions_remedy(name, !declaration_selects_source(&gemfile_text, name))
@@ -1573,7 +1598,7 @@ fn refuse_unusable_stub(
     // sources, so a native gem would install and then fail at `require` time.
     if gemspec_declares_extensions(stub_text) {
         return Err(policy.hard(
-            "native_extensions_unsupported",
+            NATIVE_EXTENSIONS_UNSUPPORTED,
             format!(
                 "the served stub gemspec for {subject} declares native extensions; bundler does \
                  not build extensions for path-sourced gems. {}",

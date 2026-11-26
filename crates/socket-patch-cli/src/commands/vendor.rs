@@ -63,8 +63,8 @@ use crate::commands::vex::{
     generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
 };
 use crate::ecosystem_dispatch::{
-    find_packages_for_rollback_reusing, npm_paths_by_identity, npm_paths_by_identity_in,
-    partition_purls, NpmCrawlSnapshot,
+    find_all_packages_for_purls, find_packages_for_rollback_reusing, npm_paths_by_identity,
+    npm_paths_by_identity_in, partition_purls, NpmCrawlSnapshot,
 };
 use crate::json_envelope::{
     Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning, Status, VexSummary,
@@ -205,6 +205,98 @@ async fn keep_older_vendored_patch(
             detail,
         },
     })
+}
+
+/// The mode in which the gem `candidate` already holds `record`, the
+/// patch the run selected for it, for a gem the vendored backend refused
+/// for its native extension: `hosted` when the lock still pins that patch
+/// (`live_pin`, the candidate's hosted pin unless this run restored its
+/// upstream entry), `agent` when the manifest records it. Either way
+/// every installed copy of the gem must hold the patch, as `vex` and
+/// `apply --check` judge it: a hosted copy by its files, a copy patched
+/// in place by its rebuilt extension as well. `None` when the gem holds
+/// another patch or none, or some installed copy does not hold this one
+/// (a hosted pin whose gem was never reinstalled, say): the refusal then
+/// stands, and the remedy it names puts the patch in place.
+async fn gem_patch_held_in(
+    common: &GlobalArgs,
+    candidate: &str,
+    record: &PatchRecord,
+    live_pin: Option<&HostedPin>,
+) -> Option<&'static str> {
+    let hosted = live_pin.is_some_and(|pin| pin.uuid == record.uuid);
+    let in_place = match hosted {
+        true => None,
+        false => read_manifest(&common.resolved_manifest_path())
+            .await
+            .ok()
+            .flatten()?
+            .patches
+            .into_iter()
+            .find(|(purl, r)| r.uuid == record.uuid && PurlKey::same(purl, candidate)),
+    };
+    if !hosted && in_place.is_none() {
+        return None;
+    }
+    // Every installed copy, not the one the loop vendors from.
+    let purls = [candidate.to_string()];
+    let copies: Vec<std::path::PathBuf> = find_all_packages_for_purls(
+        &partition_purls(&purls, None),
+        &common.crawler_options(),
+        true,
+    )
+    .await
+    .into_iter()
+    .filter(|(purl, _)| PurlKey::same(purl, candidate))
+    .flat_map(|(_, paths)| paths)
+    .collect();
+    if copies.is_empty() {
+        return None;
+    }
+    match in_place {
+        Some((purl, recorded)) => {
+            socket_patch_core::vex::verify::gem_copies_patched_in_place(&purl, &copies, &recorded)
+                .await
+                .then_some("agent")
+        }
+        None => {
+            for copy in &copies {
+                socket_patch_core::vex::verify::verify_patch_record(copy, record)
+                    .await
+                    .ok()?;
+            }
+            Some("hosted")
+        }
+    }
+}
+
+/// A backend refusal as the run reports it: a gem refused for its native
+/// extension that already holds the selected patch in hosted or agent
+/// mode is the skip [`vendor::gem::GEM_PATCHED_IN_OTHER_MODE`] (#2269);
+/// every other refusal is itself.
+async fn settle_gem_refusal(
+    common: &GlobalArgs,
+    candidate: &str,
+    record: &PatchRecord,
+    live_pin: Option<&HostedPin>,
+    code: &'static str,
+    detail: String,
+) -> (&'static str, String) {
+    if code != vendor::gem::NATIVE_EXTENSIONS_UNSUPPORTED {
+        return (code, detail);
+    }
+    match gem_patch_held_in(common, candidate, record, live_pin).await {
+        Some(mode) => {
+            let purl = normalize_purl(candidate);
+            let name = socket_patch_core::utils::purl::purl_name_version(&purl)
+                .map_or(&*purl, |(name, _)| name);
+            (
+                vendor::gem::GEM_PATCHED_IN_OTHER_MODE,
+                vendor::gem::patched_in_other_mode_detail(name, mode, &record.uuid),
+            )
+        }
+        None => (code, detail),
+    }
 }
 
 /// The `vendor_dir_symlink_unsupported` detail when `purl`'s vendor dir
@@ -3922,6 +4014,9 @@ pub(crate) async fn vendor_records_reusing(
             // does not vendor the purl, and the advisories that only hold
             // once it does (see `TakeoverUndo`).
             let mut takeover_undo: Option<TakeoverUndo> = None;
+            // The candidate's hosted pin while the lock still holds it:
+            // gone once this run's restore of its upstream entry stands.
+            let mut live_pin = hosted_pin_of(candidate);
             if let Some(pin) = hosted_pin_of(candidate) {
                 let origins = crate::commands::hosted_unwind::patch_server_origins(common);
                 let restore_opts = socket_patch_core::patch::redirect::upstream::RestoreOptions {
@@ -4179,6 +4274,7 @@ pub(crate) async fn vendor_records_reusing(
                         takeover_undo = Some(undo);
                     } else {
                         undo.settle(env, common, candidate, &mut vlt_takeover_targets);
+                        live_pin = None;
                     }
                 }
             }
@@ -4279,6 +4375,7 @@ pub(crate) async fn vendor_records_reusing(
                     matches!(&outcome, Some(VendorOutcome::Done { entry, .. }) if entry.is_some());
                 if vendored || recorded || undo.savepoint.is_none() || group.is_none() {
                     undo.settle(env, common, candidate, &mut vlt_takeover_targets);
+                    live_pin = None;
                 } else {
                     undo.abandon(group.as_ref());
                 }
@@ -4296,6 +4393,8 @@ pub(crate) async fn vendor_records_reusing(
                     );
                 }
                 Some(VendorOutcome::Refused { code, detail }) => {
+                    let (code, detail) =
+                        settle_gem_refusal(common, candidate, record, live_pin, code, detail).await;
                     if refusal_is_benign(code) {
                         // An expected skip, not an error: informational.
                         if !common.silent && !common.json {
@@ -4767,7 +4866,11 @@ fn print_vendor_closing(
             .iter()
             .filter(|e| {
                 e.action == PatchAction::Applied
-                    || e.error_code.as_deref() == Some("already_vendored")
+                    || matches!(
+                        e.error_code.as_deref(),
+                        // In place before the run, here or in another mode.
+                        Some("already_vendored" | vendor::gem::GEM_PATCHED_IN_OTHER_MODE)
+                    )
             })
             .filter_map(|e| e.purl.as_deref())
             .collect();
