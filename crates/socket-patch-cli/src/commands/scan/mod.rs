@@ -3021,6 +3021,17 @@ async fn scan_project(
                     .into_iter()
                     .map(|(code, detail)| (code.to_string(), detail)),
             );
+            // The vendored half runs below only for ledger entries the
+            // lock no longer wires, and a lost or unreadable ledger names
+            // none: what that half could not reconcile is said here.
+            if unwired_vendored.is_empty() {
+                layout_refusals.extend(
+                    gc::unreconciled_vendor_warnings(&args.common, &manifest_path)
+                        .await
+                        .into_iter()
+                        .map(|(code, detail)| (code.to_string(), detail)),
+                );
+            }
         }
         status.finish();
         // Bazel stops at an entry of the block whose jar no hub fetches
@@ -3049,11 +3060,8 @@ async fn scan_project(
         // The manifest half of the GC is skipped on an empty crawl, but
         // reverting vendored entries the lock no longer wires asks the
         // lockfile, not the crawl: run that half alone, or a project whose
-        // last vendored dependency was removed could never reconcile. A
-        // ledger that could not be read names no such entry, so the half
-        // runs for it too, and reports it.
-        let vendored_half = !unwired_vendored.is_empty() || vendor_state.is_err();
-        let unwired_gc = if prune_reverts_unwired && vendored_half {
+        // last vendored dependency was removed could never reconcile.
+        let unwired_gc = if prune_reverts_unwired && !unwired_vendored.is_empty() {
             Some(gc::run_vendor_only_gc(&args.common, &manifest_path, &socket_dir).await)
         } else if (hosted || prune) && policy.writes_allowed() {
             // What is left of a pnpm registry route that no lockfile uses

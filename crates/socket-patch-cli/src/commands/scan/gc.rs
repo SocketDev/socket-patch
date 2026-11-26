@@ -526,6 +526,21 @@ pub(super) async fn kept_pypi_patch_warnings(
     keep_patched_pypi_copies(common, &manifest, socket_dir, &mut recorded).await
 }
 
+/// What the vendored half of the GC could not reconcile
+/// ([`VendorGcSummary::unreconciled`]: a ledger it cannot read, a vendor
+/// dir no ledger entry owns that a project file still installs from), for
+/// a `--prune` whose crawl found nothing. That half runs there only for
+/// ledger entries the lock no longer wires, and a lost or unreadable
+/// ledger names none. Read-only: no lock, nothing written.
+pub(super) async fn unreconciled_vendor_warnings(
+    common: &GlobalArgs,
+    manifest_path: &Path,
+) -> Vec<(&'static str, String)> {
+    run_vendor_gc(common, manifest_path, /*dry_run=*/ true)
+        .await
+        .unreconciled
+}
+
 /// The vendored-state half of the GC alone, for a `--prune` whose crawl
 /// found nothing (the manifest half is skipped there: pruning against an
 /// empty crawl would drop every entry). Reverting entries whose patch left
