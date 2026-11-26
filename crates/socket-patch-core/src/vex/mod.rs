@@ -7,6 +7,8 @@
 //! * [`build`] — manifest + applied-set → [`schema::Document`].
 //! * [`discover`] — manifest-less input: Socket-patched dependency
 //!   references (hosted + vendored) recovered from the project's lockfiles.
+//! * [`gem_builds`] — which locked builds are patched of a gem a Bundler
+//!   lock takes from a patch registry as platform builds.
 //! * [`product`] — auto-detect the top-level product PURL from the
 //!   filesystem (package.json / pyproject.toml / Cargo.toml / go.mod /
 //!   composer.json / pom.xml / *.csproj / *.gemspec).
@@ -19,6 +21,7 @@
 
 pub mod build;
 pub mod discover;
+pub mod gem_builds;
 pub mod grype_config;
 pub mod product;
 pub mod schema;
