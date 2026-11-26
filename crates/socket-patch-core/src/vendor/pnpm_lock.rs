@@ -2134,25 +2134,28 @@ fn check_remote_dependents(
     };
     for dependent in dependents {
         let key = crate::formats::pnpm::strip_pnpm_peer_suffix(&dependent);
-        if !matches!(
-            crate::formats::pnpm::classify_pnpm_key(key),
-            crate::formats::pnpm::PnpmKey::Registry { .. }
-        ) {
+        let crate::formats::pnpm::PnpmKey::Registry {
+            name: by,
+            version: by_version,
+        } = crate::formats::pnpm::classify_pnpm_key(key)
+        else {
             continue;
-        }
+        };
         let Some((header, end)) = package_block(key) else {
             continue;
         };
-        let tarball = crate::formats::pnpm::fragment_resolution(&lines[header..end])
-            .and_then(|(_, tarball)| tarball);
-        if let Some(tarball) = tarball.filter(|t| !t.starts_with("file:")) {
+        let remote = crate::formats::pnpm::fragment_resolution(&lines[header..end])
+            .and_then(|(_, tarball)| tarball)
+            .is_some_and(|tarball| !tarball.starts_with("file:"));
+        if remote {
             return Err(format!(
-                "{PNPM_LOCK} installs {key} from a tarball URL ({tarball}) and it depends on \
-                 {name}@{version}. pnpm 12.23 and newer refuse a lock in which such a package \
-                 depends on a local file (ERR_PNPM_LOCAL_SUBDEP_NOT_ALLOWED), so vendoring \
-                 {name}@{version} would break every install. If {key} carries a hosted \
-                 patch, patch {name}@{version} in hosted mode as well, or vendor {key} \
-                 first and then run this again"
+                "{PNPM_LOCK} installs {by}@{by_version} from a tarball URL (`{key}`), as a \
+                 hosted patch pins it, and it depends on {name}@{version}. pnpm 12.23 and \
+                 newer refuse a lock in which such a package depends on a local file \
+                 (ERR_PNPM_LOCAL_SUBDEP_NOT_ALLOWED), so vendoring {name}@{version} would \
+                 break every install. Patch {name}@{version} in hosted mode as well, or \
+                 vendor {by}@{by_version} first and run this again (`socket-patch vendor` \
+                 moves every hosted patch in one run)"
             ));
         }
     }
@@ -10070,11 +10073,13 @@ snapshots:
         ] {
             let err = check(&lock(key, &pinned, snapshot, "1.0.0"))
                 .expect_err(&format!("{what} must refuse"));
-            let named = key.trim_matches('\'');
+            let key = key.trim_matches('\'');
+            let named = key.replace("socket-bbbbbbbb:", "");
             assert!(
-                err.contains(&format!("installs {named} from a tarball URL ({HOSTED})"))
+                err.contains(&format!("installs {named} from a tarball URL (`{key}`)"))
                     && err.contains("depends on leaf@1.0.0")
-                    && err.contains("ERR_PNPM_LOCAL_SUBDEP_NOT_ALLOWED"),
+                    && err.contains("ERR_PNPM_LOCAL_SUBDEP_NOT_ALLOWED")
+                    && !err.contains(HOSTED),
                 "{what}: {err}"
             );
         }

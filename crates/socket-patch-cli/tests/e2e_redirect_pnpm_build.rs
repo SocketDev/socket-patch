@@ -2069,7 +2069,9 @@ async fn pnpm11_registry_route_survives_resolution_and_cleans_up() {
 /// * leaves a project a fresh checkout installs frozen from an empty
 ///   store, with the first patch's bytes;
 /// * and `scan --mode hosted`, the remedy both refusals name, then patches
-///   both packages in a project that still installs frozen.
+///   both packages in a project that still installs frozen;
+/// * which a `scan --mode vendored` over it leaves as it is, since it can
+///   vendor `leaf` but not `peer-user`.
 async fn hosted_patch_over_a_vendored_dependency(pm: &str, tag: &str, hosted_first: bool) {
     if !has_corepack_pm(pm) {
         println!("SKIP {tag}: `corepack {pm}` unavailable");
@@ -2223,6 +2225,22 @@ async fn hosted_patch_over_a_vendored_dependency(pm: &str, tag: &str, hosted_fir
         "{tag}: the hosted scan failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     frozen_install("both-hosted", &["peer-user", "leaf"]);
+
+    // A takeover that cannot vendor `peer-user` (its snapshot key carries a
+    // peer context) does not vendor `leaf` under it either: both stay
+    // hosted.
+    let both_hosted = committed();
+    let (code, stdout, stderr) = socket(&["scan", "--mode", "vendored"]);
+    assert_eq!(
+        code, 1,
+        "{tag}: the vendored scan must fail.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        committed() == both_hosted,
+        "{tag}: the refused takeover must change nothing; the lock is now:\n{}",
+        std::fs::read_to_string(proj.join("pnpm-lock.yaml")).unwrap()
+    );
+    frozen_install("takeover-refused", &["peer-user", "leaf"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

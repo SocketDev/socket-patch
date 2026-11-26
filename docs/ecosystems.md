@@ -238,6 +238,17 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   which pnpm applies through `overrides` without a lock; `vex` attests such a
   vendored pin only while the override map that pnpm reads still routes the
   package to its artifact, and omits it otherwise (`vex_lock_not_read`).
+  **One mode for a package and its dependency.** pnpm 12.23 and newer refuse
+  a lock in which a package fetched from a tarball URL depends on a local
+  file (`ERR_PNPM_LOCAL_SUBDEP_NOT_ALLOWED`), on every install, frozen or
+  not. A hosted patch is fetched that way and a vendored one is a local
+  file, so a package patched in hosted mode cannot depend on a package
+  patched in vendored mode. Whichever run would create that pair is refused
+  before anything is written: hosted mode leaves the package unpinned and
+  warns `redirect_pnpm_local_dependency`, and vendored mode refuses the
+  dependency with `vendor_lock_entry_unsupported`. Patch both in one mode:
+  `socket-patch scan --mode hosted` takes a vendored dependency over. A
+  package on the default registry can depend on a vendored one as before.
   pnpm >=11 checks every lock entry that records a tarball URL against a
   registry, so a hosted pin needs a setting in the root `pnpm-workspace.yaml`.
   For 9.0 root or member locks the CLI writes one of two, unless opted out
