@@ -101,14 +101,28 @@ async fn mount_api_for(server: &MockServer, view_budget: Option<u64>, patched_sh
     mount_api_with(server, view_budget, patched_sha, &[]).await;
 }
 
-/// [`mount_api_for`] with the grant also listing `prebuilds`, the patch's
-/// patched platform gems as `(platform, sha256)` (`gemPlatforms`; absent
-/// from a grant that has none, as the service sends it).
+/// One platform gem of the fixture gem's version as the grant lists it
+/// (`gemBuilds`): its platform, the sha256 the patch registry serves for
+/// it, and the patch of its patched build (`None`: the registry serves
+/// upstream's own gem for that platform).
+type ListedBuild<'a> = (&'a str, String, Option<&'a str>);
+
+/// The snapshot the registry URL of a grant that lists platform gems names.
+const SNAPSHOT: u32 = 4;
+
+/// The patches of the fixture gem's patched platform builds.
+const ARM_UUID: &str = "a1b2c3d4-0000-4000-8000-00000000000a";
+const LINUX_UUID: &str = "a1b2c3d4-0000-4000-8000-00000000000b";
+
+/// [`mount_api_for`] with the grant also listing `builds`, every platform
+/// gem of the version (`gemBuilds`; absent from a grant with none, as the
+/// service sends a patch of the ruby gem alone), under a registry URL that
+/// names [`SNAPSHOT`].
 async fn mount_api_with(
     server: &MockServer,
     view_budget: Option<u64>,
     patched_sha: &str,
-    prebuilds: &[(&str, String)],
+    builds: &[ListedBuild<'_>],
 ) {
     mount_patch_api_with(
         server,
@@ -116,9 +130,16 @@ async fn mount_api_with(
         PATCHED_LIB,
         view_budget,
         patched_sha,
-        prebuilds,
+        builds,
+        SNAPSHOT,
     )
     .await;
+}
+
+/// The path of the patch registry of the fixture gem's patch as a grant
+/// that lists platform gems names it (no trailing slash).
+fn snapshot_registry_path() -> String {
+    format!("/patch-registry/gem/{TOKEN}/{UUID}/s/{SNAPSHOT}")
 }
 
 /// [`mount_api_for`] for the patch `uuid`, whose patched lib is
@@ -130,37 +151,42 @@ async fn mount_patch_api(
     view_budget: Option<u64>,
     patched_sha: &str,
 ) {
-    mount_patch_api_with(server, uuid, patched_lib, view_budget, patched_sha, &[]).await;
+    mount_patch_api_with(server, uuid, patched_lib, view_budget, patched_sha, &[], 0).await;
 }
 
 /// The API of the patch `uuid`, whose patched lib is `patched_lib` and
-/// whose grant lists `prebuilds`.
+/// whose grant lists `builds` under the registry snapshot `snapshot` (a
+/// grant with no list names the registry without one).
 async fn mount_patch_api_with(
     server: &MockServer,
     uuid: &str,
     patched_lib: &str,
     view_budget: Option<u64>,
     patched_sha: &str,
-    prebuilds: &[(&str, String)],
+    builds: &[ListedBuild<'_>],
+    snapshot: u32,
 ) {
     let mut identifiers = serde_json::json!({
         "name": DEP,
         "version": DEP_VERSION,
         "gemChecksumSha256": patched_sha,
     });
-    if !prebuilds.is_empty() {
-        identifiers["gemPlatforms"] = prebuilds
-            .iter()
-            .map(|(platform, sha)| {
-                serde_json::json!({ "platform": platform, "gemChecksumSha256": sha })
-            })
-            .collect();
-    }
     let hosted_url = format!(
         "{}/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{uuid}/{DEP}-{DEP_VERSION}.gem",
         server.uri()
     );
-    let index_url = format!("{}/patch-registry/gem/{TOKEN}/{uuid}/", server.uri());
+    let mut index_url = format!("{}/patch-registry/gem/{TOKEN}/{uuid}/", server.uri());
+    if !builds.is_empty() {
+        identifiers["gemBuilds"] = builds
+            .iter()
+            .map(|(platform, sha, patch)| {
+                serde_json::json!({
+                    "platform": platform, "gemChecksumSha256": sha, "patchUuid": patch,
+                })
+            })
+            .collect();
+        index_url = format!("{index_url}s/{snapshot}");
+    }
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -349,6 +375,23 @@ fn hosted_pinned(env: &serde_json::Value) -> u64 {
                 && (e["action"] == "applied" || e["action"] == "verified")
         })
         .count() as u64
+}
+
+/// `(purl, uuid)` of each hosted pin the run reports, in event order.
+fn hosted_pins(env: &serde_json::Value) -> Vec<(String, String)> {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
+        .map(|e| {
+            let text = |key: &str| e[key].as_str().unwrap_or_default().to_string();
+            (text("purl"), text("uuid"))
+        })
+        .collect()
 }
 
 fn stale_warnings(env: &serde_json::Value) -> Vec<String> {
@@ -2576,8 +2619,8 @@ async fn refresh_replaces_a_stale_platform_install_with_its_prebuild() {
         None,
         &sha256_of(&real_gem(PATCHED_LIB)),
         &[
-            (PLATFORM, sha256_of(&prebuilt)),
-            (OTHER_PLATFORM, sha256_of(&other_prebuilt)),
+            (PLATFORM, sha256_of(&prebuilt), Some(ARM_UUID)),
+            (OTHER_PLATFORM, sha256_of(&other_prebuilt), Some(LINUX_UUID)),
         ],
     )
     .await;
@@ -2585,7 +2628,8 @@ async fn refresh_replaces_a_stale_platform_install_with_its_prebuild() {
     // The patch registry serves the prebuild under the platform gem's name.
     Mock::given(method("GET"))
         .and(path(format!(
-            "/patch-registry/gem/{TOKEN}/{UUID}/gems/{leaf}.gem"
+            "{}/gems/{leaf}.gem",
+            snapshot_registry_path()
         )))
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(prebuilt.clone(), "application/octet-stream"),
@@ -2647,7 +2691,18 @@ async fn refresh_replaces_a_stale_platform_install_with_its_prebuild() {
     let (code, stdout, stderr) = common::run_with_env(&proj, &args, &[]);
     let env = common::parse_json_envelope(&stdout);
     assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
-    assert_eq!(hosted_pinned(&env), 1, "{env}");
+    // One pin, reported per locked build, each under its own patch.
+    assert_eq!(
+        hosted_pins(&env),
+        [
+            (format!("{PURL}?platform={PLATFORM}"), ARM_UUID.to_string()),
+            (
+                format!("{PURL}?platform={OTHER_PLATFORM}"),
+                LINUX_UUID.to_string()
+            ),
+        ],
+        "{env}"
+    );
     assert!(
         !stdout.contains("redirect_gem_platform_unsupported"),
         "every locked platform has a prebuild: {env}"
@@ -2655,7 +2710,7 @@ async fn refresh_replaces_a_stale_platform_install_with_its_prebuild() {
 
     // The lock: both builds under the patch registry, each on its own
     // prebuild's sha256.
-    let index = format!("{uri}/patch-registry/gem/{TOKEN}/{UUID}/");
+    let index = format!("{uri}{}/", snapshot_registry_path());
     let hosted_lock = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
     assert!(
         hosted_lock.contains(&format!(
@@ -2800,15 +2855,15 @@ async fn stale_guard_follows_the_builds_the_lock_names_in_a_home_with_both() {
         None,
         &sha256_of(&real_gem(PATCHED_LIB)),
         &[
-            (PLATFORM, sha256_of(&prebuilt)),
-            (OTHER_PLATFORM, sha256_of(&other_prebuilt)),
+            (PLATFORM, sha256_of(&prebuilt), Some(ARM_UUID)),
+            (OTHER_PLATFORM, sha256_of(&other_prebuilt), Some(LINUX_UUID)),
         ],
     )
     .await;
     let leaf = format!("{DEP}-{DEP_VERSION}-{PLATFORM}");
     for (route, body) in [
         (
-            format!("/patch-registry/gem/{TOKEN}/{UUID}/gems/{leaf}.gem"),
+            format!("{}/gems/{leaf}.gem", snapshot_registry_path()),
             prebuilt.clone(),
         ),
         (format!("/upstream/gems/{leaf}.gem"), upstream.clone()),
@@ -2866,7 +2921,7 @@ async fn stale_guard_follows_the_builds_the_lock_names_in_a_home_with_both() {
         common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &path_env);
     let env = common::parse_json_envelope(&stdout);
     assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
-    assert_eq!(hosted_pinned(&env), 1, "{env}");
+    assert_eq!(hosted_pinned(&env), 2, "both locked builds: {env}");
     let stale = stale_warnings(&env);
     assert_eq!(stale.len(), 1, "one stale copy, the platform build: {env}");
     assert!(
@@ -2964,11 +3019,11 @@ async fn gem_hosted_scan_pins_platform_builds_from_the_lock_alone() {
     );
     for complete in [true, false] {
         let server = MockServer::start().await;
-        let mut prebuilds = vec![(PLATFORM, arm_sha.clone())];
+        let mut builds = vec![(PLATFORM, arm_sha.clone(), Some(ARM_UUID))];
         if complete {
-            prebuilds.push((OTHER_PLATFORM, linux_sha.clone()));
+            builds.push((OTHER_PLATFORM, linux_sha.clone(), Some(LINUX_UUID)));
         }
-        mount_api_with(&server, None, &ruby_sha, &prebuilds).await;
+        mount_api_with(&server, None, &ruby_sha, &builds).await;
         let tmp = tempfile::tempdir().unwrap();
         let proj = tmp.path().join("proj");
         std::fs::create_dir_all(&proj).unwrap();
@@ -2984,12 +3039,13 @@ async fn gem_hosted_scan_pins_platform_builds_from_the_lock_alone() {
         let after = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
         let skipped = warnings_with_code(&env, "redirect_gem_platform_unsupported");
         if complete {
-            assert_eq!(hosted_pinned(&env), 1, "{env}");
+            assert_eq!(hosted_pinned(&env), 2, "one per locked build: {env}");
             assert!(skipped.is_empty(), "{env}");
             assert!(
                 after.contains(&format!(
-                    "/patch-registry/gem/{TOKEN}/{UUID}/\n  specs:\n    {DEP} \
-                     ({DEP_VERSION}-{PLATFORM})\n    {DEP} ({DEP_VERSION}-{OTHER_PLATFORM})\n"
+                    "{}/\n  specs:\n    {DEP} ({DEP_VERSION}-{PLATFORM})\n    {DEP} \
+                     ({DEP_VERSION}-{OTHER_PLATFORM})\n",
+                    snapshot_registry_path()
                 )),
                 "{after}"
             );
@@ -3011,8 +3067,9 @@ async fn gem_hosted_scan_pins_platform_builds_from_the_lock_alone() {
             };
             assert!(
                 detail.contains(&format!(
-                    "no patched build for `{DEP} ({DEP_VERSION}-{OTHER_PLATFORM})`"
-                )) && detail.contains(&format!("patched builds for {PLATFORM}")),
+                    "the patch registry does not list `{DEP} ({DEP_VERSION}-{OTHER_PLATFORM})` \
+                     among the platform gems of this version"
+                )),
                 "{detail}"
             );
             assert_eq!(after, lock, "the lock is untouched");
@@ -3026,7 +3083,7 @@ async fn gem_hosted_scan_pins_platform_builds_from_the_lock_alone() {
 }
 
 /// A lock that names the gem only as platform builds, beside a plain
-/// gem, and a patch without a patched build for every locked platform:
+/// gem, and a patch whose registry does not list every locked platform:
 /// the run refuses the gem. The lock still resolves it, so the closing
 /// totals count its advisory as left to patch, in hosted mode (which
 /// reads the gem from the lock alone) and in vendored mode (which reads
@@ -3071,7 +3128,7 @@ async fn refused_platform_gem_is_counted_as_left_to_patch() {
             &server,
             None,
             &sha256_of(&real_gem(PATCHED_LIB)),
-            &[(PLATFORM, arm_sha.clone())],
+            &[(PLATFORM, arm_sha.clone(), Some(ARM_UUID))],
         )
         .await;
         let tmp = tempfile::tempdir().unwrap();
@@ -3123,9 +3180,11 @@ async fn refused_platform_gem_is_counted_as_left_to_patch() {
         );
         assert_eq!(code, 0, "{mode}\nstdout:\n{stdout}\nstderr:\n{stderr}");
         // The premise: the run refused the gem for a platform the patch
-        // has no build for.
+        // registry does not serve.
         let refusal = match mode {
-            "hosted" => format!("no patched build for `{DEP} ({DEP_VERSION}-{OTHER_PLATFORM})`"),
+            "hosted" => {
+                format!("the patch registry does not list `{DEP} ({DEP_VERSION}-{OTHER_PLATFORM})`")
+            }
             _ => format!("the patch service has no prebuilt platform gem of `{DEP}`"),
         };
         assert!(

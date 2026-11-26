@@ -395,6 +395,9 @@ pub(crate) async fn rewrite(
         });
     }
     skipped.extend(done.unattributed.iter().cloned());
+    // A gem left on its upstream registry because no build the lock names
+    // is patched yet is skipped under its own code, never unpinned.
+    skipped.extend(engine::gem_unpatched_skips(&candidates, &done.rewrite));
     let unconfirmed = engine::unconfirmed_candidates(&candidates, &done.confirmed, &skipped);
     Ok(Rewritten {
         project,

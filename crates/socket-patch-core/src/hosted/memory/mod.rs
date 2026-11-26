@@ -1297,6 +1297,7 @@ async fn engine(
             redirect,
             summary: state.summary.clone(),
             redirected: Vec::new(),
+            upstream_builds: Vec::new(),
             skipped,
             deferred: state.deferred.clone(),
             error: state.error.clone(),
@@ -1533,6 +1534,7 @@ fn finish_root(
             redirect: serde_json::json!({ "mode": "hosted" }),
             summary: state.summary.clone(),
             redirected: Vec::new(),
+            upstream_builds: Vec::new(),
             skipped,
             deferred: state.deferred.clone(),
             error: Some(ProjectError {
@@ -1562,22 +1564,43 @@ fn finish_root(
     warnings.extend(npm_warnings);
     warnings.extend(pre_warnings);
     let redirect_warnings = crate::hosted::render::rewrite_warnings_json(&warnings);
+    // The pins as the run reports them: a gem the lock names as platform
+    // builds once per locked build.
+    let reports = crate::hosted::engine::pin_reports(&confirmed, &rewrite);
     let redirect = crate::hosted::render::redirect_json_block(
-        &confirmed,
+        &reports,
         &unconfirmed,
         rewritten,
         &skipped,
         redirect_warnings,
         dry_run,
     );
+    let mut redirected = Vec::with_capacity(reports.len());
+    let mut upstream_builds = Vec::new();
+    for report in reports {
+        match (report.uuid, report.gem_fix, report.platform) {
+            (Some(uuid), gem_fix, platform) => redirected.push(RedirectedPatch {
+                purl: report.purl,
+                uuid,
+                gem_fix,
+                platform,
+                newly_patched: report.newly_patched,
+            }),
+            (None, Some(gem_fix), Some(platform)) => upstream_builds.push(UpstreamBuild {
+                purl: report.purl,
+                gem_fix,
+                platform,
+            }),
+            // Only a platform build of a gem is ever served as upstream's.
+            (None, _, _) => {}
+        }
+    }
     ProjectResult {
         root,
         redirect,
         summary: state.summary.clone(),
-        redirected: confirmed
-            .into_iter()
-            .map(|(purl, uuid)| RedirectedPatch { purl, uuid })
-            .collect(),
+        redirected,
+        upstream_builds,
         skipped,
         deferred: state.deferred.clone(),
         error: None,

@@ -148,6 +148,13 @@ pub const GEM_NO_PATCHED_BUILD: &str = "redirect_gem_no_patched_build";
 /// neither counted nor attested as patched.
 pub const GEM_UPSTREAM_BUILD_KEPT: &str = "gem_upstream_build_kept";
 
+/// What a host says beside [`GEM_UPSTREAM_BUILD_KEPT`] for the locked
+/// build of `platform`: the one wording of the disk host's event and the
+/// in-memory engine's row.
+pub fn gem_upstream_build_kept_detail(platform: &str) -> String {
+    format!("the patch registry serves upstream's own gem for {platform}: no patched build yet")
+}
+
 /// The skips of the gems a rewrite left on their upstream registry because
 /// no locked build of them is patched yet
 /// ([`RewriteResult::gem_unpatched`]), one per candidate, in candidate

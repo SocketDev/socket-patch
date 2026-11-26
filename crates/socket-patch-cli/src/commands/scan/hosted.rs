@@ -355,35 +355,98 @@ pub(super) const VEX_HOSTED_UNVERIFIED: &str = "vex_hosted_unverified";
 /// uuid: `applied` (`verified` on a dry run) for each confirmed pin, `skipped`
 /// with the skip's code, and `skipped` / `redirect_unconfirmed` for each
 /// granted patch no lockfile entry pins. None of them change status or exit.
+///
+/// `reports` are the confirmed pins as the run reports them
+/// ([`engine::pin_reports`]): a gem the lock names as platform builds has
+/// one event per locked build, whose `details` name the gem patch
+/// (`gemFix`) and the build's `platform` (none for the ruby-platform gem).
+/// A patched build is `applied` under its own patch, with `newlyPatched:
+/// true` when this run put it in place. A build the patch registry serves
+/// as upstream's own gem is an advisory `skipped` event with no `uuid`
+/// ([`engine::GEM_UPSTREAM_BUILD_KEPT`]), which `summary` does not count:
+/// nothing was skipped, that platform is as it was.
+///
+/// [`engine::pin_reports`]: socket_patch_core::hosted::engine::pin_reports
+/// [`engine::GEM_UPSTREAM_BUILD_KEPT`]: socket_patch_core::hosted::engine::GEM_UPSTREAM_BUILD_KEPT
 pub(super) fn record_hosted_events(
     env: &mut Envelope,
-    confirmed: &[(String, String)],
+    reports: &[socket_patch_core::hosted::engine::PinReport],
     unconfirmed: &[(String, String)],
     skipped: &[socket_patch_core::hosted::engine::SkippedPatch],
     dry_run: bool,
 ) {
-    for event in hosted_events(confirmed, unconfirmed, skipped, dry_run) {
-        env.record(event);
+    use socket_patch_core::hosted::engine::GEM_UPSTREAM_BUILD_KEPT;
+    for event in hosted_events(reports, unconfirmed, skipped, dry_run) {
+        if event.error_code.as_deref() == Some(GEM_UPSTREAM_BUILD_KEPT) {
+            env.events.push(event);
+        } else {
+            env.record(event);
+        }
     }
+}
+
+/// Each pin of `confirmed` as its own report: what a run's telemetry
+/// names, one patch per package, where the envelope reports a gem locked
+/// as platform builds per build.
+fn pin_reports_by_package(
+    confirmed: &[(String, String)],
+) -> Vec<socket_patch_core::hosted::engine::PinReport> {
+    confirmed
+        .iter()
+        .map(
+            |(purl, uuid)| socket_patch_core::hosted::engine::PinReport {
+                purl: purl.clone(),
+                uuid: Some(uuid.clone()),
+                gem_fix: None,
+                platform: None,
+                newly_patched: false,
+            },
+        )
+        .collect()
 }
 
 /// A hosted run's per-patch outcomes as events, tagged `mode: "hosted"`
 /// (see [`record_hosted_events`]): what the envelope records and what the
-/// run's telemetry names.
+/// run's telemetry names. Only the advisory event of a gem build left on
+/// upstream's gem has no `uuid`.
 fn hosted_events(
-    confirmed: &[(String, String)],
+    reports: &[socket_patch_core::hosted::engine::PinReport],
     unconfirmed: &[(String, String)],
     skipped: &[socket_patch_core::hosted::engine::SkippedPatch],
     dry_run: bool,
 ) -> Vec<PatchEvent> {
+    use socket_patch_core::hosted::engine::{
+        gem_upstream_build_kept_detail, GEM_UPSTREAM_BUILD_KEPT,
+    };
     let pinned = if dry_run {
         PatchAction::Verified
     } else {
         PatchAction::Applied
     };
-    let mut events: Vec<PatchEvent> = confirmed
+    let mut events: Vec<PatchEvent> = reports
         .iter()
-        .map(|(purl, uuid)| PatchEvent::new(pinned, purl.as_str()).with_uuid(uuid.as_str()))
+        .map(|report| {
+            let mut event = match &report.uuid {
+                Some(uuid) => {
+                    PatchEvent::new(pinned, report.purl.as_str()).with_uuid(uuid.as_str())
+                }
+                None => PatchEvent::new(PatchAction::Skipped, report.purl.as_str()).with_reason(
+                    GEM_UPSTREAM_BUILD_KEPT,
+                    gem_upstream_build_kept_detail(report.platform.as_deref().unwrap_or_default()),
+                ),
+            };
+            if let Some(gem_fix) = &report.gem_fix {
+                let mut details = serde_json::json!({ "gemFix": gem_fix });
+                if let Some(platform) = &report.platform {
+                    details["platform"] = serde_json::json!(platform);
+                }
+                if report.newly_patched {
+                    details["newlyPatched"] = serde_json::json!(true);
+                }
+                event.details = Some(details);
+            }
+            event
+        })
         .chain(skipped.iter().map(|s| {
             let mut event =
                 PatchEvent::new(PatchAction::Skipped, s.purl.as_str()).with_uuid(s.uuid.as_str());
@@ -2179,6 +2242,11 @@ async fn run_redirect_selected_untracked(
     // Candidates the rewrite left out because discovery would not attribute
     // their pin (`engine::rewrite`).
     skipped.extend(done.unattributed.iter().cloned());
+    // A gem the lock names as platform builds, left on its upstream
+    // registry because none of them has a patched build yet: skipped under
+    // its own code, which is no warning, so it is never reported as a
+    // granted patch that nothing pins.
+    skipped.extend(engine::gem_unpatched_skips(&candidates, &done.rewrite));
     grant_warnings.extend(mirror_pins_not_moved(
         &mirror_sources,
         &candidates,
@@ -2662,6 +2730,10 @@ async fn run_redirect_selected_untracked(
         &confirmed,
         &skipped,
     );
+    // The pins as the run reports them: a gem the lock names as platform
+    // builds once per locked build. Everything else above and below works
+    // on the pins themselves, one per package.
+    let reports = engine::pin_reports(&confirmed, rewrite);
     // Sent before the result prints: a consumer that closes stdout early
     // (SIGPIPE on the first write) must not lose it.
     if !selected.is_empty() {
@@ -2671,7 +2743,12 @@ async fn run_redirect_selected_untracked(
             done.rewritten.len(),
             common.dry_run,
             &crate::telemetry_outcomes::patch_outcomes_of(
-                &hosted_events(&confirmed, &unconfirmed, &skipped, common.dry_run),
+                &hosted_events(
+                    &pin_reports_by_package(&confirmed),
+                    &unconfirmed,
+                    &skipped,
+                    common.dry_run,
+                ),
                 socket_patch_core::telemetry::MODE_HOSTED,
             ),
             &telemetry.auth,
@@ -2685,7 +2762,7 @@ async fn run_redirect_selected_untracked(
         // tagged `details.mode: "hosted"`, the `redirect` payload, and the
         // engine's warnings hoisted to the top-level `warnings`.
         let mut env = scan_result.take().unwrap_or_else(|| scan_envelope(common));
-        record_hosted_events(&mut env, &confirmed, &unconfirmed, &skipped, common.dry_run);
+        record_hosted_events(&mut env, &reports, &unconfirmed, &skipped, common.dry_run);
         record_registry_cleanup(
             &mut env,
             &registry_removed,
@@ -2794,6 +2871,13 @@ async fn run_redirect_selected_untracked(
             for line in format_gem_manifest_edits(&rewrite.edits, common.dry_run) {
                 println!("{line}");
             }
+            // And, for a gem the lock names as platform builds, which of
+            // them are patched.
+            let stdout_width =
+                crate::ui::attended(crate::ui::Stream::Stdout).then(crate::ui::stdout_width);
+            for line in format_gem_build_lines(&reports, &skipped, common.dry_run) {
+                println!("{}", wrap_line(&line, stdout_width));
+            }
             // And what it took out of a pnpm registry route nothing uses.
             for line in crate::commands::registry_gc::lines(&registry_removed, common.dry_run) {
                 println!("{line}");
@@ -2827,6 +2911,8 @@ async fn run_redirect_selected_untracked(
             let skipped_pairs: Vec<(String, String)> = skipped
                 .iter()
                 .filter(|s| s.reason != super::rollout::ROLLOUT_DEFERRED)
+                // Said above, as one plain line per gem: nothing failed.
+                .filter(|s| s.reason != engine::GEM_NO_PATCHED_BUILD)
                 .map(|s| (s.purl.clone(), s.reason.clone()))
                 .collect();
             let unconfirmed_purls: Vec<String> =
@@ -3374,6 +3460,124 @@ fn format_gem_manifest_edits(
             format!("{}.", crate::ui::sentence_case(&parts.join("; ")))
         })
         .collect()
+}
+
+/// Which builds are patched of each gem the Bundler lock names as
+/// precompiled platform builds, one line per gem. Such a gem takes its
+/// patch registry as the one source of every locked build, and the
+/// registry serves a patched build for some platforms and upstream's own
+/// gem for the rest, so the summary's "1 package" does not say which
+/// machines run patched code. Not a warning: nothing here needs doing.
+///
+/// - `nokogiri 1.19.3: patched for arm64-darwin, x86_64-linux-gnu`
+/// - a platform with no patched build yet: `…: patched for
+///   x86_64-linux-gnu; upstream gem kept for arm64-darwin (no patched
+///   build yet)`
+/// - a patched build that this run found for a platform of a lock already
+///   on the registry: `…: now also patched for arm64-darwin; already
+///   patched for x86_64-linux-gnu`
+/// - no locked platform has a patched build yet, so the gem was left
+///   where it is (the skip's own sentence): `…: no patched build yet for
+///   arm64-darwin, x86_64-linux-gnu; left on its upstream registry`
+///
+/// The ruby-platform gem, where the lock names it beside the platform
+/// builds, is the platform `ruby`. A dry run says `would be patched for`
+/// (`would also be patched for`) of the builds a wet run would put in
+/// place. `reports` are the run's pins per locked build
+/// (`engine::pin_reports`), `skipped` its skips.
+fn format_gem_build_lines(
+    reports: &[socket_patch_core::hosted::engine::PinReport],
+    skipped: &[socket_patch_core::hosted::engine::SkippedPatch],
+    dry_run: bool,
+) -> Vec<String> {
+    use socket_patch_core::hosted::engine::{PinReport, GEM_NO_PATCHED_BUILD};
+    // Per gem patch, in report order: its locked builds.
+    let mut gems: Vec<(&str, Vec<&PinReport>)> = Vec::new();
+    for report in reports {
+        let Some(gem_fix) = report.gem_fix.as_deref() else {
+            continue;
+        };
+        match gems.iter_mut().find(|(fix, _)| *fix == gem_fix) {
+            Some((_, builds)) => builds.push(report),
+            None => gems.push((gem_fix, vec![report])),
+        }
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for (_, builds) in gems {
+        let Some((_, name, version)) = builds.first().and_then(|build| purl_parts(&build.purl))
+        else {
+            continue;
+        };
+        let platforms = |keep: &dyn Fn(&PinReport) -> bool| -> String {
+            let named: Vec<&str> = builds
+                .iter()
+                .filter(|build| keep(build))
+                .map(|build| build.platform.as_deref().unwrap_or("ruby"))
+                .collect();
+            named.join(", ")
+        };
+        let now = platforms(&|build| build.uuid.is_some() && build.newly_patched);
+        let before = platforms(&|build| build.uuid.is_some() && !build.newly_patched);
+        let kept = platforms(&|build| build.uuid.is_none());
+        let (first, also) = if dry_run {
+            ("would be patched for", "would also be patched for")
+        } else {
+            ("patched for", "now also patched for")
+        };
+        let mut parts: Vec<String> = Vec::new();
+        match (now.is_empty(), before.is_empty()) {
+            (false, true) => parts.push(format!("{first} {now}")),
+            (false, false) => {
+                parts.push(format!("{also} {now}"));
+                parts.push(format!("already patched for {before}"));
+            }
+            (true, false) => parts.push(format!("patched for {before}")),
+            // A pin stands for at least one patched build.
+            (true, true) => {}
+        }
+        if !kept.is_empty() {
+            parts.push(format!(
+                "upstream gem kept for {kept} (no patched build yet)"
+            ));
+        }
+        lines.push(format!("{name} {version}: {}", parts.join("; ")));
+    }
+    lines.extend(
+        skipped
+            .iter()
+            .filter(|skip| skip.reason == GEM_NO_PATCHED_BUILD)
+            .filter_map(|skip| skip.detail.clone()),
+    );
+    lines
+}
+
+/// `line` as it prints on stdout. With `width` (stdout is a terminal with
+/// a person at it) a line that does not fit breaks after a clause (`; `)
+/// under a two-space hanging indent, so no clause is cut in two unless it
+/// is itself wider than the terminal, where it wraps at a word. Without
+/// it the line is as it is, so a pipe or a log keeps one line.
+fn wrap_line(line: &str, width: Option<usize>) -> String {
+    const INDENT: &str = "  ";
+    let Some(width) = width else {
+        return line.to_string();
+    };
+    let mut rows: Vec<String> = Vec::new();
+    for clause in line.split_inclusive("; ") {
+        let clause = clause.trim_end();
+        let room = if rows.len() > 1 { INDENT.len() } else { 0 };
+        match rows.last_mut() {
+            Some(row) if room + row.chars().count() + 1 + clause.chars().count() <= width => {
+                row.push(' ');
+                row.push_str(clause);
+            }
+            _ => rows.push(clause.to_string()),
+        }
+    }
+    rows.iter()
+        .enumerate()
+        .flat_map(|(at, row)| wrap_words(row, width, if at == 0 { "" } else { INDENT }, INDENT))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// What wiring a gem to its patch source costs the project's update
@@ -4342,9 +4546,13 @@ mod tests {
             {"purl": "pkg:npm/b@1.0.0", "uuid": "ub", "reason": "not_found"}
         ]))
         .unwrap();
+        let pinned = super::pin_reports_by_package(&[(
+            "pkg:npm/minimist@1.2.2".to_string(),
+            "abc-123".to_string(),
+        )]);
         record_hosted_events(
             &mut env,
-            &[("pkg:npm/minimist@1.2.2".to_string(), "abc-123".to_string())],
+            &pinned,
             &[("pkg:npm/a@1.0.0".to_string(), "ua".to_string())],
             &skipped,
             false,
@@ -4386,15 +4594,252 @@ mod tests {
 
         // A dry run previews the pin as `verified`.
         let mut env = Envelope::new(Command::Scan);
-        record_hosted_events(
-            &mut env,
-            &[("pkg:npm/minimist@1.2.2".to_string(), "abc-123".to_string())],
-            &[],
-            &[],
-            true,
-        );
+        record_hosted_events(&mut env, &pinned, &[], &[], true);
         assert_eq!(env.summary.verified, 1);
         assert_eq!(env.summary.applied, 0);
+    }
+
+    const BUILD_FIX: &str = "77777777-7777-4777-8777-777777777777";
+    const BUILD_LINUX: &str = "77777777-7777-4777-8777-00000000000b";
+
+    /// One locked build of the gem `pkg:gem/nokogiri@1.19.3` as a run
+    /// reports it: `patch` is the patch of its patched build (`None`: the
+    /// registry serves upstream's gem), `newly` whether this run put it in
+    /// place.
+    fn build_report(
+        platform: Option<&str>,
+        patch: Option<&str>,
+        newly: bool,
+    ) -> socket_patch_core::hosted::engine::PinReport {
+        socket_patch_core::hosted::engine::PinReport {
+            purl: match platform {
+                Some(platform) => format!("pkg:gem/nokogiri@1.19.3?platform={platform}"),
+                None => "pkg:gem/nokogiri@1.19.3".to_string(),
+            },
+            uuid: patch.map(str::to_string),
+            gem_fix: Some(BUILD_FIX.to_string()),
+            platform: platform.map(str::to_string),
+            newly_patched: newly,
+        }
+    }
+
+    /// A gem the lock names as platform builds is recorded per locked
+    /// build. A patched build is a counted `applied` event under its own
+    /// patch, whose `details` name the gem patch and the platform, and say
+    /// when this run put the build in place. A build the registry serves as
+    /// upstream's gem is an event with no `uuid` that no `summary` count
+    /// moves for. The quiet skip of a gem with no patched build is an
+    /// ordinary counted skip, and never a warning.
+    #[test]
+    fn hosted_events_report_a_platform_locked_gem_per_build() {
+        use crate::json_envelope::{Command, Envelope};
+        use socket_patch_core::hosted::engine::{
+            SkippedPatch, GEM_NO_PATCHED_BUILD, GEM_UPSTREAM_BUILD_KEPT,
+        };
+        let reports = [
+            build_report(None, Some(BUILD_FIX), false),
+            build_report(Some("arm64-darwin"), None, false),
+            build_report(Some("x86_64-linux-gnu"), Some(BUILD_LINUX), true),
+        ];
+        let skipped = [SkippedPatch {
+            detail: Some(
+                "rack 3.1.8: no patched build yet for java; left on its upstream registry".into(),
+            ),
+            ..SkippedPatch::new("pkg:gem/rack@3.1.8", "ur", GEM_NO_PATCHED_BUILD)
+        }];
+        let mut env = Envelope::new(Command::Scan);
+        record_hosted_events(&mut env, &reports, &[], &skipped, false);
+        let v = env.to_value();
+        assert_eq!(
+            v["events"],
+            serde_json::json!([
+                {
+                    "action": "applied", "purl": "pkg:gem/nokogiri@1.19.3", "uuid": BUILD_FIX,
+                    "details": {"gemFix": BUILD_FIX, "mode": "hosted"},
+                },
+                {
+                    "action": "skipped",
+                    "purl": "pkg:gem/nokogiri@1.19.3?platform=arm64-darwin",
+                    "errorCode": GEM_UPSTREAM_BUILD_KEPT,
+                    "reason": "the patch registry serves upstream's own gem for arm64-darwin: \
+                               no patched build yet",
+                    "details": {"gemFix": BUILD_FIX, "platform": "arm64-darwin", "mode": "hosted"},
+                },
+                {
+                    "action": "applied",
+                    "purl": "pkg:gem/nokogiri@1.19.3?platform=x86_64-linux-gnu",
+                    "uuid": BUILD_LINUX,
+                    "details": {
+                        "gemFix": BUILD_FIX, "platform": "x86_64-linux-gnu",
+                        "newlyPatched": true, "mode": "hosted",
+                    },
+                },
+                {
+                    "action": "skipped", "purl": "pkg:gem/rack@3.1.8", "uuid": "ur",
+                    "errorCode": GEM_NO_PATCHED_BUILD,
+                    "reason": "rack 3.1.8: no patched build yet for java; left on its upstream \
+                               registry",
+                    "details": {"mode": "hosted"},
+                },
+            ])
+        );
+        assert_eq!(v["summary"]["applied"], 2, "the patched builds");
+        assert_eq!(
+            v["summary"]["skipped"], 1,
+            "the gem left alone, not the build"
+        );
+        assert_eq!(v["summary"]["failed"], 0);
+        assert_eq!(v["status"], "success");
+        assert!(v["warnings"].as_array().is_none_or(Vec::is_empty), "{v}");
+
+        // A dry run previews each patched build as `verified`; the build
+        // left on upstream's gem is reported the same way.
+        let mut env = Envelope::new(Command::Scan);
+        record_hosted_events(&mut env, &reports, &[], &[], true);
+        assert_eq!((env.summary.verified, env.summary.applied), (2, 0));
+        assert_eq!(env.summary.skipped, 0);
+        assert_eq!(env.events.len(), 3);
+
+        // Telemetry names one patch per package: the pin's.
+        let pins = [("pkg:gem/nokogiri@1.19.3".to_string(), BUILD_FIX.to_string())];
+        let outcomes = crate::telemetry_outcomes::patch_outcomes_of(
+            &super::hosted_events(&super::pin_reports_by_package(&pins), &[], &skipped, false),
+            socket_patch_core::telemetry::MODE_HOSTED,
+        );
+        let named: Vec<(&str, &str, Option<&str>)> = outcomes
+            .iter()
+            .map(|o| (o.uuid.as_str(), o.outcome, o.code.as_deref()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                (BUILD_FIX, "applied", None),
+                ("ur", "skipped", Some(GEM_NO_PATCHED_BUILD)),
+            ]
+        );
+    }
+
+    /// The human line of a gem locked as platform builds: which builds are
+    /// patched, which keep upstream's gem, which this run found patched on
+    /// a lock that was already on the registry, and what a dry run would
+    /// do. A package that is no such gem has no line. A gem left on its
+    /// upstream registry prints its skip's own sentence.
+    #[test]
+    fn gem_build_lines_say_which_builds_are_patched() {
+        use socket_patch_core::hosted::engine::{SkippedPatch, GEM_NO_PATCHED_BUILD};
+        let line = |reports: &[socket_patch_core::hosted::engine::PinReport], dry_run| {
+            let lines = super::format_gem_build_lines(reports, &[], dry_run);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            lines.into_iter().next().unwrap()
+        };
+        let arm = |patch, newly| build_report(Some("arm64-darwin"), patch, newly);
+        let linux = |patch, newly| build_report(Some("x86_64-linux-gnu"), patch, newly);
+        let (a, b) = (Some("ua"), Some(BUILD_LINUX));
+
+        // Every locked build patched by this run, then found in place.
+        assert_eq!(
+            line(&[arm(a, true), linux(b, true)], false),
+            "nokogiri 1.19.3: patched for arm64-darwin, x86_64-linux-gnu"
+        );
+        assert_eq!(
+            line(&[arm(a, false), linux(b, false)], false),
+            "nokogiri 1.19.3: patched for arm64-darwin, x86_64-linux-gnu"
+        );
+        // One platform has no patched build yet.
+        assert_eq!(
+            line(&[arm(None, false), linux(b, true)], false),
+            "nokogiri 1.19.3: patched for x86_64-linux-gnu; upstream gem kept for arm64-darwin \
+             (no patched build yet)"
+        );
+        // A later run finds that platform patched.
+        assert_eq!(
+            line(&[arm(a, true), linux(b, false)], false),
+            "nokogiri 1.19.3: now also patched for arm64-darwin; already patched for \
+             x86_64-linux-gnu"
+        );
+        // The ruby-platform gem beside the platform builds.
+        assert_eq!(
+            line(
+                &[
+                    build_report(None, Some(BUILD_FIX), true),
+                    arm(None, false),
+                    linux(b, true)
+                ],
+                false
+            ),
+            "nokogiri 1.19.3: patched for ruby, x86_64-linux-gnu; upstream gem kept for \
+             arm64-darwin (no patched build yet)"
+        );
+        // A dry run says what the wet run would put in place.
+        assert_eq!(
+            line(&[arm(None, false), linux(b, true)], true),
+            "nokogiri 1.19.3: would be patched for x86_64-linux-gnu; upstream gem kept for \
+             arm64-darwin (no patched build yet)"
+        );
+        assert_eq!(
+            line(&[arm(a, true), linux(b, false)], true),
+            "nokogiri 1.19.3: would also be patched for arm64-darwin; already patched for \
+             x86_64-linux-gnu"
+        );
+
+        // Any other pin has no line; a gem left alone has its skip's.
+        let plain = super::pin_reports_by_package(&[
+            ("pkg:npm/a@1.0.0".to_string(), "u".to_string()),
+            ("pkg:gem/rack@3.1.8".to_string(), "v".to_string()),
+        ]);
+        assert!(super::format_gem_build_lines(&plain, &[], false).is_empty());
+        let left = "rack 3.1.8: no patched build yet for java; left on its upstream registry";
+        let skipped = [
+            SkippedPatch::new("pkg:npm/b@1.0.0", "ub", "not_found"),
+            SkippedPatch {
+                detail: Some(left.to_string()),
+                ..SkippedPatch::new("pkg:gem/rack@3.1.8", "ur", GEM_NO_PATCHED_BUILD)
+            },
+        ];
+        assert_eq!(
+            super::format_gem_build_lines(&[arm(a, true), linux(b, true)], &skipped, false),
+            [
+                "nokogiri 1.19.3: patched for arm64-darwin, x86_64-linux-gnu",
+                left
+            ]
+        );
+
+        // On a terminal a line that does not fit breaks after a clause,
+        // under a hanging indent; one that fits, and any line in a pipe,
+        // stays whole.
+        let long = line(&[arm(None, false), linux(b, true)], false);
+        assert_eq!(super::wrap_line(&long, None), long);
+        assert_eq!(super::wrap_line(&long, Some(120)), long);
+        for width in [80, 100] {
+            assert_eq!(
+                super::wrap_line(&long, Some(width)),
+                "nokogiri 1.19.3: patched for x86_64-linux-gnu;\n  upstream gem kept for \
+                 arm64-darwin (no patched build yet)"
+            );
+        }
+        // A clause wider than the terminal wraps at a word.
+        let platforms = [
+            "aarch64-linux-gnu",
+            "aarch64-linux-musl",
+            "arm-linux-gnu",
+            "arm-linux-musl",
+            "arm64-darwin",
+            "x86_64-darwin",
+            "x86_64-linux-gnu",
+            "x86_64-linux-musl",
+        ];
+        let many: Vec<_> = platforms
+            .iter()
+            .map(|platform| build_report(Some(platform), Some("u"), true))
+            .collect();
+        let wrapped = super::wrap_line(&line(&many, false), Some(80));
+        assert_eq!(
+            wrapped,
+            "nokogiri 1.19.3: patched for aarch64-linux-gnu, aarch64-linux-musl,\n  \
+             arm-linux-gnu, arm-linux-musl, arm64-darwin, x86_64-darwin, x86_64-linux-gnu,\n  \
+             x86_64-linux-musl"
+        );
+        assert!(wrapped.lines().all(|row| row.chars().count() <= 80));
     }
 
     use std::path::PathBuf;

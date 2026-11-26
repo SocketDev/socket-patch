@@ -35,6 +35,9 @@ struct Case {
     /// to match: a yarn classic pin reads the served tarball (#558, #591),
     /// which the fixtures' placeholder hashes could never verify.
     serve_npm_tarballs: bool,
+    /// Change the patches the fake API serves, for a case that differs from
+    /// its fixture only in what the patch service answers.
+    edit_patches: Option<fn(&mut [common::Patch])>,
 }
 
 fn case(fixture: &'static str) -> Case {
@@ -44,6 +47,7 @@ fn case(fixture: &'static str) -> Case {
         expect_redirect: true,
         dry_run: false,
         serve_npm_tarballs: false,
+        edit_patches: None,
     }
 }
 
@@ -89,11 +93,19 @@ async fn serve_npm_tarballs(server: &MockServer, patches: &mut [common::Patch]) 
 
 /// Returns the (shared) `redirect` block so a case can assert on it too.
 async fn assert_parity(case: Case) -> Value {
+    assert_parity_run(case).await.0
+}
+
+/// [`assert_parity`], also returning the engine's result for the one root.
+async fn assert_parity_run(case: Case) -> (Value, socket_patch_cli::hosted_memory::ProjectResult) {
     let dir = fixtures_root().join("redirect").join(case.fixture);
     let server = MockServer::start().await;
     let mut patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
     if case.serve_npm_tarballs {
         serve_npm_tarballs(&server, &mut patches).await;
+    }
+    if let Some(edit) = case.edit_patches {
+        edit(&mut patches);
     }
     mount_api(&server, &patches).await;
     let mut files = fixture_files(&dir.join("input"));
@@ -168,7 +180,7 @@ async fn assert_parity(case: Case) -> Value {
         "{}",
         case.fixture
     );
-    disk_redirect
+    (disk_redirect, project.clone())
 }
 
 #[tokio::test]
@@ -304,6 +316,108 @@ async fn parity_gemfile() {
 #[tokio::test]
 async fn parity_gemfile_platform_prebuilds() {
     assert_parity(case("gem/bundler/platform-prebuilds")).await;
+}
+
+/// A lock of platform builds where the patch registry has a patched build
+/// for one platform and serves upstream's own gem for the other. Both
+/// engines move the gem, pin each build to what the registry serves, and
+/// report it per locked build: the patched build under its own patch, the
+/// other as kept on upstream's gem, counted by neither.
+#[tokio::test]
+async fn parity_gemfile_platform_pass_through() {
+    use socket_patch_cli::hosted_memory::{RedirectedPatch, UpstreamBuild};
+    const FIX: &str = "77777777-7777-7777-7777-777777777777";
+    const LINUX: &str = "77777777-7777-4777-8777-00000000000b";
+    let (redirect, project) = assert_parity_run(case("gem/bundler/platform-pass-through")).await;
+    assert_eq!(redirect["redirected"], 1, "{redirect:#}");
+    assert_eq!(redirect["warnings"], serde_json::json!([]), "{redirect:#}");
+    assert_eq!(redirect["skipped"], serde_json::json!([]), "{redirect:#}");
+    assert_eq!(
+        redirect["patches"],
+        serde_json::json!([
+            {
+                "purl": "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin",
+                "action": "upstream_kept",
+                "errorCode": "gem_upstream_build_kept",
+                "error": "the patch registry serves upstream's own gem for arm64-darwin: no \
+                          patched build yet",
+                "gemFix": FIX,
+                "platform": "arm64-darwin",
+            },
+            {
+                "purl": "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu",
+                "uuid": LINUX,
+                "action": "pinned",
+                "gemFix": FIX,
+                "platform": "x86_64-linux-gnu",
+                "newlyPatched": true,
+            },
+        ]),
+        "{redirect:#}"
+    );
+    assert_eq!(
+        project.redirected,
+        [RedirectedPatch {
+            purl: "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu".into(),
+            uuid: LINUX.into(),
+            gem_fix: Some(FIX.into()),
+            platform: Some("x86_64-linux-gnu".into()),
+            newly_patched: true,
+        }]
+    );
+    assert_eq!(
+        project.upstream_builds,
+        [UpstreamBuild {
+            purl: "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin".into(),
+            gem_fix: FIX.into(),
+            platform: "arm64-darwin".into(),
+        }]
+    );
+    assert!(project.skipped.is_empty(), "{:?}", project.skipped);
+}
+
+/// The same lock where no locked platform has a patched build yet: both
+/// engines leave the gem on its upstream registry, write nothing, warn of
+/// nothing, and report one skip under the quiet code, never an unpinned
+/// patch.
+#[tokio::test]
+async fn parity_gemfile_platform_no_patched_build() {
+    fn none_patched(patches: &mut [common::Patch]) {
+        for patch in patches {
+            let builds = &mut patch.reference["registryOverride"]["identifiers"]["gemBuilds"];
+            for build in builds.as_array_mut().expect("the fixture lists builds") {
+                build["patchUuid"] = Value::Null;
+            }
+        }
+    }
+    let (redirect, project) = assert_parity_run(Case {
+        expect_redirect: false,
+        edit_patches: Some(none_patched),
+        ..case("gem/bundler/platform-pass-through")
+    })
+    .await;
+    let detail = "nokogiri 1.18.10: no patched build yet for arm64-darwin, x86_64-linux-gnu; left \
+                  on its upstream registry";
+    assert_eq!(redirect["redirected"], 0, "{redirect:#}");
+    assert_eq!(redirect["rewrittenFiles"], serde_json::json!([]));
+    assert_eq!(redirect["warnings"], serde_json::json!([]), "{redirect:#}");
+    assert_eq!(
+        redirect["patches"],
+        serde_json::json!([{
+            "purl": "pkg:gem/nokogiri@1.18.10",
+            "uuid": "77777777-7777-7777-7777-777777777777",
+            "action": "skipped",
+            "errorCode": "redirect_gem_no_patched_build",
+            "error": detail,
+        }]),
+        "{redirect:#}"
+    );
+    assert!(project.redirected.is_empty() && project.upstream_builds.is_empty());
+    let [skip] = project.skipped.as_slice() else {
+        panic!("one skip: {:?}", project.skipped);
+    };
+    assert_eq!(skip.reason, "redirect_gem_no_patched_build");
+    assert_eq!(skip.detail.as_deref(), Some(detail));
 }
 
 /// The gem fixture as the root of a Bazel workspace whose rules_ruby hub

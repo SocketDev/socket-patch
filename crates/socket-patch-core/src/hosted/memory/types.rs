@@ -272,11 +272,41 @@ pub struct ProjectSummary {
     pub can_access_paid_patches: bool,
 }
 
+/// One patch a project's files pin. A gem the Bundler lock names as
+/// platform builds is listed once per locked build that has a patched
+/// build, under that build's own patch
+/// ([`pin_reports`](crate::hosted::engine::pin_reports)); every other
+/// package once, with `purl` and `uuid` alone.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RedirectedPatch {
+    /// `pkg:gem/<name>@<version>?platform=<platform>` for a platform gem.
     pub purl: String,
     pub uuid: String,
+    /// For a build of a gem locked as platform builds: the gem patch's
+    /// uuid, the one selected patch all its builds go by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gem_fix: Option<String>,
+    /// For such a build: its platform (absent on the ruby-platform gem).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    /// For such a build: this run put its patched build in place.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub newly_patched: bool,
+}
+
+/// One locked platform build of a redirected gem that the patch registry
+/// serves as upstream's own gem (no patched build yet): machines of that
+/// platform install what they installed before, so it is no entry of
+/// `redirected`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpstreamBuild {
+    /// `pkg:gem/<name>@<version>?platform=<platform>`.
+    pub purl: String,
+    /// The gem patch's uuid, as [`RedirectedPatch::gem_fix`].
+    pub gem_fix: String,
+    pub platform: String,
 }
 
 pub use crate::hosted::engine::SkippedPatch;
@@ -307,6 +337,10 @@ pub struct ProjectResult {
     pub redirect: serde_json::Value,
     pub summary: ProjectSummary,
     pub redirected: Vec<RedirectedPatch>,
+    /// The platform builds of the redirected gems that stay upstream's own
+    /// gem; absent when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream_builds: Vec<UpstreamBuild>,
     pub skipped: Vec<SkippedPatch>,
     /// NEW patches over the run-wide `maxNewPatches` budget, in rank order
     /// (also in `skipped[]` as `rollout_deferred`).
