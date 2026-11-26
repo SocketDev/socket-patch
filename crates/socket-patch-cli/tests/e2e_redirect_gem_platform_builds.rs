@@ -2740,6 +2740,69 @@ async fn the_lines_of_a_lock_that_stays_and_is_refreshed_fit_a_terminal() {
     }
 }
 
+/// Under a patch mirror a lock that stays is left as it is. The reference
+/// of the patch it is on names that patch's registry on the patch server,
+/// and following it would be a pin on the mirror that the run has not
+/// checked there. The registry the lock is on is still read (from the
+/// patch server), the patch on offer is skipped as it is without a
+/// mirror, and the patch service is asked about no other patch.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_that_stays_under_a_patch_mirror_is_left_as_it_is() {
+    const PREFIX: &str = "/artifactory/socket-patch";
+    let case = Stays::held();
+    let server = MockServer::start().await;
+    case.mount(&server, EarlierNow::Lists(case.earlier_now()))
+        .await;
+    let api = server.uri();
+    // The mirror takes the run's check of the pin it would write, and
+    // wants credentials for anything else.
+    let mirror = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!(
+            "{PREFIX}/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.gem"
+        )))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mirror)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&mirror)
+        .await;
+    let base = format!("{}{PREFIX}", mirror.uri());
+
+    let on_mirror = earlier_index(&base);
+    let proj = hosted_project(&on_mirror, EARLIER_ARM_PATCHED, EARLIER_LINUX_PATCHED, true);
+    let lock = read(proj.path(), "Gemfile.lock");
+    let (exit, stdout, stderr) = hosted(
+        proj.path(),
+        &api,
+        &["get", UUID],
+        &["--json", "--patch-mirror-url", base.as_str()],
+    );
+    let env: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not JSON ({e}):\n{stdout}\nstderr:\n{stderr}"));
+    assert_eq!(exit, 0, "{env}\n{stderr}");
+    assert_eq!(read(proj.path(), "Gemfile.lock"), lock);
+    assert_eq!(read(proj.path(), "Gemfile"), hosted_gemfile(&on_mirror));
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(
+        hosted_events(&env),
+        [offer_skip(case.skip.0, &case.skip.1)],
+        "{env}"
+    );
+    let (references, other) = requests(&server).await;
+    assert_eq!(
+        references,
+        [vec![UUID.to_string()]],
+        "the patch on offer alone"
+    );
+    assert_eq!(
+        other,
+        [earlier_snapshot_path(3)],
+        "the registry is read from the patch server, once"
+    );
+}
+
 // ── A lock with no `CHECKSUMS` that follows a newer snapshot ──────────
 
 /// A lock with no `CHECKSUMS` section is on the patch's registry at one
@@ -2834,6 +2897,87 @@ async fn a_lock_without_checksums_on_a_newer_snapshot_says_which_build_is_now_pa
                 "{what}, dry run {dry_run}:\n{stdout}"
             );
         }
+    }
+}
+
+/// The listing of the snapshot the lock names also says that a build was
+/// withdrawn. A lock with no `CHECKSUMS` section has both builds patched
+/// at one snapshot, and the reference names a newer one that serves
+/// upstream's gem for `arm64-darwin`. The run asks the lock's snapshot
+/// once (for the linux build, which the lock does not pin), finds the
+/// arm64-darwin build gone from it, or still under the patched sha256,
+/// and says that the build is back on upstream's gem, as on a lock with
+/// `CHECKSUMS`. When that request fails, nothing says what the build was,
+/// and it is reported as upstream's gem alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_without_checksums_on_a_newer_snapshot_says_which_build_was_withdrawn() {
+    let back = format!(
+        "{DEP} {DEP_VERSION}: patched for {LINUX}; upstream gem back for {ARM} (its patched \
+         build was withdrawn)"
+    );
+    let kept = format!(
+        "{DEP} {DEP_VERSION}: patched for {LINUX}; upstream gem kept for {ARM} (no patched build \
+         yet)"
+    );
+    // `(what the snapshot the lock names lists for arm64-darwin, if it
+    // answers at all; the event of that build; the line)`.
+    let cases: [(Option<Option<&str>>, Value, &String); 3] = [
+        (Some(None), withdrawn_event(ARM), &back),
+        (Some(Some(ARM_PATCHED)), withdrawn_event(ARM), &back),
+        (None, upstream_event(ARM), &kept),
+    ];
+    for (listed, arm_event, line) in cases {
+        let what = format!("the lock's snapshot lists {listed:?}");
+        let server = MockServer::start().await;
+        mount_api(&server, Some((&ONE_PATCHED[..], 5))).await;
+        if let Some(arm) = listed {
+            let mut listing =
+                format!("---\n{DEP_VERSION}-{LINUX} racc:~> 1.4|checksum:{LINUX_PATCHED}\n");
+            if let Some(arm) = arm {
+                listing.push_str(&format!("{DEP_VERSION}-{ARM} racc:~> 1.4|checksum:{arm}\n"));
+            }
+            Mock::given(method("GET"))
+                .and(path(index_path()))
+                .respond_with(ResponseTemplate::new(200).set_body_string(listing))
+                .mount(&server)
+                .await;
+        }
+        let api = server.uri();
+        let (before, after) = (
+            format!("{}/", index_url(&api, Some(4))),
+            format!("{}/", index_url(&api, Some(5))),
+        );
+
+        let proj = hosted_project(&before, ARM_PATCHED, LINUX_PATCHED, false);
+        let (code, env) = scan_json(proj.path(), &api, &[]);
+        assert_eq!(code, 0, "{what}: {env}");
+        assert_eq!(env["status"], "success", "{what}: {env}");
+        let lock = read(proj.path(), "Gemfile.lock");
+        assert!(
+            lock.contains(&format!("  remote: {after}\n")) && !lock.contains(&before),
+            "{what}: {lock}"
+        );
+        assert_eq!(
+            warning_codes(&env),
+            ["redirect_gem_no_checksums_section"],
+            "{what}: {env}"
+        );
+        assert_eq!(
+            hosted_events(&env),
+            [
+                arm_event,
+                patched_event("applied", LINUX, LINUX_UUID, false)
+            ],
+            "{what}: {env}"
+        );
+        let (_, other) = requests(&server).await;
+        assert_eq!(other, [index_path()], "{what}: asked once");
+
+        // For a person.
+        let proj = hosted_project(&before, ARM_PATCHED, LINUX_PATCHED, false);
+        let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &[]);
+        assert_eq!(code, 0, "{what}: {stdout}\n{stderr}");
+        assert!(stdout.contains(&format!("\n{line}\n")), "{what}:\n{stdout}");
     }
 }
 
