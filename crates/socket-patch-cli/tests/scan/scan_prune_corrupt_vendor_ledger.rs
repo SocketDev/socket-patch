@@ -8,7 +8,7 @@
 //! Modeled on `scan_vendor_e2e.rs` (mock API + real fixture through the
 //! built binary).
 
-use crate::common::envelope::parse_json_envelope;
+use crate::common::envelope::{parse_json_envelope, warning_codes};
 use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::Path;
@@ -136,14 +136,20 @@ async fn corrupt_ledger_scan_prune_keeps_vendored_manifest_entry() {
     let v = parse_json_envelope(stdout.trim());
 
     // The GC must not report the vendored entry as pruned…
-    let pruned = v["gc"]["prunedManifestEntries"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let events = v["events"].as_array().cloned().unwrap_or_default();
     assert!(
-        !pruned.iter().any(|p| p == CARGO_PURL),
-        "corrupt ledger: the vendored entry must not be pruned; gc={}",
-        v["gc"]
+        !events.iter().any(|e| e["purl"] == CARGO_PURL),
+        "corrupt ledger: the vendored entry must not be pruned; events={}",
+        v["events"]
+    );
+    // …and it says that its vendored half did not run, and why, instead
+    // of a clean pass.
+    assert!(
+        warning_codes(&v)
+            .iter()
+            .any(|code| code == "vendor_state_unreadable"),
+        "the pass could not read the ledger and must say so; warnings={}",
+        v["warnings"]
     );
 
     // …the manifest entry must survive on disk…
@@ -164,4 +170,128 @@ async fn corrupt_ledger_scan_prune_keeps_vendored_manifest_entry() {
             .is_file(),
         "vendored entry's blob was swept"
     );
+}
+
+/// A project where the crawl finds nothing: the manifest half of the
+/// prune is skipped there, and the vendored half runs only for the ledger
+/// entries the lock no longer wires. A ledger that cannot be read names
+/// none, and neither does a lost one whose artifact a lockfile still
+/// installs from (nothing is installed, so the lock's `file:` entry is no
+/// package of the crawl). The run still says what it could not reconcile,
+/// read-only: no lock is taken and nothing is written.
+#[tokio::test]
+async fn scan_prune_of_an_empty_crawl_says_what_it_could_not_reconcile() {
+    const ORPHAN: &str = "1a2b3c4d-5e6f-4a1b-8c2d-9e0f1a2b3c4d";
+    let corrupt_ledger = |root: &Path| {
+        let ledger = root.join(".socket/vendor/state.json");
+        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        std::fs::write(&ledger, b"{\"entries\": {").unwrap();
+    };
+    let wired_orphan = |root: &Path| {
+        let unit = root.join(format!(".socket/vendor/npm/{ORPHAN}"));
+        std::fs::create_dir_all(&unit).unwrap();
+        std::fs::write(unit.join("left-pad-1.3.0.tgz"), b"tgz").unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"app","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}"#,
+        )
+        .unwrap();
+        let lock = serde_json::json!({
+            "name": "app", "version": "1.0.0", "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app", "version": "1.0.0", "dependencies": {"left-pad": "1.3.0"}},
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": format!("file:.socket/vendor/npm/{ORPHAN}/left-pad-1.3.0.tgz"),
+                },
+            },
+        });
+        std::fs::write(root.join("package-lock.json"), lock.to_string()).unwrap();
+    };
+    let cases: [(&dyn Fn(&Path), &str, String); 2] = [
+        (
+            &corrupt_ledger,
+            "vendor_state_unreadable",
+            "Warning: cannot read .socket/vendor/state.json: ".to_string(),
+        ),
+        (
+            &wired_orphan,
+            "vendor_orphan_still_wired",
+            format!("Warning: a project lockfile still points at .socket/vendor/npm/{ORPHAN}, "),
+        ),
+    ];
+
+    let mock = MockServer::start().await;
+    mount_empty_discovery(&mock).await;
+    let uri = mock.uri();
+    let auth = [
+        "--api-url",
+        &uri,
+        "--api-token",
+        "fake-token",
+        "--org",
+        ORG_SLUG,
+    ];
+    for (seed, code, line) in cases {
+        for dry_run in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            seed(tmp.path());
+            let files_before = files_under(&tmp.path().join(".socket"));
+            let case = format!("{code}, dry_run={dry_run}");
+            let run = |flags: &[&'static str]| {
+                let mut argv = vec!["scan", "--prune"];
+                argv.extend(flags);
+                if dry_run {
+                    argv.push("--dry-run");
+                }
+                argv.extend(auth);
+                run_cli(tmp.path(), &argv)
+            };
+
+            let (exit, stdout, stderr) = run(&["--json"]);
+            assert_eq!(exit, 0, "{case}: stdout={stdout}; stderr={stderr}");
+            let v = parse_json_envelope(stdout.trim());
+            assert_eq!(v["scannedPackages"], 0, "{case}: {v:#}");
+            assert_eq!(warning_codes(&v), [code], "{case}: {v:#}");
+
+            let (exit, stdout, stderr) = run(&[]);
+            assert_eq!(exit, 0, "{case}: stdout={stdout}; stderr={stderr}");
+            assert!(
+                stderr.contains(&line),
+                "{case}: stdout={stdout}; stderr={stderr}"
+            );
+
+            let (exit, stdout, stderr) = run(&["--silent"]);
+            assert_eq!(
+                (exit, stdout.as_str(), stderr.as_str()),
+                (0, "", ""),
+                "{case}"
+            );
+
+            assert_eq!(
+                files_under(&tmp.path().join(".socket")),
+                files_before,
+                "{case}: the report reads; it takes no lock and writes nothing"
+            );
+        }
+    }
+}
+
+/// Every file under `dir` with its bytes, sorted by path.
+fn files_under(dir: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                out.push((path, bytes));
+            }
+        }
+    }
+    out.sort();
+    out
 }

@@ -58,8 +58,11 @@ pub(super) struct GcSummary {
     /// orphan sweeps that could not finish (`cleanup_failed`: the removed
     /// counts above are what it did reclaim). Also the vendored reverts'
     /// reinstall advisories, the `vendor_revert_residual_reference` of an
-    /// entry kept for one, and `manifest_invalid` / `manifest_unreadable`
-    /// when the manifest half could not load the manifest.
+    /// entry kept for one, `manifest_invalid` / `manifest_unreadable` when
+    /// the manifest half could not load the manifest,
+    /// `vendor_state_unreadable` when the vendored half could not load the
+    /// ledger, and `vendor_orphan_still_wired` per orphan vendor dir kept
+    /// because a project file still installs from it.
     warnings: Vec<(&'static str, String)>,
     /// The entries of hosted mode's pnpm registry route that no lockfile
     /// uses any more, taken out (or, in preview mode, to take out) of
@@ -140,6 +143,7 @@ impl GcSummary {
         self.vendored_kept.sort_by(|a, b| a.0.cmp(&b.0));
         self.vendored_failed = v.failed;
         self.vendored_failed.sort();
+        self.warnings.extend(v.unreconciled);
         self.warnings.extend(v.write_failures);
         self.warnings.extend(v.advisories);
         self.vendor_orphan_dirs = v.orphan_dirs;
@@ -292,13 +296,13 @@ pub(super) async fn run_apply_gc(
     vendored: &HashSet<PurlKey>,
 ) -> GcSummary {
     // Existence gate BEFORE the lock: `acquire` creates `.socket/`, and a
-    // pristine checkout with neither a manifest nor a ledger must not gain
-    // one. A manifest that cannot be stated is not absent: the pass goes
+    // pristine checkout with neither a manifest nor vendored state must not
+    // gain one. A manifest that cannot be stated is not absent: the pass goes
     // on and reports it, as the locked read's load error or, when
     // `.socket/` itself is unusable, as the lock failure.
     let has_manifest = manifest_exists(manifest_path).await.unwrap_or(true);
     let mut route = crate::commands::registry_gc::RouteProbe::default();
-    if !has_manifest && !has_ledger(common).await && !route.present(common).await {
+    if !has_manifest && !has_vendored_state(common).await && !route.present(common).await {
         return GcSummary::default();
     }
 
@@ -395,12 +399,17 @@ async fn keep_project_entries(common: &GlobalArgs, prunable: &mut Vec<String>) {
     prunable.retain(|purl| !accounted.contains(&PurlKey::new(purl)));
 }
 
-/// Whether the vendored-state ledger exists. Checked before the lock,
-/// whose acquire would create `.socket/`.
-async fn has_ledger(common: &GlobalArgs) -> bool {
-    tokio::fs::metadata(common.cwd.join(VENDOR_STATE_REL))
-        .await
-        .is_ok_and(|m| m.is_file())
+/// Whether the manifest's project may hold vendored state: the ledger's
+/// directory, `.socket/vendor/`, which holds the artifacts too (a lost
+/// ledger leaves them, and the pass reports the ones still installed
+/// from). Checked before the lock, whose acquire would create `.socket/`.
+/// Only a directory known to be missing is "nothing vendored": one that
+/// cannot be stat'd goes on to the read that reports it, like the manifest
+/// above.
+async fn has_vendored_state(common: &GlobalArgs) -> bool {
+    let ledger = common.project_root().join(VENDOR_STATE_REL);
+    let dir = ledger.parent().expect("the ledger has a directory");
+    !matches!(tokio::fs::try_exists(dir).await, Ok(false))
 }
 
 /// Take the apply lock for a wet pass. Both halves are read-modify-writes
@@ -517,6 +526,21 @@ pub(super) async fn kept_pypi_patch_warnings(
     keep_patched_pypi_copies(common, &manifest, socket_dir, &mut recorded).await
 }
 
+/// What the vendored half of the GC could not reconcile
+/// ([`VendorGcSummary::unreconciled`]: a ledger it cannot read, a vendor
+/// dir no ledger entry owns that a project file still installs from), for
+/// a `--prune` whose crawl found nothing. That half runs there only for
+/// ledger entries the lock no longer wires, and a lost or unreadable
+/// ledger names none. Read-only: no lock, nothing written.
+pub(super) async fn unreconciled_vendor_warnings(
+    common: &GlobalArgs,
+    manifest_path: &Path,
+) -> Vec<(&'static str, String)> {
+    run_vendor_gc(common, manifest_path, /*dry_run=*/ true)
+        .await
+        .unreconciled
+}
+
 /// The vendored-state half of the GC alone, for a `--prune` whose crawl
 /// found nothing (the manifest half is skipped there: pruning against an
 /// empty crawl would drop every entry). Reverting entries whose patch left
@@ -534,7 +558,7 @@ pub(super) async fn run_vendor_only_gc(
         gc.sweep_registry(common, true, &mut route).await;
         return gc;
     }
-    if !has_ledger(common).await && !route.present(common).await {
+    if !has_vendored_state(common).await && !route.present(common).await {
         return GcSummary::default();
     }
     let guard = match lock(common, socket_dir) {
@@ -1852,12 +1876,20 @@ mod tests {
         )
         .await;
 
+        // The edit also disowns the entry's `pypi/<uuid>` dir, which the
+        // requirements files still install from: the sweep's warning leads.
+        let lines = format_gc_vendored_lines(&gc);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].starts_with(&format!(
+                "GC: a project lockfile still points at .socket/vendor/pypi/{UUID}, "
+            )),
+            "{lines:?}"
+        );
         assert_eq!(
-            format_gc_vendored_lines(&gc),
-            [
-                "GC: failed to revert 1 vendored entry: pkg:pypi/six@1.16.0 (this build has no \
-              vendor backend for ecosystem `frobnicate`)."
-            ]
+            lines[1],
+            "GC: failed to revert 1 vendored entry: pkg:pypi/six@1.16.0 (this build has no \
+             vendor backend for ecosystem `frobnicate`)."
         );
         let json = recorded(&gc, false);
         assert_eq!(
@@ -1876,6 +1908,215 @@ mod tests {
             .unwrap()
             .entries
             .contains_key(PURL));
+    }
+
+    /// What a git merge conflict leaves of the committed vendor ledger.
+    const CONFLICTED_LEDGER: &str = "{\n<<<<<<< HEAD\n";
+
+    /// The warning codes a pass records into the `scan` envelope.
+    fn warning_codes(json: &serde_json::Value) -> Vec<&str> {
+        json["warnings"]
+            .as_array()
+            .map(|warnings| {
+                warnings
+                    .iter()
+                    .map(|w| w["code"].as_str().unwrap())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A vendor ledger that cannot be read is not "nothing vendored": the
+    /// pass and its preview say that the vendored half did not run, under
+    /// the code `rollback` and `list` report it with, instead of a clean
+    /// summary. The manifest half, which never asks the ledger, still runs.
+    #[tokio::test]
+    async fn gc_reports_a_vendor_ledger_it_could_not_read() {
+        for dry_run in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (manifest_path, socket_dir, blob) =
+                seed_manifest_with_blob(tmp.path(), "pkg:npm/gone@1.0.0", &"a".repeat(64));
+            let ledger = tmp.path().join(VENDOR_STATE_REL);
+            std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+            std::fs::write(&ledger, CONFLICTED_LEDGER).unwrap();
+
+            let common = gc_common(tmp.path());
+            let gc = if dry_run {
+                preview_apply_gc(
+                    &common,
+                    &manifest_path,
+                    &socket_dir,
+                    &HashSet::new(),
+                    &no_vendored(),
+                )
+                .await
+            } else {
+                run_apply_gc(
+                    &common,
+                    &manifest_path,
+                    &socket_dir,
+                    &HashSet::new(),
+                    &no_vendored(),
+                )
+                .await
+            };
+
+            let json = recorded(&gc, dry_run);
+            assert_eq!(
+                warning_codes(&json),
+                ["vendor_state_unreadable"],
+                "dry_run={dry_run}: the vendored half did not run, and the pass must say \
+                 why: {json}"
+            );
+            let detail = json["warnings"][0]["detail"].as_str().unwrap();
+            assert!(
+                detail.starts_with("cannot read .socket/vendor/state.json: corrupt "),
+                "dry_run={dry_run}: {detail}"
+            );
+            let lines = format_gc_vendored_lines(&gc);
+            assert_eq!(lines, [format!("GC: {detail}.")], "dry_run={dry_run}");
+
+            // The manifest half is the crawl's and the manifest's alone.
+            assert_eq!(gc.pruned, ["pkg:npm/gone@1.0.0"], "dry_run={dry_run}");
+            assert_eq!(blob.exists(), dry_run, "dry_run={dry_run}");
+            assert_eq!(
+                std::fs::read_to_string(&ledger).unwrap(),
+                CONFLICTED_LEDGER,
+                "dry_run={dry_run}: the ledger is left for the user to resolve"
+            );
+        }
+    }
+
+    /// Only a `.socket/vendor/` that is not there is "nothing vendored".
+    /// With no manifest beside it, a ledger that cannot be read (a symlink
+    /// to itself) and a vendor directory that cannot even be stat'd (the
+    /// same) both take the pass past its existence gate to the step that
+    /// reports them: the ledger's load, and the lock's own check of
+    /// `.socket/vendor/`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gc_takes_only_a_missing_vendor_dir_for_nothing_vendored() {
+        for (looped, code) in [
+            (VENDOR_STATE_REL, "vendor_state_unreadable"),
+            (".socket/vendor", GC_SKIPPED),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let socket_dir = tmp.path().join(".socket");
+            let looped_path = tmp.path().join(looped);
+            std::fs::create_dir_all(looped_path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(looped_path.file_name().unwrap(), &looped_path).unwrap();
+            let manifest_path = socket_dir.join("manifest.json");
+            let common = gc_common(tmp.path());
+
+            let full = run_apply_gc(
+                &common,
+                &manifest_path,
+                &socket_dir,
+                &HashSet::new(),
+                &no_vendored(),
+            )
+            .await;
+            let vendor_only = run_vendor_only_gc(&common, &manifest_path, &socket_dir).await;
+            for (pass, gc) in [("full", full), ("vendor-only", vendor_only)] {
+                let json = recorded(&gc, false);
+                assert_eq!(warning_codes(&json), [code], "{looped}, {pass}: {json}");
+            }
+        }
+    }
+
+    /// A vendored directory no ledger entry owns stays while a project file
+    /// still installs from it, and the pass says so, as `vendor --revert`,
+    /// `rollback` and `remove` do: the lockfile and the ledger disagree,
+    /// and a clean summary would hide that. With no ledger entry at all the
+    /// pass sweeps nothing, and reports the same: with a manifest, and
+    /// (the shape of a vendored project that lost its ledger) without one,
+    /// where the wet pass must not stop at its existence gate.
+    #[tokio::test]
+    async fn gc_reports_an_orphan_dir_a_project_file_still_installs_from() {
+        const UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-9e0f1a2b3c4d";
+        let unit = format!(".socket/vendor/pypi/{UUID}");
+
+        for (dry_run, with_manifest) in [(true, true), (false, true), (true, false), (false, false)]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let (manifest_path, socket_dir, _) =
+                seed_manifest_with_blob(tmp.path(), "pkg:npm/still-here@1.0.0", &"e".repeat(64));
+            if !with_manifest {
+                std::fs::remove_file(&manifest_path).unwrap();
+            }
+            let wheel = tmp
+                .path()
+                .join(&unit)
+                .join("six-1.16.0-py2.py3-none-any.whl");
+            std::fs::create_dir_all(wheel.parent().unwrap()).unwrap();
+            std::fs::write(&wheel, b"wheel").unwrap();
+            std::fs::write(
+                tmp.path().join("requirements.txt"),
+                format!("./{unit}/six-1.16.0-py2.py3-none-any.whl\n"),
+            )
+            .unwrap();
+            // An unreferenced orphan beside it: with no ledger the pass has
+            // nothing to judge ownership by, and deletes neither.
+            let loose = tmp
+                .path()
+                .join(".socket/vendor/npm/2b3c4d5e-6f7a-4b2c-9d3e-0f1a2b3c4d5e");
+            std::fs::create_dir_all(&loose).unwrap();
+            std::fs::write(loose.join("left-pad-1.3.0.tgz"), b"tgz").unwrap();
+
+            let mut common = gc_common(tmp.path());
+            common.dry_run = dry_run;
+            let scanned = scanned(&["pkg:npm/still-here@1.0.0"]);
+            let gc = if dry_run {
+                preview_apply_gc(
+                    &common,
+                    &manifest_path,
+                    &socket_dir,
+                    &scanned,
+                    &no_vendored(),
+                )
+                .await
+            } else {
+                run_apply_gc(
+                    &common,
+                    &manifest_path,
+                    &socket_dir,
+                    &scanned,
+                    &no_vendored(),
+                )
+                .await
+            };
+
+            let case = format!("dry_run={dry_run}, with_manifest={with_manifest}");
+            let json = recorded(&gc, dry_run);
+            assert_eq!(
+                warning_codes(&json),
+                ["vendor_orphan_still_wired"],
+                "{case}: {json}"
+            );
+            let detail = json["warnings"][0]["detail"].as_str().unwrap();
+            assert!(detail.contains(&unit), "{case}: {detail}");
+            assert!(
+                !detail.contains("revert"),
+                "{case}: a prune is not a revert, and `vendor --revert` would un-vendor \
+                 the whole project: {detail}"
+            );
+            // The other way out is complete: this pass deletes no dir
+            // without a ledger entry, so the detail does not leave one.
+            assert!(
+                detail.ends_with(
+                    "or point the lockfile back at the registry release and delete the \
+                     directory)"
+                ),
+                "{case}: {detail}"
+            );
+            assert_eq!(
+                format_gc_vendored_lines(&gc),
+                [format!("GC: {detail}.")],
+                "{case}"
+            );
+            assert_eq!(json["removedVendorOrphanDirs"], 0, "{case}");
+            assert!(wheel.is_file() && loose.is_dir(), "{case}");
+        }
     }
 
     /// A pass recorded into a fresh `scan` envelope, serialized.

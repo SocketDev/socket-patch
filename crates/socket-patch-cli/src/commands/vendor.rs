@@ -33,7 +33,7 @@ use socket_patch_core::telemetry::{
     track_patch_vendor_failed, track_patch_vendored, TelemetryAuth, MODE_VENDORED,
 };
 use socket_patch_core::utils::concurrent::ordered_concurrent;
-use socket_patch_core::utils::group_commit::{CommittedFile, GroupCommit};
+use socket_patch_core::utils::group_commit::{self, CommittedFile, GroupCommit};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
@@ -54,7 +54,7 @@ use crate::commands::apply::{representative_file, result_to_event, variant_match
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendor_orphans::{
     orphan_label, orphan_removal_failed, orphan_removed_event, orphan_still_wired,
-    sweep_orphan_vendor_dirs,
+    orphan_still_wired_by_prune, sweep_orphan_vendor_dirs, OrphanSweep,
 };
 use crate::commands::vendored_backend::{
     ApplyRequest, KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
@@ -1106,10 +1106,13 @@ pub async fn run(args: VendorArgs) -> i32 {
         // ledgers and lockfiles already wire. Same contract as `apply --vex`
         // with no manifest: nothing referenced anywhere keeps exit 0; any
         // other VEX failure flips the exit; a dry run skips generation.
+        //
+        // An unreadable ledger is not "no entries": say so (stderr, or
+        // `warnings[]` under --json) instead of the calm nothing-to-vendor
+        // line.
+        let ledger = load_state(&args.common.cwd).await;
         if !args.common.json && !args.common.silent {
-            // An unreadable ledger is not "no entries": say so (stderr)
-            // instead of the calm nothing-to-vendor line.
-            match load_state(&args.common.cwd).await {
+            match &ledger {
                 Ok(state) => println!("{}", no_manifest_message(state.entries.len())),
                 Err(e) => eprintln!("{}", no_manifest_ledger_unreadable(&e.to_string())),
             }
@@ -1126,6 +1129,12 @@ pub async fn run(args: VendorArgs) -> i32 {
             env.status = Status::NoManifest;
             env.dry_run = args.common.dry_run;
             env.warnings.extend(commit_recovery);
+            env.warnings.extend(
+                ledger
+                    .as_ref()
+                    .err()
+                    .map(|e| no_manifest_ledger_unreadable_warning(&e.to_string())),
+            );
             match vex_result.as_ref() {
                 Some(ManifestlessVex::Written(summary)) => {
                     env.vex = Some(VexSummary {
@@ -2675,10 +2684,25 @@ async fn run_eject(
 }
 
 /// The no-manifest warning when the vendor ledger cannot be read either.
+/// It names no `repair`: that stops at the same ledger. The error can
+/// quote the committed ledger.
 fn no_manifest_ledger_unreadable(err: &str) -> String {
     format!(
         "Warning: No manifest to vendor from, and the vendor ledger could not be read: \
-         {err}\n  Run `socket-patch repair` to check the vendored artifacts."
+         {}\n  Restore .socket/vendor/state.json from version control.",
+        crate::ui::printable(err)
+    )
+}
+
+/// [`no_manifest_ledger_unreadable`] for the `--json` envelope, which
+/// would otherwise be a bare `noManifest`.
+fn no_manifest_ledger_unreadable_warning(err: &str) -> RunWarning {
+    RunWarning::new(
+        "vendor_state_unreadable",
+        format!(
+            "no manifest to vendor from, and the vendor ledger could not be read: {err}; \
+             restore .socket/vendor/state.json from version control"
+        ),
     )
 }
 
@@ -5470,6 +5494,12 @@ pub(crate) struct VendorGcSummary {
     /// must not drop them. Also the `vendor_revert_residual_reference`
     /// warning of an entry kept for one: it names the file to fix.
     pub advisories: Vec<(&'static str, String)>,
+    /// Vendored state the pass could not reconcile, as (`code`, `detail`):
+    /// `vendor_state_unreadable` when the ledger could not be read (the
+    /// pass then reverted and swept nothing), and one
+    /// `vendor_orphan_still_wired` per orphan uuid dir kept because a
+    /// project file still installs from it.
+    pub unreconciled: Vec<(&'static str, String)>,
 }
 
 /// The revert warnings `scan --prune` forwards into `gc.warnings[]`: only
@@ -5539,6 +5569,30 @@ impl VendorGcSummary {
         self.kept.push((purl.to_string(), cause));
         true
     }
+
+    /// Report the orphan uuid dirs `sweep` kept because a project file
+    /// still installs from them, as the sweep's other callers do.
+    ///
+    /// `locked`: the caller holds the apply lock, whose acquire finishes
+    /// the commit an interrupted vendored run left. That commit replaces
+    /// the lockfiles before the ledger, so until it is finished a lockfile
+    /// can be ahead of its ledger entry, which is no lost entry and whose
+    /// directory must not be called deletable. An unlocked pass (a dry
+    /// one) that finds such a commit pending, or cannot tell, reports no
+    /// directory: the next locked run finishes the commit and judges.
+    fn note_still_wired(&mut self, sweep: &OrphanSweep, project_root: &Path, locked: bool) {
+        if sweep.still_wired.is_empty() {
+            return;
+        }
+        if !locked && !matches!(group_commit::pending(project_root), Ok(None)) {
+            return;
+        }
+        self.unreconciled
+            .extend(sweep.still_wired.iter().map(|unit| {
+                let warning = orphan_still_wired_by_prune(unit);
+                (warning.code, warning.detail)
+            }));
+    }
 }
 /// The manifest keys an unused vendored `entry`, stored under ledger key
 /// `purl`, owns: every key with the same [`PurlKey`] as the ledger key OR
@@ -5570,7 +5624,12 @@ pub(crate) fn unused_vendored_manifest_keys<V>(
 ///     discovery `vendor --check` and `vex` judge by; `None` keeps,
 ///     fail-safe) and drop their manifest entries so the caller's manifest
 ///     prune + blob sweep reclaims the rest in the same pass;
-/// (c) sweep orphan uuid dirs.
+/// (c) sweep orphan uuid dirs. One a project file still installs from is
+///     kept, with a `vendor_orphan_still_wired` warning. With no ledger
+///     entry to judge ownership by, (c) deletes nothing and only warns.
+///
+/// A ledger that cannot be read stops the pass before (a), with a
+/// `vendor_state_unreadable` warning ([`VendorGcSummary::unreconciled`]).
 ///
 /// A revert that kept its artifact ([`RevertOutcome::kept_artifact`]: a
 /// drifted lock, or another project file that still installs from it)
@@ -5606,11 +5665,22 @@ pub(crate) async fn run_vendor_gc(
     let common: &GlobalArgs = &rooted;
     let mut out = VendorGcSummary::default();
     let mut state = match load_state(&common.project_root()).await {
-        Ok(s) if !s.entries.is_empty() => s,
-        // No ledger (or unreadable): only the orphan sweep could apply, and
-        // without a trustworthy ledger it must not delete anything.
-        _ => return out,
+        Ok(state) => state,
+        // A ledger that cannot be read is not an empty one: nothing is
+        // reverted or swept without it, and the pass says why.
+        Err(e) => {
+            out.unreconciled.push(gc_ledger_unreadable(&e));
+            return out;
+        }
     };
+    if state.entries.is_empty() {
+        // No ledger entry: nothing to revert, and with no ledger to judge
+        // ownership by the sweep deletes nothing. A directory a project
+        // file still installs from is reported all the same.
+        let kept = sweep_orphan_vendor_dirs(&common.cwd, &state, /*dry_run=*/ true).await;
+        out.note_still_wired(&kept, &common.cwd, !dry_run);
+        return out;
+    }
 
     // (a) manifest-dropped entries. Everything (a) touches is excluded from
     // (b), which would otherwise list/fail the same purl a second time on a
@@ -5753,6 +5823,7 @@ pub(crate) async fn run_vendor_gc(
     // One that could not be deleted is a `cleanup_failed` warning.
     let sweep = sweep_orphan_vendor_dirs(&common.cwd, &state, dry_run).await;
     out.orphan_dirs = sweep.removed.len();
+    out.note_still_wired(&sweep, &common.cwd, !dry_run);
     for (unit, e) in &sweep.failed {
         let warning = orphan_removal_failed(unit, e);
         out.write_failures.push((warning.code, warning.detail));
@@ -5763,6 +5834,21 @@ pub(crate) async fn run_vendor_gc(
         crate::commands::sync_bazelignore(common, false).await;
     }
     out
+}
+
+/// What a prune reports for a vendor ledger it could not read: the code
+/// `rollback`, `list` and `apply` report it with. The error can quote the
+/// committed ledger, and a human run prints the detail.
+fn gc_ledger_unreadable(e: &std::io::Error) -> (&'static str, String) {
+    (
+        "vendor_state_unreadable",
+        format!(
+            "cannot read .socket/vendor/state.json: {}; the prune did not check the \
+             vendored entries or sweep orphan vendor dirs (restore the ledger from \
+             version control)",
+            crate::ui::printable(&e.to_string())
+        ),
+    )
 }
 
 /// Human-mode stderr line for a pass-level GC problem (the GC has no
@@ -7755,6 +7841,75 @@ mod gc_tests {
             .exists());
     }
 
+    /// (c) keeps an orphan dir a project file still installs from, and the
+    /// pass reports it: the sweep's other three callers do, and a summary
+    /// of zeros would hide that the lockfile and the ledger disagree.
+    #[tokio::test]
+    async fn vendor_gc_reports_an_orphan_dir_still_wired() {
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        let orphan_uuid = "1a2b3c4d-5e6f-4a1b-8c2d-9e0f1a2b3c4d";
+        let unit = format!(".socket/vendor/pypi/{orphan_uuid}");
+        let wheel = format!("{unit}/six-1.16.0-py2.py3-none-any.whl");
+        tokio::fs::create_dir_all(tmp.path().join(&unit))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join(&wheel), b"wheel")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("requirements.txt"), format!("./{wheel}\n"))
+            .await
+            .unwrap();
+
+        for dry_run in [true, false] {
+            let out = run_vendor_gc(&common, &manifest_path, dry_run).await;
+            assert_eq!(out.orphan_dirs, 0, "dry_run={dry_run}: {out:?}");
+            assert!(
+                tmp.path().join(&wheel).is_file(),
+                "dry_run={dry_run}: a wired orphan is never deleted"
+            );
+            let codes: Vec<&str> = out.unreconciled.iter().map(|(code, _)| *code).collect();
+            assert_eq!(
+                codes,
+                ["vendor_orphan_still_wired"],
+                "dry_run={dry_run}: {out:?}"
+            );
+            assert!(
+                out.unreconciled[0].1.contains(&unit),
+                "dry_run={dry_run}: {out:?}"
+            );
+        }
+        // The entry the ledger does own is untouched.
+        assert!(load_state(tmp.path())
+            .await
+            .unwrap()
+            .entries
+            .contains_key(PURL));
+
+        // An interrupted vendored run's commit replaces the lockfiles
+        // before the ledger. While its journal is pending, a pass that
+        // holds no lock (a dry one) cannot tell a lockfile ahead of its
+        // ledger entry from a lost entry, and reports no directory.
+        tokio::fs::write(tmp.path().join(group_commit::COMMIT_JOURNAL_REL), b"{}")
+            .await
+            .unwrap();
+        let out = run_vendor_gc(&common, &manifest_path, true).await;
+        assert!(out.unreconciled.is_empty(), "{out:?}");
+    }
+
+    /// The ledger's error can quote the committed file, and a human run
+    /// prints the warning: it carries no control character.
+    #[test]
+    fn gc_ledger_unreadable_is_printable() {
+        let e = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "corrupt state.json: unknown variant `\u{1b}]0;owned\u{7}`",
+        );
+        let (code, detail) = gc_ledger_unreadable(&e);
+        assert_eq!(code, "vendor_state_unreadable");
+        assert!(!detail.chars().any(char::is_control), "{detail:?}");
+        assert!(detail.contains("unknown variant `]0;owned`"), "{detail}");
+    }
+
     /// The GC body is lock-free and runs under the CALLER's guard: with the
     /// apply lock held by the caller (as `scan --prune`'s `run_apply_gc`
     /// holds it), a dry pass lists and a wet pass reclaims — the held lock
@@ -8135,8 +8290,20 @@ mod scope_and_hint_tests {
         assert_eq!(
             no_manifest_ledger_unreadable("corrupt .socket/vendor/state.json: expected value"),
             "Warning: No manifest to vendor from, and the vendor ledger could not be read: \
-             corrupt .socket/vendor/state.json: expected value\n  Run `socket-patch repair` \
-             to check the vendored artifacts."
+             corrupt .socket/vendor/state.json: expected value\n  Restore \
+             .socket/vendor/state.json from version control."
+        );
+        assert!(
+            !no_manifest_ledger_unreadable("unknown variant `\u{1b}]0;owned\u{7}`")
+                .contains(['\u{1b}', '\u{7}']),
+            "the ledger's error is printed without its control characters"
+        );
+        let json = no_manifest_ledger_unreadable_warning("corrupt x: expected value");
+        assert_eq!(json.code, "vendor_state_unreadable");
+        assert_eq!(
+            json.detail,
+            "no manifest to vendor from, and the vendor ledger could not be read: corrupt x: \
+             expected value; restore .socket/vendor/state.json from version control"
         );
     }
 

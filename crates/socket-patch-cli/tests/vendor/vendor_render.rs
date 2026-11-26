@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use crate::common::envelope::{parse_json_envelope, warning_codes};
 use crate::common::hermetic;
 use crate::npm_fixture::*;
 use crate::prebuilt_common;
@@ -274,6 +275,43 @@ async fn human_missing_manifest_with_ledger_names_the_tracked_entries() {
     assert!(
         !fx.root().join(".socket/apply.lock").exists(),
         "the no-op path takes no lock"
+    );
+}
+
+/// Plain vendor with no manifest and a ledger that cannot be read (a merge
+/// conflict left in the committed file): still the exit-0 no-op, and both
+/// modes say that the ledger was not read. Under `--json` the envelope was
+/// a bare `noManifest`, the shape of a project with nothing vendored.
+#[test]
+fn missing_manifest_with_an_unreadable_ledger_says_so_in_both_modes() {
+    let fx = npm_fixture();
+    std::fs::remove_file(fx.manifest_path()).unwrap();
+    std::fs::create_dir_all(fx.vendor_dir()).unwrap();
+    std::fs::write(fx.state_path(), "{\n<<<<<<< HEAD\n").unwrap();
+
+    let (code, stdout, stderr) = human_vendor(&fx, &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("the vendor ledger could not be read: corrupt "),
+        "{stderr}"
+    );
+    // `repair` stops at the same ledger: the remedy is the file itself.
+    assert!(
+        stderr.contains("Restore .socket/vendor/state.json from version control")
+            && !stderr.contains("repair"),
+        "{stderr}"
+    );
+
+    let (code, stdout, stderr) = human_vendor(&fx, &["--json"]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(env["status"], "noManifest", "{env:#}");
+    assert_eq!(warning_codes(&env), ["vendor_state_unreadable"], "{env:#}");
+    let detail = env["warnings"][0]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("the vendor ledger could not be read: corrupt ")
+            && detail.ends_with("restore .socket/vendor/state.json from version control"),
+        "{detail}"
     );
 }
 

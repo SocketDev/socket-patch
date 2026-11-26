@@ -123,14 +123,30 @@ pub(crate) const UNLEDGERED_WIRING_REMEDY: &str =
      git merge kept one side of state.json, merge both sides' `entries`)";
 
 /// The advisory for an orphan uuid dir the sweep kept because a project
-/// lockfile still points into it.
+/// lockfile still points into it, from a command that was asked to revert.
 pub(crate) fn orphan_still_wired(unit: &vendor::path::SweptVendorDir) -> VendorWarning {
+    still_wired(unit, ", then revert again")
+}
+
+/// [`orphan_still_wired`] for `scan --prune`, which was not asked to revert
+/// anything: "revert again" would read as `vendor --revert`, which
+/// un-vendors the project. The ledger may not have lost an entry either
+/// (a file that was left pointing at a patch the project has since
+/// replaced), so the other way out is named too, down to the directory:
+/// a prune with no ledger entry to judge ownership by never deletes one.
+pub(crate) fn orphan_still_wired_by_prune(unit: &vendor::path::SweptVendorDir) -> VendorWarning {
+    still_wired(
+        unit,
+        ", or point the lockfile back at the registry release and delete the directory",
+    )
+}
+
+fn still_wired(unit: &vendor::path::SweptVendorDir, then: &str) -> VendorWarning {
     VendorWarning::new(
         "vendor_orphan_still_wired",
         format!(
             "a project lockfile still points at .socket/vendor/{}/{}, which no ledger \
-             entry owns; the artifacts were kept ({UNLEDGERED_WIRING_REMEDY}, then revert \
-             again)",
+             entry owns; the artifacts were kept ({UNLEDGERED_WIRING_REMEDY}{then})",
             unit.eco, unit.uuid
         ),
     )

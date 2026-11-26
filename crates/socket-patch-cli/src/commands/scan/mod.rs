@@ -3021,6 +3021,17 @@ async fn scan_project(
                     .into_iter()
                     .map(|(code, detail)| (code.to_string(), detail)),
             );
+            // The vendored half runs below only for ledger entries the
+            // lock no longer wires, and a lost or unreadable ledger names
+            // none: what that half could not reconcile is said here.
+            if unwired_vendored.is_empty() {
+                layout_refusals.extend(
+                    gc::unreconciled_vendor_warnings(&args.common, &manifest_path)
+                        .await
+                        .into_iter()
+                        .map(|(code, detail)| (code.to_string(), detail)),
+                );
+            }
         }
         status.finish();
         // Bazel stops at an entry of the block whose jar no hub fetches
