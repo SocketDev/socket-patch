@@ -791,15 +791,12 @@ async fn a_platform_missing_from_the_list_leaves_the_gem_as_it_is_quietly() {
     assert_ne!(read(proj.path(), "Gemfile.lock"), lock(true));
 }
 
-/// The patch service also has a patch record per patched platform gem
-/// (`pkg:gem/<name>@<version>?platform=<platform>`), which a search
-/// returns beside the gem's own. Agent mode takes those; a hosted run
-/// patches the gem through its own patch alone. The platform gem's record
-/// is no selection of its own: one reference request for the one patch,
-/// no skip, and a later run offers no "newer patch".
-#[tokio::test(flavor = "multi_thread")]
-async fn a_platform_gems_own_record_is_no_fix_of_its_own() {
-    let server = MockServer::start().await;
+/// Mount the searches of the patch API under `routes` (the organisation's
+/// `/v0/orgs/<org>/patches`, or the public proxy's `/patch`), ahead of
+/// [`mount_api`]'s own answers: each finds the gem's patch and the patch
+/// record of its linux gem, the latter published later (it would rank
+/// first).
+async fn mount_searches_with_a_platform_gems_record(server: &MockServer, routes: &str) {
     let platform_purl = format!("{PURL}?platform={LINUX}");
     let listed = |uuid: &str, purl: &str| {
         json!({
@@ -817,10 +814,8 @@ async fn a_platform_gems_own_record_is_no_fix_of_its_own() {
             }},
         })
     };
-    // Ahead of `mount_api`'s own answers: the gem's patch and the linux
-    // gem's, the latter published later (it would rank first).
     Mock::given(method("POST"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .and(path(format!("{routes}/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "packages": [{ "purl": PURL, "patches": [
                 listed(UUID, PURL), listed(LINUX_UUID, &platform_purl),
@@ -828,19 +823,29 @@ async fn a_platform_gems_own_record_is_no_fix_of_its_own() {
             "canAccessPaidPatches": false,
         })))
         .with_priority(1)
-        .mount(&server)
+        .mount(server)
         .await;
     Mock::given(method("GET"))
-        .and(path_regex(format!(
-            "^/v0/orgs/{ORG}/patches/by-package/.+$"
-        )))
+        .and(path_regex(format!("^{routes}/by-package/.+$")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "patches": [found(LINUX_UUID, &platform_purl), found(UUID, PURL)],
             "canAccessPaidPatches": false,
         })))
         .with_priority(1)
-        .mount(&server)
+        .mount(server)
         .await;
+}
+
+/// The patch service also has a patch record per patched platform gem
+/// (`pkg:gem/<name>@<version>?platform=<platform>`), which a search
+/// returns beside the gem's own. Agent mode takes those; a hosted run
+/// patches the gem through its own patch alone. The platform gem's record
+/// is no selection of its own: one reference request for the one patch,
+/// no skip, and a later run offers no "newer patch".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_platform_gems_own_record_is_no_fix_of_its_own() {
+    let server = MockServer::start().await;
+    mount_searches_with_a_platform_gems_record(&server, &format!("/v0/orgs/{ORG}/patches")).await;
     mount_api(&server, Some((&ONE_PATCHED[..], 4))).await;
     let api = server.uri();
 
@@ -887,6 +892,115 @@ async fn a_platform_gems_own_record_is_no_fix_of_its_own() {
         ],
         "{env}"
     );
+}
+
+/// The run's client is where the platform gem's record is left out, so
+/// what it remembers and the client it falls back to leave it out too.
+/// A scan of two project directories asks the patch service once for both
+/// and answers the second from memory: each directory moves through the
+/// gem's own patch. And a run the API refuses (401) goes on with the
+/// public proxy, whose searches find the same record: the outcome is the
+/// one of the organisation's route.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_platform_gems_own_record_is_no_fix_from_memory_or_on_the_public_proxy() {
+    // Two project directories, one run.
+    let server = MockServer::start().await;
+    mount_searches_with_a_platform_gems_record(&server, &format!("/v0/orgs/{ORG}/patches")).await;
+    mount_api(&server, Some((&ONE_PATCHED[..], 4))).await;
+    let api = server.uri();
+    let index = format!("{}/", index_url(&api, Some(4)));
+    let root = tempfile::tempdir().unwrap();
+    for dir in ["a", "b"] {
+        std::fs::create_dir(root.path().join(dir)).unwrap();
+        std::fs::write(root.path().join(dir).join("Gemfile"), GEMFILE).unwrap();
+        std::fs::write(root.path().join(dir).join("Gemfile.lock"), lock(true)).unwrap();
+    }
+    let (code, stdout, stderr) = hosted(root.path(), &api, &["scan", "a", "b"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    for dir in ["a", "b"] {
+        assert_eq!(
+            read(&root.path().join(dir), "Gemfile.lock"),
+            hosted_lock(&index, ARM_UPSTREAM, LINUX_PATCHED),
+            "{dir}:\n{stdout}\n{stderr}"
+        );
+    }
+    assert!(!stderr.contains("Warning"), "{stderr}");
+    let (references, _) = requests(&server).await;
+    assert_eq!(
+        references,
+        [[UUID.to_string()], [UUID.to_string()]],
+        "one reference request a directory, for the gem's patch alone"
+    );
+    let searches = server.received_requests().await.unwrap_or_default();
+    let searched = |route: &str| {
+        let paths = searches.iter().map(|request| request.url.path());
+        paths.filter(|path| path.contains(route)).count()
+    };
+    // (Where file descriptors are scarce a run asks directory by directory.)
+    if !socket_patch_core::crawlers::walk_pool::fd_limit_is_tight() {
+        assert_eq!(
+            (searched("/patches/batch"), searched("/patches/by-package/")),
+            (1, 1),
+            "premise: the second directory is answered from memory"
+        );
+    }
+
+    // The API refuses the token: the run goes on with the public proxy.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "error": { "message": "Unauthorized" },
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mount_searches_with_a_platform_gems_record(&server, "/patch").await;
+    let api = server.uri();
+    Mock::given(method("POST"))
+        .and(path("/patch/package"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": { UUID: reference(&api, UUID, Some((&ONE_PATCHED[..], 4))) }
+        })))
+        .mount(&server)
+        .await;
+    mount_api(&server, Some((&ONE_PATCHED[..], 4))).await;
+    let proj = project(&lock(true));
+    let (code, env) = scan_json(proj.path(), &api, &["--proxy-url", api.as_str()]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(
+        hosted_events(&env),
+        [
+            upstream_event(ARM),
+            patched_event("applied", LINUX, LINUX_UUID, true)
+        ],
+        "{env}"
+    );
+    let selected: Vec<&Value> = env["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|package| package["selectedUuids"].as_array().unwrap())
+        .collect();
+    assert_eq!(selected, [&json!(UUID)], "{env}");
+    let asked = server.received_requests().await.unwrap_or_default();
+    let on_proxy: Vec<&str> = asked
+        .iter()
+        .map(|request| request.url.path())
+        .filter(|path| path.starts_with("/patch/"))
+        .collect();
+    assert!(
+        on_proxy.contains(&"/patch/batch") && on_proxy.iter().any(|p| p.contains("/by-package/")),
+        "premise: the searches ran on the public proxy: {on_proxy:?}"
+    );
+    let referenced: Vec<Value> = asked
+        .iter()
+        .filter(|request| request.url.path() == "/patch/package")
+        .map(|request| {
+            serde_json::from_slice::<Value>(&request.body).unwrap_or_default()["uuids"].clone()
+        })
+        .collect();
+    assert_eq!(referenced, [json!([UUID])], "one reference request");
 }
 
 /// The one patched build a lock pins is withdrawn: the list has upstream's

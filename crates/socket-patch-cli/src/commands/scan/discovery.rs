@@ -125,30 +125,6 @@ pub(crate) async fn lockfile_supplement(
     out
 }
 
-/// Whether `purl` names the patch of one platform gem
-/// (`pkg:gem/<name>@<version>?platform=<platform>`, any platform but
-/// `ruby`): what an installed copy of that platform gem takes in place.
-///
-/// A vendored run patches a gem through the patch of the gem itself, whose
-/// package reference names the patched build of every platform the
-/// Bundler lock resolves. The patch of a platform gem is no fix of its own
-/// there: a vendored selection leaves it out before anything is reported,
-/// downloaded or handed to the engine ([`drop_platform_gem_patches`]).
-pub(crate) fn is_platform_gem_patch(purl: &str) -> bool {
-    socket_patch_core::hosted::engine::is_platform_gem_patch(purl)
-}
-
-/// Take the patches of platform gems ([`is_platform_gem_patch`]) out of
-/// `packages`, and the packages left with no patch on offer.
-pub(super) fn drop_platform_gem_patches(packages: &mut Vec<BatchPackagePatches>) {
-    for package in packages.iter_mut() {
-        package
-            .patches
-            .retain(|patch| !is_platform_gem_patch(&patch.purl));
-    }
-    packages.retain(|package| !package.patches.is_empty());
-}
-
 /// The purls of the jars that the pinned rules_jvm_external hubs of a Bazel
 /// workspace fetch when `--cwd` is its root, what was not read of its hubs
 /// and the entries of its block that are stale
@@ -1124,72 +1100,6 @@ mod tests {
             "pkg:composer/psr/log@3.0.2.0",
         ] {
             assert!(!lockfile_only_contains(&purls, api), "{api}");
-        }
-    }
-
-    /// A vendored run patches a gem through the patch of the gem itself.
-    /// The patches of its platform gems, which a search returns beside it,
-    /// are taken out of the offers before anything is reported or
-    /// downloaded: the gem keeps its own patch, a gem offered nothing else
-    /// leaves the list, and the release variants of every other ecosystem
-    /// (and a gem's `ruby` platform) stay.
-    #[test]
-    fn a_vendored_selection_leaves_out_the_patches_of_platform_gems() {
-        let offer = |package: &str, patches: &[(&str, &str)]| {
-            let mut package = batch_with(package, &[]);
-            for (uuid, purl) in patches {
-                let mut patch = batch_with(purl, &[uuid]).patches.remove(0);
-                patch.purl = (*purl).to_string();
-                package.patches.push(patch);
-            }
-            package
-        };
-        let mut packages = vec![
-            offer(
-                "pkg:gem/nokogiri@1.18.10",
-                &[
-                    (
-                        "linux",
-                        "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu",
-                    ),
-                    ("source", "pkg:gem/nokogiri@1.18.10?platform=ruby"),
-                    ("darwin", "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin"),
-                ],
-            ),
-            offer(
-                "pkg:gem/ffi@1.17.0",
-                &[("java", "pkg:gem/ffi@1.17.0?platform=java")],
-            ),
-            offer("pkg:gem/rack@3.1.8", &[("rack", "pkg:gem/rack@3.1.8")]),
-            offer(
-                "pkg:pypi/six@1.16.0",
-                &[("wheel", "pkg:pypi/six@1.16.0?artifact_id=py2.py3-none-any")],
-            ),
-        ];
-        drop_platform_gem_patches(&mut packages);
-        let left: Vec<(&str, Vec<&str>)> = packages
-            .iter()
-            .map(|package| {
-                let uuids = package.patches.iter().map(|patch| patch.uuid.as_str());
-                (package.purl.as_str(), uuids.collect())
-            })
-            .collect();
-        assert_eq!(
-            left,
-            [
-                ("pkg:gem/nokogiri@1.18.10", vec!["source"]),
-                ("pkg:gem/rack@3.1.8", vec!["rack"]),
-                ("pkg:pypi/six@1.16.0", vec!["wheel"]),
-            ]
-        );
-        assert!(is_platform_gem_patch("pkg:gem/a@1?platform=x64-mingw-ucrt"));
-        for kept in [
-            "pkg:gem/a@1",
-            "pkg:gem/a@1?platform=ruby",
-            "pkg:gem/a@1?platform=",
-            "pkg:npm/a@1?platform=java",
-        ] {
-            assert!(!is_platform_gem_patch(kept), "{kept}");
         }
     }
 

@@ -9,8 +9,7 @@
 use clap::Args;
 use futures_util::StreamExt;
 use socket_patch_core::api::client::{
-    build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
-    is_fallback_candidate, ApiClient, ApiError,
+    get_api_client_with_overrides, hold_back_debug, is_fallback_candidate, ApiClient, ApiError,
 };
 use socket_patch_core::api::types::{BatchPackagePatches, BatchSearchResponse, PatchSearchResult};
 use socket_patch_core::crawlers::ruby_crawler::{
@@ -70,7 +69,7 @@ use self::discovery::{
 // and vendored-ledger crawl supplements. `pub(crate)` re-exports because
 // the submodules themselves stay private to scan.
 pub(crate) use self::discovery::{
-    is_platform_gem_patch, lockfile_supplement as project_lockfile_supplement,
+    lockfile_supplement as project_lockfile_supplement,
     vendored_ledger_supplement as project_vendored_supplement,
 };
 use self::gc::gc_into;
@@ -786,6 +785,25 @@ fn print_rollout_human(stage: &rollout::Stage, dry_run: bool, silent: bool, own_
             println!("  {step}");
         }
     }
+}
+
+/// The invocation's API client as a scan in `mode` asks it.
+///
+/// A hosted or a vendored run patches a gem through the patch of the gem
+/// itself, whose reference names the patched build of every platform. The
+/// patch of a platform gem, which the patch service returns beside it, is
+/// no offer there, and the run's client is where that is said, once: it
+/// answers every search without those patches
+/// ([`ApiClient::offering_platform_gem_patches`]), so nothing after it
+/// counts, selects, reports or asks about one. Agent mode's client answers
+/// in full: there each is what an installed copy of that platform gem
+/// takes.
+///
+/// Said for each project directory's run, since the directories of one
+/// invocation share a client and can differ in mode.
+fn client_for(mode: Option<ScanMode>, client: ApiClient) -> ApiClient {
+    let offered = !matches!(mode, Some(ScanMode::Hosted | ScanMode::Vendored));
+    client.offering_platform_gem_patches(offered)
 }
 
 /// The tier filter, then the policy's per-package selection (see
@@ -2408,11 +2426,6 @@ async fn scan_project(
     let apply = args.mode == Some(ScanMode::Agent);
     let vendor = args.mode == Some(ScanMode::Vendored);
     let hosted = args.mode == Some(ScanMode::Hosted);
-    // A hosted or a vendored run patches a gem through the patch of the
-    // gem itself.
-    if vendor || hosted {
-        policy.leave_out_platform_gem_patches();
-    }
     // `patches.enabled: false` writes nothing, the GC included.
     let prune = (args.prune || args.sync) && policy.writes_allowed();
 
@@ -2434,9 +2447,10 @@ async fn scan_project(
     let overrides = args.common.api_client_overrides();
     // One client per invocation: the project directories of a run share
     // its connection (and its org lookup).
-    let (mut api_client, mut use_public_proxy) = report
+    let (api_client, mut use_public_proxy) = report
         .client(get_api_client_with_overrides(overrides.clone()))
         .await;
+    let mut api_client = client_for(args.mode, api_client);
     // Sized for the endpoint the run starts on. A mid-run downgrade to the
     // proxy keeps these chunk boundaries: every chunk is within the proxy's
     // body cap by construction (`BATCH_BODY_BYTE_CAP`).
@@ -3386,7 +3400,8 @@ async fn scan_project(
                      falling back to public patch API proxy (free patches only)."
                 ));
             }
-            api_client = build_proxy_fallback_client(&overrides);
+            // Made from the run's client: it answers a search alike.
+            api_client = api_client.proxy_fallback(&overrides);
             use_public_proxy = true;
             fallback_to_proxy = true;
             report.fell_back_to(&api_client);
@@ -3400,12 +3415,6 @@ async fn scan_project(
     // drives the report, the `--json` `packages` array and the apply order,
     // which operators diff across runs.
     all_packages_with_patches.sort_by(|a, b| a.purl.cmp(&b.purl));
-    // A hosted or a vendored run patches a gem through the patch of the gem
-    // itself: the patch of one of its platform gems is no offer of its own
-    // there.
-    if vendor || hosted {
-        discovery::drop_platform_gem_patches(&mut all_packages_with_patches);
-    }
     // #604: a patch the API returned under an equivalent spelling of a
     // lockfile-only PyPI pin is that lockfile-only package.
     adopt_pypi_equivalents(

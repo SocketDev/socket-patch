@@ -192,9 +192,6 @@ pub(crate) struct ScanPolicy {
     recorded: HashMap<String, String>,
     nested: Option<NestedRoots>,
     report: Mutex<Report>,
-    /// The run does not take the patch of a platform gem as an offer of
-    /// its own ([`Self::leave_out_platform_gem_patches`]).
-    no_platform_gem_patches: bool,
 }
 
 impl ScanPolicy {
@@ -238,17 +235,7 @@ impl ScanPolicy {
             recorded: HashMap::new(),
             nested: None,
             report: Mutex::new(report),
-            no_platform_gem_patches: false,
         }
-    }
-
-    /// Have [`Self::select`] leave out the patches of platform gems
-    /// ([`super::discovery::is_platform_gem_patch`]), which a package
-    /// search returns beside the patch of the gem itself. A vendored run
-    /// patches a gem through that one alone, so the others are no offers
-    /// there: nothing is selected, reported or downloaded for them.
-    pub(crate) fn leave_out_platform_gem_patches(&mut self) {
-        self.no_platform_gem_patches = true;
     }
 
     /// Judge crawled copies under a nested project's `node_modules` by that
@@ -597,11 +584,6 @@ impl ScanPolicy {
                 if report
                     .retained_purls
                     .contains(&PurlKey::new(&offer.purl).into_string())
-                {
-                    continue;
-                }
-                if self.no_platform_gem_patches
-                    && super::discovery::is_platform_gem_patch(&offer.purl)
                 {
                     continue;
                 }
@@ -1178,11 +1160,16 @@ mod tests {
 
     /// A package search returns the patches of a gem's platform gems
     /// beside the patch of the gem itself, and every one of them is an
-    /// offer under its own purl. A run told to leave them out (a vendored
-    /// run) selects the gem's own patch alone, and reports nothing of the
-    /// others: they are in no list, withheld or filtered.
+    /// offer under its own purl: a selection takes what the search answer
+    /// holds. Agent mode's answer holds them all. The client of a hosted
+    /// or a vendored run answers without them
+    /// (`leave_out_platform_gem_patches`), so its selection is the gem's
+    /// own patch alone, with nothing of the others in any list, withheld
+    /// or filtered.
     #[test]
-    fn a_vendored_selection_takes_a_gem_through_its_own_patch_alone() {
+    fn a_selection_takes_a_gem_through_the_patches_its_search_answer_holds() {
+        use socket_patch_core::api::types::SearchResponse;
+        use socket_patch_core::hosted::engine::leave_out_platform_gem_patches;
         let of = |uuid: &str, purl: &str| {
             let mut offer = offer(uuid, &[(HIGH, "high")]);
             offer.purl = purl.to_string();
@@ -1191,22 +1178,26 @@ mod tests {
         let source = "pkg:gem/nokogiri@1.18.10?platform=ruby";
         let linux = "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu";
         let darwin = "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin";
-        let offers = || {
+        let answer = || {
             let another = "cccccccc-0000-4000-8000-000000000001";
-            vec![of(A1, linux), of(B1, source), of(another, darwin)]
+            SearchResponse {
+                patches: vec![of(A1, linux), of(B1, source), of(another, darwin)],
+                can_access_paid_patches: true,
+            }
         };
 
         let agent = filtered_policy("", r#"{"version": 1}"#, None);
-        let all = agent.select(offers());
+        let all = agent.select(answer().patches);
         assert_eq!(
             all.selected.keys().collect::<Vec<_>>(),
             [darwin, source, linux],
-            "every other mode offers each platform gem's patch"
+            "agent mode is offered each platform gem's patch"
         );
 
-        let mut vendored = filtered_policy("", r#"{"version": 1}"#, None);
-        vendored.leave_out_platform_gem_patches();
-        let own = vendored.select(offers());
+        let vendored = filtered_policy("", r#"{"version": 1}"#, None);
+        let mut narrowed = answer();
+        leave_out_platform_gem_patches(&mut narrowed);
+        let own = vendored.select(narrowed.patches);
         assert_eq!(own.selected.keys().collect::<Vec<_>>(), [source]);
         assert_eq!(own.selected[source].uuid, B1);
         assert_eq!(own.unfiltered.keys().collect::<Vec<_>>(), [source]);

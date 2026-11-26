@@ -1,8 +1,7 @@
 use clap::Args;
 use futures_util::StreamExt;
 use socket_patch_core::api::client::{
-    build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
-    is_fallback_candidate, ApiClient, ApiError,
+    get_api_client_with_overrides, hold_back_debug, is_fallback_candidate, ApiClient, ApiError,
 };
 use socket_patch_core::api::ranking::{cmp_search_results, severity_order};
 use socket_patch_core::api::types::{
@@ -10,6 +9,7 @@ use socket_patch_core::api::types::{
 };
 use socket_patch_core::crawlers::fuzzy_match::fuzzy_match_packages;
 use socket_patch_core::formats::pnpm::PnpmLock;
+use socket_patch_core::hosted::engine::is_platform_gem_patch;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::records::{build_patch_record, files_for_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
@@ -1253,7 +1253,7 @@ struct PlatformGemPatch {
 impl PlatformGemPatch {
     /// `patch` as the patch of a platform gem; `None` for any other.
     fn of(patch: &PatchResponse) -> Option<Self> {
-        if !super::scan::is_platform_gem_patch(&patch.purl) {
+        if !is_platform_gem_patch(&patch.purl) {
             return None;
         }
         let (_, name, version) = purl_parts(&patch.purl)?;
@@ -1282,7 +1282,7 @@ impl PlatformGemPatch {
             return None;
         }
         let gem_patch = api_client.fetch_patch(built_from).await.ok()??;
-        (!super::scan::is_platform_gem_patch(&gem_patch.purl)
+        (!is_platform_gem_patch(&gem_patch.purl)
             && canonical_purl(&gem_patch.purl) == canonical_purl(&self.purl))
         .then_some(gem_patch)
     }
@@ -1462,8 +1462,14 @@ pub async fn run(args: GetArgs) -> i32 {
         eprintln!("Treating \"{}\" as a package name search", args.identifier);
     }
     let overrides = args.common.api_client_overrides();
-    let (mut api_client, mut use_public_proxy) =
-        get_api_client_with_overrides(overrides.clone()).await;
+    let (api_client, mut use_public_proxy) = get_api_client_with_overrides(overrides.clone()).await;
+    // A hosted or a vendored run patches a gem through the patch of the
+    // gem itself: the patch of one of its platform gems, which a search
+    // returns beside it, is no fix of its own there, so the run's client
+    // answers every search without them. (One named by its UUID stands
+    // for the gem's patch: see `PlatformGemPatch`.)
+    let mut api_client =
+        api_client.offering_platform_gem_patches(mode == super::scan::ScanMode::Agent);
     let telemetry = TelemetryAuth::for_client(&api_client);
     // A token whose org could not be resolved put the whole run on the
     // public proxy (the client already warned on stderr): `--json`
@@ -1507,7 +1513,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     // Building the proxy client may print core's proxy
                     // notice straight to stderr: take the line down first.
                     status.finish();
-                    api_client = build_proxy_fallback_client(&overrides);
+                    api_client = api_client.proxy_fallback(&overrides);
                     use_public_proxy = true;
                     fallback_to_proxy = true;
                     status.set(format!("Fetching patch {}...", args.identifier));
@@ -1866,18 +1872,6 @@ pub async fn run(args: GetArgs) -> i32 {
     search_response
         .patches
         .retain(|p| args.common.purl_ecosystem_selected(&p.purl));
-    // A hosted or a vendored run patches a gem through the patch of the
-    // gem itself: the patch of one of its platform gems, which a search
-    // returns beside it, is no fix of its own there. (One named by its
-    // UUID stands for the gem's patch: see `PlatformGemPatch`.)
-    if matches!(
-        mode,
-        super::scan::ScanMode::Vendored | super::scan::ScanMode::Hosted
-    ) {
-        search_response
-            .patches
-            .retain(|p| !super::scan::is_platform_gem_patch(&p.purl));
-    }
 
     if search_response.patches.is_empty() {
         if args.common.json {
