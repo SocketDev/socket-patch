@@ -121,7 +121,9 @@
     ],
     "redirect_vlt_reinstall_required: copies could not be checked": [
       "scan_redirect_vlt_heal_undeterminable_node_modules_symlink_not_deleted",
-      "scan_redirect_vlt_undeterminable_vex_not_attested"
+      "scan_redirect_vlt_undeterminable_vex_not_attested",
+      "vlt_hosted_rollback_reports_an_unchecked_copy_as_a_rollback",
+      "vlt_hosted_then_vendored_takeover_reports_an_unchecked_copy_as_a_takeover"
     ],
     "redirect_vlt_reinstall_required: none stale": [
       "scan_redirect_vlt_rerun_does_not_invalidate_healthy_tree"
