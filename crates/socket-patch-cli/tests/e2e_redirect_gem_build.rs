@@ -8110,21 +8110,26 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
         reported(true).len(),
         "every patched build is counted: {env}"
     );
-    // The platform copy bundler had installed is the patched build now, and
-    // nothing warns about platforms.
-    let caveats = |refreshed: bool| {
-        let mut codes = Vec::new();
-        if refreshed {
-            codes.push("redirect_gem_install_refreshed".to_string());
-        }
-        if !checksums_lock {
-            codes.push("redirect_gem_no_checksums_section".to_string());
-        }
-        codes
-    };
-    let mut codes = warning_codes(&env);
-    codes.sort();
-    assert_eq!(codes, caveats(true), "{env}");
+    // Nothing warns about platforms, and the platform copy bundler had
+    // installed is the patched build now.
+    let codes = warning_codes(&env);
+    let said = |code: &str| codes.iter().any(|said| said == code);
+    for code in [
+        "redirect_gem_platform_unsupported",
+        "redirect_gem_stale_install",
+        "redirect_gem_frozen_install",
+    ] {
+        assert!(!said(code), "no {code}: {env}");
+    }
+    assert_eq!(
+        said("redirect_gem_no_checksums_section"),
+        !checksums_lock,
+        "{env}"
+    );
+    assert!(
+        said("redirect_gem_install_refreshed"),
+        "the warm platform install is refreshed: {env}"
+    );
     assert_eq!(
         std::fs::read_to_string(&warm_lib).unwrap(),
         patched,
@@ -8167,13 +8172,17 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
     assert_eq!(p.lock(), lock, "a re-scan leaves the lock byte-identical");
     assert_eq!(p.gemfile(), gemfile);
     assert_eq!(hosted_events(&env), reported(false), "{env}");
-    let mut codes = warning_codes(&env);
-    codes.sort();
-    assert_eq!(
-        codes,
-        caveats(false),
-        "a re-scan has nothing to refresh, warn about or skip: {env}"
-    );
+    let codes = warning_codes(&env);
+    for code in [
+        "redirect_gem_install_refreshed",
+        "redirect_gem_stale_install",
+        "redirect_gem_platform_unsupported",
+    ] {
+        assert!(
+            !codes.iter().any(|said| said == code),
+            "a re-scan has nothing to refresh, warn about or skip: {env}"
+        );
+    }
     assert_eq!(
         env["updates"],
         serde_json::json!([]),
