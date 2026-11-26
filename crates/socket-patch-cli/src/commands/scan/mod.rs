@@ -70,7 +70,7 @@ use self::discovery::{
 // and vendored-ledger crawl supplements. `pub(crate)` re-exports because
 // the submodules themselves stay private to scan.
 pub(crate) use self::discovery::{
-    lockfile_supplement as project_lockfile_supplement,
+    is_platform_gem_patch, lockfile_supplement as project_lockfile_supplement,
     vendored_ledger_supplement as project_vendored_supplement,
 };
 use self::gc::gc_into;
@@ -2408,6 +2408,10 @@ async fn scan_project(
     let apply = args.mode == Some(ScanMode::Agent);
     let vendor = args.mode == Some(ScanMode::Vendored);
     let hosted = args.mode == Some(ScanMode::Hosted);
+    // A vendored run patches a gem through the patch of the gem itself.
+    if vendor {
+        policy.leave_out_platform_gem_patches();
+    }
     // `patches.enabled: false` writes nothing, the GC included.
     let prune = (args.prune || args.sync) && policy.writes_allowed();
 
@@ -3395,6 +3399,11 @@ async fn scan_project(
     // drives the report, the `--json` `packages` array and the apply order,
     // which operators diff across runs.
     all_packages_with_patches.sort_by(|a, b| a.purl.cmp(&b.purl));
+    // A vendored run patches a gem through the patch of the gem itself: the
+    // patch of one of its platform gems is no offer of its own there.
+    if vendor {
+        discovery::drop_platform_gem_patches(&mut all_packages_with_patches);
+    }
     // #604: a patch the API returned under an equivalent spelling of a
     // lockfile-only PyPI pin is that lockfile-only package.
     adopt_pypi_equivalents(
