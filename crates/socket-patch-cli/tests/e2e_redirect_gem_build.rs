@@ -106,9 +106,10 @@
 //! patched (this machine in either role), none patched or one still being
 //! made (nothing moves, quietly), a newer snapshot, `bundle lock
 //! --add-platform` over a hosted lock, and a refresh whose download the
-//! registry redirects. Where every locked build is patched, VEX over the
-//! fresh checkout the real bundler installed names each build under its own
-//! patch (`platform_vex_matrix`).
+//! registry redirects. VEX names each locked build (`platform_vex_matrix`,
+//! over the fresh checkout the real bundler installed): a patched build
+//! under its own patch, a build on upstream's gem as affected, whichever of
+//! the two this machine holds.
 //!
 //! VERSION MATRIX: the arms run on bundler 1.17 → 4.x (the CHECKSUMS arm
 //! from 2.6, the CHECKSUMS-era floor; every other arm from 1.17). Pick the
@@ -8816,6 +8817,104 @@ async fn gem_hosted_machine_of_the_patched_platform_installs_the_patched_gem() {
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_machine_of_a_platform_with_no_patched_build_installs_upstreams_gem() {
     one_platform_patched_and_one_on_upstream("platform-one-patched-other", false).await;
+}
+
+/// VEX of a lock with ONE patched platform and one the registry still
+/// serves as upstream's own gem, which the hosted scan moved and the REAL
+/// bundler installed frozen. `own_patched` says which of the two this
+/// machine is; `checksums_lock`, whether the lock says which sha256 it
+/// installs or the registry's index has to. The patched build is attested
+/// under its own patch and the other is said affected, never patched, with
+/// exit 0:
+///
+///   1. by the scan's own `--vex`, over the copy bundler had installed;
+///   2. by a later `vex` over a checkout nothing is installed in;
+///   3. by a later `vex` over the checkout the frozen install put this
+///      machine's gem in, the patched build or upstream's own: the copy on
+///      this machine changes nothing of what is said of either build
+///      ([`platform_vex_matrix`]).
+async fn one_patched_build_is_attested_and_the_other_said_affected(
+    tag: &str,
+    own_patched: bool,
+    checksums_lock: bool,
+) {
+    let floor = if checksums_lock { (2, 6) } else { (2, 2) };
+    let Some(mut p) = PlatformProject::start(tag, floor, checksums_lock, false, &[]).await else {
+        return;
+    };
+    let (own, foreign) = (p.own.clone(), p.foreign.clone());
+    let (patched, upstream) = if own_patched {
+        (own.as_str(), foreign.as_str())
+    } else {
+        (foreign.as_str(), own.as_str())
+    };
+    let locked = [(patched, Has::Patched), (upstream, Has::Upstream)];
+    let index_url = p.serve(Some(&locked)).await;
+    let statements = build_statements(&locked, false);
+
+    // 1. The scan, and its own document.
+    let env = p.scan(&["--vex", "out.vex.json", "--vex-product", PRODUCT]);
+    assert_eq!(env["status"], "success", "{env}");
+    assert_eq!(
+        hosted_events(&env),
+        by_platform(vec![patched_event(patched, true), upstream_event(upstream)]),
+        "{env}"
+    );
+    p.assert_hosted_pair(&index_url, &[(patched, true), (upstream, false)]);
+    let in_run = vex_e2e_common::read_doc(&p.fx.proj.join("out.vex.json"));
+    assert_eq!(said(&in_run.expect("the run's document")), statements);
+    assert_eq!(
+        (&env["vex"]["statements"], &env["vex"]["affected"]),
+        (&serde_json::json!(2), &serde_json::json!(1)),
+        "{env}"
+    );
+
+    // 2. A checkout of the pair, nothing installed.
+    let checkout = stage_fresh_checkout(&p.fx, "checkout");
+    let out = vex_e2e_common::run_vex(&binary(), &checkout, &vex_run(&p.fx));
+    assert_eq!(out.code, Some(0), "nothing installed: {out}");
+    assert_eq!(said(out.doc()), statements, "nothing installed: {out}");
+
+    // 3. The checkout a frozen install put this machine's gem in.
+    let fresh = p.install_fresh("fresh", &[("BUNDLE_FROZEN", "true")]);
+    p.assert_installed(&fresh, own_patched);
+    platform_vex_matrix(&p, &fresh, &locked).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6 for the CHECKSUMS lock); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_vex_on_a_machine_of_the_patched_platform_says_the_other_build_is_affected() {
+    one_patched_build_is_attested_and_the_other_said_affected(
+        "platform-vex-one-patched-own",
+        true,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6 for the CHECKSUMS lock); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_vex_on_a_machine_of_a_platform_with_no_patched_build_attests_the_patched_one() {
+    one_patched_build_is_attested_and_the_other_said_affected(
+        "platform-vex-one-patched-other",
+        false,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.2); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_vex_tells_the_builds_of_a_lock_without_checksums_apart_by_its_registry() {
+    one_patched_build_is_attested_and_the_other_said_affected(
+        "platform-vex-one-patched-other-no-checksums",
+        false,
+        false,
+    )
+    .await;
 }
 
 /// A gem is moved only once a locked build is patched and every locked
