@@ -323,14 +323,12 @@ const VENDOR: &[&str] = &["vendor", "--json", "--vendor-source", "service"];
 
 /// The counted events of `env` with `action`, as `(purl, uuid, gemFix,
 /// platform, errorCode)`.
-fn events<'a>(
+fn gem_events<'a>(
     env: &'a serde_json::Value,
     action: &str,
 ) -> Vec<(&'a str, &'a str, &'a str, &'a str, &'a str)> {
     let text = |value: &'a serde_json::Value| value.as_str().unwrap_or_default();
-    env["events"]
-        .as_array()
-        .expect("events array")
+    crate::common::envelope::events(env)
         .iter()
         .filter(|event| event["action"] == action)
         .map(|event| {
@@ -370,7 +368,7 @@ fn per_platform_gem(
 }
 
 fn assert_per_platform_gem(env: &serde_json::Value, action: &str, code: &'static str) {
-    let got = events(env, action);
+    let got = gem_events(env, action);
     let got: Vec<(&str, &str, &str, &str, &str)> = got
         .into_iter()
         .filter(|event| !event.2.is_empty())
@@ -639,7 +637,7 @@ async fn a_locked_platform_without_a_patched_build_is_one_line_and_no_failure() 
     assert_eq!(env["summary"]["applied"], 0, "{env:#}");
     assert_eq!(env["summary"]["failed"], 0, "{env:#}");
     assert_eq!(env["summary"]["skipped"], 1, "{env:#}");
-    let skipped = events(&env, "skipped");
+    let skipped = gem_events(&env, "skipped");
     assert_eq!(
         skipped,
         [(PURL, "", "", "", "vendor_prebuilt_platform_pending")],
@@ -707,7 +705,7 @@ async fn ledger_entries_of_other_builds_still_check_convert_and_revert() {
     let (code, env, stderr) = run_json(root, &["vendor", "--check", "--json"], &server.uri());
     assert_eq!(code, 0, "{env:#}\n{stderr}");
     assert_eq!(
-        events(&env, "verified"),
+        gem_events(&env, "verified"),
         [(PURL, "", "", "", "vendor_check_ok")],
         "{env:#}"
     );

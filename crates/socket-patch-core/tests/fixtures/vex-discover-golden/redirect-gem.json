@@ -44,6 +44,14 @@
     "elsewhere": [],
     "live_claims": []
   },
+  "redirect/gem/bundler/platform-build-pending/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
   "redirect/gem/bundler/platform-pass-through/expected": {
     "refs": [
       {
@@ -82,14 +90,6 @@
     ]
   },
   "redirect/gem/bundler/platform-pass-through/input": {
-    "refs": [],
-    "diagnostics": [],
-    "recognized": [],
-    "unlocked_pins": [],
-    "elsewhere": [],
-    "live_claims": []
-  },
-  "redirect/gem/bundler/platform-prebuild-missing/input": {
     "refs": [],
     "diagnostics": [],
     "recognized": [],

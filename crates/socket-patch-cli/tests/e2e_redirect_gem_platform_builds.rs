@@ -45,6 +45,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/mod.rs"]
 mod common;
+use common::envelope::warning_codes;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 
@@ -276,15 +277,6 @@ fn hosted_events(env: &Value) -> Vec<Value> {
         .flatten()
         .filter(|event| event["details"]["mode"] == "hosted")
         .cloned()
-        .collect()
-}
-
-fn warning_codes(env: &Value) -> Vec<String> {
-    env["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|w| w["code"].as_str().unwrap_or_default().to_string())
         .collect()
 }
 
