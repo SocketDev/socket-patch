@@ -3,7 +3,7 @@
 
 [agent] This comment is the register for the architecture refactor routine. It is rendered from `register/10-refactor.md` on the [`arch-audit/ledger`](https://github.com/SocketDev/socket-patch/tree/arch-audit/ledger) branch, and the routine updates it on every run.
 
-_Last updated 2026-11-26 · 10 runs under this charter · `main` at cfc870f when examined._
+_Last updated 2026-11-26 · 11 runs under this charter · `main` at cfc870f when examined._
 
 ### In flight
 | PR | Issue | State |
@@ -14,7 +14,7 @@ _Last updated 2026-11-26 · 10 runs under this charter · `main` at cfc870f when
 
 `hosted-e2e` is red on all three: it needs #2270 (a production gem patch the suite does not pin), then a re-run. Three are open: the next run opens none and verifies leads (step 3).
 
-**Next PR:** #2259, a wrong refusal with a probe on `main` in the issue. One file (core `utils/hatch.rs`). Then #2271, L22 (once #2261 merges: same function), #647, #1917, #1926, #1860: each ran (see Leads and Issues). #2277 waits for a maintainer's answer.
+**Next PR:** #2259, a wrong refusal with a probe on `main` in the issue. One file (core `utils/hatch.rs`). Then #2271, L22 (once #2261 merges: same function), #647, #1917, #1926, #1860, #1836: each ran (see Leads and Issues). #2277 waits for a maintainer's answer.
 
 ### Merged
 | PR | Fixed |
@@ -30,15 +30,12 @@ L01 to L18 came from earlier automated audits, the rest from this routine's runs
 
 | ID | Problem | Where | Status |
 |---|---|---|---|
-| L01–L03, L05, L11, L12, L16, L17, L20 | (collapsed) | core `utils/`, `vex/product.rs`, the gem stale probe, CLI `vex.rs`, the root walks, the update notifier, `KeepCause::of`, the Gemfile scanners | rejected (L01–L03, L17 ran: no real project produces the input. L16, L20: false) or already fixed (L05, L11, L12). Evidence in the entries |
+| L01–L03, L05, L10–L12, L16–L20 | (collapsed) | core `utils/`, `vex/product.rs`, the gem stale probe, CLI `vex.rs`, `apply.rs`, the root walks, the update notifier, `KeepCause::of`, the Gemfile scanners, the warning sinks, `tests/common/scan_proxy.rs` | rejected (L01–L03, L17 ran: no real project produces the input. L10 ran: the sinks follow the contract. L16, L20: false. L18, L19 read: the guard proves what it claims, and only an injected panic shows L19) or already fixed (L05, L11, L12). Evidence in the entries |
 | L04, L07, L21, L23, L24 | (collapsed) | CLI `vlt_heal.rs`, `scan/gc.rs`, `vendor.rs` `run_vendor_gc` | in PR #2265 (L04) and in PR #2261 (L07, L21, L23, L24). Evidence in the entries |
 | L06 | `hatch::require_pip_installer_documents` ignores the `envs` override | core `utils/hatch.rs` | filed #2259; ran a probe: a `pyproject.toml` `installer = "uv"` that hatch.toml's `envs` replaces still refuses vendored mode. Never fails open |
 | L08, L13 | `ui::shell_word` and its two POSIX-only copies don't quote `"` or `%VAR%` for cmd.exe; six verbatim-prefix strippers disagree on UNC and `\\?\Volume{…}` paths | CLI `ui/text.rs`, core `utils/` | to verify; both need Windows |
-| L09, L15, L26–L29 | (collapsed) | core `api/`, CLI `list.rs`, `vendor.rs`, `scan/gc.rs`, `vlt_heal.rs`, `scan/withdrawn.rs` | out of charter; L09, L15 and L26 need a decision the contract doesn't settle. The contract allows L27 (ran), L28 and L29. Evidence in the entries |
-| L10 | warning sinks disagree on `--silent`/`--json` | CLI `scan/mod.rs`, `list.rs`, `user_patches.rs`, `scan/withdrawn.rs` | to verify |
+| L09, L15, L26–L29, L31 | (collapsed) | core `api/`, CLI `list.rs`, `vendor.rs`, `scan/gc.rs`, `scan/mod.rs`, `vlt_heal.rs`, `scan/withdrawn.rs` | out of charter; L09, L15, L26 and L31 (ran: a prune skipped by an empty crawl has no `--json` warning) need a decision the contract doesn't settle. The contract allows L27 (ran), L28 and L29. Evidence in the entries |
 | L14 | scala-cli `discover` collapses unreadable files and cap breaches into `None`, so the user is told to run `scala-cli compile` | core JVM crawlers | to verify; read: no real project reaches the caps. Open: a non-project `.json` in Bloop's directory. No scala-cli here |
-| L18 | `assert_proxy_served_scans` counts 404s as served, so a wrong mount path stays green | `tests/common/scan_proxy.rs` | to verify; read: true, but a 404 from the mock still proves the hermeticity the guard claims |
-| L19 | `check_derived_copies` turns a join error of the Gradle derived-copy check into "no stale copies"; vex's twin withholds | CLI `commands/apply.rs` | to verify; read twice: only an injected panic shows it |
 | L22 | the prune GC raises no Go undo warning after it reverts a vendored Go module | CLI `vendor.rs` `run_vendor_gc` | filed #1910 (its last bullet); ran it: `scan --prune` says nothing where `vendor --revert`, `remove` and `rollback` warn about `vendor/modules.txt` (#1778 fixed those three) |
 | L25 | the ledger's load error is printed raw, so control characters in a committed `state.json` reach the terminal | six CLI commands | filed #2271; ran it: ESC and BEL from a snapshot hash are printed |
 | L30 | `rollback` and `remove` refuse a package when a file of its patch is absent, the state `apply --force` leaves | core `patch/rollback.rs` | filed #2277, a decision issue; ran it: exit 1 with the other file still patched, and again after a reinstall |
@@ -56,22 +53,19 @@ Issues looked at:
 | #1926 | confirmed; ran it: `scan --sync` keeps a Cargo record over a cache file at neither hash and prunes it once the before-blob is cached |
 | #1860 | confirmed; ran it: `list` prints U+202E, U+202C and U+200B from a manifest's description and a summary, and drops ESC and BEL. Same area as #2271 |
 | #647 | confirmed; ran it with a token the API refuses: `get`'s searches and `vendor`'s eject have no public-proxy fallback, where `scan`, `get <uuid>` and `show` do; the contract promises the eject one. The blob downloads fail too (the contract is silent) |
+| #1836 | confirmed; ran it: eight identical `get --mode agent --json` runs printed eight orders of `options[].vulnerabilities`, which `scan`'s events and `list` sort by id. Its unit test and the `get` suite pass with the lists emptied |
 | #1064, #882, #1981 | out of charter; the contract names the product probes (#1064, ran), `grant::check` refuses the unsafe splice (#882), and what is left of #1981 needs Go. Evidence in the entries |
 | #1899, #1861, #1877, #1927, #1969, #1950 | out of charter; tidiness, by design, a hand-written input, or a decision the contract doesn't settle. Evidence in the entries |
 | #1837, #1858, #1911, #1987 | out of charter; each ran on 2026-11-26: the contract allows what #1837 and #1858 show, the project-patch gate held on 15 runs (#1911), and what is left of #1987 needs Windows |
+| #705, #905, #594, #1835 | out of charter; each ran on 2026-11-26 and is mostly fixed: an uppercase UUID works in every mode, BOM and plain projects scan alike, the hosted NuGet model's tests pass, and `get <uuid>` agrees with `get <purl>` on seven states |
 
 ### Areas examined
 | Area | Date | `main` | Found |
 |---|---|---|---|
-| `scan --prune` vendored GC, the vendored revert classification, core `utils/redact.rs`, `utils/npm_range.rs`, the repository-root walks | 2026-11-25 | 332b3e8 | #2246 |
-| an unreadable or lost vendor ledger on every command that reads it; the orphan sweep's four callers | 2026-11-25 | 0a391c1 to cfc870f | #2250; #2253 and L21 (PR #2261) |
-| `--json` / `--silent` output of 19 commands over 5 small projects (285 runs) | 2026-11-25 | 0a391c1 | clean: one JSON document under `--json`, nothing under `--silent` |
-| Gradle: the derived-copy checks, also under a prefix; the three `--global-prefix` tests under two production mutations | 2026-11-25, 11-26 | 0a391c1, cfc870f | #2267. L19 holds by reading; nothing a real cache triggers |
-| the vlt heal and its advisory in three directions (real vlt 1.2.0); the gem stale-install guard over platform builds | 2026-11-25, 11-26 | da012af, cfc870f | #2254 (PR #2265); the guard is clean |
-| a vendored requirement removed or bumped, through `remove`, `rollback`, `vendor --revert` | 2026-11-25 | 9a2a946 | clean; the pip reinstall advisory's reason is wrong there, its remedy works |
-| core `utils/hatch.rs` installer check, `formats/xml.rs` `attr`, `api/retry.rs`, the update notifier's timeouts | 2026-11-25 | 9a2a946 | #2259; the rest need a hand-written input or a decision |
+| the 2026-11-25 runs (rows in that day's entries): the prune's vendored GC; an unreadable vendor ledger on every command; `--json` / `--silent` over 19 commands (285 runs); Gradle derived copies and `--global-prefix`; the vlt heal; the gem stale-install guard; a vendored requirement removed or bumped; core `utils/hatch.rs`, `redact.rs`, `npm_range.rs`, `formats/xml.rs`, `api/retry.rs` | 2026-11-25, 11-26 | 332b3e8 to cfc870f | #2246, #2250, #2253, #2254, #2259, #2267; the rest clean |
 | the prune's Cargo/PyPI keep rule; NuGet project files; `list`'s terminal filter; the Gemfile scanners; a refused token; a vendored Go undo; the VEX product probes | 2026-11-26 | cfc870f | #1926, #1917, #1860, #647, L22 confirmed; L17 rejected |
 | the project-patch gate in every mode; a held lock on 15 runs; `apply --force` over a missing file, then every undo | 2026-11-26 | cfc870f | #2277; the gate and the lock are clean |
+| run-to-run output of `get`, `show`, `list`, `scan`, `vex`; an uppercase UUID; BOMs on NuGet and npm files; the project-patch warning under `--silent` / `--json`; `get <uuid>` against `get <purl>`; corrupt blobs; two installed copies under `vex`; `--cwd` from another directory | 2026-11-26 | cfc870f | #1836 confirmed; the rest clean |
 
 ### Notes
 - Build with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0` on every cargo call, and give each checkout its own `CARGO_TARGET_DIR`, or the next call rebuilds everything. A cold CLI build takes 3 minutes, one test binary 2, a rebuild after an edit 25 seconds.
@@ -89,5 +83,6 @@ Issues looked at:
 - This sandbox has node, npm, pnpm, yarn 1, bun, uv, poetry, ruby and bundler, composer, java 21, mvn and gradle 8.14.3. It has no docker daemon, go, dotnet, sbt or deno. Real-Gradle tests run: `SOCKET_PATCH_GRADLE_E2E_REQUIRED=1 cargo test --test e2e_gradle_agent_build -- --ignored <name>` (35 seconds).
 - Real-vlt legs run: `scripts/install-vlt.sh 1.2.0 <dir>` prints the path for `SOCKET_PATCH_VLT_E2E_JS` (set `_VERSION` and `_REQUIRED=1` too). npmjs is unreachable here: the entry of 2026-11-26 01:34Z says how to seed the harness's registry cache.
 - Root-sandbox failures that pass in CI: the chmod tests in `tests/repair` (2) and `in_process_redirect` (3), core `copy_tree` with a symlinked root, `vlt_heal` with an unremovable lock, and the `pypi_poetry`/`pypi_requirements` wire-failure tests.
+- To find unordered output, run one command six times over one fixture and count the distinct stdout hashes (#1836). The entry of 2026-11-26 10:55Z describes a 40-line patch server for `get` and `show`.
 - To make a stat fail as root, use a symlink to itself (`ELOOP`); chmod doesn't stop root.
 - To test the prune GC over a real revert without a toolchain, hand-build a ledger entry as `apply_gc_reports_drift_kept_vendored_entry` in `scan/gc.rs` does. A vendored Go module needs no Go: the entry of 2026-11-26 06:55Z lists the files.
