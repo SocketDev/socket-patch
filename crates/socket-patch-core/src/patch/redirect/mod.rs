@@ -208,8 +208,9 @@ pub struct RegistryOverrideIdentifiers {
     /// (`patch_uuid`), else as upstream's own gem, which the registry
     /// lists and hands on unchanged. So a lock's entries can all take the
     /// registry as their one source, each pinned to the sha256 listed for
-    /// it. A platform whose patched build is still being made is left out
-    /// until it is there. `None` when the reference carries no list (the
+    /// it. A platform can be missing from the list (the patch service
+    /// leaves one out while its patched build is being made): a lock that
+    /// names it is left as it is. `None` when the reference carries no list (the
     /// service does not know the version's platforms, or the gem has no
     /// platform gem): the patch is then of the ruby gem alone, and a lock
     /// that names platform builds is left as it is.
@@ -507,10 +508,12 @@ pub struct RewriteResult {
     pub gem_unpatched: BTreeMap<String, Vec<String>>,
     /// gem: the gems the lock names as platform builds that were left as
     /// they are because the patch registry does not list a platform the
-    /// lock names, by the gem patch's uuid, with those platforms. The
-    /// patch service leaves a platform out while its patched build is
-    /// being made, so this passes by itself: a later run moves the gem.
-    /// Serialized only when non-empty.
+    /// lock names, by the gem patch's uuid, with those platforms. Not a
+    /// defect, and nothing says the list will ever name them (the patch
+    /// service leaves a platform out while its patched build is being
+    /// made, and has none to list for a platform gem it does not know): a
+    /// run over a list that names them moves the gem. Serialized only
+    /// when non-empty.
     #[cfg_attr(
         test,
         serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")
@@ -9190,10 +9193,8 @@ fn rewrite_gem(
         // unchanged) where there is none yet. So every locked build moves
         // to it together, each pinned to the sha256 the registry serves
         // for it, as soon as one of them is patched. A platform the
-        // registry does not list (its patched build is still being made)
-        // would send that platform's machines to a registry with no gem
-        // for them: the gem is left as it is until a later reference
-        // lists it.
+        // registry does not list would send that platform's machines to a
+        // registry with no gem for them: the gem is left as it is.
         if let Some(parsed) = &handed_in {
             let builds = parsed.locked_builds(&dep.name, &dep.version);
             if !builds.platforms.is_empty() {
@@ -9235,10 +9236,10 @@ fn rewrite_gem(
                     });
                     continue;
                 }
-                // A locked platform the list leaves out: its patched build
-                // is still being made, and the patch service names it only
-                // once it is there. Nothing to warn about; a later run
-                // moves the gem.
+                // A locked platform the list leaves out: the patch service
+                // leaves one out while its patched build is being made, and
+                // may never have one to name. Nothing to warn about; a run
+                // over a list that names it moves the gem.
                 if !unlisted.is_empty() {
                     result.gem_unlisted.insert(dep.patch_uuid.clone(), unlisted);
                     continue;
@@ -23465,11 +23466,10 @@ mod tests {
         assert!(r.gem_builds.is_empty() && r.gem_unpatched.is_empty() && r.gem_unlisted.is_empty());
     }
 
-    /// A locked platform the list leaves out (its patched build is still
-    /// being made) keeps the whole gem where it is: a machine of that
-    /// platform would be sent to a registry that has no gem for it. Not a
-    /// warning: the result names the platform that is waited for, and a
-    /// run over a list that has it moves the gem.
+    /// A locked platform the list leaves out keeps the whole gem where it
+    /// is: a machine of that platform would be sent to a registry that has
+    /// no gem for it. Not a warning: the result names the platform the
+    /// list lacks, and a run over a list that has it moves the gem.
     #[test]
     fn gem_platform_missing_from_the_list_leaves_the_gem_for_a_later_run() {
         let lock = nokogiri_lock(&["arm64-darwin", "x86_64-linux-gnu"], false, true);

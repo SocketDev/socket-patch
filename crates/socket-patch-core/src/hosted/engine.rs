@@ -174,22 +174,24 @@ pub fn gem_upstream_build_kept_detail(platform: &str) -> String {
 
 /// Skip reason of a gem the Bundler lock names as precompiled platform
 /// builds, left as it is because the patch registry does not list a
-/// platform the lock names: the patch service leaves a platform out while
-/// its patched build is being made. Not a warning. The gem moves on a
-/// later run, once the list has that platform.
-pub const GEM_BUILD_PENDING: &str = "redirect_gem_build_pending";
+/// platform the lock names: a machine of that platform would be sent to a
+/// registry with no gem for it. Not a warning. Nothing says that the list
+/// will come to name the platform (the patch service leaves one out while
+/// its patched build is being made, and may never have one): the gem
+/// moves on a run whose list names every platform the lock does.
+pub const GEM_PLATFORM_UNLISTED: &str = "redirect_gem_platform_unlisted";
 
 /// Whether `reason` is one of the two quiet skips of a gem locked as
-/// platform builds ([`GEM_NO_PATCHED_BUILD`], [`GEM_BUILD_PENDING`]): the
-/// only cases where a gem with a fix is not moved, both of which pass by
-/// themselves and are said in one plain line, never as a failure.
+/// platform builds ([`GEM_NO_PATCHED_BUILD`], [`GEM_PLATFORM_UNLISTED`]):
+/// the only cases where a gem with a fix is not moved, neither of which
+/// is a failure, and each said in one plain line.
 pub fn is_quiet_gem_skip(reason: &str) -> bool {
-    reason == GEM_NO_PATCHED_BUILD || reason == GEM_BUILD_PENDING
+    reason == GEM_NO_PATCHED_BUILD || reason == GEM_PLATFORM_UNLISTED
 }
 
-/// The skips of the gems a rewrite left where they are for now: no locked
-/// build of them is patched yet ([`RewriteResult::gem_unpatched`]), or
-/// the registry does not list a locked platform yet
+/// The skips of the gems a rewrite left where they are: no locked build
+/// of them is patched yet ([`RewriteResult::gem_unpatched`]), or the
+/// registry does not list a locked platform
 /// ([`RewriteResult::gem_unlisted`]). One per candidate, in candidate
 /// order: a host adds them to its skips, so the gem is reported under its
 /// own quiet code and not as a patch nothing pins.
@@ -200,11 +202,11 @@ pub fn gem_unpatched_skips(candidates: &[Candidate], rewrite: &RewriteResult) ->
             let (name, version, uuid) = (&c.dep.name, &c.dep.version, &c.dep.patch_uuid);
             let (reason, detail) = if let Some(platforms) = rewrite.gem_unlisted.get(uuid) {
                 let detail = format!(
-                    "{name} {version}: the patch registry does not list {} yet (a patched build \
-                     is still being made); left as it is until it does",
+                    "{name} {version}: the patch registry does not list {}, so the gem is left \
+                     as it is",
                     platforms.join(", ")
                 );
-                (GEM_BUILD_PENDING, detail)
+                (GEM_PLATFORM_UNLISTED, detail)
             } else {
                 let platforms = rewrite.gem_unpatched.get(uuid)?;
                 let detail = format!(
@@ -13230,8 +13232,8 @@ snapshots:
                 .is_empty()
         );
 
-        // A locked platform the list leaves out (its build is being made):
-        // the gem waits, under the other quiet code.
+        // A locked platform the list leaves out: the gem is left as it is,
+        // under another quiet code, which says only that.
         let mut pending = candidate.clone();
         let ids = &mut pending.dep.registry_override.as_mut().unwrap().identifiers;
         ids.gem_builds.as_mut().unwrap().pop();
@@ -13245,13 +13247,31 @@ snapshots:
         let [skip] = gem_unpatched_skips(std::slice::from_ref(&pending), &waits.rewrite)
             .try_into()
             .expect("one skip");
-        assert_eq!(skip.reason, GEM_BUILD_PENDING);
+        assert_eq!(skip.reason, GEM_PLATFORM_UNLISTED);
+        assert_eq!(skip.reason, "redirect_gem_platform_unlisted");
         assert!(is_quiet_gem_skip(&skip.reason) && !is_quiet_gem_skip("redirect_unconfirmed"));
         assert_eq!(
             skip.detail.as_deref(),
             Some(
-                "rails 7.0.0: the patch registry does not list x86_64-linux-gnu yet (a patched \
-                 build is still being made); left as it is until it does"
+                "rails 7.0.0: the patch registry does not list x86_64-linux-gnu, so the gem is \
+                 left as it is"
+            )
+        );
+        // An empty list names no locked platform at all.
+        let mut empty = candidate.clone();
+        let ids = &mut empty.dep.registry_override.as_mut().unwrap().identifiers;
+        ids.gem_builds = Some(Vec::new());
+        let (_, none_listed) =
+            gem_rewrite_of(&ProjectView::Memory(&fresh), vec![empty.clone()]).await;
+        assert!(none_listed.rewrite.files.is_empty() && none_listed.confirmed.is_empty());
+        let [skip] = gem_unpatched_skips(std::slice::from_ref(&empty), &none_listed.rewrite)
+            .try_into()
+            .expect("one skip");
+        assert_eq!(
+            skip.detail.as_deref(),
+            Some(
+                "rails 7.0.0: the patch registry does not list arm64-darwin, x86_64-linux-gnu, \
+                 so the gem is left as it is"
             )
         );
     }
