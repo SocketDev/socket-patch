@@ -2869,7 +2869,10 @@ fn platform_purl(platform: &str) -> String {
 /// each of `upstream` with none (the registry hands on upstream's own gem
 /// for it); a platform in neither is one whose patched build is still being
 /// made. Each of those patches serves that platform's gem (`tarball`)
-/// and stub gemspec, and one request answers for every uuid it names. The
+/// and stub gemspec, and one request answers for every uuid it names. A
+/// platform of `building` is listed with the patch of its patched build
+/// too, and the reference of that patch answers `pending_build`: the
+/// build is named before it is served. The
 /// URLs name the production host, so the run reaches them only through
 /// `--patch-server-url`.
 async fn platform_patch_service(
@@ -2878,7 +2881,16 @@ async fn platform_patch_service(
     uuid: &str,
     patched: &[String],
     upstream: &[String],
+    building: &[String],
 ) -> MockServer {
+    // Hand the test's task back to the runtime once, which renews its tokio
+    // cooperative budget. A `MockServer` verifies its mocks when it is
+    // dropped, on a blocking executor of its own, and a task that has used
+    // up its budget never gets through that. Every mount, every read of
+    // the received requests and every server start spends some of it, and
+    // a test that only runs child processes in between never yields by
+    // itself.
+    tokio::task::yield_now().await;
     let server = MockServer::start().await;
     let leaf = format!("{PLAT}-{PLAT_VERSION}");
     let file_of = |platform: Option<&str>| match platform {
@@ -2936,6 +2948,16 @@ async fn platform_patch_service(
         builds.push(serde_json::json!({
             "platform": platform, "gemChecksumSha256": sha256_hex(&gem), "patchUuid": null,
         }));
+    }
+    for platform in building {
+        let own = build_uuid(uuid, platform);
+        let gem = read("service", format!("{}.gem", file_of(Some(platform))));
+        builds.push(serde_json::json!({
+            "platform": platform, "gemChecksumSha256": sha256_hex(&gem), "patchUuid": own,
+        }));
+        let unserved =
+            serde_json::json!({ "status": "pending_build", "url": null, "artifacts": [] });
+        references.insert(own, unserved);
     }
     builds.sort_by_key(|build| build["platform"].as_str().map(str::to_string));
     let key = &sha256_hex(
@@ -3105,11 +3127,14 @@ fn per_platform_gem(
 ///      publishes it as platform gems only, and locks this machine's
 ///      platform and two foreign ones;
 ///   2. while one locked platform has no patched build (the service lists
-///      upstream's own gem for it, or does not list it yet) the gem is not
-///      vendored: the run exits 0, says so in ONE line that names the
-///      platform, asks for the gem patch's reference alone, downloads no
-///      gem and writes nothing;
-///   3. with a patched build of every platform, `vendor` asks for the gem
+///      upstream's own gem for it, does not list it yet, or names a patch
+///      for it that is still being built) the gem is not vendored: the run
+///      exits 0, says so in ONE line that names the platform, asks for the
+///      gem patch's reference (and, where every platform is named a patch,
+///      for the platform patches' in one request more), downloads no gem
+///      and writes nothing, and a dry run says the same;
+///   3. with a patched build of every platform, a dry run names each
+///      platform gem and writes nothing, and `vendor` asks for the gem
 ///      patch's reference and then for the platform patches in ONE
 ///      request, unpacks one tree per platform from that platform's own
 ///      gem (each with its stub gemspec), moves every platform block into
@@ -3182,6 +3207,7 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
         .collect();
     let (own, foreign) = platforms.split_first().expect("platforms");
     assert_eq!(foreign.len(), 2, "two foreign platforms: {platforms:?}");
+    let none: &[String] = &[];
 
     let proj = base.join("proj");
     std::fs::create_dir_all(&proj).unwrap();
@@ -3269,6 +3295,12 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
         run_socket(root, &args)
     };
     let vendor = |server: &MockServer| vendor_in(&proj, server, true);
+    let vendor_dry_run = |server: &MockServer| {
+        let uri = server.uri();
+        let root = proj.to_str().unwrap();
+        let flags = ["vendor", "--json", "--dry-run", "--cwd", root];
+        run_socket(&proj, &[&flags[..], &["--patch-server-url", &uri]].concat())
+    };
     // The project as it is before anything is vendored, for a person's run.
     let unvendored = base.join("unvendored");
     common::fs_tree::copy_tree(&proj, &unvendored);
@@ -3276,8 +3308,13 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
     // 2. One locked platform has no patched build yet: the gem is not
     //    vendored, in one line, the run does not fail, no gem is
     //    downloaded and nothing is written. The same whether the service
-    //    lists upstream's own gem for that platform or, while its build is
-    //    being made, does not list it at all.
+    //    lists upstream's own gem for that platform, does not list it at
+    //    all while its build is being made, or names a patch for it whose
+    //    own reference says it is still being built (which a run learns
+    //    from its second request, for the platform patches). A dry run
+    //    says what the wet run says.
+    let mut own_patches: Vec<String> = platforms.iter().map(|p| build_uuid(UUID, p)).collect();
+    own_patches.sort();
     let (with_build, without_build) = platforms.split_at(2);
     let mut have = with_build.to_vec();
     have.sort();
@@ -3287,8 +3324,28 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
          others now.",
         without_build[0], have[0], have[1]
     );
-    for listed in [without_build, &[]] {
-        let partial = platform_patch_service(&fixture, &purl, UUID, with_build, listed).await;
+    for (listed, building) in [(without_build, none), (none, none), (none, without_build)] {
+        let partial =
+            platform_patch_service(&fixture, &purl, UUID, with_build, listed, building).await;
+        let mut asked = vec![vec![UUID.to_string()]];
+        if !building.is_empty() {
+            asked.push(own_patches.clone());
+        }
+        let (code, stdout, stderr) = vendor_dry_run(&partial);
+        assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+        let dry = parse_json_envelope(&stdout);
+        let previewed: Vec<&serde_json::Value> = dry["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["action"] != "skipped" || e["reason"] != not_vendored.as_str())
+            .collect();
+        assert_eq!(
+            (dry["summary"]["skipped"].as_u64(), previewed.len()),
+            (Some(1), 0),
+            "a dry run says what the wet run says: {dry}"
+        );
+        assert_eq!(reference_requests(&partial).await, asked);
         let (code, stdout, stderr) = vendor(&partial);
         assert_eq!(
             code, 0,
@@ -3314,8 +3371,9 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
         );
         assert_eq!(
             reference_requests(&partial).await,
-            [[UUID]],
-            "the reference of the gem's own patch, and nothing else"
+            [asked.clone(), asked].concat(),
+            "the reference of the gem's own patch and, where it names a patch for every \
+             platform, those of the platform patches: nothing else"
         );
         assert_eq!(std::fs::read(&gemfile_path).unwrap(), gemfile_before);
         assert_eq!(std::fs::read(&lock_path).unwrap(), lock_before);
@@ -3340,8 +3398,23 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
         assert!(!unvendored.join(".socket/vendor").exists());
     }
 
-    // 3. A patched build of every platform: vendor.
-    let server = platform_patch_service(&fixture, &purl, UUID, &platforms, &[]).await;
+    // 3. A patched build of every platform: a dry run names the platform
+    //    gems the wet run vendors and writes nothing; then vendor.
+    let preview = platform_patch_service(&fixture, &purl, UUID, &platforms, none, none).await;
+    let (code, stdout, stderr) = vendor_dry_run(&preview);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let dry = parse_json_envelope(&stdout);
+    assert_eq!(
+        platform_gem_events(&dry, "verified"),
+        per_platform_gem(&sorted, ""),
+        "a dry run reports one `verified` event per platform gem: {dry}"
+    );
+    assert_eq!(dry["summary"]["verified"], 3, "each is counted: {dry}");
+    assert_eq!(std::fs::read(&gemfile_path).unwrap(), gemfile_before);
+    assert_eq!(std::fs::read(&lock_path).unwrap(), lock_before);
+    assert!(!proj.join(".socket/vendor").exists(), "nothing is written");
+
+    let server = platform_patch_service(&fixture, &purl, UUID, &platforms, none, none).await;
     let (code, stdout, stderr) = vendor(&server);
     assert_eq!(
         code, 0,
@@ -3357,8 +3430,6 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
     );
     assert_eq!(env["summary"]["applied"], 3, "each is counted: {env}");
     // The gem patch's reference, then ONE request for the platform patches.
-    let mut own_patches: Vec<String> = platforms.iter().map(|p| build_uuid(UUID, p)).collect();
-    own_patches.sort();
     assert_eq!(
         reference_requests(&server).await,
         [vec![UUID.to_string()], own_patches.clone()],
@@ -3704,7 +3775,7 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
     let manifest = std::fs::read_to_string(&manifest_path).unwrap();
     std::fs::write(&manifest_path, manifest.replace(UUID, UUID_NEXT)).unwrap();
     let update =
-        platform_patch_service(&fixture, &purl, UUID_NEXT, with_build, without_build).await;
+        platform_patch_service(&fixture, &purl, UUID_NEXT, with_build, without_build, none).await;
     let (code, stdout, stderr) = vendor(&update);
     assert_eq!(
         code, 0,
