@@ -1,56 +1,47 @@
 [agent] Progress ledger for the scheduled Hatch bug-hunt routine (label pm:hatch).
 
-Last run: 2026-10-03 09:49Z on main `045d7ec`. The latest tag v4.0.0 predates Hatch support (#244). Linux runs use real Hatch against a local mock patch API (six 1.16.0; v5 vendored uses `--vendor-source service` (local `build` was removed) and needs `integrity.sha512` in the mock, the grant artifact `kind` must be `tarball`, and `SOCKET_PATCH_SERVER_URL` must point at the mock so hosted wiring is recognised; hosted rollback needs `SOCKET_PYPI_JSON_API` pointed at a pypi.org JSON forwarder, because pypi.org is in the sandbox `NO_PROXY`). macOS and Windows use probe branches.
+Last run: 2026-11-26 on main `cfc870f`, release v5.1.0, newest Hatch 1.18.2 (bundled uv 0.13.10). Linux only (the probe workflows are off). Harness: real Hatch against a local mock patch API (`six` 1.16.0 with a `SOCKET_PATCHED = 1` marker). The mock serves batch / by-package / package grant (`kind: tarball`, sha256 + `sha512-` SRI) / view (`blobContent` base64) / `patches/blob/<git-sha256>`, plus GET **and HEAD** on the wheel route. Set `SOCKET_PATCH_SERVER_URL` to the mock and use `--vendor-source service` for vendored. Put only the `hatch` binary on PATH (not its venv `bin/`), and create the env before scanning.
+
+All `bughunt` issues filed through 2026-10-03 (#335 #385 #415 #454 #479 #505 #547 #650 #673 #674) are closed as fixed. Open: #2295.
 
 ## Coverage matrix
-| Hatch | hosted, existing env, pip (Linux / macOS / Windows) | hosted, existing env, uv | vendored, existing env | hosted shapes + rollback (Linux) | vendored shapes + rollback (Linux) | rollback after an unrelated edit (hosted / vendored) | mode takeover (H→V / V→H) | agent | agent re-scan after env recreate | global `-g`, pipx-installed (L / M / W) | global `-g`, uv-tool-installed (L / M / W) | global-prefix apply / vex / rollback (L / M / W) | locked env + pylock, hosted / vendored (L / M / W) |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1.0.0 / 1.1.1 | existing untested; fresh env pass (Linux) | n/a | refused env deps (>=1.2 preflight); project deps pass | pass + rollback (Linux) | untested | untested | untested | untested | untested | untested | untested | untested | n/a (no `hatch lock`) |
-| 1.2.1 | existing untested; fresh env pass (Linux) | n/a | pass (Linux); fail #547 on `%2F` path | pass + rollback (Linux) | untested | untested | untested | untested | untested | untested | untested | untested | n/a (no `hatch lock`) |
-| 1.7.0 | fail #335 (all 3 OS) | n/a | pass (marker, dup, env-only deps; Linux) | pass (marker, dup, env-only deps; Linux) | pass (unicode/space path) | pass / fail #385 (env-only deps pass) | untested | untested | fail #454 | fail #415 (all 3) | untested | pass (all 3) | n/a (no `hatch lock`) |
-| 1.9.7 | fail #335 (all 3 OS) | fresh env pass (Linux) | fresh env pass (Linux) | untested | untested | untested | untested | untested | untested | untested | pass / pass / fail #449 | untested | n/a (no `hatch lock`) |
-| 1.10.0 / 1.13.0 / 1.15.1 | untested | existing env fail (#335 comment, Linux) | untested | untested | untested | untested | untested | untested | untested | untested | untested | untested | n/a (no `hatch lock`) |
-| 1.12.0 | untested | existing env fail (#335 comment); fresh pass (Linux) | fresh env pass, pip (Linux); uv env refused (documented) | fresh env + rollback pass (Linux) | untested | untested | untested | untested | untested | untested | untested | untested | n/a (no `hatch lock`) |
-| 1.14.1 | existing untested; fresh env pass with virtualenv<20.31 (Linux) | fresh env pass; existing env fail (#335 comment) | fresh env pass (Linux) | untested | untested | untested | untested | untested | untested | untested | untested | untested | n/a (no `hatch lock`) |
-| 1.16.5 | fail #335 (all 3 OS) | pass (existing env re-checked on `1169ae6`) | untested | untested | untested | untested | untested | fail (see #335) | untested | fail #415 (all 3); uv-tool pass (Linux) | pass / pass / fail #449 | pass (all 3) | n/a (no `hatch lock`) |
-| 1.17.0 | untested | untested | untested | untested | untested | untested | untested | untested | untested | untested | untested | untested | fail #479 (all 3, both modes); hosted rollback / remove / H→V pass with a PyPI sibling on `1169ae6` (#407 fixed; a single-package lock is refused, documented) |
-| 1.18.1 | fail #335 (Linux re-checked on v5) | pass | fail (#335 comment) | pass (13 shapes pre-v5; v5: template, dotted keys, matrix, features, detached, hatch.toml envs pass) | pass (12 shapes; group refused, pre-v5) | pass on v5 (bump + added dep, `61cfb9b`) / pass on `045d7ec` (#385 fixed) | v5: pass / pass on `045d7ec` (#328 fixed); H→V with 2 patches: rollback fail #674 (also 1.16.5) | fail (see #335) | fail #454 | fail #415 (all 3) | pass / pass / fail #449; `UV_TOOL_DIR` fail #449 (Linux) | pass (all 3); read-only root-owned prefix: exits 1 (#424 JSON), re-run exits 0 (#454) | fail #479 (all 3, both modes; also non-default `pylock.<env>.toml`); hosted rollback / remove / H→V pass with a PyPI sibling on `1169ae6` (#407 fixed; a single-package lock is refused, documented), vendored pass; custom `lock-filename` hosted pass |
+Cells dated before 2026-11-11 count as untested for the release (INSTRUCTIONS "Release focus").
 
-Also on v5: `scan -g` is report-only and never touches pyproject or the Hatch env dirs; `-g` / `--global-prefix` / `SOCKET_GLOBAL=1` with `--mode hosted` exit 2 and write nothing. Fresh-environment installs of hosted and vendored rewrites pass on 1.18.1 (and on 1.7.0 for vendored). Locked env with no committed pylock (pyproject lane) passes on 1.18.1. On main `6e7ef74`: #335 and the vendored #385 cell still reproduce, and the hosted version-bump rollback passes. Workspaces (1.16.5 / 1.18.1, v5): a member-only dependency is refused from the root with a warning. Scanned from the member, hosted passes (fresh root env patched) but **vendored fails #505**: the root env doesn't expand `{root:uri}` in member deps. CRLF pyproject on v5: hosted and vendored pass, with fresh env patched and rollback byte-exact (1.18.1). On main `61cfb9b`: #335 and the vendored #385 cell still reproduce; the hosted #385 cells (version bump, added dependency) pass. #454 and #415 are fixed and closed. 2026-10-02 (1.18.1, both modes): markers, uppercase/spaced names, extras, the same pin in project + env `extra-dependencies`, env-only `dependencies` with `skip-install` all pass (fresh env patched); re-scans are byte-idempotent; vendored rollback is byte-exact; symlinked pyproject/hatch.toml are refused untouched. #505 also hits member `features` and workspaces declared in hatch.toml (hosted passes). 2026-10-02 09:59Z (two-package mock): multi-patch selective rollback / remove by purl and uuid, `--preserve-state` + reuse, `repair` (missing / tampered wheel), concurrent scans, `lock-envs = true` + matrix sharing one `lock-filename` (no committed lock), PEP 735 `include-group` nesting (hosted), hatch.toml vs pyproject env precedence, `{env:…}` marker contexts all pass. **Vendored fails #547** when the checkout path contains `%XX` / `#` / `;` (Hatch 1.2.1–1.18.1). 2026-10-02 15:52Z on `1169ae6` (Linux): #479 and #335 still reproduce. Hatch 1.10–1.15.1 uv-installer existing envs are also unpatched (added to #335), and 1.16.5+ resync. Passing cells: `lock-envs` with two committed env locks (hosted rewrite + byte-exact rollback), `hatch-test` matrix `extra-dependencies` (both modes), agent scan inside `hatch run`, and self-referencing extras via `features` (both modes). 2026-10-02 21:55Z on `045d7ec` (Linux): TOML literal / multi-line / commented-array spellings and inline-table env declarations pass in both modes (1.7.0, 1.16.5, 1.18.1). `six==1.16` is now accepted. `--dry-run` writes nothing. Re-scan after a manual revert re-wires. A committed vendored clone at another path is patched. The V→H takeover passes (#328 fixed). #547 still reproduces. 2026-10-03 03:50Z on `045d7ec` (Linux): vendored #385 verified fixed (bump + added dep). In-tree env `path = ".venv"` gets the hosted stale-install warning, vex omits the patch, and agent mode patches it. `installer = "uv"` + `[tool.uv.sources]` index source: hosted pass. **A superseding patch uuid is never re-pinned (#650)**: hosted exits 0 on the old uuid, vendored exits 1 (1.16.5, 1.18.1); rollback + re-scan works around it. 2026-10-03 09:49Z on `045d7ec` (Linux, 1.16.5 / 1.18.1): **hosted with `installer = "uv"` ignores `[tool.uv.sources]` (#673)**: url / path sources install unpatched and git sources break installs, for project deps and `features`. Env `dependencies`, explicit index sources and the pip installer pass. **H→V takeover with two patches leaves `allow-direct-references = true` after rollback / remove (#674)**. H→V with 1 patch and V→H with 1 or 2 patches are byte-exact. #650 also hits hatch.toml env deps.
+| Workflow | hosted | vendored | agent |
+| --- | --- | --- | --- |
+| Common path, project dep, pip installer (scan, existing env, fresh env, vex, build, rollback, reinstall) | pass 1.7.0 / 1.16.5 / 1.18.2 (2026-11-26) | pass 1.7.0 / 1.16.5 / 1.18.2 (2026-11-26) | pass 1.18.2: scan, `apply --check`, vex, apply after env recreate, rollback, remove (2026-11-26) |
+| Common path, uv installer | pass 1.16.5 / 1.18.2, existing env resynced (2026-11-26) | refused (documented) | untested |
+| Locked env / `lock-envs`, committed pylock | scan + fresh env pass 1.18.2; **rollback / remove fail #2295** on 1.18.1 / 1.18.2 (`--no-header` lock); pass 1.17.0 (2026-11-26) | refused (uv installer, documented) | untested |
+| Superseding patch uuid (#650) | pass 1.18.2, rollback byte-exact (2026-11-26) | pass 1.18.2, old artifact removed (2026-11-26) | untested |
+| Mode takeover H→V / V→H, 1 patch | pass 1.18.2 (2026-11-26) | pass 1.18.2 (2026-11-26) | n/a |
+| Takeover with 2 patches (#674) | untested since fix | untested since fix | n/a |
+| `installer = "uv"` + `[tool.uv.sources]` (#673) | url / path refused, nothing written; index source pass (1.18.2, 2026-11-26) | refused | untested |
+| Shapes: markers, extras, features, env deps, hatch.toml envs, matrix, templates, CRLF, TOML spellings | pass 1.7.0 / 1.16.5 / 1.18.1 (pre-release, 2026-10) | pass (pre-release, 2026-10) | untested |
+| Workspaces (member deps, #505) | pass (pre-release) | untested since fix | untested |
+| Checkout path with `%XX` / `#` / `;` (#547) | n/a | untested since fix | n/a |
+| Rollback after an unrelated edit (#385) | pass (pre-release) | pass (pre-release) | n/a |
+| Global `-g`: pipx / uv-tool Hatch (#415, #449) | n/a | n/a | pass Linux (pre-release) |
+| Agent re-scan after env recreate (#454) | n/a | n/a | untested since fix |
 
 ## Backlog
-1. #673 variants: `tool.uv.sources` with `workspace = true` / `editable`, `no-sources`, the `hatch-test` internal env, hatch.toml-only projects.
-2. #674 variants: H→V with a project-dep + env-dep pair, and with a user-preset `allow-direct-references = false`.
-3. Probe #547, #505, #650, #673, #674 and the #335 uv boundary on macOS / Windows once probe branches can be deleted again. Branch deletion is blocked by session policy on 2026-10-03, so the 4 stale `bughunt/hatch/*` branches need a maintainer to remove them.
-4. Superseding uuid (#650) on a Hatch 1.17+ project with a committed pylock.
-5. Global-mode remainder: `UV_TOOL_DIR` on macOS / Windows (re-check the #449 Windows uv-tool cell); read-only root-owned prefix on macOS; Windows Program Files prefix.
-6. Re-triage #335, #479, #505, #547, #650, #673 and #674 when Hatch code moves.
+1. #2295 follow-ups: H→V takeover from a hosted Hatch 1.18 locked env; `lock-filename` custom names; Hatch 1.18.0.
+2. Re-run the 2-patch takeover (#674) and workspace vendored (#505) cells on main for the release.
+3. Vendored from a checkout path with `%20` / `#` (#547 fix: it should be refused before writing).
+4. Agent mode with the uv installer and with locked envs; `scan --sync` after `hatch env prune` (#454).
+5. Shapes re-run on 1.18.2: hatch.toml-only envs, `hatch-test` matrix, features, PEP 735 groups, CRLF.
+6. `vex --grype-config` (new on main, #2252) on a hosted / vendored Hatch project.
+7. Hatch 1.0 / 1.2 boundary (vendored preflight `pypi_hatch_unsupported`) on main.
+8. Re-triage #2295 when the uv restore code moves.
 
 ## Known non-bugs
-- Locked Hatch envs with `installer = "pip"`: Hatch's pip locker can't apply lockfiles (`LockerUnsupportedError`), so it's a Hatch limitation.
-- Probing Hatch through `uv tool run` with uv 0.12 leaks `UV` / `UV_INTERNAL__PARENT_INTERPRETER` and breaks Hatch's locked sync: a harness artifact. Use installed Hatch binaries.
-- Vendored PEP 735 dependency groups are refused (Hatch does not expand `{root:uri}` there): documented.
-- Vendored with `installer = "uv"` / `uv-path` is refused: documented. Note that uv 0.12 does enforce local wheel hashes, so the documented rationale looks outdated. Hatch's internal uv envs (`hatch-test` etc.) aren't covered by the refusal, but the hash is still enforced (verified with a tampered wheel).
-- Vendored needs `hatch` >= 1.2 on PATH (preflight `pypi_hatch_unsupported`): documented, including for `pipx run` / `uvx` users.
-- Ranges, transitive-only (including workspace-member-only deps when scanned from the root), dynamic deps, sources, overrides and custom env types are refused: documented.
-- Hosted project rewrites embed a direct URL in the built wheel's `Requires-Dist` (so the result can't be uploaded to PyPI): inherent to the design.
-- `rollback` with nothing ever written exits 2 `Manifest not found`. `remove` after a full rollback gives `manifest_not_found`.
-- Vendored scan against the mock fails `vendor_prebuilt_required` unless the grant's artifact carries `integrity.sha512` (v5): a harness requirement, not a bug.
-- In mock runs every purl "has" a six patch (the batch endpoint answers six for any input). Use `scannedPackages` and the apply results, not `packages[]`, to judge discovery.
-- `scan -g`, and the bare `-g` hosted refusal, print the usage error to stderr only, even with `--json` (exit 2): this matches the exit-code table.
-- Hosted `rollback` only recognises wiring on `patch.socket.dev` or the `--patch-server-url` origin. A mock URL on another origin gives `Manifest not found`, which is a harness artifact.
-- A "read-only" prefix the current user owns (chmod 0444 / 0555) still gets patched, because the owner can write. Only a prefix the user can't write to is a real refusal case.
-- Env `overrides`, `[tool.hatch.env]` (requires / collectors), custom env `type`, and a non-table `envs` in hatch.toml are refused with nothing written: documented.
-- `six==1.16` used to be refused as not exact. It's accepted since `045d7ec` (#475). `six (==1.16)`, `===1.16.0`, `+local` and `rc` pins are still refused, failing closed.
-- A pyproject.toml with a UTF-8 BOM isn't loadable by Hatch (`TOMLDecodeError` at 1:1). Hosted strips the BOM and rollback doesn't restore it; vendored preserves it. Not filed, because the input is invalid for Hatch.
-- vex from the project root in the sandbox can omit six as `not_applied` because of the system `/usr/lib/python3/dist-packages/six.py`: a sandbox artifact.
-- Exact pins in non-canonical spellings (`===`, `(==1.16.0)`) are refused (`1.16.0.0` and `v1.16.0` are accepted since `045d7ec`) with "requires an exact ==X declaration": an over-refusal that fails closed, the same class as `six==1.16`.
-- Hosted rollback rebuilds the requirement from the URL (no v5 ledger), so the original spelling isn't byte-exact (`SIX == 1.16.0` → `SIX==1.16.0`, `;` → ` ; `). It's semantically equal. Vendored rollback is exact.
-- Hosted rollback removes a user-preset `allow-direct-references` (true or false, in pyproject or hatch.toml, and empties the table, which can leave a 0-byte hatch.toml) when no other direct reference remains. It can't tell ownership without a ledger, and it has no functional effect, so it's logged as low severity (`patch/redirect/upstream/pypi.rs:785`).
-- Env deps whose version comes from a context field (`six=={env:SIXV:1.16.0}`, `six{env:SPEC:==1.16.0}`) are refused as not exact (hosted warns in `redirect.warnings`, vendored fails): a fail-closed over-refusal, the same class as `six==1.16`.
-- `rollback` / `remove` match PURL names case-sensitively (`pkg:pypi/TOML@0.10.2` gives "No patch found"). It fails closed and isn't Hatch-specific, so it's logged, not filed.
-- When hatch.toml defines `envs`, Hatch ignores pyproject's `tool.hatch.envs` entirely, and socket-patch leaves those declarations alone (they're seen as transitive). That's consistent.
-- Vendored `partial_failure` for an undeclared `toml` / `six` in the sandbox comes from the system `/usr/lib/python3/dist-packages`: a sandbox artifact.
-- Hosted rollback of a Hatch pylock with no sibling registry package is refused ("no sibling registry package shows the registry…"): it fails closed and is documented in CLI_CONTRACT.md.
-- A vendored project's built wheel carries an absolute `file://` `Requires-Dist`, because Hatchling expands `{root:uri}` at build time. That's inherent, like the hosted direct-URL case.
-- Vendored on a project with any `[tool.uv.sources]` (and no uv.lock) is refused with the uv lane's `pypi_uv_no_lockfile`: it fails closed, and the message is only confusing.
+Full list: `known-non-bugs/hatch.md` (search it with `git grep`). Most likely to be re-filed:
+- Ranges, transitive-only, dynamic deps, sources, overrides, custom env types and vendored PEP 735 groups are refused: documented.
+- Vendored with `installer = "uv"` / `uv-path` is refused, and so are locked envs (uv installer): documented.
+- Hosted `vex` with no Hatch env yet attests from the wiring (like a lockfile-only checkout): by design.
+- A no-env scan reads the venv `python3` on PATH as the project's env (#2170): put only the `hatch` binary on PATH in the harness.
+- The mock needs HEAD on the wheel route (uv) and `/patches/blob/` (agent rollback): harness requirements.
+- Hosted rollback rebuilds the requirement from the URL, so spelling isn't byte-exact (`SIX == 1.16.0` → `SIX==1.16.0`): semantically equal.
+- Hosted rollback drops a user-preset `allow-direct-references` when no direct reference remains: low severity, logged.
+- Hosted project rewrites embed a direct URL in the built wheel's `Requires-Dist`: inherent.
+- A pyproject.toml with a UTF-8 BOM isn't loadable by Hatch: invalid input.
+- In the sandbox, the system `/usr/lib/python3/dist-packages/six.py` makes vex / vendored see an extra six: a sandbox artifact.
