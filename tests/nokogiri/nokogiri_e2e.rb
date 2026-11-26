@@ -58,6 +58,7 @@
 require "digest"
 require "fileutils"
 require "json"
+require "net/http"
 require "open3"
 require "optparse"
 require "rbconfig"
@@ -668,9 +669,15 @@ class NokogiriE2E
       rewritten = hosted_scan(service, platforms, lock, [])
       installs_frozen(service, "hosted", rewritten, patched.include?(own_platform))
     end
-    # The builds that were missing are there: a newer registry snapshot.
+    # The builds that were missing are there: a newer registry snapshot,
+    # beside the earlier one, which lists what it listed.
     earlier = service.index_url
+    listed = Net::HTTP.get(URI(earlier + "info/nokogiri"))
     waiting.each { |platform| service.publish(platform) }
+    unless waiting.empty?
+      check(service.index_url != earlier && Net::HTTP.get(URI(earlier + "info/nokogiri")) == listed,
+            "the registry has a newer snapshot, and the earlier one answers as it did", service.index_url)
+    end
     rewritten = hosted_scan(service, platforms, lock, waiting.empty? ? [] : patched)
     unless waiting.empty? || patched.empty?
       check(!rewritten.include?(earlier) && rewritten.include?(service.index_url),
