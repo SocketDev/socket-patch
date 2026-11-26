@@ -2055,6 +2055,209 @@ async fn pnpm11_registry_route_survives_resolution_and_cleans_up() {
     registry_route_survives_resolution_and_cleans_up(PNPM_TERTIARY, "pnpm11-route").await;
 }
 
+/// A HOSTED PATCH OVER A VENDORED DEPENDENCY against a real pnpm (#2263).
+///
+/// `peer-user` depends on `leaf`. pnpm 12.23 refuses a lock in which a
+/// package fetched from a hosted patch depends on a vendored `file:`
+/// tarball (`ERR_PNPM_LOCAL_SUBDEP_NOT_ALLOWED`), frozen or not, and it
+/// writes that very lock itself for the workspace file the two modes
+/// leave together. So whichever of `get <peer-user> --mode hosted` and
+/// `get <leaf> --mode vendored` runs second:
+///
+/// * is refused with a code that says why, and changes not a byte of
+///   package.json, the lock or the workspace file;
+/// * leaves a project a fresh checkout installs frozen from an empty
+///   store, with the first patch's bytes;
+/// * and `scan --mode hosted`, the remedy both refusals name, then patches
+///   both packages in a project that still installs frozen;
+/// * which a `scan --mode vendored` over it leaves as it is, since it can
+///   vendor `leaf` but not `peer-user`.
+async fn hosted_patch_over_a_vendored_dependency(pm: &str, tag: &str, hosted_first: bool) {
+    if !has_corepack_pm(pm) {
+        println!("SKIP {tag}: `corepack {pm}` unavailable");
+        return;
+    }
+    let registry = MockServer::start().await;
+    mount_route_registry(&registry).await;
+    let server = MockServer::start().await;
+    mount_route_patch_server(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("pnpm-cache");
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"app","version":"1.0.0","private":true,"dependencies":{"host":"1.0.0","peer-user":"1.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join(".npmrc"),
+        format!("registry={}/\n", registry.uri()),
+    )
+    .unwrap();
+    let store = |label: &str| format!("--store-dir={}", tmp.path().join(label).display());
+    let chatter = |out: &Output| {
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let install = route_pnpm(&cache, &proj, pm, &["install", &store("store-fixture")]);
+    if !install.status.success() {
+        assert!(
+            !pnpm_required(),
+            "fixture install failed:\n{}",
+            chatter(&install)
+        );
+        println!("SKIP {tag}: fixture install failed:\n{}", chatter(&install));
+        return;
+    }
+
+    let env = vec![
+        ("SOCKET_PATCH_SERVER_URL".to_string(), server.uri()),
+        ("SOCKET_NPM_REGISTRY".to_string(), registry.uri()),
+    ];
+    let server_uri = server.uri();
+    let socket = |args: &[&str]| {
+        let mut args = args.to_vec();
+        args.extend_from_slice(&[
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &server_uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ]);
+        run_socket_env(&proj, &args, &env)
+    };
+    const FILES: [&str; 3] = ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"];
+    let committed = || FILES.map(|file| std::fs::read(proj.join(file)).ok());
+    // A fresh checkout of what is committed, installed frozen from an
+    // empty store; `patched` are the packages whose bytes must be the
+    // patch's.
+    let frozen_install = |label: &str, patched: &[&str]| {
+        let fresh = tmp.path().join(format!("fresh-{label}"));
+        std::fs::create_dir_all(&fresh).unwrap();
+        for file in FILES.into_iter().chain([".npmrc"]) {
+            if proj.join(file).exists() {
+                std::fs::copy(proj.join(file), fresh.join(file)).unwrap();
+            }
+        }
+        if proj.join(".socket").exists() {
+            fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+        }
+        let out = route_pnpm(
+            &cache,
+            &fresh,
+            pm,
+            &[
+                "install",
+                "--frozen-lockfile",
+                &store(&format!("store-{label}")),
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "{tag} {label}: the frozen install must accept what is committed.\n{}",
+            chatter(&out)
+        );
+        for name in ["peer-user", "leaf"] {
+            let index = installed_index(&fresh, "peer-user", name);
+            assert_eq!(
+                index.starts_with(MARKER),
+                patched.contains(&name),
+                "{tag} {label}: {name} installed as:\n{index}"
+            );
+        }
+    };
+
+    let [leaf, peer_user] = &ROUTE_PATCHES;
+    let (first, first_mode, second, second_mode, refusal) = if hosted_first {
+        (
+            peer_user,
+            "hosted",
+            leaf,
+            "vendored",
+            "vendor_lock_entry_unsupported",
+        )
+    } else {
+        (
+            leaf,
+            "vendored",
+            peer_user,
+            "hosted",
+            "redirect_pnpm_local_dependency",
+        )
+    };
+    let (code, stdout, stderr) = socket(&["get", first.uuid, "--mode", first_mode]);
+    assert_eq!(
+        code, 0,
+        "{tag}: get {} --mode {first_mode} failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        first.name
+    );
+    let after_first = committed();
+
+    let (code, stdout, stderr) = socket(&["get", second.uuid, "--mode", second_mode]);
+    assert!(
+        stdout.contains(refusal) && stdout.contains("ERR_PNPM_LOCAL_SUBDEP_NOT_ALLOWED"),
+        "{tag}: get {} --mode {second_mode} must be refused as {refusal} (exit {code}).\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
+        second.name
+    );
+    assert!(
+        committed() == after_first,
+        "{tag}: the refused get {} --mode {second_mode} must change nothing; the lock is now:\n{}",
+        second.name,
+        std::fs::read_to_string(proj.join("pnpm-lock.yaml")).unwrap()
+    );
+    frozen_install("refused", &[first.name]);
+
+    // The remedy: both patches in hosted mode.
+    let (code, stdout, stderr) = socket(&["scan", "--mode", "hosted"]);
+    assert_eq!(
+        code, 0,
+        "{tag}: the hosted scan failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    frozen_install("both-hosted", &["peer-user", "leaf"]);
+
+    // A takeover that cannot vendor `peer-user` (its snapshot key carries a
+    // peer context) does not vendor `leaf` under it either: both stay
+    // hosted.
+    let both_hosted = committed();
+    let (code, stdout, stderr) = socket(&["scan", "--mode", "vendored"]);
+    assert_eq!(
+        code, 1,
+        "{tag}: the vendored scan must fail.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        committed() == both_hosted,
+        "{tag}: the refused takeover must change nothing; the lock is now:\n{}",
+        std::fs::read_to_string(proj.join("pnpm-lock.yaml")).unwrap()
+    );
+    frozen_install("takeover-refused", &["peer-user", "leaf"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm installs (~30s); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm12_vendored_dependency_of_a_hosted_patch_is_refused() {
+    hosted_patch_over_a_vendored_dependency(PNPM_NAMED_REGISTRY, "pnpm12-hosted-first", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm installs (~30s); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm12_hosted_patch_over_a_vendored_dependency_is_refused() {
+    hosted_patch_over_a_vendored_dependency(PNPM_NAMED_REGISTRY, "pnpm12-vendored-first", false)
+        .await;
+}
+
 /// CLEANUP OF THE REGISTRY ROUTE against a real pnpm: once a hosted patch
 /// is no longer needed, `scan` and `repair` take every unused entry of the
 /// route out, and what they leave is a project pnpm installs frozen.

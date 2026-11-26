@@ -121,6 +121,118 @@ fn malformed_resolution_refuses_the_dependency_across_all_locks() {
     }
 }
 
+/// A v9 lock in which `left-pad@1.3.0` depends on `leaf`, resolved as
+/// `resolution` and reached through the snapshot value `leaf`.
+fn lock_with_dependency(resolution: &str, leaf: &str) -> String {
+    format!(
+        "lockfileVersion: '9.0'\n\npackages:\n\n  left-pad@1.3.0:\n    resolution: {resolution}\n\n  \
+         other@1.0.0:\n    resolution: {{integrity: sha512-OTHER==}}\n\nsnapshots:\n\n  \
+         left-pad@1.3.0(peer@2.0.0):\n    dependencies:\n      leaf: {leaf}\n      peer: 2.0.0\n\n  \
+         other@1.0.0:\n    dependencies:\n      leaf: 1.0.0\n"
+    )
+}
+
+/// pnpm 12.23 refuses a lock in which a package fetched from a tarball
+/// URL depends on a local file (#2263), so the pin that would take such a
+/// package off the default registry is refused in every lock.
+#[test]
+fn a_package_with_a_local_dependency_is_not_taken_off_the_registry() {
+    const UPSTREAM: &str = "{integrity: sha512-UPSTREAM==}";
+    // With `lockfileIncludeTarballUrl`, a registry entry names its tarball.
+    const UPSTREAM_URL: &str = "{integrity: sha512-UPSTREAM==, tarball: https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz}";
+    for (local, upstream) in [
+        (
+            "file:.socket/vendor/npm/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/leaf-1.0.0.tgz",
+            UPSTREAM,
+        ),
+        (
+            "'file:.socket/vendor/npm/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/leaf-1.0.0.tgz'",
+            UPSTREAM,
+        ),
+        ("file:../leaf", UPSTREAM),
+        (
+            "file:.socket/vendor/npm/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/leaf-1.0.0.tgz",
+            UPSTREAM_URL,
+        ),
+    ] {
+        let files = BTreeMap::from([
+            (
+                "pnpm-lock.yaml".to_string(),
+                lock_with_dependency(upstream, local),
+            ),
+            (
+                "common/config/rush/pnpm-lock.yaml".to_string(),
+                lock_with_dependency(upstream, "1.0.0"),
+            ),
+        ]);
+        let result = rewrite_registry_redirect(&files, &[dep("left-pad")]);
+        assert!(
+            result.files.is_empty() && result.edits.is_empty(),
+            "{local}: partial rewrite"
+        );
+        assert!(result.refused_pnpm_uuids.contains("patch-id"), "{local}");
+        let warnings: Vec<_> = result
+            .warnings
+            .iter()
+            .filter(|w| w.code == "redirect_pnpm_local_dependency")
+            .collect();
+        let [warning] = warnings.as_slice() else {
+            panic!("{local}: one refusal, for the lock that has the dependency: {warnings:?}");
+        };
+        let unquoted = local.trim_matches('\'');
+        assert!(
+            warning.detail.contains(&format!("`leaf: {unquoted}`"))
+                && warning.detail.contains("in pnpm-lock.yaml")
+                && warning.detail.contains("ERR_PNPM_LOCAL_SUBDEP_NOT_ALLOWED"),
+            "{}",
+            warning.detail
+        );
+    }
+}
+
+/// The refusal is for the package the pin moves, and only when the pin
+/// makes a hosted package of it: a registry dependency, a peer a workspace
+/// project satisfies (`link:`), another package's local dependency and a
+/// package an earlier patch already pins are all pinned as before.
+#[test]
+fn the_local_dependency_refusal_is_scoped_to_the_new_pin() {
+    const LOCAL: &str =
+        "file:.socket/vendor/npm/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/leaf-1.0.0.tgz";
+    let other_has_it = lock_with_dependency("{integrity: sha512-UPSTREAM==}", "1.0.0").replace(
+        "  other@1.0.0:\n    dependencies:\n      leaf: 1.0.0\n",
+        &format!("  other@1.0.0:\n    dependencies:\n      leaf: {LOCAL}\n"),
+    );
+    assert!(other_has_it.contains(LOCAL));
+    for (what, lock) in [
+        (
+            "a registry dependency",
+            lock_with_dependency("{integrity: sha512-UPSTREAM==}", "1.0.0"),
+        ),
+        (
+            "a workspace peer",
+            lock_with_dependency("{integrity: sha512-UPSTREAM==}", "link:packages/leaf"),
+        ),
+        ("another package's local dependency", other_has_it),
+        (
+            "a package an earlier patch pins",
+            lock_with_dependency(
+                "{integrity: sha512-STALE==, tarball: https://patch.example/patch/npm/left-pad/1.3.0/9ee29ee2-9ee2-49ee-829e-e29ee29ee29e/cccccccc-cccc-4ccc-8ccc-cccccccccccc/left-pad-1.3.0.tgz}",
+                LOCAL,
+            ),
+        ),
+    ] {
+        let files = BTreeMap::from([("pnpm-lock.yaml".to_string(), lock)]);
+        let result = rewrite_registry_redirect(&files, &[dep("left-pad")]);
+        assert!(result.warnings.is_empty(), "{what}: {:?}", result.warnings);
+        assert!(result.refused_pnpm_uuids.is_empty(), "{what}");
+        assert_eq!(result.edits.len(), 1, "{what}");
+        assert!(
+            result.files["pnpm-lock.yaml"].contains("https://patch.example/left-pad-1.3.0.tgz"),
+            "{what}"
+        );
+    }
+}
+
 #[test]
 fn quoted_flow_values_keep_commas_and_extra_fields() {
     let lock = "packages:\n  left-pad@1.3.0:\n    resolution: {integrity: sha512-UPSTREAM==, tarball: 'https://registry.example/a,b.tgz', note: 'keep,a,b'}\n";

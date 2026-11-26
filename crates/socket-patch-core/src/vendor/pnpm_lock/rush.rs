@@ -70,11 +70,12 @@ use crate::vendor::state::{PnpmMeta, VendorEntry, WiringAction, WiringRecord};
 use crate::vendor::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
 use super::{
-    check_rewritable_refs_with, dep_entries, drifted, edit_packages, edit_snapshot_refs,
-    edit_snapshot_rekey, is_mixed_line_endings, lock_has_target_package, matching_blocks,
-    override_key_name, overrides_record, read_pnpm_text, restore_dep_map_refs, revert_lock_record,
-    split_v9_lock, EditCtx, PnpmDialect, RefBlocks, KIND_LOCK_IMPORTER_DEP, KIND_LOCK_PACKAGE,
-    KIND_LOCK_SNAPSHOT, VENDOR_CONFIG_DEPENDENCY_UNPATCHED, VENDOR_PNPM_LOCK_MULTI_DOCUMENT,
+    check_hosted_dependents, check_rewritable_refs_with, dep_entries, drifted, edit_packages,
+    edit_snapshot_refs, edit_snapshot_rekey, is_mixed_line_endings, lock_has_target_package,
+    matching_blocks, override_key_name, overrides_record, read_pnpm_text, restore_dep_map_refs,
+    revert_lock_record, split_v9_lock, EditCtx, PnpmDialect, RefBlocks, KIND_LOCK_IMPORTER_DEP,
+    KIND_LOCK_PACKAGE, KIND_LOCK_SNAPSHOT, VENDOR_CONFIG_DEPENDENCY_UNPATCHED,
+    VENDOR_PNPM_LOCK_MULTI_DOCUMENT,
 };
 
 /// The ledger flavor of a Rush-wired entry.
@@ -934,6 +935,7 @@ async fn plan(
             )
         };
         check_rewritable_refs_with(&doc.lines, name, version, None).map_err(unsupported)?;
+        check_hosted_dependents(&doc.lines, name, version, None).map_err(unsupported)?;
         override_conflict(
             lock_rel,
             lock_overrides(&doc.lines)
@@ -2667,6 +2669,28 @@ mod tests {
         let repo = Repo::new("pnpm10");
         let (code, _) = refused(&repo, ("minimist", "1.2.8", MINIMIST_008.2)).await;
         assert_eq!(code, "vendor_lock_entry_not_found");
+    }
+
+    /// A dependent that a hosted patch pins (#2263): pnpm 12.23 refuses a
+    /// lock in which it depends on a local file, so its dependency is not
+    /// vendored under it. The refusal names Rush's lock.
+    #[tokio::test]
+    async fn a_dependency_of_a_hosted_package_is_refused() {
+        const MKDIRP: &str = "  mkdirp@0.5.1:\n    resolution: {integrity: sha512-SknJC52obPfGQPnjIkXbmA6+5H15E+fR+E4iR2oQ3zzCLbd7/ONua69R/Gw7AgkTLsRG+r5fzksYwWe1AgTyWA==}\n";
+        let repo = Repo::new("pnpm10");
+        let lock = repo.read(RUSH_COMMON_LOCK_REL);
+        assert!(lock.contains(MKDIRP), "{lock}");
+        let hosted = "  mkdirp@0.5.1:\n    resolution: {integrity: sha512-PATCHED==, tarball: https://patch.socket.dev/patch/npm/mkdirp/0.5.1/9ee29ee2-9ee2-49ee-829e-e29ee29ee29e/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/mkdirp-0.5.1.tgz}\n";
+        repo.write(RUSH_COMMON_LOCK_REL, &lock.replace(MKDIRP, hosted));
+        let (code, detail) = refused(&repo, MINIMIST_008).await;
+        assert_eq!(code, "vendor_lock_entry_unsupported");
+        assert!(
+            detail.contains(&format!(
+                "{RUSH_COMMON_LOCK_REL} installs mkdirp@0.5.1 from a hosted patch"
+            )) && detail.contains("depends on minimist@0.0.8")
+                && detail.contains("ERR_PNPM_LOCAL_SUBDEP_NOT_ALLOWED"),
+            "{detail}"
+        );
     }
 
     /// The lock and a project's `package.json` disagree: `rush update` has

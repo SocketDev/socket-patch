@@ -456,6 +456,166 @@ async fn hosted_takeover_migrates_parent_and_child() {
     assert!(vendored_uuids(root).is_empty());
 }
 
+/// The npm registry's version documents the upstream restore re-resolves
+/// the pristine entries from, on the API's mock server.
+async fn mock_registry(server: &MockServer) {
+    for purl in [DEBUG, MS] {
+        let (name, version, _) = parts(purl);
+        let integrity = LOCK
+            .split(&format!(
+                "  {name}@{version}:\n    resolution: {{integrity: "
+            ))
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("the fixture lock's integrity");
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}/{version}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": name,
+                "version": version,
+                "dist": {
+                    "tarball": format!("https://registry.npmjs.org/{name}/-/{name}-{version}.tgz"),
+                    "integrity": integrity,
+                }
+            })))
+            .mount(server)
+            .await;
+    }
+}
+
+/// Run `args` against the mock API, which is the npm registry too; a
+/// vendoring run downloads from a prebuilt fixture of the project's
+/// manifest.
+fn run_api(root: &Path, api: &str, args: &[&str]) -> (i32, Value) {
+    let mut args = args.to_vec();
+    args.extend([
+        "--json",
+        "--yes",
+        "--api-url",
+        api,
+        "--api-token",
+        "fake",
+        "--org",
+        ORG,
+        "--cwd",
+        root.to_str().unwrap(),
+    ]);
+    let vendoring = args[0] == "vendor" || args.contains(&"vendored");
+    let fixture = vendoring.then(|| prebuilt_common::Server::project_with_env(root, &[]));
+    if let Some(fixture) = &fixture {
+        args.extend(["--vendor-url", &fixture.uri]);
+    }
+    let mut cmd = hermetic::binary_command();
+    cmd.current_dir(root)
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .env("SOCKET_NPM_REGISTRY", api)
+        .args(&args);
+    let out = cmd.output().expect("spawn socket-patch binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let env: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        panic!("{args:?} must emit a JSON envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    (out.status.code().unwrap_or(-1), env)
+}
+
+/// The project with both packages pinned in hosted mode.
+fn hosted_project(root: &Path, api: &str) {
+    write_project(root);
+    let (code, env) = run_api(root, api, &["scan", "--mode", "hosted"]);
+    assert_eq!(code, 0, "{env:#}");
+    let lock = read_lock(root);
+    for purl in [DEBUG, MS] {
+        assert!(lock.contains(&hosted_url(purl)), "{purl} pinned:\n{lock}");
+    }
+}
+
+fn vendored_key(purl: &str) -> String {
+    let (name, version, uuid) = parts(purl);
+    format!("  {name}@file:.socket/vendor/npm/{uuid}/{name}-{version}.tgz:")
+}
+
+/// #2263: pnpm 12.23 refuses a lock in which a package fetched from a
+/// tarball URL depends on a local file, so `ms` is not vendored under a
+/// `debug` that is still hosted. `scan --mode vendored` judges each hosted
+/// pin against the lock as the run found it: the first run vendors `debug`
+/// and keeps `ms` hosted (a vendored package over a hosted one installs),
+/// and the next run vendors `ms`.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_takeover_keeps_the_child_hosted_until_the_parent_is_vendored() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    mock_registry(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    hosted_project(root, &server.uri());
+
+    let (code, env) = run_api(root, &server.uri(), &["scan", "--mode", "vendored"]);
+    assert_eq!(code, 1, "{env:#}");
+    let refused: Vec<&Value> = env["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "failed")
+        .collect();
+    let [refusal] = refused.as_slice() else {
+        panic!("one refusal: {env:#}");
+    };
+    assert_eq!(refusal["purl"], MS, "{env:#}");
+    assert_eq!(refusal["errorCode"], "vendor_lock_entry_unsupported");
+    let detail = refusal["error"].as_str().unwrap();
+    assert!(
+        detail.contains("installs debug@4.3.4 from a hosted patch")
+            && detail.contains("ERR_PNPM_LOCAL_SUBDEP_NOT_ALLOWED"),
+        "{detail}"
+    );
+    let lock = read_lock(root);
+    assert!(
+        lock.contains(&vendored_key(DEBUG)),
+        "debug vendored:\n{lock}"
+    );
+    assert!(lock.contains(&hosted_url(MS)), "ms stays hosted:\n{lock}");
+    assert!(!lock.contains(&hosted_url(DEBUG)), "{lock}");
+    assert_eq!(vendored_uuids(root), [DEBUG_UUID]);
+    assert_snapshot_refs_resolve(&lock);
+
+    let (code, env) = run_api(root, &server.uri(), &["scan", "--mode", "vendored"]);
+    assert_eq!(code, 0, "{env:#}");
+    let lock = read_lock(root);
+    for purl in [DEBUG, MS] {
+        assert!(
+            lock.contains(&vendored_key(purl)),
+            "{purl} vendored:\n{lock}"
+        );
+        assert!(!lock.contains(&hosted_url(purl)), "{lock}");
+    }
+    assert_snapshot_refs_resolve(&lock);
+}
+
+/// The eject (`vendor` over hosted pins) restores every pin before it
+/// vendors any, so it moves the parent and its dependency in one run.
+#[tokio::test(flavor = "multi_thread")]
+async fn eject_vendors_a_hosted_parent_and_child_in_one_run() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    mock_registry(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    hosted_project(root, &server.uri());
+
+    let (code, env) = run_api(root, &server.uri(), &["vendor"]);
+    assert_eq!(code, 0, "{env:#}");
+    let lock = read_lock(root);
+    for purl in [DEBUG, MS] {
+        assert!(
+            lock.contains(&vendored_key(purl)),
+            "{purl} vendored:\n{lock}"
+        );
+        assert!(!lock.contains(&hosted_url(purl)), "{lock}");
+    }
+    assert_snapshot_refs_resolve(&lock);
+}
+
 /// How many hosted pins the run wrote (`applied`) or, on a dry run, would
 /// write (`verified`): the `details.mode: "hosted"` events (v5.0's
 /// `redirect.redirected`).

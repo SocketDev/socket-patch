@@ -11,12 +11,43 @@ use serde_json::Value;
 use crate::patch::redirect::{full_name, DepOverride, FileEdit, RewriteResult, RewriteWarning};
 
 use super::grammar as pnpm;
+use super::lines::{parse_key_line, unquote_value};
 use super::plan::{hosted_refuses_lock, match_hosted_key, planned_locks, KeyMatch, Target};
 
 /// Whether `entry` resolves to exactly `artifact_url` — the per-instance
 /// residual-gate predicate.
 fn pnpm_resolves_to(entry: &pnpm::Entry<'_>, artifact_url: &str) -> bool {
     pnpm::resolution(entry).is_some_and(|r| r.tarball() == Some(artifact_url))
+}
+
+/// The first dependency of `fname@version` that a `snapshots:` section of
+/// `text` (lockfileVersion 9) installs from a local `file:` path, as
+/// `dep: value`. A registry package only gets one from an override, a
+/// vendored package's among them. A `link:` value is not one: pnpm writes
+/// it for a peer a workspace project satisfies.
+fn local_dependency(text: &str, fname: &str, version: &str) -> Option<String> {
+    let mut in_snapshots = false;
+    let mut in_entry = false;
+    for line in text.lines() {
+        if !line.is_empty() && !line.starts_with([' ', '#']) {
+            in_snapshots = line == "snapshots:";
+            continue;
+        }
+        if !in_snapshots {
+            continue;
+        }
+        if let Some((key, _, _)) = parse_key_line(line, 2) {
+            in_entry = pnpm::hosted_suffix(key, fname, version).is_some();
+        } else if in_entry {
+            if let Some((dep, _, value)) = parse_key_line(line, 6) {
+                let value = unquote_value(value);
+                if value.starts_with("file:") {
+                    return Some(format!("{dep}: {value}"));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// One pnpm lock under rewrite. `text` is the lock as of the last
@@ -237,6 +268,9 @@ pub(crate) fn plan_hosted(
         type Splice = (usize, std::ops::Range<usize>, String);
         let mut planned: Vec<(usize, Vec<Splice>, Vec<FileEdit>)> = Vec::new();
         let mut residuals: Vec<(&str, Vec<String>)> = Vec::new();
+        // The locks in which the pin would leave a hosted package
+        // depending on a local file, with that dependency.
+        let mut local_dependencies: Vec<(&str, String)> = Vec::new();
         for (idx, (lock, hits)) in locks.iter().zip(&hits).enumerate() {
             // (entry, byte range to replace, replacement text) per instance,
             // plus one FileEdit per instance keyed by the canonical instance
@@ -253,6 +287,11 @@ pub(crate) fn plan_hosted(
             // instance keep installing the unpatched upstream tarball, so
             // the dep is refused instead.
             let mut leftover: Vec<String> = Vec::new();
+            // Whether a splice makes a hosted pin of an instance that is
+            // not one yet: one whose tarball already names a patch (a uuid
+            // segment, which no registry tarball has) is re-pinned as it
+            // was.
+            let mut newly_hosted = false;
             for &i in hits {
                 let entry = lock.entry(i);
                 let suffix = pnpm::hosted_suffix(entry.key, &fname, &dep.version)
@@ -289,6 +328,11 @@ pub(crate) fn plan_hosted(
                 if rebuilt == original {
                     continue;
                 }
+                newly_hosted |= !resolution.tarball().is_some_and(|tarball| {
+                    tarball
+                        .split('/')
+                        .any(crate::patch::path_safety::is_canonical_uuid)
+                });
                 instance_edits.push(FileEdit {
                     path: lock.path.clone(),
                     kind: "redirect_pnpm_resolution".into(),
@@ -302,6 +346,11 @@ pub(crate) fn plan_hosted(
             if !leftover.is_empty() {
                 residuals.push((lock.path.as_str(), leftover));
                 continue;
+            }
+            if newly_hosted {
+                if let Some(local) = local_dependency(&lock.text, &fname, &dep.version) {
+                    local_dependencies.push((lock.path.as_str(), local));
+                }
             }
             if !splices.is_empty() {
                 planned.push((idx, splices, instance_edits));
@@ -324,6 +373,34 @@ pub(crate) fn plan_hosted(
                          lock with a current pnpm (lockfileVersion 9) and re-run",
                         dep.version,
                         keys.join(", ")
+                    ),
+                });
+            }
+            continue;
+        }
+        // pnpm 12.23 refuses a lock in which a package that is not local
+        // depends on a local file, unless it can tie the workspace override
+        // to that package (ERR_PNPM_LOCAL_SUBDEP_NOT_ALLOWED). It cannot
+        // for a package fetched from a hosted patch, which the pin makes
+        // of this one, so every install would fail, frozen or not (#2263,
+        // verified against pnpm 12.23.0). The dep is refused across the
+        // whole lock set, as for a residual; the vendored backend refuses
+        // the same pair from its side (`vendor::pnpm_lock`).
+        if !local_dependencies.is_empty() {
+            result.refused_pnpm_uuids.insert(dep.patch_uuid.clone());
+            for (lock_key, local) in &local_dependencies {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_pnpm_local_dependency".into(),
+                    detail: format!(
+                        "{fname}@{} depends on a local package in {lock_key} (`{local}`). \
+                         pnpm 12.23 and newer refuse a lock in which a package fetched \
+                         from a hosted patch depends on a local file \
+                         (ERR_PNPM_LOCAL_SUBDEP_NOT_ALLOWED), so the dep is left \
+                         unredirected in EVERY lock (nothing rewritten, nothing \
+                         confirmed). If socket-patch vendored that dependency, move it \
+                         to hosted mode as well (`socket-patch scan --mode hosted` takes \
+                         it over) and re-run",
+                        dep.version
                     ),
                 });
             }
