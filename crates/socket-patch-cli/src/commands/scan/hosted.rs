@@ -1434,6 +1434,55 @@ async fn read_gem_indexes(
     }
 }
 
+/// The candidates that bring a Bundler lock which stays on a patch to what
+/// that patch serves today
+/// ([`socket_patch_core::hosted::gem_index::read_gem_refreshes`]), to
+/// rewrite beside `candidates` once `read` holds the documents of
+/// [`read_gem_indexes`].
+///
+/// A lock on the registry of another patch of a gem stays there while the
+/// patch on offer would take a patched build from it, or does not list a
+/// locked platform. Where the registry it stays on has withdrawn a build
+/// the lock pins, that platform no longer installs. The reference of the
+/// patch the lock is on lists upstream's gem for that build under its
+/// current snapshot, and the rewrite follows it there: the patch on offer
+/// is skipped as before, and the lock is whole again. The reference is one
+/// the run already holds (`references`: the withdrawn-pin sweep of a scan
+/// asks about every pin), else one request to the patch service, made only
+/// where a withdrawal was detected while a lock stays. One that is not
+/// usable changes nothing.
+///
+/// Not under a patch mirror: the reference would have to be moved onto the
+/// mirror and checked there like a new pin, and such a lock is left as it
+/// is.
+async fn refresh_gem_patches(
+    common: &crate::args::GlobalArgs,
+    api_client: &socket_patch_core::api::client::ApiClient,
+    candidates: &[socket_patch_core::hosted::engine::Candidate],
+    read: &socket_patch_core::hosted::engine::CandidateFiles,
+    references: &std::collections::HashMap<
+        String,
+        socket_patch_core::api::types::PackageVendorResult,
+    >,
+) -> Vec<socket_patch_core::hosted::engine::Candidate> {
+    use socket_patch_core::hosted::{engine, gem_index};
+    if common.patch_mirror().is_some() {
+        return Vec::new();
+    }
+    // A status line only where the patch service is asked.
+    let asks = engine::gem_refresh_targets(candidates, &read.files)
+        .iter()
+        .any(|target| !references.contains_key(&target.uuid));
+    let origins = crate::commands::hosted_unwind::patch_server_origins(common);
+    let refreshing =
+        gem_index::read_gem_refreshes(api_client, candidates, read, references, &origins);
+    if asks {
+        crate::ui::busy(common, "Resolving hosted artifacts", refreshing).await
+    } else {
+        refreshing.await
+    }
+}
+
 /// Whether the hosted flow's Pipenv probe is CERTAIN to run: the candidates
 /// that no wheel-metadata failure can drop (none shares a fetched wheel's
 /// artifact URL) already target an entry of Pipfile.lock, so
@@ -1742,6 +1791,12 @@ async fn run_redirect_selected_untracked(
     // records) would otherwise be silent gaps on a terminal. Inert under
     // --json/--silent and off a terminal.
     let mut status = crate::ui::StatusLine::stderr(common.json, common.silent);
+    // Every reference answer the run holds, by uuid: the selection's, and
+    // the withdrawn-pin sweep's for the pins the lockfiles already hold.
+    let mut references: std::collections::HashMap<
+        String,
+        socket_patch_core::api::types::PackageVendorResult,
+    > = std::collections::HashMap::new();
 
     if !selected.is_empty() {
         let uuids: Vec<String> = selected.iter().map(|(_, uuid)| uuid.clone()).collect();
@@ -1772,7 +1827,7 @@ async fn run_redirect_selected_untracked(
             }
             fetched
         });
-        let references = match fetched {
+        references = match fetched {
             Ok(r) => r,
             // A capped run whose every row is NEW: the failure affects only
             // rows the incomplete lookup defers anyway (§5.2), so it becomes
@@ -2321,6 +2376,15 @@ async fn run_redirect_selected_untracked(
         &mut gem_indexes,
     )
     .await;
+    // A gem lock that stays on the patch it is on, while that patch's
+    // registry no longer serves a build the lock pins, follows that patch's
+    // reference as it stands (see `refresh_gem_patches`). Only a run that
+    // may write, or previews: one that holds no lock leaves the lock as it
+    // is.
+    if common.dry_run || lock.is_some() {
+        let refreshed = refresh_gem_patches(common, api_client, &candidates, &read, &references);
+        candidates.extend(refreshed.await);
+    }
     // The Pipfile.lock reference shape depends on the installing Pipenv
     // (`path` for 7–11, `file` from 2018 on), so the installed release is
     // probed (`pipenv --version`, up to 10 s) — but only when a pypi patch
@@ -2688,7 +2752,17 @@ async fn run_redirect_selected_untracked(
     // unless it installed a patched build that was withdrawn since.
     let mut gem_upstream: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
-    for o in done.overrides.iter().filter(|o| o.ecosystem == "gem") {
+    // Of the pins the project's files hold alone: a gem's lock can stay
+    // on one patch while another patch of the gem is skipped, and what the
+    // skipped one's registry serves is not what the lock installs.
+    let pinned_gems: Vec<DepOverride> = done
+        .overrides
+        .iter()
+        .filter(|o| o.ecosystem == "gem")
+        .filter(|o| confirmed.iter().any(|(_, uuid)| *uuid == o.patch_uuid))
+        .cloned()
+        .collect();
+    for o in &pinned_gems {
         let sha = o
             .registry_override
             .as_ref()
@@ -2727,7 +2801,7 @@ async fn run_redirect_selected_untracked(
         &local_records,
         &gem_artifact_shas,
         &gem_upstream,
-        &done.overrides,
+        &pinned_gems,
         &mirror_sources,
         &mut views,
     )

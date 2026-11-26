@@ -30,6 +30,12 @@
 //!   the registry it is on says; otherwise it stays, under a quiet skip. A
 //!   build that registry withdrew holds nothing back: the lock moves, and
 //!   the run says that the build is back on upstream's gem;
+//! * a lock that stays on another patch of the gem, while that patch has
+//!   withdrawn a build the lock pins, is brought to that patch's current
+//!   listing: the run takes that patch's reference (the one its check of
+//!   the pins holds, else one request), writes its current snapshot with
+//!   upstream's sha256 back for the withdrawn build, and skips the patch
+//!   on offer as before;
 //! * a gem the lock names as its ruby-platform gem alone takes the
 //!   registry without its snapshot level, so a pair pinned by a reference
 //!   with no list is left byte for byte by one with a list.
@@ -1904,6 +1910,834 @@ async fn the_registry_of_a_lock_on_a_patch_mirror_is_read_from_the_patch_server(
         .filter(|request| request.contains("/info/"))
         .collect();
     assert_eq!(asked_of_mirror, Vec::<String>::new());
+}
+
+// ── A lock that stays on a patch which withdrew a build ───────────────
+
+/// The patch of the earlier patch's patched `arm64-darwin` build, and the
+/// sha256 of that build.
+const EARLIER_ARM_UUID: &str = "4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a";
+const EARLIER_ARM_PATCHED: &str =
+    "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2";
+/// The earlier patch with a patched build for both platforms, as the lock
+/// of these tests has it (snapshot `3`).
+const EARLIER_BOTH: [Listed; 2] = [
+    (ARM, EARLIER_ARM_PATCHED, Some(EARLIER_ARM_UUID)),
+    (LINUX, EARLIER_LINUX_PATCHED, Some(EARLIER_LINUX_UUID)),
+];
+/// The snapshot the earlier patch's reference names once a build of it was
+/// withdrawn.
+const EARLIER_NOW: u32 = 6;
+
+/// What the patch service answers when it is asked for the reference of
+/// the earlier patch.
+#[derive(Clone)]
+enum EarlierNow {
+    /// Granted, listing these builds at the snapshot [`EARLIER_NOW`].
+    Lists(Vec<Listed>),
+    /// Granted, with no list of the version's gems.
+    NoList,
+    /// Granted, as the reference of another package.
+    OtherPackage,
+    /// Not granted: this status.
+    Status(&'static str),
+    /// No answer for that patch.
+    Absent,
+    /// The request fails.
+    Fails,
+}
+
+/// The patch API of the patch on offer ([`UUID`], whose reference lists
+/// `offered` at snapshot `4`), which answers a reference request with the
+/// patches it was asked for and no other: the one on offer, and the
+/// earlier patch as `earlier` says. The earlier patch's record is served
+/// too, for a VEX document.
+async fn mount_api_refreshing(server: &MockServer, offered: &[Listed], earlier: EarlierNow) {
+    let api = server.uri();
+    let on_offer = reference(&api, UUID, Some((offered, 4)));
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(move |request: &wiremock::Request| {
+            let asked: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+            let asked: Vec<&str> = asked["uuids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let mut results = serde_json::Map::new();
+            if asked.contains(&UUID) {
+                results.insert(UUID.to_string(), on_offer.clone());
+            }
+            if asked.contains(&EARLIER_UUID) {
+                let answer = match &earlier {
+                    EarlierNow::Lists(builds) => Some(reference(
+                        &api,
+                        EARLIER_UUID,
+                        Some((&builds[..], EARLIER_NOW)),
+                    )),
+                    EarlierNow::NoList => Some(reference(&api, EARLIER_UUID, None)),
+                    EarlierNow::OtherPackage => {
+                        let mut other =
+                            reference(&api, EARLIER_UUID, Some((&EARLIER_BOTH[..], EARLIER_NOW)));
+                        other["purl"] = json!("pkg:gem/another-gem@1.19.3");
+                        Some(other)
+                    }
+                    EarlierNow::Status(status) => Some(json!({ "status": status })),
+                    EarlierNow::Absent => None,
+                    EarlierNow::Fails => return ResponseTemplate::new(500),
+                };
+                results.extend(answer.map(|answer| (EARLIER_UUID.to_string(), answer)));
+            }
+            ResponseTemplate::new(200).set_body_json(json!({ "results": results }))
+        })
+        .with_priority(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{EARLIER_UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uuid": EARLIER_UUID, "purl": PURL, "publishedAt": "2025-12-01T00:00:00Z",
+            "files": { "lib/platform_probe.rb": {
+                "beforeHash": "a".repeat(64), "afterHash": "c".repeat(64),
+            }},
+            "vulnerabilities": { GHSA: {
+                "cves": ["CVE-2026-5555"], "summary": "s", "severity": "high",
+                "description": "d",
+            }},
+            "description": "x", "license": "MIT", "tier": "free",
+        })))
+        .mount(server)
+        .await;
+    mount_api(server, Some((offered, 4))).await;
+}
+
+/// The compact-index document of the earlier patch's registry at
+/// `snapshot`: the patched ruby gem and `builds` (`(platform, sha256)`).
+async fn mount_earlier_snapshot(server: &MockServer, snapshot: u32, builds: &[(&str, &str)]) {
+    let mut listing = format!("---\n{DEP_VERSION} racc:~> 1.4|checksum:{RUBY_PATCHED}\n");
+    for (platform, sha256) in builds {
+        listing.push_str(&format!(
+            "{DEP_VERSION}-{platform} racc:~> 1.4|checksum:{sha256}\n"
+        ));
+    }
+    Mock::given(method("GET"))
+        .and(path(earlier_snapshot_path(snapshot)))
+        .respond_with(ResponseTemplate::new(200).set_body_string(listing))
+        .mount(server)
+        .await;
+}
+
+fn earlier_snapshot_path(snapshot: u32) -> String {
+    format!("/patch-registry/gem/{TOKEN}/{EARLIER_UUID}/s/{snapshot}/info/{DEP}")
+}
+
+/// An event of a build of the gem under the earlier patch: `applied`
+/// (`verified` on a dry run) under `patch`, or, with none, the uncounted
+/// event of a build that is back on upstream's gem.
+fn earlier_event(action: &str, platform: &str, patch: Option<&str>) -> Value {
+    let purl = format!("{PURL}?platform={platform}");
+    match patch {
+        Some(patch) => json!({
+            "action": action, "purl": purl, "uuid": patch,
+            "details": { "gemFix": EARLIER_UUID, "platform": platform, "mode": "hosted" },
+        }),
+        None => json!({
+            "action": "skipped", "purl": purl, "errorCode": "gem_upstream_build_kept",
+            "reason": format!(
+                "the patch registry serves upstream's own gem for {platform}: its patched \
+                 build was withdrawn"
+            ),
+            "details": {
+                "gemFix": EARLIER_UUID, "platform": platform, "withdrawn": true,
+                "mode": "hosted",
+            },
+        }),
+    }
+}
+
+/// The counted skip of the patch on offer: its code and its line.
+fn offer_skip(code: &str, line: &str) -> Value {
+    json!({
+        "action": "skipped", "purl": PURL, "uuid": UUID,
+        "errorCode": code, "reason": line,
+        "details": { "mode": "hosted" },
+    })
+}
+
+/// One situation in which a lock stays on the earlier patch: what the
+/// patch on offer lists, the build the earlier patch withdrew and the one
+/// it still serves (each with the sha256 the lock pins and the patch of
+/// that build), the sha256 of upstream's gem for the withdrawn one, and
+/// the quiet skip of the patch on offer.
+struct Stays {
+    offered: Vec<Listed>,
+    withdrawn: (&'static str, &'static str),
+    served: (&'static str, &'static str, &'static str),
+    upstream: &'static str,
+    skip: (&'static str, String),
+}
+
+impl Stays {
+    /// The patch on offer serves upstream's gem for both platforms: the
+    /// lock is held for the linux build, and arm64-darwin was withdrawn.
+    fn held() -> Stays {
+        Stays {
+            offered: NONE_PATCHED.to_vec(),
+            withdrawn: (ARM, EARLIER_ARM_PATCHED),
+            served: (LINUX, EARLIER_LINUX_PATCHED, EARLIER_LINUX_UUID),
+            upstream: ARM_UPSTREAM,
+            skip: ("redirect_gem_newer_fix_waits", newer_fix_waits().0),
+        }
+    }
+
+    /// The patch on offer does not list arm64-darwin, and has a patched
+    /// build for linux, which the earlier patch withdrew.
+    fn unlisted() -> Stays {
+        Stays {
+            offered: vec![(LINUX, LINUX_PATCHED, Some(LINUX_UUID))],
+            withdrawn: (LINUX, EARLIER_LINUX_PATCHED),
+            served: (ARM, EARLIER_ARM_PATCHED, EARLIER_ARM_UUID),
+            upstream: LINUX_UPSTREAM,
+            skip: (
+                "redirect_gem_platform_unlisted",
+                format!(
+                    "{DEP} {DEP_VERSION}: the newer fix's registry does not list {ARM}; the lock \
+                     stays on the patch it is on"
+                ),
+            ),
+        }
+    }
+
+    /// What the earlier patch's reference lists once the build was
+    /// withdrawn: upstream's gem for it, the other build as it was.
+    fn earlier_now(&self) -> Vec<Listed> {
+        let mut now = vec![
+            (self.withdrawn.0, self.upstream, None),
+            (self.served.0, self.served.1, Some(self.served.2)),
+        ];
+        now.sort();
+        now
+    }
+
+    /// `(arm64-darwin, x86_64-linux-gnu)` as the lock pins them once it
+    /// followed the earlier patch's reference.
+    fn pins_now(&self) -> (&'static str, &'static str) {
+        if self.withdrawn.0 == ARM {
+            (self.upstream, self.served.1)
+        } else {
+            (self.served.1, self.upstream)
+        }
+    }
+
+    /// The stand-in for this situation: the earlier patch's registry at
+    /// the snapshot the lock names lists the build it still serves and
+    /// not the withdrawn one, and at its current snapshot what its
+    /// reference lists.
+    async fn mount(&self, server: &MockServer, earlier: EarlierNow) {
+        mount_api_refreshing(server, &self.offered, earlier).await;
+        mount_earlier_snapshot(server, 3, &[(self.served.0, self.served.1)]).await;
+        let now: Vec<(&str, &str)> = self
+            .earlier_now()
+            .iter()
+            .map(|(platform, sha256, _)| (*platform, *sha256))
+            .collect();
+        mount_earlier_snapshot(server, EARLIER_NOW, &now).await;
+    }
+
+    /// The line of the earlier patch's builds once the lock followed its
+    /// reference.
+    fn line(&self, dry_run: bool) -> String {
+        let back = if dry_run { "would be back" } else { "back" };
+        format!(
+            "{DEP} {DEP_VERSION}: patched for {}; upstream gem {back} for {} (its patched build \
+             was withdrawn)",
+            self.served.0, self.withdrawn.0
+        )
+    }
+
+    /// The run's hosted events once the lock followed the earlier patch's
+    /// reference, in envelope order.
+    fn events(&self, action: &str) -> Vec<Value> {
+        let mut builds = vec![
+            earlier_event(action, self.withdrawn.0, None),
+            earlier_event(action, self.served.0, Some(self.served.2)),
+        ];
+        builds.sort_by_key(|event| event["purl"].as_str().map(str::to_string));
+        let mut events = vec![offer_skip(self.skip.0, &self.skip.1)];
+        events.extend(builds);
+        events
+    }
+}
+
+/// A project whose lock is on the earlier patch at snapshot `3`, with both
+/// builds patched there.
+fn project_on_earlier(api: &str, checksums: bool) -> tempfile::TempDir {
+    let earlier = earlier_index(api);
+    hosted_project(
+        &earlier,
+        EARLIER_ARM_PATCHED,
+        EARLIER_LINUX_PATCHED,
+        checksums,
+    )
+}
+
+/// A lock stays on an earlier patch of the gem (the patch on offer would
+/// take a patched build from it, or does not list a locked platform), and
+/// that patch has withdrawn another build the lock pins: its registry,
+/// asked once, no longer lists it, so that platform no longer installs.
+/// The run brings the lock to the earlier patch's current listing: both
+/// files name its current snapshot, the withdrawn build is back on
+/// upstream's sha256 and the build it still serves is as it was. Exit 0
+/// with no warning: the earlier patch's builds are reported as for a lock
+/// that follows a withdrawal on its own patch, the patch on offer is
+/// skipped under its quiet code, and a person reads the two lines. A
+/// `scan` holds the earlier patch's reference already (it asks about
+/// every pin before it rewrites), so it asks for nothing more; a dry run
+/// previews the same and writes nothing; a second run changes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_that_stays_is_brought_to_the_current_listing_of_the_patch_it_is_on() {
+    for case in [Stays::held(), Stays::unlisted()] {
+        let code = case.skip.0;
+        let server = MockServer::start().await;
+        case.mount(&server, EarlierNow::Lists(case.earlier_now()))
+            .await;
+        let api = server.uri();
+        let (before, now) = (
+            earlier_index(&api),
+            format!("{}/", registry_url(&api, EARLIER_UUID, Some(EARLIER_NOW))),
+        );
+        let (arm, linux) = case.pins_now();
+        let known = ["--patch-server-url", api.as_str()];
+        let pair_before = (
+            hosted_lock(&before, EARLIER_ARM_PATCHED, EARLIER_LINUX_PATCHED),
+            hosted_gemfile(&before),
+        );
+        let pair_now = (hosted_lock(&now, arm, linux), hosted_gemfile(&now));
+        let pair = |proj: &Path| (read(proj, "Gemfile.lock"), read(proj, "Gemfile"));
+
+        // A dry run: the same outcome, nothing written.
+        let proj = project_on_earlier(&api, true);
+        let (exit, env) = scan_json(proj.path(), &api, &[known[0], known[1], "--dry-run"]);
+        assert_eq!(exit, 0, "{code}: {env}");
+        assert_eq!(pair(proj.path()), pair_before, "{code}");
+        assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+        assert_eq!(
+            hosted_events(&env),
+            case.events("verified"),
+            "{code}: {env}"
+        );
+        let (exit, stdout, stderr) = hosted(
+            proj.path(),
+            &api,
+            &["scan"],
+            &[known[0], known[1], "--dry-run"],
+        );
+        assert_eq!(exit, 0, "{stdout}\n{stderr}");
+        for line in [case.line(true), case.skip.1.clone()] {
+            assert!(stdout.contains(&format!("\n{line}\n")), "{line}\n{stdout}");
+        }
+        assert_eq!(pair(proj.path()), pair_before, "{code}");
+
+        // The run.
+        let asked_before = requests(&server).await;
+        let (exit, env) = scan_json(proj.path(), &api, &known);
+        assert_eq!(exit, 0, "{code}: {env}");
+        assert_eq!(env["status"], "success", "{env}");
+        assert_eq!(pair(proj.path()), pair_now, "{code}");
+        assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+        assert_eq!(hosted_events(&env), case.events("applied"), "{code}: {env}");
+        let summary = &env["summary"];
+        assert_eq!(
+            (&summary["applied"], &summary["skipped"], &summary["failed"]),
+            (&json!(1), &json!(1), &json!(0)),
+            "{code}: {env}"
+        );
+        assert_eq!(
+            env["redirect"]["rewrittenFiles"],
+            json!(["Gemfile", "Gemfile.lock"])
+        );
+        let (references, other) = requests(&server).await;
+        assert_eq!(
+            other[asked_before.1.len()..],
+            [earlier_snapshot_path(3)],
+            "{code}: one request to the registry the lock is on"
+        );
+        assert_eq!(
+            references[asked_before.0.len()..],
+            [vec![EARLIER_UUID.to_string()], vec![UUID.to_string()]],
+            "{code}: the scan's check of the pin, and the patch on offer: no further request"
+        );
+
+        // A second run: the registry lists what the lock pins, so the
+        // lock is as it is, and the earlier patch's builds are no news.
+        let asked_before = requests(&server).await;
+        let (exit, env) = scan_json(proj.path(), &api, &known);
+        assert_eq!(exit, 0, "{code}: {env}");
+        assert_eq!(pair(proj.path()), pair_now, "{code}");
+        assert_eq!(env["redirect"]["rewrittenFiles"], json!([]), "{env}");
+        assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+        assert_eq!(
+            hosted_events(&env),
+            [offer_skip(case.skip.0, &case.skip.1)],
+            "{code}: {env}"
+        );
+        let (references, other) = requests(&server).await;
+        assert_eq!(
+            other[asked_before.1.len()..],
+            [earlier_snapshot_path(EARLIER_NOW)],
+            "{code}"
+        );
+        assert_eq!(
+            references[asked_before.0.len()..],
+            [vec![EARLIER_UUID.to_string()], vec![UUID.to_string()]],
+            "{code}"
+        );
+
+        // For a person: the two lines on stdout, and nothing that warns.
+        let proj = project_on_earlier(&api, true);
+        let (exit, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &known);
+        assert_eq!(exit, 0, "{stdout}\n{stderr}");
+        for line in [case.line(false), case.skip.1.clone()] {
+            assert!(stdout.contains(&format!("\n{line}\n")), "{line}\n{stdout}");
+        }
+        assert!(
+            !stderr.contains("Warning")
+                && !stderr.contains("No patches could be switched")
+                && !stderr.contains("Not hosted"),
+            "{code}: {stderr}"
+        );
+        assert_eq!(pair(proj.path()), pair_now, "{code}");
+    }
+}
+
+/// `get` of the patch on offer, and a `scan` that does not know the
+/// lock's patch server as one, hold no answer for the earlier patch: they
+/// ask for its reference, once, after the registry showed the withdrawal,
+/// and bring the lock to it as above. Without a withdrawal nothing is
+/// asked of the patch service beyond the patch on offer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_that_holds_no_answer_asks_for_the_reference_of_the_patch_the_lock_stays_on() {
+    for case in [Stays::held(), Stays::unlisted()] {
+        let code = case.skip.0;
+        let server = MockServer::start().await;
+        case.mount(&server, EarlierNow::Lists(case.earlier_now()))
+            .await;
+        let api = server.uri();
+        let now = format!("{}/", registry_url(&api, EARLIER_UUID, Some(EARLIER_NOW)));
+        let (arm, linux) = case.pins_now();
+        let known = ["--patch-server-url", api.as_str()];
+        let asks = [vec![UUID.to_string()], vec![EARLIER_UUID.to_string()]];
+
+        // `get`.
+        let proj = project_on_earlier(&api, true);
+        let (exit, stdout, stderr) = hosted(
+            proj.path(),
+            &api,
+            &["get", UUID],
+            &["--json", known[0], known[1]],
+        );
+        let env: Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("not JSON ({e}):\n{stdout}\nstderr:\n{stderr}"));
+        assert_eq!(exit, 0, "{code}: {env}\n{stderr}");
+        assert_eq!(
+            read(proj.path(), "Gemfile.lock"),
+            hosted_lock(&now, arm, linux)
+        );
+        assert_eq!(read(proj.path(), "Gemfile"), hosted_gemfile(&now));
+        assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+        assert_eq!(hosted_events(&env), case.events("applied"), "{code}: {env}");
+        let (references, other) = requests(&server).await;
+        assert_eq!(
+            references, asks,
+            "{code}: one request for the earlier patch"
+        );
+        assert_eq!(other, [earlier_snapshot_path(3)], "{code}");
+        // A second `get` asks for the patch on offer alone.
+        let (exit, _, stderr) = hosted(
+            proj.path(),
+            &api,
+            &["get", UUID],
+            &["--json", known[0], known[1]],
+        );
+        assert_eq!(exit, 0, "{stderr}");
+        assert_eq!(
+            read(proj.path(), "Gemfile.lock"),
+            hosted_lock(&now, arm, linux)
+        );
+        let (references, _) = requests(&server).await;
+        assert_eq!(references[asks.len()..], [vec![UUID.to_string()]], "{code}");
+
+        // A `scan` that was not told of the patch server (it takes the
+        // origin from the reference of the patch on offer).
+        let server = MockServer::start().await;
+        case.mount(&server, EarlierNow::Lists(case.earlier_now()))
+            .await;
+        let api = server.uri();
+        let now = format!("{}/", registry_url(&api, EARLIER_UUID, Some(EARLIER_NOW)));
+        let proj = project_on_earlier(&api, true);
+        let (exit, env) = scan_json(proj.path(), &api, &[]);
+        assert_eq!(exit, 0, "{code}: {env}");
+        assert_eq!(
+            read(proj.path(), "Gemfile.lock"),
+            hosted_lock(&now, arm, linux)
+        );
+        assert_eq!(hosted_events(&env), case.events("applied"), "{code}: {env}");
+        let (references, other) = requests(&server).await;
+        assert_eq!(references, asks, "{code}");
+        assert_eq!(other, [earlier_snapshot_path(3)], "{code}");
+
+        // No withdrawal: the registry lists both builds as the lock pins
+        // them. The lock stays byte for byte, and nothing is asked about
+        // the earlier patch.
+        let server = MockServer::start().await;
+        mount_api_refreshing(
+            &server,
+            &case.offered,
+            EarlierNow::Lists(EARLIER_BOTH.to_vec()),
+        )
+        .await;
+        mount_earlier_snapshot(
+            &server,
+            3,
+            &[(ARM, EARLIER_ARM_PATCHED), (LINUX, EARLIER_LINUX_PATCHED)],
+        )
+        .await;
+        let api = server.uri();
+        let before = earlier_index(&api);
+        let proj = project_on_earlier(&api, true);
+        let (exit, stdout, stderr) = hosted(
+            proj.path(),
+            &api,
+            &["get", UUID],
+            &["--json", "--patch-server-url", api.as_str()],
+        );
+        let env: Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("not JSON ({e}):\n{stdout}\nstderr:\n{stderr}"));
+        assert_eq!(exit, 0, "{code}: {env}\n{stderr}");
+        assert_eq!(
+            read(proj.path(), "Gemfile.lock"),
+            hosted_lock(&before, EARLIER_ARM_PATCHED, EARLIER_LINUX_PATCHED)
+        );
+        let skip = match code {
+            "redirect_gem_newer_fix_waits" => format!(
+                "{DEP} {DEP_VERSION}: the newer fix has no patched build for {ARM}, {LINUX} yet; \
+                 the lock stays on the patch it is on"
+            ),
+            _ => case.skip.1.clone(),
+        };
+        assert_eq!(
+            hosted_events(&env),
+            [offer_skip(code, &skip)],
+            "{code}: {env}"
+        );
+        let (references, other) = requests(&server).await;
+        assert_eq!(references, [vec![UUID.to_string()]], "{code}");
+        assert_eq!(
+            other,
+            [earlier_snapshot_path(3)],
+            "{code}: the one document"
+        );
+    }
+}
+
+/// The reference of the patch the lock stays on is followed only when it
+/// is usable. A patch that is not granted or still being built, an answer
+/// that is missing, lists no builds, leaves a locked platform out or is
+/// of another package, and a request that fails: the lock stays byte for
+/// byte, the patch on offer is skipped quietly as before, and the run
+/// says nothing more (no warning, no further event, exit 0).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unusable_reference_leaves_the_lock_that_stays_as_it_is() {
+    let case = Stays::held();
+    let unusable = [
+        (EarlierNow::Status("forbidden"), "not granted"),
+        (EarlierNow::Status("pending_build"), "still being built"),
+        (EarlierNow::Status("withdrawn"), "withdrawn"),
+        (EarlierNow::Absent, "no answer"),
+        (EarlierNow::NoList, "no list"),
+        (
+            EarlierNow::Lists(vec![(
+                LINUX,
+                EARLIER_LINUX_PATCHED,
+                Some(EARLIER_LINUX_UUID),
+            )]),
+            "a list that leaves a locked platform out",
+        ),
+        (EarlierNow::OtherPackage, "another package"),
+        (EarlierNow::Fails, "a request that fails"),
+    ];
+    for (earlier, why) in unusable {
+        let server = MockServer::start().await;
+        case.mount(&server, earlier).await;
+        let api = server.uri();
+        let before = earlier_index(&api);
+        let proj = project_on_earlier(&api, true);
+        let (exit, stdout, stderr) = hosted(
+            proj.path(),
+            &api,
+            &["get", UUID],
+            &["--json", "--patch-server-url", api.as_str()],
+        );
+        let env: Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("not JSON ({e}):\n{stdout}\nstderr:\n{stderr}"));
+        assert_eq!(exit, 0, "{why}: {env}\n{stderr}");
+        assert_eq!(env["status"], "success", "{why}: {env}");
+        assert_eq!(
+            read(proj.path(), "Gemfile.lock"),
+            hosted_lock(&before, EARLIER_ARM_PATCHED, EARLIER_LINUX_PATCHED),
+            "{why}"
+        );
+        assert_eq!(
+            read(proj.path(), "Gemfile"),
+            hosted_gemfile(&before),
+            "{why}"
+        );
+        assert_eq!(warning_codes(&env), Vec::<String>::new(), "{why}: {env}");
+        assert_eq!(
+            hosted_events(&env),
+            [offer_skip(case.skip.0, &case.skip.1)],
+            "{why}: {env}"
+        );
+        assert_eq!(env["redirect"]["rewrittenFiles"], json!([]), "{why}");
+        let (references, other) = requests(&server).await;
+        assert_eq!(
+            references,
+            [vec![UUID.to_string()], vec![EARLIER_UUID.to_string()]],
+            "{why}: asked once"
+        );
+        assert_eq!(other, [earlier_snapshot_path(3)], "{why}");
+    }
+}
+
+/// A `scan` checks every pin before it rewrites. Where the earlier patch
+/// as a whole was withdrawn, that check restores the gem to its upstream
+/// registry first (each build back on the sha256 that registry lists),
+/// and the patch on offer is then judged against a lock that is on no
+/// patch: here it has no patched build for a locked platform, so the gem
+/// is left on its upstream registry. Nothing is asked about the withdrawn
+/// patch beyond that check.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scan_restores_a_wholly_withdrawn_earlier_patch_before_the_patch_on_offer_is_judged() {
+    let case = Stays::held();
+    let server = MockServer::start().await;
+    case.mount(&server, EarlierNow::Status("withdrawn")).await;
+    // The upstream registry, as the restore reads it.
+    Mock::given(method("GET"))
+        .and(path(format!("/upstream/info/{DEP}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "---\n{DEP_VERSION}-{ARM} racc:~> 1.4|checksum:{ARM_UPSTREAM}\n{DEP_VERSION}-{LINUX} \
+             racc:~> 1.4|checksum:{LINUX_UPSTREAM}\n"
+        )))
+        .mount(&server)
+        .await;
+    let api = server.uri();
+    let upstream = format!("{api}/upstream");
+    let proj = project_on_earlier(&api, true);
+    let args = [
+        "scan",
+        "--mode",
+        "hosted",
+        "--yes",
+        "--json",
+        "--cwd",
+        proj.path().to_str().expect("utf8 temp path"),
+        "--api-url",
+        api.as_str(),
+        "--org",
+        ORG,
+        "--api-token",
+        API_TOKEN,
+        "--patch-server-url",
+        api.as_str(),
+    ];
+    let env = [("SOCKET_RUBYGEMS_URL", upstream.as_str())];
+    let (exit, stdout, stderr) = common::run_with_env(proj.path(), &args, &env);
+    let env: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not JSON ({e}):\n{stdout}\nstderr:\n{stderr}"));
+    assert_eq!(exit, 0, "{env}\n{stderr}");
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(
+        (
+            read(proj.path(), "Gemfile.lock"),
+            read(proj.path(), "Gemfile")
+        ),
+        (lock(true), GEMFILE.to_string()),
+        "the pair is back on its upstream registry: {env}"
+    );
+    let events: Vec<(String, String, String)> = env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|event| {
+            let text = |key: &str| event[key].as_str().unwrap_or_default().to_string();
+            (text("action"), text("uuid"), text("errorCode"))
+        })
+        .collect();
+    assert_eq!(
+        events,
+        [
+            (
+                "rolledBack".to_string(),
+                EARLIER_UUID.to_string(),
+                "patch_withdrawn".to_string()
+            ),
+            (
+                "skipped".to_string(),
+                UUID.to_string(),
+                "redirect_gem_no_patched_build".to_string()
+            ),
+        ],
+        "{env}"
+    );
+    let (references, other) = requests(&server).await;
+    assert_eq!(
+        references,
+        [vec![EARLIER_UUID.to_string()], vec![UUID.to_string()]],
+        "the check of the pin and the patch on offer"
+    );
+    assert_eq!(
+        other,
+        [format!("/upstream/info/{DEP}")],
+        "the upstream registry, and no patch registry"
+    );
+}
+
+/// The run's own VEX and a later `vex` over the lock a refresh left agree
+/// with it: the build the earlier patch still serves is attested under
+/// its own patch, and the withdrawn one is stated as affected.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_vex_of_a_lock_brought_to_its_patchs_current_listing_tells_the_builds_apart() {
+    let case = Stays::held();
+    let server = MockServer::start().await;
+    case.mount(&server, EarlierNow::Lists(case.earlier_now()))
+        .await;
+    let api = server.uri();
+    let now = format!("{}/", registry_url(&api, EARLIER_UUID, Some(EARLIER_NOW)));
+    let (arm, linux) = case.pins_now();
+    let statements = || {
+        let mut affected = upstream_statement(ARM);
+        affected.words = affected.words.replace(UUID, EARLIER_UUID);
+        [
+            patched_statement(&[(LINUX, EARLIER_LINUX_UUID)], false),
+            affected,
+        ]
+    };
+    let proj = project_on_earlier(&api, true);
+    let (exit, env, doc) = scan_vex(proj.path(), &api);
+    assert_eq!(exit, 0, "{env}");
+    assert_eq!(env["status"], "success", "{env}");
+    assert_eq!(
+        read(proj.path(), "Gemfile.lock"),
+        hosted_lock(&now, arm, linux)
+    );
+    assert_eq!(said(&doc.expect("a document")), statements(), "{env}");
+    assert_eq!(
+        (&env["vex"]["statements"], &env["vex"]["affected"]),
+        (&json!(2), &json!(1)),
+        "{env}"
+    );
+    let out = vex(proj.path(), &api);
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_eq!(said(out.doc()), statements(), "{out}");
+    assert_eq!(out.envelope["status"], "success", "{out}");
+}
+
+/// On a terminal the two lines of such a run stand one under the other at
+/// 80, 100 and 120 columns, each broken after a clause where it does not
+/// fit.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_lines_of_a_lock_that_stays_and_is_refreshed_fit_a_terminal() {
+    for case in [Stays::held(), Stays::unlisted()] {
+        let server = MockServer::start().await;
+        case.mount(&server, EarlierNow::Lists(case.earlier_now()))
+            .await;
+        let api = server.uri();
+        for cols in [80u16, 100, 120] {
+            let proj = project_on_earlier(&api, true);
+            let cwd = proj.path().to_path_buf();
+            let api = api.clone();
+            let run = tokio::task::spawn_blocking(move || {
+                let dir = cwd.to_str().expect("utf8 temp path");
+                let args = [
+                    "scan",
+                    "--mode",
+                    "hosted",
+                    "--yes",
+                    "--cwd",
+                    dir,
+                    "--api-url",
+                    api.as_str(),
+                    "--org",
+                    ORG,
+                    "--api-token",
+                    API_TOKEN,
+                    "--patch-server-url",
+                    api.as_str(),
+                ];
+                pty_io::run_command_at(
+                    cols,
+                    common::hermetic::pty_binary_command(),
+                    &args,
+                    &cwd,
+                    &[],
+                    &[],
+                    std::time::Duration::from_secs(60),
+                )
+            })
+            .await
+            .expect("spawn_blocking join");
+            let screen = pty_io::render(run.output.as_bytes());
+            let shown = screen.join("\n");
+            println!("--- {} at {cols} columns\n{shown}", case.skip.0);
+            assert_eq!(run.code, 0, "{shown}");
+            let at = screen
+                .iter()
+                .position(|row| row.starts_with(&format!("{DEP} {DEP_VERSION}: patched for ")))
+                .unwrap_or_else(|| panic!("no line of the gem:\n{shown}"));
+            // The rows of the two lines: each row after a line's first
+            // hangs under two spaces, up to the next line of the output.
+            let rows: Vec<&String> = screen[at..]
+                .iter()
+                .take_while(|row| row.starts_with(DEP) || row.starts_with("  "))
+                .take_while(|row| !row.starts_with("  1. "))
+                .collect();
+            let mut lines: Vec<String> = Vec::new();
+            for row in &rows {
+                match (row.strip_prefix("  "), lines.last_mut()) {
+                    (Some(rest), Some(line)) => {
+                        line.push(' ');
+                        line.push_str(rest);
+                    }
+                    _ => lines.push(row.to_string()),
+                }
+            }
+            assert_eq!(
+                lines,
+                [case.line(false), case.skip.1.clone()],
+                "{cols} columns:\n{shown}"
+            );
+            assert!(
+                rows.iter()
+                    .all(|row| row.chars().count() <= usize::from(cols)),
+                "wider than {cols} columns:\n{shown}"
+            );
+            // A line that does not fit breaks after a clause where one
+            // fits the terminal.
+            let first_clause = |line: &str| line.split_once("; ").map(|(first, _)| first.len() + 1);
+            for line in [case.line(false), case.skip.1.clone()] {
+                let whole = line.chars().count() <= usize::from(cols);
+                let clause = first_clause(&line).filter(|len| *len <= usize::from(cols));
+                if let (false, Some(len)) = (whole, clause) {
+                    assert!(
+                        rows.iter().any(|row| **row == line[..len]),
+                        "{cols} columns: {line}\n{shown}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 // ── A lock with no `CHECKSUMS` that follows a newer snapshot ──────────

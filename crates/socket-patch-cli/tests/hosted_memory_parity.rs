@@ -472,6 +472,171 @@ async fn parity_gemfile_platform_withdrawn_on_an_earlier_patch() {
     assert_eq!(asked.count(), 2, "one request an engine");
 }
 
+/// A lock of platform builds stays on an earlier patch of the gem: the
+/// patch on offer serves upstream's gem for `arm64-darwin`, which the
+/// earlier patch still serves patched. The earlier patch withdrew its
+/// `x86_64-linux-gnu` build, so its registry no longer lists it. Both
+/// engines ask that registry once, ask the patch service for the earlier
+/// patch's reference once, bring the lock to that patch's current
+/// snapshot with upstream's sha256 back for the withdrawn build, and
+/// report the same rows: the patch on offer skipped, one build in place
+/// under its own patch, one back on upstream's gem.
+#[tokio::test]
+async fn parity_gemfile_platform_lock_that_stays_follows_its_own_patch() {
+    use socket_patch_cli::hosted_memory::UpstreamBuild;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    const TOKEN: &str = "11111111-1111-1111-1111-111111111111";
+    const FIX: &str = "77777777-7777-7777-7777-777777777777";
+    const EARLIER: &str = "66666666-6666-4666-8666-666666666666";
+    const EARLIER_ARM: &str = "66666666-6666-4666-8666-00000000000a";
+    let dir = fixtures_root().join("redirect/gem/bundler/platform-pass-through");
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
+    mount_api(&server, &patches).await;
+    // The pair as a run left it on the earlier patch, which had a patched
+    // build for both platforms.
+    let (arm, linux, linux_upstream) = ("a".repeat(64), "c".repeat(64), "4".repeat(64));
+    let mut files = fixture_files(&dir.join("expected"));
+    for bytes in files.values_mut() {
+        let text = String::from_utf8(bytes.clone()).expect("a text fixture");
+        let text = text
+            .replace("https://patch.socket.dev", &server.uri())
+            .replace(&format!("{FIX}/s/4/"), &format!("{EARLIER}/s/1a/"))
+            .replace(&"3".repeat(64), &arm)
+            .replace(&"b".repeat(64), &linux);
+        *bytes = text.into_bytes();
+    }
+    // The earlier patch's registry as the lock names it lists the ruby
+    // gem and arm64-darwin, and no linux build.
+    let registry = format!("/patch-registry/gem/{TOKEN}/{EARLIER}");
+    let index = format!("{registry}/s/1a/info/nokogiri");
+    Mock::given(method("GET"))
+        .and(path(index.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "---\n1.18.10 racc:~> 1.4|checksum:{}\n1.18.10-arm64-darwin racc:~> \
+             1.4|checksum:{arm}\n",
+            "deadbeef".repeat(8)
+        )))
+        .mount(&server)
+        .await;
+    // The patch service answers a reference request with what it was asked
+    // for: the patch on offer, and the earlier patch as it stands.
+    let on_offer = patches[0].reference.clone();
+    let earlier_now = serde_json::json!({
+        "status": "granted",
+        "url": format!("{}{registry}/gems/nokogiri-1.18.10.gem", server.uri()),
+        "purl": "pkg:gem/nokogiri@1.18.10",
+        "artifacts": [{"kind": "tarball", "url": null, "integrity": {
+            "sha256": "deadbeef".repeat(8)
+        }}],
+        "registryOverride": {
+            "kind": "rubygems-compact-index",
+            "indexUrl": format!("{}{registry}/s/2b", server.uri()),
+            "identifiers": {
+                "name": "nokogiri", "version": "1.18.10",
+                "gemChecksumSha256": "deadbeef".repeat(8),
+                "gemBuilds": [
+                    {"platform": "arm64-darwin", "gemChecksumSha256": arm,
+                     "patchUuid": EARLIER_ARM},
+                    {"platform": "x86_64-linux-gnu", "gemChecksumSha256": linux_upstream,
+                     "patchUuid": null},
+                ],
+            },
+        },
+    });
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(move |request: &wiremock::Request| {
+            let asked: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+            let mut results = serde_json::Map::new();
+            for uuid in asked["uuids"].as_array().into_iter().flatten() {
+                match uuid.as_str() {
+                    Some(FIX) => results.insert(FIX.to_string(), on_offer.clone()),
+                    Some(EARLIER) => results.insert(EARLIER.to_string(), earlier_now.clone()),
+                    _ => None,
+                };
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": results }))
+        })
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let name = "a lock that stays follows its own patch";
+    let (redirect, project) = assert_parity_over(name, &server, &files, false, true).await;
+    assert_eq!(redirect["redirected"], 1, "{redirect:#}");
+    assert_eq!(redirect["warnings"], serde_json::json!([]), "{redirect:#}");
+    assert_eq!(
+        redirect["rewrittenFiles"],
+        serde_json::json!(["Gemfile", "Gemfile.lock"])
+    );
+    let waits = "nokogiri 1.18.10: the newer fix has no patched build for arm64-darwin yet; the \
+                 lock stays on the patch it is on";
+    assert_eq!(
+        redirect["patches"],
+        serde_json::json!([
+            {
+                "purl": "pkg:gem/nokogiri@1.18.10",
+                "uuid": FIX,
+                "action": "skipped",
+                "errorCode": "redirect_gem_newer_fix_waits",
+                "error": waits,
+            },
+            {
+                "purl": "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin",
+                "uuid": EARLIER_ARM,
+                "action": "pinned",
+                "gemFix": EARLIER,
+                "platform": "arm64-darwin",
+            },
+            {
+                "purl": "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu",
+                "action": "upstream_kept",
+                "errorCode": "gem_upstream_build_kept",
+                "error": "the patch registry serves upstream's own gem for x86_64-linux-gnu: \
+                          its patched build was withdrawn",
+                "gemFix": EARLIER,
+                "platform": "x86_64-linux-gnu",
+                "withdrawn": true,
+            },
+        ]),
+        "{redirect:#}"
+    );
+    assert_eq!(
+        project.upstream_builds,
+        [UpstreamBuild {
+            purl: "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu".into(),
+            gem_fix: EARLIER.into(),
+            platform: "x86_64-linux-gnu".into(),
+            withdrawn: true,
+        }]
+    );
+    let [skip] = project.skipped.as_slice() else {
+        panic!("one skip: {:?}", project.skipped);
+    };
+    assert_eq!(
+        (skip.uuid.as_str(), skip.reason.as_str()),
+        (FIX, "redirect_gem_newer_fix_waits")
+    );
+    let asked = server.received_requests().await.unwrap_or_default();
+    let indexes = asked.iter().filter(|request| request.url.path() == index);
+    assert_eq!(indexes.count(), 2, "one registry request an engine");
+    let references: Vec<Value> = asked
+        .iter()
+        .filter(|request| request.url.path().ends_with("/patches/package"))
+        .map(|request| {
+            serde_json::from_slice::<Value>(&request.body).unwrap_or_default()["uuids"].clone()
+        })
+        .collect();
+    let per_engine = [serde_json::json!([FIX]), serde_json::json!([EARLIER])];
+    assert_eq!(
+        references,
+        [&per_engine[..], &per_engine[..]].concat(),
+        "each engine asks for the patch on offer, then once for the patch the lock is on"
+    );
+}
+
 /// A lock with no `CHECKSUMS` on the patch's own registry, under an
 /// earlier snapshot in which `x86_64-linux-gnu` was upstream's gem. Both
 /// engines ask that snapshot what it lists, once each, move the lock to

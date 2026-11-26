@@ -10275,6 +10275,261 @@ async fn gem_hosted_withdrawn_build_of_an_earlier_patch_moves_to_the_newer_patch
     p.assert_installed(&p.fx.proj, false);
 }
 
+/// A lock that STAYS on the patch it is on, while that patch has withdrawn
+/// this machine's build, against the REAL bundler, on a `CHECKSUMS` lock:
+///
+///   1. the scan moves the lock to a patch with a patched build for both
+///      locked platforms and replaces the copy bundler had installed;
+///      `bundle install` agrees, and Ruby loads the PATCHED code;
+///   2. the build of this machine's platform is withdrawn: the registry,
+///      under the snapshot the lock names, no longer lists it and refuses
+///      its file. A checkout of the unchanged pair cannot be installed on
+///      this machine any more;
+///   3. a newer patch is on offer that the lock cannot move to: it has no
+///      patched build for the other platform, which the lock's patch still
+///      serves (`redirect_gem_newer_fix_waits`), or does not list that
+///      platform (`redirect_gem_platform_unlisted`). The lock stays on its
+///      patch, and the scan brings it to that patch's current listing: it
+///      asks the registry the lock is on, once, takes the reference of the
+///      lock's patch that its check of the pin already holds, writes that
+///      patch's current snapshot with upstream's sha256 for this platform
+///      and the other platform's patched sha256 unchanged, says both in
+///      two lines and in its events, and replaces the installed copy with
+///      upstream's gem from that snapshot;
+///   4. `bundle lock` leaves that lock alone; a fresh checkout installs
+///      upstream's gem, frozen and not; `bundle install` in the project
+///      keeps the copy, and `bundle exec ruby` loads UPSTREAM's code;
+///   5. a further scan changes nothing and downloads nothing.
+async fn lock_that_stays_is_brought_to_its_patchs_current_listing(
+    tag: &str,
+    other_on_offer: Has,
+    code: &str,
+) {
+    let Some(mut p) = PlatformProject::start(tag, (2, 6), true, false, &[]).await else {
+        return;
+    };
+    let (own, foreign) = (p.own.clone(), p.foreign.clone());
+    let warm_lib = p.installed_lib(&p.fx.proj);
+    let api = p.api();
+    let known = ["--patch-server-url", api.as_str()];
+    let stays = match other_on_offer {
+        Has::Building => format!(
+            "{DEP} {DEP_VERSION}: the newer fix's registry does not list {foreign}; the lock \
+             stays on the patch it is on"
+        ),
+        _ => format!(
+            "{DEP} {DEP_VERSION}: the newer fix has no patched build for {foreign} yet; the lock \
+             stays on the patch it is on"
+        ),
+    };
+    let skip_event = serde_json::json!({
+        "action": "skipped", "purl": PURL, "uuid": NEWER_UUID,
+        "errorCode": code, "reason": stays,
+        "details": { "mode": "hosted" },
+    });
+
+    // 1. Both platforms patched: this machine holds the patched build.
+    let every = [
+        (own.as_str(), Has::Patched),
+        (foreign.as_str(), Has::Patched),
+    ];
+    let first = p.serve(Some(&every)).await;
+    let env = p.scan(&known);
+    assert_eq!(
+        warning_codes(&env),
+        ["redirect_gem_install_refreshed"],
+        "{env}"
+    );
+    let first_lock = p.assert_hosted_pair(&first, &[(&own, true), (&foreign, true)]);
+    bundle_ok(&p.fx.proj, &["install"]);
+    assert_eq!(p.lock(), first_lock);
+    p.assert_installed(&p.fx.proj, true);
+    // The pair as it is committed, with nothing installed.
+    let committed = stage_fresh_checkout(&p.fx, "committed");
+
+    // 2. The build of this machine's platform is withdrawn.
+    p.withdraw(&first, &own).await;
+    p.assert_no_longer_installs(&first_lock);
+
+    // 3. The lock's patch lists upstream's gem for this platform now, and
+    //    the newer patch on offer is one the lock cannot move to.
+    let after = [
+        (own.as_str(), Has::Upstream),
+        (foreign.as_str(), Has::Patched),
+    ];
+    let second = p.serve(Some(&after)).await;
+    assert_ne!(first, second, "a withdrawal is a newer snapshot");
+    let on_offer = [
+        (own.as_str(), Has::Upstream),
+        (foreign.as_str(), other_on_offer),
+    ];
+    let newer = p.offer_newer(&on_offer).await;
+    assert!(newer.contains(NEWER_UUID), "{newer}");
+    let refreshing = p.mark().await;
+    let env = p.scan(&known);
+    assert_eq!(env["status"], "success", "{env}");
+    assert_eq!(
+        hosted_events(&env),
+        by_platform(vec![
+            skip_event.clone(),
+            withdrawn_event(&own),
+            patched_event(&foreign, false)
+        ]),
+        "{env}"
+    );
+    let summary = &env["summary"];
+    assert_eq!(
+        (&summary["applied"], &summary["skipped"], &summary["failed"]),
+        (
+            &serde_json::json!(1),
+            &serde_json::json!(1),
+            &serde_json::json!(0)
+        ),
+        "{env}"
+    );
+    assert_eq!(
+        env["redirect"]["rewrittenFiles"],
+        serde_json::json!(["Gemfile", "Gemfile.lock"])
+    );
+    let lock = p.assert_hosted_pair(&second, &[(&own, false), (&foreign, true)]);
+    let pin = |patched: bool| {
+        let token = build_token(Some(&own));
+        let sha = p.service.sha(Some(&own), patched);
+        format!("  {DEP} ({token}) sha256={sha}\n")
+    };
+    assert_eq!(
+        lock,
+        first_lock
+            .replace(&first, &second)
+            .replace(&pin(true), &pin(false)),
+        "the URL and the one checksum that changed"
+    );
+    assert!(
+        !lock.contains(NEWER_UUID),
+        "nothing of the patch on offer:\n{lock}"
+    );
+    // The guard replaced the copy of the withdrawn build.
+    assert_eq!(
+        warning_codes(&env),
+        ["redirect_gem_install_refreshed"],
+        "{env}"
+    );
+    let gem_dir = warm_lib.parent().and_then(Path::parent).unwrap();
+    assert_eq!(
+        env["warnings"][0]["detail"],
+        format!(
+            "{PURL}: replaced the withdrawn install at {} with the upstream gem",
+            gem_dir.display()
+        ),
+        "{env}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&warm_lib).unwrap(),
+        p.service.orig,
+        "the installed copy is upstream's gem"
+    );
+    let (fetched, redirected) = p.fetched_since(refreshing).await;
+    assert_eq!(
+        fetched,
+        [format!("{}gems/{}.gem", &second[api.len()..], p.own_leaf())],
+        "upstream's gem comes from the lock's patch under its current snapshot, once"
+    );
+    assert_eq!(redirected, Vec::<String>::new(), "which relays it");
+    assert_eq!(
+        p.indexes_since(refreshing).await,
+        [format!("{}info/{DEP}", &first[api.len()..])],
+        "the registry the lock is on is asked once, and no other"
+    );
+    assert_eq!(
+        p.references_since(refreshing).await,
+        [vec![UUID.to_string()], vec![NEWER_UUID.to_string()]],
+        "the check of the pin and the patch on offer: no further reference request"
+    );
+    assert_eq!(
+        p.views_since(refreshing).await,
+        Vec::<String>::new(),
+        "no patch record is fetched"
+    );
+    // For a person, over the pair as it was committed: the two lines.
+    let (exit, stdout, stderr) = p.hosted(&committed, &["scan"], &known);
+    assert_eq!(exit, 0, "{stdout}\n{stderr}");
+    let back = format!(
+        "{DEP} {DEP_VERSION}: patched for {foreign}; upstream gem back for {own} (its patched \
+         build was withdrawn)"
+    );
+    for line in [&back, &stays] {
+        assert!(stdout.contains(&format!("\n{line}\n")), "{line}\n{stdout}");
+    }
+    assert!(!stderr.contains("Warning"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(committed.join("Gemfile.lock")).unwrap(),
+        lock
+    );
+
+    // 4. Bundler agrees with the lock and installs upstream's gem.
+    bundle_ok(&p.fx.proj, &["lock"]);
+    assert_eq!(
+        p.lock(),
+        lock,
+        "`bundle lock` leaves the lock byte-identical"
+    );
+    let fresh = p.install_fresh("fresh", &[("BUNDLE_FROZEN", "true")]);
+    p.assert_installed(&fresh, false);
+    let unfrozen = p.install_fresh("unfrozen", &[]);
+    p.assert_installed(&unfrozen, false);
+    bundle_ok(&p.fx.proj, &["install"]);
+    assert_eq!(p.lock(), lock, "`bundle install` leaves the lock alone");
+    p.assert_installed(&p.fx.proj, false);
+
+    // 5. A further scan changes nothing.
+    let again = p.mark().await;
+    let env = p.scan(&known);
+    assert_eq!(
+        p.lock(),
+        lock,
+        "a further scan leaves the lock byte-identical"
+    );
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(env["redirect"]["rewrittenFiles"], serde_json::json!([]));
+    assert_eq!(hosted_events(&env), [skip_event], "{env}");
+    let (fetched, redirected) = p.fetched_since(again).await;
+    assert_eq!(
+        (fetched, redirected),
+        (Vec::new(), Vec::new()),
+        "nothing is downloaded"
+    );
+    assert_eq!(
+        p.indexes_since(again).await,
+        [format!("{}info/{DEP}", &second[api.len()..])],
+        "the registry the lock is on, at the snapshot it names"
+    );
+    p.assert_installed(&p.fx.proj, false);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6 for the CHECKSUMS lock); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_lock_held_by_another_build_follows_its_patch_past_a_withdrawn_build() {
+    lock_that_stays_is_brought_to_its_patchs_current_listing(
+        "platform-withdrawn-held",
+        Has::Upstream,
+        "redirect_gem_newer_fix_waits",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6 for the CHECKSUMS lock); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_lock_left_by_an_unlisted_platform_follows_its_patch_past_a_withdrawn_build() {
+    lock_that_stays_is_brought_to_its_patchs_current_listing(
+        "platform-withdrawn-unlisted",
+        Has::Building,
+        "redirect_gem_platform_unlisted",
+    )
+    .await;
+}
+
 /// The stale-install refresh downloads `gems/<file>` from the patch
 /// registry, which may answer a file with a redirect (it does for every
 /// platform it has no patched build of). The download follows it: here

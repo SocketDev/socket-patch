@@ -14,11 +14,21 @@
 //! ([`engine::gem_index_targets`]), handed to the gem rewriter
 //! ([`engine::record_gem_index`]). A document that cannot be read leaves
 //! the gem on the patch it is on.
+//!
+//! The same document serves two more ends. A lock that leaves one snapshot
+//! of a patch's registry for another, with no `CHECKSUMS` entry to say
+//! what a build was, is told by the snapshot it names which builds the
+//! move patches. And a lock that stays on a patch whose registry no longer
+//! serves a build the lock pins is brought to that patch's current
+//! snapshot: the patch service is asked for that patch's reference
+//! ([`read_gem_refreshes`]), which lists upstream's gem for the withdrawn
+//! build.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::engine::{self, Candidate, CandidateFiles, MirrorSources};
 use crate::api::client::PatchApi;
+use crate::api::types::PackageVendorResult;
 
 /// Bound on one document. A gem version's line is a few hundred bytes and
 /// a patch registry lists the gems of one version: anything near this is
@@ -80,9 +90,45 @@ pub async fn read_gem_indexes(
     engine::record_gem_index(read, &documents);
 }
 
+/// The candidates that bring the locks of `read` which stay on a patch to
+/// what that patch serves today ([`engine::gem_refresh_targets`]), to
+/// rewrite beside `candidates`: what a host adds once the documents of
+/// [`read_gem_indexes`] are in `read`.
+///
+/// The reference of each such patch is taken from `known` (the answers the
+/// run already holds, by uuid) and else asked of the patch service, all of
+/// them in one request. That request is made only where a withdrawal was
+/// detected while a lock stays; a run that detects none asks nothing. An
+/// answer that is not usable, and a request that fails, add no candidate
+/// ([`engine::gem_refresh_candidates`]): the lock stays as it is.
+pub async fn read_gem_refreshes(
+    client: &dyn PatchApi,
+    candidates: &[Candidate],
+    read: &CandidateFiles,
+    known: &HashMap<String, PackageVendorResult>,
+    patch_server_origins: &[String],
+) -> Vec<Candidate> {
+    let targets = engine::gem_refresh_targets(candidates, &read.files);
+    let mut references: HashMap<String, PackageVendorResult> = HashMap::new();
+    let mut unknown: Vec<String> = Vec::new();
+    for target in &targets {
+        match known.get(&target.uuid) {
+            Some(reference) => {
+                references.insert(target.uuid.clone(), reference.clone());
+            }
+            None => unknown.push(target.uuid.clone()),
+        }
+    }
+    if !unknown.is_empty() {
+        // A request that fails answers for none of them.
+        let asked = client.fetch_registry_references(&unknown).await;
+        references.extend(asked.unwrap_or_default());
+    }
+    engine::gem_refresh_candidates(&targets, &references, patch_server_origins, &read.files)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use super::*;
@@ -109,22 +155,39 @@ mod tests {
     const NEWER: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
 
     /// A patch server that answers every artifact URL with `body` (or
-    /// fails it), and records what it was asked for.
+    /// fails it) and a reference request with `references` (or fails
+    /// it), and records what it was asked for.
     struct Server {
         body: Option<Vec<u8>>,
+        references: Option<HashMap<String, PackageVendorResult>>,
         asked: Mutex<Vec<String>>,
+        asked_references: Mutex<Vec<Vec<String>>>,
     }
 
     impl Server {
         fn answering(body: Option<&[u8]>) -> Self {
             Server {
                 body: body.map(<[u8]>::to_vec),
+                references: None,
                 asked: Mutex::new(Vec::new()),
+                asked_references: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A server whose reference requests answer `references`.
+        fn granting(references: HashMap<String, PackageVendorResult>) -> Self {
+            Server {
+                references: Some(references),
+                ..Server::answering(None)
             }
         }
 
         fn asked(&self) -> Vec<String> {
             self.asked.lock().unwrap().clone()
+        }
+
+        fn asked_references(&self) -> Vec<Vec<String>> {
+            self.asked_references.lock().unwrap().clone()
         }
     }
 
@@ -143,9 +206,13 @@ mod tests {
         }
         fn fetch_registry_references<'a>(
             &'a self,
-            _: &'a [String],
+            uuids: &'a [String],
         ) -> ApiFuture<'a, HashMap<String, PackageVendorResult>> {
-            Box::pin(async { Err(ApiError::Other("unused".into())) })
+            self.asked_references.lock().unwrap().push(uuids.to_vec());
+            let references = self.references.clone();
+            Box::pin(async move {
+                references.ok_or_else(|| ApiError::Other("the patch service is down".into()))
+            })
         }
         fn download_artifact<'a>(&'a self, url: &'a str, _: u64) -> ApiFuture<'a, Vec<u8>> {
             self.asked.lock().unwrap().push(url.to_string());
@@ -296,5 +363,110 @@ mod tests {
             handed,
             BTreeMap::from([(format!("{on_mirror}info/rails"), document.to_string())])
         );
+    }
+
+    /// The reference of [`EARLIER`] as the patch service has it once its
+    /// `x86_64-linux-gnu` build was withdrawn: its registry at the
+    /// snapshot `2b`, with upstream's gem for that platform.
+    fn earlier_reference_now() -> HashMap<String, PackageVendorResult> {
+        let registry = format!("{REGISTRY}/{EARLIER}/");
+        let reference = serde_json::json!({
+            "status": "granted",
+            "url": format!("{registry}gems/rails-7.0.0.gem"),
+            "purl": "pkg:gem/rails@7.0.0",
+            "artifacts": [{"kind": "tarball", "url": null, "integrity": {
+                "sha256": "f".repeat(64)
+            }}],
+            "registryOverride": {
+                "kind": "rubygems-compact-index",
+                "indexUrl": format!("{registry}s/2b/"),
+                "identifiers": {
+                    "name": "rails", "version": "7.0.0",
+                    "gemChecksumSha256": "f".repeat(64),
+                    "gemBuilds": [
+                        {"platform": "ruby", "gemChecksumSha256": "f".repeat(64),
+                         "patchUuid": EARLIER},
+                        {"platform": "x86_64-linux-gnu", "gemChecksumSha256": "2".repeat(64),
+                         "patchUuid": null},
+                    ],
+                },
+            },
+        });
+        let reference = serde_json::from_value(reference).expect("a reference");
+        HashMap::from([(EARLIER.to_string(), reference)])
+    }
+
+    /// A lock that stays on a patch (the patch on offer does not list its
+    /// platform) while that patch's registry no longer lists the build it
+    /// pins: the reference of the patch the lock is on is asked for,
+    /// once, and its candidate comes back to rewrite beside the patch on
+    /// offer. An answer the run already holds costs no request. A request
+    /// that fails, and a lock whose registry shows no withdrawal (or was
+    /// not read), add no candidate, and the latter ask nothing.
+    #[tokio::test]
+    async fn the_reference_of_the_patch_a_lock_stays_on_is_asked_for_after_a_withdrawal() {
+        // The patch on offer lists another platform than the lock names.
+        let mut offered = candidate();
+        let ids = &mut offered.dep.registry_override.as_mut().unwrap().identifiers;
+        ids.gem_builds.as_mut().unwrap()[0].platform = "arm64-darwin".into();
+        let candidates = [offered];
+        let on_earlier = format!("{REGISTRY}/{EARLIER}/s/1a/");
+        let url = format!("{on_earlier}info/rails");
+        let read_with = |document: Option<&str>| {
+            let mut read = read_with_lock_on(&on_earlier);
+            let documents: Vec<(String, Result<String, String>)> = document
+                .map(|text| (url.clone(), Ok(text.to_string())))
+                .into_iter()
+                .collect();
+            engine::record_gem_index(&mut read, &documents);
+            read
+        };
+        // The registry lists the ruby gem, and no linux build any more.
+        let withdrawn = format!("---\n7.0.0 |checksum:{}\n", "f".repeat(64));
+        let read = read_with(Some(&withdrawn));
+        assert_eq!(
+            engine::gem_index_targets(&candidates, &read.files),
+            [url.clone()]
+        );
+        let none = HashMap::new();
+
+        let server = Server::granting(earlier_reference_now());
+        let refreshed = read_gem_refreshes(&server, &candidates, &read, &none, &[]).await;
+        assert_eq!(server.asked_references(), [[EARLIER.to_string()]]);
+        let [current] = refreshed.as_slice() else {
+            panic!("one candidate: {refreshed:?}");
+        };
+        assert_eq!(
+            (current.purl.as_str(), current.dep.patch_uuid.as_str()),
+            ("pkg:gem/rails@7.0.0", EARLIER)
+        );
+
+        // An answer the run holds already: no request.
+        let server = Server::granting(HashMap::new());
+        let known = earlier_reference_now();
+        let refreshed = read_gem_refreshes(&server, &candidates, &read, &known, &[]).await;
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(server.asked_references(), Vec::<Vec<String>>::new());
+
+        // The request fails, or answers nothing for the patch.
+        for server in [Server::answering(None), Server::granting(HashMap::new())] {
+            let refreshed = read_gem_refreshes(&server, &candidates, &read, &none, &[]).await;
+            assert!(refreshed.is_empty(), "{refreshed:?}");
+            assert_eq!(server.asked_references(), [[EARLIER.to_string()]]);
+        }
+
+        // No withdrawal shown: the registry lists the build, or was not
+        // read. Nothing is asked.
+        let served = format!(
+            "---\n7.0.0 |checksum:{}\n7.0.0-x86_64-linux-gnu |checksum:{}\n",
+            "f".repeat(64),
+            "b".repeat(64)
+        );
+        for read in [read_with(Some(&served)), read_with(None)] {
+            let server = Server::granting(earlier_reference_now());
+            let refreshed = read_gem_refreshes(&server, &candidates, &read, &none, &[]).await;
+            assert!(refreshed.is_empty(), "{refreshed:?}");
+            assert_eq!(server.asked_references(), Vec::<Vec<String>>::new());
+        }
     }
 }
