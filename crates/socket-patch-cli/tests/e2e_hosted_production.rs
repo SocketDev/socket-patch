@@ -35,7 +35,7 @@
 //! |-----------|------|------------|----------|
 //! | npm    | `pkg:npm/minimist@1.2.2`        | `642d7f02-ebc1-4ab0-99e2-07f5dd8463cb` | GHSA-xvch-5gv4-984h (CVE-2021-44906) |
 //! | PyPI   | `pkg:pypi/urllib3@1.26.18`      | *any of three* (see [`PYPI_UUIDS`])    | GHSA-gm62-xv2j-4w53 &co |
-//! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_UUIDS`] (six today; the sixth merges three advisories) | GHSA-m42x-37p3-fv5w (CVE-2020-8162), GHSA-w749-p3v6-hccq (CVE-2022-21831), GHSA-9xrj-h377-fr87 (CVE-2026-33195), GHSA-r4mg-4433-c7g3 (CVE-2025-24293), GHSA-xr9x-r78c-5hrm (CVE-2026-66066) |
+//! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_UUIDS`] (six today, one advisory each) | GHSA-m42x-37p3-fv5w (CVE-2020-8162), GHSA-w749-p3v6-hccq (CVE-2022-21831), GHSA-9xrj-h377-fr87 (CVE-2026-33195), GHSA-r4mg-4433-c7g3 (CVE-2025-24293), GHSA-xr9x-r78c-5hrm (CVE-2026-66066), GHSA-f3w6-w445-fwh9 (CVE-2026-122006) |
 //! | Maven  | `pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.7.9.2` | `8e82692a-a5bd-40ac-97a7-4f1483449fd6` | GHSA-qr7j-h6gg-jmgc (CVE-2018-11307) |
 //!
 //! `docs/testing/hosted-production-e2e.md` explains how these were chosen and
@@ -170,9 +170,6 @@ const GEM_UUIDS: &[&str] = &[
     // GHSA-m42x-37p3-fv5w / CVE-2020-8162 (s3_service.rb), from the
     // 2026-08-18 catalog republish.
     "15e960b5-f432-4b6c-b8aa-534a2b419323",
-    // GHSA-w749-p3v6-hccq / CVE-2022-21831 (image_processing_transformer.rb),
-    // published 2026-08-19T21:19Z — the second advisory.
-    "6c4141c5-1535-4fd2-9db1-b5f8e4834bdb",
     // GHSA-9xrj-h377-fr87 / CVE-2026-33195 (disk_service.rb +
     // disk_controller.rb + errors.rb), published 2026-08-20T16:14Z when
     // production extended 6.0.3 with a third advisory.
@@ -185,14 +182,19 @@ const GEM_UUIDS: &[&str] = &[
     // unfuzzed-operations hardening), published 2026-08-21T19:07Z — the fifth
     // advisory; selected until the 2026-09-04 merged patch below.
     "9c2b4925-b413-4a3a-bb3a-9990440fb446",
-    // MERGED patch — the first one production has published for any pinned
-    // purl: GHSA-w749-p3v6-hccq / CVE-2022-21831 + GHSA-r4mg-4433-c7g3 /
-    // CVE-2025-24293 + GHSA-xr9x-r78c-5hrm / CVE-2026-66066 in one artifact
-    // (image_processing_transformer.rb allowlist + unsupported-method guard,
-    // engine.rb + active_storage.rb config plumbing, NEW vips.rb libvips
-    // backport). Published 2026-09-04T21:23Z; the client-side merge rung in
-    // `api::ranking` now selects this one.
-    "01019627-b481-4bae-bc09-e93b5a5e4481",
+    // GHSA-f3w6-w445-fwh9 / CVE-2026-122006 (analyzer/image_analyzer.rb +
+    // engine.rb, NEW image_magick.rb and image_magick/policy.xml), published
+    // 2026-11-06T20:56Z. Next in the ranking after the pick below.
+    "c29ea174-efc2-443b-ab66-b6ba73c9d6ae",
+    // GHSA-w749-p3v6-hccq / CVE-2022-21831 (image_processing_transformer.rb +
+    // engine.rb + active_storage.rb), published 2026-11-26T01:43Z; the
+    // redirect wires this one now. It is a republish of the second advisory's
+    // patch: production withdrew that patch (6c4141c5-…, superseded) at the
+    // same minute, and with it the merged patch 01019627-… that contained it
+    // (three advisories in one artifact, the pick since 2026-09-04). Neither
+    // can be wired any more, so both are gone from this set; until production
+    // publishes a merged patch again the pick covers one advisory.
+    "146ef6aa-f43e-42aa-9891-0983435220e2",
 ];
 
 /// Header the patch service injects into patched npm / PyPI source files.
