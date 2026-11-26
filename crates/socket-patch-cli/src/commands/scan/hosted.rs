@@ -225,6 +225,24 @@ async fn check_mirror(
             text.contains(url) || text.contains(encoded.as_str()) || text.contains(escaped.as_str())
         })
     };
+    // A gem the Bundler lock names as its ruby-platform gem alone is pinned
+    // under its registry without the snapshot level. The registry's URL at
+    // a snapshot starts with that address, so the pin is one only where no
+    // snapshot level follows it.
+    let pinned_without_snapshot = |ov: &socket_patch_core::patch::redirect::RegistryOverride| {
+        let (root, snapshot) =
+            socket_patch_core::patch::redirect::split_gem_snapshot(&ov.index_url);
+        if ov.kind != "rubygems-compact-index" || snapshot.is_none() {
+            return false;
+        }
+        let root = root.trim_end_matches('/');
+        files.values().any(|text| {
+            text.match_indices(root).any(|(at, _)| {
+                let rest = &text[at + root.len()..];
+                !rest.strip_prefix('/').unwrap_or(rest).starts_with("s/")
+            })
+        })
+    };
     let mut asked = std::collections::BTreeSet::new();
     let new_pins: Vec<String> = candidates
         .iter()
@@ -235,7 +253,10 @@ async fn check_mirror(
                 .registry_override
                 .as_ref()
                 .map(|ov| ov.index_url.trim_end_matches('/'));
-            !already_pinned(&dep.artifact_url) && !index.is_some_and(already_pinned)
+            let keyless = dep.registry_override.as_ref();
+            !already_pinned(&dep.artifact_url)
+                && !index.is_some_and(already_pinned)
+                && !keyless.is_some_and(pinned_without_snapshot)
         })
         .filter(|dep| asked.insert(dep.artifact_url.clone()))
         .map(|dep| dep.artifact_url.clone())
@@ -1360,6 +1381,47 @@ async fn refresh_stale_gems(
     }
 }
 
+/// The compact-index documents a run has read of the registries a Bundler
+/// lock is on, by URL: the text, or why it could not be read.
+type GemIndexes = std::collections::BTreeMap<String, Result<String, String>>;
+
+/// Hand the gem rewriter what the registry a Bundler lock is on lists
+/// ([`socket_patch_core::hosted::gem_index::read_gem_indexes`]), before
+/// each rewrite of `read`.
+///
+/// A lock that takes a gem as platform builds from the registry of another
+/// patch of the gem is moved to the patch on offer only when no locked
+/// build would turn from a patched build into upstream's own gem. Where
+/// the lock has no `CHECKSUMS` entry to say what such a build is, that
+/// registry is asked: one small document per such gem, kept in `held` so
+/// it is asked for once however often the run rewrites. No other run asks
+/// anything, and a document that cannot be read leaves the gem on the
+/// patch it is on.
+///
+/// Under a patch mirror the lock names its registry on the mirror, and the
+/// document is read where the patch server serves it, as every download of
+/// the run is (`mirror_sources`).
+async fn read_gem_indexes(
+    common: &crate::args::GlobalArgs,
+    api_client: &socket_patch_core::api::client::ApiClient,
+    mirror_sources: &socket_patch_core::hosted::engine::MirrorSources,
+    candidates: &[socket_patch_core::hosted::engine::Candidate],
+    read: &mut socket_patch_core::hosted::engine::CandidateFiles,
+    held: &mut GemIndexes,
+) {
+    use socket_patch_core::hosted::{engine, gem_index};
+    // A status line only where a registry is asked.
+    let asks = engine::gem_index_targets(candidates, &read.files)
+        .iter()
+        .any(|url| !held.contains_key(url));
+    let reading = gem_index::read_gem_indexes(api_client, mirror_sources, candidates, read, held);
+    if asks {
+        crate::ui::busy(common, "Reading gem registries", reading).await;
+    } else {
+        reading.await;
+    }
+}
+
 /// Whether the hosted flow's Pipenv probe is CERTAIN to run: the candidates
 /// that no wheel-metadata failure can drop (none shares a fetched wheel's
 /// artifact URL) already target an entry of Pipfile.lock, so
@@ -2006,7 +2068,7 @@ async fn run_redirect_selected_untracked(
     // pnpm registry route (the candidate files, read whole), or the files
     // of a `.mvn/maven.config` to heal, read again now that the lock is
     // held; everything after the rewrite still runs.
-    let read = if !candidates.is_empty() || (route_cleanup && may_heal) {
+    let mut read = if !candidates.is_empty() || (route_cleanup && may_heal) {
         let mut read = crate::ui::busy(
             common,
             "Reading lockfiles",
@@ -2235,6 +2297,18 @@ async fn run_redirect_selected_untracked(
     }
     status.finish();
     candidates.retain(|c| !unavailable_python_artifacts.contains(&c.dep.artifact_url));
+    // What the registries a Bundler lock is on list, handed to every
+    // rewrite of the run and asked for once (see `read_gem_indexes`).
+    let mut gem_indexes = GemIndexes::new();
+    read_gem_indexes(
+        common,
+        api_client,
+        &mirror_sources,
+        &candidates,
+        &mut read,
+        &mut gem_indexes,
+    )
+    .await;
     // The Pipfile.lock reference shape depends on the installing Pipenv
     // (`path` for 7–11, `file` from 2018 on), so the installed release is
     // probed (`pipenv --version`, up to 10 s) — but only when a pypi patch
@@ -2407,12 +2481,21 @@ async fn run_redirect_selected_untracked(
                 &mut skipped,
             )
             .await;
-        let read = if candidates.is_empty() {
+        let mut read = if candidates.is_empty() {
             CandidateFiles::default()
         } else {
             engine::read_candidate_files(&view, &std::collections::BTreeSet::new(), &candidates)
                 .await
         };
+        read_gem_indexes(
+            common,
+            api_client,
+            &mirror_sources,
+            &candidates,
+            &mut read,
+            &mut gem_indexes,
+        )
+        .await;
         done = engine::rewrite(
             &view,
             read,
@@ -3641,9 +3724,10 @@ fn format_gem_manifest_edits(
 /// - a patched build that this run found for a platform of a lock already
 ///   on the registry: `…: now also patched for arm64-darwin; already
 ///   patched for x86_64-linux-gnu`
-/// - no locked platform has a patched build yet, so the gem was left
-///   where it is (the skip's own sentence): `…: no patched build yet for
-///   arm64-darwin, x86_64-linux-gnu; left on its upstream registry`
+/// - a gem left where it is under one of the quiet skips
+///   (`engine::is_quiet_gem_skip`), in the skip's own sentence: `…: no
+///   patched build yet for arm64-darwin, x86_64-linux-gnu; left on its
+///   upstream registry`
 ///
 /// The ruby-platform gem, where the lock names it beside the platform
 /// builds, is the platform `ruby`. A dry run says `would be patched for`

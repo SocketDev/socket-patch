@@ -22,7 +22,14 @@
 //!   quiet skip, and a reference with no list at all under the warning
 //!   `redirect_gem_platform_unsupported`;
 //! * a lock whose patched build was withdrawn follows the list back to
-//!   upstream's gem, and is then counted as no package on a hosted patch.
+//!   upstream's gem, and is then counted as no package on a hosted patch;
+//! * a lock on the registry of another patch of the gem moves to the patch
+//!   on offer only when no locked build would turn from a patched build
+//!   into upstream's gem, which its `CHECKSUMS` say, else one request to
+//!   the registry it is on; otherwise it stays, under a quiet skip;
+//! * a gem the lock names as its ruby-platform gem alone takes the
+//!   registry without its snapshot level, so a pair pinned by a reference
+//!   with no list is left byte for byte by one with a list.
 //!
 //! The VEX document is truthful per locked build, in the run's own `--vex`
 //! and in a later `socket-patch vex` over the lock the run left:
@@ -99,17 +106,22 @@ const NONE_PATCHED: [Listed; 2] = [(ARM, ARM_UPSTREAM, None), (LINUX, LINUX_UPST
 /// The registry URL a reference names: with the snapshot level when it
 /// lists platform gems, plain when it does not.
 fn index_url(api: &str, snapshot: Option<u32>) -> String {
-    let root = format!("{api}/patch-registry/gem/{TOKEN}/{UUID}/");
+    registry_url(api, UUID, snapshot)
+}
+
+/// [`index_url`] of the gem patch `uuid`.
+fn registry_url(api: &str, uuid: &str, snapshot: Option<u32>) -> String {
+    let root = format!("{api}/patch-registry/gem/{TOKEN}/{uuid}/");
     match snapshot {
         Some(snapshot) => format!("{root}s/{snapshot}"),
         None => root,
     }
 }
 
-/// Mount the patch API of the one gem patch. `listing` is the reference's
+/// The reference of the gem patch `uuid` on `api`. `listing` is its
 /// `gemBuilds` and the snapshot its registry URL names; `None` is a
 /// reference with no list (a patch of the ruby gem alone).
-async fn mount_api(server: &MockServer, listing: Option<(&[Listed], u32)>) {
+fn reference(api: &str, uuid: &str, listing: Option<(&[Listed], u32)>) -> Value {
     let mut identifiers = json!({
         "name": DEP, "version": DEP_VERSION, "gemChecksumSha256": RUBY_PATCHED,
     });
@@ -121,9 +133,28 @@ async fn mount_api(server: &MockServer, listing: Option<(&[Listed], u32)>) {
             })
             .collect();
     }
-    let api = server.uri();
     let artifact =
-        format!("{api}/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.gem");
+        format!("{api}/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{uuid}/{DEP}-{DEP_VERSION}.gem");
+    json!({
+        "status": "granted",
+        "url": artifact,
+        "purl": PURL,
+        "artifacts": [{
+            "kind": "tarball", "url": artifact,
+            "integrity": { "sha256": RUBY_PATCHED },
+        }],
+        "registryOverride": {
+            "kind": "rubygems-compact-index",
+            "indexUrl": registry_url(api, uuid, listing.map(|(_, snapshot)| snapshot)),
+            "identifiers": identifiers,
+        },
+    })
+}
+
+/// Mount the patch API of the one gem patch, with [`reference`] of
+/// `listing` as its reference.
+async fn mount_api(server: &MockServer, listing: Option<(&[Listed], u32)>) {
+    let api = server.uri();
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -155,20 +186,7 @@ async fn mount_api(server: &MockServer, listing: Option<(&[Listed], u32)>) {
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/package")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "results": { UUID: {
-                "status": "granted",
-                "url": artifact,
-                "purl": PURL,
-                "artifacts": [{
-                    "kind": "tarball", "url": artifact,
-                    "integrity": { "sha256": RUBY_PATCHED },
-                }],
-                "registryOverride": {
-                    "kind": "rubygems-compact-index",
-                    "indexUrl": index_url(&api, listing.map(|(_, snapshot)| snapshot)),
-                    "identifiers": identifiers,
-                },
-            }}
+            "results": { UUID: reference(&api, UUID, listing) }
         })))
         .mount(server)
         .await;
@@ -1008,6 +1026,497 @@ async fn rollout_and_the_severity_floor_count_the_gem_once() {
     assert_eq!(read(proj.path(), "Gemfile.lock"), lock(true));
     assert_eq!(env["policy"]["counts"]["filtered"], 1, "{env}");
     assert_eq!(hosted_events(&env), Vec::<Value>::new(), "{env}");
+}
+
+// ── A lock on the registry of another patch of the gem ────────────────
+
+/// An earlier patch of the gem, which the lock of these tests is on while
+/// the patch service offers [`UUID`] for it.
+const EARLIER_UUID: &str = "9c8b7a6f-5e4d-4c3b-8a29-1f0e9d8c7b6a";
+/// The patch of the earlier patch's patched `x86_64-linux-gnu` build, and
+/// the sha256 of that build.
+const EARLIER_LINUX_UUID: &str = "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f";
+const EARLIER_LINUX_PATCHED: &str =
+    "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+/// What the earlier patch's reference lists, at snapshot `3`.
+const EARLIER_BUILDS: [Listed; 2] = [
+    (ARM, ARM_UPSTREAM, None),
+    (LINUX, EARLIER_LINUX_PATCHED, Some(EARLIER_LINUX_UUID)),
+];
+/// A patch with a patched build for `arm64-darwin` alone.
+const ARM_ONLY: [Listed; 2] = [
+    (ARM, ARM_PATCHED, Some(ARM_UUID)),
+    (LINUX, LINUX_UPSTREAM, None),
+];
+
+/// The registry of the earlier patch on `origin`, as a lock names it.
+fn earlier_index(origin: &str) -> String {
+    format!("{}/", registry_url(origin, EARLIER_UUID, Some(3)))
+}
+
+/// [`mount_api`] for the patch on offer, whose reference lists `offered`
+/// at snapshot `4`, with the earlier patch's reference granted beside it:
+/// the lock's pin is a patch the service still serves.
+async fn mount_api_beside_earlier(server: &MockServer, offered: &[Listed]) {
+    let api = server.uri();
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": {
+                UUID: reference(&api, UUID, Some((offered, 4))),
+                EARLIER_UUID: reference(&api, EARLIER_UUID, Some((&EARLIER_BUILDS[..], 3))),
+            }
+        })))
+        .with_priority(1)
+        .mount(server)
+        .await;
+    mount_api(server, Some((offered, 4))).await;
+}
+
+/// The compact-index document of the earlier patch's registry, listing
+/// `linux` as the sha256 of its `x86_64-linux-gnu` gem.
+async fn mount_earlier_index(server: &MockServer, linux: &str) {
+    Mock::given(method("GET"))
+        .and(path(earlier_index_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "---\n{DEP_VERSION}-{ARM} racc:~> 1.4|checksum:{ARM_UPSTREAM}\n{DEP_VERSION}-{LINUX} \
+             racc:~> 1.4|checksum:{linux}\n"
+        )))
+        .mount(server)
+        .await;
+}
+
+fn earlier_index_path() -> String {
+    format!("/patch-registry/gem/{TOKEN}/{EARLIER_UUID}/s/3/info/{DEP}")
+}
+
+/// The quiet skip of the patch on offer, left for a later run because the
+/// lock would lose its patched `x86_64-linux-gnu` build.
+fn newer_fix_waits() -> (String, Value) {
+    let line = format!(
+        "{DEP} {DEP_VERSION}: the newer fix has no patched build for {LINUX} yet; the lock stays \
+         on the patch it is on"
+    );
+    let event = json!({
+        "action": "skipped", "purl": PURL, "uuid": UUID,
+        "errorCode": "redirect_gem_newer_fix_waits", "reason": line,
+        "details": { "mode": "hosted" },
+    });
+    (line, event)
+}
+
+/// The lock is on an earlier patch of the gem, with a patched build for
+/// `x86_64-linux-gnu`. The patch on offer has a patched build for
+/// `arm64-darwin` alone: moving the lock would turn the linux build into
+/// upstream's gem. The lock's `CHECKSUMS` say what it installs, so nothing
+/// is asked of its registry: both files stay byte for byte, with no
+/// warning, one skipped event under the quiet code and one plain line.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_on_an_earlier_patch_keeps_its_patched_build_and_waits_quietly() {
+    let server = MockServer::start().await;
+    mount_api_beside_earlier(&server, &ARM_ONLY[..]).await;
+    let api = server.uri();
+    let earlier = earlier_index(&api);
+    let (lock, gemfile) = (
+        hosted_lock(&earlier, ARM_UPSTREAM, EARLIER_LINUX_PATCHED),
+        hosted_gemfile(&earlier),
+    );
+    let (line, event) = newer_fix_waits();
+    let known = ["--patch-server-url", api.as_str()];
+
+    for dry_run in [false, true] {
+        let proj = hosted_project(&earlier, ARM_UPSTREAM, EARLIER_LINUX_PATCHED, true);
+        let mut extra = known.to_vec();
+        extra.extend(dry_run.then_some("--dry-run"));
+        let (code, env) = scan_json(proj.path(), &api, &extra);
+        assert_eq!(code, 0, "{env}");
+        assert_eq!(env["status"], "success", "{env}");
+        assert_eq!(read(proj.path(), "Gemfile.lock"), lock);
+        assert_eq!(read(proj.path(), "Gemfile"), gemfile);
+        assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+        assert_eq!(hosted_events(&env), [event.clone()], "{env}");
+        let summary = &env["summary"];
+        assert_eq!(
+            (&summary["applied"], &summary["skipped"], &summary["failed"]),
+            (&json!(0), &json!(1), &json!(0)),
+            "{env}"
+        );
+        assert_eq!(env["redirect"]["rewrittenFiles"], json!([]), "{env}");
+    }
+    let (_, other) = requests(&server).await;
+    assert_eq!(other, Vec::<String>::new(), "no registry request");
+
+    // For a person: the one line on stdout, and nothing that warns.
+    let proj = hosted_project(&earlier, ARM_UPSTREAM, EARLIER_LINUX_PATCHED, true);
+    let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &known);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains(&format!("\n{line}\n")), "{stdout}");
+    assert!(
+        !stderr.contains("No patches could be switched")
+            && !stderr.contains("Warning")
+            && !stderr.contains("Not hosted")
+            && !stderr.contains(DEP),
+        "nothing on stderr names it:\n{stderr}"
+    );
+    assert_eq!(read(proj.path(), "Gemfile.lock"), lock);
+    assert_eq!(read(proj.path(), "Gemfile"), gemfile);
+
+    // `get` of the patch on offer leaves the lock where it is, too.
+    let (code, stdout, stderr) = hosted(proj.path(), &api, &["get", UUID], &["--json"]);
+    let env: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not JSON ({e}):\n{stdout}\nstderr:\n{stderr}"));
+    assert_eq!(code, 0, "{env}\n{stderr}");
+    assert_eq!(hosted_events(&env), [event], "{env}");
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(read(proj.path(), "Gemfile.lock"), lock);
+}
+
+/// The same lock with no `CHECKSUMS` says nothing of what it installs, so
+/// the run asks the registry the lock is on, once: its compact-index
+/// document for the gem. A registry that lists a patched build for
+/// `x86_64-linux-gnu` keeps the lock where it is. One that lists
+/// upstream's gem has nothing to lose, and the lock moves to the patch on
+/// offer. A registry that does not answer keeps the lock where it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_without_checksums_on_an_earlier_patch_is_judged_by_its_registry() {
+    let (line, event) = newer_fix_waits();
+
+    // The registry lists a patched build: the lock stays.
+    let server = MockServer::start().await;
+    mount_api_beside_earlier(&server, &ARM_ONLY[..]).await;
+    mount_earlier_index(&server, EARLIER_LINUX_PATCHED).await;
+    let api = server.uri();
+    let earlier = earlier_index(&api);
+    let known = ["--patch-server-url", api.as_str()];
+    let proj = hosted_project(&earlier, ARM_UPSTREAM, EARLIER_LINUX_PATCHED, false);
+    let lock = read(proj.path(), "Gemfile.lock");
+    assert!(!lock.contains("CHECKSUMS"), "premise: {lock}");
+    let (code, env) = scan_json(proj.path(), &api, &known);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(env["status"], "success", "{env}");
+    assert_eq!(read(proj.path(), "Gemfile.lock"), lock);
+    assert_eq!(read(proj.path(), "Gemfile"), hosted_gemfile(&earlier));
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(hosted_events(&env), [event.clone()], "{env}");
+    let (_, other) = requests(&server).await;
+    assert_eq!(
+        other,
+        [earlier_index_path()],
+        "one request, to the registry the lock is on"
+    );
+    let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &known);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains(&format!("\n{line}\n")), "{stdout}");
+    assert!(!stderr.contains("Warning"), "{stderr}");
+
+    // The registry lists upstream's gem: nothing to lose, the lock moves.
+    let server = MockServer::start().await;
+    mount_api_beside_earlier(&server, &ARM_ONLY[..]).await;
+    mount_earlier_index(&server, LINUX_UPSTREAM).await;
+    let api = server.uri();
+    let (earlier, offered) = (
+        earlier_index(&api),
+        format!("{}/", index_url(&api, Some(4))),
+    );
+    let known = ["--patch-server-url", api.as_str()];
+    let proj = hosted_project(&earlier, ARM_UPSTREAM, LINUX_UPSTREAM, false);
+    let (code, env) = scan_json(proj.path(), &api, &known);
+    assert_eq!(code, 0, "{env}");
+    let after = read(proj.path(), "Gemfile.lock");
+    assert!(
+        after.starts_with(&format!(
+            "GEM\n  remote: {offered}\n  specs:\n    {DEP} ({DEP_VERSION}-{ARM})\n    {DEP} \
+             ({DEP_VERSION}-{LINUX})\n\nGEM\n  remote: https://rubygems.org/\n"
+        )),
+        "{after}"
+    );
+    assert!(!after.contains(EARLIER_UUID), "{after}");
+    assert_eq!(read(proj.path(), "Gemfile"), hosted_gemfile(&offered));
+    assert_eq!(
+        warning_codes(&env),
+        ["redirect_gem_no_checksums_section"],
+        "the lock's own caveat alone: {env}"
+    );
+    assert_eq!(
+        hosted_events(&env),
+        [
+            patched_event("applied", ARM, ARM_UUID, true),
+            upstream_event(LINUX)
+        ],
+        "{env}"
+    );
+    let (_, other) = requests(&server).await;
+    assert_eq!(other, [earlier_index_path()], "one registry request");
+
+    // The registry does not answer: nothing shows what the lock installs.
+    let server = MockServer::start().await;
+    mount_api_beside_earlier(&server, &ARM_ONLY[..]).await;
+    let api = server.uri();
+    let earlier = earlier_index(&api);
+    let proj = hosted_project(&earlier, ARM_UPSTREAM, EARLIER_LINUX_PATCHED, false);
+    let lock = read(proj.path(), "Gemfile.lock");
+    let (code, env) = scan_json(proj.path(), &api, &["--patch-server-url", api.as_str()]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(read(proj.path(), "Gemfile.lock"), lock);
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(hosted_events(&env), [event], "{env}");
+    let (_, other) = requests(&server).await;
+    assert_eq!(other, [earlier_index_path()], "asked once");
+}
+
+/// The patch on offer patches every build the earlier patch does: the
+/// lock loses nothing, so it moves to the offered patch's registry, and
+/// the run reports each locked build under the patch it then installs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_on_an_earlier_patch_moves_to_a_patch_that_patches_as_much() {
+    let server = MockServer::start().await;
+    mount_api_beside_earlier(&server, &ONE_PATCHED[..]).await;
+    let api = server.uri();
+    let (earlier, offered) = (
+        earlier_index(&api),
+        format!("{}/", index_url(&api, Some(4))),
+    );
+    let known = ["--patch-server-url", api.as_str()];
+
+    let proj = hosted_project(&earlier, ARM_UPSTREAM, EARLIER_LINUX_PATCHED, true);
+    let (code, env) = scan_json(proj.path(), &api, &known);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(
+        read(proj.path(), "Gemfile.lock"),
+        hosted_lock(&offered, ARM_UPSTREAM, LINUX_PATCHED)
+    );
+    assert_eq!(read(proj.path(), "Gemfile"), hosted_gemfile(&offered));
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(
+        hosted_events(&env),
+        [
+            upstream_event(ARM),
+            patched_event("applied", LINUX, LINUX_UUID, true)
+        ],
+        "{env}"
+    );
+    assert_eq!(
+        env["redirect"]["rewrittenFiles"],
+        json!(["Gemfile", "Gemfile.lock"])
+    );
+    let (_, other) = requests(&server).await;
+    assert_eq!(other, Vec::<String>::new(), "no registry request");
+
+    let proj = hosted_project(&earlier, ARM_UPSTREAM, EARLIER_LINUX_PATCHED, true);
+    let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &known);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "\n{DEP} {DEP_VERSION}: patched for {LINUX}; upstream gem kept for {ARM} (no patched \
+             build yet)\n"
+        )),
+        "{stdout}"
+    );
+    assert!(!stderr.contains("Warning"), "{stderr}");
+}
+
+/// Under a patch mirror the lock names the earlier patch's registry on
+/// the mirror, which may ask for credentials the run was never given. The
+/// document is read where the patch server serves it, like every download
+/// of the run, and the mirror is asked nothing about it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_registry_of_a_lock_on_a_patch_mirror_is_read_from_the_patch_server() {
+    const PREFIX: &str = "/artifactory/socket-patch";
+    let server = MockServer::start().await;
+    mount_api_beside_earlier(&server, &ARM_ONLY[..]).await;
+    mount_earlier_index(&server, EARLIER_LINUX_PATCHED).await;
+    let api = server.uri();
+    // The mirror takes the run's check of the pin it would write, and
+    // wants credentials for anything else.
+    let mirror = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!(
+            "{PREFIX}/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.gem"
+        )))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mirror)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&mirror)
+        .await;
+    let base = format!("{}{PREFIX}", mirror.uri());
+
+    let on_mirror = earlier_index(&base);
+    let proj = hosted_project(&on_mirror, ARM_UPSTREAM, EARLIER_LINUX_PATCHED, false);
+    let lock = read(proj.path(), "Gemfile.lock");
+    let (code, env) = scan_json(proj.path(), &api, &["--patch-mirror-url", base.as_str()]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(read(proj.path(), "Gemfile.lock"), lock);
+    assert_eq!(read(proj.path(), "Gemfile"), hosted_gemfile(&on_mirror));
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(hosted_events(&env), [newer_fix_waits().1], "{env}");
+    let (_, other) = requests(&server).await;
+    assert_eq!(
+        other,
+        [earlier_index_path()],
+        "the patch server is asked, once"
+    );
+    let asked_of_mirror: Vec<String> = mirror
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|request| format!("{} {}", request.method, request.url.path()))
+        .filter(|request| request.contains("/info/"))
+        .collect();
+    assert_eq!(asked_of_mirror, Vec::<String>::new());
+}
+
+// ── A gem locked as its ruby-platform gem alone ───────────────────────
+
+/// The sha256 a lock pins for upstream's ruby-platform gem.
+const RUBY_UPSTREAM: &str = "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0";
+
+/// A lock that names the gem as its ruby-platform gem alone, with
+/// `platforms` as its `PLATFORMS` section.
+fn ruby_lock(platforms: &[&str]) -> String {
+    let platforms: String = platforms.iter().map(|p| format!("  {p}\n")).collect();
+    format!(
+        "GEM\n  remote: https://rubygems.org/\n  specs:\n    {DEP} ({DEP_VERSION})\n    racc \
+         (1.8.1)\n\nPLATFORMS\n{platforms}\nDEPENDENCIES\n  {DEP} (= {DEP_VERSION})\n  racc (= \
+         1.8.1)\n\nCHECKSUMS\n  {DEP} ({DEP_VERSION}) sha256={RUBY_UPSTREAM}\n  racc (1.8.1) \
+         sha256={RACC}\n\nBUNDLED WITH\n  4.0.15\n"
+    )
+}
+
+/// A project that locks the gem as its ruby-platform gem alone was pinned
+/// by a reference with no list, whose registry URL has no snapshot level
+/// (what release 5.1.0 writes). A scan whose reference names the registry
+/// at a snapshot, with the list of the version's gems, leaves that pair
+/// byte for byte and confirms the pin: the gem takes the registry without
+/// the snapshot level, which lists the patched gems only. A lock that is
+/// not pinned yet gets the same pair, whatever its `PLATFORMS` names.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gem_locked_as_its_ruby_gem_alone_stays_on_the_registry_without_a_snapshot() {
+    let listed: [Listed; 3] = [
+        (ARM, ARM_PATCHED, Some(ARM_UUID)),
+        ("ruby", RUBY_PATCHED, Some(UUID)),
+        (LINUX, LINUX_UPSTREAM, None),
+    ];
+    let pinned_event = json!({
+        "action": "applied", "purl": PURL, "uuid": UUID, "details": { "mode": "hosted" },
+    });
+    for platforms in [&["ruby"][..], &[ARM, "ruby"][..]] {
+        let server = MockServer::start().await;
+        mount_api(&server, None).await;
+        let api = server.uri();
+        let root = index_url(&api, None);
+
+        // The pair as a reference with no snapshot pins it.
+        let proj = project(&ruby_lock(platforms));
+        let (code, env) = scan_json(proj.path(), &api, &[]);
+        assert_eq!(code, 0, "{env}");
+        assert_eq!(hosted_events(&env), [pinned_event.clone()], "{env}");
+        let (gemfile, lock) = (
+            read(proj.path(), "Gemfile"),
+            read(proj.path(), "Gemfile.lock"),
+        );
+        assert_eq!(gemfile, hosted_gemfile(&root));
+        assert!(
+            lock.starts_with(&format!(
+                "GEM\n  remote: {root}\n  specs:\n    {DEP} ({DEP_VERSION})\n\nGEM\n"
+            )),
+            "{lock}"
+        );
+        assert!(
+            lock.contains(&format!("  {DEP} ({DEP_VERSION}) sha256={RUBY_PATCHED}\n")),
+            "{lock}"
+        );
+
+        // A reference with a snapshot URL and a list: nothing changes.
+        server.reset().await;
+        mount_api(&server, Some((&listed[..], 4))).await;
+        let (code, env) = scan_json(proj.path(), &api, &[]);
+        assert_eq!(code, 0, "{env}");
+        assert_eq!(env["status"], "success", "{env}");
+        assert_eq!(read(proj.path(), "Gemfile"), gemfile, "{platforms:?}");
+        assert_eq!(read(proj.path(), "Gemfile.lock"), lock, "{platforms:?}");
+        assert_eq!(env["redirect"]["rewrittenFiles"], json!([]), "{env}");
+        assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+        assert_eq!(hosted_events(&env), [pinned_event.clone()], "{env}");
+        let (references, other) = requests(&server).await;
+        assert_eq!(references, [[UUID.to_string()]], "one reference request");
+        assert_eq!(other, Vec::<String>::new(), "no registry request");
+        let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &[]);
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("1 package is already on hosted patches; nothing to rewrite.\n"),
+            "{stdout}"
+        );
+        assert!(!stderr.contains("Warning"), "{stderr}");
+        assert_eq!(read(proj.path(), "Gemfile.lock"), lock);
+
+        // A lock that is not pinned yet takes the same pair.
+        let fresh = project(&ruby_lock(platforms));
+        let (code, env) = scan_json(fresh.path(), &api, &[]);
+        assert_eq!(code, 0, "{env}");
+        assert_eq!(read(fresh.path(), "Gemfile"), gemfile, "{platforms:?}");
+        assert_eq!(read(fresh.path(), "Gemfile.lock"), lock, "{platforms:?}");
+        assert_eq!(hosted_events(&env), [pinned_event.clone()], "{env}");
+    }
+}
+
+/// Under a patch mirror a run asks the mirror about each pin it is about
+/// to write, and about none the project's files hold already. A gem the
+/// lock names as its ruby-platform gem alone is pinned under the registry
+/// without its snapshot level, and a run whose reference names the
+/// registry at a snapshot knows that pin as its own: the second run asks
+/// the mirror nothing and writes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rerun_under_a_patch_mirror_knows_the_pin_without_a_snapshot() {
+    const PREFIX: &str = "/artifactory/socket-patch";
+    let listed: [Listed; 3] = [
+        (ARM, ARM_PATCHED, Some(ARM_UUID)),
+        ("ruby", RUBY_PATCHED, Some(UUID)),
+        (LINUX, LINUX_UPSTREAM, None),
+    ];
+    let server = MockServer::start().await;
+    mount_api(&server, Some((&listed[..], 4))).await;
+    let api = server.uri();
+    let mirror = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!(
+            "{PREFIX}/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.gem"
+        )))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mirror)
+        .await;
+    let base = format!("{}{PREFIX}", mirror.uri());
+    let root = registry_url(&base, UUID, None);
+    let extra = ["--patch-mirror-url", base.as_str()];
+
+    let proj = project(&ruby_lock(&["ruby"]));
+    let (code, env) = scan_json(proj.path(), &api, &extra);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(read(proj.path(), "Gemfile"), hosted_gemfile(&root));
+    let lock = read(proj.path(), "Gemfile.lock");
+    assert!(
+        lock.starts_with(&format!("GEM\n  remote: {root}\n  specs:\n")),
+        "{lock}"
+    );
+    assert_eq!(
+        mirror.received_requests().await.unwrap_or_default().len(),
+        1,
+        "the mirror is asked about the pin the run writes"
+    );
+
+    let (code, env) = scan_json(proj.path(), &api, &extra);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(env["redirect"]["rewrittenFiles"], json!([]), "{env}");
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(read(proj.path(), "Gemfile.lock"), lock);
+    assert_eq!(
+        mirror.received_requests().await.unwrap_or_default().len(),
+        1,
+        "a pin the project holds is not asked about again"
+    );
 }
 
 // ── VEX ───────────────────────────────────────────────────────────────

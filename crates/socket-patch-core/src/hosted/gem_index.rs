@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use super::engine::{self, Candidate, CandidateFiles};
+use super::engine::{self, Candidate, CandidateFiles, MirrorSources};
 use crate::api::client::PatchApi;
 
 /// Bound on one document. A gem version's line is a few hundred bytes and
@@ -48,8 +48,15 @@ pub async fn fetch_gem_index(client: &dyn PatchApi, url: &str) -> Result<String,
 /// ([`engine::record_gem_index`]): what a host does before every
 /// [`engine::rewrite`]. `held` keeps what the run has read, so a document
 /// is asked for once however often the run rewrites.
+///
+/// A lock written through a patch mirror names its registry on the
+/// mirror, which may ask for credentials the run was never given: the
+/// document is read where the patch server serves it
+/// ([`MirrorSources::fetch_url`]), and handed in under the URL the lock
+/// names.
 pub async fn read_gem_indexes(
     client: &dyn PatchApi,
+    sources: &MirrorSources,
     candidates: &[Candidate],
     read: &mut CandidateFiles,
     held: &mut BTreeMap<String, Result<String, String>>,
@@ -59,7 +66,7 @@ pub async fn read_gem_indexes(
         let document = match held.get(&url) {
             Some(document) => document.clone(),
             None => {
-                let document = fetch_gem_index(client, &url).await;
+                let document = fetch_gem_index(client, &sources.fetch_url(&url)).await;
                 held.insert(url.clone(), document.clone());
                 document
             }
@@ -197,6 +204,7 @@ mod tests {
     #[tokio::test]
     async fn a_registry_is_asked_once_a_run_and_its_answer_handed_to_each_rewrite() {
         let candidates = [candidate()];
+        let direct = MirrorSources::default();
         let on_earlier = format!("{REGISTRY}/{EARLIER}/s/1a/");
         let url = format!("{REGISTRY}/{EARLIER}/s/1a/info/rails");
         let document = "---\n7.0.0-x86_64-linux-gnu |checksum:abc\n";
@@ -204,7 +212,7 @@ mod tests {
         let server = Server::answering(Some(document.as_bytes()));
         let mut held = BTreeMap::new();
         let mut first = read_with_lock_on(&on_earlier);
-        read_gem_indexes(&server, &candidates, &mut first, &mut held).await;
+        read_gem_indexes(&server, &direct, &candidates, &mut first, &mut held).await;
         assert_eq!(server.asked(), [url.clone()]);
         let handed: BTreeMap<String, String> =
             serde_json::from_str(&first.files[GEM_INDEX_KEY]).expect("the documents");
@@ -213,7 +221,7 @@ mod tests {
             BTreeMap::from([(url.clone(), document.to_string())])
         );
         let mut second = read_with_lock_on(&on_earlier);
-        read_gem_indexes(&server, &candidates, &mut second, &mut held).await;
+        read_gem_indexes(&server, &direct, &candidates, &mut second, &mut held).await;
         assert_eq!(server.asked().len(), 1, "asked once a run");
         assert_eq!(
             second.files.get(GEM_INDEX_KEY),
@@ -227,7 +235,7 @@ mod tests {
             "https://rubygems.org/".into(),
         ] {
             let mut read = read_with_lock_on(&remote);
-            read_gem_indexes(&server, &candidates, &mut read, &mut held).await;
+            read_gem_indexes(&server, &direct, &candidates, &mut read, &mut held).await;
             assert!(!read.files.contains_key(GEM_INDEX_KEY), "{remote}");
         }
         assert_eq!(server.asked().len(), 1);
@@ -238,12 +246,51 @@ mod tests {
             let mut held = BTreeMap::new();
             for _ in 0..2 {
                 let mut read = read_with_lock_on(&on_earlier);
-                read_gem_indexes(&server, &candidates, &mut read, &mut held).await;
+                read_gem_indexes(&server, &direct, &candidates, &mut read, &mut held).await;
                 assert!(!read.files.contains_key(GEM_INDEX_KEY));
             }
             assert_eq!(server.asked(), [url.clone()]);
             let why = held[&url].as_ref().expect_err("unread");
             assert!(!why.contains("grant"), "the grant token is redacted: {why}");
         }
+    }
+
+    /// A lock written through a patch mirror is on the mirror, which may
+    /// ask for credentials the run does not hold. The document of its
+    /// registry is read at the same path of the patch server, where the
+    /// grant token in the path is all it takes, and handed to the rewrite
+    /// under the URL the lock names.
+    #[tokio::test]
+    async fn a_registry_on_a_patch_mirror_is_read_from_the_patch_server() {
+        use crate::patch::redirect::mirror::PatchMirror;
+        let mirror = PatchMirror::parse("https://repo.example/artifactory/socket-patch").unwrap();
+        let origins = vec![mirror.base().to_string()];
+        let (mut skipped, mut warnings) = (Vec::new(), Vec::new());
+        let (candidates, sources) = engine::mirror_candidates(
+            vec![candidate()],
+            &mirror,
+            &origins,
+            &mut skipped,
+            &mut warnings,
+        );
+        assert_eq!(candidates.len(), 1, "{warnings:?}");
+
+        let on_mirror = format!("{}/patch-registry/gem/grant/{EARLIER}/s/1a/", mirror.base());
+        let document = "---\n7.0.0-x86_64-linux-gnu |checksum:abc\n";
+        let server = Server::answering(Some(document.as_bytes()));
+        let mut held = BTreeMap::new();
+        let mut read = read_with_lock_on(&on_mirror);
+        read_gem_indexes(&server, &sources, &candidates, &mut read, &mut held).await;
+        assert_eq!(
+            server.asked(),
+            [format!("{REGISTRY}/{EARLIER}/s/1a/info/rails")],
+            "asked of the patch server, never of the mirror"
+        );
+        let handed: BTreeMap<String, String> =
+            serde_json::from_str(&read.files[GEM_INDEX_KEY]).expect("the documents");
+        assert_eq!(
+            handed,
+            BTreeMap::from([(format!("{on_mirror}info/rails"), document.to_string())])
+        );
     }
 }

@@ -579,9 +579,10 @@ pub const MIRROR_URL_REFUSED: &str = "redirect_mirror_url_refused";
 /// Where each mirrored reference is served from: the URL the patch
 /// server's grant named, keyed by the mirrored URL the candidate now
 /// carries. The run's own downloads (a wheel's metadata, a tarball's
-/// `package.json`, a gem to refresh a stale install with) read the served
-/// URL: the grant token in it is all the authorization that takes, where
-/// the mirror may ask for credentials the run was never given.
+/// `package.json`, a gem to refresh a stale install with, what the
+/// registry a Bundler lock is on lists) read the served URL: the grant
+/// token in it is all the authorization that takes, where the mirror may
+/// ask for credentials the run was never given.
 #[derive(Debug, Clone, Default)]
 pub struct MirrorSources {
     /// The mirror's base URL (empty when the run has no mirror).
@@ -597,6 +598,12 @@ impl MirrorSources {
     /// The URL to download `url` from: where the patch server serves it
     /// when `url` is a mirrored artifact or lies under a mirrored registry
     /// index, else itself.
+    ///
+    /// Any other URL on the mirror is the same path on the patch server
+    /// the run's references are served from: the registry of another patch,
+    /// which a lock written through the mirror is still on. Only where
+    /// every mirrored reference is served from one origin, so that the
+    /// path names one URL; else the URL is itself.
     pub fn fetch_url<'a>(&'a self, url: &'a str) -> std::borrow::Cow<'a, str> {
         use std::borrow::Cow;
         if let Some(served) = self.served.get(url) {
@@ -609,7 +616,25 @@ impl MirrorSources {
                 }
             }
         }
-        Cow::Borrowed(url)
+        let on_mirror = url
+            .strip_prefix(self.base.as_str())
+            .filter(|path| !self.base.is_empty() && path.starts_with('/'));
+        match (on_mirror, self.served_origin()) {
+            (Some(path), Some(origin)) => Cow::Owned(format!("{origin}{path}")),
+            _ => Cow::Borrowed(url),
+        }
+    }
+
+    /// The scheme and authority the patch server serves the mirrored
+    /// references from, where they all share one: a mirrored URL is the
+    /// mirror's base in front of the served URL's path.
+    fn served_origin(&self) -> Option<&str> {
+        let mut origins = self.served.iter().map(|(mirrored, served)| {
+            let path = mirrored.strip_prefix(self.base.as_str())?;
+            served.strip_suffix(path)
+        });
+        let first = origins.next()??;
+        origins.all(|origin| origin == Some(first)).then_some(first)
     }
 
     /// [`Self::fetch_url`] for a candidate's own artifact URL, borrowed:
@@ -6908,6 +6933,38 @@ mod tests {
             );
             assert_eq!(dep.token, before.token);
         }
+        // The registry of another patch on the mirror (a lock that an
+        // earlier run wrote is on it) is no reference of this run: it is
+        // read at the same path of the patch server. A URL that is not on
+        // the mirror, or only shares a prefix with its base, is itself.
+        let earlier = "/patch-registry/gem/tok/99999999-9999-4999-8999-999999999999/s/1a/info/rack";
+        assert_eq!(
+            sources.fetch_url(&format!(
+                "https://repo.example/artifactory/socket-patch{earlier}"
+            )),
+            format!("https://patch.socket.dev{earlier}")
+        );
+        for elsewhere in [
+            format!("https://rubygems.org{earlier}"),
+            format!("https://repo.example/artifactory/socket-patch-2{earlier}"),
+            "https://repo.example/artifactory/socket-patch".to_string(),
+        ] {
+            assert_eq!(sources.fetch_url(&elsewhere), elsewhere.as_str());
+        }
+        // References served from two origins: the path names no one URL.
+        let mut two_origins = sources.clone();
+        two_origins.served.insert(
+            "https://repo.example/artifactory/socket-patch/patch/npm/a/1.0.0/t/u/a.tgz".into(),
+            "https://other.example/patch/npm/a/1.0.0/t/u/a.tgz".into(),
+        );
+        let on_mirror = format!("https://repo.example/artifactory/socket-patch{earlier}");
+        assert_eq!(two_origins.fetch_url(&on_mirror), on_mirror.as_str());
+        // A run with no mirror names every URL as itself.
+        assert_eq!(
+            MirrorSources::default().fetch_url(&on_mirror),
+            on_mirror.as_str()
+        );
+
         assert_eq!(
             skipped
                 .iter()
