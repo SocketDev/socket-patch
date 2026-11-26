@@ -321,6 +321,10 @@ impl Fx {
     /// `vex -O <file>`: the envelope and the statement count (0 when the
     /// command wrote no document).
     fn vex(&self, extra: &[&str]) -> (Out, usize) {
+        self.vex_env(extra, &[])
+    }
+
+    fn vex_env(&self, extra: &[&str], env: &[(&str, &str)]) -> (Out, usize) {
         let doc = self.root.join("vex.json");
         let _ = std::fs::remove_file(&doc);
         let mut args = vec![
@@ -331,7 +335,7 @@ impl Fx {
             "pkg:maven/com.example/app@1.0",
         ];
         args.extend_from_slice(extra);
-        let out = self.run(&args);
+        let out = self.run_env(&args, env);
         let statements = std::fs::read(&doc)
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
@@ -1304,7 +1308,10 @@ fn member_record_apply_repair_rollback_is_byte_exact() {
 
 /// `--global-prefix` naming the Gradle user home (`.gradle`) or its
 /// `caches/modules-2` reaches the `files-2.1` copies for apply, vex and
-/// rollback alike.
+/// rollback alike. The commands run under another, empty Gradle user home,
+/// so the prefix alone names the cache: under the fixture's own
+/// `GRADLE_USER_HOME` project discovery reaches it with the flag ignored
+/// (#1982).
 #[test]
 fn global_prefix_apply_vex_rollback() {
     for prefix in ["", "caches/modules-2"] {
@@ -1317,12 +1324,20 @@ fn global_prefix_apply_vex_rollback() {
             f.home.join(prefix)
         };
         let p = p.to_str().unwrap();
-        f.run(&["apply", "--offline", "--global-prefix", p]).ok();
+        let elsewhere = f.root.join("another-gradle-home");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let env = [("GRADLE_USER_HOME", elsewhere.to_str().unwrap())];
+        // Control: without the prefix this run does not reach the cache.
+        f.run_env(&["apply", "--offline"], &env);
+        assert_eq!(hash_copies(&version, JAR)[0].1, pristine_jar(), "{prefix}");
+        f.run_env(&["apply", "--offline", "--global-prefix", p], &env)
+            .ok();
         assert_eq!(hash_copies(&version, JAR)[0].1, patched_jar(), "{prefix}");
-        let (out, statements) = f.vex(&["--global-prefix", p]);
+        let (out, statements) = f.vex_env(&["--global-prefix", p], &env);
         out.ok();
         assert!(statements > 0, "{prefix}");
-        f.run(&["rollback", "--offline", "--global-prefix", p]).ok();
+        f.run_env(&["rollback", "--offline", "--global-prefix", p], &env)
+            .ok();
         assert_eq!(hash_copies(&version, JAR)[0].1, pristine_jar(), "{prefix}");
     }
 }
