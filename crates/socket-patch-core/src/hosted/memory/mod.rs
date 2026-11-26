@@ -1640,7 +1640,6 @@ mod tests {
                 confirmed: vec![("pkg:cargo/serde@1.0.190".into(), "u".into())],
                 unattributed: Vec::new(),
                 binary_bun: false,
-                bun_binary_urls: String::new(),
                 rush_warnings: Vec::new(),
                 pnpm_warnings: Vec::new(),
                 npm_warnings: Vec::new(),

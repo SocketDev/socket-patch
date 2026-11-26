@@ -2711,11 +2711,6 @@ pub struct Rewritten {
     pub unattributed: Vec<SkippedPatch>,
     /// A `bun.lockb` without a text `bun.lock` drives npm.
     pub binary_bun: bool,
-    /// The `http(s)` URLs the records of that `bun.lockb` resolved from
-    /// when the run read it, one per line (empty without one, or when it
-    /// cannot be read). The binary lock is in no text of [`Self::files`],
-    /// so a reader that looks for an earlier pin by its URL reads this.
-    pub bun_binary_urls: String,
     pub rush_warnings: Vec<RewriteWarning>,
     pub pnpm_warnings: Vec<RewriteWarning>,
     pub npm_warnings: Vec<RewriteWarning>,
@@ -3573,20 +3568,12 @@ async fn rewrite_once(
         });
         rewrite.warnings.push(warning);
     }
-    let mut bun_binary_urls = String::new();
     if let Some(content) = binary_content {
         rewrite
             .warnings
             .retain(|w| w.code != "redirect_npm_no_lockfile");
         match content {
             Ok(bytes) => {
-                bun_binary_urls = crate::vendor::bun_lockb::BunLockb::parse_packages(&bytes)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|p| p.resolution)
-                    .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
                 // A package the project patches itself (`bun patch`) keeps
                 // its registry record, loudly (#367).
                 let user_patched = crate::vendor::bun_lock_text::patched_dependency_keys(
@@ -3770,7 +3757,6 @@ async fn rewrite_once(
     let confirmed = confirm(&files, &rewrite, candidates, binary_bun);
     npm_warnings.extend(npm_deno_lock(view, &overrides, &confirmed));
     Rewritten {
-        bun_binary_urls,
         files,
         symlinked_reads,
         unreadable_reads,

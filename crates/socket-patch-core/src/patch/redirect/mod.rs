@@ -439,6 +439,11 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub bundled_skipped_uuids: std::collections::BTreeSet<String>,
+    /// The Bun lock entries reported as user tarballs that are in the
+    /// patch server's path shape for the patch being pinned
+    /// ([`BunPatchShapedPin`]). Skipped while empty, as above.
+    #[cfg_attr(test, serde(skip_serializing_if = "Vec::is_empty"))]
+    pub bun_patch_shaped_pins: Vec<BunPatchShapedPin>,
     /// Patch uuid → the yarn.lock keys of the `npm:` alias entries of its
     /// package the rewriter left untouched (`redirect_yarn_classic_alias_skipped`,
     /// `redirect_yarn_berry_alias_skipped`): that copy keeps installing the
@@ -975,6 +980,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         refused_vlt_uuids,
         vlt_foreign_uuids,
         bundled_skipped_uuids,
+        mut bun_patch_shaped_pins,
         alias_skipped_entries,
         vlt_drives: _,
         gradle_uuids,
@@ -1032,6 +1038,9 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         .confirmed_maven_reactor_uuids
         .extend(confirmed_maven_reactor_uuids);
     result.bundled_skipped_uuids.extend(bundled_skipped_uuids);
+    result
+        .bun_patch_shaped_pins
+        .append(&mut bun_patch_shaped_pins);
     for (uuid, keys) in alias_skipped_entries {
         result
             .alias_skipped_entries
@@ -6616,18 +6625,10 @@ fn rewrite_bun_lock(
                 // this very version is installed from that spec beside the
                 // pinned copy and stays unpatched (#497, npm's #326): say so,
                 // and keep the in-run VEX from assuming the uuid patched.
-                // An earlier pin of this very patch on another host is no
-                // such copy ([`is_same_patch_pin`]).
-                if is_user_tarball_spec(spec, &fname, &dep.version)
-                    && spec != url_spec
-                    && !spec
-                        .strip_prefix(fname.as_str())
-                        .and_then(|rest| rest.strip_prefix('@'))
-                        .is_some_and(|url| is_same_patch_pin(url, dep))
-                {
+                if is_user_tarball_spec(spec, &fname, &dep.version) && spec != url_spec {
                     user_tarball_skipped = true;
                     result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
-                    result.warnings.push(RewriteWarning {
+                    let warning = RewriteWarning {
                         code: "redirect_bun_non_registry_entry_skipped".into(),
                         detail: format!(
                             "bun.lock entry `{}` installs {fname}@{} from a URL or local \
@@ -6636,7 +6637,14 @@ fn rewrite_bun_lock(
                              registry release to patch it",
                             entry.key, dep.version
                         ),
-                    });
+                    };
+                    let url = spec
+                        .strip_prefix(fname.as_str())
+                        .and_then(|rest| rest.strip_prefix('@'));
+                    if let Some(url) = url {
+                        BunPatchShapedPin::record("bun.lock", url, dep, &warning, result);
+                    }
+                    result.warnings.push(warning);
                 }
                 continue;
             }
@@ -6771,16 +6779,48 @@ pub(crate) fn is_prior_hosted_bun_spec(spec: &str, fname: &str, current_url: &st
     }
 }
 
-/// True when `url` is a hosted reference to `dep`'s own patch: a URL in the
-/// patch server's path shape, on any host, that names the patch's uuid. A
-/// Bun rewriter takes over an earlier pin only on the host it is writing
+/// A Bun lock entry a rewriter left as a user's tarball
+/// (`redirect_bun_non_registry_entry_skipped`) although its URL is in the
+/// patch server's path shape and names the uuid of the patch being pinned.
+///
+/// A Bun rewriter takes over an earlier pin only on the host it is writing
 /// ([`is_prior_hosted_bun_spec`]), so a run that writes a patch mirror
 /// meets the pin an earlier run wrote on the patch server as a URL it does
-/// not own. That copy is the patched one, not a user's tarball (#2279): it
-/// is left as it is and not reported unpatched. A URL in that shape naming
-/// another patch is not recognized here.
-pub(crate) fn is_same_patch_pin(url: &str, dep: &DepOverride) -> bool {
-    crate::origin::hosted_shape_uuid(url).as_deref() == Some(dep.patch_uuid.as_str())
+/// not own (#2279). The rewriter knows no host but the one it writes, so
+/// it cannot tell that pin from a look-alike on a host nobody vouches for:
+/// it treats both as it treats any user tarball, and records the entry
+/// here. A caller that knows the run's patch servers may retract
+/// [`Self::warning`] for a URL on one of them and say what is true of it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BunPatchShapedPin {
+    pub patch_uuid: String,
+    /// `bun.lock` or `bun.lockb`.
+    pub file: String,
+    /// The URL the entry installs from.
+    pub url: String,
+    /// The user-tarball warning the rewriter raised for the entry.
+    pub warning: RewriteWarning,
+}
+
+impl BunPatchShapedPin {
+    /// Record the entry of `file` that installs from `url`, when `url` is
+    /// in the patch server's path shape for `dep`'s own patch.
+    pub(crate) fn record(
+        file: &str,
+        url: &str,
+        dep: &DepOverride,
+        warning: &RewriteWarning,
+        result: &mut RewriteResult,
+    ) {
+        if crate::origin::hosted_shape_uuid(url).as_deref() == Some(dep.patch_uuid.as_str()) {
+            result.bun_patch_shaped_pins.push(Self {
+                patch_uuid: dep.patch_uuid.clone(),
+                file: file.to_string(),
+                url: url.to_string(),
+                warning: warning.clone(),
+            });
+        }
+    }
 }
 
 // ── uv.lock ──────────────────────────────────────────────────────────────────
@@ -18796,75 +18836,46 @@ mod tests {
         }
     }
 
-    /// #2279: a hosted pin of the SAME patch that an earlier run wrote on
-    /// another host (the patch server, in a run that moves pins onto a
-    /// patch mirror) is not a user's tarball: that copy is patched. It is
-    /// left as it is, without the UNPATCHED warning and without keeping
-    /// the uuid out of the in-run VEX; with nothing to rewire, the run
-    /// says so. A pin of another patch in the same shape is still a copy
-    /// this patch does not reach.
+    /// #2279: the rewriter knows no host but the one it writes, so the pin
+    /// an earlier run wrote for the SAME patch on another host (the patch
+    /// server, in a run that moves pins onto a patch mirror) is left as any
+    /// user tarball is, with the same warning. It is also recorded with
+    /// that warning, so that a caller that knows the run's patch servers
+    /// can say what is true of it. A pin of another patch in the same
+    /// shape, or a plain user tarball, is not recorded.
     #[test]
-    fn bun_lock_pin_of_the_same_patch_on_another_host_is_not_a_user_tarball() {
+    fn bun_lock_pin_of_the_same_patch_on_another_host_is_recorded() {
         let sha512 = format!("sha512-{}==", "A".repeat(86));
         let token = "22222222-2222-4222-8222-222222222222";
         let uuid = "11111111-1111-4111-8111-111111111111";
-        let served =
-            |uuid: &str| format!("patch/npm/is-number/6.0.0/{token}/{uuid}/is-number-6.0.0.tgz");
+        let served = |uuid: &str| {
+            format!(
+                "https://patch.socket.dev/patch/npm/is-number/6.0.0/{token}/{uuid}/\
+                 is-number-6.0.0.tgz"
+            )
+        };
         let ovr = npm_override(
             "is-number",
             "6.0.0",
-            &format!(
-                "https://repo.example/artifactory/socket-patch/{}",
-                served(uuid)
+            &served(uuid).replace(
+                "https://patch.socket.dev",
+                "https://repo.example/artifactory/socket-patch",
             ),
             &sha512,
         );
         assert_eq!(ovr.patch_uuid, uuid);
-        let direct = format!(
-            "\"is-number\": [\"is-number@https://patch.socket.dev/{}\", {{}}, \"{sha512}\"],",
-            served(uuid)
-        );
-        let nested = "\"is-odd/is-number\": [\"is-number@6.0.0\", \"\", {}, \"sha512-UP==\"],";
+        let entry =
+            |url: &str| format!("\"is-number\": [\"is-number@{url}\", {{}}, \"{sha512}\"],");
+        let run = |lock: &str| {
+            let mut files = BTreeMap::new();
+            files.insert("bun.lock".to_string(), bun_lock_file(lock, 2));
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+            r
+        };
 
-        // The direct pin alone: nothing is rewired, and nothing is called
-        // unpatched.
-        let mut files = BTreeMap::new();
-        files.insert("bun.lock".to_string(), bun_lock_file(&direct, 2));
-        let mut r = RewriteResult::default();
-        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        let r = run(&entry(&served(uuid)));
         assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
-        assert_eq!(
-            warning_codes(&r),
-            vec!["redirect_bun_entry_not_found"],
-            "{:?}",
-            r.warnings
-        );
-        assert!(r.bundled_skipped_uuids.is_empty());
-
-        // Beside a registry copy: that copy is pinned, the direct pin stays.
-        let both = format!("{direct}\n    {nested}");
-        let mut files = BTreeMap::new();
-        files.insert("bun.lock".to_string(), bun_lock_file(&both, 2));
-        let mut r = RewriteResult::default();
-        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
-        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
-        assert_eq!(r.edits[0].key.as_deref(), Some("is-odd/is-number"));
-        assert!(
-            r.files["bun.lock"].contains(&direct),
-            "the direct pin is untouched"
-        );
-        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
-        assert!(r.bundled_skipped_uuids.is_empty());
-
-        // The same shape for ANOTHER patch is not this patch's copy.
-        let other = format!(
-            "\"is-number\": [\"is-number@https://patch.socket.dev/{}\", {{}}, \"{sha512}\"],",
-            served("99999999-9999-4999-8999-999999999999")
-        );
-        let mut files = BTreeMap::new();
-        files.insert("bun.lock".to_string(), bun_lock_file(&other, 2));
-        let mut r = RewriteResult::default();
-        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
         assert_eq!(
             warning_codes(&r),
             vec!["redirect_bun_non_registry_entry_skipped"],
@@ -18872,6 +18883,29 @@ mod tests {
             r.warnings
         );
         assert!(r.bundled_skipped_uuids.contains(uuid));
+        assert_eq!(
+            r.bun_patch_shaped_pins,
+            vec![BunPatchShapedPin {
+                patch_uuid: uuid.into(),
+                file: "bun.lock".into(),
+                url: served(uuid),
+                warning: r.warnings[0].clone(),
+            }]
+        );
+
+        for other in [
+            served("99999999-9999-4999-8999-999999999999"),
+            "https://registry.npmjs.org/is-number/-/is-number-6.0.0.tgz".to_string(),
+        ] {
+            let r = run(&entry(&other));
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_bun_non_registry_entry_skipped"],
+                "{other}: {:?}",
+                r.warnings
+            );
+            assert!(r.bun_patch_shaped_pins.is_empty(), "{other}");
+        }
     }
 
     /// #580: the bundled check runs only for entries whose spec matches the

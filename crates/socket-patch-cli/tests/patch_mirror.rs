@@ -568,6 +568,93 @@ async fn a_bun_pin_on_the_patch_server_is_named_and_not_called_unpatched() {
     }
 }
 
+/// #2279: the earlier pin is named even when the run pins another copy of
+/// the package on the mirror: the lock still fetches the first copy from
+/// the patch server, which a build that reaches only the mirror cannot.
+#[tokio::test]
+#[serial]
+async fn a_bun_pin_left_beside_a_copy_moved_to_the_mirror_is_named() {
+    let api = MockServer::start().await;
+    mock_socket(&api, &[BUN]).await;
+    let mirror = MockServer::start().await;
+    mirror_answers(&mirror, BUN, 200).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_bun_project(tmp.path(), "bun.lock");
+    hosted_scan(tmp.path(), &api, &[], &[]);
+    // A later install adds a nested copy from the registry.
+    let lock = tmp.path().join("bun.lock");
+    let pinned = std::fs::read_to_string(&lock).unwrap();
+    let nested = format!(
+        "    \"is-odd/{0}\": [\"{0}@{1}\", \"\", {{}}, \"sha512-UPSTREAMupstream==\"],\n  }}\n}}\n",
+        BUN.name, BUN.version
+    );
+    let grown = pinned.replacen("  }\n}\n", &nested, 1);
+    assert_ne!(grown, pinned, "{pinned}");
+    std::fs::write(&lock, &grown).unwrap();
+
+    let moved = hosted_scan(
+        tmp.path(),
+        &api,
+        &["--patch-mirror-url", &mirror_base(&mirror)],
+        &[],
+    );
+    let env = moved.json();
+    let after = std::fs::read_to_string(&lock).unwrap();
+    assert!(
+        after.contains(&mirrored_url(&mirror, BUN)),
+        "the registry copy is pinned on the mirror: {after}"
+    );
+    assert!(
+        after.contains(&format!("{}{}", api.uri(), BUN.served_path())),
+        "the earlier pin is left as it is: {after}"
+    );
+    let codes = warning_codes(&env);
+    assert!(
+        codes.contains(&"redirect_mirror_pin_not_moved".to_string())
+            && !codes.contains(&"redirect_bun_non_registry_entry_skipped".to_string()),
+        "{env:#}"
+    );
+}
+
+/// The earlier pin is taken for the patched copy only on a patch server of
+/// this run. The same `bun.lockb` in a run whose patch server is another
+/// host holds a URL nobody vouches for: it stays a user's tarball, reported
+/// unpatched, and no mirror warning speaks of it.
+#[tokio::test]
+#[serial]
+async fn a_bun_pin_on_a_host_the_run_does_not_know_stays_a_user_tarball() {
+    let earlier = MockServer::start().await;
+    mock_socket(&earlier, &[BUN]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_bun_project(tmp.path(), "bun.lockb");
+    hosted_scan(tmp.path(), &earlier, &[], &[]);
+    let pinned = std::fs::read(tmp.path().join("bun.lockb")).unwrap();
+
+    let api = MockServer::start().await;
+    mock_socket(&api, &[BUN]).await;
+    let mirror = MockServer::start().await;
+    mirror_answers(&mirror, BUN, 200).await;
+    let moved = hosted_scan(
+        tmp.path(),
+        &api,
+        &["--patch-mirror-url", &mirror_base(&mirror)],
+        &[],
+    );
+    let env = moved.json();
+    let codes = warning_codes(&env);
+    assert!(
+        codes.contains(&"redirect_bun_non_registry_entry_skipped".to_string())
+            && !codes.contains(&"redirect_mirror_pin_not_moved".to_string()),
+        "{env:#}"
+    );
+    assert_ne!(event(&env, BUN), applied(), "{env:#}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("bun.lockb")).unwrap(),
+        pinned,
+        "nothing is written"
+    );
+}
+
 /// What the run needs for itself it downloads from the patch server, not
 /// from the mirror, which may want credentials the run does not have. A
 /// yarn classic pin reads the served tarball (its sha1 goes into the

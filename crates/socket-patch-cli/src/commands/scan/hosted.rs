@@ -127,22 +127,25 @@ pub(crate) const MIRROR_PIN_NOT_MOVED: &str = "redirect_mirror_pin_not_moved";
 /// Without this the run would report such a patch with only the
 /// rewriter's own, unrelated-looking reason.
 ///
-/// A binary `bun.lockb` is in no text of `files`: its pins are read from
-/// the URLs its records resolved from (`bun_binary_urls`). `rollback`
-/// refuses a `bun.lockb` pin, so the remedy there is the lock as it was
-/// before the pin.
+/// The Bun rewriters name such a pin themselves
+/// ([`BunPatchShapedPin`](socket_patch_core::patch::redirect::BunPatchShapedPin)),
+/// which is how one inside a binary `bun.lockb` is seen at all. They take
+/// it for a user's tarball, since they know no host but the mirror; for a
+/// pin on a patch server of this run that warning is retracted from
+/// `rewrite` here, because the copy is the patched one, and this warning is
+/// given in its place, also when another copy of the package was pinned
+/// on the mirror: the lock still fetches this one from the patch server.
+/// `rollback` refuses a `bun.lockb` pin, so the remedy there is the lock
+/// as it was before the pin.
 fn mirror_pins_not_moved(
     mirror_sources: &socket_patch_core::hosted::engine::MirrorSources,
     candidates: &[socket_patch_core::hosted::engine::Candidate],
     confirmed: &[(String, String)],
     files: &std::collections::BTreeMap<String, String>,
-    bun_binary_urls: &str,
+    rewrite: &mut socket_patch_core::patch::redirect::RewriteResult,
 ) -> Vec<socket_patch_core::patch::redirect::RewriteWarning> {
-    const BUN_LOCKB: &str = "bun.lockb";
-    let texts = files
-        .iter()
-        .map(|(path, text)| (path.as_str(), text.as_str()))
-        .chain(std::iter::once((BUN_LOCKB, bun_binary_urls)));
+    use socket_patch_core::vex::discover::hosted_host_in_text;
+
     // By origin: an earlier pin of the patch may carry another grant token
     // in its path.
     let served: Vec<String> = mirror_sources
@@ -152,20 +155,27 @@ fn mirror_pins_not_moved(
         .into_iter()
         .collect();
     let mirrored: std::collections::BTreeSet<&str> = mirror_sources.mirrored_urls().collect();
-    candidates
+    let mut retracted = Vec::new();
+    let warnings = candidates
         .iter()
         .filter(|c| mirrored.contains(c.dep.artifact_url.as_str()))
-        .filter(|c| !confirmed.iter().any(|(_, uuid)| uuid == &c.dep.patch_uuid))
         .filter_map(|c| {
-            let (file, host) = texts.clone().find_map(|(path, text)| {
-                socket_patch_core::vex::discover::hosted_host_in_text(
-                    text,
-                    &c.dep.patch_uuid,
-                    &served,
-                )
-                .map(|host| (path, host))
-            })?;
-            let remedy = if file == BUN_LOCKB {
+            let uuid = c.dep.patch_uuid.as_str();
+            let bun = rewrite
+                .bun_patch_shaped_pins
+                .iter()
+                .filter(|pin| pin.patch_uuid == uuid)
+                .filter_map(|pin| Some((pin, hosted_host_in_text(&pin.url, uuid, &served)?)))
+                .collect::<Vec<_>>();
+            retracted.extend(bun.iter().map(|(pin, _)| pin.warning.clone()));
+            let (file, host) = match bun.into_iter().next() {
+                Some((pin, host)) => (pin.file.as_str(), host),
+                None if confirmed.iter().any(|(_, done)| done == uuid) => return None,
+                None => files.iter().find_map(|(path, text)| {
+                    hosted_host_in_text(text, uuid, &served).map(|host| (path.as_str(), host))
+                })?,
+            };
+            let remedy = if file == "bun.lockb" {
                 "restore bun.lockb to its content before the pin (from version control: \
                  `socket-patch rollback` cannot restore a pin in a binary lock) and then run \
                  this command again"
@@ -189,7 +199,9 @@ fn mirror_pins_not_moved(
                 ),
             ))
         })
-        .collect()
+        .collect();
+    rewrite.warnings.retain(|w| !retracted.contains(w));
+    warnings
 }
 
 /// Ask the patch mirror about every mirrored pin this run would newly
@@ -2204,7 +2216,7 @@ async fn run_redirect_selected_untracked(
         &candidates,
         &done.confirmed,
         &done.files,
-        &done.bun_binary_urls,
+        &mut done.rewrite,
     ));
     let takeover::Finished {
         warnings: takeover_pre_warnings,
