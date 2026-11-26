@@ -109,7 +109,10 @@
 //! registry redirects. VEX names each locked build (`platform_vex_matrix`,
 //! over the fresh checkout the real bundler installed): a patched build
 //! under its own patch, a build on upstream's gem as affected, whichever of
-//! the two this machine holds.
+//! the two this machine holds. A lock that names such a gem as its ruby
+//! gem alone (for the `ruby` platform alone, and beside native platforms)
+//! takes the registry without the snapshot level: bundler installs the
+//! patched ruby gem, never the machine's unpatched platform gem.
 //!
 //! VERSION MATRIX: the arms run on bundler 1.17 → 4.x (the CHECKSUMS arm
 //! from 2.6, the CHECKSUMS-era floor; every other arm from 1.17). Pick the
@@ -7302,9 +7305,31 @@ impl PlatformService {
 /// What the patch registry sends with every index response.
 const REGISTRY_INDEX_HEADERS: &[(&str, &str)] = &[("Cache-Control", "public, no-cache")];
 
+/// How the fixture project's lock names the fixture gem, of which upstream
+/// publishes a ruby gem and platform gems.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Locked {
+    /// As the platform gems of this machine's platform and of a foreign
+    /// one. `ruby_entry` picks the lock's PLATFORMS: without `ruby` the
+    /// lock holds the platform builds alone, with it bundler keeps the
+    /// ruby-platform `name (version)` entry beside them (what bundler 4
+    /// locks by default for a gem that also ships a ruby gem).
+    Builds { ruby_entry: bool },
+    /// As its ruby-platform gem alone, for the `ruby` platform alone: the
+    /// lock of a bundler that was told to take ruby gems
+    /// (`force_ruby_platform`), a setting the checkout does not carry. For
+    /// such a lock bundler installs the platform gem of the machine where
+    /// the gem's source lists one.
+    RubyAlone,
+    /// As its ruby-platform gem alone, with native platforms in PLATFORMS:
+    /// the Gemfile declares the gem `force_ruby_platform: true`.
+    RubyForced,
+}
+
 /// A project the real bundler locked to the fixture gem's platform gems of
 /// this machine's platform ([`Self::own`]) and of one it is not
-/// ([`Self::foreign`]) and installed, with the stand-in patch service.
+/// ([`Self::foreign`]) and installed, with the stand-in patch service. (Or
+/// to its ruby-platform gem alone: [`Locked`].)
 struct PlatformProject {
     /// The project, its pair before any scan, and the wiremock that plays
     /// the upstream registry, the patch registry and the patches API.
@@ -7330,15 +7355,8 @@ struct PlatformProject {
 }
 
 impl PlatformProject {
-    /// Build the gems, start both servers, and let the real bundler lock
-    /// and install the project. Upstream publishes the gem as a ruby gem
-    /// and as platform gems for this machine's platform, a foreign one and
-    /// each of `more`; the lock names the first two. `ruby_entry` picks the
-    /// lock's PLATFORMS: without `ruby` the lock holds the platform builds
-    /// alone, with it bundler keeps the ruby-platform `name (version)`
-    /// entry beside them (what bundler 4 locks by default for a gem that
-    /// also ships a ruby gem). `None`: the bundler is below `floor` or
-    /// missing (said on stdout).
+    /// [`Self::start_locked`] with a lock that names the platform gems of
+    /// this machine's platform and of a foreign one ([`Locked::Builds`]).
     async fn start(
         tag: &str,
         floor: (u32, u32),
@@ -7346,6 +7364,22 @@ impl PlatformProject {
         ruby_entry: bool,
         more: &[&str],
     ) -> Option<PlatformProject> {
+        Self::start_locked(tag, floor, checksums, Locked::Builds { ruby_entry }, more).await
+    }
+
+    /// Build the gems, start both servers, and let the real bundler lock
+    /// and install the project. Upstream publishes the gem as a ruby gem
+    /// and as platform gems for this machine's platform, a foreign one and
+    /// each of `more`; `locked` says which of them the lock names. `None`:
+    /// the bundler is below `floor` or missing (said on stdout).
+    async fn start_locked(
+        tag: &str,
+        floor: (u32, u32),
+        checksums: bool,
+        locked: Locked,
+        more: &[&str],
+    ) -> Option<PlatformProject> {
+        let ruby_entry = locked == (Locked::Builds { ruby_entry: true });
         let bundler = bundler_e2e::gate("e2e_redirect_gem_build", tag, floor, &|c| {
             cache_env::isolate(c);
         })?;
@@ -7416,9 +7450,13 @@ impl PlatformProject {
         // The project, locked and installed by the real bundler.
         let proj = tmp.path().join("proj");
         std::fs::create_dir_all(&proj).unwrap();
+        let declaration = match locked {
+            Locked::RubyForced => format!("gem \"{DEP}\", force_ruby_platform: true"),
+            Locked::Builds { .. } | Locked::RubyAlone => format!("gem \"{DEP}\""),
+        };
         std::fs::write(
             proj.join("Gemfile"),
-            format!("source \"{}/upstream\"\n\ngem \"{DEP}\"\n", server.uri()),
+            format!("source \"{}/upstream\"\n\n{declaration}\n", server.uri()),
         )
         .unwrap();
         let config_args = bundler.config_local_args("path", "vendor/bundle");
@@ -7430,49 +7468,89 @@ impl PlatformProject {
                 &["config", "set", "--local", "lockfile_checksums", "false"],
             );
         }
+        let prefers_ruby_gems = ["--local", "force_ruby_platform"];
+        if locked == Locked::RubyAlone {
+            let mut set = vec!["config", "set"];
+            set.extend(prefers_ruby_gems);
+            set.push("true");
+            bundle_ok(&proj, &set);
+        }
         bundle_ok(&proj, &["install"]);
-        bundle_ok(&proj, &["lock", "--add-platform", &foreign]);
-        // Bundler adds platforms by itself to a lock it creates (4.0.15
-        // does): `ruby` when every locked gem has a ruby-platform gem, and
-        // the common platforms every locked gem has a gem for. Pin the
-        // shape either way.
-        let locks = |platform: &str| {
+        // The PLATFORMS section of the lock as it stands.
+        let locked_platforms = || -> Vec<String> {
             let lock = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
             let platforms = lock.split("\nPLATFORMS\n").nth(1).unwrap_or_default();
             let platforms = platforms.split("\n\n").next().unwrap_or_default();
-            platforms.lines().any(|line| line.trim() == platform)
+            platforms
+                .lines()
+                .map(|line| line.trim().to_string())
+                .collect()
         };
-        if ruby_entry && !locks("ruby") {
-            bundle_ok(&proj, &["lock", "--add-platform", "ruby"]);
-        } else if !ruby_entry && locks("ruby") {
-            bundle_ok(&proj, &["lock", "--remove-platform", "ruby"]);
-        }
-        for platform in more {
-            if locks(platform) {
-                bundle_ok(&proj, &["lock", "--remove-platform", platform]);
+        if let Locked::Builds { .. } = locked {
+            bundle_ok(&proj, &["lock", "--add-platform", &foreign]);
+            // Bundler adds platforms by itself to a lock it creates (4.0.15
+            // does): `ruby` when every locked gem has a ruby-platform gem,
+            // and the common platforms every locked gem has a gem for. Pin
+            // the shape either way.
+            let locks = |platform: &str| locked_platforms().iter().any(|p| p == platform);
+            if ruby_entry && !locks("ruby") {
+                bundle_ok(&proj, &["lock", "--add-platform", "ruby"]);
+            } else if !ruby_entry && locks("ruby") {
+                bundle_ok(&proj, &["lock", "--remove-platform", "ruby"]);
+            }
+            for platform in more {
+                if locks(platform) {
+                    bundle_ok(&proj, &["lock", "--remove-platform", platform]);
+                }
             }
         }
         if checksums {
             bundle_ok(&proj, &["lock", "--add-checksums"]);
         }
+        if locked == Locked::RubyAlone {
+            // The checkout does not carry the setting the lock was made
+            // under: from here on bundler takes the machine's platform gem
+            // for the plain entry where the gem's source lists one.
+            let mut unset = vec!["config", "unset"];
+            unset.extend(prefers_ruby_gems);
+            bundle_ok(&proj, &unset);
+        }
         let pristine_gemfile = std::fs::read(proj.join("Gemfile")).unwrap();
         let pristine_lock = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
-        for platform in platforms {
-            assert!(
-                pristine_lock.contains(&format!("    {DEP} ({})\n", build_token(Some(platform)))),
-                "the fixture lock must pin the {platform} build:\n{pristine_lock}"
-            );
+        let entries = pristine_lock.matches(&format!("    {DEP} (")).count();
+        let ruby_gem_locked = pristine_lock.contains(&format!("    {DEP} ({DEP_VERSION})\n"));
+        match locked {
+            Locked::Builds { .. } => {
+                for platform in platforms {
+                    let token = build_token(Some(platform));
+                    assert!(
+                        pristine_lock.contains(&format!("    {DEP} ({token})\n")),
+                        "the fixture lock must pin the {platform} build:\n{pristine_lock}"
+                    );
+                }
+                assert_eq!(
+                    ruby_gem_locked, ruby_entry,
+                    "the fixture lock's ruby-platform entry must match the case:\n{pristine_lock}"
+                );
+                assert_eq!(
+                    entries,
+                    2 + usize::from(ruby_entry),
+                    "the fixture lock must name no other build:\n{pristine_lock}"
+                );
+            }
+            Locked::RubyAlone | Locked::RubyForced => {
+                assert!(
+                    ruby_gem_locked && entries == 1,
+                    "the fixture lock must name the ruby-platform gem alone:\n{pristine_lock}"
+                );
+                let native = locked_platforms().iter().any(|p| p != "ruby");
+                assert_eq!(
+                    native,
+                    locked == Locked::RubyForced,
+                    "the fixture lock's PLATFORMS must match the case:\n{pristine_lock}"
+                );
+            }
         }
-        assert_eq!(
-            pristine_lock.contains(&format!("    {DEP} ({DEP_VERSION})\n")),
-            ruby_entry,
-            "the fixture lock's ruby-platform entry must match the case:\n{pristine_lock}"
-        );
-        assert_eq!(
-            pristine_lock.matches(&format!("    {DEP} (")).count(),
-            2 + usize::from(ruby_entry),
-            "the fixture lock must name no other build:\n{pristine_lock}"
-        );
         assert_eq!(
             pristine_lock.contains("\nCHECKSUMS\n"),
             checksums,
@@ -7500,11 +7578,14 @@ impl PlatformProject {
             checksums,
             ruby_entry,
         };
+        let warm = match locked {
+            Locked::Builds { .. } => project.installed_lib(&project.fx.proj),
+            Locked::RubyAlone | Locked::RubyForced => project.installed_ruby_lib(&project.fx.proj),
+        };
         assert_eq!(
-            std::fs::read_to_string(project.installed_lib(&project.fx.proj))
-                .expect("bundler installed the platform gem"),
+            std::fs::read_to_string(warm).expect("bundler installed the gem the lock names"),
             orig,
-            "premise: the upstream platform gem is installed before the scan"
+            "premise: upstream's gem is installed before the scan"
         );
         Some(project)
     }
@@ -7538,6 +7619,58 @@ impl PlatformProject {
     /// installed it under `dir`.
     fn installed_lib(&self, dir: &Path) -> PathBuf {
         fresh_installed_lib(dir, &self.own_leaf(), "vuln_gem.rb")
+    }
+
+    /// `lib/vuln_gem.rb` of the ruby-platform gem as bundler installed it
+    /// under `dir`.
+    fn installed_ruby_lib(&self, dir: &Path) -> PathBuf {
+        fresh_installed_lib(dir, &format!("{DEP}-{DEP_VERSION}"), "vuln_gem.rb")
+    }
+
+    /// `dir` holds the patched ruby-platform gem and no platform gem of
+    /// this machine, and Ruby loads the patched file from the ruby gem.
+    fn assert_patched_ruby_gem_installed(&self, dir: &Path) {
+        assert_eq!(
+            std::fs::read_to_string(self.installed_ruby_lib(dir))
+                .expect("the ruby-platform gem is installed"),
+            self.service.patched,
+            "the install holds the file of the patched ruby gem"
+        );
+        assert!(
+            !self.installed_lib(dir).exists(),
+            "no platform gem of this machine is installed for the plain entry"
+        );
+        let probe = bundle(
+            dir,
+            &[
+                "exec",
+                "ruby",
+                "-e",
+                "require \"vuln_gem\"\nputs VulnGem.status\nputs VulnGem::BUILD\nputs TinyDep::VALUE\nputs $LOADED_FEATURES.grep(%r{/vuln_gem\\.rb\\z})",
+            ],
+        );
+        assert!(
+            probe.status.success(),
+            "bundle exec require probe failed.\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&probe.stdout),
+            String::from_utf8_lossy(&probe.stderr),
+        );
+        let out = String::from_utf8_lossy(&probe.stdout).into_owned();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines.len(),
+            4,
+            "status, build, dep and the loaded file:\n{out}"
+        );
+        assert_eq!(
+            lines[..3],
+            [patched_marker().as_str(), "ruby", "tiny-ok"],
+            "Ruby loads the patched file, from the ruby gem:\n{out}"
+        );
+        assert!(
+            lines[3].contains(&format!("/gems/{DEP}-{DEP_VERSION}/lib/")),
+            "vuln_gem.rb loads from the installed ruby gem:\n{out}"
+        );
     }
 
     /// From now on the service has the platform gems as `listing` says
@@ -9016,6 +9149,171 @@ async fn gem_hosted_platform_gem_waits_quietly_for_its_patched_builds() {
     p.assert_hosted_pair(&index_url, &[(&own, true), (&foreign, true)]);
     let fresh = p.install_fresh("fresh", &[("BUNDLE_FROZEN", "true")]);
     p.assert_installed(&fresh, true);
+}
+
+/// A gem the lock names as its ruby-platform gem alone, of which upstream
+/// also publishes platform gems, under a reference that names the registry
+/// at a snapshot and lists the version's gems: this machine's platform on
+/// upstream's own gem, the foreign one patched. The registry at a snapshot
+/// lists every platform gem, and for a plain entry of a lock for `ruby`
+/// alone bundler takes the machine's platform gem where the source lists
+/// one, which here is upstream's unpatched gem. So such a gem takes the
+/// registry without the snapshot level, which lists the patched gems only:
+///
+///   1. the scan writes the pair a reference with no snapshot gives: the
+///      `source:` option and the lock's remote name the registry without
+///      the snapshot level, `CHECKSUMS` pins the patched ruby gem, PLATFORMS
+///      stays as it was, the run reports one `applied` event under the
+///      gem's patch, and the copy bundler had installed is replaced with
+///      the patched ruby gem;
+///   2. `bundle lock` leaves that lock byte for byte, and `bundle install`
+///      (in the project, and from a fresh checkout, frozen and not)
+///      installs the patched ruby gem and no platform gem;
+///   3. a scan under a newer snapshot changes nothing.
+async fn ruby_gem_alone_takes_the_registry_without_a_snapshot(tag: &str, locked: Locked) {
+    let Some(mut p) = PlatformProject::start_locked(tag, (2, 6), true, locked, &[]).await else {
+        return;
+    };
+    let (own, foreign) = (p.own.clone(), p.foreign.clone());
+    if locked == Locked::RubyAlone && p.fx.bundler.at_least(4, 0) {
+        // Premise, on the pair before any scan: for the plain entry
+        // bundler installs this machine's platform gem, which the gem's
+        // source lists.
+        let premise = stage_fresh_checkout(&p.fx, "premise");
+        let install = bundle_env(&premise, &["install"], &[("BUNDLE_FROZEN", "true")]);
+        assert!(
+            install.status.success(),
+            "premise install failed:\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        assert!(
+            p.installed_lib(&premise).exists() && !p.installed_ruby_lib(&premise).exists(),
+            "premise: bundler {} takes the machine's platform gem for the plain entry",
+            p.fx.bundler.version
+        );
+    }
+    let listing = [
+        (own.as_str(), Has::Upstream),
+        (foreign.as_str(), Has::Patched),
+    ];
+    let snapshot = p.serve(Some(&listing)).await;
+    let root = format!("{}/patch-registry/gem/{TOKEN}/{UUID}/", p.api());
+    assert!(
+        snapshot.starts_with(&format!("{root}s/")),
+        "premise: the reference names the registry at a snapshot: {snapshot}"
+    );
+    let pinned = serde_json::json!({
+        "action": "applied", "purl": PURL, "uuid": UUID, "details": { "mode": "hosted" },
+    });
+    let platforms_of = |lock: &str| -> String {
+        let platforms = lock.split("\nPLATFORMS\n").nth(1).unwrap_or_default();
+        platforms
+            .split("\n\n")
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // 1. The hosted scan.
+    let env = p.scan(&[]);
+    assert_eq!(hosted_events(&env), [pinned.clone()], "{env}");
+    assert_eq!(
+        warning_codes(&env),
+        ["redirect_gem_install_refreshed"],
+        "{env}"
+    );
+    let last_argument = match locked {
+        Locked::RubyForced => "force_ruby_platform: true".to_string(),
+        Locked::Builds { .. } | Locked::RubyAlone => format!("gem \"{DEP}\""),
+    };
+    let gemfile = p.gemfile();
+    assert_eq!(
+        gemfile,
+        with_source_option(&p.pristine_gemfile(), &last_argument, &root),
+        "the Gemfile names the registry without the snapshot level"
+    );
+    let lock = p.lock();
+    assert!(
+        lock.contains(&format!(
+            "  remote: {root}\n  specs:\n    {DEP} ({DEP_VERSION})\n      {TRANSITIVE}"
+        )),
+        "the gem is under the registry without the snapshot level:\n{lock}"
+    );
+    assert!(!lock.contains(&snapshot), "{lock}");
+    assert_eq!(
+        lock.matches(&format!("    {DEP} (")).count(),
+        1,
+        "the plain entry alone:\n{lock}"
+    );
+    assert!(
+        lock.contains(&format!(
+            "  {DEP} ({DEP_VERSION}) sha256={}\n",
+            p.service.sha(None, true)
+        )),
+        "CHECKSUMS pins the patched ruby gem:\n{lock}"
+    );
+    assert!(
+        lock.contains(&format!("\nDEPENDENCIES\n  {DEP}!\n")),
+        "DEPENDENCIES is source-pinned:\n{lock}"
+    );
+    assert_eq!(
+        platforms_of(&lock),
+        platforms_of(&p.pristine_lock()),
+        "PLATFORMS is as bundler wrote it"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.installed_ruby_lib(&p.fx.proj)).unwrap(),
+        p.service.patched,
+        "the copy bundler had installed is the patched ruby gem"
+    );
+
+    // 2. Bundler takes the pair as it is, and installs the patched ruby gem.
+    assert_eq!(
+        p.bundler_lock("relock", &gemfile, &lock),
+        lock,
+        "`bundle lock` must leave the lock byte-identical (bundler {})",
+        p.fx.bundler.version
+    );
+    bundle_ok(&p.fx.proj, &["install"]);
+    assert_eq!(p.lock(), lock, "`bundle install` leaves the lock alone");
+    p.assert_patched_ruby_gem_installed(&p.fx.proj);
+    let frozen = p.install_fresh("frozen", &[("BUNDLE_FROZEN", "true")]);
+    p.assert_patched_ruby_gem_installed(&frozen);
+    let unfrozen = p.install_fresh("unfrozen", &[]);
+    p.assert_patched_ruby_gem_installed(&unfrozen);
+
+    // 3. A newer snapshot, in which this machine's platform has a patched
+    // build too. Nothing of it concerns a lock that names no platform build.
+    let every = [
+        (own.as_str(), Has::Patched),
+        (foreign.as_str(), Has::Patched),
+    ];
+    let newer = p.serve(Some(&every)).await;
+    assert_ne!(newer, snapshot, "a newer snapshot is another URL");
+    let env = p.scan(&[]);
+    assert_eq!(
+        env["redirect"]["rewrittenFiles"],
+        serde_json::json!([]),
+        "{env}"
+    );
+    assert_eq!(hosted_events(&env), [pinned], "{env}");
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(p.lock(), lock);
+    assert_eq!(p.gemfile(), gemfile);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6 for the CHECKSUMS lock); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_ruby_gem_alone_for_the_ruby_platform_installs_the_patched_ruby_gem() {
+    ruby_gem_alone_takes_the_registry_without_a_snapshot("ruby-alone", Locked::RubyAlone).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6 for the CHECKSUMS lock); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_ruby_gem_alone_beside_native_platforms_installs_the_patched_ruby_gem() {
+    ruby_gem_alone_takes_the_registry_without_a_snapshot("ruby-forced", Locked::RubyForced).await;
 }
 
 /// A newer registry snapshot upgrades a hosted lock. This machine's
