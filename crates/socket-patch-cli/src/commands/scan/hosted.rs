@@ -546,6 +546,13 @@ struct StaleInstallOutcome {
     /// The gem probe's stale materializations, one per warning, for the
     /// refresh that follows it ([`refresh_stale_gems`]).
     gems: Vec<StaleGem>,
+    /// The gem probe's copies of a platform build the patch registry
+    /// serves as upstream's own gem that are another build: a patched
+    /// build that was withdrawn. The refresh puts upstream's gem in their
+    /// place. Not among `stale_purls`: the document says `affected` of
+    /// such a build whatever is installed, and its copy says nothing of
+    /// the gem's other builds.
+    withdrawn: Vec<StaleGem>,
 }
 
 /// The gem and Python stale-install probes' fallback: when a confirmed
@@ -632,7 +639,17 @@ fn stale_installed_gem(
 /// guard" section of CLI_CONTRACT.md). `why` is why the refresh did not fix
 /// it; `None` describes it before any refresh.
 fn gem_stale_warning(gem: &StaleGem, why: Option<&gem_refresh::Why>) -> serde_json::Value {
-    let direction = gem_refresh::Direction::Patched;
+    gem_stale_warning_of(gem_refresh::Direction::Patched, gem, why)
+}
+
+/// [`gem_stale_warning`] for a materialization that is stale in
+/// `direction`: an unpatched copy of a patched build, or the copy of a
+/// withdrawn build where the lock pins upstream's gem.
+fn gem_stale_warning_of(
+    direction: gem_refresh::Direction,
+    gem: &StaleGem,
+    why: Option<&gem_refresh::Why>,
+) -> serde_json::Value {
     serde_json::json!({
         "code": direction.stale_code(),
         "detail": gem_refresh::stale_detail(direction, gem, why),
@@ -690,10 +707,15 @@ fn stale_cache_gem(purl: &str, cache_path: &Path) -> StaleGem {
 ///   judged the same way, against the patched artifacts of the gem, which
 ///   include its patched platform builds.
 /// * A platform build the patch registry serves as upstream's own gem (no
-///   patched build yet; `gem_upstream_leaves` names it by leaf) is not
-///   judged at all, installed or committed to the cache dir: its lock
-///   entry pins upstream's gem, so a machine of that platform holds the
-///   right copy, and there is nothing to report or to refresh.
+///   patched build; `gem_upstream` gives the sha256 of that gem by leaf)
+///   is pinned to upstream's gem by its lock entry. Its installed copy and
+///   its archive in the cache dir are judged by that sha256 alone: an
+///   archive that is upstream's gem is the right copy, and nothing is
+///   reported, refreshed or downloaded for it. A readable archive with
+///   another sha256 is a patched build that was withdrawn (`withdrawn`):
+///   the lock does not install it, and `bundle install` keeps it. A copy
+///   whose gem home holds no archive of it is not judged: no patch record
+///   is fetched for a build that has no patch.
 /// * Which copies are judged is the lock's to say: every build of the gem
 ///   the project's lock names is looked for under its own leaf, in every
 ///   gem home. A gem home can hold several builds of one version (the
@@ -716,7 +738,7 @@ async fn gem_stale_install_warnings(
         (String, String),
         std::collections::BTreeSet<String>,
     >,
-    gem_upstream_leaves: &std::collections::BTreeSet<String>,
+    gem_upstream: &std::collections::BTreeMap<String, String>,
     views: &mut ViewFallback<'_>,
 ) -> StaleInstallOutcome {
     use socket_patch_core::crawlers::types::CrawlerOptions;
@@ -825,6 +847,11 @@ async fn gem_stale_install_warnings(
     }
     let mut dir_state: std::collections::BTreeMap<std::path::PathBuf, DirJudgment> =
         std::collections::BTreeMap::new();
+    // The installed copies of a build on upstream's gem that are another
+    // build: the candidate, the leaf, and whether the gem home is the
+    // project's own.
+    let mut withdrawn_dirs: std::collections::BTreeMap<std::path::PathBuf, (String, String, bool)> =
+        std::collections::BTreeMap::new();
     // Bundler's configured cache dir (`cache_path`, default vendor/cache).
     let app_cache = socket_patch_core::crawlers::ruby_crawler::bundler_app_cache_dir(cwd).await;
     // Copies with no local evidence, judged by the view fallback below.
@@ -840,8 +867,20 @@ async fn gem_stale_install_warnings(
             let Some(leaf) = dir.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            // Upstream's own gem is what the lock pins for this build.
-            if gem_upstream_leaves.contains(leaf) {
+            // Upstream's own gem is what the lock pins for this build: the
+            // archive RubyGems installed the copy from is that gem, or the
+            // copy is a build that was withdrawn.
+            if let Some(upstream_sha) = gem_upstream.get(leaf) {
+                let archive = gem_refresh::home_cache_archive(dir);
+                let installed_from = match &archive {
+                    Some(archive) => file_sha256_hex(archive).await,
+                    None => None,
+                };
+                if installed_from.is_some_and(|sha| !sha.eq_ignore_ascii_case(upstream_sha)) {
+                    withdrawn_dirs
+                        .entry(dir.clone())
+                        .or_insert_with(|| ((*purl).to_string(), leaf.to_string(), *project_local));
+                }
                 continue;
             }
             let entry = dir_state.entry(dir.clone()).or_insert_with(|| DirJudgment {
@@ -963,6 +1002,39 @@ async fn gem_stale_install_warnings(
         // qualifier-insensitively, so one left out would re-exempt the dir.
         out.stale_purls.extend(j.purls.iter().cloned());
     }
+    // The copies of a withdrawn build, each with the project's cache-dir
+    // archive of that build unless it is proven to be upstream's gem:
+    // bundler installs from it first.
+    let withdrawn = gem_refresh::Direction::Withdrawn;
+    for (dir, (purl, leaf, project_local)) in &withdrawn_dirs {
+        let project_cache = app_cache.join(format!("{leaf}.gem"));
+        let folded_cache = if *project_local && project_cache.is_file() {
+            let proven_upstream = match (
+                gem_upstream.get(leaf),
+                file_sha256_hex(&project_cache).await,
+            ) {
+                (Some(want), Some(got)) => got.eq_ignore_ascii_case(want),
+                _ => false,
+            };
+            (!proven_upstream).then_some(project_cache)
+        } else {
+            None
+        };
+        if let Some(archive) = &folded_cache {
+            cache_covered.insert(archive.clone());
+        }
+        let gem = stale_installed_gem(
+            purl,
+            dir,
+            leaf,
+            *project_local,
+            folded_cache.as_deref(),
+            false,
+        );
+        out.warnings
+            .push(gem_stale_warning_of(withdrawn, &gem, None));
+        out.withdrawn.push(gem);
+    }
 
     // Pass 3: standalone vendor/cache staleness — a committed archive whose
     // sha256 is readable and differs from the patched artifact's, unless a
@@ -971,23 +1043,32 @@ async fn gem_stale_install_warnings(
     // otherwise never warn). One archive per build the lock names: the
     // ruby gem's alone where no lock names the gem.
     for (index, (purl, _, _)) in candidates.iter().enumerate() {
-        let Some(want_shas) = gem_artifact_shas.get(&gem_sha_key(purl)) else {
-            continue;
-        };
+        let want_shas = gem_artifact_shas.get(&gem_sha_key(purl));
         let builds = match named[index].as_slice() {
             [] => GemBuild::ruby(purl).into_iter().collect(),
             builds => builds.to_vec(),
         };
-        for cache_path in builds
-            .iter()
-            .filter(|build| !gem_upstream_leaves.contains(&build.leaf))
-            .map(|build| app_cache.join(format!("{}.gem", build.leaf)))
-        {
+        for build in &builds {
+            let cache_path = app_cache.join(format!("{}.gem", build.leaf));
             if cache_covered.contains(&cache_path) || !cache_path.is_file() {
                 continue;
             }
             // Unreadable → no positive evidence, never a guess.
             let Some(got) = file_sha256_hex(&cache_path).await else {
+                continue;
+            };
+            // A build on upstream's gem: the archive is that gem, or a
+            // build that was withdrawn.
+            if let Some(upstream_sha) = gem_upstream.get(&build.leaf) {
+                if !got.eq_ignore_ascii_case(upstream_sha) {
+                    let gem = stale_cache_gem(purl, &cache_path);
+                    out.warnings
+                        .push(gem_stale_warning_of(withdrawn, &gem, None));
+                    out.withdrawn.push(gem);
+                }
+                continue;
+            }
+            let Some(want_shas) = want_shas else {
                 continue;
             };
             if want_shas.contains(&got) {
@@ -1013,11 +1094,17 @@ struct GemRefreshed {
     progress: Vec<String>,
     /// The one human warning for what is still stale.
     summary: Option<gem_refresh::Summary>,
+    /// The one human warning for the copies of a withdrawn build that are
+    /// still on disk.
+    withdrawn_summary: Option<gem_refresh::Summary>,
     /// The cache-dir archives replaced: files the project commits.
     replaced_archives: Vec<std::path::PathBuf>,
     /// An installed copy was replaced with the patched gem, or the upstream
     /// archive beside one patched in place was.
     replaced_installs: bool,
+    /// An installed copy of a withdrawn build was replaced with upstream's
+    /// gem.
+    replaced_withdrawn: bool,
 }
 
 /// What became of the copies of the switched gems that Bundler already
@@ -1031,12 +1118,23 @@ enum GemCopies {
     Refreshed,
     /// Some are still stale; the run's warning names the command.
     Stale,
+    /// Every stale one was brought in line with what the lock pins, and
+    /// for one of them that is upstream's gem: its patched build was
+    /// withdrawn.
+    Followed,
+    /// The copy of a withdrawn build is still installed, and nothing else
+    /// is stale; the run's warning names the command.
+    Withdrawn,
 }
 
 impl GemRefreshed {
     fn copies(&self) -> GemCopies {
         if self.summary.is_some() {
             GemCopies::Stale
+        } else if self.withdrawn_summary.is_some() {
+            GemCopies::Withdrawn
+        } else if self.replaced_withdrawn {
+            GemCopies::Followed
         } else if self.replaced_installs {
             GemCopies::Refreshed
         } else {
@@ -1052,6 +1150,12 @@ impl GemRefreshed {
 /// stale says so (the `--vex` exclusions are the second probe's). A
 /// refresh that fails changes nothing and leaves the warning; it never
 /// fails the run. `locked` is whether the run holds the apply lock.
+///
+/// The copy of a withdrawn build goes the other way under the same
+/// policy: it is replaced with upstream's gem, which the patch registry
+/// hands on for that platform (`<index>/gems/<leaf>.gem`), verified
+/// against the sha256 the reference lists for it. A build that was
+/// withdrawn may be unsafe to keep loading, and `bundle install` keeps it.
 #[allow(clippy::too_many_arguments)]
 async fn refresh_stale_gems(
     common: &crate::args::GlobalArgs,
@@ -1066,13 +1170,14 @@ async fn refresh_stale_gems(
         (String, String),
         std::collections::BTreeSet<String>,
     >,
-    gem_upstream_leaves: &std::collections::BTreeSet<String>,
+    gem_upstream: &std::collections::BTreeMap<String, String>,
     overrides: &[DepOverride],
     mirror_sources: &socket_patch_core::hosted::engine::MirrorSources,
     views: &mut ViewFallback<'_>,
 ) -> GemRefreshed {
     use socket_patch_core::patch::gem_refresh::{Source, Wanted};
     let direction = gem_refresh::Direction::Patched;
+    let withdrawn = gem_refresh::Direction::Withdrawn;
     let first = gem_stale_install_warnings(
         &common.cwd,
         common.global,
@@ -1080,11 +1185,11 @@ async fn refresh_stale_gems(
         confirmed,
         local_records,
         gem_artifact_shas,
-        gem_upstream_leaves,
+        gem_upstream,
         views,
     )
     .await;
-    if first.gems.is_empty() {
+    if first.gems.is_empty() && first.withdrawn.is_empty() {
         return GemRefreshed {
             outcome: if common.dry_run {
                 StaleInstallOutcome::default()
@@ -1150,13 +1255,45 @@ async fn refresh_stale_gems(
             on_disk: Vec::new(),
         })
     };
+    // Upstream's gem for the platform of a withdrawn build: what bundler
+    // itself would download from the patch registry, which hands that
+    // file on, verified against the sha256 the reference lists for the
+    // platform before any byte of it is used.
+    let upstream_wanted = |gem: &StaleGem| {
+        let (name, version) = gem_sha_key(&gem.purl);
+        let sha256 = gem_upstream.get(&gem.leaf)?.to_ascii_lowercase();
+        let file = format!("{}.gem", gem.leaf);
+        let mut urls: Vec<String> = overrides
+            .iter()
+            .filter(|o| o.ecosystem == "gem" && o.name == name && o.version == version)
+            .filter_map(|o| o.registry_override.as_ref())
+            .map(|ro| format!("{}/gems/{file}", ro.index_url.trim_end_matches('/')))
+            .map(|url| mirror_sources.fetch_url(&url).into_owned())
+            .collect();
+        urls.dedup();
+        Some(Wanted {
+            leaf: gem.leaf.clone(),
+            kind: "upstream",
+            sha256: std::collections::BTreeSet::from([sha256]),
+            urls,
+            on_disk: Vec::new(),
+        })
+    };
     let source = if common.offline {
         Source::DiskOnly
     } else {
         Source::PatchServer(api_client)
     };
     let pass = gem_refresh::attempt(&first.gems, wanted, &source, &policy, direction).await;
-    let mut outcome = if pass.changed(&policy) {
+    let withdrawn_pass = gem_refresh::attempt(
+        &first.withdrawn,
+        upstream_wanted,
+        &source,
+        &policy,
+        withdrawn,
+    )
+    .await;
+    let mut outcome = if pass.changed(&policy) || withdrawn_pass.changed(&policy) {
         gem_stale_install_warnings(
             &common.cwd,
             common.global,
@@ -1164,7 +1301,7 @@ async fn refresh_stale_gems(
             confirmed,
             local_records,
             gem_artifact_shas,
-            gem_upstream_leaves,
+            gem_upstream,
             views,
         )
         .await
@@ -1172,25 +1309,34 @@ async fn refresh_stale_gems(
         first
     };
     let report = gem_refresh::report(direction, &outcome.gems, &pass, &policy);
+    let withdrawn_report =
+        gem_refresh::report(withdrawn, &outcome.withdrawn, &withdrawn_pass, &policy);
     outcome.warnings = report
         .warnings
         .iter()
+        .chain(&withdrawn_report.warnings)
         .map(|(code, detail)| serde_json::json!({ "code": code, "detail": detail }))
         .collect();
     if common.dry_run {
         outcome.stale_purls.clear();
         outcome.unjudged_purls.clear();
     }
+    let mut progress = report.progress;
+    progress.extend(withdrawn_report.progress);
     GemRefreshed {
         outcome,
-        progress: report.progress,
+        progress,
         summary: report.summary,
+        withdrawn_summary: withdrawn_report.summary,
         replaced_archives: if common.dry_run {
             Vec::new()
         } else {
-            pass.replaced_archives().map(Path::to_path_buf).collect()
+            let replaced = pass.replaced_archives();
+            let replaced = replaced.chain(withdrawn_pass.replaced_archives());
+            replaced.map(Path::to_path_buf).collect()
         },
         replaced_installs: !common.dry_run && pass.refreshed_an_install(),
+        replaced_withdrawn: !common.dry_run && withdrawn_pass.refreshed_an_install(),
     }
 }
 
@@ -2422,10 +2568,11 @@ async fn run_redirect_selected_untracked(
         std::collections::BTreeSet<String>,
     > = std::collections::BTreeMap::new();
     // The platform builds the patch registry serves as upstream's own gem
-    // (no patched build yet), by leaf: a machine of such a platform holds
-    // upstream's gem, which is what its lock entry pins.
-    let mut gem_upstream_leaves: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    // (no patched build), by leaf, each with the sha256 of that gem: what
+    // its lock entry pins, and what a machine of such a platform holds
+    // unless it installed a patched build that was withdrawn since.
+    let mut gem_upstream: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     for o in done.overrides.iter().filter(|o| o.ecosystem == "gem") {
         let sha = o
             .registry_override
@@ -2441,8 +2588,10 @@ async fn run_redirect_selected_untracked(
             match build.patch_uuid {
                 Some(_) => patched_builds.push(build.gem_checksum_sha256.clone()),
                 None => {
-                    gem_upstream_leaves
-                        .insert(format!("{}-{}-{}", o.name, o.version, build.platform));
+                    gem_upstream.insert(
+                        format!("{}-{}-{}", o.name, o.version, build.platform),
+                        build.gem_checksum_sha256.clone(),
+                    );
                 }
             }
         }
@@ -2462,7 +2611,7 @@ async fn run_redirect_selected_untracked(
         &confirmed,
         &local_records,
         &gem_artifact_shas,
-        &gem_upstream_leaves,
+        &gem_upstream,
         &done.overrides,
         &mirror_sources,
         &mut views,
@@ -2996,7 +3145,8 @@ async fn run_redirect_selected_untracked(
                 };
                 eprintln!("{}", format_warning(code, &detail, width));
             }
-            if let Some(summary) = &gem_refreshed.summary {
+            let summaries = [&gem_refreshed.summary, &gem_refreshed.withdrawn_summary];
+            for summary in summaries.into_iter().flatten() {
                 eprintln!(
                     "{}",
                     render_warning(&format!("{}.", summary.headline), &summary.bullets, width)
@@ -3948,6 +4098,18 @@ fn format_next_steps(
              install` keeps the gems it already has)",
             &extra,
         ),
+        GemCopies::Followed if bundler_only => crate::ui::next_steps_installed(
+            &commit,
+            "the installed gems already hold the builds the lockfile pins, so there is nothing \
+             to reinstall",
+            &extra,
+        ),
+        GemCopies::Withdrawn if bundler_only => crate::ui::next_steps(
+            &commit,
+            "Replace the withdrawn gem build with the command in the warning above (a plain \
+             `bundle install` keeps the gems it already has)",
+            &extra,
+        ),
         _ => crate::ui::next_steps(
             &commit,
             &format!("Reinstall from the updated lockfile{hint}"),
@@ -4897,7 +5059,7 @@ mod tests {
             confirmed,
             records,
             &std::collections::BTreeMap::new(),
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await
@@ -5177,7 +5339,7 @@ mod tests {
             &one_confirmed,
             &none,
             &shas,
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5195,7 +5357,7 @@ mod tests {
             &one_confirmed,
             &none,
             &shas,
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5209,7 +5371,7 @@ mod tests {
             &one_confirmed,
             &none,
             &shas,
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5245,7 +5407,7 @@ mod tests {
             &confirmed,
             &std::collections::BTreeMap::new(),
             &shas,
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5341,7 +5503,7 @@ mod tests {
             &one_confirmed(),
             &none,
             &shas,
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut views,
         )
         .await;
@@ -5362,7 +5524,7 @@ mod tests {
             &one_confirmed(),
             &none,
             &shas,
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut views,
         )
         .await;
@@ -5393,7 +5555,7 @@ mod tests {
                 &one_confirmed(),
                 &none,
                 &std::collections::BTreeMap::new(),
-                &std::collections::BTreeSet::new(),
+                &std::collections::BTreeMap::new(),
                 &mut views,
             )
             .await;
@@ -5431,7 +5593,7 @@ mod tests {
             &one_confirmed(),
             &std::collections::BTreeMap::new(),
             &shas,
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut views,
         )
         .await;
@@ -5547,7 +5709,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &std::collections::BTreeMap::new(),
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5621,7 +5783,7 @@ mod tests {
                 &confirmed,
                 &records,
                 &shas,
-                &std::collections::BTreeSet::new(),
+                &std::collections::BTreeMap::new(),
                 &mut super::ViewFallback::offline(),
             )
             .await
@@ -5667,7 +5829,7 @@ mod tests {
             &confirmed,
             &records,
             &upper,
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5714,7 +5876,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5758,7 +5920,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5787,7 +5949,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &patched_shas,
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5811,7 +5973,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5854,7 +6016,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5880,7 +6042,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5908,7 +6070,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5998,7 +6160,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
-            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -6018,15 +6180,18 @@ mod tests {
         }
     }
 
-    /// A lock that names two platform builds, on a machine of the platform
-    /// the patch registry serves as upstream's own gem: the installed copy
-    /// and the committed cache-dir archive are upstream's gem, which is
-    /// what that lock entry pins. Neither is judged, whatever evidence
-    /// there is: nothing is stale, nothing is unjudged, and so nothing is
-    /// handed to the refresh. The same copies of a platform that has a
-    /// patched build are stale.
+    /// The copies of a platform build the patch registry serves as
+    /// upstream's own gem are judged by the sha256 of that gem alone: the
+    /// installed copy by the archive RubyGems installed it from, the
+    /// committed cache-dir archive by its own. Upstream's gem is the right
+    /// copy: nothing is stale, nothing is unjudged, and nothing is handed
+    /// to the refresh. A readable archive with another sha256 is a build
+    /// that was withdrawn: it is handed to the refresh apart from the
+    /// unpatched copies, and never withholds the gem from the same run's
+    /// VEX. A copy with no archive is not judged. The same copies of a
+    /// platform that has a patched build are stale.
     #[tokio::test]
-    async fn gem_stale_probe_leaves_a_build_on_upstreams_gem_alone() {
+    async fn gem_stale_probe_judges_a_build_on_upstreams_gem_by_its_archive() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         std::fs::write(
@@ -6058,7 +6223,7 @@ mod tests {
         /// the ruby gem and the other platform's build.
         async fn judge(
             cwd: &std::path::Path,
-            upstream_leaves: &std::collections::BTreeSet<String>,
+            upstream: &std::collections::BTreeMap<String, String>,
         ) -> super::StaleInstallOutcome {
             let shas = std::collections::BTreeMap::from([(
                 ("stale-unit".to_string(), "1.0.0".to_string()),
@@ -6071,33 +6236,101 @@ mod tests {
                 &one_confirmed(),
                 &std::collections::BTreeMap::new(),
                 &shas,
-                upstream_leaves,
+                upstream,
                 &mut super::ViewFallback::offline(),
             )
             .await
         }
-        let upstream = std::collections::BTreeSet::from([leaf.clone()]);
-        let patched_platform = std::collections::BTreeSet::new();
+        let upstream_sha = socket_patch_core::vendor::file_sha256_hex(&archive)
+            .await
+            .expect("the archive's sha256");
+        let upstream = std::collections::BTreeMap::from([(leaf.clone(), upstream_sha)]);
+        let patched_platform = std::collections::BTreeMap::new();
+        // Nothing of a build on upstream's gem is an unpatched copy, and
+        // nothing of it keeps the gem out of the run's VEX.
+        let never_unpatched = |out: &super::StaleInstallOutcome| {
+            assert!(out.gems.is_empty(), "no unpatched copy");
+            assert!(out.stale_purls.is_empty() && out.unjudged_purls.is_empty());
+        };
 
         let out = judge(cwd, &upstream).await;
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
-        assert!(out.gems.is_empty(), "nothing to refresh");
-        assert!(out.stale_purls.is_empty() && out.unjudged_purls.is_empty());
+        assert!(out.withdrawn.is_empty(), "nothing to refresh");
+        never_unpatched(&out);
         let out = judge(cwd, &patched_platform).await;
         assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
         assert_eq!(out.gems.len(), 1);
+        assert!(out.withdrawn.is_empty());
         assert_eq!(
             out.gems[0].cache_archive.as_deref(),
             Some(committed.as_path()),
             "the committed archive is stale with it"
         );
 
+        // The copy was installed from another archive than upstream's
+        // gem: a patched build that was withdrawn since.
+        std::fs::write(&archive, b"withdrawn platform .gem").unwrap();
+        let out = judge(cwd, &upstream).await;
+        never_unpatched(&out);
+        let [gem] = out.withdrawn.as_slice() else {
+            panic!("one withdrawn copy: {:?}", out.withdrawn);
+        };
+        assert_eq!((gem.purl.as_str(), gem.leaf.as_str()), (GEM_PURL, &*leaf));
+        assert_eq!(gem.installed, Some((gem_dir.clone(), true)));
+        assert_eq!(
+            gem.cache_archive, None,
+            "the committed archive is upstream's gem"
+        );
+        let [warning] = out.warnings.as_slice() else {
+            panic!("one warning: {:?}", out.warnings);
+        };
+        assert_eq!(warning["code"], "redirect_gem_stale_install");
+        let detail = detail_of(warning);
+        assert!(
+            detail.starts_with(&format!(
+                "{GEM_PURL} is back on upstream's own gem for arm64-darwin, whose patched build \
+                 was withdrawn, but its withdrawn install at {} was not refreshed, and `bundle \
+                 install` reuses an installed gem instead of fetching the upstream one.",
+                gem_dir.display()
+            )),
+            "{detail}"
+        );
+
+        // So is the committed archive, which goes with the install.
+        std::fs::write(&committed, b"withdrawn platform .gem").unwrap();
+        let out = judge(cwd, &upstream).await;
+        never_unpatched(&out);
+        assert_eq!(out.withdrawn.len(), 1, "{:?}", out.withdrawn);
+        assert_eq!(
+            out.withdrawn[0].cache_archive.as_deref(),
+            Some(committed.as_path())
+        );
+
         // With no archive beside the install there is nothing to judge it
-        // by: unjudged for a patched platform, still nothing for this one.
+        // by, and the committed archive is reported alone.
         std::fs::remove_file(&archive).unwrap();
+        let out = judge(cwd, &upstream).await;
+        never_unpatched(&out);
+        let [gem] = out.withdrawn.as_slice() else {
+            panic!("the committed archive: {:?}", out.withdrawn);
+        };
+        assert_eq!(gem.installed, None);
+        assert_eq!(gem.cache_archive.as_deref(), Some(committed.as_path()));
+        let detail = detail_of(&out.warnings[0]);
+        assert!(
+            detail.contains(&format!(
+                "but Bundler's cache dir still holds its withdrawn archive at {}",
+                committed.display()
+            )),
+            "{detail}"
+        );
+
+        // Nothing at all to judge by: unjudged for a patched platform,
+        // nothing for this one.
         std::fs::remove_file(&committed).unwrap();
         let out = judge(cwd, &upstream).await;
-        assert!(out.warnings.is_empty() && out.unjudged_purls.is_empty());
+        assert!(out.warnings.is_empty() && out.withdrawn.is_empty());
+        never_unpatched(&out);
         let out = judge(cwd, &patched_platform).await;
         assert_eq!(
             out.unjudged_purls,
@@ -6791,6 +7024,19 @@ mod tests {
         assert_eq!(
             steps(&bundler, GemCopies::Stale)[2],
             "  2. Install the patched gems with the command in the warning above (a plain \
+             `bundle install` keeps the gems it already has), then run `socket-patch vex` to \
+             verify the installed patches."
+        );
+        // A copy of a withdrawn build went back to upstream's gem: the
+        // installed gems are what the lock pins, and never called patched.
+        assert_eq!(
+            steps(&bundler, GemCopies::Followed)[2],
+            "  2. Run `socket-patch vex` to verify the installed patches (the installed gems \
+             already hold the builds the lockfile pins, so there is nothing to reinstall)."
+        );
+        assert_eq!(
+            steps(&bundler, GemCopies::Withdrawn)[2],
+            "  2. Replace the withdrawn gem build with the command in the warning above (a plain \
              `bundle install` keeps the gems it already has), then run `socket-patch vex` to \
              verify the installed patches."
         );

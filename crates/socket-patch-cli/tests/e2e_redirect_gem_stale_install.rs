@@ -3199,6 +3199,565 @@ async fn a_platform_served_as_upstreams_gem_is_no_stale_install() {
     }
 }
 
+/// The snapshot the registry URL names once the patched build of
+/// [`PLATFORM`] was withdrawn.
+const LATER_SNAPSHOT: u32 = 5;
+
+/// A machine of the platform [`PLATFORM`] that holds a patched build which
+/// was withdrawn since. The lock was moved while both locked platforms had
+/// a patched build, and the hosted scan put this machine's patched build
+/// in place: the installed copy, the archive RubyGems keeps beside it and
+/// the committed `bundle cache` archive are that build. After the
+/// withdrawal the reference lists upstream's own gem for this platform (no
+/// patch), under a later snapshot, beside the other platform's patched
+/// build.
+struct WithdrawnBuild {
+    _tmp: tempfile::TempDir,
+    proj: PathBuf,
+    home: PathBuf,
+    gem_dir: PathBuf,
+    home_archive: PathBuf,
+    committed: PathBuf,
+    /// Upstream's gem for this platform, and the build that was withdrawn.
+    upstream: Vec<u8>,
+    withdrawn: Vec<u8>,
+    /// The sha256 of the other platform's patched build.
+    other_patched: String,
+    /// The path the registry serves this platform's gem at after the
+    /// withdrawal.
+    file_route: String,
+}
+
+impl WithdrawnBuild {
+    /// Stage the machine against `server`, which answers as the patch
+    /// service does after the withdrawal, except for this platform's gem
+    /// file: each case serves that its own way.
+    async fn stage(server: &MockServer) -> WithdrawnBuild {
+        let upstream = real_gem_for(UPSTREAM_LIB, PLATFORM);
+        let other_upstream = real_gem_for(UPSTREAM_LIB, OTHER_PLATFORM);
+        let withdrawn = real_gem_for(PATCHED_LIB, PLATFORM);
+        let other_patched = sha256_of(&real_gem_for(PATCHED_LIB, OTHER_PLATFORM));
+        let ruby_sha = sha256_of(&real_gem(PATCHED_LIB));
+        let leaf = format!("{DEP}-{DEP_VERSION}-{PLATFORM}");
+
+        // While both platforms had a patched build.
+        mount_api_with(
+            server,
+            None,
+            &ruby_sha,
+            &[
+                (PLATFORM, sha256_of(&withdrawn), Some(ARM_UUID)),
+                (OTHER_PLATFORM, other_patched.clone(), Some(LINUX_UUID)),
+            ],
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "{}/gems/{leaf}.gem",
+                snapshot_registry_path()
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(withdrawn.clone(), "application/octet-stream"),
+            )
+            .mount(server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("Gemfile"),
+            format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("Gemfile.lock"),
+            platform_lock(&sha256_of(&upstream), &sha256_of(&other_upstream)),
+        )
+        .unwrap();
+        let home = project_home(&proj);
+        let gem_dir = install_real_gem_for(&home, UPSTREAM_LIB, PLATFORM);
+        let home_archive = home.join("cache").join(format!("{leaf}.gem"));
+        let committed = proj
+            .join("vendor")
+            .join("cache")
+            .join(format!("{leaf}.gem"));
+        std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+        std::fs::write(&committed, &upstream).unwrap();
+        let uri = server.uri();
+        let (code, stdout, stderr) =
+            common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+        assert_eq!(code, 0, "premise: the first scan\n{stdout}\n{stderr}");
+        assert_eq!(
+            installed_lib(&gem_dir),
+            PATCHED_LIB,
+            "premise: this machine holds the patched build"
+        );
+        for archive in [&home_archive, &committed] {
+            assert_eq!(std::fs::read(archive).unwrap(), withdrawn, "premise");
+        }
+
+        // The patched build of this platform is withdrawn.
+        server.reset().await;
+        mount_patch_api_with(
+            server,
+            UUID,
+            PATCHED_LIB,
+            None,
+            &ruby_sha,
+            &[
+                (PLATFORM, sha256_of(&upstream), None),
+                (OTHER_PLATFORM, other_patched.clone(), Some(LINUX_UUID)),
+            ],
+            LATER_SNAPSHOT,
+        )
+        .await;
+        let file_route =
+            format!("/patch-registry/gem/{TOKEN}/{UUID}/s/{LATER_SNAPSHOT}/gems/{leaf}.gem");
+        WithdrawnBuild {
+            _tmp: tmp,
+            proj,
+            home,
+            gem_dir,
+            home_archive,
+            committed,
+            upstream,
+            withdrawn,
+            other_patched,
+            file_route,
+        }
+    }
+
+    /// The registry hands this platform's gem on as `body`.
+    async fn relay(&self, server: &MockServer, body: &[u8]) {
+        Mock::given(method("GET"))
+            .and(path(self.file_route.clone()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(body.to_vec(), "application/octet-stream"),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// `socket-patch scan --mode hosted` with `extra`: exit code, stdout
+    /// and stderr.
+    fn scan(&self, server: &MockServer, extra: &[&str]) -> (i32, String, String) {
+        let uri = server.uri();
+        common::run_with_env(&self.proj, &scan_args(&self.proj, &uri, extra), &[])
+    }
+
+    /// A `--json` scan with `extra`, which must exit 0: its envelope.
+    fn scan_json(&self, server: &MockServer, extra: &[&str]) -> serde_json::Value {
+        let mut args = vec!["--json"];
+        args.extend_from_slice(extra);
+        let (code, stdout, stderr) = self.scan(server, &args);
+        let env = common::parse_json_envelope(&stdout);
+        assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+        env
+    }
+
+    /// The lock follows the reference: the registry at the later snapshot,
+    /// upstream's sha256 for this platform, the other platform's patched
+    /// build as it was.
+    fn assert_lock_is_back_on_upstreams_gem(&self, server: &MockServer) {
+        let lock = std::fs::read_to_string(self.proj.join("Gemfile.lock")).unwrap();
+        assert!(
+            lock.contains(&format!(
+                "  remote: {}/patch-registry/gem/{TOKEN}/{UUID}/s/{LATER_SNAPSHOT}/\n",
+                server.uri()
+            )) && lock.contains(&format!(
+                "CHECKSUMS\n  {DEP} ({DEP_VERSION}-{PLATFORM}) sha256={}\n  {DEP} \
+                 ({DEP_VERSION}-{OTHER_PLATFORM}) sha256={}\n",
+                sha256_of(&self.upstream),
+                self.other_patched
+            )),
+            "{lock}"
+        );
+    }
+
+    /// The copy, the archive beside it and the committed archive are all
+    /// `gem`, whose `lib` Ruby loads.
+    fn assert_holds(&self, gem: &[u8], lib: &str) {
+        assert_eq!(installed_lib(&self.gem_dir), lib);
+        assert_eq!(std::fs::read(&self.home_archive).unwrap(), gem);
+        assert_eq!(std::fs::read(&self.committed).unwrap(), gem);
+        assert!(
+            !self.home.join(".socket-patch-refresh").exists(),
+            "no stage left"
+        );
+    }
+
+    /// What a VEX document says of the gem whatever this machine holds:
+    /// the other platform's build is attested under its own patch, and
+    /// this platform's build is affected.
+    fn assert_vex(&self, doc: &serde_json::Value) {
+        let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_string();
+        let said: Vec<(String, String, String)> = doc["statements"]
+            .as_array()
+            .expect("statements")
+            .iter()
+            .map(|st| {
+                let packages = st["products"][0]["subcomponents"].as_array();
+                assert_eq!(packages.map(Vec::len), Some(1), "{st}");
+                (
+                    text(&st["status"]),
+                    text(&st["products"][0]["subcomponents"][0]["@id"]),
+                    text(&st["impact_statement"]),
+                )
+            })
+            .collect();
+        assert_eq!(
+            said,
+            [
+                (
+                    "not_affected".to_string(),
+                    format!("{PURL}?platform={OTHER_PLATFORM}"),
+                    format!("Patched via Socket patch {LINUX_UUID} (redirected)"),
+                ),
+                (
+                    "affected".to_string(),
+                    format!("{PURL}?platform={PLATFORM}"),
+                    String::new(),
+                ),
+            ],
+            "{doc}"
+        );
+        assert!(
+            !doc.to_string().contains(ARM_UUID),
+            "the withdrawn build's patch is named nowhere: {doc}"
+        );
+    }
+
+    /// A later `socket-patch vex` over the project: its outcome.
+    fn later_vex(&self, server: &MockServer) -> vex_e2e_common::VexOutcome {
+        let later = vex_e2e_common::VexRun {
+            api_url: Some(server.uri()),
+            api_token: Some("fake".into()),
+            org: Some(ORG.into()),
+            patch_server_url: Some(server.uri()),
+            product: Some("pkg:gem/app@1.0.0".into()),
+            ..vex_e2e_common::VexRun::default()
+        };
+        vex_e2e_common::run_vex(&vex_e2e_common::binary(), &self.proj, &later)
+    }
+}
+
+/// The paths of the gem files and patch records `server` was asked for
+/// after its first `skip` requests.
+async fn gems_and_views_since(server: &MockServer, skip: usize) -> Vec<String> {
+    let requests = server.received_requests().await.unwrap_or_default();
+    let routes = requests.iter().skip(skip).map(|r| r.url.path().to_string());
+    routes
+        .filter(|route| route.contains("/gems/") || route.contains("/patches/view/"))
+        .collect()
+}
+
+/// A patched build that was withdrawn must not stay installed. The next
+/// scan puts upstream's sha256 back into the lock, and the guard judges
+/// this machine's copy by the archive it was installed from: it is not
+/// upstream's gem, so it is replaced, with the committed archive, by the
+/// file the patch registry serves for the platform, verified against the
+/// sha256 the reference lists. Whether the registry relays that file
+/// (200) or redirects to the upstream registry (302), in which case the
+/// other host learns nothing of the grant. One download, no patch record.
+/// The run's VEX and a later one say `affected` of this platform's build
+/// and still attest the other; a further scan changes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withdrawn_build_is_replaced_with_upstreams_gem_through_the_registry() {
+    for redirects in [false, true] {
+        let server = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        let w = WithdrawnBuild::stage(&server).await;
+        let leaf = format!("{DEP}-{DEP_VERSION}-{PLATFORM}");
+        if redirects {
+            let location = format!("{}/gems/{leaf}.gem", elsewhere.uri());
+            Mock::given(method("GET"))
+                .and(path(w.file_route.clone()))
+                .respond_with(
+                    ResponseTemplate::new(302)
+                        .insert_header("Location", location.as_str())
+                        .insert_header("Cache-Control", "no-store"),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/gems/{leaf}.gem")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(w.upstream.clone(), "application/octet-stream"),
+                )
+                .mount(&elsewhere)
+                .await;
+        } else {
+            w.relay(&server, &w.upstream).await;
+        }
+
+        let env = w.scan_json(&server, &[]);
+        assert_eq!(
+            hosted_pins(&env),
+            [(
+                format!("{PURL}?platform={OTHER_PLATFORM}"),
+                LINUX_UUID.to_string()
+            )],
+            "redirects={redirects}: {env}"
+        );
+        w.assert_lock_is_back_on_upstreams_gem(&server);
+        assert!(stale_warnings(&env).is_empty(), "nothing is left: {env}");
+        let mut notes = warnings_with_code(&env, "redirect_gem_install_refreshed");
+        notes.sort();
+        assert_eq!(
+            notes,
+            [
+                format!(
+                    "{PURL}: replaced the withdrawn archive at {} with the upstream gem",
+                    w.committed.display()
+                ),
+                format!(
+                    "{PURL}: replaced the withdrawn install at {} with the upstream gem",
+                    w.gem_dir.display()
+                ),
+            ],
+            "redirects={redirects}: {env}"
+        );
+        w.assert_holds(&w.upstream, UPSTREAM_LIB);
+        assert_eq!(
+            gems_and_views_since(&server, 0).await,
+            [w.file_route.clone()],
+            "redirects={redirects}: one download for both, and no patch record"
+        );
+        let handed_on = elsewhere.received_requests().await.unwrap_or_default();
+        assert_eq!(handed_on.len(), usize::from(redirects));
+        for request in &handed_on {
+            let sent = format!("{:?}", request.headers);
+            assert!(
+                request.headers.get("referer").is_none() && !sent.contains(TOKEN),
+                "the other host learns nothing of the grant: {sent}"
+            );
+        }
+
+        // A further scan changes nothing and downloads nothing.
+        let lock = std::fs::read(w.proj.join("Gemfile.lock")).unwrap();
+        let before = server.received_requests().await.unwrap_or_default().len();
+        let vex_path = w.proj.join("run.vex.json");
+        let with_vex = [
+            "--vex",
+            vex_path.to_str().unwrap(),
+            "--vex-product",
+            "pkg:gem/app@1.0.0",
+        ];
+        let env = w.scan_json(&server, &with_vex);
+        assert!(
+            stale_warnings(&env).is_empty()
+                && warnings_with_code(&env, "redirect_gem_install_refreshed").is_empty(),
+            "redirects={redirects}: {env}"
+        );
+        assert_eq!(std::fs::read(w.proj.join("Gemfile.lock")).unwrap(), lock);
+        w.assert_holds(&w.upstream, UPSTREAM_LIB);
+        let asked = gems_and_views_since(&server, before).await;
+        assert!(
+            asked.iter().all(|route| !route.contains("/gems/")),
+            "redirects={redirects}: {asked:?}"
+        );
+
+        // VEX, from that run and from a later `vex`.
+        assert_eq!(env["vex"]["affected"], 1, "{env}");
+        w.assert_vex(&vex_e2e_common::read_doc(&vex_path).expect("the run's document"));
+        let out = w.later_vex(&server);
+        assert_eq!(out.code, Some(0), "redirects={redirects}: {out}");
+        w.assert_vex(out.doc());
+        assert_eq!(out.envelope["status"], "success", "{out}");
+    }
+}
+
+/// For a person, the run that replaces the copy of a withdrawn build says
+/// so in one line per kind, each naming the upstream gem and why, never a
+/// patched one, and has nothing left to reinstall.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withdrawn_build_refresh_says_what_took_its_place() {
+    let server = MockServer::start().await;
+    let w = WithdrawnBuild::stage(&server).await;
+    w.relay(&server, &w.upstream).await;
+
+    let (code, stdout, stderr) = w.scan(&server, &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    for line in [
+        format!(
+            "Replaced the installed copy of 1 gem with the upstream build (its patched build \
+             was withdrawn): {DEP} {DEP_VERSION}.\n"
+        ),
+        format!(
+            "Replaced 1 archive in Bundler's cache dir with the upstream gem (its patched build \
+             was withdrawn): {DEP} {DEP_VERSION}.\n"
+        ),
+    ] {
+        assert!(stderr.contains(&line), "missing {line:?}:\n{stderr}");
+    }
+    assert!(
+        !stderr.contains("still holds") && !stderr.contains("patched build:"),
+        "nothing is left to warn about, and nothing is called patched:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(
+            "  2. Run `socket-patch vex` to verify the installed patches (the installed gems \
+             already hold the builds the lockfile pins, so there is nothing to reinstall).\n"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("vendor/cache/{DEP}-{DEP_VERSION}-{PLATFORM}.gem")),
+        "the replaced archive is a file to commit:\n{stdout}"
+    );
+    w.assert_holds(&w.upstream, UPSTREAM_LIB);
+}
+
+/// The registry relays bytes that are not the gem the reference lists for
+/// the platform: no byte of them is used. The withdrawn build stays, the
+/// lock still goes back to upstream's sha256, and the run says, as a
+/// warning and never as a failure, that a withdrawn build is still
+/// installed and how to remove it. That copy keeps nothing of the gem out
+/// of the VEX: the other platform's build is attested, this one affected.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withdrawn_build_is_not_replaced_with_a_gem_the_reference_does_not_list() {
+    let server = MockServer::start().await;
+    let w = WithdrawnBuild::stage(&server).await;
+    // The same gem with other bytes.
+    w.relay(
+        &server,
+        &real_gem_for("module StaleProbeGem\n  EVIL = true\nend\n", PLATFORM),
+    )
+    .await;
+    let spec = w
+        .home
+        .join("specifications")
+        .join(format!("{DEP}-{DEP_VERSION}-{PLATFORM}.gemspec"));
+    let files = [&spec, &w.home_archive, &w.committed];
+
+    // For a person: one warning, and what to run.
+    let (code, stdout, stderr) = w.scan(&server, &[]);
+    assert_eq!(code, 0, "a failed refresh never fails the scan:\n{stderr}");
+    w.assert_lock_is_back_on_upstreams_gem(&server);
+    w.assert_holds(&w.withdrawn, PATCHED_LIB);
+    let words: Vec<String> = files.iter().map(|path| shell_word(path)).collect();
+    let warning = format!(
+        "Warning: 1 gem still holds a patched build on disk that was withdrawn.\n  - Not \
+         refreshed (the upstream gem the server sent does not have the pinned sha256): {DEP} \
+         {DEP_VERSION}. Re-run `socket-patch scan` to retry, or run `rm -f {} && bundle \
+         install`.\n",
+        words.join(" ")
+    );
+    assert!(stderr.contains(&warning), "missing {warning:?}:\n{stderr}");
+    assert_eq!(stderr.matches("still holds").count(), 1, "{stderr}");
+    assert!(!stderr.contains("Replaced"), "{stderr}");
+    assert!(
+        stdout.contains(
+            "  2. Replace the withdrawn gem build with the command in the warning above (a \
+             plain `bundle install` keeps the gems it already has), then run `socket-patch vex` \
+             to verify the installed patches.\n"
+        ),
+        "{stdout}"
+    );
+
+    // The same in `--json`, on every later run, with the run's own VEX.
+    let vex_path = w.proj.join("run.vex.json");
+    let with_vex = [
+        "--vex",
+        vex_path.to_str().unwrap(),
+        "--vex-product",
+        "pkg:gem/app@1.0.0",
+    ];
+    let env = w.scan_json(&server, &with_vex);
+    let listed: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
+    assert_eq!(
+        stale_warnings(&env),
+        [format!(
+            "{PURL} is back on upstream's own gem for {PLATFORM}, whose patched build was \
+             withdrawn, but its withdrawn install at {} was not refreshed (the upstream gem the \
+             server sent does not have the pinned sha256), and `bundle install` reuses an \
+             installed gem instead of fetching the upstream one. Re-run `socket-patch scan` to \
+             retry, or remove {} and run `bundle install`",
+            w.gem_dir.display(),
+            listed.join(", ")
+        )],
+        "{env}"
+    );
+    assert!(
+        warnings_with_code(&env, "redirect_gem_install_refreshed").is_empty(),
+        "{env}"
+    );
+    w.assert_holds(&w.withdrawn, PATCHED_LIB);
+    assert_eq!(env["vex"]["statements"], 2, "{env}");
+    assert_eq!(env["vex"]["affected"], 1, "{env}");
+    w.assert_vex(&vex_e2e_common::read_doc(&vex_path).expect("the run's document"));
+    let out = w.later_vex(&server);
+    assert_eq!(out.code, Some(0), "{out}");
+    w.assert_vex(out.doc());
+    assert_eq!(out.envelope["status"], "success", "{out}");
+}
+
+/// The refresh is switched off, or only previewed: nothing is downloaded
+/// and nothing replaced. A dry run says what a wet run would replace, and
+/// `--no-gem-install-refresh` warns that the withdrawn build is still
+/// installed, with the run that replaces it. That run then does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withdrawn_build_is_left_with_a_warning_when_the_refresh_is_off() {
+    let server = MockServer::start().await;
+    let w = WithdrawnBuild::stage(&server).await;
+    w.relay(&server, &w.upstream).await;
+
+    let env = w.scan_json(&server, &["--dry-run"]);
+    let mut would = warnings_with_code(&env, "redirect_gem_install_would_refresh");
+    would.sort();
+    assert_eq!(
+        would,
+        [
+            format!(
+                "{PURL}: would replace the withdrawn archive at {} with the upstream gem",
+                w.committed.display()
+            ),
+            format!(
+                "{PURL}: would replace the withdrawn install at {} with the upstream gem",
+                w.gem_dir.display()
+            ),
+        ],
+        "{env}"
+    );
+    assert!(stale_warnings(&env).is_empty(), "{env}");
+    w.assert_holds(&w.withdrawn, PATCHED_LIB);
+
+    let env = w.scan_json(&server, &["--no-gem-install-refresh"]);
+    w.assert_lock_is_back_on_upstreams_gem(&server);
+    let stale = stale_warnings(&env);
+    assert_eq!(stale.len(), 1, "{env}");
+    assert!(
+        stale[0].starts_with(&format!(
+            "{PURL} is back on upstream's own gem for {PLATFORM}, whose patched build was \
+             withdrawn, but its withdrawn install at {} was not refreshed \
+             (`--no-gem-install-refresh` is set), and `bundle install` reuses an installed gem \
+             instead of fetching the upstream one. Re-run without `--no-gem-install-refresh`, \
+             or remove ",
+            w.gem_dir.display()
+        )) && stale[0].ends_with(" and run `bundle install`"),
+        "{}",
+        stale[0]
+    );
+    w.assert_holds(&w.withdrawn, PATCHED_LIB);
+    assert_eq!(
+        gems_and_views_since(&server, 0).await,
+        Vec::<String>::new(),
+        "neither run downloads a gem or fetches a record"
+    );
+
+    // The run the warning names.
+    let env = w.scan_json(&server, &[]);
+    assert!(stale_warnings(&env).is_empty(), "{env}");
+    assert_eq!(
+        warnings_with_code(&env, "redirect_gem_install_refreshed").len(),
+        2,
+        "{env}"
+    );
+    w.assert_holds(&w.upstream, UPSTREAM_LIB);
+}
+
 /// A fresh checkout: nothing is installed, and the lock names the gem only
 /// as platform builds. The hosted scan reads the gem from the lock alone
 /// and pins every build to its patched build. Where the patch registry
