@@ -17,7 +17,8 @@
 //!   is, under a quiet skip;
 //! * a later run on the same registry snapshot changes nothing, and one on
 //!   a newer snapshot refreshes the URL and says which builds it found
-//!   patched;
+//!   patched. A lock with `CHECKSUMS` says what each build was; one
+//!   without is told by the snapshot it names, in one request;
 //! * a platform the registry does not list leaves the gem alone under a
 //!   quiet skip, and a reference with no list at all under the warning
 //!   `redirect_gem_platform_unsupported`;
@@ -1903,6 +1904,103 @@ async fn the_registry_of_a_lock_on_a_patch_mirror_is_read_from_the_patch_server(
         .filter(|request| request.contains("/info/"))
         .collect();
     assert_eq!(asked_of_mirror, Vec::<String>::new());
+}
+
+// ── A lock with no `CHECKSUMS` that follows a newer snapshot ──────────
+
+/// A lock with no `CHECKSUMS` section is on the patch's registry at one
+/// snapshot, and the reference names a newer one in which a platform that
+/// was on upstream's gem has a patched build. The lock does not say what
+/// that build was, so the run asks the snapshot the lock names, once, and
+/// reports the build as newly patched: `newlyPatched` on its event, and
+/// `now also patched for …` in the line. When that request fails the run
+/// reports the builds as it does without it (none is new), and succeeds.
+/// A lock with `CHECKSUMS` says what it had, and nothing is asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_without_checksums_on_a_newer_snapshot_says_which_build_is_now_patched() {
+    let now_also =
+        format!("{DEP} {DEP_VERSION}: now also patched for {ARM}; already patched for {LINUX}");
+    let as_before = format!("{DEP} {DEP_VERSION}: patched for {ARM}, {LINUX}");
+    // `(the lock has CHECKSUMS, the snapshot it names answers, arm64-darwin
+    // is reported as new, the line, the registry requests)`.
+    let cases = [
+        (false, true, true, &now_also, 1),
+        (false, false, false, &as_before, 1),
+        (true, true, true, &now_also, 0),
+    ];
+    for (checksums, answers, newly, line, asked) in cases {
+        let server = MockServer::start().await;
+        mount_api(&server, Some((&BOTH_PATCHED[..], 5))).await;
+        if answers {
+            mount_index(&server, ARM_UPSTREAM, LINUX_PATCHED).await;
+        }
+        let api = server.uri();
+        let (before, after) = (
+            format!("{}/", index_url(&api, Some(4))),
+            format!("{}/", index_url(&api, Some(5))),
+        );
+        let caveat: &[&str] = if checksums {
+            &[]
+        } else {
+            &["redirect_gem_no_checksums_section"]
+        };
+        let what = format!("checksums {checksums}, answers {answers}");
+
+        let proj = hosted_project(&before, ARM_UPSTREAM, LINUX_PATCHED, checksums);
+        let (code, env) = scan_json(proj.path(), &api, &[]);
+        assert_eq!(code, 0, "{what}: {env}");
+        assert_eq!(env["status"], "success", "{what}: {env}");
+        let lock = read(proj.path(), "Gemfile.lock");
+        assert!(
+            lock.contains(&format!("  remote: {after}\n")) && !lock.contains(&before),
+            "{what}: {lock}"
+        );
+        assert_eq!(lock.contains("CHECKSUMS"), checksums, "{what}");
+        assert_eq!(read(proj.path(), "Gemfile"), hosted_gemfile(&after));
+        assert_eq!(warning_codes(&env), caveat, "{what}: {env}");
+        assert_eq!(
+            hosted_events(&env),
+            [
+                patched_event("applied", ARM, ARM_UUID, newly),
+                patched_event("applied", LINUX, LINUX_UUID, false)
+            ],
+            "{what}: {env}"
+        );
+        let (_, other) = requests(&server).await;
+        assert_eq!(other, vec![index_path(); asked], "{what}");
+
+        // A second run: the lock names the reference's snapshot, so
+        // nothing is asked and nothing is new.
+        let (code, env) = scan_json(proj.path(), &api, &[]);
+        assert_eq!(code, 0, "{what}: {env}");
+        assert_eq!(env["redirect"]["rewrittenFiles"], json!([]), "{what}");
+        assert_eq!(
+            hosted_events(&env),
+            [
+                patched_event("applied", ARM, ARM_UUID, false),
+                patched_event("applied", LINUX, LINUX_UUID, false)
+            ],
+            "{what}: {env}"
+        );
+        let (_, other) = requests(&server).await;
+        assert_eq!(other.len(), asked, "{what}: no registry request");
+
+        // For a person, and a dry run.
+        for dry_run in [true, false] {
+            let proj = hosted_project(&before, ARM_UPSTREAM, LINUX_PATCHED, checksums);
+            let extra: &[&str] = if dry_run { &["--dry-run"] } else { &[] };
+            let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], extra);
+            assert_eq!(code, 0, "{what}: {stdout}\n{stderr}");
+            let line = match (dry_run, newly) {
+                (true, true) => line.replace("now also patched", "would also be patched"),
+                _ => line.to_string(),
+            };
+            assert!(
+                stdout.contains(&format!("\n{line}\n")),
+                "{what}, dry run {dry_run}:\n{stdout}"
+            );
+        }
+    }
 }
 
 // ── A gem locked as its ruby-platform gem alone ───────────────────────

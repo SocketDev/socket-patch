@@ -2589,25 +2589,37 @@ async fn read_gemspecs(
     );
 }
 
-/// The compact-index documents the gem rewriter reads before it moves a
-/// lock from one patch of a gem to another, sorted: `<remote>/info/<gem>`
-/// of the registry the Bundler lock among `files` takes a gem from, for
-/// each gem among `candidates` that the lock takes as platform builds from
-/// the registry of another patch of the gem, with a locked build that the
-/// candidate's registry serves as upstream's own gem and that the lock
-/// does not pin at upstream's sha256 already. What that build is today (a
-/// patched build the registry still serves, which the move would take
-/// away, or one it withdrew, or upstream's gem) is only said by the
-/// registry the lock is on: a `CHECKSUMS` entry says what the lock pins,
-/// not whether it is still served. One small request per such gem, and
-/// none on any other run: a lock on the candidate's own registry, on its
-/// upstream registry, one that pins upstream's sha256 for each such
-/// build, or one that names the gem as its ruby-platform gem alone.
+/// The compact-index documents the gem rewriter reads, sorted:
+/// `<remote>/info/<gem>` of the registry the Bundler lock among `files`
+/// takes a gem from, for each gem among `candidates` that the lock names
+/// platform builds of, where what that registry lists decides something
+/// ([`crate::patch::redirect::gem_index_urls`]):
+///
+/// - the lock is on the registry of another patch of the gem, and the
+///   candidate's registry serves upstream's own gem for a locked build
+///   that the lock does not pin at upstream's sha256 already. What that
+///   build is today (a patched build the registry still serves, which the
+///   move would take away, or one it withdrew, or upstream's gem) is only
+///   said by the registry the lock is on: a `CHECKSUMS` entry says what
+///   the lock pins, not whether it is still served;
+/// - the lock is on the candidate's own registry under another snapshot
+///   than the reference names, with no `CHECKSUMS` entry for a locked
+///   platform build the reference lists as patched: what the snapshot the
+///   lock names lists for the build says whether this run is what patches
+///   it.
+///
+/// One small request per such gem, and none on any other run: a lock on
+/// its upstream registry, one on the candidate's own registry at the
+/// snapshot the reference names or with `CHECKSUMS` entries, one on
+/// another patch's registry that pins upstream's sha256 for each build the
+/// candidate serves as upstream's gem, or one that names the gem as its
+/// ruby-platform gem alone.
 ///
 /// The caller reads them ([`super::gem_index::fetch_gem_index`]) and hands
 /// the answers in ([`record_gem_index`]) before every [`rewrite`]. A
 /// rewrite that is handed no document of a registry leaves the gem on the
-/// patch it is on ([`GEM_NEWER_FIX_WAITS`]): never worse than it was.
+/// patch it is on ([`GEM_NEWER_FIX_WAITS`]), never worse than it was, and
+/// reports a build as it does where nothing says what it was.
 pub fn gem_index_targets(
     candidates: &[Candidate],
     files: &BTreeMap<String, String>,
@@ -13909,6 +13921,67 @@ snapshots:
             let reasons: Vec<&str> = skips.iter().map(|skip| skip.reason.as_str()).collect();
             assert_eq!(reasons, [GEM_NEWER_FIX_WAITS]);
         }
+    }
+
+    /// A lock with no `CHECKSUMS` on a patch's own registry, which a
+    /// newer reference of that patch moves to another snapshot: the
+    /// engine names the listing of the snapshot the lock is on, and with
+    /// it the report says which build this run patched. Without it (it
+    /// could not be read) no build is reported as new, as on a lock that
+    /// says nothing. A lock with `CHECKSUMS` asks for nothing.
+    #[tokio::test]
+    async fn a_gem_lock_without_checksums_reports_what_a_newer_snapshot_patches() {
+        let arm_patch = "77777777-7777-4777-8777-77777777777a";
+        let linux_patch = "77777777-7777-4777-8777-77777777777b";
+        // At `2b` arm64-darwin, upstream's gem at `1a`, has a patched build.
+        let later = gem_candidate_listing(
+            FIXTURE_UUID,
+            "2b",
+            &[
+                ("arm64-darwin", "a".repeat(64), Some(arm_patch)),
+                ("x86_64-linux-gnu", "b".repeat(64), Some(linux_patch)),
+            ],
+        );
+        let candidates = vec![later.clone()];
+        let newly = |done: &Rewritten| -> Vec<(Option<String>, bool)> {
+            pin_reports(&done.confirmed, &done.rewrite)
+                .into_iter()
+                .map(|report| (report.uuid, report.newly_patched))
+                .collect()
+        };
+        let both = |arm_is_new: bool| {
+            [
+                (Some(arm_patch.to_string()), arm_is_new),
+                (Some(linux_patch.to_string()), false),
+            ]
+        };
+        let p = rails_project_on_a_patch(false).await;
+        let view = ProjectView::Memory(&p);
+        let (url, listing) = rails_registry_index(Some(&"b".repeat(64)));
+        let (read, unread) = gem_rewrite_of(&view, candidates.clone()).await;
+        assert_eq!(gem_index_targets(&candidates, &read.files), [url.clone()]);
+        assert_eq!(newly(&unread), both(false), "no listing: nothing is new");
+        let failed = [(url.clone(), Err("no route to host".to_string()))];
+        let (_, done) = gem_rewrite_reading(&view, candidates.clone(), &failed).await;
+        assert_eq!(newly(&done), both(false));
+        assert_eq!(done.rewritten, ["Gemfile", "Gemfile.lock"]);
+
+        let documents = [(url, Ok(listing))];
+        let (_, done) = gem_rewrite_reading(&view, candidates.clone(), &documents).await;
+        assert_eq!(
+            done.confirmed,
+            [("pkg:gem/rails@7.0.0".to_string(), FIXTURE_UUID.to_string())]
+        );
+        assert_eq!(newly(&done), both(true));
+        let lock = &done.rewrite.files["Gemfile.lock"];
+        assert!(lock.contains(&format!("/{FIXTURE_UUID}/s/2b/\n")), "{lock}");
+
+        // With `CHECKSUMS` the lock says what it had: nothing is asked.
+        let pinned = rails_project_on_a_patch(true).await;
+        let view = ProjectView::Memory(&pinned);
+        let (read, done) = gem_rewrite_of(&view, candidates.clone()).await;
+        assert!(gem_index_targets(&candidates, &read.files).is_empty());
+        assert_eq!(newly(&done), both(true));
     }
 
     /// A lock with no `CHECKSUMS` says nothing of what it installs, so the

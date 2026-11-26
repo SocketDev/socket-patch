@@ -472,6 +472,92 @@ async fn parity_gemfile_platform_withdrawn_on_an_earlier_patch() {
     assert_eq!(asked.count(), 2, "one request an engine");
 }
 
+/// A lock with no `CHECKSUMS` on the patch's own registry, under an
+/// earlier snapshot in which `x86_64-linux-gnu` was upstream's gem. Both
+/// engines ask that snapshot what it lists, once each, move the lock to
+/// the snapshot the reference names, and report the linux build as newly
+/// patched and `arm64-darwin` as upstream's gem.
+#[tokio::test]
+async fn parity_gemfile_platform_newer_snapshot_without_checksums() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    const TOKEN: &str = "11111111-1111-1111-1111-111111111111";
+    const FIX: &str = "77777777-7777-7777-7777-777777777777";
+    const LINUX: &str = "77777777-7777-4777-8777-00000000000b";
+    let dir = fixtures_root().join("redirect/gem/bundler/platform-pass-through");
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
+    mount_api(&server, &patches).await;
+    let mut files = fixture_files(&dir.join("expected"));
+    for bytes in files.values_mut() {
+        let text = String::from_utf8(bytes.clone()).expect("a text fixture");
+        let mut text = text
+            .replace("https://patch.socket.dev", &server.uri())
+            .replace(&format!("{FIX}/s/4/"), &format!("{FIX}/s/1a/"));
+        if let (Some(at), Some(end)) = (text.find("CHECKSUMS\n"), text.find("BUNDLED WITH")) {
+            text.replace_range(at..end, "");
+        }
+        *bytes = text.into_bytes();
+    }
+    let lock = String::from_utf8_lossy(&files["Gemfile.lock"]).into_owned();
+    assert!(
+        lock.contains(&format!("/{FIX}/s/1a/\n")) && !lock.contains("CHECKSUMS"),
+        "premise: {lock}"
+    );
+    let index = format!("/patch-registry/gem/{TOKEN}/{FIX}/s/1a/info/nokogiri");
+    Mock::given(method("GET"))
+        .and(path(index.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "---\n1.18.10 racc:~> 1.4|checksum:{}\n1.18.10-arm64-darwin racc:~> \
+             1.4|checksum:{}\n1.18.10-x86_64-linux-gnu racc:~> 1.4|checksum:{}\n",
+            "deadbeef".repeat(8),
+            "3".repeat(64),
+            "4".repeat(64)
+        )))
+        .mount(&server)
+        .await;
+
+    let name = "a newer snapshot on a lock without CHECKSUMS";
+    let (redirect, project) = assert_parity_over(name, &server, &files, false, true).await;
+    assert_eq!(redirect["redirected"], 1, "{redirect:#}");
+    let codes: Vec<&str> = redirect["warnings"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|w| w["code"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(codes, ["redirect_gem_no_checksums_section"], "{redirect:#}");
+    assert_eq!(
+        redirect["patches"],
+        serde_json::json!([
+            {
+                "purl": "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin",
+                "action": "upstream_kept",
+                "errorCode": "gem_upstream_build_kept",
+                "error": "the patch registry serves upstream's own gem for arm64-darwin: no \
+                          patched build yet",
+                "gemFix": FIX,
+                "platform": "arm64-darwin",
+            },
+            {
+                "purl": "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu",
+                "uuid": LINUX,
+                "action": "pinned",
+                "gemFix": FIX,
+                "platform": "x86_64-linux-gnu",
+                "newlyPatched": true,
+            },
+        ]),
+        "{redirect:#}"
+    );
+    assert!(
+        project.redirected[0].newly_patched,
+        "{:?}",
+        project.redirected
+    );
+    let asked = server.received_requests().await.unwrap_or_default();
+    let indexes = asked.iter().filter(|request| request.url.path() == index);
+    assert_eq!(indexes.count(), 2, "one request an engine");
+}
+
 /// The same lock where no locked platform has a patched build yet: both
 /// engines leave the gem on its upstream registry, write nothing, warn of
 /// nothing, and report one skip under the quiet code, never an unpinned

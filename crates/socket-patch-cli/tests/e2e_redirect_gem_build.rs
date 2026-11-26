@@ -8214,6 +8214,15 @@ impl PlatformProject {
         (registry, files)
     }
 
+    /// The index documents (`info/<gem>`) of patch registries asked for
+    /// since `mark`, each with the snapshot path it was asked under.
+    async fn indexes_since(&self, mark: (usize, usize)) -> Vec<String> {
+        let asked = request_paths(&self.fx._server, mark.0).await.into_iter();
+        asked
+            .filter(|path| path.starts_with("/patch-registry/") && path.contains("/info/"))
+            .collect()
+    }
+
     /// The body of every package reference request since `mark`, after
     /// asserting that each asked for the list of the gem's builds.
     async fn references_since(&self, mark: (usize, usize)) -> Vec<Vec<String>> {
@@ -9570,14 +9579,35 @@ async fn gem_hosted_ruby_gem_alone_beside_native_platforms_installs_the_patched_
 ///   3. the earlier snapshot answers as it did: a checkout of the earlier
 ///      pair still installs upstream's gem frozen;
 ///   4. `rollback` hands back the pre-scan pair byte for byte.
+///
+/// On a lock with a `CHECKSUMS` section the lock says what each build was,
+/// and no registry is asked. On one without, the scan asks the snapshot
+/// the lock names what it lists, once, and reports the same.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6 for the CHECKSUMS lock); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_newer_registry_snapshot_installs_the_newly_patched_build() {
-    let Some(mut p) =
-        PlatformProject::start("platform-newer-snapshot", (2, 6), true, false, &[]).await
-    else {
+    newer_registry_snapshot_installs_the_newly_patched_build("platform-newer-snapshot", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.5); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_newer_registry_snapshot_names_the_newly_patched_build_without_checksums() {
+    let tag = "platform-newer-snapshot-no-checksums";
+    newer_registry_snapshot_installs_the_newly_patched_build(tag, false).await;
+}
+
+async fn newer_registry_snapshot_installs_the_newly_patched_build(tag: &str, checksums: bool) {
+    let floor = if checksums { (2, 6) } else { (2, 5) };
+    let Some(mut p) = PlatformProject::start(tag, floor, checksums, false, &[]).await else {
         return;
+    };
+    // The caveat of a lock that cannot record a sha256, on every rewrite.
+    let caveat: &[&str] = if checksums {
+        &[]
+    } else {
+        &["redirect_gem_no_checksums_section"]
     };
     let (own, foreign) = (p.own.clone(), p.foreign.clone());
     let warm_lib = p.installed_lib(&p.fx.proj);
@@ -9620,7 +9650,7 @@ async fn gem_hosted_newer_registry_snapshot_installs_the_newly_patched_build() {
     );
     assert_eq!(
         warning_codes(&env),
-        ["redirect_gem_install_refreshed"],
+        [caveat, &["redirect_gem_install_refreshed"]].concat(),
         "{env}"
     );
     assert_eq!(
@@ -9652,6 +9682,12 @@ async fn gem_hosted_newer_registry_snapshot_installs_the_newly_patched_build() {
         "the refresh takes the patched build from the newer snapshot"
     );
     assert_eq!(redirected, Vec::<String>::new());
+    // What the lock does not say, the snapshot it names is asked: once.
+    let asked: Vec<String> = match checksums {
+        true => Vec::new(),
+        false => vec![format!("{}info/{DEP}", &first[p.api().len()..])],
+    };
+    assert_eq!(p.indexes_since(upgrading).await, asked);
     assert_eq!(
         std::fs::read_to_string(&warm_lib).unwrap(),
         p.service.patched,
@@ -9666,7 +9702,11 @@ async fn gem_hosted_newer_registry_snapshot_installs_the_newly_patched_build() {
         )),
         "{stdout}"
     );
-    assert!(!stderr.contains("Warning"), "{stderr}");
+    assert_eq!(
+        stderr.matches("Warning").count(),
+        caveat.len(),
+        "nothing warns but the lock's own caveat:\n{stderr}"
+    );
     assert_eq!(
         std::fs::read_to_string(committed.join("Gemfile.lock")).unwrap(),
         lock
@@ -10058,13 +10098,6 @@ async fn gem_hosted_withdrawn_build_of_an_earlier_patch_moves_to_the_newer_patch
     let warm_lib = p.installed_lib(&p.fx.proj);
     let api = p.api();
     let known = ["--patch-server-url", api.as_str()];
-    // The index documents of patch registries asked for since `mark`.
-    let indexes_since = |requests: Vec<String>| -> Vec<String> {
-        let asked = requests.into_iter();
-        asked
-            .filter(|path| path.starts_with("/patch-registry/") && path.contains("/info/"))
-            .collect()
-    };
 
     // 1. The earlier patch has a patched build for both platforms.
     let every = [
@@ -10172,7 +10205,7 @@ async fn gem_hosted_withdrawn_build_of_an_earlier_patch_moves_to_the_newer_patch
     );
     assert_eq!(redirected, Vec::<String>::new(), "which relays it");
     assert_eq!(
-        indexes_since(request_paths(&p.fx._server, moving.0).await),
+        p.indexes_since(moving).await,
         [format!("{}info/{DEP}", &first[api.len()..])],
         "the registry the lock was on is asked once, and no other"
     );
@@ -10235,7 +10268,7 @@ async fn gem_hosted_withdrawn_build_of_an_earlier_patch_moves_to_the_newer_patch
         "nothing is downloaded"
     );
     assert_eq!(
-        indexes_since(request_paths(&p.fx._server, again.0).await),
+        p.indexes_since(again).await,
         Vec::<String>::new(),
         "no registry is asked"
     );

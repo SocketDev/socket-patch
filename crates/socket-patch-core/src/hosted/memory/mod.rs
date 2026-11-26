@@ -2465,4 +2465,52 @@ mod tests {
             assert_eq!(project.redirect["warnings"], serde_json::json!([]));
         }
     }
+
+    /// A lock with no `CHECKSUMS` on the offered patch's own registry,
+    /// under an earlier snapshot in which `arm64-darwin` was upstream's
+    /// gem: the engine asks its provider for that snapshot's listing,
+    /// once, and reports the build as newly patched. Without the listing
+    /// it reports the build as it does on a lock that says nothing.
+    #[tokio::test]
+    async fn a_lock_without_checksums_is_told_what_a_newer_snapshot_patches() {
+        let (gemfile, lock) = gem_pair_on_a_patch("");
+        let pair = (
+            gemfile.replace(GEM_EARLIER, GEM_NEWER),
+            lock.replace(GEM_EARLIER, GEM_NEWER),
+        );
+        let index_url = format!("{}s/1a/info/rails", gem_registry(GEM_NEWER));
+        let listing = format!(
+            "---\n7.0.0 |checksum:{}\n7.0.0-arm64-darwin |checksum:{}\n7.0.0-x86_64-linux-gnu \
+             |checksum:{}\n",
+            "f".repeat(64),
+            "1".repeat(64),
+            "2".repeat(64)
+        );
+        for (served, newly) in [(vec![(index_url.as_str(), listing)], true), (vec![], false)] {
+            let (output, asked) = gem_run(&pair, &served).await;
+            assert_eq!(asked, [index_url.clone()], "newly {newly}");
+            assert_eq!(output.stats.provider_calls["downloadArtifact"], 1);
+            let [project] = output.projects.as_slice() else {
+                panic!("one project: {:?}", output.projects);
+            };
+            assert!(project.skipped.is_empty(), "{:?}", project.skipped);
+            let redirected: Vec<(Option<&str>, bool)> = project
+                .redirected
+                .iter()
+                .map(|patch| (patch.platform.as_deref(), patch.newly_patched))
+                .collect();
+            assert_eq!(redirected, [(Some("arm64-darwin"), newly)]);
+            let upstream: Vec<(&str, bool)> = project
+                .upstream_builds
+                .iter()
+                .map(|build| (build.platform.as_str(), build.withdrawn))
+                .collect();
+            assert_eq!(upstream, [("x86_64-linux-gnu", false)]);
+            let at_now = format!("{}s/c4/", gem_registry(GEM_NEWER));
+            for file in &output.changed_files {
+                assert!(file.content.contains(&at_now), "{}", file.content);
+            }
+            assert_eq!(output.changed_files.len(), 2);
+        }
+    }
 }
