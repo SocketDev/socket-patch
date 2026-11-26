@@ -3327,7 +3327,10 @@ async fn refused_platform_gem_is_counted_as_left_to_patch() {
                 &stdout,
             ),
             _ => (
-                format!("the patch service has no prebuilt platform gem of `{DEP}`"),
+                format!(
+                    "{DEP}@{DEP_VERSION} is not vendored: no patched build yet for \
+                     {OTHER_PLATFORM}"
+                ),
                 &stderr,
             ),
         };

@@ -9281,8 +9281,12 @@ fn rewrite_gem(
                 // No locked build is patched yet: moving the gem would
                 // gain nothing, so it stays on its upstream registry until
                 // a later reference lists a patched build for a platform
-                // the lock names.
-                if pinned.iter().all(|build| build.patch_uuid.is_none()) {
+                // the lock names. A lock that is on the registry already
+                // goes on: a build it pins was withdrawn since, and the
+                // registry as it stands serves upstream's gem for it, so
+                // the lock follows (its registry under the snapshot it
+                // names refuses that build now).
+                if !hosted && pinned.iter().all(|build| build.patch_uuid.is_none()) {
                     result.gem_unpatched.insert(
                         dep.patch_uuid.clone(),
                         pinned.into_iter().filter_map(|b| b.platform).collect(),
@@ -23640,6 +23644,45 @@ mod tests {
         assert_eq!(
             r.gem_unpatched.get("uuid").map(Vec::as_slice),
             Some(&["arm64-darwin".to_string(), "x86_64-linux-gnu".to_string()][..])
+        );
+    }
+
+    /// A patched build that was withdrawn: the registry as it stands
+    /// lists upstream's gem for that platform, and the snapshot the lock
+    /// names refuses the build. A lock already on the registry follows
+    /// the reference even when no locked build is patched any more, so it
+    /// pins what is served: the upstream sha256, under the current URL.
+    #[test]
+    fn gem_hosted_lock_follows_a_withdrawn_build_back_to_upstreams_gem() {
+        let arm = "a".repeat(64);
+        let upstream = upstream_sha("1.18.10-arm64-darwin");
+        let before = gem_override_at_snapshot("1a", &[("arm64-darwin", &arm, true)]);
+        let lock = nokogiri_lock(&["arm64-darwin"], false, true);
+        let (gemfile, moved, _) = gem_redirect(NOKOGIRI_GEMFILE, &lock, before);
+        assert!(moved.contains(&format!("sha256={arm}")), "{moved}");
+
+        let after = gem_override_at_snapshot("2b", &[("arm64-darwin", &upstream, false)]);
+        let (gemfile_after, lock_after, r) = gem_redirect(&gemfile, &moved, after.clone());
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.gem_unpatched.is_empty());
+        assert_eq!(builds_of(&r), [(Some("arm64-darwin"), None, false)]);
+        let (at_one, at_two) = (
+            format!("{GEM_TEST_URL}s/1a/"),
+            format!("{GEM_TEST_URL}s/2b/"),
+        );
+        assert_eq!(gemfile_after, gemfile.replace(&at_one, &at_two));
+        assert_eq!(
+            lock_after,
+            moved
+                .replace(&at_one, &at_two)
+                .replace(&format!("sha256={arm}"), &format!("sha256={upstream}"))
+        );
+        // A lock that was never moved stays upstream on the same reference.
+        let (_, _, fresh) = gem_redirect(NOKOGIRI_GEMFILE, &lock, after);
+        assert!(fresh.files.is_empty());
+        assert_eq!(
+            fresh.gem_unpatched.get("uuid").map(Vec::as_slice),
+            Some(&["arm64-darwin".to_string()][..])
         );
     }
 
