@@ -185,11 +185,6 @@ const GEM_PATCHES: &[(&str, &str)] = &[
         "15e960b5-f432-4b6c-b8aa-534a2b419323",
         "lib/active_storage/service/s3_service.rb",
     ),
-    // GHSA-w749-p3v6-hccq / CVE-2022-21831, published 2026-08-19T21:19Z.
-    (
-        "6c4141c5-1535-4fd2-9db1-b5f8e4834bdb",
-        "lib/active_storage/transformers/image_processing_transformer.rb",
-    ),
     // GHSA-9xrj-h377-fr87 / CVE-2026-33195, published 2026-08-20T16:14Z
     // (also touches disk_controller.rb + errors.rb; the service file is the
     // marker probe).
@@ -208,12 +203,19 @@ const GEM_PATCHES: &[(&str, &str)] = &[
         "9c2b4925-b413-4a3a-bb3a-9990440fb446",
         "lib/active_storage/transformers/image_processing_transformer.rb",
     ),
-    // MERGED patch (GHSA-w749-p3v6-hccq + GHSA-r4mg-4433-c7g3 +
-    // GHSA-xr9x-r78c-5hrm), published 2026-09-04T21:23Z; the merge rung in
-    // `api::ranking` selects it. Also touches engine.rb, active_storage.rb and
-    // adds vips.rb — every file carries the marker.
+    // GHSA-f3w6-w445-fwh9 / CVE-2026-122006, published 2026-11-06T20:56Z
+    // (also touches engine.rb and adds image_magick.rb + policy.xml).
     (
-        "01019627-b481-4bae-bc09-e93b5a5e4481",
+        "c29ea174-efc2-443b-ab66-b6ba73c9d6ae",
+        "lib/active_storage/analyzer/image_analyzer.rb",
+    ),
+    // GHSA-w749-p3v6-hccq / CVE-2022-21831, published 2026-11-26T01:43Z
+    // (also touches engine.rb + active_storage.rb). A republish: production
+    // withdrew the earlier patch for this advisory (6c4141c5-…) and the
+    // merged patch that contained it (01019627-…) at the same minute, so
+    // both are gone from this set.
+    (
+        "146ef6aa-f43e-42aa-9891-0983435220e2",
         "lib/active_storage/transformers/image_processing_transformer.rb",
     ),
 ];
