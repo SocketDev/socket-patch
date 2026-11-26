@@ -8155,6 +8155,39 @@ impl PlatformProject {
         );
     }
 
+    /// The premise of a withdrawn build: a fresh checkout of the project's
+    /// pair, which is `lock`, can no longer be installed on this machine,
+    /// frozen or not. The install fails, leaves no build of this machine's
+    /// platform behind, and leaves the lock as it is. (What bundler says of
+    /// it, and under which exit code, differs with its release and with
+    /// which locked build it names first, and is not held to anything.)
+    fn assert_no_longer_installs(&self, lock: &str) {
+        for (name, envs) in [
+            ("broken-frozen", &[("BUNDLE_FROZEN", "true")][..]),
+            ("broken", &[]),
+        ] {
+            let broken = stage_fresh_checkout(&self.fx, name);
+            let install = bundle_env(&broken, &["install"], envs);
+            assert!(
+                !install.status.success(),
+                "premise: `bundle install` ({envs:?}) of the unchanged pair fails on this machine \
+                 (bundler {}):\n{}{}",
+                self.fx.bundler.version,
+                String::from_utf8_lossy(&install.stdout),
+                String::from_utf8_lossy(&install.stderr)
+            );
+            assert!(
+                !self.installed_lib(&broken).exists(),
+                "({envs:?}) it installs no build of this platform"
+            );
+            assert_eq!(
+                std::fs::read_to_string(broken.join("Gemfile.lock")).unwrap(),
+                lock,
+                "({envs:?}) and leaves the lock as it is"
+            );
+        }
+    }
+
     /// How many requests the patch service and the upstream file host have
     /// answered: a mark for [`Self::fetched_since`].
     async fn mark(&self) -> (usize, usize) {
@@ -10054,38 +10087,7 @@ async fn gem_hosted_withdrawn_build_of_an_earlier_patch_moves_to_the_newer_patch
 
     // 2. The build of this machine's platform is withdrawn.
     p.withdraw(&first, &own).await;
-    let locked_build = format!("{DEP} ({})", build_token(Some(&own)));
-    for (name, envs) in [
-        ("broken-frozen", &[("BUNDLE_FROZEN", "true")][..]),
-        ("broken", &[]),
-    ] {
-        let broken = stage_fresh_checkout(&p.fx, name);
-        let install = bundle_env(&broken, &["install"], envs);
-        let said = format!(
-            "{}{}",
-            String::from_utf8_lossy(&install.stdout),
-            String::from_utf8_lossy(&install.stderr)
-        );
-        assert!(
-            !install.status.success(),
-            "premise: `bundle install` ({envs:?}) of the unchanged pair fails on this machine \
-             (bundler {}):\n{said}",
-            p.fx.bundler.version
-        );
-        assert!(
-            said.contains(&locked_build),
-            "({envs:?}) it fails on the withdrawn build:\n{said}"
-        );
-        assert!(
-            !p.installed_lib(&broken).exists(),
-            "({envs:?}) and installs no build of this platform"
-        );
-        assert_eq!(
-            std::fs::read_to_string(broken.join("Gemfile.lock")).unwrap(),
-            first_lock,
-            "({envs:?}) and leaves the lock as it is"
-        );
-    }
+    p.assert_no_longer_installs(&first_lock);
 
     // 3. The newer patch is on offer: no patched build for this platform.
     let after = [
