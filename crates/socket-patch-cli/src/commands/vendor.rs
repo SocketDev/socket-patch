@@ -33,7 +33,7 @@ use socket_patch_core::telemetry::{
     track_patch_vendor_failed, track_patch_vendored, TelemetryAuth, MODE_VENDORED,
 };
 use socket_patch_core::utils::concurrent::ordered_concurrent;
-use socket_patch_core::utils::group_commit::{CommittedFile, GroupCommit};
+use socket_patch_core::utils::group_commit::{self, CommittedFile, GroupCommit};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
@@ -5572,7 +5572,21 @@ impl VendorGcSummary {
 
     /// Report the orphan uuid dirs `sweep` kept because a project file
     /// still installs from them, as the sweep's other callers do.
-    fn note_still_wired(&mut self, sweep: &OrphanSweep) {
+    ///
+    /// `locked`: the caller holds the apply lock, whose acquire finishes
+    /// the commit an interrupted vendored run left. That commit replaces
+    /// the lockfiles before the ledger, so until it is finished a lockfile
+    /// can be ahead of its ledger entry, which is no lost entry and whose
+    /// directory must not be called deletable. An unlocked pass (a dry
+    /// one) that finds such a commit pending, or cannot tell, reports no
+    /// directory: the next locked run finishes the commit and judges.
+    fn note_still_wired(&mut self, sweep: &OrphanSweep, project_root: &Path, locked: bool) {
+        if sweep.still_wired.is_empty() {
+            return;
+        }
+        if !locked && !matches!(group_commit::pending(project_root), Ok(None)) {
+            return;
+        }
         self.unreconciled
             .extend(sweep.still_wired.iter().map(|unit| {
                 let warning = orphan_still_wired_by_prune(unit);
@@ -5664,7 +5678,7 @@ pub(crate) async fn run_vendor_gc(
         // ownership by the sweep deletes nothing. A directory a project
         // file still installs from is reported all the same.
         let kept = sweep_orphan_vendor_dirs(&common.cwd, &state, /*dry_run=*/ true).await;
-        out.note_still_wired(&kept);
+        out.note_still_wired(&kept, &common.cwd, !dry_run);
         return out;
     }
 
@@ -5809,7 +5823,7 @@ pub(crate) async fn run_vendor_gc(
     // One that could not be deleted is a `cleanup_failed` warning.
     let sweep = sweep_orphan_vendor_dirs(&common.cwd, &state, dry_run).await;
     out.orphan_dirs = sweep.removed.len();
-    out.note_still_wired(&sweep);
+    out.note_still_wired(&sweep, &common.cwd, !dry_run);
     for (unit, e) in &sweep.failed {
         let warning = orphan_removal_failed(unit, e);
         out.write_failures.push((warning.code, warning.detail));
@@ -7870,6 +7884,16 @@ mod gc_tests {
             .unwrap()
             .entries
             .contains_key(PURL));
+
+        // An interrupted vendored run's commit replaces the lockfiles
+        // before the ledger. While its journal is pending, a pass that
+        // holds no lock (a dry one) cannot tell a lockfile ahead of its
+        // ledger entry from a lost entry, and reports no directory.
+        tokio::fs::write(tmp.path().join(group_commit::COMMIT_JOURNAL_REL), b"{}")
+            .await
+            .unwrap();
+        let out = run_vendor_gc(&common, &manifest_path, true).await;
+        assert!(out.unreconciled.is_empty(), "{out:?}");
     }
 
     /// The ledger's error can quote the committed file, and a human run

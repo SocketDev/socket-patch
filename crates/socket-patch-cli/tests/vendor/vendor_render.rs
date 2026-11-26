@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use crate::common::envelope::{parse_json_envelope, warning_codes};
 use crate::common::hermetic;
 use crate::npm_fixture::*;
 use crate::prebuilt_common;
@@ -303,15 +304,10 @@ fn missing_manifest_with_an_unreadable_ledger_says_so_in_both_modes() {
 
     let (code, stdout, stderr) = human_vendor(&fx, &["--json"]);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    let env: Value = serde_json::from_str(&stdout).expect("one JSON document");
+    let env = parse_json_envelope(&stdout);
     assert_eq!(env["status"], "noManifest", "{env:#}");
-    let warnings = env["warnings"].as_array().cloned().unwrap_or_default();
-    let codes: Vec<&str> = warnings
-        .iter()
-        .map(|w| w["code"].as_str().unwrap())
-        .collect();
-    assert_eq!(codes, ["vendor_state_unreadable"], "{env:#}");
-    let detail = warnings[0]["detail"].as_str().unwrap();
+    assert_eq!(warning_codes(&env), ["vendor_state_unreadable"], "{env:#}");
+    let detail = env["warnings"][0]["detail"].as_str().unwrap();
     assert!(
         detail.contains("the vendor ledger could not be read: corrupt ")
             && detail.ends_with("restore .socket/vendor/state.json from version control"),
