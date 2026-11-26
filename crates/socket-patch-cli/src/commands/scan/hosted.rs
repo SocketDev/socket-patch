@@ -687,7 +687,12 @@ fn stale_cache_gem(purl: &str, cache_path: &Path) -> StaleGem {
 /// * A gem locked as precompiled platform builds is installed as
 ///   `<name>-<version>-<platform>`, and cached under that name: each is
 ///   judged the same way, against the patched artifacts of the gem, which
-///   include its prebuilds.
+///   include its patched platform builds.
+/// * A platform build the patch registry serves as upstream's own gem (no
+///   patched build yet; `gem_upstream_leaves` names it by leaf) is not
+///   judged at all, installed or committed to the cache dir: its lock
+///   entry pins upstream's gem, so a machine of that platform holds the
+///   right copy, and there is nothing to report or to refresh.
 /// * Which copies are judged is the lock's to say: every build of the gem
 ///   the project's lock names is looked for under its own leaf, in every
 ///   gem home. A gem home can hold several builds of one version (the
@@ -696,6 +701,7 @@ fn stale_cache_gem(purl: &str, cache_path: &Path) -> StaleGem {
 ///   platform build Bundler loads, or replace a build that is not this
 ///   project's. Only where no lock names the gem (a global scan) is the
 ///   first installed copy judged, as before.
+#[allow(clippy::too_many_arguments)]
 async fn gem_stale_install_warnings(
     cwd: &Path,
     global: bool,
@@ -709,6 +715,7 @@ async fn gem_stale_install_warnings(
         (String, String),
         std::collections::BTreeSet<String>,
     >,
+    gem_upstream_leaves: &std::collections::BTreeSet<String>,
     views: &mut ViewFallback<'_>,
 ) -> StaleInstallOutcome {
     use socket_patch_core::crawlers::types::CrawlerOptions;
@@ -832,6 +839,10 @@ async fn gem_stale_install_warnings(
             let Some(leaf) = dir.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
+            // Upstream's own gem is what the lock pins for this build.
+            if gem_upstream_leaves.contains(leaf) {
+                continue;
+            }
             let entry = dir_state.entry(dir.clone()).or_insert_with(|| DirJudgment {
                 purl: (*purl).to_string(),
                 leaf: leaf.to_string(),
@@ -968,6 +979,7 @@ async fn gem_stale_install_warnings(
         };
         for cache_path in builds
             .iter()
+            .filter(|build| !gem_upstream_leaves.contains(&build.leaf))
             .map(|build| app_cache.join(format!("{}.gem", build.leaf)))
         {
             if cache_covered.contains(&cache_path) || !cache_path.is_file() {
@@ -1053,6 +1065,7 @@ async fn refresh_stale_gems(
         (String, String),
         std::collections::BTreeSet<String>,
     >,
+    gem_upstream_leaves: &std::collections::BTreeSet<String>,
     overrides: &[DepOverride],
     mirror_sources: &socket_patch_core::hosted::engine::MirrorSources,
     views: &mut ViewFallback<'_>,
@@ -1066,6 +1079,7 @@ async fn refresh_stale_gems(
         confirmed,
         local_records,
         gem_artifact_shas,
+        gem_upstream_leaves,
         views,
     )
     .await;
@@ -1084,9 +1098,9 @@ async fn refresh_stale_gems(
     // The patched archive: what bundler itself would download from the
     // patch registry (`<index>/gems/<leaf>.gem`), else the grant's own
     // artifact, verified against the sha256 the lock pins. A platform
-    // build (`<name>-<version>-<platform>`) is the patch's prebuild for
-    // that platform, pinned by its own sha256; a platform gem declares no
-    // extensions, so replacing one builds nothing.
+    // build (`<name>-<version>-<platform>`) is the patched build the
+    // registry serves for that platform, pinned by its own sha256; a
+    // platform gem declares no extensions, so replacing one builds nothing.
     let wanted = |gem: &StaleGem| {
         let (name, version) = gem_sha_key(&gem.purl);
         let build = GemBuild::of_leaf(&gem.purl, &gem.leaf);
@@ -1097,6 +1111,7 @@ async fn refresh_stale_gems(
             .filter_map(|o| o.registry_override.as_ref())
             .flat_map(|ro| ro.identifiers.gem_builds.iter().flatten())
             .filter(|prebuild| Some(prebuild.platform.as_str()) == platform)
+            .filter(|prebuild| prebuild.patch_uuid.is_some())
             .map(|prebuild| prebuild.gem_checksum_sha256.to_ascii_lowercase())
             .collect();
         let sha256 = if prebuilt.is_empty() {
@@ -1148,6 +1163,7 @@ async fn refresh_stale_gems(
             confirmed,
             local_records,
             gem_artifact_shas,
+            gem_upstream_leaves,
             views,
         )
         .await
@@ -2397,25 +2413,39 @@ async fn run_redirect_selected_untracked(
     //
     // purl-coordinate → every PATCHED .gem artifact's sha256 (registry
     // override identifier, tarball integrity fallback; one per platform
-    // variant, and one per prebuild: the patched platform gem a lock that
+    // variant, and one per patched platform build: the gem a lock that
     // names platform builds is pinned to) — judges the installed and
     // committed archives, and verifies the archive a refresh installs.
     let mut gem_artifact_shas: std::collections::BTreeMap<
         (String, String),
         std::collections::BTreeSet<String>,
     > = std::collections::BTreeMap::new();
+    // The platform builds the patch registry serves as upstream's own gem
+    // (no patched build yet), by leaf: a machine of such a platform holds
+    // upstream's gem, which is what its lock entry pins.
+    let mut gem_upstream_leaves: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     for o in done.overrides.iter().filter(|o| o.ecosystem == "gem") {
         let sha = o
             .registry_override
             .as_ref()
             .and_then(|ro| ro.identifiers.gem_checksum_sha256.clone())
             .or_else(|| o.integrity.sha256.clone());
-        let prebuilds = o
+        let mut patched_builds = Vec::new();
+        for build in o
             .registry_override
             .iter()
             .flat_map(|ro| ro.identifiers.gem_builds.iter().flatten())
-            .map(|prebuild| prebuild.gem_checksum_sha256.clone());
-        for sha in sha.into_iter().chain(prebuilds) {
+        {
+            match build.patch_uuid {
+                Some(_) => patched_builds.push(build.gem_checksum_sha256.clone()),
+                None => {
+                    gem_upstream_leaves
+                        .insert(format!("{}-{}-{}", o.name, o.version, build.platform));
+                }
+            }
+        }
+        for sha in sha.into_iter().chain(patched_builds) {
             gem_artifact_shas
                 .entry((o.name.clone(), o.version.clone()))
                 .or_default()
@@ -2431,6 +2461,7 @@ async fn run_redirect_selected_untracked(
         &confirmed,
         &local_records,
         &gem_artifact_shas,
+        &gem_upstream_leaves,
         &done.overrides,
         &mirror_sources,
         &mut views,
@@ -4935,6 +4966,7 @@ mod tests {
             confirmed,
             records,
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeSet::new(),
             &mut super::ViewFallback::offline(),
         )
         .await
@@ -5214,6 +5246,7 @@ mod tests {
             &one_confirmed,
             &none,
             &shas,
+            &std::collections::BTreeSet::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5231,6 +5264,7 @@ mod tests {
             &one_confirmed,
             &none,
             &shas,
+            &std::collections::BTreeSet::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5244,6 +5278,7 @@ mod tests {
             &one_confirmed,
             &none,
             &shas,
+            &std::collections::BTreeSet::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5279,6 +5314,7 @@ mod tests {
             &confirmed,
             &std::collections::BTreeMap::new(),
             &shas,
+            &std::collections::BTreeSet::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5374,6 +5410,7 @@ mod tests {
             &one_confirmed(),
             &none,
             &shas,
+            &std::collections::BTreeSet::new(),
             &mut views,
         )
         .await;
@@ -5394,6 +5431,7 @@ mod tests {
             &one_confirmed(),
             &none,
             &shas,
+            &std::collections::BTreeSet::new(),
             &mut views,
         )
         .await;
@@ -5424,6 +5462,7 @@ mod tests {
                 &one_confirmed(),
                 &none,
                 &std::collections::BTreeMap::new(),
+                &std::collections::BTreeSet::new(),
                 &mut views,
             )
             .await;
@@ -5461,6 +5500,7 @@ mod tests {
             &one_confirmed(),
             &std::collections::BTreeMap::new(),
             &shas,
+            &std::collections::BTreeSet::new(),
             &mut views,
         )
         .await;
@@ -5576,6 +5616,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeSet::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5649,6 +5690,7 @@ mod tests {
                 &confirmed,
                 &records,
                 &shas,
+                &std::collections::BTreeSet::new(),
                 &mut super::ViewFallback::offline(),
             )
             .await
@@ -5694,6 +5736,7 @@ mod tests {
             &confirmed,
             &records,
             &upper,
+            &std::collections::BTreeSet::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5740,6 +5783,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeSet::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5783,6 +5827,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeSet::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5811,6 +5856,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &patched_shas,
+            &std::collections::BTreeSet::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5834,6 +5880,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeSet::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5876,6 +5923,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeSet::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5901,6 +5949,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeSet::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5928,6 +5977,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeSet::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -6017,6 +6067,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeSet::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -6034,6 +6085,93 @@ mod tests {
             );
             assert!(out.stale_purls.is_empty());
         }
+    }
+
+    /// A lock that names two platform builds, on a machine of the platform
+    /// the patch registry serves as upstream's own gem: the installed copy
+    /// and the committed cache-dir archive are upstream's gem, which is
+    /// what that lock entry pins. Neither is judged, whatever evidence
+    /// there is: nothing is stale, nothing is unjudged, and so nothing is
+    /// handed to the refresh. The same copies of a platform that has a
+    /// patched build are stale.
+    #[tokio::test]
+    async fn gem_stale_probe_leaves_a_build_on_upstreams_gem_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(
+            cwd.join("Gemfile"),
+            "source \"https://rubygems.org\"\ngem \"stale-unit\", \"1.0.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join("Gemfile.lock"),
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    stale-unit \
+             (1.0.0-arm64-darwin)\n    stale-unit (1.0.0-x86_64-linux-gnu)\n\nPLATFORMS\n  \
+             arm64-darwin\n  x86_64-linux-gnu\n\nDEPENDENCIES\n  stale-unit (= 1.0.0)\n\n\
+             BUNDLED WITH\n   2.5.0\n",
+        )
+        .unwrap();
+        let leaf = format!("{GEM_LEAF}-arm64-darwin");
+        let home = gem_home(cwd);
+        let gem_dir = home.join("gems").join(&leaf);
+        std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+        std::fs::write(gem_dir.join("lib").join("stale_unit.rb"), GEM_UPSTREAM).unwrap();
+        let archive = home.join("cache").join(format!("{leaf}.gem"));
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        std::fs::write(&archive, b"upstream platform .gem").unwrap();
+        let committed = cwd.join("vendor").join("cache").join(format!("{leaf}.gem"));
+        std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+        std::fs::write(&committed, b"upstream platform .gem").unwrap();
+
+        /// The probe of the one confirmed gem, whose patched artifacts are
+        /// the ruby gem and the other platform's build.
+        async fn judge(
+            cwd: &std::path::Path,
+            upstream_leaves: &std::collections::BTreeSet<String>,
+        ) -> super::StaleInstallOutcome {
+            let shas = std::collections::BTreeMap::from([(
+                ("stale-unit".to_string(), "1.0.0".to_string()),
+                std::collections::BTreeSet::from(["0".repeat(64), "1".repeat(64)]),
+            )]);
+            gem_stale_install_warnings(
+                cwd,
+                false,
+                None,
+                &one_confirmed(),
+                &std::collections::BTreeMap::new(),
+                &shas,
+                upstream_leaves,
+                &mut super::ViewFallback::offline(),
+            )
+            .await
+        }
+        let upstream = std::collections::BTreeSet::from([leaf.clone()]);
+        let patched_platform = std::collections::BTreeSet::new();
+
+        let out = judge(cwd, &upstream).await;
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(out.gems.is_empty(), "nothing to refresh");
+        assert!(out.stale_purls.is_empty() && out.unjudged_purls.is_empty());
+        let out = judge(cwd, &patched_platform).await;
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert_eq!(out.gems.len(), 1);
+        assert_eq!(
+            out.gems[0].cache_archive.as_deref(),
+            Some(committed.as_path()),
+            "the committed archive is stale with it"
+        );
+
+        // With no archive beside the install there is nothing to judge it
+        // by: unjudged for a patched platform, still nothing for this one.
+        std::fs::remove_file(&archive).unwrap();
+        std::fs::remove_file(&committed).unwrap();
+        let out = judge(cwd, &upstream).await;
+        assert!(out.warnings.is_empty() && out.unjudged_purls.is_empty());
+        let out = judge(cwd, &patched_platform).await;
+        assert_eq!(
+            out.unjudged_purls,
+            std::collections::BTreeSet::from([GEM_PURL.to_string()])
+        );
     }
 
     /// The standalone cache-flavor warning's load-bearing wording.

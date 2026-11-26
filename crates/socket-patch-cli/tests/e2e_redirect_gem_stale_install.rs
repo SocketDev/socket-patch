@@ -3005,11 +3005,142 @@ async fn stale_guard_follows_the_builds_the_lock_names_in_a_home_with_both() {
     ruby_copy_untouched();
 }
 
+/// A lock of two platform builds where the patch registry has a patched
+/// build for the other platform only: this machine's platform is served
+/// as upstream's own gem, and its lock entry keeps upstream's sha256. The
+/// copy this machine installed and the committed `bundle cache` archive
+/// are upstream's gem, which is right. The scan moves the gem, reports no
+/// stale install, refreshes nothing and downloads no gem: with the gem
+/// home's cached archive beside the install, and with it pruned, where
+/// only the patch's file hashes could judge the copy (they would call
+/// upstream's files stale).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_platform_served_as_upstreams_gem_is_no_stale_install() {
+    let upstream = real_gem_for(UPSTREAM_LIB, PLATFORM);
+    let other_upstream = real_gem_for(UPSTREAM_LIB, OTHER_PLATFORM);
+    let other_patched = real_gem_for(PATCHED_LIB, OTHER_PLATFORM);
+    let leaf = format!("{DEP}-{DEP_VERSION}-{PLATFORM}");
+    for cached in [true, false] {
+        let server = MockServer::start().await;
+        mount_api_with(
+            &server,
+            None,
+            &sha256_of(&real_gem(PATCHED_LIB)),
+            &[
+                (PLATFORM, sha256_of(&upstream), None),
+                (OTHER_PLATFORM, sha256_of(&other_patched), Some(LINUX_UUID)),
+            ],
+        )
+        .await;
+        // The registry hands this platform's gem on unchanged: a refresh
+        // that asked for it would be served, and would show below.
+        let gem_route = format!("{}/gems/{leaf}.gem", snapshot_registry_path());
+        Mock::given(method("GET"))
+            .and(path(gem_route.clone()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(upstream.clone(), "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("Gemfile"),
+            format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\n"),
+        )
+        .unwrap();
+        let lock = platform_lock(&sha256_of(&upstream), &sha256_of(&other_upstream));
+        std::fs::write(proj.join("Gemfile.lock"), &lock).unwrap();
+        let home = project_home(&proj);
+        let gem_dir = install_real_gem_for(&home, UPSTREAM_LIB, PLATFORM);
+        let home_archive = home.join("cache").join(format!("{leaf}.gem"));
+        if !cached {
+            std::fs::remove_file(&home_archive).unwrap();
+        }
+        let committed = proj
+            .join("vendor")
+            .join("cache")
+            .join(format!("{leaf}.gem"));
+        std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+        std::fs::write(&committed, &upstream).unwrap();
+
+        let uri = server.uri();
+        let (code, stdout, stderr) =
+            common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+        let env = common::parse_json_envelope(&stdout);
+        assert_eq!(code, 0, "cached={cached}: {env}\nstderr:\n{stderr}");
+        // The gem moved: the other platform is patched, this one is not.
+        assert_eq!(
+            hosted_pins(&env),
+            [(
+                format!("{PURL}?platform={OTHER_PLATFORM}"),
+                LINUX_UUID.to_string()
+            )],
+            "cached={cached}: {env}"
+        );
+        let hosted_lock = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
+        assert!(
+            hosted_lock.contains(&format!(
+                "CHECKSUMS\n  {DEP} ({DEP_VERSION}-{PLATFORM}) sha256={}\n  {DEP} \
+                 ({DEP_VERSION}-{OTHER_PLATFORM}) sha256={}\n",
+                sha256_of(&upstream),
+                sha256_of(&other_patched)
+            )),
+            "cached={cached}: this platform keeps upstream's sha256:\n{hosted_lock}"
+        );
+
+        // Nothing about this machine's copy: it is the gem the lock pins.
+        assert!(
+            stale_warnings(&env).is_empty()
+                && warnings_with_code(&env, "redirect_gem_install_refreshed").is_empty(),
+            "cached={cached}: {env}"
+        );
+        assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB, "cached={cached}");
+        assert_eq!(std::fs::read(&committed).unwrap(), upstream);
+        match cached {
+            true => assert_eq!(std::fs::read(&home_archive).unwrap(), upstream),
+            false => assert!(!home_archive.exists(), "no archive is added"),
+        }
+        let asked: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .filter(|route| route.contains("/gems/") || route.contains("/patches/view/"))
+            .collect();
+        assert_eq!(
+            asked,
+            Vec::<String>::new(),
+            "cached={cached}: no gem is downloaded, no record is fetched to judge the copy"
+        );
+
+        // For a person: the one line about the gem's builds, and no warning.
+        let (code, stdout, stderr) = common::run_with_env(&proj, &scan_args(&proj, &uri, &[]), &[]);
+        assert_eq!(code, 0, "cached={cached}:\n{stdout}\n{stderr}");
+        assert!(
+            stdout.contains(&format!(
+                "{DEP} {DEP_VERSION}: patched for {OTHER_PLATFORM}; upstream gem kept for \
+                 {PLATFORM} (no patched build yet)\n"
+            )),
+            "cached={cached}:\n{stdout}"
+        );
+        assert!(
+            !stderr.contains("stale") && !stderr.contains("unpatched install"),
+            "cached={cached}:\n{stderr}"
+        );
+        assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB, "cached={cached}");
+    }
+}
+
 /// A fresh checkout: nothing is installed, and the lock names the gem only
 /// as platform builds. The hosted scan reads the gem from the lock alone
-/// and pins every build to its prebuild. With a prebuild missing for one
-/// locked platform it pins nothing, says which, and leaves both files as
-/// they were.
+/// and pins every build to its patched build. Where the patch registry
+/// does not list one locked platform it pins nothing, says which, and
+/// leaves both files as they were.
 #[tokio::test(flavor = "multi_thread")]
 async fn gem_hosted_scan_pins_platform_builds_from_the_lock_alone() {
     let ruby_sha = sha256_of(&real_gem(PATCHED_LIB));
