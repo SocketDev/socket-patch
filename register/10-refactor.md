@@ -8,7 +8,7 @@ _Last updated 2026-11-26 · 5 runs under this charter · `main` at cfc870f when 
 ### In flight
 | PR | Issue | State |
 |---|---|---|
-| #2261 | #2253, and the still-wired bullet of #1910 | ready, awaiting review. `hosted-e2e` is red on the patch service's 500s, not the PR: re-run it |
+| #2261 | #2253, and the still-wired bullet of #1910 | ready, awaiting review. `hosted-e2e` is red on the patch service's 500s: re-run it |
 
 **Next PR**, most harm first. Each has a failing test, probe or mutation on `main` in its issue:
 1. #2254: wrong advice after a rollback. One file (`vlt_heal.rs`).
@@ -82,7 +82,6 @@ Issues looked at:
 ### Notes
 - Build with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0` on every cargo call, and give each checkout its own `CARGO_TARGET_DIR`, or the next call rebuilds everything. A cold CLI build takes 3 minutes, one test binary 2, a rebuild after an edit 25 seconds.
 - CI's clippy is `cargo clippy --locked --workspace --all-features -- -D warnings`. With `--all-targets` it fails on `main` in `tests/common` and `tests/prebuilt_common`.
-- Clap field doc comments are `--help` output: leave them alone.
 - `--cwd` defaults to `.`: absolutize it before walking `ancestors()`, and test via chdir under `#[serial]`. A test runner that pins `--cwd` must not also set the child's cwd to the project.
 - `git fetch --deepen=2500 origin main` takes seconds and makes `git log -S` usable on the shallow checkout.
 - A write that returns 5xx may still have landed. List before you retry.
