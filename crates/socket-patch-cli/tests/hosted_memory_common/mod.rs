@@ -593,9 +593,10 @@ pub fn legacy_redirect(envelope: &Value) -> Value {
 }
 
 /// Copy what an event's `details` say of a gem's locked build (`gemFix`,
-/// `platform`, `newlyPatched`) onto its `redirect.patches[]` row.
+/// `platform`, `newlyPatched`, `withdrawn`) onto its `redirect.patches[]`
+/// row.
 fn build_keys(event: &Value, row: &mut Value) {
-    for key in ["gemFix", "platform", "newlyPatched"] {
+    for key in ["gemFix", "platform", "newlyPatched", "withdrawn"] {
         if let Some(value) = event["details"].get(key) {
             row[key] = value.clone();
         }

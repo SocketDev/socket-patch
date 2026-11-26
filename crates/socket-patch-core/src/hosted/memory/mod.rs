@@ -1614,6 +1614,7 @@ fn finish_root(
                 purl: report.purl,
                 gem_fix,
                 platform,
+                withdrawn: report.withdrawn,
             }),
             // Only a platform build of a gem is ever served as upstream's.
             (None, _, _) => {}
@@ -2212,6 +2213,17 @@ mod tests {
         (gemfile, lock)
     }
 
+    /// The `CHECKSUMS` section of [`gem_pair_on_a_patch`] that pins
+    /// upstream's gem (`1…`) for `arm64-darwin` and `linux` for
+    /// `x86_64-linux-gnu`.
+    fn gem_sums(linux: &str) -> String {
+        format!(
+            "\nCHECKSUMS\n  rails (7.0.0-arm64-darwin) sha256={}\n  rails (7.0.0-x86_64-linux-gnu) \
+             sha256={linux}\n",
+            "1".repeat(64)
+        )
+    }
+
     /// One run of the engine over `(Gemfile, lock)` against a
     /// [`GemPatchService`] that serves `served`: the output, and the
     /// artifact URLs the run asked for.
@@ -2244,14 +2256,13 @@ mod tests {
     }
 
     /// The in-memory engine never moves a lock from one patch of a gem to
-    /// another that has a patched build for fewer of its locked builds. A
-    /// lock with `CHECKSUMS` says what it installs, and nothing is asked.
-    /// One without is judged by the compact index of the registry it is
-    /// on, which the engine asks its provider for once: a patched build
-    /// there keeps the lock where it is, as does a document the provider
-    /// cannot serve, and upstream's gem there lets the lock move. A gem
-    /// that stays is skipped under its quiet code, with nothing changed
-    /// and no warning.
+    /// another that has a patched build for fewer of the builds its
+    /// registry still serves. The lock is judged by the compact index of
+    /// the registry it is on, which the engine asks its provider for
+    /// once, with `CHECKSUMS` or without: a patched build there keeps the
+    /// lock where it is, as does a document the provider cannot serve,
+    /// and upstream's gem there lets the lock move. A gem that stays is
+    /// skipped under its quiet code, with nothing changed and no warning.
     #[tokio::test]
     async fn a_lock_on_another_patch_of_a_gem_is_moved_only_where_it_loses_nothing() {
         use crate::hosted::engine::GEM_NEWER_FIX_WAITS;
@@ -2299,16 +2310,16 @@ mod tests {
             assert_eq!(project.redirect["warnings"], serde_json::json!([]));
         };
 
-        // `CHECKSUMS` pins a patched build for linux: no request.
-        let sums = format!(
-            "\nCHECKSUMS\n  rails (7.0.0-arm64-darwin) sha256={}\n  rails (7.0.0-x86_64-linux-gnu) \
-             sha256={}\n",
-            "1".repeat(64),
-            "b".repeat(64)
-        );
-        let (output, asked) = gem_run(&gem_pair_on_a_patch(&sums), &[]).await;
+        // `CHECKSUMS` pins a patched build for linux, which the registry
+        // the lock is on still serves: one request.
+        let with_sums = gem_pair_on_a_patch(&gem_sums(&"b".repeat(64)));
+        let (output, asked) = gem_run(&with_sums, &[(&index_url, index(&"b".repeat(64)))]).await;
         stays(&output);
-        assert!(asked.is_empty(), "{asked:?}");
+        assert_eq!(asked, [index_url.clone()]);
+        assert_eq!(output.stats.provider_calls["downloadArtifact"], 1);
+        let (output, asked) = gem_run(&with_sums, &[]).await;
+        stays(&output);
+        assert_eq!(asked, [index_url.clone()]);
 
         // No `CHECKSUMS`: the registry the lock is on is asked, once.
         let pair = gem_pair_on_a_patch("");
@@ -2347,11 +2358,111 @@ mod tests {
             redirected,
             [("dddddddd-4444-4444-8444-dddddddddddd", Some("arm64-darwin"))]
         );
-        let upstream: Vec<&str> = project
+        let upstream: Vec<(&str, bool)> = project
             .upstream_builds
             .iter()
-            .map(|build| build.platform.as_str())
+            .map(|build| (build.platform.as_str(), build.withdrawn))
             .collect();
-        assert_eq!(upstream, ["x86_64-linux-gnu"]);
+        assert_eq!(
+            upstream,
+            [("x86_64-linux-gnu", false)],
+            "a lock with no `CHECKSUMS` does not say that a build was withdrawn"
+        );
+    }
+
+    /// The patched build a lock's `CHECKSUMS` pins was withdrawn: the
+    /// registry the lock is on, asked once, no longer lists it (or lists
+    /// another sha256 for it), so an install of that platform fails
+    /// there. The engine moves the lock to the patch on offer, which
+    /// serves upstream's gem for that platform, pins upstream's sha256
+    /// for it, and reports the build as back on upstream's gem: in
+    /// `upstreamBuilds[]` and in the row of the `redirect` block.
+    #[tokio::test]
+    async fn a_lock_whose_pinned_build_was_withdrawn_moves_to_the_patch_on_offer() {
+        let index_url = format!("{}s/1a/info/rails", gem_registry(GEM_EARLIER));
+        let listing = |linux: Option<&str>| {
+            let mut index = format!(
+                "---\n7.0.0 |checksum:{}\n7.0.0-arm64-darwin |checksum:{}\n",
+                "a".repeat(64),
+                "1".repeat(64)
+            );
+            if let Some(linux) = linux {
+                index.push_str(&format!("7.0.0-x86_64-linux-gnu |checksum:{linux}\n"));
+            }
+            index
+        };
+        let pair = gem_pair_on_a_patch(&gem_sums(&"b".repeat(64)));
+        let at_newer = format!("{}s/c4/", gem_registry(GEM_NEWER));
+        for served in [None, Some("e".repeat(64))] {
+            let index = listing(served.as_deref());
+            let (output, asked) = gem_run(&pair, &[(&index_url, index)]).await;
+            assert_eq!(asked, [index_url.clone()], "{served:?}");
+            assert_eq!(output.stats.provider_calls["downloadArtifact"], 1);
+            assert!(output.warnings.is_empty(), "{:?}", output.warnings);
+            let changed: Vec<&str> = output
+                .changed_files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect();
+            assert_eq!(changed, ["Gemfile", "Gemfile.lock"], "{served:?}");
+            for file in &output.changed_files {
+                assert!(file.content.contains(&at_newer), "{}", file.content);
+                assert!(!file.content.contains(GEM_EARLIER), "{}", file.content);
+            }
+            let lock = &output.changed_files[1].content;
+            assert!(
+                lock.contains(&format!(
+                    "  rails (7.0.0-arm64-darwin) sha256={}\n  rails (7.0.0-x86_64-linux-gnu) \
+                     sha256={}\n",
+                    "d".repeat(64),
+                    "2".repeat(64)
+                )),
+                "{served:?}: {lock}"
+            );
+            let [project] = output.projects.as_slice() else {
+                panic!("one project: {:?}", output.projects);
+            };
+            assert!(project.error.is_none(), "{:?}", project.error);
+            assert!(project.skipped.is_empty(), "{:?}", project.skipped);
+            let redirected: Vec<(&str, Option<&str>)> = project
+                .redirected
+                .iter()
+                .map(|patch| (patch.uuid.as_str(), patch.platform.as_deref()))
+                .collect();
+            assert_eq!(
+                redirected,
+                [("dddddddd-4444-4444-8444-dddddddddddd", Some("arm64-darwin"))]
+            );
+            assert_eq!(
+                serde_json::to_value(&project.upstream_builds).unwrap(),
+                serde_json::json!([{
+                    "purl": "pkg:gem/rails@7.0.0?platform=x86_64-linux-gnu",
+                    "gemFix": GEM_NEWER,
+                    "platform": "x86_64-linux-gnu",
+                    "withdrawn": true,
+                }]),
+                "{served:?}"
+            );
+            let rows = project.redirect["patches"].as_array().expect("the rows");
+            let row = rows
+                .iter()
+                .find(|row| row["platform"] == "x86_64-linux-gnu")
+                .expect("the row of the linux build");
+            assert_eq!(
+                row,
+                &serde_json::json!({
+                    "purl": "pkg:gem/rails@7.0.0?platform=x86_64-linux-gnu",
+                    "action": "upstream_kept",
+                    "errorCode": "gem_upstream_build_kept",
+                    "error": "the patch registry serves upstream's own gem for \
+                              x86_64-linux-gnu: its patched build was withdrawn",
+                    "gemFix": GEM_NEWER,
+                    "platform": "x86_64-linux-gnu",
+                    "withdrawn": true,
+                }),
+                "{served:?}"
+            );
+            assert_eq!(project.redirect["warnings"], serde_json::json!([]));
+        }
     }
 }

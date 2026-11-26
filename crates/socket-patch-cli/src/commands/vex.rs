@@ -3311,7 +3311,7 @@ fn emit_envelope_success(
                         Some(why) => Some((GEM_BUILD_UNKNOWN, why.clone())),
                         None if build.kept_upstream => Some((
                             GEM_UPSTREAM_BUILD_KEPT,
-                            gem_upstream_build_kept_detail(platform),
+                            gem_upstream_build_kept_detail(platform, false),
                         )),
                         None => None,
                     }

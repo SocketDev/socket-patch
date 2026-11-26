@@ -296,8 +296,8 @@ pub struct RedirectedPatch {
 }
 
 /// One locked platform build of a redirected gem that the patch registry
-/// serves as upstream's own gem (no patched build yet): machines of that
-/// platform install what they installed before, so it is no entry of
+/// serves as upstream's own gem (no patched build): machines of that
+/// platform install what upstream publishes, so it is no entry of
 /// `redirected`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -307,6 +307,12 @@ pub struct UpstreamBuild {
     /// The gem patch's uuid, as [`RedirectedPatch::gem_fix`].
     pub gem_fix: String,
     pub platform: String,
+    /// This run put the build back on upstream's gem: the patched build
+    /// its lock entry pinned was withdrawn. Absent for a build that has
+    /// had no patched build, and for one whose lock entry had no
+    /// `CHECKSUMS` sha256 to say what it was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub withdrawn: bool,
 }
 
 pub use crate::hosted::engine::SkippedPatch;

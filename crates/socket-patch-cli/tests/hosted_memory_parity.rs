@@ -112,38 +112,45 @@ async fn assert_parity_run(case: Case) -> (Value, socket_patch_cli::hosted_memor
     for (rel, bytes) in &case.extra {
         files.insert((*rel).to_string(), bytes.clone());
     }
+    let (name, dry_run, redirects) = (case.fixture, case.dry_run, case.expect_redirect);
+    assert_parity_over(name, &server, &files, dry_run, redirects).await
+}
 
-    let disk = run_disk(&server, &files, case.dry_run);
-    let input = build_input(&files, &[], options(case.dry_run));
-    let memory = run_engine(&server, input).await;
+/// The parity of the two engines over `files` against the patch API
+/// `server` answers as: the shared `redirect` block and the engine's
+/// result for the one root. `name` names the case in a failure, and
+/// `expect_redirect` requires at least one redirect.
+async fn assert_parity_over(
+    name: &str,
+    server: &MockServer,
+    files: &BTreeMap<String, Vec<u8>>,
+    dry_run: bool,
+    expect_redirect: bool,
+) -> (Value, socket_patch_cli::hosted_memory::ProjectResult) {
+    let disk = run_disk(server, files, dry_run);
+    let input = build_input(files, &[], options(dry_run));
+    let memory = run_engine(server, input).await;
 
-    assert_eq!(memory.projects.len(), 1, "{}: one root", case.fixture);
+    assert_eq!(memory.projects.len(), 1, "{name}: one root");
     let project = &memory.projects[0];
     assert_eq!(project.root, "");
-    assert!(
-        project.error.is_none(),
-        "{}: {:?}",
-        case.fixture,
-        project.error
-    );
+    assert!(project.error.is_none(), "{name}: {:?}", project.error);
     let disk_redirect = disk.redirect.clone();
     assert_eq!(
         sorted_redirect(&project.redirect),
         disk_redirect,
-        "{}: redirect block differs\nmemory: {:#}\ndisk: {:#}\nstderr: {}",
-        case.fixture,
+        "{name}: redirect block differs\nmemory: {:#}\ndisk: {:#}\nstderr: {}",
         project.redirect,
         disk_redirect,
         disk.stderr
     );
     let memory_changed = engine_changed(&memory);
-    let expected_changed = if case.dry_run {
+    let expected_changed = if dry_run {
         assert!(
             disk.changed.is_empty(),
-            "{}: a disk dry run wrote files",
-            case.fixture
+            "{name}: a disk dry run wrote files"
         );
-        let mut wet = run_disk(&server, &files, false).changed;
+        let mut wet = run_disk(server, files, false).changed;
         wet.remove(".socket/vendor/redirect-state.json");
         wet
     } else {
@@ -152,8 +159,7 @@ async fn assert_parity_run(case: Case) -> (Value, socket_patch_cli::hosted_memor
     assert_eq!(
         memory_changed.keys().collect::<Vec<_>>(),
         expected_changed.keys().collect::<Vec<_>>(),
-        "{}: changed file sets differ\nmemory:\n{}\ndisk:\n{}",
-        case.fixture,
+        "{name}: changed file sets differ\nmemory:\n{}\ndisk:\n{}",
         describe(&memory_changed),
         describe(&expected_changed)
     );
@@ -161,25 +167,19 @@ async fn assert_parity_run(case: Case) -> (Value, socket_patch_cli::hosted_memor
         assert_eq!(
             String::from_utf8_lossy(&memory_changed[rel]),
             String::from_utf8_lossy(bytes),
-            "{}: {rel} differs",
-            case.fixture
+            "{name}: {rel} differs"
         );
     }
     let redirected = disk_redirect["redirected"].as_u64().unwrap_or(0);
     assert_eq!(redirected as usize, project.redirected.len());
-    if case.expect_redirect {
+    if expect_redirect {
         assert!(
             redirected > 0,
-            "{}: the fixture redirected nothing: {disk_redirect:#}\n{}",
-            case.fixture,
+            "{name}: the fixture redirected nothing: {disk_redirect:#}\n{}",
             disk.stderr
         );
     }
-    assert!(
-        project.summary.scanned_packages >= redirected,
-        "{}",
-        case.fixture
-    );
+    assert!(project.summary.scanned_packages >= redirected, "{name}");
     (disk_redirect, project.clone())
 }
 
@@ -371,9 +371,105 @@ async fn parity_gemfile_platform_pass_through() {
             purl: "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin".into(),
             gem_fix: FIX.into(),
             platform: "arm64-darwin".into(),
+            withdrawn: false,
         }]
     );
     assert!(project.skipped.is_empty(), "{:?}", project.skipped);
+}
+
+/// A lock of platform builds on an earlier patch of the gem, whose patched
+/// `arm64-darwin` build was withdrawn: the registry the lock is on no
+/// longer lists it. The patch on offer serves upstream's gem for that
+/// platform. Both engines ask the registry the lock is on, once each,
+/// move the lock to the patch on offer with upstream's sha256 back for
+/// that build, and report it as back on upstream's gem, in the same row.
+#[tokio::test]
+async fn parity_gemfile_platform_withdrawn_on_an_earlier_patch() {
+    use socket_patch_cli::hosted_memory::UpstreamBuild;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    const TOKEN: &str = "11111111-1111-1111-1111-111111111111";
+    const FIX: &str = "77777777-7777-7777-7777-777777777777";
+    const LINUX: &str = "77777777-7777-4777-8777-00000000000b";
+    const EARLIER: &str = "66666666-6666-4666-8666-666666666666";
+    let dir = fixtures_root().join("redirect/gem/bundler/platform-pass-through");
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
+    mount_api(&server, &patches).await;
+    // The pair as a run left it on the earlier patch: the fixture's
+    // hosted pair on this host, under the earlier patch and its snapshot,
+    // with that patch's patched build pinned for `arm64-darwin`.
+    let (upstream, withdrawn) = ("3".repeat(64), "a".repeat(64));
+    let mut files = fixture_files(&dir.join("expected"));
+    for bytes in files.values_mut() {
+        let text = String::from_utf8(bytes.clone()).expect("a text fixture");
+        let text = text
+            .replace("https://patch.socket.dev", &server.uri())
+            .replace(&format!("{FIX}/s/4/"), &format!("{EARLIER}/s/1a/"))
+            .replace(&upstream, &withdrawn);
+        *bytes = text.into_bytes();
+    }
+    let lock = String::from_utf8_lossy(&files["Gemfile.lock"]).into_owned();
+    assert!(
+        lock.contains(&format!("/{EARLIER}/s/1a/\n")) && lock.contains(&withdrawn),
+        "premise: {lock}"
+    );
+    let index = format!("/patch-registry/gem/{TOKEN}/{EARLIER}/s/1a/info/nokogiri");
+    Mock::given(method("GET"))
+        .and(path(index.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "---\n1.18.10 racc:~> 1.4|checksum:{}\n1.18.10-x86_64-linux-gnu racc:~> \
+             1.4|checksum:{}\n",
+            "deadbeef".repeat(8),
+            "b".repeat(64)
+        )))
+        .mount(&server)
+        .await;
+
+    let name = "a withdrawn build on an earlier patch";
+    let (redirect, project) = assert_parity_over(name, &server, &files, false, true).await;
+    assert_eq!(redirect["redirected"], 1, "{redirect:#}");
+    assert_eq!(redirect["warnings"], serde_json::json!([]), "{redirect:#}");
+    assert_eq!(redirect["skipped"], serde_json::json!([]), "{redirect:#}");
+    assert_eq!(
+        redirect["rewrittenFiles"],
+        serde_json::json!(["Gemfile", "Gemfile.lock"])
+    );
+    assert_eq!(
+        redirect["patches"],
+        serde_json::json!([
+            {
+                "purl": "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin",
+                "action": "upstream_kept",
+                "errorCode": "gem_upstream_build_kept",
+                "error": "the patch registry serves upstream's own gem for arm64-darwin: its \
+                          patched build was withdrawn",
+                "gemFix": FIX,
+                "platform": "arm64-darwin",
+                "withdrawn": true,
+            },
+            {
+                "purl": "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu",
+                "uuid": LINUX,
+                "action": "pinned",
+                "gemFix": FIX,
+                "platform": "x86_64-linux-gnu",
+            },
+        ]),
+        "{redirect:#}"
+    );
+    assert_eq!(
+        project.upstream_builds,
+        [UpstreamBuild {
+            purl: "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin".into(),
+            gem_fix: FIX.into(),
+            platform: "arm64-darwin".into(),
+            withdrawn: true,
+        }]
+    );
+    let asked = server.received_requests().await.unwrap_or_default();
+    let asked = asked.iter().filter(|request| request.url.path() == index);
+    assert_eq!(asked.count(), 2, "one request an engine");
 }
 
 /// The same lock where no locked platform has a patched build yet: both

@@ -2034,6 +2034,7 @@ mod tests {
             gem_fix: Some("gem-fix".to_string()),
             platform: platform.map(str::to_string),
             newly_patched: patch.is_some(),
+            withdrawn: false,
         }
     }
 
@@ -2207,6 +2208,7 @@ mod tests {
             gem_fix: None,
             platform: None,
             newly_patched: false,
+            withdrawn: false,
         };
         note_unpatched_builds(
             &mut builds,

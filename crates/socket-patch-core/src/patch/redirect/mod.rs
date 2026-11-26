@@ -263,11 +263,19 @@ pub struct GemLockedBuild {
     /// The patch of the build the registry serves: the gem's own patch for
     /// the ruby-platform gem, the platform's for a patched platform gem.
     /// `None` where the registry serves upstream's own gem (no patched
-    /// build yet): that platform is as it was.
+    /// build): that platform installs what upstream publishes.
     pub patch_uuid: Option<String>,
     /// Whether this rewrite is what put the patched build in place: the
     /// lock did not already pin it from the registry.
     pub newly_patched: bool,
+    /// Whether this rewrite puts the build back on upstream's own gem:
+    /// the lock pinned another sha256 for it from a patch registry of the
+    /// gem (a patched build, withdrawn since), and the registry serves
+    /// upstream's gem for it. Never set for a build the lock has no
+    /// `CHECKSUMS` entry of: nothing then says what it was. Serialized
+    /// only when set.
+    #[cfg_attr(test, serde(skip_serializing_if = "std::ops::Not::not"))]
+    pub withdrawn: bool,
 }
 
 /// One platform gem of a patched gem's version, as the patch registry
@@ -522,11 +530,12 @@ pub struct RewriteResult {
     /// gem: the gems the lock takes as platform builds from the registry
     /// of another patch of the gem, left on that patch because this one's
     /// registry serves upstream's own gem for a platform whose locked
-    /// build is patched there (or is not shown to be upstream's), by the
-    /// gem patch's uuid, with those platforms. Moving the lock would take
-    /// a patched build away from them. Not a defect: the gem moves once a
-    /// reference lists a patched build for each. Serialized only when
-    /// non-empty.
+    /// build that registry still serves patched (or is not shown to have
+    /// stopped serving), by the gem patch's uuid, with those platforms.
+    /// Moving the lock would take a patched build away from them. Not a
+    /// defect: the gem moves once a reference lists a patched build for
+    /// each, or once the registry it is on serves none of them any more.
+    /// Serialized only when non-empty.
     #[cfg_attr(
         test,
         serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")
@@ -8366,6 +8375,15 @@ struct GemUpstreamBuild {
     pinned: Option<String>,
 }
 
+impl GemUpstreamBuild {
+    /// Whether the lock pins the build at the sha256 of upstream's gem
+    /// already: the move changes nothing for it.
+    fn pinned_upstream(&self) -> bool {
+        let pinned = self.pinned.as_deref();
+        pinned.is_some_and(|sha256| sha256.eq_ignore_ascii_case(&self.upstream))
+    }
+}
+
 /// What the gem rewriter weighs before it moves a lock of platform builds
 /// from the registry of another patch of the gem to the registry of the
 /// patch `dep` is (`ov`): the registry the lock is on (its remote for the
@@ -8374,6 +8392,8 @@ struct GemUpstreamBuild {
 /// builds the move can take a patched build away from: a platform this
 /// patch has a patched build for loses nothing, whatever the lock pins,
 /// and neither does the ruby-platform gem, which the patch itself is.
+/// Among them, one the lock pins at upstream's sha256 already has nothing
+/// to lose either ([`GemUpstreamBuild::pinned_upstream`]).
 ///
 /// `None` where nothing is weighed: the lock names no platform build of
 /// the gem, the reference lists no builds or not every locked platform,
@@ -8415,31 +8435,80 @@ fn gem_move_from_other_patch<'t>(
 
 /// The platforms among `builds` ([`gem_move_from_other_patch`]) whose
 /// locked build the move would turn from a patched build into upstream's
-/// own gem. A build is upstream's gem already when the sha256 the lock
-/// installs for it is the one the patch's reference lists for upstream's
-/// gem: the sha256 its `CHECKSUMS` pins, else the one the registry the
-/// lock is on lists (`index`: that registry's compact-index document,
-/// where a run read it). A build that neither says anything of is taken
-/// for a patched one: a move never leaves a lock with less than it has.
-fn gem_builds_lost(builds: &[GemUpstreamBuild], index: Option<&str>) -> Vec<String> {
+/// own gem: the builds that are patched today. `index` is the
+/// compact-index document of the registry the lock is on, where a run
+/// read it, and `version` the gem's locked version.
+///
+/// A build the lock pins at upstream's sha256 is upstream's gem already.
+/// Any other is patched today only while the registry the lock is on
+/// still serves it as the lock installs it:
+///
+/// - the lock's `CHECKSUMS` pins a sha256 for it: the registry lists the
+///   build under that sha256. A registry that does not list the build, or
+///   lists it under another sha256, refuses what the lock pins (the
+///   patched build was withdrawn), so nothing there is left to lose;
+/// - the lock pins none: the registry lists the build under a sha256 that
+///   is not upstream's. One that lists upstream's gem, or does not list
+///   the build, serves no patched build for it.
+///
+/// Where nothing shows what the registry serves (no document, one that is
+/// no listing of the gem's version, or a line for the build that names no
+/// sha256), every such build is taken for a patched one: a move never
+/// leaves a lock with less than it is known to have.
+fn gem_builds_lost(builds: &[GemUpstreamBuild], version: &str, index: Option<&str>) -> Vec<String> {
+    let index = index.filter(|index| gem_index_lists_version(index, version));
     builds
         .iter()
+        .filter(|build| !build.pinned_upstream())
         .filter(|build| {
-            let served = || upstream::compact_index_checksum(index?, &build.token);
-            let installed = build.pinned.clone().or_else(served);
-            !installed.is_some_and(|sha256| sha256.eq_ignore_ascii_case(&build.upstream))
+            let Some(index) = index else {
+                return true;
+            };
+            let served = upstream::compact_index_checksum(index, &build.token);
+            match (&build.pinned, served) {
+                (Some(pinned), Some(served)) => served.eq_ignore_ascii_case(pinned),
+                (None, Some(served)) => !served.eq_ignore_ascii_case(&build.upstream),
+                // A line that names no sha256 says nothing of the build.
+                (_, None) => gem_index_tokens(index).any(|token| token == build.token),
+            }
         })
         .map(|build| build.platform.clone())
         .collect()
 }
 
+/// The build each line of a compact-index `info` document is of
+/// (`<version>[-<platform>]`): the first word of every line but the `---`
+/// that opens the listing.
+fn gem_index_tokens(index: &str) -> impl Iterator<Item = &str> {
+    index.lines().filter_map(|line| {
+        let head = line.split_once('|').map_or(line, |(head, _)| head);
+        let token = head.split(' ').next()?;
+        (!token.is_empty() && token != "---").then_some(token)
+    })
+}
+
+/// Whether `index` reads as the compact-index document of a registry that
+/// serves the gem at `version`: it lists a build of that version (the
+/// ruby-platform gem or a platform gem) with its sha256. A registry of a
+/// patch lists the patched ruby gem of its version for as long as it
+/// serves the patch, so a document that lists none (an empty one, an
+/// error page) is no answer about any build.
+fn gem_index_lists_version(index: &str, version: &str) -> bool {
+    gem_index_tokens(index).any(|token| {
+        let rest = token.strip_prefix(version);
+        rest.is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+            && upstream::compact_index_checksum(index, token).is_some()
+    })
+}
+
 /// Engine-supplied input: what the registry a lock is on lists, as the
 /// JSON of a map from a compact-index document's URL
 /// ([`gem_index_info_url`]) to its text. A lock of platform builds that
-/// takes a gem from the registry of another patch of the gem and has no
-/// `CHECKSUMS` entry for a build is judged by that document. Absent, or
-/// without the document of a registry, where none was read: nothing then
-/// shows what such a build is, and the gem stays on the patch it is on.
+/// takes a gem from the registry of another patch of the gem is judged by
+/// that document wherever the move would take a build from it
+/// ([`gem_builds_lost`]). Absent, or without the document of a registry,
+/// where none was read: nothing then shows what such a build is, and the
+/// gem stays on the patch it is on.
 pub const GEM_INDEX_KEY: &str = "<socket-patch:gem-index>";
 
 /// The compact-index document in which the registry at `remote` (a lock's
@@ -8465,12 +8534,14 @@ fn gem_index_documents(files: &BTreeMap<String, String>) -> BTreeMap<String, Str
 /// The compact-index documents the gem rewriter would read for the Bundler
 /// pair among `files` ([`GEM_INDEX_KEY`]), sorted: for each gem among
 /// `overrides` that the lock takes as platform builds from the registry of
-/// another patch of the gem, with no `CHECKSUMS` entry for a locked build
-/// that the registry of the override serves as upstream's own gem, the
-/// document of the registry the lock is on. One per such gem, and none
-/// for any other: a lock on the override's own registry, on its upstream
-/// registry, with a `CHECKSUMS` entry for each such build, or that names
-/// the gem as its ruby-platform gem alone.
+/// another patch of the gem, with a locked build that the registry of the
+/// override serves as upstream's own gem and that the lock does not pin
+/// at upstream's sha256 already, the document of the registry the lock is
+/// on. One per such gem, whether the lock has `CHECKSUMS` or not, and
+/// none for any other: a lock on the override's own registry, on its
+/// upstream registry, one whose `CHECKSUMS` pins upstream's sha256 for
+/// each such build, or one that names the gem as its ruby-platform gem
+/// alone.
 pub fn gem_index_urls(files: &BTreeMap<String, String>, overrides: &[&DepOverride]) -> Vec<String> {
     let (_, lock_name) = gem_pair(files);
     let Some(lock) = files.get(lock_name) else {
@@ -8493,7 +8564,7 @@ pub fn gem_index_urls(files: &BTreeMap<String, String>, overrides: &[&DepOverrid
         let Some((remote, builds)) = gem_move_from_other_patch(parsed, dep, ov, *merged) else {
             continue;
         };
-        if builds.iter().any(|build| build.pinned.is_none()) {
+        if builds.iter().any(|build| !build.pinned_upstream()) {
             urls.extend(gem_index_info_url(remote, &dep.name));
         }
     }
@@ -9503,23 +9574,30 @@ fn rewrite_gem(
                 let hosted = gem_lock_on_registry(parsed, dep, index_url);
                 // A lock on the registry of another patch of the gem has
                 // patched builds of its own. Moving it must not turn one
-                // of them into upstream's gem, which this patch's registry
-                // serves for every platform it has no patched build for:
-                // the gem then stays on the patch it is on, as it is,
-                // until a reference lists a patched build for each. (A
-                // lock on this patch's own registry follows its list: a
-                // build that turns into upstream's gem there was
+                // that its registry still serves into upstream's gem,
+                // which this patch's registry serves for every platform
+                // it has no patched build for: the gem then stays on the
+                // patch it is on, as it is, until a reference lists a
+                // patched build for each. A build that registry no longer
+                // serves as the lock pins it was withdrawn: the lock
+                // installs nothing for that platform, so it holds nothing
+                // back. (A lock on this patch's own registry follows its
+                // list: a build that turns into upstream's gem there was
                 // withdrawn.)
                 let other = gem_move_from_other_patch(parsed, dep, ov, merged);
                 if let Some((remote, at_stake)) = &other {
                     let index = gem_index_info_url(remote, &dep.name)
                         .and_then(|url| index_documents.get(&url));
-                    let lost = gem_builds_lost(at_stake, index.map(String::as_str));
+                    let index = index.map(String::as_str);
+                    let lost = gem_builds_lost(at_stake, &dep.version, index);
                     if !lost.is_empty() {
                         result.gem_held.insert(dep.patch_uuid.clone(), lost);
                         continue;
                     }
                 }
+                // Whether the lock takes the gem from a patch registry of
+                // the gem, this patch's or another's.
+                let on_registry = hosted || other.is_some();
                 // What each locked build is pinned to: its own archive's
                 // sha256. The ruby gem's is among them only where the lock
                 // has that entry beside the platform builds.
@@ -9544,16 +9622,24 @@ fn rewrite_gem(
                     // gem. A lock with no CHECKSUMS says nothing either
                     // way, and is taken to have it when it is on this
                     // patch's own registry.
-                    let in_place = match parsed.checksum(&dep.name, &token) {
-                        Some(was) => {
-                            (hosted || other.is_some()) && was.eq_ignore_ascii_case(&sha256)
-                        }
+                    let was = parsed.checksum(&dep.name, &token);
+                    let in_place = match was {
+                        Some(was) => on_registry && was.eq_ignore_ascii_case(&sha256),
                         None => hosted,
                     };
+                    // Back on upstream's gem: the lock pinned another
+                    // archive for the build from a patch registry of the
+                    // gem, which was a patched build, and the registry
+                    // serves upstream's gem for it. A lock with no
+                    // `CHECKSUMS` entry does not say what it had.
+                    let withdrawn = patch_uuid.is_none()
+                        && on_registry
+                        && was.is_some_and(|was| !was.eq_ignore_ascii_case(&sha256));
                     pinned.push(GemLockedBuild {
                         platform: id.platform.clone(),
                         newly_patched: patch_uuid.is_some() && !in_place,
                         patch_uuid,
+                        withdrawn,
                     });
                     checksums.push((token, sha256));
                 }
@@ -9565,9 +9651,10 @@ fn rewrite_gem(
                 // was withdrawn since, and the registry as it stands
                 // serves upstream's gem for it, so the lock follows (its
                 // registry under the snapshot it names refuses that build
-                // now). On another patch's, it has no patched build to
-                // lose and follows the patch on offer.
-                let on_registry = hosted || other.is_some();
+                // now). On another patch's, no build it still installs
+                // from there is lost, and it follows the patch on offer:
+                // staying would leave it on a registry that refuses a
+                // build it pins.
                 if !on_registry && pinned.iter().all(|build| build.patch_uuid.is_none()) {
                     result.gem_unpatched.insert(
                         dep.patch_uuid.clone(),
@@ -23934,20 +24021,25 @@ mod tests {
     /// names refuses the build. A lock already on the registry follows
     /// the reference even when no locked build is patched any more, so it
     /// pins what is served: the upstream sha256, under the current URL.
+    /// The result says that the build went back to upstream's gem, once:
+    /// a run over the lock it left finds upstream's gem pinned, and says
+    /// nothing of a withdrawal.
     #[test]
     fn gem_hosted_lock_follows_a_withdrawn_build_back_to_upstreams_gem() {
         let arm = "a".repeat(64);
         let upstream = upstream_sha("1.18.10-arm64-darwin");
         let before = gem_override_at_snapshot("1a", &[("arm64-darwin", &arm, true)]);
         let lock = nokogiri_lock(&["arm64-darwin"], false, true);
-        let (gemfile, moved, _) = gem_redirect(NOKOGIRI_GEMFILE, &lock, before);
+        let (gemfile, moved, first) = gem_redirect(NOKOGIRI_GEMFILE, &lock, before);
         assert!(moved.contains(&format!("sha256={arm}")), "{moved}");
+        assert_eq!(withdrawn_of(&first, "uuid"), Vec::<&str>::new());
 
         let after = gem_override_at_snapshot("2b", &[("arm64-darwin", &upstream, false)]);
         let (gemfile_after, lock_after, r) = gem_redirect(&gemfile, &moved, after.clone());
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert!(r.gem_unpatched.is_empty());
         assert_eq!(builds_of(&r), [(Some("arm64-darwin"), None, false)]);
+        assert_eq!(withdrawn_of(&r, "uuid"), ["arm64-darwin"]);
         let (at_one, at_two) = (
             format!("{GEM_TEST_URL}s/1a/"),
             format!("{GEM_TEST_URL}s/2b/"),
@@ -23959,6 +24051,10 @@ mod tests {
                 .replace(&at_one, &at_two)
                 .replace(&format!("sha256={arm}"), &format!("sha256={upstream}"))
         );
+        let (_, _, again) = gem_redirect(&gemfile_after, &lock_after, after.clone());
+        assert!(again.files.is_empty() && again.edits.is_empty());
+        assert_eq!(builds_of(&again), [(Some("arm64-darwin"), None, false)]);
+        assert_eq!(withdrawn_of(&again, "uuid"), Vec::<&str>::new());
         // A lock that was never moved stays upstream on the same reference.
         let (_, _, fresh) = gem_redirect(NOKOGIRI_GEMFILE, &lock, after);
         assert!(fresh.files.is_empty());
@@ -23966,6 +24062,18 @@ mod tests {
             fresh.gem_unpatched.get("uuid").map(Vec::as_slice),
             Some(&["arm64-darwin".to_string()][..])
         );
+    }
+
+    /// The platforms [`RewriteResult::gem_builds`] says the rewrite put
+    /// back on upstream's gem, of the gem patch `uuid`.
+    fn withdrawn_of<'r>(r: &'r RewriteResult, uuid: &str) -> Vec<&'r str> {
+        let builds = r.gem_builds.get(uuid).map(Vec::as_slice);
+        builds
+            .unwrap_or_default()
+            .iter()
+            .filter(|build| build.withdrawn)
+            .filter_map(|build| build.platform.as_deref())
+            .collect()
     }
 
     /// [`gem_override_listing`] with its registry at the snapshot `key`
@@ -24139,13 +24247,19 @@ mod tests {
     /// `1a`, with `linux` patched there (`b…`) and `arm64-darwin` on
     /// upstream's gem: `(Gemfile, lock)`.
     fn nokogiri_pair_on_patch(checksums: bool) -> (String, String) {
-        let earlier = gem_override_at_snapshot(
-            "1a",
+        nokogiri_pair_on(
             &[
                 ("arm64-darwin", &upstream_sha("1.18.10-arm64-darwin"), false),
                 ("x86_64-linux-gnu", &"b".repeat(64), true),
             ],
-        );
+            checksums,
+        )
+    }
+
+    /// [`nokogiri_pair_on_patch`] where the registry of the patch `uuid`
+    /// lists `builds` for the two platforms.
+    fn nokogiri_pair_on(builds: &[(&str, &str, bool)], checksums: bool) -> (String, String) {
+        let earlier = gem_override_at_snapshot("1a", builds);
         let platforms = ["arm64-darwin", "x86_64-linux-gnu"];
         let lock = nokogiri_lock(&platforms, false, checksums);
         let (gemfile, lock, r) = gem_redirect(NOKOGIRI_GEMFILE, &lock, earlier);
@@ -24220,9 +24334,10 @@ mod tests {
     /// `x86_64-linux-gnu`. The patch on offer is another one, whose
     /// registry serves upstream's own gem for every locked platform.
     /// Moving the lock would turn the patched build into upstream's gem,
-    /// so the pair stays on the patch it is on, byte for byte, with no
-    /// warning: the result names the gem and the platform that would lose
-    /// its patched build.
+    /// so, while the registry the lock is on still serves that build, the
+    /// pair stays on the patch it is on, byte for byte, with no warning:
+    /// the result names the gem and the platform that would lose its
+    /// patched build.
     #[test]
     fn gem_lock_on_another_patch_is_not_moved_to_one_that_patches_less() {
         let (gemfile, lock) = nokogiri_pair_on_patch(true);
@@ -24235,18 +24350,231 @@ mod tests {
                 false,
             ),
         ]);
-        let (gemfile_after, lock_after, r) = gem_redirect(&gemfile, &lock, newer.clone());
+        // What the lock pins is what its registry serves.
+        let served = nokogiri_index(&[
+            (
+                "1.18.10-arm64-darwin",
+                &upstream_sha("1.18.10-arm64-darwin"),
+            ),
+            ("1.18.10-x86_64-linux-gnu", &"b".repeat(64)),
+        ]);
+        let (gemfile_after, lock_after, r) =
+            gem_redirect_with_index(&gemfile, &lock, newer.clone(), &[served]);
         assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
         assert_eq!((gemfile_after, lock_after), (gemfile.clone(), lock.clone()));
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert_eq!(held_of(&r), Some(vec!["x86_64-linux-gnu"]));
         assert!(r.gem_builds.is_empty() && r.gem_unpatched.is_empty() && r.gem_unlisted.is_empty());
-        // The lock says what it installs: no registry is asked.
-        let files = BTreeMap::from([
-            ("Gemfile".to_string(), gemfile),
-            ("Gemfile.lock".to_string(), lock),
+    }
+
+    /// A lock's `CHECKSUMS` say what it pins for a build, not that the
+    /// registry it is on still serves it: a patched build that was
+    /// withdrawn is refused under the snapshot the lock names, and a lock
+    /// held there for its sake would keep failing to install. So the
+    /// registry is asked, with `CHECKSUMS` too. The lock stays where the
+    /// registry lists the build under the sha256 the lock pins. It moves
+    /// to the patch on offer where the registry does not list the build
+    /// or lists it under another sha256: the build then goes back to
+    /// upstream's gem, and the result says so. Where nothing shows what
+    /// the registry serves, the lock stays.
+    #[test]
+    fn gem_lock_with_checksums_stays_only_while_its_registry_serves_what_it_pins() {
+        let (gemfile, lock) = nokogiri_pair_on_patch(true);
+        let (arm_upstream, linux_upstream) = (
+            upstream_sha("1.18.10-arm64-darwin"),
+            upstream_sha("1.18.10-x86_64-linux-gnu"),
+        );
+        let (pinned, ruby) = ("b".repeat(64), "f".repeat(64));
+        // The patch on offer: a patched build for `arm64-darwin`, and
+        // upstream's gem for `x86_64-linux-gnu`.
+        let newer = gem_override_of_newer_patch(&[
+            ("arm64-darwin", &"d".repeat(64), true),
+            ("x86_64-linux-gnu", &linux_upstream, false),
         ]);
-        assert!(gem_index_urls(&files, &[&newer]).is_empty());
+        let files = BTreeMap::from([
+            ("Gemfile".to_string(), gemfile.clone()),
+            ("Gemfile.lock".to_string(), lock.clone()),
+        ]);
+        // The registry lists the ruby gem and `arm64-darwin` throughout,
+        // and `x86_64-linux-gnu` as `linux` says.
+        let index = |linux: Option<&str>| {
+            let mut builds = vec![
+                ("1.18.10", ruby.as_str()),
+                ("1.18.10-arm64-darwin", arm_upstream.as_str()),
+            ];
+            builds.extend(linux.map(|sha| ("1.18.10-x86_64-linux-gnu", sha)));
+            nokogiri_index(&builds)
+        };
+        let (url, served) = index(Some(&pinned));
+        assert_eq!(gem_index_urls(&files, &[&newer]), [url.clone()]);
+
+        let stays = |documents: &[(String, String)], why: &str| {
+            let (gemfile_after, lock_after, r) =
+                gem_redirect_with_index(&gemfile, &lock, newer.clone(), documents);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{why}: {:?}",
+                r.edits
+            );
+            assert_eq!((&gemfile_after, &lock_after), (&gemfile, &lock), "{why}");
+            assert!(r.warnings.is_empty(), "{why}: {:?}", r.warnings);
+            assert_eq!(held_of(&r), Some(vec!["x86_64-linux-gnu"]), "{why}");
+        };
+        stays(&[(url.clone(), served)], "the pinned build is still served");
+        stays(&[], "no document");
+        let elsewhere = format!("{GEM_TEST_URL}s/2b/info/nokogiri");
+        stays(&[(elsewhere, index(None).1)], "another registry's document");
+        stays(&[(url.clone(), String::new())], "an empty document");
+        stays(
+            &[(url.clone(), "---\n".to_string())],
+            "a listing of nothing",
+        );
+        let page = "<html><body>Sign in to continue</body></html>\n".to_string();
+        stays(&[(url.clone(), page)], "a page that is no listing");
+        let other_version = format!("---\n1.18.9-x86_64-linux-gnu |checksum:{pinned}\n");
+        stays(
+            &[(url.clone(), other_version)],
+            "a listing of another version",
+        );
+        let no_sha256 = format!(
+            "{}1.18.10-x86_64-linux-gnu racc:~> 1.4|ruby:>= 3.1\n",
+            index(None).1
+        );
+        stays(
+            &[(url.clone(), no_sha256)],
+            "a line for the build that names no sha256",
+        );
+
+        let earlier_url = format!("{GEM_TEST_URL}s/1a/");
+        let arm_patch = build_uuid("arm64-darwin");
+        let other = "e".repeat(64);
+        for (linux, why) in [
+            (None, "the build is not listed"),
+            (Some(other.as_str()), "listed under another sha256"),
+            (Some(linux_upstream.as_str()), "listed as upstream's gem"),
+        ] {
+            let (gemfile_after, lock_after, r) =
+                gem_redirect_with_index(&gemfile, &lock, newer.clone(), &[index(linux)]);
+            assert!(r.warnings.is_empty(), "{why}: {:?}", r.warnings);
+            assert!(r.gem_held.is_empty(), "{why}: {:?}", r.gem_held);
+            assert_eq!(
+                gemfile_after,
+                gemfile.replace(&earlier_url, NEWER_URL),
+                "{why}"
+            );
+            assert_eq!(
+                lock_after,
+                lock.replace(&earlier_url, NEWER_URL)
+                    .replace(&arm_upstream, &"d".repeat(64))
+                    .replace(&pinned, &linux_upstream),
+                "{why}"
+            );
+            assert_eq!(
+                newer_builds_of(&r),
+                [
+                    (Some("arm64-darwin"), Some(arm_patch.as_str()), true),
+                    (Some("x86_64-linux-gnu"), None, false),
+                ],
+                "{why}"
+            );
+            assert_eq!(withdrawn_of(&r, NEWER), ["x86_64-linux-gnu"], "{why}");
+            // The lock it left is on the patch's own registry: in place.
+            let (_, _, again) = gem_redirect(&gemfile_after, &lock_after, newer.clone());
+            assert!(again.files.is_empty() && again.edits.is_empty(), "{why}");
+            assert_eq!(withdrawn_of(&again, NEWER), Vec::<&str>::new(), "{why}");
+        }
+    }
+
+    /// Two locked builds are patched on the registry the lock is on, and
+    /// the patch on offer serves upstream's gem for both. One of them was
+    /// withdrawn and the other is still served: the lock stays for the
+    /// one that is still patched, and the result names that platform
+    /// alone. Once neither is served any more the lock moves, though the
+    /// patch on offer has no patched build for any locked platform: a
+    /// lock on a patch registry is never left on one that refuses what it
+    /// pins. Both builds go back to upstream's sha256, and the result
+    /// says so of each.
+    #[test]
+    fn gem_lock_moves_off_a_registry_that_serves_none_of_its_patched_builds() {
+        let (arm, linux) = ("a".repeat(64), "b".repeat(64));
+        let (arm_upstream, linux_upstream) = (
+            upstream_sha("1.18.10-arm64-darwin"),
+            upstream_sha("1.18.10-x86_64-linux-gnu"),
+        );
+        let (gemfile, lock) = nokogiri_pair_on(
+            &[
+                ("arm64-darwin", &arm, true),
+                ("x86_64-linux-gnu", &linux, true),
+            ],
+            true,
+        );
+        // The patch on offer has a patched build for `java` alone.
+        let newer = gem_override_of_newer_patch(&[
+            ("arm64-darwin", &arm_upstream, false),
+            ("java", &"c".repeat(64), true),
+            ("x86_64-linux-gnu", &linux_upstream, false),
+        ]);
+        let ruby = ("1.18.10", "f".repeat(64));
+
+        // `arm64-darwin` was withdrawn, `x86_64-linux-gnu` is served.
+        let one_left = nokogiri_index(&[
+            (ruby.0, ruby.1.as_str()),
+            ("1.18.10-x86_64-linux-gnu", &linux),
+        ]);
+        let (gemfile_after, lock_after, r) =
+            gem_redirect_with_index(&gemfile, &lock, newer.clone(), &[one_left]);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        assert_eq!((&gemfile_after, &lock_after), (&gemfile, &lock));
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(
+            held_of(&r),
+            Some(vec!["x86_64-linux-gnu"]),
+            "the withdrawn build holds nothing back"
+        );
+
+        // Both were withdrawn: the registry lists the ruby gem alone.
+        let none_left = nokogiri_index(&[(ruby.0, ruby.1.as_str())]);
+        let (gemfile_after, lock_after, r) =
+            gem_redirect_with_index(&gemfile, &lock, newer.clone(), &[none_left]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.gem_held.is_empty() && r.gem_unpatched.is_empty());
+        let earlier_url = format!("{GEM_TEST_URL}s/1a/");
+        assert_eq!(gemfile_after, gemfile.replace(&earlier_url, NEWER_URL));
+        assert_eq!(
+            lock_after,
+            lock.replace(&earlier_url, NEWER_URL)
+                .replace(&arm, &arm_upstream)
+                .replace(&linux, &linux_upstream)
+        );
+        assert_eq!(
+            newer_builds_of(&r),
+            [
+                (Some("arm64-darwin"), None, false),
+                (Some("x86_64-linux-gnu"), None, false),
+            ]
+        );
+        assert_eq!(
+            withdrawn_of(&r, NEWER),
+            ["arm64-darwin", "x86_64-linux-gnu"]
+        );
+
+        // A lock that follows from there pins upstream's sha256 for every
+        // build the next patch serves as upstream's gem: nothing can be
+        // lost, so no registry is asked and the lock moves.
+        let files = BTreeMap::from([
+            ("Gemfile".to_string(), gemfile_after.clone()),
+            ("Gemfile.lock".to_string(), lock_after.clone()),
+        ]);
+        let mut next = newer.clone();
+        next.patch_uuid = "next".into();
+        let next_url = "https://patch.test/gem/tok/next/s/d5/";
+        next.registry_override.as_mut().unwrap().index_url = next_url.into();
+        assert!(gem_index_urls(&files, &[&next]).is_empty());
+        let (gemfile_next, lock_next, r) = gem_redirect(&gemfile_after, &lock_after, next);
+        assert!(r.gem_held.is_empty() && r.gem_unpatched.is_empty());
+        assert_eq!(gemfile_next, gemfile_after.replace(NEWER_URL, next_url));
+        assert_eq!(lock_next, lock_after.replace(NEWER_URL, next_url));
+        assert_eq!(withdrawn_of(&r, "next"), Vec::<&str>::new());
     }
 
     /// The patch on offer patches every build the lock has patched, or
@@ -24318,9 +24646,9 @@ mod tests {
 
     /// The patch on offer patches `arm64-darwin`, which the lock has on
     /// upstream's gem, but not `x86_64-linux-gnu`, which the lock has
-    /// patched: a gain for one platform is no reason to take the patched
-    /// build from another. The lock stays, and the result names the
-    /// platform that would lose.
+    /// patched and its registry still serves: a gain for one platform is
+    /// no reason to take the patched build from another. The lock stays,
+    /// and the result names the platform that would lose.
     #[test]
     fn gem_lock_is_not_moved_to_a_patch_that_patches_other_builds() {
         let (gemfile, lock) = nokogiri_pair_on_patch(true);
@@ -24332,7 +24660,15 @@ mod tests {
                 false,
             ),
         ]);
-        let (gemfile_after, lock_after, r) = gem_redirect(&gemfile, &lock, newer);
+        let served = nokogiri_index(&[
+            (
+                "1.18.10-arm64-darwin",
+                &upstream_sha("1.18.10-arm64-darwin"),
+            ),
+            ("1.18.10-x86_64-linux-gnu", &"b".repeat(64)),
+        ]);
+        let (gemfile_after, lock_after, r) =
+            gem_redirect_with_index(&gemfile, &lock, newer, &[served]);
         assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
         assert_eq!((gemfile_after, lock_after), (gemfile, lock));
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
@@ -24345,9 +24681,11 @@ mod tests {
     /// request, handed in by the engine. A build that registry lists
     /// under another sha256 than upstream's gem is a patched one, and the
     /// lock stays. A build it lists under upstream's sha256 loses
-    /// nothing, and the lock moves. With no document, one that is not
-    /// that registry's, or one that does not list the build, nothing is
-    /// known, and the lock stays.
+    /// nothing, and neither does one it does not list (no build is served
+    /// for that platform there): the lock moves, and the result claims no
+    /// withdrawal, since nothing says what the lock had. With no
+    /// document, or one that is not that registry's or no listing of the
+    /// version, nothing is known, and the lock stays.
     #[test]
     fn gem_lock_without_checksums_is_judged_by_what_its_own_registry_lists() {
         let (gemfile, lock) = nokogiri_pair_on_patch(false);
@@ -24398,9 +24736,13 @@ mod tests {
             &[(elsewhere, upstream.clone())],
             "another registry's document",
         );
-        let (_, unlisted) = nokogiri_index(&[("1.18.10-arm64-darwin", &arm_upstream)]);
-        stays(&[(url.clone(), unlisted)], "the build is not listed");
         stays(&[(url.clone(), String::new())], "an empty document");
+        let other_version =
+            "---\n1.18.9-arm64-darwin |checksum:".to_string() + &arm_upstream + "\n";
+        stays(
+            &[(url.clone(), other_version)],
+            "a listing of another version",
+        );
         // The rewriter by itself is handed nothing, and holds the gem too.
         let (_, _, alone) = gem_redirect(&gemfile, &lock, newer.clone());
         assert!(alone.files.is_empty());
@@ -24412,30 +24754,45 @@ mod tests {
         assert!(r.files.is_empty());
         assert_eq!(held_of(&r), Some(vec!["x86_64-linux-gnu"]));
 
-        // The registry lists upstream's gem for the build: nothing to lose.
-        let (gemfile_after, lock_after, r) =
-            gem_redirect_with_index(&gemfile, &lock, newer.clone(), &[(url, upstream)]);
-        assert!(r.gem_held.is_empty(), "{:?}", r.gem_held);
+        // The registry lists upstream's gem for the build, or does not
+        // list the build: nothing to lose.
+        let (_, unlisted) = nokogiri_index(&[("1.18.10-arm64-darwin", &arm_upstream)]);
         let earlier_url = format!("{GEM_TEST_URL}s/1a/");
-        assert_eq!(gemfile_after, gemfile.replace(&earlier_url, NEWER_URL));
-        assert_eq!(lock_after, lock.replace(&earlier_url, NEWER_URL));
         let arm_patch = build_uuid("arm64-darwin");
-        assert_eq!(
-            newer_builds_of(&r),
-            [
-                (Some("arm64-darwin"), Some(arm_patch.as_str()), true),
-                (Some("x86_64-linux-gnu"), None, false),
-            ]
-        );
+        for (document, why) in [
+            (upstream, "listed as upstream's gem"),
+            (unlisted, "the build is not listed"),
+        ] {
+            let documents = [(url.clone(), document)];
+            let (gemfile_after, lock_after, r) =
+                gem_redirect_with_index(&gemfile, &lock, newer.clone(), &documents);
+            assert!(r.gem_held.is_empty(), "{why}: {:?}", r.gem_held);
+            assert_eq!(
+                gemfile_after,
+                gemfile.replace(&earlier_url, NEWER_URL),
+                "{why}"
+            );
+            assert_eq!(lock_after, lock.replace(&earlier_url, NEWER_URL), "{why}");
+            assert_eq!(
+                newer_builds_of(&r),
+                [
+                    (Some("arm64-darwin"), Some(arm_patch.as_str()), true),
+                    (Some("x86_64-linux-gnu"), None, false),
+                ],
+                "{why}"
+            );
+            assert_eq!(withdrawn_of(&r, NEWER), Vec::<&str>::new(), "{why}");
+        }
     }
 
-    /// The registry a lock is on is asked only where nothing else says
-    /// what the lock installs: a lock of platform builds on the registry
-    /// of another patch, with no `CHECKSUMS` entry for a build that the
-    /// patch on offer serves as upstream's gem. One URL then, and none on
-    /// any other run.
+    /// The registry a lock is on is asked only where a move could take a
+    /// build from it: a lock of platform builds on the registry of
+    /// another patch, with a build that the patch on offer serves as
+    /// upstream's gem and that the lock does not pin at upstream's sha256
+    /// already, whether the lock has `CHECKSUMS` or not. One URL then,
+    /// and none on any other run.
     #[test]
-    fn gem_index_is_asked_for_only_where_the_lock_says_nothing() {
+    fn gem_index_is_asked_for_only_where_a_move_could_lose_a_build() {
         let linux_upstream = upstream_sha("1.18.10-x86_64-linux-gnu");
         let (arm, linux) = ("d".repeat(64), "e".repeat(64));
         let offer = [
@@ -24465,9 +24822,27 @@ mod tests {
             asked(&gemfile, &rotated, &newer),
             ["https://patch.test/gem/an-older-grant/uuid/info/nokogiri"]
         );
-        // `CHECKSUMS` entries say what the lock installs.
+        // `CHECKSUMS` entries say what the lock pins, not whether its
+        // registry still serves it: the same one URL.
         let (with_sums_gemfile, with_sums) = nokogiri_pair_on_patch(true);
-        assert!(asked(&with_sums_gemfile, &with_sums, &newer).is_empty());
+        assert_eq!(
+            asked(&with_sums_gemfile, &with_sums, &newer),
+            [format!("{GEM_TEST_URL}s/1a/info/nokogiri")]
+        );
+        // The lock pins upstream's sha256 for the one build the patch on
+        // offer serves as upstream's gem: nothing can be lost.
+        let arm_upstream = upstream_sha("1.18.10-arm64-darwin");
+        let keeps = [
+            ("arm64-darwin", arm_upstream.as_str(), false),
+            ("x86_64-linux-gnu", linux.as_str(), true),
+        ];
+        let keeping = gem_override_of_newer_patch(&keeps);
+        assert!(asked(&with_sums_gemfile, &with_sums, &keeping).is_empty());
+        // The same lock without `CHECKSUMS` pins nothing, and is asked.
+        assert_eq!(
+            asked(&gemfile, &lock, &keeping),
+            [format!("{GEM_TEST_URL}s/1a/info/nokogiri")]
+        );
         // The lock is on the registry of the patch on offer.
         let own_url = format!("{GEM_TEST_URL}s/1a/");
         let (own_gemfile, own_lock) = (
@@ -24549,6 +24924,10 @@ mod tests {
             let (gemfile_after, lock_after, r) = gem_redirect(&gemfile, &moved, after.clone());
             assert!(r.gem_held.is_empty() && r.gem_unpatched.is_empty());
             assert_eq!(builds_of(&r), [(Some("arm64-darwin"), None, false)]);
+            // Only a `CHECKSUMS` entry says that the lock had another
+            // build than upstream's.
+            let back: &[&str] = if checksums { &["arm64-darwin"] } else { &[] };
+            assert_eq!(withdrawn_of(&r, "uuid"), back, "checksums: {checksums}");
             assert_eq!(gemfile_after, gemfile.replace(older_grant, &at_two));
             assert_eq!(
                 lock_after,

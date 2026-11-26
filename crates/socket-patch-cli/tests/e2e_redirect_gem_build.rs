@@ -8157,14 +8157,31 @@ fn ruby_event(newly: bool) -> serde_json::Value {
 
 /// The uncounted event of a build that stays upstream's gem.
 fn upstream_event(platform: &str) -> serde_json::Value {
+    upstream_event_of(UUID, platform, false)
+}
+
+/// The uncounted event of a build the run put back on upstream's gem: the
+/// patched build its lock entry pinned was withdrawn.
+fn withdrawn_event(platform: &str) -> serde_json::Value {
+    upstream_event_of(UUID, platform, true)
+}
+
+/// [`upstream_event`] (or, with `withdrawn`, [`withdrawn_event`]) of a
+/// build of the gem patch `fix`.
+fn upstream_event_of(fix: &str, platform: &str, withdrawn: bool) -> serde_json::Value {
+    let mut details = serde_json::json!({ "gemFix": fix, "platform": platform, "mode": "hosted" });
+    let why = if withdrawn {
+        details["withdrawn"] = serde_json::json!(true);
+        "its patched build was withdrawn"
+    } else {
+        "no patched build yet"
+    };
     serde_json::json!({
         "action": "skipped",
         "purl": platform_purl(platform),
         "errorCode": "gem_upstream_build_kept",
-        "reason": format!(
-            "the patch registry serves upstream's own gem for {platform}: no patched build yet"
-        ),
-        "details": { "gemFix": UUID, "platform": platform, "mode": "hosted" },
+        "reason": format!("the patch registry serves upstream's own gem for {platform}: {why}"),
+        "details": details,
     })
 }
 
@@ -9584,7 +9601,8 @@ async fn gem_hosted_bundle_lock_add_platform_resolves_from_the_patch_registry() 
 ///      install` agrees, and Ruby loads the PATCHED code;
 ///   2. the build is withdrawn: the list has upstream's sha256 for this
 ///      platform, with no patch. A scan that may not refresh puts that
-///      sha256 back into the lock and warns that the withdrawn build is
+///      sha256 back into the lock, says in the build's event that it is
+///      back on upstream's gem, and warns that the withdrawn build is
 ///      still installed. Bundler does not replace it: `bundle install`
 ///      succeeds, changes nothing, and Ruby still loads the withdrawn
 ///      build;
@@ -9636,7 +9654,7 @@ async fn gem_hosted_withdrawn_build_is_replaced_with_upstreams_gem() {
     let env = p.scan(&["--no-gem-install-refresh"]);
     assert_eq!(
         hosted_events(&env),
-        by_platform(vec![upstream_event(&own), patched_event(&foreign, false)]),
+        by_platform(vec![withdrawn_event(&own), patched_event(&foreign, false)]),
         "{env}"
     );
     let lock = p.assert_hosted_pair(&second, &[(&own, false), (&foreign, true)]);

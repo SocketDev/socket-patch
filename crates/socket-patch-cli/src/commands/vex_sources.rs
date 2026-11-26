@@ -4085,6 +4085,7 @@ mod tests {
             gem_fix: Some(U1.to_string()),
             platform: platform.map(str::to_string),
             newly_patched: uuid.is_some(),
+            withdrawn: false,
         };
         let sources = Sources {
             hosted_gem_builds: vec![

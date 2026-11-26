@@ -200,17 +200,25 @@ pub fn leave_out_platform_gem_patches(answer: &mut impl SearchAnswer) {
 pub const GEM_NO_PATCHED_BUILD: &str = "redirect_gem_no_patched_build";
 
 /// Code of the uncounted event of one locked platform build of a hosted
-/// gem that the patch registry serves as upstream's own gem (no patched
-/// build yet): that platform installs what it installed before, and is
-/// neither counted nor attested as patched. A VEX document says
-/// `affected` of such a build, and `vex` reports it under this code.
+/// gem that the patch registry serves as upstream's own gem: it has no
+/// patched build yet, so that platform installs what it installed before,
+/// or its patched build was withdrawn, so the lock is back on upstream's
+/// gem for it ([`PinReport::withdrawn`]). Either way the build is neither
+/// counted nor attested as patched. A VEX document says `affected` of
+/// such a build, and `vex` reports it under this code.
 pub const GEM_UPSTREAM_BUILD_KEPT: &str = "gem_upstream_build_kept";
 
 /// What a host says beside [`GEM_UPSTREAM_BUILD_KEPT`] for the locked
 /// build of `platform`: the one wording of the disk host's event and the
-/// in-memory engine's row.
-pub fn gem_upstream_build_kept_detail(platform: &str) -> String {
-    format!("the patch registry serves upstream's own gem for {platform}: no patched build yet")
+/// in-memory engine's row. `withdrawn`: the run put the build back on
+/// upstream's gem ([`PinReport::withdrawn`]).
+pub fn gem_upstream_build_kept_detail(platform: &str, withdrawn: bool) -> String {
+    let why = if withdrawn {
+        "its patched build was withdrawn"
+    } else {
+        "no patched build yet"
+    };
+    format!("the patch registry serves upstream's own gem for {platform}: {why}")
 }
 
 /// Skip reason of a gem the Bundler lock names as precompiled platform
@@ -225,9 +233,11 @@ pub const GEM_PLATFORM_UNLISTED: &str = "redirect_gem_platform_unlisted";
 /// Skip reason of a gem the Bundler lock takes as platform builds from the
 /// registry of another patch of the gem, left on that patch because the
 /// patch on offer has no patched build for a platform whose locked build
-/// is a patched one: moving the lock would turn that build into upstream's
-/// own gem. Not a warning. The gem moves on a later run, once the patch
-/// service lists a patched build for those platforms.
+/// that registry still serves patched: moving the lock would turn that
+/// build into upstream's own gem. Not a warning. The gem moves on a later
+/// run, once the patch service lists a patched build for those platforms,
+/// or once the registry the lock is on serves none of them as the lock
+/// pins it (a withdrawn build keeps no lock where it is).
 pub const GEM_NEWER_FIX_WAITS: &str = "redirect_gem_newer_fix_waits";
 
 /// Whether `reason` is one of the quiet skips of a gem locked as platform
@@ -295,7 +305,7 @@ pub struct PinReport {
     /// `pkg:gem/<name>@<version>?platform=<platform>` for a platform gem.
     pub purl: String,
     /// The patch in place for it. `None` for a platform gem the patch
-    /// registry serves as upstream's own (no patched build yet): it is
+    /// registry serves as upstream's own (no patched build): it is
     /// reported ([`GEM_UPSTREAM_BUILD_KEPT`]) and never counted or
     /// attested as patched.
     pub uuid: Option<String>,
@@ -306,6 +316,12 @@ pub struct PinReport {
     pub platform: Option<String>,
     /// For such a build: whether this run put its patched build in place.
     pub newly_patched: bool,
+    /// For such a build with no patch: whether this run put it back on
+    /// upstream's gem, because the patched build its lock entry pinned
+    /// was withdrawn ([`GemLockedBuild::withdrawn`]).
+    ///
+    /// [`GemLockedBuild::withdrawn`]: crate::patch::redirect::GemLockedBuild::withdrawn
+    pub withdrawn: bool,
 }
 
 /// What a hosted run reports for its confirmed pins (`(purl, uuid)`): each
@@ -325,6 +341,7 @@ pub fn pin_reports(confirmed: &[(String, String)], rewrite: &RewriteResult) -> V
                 gem_fix: None,
                 platform: None,
                 newly_patched: false,
+                withdrawn: false,
             });
             continue;
         };
@@ -338,6 +355,7 @@ pub fn pin_reports(confirmed: &[(String, String)], rewrite: &RewriteResult) -> V
             gem_fix: Some(uuid.clone()),
             platform: build.platform.clone(),
             newly_patched: build.newly_patched,
+            withdrawn: build.withdrawn,
         }));
     }
     reports
@@ -2575,14 +2593,16 @@ async fn read_gemspecs(
 /// lock from one patch of a gem to another, sorted: `<remote>/info/<gem>`
 /// of the registry the Bundler lock among `files` takes a gem from, for
 /// each gem among `candidates` that the lock takes as platform builds from
-/// the registry of another patch of the gem, with no `CHECKSUMS` entry for
-/// a build that the candidate's registry serves as upstream's own gem.
-/// What that build is today (a patched build, which the move would take
-/// away, or upstream's gem) is then only said by the registry the lock is
-/// on. One small request per such gem, and none on any other run: a lock
-/// on the candidate's own registry, on its upstream registry, with
-/// `CHECKSUMS` entries, or that names the gem as its ruby-platform gem
-/// alone.
+/// the registry of another patch of the gem, with a locked build that the
+/// candidate's registry serves as upstream's own gem and that the lock
+/// does not pin at upstream's sha256 already. What that build is today (a
+/// patched build the registry still serves, which the move would take
+/// away, or one it withdrew, or upstream's gem) is only said by the
+/// registry the lock is on: a `CHECKSUMS` entry says what the lock pins,
+/// not whether it is still served. One small request per such gem, and
+/// none on any other run: a lock on the candidate's own registry, on its
+/// upstream registry, one that pins upstream's sha256 for each such
+/// build, or one that names the gem as its ruby-platform gem alone.
 ///
 /// The caller reads them ([`super::gem_index::fetch_gem_index`]) and hands
 /// the answers in ([`record_gem_index`]) before every [`rewrite`]. A
@@ -13647,12 +13667,32 @@ snapshots:
         p
     }
 
+    /// The compact-index document of the registry
+    /// [`rails_project_on_a_patch`] is on, and its URL: the ruby gem,
+    /// `arm64-darwin` on upstream's gem, and `x86_64-linux-gnu` under
+    /// `linux` (`None`: not listed).
+    fn rails_registry_index(linux: Option<&str>) -> (String, String) {
+        let url = format!(
+            "https://patch.test/patch-registry/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/s/1a/info/rails"
+        );
+        let mut index = format!(
+            "---\n7.0.0 |checksum:{}\n7.0.0-arm64-darwin |checksum:{}\n",
+            "f".repeat(64),
+            "1".repeat(64)
+        );
+        if let Some(linux) = linux {
+            index.push_str(&format!("7.0.0-x86_64-linux-gnu |checksum:{linux}\n"));
+        }
+        (url, index)
+    }
+
     /// The lock is on the registry of one patch, where `x86_64-linux-gnu`
     /// has a patched build. The patch on offer is another one, with a
     /// patched build for `arm64-darwin` only: moving the lock would turn
-    /// the linux build into upstream's gem. Nothing is written, warned
-    /// about or confirmed, the lock's `CHECKSUMS` being what says so with
-    /// no request, and the gem is skipped under its own quiet code, never
+    /// the linux build into upstream's gem. The lock's `CHECKSUMS` say
+    /// what it pins, and the registry it is on, asked once, that the
+    /// build is still served: nothing is written, warned about or
+    /// confirmed, and the gem is skipped under its own quiet code, never
     /// reported as a patch nothing pins. A patch that has a patched build
     /// for linux too takes the lock, and is confirmed.
     #[tokio::test]
@@ -13667,8 +13707,15 @@ snapshots:
                 ("x86_64-linux-gnu", "2".repeat(64), None),
             ],
         );
-        let (read, done) = gem_rewrite_of(&ProjectView::Memory(&p), vec![newer.clone()]).await;
-        assert!(gem_index_targets(std::slice::from_ref(&newer), &read.files).is_empty());
+        let (url, served) = rails_registry_index(Some(&"b".repeat(64)));
+        let documents = [(url.clone(), Ok(served))];
+        let view = ProjectView::Memory(&p);
+        let (read, done) = gem_rewrite_reading(&view, vec![newer.clone()], &documents).await;
+        assert_eq!(
+            gem_index_targets(std::slice::from_ref(&newer), &read.files),
+            [url],
+            "one document, of the registry the lock is on"
+        );
         assert!(done.rewrite.files.is_empty() && done.rewritten.is_empty());
         assert!(done.confirmed.is_empty() && done.unattributed.is_empty());
         assert!(
@@ -13732,6 +13779,136 @@ snapshots:
                 (Some(linux_patch.to_string()), true)
             ]
         );
+    }
+
+    /// The patched build the lock pins was withdrawn: the registry the
+    /// lock is on no longer lists it, or lists another sha256 for it, so
+    /// an install of that platform fails there. The lock then moves to
+    /// the patch on offer, which has no patched build for that platform
+    /// (nor, in the second case, for any locked one): both files are
+    /// rewritten, the pin is confirmed, and the run reports that build as
+    /// back on upstream's gem. A registry that cannot be read keeps the
+    /// lock where it is.
+    #[tokio::test]
+    async fn a_gem_whose_pinned_build_was_withdrawn_moves_to_the_patch_on_offer() {
+        let p = rails_project_on_a_patch(true).await;
+        let view = ProjectView::Memory(&p);
+        let arm_patch = "88888888-8888-4888-8888-88888888888a";
+        let listing = |arm: Option<&'static str>| {
+            let arm_sha = if arm.is_some() { "d" } else { "1" };
+            gem_candidate_listing(
+                NEWER_GEM_UUID,
+                "c4",
+                &[
+                    ("arm64-darwin", arm_sha.repeat(64), arm),
+                    ("x86_64-linux-gnu", "2".repeat(64), None),
+                ],
+            )
+        };
+        let pin = [(
+            "pkg:gem/rails@7.0.0".to_string(),
+            NEWER_GEM_UUID.to_string(),
+        )];
+        // `(platform, the patch in place, newly patched, withdrawn)`.
+        let reported = |done: &Rewritten| -> Vec<(Option<String>, Option<String>, bool, bool)> {
+            pin_reports(&done.confirmed, &done.rewrite)
+                .into_iter()
+                .map(|report| {
+                    assert_eq!(report.gem_fix.as_deref(), Some(NEWER_GEM_UUID));
+                    (
+                        report.platform,
+                        report.uuid,
+                        report.newly_patched,
+                        report.withdrawn,
+                    )
+                })
+                .collect()
+        };
+        let (arm, linux) = (
+            Some("arm64-darwin".to_string()),
+            Some("x86_64-linux-gnu".to_string()),
+        );
+
+        // The patch on offer patches `arm64-darwin`.
+        let newer = listing(Some(arm_patch));
+        let candidates = vec![newer.clone()];
+        for served in [None, Some("e".repeat(64)), Some("2".repeat(64))] {
+            let (url, index) = rails_registry_index(served.as_deref());
+            let documents = [(url.clone(), Ok(index))];
+            let (read, done) = gem_rewrite_reading(&view, candidates.clone(), &documents).await;
+            assert_eq!(gem_index_targets(&candidates, &read.files), [url]);
+            assert!(
+                done.rewrite.warnings.is_empty(),
+                "{served:?}: {:?}",
+                done.rewrite.warnings
+            );
+            assert_eq!(done.confirmed, pin, "{served:?}");
+            assert!(done.unattributed.is_empty(), "{served:?}");
+            assert_eq!(done.rewritten, ["Gemfile", "Gemfile.lock"], "{served:?}");
+            assert!(
+                gem_unpatched_skips(&candidates, &done.rewrite).is_empty(),
+                "{served:?}"
+            );
+            assert!(guard(&view, &done, &candidates).is_none(), "{served:?}");
+            let lock = &done.rewrite.files["Gemfile.lock"];
+            assert!(
+                lock.contains(&format!("/{NEWER_GEM_UUID}/s/c4/\n"))
+                    && !lock.contains(FIXTURE_UUID),
+                "{served:?}: {lock}"
+            );
+            assert!(
+                lock.contains(&format!(
+                    "  rails (7.0.0-arm64-darwin) sha256={}\n  rails (7.0.0-x86_64-linux-gnu) \
+                     sha256={}\n",
+                    "d".repeat(64),
+                    "2".repeat(64)
+                )),
+                "upstream's sha256 is back for linux ({served:?}): {lock}"
+            );
+            assert_eq!(
+                reported(&done),
+                [
+                    (arm.clone(), Some(arm_patch.to_string()), true, false),
+                    (linux.clone(), None, false, true),
+                ],
+                "{served:?}"
+            );
+        }
+
+        // It patches no locked build: the lock moves all the same, since
+        // the registry it is on refuses what it pins.
+        let nothing = listing(None);
+        let candidates = vec![nothing.clone()];
+        let (url, index) = rails_registry_index(None);
+        let documents = [(url.clone(), Ok(index))];
+        let (_, done) = gem_rewrite_reading(&view, candidates.clone(), &documents).await;
+        assert_eq!(done.confirmed, pin);
+        assert!(gem_unpatched_skips(&candidates, &done.rewrite).is_empty());
+        assert!(done.rewrite.gem_unpatched.is_empty());
+        let lock = &done.rewrite.files["Gemfile.lock"];
+        assert!(
+            lock.contains(&format!("/{NEWER_GEM_UUID}/s/c4/\n")) && !lock.contains(FIXTURE_UUID),
+            "{lock}"
+        );
+        assert_eq!(
+            reported(&done),
+            [
+                (arm.clone(), None, false, false),
+                (linux.clone(), None, false, true),
+            ],
+            "the build that was upstream's gem is kept, the withdrawn one is back"
+        );
+
+        // A registry that does not answer, or answers with no listing.
+        let unread = [(url.clone(), Err("no route to host".to_string()))];
+        let no_listing = [(url, Ok("<html>Sign in</html>\n".to_string()))];
+        for documents in [&unread[..], &no_listing[..], &[]] {
+            let (_, done) = gem_rewrite_reading(&view, candidates.clone(), documents).await;
+            assert!(done.rewrite.files.is_empty() && done.confirmed.is_empty());
+            let skips = gem_unpatched_skips(&candidates, &done.rewrite);
+            let reasons: Vec<&str> = skips.iter().map(|skip| skip.reason.as_str()).collect();
+            assert_eq!(reasons, [GEM_NEWER_FIX_WAITS]);
+        }
     }
 
     /// A lock with no `CHECKSUMS` says nothing of what it installs, so the

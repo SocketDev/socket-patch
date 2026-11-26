@@ -386,7 +386,10 @@ pub(super) const VEX_HOSTED_UNVERIFIED: &str = "vex_hosted_unverified";
 /// true` when this run put it in place. A build the patch registry serves
 /// as upstream's own gem is an advisory `skipped` event with no `uuid`
 /// ([`engine::GEM_UPSTREAM_BUILD_KEPT`]), which `summary` does not count:
-/// nothing was skipped, that platform is as it was.
+/// nothing was skipped, that platform is as it was. Where this run put
+/// the build back on upstream's gem because its patched build was
+/// withdrawn, the event says so (`details.withdrawn: true`, and its
+/// `reason`).
 ///
 /// [`engine::pin_reports`]: socket_patch_core::hosted::engine::pin_reports
 /// [`engine::GEM_UPSTREAM_BUILD_KEPT`]: socket_patch_core::hosted::engine::GEM_UPSTREAM_BUILD_KEPT
@@ -442,6 +445,7 @@ fn pin_reports_by_package(
                 gem_fix: None,
                 platform: None,
                 newly_patched: false,
+                withdrawn: false,
             },
         )
         .collect()
@@ -474,7 +478,10 @@ fn hosted_events(
                 }
                 None => PatchEvent::new(PatchAction::Skipped, report.purl.as_str()).with_reason(
                     GEM_UPSTREAM_BUILD_KEPT,
-                    gem_upstream_build_kept_detail(report.platform.as_deref().unwrap_or_default()),
+                    gem_upstream_build_kept_detail(
+                        report.platform.as_deref().unwrap_or_default(),
+                        report.withdrawn,
+                    ),
                 ),
             };
             if let Some(gem_fix) = &report.gem_fix {
@@ -484,6 +491,9 @@ fn hosted_events(
                 }
                 if report.newly_patched {
                     details["newlyPatched"] = serde_json::json!(true);
+                }
+                if report.withdrawn {
+                    details["withdrawn"] = serde_json::json!(true);
                 }
                 event.details = Some(details);
             }
@@ -1391,12 +1401,14 @@ type GemIndexes = std::collections::BTreeMap<String, Result<String, String>>;
 ///
 /// A lock that takes a gem as platform builds from the registry of another
 /// patch of the gem is moved to the patch on offer only when no locked
-/// build would turn from a patched build into upstream's own gem. Where
-/// the lock has no `CHECKSUMS` entry to say what such a build is, that
-/// registry is asked: one small document per such gem, kept in `held` so
-/// it is asked for once however often the run rewrites. No other run asks
-/// anything, and a document that cannot be read leaves the gem on the
-/// patch it is on.
+/// build would turn from a patched build that registry still serves into
+/// upstream's own gem. Whether it still serves one (a withdrawn build is
+/// refused, whatever the lock's `CHECKSUMS` pins) is that registry's to
+/// say, so it is asked wherever the move would put a build on upstream's
+/// gem that the lock does not pin there already: one small document per
+/// such gem, kept in `held` so it is asked for once however often the run
+/// rewrites. No other run asks anything, and a document that cannot be
+/// read leaves the gem on the patch it is on.
 ///
 /// Under a patch mirror the lock names its registry on the mirror, and the
 /// document is read where the patch server serves it, as every download of
@@ -3724,6 +3736,10 @@ fn format_gem_manifest_edits(
 /// - a patched build that this run found for a platform of a lock already
 ///   on the registry: `…: now also patched for arm64-darwin; already
 ///   patched for x86_64-linux-gnu`
+/// - a build this run put back on upstream's gem, because the patched
+///   build its lock entry pinned was withdrawn: `…: patched for
+///   arm64-darwin; upstream gem back for x86_64-linux-gnu (its patched
+///   build was withdrawn)`, before the builds that never had one
 /// - a gem left where it is under one of the quiet skips
 ///   (`engine::is_quiet_gem_skip`), in the skip's own sentence: `…: no
 ///   patched build yet for arm64-darwin, x86_64-linux-gnu; left on its
@@ -3732,8 +3748,9 @@ fn format_gem_manifest_edits(
 /// The ruby-platform gem, where the lock names it beside the platform
 /// builds, is the platform `ruby`. A dry run says `would be patched for`
 /// (`would also be patched for`) of the builds a wet run would put in
-/// place. `reports` are the run's pins per locked build
-/// (`engine::pin_reports`), `skipped` its skips.
+/// place, and `upstream gem would be back for` of those it would put back.
+/// `reports` are the run's pins per locked build (`engine::pin_reports`),
+/// `skipped` its skips.
 fn format_gem_build_lines(
     reports: &[socket_patch_core::hosted::engine::PinReport],
     skipped: &[socket_patch_core::hosted::engine::SkippedPatch],
@@ -3767,7 +3784,9 @@ fn format_gem_build_lines(
         };
         let now = platforms(&|build| build.uuid.is_some() && build.newly_patched);
         let before = platforms(&|build| build.uuid.is_some() && !build.newly_patched);
-        let kept = platforms(&|build| build.uuid.is_none());
+        let is_back = |build: &PinReport| build.uuid.is_none() && build.withdrawn;
+        let back = platforms(&is_back);
+        let kept = platforms(&|build| build.uuid.is_none() && !build.withdrawn);
         let (first, also) = if dry_run {
             ("would be patched for", "would also be patched for")
         } else {
@@ -3781,8 +3800,17 @@ fn format_gem_build_lines(
                 parts.push(format!("already patched for {before}"));
             }
             (true, false) => parts.push(format!("patched for {before}")),
-            // A pin stands for at least one patched build.
+            // No locked build is patched: the lock followed a withdrawn
+            // build back to upstream's gem.
             (true, true) => {}
+        }
+        if !back.is_empty() {
+            let is = if dry_run { "would be back" } else { "back" };
+            let why = match builds.iter().filter(|build| is_back(build)).count() {
+                1 => "its patched build was withdrawn",
+                _ => "their patched builds were withdrawn",
+            };
+            parts.push(format!("upstream gem {is} for {back} ({why})"));
         }
         if !kept.is_empty() {
             parts.push(format!(
@@ -4852,6 +4880,7 @@ mod tests {
             gem_fix: Some(BUILD_FIX.to_string()),
             platform: platform.map(str::to_string),
             newly_patched: newly,
+            withdrawn: false,
         }
     }
 
@@ -5072,6 +5101,124 @@ mod tests {
              x86_64-linux-musl"
         );
         assert!(wrapped.lines().all(|row| row.chars().count() <= 80));
+    }
+
+    /// A build the run put back on upstream's gem, because the patched
+    /// build its lock entry pinned was withdrawn, is said as such: in the
+    /// gem's line, before the builds that never had a patched build, and
+    /// in its uncounted event (`details.withdrawn`, and the reason). A
+    /// dry run says what the wet run would do. The line wraps after a
+    /// clause on a terminal and stays whole in a pipe.
+    #[test]
+    fn a_withdrawn_build_is_said_to_be_back_on_upstreams_gem() {
+        use crate::json_envelope::{Command, Envelope};
+        use socket_patch_core::hosted::engine::{PinReport, GEM_UPSTREAM_BUILD_KEPT};
+        let line = |reports: &[PinReport], dry_run| {
+            let lines = super::format_gem_build_lines(reports, &[], dry_run);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            lines.into_iter().next().unwrap()
+        };
+        let back = |platform| PinReport {
+            withdrawn: true,
+            ..build_report(Some(platform), None, false)
+        };
+        let arm = |patch, newly| build_report(Some("arm64-darwin"), patch, newly);
+        let linux = back("x86_64-linux-gnu");
+
+        // No locked build is patched any more.
+        let alone = line(std::slice::from_ref(&linux), false);
+        assert_eq!(
+            alone,
+            "nokogiri 1.19.3: upstream gem back for x86_64-linux-gnu (its patched build was \
+             withdrawn)"
+        );
+        // Beside a patched build, and one found patched by this run.
+        let beside = line(&[arm(Some("ua"), false), linux.clone()], false);
+        assert_eq!(
+            beside,
+            "nokogiri 1.19.3: patched for arm64-darwin; upstream gem back for x86_64-linux-gnu \
+             (its patched build was withdrawn)"
+        );
+        assert_eq!(
+            line(&[arm(Some("ua"), true), linux.clone()], false),
+            "nokogiri 1.19.3: patched for arm64-darwin; upstream gem back for x86_64-linux-gnu \
+             (its patched build was withdrawn)"
+        );
+        // Beside a build that never had a patched build, and two of them.
+        assert_eq!(
+            line(&[arm(None, false), linux.clone()], false),
+            "nokogiri 1.19.3: upstream gem back for x86_64-linux-gnu (its patched build was \
+             withdrawn); upstream gem kept for arm64-darwin (no patched build yet)"
+        );
+        assert_eq!(
+            line(&[back("arm64-darwin"), linux.clone()], false),
+            "nokogiri 1.19.3: upstream gem back for arm64-darwin, x86_64-linux-gnu (their \
+             patched builds were withdrawn)"
+        );
+        // A dry run writes nothing.
+        assert_eq!(
+            line(&[arm(Some("ua"), false), linux.clone()], true),
+            "nokogiri 1.19.3: patched for arm64-darwin; upstream gem would be back for \
+             x86_64-linux-gnu (its patched build was withdrawn)"
+        );
+
+        // One line in a pipe; on a terminal it breaks after the clause.
+        assert_eq!(super::wrap_line(&beside, None), beside);
+        assert_eq!(super::wrap_line(&beside, Some(120)), beside);
+        for width in [80, 100] {
+            assert_eq!(
+                super::wrap_line(&beside, Some(width)),
+                "nokogiri 1.19.3: patched for arm64-darwin;\n  upstream gem back for \
+                 x86_64-linux-gnu (its patched build was withdrawn)"
+            );
+        }
+        assert_eq!(super::wrap_line(&alone, Some(100)), alone);
+        assert_eq!(
+            super::wrap_line(&alone, Some(80)),
+            "nokogiri 1.19.3: upstream gem back for x86_64-linux-gnu (its patched build was\n  \
+             withdrawn)"
+        );
+
+        // The event: uncounted, with the flag and the reason.
+        let mut env = Envelope::new(Command::Scan);
+        record_hosted_events(&mut env, &[arm(None, false), linux], &[], &[], false);
+        let v = env.to_value();
+        assert_eq!(
+            v["events"],
+            serde_json::json!([
+                {
+                    "action": "skipped",
+                    "purl": "pkg:gem/nokogiri@1.19.3?platform=arm64-darwin",
+                    "errorCode": GEM_UPSTREAM_BUILD_KEPT,
+                    "reason": "the patch registry serves upstream's own gem for arm64-darwin: \
+                               no patched build yet",
+                    "details": {"gemFix": BUILD_FIX, "platform": "arm64-darwin", "mode": "hosted"},
+                },
+                {
+                    "action": "skipped",
+                    "purl": "pkg:gem/nokogiri@1.19.3?platform=x86_64-linux-gnu",
+                    "errorCode": GEM_UPSTREAM_BUILD_KEPT,
+                    "reason": "the patch registry serves upstream's own gem for \
+                               x86_64-linux-gnu: its patched build was withdrawn",
+                    "details": {
+                        "gemFix": BUILD_FIX, "platform": "x86_64-linux-gnu",
+                        "withdrawn": true, "mode": "hosted",
+                    },
+                },
+            ])
+        );
+        let summary = &v["summary"];
+        assert_eq!(
+            (&summary["applied"], &summary["skipped"], &summary["failed"]),
+            (
+                &serde_json::json!(0),
+                &serde_json::json!(0),
+                &serde_json::json!(0)
+            ),
+            "{v}"
+        );
+        assert_eq!(v["status"], "success");
+        assert!(v["warnings"].as_array().is_none_or(Vec::is_empty), "{v}");
     }
 
     use std::path::PathBuf;

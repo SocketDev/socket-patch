@@ -42,8 +42,10 @@ pub fn rewrite_warnings_json(warnings: &[RewriteWarning]) -> Vec<serde_json::Val
 /// on the ruby-platform gem's row): `pinned` under the build's own patch,
 /// with `newlyPatched: true` when this run put that build in place, or
 /// `upstream_kept` with no `uuid` (`errorCode: gem_upstream_build_kept`)
-/// for a build the patch registry serves as upstream's own gem.
-/// `redirected` counts the `pinned` rows.
+/// for a build the patch registry serves as upstream's own gem, with
+/// `withdrawn: true` when this run put the build back on upstream's gem
+/// because its patched build was withdrawn. `redirected` counts the
+/// `pinned` rows.
 pub fn redirect_json_block(
     reports: &[PinReport],
     unconfirmed: &[(String, String)],
@@ -66,6 +68,7 @@ pub fn redirect_json_block(
                     "errorCode": GEM_UPSTREAM_BUILD_KEPT,
                     "error": gem_upstream_build_kept_detail(
                         report.platform.as_deref().unwrap_or_default(),
+                        report.withdrawn,
                     ),
                 }),
             };
@@ -77,6 +80,9 @@ pub fn redirect_json_block(
             }
             if report.newly_patched {
                 row["newlyPatched"] = serde_json::json!(true);
+            }
+            if report.withdrawn {
+                row["withdrawn"] = serde_json::json!(true);
             }
             row
         })
@@ -129,7 +135,9 @@ mod tests {
     /// locked build: `pinned` under the build's own patch, or
     /// `upstream_kept` with no `uuid` for a build that stays upstream's
     /// gem, which `redirected` does not count and `skipped[]` does not
-    /// list. A dry run previews a pin as `would_pin`.
+    /// list. A build the run put back on upstream's gem is such a row
+    /// too, which says that its patched build was withdrawn. A dry run
+    /// previews a pin as `would_pin`.
     #[test]
     fn the_redirect_block_reports_a_platform_locked_gem_per_build() {
         const FIX: &str = "77777777-7777-4777-8777-777777777777";
@@ -142,6 +150,7 @@ mod tests {
             gem_fix: Some(FIX.to_string()),
             platform: platform.map(str::to_string),
             newly_patched: newly,
+            withdrawn: false,
         };
         let reports = [
             PinReport {
@@ -150,9 +159,14 @@ mod tests {
                 gem_fix: None,
                 platform: None,
                 newly_patched: false,
+                withdrawn: false,
             },
             build(None, Some(FIX), false),
             build(Some("arm64-darwin"), None, false),
+            PinReport {
+                withdrawn: true,
+                ..build(Some("java"), None, false)
+            },
             build(Some("x86_64-linux-gnu"), Some("ul"), true),
         ];
         let block = redirect_json_block(&reports, &[], Vec::new(), &[], Vec::new(), false);
@@ -175,6 +189,16 @@ mod tests {
                     "platform": "arm64-darwin",
                 },
                 {
+                    "purl": "pkg:gem/nokogiri@1.19.3?platform=java",
+                    "action": "upstream_kept",
+                    "errorCode": "gem_upstream_build_kept",
+                    "error": "the patch registry serves upstream's own gem for java: its \
+                              patched build was withdrawn",
+                    "gemFix": FIX,
+                    "platform": "java",
+                    "withdrawn": true,
+                },
+                {
                     "purl": "pkg:gem/nokogiri@1.19.3?platform=x86_64-linux-gnu", "uuid": "ul",
                     "action": "pinned", "gemFix": FIX, "platform": "x86_64-linux-gnu",
                     "newlyPatched": true,
@@ -191,7 +215,13 @@ mod tests {
             .collect();
         assert_eq!(
             actions,
-            ["would_pin", "upstream_kept", "would_pin", "would_pin"]
+            [
+                "would_pin",
+                "upstream_kept",
+                "upstream_kept",
+                "would_pin",
+                "would_pin"
+            ]
         );
         assert_eq!(dry["redirected"], 3);
     }

@@ -77,7 +77,7 @@ export interface ProjectResult {
   redirect: Record<string, unknown>                   // same shape as CLI `--json` `redirect` block
   summary: { scannedPackages: number; packagesWithPatches: number; totalPatches: number; freePatches: number; paidPatches: number; canAccessPaidPatches: boolean }
   redirected: { purl: string; uuid: string; gemFix?: string; platform?: string; newlyPatched?: boolean }[]   // a gem the lock names as platform builds: one entry per locked build that has a patched build, under that build's own patch (gemFix = the gem's selected patch; newlyPatched = this run put the build in place)
-  upstreamBuilds?: { purl: string; gemFix: string; platform: string }[]   // locked platform builds of redirected gems that the patch registry serves as upstream's own gem (no patched build yet); never in `redirected`
+  upstreamBuilds?: { purl: string; gemFix: string; platform: string; withdrawn?: boolean }[]   // locked platform builds of redirected gems that the patch registry serves as upstream's own gem (no patched build); never in `redirected`. withdrawn = this run put the build back on upstream's gem because the patched build its lock entry pinned was withdrawn
   skipped: { purl: string; uuid: string; reason: string; detail?: string }[]   // reasons include the policy_* codes; deferred rows appear as `rollout_deferred`
   deferred: DeferredPatch[]                           // NEW patches over the maxNewPatches budget, rank order
   error?: { code: string; message: string }           // project-level failure (e.g. corrupt_ledger, patch_lookup_failed)

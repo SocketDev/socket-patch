@@ -25,8 +25,10 @@
 //!   upstream's gem, and is then counted as no package on a hosted patch;
 //! * a lock on the registry of another patch of the gem moves to the patch
 //!   on offer only when no locked build would turn from a patched build
-//!   into upstream's gem, which its `CHECKSUMS` say, else one request to
-//!   the registry it is on; otherwise it stays, under a quiet skip;
+//!   that registry still serves into upstream's gem, which one request to
+//!   the registry it is on says; otherwise it stays, under a quiet skip. A
+//!   build that registry withdrew holds nothing back: the lock moves, and
+//!   the run says that the build is back on upstream's gem;
 //! * a gem the lock names as its ruby-platform gem alone takes the
 //!   registry without its snapshot level, so a pair pinned by a reference
 //!   with no list is left byte for byte by one with a list.
@@ -58,6 +60,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[path = "common/mod.rs"]
 mod common;
 use common::envelope::warning_codes;
+#[path = "common/pty_io.rs"]
+mod pty_io;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 
@@ -1008,7 +1012,9 @@ async fn a_platform_gems_own_record_is_no_fix_from_memory_or_on_the_public_proxy
 /// the earlier snapshot refuses that build from then on), and from there
 /// on the gem installs nothing patched. So it is no package on a hosted
 /// patch: no `applied` event, the summary line counts none, and no row
-/// under it calls the gem patched; the line of the gem says what is true.
+/// under it calls the gem patched; the line of the gem says what is true,
+/// on the run that follows the withdrawal that the build is back on
+/// upstream's gem, and from then on that both builds are upstream's.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_gem_whose_builds_are_all_upstreams_is_no_package_on_a_hosted_patch() {
     let server = MockServer::start().await;
@@ -1023,6 +1029,37 @@ async fn a_gem_whose_builds_are_all_upstreams_is_no_package_on_a_hosted_patch() 
     mount_api(&server, Some((&NONE_PATCHED[..], 5))).await;
     let api = server.uri();
     let index = format!("{}/", index_url(&api, Some(5)));
+    // The run that follows the withdrawal, over a copy of the pair: the
+    // build is reported as back on upstream's gem, counted nowhere, and
+    // the lock's own registry is not asked what it lists.
+    let before = format!("{}/", index_url(&api, Some(4)));
+    let copy = hosted_project(&before, ARM_UPSTREAM, LINUX_PATCHED, true);
+    assert_eq!(
+        read(copy.path(), "Gemfile.lock"),
+        read(proj.path(), "Gemfile.lock"),
+        "premise: the pair the first run left"
+    );
+    let (code, env) = scan_json(copy.path(), &api, &[]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(env["status"], "success", "{env}");
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(
+        hosted_events(&env),
+        [upstream_event(ARM), withdrawn_event(LINUX)],
+        "{env}"
+    );
+    let summary = &env["summary"];
+    assert_eq!(
+        (&summary["applied"], &summary["skipped"], &summary["failed"]),
+        (&json!(0), &json!(0), &json!(0)),
+        "{env}"
+    );
+    assert_eq!(
+        read(copy.path(), "Gemfile.lock"),
+        hosted_lock(&index, ARM_UPSTREAM, LINUX_UPSTREAM)
+    );
+    let (_, other) = requests(&server).await;
+    assert_eq!(other, Vec::<String>::new(), "no registry request");
     let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &[]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert_eq!(
@@ -1037,7 +1074,8 @@ async fn a_gem_whose_builds_are_all_upstreams_is_no_package_on_a_hosted_patch() 
     assert!(!stdout.contains("already on hosted patches"), "{stdout}");
     assert!(
         stdout.contains(&format!(
-            "{DEP} {DEP_VERSION}: upstream gem kept for {ARM}, {LINUX} (no patched build yet)"
+            "\n{DEP} {DEP_VERSION}: upstream gem back for {LINUX} (its patched build was \
+             withdrawn); upstream gem kept for {ARM} (no patched build yet)\n"
         )),
         "{stdout}"
     );
@@ -1060,6 +1098,12 @@ async fn a_gem_whose_builds_are_all_upstreams_is_no_package_on_a_hosted_patch() 
     let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &[]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(!stdout.contains("already on hosted patches"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "\n{DEP} {DEP_VERSION}: upstream gem kept for {ARM}, {LINUX} (no patched build yet)\n"
+        )),
+        "{stdout}"
+    );
 }
 
 /// `get <the gem's patch> --mode hosted` writes what `scan` writes and
@@ -1190,12 +1234,26 @@ async fn mount_api_beside_earlier(server: &MockServer, offered: &[Listed]) {
 /// The compact-index document of the earlier patch's registry, listing
 /// `linux` as the sha256 of its `x86_64-linux-gnu` gem.
 async fn mount_earlier_index(server: &MockServer, linux: &str) {
+    mount_earlier_listing(server, Some(linux)).await;
+}
+
+/// The compact-index document of the earlier patch's registry: the patched
+/// ruby gem, upstream's `arm64-darwin` gem, and the `x86_64-linux-gnu` gem
+/// under the sha256 `linux` (`None`: that build was withdrawn, and the
+/// registry does not list it).
+async fn mount_earlier_listing(server: &MockServer, linux: Option<&str>) {
+    let mut listing = format!(
+        "---\n{DEP_VERSION} racc:~> 1.4|checksum:{RUBY_PATCHED}\n{DEP_VERSION}-{ARM} racc:~> \
+         1.4|checksum:{ARM_UPSTREAM}\n"
+    );
+    if let Some(linux) = linux {
+        listing.push_str(&format!(
+            "{DEP_VERSION}-{LINUX} racc:~> 1.4|checksum:{linux}\n"
+        ));
+    }
     Mock::given(method("GET"))
         .and(path(earlier_index_path()))
-        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-            "---\n{DEP_VERSION}-{ARM} racc:~> 1.4|checksum:{ARM_UPSTREAM}\n{DEP_VERSION}-{LINUX} \
-             racc:~> 1.4|checksum:{linux}\n"
-        )))
+        .respond_with(ResponseTemplate::new(200).set_body_string(listing))
         .mount(server)
         .await;
 }
@@ -1222,13 +1280,15 @@ fn newer_fix_waits() -> (String, Value) {
 /// The lock is on an earlier patch of the gem, with a patched build for
 /// `x86_64-linux-gnu`. The patch on offer has a patched build for
 /// `arm64-darwin` alone: moving the lock would turn the linux build into
-/// upstream's gem. The lock's `CHECKSUMS` say what it installs, so nothing
-/// is asked of its registry: both files stay byte for byte, with no
-/// warning, one skipped event under the quiet code and one plain line.
+/// upstream's gem. The lock's `CHECKSUMS` say what it pins, and its
+/// registry, asked once a run, that it still serves that build: both files
+/// stay byte for byte, with no warning, one skipped event under the quiet
+/// code and one plain line.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lock_on_an_earlier_patch_keeps_its_patched_build_and_waits_quietly() {
     let server = MockServer::start().await;
     mount_api_beside_earlier(&server, &ARM_ONLY[..]).await;
+    mount_earlier_index(&server, EARLIER_LINUX_PATCHED).await;
     let api = server.uri();
     let earlier = earlier_index(&api);
     let (lock, gemfile) = (
@@ -1256,9 +1316,13 @@ async fn a_lock_on_an_earlier_patch_keeps_its_patched_build_and_waits_quietly() 
             "{env}"
         );
         assert_eq!(env["redirect"]["rewrittenFiles"], json!([]), "{env}");
+        let (_, other) = requests(&server).await;
+        assert_eq!(
+            other,
+            vec![earlier_index_path(); if dry_run { 2 } else { 1 }],
+            "one request a run, to the registry the lock is on"
+        );
     }
-    let (_, other) = requests(&server).await;
-    assert_eq!(other, Vec::<String>::new(), "no registry request");
 
     // For a person: the one line on stdout, and nothing that warns.
     let proj = hosted_project(&earlier, ARM_UPSTREAM, EARLIER_LINUX_PATCHED, true);
@@ -1280,9 +1344,368 @@ async fn a_lock_on_an_earlier_patch_keeps_its_patched_build_and_waits_quietly() 
     let env: Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("not JSON ({e}):\n{stdout}\nstderr:\n{stderr}"));
     assert_eq!(code, 0, "{env}\n{stderr}");
-    assert_eq!(hosted_events(&env), [event], "{env}");
+    assert_eq!(hosted_events(&env), [event.clone()], "{env}");
     assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
     assert_eq!(read(proj.path(), "Gemfile.lock"), lock);
+    let (_, other) = requests(&server).await;
+    assert_eq!(other, vec![earlier_index_path(); 4], "one request a run");
+
+    // A registry that does not answer shows nothing either way: the lock
+    // stays, quietly, after the one request.
+    let server = MockServer::start().await;
+    mount_api_beside_earlier(&server, &ARM_ONLY[..]).await;
+    let api = server.uri();
+    let earlier = earlier_index(&api);
+    let proj = hosted_project(&earlier, ARM_UPSTREAM, EARLIER_LINUX_PATCHED, true);
+    let (code, env) = scan_json(proj.path(), &api, &["--patch-server-url", api.as_str()]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(
+        read(proj.path(), "Gemfile.lock"),
+        hosted_lock(&earlier, ARM_UPSTREAM, EARLIER_LINUX_PATCHED)
+    );
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(hosted_events(&env), [event], "{env}");
+    let (_, other) = requests(&server).await;
+    assert_eq!(other, [earlier_index_path()], "asked once");
+}
+
+/// The uncounted event of a build the run put back on upstream's gem: the
+/// patched build its lock entry pinned was withdrawn.
+fn withdrawn_event(platform: &str) -> Value {
+    json!({
+        "action": "skipped",
+        "purl": format!("{PURL}?platform={platform}"),
+        "errorCode": "gem_upstream_build_kept",
+        "reason": format!(
+            "the patch registry serves upstream's own gem for {platform}: its patched build was \
+             withdrawn"
+        ),
+        "details": { "gemFix": UUID, "platform": platform, "withdrawn": true, "mode": "hosted" },
+    })
+}
+
+/// The patched `x86_64-linux-gnu` build the lock pins from an earlier
+/// patch was withdrawn: that patch's registry, under the snapshot the lock
+/// names, no longer lists the build (or lists another sha256 for it), so
+/// an install on that platform fails there. The patch on offer has no
+/// patched build for that platform. Staying would keep the install
+/// broken, so the lock moves: one request to the registry it is on, both
+/// files rewritten for the patch on offer with upstream's sha256 back for
+/// that build, exit 0, no warning, and the run says in one line and one
+/// uncounted event that the build is back on upstream's gem. A dry run
+/// previews the same and writes nothing; a further run changes nothing,
+/// asks no registry, and no longer speaks of a withdrawal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withdrawn_build_on_an_earlier_patch_moves_the_lock_to_the_patch_on_offer() {
+    let line = format!(
+        "{DEP} {DEP_VERSION}: patched for {ARM}; upstream gem back for {LINUX} (its patched \
+         build was withdrawn)"
+    );
+    let other_sha = "b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3";
+    for served in [None, Some(other_sha)] {
+        let server = MockServer::start().await;
+        mount_api_beside_earlier(&server, &ARM_ONLY[..]).await;
+        mount_earlier_listing(&server, served).await;
+        let api = server.uri();
+        let (earlier, offered) = (
+            earlier_index(&api),
+            format!("{}/", index_url(&api, Some(4))),
+        );
+        let known = ["--patch-server-url", api.as_str()];
+
+        // A dry run first: the same outcome, nothing written.
+        let proj = hosted_project(&earlier, ARM_UPSTREAM, EARLIER_LINUX_PATCHED, true);
+        let before = read(proj.path(), "Gemfile.lock");
+        let (code, env) = scan_json(proj.path(), &api, &[known[0], known[1], "--dry-run"]);
+        assert_eq!(code, 0, "{served:?}: {env}");
+        assert_eq!(read(proj.path(), "Gemfile.lock"), before, "{served:?}");
+        assert_eq!(read(proj.path(), "Gemfile"), hosted_gemfile(&earlier));
+        assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+        assert_eq!(
+            hosted_events(&env),
+            [
+                patched_event("verified", ARM, ARM_UUID, true),
+                withdrawn_event(LINUX)
+            ],
+            "{served:?}: {env}"
+        );
+        let (code, stdout, stderr) = hosted(
+            proj.path(),
+            &api,
+            &["scan"],
+            &[known[0], known[1], "--dry-run"],
+        );
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains(&format!(
+                "\n{DEP} {DEP_VERSION}: would be patched for {ARM}; upstream gem would be back \
+                 for {LINUX} (its patched build was withdrawn)\n"
+            )),
+            "{served:?}:\n{stdout}"
+        );
+        assert_eq!(read(proj.path(), "Gemfile.lock"), before, "{served:?}");
+
+        // The run.
+        let asked_before = requests(&server).await.1.len();
+        let (code, env) = scan_json(proj.path(), &api, &known);
+        assert_eq!(code, 0, "{served:?}: {env}");
+        assert_eq!(env["status"], "success", "{env}");
+        assert_eq!(
+            read(proj.path(), "Gemfile.lock"),
+            hosted_lock(&offered, ARM_PATCHED, LINUX_UPSTREAM),
+            "{served:?}: on the patch on offer, upstream's sha256 back for linux"
+        );
+        assert_eq!(read(proj.path(), "Gemfile"), hosted_gemfile(&offered));
+        assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+        assert_eq!(
+            hosted_events(&env),
+            [
+                patched_event("applied", ARM, ARM_UUID, true),
+                withdrawn_event(LINUX)
+            ],
+            "{served:?}: {env}"
+        );
+        let summary = &env["summary"];
+        assert_eq!(
+            (&summary["applied"], &summary["skipped"], &summary["failed"]),
+            (&json!(1), &json!(0), &json!(0)),
+            "the build back on upstream's gem is counted nowhere: {env}"
+        );
+        assert_eq!(
+            env["redirect"]["rewrittenFiles"],
+            json!(["Gemfile", "Gemfile.lock"])
+        );
+        let (_, other) = requests(&server).await;
+        assert_eq!(
+            other[asked_before..],
+            [earlier_index_path()],
+            "{served:?}: one request, to the registry the lock was on"
+        );
+
+        // A further run: in place, nothing asked, no withdrawal to speak of.
+        let (code, env) = scan_json(proj.path(), &api, &known);
+        assert_eq!(code, 0, "{env}");
+        assert_eq!(env["redirect"]["rewrittenFiles"], json!([]), "{env}");
+        assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+        assert_eq!(
+            hosted_events(&env),
+            [
+                patched_event("applied", ARM, ARM_UUID, false),
+                upstream_event(LINUX)
+            ],
+            "{served:?}: {env}"
+        );
+        let (_, other) = requests(&server).await;
+        assert_eq!(other.len(), asked_before + 1, "no registry request");
+
+        // For a person: the one line on stdout, and nothing that warns.
+        let proj = hosted_project(&earlier, ARM_UPSTREAM, EARLIER_LINUX_PATCHED, true);
+        let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &known);
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("Switched 1 package to hosted patches; rewrote 2 files.\n"),
+            "{stdout}"
+        );
+        assert!(stdout.contains(&format!("\n{line}\n")), "{stdout}");
+        assert!(
+            !stderr.contains("Warning")
+                && !stderr.contains("Skipped")
+                && !stderr.contains("Not hosted"),
+            "{stderr}"
+        );
+        assert_eq!(
+            read(proj.path(), "Gemfile.lock"),
+            hosted_lock(&offered, ARM_PATCHED, LINUX_UPSTREAM)
+        );
+
+        // `get` of the patch on offer moves the lock the same way.
+        let proj = hosted_project(&earlier, ARM_UPSTREAM, EARLIER_LINUX_PATCHED, true);
+        let (code, stdout, stderr) = hosted(
+            proj.path(),
+            &api,
+            &["get", UUID],
+            &["--json", known[0], known[1]],
+        );
+        let env: Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("not JSON ({e}):\n{stdout}\nstderr:\n{stderr}"));
+        assert_eq!(code, 0, "{env}\n{stderr}");
+        assert_eq!(
+            hosted_events(&env),
+            [
+                patched_event("applied", ARM, ARM_UUID, true),
+                withdrawn_event(LINUX)
+            ],
+            "{served:?}: {env}"
+        );
+        assert_eq!(
+            read(proj.path(), "Gemfile.lock"),
+            hosted_lock(&offered, ARM_PATCHED, LINUX_UPSTREAM)
+        );
+    }
+}
+
+/// On a terminal the line of a build that is back on upstream's gem breaks
+/// after its first clause, under a hanging indent, at 80, 100 and 120
+/// columns, and neither row is wider than the terminal. (In a pipe it is
+/// one line: the cases above read it there.)
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_line_of_a_withdrawn_build_fits_a_terminal_of_80_100_and_120_columns() {
+    let server = MockServer::start().await;
+    mount_api_beside_earlier(&server, &ARM_ONLY[..]).await;
+    mount_earlier_listing(&server, None).await;
+    let api = server.uri();
+    let earlier = earlier_index(&api);
+    for cols in [80u16, 100, 120] {
+        let proj = hosted_project(&earlier, ARM_UPSTREAM, EARLIER_LINUX_PATCHED, true);
+        let cwd = proj.path().to_path_buf();
+        let api = api.clone();
+        let run = tokio::task::spawn_blocking(move || {
+            let dir = cwd.to_str().expect("utf8 temp path");
+            let args = [
+                "scan",
+                "--mode",
+                "hosted",
+                "--yes",
+                "--cwd",
+                dir,
+                "--api-url",
+                api.as_str(),
+                "--org",
+                ORG,
+                "--api-token",
+                API_TOKEN,
+                "--patch-server-url",
+                api.as_str(),
+            ];
+            pty_io::run_command_at(
+                cols,
+                common::hermetic::pty_binary_command(),
+                &args,
+                &cwd,
+                &[],
+                &[],
+                std::time::Duration::from_secs(60),
+            )
+        })
+        .await
+        .expect("spawn_blocking join");
+        let screen = pty_io::render(run.output.as_bytes());
+        let shown = screen.join("\n");
+        println!("--- {cols} columns\n{shown}");
+        assert_eq!(run.code, 0, "{shown}");
+        let at = screen
+            .iter()
+            .position(|row| row.starts_with(&format!("{DEP} {DEP_VERSION}: ")))
+            .unwrap_or_else(|| panic!("no line of the gem:\n{shown}"));
+        assert_eq!(
+            screen[at..at + 2],
+            [
+                format!("{DEP} {DEP_VERSION}: patched for {ARM};"),
+                format!("  upstream gem back for {LINUX} (its patched build was withdrawn)"),
+            ],
+            "{cols} columns:\n{shown}"
+        );
+        assert!(
+            screen[at..at + 2]
+                .iter()
+                .all(|row| row.chars().count() <= usize::from(cols)),
+            "wider than {cols} columns:\n{shown}"
+        );
+    }
+}
+
+/// The same withdrawal where the patch on offer has no patched build for
+/// any platform the lock names. A lock on its upstream registry would be
+/// left there (nothing to gain); a lock on a registry that refuses a build
+/// it pins is not: it moves to the patch on offer all the same, every
+/// build on upstream's sha256, so that every platform installs again. The
+/// gem is then no package on a hosted patch. The run's own VEX and a
+/// later `vex` say `affected` of both builds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withdrawn_build_moves_the_lock_to_a_patch_with_no_patched_build_at_all() {
+    let server = MockServer::start().await;
+    mount_api_beside_earlier(&server, &NONE_PATCHED[..]).await;
+    mount_earlier_listing(&server, None).await;
+    mount_index(&server, ARM_UPSTREAM, LINUX_UPSTREAM).await;
+    let api = server.uri();
+    let (earlier, offered) = (
+        earlier_index(&api),
+        format!("{}/", index_url(&api, Some(4))),
+    );
+    let known = ["--patch-server-url", api.as_str()];
+    let line = format!(
+        "{DEP} {DEP_VERSION}: upstream gem back for {LINUX} (its patched build was withdrawn); \
+         upstream gem kept for {ARM} (no patched build yet)"
+    );
+
+    let proj = hosted_project(&earlier, ARM_UPSTREAM, EARLIER_LINUX_PATCHED, true);
+    let (code, env, doc) = scan_vex(proj.path(), &api);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(env["status"], "success", "{env}");
+    assert_eq!(
+        read(proj.path(), "Gemfile.lock"),
+        hosted_lock(&offered, ARM_UPSTREAM, LINUX_UPSTREAM),
+        "on the patch on offer, every build on upstream's sha256"
+    );
+    assert_eq!(read(proj.path(), "Gemfile"), hosted_gemfile(&offered));
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(
+        hosted_events(&env),
+        [upstream_event(ARM), withdrawn_event(LINUX)],
+        "{env}"
+    );
+    let summary = &env["summary"];
+    assert_eq!(
+        (&summary["applied"], &summary["skipped"], &summary["failed"]),
+        (&json!(0), &json!(0), &json!(0)),
+        "{env}"
+    );
+    assert_eq!(
+        env["redirect"]["rewrittenFiles"],
+        json!(["Gemfile", "Gemfile.lock"])
+    );
+    let (_, other) = requests(&server).await;
+    assert_eq!(other, [earlier_index_path()], "one registry request");
+    // The run's own document: both builds affected. No build is
+    // attested, so the gem without a platform stands for affected builds
+    // alone and is named beside each.
+    let affected = |platform: &str| {
+        let mut statement = upstream_statement(platform);
+        statement.products.insert(0, PURL.to_string());
+        statement
+    };
+    assert_eq!(
+        said(&doc.expect("a document")),
+        [affected(ARM), affected(LINUX)],
+        "{env}"
+    );
+    assert_eq!(env["vex"]["affected"], 2, "{env}");
+    // And a later `vex` over the lock the run left.
+    let out = vex(proj.path(), &api);
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_eq!(said(out.doc()), [affected(ARM), affected(LINUX)], "{out}");
+    assert_eq!(out.envelope["status"], "success", "{out}");
+
+    // For a person.
+    let proj = hosted_project(&earlier, ARM_UPSTREAM, EARLIER_LINUX_PATCHED, true);
+    let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &known);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("Switched 0 packages to hosted patches; rewrote 2 files.\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains(&format!("\n{line}\n")), "{stdout}");
+    assert!(
+        !stderr.contains("Warning")
+            && !stderr.contains("No patches could be switched")
+            && !stderr.contains("Not hosted"),
+        "{stderr}"
+    );
+    assert_eq!(
+        read(proj.path(), "Gemfile.lock"),
+        hosted_lock(&offered, ARM_UPSTREAM, LINUX_UPSTREAM)
+    );
 }
 
 /// The same lock with no `CHECKSUMS` says nothing of what it installs, so

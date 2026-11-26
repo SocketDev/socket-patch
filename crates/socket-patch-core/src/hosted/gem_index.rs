@@ -4,12 +4,16 @@
 //!
 //! A lock that takes a gem as platform builds from the registry of one
 //! patch is moved to the registry of another patch of the gem only when no
-//! locked build would turn from a patched build into upstream's own gem. A
-//! lock with a `CHECKSUMS` entry for a build says what it installs; one
-//! without says nothing, and then the registry the lock is on is asked:
-//! one document per such gem ([`engine::gem_index_targets`]), handed to the
-//! gem rewriter ([`engine::record_gem_index`]). A document that cannot be
-//! read leaves the gem on the patch it is on.
+//! locked build would turn from a patched build that registry still
+//! serves into upstream's own gem. A `CHECKSUMS` entry says what the lock
+//! pins for a build, not whether the registry still serves it (a
+//! withdrawn build is refused under the snapshot the lock names), and a
+//! lock without one says nothing. So the registry the lock is on is asked
+//! wherever the move would put a build on upstream's gem that the lock
+//! does not pin there already: one document per such gem
+//! ([`engine::gem_index_targets`]), handed to the gem rewriter
+//! ([`engine::record_gem_index`]). A document that cannot be read leaves
+//! the gem on the patch it is on.
 
 use std::collections::BTreeMap;
 

@@ -154,28 +154,25 @@ async fn mount_patch_api(
     mount_patch_api_with(server, uuid, patched_lib, view_budget, patched_sha, &[], 0).await;
 }
 
-/// The API of the patch `uuid`, whose patched lib is `patched_lib` and
-/// whose grant lists `builds` under the registry snapshot `snapshot` (a
-/// grant with no list names the registry without one).
-async fn mount_patch_api_with(
-    server: &MockServer,
+/// The grant of the patch `uuid` on `api`, whose patched ruby gem has the
+/// sha256 `patched_sha` and which lists `builds` under the registry
+/// snapshot `snapshot` (a grant with no list names the registry without
+/// one).
+fn granted_reference(
+    api: &str,
     uuid: &str,
-    patched_lib: &str,
-    view_budget: Option<u64>,
     patched_sha: &str,
     builds: &[ListedBuild<'_>],
     snapshot: u32,
-) {
+) -> serde_json::Value {
     let mut identifiers = serde_json::json!({
         "name": DEP,
         "version": DEP_VERSION,
         "gemChecksumSha256": patched_sha,
     });
-    let hosted_url = format!(
-        "{}/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{uuid}/{DEP}-{DEP_VERSION}.gem",
-        server.uri()
-    );
-    let mut index_url = format!("{}/patch-registry/gem/{TOKEN}/{uuid}/", server.uri());
+    let hosted_url =
+        format!("{api}/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{uuid}/{DEP}-{DEP_VERSION}.gem");
+    let mut index_url = format!("{api}/patch-registry/gem/{TOKEN}/{uuid}/");
     if !builds.is_empty() {
         identifiers["gemBuilds"] = builds
             .iter()
@@ -187,6 +184,36 @@ async fn mount_patch_api_with(
             .collect();
         index_url = format!("{index_url}s/{snapshot}");
     }
+    serde_json::json!({
+        "status": "granted",
+        "url": hosted_url,
+        "purl": PURL,
+        "artifacts": [{
+            "kind": "tarball",
+            "url": hosted_url,
+            "integrity": { "sha256": patched_sha }
+        }],
+        "registryOverride": {
+            "kind": "rubygems-compact-index",
+            "indexUrl": index_url,
+            "identifiers": identifiers,
+        }
+    })
+}
+
+/// The API of the patch `uuid`, whose patched lib is `patched_lib` and
+/// whose grant lists `builds` under the registry snapshot `snapshot`
+/// ([`granted_reference`]).
+async fn mount_patch_api_with(
+    server: &MockServer,
+    uuid: &str,
+    patched_lib: &str,
+    view_budget: Option<u64>,
+    patched_sha: &str,
+    builds: &[ListedBuild<'_>],
+    snapshot: u32,
+) {
+    let reference = granted_reference(&server.uri(), uuid, patched_sha, builds, snapshot);
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -220,23 +247,7 @@ async fn mount_patch_api_with(
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/package")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "results": {
-                uuid: {
-                    "status": "granted",
-                    "url": hosted_url,
-                    "purl": PURL,
-                    "artifacts": [{
-                        "kind": "tarball",
-                        "url": hosted_url,
-                        "integrity": { "sha256": patched_sha }
-                    }],
-                    "registryOverride": {
-                        "kind": "rubygems-compact-index",
-                        "indexUrl": index_url,
-                        "identifiers": identifiers,
-                    }
-                }
-            }
+            "results": { uuid: reference }
         })))
         .mount(server)
         .await;
@@ -3608,6 +3619,189 @@ async fn a_withdrawn_build_refresh_says_what_took_its_place() {
         "the replaced archive is a file to commit:\n{stdout}"
     );
     w.assert_holds(&w.upstream, UPSTREAM_LIB);
+}
+
+/// The withdrawn build is one of an earlier patch of the gem, and the
+/// patch on offer is a newer one with no patched build for this machine's
+/// platform. The earlier patch's registry, under the snapshot the lock
+/// names, no longer lists the build and refuses its file, so the lock is
+/// not held there: the scan asks that registry once, moves the pair to
+/// the newer patch with upstream's sha256 for this platform, says that
+/// the build is back on upstream's gem, and the guard replaces the copy
+/// and the committed archive with the file the newer patch's registry
+/// serves. One download, no patch record; a further scan changes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withdrawn_build_of_an_earlier_patch_is_replaced_through_the_newer_patchs_registry() {
+    let server = MockServer::start().await;
+    let w = WithdrawnBuild::stage(&server).await;
+    let leaf = format!("{DEP}-{DEP_VERSION}-{PLATFORM}");
+    let api = server.uri();
+    let lock_before = std::fs::read_to_string(w.proj.join("Gemfile.lock")).unwrap();
+    assert!(
+        lock_before.contains(&format!("  remote: {api}{}/\n", snapshot_registry_path())),
+        "premise: the lock is on the earlier patch at its first snapshot:\n{lock_before}"
+    );
+
+    // The service offers the newer patch, with a patched build for the
+    // other platform alone. The earlier patch is still granted: only its
+    // build for this platform is gone.
+    server.reset().await;
+    let ruby_sha = sha256_of(&real_gem(NEWER_PATCHED_LIB));
+    let newer_other = sha256_of(&real_gem_for(NEWER_PATCHED_LIB, OTHER_PLATFORM));
+    let newer_other_uuid = "a1b2c3d4-0000-4000-8000-00000000000c";
+    let offered = [
+        (PLATFORM, sha256_of(&w.upstream), None),
+        (OTHER_PLATFORM, newer_other.clone(), Some(newer_other_uuid)),
+    ];
+    let earlier_now = [
+        (PLATFORM, sha256_of(&w.upstream), None),
+        (OTHER_PLATFORM, w.other_patched.clone(), Some(LINUX_UUID)),
+    ];
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                NEWER_UUID: granted_reference(&api, NEWER_UUID, &ruby_sha, &offered, LATER_SNAPSHOT),
+                UUID: granted_reference(
+                    &api,
+                    UUID,
+                    &sha256_of(&real_gem(PATCHED_LIB)),
+                    &earlier_now,
+                    LATER_SNAPSHOT,
+                ),
+            }
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mount_patch_api_with(
+        &server,
+        NEWER_UUID,
+        NEWER_PATCHED_LIB,
+        None,
+        &ruby_sha,
+        &offered,
+        LATER_SNAPSHOT,
+    )
+    .await;
+    // The earlier patch's registry as the lock names it: the build of
+    // this platform is not listed, and its file is not served.
+    let earlier_index = format!("{}/info/{DEP}", snapshot_registry_path());
+    Mock::given(method("GET"))
+        .and(path(earlier_index.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "---\n{DEP_VERSION} |checksum:{}\n{DEP_VERSION}-{OTHER_PLATFORM} |checksum:{}\n",
+            sha256_of(&real_gem(PATCHED_LIB)),
+            w.other_patched
+        )))
+        .mount(&server)
+        .await;
+    // The newer patch's registry relays upstream's gem for this platform.
+    let newer_registry = format!("/patch-registry/gem/{TOKEN}/{NEWER_UUID}/s/{LATER_SNAPSHOT}");
+    let file_route = format!("{newer_registry}/gems/{leaf}.gem");
+    Mock::given(method("GET"))
+        .and(path(file_route.clone()))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(w.upstream.clone(), "application/octet-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let known = ["--patch-server-url", api.as_str()];
+    let env = w.scan_json(&server, &known);
+    let lock = std::fs::read_to_string(w.proj.join("Gemfile.lock")).unwrap();
+    assert!(
+        lock.contains(&format!("  remote: {api}{newer_registry}/\n"))
+            && !lock.contains(UUID)
+            && lock.contains(&format!(
+                "CHECKSUMS\n  {DEP} ({DEP_VERSION}-{PLATFORM}) sha256={}\n  {DEP} \
+                 ({DEP_VERSION}-{OTHER_PLATFORM}) sha256={newer_other}\n",
+                sha256_of(&w.upstream),
+            )),
+        "the lock is on the newer patch, upstream's sha256 back for this platform:\n{lock}\n{env}"
+    );
+    assert_eq!(
+        hosted_pins(&env),
+        [(
+            format!("{PURL}?platform={OTHER_PLATFORM}"),
+            newer_other_uuid.to_string()
+        )],
+        "{env}"
+    );
+    let back: Vec<&serde_json::Value> = env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|event| event["errorCode"] == "gem_upstream_build_kept")
+        .collect();
+    assert_eq!(
+        back,
+        [&serde_json::json!({
+            "action": "skipped",
+            "purl": format!("{PURL}?platform={PLATFORM}"),
+            "errorCode": "gem_upstream_build_kept",
+            "reason": format!(
+                "the patch registry serves upstream's own gem for {PLATFORM}: its patched build \
+                 was withdrawn"
+            ),
+            "details": {
+                "gemFix": NEWER_UUID, "platform": PLATFORM, "withdrawn": true, "mode": "hosted",
+            },
+        })],
+        "{env}"
+    );
+    assert!(stale_warnings(&env).is_empty(), "nothing is left: {env}");
+    let mut notes = warnings_with_code(&env, "redirect_gem_install_refreshed");
+    notes.sort();
+    assert_eq!(
+        notes,
+        [
+            format!(
+                "{PURL}: replaced the withdrawn archive at {} with the upstream gem",
+                w.committed.display()
+            ),
+            format!(
+                "{PURL}: replaced the withdrawn install at {} with the upstream gem",
+                w.gem_dir.display()
+            ),
+        ],
+        "{env}"
+    );
+    w.assert_holds(&w.upstream, UPSTREAM_LIB);
+    let asked = server.received_requests().await.unwrap_or_default();
+    let asked: Vec<&str> = asked
+        .iter()
+        .map(|request| request.url.path())
+        .filter(|route| route.starts_with("/patch-registry/") || route.contains("/patches/view/"))
+        .collect();
+    assert_eq!(
+        asked,
+        [earlier_index.as_str(), file_route.as_str()],
+        "the registry the lock was on is asked once, upstream's gem is downloaded once from the \
+         newer patch's registry, and no patch record is fetched"
+    );
+
+    // A further scan changes nothing and downloads nothing.
+    let before = server.received_requests().await.unwrap_or_default().len();
+    let env = w.scan_json(&server, &known);
+    assert!(
+        stale_warnings(&env).is_empty()
+            && warnings_with_code(&env, "redirect_gem_install_refreshed").is_empty(),
+        "{env}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(w.proj.join("Gemfile.lock")).unwrap(),
+        lock
+    );
+    w.assert_holds(&w.upstream, UPSTREAM_LIB);
+    let asked = server.received_requests().await.unwrap_or_default();
+    let asked: Vec<&str> = asked
+        .iter()
+        .skip(before)
+        .map(|request| request.url.path())
+        .filter(|route| route.starts_with("/patch-registry/"))
+        .collect();
+    assert_eq!(asked, Vec::<&str>::new(), "no registry request");
 }
 
 /// The registry relays bytes that are not the gem the reference lists for
