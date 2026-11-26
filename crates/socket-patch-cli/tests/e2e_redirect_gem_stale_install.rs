@@ -3193,13 +3193,22 @@ async fn gem_hosted_scan_pins_platform_builds_from_the_lock_alone() {
             );
         } else {
             assert_eq!(hosted_pinned(&env), 0, "{env}");
-            let [detail] = skipped.as_slice() else {
-                panic!("one platform skip: {env}");
+            // A platform the list leaves out is still being built: the
+            // gem waits for a later run, and nothing is warned about.
+            assert!(skipped.is_empty(), "{env}");
+            let waiting: Vec<&str> = env["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| event["errorCode"] == "redirect_gem_build_pending")
+                .filter_map(|event| event["reason"].as_str())
+                .collect();
+            let [detail] = waiting.as_slice() else {
+                panic!("one quiet skip: {env}");
             };
             assert!(
                 detail.contains(&format!(
-                    "the patch registry does not list `{DEP} ({DEP_VERSION}-{OTHER_PLATFORM})` \
-                     among the platform gems of this version"
+                    "the patch registry does not list {OTHER_PLATFORM} yet"
                 )),
                 "{detail}"
             );
@@ -3310,17 +3319,21 @@ async fn refused_platform_gem_is_counted_as_left_to_patch() {
             &[],
         );
         assert_eq!(code, 0, "{mode}\nstdout:\n{stdout}\nstderr:\n{stderr}");
-        // The premise: the run refused the gem for a platform the patch
-        // registry does not serve.
-        let refusal = match mode {
-            "hosted" => {
-                format!("the patch registry does not list `{DEP} ({DEP_VERSION}-{OTHER_PLATFORM})`")
-            }
-            _ => format!("the patch service has no prebuilt platform gem of `{DEP}`"),
+        // The premise: the run left the gem alone for a platform the
+        // patch registry does not serve.
+        let (refusal, said) = match mode {
+            "hosted" => (
+                format!("the patch registry does not list {OTHER_PLATFORM} yet"),
+                &stdout,
+            ),
+            _ => (
+                format!("the patch service has no prebuilt platform gem of `{DEP}`"),
+                &stderr,
+            ),
         };
         assert!(
-            stderr.contains(&refusal),
-            "{mode}: the run refuses the gem\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            said.contains(&refusal),
+            "{mode}: the run leaves the gem alone\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert_eq!(
             std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),

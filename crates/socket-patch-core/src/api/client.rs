@@ -1260,10 +1260,7 @@ impl ApiClient {
         let path = self.patches_path("package");
         let mut results = std::collections::HashMap::new();
         for chunk in uuids.chunks(MAX_REFERENCE_BATCH) {
-            let body = PackageVendorRequest {
-                uuids: chunk.to_vec(),
-                free_only: None,
-            };
+            let body = PackageVendorRequest::new(chunk, false);
             let resp = self
                 .post_json::<PackageVendorResponse, _>(&path, &body)
                 .await?;
@@ -1976,12 +1973,7 @@ impl ApiClient {
         free_only: bool,
         vendor_url: Option<&str>,
     ) -> Result<std::collections::HashMap<String, PackageVendorResult>, VendorAttemptError> {
-        let body = PackageVendorRequest {
-            uuids: uuids.to_vec(),
-            // Only send freeOnly when forcing it (the public-proxy contract);
-            // the authenticated endpoint defaults to false.
-            free_only: free_only.then_some(true),
-        };
+        let body = PackageVendorRequest::new(uuids, free_only);
         let (url, use_auth) = self.vendor_package_url(vendor_url);
         debug_log(&format!("POST {url}"));
 
@@ -5041,7 +5033,9 @@ mod vendor_package_tests {
         let serve_url = format!("{}{SERVE_PATH}", server.uri());
         Mock::given(method("POST"))
             .and(path("/v0/orgs/acme/patches/package"))
-            .and(body_partial_json(json!({ "uuids": [UUID] })))
+            .and(body_partial_json(
+                json!({ "uuids": [UUID], "gemBuilds": true }),
+            ))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(granted_body(&serve_url, "sha512-ABC123==")),
@@ -5078,7 +5072,7 @@ mod vendor_package_tests {
             .and(path("/patch/package"))
             .and(NoAuthorizationHeader)
             .and(body_partial_json(
-                json!({ "uuids": [UUID], "freeOnly": true }),
+                json!({ "uuids": [UUID], "freeOnly": true, "gemBuilds": true }),
             ))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-ZZ==")),
@@ -5349,7 +5343,12 @@ mod vendor_package_tests {
             .and(path("/patch/package"))
             .and(NoAuthorizationHeader)
             .and(BodyLacksFreeOnlyKey)
-            .and(body_partial_json(json!({ "uuids": [UUID] })))
+            // Every reference request asks for the complete list of a
+            // gem's builds: the service answers one without the flag as
+            // a release that knows no such list expects.
+            .and(body_partial_json(
+                json!({ "uuids": [UUID], "gemBuilds": true }),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "results": { UUID: { "status": "granted", "url": null, "artifacts": [] } }
             })))

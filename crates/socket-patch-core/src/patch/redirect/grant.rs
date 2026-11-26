@@ -278,7 +278,6 @@ fn check_registry_override(ov: &RegistryOverride, origins: &[String]) -> Result<
         if !is_plain_gem_token(platform)
             || platform.len() > MAX_COORDINATE
             || !platform.starts_with(|c: char| c.is_ascii_alphabetic())
-            || platform == "ruby"
         {
             return Err(bad("gem platform", "a plain platform name"));
         }
@@ -618,7 +617,7 @@ mod tests {
                 None,
                 vec![("x86_64-linux-gnu", sha.clone()), ("java", sha.clone())],
             ),
-            (Some("gem platform "), vec![("ruby", sha.clone())]),
+            (None, vec![("ruby", sha.clone())]),
             (
                 Some("gem platform "),
                 vec![("arm64-darwin)\n  evil (1.0", sha.clone())],

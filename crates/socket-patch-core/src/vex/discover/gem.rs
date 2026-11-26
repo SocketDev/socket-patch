@@ -573,7 +573,7 @@ pub(crate) fn gemfile_source_block_pins(gemfile: &str, uuid: &str, gem_name: Opt
 
 /// Whether hosted `remote` is the patch's compact-index root:
 /// `…/patch-registry/gem/<token>/<uuid>[/]`, `uuid` the LAST path level
-/// but for a snapshot level (`…/<uuid>/s/<n>[/]`), no query or fragment.
+/// but for a snapshot level (`…/<uuid>/s/<key>[/]`), no query or fragment.
 fn is_patch_registry_index(remote: &str, uuid: &str) -> bool {
     patch_registry_uuid(remote).is_some_and(|u| u == uuid)
 }
@@ -581,7 +581,7 @@ fn is_patch_registry_index(remote: &str, uuid: &str) -> bool {
 /// The patch uuid of a compact-index root
 /// `…/patch-registry/gem/<token>/<uuid>[/]` (no query or fragment): its
 /// last path level, or the one before a snapshot level
-/// (`…/<uuid>/s/<n>[/]`: the registry as it stood when the patch service
+/// (`…/<uuid>/s/<key>[/]`: the registry as it stood when the patch service
 /// made the reference).
 fn patch_registry_uuid(remote: &str) -> Option<String> {
     let url = reqwest::Url::parse(remote).ok()?;
@@ -1212,7 +1212,7 @@ mod tests {
         assert!(out.unlocked_pins.is_empty(), "{:#?}", out.unlocked_pins);
     }
 
-    /// A registry URL may end in a snapshot level (`…/<uuid>/s/<n>`): the
+    /// A registry URL may end in a snapshot level (`…/<uuid>/s/<key>`): the
     /// patch is still the one its uuid level names. Anything else after
     /// the uuid is no registry root.
     #[test]
@@ -1223,7 +1223,7 @@ mod tests {
             root.trim_end_matches('/').to_string(),
             format!("{root}s/3"),
             format!("{root}s/3/"),
-            format!("{root}s/41/"),
+            format!("{root}s/07ab2e9f/"),
         ] {
             assert_eq!(
                 super::patch_registry_uuid(&url).as_deref(),
@@ -1234,7 +1234,7 @@ mod tests {
         }
         for url in [
             format!("{root}s/"),
-            format!("{root}s/03/"),
+            format!("{root}s/3G/"),
             format!("{root}s/3/info/rails"),
             format!("{root}gems/rails-7.0.0.gem"),
             format!("{root}s/3?x=1"),

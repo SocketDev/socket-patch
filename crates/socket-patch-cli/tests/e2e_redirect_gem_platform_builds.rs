@@ -676,53 +676,87 @@ async fn a_lock_without_checksums_still_moves() {
     );
 }
 
-/// A locked platform the registry does not list, and a reference with no
-/// list at all: machines of that platform would be sent to a registry with
-/// no gem for them, so nothing is written and the run says why.
+/// A reference with no list at all is a patch of the ruby gem alone:
+/// nothing is written and the run says why.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unlisted_platform_leaves_the_gem_alone_with_a_warning() {
-    let linux_only: [Listed; 1] = [(LINUX, LINUX_PATCHED, Some(LINUX_UUID))];
-    let cases: [(Option<(&[Listed], u32)>, String); 2] = [
-        (
-            Some((&linux_only[..], 4)),
-            format!(
-                "the patch registry does not list `{DEP} ({DEP_VERSION}-{ARM})` among the \
-                 platform gems of this version"
-            ),
-        ),
-        (
-            None,
+async fn a_patch_with_no_list_leaves_the_gem_alone_with_a_warning() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    let proj = project(&lock(true));
+    let (code, env) = scan_json(proj.path(), &server.uri(), &[]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(read(proj.path(), "Gemfile.lock"), lock(true));
+    assert_eq!(read(proj.path(), "Gemfile"), GEMFILE);
+    assert_eq!(
+        warning_codes(&env),
+        ["redirect_gem_platform_unsupported"],
+        "{env}"
+    );
+    let detail = env["warnings"][0]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains(
             "the patch covers the ruby platform gem only (the patch registry does not list the \
              platform gems of this version)"
-                .to_string(),
         ),
-    ];
-    for (listing, why) in cases {
-        let server = MockServer::start().await;
-        mount_api(&server, listing).await;
-        let proj = project(&lock(true));
-        let (code, env) = scan_json(proj.path(), &server.uri(), &[]);
-        assert_eq!(code, 0, "{env}");
-        assert_eq!(read(proj.path(), "Gemfile.lock"), lock(true));
-        assert_eq!(read(proj.path(), "Gemfile"), GEMFILE);
-        assert_eq!(
-            warning_codes(&env),
-            ["redirect_gem_platform_unsupported"],
-            "{env}"
-        );
-        let detail = env["warnings"][0]["detail"].as_str().unwrap();
-        assert!(detail.contains(&why), "{detail}");
-        assert_eq!(
-            hosted_events(&env),
-            [json!({
-                "action": "skipped", "purl": PURL, "uuid": UUID,
-                "errorCode": "redirect_unconfirmed",
-                "reason": "no lockfile entry pinning it could be rewritten",
-                "details": { "mode": "hosted" },
-            })],
-            "{env}"
-        );
-    }
+        "{detail}"
+    );
+    assert_eq!(
+        hosted_events(&env),
+        [json!({
+            "action": "skipped", "purl": PURL, "uuid": UUID,
+            "errorCode": "redirect_unconfirmed",
+            "reason": "no lockfile entry pinning it could be rewritten",
+            "details": { "mode": "hosted" },
+        })],
+        "{env}"
+    );
+}
+
+/// A locked platform the list leaves out is one whose patched build is
+/// still being made: a machine of that platform would be sent to a
+/// registry with no gem for it, so the gem is left as it is, with no
+/// warning and one plain line, and a later run over a list that has the
+/// platform moves it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_platform_missing_from_the_list_is_waited_for_quietly() {
+    let linux_only: [Listed; 1] = [(LINUX, LINUX_PATCHED, Some(LINUX_UUID))];
+    let server = MockServer::start().await;
+    mount_api(&server, Some((&linux_only[..], 4))).await;
+    let proj = project(&lock(true));
+    let (code, env) = scan_json(proj.path(), &server.uri(), &[]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(read(proj.path(), "Gemfile.lock"), lock(true));
+    assert_eq!(read(proj.path(), "Gemfile"), GEMFILE);
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    let waiting = format!(
+        "{DEP} {DEP_VERSION}: the patch registry does not list {ARM} yet (a patched build is \
+         still being made); left as it is until it does"
+    );
+    assert_eq!(
+        hosted_events(&env),
+        [json!({
+            "action": "skipped", "purl": PURL, "uuid": UUID,
+            "errorCode": "redirect_gem_build_pending",
+            "reason": waiting,
+            "details": { "mode": "hosted" },
+        })],
+        "{env}"
+    );
+    assert_eq!(env["summary"]["failed"], 0, "{env}");
+
+    let (code, stdout, stderr) = hosted(proj.path(), &server.uri(), &["scan"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains(&waiting), "{stdout}");
+    assert!(!stderr.contains("Warning"), "{stderr}");
+
+    // The build is there: the list names the platform, and the gem moves.
+    let later = MockServer::start().await;
+    mount_api(&later, Some((&ONE_PATCHED[..], 5))).await;
+    let (code, env) = scan_json(proj.path(), &later.uri(), &[]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    assert_ne!(read(proj.path(), "Gemfile.lock"), lock(true));
 }
 
 /// `get <the gem's patch> --mode hosted` writes what `scan` writes and

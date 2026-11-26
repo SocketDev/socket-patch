@@ -202,15 +202,17 @@ pub struct RegistryOverrideIdentifiers {
     /// sha256 hex of the patched ruby-platform gem (`<name>-<version>.gem`),
     /// the value Bundler records in the lock's `CHECKSUMS`.
     pub gem_checksum_sha256: Option<String>,
-    /// Every platform gem of the gem's version, as the patch registry
-    /// serves it under `index_url`: a patched build where one exists
-    /// (`patch_uuid`), else upstream's own gem, which the registry lists
-    /// and hands on unchanged. The list is complete, so a lock's platform
-    /// entries can all take the registry as their one source, each pinned
-    /// to the sha256 listed for it. `None` when the reference carries no
-    /// list (the service does not know the version's platforms): the patch
-    /// is then of the ruby gem alone, and a lock that names platform
-    /// builds is left as it is.
+    /// Every gem of the gem's version, as the patch registry serves it
+    /// under `index_url`: the ruby gem (`platform: "ruby"`, the patch
+    /// itself) and each platform gem, as a patched build where one exists
+    /// (`patch_uuid`), else as upstream's own gem, which the registry
+    /// lists and hands on unchanged. So a lock's entries can all take the
+    /// registry as their one source, each pinned to the sha256 listed for
+    /// it. A platform whose patched build is still being made is left out
+    /// until it is there. `None` when the reference carries no list (the
+    /// service does not know the version's platforms, or the gem has no
+    /// platform gem): the patch is then of the ruby gem alone, and a lock
+    /// that names platform builds is left as it is.
     #[serde(default, deserialize_with = "lenient_gem_builds")]
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub gem_builds: Option<Vec<GemPlatformChecksum>>,
@@ -255,7 +257,7 @@ where
 #[cfg_attr(test, serde(rename_all = "camelCase"))]
 pub struct GemLockedBuild {
     /// The build's platform as the lock spells it; `None` for the
-    /// ruby-platform gem.
+    /// ruby-platform gem (which the list names `ruby`).
     pub platform: Option<String>,
     /// The patch of the build the registry serves: the gem's own patch for
     /// the ruby-platform gem, the platform's for a patched platform gem.
@@ -275,7 +277,8 @@ pub struct GemLockedBuild {
 #[serde(rename_all = "camelCase")]
 pub struct GemPlatformChecksum {
     /// `Gem::Platform#to_s` as the gem's file name and `Gemfile.lock` spell
-    /// it (`x86_64-linux-gnu`, `arm64-darwin`, `java`). Never `ruby`.
+    /// it (`x86_64-linux-gnu`, `arm64-darwin`, `java`), or `ruby` for the
+    /// ruby-platform gem.
     pub platform: String,
     /// sha256 hex of the `.gem` the registry serves for that platform.
     pub gem_checksum_sha256: String,
@@ -502,6 +505,17 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")
     )]
     pub gem_unpatched: BTreeMap<String, Vec<String>>,
+    /// gem: the gems the lock names as platform builds that were left as
+    /// they are because the patch registry does not list a platform the
+    /// lock names, by the gem patch's uuid, with those platforms. The
+    /// patch service leaves a platform out while its patched build is
+    /// being made, so this passes by itself: a later run moves the gem.
+    /// Serialized only when non-empty.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")
+    )]
+    pub gem_unlisted: BTreeMap<String, Vec<String>>,
     /// Patch uuid → the yarn.lock keys of the `npm:` alias entries of its
     /// package the rewriter left untouched (`redirect_yarn_classic_alias_skipped`,
     /// `redirect_yarn_berry_alias_skipped`): that copy keeps installing the
@@ -1050,6 +1064,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         confirmed_bazel_maven_uuids,
         gem_builds,
         gem_unpatched,
+        gem_unlisted,
     } = delta;
     result.files.extend(files);
     result.binary_files.extend(binary_files);
@@ -1099,6 +1114,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.bundled_skipped_uuids.extend(bundled_skipped_uuids);
     result.gem_builds.extend(gem_builds);
     result.gem_unpatched.extend(gem_unpatched);
+    result.gem_unlisted.extend(gem_unlisted);
     for (uuid, keys) in alias_skipped_entries {
         result
             .alias_skipped_entries
@@ -8153,11 +8169,12 @@ pub fn grant_token_path_segment(url: &str, patch_uuid: &str) -> Option<String> {
 /// level, so the idempotency guard never silently degrades into the
 /// nesting-corruption failure mode when a caller forgets the token.
 ///
-/// A gem registry's URL may end in a snapshot level (`…/<uuid>/s/<n>`: the
-/// registry as it stood when the reference was made, which a later
-/// reference replaces with a newer one). That level rotates too, and comes
-/// and goes with the patch service knowing the version's platform gems, so
-/// the pattern takes the URL with any snapshot or none.
+/// A gem registry's URL may end in a snapshot level (`…/<uuid>/s/<key>`:
+/// the registry as it stood when the reference was made, which a later
+/// reference replaces with another once what it lists changes). That level
+/// rotates too, and comes and goes with the patch service knowing the
+/// version's platform gems, so the pattern takes the URL with any snapshot
+/// or none.
 pub(crate) fn gem_index_url_pattern(dep: &DepOverride, index_url: &str) -> String {
     let (root, _) = split_gem_snapshot(index_url);
     let mut url_pat = regex::escape(root);
@@ -8174,26 +8191,30 @@ pub(crate) fn gem_index_url_pattern(dep: &DepOverride, index_url: &str) -> Strin
     }
     // `root` ends in `/` whenever the URL had a snapshot level.
     let level = if root.ends_with('/') { "" } else { "/" };
-    format!("{url_pat}(?:{level}s/[0-9]+/?)?")
+    format!("{url_pat}(?:{level}s/[0-9a-f]+/?)?")
 }
 
-/// A gem registry URL without its snapshot level, and that level's number:
-/// `…/<uuid>/s/<n>[/]` is `(…/<uuid>/, Some(n))`; a URL with none is itself
-/// and `None`. The snapshot is a positive integer written in plain digits.
-pub(crate) fn split_gem_snapshot(index_url: &str) -> (&str, Option<u64>) {
+/// A gem registry URL without its snapshot level, and that level's key:
+/// `…/<uuid>/s/<key>[/]` is `(…/<uuid>/, Some(key))`; a URL with none is
+/// itself and `None`. The key is the patch service's to choose (a short
+/// string of lowercase hex digits): it is never read for a meaning, only
+/// recognised, so that a URL with another key is known as the same
+/// registry at another moment.
+pub(crate) fn split_gem_snapshot(index_url: &str) -> (&str, Option<&str>) {
     let trimmed = index_url.trim_end_matches('/');
-    let Some((before, number)) = trimmed.rsplit_once('/') else {
+    let Some((before, key)) = trimmed.rsplit_once('/') else {
         return (index_url, None);
     };
-    let plain = !number.is_empty()
-        && number.len() <= 18
-        && number.bytes().all(|b| b.is_ascii_digit())
-        && !number.starts_with('0');
-    match (before.strip_suffix("/s"), plain) {
+    let hex = !key.is_empty()
+        && key.len() <= 64
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    match (before.strip_suffix("/s"), hex) {
         (Some(root), true) => {
             // Keep the slash that closes the patch uuid's level.
             let root = &index_url[..root.len() + 1];
-            (root, number.parse().ok())
+            (root, Some(key))
         }
         _ => (index_url, None),
     }
@@ -9097,10 +9118,13 @@ fn rewrite_gem(
             _ => ov.index_url.as_str().into(),
         };
         let index_url: &str = &index_url;
-        let sha256 = ov
-            .identifiers
-            .gem_checksum_sha256
-            .clone()
+        // The ruby gem's sha256: the entry the list of the version's gems
+        // has for it (`ruby`), else the reference's own checksum, which is
+        // the same archive's.
+        let ruby_listed = ov.identifiers.gem_build("ruby");
+        let sha256 = ruby_listed
+            .map(|build| build.gem_checksum_sha256.clone())
+            .or_else(|| ov.identifiers.gem_checksum_sha256.clone())
             .or_else(|| dep.integrity.sha256.clone());
         // A lock that names only platform builds pins no ruby-platform gem:
         // its prebuilds' sha256 (checked below) are all the redirect needs.
@@ -9166,8 +9190,10 @@ fn rewrite_gem(
         // unchanged) where there is none yet. So every locked build moves
         // to it together, each pinned to the sha256 the registry serves
         // for it, as soon as one of them is patched. A platform the
-        // registry does not list would send that platform's machines to a
-        // registry with no gem for them: the dep is skipped entirely.
+        // registry does not list (its patched build is still being made)
+        // would send that platform's machines to a registry with no gem
+        // for them: the gem is left as it is until a later reference
+        // lists it.
         if let Some(parsed) = &handed_in {
             let builds = parsed.locked_builds(&dep.name, &dep.version);
             if !builds.platforms.is_empty() {
@@ -9183,26 +9209,19 @@ fn rewrite_gem(
                 };
                 let unlisted: Vec<String> = platform_builds()
                     .filter(|id| listed(id).is_none())
-                    .map(entry)
+                    .filter_map(|id| id.platform.clone())
                     .collect();
                 // Bundler < 2.2 lists every source in one GEM section, where
                 // only a ruby-platform entry has been proven to converge.
                 let merged = matches!(layout, Some(LockLayout::Merged(_)));
-                if !unlisted.is_empty() || merged {
-                    let why = if ov.identifiers.gem_builds.is_none() {
+                let no_list = ov.identifiers.gem_builds.is_none();
+                if no_list || merged {
+                    let why = if no_list {
                         "the patch covers the ruby platform gem only (the patch registry does \
                          not list the platform gems of this version)"
-                            .to_string()
-                    } else if !unlisted.is_empty() {
-                        format!(
-                            "the patch registry does not list {} among the platform gems of \
-                             this version",
-                            unlisted.join(", ")
-                        )
                     } else {
                         "its bundler (< 2.2) lists every gem source in one GEM section, where \
                          socket-patch redirects only a ruby platform gem"
-                            .to_string()
                     };
                     result.warnings.push(RewriteWarning {
                         code: "redirect_gem_platform_unsupported".into(),
@@ -9214,6 +9233,14 @@ fn rewrite_gem(
                             platform_builds().map(entry).collect::<Vec<_>>().join(", "),
                         ),
                     });
+                    continue;
+                }
+                // A locked platform the list leaves out: its patched build
+                // is still being made, and the patch service names it only
+                // once it is there. Nothing to warn about; a later run
+                // moves the gem.
+                if !unlisted.is_empty() {
+                    result.gem_unlisted.insert(dep.patch_uuid.clone(), unlisted);
                     continue;
                 }
                 // Whether the lock already takes the gem from this patch's
@@ -23406,44 +23433,102 @@ mod tests {
         assert!(again.files.is_empty() && again.edits.is_empty());
     }
 
-    /// A locked platform the patch registry does not list keeps the whole
-    /// gem where it is: a machine of that platform would be sent to a
-    /// registry that has no gem for it. So does a patch whose reference
-    /// carries no list at all (a patch of the ruby gem alone). The warning
-    /// names the builds and which of the two it is.
+    /// A patch whose reference carries no list of the version's gems is a
+    /// patch of the ruby gem alone: a lock that names platform builds is
+    /// left as it is, and the warning says so.
     #[test]
-    fn gem_platform_the_registry_does_not_list_skips_the_gem_and_names_it() {
+    fn gem_platforms_with_no_list_skip_the_gem_and_say_why() {
         let lock = nokogiri_lock(&["arm64-darwin", "x86_64-linux-gnu"], false, true);
-        let arm = "a".repeat(64);
-        for (dep, why) in [
-            (
-                gem_override_prebuilt("nokogiri", "1.18.10", &[("arm64-darwin", &arm)]),
-                "the patch registry does not list `nokogiri (1.18.10-x86_64-linux-gnu)` among \
-                 the platform gems of this version; redirect skipped",
-            ),
-            (
-                gem_override("nokogiri", "1.18.10"),
+        let dep = gem_override("nokogiri", "1.18.10");
+        let (gemfile, after, r) = gem_redirect(NOKOGIRI_GEMFILE, &lock, dep);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        assert_eq!(
+            (gemfile.as_str(), after.as_str()),
+            (NOKOGIRI_GEMFILE, lock.as_str())
+        );
+        let [warning] = r.warnings.as_slice() else {
+            panic!("one warning: {:?}", r.warnings);
+        };
+        assert_eq!(warning.code, "redirect_gem_platform_unsupported");
+        assert!(
+            warning.detail.ends_with(
                 "the patch covers the ruby platform gem only (the patch registry does not list \
-                 the platform gems of this version); redirect skipped",
+                 the platform gems of this version); redirect skipped"
             ),
-        ] {
-            let (gemfile, after, r) = gem_redirect(NOKOGIRI_GEMFILE, &lock, dep);
-            assert!(
-                r.files.is_empty() && r.edits.is_empty(),
-                "nothing is written: {:?}",
-                r.edits
-            );
-            assert_eq!(
-                (gemfile.as_str(), after.as_str()),
-                (NOKOGIRI_GEMFILE, lock.as_str())
-            );
-            let [warning] = r.warnings.as_slice() else {
-                panic!("one warning: {:?}", r.warnings);
-            };
-            assert_eq!(warning.code, "redirect_gem_platform_unsupported");
-            assert!(warning.detail.ends_with(why), "{}", warning.detail);
-            assert!(r.gem_builds.is_empty() && r.gem_unpatched.is_empty());
-        }
+            "{}",
+            warning.detail
+        );
+        assert!(r.gem_builds.is_empty() && r.gem_unpatched.is_empty() && r.gem_unlisted.is_empty());
+    }
+
+    /// A locked platform the list leaves out (its patched build is still
+    /// being made) keeps the whole gem where it is: a machine of that
+    /// platform would be sent to a registry that has no gem for it. Not a
+    /// warning: the result names the platform that is waited for, and a
+    /// run over a list that has it moves the gem.
+    #[test]
+    fn gem_platform_missing_from_the_list_leaves_the_gem_for_a_later_run() {
+        let lock = nokogiri_lock(&["arm64-darwin", "x86_64-linux-gnu"], false, true);
+        let (arm, linux) = ("a".repeat(64), "b".repeat(64));
+        let dep = gem_override_prebuilt("nokogiri", "1.18.10", &[("arm64-darwin", &arm)]);
+        let (gemfile, after, r) = gem_redirect(NOKOGIRI_GEMFILE, &lock, dep);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        assert_eq!(
+            (gemfile.as_str(), after.as_str()),
+            (NOKOGIRI_GEMFILE, lock.as_str())
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(
+            r.gem_unlisted.get("uuid").map(Vec::as_slice),
+            Some(&["x86_64-linux-gnu".to_string()][..])
+        );
+        assert!(r.gem_builds.is_empty() && r.gem_unpatched.is_empty());
+
+        let dep = gem_override_prebuilt(
+            "nokogiri",
+            "1.18.10",
+            &[("arm64-darwin", &arm), ("x86_64-linux-gnu", &linux)],
+        );
+        let (_, _, later) = gem_redirect(NOKOGIRI_GEMFILE, &lock, dep);
+        assert!(!later.files.is_empty() && later.gem_unlisted.is_empty());
+        assert_eq!(builds_of(&later).len(), 2);
+    }
+
+    /// The list names the ruby gem too (`platform: "ruby"`, the patch
+    /// itself), so a lock with the plain entry beside its platform builds
+    /// reads every pin from the one list.
+    #[test]
+    fn gem_ruby_entry_is_pinned_from_the_list() {
+        let (ruby, arm) = ("e".repeat(64), "a".repeat(64));
+        let mut dep = gem_override_listing(
+            "nokogiri",
+            "1.18.10",
+            &[("arm64-darwin", &arm, true), ("ruby", &ruby, true)],
+        );
+        let ids = &mut dep.registry_override.as_mut().unwrap().identifiers;
+        ids.gem_builds.as_mut().unwrap()[1].patch_uuid = Some("uuid".into());
+        // The reference's own checksum agrees with the entry; the entry is
+        // what is read.
+        ids.gem_checksum_sha256 = None;
+        let lock = nokogiri_lock(&["arm64-darwin"], true, true);
+        let (_, moved, r) = gem_redirect(NOKOGIRI_GEMFILE, &lock, dep);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(
+            moved.contains(&format!("  nokogiri (1.18.10) sha256={ruby}\n")),
+            "{moved}"
+        );
+        assert!(
+            moved.contains(&format!("  nokogiri (1.18.10-arm64-darwin) sha256={arm}\n")),
+            "{moved}"
+        );
+        let arm_patch = build_uuid("arm64-darwin");
+        assert_eq!(
+            builds_of(&r),
+            [
+                (None, Some("uuid"), true),
+                (Some("arm64-darwin"), Some(arm_patch.as_str()), true),
+            ]
+        );
     }
 
     /// What [`RewriteResult::gem_builds`] says of the one gem: per locked
@@ -23558,19 +23643,19 @@ mod tests {
         );
     }
 
-    /// [`gem_override_listing`] with its registry at the snapshot `number`
-    /// (`…/uuid/s/<number>`, as the patch service spells it: no closing
+    /// [`gem_override_listing`] with its registry at the snapshot `key`
+    /// (`…/uuid/s/<key>`, as the patch service spells it: no closing
     /// slash).
-    fn gem_override_at_snapshot(number: u32, builds: &[(&str, &str, bool)]) -> DepOverride {
+    fn gem_override_at_snapshot(key: &str, builds: &[(&str, &str, bool)]) -> DepOverride {
         let mut dep = gem_override_listing("nokogiri", "1.18.10", builds);
         let ov = dep.registry_override.as_mut().expect("a gem registry");
-        ov.index_url = format!("{GEM_TEST_URL}s/{number}");
+        ov.index_url = format!("{GEM_TEST_URL}s/{key}");
         dep
     }
 
     /// A registry URL carries the snapshot it was made at. The manifest
     /// and the lock take it closed by a slash, as Bundler writes a remote.
-    /// A later reference names a newer snapshot, where a platform that had
+    /// A later reference names another snapshot, where a platform that had
     /// upstream's gem has a patched build: the URL is refreshed in place
     /// (never written twice), the one checksum that changed is rewritten,
     /// and the result names the build that is newly patched. The same
@@ -23581,7 +23666,7 @@ mod tests {
         let upstream = upstream_sha("1.18.10-x86_64-linux-gnu");
         let platforms = ["arm64-darwin", "x86_64-linux-gnu"];
         let first = gem_override_at_snapshot(
-            1,
+            "9f3c01",
             &[
                 ("arm64-darwin", &arm, true),
                 ("x86_64-linux-gnu", &upstream, false),
@@ -23590,7 +23675,7 @@ mod tests {
         let lock = nokogiri_lock(&platforms, false, true);
         let (gemfile, moved, r) = gem_redirect(NOKOGIRI_GEMFILE, &lock, first.clone());
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
-        let at_one = format!("{GEM_TEST_URL}s/1/");
+        let at_one = format!("{GEM_TEST_URL}s/9f3c01/");
         assert!(
             gemfile.contains(&format!("source: \"{at_one}\"")),
             "{gemfile}"
@@ -23604,7 +23689,7 @@ mod tests {
         );
 
         let second = gem_override_at_snapshot(
-            2,
+            "07ab2e",
             &[
                 ("arm64-darwin", &arm, true),
                 ("x86_64-linux-gnu", &linux, true),
@@ -23612,7 +23697,7 @@ mod tests {
         );
         let (gemfile_two, lock_two, r) = gem_redirect(&gemfile, &moved, second.clone());
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
-        let at_two = format!("{GEM_TEST_URL}s/2/");
+        let at_two = format!("{GEM_TEST_URL}s/07ab2e/");
         assert_eq!(gemfile_two, gemfile.replace(&at_one, &at_two));
         assert_eq!(
             lock_two,
@@ -23642,10 +23727,11 @@ mod tests {
         assert!(builds_of(&again).iter().all(|(_, _, newly)| !newly));
     }
 
-    /// The snapshot level of a registry URL is read off its end, and the
-    /// recogniser of a patch's registry URL takes any snapshot or none
-    /// under any grant token: a pair an earlier run wired is refreshed,
-    /// whichever form it was written in.
+    /// The snapshot level of a registry URL is read off its end (an
+    /// opaque key of lowercase hex digits), and the recogniser of a
+    /// patch's registry URL takes any snapshot or none under any grant
+    /// token: a pair an earlier run wired is refreshed, whichever form it
+    /// was written in.
     #[test]
     fn gem_registry_url_is_recognised_with_any_snapshot_or_none() {
         let plain = "https://patch.test/gem/tok/uuid/";
@@ -23654,21 +23740,24 @@ mod tests {
             split_gem_snapshot("https://patch.test/gem/tok/uuid"),
             ("https://patch.test/gem/tok/uuid", None)
         );
-        for snapshot in [
-            "https://patch.test/gem/tok/uuid/s/12",
-            "https://patch.test/gem/tok/uuid/s/12/",
+        for (snapshot, key) in [
+            ("https://patch.test/gem/tok/uuid/s/12", "12"),
+            ("https://patch.test/gem/tok/uuid/s/12/", "12"),
+            ("https://patch.test/gem/tok/uuid/s/07ab2e9f", "07ab2e9f"),
         ] {
             assert_eq!(
                 split_gem_snapshot(snapshot),
-                (plain, Some(12)),
+                (plain, Some(key)),
                 "{snapshot}"
             );
         }
-        // Not a snapshot level: no number, a leading zero, another name.
+        // Not a snapshot level: no key, a key that is not lowercase hex,
+        // another level name.
         for other in [
             "https://patch.test/gem/tok/uuid/s/",
-            "https://patch.test/gem/tok/uuid/s/012",
-            "https://patch.test/gem/tok/uuid/s/1a",
+            "https://patch.test/gem/tok/uuid/s/1G",
+            "https://patch.test/gem/tok/uuid/s/AB12",
+            "https://patch.test/gem/tok/uuid/s/a-1",
             "https://patch.test/gem/tok/uuid/t/3",
         ] {
             assert_eq!(split_gem_snapshot(other).1, None, "{other}");
@@ -23677,7 +23766,7 @@ mod tests {
         for index_url in [
             plain,
             "https://patch.test/gem/tok/uuid/s/3",
-            "https://patch.test/gem/tok/uuid/s/3/",
+            "https://patch.test/gem/tok/uuid/s/9f3c01/",
         ] {
             let registry = Regex::new(&format!("^{}$", gem_index_url_pattern(&dep, index_url)))
                 .expect("a pattern");
@@ -23686,7 +23775,7 @@ mod tests {
                 "https://patch.test/gem/an-older-grant/uuid/",
                 "https://patch.test/gem/tok/uuid/s/3",
                 "https://patch.test/gem/tok/uuid/s/3/",
-                "https://patch.test/gem/another-grant/uuid/s/41/",
+                "https://patch.test/gem/another-grant/uuid/s/07ab2e/",
             ] {
                 assert!(registry.is_match(ours), "{index_url} takes {ours}");
             }
@@ -23694,6 +23783,7 @@ mod tests {
                 "https://rubygems.org/",
                 "https://patch.test/gem/tok/uuid/s/",
                 "https://patch.test/gem/tok/uuid/s/3/x",
+                "https://patch.test/gem/tok/uuid/s/3G/",
                 "https://patch.test/gem/tok/uuid/info/nokogiri",
                 "https://evil.test/gem/tok/uuid/s/3/",
             ] {

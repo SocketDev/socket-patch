@@ -272,6 +272,25 @@ pub(crate) struct PackageVendorRequest {
     pub uuids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free_only: Option<bool>,
+    /// Asks for a gem patch's registry as the complete list of the
+    /// version's gems (`registryOverride.identifiers.gemBuilds`, under a
+    /// snapshot URL). The service answers a request without it as it
+    /// always has, with the ruby gem's registry alone, so every reference
+    /// request of this CLI carries it: [`Self::new`].
+    pub gem_builds: bool,
+}
+
+impl PackageVendorRequest {
+    /// The request for `uuids`, with `freeOnly` only when it is forced
+    /// (the public-proxy contract; the authenticated endpoint defaults to
+    /// false).
+    pub(crate) fn new(uuids: &[String], free_only: bool) -> Self {
+        PackageVendorRequest {
+            uuids: uuids.to_vec(),
+            free_only: free_only.then_some(true),
+            gem_builds: true,
+        }
+    }
 }
 
 /// Response from the package-vendor endpoint: one result per requested UUID,

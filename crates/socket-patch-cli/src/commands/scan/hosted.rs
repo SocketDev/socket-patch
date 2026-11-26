@@ -2943,7 +2943,7 @@ async fn run_redirect_selected_untracked(
                 .iter()
                 .filter(|s| s.reason != super::rollout::ROLLOUT_DEFERRED)
                 // Said above, as one plain line per gem: nothing failed.
-                .filter(|s| s.reason != engine::GEM_NO_PATCHED_BUILD)
+                .filter(|s| !engine::is_quiet_gem_skip(&s.reason))
                 .map(|s| (s.purl.clone(), s.reason.clone()))
                 .collect();
             let unconfirmed_purls: Vec<String> =
@@ -3521,7 +3521,7 @@ fn format_gem_build_lines(
     skipped: &[socket_patch_core::hosted::engine::SkippedPatch],
     dry_run: bool,
 ) -> Vec<String> {
-    use socket_patch_core::hosted::engine::{PinReport, GEM_NO_PATCHED_BUILD};
+    use socket_patch_core::hosted::engine::{is_quiet_gem_skip, PinReport};
     // Per gem patch, in report order: its locked builds.
     let mut gems: Vec<(&str, Vec<&PinReport>)> = Vec::new();
     for report in reports {
@@ -3576,7 +3576,7 @@ fn format_gem_build_lines(
     lines.extend(
         skipped
             .iter()
-            .filter(|skip| skip.reason == GEM_NO_PATCHED_BUILD)
+            .filter(|skip| is_quiet_gem_skip(&skip.reason))
             .filter_map(|skip| skip.detail.clone()),
     );
     lines
