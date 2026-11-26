@@ -158,13 +158,14 @@ fn packagist_base() -> String {
         .unwrap_or_else(|| DEFAULT_PACKAGIST.to_string())
 }
 
-/// The `checksum:` (sha256 hex of the `.gem`) a compact-index `info/<name>`
-/// file records for the build `token` — the value bundler writes into
+/// The `checksum:` (sha256 of the `.gem`) a compact-index `info/<name>`
+/// file records for the build `token`, as the hex bundler writes into
 /// `CHECKSUMS`. Lines are `<version>[-<platform>] <deps>|<reqs>`, the
-/// requirement list carrying `checksum:<hex>`: `token` is `<version>` for
-/// the ruby-platform gem and `<version>-<platform>` for a platform gem,
-/// matched whole, so a version never answers for one of its platform
-/// builds.
+/// requirement list carrying `checksum:<digest>`: `token` is `<version>`
+/// for the ruby-platform gem and `<version>-<platform>` for a platform
+/// gem, matched whole, so a version never answers for one of its platform
+/// builds. The digest is hex on rubygems.org and base64 in an index built
+/// with `gem generate_index`; bundler reads both, and so does this.
 pub(crate) fn compact_index_checksum(info: &str, token: &str) -> Option<String> {
     info.lines().find_map(|line| {
         let (head, reqs) = line.split_once('|')?;
@@ -173,7 +174,7 @@ pub(crate) fn compact_index_checksum(info: &str, token: &str) -> Option<String> 
         }
         reqs.split(',')
             .find_map(|r| r.trim().strip_prefix("checksum:"))
-            .and_then(crate::utils::digest::sha256_hex)
+            .and_then(crate::utils::digest::sha256_hex_or_base64)
     })
 }
 
@@ -1102,6 +1103,37 @@ mod tests {
         assert_eq!(compact_index_checksum(&info, "1.1.0-jav"), None);
         assert_eq!(compact_index_checksum(&info, "2.0.0"), None);
         assert_eq!(compact_index_checksum("1.0.0 |ruby:>= 2", "1.0.0"), None);
+    }
+
+    /// #2285: an index built with `gem generate_index` writes the sha256
+    /// as base64 (rack 3.2.9's line below is the one that command wrote).
+    /// Bundler reads it and pins the hex digest in `CHECKSUMS`, in the
+    /// standard and the URL-safe alphabet, so both give that hex here.
+    #[test]
+    fn compact_index_checksum_reads_a_base64_digest_as_bundler_does() {
+        const HEX: &str = "8235c1d08f0c461bedcff4413bbeba888173e5b09e1332ae951c98f0ee460dcc";
+        let info = "---\n3.2.8 |checksum:AAAA\n\
+                    3.2.9 |checksum:gjXB0I8MRhvtz/RBO766iIFz5bCeEzKulRyY8O5GDcw=,ruby:>= 2.4.0\n\
+                    3.2.9-java |checksum:gjXB0I8MRhvtz_RBO766iIFz5bCeEzKulRyY8O5GDcw=\n";
+        assert_eq!(compact_index_checksum(info, "3.2.9").as_deref(), Some(HEX));
+        assert_eq!(
+            compact_index_checksum(info, "3.2.9-java").as_deref(),
+            Some(HEX),
+            "the URL-safe alphabet"
+        );
+        // What Bundler refuses as a digest is no checksum: the padding
+        // missing or doubled, bits set past the 32nd byte, another length.
+        for bad in [
+            "gjXB0I8MRhvtz/RBO766iIFz5bCeEzKulRyY8O5GDcw",
+            "gjXB0I8MRhvtz/RBO766iIFz5bCeEzKulRyY8O5GDcw==",
+            "gjXB0I8MRhvtz/RBO766iIFz5bCeEzKulRyY8O5GDcx=",
+            "gjXB0I8MRhvtz/RBO766iIFz5bCeEzKulRyY8O5GDc==",
+            "gjXB0I8MRhvtz/RBO766iIFz5bCeEzKulRyY8O5G*cw=",
+            "AAAA",
+        ] {
+            let info = format!("3.2.9 |checksum:{bad}\n");
+            assert_eq!(compact_index_checksum(&info, "3.2.9"), None, "{bad}");
+        }
     }
 
     #[test]
