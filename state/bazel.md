@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bazel workspaces bug-hunt routine (label pm:bazel).
 
-Last run: 2026-11-26, main `cfc870f`, release v5.1.0, newest Bazel pin 9.3.2. Real Bazel builds are blocked in the sandbox (see backlog item 1), so no Hosted, Vendored, Agent or VEX cell has been tested yet.
+Last run: 2026-11-26 (second run of the day), main `cfc870f`, release v5.1.0, newest Bazel pin 9.3.2. Real Bazel builds are blocked in the sandbox (see backlog item 1), so no Hosted, Vendored or Agent cell has been tested on a build yet.
 
 Bazel support is experimental. The rows below are the rows of "Bazel workspaces: what is supported" in `docs/ecosystems.md`, which says what each cell promises and with which conditions. A cell here records what this routine saw on a real Bazel build: pass (Bazel release, date), fail (issue number), blocked (why) or untested.
 
@@ -8,30 +8,31 @@ Bazel support is experimental. The rows below are the rows of "Bazel workspaces:
 
 | Ecosystem, and how Bazel takes its packages | Hosted | Vendored | Agent (not supported: the build must still pass) | VEX | Nightly CI legs on `main` |
 |---|---|---|---|---|---|
-| npm: aspect_rules_js over a pnpm lock | untested | untested | untested | untested | green 23, 24 and 25 Nov (2026-11-26) |
-| PyPI: rules_python `pip.parse` over a requirements file | untested | untested | untested | untested | green 23, 24 and 25 Nov (2026-11-26) |
-| Go: gazelle `go_deps.from_file` over `go.mod` | untested | untested | untested | untested | green 23, 24 and 25 Nov (2026-11-26) |
-| RubyGems: rules_ruby `ruby.bundle_fetch` over `Gemfile.lock` | untested | untested | untested | untested | green 23, 24 and 25 Nov (2026-11-26) |
-| Cargo: rules_rust `crate.from_cargo` over `Cargo.lock` | untested | untested | untested | untested | green 23, 24 and 25 Nov (2026-11-26) |
-| NuGet: `nuget.from_lock` over `packages.lock.json` | untested | untested | untested | untested | green 23, 24 and 25 Nov (2026-11-26) |
-| Composer: a rule that runs `composer install` from `composer.lock` | untested | untested (declines by design) | untested | untested | green 23, 24 and 25 Nov (2026-11-26) |
-| Maven: rules_jvm_external `maven.install` with a `lock_file` | untested | untested | untested | untested | green 23, 24 and 25 Nov (2026-11-26) |
+| npm: aspect_rules_js over a pnpm lock | untested | untested | untested | untested | green 24, 25 and 26 Nov (2026-11-26) |
+| PyPI: rules_python `pip.parse` over a requirements file | untested | untested | untested | fail #2281 (no build: files only; no document for a hosted patch beside a virtualenv with the unpatched release) | green 24, 25 and 26 Nov (2026-11-26) |
+| Go: gazelle `go_deps.from_file` over `go.mod` | untested | untested | untested | untested | green 24, 25 and 26 Nov (2026-11-26) |
+| RubyGems: rules_ruby `ruby.bundle_fetch` over `Gemfile.lock` | untested | untested | untested | untested | green 24, 25 and 26 Nov (2026-11-26) |
+| Cargo: rules_rust `crate.from_cargo` over `Cargo.lock` | untested | untested | untested | untested | green 24, 25 and 26 Nov (2026-11-26) |
+| NuGet: `nuget.from_lock` over `packages.lock.json` | untested | untested | untested | untested | green 24, 25 and 26 Nov (2026-11-26) |
+| Composer: a rule that runs `composer install` from `composer.lock` | untested | untested (declines by design) | untested | untested | green 24, 25 and 26 Nov (2026-11-26) |
+| Maven: rules_jvm_external `maven.install` with a `lock_file` | untested | untested | untested | untested | green 24, 25 and 26 Nov (2026-11-26) |
 
 | Outside a Bazel build | Result |
 |---|---|
-| A project in no Bazel workspace behaves exactly as v5.1.0 did | npm (pnpm lock v9): pass, main `cfc870f` against v5.1.0, 2026-11-26: same files and exit codes; output differs only by changes that are not Bazel's. Other ecosystems untested |
-| A project in a Bazel workspace that Bazel does not build | npm: pass under a `MODULE.bazel` with no hub and under a leftover `WORKSPACE`, 2026-11-26. Other ecosystems untested |
+| A project in no Bazel workspace behaves exactly as v5.1.0 did | npm (pnpm lock v9) and PyPI (hashed requirements.txt): pass, main `cfc870f` against v5.1.0, 2026-11-26: same files and exit codes; output differs only by changes that are not Bazel's. Other ecosystems untested |
+| A project in a Bazel workspace that Bazel does not build | npm and PyPI: pass under a `MODULE.bazel` with no hub and under a leftover `WORKSPACE`; PyPI also in `tools/` beside a `pip.parse` that reads another project's file, 2026-11-26. Other ecosystems untested |
 
 ## Backlog
-1. Feasibility: **blocked, 2026-11-26.** `bazel build` of a fixture stops at module resolution: the sandbox's network policy refuses `bcr.bazel.build` (HTTP 403 from the egress proxy). Also refused: `releases.bazel.build` (9.3.2 installed only from an existing cache), `mirror.bazel.build`, `patches-api.socket.dev`, `api.socket.dev`, `patch.socket.dev`. Reachable: `github.com`, `registry.npmjs.org`, `nodejs.org`. Each run: try one fixture build first (`cargo test -p socket-patch-cli --test e2e_bazel_build -- --ignored --exact npm::hosted_npm_translate_lock`, about 10 minutes to compile); while it fails on the registry, do only items 2, 3 and 8.
+1. Feasibility: **blocked, 2026-11-26.** `bazel build` of a fixture stops at module resolution: the sandbox's network policy refuses `bcr.bazel.build` (HTTP 403 from the egress proxy). Also refused: `releases.bazel.build` (9.3.2 installed only from an existing cache), `mirror.bazel.build`, `patches-api.socket.dev`, `api.socket.dev`, `patch.socket.dev`. Still so on the second run of 2026-11-26. Reachable: `github.com/SocketDev/socket-patch` only (other GitHub repositories answer 403, so new Bazel and ruleset releases cannot be looked up either), `registry.npmjs.org`, `nodejs.org`, `pypi.org`, `proxy.golang.org`. Each run: try one fixture build first (`cargo test -p socket-patch-cli --test e2e_bazel_build -- --ignored --exact npm::hosted_npm_translate_lock`, about 10 minutes to compile); while it fails on the registry, do only items 2, 3 and 8.
 2. The latest nightly run of each `bazel-*.yml` workflow on `main`: which legs are red, and whether an open issue covers each.
-3. A project in no Bazel workspace, and one in a workspace that Bazel does not build: main against v5.1.0. npm is done; next PyPI (requirements file), then Go, RubyGems, Cargo, NuGet, Composer, Maven. No public patch API here: use a loopback stand-in shaped like `tests/hosted_memory_common/mod.rs` (`--api-url`, `--org test-org`, `SOCKET_PATCH_SERVER_URL`).
+3. A project in no Bazel workspace, and one in a workspace that Bazel does not build: main against v5.1.0. npm and PyPI are done; next Go, then RubyGems, Cargo, NuGet, Composer, Maven. No public patch API here: use a loopback stand-in shaped like `tests/hosted_memory_common/mod.rs` (`--api-url`, `--org test-org`, `SOCKET_PATCH_SERVER_URL`).
 4. Hosted mode, one ecosystem per run, in the order of the table (npm first): the mode's one command, `bazel build`, the patched package in the build, `vex`, the undo, `bazel build` again.
 5. Vendored mode, the same way, for the rows the docs list as Supported; for the rows that decline, the command exits 1, writes nothing and the build still passes.
 6. Agent mode in a Bazel workspace: the message says what to use instead, and the build still passes.
 7. `vex` in each row: `not_affected` only for a package the Bazel build takes patched.
 8. The docs table against what you saw: a cell that promises more than the build holds.
-9. Shapes, npm first: a committed `MODULE.bazel.lock` with `--lockfile_mode=error`, two hubs, a monorepo Bazel builds in part, a `.bazelrc` with a repository cache or a downloader config, a `WORKSPACE` file beside `MODULE.bazel`.
+9. File-level checks that need no build, per ecosystem (done for PyPI, 2026-11-26: the vendored decline writes nothing; hosted and download-cache undo give `requirements.txt` and `.bazelrc` back byte for byte, also for a `.bazelrc` with CRLF, without a final newline or missing): next the Go fixture (`.bazelignore` lines and their undo).
+10. Shapes, npm first: a committed `MODULE.bazel.lock` with `--lockfile_mode=error`, two hubs, a monorepo Bazel builds in part, a `.bazelrc` with a repository cache or a downloader config, a `WORKSPACE` file beside `MODULE.bazel`.
 
 ## Known non-bugs
-See `known-non-bugs/bazel.md` (3 entries, all artifacts of a home-made stand-in API or output changes that are not Bazel's).
+See `known-non-bugs/bazel.md` (6 entries). Most likely to be re-filed: an empty `.bazelrc` of the user's is removed by the undo of a PyPI download cache (documented); v5.1.0 counts the machine's Python packages in `scannedPackages` and main does not (not Bazel's).
