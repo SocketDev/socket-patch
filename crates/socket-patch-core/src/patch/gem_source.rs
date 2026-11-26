@@ -63,7 +63,7 @@ use crate::formats::gem::{self, BUNDLER_LOCKS};
 use crate::patch::redirect::upstream::{
     compact_index_checksum, is_rubygems_remote, rubygems_base, rubygems_secure_base,
 };
-use crate::utils::digest::{sha256_hex, sha256_hex_of};
+use crate::utils::digest::{sha256_hex_of, sha256_hex_or_base64};
 use crate::vendor::registry_fetch::SecureRegistryClient;
 
 /// One gem release: `<name>-<version>[-<platform>]`.
@@ -402,7 +402,8 @@ pub(crate) struct RubyVersions {
 /// that meets `requirement` and whose `ruby:` / `rubygems:` constraints the
 /// building Ruby meets: `(version, sha256)`. A prerelease is picked only
 /// for a requirement that names one, as RubyGems resolves. Lines are
-/// `<version>[-<platform>] <deps>|checksum:<hex>[,ruby:<req>][,rubygems:<req>]`.
+/// `<version>[-<platform>] <deps>|checksum:<digest>[,ruby:<req>][,rubygems:<req>]`,
+/// the digest hex or base64 as [`compact_index_checksum`] reads it.
 pub(crate) fn pick_release(
     info: &str,
     requirement: &str,
@@ -431,8 +432,8 @@ pub(crate) fn pick_release(
         let (mut sha, mut runs) = (None, true);
         for req in reqs.split(',') {
             let req = req.trim();
-            if let Some(hex) = req.strip_prefix("checksum:") {
-                sha = sha256_hex(hex);
+            if let Some(digest) = req.strip_prefix("checksum:") {
+                sha = sha256_hex_or_base64(digest);
             } else if let Some(constraint) = req.strip_prefix("ruby:") {
                 runs &= meets(ruby.ruby.as_deref(), constraint);
             } else if let Some(constraint) = req.strip_prefix("rubygems:") {
