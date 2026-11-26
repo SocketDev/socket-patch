@@ -3133,6 +3133,69 @@ async fn a_platform_served_as_upstreams_gem_is_no_stale_install() {
             "cached={cached}:\n{stderr}"
         );
         assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB, "cached={cached}");
+
+        // The VEX of this machine, from the run itself and from a later
+        // `vex`: the other platform's build is attested under its own
+        // patch, and this machine's build is said affected. The installed
+        // copy is upstream's gem, as its lock entry names it, and is no
+        // evidence against the build the lock installs patched.
+        let patched_part = format!("Patched via Socket patch {LINUX_UUID} (redirected)");
+        let expected = [
+            (
+                "not_affected".to_string(),
+                format!("{PURL}?platform={OTHER_PLATFORM}"),
+                patched_part,
+            ),
+            (
+                "affected".to_string(),
+                format!("{PURL}?platform={PLATFORM}"),
+                String::new(),
+            ),
+        ];
+        let said = |doc: &serde_json::Value| -> Vec<(String, String, String)> {
+            let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_string();
+            let statements = doc["statements"].as_array().expect("statements");
+            statements
+                .iter()
+                .map(|st| {
+                    let packages = st["products"][0]["subcomponents"].as_array();
+                    assert_eq!(packages.map(Vec::len), Some(1), "{st}");
+                    (
+                        text(&st["status"]),
+                        text(&st["products"][0]["subcomponents"][0]["@id"]),
+                        text(&st["impact_statement"]),
+                    )
+                })
+                .collect()
+        };
+        let vex_path = proj.join("run.vex.json");
+        let with_vex = [
+            "--json",
+            "--vex",
+            vex_path.to_str().unwrap(),
+            "--vex-product",
+            "pkg:gem/app@1.0.0",
+        ];
+        let (code, stdout, stderr) =
+            common::run_with_env(&proj, &scan_args(&proj, &uri, &with_vex), &[]);
+        let env = common::parse_json_envelope(&stdout);
+        assert_eq!(code, 0, "cached={cached}: {env}\nstderr:\n{stderr}");
+        assert_eq!(env["vex"]["affected"], 1, "cached={cached}: {env}");
+        let doc = vex_e2e_common::read_doc(&vex_path).expect("the run's document");
+        assert_eq!(said(&doc), expected, "cached={cached}: {doc}");
+
+        let later = vex_e2e_common::VexRun {
+            api_url: Some(uri.clone()),
+            api_token: Some("fake".into()),
+            org: Some(ORG.into()),
+            patch_server_url: Some(uri.clone()),
+            product: Some("pkg:gem/app@1.0.0".into()),
+            ..vex_e2e_common::VexRun::default()
+        };
+        let out = vex_e2e_common::run_vex(&vex_e2e_common::binary(), &proj, &later);
+        assert_eq!(out.code, Some(0), "cached={cached}: {out}");
+        assert_eq!(said(out.doc()), expected, "cached={cached}: {out}");
+        assert_eq!(out.envelope["status"], "success", "cached={cached}: {out}");
     }
 }
 
