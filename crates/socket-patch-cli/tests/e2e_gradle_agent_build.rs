@@ -324,6 +324,11 @@ impl Cell {
 
     /// `socket-patch <args> --json --cwd <proj>` under the cell's caches.
     fn socket(&self, args: &[&str]) -> (Option<i32>, serde_json::Value) {
+        self.socket_env(args, &[])
+    }
+
+    /// [`Self::socket`] with `env` set last, over the cell's own.
+    fn socket_env(&self, args: &[&str], env: &[(&str, &Path)]) -> (Option<i32>, serde_json::Value) {
         let mut cmd = hermetic::command(Path::new(env!("CARGO_BIN_EXE_socket-patch")));
         prebuilt_common::jvm_env::isolate_cli(&mut cmd);
         cmd.args(args)
@@ -337,6 +342,7 @@ impl Cell {
         if let Some(ro) = &self.ro {
             cmd.env("GRADLE_RO_DEP_CACHE", ro);
         }
+        cmd.envs(env.iter().copied());
         let out = cmd.output().expect("run socket-patch");
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let json = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
@@ -357,11 +363,15 @@ impl Cell {
     /// `vex`: the statement count (0 when no document was written) and the
     /// envelope.
     fn vex(&self, extra: &[&str]) -> (usize, serde_json::Value) {
+        self.vex_env(extra, &[])
+    }
+
+    fn vex_env(&self, extra: &[&str], env: &[(&str, &Path)]) -> (usize, serde_json::Value) {
         let doc = self.root.join("vex.json");
         let _ = std::fs::remove_file(&doc);
         let mut args = vec!["vex", "-O", doc.to_str().unwrap(), "--product", PRODUCT];
         args.extend_from_slice(extra);
-        let (_, json) = self.socket(&args);
+        let (_, json) = self.socket_env(&args, env);
         let statements = std::fs::read(&doc)
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
@@ -688,21 +698,42 @@ fn gradle_agent_ro_cache_shadows() {
 // ── global prefix ───────────────────────────────────────────────────────
 
 /// `--global-prefix` naming the user home or its `caches/modules-2`
-/// reaches the cache for apply, vex and rollback.
+/// reaches the cache for apply, vex and rollback. The CLI runs under
+/// another, empty Gradle user home, so the prefix alone names the cache
+/// the build reads: under the cell's own `GRADLE_USER_HOME` project
+/// discovery reaches it with the flag ignored (#1982).
 #[test]
 #[ignore = "real Gradle (SOCKET_PATCH_GRADLE_E2E_*)"]
 fn gradle_agent_global_prefix() {
     let Some(c) = cell(CENTRAL, "") else { return };
     c.assert_consumes_pristine(&[], "first build");
+    let elsewhere = c.root.join("another-gradle-home");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let env = [("GRADLE_USER_HOME", elsewhere.as_path())];
+    let socket_ok = |args: &[&str]| {
+        let (code, json) = c.socket_env(args, &env);
+        assert_eq!(code, Some(0), "{args:?}: {json}");
+    };
     for prefix in [c.home.clone(), c.home.join("caches/modules-2")] {
         // Each rollback drops the manifest record: write it per round.
         c.leaf_manifest();
         let p = prefix.to_str().unwrap();
-        c.socket_ok(&["apply", "--offline", "--global-prefix", p]);
+        // Control: without the prefix this run does not reach the cache.
+        let (_, json) = c.socket_env(&["apply", "--offline"], &env);
+        assert_eq!(
+            json["events"][0]["errorCode"], "package_not_installed",
+            "{json}"
+        );
+        let cached = c.hash_dirs();
+        assert!(!cached.is_empty(), "no cached {}", jar_leaf());
+        for dir in cached {
+            assert_eq!(std::fs::read(dir.join(jar_leaf())).unwrap(), pristine_jar());
+        }
+        socket_ok(&["apply", "--offline", "--global-prefix", p]);
         c.assert_consumes_patched(&[], "after a global-prefix apply");
-        let (statements, json) = c.vex(&["--global-prefix", p]);
+        let (statements, json) = c.vex_env(&["--global-prefix", p], &env);
         assert!(statements > 0, "{json}");
-        c.socket_ok(&["rollback", "--offline", "--global-prefix", p]);
+        socket_ok(&["rollback", "--offline", "--global-prefix", p]);
         c.assert_consumes_pristine(&[], "after a global-prefix rollback");
     }
 }

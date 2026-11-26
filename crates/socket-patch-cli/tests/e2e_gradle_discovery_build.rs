@@ -140,6 +140,10 @@ fn scan(cwd: &Path, gradle_home: Option<&Path>, m2: &Path, extra: &[&str]) -> Sc
         .into_iter()
         .collect();
     prebuilt_common::prepare_command(&mut cmd, cwd, &args, &env);
+    if gradle_home.is_none() {
+        // `prepare_command` pins one to an empty stand-in.
+        cmd.env_remove("GRADLE_USER_HOME");
+    }
     let out = cmd
         .current_dir(cwd)
         .env("SOCKET_TELEMETRY_DISABLED", "1")
@@ -343,13 +347,31 @@ fn scan_annotates_lock_membership_without_filtering() {
 
 /// With `--global-prefix` the cache is named outright, so the user home
 /// Gradle would pick (here the passwd home, not the scrubbed `$HOME`) is
-/// never mentioned.
+/// never mentioned. Control: a `--global` scan of the same machine, which
+/// reads that home, mentions it. Both run with no `GRADLE_USER_HOME`: with
+/// one set the note has nothing to say in either scan (#1982).
 #[test]
 fn global_prefix_scan_says_nothing_about_the_user_home() {
     let fx = Fixture::new();
     fx.write("build.gradle", BUILD);
     let version_dir = fx.cache_commons_text();
     let files21 = version_dir.ancestors().nth(3).unwrap();
+    // Only an account with a passwd home gets the note (Unix). This scan
+    // reads whatever Gradle cache that home holds, and only reports.
+    if socket_patch_core::crawlers::gradle_cache::passwd_home().is_some() {
+        let global = scan(
+            &fx.project,
+            None,
+            &fx.m2,
+            &["--global", "--ecosystems", "maven"],
+        );
+        // The envelope lists that cache's packages: print the warnings only.
+        assert!(
+            global.warning("gradle_user_home_differs").is_some(),
+            "{}",
+            global.env["warnings"]
+        );
+    }
     let scan = scan(
         &fx.project,
         None,
