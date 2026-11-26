@@ -3,7 +3,7 @@
 
 [agent] This comment is the register for the architecture refactor routine. It is rendered from `register/10-refactor.md` on the [`arch-audit/ledger`](https://github.com/SocketDev/socket-patch/tree/arch-audit/ledger) branch, and the routine updates it on every run.
 
-_Last updated 2026-11-26 · 14 runs under this charter · `main` at cfc870f when examined._
+_Last updated 2026-11-26 · 15 runs under this charter · `main` at cfc870f when examined._
 
 ### In flight
 | PR | Issue | State |
@@ -40,9 +40,9 @@ L01 to L18 came from earlier automated audits, the rest from this routine's runs
 | L25 | the ledger's load error is printed raw, so control characters in a committed `state.json` reach the terminal | six CLI commands | filed #2271; ran it: ESC and BEL from a snapshot hash are printed |
 | L30 | `rollback` and `remove` refuse a package when a file of its patch is absent, the state `apply --force` leaves | core `patch/rollback.rs` | filed #2277, a decision issue; ran it: exit 1 with the other file still patched, and again after a reinstall |
 | L33 | a failed `npm root -g` probe reads as "no global install" | core `crawlers/npm_crawler.rs`, CLI `rollback.rs` | filed #2286; ran it: `scan -g` finds nothing (exit 0), and a project `rollback` drops the record and blobs of a copy still patched globally. #1009 fixed Bun's probe |
-| L34 | refusals and hosted warnings print the userinfo of a URL quoted from a lockfile | core `vendor/`, `patch/redirect/` | filed #2287; ran it: 29 of 170 runs over 17 projects print a planted token (Cargo, Yarn classic, Poetry, a requirements direct reference). #1026 redacted vendor warnings only |
+| L34 | refusals, hosted warnings, undo errors and a Gradle note print the credentials of a URL they quote | core `vendor/`, `patch/redirect/`, `crawlers/` | filed #2287; ran it: a planted token is printed in 29 of 170 runs over 17 projects and in 103 of 2,269 hosted runs over 20 package managers (eight sites, four in a comment on the issue). #1026 redacted vendor warnings only |
 
-Read, not run (latent, wording, or copies that agree): #1912, #1887, #1069, #1935, #1940, #1838, #1880, #1924, #747, #1867.
+Read, not run (latent, wording, or copies that agree): #1912, #1887, #1069, #1935, #1940, #1838, #1880, #1924, #747, #1867, #814, #1879, #989, #715.
 
 Issues looked at:
 
@@ -56,27 +56,25 @@ Issues looked at:
 | #1860 | confirmed; ran it: `list` prints U+202E, U+202C and U+200B from a manifest's description and a summary, and drops ESC and BEL. Same area as #2271 |
 | #647 | confirmed; ran it with a token the API refuses: `get`'s searches and `vendor`'s eject have no public-proxy fallback, where `scan`, `get <uuid>` and `show` do; the contract promises the eject one |
 | #1836 | confirmed; ran it: eight identical `get --mode agent --json` runs printed eight orders of `options[].vulnerabilities`, which `scan`'s events and `list` sort by id. Its unit test and the `get` suite pass with the lists emptied |
-| #1064, #882, #1981, #1899, #1861, #1877, #1927, #1969, #1950, #676, #1968 | out of charter; the contract settles it, tidiness, by design, latent, or it needs Go. Evidence in the entries |
-| #1837, #1858, #1911, #1987, #780, #794, #675, #705, #905, #594, #1835, #1925, #1067, #748, #595, #1112 | out of charter; each ran on 2026-11-26: the contract allows it, it is mostly fixed, or nothing a user sees. Evidence in that day's entries |
+| #1064, #882, #1981, #1899, #1861, #1877, #1927, #1969, #1950, #676, #1968, #1837, #1858, #1911, #1987, #780, #794, #675, #705, #905, #594, #1835, #1925, #1067, #748, #595, #1112, #930 | out of charter; each ran or was read: the contract settles or allows it, tidiness, by design, latent, mostly fixed, a docs gap, or it needs Go. Evidence in the entries |
 | #1114 | fixed in part (#2229); the CI janitor holds the rest |
+| the other 29 open issues | out of charter by title (tracking, moves, shared test helpers) or "Decide:" issues; the 18:55Z entry lists them. Every open `arch-audit` issue has been looked at |
 
 ### Areas examined
 | Area | Date | `main` | Found |
 |---|---|---|---|
-| the 2026-11-25 runs (rows in that day's entries): the prune's vendored GC; `--json` / `--silent` over 19 commands; Gradle; the vlt heal | 2026-11-25, 11-26 | 332b3e8 to cfc870f | #2246, #2250, #2253, #2254, #2259, #2267; the rest clean |
-| the prune's keep rule; NuGet project files; `list`'s terminal filter; a refused token; a vendored Go undo; the project-patch gate; `apply --force`, then every undo; run-to-run output | 2026-11-26 | cfc870f | #1926, #1917, #1860, #647, L22, #2277, #1836 confirmed; the rest clean |
-| a broken manifest; the 16 states of a two-file patch; file keys that point outside the package; a closed output pipe; the hidden entrypoint mode's stdout; every toolchain binary hanging or failing | 2026-11-26 | cfc870f | #2286; the rest clean |
-| a credential in a URL of 17 projects' own files, and on 12 API error paths; purl and version spellings; the project-mode cache crawl of four ecosystems | 2026-11-26 | cfc870f | #2287; the rest clean |
+| the runs of 2026-11-25 and of 11-26 to 16:55Z (rows in their entries): agent mode's undo, prune, output and broken inputs; `--json` / `--silent`; Gradle; the vlt heal; failing toolchains; credentials in project files; purl spellings; cache crawls | 2026-11-25, 11-26 | 332b3e8 to cfc870f | #2246, #2250, #2253, #2254, #2259, #2267, #1926, #1917, #1860, #647, L22, #2277, #1836, #2286, #2287; the rest clean |
+| hosted mode on the bench's 20 package managers: a planted credential through 17 commands; dry-run purity; rescans; rollback atomicity; `--json`, `--silent`, `--offline` | 2026-11-26 | cfc870f | four more sites of #2287; the rest clean |
 
 ### Notes
 - Build with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0` on every cargo call, and give each checkout its own `CARGO_TARGET_DIR`, or the next call rebuilds everything. A cold CLI build takes 3 minutes, one test binary 2, a rebuild after an edit 25 seconds.
 - CI's clippy is `cargo clippy --locked --workspace --all-features -- -D warnings`. With `--all-targets` it fails on `main` in `tests/common` and `tests/prebuilt_common`.
 - `--cwd` defaults to `.`: absolutize it before walking `ancestors()`, and test via chdir under `#[serial]`. A test runner that pins `--cwd` must not also set the child's cwd to the project.
 - A write that returns 5xx may have landed: list before you retry.
-- The harness appends the "Generated by Claude Code" footer itself, and may wrap a link's URL in backticks: read a body back, and give such a link as a path and line numbers (#2287).
-- Run the built binary over small broken projects and compare the commands. Set `SOCKET_TELEMETRY_DISABLED=1 SOCKET_NO_CONFIG=1`. For `scan`, a Python `http.server` answering `POST /patch/batch` with `{"packages":[],"canAccessPaidPatches":false}` stands in for the patch API (`--proxy-url`, `NO_PROXY=127.0.0.1`). The entries of 2026-11-26 have the others: a refused token (06:55Z), how to hold `apply.lock` (08:56Z), one offered patch (14:55Z), one server for all three modes (16:55Z).
+- Read a posted body back: a permalink can come back wrapped in backticks, so cite a path and line numbers instead (#2287).
+- Run the built binary over small broken projects and compare the commands. Set `SOCKET_TELEMETRY_DISABLED=1 SOCKET_NO_CONFIG=1`. For a patch API use the bench: `socket-patch-bench serve <pm>/hosted --bin <cli> --scale 0.02 --work-dir <dir>` builds a hosted project for any of 20 package managers, serves all three hosts and prints the command with its env (runner: the 18:55Z entry). Outside registries are refused, so an undo fails except for Hatch, Maven and Gradle; nothing vendored is served. The 06:55Z, 08:56Z and 14:55Z entries have a refused token, a held `apply.lock` and a one-patch stand-in.
 - A throwaway probe test that prints a function's return for the lead's input settles it in one rebuild. For a test that can't fail, mutate one production line and keep the diff for the PR body (#2267).
-- The owner was notified on 2026-11-26 at 05:15Z that three PRs wait for review, at 09:12Z of #2277, at 15:14Z of #2286 and at 17:08Z of #2287. Don't notify again for the waiting PRs alone.
+- The owner was notified on 2026-11-26 at 05:15Z that three PRs wait for review, at 09:12Z of #2277, at 15:14Z of #2286 and at 17:08Z of #2287. Don't notify again for the waiting PRs alone, or for more sites of a filed issue.
 - Run `/code-review high` until a pass finds no real defect (#2261 took three), and the `cli` suite after touching any test file (it holds ratchets over `tests/`).
 - Most fixes and most open `agent/*` PRs edit `CLI_CONTRACT.md`. #2261 went ahead beside #2258 (hunks 100 lines apart).
 - `main` requires every review thread resolved: an open one blocks an approved PR with auto-merge armed, and nothing says so. Answer and resolve threads first. A push does not dismiss approvals.
@@ -86,7 +84,7 @@ Issues looked at:
 - Root-sandbox failures that pass in CI: the chmod tests in `tests/repair` (2) and `in_process_redirect` (3), core `copy_tree` with a symlinked root, `vlt_heal` with an unremovable lock, and the `pypi_poetry`/`pypi_requirements` wire-failure tests.
 - To find unordered output, run one command six times over one fixture and count the distinct stdout hashes (#1836).
 - To make a stat fail as root, use a symlink to itself (`ELOOP`); chmod doesn't stop root.
-- To test the prune GC over a real revert without a toolchain, hand-build a ledger entry as `apply_gc_reports_drift_kept_vendored_entry` in `scan/gc.rs` does. A vendored Go module needs no Go: the entry of 2026-11-26 06:55Z lists the files.
+- A prune GC test over a real revert needs no toolchain: hand-build a ledger entry as `apply_gc_reports_drift_kept_vendored_entry` (`scan/gc.rs`) does. The 06:55Z entry of 2026-11-26 lists the files of a vendored Go module.
 - An agent-mode fixture needs no server: the entry of 2026-11-26 12:55Z has a script that writes one and a matrix runner.
-- To find a leak, plant a token wherever a package manager writes a URL, run every mode and grep (#2287). A hand-built venv needs `include-system-site-packages = false`.
+- To find a leak, plant a token wherever a package manager writes a URL, run every mode and every undo, and grep (#2287). A hand-built venv needs `include-system-site-packages = false`.
 - A script named after a tool, first on `PATH`, is a failing (`exit 1`) or hanging (`exec sleep 600`) probe. The entry of 2026-11-26 14:55Z has the fixture for a patched global copy.
