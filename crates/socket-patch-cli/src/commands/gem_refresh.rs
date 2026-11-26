@@ -2393,11 +2393,13 @@ mod tests {
                       x86_64-linux/3.3.0/json-1.0.0, but the installed extension is /p/ruby/\
                       3.2.0/extensions/x86_64-linux/3.2.0/json-1.0.0 (another Ruby's))";
         let policy = policy(tmp.path(), true, false, false);
+        // The command quotes a path as `shell_word` does (a Windows path
+        // holds `\`); the warning's detail below lists the paths as they are.
         let command = format!(
             "`rm -rf {} {} {} && bundle install`",
-            dir.display(),
-            spec.display(),
-            cache.display()
+            shell_word(&dir),
+            shell_word(&spec),
+            shell_word(&cache)
         );
 
         let pass = failed_for(&gem, reason);
@@ -2473,7 +2475,7 @@ mod tests {
         assert!(
             bullet.contains(&format!(
                 "racc 1.0.0. Run `rm -rf {} && bundle install`",
-                dir.display()
+                shell_word(&dir)
             )),
             "{bullet}"
         );
