@@ -49,6 +49,8 @@ pub fn rewrite_bun_binary(content: &[u8], overrides: &[DepOverride], result: &mu
             Err(_) => unreachable!("validated lock"),
         };
         let mut skipped: Vec<RewriteWarning> = Vec::new();
+        // The user-tarball records, for [`super::BunPatchShapedPin`].
+        let mut shaped: Vec<(String, RewriteWarning)> = Vec::new();
         let attempt = (|| {
             let mut edits = Vec::new();
             let packages = candidate.packages()?;
@@ -74,7 +76,7 @@ pub fn rewrite_bun_binary(content: &[u8], overrides: &[DepOverride], result: &mu
                     && !matching.iter().any(|m| m.id == p.id)
                     && user_tarball_version(&name, &p.resolution) == Some(dep.version.as_str())
             }) {
-                skipped.push(RewriteWarning {
+                let warning = RewriteWarning {
                     code: "redirect_bun_non_registry_entry_skipped".into(),
                     detail: format!(
                         "bun.lockb package #{} installs {name}@{} from a URL or local tarball, \
@@ -83,7 +85,9 @@ pub fn rewrite_bun_binary(content: &[u8], overrides: &[DepOverride], result: &mu
                          release to patch it",
                         p.id, dep.version,
                     ),
-                });
+                };
+                shaped.push((p.resolution.clone(), warning.clone()));
+                skipped.push(warning);
             }
             if matching.is_empty() && !skipped.is_empty() {
                 return Ok((Vec::new(), false));
@@ -135,6 +139,9 @@ pub fn rewrite_bun_binary(content: &[u8], overrides: &[DepOverride], result: &mu
         })();
         if !skipped.is_empty() {
             result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+        }
+        for (url, warning) in &shaped {
+            super::BunPatchShapedPin::record("bun.lockb", url, dep, warning, result);
         }
         result.warnings.append(&mut skipped);
         match attempt {
@@ -285,6 +292,77 @@ mod tests {
                     && !p.resolution.contains("patch.example.test")),
                 "{shape}: the tarball record keeps its resolution: {rewired:?}"
             );
+        }
+    }
+
+    /// #2279: the rewriter knows no host but the one it writes, so a record
+    /// an earlier run pinned on another host for the SAME patch (the patch
+    /// server, in a run that moves pins onto a patch mirror) is left as any
+    /// user tarball is, with the same warning. It is also recorded with
+    /// that warning, so that a caller that knows the run's patch servers
+    /// can say what is true of it. A pin of another patch in the same
+    /// shape is not recorded.
+    #[test]
+    fn a_pin_of_the_same_patch_on_another_host_is_recorded() {
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let on = |base: &str, uuid: &str| DepOverride {
+            patch_uuid: uuid.into(),
+            artifact_url: format!(
+                "{base}/patch/npm/minimist/1.2.2/22222222-2222-4222-8222-222222222222/{uuid}/\
+                 minimist-1.2.2.tgz"
+            ),
+            ..dep("1.2.2")
+        };
+        let direct = on("https://patch.socket.dev", uuid);
+        let mut first = RewriteResult::default();
+        rewrite_bun_binary(FIXTURE, std::slice::from_ref(&direct), &mut first);
+        assert!(first.confirmed_bun_binary_uuids.contains(uuid));
+        assert!(first.bun_patch_shaped_pins.is_empty());
+        let pinned = first.binary_files["bun.lockb"].clone();
+
+        let mirror = "https://repo.example/artifactory/socket-patch";
+        for (patch, recorded) in [
+            (uuid, true),
+            ("99999999-9999-4999-8999-999999999999", false),
+        ] {
+            let mut moved = RewriteResult::default();
+            rewrite_bun_binary(&pinned, &[on(mirror, patch)], &mut moved);
+            assert!(moved.edits.is_empty(), "{patch}: {:?}", moved.edits);
+            assert!(moved.binary_files.is_empty(), "{patch}");
+            assert!(moved.confirmed_bun_binary_uuids.is_empty(), "{patch}");
+            let codes: Vec<_> = moved.warnings.iter().map(|w| w.code.as_str()).collect();
+            assert_eq!(
+                codes,
+                ["redirect_bun_non_registry_entry_skipped"],
+                "{patch}: {:?}",
+                moved.warnings
+            );
+            assert!(moved.bundled_skipped_uuids.contains(patch), "{patch}");
+            let pins: Vec<_> = moved
+                .bun_patch_shaped_pins
+                .iter()
+                .map(|pin| {
+                    (
+                        pin.patch_uuid.as_str(),
+                        pin.file.as_str(),
+                        pin.url.as_str(),
+                        &pin.warning,
+                    )
+                })
+                .collect();
+            if recorded {
+                assert_eq!(
+                    pins,
+                    [(
+                        uuid,
+                        "bun.lockb",
+                        direct.artifact_url.as_str(),
+                        &moved.warnings[0]
+                    )]
+                );
+            } else {
+                assert!(pins.is_empty(), "{patch}: {pins:?}");
+            }
         }
     }
 
