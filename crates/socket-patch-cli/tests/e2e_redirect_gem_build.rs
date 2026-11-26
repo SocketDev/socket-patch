@@ -83,15 +83,15 @@
 //! real binary: byte-idempotent under the same grant, in-place URL refresh
 //! (the Gemfile option + the converged lock's remote) under a rotated one.
 //!
-//! MANIFEST-LESS VEX (every installing arm, `manifestless_vex_matrix`): on
-//! the fresh checkout the real bundler installed — hosted never writes a
-//! `.socket/manifest.json` nor a ledger — `vex` attests `(redirected)` from
-//! the lockfile wiring + the patch API (and so does the embedded
-//! `apply --vex`); `--offline` is `record_unavailable` with zero requests;
-//! the pair reverted to its registry version names the patch nowhere, even
-//! under `--no-verify`. The main arm also proves the lock-only revert
-//! (the Gemfile's option kept) re-converges on the next unfrozen install,
-//! and on the next hosted scan.
+//! MANIFEST-LESS VEX (every arm that installs a gem locked as its ruby
+//! gem, `manifestless_vex_matrix`): on the fresh checkout the real bundler
+//! installed — hosted never writes a `.socket/manifest.json` nor a ledger
+//! — `vex` attests `(redirected)` from the lockfile wiring + the patch API
+//! (and so does the embedded `apply --vex`); `--offline` is
+//! `record_unavailable` with zero requests; the pair reverted to its
+//! registry version names the patch nowhere, even under `--no-verify`. The
+//! main arm also proves the lock-only revert (the Gemfile's option kept)
+//! re-converges on the next unfrozen install, and on the next hosted scan.
 //!
 //! PLATFORM GEMS (the cases at the end of the file, on a lock the real
 //! bundler wrote for a gem published as precompiled platform gems): the
@@ -106,7 +106,9 @@
 //! patched (this machine in either role), none patched or one still being
 //! made (nothing moves, quietly), a newer snapshot, `bundle lock
 //! --add-platform` over a hosted lock, and a refresh whose download the
-//! registry redirects.
+//! registry redirects. Where every locked build is patched, VEX over the
+//! fresh checkout the real bundler installed names each build under its own
+//! patch (`platform_vex_matrix`).
 //!
 //! VERSION MATRIX: the arms run on bundler 1.17 → 4.x (the CHECKSUMS arm
 //! from 2.6, the CHECKSUMS-era floor; every other arm from 1.17). Pick the
@@ -126,6 +128,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
+use common::envelope::{event_triples, warning_codes};
 use common::{binary, hermetic, hermetic_command};
 
 use std::io::Write as _;
@@ -2079,8 +2082,7 @@ async fn view_requests(fx: &RedirectFixture) -> usize {
 ///      offline.
 async fn manifestless_vex_matrix(fx: &RedirectFixture, fresh: &Path) {
     use vex_e2e_common::{
-        assert_absent, assert_attested, assert_not_attested, run_vex, strip_manifest, Marker,
-        VexVia,
+        assert_attested, assert_not_attested, run_vex, strip_manifest, Marker, VexVia,
     };
     let bin = binary();
     let lock = std::fs::read_to_string(fresh.join(fx.lock_name)).unwrap();
@@ -2127,15 +2129,24 @@ async fn manifestless_vex_matrix(fx: &RedirectFixture, fresh: &Path) {
     assert_not_attested(&out.envelope, PURL, "record_unavailable");
     assert_eq!(request_count(fx).await, before, "--offline made requests");
 
-    // 3. reverted to the registry pair (the patched install kept): no lock
-    //    names the patch, and hosted mode keeps no ledger to remember it.
+    // 3. reverted to the registry pair (the patched install kept).
+    assert_reverted_pair_names_no_patch(fx, fresh);
+}
+
+/// `fresh` with its manifest pair put back on the registry version, the
+/// installed tree kept: no lock names the patch and hosted mode keeps no
+/// ledger to remember it, so `vex` has nothing to attest
+/// (`manifest_not_found`), with and without `--no-verify`, online and
+/// offline.
+fn assert_reverted_pair_names_no_patch(fx: &RedirectFixture, fresh: &Path) {
+    use vex_e2e_common::{assert_absent, run_vex};
     std::fs::write(fresh.join(fx.gemfile_name), &fx.pristine_gemfile).unwrap();
     std::fs::write(fresh.join(fx.lock_name), &fx.pristine_lock).unwrap();
     for (offline, no_verify) in [(false, false), (false, true), (true, false), (true, true)] {
         let mut run = vex_run(fx);
         run.offline = offline;
         run.no_verify = no_verify;
-        let out = run_vex(&bin, fresh, &run);
+        let out = run_vex(&binary(), fresh, &run);
         let cell = format!("reverted offline={offline} no_verify={no_verify}");
         assert_eq!(out.code, Some(2), "{cell}: {out}");
         assert_eq!(
@@ -7304,6 +7315,8 @@ struct PlatformProject {
     foreign: String,
     /// The lock has a `CHECKSUMS` section.
     checksums: bool,
+    /// The lock names the ruby-platform gem beside the platform builds.
+    ruby_entry: bool,
 }
 
 impl PlatformProject {
@@ -7474,6 +7487,7 @@ impl PlatformProject {
             own,
             foreign,
             checksums,
+            ruby_entry,
         };
         assert_eq!(
             std::fs::read_to_string(project.installed_lib(&project.fx.proj))
@@ -7972,14 +7986,6 @@ fn hosted_events(env: &serde_json::Value) -> Vec<serde_json::Value> {
     events
 }
 
-/// The warning codes of a run, in envelope order.
-fn warning_codes(env: &serde_json::Value) -> Vec<String> {
-    let warnings = env["warnings"].as_array().into_iter().flatten();
-    warnings
-        .map(|w| w["code"].as_str().unwrap_or_default().to_string())
-        .collect()
-}
-
 /// The event of a patched build: `applied`, under the build's own patch,
 /// with `newlyPatched` when the run put the build in place.
 fn patched_event(platform: &str, newly: bool) -> serde_json::Value {
@@ -8025,6 +8031,237 @@ fn by_platform(mut events: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     events
 }
 
+/// What one statement of a VEX document says of the fixture gem: its
+/// status, the packages of the project it is about, the products it names
+/// beside the project, and its impact statement (`not_affected`) or action
+/// statement (`affected`).
+#[derive(Debug, PartialEq)]
+struct Said {
+    status: &'static str,
+    packages: Vec<String>,
+    products: Vec<String>,
+    words: String,
+}
+
+/// Every statement of `doc`, each about the one vulnerability of the gem
+/// patch's record ([`VULNS`]) in the project [`PRODUCT`].
+fn said(doc: &serde_json::Value) -> Vec<Said> {
+    let ids = |list: &serde_json::Value| -> Vec<String> {
+        let items = list.as_array().into_iter().flatten();
+        items
+            .filter_map(|item| item["@id"].as_str().map(str::to_string))
+            .collect()
+    };
+    let (vulnerability, aliases) = VULNS[0];
+    let statements = doc["statements"].as_array().expect("statements");
+    statements
+        .iter()
+        .map(|st| {
+            assert_eq!(st["vulnerability"]["name"], vulnerability, "{st}");
+            assert_eq!(
+                st["vulnerability"]["aliases"],
+                serde_json::json!(aliases),
+                "{st}"
+            );
+            assert_eq!(st["products"][0]["@id"], PRODUCT, "{st}");
+            let (status, words) = match st["status"].as_str() {
+                Some("not_affected") => {
+                    assert_eq!(
+                        st["justification"], "inline_mitigations_already_exist",
+                        "{st}"
+                    );
+                    ("not_affected", &st["impact_statement"])
+                }
+                Some("affected") => ("affected", &st["action_statement"]),
+                other => panic!("unexpected status {other:?}: {st}"),
+            };
+            Said {
+                status,
+                packages: ids(&st["products"][0]["subcomponents"]),
+                products: ids(&st["products"])[1..].to_vec(),
+                words: words.as_str().unwrap_or_default().to_string(),
+            }
+        })
+        .collect()
+}
+
+/// What a document says of the gem where the lock names the platform
+/// builds `locked`, each as the registry has it and at least one patched,
+/// and with `ruby_entry` the ruby-platform gem beside them. ONE
+/// `not_affected` statement names every patched build, each under its own
+/// patch, and the ruby-platform gem under the gem's. Its products are the
+/// forms a scanner reports a platform gem under, and the gem without a
+/// platform only when no locked build is on upstream's gem: a scanner that
+/// drops the platform matches every build by that form. Each build on
+/// upstream's gem has an `affected` statement of its own.
+fn build_statements(locked: &[(&str, Has)], ruby_entry: bool) -> Vec<Said> {
+    let having = |has: Has| -> Vec<&str> {
+        let builds = locked.iter().filter(|(_, how)| *how == has);
+        let mut platforms: Vec<&str> = builds.map(|(platform, _)| *platform).collect();
+        platforms.sort();
+        platforms
+    };
+    let (patched, upstream) = (having(Has::Patched), having(Has::Upstream));
+    // The form Grype and Syft report a platform gem under.
+    let grype_form = |platform: &&str| format!("{PURL}-{platform}");
+    let purl = |platform: &&str| platform_purl(platform);
+    let gem = |named: bool| named.then(|| PURL.to_string());
+    let mut patches: Vec<String> = patched
+        .iter()
+        .map(|platform| build_uuid(platform))
+        .collect();
+    patches.extend(ruby_entry.then(|| UUID.to_string()));
+    patches.sort();
+    let parts: Vec<String> = patches
+        .iter()
+        .map(|patch| format!("Patched via Socket patch {patch} (redirected)"))
+        .collect();
+    let mut statements = vec![Said {
+        status: "not_affected",
+        packages: gem(ruby_entry)
+            .into_iter()
+            .chain(patched.iter().map(purl))
+            .collect(),
+        products: gem(upstream.is_empty())
+            .into_iter()
+            .chain(patched.iter().map(grype_form))
+            .chain(patched.iter().map(purl))
+            .collect(),
+        words: parts.join("; "),
+    }];
+    statements.extend(upstream.iter().map(|platform| Said {
+        status: "affected",
+        packages: vec![purl(platform)],
+        products: vec![grype_form(platform), purl(platform)],
+        words: format!(
+            "The patch registry has no patched build of this gem for {platform} yet and serves \
+             upstream's own gem for it, so an install on that platform is without Socket patch \
+             {UUID}. Run `socket-patch scan --mode hosted` again later: the lockfile takes the \
+             patched build once it is published."
+        ),
+    }));
+    statements
+}
+
+/// Manifest-less VEX over a fresh checkout the REAL bundler installed
+/// (`fresh`) of a gem locked as the platform builds `locked`, each as the
+/// registry has it ([`manifestless_vex_matrix`] is this for a gem locked as
+/// its ruby gem alone, which is one pin under the gem's patch):
+///
+///   1. no `.socket/manifest.json` and no ledger: `vex` names each locked
+///      build ([`build_statements`]) and exits 0, a build on upstream's gem
+///      included. It asks for the gem patch's record and ONE package
+///      reference, the gem patch's, whose list says which sha256 is a
+///      patched build's; where the lock has no `CHECKSUMS` to say which
+///      sha256 it installs, also for the index of the lock's registry. It
+///      asks nothing else, and nothing of the upstream file host. The
+///      embedded `apply --vex` writes the same statements from the same
+///      requests;
+///   2. `--offline`: no local record, so nothing is attested
+///      (`record_unavailable`, no document), with ZERO requests;
+///   3. the pair reverted to its registry version names the patch nowhere
+///      ([`assert_reverted_pair_names_no_patch`]).
+async fn platform_vex_matrix(p: &PlatformProject, fresh: &Path, locked: &[(&str, Has)]) {
+    use vex_e2e_common::{assert_omitted, run_vex, strip_manifest, VexVia};
+    let bin = binary();
+    let lock = std::fs::read_to_string(fresh.join("Gemfile.lock")).unwrap();
+    assert!(
+        lock.contains(&format!("remote: {}", p.fx.index_url)),
+        "the installed checkout's lock must name the patch registry (bundler {}):\n{lock}",
+        p.fx.bundler.version
+    );
+    assert_no_redirect_ledger(fresh);
+    strip_manifest(fresh);
+    let statements = build_statements(locked, p.ruby_entry);
+    let attested = &statements[0].packages;
+    let affected: Vec<&String> = statements[1..]
+        .iter()
+        .flat_map(|said| &said.packages)
+        .collect();
+    let mut asked = vec![
+        format!("/v0/orgs/{ORG}/patches/view/{UUID}"),
+        format!("/v0/orgs/{ORG}/patches/package"),
+    ];
+    if !p.checksums {
+        asked.push(format!("{}info/{DEP}", &p.fx.index_url[p.api().len()..]));
+    }
+
+    // 1. manifest-less, ledger-less: the lock, the patch API, and the
+    //    lock's registry where the lock has no `CHECKSUMS`.
+    for via in [VexVia::Vex, VexVia::Apply] {
+        let mark = p.mark().await;
+        let out = run_vex(&bin, fresh, &vex_run(&p.fx).via(via));
+        assert_eq!(
+            out.code,
+            Some(0),
+            "{via:?}: {out}\n--- Gemfile.lock\n{lock}"
+        );
+        assert_eq!(said(out.doc()), statements, "{via:?}: {out}");
+        let env = &out.envelope;
+        if via == VexVia::Vex {
+            assert_eq!(env["status"], "success", "{out}");
+            let verified = attested.iter().map(|purl| (purl.as_str(), "verified", ""));
+            let kept = affected
+                .iter()
+                .map(|purl| (purl.as_str(), "skipped", "gem_upstream_build_kept"));
+            let events: Vec<(String, String, String)> = verified
+                .chain(kept)
+                .map(|(purl, action, code)| (purl.into(), action.into(), code.into()))
+                .collect();
+            assert_eq!(event_triples(env), events, "{out}");
+            assert_eq!(
+                (&env["summary"]["verified"], &env["summary"]["skipped"]),
+                (&serde_json::json!(attested.len()), &serde_json::json!(0)),
+                "a build on upstream's gem is counted nowhere: {out}"
+            );
+            assert_eq!(warning_codes(env), Vec::<String>::new(), "{out}");
+        } else {
+            assert_eq!(env["status"], "noManifest", "{out}");
+            assert_eq!(env["vex"]["statements"], statements.len(), "{out}");
+            assert_eq!(
+                env["vex"]["affected"].as_u64().unwrap_or(0),
+                affected.len() as u64,
+                "{out}"
+            );
+        }
+        assert_eq!(
+            request_paths(&p.fx._server, mark.0).await,
+            asked,
+            "{via:?}: the record, one reference and, without CHECKSUMS, the registry's index"
+        );
+        assert_eq!(
+            p.references_since(mark).await,
+            [[UUID]],
+            "{via:?}: the reference of the gem's own patch, with the list of its builds"
+        );
+        assert_eq!(
+            request_paths(&p.files, mark.1).await,
+            Vec::<String>::new(),
+            "{via:?}: nothing of the upstream file host"
+        );
+    }
+    assert!(
+        !fresh.join(".socket/manifest.json").exists(),
+        "vex / apply --vex must never write the manifest"
+    );
+
+    // 2. offline: no local record to build a statement from, no network.
+    let mark = p.mark().await;
+    let mut offline = vex_run(&p.fx);
+    offline.offline = true;
+    let out = run_vex(&bin, fresh, &offline);
+    assert_omitted(&out, PURL, "record_unavailable", "offline vex");
+    assert_eq!(
+        event_triples(&out.envelope).len(),
+        1,
+        "the gem's one pin is left out, and no build is reported beside it: {out}"
+    );
+    assert_eq!(p.mark().await, mark, "--offline made requests");
+
+    // 3. reverted to the registry pair (the install kept).
+    assert_reverted_pair_names_no_patch(&p.fx, fresh);
+}
+
 /// A gem bundler locks as precompiled platform builds, with a patched build
 /// for every platform the lock names, against the REAL bundler end to end:
 ///
@@ -8042,8 +8279,9 @@ fn by_platform(mut events: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
 ///      sets each entry to the sha256 the registry serves for it — the lock
 ///      the real `bundle lock` writes for that Gemfile, byte for byte. It
 ///      reports one `applied` event per locked build, each under that
-///      build's own patch, and replaces the platform copy bundler had
-///      installed with the patched platform gem;
+///      build's own patch, as its own `--vex` document does, and replaces
+///      the platform copy bundler had installed with the patched platform
+///      gem;
 ///   3. a fresh checkout's FROZEN `bundle install` fetches exactly this
 ///      machine's patched build from the patch registry (never the ruby
 ///      gem, so nothing is compiled), leaves the lock byte-identical, and
@@ -8052,8 +8290,8 @@ fn by_platform(mut events: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
 ///      search returns the platform gems' own patches beside the gem's;
 ///   5. `rollback` hands back the pre-scan pair byte for byte and puts the
 ///      installed copy back on the upstream platform gem;
-///   6. standalone `vex` attests the gem from the lock, hash-verified
-///      against the installed platform build.
+///   6. standalone `vex` over that fresh checkout attests each locked
+///      build under its own patch ([`platform_vex_matrix`]).
 ///
 /// With `takeover`, a vendored run takes the gem over before step 5, each
 /// platform's tree from that platform's own patch (asked for in one
@@ -8113,21 +8351,21 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
     // Nothing warns about platforms, and the platform copy bundler had
     // installed is the patched build now.
     let codes = warning_codes(&env);
-    let said = |code: &str| codes.iter().any(|said| said == code);
+    let warned = |code: &str| codes.iter().any(|warned| warned == code);
     for code in [
         "redirect_gem_platform_unsupported",
         "redirect_gem_stale_install",
         "redirect_gem_frozen_install",
     ] {
-        assert!(!said(code), "no {code}: {env}");
+        assert!(!warned(code), "no {code}: {env}");
     }
     assert_eq!(
-        said("redirect_gem_no_checksums_section"),
+        warned("redirect_gem_no_checksums_section"),
         !checksums_lock,
         "{env}"
     );
     assert!(
-        said("redirect_gem_install_refreshed"),
+        warned("redirect_gem_install_refreshed"),
         "the warm platform install is refreshed: {env}"
     );
     assert_eq!(
@@ -8136,6 +8374,12 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
         "the installed platform copy holds the patched file"
     );
     assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
+    let in_run = vex_e2e_common::read_doc(&p.fx.proj.join("out.vex.json"));
+    assert_eq!(
+        said(&in_run.expect("the run's document")),
+        build_statements(&every, ruby_entry),
+        "the run's own document names each locked build under its own patch"
+    );
     let asked = p.references_since(scanned).await;
     assert!(
         !asked.is_empty() && asked.iter().all(|uuids| uuids == &[UUID]),
@@ -8306,7 +8550,7 @@ async fn platform_prebuilds_install_frozen_and_roll_back(
     }
 
     // 6. Standalone VEX over the fresh checkout bundler installed.
-    manifestless_vex_matrix(&p.fx, &fresh).await;
+    platform_vex_matrix(&p, &fresh, &every).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
