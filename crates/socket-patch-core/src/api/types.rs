@@ -330,6 +330,13 @@ pub struct PackageVendorResult {
     /// other shape reads as no address.
     #[serde(default)]
     pub npm_registry_url: Option<String>,
+    /// For the patch of one platform gem: the UUID of the patch it was
+    /// built from, the patch of the gem itself. A hosted or a vendored run
+    /// patches a gem through that patch, so `get` takes it for a platform
+    /// gem's patch named by its UUID. Absent or null for every other
+    /// patch; any other shape reads as none ([`lenient`]).
+    #[serde(default, deserialize_with = "lenient")]
+    pub rebuilt_from_uuid: Option<String>,
 }
 
 /// One served artifact: the native tarball (`kind: "tarball"`), or a
@@ -616,6 +623,40 @@ mod tests {
                 ("gem-stub-gemspec", Some("sha512-stub")),
             ]
         );
+    }
+
+    /// The reference of a platform gem's patch names the patch it was
+    /// built from (`rebuiltFromUuid`). A reference without the field, with
+    /// a null, or with a value that is no string names none, and still
+    /// reads: the field never fails the response it is part of.
+    #[test]
+    fn package_vendor_result_reads_the_patch_a_platform_gems_patch_was_built_from() {
+        let read = |built_from: Option<serde_json::Value>| {
+            let mut json = serde_json::json!({
+                "status": "granted",
+                "purl": "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu",
+            });
+            if let Some(built_from) = built_from {
+                json["rebuiltFromUuid"] = built_from;
+            }
+            let result: PackageVendorResult = serde_json::from_value(json).unwrap();
+            assert_eq!(result.status, "granted");
+            result.rebuilt_from_uuid
+        };
+        let gem_patch = "7b1e4f3a-2c5d-4e6f-8a9b-0c1d2e3f4a5b";
+        assert_eq!(
+            read(Some(serde_json::json!(gem_patch))).as_deref(),
+            Some(gem_patch)
+        );
+        assert_eq!(read(None), None);
+        for unreadable in [
+            serde_json::Value::Null,
+            serde_json::json!(7),
+            serde_json::json!({ "uuid": gem_patch }),
+            serde_json::json!([gem_patch]),
+        ] {
+            assert_eq!(read(Some(unreadable.clone())), None, "{unreadable}");
+        }
     }
 
     #[test]
