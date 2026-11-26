@@ -2867,7 +2867,8 @@ fn platform_purl(platform: &str) -> String {
 /// (`registryOverride.identifiers.gemBuilds`): the ruby gem, each platform
 /// of `patched` with the patch of its patched build ([`build_uuid`]), and
 /// each of `upstream` with none (the registry hands on upstream's own gem
-/// for it). Each of those patches serves that platform's gem (`tarball`)
+/// for it); a platform in neither is one whose patched build is still being
+/// made. Each of those patches serves that platform's gem (`tarball`)
 /// and stub gemspec, and one request answers for every uuid it names. The
 /// URLs name the production host, so the run reaches them only through
 /// `--patch-server-url`.
@@ -3104,9 +3105,10 @@ fn per_platform_gem(
 ///      publishes it as platform gems only, and locks this machine's
 ///      platform and two foreign ones;
 ///   2. while one locked platform has no patched build (the service lists
-///      upstream's own gem for it) the gem is not vendored: the run exits
-///      0, says so in ONE line that names the platform, asks for the gem
-///      patch's reference alone, downloads no gem and writes nothing;
+///      upstream's own gem for it, or does not list it yet) the gem is not
+///      vendored: the run exits 0, says so in ONE line that names the
+///      platform, asks for the gem patch's reference alone, downloads no
+///      gem and writes nothing;
 ///   3. with a patched build of every platform, `vendor` asks for the gem
 ///      patch's reference and then for the platform patches in ONE
 ///      request, unpacks one tree per platform from that platform's own
@@ -3273,9 +3275,10 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
 
     // 2. One locked platform has no patched build yet: the gem is not
     //    vendored, in one line, the run does not fail, no gem is
-    //    downloaded and nothing is written.
+    //    downloaded and nothing is written. The same whether the service
+    //    lists upstream's own gem for that platform or, while its build is
+    //    being made, does not list it at all.
     let (with_build, without_build) = platforms.split_at(2);
-    let partial = platform_patch_service(&fixture, &purl, UUID, with_build, without_build).await;
     let mut have = with_build.to_vec();
     have.sort();
     let not_vendored = format!(
@@ -3284,56 +3287,58 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
          others now.",
         without_build[0], have[0], have[1]
     );
-    let (code, stdout, stderr) = vendor(&partial);
-    assert_eq!(
-        code, 0,
-        "a platform with no patched build is no failure.\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    let env = parse_json_envelope(&stdout);
-    assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(env["summary"]["applied"], 0, "nothing vendored: {env}");
-    assert_eq!(env["summary"]["failed"], 0, "and nothing failed: {env}");
-    assert_eq!(env["summary"]["skipped"], 1, "one counted skip: {env}");
-    let skipped = env["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["errorCode"] == "vendor_prebuilt_platform_pending")
-        .unwrap_or_else(|| panic!("a vendor_prebuilt_platform_pending event: {env}"));
-    assert_eq!(skipped["action"], "skipped", "{skipped}");
-    assert_eq!(skipped["reason"], not_vendored.as_str(), "{skipped}");
-    assert_eq!(
-        artifact_downloads(&partial).await,
-        Vec::<String>::new(),
-        "the package reference says what is built: nothing is downloaded"
-    );
-    assert_eq!(
-        reference_requests(&partial).await,
-        [[UUID]],
-        "the reference of the gem's own patch, and nothing else"
-    );
-    assert_eq!(std::fs::read(&gemfile_path).unwrap(), gemfile_before);
-    assert_eq!(std::fs::read(&lock_path).unwrap(), lock_before);
-    assert!(!proj.join(".socket/vendor").exists(), "nothing is written");
-    // For a person: that one line, and no warning. (The other line of
-    // stderr is the note that this run names no API token.)
-    let (code, stdout, stderr) = vendor_in(&unvendored, &partial, false);
-    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    let said: Vec<&str> = stderr
-        .lines()
-        .filter(|line| !line.contains("SOCKET_API_TOKEN"))
-        .collect();
-    assert_eq!(
-        said,
-        [not_vendored.as_str()],
-        "one line on stderr:\n{stderr}"
-    );
-    assert!(
-        stdout.contains("Vendored 0 packages; 1 skipped."),
-        "{stdout}"
-    );
-    assert!(!unvendored.join(".socket/vendor").exists());
-    drop(partial);
+    for listed in [without_build, &[]] {
+        let partial = platform_patch_service(&fixture, &purl, UUID, with_build, listed).await;
+        let (code, stdout, stderr) = vendor(&partial);
+        assert_eq!(
+            code, 0,
+            "a platform with no patched build is no failure.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let env = parse_json_envelope(&stdout);
+        assert_eq!(env["status"], "success", "envelope: {env}");
+        assert_eq!(env["summary"]["applied"], 0, "nothing vendored: {env}");
+        assert_eq!(env["summary"]["failed"], 0, "and nothing failed: {env}");
+        assert_eq!(env["summary"]["skipped"], 1, "one counted skip: {env}");
+        let skipped = env["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["errorCode"] == "vendor_prebuilt_platform_pending")
+            .unwrap_or_else(|| panic!("a vendor_prebuilt_platform_pending event: {env}"));
+        assert_eq!(skipped["action"], "skipped", "{skipped}");
+        assert_eq!(skipped["reason"], not_vendored.as_str(), "{skipped}");
+        assert_eq!(
+            artifact_downloads(&partial).await,
+            Vec::<String>::new(),
+            "the package reference says what is built: nothing is downloaded"
+        );
+        assert_eq!(
+            reference_requests(&partial).await,
+            [[UUID]],
+            "the reference of the gem's own patch, and nothing else"
+        );
+        assert_eq!(std::fs::read(&gemfile_path).unwrap(), gemfile_before);
+        assert_eq!(std::fs::read(&lock_path).unwrap(), lock_before);
+        assert!(!proj.join(".socket/vendor").exists(), "nothing is written");
+        // For a person: that one line, and no warning. (The other line of
+        // stderr is the note that this run names no API token.)
+        let (code, stdout, stderr) = vendor_in(&unvendored, &partial, false);
+        assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+        let said: Vec<&str> = stderr
+            .lines()
+            .filter(|line| !line.contains("SOCKET_API_TOKEN"))
+            .collect();
+        assert_eq!(
+            said,
+            [not_vendored.as_str()],
+            "one line on stderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("Vendored 0 packages; 1 skipped."),
+            "{stdout}"
+        );
+        assert!(!unvendored.join(".socket/vendor").exists());
+    }
 
     // 3. A patched build of every platform: vendor.
     let server = platform_patch_service(&fixture, &purl, UUID, &platforms, &[]).await;
