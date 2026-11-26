@@ -727,13 +727,13 @@ async fn a_patch_with_no_list_leaves_the_gem_alone_with_a_warning() {
     );
 }
 
-/// A locked platform the list leaves out is one whose patched build is
-/// still being made: a machine of that platform would be sent to a
-/// registry with no gem for it, so the gem is left as it is, with no
-/// warning and one plain line, and a later run over a list that has the
-/// platform moves it.
+/// A locked platform the list leaves out: a machine of that platform
+/// would be sent to a registry with no gem for it, so the gem is left as
+/// it is, with no warning and one plain line that says only that the
+/// registry does not list the platform. A later run over a list that has
+/// the platform moves it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_platform_missing_from_the_list_is_waited_for_quietly() {
+async fn a_platform_missing_from_the_list_leaves_the_gem_as_it_is_quietly() {
     let linux_only: [Listed; 1] = [(LINUX, LINUX_PATCHED, Some(LINUX_UUID))];
     let server = MockServer::start().await;
     mount_api(&server, Some((&linux_only[..], 4))).await;
@@ -743,16 +743,15 @@ async fn a_platform_missing_from_the_list_is_waited_for_quietly() {
     assert_eq!(read(proj.path(), "Gemfile.lock"), lock(true));
     assert_eq!(read(proj.path(), "Gemfile"), GEMFILE);
     assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
-    let waiting = format!(
-        "{DEP} {DEP_VERSION}: the patch registry does not list {ARM} yet (a patched build is \
-         still being made); left as it is until it does"
+    let unlisted = format!(
+        "{DEP} {DEP_VERSION}: the patch registry does not list {ARM}, so the gem is left as it is"
     );
     assert_eq!(
         hosted_events(&env),
         [json!({
             "action": "skipped", "purl": PURL, "uuid": UUID,
-            "errorCode": "redirect_gem_build_pending",
-            "reason": waiting,
+            "errorCode": "redirect_gem_platform_unlisted",
+            "reason": unlisted,
             "details": { "mode": "hosted" },
         })],
         "{env}"
@@ -761,10 +760,10 @@ async fn a_platform_missing_from_the_list_is_waited_for_quietly() {
 
     let (code, stdout, stderr) = hosted(proj.path(), &server.uri(), &["scan"], &[]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
-    assert!(stdout.contains(&waiting), "{stdout}");
+    assert!(stdout.contains(&format!("\n{unlisted}\n")), "{stdout}");
     assert!(!stderr.contains("Warning"), "{stderr}");
 
-    // The build is there: the list names the platform, and the gem moves.
+    // The list names the platform: the gem moves.
     let later = MockServer::start().await;
     mount_api(&later, Some((&ONE_PATCHED[..], 5))).await;
     let (code, env) = scan_json(proj.path(), &later.uri(), &[]);

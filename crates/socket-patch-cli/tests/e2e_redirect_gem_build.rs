@@ -103,8 +103,8 @@
 //! to the upstream registry's file (here a second wiremock). The cases:
 //! every locked build patched (with and without `CHECKSUMS`, with the ruby
 //! entry beside the builds, and taken over by a vendored run), one build
-//! patched (this machine in either role), none patched or one still being
-//! made (nothing moves, quietly), a newer snapshot, `bundle lock
+//! patched (this machine in either role), none patched or one missing
+//! from the list (nothing moves, quietly), a newer snapshot, `bundle lock
 //! --add-platform` over a hosted lock, and a refresh whose download the
 //! registry redirects. VEX names each locked build (`platform_vex_matrix`,
 //! over the fresh checkout the real bundler installed): a patched build
@@ -8948,8 +8948,9 @@ async fn gem_hosted_vex_tells_the_builds_of_a_lock_without_checksums_apart_by_it
 ///   1. no locked build has a patched build: exit 0, both files
 ///      byte-identical, no warning, one skipped event, one plain line;
 ///   2. this machine's platform has one, and the other is missing from the
-///      list (its patched build is still being made): the same, under its
-///      own code and line;
+///      list (the service leaves a platform out while its patched build is
+///      being made): the same, under its own code and a line that says only
+///      that the registry does not list the platform;
 ///   3. the list has it: the run moves the gem, and a fresh checkout
 ///      installs the patched gem frozen.
 #[tokio::test(flavor = "multi_thread")]
@@ -8985,14 +8986,14 @@ async fn gem_hosted_platform_gem_waits_quietly_for_its_patched_builds() {
     ];
     p.serve(Some(&building)).await;
     p.assert_left_alone(
-        "redirect_gem_build_pending",
+        "redirect_gem_platform_unlisted",
         &format!(
-            "{DEP} {DEP_VERSION}: the patch registry does not list {foreign} yet (a patched build \
-             is still being made); left as it is until it does"
+            "{DEP} {DEP_VERSION}: the patch registry does not list {foreign}, so the gem is left \
+             as it is"
         ),
     );
 
-    // 3. The build is there.
+    // 3. The list names every locked platform.
     let every = [
         (own.as_str(), Has::Patched),
         (foreign.as_str(), Has::Patched),

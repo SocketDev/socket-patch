@@ -3815,24 +3815,25 @@ async fn gem_hosted_scan_pins_platform_builds_from_the_lock_alone() {
             );
         } else {
             assert_eq!(hosted_pinned(&env), 0, "{env}");
-            // A platform the list leaves out is still being built: the
-            // gem waits for a later run, and nothing is warned about.
+            // A platform the list leaves out: the gem is left as it is,
+            // and nothing is warned about.
             assert!(skipped.is_empty(), "{env}");
-            let waiting: Vec<&str> = env["events"]
+            let unlisted: Vec<&str> = env["events"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|event| event["errorCode"] == "redirect_gem_build_pending")
+                .filter(|event| event["errorCode"] == "redirect_gem_platform_unlisted")
                 .filter_map(|event| event["reason"].as_str())
                 .collect();
-            let [detail] = waiting.as_slice() else {
+            let [detail] = unlisted.as_slice() else {
                 panic!("one quiet skip: {env}");
             };
-            assert!(
-                detail.contains(&format!(
-                    "the patch registry does not list {OTHER_PLATFORM} yet"
-                )),
-                "{detail}"
+            assert_eq!(
+                *detail,
+                format!(
+                    "{DEP} {DEP_VERSION}: the patch registry does not list {OTHER_PLATFORM}, so \
+                     the gem is left as it is"
+                )
             );
             assert_eq!(after, lock, "the lock is untouched");
             assert_eq!(
@@ -3945,7 +3946,10 @@ async fn refused_platform_gem_is_counted_as_left_to_patch() {
         // patch registry does not serve.
         let (refusal, said) = match mode {
             "hosted" => (
-                format!("the patch registry does not list {OTHER_PLATFORM} yet"),
+                format!(
+                    "{DEP} {DEP_VERSION}: the patch registry does not list {OTHER_PLATFORM}, so \
+                     the gem is left as it is"
+                ),
                 &stdout,
             ),
             _ => (
