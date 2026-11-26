@@ -18776,6 +18776,77 @@ mod tests {
         }
     }
 
+    /// #2279: a hosted pin of the SAME patch that an earlier run wrote on
+    /// another host (the patch server, in a run that moves pins onto a
+    /// patch mirror) is not a user's tarball: that copy is patched. It is
+    /// left as it is, without the UNPATCHED warning and without keeping
+    /// the uuid out of the in-run VEX; with nothing to rewire, the run
+    /// says so. A pin of another patch in the same shape is still a copy
+    /// this patch does not reach.
+    #[test]
+    fn bun_lock_pin_of_the_same_patch_on_another_host_is_not_a_user_tarball() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let token = "22222222-2222-4222-8222-222222222222";
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let served = |uuid: &str| format!("patch/npm/is-number/6.0.0/{token}/{uuid}/is-number-6.0.0.tgz");
+        let ovr = npm_override(
+            "is-number",
+            "6.0.0",
+            &format!("https://repo.example/artifactory/socket-patch/{}", served(uuid)),
+            &sha512,
+        );
+        assert_eq!(ovr.patch_uuid, uuid);
+        let direct = format!(
+            "\"is-number\": [\"is-number@https://patch.socket.dev/{}\", {{}}, \"{sha512}\"],",
+            served(uuid)
+        );
+        let nested = "\"is-odd/is-number\": [\"is-number@6.0.0\", \"\", {}, \"sha512-UP==\"],";
+
+        // The direct pin alone: nothing is rewired, and nothing is called
+        // unpatched.
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), bun_lock_file(&direct, 2));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_bun_entry_not_found"],
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.bundled_skipped_uuids.is_empty());
+
+        // Beside a registry copy: that copy is pinned, the direct pin stays.
+        let both = format!("{direct}\n    {nested}");
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), bun_lock_file(&both, 2));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        assert_eq!(r.edits[0].key.as_deref(), Some("is-odd/is-number"));
+        assert!(r.files["bun.lock"].contains(&direct), "the direct pin is untouched");
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.bundled_skipped_uuids.is_empty());
+
+        // The same shape for ANOTHER patch is not this patch's copy.
+        let other = format!(
+            "\"is-number\": [\"is-number@https://patch.socket.dev/{}\", {{}}, \"{sha512}\"],",
+            served("99999999-9999-4999-8999-999999999999")
+        );
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), bun_lock_file(&other, 2));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_bun_non_registry_entry_skipped"],
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.bundled_skipped_uuids.contains(uuid));
+    }
+
     /// #580: the bundled check runs only for entries whose spec matches the
     /// patch. A bundled copy of ANOTHER package (or another version) beside
     /// the target never warns or keeps the patch out of VEX, while a bundled

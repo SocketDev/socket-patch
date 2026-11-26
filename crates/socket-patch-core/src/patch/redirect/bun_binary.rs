@@ -288,6 +288,54 @@ mod tests {
         }
     }
 
+    /// #2279: a record an earlier run pinned on another host for the SAME
+    /// patch (the patch server, in a run that moves pins onto a patch
+    /// mirror) holds the patched copy. It is no user tarball: the record is
+    /// left as it is with no UNPATCHED warning, the uuid stays out of the
+    /// skipped set, and with nothing to rewire the run says so. A pin of
+    /// another patch in the same shape is still reported.
+    #[test]
+    fn a_pin_of_the_same_patch_on_another_host_is_not_a_user_tarball() {
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let served = |uuid: &str| {
+            format!(
+                "patch/npm/minimist/1.2.2/22222222-2222-4222-8222-222222222222/{uuid}/\
+                 minimist-1.2.2.tgz"
+            )
+        };
+        let on = |base: &str, uuid: &str| DepOverride {
+            patch_uuid: uuid.into(),
+            artifact_url: format!("{base}/{}", served(uuid)),
+            ..dep("1.2.2")
+        };
+        let mut direct = RewriteResult::default();
+        rewrite_bun_binary(FIXTURE, &[on("https://patch.socket.dev", uuid)], &mut direct);
+        assert!(direct.confirmed_bun_binary_uuids.contains(uuid));
+        let pinned = direct.binary_files["bun.lockb"].clone();
+
+        let mirror = "https://repo.example/artifactory/socket-patch";
+        let mut moved = RewriteResult::default();
+        rewrite_bun_binary(&pinned, &[on(mirror, uuid)], &mut moved);
+        assert!(moved.edits.is_empty(), "{:?}", moved.edits);
+        assert!(moved.binary_files.is_empty());
+        assert!(moved.confirmed_bun_binary_uuids.is_empty());
+        let codes: Vec<_> = moved.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(codes, ["redirect_bun_entry_not_found"], "{:?}", moved.warnings);
+        assert!(moved.bundled_skipped_uuids.is_empty());
+
+        let other = "99999999-9999-4999-8999-999999999999";
+        let mut unrelated = RewriteResult::default();
+        rewrite_bun_binary(&pinned, &[on(mirror, other)], &mut unrelated);
+        let codes: Vec<_> = unrelated.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            ["redirect_bun_non_registry_entry_skipped"],
+            "{:?}",
+            unrelated.warnings
+        );
+        assert!(unrelated.bundled_skipped_uuids.contains(other));
+    }
+
     #[test]
     fn malformed_metahash_cannot_confirm_an_existing_binary_redirect() {
         let mut result = RewriteResult::default();

@@ -44,28 +44,38 @@ const MIRROR_PREFIX: &str = "/artifactory/socket-patch";
 struct Pkg {
     name: &'static str,
     uuid: &'static str,
+    version: &'static str,
 }
 
 const FIRST: Pkg = Pkg {
     name: "mirror-fixture",
     uuid: "11111111-1111-4111-8111-111111111111",
+    version: VERSION,
 };
 const SECOND: Pkg = Pkg {
     name: "other-fixture",
     uuid: "33333333-3333-4333-8333-333333333333",
+    version: VERSION,
+};
+/// The registry package the Bun fixture locks
+/// (`socket-patch-core/tests/fixtures/bun-lockb/1.4.2`).
+const BUN: Pkg = Pkg {
+    name: "is-number",
+    uuid: "44444444-4444-4444-8444-444444444444",
+    version: "7.0.0",
 };
 
 impl Pkg {
     fn purl(&self) -> String {
-        format!("pkg:npm/{}@{VERSION}", self.name)
+        format!("pkg:npm/{}@{}", self.name, self.version)
     }
 
     /// The path the patch server serves the patched tarball at, and so the
     /// path under the mirror's base.
     fn served_path(&self) -> String {
         format!(
-            "/patch/npm/{0}/{VERSION}/{TOKEN}/{1}/{0}-{VERSION}.tgz",
-            self.name, self.uuid
+            "/patch/npm/{0}/{2}/{TOKEN}/{1}/{0}-{2}.tgz",
+            self.name, self.uuid, self.version
         )
     }
 
@@ -78,7 +88,10 @@ impl Pkg {
         for (name, body) in [
             (
                 "package/package.json",
-                format!(r#"{{"name":"{}","version":"{VERSION}"}}"#, self.name),
+                format!(
+                    r#"{{"name":"{}","version":"{}"}}"#,
+                    self.name, self.version
+                ),
             ),
             (
                 "package/index.js",
@@ -444,6 +457,106 @@ async fn a_run_pins_the_mirror_and_a_run_without_it_leaves_the_pin_alone() {
         bare.stdout
     );
     assert_eq!(lock(tmp.path()), pinned, "the mirrored pin is untouched");
+}
+
+/// A Bun project that locks [`BUN`] from the registry, in a text `bun.lock`
+/// or a binary `bun.lockb`.
+fn write_bun_project(root: &Path, lock: &str) {
+    std::fs::write(
+        root.join("package.json"),
+        include_bytes!("../../socket-patch-core/tests/fixtures/bun-lockb/1.4.2/package.json"),
+    )
+    .unwrap();
+    if lock == "bun.lockb" {
+        std::fs::write(
+            root.join(lock),
+            include_bytes!("../../socket-patch-core/tests/fixtures/bun-lockb/1.4.2/bun.lockb"),
+        )
+        .unwrap();
+        return;
+    }
+    std::fs::write(
+        root.join(lock),
+        format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n    \
+             \"{0}\": [\"{0}@{1}\", \"\", {{}}, \"sha512-UPSTREAMupstream==\"],\n  \
+             }}\n}}\n",
+            BUN.name, BUN.version
+        ),
+    )
+    .unwrap();
+}
+
+/// #2279: a Bun project an earlier run pinned directly on the patch server,
+/// in a run given a mirror. Neither Bun rewriter moves that pin in place,
+/// so it is left as it is and the run says which file holds it, on which
+/// host, and how to get it onto the mirror; for `bun.lockb`, whose pin
+/// `rollback` refuses, not by way of `rollback`. The pinned copy is the
+/// patched one: nothing calls it a user's tarball or unpatched.
+#[tokio::test]
+#[serial]
+async fn a_bun_pin_on_the_patch_server_is_named_and_not_called_unpatched() {
+    for lock in ["bun.lock", "bun.lockb"] {
+        let api = MockServer::start().await;
+        mock_socket(&api, &[BUN]).await;
+        let mirror = MockServer::start().await;
+        mirror_answers(&mirror, BUN, 200).await;
+        let base = mirror_base(&mirror);
+        let tmp = tempfile::tempdir().unwrap();
+        write_bun_project(tmp.path(), lock);
+        let holds = |needle: &str| {
+            let bytes = std::fs::read(tmp.path().join(lock)).unwrap();
+            bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+        };
+
+        let direct = hosted_scan(tmp.path(), &api, &[], &[]);
+        assert_eq!(event(&direct.json(), BUN), applied(), "{lock}: {}", direct.stdout);
+        let served = format!("{}{}", api.uri(), BUN.served_path());
+        assert!(holds(&served), "{lock}: the first run pins the patch server");
+        let pinned = std::fs::read(tmp.path().join(lock)).unwrap();
+
+        let moved = hosted_scan(tmp.path(), &api, &["--patch-mirror-url", &base], &[]);
+        let env = moved.json();
+        assert_eq!(event(&env, BUN), skipped("redirect_unconfirmed"), "{lock}: {env:#}");
+        let codes = warning_codes(&env);
+        assert!(
+            codes.contains(&"redirect_mirror_pin_not_moved".to_string()),
+            "{lock}: {env:#}"
+        );
+        assert!(
+            !codes.contains(&"redirect_bun_non_registry_entry_skipped".to_string())
+                && !moved.stdout.contains("UNPATCHED"),
+            "{lock}: the earlier pin is the patched copy, not a user's tarball: {env:#}"
+        );
+        let host = api.uri().trim_start_matches("http://").to_string();
+        let not_moved = env["warnings"]
+            .as_array()
+            .and_then(|warnings| {
+                warnings
+                    .iter()
+                    .find(|w| w["code"] == "redirect_mirror_pin_not_moved")
+            })
+            .map(|w| w.to_string())
+            .unwrap_or_default();
+        assert!(
+            not_moved.contains(lock) && not_moved.contains(&host) && not_moved.contains(&base),
+            "{lock}: the warning names the file, the host and the mirror: {not_moved}"
+        );
+        // `rollback` restores a bun.lock pin and refuses a bun.lockb one.
+        assert_eq!(
+            not_moved.contains("socket-patch rollback"),
+            lock == "bun.lock",
+            "{lock}: {not_moved}"
+        );
+        if lock == "bun.lockb" {
+            assert!(not_moved.contains("version control"), "{not_moved}");
+        }
+        assert_eq!(
+            std::fs::read(tmp.path().join(lock)).unwrap(),
+            pinned,
+            "{lock}: the pin is left as it is"
+        );
+    }
 }
 
 /// What the run needs for itself it downloads from the patch server, not
