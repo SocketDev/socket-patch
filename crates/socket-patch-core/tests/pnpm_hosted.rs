@@ -138,19 +138,31 @@ fn lock_with_dependency(resolution: &str, leaf: &str) -> String {
 #[test]
 fn a_package_with_a_local_dependency_is_not_taken_off_the_registry() {
     const UPSTREAM: &str = "{integrity: sha512-UPSTREAM==}";
-    for local in [
-        "file:.socket/vendor/npm/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/leaf-1.0.0.tgz",
-        "'file:.socket/vendor/npm/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/leaf-1.0.0.tgz'",
-        "link:../leaf",
+    // With `lockfileIncludeTarballUrl`, a registry entry names its tarball.
+    const UPSTREAM_URL: &str = "{integrity: sha512-UPSTREAM==, tarball: https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz}";
+    for (local, upstream) in [
+        (
+            "file:.socket/vendor/npm/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/leaf-1.0.0.tgz",
+            UPSTREAM,
+        ),
+        (
+            "'file:.socket/vendor/npm/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/leaf-1.0.0.tgz'",
+            UPSTREAM,
+        ),
+        ("file:../leaf", UPSTREAM),
+        (
+            "file:.socket/vendor/npm/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/leaf-1.0.0.tgz",
+            UPSTREAM_URL,
+        ),
     ] {
         let files = BTreeMap::from([
             (
                 "pnpm-lock.yaml".to_string(),
-                lock_with_dependency(UPSTREAM, local),
+                lock_with_dependency(upstream, local),
             ),
             (
                 "common/config/rush/pnpm-lock.yaml".to_string(),
-                lock_with_dependency(UPSTREAM, "1.0.0"),
+                lock_with_dependency(upstream, "1.0.0"),
             ),
         ]);
         let result = rewrite_registry_redirect(&files, &[dep("left-pad")]);
@@ -179,8 +191,9 @@ fn a_package_with_a_local_dependency_is_not_taken_off_the_registry() {
 }
 
 /// The refusal is for the package the pin moves, and only when the pin
-/// moves it: a registry dependency, another package's local dependency and
-/// a package that already names a tarball are all pinned as before.
+/// makes a hosted package of it: a registry dependency, a peer a workspace
+/// project satisfies (`link:`), another package's local dependency and a
+/// package an earlier patch already pins are all pinned as before.
 #[test]
 fn the_local_dependency_refusal_is_scoped_to_the_new_pin() {
     const LOCAL: &str =
@@ -195,11 +208,15 @@ fn the_local_dependency_refusal_is_scoped_to_the_new_pin() {
             "a registry dependency",
             lock_with_dependency("{integrity: sha512-UPSTREAM==}", "1.0.0"),
         ),
+        (
+            "a workspace peer",
+            lock_with_dependency("{integrity: sha512-UPSTREAM==}", "link:packages/leaf"),
+        ),
         ("another package's local dependency", other_has_it),
         (
-            "a package that already names a tarball",
+            "a package an earlier patch pins",
             lock_with_dependency(
-                "{integrity: sha512-STALE==, tarball: https://patch.example/stale/left-pad-1.3.0.tgz}",
+                "{integrity: sha512-STALE==, tarball: https://patch.example/patch/npm/left-pad/1.3.0/9ee29ee2-9ee2-49ee-829e-e29ee29ee29e/cccccccc-cccc-4ccc-8ccc-cccccccccccc/left-pad-1.3.0.tgz}",
                 LOCAL,
             ),
         ),

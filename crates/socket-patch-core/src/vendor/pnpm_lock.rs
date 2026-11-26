@@ -905,7 +905,7 @@ fn preflight_package(
             if let Err(detail) = check_rewritable_refs_with(lines, name, version, lines.index()) {
                 return Err(Box::new(refused("vendor_lock_entry_unsupported", detail)));
             }
-            if let Err(detail) = check_remote_dependents(lines, name, version, lines.index()) {
+            if let Err(detail) = check_hosted_dependents(lines, name, version, lines.index()) {
                 return Err(Box::new(refused("vendor_lock_entry_unsupported", detail)));
             }
         }
@@ -2060,55 +2060,81 @@ fn check_rewritable_refs_with(
     Ok(())
 }
 
-/// Pre-flight guard for the dependents of `name@version` that pnpm fetches
-/// from a tarball URL (#2263).
+/// Pre-flight guard for the dependents of `name@version` that a hosted
+/// patch pins (#2263).
 ///
 /// Vendoring rewrites every dependent's `name: version` snapshot ref to the
 /// `file:` tarball. pnpm 12.23 refuses a lock in which a package that is
 /// not local depends on a local file, unless it can tie the workspace
 /// override to that package (`ERR_PNPM_LOCAL_SUBDEP_NOT_ALLOWED`). It does
 /// so for a package resolved from the default registry by its integrity
-/// alone. It does not for a registry package whose resolution names a
-/// tarball URL, which is what a hosted patch leaves (its pin, or the named
-/// registry of its route): every install of the vendored project would
-/// then fail, frozen or not. Verified against pnpm 12.23.0; the hosted
-/// planner refuses the same pair from its side
+/// alone. It does not for one a hosted patch pins (the tarball of its pin,
+/// or of the named registry of its route): every install of the vendored
+/// project would then fail, frozen or not. Verified against pnpm 12.23.0;
+/// the hosted planner refuses the same pair from its side
 /// (`formats::pnpm::hosted::plan_hosted`).
 ///
-/// A dependent that is local itself (a `file:` key, a vendored package
-/// among them) is exempt, as pnpm exempts it.
-fn check_remote_dependents(
+/// Only a hosted pin is in the way: a tarball in a Socket patch server's
+/// path shape ([`crate::origin::hosted_shape_uuid`], on any origin, since
+/// the gate is not handed the run's origins). A dependent that is local
+/// itself (a `file:` key, a vendored package among them) is exempt, as
+/// pnpm exempts it, and one whose resolution names any other tarball is
+/// left as it was before this gate.
+///
+/// A hosted → vendored takeover reads this gate on the still-hosted lock
+/// ([`super::pnpm_takeover_lock_text_refusals`]), so the dependency of a
+/// package the same run takes over waits for the next run; the eject
+/// restores every pin first.
+pub(super) fn check_hosted_dependents(
     lines: &[String],
     name: &str,
     version: &str,
     index: Option<&LockIndex>,
 ) -> Result<(), String> {
-    // Off the memoized split there is no index to hand in: build one.
-    let built;
-    let index = match index {
-        Some(index) => index,
+    // The snapshot blocks whose body holds a `name: version` ref.
+    let is_ref = |line: &String| {
+        parse_key_line(line, 6)
+            .is_some_and(|(dep, _, rest)| dep == name && unquote_value(rest) == version)
+    };
+    let dependents: Vec<String> = match index {
+        Some(index) => index
+            .snapshot_dep_lines
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|&&(line, _)| is_ref(&lines[line]))
+            .map(|&(_, block)| index.snapshots.blocks[block].key.clone())
+            .collect(),
+        None => section_bounds(lines, "snapshots")
+            .into_iter()
+            .flat_map(|(start, end)| {
+                std::iter::successors(next_block(lines, start + 1, end), move |b| {
+                    next_block(lines, b.end, end)
+                })
+            })
+            .filter(|block| lines[block.header + 1..block.end].iter().any(is_ref))
+            .map(|block| block.key)
+            .collect(),
+    };
+    if dependents.is_empty() {
+        return Ok(());
+    }
+    // The `packages:` block of a key: `(header, end)`.
+    let package_block = |key: &str| match index {
+        Some(index) => {
+            let block = &index.packages.blocks[*index.packages.by_key.get(key)?.first()?];
+            Some((block.header, block.end))
+        }
         None => {
-            built = LockIndex::build(lines);
-            &built
+            let (start, end) = section_bounds(lines, "packages")?;
+            std::iter::successors(next_block(lines, start + 1, end), |b| {
+                next_block(lines, b.end, end)
+            })
+            .find(|block| block.key == key)
+            .map(|block| (block.header, block.end))
         }
     };
-    // The snapshot blocks whose body holds a `name: version` ref.
-    let dependents = index
-        .snapshot_dep_lines
-        .get(name)
-        .into_iter()
-        .flatten()
-        .filter(|&&(line, _)| {
-            parse_key_line(&lines[line], 6)
-                .is_some_and(|(_, _, rest)| unquote_value(rest) == version)
-        })
-        .map(|&(_, block)| index.snapshots.blocks[block].key.as_str());
-    // The `packages:` block of a key: `(header, end)`.
-    let package_block = |key: &str| {
-        let block = &index.packages.blocks[*index.packages.by_key.get(key)?.first()?];
-        Some((block.header, block.end))
-    };
-    for dependent in dependents {
+    for dependent in &dependents {
         let key = crate::formats::pnpm::strip_pnpm_peer_suffix(dependent);
         let crate::formats::pnpm::PnpmKey::Registry {
             name: by,
@@ -2120,14 +2146,14 @@ fn check_remote_dependents(
         let Some((header, end)) = package_block(key) else {
             continue;
         };
-        let remote = crate::formats::pnpm::fragment_resolution(&lines[header..end])
+        let hosted = crate::formats::pnpm::fragment_resolution(&lines[header..end])
             .and_then(|(_, tarball)| tarball)
-            .is_some_and(|tarball| !tarball.starts_with("file:"));
-        if remote {
+            .is_some_and(|tarball| crate::origin::hosted_shape_uuid(&tarball).is_some());
+        if hosted {
             return Err(format!(
-                "{PNPM_LOCK} installs {by}@{by_version} from a tarball URL (`{key}`), as a \
-                 hosted patch pins it, and it depends on {name}@{version}. pnpm 12.23 and \
-                 newer refuse a lock in which such a package depends on a local file \
+                "{PNPM_LOCK} installs {by}@{by_version} from a hosted patch (`{key}`) and it \
+                 depends on {name}@{version}. pnpm 12.23 and newer refuse a lock in which \
+                 such a package depends on a local file \
                  (ERR_PNPM_LOCAL_SUBDEP_NOT_ALLOWED), so vendoring {name}@{version} would \
                  break every install. Patch {name}@{version} in hosted mode as well, or \
                  vendor {by}@{by_version} first and run this again (`socket-patch vendor` \
@@ -10009,15 +10035,17 @@ snapshots:
         assert!(check_rewritable_refs(&lines, name, "1.0.0").is_ok());
     }
 
-    /// pnpm 12.23 refuses a lock in which a package fetched from a tarball
-    /// URL depends on a local file (#2263): vendoring `leaf@1.0.0` under a
-    /// dependent a hosted patch pinned (by its tarball, or through the
-    /// named registry of its route) is refused, by the scan and by the
-    /// index alike. A dependent on the default registry, a local one and
-    /// one of another `leaf` release are not in the way.
+    /// pnpm 12.23 refuses a lock in which a package a hosted patch pins
+    /// depends on a local file (#2263): vendoring `leaf@1.0.0` under such a
+    /// dependent (pinned by its tarball, or through the named registry of
+    /// its route) is refused, by the scan and by the index alike. A
+    /// dependent on the default registry (with or without its tarball URL
+    /// in the lock), a local one and one of another `leaf` release are not
+    /// in the way.
     #[test]
-    fn remote_dependents_refuse_fail_closed() {
-        const HOSTED: &str = "https://patch.socket.dev/patch/npm/mid/1.0.0/t/u/mid-1.0.0.tgz";
+    fn hosted_dependents_refuse_vendoring_their_dependency() {
+        const HOSTED: &str = "https://patch.socket.dev/patch/npm/mid/1.0.0/\
+             9ee29ee2-9ee2-49ee-829e-e29ee29ee29e/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/mid-1.0.0.tgz";
         const LOCAL: &str =
             "file:.socket/vendor/npm/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/mid-1.0.0.tgz";
         let lock = |key: &str, resolution: &str, snapshot: &str, leaf: &str| {
@@ -10032,8 +10060,8 @@ snapshots:
         let check = |text: &str| {
             let lines = split_lines(text);
             let index = LockIndex::build(&lines);
-            let scan = check_remote_dependents(&lines, "leaf", "1.0.0", None);
-            let indexed = check_remote_dependents(&lines, "leaf", "1.0.0", Some(&index));
+            let scan = check_hosted_dependents(&lines, "leaf", "1.0.0", None);
+            let indexed = check_hosted_dependents(&lines, "leaf", "1.0.0", Some(&index));
             assert_eq!(scan, indexed, "the index answers as the scan:\n{text}");
             scan
         };
@@ -10052,7 +10080,7 @@ snapshots:
             let key = key.trim_matches('\'');
             let named = key.replace("socket-bbbbbbbb:", "");
             assert!(
-                err.contains(&format!("installs {named} from a tarball URL (`{key}`)"))
+                err.contains(&format!("installs {named} from a hosted patch (`{key}`)"))
                     && err.contains("depends on leaf@1.0.0")
                     && err.contains("ERR_PNPM_LOCAL_SUBDEP_NOT_ALLOWED")
                     && !err.contains(HOSTED),
@@ -10065,6 +10093,15 @@ snapshots:
                 lock(
                     "mid@1.0.0",
                     "{integrity: sha512-MID==}",
+                    "mid@1.0.0",
+                    "1.0.0",
+                ),
+            ),
+            (
+                "a registry dependent whose tarball URL the lock records",
+                lock(
+                    "mid@1.0.0",
+                    "{integrity: sha512-MID==, tarball: https://registry.npmjs.org/mid/-/mid-1.0.0.tgz}",
                     "mid@1.0.0",
                     "1.0.0",
                 ),

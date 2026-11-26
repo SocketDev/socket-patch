@@ -1043,8 +1043,14 @@ pub async fn lock_text_refusals(
 ///
 /// Evaluating the gates on the still-hosted lock is exact for pnpm: the
 /// hosted restore only splices each entry's `resolution:` value, which no
-/// pnpm gate reads (coordinates, CRLF, catalogs, overrides, entry presence
-/// and ref rewritability all key on other text). The one difference is a
+/// pnpm gate reads of the candidate itself (coordinates, CRLF, catalogs,
+/// overrides, entry presence and ref rewritability all key on other text).
+/// One gate reads the resolution of the candidate's DEPENDENTS
+/// (`pnpm_lock::check_hosted_dependents`, #2263): a dependent that is
+/// itself a candidate of this takeover is still hosted in this text, so
+/// its dependency is refused for this run and vendored by the next, once
+/// the dependent is. That holds whatever order the run takes them in; the
+/// eject restores every pin before it asks. The one other difference is a
 /// `pnpm-workspace.yaml` scaffold hosted mode created, which the restore
 /// deletes; a gate that depended on it would make this under-predict, and
 /// the wet run still refuses.

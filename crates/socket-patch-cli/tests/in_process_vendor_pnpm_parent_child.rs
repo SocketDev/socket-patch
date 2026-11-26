@@ -565,7 +565,7 @@ async fn vendored_takeover_keeps_the_child_hosted_until_the_parent_is_vendored()
     assert_eq!(refusal["errorCode"], "vendor_lock_entry_unsupported");
     let detail = refusal["error"].as_str().unwrap();
     assert!(
-        detail.contains("installs debug@4.3.4 from a tarball URL")
+        detail.contains("installs debug@4.3.4 from a hosted patch")
             && detail.contains("ERR_PNPM_LOCAL_SUBDEP_NOT_ALLOWED"),
         "{detail}"
     );

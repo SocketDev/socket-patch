@@ -1164,10 +1164,12 @@ mod architecture_tests {
     const WRITERS: &[(&str, usize, &str)] = &[
         (
             "vendor/pnpm_lock.rs",
-            4,
+            5,
             "vendored planner (both dialects): the shared lookup and rekey \
              over line blocks (`lock_has_target_package`, `edit_packages`, \
-             `LockIndex`), keys read with `plan::match_key`; and the revert's \
+             `LockIndex`), keys read with `plan::match_key`; the ref gate's \
+             look at a dependent's block on the lines it gates, when they \
+             have no index (`check_hosted_dependents`); and the revert's \
              check, on the lines it is editing, that the registry entry is \
              back before references are pointed at it \
              (`restore_unrecorded_refs`)",
