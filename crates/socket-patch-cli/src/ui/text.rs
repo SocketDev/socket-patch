@@ -1,6 +1,6 @@
 //! Pure text helpers for human output: counted nouns, one-line
-//! truncation, sentence casing and the "Next steps:" block. No I/O, no
-//! terminal state.
+//! truncation, word wrap, sentence casing and the "Next steps:" block. No
+//! I/O, no terminal state.
 
 /// `plural(1, "package", "packages")` → `"1 package"`,
 /// `plural(2, "package", "packages")` → `"2 packages"` (and `0 packages`).
@@ -9,6 +9,89 @@ pub fn plural(n: usize, one: &str, many: &str) -> String {
 }
 
 const ELLIPSIS: &str = "...";
+
+/// Split `text` into wrap tokens at whitespace, except that a
+/// backtick-delimited code span (`` `pnpm install --trust-lockfile` ``)
+/// stays one token so a command the user copies is never broken across
+/// lines. An unclosed span falls back to plain whitespace splitting.
+pub(crate) fn wrap_tokens(text: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut span: Vec<&str> = Vec::new();
+    for word in text.split_whitespace() {
+        span.push(word);
+        let open = span.iter().map(|w| w.matches('`').count()).sum::<usize>() % 2 == 1;
+        if !open {
+            tokens.push(span.join(" "));
+            span.clear();
+        }
+    }
+    tokens.extend(span.into_iter().map(str::to_string));
+    tokens
+}
+
+/// Greedy word wrap to `width` columns (characters, not bytes). The first
+/// line starts with `first_prefix`, later lines with `indent`. A word
+/// longer than the line (a URL) gets a line of its own, never split; a
+/// backtick code span counts as one word (see [`wrap_tokens`]).
+pub(crate) fn wrap_words(
+    text: &str,
+    width: usize,
+    first_prefix: &str,
+    indent: &str,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = first_prefix.to_string();
+    let mut line_len = first_prefix.chars().count();
+    let mut empty = true;
+    for word in wrap_tokens(text) {
+        let word = word.as_str();
+        let wlen = word.chars().count();
+        if !empty && line_len + 1 + wlen > width {
+            lines.push(std::mem::replace(&mut line, indent.to_string()));
+            line_len = indent.chars().count();
+            empty = true;
+        }
+        if !empty {
+            line.push(' ');
+            line_len += 1;
+        }
+        line.push_str(word);
+        line_len += wlen;
+        empty = false;
+    }
+    lines.push(line);
+    lines
+}
+
+/// `line` as it prints for a person. With `width` (its stream is a
+/// terminal with a person at it) a line that does not fit breaks after a
+/// clause (`; `)
+/// under a two-space hanging indent, so no clause is cut in two unless it
+/// is itself wider than the terminal, where it wraps at a word. Without
+/// it the line is as it is, so a pipe or a log keeps one line.
+pub(crate) fn wrap_line(line: &str, width: Option<usize>) -> String {
+    const INDENT: &str = "  ";
+    let Some(width) = width else {
+        return line.to_string();
+    };
+    let mut rows: Vec<String> = Vec::new();
+    for clause in line.split_inclusive("; ") {
+        let clause = clause.trim_end();
+        let room = if rows.len() > 1 { INDENT.len() } else { 0 };
+        match rows.last_mut() {
+            Some(row) if room + row.chars().count() + 1 + clause.chars().count() <= width => {
+                row.push(' ');
+                row.push_str(clause);
+            }
+            _ => rows.push(clause.to_string()),
+        }
+    }
+    rows.iter()
+        .enumerate()
+        .flat_map(|(at, row)| wrap_words(row, width, if at == 0 { "" } else { INDENT }, INDENT))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// `text` as it may be printed: without its control characters. For
 /// text that came from a service or a project's files, which is shown
@@ -347,6 +430,62 @@ pub(crate) fn shell_word(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrap_words_respects_width_prefix_and_long_words() {
+        assert_eq!(
+            wrap_words("alpha beta gamma delta", 16, "W: ", "  "),
+            vec!["W: alpha beta", "  gamma delta"]
+        );
+        // A word wider than the line sits alone, unsplit.
+        let url = "https://patch.socket.dev/very/long/path/that/does/not/fit";
+        assert_eq!(
+            wrap_words(&format!("see {url} now"), 20, "", "  "),
+            vec!["see".to_string(), format!("  {url}"), "  now".to_string()]
+        );
+        assert_eq!(wrap_words("", 10, "W: ", "  "), vec!["W: "]);
+        // Counts characters, not bytes.
+        let lines = wrap_words("ééé ééé ééé", 8, "", "");
+        assert_eq!(lines, vec!["ééé ééé", "ééé"]);
+        for line in wrap_words(&"word ".repeat(50), 30, "Warning: ", "  ") {
+            assert!(line.chars().count() <= 30, "{line}");
+        }
+    }
+
+    #[test]
+    fn wrap_words_keeps_code_spans_whole() {
+        // The span crosses the wrap column: it moves to the next line whole.
+        assert_eq!(
+            wrap_words(
+                "never rebuild it (`pnpm clean --lockfile`), ever",
+                30,
+                "",
+                "  "
+            ),
+            vec!["never rebuild it", "  (`pnpm clean --lockfile`),", "  ever"]
+        );
+        // A span wider than the line gets a line of its own, unsplit.
+        assert_eq!(
+            wrap_words(
+                "use `pnpm install --frozen-lockfile --store-dir <dir>` now",
+                20,
+                "",
+                "  "
+            ),
+            vec![
+                "use",
+                "  `pnpm install --frozen-lockfile --store-dir <dir>`",
+                "  now"
+            ]
+        );
+        // Two spans in one word, and a word with a closed span, split normally.
+        assert_eq!(
+            wrap_tokens("a `b` c `d e`f g"),
+            vec!["a", "`b`", "c", "`d e`f", "g"]
+        );
+        // An unclosed span never swallows the rest of the text.
+        assert_eq!(wrap_tokens("a `b c d"), vec!["a", "`b", "c", "d"]);
+    }
 
     #[test]
     fn packages_of_one_ecosystem_are_named_without_it() {

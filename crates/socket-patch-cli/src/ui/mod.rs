@@ -32,7 +32,7 @@ pub(crate) use status::StatusLine;
 pub(crate) use text::{
     agent_next_steps, folded, manifest_error_message, next_steps, next_steps_installed,
     package_names, plural, printable, sentence_case, shell_word, short_uuid, sweep_failure,
-    truncate, worst_and_ids,
+    truncate, worst_and_ids, wrap_line, wrap_words,
 };
 
 /// [`text::no_patches_message`] for this run: the manifest path is named
