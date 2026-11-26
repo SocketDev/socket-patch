@@ -129,6 +129,20 @@ pub fn run(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32, S
 /// `TERM` is pinned: `console`/`dialoguer` derive key handling and
 /// rendering from it, and bare CI shells leave it unset or `dumb`.
 pub fn run_command(
+    cmd: portable_pty::CommandBuilder,
+    args: &[&str],
+    cwd: &Path,
+    env: &[(&str, &str)],
+    answers: &[&[u8]],
+    timeout: Duration,
+) -> PtyRun {
+    run_command_at(80, cmd, args, cwd, env, answers, timeout)
+}
+
+/// [`run_command`] on a PTY `cols` columns wide, for output that is
+/// fitted to the terminal's width.
+pub fn run_command_at(
+    cols: u16,
     mut cmd: portable_pty::CommandBuilder,
     args: &[&str],
     cwd: &Path,
@@ -139,7 +153,7 @@ pub fn run_command(
     let pair = portable_pty::native_pty_system()
         .openpty(portable_pty::PtySize {
             rows: 24,
-            cols: 80,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })
