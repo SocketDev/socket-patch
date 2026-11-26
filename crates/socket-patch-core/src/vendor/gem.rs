@@ -4036,7 +4036,7 @@ async fn revert_lock_record(
 /// True when the lock already holds the record's reverted state: no PATH
 /// section carries vendor's `remote:` line and every spec-block line of the
 /// pre-vendor original is present, but for the blocks of platforms bundler
-/// has since removed from the lock ([`platform_removed`]).
+/// has since removed from the lock ([`removed_platforms`]).
 fn lock_record_converged(text: &str, original_lines: &[String], new_lines: &[String]) -> bool {
     // A record whose `new` lost its `remote:` line is malformed, never
     // converged (the tampered-ledger matrix pins it as drift).
@@ -4058,46 +4058,90 @@ fn lock_record_converged(text: &str, original_lines: &[String], new_lines: &[Str
 /// The spec-block lines of a `gemfile_lock_spec` record's pre-vendor
 /// `original` that a revert restores to the lock `lines`: all of them, but
 /// for the blocks of platforms bundler has since removed from the lock
-/// ([`platform_removed`]). All of them as well when that would leave none:
-/// a lock that names no build of the gem is not one a removal made.
+/// ([`removed_platforms`]).
 fn locked_spec_block<'a>(lines: &[String], original_lines: &'a [String]) -> Vec<&'a String> {
-    let spec_block: Vec<&String> = original_lines
-        .iter()
-        .filter(|l| l.starts_with("    "))
-        .collect();
-    let mut locked = Vec::with_capacity(spec_block.len());
+    let removed = removed_platforms(lines, original_lines);
+    let mut locked = Vec::new();
     // Whether the block being read (an entry and its dependency lines) is
     // one of a platform the lock no longer holds.
-    let mut removed = false;
-    for &line in &spec_block {
+    let mut skip = false;
+    for line in original_lines.iter().filter(|l| l.starts_with("    ")) {
         if at_indent(line, 4).is_some() {
-            removed = spec_entry(line).is_some_and(|entry| platform_removed(lines, entry));
+            skip = spec_entry(line)
+                .is_some_and(|(name, token)| removed.iter().any(|(n, t)| n == name && t == token));
         }
-        if !removed {
+        if !skip {
             locked.push(line);
         }
     }
-    if locked.is_empty() {
-        spec_block
-    } else {
-        locked
-    }
+    locked
 }
 
-/// True when the lock `lines` hold nothing of the platform build `entry`
-/// (`(name, "<version>-<platform>")`) of a gem vendored as platform gems:
-/// no spec entry in any section, and no CHECKSUMS line. That is what
-/// `bundle lock --remove-platform` leaves of a platform (it drops the
-/// platform's spec and its CHECKSUMS line together, #2283), so a revert
-/// has nothing of that platform to put back. A lock that keeps either one
-/// is not that removal. Never true of a plain `name (version)` entry (a
-/// RubyGems version holds no `-`).
-fn platform_removed(lines: &[String], entry: (&str, &str)) -> bool {
-    entry.1.contains('-')
-        && !lines.iter().any(|l| spec_entry(l) == Some(entry))
-        && !section_span(lines, "CHECKSUMS").is_some_and(|(start, end)| {
-            (start + 1..end).any(|i| checksum_entry(&lines[i]) == Some(entry))
-        })
+/// The platform builds (`(name, "<version>-<platform>")`) of a gem
+/// vendored as platform gems that bundler has removed from the lock `lines`
+/// since: the entries of the `gemfile_lock_spec` record's pre-vendor
+/// `original_lines` the lock holds nothing of, neither a spec entry in any
+/// section nor a CHECKSUMS line. That is what `bundle lock
+/// --remove-platform` leaves of a platform (it drops the platform's spec
+/// and its CHECKSUMS line together, #2283), so a revert has nothing of that
+/// platform to put back.
+///
+/// Empty unless the lock is what such a removal leaves of the record:
+///
+/// * the record is of platform builds (a RubyGems version holds no `-`, so
+///   a plain `name (version)` entry is never one);
+/// * every spec entry and CHECKSUMS line of the gem in the lock is an entry
+///   the record names. Another build in their place (a platform respelled
+///   by a re-lock, a hand edit) or a line that names the gem and does not
+///   parse is not a removal, and the records are judged as they stand;
+/// * the lock still holds a spec entry of the record. A lock that names no
+///   build of it lost more than a platform.
+fn removed_platforms(lines: &[String], original_lines: &[String]) -> Vec<(String, String)> {
+    let recorded: Vec<(&str, &str)> = original_lines
+        .iter()
+        .filter_map(|l| spec_entry(l))
+        .collect();
+    let Some(&(name, _)) = recorded.first() else {
+        return Vec::new();
+    };
+    if recorded.iter().any(|(_, token)| !token.contains('-')) {
+        return Vec::new();
+    }
+    let names_gem = |entry: &str| {
+        entry
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with(" ("))
+    };
+    let checksums = section_span(lines, "CHECKSUMS");
+    let mut spec_held: Vec<(&str, &str)> = Vec::new();
+    let mut checksum_held: Vec<(&str, &str)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let in_checksums = checksums.is_some_and(|(start, end)| (start + 1..end).contains(&i));
+        let (entry, held) = if in_checksums {
+            (at_indent(line, 2), &mut checksum_held)
+        } else {
+            (at_indent(line, 4), &mut spec_held)
+        };
+        if !entry.is_some_and(names_gem) {
+            continue;
+        }
+        let parsed = match in_checksums {
+            true => checksum_entry(line),
+            false => spec_entry(line),
+        };
+        match parsed.filter(|entry| recorded.contains(entry)) {
+            Some(entry) => held.push(entry),
+            None => return Vec::new(),
+        }
+    }
+    if spec_held.is_empty() {
+        return Vec::new();
+    }
+    recorded
+        .into_iter()
+        .filter(|entry| !spec_held.contains(entry) && !checksum_held.contains(entry))
+        .map(|(name, token)| (name.to_string(), token.to_string()))
+        .collect()
 }
 
 fn wiring_string_array(v: Option<&Value>) -> Option<Vec<String>> {
@@ -4161,6 +4205,17 @@ async fn revert_lock_checksum_record(
         // checksum for the gem at all, so there is no line left to restore.
         return Ok(RecordRevert::Done);
     };
+    // The platforms bundler removed from the lock since, by the lock
+    // record's own reading of it (the checksum record holds only the lines
+    // vendor rewrote, not every build the lock held).
+    let removed = own
+        .entry
+        .wiring
+        .iter()
+        .find(|record| record.kind == LOCK_WIRING_KIND)
+        .and_then(|record| wiring_string_array(record.original.as_ref()))
+        .map(|original_lines| removed_platforms(&lines, &original_lines))
+        .unwrap_or_default();
     // Every pair is judged before the lock text is replaced, so one drifted
     // line leaves the others as found.
     let mut restored = false;
@@ -4174,7 +4229,9 @@ async fn revert_lock_checksum_record(
             // ALREADY CONVERGED: bundler removed the platform from the lock
             // (`bundle lock --remove-platform`), spec and CHECKSUMS line
             // together, and the lock record restores no spec of it (#2283).
-            if checksum_entry(written).is_some_and(|entry| platform_removed(&lines, entry)) {
+            if checksum_entry(written)
+                .is_some_and(|(name, token)| removed.iter().any(|(n, t)| n == name && t == token))
+            {
                 continue;
             }
             return Ok(RecordRevert::Drifted);
@@ -4203,7 +4260,7 @@ async fn revert_lock_checksum_record(
 /// Pure splice reversing [`edit_lock`]: drop the PATH section vendor emitted,
 /// move the spec block back into GEM/specs at its sorted position, and
 /// restore (or delete) the DEPENDENCIES entry. The block of a platform
-/// bundler has since removed from the lock stays out ([`platform_removed`]).
+/// bundler has since removed from the lock stays out ([`removed_platforms`]).
 /// All preconditions are checked BEFORE any mutation so drift never yields a
 /// half-restored lock; `None` means "drifted, leave the lock alone".
 fn revert_lock_text(text: &str, original_lines: &[String], new_lines: &[String]) -> Option<String> {
@@ -13361,8 +13418,10 @@ mod tests {
         /// Only the removal bundler makes counts as one. With the spec
         /// entry gone and the bare CHECKSUMS line vendor wrote still there,
         /// the platform is restored with the others. With a line vendor
-        /// did not write in its place the record has drifted, and neither
-        /// file is written.
+        /// did not write in its place, another build of the gem in its
+        /// place, no build of the gem left, or lines the entry grammar
+        /// does not read, the record has drifted and neither file is
+        /// written.
         #[tokio::test]
         async fn a_half_removed_platform_is_restored_or_drift() {
             let lock_before = lock(Some(&checksums(&sha('a'), &sha('b'))));
@@ -13378,21 +13437,41 @@ mod tests {
                 &format!("  nokogiri (1.18.10-x86_64-linux-gnu){}\n", sha('e')),
             );
             assert_ne!(other_line, spec_only);
-            tokio::fs::write(root.join(GEMFILE_LOCK), &other_line)
-                .await
-                .unwrap();
-            let outcome = revert_gem(&entry, &root, false).await;
-            assert!(
-                outcome
-                    .warnings
-                    .iter()
-                    .any(|w| w.code == "vendor_lock_entry_drifted"),
-                "{:?}",
-                outcome.warnings
+            // The platform respelled (a re-lock, a hand edit): another
+            // build of the gem stands in its place.
+            let respelled = wired.replace("1.18.10-x86_64-linux-gnu)", "1.18.10-x86_64-linux)");
+            // Every build gone, CHECKSUMS lines and all.
+            let none_left = without_linux(&wired)
+                .replace(
+                    "    nokogiri (1.18.10-arm64-darwin)\n      racc (~> 1.4)\n",
+                    "",
+                )
+                .replace("  nokogiri (1.18.10-arm64-darwin)\n", "");
+            assert!(!none_left.contains("nokogiri (1.18.10-"), "{none_left}");
+            // The platform's lines in a line ending of their own, which
+            // the entry grammar does not read.
+            let unparsed = wired.replace(
+                "1.18.10-x86_64-linux-gnu)\n",
+                "1.18.10-x86_64-linux-gnu)\r\n",
             );
-            assert_eq!(text(root.join(GEMFILE_LOCK)).await, other_line);
-            assert_eq!(text(root.join(GEMFILE)).await, gemfile);
-            assert!(root.join(rel(UUID)).is_dir(), "the copy is kept on drift");
+            for drifted in [other_line, respelled, none_left, unparsed] {
+                assert_ne!(drifted, wired);
+                tokio::fs::write(root.join(GEMFILE_LOCK), &drifted)
+                    .await
+                    .unwrap();
+                let outcome = revert_gem(&entry, &root, false).await;
+                assert!(
+                    outcome
+                        .warnings
+                        .iter()
+                        .any(|w| w.code == "vendor_lock_entry_drifted"),
+                    "{drifted}: {:?}",
+                    outcome.warnings
+                );
+                assert_eq!(text(root.join(GEMFILE_LOCK)).await, drifted);
+                assert_eq!(text(root.join(GEMFILE)).await, gemfile);
+                assert!(root.join(rel(UUID)).is_dir(), "the copy is kept on drift");
+            }
 
             assert_ne!(spec_only, wired);
             tokio::fs::write(root.join(GEMFILE_LOCK), &spec_only)
