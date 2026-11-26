@@ -1143,6 +1143,7 @@ pub async fn vendor_gem<'a>(
         dry_run,
         force,
         service,
+        false,
         &mut Vec::new(),
     )
     .await
@@ -1154,6 +1155,12 @@ pub async fn vendor_gem<'a>(
 /// the wet run would vendor, each with the patch it comes from, are put
 /// in `previewed` (in lock order) when the dry run of such a gem passes.
 /// Left as it is otherwise.
+///
+/// `hosted`: the lockfile pins the gem hosted, and the caller keeps that
+/// pin when this call does not vendor the gem (a takeover or an eject,
+/// which restores the gem's upstream entry before it calls and puts the
+/// pin back after a refusal). The skip of a gem with a locked platform
+/// that has no patched build then says that the gem stays hosted.
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_gem_previewing<'a>(
     purl: &str,
@@ -1165,6 +1172,7 @@ pub async fn vendor_gem_previewing<'a>(
     dry_run: bool,
     _force: bool,
     service: Option<&VendorServiceConfig>,
+    hosted: bool,
     previewed: &mut Vec<GemBuildEntry>,
 ) -> VendorOutcome {
     let installed_dir = installed_dir.into();
@@ -1315,7 +1323,7 @@ pub async fn vendor_gem_previewing<'a>(
         let mut standing = Standing::Wired;
         if !lock_wired {
             match gem_edits(purl, &prelude) {
-                Ok((plan, _)) => standing = plan.standing(),
+                Ok((plan, _)) => standing = plan.standing(hosted),
                 Err(outcome) => return *outcome,
             }
         }
@@ -1360,7 +1368,7 @@ pub async fn vendor_gem_previewing<'a>(
         copy_dir,
         uuid_dir,
         name,
-        &locked(plan.standing()),
+        &locked(plan.standing(hosted)),
         record,
         true, // fresh vendor: nothing pre-existing worth keeping
         service,
@@ -1813,10 +1821,13 @@ pub(super) enum BuildsFrom<'a> {
 
 /// What a gem has in place of the patch being vendored, should a locked
 /// platform turn out to have no patched build: how that skip is worded.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Standing {
     /// Nothing: the gem is not vendored.
     NotVendored,
+    /// Nothing vendored, and the lockfile pins the gem hosted: the pin
+    /// stays while the gem is not vendored.
+    Hosted,
     /// The lock is wired to this patch's copy.
     Wired,
     /// The Gemfile is wired to the copy of another patch of the gem.
@@ -1858,12 +1869,6 @@ fn listed(items: &[&str]) -> String {
     }
 }
 
-/// How the line of a gem that is not vendored
-/// ([`super::VENDOR_PREBUILT_PLATFORM_PENDING`]) ends when some of its
-/// locked platforms do have a patched build: hosted mode patches those.
-/// A caller that knows the gem is hosted already says so in its place.
-pub const HOSTED_CAN_PATCH: &str = "; `scan --mode hosted` can patch the others now.";
-
 /// The locked platforms of a gem that have no patched build to vendor, in
 /// lock order.
 #[derive(Default)]
@@ -1885,7 +1890,10 @@ impl NoPatchedBuild<'_> {
 
 /// The one line for a gem left as it is because the locked platforms of
 /// `missing` have no patched build, while `patched` (the other locked
-/// platforms) have one. For a lock already wired to this patch's copy
+/// platforms) have one. Its last clause says what the gem's `standing`
+/// leaves it with: hosted mode can patch the platforms that do have a
+/// build, unless the gem is hosted already, and a vendored copy stays in
+/// force. For a lock already wired to this patch's copy
 /// ([`Standing::Wired`]) the caller ends the line with what became of
 /// that copy ([`wired_copy_not_rebuilt`]); otherwise it is the whole
 /// line.
@@ -1896,7 +1904,7 @@ fn no_patched_build_detail(
     standing: Standing,
 ) -> String {
     let lead = match standing {
-        Standing::NotVendored => "is not vendored",
+        Standing::NotVendored | Standing::Hosted => "is not vendored",
         Standing::Wired | Standing::EarlierPatch => "was not brought up to date",
     };
     let none = match (missing.yet.as_slice(), missing.unavailable.as_slice()) {
@@ -1918,8 +1926,9 @@ fn no_patched_build_detail(
         (Standing::EarlierPatch, _) => {
             "; its vendored copy of an earlier patch stays in force as it is."
         }
-        (Standing::NotVendored, true) => ".",
-        (Standing::NotVendored, false) => HOSTED_CAN_PATCH,
+        (Standing::NotVendored | Standing::Hosted, true) => ".",
+        (Standing::NotVendored, false) => "; `scan --mode hosted` can patch the others now.",
+        (Standing::Hosted, false) => "; the gem stays hosted.",
     };
     format!("{gem} {lead}: {none}{have}. Vendored mode needs every locked platform{tail}")
 }
@@ -2502,7 +2511,9 @@ pub enum LockedBuildsPreview {
 ///
 /// `hosted`: the lockfile pins the gem hosted, and a wet run restores its
 /// upstream entry before it vendors. The Gemfile edit is then planned
-/// over text this preview does not have, so it is not judged here.
+/// over text this preview does not have, so it is not judged here, and
+/// the skip of a locked platform with no patched build says that the gem
+/// stays hosted, as the wet run's does ([`vendor_gem_previewing`]).
 ///
 /// `None` for a gem this does not judge, so the caller's own verdict
 /// stands: one the lock does not name as platform gems, one whose lock is
@@ -2535,9 +2546,9 @@ pub async fn preview_locked_builds(
         return None;
     }
     let standing = match hosted {
-        true => Standing::NotVendored,
+        true => Standing::Hosted,
         false => match gem_edits(purl, &prelude) {
-            Ok((plan, _)) => plan.standing(),
+            Ok((plan, _)) => plan.standing(false),
             Err(outcome) => return refusal(*outcome),
         },
     };
@@ -2831,10 +2842,12 @@ enum GemfilePlan {
 }
 
 impl GemfilePlan {
-    /// What the gem has in place of the patch this plan wires.
-    fn standing(&self) -> Standing {
+    /// What the gem has in place of the patch this plan wires. `hosted`:
+    /// the lockfile pins the gem hosted (see [`vendor_gem_previewing`]).
+    fn standing(&self, hosted: bool) -> Standing {
         match self {
             Self::RewireOurs { .. } => Standing::EarlierPatch,
+            Self::Rewrite { .. } | Self::Append { .. } if hosted => Standing::Hosted,
             Self::Rewrite { .. } | Self::Append { .. } => Standing::NotVendored,
         }
     }
@@ -13377,6 +13390,7 @@ mod tests {
                     dry_run,
                     false,
                     Some(cfg),
+                    false,
                     previewed,
                 )
                 .await
@@ -13576,6 +13590,190 @@ mod tests {
                     assert_eq!((code, detail), (wet_code, wet_line))
                 }
                 other => panic!("{other:?}"),
+            }
+        }
+
+        /// The line of a gem with a locked platform that has no patched
+        /// build is worded in one place, and its last clause is what the
+        /// gem is left with: hosted mode to run for the platforms that do
+        /// have a build, a hosted pin that stays, the vendored copy of an
+        /// earlier patch, or (for the caller to end) this patch's own
+        /// copy. A gem the lockfile pins hosted is never told to run
+        /// hosted mode, whichever platforms lack a build and however many
+        /// have one.
+        #[test]
+        fn the_line_of_an_unpatched_platform_ends_with_what_the_gem_is_left_with() {
+            const GEM: &str = "nokogiri@1.18.10";
+            const NONE_YET: &str = "no patched build yet for arm64-darwin";
+            const NEEDS: &str = "Vendored mode needs every locked platform";
+            let yet = NoPatchedBuild {
+                yet: vec![DARWIN],
+                unavailable: Vec::new(),
+            };
+            let line = |standing: Standing, patched: &[&str]| {
+                no_patched_build_detail(GEM, &yet, patched, standing)
+            };
+            assert_eq!(
+                line(Standing::NotVendored, &[LINUX]),
+                format!(
+                    "{GEM} is not vendored: {NONE_YET} (x86_64-linux-gnu has one). {NEEDS}; \
+                     `scan --mode hosted` can patch the others now."
+                )
+            );
+            assert_eq!(
+                line(Standing::Hosted, &[LINUX]),
+                format!(
+                    "{GEM} is not vendored: {NONE_YET} (x86_64-linux-gnu has one). {NEEDS}; the \
+                     gem stays hosted."
+                )
+            );
+            assert_eq!(
+                line(Standing::EarlierPatch, &[LINUX]),
+                format!(
+                    "{GEM} was not brought up to date: {NONE_YET} (x86_64-linux-gnu has one). \
+                     {NEEDS}; its vendored copy of an earlier patch stays in force as it is."
+                )
+            );
+            // Left open for `wired_copy_not_rebuilt`, which knows whether
+            // this patch's copy still stands.
+            assert_eq!(
+                line(Standing::Wired, &[LINUX]),
+                format!(
+                    "{GEM} was not brought up to date: {NONE_YET} (x86_64-linux-gnu has one). \
+                     {NEEDS}"
+                )
+            );
+            // No platform has a patched build: neither mode patches the gem.
+            for standing in [Standing::NotVendored, Standing::Hosted] {
+                assert_eq!(
+                    line(standing, &[]),
+                    format!("{GEM} is not vendored: {NONE_YET}. {NEEDS}."),
+                    "{standing:?}"
+                );
+            }
+
+            let unavailable = NoPatchedBuild {
+                yet: Vec::new(),
+                unavailable: vec![DARWIN],
+            };
+            let both = NoPatchedBuild {
+                yet: vec![DARWIN],
+                unavailable: vec!["java"],
+            };
+            for missing in [&yet, &unavailable, &both] {
+                for patched in [&[][..], &[LINUX][..], &[LINUX, "aarch64-linux-gnu"][..]] {
+                    let hosted = no_patched_build_detail(GEM, missing, patched, Standing::Hosted);
+                    assert!(!hosted.contains("--mode hosted"), "{hosted}");
+                    assert!(!hosted.contains("scan"), "{hosted}");
+                    assert_eq!(
+                        hosted.ends_with("; the gem stays hosted."),
+                        !patched.is_empty(),
+                        "{hosted}"
+                    );
+                    // The same platforms for a gem with no hosted pin.
+                    let unpinned =
+                        no_patched_build_detail(GEM, missing, patched, Standing::NotVendored);
+                    assert_eq!(
+                        unpinned.ends_with("; `scan --mode hosted` can patch the others now."),
+                        !patched.is_empty(),
+                        "{unpinned}"
+                    );
+                }
+            }
+        }
+
+        /// A gem the lockfile pins hosted, as a takeover or an eject hands
+        /// it to the backend (its upstream entry restored, `hosted` set):
+        /// while a locked platform has no patched build, the dry run, the
+        /// wet run and the preview without a record all leave it alone
+        /// under the benign pending code, and the line says that the gem
+        /// stays hosted. None of them names hosted mode as what to run,
+        /// which is what the same gem with no hosted pin is told.
+        #[tokio::test]
+        async fn a_hosted_gem_with_an_unpatched_platform_is_told_that_it_stays_hosted() {
+            async fn run(
+                root: &Path,
+                record: &PatchRecord,
+                cfg: &VendorServiceConfig,
+                dry_run: bool,
+                hosted: bool,
+            ) -> (&'static str, String) {
+                let blobs = root.join("no-blobs");
+                let outcome = vendor_gem_previewing(
+                    NOKO,
+                    not_installed(root).as_path(),
+                    root,
+                    record,
+                    &PatchSources::blobs_only(&blobs),
+                    "2026-06-09T00:00:00Z",
+                    dry_run,
+                    false,
+                    Some(cfg),
+                    hosted,
+                    &mut Vec::new(),
+                )
+                .await;
+                unwrap_refused(outcome)
+            }
+            const NEEDS: &str = "Vendored mode needs every locked platform";
+            let pass_through = Served {
+                listed: Listed::PassThrough,
+                ..served(LINUX)
+            };
+            let cases: [(Vec<Served>, String); 3] = [
+                (
+                    vec![served(DARWIN), pass_through],
+                    format!(
+                        "nokogiri@1.18.10 is not vendored: no patched build yet for \
+                         x86_64-linux-gnu (arm64-darwin has one). {NEEDS}; the gem stays hosted."
+                    ),
+                ),
+                (
+                    vec![unserved(DARWIN, "forbidden"), served(LINUX)],
+                    format!(
+                        "nokogiri@1.18.10 is not vendored: no patched build available for \
+                         arm64-darwin (x86_64-linux-gnu has one). {NEEDS}; the gem stays hosted."
+                    ),
+                ),
+                // No platform has a patched build: the line of any gem.
+                (
+                    vec![
+                        unserved(DARWIN, "pending_build"),
+                        unserved(LINUX, "forbidden"),
+                    ],
+                    format!(
+                        "nokogiri@1.18.10 is not vendored: no patched build yet for arm64-darwin \
+                         and none available for x86_64-linux-gnu. {NEEDS}."
+                    ),
+                ),
+            ];
+            for (builds, line) in cases {
+                let (_tmp, root, record) = project(&lock(None)).await;
+                let before = ts::tree_snapshot(&root);
+                let (server, cfg) = service(UUID, &builds).await;
+                for dry_run in [true, false] {
+                    let (code, detail) = run(&root, &record, &cfg, dry_run, true).await;
+                    assert_eq!(code, "vendor_prebuilt_platform_pending", "{detail}");
+                    assert_eq!(detail, line, "dry_run={dry_run}");
+                    assert!(!detail.contains("--mode hosted"), "{detail}");
+                }
+                match preview_locked_builds(&root, NOKO, UUID, true, Some(&cfg)).await {
+                    Some(LockedBuildsPreview::Refused { code, detail }) => {
+                        assert_eq!(code, "vendor_prebuilt_platform_pending", "{detail}");
+                        assert_eq!(detail, line, "the preview without a record");
+                    }
+                    other => panic!("{other:?}"),
+                }
+                // With no hosted pin, the line names hosted mode exactly
+                // where the hosted gem's says that it stays hosted.
+                let (_, unpinned) = run(&root, &record, &cfg, true, false).await;
+                assert_eq!(
+                    unpinned.contains("`scan --mode hosted`"),
+                    line.ends_with("the gem stays hosted."),
+                    "{unpinned}"
+                );
+                assert_eq!(ts::tree_snapshot(&root), before);
+                assert_eq!(downloads(&server).await, Vec::<String>::new());
             }
         }
 

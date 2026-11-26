@@ -1518,6 +1518,68 @@ async fn a_takeover_of_a_hosted_gem_with_an_unpatched_platform_stays_hosted_dry_
     }
 }
 
+/// No run tells a gem that stays hosted to run hosted mode. A hosted gem
+/// with a locked platform that has no patched build reaches the vendored
+/// backend three ways: `scan` and `get` take it over (their dry runs ask
+/// the patch service with no record of the patch), and `vendor` ejects it,
+/// which is all or nothing and so fails. Each of them, dry or wet, for a
+/// person and as `--json`, says that the gem stays hosted, and nothing it
+/// prints names `--mode hosted`, which is what a gem with no hosted pin is
+/// told to run.
+#[tokio::test]
+async fn no_run_tells_a_gem_that_stays_hosted_to_run_hosted_mode() {
+    let stays = format!(
+        "{NAME}@{VERSION} is not vendored: no patched build yet for {DARWIN} ({LINUX} has one). \
+         Vendored mode needs every locked platform; the gem stays hosted."
+    );
+    for command in [SCAN_IT, GET_IT, VENDOR_IT] {
+        let server = service(&[LINUX], &[DARWIN]).await;
+        mount_search(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (gemfile, lock) = write_hosted_project(root);
+        if command[0] == "scan" {
+            install_darwin_gem(root);
+        }
+        let exit = i32::from(command[0] == "vendor");
+        for flags in [&["--dry-run"][..], &[]] {
+            for json in [&[][..], &["--json"]] {
+                let args = with(&with(command, flags), json);
+                let (code, stdout, stderr) = run(root, &args, &server.uri());
+                assert_eq!(code, exit, "{args:?}\n{stdout}\n{stderr}");
+                let said = format!("{stdout}\n{stderr}");
+                assert!(said.contains(&stays), "{args:?}\n{said}");
+                assert!(
+                    !said.contains("--mode hosted"),
+                    "{args:?} names hosted mode to a gem that is hosted:\n{said}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(root.join("Gemfile")).unwrap(),
+                    gemfile
+                );
+                assert_eq!(
+                    std::fs::read_to_string(root.join("Gemfile.lock")).unwrap(),
+                    lock
+                );
+                assert!(!root.join(".socket/vendor/gem").exists());
+            }
+        }
+        assert_eq!(downloads(&server).await, Vec::<String>::new());
+    }
+
+    // The same platforms for a gem with no hosted pin: hosted mode is what
+    // patches the others.
+    let server = service(&[LINUX], &[DARWIN]).await;
+    let project = fresh_project(VENDOR_IT);
+    let (code, stdout, stderr) = run(project.path(), VENDOR_IT, &server.uri());
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("`scan --mode hosted` can patch the others now."),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("stays hosted"), "{stderr}");
+}
+
 /// Offline, the patch service may not be asked, so no dry run promises to
 /// vendor the gem. `vendor --dry-run --offline` ends as the wet run does,
 /// in the same failure, and `scan` and `get` refuse `--offline` outright.

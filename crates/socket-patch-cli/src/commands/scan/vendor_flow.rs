@@ -306,8 +306,7 @@ impl VendorPreview {
                 Some(LockedBuildsPreview::Refused { code, detail }) => (code, detail),
             };
             // As the vendor loop settles the backend's refusal: an older
-            // vendored patch still in force keeps an unserved one a skip,
-            // and a gem that stays hosted says so.
+            // vendored patch still in force keeps an unserved one a skip.
             let settled = crate::commands::vendor::keep_older_vendored_patch(
                 Some(VendorOutcome::Refused { code, detail }),
                 &state,
@@ -318,10 +317,6 @@ impl VendorPreview {
             .await;
             let Some(VendorOutcome::Refused { code, detail }) = settled else {
                 continue;
-            };
-            let detail = match row.hosted {
-                true => crate::commands::vendor::hosted_pending_detail(code, detail),
-                false => detail,
             };
             row.verdict = PreviewVerdict::WouldRefuse {
                 code: code.to_string(),

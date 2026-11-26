@@ -311,6 +311,9 @@ async fn takeover_dry_refusal(
         service,
         pipenv_version,
         installed_sites,
+        // The pin this previews the takeover of stays when the backend
+        // refuses.
+        true,
         &mut Vec::new(),
     ))
     .await;
@@ -350,9 +353,13 @@ fn restored_text_previewable(
 /// Dispatch one purl to its ecosystem backend. `pkg_path` is the crawler's
 /// installed location (site-packages root for pypi, the package dir
 /// otherwise), when available. Returns `None` for purls with no vendor
-/// backend in this build. `gem_preview` receives the platform gems a dry
-/// run found the wet run would vendor for a gem locked as platform gems
-/// (see [`vendor::gem::vendor_gem_previewing`]).
+/// backend in this build. Two arguments are the gem backend's alone (see
+/// [`vendor::gem::vendor_gem_previewing`]): `hosted` says the lockfile
+/// pins the package hosted and the caller keeps that pin when the backend
+/// does not vendor it (a takeover or an eject), so the backend words its
+/// refusal for a gem that stays hosted; `gem_preview` receives the
+/// platform gems a dry run found the wet run would vendor for a gem
+/// locked as platform gems.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_vendor_one(
     purl: &str,
@@ -366,6 +373,7 @@ pub(crate) async fn dispatch_vendor_one(
     service: Option<&VendorServiceConfig>,
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
     installed_sites: &vendor::pypi::InstalledSiteListings,
+    hosted: bool,
     gem_preview: &mut Vec<vendor::GemBuildEntry>,
 ) -> Option<VendorOutcome> {
     let eco = ecosystem_dir_for_purl(purl)?;
@@ -441,6 +449,7 @@ pub(crate) async fn dispatch_vendor_one(
                 dry_run,
                 force,
                 service,
+                hosted,
                 gem_preview,
             )
             .await
@@ -755,19 +764,6 @@ pub(crate) fn format_skip(purl: &str, code: &str, detail: &str) -> String {
         crate::ui::wrap_line(detail, width)
     } else {
         format!("Skipping {}: {detail}", normalize_purl(purl))
-    }
-}
-
-/// The detail of [`vendor::VENDOR_PREBUILT_PLATFORM_PENDING`] for a gem the
-/// lockfile pins hosted: the pin stays, so the line says that instead of
-/// naming hosted mode as the way to patch the other platforms.
-pub(crate) fn hosted_pending_detail(code: &str, detail: String) -> String {
-    if code != vendor::VENDOR_PREBUILT_PLATFORM_PENDING {
-        return detail;
-    }
-    match detail.strip_suffix(vendor::gem::HOSTED_CAN_PATCH) {
-        Some(head) => format!("{head}; the gem stays hosted."),
-        None => detail,
     }
 }
 
@@ -2449,7 +2445,6 @@ async fn run_eject(
             // An eject has no skip: a pin it cannot vendor stays hosted
             // and the eject is refused whole, so a gem with a locked
             // platform that has no patched build is the plain miss here.
-            let detail = hosted_pending_detail(code, detail);
             let code = match vendor::is_unserved(code) {
                 true => vendor::VENDOR_PREBUILT_REQUIRED,
                 false => code,
@@ -4295,7 +4290,6 @@ pub(crate) async fn vendor_records_reusing(
                     {
                         if refusal_is_benign(code) {
                             // The wet run's skip: nothing is taken over.
-                            let detail = hosted_pending_detail(code, detail);
                             if !common.silent && !common.json {
                                 eprintln!("{}", format_skip(candidate, code, &detail));
                             }
@@ -4474,6 +4468,9 @@ pub(crate) async fn vendor_records_reusing(
                 service,
                 &pipenv_version,
                 &installed_sites,
+                // A takeover the backend does not carry through keeps its
+                // hosted pin (below).
+                hosted_pin_of(candidate).is_some(),
                 &mut gem_preview,
             )
             .await;
@@ -4520,11 +4517,6 @@ pub(crate) async fn vendor_records_reusing(
                     );
                 }
                 Some(VendorOutcome::Refused { code, detail }) => {
-                    // A takeover the backend skipped keeps its hosted pin.
-                    let detail = match hosted_pin_of(candidate) {
-                        Some(_) => hosted_pending_detail(code, detail),
-                        None => detail,
-                    };
                     if refusal_is_benign(code) {
                         // An expected skip, not an error: informational.
                         if !common.silent && !common.json {
@@ -6069,6 +6061,7 @@ mod dispatch_tests {
             Some(&service),
             &tokio::sync::OnceCell::new(),
             &Default::default(),
+            false,
             &mut Vec::new(),
         )
         .await;
@@ -9056,36 +9049,30 @@ mod ui_format_tests {
 
     /// A gem with a locked platform that has no patched build is one plain
     /// line, the backend's own; every other skip names its package first.
-    /// For a gem the lockfile pins hosted, the line says the pin stays
-    /// instead of naming hosted mode as what to run.
+    /// The line is printed as the backend words it, whatever it says the
+    /// gem is left with: hosted mode to run, a hosted pin that stays, or a
+    /// vendored copy that stays in force.
     #[test]
     fn the_pending_platform_skip_is_one_plain_line() {
         let pending = vendor::VENDOR_PREBUILT_PLATFORM_PENDING;
-        let detail = "nokogiri@1.19.3 is not vendored: no patched build yet for arm64-darwin \
-                      (aarch64-linux-gnu and x86_64-linux-gnu have one). Vendored mode needs \
-                      every locked platform; `scan --mode hosted` can patch the others now.";
         let purl = "pkg:gem/nokogiri@1.19.3?platform=ruby";
-        assert_eq!(format_skip(purl, pending, detail), detail);
+        for line in [
+            "nokogiri@1.19.3 is not vendored: no patched build yet for arm64-darwin \
+             (aarch64-linux-gnu and x86_64-linux-gnu have one). Vendored mode needs every \
+             locked platform; `scan --mode hosted` can patch the others now.",
+            "nokogiri@1.19.3 is not vendored: no patched build yet for arm64-darwin \
+             (aarch64-linux-gnu and x86_64-linux-gnu have one). Vendored mode needs every \
+             locked platform; the gem stays hosted.",
+            "nokogiri@1.19.3 was not brought up to date: no patched build yet for java. \
+             Vendored mode needs every locked platform; its vendored copy stays in force as \
+             it is.",
+        ] {
+            assert_eq!(format_skip(purl, pending, line), line);
+        }
         assert_eq!(
             format_skip(purl, "vendor_gem_version_not_locked", "not locked"),
             "Skipping pkg:gem/nokogiri@1.19.3?platform=ruby: not locked"
         );
-        assert_eq!(
-            hosted_pending_detail(pending, detail.to_string()),
-            "nokogiri@1.19.3 is not vendored: no patched build yet for arm64-darwin \
-             (aarch64-linux-gnu and x86_64-linux-gnu have one). Vendored mode needs every \
-             locked platform; the gem stays hosted."
-        );
-        // Any other code, and a line that names no hosted mode, pass as
-        // they are.
-        assert_eq!(
-            hosted_pending_detail("vendor_prebuilt_required", detail.to_string()),
-            detail
-        );
-        let kept = "nokogiri@1.19.3 was not brought up to date: no patched build yet for java. \
-                    Vendored mode needs every locked platform; its vendored copy stays in \
-                    force as it is.";
-        assert_eq!(hosted_pending_detail(pending, kept.to_string()), kept);
     }
 
     /// A retracted run keeps one account per package: the per-platform
