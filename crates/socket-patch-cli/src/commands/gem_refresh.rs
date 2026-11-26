@@ -1986,9 +1986,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (proj, home) = (tmp.path().join("proj"), tmp.path().join("Jane Doe/gemhome"));
         std::fs::create_dir_all(&proj).unwrap();
-        let file = |dir: &str, name: &str| home.join(dir).join(name).display().to_string();
+        let file = |dir: &str, name: &str| shell_word(&home.join(dir).join(name));
         let expected = format!(
-            "run `rm -f '{}' '{}' && bundle install`",
+            "run `rm -f {} {} && bundle install`",
             file("specifications", "rack-1.0.0.gemspec"),
             file("cache", "rack-1.0.0.gem")
         );
@@ -2384,8 +2384,10 @@ mod tests {
         let home = tmp.path().join("vendor/bundle/ruby/3.2.0");
         let gem = installed("json", &home, true);
         let (dir, _) = gem.installed.clone().unwrap();
-        let spec = home.join("specifications/json-1.0.0.gemspec");
-        let cache = home.join("cache/json-1.0.0.gem");
+        // Joined a component at a time, as the code builds them: on Windows
+        // a `/` inside a component stays a `/`.
+        let spec = home.join("specifications").join("json-1.0.0.gemspec");
+        let cache = home.join("cache").join("json-1.0.0.gem");
         std::fs::create_dir_all(home.join("cache")).unwrap();
         std::fs::write(&cache, "").unwrap();
         let reason = "its native extension could not be rebuilt: no Ruby owning this install \
