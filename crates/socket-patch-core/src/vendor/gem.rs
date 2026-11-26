@@ -502,6 +502,27 @@ async fn gem_prelude(
     project_root: &Path,
     record: &PatchRecord,
 ) -> Result<GemPrelude, VendorOutcome> {
+    gem_prelude_of(
+        purl,
+        installed_path,
+        project_root,
+        &record.uuid,
+        Some(&record.files),
+    )
+    .await
+}
+
+/// [`gem_prelude`] for the patch `uuid` and its `files`. A caller that has
+/// not fetched the patch's record passes no files (a preview): the copy of
+/// a lock already wired to the patch is then not tested, and reads as not
+/// in sync.
+async fn gem_prelude_of(
+    purl: &str,
+    installed_path: &Path,
+    project_root: &Path,
+    uuid: &str,
+    files: Option<&HashMap<String, PatchFileInfo>>,
+) -> Result<GemPrelude, VendorOutcome> {
     // ── coordinates ──────────────────────────────────────────────────────
     let Some((name, version)) = parse_gem_purl(purl) else {
         return Err(refused(
@@ -518,10 +539,10 @@ async fn gem_prelude(
     // `bundle`) and into Gemfile.lock's line grammar. A quote, space, paren,
     // or newline would be a code/grammar injection, so only the plain gem
     // token charset is accepted. Reject fail-closed before any disk access.
-    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("gem", &record.uuid) else {
+    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("gem", uuid) else {
         return Err(refused(
             "unsafe_coordinates",
-            format!("non-canonical patch uuid {:?}", record.uuid),
+            format!("non-canonical patch uuid {uuid:?}"),
         ));
     };
     if !is_safe_single_segment(name)
@@ -541,7 +562,7 @@ async fn gem_prelude(
     let copy_dir = project_root.join(&copy_rel);
 
     // A patch with no files is meaningless to vendor: no-op success, no edits.
-    if record.files.is_empty() {
+    if files.is_some_and(HashMap::is_empty) {
         return Err(done(
             synthesized_result(purl, &copy_dir, Vec::new(), true, None),
             None,
@@ -723,7 +744,7 @@ async fn gem_prelude(
         lock_text.split('\n').any(|l| l == remote_line) && gemfile_text.contains(&copy_rel);
     let mut copy_ok = false;
     let mut unattributed = false;
-    if lock_wired {
+    if let (true, Some(files)) = (lock_wired, files) {
         if lock_checksum_in_sync(&lock_text, name, version, &locked.platforms) {
             // Probe the copy only once the lock is known to be wired (the
             // common fresh vendor has no copy to hash). Invalid-stub heal: a
@@ -735,17 +756,16 @@ async fn gem_prelude(
             // runs second so a hash mismatch short-circuits it.
             copy_ok = match locked.platforms.as_slice() {
                 [] => {
-                    copy_matches_after_hashes(&copy_dir, &record.files).await
+                    copy_matches_after_hashes(&copy_dir, files).await
                         && stub_gemspec_valid(&copy_dir, name).await
                 }
                 platforms => {
-                    let recorded = recorded_copy(project_root, &record.uuid, &copy_rel).await;
+                    let recorded = recorded_copy(project_root, uuid, &copy_rel).await;
                     let inventory = recorded
                         .as_ref()
                         .and_then(|entry| entry.artifact.file_inventory.as_ref());
                     let intact =
-                        platform_copy_intact(&copy_dir, name, platforms, &record.files, inventory)
-                            .await;
+                        platform_copy_intact(&copy_dir, name, platforms, files, inventory).await;
                     unattributed = intact
                         && recorded.is_some_and(|entry| {
                             entry.gem_builds.is_empty() && !entry.gem_platforms.is_empty()
@@ -1107,11 +1127,45 @@ pub async fn vendor_gem<'a>(
     installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    vendor_gem_previewing(
+        purl,
+        installed_dir,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service,
+        &mut Vec::new(),
+    )
+    .await
+}
+
+/// [`vendor_gem`] for a caller that reports a gem vendored as platform
+/// gems once per platform gem. A wet run names the trees it vendored in
+/// the entry it hands back; a dry run hands back no entry, so the trees
+/// the wet run would vendor, each with the patch it comes from, are put
+/// in `previewed` (in lock order) when the dry run of such a gem passes.
+/// Left as it is otherwise.
+#[allow(clippy::too_many_arguments)]
+pub async fn vendor_gem_previewing<'a>(
+    purl: &str,
+    installed_dir: impl Into<PackageSource<'a>>,
+    project_root: &Path,
+    record: &PatchRecord,
     _sources: &PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
     _force: bool,
     service: Option<&VendorServiceConfig>,
+    previewed: &mut Vec<GemBuildEntry>,
 ) -> VendorOutcome {
     let installed_dir = installed_dir.into();
     let prelude = match gem_prelude(purl, installed_dir.path(), project_root, record).await {
@@ -1265,15 +1319,20 @@ pub async fn vendor_gem<'a>(
                 Err(outcome) => return *outcome,
             }
         }
-        let previewed = match platforms.as_slice() {
-            [] => super::service_fetch::preview_service(service, record, extract_gem_data).await,
+        let checked = match platforms.as_slice() {
+            [] => super::service_fetch::preview_service(service, record, extract_gem_data)
+                .await
+                .map(|()| Vec::new()),
             _ => preview_platform_builds(service, record, name, &locked(standing)).await,
         };
-        if let Err(outcome) = previewed {
-            return match lock_wired {
-                true => wired_copy_not_rebuilt(*outcome, project_root, record, &prelude).await,
-                false => *outcome,
-            };
+        match checked {
+            Ok(builds) => *previewed = builds,
+            Err(outcome) => {
+                return match lock_wired {
+                    true => wired_copy_not_rebuilt(*outcome, project_root, record, &prelude).await,
+                    false => *outcome,
+                };
+            }
         }
         return done(
             super::common::preview_result(purl, copy_dir, &record.files),
@@ -2392,13 +2451,14 @@ async fn keep_platform_trees_committable(
 
 /// A dry run's check of a gem the lock pins as platform gems: the whole
 /// download, verification and unpacking of [`gem_platform_service_copy`],
-/// into a scratch directory.
+/// into a scratch directory. Returns what the wet run's ledger entry
+/// would record of each tree.
 async fn preview_platform_builds(
     service: Option<&VendorServiceConfig>,
     record: &PatchRecord,
     name: &str,
     trees: &PlatformTrees<'_>,
-) -> Result<(), Box<VendorOutcome>> {
+) -> Result<Vec<GemBuildEntry>, Box<VendorOutcome>> {
     if let Some(outcome) = service_offline_conflict(service) {
         return Err(Box::new(outcome));
     }
@@ -2409,7 +2469,110 @@ async fn preview_platform_builds(
         .map_err(|e| Box::new(refused("vendor_prebuilt_extract_failed", e.to_string())))?;
     stage_platform_builds(cfg, record, name, trees, scratch.path())
         .await
-        .map(|_| ())
+        .map(|(_, built)| built)
+}
+
+/// What a run would do with a gem `Gemfile.lock` names as precompiled
+/// platform gems, as far as the patch service's package references tell
+/// ([`preview_locked_builds`]).
+#[derive(Debug)]
+pub enum LockedBuildsPreview {
+    /// Every locked platform has a patched build, and the service serves
+    /// the patch of each: the tree of each, in lock order, with the patch
+    /// it is vendored from. Nothing was downloaded, so the entries carry
+    /// no digest.
+    Vendor(Vec<GemBuildEntry>),
+    /// What the backend refuses the gem with before it downloads
+    /// anything: the skip of a gem with a locked platform that has no
+    /// patched build ([`super::VENDOR_PREBUILT_PLATFORM_PENDING`]), a
+    /// refusal of its prelude or of the Gemfile edit, or why the patch
+    /// service could not say.
+    Refused { code: &'static str, detail: String },
+}
+
+/// The preview of [`vendor_gem`] for a run that has not fetched the
+/// record of the patch `uuid`: what a wet run decides for the gem `purl`
+/// before its first download. That takes the requests the wet run makes
+/// up to there and no other: the package reference of the patch and,
+/// only where it names a patched build for every locked platform, the
+/// references of those builds' patches, in ONE request more
+/// ([`served_builds`]). None is made when the backend refuses the gem
+/// first, or the service may not be asked. Nothing is downloaded and
+/// nothing written.
+///
+/// `hosted`: the lockfile pins the gem hosted, and a wet run restores its
+/// upstream entry before it vendors. The Gemfile edit is then planned
+/// over text this preview does not have, so it is not judged here.
+///
+/// `None` for a gem this does not judge, so the caller's own verdict
+/// stands: one the lock does not name as platform gems, one whose lock is
+/// already wired to this patch's copy (only the copy tells what a run
+/// does with it), one a hub of a Bazel workspace takes, and a lock the
+/// edit fails on.
+pub async fn preview_locked_builds(
+    project_root: &Path,
+    purl: &str,
+    uuid: &str,
+    hosted: bool,
+    service: Option<&VendorServiceConfig>,
+) -> Option<LockedBuildsPreview> {
+    let refusal = |outcome: VendorOutcome| match outcome {
+        VendorOutcome::Refused { code, detail } => {
+            Some(LockedBuildsPreview::Refused { code, detail })
+        }
+        VendorOutcome::Done { .. } => None,
+    };
+    // No installed copy is read: what is vendored for such a gem is the
+    // lock's to say.
+    let prelude = match gem_prelude_of(purl, Path::new(""), project_root, uuid, None).await {
+        Ok(prelude) => prelude,
+        Err(outcome) => return refusal(outcome),
+    };
+    if prelude.platforms.is_empty()
+        || prelude.lock_wired
+        || bazel::takes(&prelude, project_root, uuid).await
+    {
+        return None;
+    }
+    let standing = match hosted {
+        true => Standing::NotVendored,
+        false => match gem_edits(purl, &prelude) {
+            Ok((plan, _)) => plan.standing(),
+            Err(outcome) => return refusal(*outcome),
+        },
+    };
+    if let Some(outcome) = service_offline_conflict(service) {
+        return refusal(outcome);
+    }
+    let Some(cfg) = service.filter(|cfg| cfg.service_enabled()) else {
+        return refusal(super::service_fetch::required());
+    };
+    let label = format!("{}@{}", prelude.name, prelude.version);
+    let trees = PlatformTrees {
+        gem: &label,
+        from: BuildsFrom::Locked(&prelude.platforms),
+        standing,
+    };
+    let named = locked_build_sources(cfg, uuid, &prelude.name, &trees, &prelude.platforms).await;
+    let sources = match named {
+        Ok(sources) => sources,
+        Err(outcome) => return refusal(*outcome),
+    };
+    // A patched build is only one to vendor once its own patch is served.
+    if let Err(outcome) = served_builds(cfg, &prelude.name, &trees, &sources).await {
+        return refusal(*outcome);
+    }
+    Some(LockedBuildsPreview::Vendor(
+        sources
+            .into_iter()
+            .map(|source| GemBuildEntry {
+                platform: source.platform,
+                uuid: source.uuid,
+                gem_integrity: String::new(),
+                gemspec_integrity: String::new(),
+            })
+            .collect(),
+    ))
 }
 
 /// Acquire a verified service copy without replacing the prior copy on
@@ -13187,6 +13350,232 @@ mod tests {
                     "{detail}"
                 );
                 assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
+            }
+        }
+
+        /// A dry run that passes names the platform gems the wet run
+        /// vendors, each with its own patch and the digests it was
+        /// verified against, and writes nothing; the wet run names them in
+        /// its entry instead. A dry run that does not pass names none.
+        #[tokio::test]
+        async fn a_dry_run_names_the_platform_gems_the_wet_run_vendors() {
+            async fn run(
+                root: &Path,
+                record: &PatchRecord,
+                cfg: &VendorServiceConfig,
+                dry_run: bool,
+                previewed: &mut Vec<GemBuildEntry>,
+            ) -> VendorOutcome {
+                let blobs = root.join("no-blobs");
+                vendor_gem_previewing(
+                    NOKO,
+                    not_installed(root).as_path(),
+                    root,
+                    record,
+                    &PatchSources::blobs_only(&blobs),
+                    "2026-06-09T00:00:00Z",
+                    dry_run,
+                    false,
+                    Some(cfg),
+                    previewed,
+                )
+                .await
+            }
+            let (_tmp, root, record) = project(&lock(None)).await;
+            let before = ts::tree_snapshot(&root);
+
+            let pass_through = Served {
+                listed: Listed::PassThrough,
+                ..served(LINUX)
+            };
+            for not_vendorable in [pass_through, unserved(LINUX, "pending_build")] {
+                let (_server, cfg) = service(UUID, &[served(DARWIN), not_vendorable]).await;
+                let mut previewed = Vec::new();
+                let outcome = run(&root, &record, &cfg, true, &mut previewed).await;
+                let (code, _) = unwrap_refused(outcome);
+                assert_eq!(code, "vendor_prebuilt_platform_pending");
+                assert_eq!(previewed, Vec::new());
+            }
+
+            let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            let mut previewed = Vec::new();
+            let outcome = run(&root, &record, &cfg, true, &mut previewed).await;
+            let (result, entry, warnings) = unwrap_done(outcome);
+            assert!(result.success, "{:?}", result.error);
+            assert!(entry.is_none() && warnings.is_empty(), "{warnings:?}");
+            assert_eq!(previewed, [built(UUID, DARWIN), built(UUID, LINUX)]);
+            assert_eq!(ts::tree_snapshot(&root), before);
+
+            let mut unused = Vec::new();
+            let outcome = run(&root, &record, &cfg, false, &mut unused).await;
+            let (result, entry, _) = unwrap_done(outcome);
+            assert!(result.success, "{:?}", result.error);
+            assert_eq!(entry.expect("a ledger entry").gem_builds, previewed);
+            assert_eq!(unused, Vec::new());
+        }
+
+        /// The preview of a run that holds no record of the patch: what
+        /// the wet run decides before its first download, from the
+        /// requests the wet run makes up to there. The gem patch's
+        /// reference is the one request while a locked platform has no
+        /// patched build; where every platform is named one, the platform
+        /// patches' references are asked for too, in one request more. It
+        /// names the patch of each locked platform's build, or refuses
+        /// with the wet run's own code and line, and it downloads and
+        /// writes nothing.
+        #[tokio::test]
+        async fn the_preview_without_a_record_makes_the_wet_runs_requests_and_no_download() {
+            async fn preview(
+                root: &Path,
+                cfg: &VendorServiceConfig,
+            ) -> Option<LockedBuildsPreview> {
+                preview_locked_builds(root, NOKO, UUID, false, Some(cfg)).await
+            }
+            let (_tmp, root, record) = project(&lock(None)).await;
+            let before = ts::tree_snapshot(&root);
+            let named = |platform: &'static str| GemBuildEntry {
+                gem_integrity: String::new(),
+                gemspec_integrity: String::new(),
+                ..built(UUID, platform)
+            };
+
+            // Every locked platform has a patched build whose patch is
+            // served.
+            let (server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            match preview(&root, &cfg).await {
+                Some(LockedBuildsPreview::Vendor(builds)) => {
+                    assert_eq!(builds, [named(DARWIN), named(LINUX)])
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(reference_requests(&server).await, both_requests(UUID));
+            assert_eq!(downloads(&server).await, Vec::<String>::new());
+
+            // A locked platform with no patched build, which the gem
+            // patch's reference says (one request), or whose patch is not
+            // served, which that patch's own reference says (the second):
+            // the wet run's skip, word for word.
+            let pass_through = Served {
+                listed: Listed::PassThrough,
+                ..served(LINUX)
+            };
+            for (not_vendorable, requests) in [
+                (pass_through, vec![vec![UUID.to_string()]]),
+                (
+                    unserved(LINUX, "pending_build"),
+                    both_requests(UUID).to_vec(),
+                ),
+                (unserved(LINUX, "forbidden"), both_requests(UUID).to_vec()),
+            ] {
+                let (server, cfg) = service(UUID, &[served(DARWIN), not_vendorable]).await;
+                let (wet_code, wet_line) = unwrap_refused(
+                    vendor(&root, &not_installed(&root), &record, &cfg, false).await,
+                );
+                let asked = reference_requests(&server).await.len();
+                match preview(&root, &cfg).await {
+                    Some(LockedBuildsPreview::Refused { code, detail }) => {
+                        assert_eq!((code, &detail), (wet_code, &wet_line));
+                        assert_eq!(code, "vendor_prebuilt_platform_pending");
+                    }
+                    other => panic!("{other:?}"),
+                }
+                assert_eq!(
+                    reference_requests(&server).await[asked..],
+                    requests,
+                    "{wet_line}"
+                );
+                assert_eq!(downloads(&server).await, Vec::<String>::new());
+            }
+
+            // Offline, and for a declaration the wet run refuses before it
+            // asks, nothing is asked: the answer is the wet run's refusal.
+            let (server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            let offline = VendorServiceConfig {
+                offline: true,
+                ..gem_service_cfg(&server.uri(), VendorSource::Service, false)
+            };
+            match preview(&root, &offline).await {
+                Some(LockedBuildsPreview::Refused { code, .. }) => {
+                    assert_eq!(code, "vendor_service_offline_conflict")
+                }
+                other => panic!("{other:?}"),
+            }
+            let grouped = GEMFILE_NOKO.replace(
+                "gem \"nokogiri\", \"~> 1.18\"\n",
+                "group :test do\n  gem \"nokogiri\", \"~> 1.18\"\nend\n",
+            );
+            tokio::fs::write(root.join(GEMFILE), &grouped)
+                .await
+                .unwrap();
+            let (wet_code, wet_line) =
+                unwrap_refused(vendor(&root, &not_installed(&root), &record, &cfg, false).await);
+            assert_eq!(wet_code, "gemfile_declaration_not_editable");
+            match preview(&root, &cfg).await {
+                Some(LockedBuildsPreview::Refused { code, detail }) => {
+                    assert_eq!((code, &detail), (wet_code, &wet_line))
+                }
+                other => panic!("{other:?}"),
+            }
+            // A gem the lockfile pins hosted is restored before it is
+            // vendored: its declaration is not this preview's to judge.
+            match preview_locked_builds(&root, NOKO, UUID, true, Some(&cfg)).await {
+                Some(LockedBuildsPreview::Vendor(builds)) => {
+                    assert_eq!(builds, [named(DARWIN), named(LINUX)])
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(
+                reference_requests(&server).await,
+                both_requests(UUID),
+                "the hosted gem's are the only requests"
+            );
+            tokio::fs::write(root.join(GEMFILE), GEMFILE_NOKO)
+                .await
+                .unwrap();
+            assert_eq!(ts::tree_snapshot(&root), before);
+
+            // Not judged: a gem the lock names for the ruby platform, and
+            // a lock already wired to the patch's copy.
+            let ruby_gem = "pkg:gem/puma@6.4.2";
+            assert!(
+                preview_locked_builds(&root, ruby_gem, UUID, false, Some(&cfg))
+                    .await
+                    .is_none()
+            );
+            vendor_and_persist(&root, &record, &cfg).await;
+            let asked = ts::request_count(&server).await;
+            assert!(preview(&root, &cfg).await.is_none());
+            assert_eq!(ts::request_count(&server).await, asked);
+        }
+
+        /// The preview words a skip as the wet run does when the Gemfile
+        /// is wired to the copy of an earlier patch of the gem.
+        #[tokio::test]
+        async fn the_preview_without_a_record_says_which_copy_stays_in_force() {
+            let (_tmp, root, record_a) = project(&lock(None)).await;
+            let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            vendor_and_persist(&root, &record_a, &cfg).await;
+            let record_b = PatchRecord {
+                uuid: UUID_B.to_string(),
+                ..record_a.clone()
+            };
+            let pass_through = Served {
+                listed: Listed::PassThrough,
+                ..served(LINUX)
+            };
+            let (_server, cfg) = service(UUID_B, &[served(DARWIN), pass_through]).await;
+            let (wet_code, wet_line) =
+                unwrap_refused(vendor(&root, &not_installed(&root), &record_b, &cfg, false).await);
+            assert!(
+                wet_line
+                    .ends_with("its vendored copy of an earlier patch stays in force as it is."),
+                "{wet_line}"
+            );
+            match preview_locked_builds(&root, NOKO, UUID_B, false, Some(&cfg)).await {
+                Some(LockedBuildsPreview::Refused { code, detail }) => {
+                    assert_eq!((code, detail), (wet_code, wet_line))
+                }
+                other => panic!("{other:?}"),
             }
         }
 

@@ -488,6 +488,17 @@ pub(crate) async fn verify(archive: &Path, record: &PatchRecord) -> Result<(), S
     }
 }
 
+/// Whether [`vendor`] takes the gem of `prelude` for the patch `uuid`: the
+/// pair names the source of a hub already, or a call of rules_ruby in a
+/// Bazel workspace reads the lock of the project (and vendors the gem for
+/// it, or refuses it).
+pub(super) async fn takes(prelude: &GemPrelude, project: &Path, uuid: &str) -> bool {
+    match Site::of(prelude, uuid) {
+        Some(site) => site.lane(prelude, project).await.is_some(),
+        None => false,
+    }
+}
+
 /// The download [`vendor`] makes for the gem of `prelude`: the archive and
 /// its stub gemspec, which says whether the gem is one the lane takes.
 /// `None` where the gem is vendored as it is without Bazel; `Some(None)`
