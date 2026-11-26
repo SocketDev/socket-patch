@@ -4997,7 +4997,8 @@ A project whose `Gemfile` names a private gem server as its source (`source
 
   The checksum is then read from the server's compact index (`info/<name>`), the `Gemfile` and
   lock come back byte for byte, and the installed copy is replaced with the upstream gem
-  downloaded from that server.
+  downloaded from that server. The index may write the sha256 as hex, as rubygems.org does, or
+  as base64, as a static index built with `gem generate_index` does; Bundler reads both too.
 - On a lock without `CHECKSUMS` (Bundler 2.5 and older) the pair is restored without the setting.
   Nothing then gives the upstream gem's sha256, so the installed copy is checked against the patch
   itself: a copy that still holds the patched build is left as it is and named by

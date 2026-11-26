@@ -158,13 +158,14 @@ fn packagist_base() -> String {
         .unwrap_or_else(|| DEFAULT_PACKAGIST.to_string())
 }
 
-/// The `checksum:` (sha256 hex of the `.gem`) a compact-index `info/<name>`
-/// file records for the build `token` — the value bundler writes into
+/// The `checksum:` (sha256 of the `.gem`) a compact-index `info/<name>`
+/// file records for the build `token`, as the hex bundler writes into
 /// `CHECKSUMS`. Lines are `<version>[-<platform>] <deps>|<reqs>`, the
-/// requirement list carrying `checksum:<hex>`: `token` is `<version>` for
-/// the ruby-platform gem and `<version>-<platform>` for a platform gem,
-/// matched whole, so a version never answers for one of its platform
-/// builds.
+/// requirement list carrying `checksum:<digest>`: `token` is `<version>`
+/// for the ruby-platform gem and `<version>-<platform>` for a platform
+/// gem, matched whole, so a version never answers for one of its platform
+/// builds. The digest is hex on rubygems.org and base64 in an index built
+/// with `gem generate_index`; bundler reads both, and so does this.
 pub(crate) fn compact_index_checksum(info: &str, token: &str) -> Option<String> {
     info.lines().find_map(|line| {
         let (head, reqs) = line.split_once('|')?;
@@ -173,7 +174,7 @@ pub(crate) fn compact_index_checksum(info: &str, token: &str) -> Option<String> 
         }
         reqs.split(',')
             .find_map(|r| r.trim().strip_prefix("checksum:"))
-            .and_then(crate::utils::digest::sha256_hex)
+            .and_then(crate::utils::digest::sha256_hex_or_base64)
     })
 }
 

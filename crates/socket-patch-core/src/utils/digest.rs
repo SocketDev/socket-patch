@@ -40,6 +40,36 @@ pub(crate) fn sha256_hex(s: &str) -> Option<String> {
     is_hex(s, 64).then(|| s.to_ascii_lowercase())
 }
 
+/// A sha256 as a RubyGems compact index may write it, as lowercase hex:
+/// 64 hex digits (rubygems.org), or the base64 of the 32 bytes (a static
+/// index built with `gem generate_index`). The base64 form is the one
+/// Bundler's `Checksum.to_hexdigest` converts: 43 digits of the standard
+/// or the URL-safe alphabet and one `=`. Anything Bundler refuses as a
+/// digest is `None` here too.
+pub(crate) fn sha256_hex_or_base64(s: &str) -> Option<String> {
+    use base64::Engine as _;
+    if let Some(hex) = sha256_hex(s) {
+        return Some(hex);
+    }
+    if s.len() != 44 {
+        return None;
+    }
+    let standard: String = s
+        .chars()
+        .map(|c| match c {
+            '-' => '+',
+            '_' => '/',
+            other => other,
+        })
+        .collect();
+    // The engine wants the padding and refuses bits set past the last
+    // byte, as Ruby's strict decoder does.
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(standard)
+        .ok()?;
+    (bytes.len() == 32).then(|| hex::encode(bytes))
+}
+
 /// `sha256:<hex>` (uv / poetry / pdm artifact hashes) → the lowercased hex.
 pub(crate) fn sha256_prefixed(s: &str) -> Option<String> {
     s.strip_prefix("sha256:").and_then(sha256_hex)
@@ -82,6 +112,35 @@ pub(crate) fn sha512_sri_of(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compact_index_digest_is_read_as_hex_or_base64() {
+        // sha256 of the empty string, in the three spellings.
+        const HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        for digest in [
+            HEX,
+            &HEX.to_ascii_uppercase(),
+            "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+            "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU=",
+        ] {
+            assert_eq!(
+                sha256_hex_or_base64(digest).as_deref(),
+                Some(HEX),
+                "{digest}"
+            );
+        }
+        for bad in [
+            "",
+            "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU",
+            "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU==",
+            "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFV=",
+            "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuF==",
+            " 7DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+            &HEX[..63],
+        ] {
+            assert_eq!(sha256_hex_or_base64(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn helpers_keep_their_case_policies() {
