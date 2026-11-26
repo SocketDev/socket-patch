@@ -327,12 +327,6 @@ pub struct VendorEntry {
     /// as its ruby-platform tree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gem_builds: Vec<GemBuildEntry>,
-    /// gem: the platforms of such a copy as an entry without
-    /// [`Self::gem_builds`] names them, with no patch per tree. Read only:
-    /// the copy verifies and reverts by it, and the next vendor run
-    /// records [`Self::gem_builds`] in its place.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub gem_platforms: Vec<String>,
     /// True when vendored WITHOUT a manifest record — the posture of every
     /// `scan` / `get --mode vendored` entry (vendored mode writes no
     /// `.socket/manifest.json`); only the manifest-driven standalone
@@ -399,19 +393,14 @@ impl VendorEntry {
             .all(|built| super::gem::is_platform_dir_name(&built.platform))
     }
 
-    /// gem: the platforms of a copy vendored as precompiled platform gems,
-    /// in lock order: those of [`Self::gem_builds`], else the ones an
-    /// entry without them names ([`Self::gem_platforms`]). Empty for a gem
-    /// vendored as its ruby-platform tree.
+    /// gem: the platforms of a copy vendored as precompiled platform gems
+    /// ([`Self::gem_builds`]), in lock order. Empty for a gem vendored as
+    /// its ruby-platform tree.
     pub fn gem_tree_platforms(&self) -> Vec<&str> {
-        match self.gem_builds.is_empty() {
-            false => self
-                .gem_builds
-                .iter()
-                .map(|built| built.platform.as_str())
-                .collect(),
-            true => self.gem_platforms.iter().map(String::as_str).collect(),
-        }
+        self.gem_builds
+            .iter()
+            .map(|built| built.platform.as_str())
+            .collect()
     }
 
     /// Create an entry with no ecosystem-specific metadata or embedded record.
@@ -437,7 +426,6 @@ impl VendorEntry {
             pdm: None,
             pipenv: None,
             gem_builds: Vec::new(),
-            gem_platforms: Vec::new(),
             detached: false,
             record: None,
         }
@@ -1993,13 +1981,14 @@ mod tests {
     }
 
     /// A gem vendored as platform gems records each tree's platform, patch
-    /// and digests under `gemBuilds`, and writes no `gemPlatforms`. An
-    /// entry that names only its platforms still reads, and round-trips as
-    /// it is. An item with fields this build does not know (a development
-    /// build wrote `record` and `rebuiltFromUuid` there) reads too, those
-    /// fields ignored.
+    /// and digests under `gemBuilds`. A ledger may hold keys this build
+    /// does not know, written by a development build, and reads as if
+    /// they were not there: a `gemPlatforms` list on the entry (the
+    /// platforms of its copy, beside `gemBuilds` or in its place), which
+    /// is not written back, and the fields `record` and `rebuiltFromUuid`
+    /// of a `gemBuilds` item.
     #[tokio::test]
-    async fn gem_builds_round_trip_and_older_entries_still_read() {
+    async fn gem_builds_round_trip_and_unknown_keys_are_ignored() {
         const BUILD: &str = "2b3c4d5e-6f70-4a1b-8c2d-9e0f1a2b3c4d";
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -2041,24 +2030,37 @@ mod tests {
                 { "platform": "x86_64-linux-gnu", "uuid": UUID }
             ])
         );
-        assert!(!text.contains("gemPlatforms"), "{text}");
 
-        // An entry that names its platforms and no patch for their trees.
-        let mut older = wire.clone();
-        let older_entry = older["entries"][key].as_object_mut().unwrap();
-        older_entry.remove("gemBuilds");
-        older_entry.insert(
-            "gemPlatforms".into(),
-            serde_json::json!(["arm64-darwin", "x86_64-linux-gnu"]),
-        );
-        let read: VendorState = serde_json::from_value(older.clone()).unwrap();
-        let read_entry = &read.entries[key];
-        assert!(read_entry.gem_builds.is_empty());
-        assert_eq!(
-            read_entry.gem_tree_platforms(),
-            ["arm64-darwin", "x86_64-linux-gnu"]
-        );
-        assert_eq!(serde_json::to_value(&read).unwrap(), older, "kept as it is");
+        // An entry with the key `gemPlatforms`, beside its `gemBuilds` or
+        // in their place: the ledger reads as the same one without the key
+        // does, and a save does not write the key back.
+        let state_path = root.join(VENDOR_STATE_REL);
+        for with_builds in [true, false] {
+            let mut plain = wire.clone();
+            if !with_builds {
+                let entry = plain["entries"][key].as_object_mut().unwrap();
+                entry.remove("gemBuilds");
+            }
+            let mut keyed = plain.clone();
+            keyed["entries"][key].as_object_mut().unwrap().insert(
+                "gemPlatforms".into(),
+                serde_json::json!(["arm64-darwin", "x86_64-linux-gnu"]),
+            );
+            tokio::fs::write(&state_path, serde_json::to_vec_pretty(&keyed).unwrap())
+                .await
+                .unwrap();
+            let read = load_state(root).await.unwrap();
+            let without_key: VendorState = serde_json::from_value(plain).unwrap();
+            assert_eq!(read, without_key, "the key is ignored");
+            let trees = read.entries[key].gem_tree_platforms();
+            match with_builds {
+                true => assert_eq!(trees, ["arm64-darwin", "x86_64-linux-gnu"]),
+                false => assert!(trees.is_empty(), "the key names no tree: {trees:?}"),
+            }
+            save_state(root, &read).await.unwrap();
+            let saved = tokio::fs::read_to_string(&state_path).await.unwrap();
+            assert!(!saved.contains("gemPlatforms"), "{saved}");
+        }
 
         // Items with fields this build does not know.
         let mut extended = wire;
@@ -2782,7 +2784,6 @@ mod tests {
             pdm: None,
             pipenv: None,
             gem_builds: Vec::new(),
-            gem_platforms: Vec::new(),
         };
         let built = VendorEntry::npm(
             "pkg:npm/left-pad@1.3.0".to_string(),

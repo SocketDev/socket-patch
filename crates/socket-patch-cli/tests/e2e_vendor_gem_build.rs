@@ -3150,10 +3150,10 @@ fn per_platform_gem(
 ///   6. a second `vendor` run changes nothing and asks the service nothing,
 ///      and a newer patch that lacks one platform's patched build leaves
 ///      the vendored one in force;
-///   7. a ledger entry that names the platforms of its copy and no patch
-///      for their trees (`gemPlatforms`, as a development build recorded
-///      it) still checks and reverts, and the next `vendor` run records the
-///      patch of each tree in its place;
+///   7. a ledger whose entry has the key `gemPlatforms` in place of
+///      `gemBuilds` (as a development build recorded the platforms of the
+///      copy) reads with the key ignored, and `vendor --revert` and
+///      `rollback` each restore the Gemfile and the lock byte for byte;
 ///   8. `vendor --revert` restores the Gemfile and the lock byte for byte
 ///      (the registry CHECKSUMS tokens included) and removes the trees.
 ///
@@ -3538,7 +3538,6 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
         serde_json::Value::from(recorded),
         "the ledger records each tree's patch: {entry}"
     );
-    assert!(entry.get("gemPlatforms").is_none(), "{entry}");
     // For a person: one package, then nothing to do.
     let (code, stdout, stderr) = vendor_in(&unvendored, &server, false);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
@@ -3814,91 +3813,57 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
     drop(update);
     std::fs::write(&manifest_path, manifest).unwrap();
 
-    // 7. An entry that names the platforms of its copy and no patch for
-    //    their trees, as a development build recorded it: it still checks
-    //    (one verdict, for the gem) and reverts, and the next vendor run
-    //    records the patch of each tree in its place.
-    let mut state: serde_json::Value = serde_json::from_slice(&state_wired).unwrap();
-    for entry in state["entries"].as_object_mut().unwrap().values_mut() {
+    // 7. A ledger whose entry has the key `gemPlatforms` in place of
+    //    `gemBuilds`, as a development build recorded the platforms of the
+    //    copy. It reads with the key ignored: a check says of it what it
+    //    says of the same ledger without the key. `vendor --revert` and
+    //    `rollback` need nothing the key held: each restores the Gemfile
+    //    and the lock Bundler wrote, byte for byte, and removes the trees.
+    let mut without_key: serde_json::Value = serde_json::from_slice(&state_wired).unwrap();
+    for entry in without_key["entries"].as_object_mut().unwrap().values_mut() {
+        let removed = entry.as_object_mut().unwrap().remove("gemBuilds");
+        assert!(removed.is_some(), "the entry names its trees: {entry}");
+    }
+    let mut with_key = without_key.clone();
+    for entry in with_key["entries"].as_object_mut().unwrap().values_mut() {
         let entry = entry.as_object_mut().unwrap();
-        entry.remove("gemBuilds");
         entry.insert("gemPlatforms".into(), serde_json::json!(sorted));
     }
-    let earlier_state = serde_json::to_vec_pretty(&state).unwrap();
-    std::fs::write(&state_path, &earlier_state).unwrap();
-    let (code, stdout, stderr) = check(&proj);
-    assert_eq!(
-        code, 0,
-        "an entry that names platforms only still checks.\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    let checked = parse_json_envelope(&stdout);
-    assert_eq!(checked["summary"]["verified"], 1, "{checked}");
-    assert_eq!(
-        platform_gem_events(&checked, "verified"),
-        Vec::new(),
-        "one verdict, for the gem: {checked}"
-    );
-    let reverting = base.join("reverting");
-    common::fs_tree::copy_tree(&proj, &reverting);
-    let (code, stdout, stderr) = run_socket(
-        &reverting,
-        &[
-            "vendor",
-            "--revert",
-            "--json",
-            "--cwd",
-            reverting.to_str().unwrap(),
-        ],
-    );
-    assert_eq!(
-        code, 0,
-        "an entry that names platforms only still reverts.\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert_eq!(
-        std::fs::read(reverting.join("Gemfile")).unwrap(),
-        gemfile_before
-    );
-    assert_eq!(
-        std::fs::read(reverting.join("Gemfile.lock")).unwrap(),
-        lock_before
-    );
-    assert!(!reverting.join(".socket/vendor").exists());
-    let converting = service_requests(&server).await;
-    let (code, stdout, stderr) = vendor(&server);
-    assert_eq!(
-        code, 0,
-        "the run that converts the entry.\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    let converted = parse_json_envelope(&stdout);
-    assert_eq!(
-        platform_gem_events(&converted, "applied"),
-        per_platform_gem(&sorted, ""),
-        "{converted}"
-    );
-    let rebuilt = converted["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|event| event["errorCode"] == "vendor_artifact_rebuilt")
-        .unwrap_or_else(|| panic!("a vendor_artifact_rebuilt event: {converted}"));
+    let check_over = |state: &serde_json::Value| {
+        std::fs::write(&state_path, serde_json::to_vec_pretty(state).unwrap()).unwrap();
+        let (code, stdout, stderr) = check(&proj);
+        (code, parse_json_envelope(&stdout), stderr)
+    };
+    let (plain_code, plain, _) = check_over(&without_key);
+    let (code, checked, stderr) = check_over(&with_key);
     assert!(
-        rebuilt["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("was recorded with no patch named for its platform gems"),
-        "{rebuilt}"
+        checked["error"].is_null(),
+        "the ledger reads: {checked}\n{stderr}"
     );
-    assert!(
-        service_requests(&server).await > converting,
-        "the trees are fetched again, each from its platform's patch"
-    );
-    assert_eq!(
-        std::fs::read(&state_path).unwrap(),
-        state_wired,
-        "the ledger is the one a vendor run writes"
-    );
-    assert_eq!(std::fs::read(&gemfile_path).unwrap(), gemfile_wired);
-    assert_eq!(std::fs::read(&lock_path).unwrap(), lock_wired);
+    assert_eq!((code, &checked), (plain_code, &plain), "the key is ignored");
+    let unvendor: [&[&str]; 2] = [&["vendor", "--revert", "--json"], &["rollback", "--json"]];
+    for command in unvendor {
+        let copy = base.join(format!("unvendored-by-{}", command[0]));
+        common::fs_tree::copy_tree(&proj, &copy);
+        let args = [command, &["--cwd", copy.to_str().unwrap()]].concat();
+        let (code, stdout, stderr) = run_socket(&copy, &args);
+        assert_eq!(
+            code, 0,
+            "{command:?} over an entry with the key.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            std::fs::read(copy.join("Gemfile")).unwrap(),
+            gemfile_before,
+            "{command:?}"
+        );
+        assert_eq!(
+            std::fs::read(copy.join("Gemfile.lock")).unwrap(),
+            lock_before,
+            "{command:?}"
+        );
+        assert!(!copy.join(".socket/vendor/gem").exists(), "{command:?}");
+    }
+    std::fs::write(&state_path, &state_wired).unwrap();
 
     // 8. Revert: both files byte for byte, every tree gone.
     let (code, stdout, stderr) = run_socket(

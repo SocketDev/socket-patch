@@ -499,7 +499,6 @@ async fn a_platform_locked_gem_vendors_and_reports_per_platform_gem() {
               "gemIntegrity": sri(&platform_gem(LINUX)), "gemspecIntegrity": sri(&stub(LINUX)) }
         ])
     );
-    assert!(entry.get("gemPlatforms").is_none(), "{entry:#}");
 
     // 2. An in-sync re-run: one package, one event per platform gem, and
     //    nothing asked of the service.
@@ -702,21 +701,29 @@ async fn a_locked_platform_without_a_patched_build_is_one_line_and_no_failure() 
     );
 }
 
-/// A ledger entry that names the platforms of its copy and no patch for
-/// their trees (`gemPlatforms`) still checks as one package, the next
-/// vendor run records each tree's patch in its place, and it reverts. An
-/// entry whose `gemBuilds` items carry fields this build does not know
-/// reads as if they were not there.
+/// Ledger entries a development build wrote still read. An entry whose
+/// `gemBuilds` items carry fields this build does not know checks as if
+/// they were not there. An entry that has the key `gemPlatforms` in place
+/// of `gemBuilds` (the platforms of its copy, with no patch named for
+/// their trees) reads with the key ignored: a run says of it what it says
+/// of the same ledger without the key. `vendor --revert` and `rollback`
+/// need nothing the key held: each restores the Gemfile and the lock byte
+/// for byte from the originals the entry records, and removes the copy.
 #[tokio::test]
-async fn ledger_entries_of_other_builds_still_check_convert_and_revert() {
+async fn ledger_entries_of_development_builds_still_read_and_revert() {
     let server = service(&[DARWIN, LINUX], &[]).await;
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
+    let root = &tmp.path().join("project");
+    std::fs::create_dir(root).unwrap();
     write_project(root);
     let (code, env, stderr) = run_json(root, VENDOR, &server.uri());
     assert_eq!(code, 0, "{env:#}\n{stderr}");
     let state_path = root.join(".socket/vendor/state.json");
     let current = ledger(root);
+    let check = |state: &serde_json::Value| {
+        std::fs::write(&state_path, serde_json::to_vec_pretty(state).unwrap()).unwrap();
+        run_json(root, &["vendor", "--check", "--json"], &server.uri())
+    };
 
     // Items with unknown fields.
     let mut extended = current.clone();
@@ -731,66 +738,45 @@ async fn ledger_entries_of_other_builds_still_check_convert_and_revert() {
             serde_json::json!({ "uuid": UUID, "files": {} }),
         );
     }
-    std::fs::write(&state_path, serde_json::to_vec_pretty(&extended).unwrap()).unwrap();
-    let (code, env, stderr) = run_json(root, &["vendor", "--check", "--json"], &server.uri());
+    let (code, env, stderr) = check(&extended);
     assert_eq!(code, 0, "{env:#}\n{stderr}");
     assert_per_platform_gem(&env, "verified", "vendor_check_ok");
 
-    // Platforms only: one verdict, for the gem.
-    let mut older = current.clone();
-    let entry = older["entries"][PURL].as_object_mut().unwrap();
-    entry.remove("gemBuilds");
+    // The key `gemPlatforms` in place of `gemBuilds`: the ledger reads,
+    // and the run is the one over the ledger without the key.
+    let mut without_key = current.clone();
+    let entry = without_key["entries"][PURL].as_object_mut().unwrap();
+    assert!(entry.remove("gemBuilds").is_some());
+    let mut with_key = without_key.clone();
+    let entry = with_key["entries"][PURL].as_object_mut().unwrap();
     entry.insert("gemPlatforms".into(), serde_json::json!([DARWIN, LINUX]));
-    std::fs::write(&state_path, serde_json::to_vec_pretty(&older).unwrap()).unwrap();
-    let (code, env, stderr) = run_json(root, &["vendor", "--check", "--json"], &server.uri());
-    assert_eq!(code, 0, "{env:#}\n{stderr}");
-    assert_eq!(
-        gem_events(&env, "verified"),
-        [(PURL, "", "", "", "vendor_check_ok")],
-        "{env:#}"
-    );
-
-    // The next vendor run records the patch of each tree.
-    let (code, env, stderr) = run_json(root, VENDOR, &server.uri());
-    assert_eq!(code, 0, "{env:#}\n{stderr}");
-    assert_per_platform_gem(&env, "applied", "");
-    let rebuilt = env["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|event| event["errorCode"] == "vendor_artifact_rebuilt")
-        .unwrap_or_else(|| panic!("{env:#}"));
+    let (plain_code, plain, _) = check(&without_key);
+    let (code, env, stderr) = check(&with_key);
     assert!(
-        rebuilt["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("was recorded with no patch named for its platform gems"),
-        "{rebuilt:#}"
+        env["error"].is_null(),
+        "the ledger reads: {env:#}\n{stderr}"
     );
-    let converted = ledger(root);
-    assert_eq!(
-        converted["entries"][PURL]["gemBuilds"],
-        current["entries"][PURL]["gemBuilds"]
-    );
-    assert!(converted["entries"][PURL].get("gemPlatforms").is_none());
-    assert_eq!(
-        converted["entries"][PURL]["wiring"], current["entries"][PURL]["wiring"],
-        "the wiring records ride on"
-    );
+    assert_eq!((code, &env), (plain_code, &plain), "the key is ignored");
 
-    // Revert of the entry that names platforms only.
-    std::fs::write(&state_path, serde_json::to_vec_pretty(&older).unwrap()).unwrap();
-    let (code, env, stderr) = run_json(root, &["vendor", "--revert", "--json"], &server.uri());
-    assert_eq!(code, 0, "{env:#}\n{stderr}");
-    assert_eq!(
-        std::fs::read_to_string(root.join("Gemfile")).unwrap(),
-        GEMFILE
-    );
-    assert_eq!(
-        std::fs::read_to_string(root.join("Gemfile.lock")).unwrap(),
-        lock()
-    );
-    assert!(!root.join(".socket/vendor").exists());
+    // Each way to unvendor the gem, over that ledger.
+    let unvendor: [&[&str]; 2] = [&["vendor", "--revert", "--json"], &["rollback", "--json"]];
+    for command in unvendor {
+        let copy = tmp.path().join(command[0]);
+        crate::common::fs_tree::copy_tree(root, &copy);
+        let (code, env, stderr) = run_json(&copy, command, &server.uri());
+        assert_eq!(code, 0, "{command:?}\n{env:#}\n{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(copy.join("Gemfile")).unwrap(),
+            GEMFILE,
+            "{command:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(copy.join("Gemfile.lock")).unwrap(),
+            lock(),
+            "{command:?}"
+        );
+        assert!(!copy.join(".socket/vendor/gem").exists(), "{command:?}");
+    }
 }
 
 /// The hosted pair of the project: the gem pinned to the gem patch's

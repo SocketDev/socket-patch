@@ -2316,16 +2316,14 @@ mod tests {
     }
 
     /// The gem itself stays the attested package where the ledger does not
-    /// say which patch built which tree: an entry that names platforms
-    /// only, one whose trees are another patch's than the view's record,
-    /// and one that names a platform no gem platform token spells.
+    /// say which patch built which tree: an entry that names no tree, one
+    /// whose trees are another patch's than the view's record, and one
+    /// that names a platform no gem platform token spells.
     #[test]
     fn a_vendored_gem_with_no_patch_named_for_its_trees_is_attested_as_the_gem() {
         let key = "pkg:gem/nokogiri@1.18.10?platform=ruby";
-        let platforms_only = vendored_gem_plan(key, |entry| {
-            entry.gem_platforms = vec!["arm64-darwin".to_string()];
-        });
-        assert!(GemBuildView::of(&platforms_only).is_none());
+        let no_trees = vendored_gem_plan(key, |_| {});
+        assert!(GemBuildView::of(&no_trees).is_none());
         let another_patch = vendored_gem_plan(key, |entry| {
             entry.uuid = U2.to_string();
             entry.gem_builds = vec![gem_build("arm64-darwin", U2)];

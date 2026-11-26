@@ -237,11 +237,6 @@ struct GemPrelude {
     /// for the plain `name (version)` entry, vendored as the gem's own
     /// tree.
     platforms: Vec<String>,
-    /// The wired copy's trees are intact, and its ledger entry names no
-    /// patch for them ([`VendorEntry::gem_platforms`]): `copy_ok` is then
-    /// `false`, so the run rebuilds the copy from each platform's own
-    /// patch and records them.
-    unattributed: bool,
 }
 
 /// What `Gemfile.lock` resolves `name`@`version` to, read from every source
@@ -743,7 +738,6 @@ async fn gem_prelude_of(
     let lock_wired =
         lock_text.split('\n').any(|l| l == remote_line) && gemfile_text.contains(&copy_rel);
     let mut copy_ok = false;
-    let mut unattributed = false;
     if let (true, Some(files)) = (lock_wired, files) {
         if lock_checksum_in_sync(&lock_text, name, version, &locked.platforms) {
             // Probe the copy only once the lock is known to be wired (the
@@ -764,13 +758,7 @@ async fn gem_prelude_of(
                     let inventory = recorded
                         .as_ref()
                         .and_then(|entry| entry.artifact.file_inventory.as_ref());
-                    let intact =
-                        platform_copy_intact(&copy_dir, name, platforms, files, inventory).await;
-                    unattributed = intact
-                        && recorded.is_some_and(|entry| {
-                            entry.gem_builds.is_empty() && !entry.gem_platforms.is_empty()
-                        });
-                    intact && !unattributed
+                    platform_copy_intact(&copy_dir, name, platforms, files, inventory).await
                 }
             };
         } else {
@@ -822,7 +810,6 @@ async fn gem_prelude_of(
         lock_wired,
         copy_ok,
         platforms: locked.platforms,
-        unattributed,
     })
 }
 
@@ -1207,12 +1194,11 @@ pub async fn vendor_gem_previewing<'a>(
         lock_wired,
         copy_ok,
         platforms,
-        unattributed,
     } = &prelude;
     let (name, version) = (name.as_str(), version.as_str());
     let (copy_rel, uuid_dir, copy_dir) =
         (copy_rel.as_str(), uuid_dir.as_path(), copy_dir.as_path());
-    let (lock_wired, copy_ok, unattributed) = (*lock_wired, *copy_ok, *unattributed);
+    let (lock_wired, copy_ok) = (*lock_wired, *copy_ok);
     // What is vendored for each locked platform, once the service names it.
     let label = format!("{name}@{version}");
     let locked = |standing: Standing| PlatformTrees {
@@ -1285,15 +1271,11 @@ pub async fn vendor_gem_previewing<'a>(
             if !result.success {
                 return done(result, None, warnings);
             }
-            let why = match unattributed {
-                true => "was recorded with no patch named for its platform gems",
-                false => "was missing or stale",
-            };
             warnings.push(VendorWarning::new(
                 "vendor_artifact_rebuilt",
                 format!(
-                    "the committed vendored copy for {name}@{version} {why}; rebuilt at \
-                     {copy_rel} (Gemfile and Gemfile.lock untouched)"
+                    "the committed vendored copy for {name}@{version} was missing or stale; \
+                     rebuilt at {copy_rel} (Gemfile and Gemfile.lock untouched)"
                 ),
             ));
             // The rebuilt tree may differ from the one the ledger
@@ -1566,11 +1548,10 @@ pub async fn vendor_gem_previewing<'a>(
 /// The outcome of a copy the lock is ALREADY wired to that this run could
 /// not rebuild because a locked platform has no patched build
 /// ([`super::VENDOR_PREBUILT_PLATFORM_PENDING`]). While the copy the
-/// ledger records is intact (the lock gained a platform since, or the
-/// entry names no patch for its trees) it stays in force as it is, and
-/// the outcome stays that skip. Otherwise the lock names a tree that is
-/// missing or damaged and no older patch stands in for it: the plain
-/// miss, a failure.
+/// ledger records is intact (the lock gained a platform since) it stays
+/// in force as it is, and the outcome stays that skip. Otherwise the lock
+/// names a tree that is missing or damaged and no older patch stands in
+/// for it: the plain miss, a failure.
 async fn wired_copy_not_rebuilt(
     outcome: VendorOutcome,
     project_root: &Path,
@@ -2393,13 +2374,6 @@ pub(super) async fn gem_platform_service_copy(
     warnings.extend(staged);
     Ok(built)
 }
-
-/// Why a copy vendored as platform gems cannot be restored from its ledger
-/// entry alone: the entry names its platforms and no patch for their trees
-/// ([`VendorEntry::gem_platforms`]), so there is nothing to fetch them by.
-pub(super) const UNATTRIBUTED_TREES: &str = "the ledger names no patch for the platform gems of \
-     this copy; run `socket-patch scan --mode vendored` to vendor it again (or restore the \
-     committed directory from version control)";
 
 /// `<uuid>/.gitignore` of a gem vendored as platform gems: re-includes
 /// everything under the uuid dir against the project's own ignore rules.
@@ -12863,9 +12837,8 @@ mod tests {
                 assert_eq!(fetched, expected);
 
                 // The ledger entry: each tree's platform, patch and digests,
-                // in lock order, and no bare platform list.
+                // in lock order.
                 assert_eq!(entry.gem_builds, [built(UUID, DARWIN), built(UUID, LINUX)]);
-                assert!(entry.gem_platforms.is_empty());
                 assert_eq!(entry.uuid, UUID);
                 assert_eq!(entry.artifact.path, rel);
                 let inventory = entry.artifact.file_inventory.as_ref().expect("inventory");
@@ -12922,7 +12895,6 @@ mod tests {
                 assert!(ledger.contains("\"gemBuilds\""), "{ledger}");
                 assert!(ledger.contains("\"gemIntegrity\""), "{ledger}");
                 assert!(ledger.contains("\"gemspecIntegrity\""), "{ledger}");
-                assert!(!ledger.contains("\"gemPlatforms\""), "{ledger}");
 
                 // Verification and discovery: one vendored reference.
                 assert_eq!(
@@ -14223,21 +14195,15 @@ mod tests {
                 );
             }
 
-            // A platform the ledger names must be a plain directory name,
-            // whichever field names it.
+            // A platform the ledger names must be a plain directory name.
             let mut poisoned = entry.clone();
             poisoned.gem_builds[0].platform = "../x".to_string();
-            let mut poisoned_list = entry.clone();
-            poisoned_list.gem_builds.clear();
-            poisoned_list.gem_platforms = vec!["../x".to_string()];
-            for poisoned in [poisoned, poisoned_list] {
-                assert_eq!(
-                    check_vendored_artifact(&root, &poisoned, &record).await,
-                    ArtifactHealth::Unverifiable {
-                        reason: "vendor_path_unsafe".to_string()
-                    }
-                );
-            }
+            assert_eq!(
+                check_vendored_artifact(&root, &poisoned, &record).await,
+                ArtifactHealth::Unverifiable {
+                    reason: "vendor_path_unsafe".to_string()
+                }
+            );
         }
 
         /// The usual nokogiri patch touches only files no precompiled gem
@@ -14501,106 +14467,36 @@ mod tests {
             }
         }
 
-        /// A ledger entry that names the platforms of its copy and no patch
-        /// for their trees (`gemPlatforms`): the copy still verifies against
-        /// the gem patch's record and still reverts byte for byte; a
-        /// restore answers that it must be vendored again; and the next
-        /// vendor run rebuilds it from each platform's own patch and
-        /// records them, the wiring untouched. While a locked platform has
-        /// no patched build, that run leaves the copy in force instead.
+        /// A ledger whose entry still has the key `gemPlatforms` (a
+        /// development build wrote the platforms of the copy there, with no
+        /// patch named for their trees) reads, and the key is ignored: the
+        /// entry is the same one without it. Its revert needs nothing the
+        /// key held: the Gemfile and the lock come back byte for byte from
+        /// the originals the entry records, and the copy is removed.
         #[tokio::test]
-        async fn an_entry_that_names_only_platforms_verifies_reverts_and_is_converted() {
+        async fn an_entry_with_the_key_gem_platforms_reads_without_it_and_reverts() {
             let lock_before = lock(Some(&checksums(&sha('a'), &sha('b'))));
             let (_tmp, root, record) = project(&lock_before).await;
             let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
             let current = vendor_and_persist(&root, &record, &cfg).await;
-            // The entry as an earlier build wrote it.
-            let mut old = current.clone();
-            old.gem_builds.clear();
-            old.gem_platforms = vec![DARWIN.to_string(), LINUX.to_string()];
-            ts::persist(&root, NOKO, old.clone()).await;
-            let saved = crate::vendor::load_state(&root).await.unwrap().entries[NOKO].clone();
-            assert_eq!(saved.gem_platforms, [DARWIN, LINUX]);
-            assert!(saved.gem_builds.is_empty());
-            assert_eq!(saved.gem_tree_platforms(), [DARWIN, LINUX]);
 
-            // `vendor --check`'s verdict.
-            assert_eq!(
-                check_vendored_artifact(&root, &saved, &record).await,
-                ArtifactHealth::Healthy
-            );
-            // `repair`'s restore has no patch to fetch the trees by.
-            let err = crate::vendor::redownload::restore(&root, &saved, &record, &cfg)
+            // The ledger as such a build left it.
+            let state_path = root.join(".socket/vendor/state.json");
+            let mut ledger: Value = serde_json::from_str(&text(state_path.clone()).await).unwrap();
+            let entry = ledger["entries"][NOKO].as_object_mut().unwrap();
+            assert!(entry.remove("gemBuilds").is_some());
+            entry.insert("gemPlatforms".into(), serde_json::json!([DARWIN, LINUX]));
+            tokio::fs::write(&state_path, serde_json::to_vec_pretty(&ledger).unwrap())
                 .await
-                .expect_err("no patch is recorded for the trees");
-            assert!(
-                err.contains("names no patch for the platform gems"),
-                "{err}"
-            );
-            assert!(err.contains("scan --mode vendored"), "{err}");
+                .unwrap();
 
-            // A run while one platform has no patched build keeps the copy.
-            let wired = ts::tree_snapshot(&root);
-            let pass_through = Served {
-                listed: Listed::PassThrough,
-                ..served(LINUX)
-            };
-            let (_server, partial) = service(UUID, &[served(DARWIN), pass_through]).await;
-            let (code, detail) = unwrap_refused(
-                vendor(&root, &not_installed(&root), &record, &partial, false).await,
-            );
-            assert_eq!(code, "vendor_prebuilt_platform_pending", "{detail}");
-            assert!(
-                detail.ends_with("its vendored copy stays in force as it is."),
-                "{detail}"
-            );
-            assert_eq!(ts::tree_snapshot(&root), wired);
+            let read = crate::vendor::load_state(&root).await.unwrap().entries[NOKO].clone();
+            let mut without_the_key = current.clone();
+            without_the_key.gem_builds.clear();
+            assert_eq!(read, without_the_key, "the key is ignored");
+            assert_eq!(read.wiring, current.wiring, "the originals are the entry's");
 
-            // The next run with every platform patched converts the entry.
-            let (server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
-            let (result, converted, warnings) =
-                unwrap_done(vendor(&root, &not_installed(&root), &record, &cfg, false).await);
-            assert!(result.success, "{:?}", result.error);
-            let rebuilt = warnings
-                .iter()
-                .find(|w| w.code == "vendor_artifact_rebuilt")
-                .unwrap_or_else(|| panic!("{warnings:?}"));
-            assert!(
-                rebuilt
-                    .detail
-                    .contains("was recorded with no patch named for its platform gems"),
-                "{}",
-                rebuilt.detail
-            );
-            assert_eq!(
-                reference_requests(&server).await,
-                [
-                    vec![UUID.to_string()],
-                    vec![build_uuid(UUID, DARWIN), build_uuid(UUID, LINUX)],
-                ]
-            );
-            ts::persist(&root, NOKO, converted.expect("a refreshed entry")).await;
-            let saved = crate::vendor::load_state(&root).await.unwrap().entries[NOKO].clone();
-            assert_eq!(saved.gem_builds, [built(UUID, DARWIN), built(UUID, LINUX)]);
-            assert!(saved.gem_platforms.is_empty(), "the bare list is not kept");
-            assert_eq!(
-                saved.wiring, current.wiring,
-                "the first run's records ride on"
-            );
-            assert_eq!(
-                text(root.join(GEMFILE_LOCK)).await,
-                vendored(&rel(UUID), Some(&checksums("", "")))
-            );
-            // In sync from here on.
-            let requests = ts::request_count(&server).await;
-            let (again, entry, warnings) =
-                unwrap_done(vendor(&root, &not_installed(&root), &record, &cfg, false).await);
-            assert!(again.success, "{:?}", again.error);
-            assert!(entry.is_none() && warnings.is_empty(), "{warnings:?}");
-            assert_eq!(ts::request_count(&server).await, requests);
-
-            // Revert of the entry as the earlier build wrote it.
-            let reverted = revert_gem(&old, &root, false).await;
+            let reverted = revert_gem(&read, &root, false).await;
             assert!(reverted.success, "{:?}", reverted.error);
             assert!(reverted.warnings.is_empty(), "{:?}", reverted.warnings);
             assert_eq!(text(root.join(GEMFILE)).await, GEMFILE_NOKO);

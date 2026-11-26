@@ -254,12 +254,8 @@ pub async fn restore(
                     parse_gem_purl(&entry.base_purl).ok_or("invalid gem coordinates")?;
                 // A gem vendored as platform gems is restored tree by tree,
                 // each from the patch the ledger records for it and against
-                // the digests recorded with it. An entry that names its
-                // platforms and no patch has nothing to fetch them by.
+                // the digests recorded with it.
                 let copied = match entry.gem_builds.as_slice() {
-                    [] if !entry.gem_platforms.is_empty() => {
-                        return Err(super::gem::UNATTRIBUTED_TREES.into());
-                    }
                     [] => {
                         super::gem::gem_service_copy(
                             Some(service),

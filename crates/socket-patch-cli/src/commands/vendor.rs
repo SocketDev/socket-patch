@@ -4385,14 +4385,10 @@ pub(crate) async fn vendor_records_reusing(
             // inventories were recorded, or past the inventory cap) gives an
             // exact restore nothing to check a download against: the backend
             // below rebuilds its copy from a fresh verified download instead.
-            // Nor does a gem entry that names the platforms of its trees
-            // and no patch for them: the backend rebuilds that copy too,
-            // from each platform's own patch, and records them.
             if let Some(entry) = lookup_entry(&state.entries, candidate).filter(|entry| {
                 entry.uuid == record.uuid
                     && (entry.artifact.file_inventory.is_some()
                         || vendor::artifact_is_file_shaped(&entry.artifact.path))
-                    && (entry.gem_platforms.is_empty() || !entry.gem_builds.is_empty())
             }) {
                 let redownload =
                     match vendor::check_vendored_artifact(&common.cwd, entry, record).await {
