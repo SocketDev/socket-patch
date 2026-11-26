@@ -4910,7 +4910,7 @@ gem, and the lock then has one entry per platform the project supports, usually 
 
 For such a gem the patch registry lists every platform gem of the version: a patched platform
 gem where one is built (the upstream platform gem with the patch's files replaced, under the same
-file name), and upstream's own gem for a platform that has none yet, which the registry hands on
+file name), and upstream's own gem for a platform that has none yet, which the registry relays
 unchanged. So the scan moves the gem as soon as one platform the lock names has a patched build.
 The Gemfile edit is the same as for any gem, every platform entry moves to the patch registry's
 `GEM` section with its dependency lines (and a plain `nokogiri (1.18.10)` entry beside them moves
@@ -4929,15 +4929,17 @@ nokogiri 1.18.10: patched for x86_64-linux-gnu; upstream gem kept for arm64-darw
 In `--json`, each patched build is one `applied` event under its own patch
 (`pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu`, with the gem's patch in `details.gemFix`),
 and a build that keeps upstream's gem is an event with `errorCode: "gem_upstream_build_kept"`
-that `summary` does not count. Totals and the rollout budget count the gem as one package.
+that `summary` does not count. Totals and the rollout budget count the gem as one package, and the
+scan's closing lines name what is still waiting: `Not patched yet: nokogiri 1.18.10 for
+arm64-darwin.`
 
 VEX follows the builds. The scan's `--vex` attests each patched build under its own patch and
 writes an `affected` statement for a build that keeps upstream's gem. A later `socket-patch vex`
 reads the lock and asks the patch service which builds are patched (one request per such gem,
 and one more for a lock with no `CHECKSUMS` section): a build is attested as patched only when
-the lock installs exactly that patch's gem. When it cannot tell (`--offline`, a failed request,
-a lock older than what the patch service lists now) it leaves the build out and says so with
-`vex_gem_build_unknown`, naming what to run.
+the lock installs exactly that patch's gem. When it cannot show that (`--offline`, a failed
+request, a lock older than what the patch service lists now) it states the build as `affected`,
+with what to run to settle it, under the warning `vex_gem_build_unknown`. The run still succeeds.
 
 The registry URL the scan writes names the registry as it stood (`…/s/<key>/`). When a patched
 build is published for another platform, the next scan is given a URL with another key: it
@@ -4946,6 +4948,10 @@ refreshes the URL in both files, rewrites the one checksum that changed, and say
 ```text
 nokogiri 1.18.10: now also patched for arm64-darwin; already patched for x86_64-linux-gnu
 ```
+
+If a patched build is withdrawn, the next scan puts the upstream gem's checksum back for that
+platform, and replaces a copy a machine already installed from the withdrawn build with upstream's
+gem (a `bundle install` would keep it).
 
 Adding a platform is Bundler's own step: `bundle lock --add-platform <platform>` resolves the gem
 from its one source, the patch registry, and adds that platform's entry and checksum. The next
