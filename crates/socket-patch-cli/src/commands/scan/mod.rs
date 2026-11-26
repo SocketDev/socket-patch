@@ -4394,9 +4394,11 @@ async fn scan_project(
                 .take()
                 .expect("the vendored planning pass computed the preview");
             preview.retain_selected(&selected);
-            preview
-                .ask_platform_gems(&args.common, &api_client, use_public_proxy)
-                .await;
+            // The future embeds the vendor backend's reading of a gem's
+            // lock and its requests to the patch service, for a vendored
+            // dry run alone: awaited in line it lay in the poll frame of
+            // a scan in every mode. `boxed` leaves this frame one pointer.
+            boxed(|| preview.ask_platform_gems(&args.common, &api_client, use_public_proxy)).await;
             Some(preview)
         } else {
             None

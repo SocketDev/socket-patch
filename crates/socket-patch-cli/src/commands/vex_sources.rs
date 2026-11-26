@@ -1411,7 +1411,13 @@ pub(crate) async fn plan(
         plan.view.patches.insert(cand.key, record);
     }
     plan.redirected.sort();
-    resolve_hosted_gems(common, root, &mut plan, &hosted_gem_builds, api_client).await;
+    // The future holds the requests about the builds of the hosted gems:
+    // awaited in line it is most of this plan's own, in a run with no
+    // hosted gem too. `boxed` leaves the plan one pointer.
+    crate::ecosystem_dispatch::boxed(|| {
+        resolve_hosted_gems(common, root, &mut plan, &hosted_gem_builds, api_client)
+    })
+    .await;
     // One skip per (purl, reason): a collision gates its key once per
     // colliding candidate.
     let mut seen: HashSet<(String, String)> = HashSet::new();

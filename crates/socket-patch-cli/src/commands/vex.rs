@@ -2475,13 +2475,20 @@ async fn generate_vex_with_cleanup(
     calm_when_nothing: bool,
 ) -> Result<VexWriteSummary, VexGenError> {
     let mut warnings = Vec::new();
-    let result = generate_vex_from_manifest_path_inner(
-        common,
-        params,
-        manifest_path,
-        calm_when_nothing,
-        &mut warnings,
-    )
+    // The generator's future holds every attestation source it reads, and
+    // `scan`, `apply` and `vendor` await it for `--vex`: awaited in line
+    // it lay in the poll frame of each of them, once per place that
+    // awaits it, in a run without `--vex` too. `boxed` leaves them one
+    // pointer.
+    let result = crate::ecosystem_dispatch::boxed(|| {
+        generate_vex_from_manifest_path_inner(
+            common,
+            params,
+            manifest_path,
+            calm_when_nothing,
+            &mut warnings,
+        )
+    })
     .await;
     match result {
         Ok(mut summary) => {
@@ -4810,5 +4817,34 @@ mod bazel_tests {
                 .map(|(purl, action)| format!("{purl}: the VEX document says affected. {action}"));
             assert_eq!(details, warned);
         }
+    }
+}
+
+#[cfg(test)]
+mod embedded_future_tests {
+    use super::*;
+
+    /// What `--vex` puts on the stack of the commands that can write a
+    /// document (`scan`, `apply`, `vendor`) stays a pointer to the
+    /// generator beside what they hand it. A debug build builds every
+    /// future on the poll frame of the function that awaits it, also in a
+    /// run without `--vex`, and a scan that applies a patch in place takes
+    /// most of the 2 MiB a test thread has: what the generator reads and
+    /// asks about is behind that pointer, whatever it grows to.
+    #[test]
+    fn the_generator_costs_the_command_that_embeds_it_a_pointer() {
+        use std::mem::{size_of, size_of_val};
+        let common = GlobalArgs::default();
+        let params = VexEmbedArgs::default().to_build_params(None);
+        let manifest_path = Path::new("manifest.json");
+        // The three references, the advisories, the pointer, and the
+        // result with the removal of a stale document.
+        let bound = 128 * size_of::<usize>();
+        let with_manifest = generate_vex_from_manifest_path(&common, &params, manifest_path);
+        let size = size_of_val(&with_manifest);
+        assert!(size <= bound, "with a manifest: {size} bytes");
+        let without = generate_vex_without_manifest(&common, &params, manifest_path);
+        let size = size_of_val(&without);
+        assert!(size <= bound, "without a manifest: {size} bytes");
     }
 }
