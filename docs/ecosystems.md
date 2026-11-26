@@ -4949,9 +4949,16 @@ refreshes the URL in both files, rewrites the one checksum that changed, and say
 nokogiri 1.18.10: now also patched for arm64-darwin; already patched for x86_64-linux-gnu
 ```
 
-If a patched build is withdrawn, the next scan puts the upstream gem's checksum back for that
-platform, and replaces a copy a machine already installed from the withdrawn build with upstream's
-gem (a `bundle install` would keep it).
+If a patched build is withdrawn, the registry stops serving it under the URL the lock names, and a
+fresh `bundle install` fails on that platform until the lock is refreshed. The next scan puts the
+upstream gem's checksum back for that platform, replaces a copy a machine already installed from
+the withdrawn build with upstream's gem (a `bundle install` would keep it), and says so:
+
+```text
+nokogiri 1.18.10: patched for arm64-darwin; upstream gem back for x86_64-linux-gnu (its patched build was withdrawn)
+```
+
+In `--json` that build's `gem_upstream_build_kept` event carries `details.withdrawn: true`.
 
 Adding a platform is Bundler's own step: `bundle lock --add-platform <platform>` resolves the gem
 from its one source, the patch registry, and adds that platform's entry and checksum. The next
@@ -4965,7 +4972,11 @@ Three cases leave the gem as it is, with one plain line and no warning:
   A platform is left out while its patched build is being made;
 - the lock is on an earlier fix that patches a build the newer fix has no patched build for yet
   (`redirect_gem_newer_fix_waits`). A scan never turns a build that is patched today into
-  upstream's gem, so the lock stays on the patch it is on.
+  upstream's gem, so the lock stays on the patch it is on. To tell, the scan asks the registry
+  the lock is on what it still serves (one small request, only in this situation). A build that
+  registry has withdrawn is not patched today and would fail to install, so it does not hold the
+  lock: when nothing is left to lose, the gem moves to the newer fix and that platform goes back
+  to upstream's gem, as above. If the registry cannot be read, the lock stays.
 
 A later scan moves the gem once the patched builds are there.
 
