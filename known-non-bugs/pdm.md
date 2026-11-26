@@ -1,0 +1,45 @@
+# PDM known non-bugs and documented limitations
+
+One line per ruled-out false positive or documented limitation. Search with `git grep`; don't read it whole.
+
+- lock_version absent / 3.1 / 4.0–4.2 refused; 2.8.0 accepted-but-crashes (documented).
+- `__pypackages__` (PEP 582) not crawled; agent mode falls through to the PATH interpreter (documented). Hosted mode installs into `__pypackages__` fine.
+- A plain relock (`pdm lock`, `pdm update <pkg>`) drops the hosted / vendored patch (documented; re-scan). Measured: `pdm lock --refresh` actually **keeps** it on 2.12.4 and 2.29.2 (the doc's claim is conservative drift, not a bug). Rollback still works when the package stays at the same version.
+- PDM < 2.11 keeps an already-installed same-version package after a hosted rewrite (`redirect_pdm_stale_install_risk`, documented).
+- Vendored refuses lock-only checkouts (`vendor_fetch_unverifiable`), by design.
+- Hosted never takes over a vendored `path` (`redirect_pdm_refused`), by design (hosted-direction takeover is warn-only). Hosted→vendored for PyPI fails closed with `pypi_pdm_source_already_exists` (the same for uv/poetry): run `rollback` first.
+- A multi-target (`pdm lock --append`) lock holding the package at two versions is refused (`redirect_pdm_refused`), documented.
+- PDM 2.10 `install.cache_method=pth`: agent apply fails closed with `File not found`.
+- `pdm lock` without `-G` does not lock optional groups (PDM behaviour, not a socket-patch bug).
+- The mock-based published 4.0.0 wheel yields `redirected: 0` on lock-only projects, so it can't be used to bisect hosted findings.
+- v5 hosted rollback/remove after the package left the lock (`pdm remove`, upgrade): exit 1 `Manifest not found` is the documented truly-empty result (formerly #382).
+- v5 hosted rollback refuses a non-universal release (binary wheels) on a lock without `cross_platform` (PDM ≥ 2.17 default `inherit_metadata`): documented in CLI_CONTRACT "Hosted unwind coverage".
+- v5 hosted rollback on a `cross_platform` lock writes every PyPI release file (e.g. pyyaml 6.0.1: 51), where PDM locked a requires-python-filtered subset (39). Installs and `lock --check` are unaffected; cosmetic.
+- v5 hosted VEX on a lock-only checkout attests the redirect (the lock is the hosted state); a stale installed copy is omitted `not_applied`.
+- A first `pdm add -g` with no `pdm use -g` installs into the system interpreter, which `scan -g` does find; only the venv and PDM-managed interpreter cases are #451.
+- `scan -g --mode vendored` is accepted (exit 0) while hosted refuses. It isn't PDM-specific, so it's left to maintainers; not filed.
+- `rollback` deletes the manifest entry (documented: it removes local state), so a later `apply` is a no-op.
+- A mode-less `scan` without `-g` / `--prune` defaults to hosted and rewrites `pdm.lock` (documented default).
+- From a monorepo root, `scan 'services/*'` writes per-project `.socket/`, but `rollback` from the root reports `Manifest not found` (use `--cwd services/api`). That's generic, not PDM-specific; left to maintainers.
+- After an agent → vendored takeover, `.socket/manifest.json` stays as `{"patches": {}}` (cosmetic).
+- Test-harness note: PDM's http:// downloads from a 127.0.0.1 mock get a 405 from the agent proxy unless `HTTPS_PROXY` is unset (sandbox artifact, not a bug).
+- PDM 2.12 – 2.20 `pdm add <other>` after hosted/vendored keeps the patched hash but drops the `url`/`path` (an uninstallable lock, PDM reuse behaviour, known from #331). Hosted re-scan repairs it. Vendored re-scan refuses (`pypi_pdm_source_already_exists`, "run `pdm lock`") and rollback fails closed (drift); the `pdm lock` → re-scan → rollback path works. 2.29.2 keeps the source.
+- `pdm sync --prod --clean` leaves dev/optional-only packages installed: identical without socket-patch (PDM behaviour).
+- The hosted stale-install warning mentions "Poetry before 1.4" on PDM projects (generic text, cosmetic).
+- Test-harness note: VEX resolves the hosted patch uuid from the URL's second uuid segment, so a mock `view` must answer for it. Don't `pkill -f mock`, which kills the calling shell.
+- A UTF-8 BOM `pdm.lock` is rejected by PDM itself (`lock --check` / `sync` fail with no socket-patch involved).
+- Hosted rollback of a lock that **mixes** CRLF and LF rewrites the whole file to LF (scan only touches the edited unit; vendored rollback and pure-CRLF hosted rollback are byte-exact). PDM never writes mixed endings and the result is semantically identical, so it's cosmetic and not filed, though it drifts from pdm-compatibility.md's "preserves line endings".
+- Test-harness note: hosted refs on a mock origin need `SOCKET_PATCH_SERVER_URL`; vendored grants need `integrity.sha512` as SRI. `pdm use` in a fresh dir can pick another project's interpreter, so write `.pdm-python` explicitly. Out-of-tree PDM venvs are shared between copies of a project dir, so reset them (`pdm sync --reinstall`) between builds.
+- A SIGKILLed hosted/vendored scan leaves `.socket-stage-pdm.lock-<uuid>` files in the project root that re-scan / rollback never sweep. The lock itself is always original or fully rewritten (85 kills, 2.29.2). Generic staging behaviour and crash-only, so it's left to maintainers.
+- Test-harness note: the sandbox's `/usr/local/lib/python3.11/dist-packages` now carries urllib3 1.26.18 (from a `pdm add -g` with no global venv), which masks `-g` scan counts on python3.11; check the file bytes of the target copy instead.
+- PDM 2.0–2.4 treat a `.pdm.toml` with a base `python.path` (from `pdm use -f <base>`) as PEP 582, and discovery agrees (verified on 2.0.3).
+- Agent `vex` after a #609 mis-patch fails closed (`not_applied`), so there's no false attestation there.
+- `lock_version` by release: 1.5.x writes `2` (supported, installs fine), 1.6.x writes `3` and 1.7.x writes `3.1` (both refused, lock untouched). pdm-compatibility.md's "0.12 – 1.4" / "1.8 – 1.15" ranges are slightly off (doc drift only).
+- The vendored `vex` attestation over an out-of-sync installed tree is by design (the `vendored_tree_out_of_sync` disclosure). #641 covers only the missing scan warning and the remedy on PDM < 2.11.
+- Test-harness note: PDM 1.5.x needs `resolvelib==0.7.0`; PDM 1.x `pdm sync` exits 1 on a throwaway `[project]` without `[tool.pdm] distribution = false` (self-install), unrelated to socket-patch.
+- `scan --mode agent --json` after a refused apply (PDM cache symlink) shows `partial_failure` with `failed: 0` and no reason: that's the generic #424, not PDM-specific.
+- The "PDM 0.x may regenerate freshly generated locks" warning also fires on PDM 1.4.5 / 1.5.3 lock_version 2 locks (it can't tell them apart). Harmless.
+- `PDM_PYTHON=<venv dir>` (not an interpreter) is ignored by PDM itself, which falls back to `.venv`; socket-patch agrees.
+- Test-harness note: hosted rollback needs `SOCKET_PYPI_JSON_API` pointed at a local pass-through (reqwest can't reach pypi.org directly in the sandbox). Never `pgrep -f`/`pkill -f` the mock (it matches the shell); use pid files.
+- PDM 1.x (lock_version 2) rollback warning names `pdm sync --reinstall`, which PDM 1.4.5 / 1.5.x lack; the alternative it also names (delete `__pypackages__`/venv, then `pdm sync`) works. Cosmetic friction, not filed (2026-11-26).
+- Test-harness note: PDM 1.4.5 sync needs `pip==21.0.1` in its tool venv; PDM 2.26.9 / 2.29.2 need `uv pip install --exclude-newer 2026-09-18` (newer hishel breaks them).
