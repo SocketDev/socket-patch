@@ -1146,6 +1146,63 @@ fn vlt_hosted_rollback_dry_run_keeps_the_store_and_wet_human_run_heals() {
     assert!(!root.join("node_modules/.vlt-lock.json").exists());
 }
 
+/// A rollback that cannot check an installed copy (vlt's hidden lock is
+/// gone, as after a heal that removed another package's stale copy) keeps
+/// the copy and reports it as a rollback, in human and `--json` mode: the
+/// registry pins are restored and `vlt ci` installs the registry packages.
+/// The hosted flow's "vlt-lock.json pins Socket-patched packages" is false
+/// here, since the run has just taken the pin out.
+#[test]
+fn vlt_hosted_rollback_reports_an_unchecked_copy_as_a_rollback() {
+    let unchecked = "restored registry pins for 1 packages, but socket-patch could not check 1 \
+                     installed copies (node_modules is a link, or node_modules/.vlt-lock.json \
+                     is missing or unreadable); run `vlt ci` to be sure the registry packages \
+                     are installed";
+    let registry = NpmRegistry::start(&[("left-pad", "1.3.0")]);
+    for json in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = write_vlt_hosted_fixture(root);
+        std::fs::remove_file(root.join("node_modules/.vlt-lock.json")).unwrap();
+
+        let mut args = vec!["rollback", "--yes"];
+        if json {
+            args.push("--json");
+        }
+        let (code, stdout, stderr) = run_hosted(root, &args, Some(&registry));
+        assert_eq!(code, 0, "json={json}\n{stdout}\n{stderr}");
+        let restored = std::fs::read_to_string(root.join("vlt-lock.json")).unwrap();
+        assert!(
+            restored.contains(UPSTREAM_INTEGRITY) && !restored.contains("patch.socket.dev"),
+            "json={json}: the registry pin is back:\n{restored}"
+        );
+        assert!(
+            store.join("index.js").exists(),
+            "json={json}: a copy the heal cannot judge is kept"
+        );
+        if json {
+            let doc = common::envelope::parse_json_envelope(&stdout);
+            let details: Vec<&str> = doc["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|w| w["code"] == "redirect_vlt_reinstall_required")
+                .filter_map(|w| w["detail"].as_str())
+                .collect();
+            assert_eq!(details, [unchecked], "{doc:#}");
+        } else {
+            assert!(
+                stderr.contains(&format!("Warning: {unchecked}")),
+                "the advisory speaks of the rollback, not of a pin:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains("vlt-lock.json pins Socket-patched packages"),
+                "{stderr}"
+            );
+        }
+    }
+}
+
 /// Human twin of `manifest_write_failure_warns_and_exits_one`: the failed
 /// manifest update prints the "Error: Failed to update the manifest:"
 /// stderr line, exit 1, manifest byte-identical — after the file restore
