@@ -1512,6 +1512,19 @@ async fn generate_vex(
         tooling: Some(format!("socket-patch {}", env!("CARGO_PKG_VERSION"))),
     };
 
+    // A gem vendored as platform gems was judged above as the one copy it
+    // is; the document names each of its platform gems, under the patch
+    // that built it (see `GemBuildView`).
+    let mut affected = affected;
+    let gem_builds = crate::commands::vex_sources::GemBuildView::of(&plan);
+    if let Some(builds) = &gem_builds {
+        builds.expand(&mut outcome.applied);
+        builds.expand(&mut outcome.vendored);
+        builds.expand(&mut outcome.code_not_present);
+        builds.expand_noted(&mut affected);
+    }
+    let manifest = gem_builds.as_ref().map_or(manifest, |builds| builds.view());
+
     // `--no-verify` declared these applied with nothing checked on disk. The
     // purls an in-run hosted redirect confirmed are attested from that run's
     // own evidence in either mode, so they are not among them.

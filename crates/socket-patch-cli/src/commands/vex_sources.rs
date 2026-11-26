@@ -466,6 +466,102 @@ fn gate_unattested(
     });
 }
 
+/// The platform gems a document names in place of the gems vendored as
+/// platform gems.
+///
+/// Such a gem is one vendored copy, verified as one against the record of
+/// the gem's patch. What an install loads from it is one platform gem's
+/// tree, and each tree was built by a patch of its own, which the ledger
+/// entry records ([`VendorEntry::gem_builds`]). So the document names each
+/// platform gem (`pkg:gem/<name>@<version>?platform=<platform>`) under
+/// its own patch, with the vulnerabilities of the gem patch's record: the
+/// fix is the same in every one of them. Read from the plan alone, with
+/// no request: the ledger is what says which patch built which tree. An
+/// entry that names no patch for its trees is attested as the gem itself.
+pub(crate) struct GemBuildView {
+    /// The record view with each such gem's key replaced by its platform
+    /// gems' purls.
+    view: PatchManifest,
+    /// View purl of the gem → the purls of its platform gems.
+    platform_gems: BTreeMap<String, Vec<String>>,
+}
+
+impl GemBuildView {
+    /// `None` when `plan` attests no gem vendored as platform gems.
+    pub(crate) fn of(plan: &Plan) -> Option<Self> {
+        let gems: Vec<(&String, &VendorEntry, &PatchRecord)> = plan
+            .vendor_entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.ecosystem == "gem"
+                    && !entry.gem_builds.is_empty()
+                    && entry.gem_builds_well_formed()
+            })
+            .filter_map(|(key, entry)| Some((key, entry, plan.view.patches.get(key)?)))
+            // The entry's trees are the builds of the entry's own patch.
+            .filter(|(_, entry, record)| record.uuid == entry.uuid)
+            .collect();
+        if gems.is_empty() {
+            return None;
+        }
+        let mut view = plan.view.clone();
+        let mut platform_gems = BTreeMap::new();
+        for (key, entry, record) in gems {
+            view.patches.remove(key);
+            let purls: Vec<String> = entry
+                .gem_builds
+                .iter()
+                .map(|built| {
+                    let purl = built.purl(&entry.base_purl);
+                    // A purl the view already attests keeps its own record.
+                    view.patches
+                        .entry(purl.clone())
+                        .or_insert_with(|| PatchRecord {
+                            uuid: built.uuid.clone(),
+                            ..record.clone()
+                        });
+                    purl
+                })
+                .collect();
+            platform_gems.insert(key.clone(), purls);
+        }
+        Some(Self {
+            view,
+            platform_gems,
+        })
+    }
+
+    /// The record view to build the document from.
+    pub(crate) fn view(&self) -> &PatchManifest {
+        &self.view
+    }
+
+    /// Replace each gem of `purls` by its platform gems, in place.
+    pub(crate) fn expand(&self, purls: &mut Vec<String>) {
+        *purls = std::mem::take(purls)
+            .into_iter()
+            .flat_map(|purl| match self.platform_gems.get(&purl) {
+                Some(platform_gems) => platform_gems.clone(),
+                None => vec![purl],
+            })
+            .collect();
+    }
+
+    /// [`Self::expand`] for purls that each carry a note.
+    pub(crate) fn expand_noted(&self, noted: &mut Vec<(String, String)>) {
+        *noted = std::mem::take(noted)
+            .into_iter()
+            .flat_map(|(purl, note)| match self.platform_gems.get(&purl) {
+                Some(platform_gems) => platform_gems
+                    .iter()
+                    .map(|purl| (purl.clone(), note.clone()))
+                    .collect(),
+                None => vec![(purl, note)],
+            })
+            .collect();
+    }
+}
+
 /// One hosted-basis view purl's wiring (see [`Plan::hosted`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostedWiring {
@@ -1445,6 +1541,118 @@ mod tests {
             license: String::new(),
             tier: String::new(),
         }
+    }
+
+    /// A plan attesting the vendored gem `key` at [`U1`], its ledger entry
+    /// shaped by `shape`.
+    fn vendored_gem_plan(key: &str, shape: impl FnOnce(&mut VendorEntry)) -> Plan {
+        let mut entry = VendorEntry::new(
+            "gem".to_string(),
+            "pkg:gem/nokogiri@1.18.10".to_string(),
+            U1.to_string(),
+            socket_patch_core::vendor::state::VendorArtifact {
+                yarn_berry10c0: None,
+                path: format!(".socket/vendor/gem/{U1}/nokogiri-1.18.10"),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            Vec::new(),
+        );
+        shape(&mut entry);
+        Plan {
+            view: PatchManifest {
+                patches: HashMap::from([
+                    (key.to_string(), record(U1)),
+                    ("pkg:npm/left-pad@1.3.0".to_string(), record(U2)),
+                ]),
+                setup: None,
+            },
+            vendor_entries: HashMap::from([(key.to_string(), entry)]),
+            vendor_pins: HashMap::new(),
+            redirected: Vec::new(),
+            lockfile_basis: HashSet::new(),
+            hosted: BTreeMap::new(),
+            gated: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    fn gem_build(platform: &str, uuid: &str) -> socket_patch_core::vendor::GemBuildEntry {
+        socket_patch_core::vendor::GemBuildEntry {
+            platform: platform.to_string(),
+            uuid: uuid.to_string(),
+            gem_integrity: String::new(),
+            gemspec_integrity: String::new(),
+        }
+    }
+
+    /// A gem vendored as platform gems is named per platform gem: each
+    /// under the patch the ledger records for its tree, with the gem
+    /// patch's vulnerabilities and files, and the gem's own key gone from
+    /// the view. Every list of attested purls follows; other packages are
+    /// as they were.
+    #[test]
+    fn a_vendored_gem_is_attested_per_platform_gem_under_its_own_patch() {
+        const DARWIN: &str = "11111111-1111-4111-8111-111111111111";
+        const LINUX: &str = "22222222-2222-4222-8222-222222222222";
+        let key = "pkg:gem/nokogiri@1.18.10?platform=ruby";
+        let plan = vendored_gem_plan(key, |entry| {
+            entry.gem_builds = vec![
+                gem_build("arm64-darwin", DARWIN),
+                gem_build("x86_64-linux-gnu", LINUX),
+            ];
+        });
+        let builds = GemBuildView::of(&plan).expect("a gem vendored as platform gems");
+        let view = builds.view();
+        let darwin = "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin";
+        let linux = "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu";
+        let mut keys: Vec<&str> = view.patches.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, [darwin, linux, "pkg:npm/left-pad@1.3.0"]);
+        for (purl, uuid) in [(darwin, DARWIN), (linux, LINUX)] {
+            let attested = &view.patches[purl];
+            assert_eq!(attested.uuid, uuid);
+            assert_eq!(attested.vulnerabilities, record(U1).vulnerabilities);
+            assert_eq!(attested.files, record(U1).files);
+        }
+        assert_eq!(view.patches["pkg:npm/left-pad@1.3.0"], record(U2));
+
+        let mut applied = vec!["pkg:npm/left-pad@1.3.0".to_string(), key.to_string()];
+        builds.expand(&mut applied);
+        assert_eq!(applied, ["pkg:npm/left-pad@1.3.0", darwin, linux]);
+        let mut noted = vec![(key.to_string(), "why".to_string())];
+        builds.expand_noted(&mut noted);
+        assert_eq!(
+            noted,
+            [
+                (darwin.to_string(), "why".to_string()),
+                (linux.to_string(), "why".to_string())
+            ]
+        );
+    }
+
+    /// The gem itself stays the attested package where the ledger does not
+    /// say which patch built which tree: an entry that names platforms
+    /// only, one whose trees are another patch's than the view's record,
+    /// and one that names a platform no gem platform token spells.
+    #[test]
+    fn a_vendored_gem_with_no_patch_named_for_its_trees_is_attested_as_the_gem() {
+        let key = "pkg:gem/nokogiri@1.18.10?platform=ruby";
+        let platforms_only = vendored_gem_plan(key, |entry| {
+            entry.gem_platforms = vec!["arm64-darwin".to_string()];
+        });
+        assert!(GemBuildView::of(&platforms_only).is_none());
+        let another_patch = vendored_gem_plan(key, |entry| {
+            entry.uuid = U2.to_string();
+            entry.gem_builds = vec![gem_build("arm64-darwin", U2)];
+        });
+        assert!(GemBuildView::of(&another_patch).is_none());
+        let unsafe_platform = vendored_gem_plan(key, |entry| {
+            entry.gem_builds = vec![gem_build("../x", U2)];
+        });
+        assert!(GemBuildView::of(&unsafe_platform).is_none());
     }
 
     fn hosted_ref(purl: &str, uuid: &str, pinned: bool) -> PatchedRef {
