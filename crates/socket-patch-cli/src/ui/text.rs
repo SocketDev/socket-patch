@@ -65,30 +65,58 @@ pub(crate) fn wrap_words(
 
 /// `line` as it prints for a person. With `width` (its stream is a
 /// terminal with a person at it) a line that does not fit breaks after a
-/// clause (`; `)
-/// under a two-space hanging indent, so no clause is cut in two unless it
-/// is itself wider than the terminal, where it wraps at a word. Without
-/// it the line is as it is, so a pipe or a log keeps one line.
+/// clause (`; `) under a two-space hanging indent, so no clause is cut in
+/// two unless it is itself wider than the terminal: such a clause wraps at
+/// a word from where the row stands, and the clause after it goes on from
+/// there. Without `width` the line is as it is, so a pipe or a log keeps
+/// one line.
 pub(crate) fn wrap_line(line: &str, width: Option<usize>) -> String {
     const INDENT: &str = "  ";
     let Some(width) = width else {
         return line.to_string();
     };
-    let mut rows: Vec<String> = Vec::new();
+    let len = |text: &str| text.chars().count();
+    // What a row holds beside its indent: every row but the first has one.
+    let later = width.saturating_sub(INDENT.len());
+    let room = |rows: &[String]| if rows.len() > 1 { later } else { width };
+    // Put `text` on the row being filled, or on a new one when it is full.
+    fn place(rows: &mut Vec<String>, text: &str, room: usize) {
+        let row = rows.last_mut().expect("one row at least");
+        if row.is_empty() {
+            row.push_str(text);
+        } else if row.chars().count() + 1 + text.chars().count() <= room {
+            row.push(' ');
+            row.push_str(text);
+        } else {
+            rows.push(text.to_string());
+        }
+    }
+    let mut rows: Vec<String> = vec![String::new()];
     for clause in line.split_inclusive("; ") {
         let clause = clause.trim_end();
-        let room = if rows.len() > 1 { INDENT.len() } else { 0 };
-        match rows.last_mut() {
-            Some(row) if room + row.chars().count() + 1 + clause.chars().count() <= width => {
-                row.push(' ');
-                row.push_str(clause);
-            }
-            _ => rows.push(clause.to_string()),
+        let row = rows.last().expect("one row at least");
+        let here = if row.is_empty() {
+            len(clause) <= room(&rows)
+        } else {
+            len(row) + 1 + len(clause) <= room(&rows)
+        };
+        if here || len(clause) <= later {
+            let room = room(&rows);
+            place(&mut rows, clause, room);
+            continue;
+        }
+        // Wider than a row: at a word, a code span kept whole.
+        for word in wrap_tokens(clause) {
+            let room = room(&rows);
+            place(&mut rows, &word, room);
         }
     }
     rows.iter()
         .enumerate()
-        .flat_map(|(at, row)| wrap_words(row, width, if at == 0 { "" } else { INDENT }, INDENT))
+        .map(|(at, row)| match at {
+            0 => row.clone(),
+            _ => format!("{INDENT}{row}"),
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -430,6 +458,49 @@ pub(crate) fn shell_word(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A line breaks after a clause, a clause is cut only when it is
+    /// wider than the terminal, and the clause after one that wrapped goes
+    /// on from where it left the row. A pipe keeps one line.
+    #[test]
+    fn wrap_line_breaks_after_clauses_and_goes_on_after_one_that_wrapped() {
+        let kept =
+            "nokogiri 1.19.3: patched for aarch64-linux-gnu, x86_64-linux-gnu; upstream gem \
+                    kept for arm64-darwin (no patched build yet)";
+        assert_eq!(wrap_line(kept, None), kept);
+        assert_eq!(wrap_line(kept, Some(200)), kept);
+        assert_eq!(
+            wrap_line(kept, Some(80)),
+            "nokogiri 1.19.3: patched for aarch64-linux-gnu, x86_64-linux-gnu;\n  upstream gem kept \
+             for arm64-darwin (no patched build yet)"
+        );
+        let waiting = "nokogiri 1.19.3: no patched build yet for aarch64-linux-gnu, arm64-darwin, \
+                       x86_64-linux-gnu; left on its upstream registry";
+        assert_eq!(
+            wrap_line(waiting, Some(80)),
+            "nokogiri 1.19.3: no patched build yet for aarch64-linux-gnu, arm64-darwin,\n  \
+             x86_64-linux-gnu; left on its upstream registry"
+        );
+        let vendored = "nokogiri@1.19.3 is not vendored: no patched build yet for arm64-darwin \
+                        (aarch64-linux-gnu and x86_64-linux-gnu have one). Vendored mode needs \
+                        every locked platform; `scan --mode hosted` can patch the others now.";
+        assert_eq!(
+            wrap_line(vendored, Some(80)),
+            "nokogiri@1.19.3 is not vendored: no patched build yet for arm64-darwin\n  \
+             (aarch64-linux-gnu and x86_64-linux-gnu have one). Vendored mode needs every\n  \
+             locked platform; `scan --mode hosted` can patch the others now."
+        );
+        for width in [80, 100, 120] {
+            for line in [kept, waiting, vendored] {
+                let wrapped = wrap_line(line, Some(width));
+                assert!(
+                    wrapped.lines().all(|row| row.chars().count() <= width),
+                    "{width}: {wrapped}"
+                );
+                assert_eq!(wrapped.replace("\n  ", " "), line, "nothing is lost");
+            }
+        }
+    }
 
     #[test]
     fn wrap_words_respects_width_prefix_and_long_words() {

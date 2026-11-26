@@ -731,7 +731,10 @@ pub(crate) fn format_advisory(code: &str, detail: &str, verbose: bool) -> Option
 /// names the gem itself and is the whole line.
 fn format_skip(purl: &str, code: &str, detail: &str) -> String {
     if code == vendor::VENDOR_PREBUILT_PLATFORM_PENDING {
-        detail.to_string()
+        // The one line of the gem, on stderr: wrapped for a person at a
+        // terminal, as the hosted line of such a gem is.
+        let width = crate::ui::attended(crate::ui::Stream::Stderr).then(crate::ui::stderr_width);
+        crate::ui::wrap_line(detail, width)
     } else {
         format!("Skipping {}: {detail}", normalize_purl(purl))
     }
