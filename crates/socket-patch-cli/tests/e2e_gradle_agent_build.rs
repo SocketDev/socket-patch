@@ -710,7 +710,7 @@ fn gradle_agent_global_prefix() {
     let elsewhere = c.root.join("another-gradle-home");
     std::fs::create_dir_all(&elsewhere).unwrap();
     let env = [("GRADLE_USER_HOME", elsewhere.as_path())];
-    let ok = |args: &[&str]| {
+    let socket_ok = |args: &[&str]| {
         let (code, json) = c.socket_env(args, &env);
         assert_eq!(code, Some(0), "{args:?}: {json}");
     };
@@ -719,15 +719,21 @@ fn gradle_agent_global_prefix() {
         c.leaf_manifest();
         let p = prefix.to_str().unwrap();
         // Control: without the prefix this run does not reach the cache.
-        c.socket_env(&["apply", "--offline"], &env);
-        for dir in c.hash_dirs() {
+        let (_, json) = c.socket_env(&["apply", "--offline"], &env);
+        assert_eq!(
+            json["events"][0]["errorCode"], "package_not_installed",
+            "{json}"
+        );
+        let cached = c.hash_dirs();
+        assert!(!cached.is_empty(), "no cached {}", jar_leaf());
+        for dir in cached {
             assert_eq!(std::fs::read(dir.join(jar_leaf())).unwrap(), pristine_jar());
         }
-        ok(&["apply", "--offline", "--global-prefix", p]);
+        socket_ok(&["apply", "--offline", "--global-prefix", p]);
         c.assert_consumes_patched(&[], "after a global-prefix apply");
         let (statements, json) = c.vex_env(&["--global-prefix", p], &env);
         assert!(statements > 0, "{json}");
-        ok(&["rollback", "--offline", "--global-prefix", p]);
+        socket_ok(&["rollback", "--offline", "--global-prefix", p]);
         c.assert_consumes_pristine(&[], "after a global-prefix rollback");
     }
 }

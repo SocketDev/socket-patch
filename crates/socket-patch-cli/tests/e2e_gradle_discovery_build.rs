@@ -365,10 +365,11 @@ fn global_prefix_scan_says_nothing_about_the_user_home() {
             &fx.m2,
             &["--global", "--ecosystems", "maven"],
         );
+        // The envelope lists that cache's packages: print the warnings only.
         assert!(
             global.warning("gradle_user_home_differs").is_some(),
             "{}",
-            global.env
+            global.env["warnings"]
         );
     }
     let scan = scan(

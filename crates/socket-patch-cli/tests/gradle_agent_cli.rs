@@ -1328,7 +1328,12 @@ fn global_prefix_apply_vex_rollback() {
         std::fs::create_dir_all(&elsewhere).unwrap();
         let env = [("GRADLE_USER_HOME", elsewhere.to_str().unwrap())];
         // Control: without the prefix this run does not reach the cache.
-        f.run_env(&["apply", "--offline"], &env);
+        let control = f.run_env(&["apply", "--offline"], &env);
+        assert_eq!(
+            control.json["events"][0]["errorCode"], "package_not_installed",
+            "{prefix}: {}",
+            control.json
+        );
         assert_eq!(hash_copies(&version, JAR)[0].1, pristine_jar(), "{prefix}");
         f.run_env(&["apply", "--offline", "--global-prefix", p], &env)
             .ok();
