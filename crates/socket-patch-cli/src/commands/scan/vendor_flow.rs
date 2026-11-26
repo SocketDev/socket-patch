@@ -241,13 +241,16 @@ impl VendorPreview {
     /// could not say is the failure the wet run would end in, never a
     /// promise to vendor.
     ///
-    /// `client` is the run's API client, with whether it targets the
-    /// public proxy; a caller that holds none has one built from `common`,
-    /// once, and only when a gem is to be asked about.
+    /// `client` is the run's API client, and `use_public_proxy` whether
+    /// it targets the public proxy: the client the wet run's vendor step
+    /// asks through, so the preview takes the wet run's route (a fallback
+    /// to the public proxy included) and resolves no organisation of its
+    /// own.
     pub(crate) async fn ask_platform_gems(
         &mut self,
         common: &GlobalArgs,
-        client: Option<(&ApiClient, bool)>,
+        client: &ApiClient,
+        use_public_proxy: bool,
     ) {
         let would_vendor = |row: &PreviewRow| {
             matches!(
@@ -269,21 +272,8 @@ impl VendorPreview {
         if platform_gems.is_empty() {
             return;
         }
-        let service = match (common.offline, client) {
-            // Offline, the backend refuses before it would ask.
-            (true, _) => common.vendor_service_config(None, false),
-            (false, Some((client, use_public_proxy))) => {
-                common.vendor_service_config(Some(client.clone()), use_public_proxy)
-            }
-            (false, None) => {
-                let (client, use_public_proxy) =
-                    socket_patch_core::api::client::get_api_client_with_overrides(
-                        common.api_client_overrides(),
-                    )
-                    .await;
-                common.vendor_service_config(Some(client), use_public_proxy)
-            }
-        };
+        // Offline, the backend refuses before it would ask.
+        let service = common.vendor_service_config(Some(client.clone()), use_public_proxy);
         let state = load_state(&common.cwd).await.unwrap_or_default();
         for row in &mut self.rows {
             if !would_vendor(row) || !platform_gems.contains(&row.purl) {
@@ -452,20 +442,6 @@ pub(crate) async fn classify_vendor(
     for row in &mut preview.rows {
         row.hosted = hosted.contains(&row.purl);
     }
-    preview
-}
-
-/// The whole dry-run preview of `get … --mode vendored`, which plans no
-/// rollout: [`classify_vendor`], then what the patch service says of the
-/// gems the lock names as platform gems
-/// ([`VendorPreview::ask_platform_gems`]), asked through an API client
-/// built from `common`.
-pub(crate) async fn preview_vendor(
-    common: &GlobalArgs,
-    selected: &[PatchSearchResult],
-) -> VendorPreview {
-    let mut preview = classify_vendor(common, selected).await;
-    preview.ask_platform_gems(common, None).await;
     preview
 }
 
@@ -1037,7 +1013,7 @@ async fn run_vendor_json_path(
         // human arm, which previews the same GC through `finish_human`).
         preview.retain_selected(&selected);
         preview
-            .ask_platform_gems(&args.common, Some((api_client, use_public_proxy)))
+            .ask_platform_gems(&args.common, api_client, use_public_proxy)
             .await;
         preview.record_into(env);
         if prune {
@@ -1677,6 +1653,7 @@ mod migration_tests {
 mod preview_tests {
     use super::{preview_vendor_with, PreviewVerdict};
     use crate::json_envelope::{Command, Envelope};
+    use socket_patch_core::api::client::{ApiClient, ApiClientOptions, ApiRoute};
     use socket_patch_core::api::types::PatchSearchResult;
     use std::collections::HashMap;
     use std::path::Path;
@@ -1897,7 +1874,13 @@ mod preview_tests {
             preview.rows
         );
 
-        preview.ask_platform_gems(&common, None).await;
+        // The run's client, which answers nowhere either.
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: "http://127.0.0.1:9".to_string(),
+            api_token: None,
+            route: ApiRoute::Proxy,
+        });
+        preview.ask_platform_gems(&common, &client, true).await;
         let verdict = |purl: &str| {
             let row = preview.rows.iter().find(|row| row.purl == purl);
             row.unwrap_or_else(|| panic!("{purl}")).verdict.clone()

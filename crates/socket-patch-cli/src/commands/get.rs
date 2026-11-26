@@ -2742,10 +2742,17 @@ async fn run_get_vendored(
     if let Some(taken) = platform_gem.and_then(PlatformGemPatch::taken_json) {
         env.set_extra("platformGemPatch", taken);
     }
-    // Dry run: ledger-classification preview only (scan's posture) — no
-    // download, no vendor step, no writes.
+    // Dry run: scan's preview, with no download, no vendor step and no
+    // writes. The ledger classification, then what the patch service says
+    // of the gems the lock names as platform gems, asked through this
+    // run's client: the route the wet run's vendor step takes, a fallback
+    // to the public proxy included. `get` plans no rollout, so every row
+    // is in the run.
     if args.common.dry_run {
-        let preview = super::scan::preview_vendor(&args.common, selected).await;
+        let mut preview = super::scan::classify_vendor(&args.common, selected).await;
+        preview
+            .ask_platform_gems(&args.common, api_client, use_public_proxy)
+            .await;
         if args.common.json {
             preview.record_into(&mut env);
             emit(&env);

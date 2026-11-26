@@ -145,7 +145,9 @@ async fn service(patched: &[&'static str], pass_through: &[&'static str]) -> Moc
 
 /// [`service`] for the gem patch `uuid`, where the reference of the patch
 /// of each patched build answers the status named beside its platform
-/// (which is no grant), or a grant when none is named.
+/// (which is no grant), or a grant when none is named. The references and
+/// the gem patch's record are served on the organisation's routes and on
+/// the public proxy's (`/patch/package`, `/patch/view/<uuid>`).
 async fn service_of(
     uuid: &'static str,
     patched: &[(&'static str, Option<&'static str>)],
@@ -230,30 +232,47 @@ async fn service_of(
             }
         }),
     );
-    Mock::given(method("POST"))
-        .and(wm_path(format!("/v0/orgs/{ORG}/patches/package")))
-        .respond_with(move |request: &wiremock::Request| {
-            let asked: serde_json::Value =
-                serde_json::from_slice(&request.body).unwrap_or_default();
-            let answered: serde_json::Map<String, serde_json::Value> = asked["uuids"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|uuid| {
-                    let uuid = uuid.as_str()?;
-                    Some((uuid.to_string(), results.get(uuid)?.clone()))
-                })
-                .collect();
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": answered }))
-        })
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(wm_path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(patch_view_of(uuid)))
-        .mount(&server)
-        .await;
+    for routes in [format!("/v0/orgs/{ORG}/patches"), "/patch".to_string()] {
+        let results = results.clone();
+        Mock::given(method("POST"))
+            .and(wm_path(format!("{routes}/package")))
+            .respond_with(move |request: &wiremock::Request| {
+                let asked: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap_or_default();
+                let answered: serde_json::Map<String, serde_json::Value> = asked["uuids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|uuid| {
+                        let uuid = uuid.as_str()?;
+                        Some((uuid.to_string(), results.get(uuid)?.clone()))
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": answered }))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("{routes}/view/{uuid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(patch_view_of(uuid)))
+            .mount(&server)
+            .await;
+    }
     server
+}
+
+/// Whether `path` is a package reference route: the organisation's or the
+/// public proxy's.
+fn is_reference_route(path: &str) -> bool {
+    path.ends_with("/patches/package") || path == "/patch/package"
+}
+
+/// The path of every request `server` received after its first `seen`
+/// ones, in arrival order.
+async fn request_paths(server: &MockServer, seen: usize) -> Vec<String> {
+    let requests = server.received_requests().await.unwrap_or_default();
+    let new = requests.iter().skip(seen);
+    new.map(|request| request.url.path().to_string()).collect()
 }
 
 /// The uuids each package reference request named, in arrival order.
@@ -261,7 +280,7 @@ async fn reference_requests(server: &MockServer) -> Vec<Vec<String>> {
     let requests = server.received_requests().await.unwrap_or_default();
     requests
         .iter()
-        .filter(|request| request.url.path().ends_with("/patches/package"))
+        .filter(|request| is_reference_route(request.url.path()))
         .map(|request| {
             let asked: serde_json::Value =
                 serde_json::from_slice(&request.body).unwrap_or_default();
@@ -326,23 +345,27 @@ fn write_manifest(root: &Path, uuid: &str) {
 }
 
 /// `socket-patch <args>` at `root` against the stand-in service, hermetic
-/// (no ambient `SOCKET_*`, `BUNDLE_*` or gem home).
+/// (no ambient `SOCKET_*`, `BUNDLE_*` or gem home), as a member of the
+/// organisation [`ORG`].
 fn run(root: &Path, args: &[&str], api: &str) -> (i32, String, String) {
+    run_as(
+        root,
+        args,
+        api,
+        &["--api-token", "fake-token", "--org", ORG],
+    )
+}
+
+/// [`run`] with the `credentials` flags in place of a token and its
+/// organisation.
+fn run_as(root: &Path, args: &[&str], api: &str, credentials: &[&str]) -> (i32, String, String) {
     let mut cmd = hermetic::command(&binary());
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Bundle]);
     cmd.env_remove("GEM_HOME").env_remove("GEM_PATH");
     crate::common::jvm_env::isolate_cli(&mut cmd);
     cmd.args(args)
-        .args([
-            "--api-url",
-            api,
-            "--proxy-url",
-            api,
-            "--api-token",
-            "fake-token",
-            "--org",
-            ORG,
-        ])
+        .args(["--api-url", api, "--proxy-url", api])
+        .args(credentials)
         .current_dir(root);
     let out = cmd.output().expect("run socket-patch");
     (
@@ -1300,6 +1323,107 @@ async fn every_dry_run_previews_a_fully_patched_gem_once_per_platform_gem() {
                 PATCHED
             );
         }
+    }
+}
+
+/// The requests of `paths` to a package reference route.
+fn reference_routes(paths: &[String]) -> Vec<&str> {
+    let paths = paths.iter().map(String::as_str);
+    paths.filter(|path| is_reference_route(path)).collect()
+}
+
+/// `get --mode vendored --dry-run` asks the patch service about a gem
+/// locked as platform gems through the API client the run already has.
+/// With a token and no `--org`, the run asks once which organisation the
+/// token belongs to, and the preview asks for the references on that
+/// organisation's route: the dry run makes the lookup and the reference
+/// requests the wet run makes, on the same routes, and no second lookup.
+#[tokio::test]
+async fn a_vendored_get_dry_run_asks_through_the_runs_own_api_client() {
+    let server = service(&[DARWIN, LINUX], &[]).await;
+    mount_search(&server).await;
+    Mock::given(method("GET"))
+        .and(wm_path("/v0/organizations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organizations": { "org-1": {
+                "id": "org-1", "name": "Test", "image": null, "plan": "free", "slug": ORG
+            }}
+        })))
+        .mount(&server)
+        .await;
+    let project = fresh_project(GET_IT);
+    let root = project.path();
+    let org_route = format!("/v0/orgs/{ORG}/patches/package");
+
+    for (flags, action) in [
+        (&["--dry-run", "--json"][..], "verified"),
+        (&["--json"], "applied"),
+    ] {
+        let seen = server.received_requests().await.unwrap_or_default().len();
+        let args = with(GET_IT, flags);
+        let token = ["--api-token", "fake-token"];
+        let (code, stdout, stderr) = run_as(root, &args, &server.uri(), &token);
+        assert_eq!(code, 0, "{args:?}\n{stdout}\n{stderr}");
+        let env: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("{args:?} must emit JSON: {e}\n{stdout}\n{stderr}"));
+        assert_per_platform_gem(&env, action, "");
+
+        let paths = request_paths(&server, seen).await;
+        let lookups = paths.iter().filter(|path| *path == "/v0/organizations");
+        assert_eq!(lookups.count(), 1, "{args:?}: one lookup: {paths:?}");
+        assert_eq!(
+            reference_routes(&paths),
+            [org_route.as_str(), org_route.as_str()],
+            "{args:?}: the gem patch's reference, then the platform patches': {paths:?}"
+        );
+        let of_the_proxy =
+            |path: &&String| path.starts_with("/patch/") && !path.starts_with("/patch/gem/");
+        assert_eq!(
+            paths.iter().filter(of_the_proxy).count(),
+            0,
+            "{args:?}: nothing is asked of the public proxy: {paths:?}"
+        );
+    }
+}
+
+/// A run whose token the organisation's API refuses falls back to the
+/// public proxy once, when it fetches the patch it was given by UUID, and
+/// stays there. The preview of `get --mode vendored --dry-run` asks
+/// through that client: its references go to the proxy, as the wet run's
+/// do, and it says what the wet run then does. The one request either run
+/// makes of the organisation's API is the one that was refused.
+#[tokio::test]
+async fn a_vendored_get_dry_run_follows_the_runs_fallback_to_the_public_proxy() {
+    let server = service(&[DARWIN, LINUX], &[]).await;
+    Mock::given(wiremock::matchers::path_regex("^/v0/orgs/"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let project = fresh_project(GET_IT);
+    let root = project.path();
+    let refused = format!("/v0/orgs/{ORG}/patches/view/{UUID}");
+    let get_by_uuid = ["get", UUID, "--mode", "vendored", "--yes", "--json"];
+
+    for (flags, action) in [(&["--dry-run"][..], "verified"), (&[], "applied")] {
+        let seen = server.received_requests().await.unwrap_or_default().len();
+        let args = with(&get_by_uuid, flags);
+        let (code, env, stderr) = run_json(root, &args, &server.uri());
+        assert_eq!(code, 0, "{args:?}\n{env:#}\n{stderr}");
+        assert_per_platform_gem(&env, action, "");
+
+        let paths = request_paths(&server, seen).await;
+        let of_the_org: Vec<&str> = paths
+            .iter()
+            .map(String::as_str)
+            .filter(|path| path.starts_with("/v0/"))
+            .collect();
+        assert_eq!(of_the_org, [refused.as_str()], "{args:?}: {paths:?}");
+        assert_eq!(
+            reference_routes(&paths),
+            ["/patch/package", "/patch/package"],
+            "{args:?}: the references are asked of the proxy: {paths:?}"
+        );
     }
 }
 
