@@ -527,8 +527,9 @@ class NokogiriE2E
   #             per locked build. A fresh checkout installs with the lock
   #             frozen, as CI and a deploy do, and Ruby there loads the
   #             patched gem where this machine's platform has one and
-  #             upstream's own gem, which the registry answers with a
-  #             redirect, where it has none yet. With no locked build
+  #             upstream's own gem, which the registry relays (or, with
+  #             `--pass-through-redirect`, answers with a redirect to the
+  #             upstream registry), where it has none yet. With no locked build
   #             patched nothing moves. Once the service has the builds that
   #             were missing, the next scan moves the lock to the newer
   #             registry snapshot and the install is the patched gem.
@@ -572,7 +573,8 @@ class NokogiriE2E
     @patch_service.stop if @patch_service
     @patch_service = PatchService.new(
       "nokogiri", @version, locked_platforms, UUID, GHSA, File.join(File.dirname(@proj), "patch-service"),
-      "\nmodule Nokogiri\n  #{RB_CONST} = 1\nend\n", :pass_through => pass_through
+      "\nmodule Nokogiri\n  #{RB_CONST} = 1\nend\n", :pass_through => pass_through,
+                                                     :redirect => @opts[:redirect]
     )
   end
 
@@ -810,10 +812,16 @@ class NokogiriE2E
         check(now[RB_CONST].nil?, "Ruby there loads upstream's nokogiri: this platform has no patched build yet",
               JSON.pretty_generate(now))
         file = "nokogiri-#{@version}-#{own_platform}.gem"
-        redirected = service.requests.any? { |_, path, status| status == 302 && path.end_with?("/gems/#{file}") }
-        check(redirected && service.upstream_requests.include?(["GET", "/gems/#{file}", 200]),
-              "which the patch registry answers with a redirect to the upstream registry",
-              (service.requests + service.upstream_requests).inspect)
+        answers = service.requests.select { |_, path, _| path.end_with?("/gems/#{file}") }.map(&:last).uniq
+        if @opts[:redirect]
+          check(answers == [302] && service.upstream_requests.include?(["GET", "/gems/#{file}", 200]),
+                "which the patch registry answers with a redirect to the upstream registry",
+                (service.requests + service.upstream_requests).inspect)
+        else
+          check(answers == [200] && service.upstream_requests.empty?,
+                "which the patch registry relays itself, with nothing asked of the upstream registry",
+                (service.requests + service.upstream_requests).inspect)
+        end
       end
       check(now["binary_sha256"] == @baseline["binary_sha256"], "with the precompiled binary, nothing compiled")
       check(now["smoke"] == @baseline["smoke"], "and nokogiri parses, queries, transforms and validates")
@@ -1114,7 +1122,7 @@ puts "sp_probe\t" + JSON.generate(result)
 end
 
 opts = { :install => "any", :build => "ok", :gem_home => "project", :scenarios => %w[ruby c libxml2], :gems => [],
-         :settings => [], :unread_check => true, :add_platforms => [], :pass_through => [] }
+         :settings => [], :unread_check => true, :add_platforms => [], :pass_through => [], :redirect => false }
 parser = OptionParser.new do |o|
   o.banner = "usage: ruby nokogiri_e2e.rb --socket-patch BIN --nokogiri VERSION [options]"
   o.on("--socket-patch BIN", "the socket-patch binary under test") { |v| opts[:socket_patch] = v }
@@ -1142,6 +1150,8 @@ parser = OptionParser.new do |o|
   o.on("--pass-through LIST", Array, "hosted and vendored: the locked platforms the stand-in patch service has no",
        "patched build of yet, so that it hands on upstream's own gem for them: platform names,",
        "`own` (this machine's) or `others` (every other locked one)") { |v| opts[:pass_through].concat(v) }
+  o.on("--pass-through-redirect", "the stand-in answers the file of such a platform with a redirect to the upstream",
+       "registry, which a client must follow, where by default it relays the file") { opts[:redirect] = true }
   o.on("--rails VERSION", "also install this Rails (a Gemfile requirement, for example '~> 7.1.0') and check",
        "that a booted application sanitizes HTML through the patched nokogiri") { |v| opts[:rails] = v }
   o.on("--bundle-setting KEY=VALUE", "one more Bundler setting for the install, for example",

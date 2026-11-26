@@ -28,9 +28,11 @@
 #     `"patchUuid": null`. A request without it gets the plain URL and no
 #     list.
 #   * The registry under a snapshot lists every gem of that list. A
-#     pass-through platform is upstream's own line, and its file is a 302 to
-#     the upstream stand-in (`upstream_url`), which serves the real gem. A
-#     platform whose patched build is still being made is in neither the
+#     pass-through platform is upstream's own line, and its file is relayed:
+#     a 200 with upstream's own bytes. With `:redirect => true` it is a 302
+#     to the upstream stand-in (`upstream_url`), which serves the real gem:
+#     an answer a client must follow too.
+#     A platform whose patched build is still being made is in neither the
 #     list nor the registry. A snapshot answers as it did after `publish`
 #     made a newer one.
 #
@@ -40,8 +42,9 @@
 #   service.publish("arm64-darwin")  # its patched build is there: a newer snapshot
 #
 # Options: `:pass_through` (platforms served as upstream's own gem),
-# `:building` (platforms left out of the list), `:list => false` (a patch of
-# the ruby gem alone: no list for any request).
+# `:redirect => true` (their files are redirected to the upstream stand-in
+# and not relayed), `:building` (platforms left out of the list),
+# `:list => false` (a patch of the ruby gem alone: no list for any request).
 #
 # No gem dependencies, and nothing newer than Ruby 2.1 syntax: the file is
 # loaded on every leg, though its scenarios only run where nokogiri has
@@ -75,6 +78,7 @@ class PatchService
     @work = work
     @mark = mark
     @list = options.fetch(:list, true)
+    @redirect = options.fetch(:redirect, false)
     @requests = []
     @upstream_requests = []
     @reference_requests = []
@@ -474,8 +478,9 @@ class PatchService
     when "info/#{@name}" then [200, "text/plain", info, index]
     when "names" then [200, "text/plain", "---\n#{@name}\n", index]
     else
+      # The row of a pass-through platform holds upstream's own gem.
       state, gem = rows.find { |_, g| "gems/#{g.file}" == rest }
-      if state == :pass_through
+      if state == :pass_through && @redirect
         [302, "text/plain", "", { "Location" => "#{upstream_url}/gems/#{gem.file}", "Cache-Control" => "no-store" }]
       elsif gem then [200, "application/octet-stream", gem.bytes]
       else [404, "text/plain", ""]
