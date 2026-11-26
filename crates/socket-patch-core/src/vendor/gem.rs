@@ -13238,5 +13238,127 @@ mod tests {
             assert_eq!(text(root.join(GEMFILE_LOCK)).await, lock_before);
             assert_eq!(text(root.join(GEMFILE)).await, GEMFILE_NOKO);
         }
+
+        /// `lock` as `bundle lock --remove-platform x86_64-linux-gnu`
+        /// leaves it: the platform, its spec block and its CHECKSUMS line
+        /// are gone (bundler 4.0.18 on a registry lock and on a vendored
+        /// one, #2283).
+        fn without_linux(lock: &str) -> String {
+            let block = "    nokogiri (1.18.10-x86_64-linux-gnu)\n      racc (~> 1.4)\n";
+            assert!(lock.contains(block), "{lock}");
+            let mut out = String::new();
+            for line in lock.replace(block, "").split_inclusive('\n') {
+                let checksum = line.starts_with("  nokogiri (1.18.10-x86_64-linux-gnu)");
+                if line != "  x86_64-linux-gnu\n" && !checksum {
+                    out.push_str(line);
+                }
+            }
+            out
+        }
+
+        /// A platform bundler removed from the lock after the gem was
+        /// vendored has nothing to restore: the revert puts back the
+        /// entries of the platforms still locked, which is the lock bundler
+        /// writes for the same removal on the registry lock (#2283).
+        #[tokio::test]
+        async fn a_platform_removed_from_the_lock_reverts_without_it() {
+            for registry in [None, Some(checksums(&sha('a'), &sha('b')))] {
+                let lock_before = lock(registry.as_deref());
+                let (_tmp, root, record) = project(&lock_before).await;
+                let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+                let entry = vendor_and_persist(&root, &record, &cfg).await;
+                let removed = without_linux(&text(root.join(GEMFILE_LOCK)).await);
+                tokio::fs::write(root.join(GEMFILE_LOCK), &removed)
+                    .await
+                    .unwrap();
+
+                let outcome = revert_gem(&entry, &root, false).await;
+                assert!(outcome.success, "{:?}", outcome.error);
+                assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+                assert_eq!(
+                    text(root.join(GEMFILE_LOCK)).await,
+                    without_linux(&lock_before)
+                );
+                assert_eq!(text(root.join(GEMFILE)).await, GEMFILE_NOKO);
+                assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+            }
+        }
+
+        /// The same removal on a pair that is already back on the registry
+        /// (a hand restore, or a regenerated lock) has converged: nothing
+        /// is written and the copy goes.
+        #[tokio::test]
+        async fn a_restored_lock_without_a_removed_platform_has_converged() {
+            for registry in [None, Some(checksums(&sha('a'), &sha('b')))] {
+                let lock_before = lock(registry.as_deref());
+                let (_tmp, root, record) = project(&lock_before).await;
+                let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+                let entry = vendor_and_persist(&root, &record, &cfg).await;
+                let restored = without_linux(&lock_before);
+                tokio::fs::write(root.join(GEMFILE_LOCK), &restored)
+                    .await
+                    .unwrap();
+                tokio::fs::write(root.join(GEMFILE), GEMFILE_NOKO)
+                    .await
+                    .unwrap();
+
+                let outcome = revert_gem(&entry, &root, false).await;
+                assert!(outcome.success, "{:?}", outcome.error);
+                assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+                assert_eq!(text(root.join(GEMFILE_LOCK)).await, restored);
+                assert_eq!(text(root.join(GEMFILE)).await, GEMFILE_NOKO);
+                assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+            }
+        }
+
+        /// Only the removal bundler makes counts as one. With the spec
+        /// entry gone and the bare CHECKSUMS line vendor wrote still there,
+        /// the platform is restored with the others. With a line vendor
+        /// did not write in its place the record has drifted, and neither
+        /// file is written.
+        #[tokio::test]
+        async fn a_half_removed_platform_is_restored_or_drift() {
+            let lock_before = lock(Some(&checksums(&sha('a'), &sha('b'))));
+            let (_tmp, root, record) = project(&lock_before).await;
+            let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            let entry = vendor_and_persist(&root, &record, &cfg).await;
+            let wired = text(root.join(GEMFILE_LOCK)).await;
+            let gemfile = text(root.join(GEMFILE)).await;
+            let block = "    nokogiri (1.18.10-x86_64-linux-gnu)\n      racc (~> 1.4)\n";
+            let spec_only = wired.replace(block, "");
+            let other_line = spec_only.replace(
+                "  nokogiri (1.18.10-x86_64-linux-gnu)\n",
+                &format!("  nokogiri (1.18.10-x86_64-linux-gnu){}\n", sha('e')),
+            );
+            assert_ne!(other_line, spec_only);
+            tokio::fs::write(root.join(GEMFILE_LOCK), &other_line)
+                .await
+                .unwrap();
+            let outcome = revert_gem(&entry, &root, false).await;
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_lock_entry_drifted"),
+                "{:?}",
+                outcome.warnings
+            );
+            assert_eq!(text(root.join(GEMFILE_LOCK)).await, other_line);
+            assert_eq!(text(root.join(GEMFILE)).await, gemfile);
+            assert!(root.join(rel(UUID)).is_dir(), "the copy is kept on drift");
+
+            assert_ne!(spec_only, wired);
+            tokio::fs::write(root.join(GEMFILE_LOCK), &spec_only)
+                .await
+                .unwrap();
+            tokio::fs::write(root.join(GEMFILE), &gemfile)
+                .await
+                .unwrap();
+            let outcome = revert_gem(&entry, &root, false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert_eq!(text(root.join(GEMFILE_LOCK)).await, lock_before);
+            assert_eq!(text(root.join(GEMFILE)).await, GEMFILE_NOKO);
+        }
     }
 }
