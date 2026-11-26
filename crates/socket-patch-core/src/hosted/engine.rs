@@ -2334,11 +2334,17 @@ async fn keep_bundler_loaded_gem_files(
     out: &mut CandidateFiles,
 ) {
     use crate::formats::gem::manifest::{self, LoadedManifest};
+    // Each registry under both addresses a gem can take it by: at its
+    // snapshot, and without the snapshot level (a gem the lock names as
+    // its ruby-platform gem alone).
     let sources: Vec<&str> = candidates
         .iter()
         .filter_map(|c| c.dep.registry_override.as_ref())
         .filter(|ov| ov.kind == "rubygems-compact-index")
-        .map(|ov| ov.index_url.as_str())
+        .flat_map(|ov| {
+            let (root, snapshot) = crate::patch::redirect::split_gem_snapshot(&ov.index_url);
+            std::iter::once(ov.index_url.as_str()).chain(snapshot.map(|_| root))
+        })
         .collect();
     let loaded = crate::crawlers::ruby_crawler::bundler_loaded_manifest_in(view).await;
     let mirror = match view {
@@ -6149,6 +6155,11 @@ fn confirm(
         .filter(|(name, _)| !is_gradle_file(name))
         .map(|(_, text)| *text)
         .collect();
+    // A gem's registry is in the pair under the address the gem rewriter
+    // writes for this lock, which is the reference's index URL only for a
+    // gem the lock names a platform build of.
+    let gem_sources =
+        crate::patch::redirect::gem_source_urls(files, candidates.iter().map(|c| &c.dep));
     // Every non-substring rule decides a candidate outright; the rest are
     // confirmed by substring presence of their needles in the final texts.
     // All needle groups are answered in ONE multi-needle pass per text
@@ -6297,7 +6308,12 @@ fn confirm(
             if rewrite.maven_reactor_uuids.contains(uuid) {
                 return ProbeStep::Decided(rewrite.confirmed_maven_reactor_uuids.contains(uuid));
             }
-            ProbeStep::Needles(candidate_presence_needles(&c.dep))
+            let mut needles = candidate_presence_needles(&c.dep);
+            if let (Some(source), Some(ov)) = (gem_sources.get(uuid), &c.dep.registry_override) {
+                needles.retain(|needle| *needle != ov.index_url);
+                needles.push(source.clone());
+            }
+            ProbeStep::Needles(needles)
         })
         .collect();
     let groups: Vec<&[String]> = steps
@@ -13274,6 +13290,134 @@ snapshots:
                  so the gem is left as it is"
             )
         );
+    }
+
+    /// [`gem_candidate`] as the patch `uuid`, with its registry at the
+    /// snapshot `key` and listing `builds` (`(platform, sha256, the patch
+    /// of a patched build)`).
+    fn gem_candidate_listing(
+        uuid: &str,
+        key: &str,
+        builds: &[(&str, String, Option<&str>)],
+    ) -> Candidate {
+        use crate::patch::redirect::GemPlatformChecksum;
+        let registry = format!("https://patch.test/patch-registry/gem/{FIXTURE_TOKEN}/{uuid}/");
+        let mut candidate = gem_candidate();
+        candidate.dep.patch_uuid = uuid.to_string();
+        candidate.dep.artifact_url = format!("{registry}gems/rails-7.0.0.gem");
+        let ov = candidate.dep.registry_override.as_mut().unwrap();
+        ov.index_url = format!("{registry}s/{key}/");
+        ov.identifiers.gem_builds = Some(
+            builds
+                .iter()
+                .map(|(platform, sha256, patch)| GemPlatformChecksum {
+                    platform: platform.to_string(),
+                    gem_checksum_sha256: sha256.clone(),
+                    patch_uuid: patch.map(str::to_string),
+                })
+                .collect(),
+        );
+        candidate
+    }
+
+    /// A gem the lock names as its ruby-platform gem alone is pinned under
+    /// the registry without its snapshot level, and confirmed there: a
+    /// pair that a reference with no snapshot pinned is left byte for
+    /// byte by a reference with one, a lock that is not pinned yet gets
+    /// the registry without the snapshot, and a pair that names a
+    /// snapshot goes back to it.
+    #[tokio::test]
+    async fn a_gem_locked_as_its_ruby_gem_alone_is_confirmed_without_a_snapshot() {
+        let registry =
+            format!("https://patch.test/patch-registry/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/");
+        let lock = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\nPLATFORMS\n  \
+             ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\nCHECKSUMS\n  rails (7.0.0) sha256={}\n\n\
+             BUNDLED WITH\n  4.0.15\n",
+            "3".repeat(64)
+        );
+        let pinned = [("pkg:gem/rails@7.0.0".to_string(), FIXTURE_UUID.to_string())];
+        let keyed = |key: &str| {
+            gem_candidate_listing(
+                FIXTURE_UUID,
+                key,
+                &[
+                    (
+                        "arm64-darwin",
+                        "a".repeat(64),
+                        Some("77777777-7777-4777-8777-77777777777a"),
+                    ),
+                    ("ruby", "f".repeat(64), Some(FIXTURE_UUID)),
+                ],
+            )
+        };
+        let mut p = MemoryProject::new();
+        p.insert_text("Gemfile", GEMFILE);
+        p.insert_text("Gemfile.lock", lock.as_str());
+        let fresh = p.clone();
+
+        // The pair as a reference with no snapshot pins it.
+        let (_, first) = gem_rewrite(&p).await;
+        assert_eq!(first.confirmed, pinned);
+        for (rel, text) in &first.rewrite.files {
+            p.insert_text(rel, text.as_str());
+        }
+        let (gemfile, lock) = (
+            first.rewrite.files["Gemfile"].clone(),
+            first.rewrite.files["Gemfile.lock"].clone(),
+        );
+        assert!(lock.contains(&format!("  remote: {registry}\n")), "{lock}");
+        for key in ["9f3c01", "07ab2e"] {
+            let (_, done) = gem_rewrite_of(&ProjectView::Memory(&p), vec![keyed(key)]).await;
+            assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.edits);
+            assert!(done.rewrite.edits.is_empty() && done.rewrite.warnings.is_empty());
+            assert_eq!(done.confirmed, pinned);
+            assert!(done.unattributed.is_empty(), "{:?}", done.unattributed);
+        }
+
+        // A lock that is not pinned yet takes the same pair.
+        let (_, done) = gem_rewrite_of(&ProjectView::Memory(&fresh), vec![keyed("9f3c01")]).await;
+        assert_eq!(done.confirmed, pinned);
+        assert_eq!(done.rewrite.files["Gemfile"], gemfile);
+        assert_eq!(done.rewrite.files["Gemfile.lock"], lock);
+
+        // A pair that names the registry at a snapshot goes back to it.
+        let at_snapshot = format!("{registry}s/9f3c01/");
+        let mut wired = MemoryProject::new();
+        wired.insert_text("Gemfile", gemfile.replace(&registry, &at_snapshot));
+        wired.insert_text("Gemfile.lock", lock.replace(&registry, &at_snapshot));
+        let (_, done) = gem_rewrite_of(&ProjectView::Memory(&wired), vec![keyed("9f3c01")]).await;
+        assert_eq!(done.confirmed, pinned);
+        assert_eq!(done.rewrite.files["Gemfile"], gemfile);
+        assert_eq!(done.rewrite.files["Gemfile.lock"], lock);
+    }
+
+    /// A Bundler mirror set for the patch registry's own address captures
+    /// it under either address a gem takes the registry by: a reference
+    /// that names a snapshot is refused for a mirror of the registry
+    /// without one, which is what a gem locked as its ruby-platform gem
+    /// alone is given as its source.
+    #[tokio::test]
+    async fn bundler_mirror_for_the_registry_without_its_snapshot_redirects_nothing() {
+        let key = format!(
+            "BUNDLE_MIRROR__HTTPS://PATCH__TEST/PATCH___REGISTRY/GEM/{FIXTURE_TOKEN}/{FIXTURE_UUID}/"
+        );
+        let mut p = MemoryProject::new();
+        p.insert_text("Gemfile", GEMFILE);
+        p.insert_text("Gemfile.lock", GEM_LOCK);
+        p.insert_text(
+            ".bundle/config",
+            format!("---\n{key}: \"https://m.example/\"\n"),
+        );
+        let keyed = gem_candidate_listing(
+            FIXTURE_UUID,
+            "9f3c01",
+            &[("ruby", "f".repeat(64), Some(FIXTURE_UUID))],
+        );
+        let (read, done) = gem_rewrite_of(&ProjectView::Memory(&p), vec![keyed]).await;
+        assert!(!read.files.contains_key("Gemfile.lock"));
+        assert!(done.rewrite.files.is_empty() && done.confirmed.is_empty());
+        assert!(warning_codes(&done).contains(&"redirect_gem_mirror_overrides_source"));
     }
 
     /// #390: `bundle config set --local gemfile Gemfile.next` makes bundler
