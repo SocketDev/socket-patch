@@ -364,6 +364,33 @@ pub(crate) async fn fetch_wheel_metadata(
         .collect()
 }
 
+/// What the registry a Bundler lock is on lists, once per distinct
+/// document URL ([`crate::hosted::engine::gem_index_targets`]): the disk
+/// flow's [`crate::hosted::gem_index::fetch_gem_index`] over the provider.
+pub(crate) async fn fetch_gem_indexes(
+    provider: &Provider,
+    wanted: &BTreeSet<String>,
+) -> BTreeMap<String, Result<String, String>> {
+    use crate::hosted::gem_index::{decode_gem_index, MAX_GEM_INDEX_BYTES};
+    let ordered: Vec<&String> = wanted.iter().collect();
+    let futures: Vec<BoxFuture<'_, _>> = ordered
+        .iter()
+        .map(|url| -> BoxFuture<'_, Result<String, String>> {
+            Box::pin(async move {
+                let bytes = provider
+                    .download_artifact(url, MAX_GEM_INDEX_BYTES)
+                    .await
+                    .map_err(|error| {
+                        crate::utils::redact::redact_urls_in(&error.to_string()).into_owned()
+                    })?;
+                decode_gem_index(bytes)
+            })
+        })
+        .collect();
+    let results = join_bounded(futures, provider.concurrency).await;
+    ordered.into_iter().cloned().zip(results).collect()
+}
+
 /// Served npm tarballs' own package.json once per distinct `(url,
 /// sha512)`, for the yarn berry pin's `bin:` map: the disk flow's
 /// `fetch_hosted_npm_manifest` over the provider.

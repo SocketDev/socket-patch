@@ -1129,6 +1129,15 @@ async fn engine(
         )
         .await
     };
+    let gem_index_urls: BTreeSet<String> = planned
+        .iter()
+        .flat_map(|(_, p)| p.gem_indexes.iter().cloned())
+        .collect();
+    let gem_indexes = if gem_index_urls.is_empty() {
+        BTreeMap::new()
+    } else {
+        discover::fetch_gem_indexes(&provider, &gem_index_urls).await
+    };
     phases.mark("plan");
 
     let stage_options = StageOptions {
@@ -1144,7 +1153,15 @@ async fn engine(
         if stage.capped() {
             first_plans.insert(index, plan.clone());
         }
-        match stages::rewrite(plan, &artifact_metadata, &artifact_classic, stage_options).await {
+        match stages::rewrite(
+            plan,
+            &artifact_metadata,
+            &artifact_classic,
+            &gem_indexes,
+            stage_options,
+        )
+        .await
+        {
             Ok(done) => rewritten.push((index, done)),
             Err(RewriteRefused { refusal, skipped }) => {
                 states[index].skipped = skipped;
@@ -1231,7 +1248,14 @@ async fn engine(
                 .retain(|c| !root_deferred.contains(&c.dep.patch_uuid));
             plan.skipped
                 .extend(states[index].deferred.iter().map(deferred_skip));
-            match stages::rewrite(plan, &artifact_metadata, &artifact_classic, stage_options).await
+            match stages::rewrite(
+                plan,
+                &artifact_metadata,
+                &artifact_classic,
+                &gem_indexes,
+                stage_options,
+            )
+            .await
             {
                 Ok(done) => again.push((index, done)),
                 Err(RewriteRefused { refusal, skipped }) => {
@@ -2091,5 +2115,293 @@ mod tests {
         assert!(index.records_package("pkg:cargo/serde@1.0.200"));
         assert!(index.uuids("pkg:cargo/serde@2.0.0").is_empty());
         assert!(index.uuids("pkg:nuget/Other@1.0.0").is_empty());
+    }
+
+    const GEM_GRANT: &str = "cccccccc-3333-4333-8333-cccccccccccc";
+    /// The patch the lock of [`gem_input_on_a_patch`] is on.
+    const GEM_EARLIER: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+    /// The patch [`GemPatchService`] offers.
+    const GEM_NEWER: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+
+    fn gem_registry(uuid: &str) -> String {
+        format!("https://patch.socket.dev/patch-registry/gem/{GEM_GRANT}/{uuid}/")
+    }
+
+    /// A patch service that offers [`GEM_NEWER`] for `rails 7.0.0`, with a
+    /// patched build for `arm64-darwin` and upstream's gem (`2…`) for
+    /// `x86_64-linux-gnu`, and that answers the artifact URLs of `served`.
+    struct GemPatchService {
+        served: BTreeMap<String, String>,
+        /// The artifact URLs asked for, in order.
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl PatchApi for GemPatchService {
+        fn uses_public_proxy(&self) -> bool {
+            false
+        }
+
+        fn search_patches_batch<'a>(
+            &'a self,
+            purls: &'a [String],
+        ) -> crate::api::client::ApiFuture<'a, crate::api::types::BatchSearchResponse> {
+            use crate::api::types::{BatchPackagePatches, BatchPatchInfo, BatchSearchResponse};
+            let packages = purls
+                .iter()
+                .filter(|purl| purl.as_str() == "pkg:gem/rails@7.0.0")
+                .map(|purl| BatchPackagePatches {
+                    purl: purl.clone(),
+                    patches: vec![BatchPatchInfo {
+                        uuid: GEM_NEWER.to_string(),
+                        purl: purl.clone(),
+                        tier: "free".to_string(),
+                        cve_ids: Vec::new(),
+                        ghsa_ids: vec!["GHSA-test-aaaa-bbbb".to_string()],
+                        severity: Some("high".to_string()),
+                        title: String::new(),
+                        published_at: None,
+                    }],
+                })
+                .collect();
+            Box::pin(async move {
+                Ok(BatchSearchResponse {
+                    packages,
+                    can_access_paid_patches: false,
+                    unanswered: Vec::new(),
+                })
+            })
+        }
+
+        fn search_patches_by_package<'a>(
+            &'a self,
+            purl: &'a str,
+        ) -> crate::api::client::ApiFuture<'a, crate::api::types::SearchResponse> {
+            let response = serde_json::json!({
+                "patches": [{
+                    "uuid": GEM_NEWER, "purl": purl, "publishedAt": "2026-01-01T00:00:00Z",
+                    "description": "", "license": "MIT", "tier": "free",
+                    "vulnerabilities": {"GHSA-test-aaaa-bbbb": {
+                        "cves": [], "summary": "", "severity": "high", "description": ""
+                    }}
+                }],
+                "canAccessPaidPatches": false
+            });
+            Box::pin(async move { Ok(serde_json::from_value(response).expect("a response")) })
+        }
+
+        fn fetch_registry_references<'a>(
+            &'a self,
+            uuids: &'a [String],
+        ) -> crate::api::client::ApiFuture<
+            'a,
+            HashMap<String, crate::api::types::PackageVendorResult>,
+        > {
+            let registry = gem_registry(GEM_NEWER);
+            let reference = serde_json::json!({
+                "status": "granted",
+                "url": format!("{registry}gems/rails-7.0.0.gem"),
+                "purl": "pkg:gem/rails@7.0.0",
+                "artifacts": [{"kind": "tarball", "url": null, "integrity": {
+                    "sha256": "f".repeat(64)
+                }}],
+                "registryOverride": {
+                    "kind": "rubygems-compact-index",
+                    "indexUrl": format!("{registry}s/c4/"),
+                    "identifiers": {
+                        "name": "rails", "version": "7.0.0",
+                        "gemChecksumSha256": "f".repeat(64),
+                        "gemBuilds": [
+                            {"platform": "arm64-darwin", "gemChecksumSha256": "d".repeat(64),
+                             "patchUuid": "dddddddd-4444-4444-8444-dddddddddddd"},
+                            {"platform": "ruby", "gemChecksumSha256": "f".repeat(64),
+                             "patchUuid": GEM_NEWER},
+                            {"platform": "x86_64-linux-gnu", "gemChecksumSha256": "2".repeat(64),
+                             "patchUuid": null}
+                        ]
+                    }
+                }
+            });
+            let granted = uuids
+                .iter()
+                .filter(|uuid| uuid.as_str() == GEM_NEWER)
+                .map(|uuid| {
+                    let reference = serde_json::from_value(reference.clone()).expect("a grant");
+                    (uuid.clone(), reference)
+                })
+                .collect();
+            Box::pin(async move { Ok(granted) })
+        }
+
+        fn download_artifact<'a>(
+            &'a self,
+            url: &'a str,
+            _max_bytes: u64,
+        ) -> crate::api::client::ApiFuture<'a, Vec<u8>> {
+            self.asked.lock().unwrap().push(url.to_string());
+            let served = self.served.get(url).map(|body| body.as_bytes().to_vec());
+            Box::pin(async move {
+                served.ok_or_else(|| crate::api::client::ApiError::Other("not found".into()))
+            })
+        }
+    }
+
+    /// A project whose lock takes `rails 7.0.0` as `arm64-darwin` and
+    /// `x86_64-linux-gnu` builds from the registry of [`GEM_EARLIER`], with
+    /// `sums` as its `CHECKSUMS` section: `(Gemfile, lock)`.
+    fn gem_pair_on_a_patch(sums: &str) -> (String, String) {
+        let registry = format!("{}s/1a/", gem_registry(GEM_EARLIER));
+        let gemfile = format!(
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\", source: \"{registry}\"\n"
+        );
+        let lock = format!(
+            "GEM\n  remote: {registry}\n  specs:\n    rails (7.0.0-arm64-darwin)\n    rails \
+             (7.0.0-x86_64-linux-gnu)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n\n\
+             PLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n\
+             {sums}\nBUNDLED WITH\n  4.0.15\n"
+        );
+        (gemfile, lock)
+    }
+
+    /// One run of the engine over `(Gemfile, lock)` against a
+    /// [`GemPatchService`] that serves `served`: the output, and the
+    /// artifact URLs the run asked for.
+    async fn gem_run(
+        (gemfile, lock): &(String, String),
+        served: &[(&str, String)],
+    ) -> (HostedScanOutput, Vec<String>) {
+        let service = Arc::new(GemPatchService {
+            served: served
+                .iter()
+                .map(|(url, body)| (url.to_string(), body.clone()))
+                .collect(),
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut session = SessionBuilder::new(HostedScanOptions {
+            org_slug: "acme".to_string(),
+            ..HostedScanOptions::default()
+        })
+        .expect("valid options");
+        for (path, text) in [("Gemfile", gemfile), ("Gemfile.lock", lock)] {
+            session.push_chunk(path, text.as_bytes()).unwrap();
+            session.end_file(path).unwrap();
+        }
+        let input = session.finish().unwrap();
+        let output = run_in_memory(input, service.clone(), CancellationToken::new())
+            .await
+            .expect("an engine run");
+        let asked = service.asked.lock().unwrap().clone();
+        (output, asked)
+    }
+
+    /// The in-memory engine never moves a lock from one patch of a gem to
+    /// another that has a patched build for fewer of its locked builds. A
+    /// lock with `CHECKSUMS` says what it installs, and nothing is asked.
+    /// One without is judged by the compact index of the registry it is
+    /// on, which the engine asks its provider for once: a patched build
+    /// there keeps the lock where it is, as does a document the provider
+    /// cannot serve, and upstream's gem there lets the lock move. A gem
+    /// that stays is skipped under its quiet code, with nothing changed
+    /// and no warning.
+    #[tokio::test]
+    async fn a_lock_on_another_patch_of_a_gem_is_moved_only_where_it_loses_nothing() {
+        use crate::hosted::engine::GEM_NEWER_FIX_WAITS;
+        let index_url = format!("{}s/1a/info/rails", gem_registry(GEM_EARLIER));
+        let index = |linux: &str| {
+            format!(
+                "---\n7.0.0-arm64-darwin |checksum:{}\n7.0.0-x86_64-linux-gnu |checksum:{linux}\n",
+                "1".repeat(64)
+            )
+        };
+        let stays = |output: &HostedScanOutput| {
+            assert!(
+                output.changed_files.is_empty(),
+                "{:?}",
+                output.changed_files
+            );
+            assert!(output.warnings.is_empty(), "{:?}", output.warnings);
+            let [project] = output.projects.as_slice() else {
+                panic!("one project: {:?}", output.projects);
+            };
+            assert!(project.error.is_none(), "{:?}", project.error);
+            assert!(project.redirected.is_empty() && project.upstream_builds.is_empty());
+            let skipped: Vec<(&str, &str, Option<&str>)> = project
+                .skipped
+                .iter()
+                .map(|skip| {
+                    (
+                        skip.uuid.as_str(),
+                        skip.reason.as_str(),
+                        skip.detail.as_deref(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                skipped,
+                [(
+                    GEM_NEWER,
+                    GEM_NEWER_FIX_WAITS,
+                    Some(
+                        "rails 7.0.0: the newer fix has no patched build for x86_64-linux-gnu \
+                         yet; the lock stays on the patch it is on"
+                    )
+                )]
+            );
+            assert_eq!(project.redirect["warnings"], serde_json::json!([]));
+        };
+
+        // `CHECKSUMS` pins a patched build for linux: no request.
+        let sums = format!(
+            "\nCHECKSUMS\n  rails (7.0.0-arm64-darwin) sha256={}\n  rails (7.0.0-x86_64-linux-gnu) \
+             sha256={}\n",
+            "1".repeat(64),
+            "b".repeat(64)
+        );
+        let (output, asked) = gem_run(&gem_pair_on_a_patch(&sums), &[]).await;
+        stays(&output);
+        assert!(asked.is_empty(), "{asked:?}");
+
+        // No `CHECKSUMS`: the registry the lock is on is asked, once.
+        let pair = gem_pair_on_a_patch("");
+        let (output, asked) = gem_run(&pair, &[(&index_url, index(&"b".repeat(64)))]).await;
+        stays(&output);
+        assert_eq!(asked, [index_url.clone()]);
+        assert_eq!(output.stats.provider_calls["downloadArtifact"], 1);
+        let (output, asked) = gem_run(&pair, &[]).await;
+        stays(&output);
+        assert_eq!(asked, [index_url.clone()]);
+
+        // That registry lists upstream's gem for linux: the lock moves.
+        let (output, asked) = gem_run(&pair, &[(&index_url, index(&"2".repeat(64)))]).await;
+        assert_eq!(asked, [index_url]);
+        let changed: Vec<&str> = output
+            .changed_files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(changed, ["Gemfile", "Gemfile.lock"]);
+        let at_newer = format!("{}s/c4/", gem_registry(GEM_NEWER));
+        for file in &output.changed_files {
+            assert!(file.content.contains(&at_newer), "{}", file.content);
+            assert!(!file.content.contains(GEM_EARLIER), "{}", file.content);
+        }
+        let [project] = output.projects.as_slice() else {
+            panic!("one project: {:?}", output.projects);
+        };
+        assert!(project.skipped.is_empty(), "{:?}", project.skipped);
+        let redirected: Vec<(&str, Option<&str>)> = project
+            .redirected
+            .iter()
+            .map(|patch| (patch.uuid.as_str(), patch.platform.as_deref()))
+            .collect();
+        assert_eq!(
+            redirected,
+            [("dddddddd-4444-4444-8444-dddddddddddd", Some("arm64-darwin"))]
+        );
+        let upstream: Vec<&str> = project
+            .upstream_builds
+            .iter()
+            .map(|build| build.platform.as_str())
+            .collect();
+        assert_eq!(upstream, ["x86_64-linux-gnu"]);
     }
 }

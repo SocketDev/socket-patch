@@ -10,7 +10,9 @@
 //! 2. [`bun_lockb_symlinked`] — the binary-lock symlink refusal.
 //! 3. (caller) the apply lock and the vendored→hosted takeover.
 //! 4. [`read_candidate_files`] → [`wheel_targets`] → (caller) wheel metadata,
-//!    and [`yarn_berry_manifest_targets`] → (caller) served npm manifests.
+//!    [`yarn_berry_manifest_targets`] → (caller) served npm manifests, and
+//!    [`gem_index_targets`] → (caller) what a gem's registry lists →
+//!    [`record_gem_index`].
 //! 5. [`rewrite`] — the rewriters, the pnpm named-registry /
 //!    `trustLockfile` and npm `allow-remote` auto-configs, and the
 //!    per-ecosystem confirmation.
@@ -181,20 +183,35 @@ pub fn gem_upstream_build_kept_detail(platform: &str) -> String {
 /// moves on a run whose list names every platform the lock does.
 pub const GEM_PLATFORM_UNLISTED: &str = "redirect_gem_platform_unlisted";
 
-/// Whether `reason` is one of the two quiet skips of a gem locked as
-/// platform builds ([`GEM_NO_PATCHED_BUILD`], [`GEM_PLATFORM_UNLISTED`]):
-/// the only cases where a gem with a fix is not moved, neither of which
-/// is a failure, and each said in one plain line.
+/// Skip reason of a gem the Bundler lock takes as platform builds from the
+/// registry of another patch of the gem, left on that patch because the
+/// patch on offer has no patched build for a platform whose locked build
+/// is a patched one: moving the lock would turn that build into upstream's
+/// own gem. Not a warning. The gem moves on a later run, once the patch
+/// service lists a patched build for those platforms.
+pub const GEM_NEWER_FIX_WAITS: &str = "redirect_gem_newer_fix_waits";
+
+/// Whether `reason` is one of the quiet skips of a gem locked as platform
+/// builds ([`GEM_NO_PATCHED_BUILD`], [`GEM_PLATFORM_UNLISTED`],
+/// [`GEM_NEWER_FIX_WAITS`]): the only cases where a gem with a fix is not
+/// moved, none of which leaves the project worse than it was, and each
+/// said in one plain line, never as a failure.
 pub fn is_quiet_gem_skip(reason: &str) -> bool {
-    reason == GEM_NO_PATCHED_BUILD || reason == GEM_PLATFORM_UNLISTED
+    [
+        GEM_NO_PATCHED_BUILD,
+        GEM_PLATFORM_UNLISTED,
+        GEM_NEWER_FIX_WAITS,
+    ]
+    .contains(&reason)
 }
 
-/// The skips of the gems a rewrite left where they are: no locked build
-/// of them is patched yet ([`RewriteResult::gem_unpatched`]), or the
-/// registry does not list a locked platform
-/// ([`RewriteResult::gem_unlisted`]). One per candidate, in candidate
-/// order: a host adds them to its skips, so the gem is reported under its
-/// own quiet code and not as a patch nothing pins.
+/// The skips of the gems a rewrite left where they are: no locked build of
+/// them is patched yet ([`RewriteResult::gem_unpatched`]), the registry
+/// does not list a locked platform ([`RewriteResult::gem_unlisted`]), or
+/// the lock is on another patch of the gem and would lose a patched build
+/// ([`RewriteResult::gem_held`]). One per candidate, in candidate order: a
+/// host adds them to its skips, so the gem is reported under its own quiet
+/// code and not as a patch nothing pins.
 pub fn gem_unpatched_skips(candidates: &[Candidate], rewrite: &RewriteResult) -> Vec<SkippedPatch> {
     candidates
         .iter()
@@ -207,6 +224,13 @@ pub fn gem_unpatched_skips(candidates: &[Candidate], rewrite: &RewriteResult) ->
                     platforms.join(", ")
                 );
                 (GEM_PLATFORM_UNLISTED, detail)
+            } else if let Some(platforms) = rewrite.gem_held.get(uuid) {
+                let detail = format!(
+                    "{name} {version}: the newer fix has no patched build for {} yet; the lock \
+                     stays on the patch it is on",
+                    platforms.join(", ")
+                );
+                (GEM_NEWER_FIX_WAITS, detail)
             } else {
                 let platforms = rewrite.gem_unpatched.get(uuid)?;
                 let detail = format!(
@@ -2481,6 +2505,53 @@ async fn read_gemspecs(
         GEMSPECS_KEY.to_string(),
         serde_json::Value::Object(listing).to_string(),
     );
+}
+
+/// The compact-index documents the gem rewriter reads before it moves a
+/// lock from one patch of a gem to another, sorted: `<remote>/info/<gem>`
+/// of the registry the Bundler lock among `files` takes a gem from, for
+/// each gem among `candidates` that the lock takes as platform builds from
+/// the registry of another patch of the gem, with no `CHECKSUMS` entry for
+/// a build that the candidate's registry serves as upstream's own gem.
+/// What that build is today (a patched build, which the move would take
+/// away, or upstream's gem) is then only said by the registry the lock is
+/// on. One small request per such gem, and none on any other run: a lock
+/// on the candidate's own registry, on its upstream registry, with
+/// `CHECKSUMS` entries, or that names the gem as its ruby-platform gem
+/// alone.
+///
+/// The caller reads them ([`super::gem_index::fetch_gem_index`]) and hands
+/// the answers in ([`record_gem_index`]) before every [`rewrite`]. A
+/// rewrite that is handed no document of a registry leaves the gem on the
+/// patch it is on ([`GEM_NEWER_FIX_WAITS`]): never worse than it was.
+pub fn gem_index_targets(
+    candidates: &[Candidate],
+    files: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let deps: Vec<&DepOverride> = candidates.iter().map(|c| &c.dep).collect();
+    crate::patch::redirect::gem_index_urls(files, &deps)
+}
+
+/// Hand the documents read for [`gem_index_targets`] to the gem rewriter:
+/// each URL with the text read from it, or why it could not be read. One
+/// that could not be read is left out, and the rewriter takes it as it
+/// takes a document nobody read: what the lock installs is unknown, and
+/// the gem stays where it is.
+pub fn record_gem_index(read: &mut CandidateFiles, documents: &[(String, Result<String, String>)]) {
+    let listed: serde_json::Map<String, serde_json::Value> = documents
+        .iter()
+        .filter_map(|(url, document)| {
+            let body = document.as_ref().ok()?;
+            Some((url.clone(), serde_json::Value::String(body.clone())))
+        })
+        .collect();
+    let key = crate::patch::redirect::GEM_INDEX_KEY;
+    if listed.is_empty() {
+        read.files.remove(key);
+        return;
+    }
+    let listed = serde_json::Value::Object(listed).to_string();
+    read.files.insert(key.to_string(), listed);
 }
 
 /// The pypi wheels whose metadata a native lock rewrite needs, in
@@ -12987,6 +13058,16 @@ snapshots:
         view: &ProjectView<'_>,
         candidates: Vec<Candidate>,
     ) -> (CandidateFiles, Rewritten) {
+        gem_rewrite_reading(view, candidates, &[]).await
+    }
+
+    /// [`gem_rewrite_of`] with what a host read of the registries a lock
+    /// is on ([`gem_index_targets`]) handed in before the rewrite.
+    async fn gem_rewrite_reading(
+        view: &ProjectView<'_>,
+        candidates: Vec<Candidate>,
+        documents: &[(String, Result<String, String>)],
+    ) -> (CandidateFiles, Rewritten) {
         let outer = OuterAllowRemote::default;
         let options = RewriteOptions {
             dry_run: false,
@@ -13005,7 +13086,8 @@ snapshots:
             patch_server_origins: Vec::new(),
             prior_discovery: None,
         };
-        let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
+        let mut read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
+        record_gem_index(&mut read, documents);
         let done = rewrite(view, read.clone(), &candidates, BTreeMap::new(), options).await;
         (read, done)
     }
@@ -13292,6 +13374,9 @@ snapshots:
         );
     }
 
+    /// The uuid of another patch of the gem [`gem_candidate`] patches.
+    const NEWER_GEM_UUID: &str = "88888888-8888-4888-8888-888888888888";
+
     /// [`gem_candidate`] as the patch `uuid`, with its registry at the
     /// snapshot `key` and listing `builds` (`(platform, sha256, the patch
     /// of a patched build)`).
@@ -13318,6 +13403,221 @@ snapshots:
                 .collect(),
         );
         candidate
+    }
+
+    /// A lock that resolves rails 7.0.0 as `arm64-darwin` and
+    /// `x86_64-linux-gnu` builds from its upstream registry (`1…` and `2…`
+    /// under `CHECKSUMS` when `checksums`).
+    fn rails_platform_lock(checksums: bool) -> String {
+        let sums = format!(
+            "\nCHECKSUMS\n  rails (7.0.0-arm64-darwin) sha256={}\n  rails (7.0.0-x86_64-linux-gnu) \
+             sha256={}\n",
+            "1".repeat(64),
+            "2".repeat(64)
+        );
+        format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0-arm64-darwin)\n    rails \
+             (7.0.0-x86_64-linux-gnu)\n\nPLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\nDEPENDENCIES\n  \
+             rails (= 7.0.0)\n{}\nBUNDLED WITH\n  4.0.15\n",
+            if checksums { sums.as_str() } else { "" }
+        )
+    }
+
+    /// A project whose lock ([`rails_platform_lock`]) a run moved to the
+    /// registry of [`FIXTURE_UUID`], with a patched build for
+    /// `x86_64-linux-gnu` (`b…`) and upstream's gem for `arm64-darwin`.
+    async fn rails_project_on_a_patch(checksums: bool) -> MemoryProject {
+        let earlier = gem_candidate_listing(
+            FIXTURE_UUID,
+            "1a",
+            &[
+                ("arm64-darwin", "1".repeat(64), None),
+                (
+                    "x86_64-linux-gnu",
+                    "b".repeat(64),
+                    Some("77777777-7777-4777-8777-77777777777b"),
+                ),
+            ],
+        );
+        let mut p = MemoryProject::new();
+        p.insert_text("Gemfile", GEMFILE);
+        p.insert_text("Gemfile.lock", rails_platform_lock(checksums));
+        let (_, first) = gem_rewrite_of(&ProjectView::Memory(&p), vec![earlier]).await;
+        assert_eq!(
+            first.confirmed,
+            [("pkg:gem/rails@7.0.0".to_string(), FIXTURE_UUID.to_string())]
+        );
+        for (rel, text) in &first.rewrite.files {
+            p.insert_text(rel, text.as_str());
+        }
+        p
+    }
+
+    /// The lock is on the registry of one patch, where `x86_64-linux-gnu`
+    /// has a patched build. The patch on offer is another one, with a
+    /// patched build for `arm64-darwin` only: moving the lock would turn
+    /// the linux build into upstream's gem. Nothing is written, warned
+    /// about or confirmed, the lock's `CHECKSUMS` being what says so with
+    /// no request, and the gem is skipped under its own quiet code, never
+    /// reported as a patch nothing pins. A patch that has a patched build
+    /// for linux too takes the lock, and is confirmed.
+    #[tokio::test]
+    async fn a_gem_on_another_patch_keeps_its_patched_build_and_waits_quietly() {
+        let p = rails_project_on_a_patch(true).await;
+        let arm_patch = "88888888-8888-4888-8888-88888888888a";
+        let newer = gem_candidate_listing(
+            NEWER_GEM_UUID,
+            "c4",
+            &[
+                ("arm64-darwin", "d".repeat(64), Some(arm_patch)),
+                ("x86_64-linux-gnu", "2".repeat(64), None),
+            ],
+        );
+        let (read, done) = gem_rewrite_of(&ProjectView::Memory(&p), vec![newer.clone()]).await;
+        assert!(gem_index_targets(std::slice::from_ref(&newer), &read.files).is_empty());
+        assert!(done.rewrite.files.is_empty() && done.rewritten.is_empty());
+        assert!(done.confirmed.is_empty() && done.unattributed.is_empty());
+        assert!(
+            done.rewrite.warnings.is_empty(),
+            "{:?}",
+            done.rewrite.warnings
+        );
+        let [skip] = gem_unpatched_skips(std::slice::from_ref(&newer), &done.rewrite)
+            .try_into()
+            .expect("one skip");
+        assert_eq!(skip.reason, GEM_NEWER_FIX_WAITS);
+        assert_eq!(skip.reason, "redirect_gem_newer_fix_waits");
+        assert_eq!(
+            (skip.purl.as_str(), skip.uuid.as_str()),
+            ("pkg:gem/rails@7.0.0", NEWER_GEM_UUID)
+        );
+        assert_eq!(
+            skip.detail.as_deref(),
+            Some(
+                "rails 7.0.0: the newer fix has no patched build for x86_64-linux-gnu yet; the \
+                 lock stays on the patch it is on"
+            )
+        );
+        assert!(is_quiet_gem_skip(&skip.reason));
+        assert!(
+            unconfirmed_candidates(std::slice::from_ref(&newer), &done.confirmed, &[skip])
+                .is_empty()
+        );
+
+        let linux_patch = "88888888-8888-4888-8888-88888888888b";
+        let both = gem_candidate_listing(
+            NEWER_GEM_UUID,
+            "c5",
+            &[
+                ("arm64-darwin", "d".repeat(64), Some(arm_patch)),
+                ("x86_64-linux-gnu", "e".repeat(64), Some(linux_patch)),
+            ],
+        );
+        let (_, moved) = gem_rewrite_of(&ProjectView::Memory(&p), vec![both.clone()]).await;
+        assert_eq!(
+            moved.confirmed,
+            [(
+                "pkg:gem/rails@7.0.0".to_string(),
+                NEWER_GEM_UUID.to_string()
+            )]
+        );
+        assert!(gem_unpatched_skips(std::slice::from_ref(&both), &moved.rewrite).is_empty());
+        let lock = &moved.rewrite.files["Gemfile.lock"];
+        assert!(
+            lock.contains(&format!("/{NEWER_GEM_UUID}/s/c5/\n")) && !lock.contains(FIXTURE_UUID),
+            "{lock}"
+        );
+        let reported: Vec<(Option<String>, bool)> = pin_reports(&moved.confirmed, &moved.rewrite)
+            .into_iter()
+            .map(|report| (report.uuid, report.newly_patched))
+            .collect();
+        assert_eq!(
+            reported,
+            [
+                (Some(arm_patch.to_string()), true),
+                (Some(linux_patch.to_string()), true)
+            ]
+        );
+    }
+
+    /// A lock with no `CHECKSUMS` says nothing of what it installs, so the
+    /// engine names the one document that does: the compact index of the
+    /// registry the lock is on. Handed in, it decides. A registry that
+    /// lists a patched build keeps the lock where it is; one that lists
+    /// upstream's gem lets it move, and the pin is confirmed. A document
+    /// that could not be read, and a run that reads none (a host that
+    /// does not ask), leave the lock where it is. The documents are an
+    /// input of the rewrite and are never written.
+    #[tokio::test]
+    async fn a_gem_lock_without_checksums_is_judged_by_the_registry_it_is_on() {
+        use crate::patch::redirect::GEM_INDEX_KEY;
+        let p = rails_project_on_a_patch(false).await;
+        let view = ProjectView::Memory(&p);
+        let newer = gem_candidate_listing(
+            NEWER_GEM_UUID,
+            "c4",
+            &[
+                (
+                    "arm64-darwin",
+                    "d".repeat(64),
+                    Some("88888888-8888-4888-8888-88888888888a"),
+                ),
+                ("x86_64-linux-gnu", "2".repeat(64), None),
+            ],
+        );
+        let candidates = vec![newer.clone()];
+        let url = format!(
+            "https://patch.test/patch-registry/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/s/1a/info/rails"
+        );
+        let index = |linux: &str| {
+            format!(
+                "---\n7.0.0-arm64-darwin |checksum:{}\n7.0.0-x86_64-linux-gnu |checksum:{linux}\n",
+                "1".repeat(64)
+            )
+        };
+        let held = |done: &Rewritten| {
+            assert!(done.rewrite.files.is_empty() && done.confirmed.is_empty());
+            let skips = gem_unpatched_skips(&candidates, &done.rewrite);
+            let reasons: Vec<&str> = skips.iter().map(|skip| skip.reason.as_str()).collect();
+            assert_eq!(reasons, [GEM_NEWER_FIX_WAITS]);
+        };
+
+        // No document: the host did not ask, or could not.
+        let (read, done) = gem_rewrite_of(&view, candidates.clone()).await;
+        assert_eq!(gem_index_targets(&candidates, &read.files), [url.clone()]);
+        assert!(!read.files.contains_key(GEM_INDEX_KEY));
+        held(&done);
+        let unread = [(url.clone(), Err("no route to host".to_string()))];
+        let (read, done) = gem_rewrite_reading(&view, candidates.clone(), &unread).await;
+        assert!(!read.files.contains_key(GEM_INDEX_KEY));
+        held(&done);
+
+        // The registry lists a patched build for linux.
+        let patched = [(url.clone(), Ok(index(&"b".repeat(64))))];
+        let (read, done) = gem_rewrite_reading(&view, candidates.clone(), &patched).await;
+        assert!(read.files.contains_key(GEM_INDEX_KEY));
+        held(&done);
+
+        // The registry lists upstream's gem for linux: nothing to lose.
+        let upstream = [(url, Ok(index(&"2".repeat(64))))];
+        let (_, done) = gem_rewrite_reading(&view, candidates.clone(), &upstream).await;
+        assert_eq!(
+            done.confirmed,
+            [(
+                "pkg:gem/rails@7.0.0".to_string(),
+                NEWER_GEM_UUID.to_string()
+            )]
+        );
+        assert!(gem_unpatched_skips(&candidates, &done.rewrite).is_empty());
+        assert!(done.files.contains_key(GEM_INDEX_KEY));
+        assert!(!done.rewrite.files.contains_key(GEM_INDEX_KEY));
+        assert_eq!(done.rewritten, ["Gemfile", "Gemfile.lock"]);
+        assert!(guard(&view, &done, &candidates).is_none());
+        let lock = &done.rewrite.files["Gemfile.lock"];
+        assert!(
+            lock.contains(&format!("/{NEWER_GEM_UUID}/s/c4/\n")),
+            "{lock}"
+        );
     }
 
     /// A gem the lock names as its ruby-platform gem alone is pinned under
