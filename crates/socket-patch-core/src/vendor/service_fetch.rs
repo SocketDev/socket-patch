@@ -7,8 +7,9 @@
 //! (`IntegrityMismatch`), never a silent fallback to a wrong artifact. The
 //! backends own the placement: write the archive or extract it into a directory.
 
-use crate::api::client::{SecondaryArtifact, VendorServiceOutcome};
+use crate::api::client::{SecondaryArtifact, VendorReference, VendorServiceOutcome};
 use crate::manifest::schema::PatchRecord;
+use crate::patch::redirect::GemPlatformChecksum;
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::registry_fetch::{artifact_matches_integrity, verify_go_h1};
 use crate::vendor::VendorServiceConfig;
@@ -112,25 +113,41 @@ pub(crate) fn downloaded_warning(
     )
 }
 
-/// What the patch service lists for a patch besides its archive, learned
-/// from the package reference alone ([`fetch_served_artifacts`]): still
-/// unverified, and nothing of the patch is downloaded yet.
+/// What the patch service's package reference says of a patch
+/// ([`fetch_served_reference`]): still unverified, and nothing of the patch
+/// is downloaded yet.
 #[derive(Debug)]
-pub(crate) struct ServedArtifacts(pub Vec<SecondaryArtifact>);
+pub(crate) struct ServedReference {
+    /// The archive, when the reference gives it a url and a sha512.
+    pub archive: Option<SecondaryArtifact>,
+    /// The other served artifacts (a gem's stub gemspec, …).
+    pub secondary: Vec<SecondaryArtifact>,
+    /// gem: the platform gems of the gem's version as the patch's registry
+    /// serves them, each with the patch of its patched build if it has
+    /// one; `None` when the reference carries no list.
+    pub gem_builds: Option<Vec<GemPlatformChecksum>>,
+}
 
-impl ServedArtifacts {
-    /// The served artifact of `kind` for the gem platform `platform`, if
-    /// the service lists one.
-    pub(crate) fn platform(&self, kind: &str, platform: &str) -> Option<&SecondaryArtifact> {
-        self.0
-            .iter()
-            .find(|a| a.kind == kind && a.platform.as_deref() == Some(platform))
+impl ServedReference {
+    /// The served secondary artifact of `kind`, if the service lists one.
+    pub(crate) fn secondary(&self, kind: &str) -> Option<&SecondaryArtifact> {
+        self.secondary.iter().find(|a| a.kind == kind)
+    }
+}
+
+impl From<VendorReference> for ServedReference {
+    fn from(reference: VendorReference) -> Self {
+        Self {
+            archive: reference.archive,
+            secondary: reference.secondary,
+            gem_builds: reference.gem_builds,
+        }
     }
 }
 
 /// What the service has for a patch: its verified archive
-/// ([`fetch_verified_archive`]), or the list of its other artifacts
-/// ([`fetch_served_artifacts`]).
+/// ([`fetch_verified_archive`]), or what its package reference says
+/// ([`fetch_served_reference`]).
 #[derive(Debug)]
 pub(crate) enum ServiceArtifact<T = VerifiedArchive> {
     Ready(T),
@@ -202,14 +219,16 @@ pub(crate) async fn fetch_verified_archive(
     })
 }
 
-/// Ask the service which artifacts it serves for `uuid` besides the
-/// archive, without downloading the archive: the package reference names
-/// them. For a backend that vendors only those (a gem's per-platform
-/// prebuilds), so a patch that has none costs one request and no download.
-pub(crate) async fn fetch_served_artifacts(
+/// Ask the service for the package reference of `uuid` without downloading
+/// anything: it names the patch's artifacts and, for a gem, the platform
+/// gems its registry serves. For a backend that vendors from other patches
+/// than `uuid`'s own archive (a gem's platform gems), so a gem with a
+/// locked platform that has no patched build costs one request and no
+/// download.
+pub(crate) async fn fetch_served_reference(
     cfg: &VendorServiceConfig,
     uuid: &str,
-) -> ServiceArtifact<ServedArtifacts> {
+) -> ServiceArtifact<ServedReference> {
     let Some(client) = cfg.client.as_ref() else {
         return ServiceArtifact::Unavailable("vendor service not configured".to_string());
     };
@@ -221,10 +240,36 @@ pub(crate) async fn fetch_served_artifacts(
             cfg.patch_server_url.as_deref(),
         )
         .await;
+    served_reference(outcome)
+}
+
+/// [`fetch_served_reference`] for several patches in ONE request: the
+/// answer for each of `uuids`, in their order. `Err` (a log reason) when
+/// the request itself failed, so nothing is known of any of them.
+pub(crate) async fn fetch_served_references(
+    cfg: &VendorServiceConfig,
+    uuids: &[String],
+) -> Result<Vec<ServiceArtifact<ServedReference>>, String> {
+    let Some(client) = cfg.client.as_ref() else {
+        return Err("vendor service not configured".to_string());
+    };
+    let outcomes = client
+        .fetch_vendor_references(
+            uuids,
+            cfg.use_public_proxy,
+            cfg.vendor_url.as_deref(),
+            cfg.patch_server_url.as_deref(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(outcomes.into_iter().map(served_reference).collect())
+}
+
+fn served_reference(
+    outcome: VendorServiceOutcome<VendorReference>,
+) -> ServiceArtifact<ServedReference> {
     match outcome {
-        VendorServiceOutcome::Ready(artifacts) => {
-            ServiceArtifact::Ready(ServedArtifacts(artifacts))
-        }
+        VendorServiceOutcome::Ready(reference) => ServiceArtifact::Ready(reference.into()),
         VendorServiceOutcome::Pending => ServiceArtifact::Pending,
         VendorServiceOutcome::Unavailable(reason) => ServiceArtifact::Unavailable(reason),
         VendorServiceOutcome::Failed(err) => ServiceArtifact::Failed(err.to_string()),
@@ -382,22 +427,9 @@ pub(crate) async fn fetch_verified_secondary(
     fetch_verified_artifact(cfg, archive.secondary.iter().find(|a| a.kind == kind)).await
 }
 
-/// [`fetch_verified_secondary`] for an artifact served once per gem
-/// platform (`gem-platform`, `gem-platform-stub-gemspec`): the one of
-/// `kind` whose `platform` is exactly `platform`, the token `Gemfile.lock`
-/// spells.
-pub(crate) async fn fetch_verified_platform_secondary(
-    cfg: &VendorServiceConfig,
-    served: &ServedArtifacts,
-    kind: &str,
-    platform: &str,
-) -> SecondaryArtifactResult {
-    fetch_verified_artifact(cfg, served.platform(kind, platform)).await
-}
-
 /// Download `artifact` and verify the bytes against its own sha512 SRI;
 /// `Absent` when the service referenced no such artifact.
-async fn fetch_verified_artifact(
+pub(crate) async fn fetch_verified_artifact(
     cfg: &VendorServiceConfig,
     artifact: Option<&SecondaryArtifact>,
 ) -> SecondaryArtifactResult {
@@ -831,7 +863,6 @@ mod tests {
             secondary: vec![SecondaryArtifact {
                 prefetched: None,
                 kind: "gem-stub-gemspec".into(),
-                platform: None,
                 url: format!("{}/stub", server.uri()),
                 integrity_sri: PackedTarball::from_bytes(b"x").integrity,
             }],

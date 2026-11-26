@@ -284,17 +284,17 @@ async fn gem_platform_trees(
     if entry.ecosystem != "gem" {
         return Ok(None);
     }
-    if !entry.gem_platforms.is_empty() {
+    let platforms = entry.gem_tree_platforms();
+    if !platforms.is_empty() {
         // SECURITY: state.json is committed and tamper-able, and each
         // platform is about to name a directory that gets stat'd and hashed.
-        if !entry
-            .gem_platforms
+        if !platforms
             .iter()
             .all(|platform| super::gem::is_platform_dir_name(platform))
         {
             return Err("vendor_path_unsafe".to_string());
         }
-        let trees = entry.gem_platforms.iter().map(|p| artifact.join(p));
+        let trees = platforms.iter().map(|p| artifact.join(p));
         return Ok(Some(trees.collect()));
     }
     let Some((name, _)) = crate::utils::purl::parse_gem_purl(&entry.base_purl) else {

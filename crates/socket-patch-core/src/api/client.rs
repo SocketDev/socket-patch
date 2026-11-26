@@ -1680,19 +1680,19 @@ impl ApiClient {
     }
 
     /// Step 1 of [`Self::fetch_vendor_package`] on its own: what the
-    /// service lists for the patch besides its archive (the per-platform
-    /// gem prebuilds and their stub gemspecs), each with its host-rewritten
-    /// URL and sha512, and NO archive download. A backend that takes only
-    /// those artifacts learns here which exist. Same grant, statuses, retry
-    /// ladder and circuit breaker as the full fetch; a uuid the attached
-    /// plan names is answered from its reference batch.
+    /// service's package reference says of the patch (its artifacts, each
+    /// with its host-rewritten URL and sha512, and the platform gems its
+    /// registry lists), with NO download. A backend that downloads the
+    /// artifacts itself learns here which exist. Same grant, statuses,
+    /// retry ladder and circuit breaker as the full fetch; a uuid the
+    /// attached plan names is answered from its reference batch.
     pub(crate) async fn fetch_vendor_reference(
         &self,
         uuid: &str,
         free_only: bool,
         vendor_url: Option<&str>,
         patch_server_url: Option<&str>,
-    ) -> VendorServiceOutcome<Vec<SecondaryArtifact>> {
+    ) -> VendorServiceOutcome<VendorReference> {
         if let Some(refused) = self.vendor_request_refused(uuid) {
             return VendorServiceOutcome::Failed(refused);
         }
@@ -1700,19 +1700,56 @@ impl ApiClient {
             .request_vendor_package(uuid, free_only, vendor_url)
             .await
         {
-            Ok(result) => (
-                reference_miss(&result.status).unwrap_or_else(|| {
-                    VendorServiceOutcome::Ready(served_secondary_artifacts(
-                        &result,
-                        patch_server_url,
-                    ))
-                }),
-                false,
-            ),
+            Ok(result) => (vendor_reference(&result, patch_server_url), false),
             Err((e, retryable)) => (VendorServiceOutcome::Failed(e), retryable),
         };
         self.note_vendor_outcome(&outcome, retryable_failure);
         outcome
+    }
+
+    /// [`Self::fetch_vendor_reference`] for several patches in ONE request
+    /// (per [`MAX_REFERENCE_BATCH`] uuids): the outcome of each of `uuids`,
+    /// in their order. `Err` when no answer was had at all (a refused or
+    /// failed request), which the circuit breaker counts once.
+    pub(crate) async fn fetch_vendor_references(
+        &self,
+        uuids: &[String],
+        free_only: bool,
+        vendor_url: Option<&str>,
+        patch_server_url: Option<&str>,
+    ) -> Result<Vec<VendorServiceOutcome<VendorReference>>, ApiError> {
+        if let Some(refused) = uuids
+            .iter()
+            .find_map(|uuid| self.vendor_request_refused(uuid))
+        {
+            return Err(refused);
+        }
+        let mut results = std::collections::HashMap::new();
+        for chunk in uuids.chunks(MAX_REFERENCE_BATCH) {
+            match self
+                .request_vendor_references(chunk, free_only, vendor_url)
+                .await
+            {
+                Ok(answered) => results.extend(answered),
+                // As `note_vendor_outcome` counts one failed request.
+                Err((e, retryable)) => {
+                    if retryable {
+                        self.vendor_outage.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        self.vendor_outage.store(0, Ordering::Relaxed);
+        Ok(uuids
+            .iter()
+            .map(|uuid| match results.get(uuid) {
+                Some(result) => vendor_reference(result, patch_server_url),
+                None => VendorServiceOutcome::Failed(ApiError::Other(format!(
+                    "package response missing a result for {uuid}"
+                ))),
+            })
+            .collect())
     }
 
     /// Attach a download plan: `uuids` are the packages the vendor loop is
@@ -2397,14 +2434,11 @@ pub(crate) struct FetchedVendorPackage {
     pub prestaged: crate::vendor::prestage::Prestaged,
 }
 
-/// A non-tarball served artifact reference (e.g. `gem-stub-gemspec`): its kind,
-/// final download URL, and sha512 SRI. Bytes are fetched + verified on demand.
+/// A served artifact reference (e.g. `gem-stub-gemspec`): its kind, final
+/// download URL, and sha512 SRI. Bytes are fetched + verified on demand.
 #[derive(Debug, Clone)]
 pub(crate) struct SecondaryArtifact {
     pub kind: String,
-    /// The gem platform a `gem-platform` / `gem-platform-stub-gemspec`
-    /// artifact is for; `None` on every other kind.
-    pub platform: Option<String>,
     pub url: String,
     /// Normalized `sha512-<b64>` of the artifact bytes.
     pub integrity_sri: String,
@@ -2469,8 +2503,23 @@ impl std::fmt::Debug for PrefetchedSecondary {
     }
 }
 
-/// Outcome of [`ApiClient::fetch_vendor_package`], and, with the served
-/// artifact list in place of the archive, of
+/// What a granted package reference says of its patch, with nothing
+/// downloaded ([`ApiClient::fetch_vendor_reference`]).
+#[derive(Debug)]
+pub(crate) struct VendorReference {
+    /// The archive (`kind: "tarball"`), when the reference gives it a url
+    /// and a sha512.
+    pub archive: Option<SecondaryArtifact>,
+    /// The other served artifacts (see [`served_secondary_artifacts`]).
+    pub secondary: Vec<SecondaryArtifact>,
+    /// gem: the platform gems of the gem's version as the patch's registry
+    /// serves them (`registryOverride.identifiers.gemBuilds`); `None` when
+    /// the reference carries no list.
+    pub gem_builds: Option<Vec<crate::patch::redirect::GemPlatformChecksum>>,
+}
+
+/// Outcome of [`ApiClient::fetch_vendor_package`], and, with the
+/// [`VendorReference`] in place of the archive, of
 /// [`ApiClient::fetch_vendor_reference`].
 ///
 /// The vendor backends map these onto the `auto`/`service`/`build` policy:
@@ -2508,21 +2557,55 @@ fn reference_miss<T>(status: &str) -> Option<VendorServiceOutcome<T>> {
     }
 }
 
+/// What `result` settles for [`ApiClient::fetch_vendor_reference`]: the
+/// miss its status names, else its [`VendorReference`].
+fn vendor_reference(
+    result: &PackageVendorResult,
+    patch_server_url: Option<&str>,
+) -> VendorServiceOutcome<VendorReference> {
+    if let Some(miss) = reference_miss(&result.status) {
+        return miss;
+    }
+    let gem_builds = result
+        .registry_override
+        .as_ref()
+        .and_then(|registry| registry.identifiers.gem_builds.clone());
+    VendorServiceOutcome::Ready(VendorReference {
+        archive: served_artifacts(result, patch_server_url, true).pop(),
+        secondary: served_secondary_artifacts(result, patch_server_url),
+        gem_builds,
+    })
+}
+
 /// The served artifacts of a granted reference OTHER than the archive (the
-/// gem path-source stub gemspec, the per-platform gem prebuilds, …) — their
-/// host-rewritten URL + normalized sha512 — so a backend that needs one can
-/// download + verify it lazily. Each is skipped unless it carries both a
-/// url and a sha512.
+/// gem path-source stub gemspec, …) — their host-rewritten URL + normalized
+/// sha512 — so a backend that needs one can download + verify it lazily.
+/// Each is skipped unless it carries both a url and a sha512.
 fn served_secondary_artifacts(
     result: &PackageVendorResult,
     patch_server_url: Option<&str>,
 ) -> Vec<SecondaryArtifact> {
-    let mut secondary_artifacts: Vec<SecondaryArtifact> = Vec::new();
+    served_artifacts(result, patch_server_url, false)
+}
+
+/// The served artifacts of a granted reference that carry a url and a
+/// sha512, the url host-rewritten: the archive alone (`archive`; its own
+/// url, else the reference's top-level one), or every other artifact.
+fn served_artifacts(
+    result: &PackageVendorResult,
+    patch_server_url: Option<&str>,
+    archive: bool,
+) -> Vec<SecondaryArtifact> {
+    let mut served: Vec<SecondaryArtifact> = Vec::new();
     for a in result.artifacts.iter().flatten() {
-        if a.kind == "tarball" {
+        if (a.kind == "tarball") != archive {
             continue;
         }
-        let (Some(url), Some(sha512)) = (a.url.as_deref(), a.integrity.sha512.as_deref()) else {
+        let url = a
+            .url
+            .as_deref()
+            .or(result.url.as_deref().filter(|_| archive));
+        let (Some(url), Some(sha512)) = (url, a.integrity.sha512.as_deref()) else {
             continue;
         };
         let url = match patch_server_url {
@@ -2532,15 +2615,17 @@ fn served_secondary_artifacts(
             },
             None => url.to_string(),
         };
-        secondary_artifacts.push(SecondaryArtifact {
+        served.push(SecondaryArtifact {
             kind: a.kind.clone(),
-            platform: a.platform.clone(),
             url,
             integrity_sri: normalize_sha512_sri(sha512),
             prefetched: None,
         });
+        if archive {
+            break;
+        }
     }
-    secondary_artifacts
+    served
 }
 
 /// A serve GET's answer short of a failure.
@@ -5303,6 +5388,155 @@ mod vendor_package_tests {
             outcome,
             VendorServiceOutcome::Failed(ApiError::InvalidHash(_))
         ));
+    }
+
+    // ── fetch_vendor_reference(s) (a gem's platform builds) ────────────
+
+    /// A gem patch's reference read without a download: its archive and
+    /// stub as artifacts to fetch later, and the platform gems its
+    /// registry lists, each with the patch of its patched build.
+    #[tokio::test]
+    async fn vendor_reference_reads_the_artifacts_and_the_gem_builds() {
+        const BUILD: &str = "22222222-2222-4222-8222-222222222222";
+        let server = MockServer::start().await;
+        let gem_url = format!("{}/patch/gem/a.gem", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: {
+                    "status": "granted",
+                    "url": gem_url,
+                    "artifacts": [
+                        { "kind": "tarball", "integrity": { "sha512": "sha512-GEM==" } },
+                        { "kind": "gem-stub-gemspec", "url": "https://x/a.gemspec",
+                          "integrity": { "sha512": "STUB==" } },
+                        { "kind": "gem-stub-gemspec", "url": null,
+                          "integrity": { "sha512": "sha512-NOURL==" } }
+                    ],
+                    "registryOverride": {
+                        "kind": "rubygems-compact-index",
+                        "indexUrl": "https://x/patch-registry/gem/t/u/s/2",
+                        "identifiers": {
+                            "name": "a", "version": "1.0.0",
+                            "gemBuilds": [
+                                { "platform": "arm64-darwin",
+                                  "gemChecksumSha256": "ab".repeat(32), "patchUuid": null },
+                                { "platform": "x86_64-linux-gnu",
+                                  "gemChecksumSha256": "cd".repeat(32), "patchUuid": BUILD }
+                            ]
+                        }
+                    }
+                }}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let outcome = auth_client(server.uri())
+            .fetch_vendor_reference(UUID, false, None, None)
+            .await;
+        let VendorServiceOutcome::Ready(reference) = outcome else {
+            panic!("expected Ready, got {outcome:?}");
+        };
+        // The archive takes the reference's top-level url when it has none
+        // of its own; an artifact with no url is not listed.
+        let archive = reference.archive.expect("the archive");
+        assert_eq!(
+            (archive.url.as_str(), archive.integrity_sri.as_str()),
+            (gem_url.as_str(), "sha512-GEM==")
+        );
+        let secondary: Vec<_> = reference
+            .secondary
+            .iter()
+            .map(|a| (a.kind.as_str(), a.url.as_str(), a.integrity_sri.as_str()))
+            .collect();
+        assert_eq!(
+            secondary,
+            [("gem-stub-gemspec", "https://x/a.gemspec", "sha512-STUB==")]
+        );
+        let builds: Vec<_> = reference
+            .gem_builds
+            .as_deref()
+            .expect("the list")
+            .iter()
+            .map(|b| (b.platform.as_str(), b.patch_uuid.as_deref()))
+            .collect();
+        assert_eq!(
+            builds,
+            [("arm64-darwin", None), ("x86_64-linux-gnu", Some(BUILD))]
+        );
+    }
+
+    /// The references of several patches come from ONE request and are
+    /// answered in the order asked, each by its own status; a uuid the
+    /// response leaves out is a failure of that uuid alone. A request that
+    /// fails is `Err`: nothing is known of any of them. A malformed uuid
+    /// is refused before any request.
+    #[tokio::test]
+    async fn vendor_references_are_asked_for_in_one_request() {
+        const A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        const C: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .and(body_partial_json(json!({ "uuids": [B, A, C] })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": {
+                    A: { "status": "granted", "url": "https://x/a.gem",
+                         "artifacts": [{ "kind": "tarball", "url": "https://x/a.gem",
+                                         "integrity": { "sha512": "sha512-A==" } }] },
+                    B: { "status": "pending_build", "url": null, "artifacts": [] }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = auth_client(server.uri());
+        let uuids = [B.to_string(), A.to_string(), C.to_string()];
+        let outcomes = client
+            .fetch_vendor_references(&uuids, false, None, None)
+            .await
+            .expect("one answer for all three");
+        assert_eq!(outcomes.len(), 3);
+        assert!(matches!(outcomes[0], VendorServiceOutcome::Pending));
+        match &outcomes[1] {
+            VendorServiceOutcome::Ready(reference) => {
+                let archive = reference.archive.as_ref().expect("the archive");
+                assert_eq!(archive.url, "https://x/a.gem");
+                assert!(reference.gem_builds.is_none());
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        match &outcomes[2] {
+            VendorServiceOutcome::Failed(ApiError::Other(msg)) => {
+                assert!(msg.contains(C), "{msg}")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        let refused = client
+            .fetch_vendor_references(&[A.to_string(), "not-a-uuid".into()], false, None, None)
+            .await;
+        assert!(
+            matches!(refused, Err(ApiError::InvalidHash(_))),
+            "{refused:?}"
+        );
+
+        let down = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&down)
+            .await;
+        let down_client = auth_client(down.uri()).with_vendor_retry(VendorRetryPolicy::none());
+        let failed = down_client
+            .fetch_vendor_references(&uuids, false, None, None)
+            .await;
+        assert!(failed.is_err(), "{failed:?}");
+        assert_eq!(
+            down_client.vendor_outage.load(Ordering::Relaxed),
+            1,
+            "the circuit breaker counts the failed request once"
+        );
     }
 
     // ── fetch_registry_references (hosted-mode scan resolution) ────────
