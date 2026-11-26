@@ -3365,12 +3365,18 @@ async fn refresh_leaves_a_shared_gem_home_alone_unless_asked() {
 /// compact index entry naming the upstream archive's sha256, and its
 /// download.
 async fn serve_upstream_gem(server: &MockServer, upstream: &[u8]) {
+    serve_upstream_gem_indexed_as(server, upstream, &sha256_of(upstream)).await;
+}
+
+/// [`serve_upstream_gem`] with the index's `checksum:` written as
+/// `digest`: the gem's sha256 in whichever encoding the server uses.
+async fn serve_upstream_gem_indexed_as(server: &MockServer, upstream: &[u8], digest: &str) {
     Mock::given(method("GET"))
         .and(path(format!("/upstream/info/{DEP}")))
-        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-            "---\n{DEP_VERSION} |checksum:{}\n",
-            sha256_of(upstream)
-        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("---\n{DEP_VERSION} |checksum:{digest}\n")),
+        )
         .mount(server)
         .await;
     Mock::given(method("GET"))
@@ -4245,6 +4251,63 @@ async fn hosted_unwind_restores_a_mirror_gem_when_the_registry_setting_names_the
             details_with_code(&env, "upstream_gem_stale_install").is_empty(),
             "{command:?}: nothing is left on the patched build: {env}"
         );
+    }
+}
+
+/// #2285: a mirror built with `gem generate_index` writes the sha256 in
+/// its compact index as base64, which Bundler reads and pins as hex in
+/// `CHECKSUMS`. With `SOCKET_RUBYGEMS_URL` naming such a mirror the
+/// unwind restores the pair byte for byte and puts the upstream gem back,
+/// for the standard alphabet and the URL-safe one.
+#[tokio::test(flavor = "multi_thread")]
+async fn hosted_unwind_restores_a_mirror_gem_whose_index_checksum_is_base64() {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let engines = [
+        ("standard", base64::engine::general_purpose::STANDARD),
+        ("url-safe", base64::engine::general_purpose::URL_SAFE),
+    ];
+    for (alphabet, engine) in engines {
+        for command in HOSTED_UNWINDS {
+            let at = format!("{alphabet} {command:?}");
+            let server = MockServer::start().await;
+            let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+            mount_api_for(&server, None, &sha256_of(&patched)).await;
+            serve_patched_gem(&server, patched.clone()).await;
+            let digest = engine.encode(sha2::Sha256::digest(&upstream));
+            assert_eq!(digest.len(), 44, "premise: 43 digits and one `=`");
+            serve_upstream_gem_indexed_as(&server, &upstream, &digest).await;
+            let uri = server.uri();
+            let mirror = format!("{uri}/upstream");
+            let tmp = tempfile::tempdir().unwrap();
+            let proj = tmp.path().join("proj");
+            let gem_dir = mirror_project(&proj, &mirror, Some(&sha256_of(&upstream)));
+            let pair = |name: &str| std::fs::read_to_string(proj.join(name)).unwrap();
+            let (gemfile, lock) = (pair("Gemfile"), pair("Gemfile.lock"));
+            let (code, _, stderr) =
+                common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+            assert_eq!(code, 0, "{at}: {stderr}");
+            assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "{at}: premise");
+            assert!(pair("Gemfile.lock").contains("/patch-registry/"), "{at}");
+
+            let mut args = command.to_vec();
+            args.push("--json");
+            let (code, stdout, stderr) = unwind_run_with_registry(&proj, &uri, &args, &mirror);
+            let env: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|e| panic!("{at}: not JSON: {e}\n{stdout}\n{stderr}"));
+            assert_eq!(code, 0, "{at}: {env}\n{stderr}");
+            assert_eq!(pair("Gemfile"), gemfile, "{at}");
+            assert_eq!(pair("Gemfile.lock"), lock, "{at}");
+            assert_eq!(
+                installed_lib(&gem_dir),
+                UPSTREAM_LIB,
+                "{at}: the upstream gem is back: {env}"
+            );
+            assert!(
+                details_with_code(&env, "upstream_gem_stale_install").is_empty(),
+                "{at}: nothing is left on the patched build: {env}"
+            );
+        }
     }
 }
 

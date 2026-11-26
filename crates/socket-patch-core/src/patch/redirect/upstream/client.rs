@@ -1104,6 +1104,37 @@ mod tests {
         assert_eq!(compact_index_checksum("1.0.0 |ruby:>= 2", "1.0.0"), None);
     }
 
+    /// #2285: an index built with `gem generate_index` writes the sha256
+    /// as base64 (rack 3.2.9's line below is the one that command wrote).
+    /// Bundler reads it and pins the hex digest in `CHECKSUMS`, in the
+    /// standard and the URL-safe alphabet, so both give that hex here.
+    #[test]
+    fn compact_index_checksum_reads_a_base64_digest_as_bundler_does() {
+        const HEX: &str = "8235c1d08f0c461bedcff4413bbeba888173e5b09e1332ae951c98f0ee460dcc";
+        let info = "---\n3.2.8 |checksum:AAAA\n\
+                    3.2.9 |checksum:gjXB0I8MRhvtz/RBO766iIFz5bCeEzKulRyY8O5GDcw=,ruby:>= 2.4.0\n\
+                    3.2.9-java |checksum:gjXB0I8MRhvtz_RBO766iIFz5bCeEzKulRyY8O5GDcw=\n";
+        assert_eq!(compact_index_checksum(info, "3.2.9").as_deref(), Some(HEX));
+        assert_eq!(
+            compact_index_checksum(info, "3.2.9-java").as_deref(),
+            Some(HEX),
+            "the URL-safe alphabet"
+        );
+        // What Bundler refuses as a digest is no checksum: the padding
+        // missing or doubled, bits set past the 32nd byte, another length.
+        for bad in [
+            "gjXB0I8MRhvtz/RBO766iIFz5bCeEzKulRyY8O5GDcw",
+            "gjXB0I8MRhvtz/RBO766iIFz5bCeEzKulRyY8O5GDcw==",
+            "gjXB0I8MRhvtz/RBO766iIFz5bCeEzKulRyY8O5GDcx=",
+            "gjXB0I8MRhvtz/RBO766iIFz5bCeEzKulRyY8O5GDc==",
+            "gjXB0I8MRhvtz/RBO766iIFz5bCeEzKulRyY8O5G*cw=",
+            "AAAA",
+        ] {
+            let info = format!("3.2.9 |checksum:{bad}\n");
+            assert_eq!(compact_index_checksum(&info, "3.2.9"), None, "{bad}");
+        }
+    }
+
     #[test]
     fn packagist_minified_versions_inherit_and_unset() {
         let versions = serde_json::json!([
