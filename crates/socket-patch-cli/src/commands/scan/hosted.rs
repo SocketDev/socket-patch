@@ -386,6 +386,26 @@ pub(super) fn record_hosted_events(
     }
 }
 
+/// The pins of `confirmed` that put a patch in effect: all of them but a
+/// gem the lock names as platform builds none of which is patched (every
+/// one is served as upstream's own gem: a lock that followed a withdrawn
+/// build back). Such a gem is on the patch registry and installs nothing
+/// patched, so it is no package on a hosted patch: the telemetry, the
+/// summary line and the rows under it count what is in effect, as the
+/// envelope's events do.
+fn pins_in_effect(
+    confirmed: &[(String, String)],
+    rewrite: &socket_patch_core::patch::redirect::RewriteResult,
+) -> Vec<(String, String)> {
+    let unpatched = |uuid: &String| {
+        let builds = rewrite.gem_builds.get(uuid);
+        builds.is_some_and(|builds| builds.iter().all(|build| build.patch_uuid.is_none()))
+    };
+    let mut pins = confirmed.to_vec();
+    pins.retain(|(_, uuid)| !unpatched(uuid));
+    pins
+}
+
 /// Each pin of `confirmed` as its own report: what a run's telemetry
 /// names, one patch per package, where the envelope reports a gem locked
 /// as platform builds per build.
@@ -2922,17 +2942,20 @@ async fn run_redirect_selected_untracked(
     // builds once per locked build. Everything else above and below works
     // on the pins themselves, one per package.
     let reports = engine::pin_reports(&confirmed, rewrite);
+    // And the pins that put a patch in effect: what is counted as on a
+    // hosted patch.
+    let in_effect = pins_in_effect(&confirmed, rewrite);
     // Sent before the result prints: a consumer that closes stdout early
     // (SIGPIPE on the first write) must not lose it.
     if !selected.is_empty() {
         socket_patch_core::telemetry::track_patch_hosted(
             telemetry.command,
-            confirmed.len(),
+            in_effect.len(),
             done.rewritten.len(),
             common.dry_run,
             &crate::telemetry_outcomes::patch_outcomes_of(
                 &hosted_events(
-                    &pin_reports_by_package(&confirmed),
+                    &pin_reports_by_package(&in_effect),
                     &unconfirmed,
                     &skipped,
                     common.dry_run,
@@ -3036,21 +3059,21 @@ async fn run_redirect_selected_untracked(
                         .into_iter()
                         .map(|pin| pin.uuid)
                         .collect();
-                    confirmed
+                    in_effect
                         .iter()
                         .filter(|(_, uuid)| in_place.contains(uuid))
                         .count()
                 });
             println!(
                 "{}",
-                format_hosted_summary(confirmed.len(), already, human_files.len(), common.dry_run)
+                format_hosted_summary(in_effect.len(), already, human_files.len(), common.dry_run)
             );
             // Under it, one row per package on a hosted patch: what the
             // patch fixes and how much it leaves unpatched. The same call
             // counts the directory into the invocation's closing totals.
             if let Some(gate) = rollout.as_mut() {
                 let pinned: std::collections::HashSet<&str> =
-                    confirmed.iter().map(|(_, uuid)| uuid.as_str()).collect();
+                    in_effect.iter().map(|(_, uuid)| uuid.as_str()).collect();
                 if let Some(report) = gate.report.as_deref_mut() {
                     report.project(&gate.plan, &pinned).await;
                     report.hosted_builds(&reports);
@@ -3109,7 +3132,7 @@ async fn run_redirect_selected_untracked(
             for line in format_unredirected(
                 &skipped_pairs,
                 &unconfirmed_purls,
-                confirmed.is_empty(),
+                in_effect.is_empty(),
                 // Only the lockfile rewriters' own warnings explain a
                 // missing lock entry; unrelated guidance (pnpm trust, VEX,
                 // stale installs, Bun default trust) is not what the hint

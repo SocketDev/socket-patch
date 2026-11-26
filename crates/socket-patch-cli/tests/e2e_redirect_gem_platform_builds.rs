@@ -18,8 +18,11 @@
 //! * a later run on the same registry snapshot changes nothing, and one on
 //!   a newer snapshot refreshes the URL and says which builds it found
 //!   patched;
-//! * a platform the registry does not list, or a reference with no list at
-//!   all, leaves the gem alone under `redirect_gem_platform_unsupported`.
+//! * a platform the registry does not list leaves the gem alone under a
+//!   quiet skip, and a reference with no list at all under the warning
+//!   `redirect_gem_platform_unsupported`;
+//! * a lock whose patched build was withdrawn follows the list back to
+//!   upstream's gem, and is then counted as no package on a hosted patch.
 //!
 //! The VEX document is truthful per locked build, in the run's own `--vex`
 //! and in a later `socket-patch vex` over the lock the run left:
@@ -867,6 +870,65 @@ async fn a_platform_gems_own_record_is_no_fix_of_its_own() {
         ],
         "{env}"
     );
+}
+
+/// The one patched build a lock pins is withdrawn: the list has upstream's
+/// gem for every locked platform. The lock follows it (the registry under
+/// the earlier snapshot refuses that build from then on), and from there
+/// on the gem installs nothing patched. So it is no package on a hosted
+/// patch: no `applied` event, the summary line counts none, and no row
+/// under it calls the gem patched; the line of the gem says what is true.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gem_whose_builds_are_all_upstreams_is_no_package_on_a_hosted_patch() {
+    let server = MockServer::start().await;
+    mount_api(&server, Some((&ONE_PATCHED[..], 4))).await;
+    let proj = project(&lock(true));
+    let (code, env) = scan_json(proj.path(), &server.uri(), &[]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(env["summary"]["applied"], 1, "premise: {env}");
+
+    // The same registry, as it stands after the withdrawal.
+    server.reset().await;
+    mount_api(&server, Some((&NONE_PATCHED[..], 5))).await;
+    let api = server.uri();
+    let index = format!("{}/", index_url(&api, Some(5)));
+    let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(
+        read(proj.path(), "Gemfile.lock"),
+        hosted_lock(&index, ARM_UPSTREAM, LINUX_UPSTREAM),
+        "the lock follows the list back to upstream's gem"
+    );
+    assert!(
+        stdout.contains("Switched 0 packages to hosted patches; rewrote 2 files.\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("already on hosted patches"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "{DEP} {DEP_VERSION}: upstream gem kept for {ARM}, {LINUX} (no patched build yet)"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains(&format!("{DEP}@{DEP_VERSION}  {GHSA}")),
+        "no row calls the gem patched:\n{stdout}"
+    );
+    assert!(!stdout.contains("Nothing left to patch."), "{stdout}");
+
+    // In place afterwards: still nothing in effect, nothing rewritten.
+    let (code, env) = scan_json(proj.path(), &api, &[]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(env["summary"]["applied"], 0, "{env}");
+    assert_eq!(env["redirect"]["rewrittenFiles"], json!([]), "{env}");
+    assert_eq!(
+        hosted_events(&env),
+        [upstream_event(ARM), upstream_event(LINUX)],
+        "{env}"
+    );
+    let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(!stdout.contains("already on hosted patches"), "{stdout}");
 }
 
 /// `get <the gem's patch> --mode hosted` writes what `scan` writes and
