@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 use socket_patch_core::api::client::ApiClient;
 use socket_patch_core::api::ranking::{cmp_batch_infos, severity_order};
 use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult, PatchStatistics};
+use socket_patch_core::hosted::engine::PinReport;
 use socket_patch_core::policy::filter::{Reachability, SelectionFilter};
+use socket_patch_core::utils::purl::purl_parts;
 use socket_patch_core::utils::purl_key::PurlKey;
 
 use super::discovery::Access;
@@ -51,6 +53,11 @@ const UPGRADE_HOURS: usize = 2;
 /// The package column is as wide as the longest name, up to this many
 /// columns; a longer name keeps its `@version` and loses its middle.
 const MAX_NAME_COL: usize = 44;
+/// The widest the closing line about unpatched gem builds
+/// ([`unpatched_builds_line`]) lets itself get: one row of an 80-column
+/// terminal beside the closing lines' two-column gutter, short of the
+/// terminal's last column.
+const BUILDS_LINE_COLS: usize = 77;
 
 /// One package with a patch on offer, as the report counts and shows it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -356,6 +363,91 @@ impl Counts {
     }
 }
 
+/// The locked builds of one gem that a hosted run left on upstream's gem:
+/// the patch registry has no patched build for their platforms yet, so
+/// those platforms install what they installed before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnpatchedBuilds {
+    /// `<name> <version>`, as the run's lines name a gem.
+    pub(crate) gem: String,
+    pub(crate) platforms: Vec<String>,
+}
+
+/// Add to `builds` the locked builds of `reports` (a hosted run's pins per
+/// locked build) that keep upstream's gem. A build is one platform gem of
+/// one version, however many project directories lock it: each is listed
+/// once, in the order the run met it.
+fn note_unpatched_builds(builds: &mut Vec<UnpatchedBuilds>, reports: &[PinReport]) {
+    let kept = reports
+        .iter()
+        .filter(|report| report.gem_fix.is_some() && report.uuid.is_none());
+    for report in kept {
+        let Some((_, name, version)) = purl_parts(&report.purl) else {
+            continue;
+        };
+        let gem = format!("{name} {version}");
+        let platform = report.platform.as_deref().unwrap_or("ruby");
+        let at = match builds.iter().position(|known| known.gem == gem) {
+            Some(at) => at,
+            None => {
+                builds.push(UnpatchedBuilds {
+                    gem,
+                    platforms: Vec::new(),
+                });
+                builds.len() - 1
+            }
+        };
+        if !builds[at].platforms.iter().any(|known| known == platform) {
+            builds[at].platforms.push(platform.to_string());
+        }
+    }
+}
+
+/// The closing line about the gem builds a hosted run left on upstream's
+/// gem (`builds`), which stands where "Nothing left to patch." would: the
+/// run's packages are patched, and these builds of them are not. Not a
+/// warning: nothing here needs doing, and a later run patches a build once
+/// the patch registry has one. `None` when there is no such build.
+///
+/// ```text
+/// Not patched yet: nokogiri 1.19.3 for arm64-darwin, x86_64-linux-musl.
+/// Not patched yet: 3 builds of nokogiri 1.19.3, ffi 1.17.2.
+/// Not patched yet: 12 builds of 7 gems.
+/// ```
+///
+/// It names each gem with its platforms while that fits one row of an
+/// 80-column terminal ([`BUILDS_LINE_COLS`]), then the gems with how many
+/// builds they add up to, then only how many there are of each: the run's
+/// own line about each gem names every platform.
+fn unpatched_builds_line(builds: &[UnpatchedBuilds], color: bool) -> Option<String> {
+    const LEAD: &str = "Not patched yet";
+    let builds: Vec<&UnpatchedBuilds> = builds
+        .iter()
+        .filter(|gem| !gem.platforms.is_empty())
+        .collect();
+    if builds.is_empty() {
+        return None;
+    }
+    let count = builds.iter().map(|gem| gem.platforms.len()).sum();
+    let counted = plural(count, "build", "builds");
+    let with_platforms: Vec<String> = builds
+        .iter()
+        .map(|gem| format!("{} for {}", gem.gem, gem.platforms.join(", ")))
+        .collect();
+    let gems: Vec<&str> = builds.iter().map(|gem| gem.gem.as_str()).collect();
+    // What the row has room for beside the lead, its colon and space, and
+    // the closing period.
+    let room = BUILDS_LINE_COLS - LEAD.len() - ": .".len();
+    let named = [
+        with_platforms.join("; "),
+        format!("{counted} of {}", gems.join(", ")),
+    ]
+    .into_iter()
+    .find(|named| named.chars().count() <= room)
+    .unwrap_or_else(|| format!("{counted} of {}", plural(builds.len(), "gem", "gems")));
+    Some(format!("{}: {named}.", ui::paint(LEAD, "1;33", color)))
+}
+
 /// `left` as a share of `fixed + left`, for the closing lines: a whole
 /// percentage that never rounds a remainder away (`<1%`) or the fixed
 /// part to nothing (`>99%`). `None` when nothing was fixed, where the
@@ -577,10 +669,16 @@ fn meter(fixed: usize, left: usize, style: Style) -> Option<String> {
 /// lines under the count say so (how many merged patches, one per patched
 /// package that waits, and what to do).
 ///
+/// A hosted run can leave a locked build of a patched gem on upstream's
+/// gem (`builds`). The lines then name those builds
+/// ([`unpatched_builds_line`]) where they would say that nothing is left,
+/// or under what is left.
+///
 /// Where the terminal shows glyphs, the lines of what was done open with a
 /// check mark (the others are indented to match) and a meter closes them.
 pub(crate) fn closing(
     counts: &Counts,
+    builds: &[UnpatchedBuilds],
     projects: usize,
     dry_run: bool,
     reachability: bool,
@@ -588,10 +686,11 @@ pub(crate) fn closing(
     style: Style,
 ) -> Vec<String> {
     let left = counts.left();
-    if counts.patched == 0 && left == 0 {
+    let color = style.color;
+    let unpatched_builds = unpatched_builds_line(builds, color);
+    if counts.patched == 0 && left == 0 && unpatched_builds.is_none() {
         return Vec::new();
     }
-    let color = style.color;
     let num = |n: usize, one: &str, many: &str| {
         format!(
             "{} {}",
@@ -703,7 +802,10 @@ pub(crate) fn closing(
         } else {
             "Nothing left to patch."
         };
-        lines.push(plain(nothing.to_string()));
+        // A gem build still on upstream's gem is something left.
+        if unpatched_builds.is_none() {
+            lines.push(plain(nothing.to_string()));
+        }
     } else {
         let mut why = Vec::new();
         if counts.left_merge > 0 {
@@ -773,6 +875,7 @@ pub(crate) fn closing(
             )));
         }
     }
+    lines.extend(unpatched_builds.map(plain));
     if reachability {
         let share = percent_left(counts.fixed_reachable, counts.left_reachable)
             .map(|p| format!(" ({p})"))
@@ -829,6 +932,9 @@ pub(crate) struct Run {
     shares_lookups: bool,
     /// Some project directory's lookup ran on the public proxy.
     free_only: bool,
+    /// The gem builds the hosted runs left on upstream's gem
+    /// ([`Self::hosted_builds`]).
+    unpatched_builds: Vec<UnpatchedBuilds>,
 }
 
 impl Run {
@@ -851,6 +957,7 @@ impl Run {
             upsold: false,
             shares_lookups: false,
             free_only: false,
+            unpatched_builds: Vec::new(),
         }
     }
 
@@ -1071,6 +1178,14 @@ impl Run {
         );
     }
 
+    /// A project directory's hosted pins per locked build (`reports`,
+    /// `engine::pin_reports`). The builds among them that keep upstream's
+    /// gem are named in the closing lines, which then do not say that
+    /// nothing is left to patch. Once per directory.
+    pub(crate) fn hosted_builds(&mut self, reports: &[PinReport]) {
+        note_unpatched_builds(&mut self.unpatched_builds, reports);
+    }
+
     /// Print the closing lines (stdout), under a blank line. The elapsed
     /// time is for someone watching: it prints on a terminal only, so a
     /// log of the same run reads the same every time.
@@ -1090,6 +1205,7 @@ impl Run {
         let elapsed = ui::attended(ui::Stream::Stdout).then(|| self.started.elapsed());
         let lines = closing(
             &counts,
+            &self.unpatched_builds,
             self.projects,
             self.dry_run,
             self.reachability,
@@ -1655,7 +1771,7 @@ mod tests {
             ..counts(22, 39, 14, 3, 1)
         };
         assert_eq!(
-            closing(&c, 3, false, false, None, PLAIN),
+            closing(&c, &[], 3, false, false, None, PLAIN),
             vec![
                 "Patched 22 packages in 3 projects, fixing 39 vulnerabilities (5 critical, 21 high).",
                 "Saved about 44 hours of engineering time (22 package upgrades at ~2 hours each).",
@@ -1667,6 +1783,7 @@ mod tests {
         assert_eq!(
             closing(
                 &counts(1, 1, 0, 0, 0),
+                &[],
                 1,
                 false,
                 false,
@@ -1681,7 +1798,7 @@ mod tests {
         );
         // A patch that names no advisory still patched its package.
         assert_eq!(
-            closing(&counts(2, 0, 0, 0, 0), 2, false, false, None, PLAIN),
+            closing(&counts(2, 0, 0, 0, 0), &[], 2, false, false, None, PLAIN),
             vec![
                 "Patched 2 packages in 2 projects.",
                 "Saved about 4 hours of engineering time (2 package upgrades at ~2 hours each).",
@@ -1690,14 +1807,14 @@ mod tests {
         );
         // Nothing patched: only what is left, with no share of nothing.
         assert_eq!(
-            closing(&counts(0, 0, 0, 4, 1), 0, false, false, None, PLAIN),
+            closing(&counts(0, 0, 0, 4, 1), &[], 0, false, false, None, PLAIN),
             vec![
                 "5 vulnerabilities left to patch: 4 need a paid Socket plan, 1 is in packages \
                  this run did not patch."
             ]
         );
         // Nothing found at all: no lines.
-        assert!(closing(&Counts::default(), 0, false, false, None, PLAIN).is_empty());
+        assert!(closing(&Counts::default(), &[], 0, false, false, None, PLAIN).is_empty());
     }
 
     /// Advisories waiting on a merged patch are counted apart from the
@@ -1711,7 +1828,7 @@ mod tests {
             ..counts(1, 1, 0, 0, 0)
         };
         assert_eq!(
-            closing(&one, 1, false, false, None, PLAIN)[2..],
+            closing(&one, &[], 1, false, false, None, PLAIN)[2..],
             [
                 "1 vulnerability left to patch (50%): 1 awaits a merged patch.",
                 "1 merged patch is not ready yet: Socket is still processing it.",
@@ -1724,7 +1841,7 @@ mod tests {
             ..counts(22, 39, 8, 3, 1)
         };
         assert_eq!(
-            closing(&many, 3, true, false, None, PLAIN)[2..],
+            closing(&many, &[], 3, true, false, None, PLAIN)[2..],
             [
                 "18 vulnerabilities would be left to patch (32%): 6 await a merged patch, 8 need a \
                  package upgrade, 3 need a paid Socket plan, 1 is in packages a run would not \
@@ -1743,7 +1860,7 @@ mod tests {
             ..counts(22, 39, 1, 0, 2)
         };
         assert_eq!(
-            closing(&c, 3, true, true, None, PLAIN),
+            closing(&c, &[], 3, true, true, None, PLAIN),
             vec![
                 "Would patch 22 packages in 3 projects, fixing 39 vulnerabilities.",
                 "Would save about 44 hours of engineering time (22 package upgrades at ~2 hours \
@@ -1758,7 +1875,7 @@ mod tests {
             ..counts(5, 6, 0, 0, 0)
         };
         assert_eq!(
-            closing(&none_left, 1, false, true, None, PLAIN)[2..],
+            closing(&none_left, &[], 1, false, true, None, PLAIN)[2..],
             [
                 "Nothing left to patch.",
                 "Reachable: 4 fixed, 0 left to patch."
@@ -1768,7 +1885,7 @@ mod tests {
 
     #[test]
     fn closing_colors_the_numbers_only() {
-        let lines = closing(&counts(2, 3, 1, 0, 0), 1, false, false, None, COLOR);
+        let lines = closing(&counts(2, 3, 1, 0, 0), &[], 1, false, false, None, COLOR);
         assert_eq!(
             lines[0],
             "\x1b[1;32mPatched\x1b[0m \x1b[1m2\x1b[0m packages, fixing \x1b[1m3\x1b[0m vulnerabilities."
@@ -1776,7 +1893,7 @@ mod tests {
         let plain: Vec<String> = lines.iter().map(|l| ui::strip_ansi(l)).collect();
         assert_eq!(
             plain,
-            closing(&counts(2, 3, 1, 0, 0), 1, false, false, None, PLAIN)
+            closing(&counts(2, 3, 1, 0, 0), &[], 1, false, false, None, PLAIN)
         );
     }
 
@@ -1841,7 +1958,7 @@ mod tests {
             tests: 1208,
             ..counts(22, 39, 23, 0, 0)
         };
-        let plain = closing(&c, 3, false, false, None, PLAIN);
+        let plain = closing(&c, &[], 3, false, false, None, PLAIN);
         assert_eq!(
             plain,
             vec![
@@ -1853,7 +1970,7 @@ mod tests {
         );
         // With glyphs: a check mark on what was done, the rest indented to
         // match, and the meter of the share patched.
-        let fancy: Vec<String> = closing(&c, 3, false, false, None, FANCY)
+        let fancy: Vec<String> = closing(&c, &[], 3, false, false, None, FANCY)
             .iter()
             .map(|l| ui::strip_ansi(l))
             .collect();
@@ -1874,7 +1991,7 @@ mod tests {
             tests_passing: 1200,
             ..c
         };
-        let lines: Vec<String> = closing(&partly, 3, false, false, None, FANCY)
+        let lines: Vec<String> = closing(&partly, &[], 3, false, false, None, FANCY)
             .iter()
             .map(|l| ui::strip_ansi(l))
             .collect();
@@ -1884,7 +2001,7 @@ mod tests {
              (measured for 18 of 22 patches)."
         );
         // Nothing left: no meter to draw.
-        let done = closing(&counts(2, 3, 0, 0, 0), 1, false, false, None, FANCY);
+        let done = closing(&counts(2, 3, 0, 0, 0), &[], 1, false, false, None, FANCY);
         assert_eq!(done.len(), 3);
         assert_eq!(ui::strip_ansi(&done[2]), "  Nothing left to patch.");
         // A lookup that saw free patches only speaks for those alone.
@@ -1893,8 +2010,233 @@ mod tests {
             ..counts(2, 3, 0, 0, 0)
         };
         assert_eq!(
-            closing(&free, 1, false, false, None, PLAIN)[2],
+            closing(&free, &[], 1, false, false, None, PLAIN)[2],
             "No free patches left to apply."
+        );
+    }
+
+    fn unpatched(gem: &str, platforms: &[&str]) -> UnpatchedBuilds {
+        UnpatchedBuilds {
+            gem: gem.to_string(),
+            platforms: strs(platforms),
+        }
+    }
+
+    /// One locked build of a hosted gem as a run reports it: patched under
+    /// `patch`, or on upstream's gem with none.
+    fn build(purl: &str, platform: Option<&str>, patch: Option<&str>) -> PinReport {
+        PinReport {
+            purl: match platform {
+                Some(platform) => format!("{purl}?platform={platform}"),
+                None => purl.to_string(),
+            },
+            uuid: patch.map(str::to_string),
+            gem_fix: Some("gem-fix".to_string()),
+            platform: platform.map(str::to_string),
+            newly_patched: patch.is_some(),
+        }
+    }
+
+    const NOKOGIRI: &str = "pkg:gem/nokogiri@1.19.3";
+    const FFI: &str = "pkg:gem/ffi@1.17.2";
+
+    /// A run whose every package is patched does not say that nothing is
+    /// left while a locked build of one of them keeps upstream's gem: one
+    /// line names the build in that place, on a dry run too, with no
+    /// check mark and no meter.
+    #[test]
+    fn closing_names_a_gem_build_that_is_not_patched_yet() {
+        let one = [unpatched("nokogiri 1.19.3", &["arm64-darwin"])];
+        let wet = closing(&counts(1, 1, 0, 0, 0), &one, 1, false, false, None, PLAIN);
+        assert_eq!(
+            wet,
+            vec![
+                "Patched 1 package, fixing 1 vulnerability.",
+                "Saved about 2 hours of engineering time (1 package upgrade at ~2 hours).",
+                "Not patched yet: nokogiri 1.19.3 for arm64-darwin.",
+            ]
+        );
+        let dry = closing(&counts(1, 1, 0, 0, 0), &one, 1, true, false, None, PLAIN);
+        assert_eq!(dry[0], "Would patch 1 package, fixing 1 vulnerability.");
+        assert_eq!(dry[2..], wet[2..]);
+        // A lookup that saw free patches only: the build is still what is
+        // left, so the line about free patches gives way too.
+        let free = Counts {
+            free_only: true,
+            ..counts(1, 1, 0, 0, 0)
+        };
+        assert_eq!(
+            closing(&free, &one, 1, false, false, None, PLAIN)[2..],
+            wet[2..]
+        );
+        // With glyphs and color: in the gutter, its lead painted like the
+        // count of what is left, and nothing after it.
+        let fancy = closing(&counts(1, 1, 0, 0, 0), &one, 1, false, false, None, FANCY);
+        assert_eq!(
+            fancy[2..],
+            ["  \x1b[1;33mNot patched yet\x1b[0m: nokogiri 1.19.3 for arm64-darwin."]
+        );
+        // No build on upstream's gem: nothing is left.
+        let none = [unpatched("nokogiri 1.19.3", &[])];
+        assert_eq!(
+            closing(&counts(1, 1, 0, 0, 0), &none, 1, false, false, None, PLAIN)[2..],
+            ["Nothing left to patch."]
+        );
+    }
+
+    /// Beside advisories left to patch the line follows theirs, ahead of
+    /// the reachable count and the meter.
+    #[test]
+    fn closing_names_unpatched_builds_after_what_is_left() {
+        let one = [unpatched("nokogiri 1.19.3", &["arm64-darwin"])];
+        let c = Counts {
+            left_merge: 1,
+            merge_packages: 1,
+            fixed_reachable: 1,
+            ..counts(2, 3, 0, 0, 1)
+        };
+        let lines: Vec<String> = closing(&c, &one, 1, false, true, None, FANCY)
+            .iter()
+            .map(|l| ui::strip_ansi(l))
+            .collect();
+        assert_eq!(
+            lines[2..],
+            [
+                "  2 vulnerabilities left to patch (40%): 1 awaits a merged patch, 1 is in \
+                 packages this run did not patch."
+                    .to_string(),
+                "  1 merged patch is not ready yet: Socket is still processing it.".to_string(),
+                "  Run `socket-patch scan` again later to apply it.".to_string(),
+                "  Not patched yet: nokogiri 1.19.3 for arm64-darwin.".to_string(),
+                "  Reachable: 1 fixed, 0 left to patch.".to_string(),
+                format!("  {}  60% patched", "━".repeat(METER_CELLS)),
+            ]
+        );
+        // The builds alone are worth the closing lines.
+        assert_eq!(
+            closing(&Counts::default(), &one, 0, false, false, None, PLAIN),
+            vec!["Not patched yet: nokogiri 1.19.3 for arm64-darwin."]
+        );
+    }
+
+    /// The line names every gem with its platforms while that fits one row
+    /// of an 80-column terminal beside the gutter, then the gems and how
+    /// many builds they add up to, then only how many there are.
+    #[test]
+    fn unpatched_builds_line_fits_a_row_and_says_less_when_it_cannot() {
+        let line = |builds: &[UnpatchedBuilds]| unpatched_builds_line(builds, false);
+        assert_eq!(line(&[]), None);
+        assert_eq!(
+            line(&[unpatched(
+                "nokogiri 1.19.3",
+                &["arm64-darwin", "x86_64-linux-musl"]
+            )])
+            .as_deref(),
+            Some("Not patched yet: nokogiri 1.19.3 for arm64-darwin, x86_64-linux-musl.")
+        );
+        // Two gems, each with its platform.
+        let two = [
+            unpatched("ffi 1.17.2", &["arm64-darwin"]),
+            unpatched("racc 1.8.1", &["java"]),
+        ];
+        assert_eq!(
+            line(&two).as_deref(),
+            Some("Not patched yet: ffi 1.17.2 for arm64-darwin; racc 1.8.1 for java.")
+        );
+        // Too wide with the platforms: the gems, and how many builds.
+        let wide = [
+            unpatched("nokogiri 1.19.3", &["arm64-darwin", "x86_64-linux-musl"]),
+            unpatched("ffi 1.17.2", &["arm64-darwin"]),
+        ];
+        assert_eq!(
+            line(&wide).as_deref(),
+            Some("Not patched yet: 3 builds of nokogiri 1.19.3, ffi 1.17.2.")
+        );
+        // Too wide with the gems: how many there are of each.
+        let many: Vec<UnpatchedBuilds> = (0..7)
+            .map(|i| {
+                unpatched(
+                    &format!("native-gem-{i} 1.0.{i}"),
+                    &["arm64-darwin", "java"],
+                )
+            })
+            .collect();
+        assert_eq!(
+            line(&many).as_deref(),
+            Some("Not patched yet: 14 builds of 7 gems.")
+        );
+        // One gem whose name alone fills the row.
+        let long = [unpatched(&format!("{} 1.0.0", "g".repeat(70)), &["java"])];
+        assert_eq!(
+            line(&long).as_deref(),
+            Some("Not patched yet: 1 build of 1 gem.")
+        );
+        // The widest line that still names its platforms: it fills the
+        // row beside the gutter and no more. One column wider, it does not.
+        let fits = [unpatched(
+            "nokogiri 1.19.3",
+            &["aarch64-linux-musl", "x86_64-darwin", "java"],
+        )];
+        let full = line(&fits).unwrap();
+        assert_eq!(
+            full,
+            "Not patched yet: nokogiri 1.19.3 for aarch64-linux-musl, x86_64-darwin, java."
+        );
+        assert_eq!(full.chars().count(), BUILDS_LINE_COLS);
+        assert!(format!("  {full}").chars().count() < 80);
+        let over = [unpatched(
+            "nokogiri 1.19.3",
+            &["aarch64-linux-musl", "x86_64-darwin", "jruby"],
+        )];
+        assert_eq!(
+            line(&over).as_deref(),
+            Some("Not patched yet: 3 builds of nokogiri 1.19.3.")
+        );
+    }
+
+    /// The builds on upstream's gem are read off a hosted run's pins per
+    /// locked build: a patched build and a pin that is no platform gem are
+    /// not among them, the ruby-platform gem is the platform `ruby`, and a
+    /// build several project directories lock is one build.
+    #[test]
+    fn unpatched_builds_are_the_locked_builds_on_upstream_gems() {
+        let mut builds = Vec::new();
+        let plain_pin = PinReport {
+            purl: "pkg:npm/undici@8.10.0".to_string(),
+            uuid: Some("u".to_string()),
+            gem_fix: None,
+            platform: None,
+            newly_patched: false,
+        };
+        note_unpatched_builds(
+            &mut builds,
+            &[
+                plain_pin.clone(),
+                build(NOKOGIRI, Some("arm64-darwin"), None),
+                build(NOKOGIRI, Some("x86_64-linux-gnu"), Some("linux")),
+                build(NOKOGIRI, None, None),
+                build(FFI, Some("x86_64-linux-gnu"), Some("ffi-linux")),
+            ],
+        );
+        assert_eq!(
+            builds,
+            [unpatched("nokogiri 1.19.3", &["arm64-darwin", "ruby"])]
+        );
+        // The next project directory locks the same build, and one more.
+        note_unpatched_builds(
+            &mut builds,
+            &[
+                build(NOKOGIRI, Some("arm64-darwin"), None),
+                build(FFI, Some("java"), None),
+                plain_pin,
+            ],
+        );
+        assert_eq!(
+            builds,
+            [
+                unpatched("nokogiri 1.19.3", &["arm64-darwin", "ruby"]),
+                unpatched("ffi 1.17.2", &["java"]),
+            ]
         );
     }
 

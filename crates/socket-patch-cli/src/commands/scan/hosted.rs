@@ -3053,6 +3053,7 @@ async fn run_redirect_selected_untracked(
                     confirmed.iter().map(|(_, uuid)| uuid.as_str()).collect();
                 if let Some(report) = gate.report.as_deref_mut() {
                     report.project(&gate.plan, &pinned).await;
+                    report.hosted_builds(&reports);
                 }
             }
             // Then what the run did to the user's Bundler manifest.
