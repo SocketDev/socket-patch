@@ -538,6 +538,26 @@ async fn a_platform_locked_gem_vendors_and_reports_per_platform_gem() {
         assert!(impact.split("; ").any(|p| p == part), "{impact}");
     }
     assert!(!impact.contains(UUID), "{impact}");
+    // The run's events name the gem's patch as the fix of each platform gem.
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("the vex envelope");
+    let fixes: Vec<(&str, &str, &str)> = envelope["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|event| {
+            let details = &event["details"];
+            (
+                event["action"].as_str().unwrap_or_default(),
+                details["platform"].as_str().unwrap_or_default(),
+                details["gemFix"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        fixes,
+        [("verified", DARWIN, UUID), ("verified", LINUX, UUID)],
+        "{envelope:#}"
+    );
     assert_eq!(
         server.received_requests().await.unwrap().len(),
         asked,

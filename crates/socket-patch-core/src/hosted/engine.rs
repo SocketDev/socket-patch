@@ -161,7 +161,8 @@ pub const GEM_NO_PATCHED_BUILD: &str = "redirect_gem_no_patched_build";
 /// Code of the uncounted event of one locked platform build of a hosted
 /// gem that the patch registry serves as upstream's own gem (no patched
 /// build yet): that platform installs what it installed before, and is
-/// neither counted nor attested as patched.
+/// neither counted nor attested as patched. A VEX document says
+/// `affected` of such a build, and `vex` reports it under this code.
 pub const GEM_UPSTREAM_BUILD_KEPT: &str = "gem_upstream_build_kept";
 
 /// What a host says beside [`GEM_UPSTREAM_BUILD_KEPT`] for the locked

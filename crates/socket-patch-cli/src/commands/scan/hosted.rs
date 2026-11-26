@@ -2634,6 +2634,13 @@ async fn run_redirect_selected_untracked(
         // v5 keeps no hosted ledger: the in-run attestation fetches the
         // records of the pins this run confirmed.
         params.hosted_uuids = confirmed.iter().map(|(_, uuid)| uuid.clone()).collect();
+        // A gem pinned as platform builds is one pin, and the registry
+        // serves upstream's own gem for a platform with no patched build:
+        // the document names each locked build, as this run reports them.
+        params.hosted_gem_builds = engine::pin_reports(&confirmed, rewrite)
+            .into_iter()
+            .filter(|report| report.gem_fix.is_some())
+            .collect();
         // The gem intake gate withholds every gem file. VEX independently
         // rediscovers older pins too, so a candidate-only set would miss some
         // refused hosted gems. Keep their actual installed-byte verification,

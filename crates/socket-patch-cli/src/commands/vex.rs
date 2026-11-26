@@ -33,8 +33,9 @@ use socket_patch_core::vex::{
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::vex_grype;
 use crate::commands::vex_sources::{
-    self, Plan, RunApiClient, Sources, GO_WORKSPACE_OVERRIDE, RECORD_MISMATCH, RECORD_UNAVAILABLE,
-    REDIRECT_UNWIRED, VENDOR_UNWIRED, WIRING_CONFLICT,
+    self, GemBuildInfo, HostedGemBuild, Plan, RunApiClient, Sources, GEM_BUILD_UNKNOWN,
+    GO_WORKSPACE_OVERRIDE, RECORD_MISMATCH, RECORD_UNAVAILABLE, REDIRECT_UNWIRED, VENDOR_UNWIRED,
+    WIRING_CONFLICT,
 };
 use crate::ecosystem_dispatch::{find_manifest_package_copies_reusing, JvmScope};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning};
@@ -226,6 +227,7 @@ impl VexEmbedArgs {
             flag_prefix: "--vex-",
             npm_prior: None,
             hosted_uuids: Vec::new(),
+            hosted_gem_builds: Vec::new(),
             warnings_printed: Default::default(),
         }
     }
@@ -296,6 +298,14 @@ pub(crate) struct VexBuildParams {
     /// standalone `vex` finds them through the lockfiles instead). Empty
     /// everywhere else.
     pub hosted_uuids: Vec<String>,
+    /// Embedded hosted `scan --vex` only: what THIS RUN reports for each
+    /// locked build of the gems it pinned as platform builds
+    /// (`engine::pin_reports`, the reports that name a gem patch). The
+    /// document names those builds one by one, each patched build under
+    /// its own patch, and the plan asks nothing more to tell them apart
+    /// (see `vex_sources::Sources::hosted_gem_builds`). Empty everywhere
+    /// else.
+    pub hosted_gem_builds: Vec<socket_patch_core::hosted::engine::PinReport>,
     /// The run's API client (see [`RunApiClient`]): seeded by a host
     /// command, else built at most once when the plan must fetch records.
     /// Telemetry reads its route when it exists.
@@ -327,8 +337,21 @@ impl VexBuildParams {
 /// Successful result of [`generate_vex`].
 pub(crate) struct VexWriteSummary {
     pub statements: usize,
-    /// How many of them say `affected` ([`unbuilt_by_bazel`]).
+    /// How many of them say `affected`: of a package Bazel builds without
+    /// its patch ([`unbuilt_by_bazel`]), or of a gem build the lockfile
+    /// takes from a patch registry as upstream's own gem
+    /// ([`GemBuildView::kept_upstream`]).
+    ///
+    /// [`GemBuildView::kept_upstream`]: crate::commands::vex_sources::GemBuildView::kept_upstream
     pub affected: usize,
+    /// The builds the document names in place of a gem (a gem vendored as
+    /// platform gems, or taken from its patch registry as platform
+    /// builds), by purl: the standalone `vex` envelope says of each event
+    /// which gem patch it goes by.
+    pub gem_builds: std::collections::BTreeMap<String, GemBuildInfo>,
+    /// One line per gem whose locked builds this run told apart
+    /// ([`gem_build_lines`]), for a person.
+    pub gem_build_lines: Vec<String>,
     pub failed: Vec<FailedPatch>,
     /// The built document — returned so the standalone `vex` command can
     /// emit its per-subcomponent envelope without rebuilding.
@@ -362,6 +385,9 @@ pub(crate) struct VexGenError {
     /// diagnostics say why a lockfile's mention is not live wiring). The
     /// `--json` error envelopes carry them.
     pub warnings: Vec<RunWarning>,
+    /// The builds among `failed` that the document would have named in
+    /// place of a gem, by purl (see [`VexWriteSummary::gem_builds`]).
+    pub gem_builds: std::collections::BTreeMap<String, GemBuildInfo>,
 }
 
 impl VexGenError {
@@ -463,6 +489,7 @@ pub async fn run(args: VexArgs) -> i32 {
         flag_prefix: "--",
         npm_prior: None,
         hosted_uuids: Vec::new(),
+        hosted_gem_builds: Vec::new(),
         api_client: RunApiClient::new(),
         warnings_printed: Default::default(),
     };
@@ -500,6 +527,25 @@ pub async fn run(args: VexArgs) -> i32 {
                         println!("{}", format_vex_dry_run(count, summary.affected, path));
                     }
                     None => eprintln!("{}", format_vex_emitted(count, summary.affected)),
+                }
+                // Under it, which builds are attested of a gem the lock
+                // takes from its patch registry as platform builds. Beside
+                // the summary: stdout holds the document when it holds no
+                // summary. On a terminal a long line breaks after a clause.
+                let on_stdout = output.is_some();
+                let width =
+                    match on_stdout {
+                        true => crate::ui::attended(crate::ui::Stream::Stdout)
+                            .then(crate::ui::stdout_width),
+                        false => crate::ui::attended(crate::ui::Stream::Stderr)
+                            .then(crate::ui::stderr_width),
+                    };
+                for line in &summary.gem_build_lines {
+                    let line = crate::ui::wrap_line(line, width);
+                    match on_stdout {
+                        true => println!("{line}"),
+                        false => eprintln!("{line}"),
+                    }
                 }
                 if let Some(line) = grype.as_ref().and_then(|g| g.human_line()) {
                     println!("{line}");
@@ -591,7 +637,7 @@ pub async fn run(args: VexArgs) -> i32 {
                 &args,
                 e.code,
                 &message,
-                &e.failed,
+                (&e.failed, &e.gem_builds),
                 &gems,
                 &run_warnings,
                 grype.as_ref(),
@@ -867,7 +913,6 @@ async fn generate_vex(
                 && purl.starts_with("pkg:gem/")
                 && plan.hosted.contains_key(purl))
     };
-    let redirected: &[String] = &plan.redirected;
     let product_id = match resolve_product_id(
         common,
         params.product.as_deref(),
@@ -1012,13 +1057,21 @@ async fn generate_vex(
         // maven's suffixed version; every copy where hosted and registry
         // bytes share a location) — never by a pristine sibling the
         // crawler's first match may be. See `vex_consumed`.
-        let hosted = crate::commands::vex_consumed::hosted_consumed_copies(
+        let mut hosted = crate::commands::vex_consumed::hosted_consumed_copies(
             common,
             &plan.hosted,
             &copies,
             params.npm_prior.as_ref(),
         )
         .await;
+        // A gem the lock takes from its registry as platform builds: the
+        // copy of a build the lock does not install patched is upstream's
+        // own gem by the lock, and says nothing of the other builds.
+        for (purl, gem) in &plan.hosted_gems {
+            if let Some(consumed) = hosted.get_mut(purl) {
+                consumed.paths.retain(|path| gem.judges(purl, path));
+            }
+        }
         let vendor = VendorContext {
             project_root: common.cwd.clone(),
             entries: plan.vendor_entries.clone(),
@@ -1512,18 +1565,24 @@ async fn generate_vex(
         tooling: Some(format!("socket-patch {}", env!("CARGO_PKG_VERSION"))),
     };
 
-    // A gem vendored as platform gems was judged above as the one copy it
-    // is; the document names each of its platform gems, under the patch
-    // that built it (see `GemBuildView`).
+    // A gem vendored as platform gems, or taken from its patch registry as
+    // platform builds, was judged above as the one copy or pin it is; the
+    // document names each of its builds: a patched one under the patch
+    // that built it, and a hosted one the lock installs as upstream's own
+    // gem as affected (see `GemBuildView`).
     let mut affected = affected;
+    let mut redirected = plan.redirected.clone();
     let gem_builds = crate::commands::vex_sources::GemBuildView::of(&plan);
     if let Some(builds) = &gem_builds {
         builds.expand(&mut outcome.applied);
         builds.expand(&mut outcome.vendored);
         builds.expand(&mut outcome.code_not_present);
+        builds.expand(&mut redirected);
         builds.expand_noted(&mut affected);
+        affected.extend(builds.kept_upstream().iter().cloned());
     }
     let manifest = gem_builds.as_ref().map_or(manifest, |builds| builds.view());
+    let redirected: &[String] = &redirected;
 
     // `--no-verify` declared these applied with nothing checked on disk. The
     // purls an in-run hosted redirect confirmed are attested from that run's
@@ -1577,6 +1636,9 @@ async fn generate_vex(
                 failed: outcome.failed,
                 hosted,
                 warnings: Vec::new(),
+                gem_builds: gem_builds
+                    .map(|builds| builds.builds().clone())
+                    .unwrap_or_default(),
             });
         }
     };
@@ -1668,6 +1730,10 @@ async fn generate_vex(
     Ok(VexWriteSummary {
         statements: doc.statements.len(),
         affected: doc.statements.iter().filter(says_affected).count(),
+        gem_build_lines: gem_build_lines(&plan, &outcome.applied),
+        gem_builds: gem_builds
+            .map(|builds| builds.builds().clone())
+            .unwrap_or_default(),
         failed: outcome.failed,
         doc,
         warnings: Vec::new(),
@@ -2175,6 +2241,58 @@ fn vendored_out_of_sync_detail(purl: &str, copies: &[&Path], notes: &str) -> Str
     )
 }
 
+/// Which builds the document attests of each gem whose locked builds this
+/// run told apart (the gems of [`Plan::hosted_gems`] the plan worked out),
+/// one line per gem, in the words of the hosted scan's own line:
+/// `nokogiri 1.19.3: patched for x86_64-linux-gnu; upstream gem kept for
+/// arm64-darwin (no patched build yet)`. A build the document leaves out
+/// (nothing shows what the lock installs for it, or the gem's installed
+/// copy did not verify) is `not attested for <platform>`: the run's
+/// warnings say why. The ruby-platform gem, where the lock names it beside
+/// the platform builds, is the platform `ruby`. `applied` are the purls
+/// the document attests as patched.
+fn gem_build_lines(plan: &Plan, applied: &[String]) -> Vec<String> {
+    use socket_patch_core::vex::gem_builds::GemBuildState;
+    let attested = |build: &HostedGemBuild| {
+        matches!(build.state, GemBuildState::Patched { .. }) && applied.contains(&build.purl)
+    };
+    let kept = |build: &HostedGemBuild| build.state == GemBuildState::Upstream;
+    plan.hosted_gems
+        .values()
+        .filter(|gem| gem.resolved)
+        .map(|gem| {
+            let platforms = |keep: &dyn Fn(&HostedGemBuild) -> bool| -> String {
+                let named: Vec<&str> = gem
+                    .builds
+                    .iter()
+                    .filter(|build| keep(build))
+                    .map(|build| build.platform.as_deref().unwrap_or("ruby"))
+                    .collect();
+                named.join(", ")
+            };
+            let parts = [
+                ("patched for", platforms(&attested), ""),
+                (
+                    "upstream gem kept for",
+                    platforms(&kept),
+                    " (no patched build yet)",
+                ),
+                (
+                    "not attested for",
+                    platforms(&|build| !attested(build) && !kept(build)),
+                    "",
+                ),
+            ];
+            let parts: Vec<String> = parts
+                .into_iter()
+                .filter(|(_, platforms, _)| !platforms.is_empty())
+                .map(|(lead, platforms, tail)| format!("{lead} {platforms}{tail}"))
+                .collect();
+            format!("{} {}: {}", gem.name, gem.version, parts.join("; "))
+        })
+        .collect()
+}
+
 /// Record a run-level advisory: into `warnings`, which the `--json`
 /// envelope carries in `warnings[]`. A human run prints it later, folded
 /// with the others of its kind ([`flush_warnings`]): nothing prints while
@@ -2511,6 +2629,7 @@ async fn generate_vex_from_manifest_path_inner(
         discovery,
         // Their records join a pre-v5 ledger's as the hosted record source.
         hosted_uuids: params.hosted_uuids.clone(),
+        hosted_gem_builds: params.hosted_gem_builds.clone(),
     };
     if sources.is_empty() {
         // A discovery diagnostic (an unparseable lock, a rejected reference)
@@ -2530,6 +2649,7 @@ async fn generate_vex_from_manifest_path_inner(
                     failed: Vec::new(),
                     hosted: Vec::new(),
                     warnings: Vec::new(),
+                    gem_builds: Default::default(),
                 }
             } else {
                 fail(common, params, "manifest_not_found", message).await
@@ -2566,6 +2686,7 @@ async fn fail(
         failed: Vec::new(),
         hosted: Vec::new(),
         warnings: Vec::new(),
+        gem_builds: Default::default(),
     }
 }
 
@@ -2757,14 +2878,19 @@ async fn synthesize_go_patches(
 /// Emit a `vex` error to the active output channel: an error envelope on
 /// stdout in `--json` mode, a stderr message otherwise. `failures` lists
 /// patches omitted by verification (populated for `no_applicable_patches`,
-/// empty everywhere else), `gems` the hosted gems among them that the hint
-/// sends to the scan; `warnings` are the run's advisories, already on
-/// stderr in human mode, folded into the envelope's `warnings[]` here.
+/// empty everywhere else), with the builds among them that stand for a gem
+/// ([`VexGenError::gem_builds`]); `gems` are the hosted gems among them
+/// that the hint sends to the scan; `warnings` are the run's advisories,
+/// already on stderr in human mode, folded into the envelope's
+/// `warnings[]` here.
 fn emit_envelope_error(
     args: &VexArgs,
     code: &str,
     message: &str,
-    failures: &[FailedPatch],
+    (failures, gem_builds): (
+        &[FailedPatch],
+        &std::collections::BTreeMap<String, GemBuildInfo>,
+    ),
     gems: &StaleHostedGems,
     warnings: &[RunWarning],
     grype: Option<&vex_grype::GrypeConfigOutcome>,
@@ -2776,10 +2902,7 @@ fn emit_envelope_error(
         }
         env.dry_run = args.common.dry_run;
         for f in failures {
-            env.record(
-                PatchEvent::new(PatchAction::Skipped, f.purl.clone())
-                    .with_reason(f.reason.clone(), omission_reason_message(&f.reason)),
-            );
+            env.record(omission_event(f, gem_builds));
         }
         env.mark_error(EnvelopeError::new(code, message.to_string()));
         env.warnings = warnings.to_vec();
@@ -2904,6 +3027,10 @@ fn omission_phrase(reason: &str) -> &'static str {
             "another package bundles its own copy, which no Socket wiring reaches (the \
              warning above names it)"
         }
+        GEM_BUILD_UNKNOWN => {
+            "it is not shown whether the lockfile installs a patched build for this platform \
+             (the warning above says why, and what to run)"
+        }
         _ => "the patch could not be verified",
     }
 }
@@ -2915,6 +3042,28 @@ fn format_omission_warning(purl: &str, reason: &str) -> String {
         "Warning: omitting {purl} from VEX: {} ({reason})",
         omission_phrase(reason)
     )
+}
+
+/// How a line names the packages `purls` it leaves out
+/// ([`crate::ui::package_names`]), a platform gem with its platform: the
+/// builds of one gem share its name and version.
+fn omitted_names(purls: &[&str]) -> Vec<String> {
+    use socket_patch_core::crawlers::Ecosystem;
+    use socket_patch_core::utils::purl::{percent_decode_purl_component, purl_qualifier};
+    crate::ui::package_names(purls)
+        .into_iter()
+        .zip(purls)
+        .map(|(name, purl)| {
+            let platform = purl_qualifier(purl, "platform")
+                .filter(|_| Ecosystem::from_purl(purl) == Some(Ecosystem::Gem));
+            match platform {
+                Some(platform) => {
+                    format!("{name} ({})", percent_decode_purl_component(platform))
+                }
+                None => name,
+            }
+        })
+        .collect()
 }
 
 /// The stderr lines for the patches left out of the document: one per
@@ -2946,7 +3095,7 @@ fn omission_lines(failed: &[FailedPatch], verbose: bool) -> Vec<String> {
                 "Warning: omitting {} packages from VEX: {} ({reason}): {}{}",
                 purls.len(),
                 omission_phrase(reason),
-                crate::ui::folded(&crate::ui::package_names(&purls), NAMES_SHOWN),
+                crate::ui::folded(&omitted_names(&purls), NAMES_SHOWN),
                 if purls.len() > NAMES_SHOWN {
                     " (--verbose lists them all)"
                 } else {
@@ -3096,39 +3245,95 @@ fn omission_reason_message(reason: &str) -> String {
     format!("patch omitted from VEX: {}", omission_phrase(reason))
 }
 
+/// Say in `details` which gem patch a build named in place of a gem goes
+/// by (`gemFix`), and its platform, as the hosted and vendored runs' own
+/// events do.
+fn gem_build_details(build: &GemBuildInfo, details: &mut serde_json::Value) {
+    details["gemFix"] = serde_json::json!(build.gem_fix);
+    if let Some(platform) = &build.platform {
+        details["platform"] = serde_json::json!(platform);
+    }
+}
+
+/// The `skipped` event of a patch the document leaves out: its routing
+/// tag as `errorCode`, the reason in words, and, for a build among
+/// `gem_builds`, the gem patch it goes by ([`gem_build_details`]).
+fn omission_event(
+    f: &FailedPatch,
+    gem_builds: &std::collections::BTreeMap<String, GemBuildInfo>,
+) -> PatchEvent {
+    let event = PatchEvent::new(PatchAction::Skipped, f.purl.clone())
+        .with_reason(f.reason.clone(), omission_reason_message(&f.reason));
+    match gem_builds.get(&f.purl) {
+        Some(build) => {
+            let mut details = serde_json::json!({});
+            gem_build_details(build, &mut details);
+            event.with_details(details)
+        }
+        None => event,
+    }
+}
+
 fn emit_envelope_success(
     summary: &VexWriteSummary,
     dry_run: bool,
     grype: Option<&vex_grype::GrypeConfigOutcome>,
 ) {
+    use socket_patch_core::hosted::engine::{
+        gem_upstream_build_kept_detail, GEM_UPSTREAM_BUILD_KEPT,
+    };
     let mut env = Envelope::new(Command::Vex);
     env.dry_run = dry_run;
+    // Some package is in the document as affected because its patch is not
+    // in what gets built.
+    let mut unbuilt = false;
     for st in &summary.doc.statements {
         for prod in &st.products {
             for sub in &prod.subcomponents {
+                let mut details = serde_json::json!({
+                    "vulnerability": st.vulnerability.name,
+                    "aliases": st.vulnerability.aliases,
+                    "status": st.status,
+                });
+                let build = summary.gem_builds.get(&sub.id);
+                if let Some(build) = build {
+                    gem_build_details(build, &mut details);
+                }
                 // A package the document says is affected is not reported
                 // as verified, nor counted as such: it is skipped, like a
                 // patch the document leaves out, under its own code.
                 let event = match st.status {
-                    Status::Affected => PatchEvent::new(PatchAction::Skipped, sub.id.clone())
-                        .with_reason(BAZEL_NOT_IN_BUILD, AFFECTED_REASON),
+                    Status::Affected => match build.filter(|build| build.kept_upstream) {
+                        // A gem build on upstream's gem: nothing was
+                        // skipped and nothing failed, that platform is as
+                        // it was. Reported as the hosted run reports it,
+                        // and counted nowhere.
+                        Some(build) => {
+                            let platform = build.platform.as_deref().unwrap_or_default();
+                            let event = PatchEvent::new(PatchAction::Skipped, sub.id.clone())
+                                .with_reason(
+                                    GEM_UPSTREAM_BUILD_KEPT,
+                                    gem_upstream_build_kept_detail(platform),
+                                );
+                            env.events.push(event.with_details(details));
+                            continue;
+                        }
+                        None => {
+                            unbuilt = true;
+                            PatchEvent::new(PatchAction::Skipped, sub.id.clone())
+                                .with_reason(BAZEL_NOT_IN_BUILD, AFFECTED_REASON)
+                        }
+                    },
                     _ => PatchEvent::new(PatchAction::Verified, sub.id.clone()),
                 };
-                env.record(event.with_details(serde_json::json!({
-                    "vulnerability": st.vulnerability.name,
-                    "aliases": st.vulnerability.aliases,
-                    "status": st.status,
-                })));
+                env.record(event.with_details(details));
             }
         }
     }
     for f in &summary.failed {
-        env.record(
-            PatchEvent::new(PatchAction::Skipped, f.purl.clone())
-                .with_reason(f.reason.clone(), omission_reason_message(&f.reason)),
-        );
+        env.record(omission_event(f, &summary.gem_builds));
     }
-    if !summary.failed.is_empty() || summary.affected > 0 {
+    if !summary.failed.is_empty() || unbuilt {
         env.mark_partial_failure();
     }
     env.warnings = summary.warnings.clone();
@@ -3361,6 +3566,29 @@ mod tests {
             [
                 "Warning: omitting 2 packages from VEX: the patched files still hold the original \
               content (not_applied): pkg:npm/a@1.0.0, pkg:pypi/b@2.0.0"
+            ]
+        );
+        // The builds of one gem share its name: each is named with its
+        // platform.
+        assert_eq!(
+            omission_lines(
+                &[
+                    failed(
+                        "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin",
+                        GEM_BUILD_UNKNOWN
+                    ),
+                    failed(
+                        "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu",
+                        GEM_BUILD_UNKNOWN
+                    ),
+                ],
+                false
+            ),
+            [
+                "Warning: omitting 2 packages from VEX: it is not shown whether the lockfile \
+              installs a patched build for this platform (the warning above says why, and what \
+              to run) (vex_gem_build_unknown): nokogiri@1.18.10 (arm64-darwin), nokogiri@1.18.10 \
+              (x86_64-linux-gnu)"
             ]
         );
     }
@@ -3955,6 +4183,7 @@ mod npm_prior_tests {
             flag_prefix: "--vex-",
             npm_prior: prior,
             hosted_uuids: Vec::new(),
+            hosted_gem_builds: Vec::new(),
             api_client: RunApiClient::new(),
             warnings_printed: Default::default(),
         };
@@ -4084,6 +4313,7 @@ mod mirror_refusal_tests {
                     redirected: vec![purls[0].to_string(), purls[2].to_string()],
                     lockfile_basis: HashSet::from([purls[0].to_string(), purls[2].to_string()]),
                     hosted,
+                    hosted_gems: Default::default(),
                     gated: Vec::new(),
                     notes: Vec::new(),
                 };
@@ -4206,6 +4436,7 @@ mod mirror_refusal_tests {
                 redirected: vec![gem.to_string(), npm.to_string()],
                 lockfile_basis: HashSet::from([gem.to_string(), npm.to_string()]),
                 hosted,
+                hosted_gems: Default::default(),
                 gated: Vec::new(),
                 notes: Vec::new(),
             };
@@ -4385,6 +4616,7 @@ mod unjudged_tests {
                     .into_iter()
                     .collect::<HashSet<_>>(),
                 hosted,
+                hosted_gems: Default::default(),
                 gated: Vec::new(),
                 notes: Vec::new(),
             };
@@ -4512,6 +4744,7 @@ mod bazel_tests {
             redirected: vec![purls[2].to_string()],
             lockfile_basis: HashSet::new(),
             hosted: BTreeMap::from([(purls[2].to_string(), wiring)]),
+            hosted_gems: Default::default(),
             gated: Vec::new(),
             notes: Vec::new(),
         };
