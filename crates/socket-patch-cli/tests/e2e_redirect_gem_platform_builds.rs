@@ -32,8 +32,10 @@
 //!   the lock's registry only when the lock has no `CHECKSUMS`;
 //! * a build is attested by its patch only on the sha256 the lock installs
 //!   for it: one the lock pins otherwise, or that nothing could be read
-//!   about (`--offline`, a failed request), is left out and the run says
-//!   what to run (`vex_gem_build_unknown`);
+//!   about (`--offline`, a failed request, an unreadable index), is said
+//!   `affected`, with why and what to run. That is no failure: the run
+//!   exits 0 as a success, and one warning names the gem
+//!   (`vex_gem_build_unknown`);
 //! * a gem locked as its ruby-platform gem alone is one pin, with no
 //!   request of its own.
 
@@ -1049,6 +1051,53 @@ fn upstream_statement(platform: &str) -> Said {
     }
 }
 
+/// The statement of the build for `platform`, of which nothing shows what
+/// the lock installs: `why`, and `remedy` is what to run. It names no
+/// patch. `shared` when no locked build is attested, so that the form
+/// Trivy reports the gem under stands for affected builds alone.
+fn unshown_statement(platform: &str, why: &str, remedy: &str, shared: bool) -> Said {
+    let mut products: Vec<String> = Vec::new();
+    products.extend(shared.then(|| PURL.to_string()));
+    products.extend([grype_form(platform), build_purl(platform)]);
+    Said {
+        status: "affected",
+        packages: vec![build_purl(platform)],
+        products,
+        words: format!(
+            "It could not be shown that the lockfile installs a patched build of this gem for \
+             {platform} ({why}), so it is stated as affected. {remedy}"
+        ),
+    }
+}
+
+/// What to run for a build the lock and the patch registry disagree about,
+/// and for one a later run can read.
+const RESCAN: &str = "Run `socket-patch scan --mode hosted` to bring the lockfile up to date, \
+    then `socket-patch vex` again.";
+const RETRY: &str = "Run `socket-patch vex` again to attest each build.";
+
+/// The uncounted events of the builds `platforms`, of which nothing shows
+/// what the lock installs, after asserting that each says `affected` and
+/// that the run counts none of them and is a success.
+fn unshown_events(env: &Value, platforms: &[&str]) -> Vec<(String, String, String)> {
+    assert_eq!(env["status"], "success", "{env}");
+    assert_eq!(
+        (&env["summary"]["skipped"], &env["summary"]["failed"]),
+        (&json!(0), &json!(0)),
+        "a build that is not shown patched is counted nowhere: {env}"
+    );
+    for event in env["events"].as_array().into_iter().flatten() {
+        if event["errorCode"] == "vex_gem_build_unknown" {
+            assert_eq!(event["details"]["status"], "affected", "{event}");
+            assert_eq!(event["uuid"], Value::Null, "no patch is named: {event}");
+        }
+    }
+    platforms
+        .iter()
+        .map(|platform| event("skipped", platform, "vex_gem_build_unknown"))
+        .collect()
+}
+
 /// A `--json` hosted scan with `--vex`: exit code, envelope and document.
 fn scan_vex(proj: &Path, api: &str) -> (i32, Value, Option<Value>) {
     let out = proj.join("out.vex.json");
@@ -1339,8 +1388,10 @@ async fn a_later_vex_tells_the_builds_of_a_checksummed_lock_apart_in_one_request
 
 /// A later `vex` over a lock with no `CHECKSUMS`: the lock installs what
 /// its own registry serves, so a SECOND request reads that registry's
-/// index. Two requests, the same document. With the index unreadable the
-/// builds are left out, and the run says why and what to run.
+/// index. Two requests, the same document. With the index unreadable
+/// nothing shows what the lock installs: both builds are in the document
+/// as affected, the run exits 0 as a success, and one warning says why
+/// (with the error of the read) and what to run.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_later_vex_asks_the_registry_of_a_lock_without_checksums() {
     let server = MockServer::start().await;
@@ -1372,18 +1423,29 @@ async fn a_later_vex_asks_the_registry_of_a_lock_without_checksums() {
     let index = format!("{}/", index_url(&api, Some(4)));
     let proj = hosted_project(&index, ARM_UPSTREAM, LINUX_PATCHED, false);
     let out = vex(proj.path(), &api);
-    assert_eq!(out.code, Some(1), "{out}");
+    assert_eq!(out.code, Some(0), "{out}");
+    let why = "the lockfile has no CHECKSUMS entry for it, and its registry's index could not be \
+               read";
     assert_eq!(
-        out.envelope["error"]["code"], "no_applicable_patches",
+        said(out.doc()),
+        [
+            unshown_statement(ARM, why, RETRY, true),
+            unshown_statement(LINUX, why, RETRY, true)
+        ],
         "{out}"
     );
-    assert!(out.doc.is_none(), "{out}");
+    assert!(
+        !out.doc().to_string().contains(LINUX_UUID) && !out.doc().to_string().contains(UUID),
+        "no patch is named for a build that is not shown patched: {out}"
+    );
     assert_eq!(
         build_events(&out.envelope),
-        [
-            event("skipped", ARM, "vex_gem_build_unknown"),
-            event("skipped", LINUX, "vex_gem_build_unknown")
-        ],
+        unshown_events(&out.envelope, &[ARM, LINUX]),
+        "{out}"
+    );
+    assert_eq!(
+        out.envelope["events"][0]["reason"],
+        format!("not shown patched for {ARM}: {why}"),
         "{out}"
     );
     assert_eq!(
@@ -1394,10 +1456,11 @@ async fn a_later_vex_asks_the_registry_of_a_lock_without_checksums() {
     let detail = out.envelope["warnings"][0]["detail"].as_str().unwrap();
     assert!(
         detail.contains(
-            "the lockfile has no CHECKSUMS entry for them, and its registry's index could not \
-             be read"
-        ) && detail.ends_with("Run `socket-patch vex` again to attest each build.")
-            && !detail.contains(TOKEN),
+            "(the lockfile has no CHECKSUMS entry for them, and its registry's index could not \
+             be read: "
+        ) && detail.ends_with(&format!(
+            "), so the VEX document states them as affected. {RETRY}"
+        )) && !detail.contains(TOKEN),
         "{detail}"
     );
 }
@@ -1405,10 +1468,11 @@ async fn a_later_vex_asks_the_registry_of_a_lock_without_checksums() {
 /// The reference a later `vex` gets is of a newer registry than the lock
 /// names: it lists a patched build for the platform the lock still pins
 /// upstream's gem for. That build is NOT attested: the lock does not
-/// install it. The build the lock does pin patched is, and the run sends
-/// the reader to the scan that moves the lock.
+/// install it. It is in the document as affected, with no patch named for
+/// it, beside the build the lock does pin patched; the run exits 0 as a
+/// success and sends the reader to the scan that moves the lock.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_later_vex_attests_no_build_a_newer_reference_lists_but_the_lock_does_not_pin() {
+async fn a_later_vex_says_affected_of_a_build_a_newer_reference_lists_but_the_lock_does_not_pin() {
     for checksums in [true, false] {
         let server = MockServer::start().await;
         mount_api(&server, Some((&BOTH_PATCHED[..], 5))).await;
@@ -1418,23 +1482,27 @@ async fn a_later_vex_attests_no_build_a_newer_reference_lists_but_the_lock_does_
         let index = format!("{}/", index_url(&api, Some(4)));
         let proj = hosted_project(&index, ARM_UPSTREAM, LINUX_PATCHED, checksums);
 
+        let why = "the lockfile installs another archive for it than the patch registry lists now";
         let out = vex(proj.path(), &api);
         assert_eq!(out.code, Some(0), "checksums: {checksums}: {out}");
         assert_eq!(
             said(out.doc()),
-            [patched_statement(&[(LINUX, LINUX_UUID)], false)],
+            [
+                patched_statement(&[(LINUX, LINUX_UUID)], false),
+                unshown_statement(ARM, why, RESCAN, false)
+            ],
             "checksums: {checksums}"
         );
         assert!(!out.doc().to_string().contains(ARM_UUID), "{out}");
+        let mut events = vec![event("verified", LINUX, "")];
+        events.extend(unshown_events(&out.envelope, &[ARM]));
+        assert_eq!(build_events(&out.envelope), events, "{out}");
         assert_eq!(
-            build_events(&out.envelope),
-            [
-                event("verified", LINUX, ""),
-                event("skipped", ARM, "vex_gem_build_unknown")
-            ],
+            out.envelope["events"][1]["reason"],
+            format!("not shown patched for {ARM}: {why}"),
             "{out}"
         );
-        assert_eq!(out.envelope["status"], "partialFailure", "{out}");
+        assert_eq!(out.envelope["summary"]["verified"], 1, "{out}");
         assert_eq!(
             warning_codes(&out.envelope),
             ["vex_gem_build_unknown"],
@@ -1446,9 +1514,8 @@ async fn a_later_vex_attests_no_build_a_newer_reference_lists_but_the_lock_does_
                 "{PURL}: the lockfile takes its build for {ARM} from the registry of Socket patch \
                  {UUID}, which serves a patched build for some platforms and upstream's own gem \
                  for the others. Which it is for this one could not be told (the lockfile \
-                 installs another archive for it than the patch registry lists now), so it is \
-                 not attested. Run `socket-patch scan --mode hosted` to bring the lockfile up to \
-                 date, then `socket-patch vex` again."
+                 installs another archive for it than the patch registry lists now), so the VEX \
+                 document states it as affected. {RESCAN}"
             ),
             "{out}"
         );
@@ -1456,8 +1523,8 @@ async fn a_later_vex_attests_no_build_a_newer_reference_lists_but_the_lock_does_
         assert_eq!(references, [[UUID.to_string()]], "one reference request");
         assert_eq!(other.len(), usize::from(!checksums), "{other:?}");
 
-        // A person reads the warning, the build left out, and which
-        // builds the document attests.
+        // A person reads the warning and what the document says of each
+        // build: nothing is left out, and nothing fails.
         let human = vex_e2e_common::VexRun {
             human: true,
             ..vex_run(&api)
@@ -1466,7 +1533,9 @@ async fn a_later_vex_attests_no_build_a_newer_reference_lists_but_the_lock_does_
         assert_eq!(out.code, Some(0), "{out}");
         assert!(
             out.stdout.ends_with(&format!(
-                "\n{DEP} {DEP_VERSION}: patched for {LINUX}; not attested for {ARM}\n"
+                "Wrote OpenVEX document with 2 statements (1 affected) to {}\n{DEP} \
+                 {DEP_VERSION}: patched for {LINUX}; not shown patched for {ARM}\n",
+                out.output.display()
             )),
             "{out}"
         );
@@ -1474,13 +1543,14 @@ async fn a_later_vex_attests_no_build_a_newer_reference_lists_but_the_lock_does_
             out.stderr.contains(&format!(
                 "Warning: {PURL}: the lockfile takes its build for {ARM} from the registry of \
                  Socket patch {UUID}"
-            )) && out.stderr.contains(&format!(
-                "Warning: omitting {} from VEX: it is not shown whether the lockfile installs \
-                 a patched build for this platform (the warning above says why, and what to \
-                 run) (vex_gem_build_unknown)\n",
-                build_purl(ARM)
             )),
             "{out}"
+        );
+        assert!(
+            out.stderr.matches("Warning: ").count() == 1
+                && !out.stderr.contains("omitting")
+                && !out.stderr.contains("Error"),
+            "one warning, and nothing left out: {out}"
         );
 
         // The scan the note names moves the lock, and the next document
@@ -1493,6 +1563,75 @@ async fn a_later_vex_attests_no_build_a_newer_reference_lists_but_the_lock_does_
                 &[(ARM, ARM_UUID), (LINUX, LINUX_UUID)],
                 true
             )]
+        );
+    }
+}
+
+/// A hosted run's own `--vex` can meet a build it cannot tell too: a gem
+/// an earlier run moved, whose patch this run's search does not return
+/// (such a pin is kept, and the run pins nothing), on a lock older than
+/// the reference lists. The run's document says `affected` of that build
+/// beside the one the lock pins patched, the warning is among the
+/// document's, and the run is a success. With every build untold it still
+/// is: both are in the document as affected.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_runs_vex_says_affected_of_a_build_of_a_gem_it_did_not_pin() {
+    let why = "the lockfile installs another archive for it than the patch registry lists now";
+    for (linux_pin, statements, affected) in [
+        (
+            LINUX_PATCHED,
+            vec![
+                patched_statement(&[(LINUX, LINUX_UUID)], false),
+                unshown_statement(ARM, why, RESCAN, false),
+            ],
+            1,
+        ),
+        (
+            LINUX_UPSTREAM,
+            vec![
+                unshown_statement(ARM, why, RESCAN, true),
+                unshown_statement(LINUX, why, RESCAN, true),
+            ],
+            2,
+        ),
+    ] {
+        let server = MockServer::start().await;
+        // The search finds no patch for the gem.
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "packages": [], "canAccessPaidPatches": false,
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_api(&server, Some((&BOTH_PATCHED[..], 5))).await;
+        let api = server.uri();
+        let index = format!("{}/", index_url(&api, Some(4)));
+        let proj = hosted_project(&index, ARM_UPSTREAM, linux_pin, true);
+        let before = read(proj.path(), "Gemfile.lock");
+        let (code, env, doc) = scan_vex(proj.path(), &api);
+        assert_eq!(code, 0, "{env}");
+        assert_eq!(env["status"], "success", "{env}");
+        assert_eq!(hosted_events(&env), Vec::<Value>::new(), "{env}");
+        assert_eq!(
+            read(proj.path(), "Gemfile.lock"),
+            before,
+            "nothing is pinned"
+        );
+        assert_eq!(said(&doc.expect("a document")), statements, "{env}");
+        assert_eq!(env["vex"]["statements"], 2, "{env}");
+        assert_eq!(env["vex"]["affected"], affected, "{env}");
+        let vex_warnings: Vec<&str> = env["vex"]["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|warning| warning["code"].as_str())
+            .collect();
+        assert_eq!(
+            vex_warnings,
+            ["vex_hosted_unverified", "vex_gem_build_unknown"],
+            "the standing note of a hosted run's document, and the one warning for the gem: {env}"
         );
     }
 }
@@ -1513,12 +1652,13 @@ fn write_record_ledger(proj: &Path) {
     vex_e2e_common::write_legacy_redirect_ledger(proj, PURL, &view);
 }
 
-/// `--offline`: no request at all, so nothing says which locked build is
-/// patched. With the record at hand the gem's one pin would have attested
-/// every build; instead the platform builds are left out, and one warning
+/// `--offline`, with the record of the gem's patch at hand: no request at
+/// all, so nothing says which locked build is patched. The gem's one pin
+/// would have attested every build; instead each platform build is in the
+/// document as affected, the run exits 0 as a success, and one warning
 /// names the gem and what to run.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_offline_vex_attests_no_platform_build_and_says_so_once() {
+async fn an_offline_vex_says_affected_of_each_platform_build_and_warns_once() {
     let server = MockServer::start().await;
     mount_api(&server, Some((&ONE_PATCHED[..], 4))).await;
     let api = server.uri();
@@ -1531,18 +1671,26 @@ async fn an_offline_vex_attests_no_platform_build_and_says_so_once() {
     };
 
     let out = vex_e2e_common::run_vex(&vex_e2e_common::binary(), proj.path(), &offline);
-    assert_eq!(out.code, Some(1), "{out}");
+    assert_eq!(out.code, Some(0), "{out}");
+    let (why, online) = (
+        "--offline forbids asking the patch API",
+        "Run `socket-patch vex` without --offline to attest each build.",
+    );
     assert_eq!(
-        out.envelope["error"]["code"], "no_applicable_patches",
+        said(out.doc()),
+        [
+            unshown_statement(ARM, why, online, true),
+            unshown_statement(LINUX, why, online, true)
+        ],
         "{out}"
     );
-    assert!(out.doc.is_none(), "{out}");
+    assert!(
+        !out.doc().to_string().contains(LINUX_UUID) && !out.doc().to_string().contains(UUID),
+        "no patch is named for a build that is not shown patched: {out}"
+    );
     assert_eq!(
         build_events(&out.envelope),
-        [
-            event("skipped", ARM, "vex_gem_build_unknown"),
-            event("skipped", LINUX, "vex_gem_build_unknown")
-        ],
+        unshown_events(&out.envelope, &[ARM, LINUX]),
         "{out}"
     );
     assert_eq!(
@@ -1553,8 +1701,8 @@ async fn an_offline_vex_attests_no_platform_build_and_says_so_once() {
                 "{PURL}: the lockfile takes its builds for {ARM}, {LINUX} from the registry of \
                  Socket patch {UUID}, which serves a patched build for some platforms and \
                  upstream's own gem for the others. Which it is for these could not be told \
-                 (--offline forbids asking the patch API), so they are not attested. Run \
-                 `socket-patch vex` without --offline to attest each build."
+                 (--offline forbids asking the patch API), so the VEX document states them as \
+                 affected. {online}"
             ),
         }]),
         "{out}"
@@ -1579,10 +1727,11 @@ async fn an_offline_vex_attests_no_platform_build_and_says_so_once() {
 }
 
 /// The reference request fails: the record is there, the list of the
-/// gem's builds is not. No build is attested, the registry is not asked,
-/// and the warning carries the failure.
+/// gem's builds is not. No build is attested as patched: each is in the
+/// document as affected, the run exits 0 as a success, the registry is
+/// not asked, and the warning carries the failure (the document does not).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_failed_reference_request_attests_no_platform_build() {
+async fn a_failed_reference_request_says_affected_of_each_platform_build() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/package")))
@@ -1596,14 +1745,19 @@ async fn a_failed_reference_request_attests_no_platform_build() {
     let proj = hosted_project(&index, ARM_UPSTREAM, LINUX_PATCHED, true);
 
     let out = vex(proj.path(), &api);
-    assert_eq!(out.code, Some(1), "{out}");
-    assert!(out.doc.is_none(), "{out}");
+    assert_eq!(out.code, Some(0), "{out}");
+    let why = "the patch API request failed";
+    assert_eq!(
+        said(out.doc()),
+        [
+            unshown_statement(ARM, why, RETRY, true),
+            unshown_statement(LINUX, why, RETRY, true)
+        ],
+        "{out}"
+    );
     assert_eq!(
         build_events(&out.envelope),
-        [
-            event("skipped", ARM, "vex_gem_build_unknown"),
-            event("skipped", LINUX, "vex_gem_build_unknown")
-        ],
+        unshown_events(&out.envelope, &[ARM, LINUX]),
         "{out}"
     );
     assert_eq!(
@@ -1614,7 +1768,9 @@ async fn a_failed_reference_request_attests_no_platform_build() {
     let detail = out.envelope["warnings"][0]["detail"].as_str().unwrap();
     assert!(
         detail.contains("could not be told (the patch API request failed: ")
-            && detail.ends_with("Run `socket-patch vex` again to attest each build."),
+            && detail.ends_with(&format!(
+                "), so the VEX document states them as affected. {RETRY}"
+            )),
         "{detail}"
     );
     let (references, other) = requests(&server).await;
@@ -1625,26 +1781,28 @@ async fn a_failed_reference_request_attests_no_platform_build() {
     assert_eq!(other, Vec::<String>::new(), "no registry request");
 
     // A person reads one warning for the gem and one line for its builds,
-    // each named with its platform.
+    // each named with its platform, and no error.
     let human = vex_e2e_common::VexRun {
         human: true,
         ..vex_run(&api)
     };
     let out = vex_e2e_common::run_vex(&vex_e2e_common::binary(), proj.path(), &human);
-    assert_eq!(out.code, Some(1), "{out}");
-    assert_eq!(out.stderr.matches("Warning: ").count(), 2, "{out}");
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_eq!(out.stderr.matches("Warning: ").count(), 1, "{out}");
     assert!(
         out.stderr.contains(&format!(
-            "Warning: omitting 2 packages from VEX: it is not shown whether the lockfile \
-             installs a patched build for this platform (the warning above says why, and what \
-             to run) (vex_gem_build_unknown): {DEP}@{DEP_VERSION} ({ARM}), {DEP}@{DEP_VERSION} \
-             ({LINUX})\n"
-        )),
+            "Warning: {PURL}: the lockfile takes its builds for {ARM}, {LINUX} from the \
+             registry of Socket patch {UUID}"
+        )) && !out.stderr.contains("omitting")
+            && !out.stderr.contains("Error"),
         "{out}"
     );
     assert!(
-        out.stderr
-            .ends_with("Error: No applied patches with vulnerability metadata to attest.\n"),
+        out.stdout.ends_with(&format!(
+            "Wrote OpenVEX document with 2 statements (2 affected) to {}\n{DEP} {DEP_VERSION}: \
+             not shown patched for {ARM}, {LINUX}\n",
+            out.output.display()
+        )),
         "{out}"
     );
 }

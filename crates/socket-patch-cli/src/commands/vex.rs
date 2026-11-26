@@ -339,10 +339,11 @@ pub(crate) struct VexWriteSummary {
     pub statements: usize,
     /// How many of them say `affected`: of a package Bazel builds without
     /// its patch ([`unbuilt_by_bazel`]), or of a gem build the lockfile
-    /// takes from a patch registry as upstream's own gem
-    /// ([`GemBuildView::kept_upstream`]).
+    /// takes from a patch registry that is not shown patched: upstream's
+    /// own gem, or a build of which nothing shows what the lock installs
+    /// ([`GemBuildView::not_patched`]).
     ///
-    /// [`GemBuildView::kept_upstream`]: crate::commands::vex_sources::GemBuildView::kept_upstream
+    /// [`GemBuildView::not_patched`]: crate::commands::vex_sources::GemBuildView::not_patched
     pub affected: usize,
     /// The builds the document names in place of a gem (a gem vendored as
     /// platform gems, or taken from its patch registry as platform
@@ -1568,8 +1569,9 @@ async fn generate_vex(
     // A gem vendored as platform gems, or taken from its patch registry as
     // platform builds, was judged above as the one copy or pin it is; the
     // document names each of its builds: a patched one under the patch
-    // that built it, and a hosted one the lock installs as upstream's own
-    // gem as affected (see `GemBuildView`).
+    // that built it, and a hosted one that is not shown patched as
+    // affected: one the lock installs as upstream's own gem, and one of
+    // which nothing shows what the lock installs (see `GemBuildView`).
     let mut affected = affected;
     let mut redirected = plan.redirected.clone();
     let gem_builds = crate::commands::vex_sources::GemBuildView::of(&plan);
@@ -1579,7 +1581,7 @@ async fn generate_vex(
         builds.expand(&mut outcome.code_not_present);
         builds.expand(&mut redirected);
         builds.expand_noted(&mut affected);
-        affected.extend(builds.kept_upstream().iter().cloned());
+        affected.extend(builds.not_patched().iter().cloned());
     }
     let manifest = gem_builds.as_ref().map_or(manifest, |builds| builds.view());
     let redirected: &[String] = &redirected;
@@ -2245,18 +2247,20 @@ fn vendored_out_of_sync_detail(purl: &str, copies: &[&Path], notes: &str) -> Str
 /// run told apart (the gems of [`Plan::hosted_gems`] the plan worked out),
 /// one line per gem, in the words of the hosted scan's own line:
 /// `nokogiri 1.19.3: patched for x86_64-linux-gnu; upstream gem kept for
-/// arm64-darwin (no patched build yet)`. A build the document leaves out
-/// (nothing shows what the lock installs for it, or the gem's installed
-/// copy did not verify) is `not attested for <platform>`: the run's
-/// warnings say why. The ruby-platform gem, where the lock names it beside
-/// the platform builds, is the platform `ruby`. `applied` are the purls
-/// the document attests as patched.
+/// arm64-darwin (no patched build yet)`. A build of which nothing shows
+/// what the lock installs is `not shown patched for <platform>`: the
+/// document says `affected` of it, and the run's warning says why. A
+/// build the document leaves out (the lock installs it patched, and the
+/// gem's installed copy did not verify) is `not attested for <platform>`.
+/// The ruby-platform gem, where the lock names it beside the platform
+/// builds, is the platform `ruby`. `applied` are the purls the document
+/// attests as patched.
 fn gem_build_lines(plan: &Plan, applied: &[String]) -> Vec<String> {
     use socket_patch_core::vex::gem_builds::GemBuildState;
-    let attested = |build: &HostedGemBuild| {
-        matches!(build.state, GemBuildState::Patched { .. }) && applied.contains(&build.purl)
-    };
+    let patched = |build: &HostedGemBuild| matches!(build.state, GemBuildState::Patched { .. });
+    let attested = |build: &HostedGemBuild| patched(build) && applied.contains(&build.purl);
     let kept = |build: &HostedGemBuild| build.state == GemBuildState::Upstream;
+    let unshown = |build: &HostedGemBuild| build.unshown.is_some();
     plan.hosted_gems
         .values()
         .filter(|gem| gem.resolved)
@@ -2277,9 +2281,10 @@ fn gem_build_lines(plan: &Plan, applied: &[String]) -> Vec<String> {
                     platforms(&kept),
                     " (no patched build yet)",
                 ),
+                ("not shown patched for", platforms(&unshown), ""),
                 (
                     "not attested for",
-                    platforms(&|build| !attested(build) && !kept(build)),
+                    platforms(&|build| patched(build) && !attested(build)),
                     "",
                 ),
             ];
@@ -3027,10 +3032,6 @@ fn omission_phrase(reason: &str) -> &'static str {
             "another package bundles its own copy, which no Socket wiring reaches (the \
              warning above names it)"
         }
-        GEM_BUILD_UNKNOWN => {
-            "it is not shown whether the lockfile installs a patched build for this platform \
-             (the warning above says why, and what to run)"
-        }
         _ => "the patch could not be verified",
     }
 }
@@ -3299,31 +3300,37 @@ fn emit_envelope_success(
                 if let Some(build) = build {
                     gem_build_details(build, &mut details);
                 }
+                // A gem build that is not shown patched: on upstream's
+                // gem (reported as the hosted run reports it), or one of
+                // which nothing shows what the lock installs. Nothing was
+                // skipped and nothing failed, so its event is counted
+                // nowhere.
+                let not_patched = build.and_then(|build| {
+                    let platform = build.platform.as_deref().unwrap_or_default();
+                    match &build.unshown {
+                        Some(why) => Some((GEM_BUILD_UNKNOWN, why.clone())),
+                        None if build.kept_upstream => Some((
+                            GEM_UPSTREAM_BUILD_KEPT,
+                            gem_upstream_build_kept_detail(platform),
+                        )),
+                        None => None,
+                    }
+                });
                 // A package the document says is affected is not reported
                 // as verified, nor counted as such: it is skipped, like a
                 // patch the document leaves out, under its own code.
-                let event = match st.status {
-                    Status::Affected => match build.filter(|build| build.kept_upstream) {
-                        // A gem build on upstream's gem: nothing was
-                        // skipped and nothing failed, that platform is as
-                        // it was. Reported as the hosted run reports it,
-                        // and counted nowhere.
-                        Some(build) => {
-                            let platform = build.platform.as_deref().unwrap_or_default();
-                            let event = PatchEvent::new(PatchAction::Skipped, sub.id.clone())
-                                .with_reason(
-                                    GEM_UPSTREAM_BUILD_KEPT,
-                                    gem_upstream_build_kept_detail(platform),
-                                );
-                            env.events.push(event.with_details(details));
-                            continue;
-                        }
-                        None => {
-                            unbuilt = true;
-                            PatchEvent::new(PatchAction::Skipped, sub.id.clone())
-                                .with_reason(BAZEL_NOT_IN_BUILD, AFFECTED_REASON)
-                        }
-                    },
+                let event = match (st.status, not_patched) {
+                    (Status::Affected, Some((code, reason))) => {
+                        let event = PatchEvent::new(PatchAction::Skipped, sub.id.clone())
+                            .with_reason(code, reason);
+                        env.events.push(event.with_details(details));
+                        continue;
+                    }
+                    (Status::Affected, None) => {
+                        unbuilt = true;
+                        PatchEvent::new(PatchAction::Skipped, sub.id.clone())
+                            .with_reason(BAZEL_NOT_IN_BUILD, AFFECTED_REASON)
+                    }
                     _ => PatchEvent::new(PatchAction::Verified, sub.id.clone()),
                 };
                 env.record(event.with_details(details));
@@ -3575,19 +3582,18 @@ mod tests {
                 &[
                     failed(
                         "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin",
-                        GEM_BUILD_UNKNOWN
+                        "not_applied"
                     ),
                     failed(
                         "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu",
-                        GEM_BUILD_UNKNOWN
+                        "not_applied"
                     ),
                 ],
                 false
             ),
             [
-                "Warning: omitting 2 packages from VEX: it is not shown whether the lockfile \
-              installs a patched build for this platform (the warning above says why, and what \
-              to run) (vex_gem_build_unknown): nokogiri@1.18.10 (arm64-darwin), nokogiri@1.18.10 \
+                "Warning: omitting 2 packages from VEX: the patched files still hold the original \
+              content (not_applied): nokogiri@1.18.10 (arm64-darwin), nokogiri@1.18.10 \
               (x86_64-linux-gnu)"
             ]
         );

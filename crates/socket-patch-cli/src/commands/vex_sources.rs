@@ -81,9 +81,10 @@
 //! lock and at most two requests per gem (the gem patch's reference, and
 //! the index of the lock's registry where the lock has no `CHECKSUMS`).
 //! The gem is judged as its one pin, and the document then names each
-//! build ([`GemBuildView`]): a patched one under its own patch, one on
-//! upstream's gem as affected, and one of which neither is shown not at
-//! all (`vex_gem_build_unknown`).
+//! build ([`GemBuildView`]): a patched one under its own patch, and one on
+//! upstream's gem, or of which neither is shown, as affected. The latter
+//! is no failure of the run: the statement says why and what settles it,
+//! and one warning names the gem (`vex_gem_build_unknown`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -340,11 +341,13 @@ pub(crate) const GO_WORKSPACE_OVERRIDE: &str = "go_workspace_override";
 /// package to the artifact; `vex::Unattested`,
 /// `UnattestedKind::LockNotRead`).
 const NOTE_LOCK_NOT_READ: &str = "vex_lock_not_read";
-/// Omission tag and note: a platform build of a gem the lockfile takes from
-/// a patch registry, of which nothing shows whether the lock installs a
-/// patched build or upstream's own gem ([`GemBuildState::Unknown`]). The
-/// build is left out of the document, never attested on the strength of
-/// the gem's one pin.
+/// Note, and code of the uncounted event: a platform build of a gem the
+/// lockfile takes from a patch registry, of which nothing shows whether the
+/// lock installs a patched build or upstream's own gem
+/// ([`GemBuildState::Unknown`]). The document says `affected` of the build,
+/// with why and what settles it ([`GemBuildUnshown`]): it is never attested
+/// on the strength of the gem's one pin, and never left out. Not an
+/// omission: the run's status and exit code are what they are without it.
 pub(crate) const GEM_BUILD_UNKNOWN: &str = "vex_gem_build_unknown";
 
 /// Largest compact-index document read for a gem's builds
@@ -526,20 +529,23 @@ fn gate_unattested(
 /// platforms and upstream's own gem for the others, so the pin does not
 /// say that every locked build is patched ([`Plan::hosted_gems`]). The
 /// document names each locked build: a patched one under its own patch,
-/// like a vendored one; one on upstream's gem as `affected`
-/// ([`Self::kept_upstream`]), because the lock is known to install it
-/// without the patch; and one of which neither is shown not at all (the
-/// plan left it out, [`GEM_BUILD_UNKNOWN`]). The record of every build
-/// stays in the view, so that no statement names a form of the gem that
-/// also stands for a build the document does not call patched.
+/// like a vendored one, and every other one as `affected`
+/// ([`Self::not_patched`]). That is a build on upstream's gem, which the
+/// lock is known to install without the patch, and a build of which
+/// neither is shown ([`GEM_BUILD_UNKNOWN`]): nothing shows that the lock
+/// installs a patched build for it, so the document does not say it does,
+/// and says why and what settles it. The record of every build stays in
+/// the view, so that no statement names a form of the gem that also
+/// stands for a build the document does not call patched.
 pub(crate) struct GemBuildView {
     /// The record view with each such gem's key replaced by its builds'
     /// purls.
     view: PatchManifest,
     /// View purl of the gem → the purls of its builds that are patched.
     platform_gems: BTreeMap<String, Vec<String>>,
-    /// The hosted builds on upstream's gem, each with what to do about it.
-    kept_upstream: Vec<(String, String)>,
+    /// The hosted builds that are not shown patched, each with what to do
+    /// about it.
+    not_patched: Vec<(String, String)>,
     /// Every build the view names in place of a gem, by purl.
     builds: BTreeMap<String, GemBuildInfo>,
 }
@@ -554,6 +560,9 @@ pub(crate) struct GemBuildInfo {
     pub platform: Option<String>,
     /// A hosted build the patch registry serves as upstream's own gem.
     pub kept_upstream: bool,
+    /// A hosted build of which nothing shows what the lock installs: why,
+    /// as its event says it ([`GemBuildUnshown::reason`]).
+    pub unshown: Option<String>,
 }
 
 /// The action statement of a hosted gem build on upstream's gem
@@ -596,7 +605,7 @@ impl GemBuildView {
         }
         let mut view = plan.view.clone();
         let mut platform_gems = BTreeMap::new();
-        let mut kept_upstream = Vec::new();
+        let mut not_patched = Vec::new();
         let mut builds = BTreeMap::new();
         for (key, entry, record) in vendored {
             view.patches.remove(key);
@@ -618,6 +627,7 @@ impl GemBuildView {
                             gem_fix: entry.uuid.clone(),
                             platform: Some(built.platform.clone()),
                             kept_upstream: false,
+                            unshown: None,
                         },
                     );
                     purl
@@ -646,15 +656,20 @@ impl GemBuildView {
                     },
                 );
                 let upstream = build.state == GemBuildState::Upstream;
+                let unshown = build.unshown.as_ref().zip(build.platform.as_deref());
                 match (&build.state, build.platform.as_deref()) {
                     (GemBuildState::Patched { .. }, _) => patched.push(build.purl.clone()),
-                    (GemBuildState::Upstream, Some(platform)) => kept_upstream.push((
+                    (GemBuildState::Upstream, Some(platform)) => not_patched.push((
                         build.purl.clone(),
                         upstream_build_action(platform, &gem.gem_fix),
                     )),
-                    // Left out by the plan; the ruby-platform gem of a
-                    // patch's registry is never upstream's.
-                    (GemBuildState::Upstream, None) | (GemBuildState::Unknown(_), _) => {}
+                    (GemBuildState::Unknown(_), Some(_)) => {
+                        let action = unshown.map(|(why, platform)| why.action(platform));
+                        not_patched.extend(action.map(|action| (build.purl.clone(), action)));
+                    }
+                    // The ruby-platform gem of a patch's registry is the
+                    // gem's patch, never upstream's nor unknown.
+                    (GemBuildState::Upstream | GemBuildState::Unknown(_), None) => {}
                 }
                 builds.insert(
                     build.purl.clone(),
@@ -662,6 +677,7 @@ impl GemBuildView {
                         gem_fix: gem.gem_fix.clone(),
                         platform: build.platform.clone(),
                         kept_upstream: upstream,
+                        unshown: unshown.map(|(why, platform)| why.reason(platform)),
                     },
                 );
             }
@@ -670,7 +686,7 @@ impl GemBuildView {
         Some(Self {
             view,
             platform_gems,
-            kept_upstream,
+            not_patched,
             builds,
         })
     }
@@ -680,10 +696,12 @@ impl GemBuildView {
         &self.view
     }
 
-    /// The hosted builds the lock installs as upstream's own gem, each with
-    /// its action statement: what the document says `affected` of.
-    pub(crate) fn kept_upstream(&self) -> &[(String, String)] {
-        &self.kept_upstream
+    /// The hosted builds that are not shown patched, each with its action
+    /// statement: what the document says `affected` of. A build the lock
+    /// installs as upstream's own gem, and one of which nothing shows what
+    /// the lock installs.
+    pub(crate) fn not_patched(&self) -> &[(String, String)] {
+        &self.not_patched
     }
 
     /// Every build the view names in place of a gem, by purl.
@@ -756,6 +774,115 @@ pub(crate) struct HostedGemBuild {
     pub purl: String,
     /// What the lock installs for it.
     pub state: GemBuildState,
+    /// For a build in [`GemBuildState::Unknown`]: why nothing shows what
+    /// the lock installs for it.
+    pub unshown: Option<GemBuildUnshown>,
+}
+
+/// Why nothing shows whether a lock installs a patched build or upstream's
+/// own gem for a platform build of a hosted gem
+/// ([`GemBuildState::Unknown`]), and what settles it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum GemBuildUnshown {
+    /// `--offline` forbids asking the patch service for the gem's builds.
+    Offline,
+    /// The reference request failed; its error, safe to print.
+    Request(String),
+    /// The patch service gave no list of the patch's builds; why.
+    NoList(String),
+    /// The lock has no `CHECKSUMS` entry for the build, and the index of
+    /// its registry could not be read; the error, safe to print.
+    IndexUnread(String),
+    /// Neither the lock's `CHECKSUMS` nor the index of its registry names
+    /// an archive for the build.
+    Unpinned,
+    /// The list does not name the build's platform.
+    Unlisted,
+    /// The lock installs another archive than the list names: the list is
+    /// of a later state of the registry than the one the lock names.
+    Differs,
+}
+
+impl From<GemBuildUnknown> for GemBuildUnshown {
+    fn from(why: GemBuildUnknown) -> Self {
+        match why {
+            GemBuildUnknown::Unpinned => GemBuildUnshown::Unpinned,
+            GemBuildUnknown::Unlisted => GemBuildUnshown::Unlisted,
+            GemBuildUnknown::Differs => GemBuildUnshown::Differs,
+        }
+    }
+}
+
+impl GemBuildUnshown {
+    /// The reason in words, said of `them` (`it` for one build, `them`
+    /// for several). `detail` adds the error of a read that failed: the
+    /// run's warning carries it, the document and the events do not.
+    fn why(&self, them: &str, detail: bool) -> String {
+        let failed = |what: String, error: &str| match detail {
+            true => format!("{what}: {error}"),
+            false => what,
+        };
+        match self {
+            GemBuildUnshown::Offline => "--offline forbids asking the patch API".to_string(),
+            GemBuildUnshown::Request(error) => {
+                failed("the patch API request failed".to_string(), error)
+            }
+            GemBuildUnshown::NoList(why) => why.clone(),
+            GemBuildUnshown::IndexUnread(error) => failed(
+                format!(
+                    "the lockfile has no CHECKSUMS entry for {them}, and its registry's index \
+                     could not be read"
+                ),
+                error,
+            ),
+            GemBuildUnshown::Unpinned => format!(
+                "neither the lockfile's CHECKSUMS nor its registry's index names an archive for \
+                 {them}"
+            ),
+            GemBuildUnshown::Unlisted => {
+                format!("the patch registry does not list {them} now")
+            }
+            GemBuildUnshown::Differs => format!(
+                "the lockfile installs another archive for {them} than the patch registry lists \
+                 now"
+            ),
+        }
+    }
+
+    /// What to run to settle it: the request again where one failed,
+    /// without `--offline` where that forbade it, and the scan that brings
+    /// the lock up to date where the lock and the patch registry disagree.
+    fn remedy(&self) -> &'static str {
+        match self {
+            GemBuildUnshown::Offline => GEM_BUILD_ONLINE,
+            GemBuildUnshown::Request(_) | GemBuildUnshown::IndexUnread(_) => GEM_BUILD_RETRY,
+            GemBuildUnshown::NoList(_)
+            | GemBuildUnshown::Unpinned
+            | GemBuildUnshown::Unlisted
+            | GemBuildUnshown::Differs => GEM_BUILD_RESCAN,
+        }
+    }
+
+    /// The action statement of the build for `platform`: what could not be
+    /// shown, why, and what settles it. It names no patch: none is shown
+    /// to be in what the lock installs.
+    fn action(&self, platform: &str) -> String {
+        format!(
+            "It could not be shown that the lockfile installs a patched build of this gem for \
+             {platform} ({}), so it is stated as affected. {}",
+            self.why("it", false),
+            self.remedy()
+        )
+    }
+
+    /// What the uncounted [`GEM_BUILD_UNKNOWN`] event of the build for
+    /// `platform` says.
+    fn reason(&self, platform: &str) -> String {
+        format!(
+            "not shown patched for {platform}: {}",
+            self.why("it", false)
+        )
+    }
 }
 
 impl HostedGem {
@@ -775,6 +902,10 @@ impl HostedGem {
                 purl: match &platform {
                     Some(platform) => format!("{base}?platform={platform}"),
                     None => key.to_string(),
+                },
+                unshown: match (&state, &platform) {
+                    (GemBuildState::Unknown(why), Some(_)) => Some(GemBuildUnshown::from(*why)),
+                    _ => None,
                 },
                 platform,
                 state,
@@ -1754,18 +1885,6 @@ async fn fetch_records(
     out
 }
 
-/// Why nothing is known of the platform builds of a gem
-/// ([`resolve_hosted_gems`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BuildsUnread {
-    /// `--offline` forbids asking.
-    Offline,
-    /// The reference request failed; its error, safe to print.
-    Request(String),
-    /// The patch service gave no list of the patch's builds; why.
-    NoList(String),
-}
-
 /// A hosted gem whose builds the plan works out.
 struct PendingGem {
     /// Its view purl.
@@ -1792,36 +1911,36 @@ impl PendingGem {
 
 /// What to run for a build whose state a later run can read.
 const GEM_BUILD_RETRY: &str = "Run `socket-patch vex` again to attest each build.";
+/// What to run for a build `--offline` kept the run from asking about.
+const GEM_BUILD_ONLINE: &str = "Run `socket-patch vex` without --offline to attest each build.";
 /// What to run for a build the lock and the patch registry disagree about.
 const GEM_BUILD_RESCAN: &str = "Run `socket-patch scan --mode hosted` to bring the lockfile up \
     to date, then `socket-patch vex` again.";
 
-/// The [`GEM_BUILD_UNKNOWN`] note of the gem at `key`: the builds for
-/// `platforms` are left out, `why`, and `remedy` is what to run.
-fn gem_build_note(
-    key: &str,
-    gem_fix: &str,
-    platforms: &[&str],
-    why: &str,
-    remedy: &str,
-) -> PlanNote {
+/// The [`GEM_BUILD_UNKNOWN`] note of the gem at `key`: nothing shows what
+/// the lock installs for the builds of `platforms`, for the reason `why`,
+/// so the document says `affected` of them.
+fn gem_build_note(key: &str, gem_fix: &str, platforms: &[&str], why: &GemBuildUnshown) -> PlanNote {
     let one = platforms.len() == 1;
+    let them = if one { "it" } else { "them" };
     PlanNote {
         code: GEM_BUILD_UNKNOWN,
         detail: format!(
             "{key}: the lockfile takes its {} for {} from the registry of Socket patch {gem_fix}, \
              which serves a patched build for some platforms and upstream's own gem for the \
-             others. Which it is for {} could not be told ({why}), so {} not attested. {remedy}",
+             others. Which it is for {} could not be told ({}), so the VEX document states \
+             {them} as affected. {}",
             if one { "build" } else { "builds" },
             platforms.join(", "),
             if one { "this one" } else { "these" },
-            if one { "it is" } else { "they are" },
+            why.why(them, true),
+            why.remedy(),
         ),
     }
 }
 
-/// Work out [`Plan::hosted_gems`], and leave out the builds of which
-/// nothing shows what the lock installs.
+/// Work out [`Plan::hosted_gems`], and why nothing shows what the lock
+/// installs for a build where nothing does.
 ///
 /// A gem `in_run` reports (a pin of the hosted run this plan is part of)
 /// takes its builds from there. Any other hosted gem is read from the lock
@@ -1833,9 +1952,11 @@ fn gem_build_note(
 /// ([`gem_index`]).
 ///
 /// Under `--offline`, and where a request fails or the answers do not
-/// settle a build, nothing is known of it: the build is omitted
-/// ([`GEM_BUILD_UNKNOWN`]) and a note names the gem and what to run, once
-/// per gem and reason. The ruby-platform gem a lock names beside the
+/// settle a build, nothing is known of it: the build keeps the reason
+/// ([`HostedGemBuild::unshown`]), which the document states it as
+/// affected with, and a note names the gem and what to run, once per gem
+/// and reason ([`GEM_BUILD_UNKNOWN`]). Nothing is gated: the run is no
+/// less a success for it. The ruby-platform gem a lock names beside the
 /// platform builds is the gem's patch by the lock's wiring, whatever the
 /// requests say.
 async fn resolve_hosted_gems(
@@ -1902,7 +2023,7 @@ async fn resolve_hosted_gems(
     // What each patch's reference lists, and what each lock's registry
     // serves where the lock does not say.
     let (lists, indexes) = if common.offline {
-        let unread = |_: &PendingGem| Err(BuildsUnread::Offline);
+        let unread = |_: &PendingGem| Err(GemBuildUnshown::Offline);
         let lists: Vec<_> = pending.iter().map(unread).collect();
         (lists, pending.iter().map(|_| None).collect())
     } else {
@@ -1922,69 +2043,32 @@ async fn resolve_hosted_gems(
         let served = index.as_ref().and_then(|read| read.as_deref().ok());
         let states = gem_build_states(&gem.version, &gem.pins, &gem.uuid, &listed, served);
         let builds = gem.pins.iter().map(|pin| pin.platform.clone()).zip(states);
-        let Some(hosted) = HostedGem::of(&gem.key, &gem.uuid, builds, true) else {
+        let Some(mut hosted) = HostedGem::of(&gem.key, &gem.uuid, builds, true) else {
             continue;
         };
-        let mut unknown: BTreeMap<GemBuildUnknown, Vec<&str>> = BTreeMap::new();
+        // What the reads say of a build beyond its state: with no list,
+        // why there is none; with no index, the error of that read.
+        for build in &mut hosted.builds {
+            let Some(why) = build.unshown.take() else {
+                continue;
+            };
+            build.unshown = Some(match (&unread, why, &index) {
+                (Some(unread), _, _) => unread.clone(),
+                (None, GemBuildUnshown::Unpinned, Some(Err(error))) => {
+                    GemBuildUnshown::IndexUnread(error.clone())
+                }
+                (None, why, _) => why,
+            });
+        }
+        let mut unshown: BTreeMap<&GemBuildUnshown, Vec<&str>> = BTreeMap::new();
         for build in &hosted.builds {
-            if let (GemBuildState::Unknown(why), Some(platform)) =
-                (&build.state, build.platform.as_deref())
-            {
-                plan.gated.push(failed(&build.purl, GEM_BUILD_UNKNOWN));
-                unknown.entry(*why).or_default().push(platform);
+            if let (Some(why), Some(platform)) = (&build.unshown, build.platform.as_deref()) {
+                unshown.entry(why).or_default().push(platform);
             }
         }
-        let note = |platforms: &[&str], why: &str, remedy: &str| {
-            gem_build_note(&gem.key, &gem.uuid, platforms, why, remedy)
-        };
-        if let Some(unread) = unread {
-            let platforms: Vec<&str> = unknown.into_values().flatten().collect();
-            let (why, remedy) = match &unread {
-                BuildsUnread::Offline => (
-                    "--offline forbids asking the patch API".to_string(),
-                    "Run `socket-patch vex` without --offline to attest each build.",
-                ),
-                BuildsUnread::Request(error) => (
-                    format!("the patch API request failed: {error}"),
-                    GEM_BUILD_RETRY,
-                ),
-                BuildsUnread::NoList(why) => (why.clone(), GEM_BUILD_RESCAN),
-            };
-            if !platforms.is_empty() {
-                plan.notes.push(note(&platforms, &why, remedy));
-            }
-        } else {
-            for (why, platforms) in unknown {
-                let them = if platforms.len() == 1 { "it" } else { "them" };
-                let (why, remedy) = match (why, &index) {
-                    (GemBuildUnknown::Unpinned, Some(Err(error))) => (
-                        format!(
-                            "the lockfile has no CHECKSUMS entry for {them}, and its registry's \
-                             index could not be read: {error}"
-                        ),
-                        GEM_BUILD_RETRY,
-                    ),
-                    (GemBuildUnknown::Unpinned, _) => (
-                        format!(
-                            "neither the lockfile's CHECKSUMS nor its registry's index names an \
-                             archive for {them}"
-                        ),
-                        GEM_BUILD_RESCAN,
-                    ),
-                    (GemBuildUnknown::Unlisted, _) => (
-                        format!("the patch registry does not list {them} now"),
-                        GEM_BUILD_RESCAN,
-                    ),
-                    (GemBuildUnknown::Differs, _) => (
-                        format!(
-                            "the lockfile installs another archive for {them} than the patch \
-                             registry lists now"
-                        ),
-                        GEM_BUILD_RESCAN,
-                    ),
-                };
-                plan.notes.push(note(&platforms, &why, remedy));
-            }
+        for (why, platforms) in unshown {
+            plan.notes
+                .push(gem_build_note(&gem.key, &gem.uuid, &platforms, why));
         }
         plan.hosted_gems.insert(gem.key.clone(), hosted);
     }
@@ -2001,7 +2085,7 @@ async fn read_gem_builds(
     gems: &[PendingGem],
     notes: &mut Vec<PlanNote>,
 ) -> (
-    Vec<Result<Vec<GemPlatformChecksum>, BuildsUnread>>,
+    Vec<Result<Vec<GemPlatformChecksum>, GemBuildUnshown>>,
     Vec<Option<Result<String, String>>>,
 ) {
     use socket_patch_core::utils::redact::redact_urls_in;
@@ -2029,10 +2113,10 @@ async fn read_gem_builds(
                 .release();
         }
     }
-    let lists: Vec<Result<Vec<GemPlatformChecksum>, BuildsUnread>> = gems
+    let lists: Vec<Result<Vec<GemPlatformChecksum>, GemBuildUnshown>> = gems
         .iter()
         .map(|gem| match &references {
-            Err(error) => Err(BuildsUnread::Request(
+            Err(error) => Err(GemBuildUnshown::Request(
                 redact_urls_in(&error.to_string()).into_owned(),
             )),
             Ok(references) => {
@@ -2043,7 +2127,7 @@ async fn read_gem_builds(
                     .and_then(|reference| reference.registry_override.as_ref())
                     .and_then(|registry| registry.identifiers.gem_builds.clone())
                     .ok_or_else(|| {
-                        BuildsUnread::NoList(
+                        GemBuildUnshown::NoList(
                             match reference.map(|reference| reference.status.as_str()) {
                                 Some("granted" | "reused") => {
                                     "the patch API lists no builds for that patch"
@@ -3567,6 +3651,25 @@ mod tests {
         }
     }
 
+    /// What the document made from `plan` says of the gem: the purls it
+    /// attests as patched, and each purl it says `affected` of with the
+    /// action statement.
+    fn gem_statements(plan: &Plan) -> (Vec<String>, Vec<(String, String)>) {
+        let builds = GemBuildView::of(plan).expect("a gem locked as platform builds");
+        let mut applied = vec![GEM.to_string()];
+        builds.expand(&mut applied);
+        (applied, builds.not_patched().to_vec())
+    }
+
+    /// The action statement of a build for `platform` that is not shown
+    /// patched for the reason `why`, with what to run.
+    fn unshown_action(platform: &str, why: &str, remedy: &str) -> String {
+        format!(
+            "It could not be shown that the lockfile installs a patched build of this gem for \
+             {platform} ({why}), so it is stated as affected. {remedy}"
+        )
+    }
+
     const REFERENCE: &str = "/v0/orgs/acme/patches/package";
     const ONE_PATCHED: [(&str, &str, Option<&str>); 2] = [
         ("arm64-darwin", ARM_UPSTREAM, None),
@@ -3649,11 +3752,13 @@ mod tests {
         );
     }
 
-    /// The index of the lock's registry cannot be read: the builds are
-    /// omitted, and one note names the gem, the reason and what to run.
+    /// The index of the lock's registry cannot be read: nothing shows what
+    /// the lock installs, so the document says `affected` of both builds
+    /// and names no patch for them. Nothing is gated, and one note names
+    /// the gem, the reason (with the error of the read) and what to run.
     #[tokio::test]
     #[serial_test::serial]
-    async fn an_unreadable_index_omits_the_builds_of_a_lock_without_checksums() {
+    async fn an_unreadable_index_states_the_builds_of_a_lock_without_checksums_as_affected() {
         let server = wiremock::MockServer::start().await;
         mount_gem_reference(&server, "4f", &ONE_PATCHED).await;
         let tmp = tempfile::tempdir().unwrap();
@@ -3671,13 +3776,7 @@ mod tests {
             gem_states(&plan),
             [(GEM_ARM, &unpinned), (GEM_LINUX, &unpinned)]
         );
-        assert_eq!(
-            plan.gated,
-            [
-                failed(GEM_ARM, GEM_BUILD_UNKNOWN),
-                failed(GEM_LINUX, GEM_BUILD_UNKNOWN)
-            ]
-        );
+        assert!(plan.gated.is_empty(), "{:?}", plan.gated);
         let [note] = plan.notes.as_slice() else {
             panic!("one note for the gem: {:?}", plan.notes);
         };
@@ -3687,20 +3786,39 @@ mod tests {
                 "{GEM}: the lockfile takes its builds for arm64-darwin, x86_64-linux-gnu from \
                  the registry of Socket patch {U1}"
             )) && note.detail.contains(
-                "the lockfile has no CHECKSUMS entry for them, and its registry's index could \
-                 not be read"
-            ) && note.detail.ends_with(GEM_BUILD_RETRY),
+                "(the lockfile has no CHECKSUMS entry for them, and its registry's index could \
+                 not be read: "
+            ) && note.detail.ends_with(&format!(
+                "), so the VEX document states them as affected. {GEM_BUILD_RETRY}"
+            )),
             "{}",
             note.detail
         );
         assert!(!note.detail.contains("/tok/"), "the grant token: {note:?}");
+
+        // The document: both builds as affected, without the error.
+        let why = "the lockfile has no CHECKSUMS entry for it, and its registry's index could \
+                   not be read";
+        let action = |platform: &str| unshown_action(platform, why, GEM_BUILD_RETRY);
+        assert_eq!(
+            gem_statements(&plan),
+            (
+                Vec::new(),
+                vec![
+                    (GEM_ARM.to_string(), action("arm64-darwin")),
+                    (GEM_LINUX.to_string(), action("x86_64-linux-gnu")),
+                ]
+            )
+        );
     }
 
     /// The reference is of a later registry than the lock names: it lists
     /// a patched build for a platform the lock still pins upstream's gem
     /// for. That build is not attested as patched, on either way of
-    /// telling what the lock installs; the build the lock does pin patched
-    /// is. The note sends the reader to the scan.
+    /// telling what the lock installs: the document says `affected` of it,
+    /// and names the patch the list gives for it nowhere. The build the
+    /// lock does pin patched is attested. Nothing is gated, and the note
+    /// sends the reader to the scan.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_reference_newer_than_the_lock_attests_no_build_the_lock_pins_otherwise() {
@@ -3731,7 +3849,7 @@ mod tests {
                 ],
                 "checksums: {checksums}"
             );
-            assert_eq!(plan.gated, [failed(GEM_ARM, GEM_BUILD_UNKNOWN)]);
+            assert!(plan.gated.is_empty(), "{:?}", plan.gated);
             let [note] = plan.notes.as_slice() else {
                 panic!("one note for the gem: {:?}", plan.notes);
             };
@@ -3739,12 +3857,28 @@ mod tests {
                 note.detail.contains("its build for arm64-darwin from")
                     && note.detail.contains(
                         "(the lockfile installs another archive for it than the patch registry \
-                         lists now), so it is not attested."
+                         lists now), so the VEX document states it as affected."
                     )
                     && note.detail.ends_with(GEM_BUILD_RESCAN),
                 "{}",
                 note.detail
             );
+            let (applied, affected) = gem_statements(&plan);
+            assert_eq!(applied, [GEM_LINUX], "checksums: {checksums}");
+            assert_eq!(
+                affected,
+                [(
+                    GEM_ARM.to_string(),
+                    unshown_action(
+                        "arm64-darwin",
+                        "the lockfile installs another archive for it than the patch registry \
+                         lists now",
+                        GEM_BUILD_RESCAN
+                    )
+                )],
+                "checksums: {checksums}"
+            );
+            assert!(!affected[0].1.contains(ARM_UUID) && !affected[0].1.contains(U1));
             assert_eq!(
                 asked(&server).await.len(),
                 if checksums { 1 } else { 2 },
@@ -3754,12 +3888,12 @@ mod tests {
     }
 
     /// `--offline`: nothing is asked, so nothing says which locked build
-    /// is patched. The platform builds are omitted with one note; the
-    /// ruby-platform gem the lock names beside them is the gem's patch by
-    /// the lock's wiring alone.
+    /// is patched. The document says `affected` of the platform builds,
+    /// with one note and nothing gated; the ruby-platform gem the lock
+    /// names beside them is the gem's patch by the lock's wiring alone.
     #[tokio::test]
     #[serial_test::serial]
-    async fn offline_attests_no_platform_build_and_asks_nothing() {
+    async fn offline_states_the_platform_builds_as_affected_and_asks_nothing() {
         let server = wiremock::MockServer::start().await;
         mount_gem_reference(&server, "4f", &ONE_PATCHED).await;
         let tmp = tempfile::tempdir().unwrap();
@@ -3784,13 +3918,7 @@ mod tests {
                 (GEM_LINUX, &unlisted)
             ]
         );
-        assert_eq!(
-            plan.gated,
-            [
-                failed(GEM_ARM, GEM_BUILD_UNKNOWN),
-                failed(GEM_LINUX, GEM_BUILD_UNKNOWN)
-            ]
-        );
+        assert!(plan.gated.is_empty(), "{:?}", plan.gated);
         let [note] = plan.notes.as_slice() else {
             panic!("one note for the gem: {:?}", plan.notes);
         };
@@ -3800,26 +3928,42 @@ mod tests {
                 "{GEM}: the lockfile takes its builds for arm64-darwin, x86_64-linux-gnu from \
                  the registry of Socket patch {U1}, which serves a patched build for some \
                  platforms and upstream's own gem for the others. Which it is for these could \
-                 not be told (--offline forbids asking the patch API), so they are not attested. \
-                 Run `socket-patch vex` without --offline to attest each build."
+                 not be told (--offline forbids asking the patch API), so the VEX document \
+                 states them as affected. Run `socket-patch vex` without --offline to attest \
+                 each build."
             )
         );
         assert_eq!(asked(&server).await, Vec::<String>::new());
 
-        // The document: the ruby-platform gem alone, under the gem's patch.
-        let builds = GemBuildView::of(&plan).expect("a gem locked as platform builds");
-        let mut applied = vec![GEM.to_string()];
-        builds.expand(&mut applied);
-        assert_eq!(applied, [GEM]);
-        assert!(builds.kept_upstream().is_empty());
+        // The document: the ruby-platform gem under the gem's patch, and
+        // each platform build as affected.
+        let action = |platform: &str| {
+            unshown_action(
+                platform,
+                "--offline forbids asking the patch API",
+                GEM_BUILD_ONLINE,
+            )
+        };
+        assert_eq!(
+            gem_statements(&plan),
+            (
+                vec![GEM.to_string()],
+                vec![
+                    (GEM_ARM.to_string(), action("arm64-darwin")),
+                    (GEM_LINUX.to_string(), action("x86_64-linux-gnu")),
+                ]
+            )
+        );
     }
 
     /// The reference request fails, or the reference carries no list: no
-    /// build is attested, the note says which it was, and the registry is
-    /// not asked for an index nothing could be held against.
+    /// build is attested as patched and the document says `affected` of
+    /// each, the note says which it was (with the error of a failed
+    /// request, which the document leaves out), nothing is gated, and the
+    /// registry is not asked for an index nothing could be held against.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_failed_or_listless_reference_attests_no_platform_build() {
+    async fn a_failed_or_listless_reference_states_the_platform_builds_as_affected() {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, ResponseTemplate};
         let no_list = serde_json::json!({ "results": { U1: {
@@ -3832,15 +3976,17 @@ mod tests {
                 },
             },
         }}});
-        for (answer, why, remedy) in [
+        for (answer, why, stated, remedy) in [
             (
                 ResponseTemplate::new(500),
-                "the patch API request failed: ",
+                "(the patch API request failed: ",
+                "the patch API request failed",
                 GEM_BUILD_RETRY,
             ),
             (
                 ResponseTemplate::new(200).set_body_json(no_list),
                 "(the patch API lists no builds for that patch)",
+                "the patch API lists no builds for that patch",
                 GEM_BUILD_RESCAN,
             ),
         ] {
@@ -3861,14 +4007,7 @@ mod tests {
                 &RunApiClient::new(),
             )
             .await;
-            assert_eq!(
-                plan.gated,
-                [
-                    failed(GEM_ARM, GEM_BUILD_UNKNOWN),
-                    failed(GEM_LINUX, GEM_BUILD_UNKNOWN)
-                ],
-                "{why}"
-            );
+            assert!(plan.gated.is_empty(), "{why}: {:?}", plan.gated);
             let [note] = plan.notes.as_slice() else {
                 panic!("one note for the gem: {:?}", plan.notes);
             };
@@ -3884,11 +4023,19 @@ mod tests {
                 !asked.is_empty() && asked.iter().all(|path| path == REFERENCE),
                 "{asked:?}"
             );
-            // Nothing of the gem is in the document.
-            let builds = GemBuildView::of(&plan).expect("a gem locked as platform builds");
-            let mut applied = vec![GEM.to_string()];
-            builds.expand(&mut applied);
-            assert!(applied.is_empty() && builds.kept_upstream().is_empty());
+            // The document: no build as patched, each as affected.
+            let action = |platform: &str| unshown_action(platform, stated, remedy);
+            assert_eq!(
+                gem_statements(&plan),
+                (
+                    Vec::new(),
+                    vec![
+                        (GEM_ARM.to_string(), action("arm64-darwin")),
+                        (GEM_LINUX.to_string(), action("x86_64-linux-gnu")),
+                    ]
+                ),
+                "{why}"
+            );
         }
     }
 
@@ -4004,10 +4151,10 @@ mod tests {
     /// A gem a lock takes from its patch registry as platform builds is
     /// named per locked build. A patched build goes under its own patch,
     /// with the gem patch's vulnerabilities, wherever the gem was; a build
-    /// on upstream's gem is in no list of attested purls and is handed
-    /// over as affected, with what to do; a build nothing is known of is
-    /// in neither. All three keep a record in the view, so no statement
-    /// names a form of the gem that stands for an unpatched build too.
+    /// on upstream's gem, and a build nothing is known of, are in no list
+    /// of attested purls and are handed over as affected, each with what
+    /// to do. All three keep a record in the view, so no statement names a
+    /// form of the gem that stands for an unpatched build too.
     #[test]
     fn a_hosted_gem_is_attested_per_locked_build() {
         const JAVA: &str = "pkg:gem/nokogiri@1.18.10?platform=java";
@@ -4045,20 +4192,30 @@ mod tests {
             builds.expand(&mut attested);
             assert_eq!(attested[others..], [GEM, GEM_LINUX]);
         }
-        let [(purl, action)] = builds.kept_upstream() else {
-            panic!("one build on upstream's gem: {:?}", builds.kept_upstream());
-        };
-        assert_eq!(purl, GEM_ARM);
         assert_eq!(
-            action,
-            &format!(
-                "The patch registry has no patched build of this gem for arm64-darwin yet and \
-                 serves upstream's own gem for it, so an install on that platform is without \
-                 Socket patch {U1}. Run `socket-patch scan --mode hosted` again later: the \
-                 lockfile takes the patched build once it is published."
-            )
+            builds.not_patched(),
+            [
+                (
+                    GEM_ARM.to_string(),
+                    format!(
+                        "The patch registry has no patched build of this gem for arm64-darwin \
+                         yet and serves upstream's own gem for it, so an install on that \
+                         platform is without Socket patch {U1}. Run `socket-patch scan --mode \
+                         hosted` again later: the lockfile takes the patched build once it is \
+                         published."
+                    )
+                ),
+                (
+                    JAVA.to_string(),
+                    unshown_action(
+                        "java",
+                        "the patch registry does not list it now",
+                        GEM_BUILD_RESCAN
+                    )
+                ),
+            ]
         );
-        let described: Vec<(&str, Option<&str>, bool)> = builds
+        let described: Vec<(&str, Option<&str>, bool, Option<&str>)> = builds
             .builds()
             .iter()
             .map(|(purl, build)| {
@@ -4067,16 +4224,22 @@ mod tests {
                     purl.as_str(),
                     build.platform.as_deref(),
                     build.kept_upstream,
+                    build.unshown.as_deref(),
                 )
             })
             .collect();
         assert_eq!(
             described,
             [
-                (GEM, None, false),
-                (GEM_ARM, Some("arm64-darwin"), true),
-                (JAVA, Some("java"), false),
-                (GEM_LINUX, Some("x86_64-linux-gnu"), false),
+                (GEM, None, false, None),
+                (GEM_ARM, Some("arm64-darwin"), true, None),
+                (
+                    JAVA,
+                    Some("java"),
+                    false,
+                    Some("not shown patched for java: the patch registry does not list it now")
+                ),
+                (GEM_LINUX, Some("x86_64-linux-gnu"), false, None),
             ]
         );
     }
