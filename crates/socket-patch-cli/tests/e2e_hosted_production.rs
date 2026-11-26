@@ -193,6 +193,10 @@ const GEM_UUIDS: &[&str] = &[
     // backport). Published 2026-09-04T21:23Z; the client-side merge rung in
     // `api::ranking` now selects this one.
     "01019627-b481-4bae-bc09-e93b5a5e4481",
+    // GHSA-w749-p3v6-hccq / CVE-2022-21831 again, republished
+    // 2026-11-26T01:43Z as a patch of its own (image_processing_transformer.rb
+    // + engine.rb + active_storage.rb); the redirect wires this one now.
+    "146ef6aa-f43e-42aa-9891-0983435220e2",
 ];
 
 /// Header the patch service injects into patched npm / PyPI source files.
