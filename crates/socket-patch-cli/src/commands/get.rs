@@ -15,7 +15,9 @@ use socket_patch_core::manifest::records::{build_patch_record, files_for_manifes
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched, TelemetryAuth};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
-use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{
+    canonical_purl, normalize_purl, purl_parts, purl_qualifier, strip_purl_qualifiers,
+};
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::utils::target::{Target, TargetKind};
 use socket_patch_core::vendor::load_state;
@@ -1226,6 +1228,102 @@ pub(crate) async fn download_patch_records_with(
     download_patch_records_reusing(selected, params, api_client, prefetched, None).await
 }
 
+/// Warning code of a hosted `get <uuid>` whose UUID names the patch of one
+/// platform gem, when no patch of the gem itself could be taken for it
+/// ([`PlatformGemPatch`]): the run pins nothing, and the warning names the
+/// command that patches the gem.
+const PLATFORM_GEM_PATCH_NOT_TAKEN: &str = "platform_gem_patch_not_taken";
+
+/// The patch of one platform gem (`pkg:gem/<name>@<version>?platform=…`)
+/// that a hosted or a vendored `get` was given by its UUID. Such a run
+/// patches a gem through the patch of the gem itself, whose reference
+/// names the patched build of every platform: it takes the patch this one
+/// was built from ([`Self::gem_patch`]) and goes on as it does for that
+/// patch's UUID.
+struct PlatformGemPatch {
+    uuid: String,
+    purl: String,
+    /// `<name> <version>`, as the run's lines name a gem.
+    gem: String,
+    platform: String,
+    /// The gem's patch the run took in its place, once it has one.
+    gem_fix: Option<String>,
+}
+
+impl PlatformGemPatch {
+    /// `patch` as the patch of a platform gem; `None` for any other.
+    fn of(patch: &PatchResponse) -> Option<Self> {
+        if !super::scan::is_platform_gem_patch(&patch.purl) {
+            return None;
+        }
+        let (_, name, version) = purl_parts(&patch.purl)?;
+        Some(PlatformGemPatch {
+            uuid: patch.uuid.clone(),
+            purl: patch.purl.clone(),
+            gem: format!("{name} {version}"),
+            platform: purl_qualifier(&patch.purl, "platform")?.to_string(),
+            gem_fix: None,
+        })
+    }
+
+    /// The gem's patch: the one this patch's package reference names as
+    /// what it was built from (`rebuiltFromUuid`). One reference request,
+    /// then the fetch of that record. `None` when the reference names no
+    /// patch, a request fails, or the patch named is not the patch of this
+    /// gem itself.
+    async fn gem_patch(&self, api_client: &ApiClient) -> Option<PatchResponse> {
+        let references = api_client
+            .fetch_registry_references(std::slice::from_ref(&self.uuid))
+            .await
+            .ok()?;
+        let built_from = references.get(&self.uuid)?.rebuilt_from_uuid.as_deref()?;
+        // The value goes into a request path: a patch UUID or nothing.
+        if Target::parse(built_from).kind() != TargetKind::Uuid {
+            return None;
+        }
+        let gem_patch = api_client.fetch_patch(built_from).await.ok()??;
+        (!super::scan::is_platform_gem_patch(&gem_patch.purl)
+            && canonical_purl(&gem_patch.purl) == canonical_purl(&self.purl))
+        .then_some(gem_patch)
+    }
+
+    /// The one line that says which patch the run took (stderr).
+    fn taken_line(&self, mode: &str) -> Option<String> {
+        let gem_fix = self.gem_fix.as_deref()?;
+        Some(format!(
+            "{} is the patch of {}'s {} build; {mode} mode takes the gem's patch {gem_fix}, \
+             which it was built from",
+            self.uuid, self.gem, self.platform
+        ))
+    }
+
+    /// The same fact for the envelope (`platformGemPatch`).
+    fn taken_json(&self) -> Option<serde_json::Value> {
+        let gem_fix = self.gem_fix.as_deref()?;
+        Some(serde_json::json!({
+            "uuid": self.uuid,
+            "purl": self.purl,
+            "platform": self.platform,
+            "gemFix": gem_fix,
+        }))
+    }
+
+    /// What a run that found no gem's patch to take says of this one: it
+    /// is no fix of its own in `mode`, and the command that patches the
+    /// gem there.
+    fn not_taken(&self, mode: &str) -> String {
+        format!(
+            "{} is the patch of {}'s {} build, which {mode} mode does not take by itself: it \
+             patches a gem through the gem's own patch. Run `socket-patch get {} --mode {mode}` \
+             instead",
+            self.uuid,
+            self.gem,
+            self.platform,
+            canonical_purl(&self.purl)
+        )
+    }
+}
+
 pub async fn run(args: GetArgs) -> i32 {
     // Validate flags
     let type_flags = [args.id, args.cve, args.ghsa, args.package]
@@ -1416,6 +1514,36 @@ pub async fn run(args: GetArgs) -> i32 {
             }
         }
         status.finish();
+        // The patch of one platform gem is no fix of its own in hosted and
+        // vendored mode: the run takes the gem's patch, which it was built
+        // from, and goes on below as it does for that patch's UUID. (A
+        // patch outside the run's ecosystems, or a paid one on the public
+        // proxy, gets its own answer below and costs no request here.)
+        let mut platform_gem: Option<PlatformGemPatch> = None;
+        if mode != super::scan::ScanMode::Agent {
+            let named = fetch_result.as_ref().ok().and_then(Option::as_ref);
+            let asked = named.and_then(PlatformGemPatch::of).filter(|_| {
+                named.is_some_and(|patch| {
+                    args.common.purl_ecosystem_selected(&patch.purl)
+                        && !(patch.tier == "paid" && use_public_proxy)
+                })
+            });
+            if let Some(mut asked) = asked {
+                status.set(format!("Fetching the patch of {}...", asked.gem));
+                let gem_patch = asked.gem_patch(&api_client).await;
+                status.finish();
+                if let Some(gem_patch) = gem_patch {
+                    asked.gem_fix = Some(gem_patch.uuid.clone());
+                    fetch_result = Ok(Some(gem_patch));
+                }
+                if let Some(line) = asked.taken_line(mode.cli_name()).filter(|_| !quiet) {
+                    let width = crate::ui::attended(crate::ui::Stream::Stderr)
+                        .then(crate::ui::stderr_width);
+                    eprintln!("{}", crate::ui::wrap_line(&line, width));
+                }
+                platform_gem = Some(asked);
+            }
+        }
         match fetch_result {
             Ok(Some(patch)) => {
                 // The search path's selection rules hold here too: a patch
@@ -1492,6 +1620,17 @@ pub async fn run(args: GetArgs) -> i32 {
                 // (`policy_bypassed`).
                 let mut uuid_warnings =
                     super::scan::policy::policy_bypass_warnings(&args.common, &selected);
+                // A platform gem's patch that no gem's patch was taken for
+                // reaches the hosted engine, which pins nothing for it:
+                // say what to run. (The vendored refusal says it itself.)
+                if let Some(asked) = platform_gem.as_ref().filter(|asked| {
+                    asked.gem_fix.is_none() && mode == super::scan::ScanMode::Hosted
+                }) {
+                    uuid_warnings.push((
+                        PLATFORM_GEM_PATCH_NOT_TAKEN.to_string(),
+                        asked.not_taken(mode.cli_name()),
+                    ));
+                }
                 if !args.common.silent {
                     for (_, detail) in &uuid_warnings {
                         eprintln!("Warning: {detail}");
@@ -1512,7 +1651,15 @@ pub async fn run(args: GetArgs) -> i32 {
                         save_and_apply_patch(&args, &api_client, &patch, &uuid_warnings).await
                     }
                     super::scan::ScanMode::Hosted => {
-                        run_get_hosted(&args, &api_client, &selected, &[], &uuid_warnings).await
+                        run_get_hosted(
+                            &args,
+                            &api_client,
+                            &selected,
+                            platform_gem.as_ref(),
+                            &[],
+                            &uuid_warnings,
+                        )
+                        .await
                     }
                     super::scan::ScanMode::Vendored => {
                         run_get_vendored(
@@ -1521,6 +1668,7 @@ pub async fn run(args: GetArgs) -> i32 {
                             use_public_proxy,
                             &selected,
                             Some(&patch),
+                            platform_gem.as_ref(),
                             &[],
                             &uuid_warnings,
                             &telemetry,
@@ -1719,8 +1867,7 @@ pub async fn run(args: GetArgs) -> i32 {
     // A hosted or a vendored run patches a gem through the patch of the
     // gem itself: the patch of one of its platform gems, which a search
     // returns beside it, is no fix of its own there. (One named by its
-    // UUID is the caller's exact intent, and reaches the backend's own
-    // refusal.)
+    // UUID stands for the gem's patch: see `PlatformGemPatch`.)
     if matches!(
         mode,
         super::scan::ScanMode::Vendored | super::scan::ScanMode::Hosted
@@ -1995,6 +2142,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 &args,
                 &api_client,
                 &selected,
+                None,
                 &narrow_skips,
                 &narrow_warnings,
             )
@@ -2006,6 +2154,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 &api_client,
                 use_public_proxy,
                 &selected,
+                None,
                 None,
                 &narrow_skips,
                 &narrow_warnings,
@@ -2509,11 +2658,14 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
 /// matches `scan --mode hosted` selecting the same patches. The engine owns
 /// all output (and honors `--dry-run` internally); in JSON mode it records
 /// its events (`details.mode: "hosted"`) into the get envelope passed as
-/// `scan_result` and prints it.
+/// `scan_result` and prints it. `platform_gem` is the platform gem's patch
+/// the run was given by its UUID, when `selected` is the gem's patch taken
+/// for it: the envelope names it (`platformGemPatch`).
 async fn run_get_hosted(
     args: &GetArgs,
     api_client: &ApiClient,
     selected: &[PatchSearchResult],
+    platform_gem: Option<&PlatformGemPatch>,
     narrow_skips: &[PatchEvent],
     narrow_warnings: &[(String, String)],
 ) -> i32 {
@@ -2526,6 +2678,9 @@ async fn run_get_hosted(
     let scan_result = args.common.json.then(|| {
         let mut env = new_envelope(&args.common);
         fold_narrowing_into_result(&mut env, narrow_skips, narrow_warnings);
+        if let Some(taken) = platform_gem.and_then(PlatformGemPatch::taken_json) {
+            env.set_extra("platformGemPatch", taken);
+        }
         env
     });
     // Embedded VEX stays a scan/vendor feature (get has no --vex): a
@@ -2564,6 +2719,12 @@ async fn run_get_hosted(
 /// pre-record envelope, so a refused run writes nothing at all; the search
 /// path lets the download phase record the refusal per patch and still runs
 /// the vendor step (scan parity).
+///
+/// `platform_gem` is the platform gem's patch the uuid path was given. With
+/// the gem's patch taken for it (`prefetched`), the envelope names it
+/// (`platformGemPatch`). With none taken, `prefetched` is that patch itself
+/// and is refused `platform_gem_unsupported` before the engine, with the
+/// command that vendors the gem.
 #[allow(clippy::too_many_arguments)]
 async fn run_get_vendored(
     args: &GetArgs,
@@ -2571,12 +2732,16 @@ async fn run_get_vendored(
     use_public_proxy: bool,
     selected: &[PatchSearchResult],
     prefetched: Option<&PatchResponse>,
+    platform_gem: Option<&PlatformGemPatch>,
     narrow_skips: &[PatchEvent],
     narrow_warnings: &[(String, String)],
     telemetry: &TelemetryAuth,
 ) -> i32 {
     let mut env = new_envelope(&args.common);
     fold_narrowing_into_result(&mut env, narrow_skips, narrow_warnings);
+    if let Some(taken) = platform_gem.and_then(PlatformGemPatch::taken_json) {
+        env.set_extra("platformGemPatch", taken);
+    }
     // Dry run: ledger-classification preview only (scan's posture) — no
     // download, no vendor step, no writes.
     if args.common.dry_run {
@@ -2616,13 +2781,23 @@ async fn run_get_vendored(
         // Human: `Error (<code>): <detail>` on stderr — an error, so it is
         // exempt from `--silent` like every other `Error (…)` line here.
         let vendor_state = load_state(&args.common.project_root()).await;
-        let refusals = Box::pin(vendored_download_refusals(
+        let mut refusals = Box::pin(vendored_download_refusals(
             &params,
             selected,
             vendor_state.as_ref().map(|s| &s.entries),
             None,
         ))
         .await;
+        // A platform gem's patch that no gem's patch was taken for: what
+        // the project's own files refuse it for, if anything, comes first.
+        if let Some(asked) = platform_gem.filter(|asked| asked.gem_fix.is_none()) {
+            refusals
+                .entry(patch.purl.clone())
+                .or_insert_with(|| VendorRefusal {
+                    code: "platform_gem_unsupported",
+                    detail: asked.not_taken("vendored"),
+                });
+        }
         if let Some(VendorRefusal { code, detail }) = refusals.get(&patch.purl) {
             // An expected skip (a gem version this project doesn't lock)
             // is not an error: the same `skipped` event and `[skip]` line

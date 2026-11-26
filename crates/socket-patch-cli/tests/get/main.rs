@@ -10,6 +10,8 @@ mod common;
 mod npm_e2e_common;
 #[path = "../prebuilt_common/mod.rs"]
 mod prebuilt_common;
+#[path = "../common/pty_io.rs"]
+mod pty_io;
 #[path = "../vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 #[path = "../vlt_hosted_common/mod.rs"]
@@ -27,6 +29,7 @@ mod get_fixture;
 mod get_invariants;
 mod get_modes_e2e;
 mod get_nested_apply_api_flags_e2e;
+mod get_platform_gem_uuid;
 mod get_render;
 mod get_single_json_document;
 mod get_update_summary_e2e;
