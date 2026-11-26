@@ -2083,57 +2083,33 @@ fn check_remote_dependents(
     version: &str,
     index: Option<&LockIndex>,
 ) -> Result<(), String> {
-    // The snapshot blocks whose body holds a `name: version` ref.
-    let dependents: Vec<String> = match index {
-        Some(index) => index
-            .snapshot_dep_lines
-            .get(name)
-            .into_iter()
-            .flatten()
-            .filter(|&&(line, _)| {
-                parse_key_line(&lines[line], 6)
-                    .is_some_and(|(_, _, rest)| unquote_value(rest) == version)
-            })
-            .map(|&(_, block)| index.snapshots.blocks[block].key.clone())
-            .collect(),
+    // Off the memoized split there is no index to hand in: build one.
+    let built;
+    let index = match index {
+        Some(index) => index,
         None => {
-            let mut found = Vec::new();
-            if let Some((start, end)) = section_bounds(lines, "snapshots") {
-                let mut i = start + 1;
-                while let Some(block) = next_block(lines, i, end) {
-                    if lines[block.header + 1..block.end].iter().any(|line| {
-                        parse_key_line(line, 6).is_some_and(|(dep, _, rest)| {
-                            dep == name && unquote_value(rest) == version
-                        })
-                    }) {
-                        found.push(block.key.clone());
-                    }
-                    i = block.end;
-                }
-            }
-            found
+            built = LockIndex::build(lines);
+            &built
         }
     };
-    if dependents.is_empty() {
-        return Ok(());
-    }
+    // The snapshot blocks whose body holds a `name: version` ref.
+    let dependents = index
+        .snapshot_dep_lines
+        .get(name)
+        .into_iter()
+        .flatten()
+        .filter(|&&(line, _)| {
+            parse_key_line(&lines[line], 6)
+                .is_some_and(|(_, _, rest)| unquote_value(rest) == version)
+        })
+        .map(|&(_, block)| index.snapshots.blocks[block].key.as_str());
     // The `packages:` block of a key: `(header, end)`.
-    let package_block = |key: &str| match index {
-        Some(index) => {
-            let block = &index.packages.blocks[*index.packages.by_key.get(key)?.first()?];
-            Some((block.header, block.end))
-        }
-        None => {
-            let (start, end) = section_bounds(lines, "packages")?;
-            std::iter::successors(next_block(lines, start + 1, end), |b| {
-                next_block(lines, b.end, end)
-            })
-            .find(|b| b.key == key)
-            .map(|b| (b.header, b.end))
-        }
+    let package_block = |key: &str| {
+        let block = &index.packages.blocks[*index.packages.by_key.get(key)?.first()?];
+        Some((block.header, block.end))
     };
     for dependent in dependents {
-        let key = crate::formats::pnpm::strip_pnpm_peer_suffix(&dependent);
+        let key = crate::formats::pnpm::strip_pnpm_peer_suffix(dependent);
         let crate::formats::pnpm::PnpmKey::Registry {
             name: by,
             version: by_version,
