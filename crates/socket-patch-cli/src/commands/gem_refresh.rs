@@ -1986,9 +1986,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (proj, home) = (tmp.path().join("proj"), tmp.path().join("Jane Doe/gemhome"));
         std::fs::create_dir_all(&proj).unwrap();
-        let file = |dir: &str, name: &str| home.join(dir).join(name).display().to_string();
+        let file = |dir: &str, name: &str| shell_word(&home.join(dir).join(name));
         let expected = format!(
-            "run `rm -f '{}' '{}' && bundle install`",
+            "run `rm -f {} {} && bundle install`",
             file("specifications", "rack-1.0.0.gemspec"),
             file("cache", "rack-1.0.0.gem")
         );
@@ -2384,8 +2384,10 @@ mod tests {
         let home = tmp.path().join("vendor/bundle/ruby/3.2.0");
         let gem = installed("json", &home, true);
         let (dir, _) = gem.installed.clone().unwrap();
-        let spec = home.join("specifications/json-1.0.0.gemspec");
-        let cache = home.join("cache/json-1.0.0.gem");
+        // Joined a component at a time, as the code builds them: on Windows
+        // a `/` inside a component stays a `/`.
+        let spec = home.join("specifications").join("json-1.0.0.gemspec");
+        let cache = home.join("cache").join("json-1.0.0.gem");
         std::fs::create_dir_all(home.join("cache")).unwrap();
         std::fs::write(&cache, "").unwrap();
         let reason = "its native extension could not be rebuilt: no Ruby owning this install \
@@ -2393,11 +2395,13 @@ mod tests {
                       x86_64-linux/3.3.0/json-1.0.0, but the installed extension is /p/ruby/\
                       3.2.0/extensions/x86_64-linux/3.2.0/json-1.0.0 (another Ruby's))";
         let policy = policy(tmp.path(), true, false, false);
+        // The command quotes a path as `shell_word` does (a Windows path
+        // holds `\`); the warning's detail below lists the paths as they are.
         let command = format!(
             "`rm -rf {} {} {} && bundle install`",
-            dir.display(),
-            spec.display(),
-            cache.display()
+            shell_word(&dir),
+            shell_word(&spec),
+            shell_word(&cache)
         );
 
         let pass = failed_for(&gem, reason);
@@ -2473,7 +2477,7 @@ mod tests {
         assert!(
             bullet.contains(&format!(
                 "racc 1.0.0. Run `rm -rf {} && bundle install`",
-                dir.display()
+                shell_word(&dir)
             )),
             "{bullet}"
         );
