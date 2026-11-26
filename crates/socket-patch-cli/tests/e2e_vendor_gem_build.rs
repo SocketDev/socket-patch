@@ -2948,6 +2948,11 @@ async fn service_requests(server: &MockServer) -> usize {
 ///   7. `vendor --revert` restores the Gemfile and the lock byte for byte
 ///      (the registry CHECKSUMS tokens included) and removes the trees.
 ///
+/// Before the revert, a copy of the vendored project drops one platform
+/// with `bundle lock --remove-platform`: it still installs frozen, and
+/// `rollback` restores the lock bundler writes for that removal on the
+/// registry lock (#2283).
+///
 /// Run for a gem the Gemfile declares, and for one it only reaches through
 /// another gem (wired by the managed block).
 #[tokio::test(flavor = "multi_thread")]
@@ -3450,6 +3455,73 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
     assert_eq!(artifact_downloads(&update).await, Vec::<String>::new());
     drop(update);
     std::fs::write(&manifest_path, manifest).unwrap();
+
+    // A platform the project drops after the gem is vendored (#2283):
+    // `bundle lock --remove-platform` takes it out of the wired lock,
+    // which still installs frozen, and `rollback` then gives back the lock
+    // the same bundler writes for that removal on the registry lock.
+    let dropped = foreign[1].as_str();
+    let dropped_entry = format!("{PLAT} ({PLAT_VERSION}-{dropped})");
+    let remove_platform = |root: &Path| {
+        let out = bundle(root, &["lock", "--remove-platform", dropped], false);
+        assert!(
+            out.status.success(),
+            "`bundle lock --remove-platform {dropped}` failed in {}:\n{}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(root.join("Gemfile.lock")).unwrap()
+    };
+    let registry = base.join("registry-removed");
+    std::fs::create_dir_all(&registry).unwrap();
+    std::fs::write(registry.join("Gemfile"), &gemfile_before).unwrap();
+    std::fs::write(registry.join("Gemfile.lock"), &lock_before).unwrap();
+    common::fs_tree::copy_tree(&proj.join(".bundle"), &registry.join(".bundle"));
+    let lock_removed = remove_platform(&registry);
+    let removed = base.join("vendored-removed");
+    common::fs_tree::copy_tree(&proj, &removed);
+    // Bundler 2.5 and later drop the platform's spec entries with it; an
+    // older one keeps them, in the registry lock and in the wired one
+    // alike, and the rollback then restores every entry as before.
+    let wired_removed = remove_platform(&removed);
+    assert!(
+        wired_removed.starts_with(&format!("PATH\n  remote: {copy_rel}\n"))
+            && wired_removed.contains(&dropped_entry) == lock_removed.contains(&dropped_entry),
+        "the wired lock loses what the registry lock loses (test premise):\n{wired_removed}"
+    );
+    let ci = bundle(&removed, &["install"], true);
+    assert!(
+        ci.status.success(),
+        "the vendored pair must install frozen without the removed platform.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    let (code, stdout, stderr) = run_socket(
+        &removed,
+        &[
+            "rollback",
+            "--yes",
+            "--json",
+            "--offline",
+            "--cwd",
+            removed.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "rollback after a removed platform failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(removed.join("Gemfile.lock")).unwrap(),
+        lock_removed,
+        "rollback must give back the registry lock without the removed platform"
+    );
+    assert_eq!(
+        std::fs::read(removed.join("Gemfile")).unwrap(),
+        gemfile_before,
+        "rollback must restore the Gemfile byte for byte"
+    );
+    assert!(!removed.join(".socket/vendor").exists());
 
     // 7. Revert: both files byte for byte, every tree gone.
     let (code, stdout, stderr) = run_socket(

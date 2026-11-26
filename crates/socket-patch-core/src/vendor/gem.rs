@@ -4035,7 +4035,8 @@ async fn revert_lock_record(
 
 /// True when the lock already holds the record's reverted state: no PATH
 /// section carries vendor's `remote:` line and every spec-block line of the
-/// pre-vendor original is present.
+/// pre-vendor original is present, but for the blocks of platforms bundler
+/// has since removed from the lock ([`platform_removed`]).
 fn lock_record_converged(text: &str, original_lines: &[String], new_lines: &[String]) -> bool {
     // A record whose `new` lost its `remote:` line is malformed, never
     // converged (the tampered-ledger matrix pins it as drift).
@@ -4050,13 +4051,53 @@ fn lock_record_converged(text: &str, original_lines: &[String], new_lines: &[Str
         return false;
     };
     let gem = &lines[gs..ge];
-    let mut spec_block = original_lines.iter().filter(|l| l.starts_with("    "));
-    let mut any = false;
-    let all_present = spec_block.all(|l| {
-        any = true;
-        gem.contains(l)
-    });
-    any && all_present
+    let spec_block = locked_spec_block(&lines, original_lines);
+    !spec_block.is_empty() && spec_block.iter().all(|l| gem.contains(l))
+}
+
+/// The spec-block lines of a `gemfile_lock_spec` record's pre-vendor
+/// `original` that a revert restores to the lock `lines`: all of them, but
+/// for the blocks of platforms bundler has since removed from the lock
+/// ([`platform_removed`]). All of them as well when that would leave none:
+/// a lock that names no build of the gem is not one a removal made.
+fn locked_spec_block<'a>(lines: &[String], original_lines: &'a [String]) -> Vec<&'a String> {
+    let spec_block: Vec<&String> = original_lines
+        .iter()
+        .filter(|l| l.starts_with("    "))
+        .collect();
+    let mut locked = Vec::with_capacity(spec_block.len());
+    // Whether the block being read (an entry and its dependency lines) is
+    // one of a platform the lock no longer holds.
+    let mut removed = false;
+    for &line in &spec_block {
+        if at_indent(line, 4).is_some() {
+            removed = spec_entry(line).is_some_and(|entry| platform_removed(lines, entry));
+        }
+        if !removed {
+            locked.push(line);
+        }
+    }
+    if locked.is_empty() {
+        spec_block
+    } else {
+        locked
+    }
+}
+
+/// True when the lock `lines` hold nothing of the platform build `entry`
+/// (`(name, "<version>-<platform>")`) of a gem vendored as platform gems:
+/// no spec entry in any section, and no CHECKSUMS line. That is what
+/// `bundle lock --remove-platform` leaves of a platform (it drops the
+/// platform's spec and its CHECKSUMS line together, #2283), so a revert
+/// has nothing of that platform to put back. A lock that keeps either one
+/// is not that removal. Never true of a plain `name (version)` entry (a
+/// RubyGems version holds no `-`).
+fn platform_removed(lines: &[String], entry: (&str, &str)) -> bool {
+    entry.1.contains('-')
+        && !lines.iter().any(|l| spec_entry(l) == Some(entry))
+        && !section_span(lines, "CHECKSUMS").is_some_and(|(start, end)| {
+            (start + 1..end).any(|i| checksum_entry(&lines[i]) == Some(entry))
+        })
 }
 
 fn wiring_string_array(v: Option<&Value>) -> Option<Vec<String>> {
@@ -4075,7 +4116,8 @@ fn wiring_string_array(v: Option<&Value>) -> Option<Vec<String>> {
 /// pair). The search is confined to the CHECKSUMS section so a coincidental
 /// identical line elsewhere (e.g. a DEPENDENCIES entry) is never clobbered.
 /// The line vendor wrote being gone is drift — unless the registry line it
-/// replaced is already back (convergence), left alone either way.
+/// replaced is already back, or bundler removed the line's platform from
+/// the lock (convergence), left alone either way.
 async fn revert_lock_checksum_record(
     files: &mut RevertFiles<'_>,
     w: &WiringRecord,
@@ -4129,6 +4171,12 @@ async fn revert_lock_checksum_record(
             if original.is_some_and(|orig| (ck_start + 1..ck_end).any(|i| lines[i] == orig)) {
                 continue;
             }
+            // ALREADY CONVERGED: bundler removed the platform from the lock
+            // (`bundle lock --remove-platform`), spec and CHECKSUMS line
+            // together, and the lock record restores no spec of it (#2283).
+            if checksum_entry(written).is_some_and(|entry| platform_removed(&lines, entry)) {
+                continue;
+            }
             return Ok(RecordRevert::Drifted);
         };
         let Some(original) = original else {
@@ -4154,26 +4202,25 @@ async fn revert_lock_checksum_record(
 
 /// Pure splice reversing [`edit_lock`]: drop the PATH section vendor emitted,
 /// move the spec block back into GEM/specs at its sorted position, and
-/// restore (or delete) the DEPENDENCIES entry. All preconditions are checked
-/// BEFORE any mutation so drift never yields a half-restored lock; `None`
-/// means "drifted, leave the lock alone".
+/// restore (or delete) the DEPENDENCIES entry. The block of a platform
+/// bundler has since removed from the lock stays out ([`platform_removed`]).
+/// All preconditions are checked BEFORE any mutation so drift never yields a
+/// half-restored lock; `None` means "drifted, leave the lock alone".
 fn revert_lock_text(text: &str, original_lines: &[String], new_lines: &[String]) -> Option<String> {
     let (new_dep_line, path_lines) = new_lines.split_last()?;
     let remote_line = path_lines.get(1)?;
     if !remote_line.starts_with("  remote: ") {
         return None;
     }
-    let spec_block: Vec<&String> = original_lines
-        .iter()
-        .filter(|l| l.starts_with("    "))
-        .collect();
     let source_remote = record_source_remote(original_lines);
     let old_dep_line = original_lines
         .iter()
         .find(|l| l.starts_with("  ") && !l[2..].starts_with(' ') && !l.starts_with("  remote: "));
-    let our_name = spec_entry_name(spec_block.first()?)?.to_string();
 
     let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    // Read off the lock as found: the drain below takes the entries with it.
+    let spec_block = locked_spec_block(&lines, original_lines);
+    let our_name = spec_entry_name(spec_block.first()?)?.to_string();
 
     // Preconditions on the untouched lines.
     let (path_start, path_end) = find_path_section(&lines, remote_line)?;
