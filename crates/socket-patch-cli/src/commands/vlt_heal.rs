@@ -158,11 +158,13 @@ fn reinstall_detail(tally: &HealTally) -> String {
             held,
         )
     } else if tally.undeterminable > 0 {
-        with_optional_kept(
-            undeterminable_detail(tally.undeterminable),
-            tally.optional_left,
-            held,
-        )
+        let mut detail = unchecked_detail(
+            "vlt-lock.json pins Socket-patched packages",
+            tally.undeterminable,
+            "patched",
+        );
+        detail.push('.');
+        with_optional_kept(detail, tally.optional_left, held)
     } else if tally.invalidated > 0 {
         let mut detail = with_optional_kept(
             format!(
@@ -201,7 +203,11 @@ fn rollback_detail(tally: &HealTally, restored: usize) -> Option<String> {
             tally.stale_left
         )
     } else if tally.undeterminable > 0 {
-        undeterminable_detail(tally.undeterminable)
+        unchecked_detail(
+            &format!("restored registry pins for {restored} packages"),
+            tally.undeterminable,
+            "registry",
+        )
     } else if tally.invalidated > 0 && tally.optional_left > 0 {
         format!(
             "restored registry pins for {restored} packages; removed {} patched installed \
@@ -235,7 +241,11 @@ fn takeover_detail(tally: &HealTally, vendored: usize) -> Option<String> {
             tally.stale_left
         )
     } else if tally.undeterminable > 0 {
-        undeterminable_detail(tally.undeterminable)
+        unchecked_detail(
+            &format!("vendored {vendored} hosted-pinned packages"),
+            tally.undeterminable,
+            "vendored",
+        )
     } else if tally.invalidated > 0 && tally.optional_left > 0 {
         format!(
             "vendored {vendored} hosted-pinned packages; removed {} hosted installed copies, so \
@@ -259,11 +269,15 @@ fn takeover_detail(tally: &HealTally, vendored: usize) -> Option<String> {
     Some(with_optional_kept(detail, tally.optional_left, held))
 }
 
-fn undeterminable_detail(n: usize) -> String {
+/// The arm for copies the heal could not judge and so kept. `did` is what
+/// the run did to the lock and `installs` the kind of package the lock now
+/// installs: a rollback's lock no longer pins a Socket patch, so it must
+/// not ask for the patched packages the hosted rewrite asks for.
+fn unchecked_detail(did: &str, unchecked: usize, installs: &str) -> String {
     format!(
-        "vlt-lock.json pins Socket-patched packages, but socket-patch could not check {n} \
-         installed copies (node_modules is a link, or node_modules/.vlt-lock.json is missing \
-         or unreadable); run `vlt ci` to be sure the patched packages are installed."
+        "{did}, but socket-patch could not check {unchecked} installed copies (node_modules \
+         is a link, or node_modules/.vlt-lock.json is missing or unreadable); run `vlt ci` to \
+         be sure the {installs} packages are installed"
     )
 }
 
@@ -465,6 +479,63 @@ mod tests {
         assert!(reinstall_detail(&tally).contains("still holds 3 unpatched copies and"));
     }
 
+    /// A copy the heal could not check is reported in the direction of the
+    /// run, like every other arm: after a rollback the lock no longer pins
+    /// a Socket-patched package, and after a takeover the hosted pin is
+    /// gone.
+    #[test]
+    fn an_unchecked_copy_is_reported_in_the_direction_of_the_run() {
+        let tally = HealTally {
+            undeterminable: 1,
+            ..HealTally::default()
+        };
+        let unchecked = "socket-patch could not check 1 installed copies (node_modules is a \
+                         link, or node_modules/.vlt-lock.json is missing or unreadable)";
+        assert_eq!(
+            reinstall_detail(&tally),
+            format!(
+                "vlt-lock.json pins Socket-patched packages, but {unchecked}; run `vlt ci` to \
+                 be sure the patched packages are installed."
+            )
+        );
+        assert_eq!(
+            rollback_detail(&tally, 2).unwrap(),
+            format!(
+                "restored registry pins for 2 packages, but {unchecked}; run `vlt ci` to be \
+                 sure the registry packages are installed"
+            )
+        );
+        assert_eq!(
+            takeover_detail(&tally, 2).unwrap(),
+            format!(
+                "vendored 2 hosted-pinned packages, but {unchecked}; run `vlt ci` to be sure \
+                 the vendored packages are installed"
+            )
+        );
+
+        // The kept optional copies follow as their own sentence.
+        let tally = HealTally {
+            optional_left: 3,
+            ..tally
+        };
+        let rollback = rollback_detail(&tally, 2).unwrap();
+        assert!(
+            rollback.contains(
+                "be sure the registry packages are installed. node_modules also still holds 3 \
+                 patched copies of optional dependencies; "
+            ),
+            "{rollback}"
+        );
+        let takeover = takeover_detail(&tally, 2).unwrap();
+        assert!(
+            takeover.contains(
+                "be sure the vendored packages are installed. node_modules also still holds 3 \
+                 installed copies of the vendored optional dependencies; "
+            ),
+            "{takeover}"
+        );
+    }
+
     #[test]
     fn kept_optional_copies_are_reported_alongside_every_variant() {
         let optional = |invalidated, stale_left, undeterminable| HealTally {
@@ -505,7 +576,12 @@ mod tests {
         );
         assert_eq!(
             reinstall_detail(&optional(0, 0, 1)),
-            format!("{} {unpatched}", undeterminable_detail(1))
+            format!(
+                "vlt-lock.json pins Socket-patched packages, but socket-patch could not check 1 \
+                 installed copies (node_modules is a link, or node_modules/.vlt-lock.json is \
+                 missing or unreadable); run `vlt ci` to be sure the patched packages are \
+                 installed. {unpatched}"
+            )
         );
 
         assert_eq!(

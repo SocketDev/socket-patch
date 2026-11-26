@@ -542,6 +542,38 @@ async fn vlt_failed_vendor_after_the_takeover_revert_keeps_the_hosted_pin() {
     );
 }
 
+/// A takeover that cannot check the hosted store copy (no hidden lock)
+/// keeps it and reports it as a takeover: the package is vendored now, so
+/// the advisory does not speak of a pin in `vlt-lock.json`.
+#[tokio::test(flavor = "multi_thread")]
+async fn vlt_hosted_then_vendored_takeover_reports_an_unchecked_copy_as_a_takeover() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    hosted_project(root, &server).await;
+    std::fs::remove_file(root.join("node_modules/.vlt-lock.json")).unwrap();
+
+    let (code, env, stderr) = scan(root, &server, "vendored", &[]);
+
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert!(
+        hosted::read(root, "vlt-lock.json").contains(&rel()),
+        "{env:#}"
+    );
+    assert_eq!(
+        detail_of(&env, "redirect_vlt_reinstall_required"),
+        "vendored 1 hosted-pinned packages, but socket-patch could not check 1 installed copies \
+         (node_modules is a link, or node_modules/.vlt-lock.json is missing or unreadable); run \
+         `vlt ci` to be sure the vendored packages are installed"
+    );
+    assert_eq!(
+        std::fs::read(hosted::store_dir(root, TILDE_ID).join("index.js")).unwrap(),
+        PATCHED,
+        "a copy the heal cannot judge is kept"
+    );
+}
+
 /// An optional hosted pin taken over by `scan --mode vendored`: the
 /// hosted store copy stays (vlt would not reinstall a removed optional
 /// node), and the advisory says how to refresh it.
