@@ -1426,11 +1426,8 @@ fn select_with_policy(
     filtered: &mut Vec<FilteredEntry>,
     skipped: &mut Vec<SkippedPatch>,
 ) -> Offers {
-    // A gem is patched through the patch of the gem itself: the patch of
-    // one of its platform gems is no offer of its own here.
     let accessible: Vec<PatchSearchResult> = results
         .into_iter()
-        .filter(|p| !crate::hosted::engine::is_platform_gem_patch(&p.purl))
         .filter(|p| can_access_paid || p.tier == "free")
         .collect();
     let (admitted, dropped) = if policy.enabled() {
@@ -1656,53 +1653,6 @@ mod tests {
             policy_skipped: Vec::new(),
             error: None,
         }
-    }
-
-    /// The patch service has a patch record per patched platform gem
-    /// beside the gem's own. Here a gem is patched through its own patch,
-    /// so the platform gem's record is no offer: it is neither selected
-    /// nor reported as filtered or skipped.
-    #[test]
-    fn a_platform_gems_own_patch_is_no_offer() {
-        let found = |uuid: &str, purl: &str| PatchSearchResult {
-            uuid: uuid.to_string(),
-            purl: purl.to_string(),
-            published_at: "2026-01-01T00:00:00Z".to_string(),
-            description: String::new(),
-            license: "MIT".to_string(),
-            tier: "free".to_string(),
-            vulnerabilities: Default::default(),
-        };
-        let results = vec![
-            found("b", "pkg:gem/nokogiri@1.19.3?platform=x86_64-linux-gnu"),
-            found("a", "pkg:gem/nokogiri@1.19.3"),
-            found("r", "pkg:gem/rack@3.1.8?platform=ruby"),
-        ];
-        let (mut filtered, mut skipped) = (Vec::new(), Vec::new());
-        let offers = select_with_policy(
-            &SelectionPolicy::unrestricted(),
-            results,
-            false,
-            "",
-            &mut filtered,
-            &mut skipped,
-        );
-        let selected: Vec<(&str, &str)> = offers
-            .selected
-            .iter()
-            .map(|(purl, patch)| (purl.as_str(), patch.uuid.as_str()))
-            .collect();
-        assert_eq!(
-            selected,
-            [
-                ("pkg:gem/nokogiri@1.19.3", "a"),
-                ("pkg:gem/rack@3.1.8?platform=ruby", "r"),
-            ]
-        );
-        assert!(filtered.is_empty() && skipped.is_empty());
-        assert!(!offers
-            .unfiltered
-            .contains_key("pkg:gem/nokogiri@1.19.3?platform=x86_64-linux-gnu"));
     }
 
     fn rewritten(files: &[(&str, &str)]) -> Rewritten {

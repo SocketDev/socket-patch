@@ -29,7 +29,7 @@ use std::pin::Pin;
 use futures_util::future::Either;
 use serde::{Deserialize, Serialize};
 
-use crate::api::types::PackageVendorResult;
+use crate::api::types::{BatchSearchResponse, PackageVendorResult, SearchResponse};
 use crate::constants::npm_family::VLT_HIDDEN_LOCK_REL;
 use crate::crawlers::maven_selection::MavenSelection;
 use crate::formats::cargo::source_replacement::CratesIoSource;
@@ -145,12 +145,51 @@ pub fn unconfirmed_candidates(
 /// A hosted or a vendored run patches a gem through the patch of the gem
 /// itself, whose package reference names the patched build of every
 /// platform. The patch of a platform gem is no fix of its own there: such
-/// a run leaves it out of what it selects, before anything is reported,
-/// looked up or written, so the gem is one package with one patch.
+/// a run leaves it out of what the patch service answers
+/// ([`leave_out_platform_gem_patches`]), before anything is selected,
+/// reported, looked up or written, so the gem is one package with one
+/// patch.
 pub fn is_platform_gem_patch(purl: &str) -> bool {
     crate::crawlers::Ecosystem::from_purl(purl) == Some(crate::crawlers::Ecosystem::Gem)
         && crate::utils::purl::purl_qualifier(purl, "platform")
             .is_some_and(|platform| !platform.is_empty() && !platform.eq_ignore_ascii_case("ruby"))
+}
+
+/// What the patch service answers a search with, in either shape: the
+/// patches found for one question ([`SearchResponse`]), or the packages of
+/// a batch, each with its patches ([`BatchSearchResponse`]).
+pub trait SearchAnswer {
+    /// Keep the patches whose purl `keep` takes. A package of a batch that
+    /// is left with no patch goes too: it has none on offer.
+    fn retain_patches(&mut self, keep: impl FnMut(&str) -> bool);
+}
+
+impl SearchAnswer for SearchResponse {
+    fn retain_patches(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.patches.retain(|patch| keep(&patch.purl));
+    }
+}
+
+impl SearchAnswer for BatchSearchResponse {
+    fn retain_patches(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        for package in &mut self.packages {
+            package.patches.retain(|patch| keep(&patch.purl));
+        }
+        self.packages.retain(|package| !package.patches.is_empty());
+    }
+}
+
+/// Leave the patches of platform gems ([`is_platform_gem_patch`]) out of
+/// a search answer: the one filter of a hosted or a vendored run, applied
+/// where the patch service's answer comes in, so that no later step sees
+/// such a patch as an offer. The disk hosts' API client applies it to
+/// every search it answers
+/// ([`crate::api::client::ApiClient::offering_platform_gem_patches`]), and
+/// the in-memory engine to what its provider answers. Agent mode does not:
+/// there the patch of a platform gem is what an installed copy of that
+/// platform gem takes.
+pub fn leave_out_platform_gem_patches(answer: &mut impl SearchAnswer) {
+    answer.retain_patches(|purl| !is_platform_gem_patch(purl));
 }
 
 /// Skip reason of a gem the Bundler lock names as precompiled platform
@@ -13428,6 +13467,104 @@ snapshots:
                 "rails 7.0.0: the patch registry does not list arm64-darwin, x86_64-linux-gnu, \
                  so the gem is left as it is"
             )
+        );
+    }
+
+    /// The patch service returns the patch of each platform gem of a gem
+    /// beside the patch of the gem itself. The filter of a hosted or a
+    /// vendored run leaves them out of either answer shape: the gem keeps
+    /// its own patch, a package offered nothing else leaves a batch, and
+    /// the release variants of every other ecosystem (and a gem's `ruby`
+    /// platform) stay.
+    #[test]
+    fn platform_gem_patches_are_left_out_of_either_search_answer() {
+        assert!(is_platform_gem_patch("pkg:gem/a@1?platform=x64-mingw-ucrt"));
+        for kept in [
+            "pkg:gem/a@1",
+            "pkg:gem/a@1?platform=ruby",
+            "pkg:gem/a@1?platform=RUBY",
+            "pkg:gem/a@1?platform=",
+            "pkg:npm/a@1?platform=java",
+        ] {
+            assert!(!is_platform_gem_patch(kept), "{kept}");
+        }
+
+        // What a search finds: `(uuid, purl)` of each patch.
+        let found = [
+            (
+                "linux",
+                "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu",
+            ),
+            ("source", "pkg:gem/nokogiri@1.18.10?platform=ruby"),
+            ("darwin", "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin"),
+            ("java", "pkg:gem/ffi@1.17.0?platform=java"),
+            ("rack", "pkg:gem/rack@3.1.8"),
+            ("wheel", "pkg:pypi/six@1.16.0?artifact_id=py2.py3-none-any"),
+        ];
+        let kept = ["source", "rack", "wheel"];
+
+        let mut by_package: SearchResponse = serde_json::from_value(serde_json::json!({
+            "patches": found.iter().map(|(uuid, purl)| serde_json::json!({
+                "uuid": uuid, "purl": purl, "publishedAt": "2026-01-01T00:00:00Z",
+                "description": "", "license": "MIT", "tier": "free", "vulnerabilities": {},
+            })).collect::<Vec<_>>(),
+            "canAccessPaidPatches": true,
+        }))
+        .unwrap();
+        leave_out_platform_gem_patches(&mut by_package);
+        let uuids: Vec<&str> = by_package.patches.iter().map(|p| p.uuid.as_str()).collect();
+        assert_eq!(uuids, kept);
+        assert!(by_package.can_access_paid_patches);
+
+        let offered = |uuid: &str, purl: &str| {
+            serde_json::json!({
+                "uuid": uuid, "purl": purl, "tier": "free", "cveIds": [], "ghsaIds": [],
+                "severity": "high", "title": "",
+            })
+        };
+        let package = |purl: &str, uuids: &[&str]| {
+            let patches: Vec<_> = found
+                .iter()
+                .filter(|(uuid, _)| uuids.contains(uuid))
+                .map(|(uuid, purl)| offered(uuid, purl))
+                .collect();
+            serde_json::json!({ "purl": purl, "patches": patches })
+        };
+        let mut batch: BatchSearchResponse = serde_json::from_value(serde_json::json!({
+            "packages": [
+                package("pkg:gem/nokogiri@1.18.10", &["linux", "source", "darwin"]),
+                package("pkg:gem/ffi@1.17.0", &["java"]),
+                package("pkg:gem/rack@3.1.8", &["rack"]),
+                package("pkg:pypi/six@1.16.0", &["wheel"]),
+            ],
+            "canAccessPaidPatches": false,
+        }))
+        .unwrap();
+        batch.unanswered.push(crate::api::types::UnansweredPurl {
+            purl: "pkg:gem/racc@1.8.1".into(),
+            error: "timed out".into(),
+        });
+        leave_out_platform_gem_patches(&mut batch);
+        let left: Vec<(&str, Vec<&str>)> = batch
+            .packages
+            .iter()
+            .map(|package| {
+                let uuids = package.patches.iter().map(|patch| patch.uuid.as_str());
+                (package.purl.as_str(), uuids.collect())
+            })
+            .collect();
+        assert_eq!(
+            left,
+            [
+                ("pkg:gem/nokogiri@1.18.10", vec!["source"]),
+                ("pkg:gem/rack@3.1.8", vec!["rack"]),
+                ("pkg:pypi/six@1.16.0", vec!["wheel"]),
+            ]
+        );
+        assert_eq!(
+            batch.unanswered.len(),
+            1,
+            "what was not answered stays said"
         );
     }
 

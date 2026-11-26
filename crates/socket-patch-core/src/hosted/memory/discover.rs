@@ -15,6 +15,7 @@ use std::time::Duration;
 use crate::api::client::{ApiError, ApiFuture, PatchApi};
 use crate::api::ranking::cmp_search_results;
 use crate::api::types::{BatchPackagePatches, PackageVendorResult, SearchResponse};
+use crate::hosted::engine::leave_out_platform_gem_patches;
 use crate::hosted::npm_manifest::HostedClassicArtifact;
 use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use crate::utils::purl_key::PurlKey;
@@ -65,6 +66,12 @@ pub(crate) async fn join_bounded<'a, T>(futures: Vec<BoxFuture<'a, T>>, limit: u
 }
 
 /// The host's [`PatchApi`] behind per-call timeouts and call counting.
+///
+/// What it answers a search with is where the patch service's offers come
+/// into the engine, and the engine patches a gem through the patch of the
+/// gem itself: both searches leave the patches of platform gems out
+/// ([`leave_out_platform_gem_patches`]), so no later stage counts,
+/// selects or reports one.
 pub(crate) struct Provider {
     api: Arc<dyn PatchApi>,
     timeout: Duration,
@@ -107,6 +114,7 @@ impl Provider {
             .call("searchPatchesBatch", self.api.search_patches_batch(purls))
             .await?;
         crate::api::client::sort_batch_response(&mut response);
+        leave_out_platform_gem_patches(&mut response);
         Ok(response)
     }
 
@@ -121,6 +129,7 @@ impl Provider {
             )
             .await?;
         response.patches.sort_by(cmp_search_results);
+        leave_out_platform_gem_patches(&mut response);
         Ok(response)
     }
 
@@ -623,5 +632,132 @@ mod tests {
             outcome.roots["b"].packages.is_empty(),
             "a NuGet package must not be credited to a root that never asked for it"
         );
+    }
+
+    /// Answers a search with the patch of a gem beside the patch of one
+    /// of its platform gems, and the batch search with a second gem that
+    /// only a platform gem's patch is offered for.
+    struct PlatformGemRecords;
+
+    impl PatchApi for PlatformGemRecords {
+        fn uses_public_proxy(&self) -> bool {
+            false
+        }
+        fn search_patches_batch<'a>(
+            &'a self,
+            _purls: &'a [String],
+        ) -> ApiFuture<'a, crate::api::types::BatchSearchResponse> {
+            let listed = |uuid: &str, purl: &str| {
+                serde_json::json!({
+                    "uuid": uuid, "purl": purl, "tier": "free", "cveIds": [], "ghsaIds": [],
+                    "severity": "high", "title": "",
+                })
+            };
+            let answer = serde_json::json!({
+                "packages": [
+                    { "purl": "pkg:gem/nokogiri@1.19.3", "patches": [
+                        listed("linux", "pkg:gem/nokogiri@1.19.3?platform=x86_64-linux-gnu"),
+                        listed("source", "pkg:gem/nokogiri@1.19.3"),
+                    ]},
+                    { "purl": "pkg:gem/ffi@1.17.0", "patches": [
+                        listed("java", "pkg:gem/ffi@1.17.0?platform=java"),
+                    ]},
+                ],
+                "canAccessPaidPatches": false,
+            });
+            Box::pin(async move { Ok(serde_json::from_value(answer).unwrap()) })
+        }
+        fn search_patches_by_package<'a>(
+            &'a self,
+            _purl: &'a str,
+        ) -> ApiFuture<'a, crate::api::types::SearchResponse> {
+            let patches = vec![
+                result(
+                    "pkg:gem/nokogiri@1.19.3?platform=x86_64-linux-gnu",
+                    "linux",
+                    "free",
+                    "critical",
+                ),
+                result("pkg:gem/nokogiri@1.19.3", "source", "free", "high"),
+                result("pkg:gem/rack@3.1.8?platform=ruby", "rack", "free", "high"),
+            ];
+            Box::pin(async move {
+                Ok(crate::api::types::SearchResponse {
+                    patches,
+                    can_access_paid_patches: false,
+                })
+            })
+        }
+        fn fetch_registry_references<'a>(
+            &'a self,
+            _uuids: &'a [String],
+        ) -> ApiFuture<'a, HashMap<String, crate::api::types::PackageVendorResult>> {
+            Box::pin(async { Err(ApiError::Other("unused".into())) })
+        }
+        fn download_artifact<'a>(&'a self, _url: &'a str, _max: u64) -> ApiFuture<'a, Vec<u8>> {
+            Box::pin(async { Err(ApiError::Other("unused".into())) })
+        }
+    }
+
+    /// The patch service has a patch record per patched platform gem
+    /// beside the gem's own. The engine patches a gem through its own
+    /// patch, so what the provider answers comes in without those records:
+    /// a root is credited the gem with its one patch, a gem offered only a
+    /// platform gem's patch is no package with a patch, and the details of
+    /// a package hold no platform gem's patch to select or to report as
+    /// filtered or skipped.
+    #[tokio::test]
+    async fn a_platform_gems_own_patch_is_no_offer() {
+        let provider = Provider::new(Arc::new(PlatformGemRecords), Duration::from_secs(5), 2);
+        let mut roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        roots.insert(
+            String::new(),
+            vec![
+                "pkg:gem/ffi@1.17.0".to_string(),
+                "pkg:gem/nokogiri@1.19.3".to_string(),
+            ],
+        );
+        let outcome = batch_search(&provider, &roots, 10).await;
+        let packages: Vec<(&str, Vec<&str>)> = outcome.roots[""]
+            .packages
+            .iter()
+            .map(|package| {
+                let uuids = package.patches.iter().map(|patch| patch.uuid.as_str());
+                (package.purl.as_str(), uuids.collect())
+            })
+            .collect();
+        assert_eq!(packages, [("pkg:gem/nokogiri@1.19.3", vec!["source"])]);
+        assert_eq!(outcome.roots[""].failed_purls, 0);
+
+        let purls = BTreeSet::from(["pkg:gem/nokogiri@1.19.3".to_string()]);
+        let details = fetch_details(&provider, &purls).await;
+        let found = details["pkg:gem/nokogiri@1.19.3"]
+            .as_ref()
+            .expect("answered");
+        let (mut filtered, mut skipped) = (Vec::new(), Vec::new());
+        let offers = super::super::select_with_policy(
+            &crate::policy::SelectionPolicy::unrestricted(),
+            found.patches.clone(),
+            false,
+            "",
+            &mut filtered,
+            &mut skipped,
+        );
+        let selected: Vec<(&str, &str)> = offers
+            .selected
+            .iter()
+            .map(|(purl, patch)| (purl.as_str(), patch.uuid.as_str()))
+            .collect();
+        assert_eq!(
+            selected,
+            [
+                ("pkg:gem/nokogiri@1.19.3", "source"),
+                ("pkg:gem/rack@3.1.8?platform=ruby", "rack"),
+            ]
+        );
+        assert!(filtered.is_empty() && skipped.is_empty());
+        assert!(!offers
+            .unfiltered
+            .contains_key("pkg:gem/nokogiri@1.19.3?platform=x86_64-linux-gnu"));
     }
 }

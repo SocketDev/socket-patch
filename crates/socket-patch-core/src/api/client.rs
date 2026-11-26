@@ -377,6 +377,9 @@ pub struct ApiClient {
     /// The lookups this client has answered, when it remembers them
     /// ([`Self::remembering_lookups`]). Shared by clones.
     lookups: Option<Arc<Lookups>>,
+    /// Whether a search answers without the patches of platform gems
+    /// ([`Self::offering_platform_gem_patches`]).
+    no_platform_gem_patches: bool,
 }
 
 /// What the patch service answered a client that remembers its lookups
@@ -633,6 +636,7 @@ impl ApiClient {
             vendor_prefetch: Arc::new(std::sync::Mutex::new(None)),
             api_retry: ApiRetry::from_env(),
             lookups: None,
+            no_platform_gem_patches: false,
         }
     }
 
@@ -646,6 +650,48 @@ impl ApiClient {
     pub fn remembering_lookups(mut self) -> Self {
         self.lookups.get_or_insert_with(Default::default);
         self
+    }
+
+    /// This client as a run asks it about platform gems. A hosted or a
+    /// vendored run patches a gem through the patch of the gem itself, so
+    /// its client is not `offered` the patch of a platform gem: every
+    /// search it answers (by package, by CVE, by GHSA and the batch search)
+    /// leaves those patches out, and a package of a batch they leave with
+    /// no patch
+    /// ([`crate::hosted::engine::leave_out_platform_gem_patches`]). This is
+    /// the one place such a run narrows what the patch service offers:
+    /// nothing is selected, reported, counted or looked up for a patch its
+    /// client never returns. Agent mode is `offered` them, as every client
+    /// is until it is told otherwise. A patch asked for by its UUID
+    /// ([`Self::fetch_patch`]) is returned whatever it patches.
+    ///
+    /// What the client remembers ([`Self::remembering_lookups`]) is what
+    /// the patch service answered, so clones that share one memory can be
+    /// asked both ways (the directories of one run can differ in mode).
+    /// The client a run falls back to on the public proxy answers as the
+    /// one it is made from ([`Self::proxy_fallback`]).
+    pub fn offering_platform_gem_patches(mut self, offered: bool) -> Self {
+        self.no_platform_gem_patches = !offered;
+        self
+    }
+
+    /// `answer` as this client hands back a search answer
+    /// ([`Self::offering_platform_gem_patches`]).
+    fn offered<A: crate::hosted::engine::SearchAnswer>(&self, mut answer: A) -> A {
+        if self.no_platform_gem_patches {
+            crate::hosted::engine::leave_out_platform_gem_patches(&mut answer);
+        }
+        answer
+    }
+
+    /// The public-proxy client a run falls back to when the API refuses
+    /// this client's token ([`build_proxy_fallback_client`]), answering a
+    /// search as this client does
+    /// ([`Self::offering_platform_gem_patches`]).
+    pub fn proxy_fallback(&self, overrides: &ApiClientEnvOverrides) -> ApiClient {
+        let mut proxy = build_proxy_fallback_client(overrides);
+        proxy.no_platform_gem_patches = self.no_platform_gem_patches;
+        proxy
     }
 
     /// Override the JSON calls' 429 / 503 retry policy and clock hooks
@@ -1133,14 +1179,18 @@ impl ApiClient {
 
     /// Search patches by CVE ID.
     pub async fn search_patches_by_cve(&self, cve_id: &str) -> Result<SearchResponse, ApiError> {
-        self.search_patches_by_route("by-cve", cve_id, self.search_bare_404())
-            .await
+        let answer = self
+            .search_patches_by_route("by-cve", cve_id, self.search_bare_404())
+            .await?;
+        Ok(self.offered(answer))
     }
 
     /// Search patches by GHSA ID.
     pub async fn search_patches_by_ghsa(&self, ghsa_id: &str) -> Result<SearchResponse, ApiError> {
-        self.search_patches_by_route("by-ghsa", ghsa_id, self.search_bare_404())
-            .await
+        let answer = self
+            .search_patches_by_route("by-ghsa", ghsa_id, self.search_bare_404())
+            .await?;
+        Ok(self.offered(answer))
     }
 
     /// Search patches by package PURL.
@@ -1151,7 +1201,7 @@ impl ApiClient {
         if let Some(lookups) = &self.lookups {
             let held = lookups.by_package.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(answer) = held.get(purl) {
-                return Ok(answer.clone());
+                return Ok(self.offered(answer.clone()));
             }
         }
         let answer = self
@@ -1164,7 +1214,7 @@ impl ApiClient {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(purl.to_string(), answer.clone());
         }
-        Ok(answer)
+        Ok(self.offered(answer))
     }
 
     /// Search patches for multiple packages (batch).
@@ -1191,13 +1241,13 @@ impl ApiClient {
         purls: &[String],
     ) -> Result<BatchSearchResponse, ApiError> {
         if let Some(answer) = self.lookups.as_ref().and_then(|l| l.batch(purls)) {
-            return Ok(answer);
+            return Ok(self.offered(answer));
         }
         let answer = self.search_patches_batch_asking(purls).await?;
         if let Some(lookups) = &self.lookups {
             lookups.remember_batch(purls, &answer);
         }
-        Ok(answer)
+        Ok(self.offered(answer))
     }
 
     /// [`Self::search_patches_batch`], always by asking the service.
@@ -2976,10 +3026,12 @@ fn proxy_client_at(proxy_url: String) -> ApiClient {
 /// Build a public-proxy `ApiClient` from the same overrides used by
 /// [`get_api_client_with_overrides`], ignoring any API token.
 ///
-/// Used by `scan` and `get` to retry against the public proxy after
-/// the authenticated endpoint returns 401/403 — a stale/revoked token
-/// shouldn't block access to free patches. The auth header is
-/// deliberately dropped (`api_token: None`).
+/// For the retry against the public proxy after the authenticated
+/// endpoint returns 401/403 — a stale/revoked token shouldn't block
+/// access to free patches. The auth header is deliberately dropped
+/// (`api_token: None`). A run whose client answers for a hosted or a
+/// vendored run (`scan`, `get`) makes its fallback from that client
+/// ([`ApiClient::proxy_fallback`]), so both answer a search alike.
 pub fn build_proxy_fallback_client(overrides: &ApiClientEnvOverrides) -> ApiClient {
     let proxy_url = overrides
         .proxy_url
@@ -7236,6 +7288,217 @@ mod lookup_memory_tests {
             .await
             .unwrap();
         assert_eq!(requests(&server).await, 4);
+    }
+}
+
+#[cfg(test)]
+mod platform_gem_patch_tests {
+    //! A client made for a hosted or a vendored run answers every search
+    //! without the patches of platform gems: asked or remembered, on the
+    //! organisation's route and on the public proxy it falls back to. Any
+    //! other client is answered in full.
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const GEM: &str = "pkg:gem/nokogiri@1.19.3";
+    const LINUX: &str = "pkg:gem/nokogiri@1.19.3?platform=x86_64-linux-gnu";
+    /// A gem whose only patch on offer is one platform gem's.
+    const FFI: &str = "pkg:gem/ffi@1.17.0";
+    const FFI_JAVA: &str = "pkg:gem/ffi@1.17.0?platform=java";
+
+    /// A patch service that answers every search, on the organisation's
+    /// routes and on the public proxy's, with the gem's own patch
+    /// (`source`) beside the patch of its linux gem (`linux`), and the
+    /// batch search with a second gem that only a platform gem's patch
+    /// (`java`) is offered for.
+    async fn service() -> MockServer {
+        let found = |uuid: &str, purl: &str| {
+            json!({
+                "uuid": uuid, "purl": purl, "publishedAt": "2026-01-01T00:00:00Z",
+                "description": "", "license": "MIT", "tier": "free", "vulnerabilities": {},
+            })
+        };
+        let listed = |uuid: &str, purl: &str| {
+            json!({
+                "uuid": uuid, "purl": purl, "tier": "free", "cveIds": [], "ghsaIds": [],
+                "severity": "high", "title": "",
+            })
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "^(/v0/orgs/acme/patches|/patch)/by-(package|cve|ghsa)/.+$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "patches": [found("linux", LINUX), found("source", GEM)],
+                "canAccessPaidPatches": true,
+            })))
+            .mount(&server)
+            .await;
+        for route in ["/v0/orgs/acme/patches/batch", "/patch/batch"] {
+            Mock::given(method("POST"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "packages": [
+                        { "purl": GEM, "patches": [listed("linux", LINUX), listed("source", GEM)] },
+                        { "purl": FFI, "patches": [listed("java", FFI_JAVA)] },
+                    ],
+                    "canAccessPaidPatches": true,
+                })))
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    fn org_client(uri: String) -> ApiClient {
+        ApiClient::new(ApiClientOptions {
+            api_url: uri,
+            api_token: Some("sktsec_token_placeholder_value_api".into()),
+            route: ApiRoute::org("acme"),
+        })
+    }
+
+    /// The uuids of every search of `client`: by package, by CVE, by GHSA,
+    /// and each package of the batch search with its patches' uuids, by
+    /// purl.
+    async fn answers(client: &ApiClient) -> (Vec<Vec<String>>, Vec<(String, Vec<String>)>) {
+        let uuids = |answer: SearchResponse| -> Vec<String> {
+            assert!(answer.can_access_paid_patches);
+            let mut uuids: Vec<String> = answer.patches.into_iter().map(|p| p.uuid).collect();
+            uuids.sort();
+            uuids
+        };
+        let searches = vec![
+            uuids(client.search_patches_by_package(GEM).await.unwrap()),
+            uuids(client.search_patches_by_cve("CVE-2026-0001").await.unwrap()),
+            uuids(
+                client
+                    .search_patches_by_ghsa("GHSA-aaaa-bbbb-cccc")
+                    .await
+                    .unwrap(),
+            ),
+        ];
+        let asked = [GEM.to_string(), FFI.to_string()];
+        let batch = client.search_patches_batch(&asked).await.unwrap();
+        assert!(batch.can_access_paid_patches);
+        let mut packages: Vec<(String, Vec<String>)> = batch
+            .packages
+            .into_iter()
+            .map(|package| {
+                let mut uuids: Vec<String> = package.patches.into_iter().map(|p| p.uuid).collect();
+                uuids.sort();
+                (package.purl, uuids)
+            })
+            .collect();
+        packages.sort();
+        (searches, packages)
+    }
+
+    /// What the patch service answers.
+    fn all() -> (Vec<Vec<String>>, Vec<(String, Vec<String>)>) {
+        let both = vec!["linux".to_string(), "source".to_string()];
+        (
+            vec![both.clone(); 3],
+            vec![
+                (FFI.to_string(), vec!["java".to_string()]),
+                (GEM.to_string(), both),
+            ],
+        )
+    }
+
+    fn own_patch_alone() -> (Vec<Vec<String>>, Vec<(String, Vec<String>)>) {
+        let own = vec!["source".to_string()];
+        (vec![own.clone(); 3], vec![(GEM.to_string(), own)])
+    }
+
+    async fn requests(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap_or_default().len()
+    }
+
+    #[tokio::test]
+    async fn a_client_for_a_hosted_or_a_vendored_run_answers_no_platform_gem_patch() {
+        let server = service().await;
+        let client = org_client(server.uri());
+        assert_eq!(answers(&client).await, all(), "any other run");
+        let narrowed = client.offering_platform_gem_patches(false);
+        assert_eq!(answers(&narrowed).await, own_patch_alone());
+        // The same client asked for a run in agent mode (another
+        // directory of the invocation) answers in full again.
+        assert_eq!(
+            answers(&narrowed.offering_platform_gem_patches(true)).await,
+            all()
+        );
+    }
+
+    /// What a client remembers is what the patch service answered: the
+    /// answer it gives from memory is narrowed as the one it asked for
+    /// was, and a clone that was not made for such a run is answered in
+    /// full from the same memory, whichever of the two asked.
+    #[tokio::test]
+    async fn remembered_answers_are_narrowed_like_asked_ones() {
+        for narrowed_asks in [true, false] {
+            let server = service().await;
+            let full = org_client(server.uri()).remembering_lookups();
+            let narrowed = full.clone().offering_platform_gem_patches(false);
+            let (first, second) = if narrowed_asks {
+                (&narrowed, &full)
+            } else {
+                (&full, &narrowed)
+            };
+            let expected = |client: &ApiClient| {
+                if std::ptr::eq(client, &narrowed) {
+                    own_patch_alone()
+                } else {
+                    all()
+                }
+            };
+            assert_eq!(answers(first).await, expected(first));
+            // By package and the batch are remembered; by CVE and by GHSA
+            // are asked each time.
+            let asked = requests(&server).await;
+            assert_eq!(asked, 4);
+            assert_eq!(answers(first).await, expected(first));
+            assert_eq!(answers(second).await, expected(second));
+            assert_eq!(
+                requests(&server).await,
+                asked + 4,
+                "only the advisory searches were asked again"
+            );
+        }
+    }
+
+    /// The public-proxy client a run falls back to answers as the client
+    /// it was made from does, on the proxy's own routes.
+    #[tokio::test]
+    async fn the_proxy_fallback_answers_as_its_client_does() {
+        let server = service().await;
+        let overrides = ApiClientEnvOverrides {
+            proxy_url: Some(server.uri()),
+            ..ApiClientEnvOverrides::default()
+        };
+        let client = org_client("http://127.0.0.1:1".to_string());
+        let proxy = client.proxy_fallback(&overrides);
+        assert!(proxy.uses_public_proxy());
+        assert_eq!(answers(&proxy).await, all());
+
+        let narrowed = client.offering_platform_gem_patches(false);
+        let proxy = narrowed.proxy_fallback(&overrides);
+        assert!(proxy.uses_public_proxy() && proxy.api_token().is_none());
+        assert_eq!(answers(&proxy).await, own_patch_alone());
+        let asked: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert!(
+            asked.iter().all(|path| path.starts_with("/patch/")),
+            "{asked:?}"
+        );
     }
 }
 
