@@ -61,4 +61,4 @@ The full list is in `known-non-bugs/bundler.md` on this branch. Search it with `
 - "the patched gem's gemspec differs from the installed one" after a hosted scan: a mock gem rebuilt with `gem build`. Repack with the original `metadata.gz`.
 - `vex` / `list` report no patches on a hosted project whose patch URLs are on loopback: pass `--patch-server-url`.
 - `vex` exits 2 asking for a product when the project has no git origin or gemspec: pass `--product`.
-- In a project with patches of two modes, `scan --mode agent` says "N vulnerabilities left to patch … in packages this run did not patch" for the vendored gems: reported inside #2269, do not file again.
+- Two modes in one project: `scan --mode agent` counts the vendored gems as "left to patch": inside #2269.
