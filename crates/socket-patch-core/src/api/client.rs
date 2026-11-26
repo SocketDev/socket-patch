@@ -2665,6 +2665,10 @@ fn api_client(api_token: Option<&str>, timeouts: &ApiTimeouts) -> reqwest::Clien
 /// public-proxy POST and the grant-tokenized serve GETs, where sending the
 /// Socket bearer would leak it to a third party. Bounded by `timeouts`,
 /// like the authenticated client.
+///
+/// A serve URL holds its grant token in the path, and a serve route can
+/// answer with a redirect to another host, which the client follows. No
+/// `Referer` is set on the way: it would hand that URL to the next host.
 fn plain_client(timeouts: &ApiTimeouts) -> reqwest::Client {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -2672,7 +2676,11 @@ fn plain_client(timeouts: &ApiTimeouts) -> reqwest::Client {
         HeaderValue::from_static(USER_AGENT_VALUE),
     );
     timeouts
-        .apply(crate::utils::http::client_builder().default_headers(headers))
+        .apply(
+            crate::utils::http::client_builder()
+                .default_headers(headers)
+                .referer(false),
+        )
         .build()
         .expect("failed to build plain reqwest client")
 }
@@ -5903,6 +5911,49 @@ mod vendor_package_tests {
             assert!(!msg.contains(GRANT) && !msg.contains("u:pw"), "{msg}");
             assert!(msg.contains(&format!("/<redacted>/{UUID}/")), "{msg}");
         }
+    }
+
+    /// A serve URL can answer with a redirect to another host (a patch
+    /// registry may send a client to the upstream registry for a gem it
+    /// has no patched build of). The download follows it, and the request
+    /// to that host carries no `Referer`: the URL it came from holds the
+    /// grant token.
+    #[tokio::test]
+    async fn download_artifact_follows_a_redirect_without_naming_the_grant_url() {
+        const GRANT: &str = "grant-level";
+        let registry = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        let file = format!("/patch-registry/gem/{GRANT}/u/s/4f/gems/a-1.0.0-java.gem");
+        Mock::given(method("GET"))
+            .and(path(file.as_str()))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "Location",
+                format!("{}/gems/a.gem", elsewhere.uri()).as_str(),
+            ))
+            .mount(&registry)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/gems/a.gem"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"upstream".to_vec()))
+            .mount(&elsewhere)
+            .await;
+        let client = auth_client(registry.uri());
+        let bytes = client
+            .download_artifact(&format!("{}{file}", registry.uri()))
+            .await
+            .expect("the redirect is followed");
+        assert_eq!(bytes, b"upstream");
+        let received = elsewhere.received_requests().await.unwrap_or_default();
+        let [request] = received.as_slice() else {
+            panic!("one request to the other host: {received:?}");
+        };
+        assert!(
+            request.headers.get("referer").is_none(),
+            "the other host is told where the request came from: {:?}",
+            request.headers
+        );
+        let sent = format!("{:?} {}", request.headers, request.url);
+        assert!(!sent.contains(GRANT), "the grant token: {sent}");
     }
 
     /// A promised secondary that 404s must ERROR ("artifact not found"),
