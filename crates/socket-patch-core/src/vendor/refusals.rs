@@ -461,9 +461,13 @@ mod tests {
     /// is still a failure.
     #[test]
     fn a_gem_patched_in_another_mode_is_a_skip_and_its_refusal_is_not() {
-        assert!(refusal_is_benign(gem::GEM_PATCHED_IN_OTHER_MODE));
-        assert!(!refusal_is_benign(gem::NATIVE_EXTENSIONS_UNSUPPORTED));
-        let detail = gem::patched_in_other_mode_detail("json", "hosted", "u-1");
+        assert!(refusal_is_benign(
+            crate::vendor::gem::GEM_PATCHED_IN_OTHER_MODE
+        ));
+        assert!(!refusal_is_benign(
+            crate::vendor::gem::NATIVE_EXTENSIONS_UNSUPPORTED
+        ));
+        let detail = crate::vendor::gem::patched_in_other_mode_detail("json", "hosted", "u-1");
         assert!(
             detail.contains("json builds a native extension")
                 && detail.contains("patched in hosted mode (patch u-1)"),

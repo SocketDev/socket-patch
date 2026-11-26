@@ -5986,31 +5986,58 @@ async fn vendored_scan_skips_a_native_gem_that_holds_the_patch_in_agent_mode() {
     assert!(shown.contains("patched in agent mode"), "{shown}");
 }
 
-/// The other side of #2269: a native gem that holds the patch in no mode
-/// is still refused, and the run still fails. Neither an upstream install
-/// with no record, nor a manifest record whose patch is not in the
-/// installed copy, counts as patched.
+/// The other side of #2269: a native gem that does not hold the patch
+/// everywhere is still refused, and the run still fails. None of these
+/// counts as patched: an upstream install with no record; a manifest
+/// record whose patch is not in the installed copy; a patched copy beside
+/// an unpatched one in the tree of another Ruby (`vex` and `apply
+/// --check` judge every copy); a hosted pin whose installed copy is still
+/// the upstream gem.
 #[tokio::test(flavor = "multi_thread")]
 async fn vendored_scan_still_refuses_a_native_gem_that_is_not_patched() {
-    for recorded in [false, true] {
+    for case in [
+        "no record",
+        "record not applied",
+        "one of two copies unpatched",
+        "hosted pin over an upstream install",
+    ] {
         let server = MockServer::start().await;
         let tmp = tempfile::tempdir().unwrap();
         let proj = tmp.path().join("proj");
         let home = vendorable_project(&server, &proj).await;
-        let gem_dir = if recorded {
-            let gem_dir = agent_patched_install(&proj, &home);
-            // The record is there; the patch is not in the copy.
-            std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), UPSTREAM_LIB).unwrap();
-            gem_dir
-        } else {
-            install_real_gem(&home, UPSTREAM_LIB)
+        let uri = server.uri();
+        let (gem_dir, left) = match case {
+            "no record" => (install_real_gem(&home, UPSTREAM_LIB), UPSTREAM_LIB),
+            "record not applied" => {
+                let gem_dir = agent_patched_install(&proj, &home);
+                std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), UPSTREAM_LIB)
+                    .unwrap();
+                (gem_dir, UPSTREAM_LIB)
+            }
+            "one of two copies unpatched" => {
+                let other = home.with_file_name("3.2.0");
+                install_real_gem(&other, UPSTREAM_LIB);
+                declare_native_extension(&other);
+                (agent_patched_install(&proj, &home), PATCHED_LIB)
+            }
+            _ => {
+                let gem_dir = install_real_gem(&home, UPSTREAM_LIB);
+                let (code, _, stderr) =
+                    common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+                assert_eq!(code, 0, "{case}: hosted scan:\n{stderr}");
+                std::fs::write(proj.join("Gemfile.lock"), converged_lock(&uri)).unwrap();
+                // The gem as it is before the pinned build is installed.
+                std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), UPSTREAM_LIB)
+                    .unwrap();
+                (gem_dir, UPSTREAM_LIB)
+            }
         };
         declare_native_extension(&home);
         let pair_before = read_pair(&proj);
 
         let (code, stdout, stderr) = unwind_run(
             &proj,
-            &server.uri(),
+            &uri,
             &["scan", "--mode", "vendored", "--yes", "--json"],
         );
         let env = common::parse_json_envelope(&stdout);
@@ -6019,14 +6046,14 @@ async fn vendored_scan_still_refuses_a_native_gem_that_is_not_patched() {
             events
                 .iter()
                 .any(|e| e == "failed/native_extensions_unsupported"),
-            "recorded={recorded}: {events:?}\n{env}\nstderr:\n{stderr}"
+            "{case}: {events:?}\n{env}\nstderr:\n{stderr}"
         );
         assert!(
             !env.to_string().contains(PATCHED_IN_OTHER_MODE),
-            "recorded={recorded}: {env}"
+            "{case}: {env}"
         );
-        assert_ne!(code, 0, "recorded={recorded}: {env}");
-        assert_eq!(read_pair(&proj), pair_before, "recorded={recorded}");
-        assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB, "recorded={recorded}");
+        assert_ne!(code, 0, "{case}: {env}");
+        assert_eq!(read_pair(&proj), pair_before, "{case}");
+        assert_eq!(installed_lib(&gem_dir), left, "{case}");
     }
 }
