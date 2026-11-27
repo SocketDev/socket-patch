@@ -113,3 +113,4 @@ One line per ruled-out finding. Moved here from state/pnpm.md when it was compac
 - `pnpm update` with `packageManager: pnpm@12.x` asks the configured registry for `/pnpm`; a mock without it makes `update` exit 1. Mock gap (2026-11-26).
 - Hosted `rollback` of a project whose `pnpm-workspace.yaml` was the user's own keeps `trustLockfile: true` with the `pnpm_trust_lockfile_left` warning (re-confirmed 12.23.0, catalog workspace, 2026-11-26).
 - A hosted → vendored takeover (`scan --mode vendored`) refuses a peer-suffixed hosted snapshot (`peer-user@1.0.0(host@1.0.0)`) as "not supported yet" and leaves it hosted; documented lock-shape limit. On pnpm 12.23 the resulting mix then trips #2263 (2026-11-26).
+- Agent `rollback` removes the patch from `.socket/manifest.json` and frees its blobs ("Removed 1 patch from manifest"): by design, not data loss (run 51).
