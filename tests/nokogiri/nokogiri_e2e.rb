@@ -635,14 +635,23 @@ class NokogiriE2E
     check(probe[RB_CONST] == 1, "the scanned project loads the patched nokogiri too")
     service.bring_up
     code, stdout, stderr, = sp_service("vex", "--product", PRODUCT, "--output", File.join(@proj, "vex.json"))
-    statuses = begin
+    statements = begin
       JSON.parse(File.read(File.join(@proj, "vex.json"))).fetch("statements", [])
-          .select { |st| st.to_s.include?("pkg:gem/nokogiri@#{@version}") }.map { |st| st["status"] }
+          .select { |st| st.to_s.include?("pkg:gem/nokogiri@#{@version}") }
     rescue StandardError
       []
     end
+    statuses = statements.map { |st| st["status"] }
     check(code.zero? && statuses == ["not_affected"], "`vex` attests the patch",
           "exit #{code} #{statuses.inspect}\n#{tail(stdout)}#{tail(stderr)}")
+    # The build this machine installed is a patch of its own, checked
+    # against that patch's record: it is attested, and nothing is left out.
+    attested = statements.flat_map { |st| Array(st["products"]) }
+                         .flat_map { |product| Array(product["subcomponents"]) }.map { |sub| sub["@id"] }
+    check(attested.include?("pkg:gem/nokogiri@#{@version}?platform=#{own_platform}"),
+          "for the #{own_platform} build this machine installed", attested.inspect)
+    check(!(stdout + stderr).include?("omitting"), "and leaves no build out",
+          tail(stdout) + tail(stderr))
 
     code, stdout, stderr, = sp_service("rollback")
     check(code.zero?, "`rollback` succeeds", "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
@@ -764,7 +773,7 @@ class NokogiriE2E
             "and names the platforms that have none", pending["reason"].inspect)
       check(File.read(lock_path) == lock && File.read(File.join(@proj, "Gemfile")) == gemfile &&
             !File.exist?(File.join(@proj, ".socket", "vendor", "gem")), "nothing is written")
-      fetched = service.requests.select { |_, path, _| path.start_with?("/artifacts/") }
+      fetched = service.requests.select { |_, path, _| path.start_with?("/patch/") || path.include?("/gems/") }
       check(fetched.empty?, "and nothing is downloaded", fetched.inspect)
       waiting.each { |platform| service.publish(platform) }
     end
@@ -787,8 +796,11 @@ class NokogiriE2E
           "every package reference request asks for the list of the gem's builds", asked.inspect)
     batches = asked.map { |body| Array(body["uuids"]).sort }.reject { |uuids| (uuids & own).empty? }
     check(batches == [own], "the patches of the platform gems are asked for in one request", asked.inspect)
+    # A platform gem is checked against the record of its own patch: the
+    # service stamps the files of each patch, so no build matches the gem's.
     views = service.requests.select { |_, path, _| path.include?("/view/") && !path.end_with?("/#{UUID}") }
-    check(views.empty?, "and no record of a platform gem's patch is fetched", views.inspect)
+    check(views.map { |_, path, status| [File.basename(path), status] }.sort == own.map { |uuid| [uuid, 200] },
+          "and the record of each platform gem's own patch is read once", views.inspect)
     # From here on nothing may need the patch service.
     service.take_down
     service.forget_requests
