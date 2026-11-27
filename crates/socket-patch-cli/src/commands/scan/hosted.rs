@@ -446,6 +446,7 @@ fn pin_reports_by_package(
                 platform: None,
                 newly_patched: false,
                 withdrawn: false,
+                sha256: None,
             },
         )
         .collect()
@@ -652,8 +653,10 @@ impl<'a> ViewFallback<'a> {
     ) -> Option<&socket_patch_core::manifest::schema::PatchRecord> {
         if !self.fetched.contains_key(uuid) {
             let record = match self.api {
+                // The file hashes are all a judgment needs: asked without
+                // the file contents.
                 Some(api) => api
-                    .fetch_patch(uuid)
+                    .fetch_patch_summary(uuid)
                     .await
                     .ok()
                     .and_then(|view| gem_refresh::view_record(view, uuid)),
@@ -1046,10 +1049,12 @@ async fn gem_stale_install_warnings(
                         patched: true,
                         stale_evidence: false,
                     }),
-                    Some(BuildCopyEvidence::OtherArchive) => Some(InstalledRecordJudgment {
-                        patched: false,
-                        stale_evidence: true,
-                    }),
+                    Some(BuildCopyEvidence::OtherArchive | BuildCopyEvidence::AlteredTree) => {
+                        Some(InstalledRecordJudgment {
+                            patched: false,
+                            stale_evidence: true,
+                        })
+                    }
                     _ => None,
                 },
                 Some(record) => {
@@ -3106,6 +3111,15 @@ async fn run_redirect_selected_untracked(
         params.hosted_gem_builds = engine::pin_reports(&confirmed, rewrite)
             .into_iter()
             .filter(|report| report.gem_fix.is_some())
+            .map(|mut report| {
+                // The sha256 the reference lists for a patched build: what
+                // tells that an installed copy is that build.
+                report.sha256 = gem_build_patches
+                    .iter()
+                    .find(|(_, (own, _))| Some(own) == report.uuid.as_ref())
+                    .map(|(_, (_, sha256))| sha256.clone());
+                report
+            })
             .collect();
         // The gem intake gate withholds every gem file. VEX independently
         // rediscovers older pins too, so a candidate-only set would miss some
@@ -5090,6 +5104,7 @@ mod tests {
             platform: platform.map(str::to_string),
             newly_patched: newly,
             withdrawn: false,
+            sha256: None,
         }
     }
 

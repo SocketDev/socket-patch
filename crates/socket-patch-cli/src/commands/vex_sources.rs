@@ -800,8 +800,9 @@ pub(crate) struct HostedGemBuild {
     pub unshown: Option<GemBuildUnshown>,
     /// For a patched platform build: the sha256 of its gem, as the gem
     /// patch's listing gives it. An installed copy whose archive has it is
-    /// that build ([`build_copy_evidence`]). `None` where no listing was
-    /// read: the pins of the run that moved the lock.
+    /// that build ([`build_copy_evidence`]). The pins of the run that
+    /// moved the lock carry the one its reference listed. `None` where no
+    /// listing names one.
     ///
     /// [`build_copy_evidence`]: socket_patch_core::vex::gem_builds::build_copy_evidence
     pub sha256: Option<String>,
@@ -2040,7 +2041,15 @@ async fn resolve_hosted_gems(
             })
             .collect();
         if !reported.is_empty() {
-            if let Some(gem) = HostedGem::of(key, &wiring.uuid, reported, false) {
+            if let Some(mut gem) = HostedGem::of(key, &wiring.uuid, reported, false) {
+                // The run's own pins carry the digest its reference listed.
+                for build in &mut gem.builds {
+                    let pin = in_run.iter().find(|report| {
+                        report.gem_fix.as_deref() == Some(wiring.uuid.as_str())
+                            && report.platform == build.platform
+                    });
+                    build.sha256 = pin.and_then(|report| report.sha256.clone());
+                }
                 plan.hosted_gems.insert(key.clone(), gem);
             }
             continue;
@@ -4196,6 +4205,7 @@ mod tests {
             platform: platform.map(str::to_string),
             newly_patched: uuid.is_some(),
             withdrawn: false,
+            sha256: None,
         };
         let sources = Sources {
             hosted_gem_builds: vec![

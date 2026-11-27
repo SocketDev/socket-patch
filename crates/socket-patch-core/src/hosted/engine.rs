@@ -334,6 +334,10 @@ pub struct PinReport {
     ///
     /// [`GemLockedBuild::withdrawn`]: crate::patch::redirect::GemLockedBuild::withdrawn
     pub withdrawn: bool,
+    /// For a patched platform build: the sha256 of its gem, as the gem
+    /// patch's reference lists it, where the host has it. An installed
+    /// copy whose archive has it is that build.
+    pub sha256: Option<String>,
 }
 
 /// What a hosted run reports for its confirmed pins (`(purl, uuid)`): each
@@ -354,6 +358,7 @@ pub fn pin_reports(confirmed: &[(String, String)], rewrite: &RewriteResult) -> V
                 platform: None,
                 newly_patched: false,
                 withdrawn: false,
+                sha256: None,
             });
             continue;
         };
@@ -368,6 +373,7 @@ pub fn pin_reports(confirmed: &[(String, String)], rewrite: &RewriteResult) -> V
             platform: build.platform.clone(),
             newly_patched: build.newly_patched,
             withdrawn: build.withdrawn,
+            sha256: None,
         }));
     }
     reports

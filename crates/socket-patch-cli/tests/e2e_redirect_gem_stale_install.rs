@@ -7284,5 +7284,122 @@ async fn a_patched_platform_copy_with_a_pruned_cache_is_judged_by_its_own_patch(
             fix_records, 0,
             "{label}: the gem patch's record is not what judges it"
         );
+        // The build's own record is asked for without its file contents.
+        let own: Vec<Option<String>> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| {
+                request
+                    .url
+                    .path()
+                    .ends_with(&format!("/patches/view/{ARM_UUID}"))
+            })
+            .map(|request| request.url.query().map(str::to_string))
+            .collect();
+        assert!(
+            !own.is_empty()
+                && own
+                    .iter()
+                    .all(|query| query.as_deref() == Some("include_blobs=false")),
+            "{label}: {own:?}"
+        );
     }
+}
+
+/// What `vex` attests of a platform build is what Ruby loads. The archive
+/// RubyGems installed the copy from says which gem it was, with no
+/// request, and the installed tree is then held to that archive's own
+/// files: a copy whose archive is the patched gem while a file under
+/// `gems/<leaf>` has other bytes is not attested, and the scan replaces it
+/// from the archive.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_platform_copy_is_attested_by_its_archive_only_while_its_tree_is_the_archives() {
+    use vex_e2e_common::{assert_not_attested, run_vex, statements_for, VexRun};
+    let stamped = format!("# Socket Community Patch: {ARM_UUID}\n{PATCHED_LIB}");
+    let server = MockServer::start().await;
+    let prebuilt = real_gem_for(&stamped, PLATFORM);
+    let other = real_gem_for(PATCHED_LIB, OTHER_PLATFORM);
+    mount_api_with(
+        &server,
+        None,
+        &sha256_of(&real_gem(PATCHED_LIB)),
+        &[
+            (PLATFORM, sha256_of(&prebuilt), Some(ARM_UUID)),
+            (OTHER_PLATFORM, sha256_of(&other), Some(LINUX_UUID)),
+        ],
+    )
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("Gemfile"),
+        format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\n"),
+    )
+    .unwrap();
+    let upstream = |platform: &str| sha256_of(&real_gem_for(UPSTREAM_LIB, platform));
+    std::fs::write(
+        proj.join("Gemfile.lock"),
+        platform_lock(&upstream(PLATFORM), &upstream(OTHER_PLATFORM)),
+    )
+    .unwrap();
+    let home = project_home(&proj);
+    let gem_dir = install_real_gem_for(&home, &stamped, PLATFORM);
+    let uri = server.uri();
+    let (code, stdout, stderr) =
+        common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    assert!(stale_warnings(&env).is_empty(), "{env}");
+
+    let run = VexRun {
+        api_url: Some(uri.clone()),
+        api_token: Some("fake".into()),
+        org: Some(ORG.into()),
+        patch_server_url: Some(uri.clone()),
+        product: Some("pkg:gem/app@1.0.0".into()),
+        ..VexRun::default()
+    };
+    let build = format!("{PURL}?platform={PLATFORM}");
+    let out = run_vex(&vex_e2e_common::binary(), &proj, &run);
+    assert_eq!(out.code, Some(0), "{out}");
+    let attested = statements_for(out.doc(), &build);
+    assert!(
+        attested
+            .iter()
+            .any(|statement| statement["status"] == "not_affected"),
+        "the build is attested by its archive and its tree: {out}"
+    );
+    let records = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| {
+            request
+                .url
+                .path()
+                .ends_with(&format!("/patches/view/{ARM_UUID}"))
+        })
+        .count();
+    assert_eq!(records, 0, "with no record of its patch read");
+
+    // The same archive, and a file of the gem with other bytes.
+    std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), UPSTREAM_LIB).unwrap();
+    let out = run_vex(&vex_e2e_common::binary(), &proj, &run);
+    assert_not_attested(&out.envelope, &build, "hash_mismatch");
+
+    // The scan sees the same, and puts the archive's files back.
+    let (code, stdout, stderr) =
+        common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    assert_eq!(
+        warnings_with_code(&env, "redirect_gem_install_refreshed").len(),
+        1,
+        "{env}"
+    );
+    assert_eq!(installed_lib(&gem_dir), stamped);
 }

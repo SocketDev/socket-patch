@@ -66,9 +66,13 @@ pub use crate::patch::redirect::gem_index_info_url as gem_index_url;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildCopyEvidence {
     /// The archive RubyGems installed the copy from is the patched gem
-    /// the gem patch's listing names for the platform: the copy is the
-    /// patched build, and no record is read.
+    /// the gem patch's listing names for the platform, and the installed
+    /// tree holds that archive's files byte for byte: what Ruby loads is
+    /// the patched build, and no record is read.
     PatchedArchive,
+    /// That archive is the patched gem, and the installed tree is not
+    /// what it holds: a file of the gem is missing or has other bytes.
+    AlteredTree,
     /// That archive is readable and is another gem.
     OtherArchive,
     /// The gem home keeps no readable archive of the copy (a pruned
@@ -95,10 +99,77 @@ pub async fn build_copy_evidence(
         return BuildCopyEvidence::OwnRecord;
     };
     match crate::vendor::file_sha256_hex(&archive).await {
-        Some(sha) if sha.eq_ignore_ascii_case(listed) => BuildCopyEvidence::PatchedArchive,
+        Some(sha) if sha.eq_ignore_ascii_case(listed) => {
+            match tree_holds_archive(gem_dir, &archive).await {
+                true => BuildCopyEvidence::PatchedArchive,
+                false => BuildCopyEvidence::AlteredTree,
+            }
+        }
         Some(_) => BuildCopyEvidence::OtherArchive,
         None => BuildCopyEvidence::OwnRecord,
     }
+}
+
+/// The largest gem archive read to compare an installed tree with.
+const MAX_COMPARED_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Whether the installed tree `gem_dir` holds every file of the gem
+/// archive `archive` (its `data.tar.gz`) with the archive's own bytes.
+/// Files RubyGems or a build adds beside them do not count against it; a
+/// missing file, a changed one, an entry that is no plain relative path
+/// and an archive that cannot be read all do.
+async fn tree_holds_archive(gem_dir: &std::path::Path, archive: &std::path::Path) -> bool {
+    use std::io::Read as _;
+    let (gem_dir, archive) = (gem_dir.to_path_buf(), archive.to_path_buf());
+    crate::utils::fs::run_blocking(move || {
+        let small = std::fs::metadata(&archive)
+            .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_COMPARED_ARCHIVE_BYTES);
+        let Some(bytes) = small.then(|| std::fs::read(&archive).ok()).flatten() else {
+            return false;
+        };
+        let mut outer = tar::Archive::new(bytes.as_slice());
+        let Ok(members) = outer.entries() else {
+            return false;
+        };
+        for member in members.flatten() {
+            if !member
+                .path()
+                .is_ok_and(|path| path.as_os_str() == "data.tar.gz")
+            {
+                continue;
+            }
+            let mut data = tar::Archive::new(flate2::read::GzDecoder::new(member));
+            let Ok(entries) = data.entries() else {
+                return false;
+            };
+            let mut files = 0usize;
+            for entry in entries {
+                let Ok(mut entry) = entry else {
+                    return false;
+                };
+                if !entry.header().entry_type().is_file() {
+                    continue;
+                }
+                let Ok(path) = entry.path().map(|path| path.into_owned()) else {
+                    return false;
+                };
+                let plain = path
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)));
+                let mut packed = Vec::new();
+                if !plain || entry.read_to_end(&mut packed).is_err() {
+                    return false;
+                }
+                if std::fs::read(gem_dir.join(&path)).ok().as_deref() != Some(packed.as_slice()) {
+                    return false;
+                }
+                files += 1;
+            }
+            return files > 0;
+        }
+        false
+    })
+    .await
 }
 
 /// What a lock installs for one build of a gem on a patch registry.
@@ -189,7 +260,30 @@ mod tests {
         let home = tmp.path();
         let dir = home.join("gems").join("nokogiri-1.19.3-arm64-darwin");
         std::fs::create_dir_all(&dir).unwrap();
-        let patched = sha256_hex_of(b"patched gem");
+        // A gem archive: a tar holding `data.tar.gz`, the gem's files.
+        let gem = {
+            let mut data = tar::Builder::new(flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::default(),
+            ));
+            let mut header = tar::Header::new_gnu();
+            header.set_size(8);
+            header.set_mode(0o644);
+            header.set_cksum();
+            data.append_data(&mut header, "lib/nokogiri.rb", &b"patched\n"[..])
+                .unwrap();
+            let data = data.into_inner().unwrap().finish().unwrap();
+            let mut outer = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            outer
+                .append_data(&mut header, "data.tar.gz", data.as_slice())
+                .unwrap();
+            outer.into_inner().unwrap()
+        };
+        let patched = sha256_hex_of(&gem);
         let evidence = |listed: Option<&'static str>| {
             let dir = dir.clone();
             async move { build_copy_evidence(&dir, listed).await }
@@ -200,7 +294,16 @@ mod tests {
         assert_eq!(evidence(Some(listed)).await, BuildCopyEvidence::OwnRecord);
         let archive = home.join("cache").join("nokogiri-1.19.3-arm64-darwin.gem");
         std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
-        std::fs::write(&archive, b"patched gem").unwrap();
+        std::fs::write(&archive, &gem).unwrap();
+        // The listed archive, and a tree that is not what it holds: a
+        // file missing, then a file with other bytes.
+        assert_eq!(evidence(Some(listed)).await, BuildCopyEvidence::AlteredTree);
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/nokogiri.rb"), b"other bytes").unwrap();
+        assert_eq!(evidence(Some(listed)).await, BuildCopyEvidence::AlteredTree);
+        // The tree the archive holds, with a file RubyGems added beside it.
+        std::fs::write(dir.join("lib/nokogiri.rb"), b"patched\n").unwrap();
+        std::fs::write(dir.join("gem_make.out"), b"added on install").unwrap();
         assert_eq!(
             evidence(Some(listed)).await,
             BuildCopyEvidence::PatchedArchive

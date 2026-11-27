@@ -999,10 +999,9 @@ async fn generate_vex(
     // The gems whose installed copies include a precompiled build Bundler
     // loads in place of the ruby-platform gem the lock names.
     let mut gem_stand_ins: HashSet<String> = HashSet::new();
-    // The patched platform builds whose installed copy was judged without
-    // the verifier: the patched gem by its archive, another gem by its
-    // archive, and those nothing could judge ([`JudgedBuildCopies`]).
-    let mut build_copies: (Vec<String>, Vec<String>, BTreeMap<String, _>) = Default::default();
+    // The patched platform builds of which nothing showed what an
+    // installed copy is ([`JudgedBuildCopies::unknown`]).
+    let mut unjudged_copies = BTreeMap::new();
     let mut outcome = if params.no_verify {
         // Trust-the-records mode still needs the vendored classification:
         // the property-7 exemption and the "(vendored)" phrasing key off
@@ -1090,7 +1089,6 @@ async fn generate_vex(
         // under its own purl, and never against the gem patch's.
         let judged = judge_gem_build_copies(common, params, &plan, &mut hosted).await;
         let manifest = judged.view.as_ref().unwrap_or(manifest);
-        build_copies = (judged.patched, judged.stale, judged.unknown);
         let vendor = VendorContext {
             project_root: common.cwd.clone(),
             entries: plan.vendor_entries.clone(),
@@ -1104,6 +1102,32 @@ async fn generate_vex(
         )
         .await;
         verifying.finish();
+        // The builds judged by their archives join the outcome here, one
+        // entry each, so every gate, the sort and the lines below see them
+        // like any other verdict. A build is in one list only.
+        for (purl, reason) in &judged.failed {
+            outcome.failed.push(FailedPatch {
+                purl: purl.clone(),
+                reason: (*reason).to_string(),
+            });
+        }
+        outcome.applied.extend(judged.patched.iter().cloned());
+        for (purl, why) in &judged.unknown {
+            let gem = plan.hosted_gems.iter().find_map(|(key, gem)| {
+                let build = gem.builds.iter().find(|build| &build.purl == purl)?;
+                Some((key, gem, build.platform.clone()?))
+            });
+            if let Some((key, gem, platform)) = gem {
+                let note = crate::commands::vex_sources::unjudged_build_note(
+                    key,
+                    &gem.gem_fix,
+                    &platform,
+                    why,
+                );
+                note_warning(warnings, common, note.code, note.detail);
+            }
+        }
+        unjudged_copies = judged.unknown;
         // Hosted lockfile basis: a DISCOVERED Socket-host reference whose
         // lock pins the artifact attests from that wiring when no installed
         // tree exists yet (a lockfile-only CI checkout) — the evidence the
@@ -1596,36 +1620,9 @@ async fn generate_vex(
     let mut affected = affected;
     affected.extend(gem_stand_ins.iter().cloned());
     let mut redirected = plan.redirected.clone();
-    let (patched_copies, stale_copies, unjudged_copies) = build_copies;
-    // A copy installed from another gem than the patched build is that
-    // build unpatched, whatever else the gem's pin shows.
-    for purl in stale_copies {
-        outcome.failed.push(FailedPatch {
-            purl,
-            reason: "not_applied".to_string(),
-        });
-    }
-    for (purl, why) in &unjudged_copies {
-        let gem = plan.hosted_gems.iter().find_map(|(key, gem)| {
-            let build = gem.builds.iter().find(|build| &build.purl == purl)?;
-            Some((key, gem, build.platform.clone()?))
-        });
-        if let Some((key, gem, platform)) = gem {
-            let note = crate::commands::vex_sources::unjudged_build_note(
-                key,
-                &gem.gem_fix,
-                &platform,
-                why,
-            );
-            note_warning(warnings, common, note.code, note.detail);
-        }
-    }
     let gem_builds = crate::commands::vex_sources::GemBuildView::of_judged(&plan, &unjudged_copies);
     if let Some(builds) = &gem_builds {
         builds.expand(&mut outcome.applied);
-        // A build whose archive is the patched gem is attested whatever
-        // became of the gem's other copies.
-        outcome.applied.extend(patched_copies);
         // A build whose own copy did not verify is not one of the gem's
         // attested builds, and one that did is named once.
         let withheld: HashSet<&str> = outcome.failed.iter().map(|f| f.purl.as_str()).collect();
@@ -2381,21 +2378,23 @@ fn vendored_out_of_sync_detail(purl: &str, copies: &[&Path], notes: &str) -> Str
 }
 
 /// What judging the installed copies of the patched platform builds of the
-/// hosted gems found ([`judge_gem_build_copies`]).
+/// hosted gems found ([`judge_gem_build_copies`]): one outcome per build,
+/// from all of its copies.
 #[derive(Default)]
 struct JudgedBuildCopies {
     /// The record view to check the moved copies with: the plan's, plus
-    /// one record per build whose own record was read. `None` when no
-    /// copy moved.
+    /// one record per build whose copies its own record judges. `None`
+    /// when no copy moved.
     view: Option<PatchManifest>,
-    /// The builds (by purl) a copy of which is the patched gem by its
-    /// archive: attested with no record read.
+    /// The builds (by purl) every copy of which is the patched gem by its
+    /// archive, with the tree that archive holds: attested, no record read.
     patched: Vec<String>,
-    /// The builds a copy of which was installed from another gem: not the
-    /// patched build.
-    stale: Vec<String>,
-    /// The builds of which nothing showed what the installed copy is,
-    /// each with why: stated `affected`, never attested.
+    /// The builds a copy of which is not the patched build, each with the
+    /// omission reason: `not_applied` for a copy installed from another
+    /// gem, `hash_mismatch` for a tree that is not what its archive holds.
+    failed: BTreeMap<String, &'static str>,
+    /// The builds of which nothing showed what a copy is, each with why:
+    /// stated `affected`, never attested.
     unknown: BTreeMap<String, crate::commands::vex_sources::GemBuildUnshown>,
 }
 
@@ -2406,19 +2405,28 @@ struct JudgedBuildCopies {
 /// patch's: a compiled build changes binaries the gem's patch does not
 /// name, and the service stamps the files of each patch with that patch's
 /// own header, so a copy of the build never matches the gem patch's
-/// hashes and is never checked against them. What judges it is, in this
-/// order ([`build_copy_evidence`]):
+/// hashes and is never checked against them. What judges a copy is, in
+/// this order ([`build_copy_evidence`]):
 ///
 /// 1. the archive RubyGems installed it from: the patched gem the gem
-///    patch's listing names for the platform means the copy is the
-///    patched build, with no request; any other readable archive means it
-///    is not;
+///    patch's listing names for the platform, with the installed tree
+///    holding that archive's files, means the copy is the patched build,
+///    with no request; any other readable archive, or a tree that is not
+///    the archive's, means it is not;
 /// 2. with no archive (a pruned `cache/`), the record of the build's own
-///    patch, read once per build: the copy moves under the build's purl
+///    patch, read once per build without its file contents: the copy
+///    moves under the build's purl
 ///    (`pkg:gem/<name>@<version>?platform=<platform>`) and its files are
 ///    checked against that record;
-/// 3. where that record cannot be read, nothing: the build is stated
-///    `affected` under the unknown-build warning, never attested.
+/// 3. where that record cannot be read, nothing.
+///
+/// A build has ONE outcome, from all of its copies (two gem homes can
+/// hold it): not the patched build if any copy is not, else unknown if
+/// nothing judged some copy, else its record's verdict over the copies
+/// that have no archive, else attested. The pins of the run that moved
+/// the lock are the exception to "unknown": that run confirmed the build,
+/// so a copy it cannot judge is left to the run's own gates, never
+/// stated `affected` for a read that failed.
 ///
 /// [`build_copy_evidence`]: socket_patch_core::vex::gem_builds::build_copy_evidence
 async fn judge_gem_build_copies(
@@ -2433,14 +2441,15 @@ async fn judge_gem_build_copies(
         build_copy_evidence, BuildCopyEvidence, GemBuildState,
     };
     let mut judged = JudgedBuildCopies::default();
-    let mut records = HashMap::new();
     for (key, gem) in &plan.hosted_gems {
         let (Some(record), Some(consumed)) = (plan.view.patches.get(key), hosted.get_mut(key))
         else {
             continue;
         };
+        // Per build: its patch, and the evidence of each of its copies.
+        type Copies<'a> = (&'a String, Vec<(PathBuf, BuildCopyEvidence)>);
+        let mut copies: BTreeMap<&str, Copies<'_>> = BTreeMap::new();
         let mut kept = Vec::new();
-        let mut moved: BTreeMap<String, (PatchRecord, Vec<PathBuf>)> = BTreeMap::new();
         for path in std::mem::take(&mut consumed.paths) {
             let leaf = path.file_name().and_then(|leaf| leaf.to_str());
             let platform = leaf
@@ -2458,46 +2467,58 @@ async fn judge_gem_build_copies(
                 kept.push(path);
                 continue;
             };
-            match build_copy_evidence(&path, build.sha256.as_deref()).await {
-                BuildCopyEvidence::PatchedArchive => judged.patched.push(build.purl.clone()),
-                BuildCopyEvidence::OtherArchive => judged.stale.push(build.purl.clone()),
-                BuildCopyEvidence::OwnRecord => {
-                    if !records.contains_key(uuid) {
-                        let read = read_build_record(common, &params.api_client, uuid).await;
-                        records.insert(uuid.clone(), read);
-                    }
-                    match &records[uuid] {
-                        Ok(files) => {
-                            let entry = moved.entry(build.purl.clone()).or_insert_with(|| {
-                                let record = PatchRecord {
-                                    uuid: uuid.clone(),
-                                    files: files.clone(),
-                                    ..record.clone()
-                                };
-                                (record, Vec::new())
-                            });
-                            entry.1.push(path);
-                        }
-                        Err(why) => {
-                            judged.unknown.insert(build.purl.clone(), why.clone());
-                        }
-                    }
-                }
-            }
+            let evidence = build_copy_evidence(&path, build.sha256.as_deref()).await;
+            let of_build = copies
+                .entry(build.purl.as_str())
+                .or_insert((uuid, Vec::new()));
+            of_build.1.push((path, evidence));
         }
         consumed.paths = kept;
         let rename = consumed.rename.clone();
-        for (purl, (record, paths)) in moved {
-            judged
-                .view
-                .get_or_insert_with(|| plan.view.clone())
-                .patches
-                .insert(purl.clone(), record);
-            let copies = socket_patch_core::vex::HostedCopies {
-                paths,
-                rename: rename.clone(),
-            };
-            hosted.insert(purl, copies);
+        for (purl, (uuid, copies)) in copies {
+            let has = |wanted: BuildCopyEvidence| copies.iter().any(|(_, e)| *e == wanted);
+            if has(BuildCopyEvidence::OtherArchive) {
+                judged.failed.insert(purl.to_string(), "not_applied");
+                continue;
+            }
+            if has(BuildCopyEvidence::AlteredTree) {
+                judged.failed.insert(purl.to_string(), "hash_mismatch");
+                continue;
+            }
+            let unarchived: Vec<PathBuf> = copies
+                .into_iter()
+                .filter(|(_, evidence)| *evidence == BuildCopyEvidence::OwnRecord)
+                .map(|(path, _)| path)
+                .collect();
+            if unarchived.is_empty() {
+                judged.patched.push(purl.to_string());
+                continue;
+            }
+            match read_build_record(common, &params.api_client, uuid).await {
+                Ok(files) => {
+                    let record = PatchRecord {
+                        uuid: uuid.clone(),
+                        files,
+                        ..record.clone()
+                    };
+                    judged
+                        .view
+                        .get_or_insert_with(|| plan.view.clone())
+                        .patches
+                        .insert(purl.to_string(), record);
+                    let copies = socket_patch_core::vex::HostedCopies {
+                        paths: unarchived,
+                        rename: rename.clone(),
+                    };
+                    hosted.insert(purl.to_string(), copies);
+                }
+                // The run that moved the lock confirmed this build: its
+                // own gates say what becomes of a copy nothing judged.
+                Err(_) if !gem.resolved => {}
+                Err(why) => {
+                    judged.unknown.insert(purl.to_string(), why);
+                }
+            }
         }
     }
     judged

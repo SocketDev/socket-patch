@@ -151,6 +151,7 @@ mod tests {
             platform: platform.map(str::to_string),
             newly_patched: newly,
             withdrawn: false,
+            sha256: None,
         };
         let reports = [
             PinReport {
@@ -160,6 +161,7 @@ mod tests {
                 platform: None,
                 newly_patched: false,
                 withdrawn: false,
+                sha256: None,
             },
             build(None, Some(FIX), false),
             build(Some("arm64-darwin"), None, false),

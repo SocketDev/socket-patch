@@ -1271,7 +1271,7 @@ pub(crate) fn view_record(
     uuid: &str,
 ) -> Option<PatchRecord> {
     view.map(|view| socket_patch_core::manifest::records::record_from_patch_response(&view).1)
-        .filter(|record| record.uuid == uuid && !record.files.is_empty())
+        .filter(|record| record.uuid.eq_ignore_ascii_case(uuid) && !record.files.is_empty())
 }
 
 /// Why a hosted unwind has no patch record to judge an installed copy by.
