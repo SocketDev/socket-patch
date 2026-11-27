@@ -4936,9 +4936,12 @@ arm64-darwin.`
 VEX follows the builds. The scan's `--vex` attests each patched build under its own patch and
 writes an `affected` statement for a build that keeps upstream's gem. A later `socket-patch vex`
 reads the lock and asks the patch service which builds are patched: one request for all such gems
-together, and one more per gem whose lock has no `CHECKSUMS` entry for a build. That is on top of
-the one request `vex` makes for the record of any hosted patch. A build is attested as patched only
-when the lock installs exactly that patch's gem. When it cannot show that (`--offline`, a failed
+together, one more per gem whose lock has no `CHECKSUMS` entry for a build, and one per patched
+build the lock names, for that build's own record. That is on top of the one request `vex` makes
+for the record of any hosted patch. A build is attested as patched only when the lock installs
+exactly that patch's gem, and an installed copy of it is checked against the build's own record: a
+platform gem is a patch of its own, whose files carry that patch's header (and, for a compiled
+build, its binaries), so they are not the files of the gem's patch. When it cannot show that (`--offline`, a failed
 request, a lock older than what the patch service lists now) it states the build as `affected`,
 with what to run to settle it, under the warning `vex_gem_build_unknown`. The run still succeeds.
 
@@ -4965,6 +4968,23 @@ nokogiri 1.18.10: patched for arm64-darwin; upstream gem back for x86_64-linux-g
 ```
 
 In `--json` that build's `gem_upstream_build_kept` event carries `details.withdrawn: true`.
+
+**A lock with `ruby` alone under `PLATFORMS`.** Such a lock names nokogiri as plain
+`nokogiri (1.18.10)`, and the scan pins it under the patch registry without the `…/s/<key>/`
+level, which serves the patched ruby gem alone. A fresh `bundle install` builds that gem. On a
+machine that installed the gem before the scan, Bundler picked the precompiled gem of the machine
+for this lock, and it keeps loading that copy, which is upstream's. The scan does not replace it
+(the patched gem of this lock is the ruby gem, which only an install builds). It reports it, and
+its closing lines say that the gem is still unpatched on disk where they would say that nothing
+is left to patch:
+
+```text
+Warning: 1 gem is still unpatched on disk after the switch to hosted patches.
+  - Not refreshed (it is a precompiled arm64-darwin gem, which Bundler loads in place of the ruby gem the lock names, and the patched gem of this lock is the ruby gem, which `bundle install` builds): nokogiri 1.18.10. Run `rm -f vendor/bundle/ruby/3.4.0/specifications/nokogiri-1.18.10-arm64-darwin.gemspec vendor/bundle/ruby/3.4.0/cache/nokogiri-1.18.10-arm64-darwin.gem && bundle install`.
+```
+
+After that command Ruby loads the patched gem. Until then `socket-patch vex` exits 0 and states
+the gem as `affected` (warning `vex_gem_install_unpatched`), with what to run.
 
 Adding a platform is Bundler's own step: `bundle lock --add-platform <platform>` resolves the gem
 from its one source, the patch registry, and adds that platform's entry and checksum. The next
