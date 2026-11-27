@@ -4939,7 +4939,9 @@ reads the lock and asks the patch service which builds are patched: one request 
 together, and one more per gem whose lock has no `CHECKSUMS` entry for a build. That is on top of
 the one request `vex` makes for the record of any hosted patch. A build is attested as patched
 only when the lock installs exactly that patch's gem. An installed copy of it is judged by the
-archive RubyGems installed it from (`cache/<gem>.gem` in the gem home), which needs no request.
+archive RubyGems installed it from (`cache/<gem>.gem` in the gem home) and by the installed files
+themselves, which must be the ones that archive holds: no request, and what Ruby loads is what
+is attested.
 Where the gem home keeps no archive (a slim image, `gem cleanup`), the copy's files are checked
 against the record of that build's own patch, one request per such build: a platform gem is a
 patch of its own, whose files carry that patch's header (and, for a compiled build, its
