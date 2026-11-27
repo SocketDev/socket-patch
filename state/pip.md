@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pip / requirements.txt bug-hunt routine (label pm:pip).
 
-Last run: 2026-11-26, main `cfc870f`, release v5.1.0, newest pip 26.3 (CPython 3.8–3.14 covered). Compacted from 61 KB this run: the old per-cell matrix and backlog notes are in the branch history (commit before 2026-11-26); the known non-bugs moved to `known-non-bugs/pip.md`. Open bughunt issues: #2272 (new), #977 (needs-human). Harness: mock2.py from entry 20261029T021000Z plus the blob endpoint and mirror proxy from entry 20261126T035147Z.
+Last run: 2026-11-27, main `cfc870f`, release v5.1.0, newest pip 26.3 (CPython 3.8–3.14 covered). Open bughunt issues: #2302 (new), #2272, #977 (needs-human). Harness: mock2.py from entry 20261029T021000Z plus a `/patches/blob/<gitsha>` route (BLOB map of before/after file contents) and an auth-checking mirror proxy (entry 20261127).
 
 ## Coverage matrix
 
@@ -10,30 +10,32 @@ Cells dated before 2026-11-11 count as untested for the release (see INSTRUCTION
 | --- | --- | --- | --- |
 | Common path: scan → install → vex → rollback/revert → reinstall | pass (26.3/py3.13, 2026-11-26) | pass (26.3/py3.12, 20.3.4/py3.8, 2026-11-26) | pass (26.3/py3.12, 20.3.4/py3.8, 2026-11-26) |
 | Plain `pip install -r` after rollback / revert (#1953) | n/a | pass: reinstall advisory (2026-11-26) | pass: advisory (2026-11-26) |
-| CRLF + marker + mixed-case name | untested | pass (20.3.4, 2026-11-26; restore normalises name) | pass (20.3.4, 2026-11-26) |
+| CRLF + marker + mixed-case name | pass (26.3/py3.12, 20.3.4/py3.8, 2026-11-27) | pass (20.3.4, 2026-11-26; restore normalises name) | pass (20.3.4, 2026-11-26) |
 | pip-compile hashed pins, `--require-hashes` | pass (old) | pass (26.3 + mirror, 2026-11-26) | pass (24.0/25.0.1, 2026-10-29) |
 | `-r` / `-c` includes | n/a | root file only (documented) | pass (2026-10-29) |
 | `${VAR}` in requirement lines + pylock (#1873) | n/a | pass (refuses) | pass: fixed, six refused, not attested (2026-11-26) |
-| Out-of-root `-r` include (#1851) | n/a | untested since fix | untested since fix |
+| Out-of-root `-r` include (#1851) | n/a | root-only (documented), eject refused (2026-11-27) | pass: refused, fixed (26.3, 2026-11-27) |
 | `pip lock` pylock.toml / `pip install -r pylock.toml` | n/a | pass (26.3, 2026-11-26); sole-package restore refusal is known | pass (26.2.2, 2026-10-29) |
 | Patch mirror (`--patch-mirror-url`, new since v5.1.0) | n/a | pass: re-pin, install, vex, rollback, dead/404 mirror skip, takeover (2026-11-26); without the setting → fail #2272 | pass: eject + `--check` with mirror (2026-11-26) |
 | Editable `-e ./app`, option lines, marker-split duplicates | n/a | pass (26.2.2, 2026-11-01) | pass (2026-11-01) |
 | Extras (`six[foo]`) eject / vendored (#1794) | n/a | pass | pass: refused (2026-11-01) |
 | Vendored comment edited then revert | n/a | n/a | fail #977 (needs-human) |
-| system-site venv / global `-g` (`--user`) | pass (old) | pass (old) | untested |
+| system-site venv / global `-g` (`--user`) | pass (26.3 system-site, 24.0 `-g`, 2026-11-27) | pass (old) | untested |
 | No venv (lock-only) hosted | n/a | `redirect_unconfirmed` / #638 class (closed) | pass |
-| UTF-16 / BOM / PEP 263 coding line | n/a | pass / fail-closed (old) | pass (old) |
+| UTF-16 / BOM / PEP 263 coding line | n/a | pass BOM / fail-closed UTF-16, latin-1 (2026-11-27) | pass BOM / fail-closed latin-1 (2026-11-27) |
+| `pip freeze`-regenerated file, `--max-new-patches` | pass (2026-11-27) | pass (2026-11-27) | pass `--max-new-patches` (2026-11-27) |
+| pip 26.3 `--group` from pylock with group markers | n/a | pass (2026-11-27) | pass (2026-11-27) |
+| Warm venv: follow the printed reinstall advice | n/a | fail #2302 | fail #2302 |
 | macOS / Windows | blocked (probe workflows off by maintainer decision) | blocked | blocked |
 
 ## Backlog
 
-1. #2272: re-verify once fixed (rollback / remove / repair / list / vex without the mirror over mirror pins must name the host and the setting).
-2. Re-verify #1851 (out-of-root `-r` include, vendored + eject; `vex` must not attest) on main with real pip.
-3. Mirror follow-ups: a mirror base with a path that collides with a project-owned URL on the same host (fork in another repository → must be refused); a `-r` include pinned on the patch server then a mirror run (vendored → hosted takeover); `SOCKET_PATCH_MIRROR_AUTHORIZATION` with a 401 mirror (`redirect_mirror_unverified`) followed by a netrc-authenticated pip install.
-4. pip 26.3 new surfaces: `pip install --group dev` from `pylock.toml` / `pylock.<name>.toml` after a hosted / vendored run (must install patched; `vex` must not attest a group not installed); `--uploaded-prior-to` with a hosted URL pin.
-5. Re-run the pre-2026-11-11 cells on main: system-site venv, `-g` / `--user`, PEP 263 coding line, UTF-16 file, `pip freeze`-regenerated file, `--max-new-patches`.
-6. #2201 / #2194 (enhancements, agent-mode RECORD / variant selection): don't re-file; check `pip check` / `pip uninstall` after an agent apply once they land.
-7. Maintainer questions still open (details in history): vex attesting a hosted pin when the venv holds another version; hosted rollback restoring an unpinned root as `==X`; `vendor --revert` vs `rollback` on a one-sided `state.json` merge; residual probe reading only `*.txt` / `*.lock`.
+1. #2272 and #2302: re-verify once fixed (#2302: the hosted / vendored / vex advice for a pip venv must name a command that replaces a same-version install).
+2. Mirror follow-ups: a mirror base with a path that collides with a project-owned URL on the same host (a fork elsewhere → must be refused); a `-r` include pinned on the patch server, then a mirror run (vendored → hosted takeover).
+3. pip 26.3 `--uploaded-prior-to` with a hosted URL pin; `pip lock` re-run over a hosted requirements.txt.
+4. Vendored `--user` / system-site venv on main; hosted `-g` on main.
+5. #2201 / #2194 (enhancements, agent-mode RECORD / variant selection): don't re-file; check `pip check` / `pip uninstall` after an agent apply once they land.
+6. Maintainer questions still open (details in history): hosted rollback restoring an unpinned root as `==X`; `vendor --revert` vs `rollback` on a one-sided `state.json` merge; residual probe reading only `*.txt` / `*.lock`.
 
 ## Known non-bugs
 
@@ -47,3 +49,4 @@ Full list: `known-non-bugs/pip.md` (search with `git grep`). Most likely to be r
 - After an eject, a re-run of `vendor` reports `noManifest` (exit 0).
 - The agent mock needs a `/patches/blob/<sha>` route; "Before blob could not be downloaded" from a mock without it is a harness gap.
 - v5 has no `setup` command / `.pth` hook; that focus area is obsolete.
+- `vex` attests a pylock dependency-group package that the venv didn't install: documented verification basis (lock pin / committed artifact).
