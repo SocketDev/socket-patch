@@ -35,6 +35,11 @@ pub(super) async fn before_rewrite<'a>(
     Cow::Owned(discover_patched_refs_with(&common.cwd, &opts).await)
 }
 
+/// The project as it is now, discovered with the same origins as [`before_rewrite`].
+pub(super) async fn discover_now(common: &GlobalArgs, candidates: &[Candidate]) -> Discovery {
+    before_rewrite(common, candidates, None).await.into_owned()
+}
+
 pub(super) fn unchanged(confirmed: &[(String, String)]) -> PinChanges<'_> {
     confirmed
         .iter()
@@ -44,9 +49,11 @@ pub(super) fn unchanged(confirmed: &[(String, String)]) -> PinChanges<'_> {
 
 fn refs_by_patch(discovery: &Discovery) -> HashMap<(PurlKey, &str), Vec<&PatchedRef>> {
     let mut pins: HashMap<_, Vec<_>> = HashMap::new();
+    // A shadowed pin is still confirmed and managed (see `Discovery::shadowed`).
     for pin in discovery
         .refs
         .iter()
+        .chain(&discovery.shadowed)
         .filter(|pin| pin.mode == WiringMode::Hosted)
     {
         pins.entry((PurlKey::new(&pin.purl), pin.uuid.as_str()))

@@ -2711,6 +2711,17 @@ async fn run_redirect_selected_untracked(
                 Written::Landed { created: &created },
                 vlt_stale.healed_store.as_ref(),
             );
+            // A wet run's writes have landed: when the gate's overlay cannot
+            // stand for the project, read it again. A dry run has no disk to
+            // read and reports `null`.
+            let fresh;
+            let after = match after {
+                None if !common.dry_run && before_pins.is_some() => {
+                    fresh = pin_changes::discover_now(common, &candidates).await;
+                    Some(&fresh)
+                }
+                after => after,
+            };
             pin_changes::compare(before_pins.as_deref(), after, &confirmed)
         };
         record_hosted_events(
