@@ -1,0 +1,90 @@
+# Poetry known non-bugs
+
+One line per ruled-out false positive or documented limitation. Search with `git grep`; don't read the whole file.
+
+- A PyPI mirror as the `default = true` (1.x) / `priority = "default"` (1.5–1.8) source gives six a `[package.source] legacy`, so hosted and vendored refuse it before writing. Documented user-authored-source refusal (r28). `secondary` sources that don't serve six work in both modes.
+- Hosted `vex` attests from the lock when Poetry's venv lives where socket-patch can't see it (for example a `POETRY_CACHE_DIR` exported only to Poetry); with the same env discoverable it refuses with `redirect_pypi_stale_install`. That's the documented lock-only behaviour (r27).
+- `poetry add --lock <other>` on Poetry 1.8.5 / 2.5.1 keeps the hosted / vendored six source and its `files` hash (r27); it's not one of the documented relock commands that drop it.
+- `patches-api.socket.dev` / `patch.socket.dev` / `api.socket.dev` are blocked by the sandbox proxy (403). Use a local mock API (`SOCKET_API_URL`).
+- The CLI's rustls client doesn't trust the sandbox's re-terminating proxy CA. So vendored PyPI fetches (`vendor_fetch_failed`) and **v5 hosted rollback/remove** (re-resolves `https://pypi.org/pypi/<name>/<ver>/json`) fail in the sandbox. Point `SOCKET_PYPI_JSON_API` at a local HTTP forwarder that also rewrites `files.pythonhosted.org`. The repo's `e2e_vex_build -- poetry::` hosted test scrubs `SOCKET_*`, so its rollback step fails in the sandbox for the same reason. Not a product bug.
+- A `poetry.lock` with a UTF-8 BOM is rejected by Poetry itself ("Invalid statement (at line 1, column 1)").
+- A lock whose packages come from a custom `[[tool.poetry.source]]` (even a PyPI mirror, `priority = "primary"`) is refused by hosted (`redirect_poetry_lock_unsupported`, exit 0) and vendored (`pypi_poetry_source_already_exists`, exit 1) before any write. Documented ("a user-authored `[package.source]` on another origin").
+- Agent-mode `vex` on a project with no install hook reports `ecosystem_not_setup` / `no_applicable_patches`. Documented.
+- `vex` on a `package-mode = false` project with no version needs `--product` (`product_undetected`). Expected.
+- Poetry 1.8 ignores PEP 621 `[project]` dependencies, so "`[project].name` + `[tool.poetry].name`" is n/a before 2.0.
+- CLI_CONTRACT.md lives at `crates/socket-patch-cli/CLI_CONTRACT.md`, not the repo root.
+- Running from a subdirectory of a Poetry project doesn't find it: pypi is cwd-only (CLI_CONTRACT.md "Monorepo / multi-project discovery model"; use `--cwd` or a directory target).
+- On Poetry < 1.4, vendored emits `pypi_poetry_integrity_unverified` and hosted emits `redirect_poetry_stale_install_risk`. Both are deliberate advisories.
+- On Poetry 1.1–1.3, a warm venv keeps the upstream bytes after a hosted rewrite, even when Poetry prints "Updating six (1.16.0 -> 1.16.0 <url>)". Documented. v5 flags it as `redirect_pypi_stale_install` and refuses VEX.
+- `poetry check --lock` fails on Poetry 1.1 / 1.2 (1.2 has no `--lock` option, and 1.1's `check` crashes). This isn't caused by socket-patch.
+- Poetry 1.0 + pip 22.3 / 23.0 (e.g. venvs seeded with pip 23.0.1) refuses the hosted wheel's `#sha256=…&#egg=` fragment. Documented, and named in the `redirect_poetry_stale_install_risk` detail. Use pip ≤ 22.2 or ≥ 23.1.
+- Poetry 1.0 writes empty `[metadata.files]` against today's PyPI. Documented (backtest "populated" shape).
+- Vendored `--vex` on a warm, unpatched venv still attests, with the warning `vendored_tree_out_of_sync`. Documented in CLI_CONTRACT.md.
+- `list` / standalone `vex` only recognise hosted pins on Socket's origin. A mock origin needs `--patch-server-url`.
+- `scan --json` with several directory targets is refused ("--json takes one project directory").
+- v5 removed `--vendor-source build` (local artifact construction). Repair re-downloads from the service.
+- Agent rollback needs the "before" blob from `/v0/orgs/<org>/patches/blob/<hash>`. A mock without that route gives `missing_blob`.
+- `scan --mode agent` re-run after a failed apply says `[skip] … (already recorded)` and exits 0 with the file unpatched. That's by design (it prints "run `socket-patch apply` to re-apply them"), and `apply` / `vex` then report the failure correctly.
+- My mock answers every per-ecosystem batch with the same patch, so a mode-less multi-ecosystem scan lists `six` twice. That's a mock artifact; pass `--ecosystems pypi`.
+- In the sandbox, `/usr/lib/python3/dist-packages/six` is an apt `.egg-info` install. Since #452 the crawler sees it, so global-fallback cells pick it up (see backlog 1). Use `pip install --user --ignore-installed` for a controlled global copy, and `rollback` afterwards if agent mode patched it.
+- `POETRY_VIRTUALENVS_IN_PROJECT=yes` / `on` is true to socket-patch and false to Poetry (`boolean_normalizer` accepts only "true" / "1"). Theoretical, not filed.
+- The CLI's PyPI requests (hosted rollback, hosted → vendored takeover) need `SOCKET_PYPI_JSON_API` pointed at a local forwarder in the sandbox. Without it the takeover fails closed with `redirect_revert_failed`. A forwarder script that rewrites `files.pythonhosted.org` works.
+- Concurrent `scan` runs in one project: the extra runs exit 1 with "Another socket-patch process is operating in this directory" (use `--lock-timeout`). This is by design.
+- Dotted names (`jaraco.context`): Poetry 1.1 keeps the dotted name in the lock (quoted `[metadata.files]` key), Poetry ≥ 1.8 canonicalizes it. Hosted rewrite, install, vex and rollback all work with both purl spellings (r5).
+- `rollback -g --json` with no manifest returns `error` as a plain string ("Manifest not found"), not a `{code, message}` object. This is a shape nit, not Poetry-specific, and not filed.
+- Poetry 1.8 – 2.2 with `virtualenvs.create = false` running as root in this image reinstall a user-site package into `/usr/local/lib/python3.11/dist-packages`. That's Poetry's behaviour, not socket-patch.
+- The uv-tool-installed Poetry in this image builds `poetry env use python3.12` envs on its own 3.11 interpreter (`pyvenv.cfg` says 3.11.15). That's a sandbox quirk; use pip-installed Poetry for multi-interpreter cells.
+- In agent `scan --json`, `ecosystems: [npm]` reports `policy.counts.filtered: 2` for a single `six` (likely the lock and the installed copy). Cosmetic, not filed.
+- Forked Poetry locks (one package at several versions by marker) are refused by hosted (`redirect_poetry_lock_unsupported`, "forked Poetry package requires an unambiguous source") and vendored ("forked resolution"). Documented in CLI_CONTRACT.md.
+- Hosted `vex` attests a lock pin for a package that isn't installed (for example an optional group left uninstalled). Documented ("with nothing installed, attests a discovered lockfile reference from its integrity pin").
+- `rollback` on a project with no manifest, ledger or hosted pin gives "Manifest not found", exit 1. Documented (truly-empty project).
+- Hosted-only `rollback --json` reports `rolledBack: 0` while it restores the lock. Cosmetic, not filed.
+- uv can't install from `poetry export` output against the sandbox mock (it sends `HEAD`, which the mock doesn't answer). Mock artifact.
+- Poetry 1.0's `EnvManager.get()` uses an existing `./.venv` even with an explicit `virtualenvs.in-project = false`; 1.1+ honour the `false` and socket-patch follows them. It only diverges when Poetry 1.0 also has an out-of-tree env. Theoretical, not filed.
+- Hosted `socket.yml` narrowing lists recorded pins under `policy.filtered` rather than `retained` when the mock origin isn't the patch server. Set `SOCKET_PATCH_SERVER_URL`; this is the documented hosted-origin rule.
+- #543's vendored "unwired ledger entry" check doesn't cover pypi (`dispatch_in_use_one` returns `None`), so Poetry vendored re-runs are unchanged by it.
+- A test mock that answers every `/patches/batch` with the same patch makes agent scans report `partial_failure` for packages the project doesn't have. Filter the mock to the requested purls.
+- Poetry < 2.1 has no `data-dir` config key, so `{data-dir}` in `virtualenvs.path` stays a literal relative directory, and socket-patch matches it.
+- `vex` saying "No applied patches with vulnerability metadata" after a hand-staged manifest with empty `vulnerabilities` is a fixture artifact.
+- Poetry 1.x's env-var `boolean_normalizer` is case-sensitive (`POETRY_VIRTUALENVS_IN_PROJECT=True` is false), while 2.x lowercases. Same theoretical class as `yes` / `on`; it only diverges with a stray `.venv`. Not filed.
+- Standalone `vex --json` needs `-O <file>` (`-o` is `--org`), and against a mock it needs `--api-url` / `--org` for vulnerability metadata. Without them you get harness errors, not product bugs.
+- Hosted `rollback` prints "1 unwired package keeps its patched bytes in installed trees" even when no venv exists. Cosmetic, not filed.
+- Hosted `rollback` / `remove` on a lock mixing CRLF and LF rewrites the whole file as LF (content equal modulo EOL; Poetry still installs). Tracked under #814 child 2 (comment from run 13), not filed separately.
+- Release 4.0.0 doesn't redirect against a v5-shaped mock (`Redirected 0`). It's no baseline for hosted cells.
+- A vendored grant needs `integrity.sha512` on the tarball artifact. A mock grant with only `sha256` gives `vendor_prebuilt_required` ("tarball artifact has no sha512 integrity"), and a takeover then un-hosts first. Mock artifact.
+- uv's standalone CPython ships an `EXTERNALLY-MANAGED` marker, so Poetry with `create = false` fails at `pip uninstall`. Delete the marker in the sandbox.
+- Copying a project together with its `.venv` (virtualenv-created) keeps pip entry scripts pointing at the source venv, so Poetry 1.1 installs land in the wrong tree. Always create fresh venvs.
+- `redirect_takeover_unpatched` after a refused lock is documented in CLI_CONTRACT.md. #945 covers only the Poetry 0.x dry-run mismatch and the missing pre-revert gate.
+- Symlinked `poetry.lock`: hosted (`redirect_symlinked_file_unsupported`) and vendored (`pypi_poetry_symlink_unsupported`) both refuse before writing. Documented.
+- With Poetry ≤ 2.2, `poetry lock` creates the project env. A "fresh checkout" cell has to delete the env after locking, or the scan correctly finds it.
+- Two patched packages: `remove` of one keeps the other's hosted / vendored wiring (r15, LF + CRLF, Poetry 1.8.5 / 2.5.1). Not a bug.
+- A mock that rebuilds its wheel on every request (zip timestamps) makes `poetry install` fail "Hash … not found in known hashes", and Poetry then keeps the bad bytes in `~/.cache/pypoetry/artifacts` (keyed by URL). Build the mock wheel deterministically and clear that cache.
+- Hosted rollback of an exported `requirements.txt` beside `poetry.lock` folds its `\` continuation lines into one line (semantically equal). It's pip's file and cosmetic, so not filed.
+- Vendored with `poetry.lock` + `requirements.txt` warns `pypi_multiple_lockfiles` and wires only `poetry.lock`. Documented.
+- Hosted rollback of a hand-edited six unit (inline / tab-indented / empty / wheel-only / sdist-only `files`, a missing `files` key, quoted or `six=[` `[metadata.files]` keys) writes Poetry's canonical multi-line full-release `files` back, not the original bytes. Documented (hosted rollback "has no … guarantee of the original byte layout").
+- `docs/testing/poetry-compatibility/` (named in the routine prompt) doesn't exist on main; only `docs/testing/poetry-compatibility.md` does.
+- Hosted → vendored `scan --dry-run` reports only `verified` (exit 0) and doesn't model the takeover, even when the wet run refuses (exit 1). Documented in CLI_CONTRACT "Takeover reconciliation"; #944 closed not planned. The wet run keeps the hosted pin.
+- A path dependency's own `source = "pypi"` pin doesn't break the root project's install after a rewrite (Poetry 2.2.1), so the guard reading only the root pyproject is correct.
+- An explicit `[[tool.poetry.source]] name = "PyPI"` declaration doesn't rescue Poetry 1.8 / 2.2 from the `source = "pypi"` failure, so the guard isn't over-refusing there.
+- Poetry 1.2.2 can't be installed with uv without `--prerelease=allow` + `cleo==1.0.0a5` (yanked cleo 1.0.0). Sandbox setup, not a product issue.
+- A `pyproject.toml` with a UTF-8 BOM is rejected by Poetry 2.5.1 itself ("Invalid TOML file … Empty key at line 1 col 0").
+- six as a git dependency (`[package.source] type = "git"`): hosted (`redirect_poetry_lock_unsupported`) and vendored (`pypi_poetry_source_already_exists`, exit 1) refuse it before any write. Documented user-authored-source refusal.
+- `rollback` / `vendor --revert` exit 1 with `vendor_revert_kept` / `vendor_revert_residual_reference` when another `poetry.lock` under the project tree (e.g. a test copy in a subdirectory) still references the vendored wheel. That's the guard working, so keep scratch copies outside the project.
+- After `remove` of one package in a vendored + hosted project, a bare `scan` follows the remaining state and re-adds patches the service still offers. `remove` isn't an ignore rule; use `socket.yml` `ignorePackages`.
+- Poetry 1.0.10 can't lock a `source = "pypi"` dependency at all ("doesn't exist, version solving failed"), so the source-pin guard has no lock-format-1.0 case.
+- A vendored scan killed partway leaves `.socket/apply.lock` and some wheels under `.socket/vendor/pypi` with the lock untouched; the next scan proceeds and converges. Not a bug.
+- A hosted scan of a one-package Poetry project finishes in under 50 ms, so a SIGKILL can't land mid-write. The lock is written by atomic replace (CLI_CONTRACT "Staged takeover"). Not a bug.
+- The source-pin guard (`pyproject_source_constraints`) reads `[tool.poetry.dependencies]`, `dev-dependencies` and every `group.*.dependencies`; a group-only pin is covered.
+- `[project].name` + `dynamic = ["version"]` + a different `[tool.poetry].name`: product detection returns `product_undetected` on purpose (`product.rs` `pyproject_name_version`), because Poetry 2 builds `[project].name` ("[tool.poetry.name] … will be ignored") and Poetry 1.x builds `[tool.poetry].name`. Use `--product`. Not filed.
+- `explicit` / `supplemental` `[[tool.poetry.source]]` entries that six doesn't resolve from are not refused by hosted or vendored (r22). The refusal only covers a source six actually uses.
+- Hosted → vendored takeover against a mock origin fails with "already declares a [package.source] for six; refusing to overwrite a user-authored source" unless `SOCKET_PATCH_SERVER_URL` names the mock (the hosted-origin rule). Harness artifact.
+- A scan racing a concurrent `poetry install` may report `package_not_installed` and leave six unpatched (exit 0). `vex` then refuses, so nothing is misattested. Expected race outcome.
+- `scan --mode hosted` over agent state keeps `.socket/manifest.json`; a later bare `scan` resolves to agent mode and warns that the hosted wiring is still live. Documented mode resolution.
+- Hosted `rollback` of a poetry-plugin-export `pylock.toml` whose only registry package is the hosted one refuses (`hosted_restore_refused`, "no sibling registry package shows the registry and artifact fields", exit 1, nothing rolled back, `poetry.lock` kept hosted too). CLI_CONTRACT "Hosted unwind coverage" refuses a pylock whose other registry packages show no `index`. With none, the restore has no evidence, and the message names the `git checkout` remedy. With one sibling (idna) it restores fine (r24). Not filed.
+- Hosted rollback of a lock with no final newline adds one, and a restored pylock entry's `upload-time` keeps millisecond precision. Covered by "no guarantee of the original byte layout". Not filed.
+- A bare `--vex` flag is a usage error: `scan --vex` takes a path (`--vex vex.json`).
+- Vendored with an exported `pylock.toml` that pins the package beside `poetry.lock` wires only the pylock and leaves `poetry.lock` on its registry source (`pypi_multiple_lockfiles`; `vendor --check` says "wiring contested"). Documented precedence: standalone PEP 751 locks rank between uv and Poetry when they pin the package (`formats/governing_locks.rs` `PYPI_TOOL_LOCKS`). So a hosted → vendored takeover returns `poetry.lock` to upstream. Not filed (r25).
+- A project path containing `;` breaks vendored installs on Poetry 1.0 (pip parses the absolute wheel path as `requirement; marker`, "Invalid marker"). Any path dependency there fails the same way; `#` and `%20` are fine, and Poetry 2.5.1 is fine with all three. Not filed (r26).
+- With several exported pylocks (`--with dev` → `pylock.toml`, `--with test` → `pylock.test.toml`), hosted warns `redirect_uv_entry_not_found` for each package a pylock deliberately doesn't list, and vendored repeats one generic "wiring pylock.test.toml, pylock.toml" warning per package. Cosmetic, handed to pip (r26).
+- `list --json` reports patches as `events[]` with `action: discovered`, not a `patches` array. Not a bug.
+- Hosted / vendored `rollback` on Poetry 1.4+ (1.8.5, 2.5.2): the next `poetry install` prints "Updating six (… -> 1.16.0)" and restores upstream bytes, so the generic reinstall note is right there (r29). Only 1.0–1.3 are wrong (#2320).

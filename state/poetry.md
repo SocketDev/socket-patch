@@ -1,470 +1,52 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-17 (run 28), main `7d3086f` (only a CI change since `657fce2`), latest release **v5.0.1**. Run 9 re-measured the cells marked "r9". Runs 10–28 have their own tables below. #327, #329, #671, #866, #945, #1023, #1024, #1136, #1282, #1447, #1503, #1527 and #1547 are closed. Open: #450, #1615, #1635 (and #1589, filed by the uv routine, with Poetry evidence). macOS / Windows cells that still show #327 / #329 haven't been re-run, because probe branches are blocked.
+Last run: 2026-11-27 (run 29), main `cfc870f`, latest release v5.1.0 (2026-11-11), newest Poetry 2.5.2 (2026-11-21).
+
+Compacted in run 29 from a 54 KB file. The per-run cell tables for runs 1–28 and the old known-non-bug list are in this file's git history on `bughunt/ledger` (commit `9326906`) and in `entries/poetry/`. Open bughunt issues: #2320. Closed since run 28: #450, #1105, #1184, #1589, #1615, #1635 (all fixed). #1114 (arch-audit, not bughunt) is still open, though #2229 says it fixes it.
 
 ## Coverage matrix
 
-Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local mock of the patch API (patches-api.socket.dev is blocked from the sandbox) serving a patched `six-1.16.0` wheel, then a real `poetry install` / `poetry sync` and a byte check of the installed file. The existing `poetry-compatibility.yml` matrix (Linux + macOS) covers the plain cells against production. Rows before run 3 were measured on main `f6b7fb9` (pre-v5). Run 3 re-measured the cells marked "v5". Run 5 re-measured the cells marked "r5" on `6e7ef74` (after #330); #327 cells on macOS / Windows still show the pre-fix result because probe branches are blocked.
+Linux only (macOS / Windows probes are switched off; see INSTRUCTIONS.md). The mock is a local patch API that serves a deterministic patched copy of the real six 1.16.0 wheel (grant with sha256 + sha512, view, blob). Real Poetry, real PyPI (now reachable directly). A cell dated before 2026-11-11 counts as untested for the release.
 
-| OS | Poetry | Agent (in-project `.venv`) | Agent (default out-of-tree venv) | Agent: nameless `package-mode=false` / `[project].name` override / `in-project=false` + stray `.venv` | Agent + hosted VEX: `in-project=true`, no `.venv`, existing out-of-tree env | Hosted (scan, install, rollback) | Hosted VEX with undiscovered venv | Vendored | Mode switch hosted ⇄ vendored | Vendored `repair` (lock-only, wheel deleted) |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 0.12.17 | untested | untested | n/a | untested | pass v5 (refused, `redirect_poetry_lock_unsupported`) | n/a | pass v5 (`[metadata.hashes]`); r14 pass | vendored→hosted fail #945 | untested |
-| Linux | 1.0.10 | untested | pass r8 (scan, re-run, vex, rollback) | n/a | untested | pass v5 (lock 1.0 native-empty + populated; pip ≥ 23.1); r26 10 hand-edited lock 1.0 shapes pass | untested | pass v5 (populated lock 1.0); r19 supersede A → B | r19 pass (two-package partial takeovers, LF + CRLF) | r23 pass (lock-only, wheel deleted, fresh install patched) |
-| Linux | 1.1.15 | pass v5 | pass r8 (scan, re-run, vex, rollback); r9 `envs.toml` (3.10/3.11) pass | n/a | fixed by #527 (not re-run) | pass v5 (lock 1.1, extras + dev); r5 dotted name `jaraco.context` rewrite/install/vex/rollback | untested | pass v5 (LF + CRLF, unicode/space path); r19 supersede A → B (lock 1.1) | pass r14 (both ways, LF + CRLF); r19 two-package partial takeovers | pass r19 (after supersede) |
-| Linux | 1.2.2 | r23 pass (scan, re-run, vex, rollback) | r23 pass (scan, re-run, vex, rollback) | n/a | untested | pass v5 (lock 1.1, extras + dev, warm-venv stale check) | untested | pass (lock 1.1) | untested | untested |
-| Linux | 1.8.5 | untested | pass; r9 `envs.toml` + custom path pass | pass r5 (fixed by #330; nameless, in-project=false, unicode path) | pass r9 (#527) | pass v5 (LF + CRLF) | pass r5 (#330) | pass v5 (LF + CRLF, unicode/space path) | pass r14 (both ways, LF + CRLF) | pass v5 (#380 fixed) |
-| Linux | 2.0.1 | pass r17 | pass | pass r5 (fixed by #330; nameless, in-project=false, unicode path, both names) | fixed by #527 (not re-run) | pass v5 (LF + CRLF); r17 `re-resolve=false` pass; `source = "pypi"` fixed by #1413 (r18 on 1.5–2.5; 2.0.1 not re-run) | pass r5 (#330) | pass r17 (LF + CRLF, `re-resolve=false`); `source = "pypi"` fixed by #1413 (r18 on 1.5–2.5; 2.0.1 not re-run) | pass r21 (both ways, LF + CRLF) | untested |
-| Linux | 2.1.1 / 2.1.4 | r22 pass (2.1.4: scan, re-run, vex) | r22 pass (2.1.4) | untested | untested | pass v5 (repo e2e, up to rollback); r22 2.1.4 pass (install, `sync`, rollback byte-identical) | untested | pass v5 (repo e2e); r22 2.1.4 pass (`vendor --check`) | r22 pass (2.1.4, both ways, fresh install after each, rollback) | r22 pass (2.1.4) |
-| Linux | 2.3.3 | pass | pass | pass r11 (all 3 layouts) | untested | pass (groups, markers, path/url deps, supersede, dry-run, get) | untested | pass (path/url deps) | fixed by #503 (not re-run) | fixed (#380) |
-| Linux | 2.4.3 | r23 pass (scan, re-run, vex, rollback) | pass; r23 pass | pass r11 (all 3 layouts) | untested | pass (LF + CRLF) | r27 pass (discovered warm venv: `redirect_pypi_stale_install`, vex refuses; truly undiscovered venv: documented lock-based attestation) | pass (LF + CRLF, CI) | r23 pass (both ways, fresh install after each, `sync`, rollback byte-identical) | fixed (#380) |
-| Linux | 2.5.1 | pass v5 | pass r5 (full agent cycle incl. rollback + vex) | pass r5 (all 3 cases, plus long names, symlinked dir, relative / `{cache-dir}` / `~` virtualenvs.path, XDG_CACHE_HOME, `.venv` symlink) | pass r9 (#527) | pass v5 (LF + CRLF, PEP 621 extras/groups/markers, `sync`, `remove`, dry-run, `get`, relock/`add`, directory targets) | pass r5 (#330: stale check fires) | pass v5 (LF + CRLF, unicode/space path) | hosted→vendored pass r5; vendored→hosted pass r10 (#328 fixed by #503); r14 both ways LF + CRLF pass, mixed EOL → whole-file LF (#814) | pass v5 (#380 fixed) |
-| macOS | 1.8.5 | untested | pass | fail #327 (closed; not re-run) | untested | pass (LF + CRLF) | untested | pass (LF + CRLF) | untested | untested |
-| macOS | 2.0.1 | untested | pass | fail #327 (closed; not re-run) | untested | untested | untested | untested | untested | untested |
-| macOS | 2.4.3 | untested | pass | fail #327 (closed; not re-run) | untested | pass (LF + CRLF) | untested | pass (LF + CRLF) | untested | untested |
-| macOS | 2.5.1 | untested | untested | untested | untested | untested | untested | untested | untested | untested |
-| Windows | 1.8.5 | untested | fail #329 (closed; not re-run) | fail #327 (closed; not re-run) | untested | pass (LF + CRLF) | untested (likely #327/#329) | pass (LF + CRLF) | untested | untested |
-| Windows | 2.0.1 | untested | fail #329 (closed; not re-run) | fail #327 (closed; not re-run) | untested | untested | untested | untested | untested | untested |
-| Windows | 2.4.3 | untested | fail #329 (closed; not re-run) | fail #327 (closed; not re-run) | untested | pass (LF + CRLF) | untested (likely #327/#329) | pass (LF + CRLF) | untested | untested |
-| Windows | 2.5.1 | untested | untested | untested | untested | untested | untested | untested | untested | untested |
-
-### Venv selection and policy (run 7, Linux, main `61cfb9b`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 1.8.5, 2.5.1 | Several per-minor envs (`poetry env use`), active env sorts after an older one (3.11→3.12, 3.10→3.13), custom and default `virtualenvs.path` | fixed by #527; pass r9 (2.5.1, 1.8.5, 1.1.15) |
-| 1.8.5, 2.5.1 | Several per-minor envs, active env sorts first | pass (by luck) |
-| 2.5.1 | `VIRTUAL_ENV` set to another venv + `envs.toml` entry for the project | fixed by #527 (unit-tested; r9 conda variants pass) |
-| 2.5.1 | #456: reinstall wipes the patch, `scan --mode agent` re-applies | pass |
-| 2.5.1 | Agent `socket.yml`: `minSeverity`, `ignorePackages` (purl, name, case), `maxNewPatches: 0`, `ecosystems`, `ignorePaths`, `enabled: false`, retain-on-narrow | pass |
-| 2.5.1 | Hosted `socket.yml` | untested (mock has no grant route) |
-
-### Global mode (`-g` / `--global-prefix` / `SOCKET_GLOBAL=1`), agent patches (run 4)
-
-Global installs aren't Poetry-specific (Poetry never installs globally unless `virtualenvs.create = false`), so these cells were run from inside a Poetry 2.1.1 project (in-project `.venv`) against a real `pip install --user` copy and a `pip install --target` prefix.
-
-| OS | Cell | Result |
-| --- | --- | --- |
-| Linux | `scan -g` report-only (`--json`): global user-site `six` found, project `.venv` and lock-only packages don't leak in | pass |
-| Linux | `scan -g` sees Debian/apt `.egg-info` installs | fixed by #452 (but see #501) |
-| Linux | `scan -g` sees Poetry's official-installer venv (`~/.local/share/pypoetry/venv`, custom `POETRY_HOME`) | pass r13 (#640 fixed by #644) |
-| Linux | `scan -g --mode hosted`, `--global-prefix --mode hosted`, `SOCKET_GLOBAL=1 --mode hosted`: exit 2, poetry.lock untouched | pass |
-| Linux | `scan -g --mode agent`, re-run idempotent, `get <uuid> -g`, `SOCKET_GLOBAL=1 get`: global copy patched, `.venv` and lock untouched | pass |
-| Linux | `vex -g` attests applied global patch; plain `vex` refuses (`not_applied`) | pass |
-| Linux | `rollback -g` restores the global copy byte for byte | pass |
-| Linux | Cross-scope rollback (project apply + `rollback -g`, or `-g` apply + `rollback`) | fail #450 (still on `d63ae5f`, r9) |
-| Linux | `scan -g` / `create = false` project scan with the same release in user site **and** a system dir (apt egg-info or `/usr/local` dist-info) | fixed by #538 (not re-run) |
-| Linux | #436/#445 on a hosted Poetry project: `get -g --mode hosted\|vendored`, `scan -g --mode hosted\|vendored` refuse; `rollback -g` / `remove -g` leave `poetry.lock` alone | pass (r6) |
-| Linux | Poetry `virtualenvs.create = false`, single system copy | pass (r6: 1.8.5, 2.0.1, 2.2.1, 2.5.1) |
-| Linux | `vex -g` from a hosted, synced Poetry project with an unpatched global copy: refuses (`not_applied`) | pass (r5) |
-| Linux | `list -g` from a hosted Poetry project lists the project's hosted pin | not filed (PR #446 notes it) |
-| Linux | Read-only `--global-prefix` (non-root user, path with space + `é`): human mode shows the error, exit 1 | pass; JSON drops the error (#424) |
-| Linux | Project scan without `-g`, Poetry venv undiscovered / not created yet: falls back to and **patches** the global interpreter | #327 layouts fixed by #330 (r5); `in-project = true` + no `.venv` fixed by #527 (r9 pass) |
-| macOS / Windows | all of the above | untested (probe branches blocked) |
-
-### Run 8 cells (Linux, main `61cfb9b`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 2.5.1 | Hosted, then `poetry export` (plugin), then `pip install -r` | pass |
-| 2.5.1 | Hosted with a `supplemental` / `explicit` mirror source, six from PyPI | pass (install, `check --lock`, vex) |
-| 2.5.1 | Forked lock (six at two versions by marker) | hosted and vendored refuse before writing (documented) |
-| 2.5.1 | Agent, `virtualenvs.options.system-site-packages = true`, six in system site | fail #409 (comment): Poetry 2 skips installing into `.venv`, agent says `package_not_installed`, exit 0 |
-| 1.8.5 | Same, agent | pass (Poetry 1.8 installs into `.venv`) |
-| 1.8.5, 2.5.1 | Same, hosted, then install, then vex | pass |
-| 1.8.5, 2.5.1 | Hosted, then install with `installer.no-binary` = `six` / `:all:` | pass |
-| 1.8.5, 2.5.1 | Hosted `rollback` (PyPI forwarder), `check --lock`, reinstall | pass |
-| macOS 1.2–2.x | `XDG_CACHE_HOME` / `XDG_CONFIG_HOME` set (platformdirs ≥ 4.6 honours them on macOS; socket-patch doesn't) | untested, suspected fail (needs probe) |
-| Windows 1.0/1.1 | Out-of-tree env-name hash (Poetry < 1.2 doesn't `normcase`; socket-patch lowercases) | untested, suspected fail (needs probe) |
-
-### Run 9 cells (Linux, main `d63ae5f`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 2.5.1, 1.8.5, 1.1.15 | `poetry env use` on two minors (`envs.toml`): only the active env is patched, `poetry run` imports the patched copy | pass (#526 fixed) |
-| 2.5.1, 1.8.5 | `envs.toml` under a custom `virtualenvs.path`, `Demo_App.Core` name, path with a space and `é` | pass |
-| 2.5.1, 1.8.5 | `CONDA_PREFIX` + `CONDA_DEFAULT_ENV` = work / base; `VIRTUAL_ENV` under conda base; empty `CONDA_PREFIX` / `VIRTUAL_ENV` | pass |
-| 2.5.1 | #538: two envs, no `envs.toml`; drift in one copy: `vex` refuses, `apply` re-run fixes it, `rollback` restores both | pass |
-| 2.5.1 | Project apply with the same release in user site | pass (user site untouched) |
-| 2.5.1, 1.8.5 | Hosted + `envs.toml` envs: `vex` follows the active env (refuses for the stale env) | pass |
-| 2.5.1 | Hosted `socket.yml`: minSeverity, ignorePackages, ecosystems + `--prune`, `enabled: false`, maxNewPatches, ignorePaths, includePaths | pass (needs `SOCKET_PATCH_SERVER_URL` for `retained`) |
-
-### Run 10 cells (Linux, main `045d7ec`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 2.5.1, 1.8.5, 1.1.15 | Vendored → hosted takeover, then fresh install | pass (#328 fixed) |
-| 2.5.1, 1.8.5 | Vendored + `poetry add` sibling edit, re-run, rollback; relock drops the wiring, then `vendor_artifact_reused` | pass |
-| 2.5.1 | Agent `scan` (API path) after the env set changes (`env use` + `env remove`) | pass |
-| 2.5.1, 1.8.5 | Agent apply with an uninstalled optional group (#555) | pass |
-| 2.5.1 | Hosted with path-prefixed `--patch-server-url` (scan, re-scan, list, vex, rollback) | pass |
-| 2.5.1, 1.8.5 | Vendored install via `poetry -C` / `--directory` / from a subdir | pass |
-| 2.5.1, 1.8.5 | Hosted `virtualenvs.create = false` into an activated env | pass |
-| 1.1.15, 2.5.1 | `Jinja2` / `typing_extensions` name normalization × hosted / vendored / agent | pass |
-| 1.1.15 → 1.8.5 / 2.5.1 | Lock 1.1 rewrite consumed by newer Poetry, tampered hash refused | pass |
-| 1.8.5 | `installer.modern-installation = false`, warm venv | Poetry keeps the upstream bytes; CLI fail-closed (stale warning, vex refuses); docs table is inaccurate |
-| 1.1.15, 1.8.5, 2.5.1 | `virtualenvs.path = "{project-dir}/.envs"` | fail #608 |
-
-### Run 11 cells (Linux, main `045d7ec`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 2.3.3, 2.4.3 | #327 layouts (nameless `package-mode=false`, `[project].name` override, `in-project=false` + stray `.venv`), agent scan finds the out-of-tree env | pass |
-| 2.2.1 (official installer), 1.8.5 (`POETRY_HOME`) | `scan -g` crawls `$POETRY_HOME/venv` / `~/.local/share/pypoetry/venv` | fail #640 (pipx-layout control passes) |
-| 2.5.1 | `virtualenvs.path = "{data-dir}/venvs"`; `cache-dir = "{data-dir}/cache"` | fail (commented on #608; `data-dir` key exists from Poetry 2.1) |
-| 1.8.5 | same (`{data-dir}` stays literal in Poetry < 2.1) | pass |
-| 1.8.5, 2.5.1 | `path = "{cache-dir}/venvs"` control | pass |
-
-### Run 12 cells (Linux, main `045d7ec`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 1.3.2 → 1.8.5 (every minor) | Hosted, warm venv: the 1.3 / 1.4 boundary (version stamp, advisory, byte replacement), then `vex` | pass (matches the docs) |
-| 1.3.2, 1.4.0, 1.5.1, 1.7.1, 2.0.1, 2.1.1 | Vendored scan, install, vex (1.3.2 warns `vendored_tree_out_of_sync`) | pass |
-| 1.2.2 – 1.7.1, 2.1.1 | Agent, out-of-tree env, `Demo_App.Core` / `My Proj é` names | pass |
-| 2.1.1 | Agent list / rollback / apply / repair / remove | pass |
-| 2.5.1 | Agent, dev-group-only patch, `sync --without dev`, then `vex` omits it | pass |
-| 2.5.1 | Hosted / vendored with six as a path-wheel or URL dependency | refused before any write (documented) |
-| 1.0.10, 1.1.15 | Hosted on a CRLF lock + fresh install + idempotent re-scan | pass |
-| 1.0.10, 1.1.15, 1.3.2 | Hosted rollback (via the forwarder): byte-identical lock | pass |
-| 1.8.5, 2.5.1 | `virtualenvs.create = false` + stray `./venv`, or `./.venv` with `in-project = false` | fail #671 (also release 4.0.0 and the PR #644 head) |
-| 2.5.1 | `create = false` controls (no stray tree; `.venv` with in-project unset) | pass |
-
-### Run 13 cells (Linux, main `99f61d2`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 2.5.1, 1.8.5 | #608 re-check: `{data-dir}/venvs` (2.5.1), `{project-dir}/.envs` literal (1.8.5) + vex | pass (fixed by #644) |
-| any | #640 re-check: `scan -g` / `rollback -g` on `$POETRY_HOME/venv` and `~/.local/share/pypoetry/venv` | pass (fixed by #644) |
-| 2.5.1, 1.8.5 | `{data-dir}/venvs` + `env use` + unrelated `VIRTUAL_ENV` / conda env | fail #866 (agent over-patches; hosted vex refuses) |
-| 2.5.1 | default path + `env use` + unrelated `VIRTUAL_ENV` | pass (control) |
-| 2.5.1, 1.8.5 | Hosted forward splice on a mixed CRLF/LF lock (#703) | pass |
-| 1.2.2 | Hosted on a mixed lock 1.1 (`[metadata.files]` LF), then install | pass |
-| 2.5.1, 1.8.5 | Hosted `rollback` / `remove` on a mixed lock | whole file goes LF (see #814, comment) |
-| 2.5.1 | #671, #450 | still fail |
-
-### Run 14 cells (Linux, main `9c43dfc`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 2.5.1, 1.8.5, 1.1.15 | hosted → vendored → hosted takeovers + fresh installs + rollback, LF and CRLF locks | pass (EOL kept, rollback byte-identical) |
-| 2.5.1 | same on a mixed CRLF/LF lock | takeover revert writes the lock all-LF (#814 child 2) |
-| 2.5.1 | symlinked `poetry.lock`: hosted / vendored takeover | pass (both refuse before writing) |
-| 0.12.17 | vendored → hosted takeover | fail #945 (dry run promises `redirected: 1`; wet run un-vendors, then refuses) |
-| 2.5.1 | #866, #671 | still fail |
-| 2.5.1, `create = false` (uv CPython) | hosted `vex` / agent with an apt `python3-six` in `/usr/lib/python3/dist-packages` | vex refuses (`not_applied`); agent also patches the dpkg-owned copy. Lead (backlog 1) |
-
-### Run 15 cells (Linux, main `db83f01`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 2.5.1, 2.2.1, 1.8.5 | Fresh lock-only checkout (default `create = true`, no env yet), apt `six` in system Python: vendored | fail #1023 (exit 1, `pypi_poetry_lock_package_missing`) |
-| 2.5.1 | same, agent | fail #1023 (patches dpkg-owned `six.py`) |
-| 2.2.1 | `in-project = true`, no `.venv`, no out-of-tree env | fail #1023 |
-| 2.2.1 | `create = false` | fallback intended |
-| 2.5.1, 1.8.5 | Two patched packages, `remove` one: hosted + vendored, LF + CRLF; vendored `remove <uuid>` | pass |
-| 2.5.1 | `remove` / `rollback` with a non-canonical PyPI purl (`typing_extensions`, `Typing-Extensions`), agent / hosted / vendored | fail #1024 |
-| 0.12.17 | #945 re-check | still fails (commented) |
-
-### Run 16 cells (Linux, main `3b4ac84`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 1.1.15, 1.8.5, 2.0.1, 2.4.3 (LF + CRLF) | Vendored A → vendored B (superseding uuid), dry run, `get --mode vendored` | fail #1136 (wet exit 1 `pypi_poetry_source_already_exists`; dry run `would_revendor`) |
-| 1.1.15, 1.8.5, 2.4.3 (LF + CRLF) | Hosted A → hosted B (#1035), then `remove` / `rollback`, fresh installs | pass |
-| 1.1.15, 1.8.5, 2.4.3 | Hosted A → vendored B takeover, venv holds A | fail (#1105 comment): exit 1 `package_not_installed`, dry run `would_vendor` |
-| 1.8.5 | same, no venv; or B = A | pass |
-| 2.4.3 | `poetry.lock` + exported `requirements.txt`: hosted (scan, `pip install -r`, rollback) / vendored | pass / `pypi_multiple_lockfiles` (documented) |
-| 2.4.3 | #1023 / #671 re-check | still fail |
-
-### Run 17 cells (Linux, main `e782c9a`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 2.5.1, 1.8.5 (LF + CRLF) | #1136 re-check: vendored A → B, fresh install | pass (fixed by #1137) |
-| 2.5.1, 1.8.5, 1.1.15 (LF + CRLF) | Hosted scan / install / rollback; vendored scan / install / revert after #1185 | pass (byte-identical on Poetry-written locks) |
-| 2.5.1, 1.1.15 | #1185 sweep over hand-edited six units (spacing, inline / empty / missing `files`, comments, quotes, key order, tabs, wheel- / sdist-only, sub-tables, CRLF) | pass (hosted rollback re-renders layout, documented) |
-| 2.0.1, 1.1.15, 2.5.1 | Agent in-project full cycle | pass |
-| 2.5.1, 2.0.1 | `installer.re-resolve = false`, hosted + vendored, LF + CRLF | pass |
-| 1.8.5, 2.5.1 | Vendored + `poetry export` (root / subdir), then revert / remove / rollback / `vendor --check` | keep correct; mislabel + loop (#1184 comment) |
-| 1.4.2 – 2.2.1 | Patched dep declared with `source = "pypi"`: hosted / vendored, then install | fail #1282 (1.1.15, 1.2.2, 2.3.3, 2.4.3, 2.5.1 pass) |
-| 2.5.1, 1.8.5 | #1105 (hosted A → vendored B, warm venv) | still fails |
-
-### Run 18 cells (Linux, main `74a44b8`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 1.5.1, 1.8.5, 2.2.1 | #1282 re-check: `source = "pypi"`, hosted + vendored, then fresh install | pass (refused before any write, lock untouched) |
-| 2.5.1 | same | pass (rewired + `*_source_constraint` advisory, installs patched) |
-| 1.5.1, 2.2.1, 2.5.1 | `source = "PyPI"` spelling | same as `"pypi"` (pass) |
-| 1.2.2 | `source = "pypi"`, hosted + vendored | pass (installs patched) |
-| 1.3.0, 1.3.1, 1.3.2 | `source = "pypi"`, hosted + vendored | **fail #1447** (versionless stamp: guard skipped, install solver failure); 1.3.2 r20 pass (fixed by #1451); control without `source` passes |
-| 2.2.1, 1.8.5 | Explicit `[[tool.poetry.source]] name = "PyPI"` primary + `source = "PyPI"` | guard correct (forced rewrite still fails "Repository \"pypi\" does not exist.") |
-| 2.2.1 | Path dep (`develop = true`) whose own pyproject pins six `source = "pypi"`, hosted | pass (transitive pin doesn't break install) |
-| 2.2.1 | PEP 621 `[project]` deps + `[tool.poetry.dependencies] six = {source = "pypi"}` | pass (refused) |
-| 2.2.1 | Already-wired lock + source pin: hosted re-scan / `rollback`; vendored re-scan / `vendor --revert` | pass (refusal names the right remedy; lock restored byte-identical; installs) |
-| 2.2.1 | Same, vendored → hosted takeover | pass (`redirect_takeover_kept_vendored`, lock untouched) |
-| 2.2.1 | Same, hosted → vendored takeover | wet exit 1, lock stays hosted (correct); dry run `verified` exit 0 (documented gap, #944); refusal remedy omits "rollback first" (nit, not filed) |
-| 2.2.1, 2.5.1 | #1023 re-check: lock-only vendored (in-project, no `.venv`, apt six) + agent | pass |
-| 2.5.1 | #671 re-check: `create = false` + stray `./venv` | pass (stray venv untouched; system copy patched = lead 4) |
-| 2.5.1 | #450 re-check | still fails (2/2) |
-
-### Run 19 cells (Linux, main `15c2c83`)
-
-Mock now serves two packages: six (patches A, B) and toml 0.10.2 (patch T).
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 2.5.1, 1.8.5 | #409 (fixed by #1419): `system-site-packages = true`, in-project and out-of-tree; six only in user site / a uv-managed base. Agent, hosted (stale warning, vex refuses then attests), vendored | pass |
-| 2.5.1 | Same, venv six 1.15.0 shadows base 1.16.0 | pass (nothing patched) |
-| 2.5.1 | #866 re-check (`{data-dir}/venvs` + `env use` + unrelated `VIRTUAL_ENV`) | pass 2/2 (fixed by #1259) |
-| 2.5.1 | #450 | still fails 2/2 |
-| 2.5.1, 1.1.15, 1.0.10 | Vendored supersede A → B, then wheel deleted + `repair`, fresh install, `--check`, `--revert`; B → A with `--prune` | pass |
-| 1.0.10, 1.1.15, 1.8.5, 2.5.1 (+ CRLF) | #1437 (fixed by #1440): six vendored + toml hosted, then bare `scan` / `get` / `--dry-run` | pass (`mode_ambiguous`, exit 2, nothing written) |
-| 1.0.10, 1.1.15, 1.8.5, 2.5.1 (LF / CRLF) | Partial takeovers from that mixed state, both directions; `list`, `repair`, `vendor --check`, `remove` either package | pass |
-| 2.5.1 | Bare `scan` / `get` on hosted-only project | pass (stays hosted) |
-| 2.5.1 | Vendored through a symlinked `--cwd`; nested monorepo (root + path-dep lib, two locks, two directory targets) | pass |
-| 2.5.1 | six as a git dependency: hosted / vendored refuse, agent patches | pass (documented) |
-| 2.5.1, 1.8.5 | `poetry.toml` dotted key / inline table / CRLF; global vs local config precedence; `POETRY_CACHE_DIR` / `POETRY_CONFIG_DIR` / `POETRY_DATA_DIR` | pass |
-| 2.5.1 | Lock 2.1 per-group `markers = {main, dev}`, hosted, `--only main` / `sync --only dev` | pass |
-| 2.5.1, 1.1.15 | Transitive six (via python-dateutil), hosted + vendored | pass |
-| 2.5.1, 1.8.5 | `name = "PyPI" priority = "primary"` + supplemental mirror, hosted + vendored | pass |
-| 2.5.1 | #1220: 2-pin hosted rollback / takeover under `ulimit -n 100` | pass |
-
-### Run 20 cells (Linux, main `aa85c6c`)
-
-Mock serves eight packages (six, toml, idna, attrs, packaging, certifi, urllib3, charset-normalizer), each a real wheel with a marker appended to one module.
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 1.3.2 | #1447 re-check (`source = "pypi"`), hosted + vendored | pass (refused before any write; fixed by #1451) |
-| 1.2.2 | same | pass (rewritten, installs patched with 1.2.2) |
-| writer 1.1.15 / 1.2.2 (lock 1.1) → installer 1.3.2, 2.0.1, 2.2.1, 2.3.4, 2.4.3, 2.5.1 | `source = "pypi"` rewrite, hosted + vendored, fresh install | **fail #1503** (`Repository "pypi" does not exist.`; advisory says 2.3+ install it) |
-| writer 2.3.4 / 2.5.1 (lock 2.1) → installer 2.3.4 / 2.5.1 | same | pass (installs patched) |
-| 1.1.15, 1.8.5, 2.5.1 (LF + CRLF) | #1475 batch: 8 hosted pins in one lock, byte-compared to release v5.0.0 | pass (byte-identical) |
-| 1.1.15, 1.8.5, 2.5.1 (LF + CRLF) | same, fresh install (8/8 patched), vex (1 statement, 8 subcomponents), rollback byte-identical | pass |
-| 1.1.15 (CRLF) | Lock-only hosted vex over `[metadata.files]` lock (#1486 read-only parse) | pass (8 subcomponents) |
-| 1.1.15, 2.5.1 (LF + CRLF) | Vendored 8-package batch: install, `vendor --check`, `--revert` byte-identical | pass |
-| 2.5.1 | Interrupted vendored scan (SIGKILL at 0.5–11 s, right after the lock write, right after `state.json`): check, rescan, revert, fresh install | pass (partial wheels harmless; rescan converges; stale `apply.lock` doesn't block) |
-| 2.5.1, 1.8.5 | Hosted rollback, then `poetry sync` / `install --sync`: upstream bytes back, vex refuses (`manifest_not_found`) | pass |
-| 2.5.1 | #450 | still fails |
-
-### Run 21 cells (Linux, main `6a06ddd`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 1.1.15 | #1503 re-check (lock 1.1 + `source = "pypi"`), hosted + vendored | pass (refused, lock untouched; fixed by #1506) |
-| 2.5.1 | Hosted scan SIGKILLed at 50 ms – 1 s | pass (the run finishes in under 50 ms; the lock is always the original or the full rewrite) |
-| 1.1.15, 1.8.5, 2.5.1 | Optional extra: hosted, install without / with `-E`, vex; vendored (1.1.15, 2.5.1) | pass |
-| 2.0.1, 2.2.1 (LF + CRLF) | hosted → vendored → hosted, fresh installs, rollback | pass |
-| 2.0.1, 2.2.1, 2.5.1 | PEP 621 `dynamic = ["version"]` + `[tool.poetry] version`, no git remote: `vex` / `scan --vex` | **fail #1527** (`product_undetected`) |
-| 2.5.1 | #450 | still fails |
-
-### Run 22 cells (Linux, main `fc1b4f9`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 2.5.1 | #1527 re-check: `[project]` name + `dynamic = ["version"]` + `[tool.poetry].version`, `scan --mode hosted --vex` | pass (fixed by #1529; product `pkg:pypi/demo1527@0.3.0`, install patched) |
-| 2.5.1 | Same plus a stale `[tool.poetry].name` | `product_undetected` (deliberate: Poetry 1.x and 2.x build different names; see Known non-bugs) |
-| 2.1.4 | Full row: hosted, vendored, agent in-project + out-of-tree, takeovers both ways, `repair` with the wheel deleted, rollback | pass |
-| 1.8.5, 2.5.1 | `[[tool.poetry.source]]` with `priority = "explicit"` / `"supplemental"` that six doesn't come from: hosted + vendored, fresh install | pass (not refused, patched) |
-| 1.8.5, 2.5.1 | VEX product purl for a project named `My_Service` / `Demo_Pkg.Core` (hosted `--vex`, agent + `vex`) | **fail #1547** (raw name, not normalized) |
-| 2.5.1 | #450 | still fails |
-| macOS / Windows | anything | blocked (deleting `bughunt/poetry/*` still denied) |
-
-### Run 23 cells (Linux, main `e76cb9b`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 2.4.3 | Hosted → vendored → hosted, fresh install after each, `poetry sync`, rollback byte-identical | pass |
-| 2.4.3, 1.2.2 | Agent, in-project and default out-of-tree venv: scan, re-run, vex, rollback | pass |
-| 1.0.10 | Vendored `repair` (lock-only, wheel deleted), fresh install (pip 22.2.2) | pass |
-| 2.5.1, 1.8.5, 1.1.15 | Project path with spaces and non-ASCII (`/tmp/sp ü ç/proj é`): vendored, vendored → hosted, agent, vex, fresh installs | pass |
-| 2.5.1 | Agent → hosted takeover, then a bare scan (keeps agent, warns hosted wiring live), vex, rollback | pass (lock byte-identical after rollback) |
-| 2.5.1 | Agent-patched venv reinstalled upstream (`pip --force-reinstall`), then `vex` | pass (refuses, `no_applicable_patches`) |
-| 2.5.1 | 16 hand-edited lock 2.1 shapes (no EOL, comments in block / `files`, no trailing comma, sdist first, inline / tab-indented / blank-line `files`, single quotes, `key=val`, `develop = false`, string `markers`, `files` after `[package.dependencies]`, `name = "Six"`): hosted (install, rollback) and vendored (install, `--revert` byte-identical) | pass |
-| writer 1.1.15 → installers 1.1.15 / 1.8.5 | Lock 1.1 `[metadata.files]` shapes (populated, comment, no EOL, entry after six, inline, CRLF): hosted + vendored, fresh install | pass (advisories present) |
-| 2.5.1 | `poetry install` racing an agent scan (8 iterations) | pass (outcome varies, `vex` always matches the bytes) |
-| 2.5.1, 1.8.5 | `installer.no-binary = six` / `:all:` with hosted and vendored rewrites | pass (wheel installed patched, vex ok) |
-| 2.5.1 | #1547 | still fails (`pkg:pypi/My_Service@1.2.0`) |
-| 2.5.1 | #450 (project apply, `rollback -g`) | still fails (manifest emptied, `.venv` still patched, exit 0) |
-| macOS / Windows | anything | blocked (deleting `bughunt/poetry/*` still denied) |
-
-### Run 24 cells (Linux, main `657fce2`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 2.5.1 | #1547 re-check: `[tool.poetry]` name `My_Service.Core` (hosted `--vex`) and `[project]` name `Demo_Pkg.Core` (`vex` after `poetry sync`) | pass (fixed by #1577: `my-service-core`, `demo-pkg-core`) |
-| 2.5.1 | #450 (project apply, `rollback -g`) | still fails |
-| 2.5.1 | #1549 Poetry side: `poetry.lock` pins six by `url` / `file` (path wheel) / `directory` source, `requirements.txt` beside it is wired hosted | pass (`patched_ref_unattributable`, no VEX) |
-| 2.5.1 | `pylock.toml` from poetry-plugin-export beside `poetry.lock` (six + idna): hosted rewrites both, `uv pip install -r pylock.toml` gets the patch, `vex`, rollback | pass |
-| 2.5.1 | Same with six as the only package in the pylock | rollback refused (`hosted_restore_refused`, see Known non-bugs) |
-| 1.8.5 | 9 hand-edited lock 2.0 shapes (CRLF, mixed EOL, no EOL, comment in block, inline / sdist-first / tab-indented `files`, no trailing comma, `markers`): hosted (install, vex, rollback) + vendored (install, vex, `--revert` byte-identical) | pass |
-| 2.5.1, 1.8.5 | six optional behind an extra, `install -E`: hosted + vendored | pass |
-| 2.5.1, 1.8.5 | Hosted / vendored, then `check --lock`, `poetry lock` (`--no-update` on 1.8), `poetry add idna` | pass (pin kept, install patched, vex ok) |
-| 2.5.1, 1.8.5 | Hosted / vendored, then `lock --regenerate` (2.x) / `lock` (1.8) drops the pin: `vex` refuses, bare re-scan re-wires in the same mode | pass |
-| 2.1.4 | Agent: nameless `package-mode=false`, `[project].name` `Proj_Name.X`, `[project]` + `[tool.poetry].name` override, in-project and out-of-tree: scan, vex, rollback | pass (nameless vex = `product_undetected`, expected) |
-| 2.5.1 | `poetry.toml` `in-project` vs `POETRY_VIRTUALENVS_IN_PROJECT` (env wins), `.venv` + out-of-tree env both present, both directions | pass |
-| 2.5.1 | `[tool.poetry.requires-plugins]` installing six into `.poetry/plugins` | not crawled by any mode (see Backlog) |
-| 1.2.2 | Hosted → vendored → hosted, fresh install after each, vex, rollback byte-identical | pass |
-| 2.5.1 | six in `main` + `dev` with different markers: hosted, vendored, `install --only dev` | pass |
-| macOS / Windows | anything | blocked (deleting `bughunt/poetry/*` still denied) |
-
-### Run 25 cells (Linux, main `657fce2`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| writers 1.3.2 / 1.5.1 / 1.7.1 (lock 2.0), 2.5.1 (lock 2.1) | Hosted: scan, fresh install, vex, rollback byte-identical; vendored: scan, fresh install, `--check`, vex, `--revert` byte-identical | pass |
-| 1.3.2, 1.5.1, 1.7.1 | Hosted advisories vs venv state (versionless 1.3 stamp → `redirect_poetry_stale_install_risk`) | pass |
-| 2.5.1 | Exported `pylock.toml` beside `poetry.lock`: vendored, `uv pip install -r pylock.toml`, `--check`, `--revert` | pylock wired, `poetry.lock` left upstream with `pypi_multiple_lockfiles` (documented precedence, see Known non-bugs) |
-| 2.5.1 | Same: hosted → vendored → hosted takeovers, fresh install, rollback | pass |
-| 1.7.1 (`install --sync`), 2.5.1 (`sync`) | Vendored → `--revert` → `vex` before reinstall → sync | pass |
-| 2.5.1 | #450 | still fails |
-| macOS / Windows | anything | blocked (deleting `bughunt/poetry/*` still denied) |
-
-### Run 26 cells (Linux, main `657fce2`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 2.5.1 + export plugin | `pylock.toml` (`--with dev`) + `pylock.test.toml` (`--with test`), 3 patched packages: hosted scan, `poetry install --with test`, `uv pip install -r`, vex | pass |
-| same | hosted rollback | `hosted_restore_refused` (no sibling registry package; Known non-bugs) |
-| same | vendored + `--revert` with ≥ 2 packages in one pylock | in-entry comments dropped (pylock lane only; handed over to pip) |
-| 1.0.10 | 10 hand-edited lock 1.0 `[metadata.files]` shapes × hosted / vendored, fresh install, revert | pass 20/20 |
-| 1.0.10, 2.5.1 | Vendored in a path with `#`, `%20`, `;` | pass (`;` on 1.0 is a pip limit, Known non-bugs) |
-| 2.5.1, 1.8.5 | VEX product with a non-canonical PEP 440 version (`[tool.poetry]` and PEP 621) | fail #1589 (commented) |
-| 2.5.1 | Two-package hosted `list` / `repair` / `remove` / `sync` / vex / rollback | pass |
-| 1.8.5 → 2.5.1 / 2.4.3, 2.5.1 → 1.8.5 | Vendored, then `poetry lock` with another Poetry major: `--revert`, `rollback`, `remove`, re-vendor, → hosted takeover | **fail #1615** (main + v5.0.1) |
-| same-version relocks (2.5.1, 1.8.5) | same | pass |
-| 1.8.5 → 2.5.1 | Hosted, cross-major relock, install, vex, rollback | pass |
-| macOS / Windows | anything | blocked (deleting `bughunt/poetry/*` still denied) |
-
-### Run 27 cells (Linux, main `657fce2`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 1.1.15 → 1.8.5 (`lock --no-update`), 1.1.15 → 2.5.1 | Vendored on lock 1.1, re-locked into lock 2.0 / 2.1: `vendor --revert`, `rollback` | fail #1615 (2/2 each; commented). 1.1 → 1.1 control passes |
-| 1.1.15, 1.8.5, 2.5.1 | Warm venv, hosted / vendored, then `rollback` / `vendor --revert`, then plain `poetry install` | pass (1.8.5 / 2.5.1 "Updating six … -> 1.16.0" restores upstream; 1.1.15 never had the patch, documented stale) |
-| 1.8.5, 2.5.1 | Agent, `virtualenvs.path` = `~/…` (poetry.toml and `POETRY_VIRTUALENVS_PATH`), relative `.envs` | pass (env copy patched, system copies untouched) |
-| 2.5.1 | `poetry.lock` deleted, venv installed: hosted / vendored | hosted `redirect_unconfirmed` + vex `manifest_not_found` exit 1; vendored `pypi_poetry_no_lockfile` exit 1 (fail-closed) |
-| 1.8.5, 2.5.1 | Vendored lock: `poetry check --lock`, `poetry show six` | pass |
-| 2.5.1 | Root project + nested Poetry sub-project (path dep, own `poetry.lock`): hosted / vendored, install, vex, rollback | pass (root wired, nested lock untouched per cwd-only model) |
-| 1.1.15, 1.8.5, 2.5.1 | Vendored in a project path with a space and `é` | pass |
-| 2.4.3, 1.8.5 | Hosted, default out-of-tree venv warm with upstream bytes: scan `--vex`, `vex`, then install + `vex` | pass (`redirect_pypi_stale_install`, vex exit 1 until reinstall, then 1 statement) |
-| 2.5.1 | Multi-target `scan --mode hosted\|vendored 'apps/*'` (two Poetry projects), per-project `rollback --cwd` | pass |
-| 1.8.5, 2.5.1 | Hosted / vendored, then `poetry add --lock attrs`, fresh install, vex | pass (wiring and patched `files` hash kept) |
-| macOS / Windows | anything | blocked: deleting `bughunt/poetry/*` still denied (run 27 retried once), so no probes pushed |
-
-### Run 28 cells (Linux, main `7d3086f`)
-
-| Poetry | Cell | Result |
-| --- | --- | --- |
-| 1.8.5 `priority = "secondary"`, 1.1.15 `secondary = true`, 2.5.1 `PyPI` + mirror both primary | Hosted and vendored scan, fresh install, vex, rollback (six from PyPI) | pass 6/6 |
-| 1.8.5 `priority = "default"`, 1.1.15 `default = true` (PyPI mirror) | Hosted / vendored | refused before writing (documented user-authored source) |
-| 2.5.1 | Lock mode 0640 kept by hosted / vendored scan + rollback | pass |
-| 2.5.1, 1.8.5 | Root-run hosted / vendored scan + rollback on a uid-1000 project | **fail #1635** (lock becomes 0:0, owner's `poetry add --lock` gets EACCES; v5.0.1 too) |
-| 2.5.1 | Non-root hosted scan in a shared-group checkout | **fail #1635** (group lost) |
-| 2.5.1 | Agent scan as root over a uid-1000 venv | pass (owner kept) |
-| 1.3.2 → 1.8.5 | Vendored, relock (lock 2.0 → 2.0), `vendor --revert` | fail #1615 (commented) |
-| macOS / Windows | anything | blocked (deleting `bughunt/poetry/*` still denied) |
+| Workflow | Agent | Hosted | Vendored |
+| --- | --- | --- | --- |
+| Common path: scan, re-scan, fresh install, import check, `vex`, rollback, reinstall | pass 2.5.2 in-project + default out-of-tree env (2026-11-27) | pass 1.1.15, 1.3.2, 1.8.5, 2.5.2 (2026-11-27), CRLF 2.5.2; rollback advice wrong on 1.1–1.3: fail #2320 | pass 1.1.15, 1.8.5, 2.5.2 incl. `vendor --check` (2026-11-27); revert advice wrong on 1.1–1.3: fail #2320 |
+| Mode switch hosted → vendored → hosted, fresh install after each, rollback | n/a | pass 2.5.2 (2026-11-27) | pass 2.5.2 (2026-11-27) |
+| Lock formats 1.0 / 1.1 / 2.0 / 2.1, CRLF / mixed EOL, hand-edited units | untested since v5.1.0 | 1.1 / 2.0 / 2.1 pass (2026-11-27); 1.0 and mixed EOL pass pre-release (r13–r26) | 1.1 / 2.1 pass (2026-11-27); 1.0 pass pre-release |
+| Groups, extras, markers, `install --sync` / `sync`, `--without` | pass pre-release (r19, 2.5.1) | pass pre-release (2.5.1) | pass pre-release (2.5.1) |
+| Sources with priority (primary / secondary / supplemental / explicit / default), `source = "pypi"` pins | n/a | pass pre-release (r18, r28) | pass pre-release (r18, r28) |
+| Path / URL / git deps of the patched package | n/a | refused before writing (documented, r12) | refused before writing (documented) |
+| Venv discovery: in-project, default path, `virtualenvs.path` templates, `envs.toml`, `env use`, `VIRTUAL_ENV` / conda | pass pre-release (r9–r13, r27) | VEX stale check pass pre-release (r27) | n/a |
+| `virtualenvs.create = false` / system-site-packages | pass pre-release (#671, #1023, #409 fixed); dpkg-copy lead open | pass pre-release | pass pre-release |
+| Relock after patch (`poetry lock`, `add --lock`, cross-major relock) | n/a | pass pre-release (r27) | pass pre-release (#1615 fixed, not re-run) |
+| Supersede A → B, `remove` of one of two packages | pass pre-release | pass pre-release (r16) | pass pre-release (#1136 fixed) |
+| Global mode `-g` / cross-scope rollback | pass pre-release; #450 fixed, not re-run | n/a | n/a |
+| Ownership / mode of rewritten `poetry.lock` (root run on uid-1000 tree) | pass pre-release | #1635 fixed, not re-run | #1635 fixed, not re-run |
+| Poetry 0.12 (must be refused for hosted) | untested | refused pre-release (`redirect_poetry_lock_unsupported`) | pass pre-release; #945 fixed |
 
 ## Backlog
 
-1. Re-check #1635, #1615, #1589, #450, #1105 and #1184 once fixed.
-1a. #1635 follow-up: a root vendored run leaves a root-owned `.socket/vendor` tree; check the owner's later `vendor --revert` / `rollback`.
-2. #1615: done for 1.1 → 1.8 / 2.x (r27) and 1.3 → 1.8 within lock 2.0 (r28). Remaining: 1.8 → 2.0–2.2.
-3. **Lead (run 24):** Poetry 2 `[tool.poetry.requires-plugins]` installs plugins (and their deps) into `<project>/.poetry/plugins`, which no mode crawls. Needs a maintainer call on scope.
-4. **Lead (run 14):** with `virtualenvs.create = false`, the project global fallback patches the system interpreter's dpkg-owned copy (follows #538's "patch every copy"); a maintainer call before filing.
-5. Untested Linux cells: hosted VEX with an undiscovered venv on 1.2.2 (needs `--prerelease=allow` + `cleo==1.0.0a5`).
-6. pylock export: vendored prefers an exported pylock over `poetry.lock` for Poetry users (documented precedence; maintainer call).
-7. **macOS / Windows re-checks** for closed #327 / #329, the #640 default paths, #866 on macOS, macOS XDG and the Windows Poetry 1.0/1.1 env hash. All need probe branches.
-8. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist, and deleting them was denied (runs 9–26). A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
-9. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the "Installer boundaries" table says 1.4–1.8 replace it. Line 24 still says CRLF / legacy `files` get a single-line inline array (changed by #1185). CLI_CONTRACT's `mode_ambiguous` row still names only agent + vendored state.
+1. Re-check #2320 once fixed (1.1.15 and 1.3.2, hosted `rollback`, vendored `rollback` and `vendor --revert`, then plain `poetry install`).
+2. Re-run the pre-release cells on main after v5.1.0: groups / extras / `sync --without`, sources with priority, `source = "pypi"`, cross-major relock (#1615), root-run ownership (#1635), cross-scope rollback (#450). Start with Poetry 2.5.2 and 1.8.5.
+3. Lock 1.0 (Poetry 1.0.10) hosted and vendored on main, plus Poetry 0.12 refusal.
+4. #2170 (no-venv Python projects scan only declared packages) for Poetry: a PEP 621-only Poetry 2 project with no `poetry.lock` and `create = false`. The sandbox's system Python already has an apt `six` in `/usr/lib/python3/dist-packages`, so use a controlled interpreter on PATH.
+5. Lead (r29), not filed: since #2243, a PyPI patch's VEX product keeps `?artifact_id=…` (by design, from the review). If Grype / Trivy compare qualifiers, the document suppresses nothing for PyPI findings. Needs a real scanner run, and downloading Grype / Trivy was denied in this sandbox.
+6. #1635 follow-up: a root vendored run leaves a root-owned `.socket/vendor` tree; check the owner's later `vendor --revert` / `rollback`.
+7. Lead (r24): Poetry 2 `[tool.poetry.requires-plugins]` installs plugins into `<project>/.poetry/plugins`, which no mode crawls. Needs a maintainer call on scope.
+8. Lead (r14): with `virtualenvs.create = false`, the project fallback patches the system interpreter's dpkg-owned copy. Needs a maintainer call.
+9. Docs: `installer.modern-installation = false` (1.4–1.8) keeps a warm same-version install, though the "Installer boundaries" table says 1.4–1.8 replace it.
 
 ## Known non-bugs
 
-- A PyPI mirror as the `default = true` (1.x) / `priority = "default"` (1.5–1.8) source gives six a `[package.source] legacy`, so hosted and vendored refuse it before writing. Documented user-authored-source refusal (r28). `secondary` sources that don't serve six work in both modes.
+The full list is in `known-non-bugs/poetry.md`; search it with `git grep`. These are the ones most likely to be re-filed:
 
-- Hosted `vex` attests from the lock when Poetry's venv lives where socket-patch can't see it (for example a `POETRY_CACHE_DIR` exported only to Poetry); with the same env discoverable it refuses with `redirect_pypi_stale_install`. That's the documented lock-only behaviour (r27).
-- `poetry add --lock <other>` on Poetry 1.8.5 / 2.5.1 keeps the hosted / vendored six source and its `files` hash (r27); it's not one of the documented relock commands that drop it.
-
-- `patches-api.socket.dev` / `patch.socket.dev` / `api.socket.dev` are blocked by the sandbox proxy (403). Use a local mock API (`SOCKET_API_URL`).
-- The CLI's rustls client doesn't trust the sandbox's re-terminating proxy CA. So vendored PyPI fetches (`vendor_fetch_failed`) and **v5 hosted rollback/remove** (re-resolves `https://pypi.org/pypi/<name>/<ver>/json`) fail in the sandbox. Point `SOCKET_PYPI_JSON_API` at a local HTTP forwarder that also rewrites `files.pythonhosted.org`. The repo's `e2e_vex_build -- poetry::` hosted test scrubs `SOCKET_*`, so its rollback step fails in the sandbox for the same reason. Not a product bug.
-- A `poetry.lock` with a UTF-8 BOM is rejected by Poetry itself ("Invalid statement (at line 1, column 1)").
-- A lock whose packages come from a custom `[[tool.poetry.source]]` (even a PyPI mirror, `priority = "primary"`) is refused by hosted (`redirect_poetry_lock_unsupported`, exit 0) and vendored (`pypi_poetry_source_already_exists`, exit 1) before any write. Documented ("a user-authored `[package.source]` on another origin").
-- Agent-mode `vex` on a project with no install hook reports `ecosystem_not_setup` / `no_applicable_patches`. Documented.
-- `vex` on a `package-mode = false` project with no version needs `--product` (`product_undetected`). Expected.
-- Poetry 1.8 ignores PEP 621 `[project]` dependencies, so "`[project].name` + `[tool.poetry].name`" is n/a before 2.0.
-- CLI_CONTRACT.md lives at `crates/socket-patch-cli/CLI_CONTRACT.md`, not the repo root.
-- Running from a subdirectory of a Poetry project doesn't find it: pypi is cwd-only (CLI_CONTRACT.md "Monorepo / multi-project discovery model"; use `--cwd` or a directory target).
-- On Poetry < 1.4, vendored emits `pypi_poetry_integrity_unverified` and hosted emits `redirect_poetry_stale_install_risk`. Both are deliberate advisories.
-- On Poetry 1.1–1.3, a warm venv keeps the upstream bytes after a hosted rewrite, even when Poetry prints "Updating six (1.16.0 -> 1.16.0 <url>)". Documented. v5 flags it as `redirect_pypi_stale_install` and refuses VEX.
-- `poetry check --lock` fails on Poetry 1.1 / 1.2 (1.2 has no `--lock` option, and 1.1's `check` crashes). This isn't caused by socket-patch.
-- Poetry 1.0 + pip 22.3 / 23.0 (e.g. venvs seeded with pip 23.0.1) refuses the hosted wheel's `#sha256=…&#egg=` fragment. Documented, and named in the `redirect_poetry_stale_install_risk` detail. Use pip ≤ 22.2 or ≥ 23.1.
-- Poetry 1.0 writes empty `[metadata.files]` against today's PyPI. Documented (backtest "populated" shape).
-- Vendored `--vex` on a warm, unpatched venv still attests, with the warning `vendored_tree_out_of_sync`. Documented in CLI_CONTRACT.md.
-- `list` / standalone `vex` only recognise hosted pins on Socket's origin. A mock origin needs `--patch-server-url`.
-- `scan --json` with several directory targets is refused ("--json takes one project directory").
-- v5 removed `--vendor-source build` (local artifact construction). Repair re-downloads from the service.
-- Agent rollback needs the "before" blob from `/v0/orgs/<org>/patches/blob/<hash>`. A mock without that route gives `missing_blob`.
-- `scan --mode agent` re-run after a failed apply says `[skip] … (already recorded)` and exits 0 with the file unpatched. That's by design (it prints "run `socket-patch apply` to re-apply them"), and `apply` / `vex` then report the failure correctly.
-- My mock answers every per-ecosystem batch with the same patch, so a mode-less multi-ecosystem scan lists `six` twice. That's a mock artifact; pass `--ecosystems pypi`.
-- In the sandbox, `/usr/lib/python3/dist-packages/six` is an apt `.egg-info` install. Since #452 the crawler sees it, so global-fallback cells pick it up (see backlog 1). Use `pip install --user --ignore-installed` for a controlled global copy, and `rollback` afterwards if agent mode patched it.
-- `POETRY_VIRTUALENVS_IN_PROJECT=yes` / `on` is true to socket-patch and false to Poetry (`boolean_normalizer` accepts only "true" / "1"). Theoretical, not filed.
-- The CLI's PyPI requests (hosted rollback, hosted → vendored takeover) need `SOCKET_PYPI_JSON_API` pointed at a local forwarder in the sandbox. Without it the takeover fails closed with `redirect_revert_failed`. A forwarder script that rewrites `files.pythonhosted.org` works.
-- Concurrent `scan` runs in one project: the extra runs exit 1 with "Another socket-patch process is operating in this directory" (use `--lock-timeout`). This is by design.
-- Dotted names (`jaraco.context`): Poetry 1.1 keeps the dotted name in the lock (quoted `[metadata.files]` key), Poetry ≥ 1.8 canonicalizes it. Hosted rewrite, install, vex and rollback all work with both purl spellings (r5).
-- `rollback -g --json` with no manifest returns `error` as a plain string ("Manifest not found"), not a `{code, message}` object. This is a shape nit, not Poetry-specific, and not filed.
-- Poetry 1.8 – 2.2 with `virtualenvs.create = false` running as root in this image reinstall a user-site package into `/usr/local/lib/python3.11/dist-packages`. That's Poetry's behaviour, not socket-patch.
-- The uv-tool-installed Poetry in this image builds `poetry env use python3.12` envs on its own 3.11 interpreter (`pyvenv.cfg` says 3.11.15). That's a sandbox quirk; use pip-installed Poetry for multi-interpreter cells.
-- In agent `scan --json`, `ecosystems: [npm]` reports `policy.counts.filtered: 2` for a single `six` (likely the lock and the installed copy). Cosmetic, not filed.
-- Forked Poetry locks (one package at several versions by marker) are refused by hosted (`redirect_poetry_lock_unsupported`, "forked Poetry package requires an unambiguous source") and vendored ("forked resolution"). Documented in CLI_CONTRACT.md.
-- Hosted `vex` attests a lock pin for a package that isn't installed (for example an optional group left uninstalled). Documented ("with nothing installed, attests a discovered lockfile reference from its integrity pin").
-- `rollback` on a project with no manifest, ledger or hosted pin gives "Manifest not found", exit 1. Documented (truly-empty project).
-- Hosted-only `rollback --json` reports `rolledBack: 0` while it restores the lock. Cosmetic, not filed.
-- uv can't install from `poetry export` output against the sandbox mock (it sends `HEAD`, which the mock doesn't answer). Mock artifact.
-- Poetry 1.0's `EnvManager.get()` uses an existing `./.venv` even with an explicit `virtualenvs.in-project = false`; 1.1+ honour the `false` and socket-patch follows them. It only diverges when Poetry 1.0 also has an out-of-tree env. Theoretical, not filed.
-- Hosted `socket.yml` narrowing lists recorded pins under `policy.filtered` rather than `retained` when the mock origin isn't the patch server. Set `SOCKET_PATCH_SERVER_URL`; this is the documented hosted-origin rule.
-- #543's vendored "unwired ledger entry" check doesn't cover pypi (`dispatch_in_use_one` returns `None`), so Poetry vendored re-runs are unchanged by it.
-- A test mock that answers every `/patches/batch` with the same patch makes agent scans report `partial_failure` for packages the project doesn't have. Filter the mock to the requested purls.
-- Poetry < 2.1 has no `data-dir` config key, so `{data-dir}` in `virtualenvs.path` stays a literal relative directory, and socket-patch matches it.
-- `vex` saying "No applied patches with vulnerability metadata" after a hand-staged manifest with empty `vulnerabilities` is a fixture artifact.
-- Poetry 1.x's env-var `boolean_normalizer` is case-sensitive (`POETRY_VIRTUALENVS_IN_PROJECT=True` is false), while 2.x lowercases. Same theoretical class as `yes` / `on`; it only diverges with a stray `.venv`. Not filed.
-- Standalone `vex --json` needs `-O <file>` (`-o` is `--org`), and against a mock it needs `--api-url` / `--org` for vulnerability metadata. Without them you get harness errors, not product bugs.
-- Hosted `rollback` prints "1 unwired package keeps its patched bytes in installed trees" even when no venv exists. Cosmetic, not filed.
-- Hosted `rollback` / `remove` on a lock mixing CRLF and LF rewrites the whole file as LF (content equal modulo EOL; Poetry still installs). Tracked under #814 child 2 (comment from run 13), not filed separately.
-- Release 4.0.0 doesn't redirect against a v5-shaped mock (`Redirected 0`). It's no baseline for hosted cells.
-- A vendored grant needs `integrity.sha512` on the tarball artifact. A mock grant with only `sha256` gives `vendor_prebuilt_required` ("tarball artifact has no sha512 integrity"), and a takeover then un-hosts first. Mock artifact.
-- uv's standalone CPython ships an `EXTERNALLY-MANAGED` marker, so Poetry with `create = false` fails at `pip uninstall`. Delete the marker in the sandbox.
-- Copying a project together with its `.venv` (virtualenv-created) keeps pip entry scripts pointing at the source venv, so Poetry 1.1 installs land in the wrong tree. Always create fresh venvs.
-- `redirect_takeover_unpatched` after a refused lock is documented in CLI_CONTRACT.md. #945 covers only the Poetry 0.x dry-run mismatch and the missing pre-revert gate.
-- Symlinked `poetry.lock`: hosted (`redirect_symlinked_file_unsupported`) and vendored (`pypi_poetry_symlink_unsupported`) both refuse before writing. Documented.
-- With Poetry ≤ 2.2, `poetry lock` creates the project env. A "fresh checkout" cell has to delete the env after locking, or the scan correctly finds it.
-- Two patched packages: `remove` of one keeps the other's hosted / vendored wiring (r15, LF + CRLF, Poetry 1.8.5 / 2.5.1). Not a bug.
-- A mock that rebuilds its wheel on every request (zip timestamps) makes `poetry install` fail "Hash … not found in known hashes", and Poetry then keeps the bad bytes in `~/.cache/pypoetry/artifacts` (keyed by URL). Build the mock wheel deterministically and clear that cache.
-- Hosted rollback of an exported `requirements.txt` beside `poetry.lock` folds its `\` continuation lines into one line (semantically equal). It's pip's file and cosmetic, so not filed.
-- Vendored with `poetry.lock` + `requirements.txt` warns `pypi_multiple_lockfiles` and wires only `poetry.lock`. Documented.
-- Hosted rollback of a hand-edited six unit (inline / tab-indented / empty / wheel-only / sdist-only `files`, a missing `files` key, quoted or `six=[` `[metadata.files]` keys) writes Poetry's canonical multi-line full-release `files` back, not the original bytes. Documented (hosted rollback "has no … guarantee of the original byte layout").
-- `docs/testing/poetry-compatibility/` (named in the routine prompt) doesn't exist on main; only `docs/testing/poetry-compatibility.md` does.
-- Hosted → vendored `scan --dry-run` reports only `verified` (exit 0) and doesn't model the takeover, even when the wet run refuses (exit 1). Documented in CLI_CONTRACT "Takeover reconciliation"; #944 closed not planned. The wet run keeps the hosted pin.
-- A path dependency's own `source = "pypi"` pin doesn't break the root project's install after a rewrite (Poetry 2.2.1), so the guard reading only the root pyproject is correct.
-- An explicit `[[tool.poetry.source]] name = "PyPI"` declaration doesn't rescue Poetry 1.8 / 2.2 from the `source = "pypi"` failure, so the guard isn't over-refusing there.
-- Poetry 1.2.2 can't be installed with uv without `--prerelease=allow` + `cleo==1.0.0a5` (yanked cleo 1.0.0). Sandbox setup, not a product issue.
-- A `pyproject.toml` with a UTF-8 BOM is rejected by Poetry 2.5.1 itself ("Invalid TOML file … Empty key at line 1 col 0").
-- six as a git dependency (`[package.source] type = "git"`): hosted (`redirect_poetry_lock_unsupported`) and vendored (`pypi_poetry_source_already_exists`, exit 1) refuse it before any write. Documented user-authored-source refusal.
-- `rollback` / `vendor --revert` exit 1 with `vendor_revert_kept` / `vendor_revert_residual_reference` when another `poetry.lock` under the project tree (e.g. a test copy in a subdirectory) still references the vendored wheel. That's the guard working, so keep scratch copies outside the project.
-- After `remove` of one package in a vendored + hosted project, a bare `scan` follows the remaining state and re-adds patches the service still offers. `remove` isn't an ignore rule; use `socket.yml` `ignorePackages`.
-- Poetry 1.0.10 can't lock a `source = "pypi"` dependency at all ("doesn't exist, version solving failed"), so the source-pin guard has no lock-format-1.0 case.
-- A vendored scan killed partway leaves `.socket/apply.lock` and some wheels under `.socket/vendor/pypi` with the lock untouched; the next scan proceeds and converges. Not a bug.
-- A hosted scan of a one-package Poetry project finishes in under 50 ms, so a SIGKILL can't land mid-write. The lock is written by atomic replace (CLI_CONTRACT "Staged takeover"). Not a bug.
-- The source-pin guard (`pyproject_source_constraints`) reads `[tool.poetry.dependencies]`, `dev-dependencies` and every `group.*.dependencies`; a group-only pin is covered.
-- `[project].name` + `dynamic = ["version"]` + a different `[tool.poetry].name`: product detection returns `product_undetected` on purpose (`product.rs` `pyproject_name_version`), because Poetry 2 builds `[project].name` ("[tool.poetry.name] … will be ignored") and Poetry 1.x builds `[tool.poetry].name`. Use `--product`. Not filed.
-- `explicit` / `supplemental` `[[tool.poetry.source]]` entries that six doesn't resolve from are not refused by hosted or vendored (r22). The refusal only covers a source six actually uses.
-- Hosted → vendored takeover against a mock origin fails with "already declares a [package.source] for six; refusing to overwrite a user-authored source" unless `SOCKET_PATCH_SERVER_URL` names the mock (the hosted-origin rule). Harness artifact.
-- A scan racing a concurrent `poetry install` may report `package_not_installed` and leave six unpatched (exit 0). `vex` then refuses, so nothing is misattested. Expected race outcome.
-- `scan --mode hosted` over agent state keeps `.socket/manifest.json`; a later bare `scan` resolves to agent mode and warns that the hosted wiring is still live. Documented mode resolution.
-- Hosted `rollback` of a poetry-plugin-export `pylock.toml` whose only registry package is the hosted one refuses (`hosted_restore_refused`, "no sibling registry package shows the registry and artifact fields", exit 1, nothing rolled back, `poetry.lock` kept hosted too). CLI_CONTRACT "Hosted unwind coverage" refuses a pylock whose other registry packages show no `index`. With none, the restore has no evidence, and the message names the `git checkout` remedy. With one sibling (idna) it restores fine (r24). Not filed.
-- Hosted rollback of a lock with no final newline adds one, and a restored pylock entry's `upload-time` keeps millisecond precision. Covered by "no guarantee of the original byte layout". Not filed.
-- A bare `--vex` flag is a usage error: `scan --vex` takes a path (`--vex vex.json`).
-- Vendored with an exported `pylock.toml` that pins the package beside `poetry.lock` wires only the pylock and leaves `poetry.lock` on its registry source (`pypi_multiple_lockfiles`; `vendor --check` says "wiring contested"). Documented precedence: standalone PEP 751 locks rank between uv and Poetry when they pin the package (`formats/governing_locks.rs` `PYPI_TOOL_LOCKS`). So a hosted → vendored takeover returns `poetry.lock` to upstream. Not filed (r25).
-- A project path containing `;` breaks vendored installs on Poetry 1.0 (pip parses the absolute wheel path as `requirement; marker`, "Invalid marker"). Any path dependency there fails the same way; `#` and `%20` are fine, and Poetry 2.5.1 is fine with all three. Not filed (r26).
-- With several exported pylocks (`--with dev` → `pylock.toml`, `--with test` → `pylock.test.toml`), hosted warns `redirect_uv_entry_not_found` for each package a pylock deliberately doesn't list, and vendored repeats one generic "wiring pylock.test.toml, pylock.toml" warning per package. Cosmetic, handed to pip (r26).
-- `list --json` reports patches as `events[]` with `action: discovered`, not a `patches` array. Not a bug.
+- patches-api / api.socket.dev are blocked from the sandbox. Use a local mock with `--api-url` and set `SOCKET_PATCH_SERVER_URL` to the mock so `list`, `vex` and rollback see the hosted origin.
+- On Poetry 1.1–1.3, a warm venv keeps upstream bytes after a hosted rewrite, even when Poetry prints "Updating six". Documented, and flagged `redirect_poetry_stale_install_risk`.
+- On Poetry < 1.4, vendored warns `pypi_poetry_integrity_unverified` and hosted warns `redirect_poetry_stale_install_risk`. Both are deliberate.
+- A user-authored `[package.source]` (mirror default source, git, path, URL) is refused before writing by hosted and vendored. Documented.
+- Forked locks (one package at two versions by marker) are refused. Documented.
+- pypi is cwd-only: running from a subdirectory doesn't find the project. Use `--cwd`.
+- Hosted rollback re-renders a hand-edited unit in Poetry's canonical layout. There's no byte-layout guarantee.
+- A mock that rebuilds its wheel on each request breaks `poetry install` hash checks. Build it deterministically.
+- `poetry check --lock` fails on Poetry 1.1 / 1.2 on its own.
+- Poetry 1.0 + pip 22.3 / 23.0 refuse the hosted wheel's `#sha256=…&` fragment. Documented.
