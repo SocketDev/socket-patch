@@ -897,7 +897,17 @@ impl ApiClient {
         path: &str,
         bare_404: Bare404,
     ) -> Result<Option<T>, ApiError> {
-        let url = format!("{}{}", self.api_url, path);
+        self.get_json_at(&self.api_url, path, bare_404).await
+    }
+
+    /// [`Self::get_json`] of `path` on the host `base`.
+    async fn get_json_at<T: serde::de::DeserializeOwned>(
+        &self,
+        base: &str,
+        path: &str,
+        bare_404: Bare404,
+    ) -> Result<Option<T>, ApiError> {
+        let url = format!("{base}{path}");
         debug_log(&format!("GET {}", url));
 
         let sent = self
@@ -1114,6 +1124,28 @@ impl ApiClient {
         };
         let path = self.patches_path(&format!("view/{uuid}{query}"));
         self.get_json(&path, Bare404::NotFound).await
+    }
+
+    /// [`Self::fetch_patch_summary`] for a vendoring run, asked of the host
+    /// its package references are asked of: `vendor_url`, where the run
+    /// overrides the vendor service's host ([`Self::vendor_package_url`]),
+    /// else this client's own. A run reads a patch's reference and its
+    /// record from one service.
+    pub async fn fetch_vendor_patch_summary(
+        &self,
+        uuid: &str,
+        vendor_url: Option<&str>,
+    ) -> Result<Option<PatchResponse>, ApiError> {
+        let Some(base) = vendor_url else {
+            return self.fetch_patch_summary(uuid).await;
+        };
+        let query = match &self.route {
+            ApiRoute::Org { .. } => "?include_blobs=false",
+            ApiRoute::Proxy => "",
+        };
+        let path = self.patches_path(&format!("view/{uuid}{query}"));
+        self.get_json_at(base.trim_end_matches('/'), &path, Bare404::NotFound)
+            .await
     }
 
     /// What Socket measured about patch `uuid` (see [`PatchStatistics`]):
@@ -4915,6 +4947,46 @@ mod tests {
         let (url, use_auth) = client.vendor_package_url(None);
         assert!(use_auth);
         assert_eq!(url, "https://api.socket.dev/v0/orgs/my-org/patches/package");
+    }
+
+    /// A vendoring run that overrides the vendor service's host reads a
+    /// patch's record from that host, where it reads the patch's
+    /// reference, and never from the API host it was given. Without the
+    /// override the record is the API host's.
+    #[tokio::test]
+    async fn vendor_patch_summary_is_asked_of_the_vendor_url() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        const UUID: &str = "0c0ffee0-0000-4000-8000-000000000001";
+        let (api, vendor) = (MockServer::start().await, MockServer::start().await);
+        let record = serde_json::json!({
+            "uuid": UUID, "purl": "pkg:gem/nokogiri@1.19.3?platform=arm64-darwin",
+            "publishedAt": "2026-01-01T00:00:00Z", "files": {}, "vulnerabilities": {},
+            "description": "", "license": "MIT", "tier": "free"
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/my-org/patches/view/{UUID}")))
+            .and(query_param("include_blobs", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(record))
+            .mount(&vendor)
+            .await;
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: api.uri(),
+            api_token: Some("sktsec_x_api".into()),
+            route: ApiRoute::org("my-org"),
+        });
+        let overridden = format!("{}/", vendor.uri());
+        let read = client
+            .fetch_vendor_patch_summary(UUID, Some(&overridden))
+            .await
+            .unwrap();
+        assert_eq!(read.map(|view| view.uuid).as_deref(), Some(UUID));
+        assert!(api.received_requests().await.unwrap().is_empty());
+
+        let read = client.fetch_vendor_patch_summary(UUID, None).await.unwrap();
+        assert!(read.is_none(), "the API host has no such record");
+        assert_eq!(api.received_requests().await.unwrap().len(), 1);
+        assert_eq!(vendor.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]

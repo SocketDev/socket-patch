@@ -2059,7 +2059,8 @@ async fn build_files(
     let Some(client) = cfg.client.as_ref() else {
         return Err(policy.miss("vendor service not configured".to_string()));
     };
-    match client.fetch_patch_summary(&source.uuid).await {
+    let asked = client.fetch_vendor_patch_summary(&source.uuid, cfg.vendor_url.as_deref());
+    match asked.await {
         Ok(Some(view)) if view.uuid.eq_ignore_ascii_case(&source.uuid) => {
             Ok(crate::manifest::records::files_for_manifest(&view)
                 .into_iter()
