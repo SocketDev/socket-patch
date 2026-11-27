@@ -4936,12 +4936,16 @@ arm64-darwin.`
 VEX follows the builds. The scan's `--vex` attests each patched build under its own patch and
 writes an `affected` statement for a build that keeps upstream's gem. A later `socket-patch vex`
 reads the lock and asks the patch service which builds are patched: one request for all such gems
-together, one more per gem whose lock has no `CHECKSUMS` entry for a build, and one per patched
-build the lock names, for that build's own record. That is on top of the one request `vex` makes
-for the record of any hosted patch. A build is attested as patched only when the lock installs
-exactly that patch's gem, and an installed copy of it is checked against the build's own record: a
-platform gem is a patch of its own, whose files carry that patch's header (and, for a compiled
-build, its binaries), so they are not the files of the gem's patch. When it cannot show that (`--offline`, a failed
+together, and one more per gem whose lock has no `CHECKSUMS` entry for a build. That is on top of
+the one request `vex` makes for the record of any hosted patch. A build is attested as patched
+only when the lock installs exactly that patch's gem. An installed copy of it is judged by the
+archive RubyGems installed it from (`cache/<gem>.gem` in the gem home), which needs no request.
+Where the gem home keeps no archive (a slim image, `gem cleanup`), the copy's files are checked
+against the record of that build's own patch, one request per such build: a platform gem is a
+patch of its own, whose files carry that patch's header (and, for a compiled build, its
+binaries), so they are never checked against the gem's patch. If that record cannot be read, the
+build is stated as `affected` under `vex_gem_build_unknown`, like a build the lock cannot be
+shown to install. When it cannot show that (`--offline`, a failed
 request, a lock older than what the patch service lists now) it states the build as `affected`,
 with what to run to settle it, under the warning `vex_gem_build_unknown`. The run still succeeds.
 
@@ -4989,6 +4993,11 @@ the gem as `affected` (warning `vex_gem_install_unpatched`), with what to run.
 Adding a platform is Bundler's own step: `bundle lock --add-platform <platform>` resolves the gem
 from its one source, the patch registry, and adds that platform's entry and checksum. The next
 scan reports the new build.
+
+A lock that is already on the patch stays on it when a later listing leaves one of its platforms
+out, which the patch service does while that platform's build is being made again: the registry
+address the lock names keeps serving what it listed, so the scan changes nothing, reports the gem
+as on its patch and prints no line about it.
 
 Three cases leave the gem as it is, with one plain line and no warning:
 

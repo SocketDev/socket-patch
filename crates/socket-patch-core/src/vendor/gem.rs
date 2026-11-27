@@ -111,9 +111,11 @@
 //! * the ledger entry records each tree's platform, patch and the digests
 //!   its downloads were verified against
 //!   ([`VendorEntry::gem_builds`]), which is what a restore fetches the
-//!   tree again by. The trees are verified against the FIX's record for
-//!   the patched files they ship; a platform patch's own record is never
-//!   read here.
+//!   tree again by. A platform gem is a patch of its own, so each tree
+//!   is verified against the record of ITS patch for the patched files it
+//!   ships, never against the fix's: that record is read when the tree is
+//!   vendored or restored (one request per platform), and its file hashes
+//!   are kept in the entry for the checks that run offline.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
