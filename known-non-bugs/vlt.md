@@ -1,0 +1,74 @@
+# vlt known non-bugs and documented limitations
+
+One line each. Moved from state/vlt.md on 2026-11-27; search with git grep.
+
+- Hosted pins are recognized only on `patch.socket.dev` or `SOCKET_PATCH_SERVER_URL`. Against a mock without it, `rollback` says "Manifest not found" (documented).
+- If the patch server shares the project registry's `config.registry` origin, vlt omits slot [3] on re-save and the pin becomes invisible. That's a mock artifact only.
+- vlt re-saves CRLF locks as LF on any install (documented). socket-patch itself keeps `\r` through scan and rollback.
+- Vendored refuses a package entirely when any instance is on a named non-default registry (`vendor_lock_entry_unsupported`). That's loud and fail-closed.
+- vlt 1.0.0-rc.14 / rc.32 resolve from public npmjs despite `registries.npm`.
+- The nightly canary failure "vlt 1.3.x is published but neither supported nor excluded" is the docs Releases table lagging new vlt releases.
+- `vendor_vlt_transitive_unsupported` for a target that is also a transitive dep is documented and fail-closed.
+- vlt 1.3.0 fails `vlt install` with "Integrity check failure" against registries advertising `tar.br` alternates (a vlt bug, fixed in 1.3.1).
+- Sandbox: the Rust binaries can't reach npmjs through the TLS proxy (serve version docs locally), vlt's cold-cache "security data" fetch fails, vlt's machine cache must be isolated per mock change (XDG/HOME), the Actions artifact/log blob host is blocked, and the git proxy drops branch deletions.
+- Release 4.0.0 reports `redirect_npm_no_lockfile` on vlt projects: it predates vlt support.
+- vlt has no global install surface (no `vlt install -g`, as of 1.0.10 … 1.3.3). `-g` only covers npm/pnpm/yarn/bun globals.
+- `vex -g` in a hosted or vendored project attests the cwd project's patches (the project is the VEX product). That's deliberate per `commands/vex.rs:1013` (cwd ledgers gate discovery under `--global`).
+- A `-g` "unwritable prefix" test needs files the user doesn't own: socket-patch may chmod files it owns.
+- vlt-lock.json has no node for a bundled copy (1.0.10 … 1.3.3). That's vlt's format, not a socket-patch parse bug. The bug is #471 (not detecting it).
+- vlt 1.0.10 `vlt ci` fails EINTEGRITY on a `remote~` (tarball URL) dependency whenever vlt's machine cache is warm, with or without socket-patch. It's a vlt bug that's gone by 1.2.0.
+- vlt dedupes a peer-dependent package to one `~peer.<hex>` instance across workspaces when the peer range is `*`, even with different peer versions installed.
+- A mock patch artifact whose leaf keeps the scope (`@sc/name-ver.tgz`) is refused as `patched_ref_invalid`. The real service uses the unscoped leaf, so that's a mock artifact.
+- Concurrent socket-patch runs in one directory: the losers fail with "Another socket-patch process is operating in this directory" (`.socket/apply.lock`, `--lock-timeout`). That's by design.
+- Vendored refuses a target with several `~peer.<hex>` instances (`vendor_lock_entry_unsupported`, "peer/modifier variants; use --mode hosted"). That's loud and fail-closed. Hosted and agent handle the shape.
+- `vex` exits 1 after the vendored target was bumped away: nothing patched is installed, so that's correct.
+- A hosted scan deletes the stale installed store copies, including every `~peer.<hex>` instance, so `require` fails until `vlt install` / `vlt ci`. That's documented, and the scan prints a warning.
+- vlt 1.0.0-rc.14 full-probe rollback mismatches against the mock because rc.14 resolves left-pad from public npmjs. That's a mock artifact.
+- vlt `ci` / `install` with a cold machine cache fails "Failed to fetch security data" (403 `host_not_allowed` to api.socket.dev) in the sandbox. That's a sandbox artifact; use `--allow-scripts :scripts`.
+- Agent-mode patches disappear after `rm -rf node_modules && vlt ci`. That's expected: a reinstall replaces agent edits.
+- Vendored refuses graph-modifier variants (`~<selector>` DepID suffix) and root peer-only edges with `vendor_lock_entry_unsupported` ("use --mode hosted"). That's loud and fail-closed; hosted and agent handle both.
+- Vendored `rollback` after a refused vendored scan returns "Manifest not found": nothing was written.
+- Vendoring a `catalog:` member rewrites its spec to `file:`, so a later catalog bump doesn't move it until rollback restores `catalog:` (consistent with vendored owning the spec).
+- Agent mode refuses a `node_modules` link to a first-party workspace member / `file:` dir that shares the patched name@version (#634, #626). That's intended. The missing failure count in `scan --json` is #424 (generic, not vlt).
+- A rerun that "passes" right after switching mock modes can be a stale mock still bound to the port. That's a harness artifact.
+- With a scalar `config.registry` (3-tuple lock) and a registry whose `dist.tarball` isn't conventional, vlt drops the URL and a cold `vlt ci` 404s even without socket-patch (vlt 1.0.10 … 1.3.7). That's vlt behavior.
+- vlt 1.0.10 … 1.3.7 refuse to install with only a scalar `config.registry` ("Missing npm registry configuration"). Set `registries.npm` too.
+- #941 (hosted rollback / remove restore a vlt 1.3 brotli node as gzip): a maintainer closed it `not_planned` on 2026-10-08 pending #1130. Don't re-file it unless #1130 decides to restore the brotli entry.
+- A mock whose `/patches/batch` answers every request gives a bumped or uninstalled project a false `partial_failure` / `redirect_vlt_entry_not_found`. Filter by the request body.
+- A vlt workspace member with its own `vlt.json` is its own vlt project root. A refusal from it before its first install is acceptable.
+- Dual-root shape (a member with its own `vlt.json`, also listed by the root's `workspaces`): socket-patch treats the member as its own project, as vlt does from there. A vendored run from the member then makes the root's `vlt ci` fail "out of sync", because the shared `package.json` changed. Run from the root to patch the root's install.
+- Hosted scan with an artifact the preflight can't verify, over a vendored entry: exits 0 with `redirect_vlt_artifact_unverifiable` and stays vendored (documented).
+- vlt (1.2.0 / 1.3.7) doesn't restore a deleted `node_modules/<name>` link or `node_modules/.vlt` on `vlt install`, with or without socket-patch. Use `vlt ci`.
+- `vlt ci` re-resolves the peer edge of a vendored `file:` node (e.g. `peer-host` 1.0.0 → 2.0.0) and re-saves the lock. A later rollback keeps vlt's edge, so it isn't byte-exact against the pre-scan lock. That's vlt's change.
+- Hosted rollback writes `resolved` / `integrity` into a sibling `package-lock.json` entry that npm wrote without them. Rollback restores the upstream registry entry (contract).
+- vlt 0.0.0-16 … 0.0.0-24 ignore `vlt-lock.json` without `"modifiers": {}`, so a hosted pin there installs pristine. socket-patch warns `redirect_vlt_old_lockfile_ignored`. vlt 0.0.0-18 has no `ci` command.
+- Agent `repair` against the mock fails `download_failed`: the mock serves no diff archives.
+- `vlt update` (>= 1.0.8) re-resolves an exact spec and drops a hosted pin (documented, `docs/ecosystems.md`). vex then refuses. A vendored `file:` spec survives it.
+- Hosted `vex` with nothing installed attests from the lock's pin (documented in the CLI_CONTRACT hosted VEX row).
+- Vendored `rollback` with `.socket/vendor` deleted fails loudly with `vendor_ledger_missing` and changes nothing (fail-closed). `vlt ci` exits 0 in that state with the `file:` target missing, which is vlt's behavior.
+- A mock patch server with a path prefix (`RP=` on port 18556) gives `redirect_unattributable`: the artifact URL is off the patch host. That's a mock artifact.
+- `apply --check` on hosted / vendored vlt projects prints "No patch manifest found": vendor-owned and hosted patches are out of its scope by contract.
+- A no-mode `scan --prune` on a vendored vlt project is report-only for patching, but its GC runs for real: it reverts a ledger entry whose dependency `vlt uninstall` dropped and deletes that `.socket/vendor/npm/<uuid>` dir (documented, `CLI_CONTRACT.md` mode resolution and `--prune` leg (b)).
+- A bare `scan` / `get` from a vlt workspace member while the vendor ledger sits at the root runs hosted mode and refuses `redirect_workspace_lockfile_elsewhere` without writing. That's fail-closed; run from the root.
+- `vlt ci` (1.2.0 / 1.3.8), and `vlt install` in a workspace member, link a `file:` tarball dependency straight to the raw `.tgz` (`node_modules/x -> ../x.tgz`) instead of extracting it, with or without socket-patch. No copy can be loaded, so `vex` attesting the registry pin there isn't a false attestation. With the tarball copy extracted pristine (a fresh root `vlt install`), `vex` refuses correctly.
+- `vlt-compatibility.yml` (with every other `*-compatibility.yml`) was `disabled_manually` on 2026-10-09, so it has no runs on main since. That's a maintainer choice, not a trigger bug; the blocking vlt rows run in `ci.yml`.
+- vlt (1.3.8) dedupes a workspace member's peer-dependent package onto an existing `~peer.<hex>` instance (peer-host 1.0.0) even when the member itself depends on peer-host 1.5.0, and a root `peer-host` dep collapses every instance into one. That's vlt's peer resolution.
+- `vendor --check` on a vendored project that later gained a `file:` copy of the same name@version says "wiring missing: no lockfile or config references …" although the lock still references the vendored dir. The exit code (1) and VEX omission are right; only the wording is imprecise.
+- vlt's workspace globs (1.3.8): a `!` pattern excludes regardless of its position, but a later literal path re-includes; `"packages"` lists nothing. A directory excluded by `!` isn't its own project (`vlt install` there installs the root), so socket-patch refusing from it is fail-closed.
+- vlt 1.2.0 ignores `package.json` `workspaces` with extglobs when `vlt.json` exists without `workspaces` (the member gets no edge), so a vendored write to that directory's own lock isn't the #1542 bug.
+- vlt's global store holding patched `index.js` bytes after a hosted / vendored run: those are the patched tarballs fetched for the pin, not an agent-mode leak.
+- `docs/testing/vlt-compatibility.md` not listing vlt 1.4.0 yet (released 2026-10-14) is docs lag, like the canary note above.
+- `socket-patch vex --json` without `-O <file>` exits 2 with `json_requires_output`. That's a usage error, not a VEX result.
+- vlt 1.4.0's `pnpm-workspace.yaml` reader rejects anchors / aliases, tab indentation, a duplicate `packages:` key, invalid JSON escapes in a double-quoted item, and a flow list starting on the line after `packages:`. Those dirs aren't vlt members, so no refusal is right.
+- Hosted / vendored `scan <path>` (path-scoped from the root) at a workspace member refuses like a scan run from inside the member: a PATH is a project dir, as if `--cwd` (CLI_CONTRACT `scan` positional row).
+- A vlt 1.4.0 edge-removing modifier (`"-"`) on the target's only edge leaves nothing installed, so no pin and no attestation is correct. A root edge removed while a transitive edge remains gets `vendor_vlt_transitive_unsupported` (documented).
+- Hosted skips a named-registry vlt node (`~acme~…`, `redirect_vlt_custom_registry_skipped`) and vendored refuses it (`vendor_lock_entry_unsupported`); both are documented. Only the hint text is wrong (#1601).
+- vlt lists a workspace member outside the project root for `["../ext/*"]` (`workspace~..+ext+e`), but from that directory (no outer `package.json`) vlt treats it as its own project, so socket-patch writing its own lock there isn't a stray-lock bug.
+- A scoped package installed through an `npm:` alias (`"@sc/sp": "npm:@sc/sp@1.3.0"`) gets DepID `~npm~@sc+sp` although vlt fetches it from the scoped registry. Hosted and vendored treat it as default-registry (segment rule, tested on purpose in `upstream/vlt.rs` `restore_honors_scope_for_slot3_and_configured_registry_omission`), and rollback restores the scoped URL byte-exact.
+- vlt 1.4.0 `vlt ci` dedupes a plain scoped spec and an `npm:` alias of the same package onto the URL-segment node, which drops a hosted pin on the `~npm~` node. That happens on an untouched lock too (vlt behaviour), and the hosted run's `--vex` already omits the package.
+- vlt `install` rewrites a same-name jsr spec (`"@sc/jp": "jsr:@sc/jp@1.0.0"`) to `"jsr:1.0.0"` in `package.json` (1.3.8 / 1.4.0), before socket-patch runs. Vendored rollback restores what vlt wrote.
+- vlt (1.4.0) rejects a BOM-prefixed `vlt-lock.json` on `vlt ci`, so there's no socket-patch case there.
+- vlt resolves a jsr package's plain npm dependency through the jsr registry (`~jsr~left-pad@1.3.0`). Hosted skips that node and vendored refuses it (both documented); with a direct default-registry copy beside it, hosted pins the direct copy and VEX omits the package.
+- vlt runs `prepare` for a `file:` directory dependency (1.0.10 … 1.4.0), so the vendored `prepare` refusal is right; registry nodes never run prepare-family scripts.
+- npm hosted / vendored rollback's "unwired packages keep their patched bytes" note is true on npm (the copy stays until `npm ci`); only the vlt note is false (#2323, 2026-11-27).
+- vlt 1.4.0 … 1.9.0 still write `lockfileVersion: 1` with root edge key `file~_d`; no new lock format to refuse (2026-11-27).
