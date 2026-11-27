@@ -3,7 +3,7 @@
 
 [agent] This comment is the register for the architecture refactor routine. It is rendered from `register/10-refactor.md` on the [`arch-audit/ledger`](https://github.com/SocketDev/socket-patch/tree/arch-audit/ledger) branch, and the routine updates it on every run.
 
-_Last updated 2026-11-26 · 17 runs under this charter · `main` at cfc870f when examined._
+_Last updated 2026-11-27 · 18 runs under this charter · `main` at cfc870f when examined._
 
 ### In flight
 | PR | Issue | State |
@@ -14,7 +14,7 @@ _Last updated 2026-11-26 · 17 runs under this charter · `main` at cfc870f when
 
 `hosted-e2e` is red on all three: it needs #2270 (a production gem patch the suite does not pin; #2280 is open for it), then a re-run. Three are open: the next run opens none (step 3).
 
-**Next PR:** #2287 (a printed credential), then #2290 (a `remove` that reports success), #2286 and #2289: the most harm. Then #2259 (core `utils/hatch.rs`), #2294, #2296, #2271, L22 (once #2261 merges: same function), #647, #1917, #1926, #1860, #1836: each ran. #2277 and #2297 wait for a maintainer's answer.
+**Next PR:** #2287 (a printed credential), then #2290 (a `remove` that reports success), #2299 (a failed patch upgrade that strands the project), #2286 and #2289: the most harm. Then #2259 (core `utils/hatch.rs`), #2294, #2296, #2271, L22 (once #2261 merges: same function), #647, #1917, #1926, #1860, #1836: each ran. #2277 and #2297 wait for a maintainer's answer.
 
 ### Merged
 | PR | Fixed |
@@ -37,15 +37,11 @@ L01 to L18 came from earlier audits, the rest from this routine. A row is a hypo
 | L09, L15, L26–L29, L31, L32, L35, L39 | (collapsed) | core `api/`, `telemetry.rs`, CLI `list.rs`, `vendor.rs`, `scan/gc.rs`, `scan/mod.rs`, `vlt_heal.rs`, `scan/withdrawn.rs` | out of charter; L09, L15, L26 and L31 (ran) need a decision the contract doesn't settle. The contract allows L27 (ran), L28, L29, L32 (ran) and L35 (ran). L39 (ran): the contract's telemetry list omits a `ci` flag. Evidence in the entries |
 | L14 | scala-cli `discover` collapses unreadable files and cap breaches into `None`, so the user is told to run `scala-cli compile` | core JVM crawlers | to verify; read: no real project reaches the caps. Open: a non-project `.json` in Bloop's directory. Needs scala-cli |
 | L22 | the prune GC raises no Go undo warning after it reverts a vendored Go module | CLI `vendor.rs` `run_vendor_gc` | filed #1910 (its last bullet); ran it: `scan --prune` says nothing where the undo commands warn (#1778) |
-| L25 | the ledger's load error is printed raw, so control characters in a committed `state.json` reach the terminal | six CLI commands | filed #2271; ran it: ESC and BEL from a snapshot hash are printed |
-| L30 | `rollback` and `remove` refuse a package when a file of its patch is absent, the state `apply --force` leaves | core `patch/rollback.rs` | filed #2277, a decision issue; ran it |
-| L33 | a failed `npm root -g` probe reads as "no global install" | core `crawlers/npm_crawler.rs`, CLI `rollback.rs` | filed #2286; ran it: a project `rollback` drops the record of a copy still patched globally |
-| L34 | refusals, hosted warnings, undo errors and a Gradle note print the credentials of a URL they quote | core `vendor/`, `patch/redirect/`, `crawlers/` | filed #2287; ran it: a planted token is printed at eight sites |
-| L36 | vendoring reports a PyPI package or gem whose installed copy is at neither hash as not installed | CLI `vendor.rs` | filed #2289; ran it: an agent-mode project on an older patch cannot switch to vendored |
-| L37 | `remove <target>` and `rollback <target>` never ask whether a lockfile still installs from a vendor directory no ledger entry owns | CLI `remove.rs`, `rollback.rs` | filed #2290; ran it: `remove` exits 0 with the lock still wired |
+| L25, L30, L33, L34, L36, L37 | (collapsed) | six CLI commands, core `patch/rollback.rs`, `crawlers/npm_crawler.rs`, `vendor/`, CLI `vendor.rs`, `remove.rs` | filed #2271 (L25), #2277 (L30, a decision issue), #2286 (L33), #2287 (L34), #2289 (L36), #2290 (L37); each ran. Evidence in the issues |
 | L38 | `socket.yml` and the selection filter refuse a scoped npm purl (`pkg:npm/@babel/core`) that `scan --package` takes | core `policy/socket_yml.rs` | filed #2294; ran it: the scan fails with `socket_yml_invalid` or `filter_invalid` |
 | L40 | `scan --package` that matches nothing says "Run your package manager's install first" | CLI `scan/render.rs` | filed #2296; ran it. #248 named the other two filters |
 | L41 | `socket.yml` accepts `lodash@4.17.20` in `ignorePackages`, a deny that never matches | core `policy/socket_yml.rs` | filed #2297, a decision issue; ran it: lodash is patched |
+| L42 | an agent `scan` or `get` that replaces a recorded patch writes the new record before the apply; when the apply fails the files keep the old patch with no record of it | CLI `agent_download.rs`, `get.rs` | filed #2299; ran it: one failed blob download under `scan --prune`, `--strict`, or `get --save-only` then `repair`, and `apply` and `rollback` exit 1 from then on. Two tests fail on `main` |
 
 Issues looked at:
 
@@ -57,7 +53,7 @@ Issues looked at:
 | #1917, #1926, #1860, #647, #1836 | confirmed; each ran: `App.CSPROJ` scans as 0 packages; `scan --sync` keeps, then prunes, a Cargo record over a cache file at neither hash; `list` prints bidi characters (beside #2271); `get`'s searches and `vendor`'s eject lack the public-proxy fallback; `get --json` orders `options[].vulnerabilities` at random |
 | 42 issues, named in the entries | out of charter; each ran or was read (14 read only) |
 | #1114 | fixed in part (#2229); the CI janitor holds the rest |
-| the other 29 open issues | out of charter by title, or "Decide:" issues (the 18:55Z entry). Every `arch-audit` issue open at 23:20Z on 2026-11-26 has been looked at |
+| the other 29 open issues | out of charter by title, or "Decide:" issues (the 18:55Z entry). Every `arch-audit` issue open at 00:57Z on 2026-11-27 has been looked at |
 
 ### Areas examined
 | Area | Date | `main` | Found |
@@ -65,6 +61,7 @@ Issues looked at:
 | the runs of 2026-11-25 and of 11-26 to 16:55Z: agent mode's undo, prune, output and broken inputs; `--json` / `--silent`; Gradle; the vlt heal; failing toolchains; credentials in project files; purl spellings; cache crawls | 2026-11-25, 11-26 | 332b3e8 to cfc870f | the PRs and issues above up to #2287; the rest clean |
 | hosted mode on the bench's 20 package managers (a planted credential, dry runs, rescans, rollback, `--json`, `--silent`, `--offline`); vendored mode on 8 (the round trip over CRLF, BOM and tab lockfiles, tampered artifacts, the undo commands, an installed copy at other bytes) | 2026-11-26 | cfc870f | four more sites of #2287; #2289, #2290; the rest clean |
 | the `socket.yml` policy and the selection filter; telemetry; `vex --grype-config`; the socket-cli config file; `scan`, `list` and `rollback` over a monorepo | 2026-11-26 | cfc870f | #2294, #2296, #2297; the rest clean |
+| the patch API failing mid-run (5xx, 404, HTML, an empty or cut-off body, a reset, 429) under `scan`, `get`, `show`, `repair`, `apply` and `rollback`; `report`; `--update` against a mock release host; a newer patch for a patched package | 2026-11-27 | cfc870f | #2299; the rest clean |
 
 ### Notes
 - Build with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0` on every cargo call, and give each checkout its own `CARGO_TARGET_DIR`, or the next call rebuilds everything. A cold CLI build takes 3 minutes, core's unit tests 4, a rebuild after an edit 25 seconds.
@@ -72,10 +69,10 @@ Issues looked at:
 - `--cwd` defaults to `.`: absolutize it before walking `ancestors()`, and test via chdir under `#[serial]`. A test runner that pins `--cwd` must not also set the child's cwd to the project.
 - A write that returns 5xx may have landed: list before you retry.
 - Cite a path and line numbers, not a permalink: one came back wrapped in backticks (#2287).
-- Run the built binary over small broken projects and compare the commands. Set `SOCKET_TELEMETRY_DISABLED=1 SOCKET_NO_CONFIG=1`. For a patch API use the bench: `socket-patch-bench serve <pm>/hosted --bin <cli> --scale 0.02 --work-dir <dir>` builds a hosted project for any of 20 package managers (24 patches at `--scale 0.4`), serves all three hosts and prints the command with its env (runner: the 18:55Z entry). Outside registries are refused, so an undo fails except for Hatch, Maven and Gradle. The 06:55Z, 08:56Z and 22:56Z entries have a refused token, a held `apply.lock`, and a stand-in API with an npm monorepo of six patched packages.
+- Run the built binary over small broken projects and compare the commands. Set `SOCKET_TELEMETRY_DISABLED=1 SOCKET_NO_CONFIG=1`. For a patch API use the bench: `socket-patch-bench serve <pm>/hosted --bin <cli> --scale 0.02 --work-dir <dir>` builds a hosted project for any of 20 package managers (24 patches at `--scale 0.4`), serves all three hosts and prints the command with its env (runner: the 18:55Z entry). Outside registries are refused, so an undo fails except for Hatch, Maven and Gradle. The 06:55Z, 08:56Z and 22:56Z entries have a refused token, a held `apply.lock`, and a stand-in API with an npm monorepo of six patched packages; the 00:55Z entry of 11-27 adds failure rules per route, a second patch for one package, and a mock release host.
 - Vendored mode runs on files alone, with `tests/prebuilt_common`'s `Server::project(<dir>)` held open by a throwaway ignored test as the vendor service (the 20:56Z entry). Building a test rebuilds `target/debug/socket-patch` with core's test features: keep the plain binary in a second target directory.
 - A throwaway probe test over the lead's input settles it in one rebuild. For a test that can't fail, mutate one production line and keep the diff (#2267).
-- The owner was notified on 2026-11-26 of the three waiting PRs (05:15Z), #2277, #2286, #2287, #2289, #2290, #2294, #2296 and #2297. Don't notify again for the waiting PRs alone, or for more sites of a filed issue.
+- The owner was notified of the three waiting PRs (2026-11-26 05:15Z), #2277, #2286, #2287, #2289, #2290, #2294, #2296, #2297 and #2299. Don't notify again for the waiting PRs alone, or for more sites of a filed issue.
 - Run `/code-review high` until a pass finds no real defect (#2261 took three), and the `cli` suite after touching any test file (it holds ratchets over `tests/`).
 - Most open `agent/*` PRs edit `CLI_CONTRACT.md`: far-apart hunks are fine (#2261 beside #2258).
 - `main` requires every review thread resolved: an open one blocks an approved PR with auto-merge armed, and nothing says so. Answer and resolve threads first. A push does not dismiss approvals.
