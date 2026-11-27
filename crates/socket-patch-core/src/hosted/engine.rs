@@ -2740,14 +2740,7 @@ pub struct Rewritten {
     /// In memory only: the trust auto-config would write through a
     /// symlinked `pnpm-workspace.yaml`.
     pub(crate) workspace_symlinked: bool,
-    /// The attribution gate's discovery of the project as this rewrite
-    /// leaves it, when it equals a discovery made with exactly
-    /// [`RewriteOptions::patch_server_origins`] (this run's grants name no
-    /// other origin). `None` when the gate discovered nothing (no
-    /// confirmed candidate) or counted another origin. A caller that
-    /// writes exactly [`RewriteResult::files`] and
-    /// [`RewriteResult::binary_files`] and nothing else may use it in place
-    /// of discovering the written project again (see [`FinalDiscovery`]).
+    /// The discovery used to check the final hosted pins.
     pub final_discovery: Option<FinalDiscovery>,
 }
 
@@ -2767,6 +2760,11 @@ impl Rewritten {
 /// Where [`Rewritten::final_discovery`] lives.
 #[derive(Debug)]
 pub enum FinalDiscovery {
+    /// The gate also recognized origins from this run's grants.
+    WithGrantOrigins {
+        discovery: Box<crate::vex::discover::Discovery>,
+        view_only: bool,
+    },
     /// The pass wrote nothing, and the gate reused the caller's
     /// [`RewriteOptions::prior_discovery`]: still the caller's to read.
     Prior,
@@ -3264,8 +3262,11 @@ async fn unattributed_pins(
         })
         .collect();
     let discovery = match (same_origins, fresh) {
-        (false, _) => None,
-        (true, None) => Some(FinalDiscovery::Prior),
+        (false, Some((fresh, view_only))) => Some(FinalDiscovery::WithGrantOrigins {
+            discovery: Box::new(fresh),
+            view_only,
+        }),
+        (_, None) => Some(FinalDiscovery::Prior),
         (true, Some((fresh, view_only))) => Some(FinalDiscovery::Overlaid {
             discovery: Box::new(fresh),
             view_only,
@@ -12674,14 +12675,17 @@ snapshots:
 
     /// A grant on a server the caller did not configure makes the gate count
     /// another origin: its discovery is not the caller's, so the gate never
-    /// reuses the prior one and hands back none.
+    /// reuses the prior one.
     #[tokio::test]
-    async fn a_foreign_grant_origin_hands_back_no_discovery() {
+    async fn a_foreign_grant_origin_keeps_its_discovery_separate() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("package-lock.json"), LEFT_PAD_LOCK).unwrap();
         let done = gated_left_pad_rewrite(tmp.path(), &[], None).await;
         assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
-        assert!(done.final_discovery.is_none());
+        assert!(matches!(
+            done.final_discovery,
+            Some(FinalDiscovery::WithGrantOrigins { .. })
+        ));
         write_rewrite(tmp.path(), &done);
         // Unwritten now, with a prior discovery made without the grant's
         // origin: still not reused.
@@ -12689,7 +12693,10 @@ snapshots:
         let done = gated_left_pad_rewrite(tmp.path(), &[], Some(&prior)).await;
         assert!(done.rewrite.files.is_empty());
         assert_eq!(done.confirmed.len(), 1);
-        assert!(done.final_discovery.is_none());
+        assert!(matches!(
+            done.final_discovery,
+            Some(FinalDiscovery::WithGrantOrigins { .. })
+        ));
     }
 
     /// Nothing confirmed: the gate discovers nothing and hands back none.

@@ -24,6 +24,7 @@ use socket_patch_core::formats::gem::GemBuild;
 use super::{discover_selected, emit_scan, scan_envelope, ScanArgs};
 
 mod nuget;
+mod pin_changes;
 mod python;
 mod takeover;
 
@@ -361,8 +362,18 @@ pub(super) fn record_hosted_events(
     unconfirmed: &[(String, String)],
     skipped: &[socket_patch_core::hosted::engine::SkippedPatch],
     dry_run: bool,
+    changes: &std::collections::HashMap<(&str, &str), bool>,
 ) {
-    for event in hosted_events(confirmed, unconfirmed, skipped, dry_run) {
+    for mut event in hosted_events(confirmed, unconfirmed, skipped, dry_run) {
+        if matches!(event.action, PatchAction::Applied | PatchAction::Verified) {
+            let changed = event
+                .purl
+                .as_deref()
+                .zip(event.uuid.as_deref())
+                .and_then(|key| changes.get(&key));
+            event.details.get_or_insert_with(|| serde_json::json!({}))["pinChanged"] =
+                serde_json::json!(changed);
+        }
         env.record(event);
     }
 }
@@ -1285,8 +1296,9 @@ fn discovery_after_writes<'d>(
             discovery,
             view_only,
         }) => (Some(&**discovery), *view_only),
-        // The gate read `prior` itself (see `engine::rewrite`).
-        Some(FinalDiscovery::Prior) | None => (None, false),
+        Some(FinalDiscovery::Prior | FinalDiscovery::WithGrantOrigins { .. }) | None => {
+            (None, false)
+        }
     };
     let candidate = match written {
         Written::Nothing => prior.or(overlaid),
@@ -1718,6 +1730,13 @@ async fn run_redirect_selected_untracked(
     // `Err` (unreadable / malformed) is "no vendored ownership known" for
     // both consumers.
     let mut vendor_state = socket_patch_core::vendor::load_state(&common.cwd).await;
+
+    let before_pins = if common.json && !candidates.is_empty() {
+        let prior = rollout.as_ref().and_then(|gate| gate.prior);
+        Some(pin_changes::before_rewrite(common, &candidates, prior).await)
+    } else {
+        None
+    };
 
     // Every project write of this run — a takeover's vendored reverts, the
     // hosted pins and the vendored ledger — is staged in one group commit
@@ -2239,7 +2258,7 @@ async fn run_redirect_selected_untracked(
     // files the overlay creates or removes (see `discovery_after_writes`).
     // Taken before the commit, while the disk is still as discovery saw it.
     let mut created_paths: Vec<String> = Vec::new();
-    if !common.dry_run {
+    if !common.dry_run || common.json {
         let on_disk = |rel: &str| {
             let path = common.cwd.join(rel);
             async move {
@@ -2685,7 +2704,21 @@ async fn run_redirect_selected_untracked(
         // tagged `details.mode: "hosted"`, the `redirect` payload, and the
         // engine's warnings hoisted to the top-level `warnings`.
         let mut env = scan_result.take().unwrap_or_else(|| scan_envelope(common));
-        record_hosted_events(&mut env, &confirmed, &unconfirmed, &skipped, common.dry_run);
+        let changes = pin_changes::compare(
+            before_pins.as_deref(),
+            done.final_discovery.as_ref(),
+            &created_paths,
+            &confirmed,
+            done.rewritten.is_empty() && takeover_files.is_empty(),
+        );
+        record_hosted_events(
+            &mut env,
+            &confirmed,
+            &unconfirmed,
+            &skipped,
+            common.dry_run,
+            &changes,
+        );
         record_registry_cleanup(
             &mut env,
             &registry_removed,
@@ -4348,6 +4381,7 @@ mod tests {
             &[("pkg:npm/a@1.0.0".to_string(), "ua".to_string())],
             &skipped,
             false,
+            &Default::default(),
         );
         env.set_extra("redirect", redirect_block(vec!["package-lock.json".into()]));
         env.warnings.push(prune_ignored_warning());
@@ -4376,6 +4410,11 @@ mod tests {
                 ("applied", "pkg:npm/minimist@1.2.2", None),
             ]
         );
+        assert_eq!(
+            v["events"][2]["details"].get("pinChanged"),
+            Some(&serde_json::Value::Null)
+        );
+        assert!(v["events"][0]["details"].get("pinChanged").is_none());
         assert_eq!(v["summary"]["applied"], 1);
         assert_eq!(v["summary"]["skipped"], 2);
         assert_eq!(
@@ -4392,6 +4431,7 @@ mod tests {
             &[],
             &[],
             true,
+            &Default::default(),
         );
         assert_eq!(env.summary.verified, 1);
         assert_eq!(env.summary.applied, 0);
