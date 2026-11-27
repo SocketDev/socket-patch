@@ -7175,3 +7175,114 @@ async fn a_precompiled_copy_under_a_ruby_only_lock_is_reported_and_attested_affe
     assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
     assert!(stale_warnings(&env).is_empty(), "{env}");
 }
+
+/// A patched platform build in a gem home whose `cache/` was pruned (a
+/// slim image, `gem cleanup`): no archive says which gem the copy was
+/// installed from. A platform gem is a patch of its own, whose files carry
+/// that patch's header, so they never hash to what the gem patch's record
+/// lists.
+///
+/// * The copy is judged by the record of its own patch: the healthy one is
+///   left alone and nothing is said, run after run. Judged by the gem
+///   patch's record it was called stale and replaced, or warned about,
+///   every time.
+/// * Where that build's record cannot be read, nothing judges the copy: it
+///   is not called stale and is not replaced.
+/// * An upstream copy in the same place is still stale, by the build's
+///   record.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_patched_platform_copy_with_a_pruned_cache_is_judged_by_its_own_patch() {
+    // What the platform build's own patch makes of the file.
+    let stamped = format!("# Socket Community Patch: {ARM_UUID}\n{PATCHED_LIB}");
+    let build_record = |served: bool| {
+        let template = match served {
+            true => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": ARM_UUID,
+                "purl": format!("{PURL}?platform={PLATFORM}"),
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "files": { "lib/stale_probe_gem.rb": {
+                    "beforeHash": compute_git_sha256_from_bytes(UPSTREAM_LIB.as_bytes()),
+                    "afterHash": compute_git_sha256_from_bytes(stamped.as_bytes()),
+                } },
+                "vulnerabilities": {},
+                "description": "x", "license": "MIT", "tier": "free"
+            })),
+            false => ResponseTemplate::new(404),
+        };
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/view/{ARM_UUID}")))
+            .respond_with(template)
+    };
+    for (served, installed, stale) in [
+        (true, stamped.as_str(), false),
+        (false, stamped.as_str(), false),
+        (true, UPSTREAM_LIB, true),
+    ] {
+        let server = MockServer::start().await;
+        let prebuilt = real_gem_for(&stamped, PLATFORM);
+        let other = real_gem_for(PATCHED_LIB, OTHER_PLATFORM);
+        mount_api_with(
+            &server,
+            None,
+            &sha256_of(&real_gem(PATCHED_LIB)),
+            &[
+                (PLATFORM, sha256_of(&prebuilt), Some(ARM_UUID)),
+                (OTHER_PLATFORM, sha256_of(&other), Some(LINUX_UUID)),
+            ],
+        )
+        .await;
+        build_record(served).mount(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("Gemfile"),
+            format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\n"),
+        )
+        .unwrap();
+        let upstream = |platform: &str| sha256_of(&real_gem_for(UPSTREAM_LIB, platform));
+        std::fs::write(
+            proj.join("Gemfile.lock"),
+            platform_lock(&upstream(PLATFORM), &upstream(OTHER_PLATFORM)),
+        )
+        .unwrap();
+        let home = project_home(&proj);
+        let gem_dir = install_real_gem_for(&home, installed, PLATFORM);
+        std::fs::remove_dir_all(home.join("cache")).unwrap();
+
+        let uri = server.uri();
+        let label = format!("record served: {served}, stale: {stale}");
+        for run in ["first", "second"] {
+            let (code, stdout, stderr) =
+                common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+            let env = common::parse_json_envelope(&stdout);
+            assert_eq!(code, 0, "{label}, {run} scan: {env}\nstderr:\n{stderr}");
+            assert_eq!(
+                stale_warnings(&env).len(),
+                usize::from(stale),
+                "{label}, {run} scan: {env}"
+            );
+            assert!(
+                warnings_with_code(&env, "redirect_gem_install_refreshed").is_empty(),
+                "{label}, {run} scan: nothing is replaced without the archive: {env}"
+            );
+            assert_eq!(installed_lib(&gem_dir), installed, "{label}, {run} scan");
+        }
+        let fix_records = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| {
+                request
+                    .url
+                    .path()
+                    .ends_with(&format!("/patches/view/{UUID}"))
+            })
+            .count();
+        assert_eq!(
+            fix_records, 0,
+            "{label}: the gem patch's record is not what judges it"
+        );
+    }
+}

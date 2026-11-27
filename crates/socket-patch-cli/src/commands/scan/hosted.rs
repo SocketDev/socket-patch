@@ -750,6 +750,12 @@ fn stale_cache_gem(purl: &str, cache_path: &Path) -> StaleGem {
 ///   with), the patch's view record judges the dir ([`ViewFallback`]). A
 ///   dir that record cannot judge either (the fetch failed, or `--offline`)
 ///   is reported in `unjudged_purls`, never as healthy.
+/// * The copy of a platform build that has a patch of its own
+///   (`gem_build_patches`, by leaf) is judged by its archive, else by the
+///   record of that build's own patch, and never by the gem patch's
+///   record, the agent-mode one included: a platform gem's files are not
+///   the gem patch's. With neither it is unjudged: not stale, and not
+///   replaced.
 /// * Judgments are grouped by installed dir: platform-variant purls of one
 ///   gem share a dir, and if any variant proves it patched, it is never
 ///   warned.
@@ -800,6 +806,7 @@ async fn gem_stale_install_warnings(
         std::collections::BTreeSet<String>,
     >,
     gem_upstream: &std::collections::BTreeMap<String, String>,
+    gem_build_patches: &std::collections::BTreeMap<String, String>,
     views: &mut ViewFallback<'_>,
 ) -> StaleInstallOutcome {
     use socket_patch_core::crawlers::types::CrawlerOptions;
@@ -1008,7 +1015,12 @@ async fn gem_stale_install_warnings(
                     _ => None,
                 }
             };
-            let judged = match local {
+            // A platform build with a patch of its own is a patch of its
+            // own: its files carry that patch's header (and, compiled, its
+            // binaries), so the gem patch's record says nothing true of it.
+            // Its archive judges it, else that build's own record (below).
+            let own_patch = gem_build_patches.get(leaf);
+            let judged = match local.filter(|_| own_patch.is_none()) {
                 Some(record) => {
                     let judged = judge_installed_record(dir, record).await;
                     if judged.patched
@@ -1028,7 +1040,10 @@ async fn gem_stale_install_warnings(
             };
             match judged {
                 Some(judged) => entry.record(purl, judged),
-                None => pending.push((dir.clone(), purl, uuid)),
+                None => {
+                    let record_of = own_patch.map_or(*uuid, String::as_str);
+                    pending.push((dir.clone(), purl, record_of));
+                }
             }
         }
     }
@@ -1272,6 +1287,7 @@ async fn refresh_stale_gems(
         std::collections::BTreeSet<String>,
     >,
     gem_upstream: &std::collections::BTreeMap<String, String>,
+    gem_build_patches: &std::collections::BTreeMap<String, String>,
     overrides: &[DepOverride],
     mirror_sources: &socket_patch_core::hosted::engine::MirrorSources,
     views: &mut ViewFallback<'_>,
@@ -1287,6 +1303,7 @@ async fn refresh_stale_gems(
         local_records,
         gem_artifact_shas,
         gem_upstream,
+        gem_build_patches,
         views,
     )
     .await;
@@ -1417,6 +1434,7 @@ async fn refresh_stale_gems(
             local_records,
             gem_artifact_shas,
             gem_upstream,
+            gem_build_patches,
             views,
         )
         .await
@@ -2816,6 +2834,11 @@ async fn run_redirect_selected_untracked(
     // unless it installed a patched build that was withdrawn since.
     let mut gem_upstream: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
+    // The platform builds that have a patch of their own, by leaf, each
+    // with that patch's uuid: its record, never the gem patch's, is what
+    // judges a copy of such a build that has no archive to go by.
+    let mut gem_build_patches: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     // Of the pins the project's files hold alone: a gem's lock can stay
     // on one patch while another patch of the gem is skipped, and what the
     // skipped one's registry serves is not what the lock installs.
@@ -2838,8 +2861,16 @@ async fn run_redirect_selected_untracked(
             .iter()
             .flat_map(|ro| ro.identifiers.gem_builds.iter().flatten())
         {
-            match build.patch_uuid {
-                Some(_) => patched_builds.push(build.gem_checksum_sha256.clone()),
+            match &build.patch_uuid {
+                Some(own) => {
+                    patched_builds.push(build.gem_checksum_sha256.clone());
+                    if build.platform != "ruby" {
+                        gem_build_patches.insert(
+                            format!("{}-{}-{}", o.name, o.version, build.platform),
+                            own.clone(),
+                        );
+                    }
+                }
                 None => {
                     gem_upstream.insert(
                         format!("{}-{}-{}", o.name, o.version, build.platform),
@@ -2865,6 +2896,7 @@ async fn run_redirect_selected_untracked(
         &local_records,
         &gem_artifact_shas,
         &gem_upstream,
+        &gem_build_patches,
         &pinned_gems,
         &mirror_sources,
         &mut views,
