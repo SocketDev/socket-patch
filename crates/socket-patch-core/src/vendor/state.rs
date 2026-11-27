@@ -33,7 +33,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::constants::SOCKET_DIR;
-use crate::manifest::schema::PatchRecord;
+use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::utils::fs::{atomic_write_artifact, read_regular_to_bytes};
 use crate::utils::purl_key::PurlKey;
 use crate::utils::serde::serialize_sorted;
@@ -369,6 +369,15 @@ pub struct GemBuildEntry {
     /// The sha512 (SRI) of the stub gemspec the tree holds, likewise.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub gemspec_integrity: String,
+    /// The files this platform's own patch changes, with their hashes, as
+    /// that patch's record states them: what the tree is verified against.
+    /// A platform gem is a patch of its own, so its files are not the
+    /// gem patch's: a compiled build changes binaries the gem's patch does
+    /// not name, and the service stamps each patch's files with that
+    /// patch's own header. Empty for a tree vendored before this was
+    /// recorded, which is then checked against the gem's patch as before.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, PatchFileInfo>,
 }
 
 impl GemBuildEntry {
@@ -391,6 +400,23 @@ impl VendorEntry {
         self.gem_builds
             .iter()
             .all(|built| super::gem::is_platform_dir_name(&built.platform))
+    }
+
+    /// gem: the files the tree of `platform` is verified against: those of
+    /// that platform's own patch where the ledger records them
+    /// ([`GemBuildEntry::files`]), else `fallback`, the gem patch's.
+    pub fn gem_tree_files(
+        &self,
+        platform: &str,
+        fallback: &HashMap<String, PatchFileInfo>,
+    ) -> HashMap<String, PatchFileInfo> {
+        self.gem_builds
+            .iter()
+            .find(|built| built.platform == platform && !built.files.is_empty())
+            .map_or_else(
+                || fallback.clone(),
+                |built| built.files.clone().into_iter().collect(),
+            )
     }
 
     /// gem: the platforms of a copy vendored as precompiled platform gems
@@ -2001,12 +2027,14 @@ mod tests {
                 uuid: BUILD.into(),
                 gem_integrity: "sha512-GEM==".into(),
                 gemspec_integrity: "sha512-STUB==".into(),
+                files: BTreeMap::new(),
             },
             GemBuildEntry {
                 platform: "x86_64-linux-gnu".into(),
                 uuid: UUID.into(),
                 gem_integrity: String::new(),
                 gemspec_integrity: String::new(),
+                files: Default::default(),
             },
         ];
         assert_eq!(

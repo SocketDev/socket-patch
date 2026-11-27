@@ -115,7 +115,7 @@
 //!   the patched files they ship; a platform patch's own record is never
 //!   read here.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -755,10 +755,7 @@ async fn gem_prelude_of(
                 }
                 platforms => {
                     let recorded = recorded_copy(project_root, uuid, &copy_rel).await;
-                    let inventory = recorded
-                        .as_ref()
-                        .and_then(|entry| entry.artifact.file_inventory.as_ref());
-                    platform_copy_intact(&copy_dir, name, platforms, files, inventory).await
+                    platform_copy_intact(&copy_dir, name, platforms, recorded.as_ref(), files).await
                 }
             };
         } else {
@@ -940,14 +937,7 @@ async fn recorded_copy_stands(
         .collect();
     !platforms.is_empty()
         && platforms.iter().all(|p| is_platform_dir_name(p))
-        && platform_copy_intact(
-            copy_dir,
-            name,
-            &platforms,
-            &record.files,
-            entry.artifact.file_inventory.as_ref(),
-        )
-        .await
+        && platform_copy_intact(copy_dir, name, &platforms, Some(&entry), &record.files).await
 }
 
 /// The in-sync test of a copy vendored as platform gems: the tree of every
@@ -962,13 +952,19 @@ async fn platform_copy_intact(
     copy_dir: &Path,
     name: &str,
     platforms: &[String],
+    entry: Option<&VendorEntry>,
     files: &HashMap<String, PatchFileInfo>,
-    inventory: Option<&std::collections::BTreeMap<String, String>>,
 ) -> bool {
+    let inventory = entry.and_then(|entry| entry.artifact.file_inventory.as_ref());
     for platform in platforms {
         let tree = copy_dir.join(platform);
         let voucher = super::verify::TreeVoucher::Ledger(inventory);
-        if super::verify::verify_platform_tree(&tree, files, voucher)
+        // Each tree is a build of its own patch (`GemBuildEntry::files`).
+        let files = entry.map_or_else(
+            || files.clone(),
+            |entry| entry.gem_tree_files(platform, files),
+        );
+        if super::verify::verify_platform_tree(&tree, &files, voucher)
             .await
             .is_err()
             || !stub_gemspec_valid(&tree, name).await
@@ -1830,6 +1826,9 @@ struct BuildSource {
     platform: String,
     uuid: String,
     pinned: BuildPin,
+    /// The files of this build's own patch as the ledger entry being
+    /// restored records them; `None` asks the patch service for them.
+    files: Option<BTreeMap<String, PatchFileInfo>>,
 }
 
 enum BuildPin {
@@ -1960,6 +1959,7 @@ async fn locked_build_sources(
                 platform: platform.clone(),
                 uuid: uuid.to_string(),
                 pinned: BuildPin::Registry(build.gem_checksum_sha256.clone()),
+                files: None,
             }),
             None => missing.yet.push(platform),
         }
@@ -2040,13 +2040,46 @@ async fn served_builds<'a>(
     Ok(builds)
 }
 
+/// The files `source`'s own patch changes, with their hashes: what its
+/// tree is verified against. A platform gem is a patch of its own, so
+/// these are not the files of the gem's fix: a compiled build changes
+/// binaries the fix does not name, and the service stamps the files of
+/// each patch with that patch's own header. Taken from the ledger entry
+/// being restored where it records them, else from that patch's record:
+/// ONE request per platform, asked without file contents.
+async fn build_files(
+    cfg: &VendorServiceConfig,
+    source: &BuildSource,
+    subject: &str,
+) -> Result<BTreeMap<String, PatchFileInfo>, Box<VendorOutcome>> {
+    if let Some(files) = &source.files {
+        return Ok(files.clone());
+    }
+    let policy = ServicePolicy::Refused;
+    let Some(client) = cfg.client.as_ref() else {
+        return Err(policy.miss("vendor service not configured".to_string()));
+    };
+    match client.fetch_patch_summary(&source.uuid).await {
+        Ok(Some(view)) if view.uuid.eq_ignore_ascii_case(&source.uuid) => {
+            Ok(crate::manifest::records::files_for_manifest(&view)
+                .into_iter()
+                .collect())
+        }
+        Ok(_) => Err(policy.miss(format!(
+            "the patch service has no record of the patch of the platform gem for {subject}"
+        ))),
+        Err(e) => Err(policy.miss(format!("patch service request failed ({e})"))),
+    }
+}
+
 /// Download and verify the patched gem of each platform of `trees` and its
 /// stub gemspec, and unpack them into `stage`: `<stage>/<platform>/` holds
 /// the platform gem's files and `<name>.gemspec` (see the module docs).
 /// Each platform's gem is the `tarball` of that platform's own patch, and
-/// its stub that patch's [`GEM_STUB_ARTIFACT_KIND`]; `record` is the gem's
-/// fix, whose files the trees are verified against. The ruby gem of the
-/// fix is never downloaded (bundler would have to build its extensions).
+/// its stub that patch's [`GEM_STUB_ARTIFACT_KIND`]; each tree is verified
+/// against the files of that same patch ([`build_files`]). `record` is the
+/// gem's fix, which names the builds. The ruby gem of the fix is never
+/// downloaded (bundler would have to build its extensions).
 ///
 /// The patches are named by the fix's package reference (one request,
 /// [`locked_build_sources`]) or by the ledger entry being restored, and
@@ -2092,6 +2125,7 @@ async fn stage_platform_builds(
                     gem: built.gem_integrity.clone(),
                     gemspec: built.gemspec_integrity.clone(),
                 },
+                files: (!built.files.is_empty()).then(|| built.files.clone()),
             })
             .collect(),
     };
@@ -2105,7 +2139,8 @@ async fn stage_platform_builds(
             source.pinned.check_gem(&gem_bytes, subject)?;
             let stub_bytes = build_artifact(cfg, stub, "stub gemspec", subject).await?;
             source.pinned.check_stub(&stub_bytes, subject)?;
-            Ok::<_, Box<VendorOutcome>>((gem_bytes, stub_bytes))
+            let files = build_files(cfg, source, subject).await?;
+            Ok::<_, Box<VendorOutcome>>((gem_bytes, stub_bytes, files))
         })
         .buffered(PREBUILD_DOWNLOADS_AT_ONCE));
 
@@ -2115,7 +2150,8 @@ async fn stage_platform_builds(
         let Some(downloaded) = downloads.next().await else {
             break;
         };
-        let (gem_bytes, stub_bytes) = downloaded?;
+        let (gem_bytes, stub_bytes, files) = downloaded?;
+        let own: HashMap<String, PatchFileInfo> = files.clone().into_iter().collect();
         let platform = source.platform.as_str();
         refuse_unusable_stub(policy, name, subject, &String::from_utf8_lossy(&stub_bytes))?;
 
@@ -2132,7 +2168,7 @@ async fn stage_platform_builds(
                 format!("cannot extract the patched platform gem for {subject}: {e}"),
             ));
         }
-        match empty_shipped_gitignores(&tree, &record.files).await {
+        match empty_shipped_gitignores(&tree, &own).await {
             Ok(files) => emptied.extend(files.into_iter().map(|file| format!("{platform}/{file}"))),
             Err(e) => {
                 return Err(policy.hard(
@@ -2148,10 +2184,10 @@ async fn stage_platform_builds(
             ));
         }
         // The gem passed the digests stated for this platform above, which
-        // is what vouches for a tree that ships none of the patched files:
-        // only one it does ship can contradict the patch.
+        // is what vouches for a tree that ships none of the files its patch
+        // names: only one it does ship can contradict that patch.
         let verified = super::verify::TreeVoucher::VerifiedDownload;
-        if super::verify::verify_platform_tree(&tree, &record.files, verified)
+        if super::verify::verify_platform_tree(&tree, &own, verified)
             .await
             .is_err()
         {
@@ -2165,6 +2201,7 @@ async fn stage_platform_builds(
             uuid: source.uuid.clone(),
             gem_integrity: gem.integrity_sri.clone(),
             gemspec_integrity: stub.integrity_sri.clone(),
+            files,
         });
     }
 
@@ -2402,7 +2439,7 @@ pub(crate) async fn restore_uuid_metadata(uuid_dir: &Path) -> std::io::Result<bo
 async fn keep_platform_trees_committable(
     project_root: &Path,
     copy_rel: &str,
-    inventory: Option<&std::collections::BTreeMap<String, String>>,
+    inventory: Option<&BTreeMap<String, String>>,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<(), VendorOutcome> {
     let Some(inventory) = inventory else {
@@ -2555,6 +2592,7 @@ pub async fn preview_locked_builds(
                 uuid: source.uuid,
                 gem_integrity: String::new(),
                 gemspec_integrity: String::new(),
+                files: BTreeMap::new(),
             })
             .collect(),
     ))
@@ -12506,6 +12544,36 @@ mod tests {
             stub: Option<Vec<u8>>,
             gem_sha512: Option<String>,
             listed_sha256: Option<String>,
+            /// The files the record of the platform's own patch names.
+            files: BTreeMap<String, PatchFileInfo>,
+        }
+
+        /// The Ruby file of `platform`'s patched build. The service stamps
+        /// the files of each patch with that patch's own header, so no two
+        /// builds of a fix, nor a build and the gem's own patch, ship the
+        /// same bytes for it.
+        fn stamped(platform: &str) -> Vec<u8> {
+            [
+                format!("# Socket patch of the {platform} build\n").as_bytes(),
+                RB_PATCHED,
+            ]
+            .concat()
+        }
+
+        /// The files `platform`'s own patch changes, as its record states
+        /// them: the stamped Ruby file and the binary built for it.
+        fn build_files(platform: &str) -> BTreeMap<String, PatchFileInfo> {
+            let file = |before: &[u8], after: &[u8]| PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(before),
+                after_hash: compute_git_sha256_from_bytes(after),
+            };
+            BTreeMap::from([
+                (RB.to_string(), file(RB_PRISTINE, &stamped(platform))),
+                (
+                    SO.to_string(),
+                    file(b"upstream's binary", platform.as_bytes()),
+                ),
+            ])
         }
 
         /// `platform`'s patched build: the patched Ruby file and the
@@ -12515,10 +12583,14 @@ mod tests {
                 platform,
                 listed: Listed::Patched,
                 own: Own::Granted,
-                gem: Some(make_gem(&[(RB, RB_PATCHED), (SO, platform.as_bytes())])),
+                gem: Some(make_gem(&[
+                    (RB, &stamped(platform)),
+                    (SO, platform.as_bytes()),
+                ])),
                 stub: Some(stub(platform)),
                 gem_sha512: None,
                 listed_sha256: None,
+                files: build_files(platform),
             }
         }
 
@@ -12600,11 +12672,25 @@ mod tests {
                     let route = format!("{}/nokogiri-1.18.10-{platform}.gemspec", base(&own));
                     artifacts.push(artifact("gem-stub-gemspec", route, stub, None));
                 }
+                // The record of the build's own patch, without contents.
+                let view = serde_json::json!({
+                    "uuid": own,
+                    "purl": format!("pkg:gem/nokogiri@1.18.10?platform={platform}"),
+                    "publishedAt": "2026-06-09T00:00:00Z",
+                    "files": build.files,
+                    "vulnerabilities": {},
+                    "description": "", "license": "", "tier": "free"
+                });
+                Mock::given(method("GET"))
+                    .and(path(format!("/v0/orgs/acme/patches/view/{own}")))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(view))
+                    .mount(&server)
+                    .await;
                 results.insert(
                     own,
                     serde_json::json!({
                         "status": "granted",
-                        "purl": format!("pkg:gem/nokogiri@1.18.10?platform={platform}"),
+                        "purl": "pkg:gem/nokogiri@1.18.10",
                         "artifacts": artifacts
                     }),
                 );
@@ -12698,6 +12784,7 @@ mod tests {
                 .iter()
                 .filter(|request| request.method.as_str() == "GET")
                 .map(|request| request.url.path().to_string())
+                .filter(|path| !path.starts_with("/v0/"))
                 .collect()
         }
 
@@ -12710,6 +12797,7 @@ mod tests {
                 uuid: build_uuid(uuid, platform),
                 gem_integrity: sri_sha512(build.gem.as_deref().unwrap()),
                 gemspec_integrity: sri_sha512(build.stub.as_deref().unwrap()),
+                files: build_files(platform),
             }
         }
 
@@ -12783,7 +12871,11 @@ mod tests {
                 let rel = rel(UUID);
                 for platform in [DARWIN, LINUX] {
                     let tree = root.join(&rel).join(platform);
-                    assert_eq!(tokio::fs::read(tree.join(RB)).await.unwrap(), RB_PATCHED);
+                    assert_eq!(
+                        tokio::fs::read(tree.join(RB)).await.unwrap(),
+                        stamped(platform),
+                        "each tree holds its own patch's file, not the gem patch's"
+                    );
                     assert_eq!(
                         tokio::fs::read(tree.join(SO)).await.unwrap(),
                         platform.as_bytes()
@@ -13425,6 +13517,7 @@ mod tests {
             let named = |platform: &'static str| GemBuildEntry {
                 gem_integrity: String::new(),
                 gemspec_integrity: String::new(),
+                files: BTreeMap::new(),
                 ..built(UUID, platform)
             };
 
@@ -13919,15 +14012,15 @@ mod tests {
             );
             assert_eq!(
                 asked.len(),
-                6,
+                8,
                 "the gem patch's reference, the platform patches' in one request, then a \
-                 platform gem and its stub per platform: {asked:?}"
+                 platform gem, its stub and the record of its patch per platform: {asked:?}"
             );
             assert_eq!(
                 tokio::fs::read(root.join(rel(UUID)).join(LINUX).join(RB))
                     .await
                     .unwrap(),
-                RB_PATCHED
+                stamped(LINUX)
             );
             assert_eq!(
                 tokio::fs::read(installed.join(RB)).await.unwrap(),
@@ -14101,13 +14194,24 @@ mod tests {
         async fn a_patch_of_unshipped_sources_vendors_and_verifies_by_inventory() {
             const EXTRA: &str = "lib/nokogiri/extra.rb";
             const EXTRA_PATCHED: &[u8] = b"# extra, patched\n";
-            let with_extra = |platform: &'static str| Served {
-                gem: Some(make_gem(&[
-                    (RB, RB_PATCHED),
-                    (EXTRA, EXTRA_PATCHED),
-                    (SO, platform.as_bytes()),
-                ])),
-                ..served(platform)
+            let with_extra = |platform: &'static str| {
+                let mut files = build_files(platform);
+                files.insert(
+                    EXTRA.to_string(),
+                    PatchFileInfo {
+                        before_hash: compute_git_sha256_from_bytes(b"# extra\n"),
+                        after_hash: compute_git_sha256_from_bytes(EXTRA_PATCHED),
+                    },
+                );
+                Served {
+                    gem: Some(make_gem(&[
+                        (RB, &stamped(platform)),
+                        (EXTRA, EXTRA_PATCHED),
+                        (SO, platform.as_bytes()),
+                    ])),
+                    files,
+                    ..served(platform)
+                }
             };
             let (_tmp, root, _) = project(&lock(None)).await;
             let record = record(
@@ -14131,19 +14235,22 @@ mod tests {
             };
 
             // No inventory says which files were vendored: the unshipped
-            // source is accepted, also for an entry synthesized from the
-            // lock (no trees named either), which reads the trees off the
-            // artifact.
+            // source is accepted, each tree being checked against the
+            // files of its own patch.
             let mut bare = entry.clone();
             bare.artifact.file_inventory = None;
             assert_eq!(
                 check_vendored_artifact(&root, &bare, &record).await,
                 ArtifactHealth::Healthy
             );
+            // An entry synthesized from the lock names no tree, and so no
+            // tree's own patch: the trees are read off the artifact and
+            // checked against the gem's patch, whose stamped file is not
+            // the one a platform's patch ships.
             bare.gem_builds.clear();
             assert_eq!(
                 check_vendored_artifact(&root, &bare, &record).await,
-                ArtifactHealth::Healthy
+                corrupt("vendor_hash_mismatch")
             );
             // A tree holding none of the patched files is vouched for by
             // the inventory; with none, nothing vouches for it.
@@ -14182,13 +14289,14 @@ mod tests {
                 ArtifactHealth::Healthy
             );
 
-            // Drift in ONE platform's tree fails the whole copy.
+            // Drift in ONE platform's tree fails the whole copy: the binary
+            // is a file of that platform's own patch.
             tokio::fs::write(tree.join(SO), b"another binary")
                 .await
                 .unwrap();
             assert_eq!(
                 check_vendored_artifact(&root, &entry, &record).await,
-                corrupt("vendor_inventory_mismatch")
+                corrupt("vendor_hash_mismatch")
             );
             tokio::fs::write(tree.join(RB), RB_PRISTINE).await.unwrap();
             for entry in [&entry, &bare] {
@@ -14243,9 +14351,19 @@ mod tests {
             assert!(rerun_entry.is_none() && warnings.is_empty(), "{warnings:?}");
             assert_eq!(ts::request_count(&server).await, requests);
 
-            // Without the inventory nothing vouches for such a tree.
+            // Without the inventory the files of each tree's own patch
+            // vouch for it: the binary that patch built is in the tree.
             let mut bare = entry.clone();
             bare.artifact.file_inventory = None;
+            assert_eq!(
+                check_vendored_artifact(&root, &bare, &record).await,
+                ArtifactHealth::Healthy
+            );
+            // An entry that records neither is checked against the gem's
+            // patch, as before: nothing vouches for such a tree.
+            for built in &mut bare.gem_builds {
+                built.files.clear();
+            }
             assert_eq!(
                 check_vendored_artifact(&root, &bare, &record).await,
                 ArtifactHealth::Corrupt {
@@ -14261,7 +14379,7 @@ mod tests {
             assert_eq!(
                 check_vendored_artifact(&root, &entry, &record).await,
                 ArtifactHealth::Corrupt {
-                    reason: "vendor_inventory_mismatch".to_string()
+                    reason: "vendor_hash_mismatch".to_string()
                 }
             );
             let (result, rebuilt, warnings) =
@@ -14360,7 +14478,10 @@ mod tests {
                 [built(UUID, DARWIN), built(UUID, LINUX)]
             );
             assert!(rebuilt.wiring.is_empty(), "the first run's records ride on");
-            assert_eq!(tokio::fs::read(tree.join(RB)).await.unwrap(), RB_PATCHED);
+            assert_eq!(
+                tokio::fs::read(tree.join(RB)).await.unwrap(),
+                stamped(LINUX)
+            );
             assert_eq!(
                 (
                     text(root.join(GEMFILE)).await,
@@ -14440,7 +14561,10 @@ mod tests {
                 .unwrap();
             let before = ts::tree_snapshot(&root);
             let another_gem = Served {
-                gem: Some(make_gem(&[(RB, RB_PATCHED), (SO, &b"another build"[..])])),
+                gem: Some(make_gem(&[
+                    (RB, &stamped(LINUX)),
+                    (SO, &b"another build"[..]),
+                ])),
                 ..served(LINUX)
             };
             let another_stub = Served {
@@ -14711,15 +14835,26 @@ mod tests {
         async fn a_gitignore_a_prebuild_ships_is_emptied_in_the_copy() {
             const NESTED: &str = "lib/nokogiri/.gitignore";
             const PATCHED_IGNORE: &str = "ext/.gitignore";
-            let shipping = |platform: &'static str| Served {
-                gem: Some(make_gem(&[
-                    (RB, RB_PATCHED),
-                    (SO, platform.as_bytes()),
-                    (".gitignore", &b"*.so\n*.bundle\n"[..]),
-                    (NESTED, &b"nokogiri.so\n"[..]),
-                    (PATCHED_IGNORE, &b"# the patch's own\n"[..]),
-                ])),
-                ..served(platform)
+            let shipping = |platform: &'static str| {
+                let mut files = build_files(platform);
+                files.insert(
+                    PATCHED_IGNORE.to_string(),
+                    PatchFileInfo {
+                        before_hash: compute_git_sha256_from_bytes(b"*.o\n"),
+                        after_hash: compute_git_sha256_from_bytes(b"# the patch's own\n"),
+                    },
+                );
+                Served {
+                    gem: Some(make_gem(&[
+                        (RB, &stamped(platform)),
+                        (SO, platform.as_bytes()),
+                        (".gitignore", &b"*.so\n*.bundle\n"[..]),
+                        (NESTED, &b"nokogiri.so\n"[..]),
+                        (PATCHED_IGNORE, &b"# the patch's own\n"[..]),
+                    ])),
+                    files,
+                    ..served(platform)
+                }
             };
             let (_tmp, root, _) = project(&lock(None)).await;
             let record = record(

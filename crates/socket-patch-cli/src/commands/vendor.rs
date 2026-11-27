@@ -8916,6 +8916,7 @@ mod ui_format_tests {
                 uuid: uuid.to_string(),
                 gem_integrity: String::new(),
                 gemspec_integrity: String::new(),
+                files: Default::default(),
             })
             .collect()
     }

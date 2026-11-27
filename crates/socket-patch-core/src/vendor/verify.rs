@@ -160,7 +160,10 @@ pub async fn verify_vendored_patch_record(
             Some(trees) => {
                 let voucher = TreeVoucher::Ledger(entry.artifact.file_inventory.as_ref());
                 for tree in &trees {
-                    verify_platform_tree(tree, &record.files, voucher).await?;
+                    // Each tree is a build of its own patch.
+                    let platform = tree.file_name().and_then(|leaf| leaf.to_str());
+                    let files = entry.gem_tree_files(platform.unwrap_or_default(), &record.files);
+                    verify_platform_tree(tree, &files, voucher).await?;
                 }
             }
             None => verify_dir_members(&artifact, record, cargo_uuid).await?,
