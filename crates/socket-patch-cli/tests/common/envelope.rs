@@ -177,6 +177,20 @@ pub fn hosted_pins(envelope: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
+/// `(uuid, details.pinChanged)` of each [`hosted_pins`] event.
+pub fn hosted_pin_changes(envelope: &Value) -> Vec<(String, Option<bool>)> {
+    mode_events(envelope, "hosted")
+        .into_iter()
+        .filter(|e| e["action"] == "applied" || e["action"] == "verified")
+        .map(|e| {
+            (
+                e["uuid"].as_str().unwrap_or_default().to_string(),
+                e["details"]["pinChanged"].as_bool(),
+            )
+        })
+        .collect()
+}
+
 /// The `{purl, uuid, reason, detail}` rows of the hosted `skipped` events
 /// (v5.0's `redirect.skipped[]`: `reason` is the event's `errorCode`).
 pub fn hosted_skips(envelope: &Value) -> Vec<(String, String)> {

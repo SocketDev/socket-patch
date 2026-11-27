@@ -362,18 +362,9 @@ pub(super) fn record_hosted_events(
     unconfirmed: &[(String, String)],
     skipped: &[socket_patch_core::hosted::engine::SkippedPatch],
     dry_run: bool,
-    changes: &std::collections::HashMap<(&str, &str), bool>,
+    changes: &pin_changes::PinChanges<'_>,
 ) {
-    for mut event in hosted_events(confirmed, unconfirmed, skipped, dry_run) {
-        if matches!(event.action, PatchAction::Applied | PatchAction::Verified) {
-            let changed = event
-                .purl
-                .as_deref()
-                .zip(event.uuid.as_deref())
-                .and_then(|key| changes.get(&key));
-            event.details.get_or_insert_with(|| serde_json::json!({}))["pinChanged"] =
-                serde_json::json!(changed);
-        }
+    for event in hosted_events(confirmed, unconfirmed, skipped, dry_run, Some(changes)) {
         env.record(event);
     }
 }
@@ -386,6 +377,7 @@ fn hosted_events(
     unconfirmed: &[(String, String)],
     skipped: &[socket_patch_core::hosted::engine::SkippedPatch],
     dry_run: bool,
+    changes: Option<&pin_changes::PinChanges<'_>>,
 ) -> Vec<PatchEvent> {
     let pinned = if dry_run {
         PatchAction::Verified
@@ -394,7 +386,15 @@ fn hosted_events(
     };
     let mut events: Vec<PatchEvent> = confirmed
         .iter()
-        .map(|(purl, uuid)| PatchEvent::new(pinned, purl.as_str()).with_uuid(uuid.as_str()))
+        .map(|(purl, uuid)| {
+            let event = PatchEvent::new(pinned, purl.as_str()).with_uuid(uuid.as_str());
+            match changes {
+                Some(changes) => event.with_details(serde_json::json!({
+                    "pinChanged": changes.get(&(purl.as_str(), uuid.as_str())),
+                })),
+                None => event,
+            }
+        })
         .chain(skipped.iter().map(|s| {
             let mut event =
                 PatchEvent::new(PatchAction::Skipped, s.purl.as_str()).with_uuid(s.uuid.as_str());
@@ -1729,9 +1729,12 @@ async fn run_redirect_selected_untracked(
     // both consumers.
     let mut vendor_state = socket_patch_core::vendor::load_state(&common.cwd).await;
 
+    let current_prior = rollout
+        .as_ref()
+        .and_then(|gate| gate.prior)
+        .and_then(|prior| prior.still_current());
     let before_pins = if common.json && !candidates.is_empty() {
-        let prior = rollout.as_ref().and_then(|gate| gate.prior);
-        Some(pin_changes::before_rewrite(common, &candidates, prior).await)
+        Some(pin_changes::before_rewrite(common, &candidates, current_prior).await)
     } else {
         None
     };
@@ -2051,11 +2054,7 @@ async fn run_redirect_selected_untracked(
     // (a concurrent writer that finished before the lock was taken shows up
     // here). It was made with `patch_server_origins`
     // (`discover_wiring`).
-    let prior_discovery = rollout
-        .as_ref()
-        .and_then(|gate| gate.prior)
-        .filter(|_| !takeover.is_staged())
-        .and_then(|prior| prior.still_current());
+    let prior_discovery = current_prior.filter(|_| !takeover.is_staged());
     // The cargo configs cargo reads for a build here (the project's, every
     // parent directory's and `$CARGO_HOME`'s): a directory source or local
     // registry in any of them refuses the cargo rewrite like a project one.
@@ -2256,7 +2255,7 @@ async fn run_redirect_selected_untracked(
     // files the overlay creates or removes (see `discovery_after_writes`).
     // Taken before the commit, while the disk is still as discovery saw it.
     let mut created_paths: Vec<String> = Vec::new();
-    if !common.dry_run || common.json {
+    if !common.dry_run || before_pins.is_some() {
         let on_disk = |rel: &str| {
             let path = common.cwd.join(rel);
             async move {
@@ -2688,7 +2687,7 @@ async fn run_redirect_selected_untracked(
             done.rewritten.len(),
             common.dry_run,
             &crate::telemetry_outcomes::patch_outcomes_of(
-                &hosted_events(&confirmed, &unconfirmed, &skipped, common.dry_run),
+                &hosted_events(&confirmed, &unconfirmed, &skipped, common.dry_run, None),
                 socket_patch_core::telemetry::MODE_HOSTED,
             ),
             &telemetry.auth,
@@ -2702,13 +2701,18 @@ async fn run_redirect_selected_untracked(
         // tagged `details.mode: "hosted"`, the `redirect` payload, and the
         // engine's warnings hoisted to the top-level `warnings`.
         let mut env = scan_result.take().unwrap_or_else(|| scan_envelope(common));
-        let changes = pin_changes::compare(
-            before_pins.as_deref(),
-            done.pin_discovery(),
-            &created_paths,
-            &confirmed,
-            done.rewritten.is_empty() && takeover_files.is_empty(),
-        );
+        let changes = if done.rewritten.is_empty() && takeover_files.is_empty() {
+            pin_changes::unchanged(&confirmed)
+        } else {
+            let created: Vec<&str> = created_paths.iter().map(String::as_str).collect();
+            let after = discovery_after_writes(
+                None,
+                done.pin_discovery(),
+                Written::Landed { created: &created },
+                vlt_stale.healed_store.as_ref(),
+            );
+            pin_changes::compare(before_pins.as_deref(), after, &confirmed)
+        };
         record_hosted_events(
             &mut env,
             &confirmed,
