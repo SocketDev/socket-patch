@@ -2926,12 +2926,37 @@ async fn platform_patch_service(
         "platform": "ruby", "gemChecksumSha256": ruby_sha, "patchUuid": uuid,
     })];
     let mut references = serde_json::Map::new();
+    // The record of a platform gem's own patch, which a client checks that
+    // gem's tree against. (This fixture builds every patched gem from one
+    // `patched.rb`, so the records of the builds list the same hashes; the
+    // patch service stamps each patch's files, and theirs differ.)
+    let (pristine, patched_rb) = (
+        read("", "pristine.rb".into()),
+        read("", "patched.rb".into()),
+    );
+    let mut records = Vec::new();
     for platform in patched {
         let own = build_uuid(uuid, platform);
         let gem = read("service", format!("{}.gem", file_of(Some(platform))));
         builds.push(serde_json::json!({
             "platform": platform, "gemChecksumSha256": sha256_hex(&gem), "patchUuid": own,
         }));
+        records.push((
+            own.clone(),
+            serde_json::json!({
+                "uuid": own,
+                "purl": platform_purl(platform),
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "files": { "lib/sockplat.rb": {
+                    "beforeHash": git_sha256(&pristine),
+                    "afterHash": git_sha256(&patched_rb),
+                } },
+                "vulnerabilities": {},
+                "description": "fixture platform gem patch",
+                "license": "MIT",
+                "tier": "free",
+            }),
+        ));
         let artifacts = artifacts(&own, Some(platform));
         references.insert(
             own,
@@ -3017,6 +3042,13 @@ async fn platform_patch_service(
         Mock::given(method("GET"))
             .and(path(route))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(&server)
+            .await;
+    }
+    for (own, record) in records {
+        Mock::given(method("GET"))
+            .and(path_regex(format!("/(patch|patches)/view/{own}$")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(record))
             .mount(&server)
             .await;
     }
@@ -3529,6 +3561,12 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
                 "uuid": build_uuid(UUID, platform),
                 "gemIntegrity": sri(&file("gem")),
                 "gemspecIntegrity": sri(&file("gemspec")),
+                // The files of that build's own record, which the tree
+                // was checked against.
+                "files": { "lib/sockplat.rb": {
+                    "beforeHash": git_sha256(PLAT_PRISTINE.as_bytes()),
+                    "afterHash": git_sha256(patched.as_bytes()),
+                } },
             })
         })
         .collect();

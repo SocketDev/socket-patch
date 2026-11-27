@@ -426,6 +426,8 @@ fn strings(items: &[&str]) -> Vec<String> {
 /// `mode`: the same files, the same output but for the one line (stderr,
 /// once), and the one reference request and record fetch it takes to find
 /// the gem's patch. Returns the reference requests of the gem's own run.
+/// Every other request is the gem's own run's: in vendored mode that
+/// includes the record of each platform gem's own patch.
 async fn assert_takes_the_gems_patch(mode: &str) -> Vec<Vec<String>> {
     let server = service(BuiltFrom::Gem).await;
     let api = server.uri();
@@ -435,7 +437,19 @@ async fn assert_takes_the_gems_patch(mode: &str) -> Vec<Vec<String>> {
     let (code, gem_stdout, gem_stderr) = get(by_gem.path(), &api, UUID, Some(mode), &[]);
     assert_eq!(code, 0, "{gem_stdout}\n{gem_stderr}");
     let (gem_references, gem_views) = api_calls(&server, 0).await;
-    assert_eq!(gem_views, [UUID]);
+    // Vendored mode also reads the record of each platform gem's own
+    // patch, which it checks that gem's tree against.
+    let build_views: &[&str] = match mode {
+        "vendored" => &[DARWIN_UUID, LINUX_UUID],
+        _ => &[],
+    };
+    let sorted = |views: &[String]| {
+        let mut views = views.to_vec();
+        views.sort();
+        views
+    };
+    assert_eq!(gem_views[..1], [UUID]);
+    assert_eq!(sorted(&gem_views[1..]), sorted(&strings(build_views)));
     assert!(!gem_stderr.contains("is the patch of"), "{gem_stderr}");
     let written = tree(by_gem.path());
     assert_ne!(
@@ -459,7 +473,8 @@ async fn assert_takes_the_gems_patch(mode: &str) -> Vec<Vec<String>> {
     let mut expected = vec![strings(&[LINUX_UUID])];
     expected.extend(gem_references.iter().cloned());
     assert_eq!(references, expected, "one reference request more");
-    assert_eq!(views, [LINUX_UUID, UUID]);
+    assert_eq!(views[..2], [LINUX_UUID, UUID]);
+    assert_eq!(sorted(&views[2..]), sorted(&strings(build_views)));
 
     // `--json`: the envelope of the gem's own run, and the patch that was
     // named. Nothing on stderr.

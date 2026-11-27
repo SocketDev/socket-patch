@@ -74,10 +74,24 @@ fn make_gem(files: &[(&str, &[u8])]) -> Vec<u8> {
     gem.into_inner().unwrap()
 }
 
-/// The patched gem of `platform`: the patched Ruby file and the platform's
-/// own binary.
+/// The patched Ruby file as the patch `uuid` ships it. The patch service
+/// stamps the files of every patch with a header that names that patch, so
+/// the same change is other bytes in the gem of each patch, and the record
+/// of a platform gem's patch lists that gem's own hashes.
+fn stamped(uuid: &str) -> Vec<u8> {
+    let mut bytes =
+        format!("# Socket Community Patch: https://socket.dev/patch/{uuid}\n").into_bytes();
+    bytes.extend_from_slice(PATCHED);
+    bytes
+}
+
+/// The patched gem of `platform`: the Ruby file as that platform's own
+/// patch ships it, and the platform's own binary.
 fn platform_gem(platform: &str) -> Vec<u8> {
-    make_gem(&[(LIB, PATCHED), (SO, platform.as_bytes())])
+    make_gem(&[
+        (LIB, &stamped(build_uuid(platform))),
+        (SO, platform.as_bytes()),
+    ])
 }
 
 fn stub(platform: &str) -> Vec<u8> {
@@ -117,8 +131,8 @@ fn patch_view_of(uuid: &str) -> serde_json::Value {
         "files": {
             LIB: {
                 "beforeHash": git_sha256(PRISTINE),
-                "afterHash": git_sha256(PATCHED),
-                "blobContent": base64::engine::general_purpose::STANDARD.encode(PATCHED),
+                "afterHash": git_sha256(&stamped(uuid)),
+                "blobContent": base64::engine::general_purpose::STANDARD.encode(stamped(uuid)),
             }
         },
         "vulnerabilities": {
@@ -135,6 +149,25 @@ fn patch_view_of(uuid: &str) -> serde_json::Value {
     })
 }
 
+/// The record of the patch of `platform`'s gem, as the patch API's view
+/// serves it: that patch's own uuid, purl and file hashes.
+fn build_view(platform: &str) -> serde_json::Value {
+    let own = build_uuid(platform);
+    let mut view = patch_view_of(own);
+    view["purl"] = format!("{PURL}?platform={platform}").into();
+    view
+}
+
+/// The files of that record as a vendor ledger keeps them for the build.
+fn build_files(platform: &str) -> serde_json::Value {
+    serde_json::json!({
+        LIB: {
+            "beforeHash": git_sha256(PRISTINE),
+            "afterHash": git_sha256(&stamped(build_uuid(platform))),
+        }
+    })
+}
+
 /// A patch service where the platforms of `patched` have a patched build
 /// and those of `pass_through` are listed as upstream's own gem.
 async fn service(patched: &[&'static str], pass_through: &[&'static str]) -> MockServer {
@@ -146,8 +179,14 @@ async fn service(patched: &[&'static str], pass_through: &[&'static str]) -> Moc
 /// [`service`] for the gem patch `uuid`, where the reference of the patch
 /// of each patched build answers the status named beside its platform
 /// (which is no grant), or a grant when none is named. The references and
-/// the gem patch's record are served on the organisation's routes and on
-/// the public proxy's (`/patch/package`, `/patch/view/<uuid>`).
+/// the records (the gem patch's, and each granted platform patch's own)
+/// are served on the organisation's routes and on the public proxy's
+/// (`/patch/package`, `/patch/view/<uuid>`).
+///
+/// It answers as the patch service does: a reference names its package
+/// without a platform, each patch has a grant token of its own, and a
+/// patch serves its gem and its stub gemspec in files named after the gem
+/// and its version alone.
 async fn service_of(
     uuid: &'static str,
     patched: &[(&'static str, Option<&'static str>)],
@@ -175,7 +214,7 @@ async fn service_of(
             results.insert(own.to_string(), unserved);
             continue;
         }
-        let base = format!("/patch/gem/{NAME}/{VERSION}/tok/{own}/{NAME}-{VERSION}-{platform}");
+        let base = format!("/patch/gem/{NAME}/{VERSION}/tok-{platform}/{own}/{NAME}-{VERSION}");
         let mut artifacts = Vec::new();
         for (kind, ext, bytes) in [
             ("tarball", "gem", &gem),
@@ -197,10 +236,18 @@ async fn service_of(
             own.to_string(),
             serde_json::json!({
                 "status": "granted",
-                "purl": format!("{PURL}?platform={platform}"),
-                "artifacts": artifacts
+                "purl": PURL,
+                "artifacts": artifacts,
+                "rebuiltFromUuid": uuid
             }),
         );
+        for routes in [format!("/v0/orgs/{ORG}/patches"), "/patch".to_string()] {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("{routes}/view/{own}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(build_view(platform)))
+                .mount(&server)
+                .await;
+        }
     }
     for platform in pass_through {
         gem_builds.push(serde_json::json!({
@@ -208,7 +255,7 @@ async fn service_of(
         }));
     }
     gem_builds.sort_by_key(|build| build["platform"].as_str().map(str::to_string));
-    let ruby_gem = make_gem(&[(LIB, PATCHED)]);
+    let ruby_gem = make_gem(&[(LIB, &stamped(uuid))]);
     let ruby_url = format!(
         "{}/patch/gem/{NAME}/{VERSION}/tok/{uuid}/{NAME}-{VERSION}.gem",
         server.uri()
@@ -217,7 +264,7 @@ async fn service_of(
         uuid.to_string(),
         serde_json::json!({
             "status": "granted",
-            "purl": format!("{PURL}?platform=ruby"),
+            "purl": PURL,
             "url": ruby_url,
             "artifacts": [{ "kind": "tarball", "url": ruby_url,
                             "integrity": { "sha512": sri(&ruby_gem) } }],
@@ -326,7 +373,7 @@ fn write_manifest(root: &Path, uuid: &str) {
                 "files": {
                     LIB: {
                         "beforeHash": git_sha256(PRISTINE),
-                        "afterHash": git_sha256(PATCHED),
+                        "afterHash": git_sha256(&stamped(UUID)),
                     }
                 },
                 "vulnerabilities": view["vulnerabilities"],
@@ -341,7 +388,8 @@ fn write_manifest(root: &Path, uuid: &str) {
         serde_json::to_vec_pretty(&manifest).unwrap(),
     )
     .unwrap();
-    std::fs::write(socket.join("blobs").join(git_sha256(PATCHED)), PATCHED).unwrap();
+    let after = stamped(UUID);
+    std::fs::write(socket.join("blobs").join(git_sha256(&after)), after).unwrap();
 }
 
 /// `socket-patch <args>` at `root` against the stand-in service, hermetic
@@ -479,7 +527,7 @@ async fn a_platform_locked_gem_vendors_and_reports_per_platform_gem() {
     for platform in [DARWIN, LINUX] {
         assert_eq!(
             std::fs::read(tree(root, platform).join(LIB)).unwrap(),
-            PATCHED
+            stamped(build_uuid(platform))
         );
         assert_eq!(
             std::fs::read(tree(root, platform).join(SO)).unwrap(),
@@ -517,9 +565,11 @@ async fn a_platform_locked_gem_vendors_and_reports_per_platform_gem() {
         entry["gemBuilds"],
         serde_json::json!([
             { "platform": DARWIN, "uuid": DARWIN_UUID,
-              "gemIntegrity": sri(&platform_gem(DARWIN)), "gemspecIntegrity": sri(&stub(DARWIN)) },
+              "gemIntegrity": sri(&platform_gem(DARWIN)), "gemspecIntegrity": sri(&stub(DARWIN)),
+              "files": build_files(DARWIN) },
             { "platform": LINUX, "uuid": LINUX_UUID,
-              "gemIntegrity": sri(&platform_gem(LINUX)), "gemspecIntegrity": sri(&stub(LINUX)) }
+              "gemIntegrity": sri(&platform_gem(LINUX)), "gemspecIntegrity": sri(&stub(LINUX)),
+              "files": build_files(LINUX) }
         ])
     );
 
@@ -880,7 +930,7 @@ async fn an_eject_of_a_hosted_platform_gem_vendors_every_platform() {
     for platform in [DARWIN, LINUX] {
         assert_eq!(
             std::fs::read(tree(root, platform).join(LIB)).unwrap(),
-            PATCHED
+            stamped(build_uuid(platform))
         );
     }
     let lock = std::fs::read_to_string(root.join("Gemfile.lock")).unwrap();
@@ -990,11 +1040,11 @@ async fn a_vendored_scan_takes_the_gem_through_its_own_patch_alone() {
     for platform in [DARWIN, LINUX] {
         assert_eq!(
             std::fs::read(tree(root, platform).join(LIB)).unwrap(),
-            PATCHED
+            stamped(build_uuid(platform))
         );
     }
     // Nothing is said of a platform gem's patch but the tree vendored from
-    // it, and its record is never asked for.
+    // it. Its record is read once, to check that tree against.
     for event in env["events"].as_array().unwrap() {
         let own = [DARWIN_UUID, LINUX_UUID].contains(&event["uuid"].as_str().unwrap_or_default());
         assert!(
@@ -1008,10 +1058,12 @@ async fn a_vendored_scan_takes_the_gem_through_its_own_patch_alone() {
         .map(|request| request.url.path())
         .filter(|path| path.contains("/patches/view/"))
         .collect();
-    assert!(!views.is_empty(), "the gem's own record is downloaded");
-    assert!(
-        views.iter().all(|path| path.ends_with(UUID)),
-        "only the gem's own record: {views:?}"
+    let of = |uuid: &str| views.iter().filter(|path| path.ends_with(uuid)).count();
+    assert!(of(UUID) > 0, "the gem's own record is downloaded");
+    assert_eq!(
+        (of(DARWIN_UUID), of(LINUX_UUID)),
+        (1, 1),
+        "each platform gem's own record is read once: {views:?}"
     );
     assert_eq!(
         std::fs::read(gem_dir.join(LIB)).unwrap(),
@@ -1115,7 +1167,7 @@ async fn a_vendored_get_takes_the_gem_through_its_own_patch_alone() {
     for platform in [DARWIN, LINUX] {
         assert_eq!(
             std::fs::read(tree(root, platform).join(LIB)).unwrap(),
-            PATCHED
+            stamped(build_uuid(platform))
         );
     }
     let requests = server.received_requests().await.unwrap();
@@ -1124,9 +1176,12 @@ async fn a_vendored_get_takes_the_gem_through_its_own_patch_alone() {
         .map(|request| request.url.path())
         .filter(|path| path.contains("/patches/view/"))
         .collect();
-    assert!(
-        !views.is_empty() && views.iter().all(|path| path.ends_with(UUID)),
-        "only the gem's own record is downloaded: {views:?}"
+    let of = |uuid: &str| views.iter().filter(|path| path.ends_with(uuid)).count();
+    assert!(of(UUID) > 0, "the gem's own record is downloaded");
+    assert_eq!(
+        (of(DARWIN_UUID), of(LINUX_UUID)),
+        (1, 1),
+        "each platform gem's own record is read once: {views:?}"
     );
 }
 
@@ -1320,7 +1375,7 @@ async fn every_dry_run_previews_a_fully_patched_gem_once_per_platform_gem() {
         for platform in [DARWIN, LINUX] {
             assert_eq!(
                 std::fs::read(tree(root, platform).join(LIB)).unwrap(),
-                PATCHED
+                stamped(build_uuid(platform))
             );
         }
     }

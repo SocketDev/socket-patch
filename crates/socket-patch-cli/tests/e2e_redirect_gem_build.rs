@@ -8617,10 +8617,26 @@ async fn platform_vex_matrix(p: &PlatformProject, fresh: &Path, locked: &[(&str,
                 "{out}"
             );
         }
+        // Then the record of each platform build the document attests: a
+        // platform gem is a patch of its own, and its installed copy is
+        // checked against that patch's record.
+        let paths = request_paths(&p.fx._server, mark.0).await;
+        let (first, records) = paths.split_at(asked.len().min(paths.len()));
         assert_eq!(
-            request_paths(&p.fx._server, mark.0).await,
-            asked,
+            first, asked,
             "{via:?}: the record, one reference and, without CHECKSUMS, the registry's index"
+        );
+        let builds = attested
+            .iter()
+            .filter(|purl| purl.contains("?platform=") && !purl.ends_with("?platform=ruby"))
+            .count();
+        let own_record = |path: &String| {
+            path.starts_with(&format!("/v0/orgs/{ORG}/patches/view/")) && !path.ends_with(UUID)
+        };
+        let distinct: std::collections::BTreeSet<&String> = records.iter().collect();
+        assert!(
+            records.iter().all(own_record) && distinct.len() == builds && records.len() == builds,
+            "{via:?}: one record per attested platform build ({builds}): {records:?}"
         );
         assert_eq!(
             p.references_since(mark).await,
