@@ -8286,11 +8286,11 @@ pub fn split_gem_snapshot(index_url: &str) -> (&str, Option<&str>) {
 /// later `bundle install` has nothing to respell.
 ///
 /// A gem the lock names as its ruby-platform gem alone takes the registry
-/// without the snapshot level, which lists the patched gems only. The
-/// snapshot's key changes whenever a platform build is published, which
-/// installs nothing else for such a lock, and under a snapshot Bundler
-/// may pick the platform gem of the machine for the plain entry, which
-/// can be upstream's own.
+/// without the snapshot level, which lists the patched ruby-platform gem
+/// alone. The snapshot's key changes whenever a platform build is
+/// published, which installs nothing else for such a lock, and under a
+/// snapshot Bundler may pick the platform gem of the machine for the
+/// plain entry, which can be upstream's own.
 pub(crate) fn gem_source_url(index_url: &str, platform_builds: bool) -> std::borrow::Cow<'_, str> {
     match split_gem_snapshot(index_url) {
         (root, Some(_)) if !platform_builds => root.into(),

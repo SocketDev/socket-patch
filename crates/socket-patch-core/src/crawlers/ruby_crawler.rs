@@ -1216,6 +1216,43 @@ impl RubyCrawler {
         .await
     }
 
+    /// The installed precompiled builds of each of `purls` in `gem_path`:
+    /// element `i` is every installed-looking
+    /// `<name>-<version>-<platform>` gem dir of `purls[i]`, in name order,
+    /// and never its ruby-platform dir. `gem_path` is listed at most once.
+    /// For a lock under which Bundler loads such a copy in place of the
+    /// ruby-platform gem it names
+    /// ([`crate::formats::gem::lock_loads_platform_copies`]).
+    pub async fn find_platform_builds(
+        &self,
+        gem_path: &Path,
+        purls: &[String],
+    ) -> Vec<Vec<PathBuf>> {
+        let gem_path = gem_path.to_path_buf();
+        let purls = purls.to_vec();
+        crate::utils::fs::run_blocking(move || {
+            let mut names: Option<Vec<String>> = None;
+            purls
+                .iter()
+                .map(|purl| {
+                    let Some((name, version)) = crate::utils::purl::parse_gem_purl(purl) else {
+                        return Vec::new();
+                    };
+                    let (name, version) = (name.as_ref(), version.as_ref());
+                    if !path_safety::is_safe_name_version(name, version) {
+                        return Vec::new();
+                    }
+                    let ruby = gem_path.join(format!("{name}-{version}"));
+                    locate_gem_dirs_sync(&gem_path, name, version, &mut names)
+                        .into_iter()
+                        .filter(|dir| *dir != ruby)
+                        .collect()
+                })
+                .collect()
+        })
+        .await
+    }
+
     /// [`Self::find_by_purls`] for each of `purls` ON ITS OWN — element `i`
     /// is what `find_by_purls(gem_path, &[purls[i]])` returns for that PURL
     /// — as one blocking-pool task that lists `gem_path` at most once for
@@ -6940,6 +6977,46 @@ mod tests {
         // Bare `~` → home itself (PathBuf equality is components-based,
         // tolerating join("")'s trailing-separator artifact).
         assert_eq!(expand_tilde(Path::new("~"), Some(home)), home.to_path_buf());
+    }
+
+    /// The precompiled builds of a gem version in a gem home: every
+    /// installed `<name>-<version>-<platform>` dir, in name order, and
+    /// neither the ruby-platform dir, another version, nor another gem
+    /// whose name starts the same way.
+    #[tokio::test]
+    async fn find_platform_builds_lists_the_precompiled_dirs_of_each_purl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gems = tmp.path().join("gems");
+        for dir in [
+            "nokogiri-1.19.3",
+            "nokogiri-1.19.3-x86_64-linux-gnu",
+            "nokogiri-1.19.3-arm64-darwin",
+            "nokogiri-1.19.2-arm64-darwin",
+            "nokogiri-1.19.3-2.0",
+            "nokogiri-ext-1.19.3-arm64-darwin",
+            "rack-3.0.0",
+        ] {
+            std::fs::create_dir_all(gems.join(dir).join("lib")).unwrap();
+        }
+        // A dir with neither `lib/` nor a gemspec is no installed gem.
+        std::fs::create_dir_all(gems.join("nokogiri-1.19.3-java")).unwrap();
+        let purls = [
+            "pkg:gem/nokogiri@1.19.3".to_string(),
+            "pkg:gem/rack@3.0.0".to_string(),
+            "pkg:npm/nokogiri@1.19.3".to_string(),
+        ];
+        let found = RubyCrawler::new().find_platform_builds(&gems, &purls).await;
+        assert_eq!(
+            found,
+            vec![
+                vec![
+                    gems.join("nokogiri-1.19.3-arm64-darwin"),
+                    gems.join("nokogiri-1.19.3-x86_64-linux-gnu"),
+                ],
+                vec![],
+                vec![],
+            ]
+        );
     }
 
     // ── find_each_by_purl ≡ per-PURL find_by_purls ─────────────────────

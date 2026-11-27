@@ -353,6 +353,10 @@ pub(crate) struct VexWriteSummary {
     /// One line per gem whose locked builds this run told apart
     /// ([`gem_build_lines`]), for a person.
     pub gem_build_lines: Vec<String>,
+    /// The gems the document says `affected` of because the installed copy
+    /// Bundler loads is upstream's precompiled build
+    /// ([`unpatched_gem_stand_ins`]), by purl.
+    pub gem_stand_ins: std::collections::BTreeSet<String>,
     pub failed: Vec<FailedPatch>,
     /// The built document — returned so the standalone `vex` command can
     /// emit its per-subcomponent envelope without rebuilding.
@@ -992,6 +996,9 @@ async fn generate_vex(
     // applied every gate hashing cannot stand in for (wiring liveness, the
     // wired-uuid rule, record match), so `--no-verify` skips ONLY the
     // hashing below — a stale ledger no lockfile wires stays omitted.
+    // The gems whose installed copies include a precompiled build Bundler
+    // loads in place of the ruby-platform gem the lock names.
+    let mut gem_stand_ins: HashSet<String> = HashSet::new();
     let mut outcome = if params.no_verify {
         // Trust-the-records mode still needs the vendored classification:
         // the property-7 exemption and the "(vendored)" phrasing key off
@@ -1073,6 +1080,7 @@ async fn generate_vex(
                 consumed.paths.retain(|path| gem.judges(purl, path));
             }
         }
+        gem_stand_ins = gem_stand_in_copies(common, &plan, &hosted).await;
         // A patched platform build is a patch of its own: its installed
         // copy is checked against that patch's files, under its own purl.
         let build_view = split_gem_build_copies(&plan, &mut hosted);
@@ -1484,6 +1492,9 @@ async fn generate_vex(
     // through here, `--no-verify` and the in-run ones included. A run told
     // that the installed tree is what ships (`--no-bazel`) skips the step.
     let affected = unbuilt_by_bazel(&mut outcome, &plan, common, params, warnings).await;
+    // A gem whose lock names the patched gem while Ruby runs upstream's
+    // precompiled build is not left out: the document says `affected`.
+    let gem_stand_ins = unpatched_gem_stand_ins(&mut outcome, &gem_stand_ins, common, warnings);
 
     // The plan's gate omissions (record_unavailable / record_mismatch /
     // vendor_unwired / redirect_unwired / wiring_conflict) join the omission
@@ -1577,6 +1588,7 @@ async fn generate_vex(
     // affected: one the lock installs as upstream's own gem, and one of
     // which nothing shows what the lock installs (see `GemBuildView`).
     let mut affected = affected;
+    affected.extend(gem_stand_ins.iter().cloned());
     let mut redirected = plan.redirected.clone();
     let gem_builds = crate::commands::vex_sources::GemBuildView::of(&plan);
     if let Some(builds) = &gem_builds {
@@ -1747,6 +1759,7 @@ async fn generate_vex(
         gem_builds: gem_builds
             .map(|builds| builds.builds().clone())
             .unwrap_or_default(),
+        gem_stand_ins: gem_stand_ins.into_iter().map(|(purl, _)| purl).collect(),
         failed: outcome.failed,
         doc,
         warnings: Vec::new(),
@@ -2164,6 +2177,86 @@ async fn unbuilt_by_bazel(
     affected
 }
 
+/// Run warning: the lock takes the gem from its patch registry, and the
+/// installed copy Bundler loads is upstream's precompiled build, so the
+/// document says `affected` of it.
+const GEM_STAND_IN_UNPATCHED: &str = "vex_gem_install_unpatched";
+
+/// The `reason` of the `skipped` event `vex --json` reports for the gem of
+/// such a statement.
+const GEM_STAND_IN_REASON: &str = "attested as affected, not as patched: Bundler loads an \
+    installed precompiled build of this gem, which is upstream's, in place of the patched \
+    gem the lock names; the run warning says what to do";
+
+/// What to do about such a gem, for its statement and the run warning.
+const GEM_STAND_IN_ACTION: &str = "The lock names the patched gem, but an installed copy of \
+    this gem is upstream's precompiled build, which Bundler loads in its place and \
+    `bundle install` keeps. Run `socket-patch scan`: it names the files to remove before \
+    `bundle install` installs the patched gem.";
+
+/// The hosted gems (by view purl) of which a precompiled build is
+/// installed that Bundler loads in place of the ruby-platform gem their
+/// lock names: the lock's `PLATFORMS` names `ruby` alone, so it names
+/// every gem that way, and Bundler takes the installed gem that fits the
+/// machine best. `hosted` is the copies each hosted purl is judged by. The
+/// lock is read only when such a copy is installed.
+async fn gem_stand_in_copies(
+    common: &GlobalArgs,
+    plan: &Plan,
+    hosted: &HashMap<String, socket_patch_core::vex::HostedCopies>,
+) -> HashSet<String> {
+    use socket_patch_core::formats::gem::GemBuild;
+    use socket_patch_core::vendor::lock_inventory::{
+        gem_lock_loads_platform_copies_in, ProjectView,
+    };
+    let precompiled = |purl: &str, path: &PathBuf| {
+        let leaf = path.file_name().and_then(|leaf| leaf.to_str());
+        leaf.and_then(|leaf| GemBuild::of_leaf(purl, leaf))
+            .is_some_and(|build| build.platform.is_some())
+    };
+    let held: HashSet<String> = hosted
+        .iter()
+        .filter(|(purl, _)| purl.starts_with("pkg:gem/") && !plan.hosted_gems.contains_key(*purl))
+        .filter(|(purl, copies)| copies.paths.iter().any(|path| precompiled(purl, path)))
+        .map(|(purl, _)| purl.clone())
+        .collect();
+    if held.is_empty()
+        || common.is_global()
+        || !gem_lock_loads_platform_copies_in(&ProjectView::Disk(&common.cwd)).await
+    {
+        return HashSet::new();
+    }
+    held
+}
+
+/// The gems among `stand_ins` ([`gem_stand_in_copies`]) whose installed
+/// copy still holds the original content (`not_applied`): the lock pins
+/// the patched gem, and what Ruby runs is upstream's precompiled build.
+/// That is the state of the package, so it is not left out: each leaves
+/// `outcome.failed` and is returned with what to do about it, for a
+/// statement that says `affected`. A run warning tells a person the same.
+fn unpatched_gem_stand_ins(
+    outcome: &mut VerifyOutcome,
+    stand_ins: &HashSet<String>,
+    common: &GlobalArgs,
+    warnings: &mut Vec<RunWarning>,
+) -> Vec<(String, String)> {
+    let mut affected = Vec::new();
+    outcome.failed.retain(|failed| {
+        if failed.reason != "not_applied" || !stand_ins.contains(&failed.purl) {
+            return true;
+        }
+        affected.push((failed.purl.clone(), GEM_STAND_IN_ACTION.to_string()));
+        false
+    });
+    affected.sort();
+    for (purl, action) in &affected {
+        let detail = format!("{purl}: the VEX document says affected. {action}");
+        note_warning(warnings, common, GEM_STAND_IN_UNPATCHED, detail);
+    }
+    affected
+}
+
 /// The start of a Maven purl.
 const MAVEN: &str = "pkg:maven/";
 
@@ -2506,6 +2599,9 @@ pub(crate) async fn generate_vex_from_manifest_path(
 }
 
 /// Outcome of [`generate_vex_without_manifest`].
+// `large_enum_variant`: `Written` carries the document. One value is made
+// per run and matched at once, so boxing it would save nothing.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ManifestlessVex {
     /// Nothing references a patch anywhere (no manifest, no ledger record,
     /// no lockfile reference): the caller keeps its historical calm
@@ -3411,6 +3507,11 @@ fn emit_envelope_success(
                             .with_reason(code, reason);
                         env.events.push(event.with_details(details));
                         continue;
+                    }
+                    (Status::Affected, None) if summary.gem_stand_ins.contains(&sub.id) => {
+                        unbuilt = true;
+                        PatchEvent::new(PatchAction::Skipped, sub.id.clone())
+                            .with_reason(GEM_STAND_IN_UNPATCHED, GEM_STAND_IN_REASON)
                     }
                     (Status::Affected, None) => {
                         unbuilt = true;

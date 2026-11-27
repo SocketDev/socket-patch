@@ -92,6 +92,18 @@ pub async fn gem_locked_builds_in(
     }
 }
 
+/// Whether the Bundler lock bundler loads has Bundler load an installed
+/// precompiled build of a gem in place of the ruby-platform gem it names
+/// ([`lock_loads_platform_copies`](crate::formats::gem::lock_loads_platform_copies)).
+/// `false` when bundler loads no lock here, or it cannot be read.
+pub async fn gem_lock_loads_platform_copies_in(view: &ProjectView<'_>) -> bool {
+    let text = match bundler_loaded_lock_in(view).await {
+        Some(lock) => view.read_text(lock).await.ok(),
+        None => None,
+    };
+    text.is_some_and(|text| crate::formats::gem::lock_loads_platform_copies(&text))
+}
+
 /// Why the project's Bundler lock was not inventoried, when it holds gem
 /// files ([`GEM_FILES`]) but bundler loads no lock socket-patch reads
 /// ([`bundler_loaded_lock_diagnosed_in`]): an unsupported `BUNDLE_GEMFILE`

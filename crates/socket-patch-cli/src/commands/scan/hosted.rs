@@ -604,6 +604,11 @@ struct StaleInstallOutcome {
     /// such a build whatever is installed, and its copy says nothing of
     /// the gem's other builds.
     withdrawn: Vec<StaleGem>,
+    /// The stale installed dirs among `gems` that are a precompiled build
+    /// Bundler loads in place of the ruby-platform gem the lock names,
+    /// each with its platform. The refresh leaves them: the patched gem
+    /// of such a lock is the ruby-platform gem, which a reinstall builds.
+    stand_ins: std::collections::BTreeMap<std::path::PathBuf, String>,
 }
 
 /// The gem and Python stale-install probes' fallback: when a confirmed
@@ -775,6 +780,11 @@ fn stale_cache_gem(purl: &str, cache_path: &Path) -> StaleGem {
 ///   platform build Bundler loads, or replace a build that is not this
 ///   project's. Only where no lock names the gem (a global scan) is the
 ///   first installed copy judged, as before.
+/// * A lock whose `PLATFORMS` names `ruby` alone names every gem as its
+///   ruby-platform gem, and Bundler loads an installed precompiled build
+///   of the locked version in its place. Each such copy is judged beside
+///   the ruby-platform gem, as the gem's own: an upstream one is what Ruby
+///   runs, and no `bundle install` replaces it (`stand_ins`).
 #[allow(clippy::too_many_arguments)]
 async fn gem_stale_install_warnings(
     cwd: &Path,
@@ -872,8 +882,27 @@ async fn gem_stale_install_warnings(
         .filter(|(_, builds)| builds.is_empty())
         .map(|(purl, _)| purl.clone())
         .collect();
+    // The candidates the lock names as their ruby-platform gem alone, where
+    // Bundler loads an installed precompiled build in its place (module
+    // docs).
+    let loads_platform_copies =
+        socket_patch_core::vendor::lock_inventory::gem_lock_loads_platform_copies_in(
+            &socket_patch_core::vendor::lock_inventory::ProjectView::Disk(cwd),
+        )
+        .await;
+    let stood_in = |builds: &[GemBuild]| {
+        loads_platform_copies && matches!(builds, [ruby] if ruby.platform.is_none())
+    };
+    let stand_in_purls: Vec<String> = stripped
+        .iter()
+        .zip(&named)
+        .filter(|(_, builds)| stood_in(builds))
+        .map(|(purl, _)| purl.clone())
+        .collect();
     // Per home: each candidate's installed dirs.
     let mut found_per_home = Vec::with_capacity(homes.len());
+    let mut stand_in_dirs: std::collections::BTreeSet<std::path::PathBuf> =
+        std::collections::BTreeSet::new();
     for home in &homes {
         let mut by_leaf = crawler
             .find_builds(&home.gems_dir, &leaves)
@@ -883,6 +912,10 @@ async fn gem_stale_install_warnings(
             .find_each_by_purl(&home.gems_dir, &unnamed)
             .await
             .into_iter();
+        let mut platform_copies = crawler
+            .find_platform_builds(&home.gems_dir, &stand_in_purls)
+            .await
+            .into_iter();
         let dirs: Vec<Vec<std::path::PathBuf>> = named
             .iter()
             .map(|builds| {
@@ -890,7 +923,17 @@ async fn gem_stale_install_warnings(
                     let pkg = first.next().flatten();
                     pkg.map(|pkg| pkg.path).into_iter().collect()
                 } else {
-                    by_leaf.by_ref().take(builds.len()).flatten().collect()
+                    let mut dirs: Vec<std::path::PathBuf> =
+                        by_leaf.by_ref().take(builds.len()).flatten().collect();
+                    if stood_in(builds) {
+                        // A dir no gemspec lists is what an install left
+                        // behind: neither RubyGems nor Bundler loads it.
+                        let mut copies = platform_copies.next().unwrap_or_default();
+                        copies.retain(|dir| !gem_refresh::gemspec_is_gone(dir));
+                        stand_in_dirs.extend(copies.iter().cloned());
+                        dirs.extend(copies);
+                    }
+                    dirs
                 }
             })
             .collect();
@@ -920,8 +963,10 @@ async fn gem_stale_install_warnings(
             };
             // Upstream's own gem is what the lock pins for this build: the
             // archive RubyGems installed the copy from is that gem, or the
-            // copy is a build that was withdrawn.
-            if let Some(upstream_sha) = gem_upstream.get(leaf) {
+            // copy is a build that was withdrawn. Never for a copy that
+            // stands in for the ruby-platform gem: the lock pins that gem.
+            let stands_in = stand_in_dirs.contains(dir);
+            if let Some(upstream_sha) = gem_upstream.get(leaf).filter(|_| !stands_in) {
                 let archive = gem_refresh::home_cache_archive(dir);
                 let installed_from = match &archive {
                     Some(archive) => file_sha256_hex(archive).await,
@@ -1049,6 +1094,11 @@ async fn gem_stale_install_warnings(
         );
         out.warnings.push(gem_stale_warning(&gem, None));
         out.gems.push(gem);
+        if !in_place && stand_in_dirs.contains(dir) {
+            let platform = GemBuild::of_leaf(&j.purl, &j.leaf).and_then(|build| build.platform);
+            out.stand_ins
+                .insert(dir.clone(), platform.unwrap_or_default());
+        }
         // Every variant installed in this dir: VEX matches its exemptions
         // qualifier-insensitively, so one left out would re-exempt the dir.
         out.stale_purls.extend(j.purls.iter().cloned());
@@ -1335,7 +1385,21 @@ async fn refresh_stale_gems(
     } else {
         Source::PatchServer(api_client)
     };
-    let pass = gem_refresh::attempt(&first.gems, wanted, &source, &policy, direction).await;
+    // A precompiled build that stands in for the ruby-platform gem the
+    // lock names is left as it is: the patched gem of that lock is the
+    // ruby-platform gem, and replacing the copy with it means building it.
+    let stand_in = |gem: &StaleGem| {
+        let (dir, _) = gem.installed.as_ref()?;
+        first.stand_ins.get_key_value(dir)
+    };
+    let replaceable: Vec<StaleGem> = (first.gems.iter())
+        .filter(|gem| stand_in(gem).is_none())
+        .cloned()
+        .collect();
+    let mut pass = gem_refresh::attempt(&replaceable, wanted, &source, &policy, direction).await;
+    for (dir, platform) in first.gems.iter().filter_map(stand_in) {
+        pass.leave(dir, gem_refresh::Why::StandIn(platform.clone()));
+    }
     let withdrawn_pass = gem_refresh::attempt(
         &first.withdrawn,
         upstream_wanted,
@@ -3246,6 +3310,13 @@ async fn run_redirect_selected_untracked(
                 if let Some(report) = gate.report.as_deref_mut() {
                     report.project(&gate.plan, &pinned).await;
                     report.hosted_builds(&reports);
+                    if !common.dry_run {
+                        let stale: std::collections::BTreeSet<&str> = (gem_refreshed.outcome.gems)
+                            .iter()
+                            .map(|gem| gem.purl.as_str())
+                            .collect();
+                        report.stale_gem_installs(stale.len());
+                    }
                 }
             }
             // Then what the run did to the user's Bundler manifest.

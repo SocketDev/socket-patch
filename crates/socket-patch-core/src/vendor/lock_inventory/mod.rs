@@ -76,7 +76,9 @@ pub(crate) mod vlt;
 pub(crate) mod yarn;
 
 pub use self::bun::{bun_binary_lock_drives, bun_text_lock_drives};
-pub use self::gem::{gem_locked_builds_in, gem_platform_only_purls_in};
+pub use self::gem::{
+    gem_lock_loads_platform_copies_in, gem_locked_builds_in, gem_platform_only_purls_in,
+};
 pub(crate) use self::npm::{
     npm_lock_bundled_nodes, npm_lock_entries, npm_lock_legacy_mirror_nodes, npm_lock_located_nodes,
     NpmLockEntry, NpmLockNode, NpmLockSection,

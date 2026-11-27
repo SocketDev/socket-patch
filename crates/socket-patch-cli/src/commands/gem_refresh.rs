@@ -232,6 +232,11 @@ pub(crate) enum Why {
     /// gem could not be had, for this reason. It is not known to be stale,
     /// and not known not to be.
     Unverified(String),
+    /// The copy is a precompiled build of this platform that Bundler loads
+    /// in place of the ruby-platform gem the lock names. The patched gem
+    /// of such a lock is the ruby-platform gem, which only an install
+    /// builds: no refresh was tried.
+    StandIn(String),
 }
 
 /// What one refresh pass did.
@@ -247,6 +252,12 @@ pub(crate) struct Attempt {
 }
 
 impl Attempt {
+    /// Record that the pass left the materialization at `path` as it was,
+    /// for `why`, without trying it.
+    pub(crate) fn leave(&mut self, path: &Path, why: Why) {
+        self.left.insert(path.to_path_buf(), why);
+    }
+
     /// Whether the pass changed anything on disk.
     pub(crate) fn changed(&self, policy: &Policy) -> bool {
         !policy.dry_run && !self.refreshed.is_empty()
@@ -421,7 +432,7 @@ fn files_to_remove(gem: &StaleGem) -> Vec<PathBuf> {
 /// Whether no gem home lists the gem dir `<home>/gems/<leaf>`: neither
 /// `specifications/<leaf>.gemspec` nor the default gem's entry under
 /// `specifications/default/` is there. Only "not found" says so.
-fn gemspec_is_gone(gem_dir: &Path) -> bool {
+pub(crate) fn gemspec_is_gone(gem_dir: &Path) -> bool {
     let Some(spec) = home_spec(gem_dir) else {
         return false;
     };
@@ -574,6 +585,11 @@ fn reason(why: Option<&Why>) -> String {
             format!(" ({reason})")
         }
         Some(Why::Disabled) => " (`--no-gem-install-refresh` is set)".to_string(),
+        Some(Why::StandIn(platform)) => format!(
+            " (it is a precompiled {platform} gem, which Bundler loads in place of the ruby \
+             gem the lock names, and the patched gem of this lock is the ruby gem, which \
+             `bundle install` builds)"
+        ),
         _ => String::new(),
     }
 }
@@ -596,7 +612,7 @@ pub(crate) fn stale_detail(direction: Direction, gem: &StaleGem, why: Option<&Wh
         return if !project_local
             && !matches!(
                 why,
-                Some(Why::Disabled | Why::Failed(_) | Why::OutOfTree(_))
+                Some(Why::Disabled | Why::Failed(_) | Why::OutOfTree(_) | Why::StandIn(_))
             ) {
             format!(
                 "{held}. {IN_PLACE_REINSTALL}. Other projects may load that shared gem home, so \
@@ -636,7 +652,7 @@ pub(crate) fn stale_detail(direction: Direction, gem: &StaleGem, why: Option<&Wh
         Some((dir, false))
             if !matches!(
                 why,
-                Some(Why::Disabled | Why::Failed(_) | Why::OutOfTree(_))
+                Some(Why::Disabled | Why::Failed(_) | Why::OutOfTree(_) | Why::StandIn(_))
             ) =>
         {
             format!(
@@ -1881,6 +1897,72 @@ mod tests {
             Direction::Patched,
         )
         .await
+    }
+
+    /// A precompiled build that Bundler loads in place of the ruby gem
+    /// its lock names is left as it is, in the project's own gem home too:
+    /// the warning says what the copy is and which gem the lock patches,
+    /// and offers the command alone. A second scan would do the same, so
+    /// no retry is offered.
+    #[tokio::test]
+    async fn a_precompiled_stand_in_is_left_with_its_reason_and_the_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let home = proj.join("vendor/bundle/ruby/3.4.0");
+        let mut gem = installed("nokogiri", &home, true);
+        let dir = home.join("gems/nokogiri-1.0.0-arm64-darwin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            home.join("specifications/nokogiri-1.0.0-arm64-darwin.gemspec"),
+            "",
+        )
+        .unwrap();
+        gem.leaf = "nokogiri-1.0.0-arm64-darwin".to_string();
+        gem.installed = Some((dir.clone(), true));
+        let policy = policy(&proj, true, false, false);
+        let mut pass = pass(&[], &policy).await;
+        pass.leave(&dir, Why::StandIn("arm64-darwin".to_string()));
+        assert!(!pass.changed(&policy));
+
+        let out = report(
+            Direction::Patched,
+            std::slice::from_ref(&gem),
+            &pass,
+            &policy,
+        );
+        let why = "it is a precompiled arm64-darwin gem, which Bundler loads in place of the \
+                   ruby gem the lock names, and the patched gem of this lock is the ruby gem, \
+                   which `bundle install` builds";
+        let spec = home.join("specifications/nokogiri-1.0.0-arm64-darwin.gemspec");
+        let archive = home.join("cache/nokogiri-1.0.0-arm64-darwin.gem");
+        assert_eq!(
+            out.warnings,
+            [(
+                "redirect_gem_stale_install",
+                format!(
+                    "pkg:gem/nokogiri@1.0.0 was switched to its hosted patch, but its unpatched \
+                     install at {} was not refreshed ({why}), and `bundle install` reuses an \
+                     installed gem instead of fetching the patched one. Remove {}, {} and run \
+                     `bundle install`",
+                    dir.display(),
+                    spec.display(),
+                    archive.display()
+                )
+            )]
+        );
+        let summary = out.summary.expect("a summary");
+        assert_eq!(
+            summary.headline,
+            "1 gem is still unpatched on disk after the switch to hosted patches"
+        );
+        assert_eq!(
+            summary.bullets,
+            [format!(
+                "Not refreshed ({why}): nokogiri 1.0.0. Run `rm -f {} {} && bundle install`.",
+                spec.display(),
+                archive.display()
+            )]
+        );
     }
 
     /// Four gems in a shared home are one warning: the home, the gems, why

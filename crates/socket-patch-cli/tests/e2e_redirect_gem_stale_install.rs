@@ -7050,3 +7050,128 @@ async fn vendored_takeover_of_a_superseded_native_gem_names_the_extension() {
     );
     assert!(!proj.join(".socket").join("vendor").exists());
 }
+
+/// A lock whose `PLATFORMS` names `ruby` alone names every gem as its
+/// ruby-platform gem, and for such a lock Bundler loads an installed
+/// precompiled build of the locked version in its place: the copy an
+/// install from the upstream registry left behind. After the switch that
+/// copy is what Ruby runs, and `bundle install` keeps it.
+///
+/// * The scan reports it and does not replace it: the patched gem of this
+///   lock is the ruby-platform gem, which only an install builds. It asks
+///   the patch registry for no gem, names the command, offers no retry
+///   that would do the same, and does not say that nothing is left.
+/// * `vex` exits 0 and says `affected` of the gem, with what to do.
+/// * A lock that names another platform as well loads the gems it lists,
+///   so the copy is not this project's, and a gem dir no gemspec lists is
+///   no gem: neither is reported.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_precompiled_copy_under_a_ruby_only_lock_is_reported_and_attested_affected() {
+    use vex_e2e_common::{run_vex, statements_for, VexRun};
+    let server = MockServer::start().await;
+    let patched = real_gem(PATCHED_LIB);
+    mount_api_for(&server, None, &sha256_of(&patched)).await;
+    serve_patched_gem(&server, patched).await;
+    let uri = server.uri();
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_manifest_pair(&proj);
+    let home = project_home(&proj);
+    let gem_dir = install_real_gem_for(&home, UPSTREAM_LIB, PLATFORM);
+    let leaf = format!("{DEP}-{DEP_VERSION}-{PLATFORM}");
+    let spec = home.join("specifications").join(format!("{leaf}.gemspec"));
+
+    let (code, stdout, stderr) = common::run_with_env(&proj, &scan_args(&proj, &uri, &[]), &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("1 gem is still unpatched on disk after the switch to hosted patches")
+            && stderr.contains(&format!(
+                "Not refreshed (it is a precompiled {PLATFORM} gem, which Bundler loads in \
+                 place of the ruby gem the lock names"
+            )),
+        "the copy Bundler loads is reported with what it is:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Run `rm -f ")
+            && stderr.contains(&format!("{leaf}.gemspec"))
+            && stderr.contains(&format!("{leaf}.gem && bundle install`")),
+        "the command names the copy's gemspec and archive:\n{stderr}"
+    );
+    assert!(!stderr.contains("to retry"), "{stderr}");
+    assert!(
+        stdout.contains(
+            "1 gem is still unpatched on disk: the warning names the command that installs the \
+             patched gem."
+        ) && !stdout.contains("Nothing left to patch"),
+        "the closing lines do not say that nothing is left:\n{stdout}"
+    );
+    assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB, "the copy is left");
+    let gems: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|request| request.url.path().to_string())
+        .filter(|path| path.contains("/gems/"))
+        .collect();
+    assert!(gems.is_empty(), "no gem is asked for: {gems:?}");
+
+    // `vex`: a document, exit 0, and the gem's actual state.
+    let run = VexRun {
+        api_url: Some(uri.clone()),
+        api_token: Some("fake".into()),
+        org: Some(ORG.into()),
+        patch_server_url: Some(uri.clone()),
+        product: Some("pkg:gem/app@1.0.0".into()),
+        ..VexRun::default()
+    };
+    let out = run_vex(&vex_e2e_common::binary(), &proj, &run);
+    assert_eq!(out.code, Some(0), "{out}");
+    let statements = statements_for(out.doc(), PURL);
+    assert_eq!(statements.len(), 1, "{out}");
+    assert_eq!(statements[0]["status"], "affected", "{out}");
+    let action = statements[0]["action_statement"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(action.contains("Run `socket-patch scan`"), "{action}");
+    let skipped: Vec<&serde_json::Value> = out.envelope["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|event| event["action"] == "skipped")
+        .collect();
+    assert_eq!(skipped.len(), 1, "{out}");
+    assert_eq!(
+        skipped[0]["errorCode"], "vex_gem_install_unpatched",
+        "{out}"
+    );
+    assert!(
+        warnings_with_code(&out.envelope, "vex_gem_install_unpatched")
+            .iter()
+            .any(|detail| detail.contains("the VEX document says affected")),
+        "{out}"
+    );
+
+    // A lock that names another platform too loads exactly what it lists.
+    let lock_path = proj.join("Gemfile.lock");
+    let hosted_lock = std::fs::read_to_string(&lock_path).unwrap();
+    let both = hosted_lock.replace("PLATFORMS\n  ruby\n", "PLATFORMS\n  ruby\n  x86_64-linux\n");
+    assert_ne!(both, hosted_lock);
+    std::fs::write(&lock_path, &both).unwrap();
+    let (code, stdout, stderr) =
+        common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    assert!(stale_warnings(&env).is_empty(), "{env}");
+
+    // Back on the ruby-only lock, with the copy's gemspec removed: the dir
+    // is what an install left behind, and nothing loads it.
+    std::fs::write(&lock_path, &hosted_lock).unwrap();
+    std::fs::remove_file(&spec).unwrap();
+    let (code, stdout, stderr) =
+        common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    assert!(stale_warnings(&env).is_empty(), "{env}");
+}

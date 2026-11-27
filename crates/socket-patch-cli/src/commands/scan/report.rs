@@ -287,6 +287,10 @@ pub(crate) struct Counts {
     /// Some lookup of the run saw free patches only (the public proxy):
     /// "nothing left" then speaks for the free patches alone.
     pub(crate) free_only: bool,
+    /// The gems on a hosted patch whose installed copy is still the
+    /// unpatched one after the run ([`Run::stale_gem_installs`]): the run
+    /// then does not say that nothing is left.
+    pub(crate) stale_installs: usize,
 }
 
 impl Counts {
@@ -802,8 +806,24 @@ pub(crate) fn closing(
         } else {
             "Nothing left to patch."
         };
-        // A gem build still on upstream's gem is something left.
-        if unpatched_builds.is_none() {
+        // A gem build still on upstream's gem is something left, and so
+        // is a patched gem whose installed copy is still the unpatched
+        // one: the run's warning names the command for it.
+        if counts.stale_installs > 0 {
+            lines.push(plain(format!(
+                "{} on disk: the warning names the command that installs the patched {}.",
+                plural(
+                    counts.stale_installs,
+                    "gem is still unpatched",
+                    "gems are still unpatched"
+                ),
+                if counts.stale_installs == 1 {
+                    "gem"
+                } else {
+                    "gems"
+                },
+            )));
+        } else if unpatched_builds.is_none() {
             lines.push(plain(nothing.to_string()));
         }
     } else {
@@ -935,6 +955,9 @@ pub(crate) struct Run {
     /// The gem builds the hosted runs left on upstream's gem
     /// ([`Self::hosted_builds`]).
     unpatched_builds: Vec<UnpatchedBuilds>,
+    /// The gems the hosted runs left with their unpatched copy installed
+    /// ([`Self::stale_gem_installs`]).
+    stale_installs: usize,
 }
 
 impl Run {
@@ -958,6 +981,7 @@ impl Run {
             shares_lookups: false,
             free_only: false,
             unpatched_builds: Vec::new(),
+            stale_installs: 0,
         }
     }
 
@@ -1186,6 +1210,15 @@ impl Run {
         note_unpatched_builds(&mut self.unpatched_builds, reports);
     }
 
+    /// How many gems a project directory's hosted run left on a hosted
+    /// patch with the unpatched copy still installed (its
+    /// `redirect_gem_stale_install` warning names the command). The closing
+    /// lines then do not say that nothing is left to patch. Once per
+    /// directory.
+    pub(crate) fn stale_gem_installs(&mut self, gems: usize) {
+        self.stale_installs += gems;
+    }
+
     /// Print the closing lines (stdout), under a blank line. The elapsed
     /// time is for someone watching: it prints on a terminal only, so a
     /// log of the same run reads the same every time.
@@ -1202,6 +1235,7 @@ impl Run {
         let mut counts = self.counts;
         counts.verify(&self.patched, &self.measured);
         counts.free_only = self.free_only;
+        counts.stale_installs = self.stale_installs;
         let elapsed = ui::attended(ui::Stream::Stdout).then(|| self.started.elapsed());
         let lines = closing(
             &counts,
@@ -1796,6 +1830,31 @@ mod tests {
                 "Nothing left to patch.",
             ]
         );
+        // A patched gem whose installed copy is still the unpatched one is
+        // something left: the run never says that nothing is.
+        for (stale, line) in [
+            (
+                1,
+                "1 gem is still unpatched on disk: the warning names the command that installs \
+                 the patched gem.",
+            ),
+            (
+                2,
+                "2 gems are still unpatched on disk: the warning names the command that installs \
+                 the patched gems.",
+            ),
+        ] {
+            let c = Counts {
+                stale_installs: stale,
+                ..counts(2, 2, 0, 0, 0)
+            };
+            let lines = closing(&c, &[], 1, false, false, None, PLAIN);
+            assert_eq!(lines.last().map(String::as_str), Some(line));
+            assert!(
+                !lines.iter().any(|l| l.contains("Nothing left")),
+                "{lines:?}"
+            );
+        }
         // A patch that names no advisory still patched its package.
         assert_eq!(
             closing(&counts(2, 0, 0, 0, 0), &[], 2, false, false, None, PLAIN),
