@@ -1975,18 +1975,30 @@ async fn locked_build_sources(
     Err(no_patched_build(trees, &missing, &patched))
 }
 
+/// A restore found that the build a ledger entry records for a platform is
+/// no longer the one the gem's fix names for it: it was rebuilt under
+/// another patch or with other bytes, or withdrawn, or is being made again.
+/// Nothing is unpacked. Not an integrity failure: the same state follows
+/// an edited ledger, and neither is told from the other here.
+pub(crate) const VENDOR_PREBUILT_REPLACED: &str = "vendor_prebuilt_replaced";
+
 /// The sources of the trees a ledger entry records, for a restore.
 ///
 /// SECURITY: the ledger is committed, tamper-able data, and it must not
 /// choose what is unpacked as a gem's tree. A restore unpacks what the
-/// gem's fix names for each platform today ([`locked_build_sources`]):
-/// the patch the entry records for a tree must be that one, and the entry
-/// must pin the gem and the gemspec that tree was vendored from (an entry
-/// that pins none is refused). The downloads then have to be both the gem
-/// the fix's registry lists and the ones the entry pins, and the tree is
-/// held to the record the patch service serves now, never to file hashes
-/// the ledger supplies. An entry that fails this is refused before
-/// anything is downloaded.
+/// gem's fix names for each platform today: the patch the entry records
+/// for a tree must be that one, and the entry must pin the gem and the
+/// gemspec that tree was vendored from (an entry that pins none is
+/// refused). The downloads then have to be both the gem the fix's
+/// registry lists and the ones the entry pins, and the tree is held to
+/// the record the patch service serves now, never to file hashes the
+/// ledger supplies. An entry that fails this is refused before anything
+/// is downloaded.
+///
+/// A fix that names another build for a platform than the entry records,
+/// or none, is not worded as tampering nor as a first vendoring: the copy
+/// cannot be restored as it was ([`VENDOR_PREBUILT_REPLACED`]), and the
+/// message names the commands that vendor the current build.
 async fn recorded_build_sources(
     cfg: &VendorServiceConfig,
     fix: &str,
@@ -1995,40 +2007,57 @@ async fn recorded_build_sources(
     builds: &[GemBuildEntry],
 ) -> Result<Vec<BuildSource>, Box<VendorOutcome>> {
     let policy = ServicePolicy::Refused;
-    let platforms: Vec<String> = builds.iter().map(|b| b.platform.clone()).collect();
-    let listed = locked_build_sources(cfg, fix, name, trees, &platforms).await?;
+    let reference = fetch_served_reference(cfg, fix).await;
+    let served = policy.settle(
+        reference,
+        "platform gem",
+        &format!("platform gems for {name}"),
+    )?;
+    let listed = served.gem_builds.as_deref().unwrap_or_default();
     let mut sources = Vec::with_capacity(builds.len());
-    for (built, listed) in builds.iter().zip(listed) {
-        let refuse = |why: String| {
+    for built in builds {
+        let subject = format!("{name} ({})", built.platform);
+        let replaced = |now: &str| {
             policy.hard(
-                "vendor_prebuilt_integrity_mismatch",
+                VENDOR_PREBUILT_REPLACED,
                 format!(
-                    "the vendor ledger's entry for the platform gem for {name} ({}) {why}; \
-                     refusing to restore it",
-                    built.platform
+                    "the copy of the platform gem for {subject} cannot be restored as it was \
+                     vendored: the vendor ledger records patch {} for it, and the gem's fix \
+                     {now}. Nothing was restored. To vendor what the patch service serves \
+                     now, run `socket-patch rollback pkg:gem/{}` and then \
+                     `socket-patch scan --mode vendored`",
+                    built.uuid, trees.gem
                 ),
             )
         };
-        if !built.uuid.eq_ignore_ascii_case(&listed.uuid) {
-            return Err(refuse(format!(
-                "names patch {}, which is not the patch the gem's fix names for that platform \
-                 ({})",
-                built.uuid, listed.uuid
+        let now = listed.iter().find(|gem| gem.platform == built.platform);
+        let Some((gem, uuid)) = now.and_then(|gem| Some((gem, gem.patch_uuid.as_deref()?))) else {
+            return Err(replaced(
+                "names no patched build for that platform now (it was withdrawn, or is being \
+                 made again)",
+            ));
+        };
+        if !built.uuid.eq_ignore_ascii_case(uuid) {
+            return Err(replaced(&format!(
+                "now names patch {uuid} for that platform (the build was replaced, or the \
+                 ledger was edited)"
             )));
         }
         if built.gem_integrity.is_empty() || built.gemspec_integrity.is_empty() {
-            return Err(refuse(
-                "pins no digest for the gem or the gemspec it was vendored from".to_string(),
+            return Err(policy.hard(
+                "vendor_prebuilt_integrity_mismatch",
+                format!(
+                    "the vendor ledger's entry for the platform gem for {subject} pins no \
+                     digest for the gem or the gemspec it was vendored from; refusing to \
+                     restore it"
+                ),
             ));
         }
-        let BuildPin::Registry(sha256) = listed.pinned else {
-            return Err(refuse("has no gem the patch registry lists".to_string()));
-        };
         sources.push(BuildSource {
-            platform: listed.platform,
-            uuid: listed.uuid,
+            platform: built.platform.clone(),
+            uuid: uuid.to_string(),
             pinned: BuildPin::Restored {
-                sha256,
+                sha256: gem.gem_checksum_sha256.clone(),
                 gem: built.gem_integrity.clone(),
                 gemspec: built.gemspec_integrity.clone(),
             },
@@ -2090,9 +2119,10 @@ type ServedBuild<'a> = (
 /// does not serve, because it is still being built or is not granted to
 /// this caller, leaves its platform without a patched build to vendor, as
 /// if the fix named none: the gem is skipped ([`no_patched_build`]). The
-/// trees of a ledger entry have nothing to wait for, so a patch of theirs
-/// that is not served is a miss, as is a patch the service does not answer
-/// for and a granted one that lists no gem or no stub.
+/// trees of a ledger entry come here only with the patches the fix names
+/// for them today ([`recorded_build_sources`]), so one that is not served
+/// is a miss, as is a patch the service does not answer for and a granted
+/// one that lists no gem or no stub.
 async fn served_builds<'a>(
     cfg: &VendorServiceConfig,
     name: &str,
@@ -14611,7 +14641,7 @@ mod tests {
             let mut no_pin = entry.clone();
             no_pin.gem_builds[1].gem_integrity.clear();
             for (edited, why) in [
-                (&other_patch, "is not the patch the gem's fix names"),
+                (&other_patch, "the gem's fix now names patch"),
                 (&no_pin, "pins no digest"),
             ] {
                 let refused = crate::vendor::redownload::restore(&root, edited, &record, &cfg)

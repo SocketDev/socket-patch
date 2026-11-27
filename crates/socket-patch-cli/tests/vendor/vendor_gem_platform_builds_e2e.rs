@@ -711,9 +711,19 @@ async fn a_platform_locked_gem_vendors_and_reports_per_platform_gem() {
     let fetched = downloads(&server).await.len();
     let (code, env, stderr) = run_json(root, VENDOR, &server.uri());
     assert_ne!(code, 0, "{env:#}\n{stderr}");
+    // Said as what it is, a build that is no longer the one the fix
+    // names, under its own code and with the commands that vendor the
+    // current one: not as tampering, and not as a first vendoring.
+    let said = env.to_string();
     assert!(
-        env.to_string()
-            .contains("is not the patch the gem's fix names for that platform"),
+        said.contains("vendor_prebuilt_replaced")
+            && said.contains("cannot be restored as it was vendored")
+            && said.contains("the gem's fix now names patch")
+            && said.contains("socket-patch scan --mode vendored"),
+        "{env:#}"
+    );
+    assert!(
+        !said.contains("vendor_prebuilt_integrity_mismatch"),
         "{env:#}"
     );
     assert_eq!(
