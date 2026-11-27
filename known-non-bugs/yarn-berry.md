@@ -1,0 +1,107 @@
+# Yarn Berry (2+) known non-bugs and documented limitations
+
+One line per item. Moved from state/yarn-berry.md on 2026-11-27 (runs 1-48); append new lines at the end.
+
+- Every berry `${…}` expansion reads only the process env, never `.env.yarn`. Any `.env.yarn`-driven setting misread (`pnpmStoreFolder`, `npmRegistryServer`, `compressionLevel`) is #1611's root cause, so don't file it separately (run 47).
+- A first-party workspace that is itself named `left-pad@1.3.0` (transparent workspaces resolve `left-pad: 1.3.0` to it) is refused by hosted (`redirect_yarn_berry_entry_not_found`) and vendored (`vendor_override_conflict`), and agent writes nothing. That's correct and fail-closed (run 47).
+- Yarn `packageExtensions` deps aren't recorded in the lock entry, so a hosted pin of an extended package passes fresh `--immutable` and hardened mode (run 47).
+- Vendored on a live PnP project (when the linker is misread, #1611) wires `resolutions: file:` and PnP then resolves the patched bytes. So the vendored PnP refusal is conservative rather than load-bearing; only the misfire is #1611 (run 46).
+- Yarn 3.8.7 hosted: `redirect_yarn_berry_cache_unsupported` (cacheKey 8), exit 0. Documented (run 46 re-check).
+- A nested independent berry project (own `yarn.lock`) that the root also links with `portal:./tools/x`, where the root locks the patched package too: hosted pins the root copy with no `nested_project_skipped` warning, and `tools/x/node_modules/left-pad` (from the nested project's own install) stays unpatched and shadows the root copy at runtime. That's the #1534 design (the warning fires only for packages the root's lock doesn't list; hosted/vendored rewire only the root's locks), so it isn't filed (run 45).
+- A `portal:`/`link:` copy whose manifest names a different valid package (`"name": "other-pkg"`, version 1.3.0) is treated as that package, not as a copy of the patched one. That's the designed identity rule (run 45).
+- A berry `link:` to a non-empty directory with no `package.json` (plain assets, or only a `.gitkeep`) isn't a package copy (documented, and yarn installs it as a plain link). Only the `portal:` form is #1579, because yarn refuses a manifest-less portal (run 44).
+- A root hosted/vendored `scan --vex` whose only patch belongs to a nested independent berry project exits 1 with `manifest_not_found` (nothing to attest) after `nested_project_skipped`. That's the documented exit (run 44).
+- Lock-only `vex` exits 2 saying "no hosted or vendored patch references were found" when the only pin is withheld by an unpatched copy. The wording is misleading but the run fails closed, so it isn't filed (run 43).
+- An absolute `file:/…` renamed copy (dir or tgz) is never read (an untrusted lock), but it fails closed as an unidentified copy: `redirect_copy_unpatched`, and `vex` refuses. That's the designed #1517 behaviour; only absolute `portal:`/`link:` copies fail open (#1540) (run 42).
+- Vendored revert after a member adds `left-pad@latest`, a partial hyphen range (`1.3.0 - 2`) or an unsatisfied range while vendored: a `vendor_lock_descriptor_unlocked` event telling you to run `yarn install`, exit 0, and fresh `--immutable` YN0028 until you do. That is the designed fail-loud path from #1464 (run 40).
+- `packages/.hidden` under `packages/*` is refused as a workspace member (`redirect_workspace_lockfile_elsewhere`), but yarn berry skips dot directories. Loud and harmless, so not filed (run 40).
+- `nodeLinker: PnP` (wrong case) isn't PnP to yarn either (no linker matches), so agent apply proceeding is consistent (run 39).
+- A #1465-style bare `npm:` locator passes plain `--immutable` and `--refresh-lockfile`. Only the cold fetch against a mirror without `/-/` tarballs fails; don't call a mirror that serves `/-/` a pass for #1465 (run 39).
+- Hosted rollback of a native-addon pin (`nan`, #737 fix) can't restore the pruned `node-gyp` subtree: it warns `yarn_berry_node_gyp_unresolved`, plain `--immutable` passes and hardened fails until `yarn install`. Documented in CLI_CONTRACT (run 38).
+- Yarn 2/3 (cacheKey 7/8) are refused by hosted and vendored mode (documented).
+- PnP projects with a `.pnp.cjs` are refused in every mode with `yarn_pnp_unsupported` (documented).
+- Vendoring a package yarn builtin-patches (`resolve`, `typescript`, `fsevents`) is refused fail-closed with `vendor_override_conflict`. It's loud and closed, so it isn't filed (the hosted counterpart is #368).
+- Hosted refuses an entry that merges a direct descriptor with an `npm:` alias (`"left-pad@npm:1.3.0, lp@npm:left-pad@1.3.0"`) with `redirect_yarn_berry_ambiguous_entry` and exit 1. It's fail-closed and loud; arguably over-broad, but not filed.
+- Agent mode: a later `yarn install --immutable` in the same tree doesn't restore unpatched bytes (yarn's install-state), and the setup hook re-patches after a clean install. Standalone `vex` in agent mode needs `setup` or `setup.manual` (documented).
+- `patches-api.socket.dev` is unreachable from the sandbox; use the mock.
+- A BOM'd yarn.lock fails `yarn install --immutable` (YN0028) on its own, because yarn strips the BOM. Not caused by socket-patch.
+- Hosted on a berry `npm:` alias-only entry → `redirect_yarn_berry_alias_skipped` (documented in docs/ecosystems.md).
+- ~~`scan <workspace-member-dir>` finds 0 packages~~ Superseded in run 21: after #590/#598, the hosted run from a member is a bug (#884, Berry evidence commented). A hoisted member scan still finds 0 packages, but `get <uuid>` and member-owned copies report success while pinning nothing.
+- PnP with `.pnp.cjs`: scan reports 0 packages with a PnP warning (same in 4.0.0). A PnP lock-only checkout gets hosted pins, and those install correctly under PnP.
+- v5 rollback/remove/list treat only `patch.socket.dev` (or `--patch-server-url`) URLs as hosted pins. Without that flag, a mock host reads as "Manifest not found".
+- PnP on yarn 2.x (`.pnp.js`) and 3.x is detected and gets the loud PnP warning in every mode, exit 0 (same as 4.x).
+- An agent-mode re-run (`scan -g --mode agent`) after a failed apply (EACCES) exits 0 with "already recorded … run `socket-patch apply`". This is the designed re-run message; `apply -g` itself exits 1.
+- The report-only hint after `scan -g` doesn't mention `-g`. It's cross-PM and was handed to npm (#302), so it isn't filed here.
+- Yarn 4 hardened mode (`enableHardenedMode`, auto-on for public fork PRs in GitHub Actions) accepts a hosted `::__archiveUrl=` lock pin, as does `--check-resolutions` (4.12.0, registry reachable).
+- Zero-install (`enableGlobalCache: false` with `.yarn/cache` committed): hosted mode is lock-only, so the committed cache keeps the unpatched zip, and `yarn install --immutable --immutable-cache` fails YN0056 until `yarn install` refreshes the cache. Vendored mode behaves the same way (the `file:` entry has no cache zip; no warning). It's a docs gap, not filed.
+- `compressionLevel` set outside the project `.yarnrc.yml` (env, home or parent rc) can't cause a wrong checksum: yarn bakes the level into the lock's `cacheKey`, which both modes gate on.
+- Vendored refuses a user `yarn patch` (`patch:` descriptor) with `vendor_override_conflict`, plus an alias-only dependency (root or workspace member) with `vendor_lock_entry_not_found`, a merged direct + alias entry, and a user-authored `resolutions` key for the target. All are loud and closed with nothing written, so none are filed.
+- Mixed CRLF/LF `yarn.lock` is refused by vendored (`vendor_yarn_berry_mixed_line_endings`) and hosted (`redirect_yarn_berry_mixed_line_endings`). That's correct: yarn itself fails YN0028 on such a lock.
+- v5 `rollback` drops the patch's manifest entry, so a later `apply` is a no-op (designed).
+- A berry install rewrites a BOM'd, compact, or no-trailing-newline `package.json`. Vendored snapshots the post-install bytes and reverts to them byte-exactly.
+- Vendored refuses a lock that resolves the target name at a second version (`left-pad@1.2.0` alongside the patched 1.3.0) with `vendor_override_conflict`, because the name-keyed `resolutions` would move both. That's correct and loud.
+- `repair` refuses (`vendor_artifact_redownload_failed`, nothing written) when the service now serves different bytes for a uuid whose integrity is pinned in the ledger. That's correct.
+- `vendor --cwd <workspace member>` fails loudly with `vendor_lockfile_missing` (the lock lives at the root).
+- Yarn 4 locks carry no `virtual:` entries for peer-dependent packages, so the hosted/vendored rewrite has no virtual locator to keep in sync.
+- Hosted rollback reformats a compact one-line `package.json` to 2-space and drops a user-authored empty `"resolutions": {}`. Yarn's own next install writes exactly the same bytes, so it isn't filed.
+- Hosted per-package refusals (`redirect_yarn_berry_shared_descriptor`, `redirect_yarn_berry_ambiguous_entry`, `cache_unsupported`) exit 0 with `redirected: 0` and nothing written. With `--vex` and nothing to attest, the run exits 1.
+- Hosted refuses a user-authored `resolutions` entry targeting the patched package (bare or scoped selector) with `redirect_yarn_berry_resolutions_conflict`. It's documented and loud.
+- An interrupted (SIGKILL) vendor can leave a ledger + tgz without the package.json/yarn.lock wiring. A re-run completes, `vendor --revert` removes the orphan, and `vex` refuses. `rollback` and `repair` fail with `manifest_not_found` in that state.
+- After a hosted pin, a user descriptor change (`yarn add left-pad@1.3.0`) leaves a stale `resolutions` selector. `rollback` in that state refuses loudly and tells you to re-run `scan --mode hosted`, which re-pins correctly. It's fail-closed and gives a remedy, so it isn't filed.
+- #628 (hosted rewrites a mixed-EOL root package.json) was filed by the arch audit; don't re-file it.
+- Hosted on a direct tarball-URL descriptor (`left-pad@https://…tgz`) is refused with `redirect_yarn_berry_unsupported_protocol`, exit 0, nothing written. That's correct.
+- `compressionLevel: mixed` (cacheKey `10`) is refused by hosted (`redirect_yarn_berry_cache_unsupported`, exit 0) and vendored (`vendor_yarn_berry_cache_unsupported`, exit 1). Both are documented.
+- Hosted on a user `patch:` descriptor in `dependencies` is refused (`redirect_yarn_berry_unsupported_protocol` + `redirect_yarn_berry_shared_descriptor`), nothing written. That's correct. The hint suggests `--mode vendored`, which also refuses it; `--mode agent` works.
+- Yarn 4 writes no `checksum:` for a platform-conditional entry reached only through `optionalDependencies`, and strips one on its next mutable install. A hosted pin's checksum on such an entry therefore doesn't survive `yarn add`; `vex` still attests from the installed tree. That's yarn's policy. The misplaced-line part is #697.
+- A hosted pin whose `bin:` differs from the tarball's passes a plain `yarn install --immutable` and a later mutable install (yarn trusts the locked entry). Only hardened mode or `--refresh-lockfile` fails, and that is #718.
+- A scoped patch missing from a mock-driven scan is a mock artifact if the mock doesn't fully unquote `%2540` purls (run 14).
+- `lockfileFilename` in `.yarnrc.yml` is rejected by yarn 4 ("Unrecognized or legacy configuration settings"). It only exists in yarn 2/3, which hosted/vendored refuse anyway.
+- `checksumBehavior` (ignore/update/reset) doesn't change what yarn writes to the lock. Hosted and vendored pins pass under all three (run 15).
+- A user `**/name` resolution is dropped from `package.json` by yarn 4's own install, so a hosted pin that seems to replace it isn't socket-patch's doing (run 16).
+- `compressionLevel:` with its value on the next line (a multi-line YAML scalar) is refused by both modes. It's loud and unrealistic, so it isn't filed (run 16).
+- Vendored `vex` on a tree whose `node_modules` still holds unpatched bytes (wiring pulled without a reinstall) attests `not_affected` from the committed artifact and warns `vendored_tree_out_of_sync`. That's by design (run 17).
+- `vendor --check` reporting wiring verified after the Berry wiring drifts is #725 (cross-PM root cause, Berry evidence commented in run 17). Don't re-file it.
+- `yarn install --mode=update-lockfile` (Renovate) still writes `checksum:` lines on yarn 4.0.2 and 4.18.1, so there are no checksum-less target entries to test (run 18).
+- A hosted-rollback bare `npm:<v>` locator where yarn wrote `::__archiveUrl=` passes hardened mode and `--refresh-lockfile`. The breakage is only the fetch (#817).
+- `scan --mode agent --json` reporting an apply failure as `action: "added"`, `failed: 0` with no error is #424 (cross-PM, open). Don't re-file it (run 20).
+- Yarn 4.0.x rejects `pnpmStoreFolder` ("Unrecognized or legacy configuration settings"), so #859 cells start at 4.1+ (run 20).
+- A vendored refusal on a symlinked `yarn.lock`/`package.json` (#802) leaves `.socket/vendor/npm/<uuid>/` behind despite saying "nothing was written". It's benign (`vex` refuses, `vendor --check` sees nothing, the re-run is clean), so it isn't filed (run 21).
+- Hosted rollback failing with "error sending request for url (https://registry.npmjs.org/…)" in the sandbox is the rustls/proxy-CA artifact. Use `SOCKET_NPM_REGISTRY` (run 21).
+- A symlinked project path (cwd or `--cwd` through a link, as macOS `/tmp` is) works in agent, vendored and hosted modes (run 22).
+- A conventional mirror with a path base (`npmRegistryServer: http://host/api/npm/npm-remote`) restores bare and byte-exact after a hosted rollback (run 23).
+- The #817 runs 18–20 "fixed" verdicts held only with `SOCKET_NPM_REGISTRY` pointed at the project's mirror. The realistic config is #908, so don't re-verify #817 that way.
+- A workspace member's **same-name** `file:` directory/tarball copy of the patched package (`"left-pad": "file:…"`) is refused by hosted (`redirect_yarn_berry_unsupported_protocol` + `redirect_yarn_berry_shared_descriptor`) and vendored (`vendor_override_conflict`), nothing written. That's correct; the other-name copy is #939 (run 24).
+- A user `yarn patch` on a hosted-pinned package makes `vex` decline (`hash_mismatch`) and a re-scan refuse (the `patch:` entry wraps the descriptor). Both are correct; only the unwind is #962 (run 25).
+- Agent mode skips a `node_modules/<name>` link into first-party source (`portal:`/`link:`) by design (docs/ecosystems.md), and reports `already patched`. Whether VEX should then attest is raised on #939, so don't re-file it (run 25).
+- A rollback error "upstream checksum metadata names a different package" against the mock means the `/upstream/npm/<uuid>.json` route is incomplete (run 25).
+- A hosted `scan` whose `yarn.lock` write fails after `package.json` was written exits 1 loudly. A re-run completes the pin (exit 0). Hosted `rollback` with a write fault can leave `package.json` restored and `yarn.lock` still pinned; `staged.rs` `flush_staged` documents that as the residual I/O-fault exposure (run 26).
+- Agent `apply` over a file the user changed with `yarn patch` overwrites it with Socket's patched bytes (`content_mismatch_overwritten`). That's the documented default mismatch policy; `--strict` refuses instead (run 26).
+- Yarn 2/3 vendored refusal text says "remove custom compression settings", which can't help on cacheKey 7/8 (an upgrade to yarn 4 is the real remedy). It's cosmetic, so it isn't filed (run 26).
+- Yarn 2.4.2 and 3.8.7 linker switches, and yarn classic turning off `installConfig.pnp`, all delete `.pnp.js`; only Yarn 4 leaves it (#975, run 26).
+- A hoisted workspace-member `scan --mode hosted` finds 0 packages and exits 0 after #901. Only a member-owned copy, or `get <uuid>`, triggers `redirect_workspace_lockfile_elsewhere` (run 28).
+- Yarn 4.18 quarantines registry versions whose packument has no `time` field (YN0016, "All versions … are quarantined"). Mock registries must serve `time` (run 28).
+- #657 berry gates: a hosted scan over a mixed-EOL root `package.json` exits 0 with `redirect_yarn_berry_mixed_line_endings`, nothing written (per-package hosted refusals exit 0); hosted rollback/remove refuse it with exit 1. The rollback hint naming `git checkout -- yarn.lock` and the `--json` top-level `failed: 0` are cosmetic (run 29).
+- Lock-only `vex` in agent mode on a live PnP tree omits the package (`package_not_found`) whatever the nodeLinker spelling, so #1100 doesn't produce a false attestation (run 30).
+- `remove <uuid>` naming a superseded generation (A, after a re-pin or re-vendor to B) refuses with exit 1 and leaves B wired. That's correct (run 31).
+- `scan --mode agent` over a vendored package with a newer patch published keeps the vendored generation (`vendored_ownership_retained`), so the #999 manifest-B/ledger-A shape can't arise on berry this way (run 31).
+- A leftover `package-lock.json` beside a berry `yarn.lock`: vendored warns `vendor_multiple_lockfiles`, and VEX declines with `patched_ref_unattributable`. Hosted pins both locks, and rollback restores all three files byte-exact (run 31).
+- A hosted re-pin that reports `redirect_yarn_berry_unsupported_protocol` + `entry_not_found` against a mock means the mock's tarball leaf isn't `<name>-<version>.tgz` (run 31).
+- A leftover `pnpm-lock.yaml` beside a berry `yarn.lock`: vendored wires pnpm (`vendor_multiple_lockfiles` names `yarn.lock` as unwired), even with `packageManager: yarn@4.18.1`. Same in release 4.0.0 and documented as a warning, so not filed. Hosted pins both locks and rolls back byte-exact (run 32).
+- Agent-mode state under a symlinked `.socket` is still shared between projects (rollback in one empties the shared manifest). #1042 keeps it deliberately and calls it a known gap; the vendored half of #887 is fixed (run 32).
+- `scan --mode vendored --prune` needs a patch to exist for the human path to run the GC (#1127, npm-owned); use `--json` (run 32).
+- A Yarn pnpm-linker `pnpmStoreFolder` outside the project (`../shared`) shared by two projects: agent apply in one patches the other's copy. docs/ecosystems.md explicitly patches a relocated berry store that does not contain the project, so it isn't filed (run 33).
+- A #1039 takeover retraction (`redirect_takeover_kept_vendored`) exits 0, also for `get <uuid> --mode hosted`, like every per-package hosted refusal (run 33).
+- `npm install --package-lock-only` beside a berry `yarn.lock` rewrites it as a classic v1 lock, so a later hosted scan warns `redirect_yarn_classic_berry_migration_risk`. That's a harness artifact, not a socket-patch bug (run 34).
+- #1058's discovery-based "already pinned" decision counts berry resolutions pins (plain, merged workspace entry, `catalog:`, pnpm linker) as `already`, and migrates release-4.0.0 `__archiveUrl` pins (run 34).
+- A SIGKILL before the takeover's journal is renamed into place (only `.socket/vendor/.socket-stage-.commit-journal.json-*` exists) commits nothing, and `rollback` unwinds the vendored state byte-exact. The stray stage file stays untracked; benign, not filed (run 35).
+- After a replayed takeover journal, the orphaned `.socket/vendor/npm/<uuid>/` dirs are #1157 (pnpm-owned, cross-PM); don't re-file them (run 35).
+- A plain hosted scan (no takeover) commits without a journal by design (CLI_CONTRACT "Staged takeover"): a SIGKILL between the `package.json` and `yarn.lock` renames leaves a half-pinned pair. `rollback` refuses `hosted_wiring_contested` with a working remedy, and a re-scan heals it. Not filed (run 36).
+- A SIGKILL leaves `.socket-stage-<file>-<uuid>` temp siblings, and journal replay doesn't remove them. The contract promises a clean tree only after a successful write; the npm routine already noted it on #809 (run 36).
+- Agent `scan PATH`: a member's dependency hoisted to the root `node_modules` is out of scope for `scan packages/a` (contract: in scope only if some installed copy sits under the PATH) (run 36).
+- After a SIGKILL between the package.json and yarn.lock renames of a hosted `rollback`/`remove` (journal-less by design), the lock keeps an orphaned pin. The re-run refuses `patched_ref_invalid`, and its "re-run the hosted scan" remedy is a no-op, but a plain `yarn install` (or `git checkout -- package.json yarn.lock`) heals it. Loud, so not filed (run 37).
+- Target grammar (#1034): `rollback/remove name@version`, CVE and GHSA ids select no hosted or vendored pin (documented); `is` next to `@sindresorhus/is` selects only `is` (the full name wins, by design); a hoisted member dependency is out of reach of `rollback packages/a` (`path_glob_no_match`, by contract) (run 37).
+- A berry alias at another version (`lp: npm:left-pad@1.1.3`) beside a pinned `^1.3.0` doesn't block VEX or the pin (run 37).
+- Mirror harness: when the mirror base shares host:port with `--patch-server-url`, the patch-server origin owns the mirror's pins too (it holds its whole host), so rollback without `SOCKET_PATCH_MIRROR_URL` still restores them. Use a separate port (run 49).
+- `SOCKET_PATCH_MIRROR_URL` with an uppercase scheme (`HTTP://`) is a usage error, exit 2 ("not an http(s) URL"); an uppercase host is accepted and matches the lowercase pin (run 49).
+- A mirrored pin read without the mirror setting is on an unconfigured host: `rollback` says "Manifest not found", and a scan under another base warns `redirect_pin_on_unconfigured_host` (documented in CLI_CONTRACT "What every command reads") (run 49).
+- An unreachable or 404 mirror: `redirect_mirror_unavailable`, exit 0, nothing written (documented) (run 49).
