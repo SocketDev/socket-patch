@@ -109,27 +109,58 @@ impl GemPlatform {
     }
 }
 
-/// The locked platforms of `locked` that keep the plain entry of a gem
-/// whose platform builds are `builds`: `ruby`, and each one that no build
-/// [serves](GemPlatform::serves). In the order of `locked`. A platform this
-/// module cannot read is left out, and so is every platform when one of the
-/// builds cannot be read (what it serves is not known).
-pub(crate) fn unserved_platforms<'a>(locked: &[&'a str], builds: &[String]) -> Vec<&'a str> {
-    let Some(builds) = builds
-        .iter()
-        .map(|build| GemPlatform::parse(build))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return locked.iter().copied().filter(|p| *p == "ruby").collect();
-    };
-    locked
+/// The locked platforms that keep the plain entry of a gem, as far as the
+/// lock's `PLATFORMS` and the gem's platform builds can be read.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Unserved<'a> {
+    /// `ruby` when it is locked, and each locked platform that no build
+    /// [serves](GemPlatform::serves). In the order of the lock, each once.
+    pub(crate) platforms: Vec<&'a str>,
+    /// Whether every locked platform and every build was read. When not,
+    /// a platform that is not in [`Self::platforms`] may keep the entry
+    /// too.
+    pub(crate) complete: bool,
+}
+
+/// The platforms of `locked` that keep the plain entry of a gem whose
+/// platform builds are `builds`. A platform this module cannot read is
+/// never named, and when one of the builds cannot be read (what it serves
+/// is not known) only `ruby` is.
+pub(crate) fn unserved_platforms<'a>(locked: &[&'a str], builds: &[String]) -> Unserved<'a> {
+    let mut seen: Vec<&str> = Vec::new();
+    let locked: Vec<&'a str> = locked
         .iter()
         .copied()
-        .filter(|platform| match GemPlatform::parse(platform) {
-            Some(parsed) => !builds.iter().any(|build| build.serves(&parsed)),
-            None => *platform == "ruby",
+        .filter(|platform| {
+            let new = !seen.contains(platform);
+            seen.push(platform);
+            new
         })
-        .collect()
+        .collect();
+    let builds: Option<Vec<GemPlatform>> = builds
+        .iter()
+        .map(|build| GemPlatform::parse(build))
+        .collect();
+    let mut complete = builds.is_some();
+    let platforms = locked
+        .into_iter()
+        .filter(|platform| {
+            if *platform == "ruby" {
+                return true;
+            }
+            let Some(parsed) = GemPlatform::parse(platform) else {
+                complete = false;
+                return false;
+            };
+            builds
+                .as_ref()
+                .is_some_and(|builds| !builds.iter().any(|build| build.serves(&parsed)))
+        })
+        .collect();
+    Unserved {
+        platforms,
+        complete,
+    }
 }
 
 /// The OS and version of the OS part of a platform name, for the operating
@@ -149,6 +180,13 @@ fn known_os(part: &str) -> Option<(&'static str, Option<String>)> {
             .unwrap_or(rest.len());
         (end > 0).then(|| rest[..end].to_string())
     };
+    // RubyGems tests these names before the ones read here.
+    if ["aix", "cygwin", "freebsd"]
+        .iter()
+        .any(|os| part.contains(os))
+    {
+        return None;
+    }
     if let Some(rest) = after("darwin") {
         return Some(("darwin", digits(rest)));
     }
@@ -167,10 +205,12 @@ fn known_os(part: &str) -> Option<(&'static str, Option<String>)> {
     None
 }
 
-/// `i386` … `i686`, which RubyGems reads as `x86`.
+/// `i386` … `i686`, which RubyGems reads as `x86`. It looks for the name
+/// anywhere in the CPU.
 fn is_ix86(cpu: &str) -> bool {
-    let bytes = cpu.as_bytes();
-    bytes.len() == 4 && bytes[0] == b'i' && bytes[1].is_ascii_digit() && &bytes[2..] == b"86"
+    cpu.as_bytes()
+        .windows(4)
+        .any(|w| w[0] == b'i' && w[1].is_ascii_digit() && &w[2..] == b"86")
 }
 
 fn ends_with_digit(part: &str) -> bool {
@@ -343,7 +383,10 @@ mod tests {
         ]);
         assert_eq!(
             unserved_platforms(&locked, &thruster),
-            ["arm-linux-gnu", "arm-linux-musl", "ruby"]
+            Unserved {
+                platforms: vec!["arm-linux-gnu", "arm-linux-musl", "ruby"],
+                complete: true
+            }
         );
         let nokogiri = builds(&[
             "aarch64-linux-gnu",
@@ -355,22 +398,59 @@ mod tests {
             "x86_64-linux-gnu",
             "x86_64-linux-musl",
         ]);
-        assert_eq!(unserved_platforms(&locked, &nokogiri), ["ruby"]);
+        assert_eq!(
+            unserved_platforms(&locked, &nokogiri),
+            Unserved {
+                platforms: vec!["ruby"],
+                complete: true
+            }
+        );
+        // A line the lock repeats is named once.
+        assert_eq!(
+            unserved_platforms(
+                &["ruby", "arm-linux-gnu", "ruby", "arm-linux-gnu"],
+                &thruster
+            )
+            .platforms,
+            ["ruby", "arm-linux-gnu"]
+        );
     }
 
     /// What cannot be read is never named: a locked platform of an unknown
-    /// system, and every platform when a build is of one.
+    /// system, and every platform but `ruby` when a build is of one. The
+    /// answer then says it is not the whole of it.
     #[test]
     fn unreadable_platforms_are_never_named() {
         let builds = vec!["x86_64-linux".to_string()];
         assert_eq!(
             unserved_platforms(&["x86_64-freebsd14", "arm64-darwin", "ruby"], &builds),
-            ["arm64-darwin", "ruby"]
+            Unserved {
+                platforms: vec!["arm64-darwin", "ruby"],
+                complete: false
+            }
         );
         let odd = vec!["x86_64-linux".to_string(), "x86_64-freebsd14".to_string()];
         assert_eq!(
-            unserved_platforms(&["arm64-darwin", "ruby", "x86_64-freebsd14"], &odd),
-            ["ruby"]
+            unserved_platforms(&["arm64-darwin", "ruby"], &odd),
+            Unserved {
+                platforms: vec!["ruby"],
+                complete: false
+            }
         );
+    }
+
+    /// Names RubyGems reads as another system, or as an x86 CPU, are read
+    /// the same way here.
+    #[test]
+    fn names_rubygems_reads_first_are_not_taken_for_linux_or_darwin() {
+        for name in [
+            "x86_64-freebsd-linux",
+            "powerpc-aix-darwin",
+            "x86_64-cygwin",
+        ] {
+            assert_eq!(GemPlatform::parse(name), None, "{name}");
+        }
+        let odd = GemPlatform::parse("xi386y-linux").unwrap();
+        assert_eq!(odd.cpu.as_deref(), Some("x86"));
     }
 }

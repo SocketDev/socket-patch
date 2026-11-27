@@ -769,11 +769,6 @@ fn parse_checksum(entry: &str) -> Option<((&str, &str), Option<String>)> {
 mod tests {
     use super::*;
 
-    /// Section spans, remote line numbers and DEPENDENCIES entries: what the
-    /// hosted lock writer splices by. Blank (and whitespace-only) separator
-    /// lines belong to the section they follow; a CRLF lock gives the same
-    /// numbers as its LF spelling, and the last section runs to the last
-    /// line whether or not the file ends with a newline.
     #[test]
     fn locked_platforms_are_the_lines_of_the_platforms_section() {
         let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.2.6)\n\nPLATFORMS\n  arm64-darwin\n  ruby\n\nDEPENDENCIES\n  rack\n\nBUNDLED WITH\n   2.5.22\n";
@@ -785,6 +780,11 @@ mod tests {
         assert!(locked_platforms("GEM\n  specs:\n    rack (3.2.6)\n").is_empty());
     }
 
+    /// Section spans, remote line numbers and DEPENDENCIES entries: what the
+    /// hosted lock writer splices by. Blank (and whitespace-only) separator
+    /// lines belong to the section they follow; a CRLF lock gives the same
+    /// numbers as its LF spelling, and the last section runs to the last
+    /// line whether or not the file ends with a newline.
     #[test]
     fn section_spans_remote_lines_and_dependency_entries() {
         let lf = "GEM\n  remote: https://a.example/\n  specs:\n    rack (3.1.0)\n\nGEM\n  remote: https://b.example/\n  specs:\n    rails (7.0.0)\n      rack\n \n\nPATH\n  remote: .\n  specs:\n    app (0.1.0)\n\nDEPENDENCIES\n  app!\n  rack\n  rack (~> 3.1)\n  rails (= 7.0.0)!\n   nested (1.0)\n\nBUNDLED WITH\n   2.6.2\n\n";
