@@ -783,8 +783,9 @@ fn platform_lock_refusal(
         return Some((
             "platform_gem_unsupported",
             format!(
-                "{GEMFILE_LOCK} locks `{name} ({version})` (the ruby platform) beside the platform gems {}: a vendored directory of prebuilt platform gems has nothing for the ruby platform, and bundler never builds a `path:` gem's extensions. Remove the ruby platform from the lock (`bundle lock --remove-platform ruby`) to vendor {name}",
-                entries.join(", ")
+                "{GEMFILE_LOCK} locks `{name} ({version})` (the ruby platform) beside the platform gems {}: a vendored directory of prebuilt platform gems has nothing for the ruby platform, and bundler never builds a `path:` gem's extensions. {} to vendor {name}",
+                entries.join(", "),
+                plain_entry_remedy(&locked.platforms, lock_text)
             ),
         ));
     }
@@ -807,6 +808,37 @@ fn platform_lock_refusal(
             "{GEMFILE_LOCK} locks `{name}` as precompiled platform gems and {written_by}: a vendored directory of prebuilt platform gems needs Bundler {major}.{minor} or later, the oldest it is verified on. Re-lock with Bundler {major}.{minor} or later (`bundle update --bundler`) to vendor {name}"
         ),
     ))
+}
+
+/// How to drop the plain `name (version)` entry of a gem whose platform
+/// builds are `builds` from the lock `lock_text` (#2284). Bundler keeps
+/// that entry for `ruby` and for every other locked platform that none of
+/// the builds serves, so `bundle lock --remove-platform ruby` alone clears
+/// it only when `ruby` is the one such platform. The remedy names each of
+/// them, and none when the lock shows none (no `PLATFORMS`, or a platform
+/// [`crate::formats::gem::platform`] cannot read).
+///
+/// SECURITY: `PLATFORMS` is a committed, tamper-able section and the
+/// remedy is a command the user copies, so only a platform in the plain
+/// gem-token charset is printed.
+fn plain_entry_remedy(builds: &[String], lock_text: &str) -> String {
+    let locked: Vec<&str> = crate::formats::gem::locked_platforms(lock_text)
+        .into_iter()
+        .filter(|platform| is_platform_dir_name(platform))
+        .collect();
+    let kept_for = crate::formats::gem::platform::unserved_platforms(&locked, builds);
+    match kept_for.as_slice() {
+        [] => "Bundler keeps that entry for a locked platform that none of those builds serves. Remove that platform from the lock (`bundle lock --remove-platform <platform>`)".to_string(),
+        ["ruby"] => "Remove the ruby platform from the lock (`bundle lock --remove-platform ruby`)".to_string(),
+        platforms => {
+            let named: Vec<String> = platforms.iter().map(|p| format!("`{p}`")).collect();
+            format!(
+                "Bundler keeps that entry for each locked platform that none of those builds serves: {}. Remove each of them from the lock, if the project is not installed there (`bundle lock --remove-platform {}`),",
+                named.join(", "),
+                platforms.join(" ")
+            )
+        }
+    }
 }
 
 /// The [`platform_lock_refusal`]s of [`gem_lock_refusals`].

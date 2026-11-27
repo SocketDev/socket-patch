@@ -24,6 +24,7 @@ pub(crate) mod gemspec;
 pub(crate) mod hosted;
 pub(crate) mod manifest;
 pub(crate) mod mirror;
+pub(crate) mod platform;
 pub(crate) mod ruby;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -677,6 +678,26 @@ pub(crate) fn listed_specs(lock: &str) -> HashSet<(&str, &str)> {
         .collect()
 }
 
+/// The platforms the Bundler lock `lock` names under `PLATFORMS`, in file
+/// order, as written (`ruby` among them when it is locked). Empty for a
+/// lock without the section. CRLF is tolerated.
+pub(crate) fn locked_platforms(lock: &str) -> Vec<&str> {
+    let mut platforms = Vec::new();
+    let mut in_platforms = false;
+    for raw in lock.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with(' ') {
+            in_platforms = line.trim_end() == "PLATFORMS";
+        } else if in_platforms {
+            platforms.push(line.trim());
+        }
+    }
+    platforms
+}
+
 /// The plain gem-token charset (letters, digits, `.`, `_`, `-`). The vendor
 /// backend applies it before embedding coordinates into Ruby source and lock
 /// line grammar (see the SECURITY note in `crate::vendor::gem`'s
@@ -753,6 +774,17 @@ mod tests {
     /// lines belong to the section they follow; a CRLF lock gives the same
     /// numbers as its LF spelling, and the last section runs to the last
     /// line whether or not the file ends with a newline.
+    #[test]
+    fn locked_platforms_are_the_lines_of_the_platforms_section() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.2.6)\n\nPLATFORMS\n  arm64-darwin\n  ruby\n\nDEPENDENCIES\n  rack\n\nBUNDLED WITH\n   2.5.22\n";
+        assert_eq!(locked_platforms(lock), ["arm64-darwin", "ruby"]);
+        assert_eq!(
+            locked_platforms(&lock.replace('\n', "\r\n")),
+            ["arm64-darwin", "ruby"]
+        );
+        assert!(locked_platforms("GEM\n  specs:\n    rack (3.2.6)\n").is_empty());
+    }
+
     #[test]
     fn section_spans_remote_lines_and_dependency_entries() {
         let lf = "GEM\n  remote: https://a.example/\n  specs:\n    rack (3.1.0)\n\nGEM\n  remote: https://b.example/\n  specs:\n    rails (7.0.0)\n      rack\n \n\nPATH\n  remote: .\n  specs:\n    app (0.1.0)\n\nDEPENDENCIES\n  app!\n  rack\n  rack (~> 3.1)\n  rails (= 7.0.0)!\n   nested (1.0)\n\nBUNDLED WITH\n   2.6.2\n\n";
