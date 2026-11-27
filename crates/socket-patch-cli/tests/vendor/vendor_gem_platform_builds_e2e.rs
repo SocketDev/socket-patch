@@ -675,8 +675,9 @@ async fn a_platform_locked_gem_vendors_and_reports_per_platform_gem() {
     );
 
     // 5. A damaged tree: the check fails per platform gem, and the next
-    //    run rebuilds the copy from the patches the ledger records, asked
-    //    for in one request (the gem patch's reference is not needed).
+    //    run rebuilds the copy. The gem patch's reference says which patch
+    //    each platform's gem is (the ledger must name the same ones), then
+    //    those patches are asked for in one request.
     std::fs::write(tree(root, LINUX).join(SO), b"another binary").unwrap();
     let (code, env, stderr) = run_json(root, &["vendor", "--check", "--json"], &server.uri());
     assert_eq!(code, 1, "{env:#}\n{stderr}");
@@ -689,8 +690,45 @@ async fn a_platform_locked_gem_vendors_and_reports_per_platform_gem() {
     assert_per_platform_gem(&env, "skipped", "already_vendored");
     assert_eq!(
         reference_requests(&server).await[before..],
-        [vec![DARWIN_UUID.to_string(), LINUX_UUID.to_string()]]
+        [
+            vec![UUID.to_string()],
+            vec![DARWIN_UUID.to_string(), LINUX_UUID.to_string()]
+        ]
     );
+    assert_eq!(
+        std::fs::read(tree(root, LINUX).join(SO)).unwrap(),
+        LINUX.as_bytes()
+    );
+
+    // 5b. The ledger is committed data, and it does not choose what is
+    //     unpacked: with the patch of the linux tree edited to another
+    //     served patch, the damaged tree is not rebuilt from it. The run
+    //     fails, downloads nothing and leaves the tree as it was.
+    let state_path = root.join(".socket/vendor/state.json");
+    let honest = std::fs::read_to_string(&state_path).unwrap();
+    std::fs::write(&state_path, honest.replace(LINUX_UUID, DARWIN_UUID)).unwrap();
+    std::fs::write(tree(root, LINUX).join(SO), b"another binary").unwrap();
+    let fetched = downloads(&server).await.len();
+    let (code, env, stderr) = run_json(root, VENDOR, &server.uri());
+    assert_ne!(code, 0, "{env:#}\n{stderr}");
+    assert!(
+        env.to_string()
+            .contains("is not the patch the gem's fix names for that platform"),
+        "{env:#}"
+    );
+    assert_eq!(
+        downloads(&server).await.len(),
+        fetched,
+        "nothing is downloaded"
+    );
+    assert_eq!(
+        std::fs::read(tree(root, LINUX).join(SO)).unwrap(),
+        b"another binary",
+        "nothing is unpacked"
+    );
+    std::fs::write(&state_path, honest).unwrap();
+    let (code, env, stderr) = run_json(root, VENDOR, &server.uri());
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
     assert_eq!(
         std::fs::read(tree(root, LINUX).join(SO)).unwrap(),
         LINUX.as_bytes()

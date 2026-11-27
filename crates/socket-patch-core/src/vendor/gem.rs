@@ -1826,18 +1826,21 @@ struct BuildSource {
     platform: String,
     uuid: String,
     pinned: BuildPin,
-    /// The files of this build's own patch as the ledger entry being
-    /// restored records them; `None` asks the patch service for them.
-    files: Option<BTreeMap<String, PatchFileInfo>>,
 }
 
 enum BuildPin {
     /// sha256 (hex) of the `.gem` the gem patch's registry lists for the
     /// platform (`gemBuilds[].gemChecksumSha256`).
     Registry(String),
-    /// sha512 (SRI) of the `.gem` and of the stub gemspec the ledger
-    /// recorded when the tree was vendored. An empty one pins nothing.
-    Ledger { gem: String, gemspec: String },
+    /// A restore: the sha256 the gem patch's registry lists for the
+    /// platform today, and the sha512 (SRI) of the `.gem` and of the stub
+    /// gemspec the ledger recorded when the tree was vendored. Neither
+    /// ledger pin is empty ([`recorded_build_sources`]).
+    Restored {
+        sha256: String,
+        gem: String,
+        gemspec: String,
+    },
 }
 
 /// `a`, `a and b`, `a, b and c`.
@@ -1959,7 +1962,6 @@ async fn locked_build_sources(
                 platform: platform.clone(),
                 uuid: uuid.to_string(),
                 pinned: BuildPin::Registry(build.gem_checksum_sha256.clone()),
-                files: None,
             }),
             None => missing.yet.push(platform),
         }
@@ -1969,6 +1971,104 @@ async fn locked_build_sources(
     }
     let patched: Vec<&str> = sources.iter().map(|s| s.platform.as_str()).collect();
     Err(no_patched_build(trees, &missing, &patched))
+}
+
+/// The sources of the trees a ledger entry records, for a restore.
+///
+/// SECURITY: the ledger is committed, tamper-able data, and it must not
+/// choose what is unpacked as a gem's tree. A restore unpacks what the
+/// gem's fix names for each platform today ([`locked_build_sources`]):
+/// the patch the entry records for a tree must be that one, and the entry
+/// must pin the gem and the gemspec that tree was vendored from (an entry
+/// that pins none is refused). The downloads then have to be both the gem
+/// the fix's registry lists and the ones the entry pins, and the tree is
+/// held to the record the patch service serves now, never to file hashes
+/// the ledger supplies. An entry that fails this is refused before
+/// anything is downloaded.
+async fn recorded_build_sources(
+    cfg: &VendorServiceConfig,
+    fix: &str,
+    name: &str,
+    trees: &PlatformTrees<'_>,
+    builds: &[GemBuildEntry],
+) -> Result<Vec<BuildSource>, Box<VendorOutcome>> {
+    let policy = ServicePolicy::Refused;
+    let platforms: Vec<String> = builds.iter().map(|b| b.platform.clone()).collect();
+    let listed = locked_build_sources(cfg, fix, name, trees, &platforms).await?;
+    let mut sources = Vec::with_capacity(builds.len());
+    for (built, listed) in builds.iter().zip(listed) {
+        let refuse = |why: String| {
+            policy.hard(
+                "vendor_prebuilt_integrity_mismatch",
+                format!(
+                    "the vendor ledger's entry for the platform gem for {name} ({}) {why}; \
+                     refusing to restore it",
+                    built.platform
+                ),
+            )
+        };
+        if !built.uuid.eq_ignore_ascii_case(&listed.uuid) {
+            return Err(refuse(format!(
+                "names patch {}, which is not the patch the gem's fix names for that platform \
+                 ({})",
+                built.uuid, listed.uuid
+            )));
+        }
+        if built.gem_integrity.is_empty() || built.gemspec_integrity.is_empty() {
+            return Err(refuse(
+                "pins no digest for the gem or the gemspec it was vendored from".to_string(),
+            ));
+        }
+        let BuildPin::Registry(sha256) = listed.pinned else {
+            return Err(refuse("has no gem the patch registry lists".to_string()));
+        };
+        sources.push(BuildSource {
+            platform: listed.platform,
+            uuid: listed.uuid,
+            pinned: BuildPin::Restored {
+                sha256,
+                gem: built.gem_integrity.clone(),
+                gemspec: built.gemspec_integrity.clone(),
+            },
+        });
+    }
+    Ok(sources)
+}
+
+/// Refuses a stub gemspec that is not the one of the platform gem being
+/// restored: its name, version and platform must be the ledger entry's
+/// (`gem` is `<name>@<version>`). A stub that states no platform is the
+/// ruby-platform gem's, which no platform tree holds.
+fn refuse_foreign_stub(
+    policy: ServicePolicy<'_>,
+    gem: &str,
+    platform: &str,
+    subject: &str,
+    stub_text: &str,
+) -> Result<(), Box<VendorOutcome>> {
+    let stated = |attr: &str| {
+        let rhs = gemspec_attr_rhs(stub_text, &[attr])
+            .into_iter()
+            .next_back()?;
+        let value = rhs.trim_end_matches(".freeze").trim();
+        Some(value.trim_matches(|c| c == '"' || c == '\'').to_string())
+    };
+    let (name, version) = gem.rsplit_once('@').unwrap_or((gem, ""));
+    let want = [("name", name), ("version", version), ("platform", platform)];
+    match want
+        .iter()
+        .find(|(attr, want)| stated(attr).as_deref() != Some(*want))
+    {
+        None => Ok(()),
+        Some((attr, want)) => Err(policy.hard(
+            "vendor_prebuilt_integrity_mismatch",
+            format!(
+                "the stub gemspec served for {subject} is not that gem's (its {attr} is {}, \
+                 not {want}); refusing to restore it",
+                stated(attr).unwrap_or_else(|| "not stated".to_string())
+            ),
+        )),
+    }
 }
 
 /// One platform tree whose patch the service serves: its source, how
@@ -2044,17 +2144,15 @@ async fn served_builds<'a>(
 /// tree is verified against. A platform gem is a patch of its own, so
 /// these are not the files of the gem's fix: a compiled build changes
 /// binaries the fix does not name, and the service stamps the files of
-/// each patch with that patch's own header. Taken from the ledger entry
-/// being restored where it records them, else from that patch's record:
-/// ONE request per platform, asked without file contents.
+/// each patch with that patch's own header. Read from that patch's
+/// record, on a restore too (a ledger is committed data, and what it says
+/// a tree holds is not evidence): ONE request per platform, asked without
+/// file contents.
 async fn build_files(
     cfg: &VendorServiceConfig,
     source: &BuildSource,
     subject: &str,
 ) -> Result<BTreeMap<String, PatchFileInfo>, Box<VendorOutcome>> {
-    if let Some(files) = &source.files {
-        return Ok(files.clone());
-    }
     let policy = ServicePolicy::Refused;
     let Some(client) = cfg.client.as_ref() else {
         return Err(policy.miss("vendor service not configured".to_string()));
@@ -2117,18 +2215,9 @@ async fn stage_platform_builds(
         BuildsFrom::Locked(platforms) => {
             locked_build_sources(cfg, &record.uuid, name, trees, platforms).await?
         }
-        BuildsFrom::Recorded(builds) => builds
-            .iter()
-            .map(|built| BuildSource {
-                platform: built.platform.clone(),
-                uuid: built.uuid.clone(),
-                pinned: BuildPin::Ledger {
-                    gem: built.gem_integrity.clone(),
-                    gemspec: built.gemspec_integrity.clone(),
-                },
-                files: (!built.files.is_empty()).then(|| built.files.clone()),
-            })
-            .collect(),
+        BuildsFrom::Recorded(builds) => {
+            recorded_build_sources(cfg, &record.uuid, name, trees, builds).await?
+        }
     };
 
     let builds = served_builds(cfg, name, trees, &sources).await?;
@@ -2154,7 +2243,11 @@ async fn stage_platform_builds(
         let (gem_bytes, stub_bytes, files) = downloaded?;
         let own: HashMap<String, PatchFileInfo> = files.clone().into_iter().collect();
         let platform = source.platform.as_str();
-        refuse_unusable_stub(policy, name, subject, &String::from_utf8_lossy(&stub_bytes))?;
+        let stub_text = String::from_utf8_lossy(&stub_bytes);
+        refuse_unusable_stub(policy, name, subject, &stub_text)?;
+        if matches!(trees.from, BuildsFrom::Recorded(_)) {
+            refuse_foreign_stub(policy, trees.gem, platform, subject, &stub_text)?;
+        }
 
         let tree = stage.join(platform);
         if let Err(e) = tokio::fs::create_dir_all(&tree).await {
@@ -2238,18 +2331,17 @@ impl BuildPin {
                 format!("patched platform gem for {subject} {why}; refusing to vendor it"),
             )
         };
+        let (Self::Registry(listed) | Self::Restored { sha256: listed, .. }) = self;
+        let sha256 = crate::utils::digest::sha256_hex_of(gem);
+        if !sha256.eq_ignore_ascii_case(listed) {
+            return Err(mismatch(format!(
+                "is not the gem the patch registry lists for that platform (sha256 {sha256}, \
+                 listed {listed})"
+            )));
+        }
         match self {
-            Self::Registry(listed) => {
-                let sha256 = crate::utils::digest::sha256_hex_of(gem);
-                match sha256.eq_ignore_ascii_case(listed) {
-                    true => Ok(()),
-                    false => Err(mismatch(format!(
-                        "is not the gem the patch registry lists for that platform (sha256 \
-                         {sha256}, listed {listed})"
-                    ))),
-                }
-            }
-            Self::Ledger { gem: recorded, .. } => {
+            Self::Registry(_) => Ok(()),
+            Self::Restored { gem: recorded, .. } => {
                 Self::check_recorded(gem, recorded).map_err(|why| {
                     mismatch(format!(
                         "is not the gem this copy was vendored from ({why})"
@@ -2261,7 +2353,7 @@ impl BuildPin {
 
     /// [`Self::check_gem`] for the stub gemspec, which only the ledger pins.
     fn check_stub(&self, stub: &[u8], subject: &str) -> Result<(), Box<VendorOutcome>> {
-        let Self::Ledger { gemspec, .. } = self else {
+        let Self::Restored { gemspec, .. } = self else {
             return Ok(());
         };
         Self::check_recorded(stub, gemspec).map_err(|why| {
@@ -2276,9 +2368,6 @@ impl BuildPin {
     }
 
     fn check_recorded(bytes: &[u8], recorded: &str) -> Result<(), String> {
-        if recorded.is_empty() {
-            return Ok(());
-        }
         // The Sri verifier never reads the name arg.
         artifact_matches_integrity(bytes, "", &LockIntegrity::Sri(recorded.to_string()))
     }
@@ -14510,14 +14599,39 @@ mod tests {
                     reason: "file_not_found".to_string()
                 }
             );
+            // SECURITY: the ledger is committed data, and it does not choose
+            // what is unpacked as the gem's tree. An entry edited to name
+            // another served patch for a tree, or one that pins no digest
+            // for it, is refused before anything is downloaded.
+            let fetched = downloads(&server).await.len();
+            let mut other_patch = entry.clone();
+            other_patch.gem_builds[1].uuid = build_uuid(UUID, DARWIN);
+            let mut no_pin = entry.clone();
+            no_pin.gem_builds[1].gem_integrity.clear();
+            for (edited, why) in [
+                (&other_patch, "is not the patch the gem's fix names"),
+                (&no_pin, "pins no digest"),
+            ] {
+                let refused = crate::vendor::redownload::restore(&root, edited, &record, &cfg)
+                    .await
+                    .expect_err("an edited ledger entry is refused");
+                assert!(format!("{refused:?}").contains(why), "{refused:?}");
+                assert!(!tree.exists(), "nothing is unpacked: {why}");
+                assert_eq!(downloads(&server).await.len(), fetched, "{why}");
+            }
+
             let asked = reference_requests(&server).await.len();
             crate::vendor::redownload::restore(&root, &entry, &record, &cfg)
                 .await
                 .expect("restore");
             assert_eq!(
                 reference_requests(&server).await[asked..],
-                [vec![build_uuid(UUID, DARWIN), build_uuid(UUID, LINUX)]],
-                "one request, for the patches the ledger records"
+                [
+                    vec![UUID.to_string()],
+                    vec![build_uuid(UUID, DARWIN), build_uuid(UUID, LINUX)]
+                ],
+                "the fix's reference, which names each platform's patch, then one request \
+                 for those patches"
             );
             assert_eq!(
                 check_vendored_artifact(&root, &entry, &record).await,
