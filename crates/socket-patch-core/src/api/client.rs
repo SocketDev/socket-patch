@@ -1118,12 +1118,19 @@ impl ApiClient {
     /// the query, so there this is the plain view. `Ok(None)` for a patch
     /// that is not there.
     pub async fn fetch_patch_summary(&self, uuid: &str) -> Result<Option<PatchResponse>, ApiError> {
+        self.get_json(&self.summary_path(uuid), Bare404::NotFound)
+            .await
+    }
+
+    /// The path of patch `uuid`'s view without its file contents: the
+    /// authenticated API leaves them out on request, and the public proxy
+    /// serves one cached view per patch whatever the query.
+    fn summary_path(&self, uuid: &str) -> String {
         let query = match &self.route {
             ApiRoute::Org { .. } => "?include_blobs=false",
             ApiRoute::Proxy => "",
         };
-        let path = self.patches_path(&format!("view/{uuid}{query}"));
-        self.get_json(&path, Bare404::NotFound).await
+        self.patches_path(&format!("view/{uuid}{query}"))
     }
 
     /// [`Self::fetch_patch_summary`] for a vendoring run, asked of the host
@@ -1136,15 +1143,8 @@ impl ApiClient {
         uuid: &str,
         vendor_url: Option<&str>,
     ) -> Result<Option<PatchResponse>, ApiError> {
-        let Some(base) = vendor_url else {
-            return self.fetch_patch_summary(uuid).await;
-        };
-        let query = match &self.route {
-            ApiRoute::Org { .. } => "?include_blobs=false",
-            ApiRoute::Proxy => "",
-        };
-        let path = self.patches_path(&format!("view/{uuid}{query}"));
-        self.get_json_at(base.trim_end_matches('/'), &path, Bare404::NotFound)
+        let base = vendor_url.map_or(self.api_url.as_str(), |base| base.trim_end_matches('/'));
+        self.get_json_at(base, &self.summary_path(uuid), Bare404::NotFound)
             .await
     }
 
@@ -1160,11 +1160,7 @@ impl ApiClient {
         &self,
         uuid: &str,
     ) -> Result<Option<PatchStatistics>, ApiError> {
-        let query = match &self.route {
-            ApiRoute::Org { .. } => "?include_blobs=false",
-            ApiRoute::Proxy => "",
-        };
-        let path = self.patches_path(&format!("view/{uuid}{query}"));
+        let path = self.summary_path(uuid);
         let view: Option<PatchStatisticsView> = self.get_json(&path, Bare404::NotFound).await?;
         Ok(view.and_then(|view| view.statistics))
     }
