@@ -3,7 +3,7 @@
 
 [agent] This comment is the register for the architecture refactor routine. It is rendered from `register/10-refactor.md` on the [`arch-audit/ledger`](https://github.com/SocketDev/socket-patch/tree/arch-audit/ledger) branch, and the routine updates it on every run.
 
-_Last updated 2026-11-27 · 20 runs under this charter · `main` at cfc870f when examined._
+_Last updated 2026-11-27 · 21 runs under this charter · `main` at cfc870f when examined._
 
 ### In flight
 | PR | Issue | State |
@@ -14,7 +14,7 @@ _Last updated 2026-11-27 · 20 runs under this charter · `main` at cfc870f when
 
 `hosted-e2e` is red on all three: it needs #2270 (a production gem patch the suite does not pin; #2280 is open for it), then a re-run. Three are open: the next run opens none (step 3).
 
-**Next PR:** #2301 (a cleanup that deletes the project's own files), then #2303 (a gem reported as patched that Bundler does not install), #2287 (a printed credential), #2290 (a `remove` that reports success), #2299 (a failed patch upgrade that strands the project), #2286 and #2289: the most harm. Then #2259 (core `utils/hatch.rs`), #2294, #2296, #2271, L22 (once #2261 merges: same function), #647, #1917, #1926, #1860, #1836: each ran. #2277 and #2297 wait for a maintainer's answer.
+**Next PR:** #2301 (a cleanup that deletes the project's own files), then #2303 (a gem reported as patched that Bundler does not install), #2305 (a crate reported as patched that cargo builds unpatched), #2287 (a printed credential), #2290 (a `remove` that reports success), #2299 (a failed patch upgrade that strands the project), #2286 and #2289: the most harm. Then #2259 (core `utils/hatch.rs`), #2294, #2296, #2271, L22 (once #2261 merges: same function), #647, #1917, #1926, #1860, #1836, #2306: each ran. #2277 and #2297 wait for a maintainer's answer.
 
 ### Merged
 | PR | Fixed |
@@ -37,8 +37,7 @@ L01 to L18 came from earlier audits, the rest from this routine. A row is a hypo
 | L09, L15, L26–L29, L31, L32, L35, L39, L45 | (collapsed) | core `api/`, `telemetry.rs`, `patch/redirect/`, CLI `list.rs`, `vendor.rs`, `scan/gc.rs`, `scan/mod.rs`, `vlt_heal.rs`, `scan/withdrawn.rs` | out of charter; L09, L15, L26 and L31 (ran) need a decision the contract doesn't settle. The contract allows L27 (ran), L28, L29, L32 (ran) and L35 (ran). L39 (ran): the contract's telemetry list omits a `ci` flag. L45 (ran): a hosted rescan does not rewrite a `pom.xml` pin's lost `.mvn/` checksum files, optional by contract. Evidence in the entries |
 | L14 | scala-cli `discover` collapses unreadable files and cap breaches into `None`, so the user is told to run `scala-cli compile` | core JVM crawlers | to verify; read: no real project reaches the caps. Open: a non-project `.json` in Bloop's directory. Needs scala-cli |
 | L22 | the prune GC raises no Go undo warning after it reverts a vendored Go module | CLI `vendor.rs` `run_vendor_gc` | filed #1910 (its last bullet); ran it: `scan --prune` says nothing where the undo commands warn (#1778) |
-| L25, L30, L33, L34, L36–L38, L40–L43 | (collapsed) | six CLI commands, core `patch/rollback.rs`, `crawlers/npm_crawler.rs`, `vendor/`, `policy/socket_yml.rs`, CLI `vendor.rs`, `remove.rs`, `scan/render.rs`, `agent_download.rs`, `get.rs`, core `manifest/cleanup_blobs.rs` | filed #2271 (L25), #2277 (L30, a decision issue), #2286 (L33), #2287 (L34), #2289 (L36), #2290 (L37), #2294 (L38), #2296 (L40), #2297 (L41, a decision issue), #2299 (L42), #2301 (L43); each ran. Evidence in the issues |
-| L44 | a hosted gem pin whose `Gemfile` no longer names the patch source is confirmed from the lock's `remote:` line: the scan says `Patched 1 package` and `--vex` attests it | core `hosted/engine.rs` `confirm` | filed #2303; ran it: Bundler's frozen install fails over that pair, and a unit test beside the yarn berry twin fails on `main` |
+| L25, L30, L33, L34, L36–L38, L40–L44, L46, L47 | (collapsed) | CLI commands; core `patch/`, `crawlers/`, `vendor/`, `policy/`, `manifest/`, `formats/cargo/`: named in the issues | filed #2271 (L25), #2277 (L30, a decision issue), #2286 (L33), #2287 (L34), #2289 (L36), #2290 (L37), #2294 (L38), #2296 (L40), #2297 (L41, a decision issue), #2299 (L42), #2301 (L43), #2303 (L44), #2305 (L46), #2306 (L47); each ran. Evidence in the issues |
 
 Issues looked at:
 
@@ -47,7 +46,7 @@ Issues looked at:
 | #1910 | fixed in part (#2246); the still-wired bullet is in PR #2261; the Go undo warning is confirmed (L22) |
 | #1970 | to verify; read at da012af: eight docker suites still serve a 64-zero `beforeHash` and apply with `--force`. Only CI can run them |
 | #1014, #1963, #717, #815 | rejected and closed; each ran. Evidence in the entries |
-| #1917, #1926, #1860, #647, #1836 | confirmed; each ran: `App.CSPROJ` scans as 0 packages; `scan --sync` keeps, then prunes, a Cargo record over a cache file at neither hash; `list` prints bidi characters (beside #2271); `get`'s searches and `vendor`'s eject lack the public-proxy fallback; `get --json` orders `options[].vulnerabilities` at random |
+| #1917, #1926, #1860, #647, #1836 | confirmed; each ran: `App.CSPROJ` scans as 0 packages; `scan --sync` keeps, then prunes, a Cargo record; `list` prints bidi characters (beside #2271); `get` and `vendor`'s eject lack the public-proxy fallback; `get --json` orders `options[].vulnerabilities` at random |
 | 42 issues, named in the entries | out of charter; each ran or was read (14 read only) |
 | #1114 | fixed in part (#2229); the CI janitor holds the rest |
 | the other 29 open issues | out of charter by title, or "Decide:" issues (the 18:55Z entry). Every `arch-audit` issue open at 00:57Z on 2026-11-27 has been looked at |
@@ -58,28 +57,29 @@ Issues looked at:
 | the runs of 2026-11-25 and of 11-26 to 16:55Z: agent mode's undo, prune, output and broken inputs; `--json` / `--silent`; Gradle; the vlt heal; failing toolchains; credentials in project files; purl spellings; cache crawls | 2026-11-25, 11-26 | 332b3e8 to cfc870f | the PRs and issues above up to #2287; the rest clean |
 | hosted mode on the bench's 20 package managers (a planted credential, dry runs, rescans, rollback, `--json`, `--silent`, `--offline`); vendored mode on 8 (the round trip over CRLF, BOM and tab lockfiles, tampered artifacts, the undo commands, an installed copy at other bytes) | 2026-11-26 | cfc870f | four more sites of #2287; #2289, #2290; the rest clean |
 | the `socket.yml` policy and the selection filter; telemetry; `vex --grype-config`; the socket-cli config file; `scan`, `list` and `rollback` over a monorepo | 2026-11-26 | cfc870f | #2294, #2296, #2297; the rest clean |
-| the patch API failing mid-run under six commands; `report`; `--update`; a newer patch for a patched package; linked `.socket/` stores; the contract's `jq` recipes; `rollback` and `remove` targets; a manifest outside `.socket/`; the in-memory hosted engine against the disk scan (16 package managers); the update notice; each partial state of a hosted scan's writes under `scan`, `vex` and `scan --vex` | 2026-11-27 | cfc870f | #2299, #2301, #2303; the rest clean |
+| the patch API failing mid-run; `report`; `--update`; a newer patch for a patched package; linked `.socket/` stores; the contract's `jq` recipes; undo targets; a manifest outside `.socket/`; the in-memory hosted engine against the disk scan; the update notice; each partial state of a hosted scan's writes; the project-patch gate and Cargo's agent mode against real pnpm, Bun and cargo 1.97; a native-extension gem under a real Ruby | 2026-11-27 | cfc870f | #2299, #2301, #2303, #2305, #2306; the rest clean |
 
 ### Notes
 - Build with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0` on every cargo call, and give each checkout its own `CARGO_TARGET_DIR`, or the next call rebuilds everything. A cold CLI build takes 3 minutes, core's unit tests 4, a rebuild after an edit 25 seconds.
 - CI's clippy is `cargo clippy --locked --workspace --all-features -- -D warnings`. With `--all-targets` it fails on `main` in `tests/common` and `tests/prebuilt_common`.
 - `--cwd` defaults to `.`: absolutize it before walking `ancestors()`, and test via chdir under `#[serial]`. A test runner that pins `--cwd` must not also set the child's cwd to the project.
 - A write that returns 5xx may have landed: list before you retry.
-- Cite a path and line numbers, not a permalink: one came back wrapped in backticks (#2287).
-- Run the built binary over small broken projects and compare the commands. Set `SOCKET_TELEMETRY_DISABLED=1 SOCKET_NO_CONFIG=1`. For a patch API use the bench: `socket-patch-bench serve <pm>/hosted --bin <cli> --scale 0.02 --work-dir <dir>` builds a hosted project for any of 20 package managers, serves all three hosts and prints the command with its env (runner: the 18:55Z entry). Its env refuses outside registries, so an undo fails except for Hatch, Maven and Gradle. Fixtures: a refused token (06:55Z), a held `apply.lock` (08:56Z), a stand-in API over an npm monorepo (22:56Z), failure rules per route and a mock release host (00:55Z of 11-27).
+- Cite a path and line numbers, not a permalink (#2287).
+- Run the built binary over small broken projects and compare the commands. Set `SOCKET_TELEMETRY_DISABLED=1 SOCKET_NO_CONFIG=1`. For a patch API use the bench: `socket-patch-bench serve <pm>/hosted --bin <cli> --scale 0.02 --work-dir <dir>` builds a hosted project for any of 20 package managers, serves all three hosts and prints the command with its env (runner: the 18:55Z entry). Its env refuses outside registries, so an undo fails except for Hatch, Maven and Gradle. Fixtures: a refused token (06:55Z), a held `apply.lock` (08:56Z), a stand-in API over an npm monorepo (22:56Z), failure rules per route and a mock release host (00:55Z of 11-27), real cargo offline and a native gem (06:55Z).
 - Vendored mode runs on files alone, with `tests/prebuilt_common`'s `Server::project(<dir>)` held open by a throwaway ignored test as the vendor service (the 20:56Z entry). Building a test rebuilds `target/debug/socket-patch` with core's test features: keep the plain binary in a second target directory.
 - A throwaway probe test over the lead's input settles it in one rebuild. For a test that can't fail, mutate one production line and keep the diff (#2267).
-- The owner was notified of the three waiting PRs (2026-11-26 05:15Z), #2277, #2286, #2287, #2289, #2290, #2294, #2296, #2297, #2299, #2301 and #2303. Don't notify again for the waiting PRs alone, or for more sites of a filed issue.
+- The owner was notified of the three waiting PRs (2026-11-26 05:15Z), #2277, #2286, #2287, #2289, #2290, #2294, #2296, #2297, #2299, #2301, #2303, #2305 and #2306. Don't notify again for the waiting PRs alone, or for more sites of a filed issue.
 - Run `/code-review high` until a pass finds no real defect (#2261 took three), and the `cli` suite after touching any test file (it holds ratchets over `tests/`).
 - Most open `agent/*` PRs edit `CLI_CONTRACT.md`: far-apart hunks are fine (#2261 beside #2258).
 - `main` requires every review thread resolved: an open one blocks an approved PR with auto-merge armed, and nothing says so. Answer and resolve threads first. A push does not dismiss approvals.
 - Issue search works: `gh api -X GET search/issues -f q='repo:SocketDev/socket-patch is:issue is:open <words>'`. `git fetch --deepen=2500 origin main` makes `git log -S` usable.
-- This sandbox has node, npm, pnpm, yarn 1, bun, uv, poetry, ruby and bundler, composer, java 21, mvn, gradle 8.14.3 and PyYAML. It has no docker daemon, go, dotnet, sbt, scala-cli or deno, and refuses to run a binary downloaded during the run. Real-Gradle tests run: `SOCKET_PATCH_GRADLE_E2E_REQUIRED=1 cargo test --test e2e_gradle_agent_build -- --ignored <name>` (35 seconds).
+- This sandbox has node, npm, pnpm, yarn 1, bun, uv, poetry, ruby and bundler, composer, java 21, mvn, gradle 8.14.3, gcc, PyYAML, and cargo 1.97.0 outside the repository (1.93.1 inside). It has no docker daemon, go, dotnet, sbt, scala-cli or deno, and refuses to run a tool downloaded during the run (a binary, `npx`). Real-Gradle tests run: `SOCKET_PATCH_GRADLE_E2E_REQUIRED=1 cargo test --test e2e_gradle_agent_build -- --ignored <name>` (35 seconds).
 - Real-vlt legs run: `scripts/install-vlt.sh 1.2.0 <dir>` prints the path for `SOCKET_PATCH_VLT_E2E_JS` (set `_VERSION` and `_REQUIRED=1` too). The 01:34Z entry of 2026-11-26 seeds the harness's registry cache.
 - Root-sandbox failures that pass in CI: the chmod tests in `tests/repair` (2) and `in_process_redirect` (3), core `copy_tree` with a symlinked root, `vlt_heal` with an unremovable lock, and the `pypi_poetry`/`pypi_requirements` wire-failure tests.
 - To find unordered output, run one command six times over one fixture and count the distinct stdout hashes (#1836).
 - Run each layout the contract documents with the user's own files beside it (#2301), and each proper subset of a command's writes as a merge would leave them (#2303; the 04:55Z entry of 11-27 has the loop and a disk-against-memory runner).
 - To make a stat fail as root, use a symlink to itself; chmod doesn't stop root.
+- Ask the package manager what it reads, then compare: `cargo metadata` names the copy cargo builds (#2305). A key the real tool takes in several spellings is a list to run in full (#2306).
 - A prune GC test over a real revert needs no toolchain: hand-build a ledger entry as `apply_gc_reports_drift_kept_vendored_entry` (`scan/gc.rs`) does. The 06:55Z entry lists a vendored Go module's files; the 12:55Z one writes an agent-mode fixture that needs no server.
 - To find a leak, plant a token wherever a package manager writes a URL, run every mode and every undo, and grep (#2287). A hand-built venv needs `include-system-site-packages = false`.
 - A script named after a tool, first on `PATH`, is a failing (`exit 1`) or hanging (`exec sleep 600`) probe. The 14:55Z entry has the fixture for a patched global copy.
