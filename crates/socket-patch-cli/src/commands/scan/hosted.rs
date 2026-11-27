@@ -806,7 +806,7 @@ async fn gem_stale_install_warnings(
         std::collections::BTreeSet<String>,
     >,
     gem_upstream: &std::collections::BTreeMap<String, String>,
-    gem_build_patches: &std::collections::BTreeMap<String, String>,
+    gem_build_patches: &std::collections::BTreeMap<String, (String, String)>,
     views: &mut ViewFallback<'_>,
 ) -> StaleInstallOutcome {
     use socket_patch_core::crawlers::types::CrawlerOptions;
@@ -993,14 +993,11 @@ async fn gem_stale_install_warnings(
                 "{}-",
                 GemBuild::ruby(purl).map_or_else(String::new, |b| b.leaf)
             );
-            let lists_builds = |map: &std::collections::BTreeMap<String, String>| {
-                map.keys().any(|key| key.starts_with(&listed_prefix))
-            };
+            let listed = |key: &String| key.starts_with(&listed_prefix);
+            let lists_builds =
+                gem_build_patches.keys().any(listed) || gem_upstream.keys().any(listed);
             let platform_copy = GemBuild::of_leaf(purl, leaf).is_some_and(|b| b.platform.is_some());
-            if platform_copy
-                && !stands_in
-                && !gem_build_patches.contains_key(leaf)
-                && (lists_builds(gem_build_patches) || lists_builds(gem_upstream))
+            if platform_copy && !stands_in && !gem_build_patches.contains_key(leaf) && lists_builds
             {
                 continue;
             }
@@ -1037,8 +1034,24 @@ async fn gem_stale_install_warnings(
             // own: its files carry that patch's header (and, compiled, its
             // binaries), so the gem patch's record says nothing true of it.
             // Its archive judges it, else that build's own record (below).
+            use socket_patch_core::vex::gem_builds::{build_copy_evidence, BuildCopyEvidence};
             let own_patch = gem_build_patches.get(leaf);
+            let own_evidence = match own_patch {
+                Some((_, sha256)) => Some(build_copy_evidence(dir, Some(sha256)).await),
+                None => None,
+            };
             let judged = match local.filter(|_| own_patch.is_none()) {
+                _ if own_evidence.is_some() => match own_evidence {
+                    Some(BuildCopyEvidence::PatchedArchive) => Some(InstalledRecordJudgment {
+                        patched: true,
+                        stale_evidence: false,
+                    }),
+                    Some(BuildCopyEvidence::OtherArchive) => Some(InstalledRecordJudgment {
+                        patched: false,
+                        stale_evidence: true,
+                    }),
+                    _ => None,
+                },
                 Some(record) => {
                     let judged = judge_installed_record(dir, record).await;
                     if judged.patched
@@ -1059,7 +1072,7 @@ async fn gem_stale_install_warnings(
             match judged {
                 Some(judged) => entry.record(purl, judged),
                 None => {
-                    let record_of = own_patch.map_or(*uuid, String::as_str);
+                    let record_of = own_patch.map_or(*uuid, |(own, _)| own.as_str());
                     pending.push((dir.clone(), purl, record_of));
                 }
             }
@@ -1305,7 +1318,7 @@ async fn refresh_stale_gems(
         std::collections::BTreeSet<String>,
     >,
     gem_upstream: &std::collections::BTreeMap<String, String>,
-    gem_build_patches: &std::collections::BTreeMap<String, String>,
+    gem_build_patches: &std::collections::BTreeMap<String, (String, String)>,
     overrides: &[DepOverride],
     mirror_sources: &socket_patch_core::hosted::engine::MirrorSources,
     views: &mut ViewFallback<'_>,
@@ -2853,9 +2866,10 @@ async fn run_redirect_selected_untracked(
     let mut gem_upstream: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     // The platform builds that have a patch of their own, by leaf, each
-    // with that patch's uuid: its record, never the gem patch's, is what
-    // judges a copy of such a build that has no archive to go by.
-    let mut gem_build_patches: std::collections::BTreeMap<String, String> =
+    // with that patch's uuid and the sha256 of its gem: a copy of such a
+    // build is judged by its archive, else by that patch's record, and
+    // never by the gem patch's (`build_copy_evidence`).
+    let mut gem_build_patches: std::collections::BTreeMap<String, (String, String)> =
         std::collections::BTreeMap::new();
     // Of the pins the project's files hold alone: a gem's lock can stay
     // on one patch while another patch of the gem is skipped, and what the
@@ -2885,7 +2899,7 @@ async fn run_redirect_selected_untracked(
                     if build.platform != "ruby" {
                         gem_build_patches.insert(
                             format!("{}-{}-{}", o.name, o.version, build.platform),
-                            own.clone(),
+                            (own.clone(), build.gem_checksum_sha256.clone()),
                         );
                     }
                 }
@@ -5510,6 +5524,7 @@ mod tests {
             records,
             &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await
@@ -5790,6 +5805,7 @@ mod tests {
             &none,
             &shas,
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5808,6 +5824,7 @@ mod tests {
             &none,
             &shas,
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5821,6 +5838,7 @@ mod tests {
             &one_confirmed,
             &none,
             &shas,
+            &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
@@ -5857,6 +5875,7 @@ mod tests {
             &confirmed,
             &std::collections::BTreeMap::new(),
             &shas,
+            &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
@@ -5954,6 +5973,7 @@ mod tests {
             &none,
             &shas,
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut views,
         )
         .await;
@@ -5974,6 +5994,7 @@ mod tests {
             &one_confirmed(),
             &none,
             &shas,
+            &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             &mut views,
         )
@@ -6004,6 +6025,7 @@ mod tests {
                 None,
                 &one_confirmed(),
                 &none,
+                &std::collections::BTreeMap::new(),
                 &std::collections::BTreeMap::new(),
                 &std::collections::BTreeMap::new(),
                 &mut views,
@@ -6043,6 +6065,7 @@ mod tests {
             &one_confirmed(),
             &std::collections::BTreeMap::new(),
             &shas,
+            &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             &mut views,
         )
@@ -6160,6 +6183,7 @@ mod tests {
             &one_record(),
             &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -6234,6 +6258,7 @@ mod tests {
                 &records,
                 &shas,
                 &std::collections::BTreeMap::new(),
+                &std::collections::BTreeMap::new(),
                 &mut super::ViewFallback::offline(),
             )
             .await
@@ -6279,6 +6304,7 @@ mod tests {
             &confirmed,
             &records,
             &upper,
+            &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
@@ -6327,6 +6353,7 @@ mod tests {
             &one_record(),
             &shas,
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -6371,6 +6398,7 @@ mod tests {
             &one_record(),
             &shas,
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -6400,6 +6428,7 @@ mod tests {
             &one_record(),
             &patched_shas,
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -6423,6 +6452,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
@@ -6467,6 +6497,7 @@ mod tests {
             &one_record(),
             &shas,
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -6492,6 +6523,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
@@ -6520,6 +6552,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
@@ -6611,6 +6644,7 @@ mod tests {
             &one_record(),
             &shas,
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -6687,6 +6721,7 @@ mod tests {
                 &std::collections::BTreeMap::new(),
                 &shas,
                 upstream,
+                &std::collections::BTreeMap::new(),
                 &mut super::ViewFallback::offline(),
             )
             .await

@@ -4090,11 +4090,71 @@ async fn an_installed_copy_is_evidence_about_its_own_build_alone() {
     assert_eq!(said(out.doc()), both, "{out}");
     assert_eq!(out.envelope["status"], "success", "{out}");
 
-    // The patched build installed beside it, holding the patch.
-    install(LINUX, patched);
+    // The patched build installed beside it, in a gem home that keeps no
+    // archive of it. A platform gem is a patch of its own, whose files
+    // carry that patch's header: the gem patch's record says nothing of
+    // them. While the record of the build's own patch cannot be read,
+    // nothing judges the copy: the build is stated affected under the
+    // unknown-build warning, and the run succeeds.
+    let stamped = [
+        format!("# Socket Community Patch: {LINUX_UUID}\n").as_bytes(),
+        &patched[..],
+    ]
+    .concat();
+    install(LINUX, &stamped);
+    let out = vex(proj.path(), &api);
+    assert_eq!(out.code, Some(0), "{out}");
+    let statuses: Vec<&str> = out.doc()["statements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|statement| statement["status"].as_str())
+        .collect();
+    assert_eq!(statuses, ["affected", "affected"], "{out}");
+    assert!(
+        warning_codes(&out.envelope).contains(&"vex_gem_build_unknown".to_string()),
+        "{out}"
+    );
+
+    // With that record served, the copy is checked against it and the
+    // build is attested.
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{LINUX_UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uuid": LINUX_UUID, "purl": format!("{PURL}?platform={LINUX}"),
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": { "lib/platform_probe.rb": {
+                "beforeHash": vex_e2e_common::git_sha256(upstream),
+                "afterHash": vex_e2e_common::git_sha256(&stamped),
+            }},
+            "vulnerabilities": {},
+            "description": "x", "license": "MIT", "tier": "free",
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
     let out = vex(proj.path(), &api);
     assert_eq!(out.code, Some(0), "{out}");
     assert_eq!(said(out.doc()), both, "{out}");
+
+    // The archive the copy was installed from, where the gem home keeps
+    // it, comes first: the patched gem the listing names needs no record,
+    // and the copy's files are not read against one.
+    let cache = proj.path().join("vendor/bundle/ruby/3.3.0/cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(
+        cache.join(format!("{DEP}-{DEP_VERSION}-{LINUX}.gem")),
+        b"not the listed gem",
+    )
+    .unwrap();
+    let out = vex(proj.path(), &api);
+    assert_eq!(out.code, Some(0), "{out}");
+    vex_e2e_common::assert_not_attested(
+        &out.envelope,
+        &format!("{PURL}?platform={LINUX}"),
+        "not_applied",
+    );
+    std::fs::remove_dir_all(&cache).unwrap();
 
     // That copy still on upstream's files: the build is not attested, and
     // no build of the gem is, so the gem without a platform is affected.
@@ -4104,7 +4164,11 @@ async fn an_installed_copy_is_evidence_about_its_own_build_alone() {
     let mut unpatched = upstream_statement(ARM);
     unpatched.products.insert(0, PURL.to_string());
     assert_eq!(said(out.doc()), [unpatched], "{out}");
-    vex_e2e_common::assert_not_attested(&out.envelope, PURL, "not_applied");
+    vex_e2e_common::assert_not_attested(
+        &out.envelope,
+        &format!("{PURL}?platform={LINUX}"),
+        "not_applied",
+    );
     assert_eq!(out.envelope["status"], "partialFailure", "{out}");
 }
 

@@ -50,13 +50,55 @@ pub fn locked_gem_pins(lock: &str, name: &str, version: &str) -> Vec<LockedGemPi
 }
 
 /// The compact-index document in which the registry at `remote` (a lock's
-/// `remote:`) lists the gems of `name` it serves, one
-/// `<version>[-<platform>] <deps>|checksum:<sha256>` line each. `None` for
-/// a remote that is no http(s) URL or a name that is no plain gem token.
-pub fn gem_index_url(remote: &str, name: &str) -> Option<String> {
-    let http = remote.starts_with("https://") || remote.starts_with("http://");
-    (http && gem::is_plain_gem_token(name))
-        .then(|| format!("{}/info/{name}", remote.trim_end_matches('/')))
+/// `remote:`) lists the gems of `name` it serves: the one the hosted scan
+/// reads ([`crate::patch::redirect::gem_index_info_url`]), under the same
+/// rules for what is a registry URL and a gem name.
+pub use crate::patch::redirect::gem_index_info_url as gem_index_url;
+
+/// What judges an installed copy of a platform gem that has a patch of
+/// its own ([`build_copy_evidence`]).
+///
+/// A platform gem is a patch of its own: its files carry that patch's
+/// header and, for a compiled build, its binaries, so they are never the
+/// files of the gem's patch. Every judge of such a copy (the hosted scan's
+/// stale-install guard, `vex`) asks here, and none falls back to the
+/// record of the gem's patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildCopyEvidence {
+    /// The archive RubyGems installed the copy from is the patched gem
+    /// the gem patch's listing names for the platform: the copy is the
+    /// patched build, and no record is read.
+    PatchedArchive,
+    /// That archive is readable and is another gem.
+    OtherArchive,
+    /// The gem home keeps no readable archive of the copy (a pruned
+    /// `cache/`, `gem cleanup`): the record of the build's own patch
+    /// judges its files. Where that record cannot be read, nothing does.
+    OwnRecord,
+}
+
+/// The evidence at hand for the copy in `gem_dir` (`<home>/gems/<leaf>`)
+/// of a platform build whose patched gem the listing gives the sha256
+/// `listed` for; `None` where no listing names one (the pins of the run
+/// that moved the lock). The archive digest comes first: one hash of
+/// `<home>/cache/<leaf>.gem`, and no request.
+pub async fn build_copy_evidence(
+    gem_dir: &std::path::Path,
+    listed: Option<&str>,
+) -> BuildCopyEvidence {
+    let archive = (|| {
+        let leaf = gem_dir.file_name()?.to_str()?;
+        let home = gem_dir.parent()?.parent()?;
+        Some(home.join("cache").join(format!("{leaf}.gem")))
+    })();
+    let (Some(listed), Some(archive)) = (listed, archive) else {
+        return BuildCopyEvidence::OwnRecord;
+    };
+    match crate::vendor::file_sha256_hex(&archive).await {
+        Some(sha) if sha.eq_ignore_ascii_case(listed) => BuildCopyEvidence::PatchedArchive,
+        Some(_) => BuildCopyEvidence::OtherArchive,
+        None => BuildCopyEvidence::OwnRecord,
+    }
 }
 
 /// What a lock installs for one build of a gem on a patch registry.
@@ -137,6 +179,45 @@ pub fn gem_build_states(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The archive digest comes first, and only its absence leaves the
+    /// copy to the record of the build's own patch.
+    #[tokio::test]
+    async fn the_archive_of_a_platform_copy_is_its_first_evidence() {
+        use crate::utils::digest::sha256_hex_of;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let dir = home.join("gems").join("nokogiri-1.19.3-arm64-darwin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let patched = sha256_hex_of(b"patched gem");
+        let evidence = |listed: Option<&'static str>| {
+            let dir = dir.clone();
+            async move { build_copy_evidence(&dir, listed).await }
+        };
+        let listed: &'static str = Box::leak(patched.clone().into_boxed_str());
+
+        // A pruned cache: the record is all there is.
+        assert_eq!(evidence(Some(listed)).await, BuildCopyEvidence::OwnRecord);
+        let archive = home.join("cache").join("nokogiri-1.19.3-arm64-darwin.gem");
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        std::fs::write(&archive, b"patched gem").unwrap();
+        assert_eq!(
+            evidence(Some(listed)).await,
+            BuildCopyEvidence::PatchedArchive
+        );
+        assert_eq!(
+            evidence(Some(&listed.to_uppercase()).map(|s| &*Box::leak(s.clone().into_boxed_str())))
+                .await,
+            BuildCopyEvidence::PatchedArchive
+        );
+        std::fs::write(&archive, b"upstream gem").unwrap();
+        assert_eq!(
+            evidence(Some(listed)).await,
+            BuildCopyEvidence::OtherArchive
+        );
+        // No listing names the patched gem: an archive says nothing.
+        assert_eq!(evidence(None).await, BuildCopyEvidence::OwnRecord);
+    }
 
     const GEM_UUID: &str = "7b1e4f3a-2c5d-4e6f-8a9b-0c1d2e3f4a5b";
     const LINUX_UUID: &str = "2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e";
@@ -310,6 +391,11 @@ mod tests {
         );
         assert_eq!(
             gem_index_url("https://patch.example/r/", "../versions"),
+            None
+        );
+        // A URL with a query or a fragment is no registry address.
+        assert_eq!(
+            gem_index_url("https://patch.example/r/?x=1", "nokogiri"),
             None
         );
     }
