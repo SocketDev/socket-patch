@@ -1296,9 +1296,7 @@ fn discovery_after_writes<'d>(
             discovery,
             view_only,
         }) => (Some(&**discovery), *view_only),
-        Some(FinalDiscovery::Prior | FinalDiscovery::WithGrantOrigins { .. }) | None => {
-            (None, false)
-        }
+        Some(FinalDiscovery::Prior) | None => (None, false),
     };
     let candidate = match written {
         Written::Nothing => prior.or(overlaid),
@@ -2706,7 +2704,7 @@ async fn run_redirect_selected_untracked(
         let mut env = scan_result.take().unwrap_or_else(|| scan_envelope(common));
         let changes = pin_changes::compare(
             before_pins.as_deref(),
-            done.final_discovery.as_ref(),
+            done.pin_discovery(),
             &created_paths,
             &confirmed,
             done.rewritten.is_empty() && takeover_files.is_empty(),

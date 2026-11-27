@@ -1649,6 +1649,7 @@ mod tests {
                 pnpm_workspace_emptied: false,
                 workspace_symlinked: false,
                 final_discovery: None,
+                grant_origin_discovery: None,
             },
         }
     }

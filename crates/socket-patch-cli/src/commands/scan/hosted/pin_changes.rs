@@ -62,16 +62,10 @@ pub(super) fn compare<'a>(
     }
     let (
         Some(before),
-        Some(
-            FinalDiscovery::Overlaid {
-                discovery: after,
-                view_only,
-            }
-            | FinalDiscovery::WithGrantOrigins {
-                discovery: after,
-                view_only,
-            },
-        ),
+        Some(FinalDiscovery::Overlaid {
+            discovery: after,
+            view_only,
+        }),
     ) = (before, after)
     else {
         return HashMap::new();
