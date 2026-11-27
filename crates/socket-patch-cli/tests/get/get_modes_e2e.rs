@@ -256,7 +256,10 @@ async fn get_uuid_hosted_json_envelope_nests_redirect() {
     assert_eq!(
         v["events"],
         serde_json::json!([
-            { "action": "applied", "purl": PURL1, "uuid": UUID1, "details": { "mode": "hosted" } }
+            {
+                "action": "applied", "purl": PURL1, "uuid": UUID1,
+                "details": { "mode": "hosted", "pinChanged": true }
+            }
         ]),
         "{v:#}"
     );
@@ -599,7 +602,10 @@ async fn get_hosted_dry_run_json_envelope() {
     assert_eq!(
         v["events"],
         serde_json::json!([
-            { "action": "verified", "purl": PURL1, "uuid": UUID1, "details": { "mode": "hosted" } }
+            {
+                "action": "verified", "purl": PURL1, "uuid": UUID1,
+                "details": { "mode": "hosted", "pinChanged": true }
+            }
         ]),
         "{v:#}"
     );

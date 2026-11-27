@@ -2740,18 +2740,19 @@ pub struct Rewritten {
     /// In memory only: the trust auto-config would write through a
     /// symlinked `pnpm-workspace.yaml`.
     pub(crate) workspace_symlinked: bool,
-    /// The attribution gate's discovery of the project as this rewrite
-    /// leaves it, when it equals a discovery made with exactly
-    /// [`RewriteOptions::patch_server_origins`] (this run's grants name no
-    /// other origin). `None` when the gate discovered nothing (no
-    /// confirmed candidate) or counted another origin. A caller that
-    /// writes exactly [`RewriteResult::files`] and
-    /// [`RewriteResult::binary_files`] and nothing else may use it in place
-    /// of discovering the written project again (see [`FinalDiscovery`]).
+    /// The pin check's discovery when it used only [`RewriteOptions::patch_server_origins`].
     pub final_discovery: Option<FinalDiscovery>,
+    pub(super) grant_origin_discovery: Option<FinalDiscovery>,
 }
 
 impl Rewritten {
+    /// The discovery used to confirm pins, including any servers named by this run's grants.
+    pub fn pin_discovery(&self) -> Option<&FinalDiscovery> {
+        self.grant_origin_discovery
+            .as_ref()
+            .or(self.final_discovery.as_ref())
+    }
+
     /// Take the Maven rewriter's respelling of `.mvn/maven.config` back
     /// out of what this run writes and reports
     /// ([`crate::patch::redirect::withhold_maven_heal`]): for a caller that
@@ -2948,6 +2949,7 @@ pub async fn rewrite(
             copy_left,
             copy_shadowed,
             discovery,
+            used_grant_origins,
         } = unattributed_pins(
             view,
             &done,
@@ -2964,7 +2966,11 @@ pub async fn rewrite(
             done.rewrite.warnings.extend(lockless);
             done.rewrite.warnings.extend(copy_left);
             done.rewrite.bundled_skipped_uuids.extend(copy_shadowed);
-            done.final_discovery = discovery;
+            if used_grant_origins {
+                done.grant_origin_discovery = discovery;
+            } else {
+                done.final_discovery = discovery;
+            }
             return done;
         }
         kept.retain(|c| !vetoed.iter().any(|skip| skip.uuid == c.dep.patch_uuid));
@@ -3263,20 +3269,20 @@ async fn unattributed_pins(
             }
         })
         .collect();
-    let discovery = match (same_origins, fresh) {
-        (false, _) => None,
-        (true, None) => Some(FinalDiscovery::Prior),
-        (true, Some((fresh, view_only))) => Some(FinalDiscovery::Overlaid {
+    let discovery = match fresh {
+        None => FinalDiscovery::Prior,
+        Some((fresh, view_only)) => FinalDiscovery::Overlaid {
             discovery: Box::new(fresh),
             view_only,
-        }),
+        },
     };
     Gated {
         vetoed,
         lockless,
         copy_left,
         copy_shadowed,
-        discovery,
+        discovery: Some(discovery),
+        used_grant_origins: !same_origins,
     }
 }
 
@@ -3307,8 +3313,8 @@ struct Gated {
     /// The uuids of those pins, which the in-run VEX must not assume
     /// applied (joined into [`RewriteResult::bundled_skipped_uuids`]).
     copy_shadowed: BTreeSet<String>,
-    /// The discovery the verdict read, for [`Rewritten::final_discovery`].
     discovery: Option<FinalDiscovery>,
+    used_grant_origins: bool,
 }
 
 /// The caller's pre-rewrite discovery, when it is exactly what the gate
@@ -3777,6 +3783,7 @@ async fn rewrite_once(
         pnpm_workspace_emptied,
         workspace_symlinked,
         final_discovery: None,
+        grant_origin_discovery: None,
     }
 }
 
@@ -12672,16 +12679,18 @@ snapshots:
         assert_eq!(format!("{fresh:?}"), format!("{prior:?}"));
     }
 
-    /// A grant on a server the caller did not configure makes the gate count
-    /// another origin: its discovery is not the caller's, so the gate never
-    /// reuses the prior one and hands back none.
+    /// A discovery limited to configured servers misses pins on the grant's server.
     #[tokio::test]
-    async fn a_foreign_grant_origin_hands_back_no_discovery() {
+    async fn a_foreign_grant_origin_keeps_its_discovery_separate() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("package-lock.json"), LEFT_PAD_LOCK).unwrap();
         let done = gated_left_pad_rewrite(tmp.path(), &[], None).await;
         assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
         assert!(done.final_discovery.is_none());
+        assert!(matches!(
+            done.pin_discovery(),
+            Some(FinalDiscovery::Overlaid { .. })
+        ));
         write_rewrite(tmp.path(), &done);
         // Unwritten now, with a prior discovery made without the grant's
         // origin: still not reused.
@@ -12690,6 +12699,10 @@ snapshots:
         assert!(done.rewrite.files.is_empty());
         assert_eq!(done.confirmed.len(), 1);
         assert!(done.final_discovery.is_none());
+        assert!(matches!(
+            done.pin_discovery(),
+            Some(FinalDiscovery::Overlaid { .. })
+        ));
     }
 
     /// Nothing confirmed: the gate discovers nothing and hands back none.
@@ -12705,6 +12718,7 @@ snapshots:
         let done = gated_left_pad_rewrite(tmp.path(), &["https://patch.test"], Some(&prior)).await;
         assert!(done.confirmed.is_empty());
         assert!(done.final_discovery.is_none());
+        assert!(done.pin_discovery().is_none());
     }
 
     /// Only the install-policy auto-configs' root config files may be

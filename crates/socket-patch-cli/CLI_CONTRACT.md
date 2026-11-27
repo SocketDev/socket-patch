@@ -3111,11 +3111,13 @@ socket-patch scan --mode agent --json | jq '
 '
 ```
 
-Hosted pins a run wrote (dry run: `verified`), and why the rest were skipped:
+Hosted `scan` and `get` report `details.pinChanged` on each confirmed pin. A wet run reports an `applied` event. A dry run reports the planned result on a `verified` event. The value is `true` when the local dependency files show a new or updated hosted reference for this package and patch UUID. It is `false` when the recorded references stayed the same or the run rewrote nothing. Changes to a sibling package in the same lockfile do not count. A `null` value means the CLI could not determine the change, for example when it could not attribute the final reference to a package version. Older releases omit the field.
+
+To list confirmed pins and the changes the CLI could attribute:
 
 ```bash
 socket-patch scan --mode hosted --json | jq '
-  { pinned:  [.events[] | select(.details.mode == "hosted" and .action == "applied") | .purl],
+  { pinned:  [.events[] | select(.details.mode == "hosted" and (.action == "applied" or .action == "verified")) | {purl, uuid, changed: .details.pinChanged}],
     skipped: [.events[] | select(.action == "skipped") | {purl, code: .errorCode}],
     files:   .redirect.rewrittenFiles }
 '

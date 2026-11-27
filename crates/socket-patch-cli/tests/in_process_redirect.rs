@@ -7163,7 +7163,8 @@ async fn hosted_json_reports_a_pinned_row_per_patch() {
     assert_eq!(
         env["events"],
         serde_json::json!([{
-            "action": "applied", "purl": PURL, "uuid": UUID, "details": {"mode": "hosted"},
+            "action": "applied", "purl": PURL, "uuid": UUID,
+            "details": {"mode": "hosted", "pinChanged": true},
         }]),
         "{env:#}"
     );

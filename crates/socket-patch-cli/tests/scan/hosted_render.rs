@@ -654,7 +654,7 @@ async fn human_names_the_fixed_advisory_and_the_ones_left_unpatched() {
 /// earlier run already switched, counts one package as switched and says
 /// the other was already there. Before, it said "Switched 2 packages".
 #[tokio::test]
-async fn human_summary_counts_only_the_packages_this_run_switched() {
+async fn hosted_reports_only_the_packages_this_run_switched() {
     const SECOND: &str = "covgap-second";
     const SECOND_PURL: &str = "pkg:npm/covgap-second@1.0.0";
     const SECOND_UUID: &str = "55555555-5555-4555-8555-555555555555";
@@ -773,6 +773,23 @@ async fn human_summary_counts_only_the_packages_this_run_switched() {
     // The fixture's patch server is not Socket's: name it, so its pins are
     // recognised as hosted, as Socket's own are by default.
     const SERVER: [&str; 2] = ["--patch-server-url", "https://patch.test"];
+    let lock = root.join("package-lock.json");
+    let mixed_lock = std::fs::read(&lock).unwrap();
+    let assert_changes = |args: &[&str], second_changed: bool| {
+        let (code, doc) = scan_hosted_json(root, &second.uri(), args, &[]);
+        assert_eq!(code, 0, "{doc:#}");
+        assert_eq!(
+            crate::common::envelope::hosted_pin_changes(&doc),
+            [
+                (UUID.to_string(), Some(false)),
+                (SECOND_UUID.to_string(), Some(second_changed))
+            ],
+            "{doc:#}"
+        );
+    };
+    assert_changes(&[SERVER[0], SERVER[1], "--dry-run"], true);
+    assert_eq!(std::fs::read(&lock).unwrap(), mixed_lock);
+
     let (code, stdout, stderr) = scan_hosted(
         root,
         &second.uri(),
@@ -811,6 +828,14 @@ async fn human_summary_counts_only_the_packages_this_run_switched() {
          HIGH  covgap-second@1.0.0\n",
         "stderr=\n{stderr}"
     );
+    assert_changes(&SERVER, false);
+    std::fs::write(&lock, mixed_lock).unwrap();
+    assert_changes(&[], true);
+
+    let mut repaired: Value = serde_json::from_slice(&std::fs::read(&lock).unwrap()).unwrap();
+    repaired["packages"][format!("node_modules/{SECOND}")]["integrity"] = json!(UPSTREAM_SHA512);
+    std::fs::write(&lock, serde_json::to_vec(&repaired).unwrap()).unwrap();
+    assert_changes(&SERVER, true);
 }
 
 /// A granted patch whose package has no lock entry is listed by purl on
