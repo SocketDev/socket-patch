@@ -6439,6 +6439,13 @@ fn confirm(
             if rewrite.confirmed_bazel_maven_uuids.contains(uuid) {
                 return ProbeStep::Decided(true);
             }
+            // A gem whose lock is on this patch's registry at an earlier
+            // snapshot, kept there because the reference at hand leaves a
+            // locked platform out: the gem rewriter found the lock on the
+            // registry, which is the pin.
+            if rewrite.gem_kept_on_snapshot.contains(uuid) {
+                return ProbeStep::Decided(true);
+            }
             if purl.starts_with("pkg:maven/") {
                 if let Some(sbt_only) = crate::patch::redirect::sbt::maven_confirmation(files) {
                     let refused_by_sbt = rewrite.refused_sbt_uuids.contains(uuid);

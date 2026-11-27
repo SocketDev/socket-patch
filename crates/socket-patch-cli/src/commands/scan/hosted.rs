@@ -986,6 +986,24 @@ async fn gem_stale_install_warnings(
                 }
                 continue;
             }
+            // A locked platform the fix's listing leaves out (its build is
+            // being made): nothing at hand says what the lock installs for
+            // it, so its copy is left alone.
+            let listed_prefix = format!(
+                "{}-",
+                GemBuild::ruby(purl).map_or_else(String::new, |b| b.leaf)
+            );
+            let lists_builds = |map: &std::collections::BTreeMap<String, String>| {
+                map.keys().any(|key| key.starts_with(&listed_prefix))
+            };
+            let platform_copy = GemBuild::of_leaf(purl, leaf).is_some_and(|b| b.platform.is_some());
+            if platform_copy
+                && !stands_in
+                && !gem_build_patches.contains_key(leaf)
+                && (lists_builds(gem_build_patches) || lists_builds(gem_upstream))
+            {
+                continue;
+            }
             let entry = dir_state.entry(dir.clone()).or_insert_with(|| DirJudgment {
                 purl: (*purl).to_string(),
                 leaf: leaf.to_string(),

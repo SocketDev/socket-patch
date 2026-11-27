@@ -4107,3 +4107,79 @@ async fn an_installed_copy_is_evidence_about_its_own_build_alone() {
     vex_e2e_common::assert_not_attested(&out.envelope, PURL, "not_applied");
     assert_eq!(out.envelope["status"], "partialFailure", "{out}");
 }
+
+/// A lock that already takes its platform builds from this patch's
+/// registry, at the snapshot an earlier scan wrote, while the reference at
+/// hand leaves one of its platforms out: the patch service does that while
+/// that platform's build is being made. The snapshot the lock names goes
+/// on serving what it listed, so the lock still installs the patched
+/// builds. It is left byte for byte, the gem stays on its patch (in the
+/// run's pins and its summary, with no failure), and it is not reported as
+/// a gem the registry does not list.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_on_its_patch_stays_in_effect_while_the_list_leaves_a_locked_platform_out() {
+    let server = MockServer::start().await;
+    mount_api(&server, Some((&BOTH_PATCHED[..], 4))).await;
+    let proj = project(&lock(true));
+    let (code, env) = scan_json(proj.path(), &server.uri(), &[]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(env["summary"]["applied"], 2, "{env}");
+    let pinned = (
+        read(proj.path(), "Gemfile.lock"),
+        read(proj.path(), "Gemfile"),
+    );
+    assert!(
+        pinned.0.contains(&index_url(&server.uri(), Some(4))),
+        "{}",
+        pinned.0
+    );
+
+    // The arm build is being made again: a newer listing without it.
+    server.reset().await;
+    let linux_only: [Listed; 1] = [(LINUX, LINUX_PATCHED, Some(LINUX_UUID))];
+    mount_api(&server, Some((&linux_only[..], 5))).await;
+    let (code, env) = scan_json(proj.path(), &server.uri(), &[]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(
+        (
+            read(proj.path(), "Gemfile.lock"),
+            read(proj.path(), "Gemfile")
+        ),
+        pinned,
+        "the pair is left as it is"
+    );
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    let events = hosted_events(&env);
+    assert!(
+        events
+            .iter()
+            .all(|event| event["errorCode"] != "redirect_gem_platform_unlisted"),
+        "the gem is not reported as left out: {env}"
+    );
+    assert_eq!(
+        (&env["summary"]["failed"], &env["summary"]["skipped"]),
+        (&json!(0), &json!(0)),
+        "{env}"
+    );
+    // The gem is still one of the run's hosted pins: reported as on its
+    // patch, and counted as a package that was patched already.
+    assert_eq!(
+        events,
+        [json!({
+            "action": "applied", "purl": PURL, "uuid": UUID,
+            "details": { "mode": "hosted" },
+        })],
+        "{env}"
+    );
+    assert_eq!(env["rollout"]["counts"]["already"], 1, "{env}");
+
+    // For a person: the gem is on its hosted patch, with nothing to do.
+    let (code, stdout, stderr) = hosted(proj.path(), &server.uri(), &["scan"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("1 package is already on hosted patches; nothing to rewrite."),
+        "{stdout}\n{stderr}"
+    );
+    assert!(!stdout.contains("does not list"), "{stdout}");
+    assert!(!stderr.contains("Warning"), "{stderr}");
+}
