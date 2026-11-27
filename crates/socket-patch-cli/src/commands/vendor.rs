@@ -875,6 +875,10 @@ fn vendored_packages(env: &Envelope) -> u32 {
 /// vendored as platform gems name the gem, while its `applied` events name
 /// its platform gems, so the advisories of a retracted one are dropped
 /// here: the re-tagged events are the gem's one account.
+///
+/// `summary.skipped` is left as it is: a vendor advisory is an event the
+/// summary never counted ([`push_advisory_event`]), so dropping one takes
+/// nothing out of the count.
 fn retract_vendored(
     env: &mut Envelope,
     since: usize,
@@ -9114,7 +9118,14 @@ mod ui_format_tests {
             ]
         );
         assert_eq!((env.summary.applied, env.summary.failed), (0, 2));
+        // The dropped advisory was never counted, so the one counted skip
+        // (the other package's) is still the whole count.
         assert_eq!(env.summary.skipped, 1);
+        let counted = env.events.iter().filter(|event| {
+            event.action == PatchAction::Skipped
+                && event.error_code.as_deref() == Some("already_vendored")
+        });
+        assert_eq!(counted.count() as u32, env.summary.skipped);
     }
 
     #[test]
