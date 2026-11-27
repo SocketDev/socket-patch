@@ -150,3 +150,7 @@ One line each. Moved from state/npm.md on 2026-11-26; search with git grep.
 - Hosted pins on a patch mirror: a run without `SOCKET_PATCH_MIRROR_URL` doesn't see them (`vex` "No patches in this project … Run `socket-patch scan` first", `rollback` "nothing to roll back"); `scan` warns `redirect_pin_on_unconfigured_host` with the right remedy. Documented in CLI_CONTRACT "Patch hosts" (2026-11-26).
 - Vendored scan emits informational `skipped` events with `errorCode: vendor_prebuilt_downloaded` next to each `applied` (documented advisory, v5.1.0 too; 2026-11-26).
 - After `vex --grype-config` removes its entry (the document is gone), `.grype.yaml` is left as `vex-documents:` with no items (documented "leaving the key"; 2026-11-26).
+- `report lp` / `rollback lp` for an npm alias `lp@npm:left-pad` don't match: identifiers are registry names (`left-pad`), and the error names the UUID route (2026-11-27).
+- A `--global-prefix` agent scan keeps its records in the cwd's `.socket/manifest.json`; global `rollback` keeps a record while a copy in the cwd project is still patched (CLI_CONTRACT "Global scope"; 2026-11-27).
+- Hosted `scan` with npm 12 `allow-remote=root` and a transitive pin: the explicit value is respected and the run warns that npm refuses the pin; `npm ci` fails EALLOWREMOTE (documented; 2026-11-27).
+- Dual lock where npm <= 11 updated only npm-shrinkwrap.json: hosted and vendored scans write nothing for the package ("could not attribute its pin"), exit 0; `--json` names both locks (fail closed, documented; 2026-11-27).
