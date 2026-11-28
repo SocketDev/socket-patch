@@ -309,44 +309,87 @@ pub(crate) async fn fetch_details(
         .collect()
 }
 
-/// Reference grants for every distinct uuid (`MAX_REFERENCE_BATCH` per
-/// request): the merged results, plus the uuids whose request failed.
-/// `gem_snapshots` are the registry snapshots a root's Bundler lock takes
-/// gems from, presented with each request.
+/// One reference to ask for: a patch, and the snapshot of its gem
+/// registry that the asking root's Bundler lock names (`None` for a root
+/// whose lock names none).
+pub(crate) type AskedReference = (String, Option<String>);
+
+/// The reference a root asks for about the patch `uuid`, `held` being the
+/// snapshots its lock names.
+pub(crate) fn asked_reference(uuid: &str, held: &GemSnapshotKeys) -> AskedReference {
+    let of_patch = held.iter().find(|(of, _)| of.eq_ignore_ascii_case(uuid));
+    (uuid.to_string(), of_patch.map(|(_, key)| key.clone()))
+}
+
+/// Reference grants for every distinct patch and presented snapshot
+/// (`MAX_REFERENCE_BATCH` per request, all of them sent together): the
+/// answers, plus the references whose request failed. A request names a
+/// patch once, so a patch is asked about once for each snapshot of it that
+/// is presented, and once for all the roots that present none, whatever
+/// else those roots hold.
 pub(crate) async fn fetch_references(
     provider: &Provider,
-    uuids: &BTreeSet<String>,
-    gem_snapshots: &GemSnapshotKeys,
+    asked: &BTreeSet<AskedReference>,
 ) -> (
-    HashMap<String, PackageVendorResult>,
-    BTreeMap<String, String>,
+    HashMap<AskedReference, PackageVendorResult>,
+    BTreeMap<AskedReference, String>,
 ) {
-    let ordered: Vec<String> = uuids.iter().cloned().collect();
-    let chunks: Vec<Vec<String>> = ordered
-        .chunks(MAX_REFERENCE_BATCH)
-        .map(<[String]>::to_vec)
-        .collect();
-    let futures: Vec<BoxFuture<'_, _>> = chunks
+    // `asked` is ordered by patch, so the n-th snapshot of each patch
+    // rides the n-th round, and no round names a patch twice.
+    let mut rounds: Vec<Vec<&AskedReference>> = Vec::new();
+    let mut nth = 0;
+    let mut previous: Option<&str> = None;
+    for reference in asked {
+        nth = if previous == Some(reference.0.as_str()) {
+            nth + 1
+        } else {
+            0
+        };
+        previous = Some(&reference.0);
+        if rounds.len() == nth {
+            rounds.push(Vec::new());
+        }
+        rounds[nth].push(reference);
+    }
+    let requests: Vec<(Vec<String>, GemSnapshotKeys, &[&AskedReference])> = rounds
         .iter()
-        .map(|chunk| -> BoxFuture<'_, _> {
-            Box::pin(provider.fetch_registry_references(chunk, gem_snapshots))
+        .flat_map(|round| round.chunks(MAX_REFERENCE_BATCH))
+        .map(|chunk| {
+            let uuids = chunk.iter().map(|(uuid, _)| uuid.clone()).collect();
+            let snapshots = chunk
+                .iter()
+                .filter_map(|(uuid, key)| Some((uuid.clone(), key.clone()?)))
+                .collect();
+            (uuids, snapshots, chunk)
+        })
+        .collect();
+    let futures: Vec<BoxFuture<'_, _>> = requests
+        .iter()
+        .map(|(uuids, snapshots, _)| -> BoxFuture<'_, _> {
+            Box::pin(provider.fetch_registry_references(uuids, snapshots))
         })
         .collect();
     let results = join_bounded(futures, provider.concurrency).await;
-    let mut merged: HashMap<String, PackageVendorResult> = HashMap::new();
-    let mut failed: BTreeMap<String, String> = BTreeMap::new();
-    for (chunk, result) in chunks.iter().zip(results) {
+    let mut answers: HashMap<AskedReference, PackageVendorResult> = HashMap::new();
+    let mut failed: BTreeMap<AskedReference, String> = BTreeMap::new();
+    for ((_, _, chunk), result) in requests.iter().zip(results) {
         match result {
-            Ok(map) => merged.extend(map),
+            Ok(mut granted) => {
+                for reference in *chunk {
+                    if let Some(answer) = granted.remove(&reference.0) {
+                        answers.insert((*reference).clone(), answer);
+                    }
+                }
+            }
             Err(error) => {
                 let message = error.to_string();
-                for uuid in chunk {
-                    failed.insert(uuid.clone(), message.clone());
+                for reference in *chunk {
+                    failed.insert((*reference).clone(), message.clone());
                 }
             }
         }
     }
-    (merged, failed)
+    (answers, failed)
 }
 
 /// Hosted wheel metadata once per distinct `(url, sha256)`: the disk

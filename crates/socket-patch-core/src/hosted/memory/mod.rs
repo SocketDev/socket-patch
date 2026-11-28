@@ -1021,10 +1021,9 @@ async fn engine(
     }
     phases.mark("classify");
 
-    // A root is answered by the registry snapshots its own Bundler lock
-    // names, as a checkout of it alone would be: roots that present the
-    // same snapshots share a request, a root with others or none has its
-    // own.
+    // A root is answered by the registry snapshot its own Bundler lock
+    // names for a patch, as a checkout of it alone would be. Roots that
+    // name the same snapshot of a patch, or none, share its answer.
     let mut root_snapshots: Vec<crate::api::client::GemSnapshotKeys> = Vec::new();
     for state in &states {
         root_snapshots.push(match (&state.error, &state.project) {
@@ -1035,27 +1034,17 @@ async fn engine(
             _ => Default::default(),
         });
     }
-    let mut asked: BTreeMap<&crate::api::client::GemSnapshotKeys, BTreeSet<String>> =
-        BTreeMap::new();
-    for (state, held) in states.iter().zip(&root_snapshots) {
+    let asked_of =
+        |index: usize, uuid: &str| discover::asked_reference(uuid, &root_snapshots[index]);
+    let mut asked: BTreeSet<discover::AskedReference> = BTreeSet::new();
+    for (index, state) in states.iter().enumerate() {
         if state.error.is_none() {
-            let uuids = state.selected.iter().map(|(_, uuid)| uuid.clone());
-            asked.entry(held).or_default().extend(uuids);
+            let selected = state.selected.iter();
+            asked.extend(selected.map(|(_, uuid)| asked_of(index, uuid)));
         }
     }
-    let mut answered = BTreeMap::new();
-    for (held, uuids) in asked {
-        if !uuids.is_empty() {
-            answered.insert(
-                held,
-                discover::fetch_references(&provider, &uuids, held).await,
-            );
-        }
-    }
-    let unasked = (HashMap::new(), BTreeMap::new());
-    // The references of the root at `index`, and the uuids whose request
-    // failed.
-    let references_of = |index: usize| answered.get(&root_snapshots[index]).unwrap_or(&unasked);
+    checkpoint(&cancel).await?;
+    let (answered, failed_refs) = discover::fetch_references(&provider, &asked).await;
     // Roots whose rows' eligibility is unknown: a reference failure that
     // hit only NEW rows of a capped run defers them instead of failing the
     // root (§5.2).
@@ -1064,11 +1053,10 @@ async fn engine(
         if state.error.is_some() {
             continue;
         }
-        let failed_refs = &references_of(index).1;
         if let Some(error) = state
             .selected
             .iter()
-            .find_map(|(_, uuid)| failed_refs.get(uuid))
+            .find_map(|(_, uuid)| failed_refs.get(&asked_of(index, uuid)))
         {
             if stage.capped() && state.rows.iter().all(|r| r.candidate.recorded.is_new()) {
                 stage.incomplete = true;
@@ -1096,8 +1084,14 @@ async fn engine(
             continue;
         };
         let unreadable = std::mem::take(&mut state.unreadable);
-        let references = &references_of(index).0;
-        match stages::plan(project, unreadable, &state.selected, references).await {
+        let references: HashMap<String, crate::api::types::PackageVendorResult> = state
+            .selected
+            .iter()
+            .filter_map(|(_, uuid)| {
+                Some((uuid.clone(), answered.get(&asked_of(index, uuid))?.clone()))
+            })
+            .collect();
+        match stages::plan(project, unreadable, &state.selected, &references).await {
             Ok(plan) => planned.push((index, plan)),
             Err(refusal) => state.error = Some(ProjectError::from(refusal)),
         }
@@ -1176,27 +1170,30 @@ async fn engine(
     for (_, plan) in planned.iter_mut() {
         refreshes.push(stages::record_gem_indexes(plan, &gem_indexes));
     }
+    let mut unknown: BTreeSet<discover::AskedReference> = BTreeSet::new();
+    for ((index, _), targets) in planned.iter().zip(&refreshes) {
+        let asked = targets.iter().map(|target| asked_of(*index, &target.uuid));
+        unknown.extend(asked.filter(|reference| !answered.contains_key(reference)));
+    }
+    // A request that fails answers for none of its patches.
+    let refreshed = if unknown.is_empty() {
+        HashMap::new()
+    } else {
+        checkpoint(&cancel).await?;
+        discover::fetch_references(&provider, &unknown).await.0
+    };
     for ((index, plan), targets) in planned.iter_mut().zip(&refreshes) {
         if targets.is_empty() {
             continue;
         }
-        let known = &references_of(*index).0;
-        let mut answers: HashMap<String, crate::api::types::PackageVendorResult> = targets
+        let answers: HashMap<String, crate::api::types::PackageVendorResult> = targets
             .iter()
-            .filter_map(|target| Some((target.uuid.clone(), known.get(&target.uuid)?.clone())))
+            .filter_map(|target| {
+                let asked = asked_of(*index, &target.uuid);
+                let answer = answered.get(&asked).or_else(|| refreshed.get(&asked))?;
+                Some((target.uuid.clone(), answer.clone()))
+            })
             .collect();
-        let unknown: BTreeSet<String> = targets
-            .iter()
-            .map(|target| &target.uuid)
-            .filter(|uuid| !answers.contains_key(*uuid))
-            .cloned()
-            .collect();
-        if !unknown.is_empty() {
-            // A request that fails answers for none of them.
-            let held = &root_snapshots[*index];
-            let (more, _) = discover::fetch_references(&provider, &unknown, held).await;
-            answers.extend(more);
-        }
         stages::refresh_gem_patches(plan, targets, &answers);
     }
     phases.mark("plan");
@@ -2392,8 +2389,10 @@ mod tests {
         );
         let roots = [
             ("current", on_snapshot("c4")),
+            ("current-too", on_snapshot("c4")),
             ("earlier", on_snapshot("1a")),
-            ("upstream", upstream),
+            ("upstream", upstream.clone()),
+            ("upstream-too", upstream),
         ];
         let service = Arc::new(GemPatchService {
             served: BTreeMap::new(),
@@ -2430,7 +2429,7 @@ mod tests {
         expected.sort();
         assert_eq!(
             asked, expected,
-            "one request for each distinct set of snapshots"
+            "the patch is asked about once for each snapshot presented, and once for none"
         );
         assert!(
             output.changed_files.is_empty(),
@@ -2445,17 +2444,91 @@ mod tests {
             let skipped = &project(root).skipped;
             skipped.iter().map(|skip| skip.reason.as_str()).collect()
         };
-        assert!(project("current").error.is_none());
-        assert!(
-            !reasons("current").contains(&"pending_build"),
-            "the root on the current snapshot is answered it: {:?}",
-            project("current")
-        );
+        for root in ["current", "current-too"] {
+            assert!(project(root).error.is_none());
+            assert!(
+                !reasons(root).contains(&"pending_build"),
+                "the root on the current snapshot is answered it: {:?}",
+                project(root)
+            );
+        }
         assert_eq!(reasons("earlier"), ["pending_build"]);
-        assert!(
-            project("upstream").redirected.is_empty(),
-            "a root not on the patch is not moved during the rebuild: {:?}",
-            project("upstream")
+        for root in ["upstream", "upstream-too"] {
+            assert!(
+                project(root).redirected.is_empty(),
+                "a root not on the patch is not moved during the rebuild: {:?}",
+                project(root)
+            );
+        }
+    }
+
+    /// The requests of one round of references: a patch is named once for
+    /// each snapshot of it that is presented and once for the roots that
+    /// present none, a request never names a patch twice, and each answer
+    /// is kept under the snapshot it was given for.
+    #[tokio::test]
+    async fn a_patch_is_asked_about_once_for_each_snapshot_presented() {
+        let service = Arc::new(GemPatchService {
+            served: BTreeMap::new(),
+            asked: std::sync::Mutex::new(Vec::new()),
+            earlier: None,
+            asked_references: std::sync::Mutex::new(Vec::new()),
+            rebuilding: Some("c4"),
+            asked_snapshots: std::sync::Mutex::new(Vec::new()),
+        });
+        let provider = Provider::new(service.clone(), std::time::Duration::from_secs(5), 4);
+        let reference = |uuid: &str, snapshot: Option<&str>| -> discover::AskedReference {
+            (uuid.to_string(), snapshot.map(str::to_string))
+        };
+        let asked: BTreeSet<discover::AskedReference> = [
+            reference(GEM_NEWER, None),
+            reference(GEM_NEWER, Some("c4")),
+            reference(GEM_NEWER, Some("1a")),
+            reference(GEM_EARLIER, None),
+            reference(GEM_EARLIER, Some("9f")),
+        ]
+        .into();
+        let (answers, failed) = discover::fetch_references(&provider, &asked).await;
+
+        let uuids = service.asked_references.lock().unwrap().clone();
+        let snapshots = service.asked_snapshots.lock().unwrap().clone();
+        let mut requests: Vec<_> = uuids.into_iter().zip(snapshots).collect();
+        requests.sort();
+        let both = vec![GEM_EARLIER.to_string(), GEM_NEWER.to_string()];
+        let held = |pairs: &[(&str, &str)]| -> crate::api::client::GemSnapshotKeys {
+            let pairs = pairs.iter();
+            pairs
+                .map(|(uuid, key)| (uuid.to_string(), key.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            requests,
+            [
+                (both.clone(), held(&[])),
+                (both, held(&[(GEM_EARLIER, "9f"), (GEM_NEWER, "1a")])),
+                (vec![GEM_NEWER.to_string()], held(&[(GEM_NEWER, "c4")])),
+            ]
+        );
+        assert!(failed.is_empty(), "{failed:?}");
+        let status = |snapshot: Option<&str>| {
+            let answer = answers.get(&reference(GEM_NEWER, snapshot));
+            let answer = answer.unwrap_or_else(|| panic!("no answer for {snapshot:?}"));
+            let listed = answer.registry_override.as_ref().map(|registry| {
+                let builds = &registry.identifiers.gem_builds;
+                (registry.index_url.ends_with("/s/c4/"), builds.is_some())
+            });
+            (answer.status.as_str().to_string(), listed)
+        };
+        assert_eq!(
+            status(Some("c4")),
+            ("granted".to_string(), Some((true, true)))
+        );
+        assert_eq!(status(Some("1a")), ("pending_build".to_string(), None));
+        assert_eq!(status(None), ("granted".to_string(), Some((false, false))));
+        assert_eq!(
+            answers.len(),
+            3,
+            "the service has no answer for the other patch"
         );
     }
 
