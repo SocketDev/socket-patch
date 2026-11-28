@@ -1977,7 +1977,7 @@ async fn locked_build_sources(
 
 /// A restore found that the build a ledger entry records for a platform is
 /// no longer the one the gem's fix names for it: it was rebuilt under
-/// another patch or with other bytes, or withdrawn, or is being made again.
+/// another patch or with other bytes, or withdrawn.
 /// Nothing is unpacked. Not an integrity failure: the same state follows
 /// an edited ledger, and neither is told from the other here.
 pub(crate) const VENDOR_PREBUILT_REPLACED: &str = "vendor_prebuilt_replaced";

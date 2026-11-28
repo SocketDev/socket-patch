@@ -4166,6 +4166,88 @@ async fn an_installed_copy_is_evidence_about_its_own_build_alone() {
     assert_eq!(said(out.doc()), [unpatched], "{out}");
     vex_e2e_common::assert_not_attested(
         &out.envelope,
+
+/// A lock that already takes its platform builds from this patch's
+/// registry, at the snapshot an earlier scan wrote, while the reference at
+/// hand leaves one of its platforms out: upstream no longer publishes that
+/// platform's gem. The snapshot the lock names goes on serving what it
+/// listed, and the registry as it stands has no gem for that platform, so
+/// the lock stays where it is, byte for byte, and the gem stays in effect:
+/// the run reports, counts and attests its builds as it did before, each
+/// by what the lock itself pins, and says nothing of a gem left out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_on_its_patch_stays_in_effect_when_the_list_leaves_a_locked_platform_out() {
+    let server = MockServer::start().await;
+    mount_api(&server, Some((&ONE_PATCHED[..], 4))).await;
+    let proj = project(&lock(true));
+    let api = server.uri();
+    let (code, env) = scan_json(proj.path(), &api, &[]);
+    assert_eq!(code, 0, "{env}");
+    let pair = || {
+        (
+            read(proj.path(), "Gemfile.lock"),
+            read(proj.path(), "Gemfile"),
+        )
+    };
+    let pinned = pair();
+    assert!(pinned.0.contains(&index_url(&api, Some(4))), "{}", pinned.0);
+    // What a run says of the gem once it is on its patch.
+    let (code, settled) = scan_json(proj.path(), &api, &[]);
+    assert_eq!(code, 0, "{settled}");
+    let attested = vex(proj.path(), &api);
+    assert_eq!(attested.code, Some(0), "{attested}");
+
+    // Upstream yanks the arm gem: the list no longer names the platform.
+    server.reset().await;
+    let linux_only: [Listed; 1] = [(LINUX, LINUX_PATCHED, Some(LINUX_UUID))];
+    mount_api(&server, Some((&linux_only[..], 5))).await;
+    let (code, env) = scan_json(proj.path(), &api, &[]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(pair(), pinned, "the pair is left as it is");
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(
+        hosted_events(&env),
+        hosted_events(&settled),
+        "each build is reported as before: {env}"
+    );
+    assert_eq!(env["summary"], settled["summary"], "{env}");
+    assert_eq!(env["rollout"]["counts"]["already"], 1, "{env}");
+
+    // The lock still installs the patched linux build, and `vex` still
+    // attests it; the arm build is on upstream's gem, as it was.
+    let out = vex(proj.path(), &api);
+    assert_eq!(out.code, Some(0), "{out}");
+    let statuses = |doc: &Value| -> Vec<(String, String)> {
+        let mut statuses: Vec<(String, String)> = doc["statements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|statement| {
+                let products = statement["products"].to_string();
+                let platform = if products.contains(LINUX) { LINUX } else { ARM };
+                let status = statement["status"].as_str().unwrap_or_default();
+                (platform.to_string(), status.to_string())
+            })
+            .collect();
+        statuses.sort();
+        statuses
+    };
+    assert_eq!(statuses(out.doc()), statuses(attested.doc()), "{out}");
+    assert_eq!(
+        statuses(out.doc()),
+        [
+            (ARM.to_string(), "affected".to_string()),
+            (LINUX.to_string(), "not_affected".to_string()),
+        ],
+        "{out}"
+    );
+
+    // For a person: the gem is on its hosted patch, with nothing to do.
+    let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(!stdout.contains("does not list"), "{stdout}");
+    assert!(!stderr.contains("Warning"), "{stderr}");
+}
         &format!("{PURL}?platform={LINUX}"),
         "not_applied",
     );
