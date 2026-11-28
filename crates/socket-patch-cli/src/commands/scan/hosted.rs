@@ -446,7 +446,6 @@ fn pin_reports_by_package(
                 platform: None,
                 newly_patched: false,
                 withdrawn: false,
-                sha256: None,
             },
         )
         .collect()
@@ -809,7 +808,7 @@ async fn gem_stale_install_warnings(
         std::collections::BTreeSet<String>,
     >,
     gem_upstream: &std::collections::BTreeMap<String, String>,
-    gem_build_patches: &std::collections::BTreeMap<String, (String, String)>,
+    gem_build_patches: &std::collections::BTreeMap<String, String>,
     views: &mut ViewFallback<'_>,
 ) -> StaleInstallOutcome {
     use socket_patch_core::crawlers::types::CrawlerOptions;
@@ -1022,26 +1021,8 @@ async fn gem_stale_install_warnings(
             // own: its files carry that patch's header (and, compiled, its
             // binaries), so the gem patch's record says nothing true of it.
             // Its archive judges it, else that build's own record (below).
-            use socket_patch_core::vex::gem_builds::{build_copy_evidence, BuildCopyEvidence};
             let own_patch = gem_build_patches.get(leaf);
-            let own_evidence = match own_patch {
-                Some((_, sha256)) => Some(build_copy_evidence(dir, Some(sha256)).await),
-                None => None,
-            };
             let judged = match local.filter(|_| own_patch.is_none()) {
-                _ if own_evidence.is_some() => match own_evidence {
-                    Some(BuildCopyEvidence::PatchedArchive) => Some(InstalledRecordJudgment {
-                        patched: true,
-                        stale_evidence: false,
-                    }),
-                    Some(BuildCopyEvidence::OtherArchive | BuildCopyEvidence::AlteredTree) => {
-                        Some(InstalledRecordJudgment {
-                            patched: false,
-                            stale_evidence: true,
-                        })
-                    }
-                    _ => None,
-                },
                 Some(record) => {
                     let judged = judge_installed_record(dir, record).await;
                     if judged.patched
@@ -1062,7 +1043,7 @@ async fn gem_stale_install_warnings(
             match judged {
                 Some(judged) => entry.record(purl, judged),
                 None => {
-                    let record_of = own_patch.map_or(*uuid, |(own, _)| own.as_str());
+                    let record_of = own_patch.map_or(*uuid, String::as_str);
                     pending.push((dir.clone(), purl, record_of));
                 }
             }
@@ -1308,7 +1289,7 @@ async fn refresh_stale_gems(
         std::collections::BTreeSet<String>,
     >,
     gem_upstream: &std::collections::BTreeMap<String, String>,
-    gem_build_patches: &std::collections::BTreeMap<String, (String, String)>,
+    gem_build_patches: &std::collections::BTreeMap<String, String>,
     overrides: &[DepOverride],
     mirror_sources: &socket_patch_core::hosted::engine::MirrorSources,
     views: &mut ViewFallback<'_>,
@@ -2856,10 +2837,9 @@ async fn run_redirect_selected_untracked(
     let mut gem_upstream: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     // The platform builds that have a patch of their own, by leaf, each
-    // with that patch's uuid and the sha256 of its gem: a copy of such a
-    // build is judged by its archive, else by that patch's record, and
-    // never by the gem patch's (`build_copy_evidence`).
-    let mut gem_build_patches: std::collections::BTreeMap<String, (String, String)> =
+    // with that patch's uuid: a copy of such a build is judged by its
+    // archive, else by that patch's record, and never by the gem patch's.
+    let mut gem_build_patches: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     // Of the pins the project's files hold alone: a gem's lock can stay
     // on one patch while another patch of the gem is skipped, and what the
@@ -2877,27 +2857,41 @@ async fn run_redirect_selected_untracked(
             .as_ref()
             .and_then(|ro| ro.identifiers.gem_checksum_sha256.clone())
             .or_else(|| o.integrity.sha256.clone());
+        // What each platform build is, and the archive it is pinned to: as
+        // the rewriter judged the builds the lock names, which holds for a
+        // lock that stays on the snapshot it names too. A lock that names
+        // none goes by the reference's list, for the installed platform
+        // copies that stand in for its ruby-platform gem.
+        let builds: Vec<(String, Option<String>, String)> =
+            match rewrite.gem_builds.get(&o.patch_uuid) {
+                Some(locked) => locked
+                    .iter()
+                    .filter_map(|build| {
+                        let platform = build.platform.clone()?;
+                        Some((platform, build.patch_uuid.clone(), build.sha256.clone()))
+                    })
+                    .collect(),
+                None => o
+                    .registry_override
+                    .iter()
+                    .flat_map(|ro| ro.identifiers.gem_builds.iter().flatten())
+                    .filter(|build| build.platform != "ruby")
+                    .map(|build| {
+                        let sha256 = build.gem_checksum_sha256.clone();
+                        (build.platform.clone(), build.patch_uuid.clone(), sha256)
+                    })
+                    .collect(),
+            };
         let mut patched_builds = Vec::new();
-        for build in o
-            .registry_override
-            .iter()
-            .flat_map(|ro| ro.identifiers.gem_builds.iter().flatten())
-        {
-            match &build.patch_uuid {
+        for (platform, patch_uuid, sha256) in builds {
+            let leaf = format!("{}-{}-{}", o.name, o.version, platform);
+            match patch_uuid {
                 Some(own) => {
-                    patched_builds.push(build.gem_checksum_sha256.clone());
-                    if build.platform != "ruby" {
-                        gem_build_patches.insert(
-                            format!("{}-{}-{}", o.name, o.version, build.platform),
-                            (own.clone(), build.gem_checksum_sha256.clone()),
-                        );
-                    }
+                    patched_builds.push(sha256);
+                    gem_build_patches.insert(leaf, own);
                 }
                 None => {
-                    gem_upstream.insert(
-                        format!("{}-{}-{}", o.name, o.version, build.platform),
-                        build.gem_checksum_sha256.clone(),
-                    );
+                    gem_upstream.insert(leaf, sha256);
                 }
             }
         }
@@ -3096,15 +3090,6 @@ async fn run_redirect_selected_untracked(
         params.hosted_gem_builds = engine::pin_reports(&confirmed, rewrite)
             .into_iter()
             .filter(|report| report.gem_fix.is_some())
-            .map(|mut report| {
-                // The sha256 the reference lists for a patched build: what
-                // tells that an installed copy is that build.
-                report.sha256 = gem_build_patches
-                    .iter()
-                    .find(|(_, (own, _))| Some(own) == report.uuid.as_ref())
-                    .map(|(_, (_, sha256))| sha256.clone());
-                report
-            })
             .collect();
         // The gem intake gate withholds every gem file. VEX independently
         // rediscovers older pins too, so a candidate-only set would miss some
@@ -5089,7 +5074,6 @@ mod tests {
             platform: platform.map(str::to_string),
             newly_patched: newly,
             withdrawn: false,
-            sha256: None,
         }
     }
 

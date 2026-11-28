@@ -4938,16 +4938,15 @@ writes an `affected` statement for a build that keeps upstream's gem. A later `s
 reads the lock and asks the patch service which builds are patched: one request for all such gems
 together, and one more per gem whose lock has no `CHECKSUMS` entry for a build. That is on top of
 the one request `vex` makes for the record of any hosted patch. A build is attested as patched
-only when the lock installs exactly that patch's gem. An installed copy of it is judged by the
-archive RubyGems installed it from (`cache/<gem>.gem` in the gem home) and by the installed files
-themselves, which must be the ones that archive holds: no request, and what Ruby loads is what
-is attested.
-Where the gem home keeps no archive (a slim image, `gem cleanup`), the copy's files are checked
-against the record of that build's own patch, one request per such build: a platform gem is a
-patch of its own, whose files carry that patch's header (and, for a compiled build, its
-binaries), so they are never checked against the gem's patch. If that record cannot be read, the
-build is stated as `affected` under `vex_gem_build_unknown`, like a build the lock cannot be
-shown to install. When it cannot show that (`--offline`, a failed
+only when the lock installs exactly that patch's gem. An installed copy of it is checked like any installed
+package, against the record of that build's own patch: one more request per installed patched
+build, whichever gem homes hold it. A platform gem is a patch of its own, whose files carry that
+patch's header (and, for a compiled build, its binaries), so they are never checked against the
+gem's patch. Every copy has to verify; one that does not leaves the build out of the document.
+If that record cannot be read, the build is stated as `affected` under `vex_gem_build_unknown`,
+like a build the lock cannot be shown to install. The scan's own `--vex` holds a build to the
+same check.
+When it cannot show that (`--offline`, a failed
 request, a lock older than what the patch service lists now) it states the build as `affected`,
 with what to run to settle it, under the warning `vex_gem_build_unknown`. The run still succeeds.
 For a platform the registry lists no gem for (one upstream does not publish), a scan changes

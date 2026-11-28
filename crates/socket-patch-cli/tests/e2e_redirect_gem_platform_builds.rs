@@ -4137,9 +4137,8 @@ async fn an_installed_copy_is_evidence_about_its_own_build_alone() {
     assert_eq!(out.code, Some(0), "{out}");
     assert_eq!(said(out.doc()), both, "{out}");
 
-    // The archive the copy was installed from, where the gem home keeps
-    // it, comes first: the patched gem the listing names needs no record,
-    // and the copy's files are not read against one.
+    // The archive in the gem home is no evidence for `vex`: whatever it
+    // holds, the copy's files are what the build's record judges.
     let cache = proj.path().join("vendor/bundle/ruby/3.3.0/cache");
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(
@@ -4149,11 +4148,7 @@ async fn an_installed_copy_is_evidence_about_its_own_build_alone() {
     .unwrap();
     let out = vex(proj.path(), &api);
     assert_eq!(out.code, Some(0), "{out}");
-    vex_e2e_common::assert_not_attested(
-        &out.envelope,
-        &format!("{PURL}?platform={LINUX}"),
-        "not_applied",
-    );
+    assert_eq!(said(out.doc()), both, "{out}");
     std::fs::remove_dir_all(&cache).unwrap();
 
     // That copy still on upstream's files: the build is not attested, and
@@ -4166,6 +4161,11 @@ async fn an_installed_copy_is_evidence_about_its_own_build_alone() {
     assert_eq!(said(out.doc()), [unpatched], "{out}");
     vex_e2e_common::assert_not_attested(
         &out.envelope,
+        &format!("{PURL}?platform={LINUX}"),
+        "not_applied",
+    );
+    assert_eq!(out.envelope["status"], "partialFailure", "{out}");
+}
 
 /// A lock that already takes its platform builds from this patch's
 /// registry, at the snapshot an earlier scan wrote, while the reference at
@@ -4247,9 +4247,4 @@ async fn a_lock_on_its_patch_stays_in_effect_when_the_list_leaves_a_locked_platf
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(!stdout.contains("does not list"), "{stdout}");
     assert!(!stderr.contains("Warning"), "{stderr}");
-}
-        &format!("{PURL}?platform={LINUX}"),
-        "not_applied",
-    );
-    assert_eq!(out.envelope["status"], "partialFailure", "{out}");
 }

@@ -2094,7 +2094,6 @@ mod tests {
             platform: platform.map(str::to_string),
             newly_patched: patch.is_some(),
             withdrawn: false,
-            sha256: None,
         }
     }
 
@@ -2269,7 +2268,6 @@ mod tests {
             platform: None,
             newly_patched: false,
             withdrawn: false,
-            sha256: None,
         };
         note_unpatched_builds(
             &mut builds,

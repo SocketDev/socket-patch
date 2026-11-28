@@ -798,14 +798,6 @@ pub(crate) struct HostedGemBuild {
     /// For a build in [`GemBuildState::Unknown`]: why nothing shows what
     /// the lock installs for it.
     pub unshown: Option<GemBuildUnshown>,
-    /// For a patched platform build: the sha256 of its gem, as the gem
-    /// patch's listing gives it. An installed copy whose archive has it is
-    /// that build ([`build_copy_evidence`]). The pins of the run that
-    /// moved the lock carry the one its reference listed. `None` where no
-    /// listing names one.
-    ///
-    /// [`build_copy_evidence`]: socket_patch_core::vex::gem_builds::build_copy_evidence
-    pub sha256: Option<String>,
 }
 
 /// Why nothing shows whether a lock installs a patched build or upstream's
@@ -831,9 +823,8 @@ pub(crate) enum GemBuildUnshown {
     /// of a later state of the registry than the one the lock names.
     Differs,
     /// The lock installs the patched build, and nothing shows that the
-    /// installed copy is it: its gem home keeps no archive of it, and the
-    /// record of the build's own patch could not be read; why, safe to
-    /// print.
+    /// installed copy is it: the record of the build's own patch could
+    /// not be read; why, safe to print.
     RecordUnread(String),
 }
 
@@ -882,8 +873,8 @@ impl GemBuildUnshown {
             ),
             GemBuildUnshown::RecordUnread(why) => failed(
                 format!(
-                    "the gem home keeps no archive of the installed copy of {them}, and the \
-                     record of its patch could not be read"
+                    "the record of the patch of {them} could not be read, so nothing shows \
+                     that the installed copy is the patched build"
                 ),
                 why,
             ),
@@ -960,7 +951,6 @@ impl HostedGem {
                 },
                 platform,
                 state,
-                sha256: None,
             })
             .collect();
         Some(HostedGem {
@@ -2048,15 +2038,7 @@ async fn resolve_hosted_gems(
             })
             .collect();
         if !reported.is_empty() {
-            if let Some(mut gem) = HostedGem::of(key, &wiring.uuid, reported, false) {
-                // The run's own pins carry the digest its reference listed.
-                for build in &mut gem.builds {
-                    let pin = in_run.iter().find(|report| {
-                        report.gem_fix.as_deref() == Some(wiring.uuid.as_str())
-                            && report.platform == build.platform
-                    });
-                    build.sha256 = pin.and_then(|report| report.sha256.clone());
-                }
+            if let Some(gem) = HostedGem::of(key, &wiring.uuid, reported, false) {
                 plan.hosted_gems.insert(key.clone(), gem);
             }
             continue;
@@ -2119,15 +2101,6 @@ async fn resolve_hosted_gems(
         let Some(mut hosted) = HostedGem::of(&gem.key, &gem.uuid, builds, true) else {
             continue;
         };
-        // The gem of a patched platform build: the archive of an installed
-        // copy of it is the first evidence of what that copy is.
-        for build in &mut hosted.builds {
-            if let (Some(platform), GemBuildState::Patched { .. }) = (&build.platform, &build.state)
-            {
-                let gem = listed.iter().find(|gem| &gem.platform == platform);
-                build.sha256 = gem.map(|gem| gem.gem_checksum_sha256.clone());
-            }
-        }
         // What the reads say of a build beyond its state: with no list,
         // why there is none; with no index, the error of that read.
         for build in &mut hosted.builds {
@@ -2162,7 +2135,7 @@ async fn resolve_hosted_gems(
 /// registry its lock names, read only for a gem that has a list and whose
 /// lock does not pin every build ([`PendingGem::needs_index`]). No patch
 /// record is read here: the record of a platform build's own patch is
-/// read only for an installed copy that has no archive to go by
+/// read only for a build that has an installed copy
 /// ([`read_build_record`]).
 async fn read_gem_builds(
     common: &GlobalArgs,
@@ -2250,10 +2223,10 @@ async fn read_gem_builds(
 }
 
 /// The files the patch `uuid` of a platform build changes, as that patch's
-/// own record lists them (asked without file contents): what a copy of the
-/// build is checked against when its gem home keeps no archive of it. One
-/// request, made only for such a copy. `Err` says why the record could not
-/// be read, safe to print: nothing then judges the copy.
+/// own record lists them (asked without file contents): what the installed
+/// copies of the build are checked against. One request, made only for a
+/// build that has an installed copy. `Err` says why the record could not
+/// be read, safe to print: nothing then judges the copies.
 pub(crate) async fn read_build_record(
     common: &GlobalArgs,
     api_client: &RunApiClient,
@@ -4002,7 +3975,7 @@ mod tests {
             );
             assert!(!affected[0].1.contains(ARM_UUID) && !affected[0].1.contains(U1));
             // No patch record is read for the plan: a record is read
-            // only for an installed copy that has no archive to go by.
+            // only for a build that has an installed copy.
             assert_eq!(
                 asked(&server).await.len(),
                 if checksums { 1 } else { 2 },
@@ -4212,7 +4185,6 @@ mod tests {
             platform: platform.map(str::to_string),
             newly_patched: uuid.is_some(),
             withdrawn: false,
-            sha256: None,
         };
         let sources = Sources {
             hosted_gem_builds: vec![

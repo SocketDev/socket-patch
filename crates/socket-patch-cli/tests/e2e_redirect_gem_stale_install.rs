@@ -7308,43 +7308,45 @@ async fn a_patched_platform_copy_with_a_pruned_cache_is_judged_by_its_own_patch(
     }
 }
 
-/// What `vex` attests of a platform build is what Ruby loads. The archive
-/// RubyGems installed the copy from says which gem it was, with no
-/// request, and the installed tree is then held to that archive's own
-/// files: a copy whose archive is the patched gem while a file under
-/// `gems/<leaf>` has other bytes is not attested, and the scan replaces it
-/// from the archive.
+/// The record of the [`PLATFORM`] build's own patch, whose patched lib is
+/// `stamped`, as the patch API serves it.
+async fn mount_build_record(server: &MockServer, stamped: &str) {
+    let record = serde_json::json!({
+        "uuid": ARM_UUID,
+        "purl": format!("{PURL}?platform={PLATFORM}"),
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": { "lib/stale_probe_gem.rb": {
+            "beforeHash": compute_git_sha256_from_bytes(UPSTREAM_LIB.as_bytes()),
+            "afterHash": compute_git_sha256_from_bytes(stamped.as_bytes()),
+        } },
+        "vulnerabilities": {},
+        "description": "x", "license": "MIT", "tier": "free"
+    });
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{ARM_UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(record))
+        .mount(server)
+        .await;
+}
+
+/// `vex` judges an installed platform copy as it judges any installed
+/// package: its files against the record of that build's own patch, one
+/// request per build, asked without file contents. The archive in the gem
+/// home is no evidence for it.
+///
+/// * The healthy copy is attested.
+/// * A file of the gem with other bytes, or a file that is gone, leaves
+///   the build out, with the patched archive still in `cache/`.
+/// * The scan's guard goes by that archive's sha256 alone: it does not
+///   compare the installed files with it, so it says nothing.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_platform_copy_is_attested_by_its_archive_only_while_its_tree_is_the_archives() {
+async fn a_platform_copy_is_attested_by_the_record_of_its_own_patch() {
     use vex_e2e_common::{assert_not_attested, run_vex, statements_for, VexRun};
     let stamped = format!("# Socket Community Patch: {ARM_UUID}\n{PATCHED_LIB}");
     let server = MockServer::start().await;
-    let prebuilt = real_gem_for(&stamped, PLATFORM);
-    let other = real_gem_for(PATCHED_LIB, OTHER_PLATFORM);
-    mount_api_with(
-        &server,
-        None,
-        &sha256_of(&real_gem(PATCHED_LIB)),
-        &[
-            (PLATFORM, sha256_of(&prebuilt), Some(ARM_UUID)),
-            (OTHER_PLATFORM, sha256_of(&other), Some(LINUX_UUID)),
-        ],
-    )
-    .await;
     let tmp = tempfile::tempdir().unwrap();
-    let proj = tmp.path().join("proj");
-    std::fs::create_dir_all(&proj).unwrap();
-    std::fs::write(
-        proj.join("Gemfile"),
-        format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\n"),
-    )
-    .unwrap();
-    let upstream = |platform: &str| sha256_of(&real_gem_for(UPSTREAM_LIB, platform));
-    std::fs::write(
-        proj.join("Gemfile.lock"),
-        platform_lock(&upstream(PLATFORM), &upstream(OTHER_PLATFORM)),
-    )
-    .unwrap();
+    let proj = platform_project(&server, tmp.path(), &real_gem_for(&stamped, PLATFORM)).await;
+    mount_build_record(&server, &stamped).await;
     let home = project_home(&proj);
     let gem_dir = install_real_gem_for(&home, &stamped, PLATFORM);
     let uri = server.uri();
@@ -7353,6 +7355,11 @@ async fn a_platform_copy_is_attested_by_its_archive_only_while_its_tree_is_the_a
     let env = common::parse_json_envelope(&stdout);
     assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
     assert!(stale_warnings(&env).is_empty(), "{env}");
+    assert_eq!(
+        build_record_requests(&server).await,
+        0,
+        "the guard goes by the archive, with no record read"
+    );
 
     let run = VexRun {
         api_url: Some(uri.clone()),
@@ -7370,38 +7377,42 @@ async fn a_platform_copy_is_attested_by_its_archive_only_while_its_tree_is_the_a
         attested
             .iter()
             .any(|statement| statement["status"] == "not_affected"),
-        "the build is attested by its archive and its tree: {out}"
+        "the build is attested by its own record: {out}"
     );
-    let records = server
-        .received_requests()
-        .await
-        .unwrap_or_default()
+    assert_eq!(build_record_requests(&server).await, 1, "one request");
+    let requests = server.received_requests().await.unwrap_or_default();
+    let record = format!("/patches/view/{ARM_UUID}");
+    let asked = requests
         .iter()
-        .filter(|request| {
-            request
-                .url
-                .path()
-                .ends_with(&format!("/patches/view/{ARM_UUID}"))
-        })
-        .count();
-    assert_eq!(records, 0, "with no record of its patch read");
+        .find(|request| request.url.path().ends_with(&record))
+        .and_then(|request| request.url.query().map(str::to_string));
+    assert_eq!(asked.as_deref(), Some("include_blobs=false"));
 
-    // The same archive, and a file of the gem with other bytes.
-    std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), UPSTREAM_LIB).unwrap();
+    // The patched archive is still in `cache/`; a file of the gem is not
+    // what the build's patch makes of it.
+    let lib = gem_dir.join("lib").join("stale_probe_gem.rb");
+    std::fs::write(&lib, "module StaleProbeGem; end # edited\n").unwrap();
     let out = run_vex(&vex_e2e_common::binary(), &proj, &run);
     assert_not_attested(&out.envelope, &build, "hash_mismatch");
+    std::fs::remove_file(&lib).unwrap();
+    let out = run_vex(&vex_e2e_common::binary(), &proj, &run);
+    assert!(
+        statements_for(out.doc(), &build)
+            .iter()
+            .all(|statement| statement["status"] != "not_affected"),
+        "a build with a file gone is not attested: {out}"
+    );
 
-    // The scan sees the same, and puts the archive's files back.
+    // The guard does not hold the tree to the archive: nothing is said.
     let (code, stdout, stderr) =
         common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
     let env = common::parse_json_envelope(&stdout);
     assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
-    assert_eq!(
-        warnings_with_code(&env, "redirect_gem_install_refreshed").len(),
-        1,
+    assert!(stale_warnings(&env).is_empty(), "{env}");
+    assert!(
+        warnings_with_code(&env, "redirect_gem_install_refreshed").is_empty(),
         "{env}"
     );
-    assert_eq!(installed_lib(&gem_dir), stamped);
 }
 
 /// A project locked on the two platform builds of the fixture gem, against
@@ -7447,87 +7458,110 @@ async fn build_record_requests(server: &MockServer) -> usize {
 }
 
 /// The `--vex` of the run that moved the lock judges an installed platform
-/// copy by the digest that run's own reference listed: the archive says
-/// the copy is the patched build, and no record is read. Where the gem
-/// home keeps no archive and the build's record cannot be read, the build
-/// the run just confirmed is not stated `affected`: the run's own gate
-/// withholds the gem as a copy nothing judged, as it does for any gem.
+/// copy as `vex` does: against the record of the build's own patch, with
+/// one request. Where that record cannot be read nothing judges the copy,
+/// and the build is stated `affected` under the unknown-build warning, as
+/// `vex` states it: what the run assumes of the gem does not attest it.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_vex_of_the_run_that_moved_the_lock_goes_by_that_runs_digest() {
+async fn the_vex_of_the_run_that_moved_the_lock_checks_a_build_by_its_own_record() {
     let stamped = format!("# Socket Community Patch: {ARM_UUID}\n{PATCHED_LIB}");
     let build = format!("{PURL}?platform={PLATFORM}");
-    for pruned in [false, true] {
+    for record_served in [true, false] {
         let server = MockServer::start().await;
         let tmp = tempfile::tempdir().unwrap();
         let proj = platform_project(&server, tmp.path(), &real_gem_for(&stamped, PLATFORM)).await;
-        let home = project_home(&proj);
-        install_real_gem_for(&home, &stamped, PLATFORM);
-        if pruned {
-            std::fs::remove_dir_all(home.join("cache")).unwrap();
+        if record_served {
+            mount_build_record(&server, &stamped).await;
         }
-        let vex_path = proj.join("out.vex.json");
-        let uri = server.uri();
-        let args = scan_args(
-            &proj,
-            &uri,
-            &[
-                "--json",
-                "--vex",
-                vex_path.to_str().unwrap(),
-                "--vex-product",
-                "pkg:gem/app@1.0.0",
-            ],
-        );
-        let (code, stdout, stderr) = common::run_with_env(&proj, &args, &[]);
-        let env = common::parse_json_envelope(&stdout);
-        // With nothing to judge the copy by, the run's gate withholds the
-        // gem, and an embedded document with nothing in it fails the run.
-        assert_eq!(
-            code == 0,
-            !pruned,
-            "pruned: {pruned}: {env}\nstderr:\n{stderr}"
-        );
-        let doc: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&vex_path).unwrap_or_default())
-                .unwrap_or_default();
+        install_real_gem_for(&project_home(&proj), &stamped, PLATFORM);
+        let (code, env, doc) = scan_with_vex(&proj, &server.uri());
+        let label = format!("record served: {record_served}: {env}\n{doc}");
+        assert_eq!(code, 0, "{label}");
         let statuses: Vec<&str> = vex_e2e_common::statements_for(&doc, &build)
             .iter()
             .filter_map(|statement| statement["status"].as_str())
             .collect();
-        match pruned {
+        assert_eq!(build_record_requests(&server).await, 1, "{label}");
+        match record_served {
+            true => assert_eq!(statuses, ["not_affected"], "{label}"),
             false => {
-                assert_eq!(statuses, ["not_affected"], "{env}\n{doc}");
-                assert_eq!(build_record_requests(&server).await, 0, "no record is read");
+                assert_eq!(statuses, ["affected"], "{label}");
+                let warned = env["vex"]["warnings"].to_string();
+                assert!(warned.contains("vex_gem_build_unknown"), "{label}");
             }
-            true => assert!(
-                !statuses.contains(&"affected")
-                    && !env.to_string().contains("vex_gem_build_unknown"),
-                "a build the run confirmed is not stated affected for a read that failed: \
-                 {env}\n{doc}"
-            ),
         }
     }
 }
 
+/// `scan --mode hosted --json --vex` in `proj`: the exit code, the
+/// envelope and the document it wrote (null where it wrote none).
+fn scan_with_vex(proj: &Path, uri: &str) -> (i32, serde_json::Value, serde_json::Value) {
+    let vex_path = proj.join("out.vex.json");
+    let _ = std::fs::remove_file(&vex_path);
+    let vex = ["--json", "--vex", vex_path.to_str().unwrap()];
+    let product = ["--vex-product", "pkg:gem/app@1.0.0"];
+    let args = scan_args(proj, uri, &[vex.as_slice(), product.as_slice()].concat());
+    let (code, stdout, _stderr) = common::run_with_env(proj, &args, &[]);
+    let doc = serde_json::from_slice(&std::fs::read(&vex_path).unwrap_or_default());
+    (
+        code,
+        common::parse_json_envelope(&stdout),
+        doc.unwrap_or_default(),
+    )
+}
+
 /// A platform build has one `vex` outcome, from all of its installed
-/// copies, and is attested only when every copy is shown to be the patched
-/// build.
+/// copies, and is attested only when every copy is the patched build by
+/// the record of its own patch.
 ///
-/// * The same build installed from another gem in two gem homes is left
-///   out once, not once per home.
-/// * One copy proven by its archive beside one that nothing can judge (no
-///   archive, and the build's record cannot be read) is not attested: the
-///   build is stated `affected` once, under the unknown-build warning, and
-///   is in no other list.
+/// * The same build installed from upstream's gem in two gem homes is
+///   left out once, not once per home.
+/// * One patched copy beside one that is upstream's gem is left out.
+/// * Where the build's record cannot be read nothing judges the copies:
+///   the build is stated `affected` once, under the unknown-build
+///   warning, and is in no other list.
+/// * The run that moves the lock holds the build to the same: what it
+///   assumes of the gem does not speak for a copy in a gem home its guard
+///   left as it was.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_platform_build_in_two_gem_homes_has_one_vex_outcome() {
     use vex_e2e_common::{run_vex, statements_for, VexRun};
     let stamped = format!("# Socket Community Patch: {ARM_UUID}\n{PATCHED_LIB}");
     let build = format!("{PURL}?platform={PLATFORM}");
-    for proven_beside_unjudged in [false, true] {
+    let outcome = |envelope: &serde_json::Value, doc: &serde_json::Value| {
+        let events: Vec<(String, String)> = envelope["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|event| event["purl"] == build.as_str())
+            .map(|event| {
+                let text = |key: &str| event[key].as_str().unwrap_or_default().to_string();
+                (text("action"), text("errorCode"))
+            })
+            .collect();
+        let statuses: Vec<String> = statements_for(doc, &build)
+            .iter()
+            .filter_map(|statement| statement["status"].as_str().map(str::to_string))
+            .collect();
+        (events, statuses)
+    };
+    let skipped = |code: &str| vec![("skipped".to_string(), code.to_string())];
+    for (first_lib, second_lib, record_served, expected) in [
+        (UPSTREAM_LIB, UPSTREAM_LIB, true, "not_applied"),
+        (stamped.as_str(), UPSTREAM_LIB, true, "not_applied"),
+        (
+            stamped.as_str(),
+            stamped.as_str(),
+            false,
+            "vex_gem_build_unknown",
+        ),
+    ] {
         let server = MockServer::start().await;
         let tmp = tempfile::tempdir().unwrap();
         let proj = platform_project(&server, tmp.path(), &real_gem_for(&stamped, PLATFORM)).await;
+        if record_served {
+            mount_build_record(&server, &stamped).await;
+        }
         let uri = server.uri();
         let (code, stdout, stderr) =
             common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
@@ -7535,18 +7569,8 @@ async fn a_platform_build_in_two_gem_homes_has_one_vex_outcome() {
         // Two gem homes of the project: the trees of two Rubies.
         let first = project_home(&proj);
         let second = first.with_file_name("3.4.0");
-        match proven_beside_unjudged {
-            false => {
-                // Both copies were installed from upstream's gem.
-                install_real_gem_for(&first, UPSTREAM_LIB, PLATFORM);
-                install_real_gem_for(&second, UPSTREAM_LIB, PLATFORM);
-            }
-            true => {
-                install_real_gem_for(&first, &stamped, PLATFORM);
-                install_real_gem_for(&second, &stamped, PLATFORM);
-                std::fs::remove_dir_all(second.join("cache")).unwrap();
-            }
-        }
+        install_real_gem_for(&first, first_lib, PLATFORM);
+        install_real_gem_for(&second, second_lib, PLATFORM);
         let run = VexRun {
             api_url: Some(uri.clone()),
             api_token: Some("fake".into()),
@@ -7556,30 +7580,35 @@ async fn a_platform_build_in_two_gem_homes_has_one_vex_outcome() {
             ..VexRun::default()
         };
         let out = run_vex(&vex_e2e_common::binary(), &proj, &run);
-        let label = format!("proven beside unjudged: {proven_beside_unjudged}: {out}");
-        let events: Vec<(&str, &str)> = out.envelope["events"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|event| event["purl"] == build.as_str())
-            .map(|event| {
-                let text = |key: &str| event[key].as_str().unwrap_or_default();
-                (text("action"), text("errorCode"))
-            })
-            .collect();
-        let statuses: Vec<&str> = statements_for(out.doc(), &build)
-            .iter()
-            .filter_map(|statement| statement["status"].as_str())
-            .collect();
-        match proven_beside_unjudged {
-            false => {
-                assert_eq!(events, [("skipped", "not_applied")], "{label}");
-                assert!(statuses.is_empty(), "{label}");
-            }
-            true => {
-                assert_eq!(events, [("skipped", "vex_gem_build_unknown")], "{label}");
-                assert_eq!(statuses, ["affected"], "{label}");
-            }
-        }
+        let label = format!("{expected}: {out}");
+        let (events, statuses) = outcome(&out.envelope, out.doc());
+        assert_eq!(events, skipped(expected), "{label}");
+        let affected = match record_served {
+            true => Vec::new(),
+            false => vec!["affected".to_string()],
+        };
+        assert_eq!(statuses, affected, "{label}");
+        assert_eq!(build_record_requests(&server).await, 1, "one per build");
     }
+
+    // The run that moves the lock, with a copy its guard passes (the
+    // archive in `cache/` is the patched gem) whose files are not the
+    // patched build's: the guard says nothing, and the run's own document
+    // does not attest the build on the strength of the gem's pin.
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = platform_project(&server, tmp.path(), &real_gem_for(&stamped, PLATFORM)).await;
+    mount_build_record(&server, &stamped).await;
+    let first = project_home(&proj);
+    install_real_gem_for(&first, &stamped, PLATFORM);
+    let other = install_real_gem_for(&first.with_file_name("3.4.0"), &stamped, PLATFORM);
+    std::fs::write(other.join("lib").join("stale_probe_gem.rb"), UPSTREAM_LIB).unwrap();
+    let (code, env, doc) = scan_with_vex(&proj, &server.uri());
+    assert_eq!(code, 0, "{env}");
+    assert!(stale_warnings(&env).is_empty(), "{env}");
+    let (_, statuses) = outcome(&env, &doc);
+    assert!(
+        !statuses.iter().any(|status| status == "not_affected"),
+        "a build with an unpatched copy is not attested by the run: {env}\n{doc}"
+    );
 }
