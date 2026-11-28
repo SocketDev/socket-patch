@@ -3538,6 +3538,21 @@ pub fn gem_snapshots_for(uuids: &[String], held: &GemSnapshotKeys) -> GemSnapsho
         .collect()
 }
 
+/// The request a host's provider is handed for
+/// [`PatchApi::fetch_registry_references`], which is the v0 API's body:
+/// the patches asked about, `gemBuilds` (the hosted engine reads each gem
+/// patch's list of builds, and the service reads a snapshot key only on
+/// such a request), and the registry snapshots `held` names for `uuids`
+/// (`gemSnapshotKeys`, left out when it names none).
+pub fn provider_references_request(uuids: &[String], held: &GemSnapshotKeys) -> serde_json::Value {
+    let presented = gem_snapshots_for(uuids, held);
+    let mut request = serde_json::json!({ "uuids": uuids, "gemBuilds": true });
+    if !presented.is_empty() {
+        request["gemSnapshotKeys"] = serde_json::json!(presented);
+    }
+    request
+}
+
 /// The patch-data calls the hosted flow makes, as an object-safe trait so an
 /// embedding host (the in-memory engine, a napi addon) can serve them
 /// in-process. [`ApiClient`] implements it by forwarding to its inherent
@@ -5560,6 +5575,32 @@ mod vendor_package_tests {
             outcome,
             VendorServiceOutcome::Failed(ApiError::InvalidHash(_))
         ));
+    }
+
+    /// The request a host's provider gets says what the engine needs:
+    /// the list of each gem's builds, and the snapshots of the patches it
+    /// asks about, in any case of the uuid, left out when there is none.
+    #[test]
+    fn the_provider_request_asks_for_gem_builds_and_presents_the_snapshots() {
+        const OTHER: &str = "22222222-2222-4222-8222-222222222222";
+        let uuids = [UUID.to_string()];
+        let held: GemSnapshotKeys = [
+            (UUID.to_uppercase(), "9f3c01".to_string()),
+            (OTHER.to_string(), "4a".to_string()),
+        ]
+        .into();
+        assert_eq!(
+            provider_references_request(&uuids, &held),
+            json!({
+                "uuids": [UUID],
+                "gemBuilds": true,
+                "gemSnapshotKeys": { UUID.to_uppercase(): "9f3c01" },
+            })
+        );
+        assert_eq!(
+            provider_references_request(&uuids, &GemSnapshotKeys::new()),
+            json!({ "uuids": [UUID], "gemBuilds": true })
+        );
     }
 
     // ── fetch_vendor_reference(s) (a gem's platform builds) ────────────

@@ -840,6 +840,58 @@ async fn parity_gemfile_platform_lock_on_its_patch_through_a_rebuild() {
     );
 }
 
+/// A lock that is on a snapshot registry, and a patch service that answers
+/// references with no list of builds, as it does for a host that does not
+/// ask for one. Neither engine has a list to pin the locked builds by, so
+/// both leave the pair byte for byte and say the same.
+#[tokio::test]
+async fn parity_gemfile_platform_lock_on_a_snapshot_given_plain_references() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    const FIX: &str = "77777777-7777-7777-7777-777777777777";
+    let dir = fixtures_root().join("redirect/gem/bundler/platform-pass-through");
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
+    mount_api(&server, &patches).await;
+    let mut files = fixture_files(&dir.join("expected"));
+    for bytes in files.values_mut() {
+        let text = String::from_utf8(bytes.clone()).expect("a text fixture");
+        *bytes = text
+            .replace("https://patch.socket.dev", &server.uri())
+            .into_bytes();
+    }
+    let mut plain = patches[0].reference.clone();
+    let registry = &mut plain["registryOverride"];
+    let index = registry["indexUrl"].as_str().expect("an index URL");
+    let root = index.split("/s/").next().expect("a registry root");
+    registry["indexUrl"] = serde_json::json!(format!("{root}/"));
+    let identifiers = registry["identifiers"].as_object_mut();
+    identifiers.expect("identifiers").remove("gemBuilds");
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "results": { FIX: plain } })),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let name = "a lock on a snapshot given plain references";
+    let (redirect, project) = assert_parity_over(name, &server, &files, false, false).await;
+    assert_eq!(
+        redirect["rewrittenFiles"],
+        serde_json::json!([]),
+        "{redirect:#}"
+    );
+    let codes: Vec<&str> = redirect["warnings"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|w| w["code"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(codes, ["redirect_gem_platform_unsupported"], "{redirect:#}");
+    assert_eq!(project.redirected.len(), 1, "{:?}", project.redirected);
+}
+
 /// The gem fixture as the root of a Bazel workspace whose rules_ruby hub
 /// reads the lock and names the patched gem in `gem_checksums`. With the
 /// sha256 of the upstream archive there, the checkout and the engine write

@@ -1021,23 +1021,50 @@ async fn engine(
     }
     phases.mark("classify");
 
-    let uuids: BTreeSet<String> = states
-        .iter()
-        .filter(|s| s.error.is_none())
-        .flat_map(|s| s.selected.iter().map(|(_, u)| u.clone()))
-        .collect();
-    let gem_snapshots =
-        discover::gem_snapshots_of(states.iter().filter_map(|state| state.project.as_ref()));
-    let (references, failed_refs) = if uuids.is_empty() {
-        (HashMap::new(), BTreeMap::new())
-    } else {
-        discover::fetch_references(&provider, &uuids, &gem_snapshots).await
-    };
+    // A root is answered by the registry snapshots its own Bundler lock
+    // names, as a checkout of it alone would be: roots that present the
+    // same snapshots share a request, a root with others or none has its
+    // own.
+    let mut root_snapshots: Vec<crate::api::client::GemSnapshotKeys> = Vec::new();
+    for state in &states {
+        root_snapshots.push(match (&state.error, &state.project) {
+            (None, Some(project)) => {
+                let view = ProjectView::Memory(project);
+                crate::hosted::engine::gem_snapshots_presented(&view, &state.unreadable).await
+            }
+            _ => Default::default(),
+        });
+    }
+    let mut asked: BTreeMap<&crate::api::client::GemSnapshotKeys, BTreeSet<String>> =
+        BTreeMap::new();
+    for (state, held) in states.iter().zip(&root_snapshots) {
+        if state.error.is_none() {
+            let uuids = state.selected.iter().map(|(_, uuid)| uuid.clone());
+            asked.entry(held).or_default().extend(uuids);
+        }
+    }
+    let mut answered = BTreeMap::new();
+    for (held, uuids) in asked {
+        if !uuids.is_empty() {
+            answered.insert(
+                held,
+                discover::fetch_references(&provider, &uuids, held).await,
+            );
+        }
+    }
+    let unasked = (HashMap::new(), BTreeMap::new());
+    // The references of the root at `index`, and the uuids whose request
+    // failed.
+    let references_of = |index: usize| answered.get(&root_snapshots[index]).unwrap_or(&unasked);
     // Roots whose rows' eligibility is unknown: a reference failure that
     // hit only NEW rows of a capped run defers them instead of failing the
     // root (§5.2).
     let mut unknown_roots: BTreeSet<String> = BTreeSet::new();
-    for state in states.iter_mut().filter(|s| s.error.is_none()) {
+    for (index, state) in states.iter_mut().enumerate() {
+        if state.error.is_some() {
+            continue;
+        }
+        let failed_refs = &references_of(index).1;
         if let Some(error) = state
             .selected
             .iter()
@@ -1069,7 +1096,8 @@ async fn engine(
             continue;
         };
         let unreadable = std::mem::take(&mut state.unreadable);
-        match stages::plan(project, unreadable, &state.selected, &references).await {
+        let references = &references_of(index).0;
+        match stages::plan(project, unreadable, &state.selected, references).await {
             Ok(plan) => planned.push((index, plan)),
             Err(refusal) => state.error = Some(ProjectError::from(refusal)),
         }
@@ -1148,24 +1176,28 @@ async fn engine(
     for (_, plan) in planned.iter_mut() {
         refreshes.push(stages::record_gem_indexes(plan, &gem_indexes));
     }
-    if refreshes.iter().any(|targets| !targets.is_empty()) {
-        let asked = || refreshes.iter().flatten().map(|target| &target.uuid);
-        let mut answers: HashMap<String, crate::api::types::PackageVendorResult> = asked()
-            .filter_map(|uuid| Some((uuid.clone(), references.get(uuid)?.clone())))
+    for ((index, plan), targets) in planned.iter_mut().zip(&refreshes) {
+        if targets.is_empty() {
+            continue;
+        }
+        let known = &references_of(*index).0;
+        let mut answers: HashMap<String, crate::api::types::PackageVendorResult> = targets
+            .iter()
+            .filter_map(|target| Some((target.uuid.clone(), known.get(&target.uuid)?.clone())))
             .collect();
-        let unknown: BTreeSet<String> = asked()
+        let unknown: BTreeSet<String> = targets
+            .iter()
+            .map(|target| &target.uuid)
             .filter(|uuid| !answers.contains_key(*uuid))
             .cloned()
             .collect();
         if !unknown.is_empty() {
             // A request that fails answers for none of them.
-            let (answered, _) =
-                discover::fetch_references(&provider, &unknown, &gem_snapshots).await;
-            answers.extend(answered);
+            let held = &root_snapshots[*index];
+            let (more, _) = discover::fetch_references(&provider, &unknown, held).await;
+            answers.extend(more);
         }
-        for ((_, plan), targets) in planned.iter_mut().zip(&refreshes) {
-            stages::refresh_gem_patches(plan, targets, &answers);
-        }
+        stages::refresh_gem_patches(plan, targets, &answers);
     }
     phases.mark("plan");
 
@@ -2104,6 +2136,13 @@ mod tests {
         earlier: Option<serde_json::Value>,
         /// The uuids of each reference request, in order.
         asked_references: std::sync::Mutex<Vec<Vec<String>>>,
+        /// The snapshot of the registry of [`GEM_NEWER`] while a gem it
+        /// lists is being built again: a request is then answered by the
+        /// snapshot it presents (that registry for this one, not ready for
+        /// another, the ruby gem's registry and no list for none).
+        rebuilding: Option<&'static str>,
+        /// The snapshots each reference request presented, in order.
+        asked_snapshots: std::sync::Mutex<Vec<crate::api::client::GemSnapshotKeys>>,
     }
 
     impl PatchApi for GemPatchService {
@@ -2162,12 +2201,16 @@ mod tests {
         fn fetch_registry_references<'a>(
             &'a self,
             uuids: &'a [String],
-            _: &'a crate::api::client::GemSnapshotKeys,
+            presented: &'a crate::api::client::GemSnapshotKeys,
         ) -> crate::api::client::ApiFuture<
             'a,
             HashMap<String, crate::api::types::PackageVendorResult>,
         > {
             let registry = gem_registry(GEM_NEWER);
+            let mut asked = self.asked_snapshots.lock().unwrap();
+            asked.push(crate::api::client::gem_snapshots_for(uuids, presented));
+            drop(asked);
+            let held = presented.get(GEM_NEWER).map(String::as_str);
             let reference = serde_json::json!({
                 "status": "granted",
                 "url": format!("{registry}gems/rails-7.0.0.gem"),
@@ -2192,6 +2235,22 @@ mod tests {
                     }
                 }
             });
+            // In a rebuild the answer goes by the snapshot presented.
+            let reference = match (self.rebuilding, held) {
+                (None, _) => reference,
+                (Some(current), Some(held)) if held == current => reference,
+                (Some(_), Some(_)) => serde_json::json!({
+                    "status": "pending_build", "url": null, "purl": null, "artifacts": [],
+                    "registryOverride": null,
+                }),
+                (Some(_), None) => {
+                    let mut plain = reference;
+                    plain["registryOverride"]["indexUrl"] = serde_json::json!(registry);
+                    let identifiers = plain["registryOverride"]["identifiers"].as_object_mut();
+                    identifiers.expect("identifiers").remove("gemBuilds");
+                    plain
+                }
+            };
             self.asked_references.lock().unwrap().push(uuids.to_vec());
             let granted = uuids
                 .iter()
@@ -2276,6 +2335,8 @@ mod tests {
             asked: std::sync::Mutex::new(Vec::new()),
             earlier,
             asked_references: std::sync::Mutex::new(Vec::new()),
+            rebuilding: None,
+            asked_snapshots: std::sync::Mutex::new(Vec::new()),
         });
         let mut session = SessionBuilder::new(HostedScanOptions {
             org_slug: "acme".to_string(),
@@ -2293,6 +2354,109 @@ mod tests {
         let asked = service.asked.lock().unwrap().clone();
         let asked_references = service.asked_references.lock().unwrap().clone();
         (output, asked, asked_references)
+    }
+
+    /// Three roots in one run while a gem of the fix's registry is being
+    /// built again: one on that registry's snapshot, one on an earlier
+    /// snapshot of it, one not on the patch. Each is asked about with the
+    /// snapshots its own lock names, so each gets the answer a checkout of
+    /// it alone would: the first is left as it is, the second is told the
+    /// patch is not ready, and the third is not moved onto a registry
+    /// whose gem cannot be installed yet. Nothing is written.
+    #[tokio::test]
+    async fn each_root_is_answered_by_the_snapshots_its_own_lock_names() {
+        let registry = gem_registry(GEM_NEWER);
+        let on_snapshot = |snapshot: &str| {
+            let remote = format!("{registry}s/{snapshot}/");
+            let gemfile = format!(
+                "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\", source: \
+                 \"{remote}\"\n"
+            );
+            let lock = format!(
+                "GEM\n  remote: {remote}\n  specs:\n    rails (7.0.0-arm64-darwin)\n    rails \
+                 (7.0.0-x86_64-linux-gnu)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n\n\
+                 PLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\nDEPENDENCIES\n  rails (= \
+                 7.0.0)!\n\nCHECKSUMS\n  rails (7.0.0-arm64-darwin) sha256={}\n  rails \
+                 (7.0.0-x86_64-linux-gnu) sha256={}\n\nBUNDLED WITH\n  4.0.15\n",
+                "d".repeat(64),
+                "2".repeat(64)
+            );
+            (gemfile, lock)
+        };
+        let upstream = (
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0-arm64-darwin)\n    \
+             rails (7.0.0-x86_64-linux-gnu)\n\nPLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\n\
+             DEPENDENCIES\n  rails (= 7.0.0)\n\nBUNDLED WITH\n  4.0.15\n"
+                .to_string(),
+        );
+        let roots = [
+            ("current", on_snapshot("c4")),
+            ("earlier", on_snapshot("1a")),
+            ("upstream", upstream),
+        ];
+        let service = Arc::new(GemPatchService {
+            served: BTreeMap::new(),
+            asked: std::sync::Mutex::new(Vec::new()),
+            earlier: None,
+            asked_references: std::sync::Mutex::new(Vec::new()),
+            rebuilding: Some("c4"),
+            asked_snapshots: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut session = SessionBuilder::new(HostedScanOptions {
+            org_slug: "acme".to_string(),
+            project_roots: Some(roots.iter().map(|(root, _)| root.to_string()).collect()),
+            ..HostedScanOptions::default()
+        })
+        .expect("valid options");
+        for (root, (gemfile, lock)) in &roots {
+            for (name, text) in [("Gemfile", gemfile), ("Gemfile.lock", lock)] {
+                let path = format!("{root}/{name}");
+                session.push_chunk(&path, text.as_bytes()).unwrap();
+                session.end_file(&path).unwrap();
+            }
+        }
+        let input = session.finish().unwrap();
+        let output = run_in_memory(input, service.clone(), CancellationToken::new())
+            .await
+            .expect("an engine run");
+
+        let held = |snapshot: &str| -> crate::api::client::GemSnapshotKeys {
+            [(GEM_NEWER.to_string(), snapshot.to_string())].into()
+        };
+        let mut asked = service.asked_snapshots.lock().unwrap().clone();
+        asked.sort();
+        let mut expected = vec![held("c4"), held("1a"), Default::default()];
+        expected.sort();
+        assert_eq!(
+            asked, expected,
+            "one request for each distinct set of snapshots"
+        );
+        assert!(
+            output.changed_files.is_empty(),
+            "{:?}",
+            output.changed_files
+        );
+        let project = |root: &str| {
+            let found = output.projects.iter().find(|project| project.root == root);
+            found.unwrap_or_else(|| panic!("no project {root}: {:?}", output.projects))
+        };
+        let reasons = |root: &str| -> Vec<&str> {
+            let skipped = &project(root).skipped;
+            skipped.iter().map(|skip| skip.reason.as_str()).collect()
+        };
+        assert!(project("current").error.is_none());
+        assert!(
+            !reasons("current").contains(&"pending_build"),
+            "the root on the current snapshot is answered it: {:?}",
+            project("current")
+        );
+        assert_eq!(reasons("earlier"), ["pending_build"]);
+        assert!(
+            project("upstream").redirected.is_empty(),
+            "a root not on the patch is not moved during the rebuild: {:?}",
+            project("upstream")
+        );
     }
 
     /// The in-memory engine never moves a lock from one patch of a gem to

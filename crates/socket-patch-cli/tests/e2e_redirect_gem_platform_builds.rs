@@ -4492,46 +4492,110 @@ async fn a_lock_on_an_earlier_snapshot_waits_out_a_rebuild_and_then_moves_once()
     );
 }
 
-/// A project with both spellings of the Bundler pair, each lock on another
-/// snapshot of the patch. Bundler reads `gems.rb` and `gems.locked` there,
-/// and so does the rewriter: the key every reference request presents is
-/// the one `gems.locked` names, never the stale `Gemfile.lock`'s.
+/// The files of a Bundler pair as a hosted run leaves them on the snapshot
+/// `index` names, written into `proj` under `manifest` and `lock`.
+fn write_hosted_pair(proj: &Path, manifest: &str, lock: &str, index: &str) {
+    std::fs::write(proj.join(manifest), hosted_gemfile(index)).unwrap();
+    let pinned = hosted_lock(index, ARM_UPSTREAM, LINUX_PATCHED);
+    std::fs::write(proj.join(lock), pinned).unwrap();
+}
+
+/// The snapshot each reference request of the run presented for the patch.
+async fn presented_keys(server: &MockServer) -> Vec<Value> {
+    let bodies = reference_bodies(server).await;
+    bodies
+        .iter()
+        .map(|body| body["gemSnapshotKeys"][UUID].clone())
+        .collect()
+}
+
+/// A `gems.rb` project with an orphan `Gemfile.lock` beside it, each lock
+/// on another snapshot of the patch. Bundler loads `gems.rb`, so the run
+/// rewrites `gems.rb` and `gems.locked`, presents the snapshot
+/// `gems.locked` names, and leaves the orphan as it is.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_key_presented_is_the_one_of_the_lock_the_run_rewrites() {
+async fn a_gems_rb_project_presents_and_rewrites_gems_locked_beside_an_orphan_lock() {
     let server = MockServer::start().await;
     let api = server.uri();
-    mount_api(&server, Some((&ONE_PATCHED[..], 4))).await;
-    let current = format!("{}/", index_url(&api, Some(4)));
-    let stale = format!("{}/", index_url(&api, Some(9)));
-    let proj = hosted_project(&stale, ARM_UPSTREAM, LINUX_PATCHED, true);
-    let write = |rel: &str, text: String| std::fs::write(proj.path().join(rel), text).unwrap();
-    write("gems.rb", hosted_gemfile(&current));
-    write(
-        "gems.locked",
-        hosted_lock(&current, ARM_UPSTREAM, LINUX_PATCHED),
-    );
-    let (code, env) = scan_json(proj.path(), &api, &[]);
-    assert_eq!(code, 0, "{env}");
-    let bodies = reference_bodies(&server).await;
-    assert!(
-        !bodies.is_empty()
-            && bodies
-                .iter()
-                .all(|body| body["gemSnapshotKeys"] == json!({ UUID: "4" })),
-        "the snapshot of gems.locked is presented: {bodies:?}"
-    );
+    mount_api(&server, Some((&BOTH_PATCHED[..], 5))).await;
+    let index = |snapshot: u32| format!("{}/", index_url(&api, Some(snapshot)));
+    let dir = tempfile::tempdir().unwrap();
+    let proj = dir.path();
+    write_hosted_pair(proj, "gems.rb", "gems.locked", &index(4));
+    let orphan = hosted_lock(&index(9), ARM_UPSTREAM, LINUX_PATCHED);
+    std::fs::write(proj.join("Gemfile.lock"), &orphan).unwrap();
 
-    // Without a gems.rb the pair is Gemfile and Gemfile.lock.
-    std::fs::remove_file(proj.path().join("gems.rb")).unwrap();
-    std::fs::remove_file(proj.path().join("gems.locked")).unwrap();
-    server.reset().await;
-    mount_api(&server, Some((&ONE_PATCHED[..], 4))).await;
-    let (code, env) = scan_json(proj.path(), &api, &[]);
+    let (code, env) = scan_json(proj, &api, &[]);
     assert_eq!(code, 0, "{env}");
-    let first = reference_bodies(&server).await;
+    let keys = presented_keys(&server).await;
+    assert!(
+        !keys.is_empty() && keys.iter().all(|key| key == "4"),
+        "the snapshot of gems.locked is presented: {keys:?}"
+    );
     assert_eq!(
-        first.first().map(|body| &body["gemSnapshotKeys"]),
-        Some(&json!({ UUID: "9" })),
-        "{first:?}"
+        read(proj, "gems.locked"),
+        hosted_lock(&index(5), ARM_PATCHED, LINUX_PATCHED),
+        "{env}"
+    );
+    assert_eq!(read(proj, "gems.rb"), hosted_gemfile(&index(5)));
+    assert_eq!(
+        read(proj, "Gemfile.lock"),
+        orphan,
+        "the orphan is untouched"
+    );
+    assert!(!proj.join("Gemfile").exists());
+}
+
+/// Both spellings of the pair side by side, each lock on another snapshot
+/// of the patch, with `BUNDLE_GEMFILE` naming the `Gemfile`. Bundler loads
+/// that pair, so the run rewrites it and presents the snapshot
+/// `Gemfile.lock` names; the `gems.rb` pair is left as it is. Without the
+/// setting nothing says which pair Bundler loads: neither is rewritten,
+/// and no snapshot is presented.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_twin_presents_and_rewrites_the_pair_bundle_gemfile_names() {
+    let server = MockServer::start().await;
+    let api = server.uri();
+    mount_api(&server, Some((&BOTH_PATCHED[..], 5))).await;
+    let index = |snapshot: u32| format!("{}/", index_url(&api, Some(snapshot)));
+    let dir = tempfile::tempdir().unwrap();
+    let proj = dir.path();
+    write_hosted_pair(proj, "Gemfile", "Gemfile.lock", &index(4));
+    write_hosted_pair(proj, "gems.rb", "gems.locked", &index(9));
+    let other = (read(proj, "gems.rb"), read(proj, "gems.locked"));
+    std::fs::create_dir(proj.join(".bundle")).unwrap();
+    let config = proj.join(".bundle/config");
+    std::fs::write(&config, "---\nBUNDLE_GEMFILE: \"Gemfile\"\n").unwrap();
+
+    let (code, env) = scan_json(proj, &api, &[]);
+    assert_eq!(code, 0, "{env}");
+    let keys = presented_keys(&server).await;
+    assert!(
+        !keys.is_empty() && keys.iter().all(|key| key == "4"),
+        "the snapshot of Gemfile.lock is presented: {keys:?}"
+    );
+    assert_eq!(
+        read(proj, "Gemfile.lock"),
+        hosted_lock(&index(5), ARM_PATCHED, LINUX_PATCHED),
+        "{env}"
+    );
+    assert_eq!(read(proj, "Gemfile"), hosted_gemfile(&index(5)));
+    assert_eq!((read(proj, "gems.rb"), read(proj, "gems.locked")), other);
+
+    std::fs::remove_file(&config).unwrap();
+    server.reset().await;
+    mount_api(&server, Some((&BOTH_PATCHED[..], 6))).await;
+    let before = (read(proj, "Gemfile"), read(proj, "Gemfile.lock"));
+    let (_, env) = scan_json(proj, &api, &[]);
+    assert_eq!(
+        (read(proj, "Gemfile"), read(proj, "Gemfile.lock")),
+        before,
+        "{env}"
+    );
+    assert_eq!((read(proj, "gems.rb"), read(proj, "gems.locked")), other);
+    let keys = presented_keys(&server).await;
+    assert!(
+        keys.iter().all(Value::is_null),
+        "a twin nothing settles presents no snapshot: {keys:?}"
     );
 }

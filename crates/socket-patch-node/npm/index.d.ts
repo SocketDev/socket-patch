@@ -34,8 +34,8 @@ export interface PatchResponse { uuid: string; purl: string; publishedAt: string
 export interface PatchProvider {
   searchPatchesBatch(request: { components: { purl: string }[] }): Promise<ProviderResult<BatchSearchResponse>>
   searchPatchesByPackage(request: { purl: string }): Promise<ProviderResult<SearchResponse>>
-  // gemSnapshotKeys: the registry snapshot a project's Bundler lock names for a patch, by uuid; present only when a lock names one. Pass it on with the request (it is the v0 API's body), so a gem that is being rebuilt leaves that lock as it is.
-  fetchRegistryReferences(request: { uuids: string[]; gemSnapshotKeys?: Record<string, string> }): Promise<ProviderResult<{ results: Record<string, PackageVendorResult> }>>
+  // The request is the v0 API's body for POST …/patches/package. gemBuilds: the engine reads each gem patch's list of builds. gemSnapshotKeys: the registry snapshot a root's Bundler lock names for a patch, by uuid, present only when a lock names one (the service reads it only on a gemBuilds request; with it a gem that is being rebuilt leaves that lock as it is). Roots that name different snapshots are asked about in separate calls. A provider that builds its own body from `uuids` gets references with no list, and a lock of platform gems is then left alone.
+  fetchRegistryReferences(request: { uuids: string[]; gemBuilds: true; gemSnapshotKeys?: Record<string, string> }): Promise<ProviderResult<{ results: Record<string, PackageVendorResult> }>>
   // Ignored: the engine no longer fetches patch views. Optional so existing providers still type-check.
   fetchPatch?(request: { uuid: string }): Promise<ProviderResult<PatchResponse | null>>
   downloadArtifact(request: { url: string; maxBytes: number }): Promise<ProviderResult<Buffer>>

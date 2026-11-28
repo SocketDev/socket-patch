@@ -1848,23 +1848,18 @@ struct HostedTelemetry {
 
 /// The registry snapshots the Bundler lock of the project in `cwd` takes
 /// gems from, by patch uuid: what the run's reference requests present
-/// ([`ApiClient::fetch_registry_references`]). The lock is the one the
-/// rewriter edits ([`gem_project_snapshot_keys`]).
+/// ([`ApiClient::fetch_registry_references`]). The lock is the one of the
+/// pair the rewriter is given ([`gem_snapshots_presented`]).
 ///
 /// [`ApiClient::fetch_registry_references`]: socket_patch_core::api::client::ApiClient::fetch_registry_references
-/// [`gem_project_snapshot_keys`]: socket_patch_core::patch::redirect::gem_project_snapshot_keys
+/// [`gem_snapshots_presented`]: socket_patch_core::hosted::engine::gem_snapshots_presented
 pub(super) async fn gem_lock_snapshots(
     cwd: &Path,
 ) -> socket_patch_core::api::client::GemSnapshotKeys {
-    use socket_patch_core::patch::redirect::{gem_project_snapshot_keys, GEM_SNAPSHOT_FILES};
-    let mut files = std::collections::BTreeMap::new();
-    for name in GEM_SNAPSHOT_FILES {
-        let path = cwd.join(name);
-        if let Ok(text) = socket_patch_core::utils::fs::read_regular_to_string(&path).await {
-            files.insert(name.to_string(), text);
-        }
-    }
-    gem_project_snapshot_keys(&files)
+    use socket_patch_core::vendor::lock_inventory::ProjectView;
+    let unreadable = std::collections::BTreeSet::new();
+    socket_patch_core::hosted::engine::gem_snapshots_presented(&ProjectView::Disk(cwd), &unreadable)
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]

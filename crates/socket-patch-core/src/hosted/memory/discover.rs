@@ -291,28 +291,6 @@ pub(crate) async fn batch_search(
     outcome
 }
 
-/// The registry snapshots the Bundler locks of `projects` take gems from
-/// ([`crate::patch::redirect::gem_project_snapshot_keys`]), by patch uuid.
-/// One request answers for every root, so where two roots name different
-/// snapshots of one patch the first root's is presented: the answer to it
-/// (that snapshot, or not ready) is one the other root's lock can follow.
-pub(crate) fn gem_snapshots_of<'a>(
-    projects: impl Iterator<Item = &'a crate::vendor::lock_inventory::MemoryProject>,
-) -> GemSnapshotKeys {
-    use crate::patch::redirect::{gem_project_snapshot_keys, GEM_SNAPSHOT_FILES};
-    let mut held = GemSnapshotKeys::new();
-    for project in projects {
-        let files = GEM_SNAPSHOT_FILES
-            .iter()
-            .filter_map(|name| Some((name.to_string(), project.text(name)?.to_string())))
-            .collect();
-        for (uuid, key) in gem_project_snapshot_keys(&files) {
-            held.entry(uuid).or_insert(key);
-        }
-    }
-    held
-}
-
 /// `search_patches_by_package` once per distinct purl.
 pub(crate) async fn fetch_details(
     provider: &Provider,
@@ -333,8 +311,8 @@ pub(crate) async fn fetch_details(
 
 /// Reference grants for every distinct uuid (`MAX_REFERENCE_BATCH` per
 /// request): the merged results, plus the uuids whose request failed.
-/// `gem_snapshots` are the registry snapshots the roots' Bundler locks
-/// take gems from ([`gem_snapshots_of`]), presented with each request.
+/// `gem_snapshots` are the registry snapshots a root's Bundler lock takes
+/// gems from, presented with each request.
 pub(crate) async fn fetch_references(
     provider: &Provider,
     uuids: &BTreeSet<String>,
@@ -498,37 +476,6 @@ pub(crate) async fn fetch_classic_artifacts(
 mod tests {
     use super::*;
 
-    /// The snapshots of every root's lock are presented, each read from
-    /// the lock that root's rewrite edits; where two roots name different
-    /// snapshots of one patch, the first root's stands.
-    #[test]
-    fn the_snapshots_of_the_roots_locks_are_gathered_first_root_first() {
-        use crate::vendor::lock_inventory::MemoryProject;
-        let (one, two) = (
-            "7b1e4f3a-2c5d-4e6f-8a9b-0c1d2e3f4a5b",
-            "2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e",
-        );
-        let lock = |uuid: &str, key: &str| {
-            format!(
-                "GEM\n  remote: https://patch.test/patch-registry/gem/tok/{uuid}/s/{key}/\n  \
-                 specs:\n    nokogiri (1.18.10-arm64-darwin)\n"
-            )
-        };
-        let mut first = MemoryProject::new();
-        first.insert_text("Gemfile.lock", lock(one, "aa"));
-        let mut second = MemoryProject::new();
-        second.insert_text("gems.rb", "");
-        second.insert_text("gems.locked", lock(one, "bb") + &lock(two, "cc"));
-        second.insert_text("Gemfile.lock", lock(two, "dd"));
-        let held = gem_snapshots_of([&first, &second].into_iter());
-        let expected: GemSnapshotKeys = [
-            (one.to_string(), "aa".to_string()),
-            (two.to_string(), "cc".to_string()),
-        ]
-        .into();
-        assert_eq!(held, expected);
-        assert!(gem_snapshots_of(std::iter::empty()).is_empty());
-    }
     use crate::api::types::PatchSearchResult;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

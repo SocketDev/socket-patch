@@ -2544,6 +2544,28 @@ async fn keep_bundler_loaded_gem_files(
     }));
 }
 
+/// The registry snapshots the project's Bundler lock takes gems from, by
+/// patch uuid ([`gem_project_snapshot_keys`]): what a run's reference
+/// requests present. Read from the pair the gem rewriter is given, which
+/// is the one Bundler loads ([`keep_bundler_loaded_gem_files`]), so the
+/// key never comes from a lock the run will not rewrite. Where the
+/// rewriter is given neither pair, none is presented.
+///
+/// [`gem_project_snapshot_keys`]: crate::patch::redirect::gem_project_snapshot_keys
+pub async fn gem_snapshots_presented(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+) -> crate::api::client::GemSnapshotKeys {
+    let mut read = CandidateFiles::default();
+    for name in GEM_MANIFEST_FILES {
+        read.read(view, unreadable, name).await;
+    }
+    // No reference is known yet, so no candidate: the mirror gate, which
+    // needs one, only ever drops the pair the keys were read from.
+    keep_bundler_loaded_gem_files(view, &[], &mut read).await;
+    crate::patch::redirect::gem_project_snapshot_keys(&read.files)
+}
+
 /// The gemspecs the Gemfile's `gemspec` directives load: bundler 2.7+
 /// folds their development dependencies into the requirement the lock
 /// pins (#985). Advisory: never rewritten, carried in the
@@ -14947,6 +14969,57 @@ snapshots:
         );
         assert!(!done.rewrite.files.contains_key("gems.rb"));
         assert!(!done.rewrite.files.contains_key("gems.locked"));
+    }
+
+    /// The registry snapshot a run presents is read from the pair the
+    /// rewriter is given, the one Bundler loads: never from a lock of the
+    /// other spelling, and from neither pair of a twin nothing settles.
+    #[tokio::test]
+    async fn the_snapshots_presented_come_from_the_pair_bundler_loads() {
+        let uuid = "7b1e4f3a-2c5d-4e6f-8a9b-0c1d2e3f4a5b";
+        let lock = |key: &str| {
+            format!(
+                "GEM\n  remote: https://patch.test/patch-registry/gem/tok/{uuid}/s/{key}/\n  \
+                 specs:\n    nokogiri (1.18.10-arm64-darwin)\n"
+            )
+        };
+        let held = |key: &str| -> crate::api::client::GemSnapshotKeys {
+            [(uuid.to_string(), key.to_string())].into()
+        };
+        async fn presented(p: &MemoryProject) -> crate::api::client::GemSnapshotKeys {
+            gem_snapshots_presented(&ProjectView::Memory(p), &BTreeSet::new()).await
+        }
+        let none = crate::api::client::GemSnapshotKeys::new();
+
+        let mut lone = MemoryProject::new();
+        lone.insert_text("Gemfile", GEMFILE);
+        lone.insert_text("Gemfile.lock", lock("aa"));
+        assert_eq!(presented(&lone).await, held("aa"));
+
+        // A `gems.rb` project beside an orphan `Gemfile.lock`.
+        let mut orphan = MemoryProject::new();
+        orphan.insert_text("gems.rb", GEMFILE);
+        orphan.insert_text("gems.locked", lock("bb"));
+        orphan.insert_text("Gemfile.lock", lock("aa"));
+        assert_eq!(presented(&orphan).await, held("bb"));
+
+        // A twin: neither pair is the rewriter's until Bundler is told.
+        let mut twin = orphan.clone();
+        twin.insert_text("Gemfile", GEMFILE);
+        assert_eq!(presented(&twin).await, none);
+        for (gemfile, key) in [("Gemfile", "aa"), ("gems.rb", "bb")] {
+            let mut told = twin.clone();
+            told.insert_text(
+                ".bundle/config",
+                format!("---\nBUNDLE_GEMFILE: \"{gemfile}\"\n").as_str(),
+            );
+            assert_eq!(presented(&told).await, held(key), "{gemfile}");
+        }
+
+        // A manifest Bundler is pointed away from presents nothing.
+        let mut elsewhere = lone.clone();
+        elsewhere.insert_text(".bundle/config", "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n");
+        assert_eq!(presented(&elsewhere).await, none);
     }
 
     /// Without `BUNDLE_GEMFILE` a lone `gems.rb` pair is still the one

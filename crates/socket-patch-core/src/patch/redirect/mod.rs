@@ -8295,14 +8295,11 @@ pub fn gem_lock_snapshot_keys(lock: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The names [`gem_project_snapshot_keys`] reads among a project's files.
-pub const GEM_SNAPSHOT_FILES: [&str; 3] = ["gems.rb", "gems.locked", "Gemfile.lock"];
-
-/// [`gem_lock_snapshot_keys`] of the one Bundler lock a run rewrites among
-/// a project's `files` ([`gem_pair`]): `gems.locked` where the project has
-/// a `gems.rb`, else `Gemfile.lock`. A lock of the other spelling is one
-/// Bundler does not read there, so its registries say nothing of the
-/// project. What every reference request of a run presents.
+/// [`gem_lock_snapshot_keys`] of the one Bundler lock the rewriter edits
+/// among the `files` it is given ([`gem_pair`]): `gems.locked` where they
+/// hold a `gems.rb`, else `Gemfile.lock`. `files` are the candidate files
+/// as the hosted engine narrows them to the pair Bundler loads, never a
+/// project's raw files, where a second pair may sit unused.
 pub fn gem_project_snapshot_keys(files: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let (_, lock) = gem_pair(files);
     files
