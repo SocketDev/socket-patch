@@ -350,9 +350,9 @@ pub struct ApiClient {
     /// retryable failure (transport / 429 / 5xx after every retry) — the
     /// run-level circuit breaker. Shared by clones: one CLI run, one count.
     vendor_outage: Arc<AtomicU32>,
-    /// Whether the authenticated API answered a JSON request of this
-    /// client 401: it refuses the credential itself, whatever is asked (a
-    /// 403 is about what was asked). Shared by clones: one CLI run, one
+    /// Whether the authenticated API answered a request of this client
+    /// 401: it refuses the credential itself, whatever is asked (a 403 is
+    /// about what was asked). Shared by clones: one CLI run, one
     /// credential ([`Self::credential_refused`]).
     credential_refused: Arc<AtomicBool>,
     /// In-flight slots for the public proxy's batch path — the
@@ -741,11 +741,25 @@ impl ApiClient {
     }
 
     /// Whether the authenticated API has refused this run's credential: a
-    /// 401 to a JSON request of this client or of a clone of it. A reader
-    /// that falls back to the public proxy for what the API refuses has no
-    /// reason to present the credential again after that.
+    /// 401 to an authenticated request of this client or of a clone of
+    /// it, whichever kind of request met it. A reader that falls back to
+    /// the public proxy for what the API refuses has no reason to present
+    /// the credential again after that.
     pub fn credential_refused(&self) -> bool {
         self.credential_refused.load(Ordering::Relaxed)
+    }
+
+    /// [`classify_auth_error`] for the answer to a request of this client:
+    /// the one place every transport path classifies through, so the 401
+    /// of an authenticated request is remembered
+    /// ([`Self::credential_refused`]) whether it answered a JSON request,
+    /// a download or a package reference. `use_public_proxy` says the
+    /// request carried no credential.
+    fn auth_error(&self, status: StatusCode, use_public_proxy: bool) -> Option<ApiError> {
+        if status == StatusCode::UNAUTHORIZED && !use_public_proxy {
+            self.credential_refused.store(true, Ordering::Relaxed);
+        }
+        classify_auth_error(status, use_public_proxy)
     }
 
     /// Returns the API token, if set.
@@ -1006,10 +1020,7 @@ impl ApiClient {
                 ))
             };
         }
-        if let Some(err) = classify_auth_error(status, use_public_proxy) {
-            if status == StatusCode::UNAUTHORIZED && !use_public_proxy {
-                self.credential_refused.store(true, Ordering::Relaxed);
-            }
+        if let Some(err) = self.auth_error(status, use_public_proxy) {
             return Err(err);
         }
         let text = resp.text().await.unwrap_or_default();
@@ -1441,7 +1452,7 @@ impl ApiClient {
                         .map_err(|e| self.json_body_error(e, &host))?;
                     return Ok(Some(parsed));
                 }
-                if let Some(err) = classify_auth_error(status, true) {
+                if let Some(err) = self.auth_error(status, true) {
                     return Err(err);
                 }
                 (status, resp.text().await.unwrap_or_default(), host)
@@ -1687,7 +1698,7 @@ impl ApiClient {
         // auth→proxy fallback for binary downloads. `use_auth` is the
         // authenticated-endpoint flag, so `!use_auth` is the proxy case that
         // drives the paid-patch wording.
-        if let Some(err) = classify_auth_error(status, !use_auth) {
+        if let Some(err) = self.auth_error(status, !use_auth) {
             return Err(err);
         }
         let text = resp.text().await.unwrap_or_default();
@@ -2161,7 +2172,7 @@ impl ApiClient {
         // 429 classifies as RateLimited but is still retried (the hint);
         // 401/403 carry no hint.
         let hint = self.vendor_retry_hint(status, resp.headers());
-        if let Some(err) = classify_auth_error(status, !use_auth) {
+        if let Some(err) = self.auth_error(status, !use_auth) {
             return Err((err, hint));
         }
         let text = resp.text().await.unwrap_or_default();
@@ -2321,7 +2332,7 @@ impl ApiClient {
             StatusCode::REQUEST_TIMEOUT => return Ok(ServeDownload::Pending),
             _ => {
                 let hint = self.vendor_retry_hint(status, resp.headers());
-                if let Some(err) = classify_auth_error(status, true) {
+                if let Some(err) = self.auth_error(status, true) {
                     return Err((err, hint));
                 }
                 // An error body is only shown, so a small cap and the body
@@ -6002,6 +6013,48 @@ mod vendor_package_tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// A 401 to an authenticated request is remembered on the client and
+    /// on its clones, whichever kind of request met it: here the package
+    /// reference POST, which the JSON reader never sees. A 403 is about
+    /// one patch and is not remembered, and neither is a 401 of the public
+    /// proxy, which is sent no credential.
+    #[tokio::test]
+    async fn a_refused_credential_is_remembered_whichever_request_met_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/acme/patches/view/{UUID}")))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/patch/view/{UUID}")))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = auth_client(server.uri());
+        let clone = client.clone();
+        let forbidden = client.fetch_patch_summary(UUID).await;
+        assert!(matches!(forbidden, Err(ApiError::Forbidden(_))));
+        assert!(!client.credential_refused(), "a 403 is about one patch");
+        let proxy = proxy_client(server.uri());
+        let unauthorized = proxy.fetch_patch_summary(UUID).await;
+        assert!(matches!(unauthorized, Err(ApiError::Unauthorized(_))));
+        assert!(!proxy.credential_refused(), "the proxy is sent none");
+
+        let outcome = client.fetch_vendor_package(UUID, false, None, None).await;
+        assert!(matches!(
+            outcome,
+            VendorServiceOutcome::Failed(ApiError::Unauthorized(_))
+        ));
+        assert!(client.credential_refused() && clone.credential_refused());
     }
 
     /// Secondary (non-tarball) artifact edge arms: an entry missing its
