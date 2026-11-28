@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
+/// No registry snapshot to present: see [`Provider::fetch_registry_references`].
+static NO_GEM_SNAPSHOTS: crate::api::client::GemSnapshotKeys =
+    crate::api::client::GemSnapshotKeys::new();
+
 use crate::api::client::{ApiError, ApiFuture, PatchApi};
 use crate::api::ranking::cmp_search_results;
 use crate::api::types::{BatchPackagePatches, PackageVendorResult, SearchResponse};
@@ -137,9 +141,12 @@ impl Provider {
         &self,
         uuids: &[String],
     ) -> Result<HashMap<String, PackageVendorResult>, ApiError> {
+        // The in-memory hosts do not ask for a gem's listing with this
+        // call (their request names the uuids alone), so there is no
+        // snapshot to present.
         self.call(
             "fetchRegistryReferences",
-            self.api.fetch_registry_references(uuids),
+            self.api.fetch_registry_references(uuids, &NO_GEM_SNAPSHOTS),
         )
         .await
     }
@@ -582,6 +589,7 @@ mod tests {
         fn fetch_registry_references<'a>(
             &'a self,
             _uuids: &'a [String],
+            _: &'a crate::api::client::GemSnapshotKeys,
         ) -> ApiFuture<'a, HashMap<String, crate::api::types::PackageVendorResult>> {
             Box::pin(async { Err(ApiError::Other("unused".into())) })
         }
@@ -691,6 +699,7 @@ mod tests {
         fn fetch_registry_references<'a>(
             &'a self,
             _uuids: &'a [String],
+            _: &'a crate::api::client::GemSnapshotKeys,
         ) -> ApiFuture<'a, HashMap<String, crate::api::types::PackageVendorResult>> {
             Box::pin(async { Err(ApiError::Other("unused".into())) })
         }

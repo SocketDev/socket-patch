@@ -121,7 +121,14 @@ pub async fn read_gem_refreshes(
     }
     if !unknown.is_empty() {
         // A request that fails answers for none of them.
-        let asked = client.fetch_registry_references(&unknown).await;
+        // The lock stays on such a patch's registry: its request presents
+        // the snapshot the lock names.
+        let held = ["gems.locked", "Gemfile.lock"]
+            .iter()
+            .filter_map(|lock| read.files.get(*lock))
+            .flat_map(|lock| crate::patch::redirect::gem_lock_snapshot_keys(lock))
+            .collect();
+        let asked = client.fetch_registry_references(&unknown, &held).await;
         references.extend(asked.unwrap_or_default());
     }
     engine::gem_refresh_candidates(&targets, &references, patch_server_origins, &read.files)
@@ -207,6 +214,7 @@ mod tests {
         fn fetch_registry_references<'a>(
             &'a self,
             uuids: &'a [String],
+            _: &'a crate::api::client::GemSnapshotKeys,
         ) -> ApiFuture<'a, HashMap<String, PackageVendorResult>> {
             self.asked_references.lock().unwrap().push(uuids.to_vec());
             let references = self.references.clone();

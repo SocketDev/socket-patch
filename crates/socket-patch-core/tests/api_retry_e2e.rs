@@ -757,7 +757,7 @@ async fn package_references_and_patch_view_retry_too() {
     .await;
     let (c, log) = client(&server.uri(), ApiRetryPolicy::default());
     let got = c
-        .fetch_registry_references(&["u-1".to_string()])
+        .fetch_registry_references(&["u-1".to_string()], &Default::default())
         .await
         .expect("references after one 429");
     assert_eq!(got["u-1"].status, "granted");

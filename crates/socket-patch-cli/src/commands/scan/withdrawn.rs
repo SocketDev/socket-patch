@@ -189,7 +189,7 @@ async fn withdrawn(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    super::hosted::present_gem_snapshots(&common.cwd, api_client).await;
+    let held = super::hosted::gem_lock_snapshots(&common.cwd).await;
     // A network round trip between the lookup and the patch records.
     let asked = crate::ui::busy(
         common,
@@ -197,7 +197,7 @@ async fn withdrawn(
             "Checking {}",
             crate::ui::plural(uuids.len(), "hosted patch", "hosted patches")
         ),
-        api_client.fetch_registry_references(&uuids),
+        api_client.fetch_registry_references(&uuids, &held),
     )
     .await;
     let references = match asked {

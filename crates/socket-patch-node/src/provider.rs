@@ -213,9 +213,12 @@ impl PatchApi for JsPatchApi {
         })
     }
 
+    // This host does not ask for a gem's listing: its request names the
+    // uuids alone, so it has no registry snapshot to present.
     fn fetch_registry_references<'a>(
         &'a self,
         uuids: &'a [String],
+        _gem_snapshots: &'a socket_patch_core::api::client::GemSnapshotKeys,
     ) -> ApiFuture<'a, HashMap<String, PackageVendorResult>> {
         Box::pin(async move {
             if uuids.is_empty() {

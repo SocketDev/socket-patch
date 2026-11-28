@@ -358,6 +358,7 @@ impl PatchApi for Stalled {
     fn fetch_registry_references<'a>(
         &'a self,
         _: &'a [String],
+        _: &'a socket_patch_core::api::client::GemSnapshotKeys,
     ) -> ApiFuture<'a, std::collections::HashMap<String, PackageVendorResult>> {
         Box::pin(std::future::pending())
     }
@@ -414,6 +415,7 @@ impl PatchApi for CountingStalled {
     fn fetch_registry_references<'a>(
         &'a self,
         _: &'a [String],
+        _: &'a socket_patch_core::api::client::GemSnapshotKeys,
     ) -> ApiFuture<'a, std::collections::HashMap<String, PackageVendorResult>> {
         Box::pin(std::future::pending())
     }

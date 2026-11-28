@@ -2159,6 +2159,7 @@ mod tests {
         fn fetch_registry_references<'a>(
             &'a self,
             uuids: &'a [String],
+            _: &'a crate::api::client::GemSnapshotKeys,
         ) -> crate::api::client::ApiFuture<
             'a,
             HashMap<String, crate::api::types::PackageVendorResult>,

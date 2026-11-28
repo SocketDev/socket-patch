@@ -1846,22 +1846,27 @@ struct HostedTelemetry {
     json_error: Option<Envelope>,
 }
 
-/// Tells `api_client` which registry snapshots the Bundler lock in `cwd`
-/// already takes gems from, so that its reference requests present them
-/// ([`ApiClient::hold_gem_snapshots`]): the patch service then answers
-/// the listing the lock holds while a gem of it is being built again.
-pub(super) async fn present_gem_snapshots(
+/// The registry snapshots the Bundler lock in `cwd` already takes gems
+/// from, by patch uuid: what the run's reference requests present, so
+/// that the patch service answers the listing the lock holds while a gem
+/// of it is being built again
+/// ([`ApiClient::fetch_registry_references`]). The key of a remote is the
+/// snapshot level the rewriter recognises: lowercase hexadecimal digits.
+///
+/// [`ApiClient::fetch_registry_references`]: socket_patch_core::api::client::ApiClient::fetch_registry_references
+pub(super) async fn gem_lock_snapshots(
     cwd: &Path,
-    api_client: &socket_patch_core::api::client::ApiClient,
-) {
+) -> socket_patch_core::api::client::GemSnapshotKeys {
     use socket_patch_core::patch::redirect::gem_lock_snapshot_keys;
+    let mut held = socket_patch_core::api::client::GemSnapshotKeys::new();
     for lock in ["gems.locked", "Gemfile.lock"] {
         let lock = cwd.join(lock);
         let read = socket_patch_core::utils::fs::read_regular_to_string(&lock);
         if let Ok(text) = read.await {
-            api_client.hold_gem_snapshots(gem_lock_snapshot_keys(&text));
+            held.extend(gem_lock_snapshot_keys(&text));
         }
     }
+    held
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1917,8 +1922,8 @@ async fn run_redirect_selected_untracked(
                 "Resolving hosted artifacts for {}",
                 crate::ui::plural(to_fetch.len(), "patch", "patches")
             ));
-            present_gem_snapshots(&common.cwd, api_client).await;
-            let fetched = api_client.fetch_registry_references(&to_fetch).await;
+            let held = gem_lock_snapshots(&common.cwd).await;
+            let fetched = api_client.fetch_registry_references(&to_fetch, &held).await;
             status.finish();
             fetched
         };

@@ -370,11 +370,6 @@ pub struct ApiClient {
     /// takes a planned uuid's outcome from it instead of requesting it.
     /// Shared by clones, like the breaker it defers to.
     vendor_prefetch: Arc<std::sync::Mutex<Option<Arc<VendorPrefetch>>>>,
-    /// The registry snapshots the project's Bundler lock already takes
-    /// gems from, by patch uuid ([`Self::hold_gem_snapshots`]): every
-    /// reference request for one of those patches presents its key. Shared
-    /// by clones.
-    gem_snapshots: Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
     /// Bounded 429 / 503 retry for the JSON calls ([`crate::api::retry`]):
     /// the policy, the run-wide retry window (shared by clones, and by
     /// every default client in the process) and the clock hooks.
@@ -639,7 +634,6 @@ impl ApiClient {
             proxy_batch_slots: Arc::new(tokio::sync::Semaphore::new(proxy_batch_cap)),
             service_confirmed: Arc::new(AtomicBool::new(false)),
             vendor_prefetch: Arc::new(std::sync::Mutex::new(None)),
-            gem_snapshots: Arc::default(),
             api_retry: ApiRetry::from_env(),
             lookups: None,
             no_platform_gem_patches: false,
@@ -1328,40 +1322,23 @@ impl ApiClient {
         Ok(response)
     }
 
-    /// Tells the client which registry snapshots the project's Bundler
-    /// lock already takes gems from (`keys`: the snapshot key by patch
-    /// uuid, see [`crate::patch::redirect::gem_lock_snapshot_keys`]). A
-    /// reference request for one of those patches then presents the key,
-    /// and the patch service answers the listing the lock holds while a
-    /// gem of it is being built again, where it would otherwise say the
-    /// patch is not ready. The key changes no other answer.
-    pub fn hold_gem_snapshots(&self, keys: std::collections::BTreeMap<String, String>) {
-        if let Ok(mut held) = self.gem_snapshots.lock() {
-            held.extend(keys);
-        }
-    }
-
-    /// The reference request for `uuids`, presenting the snapshot the
-    /// lock holds of each ([`Self::hold_gem_snapshots`]).
-    fn reference_request(&self, uuids: &[String], free_only: bool) -> PackageVendorRequest {
-        let held = self.gem_snapshots.lock();
-        let held = held.as_deref().ok().into_iter().flatten();
-        let keys = held
-            .filter(|(uuid, _)| uuids.iter().any(|asked| asked.eq_ignore_ascii_case(uuid)))
-            .map(|(uuid, key)| (uuid.clone(), key.clone()))
-            .collect();
-        PackageVendorRequest::new(uuids, free_only, keys)
-    }
-
     /// Resolve hosted-patch references for a set of published-patch UUIDs
     /// (hosted-mode `scan`, the default for a bare `scan`). Uses the authenticated
     /// `POST /v0/orgs/{org}/patches/package` when a token+org are set, else the
     /// public proxy `POST /patch/package` (free patches only), in requests
     /// of at most [`MAX_REFERENCE_BATCH`] UUIDs (the endpoint rejects more).
     /// Returns a UUID → reference map (missing/404 → empty).
+    ///
+    /// `gem_snapshots` are the registry snapshots the project's Bundler
+    /// lock already takes gems from ([`GemSnapshotKeys`]): a request about
+    /// one of those patches presents its key, and the patch service then
+    /// answers the listing the lock holds while a gem of it is being built
+    /// again. The key changes no other answer. A caller with no lock to
+    /// read passes an empty map.
     pub async fn fetch_registry_references(
         &self,
         uuids: &[String],
+        gem_snapshots: &GemSnapshotKeys,
     ) -> Result<std::collections::HashMap<String, PackageVendorResult>, ApiError> {
         if uuids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -1369,7 +1346,13 @@ impl ApiClient {
         let path = self.patches_path("package");
         let mut results = std::collections::HashMap::new();
         for chunk in uuids.chunks(MAX_REFERENCE_BATCH) {
-            let body = self.reference_request(chunk, false);
+            let asked = |uuid: &&String| chunk.iter().any(|u| u.eq_ignore_ascii_case(uuid));
+            let presented = gem_snapshots
+                .iter()
+                .filter(|(uuid, _)| asked(uuid))
+                .map(|(uuid, key)| (uuid.clone(), key.clone()))
+                .collect();
+            let body = PackageVendorRequest::new(chunk, false, presented);
             let resp = self
                 .post_json::<PackageVendorResponse, _>(&path, &body)
                 .await?;
@@ -2119,7 +2102,9 @@ impl ApiClient {
         free_only: bool,
         vendor_url: Option<&str>,
     ) -> Result<std::collections::HashMap<String, PackageVendorResult>, VendorAttemptError> {
-        let body = self.reference_request(uuids, free_only);
+        // A vendored lock takes the gem from a path: it has no registry
+        // snapshot to present.
+        let body = PackageVendorRequest::new(uuids, free_only, GemSnapshotKeys::new());
         let (url, use_auth) = self.vendor_package_url(vendor_url);
         debug_log(&format!("POST {url}"));
 
@@ -3534,6 +3519,12 @@ pub enum ApiError {
 pub type ApiFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ApiError>> + Send + 'a>>;
 
+/// The registry snapshots a Bundler lock already takes gems from, by patch
+/// uuid: the key each such remote names
+/// ([`crate::patch::redirect::gem_lock_snapshot_keys`]), a short string of
+/// lowercase hexadecimal digits.
+pub type GemSnapshotKeys = std::collections::BTreeMap<String, String>;
+
 /// The patch-data calls the hosted flow makes, as an object-safe trait so an
 /// embedding host (the in-memory engine, a napi addon) can serve them
 /// in-process. [`ApiClient`] implements it by forwarding to its inherent
@@ -3555,9 +3546,14 @@ pub trait PatchApi: Send + Sync {
     fn search_patches_by_package<'a>(&'a self, purl: &'a str) -> ApiFuture<'a, SearchResponse>;
 
     /// `POST …/patches/package` (hosted reference grants), keyed by uuid.
+    /// `gem_snapshots` are the registry snapshots the project's Bundler
+    /// lock already takes gems from ([`GemSnapshotKeys`]), which a host
+    /// that asks for a gem's listing presents with the request; a host
+    /// that asks for none has nothing to do with them.
     fn fetch_registry_references<'a>(
         &'a self,
         uuids: &'a [String],
+        gem_snapshots: &'a GemSnapshotKeys,
     ) -> ApiFuture<'a, std::collections::HashMap<String, PackageVendorResult>>;
 
     /// Download a grant-tokenized artifact URL, refusing bodies over
@@ -3584,8 +3580,13 @@ impl PatchApi for ApiClient {
     fn fetch_registry_references<'a>(
         &'a self,
         uuids: &'a [String],
+        gem_snapshots: &'a GemSnapshotKeys,
     ) -> ApiFuture<'a, std::collections::HashMap<String, PackageVendorResult>> {
-        Box::pin(ApiClient::fetch_registry_references(self, uuids))
+        Box::pin(ApiClient::fetch_registry_references(
+            self,
+            uuids,
+            gem_snapshots,
+        ))
     }
 
     fn download_artifact<'a>(&'a self, url: &'a str, max_bytes: u64) -> ApiFuture<'a, Vec<u8>> {
@@ -5707,7 +5708,7 @@ mod vendor_package_tests {
     #[tokio::test]
     async fn fetch_registry_references_empty_uuids_makes_no_request() {
         let map = proxy_client("http://127.0.0.1:1".into())
-            .fetch_registry_references(&[])
+            .fetch_registry_references(&[], &GemSnapshotKeys::new())
             .await
             .expect("empty input is a local no-op, never a network call");
         assert!(map.is_empty());
@@ -5750,7 +5751,7 @@ mod vendor_package_tests {
             .await;
 
         let map = proxy_client(server.uri())
-            .fetch_registry_references(&[UUID.to_string()])
+            .fetch_registry_references(&[UUID.to_string()], &GemSnapshotKeys::new())
             .await
             .expect("proxy package-reference resolution must succeed");
         assert_eq!(map.len(), 1);
@@ -5793,7 +5794,7 @@ mod vendor_package_tests {
             .map(|i| format!("{i:08x}-0000-4000-8000-{i:012x}"))
             .collect();
         let map = proxy_client(server.uri())
-            .fetch_registry_references(&uuids)
+            .fetch_registry_references(&uuids, &GemSnapshotKeys::new())
             .await
             .expect("chunked resolution succeeds");
         assert_eq!(map.len(), uuids.len());
@@ -7740,7 +7741,7 @@ mod not_found_tests {
                 .map(|_| ())
                 .expect_err("view"),
             client
-                .fetch_registry_references(&[UUID.to_string()])
+                .fetch_registry_references(&[UUID.to_string()], &GemSnapshotKeys::new())
                 .await
                 .map(|_| ())
                 .expect_err("package references"),
@@ -7835,7 +7836,7 @@ mod not_found_tests {
         }
         assert!(client.fetch_patch(UUID).await.expect("view").is_none());
         assert!(client
-            .fetch_registry_references(&[UUID.to_string()])
+            .fetch_registry_references(&[UUID.to_string()], &GemSnapshotKeys::new())
             .await
             .expect("package references")
             .is_empty());

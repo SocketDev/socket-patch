@@ -1273,7 +1273,8 @@ impl PlatformGemPatch {
     /// gem itself.
     async fn gem_patch(&self, api_client: &ApiClient) -> Option<PatchResponse> {
         let references = api_client
-            .fetch_registry_references(std::slice::from_ref(&self.uuid))
+            // The patch of a platform build has no listing to present.
+            .fetch_registry_references(std::slice::from_ref(&self.uuid), &Default::default())
             .await
             .ok()?;
         let built_from = references.get(&self.uuid)?.rebuilt_from_uuid.as_deref()?;
