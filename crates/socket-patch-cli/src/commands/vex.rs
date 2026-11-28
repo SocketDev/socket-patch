@@ -2475,20 +2475,7 @@ async fn judge_gem_build_copies(
         }
     }
     let uuids: Vec<String> = builds.iter().map(|(_, uuid, ..)| uuid.clone()).collect();
-    // A run whose earlier reads were refused by the authenticated API
-    // stays on the public proxy for these.
-    let fell_back = plan.notes.iter().any(|note| {
-        note.code == crate::commands::vex_sources::NOTE_API_AUTH_FALLBACK
-            && note.detail.starts_with("authenticated API returned")
-    });
-    let records = read_build_records(
-        common,
-        &params.api_client,
-        &uuids,
-        fell_back,
-        &mut judged.notes,
-    )
-    .await;
+    let records = read_build_records(common, &params.api_client, &uuids, &mut judged.notes).await;
     for ((purl, uuid, record, copies), files) in builds.into_iter().zip(records) {
         match files {
             Ok(files) => {
