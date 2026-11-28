@@ -2548,8 +2548,11 @@ async fn keep_bundler_loaded_gem_files(
 /// patch uuid ([`gem_project_snapshot_keys`]): what a run's reference
 /// requests present. Read from the pair the gem rewriter is given, which
 /// is the one Bundler loads ([`keep_bundler_loaded_gem_files`]), so the
-/// key never comes from a lock the run will not rewrite. Where the
-/// rewriter is given neither pair, none is presented.
+/// key never comes from a lock the run will not rewrite. None is
+/// presented where the rewriter is given neither pair: a twin that nothing
+/// settles, a `BUNDLE_GEMFILE` or `BUNDLE_LOCKFILE` that names another
+/// file, and a Bundler mirror of every source (`mirror.all`), under which
+/// no gem is redirected whatever the answer.
 ///
 /// [`gem_project_snapshot_keys`]: crate::patch::redirect::gem_project_snapshot_keys
 pub async fn gem_snapshots_presented(
@@ -2560,8 +2563,12 @@ pub async fn gem_snapshots_presented(
     for name in GEM_MANIFEST_FILES {
         read.read(view, unreadable, name).await;
     }
-    // No reference is known yet, so no candidate: the mirror gate, which
-    // needs one, only ever drops the pair the keys were read from.
+    // No reference is known yet, so no candidate names a registry. A
+    // mirror of every source needs none: it drops the pair here as it does
+    // for the rewrite, and no key is presented. A mirror of one source
+    // (`mirror.<source>`) is told only from a candidate's registry, so it
+    // is judged when the rewriter's files are read, and the key of such a
+    // project is presented here.
     keep_bundler_loaded_gem_files(view, &[], &mut read).await;
     crate::patch::redirect::gem_project_snapshot_keys(&read.files)
 }
