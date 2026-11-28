@@ -2604,6 +2604,105 @@ mod tests {
         assert!(out.contains_key(U1) && out.contains_key(U2), "{out:?}");
     }
 
+    /// The view of a platform build's patch `uuid`, which changes one file.
+    fn build_view(uuid: &str, tier: &str) -> serde_json::Value {
+        serde_json::json!({
+            "uuid": uuid,
+            "purl": "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu",
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": {"lib/nokogiri/version.rb": {
+                "beforeHash": "a".repeat(64), "afterHash": "b".repeat(64)
+            }},
+            "vulnerabilities": {},
+            "description": "",
+            "license": "MIT",
+            "tier": tier,
+        })
+    }
+
+    /// `GET` of `route` on `server` answers `status` (with `view` on a
+    /// 200), `times` times and no more.
+    async fn mount_view(
+        server: &wiremock::MockServer,
+        route: String,
+        status: u16,
+        view: Option<serde_json::Value>,
+        times: u64,
+    ) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, ResponseTemplate};
+        let response = match view {
+            Some(view) => ResponseTemplate::new(status).set_body_json(view),
+            None => ResponseTemplate::new(status),
+        };
+        Mock::given(method("GET"))
+            .and(wm_path(route))
+            .respond_with(response)
+            .expect(times)
+            .mount(server)
+            .await;
+    }
+
+    fn authenticated(
+        tmp: &Path,
+        api: &wiremock::MockServer,
+        proxy: &wiremock::MockServer,
+    ) -> GlobalArgs {
+        GlobalArgs {
+            cwd: tmp.to_path_buf(),
+            json: true,
+            api_url: Some(api.uri()),
+            api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+            org: Some("acme".into()),
+            proxy_url: Some(proxy.uri()),
+            ..GlobalArgs::default()
+        }
+    }
+
+    fn fallback_notes(notes: &[PlanNote]) -> usize {
+        let fallbacks = notes.iter().filter(|n| n.code == NOTE_API_AUTH_FALLBACK);
+        fallbacks.count()
+    }
+
+    /// Each build's record is asked of the authenticated API first, and
+    /// only one it refuses goes to the public proxy: a paid patch's record,
+    /// which the proxy does not serve, is read where the API serves it,
+    /// beside a refused one. The fallback is noted once.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_build_record_goes_to_the_proxy_only_when_the_api_refuses_it() {
+        let api = wiremock::MockServer::start().await;
+        let proxy = wiremock::MockServer::start().await;
+        let org = |uuid: &str| format!("/v0/orgs/acme/patches/view/{uuid}");
+        let public = |uuid: &str| format!("/patch/view/{uuid}");
+        mount_view(&api, org(U1), 200, Some(build_view(U1, "paid")), 2).await;
+        mount_view(&api, org(U2), 403, None, 1).await;
+        mount_view(&proxy, public(U1), 403, None, 0).await;
+        mount_view(&proxy, public(U2), 200, Some(build_view(U2, "free")), 1).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let common = authenticated(tmp.path(), &api, &proxy);
+        let run = RunApiClient::new();
+        let mut notes: Vec<PlanNote> = Vec::new();
+        let uuids = [U1.to_string(), U2.to_string()];
+        let records = read_build_records(&common, &run, &uuids, &mut notes).await;
+
+        for (uuid, record) in uuids.iter().zip(&records) {
+            let files = record
+                .as_ref()
+                .unwrap_or_else(|_| panic!("no record of {uuid}"));
+            let file = files.get("lib/nokogiri/version.rb");
+            assert_eq!(file.map(|f| f.after_hash.as_str()), Some(&*"b".repeat(64)));
+        }
+        assert_eq!(fallback_notes(&notes), 1, "{notes:?}");
+        // A 403 is about one patch: the next read asks the API again.
+        let again = read_build_records(&common, &run, &uuids[..1], &mut notes).await;
+        assert!(again[0].is_ok());
+        assert_eq!(fallback_notes(&notes), 1, "{notes:?}");
+        api.verify().await;
+        proxy.verify().await;
+    }
+
     /// Standalone `vex --json` (no host client): a token whose org cannot
     /// be resolved builds a proxy client here, the records come from the
     /// proxy, and the envelope gets one `api_auth_fallback` note. A client
