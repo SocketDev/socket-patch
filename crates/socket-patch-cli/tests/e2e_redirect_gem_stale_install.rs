@@ -4351,7 +4351,8 @@ async fn refused_platform_gem_is_counted_as_left_to_patch() {
         );
         assert_eq!(code, 0, "{mode}\nstdout:\n{stdout}\nstderr:\n{stderr}");
         // The premise: the run left the gem alone for a platform the
-        // patch registry does not serve.
+        // patch registry does not list, which both modes say in the same
+        // words.
         let (refusal, said) = match mode {
             "hosted" => (
                 format!(
@@ -4362,8 +4363,11 @@ async fn refused_platform_gem_is_counted_as_left_to_patch() {
             ),
             _ => (
                 format!(
-                    "{DEP}@{DEP_VERSION} is not vendored: no patched build yet for \
-                     {OTHER_PLATFORM}"
+                    "{DEP}@{DEP_VERSION} is not vendored: the patch registry does not list \
+                     {OTHER_PLATFORM}. Vendored mode needs every locked platform, and a re-run \
+                     does not change what the registry lists: this is settled once the \
+                     lockfile no longer names {OTHER_PLATFORM} (`bundle lock --remove-platform \
+                     {OTHER_PLATFORM}`), or the registry lists a gem for every locked platform."
                 ),
                 &stderr,
             ),
