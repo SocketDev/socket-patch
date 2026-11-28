@@ -350,6 +350,11 @@ pub struct ApiClient {
     /// retryable failure (transport / 429 / 5xx after every retry) — the
     /// run-level circuit breaker. Shared by clones: one CLI run, one count.
     vendor_outage: Arc<AtomicU32>,
+    /// Whether the authenticated API answered a JSON request of this
+    /// client 401: it refuses the credential itself, whatever is asked (a
+    /// 403 is about what was asked). Shared by clones: one CLI run, one
+    /// credential ([`Self::credential_refused`]).
+    credential_refused: Arc<AtomicBool>,
     /// In-flight slots for the public proxy's batch path — the
     /// `/patch/batch` POSTs and the legacy per-package GETs they degrade
     /// to. Shared by clones, so concurrent [`Self::search_patches_batch`]
@@ -631,6 +636,7 @@ impl ApiClient {
             org_unresolved: None,
             vendor_retry: VendorRetryPolicy::default(),
             vendor_outage: Arc::new(AtomicU32::new(0)),
+            credential_refused: Arc::new(AtomicBool::new(false)),
             proxy_batch_slots: Arc::new(tokio::sync::Semaphore::new(proxy_batch_cap)),
             service_confirmed: Arc::new(AtomicBool::new(false)),
             vendor_prefetch: Arc::new(std::sync::Mutex::new(None)),
@@ -732,6 +738,14 @@ impl ApiClient {
     #[cfg(test)]
     pub(crate) fn vendor_outage_count(&self) -> u32 {
         self.vendor_outage.load(Ordering::Relaxed)
+    }
+
+    /// Whether the authenticated API has refused this run's credential: a
+    /// 401 to a JSON request of this client or of a clone of it. A reader
+    /// that falls back to the public proxy for what the API refuses has no
+    /// reason to present the credential again after that.
+    pub fn credential_refused(&self) -> bool {
+        self.credential_refused.load(Ordering::Relaxed)
     }
 
     /// Returns the API token, if set.
@@ -993,6 +1007,9 @@ impl ApiClient {
             };
         }
         if let Some(err) = classify_auth_error(status, use_public_proxy) {
+            if status == StatusCode::UNAUTHORIZED && !use_public_proxy {
+                self.credential_refused.store(true, Ordering::Relaxed);
+            }
             return Err(err);
         }
         let text = resp.text().await.unwrap_or_default();

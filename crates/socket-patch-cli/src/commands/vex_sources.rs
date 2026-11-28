@@ -2236,8 +2236,11 @@ async fn read_gem_builds(
 /// per patch, asked without file contents, several at a time, with the
 /// stale-credential fallback of the other reads: a patch the
 /// authenticated API refuses (401/403) is asked of the public proxy, and
-/// `notes` says so once. `Err` says why a record could not be read, safe
-/// to print: nothing then judges that build's copies.
+/// `notes` says so once. A 403 is about one patch, so the next record is
+/// still asked of the API first; once the API has refused the credential
+/// itself (a 401, here or earlier in the run), the records are read from
+/// the proxy alone. `Err` says why a record could not be read, safe to
+/// print: nothing then judges that build's copies.
 pub(crate) async fn read_build_records(
     common: &GlobalArgs,
     api_client: &RunApiClient,
@@ -2265,6 +2268,11 @@ pub(crate) async fn read_build_records(
         .await
     };
     let client = run_client(common, api_client, notes).await;
+    // The read that met the 401 has said that the run fell back.
+    let client = match client.credential_refused() {
+        true => build_proxy_fallback_client(&common.api_client_overrides()),
+        false => client,
+    };
     let on_proxy = client.uses_public_proxy();
     let mut reads = summaries(client, uuids.to_vec()).await;
     let refused = |read: &Result<_, socket_patch_core::api::client::ApiError>| matches!(read, Err(e) if is_fallback_candidate(e));
@@ -2698,6 +2706,35 @@ mod tests {
         // A 403 is about one patch: the next read asks the API again.
         let again = read_build_records(&common, &run, &uuids[..1], &mut notes).await;
         assert!(again[0].is_ok());
+        assert_eq!(fallback_notes(&notes), 1, "{notes:?}");
+        api.verify().await;
+        proxy.verify().await;
+    }
+
+    /// Once the authenticated API has refused the credential itself (a
+    /// 401), the run's later build records are read from the public proxy
+    /// alone: the credential is not presented again for each of them, and
+    /// the fallback is not noted a second time.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn build_records_stay_on_the_proxy_after_the_credential_is_refused() {
+        let api = wiremock::MockServer::start().await;
+        let proxy = wiremock::MockServer::start().await;
+        let org = |uuid: &str| format!("/v0/orgs/acme/patches/view/{uuid}");
+        let public = |uuid: &str| format!("/patch/view/{uuid}");
+        mount_view(&api, org(U1), 401, None, 1).await;
+        mount_view(&api, org(U2), 401, None, 0).await;
+        mount_view(&proxy, public(U1), 200, Some(build_view(U1, "free")), 1).await;
+        mount_view(&proxy, public(U2), 200, Some(build_view(U2, "free")), 1).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let common = authenticated(tmp.path(), &api, &proxy);
+        let run = RunApiClient::new();
+        let mut notes: Vec<PlanNote> = Vec::new();
+        let first = read_build_records(&common, &run, &[U1.to_string()], &mut notes).await;
+        let later = read_build_records(&common, &run, &[U2.to_string()], &mut notes).await;
+
+        assert!(first[0].is_ok() && later[0].is_ok());
         assert_eq!(fallback_notes(&notes), 1, "{notes:?}");
         api.verify().await;
         proxy.verify().await;
