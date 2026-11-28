@@ -281,11 +281,6 @@ pub struct GemLockedBuild {
     /// when set.
     #[cfg_attr(test, serde(skip_serializing_if = "std::ops::Not::not"))]
     pub withdrawn: bool,
-    /// The sha256 of the archive the lock is pinned to for the build
-    /// once the rewrite is done: what tells an installed copy of it from
-    /// another gem.
-    #[cfg_attr(test, serde(skip))]
-    pub sha256: String,
 }
 
 /// One platform gem of a patched gem's version, as the patch registry
@@ -530,9 +525,7 @@ pub struct RewriteResult {
     /// defect: the patch service lists every platform gem upstream
     /// publishes, so such a platform is one upstream does not publish (a
     /// private build, a yanked platform gem), and a run over a list that
-    /// names it moves the gem. Never a lock that is on this patch's own
-    /// registry already, which stays on the snapshot it names and stays
-    /// in effect ([`gem_pair_address`]). Serialized only when non-empty.
+    /// names it moves the gem. Serialized only when non-empty.
     #[cfg_attr(
         test,
         serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")
@@ -8286,7 +8279,8 @@ pub fn split_gem_snapshot(index_url: &str) -> (&str, Option<&str>) {
 /// The registry snapshots the Bundler lock `lock` takes gems from, by
 /// patch uuid: the key each such remote names (`…/<patch uuid>/s/<key>`).
 /// What a reference request presents for those patches
-/// ([`crate::api::client::ApiClient::hold_gem_snapshots`]).
+/// ([`crate::api::client::GemSnapshotKeys`]). A key is the snapshot level
+/// [`split_gem_snapshot`] recognises: lowercase hexadecimal digits.
 pub fn gem_lock_snapshot_keys(lock: &str) -> BTreeMap<String, String> {
     let lock = crate::utils::line_endings::to_lf(lock);
     let parsed = crate::formats::gem::parse(&lock);
@@ -8323,50 +8317,29 @@ pub(crate) fn gem_source_url(index_url: &str, platform_builds: bool) -> std::bor
     }
 }
 
-/// The address the gem `dep` patches is under in the Bundler pair of
-/// `lock` once the gem rewriter has run, from its reference `ov`.
-///
-/// It is [`gem_source_url`] of the reference, with one exception: a lock
-/// of platform builds that takes the gem from this patch's own registry
-/// already, while the reference's list leaves out a platform the lock
-/// names (one upstream no longer publishes). The snapshot the lock names
-/// goes on serving what it listed, and the registry as it stands has no
-/// gem for that platform, so the lock stays where it is.
-fn gem_pair_address(
-    lock: Option<&crate::formats::gem::GemfileLock<'_>>,
-    dep: &DepOverride,
-    ov: &RegistryOverride,
-) -> String {
-    let builds = lock.map(|lock| lock.locked_builds(&dep.name, &dep.version));
-    let platform_builds = builds.as_ref().is_some_and(|b| !b.platforms.is_empty());
-    let source = gem_source_url(&ov.index_url, platform_builds);
-    let stays = || {
-        ov.identifiers.gem_builds.as_ref()?;
-        let ids = builds.as_ref()?.ids(&dep.name, &dep.version);
-        let mut platforms = ids.iter().filter_map(|id| id.platform.as_deref());
-        platforms
-            .any(|platform| ov.identifiers.gem_build(platform).is_none())
-            .then(|| gem_lock_own_remote(lock?, dep, &source))
-            .flatten()
-            .map(|remote| format!("{remote}/"))
-    };
-    stays().unwrap_or_else(|| source.into_owned())
-}
-
-/// [`gem_pair_address`] of each gem among `deps` for the Bundler pair
-/// among `files`, by patch uuid: what a run looks for to tell that the
-/// pair pins the gem.
+/// [`gem_source_url`] of each gem among `deps` as the gem rewriter decides
+/// it for the Bundler pair among `files`, by patch uuid: what a run looks
+/// for to tell that the pair pins the gem.
 pub(crate) fn gem_source_urls<'a>(
     files: &BTreeMap<String, String>,
     deps: impl Iterator<Item = &'a DepOverride>,
 ) -> BTreeMap<String, String> {
     let (_, lock_name) = gem_pair(files);
-    let lock = files
-        .get(lock_name)
-        .map(|lk| crate::formats::gem::parse(lk));
+    let mut lock = None;
     deps.filter_map(|dep| {
         let ov = registry_override_of_kind(dep, "rubygems-compact-index")?;
-        let source = gem_pair_address(lock.as_ref(), dep, ov);
+        let platform_builds = lock
+            .get_or_insert_with(|| {
+                files
+                    .get(lock_name)
+                    .map(|lk| crate::formats::gem::parse(lk))
+            })
+            .as_ref()
+            .is_some_and(|lock| {
+                let builds = lock.locked_builds(&dep.name, &dep.version);
+                !builds.platforms.is_empty()
+            });
+        let source = gem_source_url(&ov.index_url, platform_builds).into_owned();
         Some((dep.patch_uuid.clone(), source))
     })
     .collect()
@@ -9751,9 +9724,8 @@ fn rewrite_gem(
             .map(|parsed| parsed.locked_builds(&dep.name, &dep.version));
         let platform_locked = builds.as_ref().is_some_and(|b| !b.platforms.is_empty());
         // The registry at its snapshot for a gem the lock names a platform
-        // build of, without the snapshot level for any other; the snapshot
-        // the lock names for one that stays on it.
-        let index_url = gem_pair_address(handed_in.as_ref(), dep, ov);
+        // build of, without the snapshot level for any other.
+        let index_url = gem_source_url(&ov.index_url, platform_locked);
         let index_url: &str = &index_url;
         // The ruby gem's sha256: the entry the list of the version's gems
         // has for it (`ruby`), else the reference's own checksum, which is
@@ -9866,18 +9838,11 @@ fn rewrite_gem(
                     });
                     continue;
                 }
-                // Whether the lock already takes the gem from this patch's
-                // registry (under any grant token and snapshot).
-                let hosted = gem_lock_on_registry(parsed, dep, index_url);
                 // A locked platform the list leaves out: one upstream does
                 // not publish, since the patch service lists every platform
-                // gem upstream has. A lock on this patch's registry stays
-                // on the snapshot it names ([`gem_pair_address`]), judged
-                // below by what it pins. Any other is left as it is, with
-                // nothing to warn about: a run over a list that names the
-                // platform moves the gem.
-                let stays = hosted && !unlisted.is_empty();
-                if !unlisted.is_empty() && !stays {
+                // gem upstream has. Nothing to warn about; a run over a list
+                // that names it moves the gem.
+                if !unlisted.is_empty() {
                     result.gem_unlisted.insert(dep.patch_uuid.clone(), unlisted);
                     // A lock on another patch of the gem stays on it.
                     if gem_lock_on_other_registry(parsed, dep, index_url).is_some() {
@@ -9885,6 +9850,9 @@ fn rewrite_gem(
                     }
                     continue;
                 }
+                // Whether the lock already takes the gem from this patch's
+                // registry (under any grant token and snapshot).
+                let hosted = gem_lock_on_registry(parsed, dep, index_url);
                 // A lock on the registry of another patch of the gem has
                 // patched builds of its own. Moving it must not turn one
                 // that its registry still serves into upstream's gem,
@@ -9929,34 +9897,10 @@ fn rewrite_gem(
                 let mut pinned: Vec<GemLockedBuild> = Vec::with_capacity(ids.len());
                 checksums = Vec::with_capacity(ids.len());
                 for id in &ids {
-                    let token = id.token();
                     let (patch_uuid, sha256) = match id.platform.as_deref() {
                         Some(_) => {
-                            // What a lock that stays pins for the build:
-                            // its `CHECKSUMS` entry, else the line of the
-                            // snapshot it names. The list says what that
-                            // archive is only where it names the same one;
-                            // any other is kept as the lock pins it, with
-                            // no patch to its name.
-                            let own = stays
-                                .then(|| {
-                                    let line = listing.and_then(|i| gem_index_build(i, &token));
-                                    let pin = parsed.checksum(&dep.name, &token);
-                                    pin.map(str::to_string).or(line.flatten())
-                                })
-                                .flatten();
-                            match (listed(&id), own) {
-                                (Some(build), Some(own))
-                                    if !own.eq_ignore_ascii_case(&build.gem_checksum_sha256) =>
-                                {
-                                    (None, own)
-                                }
-                                (Some(build), _) => {
-                                    (build.patch_uuid.clone(), build.gem_checksum_sha256.clone())
-                                }
-                                (None, Some(own)) => (None, own),
-                                (None, None) => continue,
-                            }
+                            let Some(build) = listed(&id) else { continue };
+                            (build.patch_uuid.clone(), build.gem_checksum_sha256.clone())
                         }
                         None => {
                             let Some(sha256) = sha256.clone() else {
@@ -9965,6 +9909,7 @@ fn rewrite_gem(
                             (Some(dep.patch_uuid.clone()), sha256)
                         }
                     };
+                    let token = id.token();
                     // In place before this run: the lock already pinned
                     // exactly this archive from a patch registry of the
                     // gem. A lock with no CHECKSUMS entry says nothing
@@ -10002,7 +9947,6 @@ fn rewrite_gem(
                         newly_patched: patch_uuid.is_some() && !in_place,
                         patch_uuid,
                         withdrawn,
-                        sha256: sha256.clone(),
                     });
                     checksums.push((token, sha256));
                 }

@@ -2876,41 +2876,26 @@ async fn run_redirect_selected_untracked(
             .as_ref()
             .and_then(|ro| ro.identifiers.gem_checksum_sha256.clone())
             .or_else(|| o.integrity.sha256.clone());
-        // What each platform build is, and the archive it is pinned to: as
-        // the rewriter judged the builds the lock names, which holds for a
-        // lock that stays on the snapshot it names too. A lock that names
-        // none goes by the reference's list, for the installed platform
-        // copies that stand in for its ruby-platform gem.
-        let builds: Vec<(String, Option<String>, String)> =
-            match rewrite.gem_builds.get(&o.patch_uuid) {
-                Some(locked) => locked
-                    .iter()
-                    .filter_map(|build| {
-                        let platform = build.platform.clone()?;
-                        Some((platform, build.patch_uuid.clone(), build.sha256.clone()))
-                    })
-                    .collect(),
-                None => o
-                    .registry_override
-                    .iter()
-                    .flat_map(|ro| ro.identifiers.gem_builds.iter().flatten())
-                    .filter(|build| build.platform != "ruby")
-                    .map(|build| {
-                        let sha256 = build.gem_checksum_sha256.clone();
-                        (build.platform.clone(), build.patch_uuid.clone(), sha256)
-                    })
-                    .collect(),
-            };
+        // The reference's list says what each gem of the version is: the
+        // sha256 of every patched one (the ruby-platform gem's among
+        // them), the patch of a patched platform build, and upstream's
+        // sha256 for a platform with none.
         let mut patched_builds = Vec::new();
-        for (platform, patch_uuid, sha256) in builds {
-            let leaf = format!("{}-{}-{}", o.name, o.version, platform);
-            match patch_uuid {
+        for build in o
+            .registry_override
+            .iter()
+            .flat_map(|ro| ro.identifiers.gem_builds.iter().flatten())
+        {
+            let leaf = format!("{}-{}-{}", o.name, o.version, build.platform);
+            match &build.patch_uuid {
                 Some(own) => {
-                    patched_builds.push(sha256);
-                    gem_build_patches.insert(leaf, own);
+                    patched_builds.push(build.gem_checksum_sha256.clone());
+                    if build.platform != "ruby" {
+                        gem_build_patches.insert(leaf, own.clone());
+                    }
                 }
                 None => {
-                    gem_upstream.insert(leaf, sha256);
+                    gem_upstream.insert(leaf, build.gem_checksum_sha256.clone());
                 }
             }
         }

@@ -44,12 +44,15 @@
 #     A platform upstream does not publish (`:unlisted`) is in neither the
 #     list nor the registry. A snapshot answers as it did after `publish`
 #     made a newer one.
-#   * While a patched build that a snapshot lists is being built again
-#     (`rebuild`), a `gemBuilds` reference is `pending_build`: no list and
-#     no pin. A request that presents the key of a snapshot it holds
+#   * While a patched build is being built again (`rebuild`), the registry
+#     as it stands lists upstream's own gem for that platform: that is
+#     what a `gemBuilds` request with no key is answered, under another
+#     snapshot. A request that presents the key of a snapshot it holds
 #     (`"gemSnapshotKeys": { "<uuid>": "<key>" }`) is answered that
-#     snapshot, as it was. Under every snapshot the gem being rebuilt is a
-#     404 until `rebuilt`. Without `gemBuilds` the key is ignored.
+#     snapshot, as it was, while every patched gem it lists still is one
+#     and one of them is being rebuilt. Under every snapshot the gem being
+#     rebuilt is a 404 until `rebuilt`. Without `gemBuilds` the key is
+#     ignored.
 #
 #   service = PatchService.new("nokogiri", "1.18.10", %w[arm64-darwin x86_64-linux-gnu],
 #                              uuid, ghsa, dir, mark, :pass_through => %w[arm64-darwin])
@@ -156,8 +159,7 @@ class PatchService
   end
 
   # The patched build of `platform` is being built again: its gem is not
-  # served, and the gem's reference is not ready for a client that holds
-  # no snapshot.
+  # served, and the registry as it stands lists upstream's gem for it.
   def rebuild(platform)
     @lock.synchronize { @rebuilding |= [platform] }
   end
@@ -360,7 +362,10 @@ class PatchService
   def listing
     rows = [[:patched, @patched[nil]]]
     @states.each do |platform, state|
-      rows << [state, (state == :patched ? @patched : @upstream).fetch(platform)] unless state == :unlisted
+      next if state == :unlisted
+      # A build that is being rebuilt is not there to list.
+      state = :pass_through if @rebuilding.include?(platform)
+      rows << [state, (state == :patched ? @patched : @upstream).fetch(platform)]
     end
     rows
   end
@@ -446,11 +451,13 @@ class PatchService
     identifiers = { "name" => @name, "version" => @version, "gemChecksumSha256" => ruby_gem.sha256 }
     index = "#{url}#{registry_path}/"
     key, rows = with_list ? snapshot : nil
-    if key && !@rebuilding.empty?
-      # No listing while a listed build is rebuilt, except the one the
-      # client already holds.
-      key, rows = @snapshots.key?(held) ? [held, @snapshots[held]] : nil
-      return { "status" => "pending_build", "url" => nil, "artifacts" => [] } unless key
+    # The snapshot the client holds, while it stands and a gem of it is
+    # being rebuilt: every patched gem it lists is still a patched one.
+    kept = key && @snapshots[held]
+    if kept
+      patched = kept.select { |state, gem| state == :patched && gem.platform }.map { |_, gem| gem.platform }
+      stands = patched.all? { |platform| @states[platform] == :patched }
+      key, rows = held, kept if stands && patched.any? { |platform| @rebuilding.include?(platform) }
     end
     if key
       index += "s/#{key}"

@@ -219,15 +219,19 @@ async fn mount_api(server: &MockServer, listing: Option<(&[Listed], u32)>) {
 }
 
 /// [`mount_api`] while a patched build that the snapshot `held` lists is
-/// being built again. The reference is not ready (`pending_build`: no
-/// list, no pin), except for a request that presents the key of that
-/// snapshot (`gemSnapshotKeys`), which is answered the snapshot as it was.
-async fn mount_api_rebuilding(server: &MockServer, held: (&[Listed], u32)) {
+/// being built again. The registry as it stands (`current`) lists
+/// upstream's own gem for that platform, under another snapshot: that is
+/// what a request with no key is answered. A request that presents the
+/// key of `held` (`gemSnapshotKeys`) is answered that snapshot as it was.
+async fn mount_api_rebuilding(
+    server: &MockServer,
+    held: (&[Listed], u32),
+    current: (&[Listed], u32),
+) {
     let api = server.uri();
-    let references =
-        || Mock::given(method("POST")).and(path(format!("/v0/orgs/{ORG}/patches/package")));
     let holding = json!({ "gemBuilds": true, "gemSnapshotKeys": { UUID: held.1.to_string() } });
-    references()
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
         .and(body_partial_json(holding))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "results": { UUID: reference(&api, UUID, Some(held)) }
@@ -235,14 +239,7 @@ async fn mount_api_rebuilding(server: &MockServer, held: (&[Listed], u32)) {
         .with_priority(1)
         .mount(server)
         .await;
-    references()
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "results": { UUID: { "status": "pending_build", "url": null, "artifacts": [] } }
-        })))
-        .with_priority(2)
-        .mount(server)
-        .await;
-    mount_api(server, Some(held)).await;
+    mount_api(server, Some(current)).await;
 }
 
 /// The bodies of the package reference requests `server` got.
@@ -4205,15 +4202,15 @@ async fn an_installed_copy_is_evidence_about_its_own_build_alone() {
 }
 
 /// A lock that already takes its platform builds from this patch's
-/// registry, at the snapshot an earlier scan wrote, while the reference at
-/// hand leaves one of its platforms out: upstream no longer publishes that
-/// platform's gem. The snapshot the lock names goes on serving what it
-/// listed, and the registry as it stands has no gem for that platform, so
-/// the lock stays where it is, byte for byte, and the gem stays in effect:
-/// the run reports, counts and attests its builds as it did before, each
-/// by what the lock itself pins, and says nothing of a gem left out.
+/// registry, at the snapshot an earlier scan wrote, while the list at hand
+/// leaves one of its platforms out: upstream no longer publishes that
+/// platform's gem. The gem is reported once, as a gem the registry does
+/// not list a platform of, and nothing is written: the pair stays byte for
+/// byte, and no string of the lock reaches the Gemfile. `vex` says nothing
+/// false of it: the build the lock still installs patched is attested, the
+/// one the list no longer names is `affected`, with what settles it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_lock_on_its_patch_stays_in_effect_when_the_list_leaves_a_locked_platform_out() {
+async fn a_lock_on_its_patch_whose_platform_the_list_no_longer_names_is_reported_and_left() {
     let server = MockServer::start().await;
     mount_api(&server, Some((&ONE_PATCHED[..], 4))).await;
     let proj = project(&lock(true));
@@ -4228,11 +4225,6 @@ async fn a_lock_on_its_patch_stays_in_effect_when_the_list_leaves_a_locked_platf
     };
     let pinned = pair();
     assert!(pinned.0.contains(&index_url(&api, Some(4))), "{}", pinned.0);
-    // What a run says of the gem once it is on its patch.
-    let (code, settled) = scan_json(proj.path(), &api, &[]);
-    assert_eq!(code, 0, "{settled}");
-    let attested = vex(proj.path(), &api);
-    assert_eq!(attested.code, Some(0), "{attested}");
 
     // Upstream yanks the arm gem: the list no longer names the platform.
     server.reset().await;
@@ -4242,55 +4234,47 @@ async fn a_lock_on_its_patch_stays_in_effect_when_the_list_leaves_a_locked_platf
     assert_eq!(code, 0, "{env}");
     assert_eq!(pair(), pinned, "the pair is left as it is");
     assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    let events = hosted_events(&env);
+    assert_eq!(events.len(), 1, "reported once: {env}");
     assert_eq!(
-        hosted_events(&env),
-        hosted_events(&settled),
-        "each build is reported as before: {env}"
+        (&events[0]["action"], &events[0]["errorCode"]),
+        (&json!("skipped"), &json!("redirect_gem_platform_unlisted")),
+        "{env}"
     );
-    assert_eq!(env["summary"], settled["summary"], "{env}");
-    assert_eq!(env["rollout"]["counts"]["already"], 1, "{env}");
+    let said = events[0]["reason"].as_str().unwrap_or_default();
+    assert!(said.contains(&format!("does not list {ARM}")), "{env}");
 
-    // The lock still installs the patched linux build, and `vex` still
-    // attests it; the arm build is on upstream's gem, as it was.
     let out = vex(proj.path(), &api);
     assert_eq!(out.code, Some(0), "{out}");
-    let statuses = |doc: &Value| -> Vec<(String, String)> {
-        let mut statuses: Vec<(String, String)> = doc["statements"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|statement| {
-                let products = statement["products"].to_string();
-                let platform = if products.contains(LINUX) { LINUX } else { ARM };
-                let status = statement["status"].as_str().unwrap_or_default();
-                (platform.to_string(), status.to_string())
-            })
-            .collect();
-        statuses.sort();
-        statuses
-    };
-    assert_eq!(statuses(out.doc()), statuses(attested.doc()), "{out}");
+    let mut statuses: Vec<(&str, &str)> = out.doc()["statements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|statement| {
+            let products = statement["products"].to_string();
+            let platform = if products.contains(LINUX) { LINUX } else { ARM };
+            (platform, statement["status"].as_str().unwrap_or_default())
+        })
+        .collect();
+    statuses.sort();
     assert_eq!(
-        statuses(out.doc()),
-        [
-            (ARM.to_string(), "affected".to_string()),
-            (LINUX.to_string(), "not_affected".to_string()),
-        ],
+        statuses,
+        [(ARM, "affected"), (LINUX, "not_affected")],
         "{out}"
     );
-
-    // For a person: the gem is on its hosted patch, with nothing to do.
-    let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &[]);
-    assert_eq!(code, 0, "{stdout}\n{stderr}");
-    assert!(!stdout.contains("does not list"), "{stdout}");
-    assert!(!stderr.contains("Warning"), "{stderr}");
+    let warned = out.envelope["warnings"].to_string();
+    assert!(
+        warned.contains("vex_gem_build_unknown")
+            && warned.contains("bundle lock --remove-platform"),
+        "the warning names what settles it: {out}"
+    );
 }
 
 /// The patch service builds a patched gem again while a lock is pinned to
-/// it. A reference then names no listing, except for a client that
-/// presents the key of the listing it already holds: the scan of such a
-/// lock sends the key its registry URL names and is answered that
-/// listing. So nothing changes, the gem is reported as on its patch, with
+/// it. The registry as it stands lists upstream's gem for that platform,
+/// except for a client that presents the key of the listing it already
+/// holds: the scan of such a lock sends the key its registry URL names
+/// and is answered that listing. So nothing changes, the gem is reported as on its patch, with
 /// nothing left to patch, and `vex` still attests the installed patched
 /// build.
 #[tokio::test(flavor = "multi_thread")]
@@ -4352,7 +4336,7 @@ async fn a_lock_on_its_patch_presents_its_snapshot_while_a_build_is_rebuilt() {
     // The linux build is being built again.
     server.reset().await;
     build_record().mount(&server).await;
-    mount_api_rebuilding(&server, (&ONE_PATCHED[..], 4)).await;
+    mount_api_rebuilding(&server, (&ONE_PATCHED[..], 4), (&NONE_PATCHED[..], 5)).await;
     let (code, env) = scan_json(proj.path(), &api, &[]);
     assert_eq!(code, 0, "{env}");
     assert_eq!(pair(), pinned, "the pair is left as it is");
@@ -4385,14 +4369,16 @@ async fn a_lock_on_its_patch_presents_its_snapshot_while_a_build_is_rebuilt() {
     );
 }
 
-/// A client that presents no snapshot is told the fix is not ready: a
+/// A client that presents no snapshot is answered the registry as it
+/// stands, with upstream's own gem for the build that is being rebuilt: a
 /// project whose lock is not on the patch's registry has none to present.
-/// Its request names no key, the pair is left as it is, and the gem is
-/// reported as still being built, with exit 0.
+/// Its request names no key. With no locked build patched in that
+/// listing, the gem is left on its upstream registry, quietly, and moves
+/// on a later run.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_lock_that_holds_no_snapshot_waits_while_a_build_is_rebuilt() {
+async fn a_lock_that_holds_no_snapshot_gets_the_current_listing_while_a_build_is_rebuilt() {
     let server = MockServer::start().await;
-    mount_api_rebuilding(&server, (&ONE_PATCHED[..], 4)).await;
+    mount_api_rebuilding(&server, (&ONE_PATCHED[..], 4), (&NONE_PATCHED[..], 5)).await;
     let proj = project(&lock(true));
     let api = server.uri();
     let (code, env) = scan_json(proj.path(), &api, &[]);
@@ -4405,7 +4391,8 @@ async fn a_lock_that_holds_no_snapshot_waits_while_a_build_is_rebuilt() {
         .flatten()
         .filter_map(|event| event["errorCode"].as_str())
         .collect();
-    assert_eq!(codes, ["pending_build"], "{env}");
+    assert_eq!(codes, ["redirect_gem_no_patched_build"], "{env}");
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
     let bodies = reference_bodies(&server).await;
     assert!(
         !bodies.is_empty()
@@ -4417,7 +4404,7 @@ async fn a_lock_that_holds_no_snapshot_waits_while_a_build_is_rebuilt() {
     let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &[]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(
-        (stdout + &stderr).contains("still being built"),
-        "the gem is reported as being built"
+        (stdout + &stderr).contains("no patched build yet"),
+        "the gem is reported as not patched yet"
     );
 }

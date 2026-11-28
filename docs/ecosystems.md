@@ -4953,13 +4953,21 @@ For a platform the registry lists no gem for (one upstream does not publish), a 
 nothing, and the statement says so: the build is settled once the lock no longer names the
 platform (`bundle lock --remove-platform`).
 
-While the patch service builds a patched gem again (a rebuild of a published build), it names no
-listing for the gem's patch. A project whose lock is already on the patch is not affected: its
-scan and `vex` present the key of the snapshot the lock names, and are answered that snapshot as
-it was, so the scan reports the gem as already on its patch and `vex` attests its builds. A
-project that is not on the patch yet is told the patch is still being built, is left as it is,
-and moves on a later run. During the rebuild a fresh `bundle install` of that platform's gem
-fails until the rebuilt gem is there, as for any gem that is briefly unavailable.
+While the patch service builds a patched gem again (a rebuild of a published build), the registry
+as it stands lists upstream's own gem for that platform. A project whose lock is already on the
+patch is not affected: its scan and `vex` present the key of the snapshot the lock names, and are
+answered that snapshot as it was, so the scan reports the gem as already on its patch and `vex`
+attests its builds. A project that is not on the patch yet is answered the registry as it stands,
+and takes the patched build on a later run. During the rebuild a fresh `bundle install` of that
+platform's gem from the earlier snapshot fails until the rebuilt gem is there, as for any gem
+that is briefly unavailable.
+
+When upstream stops publishing a platform gem that a lock names, the patch registry no longer
+lists that platform. The scan then leaves the gem as it is and says so
+(`redirect_gem_platform_unlisted`), also for a lock that is already on the patch, and `vex`
+states that platform's build as `affected` with what settles it: `bundle lock
+--remove-platform`. Nothing more is done about it, because that platform's gem cannot be
+installed from upstream either.
 
 The registry URL the scan writes names the registry as it stood (`…/s/<key>/`). When a patched
 build is published for another platform, the next scan is given a URL with another key: it
