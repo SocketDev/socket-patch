@@ -61,7 +61,7 @@
 use std::path::Path;
 
 use serde_json::{json, Value};
-use wiremock::matchers::{method, path, path_regex};
+use wiremock::matchers::{body_partial_json, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/mod.rs"]
@@ -216,6 +216,43 @@ async fn mount_api(server: &MockServer, listing: Option<(&[Listed], u32)>) {
         })))
         .mount(server)
         .await;
+}
+
+/// [`mount_api`] while a patched build that the snapshot `held` lists is
+/// being built again. The reference is not ready (`pending_build`: no
+/// list, no pin), except for a request that presents the key of that
+/// snapshot (`gemSnapshotKeys`), which is answered the snapshot as it was.
+async fn mount_api_rebuilding(server: &MockServer, held: (&[Listed], u32)) {
+    let api = server.uri();
+    let references =
+        || Mock::given(method("POST")).and(path(format!("/v0/orgs/{ORG}/patches/package")));
+    let holding = json!({ "gemBuilds": true, "gemSnapshotKeys": { UUID: held.1.to_string() } });
+    references()
+        .and(body_partial_json(holding))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": { UUID: reference(&api, UUID, Some(held)) }
+        })))
+        .with_priority(1)
+        .mount(server)
+        .await;
+    references()
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": { UUID: { "status": "pending_build", "url": null, "artifacts": [] } }
+        })))
+        .with_priority(2)
+        .mount(server)
+        .await;
+    mount_api(server, Some(held)).await;
+}
+
+/// The bodies of the package reference requests `server` got.
+async fn reference_bodies(server: &MockServer) -> Vec<Value> {
+    let requests = server.received_requests().await.unwrap_or_default();
+    requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/patches/package"))
+        .filter_map(|request| serde_json::from_slice(&request.body).ok())
+        .collect()
 }
 
 const GEMFILE: &str =
@@ -4247,4 +4284,140 @@ async fn a_lock_on_its_patch_stays_in_effect_when_the_list_leaves_a_locked_platf
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(!stdout.contains("does not list"), "{stdout}");
     assert!(!stderr.contains("Warning"), "{stderr}");
+}
+
+/// The patch service builds a patched gem again while a lock is pinned to
+/// it. A reference then names no listing, except for a client that
+/// presents the key of the listing it already holds: the scan of such a
+/// lock sends the key its registry URL names and is answered that
+/// listing. So nothing changes, the gem is reported as on its patch, with
+/// nothing left to patch, and `vex` still attests the installed patched
+/// build.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_on_its_patch_presents_its_snapshot_while_a_build_is_rebuilt() {
+    let patched = b"module PlatformProbe\n  FIXED = true\nend\n";
+    let upstream = b"module PlatformProbe\n  FIXED = false\nend\n";
+    let stamped = [
+        format!("# Socket Community Patch: {LINUX_UUID}\n").as_bytes(),
+        &patched[..],
+    ]
+    .concat();
+    let build_record = || {
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/view/{LINUX_UUID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "uuid": LINUX_UUID, "purl": format!("{PURL}?platform={LINUX}"),
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "files": { "lib/platform_probe.rb": {
+                    "beforeHash": vex_e2e_common::git_sha256(upstream),
+                    "afterHash": vex_e2e_common::git_sha256(&stamped),
+                }},
+                "vulnerabilities": {},
+                "description": "x", "license": "MIT", "tier": "free",
+            })))
+    };
+    let server = MockServer::start().await;
+    build_record().mount(&server).await;
+    mount_api(&server, Some((&ONE_PATCHED[..], 4))).await;
+    let proj = project(&lock(true));
+    let api = server.uri();
+    let (code, env) = scan_json(proj.path(), &api, &[]);
+    assert_eq!(code, 0, "{env}");
+    // The patched linux build, installed.
+    let lib = proj.path().join(format!(
+        "vendor/bundle/ruby/3.3.0/gems/{DEP}-{DEP_VERSION}-{LINUX}/lib"
+    ));
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("platform_probe.rb"), &stamped).unwrap();
+    let pair = || {
+        (
+            read(proj.path(), "Gemfile.lock"),
+            read(proj.path(), "Gemfile"),
+        )
+    };
+    let pinned = pair();
+    let (code, settled) = scan_json(proj.path(), &api, &[]);
+    assert_eq!(code, 0, "{settled}");
+    let attested = vex(proj.path(), &api);
+    assert_eq!(attested.code, Some(0), "{attested}");
+    let build = format!("{PURL}?platform={LINUX}");
+    let statuses = |doc: &Value| -> Vec<String> {
+        vex_e2e_common::statements_for(doc, &build)
+            .iter()
+            .filter_map(|statement| statement["status"].as_str().map(str::to_string))
+            .collect()
+    };
+    assert_eq!(statuses(attested.doc()), ["not_affected"], "{attested}");
+
+    // The linux build is being built again.
+    server.reset().await;
+    build_record().mount(&server).await;
+    mount_api_rebuilding(&server, (&ONE_PATCHED[..], 4)).await;
+    let (code, env) = scan_json(proj.path(), &api, &[]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(pair(), pinned, "the pair is left as it is");
+    assert_eq!(warning_codes(&env), warning_codes(&settled), "{env}");
+    assert_eq!(hosted_events(&env), hosted_events(&settled), "{env}");
+    assert_eq!(env["summary"], settled["summary"], "{env}");
+    let bodies = reference_bodies(&server).await;
+    assert!(
+        !bodies.is_empty()
+            && bodies
+                .iter()
+                .all(|body| body["gemSnapshotKeys"] == json!({ UUID: "4" })),
+        "every reference request presents the snapshot the lock is on: {bodies:?}"
+    );
+    let out = vex(proj.path(), &api);
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_eq!(statuses(out.doc()), ["not_affected"], "{out}");
+    assert_eq!(warning_codes(&out.envelope), Vec::<String>::new(), "{out}");
+
+    // For a person: the gem is on its patch, and nothing is left to patch.
+    let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("already on hosted patches") && !stdout.contains("left to patch"),
+        "{stdout}\n{stderr}"
+    );
+    assert!(
+        !(stdout + &stderr).contains("still being built"),
+        "{stderr}"
+    );
+}
+
+/// A client that presents no snapshot is told the fix is not ready: a
+/// project whose lock is not on the patch's registry has none to present.
+/// Its request names no key, the pair is left as it is, and the gem is
+/// reported as still being built, with exit 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_that_holds_no_snapshot_waits_while_a_build_is_rebuilt() {
+    let server = MockServer::start().await;
+    mount_api_rebuilding(&server, (&ONE_PATCHED[..], 4)).await;
+    let proj = project(&lock(true));
+    let api = server.uri();
+    let (code, env) = scan_json(proj.path(), &api, &[]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(read(proj.path(), "Gemfile.lock"), lock(true));
+    assert_eq!(read(proj.path(), "Gemfile"), GEMFILE);
+    let codes: Vec<&str> = env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|event| event["errorCode"].as_str())
+        .collect();
+    assert_eq!(codes, ["pending_build"], "{env}");
+    let bodies = reference_bodies(&server).await;
+    assert!(
+        !bodies.is_empty()
+            && bodies
+                .iter()
+                .all(|body| body.get("gemSnapshotKeys").is_none()),
+        "a request with no snapshot to present is the request it always was: {bodies:?}"
+    );
+    let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        (stdout + &stderr).contains("still being built"),
+        "the gem is reported as being built"
+    );
 }

@@ -189,6 +189,7 @@ async fn withdrawn(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    super::hosted::present_gem_snapshots(&common.cwd, api_client).await;
     // A network round trip between the lookup and the patch records.
     let asked = crate::ui::busy(
         common,

@@ -2150,7 +2150,16 @@ async fn read_gem_builds(
     let mut uuids: Vec<String> = gems.iter().map(|gem| gem.uuid.clone()).collect();
     uuids.sort();
     uuids.dedup();
+    // Each request presents the registry snapshot the gem's lock is on.
+    let held: std::collections::BTreeMap<String, String> = gems
+        .iter()
+        .filter_map(|gem| {
+            let (_, key) = socket_patch_core::patch::redirect::split_gem_snapshot(&gem.remote);
+            Some((gem.uuid.clone(), key?.to_string()))
+        })
+        .collect();
     let mut client = run_client(common, api_client, notes).await;
+    client.hold_gem_snapshots(held.clone());
     let mut references = hold_back_debug(client.fetch_registry_references(&uuids))
         .await
         .release();
@@ -2166,6 +2175,7 @@ async fn read_gem_builds(
                 ),
             });
             client = build_proxy_fallback_client(&common.api_client_overrides());
+            client.hold_gem_snapshots(held);
             references = hold_back_debug(client.fetch_registry_references(&uuids))
                 .await
                 .release();

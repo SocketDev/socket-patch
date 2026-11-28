@@ -8283,6 +8283,24 @@ pub fn split_gem_snapshot(index_url: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// The registry snapshots the Bundler lock `lock` takes gems from, by
+/// patch uuid: the key each such remote names (`…/<patch uuid>/s/<key>`).
+/// What a reference request presents for those patches
+/// ([`crate::api::client::ApiClient::hold_gem_snapshots`]).
+pub fn gem_lock_snapshot_keys(lock: &str) -> BTreeMap<String, String> {
+    let lock = crate::utils::line_endings::to_lf(lock);
+    let parsed = crate::formats::gem::parse(&lock);
+    let remotes = parsed
+        .gem_sections()
+        .flat_map(|section| section.remote_bases());
+    remotes
+        .filter_map(|remote| {
+            let (_, key) = split_gem_snapshot(remote);
+            Some((gem_remote_patch_uuid(remote)?.to_string(), key?.to_string()))
+        })
+        .collect()
+}
+
 /// The address a gem takes its patch registry under in the manifest and
 /// the lock, from the `index_url` of its reference.
 ///
@@ -24503,6 +24521,28 @@ mod tests {
             again.edits
         );
         assert!(builds_of(&again).iter().all(|(_, _, newly)| !newly));
+    }
+
+    /// The snapshots a lock takes gems from are read off its remotes: the
+    /// key by the patch uuid, and nothing for a registry with no snapshot
+    /// level, for a remote that names no patch, or for the upstream
+    /// registry.
+    #[test]
+    fn a_locks_registry_snapshots_are_read_off_its_remotes() {
+        let on_snapshot = "7b1e4f3a-2c5d-4e6f-8a9b-0c1d2e3f4a5b";
+        let plain = "2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e";
+        let lock = format!(
+            "GEM\n  remote: https://patch.test/patch-registry/gem/tok/{on_snapshot}/s/9f3c01/\n  \
+             specs:\n    nokogiri (1.18.10-arm64-darwin)\n\nGEM\n  remote: \
+             https://patch.test/patch-registry/gem/tok/{plain}/\n  specs:\n    rack \
+             (3.0.0)\n\nGEM\n  remote: https://patch.test/gem/tok/not-a-patch/s/4f/\n  specs:\n    \
+             rake (13.0.6)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n    racc (1.8.1)\n"
+        );
+        let held: BTreeMap<String, String> =
+            [(on_snapshot.to_string(), "9f3c01".to_string())].into();
+        assert_eq!(gem_lock_snapshot_keys(&lock), held);
+        assert_eq!(gem_lock_snapshot_keys(&lock.replace('\n', "\r\n")), held);
+        assert_eq!(gem_lock_snapshot_keys(""), BTreeMap::new());
     }
 
     /// The snapshot level of a registry URL is read off its end (an

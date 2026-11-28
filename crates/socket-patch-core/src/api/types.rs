@@ -278,17 +278,29 @@ pub(crate) struct PackageVendorRequest {
     /// always has, with the ruby gem's registry alone, so every reference
     /// request of this CLI carries it: [`Self::new`].
     pub gem_builds: bool,
+    /// The registry snapshot the project's Bundler lock already takes a
+    /// gem from, by patch uuid: its key. The service reads it only while
+    /// a gem of that snapshot is being built again, and then answers the
+    /// snapshot the lock holds where it would say the patch is not ready.
+    /// Left out of a request that presents none.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub gem_snapshot_keys: std::collections::BTreeMap<String, String>,
 }
 
 impl PackageVendorRequest {
     /// The request for `uuids`, with `freeOnly` only when it is forced
     /// (the public-proxy contract; the authenticated endpoint defaults to
-    /// false).
-    pub(crate) fn new(uuids: &[String], free_only: bool) -> Self {
+    /// false), presenting `gem_snapshot_keys`.
+    pub(crate) fn new(
+        uuids: &[String],
+        free_only: bool,
+        gem_snapshot_keys: std::collections::BTreeMap<String, String>,
+    ) -> Self {
         PackageVendorRequest {
             uuids: uuids.to_vec(),
             free_only: free_only.then_some(true),
             gem_builds: true,
+            gem_snapshot_keys,
         }
     }
 }
@@ -366,6 +378,31 @@ pub struct PackageVendorArtifact {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reference request presents the registry snapshots the lock holds
+    /// only when it holds some: with none it is the request it always was.
+    #[test]
+    fn a_reference_request_presents_the_snapshots_the_lock_holds() {
+        let uuids = ["u-1".to_string()];
+        let body = |free_only, held: &[(&str, &str)]| {
+            let held = held
+                .iter()
+                .map(|(uuid, key)| (uuid.to_string(), key.to_string()));
+            let request = PackageVendorRequest::new(&uuids, free_only, held.collect());
+            serde_json::to_value(request).unwrap()
+        };
+        assert_eq!(
+            body(false, &[]),
+            serde_json::json!({ "uuids": ["u-1"], "gemBuilds": true })
+        );
+        assert_eq!(
+            body(true, &[("u-1", "9f3c01")]),
+            serde_json::json!({
+                "uuids": ["u-1"], "freeOnly": true, "gemBuilds": true,
+                "gemSnapshotKeys": { "u-1": "9f3c01" },
+            })
+        );
+    }
 
     fn view(statistics: serde_json::Value) -> serde_json::Value {
         serde_json::json!({

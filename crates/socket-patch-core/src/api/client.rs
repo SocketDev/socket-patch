@@ -370,6 +370,11 @@ pub struct ApiClient {
     /// takes a planned uuid's outcome from it instead of requesting it.
     /// Shared by clones, like the breaker it defers to.
     vendor_prefetch: Arc<std::sync::Mutex<Option<Arc<VendorPrefetch>>>>,
+    /// The registry snapshots the project's Bundler lock already takes
+    /// gems from, by patch uuid ([`Self::hold_gem_snapshots`]): every
+    /// reference request for one of those patches presents its key. Shared
+    /// by clones.
+    gem_snapshots: Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
     /// Bounded 429 / 503 retry for the JSON calls ([`crate::api::retry`]):
     /// the policy, the run-wide retry window (shared by clones, and by
     /// every default client in the process) and the clock hooks.
@@ -634,6 +639,7 @@ impl ApiClient {
             proxy_batch_slots: Arc::new(tokio::sync::Semaphore::new(proxy_batch_cap)),
             service_confirmed: Arc::new(AtomicBool::new(false)),
             vendor_prefetch: Arc::new(std::sync::Mutex::new(None)),
+            gem_snapshots: Arc::default(),
             api_retry: ApiRetry::from_env(),
             lookups: None,
             no_platform_gem_patches: false,
@@ -1322,6 +1328,31 @@ impl ApiClient {
         Ok(response)
     }
 
+    /// Tells the client which registry snapshots the project's Bundler
+    /// lock already takes gems from (`keys`: the snapshot key by patch
+    /// uuid, see [`crate::patch::redirect::gem_lock_snapshot_keys`]). A
+    /// reference request for one of those patches then presents the key,
+    /// and the patch service answers the listing the lock holds while a
+    /// gem of it is being built again, where it would otherwise say the
+    /// patch is not ready. The key changes no other answer.
+    pub fn hold_gem_snapshots(&self, keys: std::collections::BTreeMap<String, String>) {
+        if let Ok(mut held) = self.gem_snapshots.lock() {
+            held.extend(keys);
+        }
+    }
+
+    /// The reference request for `uuids`, presenting the snapshot the
+    /// lock holds of each ([`Self::hold_gem_snapshots`]).
+    fn reference_request(&self, uuids: &[String], free_only: bool) -> PackageVendorRequest {
+        let held = self.gem_snapshots.lock();
+        let held = held.as_deref().ok().into_iter().flatten();
+        let keys = held
+            .filter(|(uuid, _)| uuids.iter().any(|asked| asked.eq_ignore_ascii_case(uuid)))
+            .map(|(uuid, key)| (uuid.clone(), key.clone()))
+            .collect();
+        PackageVendorRequest::new(uuids, free_only, keys)
+    }
+
     /// Resolve hosted-patch references for a set of published-patch UUIDs
     /// (hosted-mode `scan`, the default for a bare `scan`). Uses the authenticated
     /// `POST /v0/orgs/{org}/patches/package` when a token+org are set, else the
@@ -1338,7 +1369,7 @@ impl ApiClient {
         let path = self.patches_path("package");
         let mut results = std::collections::HashMap::new();
         for chunk in uuids.chunks(MAX_REFERENCE_BATCH) {
-            let body = PackageVendorRequest::new(chunk, false);
+            let body = self.reference_request(chunk, false);
             let resp = self
                 .post_json::<PackageVendorResponse, _>(&path, &body)
                 .await?;
@@ -2088,7 +2119,7 @@ impl ApiClient {
         free_only: bool,
         vendor_url: Option<&str>,
     ) -> Result<std::collections::HashMap<String, PackageVendorResult>, VendorAttemptError> {
-        let body = PackageVendorRequest::new(uuids, free_only);
+        let body = self.reference_request(uuids, free_only);
         let (url, use_auth) = self.vendor_package_url(vendor_url);
         debug_log(&format!("POST {url}"));
 
