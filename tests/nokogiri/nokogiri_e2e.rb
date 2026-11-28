@@ -653,6 +653,28 @@ class NokogiriE2E
     check(!(stdout + stderr).include?("omitting"), "and leaves no build out",
           tail(stdout) + tail(stderr))
 
+    if mode == "hosted"
+      # The service builds this machine's patched gem again. The lock is on
+      # a snapshot that lists it: the scan presents that snapshot's key and
+      # is answered what the lock holds, so nothing changes and `vex` still
+      # attests the build.
+      service.rebuild(own_platform)
+      service.forget_requests
+      held = File.read(lock_path)
+      code, stdout, stderr, = sp_service("scan", "--mode", "hosted", "--yes", "--json")
+      presented = service.reference_requests.map { |body| (body["gemSnapshotKeys"] || {})[UUID] }
+      check(code.zero? && File.read(lock_path) == held &&
+            events(stdout).none? { |e| e["errorCode"] == "pending_build" },
+            "while that build is being built again, a scan changes nothing and reports the gem as on its patch",
+            "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
+      check(!presented.empty? && presented.all? { |key| key && held.include?("/s/#{key}/") },
+            "its reference requests present the snapshot the lock is on", presented.inspect)
+      code, stdout, stderr, = sp_service("vex", "--product", PRODUCT, "--output", File.join(@proj, "vex.json"))
+      check(code.zero? && vex_statement["status"] == "not_affected" && !(stdout + stderr).include?("as affected"),
+            "and `vex` still attests the patch", "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
+      service.rebuilt(own_platform)
+    end
+
     code, stdout, stderr, = sp_service("rollback")
     check(code.zero?, "`rollback` succeeds", "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
     check(File.read(lock_path) == lock, "the lock is byte for byte what it was",
