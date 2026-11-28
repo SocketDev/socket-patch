@@ -8546,8 +8546,10 @@ fn build_statements(locked: &[(&str, Has)], ruby_entry: bool) -> Vec<Said> {
 ///      included. It asks for the gem patch's record and ONE package
 ///      reference, the gem patch's, whose list says which sha256 is a
 ///      patched build's; where the lock has no `CHECKSUMS` to say which
-///      sha256 it installs, also for the index of the lock's registry. It
-///      asks nothing else, and nothing of the upstream file host. The
+///      sha256 it installs, also for the index of the lock's registry;
+///      and for the record of the patch of the build installed on this
+///      machine, where that is a patched one, to check its files. It asks
+///      nothing else, and nothing of the upstream file host. The
 ///      embedded `apply --vex` writes the same statements from the same
 ///      requests;
 ///   2. `--offline`: no local record, so nothing is attested
@@ -8577,6 +8579,13 @@ async fn platform_vex_matrix(p: &PlatformProject, fresh: &Path, locked: &[(&str,
     ];
     if !p.checksums {
         asked.push(format!("{}info/{DEP}", &p.fx.index_url[p.api().len()..]));
+    }
+    // The machine's own build has an installed copy: where it is a patched
+    // one, its files are checked against the record of its own patch.
+    let own_patched = (p.own.as_str(), Has::Patched);
+    if locked.contains(&own_patched) {
+        let own = build_uuid(&p.own);
+        asked.push(format!("/v0/orgs/{ORG}/patches/view/{own}"));
     }
 
     // 1. manifest-less, ledger-less: the lock, the patch API, and the
@@ -8617,13 +8626,13 @@ async fn platform_vex_matrix(p: &PlatformProject, fresh: &Path, locked: &[(&str,
                 "{out}"
             );
         }
-        // No record of a platform build's own patch is read: Bundler keeps
-        // the archive it installed each gem from, and that archive is what
-        // says the copy is the patched build.
+        // The archive Bundler keeps of each gem is no evidence here: an
+        // installed patched build is held to the record of its own patch.
         assert_eq!(
             request_paths(&p.fx._server, mark.0).await,
             asked,
-            "{via:?}: the record, one reference and, without CHECKSUMS, the registry's index"
+            "{via:?}: the record, one reference, without CHECKSUMS the registry's index, and \
+             the record of an installed patched build"
         );
         assert_eq!(
             p.references_since(mark).await,
