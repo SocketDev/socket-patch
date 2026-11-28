@@ -22,8 +22,10 @@
 //! network: every host effect (locking, record fetches, the commit of the
 //! rewritten files) stays with the caller.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
+use std::hash::Hash;
 use std::pin::Pin;
 
 use futures_util::future::Either;
@@ -508,20 +510,25 @@ pub const GRANT_INSECURE_URL: &str = "redirect_grant_insecure_url";
 /// URLs are accepted.
 ///
 /// [`grant::check`]: crate::patch::redirect::grant::check
-pub fn build_candidates(
+pub fn build_candidates<K, R>(
     selected: &[(String, String)],
-    references: &HashMap<String, PackageVendorResult>,
+    references: &HashMap<K, R>,
     patch_server_origins: &[String],
     skipped: &mut Vec<SkippedPatch>,
     warnings: &mut Vec<RewriteWarning>,
-) -> Vec<Candidate> {
+) -> Vec<Candidate>
+where
+    K: Borrow<str> + Eq + Hash,
+    R: Borrow<PackageVendorResult>,
+{
     use crate::patch::redirect::grant::{self, Flaw};
     let mut candidates = Vec::new();
     for (sel_purl, sel_uuid) in selected {
-        let Some(reference) = references.get(sel_uuid) else {
+        let Some(reference) = references.get(sel_uuid.as_str()) else {
             skipped.push(SkippedPatch::new(sel_purl, sel_uuid, "not_found"));
             continue;
         };
+        let reference: &PackageVendorResult = reference.borrow();
         if reference.status != "granted" && reference.status != "reused" {
             skipped.push(SkippedPatch::new(sel_purl, sel_uuid, &reference.status));
             continue;
@@ -2706,12 +2713,16 @@ pub fn gem_refresh_targets(
 /// being built, a reference with no list or of another package) yields no
 /// candidate and says nothing: the lock stays as it is, as on a run that
 /// asked for none.
-pub fn gem_refresh_candidates(
+pub fn gem_refresh_candidates<K, R>(
     targets: &[crate::patch::redirect::GemRefresh],
-    references: &HashMap<String, PackageVendorResult>,
+    references: &HashMap<K, R>,
     patch_server_origins: &[String],
     files: &BTreeMap<String, String>,
-) -> Vec<Candidate> {
+) -> Vec<Candidate>
+where
+    K: Borrow<str> + Eq + Hash,
+    R: Borrow<PackageVendorResult>,
+{
     let mut candidates = Vec::new();
     for target in targets {
         let purl = crate::utils::purl::simple_purl("gem", &target.name, &target.version);

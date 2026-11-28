@@ -1034,15 +1034,17 @@ async fn engine(
             _ => Default::default(),
         });
     }
-    let asked_of =
-        |index: usize, uuid: &str| discover::asked_reference(uuid, &root_snapshots[index]);
-    let mut asked: BTreeSet<discover::AskedReference> = BTreeSet::new();
-    for (index, state) in states.iter().enumerate() {
-        if state.error.is_none() {
-            let selected = state.selected.iter();
-            asked.extend(selected.map(|(_, uuid)| asked_of(index, uuid)));
-        }
+    // What each root asks for, in the order of its selected patches.
+    let mut root_asked: Vec<Vec<discover::AskedReference>> = Vec::new();
+    for (state, held) in states.iter().zip(&root_snapshots) {
+        let selected = state.selected.iter().filter(|_| state.error.is_none());
+        root_asked.push(
+            selected
+                .map(|(_, uuid)| discover::asked_reference(uuid, held))
+                .collect(),
+        );
     }
+    let asked: BTreeSet<discover::AskedReference> = root_asked.iter().flatten().cloned().collect();
     checkpoint(&cancel).await?;
     let (answered, failed_refs) = discover::fetch_references(&provider, &asked).await;
     // Roots whose rows' eligibility is unknown: a reference failure that
@@ -1053,16 +1055,16 @@ async fn engine(
         if state.error.is_some() {
             continue;
         }
-        if let Some(error) = state
-            .selected
+        let failed = root_asked[index]
             .iter()
-            .find_map(|(_, uuid)| failed_refs.get(&asked_of(index, uuid)))
-        {
+            .find_map(|asked| failed_refs.get(asked));
+        if let Some(error) = failed {
             if stage.capped() && state.rows.iter().all(|r| r.candidate.recorded.is_new()) {
                 stage.incomplete = true;
                 stage.reference_failed = Some(error.clone());
                 unknown_roots.insert(state.root.clone());
                 state.selected.clear();
+                root_asked[index].clear();
                 continue;
             }
             stage.incomplete = true;
@@ -1084,12 +1086,13 @@ async fn engine(
             continue;
         };
         let unreadable = std::mem::take(&mut state.unreadable);
-        let references: HashMap<String, crate::api::types::PackageVendorResult> = state
+        // The answers stay where the round put them: the planner reads
+        // each through the root's own key for it.
+        let references: HashMap<&str, &crate::api::types::PackageVendorResult> = state
             .selected
             .iter()
-            .filter_map(|(_, uuid)| {
-                Some((uuid.clone(), answered.get(&asked_of(index, uuid))?.clone()))
-            })
+            .zip(&root_asked[index])
+            .filter_map(|((_, uuid), asked)| Some((uuid.as_str(), answered.get(asked)?)))
             .collect();
         match stages::plan(project, unreadable, &state.selected, &references).await {
             Ok(plan) => planned.push((index, plan)),
@@ -1170,11 +1173,23 @@ async fn engine(
     for (_, plan) in planned.iter_mut() {
         refreshes.push(stages::record_gem_indexes(plan, &gem_indexes));
     }
-    let mut unknown: BTreeSet<discover::AskedReference> = BTreeSet::new();
-    for ((index, _), targets) in planned.iter().zip(&refreshes) {
-        let asked = targets.iter().map(|target| asked_of(*index, &target.uuid));
-        unknown.extend(asked.filter(|reference| !answered.contains_key(reference)));
-    }
+    let refresh_asked: Vec<Vec<discover::AskedReference>> = planned
+        .iter()
+        .zip(&refreshes)
+        .map(|((index, _), targets)| {
+            let held = &root_snapshots[*index];
+            let targets = targets.iter();
+            targets
+                .map(|target| discover::asked_reference(&target.uuid, held))
+                .collect()
+        })
+        .collect();
+    let unknown: BTreeSet<discover::AskedReference> = refresh_asked
+        .iter()
+        .flatten()
+        .filter(|asked| !answered.contains_key(*asked))
+        .cloned()
+        .collect();
     // A request that fails answers for none of its patches.
     let refreshed = if unknown.is_empty() {
         HashMap::new()
@@ -1182,16 +1197,16 @@ async fn engine(
         checkpoint(&cancel).await?;
         discover::fetch_references(&provider, &unknown).await.0
     };
-    for ((index, plan), targets) in planned.iter_mut().zip(&refreshes) {
+    for (((_, plan), targets), asked) in planned.iter_mut().zip(&refreshes).zip(&refresh_asked) {
         if targets.is_empty() {
             continue;
         }
-        let answers: HashMap<String, crate::api::types::PackageVendorResult> = targets
+        let answers: HashMap<&str, &crate::api::types::PackageVendorResult> = targets
             .iter()
-            .filter_map(|target| {
-                let asked = asked_of(*index, &target.uuid);
-                let answer = answered.get(&asked).or_else(|| refreshed.get(&asked))?;
-                Some((target.uuid.clone(), answer.clone()))
+            .zip(asked)
+            .filter_map(|(target, asked)| {
+                let answer = answered.get(asked).or_else(|| refreshed.get(asked))?;
+                Some((target.uuid.as_str(), answer))
             })
             .collect();
         stages::refresh_gem_patches(plan, targets, &answers);

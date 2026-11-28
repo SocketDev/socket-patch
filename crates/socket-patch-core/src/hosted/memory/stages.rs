@@ -193,7 +193,7 @@ pub(crate) fn record_gem_indexes(
 pub(crate) fn refresh_gem_patches(
     plan: &mut Planned,
     targets: &[crate::patch::redirect::GemRefresh],
-    references: &HashMap<String, PackageVendorResult>,
+    references: &HashMap<&str, &PackageVendorResult>,
 ) {
     // The in-memory host configures no patch server of its own.
     let refreshed = engine::gem_refresh_candidates(targets, references, &[], &plan.read.files);
@@ -206,7 +206,7 @@ pub(crate) async fn plan(
     project: MemoryProject,
     unreadable: BTreeSet<String>,
     selected: &[(String, String)],
-    references: &HashMap<String, PackageVendorResult>,
+    references: &HashMap<&str, &PackageVendorResult>,
 ) -> Result<Planned, Refusal> {
     let mut skipped: Vec<SkippedPatch> = Vec::new();
     let mut pre_warnings = Vec::new();
