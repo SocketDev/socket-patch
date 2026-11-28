@@ -899,10 +899,10 @@ impl GemBuildUnshown {
             GemBuildUnshown::Request(_)
             | GemBuildUnshown::IndexUnread(_)
             | GemBuildUnshown::RecordUnread(_) => GEM_BUILD_RETRY,
-            GemBuildUnshown::NoList(_)
-            | GemBuildUnshown::Unpinned
-            | GemBuildUnshown::Unlisted
-            | GemBuildUnshown::Differs => GEM_BUILD_RESCAN,
+            GemBuildUnshown::Unlisted => GEM_BUILD_UNLISTED,
+            GemBuildUnshown::NoList(_) | GemBuildUnshown::Unpinned | GemBuildUnshown::Differs => {
+                GEM_BUILD_RESCAN
+            }
         }
     }
 
@@ -1974,6 +1974,13 @@ const GEM_BUILD_ONLINE: &str = "Run `socket-patch vex` without --offline to atte
 /// What to run for a build the lock and the patch registry disagree about.
 const GEM_BUILD_RESCAN: &str = "Run `socket-patch scan --mode hosted` to bring the lockfile up \
     to date, then `socket-patch vex` again.";
+
+/// What settles a build of a platform the patch registry does not list. A
+/// scan changes nothing for it: the registry lists every platform gem
+/// upstream publishes, so the platform is one upstream does not publish.
+const GEM_BUILD_UNLISTED: &str = "A scan does not change this: the patch registry lists no gem \
+    for that platform. It is settled once the lockfile no longer names the platform \
+    (`bundle lock --remove-platform`), or the registry lists a gem for it.";
 
 /// The [`GEM_BUILD_UNKNOWN`] note of the gem at `key`: nothing shows what
 /// the lock installs for the builds of `platforms`, for the reason `why`,
@@ -4326,10 +4333,12 @@ mod tests {
                 ),
                 (
                     JAVA.to_string(),
+                    // A scan changes nothing for a platform the registry
+                    // does not list, so the remedy names none.
                     unshown_action(
                         "java",
                         "the patch registry does not list it now",
-                        GEM_BUILD_RESCAN
+                        GEM_BUILD_UNLISTED
                     )
                 ),
             ]

@@ -224,9 +224,10 @@ pub fn gem_upstream_build_kept_detail(platform: &str, withdrawn: bool) -> String
 /// Skip reason of a gem the Bundler lock names as precompiled platform
 /// builds, left as it is because the patch registry does not list a
 /// platform the lock names: a machine of that platform would be sent to a
-/// registry with no gem for it. Not a warning. Nothing says that the list
-/// will come to name the platform (the patch service leaves one out while
-/// its patched build is being made, and may never have one): the gem
+/// registry with no gem for it. Not a warning. The patch service lists
+/// every platform gem upstream publishes for the version, so such a
+/// platform is one upstream does not publish (a private build, a yanked
+/// gem), and nothing says that the list will come to name it: the gem
 /// moves on a run whose list names every platform the lock does. A lock
 /// that takes the gem from the registry of another patch of the gem stays
 /// on that patch meanwhile, and the skip says so.
@@ -6443,13 +6444,6 @@ fn confirm(
             // builds is pinned once its entry is in the block of
             // `MODULE.bazel`, whatever another build of the checkout pins.
             if rewrite.confirmed_bazel_maven_uuids.contains(uuid) {
-                return ProbeStep::Decided(true);
-            }
-            // A gem whose lock is on this patch's registry at an earlier
-            // snapshot, kept there because the reference at hand leaves a
-            // locked platform out: the gem rewriter found the lock on the
-            // registry, which is the pin.
-            if rewrite.gem_kept_on_snapshot.contains(uuid) {
                 return ProbeStep::Decided(true);
             }
             if purl.starts_with("pkg:maven/") {

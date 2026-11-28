@@ -208,9 +208,9 @@ pub struct RegistryOverrideIdentifiers {
     /// (`patch_uuid`), else as upstream's own gem, which the registry
     /// lists and hands on unchanged. So a lock's entries can all take the
     /// registry as their one source, each pinned to the sha256 listed for
-    /// it. A platform can be missing from the list (the patch service
-    /// leaves one out while its patched build is being made): a lock that
-    /// names it is left as it is. `None` when the reference carries no list (the
+    /// it. The list names every platform gem upstream publishes for the
+    /// version; a lock that names a platform it lacks (one upstream does
+    /// not publish) is left as it is. `None` when the reference carries no list (the
     /// service does not know the version's platforms, or the gem has no
     /// platform gem): the patch is then of the ruby gem alone, and a lock
     /// that names platform builds is left as it is.
@@ -542,19 +542,6 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub gem_unlisted_on_patch: std::collections::BTreeSet<String>,
-    /// gem: the gems whose lock already takes its platform builds from
-    /// this patch's own registry while the reference at hand leaves a
-    /// locked platform out, by the gem patch's uuid. The patch service
-    /// leaves a platform out while its patched build is being made, and
-    /// the snapshot the lock names goes on serving what it listed, so the
-    /// lock is left as it is and still pins the patch: such a gem is in
-    /// effect, and is never among [`Self::gem_unlisted`]. Serialized only
-    /// when non-empty.
-    #[cfg_attr(
-        test,
-        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
-    )]
-    pub gem_kept_on_snapshot: std::collections::BTreeSet<String>,
     /// gem: the gems the lock takes as platform builds from the registry
     /// of another patch of the gem, left on that patch because this one's
     /// registry serves upstream's own gem for a platform whose locked
@@ -1119,7 +1106,6 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         gem_unpatched,
         gem_unlisted,
         gem_unlisted_on_patch,
-        gem_kept_on_snapshot,
         gem_held,
     } = delta;
     result.files.extend(files);
@@ -1172,7 +1158,6 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.gem_unpatched.extend(gem_unpatched);
     result.gem_unlisted.extend(gem_unlisted);
     result.gem_unlisted_on_patch.extend(gem_unlisted_on_patch);
-    result.gem_kept_on_snapshot.extend(gem_kept_on_snapshot);
     result.gem_held.extend(gem_held);
     for (uuid, keys) in alias_skipped_entries {
         result
@@ -9835,18 +9820,11 @@ fn rewrite_gem(
                     });
                     continue;
                 }
-                // A locked platform the list leaves out: the patch service
-                // leaves one out while its patched build is being made, and
-                // may never have one to name. Nothing to warn about; a run
-                // over a list that names it moves the gem.
+                // A locked platform the list leaves out: one upstream does
+                // not publish, since the patch service lists every platform
+                // gem upstream has. Nothing to warn about; a run over a list
+                // that names it moves the gem.
                 if !unlisted.is_empty() {
-                    // A lock that is on this patch's registry already keeps
-                    // installing what its snapshot lists: it stays as it
-                    // is, and stays on the patch.
-                    if gem_lock_on_registry(parsed, dep, index_url) {
-                        result.gem_kept_on_snapshot.insert(dep.patch_uuid.clone());
-                        continue;
-                    }
                     result.gem_unlisted.insert(dep.patch_uuid.clone(), unlisted);
                     // A lock on another patch of the gem stays on it.
                     if gem_lock_on_other_registry(parsed, dep, index_url).is_some() {

@@ -4996,17 +4996,13 @@ Adding a platform is Bundler's own step: `bundle lock --add-platform <platform>`
 from its one source, the patch registry, and adds that platform's entry and checksum. The next
 scan reports the new build.
 
-A lock that is already on the patch stays on it when a later listing leaves one of its platforms
-out, which the patch service does while that platform's build is being made again: the registry
-address the lock names keeps serving what it listed, so the scan changes nothing, reports the gem
-as on its patch and prints no line about it.
-
 Three cases leave the gem as it is, with one plain line and no warning:
 
 - no platform the lock names has a patched build yet (`redirect_gem_no_patched_build`). Moving the
   gem would gain nothing, so it stays on its upstream registry;
 - the patch registry does not list a platform the lock names (`redirect_gem_platform_unlisted`).
-  A platform is left out while its patched build is being made;
+  The registry lists every platform gem upstream publishes for the version, so such a platform
+  is one upstream does not publish (a private build, a yanked platform gem);
 - the lock is on an earlier fix that patches a build the newer fix has no patched build for yet
   (`redirect_gem_newer_fix_waits`). A scan never turns a build that is patched today into
   upstream's gem, so the lock stays on the patch it is on. To tell, the scan asks the registry
