@@ -335,7 +335,10 @@ pub(crate) async fn fetch_references(
     BTreeMap<AskedReference, String>,
 ) {
     // `asked` is ordered by patch, so the n-th snapshot of each patch
-    // rides the n-th round, and no round names a patch twice.
+    // rides the n-th round, and no round names a patch twice. The first
+    // round so carries the keyless references beside the first snapshot of
+    // every keyed patch: fewer requests, at the price that one of them
+    // failing fails roots that a request per root would have kept apart.
     let mut rounds: Vec<Vec<&AskedReference>> = Vec::new();
     let mut nth = 0;
     let mut previous: Option<&str> = None;
