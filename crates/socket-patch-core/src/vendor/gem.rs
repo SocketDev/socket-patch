@@ -1918,29 +1918,34 @@ fn no_patched_build_detail(
     format!("{gem} {lead}: {none}{have}. Vendored mode needs every locked platform{tail}")
 }
 
-/// What a gem is told when its fix names no builds to vendor from right
-/// now: the fix's reference carries no list of the version's gems (the
-/// service has not read them, or is building one of them again), or the
-/// service says the patch is not ready. Nothing in that answer says a
-/// build was withdrawn or replaced, so nothing here says so either. One
-/// sentence for a first vendoring, a re-scan and a restore.
+/// What a gem's fix says when it names no builds to vendor from right
+/// now: its reference carries no list of the version's gems (the service
+/// has not read them, or is building one of them again), or the service
+/// says the patch is not ready. Nothing in that answer says a build was
+/// withdrawn or replaced, so nothing here says so either. A phrase: each
+/// caller ends its own line with what to do.
 fn no_builds_listed(gem: &str) -> String {
-    format!("the patch service lists no builds for {gem} right now; run this again later")
+    format!("the patch service lists no builds for {gem} right now")
 }
 
 /// [`no_builds_listed`] for the platforms a lock names: the skip of
-/// [`no_patched_build`], with what the gem's `standing` leaves it with.
+/// [`no_patched_build`], opened like its line and closed with what the
+/// gem's `standing` leaves it with. Either answer of [`no_builds_listed`]
+/// is this skip, so one rebuild is not a skip for one and a failure for
+/// the other.
 fn no_builds_listed_skip(trees: &PlatformTrees<'_>) -> Box<VendorOutcome> {
-    let tail = match trees.standing {
-        Standing::Wired => "",
-        Standing::EarlierPatch => {
-            "; its vendored copy of an earlier patch stays in force as it is."
-        }
-        Standing::NotVendored | Standing::Hosted => ".",
+    let (lead, tail) = match trees.standing {
+        Standing::NotVendored => ("is not vendored", "; run the scan again later."),
+        Standing::Hosted => ("is not vendored", "; the gem stays hosted."),
+        Standing::Wired => ("was not brought up to date", ""),
+        Standing::EarlierPatch => (
+            "was not brought up to date",
+            "; its vendored copy of an earlier patch stays in force as it is.",
+        ),
     };
     Box::new(refused(
         super::VENDOR_PREBUILT_PLATFORM_PENDING,
-        format!("{}{tail}", no_builds_listed(trees.gem)),
+        format!("{} {lead}: {}{tail}", trees.gem, no_builds_listed("it")),
     ))
 }
 
@@ -1976,9 +1981,7 @@ async fn locked_build_sources(
 ) -> Result<Vec<BuildSource>, Box<VendorOutcome>> {
     let policy = ServicePolicy::Refused;
     let served = match fetch_served_reference(cfg, uuid).await {
-        ServiceArtifact::Pending => {
-            return Err(policy.unserved(super::VENDOR_PREBUILT_PENDING, no_builds_listed(trees.gem)))
-        }
+        ServiceArtifact::Pending => return Err(no_builds_listed_skip(trees)),
         reference => policy.settle(
             reference,
             "platform gem",
@@ -2041,8 +2044,14 @@ async fn recorded_build_sources(
     builds: &[GemBuildEntry],
 ) -> Result<Vec<BuildSource>, Box<VendorOutcome>> {
     let policy = ServicePolicy::Refused;
-    let not_listed =
-        || policy.unserved(super::VENDOR_PREBUILT_PENDING, no_builds_listed(trees.gem));
+    // A restore has no copy to leave in force: it fails, and says when to
+    // run it again.
+    let not_listed = || {
+        policy.unserved(
+            super::VENDOR_PREBUILT_PENDING,
+            format!("{}; run this again later", no_builds_listed(trees.gem)),
+        )
+    };
     let served = match fetch_served_reference(cfg, fix).await {
         ServiceArtifact::Pending => return Err(not_listed()),
         reference => policy.settle(
@@ -12913,6 +12922,26 @@ mod tests {
             (server, cfg)
         }
 
+        /// A service that says the gem's fix `uuid` is not ready
+        /// (`pending_build`), as it does while the fix's own gem is being
+        /// built again.
+        async fn fix_not_ready(uuid: &str) -> (wiremock::MockServer, VendorServiceConfig) {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, ResponseTemplate};
+            let server = wiremock::MockServer::start().await;
+            let results = serde_json::json!({ uuid: { "status": "pending_build" } });
+            Mock::given(method("POST"))
+                .and(path("/v0/orgs/acme/patches/package"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "results": results })),
+                )
+                .mount(&server)
+                .await;
+            let cfg = gem_service_cfg(&server.uri(), VendorSource::Service, false);
+            (server, cfg)
+        }
+
         /// [`serve`] with the platform gems listed.
         async fn service(
             uuid: &str,
@@ -13238,8 +13267,8 @@ mod tests {
                 (
                     vec![served(DARWIN), served(LINUX)],
                     false,
-                    "the patch service lists no builds for nokogiri@1.18.10 right now; run this \
-                     again later.",
+                    "nokogiri@1.18.10 is not vendored: the patch service lists no builds for it \
+                     right now; run the scan again later.",
                 ),
             ];
             for (builds, list, line) in cases {
@@ -13264,6 +13293,61 @@ mod tests {
                 );
                 assert_eq!(downloads(&server).await, Vec::<String>::new());
             }
+        }
+
+        /// A fix that names no builds right now is the same skip whichever
+        /// way the service says so: a reference with no list, or a fix
+        /// that is not ready. A project not yet vendored is left as it is,
+        /// and a vendored copy that is intact stays in force when its lock
+        /// has gained a platform; both under the benign code, in one line
+        /// that opens like its neighbours and says what to do.
+        #[tokio::test]
+        async fn a_fix_that_lists_no_builds_is_the_same_skip_for_either_answer() {
+            const JAVA: &str = "java";
+            let (_fresh_tmp, fresh, fresh_record) = project(&lock(None)).await;
+            let (_tmp, root, record) = project(&lock(None)).await;
+            let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            vendor_and_persist(&root, &record, &cfg).await;
+            let lock_path = root.join(GEMFILE_LOCK);
+            let locked = text(lock_path.clone()).await;
+            let gained = locked.replace(
+                "    nokogiri (1.18.10-x86_64-linux-gnu)\n",
+                "    nokogiri (1.18.10-java)\n      racc (~> 1.4)\n    nokogiri (1.18.10-x86_64-linux-gnu)\n",
+            );
+            assert_ne!(gained, locked);
+            tokio::fs::write(&lock_path, &gained).await.unwrap();
+            let before = (ts::tree_snapshot(&fresh), ts::tree_snapshot(&root));
+
+            let no_list = serve(UUID, &[served(DARWIN), served(JAVA), served(LINUX)], false).await;
+            let not_ready = fix_not_ready(UUID).await;
+            for (_server, cfg) in [&no_list, &not_ready] {
+                for dry_run in [true, false] {
+                    let (code, detail) = unwrap_refused(
+                        vendor(&fresh, &not_installed(&fresh), &fresh_record, cfg, dry_run).await,
+                    );
+                    assert_eq!(code, "vendor_prebuilt_platform_pending", "{detail}");
+                    assert!(crate::vendor::refusals::refusal_is_benign(code));
+                    assert_eq!(
+                        detail,
+                        "nokogiri@1.18.10 is not vendored: the patch service lists no builds \
+                         for it right now; run the scan again later."
+                    );
+                    let (code, detail) = unwrap_refused(
+                        vendor(&root, &not_installed(&root), &record, cfg, dry_run).await,
+                    );
+                    assert_eq!(code, "vendor_prebuilt_platform_pending", "{detail}");
+                    assert_eq!(
+                        detail,
+                        "nokogiri@1.18.10 was not brought up to date: the patch service lists \
+                         no builds for it right now; its vendored copy stays in force as it is."
+                    );
+                    assert!(!detail.contains('\n'), "one line: {detail}");
+                }
+            }
+            assert_eq!(
+                (ts::tree_snapshot(&fresh), ts::tree_snapshot(&root)),
+                before
+            );
         }
 
         /// A platform the lock gains after the gem was vendored, with no
@@ -13551,8 +13635,10 @@ mod tests {
         /// a restore speak of a withdrawal.
         #[tokio::test]
         async fn a_damaged_copy_whose_fix_lists_no_builds_is_told_to_run_again_later() {
-            const WORDS: &str = "the patch service lists no builds for nokogiri@1.18.10 right \
-                                 now; run this again later";
+            const SCAN: &str = "nokogiri@1.18.10 was not brought up to date: the patch service \
+                                lists no builds for it right now";
+            const RESTORE: &str = "vendor_prebuilt_required: the patch service lists no builds \
+                                   for nokogiri@1.18.10 right now; run this again later";
             let (_tmp, root, record) = project(&lock(None)).await;
             let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
             let entry = vendor_and_persist(&root, &record, &cfg).await;
@@ -13570,7 +13656,7 @@ mod tests {
                 assert_eq!(
                     detail,
                     format!(
-                        "{WORDS}; its vendored copy is missing or damaged and cannot be rebuilt \
+                        "{SCAN}; its vendored copy is missing or damaged and cannot be rebuilt \
                          until then."
                     )
                 );
@@ -13579,11 +13665,22 @@ mod tests {
             let failed = crate::vendor::redownload::restore(&root, &entry, &record, &cfg)
                 .await
                 .expect_err("a fix that lists no builds restores nothing");
-            assert!(failed.ends_with(WORDS), "{failed}");
-            assert!(
-                !failed.contains("vendor_prebuilt_replaced") && !failed.contains("withdrawn"),
-                "{failed}"
-            );
+            assert_eq!(failed, RESTORE);
+            assert_eq!(ts::tree_snapshot(&root), before, "restore");
+
+            // The same from a fix that is not ready, in the same words.
+            let (_server, cfg) = fix_not_ready(UUID).await;
+            for dry_run in [true, false] {
+                let (code, detail) = unwrap_refused(
+                    vendor(&root, &not_installed(&root), &record, &cfg, dry_run).await,
+                );
+                assert_eq!(code, "vendor_prebuilt_required", "{detail}");
+                assert!(detail.starts_with(SCAN), "{detail}");
+            }
+            let failed = crate::vendor::redownload::restore(&root, &entry, &record, &cfg)
+                .await
+                .expect_err("a fix that is not ready restores nothing");
+            assert_eq!(failed, RESTORE);
             assert_eq!(ts::tree_snapshot(&root), before, "restore");
 
             let pass_through = Served {
@@ -13971,6 +14068,45 @@ mod tests {
                     );
                 }
             }
+        }
+
+        /// The line of a fix that names no builds right now, for each
+        /// standing: it opens like the line of a platform with no patched
+        /// build, names the gem once, and ends with what the gem is left
+        /// with (the caller ends the line of a wired copy).
+        #[test]
+        fn a_fix_that_names_no_builds_says_what_the_gem_is_left_with() {
+            const NONE: &str = "the patch service lists no builds for it right now";
+            let platforms = [LINUX.to_string()];
+            let line = |standing: Standing| {
+                let trees = PlatformTrees {
+                    gem: "nokogiri@1.18.10",
+                    from: BuildsFrom::Locked(&platforms),
+                    standing,
+                };
+                let (code, detail) = unwrap_refused(*no_builds_listed_skip(&trees));
+                assert_eq!(code, "vendor_prebuilt_platform_pending");
+                detail
+            };
+            assert_eq!(
+                line(Standing::NotVendored),
+                format!("nokogiri@1.18.10 is not vendored: {NONE}; run the scan again later.")
+            );
+            assert_eq!(
+                line(Standing::Hosted),
+                format!("nokogiri@1.18.10 is not vendored: {NONE}; the gem stays hosted.")
+            );
+            assert_eq!(
+                line(Standing::Wired),
+                format!("nokogiri@1.18.10 was not brought up to date: {NONE}")
+            );
+            assert_eq!(
+                line(Standing::EarlierPatch),
+                format!(
+                    "nokogiri@1.18.10 was not brought up to date: {NONE}; its vendored copy of \
+                     an earlier patch stays in force as it is."
+                )
+            );
         }
 
         /// A gem the lockfile pins hosted, as a takeover or an eject hands
