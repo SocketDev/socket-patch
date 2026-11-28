@@ -145,7 +145,7 @@ use super::revert::{self, KeepPolicy};
 use super::service_fetch::{
     claim_prestaged, downloaded_warning, fetch_served_reference, fetch_served_references,
     fetch_verified_archive, fetch_verified_artifact, fetch_verified_secondary,
-    SecondaryArtifactResult, ServicePolicy, Unserved,
+    SecondaryArtifactResult, ServiceArtifact, ServicePolicy, Unserved,
 };
 use super::source::PackageSource;
 use super::state::{
@@ -1203,7 +1203,6 @@ pub async fn vendor_gem_previewing<'a>(
         gem: &label,
         from: BuildsFrom::Locked(platforms),
         standing,
-        snapshot: None,
     };
 
     // ── idempotent hot path ──────────────────────────────────────────────
@@ -1595,13 +1594,12 @@ fn gem_entry(
     base_purl: String,
     record: &PatchRecord,
     copy_rel: String,
-    (builds, snapshot): (Vec<GemBuildEntry>, Option<String>),
+    builds: Vec<GemBuildEntry>,
     file_inventory: Option<std::collections::BTreeMap<String, String>>,
     wiring: Vec<WiringRecord>,
 ) -> VendorEntry {
     VendorEntry {
         gem_builds: builds,
-        gem_snapshot: snapshot,
         ..VendorEntry::new(
             "gem".to_string(),
             base_purl,
@@ -1821,10 +1819,6 @@ pub(super) struct PlatformTrees<'a> {
     pub(super) gem: &'a str,
     pub(super) from: BuildsFrom<'a>,
     pub(super) standing: Standing,
-    /// A restore: the registry snapshot the ledger entry records for the
-    /// trees ([`VendorEntry::gem_snapshot`]), presented with the request
-    /// for the reference of the gem's fix.
-    pub(super) snapshot: Option<&'a str>,
 }
 
 /// One platform tree to stage: the patch it is unpacked from, and what its
@@ -1924,6 +1918,32 @@ fn no_patched_build_detail(
     format!("{gem} {lead}: {none}{have}. Vendored mode needs every locked platform{tail}")
 }
 
+/// What a gem is told when its fix names no builds to vendor from right
+/// now: the fix's reference carries no list of the version's gems (the
+/// service has not read them, or is building one of them again), or the
+/// service says the patch is not ready. Nothing in that answer says a
+/// build was withdrawn or replaced, so nothing here says so either. One
+/// sentence for a first vendoring, a re-scan and a restore.
+fn no_builds_listed(gem: &str) -> String {
+    format!("the patch service lists no builds for {gem} right now; run this again later")
+}
+
+/// [`no_builds_listed`] for the platforms a lock names: the skip of
+/// [`no_patched_build`], with what the gem's `standing` leaves it with.
+fn no_builds_listed_skip(trees: &PlatformTrees<'_>) -> Box<VendorOutcome> {
+    let tail = match trees.standing {
+        Standing::Wired => "",
+        Standing::EarlierPatch => {
+            "; its vendored copy of an earlier patch stays in force as it is."
+        }
+        Standing::NotVendored | Standing::Hosted => ".",
+    };
+    Box::new(refused(
+        super::VENDOR_PREBUILT_PLATFORM_PENDING,
+        format!("{}{tail}", no_builds_listed(trees.gem)),
+    ))
+}
+
 /// The skip of a gem left as it is because locked platforms have no
 /// patched build ([`super::VENDOR_PREBUILT_PLATFORM_PENDING`]). Not a
 /// failure: a platform's patched build is named and served only once it
@@ -1944,23 +1964,30 @@ fn no_patched_build(
 /// reference of the gem's fix `uuid` names them, with the sha256 its
 /// registry lists for that platform gem: ONE request, and nothing
 /// downloaded. While a locked platform has no patched build (the registry
-/// serves upstream's own gem for it, does not list it, or lists no
-/// platform gem at all) the gem is skipped ([`no_patched_build`]).
+/// serves upstream's own gem for it, or does not list it) the gem is
+/// skipped ([`no_patched_build`]); a reference with no list at all is
+/// skipped as naming no builds right now ([`no_builds_listed_skip`]).
 async fn locked_build_sources(
     cfg: &VendorServiceConfig,
     uuid: &str,
     name: &str,
     trees: &PlatformTrees<'_>,
     platforms: &[String],
-) -> Result<(Vec<BuildSource>, Option<String>), Box<VendorOutcome>> {
+) -> Result<Vec<BuildSource>, Box<VendorOutcome>> {
     let policy = ServicePolicy::Refused;
-    let reference = fetch_served_reference(cfg, uuid, trees.snapshot).await;
-    let served = policy.settle(
-        reference,
-        "platform gem",
-        &format!("platform gems for {name}"),
-    )?;
-    let builds = served.gem_builds.as_deref().unwrap_or_default();
+    let served = match fetch_served_reference(cfg, uuid).await {
+        ServiceArtifact::Pending => {
+            return Err(policy.unserved(super::VENDOR_PREBUILT_PENDING, no_builds_listed(trees.gem)))
+        }
+        reference => policy.settle(
+            reference,
+            "platform gem",
+            &format!("platform gems for {name}"),
+        )?,
+    };
+    let Some(builds) = served.gem_builds.as_deref() else {
+        return Err(no_builds_listed_skip(trees));
+    };
     let mut sources: Vec<BuildSource> = Vec::with_capacity(platforms.len());
     let mut missing = NoPatchedBuild::default();
     for platform in platforms {
@@ -1975,22 +2002,18 @@ async fn locked_build_sources(
         }
     }
     if missing.is_empty() {
-        return Ok((sources, served.gem_snapshot));
+        return Ok(sources);
     }
     let patched: Vec<&str> = sources.iter().map(|s| s.platform.as_str()).collect();
     Err(no_patched_build(trees, &missing, &patched))
 }
 
 /// A restore found that the build a ledger entry records for a platform is
-/// no longer the one the gem's fix names for it: it was rebuilt under
-/// another patch or with other bytes, or withdrawn.
+/// no longer the one the list of the gem's fix names for it: it was rebuilt
+/// under another patch or with other bytes, or withdrawn. A fix that
+/// carries no list says neither ([`no_builds_listed`]).
 /// Nothing is unpacked. Not an integrity failure: the same state follows
 /// an edited ledger, and neither is told from the other here.
-///
-/// A build that is only being made again is still named for an entry that
-/// records its registry snapshot, which the request presents
-/// ([`PlatformTrees::snapshot`]). An entry without one asks with no key and
-/// is answered no list during a rebuild: its message names both causes.
 pub(crate) const VENDOR_PREBUILT_REPLACED: &str = "vendor_prebuilt_replaced";
 
 /// The sources of the trees a ledger entry records, for a restore.
@@ -2016,15 +2039,22 @@ async fn recorded_build_sources(
     name: &str,
     trees: &PlatformTrees<'_>,
     builds: &[GemBuildEntry],
-) -> Result<(Vec<BuildSource>, Option<String>), Box<VendorOutcome>> {
+) -> Result<Vec<BuildSource>, Box<VendorOutcome>> {
     let policy = ServicePolicy::Refused;
-    let reference = fetch_served_reference(cfg, fix, trees.snapshot).await;
-    let served = policy.settle(
-        reference,
-        "platform gem",
-        &format!("platform gems for {name}"),
-    )?;
-    let listed = served.gem_builds.as_deref().unwrap_or_default();
+    let not_listed =
+        || policy.unserved(super::VENDOR_PREBUILT_PENDING, no_builds_listed(trees.gem));
+    let served = match fetch_served_reference(cfg, fix).await {
+        ServiceArtifact::Pending => return Err(not_listed()),
+        reference => policy.settle(
+            reference,
+            "platform gem",
+            &format!("platform gems for {name}"),
+        )?,
+    };
+    // Only a list says a build was replaced or withdrawn.
+    let Some(listed) = served.gem_builds.as_deref() else {
+        return Err(not_listed());
+    };
     let mut sources = Vec::with_capacity(builds.len());
     for built in builds {
         let subject = format!("{name} ({})", built.platform);
@@ -2043,15 +2073,9 @@ async fn recorded_build_sources(
         };
         let now = listed.iter().find(|gem| gem.platform == built.platform);
         let Some((gem, uuid)) = now.and_then(|gem| Some((gem, gem.patch_uuid.as_deref()?))) else {
-            // A copy with no snapshot on record asked with none, and is
-            // then answered no list while a build is being made again.
-            return Err(replaced(match trees.snapshot {
-                Some(_) => "names no patched build for that platform now (it was withdrawn)",
-                None => {
-                    "names no patched build for that platform now (it was withdrawn, or is \
-                     being made again: then run this again in a few minutes)"
-                }
-            }));
+            return Err(replaced(
+                "names no patched build for that platform now (it was withdrawn)",
+            ));
         };
         if !built.uuid.eq_ignore_ascii_case(uuid) {
             return Err(replaced(&format!(
@@ -2079,7 +2103,7 @@ async fn recorded_build_sources(
             },
         });
     }
-    Ok((sources, served.gem_snapshot))
+    Ok(sources)
 }
 
 /// Refuses a stub gemspec that is not the one of the platform gem being
@@ -2244,7 +2268,7 @@ async fn stage_platform_builds(
     name: &str,
     trees: &PlatformTrees<'_>,
     stage: &Path,
-) -> Result<(Vec<VendorWarning>, Vec<GemBuildEntry>, Option<String>), Box<VendorOutcome>> {
+) -> Result<(Vec<VendorWarning>, Vec<GemBuildEntry>), Box<VendorOutcome>> {
     use futures_util::StreamExt as _;
     let policy = ServicePolicy::Refused;
     let platforms: Vec<&str> = match &trees.from {
@@ -2259,7 +2283,7 @@ async fn stage_platform_builds(
             format!("unsafe gem platform `{platform}` for `{name}`"),
         ));
     }
-    let (sources, snapshot): (Vec<BuildSource>, _) = match &trees.from {
+    let sources: Vec<BuildSource> = match &trees.from {
         BuildsFrom::Locked(platforms) => {
             locked_build_sources(cfg, &record.uuid, name, trees, platforms).await?
         }
@@ -2366,7 +2390,7 @@ async fn stage_platform_builds(
             ),
         ));
     }
-    Ok((warnings, built, snapshot))
+    Ok((warnings, built))
 }
 
 impl BuildPin {
@@ -2526,14 +2550,13 @@ pub(super) async fn gem_platform_service_copy(
     uuid_dir: &Path,
     unwind_uuid_dir: bool,
     warnings: &mut Vec<VendorWarning>,
-) -> Result<(Vec<GemBuildEntry>, Option<String>), Box<VendorOutcome>> {
+) -> Result<Vec<GemBuildEntry>, Box<VendorOutcome>> {
     let cfg = service
         .filter(|cfg| cfg.service_enabled())
         .ok_or_else(|| Box::new(super::service_fetch::required()))?;
     let stage = stage_dir_for(copy_dir);
     let _ = remove_tree(&stage).await;
-    let staging = stage_platform_builds(cfg, record, name, trees, &stage).await;
-    let (staged, built, snapshot) = match staging {
+    let (staged, built) = match stage_platform_builds(cfg, record, name, trees, &stage).await {
         Ok(staged) => staged,
         Err(outcome) => {
             cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
@@ -2548,7 +2571,7 @@ pub(super) async fn gem_platform_service_copy(
         ));
     }
     warnings.extend(staged);
-    Ok((built, snapshot))
+    Ok(built)
 }
 
 /// `<uuid>/.gitignore` of a gem vendored as platform gems: re-includes
@@ -2628,7 +2651,7 @@ async fn preview_platform_builds(
         .map_err(|e| Box::new(refused("vendor_prebuilt_extract_failed", e.to_string())))?;
     stage_platform_builds(cfg, record, name, trees, scratch.path())
         .await
-        .map(|(_, built, _)| built)
+        .map(|(_, built)| built)
 }
 
 /// What a run would do with a gem `Gemfile.lock` names as precompiled
@@ -2713,11 +2736,10 @@ pub async fn preview_locked_builds(
         gem: &label,
         from: BuildsFrom::Locked(&prelude.platforms),
         standing,
-        snapshot: None,
     };
     let named = locked_build_sources(cfg, uuid, &prelude.name, &trees, &prelude.platforms).await;
     let sources = match named {
-        Ok((sources, _)) => sources,
+        Ok(sources) => sources,
         Err(outcome) => return refusal(*outcome),
     };
     // A patched build is only one to vendor once its own patch is served.
@@ -2754,8 +2776,8 @@ async fn materialise_patched_copy(
     unwind_uuid_dir: bool,
     service: Option<&VendorServiceConfig>,
     warnings: &mut Vec<VendorWarning>,
-) -> Result<(ApplyResult, (Vec<GemBuildEntry>, Option<String>)), Box<VendorOutcome>> {
-    let mut builds = (Vec::new(), None);
+) -> Result<(ApplyResult, Vec<GemBuildEntry>), Box<VendorOutcome>> {
+    let mut builds = Vec::new();
     match &trees.from {
         BuildsFrom::Locked([]) => {
             gem_service_copy(
@@ -13074,11 +13096,6 @@ mod tests {
                 // The ledger entry: each tree's platform, patch and digests,
                 // in lock order.
                 assert_eq!(entry.gem_builds, [built(UUID, DARWIN), built(UUID, LINUX)]);
-                assert_eq!(
-                    entry.gem_snapshot.as_deref(),
-                    Some("4"),
-                    "the snapshot the fix's registry named, for a later restore to present"
-                );
                 assert_eq!(entry.uuid, UUID);
                 assert_eq!(entry.artifact.path, rel);
                 let inventory = entry.artifact.file_inventory.as_ref().expect("inventory");
@@ -13216,13 +13233,13 @@ mod tests {
                     "nokogiri@1.18.10 is not vendored: no patched build yet for arm64-darwin and \
                      x86_64-linux-gnu. Vendored mode needs every locked platform.",
                 ),
-                // A patch of the ruby gem alone: its reference carries no
-                // list of platform gems.
+                // A reference that carries no list of the version's gems:
+                // the service names no builds to vendor from right now.
                 (
                     vec![served(DARWIN), served(LINUX)],
                     false,
-                    "nokogiri@1.18.10 is not vendored: no patched build yet for arm64-darwin and \
-                     x86_64-linux-gnu. Vendored mode needs every locked platform.",
+                    "the patch service lists no builds for nokogiri@1.18.10 right now; run this \
+                     again later.",
                 ),
             ];
             for (builds, list, line) in cases {
@@ -13522,6 +13539,67 @@ mod tests {
                 assert!(failed.contains(restore_says), "{failed}");
                 assert_eq!(ts::tree_snapshot(&root), before, "restore");
             }
+        }
+
+        /// A copy that lost a tree while the gem's fix names no builds: its
+        /// reference carries no list, as when the service has not read the
+        /// version's gems or is building one of them again. Nothing in
+        /// that answer says a build was replaced or withdrawn, so neither
+        /// a re-scan nor a restore says so. Both say, in the same words,
+        /// that the service lists no builds right now, and change nothing.
+        /// Only a list that names no patched build for the platform makes
+        /// a restore speak of a withdrawal.
+        #[tokio::test]
+        async fn a_damaged_copy_whose_fix_lists_no_builds_is_told_to_run_again_later() {
+            const WORDS: &str = "the patch service lists no builds for nokogiri@1.18.10 right \
+                                 now; run this again later";
+            let (_tmp, root, record) = project(&lock(None)).await;
+            let (_server, cfg) = service(UUID, &[served(DARWIN), served(LINUX)]).await;
+            let entry = vendor_and_persist(&root, &record, &cfg).await;
+            tokio::fs::remove_dir_all(root.join(rel(UUID)).join(LINUX))
+                .await
+                .unwrap();
+            let before = ts::tree_snapshot(&root);
+
+            let (_server, cfg) = serve(UUID, &[served(DARWIN), served(LINUX)], false).await;
+            for dry_run in [true, false] {
+                let (code, detail) = unwrap_refused(
+                    vendor(&root, &not_installed(&root), &record, &cfg, dry_run).await,
+                );
+                assert_eq!(code, "vendor_prebuilt_required", "{detail}");
+                assert_eq!(
+                    detail,
+                    format!(
+                        "{WORDS}; its vendored copy is missing or damaged and cannot be rebuilt \
+                         until then."
+                    )
+                );
+                assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
+            }
+            let failed = crate::vendor::redownload::restore(&root, &entry, &record, &cfg)
+                .await
+                .expect_err("a fix that lists no builds restores nothing");
+            assert!(failed.ends_with(WORDS), "{failed}");
+            assert!(
+                !failed.contains("vendor_prebuilt_replaced") && !failed.contains("withdrawn"),
+                "{failed}"
+            );
+            assert_eq!(ts::tree_snapshot(&root), before, "restore");
+
+            let pass_through = Served {
+                listed: Listed::PassThrough,
+                ..served(LINUX)
+            };
+            let (_server, cfg) = service(UUID, &[served(DARWIN), pass_through]).await;
+            let failed = crate::vendor::redownload::restore(&root, &entry, &record, &cfg)
+                .await
+                .expect_err("a list with no patched build for the platform restores nothing");
+            assert!(
+                failed.starts_with("vendor_prebuilt_replaced: ")
+                    && failed.contains("(it was withdrawn)"),
+                "{failed}"
+            );
+            assert_eq!(ts::tree_snapshot(&root), before, "restore");
         }
 
         /// What the skip does not cover: a response that leaves a platform

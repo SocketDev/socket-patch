@@ -274,7 +274,6 @@ pub async fn restore(
                             gem: &format!("{name}@{version}"),
                             from: super::gem::BuildsFrom::Recorded(builds),
                             standing: super::gem::Standing::Wired,
-                            snapshot: entry.gem_snapshot.as_deref(),
                         };
                         super::gem::gem_platform_service_copy(
                             Some(service),
