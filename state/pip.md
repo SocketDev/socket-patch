@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pip / requirements.txt bug-hunt routine (label pm:pip).
 
-Last run: 2026-11-27, main `cfc870f`, release v5.1.0, newest pip 26.3 (CPython 3.8–3.14 covered). Open bughunt issues: #2302 (new), #2272, #977 (needs-human). Harness: mock2.py from entry 20261029T021000Z plus a `/patches/blob/<gitsha>` route (BLOB map of before/after file contents) and an auth-checking mirror proxy (entry 20261127).
+Last run: 2026-11-28, main `cfc870f`, release v5.1.0, newest pip 26.3 (CPython 3.8–3.14 covered). Open bughunt issues: #2329 (new), #2302, #2272, #977 (needs-human). Harness: mock2.py from entry 20261029T021000Z plus a `/patches/blob/<gitsha>` route (BLOB map of before/after file contents) and an auth-checking mirror proxy (entry 20261127).
 
 ## Coverage matrix
 
@@ -20,22 +20,26 @@ Cells dated before 2026-11-11 count as untested for the release (see INSTRUCTION
 | Editable `-e ./app`, option lines, marker-split duplicates | n/a | pass (26.2.2, 2026-11-01) | pass (2026-11-01) |
 | Extras (`six[foo]`) eject / vendored (#1794) | n/a | pass | pass: refused (2026-11-01) |
 | Vendored comment edited then revert | n/a | n/a | fail #977 (needs-human) |
-| system-site venv / global `-g` (`--user`) | pass (26.3 system-site, 24.0 `-g`, 2026-11-27) | pass (old) | untested |
+| system-site venv / global `-g` (`--user`) | pass (26.3 system-site, 24.0 `-g`, 2026-11-27) | pass (old) | system-site: known non-bug (base copy kept, vex warns out-of-sync), CRLF + marker revert byte-identical (26.3, 2026-11-28) |
 | No venv (lock-only) hosted | n/a | `redirect_unconfirmed` / #638 class (closed) | pass |
 | UTF-16 / BOM / PEP 263 coding line | n/a | pass BOM / fail-closed UTF-16, latin-1 (2026-11-27) | pass BOM / fail-closed latin-1 (2026-11-27) |
 | `pip freeze`-regenerated file, `--max-new-patches` | pass (2026-11-27) | pass (2026-11-27) | pass `--max-new-patches` (2026-11-27) |
 | pip 26.3 `--group` from pylock with group markers | n/a | pass (2026-11-27) | pass (2026-11-27) |
 | Warm venv: follow the printed reinstall advice | n/a | fail #2302 | fail #2302 |
+| `pip lock -r requirements.txt` over a hosted requirements.txt (archive entries, no `version`): re-scan / rollback / list / vex | n/a | fail #2329 (26.3, 25.1; also v5.1.0) | untested |
+| Mirror: fork in another repository of the mirror host (`/other/…` patch-path shape) | n/a | pass: left alone, `redirect_pin_on_unconfigured_host`; list / vex ignore it (2026-11-28) | untested |
+| pip 26.3 `--uploaded-prior-to` with hosted URL pins | n/a | pass (2026-11-28) | n/a |
 | macOS / Windows | blocked (probe workflows off by maintainer decision) | blocked | blocked |
 
 ## Backlog
 
-1. #2272 and #2302: re-verify once fixed (#2302: the hosted / vendored / vex advice for a pip venv must name a command that replaces a same-version install).
-2. Mirror follow-ups: a mirror base with a path that collides with a project-owned URL on the same host (a fork elsewhere → must be refused); a `-r` include pinned on the patch server, then a mirror run (vendored → hosted takeover).
-3. pip 26.3 `--uploaded-prior-to` with a hosted URL pin; `pip lock` re-run over a hosted requirements.txt.
-4. Vendored `--user` / system-site venv on main; hosted `-g` on main.
+1. #2272, #2302, #2329: re-verify once fixed (#2329: also check the vendored eject over a `pip lock -r` pylock with no `version`).
+2. Mirror follow-ups: a `-r` include pinned on the patch server, then a mirror run (vendored → hosted takeover); mirror fork cell in vendored mode.
+3. `pip lock -r` over a vendored requirements.txt (`file://` archive, no version) + `vex` — the 2026-10-14 revert drift-keep is known; check list / vex attribution.
+4. Hosted `-g` on main; vendored `--user`.
 5. #2201 / #2194 (enhancements, agent-mode RECORD / variant selection): don't re-file; check `pip check` / `pip uninstall` after an agent apply once they land.
 6. Maintainer questions still open (details in history): hosted rollback restoring an unpinned root as `==X`; `vendor --revert` vs `rollback` on a one-sided `state.json` merge; residual probe reading only `*.txt` / `*.lock`.
+7. Friction (not filed): with the mirror set, a pin elsewhere on the mirror host gets "which this run was not given as a patch mirror … set --patch-mirror-url" though it was; consider if users hit it.
 
 ## Known non-bugs
 
