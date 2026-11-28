@@ -222,6 +222,133 @@ test('streamed session redirects the package-lock fixture', async () => {
   assert.equal(calls.fetchPatch, 0, 'patch views are never fetched')
 })
 
+test('gem references are asked with gemBuilds and each lock\'s snapshot', async () => {
+  // Three roots on one gem patch: two locks on different snapshots of its
+  // registry and one still on the upstream registry.
+  const uuid = 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb'
+  const registry = `https://patch.socket.dev/patch-registry/gem/cccccccc-3333-4333-8333-cccccccccccc/${uuid}/`
+  const onSnapshot = (snapshot) => {
+    const remote = `${registry}s/${snapshot}/`
+    return {
+      Gemfile: `source "https://rubygems.org"\n\ngem "rails", "7.0.0", source: "${remote}"\n`,
+      'Gemfile.lock': [
+        'GEM',
+        `  remote: ${remote}`,
+        '  specs:',
+        '    rails (7.0.0-arm64-darwin)',
+        '',
+        'GEM',
+        '  remote: https://rubygems.org/',
+        '  specs:',
+        '',
+        'PLATFORMS',
+        '  arm64-darwin',
+        '',
+        'DEPENDENCIES',
+        '  rails (= 7.0.0)!',
+        '',
+        'CHECKSUMS',
+        `  rails (7.0.0-arm64-darwin) sha256=${'d'.repeat(64)}`,
+        '',
+        'BUNDLED WITH',
+        '  4.0.15',
+        '',
+      ].join('\n'),
+    }
+  }
+  const upstream = {
+    Gemfile: 'source "https://rubygems.org"\n\ngem "rails", "7.0.0"\n',
+    'Gemfile.lock': [
+      'GEM',
+      '  remote: https://rubygems.org/',
+      '  specs:',
+      '    rails (7.0.0-arm64-darwin)',
+      '',
+      'PLATFORMS',
+      '  arm64-darwin',
+      '',
+      'DEPENDENCIES',
+      '  rails (= 7.0.0)',
+      '',
+      'BUNDLED WITH',
+      '  4.0.15',
+      '',
+    ].join('\n'),
+  }
+  const roots = { current: onSnapshot('c4'), earlier: onSnapshot('1a'), upstream }
+  const gemFiles = {}
+  for (const [root, pair] of Object.entries(roots)) {
+    for (const [name, text] of Object.entries(pair)) {
+      gemFiles[`${root}/${name}`] = Buffer.from(text)
+    }
+  }
+  const requests = []
+  const { provider } = fakeProvider({
+    async searchPatchesBatch({ components }) {
+      const packages = components
+        .filter(({ purl }) => purl === 'pkg:gem/rails@7.0.0')
+        .map(({ purl }) => ({
+          purl,
+          patches: [
+            {
+              uuid,
+              purl,
+              tier: 'free',
+              cveIds: [],
+              ghsaIds: ['GHSA-test-aaaa-bbbb'],
+              severity: 'high',
+              title: 'fixture',
+            },
+          ],
+        }))
+      return { ok: true, value: { packages, canAccessPaidPatches: false } }
+    },
+    async searchPatchesByPackage({ purl }) {
+      const patch = {
+        uuid,
+        purl,
+        publishedAt: '2024-01-01T00:00:00Z',
+        description: 'fixture',
+        license: 'MIT',
+        tier: 'free',
+        vulnerabilities,
+      }
+      return { ok: true, value: { patches: [patch], canAccessPaidPatches: false } }
+    },
+    async fetchRegistryReferences(request) {
+      requests.push(request)
+      const pending = { status: 'pending_build', url: null, purl: null, artifacts: [], registryOverride: null }
+      return { ok: true, value: { results: Object.fromEntries(request.uuids.map((u) => [u, pending])) } }
+    },
+  })
+  const options = { ecosystems: ['gem'], projectRoots: Object.keys(roots) }
+  const gemTree = Object.entries(gemFiles).map(([file, bytes]) => ({
+    path: file,
+    mode: '100644',
+    type: 'blob',
+    size: bytes.length,
+  }))
+  const selection = addon.selectHostedScanPaths(gemTree, options)
+  const session = new addon.HostedScanSession({ orgSlug: 'test-org', ...options }, provider)
+  for (const file of selection.fetchText) {
+    session.pushChunk(file, gemFiles[file])
+    session.endFile(file)
+  }
+  const result = await session.finish()
+
+  assert.deepEqual(result.changedFiles, [])
+  // The request is the v0 API's body: every call asks for the list of
+  // builds, and names the patch once, with the snapshot one lock is on.
+  for (const request of requests) {
+    assert.deepEqual(request.uuids, [uuid])
+    assert.equal(request.gemBuilds, true)
+  }
+  const presented = requests.map((request) => request.gemSnapshotKeys?.[uuid] ?? '')
+  assert.deepEqual(presented.sort(), ['', '1a', 'c4'])
+  const keyless = requests.find((request) => request.gemSnapshotKeys === undefined)
+  assert.ok(keyless, 'a root whose lock names no snapshot presents none')
+})
+
 test('dry run previews the lockfile without patch fetches', async () => {
   const { provider, calls } = fakeProvider()
   const selection = addon.selectHostedScanPaths(tree)

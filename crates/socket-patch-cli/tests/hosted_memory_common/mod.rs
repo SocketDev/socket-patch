@@ -532,7 +532,19 @@ pub fn legacy_redirect(envelope: &Value) -> Value {
             Some("applied") | Some("verified") => {
                 redirected += 1;
                 let action = if dry_run { "would_pin" } else { "pinned" };
-                patches.push(serde_json::json!({"purl": purl, "uuid": uuid, "action": action}));
+                let mut row = serde_json::json!({"purl": purl, "uuid": uuid, "action": action});
+                build_keys(e, &mut row);
+                patches.push(row);
+            }
+            // A locked platform build of a hosted gem that stays upstream's
+            // own gem: reported, never counted, and no skip.
+            Some("skipped") if e["errorCode"] == "gem_upstream_build_kept" => {
+                let mut row = serde_json::json!({
+                    "purl": purl, "action": "upstream_kept",
+                    "errorCode": "gem_upstream_build_kept", "error": e["reason"],
+                });
+                build_keys(e, &mut row);
+                patches.push(row);
             }
             Some("skipped") if e["errorCode"] == "redirect_unconfirmed" => {
                 patches.push(serde_json::json!({
@@ -578,6 +590,17 @@ pub fn legacy_redirect(envelope: &Value) -> Value {
         "warnings": warnings,
         "dryRun": dry_run,
     }))
+}
+
+/// Copy what an event's `details` say of a gem's locked build (`gemFix`,
+/// `platform`, `newlyPatched`, `withdrawn`) onto its `redirect.patches[]`
+/// row.
+fn build_keys(event: &Value, row: &mut Value) {
+    for key in ["gemFix", "platform", "newlyPatched", "withdrawn"] {
+        if let Some(value) = event["details"].get(key) {
+            row[key] = value.clone();
+        }
+    }
 }
 
 /// An engine `redirect` block with `skipped[]` sorted by purl then uuid

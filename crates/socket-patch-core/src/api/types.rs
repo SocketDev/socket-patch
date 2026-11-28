@@ -272,6 +272,37 @@ pub(crate) struct PackageVendorRequest {
     pub uuids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free_only: Option<bool>,
+    /// Asks for a gem patch's registry as the complete list of the
+    /// version's gems (`registryOverride.identifiers.gemBuilds`, under a
+    /// snapshot URL). The service answers a request without it as it
+    /// always has, with the ruby gem's registry alone, so every reference
+    /// request of this CLI carries it: [`Self::new`].
+    pub gem_builds: bool,
+    /// The registry snapshot the project's Bundler lock takes a gem from,
+    /// by patch uuid: its key
+    /// ([`GemSnapshotKeys`](crate::api::client::GemSnapshotKeys), which
+    /// says what the service does with it). Left out of a request that
+    /// presents none.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub gem_snapshot_keys: std::collections::BTreeMap<String, String>,
+}
+
+impl PackageVendorRequest {
+    /// The request for `uuids`, with `freeOnly` only when it is forced
+    /// (the public-proxy contract; the authenticated endpoint defaults to
+    /// false), presenting `gem_snapshot_keys`.
+    pub(crate) fn new(
+        uuids: &[String],
+        free_only: bool,
+        gem_snapshot_keys: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        PackageVendorRequest {
+            uuids: uuids.to_vec(),
+            free_only: free_only.then_some(true),
+            gem_builds: true,
+            gem_snapshot_keys,
+        }
+    }
 }
 
 /// Response from the package-vendor endpoint: one result per requested UUID,
@@ -311,29 +342,28 @@ pub struct PackageVendorResult {
     /// other shape reads as no address.
     #[serde(default)]
     pub npm_registry_url: Option<String>,
+    /// For the patch of one platform gem: the UUID of the patch it was
+    /// built from, the patch of the gem itself. A hosted or a vendored run
+    /// patches a gem through that patch, so `get` takes it for a platform
+    /// gem's patch named by its UUID. Absent or null for every other
+    /// patch; any other shape reads as none ([`lenient`]).
+    #[serde(default, deserialize_with = "lenient")]
+    pub rebuilt_from_uuid: Option<String>,
 }
 
 /// One served artifact: the native tarball (`kind: "tarball"`), or a
-/// second artifact — npm's yarn-berry cache zip (`kind: "yarn-berry-zip"`),
-/// gem's path-source stub gemspec (`kind: "gem-stub-gemspec"`), or, per
-/// platform a gem patch has a prebuild for, the patched platform gem
-/// (`kind: "gem-platform"`) and its stub gemspec
-/// (`kind: "gem-platform-stub-gemspec"`). `url` is null only when the
-/// artifact isn't stored yet (e.g. an unbuilt berry zip).
+/// second artifact — npm's yarn-berry cache zip (`kind: "yarn-berry-zip"`)
+/// or gem's path-source stub gemspec (`kind: "gem-stub-gemspec"`). The
+/// patch of a platform gem serves the same two as the patch of the ruby
+/// gem: the patched platform `.gem` as its `tarball`, and that gem's stub
+/// gemspec. `url` is null only when the artifact isn't stored yet (e.g. an
+/// unbuilt berry zip).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackageVendorArtifact {
     pub kind: String,
     #[serde(default)]
     pub url: Option<String>,
-    /// The gem platform the artifact is for (`x86_64-linux-gnu`,
-    /// `arm64-darwin`, `java`: `Gem::Platform#to_s` as `Gemfile.lock`
-    /// spells it, never `ruby`). Present exactly on the two `gem-platform*`
-    /// kinds; a patch with no prebuild serves neither. A value that is no
-    /// string reads as absent instead of failing the whole response: that
-    /// artifact is then the prebuild of no platform.
-    #[serde(default, deserialize_with = "lenient_string")]
-    pub platform: Option<String>,
     /// Every ecosystem's tarball populates `sha512` (npm SRI form
     /// `sha512-<b64>`) + `sha1` + `md5`; golang additionally `dirhash_h1`
     /// (`h1:<b64>`); the npm yarn-berry zip carries only `yarn_berry10c0`
@@ -345,19 +375,34 @@ pub struct PackageVendorArtifact {
     pub integrity: Integrity,
 }
 
-/// An optional string field that never fails its response: anything that
-/// is no string reads as absent.
-fn lenient_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(value.as_str().map(str::to_string))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reference request presents the registry snapshots the lock holds
+    /// only when it holds some: with none it is the request it always was.
+    #[test]
+    fn a_reference_request_presents_the_snapshots_the_lock_holds() {
+        let uuids = ["u-1".to_string()];
+        let body = |free_only, held: &[(&str, &str)]| {
+            let held = held
+                .iter()
+                .map(|(uuid, key)| (uuid.to_string(), key.to_string()));
+            let request = PackageVendorRequest::new(&uuids, free_only, held.collect());
+            serde_json::to_value(request).unwrap()
+        };
+        assert_eq!(
+            body(false, &[]),
+            serde_json::json!({ "uuids": ["u-1"], "gemBuilds": true })
+        );
+        assert_eq!(
+            body(true, &[("u-1", "9f3c01")]),
+            serde_json::json!({
+                "uuids": ["u-1"], "freeOnly": true, "gemBuilds": true,
+                "gemSnapshotKeys": { "u-1": "9f3c01" },
+            })
+        );
+    }
 
     fn view(statistics: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
@@ -580,23 +625,24 @@ mod tests {
         );
     }
 
-    /// A gem patch with prebuilds serves, beside the ruby gem's `tarball`
-    /// and stub, one `gem-platform` gem and stub per built platform; the
-    /// artifacts every patch served before carry no `platform`.
+    /// The patch of a platform gem serves what the patch of a ruby gem
+    /// serves: the patched platform `.gem` as its `tarball`, and that gem's
+    /// stub gemspec. A field this build does not read on an artifact (a
+    /// `platform`, whatever its type) is ignored and never fails the
+    /// response.
     #[test]
-    fn package_vendor_result_reads_the_gem_platform_artifacts() {
+    fn package_vendor_result_reads_a_platform_gems_own_artifacts() {
         let json = r#"{
             "status": "granted",
-            "purl": "pkg:gem/nokogiri@1.18.10?platform=ruby",
-            "url": "https://patch.example/nokogiri-1.18.10.gem",
+            "purl": "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu",
+            "url": "https://patch.example/nokogiri-1.18.10-x86_64-linux-gnu.gem",
             "artifacts": [
-                { "kind": "tarball", "url": "https://patch.example/nokogiri-1.18.10.gem",
-                  "integrity": { "sha512": "sha512-ruby" } },
-                { "kind": "gem-platform", "platform": "x86_64-linux-gnu",
+                { "kind": "tarball",
                   "url": "https://patch.example/nokogiri-1.18.10-x86_64-linux-gnu.gem",
                   "contentType": "application/octet-stream", "sizeBytes": 4000000,
-                  "integrity": { "sha512": "sha512-prebuild" } },
-                { "kind": "gem-platform-stub-gemspec", "platform": "x86_64-linux-gnu",
+                  "platform": 7,
+                  "integrity": { "sha512": "sha512-build" } },
+                { "kind": "gem-stub-gemspec", "platform": "x86_64-linux-gnu",
                   "url": "https://patch.example/nokogiri-1.18.10-x86_64-linux-gnu.gemspec",
                   "integrity": { "sha512": "sha512-stub" } }
             ]
@@ -605,20 +651,49 @@ mod tests {
         let artifacts = result.artifacts.unwrap();
         let seen: Vec<(&str, Option<&str>)> = artifacts
             .iter()
-            .map(|a| (a.kind.as_str(), a.platform.as_deref()))
+            .map(|a| (a.kind.as_str(), a.integrity.sha512.as_deref()))
             .collect();
         assert_eq!(
             seen,
             [
-                ("tarball", None),
-                ("gem-platform", Some("x86_64-linux-gnu")),
-                ("gem-platform-stub-gemspec", Some("x86_64-linux-gnu")),
+                ("tarball", Some("sha512-build")),
+                ("gem-stub-gemspec", Some("sha512-stub")),
             ]
         );
+    }
+
+    /// The reference of a platform gem's patch names the patch it was
+    /// built from (`rebuiltFromUuid`). A reference without the field, with
+    /// a null, or with a value that is no string names none, and still
+    /// reads: the field never fails the response it is part of.
+    #[test]
+    fn package_vendor_result_reads_the_patch_a_platform_gems_patch_was_built_from() {
+        let read = |built_from: Option<serde_json::Value>| {
+            let mut json = serde_json::json!({
+                "status": "granted",
+                "purl": "pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu",
+            });
+            if let Some(built_from) = built_from {
+                json["rebuiltFromUuid"] = built_from;
+            }
+            let result: PackageVendorResult = serde_json::from_value(json).unwrap();
+            assert_eq!(result.status, "granted");
+            result.rebuilt_from_uuid
+        };
+        let gem_patch = "7b1e4f3a-2c5d-4e6f-8a9b-0c1d2e3f4a5b";
         assert_eq!(
-            artifacts[1].integrity.sha512.as_deref(),
-            Some("sha512-prebuild")
+            read(Some(serde_json::json!(gem_patch))).as_deref(),
+            Some(gem_patch)
         );
+        assert_eq!(read(None), None);
+        for unreadable in [
+            serde_json::Value::Null,
+            serde_json::json!(7),
+            serde_json::json!({ "uuid": gem_patch }),
+            serde_json::json!([gem_patch]),
+        ] {
+            assert_eq!(read(Some(unreadable.clone())), None, "{unreadable}");
+        }
     }
 
     #[test]
@@ -762,13 +837,17 @@ mod tests {
         );
     }
 
-    /// A gem patch with a built prebuild: the per-platform artifacts carry
-    /// `platform`, and the override lists each platform's sha256 under
-    /// `gemPlatforms`. Both are absent from a patch with no prebuild, which
-    /// reads as none.
+    /// A gem patch whose registry lists the version's platform gems: the
+    /// override names every one under `gemBuilds`, with the sha256 the
+    /// registry serves and the patch of a patched build (`patchUuid`,
+    /// `null` where the registry hands on upstream's gem), and the index
+    /// URL carries the snapshot. A reference with no `gemBuilds` reads as
+    /// no list, which is not an empty one.
     #[test]
-    fn package_vendor_result_reads_gem_prebuilds() {
+    fn package_vendor_result_reads_gem_builds() {
         let sha = "ab".repeat(32);
+        let upstream = "cd".repeat(32);
+        let built = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
         let json = serde_json::json!({
             "status": "granted",
             "purl": "pkg:gem/nokogiri@1.18.10?platform=ruby",
@@ -776,66 +855,86 @@ mod tests {
             "artifacts": [
                 { "kind": "tarball", "url": "https://patch.socket.dev/a.gem",
                   "integrity": { "sha256": sha } },
-                { "kind": "gem-platform", "platform": "x86_64-linux-gnu",
-                  "url": "https://patch.socket.dev/a-x86_64-linux-gnu.gem",
-                  "contentType": "application/octet-stream", "sizeBytes": 4000000,
-                  "integrity": { "sha256": sha } },
-                { "kind": "gem-platform-stub-gemspec", "platform": "x86_64-linux-gnu",
-                  "url": "https://patch.socket.dev/a-x86_64-linux-gnu.gemspec",
+                { "kind": "gem-stub-gemspec", "url": "https://patch.socket.dev/a.gemspec",
                   "integrity": {} }
             ],
             "registryOverride": {
                 "kind": "rubygems-compact-index",
-                "indexUrl": "https://patch.socket.dev/patch-registry/gem/t/u/",
+                "indexUrl": "https://patch.socket.dev/patch-registry/gem/t/u/s/3",
                 "identifiers": {
                     "name": "nokogiri", "version": "1.18.10",
                     "gemChecksumSha256": sha,
-                    "gemPlatforms": [
-                        { "platform": "x86_64-linux-gnu", "gemChecksumSha256": sha }
+                    "gemBuilds": [
+                        { "platform": "arm64-darwin", "gemChecksumSha256": upstream,
+                          "patchUuid": null },
+                        { "platform": "x86_64-linux-gnu", "gemChecksumSha256": sha,
+                          "patchUuid": built }
                     ]
                 }
             }
         });
         let result: PackageVendorResult = serde_json::from_value(json.clone()).unwrap();
+        // The platform gems are not artifacts of this reference: each
+        // patched one is the `tarball` of its own patch.
         let artifacts = result.artifacts.as_deref().unwrap();
-        let platforms: Vec<_> = artifacts
+        let kinds: Vec<_> = artifacts.iter().map(|a| a.kind.as_str()).collect();
+        assert_eq!(kinds, ["tarball", "gem-stub-gemspec"]);
+        let registry = result.registry_override.unwrap();
+        assert!(registry.index_url.ends_with("/u/s/3"));
+        let ids = registry.identifiers;
+        let builds = ids.gem_builds.as_deref().expect("the list");
+        let read: Vec<_> = builds
             .iter()
-            .map(|a| (a.kind.as_str(), a.platform.as_deref()))
+            .map(|b| {
+                (
+                    b.platform.as_str(),
+                    b.gem_checksum_sha256.as_str(),
+                    b.patch_uuid.as_deref(),
+                )
+            })
             .collect();
         assert_eq!(
-            platforms,
+            read,
             [
-                ("tarball", None),
-                ("gem-platform", Some("x86_64-linux-gnu")),
-                ("gem-platform-stub-gemspec", Some("x86_64-linux-gnu")),
+                ("arm64-darwin", upstream.as_str(), None),
+                ("x86_64-linux-gnu", sha.as_str(), Some(built)),
             ]
         );
-        let ids = result.registry_override.unwrap().identifiers;
-        assert_eq!(ids.gem_platforms.len(), 1);
-        assert_eq!(ids.gem_platforms[0].platform, "x86_64-linux-gnu");
-        assert_eq!(ids.gem_platforms[0].gem_checksum_sha256, sha);
+        assert_eq!(
+            ids.gem_build("x86_64-linux-gnu")
+                .and_then(|b| b.patch_uuid.as_deref()),
+            Some(built)
+        );
+        assert!(ids.gem_build("java").is_none());
 
-        let mut bare = json;
+        let mut bare = json.clone();
         bare["registryOverride"]["identifiers"]
             .as_object_mut()
             .unwrap()
-            .remove("gemPlatforms");
+            .remove("gemBuilds");
         let result: PackageVendorResult = serde_json::from_value(bare).unwrap();
         assert!(result
             .registry_override
             .unwrap()
             .identifiers
-            .gem_platforms
-            .is_empty());
+            .gem_builds
+            .is_none());
+        // A list with nothing in it is a list: the version has no platform gem.
+        let mut empty = json;
+        empty["registryOverride"]["identifiers"]["gemBuilds"] = serde_json::json!([]);
+        let result: PackageVendorResult = serde_json::from_value(empty).unwrap();
+        let ids = result.registry_override.unwrap().identifiers;
+        assert_eq!(ids.gem_builds.as_deref(), Some(&[][..]));
     }
 
     /// One reference response answers for every package of a batch. A
-    /// `gemPlatforms` the service sends as `null`, or with an entry that
+    /// `gemBuilds` the service sends as `null`, or with an entry that
     /// lacks its platform or its checksum, must not cost the other packages
-    /// (or the gem itself) their grants: `null` is no prebuild, and such an
-    /// entry is dropped, leaving that platform without one.
+    /// (or the gem itself) their grants: `null` is no list, and such an
+    /// entry is dropped, leaving that platform unlisted. A `patchUuid` that
+    /// is no string is no patch.
     #[test]
-    fn a_malformed_gem_platforms_field_never_fails_the_batch() {
+    fn a_malformed_gem_builds_field_never_fails_the_batch() {
         let sha = "ab".repeat(32);
         let gem = |platforms: serde_json::Value| {
             serde_json::json!({
@@ -844,8 +943,8 @@ mod tests {
                 "artifacts": [
                     { "kind": "tarball", "url": "https://patch.socket.dev/a.gem",
                       "integrity": { "sha256": sha } },
-                    { "kind": "gem-platform", "platform": null, "url": null },
-                    { "kind": "gem-platform", "platform": 7 }
+                    { "kind": "gem-stub-gemspec", "platform": null, "url": null },
+                    { "kind": "gem-stub-gemspec", "platform": 7 }
                 ],
                 "registryOverride": {
                     "kind": "rubygems-compact-index",
@@ -853,7 +952,7 @@ mod tests {
                     "identifiers": {
                         "name": "nokogiri", "version": "1.18.10",
                         "gemChecksumSha256": sha,
-                        "gemPlatforms": platforms
+                        "gemBuilds": platforms
                     }
                 }
             })
@@ -870,7 +969,8 @@ mod tests {
                     { "platform": 3, "gemChecksumSha256": sha },
                     "x86_64-linux-gnu",
                     null,
-                    { "platform": "x86_64-linux-gnu", "gemChecksumSha256": sha }
+                    { "platform": "x86_64-linux-gnu", "gemChecksumSha256": sha,
+                      "patchUuid": 7 }
                 ])),
                 "npm": { "status": "granted", "url": "https://patch.socket.dev/x.tgz" }
             }
@@ -882,19 +982,26 @@ mod tests {
             assert_eq!(result.status, "granted");
             let ids = &result.registry_override.as_ref().unwrap().identifiers;
             assert_eq!(ids.gem_checksum_sha256.as_deref(), Some(sha.as_str()));
-            ids.gem_platforms
-                .iter()
-                .map(|p| (p.platform.clone(), p.gem_checksum_sha256.clone()))
-                .collect::<Vec<_>>()
+            ids.gem_builds.as_ref().map(|builds| {
+                assert!(builds.iter().all(|b| b.patch_uuid.is_none()));
+                builds
+                    .iter()
+                    .map(|p| (p.platform.clone(), p.gem_checksum_sha256.clone()))
+                    .collect::<Vec<_>>()
+            })
         };
-        assert!(prebuilds("null-list").is_empty());
-        assert!(prebuilds("no-list").is_empty());
+        assert!(prebuilds("null-list").is_none());
+        assert!(prebuilds("no-list").is_none());
         assert_eq!(
-            prebuilds("holes"),
-            [("x86_64-linux-gnu".to_string(), sha.clone())],
+            prebuilds("holes").as_deref(),
+            Some(&[("x86_64-linux-gnu".to_string(), sha.clone())][..]),
             "only the entry that names a platform and a checksum is a prebuild"
         );
         let artifacts = response.results["holes"].artifacts.as_deref().unwrap();
-        assert!(artifacts.iter().all(|a| a.platform.is_none()));
+        assert_eq!(
+            artifacts.len(),
+            3,
+            "an artifact field of any type is read past"
+        );
     }
 }

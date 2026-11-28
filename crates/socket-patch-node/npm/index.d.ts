@@ -34,7 +34,8 @@ export interface PatchResponse { uuid: string; purl: string; publishedAt: string
 export interface PatchProvider {
   searchPatchesBatch(request: { components: { purl: string }[] }): Promise<ProviderResult<BatchSearchResponse>>
   searchPatchesByPackage(request: { purl: string }): Promise<ProviderResult<SearchResponse>>
-  fetchRegistryReferences(request: { uuids: string[] }): Promise<ProviderResult<{ results: Record<string, PackageVendorResult> }>>
+  // The request is the v0 API's body for POST …/patches/package. gemBuilds: the engine reads each gem patch's list of builds. gemSnapshotKeys: the registry snapshot a root's Bundler lock names for a patch, by uuid, present only when a lock names one (the service reads it only on a gemBuilds request; with it a gem that is being rebuilt leaves that lock as it is). A call names a patch once: a patch whose roots name different snapshots of it, or none, is asked about once for each. A provider that builds its own body from `uuids` gets references with no list, and a lock of platform gems is then left alone.
+  fetchRegistryReferences(request: { uuids: string[]; gemBuilds: true; gemSnapshotKeys?: Record<string, string> }): Promise<ProviderResult<{ results: Record<string, PackageVendorResult> }>>
   // Ignored: the engine no longer fetches patch views. Optional so existing providers still type-check.
   fetchPatch?(request: { uuid: string }): Promise<ProviderResult<PatchResponse | null>>
   downloadArtifact(request: { url: string; maxBytes: number }): Promise<ProviderResult<Buffer>>
@@ -76,7 +77,8 @@ export interface ProjectResult {
   root: string
   redirect: Record<string, unknown>                   // same shape as CLI `--json` `redirect` block
   summary: { scannedPackages: number; packagesWithPatches: number; totalPatches: number; freePatches: number; paidPatches: number; canAccessPaidPatches: boolean }
-  redirected: { purl: string; uuid: string }[]
+  redirected: { purl: string; uuid: string; gemFix?: string; platform?: string; newlyPatched?: boolean }[]   // a gem the lock names as platform builds: one entry per locked build that has a patched build, under that build's own patch (gemFix = the gem's selected patch; newlyPatched = this run put the build in place)
+  upstreamBuilds?: { purl: string; gemFix: string; platform: string; withdrawn?: boolean }[]   // locked platform builds of redirected gems that the patch registry serves as upstream's own gem (no patched build); never in `redirected`. withdrawn = this run put the build back on upstream's gem because the patched build its lock entry pinned was withdrawn
   skipped: { purl: string; uuid: string; reason: string; detail?: string }[]   // reasons include the policy_* codes; deferred rows appear as `rollout_deferred`
   deferred: DeferredPatch[]                           // NEW patches over the maxNewPatches budget, rank order
   error?: { code: string; message: string }           // project-level failure (e.g. corrupt_ledger, patch_lookup_failed)

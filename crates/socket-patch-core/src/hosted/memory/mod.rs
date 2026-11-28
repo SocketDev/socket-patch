@@ -1021,31 +1021,50 @@ async fn engine(
     }
     phases.mark("classify");
 
-    let uuids: BTreeSet<String> = states
-        .iter()
-        .filter(|s| s.error.is_none())
-        .flat_map(|s| s.selected.iter().map(|(_, u)| u.clone()))
-        .collect();
-    let (references, failed_refs) = if uuids.is_empty() {
-        (HashMap::new(), BTreeMap::new())
-    } else {
-        discover::fetch_references(&provider, &uuids).await
-    };
+    // A root is answered by the registry snapshot its own Bundler lock
+    // names for a patch, as a checkout of it alone would be. Roots that
+    // name the same snapshot of a patch, or none, share its answer.
+    let mut root_snapshots: Vec<crate::api::client::GemSnapshotKeys> = Vec::new();
+    for state in &states {
+        root_snapshots.push(match (&state.error, &state.project) {
+            (None, Some(project)) => {
+                let view = ProjectView::Memory(project);
+                crate::hosted::engine::gem_snapshots_presented(&view, &state.unreadable).await
+            }
+            _ => Default::default(),
+        });
+    }
+    // What each root asks for, in the order of its selected patches.
+    let mut root_asked: Vec<Vec<discover::AskedReference>> = Vec::new();
+    for (state, held) in states.iter().zip(&root_snapshots) {
+        let selected = state.selected.iter().filter(|_| state.error.is_none());
+        root_asked.push(
+            selected
+                .map(|(_, uuid)| discover::asked_reference(uuid, held))
+                .collect(),
+        );
+    }
+    let asked: BTreeSet<discover::AskedReference> = root_asked.iter().flatten().cloned().collect();
+    checkpoint(&cancel).await?;
+    let (answered, failed_refs) = discover::fetch_references(&provider, &asked).await;
     // Roots whose rows' eligibility is unknown: a reference failure that
     // hit only NEW rows of a capped run defers them instead of failing the
     // root (§5.2).
     let mut unknown_roots: BTreeSet<String> = BTreeSet::new();
-    for state in states.iter_mut().filter(|s| s.error.is_none()) {
-        if let Some(error) = state
-            .selected
+    for (index, state) in states.iter_mut().enumerate() {
+        if state.error.is_some() {
+            continue;
+        }
+        let failed = root_asked[index]
             .iter()
-            .find_map(|(_, uuid)| failed_refs.get(uuid))
-        {
+            .find_map(|asked| failed_refs.get(asked));
+        if let Some(error) = failed {
             if stage.capped() && state.rows.iter().all(|r| r.candidate.recorded.is_new()) {
                 stage.incomplete = true;
                 stage.reference_failed = Some(error.clone());
                 unknown_roots.insert(state.root.clone());
                 state.selected.clear();
+                root_asked[index].clear();
                 continue;
             }
             stage.incomplete = true;
@@ -1067,6 +1086,14 @@ async fn engine(
             continue;
         };
         let unreadable = std::mem::take(&mut state.unreadable);
+        // The answers stay where the round put them: the planner reads
+        // each through the root's own key for it.
+        let references: HashMap<&str, &crate::api::types::PackageVendorResult> = state
+            .selected
+            .iter()
+            .zip(&root_asked[index])
+            .filter_map(|((_, uuid), asked)| Some((uuid.as_str(), answered.get(asked)?)))
+            .collect();
         match stages::plan(project, unreadable, &state.selected, &references).await {
             Ok(plan) => planned.push((index, plan)),
             Err(refusal) => state.error = Some(ProjectError::from(refusal)),
@@ -1129,6 +1156,61 @@ async fn engine(
         )
         .await
     };
+    let gem_index_urls: BTreeSet<String> = planned
+        .iter()
+        .flat_map(|(_, p)| p.gem_indexes.iter().cloned())
+        .collect();
+    let gem_indexes = if gem_index_urls.is_empty() {
+        BTreeMap::new()
+    } else {
+        discover::fetch_gem_indexes(&provider, &gem_index_urls).await
+    };
+    // A lock that stays on a patch whose registry no longer serves a build
+    // it pins follows that patch's reference as it stands: one more
+    // reference round, for the patches the documents name and no answer is
+    // held for, and none where no withdrawal was detected.
+    let mut refreshes: Vec<Vec<crate::patch::redirect::GemRefresh>> = Vec::new();
+    for (_, plan) in planned.iter_mut() {
+        refreshes.push(stages::record_gem_indexes(plan, &gem_indexes));
+    }
+    let refresh_asked: Vec<Vec<discover::AskedReference>> = planned
+        .iter()
+        .zip(&refreshes)
+        .map(|((index, _), targets)| {
+            let held = &root_snapshots[*index];
+            let targets = targets.iter();
+            targets
+                .map(|target| discover::asked_reference(&target.uuid, held))
+                .collect()
+        })
+        .collect();
+    let unknown: BTreeSet<discover::AskedReference> = refresh_asked
+        .iter()
+        .flatten()
+        .filter(|asked| !answered.contains_key(*asked))
+        .cloned()
+        .collect();
+    // A request that fails answers for none of its patches.
+    let refreshed = if unknown.is_empty() {
+        HashMap::new()
+    } else {
+        checkpoint(&cancel).await?;
+        discover::fetch_references(&provider, &unknown).await.0
+    };
+    for (((_, plan), targets), asked) in planned.iter_mut().zip(&refreshes).zip(&refresh_asked) {
+        if targets.is_empty() {
+            continue;
+        }
+        let answers: HashMap<&str, &crate::api::types::PackageVendorResult> = targets
+            .iter()
+            .zip(asked)
+            .filter_map(|(target, asked)| {
+                let answer = answered.get(asked).or_else(|| refreshed.get(asked))?;
+                Some((target.uuid.as_str(), answer))
+            })
+            .collect();
+        stages::refresh_gem_patches(plan, targets, &answers);
+    }
     phases.mark("plan");
 
     let stage_options = StageOptions {
@@ -1297,6 +1379,7 @@ async fn engine(
             redirect,
             summary: state.summary.clone(),
             redirected: Vec::new(),
+            upstream_builds: Vec::new(),
             skipped,
             deferred: state.deferred.clone(),
             error: state.error.clone(),
@@ -1533,6 +1616,7 @@ fn finish_root(
             redirect: serde_json::json!({ "mode": "hosted" }),
             summary: state.summary.clone(),
             redirected: Vec::new(),
+            upstream_builds: Vec::new(),
             skipped,
             deferred: state.deferred.clone(),
             error: Some(ProjectError {
@@ -1562,22 +1646,44 @@ fn finish_root(
     warnings.extend(npm_warnings);
     warnings.extend(pre_warnings);
     let redirect_warnings = crate::hosted::render::rewrite_warnings_json(&warnings);
+    // The pins as the run reports them: a gem the lock names as platform
+    // builds once per locked build.
+    let reports = crate::hosted::engine::pin_reports(&confirmed, &rewrite);
     let redirect = crate::hosted::render::redirect_json_block(
-        &confirmed,
+        &reports,
         &unconfirmed,
         rewritten,
         &skipped,
         redirect_warnings,
         dry_run,
     );
+    let mut redirected = Vec::with_capacity(reports.len());
+    let mut upstream_builds = Vec::new();
+    for report in reports {
+        match (report.uuid, report.gem_fix, report.platform) {
+            (Some(uuid), gem_fix, platform) => redirected.push(RedirectedPatch {
+                purl: report.purl,
+                uuid,
+                gem_fix,
+                platform,
+                newly_patched: report.newly_patched,
+            }),
+            (None, Some(gem_fix), Some(platform)) => upstream_builds.push(UpstreamBuild {
+                purl: report.purl,
+                gem_fix,
+                platform,
+                withdrawn: report.withdrawn,
+            }),
+            // Only a platform build of a gem is ever served as upstream's.
+            (None, _, _) => {}
+        }
+    }
     ProjectResult {
         root,
         redirect,
         summary: state.summary.clone(),
-        redirected: confirmed
-            .into_iter()
-            .map(|(purl, uuid)| RedirectedPatch { purl, uuid })
-            .collect(),
+        redirected,
+        upstream_builds,
         skipped,
         deferred: state.deferred.clone(),
         error: None,
@@ -2018,5 +2124,855 @@ mod tests {
         assert!(index.records_package("pkg:cargo/serde@1.0.200"));
         assert!(index.uuids("pkg:cargo/serde@2.0.0").is_empty());
         assert!(index.uuids("pkg:nuget/Other@1.0.0").is_empty());
+    }
+
+    const GEM_GRANT: &str = "cccccccc-3333-4333-8333-cccccccccccc";
+    /// The patch the lock of [`gem_input_on_a_patch`] is on.
+    const GEM_EARLIER: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+    /// The patch [`GemPatchService`] offers.
+    const GEM_NEWER: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+
+    fn gem_registry(uuid: &str) -> String {
+        format!("https://patch.socket.dev/patch-registry/gem/{GEM_GRANT}/{uuid}/")
+    }
+
+    /// A patch service that offers [`GEM_NEWER`] for `rails 7.0.0`, with a
+    /// patched build for `arm64-darwin` and upstream's gem (`2…`) for
+    /// `x86_64-linux-gnu`, and that answers the artifact URLs of `served`.
+    struct GemPatchService {
+        served: BTreeMap<String, String>,
+        /// The artifact URLs asked for, in order.
+        asked: std::sync::Mutex<Vec<String>>,
+        /// What it answers for the reference of [`GEM_EARLIER`], if
+        /// anything.
+        earlier: Option<serde_json::Value>,
+        /// The uuids of each reference request, in order.
+        asked_references: std::sync::Mutex<Vec<Vec<String>>>,
+        /// The snapshot of the registry of [`GEM_NEWER`] while a gem it
+        /// lists is being built again: a request is then answered by the
+        /// snapshot it presents (that registry for this one, not ready for
+        /// another, the ruby gem's registry and no list for none).
+        rebuilding: Option<&'static str>,
+        /// The snapshots each reference request presented, in order.
+        asked_snapshots: std::sync::Mutex<Vec<crate::api::client::GemSnapshotKeys>>,
+    }
+
+    impl PatchApi for GemPatchService {
+        fn uses_public_proxy(&self) -> bool {
+            false
+        }
+
+        fn search_patches_batch<'a>(
+            &'a self,
+            purls: &'a [String],
+        ) -> crate::api::client::ApiFuture<'a, crate::api::types::BatchSearchResponse> {
+            use crate::api::types::{BatchPackagePatches, BatchPatchInfo, BatchSearchResponse};
+            let packages = purls
+                .iter()
+                .filter(|purl| purl.as_str() == "pkg:gem/rails@7.0.0")
+                .map(|purl| BatchPackagePatches {
+                    purl: purl.clone(),
+                    patches: vec![BatchPatchInfo {
+                        uuid: GEM_NEWER.to_string(),
+                        purl: purl.clone(),
+                        tier: "free".to_string(),
+                        cve_ids: Vec::new(),
+                        ghsa_ids: vec!["GHSA-test-aaaa-bbbb".to_string()],
+                        severity: Some("high".to_string()),
+                        title: String::new(),
+                        published_at: None,
+                    }],
+                })
+                .collect();
+            Box::pin(async move {
+                Ok(BatchSearchResponse {
+                    packages,
+                    can_access_paid_patches: false,
+                    unanswered: Vec::new(),
+                })
+            })
+        }
+
+        fn search_patches_by_package<'a>(
+            &'a self,
+            purl: &'a str,
+        ) -> crate::api::client::ApiFuture<'a, crate::api::types::SearchResponse> {
+            let response = serde_json::json!({
+                "patches": [{
+                    "uuid": GEM_NEWER, "purl": purl, "publishedAt": "2026-01-01T00:00:00Z",
+                    "description": "", "license": "MIT", "tier": "free",
+                    "vulnerabilities": {"GHSA-test-aaaa-bbbb": {
+                        "cves": [], "summary": "", "severity": "high", "description": ""
+                    }}
+                }],
+                "canAccessPaidPatches": false
+            });
+            Box::pin(async move { Ok(serde_json::from_value(response).expect("a response")) })
+        }
+
+        fn fetch_registry_references<'a>(
+            &'a self,
+            uuids: &'a [String],
+            presented: &'a crate::api::client::GemSnapshotKeys,
+        ) -> crate::api::client::ApiFuture<
+            'a,
+            HashMap<String, crate::api::types::PackageVendorResult>,
+        > {
+            let registry = gem_registry(GEM_NEWER);
+            let mut asked = self.asked_snapshots.lock().unwrap();
+            asked.push(crate::api::client::gem_snapshots_for(uuids, presented));
+            drop(asked);
+            let held = presented.get(GEM_NEWER).map(String::as_str);
+            let reference = serde_json::json!({
+                "status": "granted",
+                "url": format!("{registry}gems/rails-7.0.0.gem"),
+                "purl": "pkg:gem/rails@7.0.0",
+                "artifacts": [{"kind": "tarball", "url": null, "integrity": {
+                    "sha256": "f".repeat(64)
+                }}],
+                "registryOverride": {
+                    "kind": "rubygems-compact-index",
+                    "indexUrl": format!("{registry}s/c4/"),
+                    "identifiers": {
+                        "name": "rails", "version": "7.0.0",
+                        "gemChecksumSha256": "f".repeat(64),
+                        "gemBuilds": [
+                            {"platform": "arm64-darwin", "gemChecksumSha256": "d".repeat(64),
+                             "patchUuid": "dddddddd-4444-4444-8444-dddddddddddd"},
+                            {"platform": "ruby", "gemChecksumSha256": "f".repeat(64),
+                             "patchUuid": GEM_NEWER},
+                            {"platform": "x86_64-linux-gnu", "gemChecksumSha256": "2".repeat(64),
+                             "patchUuid": null}
+                        ]
+                    }
+                }
+            });
+            // In a rebuild the answer goes by the snapshot presented.
+            let reference = match (self.rebuilding, held) {
+                (None, _) => reference,
+                (Some(current), Some(held)) if held == current => reference,
+                (Some(_), Some(_)) => serde_json::json!({
+                    "status": "pending_build", "url": null, "purl": null, "artifacts": [],
+                    "registryOverride": null,
+                }),
+                (Some(_), None) => {
+                    let mut plain = reference;
+                    plain["registryOverride"]["indexUrl"] = serde_json::json!(registry);
+                    let identifiers = plain["registryOverride"]["identifiers"].as_object_mut();
+                    identifiers.expect("identifiers").remove("gemBuilds");
+                    plain
+                }
+            };
+            self.asked_references.lock().unwrap().push(uuids.to_vec());
+            let granted = uuids
+                .iter()
+                .filter_map(|uuid| {
+                    let reference = match uuid.as_str() {
+                        GEM_NEWER => reference.clone(),
+                        GEM_EARLIER => self.earlier.clone()?,
+                        _ => return None,
+                    };
+                    let reference = serde_json::from_value(reference).expect("a grant");
+                    Some((uuid.clone(), reference))
+                })
+                .collect();
+            Box::pin(async move { Ok(granted) })
+        }
+
+        fn download_artifact<'a>(
+            &'a self,
+            url: &'a str,
+            _max_bytes: u64,
+        ) -> crate::api::client::ApiFuture<'a, Vec<u8>> {
+            self.asked.lock().unwrap().push(url.to_string());
+            let served = self.served.get(url).map(|body| body.as_bytes().to_vec());
+            Box::pin(async move {
+                served.ok_or_else(|| crate::api::client::ApiError::Other("not found".into()))
+            })
+        }
+    }
+
+    /// A project whose lock takes `rails 7.0.0` as `arm64-darwin` and
+    /// `x86_64-linux-gnu` builds from the registry of [`GEM_EARLIER`], with
+    /// `sums` as its `CHECKSUMS` section: `(Gemfile, lock)`.
+    fn gem_pair_on_a_patch(sums: &str) -> (String, String) {
+        let registry = format!("{}s/1a/", gem_registry(GEM_EARLIER));
+        let gemfile = format!(
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\", source: \"{registry}\"\n"
+        );
+        let lock = format!(
+            "GEM\n  remote: {registry}\n  specs:\n    rails (7.0.0-arm64-darwin)\n    rails \
+             (7.0.0-x86_64-linux-gnu)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n\n\
+             PLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n\
+             {sums}\nBUNDLED WITH\n  4.0.15\n"
+        );
+        (gemfile, lock)
+    }
+
+    /// The `CHECKSUMS` section of [`gem_pair_on_a_patch`] that pins
+    /// upstream's gem (`1…`) for `arm64-darwin` and `linux` for
+    /// `x86_64-linux-gnu`.
+    fn gem_sums(linux: &str) -> String {
+        format!(
+            "\nCHECKSUMS\n  rails (7.0.0-arm64-darwin) sha256={}\n  rails (7.0.0-x86_64-linux-gnu) \
+             sha256={linux}\n",
+            "1".repeat(64)
+        )
+    }
+
+    /// One run of the engine over `(Gemfile, lock)` against a
+    /// [`GemPatchService`] that serves `served`: the output, and the
+    /// artifact URLs the run asked for.
+    async fn gem_run(
+        pair: &(String, String),
+        served: &[(&str, String)],
+    ) -> (HostedScanOutput, Vec<String>) {
+        let (output, asked, _) = gem_run_granting(pair, served, None).await;
+        (output, asked)
+    }
+
+    /// [`gem_run`] against a service that answers `earlier` for the
+    /// reference of [`GEM_EARLIER`]: also the uuids of each reference
+    /// request.
+    async fn gem_run_granting(
+        (gemfile, lock): &(String, String),
+        served: &[(&str, String)],
+        earlier: Option<serde_json::Value>,
+    ) -> (HostedScanOutput, Vec<String>, Vec<Vec<String>>) {
+        let service = Arc::new(GemPatchService {
+            served: served
+                .iter()
+                .map(|(url, body)| (url.to_string(), body.clone()))
+                .collect(),
+            asked: std::sync::Mutex::new(Vec::new()),
+            earlier,
+            asked_references: std::sync::Mutex::new(Vec::new()),
+            rebuilding: None,
+            asked_snapshots: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut session = SessionBuilder::new(HostedScanOptions {
+            org_slug: "acme".to_string(),
+            ..HostedScanOptions::default()
+        })
+        .expect("valid options");
+        for (path, text) in [("Gemfile", gemfile), ("Gemfile.lock", lock)] {
+            session.push_chunk(path, text.as_bytes()).unwrap();
+            session.end_file(path).unwrap();
+        }
+        let input = session.finish().unwrap();
+        let output = run_in_memory(input, service.clone(), CancellationToken::new())
+            .await
+            .expect("an engine run");
+        let asked = service.asked.lock().unwrap().clone();
+        let asked_references = service.asked_references.lock().unwrap().clone();
+        (output, asked, asked_references)
+    }
+
+    /// Three roots in one run while a gem of the fix's registry is being
+    /// built again: one on that registry's snapshot, one on an earlier
+    /// snapshot of it, one not on the patch. Each is asked about with the
+    /// snapshots its own lock names, so each gets the answer a checkout of
+    /// it alone would: the first is left as it is, the second is told the
+    /// patch is not ready, and the third is not moved onto a registry
+    /// whose gem cannot be installed yet. Nothing is written.
+    #[tokio::test]
+    async fn each_root_is_answered_by_the_snapshots_its_own_lock_names() {
+        let registry = gem_registry(GEM_NEWER);
+        let on_snapshot = |snapshot: &str| {
+            let remote = format!("{registry}s/{snapshot}/");
+            let gemfile = format!(
+                "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\", source: \
+                 \"{remote}\"\n"
+            );
+            let lock = format!(
+                "GEM\n  remote: {remote}\n  specs:\n    rails (7.0.0-arm64-darwin)\n    rails \
+                 (7.0.0-x86_64-linux-gnu)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n\n\
+                 PLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\nDEPENDENCIES\n  rails (= \
+                 7.0.0)!\n\nCHECKSUMS\n  rails (7.0.0-arm64-darwin) sha256={}\n  rails \
+                 (7.0.0-x86_64-linux-gnu) sha256={}\n\nBUNDLED WITH\n  4.0.15\n",
+                "d".repeat(64),
+                "2".repeat(64)
+            );
+            (gemfile, lock)
+        };
+        let upstream = (
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0-arm64-darwin)\n    \
+             rails (7.0.0-x86_64-linux-gnu)\n\nPLATFORMS\n  arm64-darwin\n  x86_64-linux-gnu\n\n\
+             DEPENDENCIES\n  rails (= 7.0.0)\n\nBUNDLED WITH\n  4.0.15\n"
+                .to_string(),
+        );
+        let roots = [
+            ("current", on_snapshot("c4")),
+            ("current-too", on_snapshot("c4")),
+            ("earlier", on_snapshot("1a")),
+            ("upstream", upstream.clone()),
+            ("upstream-too", upstream),
+        ];
+        let service = Arc::new(GemPatchService {
+            served: BTreeMap::new(),
+            asked: std::sync::Mutex::new(Vec::new()),
+            earlier: None,
+            asked_references: std::sync::Mutex::new(Vec::new()),
+            rebuilding: Some("c4"),
+            asked_snapshots: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut session = SessionBuilder::new(HostedScanOptions {
+            org_slug: "acme".to_string(),
+            project_roots: Some(roots.iter().map(|(root, _)| root.to_string()).collect()),
+            ..HostedScanOptions::default()
+        })
+        .expect("valid options");
+        for (root, (gemfile, lock)) in &roots {
+            for (name, text) in [("Gemfile", gemfile), ("Gemfile.lock", lock)] {
+                let path = format!("{root}/{name}");
+                session.push_chunk(&path, text.as_bytes()).unwrap();
+                session.end_file(&path).unwrap();
+            }
+        }
+        let input = session.finish().unwrap();
+        let output = run_in_memory(input, service.clone(), CancellationToken::new())
+            .await
+            .expect("an engine run");
+
+        let held = |snapshot: &str| -> crate::api::client::GemSnapshotKeys {
+            [(GEM_NEWER.to_string(), snapshot.to_string())].into()
+        };
+        let mut asked = service.asked_snapshots.lock().unwrap().clone();
+        asked.sort();
+        let mut expected = vec![held("c4"), held("1a"), Default::default()];
+        expected.sort();
+        assert_eq!(
+            asked, expected,
+            "the patch is asked about once for each snapshot presented, and once for none"
+        );
+        assert!(
+            output.changed_files.is_empty(),
+            "{:?}",
+            output.changed_files
+        );
+        let project = |root: &str| {
+            let found = output.projects.iter().find(|project| project.root == root);
+            found.unwrap_or_else(|| panic!("no project {root}: {:?}", output.projects))
+        };
+        let reasons = |root: &str| -> Vec<&str> {
+            let skipped = &project(root).skipped;
+            skipped.iter().map(|skip| skip.reason.as_str()).collect()
+        };
+        for root in ["current", "current-too"] {
+            assert!(project(root).error.is_none());
+            assert!(
+                !reasons(root).contains(&"pending_build"),
+                "the root on the current snapshot is answered it: {:?}",
+                project(root)
+            );
+        }
+        assert_eq!(reasons("earlier"), ["pending_build"]);
+        for root in ["upstream", "upstream-too"] {
+            assert!(
+                project(root).redirected.is_empty(),
+                "a root not on the patch is not moved during the rebuild: {:?}",
+                project(root)
+            );
+        }
+    }
+
+    /// The requests of one round of references: a patch is named once for
+    /// each snapshot of it that is presented and once for the roots that
+    /// present none, a request never names a patch twice, and each answer
+    /// is kept under the snapshot it was given for.
+    #[tokio::test]
+    async fn a_patch_is_asked_about_once_for_each_snapshot_presented() {
+        let service = Arc::new(GemPatchService {
+            served: BTreeMap::new(),
+            asked: std::sync::Mutex::new(Vec::new()),
+            earlier: None,
+            asked_references: std::sync::Mutex::new(Vec::new()),
+            rebuilding: Some("c4"),
+            asked_snapshots: std::sync::Mutex::new(Vec::new()),
+        });
+        let provider = Provider::new(service.clone(), std::time::Duration::from_secs(5), 4);
+        let reference = |uuid: &str, snapshot: Option<&str>| -> discover::AskedReference {
+            (uuid.to_string(), snapshot.map(str::to_string))
+        };
+        let asked: BTreeSet<discover::AskedReference> = [
+            reference(GEM_NEWER, None),
+            reference(GEM_NEWER, Some("c4")),
+            reference(GEM_NEWER, Some("1a")),
+            reference(GEM_EARLIER, None),
+            reference(GEM_EARLIER, Some("9f")),
+        ]
+        .into();
+        let (answers, failed) = discover::fetch_references(&provider, &asked).await;
+
+        let uuids = service.asked_references.lock().unwrap().clone();
+        let snapshots = service.asked_snapshots.lock().unwrap().clone();
+        let mut requests: Vec<_> = uuids.into_iter().zip(snapshots).collect();
+        requests.sort();
+        let both = vec![GEM_EARLIER.to_string(), GEM_NEWER.to_string()];
+        let held = |pairs: &[(&str, &str)]| -> crate::api::client::GemSnapshotKeys {
+            let pairs = pairs.iter();
+            pairs
+                .map(|(uuid, key)| (uuid.to_string(), key.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            requests,
+            [
+                (both.clone(), held(&[])),
+                (both, held(&[(GEM_EARLIER, "9f"), (GEM_NEWER, "1a")])),
+                (vec![GEM_NEWER.to_string()], held(&[(GEM_NEWER, "c4")])),
+            ]
+        );
+        assert!(failed.is_empty(), "{failed:?}");
+        let status = |snapshot: Option<&str>| {
+            let answer = answers.get(&reference(GEM_NEWER, snapshot));
+            let answer = answer.unwrap_or_else(|| panic!("no answer for {snapshot:?}"));
+            let listed = answer.registry_override.as_ref().map(|registry| {
+                let builds = &registry.identifiers.gem_builds;
+                (registry.index_url.ends_with("/s/c4/"), builds.is_some())
+            });
+            (answer.status.as_str().to_string(), listed)
+        };
+        assert_eq!(
+            status(Some("c4")),
+            ("granted".to_string(), Some((true, true)))
+        );
+        assert_eq!(status(Some("1a")), ("pending_build".to_string(), None));
+        assert_eq!(status(None), ("granted".to_string(), Some((false, false))));
+        assert_eq!(
+            answers.len(),
+            3,
+            "the service has no answer for the other patch"
+        );
+    }
+
+    /// The in-memory engine never moves a lock from one patch of a gem to
+    /// another that has a patched build for fewer of the builds its
+    /// registry still serves. The lock is judged by the compact index of
+    /// the registry it is on, which the engine asks its provider for
+    /// once, with `CHECKSUMS` or without: a patched build there keeps the
+    /// lock where it is, as does a document the provider cannot serve,
+    /// and upstream's gem there lets the lock move. A gem that stays is
+    /// skipped under its quiet code, with nothing changed and no warning.
+    #[tokio::test]
+    async fn a_lock_on_another_patch_of_a_gem_is_moved_only_where_it_loses_nothing() {
+        use crate::hosted::engine::GEM_NEWER_FIX_WAITS;
+        let index_url = format!("{}s/1a/info/rails", gem_registry(GEM_EARLIER));
+        let index = |linux: &str| {
+            format!(
+                "---\n7.0.0-arm64-darwin |checksum:{}\n7.0.0-x86_64-linux-gnu |checksum:{linux}\n",
+                "1".repeat(64)
+            )
+        };
+        let stays = |output: &HostedScanOutput| {
+            assert!(
+                output.changed_files.is_empty(),
+                "{:?}",
+                output.changed_files
+            );
+            assert!(output.warnings.is_empty(), "{:?}", output.warnings);
+            let [project] = output.projects.as_slice() else {
+                panic!("one project: {:?}", output.projects);
+            };
+            assert!(project.error.is_none(), "{:?}", project.error);
+            assert!(project.redirected.is_empty() && project.upstream_builds.is_empty());
+            let skipped: Vec<(&str, &str, Option<&str>)> = project
+                .skipped
+                .iter()
+                .map(|skip| {
+                    (
+                        skip.uuid.as_str(),
+                        skip.reason.as_str(),
+                        skip.detail.as_deref(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                skipped,
+                [(
+                    GEM_NEWER,
+                    GEM_NEWER_FIX_WAITS,
+                    Some(
+                        "rails 7.0.0: the newer fix has no patched build for x86_64-linux-gnu \
+                         yet; the lock stays on the patch it is on"
+                    )
+                )]
+            );
+            assert_eq!(project.redirect["warnings"], serde_json::json!([]));
+        };
+
+        // `CHECKSUMS` pins a patched build for linux, which the registry
+        // the lock is on still serves: one request.
+        let with_sums = gem_pair_on_a_patch(&gem_sums(&"b".repeat(64)));
+        let (output, asked) = gem_run(&with_sums, &[(&index_url, index(&"b".repeat(64)))]).await;
+        stays(&output);
+        assert_eq!(asked, [index_url.clone()]);
+        assert_eq!(output.stats.provider_calls["downloadArtifact"], 1);
+        let (output, asked) = gem_run(&with_sums, &[]).await;
+        stays(&output);
+        assert_eq!(asked, [index_url.clone()]);
+
+        // No `CHECKSUMS`: the registry the lock is on is asked, once.
+        let pair = gem_pair_on_a_patch("");
+        let (output, asked) = gem_run(&pair, &[(&index_url, index(&"b".repeat(64)))]).await;
+        stays(&output);
+        assert_eq!(asked, [index_url.clone()]);
+        assert_eq!(output.stats.provider_calls["downloadArtifact"], 1);
+        let (output, asked) = gem_run(&pair, &[]).await;
+        stays(&output);
+        assert_eq!(asked, [index_url.clone()]);
+
+        // That registry lists upstream's gem for linux: the lock moves.
+        let (output, asked) = gem_run(&pair, &[(&index_url, index(&"2".repeat(64)))]).await;
+        assert_eq!(asked, [index_url]);
+        let changed: Vec<&str> = output
+            .changed_files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(changed, ["Gemfile", "Gemfile.lock"]);
+        let at_newer = format!("{}s/c4/", gem_registry(GEM_NEWER));
+        for file in &output.changed_files {
+            assert!(file.content.contains(&at_newer), "{}", file.content);
+            assert!(!file.content.contains(GEM_EARLIER), "{}", file.content);
+        }
+        let [project] = output.projects.as_slice() else {
+            panic!("one project: {:?}", output.projects);
+        };
+        assert!(project.skipped.is_empty(), "{:?}", project.skipped);
+        let redirected: Vec<(&str, Option<&str>)> = project
+            .redirected
+            .iter()
+            .map(|patch| (patch.uuid.as_str(), patch.platform.as_deref()))
+            .collect();
+        assert_eq!(
+            redirected,
+            [("dddddddd-4444-4444-8444-dddddddddddd", Some("arm64-darwin"))]
+        );
+        let upstream: Vec<(&str, bool)> = project
+            .upstream_builds
+            .iter()
+            .map(|build| (build.platform.as_str(), build.withdrawn))
+            .collect();
+        assert_eq!(
+            upstream,
+            [("x86_64-linux-gnu", false)],
+            "a lock with no `CHECKSUMS` does not say that a build was withdrawn"
+        );
+    }
+
+    /// The patched build a lock's `CHECKSUMS` pins was withdrawn: the
+    /// registry the lock is on, asked once, no longer lists it (or lists
+    /// another sha256 for it), so an install of that platform fails
+    /// there. The engine moves the lock to the patch on offer, which
+    /// serves upstream's gem for that platform, pins upstream's sha256
+    /// for it, and reports the build as back on upstream's gem: in
+    /// `upstreamBuilds[]` and in the row of the `redirect` block.
+    #[tokio::test]
+    async fn a_lock_whose_pinned_build_was_withdrawn_moves_to_the_patch_on_offer() {
+        let index_url = format!("{}s/1a/info/rails", gem_registry(GEM_EARLIER));
+        let listing = |linux: Option<&str>| {
+            let mut index = format!(
+                "---\n7.0.0 |checksum:{}\n7.0.0-arm64-darwin |checksum:{}\n",
+                "a".repeat(64),
+                "1".repeat(64)
+            );
+            if let Some(linux) = linux {
+                index.push_str(&format!("7.0.0-x86_64-linux-gnu |checksum:{linux}\n"));
+            }
+            index
+        };
+        let pair = gem_pair_on_a_patch(&gem_sums(&"b".repeat(64)));
+        let at_newer = format!("{}s/c4/", gem_registry(GEM_NEWER));
+        for served in [None, Some("e".repeat(64))] {
+            let index = listing(served.as_deref());
+            let (output, asked) = gem_run(&pair, &[(&index_url, index)]).await;
+            assert_eq!(asked, [index_url.clone()], "{served:?}");
+            assert_eq!(output.stats.provider_calls["downloadArtifact"], 1);
+            assert!(output.warnings.is_empty(), "{:?}", output.warnings);
+            let changed: Vec<&str> = output
+                .changed_files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect();
+            assert_eq!(changed, ["Gemfile", "Gemfile.lock"], "{served:?}");
+            for file in &output.changed_files {
+                assert!(file.content.contains(&at_newer), "{}", file.content);
+                assert!(!file.content.contains(GEM_EARLIER), "{}", file.content);
+            }
+            let lock = &output.changed_files[1].content;
+            assert!(
+                lock.contains(&format!(
+                    "  rails (7.0.0-arm64-darwin) sha256={}\n  rails (7.0.0-x86_64-linux-gnu) \
+                     sha256={}\n",
+                    "d".repeat(64),
+                    "2".repeat(64)
+                )),
+                "{served:?}: {lock}"
+            );
+            let [project] = output.projects.as_slice() else {
+                panic!("one project: {:?}", output.projects);
+            };
+            assert!(project.error.is_none(), "{:?}", project.error);
+            assert!(project.skipped.is_empty(), "{:?}", project.skipped);
+            let redirected: Vec<(&str, Option<&str>)> = project
+                .redirected
+                .iter()
+                .map(|patch| (patch.uuid.as_str(), patch.platform.as_deref()))
+                .collect();
+            assert_eq!(
+                redirected,
+                [("dddddddd-4444-4444-8444-dddddddddddd", Some("arm64-darwin"))]
+            );
+            assert_eq!(
+                serde_json::to_value(&project.upstream_builds).unwrap(),
+                serde_json::json!([{
+                    "purl": "pkg:gem/rails@7.0.0?platform=x86_64-linux-gnu",
+                    "gemFix": GEM_NEWER,
+                    "platform": "x86_64-linux-gnu",
+                    "withdrawn": true,
+                }]),
+                "{served:?}"
+            );
+            let rows = project.redirect["patches"].as_array().expect("the rows");
+            let row = rows
+                .iter()
+                .find(|row| row["platform"] == "x86_64-linux-gnu")
+                .expect("the row of the linux build");
+            assert_eq!(
+                row,
+                &serde_json::json!({
+                    "purl": "pkg:gem/rails@7.0.0?platform=x86_64-linux-gnu",
+                    "action": "upstream_kept",
+                    "errorCode": "gem_upstream_build_kept",
+                    "error": "the patch registry serves upstream's own gem for \
+                              x86_64-linux-gnu: its patched build was withdrawn",
+                    "gemFix": GEM_NEWER,
+                    "platform": "x86_64-linux-gnu",
+                    "withdrawn": true,
+                }),
+                "{served:?}"
+            );
+            assert_eq!(project.redirect["warnings"], serde_json::json!([]));
+        }
+    }
+
+    /// The reference of [`GEM_EARLIER`] as it stands once its
+    /// `arm64-darwin` build was withdrawn: its registry at the snapshot
+    /// `2b`, upstream's gem (`1…`) for that platform and the patched build
+    /// (`b…`) for `x86_64-linux-gnu`. `list: false` leaves the list out.
+    fn gem_earlier_now(list: bool) -> serde_json::Value {
+        let registry = gem_registry(GEM_EARLIER);
+        let mut identifiers = serde_json::json!({
+            "name": "rails", "version": "7.0.0", "gemChecksumSha256": "f".repeat(64),
+        });
+        let mut index_url = registry.clone();
+        if list {
+            index_url = format!("{registry}s/2b/");
+            identifiers["gemBuilds"] = serde_json::json!([
+                {"platform": "arm64-darwin", "gemChecksumSha256": "1".repeat(64),
+                 "patchUuid": null},
+                {"platform": "ruby", "gemChecksumSha256": "f".repeat(64),
+                 "patchUuid": GEM_EARLIER},
+                {"platform": "x86_64-linux-gnu", "gemChecksumSha256": "b".repeat(64),
+                 "patchUuid": "eeeeeeee-5555-4555-8555-eeeeeeeeeeee"},
+            ]);
+        }
+        serde_json::json!({
+            "status": "granted",
+            "url": format!("{registry}gems/rails-7.0.0.gem"),
+            "purl": "pkg:gem/rails@7.0.0",
+            "artifacts": [{"kind": "tarball", "url": null, "integrity": {
+                "sha256": "f".repeat(64)
+            }}],
+            "registryOverride": {
+                "kind": "rubygems-compact-index",
+                "indexUrl": index_url,
+                "identifiers": identifiers,
+            },
+        })
+    }
+
+    /// A lock stays on an earlier patch of the gem, held by a build that
+    /// patch still serves, while its registry no longer lists another
+    /// build the lock pins (one the patch on offer has a patched build
+    /// for). The engine asks its provider for the earlier patch's
+    /// reference, in one more reference request, and brings the lock to
+    /// that patch's current snapshot: the withdrawn build is back on
+    /// upstream's sha256 and reported as such, the other is in place, and
+    /// the patch on offer is skipped as before. An answer that is not
+    /// usable leaves the lock as it is under the quiet skip alone, and a
+    /// run that sees no withdrawal makes no such request.
+    #[tokio::test]
+    async fn a_lock_that_stays_follows_the_current_reference_of_the_patch_it_is_on() {
+        use crate::hosted::engine::GEM_NEWER_FIX_WAITS;
+        let index_url = format!("{}s/1a/info/rails", gem_registry(GEM_EARLIER));
+        let pair = gem_pair_on_a_patch(&format!(
+            "\nCHECKSUMS\n  rails (7.0.0-arm64-darwin) sha256={}\n  rails (7.0.0-x86_64-linux-gnu) \
+             sha256={}\n",
+            "a".repeat(64),
+            "b".repeat(64)
+        ));
+        let listing = |arm: Option<&str>| {
+            let mut index = format!("---\n7.0.0 |checksum:{}\n", "f".repeat(64));
+            if let Some(arm) = arm {
+                index.push_str(&format!("7.0.0-arm64-darwin |checksum:{arm}\n"));
+            }
+            index.push_str(&format!(
+                "7.0.0-x86_64-linux-gnu |checksum:{}\n",
+                "b".repeat(64)
+            ));
+            index
+        };
+        let held = |project: &ProjectResult| {
+            let skipped: Vec<(&str, &str)> = project
+                .skipped
+                .iter()
+                .map(|skip| (skip.uuid.as_str(), skip.reason.as_str()))
+                .collect();
+            assert_eq!(skipped, [(GEM_NEWER, GEM_NEWER_FIX_WAITS)]);
+        };
+        let both = [vec![GEM_NEWER.to_string()], vec![GEM_EARLIER.to_string()]];
+
+        // The withdrawal, and a usable reference.
+        let withdrawn = [(index_url.as_str(), listing(None))];
+        let (output, asked, references) =
+            gem_run_granting(&pair, &withdrawn, Some(gem_earlier_now(true))).await;
+        assert_eq!(asked, [index_url.clone()]);
+        assert_eq!(references, both);
+        assert_eq!(output.stats.provider_calls["fetchRegistryReferences"], 2);
+        assert_eq!(output.stats.provider_calls["downloadArtifact"], 1);
+        assert!(output.warnings.is_empty(), "{:?}", output.warnings);
+        let changed: Vec<&str> = output
+            .changed_files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(changed, ["Gemfile", "Gemfile.lock"]);
+        let at_now = format!("{}s/2b/", gem_registry(GEM_EARLIER));
+        for file in &output.changed_files {
+            assert!(file.content.contains(&at_now), "{}", file.content);
+            assert!(!file.content.contains(GEM_NEWER), "{}", file.content);
+        }
+        let lock = &output.changed_files[1].content;
+        assert!(
+            lock.contains(&format!(
+                "  rails (7.0.0-arm64-darwin) sha256={}\n  rails (7.0.0-x86_64-linux-gnu) \
+                 sha256={}\n",
+                "1".repeat(64),
+                "b".repeat(64)
+            )),
+            "{lock}"
+        );
+        let [project] = output.projects.as_slice() else {
+            panic!("one project: {:?}", output.projects);
+        };
+        assert!(project.error.is_none(), "{:?}", project.error);
+        held(project);
+        assert_eq!(
+            serde_json::to_value(&project.redirected).unwrap(),
+            serde_json::json!([{
+                "purl": "pkg:gem/rails@7.0.0?platform=x86_64-linux-gnu",
+                "uuid": "eeeeeeee-5555-4555-8555-eeeeeeeeeeee",
+                "gemFix": GEM_EARLIER,
+                "platform": "x86_64-linux-gnu",
+            }])
+        );
+        assert_eq!(
+            serde_json::to_value(&project.upstream_builds).unwrap(),
+            serde_json::json!([{
+                "purl": "pkg:gem/rails@7.0.0?platform=arm64-darwin",
+                "gemFix": GEM_EARLIER,
+                "platform": "arm64-darwin",
+                "withdrawn": true,
+            }])
+        );
+        assert_eq!(project.redirect["redirected"], 1);
+        assert_eq!(project.redirect["warnings"], serde_json::json!([]));
+
+        // Answers that are not usable: none, one with no list, a patch
+        // that is not granted.
+        let mut not_granted = gem_earlier_now(true);
+        not_granted["status"] = serde_json::json!("forbidden");
+        for earlier in [None, Some(gem_earlier_now(false)), Some(not_granted)] {
+            let (output, asked, references) = gem_run_granting(&pair, &withdrawn, earlier).await;
+            assert_eq!(asked, [index_url.clone()]);
+            assert_eq!(references, both);
+            assert!(
+                output.changed_files.is_empty(),
+                "{:?}",
+                output.changed_files
+            );
+            assert!(output.warnings.is_empty(), "{:?}", output.warnings);
+            let [project] = output.projects.as_slice() else {
+                panic!("one project: {:?}", output.projects);
+            };
+            held(project);
+            assert!(project.redirected.is_empty() && project.upstream_builds.is_empty());
+        }
+
+        // No withdrawal: the registry lists both builds as the lock pins
+        // them. One reference request, for the patch on offer.
+        let served = [(index_url.as_str(), listing(Some(&"a".repeat(64))))];
+        let (output, asked, references) =
+            gem_run_granting(&pair, &served, Some(gem_earlier_now(true))).await;
+        assert_eq!(asked, [index_url.clone()]);
+        assert_eq!(references, [vec![GEM_NEWER.to_string()]]);
+        assert_eq!(output.stats.provider_calls["fetchRegistryReferences"], 1);
+        assert!(
+            output.changed_files.is_empty(),
+            "{:?}",
+            output.changed_files
+        );
+    }
+
+    /// A lock with no `CHECKSUMS` on the offered patch's own registry,
+    /// under an earlier snapshot in which `arm64-darwin` was upstream's
+    /// gem: the engine asks its provider for that snapshot's listing,
+    /// once, and reports the build as newly patched. Without the listing
+    /// it reports the build as it does on a lock that says nothing.
+    #[tokio::test]
+    async fn a_lock_without_checksums_is_told_what_a_newer_snapshot_patches() {
+        let (gemfile, lock) = gem_pair_on_a_patch("");
+        let pair = (
+            gemfile.replace(GEM_EARLIER, GEM_NEWER),
+            lock.replace(GEM_EARLIER, GEM_NEWER),
+        );
+        let index_url = format!("{}s/1a/info/rails", gem_registry(GEM_NEWER));
+        let listing = format!(
+            "---\n7.0.0 |checksum:{}\n7.0.0-arm64-darwin |checksum:{}\n7.0.0-x86_64-linux-gnu \
+             |checksum:{}\n",
+            "f".repeat(64),
+            "1".repeat(64),
+            "2".repeat(64)
+        );
+        for (served, newly) in [(vec![(index_url.as_str(), listing)], true), (vec![], false)] {
+            let (output, asked, references) = gem_run_granting(&pair, &served, None).await;
+            assert_eq!(asked, [index_url.clone()], "newly {newly}");
+            assert_eq!(output.stats.provider_calls["downloadArtifact"], 1);
+            assert_eq!(references, [vec![GEM_NEWER.to_string()]]);
+            let [project] = output.projects.as_slice() else {
+                panic!("one project: {:?}", output.projects);
+            };
+            assert!(project.skipped.is_empty(), "{:?}", project.skipped);
+            let redirected: Vec<(Option<&str>, bool)> = project
+                .redirected
+                .iter()
+                .map(|patch| (patch.platform.as_deref(), patch.newly_patched))
+                .collect();
+            assert_eq!(redirected, [(Some("arm64-darwin"), newly)]);
+            let upstream: Vec<(&str, bool)> = project
+                .upstream_builds
+                .iter()
+                .map(|build| (build.platform.as_str(), build.withdrawn))
+                .collect();
+            assert_eq!(upstream, [("x86_64-linux-gnu", false)]);
+            let at_now = format!("{}s/c4/", gem_registry(GEM_NEWER));
+            for file in &output.changed_files {
+                assert!(file.content.contains(&at_now), "{}", file.content);
+            }
+            assert_eq!(output.changed_files.len(), 2);
+        }
     }
 }

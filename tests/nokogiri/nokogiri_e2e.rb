@@ -58,6 +58,7 @@
 require "digest"
 require "fileutils"
 require "json"
+require "net/http"
 require "open3"
 require "optparse"
 require "rbconfig"
@@ -288,6 +289,9 @@ class NokogiriE2E
 
     puts "Installing nokogiri #{@version} (#{want}) with #{sh!({}, *bundle('--version')).strip}, #{ruby_label}"
     bundle_install!(@install_env)
+    # The platforms the project also deploys to: one more platform gem of
+    # nokogiri in the lock for each, none of them installed here.
+    @opts[:add_platforms].each { |platform| sh!(@install_env, *bundle("lock", "--add-platform", platform)) }
 
     # The copy Bundler loads, wherever this environment keeps its gems.
     where = sh!({}, *bundle("exec", RbConfig.ruby, "-e",
@@ -511,10 +515,32 @@ class NokogiriE2E
   #
   # Both deliver a patched gem through Bundler instead of patching the
   # installed one. For a precompiled install the lock names one platform gem
-  # per platform, so what is delivered is a patched platform gem for each
-  # (PatchService repacks the real ones). The scenario scans, then installs
-  # the result from a fresh checkout with the lock frozen, as CI and a
-  # deploy do, and asks the Ruby there what it loaded.
+  # per platform. The gem's fix is one patch, and the patch service makes a
+  # patched build of each platform gem under a patch of its own
+  # (PatchService repacks the real ones). Until a platform's build is there
+  # the service hands on upstream's own gem for it: `--pass-through` names
+  # such platforms, and `--add-platform` locks one more than this machine's.
+  #
+  #   hosted    The scan moves every locked platform gem to the patch
+  #             registry as soon as one of them is patched, each pinned to
+  #             the sha256 the registry serves for it, and reports the gem
+  #             per locked build. A fresh checkout installs with the lock
+  #             frozen, as CI and a deploy do, and Ruby there loads the
+  #             patched gem where this machine's platform has one and
+  #             upstream's own gem, which the registry relays (or, with
+  #             `--pass-through-redirect`, answers with a redirect to the
+  #             upstream registry), where it has none yet. With no locked build
+  #             patched nothing moves. Once the service has the builds that
+  #             were missing, the next scan moves the lock to the newer
+  #             registry snapshot and the install is the patched gem.
+  #   vendored  The scan commits the patched platform gem of every locked
+  #             platform, each from its own patch, and a fresh checkout
+  #             installs from that tree with the service unreachable. While
+  #             a locked platform has no patched build nothing is vendored:
+  #             the run says so and exits 0.
+  #
+  # Either way the scenario ends with `vex` and a `rollback` to the lock as
+  # it was.
 
   def lock_path
     File.join(@proj, "Gemfile.lock")
@@ -525,10 +551,30 @@ class NokogiriE2E
     File.read(lock_path).scan(/^    nokogiri \(#{Regexp.escape(@version)}-([^)\s]+)\)$/).flatten.uniq
   end
 
+  # The platform of the gem this machine installs, as the lock spells it.
+  def own_platform
+    @full_name.sub("nokogiri-#{@version}-", "")
+  end
+
+  # The locked platforms `--pass-through` names: `own` is this machine's,
+  # `others` is every other one.
+  def pass_through
+    @opts[:pass_through].flat_map do |which|
+      case which
+      when "own" then [own_platform]
+      when "others" then locked_platforms - [own_platform]
+      else [which]
+      end
+    end.uniq
+  end
+
+  # A new stand-in service for the lock as it is.
   def patch_service
-    @patch_service ||= PatchService.new(
+    @patch_service.stop if @patch_service
+    @patch_service = PatchService.new(
       "nokogiri", @version, locked_platforms, UUID, GHSA, File.join(File.dirname(@proj), "patch-service"),
-      "\nmodule Nokogiri\n  #{RB_CONST} = 1\nend\n"
+      "\nmodule Nokogiri\n  #{RB_CONST} = 1\nend\n", :pass_through => pass_through,
+                                                     :redirect => @opts[:redirect]
     )
   end
 
@@ -538,8 +584,8 @@ class NokogiriE2E
     # `--patch-server-url`: a hosted reference in the lock counts only on a
     # Socket host or the one the run is told is the patch server, and this
     # one is on loopback.
-    args += ["--api-url", patch_service.url, "--org", PatchService::ORG, "--api-token", "fake",
-             "--patch-server-url", patch_service.url]
+    args += ["--api-url", @patch_service.url, "--org", PatchService::ORG, "--api-token", "fake",
+             "--patch-server-url", @patch_service.url]
     started = Time.now
     out, err, status = Open3.capture3(base_env.merge(env), @bin, *args, :chdir => @proj)
     [status.exitstatus || -1, out, err, Time.now - started]
@@ -570,70 +616,78 @@ class NokogiriE2E
     return skip("the lock pins no platform gem of nokogiri: nothing here is specific to a precompiled install") if locked_platforms.empty?
     return skip("needs a gem home of its own (--gem-home project)") unless project_home?
     service = patch_service
-    service.bring_up
     gemfile, lock = File.read(File.join(@proj, "Gemfile")), File.read(lock_path)
     platforms = locked_platforms
+    waiting = platforms.reject { |p| service.uuid_of(p) }
+    unless waiting.empty?
+      puts "  #{waiting.join(', ')}: no patched build yet, the registry hands on upstream's gem"
+    end
 
-    code, stdout, stderr, secs = sp_service("scan", "--mode", mode, "--yes", "--json")
-    check(code.zero?, "`scan --mode #{mode}` succeeds (#{secs.round}s)", "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
-    # What the scan warned about, for a later check that fails because of it.
-    scan_said = begin
-      JSON.pretty_generate(JSON.parse(stdout).fetch("warnings", []))
-    rescue JSON::ParserError
-      tail(stdout)
-    end + tail(stderr)
-    rewritten = File.read(lock_path)
-    check(rewritten != lock, "it rewires the lock", tail(stdout) + tail(stderr))
     if mode == "hosted"
-      section = rewritten[/^GEM\n  remote: #{Regexp.escape(service.index_url)}\n  specs:\n((?:    .*\n)+)/, 1].to_s
-      missing = platforms.reject { |p| section.include?("    nokogiri (#{@version}-#{p})\n") }
-      check(missing.empty?, "every platform gem of nokogiri now comes from the patch registry",
-            "not moved: #{missing.inspect}\n#{rewritten}")
-      platforms.each do |p|
-        next unless rewritten.include?("\nCHECKSUMS\n")
-        check(rewritten.include?("  nokogiri (#{@version}-#{p}) sha256=#{service.sha256_of(p)}\n"),
-              "the lock pins the patched #{p} gem's checksum", rewritten[/^CHECKSUMS\n(?:  .*\n)+/])
-      end
+      rewritten = hosted(service, platforms, waiting, lock)
     else
-      vendored = Dir.glob(File.join(@proj, ".socket", "vendor", "gem", "**", "*.gemspec"))
-      check(vendored.size >= platforms.size, "a patched gem is vendored for each of #{platforms.size} platforms",
-            vendored.inspect)
-      check(rewritten =~ /^PATH\n  remote: \.socket\/vendor\/gem\//, "the lock takes nokogiri from the vendored path", rewritten)
-      # From here on nothing may need the patch service.
-      service.take_down
-      service.forget_requests
+      rewritten = vendored(service, platforms, waiting, lock, gemfile)
     end
-
-    checkout = fresh_checkout(mode == "vendored" ? [".socket"] : [])
-    in_project(checkout) do
-      code, out = bundle_install("BUNDLE_FROZEN" => "true")
-      check(code.zero?, "a fresh checkout installs with the lock frozen", tail(out))
-      check(File.read(lock_path) == rewritten, "and the install leaves the lock as it was")
-      now = probe
-      check(now[RB_CONST] == 1, "Ruby there loads the patched nokogiri", JSON.pretty_generate(now))
-      check(now["binary_sha256"] == @baseline["binary_sha256"], "with the precompiled binary, nothing compiled")
-      check(now["smoke"] == @baseline["smoke"], "and nokogiri parses, queries, transforms and validates")
-      if mode == "vendored"
-        check(now["loaded_from"].to_s.include?("/.socket/vendor/"), "from the vendored tree", now["loaded_from"].inspect)
-        asked = service.requests.reject { |_, _, status| status == 200 }
-        check(asked.empty?, "without asking the patch service for anything", asked.inspect)
-      end
-    end
-    FileUtils.rm_rf(checkout)
+    installs_frozen(service, mode, rewritten, true)
 
     # The project itself, after one more `bundle install`.
     bundle_install!
-    check(probe[RB_CONST] == 1, "the scanned project loads the patched nokogiri too", scan_said)
+    check(probe[RB_CONST] == 1, "the scanned project loads the patched nokogiri too")
     service.bring_up
     code, stdout, stderr, = sp_service("vex", "--product", PRODUCT, "--output", File.join(@proj, "vex.json"))
-    statuses = begin
+    statements = begin
       JSON.parse(File.read(File.join(@proj, "vex.json"))).fetch("statements", [])
-          .select { |st| st.to_s.include?("pkg:gem/nokogiri@#{@version}") }.map { |st| st["status"] }
+          .select { |st| st.to_s.include?("pkg:gem/nokogiri@#{@version}") }
     rescue StandardError
       []
     end
+    statuses = statements.map { |st| st["status"] }
     check(code.zero? && statuses == ["not_affected"], "`vex` attests the patch",
           "exit #{code} #{statuses.inspect}\n#{tail(stdout)}#{tail(stderr)}")
+    # The build this machine installed is a patch of its own, checked
+    # against that patch's record: it is attested, and nothing is left out.
+    attested = statements.flat_map { |st| Array(st["products"]) }
+                         .flat_map { |product| Array(product["subcomponents"]) }.map { |sub| sub["@id"] }
+    check(attested.include?("pkg:gem/nokogiri@#{@version}?platform=#{own_platform}"),
+          "for the #{own_platform} build this machine installed", attested.inspect)
+    check(!(stdout + stderr).include?("omitting"), "and leaves no build out",
+          tail(stdout) + tail(stderr))
+
+    if mode == "hosted"
+      # The service builds this machine's patched gem again. The lock is on
+      # a snapshot that lists it: the scan presents that snapshot's key and
+      # is answered what the lock holds, so nothing changes and `vex` still
+      # attests the build.
+      service.rebuild(own_platform)
+      service.forget_requests
+      held = File.read(lock_path)
+      code, stdout, stderr, = sp_service("scan", "--mode", "hosted", "--yes", "--json")
+      presented = service.reference_requests.map { |body| (body["gemSnapshotKeys"] || {})[UUID] }
+      check(code.zero? && File.read(lock_path) == held &&
+            events(stdout).none? { |e| e["errorCode"] == "pending_build" },
+            "while that build is being built again, a scan changes nothing and reports the gem as on its patch",
+            "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
+      check(!presented.empty? && presented.all? { |key| key && held.include?("/s/#{key}/") },
+            "its reference requests present the snapshot the lock is on", presented.inspect)
+      code, stdout, stderr, = sp_service("vex", "--product", PRODUCT, "--output", File.join(@proj, "vex.json"))
+      check(code.zero? && vex_statement["status"] == "not_affected" && !(stdout + stderr).include?("as affected"),
+            "and `vex` still attests the patch", "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
+      # What the service answers a client that is not on that snapshot.
+      asked = lambda do |keys|
+        body = { "uuids" => [UUID], "gemBuilds" => true }
+        body["gemSnapshotKeys"] = keys if keys
+        reply = Net::HTTP.post(URI("#{service.url}/v0/orgs/#{PatchService::ORG}/patches/package"), JSON.generate(body),
+                               "Content-Type" => "application/json")
+        JSON.parse(reply.body).fetch("results").fetch(UUID)
+      end
+      keyless = asked.call(nil)
+      check(keyless["status"] == "granted" && !keyless["registryOverride"]["indexUrl"].include?("/s/") &&
+            !keyless["registryOverride"]["identifiers"].key?("gemBuilds"),
+            "a request with no key is answered the plain registry and no list", keyless.inspect)
+      check(asked.call(UUID => "0" * 12)["status"] == "pending_build",
+            "and one that presents another key is told the patch is not ready")
+      service.rebuilt(own_platform)
+    end
 
     code, stdout, stderr, = sp_service("rollback")
     check(code.zero?, "`rollback` succeeds", "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
@@ -643,6 +697,189 @@ class NokogiriE2E
     check(!File.exist?(File.join(@proj, ".socket", "vendor", "gem")), "nothing vendored is left") if mode == "vendored"
     bundle_install!
     check(probe == @baseline, "after `bundle install`, Ruby loads what it loaded before the patch")
+  end
+
+  # The hosted scans, up to the lock that pins a patched build of every
+  # locked platform. Returns that lock.
+  def hosted(service, platforms, waiting, lock)
+    patched = platforms - waiting
+    if patched.empty?
+      # No locked build is patched: moving the gem would gain nothing.
+      code, stdout, stderr, secs = sp_service("scan", "--mode", "hosted", "--yes", "--json")
+      left = events(stdout).find { |e| e["errorCode"] == "redirect_gem_no_patched_build" } || {}
+      check(code.zero? && left["action"] == "skipped",
+            "`scan --mode hosted` leaves a gem with no patched build where it is, and succeeds (#{secs.round}s)",
+            "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
+      check(redirect_warnings(stdout).empty?, "without a warning", redirect_warnings(stdout).inspect)
+      check(File.read(lock_path) == lock, "the lock is untouched")
+    elsif !waiting.empty?
+      rewritten = hosted_scan(service, platforms, lock, [])
+      installs_frozen(service, "hosted", rewritten, patched.include?(own_platform))
+    end
+    # The builds that were missing are there: a newer registry snapshot,
+    # beside the earlier one, which lists what it listed.
+    earlier = service.index_url
+    listed = Net::HTTP.get(URI(earlier + "info/nokogiri"))
+    waiting.each { |platform| service.publish(platform) }
+    unless waiting.empty?
+      check(service.index_url != earlier && Net::HTTP.get(URI(earlier + "info/nokogiri")) == listed,
+            "the registry has a newer snapshot, and the earlier one answers as it did", service.index_url)
+    end
+    rewritten = hosted_scan(service, platforms, lock, waiting.empty? ? [] : patched)
+    unless waiting.empty? || patched.empty?
+      check(!rewritten.include?(earlier) && rewritten.include?(service.index_url),
+            "the lock follows the registry to its newer snapshot", rewritten)
+    end
+    rewritten
+  end
+
+  # One hosted scan that moves the gem: every locked platform gem under the
+  # patch registry, pinned to what it serves, and reported per build.
+  # `in_place` names the platforms an earlier scan already pinned patched.
+  # Returns the lock.
+  def hosted_scan(service, platforms, lock, in_place)
+    service.forget_requests
+    code, stdout, stderr, secs = sp_service("scan", "--mode", "hosted", "--yes", "--json")
+    said = tail(stdout) + tail(stderr)
+    check(code.zero?, "`scan --mode hosted` succeeds (#{secs.round}s)", "exit #{code}\n#{said}")
+    rewritten = File.read(lock_path)
+    section = rewritten[/^GEM\n  remote: #{Regexp.escape(service.index_url)}\n  specs:\n((?:    .*\n)+)/, 1].to_s
+    missing = platforms.reject { |p| section.include?("    nokogiri (#{@version}-#{p})\n") }
+    check(missing.empty?, "every platform gem of nokogiri comes from the patch registry's snapshot",
+          "not moved: #{missing.inspect}\n#{rewritten}\n#{said}")
+    platforms.each do |p|
+      next unless rewritten.include?("\nCHECKSUMS\n")
+      pin = "  nokogiri (#{@version}-#{p}) sha256=#{service.sha256_of(p)}\n"
+      if service.uuid_of(p)
+        check(rewritten.include?(pin) && !lock.include?(pin), "the lock pins the patched #{p} gem's checksum",
+              rewritten[/^CHECKSUMS\n(?:  .*\n)+/])
+      else
+        check(rewritten.include?(pin) && lock.include?(pin), "the lock keeps upstream's checksum for #{p}",
+              rewritten[/^CHECKSUMS\n(?:  .*\n)+/])
+      end
+    end
+
+    # One `applied` event per patched build, under that build's own patch,
+    # and an uncounted one per build that stays upstream's gem.
+    applied, kept = {}, []
+    events(stdout).each do |e|
+      details = e["details"] || {}
+      next unless details["gemFix"] == UUID && details["platform"]
+      if e["errorCode"] == "gem_upstream_build_kept"
+        kept << details["platform"]
+      elsif e["action"] == "applied"
+        applied[details["platform"]] = [e["uuid"], details["newlyPatched"] == true]
+      end
+    end
+    want = {}
+    platforms.each { |p| want[p] = [service.uuid_of(p), !in_place.include?(p)] if service.uuid_of(p) }
+    check(applied == want, "the run reports each patched build under its own patch",
+          "expected #{want.inspect}\ngot #{applied.inspect}\n#{said}")
+    check(kept.sort == platforms.reject { |p| service.uuid_of(p) }.sort,
+          "and each build that stays upstream's gem as kept, not patched", "#{kept.inspect}\n#{said}")
+    check(redirect_warnings(stdout).empty?, "without a warning about the gem", redirect_warnings(stdout).inspect)
+    asked = service.reference_requests
+    check(!asked.empty? && asked.all? { |body| body["gemBuilds"] == true },
+          "every package reference request asks for the list of the gem's builds", asked.inspect)
+    check(asked.all? { |body| body["uuids"] == [UUID] },
+          "and none asks about a platform gem's own patch", asked.inspect)
+    rewritten
+  end
+
+  # The `redirect_gem_*` warnings of a `--json` run that are neither the
+  # note of a refreshed install nor the caveat of a lock with no
+  # `CHECKSUMS` section.
+  def redirect_warnings(stdout)
+    warning_codes(stdout).select { |code| code.to_s.start_with?("redirect_gem_") } -
+      %w[redirect_gem_install_refreshed redirect_gem_no_checksums_section]
+  end
+
+  # The vendored scans, up to the lock that takes nokogiri from the
+  # committed tree. Returns that lock.
+  def vendored(service, platforms, waiting, lock, gemfile)
+    unless waiting.empty?
+      # A locked platform with no patched build: nothing is vendored.
+      code, stdout, stderr, secs = sp_service("scan", "--mode", "vendored", "--yes", "--json")
+      pending = events(stdout).find { |e| e["errorCode"] == "vendor_prebuilt_platform_pending" } || {}
+      check(code.zero? && pending["action"] == "skipped",
+            "`scan --mode vendored` does not vendor a gem that lacks a patched build, and succeeds (#{secs.round}s)",
+            "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
+      check(waiting.all? { |p| pending["reason"].to_s.include?(p) } &&
+            pending["reason"].to_s.include?("is not vendored: no patched build yet for"),
+            "and names the platforms that have none", pending["reason"].inspect)
+      check(File.read(lock_path) == lock && File.read(File.join(@proj, "Gemfile")) == gemfile &&
+            !File.exist?(File.join(@proj, ".socket", "vendor", "gem")), "nothing is written")
+      fetched = service.requests.select { |_, path, _| path.start_with?("/patch/") || path.include?("/gems/") }
+      check(fetched.empty?, "and nothing is downloaded", fetched.inspect)
+      waiting.each { |platform| service.publish(platform) }
+    end
+
+    service.forget_requests
+    code, stdout, stderr, secs = sp_service("scan", "--mode", "vendored", "--yes", "--json")
+    said = tail(stdout) + tail(stderr)
+    check(code.zero?, "`scan --mode vendored` succeeds (#{secs.round}s)", "exit #{code}\n#{said}")
+    rewritten = File.read(lock_path)
+    check(rewritten != lock, "it rewires the lock", said)
+    vendored = Dir.glob(File.join(@proj, ".socket", "vendor", "gem", "**", "*.gemspec"))
+    check(vendored.size >= platforms.size, "a patched gem is vendored for each of #{platforms.size} platforms",
+          vendored.inspect)
+    check(rewritten =~ /^PATH\n  remote: \.socket\/vendor\/gem\//, "the lock takes nokogiri from the vendored path", rewritten)
+    # Each platform's tree comes from that platform's own patch, and the
+    # run asks for those patches in one request.
+    own = platforms.map { |p| service.uuid_of(p) }.sort
+    asked = service.reference_requests
+    check(!asked.empty? && asked.all? { |body| body["gemBuilds"] == true },
+          "every package reference request asks for the list of the gem's builds", asked.inspect)
+    batches = asked.map { |body| Array(body["uuids"]).sort }.reject { |uuids| (uuids & own).empty? }
+    check(batches == [own], "the patches of the platform gems are asked for in one request", asked.inspect)
+    # A platform gem is checked against the record of its own patch: the
+    # service stamps the files of each patch, so no build matches the gem's.
+    views = service.requests.select { |_, path, _| path.include?("/view/") && !path.end_with?("/#{UUID}") }
+    check(views.map { |_, path, status| [File.basename(path), status] }.sort == own.map { |uuid| [uuid, 200] },
+          "and the record of each platform gem's own patch is read once", views.inspect)
+    # From here on nothing may need the patch service.
+    service.take_down
+    service.forget_requests
+    rewritten
+  end
+
+  # A fresh checkout of what the scan left to commit installs with the lock
+  # frozen, and Ruby there loads nokogiri: the patched gem when `patched`,
+  # else upstream's own, which the patch registry hands on.
+  def installs_frozen(service, mode, rewritten, patched)
+    checkout = fresh_checkout(mode == "vendored" ? [".socket"] : [])
+    service.forget_requests
+    in_project(checkout) do
+      code, out = bundle_install("BUNDLE_FROZEN" => "true")
+      check(code.zero?, "a fresh checkout installs with the lock frozen", tail(out))
+      check(File.read(lock_path) == rewritten, "and the install leaves the lock as it was")
+      now = probe
+      if patched
+        check(now[RB_CONST] == 1, "Ruby there loads the patched nokogiri", JSON.pretty_generate(now))
+      else
+        check(now[RB_CONST].nil?, "Ruby there loads upstream's nokogiri: this platform has no patched build yet",
+              JSON.pretty_generate(now))
+        file = "nokogiri-#{@version}-#{own_platform}.gem"
+        answers = service.requests.select { |_, path, _| path.end_with?("/gems/#{file}") }.map(&:last).uniq
+        if @opts[:redirect]
+          check(answers == [302] && service.upstream_requests.include?(["GET", "/gems/#{file}", 200]),
+                "which the patch registry answers with a redirect to the upstream registry",
+                (service.requests + service.upstream_requests).inspect)
+        else
+          check(answers == [200] && service.upstream_requests.empty?,
+                "which the patch registry relays itself, with nothing asked of the upstream registry",
+                (service.requests + service.upstream_requests).inspect)
+        end
+      end
+      check(now["binary_sha256"] == @baseline["binary_sha256"], "with the precompiled binary, nothing compiled")
+      check(now["smoke"] == @baseline["smoke"], "and nokogiri parses, queries, transforms and validates")
+      if mode == "vendored"
+        check(now["loaded_from"].to_s.include?("/.socket/vendor/"), "from the vendored tree", now["loaded_from"].inspect)
+        asked = service.requests.reject { |_, _, status| status == 200 }
+        check(asked.empty?, "without asking the patch service for anything", asked.inspect)
+      end
+    end
+    FileUtils.rm_rf(checkout)
   end
 
   def skip(why)
@@ -933,7 +1170,7 @@ puts "sp_probe\t" + JSON.generate(result)
 end
 
 opts = { :install => "any", :build => "ok", :gem_home => "project", :scenarios => %w[ruby c libxml2], :gems => [],
-         :settings => [], :unread_check => true }
+         :settings => [], :unread_check => true, :add_platforms => [], :pass_through => [], :redirect => false }
 parser = OptionParser.new do |o|
   o.banner = "usage: ruby nokogiri_e2e.rb --socket-patch BIN --nokogiri VERSION [options]"
   o.on("--socket-patch BIN", "the socket-patch binary under test") { |v| opts[:socket_patch] = v }
@@ -956,6 +1193,13 @@ parser = OptionParser.new do |o|
        "in an official Ruby image is /usr/local/bundle; only for a throwaway environment)") { |v| opts[:gem_home] = v }
   o.on("--scenarios LIST", Array, "of ruby,c,libxml2 (default: all three, agent mode) and hosted,vendored",
        "(a scan against a stand-in patch service that serves repacked platform gems)") { |v| opts[:scenarios] = v }
+  o.on("--add-platform PLATFORM", "also lock nokogiri's gem of this platform (`bundle lock --add-platform`), for",
+       "example aarch64-linux-gnu; may be given more than once") { |v| opts[:add_platforms] << v }
+  o.on("--pass-through LIST", Array, "hosted and vendored: the locked platforms the stand-in patch service has no",
+       "patched build of yet, so that it hands on upstream's own gem for them: platform names,",
+       "`own` (this machine's) or `others` (every other locked one)") { |v| opts[:pass_through].concat(v) }
+  o.on("--pass-through-redirect", "the stand-in answers the file of such a platform with a redirect to the upstream",
+       "registry, which a client must follow, where by default it relays the file") { opts[:redirect] = true }
   o.on("--rails VERSION", "also install this Rails (a Gemfile requirement, for example '~> 7.1.0') and check",
        "that a booted application sanitizes HTML through the patched nokogiri") { |v| opts[:rails] = v }
   o.on("--bundle-setting KEY=VALUE", "one more Bundler setting for the install, for example",

@@ -33,7 +33,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::constants::SOCKET_DIR;
-use crate::manifest::schema::PatchRecord;
+use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::utils::fs::{atomic_write_artifact, read_regular_to_bytes};
 use crate::utils::purl_key::PurlKey;
 use crate::utils::serde::serialize_sorted;
@@ -317,15 +317,16 @@ pub struct VendorEntry {
     /// pypi/pipenv extras.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipenv: Option<PipenvMeta>,
-    /// gem: the platforms of a gem vendored as precompiled platform gems,
-    /// in `Gemfile.lock` order (`arm64-darwin`, `x86_64-linux-gnu`, …).
-    /// The artifact dir then holds one unpacked prebuild per platform, at
+    /// gem: the trees of a gem vendored as precompiled platform gems, in
+    /// `Gemfile.lock` order. The artifact dir then holds one unpacked
+    /// patched platform gem per locked platform, at
     /// `<artifact>/<platform>/`, instead of the gem's own tree: bundler
     /// never builds a `path:` gem's extensions, so a gem the lock resolves
-    /// to platform gems is vendored as the patch service's prebuilt ones.
-    /// Empty for a gem vendored as its ruby-platform tree.
+    /// to platform gems is vendored as the patch service's patched ones,
+    /// each from the patch of its own platform. Empty for a gem vendored
+    /// as its ruby-platform tree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub gem_platforms: Vec<String>,
+    pub gem_builds: Vec<GemBuildEntry>,
     /// True when vendored WITHOUT a manifest record — the posture of every
     /// `scan` / `get --mode vendored` entry (vendored mode writes no
     /// `.socket/manifest.json`); only the manifest-driven standalone
@@ -351,7 +352,83 @@ pub struct VendorEntry {
     pub record: Option<PatchRecord>,
 }
 
+/// One tree of a gem vendored as precompiled platform gems
+/// ([`VendorEntry::gem_builds`]): `<artifact>/<platform>/`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GemBuildEntry {
+    /// `Gem::Platform#to_s` as `Gemfile.lock` spells it.
+    pub platform: String,
+    /// The patch of this platform gem: the one the tree was unpacked from.
+    pub uuid: String,
+    /// The sha512 (SRI) of the patched platform `.gem` the tree was
+    /// unpacked from, as the patch service stated it and the download was
+    /// verified against.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gem_integrity: String,
+    /// The sha512 (SRI) of the stub gemspec the tree holds, likewise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gemspec_integrity: String,
+    /// The files this platform's own patch changes, with their hashes, as
+    /// that patch's record states them: what the tree is verified against.
+    /// A platform gem is a patch of its own, so its files are not the
+    /// gem patch's: a compiled build changes binaries the gem's patch does
+    /// not name, and the service stamps each patch's files with that
+    /// patch's own header. Empty for a tree vendored before this was
+    /// recorded, which is then checked against the gem's patch as before.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, PatchFileInfo>,
+}
+
+impl GemBuildEntry {
+    /// The purl of this platform gem of the gem `base_purl`:
+    /// `pkg:gem/<name>@<version>?platform=<platform>`.
+    pub fn purl(&self, base_purl: &str) -> String {
+        format!(
+            "{}?platform={}",
+            crate::utils::purl::strip_purl_qualifiers(base_purl),
+            self.platform
+        )
+    }
+}
+
 impl VendorEntry {
+    /// gem: whether every tree of [`Self::gem_builds`] names a plain gem
+    /// platform token. The ledger is committed, tamper-able data, and a
+    /// platform names a directory and a purl qualifier.
+    pub fn gem_builds_well_formed(&self) -> bool {
+        self.gem_builds
+            .iter()
+            .all(|built| super::gem::is_platform_dir_name(&built.platform))
+    }
+
+    /// gem: the files the tree of `platform` is verified against: those of
+    /// that platform's own patch where the ledger records them
+    /// ([`GemBuildEntry::files`]), else `fallback`, the gem patch's.
+    pub fn gem_tree_files(
+        &self,
+        platform: &str,
+        fallback: &HashMap<String, PatchFileInfo>,
+    ) -> HashMap<String, PatchFileInfo> {
+        self.gem_builds
+            .iter()
+            .find(|built| built.platform == platform && !built.files.is_empty())
+            .map_or_else(
+                || fallback.clone(),
+                |built| built.files.clone().into_iter().collect(),
+            )
+    }
+
+    /// gem: the platforms of a copy vendored as precompiled platform gems
+    /// ([`Self::gem_builds`]), in lock order. Empty for a gem vendored as
+    /// its ruby-platform tree.
+    pub fn gem_tree_platforms(&self) -> Vec<&str> {
+        self.gem_builds
+            .iter()
+            .map(|built| built.platform.as_str())
+            .collect()
+    }
+
     /// Create an entry with no ecosystem-specific metadata or embedded record.
     pub fn new(
         ecosystem: String,
@@ -374,7 +451,7 @@ impl VendorEntry {
             poetry: None,
             pdm: None,
             pipenv: None,
-            gem_platforms: Vec::new(),
+            gem_builds: Vec::new(),
             detached: false,
             record: None,
         }
@@ -1929,6 +2006,107 @@ mod tests {
         assert!(back_entry.record.is_none());
     }
 
+    /// A gem vendored as platform gems records each tree's platform, patch
+    /// and digests under `gemBuilds`. A ledger may hold keys this build
+    /// does not know, written by a development build, and reads as if
+    /// they were not there: a `gemPlatforms` list on the entry (the
+    /// platforms of its copy, beside `gemBuilds` or in its place), which
+    /// is not written back, and the fields `record` and `rebuiltFromUuid`
+    /// of a `gemBuilds` item.
+    #[tokio::test]
+    async fn gem_builds_round_trip_and_unknown_keys_are_ignored() {
+        const BUILD: &str = "2b3c4d5e-6f70-4a1b-8c2d-9e0f1a2b3c4d";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut entry = sample_entry();
+        entry.ecosystem = "gem".into();
+        entry.base_purl = "pkg:gem/nokogiri@1.18.10".into();
+        entry.gem_builds = vec![
+            GemBuildEntry {
+                platform: "arm64-darwin".into(),
+                uuid: BUILD.into(),
+                gem_integrity: "sha512-GEM==".into(),
+                gemspec_integrity: "sha512-STUB==".into(),
+                files: BTreeMap::new(),
+            },
+            GemBuildEntry {
+                platform: "x86_64-linux-gnu".into(),
+                uuid: UUID.into(),
+                gem_integrity: String::new(),
+                gemspec_integrity: String::new(),
+                files: Default::default(),
+            },
+        ];
+        assert_eq!(
+            entry.gem_tree_platforms(),
+            ["arm64-darwin", "x86_64-linux-gnu"]
+        );
+        let key = "pkg:gem/nokogiri@1.18.10?platform=ruby";
+        let mut state = VendorState::new();
+        state.entries.insert(key.into(), entry.clone());
+        save_state(root, &state).await.unwrap();
+        assert_eq!(load_state(root).await.unwrap(), state);
+        let text = tokio::fs::read_to_string(root.join(VENDOR_STATE_REL))
+            .await
+            .unwrap();
+        let wire: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            wire["entries"][key]["gemBuilds"],
+            serde_json::json!([
+                { "platform": "arm64-darwin", "uuid": BUILD,
+                  "gemIntegrity": "sha512-GEM==", "gemspecIntegrity": "sha512-STUB==" },
+                { "platform": "x86_64-linux-gnu", "uuid": UUID }
+            ])
+        );
+
+        // An entry with the key `gemPlatforms`, beside its `gemBuilds` or
+        // in their place: the ledger reads as the same one without the key
+        // does, and a save does not write the key back.
+        let state_path = root.join(VENDOR_STATE_REL);
+        for with_builds in [true, false] {
+            let mut plain = wire.clone();
+            if !with_builds {
+                let entry = plain["entries"][key].as_object_mut().unwrap();
+                entry.remove("gemBuilds");
+            }
+            let mut keyed = plain.clone();
+            keyed["entries"][key].as_object_mut().unwrap().insert(
+                "gemPlatforms".into(),
+                serde_json::json!(["arm64-darwin", "x86_64-linux-gnu"]),
+            );
+            tokio::fs::write(&state_path, serde_json::to_vec_pretty(&keyed).unwrap())
+                .await
+                .unwrap();
+            let read = load_state(root).await.unwrap();
+            let without_key: VendorState = serde_json::from_value(plain).unwrap();
+            assert_eq!(read, without_key, "the key is ignored");
+            let trees = read.entries[key].gem_tree_platforms();
+            match with_builds {
+                true => assert_eq!(trees, ["arm64-darwin", "x86_64-linux-gnu"]),
+                false => assert!(trees.is_empty(), "the key names no tree: {trees:?}"),
+            }
+            save_state(root, &read).await.unwrap();
+            let saved = tokio::fs::read_to_string(&state_path).await.unwrap();
+            assert!(!saved.contains("gemPlatforms"), "{saved}");
+        }
+
+        // Items with fields this build does not know.
+        let mut extended = wire;
+        for item in extended["entries"][key]["gemBuilds"]
+            .as_array_mut()
+            .unwrap()
+        {
+            let item = item.as_object_mut().unwrap();
+            item.insert("rebuiltFromUuid".into(), serde_json::json!(UUID));
+            item.insert(
+                "record".into(),
+                serde_json::json!({ "uuid": BUILD, "files": {}, "anything": [1, 2] }),
+            );
+        }
+        let read: VendorState = serde_json::from_value(extended).unwrap();
+        assert_eq!(read.entries[key].gem_builds, entry.gem_builds);
+    }
+
     #[tokio::test]
     async fn v2_meta_structs_round_trip_with_camel_case() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2633,7 +2811,7 @@ mod tests {
             poetry: None,
             pdm: None,
             pipenv: None,
-            gem_platforms: Vec::new(),
+            gem_builds: Vec::new(),
         };
         let built = VendorEntry::npm(
             "pkg:npm/left-pad@1.3.0".to_string(),

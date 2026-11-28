@@ -350,6 +350,11 @@ pub struct ApiClient {
     /// retryable failure (transport / 429 / 5xx after every retry) — the
     /// run-level circuit breaker. Shared by clones: one CLI run, one count.
     vendor_outage: Arc<AtomicU32>,
+    /// Whether the authenticated API answered a request of this client
+    /// 401: it refuses the credential itself, whatever is asked (a 403 is
+    /// about what was asked). Shared by clones: one CLI run, one
+    /// credential ([`Self::credential_refused`]).
+    credential_refused: Arc<AtomicBool>,
     /// In-flight slots for the public proxy's batch path — the
     /// `/patch/batch` POSTs and the legacy per-package GETs they degrade
     /// to. Shared by clones, so concurrent [`Self::search_patches_batch`]
@@ -377,6 +382,9 @@ pub struct ApiClient {
     /// The lookups this client has answered, when it remembers them
     /// ([`Self::remembering_lookups`]). Shared by clones.
     lookups: Option<Arc<Lookups>>,
+    /// Whether a search answers without the patches of platform gems
+    /// ([`Self::offering_platform_gem_patches`]).
+    no_platform_gem_patches: bool,
 }
 
 /// What the patch service answered a client that remembers its lookups
@@ -628,11 +636,13 @@ impl ApiClient {
             org_unresolved: None,
             vendor_retry: VendorRetryPolicy::default(),
             vendor_outage: Arc::new(AtomicU32::new(0)),
+            credential_refused: Arc::new(AtomicBool::new(false)),
             proxy_batch_slots: Arc::new(tokio::sync::Semaphore::new(proxy_batch_cap)),
             service_confirmed: Arc::new(AtomicBool::new(false)),
             vendor_prefetch: Arc::new(std::sync::Mutex::new(None)),
             api_retry: ApiRetry::from_env(),
             lookups: None,
+            no_platform_gem_patches: false,
         }
     }
 
@@ -646,6 +656,48 @@ impl ApiClient {
     pub fn remembering_lookups(mut self) -> Self {
         self.lookups.get_or_insert_with(Default::default);
         self
+    }
+
+    /// This client as a run asks it about platform gems. A hosted or a
+    /// vendored run patches a gem through the patch of the gem itself, so
+    /// its client is not `offered` the patch of a platform gem: every
+    /// search it answers (by package, by CVE, by GHSA and the batch search)
+    /// leaves those patches out, and a package of a batch they leave with
+    /// no patch
+    /// ([`crate::hosted::engine::leave_out_platform_gem_patches`]). This is
+    /// the one place such a run narrows what the patch service offers:
+    /// nothing is selected, reported, counted or looked up for a patch its
+    /// client never returns. Agent mode is `offered` them, as every client
+    /// is until it is told otherwise. A patch asked for by its UUID
+    /// ([`Self::fetch_patch`]) is returned whatever it patches.
+    ///
+    /// What the client remembers ([`Self::remembering_lookups`]) is what
+    /// the patch service answered, so clones that share one memory can be
+    /// asked both ways (the directories of one run can differ in mode).
+    /// The client a run falls back to on the public proxy answers as the
+    /// one it is made from ([`Self::proxy_fallback`]).
+    pub fn offering_platform_gem_patches(mut self, offered: bool) -> Self {
+        self.no_platform_gem_patches = !offered;
+        self
+    }
+
+    /// `answer` as this client hands back a search answer
+    /// ([`Self::offering_platform_gem_patches`]).
+    fn offered<A: crate::hosted::engine::SearchAnswer>(&self, mut answer: A) -> A {
+        if self.no_platform_gem_patches {
+            crate::hosted::engine::leave_out_platform_gem_patches(&mut answer);
+        }
+        answer
+    }
+
+    /// The public-proxy client a run falls back to when the API refuses
+    /// this client's token ([`build_proxy_fallback_client`]), answering a
+    /// search as this client does
+    /// ([`Self::offering_platform_gem_patches`]).
+    pub fn proxy_fallback(&self, overrides: &ApiClientEnvOverrides) -> ApiClient {
+        let mut proxy = build_proxy_fallback_client(overrides);
+        proxy.no_platform_gem_patches = self.no_platform_gem_patches;
+        proxy
     }
 
     /// Override the JSON calls' 429 / 503 retry policy and clock hooks
@@ -686,6 +738,28 @@ impl ApiClient {
     #[cfg(test)]
     pub(crate) fn vendor_outage_count(&self) -> u32 {
         self.vendor_outage.load(Ordering::Relaxed)
+    }
+
+    /// Whether the authenticated API has refused this run's credential: a
+    /// 401 to an authenticated request of this client or of a clone of
+    /// it, whichever kind of request met it. A reader that falls back to
+    /// the public proxy for what the API refuses has no reason to present
+    /// the credential again after that.
+    pub fn credential_refused(&self) -> bool {
+        self.credential_refused.load(Ordering::Relaxed)
+    }
+
+    /// [`classify_auth_error`] for the answer to a request of this client:
+    /// the one place every transport path classifies through, so the 401
+    /// of an authenticated request is remembered
+    /// ([`Self::credential_refused`]) whether it answered a JSON request,
+    /// a download or a package reference. `use_public_proxy` says the
+    /// request carried no credential.
+    fn auth_error(&self, status: StatusCode, use_public_proxy: bool) -> Option<ApiError> {
+        if status == StatusCode::UNAUTHORIZED && !use_public_proxy {
+            self.credential_refused.store(true, Ordering::Relaxed);
+        }
+        classify_auth_error(status, use_public_proxy)
     }
 
     /// Returns the API token, if set.
@@ -851,7 +925,17 @@ impl ApiClient {
         path: &str,
         bare_404: Bare404,
     ) -> Result<Option<T>, ApiError> {
-        let url = format!("{}{}", self.api_url, path);
+        self.get_json_at(&self.api_url, path, bare_404).await
+    }
+
+    /// [`Self::get_json`] of `path` on the host `base`.
+    async fn get_json_at<T: serde::de::DeserializeOwned>(
+        &self,
+        base: &str,
+        path: &str,
+        bare_404: Bare404,
+    ) -> Result<Option<T>, ApiError> {
+        let url = format!("{base}{path}");
         debug_log(&format!("GET {}", url));
 
         let sent = self
@@ -936,7 +1020,7 @@ impl ApiClient {
                 ))
             };
         }
-        if let Some(err) = classify_auth_error(status, use_public_proxy) {
+        if let Some(err) = self.auth_error(status, use_public_proxy) {
             return Err(err);
         }
         let text = resp.text().await.unwrap_or_default();
@@ -1062,12 +1146,34 @@ impl ApiClient {
     /// the query, so there this is the plain view. `Ok(None)` for a patch
     /// that is not there.
     pub async fn fetch_patch_summary(&self, uuid: &str) -> Result<Option<PatchResponse>, ApiError> {
+        self.get_json(&self.summary_path(uuid), Bare404::NotFound)
+            .await
+    }
+
+    /// The path of patch `uuid`'s view without its file contents: the
+    /// authenticated API leaves them out on request, and the public proxy
+    /// serves one cached view per patch whatever the query.
+    fn summary_path(&self, uuid: &str) -> String {
         let query = match &self.route {
             ApiRoute::Org { .. } => "?include_blobs=false",
             ApiRoute::Proxy => "",
         };
-        let path = self.patches_path(&format!("view/{uuid}{query}"));
-        self.get_json(&path, Bare404::NotFound).await
+        self.patches_path(&format!("view/{uuid}{query}"))
+    }
+
+    /// [`Self::fetch_patch_summary`] for a vendoring run, asked of the host
+    /// its package references are asked of: `vendor_url`, where the run
+    /// overrides the vendor service's host ([`Self::vendor_package_url`]),
+    /// else this client's own. A run reads a patch's reference and its
+    /// record from one service.
+    pub async fn fetch_vendor_patch_summary(
+        &self,
+        uuid: &str,
+        vendor_url: Option<&str>,
+    ) -> Result<Option<PatchResponse>, ApiError> {
+        let base = vendor_url.map_or(self.api_url.as_str(), |base| base.trim_end_matches('/'));
+        self.get_json_at(base, &self.summary_path(uuid), Bare404::NotFound)
+            .await
     }
 
     /// What Socket measured about patch `uuid` (see [`PatchStatistics`]):
@@ -1082,11 +1188,7 @@ impl ApiClient {
         &self,
         uuid: &str,
     ) -> Result<Option<PatchStatistics>, ApiError> {
-        let query = match &self.route {
-            ApiRoute::Org { .. } => "?include_blobs=false",
-            ApiRoute::Proxy => "",
-        };
-        let path = self.patches_path(&format!("view/{uuid}{query}"));
+        let path = self.summary_path(uuid);
         let view: Option<PatchStatisticsView> = self.get_json(&path, Bare404::NotFound).await?;
         Ok(view.and_then(|view| view.statistics))
     }
@@ -1133,14 +1235,18 @@ impl ApiClient {
 
     /// Search patches by CVE ID.
     pub async fn search_patches_by_cve(&self, cve_id: &str) -> Result<SearchResponse, ApiError> {
-        self.search_patches_by_route("by-cve", cve_id, self.search_bare_404())
-            .await
+        let answer = self
+            .search_patches_by_route("by-cve", cve_id, self.search_bare_404())
+            .await?;
+        Ok(self.offered(answer))
     }
 
     /// Search patches by GHSA ID.
     pub async fn search_patches_by_ghsa(&self, ghsa_id: &str) -> Result<SearchResponse, ApiError> {
-        self.search_patches_by_route("by-ghsa", ghsa_id, self.search_bare_404())
-            .await
+        let answer = self
+            .search_patches_by_route("by-ghsa", ghsa_id, self.search_bare_404())
+            .await?;
+        Ok(self.offered(answer))
     }
 
     /// Search patches by package PURL.
@@ -1151,7 +1257,7 @@ impl ApiClient {
         if let Some(lookups) = &self.lookups {
             let held = lookups.by_package.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(answer) = held.get(purl) {
-                return Ok(answer.clone());
+                return Ok(self.offered(answer.clone()));
             }
         }
         let answer = self
@@ -1164,7 +1270,7 @@ impl ApiClient {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(purl.to_string(), answer.clone());
         }
-        Ok(answer)
+        Ok(self.offered(answer))
     }
 
     /// Search patches for multiple packages (batch).
@@ -1191,13 +1297,13 @@ impl ApiClient {
         purls: &[String],
     ) -> Result<BatchSearchResponse, ApiError> {
         if let Some(answer) = self.lookups.as_ref().and_then(|l| l.batch(purls)) {
-            return Ok(answer);
+            return Ok(self.offered(answer));
         }
         let answer = self.search_patches_batch_asking(purls).await?;
         if let Some(lookups) = &self.lookups {
             lookups.remember_batch(purls, &answer);
         }
-        Ok(answer)
+        Ok(self.offered(answer))
     }
 
     /// [`Self::search_patches_batch`], always by asking the service.
@@ -1250,9 +1356,16 @@ impl ApiClient {
     /// public proxy `POST /patch/package` (free patches only), in requests
     /// of at most [`MAX_REFERENCE_BATCH`] UUIDs (the endpoint rejects more).
     /// Returns a UUID → reference map (missing/404 → empty).
+    ///
+    /// `gem_snapshots` are the registry snapshots the project's Bundler
+    /// lock takes gems from ([`GemSnapshotKeys`]), which the request
+    /// presents for the patches it asks about; what the patch service
+    /// does with a key is said there. A caller with no lock to read
+    /// passes an empty map.
     pub async fn fetch_registry_references(
         &self,
         uuids: &[String],
+        gem_snapshots: &GemSnapshotKeys,
     ) -> Result<std::collections::HashMap<String, PackageVendorResult>, ApiError> {
         if uuids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -1260,10 +1373,8 @@ impl ApiClient {
         let path = self.patches_path("package");
         let mut results = std::collections::HashMap::new();
         for chunk in uuids.chunks(MAX_REFERENCE_BATCH) {
-            let body = PackageVendorRequest {
-                uuids: chunk.to_vec(),
-                free_only: None,
-            };
+            let presented = gem_snapshots_for(chunk, gem_snapshots);
+            let body = PackageVendorRequest::new(chunk, false, presented);
             let resp = self
                 .post_json::<PackageVendorResponse, _>(&path, &body)
                 .await?;
@@ -1341,7 +1452,7 @@ impl ApiClient {
                         .map_err(|e| self.json_body_error(e, &host))?;
                     return Ok(Some(parsed));
                 }
-                if let Some(err) = classify_auth_error(status, true) {
+                if let Some(err) = self.auth_error(status, true) {
                     return Err(err);
                 }
                 (status, resp.text().await.unwrap_or_default(), host)
@@ -1587,7 +1698,7 @@ impl ApiClient {
         // auth→proxy fallback for binary downloads. `use_auth` is the
         // authenticated-endpoint flag, so `!use_auth` is the proxy case that
         // drives the paid-patch wording.
-        if let Some(err) = classify_auth_error(status, !use_auth) {
+        if let Some(err) = self.auth_error(status, !use_auth) {
             return Err(err);
         }
         let text = resp.text().await.unwrap_or_default();
@@ -1683,19 +1794,19 @@ impl ApiClient {
     }
 
     /// Step 1 of [`Self::fetch_vendor_package`] on its own: what the
-    /// service lists for the patch besides its archive (the per-platform
-    /// gem prebuilds and their stub gemspecs), each with its host-rewritten
-    /// URL and sha512, and NO archive download. A backend that takes only
-    /// those artifacts learns here which exist. Same grant, statuses, retry
-    /// ladder and circuit breaker as the full fetch; a uuid the attached
-    /// plan names is answered from its reference batch.
+    /// service's package reference says of the patch (its artifacts, each
+    /// with its host-rewritten URL and sha512, and the platform gems its
+    /// registry lists), with NO download. A backend that downloads the
+    /// artifacts itself learns here which exist. Same grant, statuses,
+    /// retry ladder and circuit breaker as the full fetch; a uuid the
+    /// attached plan names is answered from its reference batch.
     pub(crate) async fn fetch_vendor_reference(
         &self,
         uuid: &str,
         free_only: bool,
         vendor_url: Option<&str>,
         patch_server_url: Option<&str>,
-    ) -> VendorServiceOutcome<Vec<SecondaryArtifact>> {
+    ) -> VendorServiceOutcome<VendorReference> {
         if let Some(refused) = self.vendor_request_refused(uuid) {
             return VendorServiceOutcome::Failed(refused);
         }
@@ -1703,19 +1814,56 @@ impl ApiClient {
             .request_vendor_package(uuid, free_only, vendor_url)
             .await
         {
-            Ok(result) => (
-                reference_miss(&result.status).unwrap_or_else(|| {
-                    VendorServiceOutcome::Ready(served_secondary_artifacts(
-                        &result,
-                        patch_server_url,
-                    ))
-                }),
-                false,
-            ),
+            Ok(result) => (vendor_reference(&result, patch_server_url), false),
             Err((e, retryable)) => (VendorServiceOutcome::Failed(e), retryable),
         };
         self.note_vendor_outcome(&outcome, retryable_failure);
         outcome
+    }
+
+    /// [`Self::fetch_vendor_reference`] for several patches in ONE request
+    /// (per [`MAX_REFERENCE_BATCH`] uuids): the outcome of each of `uuids`,
+    /// in their order. `Err` when no answer was had at all (a refused or
+    /// failed request), which the circuit breaker counts once.
+    pub(crate) async fn fetch_vendor_references(
+        &self,
+        uuids: &[String],
+        free_only: bool,
+        vendor_url: Option<&str>,
+        patch_server_url: Option<&str>,
+    ) -> Result<Vec<VendorServiceOutcome<VendorReference>>, ApiError> {
+        if let Some(refused) = uuids
+            .iter()
+            .find_map(|uuid| self.vendor_request_refused(uuid))
+        {
+            return Err(refused);
+        }
+        let mut results = std::collections::HashMap::new();
+        for chunk in uuids.chunks(MAX_REFERENCE_BATCH) {
+            match self
+                .request_vendor_references(chunk, free_only, vendor_url)
+                .await
+            {
+                Ok(answered) => results.extend(answered),
+                // As `note_vendor_outcome` counts one failed request.
+                Err((e, retryable)) => {
+                    if retryable {
+                        self.vendor_outage.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        self.vendor_outage.store(0, Ordering::Relaxed);
+        Ok(uuids
+            .iter()
+            .map(|uuid| match results.get(uuid) {
+                Some(result) => vendor_reference(result, patch_server_url),
+                None => VendorServiceOutcome::Failed(ApiError::Other(format!(
+                    "package response missing a result for {uuid}"
+                ))),
+            })
+            .collect())
     }
 
     /// Attach a download plan: `uuids` are the packages the vendor loop is
@@ -1976,12 +2124,9 @@ impl ApiClient {
         free_only: bool,
         vendor_url: Option<&str>,
     ) -> Result<std::collections::HashMap<String, PackageVendorResult>, VendorAttemptError> {
-        let body = PackageVendorRequest {
-            uuids: uuids.to_vec(),
-            // Only send freeOnly when forcing it (the public-proxy contract);
-            // the authenticated endpoint defaults to false.
-            free_only: free_only.then_some(true),
-        };
+        // A vendored lock takes the gem from a path: it has no registry
+        // snapshot to present.
+        let body = PackageVendorRequest::new(uuids, free_only, GemSnapshotKeys::new());
         let (url, use_auth) = self.vendor_package_url(vendor_url);
         debug_log(&format!("POST {url}"));
 
@@ -2027,7 +2172,7 @@ impl ApiClient {
         // 429 classifies as RateLimited but is still retried (the hint);
         // 401/403 carry no hint.
         let hint = self.vendor_retry_hint(status, resp.headers());
-        if let Some(err) = classify_auth_error(status, !use_auth) {
+        if let Some(err) = self.auth_error(status, !use_auth) {
             return Err((err, hint));
         }
         let text = resp.text().await.unwrap_or_default();
@@ -2187,7 +2332,7 @@ impl ApiClient {
             StatusCode::REQUEST_TIMEOUT => return Ok(ServeDownload::Pending),
             _ => {
                 let hint = self.vendor_retry_hint(status, resp.headers());
-                if let Some(err) = classify_auth_error(status, true) {
+                if let Some(err) = self.auth_error(status, true) {
                     return Err((err, hint));
                 }
                 // An error body is only shown, so a small cap and the body
@@ -2405,14 +2550,11 @@ pub(crate) struct FetchedVendorPackage {
     pub prestaged: crate::vendor::prestage::Prestaged,
 }
 
-/// A non-tarball served artifact reference (e.g. `gem-stub-gemspec`): its kind,
-/// final download URL, and sha512 SRI. Bytes are fetched + verified on demand.
+/// A served artifact reference (e.g. `gem-stub-gemspec`): its kind, final
+/// download URL, and sha512 SRI. Bytes are fetched + verified on demand.
 #[derive(Debug, Clone)]
 pub(crate) struct SecondaryArtifact {
     pub kind: String,
-    /// The gem platform a `gem-platform` / `gem-platform-stub-gemspec`
-    /// artifact is for; `None` on every other kind.
-    pub platform: Option<String>,
     pub url: String,
     /// Normalized `sha512-<b64>` of the artifact bytes.
     pub integrity_sri: String,
@@ -2477,8 +2619,23 @@ impl std::fmt::Debug for PrefetchedSecondary {
     }
 }
 
-/// Outcome of [`ApiClient::fetch_vendor_package`], and, with the served
-/// artifact list in place of the archive, of
+/// What a granted package reference says of its patch, with nothing
+/// downloaded ([`ApiClient::fetch_vendor_reference`]).
+#[derive(Debug)]
+pub(crate) struct VendorReference {
+    /// The archive (`kind: "tarball"`), when the reference gives it a url
+    /// and a sha512.
+    pub archive: Option<SecondaryArtifact>,
+    /// The other served artifacts (see [`served_secondary_artifacts`]).
+    pub secondary: Vec<SecondaryArtifact>,
+    /// gem: the platform gems of the gem's version as the patch's registry
+    /// serves them (`registryOverride.identifiers.gemBuilds`); `None` when
+    /// the reference carries no list.
+    pub gem_builds: Option<Vec<crate::patch::redirect::GemPlatformChecksum>>,
+}
+
+/// Outcome of [`ApiClient::fetch_vendor_package`], and, with the
+/// [`VendorReference`] in place of the archive, of
 /// [`ApiClient::fetch_vendor_reference`].
 ///
 /// The vendor backends map these onto the `auto`/`service`/`build` policy:
@@ -2516,21 +2673,55 @@ fn reference_miss<T>(status: &str) -> Option<VendorServiceOutcome<T>> {
     }
 }
 
+/// What `result` settles for [`ApiClient::fetch_vendor_reference`]: the
+/// miss its status names, else its [`VendorReference`].
+fn vendor_reference(
+    result: &PackageVendorResult,
+    patch_server_url: Option<&str>,
+) -> VendorServiceOutcome<VendorReference> {
+    if let Some(miss) = reference_miss(&result.status) {
+        return miss;
+    }
+    let gem_builds = result
+        .registry_override
+        .as_ref()
+        .and_then(|registry| registry.identifiers.gem_builds.clone());
+    VendorServiceOutcome::Ready(VendorReference {
+        archive: served_artifacts(result, patch_server_url, true).pop(),
+        secondary: served_secondary_artifacts(result, patch_server_url),
+        gem_builds,
+    })
+}
+
 /// The served artifacts of a granted reference OTHER than the archive (the
-/// gem path-source stub gemspec, the per-platform gem prebuilds, …) — their
-/// host-rewritten URL + normalized sha512 — so a backend that needs one can
-/// download + verify it lazily. Each is skipped unless it carries both a
-/// url and a sha512.
+/// gem path-source stub gemspec, …) — their host-rewritten URL + normalized
+/// sha512 — so a backend that needs one can download + verify it lazily.
+/// Each is skipped unless it carries both a url and a sha512.
 fn served_secondary_artifacts(
     result: &PackageVendorResult,
     patch_server_url: Option<&str>,
 ) -> Vec<SecondaryArtifact> {
-    let mut secondary_artifacts: Vec<SecondaryArtifact> = Vec::new();
+    served_artifacts(result, patch_server_url, false)
+}
+
+/// The served artifacts of a granted reference that carry a url and a
+/// sha512, the url host-rewritten: the archive alone (`archive`; its own
+/// url, else the reference's top-level one), or every other artifact.
+fn served_artifacts(
+    result: &PackageVendorResult,
+    patch_server_url: Option<&str>,
+    archive: bool,
+) -> Vec<SecondaryArtifact> {
+    let mut served: Vec<SecondaryArtifact> = Vec::new();
     for a in result.artifacts.iter().flatten() {
-        if a.kind == "tarball" {
+        if (a.kind == "tarball") != archive {
             continue;
         }
-        let (Some(url), Some(sha512)) = (a.url.as_deref(), a.integrity.sha512.as_deref()) else {
+        let url = a
+            .url
+            .as_deref()
+            .or(result.url.as_deref().filter(|_| archive));
+        let (Some(url), Some(sha512)) = (url, a.integrity.sha512.as_deref()) else {
             continue;
         };
         let url = match patch_server_url {
@@ -2540,15 +2731,17 @@ fn served_secondary_artifacts(
             },
             None => url.to_string(),
         };
-        secondary_artifacts.push(SecondaryArtifact {
+        served.push(SecondaryArtifact {
             kind: a.kind.clone(),
-            platform: a.platform.clone(),
             url,
             integrity_sri: normalize_sha512_sri(sha512),
             prefetched: None,
         });
+        if archive {
+            break;
+        }
     }
-    secondary_artifacts
+    served
 }
 
 /// A serve GET's answer short of a failure.
@@ -2588,6 +2781,10 @@ fn api_client(api_token: Option<&str>, timeouts: &ApiTimeouts) -> reqwest::Clien
 /// public-proxy POST and the grant-tokenized serve GETs, where sending the
 /// Socket bearer would leak it to a third party. Bounded by `timeouts`,
 /// like the authenticated client.
+///
+/// A serve URL holds its grant token in the path, and a serve route can
+/// answer with a redirect to another host, which the client follows. No
+/// `Referer` is set on the way: it would hand that URL to the next host.
 fn plain_client(timeouts: &ApiTimeouts) -> reqwest::Client {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -2595,7 +2792,11 @@ fn plain_client(timeouts: &ApiTimeouts) -> reqwest::Client {
         HeaderValue::from_static(USER_AGENT_VALUE),
     );
     timeouts
-        .apply(crate::utils::http::client_builder().default_headers(headers))
+        .apply(
+            crate::utils::http::client_builder()
+                .default_headers(headers)
+                .referer(false),
+        )
         .build()
         .expect("failed to build plain reqwest client")
 }
@@ -2891,10 +3092,12 @@ fn proxy_client_at(proxy_url: String) -> ApiClient {
 /// Build a public-proxy `ApiClient` from the same overrides used by
 /// [`get_api_client_with_overrides`], ignoring any API token.
 ///
-/// Used by `scan` and `get` to retry against the public proxy after
-/// the authenticated endpoint returns 401/403 — a stale/revoked token
-/// shouldn't block access to free patches. The auth header is
-/// deliberately dropped (`api_token: None`).
+/// For the retry against the public proxy after the authenticated
+/// endpoint returns 401/403 — a stale/revoked token shouldn't block
+/// access to free patches. The auth header is deliberately dropped
+/// (`api_token: None`). A run whose client answers for a hosted or a
+/// vendored run (`scan`, `get`) makes its fallback from that client
+/// ([`ApiClient::proxy_fallback`]), so both answer a search alike.
 pub fn build_proxy_fallback_client(overrides: &ApiClientEnvOverrides) -> ApiClient {
     let proxy_url = overrides
         .proxy_url
@@ -3338,6 +3541,42 @@ pub enum ApiError {
 pub type ApiFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ApiError>> + Send + 'a>>;
 
+/// The registry snapshots a Bundler lock takes gems from, by patch uuid:
+/// the key each such remote names
+/// ([`crate::patch::redirect::gem_project_snapshot_keys`]), a short string
+/// of lowercase hexadecimal digits.
+///
+/// A reference request presents the key of each patch it asks about
+/// (`gemSnapshotKeys`). The patch service reads a key only while a gem
+/// that patch's registry lists is being built again. A request whose key
+/// is the key of the registry as it stands is then answered that registry,
+/// so the lock is left as it is. One that presents another key is told the
+/// patch is not ready (`pending_build`). One with no key is answered as a
+/// client that asks for no list is: the ruby gem's registry alone.
+/// Outside a rebuild the key changes no answer.
+pub type GemSnapshotKeys = std::collections::BTreeMap<String, String>;
+
+/// The entries of `held` for the patches `uuids` (in any case): what one
+/// reference request about `uuids` presents.
+pub fn gem_snapshots_for(uuids: &[String], held: &GemSnapshotKeys) -> GemSnapshotKeys {
+    let asked = |uuid: &&String| uuids.iter().any(|u| u.eq_ignore_ascii_case(uuid));
+    held.iter()
+        .filter(|(uuid, _)| asked(uuid))
+        .map(|(uuid, key)| (uuid.clone(), key.clone()))
+        .collect()
+}
+
+/// The request a host's provider is handed for
+/// [`PatchApi::fetch_registry_references`], which is the v0 API's body:
+/// the patches asked about, `gemBuilds` (the hosted engine reads each gem
+/// patch's list of builds, and the service reads a snapshot key only on
+/// such a request), and the registry snapshots `held` names for `uuids`
+/// (`gemSnapshotKeys`, left out when it names none).
+pub fn provider_references_request(uuids: &[String], held: &GemSnapshotKeys) -> serde_json::Value {
+    let request = PackageVendorRequest::new(uuids, false, gem_snapshots_for(uuids, held));
+    serde_json::json!(request)
+}
+
 /// The patch-data calls the hosted flow makes, as an object-safe trait so an
 /// embedding host (the in-memory engine, a napi addon) can serve them
 /// in-process. [`ApiClient`] implements it by forwarding to its inherent
@@ -3359,9 +3598,13 @@ pub trait PatchApi: Send + Sync {
     fn search_patches_by_package<'a>(&'a self, purl: &'a str) -> ApiFuture<'a, SearchResponse>;
 
     /// `POST …/patches/package` (hosted reference grants), keyed by uuid.
+    /// `gem_snapshots` are the registry snapshots the project's Bundler
+    /// lock takes gems from ([`GemSnapshotKeys`]): a host passes the
+    /// entries for `uuids` on with its request.
     fn fetch_registry_references<'a>(
         &'a self,
         uuids: &'a [String],
+        gem_snapshots: &'a GemSnapshotKeys,
     ) -> ApiFuture<'a, std::collections::HashMap<String, PackageVendorResult>>;
 
     /// Download a grant-tokenized artifact URL, refusing bodies over
@@ -3388,8 +3631,13 @@ impl PatchApi for ApiClient {
     fn fetch_registry_references<'a>(
         &'a self,
         uuids: &'a [String],
+        gem_snapshots: &'a GemSnapshotKeys,
     ) -> ApiFuture<'a, std::collections::HashMap<String, PackageVendorResult>> {
-        Box::pin(ApiClient::fetch_registry_references(self, uuids))
+        Box::pin(ApiClient::fetch_registry_references(
+            self,
+            uuids,
+            gem_snapshots,
+        ))
     }
 
     fn download_artifact<'a>(&'a self, url: &'a str, max_bytes: u64) -> ApiFuture<'a, Vec<u8>> {
@@ -4780,6 +5028,46 @@ mod tests {
         assert_eq!(url, "https://api.socket.dev/v0/orgs/my-org/patches/package");
     }
 
+    /// A vendoring run that overrides the vendor service's host reads a
+    /// patch's record from that host, where it reads the patch's
+    /// reference, and never from the API host it was given. Without the
+    /// override the record is the API host's.
+    #[tokio::test]
+    async fn vendor_patch_summary_is_asked_of_the_vendor_url() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        const UUID: &str = "0c0ffee0-0000-4000-8000-000000000001";
+        let (api, vendor) = (MockServer::start().await, MockServer::start().await);
+        let record = serde_json::json!({
+            "uuid": UUID, "purl": "pkg:gem/nokogiri@1.19.3?platform=arm64-darwin",
+            "publishedAt": "2026-01-01T00:00:00Z", "files": {}, "vulnerabilities": {},
+            "description": "", "license": "MIT", "tier": "free"
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/my-org/patches/view/{UUID}")))
+            .and(query_param("include_blobs", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(record))
+            .mount(&vendor)
+            .await;
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: api.uri(),
+            api_token: Some("sktsec_x_api".into()),
+            route: ApiRoute::org("my-org"),
+        });
+        let overridden = format!("{}/", vendor.uri());
+        let read = client
+            .fetch_vendor_patch_summary(UUID, Some(&overridden))
+            .await
+            .unwrap();
+        assert_eq!(read.map(|view| view.uuid).as_deref(), Some(UUID));
+        assert!(api.received_requests().await.unwrap().is_empty());
+
+        let read = client.fetch_vendor_patch_summary(UUID, None).await.unwrap();
+        assert!(read.is_none(), "the API host has no such record");
+        assert_eq!(api.received_requests().await.unwrap().len(), 1);
+        assert_eq!(vendor.received_requests().await.unwrap().len(), 1);
+    }
+
     #[test]
     fn vendor_package_url_vendor_url_overrides_base() {
         // The staging override wins for both routes.
@@ -5041,7 +5329,9 @@ mod vendor_package_tests {
         let serve_url = format!("{}{SERVE_PATH}", server.uri());
         Mock::given(method("POST"))
             .and(path("/v0/orgs/acme/patches/package"))
-            .and(body_partial_json(json!({ "uuids": [UUID] })))
+            .and(body_partial_json(
+                json!({ "uuids": [UUID], "gemBuilds": true }),
+            ))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(granted_body(&serve_url, "sha512-ABC123==")),
@@ -5078,7 +5368,7 @@ mod vendor_package_tests {
             .and(path("/patch/package"))
             .and(NoAuthorizationHeader)
             .and(body_partial_json(
-                json!({ "uuids": [UUID], "freeOnly": true }),
+                json!({ "uuids": [UUID], "freeOnly": true, "gemBuilds": true }),
             ))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-ZZ==")),
@@ -5311,6 +5601,181 @@ mod vendor_package_tests {
         ));
     }
 
+    /// The request a host's provider gets says what the engine needs:
+    /// the list of each gem's builds, and the snapshots of the patches it
+    /// asks about, in any case of the uuid, left out when there is none.
+    #[test]
+    fn the_provider_request_asks_for_gem_builds_and_presents_the_snapshots() {
+        const OTHER: &str = "22222222-2222-4222-8222-222222222222";
+        let uuids = [UUID.to_string()];
+        let held: GemSnapshotKeys = [
+            (UUID.to_uppercase(), "9f3c01".to_string()),
+            (OTHER.to_string(), "4a".to_string()),
+        ]
+        .into();
+        assert_eq!(
+            provider_references_request(&uuids, &held),
+            json!({
+                "uuids": [UUID],
+                "gemBuilds": true,
+                "gemSnapshotKeys": { UUID.to_uppercase(): "9f3c01" },
+            })
+        );
+        assert_eq!(
+            provider_references_request(&uuids, &GemSnapshotKeys::new()),
+            json!({ "uuids": [UUID], "gemBuilds": true })
+        );
+    }
+
+    // ── fetch_vendor_reference(s) (a gem's platform builds) ────────────
+
+    /// A gem patch's reference read without a download: its archive and
+    /// stub as artifacts to fetch later, and the platform gems its
+    /// registry lists, each with the patch of its patched build.
+    #[tokio::test]
+    async fn vendor_reference_reads_the_artifacts_and_the_gem_builds() {
+        const BUILD: &str = "22222222-2222-4222-8222-222222222222";
+        let server = MockServer::start().await;
+        let gem_url = format!("{}/patch/gem/a.gem", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: {
+                    "status": "granted",
+                    "url": gem_url,
+                    "artifacts": [
+                        { "kind": "tarball", "integrity": { "sha512": "sha512-GEM==" } },
+                        { "kind": "gem-stub-gemspec", "url": "https://x/a.gemspec",
+                          "integrity": { "sha512": "STUB==" } },
+                        { "kind": "gem-stub-gemspec", "url": null,
+                          "integrity": { "sha512": "sha512-NOURL==" } }
+                    ],
+                    "registryOverride": {
+                        "kind": "rubygems-compact-index",
+                        "indexUrl": "https://x/patch-registry/gem/t/u/s/2",
+                        "identifiers": {
+                            "name": "a", "version": "1.0.0",
+                            "gemBuilds": [
+                                { "platform": "arm64-darwin",
+                                  "gemChecksumSha256": "ab".repeat(32), "patchUuid": null },
+                                { "platform": "x86_64-linux-gnu",
+                                  "gemChecksumSha256": "cd".repeat(32), "patchUuid": BUILD }
+                            ]
+                        }
+                    }
+                }}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let outcome = auth_client(server.uri())
+            .fetch_vendor_reference(UUID, false, None, None)
+            .await;
+        let VendorServiceOutcome::Ready(reference) = outcome else {
+            panic!("expected Ready, got {outcome:?}");
+        };
+        // The archive takes the reference's top-level url when it has none
+        // of its own; an artifact with no url is not listed.
+        let archive = reference.archive.expect("the archive");
+        assert_eq!(
+            (archive.url.as_str(), archive.integrity_sri.as_str()),
+            (gem_url.as_str(), "sha512-GEM==")
+        );
+        let secondary: Vec<_> = reference
+            .secondary
+            .iter()
+            .map(|a| (a.kind.as_str(), a.url.as_str(), a.integrity_sri.as_str()))
+            .collect();
+        assert_eq!(
+            secondary,
+            [("gem-stub-gemspec", "https://x/a.gemspec", "sha512-STUB==")]
+        );
+        let builds: Vec<_> = reference
+            .gem_builds
+            .as_deref()
+            .expect("the list")
+            .iter()
+            .map(|b| (b.platform.as_str(), b.patch_uuid.as_deref()))
+            .collect();
+        assert_eq!(
+            builds,
+            [("arm64-darwin", None), ("x86_64-linux-gnu", Some(BUILD))]
+        );
+    }
+
+    /// The references of several patches come from ONE request and are
+    /// answered in the order asked, each by its own status; a uuid the
+    /// response leaves out is a failure of that uuid alone. A request that
+    /// fails is `Err`: nothing is known of any of them. A malformed uuid
+    /// is refused before any request.
+    #[tokio::test]
+    async fn vendor_references_are_asked_for_in_one_request() {
+        const A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        const C: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .and(body_partial_json(json!({ "uuids": [B, A, C] })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": {
+                    A: { "status": "granted", "url": "https://x/a.gem",
+                         "artifacts": [{ "kind": "tarball", "url": "https://x/a.gem",
+                                         "integrity": { "sha512": "sha512-A==" } }] },
+                    B: { "status": "pending_build", "url": null, "artifacts": [] }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = auth_client(server.uri());
+        let uuids = [B.to_string(), A.to_string(), C.to_string()];
+        let outcomes = client
+            .fetch_vendor_references(&uuids, false, None, None)
+            .await
+            .expect("one answer for all three");
+        assert_eq!(outcomes.len(), 3);
+        assert!(matches!(outcomes[0], VendorServiceOutcome::Pending));
+        match &outcomes[1] {
+            VendorServiceOutcome::Ready(reference) => {
+                let archive = reference.archive.as_ref().expect("the archive");
+                assert_eq!(archive.url, "https://x/a.gem");
+                assert!(reference.gem_builds.is_none());
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        match &outcomes[2] {
+            VendorServiceOutcome::Failed(ApiError::Other(msg)) => {
+                assert!(msg.contains(C), "{msg}")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        let refused = client
+            .fetch_vendor_references(&[A.to_string(), "not-a-uuid".into()], false, None, None)
+            .await;
+        assert!(
+            matches!(refused, Err(ApiError::InvalidHash(_))),
+            "{refused:?}"
+        );
+
+        let down = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&down)
+            .await;
+        let down_client = auth_client(down.uri()).with_vendor_retry(VendorRetryPolicy::none());
+        let failed = down_client
+            .fetch_vendor_references(&uuids, false, None, None)
+            .await;
+        assert!(failed.is_err(), "{failed:?}");
+        assert_eq!(
+            down_client.vendor_outage.load(Ordering::Relaxed),
+            1,
+            "the circuit breaker counts the failed request once"
+        );
+    }
+
     // ── fetch_registry_references (hosted-mode scan resolution) ────────
 
     /// `fetch_registry_references` with no UUIDs must return an empty map
@@ -5320,7 +5785,7 @@ mod vendor_package_tests {
     #[tokio::test]
     async fn fetch_registry_references_empty_uuids_makes_no_request() {
         let map = proxy_client("http://127.0.0.1:1".into())
-            .fetch_registry_references(&[])
+            .fetch_registry_references(&[], &GemSnapshotKeys::new())
             .await
             .expect("empty input is a local no-op, never a network call");
         assert!(map.is_empty());
@@ -5349,7 +5814,12 @@ mod vendor_package_tests {
             .and(path("/patch/package"))
             .and(NoAuthorizationHeader)
             .and(BodyLacksFreeOnlyKey)
-            .and(body_partial_json(json!({ "uuids": [UUID] })))
+            // Every reference request asks for the complete list of a
+            // gem's builds: the service answers one without the flag as
+            // a release that knows no such list expects.
+            .and(body_partial_json(
+                json!({ "uuids": [UUID], "gemBuilds": true }),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "results": { UUID: { "status": "granted", "url": null, "artifacts": [] } }
             })))
@@ -5358,7 +5828,7 @@ mod vendor_package_tests {
             .await;
 
         let map = proxy_client(server.uri())
-            .fetch_registry_references(&[UUID.to_string()])
+            .fetch_registry_references(&[UUID.to_string()], &GemSnapshotKeys::new())
             .await
             .expect("proxy package-reference resolution must succeed");
         assert_eq!(map.len(), 1);
@@ -5401,7 +5871,7 @@ mod vendor_package_tests {
             .map(|i| format!("{i:08x}-0000-4000-8000-{i:012x}"))
             .collect();
         let map = proxy_client(server.uri())
-            .fetch_registry_references(&uuids)
+            .fetch_registry_references(&uuids, &GemSnapshotKeys::new())
             .await
             .expect("chunked resolution succeeds");
         assert_eq!(map.len(), uuids.len());
@@ -5545,6 +6015,48 @@ mod vendor_package_tests {
         }
     }
 
+    /// A 401 to an authenticated request is remembered on the client and
+    /// on its clones, whichever kind of request met it: here the package
+    /// reference POST, which the JSON reader never sees. A 403 is about
+    /// one patch and is not remembered, and neither is a 401 of the public
+    /// proxy, which is sent no credential.
+    #[tokio::test]
+    async fn a_refused_credential_is_remembered_whichever_request_met_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/acme/patches/view/{UUID}")))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/patch/view/{UUID}")))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = auth_client(server.uri());
+        let clone = client.clone();
+        let forbidden = client.fetch_patch_summary(UUID).await;
+        assert!(matches!(forbidden, Err(ApiError::Forbidden(_))));
+        assert!(!client.credential_refused(), "a 403 is about one patch");
+        let proxy = proxy_client(server.uri());
+        let unauthorized = proxy.fetch_patch_summary(UUID).await;
+        assert!(matches!(unauthorized, Err(ApiError::Unauthorized(_))));
+        assert!(!proxy.credential_refused(), "the proxy is sent none");
+
+        let outcome = client.fetch_vendor_package(UUID, false, None, None).await;
+        assert!(matches!(
+            outcome,
+            VendorServiceOutcome::Failed(ApiError::Unauthorized(_))
+        ));
+        assert!(client.credential_refused() && clone.credential_refused());
+    }
+
     /// Secondary (non-tarball) artifact edge arms: an entry missing its
     /// sha512 is skipped, one whose URL can't be host-rewritten is skipped
     /// (Err → continue), and the survivor gets its host rewritten at
@@ -5670,6 +6182,49 @@ mod vendor_package_tests {
             assert!(!msg.contains(GRANT) && !msg.contains("u:pw"), "{msg}");
             assert!(msg.contains(&format!("/<redacted>/{UUID}/")), "{msg}");
         }
+    }
+
+    /// A serve URL can answer with a redirect to another host (a patch
+    /// registry may send a client to the upstream registry for a gem it
+    /// has no patched build of). The download follows it, and the request
+    /// to that host carries no `Referer`: the URL it came from holds the
+    /// grant token.
+    #[tokio::test]
+    async fn download_artifact_follows_a_redirect_without_naming_the_grant_url() {
+        const GRANT: &str = "grant-level";
+        let registry = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        let file = format!("/patch-registry/gem/{GRANT}/u/s/4f/gems/a-1.0.0-java.gem");
+        Mock::given(method("GET"))
+            .and(path(file.as_str()))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "Location",
+                format!("{}/gems/a.gem", elsewhere.uri()).as_str(),
+            ))
+            .mount(&registry)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/gems/a.gem"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"upstream".to_vec()))
+            .mount(&elsewhere)
+            .await;
+        let client = auth_client(registry.uri());
+        let bytes = client
+            .download_artifact(&format!("{}{file}", registry.uri()))
+            .await
+            .expect("the redirect is followed");
+        assert_eq!(bytes, b"upstream");
+        let received = elsewhere.received_requests().await.unwrap_or_default();
+        let [request] = received.as_slice() else {
+            panic!("one request to the other host: {received:?}");
+        };
+        assert!(
+            request.headers.get("referer").is_none(),
+            "the other host is told where the request came from: {:?}",
+            request.headers
+        );
+        let sent = format!("{:?} {}", request.headers, request.url);
+        assert!(!sent.contains(GRANT), "the grant token: {sent}");
     }
 
     /// A promised secondary that 404s must ERROR ("artifact not found"),
@@ -6956,6 +7511,217 @@ mod lookup_memory_tests {
 }
 
 #[cfg(test)]
+mod platform_gem_patch_tests {
+    //! A client made for a hosted or a vendored run answers every search
+    //! without the patches of platform gems: asked or remembered, on the
+    //! organisation's route and on the public proxy it falls back to. Any
+    //! other client is answered in full.
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const GEM: &str = "pkg:gem/nokogiri@1.19.3";
+    const LINUX: &str = "pkg:gem/nokogiri@1.19.3?platform=x86_64-linux-gnu";
+    /// A gem whose only patch on offer is one platform gem's.
+    const FFI: &str = "pkg:gem/ffi@1.17.0";
+    const FFI_JAVA: &str = "pkg:gem/ffi@1.17.0?platform=java";
+
+    /// A patch service that answers every search, on the organisation's
+    /// routes and on the public proxy's, with the gem's own patch
+    /// (`source`) beside the patch of its linux gem (`linux`), and the
+    /// batch search with a second gem that only a platform gem's patch
+    /// (`java`) is offered for.
+    async fn service() -> MockServer {
+        let found = |uuid: &str, purl: &str| {
+            json!({
+                "uuid": uuid, "purl": purl, "publishedAt": "2026-01-01T00:00:00Z",
+                "description": "", "license": "MIT", "tier": "free", "vulnerabilities": {},
+            })
+        };
+        let listed = |uuid: &str, purl: &str| {
+            json!({
+                "uuid": uuid, "purl": purl, "tier": "free", "cveIds": [], "ghsaIds": [],
+                "severity": "high", "title": "",
+            })
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "^(/v0/orgs/acme/patches|/patch)/by-(package|cve|ghsa)/.+$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "patches": [found("linux", LINUX), found("source", GEM)],
+                "canAccessPaidPatches": true,
+            })))
+            .mount(&server)
+            .await;
+        for route in ["/v0/orgs/acme/patches/batch", "/patch/batch"] {
+            Mock::given(method("POST"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "packages": [
+                        { "purl": GEM, "patches": [listed("linux", LINUX), listed("source", GEM)] },
+                        { "purl": FFI, "patches": [listed("java", FFI_JAVA)] },
+                    ],
+                    "canAccessPaidPatches": true,
+                })))
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    fn org_client(uri: String) -> ApiClient {
+        ApiClient::new(ApiClientOptions {
+            api_url: uri,
+            api_token: Some("sktsec_token_placeholder_value_api".into()),
+            route: ApiRoute::org("acme"),
+        })
+    }
+
+    /// The uuids of every search of `client`: by package, by CVE, by GHSA,
+    /// and each package of the batch search with its patches' uuids, by
+    /// purl.
+    async fn answers(client: &ApiClient) -> (Vec<Vec<String>>, Vec<(String, Vec<String>)>) {
+        let uuids = |answer: SearchResponse| -> Vec<String> {
+            assert!(answer.can_access_paid_patches);
+            let mut uuids: Vec<String> = answer.patches.into_iter().map(|p| p.uuid).collect();
+            uuids.sort();
+            uuids
+        };
+        let searches = vec![
+            uuids(client.search_patches_by_package(GEM).await.unwrap()),
+            uuids(client.search_patches_by_cve("CVE-2026-0001").await.unwrap()),
+            uuids(
+                client
+                    .search_patches_by_ghsa("GHSA-aaaa-bbbb-cccc")
+                    .await
+                    .unwrap(),
+            ),
+        ];
+        let asked = [GEM.to_string(), FFI.to_string()];
+        let batch = client.search_patches_batch(&asked).await.unwrap();
+        assert!(batch.can_access_paid_patches);
+        let mut packages: Vec<(String, Vec<String>)> = batch
+            .packages
+            .into_iter()
+            .map(|package| {
+                let mut uuids: Vec<String> = package.patches.into_iter().map(|p| p.uuid).collect();
+                uuids.sort();
+                (package.purl, uuids)
+            })
+            .collect();
+        packages.sort();
+        (searches, packages)
+    }
+
+    /// What the patch service answers.
+    fn all() -> (Vec<Vec<String>>, Vec<(String, Vec<String>)>) {
+        let both = vec!["linux".to_string(), "source".to_string()];
+        (
+            vec![both.clone(); 3],
+            vec![
+                (FFI.to_string(), vec!["java".to_string()]),
+                (GEM.to_string(), both),
+            ],
+        )
+    }
+
+    fn own_patch_alone() -> (Vec<Vec<String>>, Vec<(String, Vec<String>)>) {
+        let own = vec!["source".to_string()];
+        (vec![own.clone(); 3], vec![(GEM.to_string(), own)])
+    }
+
+    async fn requests(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap_or_default().len()
+    }
+
+    #[tokio::test]
+    async fn a_client_for_a_hosted_or_a_vendored_run_answers_no_platform_gem_patch() {
+        let server = service().await;
+        let client = org_client(server.uri());
+        assert_eq!(answers(&client).await, all(), "any other run");
+        let narrowed = client.offering_platform_gem_patches(false);
+        assert_eq!(answers(&narrowed).await, own_patch_alone());
+        // The same client asked for a run in agent mode (another
+        // directory of the invocation) answers in full again.
+        assert_eq!(
+            answers(&narrowed.offering_platform_gem_patches(true)).await,
+            all()
+        );
+    }
+
+    /// What a client remembers is what the patch service answered: the
+    /// answer it gives from memory is narrowed as the one it asked for
+    /// was, and a clone that was not made for such a run is answered in
+    /// full from the same memory, whichever of the two asked.
+    #[tokio::test]
+    async fn remembered_answers_are_narrowed_like_asked_ones() {
+        for narrowed_asks in [true, false] {
+            let server = service().await;
+            let full = org_client(server.uri()).remembering_lookups();
+            let narrowed = full.clone().offering_platform_gem_patches(false);
+            let (first, second) = if narrowed_asks {
+                (&narrowed, &full)
+            } else {
+                (&full, &narrowed)
+            };
+            let expected = |client: &ApiClient| {
+                if std::ptr::eq(client, &narrowed) {
+                    own_patch_alone()
+                } else {
+                    all()
+                }
+            };
+            assert_eq!(answers(first).await, expected(first));
+            // By package and the batch are remembered; by CVE and by GHSA
+            // are asked each time.
+            let asked = requests(&server).await;
+            assert_eq!(asked, 4);
+            assert_eq!(answers(first).await, expected(first));
+            assert_eq!(answers(second).await, expected(second));
+            assert_eq!(
+                requests(&server).await,
+                asked + 4,
+                "only the advisory searches were asked again"
+            );
+        }
+    }
+
+    /// The public-proxy client a run falls back to answers as the client
+    /// it was made from does, on the proxy's own routes.
+    #[tokio::test]
+    async fn the_proxy_fallback_answers_as_its_client_does() {
+        let server = service().await;
+        let overrides = ApiClientEnvOverrides {
+            proxy_url: Some(server.uri()),
+            ..ApiClientEnvOverrides::default()
+        };
+        let client = org_client("http://127.0.0.1:1".to_string());
+        let proxy = client.proxy_fallback(&overrides);
+        assert!(proxy.uses_public_proxy());
+        assert_eq!(answers(&proxy).await, all());
+
+        let narrowed = client.offering_platform_gem_patches(false);
+        let proxy = narrowed.proxy_fallback(&overrides);
+        assert!(proxy.uses_public_proxy() && proxy.api_token().is_none());
+        assert_eq!(answers(&proxy).await, own_patch_alone());
+        let asked: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert!(
+            asked.iter().all(|path| path.starts_with("/patch/")),
+            "{asked:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod not_found_tests {
     //! A 404 reads as "not there" only when the patch service says so. A
     //! 404 for an unknown organization or route, or one a different host
@@ -7094,7 +7860,7 @@ mod not_found_tests {
                 .map(|_| ())
                 .expect_err("view"),
             client
-                .fetch_registry_references(&[UUID.to_string()])
+                .fetch_registry_references(&[UUID.to_string()], &GemSnapshotKeys::new())
                 .await
                 .map(|_| ())
                 .expect_err("package references"),
@@ -7189,7 +7955,7 @@ mod not_found_tests {
         }
         assert!(client.fetch_patch(UUID).await.expect("view").is_none());
         assert!(client
-            .fetch_registry_references(&[UUID.to_string()])
+            .fetch_registry_references(&[UUID.to_string()], &GemSnapshotKeys::new())
             .await
             .expect("package references")
             .is_empty());

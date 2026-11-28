@@ -8,15 +8,21 @@
     "artifactUrl": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/gems/nokogiri-1.18.10.gem",
     "registryOverride": {
       "kind": "rubygems-compact-index",
-      "indexUrl": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/",
+      "indexUrl": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/s/4",
       "identifiers": {
         "name": "nokogiri",
         "version": "1.18.10",
         "gemChecksumSha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-        "gemPlatforms": [
+        "gemBuilds": [
           {
             "platform": "arm64-darwin",
-            "gemChecksumSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            "gemChecksumSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "patchUuid": null
+          },
+          {
+            "platform": "x86_64-linux-gnu",
+            "gemChecksumSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "patchUuid": "77777777-7777-4777-8777-00000000000b"
           }
         ]
       }

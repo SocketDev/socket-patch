@@ -2816,7 +2816,9 @@ fn gem_hosted_ref_is_verified_under_an_out_of_tree_config_bundle_path() {
 /// x86_64-linux/` dir with no gemspec. Nothing loads that dir, so `vex`
 /// attests the gem, in the project's bundle path and in an out-of-tree
 /// one alike. With its gemspec back the platform build is installed and
-/// unpatched, and `vex` refuses again (#1092).
+/// unpatched (#1092), and under this lock, whose `PLATFORMS` names `ruby`
+/// alone, Bundler loads it in place of the ruby gem: `vex` exits 0 and
+/// says `affected` of the gem, which is its state.
 #[test]
 fn gem_hosted_ref_is_attested_beside_a_leftover_platform_dir_with_no_gemspec() {
     const U: &str = "77777777-7777-7777-7777-777777777777";
@@ -2869,13 +2871,23 @@ fn gem_hosted_ref_is_attested_beside_a_leftover_platform_dir_with_no_gemspec() {
         let (code, env) = vex_json(&cwd, &args);
         assert_eq!(
             code,
-            Some(1),
+            Some(0),
             "an installed unpatched platform build (out of tree: {out_of_tree}): {env}"
         );
-        let reason = skipped_reason(&env, purl);
-        assert!(
-            reason == "not_applied" || reason == "hash_mismatch",
-            "the platform build was read and failed verification, got {reason}: {env}"
+        assert_eq!(
+            skipped_reason(&env, purl),
+            "vex_gem_install_unpatched",
+            "the platform build was read, and the gem is stated as it is: {env}"
         );
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cwd.join("out.vex.json")).unwrap_or_default())
+                .unwrap_or_default();
+        let statuses: Vec<&str> = doc["statements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|statement| statement["status"].as_str())
+            .collect();
+        assert_eq!(statuses, ["affected"], "{doc}");
     }
 }

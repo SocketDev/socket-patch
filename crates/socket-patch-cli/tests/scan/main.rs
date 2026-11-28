@@ -1,6 +1,7 @@
 //! `scan`: batching, ecosystem scope, ordering, paths, sync, hosted refusals,
 //! the scan and hosted `--json` failure paths and their human render checks,
-//! the hosted dry run over a vendored project,
+//! the hosted dry run over a vendored project, the closing lines of a
+//! hosted run that leaves a gem build on upstream's gem,
 //! `--prune` over a corrupt vendor ledger, scan on a real terminal, and
 //! the vendor flow (previews, lock failures, corrupt legacy manifests).
 //!
@@ -22,6 +23,7 @@ mod vlt_vendored;
 mod hosted_dryrun_vendored;
 mod hosted_failure_paths;
 mod hosted_fixture;
+mod hosted_gem_closing_total;
 mod hosted_grant_validation;
 mod hosted_management_refusals;
 mod hosted_render;

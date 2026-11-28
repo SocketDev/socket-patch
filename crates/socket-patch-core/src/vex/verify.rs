@@ -8,7 +8,8 @@
 //! on is "never emit `affected` or `under_investigation` — just omit".
 //! A failed check shows no more than that this copy is not the patched
 //! one. `affected` is for a package the caller knows the build takes
-//! unpatched (`vex::build::build_document_with`).
+//! unpatched, or cannot show it takes patched
+//! (`vex::build::build_document_with`).
 //!
 //! The CLI is responsible for resolving PURL → on-disk package path
 //! (it already does this for `apply` / `scan` via the ecosystem

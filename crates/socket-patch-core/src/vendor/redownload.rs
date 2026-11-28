@@ -250,11 +250,13 @@ pub async fn restore(
                 .await?;
             }
             "gem" => {
-                let (name, _) =
+                let (name, version) =
                     parse_gem_purl(&entry.base_purl).ok_or("invalid gem coordinates")?;
-                // A gem vendored as platform gems is restored from the
-                // prebuild of each platform the ledger names.
-                let copied = match entry.gem_platforms.as_slice() {
+                // A gem vendored as platform gems is restored tree by tree,
+                // each from the patch the gem's fix names for its platform
+                // today, which must be the one the ledger records, and
+                // against the digests recorded with it.
+                let copied = match entry.gem_builds.as_slice() {
                     [] => {
                         super::gem::gem_service_copy(
                             Some(service),
@@ -267,18 +269,24 @@ pub async fn restore(
                         )
                         .await
                     }
-                    platforms => {
+                    builds => {
+                        let trees = super::gem::PlatformTrees {
+                            gem: &format!("{name}@{version}"),
+                            from: super::gem::BuildsFrom::Recorded(builds),
+                            standing: super::gem::Standing::Wired,
+                        };
                         super::gem::gem_platform_service_copy(
                             Some(service),
                             record,
                             &name,
-                            platforms,
+                            &trees,
                             &stage,
                             uuid_dir,
                             true,
                             &mut warnings,
                         )
                         .await
+                        .map(|_| ())
                     }
                 };
                 copied.map_err(|outcome| detail(*outcome))?;
@@ -422,9 +430,9 @@ pub async fn restore(
     }
     // Likewise a gem vendored as platform gems: only the artifact dir was
     // swapped in from the stage, and without the uuid dir's own metadata a
-    // `*.so` / `*.bundle` rule drops the prebuilt binaries from the commit.
+    // `*.so` / `*.bundle` rule drops the compiled binaries from the commit.
     let archive = super::gem::bazel::is_archive(entry);
-    if entry.ecosystem == "gem" && (archive || !entry.gem_platforms.is_empty()) {
+    if entry.ecosystem == "gem" && (archive || !entry.gem_tree_platforms().is_empty()) {
         if let Some(rel) = super::path::vendor_uuid_dir_rel("gem", &entry.uuid) {
             super::gem::restore_uuid_metadata(&root.join(rel))
                 .await

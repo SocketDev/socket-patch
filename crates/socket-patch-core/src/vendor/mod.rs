@@ -135,8 +135,8 @@ pub use pnpm_lock::rush::wiring_files as rush_wiring_files;
 pub use pypi_requirements::requirements_include_names;
 pub use state::{
     carry_forward_wiring, file_gitignored, ledger_gitignore_refusal, load_state, lookup_entry,
-    lookup_entry_kv, purl_keys_cover, save_state, save_state_shared, VendorEntry, VendorState,
-    LEDGER_GITIGNORED, VENDOR_STATE_REL,
+    lookup_entry_kv, purl_keys_cover, save_state, save_state_shared, GemBuildEntry, VendorEntry,
+    VendorState, LEDGER_GITIGNORED, VENDOR_STATE_REL,
 };
 pub use verify::{
     artifact_is_file_shaped, check_vendored_artifact, compute_dir_inventory,
@@ -728,13 +728,16 @@ pub const VENDOR_PREBUILT_UNAVAILABLE: &str = "vendor_prebuilt_unavailable";
 /// no older vendored patch to keep.
 pub const VENDOR_PREBUILT_REQUIRED: &str = "vendor_prebuilt_required";
 
-/// gem: `Gemfile.lock` pins the gem as precompiled platform gems and the
-/// patch service lists no prebuilt platform gem for at least one of the
-/// locked platforms. The service lists a prebuild only once it is built, so
-/// "not built yet" and "never built" look the same from here: the package
-/// is left as it is and the run does not fail because of it, with or
-/// without an older vendored patch to keep (see [`VENDOR_PREBUILT_PENDING`]
-/// for the kept one). A re-run vendors it once every platform has one.
+/// gem: `Gemfile.lock` pins the gem as precompiled platform gems and at
+/// least one of the locked platforms has no patched build: the gem
+/// patch's registry serves upstream's own gem for it or does not list it,
+/// or the patch it names for that build is not served (still being built,
+/// or not granted). A patched build is named and served only once it is
+/// published, so "not yet" and "never" look the same from here: the
+/// package is left as it is and the
+/// run does not fail because of it, whether or not an earlier vendored
+/// copy stays in force (the detail says which). A re-run vendors it once
+/// every locked platform has one.
 pub const VENDOR_PREBUILT_PLATFORM_PENDING: &str = "vendor_prebuilt_platform_pending";
 
 /// Whether `code` marks a patch the service does not serve (yet):

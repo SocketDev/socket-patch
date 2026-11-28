@@ -18,7 +18,7 @@ pub struct VulnerabilityInfo {
 /// names and vendored pins then compare them to a computed (lowercase)
 /// git-sha256 with plain `==`, and no comparison site needs its own case
 /// rule.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PatchFileInfo {
     #[serde(deserialize_with = "deserialize_hash")]

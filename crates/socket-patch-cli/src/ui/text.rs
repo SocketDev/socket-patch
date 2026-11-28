@@ -1,6 +1,6 @@
 //! Pure text helpers for human output: counted nouns, one-line
-//! truncation, sentence casing and the "Next steps:" block. No I/O, no
-//! terminal state.
+//! truncation, word wrap, sentence casing and the "Next steps:" block. No
+//! I/O, no terminal state.
 
 /// `plural(1, "package", "packages")` → `"1 package"`,
 /// `plural(2, "package", "packages")` → `"2 packages"` (and `0 packages`).
@@ -9,6 +9,117 @@ pub fn plural(n: usize, one: &str, many: &str) -> String {
 }
 
 const ELLIPSIS: &str = "...";
+
+/// Split `text` into wrap tokens at whitespace, except that a
+/// backtick-delimited code span (`` `pnpm install --trust-lockfile` ``)
+/// stays one token so a command the user copies is never broken across
+/// lines. An unclosed span falls back to plain whitespace splitting.
+pub(crate) fn wrap_tokens(text: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut span: Vec<&str> = Vec::new();
+    for word in text.split_whitespace() {
+        span.push(word);
+        let open = span.iter().map(|w| w.matches('`').count()).sum::<usize>() % 2 == 1;
+        if !open {
+            tokens.push(span.join(" "));
+            span.clear();
+        }
+    }
+    tokens.extend(span.into_iter().map(str::to_string));
+    tokens
+}
+
+/// Greedy word wrap to `width` columns (characters, not bytes). The first
+/// line starts with `first_prefix`, later lines with `indent`. A word
+/// longer than the line (a URL) gets a line of its own, never split; a
+/// backtick code span counts as one word (see [`wrap_tokens`]).
+pub(crate) fn wrap_words(
+    text: &str,
+    width: usize,
+    first_prefix: &str,
+    indent: &str,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = first_prefix.to_string();
+    let mut line_len = first_prefix.chars().count();
+    let mut empty = true;
+    for word in wrap_tokens(text) {
+        let word = word.as_str();
+        let wlen = word.chars().count();
+        if !empty && line_len + 1 + wlen > width {
+            lines.push(std::mem::replace(&mut line, indent.to_string()));
+            line_len = indent.chars().count();
+            empty = true;
+        }
+        if !empty {
+            line.push(' ');
+            line_len += 1;
+        }
+        line.push_str(word);
+        line_len += wlen;
+        empty = false;
+    }
+    lines.push(line);
+    lines
+}
+
+/// `line` as it prints for a person. With `width` (its stream is a
+/// terminal with a person at it) a line that does not fit breaks after a
+/// clause (`; `) under a two-space hanging indent, so no clause is cut in
+/// two unless it is itself wider than the terminal: such a clause wraps at
+/// a word from where the row stands, and the clause after it goes on from
+/// there. Without `width` the line is as it is, so a pipe or a log keeps
+/// one line.
+pub(crate) fn wrap_line(line: &str, width: Option<usize>) -> String {
+    const INDENT: &str = "  ";
+    let Some(width) = width else {
+        return line.to_string();
+    };
+    let len = |text: &str| text.chars().count();
+    // What a row holds beside its indent: every row but the first has one.
+    let later = width.saturating_sub(INDENT.len());
+    let room = |rows: &[String]| if rows.len() > 1 { later } else { width };
+    // Put `text` on the row being filled, or on a new one when it is full.
+    fn place(rows: &mut Vec<String>, text: &str, room: usize) {
+        let row = rows.last_mut().expect("one row at least");
+        if row.is_empty() {
+            row.push_str(text);
+        } else if row.chars().count() + 1 + text.chars().count() <= room {
+            row.push(' ');
+            row.push_str(text);
+        } else {
+            rows.push(text.to_string());
+        }
+    }
+    let mut rows: Vec<String> = vec![String::new()];
+    for clause in line.split_inclusive("; ") {
+        let clause = clause.trim_end();
+        let row = rows.last().expect("one row at least");
+        let here = if row.is_empty() {
+            len(clause) <= room(&rows)
+        } else {
+            len(row) + 1 + len(clause) <= room(&rows)
+        };
+        if here || len(clause) <= later {
+            let room = room(&rows);
+            place(&mut rows, clause, room);
+            continue;
+        }
+        // Wider than a row: at a word, a code span kept whole.
+        for word in wrap_tokens(clause) {
+            let room = room(&rows);
+            place(&mut rows, &word, room);
+        }
+    }
+    rows.iter()
+        .enumerate()
+        .map(|(at, row)| match at {
+            0 => row.clone(),
+            _ => format!("{INDENT}{row}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// `text` as it may be printed: without its control characters. For
 /// text that came from a service or a project's files, which is shown
@@ -347,6 +458,105 @@ pub(crate) fn shell_word(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A line breaks after a clause, a clause is cut only when it is
+    /// wider than the terminal, and the clause after one that wrapped goes
+    /// on from where it left the row. A pipe keeps one line.
+    #[test]
+    fn wrap_line_breaks_after_clauses_and_goes_on_after_one_that_wrapped() {
+        let kept =
+            "nokogiri 1.19.3: patched for aarch64-linux-gnu, x86_64-linux-gnu; upstream gem \
+                    kept for arm64-darwin (no patched build yet)";
+        assert_eq!(wrap_line(kept, None), kept);
+        assert_eq!(wrap_line(kept, Some(200)), kept);
+        assert_eq!(
+            wrap_line(kept, Some(80)),
+            "nokogiri 1.19.3: patched for aarch64-linux-gnu, x86_64-linux-gnu;\n  upstream gem kept \
+             for arm64-darwin (no patched build yet)"
+        );
+        let waiting = "nokogiri 1.19.3: no patched build yet for aarch64-linux-gnu, arm64-darwin, \
+                       x86_64-linux-gnu; left on its upstream registry";
+        assert_eq!(
+            wrap_line(waiting, Some(80)),
+            "nokogiri 1.19.3: no patched build yet for aarch64-linux-gnu, arm64-darwin,\n  \
+             x86_64-linux-gnu; left on its upstream registry"
+        );
+        let vendored = "nokogiri@1.19.3 is not vendored: no patched build yet for arm64-darwin \
+                        (aarch64-linux-gnu and x86_64-linux-gnu have one). Vendored mode needs \
+                        every locked platform; `scan --mode hosted` can patch the others now.";
+        assert_eq!(
+            wrap_line(vendored, Some(80)),
+            "nokogiri@1.19.3 is not vendored: no patched build yet for arm64-darwin\n  \
+             (aarch64-linux-gnu and x86_64-linux-gnu have one). Vendored mode needs every\n  \
+             locked platform; `scan --mode hosted` can patch the others now."
+        );
+        for width in [80, 100, 120] {
+            for line in [kept, waiting, vendored] {
+                let wrapped = wrap_line(line, Some(width));
+                assert!(
+                    wrapped.lines().all(|row| row.chars().count() <= width),
+                    "{width}: {wrapped}"
+                );
+                assert_eq!(wrapped.replace("\n  ", " "), line, "nothing is lost");
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_words_respects_width_prefix_and_long_words() {
+        assert_eq!(
+            wrap_words("alpha beta gamma delta", 16, "W: ", "  "),
+            vec!["W: alpha beta", "  gamma delta"]
+        );
+        // A word wider than the line sits alone, unsplit.
+        let url = "https://patch.socket.dev/very/long/path/that/does/not/fit";
+        assert_eq!(
+            wrap_words(&format!("see {url} now"), 20, "", "  "),
+            vec!["see".to_string(), format!("  {url}"), "  now".to_string()]
+        );
+        assert_eq!(wrap_words("", 10, "W: ", "  "), vec!["W: "]);
+        // Counts characters, not bytes.
+        let lines = wrap_words("ééé ééé ééé", 8, "", "");
+        assert_eq!(lines, vec!["ééé ééé", "ééé"]);
+        for line in wrap_words(&"word ".repeat(50), 30, "Warning: ", "  ") {
+            assert!(line.chars().count() <= 30, "{line}");
+        }
+    }
+
+    #[test]
+    fn wrap_words_keeps_code_spans_whole() {
+        // The span crosses the wrap column: it moves to the next line whole.
+        assert_eq!(
+            wrap_words(
+                "never rebuild it (`pnpm clean --lockfile`), ever",
+                30,
+                "",
+                "  "
+            ),
+            vec!["never rebuild it", "  (`pnpm clean --lockfile`),", "  ever"]
+        );
+        // A span wider than the line gets a line of its own, unsplit.
+        assert_eq!(
+            wrap_words(
+                "use `pnpm install --frozen-lockfile --store-dir <dir>` now",
+                20,
+                "",
+                "  "
+            ),
+            vec![
+                "use",
+                "  `pnpm install --frozen-lockfile --store-dir <dir>`",
+                "  now"
+            ]
+        );
+        // Two spans in one word, and a word with a closed span, split normally.
+        assert_eq!(
+            wrap_tokens("a `b` c `d e`f g"),
+            vec!["a", "`b`", "c", "`d e`f", "g"]
+        );
+        // An unclosed span never swallows the rest of the text.
+        assert_eq!(wrap_tokens("a `b c d"), vec!["a", "`b", "c", "d"]);
+    }
 
     #[test]
     fn packages_of_one_ecosystem_are_named_without_it() {

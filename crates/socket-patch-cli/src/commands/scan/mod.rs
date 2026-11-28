@@ -9,8 +9,7 @@
 use clap::Args;
 use futures_util::StreamExt;
 use socket_patch_core::api::client::{
-    build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
-    is_fallback_candidate, ApiClient, ApiError,
+    get_api_client_with_overrides, hold_back_debug, is_fallback_candidate, ApiClient, ApiError,
 };
 use socket_patch_core::api::types::{BatchPackagePatches, BatchSearchResponse, PatchSearchResult};
 use socket_patch_core::crawlers::ruby_crawler::{
@@ -79,7 +78,7 @@ use self::hosted::run_redirect;
 use self::vendor_flow::{
     boxed_vendor_interactive_path, boxed_vendor_json_path, partition_skipped_selected,
 };
-pub(crate) use self::vendor_flow::{boxed_vendor_step, preview_vendor, VendorStep};
+pub(crate) use self::vendor_flow::{boxed_vendor_step, classify_vendor, VendorStep};
 
 /// Packages per batch request on the authenticated API when `--batch-size`
 /// is not given: the server's own per-request maximum
@@ -786,6 +785,25 @@ fn print_rollout_human(stage: &rollout::Stage, dry_run: bool, silent: bool, own_
             println!("  {step}");
         }
     }
+}
+
+/// The invocation's API client as a scan in `mode` asks it.
+///
+/// A hosted or a vendored run patches a gem through the patch of the gem
+/// itself, whose reference names the patched build of every platform. The
+/// patch of a platform gem, which the patch service returns beside it, is
+/// no offer there, and the run's client is where that is said, once: it
+/// answers every search without those patches
+/// ([`ApiClient::offering_platform_gem_patches`]), so nothing after it
+/// counts, selects, reports or asks about one. Agent mode's client answers
+/// in full: there each is what an installed copy of that platform gem
+/// takes.
+///
+/// Said for each project directory's run, since the directories of one
+/// invocation share a client and can differ in mode.
+fn client_for(mode: Option<ScanMode>, client: ApiClient) -> ApiClient {
+    let offered = !matches!(mode, Some(ScanMode::Hosted | ScanMode::Vendored));
+    client.offering_platform_gem_patches(offered)
 }
 
 /// The tier filter, then the policy's per-package selection (see
@@ -2429,9 +2447,10 @@ async fn scan_project(
     let overrides = args.common.api_client_overrides();
     // One client per invocation: the project directories of a run share
     // its connection (and its org lookup).
-    let (mut api_client, mut use_public_proxy) = report
+    let (api_client, mut use_public_proxy) = report
         .client(get_api_client_with_overrides(overrides.clone()))
         .await;
+    let mut api_client = client_for(args.mode, api_client);
     // Sized for the endpoint the run starts on. A mid-run downgrade to the
     // proxy keeps these chunk boundaries: every chunk is within the proxy's
     // body cap by construction (`BATCH_BODY_BYTE_CAP`).
@@ -3381,7 +3400,8 @@ async fn scan_project(
                      falling back to public patch API proxy (free patches only)."
                 ));
             }
-            api_client = build_proxy_fallback_client(&overrides);
+            // Made from the run's client: it answers a search alike.
+            api_client = api_client.proxy_fallback(&overrides);
             use_public_proxy = true;
             fallback_to_proxy = true;
             report.fell_back_to(&api_client);
@@ -4161,7 +4181,7 @@ async fn scan_project(
     let selected = if report_only {
         selected
     } else if vendor {
-        let preview = preview_vendor(&args.common, &selected).await;
+        let preview = classify_vendor(&args.common, &selected).await;
         let refused = preview.refused_purls();
         vendor_preview = Some(preview);
         stage.plan(&rows, |r| !refused.contains(&r.writer.purl));
@@ -4374,6 +4394,11 @@ async fn scan_project(
                 .take()
                 .expect("the vendored planning pass computed the preview");
             preview.retain_selected(&selected);
+            // The future embeds the vendor backend's reading of a gem's
+            // lock and its requests to the patch service, for a vendored
+            // dry run alone: awaited in line it lay in the poll frame of
+            // a scan in every mode. `boxed` leaves this frame one pointer.
+            boxed(|| preview.ask_platform_gems(&args.common, &api_client, use_public_proxy)).await;
             Some(preview)
         } else {
             None

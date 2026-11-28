@@ -22,7 +22,7 @@ below is about what a package manager installs and builds.
 | PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ in place | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; Pipenv 2023.7.9+ exports the vendored wheel without a hash, so `pipenv requirements --hash` output fails pip's hash-checking mode — `pypi_pipenv_hash_export_unsupported`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). Declined where a rules_python hub of a Bazel workspace reads the file, see [Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode) | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
 | pixi (`pypi`) — the Python packages of a pixi project, from conda channels or PyPI | ✅ in place, in every environment under `.pixi/envs`: PyPI wheels and pure-Python conda packages (compiled conda packages are not supported yet and are skipped) — see [PyPI: pixi projects](#pypi-pixi-projects) | ❌ refused (`pypi_no_requirements` / `pypi_pyproject_only`, which name agent mode) | ❌ nothing rewritten (`redirect_pypi_pixi_project` names agent mode) |
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum); needs cargo 1.68+ (sparse registries) — a project whose `rust-version` or `rust-toolchain[.toml]` declares an older cargo is refused (`redirect_cargo_old_cargo`), use `--mode vendored`; direct dependencies only — a crate another dependency also pulls in is refused, use `--mode vendored`; a crate the user overrides with `[patch]` (path, git or another registry) is refused too, the override is left alone; a `cargo vendor` or `cargo local-registry` project (crates.io replaced by an on-disk source in the project's, a parent directory's or `$CARGO_HOME`'s `.cargo/config*`) is refused, use agent mode; with no `Cargo.lock` the graph is unknown, so only a project whose sole dependency is the patched crate is redirected; in a Bazel workspace a crate is not pinned while a rules_rust hub reads the project's Cargo files without its cargo config (`redirect_cargo_bazel_config_unread`), see [Bazel workspaces: Cargo](#bazel-workspaces-cargo) |
-| RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (a CRLF `Gemfile.lock`, as a `core.autocrlf` checkout leaves it, is edited and reverted in its own line ending, and a lock mixing CRLF and LF fails closed; a gem locked as precompiled platform gems is vendored from prebuilt patched platform gems, see [Ruby gems: native extensions](#ruby-gems-native-extensions); `Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write); declined where a rules_ruby hub of a Bazel workspace reads the pair, see [Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode) | ✅ a `source:` option on the gem's own declaration, the lock converged to match (see [Ruby gems: hosted mode](#ruby-gems-hosted-mode)) — edits `gems.rb` + `gems.locked` or `Gemfile` + `Gemfile.lock`, whichever the project holds (a `Gemfile` + `gems.rb` twin is refused with `redirect_gem_twin_manifest_ambiguous`: bundler 1.x loads the `Gemfile`, bundler ≥ 2 loads `gems.rb`, and nothing in the project says which bundler installs it; bundler 4's `BUNDLE_LOCKFILE` (environment, app config or global config) naming any other lock is refused with `redirect_gem_bundle_lockfile_unsupported`, as is vendoring with `gemfile_not_loaded`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from `.bundle/config` (which outranks the environment, as in bundler), the environment, or the global `~/.bundle/config` / `$BUNDLE_USER_CONFIG` (lowest, as in bundler) is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); a Bundler all-source, exact-source or hostname mirror in app config or the scan environment can capture the patch registry, so the redirect is refused with `redirect_gem_mirror_overrides_source` without printing mirror URLs (scope mirrors to `mirror.https://rubygems.org`; user-global config and mirrors set only in a later install environment are not inspected); the `CHECKSUMS` pin needs bundler ≥ 2.6 (an older lock is still pinned by source and installs frozen; the run says once, with `redirect_gem_no_checksums_section`, that it cannot record the checksums); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is replaced with the verified patched gem when it is the project's own, else flagged `redirect_gem_stale_install` with the remedy (see "Ruby gems: gems already installed" below and CLI_CONTRACT.md's "Gem stale-install guard"). In a Bazel workspace whose rules_ruby call holds the gem to another sha256 in `gem_checksums`, or has a `gem_checksums` that is not written out in the call, nothing is written for it (`redirect_bazel_gem_checksums_pinned`); see [Bazel workspaces: RubyGems](#bazel-workspaces-rubygems) |
+| RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (a CRLF `Gemfile.lock`, as a `core.autocrlf` checkout leaves it, is edited and reverted in its own line ending, and a lock mixing CRLF and LF fails closed; a gem locked as precompiled platform gems is vendored from the patched platform gems, see [Ruby gems: native extensions](#ruby-gems-native-extensions); `Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write); declined where a rules_ruby hub of a Bazel workspace reads the pair, see [Bazel workspaces: PyPI and RubyGems vendored mode](#bazel-workspaces-pypi-and-rubygems-vendored-mode) | ✅ a `source:` option on the gem's own declaration, the lock converged to match (see [Ruby gems: hosted mode](#ruby-gems-hosted-mode)) — edits `gems.rb` + `gems.locked` or `Gemfile` + `Gemfile.lock`, whichever the project holds (a `Gemfile` + `gems.rb` twin is refused with `redirect_gem_twin_manifest_ambiguous`: bundler 1.x loads the `Gemfile`, bundler ≥ 2 loads `gems.rb`, and nothing in the project says which bundler installs it; bundler 4's `BUNDLE_LOCKFILE` (environment, app config or global config) naming any other lock is refused with `redirect_gem_bundle_lockfile_unsupported`, as is vendoring with `gemfile_not_loaded`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from `.bundle/config` (which outranks the environment, as in bundler), the environment, or the global `~/.bundle/config` / `$BUNDLE_USER_CONFIG` (lowest, as in bundler) is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); a Bundler all-source, exact-source or hostname mirror in app config or the scan environment can capture the patch registry, so the redirect is refused with `redirect_gem_mirror_overrides_source` without printing mirror URLs (scope mirrors to `mirror.https://rubygems.org`; user-global config and mirrors set only in a later install environment are not inspected); the `CHECKSUMS` pin needs bundler ≥ 2.6 (an older lock is still pinned by source and installs frozen; the run says once, with `redirect_gem_no_checksums_section`, that it cannot record the checksums); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is replaced with the verified patched gem when it is the project's own, else flagged `redirect_gem_stale_install` with the remedy (see "Ruby gems: gems already installed" below and CLI_CONTRACT.md's "Gem stale-install guard"). In a Bazel workspace whose rules_ruby call holds the gem to another sha256 in `gem_checksums`, or has a `gem_checksums` that is not written out in the call, nothing is written for it (`redirect_bazel_gem_checksums_pinned`); see [Bazel workspaces: RubyGems](#bazel-workspaces-rubygems) |
 | Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [Go notes](#go-directory-replaces-and-gosum). Paid hosted patches are unsupported; `redirect_golang_unsupported` names the vendored remedy |
 | Maven (`maven`) — Maven and Gradle | ✅ in place in every copy the build consumes: each `~/.m2` copy it reads and each Gradle `files-2.1` copy; `~/.m2` `.sha1`/`.md5` sidecars are rewritten, Gradle copies get advisories; jar-member records swap in the patch service's whole jar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) | ✅ suffixed Maven repository (`<version>-socket.<hex8>` pin + `.mvn/maven.config` + fallback file repository) for every pom root, single-module or reactor, or Gradle 6.8+ same-GAV repository with settings wiring and SHA-256 checks (a root with both `pom.xml` and a Gradle build wires both); see [JVM vendoring](design/maven-vendoring.md) and [Gradle](#gradle) | ✅ fail-closed by a Socket-only `<version>-socket.<hex8>` suffix: pom projects get a pinned `<version>` (`${property}` versions are refused); Gradle 6.8+ builds get an owned settings script, lock-entry rewrites and a resolution tripwire — see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) |
 | sbt / Mill / scala-cli (`maven`) | ✅ Coursier caches (sbt 1.3+, sbt 2, Mill, scala-cli) and Ivy caches (sbt 0.13–1.2, `useCoursier := false`) patched in place, Coursier checksum sidecars resynced — see [Scala build tools](#scala-build-tools-sbt-mill-scala-cli) | ✅ sbt 0.13.18+: generated `socket-patch-vendor.sbt` over the committed suffixed `.socket/vendor/maven2` tree; scala-cli directory builds: owned `socket-patch.scala` + same-GAV `.socket/vendor/coursier` tree (Linux / macOS); Mill: not wired (agent or hosted guidance) | ✅ sbt 0.13.18+: one generated `socket-patch.sbt`, gated on sbt's own `sbt update` records; Mill / scala-cli: paste-able snippets only (`redirect_mill_manual_snippet`, `redirect_scala_cli_manual_snippet`) |
@@ -4892,7 +4892,7 @@ wire is skipped, neither file changes for it, and the warning says why and what 
 | `redirect_gem_declaration_not_visible` | the lock lists it as a direct dependency, but it is declared where the scan cannot edit: an `eval_gemfile`d file, a loop, a gemspec. Declare it with a literal `gem "<name>"` line in the Gemfile, in place of any other `gem` call that declares it (a gemspec's development dependency stays), or patch it with `--mode agent`. Vendored mode refuses it for the same reason. |
 | `redirect_gem_dependency_not_locked` | the Gemfile declares it and the lock's `DEPENDENCIES` does not list it. Run `bundle lock` and re-run. |
 | `redirect_gem_lock_unconvergeable` | the lock cannot be brought in line with the Gemfile: it has no `BUNDLED WITH` section to say which layout its Bundler accepts, or a Bundler < 2.2 lock lists its sources in an order the Gemfile's `source` lines do not explain. Run `bundle lock` with your current Bundler and re-run. Also a Gemfile with more than one top-level `source` line: Bundler 2.2 to 2.7 lock all its gems in one `GEM` section that names every source, which hosted mode does not rewrite, and `bundle lock` writes the same lock again. Keep the source that serves the gem as the one top-level `source` and move each other one into a `source "<url>" do … end` block around the gems that come from it (Bundler's own deprecation warning asks for the same), then run `bundle lock` and re-run; or use `--mode agent`. A Bundler 2.2 release before 2.2.25 keeps the one section even then, so run that `bundle lock` with a later Bundler; the warning says so when the lock was written by one. |
-| `redirect_gem_platform_unsupported` | the lock holds a platform-specific build of the gem (`nokogiri (1.18.10-x86_64-linux-gnu)`) that the patch has no patched build for. The warning names the builds the lock holds, the ones that are missing, and what the patch registry serves. See "Precompiled platform gems" below. |
+| `redirect_gem_platform_unsupported` | the lock holds platform-specific builds of the gem (`nokogiri (1.18.10-x86_64-linux-gnu)`) and the patch service names no platform gem of the version right now (also its answer, for the length of a rebuild, to a project that is not on the patch yet), or the lock is the merged layout of a Bundler older than 2.2. The warning names the builds the lock holds and which of the two it is. See "Precompiled platform gems" below. |
 
 `--mode agent` can still patch a gem hosted mode skips. `--mode vendored` can too, unless it
 refuses the gem itself (see "Ruby gems: gems vendored mode refuses").
@@ -4908,20 +4908,153 @@ gem, and the lock then has one entry per platform the project supports, usually 
       racc (~> 1.4)
 ```
 
-For such a gem the patch registry serves a patched platform gem (a "prebuild") per platform: the
-upstream platform gem with the patch's files replaced, under the same file name. When the patch
-has a prebuild for every platform the lock names, the scan wires the gem like any other. The
-Gemfile edit is the same, every platform entry moves to the patch registry's `GEM` section with
-its dependency lines (and a plain `nokogiri (1.18.10)` entry beside them moves too),
-`DEPENDENCIES` gains the `!`, and each `CHECKSUMS` entry takes the sha256 of its own prebuild.
-`bundle install` then fetches the one patched platform gem of the machine it runs on and
-compiles nothing, in frozen and deployment mode too.
+For such a gem the patch registry lists every platform gem of the version: a patched platform
+gem where one is built (the upstream platform gem with the patch's files replaced, under the same
+file name), and upstream's own gem for a platform that has none yet, which the registry relays
+unchanged. So the scan moves the gem as soon as one platform the lock names has a patched build.
+The Gemfile edit is the same as for any gem, every platform entry moves to the patch registry's
+`GEM` section with its dependency lines (and a plain `nokogiri (1.18.10)` entry beside them moves
+too), `DEPENDENCIES` gains the `!`, and each `CHECKSUMS` entry takes the sha256 the registry
+serves for that build: the patched gem's where there is one, and the upstream gem's, which the
+entry already had, where there is none. `bundle install` then fetches the gem of the machine it
+runs on and compiles nothing, in frozen and deployment mode too. A machine of a patched platform
+installs the patched gem; any other installs what it installed before.
 
-When the patch has no prebuild for one of the locked platforms, the gem is skipped with
-`redirect_gem_platform_unsupported` and neither file changes: a machine of that platform would
-otherwise be sent to a registry that has no gem for it. Remove the platform from the lock if the
-project does not need it (`bundle lock --remove-platform <platform>`) and re-run, or wait for the
-prebuild.
+The run says which is which in one line, and warns about nothing:
+
+```text
+nokogiri 1.18.10: patched for x86_64-linux-gnu; upstream gem kept for arm64-darwin (no patched build yet)
+```
+
+In `--json`, each patched build is one `applied` event under its own patch
+(`pkg:gem/nokogiri@1.18.10?platform=x86_64-linux-gnu`, with the gem's patch in `details.gemFix`),
+and a build that keeps upstream's gem is an event with `errorCode: "gem_upstream_build_kept"`
+that `summary` does not count. Totals and the rollout budget count the gem as one package, and the
+scan's closing lines name what is still waiting: `Not patched yet: nokogiri 1.18.10 for
+arm64-darwin.`
+
+VEX follows the builds. The scan's `--vex` attests each patched build under its own patch and
+writes an `affected` statement for a build that keeps upstream's gem. A later `socket-patch vex`
+reads the lock and asks the patch service which builds are patched: one request for all such gems
+together, and one more per gem whose lock has no `CHECKSUMS` entry for a build. That is on top of
+the one request `vex` makes for the record of any hosted patch. A build is attested as patched
+only when the lock installs exactly that patch's gem. An installed copy of it is checked like any installed
+package, against the record of that build's own patch: one more request per installed patched
+build, whichever gem homes hold it. A platform gem is a patch of its own, whose files carry that
+patch's header (and, for a compiled build, its binaries), so they are never checked against the
+gem's patch. Every copy has to verify; one that does not leaves the build out of the document.
+The scan's own `--vex` holds a build to the same check.
+When `vex` cannot show what the lock installs for a build (`--offline`, a failed request, a lock
+older than what the patch service lists now), or cannot read the record of an installed build's
+patch, it states the build as `affected`, with what to run to settle it, under the warning
+`vex_gem_build_unknown`. The run still succeeds.
+For a platform the registry lists no gem for (one upstream does not publish), a scan changes
+nothing, and the statement says so: the build is settled once the lock no longer names the
+platform (`bundle lock --remove-platform`).
+
+While the patch service builds a patched gem again (a rebuild of a published build), its registry
+lists what it listed. A project whose lock is already on the patch is not affected: its scan and
+`vex` present the key of the snapshot the lock names, and are answered that snapshot, so the
+scan reports the gem as already on its patch and `vex` attests its builds. A lock on an earlier
+snapshot of the patch is told the patch is still being built and is left as it is; the first scan
+after the rebuild moves it. A project that is not on the patch yet is left on its upstream
+registry and takes the patched build on a scan after the rebuild. A vendored copy is not touched
+by a rebuild either: a re-scan, `repair` and `vendor --check` find it as it was. A vendored tree
+that is damaged or missing cannot be restored until the rebuild is over: the run says that the
+patch service lists no builds for the gem right now, and to run it again later. A project that
+is not vendored yet, or whose lock gained a platform, is left as it is for the length of the
+rebuild (exit 0): `nokogiri@1.18.10 is not vendored: the patch service lists no builds for it
+right now. Run this again later.` During the
+rebuild a fresh `bundle install` of that platform's gem from the snapshot fails until the rebuilt
+gem is there, as for any gem that is briefly unavailable.
+
+When upstream stops publishing a platform gem that a lock names, the patch registry no longer
+lists that platform. The scan then leaves the gem as it is and says so
+(`redirect_gem_platform_unlisted`), also for a lock that is already on the patch, and `vex`
+states that platform's build as `affected` with what settles it: `bundle lock
+--remove-platform`. Nothing more is done about it, because that platform's gem cannot be
+installed from upstream either.
+
+The registry URL the scan writes names the registry as it stood (`…/s/<key>/`). When a patched
+build is published for another platform, the next scan is given a URL with another key: it
+refreshes the URL in both files, rewrites the one checksum that changed, and says what is new:
+
+```text
+nokogiri 1.18.10: now also patched for arm64-darwin; already patched for x86_64-linux-gnu
+```
+
+A lock with no `CHECKSUMS` section gets the same line. It does not record what a build was, so
+the scan asks the registry URL the lock names what it listed (one small request, made only when
+the URL changes). If that cannot be read, the line says `patched for` without telling which
+build is new.
+
+If a patched build is withdrawn, the registry stops serving it under the URL the lock names, and a
+fresh `bundle install` fails on that platform until the lock is refreshed. The next scan puts the
+upstream gem's checksum back for that platform, replaces a copy a machine already installed from
+the withdrawn build with upstream's gem (a `bundle install` would keep it), and says so:
+
+```text
+nokogiri 1.18.10: patched for arm64-darwin; upstream gem back for x86_64-linux-gnu (its patched build was withdrawn)
+```
+
+In `--json` that build's `gem_upstream_build_kept` event carries `details.withdrawn: true`.
+
+**A lock with `ruby` alone under `PLATFORMS`.** Such a lock names nokogiri as plain
+`nokogiri (1.18.10)`, and the scan pins it under the patch registry without the `…/s/<key>/`
+level, which serves the patched ruby gem alone. A fresh `bundle install` builds that gem. On a
+machine that installed the gem before the scan, Bundler picked the precompiled gem of the machine
+for this lock, and it keeps loading that copy, which is upstream's. The scan does not replace it
+(the patched gem of this lock is the ruby gem, which only an install builds). It reports it, and
+its closing lines say that the gem is still unpatched on disk where they would say that nothing
+is left to patch:
+
+```text
+Warning: 1 gem is still unpatched on disk after the switch to hosted patches.
+  - Not refreshed (it is a precompiled arm64-darwin gem, which Bundler loads in place of the ruby gem the lock names, and the patched gem of this lock is the ruby gem, which `bundle install` builds): nokogiri 1.18.10. Run `rm -f vendor/bundle/ruby/3.4.0/specifications/nokogiri-1.18.10-arm64-darwin.gemspec vendor/bundle/ruby/3.4.0/cache/nokogiri-1.18.10-arm64-darwin.gem && bundle install`.
+```
+
+After that command Ruby loads the patched gem. Until then `socket-patch vex` exits 0 and states
+the gem as `affected` (warning `vex_gem_install_unpatched`), with what to run.
+
+Adding a platform is Bundler's own step: `bundle lock --add-platform <platform>` resolves the gem
+from its one source, the patch registry, and adds that platform's entry and checksum. The next
+scan reports the new build.
+
+Three cases leave the gem as it is, with one plain line and no warning:
+
+- no platform the lock names has a patched build yet (`redirect_gem_no_patched_build`). Moving the
+  gem would gain nothing, so it stays on its upstream registry;
+- the patch registry does not list a platform the lock names (`redirect_gem_platform_unlisted`).
+  The registry lists every platform gem upstream publishes for the version, so such a platform
+  is one upstream does not publish (a private build, a yanked platform gem);
+- the lock is on an earlier fix that patches a build the newer fix has no patched build for yet
+  (`redirect_gem_newer_fix_waits`). A scan never turns a build that is patched today into
+  upstream's gem, so the lock stays on the patch it is on. To tell, the scan asks the registry
+  the lock is on what it still serves (one small request, only in this situation). A build that
+  registry has withdrawn is not patched today and would fail to install, so it does not hold the
+  lock: when nothing is left to lose, the gem moves to the newer fix and that platform goes back
+  to upstream's gem, as above. If the registry cannot be read, the lock stays.
+
+In the last two cases a lock that is on an earlier fix stays on it. If that fix has withdrawn one
+of its builds in the meantime, the platform would no longer install, so the scan brings the lock to
+the earlier fix's current listing: the withdrawn platform goes back to upstream's gem, the other
+platforms keep their patched builds, and both lines are printed:
+
+```text
+nokogiri 1.18.10: patched for x86_64-linux-gnu; upstream gem back for arm64-darwin (its patched build was withdrawn)
+nokogiri 1.18.10: the newer fix has no patched build for x86_64-linux-gnu yet; the lock stays on the patch it is on
+```
+
+A later scan moves the gem once the patched builds are there.
+
+A gem the lock names as its plain `nokogiri (1.18.10)` entry alone is not affected by any of this:
+its registry URL has no `/s/<key>/` level, and a project pinned by an earlier release sees no
+change.
+
+The gem is skipped with the warning `redirect_gem_platform_unsupported` only when the patch
+service names no platform gem of the version (it has not read them yet, or is building a gem of
+the patch again while the project is not on the patch), or the lock is the merged layout of a
+Bundler older than 2.2.
 
 **Undoing it.** `rollback` and `remove` take the option (or the added line) off again and
 restore the lock: the pair is the pre-scan pair byte for byte, with LF or CRLF line endings.
@@ -5073,15 +5206,15 @@ mode warns `redirect_gem_version_not_locked`, vendored mode reports a `skipped` 
 
 Vendored mode rewrites one top-level `gem` line to a `path:` source, and Bundler builds nothing
 for a path-sourced gem. It refuses a gem that doesn't fit and changes nothing for it; the other
-gems of the run are still vendored, and the run exits 1. These four refusals name another mode
-that can patch the gem:
+gems of the run are still vendored, and the run exits 1. Each of these four refusals names a
+way to patch the gem:
 
 | Code | The gem | What the error offers |
 |---|---|---|
 | `gemfile_declaration_not_editable` ("is indented") | is declared inside a block: `group :test do`, `platforms … do`, a conditional. Every Rails Gemfile declares its development and test gems this way. | Move the declaration to the top level (for a plain `group` block the error spells the option that replaces it, `group: :test`), or patch the gem with `--mode hosted`, which edits a declaration where it is. Inside a `source`, `git`, `github` or `path` block hosted mode refuses the gem too, and the error names `--mode agent`. |
 | `gemfile_declaration_not_editable` ("as a direct dependency") | is a direct dependency the Gemfile declares out of sight: in a gemspec (a gem library's development dependency), an `eval_gemfile`d file, a loop. | Declare it with one literal `gem "<name>"` line in the Gemfile (above `gemspec`, where the Gemfile has that directive), in place of any other `gem` call that declares it, or patch the gem with `--mode agent`. Hosted mode refuses a gem declared in those places too. |
 | `native_extensions_unsupported` | builds a native extension (puma, bootsnap). | `--mode hosted` or `--mode agent`. Both build the extension. Only `--mode agent` when the declaration picks the gem's source (a `source`, `git`, `github` or `path` block or option), which hosted mode refuses. |
-| `platform_gem_unsupported` | is installed as a precompiled platform build (`nokogiri-1.18.3-x86_64-linux-gnu`). | `--mode agent`. Hosted mode refuses a precompiled build too. |
+| `platform_gem_unsupported` | is a precompiled platform build in a shape a vendored directory cannot hold: the installed copy is a precompiled build (`nokogiri-1.18.3-x86_64-linux-gnu`) while the lock names the gem for the `ruby` platform alone; or the lock has the plain `nokogiri (1.18.10)` entry beside its platform gems; or the lock was written by a Bundler older than 2.3. A gem the lock pins as platform gems alone is vendored, see the next section. | The way out for its case: `--mode agent`, which patches the installed copy; `bundle lock --remove-platform ruby`; or a re-lock with Bundler 2.3 or later. `--mode hosted` patches the gem as well: a gem locked as platform gems through the patch registry (on a lock written by Bundler 2.2 or later), and one locked for the `ruby` platform alone like any other gem. |
 
 To patch one gem in another mode, name it: `socket-patch get <gem> --mode hosted`. A whole-project
 `scan --mode hosted` leaves vendored gems as they are, but it moves the vendored patches of the
@@ -5100,8 +5233,8 @@ How each mode gets the patched code running:
 
 | Mode | What happens |
 |---|---|
-| Hosted | Bundler installs the patched `.gem` from the patch registry, and RubyGems compiles it like any registry gem. A gem the lock pins as precompiled platform gems (`x86_64-linux-gnu`) is installed from the patched platform gem the registry serves for that platform, with nothing to compile; it is skipped with `redirect_gem_platform_unsupported` only while the patch has no patched build for one of the locked platforms. |
-| Vendored | A gem `Gemfile.lock` pins as precompiled platform gems (one entry per platform, such as `nokogiri (1.18.10-x86_64-linux-gnu)`) is vendored from prebuilt patched platform gems. The patch service builds one for each platform, and the vendored directory holds each of them unpacked (`<name>-<version>/<platform>/`), so Bundler loads the one for the platform it runs on and builds nothing. Every platform in the lock needs one. While the patch service has none for one of them the gem is skipped with `vendor_prebuilt_platform_pending`, which names the platforms that have none: the run does not fail, nothing is written, a patch that is already vendored stays in place, and a later run vendors the gem once every platform has one. A lock that also holds the plain `nokogiri (1.18.10)` entry of the `ruby` platform is refused with `platform_gem_unsupported`, and so is a lock written by a Bundler older than 2.3 (its `BUNDLED WITH`), the oldest version the layout is verified on. The vendored directory carries its own `.gitignore` and `.gitattributes`, so a project rule such as `*.so` or a Git LFS filter does not keep the prebuilt binaries out of the commit or change their bytes. Bundler cannot add a platform the vendored directory has no gem for: to add one later, revert the gem (`vendor --revert`), run `bundle lock --add-platform <platform>` and vendor again. A gem with a native extension that is locked for the `ruby` platform alone is refused (`native_extensions_unsupported`, or `platform_gem_unsupported` when the installed copy is a precompiled one): Bundler builds no extensions for path-sourced gems. Use hosted or agent mode for that gem. |
+| Hosted | Bundler installs the patched `.gem` from the patch registry, and RubyGems compiles it like any registry gem. A gem the lock pins as precompiled platform gems (`x86_64-linux-gnu`) is installed through the patch registry with nothing to compile: the patched platform gem where the platform has one, upstream's own gem where it has none yet. The gem moves as soon as one locked platform has a patched build, and the run names the platforms that are patched and the ones that keep upstream's gem. |
+| Vendored | A gem `Gemfile.lock` pins as precompiled platform gems (one entry per platform, such as `nokogiri (1.18.10-x86_64-linux-gnu)`) is vendored from patched platform gems. Each platform has a patch of its own, and the vendored directory holds each platform's patched gem unpacked (`<name>-<version>/<platform>/`), so Bundler loads the one for the platform it runs on and builds nothing. Every platform in the lock needs a patched build. While one has none the gem is not vendored: one line (`vendor_prebuilt_platform_pending`) names the platforms without a patched build and says that hosted mode can patch the others now. A platform the patch registry does not list (one upstream does not publish) is named as such, with what settles it (`bundle lock --remove-platform`), and neither mode patches the gem until then. While the patch service lists no builds for the gem at all (it has not read the version's gems yet, or is building one of them again), the line names no platform and says to run again later. A dry run says the same. The run does not fail, nothing is written, a copy that is already vendored stays in place, and a later run vendors the gem once every platform has a patched build. A lock that also holds the plain `nokogiri (1.18.10)` entry of the `ruby` platform is refused with `platform_gem_unsupported`, and so is a lock written by a Bundler older than 2.3 (its `BUNDLED WITH`), the oldest version the layout is verified on. The vendored directory carries its own `.gitignore` and `.gitattributes`, so a project rule such as `*.so` or a Git LFS filter does not keep the binaries out of the commit or change their bytes. Bundler cannot add a platform the vendored directory has no gem for: to add one later, revert the gem (`vendor --revert`), run `bundle lock --add-platform <platform>` and vendor again. A gem with a native extension that is locked for the `ruby` platform alone is refused (`native_extensions_unsupported`, or `platform_gem_unsupported` when the installed copy is a precompiled one): Bundler builds no extensions for path-sourced gems. Use hosted or agent mode for that gem. |
 | Agent (`apply`) | The extension is rebuilt from the gem's source archive with the patch laid over it, using RubyGems' builder and the Ruby that owns the install, and the build is put where Ruby loads it: the extension directory of a gem RubyGems built, the prebuilt binary of a precompiled gem. |
 
 `apply` takes the source gem (`<name>-<version>.gem`) from the gem home's `cache/` directory,

@@ -216,13 +216,16 @@ impl PatchApi for JsPatchApi {
     fn fetch_registry_references<'a>(
         &'a self,
         uuids: &'a [String],
+        gem_snapshots: &'a socket_patch_core::api::client::GemSnapshotKeys,
     ) -> ApiFuture<'a, HashMap<String, PackageVendorResult>> {
         Box::pin(async move {
             if uuids.is_empty() {
                 return Ok(HashMap::new());
             }
             let method = "fetchRegistryReferences";
-            let request = serde_json::json!({ "uuids": uuids }).to_string();
+            let request =
+                socket_patch_core::api::client::provider_references_request(uuids, gem_snapshots)
+                    .to_string();
             match call_json::<ReferencesBody>(method, &self.fetch_registry_references, request)
                 .await?
             {

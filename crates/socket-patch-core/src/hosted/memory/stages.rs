@@ -160,6 +160,44 @@ pub(crate) struct Planned {
     /// `(artifact url, sha512)` of every npm tarball a yarn classic pin
     /// reads (its sha1, #558, and its package.json, #591).
     pub(crate) npm_classic: Vec<(String, String)>,
+    /// The compact-index documents the gem rewriter reads
+    /// ([`engine::gem_index_targets`]).
+    pub(crate) gem_indexes: Vec<String>,
+}
+
+/// Hand `plan`'s rewrite what the registries its Bundler lock is on list
+/// (`gem_indexes`, by document URL), and name the patches the patch
+/// service is asked about once they are known
+/// ([`engine::gem_refresh_targets`]): the patch a lock stays on, where its
+/// registry no longer serves a build the lock pins.
+pub(crate) fn record_gem_indexes(
+    plan: &mut Planned,
+    gem_indexes: &BTreeMap<String, Result<String, String>>,
+) -> Vec<crate::patch::redirect::GemRefresh> {
+    // A document that was not read is one nobody has: the gem it would
+    // have answered for stays on the patch it is on.
+    let listed: Vec<(String, Result<String, String>)> = plan
+        .gem_indexes
+        .iter()
+        .filter_map(|url| Some((url.clone(), gem_indexes.get(url)?.clone())))
+        .collect();
+    engine::record_gem_index(&mut plan.read, &listed);
+    engine::gem_refresh_targets(&plan.candidates, &plan.read.files)
+}
+
+/// Add to `plan` the candidates of the patches `targets` name
+/// ([`record_gem_indexes`]), from what the patch service answered for them
+/// ([`engine::gem_refresh_candidates`]): a lock that stays on such a patch
+/// follows its reference to that patch's current snapshot. A patch with no
+/// usable answer adds none, and its lock stays as it is.
+pub(crate) fn refresh_gem_patches(
+    plan: &mut Planned,
+    targets: &[crate::patch::redirect::GemRefresh],
+    references: &HashMap<&str, &PackageVendorResult>,
+) {
+    // The in-memory host configures no patch server of its own.
+    let refreshed = engine::gem_refresh_candidates(targets, references, &[], &plan.read.files);
+    plan.candidates.extend(refreshed);
 }
 
 /// Everything up to the wheel-metadata fetch. `unreadable` are the paths
@@ -168,7 +206,7 @@ pub(crate) async fn plan(
     project: MemoryProject,
     unreadable: BTreeSet<String>,
     selected: &[(String, String)],
-    references: &HashMap<String, PackageVendorResult>,
+    references: &HashMap<&str, &PackageVendorResult>,
 ) -> Result<Planned, Refusal> {
     let mut skipped: Vec<SkippedPatch> = Vec::new();
     let mut pre_warnings = Vec::new();
@@ -226,6 +264,7 @@ pub(crate) async fn plan(
     .into_iter()
     .filter_map(|dep| Some((dep.artifact_url.clone(), dep.integrity.sha512.clone()?)))
     .collect();
+    let gem_indexes = engine::gem_index_targets(&candidates, &read.files);
     Ok(Planned {
         project,
         candidates,
@@ -235,6 +274,7 @@ pub(crate) async fn plan(
         wheels,
         npm_manifests,
         npm_classic,
+        gem_indexes,
     })
 }
 
@@ -259,7 +299,8 @@ pub(crate) struct RewriteRefused {
 
 /// Wheel metadata, served npm manifests and the served npm tarballs a
 /// yarn classic pin reads (each keyed by artifact URL) → the engine's
-/// rewrite → the guard.
+/// rewrite → the guard. What the registries a Bundler lock is on list is
+/// in the plan already ([`record_gem_indexes`]).
 pub(crate) async fn rewrite(
     planned: Planned,
     artifact_metadata: &BTreeMap<String, Result<Option<String>, String>>,
@@ -275,6 +316,7 @@ pub(crate) async fn rewrite(
         wheels,
         npm_manifests,
         npm_classic,
+        gem_indexes: _,
     } = planned;
     let skipped_before = skipped.clone();
     let mut python_metadata: BTreeMap<String, String> = BTreeMap::new();
@@ -395,6 +437,11 @@ pub(crate) async fn rewrite(
         });
     }
     skipped.extend(done.unattributed.iter().cloned());
+    // A gem left where it is (no build the lock names is patched yet, a
+    // locked platform is not listed, or the lock would lose a patched
+    // build of another patch) is skipped under its own code, never
+    // unpinned.
+    skipped.extend(engine::gem_unpatched_skips(&candidates, &done.rewrite));
     let unconfirmed = engine::unconfirmed_candidates(&candidates, &done.confirmed, &skipped);
     Ok(Rewritten {
         project,

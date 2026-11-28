@@ -165,8 +165,11 @@ pub struct VexSummary {
     pub path: String,
     /// Number of OpenVEX statements in the document.
     pub statements: usize,
-    /// How many of them say `affected` (see `vex_bazel_not_in_build`), not
-    /// `not_affected`. Omitted from JSON when none does.
+    /// How many of them say `affected`, not `not_affected`: of a package
+    /// Bazel builds without its patch (see `vex_bazel_not_in_build`), or of
+    /// a gem build the lockfile takes from a patch registry as upstream's
+    /// own gem (`gem_upstream_build_kept`). Omitted from JSON when none
+    /// does.
     #[serde(skip_serializing_if = "is_zero")]
     pub affected: usize,
     /// Document format tag, e.g. `"openvex-0.2.0"`.

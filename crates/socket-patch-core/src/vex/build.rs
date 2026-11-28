@@ -11,9 +11,9 @@
 //! the latter become aliases. When two patches fix the same vuln ID
 //! they merge into one statement with both PURLs as subcomponents.
 //!
-//! A package the caller knows the build takes without its patch gets
-//! `affected` statements ([`build_document_with`] with
-//! [`Attested::affected`]): one per
+//! A package the caller knows the build takes without its patch, or
+//! cannot show the build takes patched, gets `affected` statements
+//! ([`build_document_with`] with [`Attested::affected`]): one per
 //! vulnerability ID, of its own, after the `not_affected` one of the same
 //! ID. Such statements are not merged, so that the action statement of
 //! each is about one subcomponent.
@@ -136,8 +136,9 @@ pub struct Attested<'a> {
     /// installed build of the package
     /// ([`VerifyOutcome::code_not_present`](crate::vex::verify::VerifyOutcome::code_not_present)).
     pub code_not_present: &'a [String],
-    /// PURLs whose patch the caller knows the build does not take, each
-    /// with what to do about it. See [`build_document_with`].
+    /// PURLs whose patch the caller knows the build does not take, or
+    /// cannot show it takes, each with what to do about it. See
+    /// [`build_document_with`].
     pub affected: &'a [(String, String)],
 }
 
@@ -159,12 +160,13 @@ pub const CODE_NOT_PRESENT_PREFIX: &str =
 /// is which.
 ///
 /// `attested.affected` names the PURLs whose patch the caller knows the
-/// build does not take, each with what to do about it. Every vulnerability
-/// of such a PURL's record gets a statement of the PURL's own with the
-/// status `affected`: the PURL is the one subcomponent of the product, and
-/// the action statement is what the caller gave for it, so a reader knows
-/// which package to act on. It has no justification and no impact
-/// statement, which belong to `not_affected`.
+/// build does not take, or cannot show it takes (a gem build of which
+/// nothing shows what the lockfile installs), each with what to do about
+/// it. Every vulnerability of such a PURL's record gets a statement of the
+/// PURL's own with the status `affected`: the PURL is the one subcomponent
+/// of the product, and the action statement is what the caller gave for
+/// it, so a reader knows which package to act on. It has no justification
+/// and no impact statement, which belong to `not_affected`.
 ///
 /// A PURL is in `applied` or in `affected`, and `affected` wins for one
 /// in both. A vulnerability that PURLs of both kinds share has the

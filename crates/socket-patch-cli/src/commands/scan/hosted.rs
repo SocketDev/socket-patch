@@ -19,6 +19,7 @@ use crate::commands::vex::generate_vex_from_manifest_path;
 use crate::json_envelope::{
     Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning, VexSummary,
 };
+use crate::ui::{wrap_line, wrap_words};
 use socket_patch_core::formats::gem::GemBuild;
 
 use super::{discover_selected, emit_scan, scan_envelope, ScanArgs};
@@ -224,6 +225,24 @@ async fn check_mirror(
             text.contains(url) || text.contains(encoded.as_str()) || text.contains(escaped.as_str())
         })
     };
+    // A gem the Bundler lock names as its ruby-platform gem alone is pinned
+    // under its registry without the snapshot level. The registry's URL at
+    // a snapshot starts with that address, so the pin is one only where no
+    // snapshot level follows it.
+    let pinned_without_snapshot = |ov: &socket_patch_core::patch::redirect::RegistryOverride| {
+        let (root, snapshot) =
+            socket_patch_core::patch::redirect::split_gem_snapshot(&ov.index_url);
+        if ov.kind != "rubygems-compact-index" || snapshot.is_none() {
+            return false;
+        }
+        let root = root.trim_end_matches('/');
+        files.values().any(|text| {
+            text.match_indices(root).any(|(at, _)| {
+                let rest = &text[at + root.len()..];
+                !rest.strip_prefix('/').unwrap_or(rest).starts_with("s/")
+            })
+        })
+    };
     let mut asked = std::collections::BTreeSet::new();
     let new_pins: Vec<String> = candidates
         .iter()
@@ -234,7 +253,10 @@ async fn check_mirror(
                 .registry_override
                 .as_ref()
                 .map(|ov| ov.index_url.trim_end_matches('/'));
-            !already_pinned(&dep.artifact_url) && !index.is_some_and(already_pinned)
+            let keyless = dep.registry_override.as_ref();
+            !already_pinned(&dep.artifact_url)
+                && !index.is_some_and(already_pinned)
+                && !keyless.is_some_and(pinned_without_snapshot)
         })
         .filter(|dep| asked.insert(dep.artifact_url.clone()))
         .map(|dep| dep.artifact_url.clone())
@@ -355,35 +377,128 @@ pub(super) const VEX_HOSTED_UNVERIFIED: &str = "vex_hosted_unverified";
 /// uuid: `applied` (`verified` on a dry run) for each confirmed pin, `skipped`
 /// with the skip's code, and `skipped` / `redirect_unconfirmed` for each
 /// granted patch no lockfile entry pins. None of them change status or exit.
+///
+/// `reports` are the confirmed pins as the run reports them
+/// ([`engine::pin_reports`]): a gem the lock names as platform builds has
+/// one event per locked build, whose `details` name the gem patch
+/// (`gemFix`) and the build's `platform` (none for the ruby-platform gem).
+/// A patched build is `applied` under its own patch, with `newlyPatched:
+/// true` when this run put it in place. A build the patch registry serves
+/// as upstream's own gem is an advisory `skipped` event with no `uuid`
+/// ([`engine::GEM_UPSTREAM_BUILD_KEPT`]), which `summary` does not count:
+/// nothing was skipped, that platform is as it was. Where this run put
+/// the build back on upstream's gem because its patched build was
+/// withdrawn, the event says so (`details.withdrawn: true`, and its
+/// `reason`).
+///
+/// [`engine::pin_reports`]: socket_patch_core::hosted::engine::pin_reports
+/// [`engine::GEM_UPSTREAM_BUILD_KEPT`]: socket_patch_core::hosted::engine::GEM_UPSTREAM_BUILD_KEPT
 pub(super) fn record_hosted_events(
     env: &mut Envelope,
-    confirmed: &[(String, String)],
+    reports: &[socket_patch_core::hosted::engine::PinReport],
     unconfirmed: &[(String, String)],
     skipped: &[socket_patch_core::hosted::engine::SkippedPatch],
     dry_run: bool,
 ) {
-    for event in hosted_events(confirmed, unconfirmed, skipped, dry_run) {
-        env.record(event);
+    use socket_patch_core::hosted::engine::GEM_UPSTREAM_BUILD_KEPT;
+    for event in hosted_events(reports, unconfirmed, skipped, dry_run) {
+        if event.error_code.as_deref() == Some(GEM_UPSTREAM_BUILD_KEPT) {
+            env.events.push(event);
+        } else {
+            env.record(event);
+        }
     }
+}
+
+/// The pins of `confirmed` that put a patch in effect: all of them but a
+/// gem the lock names as platform builds none of which is patched (every
+/// one is served as upstream's own gem: a lock that followed a withdrawn
+/// build back). Such a gem is on the patch registry and installs nothing
+/// patched, so it is no package on a hosted patch: the telemetry, the
+/// summary line and the rows under it count what is in effect, as the
+/// envelope's events do.
+fn pins_in_effect(
+    confirmed: &[(String, String)],
+    rewrite: &socket_patch_core::patch::redirect::RewriteResult,
+) -> Vec<(String, String)> {
+    let unpatched = |uuid: &String| {
+        let builds = rewrite.gem_builds.get(uuid);
+        builds.is_some_and(|builds| builds.iter().all(|build| build.patch_uuid.is_none()))
+    };
+    let mut pins = confirmed.to_vec();
+    pins.retain(|(_, uuid)| !unpatched(uuid));
+    pins
+}
+
+/// Each pin of `confirmed` as its own report: what a run's telemetry
+/// names, one patch per package, where the envelope reports a gem locked
+/// as platform builds per build.
+fn pin_reports_by_package(
+    confirmed: &[(String, String)],
+) -> Vec<socket_patch_core::hosted::engine::PinReport> {
+    confirmed
+        .iter()
+        .map(
+            |(purl, uuid)| socket_patch_core::hosted::engine::PinReport {
+                purl: purl.clone(),
+                uuid: Some(uuid.clone()),
+                gem_fix: None,
+                platform: None,
+                newly_patched: false,
+                withdrawn: false,
+            },
+        )
+        .collect()
 }
 
 /// A hosted run's per-patch outcomes as events, tagged `mode: "hosted"`
 /// (see [`record_hosted_events`]): what the envelope records and what the
-/// run's telemetry names.
+/// run's telemetry names. Only the advisory event of a gem build left on
+/// upstream's gem has no `uuid`.
 fn hosted_events(
-    confirmed: &[(String, String)],
+    reports: &[socket_patch_core::hosted::engine::PinReport],
     unconfirmed: &[(String, String)],
     skipped: &[socket_patch_core::hosted::engine::SkippedPatch],
     dry_run: bool,
 ) -> Vec<PatchEvent> {
+    use socket_patch_core::hosted::engine::{
+        gem_upstream_build_kept_detail, GEM_UPSTREAM_BUILD_KEPT,
+    };
     let pinned = if dry_run {
         PatchAction::Verified
     } else {
         PatchAction::Applied
     };
-    let mut events: Vec<PatchEvent> = confirmed
+    let mut events: Vec<PatchEvent> = reports
         .iter()
-        .map(|(purl, uuid)| PatchEvent::new(pinned, purl.as_str()).with_uuid(uuid.as_str()))
+        .map(|report| {
+            let mut event = match &report.uuid {
+                Some(uuid) => {
+                    PatchEvent::new(pinned, report.purl.as_str()).with_uuid(uuid.as_str())
+                }
+                None => PatchEvent::new(PatchAction::Skipped, report.purl.as_str()).with_reason(
+                    GEM_UPSTREAM_BUILD_KEPT,
+                    gem_upstream_build_kept_detail(
+                        report.platform.as_deref().unwrap_or_default(),
+                        report.withdrawn,
+                    ),
+                ),
+            };
+            if let Some(gem_fix) = &report.gem_fix {
+                let mut details = serde_json::json!({ "gemFix": gem_fix });
+                if let Some(platform) = &report.platform {
+                    details["platform"] = serde_json::json!(platform);
+                }
+                if report.newly_patched {
+                    details["newlyPatched"] = serde_json::json!(true);
+                }
+                if report.withdrawn {
+                    details["withdrawn"] = serde_json::json!(true);
+                }
+                event.details = Some(details);
+            }
+            event
+        })
         .chain(skipped.iter().map(|s| {
             let mut event =
                 PatchEvent::new(PatchAction::Skipped, s.purl.as_str()).with_uuid(s.uuid.as_str());
@@ -482,6 +597,18 @@ struct StaleInstallOutcome {
     /// The gem probe's stale materializations, one per warning, for the
     /// refresh that follows it ([`refresh_stale_gems`]).
     gems: Vec<StaleGem>,
+    /// The gem probe's copies of a platform build the patch registry
+    /// serves as upstream's own gem that are another build: a patched
+    /// build that was withdrawn. The refresh puts upstream's gem in their
+    /// place. Not among `stale_purls`: the document says `affected` of
+    /// such a build whatever is installed, and its copy says nothing of
+    /// the gem's other builds.
+    withdrawn: Vec<StaleGem>,
+    /// The stale installed dirs among `gems` that are a precompiled build
+    /// Bundler loads in place of the ruby-platform gem the lock names,
+    /// each with its platform. The refresh leaves them: the patched gem
+    /// of such a lock is the ruby-platform gem, which a reinstall builds.
+    stand_ins: std::collections::BTreeMap<std::path::PathBuf, String>,
 }
 
 /// The gem and Python stale-install probes' fallback: when a confirmed
@@ -525,8 +652,10 @@ impl<'a> ViewFallback<'a> {
     ) -> Option<&socket_patch_core::manifest::schema::PatchRecord> {
         if !self.fetched.contains_key(uuid) {
             let record = match self.api {
+                // The file hashes are all a judgment needs: asked without
+                // the file contents.
                 Some(api) => api
-                    .fetch_patch(uuid)
+                    .fetch_patch_summary(uuid)
                     .await
                     .ok()
                     .and_then(|view| gem_refresh::view_record(view, uuid)),
@@ -568,7 +697,17 @@ fn stale_installed_gem(
 /// guard" section of CLI_CONTRACT.md). `why` is why the refresh did not fix
 /// it; `None` describes it before any refresh.
 fn gem_stale_warning(gem: &StaleGem, why: Option<&gem_refresh::Why>) -> serde_json::Value {
-    let direction = gem_refresh::Direction::Patched;
+    gem_stale_warning_of(gem_refresh::Direction::Patched, gem, why)
+}
+
+/// [`gem_stale_warning`] for a materialization that is stale in
+/// `direction`: an unpatched copy of a patched build, or the copy of a
+/// withdrawn build where the lock pins upstream's gem.
+fn gem_stale_warning_of(
+    direction: gem_refresh::Direction,
+    gem: &StaleGem,
+    why: Option<&gem_refresh::Why>,
+) -> serde_json::Value {
     serde_json::json!({
         "code": direction.stale_code(),
         "detail": gem_refresh::stale_detail(direction, gem, why),
@@ -613,6 +752,12 @@ fn stale_cache_gem(purl: &str, cache_path: &Path) -> StaleGem {
 ///   with), the patch's view record judges the dir ([`ViewFallback`]). A
 ///   dir that record cannot judge either (the fetch failed, or `--offline`)
 ///   is reported in `unjudged_purls`, never as healthy.
+/// * The copy of a platform build that has a patch of its own
+///   (`gem_build_patches`, by leaf) is judged by its archive, else by the
+///   record of that build's own patch, and never by the gem patch's
+///   record, the agent-mode one included: a platform gem's files are not
+///   the gem patch's. With neither it is unjudged: not stale, and not
+///   replaced.
 /// * Judgments are grouped by installed dir: platform-variant purls of one
 ///   gem share a dir, and if any variant proves it patched, it is never
 ///   warned.
@@ -624,7 +769,17 @@ fn stale_cache_gem(purl: &str, cache_path: &Path) -> StaleGem {
 /// * A gem locked as precompiled platform builds is installed as
 ///   `<name>-<version>-<platform>`, and cached under that name: each is
 ///   judged the same way, against the patched artifacts of the gem, which
-///   include its prebuilds.
+///   include its patched platform builds.
+/// * A platform build the patch registry serves as upstream's own gem (no
+///   patched build; `gem_upstream` gives the sha256 of that gem by leaf)
+///   is pinned to upstream's gem by its lock entry. Its installed copy and
+///   its archive in the cache dir are judged by that sha256 alone: an
+///   archive that is upstream's gem is the right copy, and nothing is
+///   reported, refreshed or downloaded for it. A readable archive with
+///   another sha256 is a patched build that was withdrawn (`withdrawn`):
+///   the lock does not install it, and `bundle install` keeps it. A copy
+///   whose gem home holds no archive of it is not judged: no patch record
+///   is fetched for a build that has no patch.
 /// * Which copies are judged is the lock's to say: every build of the gem
 ///   the project's lock names is looked for under its own leaf, in every
 ///   gem home. A gem home can hold several builds of one version (the
@@ -633,6 +788,12 @@ fn stale_cache_gem(purl: &str, cache_path: &Path) -> StaleGem {
 ///   platform build Bundler loads, or replace a build that is not this
 ///   project's. Only where no lock names the gem (a global scan) is the
 ///   first installed copy judged, as before.
+/// * A lock whose `PLATFORMS` names `ruby` alone names every gem as its
+///   ruby-platform gem, and Bundler loads an installed precompiled build
+///   of the locked version in its place. Each such copy is judged beside
+///   the ruby-platform gem, as the gem's own: an upstream one is what Ruby
+///   runs, and no `bundle install` replaces it (`stand_ins`).
+#[allow(clippy::too_many_arguments)]
 async fn gem_stale_install_warnings(
     cwd: &Path,
     global: bool,
@@ -646,6 +807,8 @@ async fn gem_stale_install_warnings(
         (String, String),
         std::collections::BTreeSet<String>,
     >,
+    gem_upstream: &std::collections::BTreeMap<String, String>,
+    gem_build_patches: &std::collections::BTreeMap<String, String>,
     views: &mut ViewFallback<'_>,
 ) -> StaleInstallOutcome {
     use socket_patch_core::crawlers::types::CrawlerOptions;
@@ -728,8 +891,27 @@ async fn gem_stale_install_warnings(
         .filter(|(_, builds)| builds.is_empty())
         .map(|(purl, _)| purl.clone())
         .collect();
+    // The candidates the lock names as their ruby-platform gem alone, where
+    // Bundler loads an installed precompiled build in its place (module
+    // docs).
+    let loads_platform_copies =
+        socket_patch_core::vendor::lock_inventory::gem_lock_loads_platform_copies_in(
+            &socket_patch_core::vendor::lock_inventory::ProjectView::Disk(cwd),
+        )
+        .await;
+    let stood_in = |builds: &[GemBuild]| {
+        loads_platform_copies && matches!(builds, [ruby] if ruby.platform.is_none())
+    };
+    let stand_in_purls: Vec<String> = stripped
+        .iter()
+        .zip(&named)
+        .filter(|(_, builds)| stood_in(builds))
+        .map(|(purl, _)| purl.clone())
+        .collect();
     // Per home: each candidate's installed dirs.
     let mut found_per_home = Vec::with_capacity(homes.len());
+    let mut stand_in_dirs: std::collections::BTreeSet<std::path::PathBuf> =
+        std::collections::BTreeSet::new();
     for home in &homes {
         let mut by_leaf = crawler
             .find_builds(&home.gems_dir, &leaves)
@@ -739,6 +921,10 @@ async fn gem_stale_install_warnings(
             .find_each_by_purl(&home.gems_dir, &unnamed)
             .await
             .into_iter();
+        let mut platform_copies = crawler
+            .find_platform_builds(&home.gems_dir, &stand_in_purls)
+            .await
+            .into_iter();
         let dirs: Vec<Vec<std::path::PathBuf>> = named
             .iter()
             .map(|builds| {
@@ -746,13 +932,28 @@ async fn gem_stale_install_warnings(
                     let pkg = first.next().flatten();
                     pkg.map(|pkg| pkg.path).into_iter().collect()
                 } else {
-                    by_leaf.by_ref().take(builds.len()).flatten().collect()
+                    let mut dirs: Vec<std::path::PathBuf> =
+                        by_leaf.by_ref().take(builds.len()).flatten().collect();
+                    if stood_in(builds) {
+                        // A dir no gemspec lists is what an install left
+                        // behind: neither RubyGems nor Bundler loads it.
+                        let mut copies = platform_copies.next().unwrap_or_default();
+                        copies.retain(|dir| !gem_refresh::gemspec_is_gone(dir));
+                        stand_in_dirs.extend(copies.iter().cloned());
+                        dirs.extend(copies);
+                    }
+                    dirs
                 }
             })
             .collect();
         found_per_home.push((dirs, home.project_local));
     }
     let mut dir_state: std::collections::BTreeMap<std::path::PathBuf, DirJudgment> =
+        std::collections::BTreeMap::new();
+    // The installed copies of a build on upstream's gem that are another
+    // build: the candidate, the leaf, and whether the gem home is the
+    // project's own.
+    let mut withdrawn_dirs: std::collections::BTreeMap<std::path::PathBuf, (String, String, bool)> =
         std::collections::BTreeMap::new();
     // Bundler's configured cache dir (`cache_path`, default vendor/cache).
     let app_cache = socket_patch_core::crawlers::ruby_crawler::bundler_app_cache_dir(cwd).await;
@@ -769,6 +970,24 @@ async fn gem_stale_install_warnings(
             let Some(leaf) = dir.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
+            // Upstream's own gem is what the lock pins for this build: the
+            // archive RubyGems installed the copy from is that gem, or the
+            // copy is a build that was withdrawn. Never for a copy that
+            // stands in for the ruby-platform gem: the lock pins that gem.
+            let stands_in = stand_in_dirs.contains(dir);
+            if let Some(upstream_sha) = gem_upstream.get(leaf).filter(|_| !stands_in) {
+                let archive = gem_refresh::home_cache_archive(dir);
+                let installed_from = match &archive {
+                    Some(archive) => file_sha256_hex(archive).await,
+                    None => None,
+                };
+                if installed_from.is_some_and(|sha| !sha.eq_ignore_ascii_case(upstream_sha)) {
+                    withdrawn_dirs
+                        .entry(dir.clone())
+                        .or_insert_with(|| ((*purl).to_string(), leaf.to_string(), *project_local));
+                }
+                continue;
+            }
             let entry = dir_state.entry(dir.clone()).or_insert_with(|| DirJudgment {
                 purl: (*purl).to_string(),
                 leaf: leaf.to_string(),
@@ -798,7 +1017,12 @@ async fn gem_stale_install_warnings(
                     _ => None,
                 }
             };
-            let judged = match local {
+            // A platform build with a patch of its own is a patch of its
+            // own: its files carry that patch's header (and, compiled, its
+            // binaries), so the gem patch's record says nothing true of it.
+            // Its archive judges it, else that build's own record (below).
+            let own_patch = gem_build_patches.get(leaf);
+            let judged = match local.filter(|_| own_patch.is_none()) {
                 Some(record) => {
                     let judged = judge_installed_record(dir, record).await;
                     if judged.patched
@@ -818,7 +1042,10 @@ async fn gem_stale_install_warnings(
             };
             match judged {
                 Some(judged) => entry.record(purl, judged),
-                None => pending.push((dir.clone(), purl, uuid)),
+                None => {
+                    let record_of = own_patch.map_or(*uuid, String::as_str);
+                    pending.push((dir.clone(), purl, record_of));
+                }
             }
         }
     }
@@ -884,9 +1111,47 @@ async fn gem_stale_install_warnings(
         );
         out.warnings.push(gem_stale_warning(&gem, None));
         out.gems.push(gem);
+        if !in_place && stand_in_dirs.contains(dir) {
+            let platform = GemBuild::of_leaf(&j.purl, &j.leaf).and_then(|build| build.platform);
+            out.stand_ins
+                .insert(dir.clone(), platform.unwrap_or_default());
+        }
         // Every variant installed in this dir: VEX matches its exemptions
         // qualifier-insensitively, so one left out would re-exempt the dir.
         out.stale_purls.extend(j.purls.iter().cloned());
+    }
+    // The copies of a withdrawn build, each with the project's cache-dir
+    // archive of that build unless it is proven to be upstream's gem:
+    // bundler installs from it first.
+    let withdrawn = gem_refresh::Direction::Withdrawn;
+    for (dir, (purl, leaf, project_local)) in &withdrawn_dirs {
+        let project_cache = app_cache.join(format!("{leaf}.gem"));
+        let folded_cache = if *project_local && project_cache.is_file() {
+            let proven_upstream = match (
+                gem_upstream.get(leaf),
+                file_sha256_hex(&project_cache).await,
+            ) {
+                (Some(want), Some(got)) => got.eq_ignore_ascii_case(want),
+                _ => false,
+            };
+            (!proven_upstream).then_some(project_cache)
+        } else {
+            None
+        };
+        if let Some(archive) = &folded_cache {
+            cache_covered.insert(archive.clone());
+        }
+        let gem = stale_installed_gem(
+            purl,
+            dir,
+            leaf,
+            *project_local,
+            folded_cache.as_deref(),
+            false,
+        );
+        out.warnings
+            .push(gem_stale_warning_of(withdrawn, &gem, None));
+        out.withdrawn.push(gem);
     }
 
     // Pass 3: standalone vendor/cache staleness — a committed archive whose
@@ -896,22 +1161,32 @@ async fn gem_stale_install_warnings(
     // otherwise never warn). One archive per build the lock names: the
     // ruby gem's alone where no lock names the gem.
     for (index, (purl, _, _)) in candidates.iter().enumerate() {
-        let Some(want_shas) = gem_artifact_shas.get(&gem_sha_key(purl)) else {
-            continue;
-        };
+        let want_shas = gem_artifact_shas.get(&gem_sha_key(purl));
         let builds = match named[index].as_slice() {
             [] => GemBuild::ruby(purl).into_iter().collect(),
             builds => builds.to_vec(),
         };
-        for cache_path in builds
-            .iter()
-            .map(|build| app_cache.join(format!("{}.gem", build.leaf)))
-        {
+        for build in &builds {
+            let cache_path = app_cache.join(format!("{}.gem", build.leaf));
             if cache_covered.contains(&cache_path) || !cache_path.is_file() {
                 continue;
             }
             // Unreadable → no positive evidence, never a guess.
             let Some(got) = file_sha256_hex(&cache_path).await else {
+                continue;
+            };
+            // A build on upstream's gem: the archive is that gem, or a
+            // build that was withdrawn.
+            if let Some(upstream_sha) = gem_upstream.get(&build.leaf) {
+                if !got.eq_ignore_ascii_case(upstream_sha) {
+                    let gem = stale_cache_gem(purl, &cache_path);
+                    out.warnings
+                        .push(gem_stale_warning_of(withdrawn, &gem, None));
+                    out.withdrawn.push(gem);
+                }
+                continue;
+            }
+            let Some(want_shas) = want_shas else {
                 continue;
             };
             if want_shas.contains(&got) {
@@ -937,11 +1212,17 @@ struct GemRefreshed {
     progress: Vec<String>,
     /// The one human warning for what is still stale.
     summary: Option<gem_refresh::Summary>,
+    /// The one human warning for the copies of a withdrawn build that are
+    /// still on disk.
+    withdrawn_summary: Option<gem_refresh::Summary>,
     /// The cache-dir archives replaced: files the project commits.
     replaced_archives: Vec<std::path::PathBuf>,
     /// An installed copy was replaced with the patched gem, or the upstream
     /// archive beside one patched in place was.
     replaced_installs: bool,
+    /// An installed copy of a withdrawn build was replaced with upstream's
+    /// gem.
+    replaced_withdrawn: bool,
 }
 
 /// What became of the copies of the switched gems that Bundler already
@@ -955,12 +1236,23 @@ enum GemCopies {
     Refreshed,
     /// Some are still stale; the run's warning names the command.
     Stale,
+    /// Every stale one was brought in line with what the lock pins, and
+    /// for one of them that is upstream's gem: its patched build was
+    /// withdrawn.
+    Followed,
+    /// The copy of a withdrawn build is still installed, and nothing else
+    /// is stale; the run's warning names the command.
+    Withdrawn,
 }
 
 impl GemRefreshed {
     fn copies(&self) -> GemCopies {
         if self.summary.is_some() {
             GemCopies::Stale
+        } else if self.withdrawn_summary.is_some() {
+            GemCopies::Withdrawn
+        } else if self.replaced_withdrawn {
+            GemCopies::Followed
         } else if self.replaced_installs {
             GemCopies::Refreshed
         } else {
@@ -976,6 +1268,12 @@ impl GemRefreshed {
 /// stale says so (the `--vex` exclusions are the second probe's). A
 /// refresh that fails changes nothing and leaves the warning; it never
 /// fails the run. `locked` is whether the run holds the apply lock.
+///
+/// The copy of a withdrawn build goes the other way under the same
+/// policy: it is replaced with upstream's gem, which the patch registry
+/// hands on for that platform (`<index>/gems/<leaf>.gem`), verified
+/// against the sha256 the reference lists for it. A build that was
+/// withdrawn may be unsafe to keep loading, and `bundle install` keeps it.
 #[allow(clippy::too_many_arguments)]
 async fn refresh_stale_gems(
     common: &crate::args::GlobalArgs,
@@ -990,12 +1288,15 @@ async fn refresh_stale_gems(
         (String, String),
         std::collections::BTreeSet<String>,
     >,
+    gem_upstream: &std::collections::BTreeMap<String, String>,
+    gem_build_patches: &std::collections::BTreeMap<String, String>,
     overrides: &[DepOverride],
     mirror_sources: &socket_patch_core::hosted::engine::MirrorSources,
     views: &mut ViewFallback<'_>,
 ) -> GemRefreshed {
     use socket_patch_core::patch::gem_refresh::{Source, Wanted};
     let direction = gem_refresh::Direction::Patched;
+    let withdrawn = gem_refresh::Direction::Withdrawn;
     let first = gem_stale_install_warnings(
         &common.cwd,
         common.global,
@@ -1003,10 +1304,12 @@ async fn refresh_stale_gems(
         confirmed,
         local_records,
         gem_artifact_shas,
+        gem_upstream,
+        gem_build_patches,
         views,
     )
     .await;
-    if first.gems.is_empty() {
+    if first.gems.is_empty() && first.withdrawn.is_empty() {
         return GemRefreshed {
             outcome: if common.dry_run {
                 StaleInstallOutcome::default()
@@ -1021,9 +1324,9 @@ async fn refresh_stale_gems(
     // The patched archive: what bundler itself would download from the
     // patch registry (`<index>/gems/<leaf>.gem`), else the grant's own
     // artifact, verified against the sha256 the lock pins. A platform
-    // build (`<name>-<version>-<platform>`) is the patch's prebuild for
-    // that platform, pinned by its own sha256; a platform gem declares no
-    // extensions, so replacing one builds nothing.
+    // build (`<name>-<version>-<platform>`) is the patched build the
+    // registry serves for that platform, pinned by its own sha256; a
+    // platform gem declares no extensions, so replacing one builds nothing.
     let wanted = |gem: &StaleGem| {
         let (name, version) = gem_sha_key(&gem.purl);
         let build = GemBuild::of_leaf(&gem.purl, &gem.leaf);
@@ -1032,8 +1335,9 @@ async fn refresh_stale_gems(
             .iter()
             .filter(|o| o.ecosystem == "gem" && o.name == name && o.version == version)
             .filter_map(|o| o.registry_override.as_ref())
-            .flat_map(|ro| &ro.identifiers.gem_platforms)
+            .flat_map(|ro| ro.identifiers.gem_builds.iter().flatten())
             .filter(|prebuild| Some(prebuild.platform.as_str()) == platform)
+            .filter(|prebuild| prebuild.patch_uuid.is_some())
             .map(|prebuild| prebuild.gem_checksum_sha256.to_ascii_lowercase())
             .collect();
         let sha256 = if prebuilt.is_empty() {
@@ -1071,13 +1375,59 @@ async fn refresh_stale_gems(
             on_disk: Vec::new(),
         })
     };
+    // Upstream's gem for the platform of a withdrawn build: what bundler
+    // itself would download from the patch registry, which hands that
+    // file on, verified against the sha256 the reference lists for the
+    // platform before any byte of it is used.
+    let upstream_wanted = |gem: &StaleGem| {
+        let (name, version) = gem_sha_key(&gem.purl);
+        let sha256 = gem_upstream.get(&gem.leaf)?.to_ascii_lowercase();
+        let file = format!("{}.gem", gem.leaf);
+        let mut urls: Vec<String> = overrides
+            .iter()
+            .filter(|o| o.ecosystem == "gem" && o.name == name && o.version == version)
+            .filter_map(|o| o.registry_override.as_ref())
+            .map(|ro| format!("{}/gems/{file}", ro.index_url.trim_end_matches('/')))
+            .map(|url| mirror_sources.fetch_url(&url).into_owned())
+            .collect();
+        urls.dedup();
+        Some(Wanted {
+            leaf: gem.leaf.clone(),
+            kind: "upstream",
+            sha256: std::collections::BTreeSet::from([sha256]),
+            urls,
+            on_disk: Vec::new(),
+        })
+    };
     let source = if common.offline {
         Source::DiskOnly
     } else {
         Source::PatchServer(api_client)
     };
-    let pass = gem_refresh::attempt(&first.gems, wanted, &source, &policy, direction).await;
-    let mut outcome = if pass.changed(&policy) {
+    // A precompiled build that stands in for the ruby-platform gem the
+    // lock names is left as it is: the patched gem of that lock is the
+    // ruby-platform gem, and replacing the copy with it means building it.
+    let stand_in = |gem: &StaleGem| {
+        let (dir, _) = gem.installed.as_ref()?;
+        first.stand_ins.get_key_value(dir)
+    };
+    let replaceable: Vec<StaleGem> = (first.gems.iter())
+        .filter(|gem| stand_in(gem).is_none())
+        .cloned()
+        .collect();
+    let mut pass = gem_refresh::attempt(&replaceable, wanted, &source, &policy, direction).await;
+    for (dir, platform) in first.gems.iter().filter_map(stand_in) {
+        pass.leave(dir, gem_refresh::Why::StandIn(platform.clone()));
+    }
+    let withdrawn_pass = gem_refresh::attempt(
+        &first.withdrawn,
+        upstream_wanted,
+        &source,
+        &policy,
+        withdrawn,
+    )
+    .await;
+    let mut outcome = if pass.changed(&policy) || withdrawn_pass.changed(&policy) {
         gem_stale_install_warnings(
             &common.cwd,
             common.global,
@@ -1085,6 +1435,8 @@ async fn refresh_stale_gems(
             confirmed,
             local_records,
             gem_artifact_shas,
+            gem_upstream,
+            gem_build_patches,
             views,
         )
         .await
@@ -1092,25 +1444,126 @@ async fn refresh_stale_gems(
         first
     };
     let report = gem_refresh::report(direction, &outcome.gems, &pass, &policy);
+    let withdrawn_report =
+        gem_refresh::report(withdrawn, &outcome.withdrawn, &withdrawn_pass, &policy);
     outcome.warnings = report
         .warnings
         .iter()
+        .chain(&withdrawn_report.warnings)
         .map(|(code, detail)| serde_json::json!({ "code": code, "detail": detail }))
         .collect();
     if common.dry_run {
         outcome.stale_purls.clear();
         outcome.unjudged_purls.clear();
     }
+    let mut progress = report.progress;
+    progress.extend(withdrawn_report.progress);
     GemRefreshed {
         outcome,
-        progress: report.progress,
+        progress,
         summary: report.summary,
+        withdrawn_summary: withdrawn_report.summary,
         replaced_archives: if common.dry_run {
             Vec::new()
         } else {
-            pass.replaced_archives().map(Path::to_path_buf).collect()
+            let replaced = pass.replaced_archives();
+            let replaced = replaced.chain(withdrawn_pass.replaced_archives());
+            replaced.map(Path::to_path_buf).collect()
         },
         replaced_installs: !common.dry_run && pass.refreshed_an_install(),
+        replaced_withdrawn: !common.dry_run && withdrawn_pass.refreshed_an_install(),
+    }
+}
+
+/// The compact-index documents a run has read of the registries a Bundler
+/// lock is on, by URL: the text, or why it could not be read.
+type GemIndexes = std::collections::BTreeMap<String, Result<String, String>>;
+
+/// Hand the gem rewriter what the registry a Bundler lock is on lists
+/// ([`socket_patch_core::hosted::gem_index::read_gem_indexes`]), before
+/// each rewrite of `read`.
+///
+/// A lock that takes a gem as platform builds from the registry of another
+/// patch of the gem is moved to the patch on offer only when no locked
+/// build would turn from a patched build that registry still serves into
+/// upstream's own gem. Whether it still serves one (a withdrawn build is
+/// refused, whatever the lock's `CHECKSUMS` pins) is that registry's to
+/// say, so it is asked wherever the move would put a build on upstream's
+/// gem that the lock does not pin there already: one small document per
+/// such gem, kept in `held` so it is asked for once however often the run
+/// rewrites. No other run asks anything, and a document that cannot be
+/// read leaves the gem on the patch it is on.
+///
+/// Under a patch mirror the lock names its registry on the mirror, and the
+/// document is read where the patch server serves it, as every download of
+/// the run is (`mirror_sources`).
+async fn read_gem_indexes(
+    common: &crate::args::GlobalArgs,
+    api_client: &socket_patch_core::api::client::ApiClient,
+    mirror_sources: &socket_patch_core::hosted::engine::MirrorSources,
+    candidates: &[socket_patch_core::hosted::engine::Candidate],
+    read: &mut socket_patch_core::hosted::engine::CandidateFiles,
+    held: &mut GemIndexes,
+) {
+    use socket_patch_core::hosted::{engine, gem_index};
+    // A status line only where a registry is asked.
+    let asks = engine::gem_index_targets(candidates, &read.files)
+        .iter()
+        .any(|url| !held.contains_key(url));
+    let reading = gem_index::read_gem_indexes(api_client, mirror_sources, candidates, read, held);
+    if asks {
+        crate::ui::busy(common, "Reading gem registries", reading).await;
+    } else {
+        reading.await;
+    }
+}
+
+/// The candidates that bring a Bundler lock which stays on a patch to what
+/// that patch serves today
+/// ([`socket_patch_core::hosted::gem_index::read_gem_refreshes`]), to
+/// rewrite beside `candidates` once `read` holds the documents of
+/// [`read_gem_indexes`].
+///
+/// A lock on the registry of another patch of a gem stays there while the
+/// patch on offer would take a patched build from it, or does not list a
+/// locked platform. Where the registry it stays on has withdrawn a build
+/// the lock pins, that platform no longer installs. The reference of the
+/// patch the lock is on lists upstream's gem for that build under its
+/// current snapshot, and the rewrite follows it there: the patch on offer
+/// is skipped as before, and the lock is whole again. The reference is one
+/// the run already holds (`references`: the withdrawn-pin sweep of a scan
+/// asks about every pin), else one request to the patch service, made only
+/// where a withdrawal was detected while a lock stays. One that is not
+/// usable changes nothing.
+///
+/// Not under a patch mirror: the reference would have to be moved onto the
+/// mirror and checked there like a new pin, and such a lock is left as it
+/// is.
+async fn refresh_gem_patches(
+    common: &crate::args::GlobalArgs,
+    api_client: &socket_patch_core::api::client::ApiClient,
+    candidates: &[socket_patch_core::hosted::engine::Candidate],
+    read: &socket_patch_core::hosted::engine::CandidateFiles,
+    references: &std::collections::HashMap<
+        String,
+        socket_patch_core::api::types::PackageVendorResult,
+    >,
+) -> Vec<socket_patch_core::hosted::engine::Candidate> {
+    use socket_patch_core::hosted::{engine, gem_index};
+    if common.patch_mirror().is_some() {
+        return Vec::new();
+    }
+    // A status line only where the patch service is asked.
+    let asks = engine::gem_refresh_targets(candidates, &read.files)
+        .iter()
+        .any(|target| !references.contains_key(&target.uuid));
+    let origins = crate::commands::hosted_unwind::patch_server_origins(common);
+    let refreshing =
+        gem_index::read_gem_refreshes(api_client, candidates, read, references, &origins);
+    if asks {
+        crate::ui::busy(common, "Resolving hosted artifacts", refreshing).await
+    } else {
+        refreshing.await
     }
 }
 
@@ -1393,6 +1846,22 @@ struct HostedTelemetry {
     json_error: Option<Envelope>,
 }
 
+/// The registry snapshots the Bundler lock of the project in `cwd` takes
+/// gems from, by patch uuid: what the run's reference requests present
+/// ([`ApiClient::fetch_registry_references`]). The lock is the one of the
+/// pair the rewriter is given ([`gem_snapshots_presented`]).
+///
+/// [`ApiClient::fetch_registry_references`]: socket_patch_core::api::client::ApiClient::fetch_registry_references
+/// [`gem_snapshots_presented`]: socket_patch_core::hosted::engine::gem_snapshots_presented
+pub(super) async fn gem_lock_snapshots(
+    cwd: &Path,
+) -> socket_patch_core::api::client::GemSnapshotKeys {
+    use socket_patch_core::vendor::lock_inventory::ProjectView;
+    let unreadable = std::collections::BTreeSet::new();
+    socket_patch_core::hosted::engine::gem_snapshots_presented(&ProjectView::Disk(cwd), &unreadable)
+        .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_redirect_selected_untracked(
     common: &crate::args::GlobalArgs,
@@ -1422,6 +1891,12 @@ async fn run_redirect_selected_untracked(
     // records) would otherwise be silent gaps on a terminal. Inert under
     // --json/--silent and off a terminal.
     let mut status = crate::ui::StatusLine::stderr(common.json, common.silent);
+    // Every reference answer the run holds, by uuid: the selection's, and
+    // the withdrawn-pin sweep's for the pins the lockfiles already hold.
+    let mut references: std::collections::HashMap<
+        String,
+        socket_patch_core::api::types::PackageVendorResult,
+    > = std::collections::HashMap::new();
 
     if !selected.is_empty() {
         let uuids: Vec<String> = selected.iter().map(|(_, uuid)| uuid.clone()).collect();
@@ -1440,7 +1915,8 @@ async fn run_redirect_selected_untracked(
                 "Resolving hosted artifacts for {}",
                 crate::ui::plural(to_fetch.len(), "patch", "patches")
             ));
-            let fetched = api_client.fetch_registry_references(&to_fetch).await;
+            let held = gem_lock_snapshots(&common.cwd).await;
+            let fetched = api_client.fetch_registry_references(&to_fetch, &held).await;
             status.finish();
             fetched
         };
@@ -1452,7 +1928,7 @@ async fn run_redirect_selected_untracked(
             }
             fetched
         });
-        let references = match fetched {
+        references = match fetched {
             Ok(r) => r,
             // A capped run whose every row is NEW: the failure affects only
             // rows the incomplete lookup defers anyway (§5.2), so it becomes
@@ -1760,7 +2236,7 @@ async fn run_redirect_selected_untracked(
     // pnpm registry route (the candidate files, read whole), or the files
     // of a `.mvn/maven.config` to heal, read again now that the lock is
     // held; everything after the rewrite still runs.
-    let read = if !candidates.is_empty() || (route_cleanup && may_heal) {
+    let mut read = if !candidates.is_empty() || (route_cleanup && may_heal) {
         let mut read = crate::ui::busy(
             common,
             "Reading lockfiles",
@@ -1989,6 +2465,27 @@ async fn run_redirect_selected_untracked(
     }
     status.finish();
     candidates.retain(|c| !unavailable_python_artifacts.contains(&c.dep.artifact_url));
+    // What the registries a Bundler lock is on list, handed to every
+    // rewrite of the run and asked for once (see `read_gem_indexes`).
+    let mut gem_indexes = GemIndexes::new();
+    read_gem_indexes(
+        common,
+        api_client,
+        &mirror_sources,
+        &candidates,
+        &mut read,
+        &mut gem_indexes,
+    )
+    .await;
+    // A gem lock that stays on the patch it is on, while that patch's
+    // registry no longer serves a build the lock pins, follows that patch's
+    // reference as it stands (see `refresh_gem_patches`). Only a run that
+    // may write, or previews: one that holds no lock leaves the lock as it
+    // is.
+    if common.dry_run || lock.is_some() {
+        let refreshed = refresh_gem_patches(common, api_client, &candidates, &read, &references);
+        candidates.extend(refreshed.await);
+    }
     // The Pipfile.lock reference shape depends on the installing Pipenv
     // (`path` for 7–11, `file` from 2018 on), so the installed release is
     // probed (`pipenv --version`, up to 10 s) — but only when a pypi patch
@@ -2161,12 +2658,21 @@ async fn run_redirect_selected_untracked(
                 &mut skipped,
             )
             .await;
-        let read = if candidates.is_empty() {
+        let mut read = if candidates.is_empty() {
             CandidateFiles::default()
         } else {
             engine::read_candidate_files(&view, &std::collections::BTreeSet::new(), &candidates)
                 .await
         };
+        read_gem_indexes(
+            common,
+            api_client,
+            &mirror_sources,
+            &candidates,
+            &mut read,
+            &mut gem_indexes,
+        )
+        .await;
         done = engine::rewrite(
             &view,
             read,
@@ -2179,6 +2685,11 @@ async fn run_redirect_selected_untracked(
     // Candidates the rewrite left out because discovery would not attribute
     // their pin (`engine::rewrite`).
     skipped.extend(done.unattributed.iter().cloned());
+    // A gem the lock names as platform builds, left on its upstream
+    // registry because none of them has a patched build yet: skipped under
+    // its own code, which is no warning, so it is never reported as a
+    // granted patch that nothing pins.
+    skipped.extend(engine::gem_unpatched_skips(&candidates, &done.rewrite));
     grant_warnings.extend(mirror_pins_not_moved(
         &mirror_sources,
         &candidates,
@@ -2329,25 +2840,64 @@ async fn run_redirect_selected_untracked(
     //
     // purl-coordinate → every PATCHED .gem artifact's sha256 (registry
     // override identifier, tarball integrity fallback; one per platform
-    // variant, and one per prebuild: the patched platform gem a lock that
+    // variant, and one per patched platform build: the gem a lock that
     // names platform builds is pinned to) — judges the installed and
     // committed archives, and verifies the archive a refresh installs.
     let mut gem_artifact_shas: std::collections::BTreeMap<
         (String, String),
         std::collections::BTreeSet<String>,
     > = std::collections::BTreeMap::new();
-    for o in done.overrides.iter().filter(|o| o.ecosystem == "gem") {
+    // The platform builds the patch registry serves as upstream's own gem
+    // (no patched build), by leaf, each with the sha256 of that gem: what
+    // its lock entry pins, and what a machine of such a platform holds
+    // unless it installed a patched build that was withdrawn since.
+    let mut gem_upstream: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    // The platform builds that have a patch of their own, by leaf, each
+    // with that patch's uuid: a copy of such a build is judged by its
+    // archive, else by that patch's record, and never by the gem patch's.
+    let mut gem_build_patches: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    // Of the pins the project's files hold alone: a gem's lock can stay
+    // on one patch while another patch of the gem is skipped, and what the
+    // skipped one's registry serves is not what the lock installs.
+    let pinned_gems: Vec<DepOverride> = done
+        .overrides
+        .iter()
+        .filter(|o| o.ecosystem == "gem")
+        .filter(|o| confirmed.iter().any(|(_, uuid)| *uuid == o.patch_uuid))
+        .cloned()
+        .collect();
+    for o in &pinned_gems {
         let sha = o
             .registry_override
             .as_ref()
             .and_then(|ro| ro.identifiers.gem_checksum_sha256.clone())
             .or_else(|| o.integrity.sha256.clone());
-        let prebuilds = o
+        // The reference's list says what each gem of the version is: the
+        // sha256 of every patched one (the ruby-platform gem's among
+        // them), the patch of a patched platform build, and upstream's
+        // sha256 for a platform with none.
+        let mut patched_builds = Vec::new();
+        for build in o
             .registry_override
             .iter()
-            .flat_map(|ro| &ro.identifiers.gem_platforms)
-            .map(|prebuild| prebuild.gem_checksum_sha256.clone());
-        for sha in sha.into_iter().chain(prebuilds) {
+            .flat_map(|ro| ro.identifiers.gem_builds.iter().flatten())
+        {
+            let leaf = format!("{}-{}-{}", o.name, o.version, build.platform);
+            match &build.patch_uuid {
+                Some(own) => {
+                    patched_builds.push(build.gem_checksum_sha256.clone());
+                    if build.platform != "ruby" {
+                        gem_build_patches.insert(leaf, own.clone());
+                    }
+                }
+                None => {
+                    gem_upstream.insert(leaf, build.gem_checksum_sha256.clone());
+                }
+            }
+        }
+        for sha in sha.into_iter().chain(patched_builds) {
             gem_artifact_shas
                 .entry((o.name.clone(), o.version.clone()))
                 .or_default()
@@ -2363,7 +2913,9 @@ async fn run_redirect_selected_untracked(
         &confirmed,
         &local_records,
         &gem_artifact_shas,
-        &done.overrides,
+        &gem_upstream,
+        &gem_build_patches,
+        &pinned_gems,
         &mirror_sources,
         &mut views,
     )
@@ -2534,6 +3086,13 @@ async fn run_redirect_selected_untracked(
         // v5 keeps no hosted ledger: the in-run attestation fetches the
         // records of the pins this run confirmed.
         params.hosted_uuids = confirmed.iter().map(|(_, uuid)| uuid.clone()).collect();
+        // A gem pinned as platform builds is one pin, and the registry
+        // serves upstream's own gem for a platform with no patched build:
+        // the document names each locked build, as this run reports them.
+        params.hosted_gem_builds = engine::pin_reports(&confirmed, rewrite)
+            .into_iter()
+            .filter(|report| report.gem_fix.is_some())
+            .collect();
         // The gem intake gate withholds every gem file. VEX independently
         // rediscovers older pins too, so a candidate-only set would miss some
         // refused hosted gems. Keep their actual installed-byte verification,
@@ -2662,16 +3221,28 @@ async fn run_redirect_selected_untracked(
         &confirmed,
         &skipped,
     );
+    // The pins as the run reports them: a gem the lock names as platform
+    // builds once per locked build. Everything else above and below works
+    // on the pins themselves, one per package.
+    let reports = engine::pin_reports(&confirmed, rewrite);
+    // And the pins that put a patch in effect: what is counted as on a
+    // hosted patch.
+    let in_effect = pins_in_effect(&confirmed, rewrite);
     // Sent before the result prints: a consumer that closes stdout early
     // (SIGPIPE on the first write) must not lose it.
     if !selected.is_empty() {
         socket_patch_core::telemetry::track_patch_hosted(
             telemetry.command,
-            confirmed.len(),
+            in_effect.len(),
             done.rewritten.len(),
             common.dry_run,
             &crate::telemetry_outcomes::patch_outcomes_of(
-                &hosted_events(&confirmed, &unconfirmed, &skipped, common.dry_run),
+                &hosted_events(
+                    &pin_reports_by_package(&in_effect),
+                    &unconfirmed,
+                    &skipped,
+                    common.dry_run,
+                ),
                 socket_patch_core::telemetry::MODE_HOSTED,
             ),
             &telemetry.auth,
@@ -2685,7 +3256,7 @@ async fn run_redirect_selected_untracked(
         // tagged `details.mode: "hosted"`, the `redirect` payload, and the
         // engine's warnings hoisted to the top-level `warnings`.
         let mut env = scan_result.take().unwrap_or_else(|| scan_envelope(common));
-        record_hosted_events(&mut env, &confirmed, &unconfirmed, &skipped, common.dry_run);
+        record_hosted_events(&mut env, &reports, &unconfirmed, &skipped, common.dry_run);
         record_registry_cleanup(
             &mut env,
             &registry_removed,
@@ -2771,28 +3342,43 @@ async fn run_redirect_selected_untracked(
                         .into_iter()
                         .map(|pin| pin.uuid)
                         .collect();
-                    confirmed
+                    in_effect
                         .iter()
                         .filter(|(_, uuid)| in_place.contains(uuid))
                         .count()
                 });
             println!(
                 "{}",
-                format_hosted_summary(confirmed.len(), already, human_files.len(), common.dry_run)
+                format_hosted_summary(in_effect.len(), already, human_files.len(), common.dry_run)
             );
             // Under it, one row per package on a hosted patch: what the
             // patch fixes and how much it leaves unpatched. The same call
             // counts the directory into the invocation's closing totals.
             if let Some(gate) = rollout.as_mut() {
                 let pinned: std::collections::HashSet<&str> =
-                    confirmed.iter().map(|(_, uuid)| uuid.as_str()).collect();
+                    in_effect.iter().map(|(_, uuid)| uuid.as_str()).collect();
                 if let Some(report) = gate.report.as_deref_mut() {
                     report.project(&gate.plan, &pinned).await;
+                    report.hosted_builds(&reports);
+                    if !common.dry_run {
+                        let stale: std::collections::BTreeSet<&str> = (gem_refreshed.outcome.gems)
+                            .iter()
+                            .map(|gem| gem.purl.as_str())
+                            .collect();
+                        report.stale_gem_installs(stale.len());
+                    }
                 }
             }
             // Then what the run did to the user's Bundler manifest.
             for line in format_gem_manifest_edits(&rewrite.edits, common.dry_run) {
                 println!("{line}");
+            }
+            // And, for a gem the lock names as platform builds, which of
+            // them are patched.
+            let stdout_width =
+                crate::ui::attended(crate::ui::Stream::Stdout).then(crate::ui::stdout_width);
+            for line in format_gem_build_lines(&reports, &skipped, common.dry_run) {
+                println!("{}", wrap_line(&line, stdout_width));
             }
             // And what it took out of a pnpm registry route nothing uses.
             for line in crate::commands::registry_gc::lines(&registry_removed, common.dry_run) {
@@ -2827,6 +3413,8 @@ async fn run_redirect_selected_untracked(
             let skipped_pairs: Vec<(String, String)> = skipped
                 .iter()
                 .filter(|s| s.reason != super::rollout::ROLLOUT_DEFERRED)
+                // Said above, as one plain line per gem: nothing failed.
+                .filter(|s| !engine::is_quiet_gem_skip(&s.reason))
                 .map(|s| (s.purl.clone(), s.reason.clone()))
                 .collect();
             let unconfirmed_purls: Vec<String> =
@@ -2834,7 +3422,7 @@ async fn run_redirect_selected_untracked(
             for line in format_unredirected(
                 &skipped_pairs,
                 &unconfirmed_purls,
-                confirmed.is_empty(),
+                in_effect.is_empty(),
                 // Only the lockfile rewriters' own warnings explain a
                 // missing lock entry; unrelated guidance (pnpm trust, VEX,
                 // stale installs, Bun default trust) is not what the hint
@@ -2871,7 +3459,8 @@ async fn run_redirect_selected_untracked(
                 };
                 eprintln!("{}", format_warning(code, &detail, width));
             }
-            if let Some(summary) = &gem_refreshed.summary {
+            let summaries = [&gem_refreshed.summary, &gem_refreshed.withdrawn_summary];
+            for summary in summaries.into_iter().flatten() {
                 eprintln!(
                     "{}",
                     render_warning(&format!("{}.", summary.headline), &summary.bullets, width)
@@ -3156,54 +3745,6 @@ fn format_error_line(msg: &str) -> String {
     format!("Error: {}", crate::ui::sentence_case(msg))
 }
 
-/// Split `text` into wrap tokens at whitespace, except that a
-/// backtick-delimited code span (`` `pnpm install --trust-lockfile` ``)
-/// stays one token so a command the user copies is never broken across
-/// lines. An unclosed span falls back to plain whitespace splitting.
-fn wrap_tokens(text: &str) -> Vec<String> {
-    let mut tokens: Vec<String> = Vec::new();
-    let mut span: Vec<&str> = Vec::new();
-    for word in text.split_whitespace() {
-        span.push(word);
-        let open = span.iter().map(|w| w.matches('`').count()).sum::<usize>() % 2 == 1;
-        if !open {
-            tokens.push(span.join(" "));
-            span.clear();
-        }
-    }
-    tokens.extend(span.into_iter().map(str::to_string));
-    tokens
-}
-
-/// Greedy word wrap to `width` columns (characters, not bytes). The first
-/// line starts with `first_prefix`, later lines with `indent`. A word
-/// longer than the line (a URL) gets a line of its own, never split; a
-/// backtick code span counts as one word (see [`wrap_tokens`]).
-fn wrap_words(text: &str, width: usize, first_prefix: &str, indent: &str) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    let mut line = first_prefix.to_string();
-    let mut line_len = first_prefix.chars().count();
-    let mut empty = true;
-    for word in wrap_tokens(text) {
-        let word = word.as_str();
-        let wlen = word.chars().count();
-        if !empty && line_len + 1 + wlen > width {
-            lines.push(std::mem::replace(&mut line, indent.to_string()));
-            line_len = indent.chars().count();
-            empty = true;
-        }
-        if !empty {
-            line.push(' ');
-            line_len += 1;
-        }
-        line.push_str(word);
-        line_len += wlen;
-        empty = false;
-    }
-    lines.push(line);
-    lines
-}
-
 /// Split a long guidance paragraph into its sentences, at every period
 /// followed by a space (host names and versions such as `patch.socket.dev`
 /// or `5.4` never contain one). Each sentence keeps its own period; the
@@ -3374,6 +3915,112 @@ fn format_gem_manifest_edits(
             format!("{}.", crate::ui::sentence_case(&parts.join("; ")))
         })
         .collect()
+}
+
+/// Which builds are patched of each gem the Bundler lock names as
+/// precompiled platform builds, one line per gem. Such a gem takes its
+/// patch registry as the one source of every locked build, and the
+/// registry serves a patched build for some platforms and upstream's own
+/// gem for the rest, so the summary's "1 package" does not say which
+/// machines run patched code. Not a warning: nothing here needs doing.
+///
+/// - `nokogiri 1.19.3: patched for arm64-darwin, x86_64-linux-gnu`
+/// - a platform with no patched build yet: `…: patched for
+///   x86_64-linux-gnu; upstream gem kept for arm64-darwin (no patched
+///   build yet)`
+/// - a patched build that this run found for a platform of a lock already
+///   on the registry: `…: now also patched for arm64-darwin; already
+///   patched for x86_64-linux-gnu`
+/// - a build this run put back on upstream's gem, because the patched
+///   build its lock entry pinned was withdrawn: `…: patched for
+///   arm64-darwin; upstream gem back for x86_64-linux-gnu (its patched
+///   build was withdrawn)`, before the builds that never had one
+/// - a gem left where it is under one of the quiet skips
+///   (`engine::is_quiet_gem_skip`), in the skip's own sentence: `…: no
+///   patched build yet for arm64-darwin, x86_64-linux-gnu; left on its
+///   upstream registry`
+///
+/// The ruby-platform gem, where the lock names it beside the platform
+/// builds, is the platform `ruby`. A dry run says `would be patched for`
+/// (`would also be patched for`) of the builds a wet run would put in
+/// place, and `upstream gem would be back for` of those it would put back.
+/// `reports` are the run's pins per locked build (`engine::pin_reports`),
+/// `skipped` its skips.
+fn format_gem_build_lines(
+    reports: &[socket_patch_core::hosted::engine::PinReport],
+    skipped: &[socket_patch_core::hosted::engine::SkippedPatch],
+    dry_run: bool,
+) -> Vec<String> {
+    use socket_patch_core::hosted::engine::{is_quiet_gem_skip, PinReport};
+    // Per gem patch, in report order: its locked builds.
+    let mut gems: Vec<(&str, Vec<&PinReport>)> = Vec::new();
+    for report in reports {
+        let Some(gem_fix) = report.gem_fix.as_deref() else {
+            continue;
+        };
+        match gems.iter_mut().find(|(fix, _)| *fix == gem_fix) {
+            Some((_, builds)) => builds.push(report),
+            None => gems.push((gem_fix, vec![report])),
+        }
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for (_, builds) in gems {
+        let Some((_, name, version)) = builds.first().and_then(|build| purl_parts(&build.purl))
+        else {
+            continue;
+        };
+        let platforms = |keep: &dyn Fn(&PinReport) -> bool| -> String {
+            let named: Vec<&str> = builds
+                .iter()
+                .filter(|build| keep(build))
+                .map(|build| build.platform.as_deref().unwrap_or("ruby"))
+                .collect();
+            named.join(", ")
+        };
+        let now = platforms(&|build| build.uuid.is_some() && build.newly_patched);
+        let before = platforms(&|build| build.uuid.is_some() && !build.newly_patched);
+        let is_back = |build: &PinReport| build.uuid.is_none() && build.withdrawn;
+        let back = platforms(&is_back);
+        let kept = platforms(&|build| build.uuid.is_none() && !build.withdrawn);
+        let (first, also) = if dry_run {
+            ("would be patched for", "would also be patched for")
+        } else {
+            ("patched for", "now also patched for")
+        };
+        let mut parts: Vec<String> = Vec::new();
+        match (now.is_empty(), before.is_empty()) {
+            (false, true) => parts.push(format!("{first} {now}")),
+            (false, false) => {
+                parts.push(format!("{also} {now}"));
+                parts.push(format!("already patched for {before}"));
+            }
+            (true, false) => parts.push(format!("patched for {before}")),
+            // No locked build is patched: the lock followed a withdrawn
+            // build back to upstream's gem.
+            (true, true) => {}
+        }
+        if !back.is_empty() {
+            let is = if dry_run { "would be back" } else { "back" };
+            let why = match builds.iter().filter(|build| is_back(build)).count() {
+                1 => "its patched build was withdrawn",
+                _ => "their patched builds were withdrawn",
+            };
+            parts.push(format!("upstream gem {is} for {back} ({why})"));
+        }
+        if !kept.is_empty() {
+            parts.push(format!(
+                "upstream gem kept for {kept} (no patched build yet)"
+            ));
+        }
+        lines.push(format!("{name} {version}: {}", parts.join("; ")));
+    }
+    lines.extend(
+        skipped
+            .iter()
+            .filter(|skip| is_quiet_gem_skip(&skip.reason))
+            .filter_map(|skip| skip.detail.clone()),
+    );
+    lines
 }
 
 /// What wiring a gem to its patch source costs the project's update
@@ -3782,6 +4429,18 @@ fn format_next_steps(
              install` keeps the gems it already has)",
             &extra,
         ),
+        GemCopies::Followed if bundler_only => crate::ui::next_steps_installed(
+            &commit,
+            "the installed gems already hold the builds the lockfile pins, so there is nothing \
+             to reinstall",
+            &extra,
+        ),
+        GemCopies::Withdrawn if bundler_only => crate::ui::next_steps(
+            &commit,
+            "Replace the withdrawn gem build with the command in the warning above (a plain \
+             `bundle install` keeps the gems it already has)",
+            &extra,
+        ),
         _ => crate::ui::next_steps(
             &commit,
             &format!("Reinstall from the updated lockfile{hint}"),
@@ -3900,7 +4559,7 @@ mod tests {
         describe_skip_reason, format_error_line, format_hosted_summary, format_next_steps,
         format_redirect_summary, format_takeover_line, format_unredirected, format_warning,
         join_names, lock_entry_warning_count, pnpm_trust_rerun_reminder, split_sentences,
-        wrap_tokens, wrap_words, GemCopies, TAKEOVER_INFO_CODES,
+        GemCopies, TAKEOVER_INFO_CODES,
     };
     use super::{
         gem_stale_install_warnings, gem_stale_warning, prune_ignored_warning, record_hosted_events,
@@ -4342,9 +5001,13 @@ mod tests {
             {"purl": "pkg:npm/b@1.0.0", "uuid": "ub", "reason": "not_found"}
         ]))
         .unwrap();
+        let pinned = super::pin_reports_by_package(&[(
+            "pkg:npm/minimist@1.2.2".to_string(),
+            "abc-123".to_string(),
+        )]);
         record_hosted_events(
             &mut env,
-            &[("pkg:npm/minimist@1.2.2".to_string(), "abc-123".to_string())],
+            &pinned,
             &[("pkg:npm/a@1.0.0".to_string(), "ua".to_string())],
             &skipped,
             false,
@@ -4386,15 +5049,371 @@ mod tests {
 
         // A dry run previews the pin as `verified`.
         let mut env = Envelope::new(Command::Scan);
-        record_hosted_events(
-            &mut env,
-            &[("pkg:npm/minimist@1.2.2".to_string(), "abc-123".to_string())],
-            &[],
-            &[],
-            true,
-        );
+        record_hosted_events(&mut env, &pinned, &[], &[], true);
         assert_eq!(env.summary.verified, 1);
         assert_eq!(env.summary.applied, 0);
+    }
+
+    const BUILD_FIX: &str = "77777777-7777-4777-8777-777777777777";
+    const BUILD_LINUX: &str = "77777777-7777-4777-8777-00000000000b";
+
+    /// One locked build of the gem `pkg:gem/nokogiri@1.19.3` as a run
+    /// reports it: `patch` is the patch of its patched build (`None`: the
+    /// registry serves upstream's gem), `newly` whether this run put it in
+    /// place.
+    fn build_report(
+        platform: Option<&str>,
+        patch: Option<&str>,
+        newly: bool,
+    ) -> socket_patch_core::hosted::engine::PinReport {
+        socket_patch_core::hosted::engine::PinReport {
+            purl: match platform {
+                Some(platform) => format!("pkg:gem/nokogiri@1.19.3?platform={platform}"),
+                None => "pkg:gem/nokogiri@1.19.3".to_string(),
+            },
+            uuid: patch.map(str::to_string),
+            gem_fix: Some(BUILD_FIX.to_string()),
+            platform: platform.map(str::to_string),
+            newly_patched: newly,
+            withdrawn: false,
+        }
+    }
+
+    /// A gem the lock names as platform builds is recorded per locked
+    /// build. A patched build is a counted `applied` event under its own
+    /// patch, whose `details` name the gem patch and the platform, and say
+    /// when this run put the build in place. A build the registry serves as
+    /// upstream's gem is an event with no `uuid` that no `summary` count
+    /// moves for. The quiet skip of a gem with no patched build is an
+    /// ordinary counted skip, and never a warning.
+    #[test]
+    fn hosted_events_report_a_platform_locked_gem_per_build() {
+        use crate::json_envelope::{Command, Envelope};
+        use socket_patch_core::hosted::engine::{
+            SkippedPatch, GEM_NO_PATCHED_BUILD, GEM_UPSTREAM_BUILD_KEPT,
+        };
+        let reports = [
+            build_report(None, Some(BUILD_FIX), false),
+            build_report(Some("arm64-darwin"), None, false),
+            build_report(Some("x86_64-linux-gnu"), Some(BUILD_LINUX), true),
+        ];
+        let skipped = [SkippedPatch {
+            detail: Some(
+                "rack 3.1.8: no patched build yet for java; left on its upstream registry".into(),
+            ),
+            ..SkippedPatch::new("pkg:gem/rack@3.1.8", "ur", GEM_NO_PATCHED_BUILD)
+        }];
+        let mut env = Envelope::new(Command::Scan);
+        record_hosted_events(&mut env, &reports, &[], &skipped, false);
+        let v = env.to_value();
+        assert_eq!(
+            v["events"],
+            serde_json::json!([
+                {
+                    "action": "applied", "purl": "pkg:gem/nokogiri@1.19.3", "uuid": BUILD_FIX,
+                    "details": {"gemFix": BUILD_FIX, "mode": "hosted"},
+                },
+                {
+                    "action": "skipped",
+                    "purl": "pkg:gem/nokogiri@1.19.3?platform=arm64-darwin",
+                    "errorCode": GEM_UPSTREAM_BUILD_KEPT,
+                    "reason": "the patch registry serves upstream's own gem for arm64-darwin: \
+                               no patched build yet",
+                    "details": {"gemFix": BUILD_FIX, "platform": "arm64-darwin", "mode": "hosted"},
+                },
+                {
+                    "action": "applied",
+                    "purl": "pkg:gem/nokogiri@1.19.3?platform=x86_64-linux-gnu",
+                    "uuid": BUILD_LINUX,
+                    "details": {
+                        "gemFix": BUILD_FIX, "platform": "x86_64-linux-gnu",
+                        "newlyPatched": true, "mode": "hosted",
+                    },
+                },
+                {
+                    "action": "skipped", "purl": "pkg:gem/rack@3.1.8", "uuid": "ur",
+                    "errorCode": GEM_NO_PATCHED_BUILD,
+                    "reason": "rack 3.1.8: no patched build yet for java; left on its upstream \
+                               registry",
+                    "details": {"mode": "hosted"},
+                },
+            ])
+        );
+        assert_eq!(v["summary"]["applied"], 2, "the patched builds");
+        assert_eq!(
+            v["summary"]["skipped"], 1,
+            "the gem left alone, not the build"
+        );
+        assert_eq!(v["summary"]["failed"], 0);
+        assert_eq!(v["status"], "success");
+        assert!(v["warnings"].as_array().is_none_or(Vec::is_empty), "{v}");
+
+        // A dry run previews each patched build as `verified`; the build
+        // left on upstream's gem is reported the same way.
+        let mut env = Envelope::new(Command::Scan);
+        record_hosted_events(&mut env, &reports, &[], &[], true);
+        assert_eq!((env.summary.verified, env.summary.applied), (2, 0));
+        assert_eq!(env.summary.skipped, 0);
+        assert_eq!(env.events.len(), 3);
+
+        // Telemetry names one patch per package: the pin's.
+        let pins = [("pkg:gem/nokogiri@1.19.3".to_string(), BUILD_FIX.to_string())];
+        let outcomes = crate::telemetry_outcomes::patch_outcomes_of(
+            &super::hosted_events(&super::pin_reports_by_package(&pins), &[], &skipped, false),
+            socket_patch_core::telemetry::MODE_HOSTED,
+        );
+        let named: Vec<(&str, &str, Option<&str>)> = outcomes
+            .iter()
+            .map(|o| (o.uuid.as_str(), o.outcome, o.code.as_deref()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                (BUILD_FIX, "applied", None),
+                ("ur", "skipped", Some(GEM_NO_PATCHED_BUILD)),
+            ]
+        );
+    }
+
+    /// The human line of a gem locked as platform builds: which builds are
+    /// patched, which keep upstream's gem, which this run found patched on
+    /// a lock that was already on the registry, and what a dry run would
+    /// do. A package that is no such gem has no line. A gem left on its
+    /// upstream registry prints its skip's own sentence.
+    #[test]
+    fn gem_build_lines_say_which_builds_are_patched() {
+        use socket_patch_core::hosted::engine::{SkippedPatch, GEM_NO_PATCHED_BUILD};
+        let line = |reports: &[socket_patch_core::hosted::engine::PinReport], dry_run| {
+            let lines = super::format_gem_build_lines(reports, &[], dry_run);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            lines.into_iter().next().unwrap()
+        };
+        let arm = |patch, newly| build_report(Some("arm64-darwin"), patch, newly);
+        let linux = |patch, newly| build_report(Some("x86_64-linux-gnu"), patch, newly);
+        let (a, b) = (Some("ua"), Some(BUILD_LINUX));
+
+        // Every locked build patched by this run, then found in place.
+        assert_eq!(
+            line(&[arm(a, true), linux(b, true)], false),
+            "nokogiri 1.19.3: patched for arm64-darwin, x86_64-linux-gnu"
+        );
+        assert_eq!(
+            line(&[arm(a, false), linux(b, false)], false),
+            "nokogiri 1.19.3: patched for arm64-darwin, x86_64-linux-gnu"
+        );
+        // One platform has no patched build yet.
+        assert_eq!(
+            line(&[arm(None, false), linux(b, true)], false),
+            "nokogiri 1.19.3: patched for x86_64-linux-gnu; upstream gem kept for arm64-darwin \
+             (no patched build yet)"
+        );
+        // A later run finds that platform patched.
+        assert_eq!(
+            line(&[arm(a, true), linux(b, false)], false),
+            "nokogiri 1.19.3: now also patched for arm64-darwin; already patched for \
+             x86_64-linux-gnu"
+        );
+        // The ruby-platform gem beside the platform builds.
+        assert_eq!(
+            line(
+                &[
+                    build_report(None, Some(BUILD_FIX), true),
+                    arm(None, false),
+                    linux(b, true)
+                ],
+                false
+            ),
+            "nokogiri 1.19.3: patched for ruby, x86_64-linux-gnu; upstream gem kept for \
+             arm64-darwin (no patched build yet)"
+        );
+        // A dry run says what the wet run would put in place.
+        assert_eq!(
+            line(&[arm(None, false), linux(b, true)], true),
+            "nokogiri 1.19.3: would be patched for x86_64-linux-gnu; upstream gem kept for \
+             arm64-darwin (no patched build yet)"
+        );
+        assert_eq!(
+            line(&[arm(a, true), linux(b, false)], true),
+            "nokogiri 1.19.3: would also be patched for arm64-darwin; already patched for \
+             x86_64-linux-gnu"
+        );
+
+        // Any other pin has no line; a gem left alone has its skip's.
+        let plain = super::pin_reports_by_package(&[
+            ("pkg:npm/a@1.0.0".to_string(), "u".to_string()),
+            ("pkg:gem/rack@3.1.8".to_string(), "v".to_string()),
+        ]);
+        assert!(super::format_gem_build_lines(&plain, &[], false).is_empty());
+        let left = "rack 3.1.8: no patched build yet for java; left on its upstream registry";
+        let skipped = [
+            SkippedPatch::new("pkg:npm/b@1.0.0", "ub", "not_found"),
+            SkippedPatch {
+                detail: Some(left.to_string()),
+                ..SkippedPatch::new("pkg:gem/rack@3.1.8", "ur", GEM_NO_PATCHED_BUILD)
+            },
+        ];
+        assert_eq!(
+            super::format_gem_build_lines(&[arm(a, true), linux(b, true)], &skipped, false),
+            [
+                "nokogiri 1.19.3: patched for arm64-darwin, x86_64-linux-gnu",
+                left
+            ]
+        );
+
+        // On a terminal a line that does not fit breaks after a clause,
+        // under a hanging indent; one that fits, and any line in a pipe,
+        // stays whole.
+        let long = line(&[arm(None, false), linux(b, true)], false);
+        assert_eq!(super::wrap_line(&long, None), long);
+        assert_eq!(super::wrap_line(&long, Some(120)), long);
+        for width in [80, 100] {
+            assert_eq!(
+                super::wrap_line(&long, Some(width)),
+                "nokogiri 1.19.3: patched for x86_64-linux-gnu;\n  upstream gem kept for \
+                 arm64-darwin (no patched build yet)"
+            );
+        }
+        // A clause wider than the terminal wraps at a word.
+        let platforms = [
+            "aarch64-linux-gnu",
+            "aarch64-linux-musl",
+            "arm-linux-gnu",
+            "arm-linux-musl",
+            "arm64-darwin",
+            "x86_64-darwin",
+            "x86_64-linux-gnu",
+            "x86_64-linux-musl",
+        ];
+        let many: Vec<_> = platforms
+            .iter()
+            .map(|platform| build_report(Some(platform), Some("u"), true))
+            .collect();
+        let wrapped = super::wrap_line(&line(&many, false), Some(80));
+        assert_eq!(
+            wrapped,
+            "nokogiri 1.19.3: patched for aarch64-linux-gnu, aarch64-linux-musl,\n  \
+             arm-linux-gnu, arm-linux-musl, arm64-darwin, x86_64-darwin, x86_64-linux-gnu,\n  \
+             x86_64-linux-musl"
+        );
+        assert!(wrapped.lines().all(|row| row.chars().count() <= 80));
+    }
+
+    /// A build the run put back on upstream's gem, because the patched
+    /// build its lock entry pinned was withdrawn, is said as such: in the
+    /// gem's line, before the builds that never had a patched build, and
+    /// in its uncounted event (`details.withdrawn`, and the reason). A
+    /// dry run says what the wet run would do. The line wraps after a
+    /// clause on a terminal and stays whole in a pipe.
+    #[test]
+    fn a_withdrawn_build_is_said_to_be_back_on_upstreams_gem() {
+        use crate::json_envelope::{Command, Envelope};
+        use socket_patch_core::hosted::engine::{PinReport, GEM_UPSTREAM_BUILD_KEPT};
+        let line = |reports: &[PinReport], dry_run| {
+            let lines = super::format_gem_build_lines(reports, &[], dry_run);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            lines.into_iter().next().unwrap()
+        };
+        let back = |platform| PinReport {
+            withdrawn: true,
+            ..build_report(Some(platform), None, false)
+        };
+        let arm = |patch, newly| build_report(Some("arm64-darwin"), patch, newly);
+        let linux = back("x86_64-linux-gnu");
+
+        // No locked build is patched any more.
+        let alone = line(std::slice::from_ref(&linux), false);
+        assert_eq!(
+            alone,
+            "nokogiri 1.19.3: upstream gem back for x86_64-linux-gnu (its patched build was \
+             withdrawn)"
+        );
+        // Beside a patched build, and one found patched by this run.
+        let beside = line(&[arm(Some("ua"), false), linux.clone()], false);
+        assert_eq!(
+            beside,
+            "nokogiri 1.19.3: patched for arm64-darwin; upstream gem back for x86_64-linux-gnu \
+             (its patched build was withdrawn)"
+        );
+        assert_eq!(
+            line(&[arm(Some("ua"), true), linux.clone()], false),
+            "nokogiri 1.19.3: patched for arm64-darwin; upstream gem back for x86_64-linux-gnu \
+             (its patched build was withdrawn)"
+        );
+        // Beside a build that never had a patched build, and two of them.
+        assert_eq!(
+            line(&[arm(None, false), linux.clone()], false),
+            "nokogiri 1.19.3: upstream gem back for x86_64-linux-gnu (its patched build was \
+             withdrawn); upstream gem kept for arm64-darwin (no patched build yet)"
+        );
+        assert_eq!(
+            line(&[back("arm64-darwin"), linux.clone()], false),
+            "nokogiri 1.19.3: upstream gem back for arm64-darwin, x86_64-linux-gnu (their \
+             patched builds were withdrawn)"
+        );
+        // A dry run writes nothing.
+        assert_eq!(
+            line(&[arm(Some("ua"), false), linux.clone()], true),
+            "nokogiri 1.19.3: patched for arm64-darwin; upstream gem would be back for \
+             x86_64-linux-gnu (its patched build was withdrawn)"
+        );
+
+        // One line in a pipe; on a terminal it breaks after the clause.
+        assert_eq!(super::wrap_line(&beside, None), beside);
+        assert_eq!(super::wrap_line(&beside, Some(120)), beside);
+        for width in [80, 100] {
+            assert_eq!(
+                super::wrap_line(&beside, Some(width)),
+                "nokogiri 1.19.3: patched for arm64-darwin;\n  upstream gem back for \
+                 x86_64-linux-gnu (its patched build was withdrawn)"
+            );
+        }
+        assert_eq!(super::wrap_line(&alone, Some(100)), alone);
+        assert_eq!(
+            super::wrap_line(&alone, Some(80)),
+            "nokogiri 1.19.3: upstream gem back for x86_64-linux-gnu (its patched build was\n  \
+             withdrawn)"
+        );
+
+        // The event: uncounted, with the flag and the reason.
+        let mut env = Envelope::new(Command::Scan);
+        record_hosted_events(&mut env, &[arm(None, false), linux], &[], &[], false);
+        let v = env.to_value();
+        assert_eq!(
+            v["events"],
+            serde_json::json!([
+                {
+                    "action": "skipped",
+                    "purl": "pkg:gem/nokogiri@1.19.3?platform=arm64-darwin",
+                    "errorCode": GEM_UPSTREAM_BUILD_KEPT,
+                    "reason": "the patch registry serves upstream's own gem for arm64-darwin: \
+                               no patched build yet",
+                    "details": {"gemFix": BUILD_FIX, "platform": "arm64-darwin", "mode": "hosted"},
+                },
+                {
+                    "action": "skipped",
+                    "purl": "pkg:gem/nokogiri@1.19.3?platform=x86_64-linux-gnu",
+                    "errorCode": GEM_UPSTREAM_BUILD_KEPT,
+                    "reason": "the patch registry serves upstream's own gem for \
+                               x86_64-linux-gnu: its patched build was withdrawn",
+                    "details": {
+                        "gemFix": BUILD_FIX, "platform": "x86_64-linux-gnu",
+                        "withdrawn": true, "mode": "hosted",
+                    },
+                },
+            ])
+        );
+        let summary = &v["summary"];
+        assert_eq!(
+            (&summary["applied"], &summary["skipped"], &summary["failed"]),
+            (
+                &serde_json::json!(0),
+                &serde_json::json!(0),
+                &serde_json::json!(0)
+            ),
+            "{v}"
+        );
+        assert_eq!(v["status"], "success");
+        assert!(v["warnings"].as_array().is_none_or(Vec::is_empty), "{v}");
     }
 
     use std::path::PathBuf;
@@ -4489,6 +5508,8 @@ mod tests {
             None,
             confirmed,
             records,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
@@ -4769,6 +5790,8 @@ mod tests {
             &one_confirmed,
             &none,
             &shas,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -4786,6 +5809,8 @@ mod tests {
             &one_confirmed,
             &none,
             &shas,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -4799,6 +5824,8 @@ mod tests {
             &one_confirmed,
             &none,
             &shas,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -4834,6 +5861,8 @@ mod tests {
             &confirmed,
             &std::collections::BTreeMap::new(),
             &shas,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -4929,6 +5958,8 @@ mod tests {
             &one_confirmed(),
             &none,
             &shas,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut views,
         )
         .await;
@@ -4949,6 +5980,8 @@ mod tests {
             &one_confirmed(),
             &none,
             &shas,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut views,
         )
         .await;
@@ -4978,6 +6011,8 @@ mod tests {
                 None,
                 &one_confirmed(),
                 &none,
+                &std::collections::BTreeMap::new(),
+                &std::collections::BTreeMap::new(),
                 &std::collections::BTreeMap::new(),
                 &mut views,
             )
@@ -5016,6 +6051,8 @@ mod tests {
             &one_confirmed(),
             &std::collections::BTreeMap::new(),
             &shas,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut views,
         )
         .await;
@@ -5131,6 +6168,8 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5204,6 +6243,8 @@ mod tests {
                 &confirmed,
                 &records,
                 &shas,
+                &std::collections::BTreeMap::new(),
+                &std::collections::BTreeMap::new(),
                 &mut super::ViewFallback::offline(),
             )
             .await
@@ -5249,6 +6290,8 @@ mod tests {
             &confirmed,
             &records,
             &upper,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5295,6 +6338,8 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5338,6 +6383,8 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5366,6 +6413,8 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &patched_shas,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5389,6 +6438,8 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5431,6 +6482,8 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5456,6 +6509,8 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5483,6 +6538,8 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5572,6 +6629,8 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             &mut super::ViewFallback::offline(),
         )
         .await;
@@ -5589,6 +6648,165 @@ mod tests {
             );
             assert!(out.stale_purls.is_empty());
         }
+    }
+
+    /// The copies of a platform build the patch registry serves as
+    /// upstream's own gem are judged by the sha256 of that gem alone: the
+    /// installed copy by the archive RubyGems installed it from, the
+    /// committed cache-dir archive by its own. Upstream's gem is the right
+    /// copy: nothing is stale, nothing is unjudged, and nothing is handed
+    /// to the refresh. A readable archive with another sha256 is a build
+    /// that was withdrawn: it is handed to the refresh apart from the
+    /// unpatched copies, and never withholds the gem from the same run's
+    /// VEX. A copy with no archive is not judged. The same copies of a
+    /// platform that has a patched build are stale.
+    #[tokio::test]
+    async fn gem_stale_probe_judges_a_build_on_upstreams_gem_by_its_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(
+            cwd.join("Gemfile"),
+            "source \"https://rubygems.org\"\ngem \"stale-unit\", \"1.0.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join("Gemfile.lock"),
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    stale-unit \
+             (1.0.0-arm64-darwin)\n    stale-unit (1.0.0-x86_64-linux-gnu)\n\nPLATFORMS\n  \
+             arm64-darwin\n  x86_64-linux-gnu\n\nDEPENDENCIES\n  stale-unit (= 1.0.0)\n\n\
+             BUNDLED WITH\n   2.5.0\n",
+        )
+        .unwrap();
+        let leaf = format!("{GEM_LEAF}-arm64-darwin");
+        let home = gem_home(cwd);
+        let gem_dir = home.join("gems").join(&leaf);
+        std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+        std::fs::write(gem_dir.join("lib").join("stale_unit.rb"), GEM_UPSTREAM).unwrap();
+        let archive = home.join("cache").join(format!("{leaf}.gem"));
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        std::fs::write(&archive, b"upstream platform .gem").unwrap();
+        let committed = cwd.join("vendor").join("cache").join(format!("{leaf}.gem"));
+        std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+        std::fs::write(&committed, b"upstream platform .gem").unwrap();
+
+        /// The probe of the one confirmed gem, whose patched artifacts are
+        /// the ruby gem and the other platform's build.
+        async fn judge(
+            cwd: &std::path::Path,
+            upstream: &std::collections::BTreeMap<String, String>,
+        ) -> super::StaleInstallOutcome {
+            let shas = std::collections::BTreeMap::from([(
+                ("stale-unit".to_string(), "1.0.0".to_string()),
+                std::collections::BTreeSet::from(["0".repeat(64), "1".repeat(64)]),
+            )]);
+            gem_stale_install_warnings(
+                cwd,
+                false,
+                None,
+                &one_confirmed(),
+                &std::collections::BTreeMap::new(),
+                &shas,
+                upstream,
+                &std::collections::BTreeMap::new(),
+                &mut super::ViewFallback::offline(),
+            )
+            .await
+        }
+        let upstream_sha = socket_patch_core::vendor::file_sha256_hex(&archive)
+            .await
+            .expect("the archive's sha256");
+        let upstream = std::collections::BTreeMap::from([(leaf.clone(), upstream_sha)]);
+        let patched_platform = std::collections::BTreeMap::new();
+        // Nothing of a build on upstream's gem is an unpatched copy, and
+        // nothing of it keeps the gem out of the run's VEX.
+        let never_unpatched = |out: &super::StaleInstallOutcome| {
+            assert!(out.gems.is_empty(), "no unpatched copy");
+            assert!(out.stale_purls.is_empty() && out.unjudged_purls.is_empty());
+        };
+
+        let out = judge(cwd, &upstream).await;
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(out.withdrawn.is_empty(), "nothing to refresh");
+        never_unpatched(&out);
+        let out = judge(cwd, &patched_platform).await;
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert_eq!(out.gems.len(), 1);
+        assert!(out.withdrawn.is_empty());
+        assert_eq!(
+            out.gems[0].cache_archive.as_deref(),
+            Some(committed.as_path()),
+            "the committed archive is stale with it"
+        );
+
+        // The copy was installed from another archive than upstream's
+        // gem: a patched build that was withdrawn since.
+        std::fs::write(&archive, b"withdrawn platform .gem").unwrap();
+        let out = judge(cwd, &upstream).await;
+        never_unpatched(&out);
+        let [gem] = out.withdrawn.as_slice() else {
+            panic!("one withdrawn copy: {:?}", out.withdrawn);
+        };
+        assert_eq!((gem.purl.as_str(), gem.leaf.as_str()), (GEM_PURL, &*leaf));
+        assert_eq!(gem.installed, Some((gem_dir.clone(), true)));
+        assert_eq!(
+            gem.cache_archive, None,
+            "the committed archive is upstream's gem"
+        );
+        let [warning] = out.warnings.as_slice() else {
+            panic!("one warning: {:?}", out.warnings);
+        };
+        assert_eq!(warning["code"], "redirect_gem_stale_install");
+        let detail = detail_of(warning);
+        assert!(
+            detail.starts_with(&format!(
+                "{GEM_PURL} is back on upstream's own gem for arm64-darwin, whose patched build \
+                 was withdrawn, but its withdrawn install at {} was not refreshed, and `bundle \
+                 install` reuses an installed gem instead of fetching the upstream one.",
+                gem_dir.display()
+            )),
+            "{detail}"
+        );
+
+        // So is the committed archive, which goes with the install.
+        std::fs::write(&committed, b"withdrawn platform .gem").unwrap();
+        let out = judge(cwd, &upstream).await;
+        never_unpatched(&out);
+        assert_eq!(out.withdrawn.len(), 1, "{:?}", out.withdrawn);
+        assert_eq!(
+            out.withdrawn[0].cache_archive.as_deref(),
+            Some(committed.as_path())
+        );
+
+        // With no archive beside the install there is nothing to judge it
+        // by, and the committed archive is reported alone.
+        std::fs::remove_file(&archive).unwrap();
+        let out = judge(cwd, &upstream).await;
+        never_unpatched(&out);
+        let [gem] = out.withdrawn.as_slice() else {
+            panic!("the committed archive: {:?}", out.withdrawn);
+        };
+        assert_eq!(gem.installed, None);
+        assert_eq!(gem.cache_archive.as_deref(), Some(committed.as_path()));
+        let detail = detail_of(&out.warnings[0]);
+        assert!(
+            detail.contains(&format!(
+                "but Bundler's cache dir still holds its withdrawn archive at {}",
+                committed.display()
+            )),
+            "{detail}"
+        );
+
+        // Nothing at all to judge by: unjudged for a patched platform,
+        // nothing for this one.
+        std::fs::remove_file(&committed).unwrap();
+        let out = judge(cwd, &upstream).await;
+        assert!(out.warnings.is_empty() && out.withdrawn.is_empty());
+        never_unpatched(&out);
+        let out = judge(cwd, &patched_platform).await;
+        assert_eq!(
+            out.unjudged_purls,
+            std::collections::BTreeSet::from([GEM_PURL.to_string()])
+        );
     }
 
     /// The standalone cache-flavor warning's load-bearing wording.
@@ -5929,62 +7147,6 @@ mod tests {
             format_error_line("pnpm-lock.yaml was repointed"),
             "Error: pnpm-lock.yaml was repointed"
         );
-    }
-
-    #[test]
-    fn wrap_words_respects_width_prefix_and_long_words() {
-        assert_eq!(
-            wrap_words("alpha beta gamma delta", 16, "W: ", "  "),
-            vec!["W: alpha beta", "  gamma delta"]
-        );
-        // A word wider than the line sits alone, unsplit.
-        let url = "https://patch.socket.dev/very/long/path/that/does/not/fit";
-        assert_eq!(
-            wrap_words(&format!("see {url} now"), 20, "", "  "),
-            vec!["see".to_string(), format!("  {url}"), "  now".to_string()]
-        );
-        assert_eq!(wrap_words("", 10, "W: ", "  "), vec!["W: "]);
-        // Counts characters, not bytes.
-        let lines = wrap_words("ééé ééé ééé", 8, "", "");
-        assert_eq!(lines, vec!["ééé ééé", "ééé"]);
-        for line in wrap_words(&"word ".repeat(50), 30, "Warning: ", "  ") {
-            assert!(line.chars().count() <= 30, "{line}");
-        }
-    }
-
-    #[test]
-    fn wrap_words_keeps_code_spans_whole() {
-        // The span crosses the wrap column: it moves to the next line whole.
-        assert_eq!(
-            wrap_words(
-                "never rebuild it (`pnpm clean --lockfile`), ever",
-                30,
-                "",
-                "  "
-            ),
-            vec!["never rebuild it", "  (`pnpm clean --lockfile`),", "  ever"]
-        );
-        // A span wider than the line gets a line of its own, unsplit.
-        assert_eq!(
-            wrap_words(
-                "use `pnpm install --frozen-lockfile --store-dir <dir>` now",
-                20,
-                "",
-                "  "
-            ),
-            vec![
-                "use",
-                "  `pnpm install --frozen-lockfile --store-dir <dir>`",
-                "  now"
-            ]
-        );
-        // Two spans in one word, and a word with a closed span, split normally.
-        assert_eq!(
-            wrap_tokens("a `b` c `d e`f g"),
-            vec!["a", "`b`", "c", "`d e`f", "g"]
-        );
-        // An unclosed span never swallows the rest of the text.
-        assert_eq!(wrap_tokens("a `b c d"), vec!["a", "`b", "c", "d"]);
     }
 
     #[test]
@@ -6333,6 +7495,19 @@ mod tests {
         assert_eq!(
             steps(&bundler, GemCopies::Stale)[2],
             "  2. Install the patched gems with the command in the warning above (a plain \
+             `bundle install` keeps the gems it already has), then run `socket-patch vex` to \
+             verify the installed patches."
+        );
+        // A copy of a withdrawn build went back to upstream's gem: the
+        // installed gems are what the lock pins, and never called patched.
+        assert_eq!(
+            steps(&bundler, GemCopies::Followed)[2],
+            "  2. Run `socket-patch vex` to verify the installed patches (the installed gems \
+             already hold the builds the lockfile pins, so there is nothing to reinstall)."
+        );
+        assert_eq!(
+            steps(&bundler, GemCopies::Withdrawn)[2],
+            "  2. Replace the withdrawn gem build with the command in the warning above (a plain \
              `bundle install` keeps the gems it already has), then run `socket-patch vex` to \
              verify the installed patches."
         );

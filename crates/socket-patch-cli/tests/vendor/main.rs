@@ -1,4 +1,4 @@
-//! `vendor`: lockfile-only gems, pristine fetch order, no-network re-runs, bun, the hosted redirects, the failure paths, the `--silent` error output and the human render.
+//! `vendor`: lockfile-only gems, gems locked as platform gems, pristine fetch order, no-network re-runs, bun, the hosted redirects, the failure paths, the `--silent` error output and the human render.
 //!
 //! One test binary per command: each module was its own binary.
 
@@ -21,6 +21,7 @@ mod npm_fixture;
 mod redirect_npm_allow_remote;
 mod vendor_failure_paths;
 mod vendor_gem_lockfile_only_e2e;
+mod vendor_gem_platform_builds_e2e;
 mod vendor_render;
 mod vendor_rerun_no_network_e2e;
 mod vendor_silent_errors;

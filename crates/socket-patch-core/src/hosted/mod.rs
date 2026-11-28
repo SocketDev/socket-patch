@@ -5,6 +5,8 @@
 //!   [`ProjectView`](crate::vendor::lock_inventory::ProjectView), shared by
 //!   the disk flow (`scan`/`get --mode hosted` in the CLI) and the
 //!   in-memory engine.
+//! - [`gem_index`] — what the patch registry a Bundler lock is on lists,
+//!   read before a lock of platform builds moves between patches of a gem.
 //! - [`governing_root`] — the workspace-member pre-check (a lock in an
 //!   ancestor directory governs the project).
 //! - [`guidance`] — the pnpm `trustLockfile` / npm `allow-remote`
@@ -17,6 +19,7 @@
 //!   (`socket-patch-node`) and the CLI's hidden `hosted-bundle` harness.
 
 pub mod engine;
+pub mod gem_index;
 pub mod governing_root;
 pub mod guidance;
 pub mod memory;

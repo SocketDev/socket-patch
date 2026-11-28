@@ -250,6 +250,19 @@ fn check_registry_override(ov: &RegistryOverride, origins: &[String]) -> Result<
         _ => &ov.index_url,
     };
     check_url("registry index URL", index_url, origins)?;
+    // A gem registry's snapshot level (`…/s/<key>/`) is recognised only
+    // with a key of lowercase hex digits; any other key would be written
+    // into the lock as if it named no snapshot, and a rerun would no
+    // longer know the remote as the same registry.
+    if ov.kind == "rubygems-compact-index" {
+        let trimmed = index_url.trim_end_matches('/');
+        let snapshot_level = trimmed
+            .rsplit_once('/')
+            .is_some_and(|(before, _)| before.ends_with("/s"));
+        if snapshot_level && super::split_gem_snapshot(index_url).1.is_none() {
+            return Err(bad("gem registry snapshot key", "lowercase hex digits"));
+        }
+    }
 
     let ids = &ov.identifiers;
     // The package's own spelling in its registry; no rewriter writes it.
@@ -267,27 +280,32 @@ fn check_registry_override(ov: &RegistryOverride, origins: &[String]) -> Result<
             return Err(bad(what, "64 hex digits"));
         }
     }
-    // A prebuild's platform and sha256 are spelled into `Gemfile.lock`
+    // A platform gem's platform and sha256 are spelled into `Gemfile.lock`
     // (`name (version-<platform>) sha256=<hex>`) and its platform into the
     // gem file name a refresh downloads. One entry per platform: two would
-    // leave which sha256 the lock pins to their order.
-    for (at, prebuild) in ids.gem_platforms.iter().enumerate() {
+    // leave which sha256 the lock pins to their order. The patch of a
+    // patched build is reported and attested by its uuid.
+    let gem_builds = ids.gem_builds.as_deref().unwrap_or_default();
+    for (at, prebuild) in gem_builds.iter().enumerate() {
         let platform = prebuild.platform.as_str();
         if !is_plain_gem_token(platform)
             || platform.len() > MAX_COORDINATE
             || !platform.starts_with(|c: char| c.is_ascii_alphabetic())
-            || platform == "ruby"
         {
             return Err(bad("gem platform", "a plain platform name"));
         }
         if !is_hex(&prebuild.gem_checksum_sha256, 64) {
             return Err(bad("gem platform checksum", "64 hex digits"));
         }
-        if ids.gem_platforms[..at]
+        if gem_builds[..at]
             .iter()
             .any(|earlier| earlier.platform == platform)
         {
             return Err(bad("gem platform list", "one entry per platform"));
+        }
+        let patch = prebuild.patch_uuid.as_deref();
+        if patch.is_some_and(|uuid| !crate::patch::path_safety::is_canonical_uuid(uuid)) {
+            return Err(bad("gem platform patch", "a patch uuid"));
         }
     }
     for (what, digest) in [
@@ -612,7 +630,7 @@ mod tests {
                 None,
                 vec![("x86_64-linux-gnu", sha.clone()), ("java", sha.clone())],
             ),
-            (Some("gem platform "), vec![("ruby", sha.clone())]),
+            (None, vec![("ruby", sha.clone())]),
             (
                 Some("gem platform "),
                 vec![("arm64-darwin)\n  evil (1.0", sha.clone())],
@@ -633,17 +651,41 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .identifiers
-                .gem_platforms = list
-                .iter()
-                .map(
-                    |(platform, sha)| crate::patch::redirect::GemPlatformChecksum {
-                        platform: platform.to_string(),
-                        gem_checksum_sha256: sha.clone(),
-                    },
-                )
-                .collect();
+                .gem_builds = Some(
+                list.iter()
+                    .map(
+                        |(platform, sha)| crate::patch::redirect::GemPlatformChecksum {
+                            platform: platform.to_string(),
+                            gem_checksum_sha256: sha.clone(),
+                            patch_uuid: None,
+                        },
+                    )
+                    .collect(),
+            );
             match field {
                 None => assert_eq!(check(&dep, &[]), Ok(())),
+                Some(field) => {
+                    let reason = malformed(&dep);
+                    assert!(reason.starts_with(&format!("its {field}")), "{reason}");
+                }
+            }
+        }
+        // A gem registry's snapshot key is lowercase hex, as the lock's
+        // recogniser reads it.
+        for (key, field) in [
+            ("3f", None),
+            ("3f/", None),
+            ("3F", Some("gem registry snapshot key ")),
+            ("x/", Some("gem registry snapshot key ")),
+            (&"a".repeat(65)[..], Some("gem registry snapshot key ")),
+        ] {
+            let mut dep = maven();
+            let ov = dep.registry_override.as_mut().unwrap();
+            ov.kind = "rubygems-compact-index".into();
+            ov.index_url =
+                format!("https://patch.socket.dev/patch-registry/gem/tok/{UUID}/s/{key}");
+            match field {
+                None => assert_eq!(check(&dep, &[]), Ok(()), "{key}"),
                 Some(field) => {
                     let reason = malformed(&dep);
                     assert!(reason.starts_with(&format!("its {field}")), "{reason}");

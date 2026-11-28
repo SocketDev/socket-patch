@@ -19,12 +19,21 @@ use socket_patch_core::patch::gem_refresh::{refresh, Source, Target, Wanted};
 use crate::args::{GlobalArgs, RunApiClient};
 use crate::ui::plural;
 
-/// What the lock now pins: the hosted patch, or the upstream registry
-/// entry an unwind put back.
+/// What the lock now pins: the hosted patch, the upstream registry entry
+/// an unwind put back, or, for one platform of a gem that stays on its
+/// hosted patch, upstream's own gem again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Direction {
     Patched,
     Upstream,
+    /// A hosted gem locked as platform builds, and a platform the patch
+    /// registry serves as upstream's own gem while a copy on disk holds
+    /// another build: the patched build that copy was installed from was
+    /// withdrawn, and the lock pins upstream's gem for that platform. The
+    /// hosted scan's guard finds it, so its codes and its retry are the
+    /// guard's ([`Direction::Patched`]); what replaces the copy is the
+    /// upstream gem.
+    Withdrawn,
 }
 
 impl Direction {
@@ -32,7 +41,7 @@ impl Direction {
     fn wanted(self) -> &'static str {
         match self {
             Direction::Patched => "patched",
-            Direction::Upstream => "upstream",
+            Direction::Upstream | Direction::Withdrawn => "upstream",
         }
     }
 
@@ -41,20 +50,43 @@ impl Direction {
         match self {
             Direction::Patched => "unpatched",
             Direction::Upstream => "patched",
+            Direction::Withdrawn => "withdrawn",
         }
     }
 
-    fn switched(self) -> &'static str {
+    /// What became of `gem`, before what is still stale of it.
+    fn switched(self, gem: &StaleGem) -> String {
         match self {
-            Direction::Patched => "was switched to its hosted patch",
-            Direction::Upstream => "is back on its upstream registry entry",
+            Direction::Patched => "was switched to its hosted patch".to_string(),
+            Direction::Upstream => "is back on its upstream registry entry".to_string(),
+            Direction::Withdrawn => {
+                let build = GemBuild::of_leaf(&gem.purl, &gem.leaf);
+                match build.and_then(|build| build.platform) {
+                    Some(platform) => format!(
+                        "is back on upstream's own gem for {platform}, whose patched build was \
+                         withdrawn"
+                    ),
+                    None => "is back on upstream's own gem, whose patched build was withdrawn"
+                        .to_string(),
+                }
+            }
+        }
+    }
+
+    /// Whether a re-run of the command can still refresh what this run
+    /// left: a scan finds the same copy again. An unwind can't be re-run:
+    /// its first run removed the wiring a second one would look for.
+    fn rerunnable(self) -> bool {
+        match self {
+            Direction::Patched | Direction::Withdrawn => true,
+            Direction::Upstream => false,
         }
     }
 
     /// The warning code of a materialization that is still stale.
     pub(crate) fn stale_code(self) -> &'static str {
         match self {
-            Direction::Patched => "redirect_gem_stale_install",
+            Direction::Patched | Direction::Withdrawn => "redirect_gem_stale_install",
             Direction::Upstream => "upstream_gem_stale_install",
         }
     }
@@ -62,7 +94,7 @@ impl Direction {
     /// The `--json` note of a materialization this run refreshed.
     pub(crate) fn refreshed_code(self) -> &'static str {
         match self {
-            Direction::Patched => "redirect_gem_install_refreshed",
+            Direction::Patched | Direction::Withdrawn => "redirect_gem_install_refreshed",
             Direction::Upstream => "upstream_gem_install_refreshed",
         }
     }
@@ -70,7 +102,7 @@ impl Direction {
     /// The `--json` note of a materialization a wet run would refresh.
     pub(crate) fn would_refresh_code(self) -> &'static str {
         match self {
-            Direction::Patched => "redirect_gem_install_would_refresh",
+            Direction::Patched | Direction::Withdrawn => "redirect_gem_install_would_refresh",
             Direction::Upstream => "upstream_gem_install_would_refresh",
         }
     }
@@ -160,12 +192,12 @@ impl Policy {
         }
         if !self.shared && !resolves_inside(&self.root, path) {
             return Err(Why::OutOfTree(
-                match direction {
-                    Direction::Patched => {
+                match direction.rerunnable() {
+                    true => {
                         "it is outside the project directory; `--gem-refresh-shared` refreshes \
                          it too"
                     }
-                    Direction::Upstream => "it is outside the project directory",
+                    false => "it is outside the project directory",
                 }
                 .to_string(),
             ));
@@ -200,6 +232,11 @@ pub(crate) enum Why {
     /// gem could not be had, for this reason. It is not known to be stale,
     /// and not known not to be.
     Unverified(String),
+    /// The copy is a precompiled build of this platform that Bundler loads
+    /// in place of the ruby-platform gem the lock names. The patched gem
+    /// of such a lock is the ruby-platform gem, which only an install
+    /// builds: no refresh was tried.
+    StandIn(String),
 }
 
 /// What one refresh pass did.
@@ -215,6 +252,12 @@ pub(crate) struct Attempt {
 }
 
 impl Attempt {
+    /// Record that the pass left the materialization at `path` as it was,
+    /// for `why`, without trying it.
+    pub(crate) fn leave(&mut self, path: &Path, why: Why) {
+        self.left.insert(path.to_path_buf(), why);
+    }
+
     /// Whether the pass changed anything on disk.
     pub(crate) fn changed(&self, policy: &Policy) -> bool {
         !policy.dry_run && !self.refreshed.is_empty()
@@ -389,7 +432,7 @@ fn files_to_remove(gem: &StaleGem) -> Vec<PathBuf> {
 /// Whether no gem home lists the gem dir `<home>/gems/<leaf>`: neither
 /// `specifications/<leaf>.gemspec` nor the default gem's entry under
 /// `specifications/default/` is there. Only "not found" says so.
-fn gemspec_is_gone(gem_dir: &Path) -> bool {
+pub(crate) fn gemspec_is_gone(gem_dir: &Path) -> bool {
     let Some(spec) = home_spec(gem_dir) else {
         return false;
     };
@@ -475,16 +518,14 @@ fn display_list(paths: &[PathBuf]) -> String {
 /// every one of them does: a gem dir with no gemspec fails a re-run the
 /// same way, and a copy no Ruby owns needs its Ruby found first.
 fn retry_hint(direction: Direction, why: Option<&Why>, outlives: Option<Outlives>) -> &'static str {
-    match (why, direction) {
-        (Some(Why::Failed(_)), Direction::Patched) if outlives == Some(Outlives::NoGemspec) => "",
-        (Some(Why::Failed(_)), Direction::Patched) if outlives == Some(Outlives::ForeignRuby) => {
+    match (why, direction.rerunnable()) {
+        (Some(Why::Failed(_)), true) if outlives == Some(Outlives::NoGemspec) => "",
+        (Some(Why::Failed(_)), true) if outlives == Some(Outlives::ForeignRuby) => {
             "Re-run `socket-patch scan` with the Ruby that installed the gem first on `PATH` \
              to retry, or "
         }
-        (Some(Why::Disabled), Direction::Patched) => {
-            "Re-run without `--no-gem-install-refresh`, or "
-        }
-        (Some(Why::Failed(_) | Why::OutOfTree(_)), Direction::Patched) => {
+        (Some(Why::Disabled), true) => "Re-run without `--no-gem-install-refresh`, or ",
+        (Some(Why::Failed(_) | Why::OutOfTree(_)), true) => {
             "Re-run `socket-patch scan` to retry, or "
         }
         _ => "",
@@ -544,6 +585,11 @@ fn reason(why: Option<&Why>) -> String {
             format!(" ({reason})")
         }
         Some(Why::Disabled) => " (`--no-gem-install-refresh` is set)".to_string(),
+        Some(Why::StandIn(platform)) => format!(
+            " (it is a precompiled {platform} gem, which Bundler loads in place of the ruby \
+             gem the lock names, and the patched gem of this lock is the ruby gem, which \
+             `bundle install` builds)"
+        ),
         _ => String::new(),
     }
 }
@@ -551,7 +597,7 @@ fn reason(why: Option<&Why>) -> String {
 /// The detail of one still-stale materialization (the `--json` warning).
 /// `why` is `None` where no refresh was attempted yet.
 pub(crate) fn stale_detail(direction: Direction, gem: &StaleGem, why: Option<&Why>) -> String {
-    let (purl, switched) = (&gem.purl, direction.switched());
+    let (purl, switched) = (&gem.purl, direction.switched(gem));
     let (stale, wanted) = (direction.stale(), direction.wanted());
     let reuse =
         format!("`bundle install` reuses an installed gem instead of fetching the {wanted} one");
@@ -566,7 +612,7 @@ pub(crate) fn stale_detail(direction: Direction, gem: &StaleGem, why: Option<&Wh
         return if !project_local
             && !matches!(
                 why,
-                Some(Why::Disabled | Why::Failed(_) | Why::OutOfTree(_))
+                Some(Why::Disabled | Why::Failed(_) | Why::OutOfTree(_) | Why::StandIn(_))
             ) {
             format!(
                 "{held}. {IN_PLACE_REINSTALL}. Other projects may load that shared gem home, so \
@@ -606,7 +652,7 @@ pub(crate) fn stale_detail(direction: Direction, gem: &StaleGem, why: Option<&Wh
         Some((dir, false))
             if !matches!(
                 why,
-                Some(Why::Disabled | Why::Failed(_) | Why::OutOfTree(_))
+                Some(Why::Disabled | Why::Failed(_) | Why::OutOfTree(_) | Why::StandIn(_))
             ) =>
         {
             format!(
@@ -614,11 +660,11 @@ pub(crate) fn stale_detail(direction: Direction, gem: &StaleGem, why: Option<&Wh
              {}, and {reuse}. Other projects may load that gem home, so it was left alone. \
              Install the {wanted} gem for this project only with `{LOCAL_PATH_REMEDY}`, or {}",
                 dir.display(),
-                match direction {
-                    Direction::Patched => {
+                match direction.rerunnable() {
+                    true => {
                         "re-run with `--gem-refresh-shared` to replace the shared copy".to_string()
                     }
-                    Direction::Upstream => format!(
+                    false => format!(
                         "replace the shared copy: remove {} and run `bundle install` ({})",
                         display_list(&files_to_remove(gem)),
                         other_projects_cost(1)
@@ -743,6 +789,11 @@ pub(crate) fn report(
     } else {
         (direction.refreshed_code(), "replaced", "Replaced")
     };
+    // Why the upstream gem takes the place of a copy on a hosted scan.
+    let because = match direction {
+        Direction::Withdrawn => " (its patched build was withdrawn)",
+        Direction::Patched | Direction::Upstream => "",
+    };
     let (mut installed, mut archives, mut in_place) = (Vec::new(), Vec::new(), Vec::new());
     for (purl, target) in &attempt.refreshed {
         let what = match target {
@@ -769,7 +820,7 @@ pub(crate) fn report(
     }
     if !installed.is_empty() {
         out.progress.push(format!(
-            "{replaced} the installed copy of {} with the {wanted} build: {}.",
+            "{replaced} the installed copy of {} with the {wanted} build{because}: {}.",
             plural(installed.len(), "gem", "gems"),
             labels(installed.iter().copied())
         ));
@@ -784,7 +835,7 @@ pub(crate) fn report(
     }
     if !archives.is_empty() {
         out.progress.push(format!(
-            "{replaced} {} in Bundler's cache dir with the {wanted} gem: {}.",
+            "{replaced} {} in Bundler's cache dir with the {wanted} gem{because}: {}.",
             plural(archives.len(), "archive", "archives"),
             labels(archives.iter().copied())
         ));
@@ -845,6 +896,7 @@ pub(crate) fn report(
     let switch = match direction {
         Direction::Patched => "the switch to hosted patches",
         Direction::Upstream => "the switch back to the upstream registry",
+        Direction::Withdrawn => "the withdrawal of a patched build",
     };
     let known = match direction {
         Direction::Patched if stale.iter().all(|gem| gem.in_place) => format!(
@@ -865,6 +917,10 @@ pub(crate) fn report(
         ),
         Direction::Upstream => format!(
             "{} the patched build on disk after {switch}",
+            plural(count, "gem still holds", "gems still hold")
+        ),
+        Direction::Withdrawn => format!(
+            "{} a patched build on disk that was withdrawn",
             plural(count, "gem still holds", "gems still hold")
         ),
     };
@@ -907,14 +963,14 @@ pub(crate) fn report(
                  place from the upstream archive beside it. ",
             );
         }
-        bullets.push(match direction {
-            Direction::Patched => format!(
+        bullets.push(match direction.rerunnable() {
+            true => format!(
                 "{why}To install {them} for this project only, run `{LOCAL_PATH_REMEDY}`, or \
                  re-run with `--gem-refresh-shared` to replace the shared {copies}."
             ),
             // An unwind can't be re-run (see `retry_hint`), so the shared
             // copies are replaced by hand (#2086).
-            Direction::Upstream => format!(
+            false => format!(
                 "{why}To install {them} for this project only, run `{LOCAL_PATH_REMEDY}`. To \
                  replace the shared {copies}, run `{}`; {}.",
                 reinstall_command(&shared_files, false),
@@ -1215,7 +1271,7 @@ pub(crate) fn view_record(
     uuid: &str,
 ) -> Option<PatchRecord> {
     view.map(|view| socket_patch_core::manifest::records::record_from_patch_response(&view).1)
-        .filter(|record| record.uuid == uuid && !record.files.is_empty())
+        .filter(|record| record.uuid.eq_ignore_ascii_case(uuid) && !record.files.is_empty())
 }
 
 /// Why a hosted unwind has no patch record to judge an installed copy by.
@@ -1841,6 +1897,72 @@ mod tests {
             Direction::Patched,
         )
         .await
+    }
+
+    /// A precompiled build that Bundler loads in place of the ruby gem
+    /// its lock names is left as it is, in the project's own gem home too:
+    /// the warning says what the copy is and which gem the lock patches,
+    /// and offers the command alone. A second scan would do the same, so
+    /// no retry is offered.
+    #[tokio::test]
+    async fn a_precompiled_stand_in_is_left_with_its_reason_and_the_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let home = proj.join("vendor/bundle/ruby/3.4.0");
+        let mut gem = installed("nokogiri", &home, true);
+        let dir = home.join("gems/nokogiri-1.0.0-arm64-darwin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            home.join("specifications/nokogiri-1.0.0-arm64-darwin.gemspec"),
+            "",
+        )
+        .unwrap();
+        gem.leaf = "nokogiri-1.0.0-arm64-darwin".to_string();
+        gem.installed = Some((dir.clone(), true));
+        let policy = policy(&proj, true, false, false);
+        let mut pass = pass(&[], &policy).await;
+        pass.leave(&dir, Why::StandIn("arm64-darwin".to_string()));
+        assert!(!pass.changed(&policy));
+
+        let out = report(
+            Direction::Patched,
+            std::slice::from_ref(&gem),
+            &pass,
+            &policy,
+        );
+        let why = "it is a precompiled arm64-darwin gem, which Bundler loads in place of the \
+                   ruby gem the lock names, and the patched gem of this lock is the ruby gem, \
+                   which `bundle install` builds";
+        let spec = home.join("specifications/nokogiri-1.0.0-arm64-darwin.gemspec");
+        let archive = home.join("cache/nokogiri-1.0.0-arm64-darwin.gem");
+        assert_eq!(
+            out.warnings,
+            [(
+                "redirect_gem_stale_install",
+                format!(
+                    "pkg:gem/nokogiri@1.0.0 was switched to its hosted patch, but its unpatched \
+                     install at {} was not refreshed ({why}), and `bundle install` reuses an \
+                     installed gem instead of fetching the patched one. Remove {}, {} and run \
+                     `bundle install`",
+                    dir.display(),
+                    spec.display(),
+                    archive.display()
+                )
+            )]
+        );
+        let summary = out.summary.expect("a summary");
+        assert_eq!(
+            summary.headline,
+            "1 gem is still unpatched on disk after the switch to hosted patches"
+        );
+        assert_eq!(
+            summary.bullets,
+            [format!(
+                "Not refreshed ({why}): nokogiri 1.0.0. Run `rm -f {} {} && bundle install`.",
+                spec.display(),
+                archive.display()
+            )]
+        );
     }
 
     /// Four gems in a shared home are one warning: the home, the gems, why
@@ -2670,6 +2792,192 @@ mod tests {
             out.summary.expect("a summary").headline,
             "2 gems still have unpatched files or archives on disk after the switch to hosted \
              patches"
+        );
+    }
+
+    /// The copy of a withdrawn build, where the lock pins upstream's gem
+    /// for the platform: the hosted scan's guard reports it under its own
+    /// codes and with its own retries (a scan can be re-run), and every
+    /// line says what the copy is and that the upstream gem takes its
+    /// place. Nothing calls the result patched.
+    #[tokio::test]
+    async fn the_copy_of_a_withdrawn_build_is_replaced_with_the_upstream_gem() {
+        let withdrawn = Direction::Withdrawn;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let platform_gem = |name: &str, home: &Path, project_local: bool| {
+            let mut gem = installed(name, home, project_local);
+            let (dir, _) = gem.installed.take().unwrap();
+            let platform_dir = dir.with_file_name(format!("{name}-1.0.0-arm64-darwin"));
+            std::fs::rename(&dir, &platform_dir).unwrap();
+            let specs = home.join("specifications");
+            std::fs::rename(
+                specs.join(format!("{name}-1.0.0.gemspec")),
+                specs.join(format!("{name}-1.0.0-arm64-darwin.gemspec")),
+            )
+            .unwrap();
+            gem.leaf = format!("{name}-1.0.0-arm64-darwin");
+            gem.installed = Some((platform_dir, project_local));
+            gem
+        };
+        let home = proj.join("vendor/bundle/ruby/3.4.0");
+        let local = platform_gem("rexml", &home, true);
+        let (dir, _) = local.installed.clone().unwrap();
+
+        // Replaced: the notes and the progress line.
+        let replaced = Attempt {
+            refreshed: vec![
+                (
+                    "pkg:gem/rexml@1.0.0".to_string(),
+                    Target::Installed(dir.clone()),
+                ),
+                (
+                    "pkg:gem/rexml@1.0.0".to_string(),
+                    Target::CacheArchive(PathBuf::from(
+                        "vendor/cache/rexml-1.0.0-arm64-darwin.gem",
+                    )),
+                ),
+            ],
+            ..Attempt::default()
+        };
+        let out = report(
+            withdrawn,
+            &[],
+            &replaced,
+            &policy(&proj, true, false, false),
+        );
+        assert!(out.summary.is_none());
+        assert_eq!(
+            out.progress,
+            [
+                "Replaced the installed copy of 1 gem with the upstream build (its patched build \
+                 was withdrawn): rexml 1.0.0.",
+                "Replaced 1 archive in Bundler's cache dir with the upstream gem (its patched \
+                 build was withdrawn): rexml 1.0.0.",
+            ]
+        );
+        assert_eq!(
+            out.warnings,
+            [
+                (
+                    "redirect_gem_install_refreshed",
+                    format!(
+                        "pkg:gem/rexml@1.0.0: replaced the withdrawn install at {} with the \
+                         upstream gem",
+                        dir.display()
+                    )
+                ),
+                (
+                    "redirect_gem_install_refreshed",
+                    "pkg:gem/rexml@1.0.0: replaced the withdrawn archive at \
+                     vendor/cache/rexml-1.0.0-arm64-darwin.gem with the upstream gem"
+                        .to_string()
+                ),
+            ]
+        );
+        let dry = report(withdrawn, &[], &replaced, &policy(&proj, true, false, true));
+        assert!(
+            dry.progress[0].starts_with(
+                "Would replace the installed copy of 1 gem with the upstream build (its patched \
+                 build was withdrawn)"
+            ) && dry
+                .warnings
+                .iter()
+                .all(|(code, _)| *code == "redirect_gem_install_would_refresh"),
+            "{dry:?}"
+        );
+
+        // Left as it is: what it is, why, and how to remove it. A scan can
+        // be re-run, so the retry is offered.
+        let off = policy(&proj, false, false, false);
+        let stale = [local.clone()];
+        let out = report(withdrawn, &stale, &pass(&stale, &off).await, &off);
+        let spec = home.join("specifications/rexml-1.0.0-arm64-darwin.gemspec");
+        let archive = home.join("cache/rexml-1.0.0-arm64-darwin.gem");
+        assert_eq!(
+            out.warnings,
+            [(
+                "redirect_gem_stale_install",
+                format!(
+                    "pkg:gem/rexml@1.0.0 is back on upstream's own gem for arm64-darwin, whose \
+                     patched build was withdrawn, but its withdrawn install at {} was not \
+                     refreshed (`--no-gem-install-refresh` is set), and `bundle install` reuses \
+                     an installed gem instead of fetching the upstream one. Re-run without \
+                     `--no-gem-install-refresh`, or remove {}, {} and run `bundle install`",
+                    dir.display(),
+                    spec.display(),
+                    archive.display()
+                )
+            )]
+        );
+        let summary = out.summary.expect("a summary");
+        assert_eq!(
+            summary.headline,
+            "1 gem still holds a patched build on disk that was withdrawn"
+        );
+        assert_eq!(
+            summary.bullets,
+            [format!(
+                "Not refreshed (`--no-gem-install-refresh` is set): rexml 1.0.0. Re-run without \
+                 `--no-gem-install-refresh`, or run `rm -f {} {} && bundle install`.",
+                shell_word(&spec),
+                shell_word(&archive)
+            )]
+        );
+
+        // A run that may not download (`--offline`) and holds no verified
+        // copy of the upstream gem: the same warning, with that reason.
+        let on = policy(&proj, true, false, false);
+        let upstream_gem = |gem: &StaleGem| {
+            Some(Wanted {
+                leaf: gem.leaf.clone(),
+                kind: "upstream",
+                sha256: BTreeSet::from(["0".repeat(64)]),
+                urls: vec!["http://127.0.0.1:9/gems/rexml.gem".to_string()],
+                on_disk: Vec::new(),
+            })
+        };
+        let tried = attempt(&stale, upstream_gem, &Source::DiskOnly, &on, withdrawn).await;
+        let out = report(withdrawn, &stale, &tried, &on);
+        assert_eq!(
+            out.summary.expect("a summary").bullets,
+            [format!(
+                "Not refreshed (this run is offline and no verified copy of the upstream gem is \
+                 on disk): rexml 1.0.0. Re-run `socket-patch scan` to retry, or run `rm -f {} {} \
+                 && bundle install`.",
+                shell_word(&spec),
+                shell_word(&archive)
+            )]
+        );
+
+        // In a gem home other projects load: left alone, with the flag
+        // that covers it.
+        let shared = platform_gem("rack", &tmp.path().join("gemhome"), false);
+        let stale = [shared];
+        let out = report(withdrawn, &stale, &pass(&stale, &on).await, &on);
+        let detail = &out.warnings[0].1;
+        assert!(
+            detail.contains("but the shared gem home still holds its withdrawn install at")
+                && detail.ends_with(
+                    "Install the upstream gem for this project only with `bundle config set \
+                     --local path vendor/bundle && bundle install`, or re-run with \
+                     `--gem-refresh-shared` to replace the shared copy"
+                ),
+            "{detail}"
+        );
+        let summary = out.summary.expect("a summary");
+        assert_eq!(
+            summary.headline,
+            "1 gem still holds a patched build on disk that was withdrawn"
+        );
+        assert!(
+            summary.bullets[1].starts_with(
+                "`bundle install` reuses an installed gem instead of fetching the upstream one. \
+                 To install it for this project only, run"
+            ) && summary.bullets[1]
+                .ends_with("or re-run with `--gem-refresh-shared` to replace the shared copy."),
+            "{:?}",
+            summary.bullets
         );
     }
 

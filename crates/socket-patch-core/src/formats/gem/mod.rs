@@ -199,9 +199,22 @@ pub(crate) struct GemfileLock<'t> {
     pub(crate) direct: BTreeSet<&'t str>,
     /// Why bundler would refuse this lock, first problem first.
     pub(crate) problems: Vec<String>,
+    /// The entries of the `PLATFORMS` section, in lock order.
+    pub(crate) platforms: Vec<&'t str>,
 }
 
 impl<'t> GemfileLock<'t> {
+    /// Whether Bundler loads an installed precompiled build of a gem in
+    /// place of the ruby-platform gem this lock names for it: it does
+    /// where `PLATFORMS` names `ruby` and nothing else. For such a lock
+    /// Bundler takes, among the gems of the locked version, the one that
+    /// fits the machine best, so a `<name>-<version>-<platform>` copy in
+    /// a gem home is what Ruby runs. A lock that names any other platform
+    /// installs and loads exactly the gems it lists.
+    pub(crate) fn loads_platform_copies(&self) -> bool {
+        !self.platforms.is_empty() && self.platforms.iter().all(|platform| *platform == "ruby")
+    }
+
     /// The `GEM` sections, in lock order.
     pub(crate) fn gem_sections(&self) -> impl Iterator<Item = &Section<'t>> {
         self.sections.iter().filter(|s| s.header == "GEM")
@@ -381,6 +394,14 @@ impl GemBuild {
     }
 }
 
+/// Whether Bundler loads an installed precompiled build of a gem in place
+/// of the ruby-platform gem the lock text `lock` names for it
+/// ([`GemfileLock::loads_platform_copies`]).
+pub fn lock_loads_platform_copies(lock: &str) -> bool {
+    let lock = crate::utils::line_endings::to_lf(lock);
+    parse(&lock).loads_platform_copies()
+}
+
 /// The name and version of the gem `purl`, qualifiers dropped.
 fn gem_coordinates(purl: &str) -> Option<(String, String)> {
     let (ecosystem, name, version) = crate::utils::purl::purl_parts(purl)?;
@@ -507,6 +528,8 @@ pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
     let mut in_specs = false;
     let mut in_checksums = false;
     let mut in_dependencies = false;
+    let mut in_platforms = false;
+    let mut platforms: Vec<&str> = Vec::new();
     let mut pinned: BTreeSet<&str> = BTreeSet::new();
     let mut direct: BTreeSet<&str> = BTreeSet::new();
     let mut dependencies: Option<Dependencies<'_>> = None;
@@ -548,6 +571,7 @@ pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
             in_specs = false;
             in_checksums = header == "CHECKSUMS";
             in_dependencies = header == "DEPENDENCIES";
+            in_platforms = header == "PLATFORMS";
             if in_checksums && checksum_entries.is_none() {
                 checksum_entries = Some(Vec::new());
             }
@@ -617,6 +641,8 @@ pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
             if let Some(entries) = checksum_entries.as_mut() {
                 entries.push(trimmed);
             }
+        } else if in_platforms && indent == 2 {
+            platforms.push(trimmed);
         }
     }
     let last_line = text.split_inclusive('\n').count();
@@ -638,6 +664,7 @@ pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
         pinned,
         direct,
         problems,
+        platforms,
     }
 }
 
@@ -862,6 +889,42 @@ mod tests {
     /// the specs and the sha256-pinned `CHECKSUMS` entries, and whether the
     /// ruby-platform entry is one of them. Other versions, other gems,
     /// non-`GEM` sections and bare `CHECKSUMS` entries do not count.
+    /// Bundler takes the installed gem that fits the machine best for a
+    /// ruby-platform entry only where the lock's `PLATFORMS` names `ruby`
+    /// and nothing else. A lock with any other platform, or with no
+    /// `PLATFORMS` entry at all, loads exactly the gems it lists.
+    #[test]
+    fn a_lock_of_the_ruby_platform_alone_loads_platform_copies() {
+        let lock = |platforms: &str| {
+            format!(
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    nokogiri (1.18.10)\n\n\
+                 PLATFORMS\n{platforms}\nDEPENDENCIES\n  nokogiri\n"
+            )
+        };
+        assert!(lock_loads_platform_copies(&lock("  ruby\n")));
+        assert!(lock_loads_platform_copies(
+            &lock("  ruby\n").replace('\n', "\r\n")
+        ));
+        for platforms in [
+            "  arm64-darwin\n  ruby\n",
+            "  x86_64-linux\n",
+            "  java\n",
+            "",
+        ] {
+            assert!(
+                !lock_loads_platform_copies(&lock(platforms)),
+                "{platforms:?}"
+            );
+        }
+        assert!(!lock_loads_platform_copies(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    nokogiri (1.18.10)\n"
+        ));
+        assert_eq!(
+            parse(&lock("  arm64-darwin\n  ruby\n")).platforms,
+            ["arm64-darwin", "ruby"]
+        );
+    }
+
     #[test]
     fn locked_builds_of_a_gem_version() {
         let sha = "a".repeat(64);
