@@ -4950,6 +4950,9 @@ build is stated as `affected` under `vex_gem_build_unknown`, like a build the lo
 shown to install. When it cannot show that (`--offline`, a failed
 request, a lock older than what the patch service lists now) it states the build as `affected`,
 with what to run to settle it, under the warning `vex_gem_build_unknown`. The run still succeeds.
+For a platform the registry lists no gem for (one upstream does not publish), a scan changes
+nothing, and the statement says so: the build is settled once the lock no longer names the
+platform (`bundle lock --remove-platform`).
 
 The registry URL the scan writes names the registry as it stood (`…/s/<key>/`). When a patched
 build is published for another platform, the next scan is given a URL with another key: it
