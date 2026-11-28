@@ -91,8 +91,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use futures_util::StreamExt;
 
 use socket_patch_core::api::client::{
-    build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
-    is_fallback_candidate, ApiClient,
+    build_proxy_fallback_client, hold_back_debug, is_fallback_candidate, ApiClient,
 };
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::hosted::engine::PinReport;
@@ -1790,17 +1789,18 @@ fn local_record_by_uuid(
 }
 
 /// The run's client: the host's, or built here once (standalone `vex`).
+/// Once the authenticated API has refused the credential itself (a 401
+/// to a request of that client, here or earlier in the run), every read
+/// is handed the public proxy's client: the read that met the refusal
+/// fell back and said so, and none after it presents the credential
+/// again. A 403 is about one patch and changes nothing here.
 async fn run_client(
     common: &GlobalArgs,
     api_client: &RunApiClient,
     notes: &mut Vec<PlanNote>,
 ) -> ApiClient {
-    let overrides = common.api_client_overrides();
     let built_here = !api_client.initialized();
-    let client = api_client
-        .get_or_init(|| async { get_api_client_with_overrides(overrides).await.0 })
-        .await
-        .clone();
+    let client = common.api_client(api_client).await.clone();
     // A client built here whose org could not be resolved put the run on
     // the proxy. Its construction already warned on stderr, so only the
     // `--json` envelope needs the note (a host that seeded its client
@@ -1812,6 +1812,9 @@ async fn run_client(
                 detail: reason.to_string(),
             });
         }
+    }
+    if client.credential_refused() {
+        return build_proxy_fallback_client(&common.api_client_overrides());
     }
     client
 }
@@ -2237,10 +2240,9 @@ async fn read_gem_builds(
 /// stale-credential fallback of the other reads: a patch the
 /// authenticated API refuses (401/403) is asked of the public proxy, and
 /// `notes` says so once. A 403 is about one patch, so the next record is
-/// still asked of the API first; once the API has refused the credential
-/// itself (a 401, here or earlier in the run), the records are read from
-/// the proxy alone. `Err` says why a record could not be read, safe to
-/// print: nothing then judges that build's copies.
+/// still asked of the API first; after a 401 the run's client is the
+/// proxy's ([`run_client`]). `Err` says why a record could not be read,
+/// safe to print: nothing then judges that build's copies.
 pub(crate) async fn read_build_records(
     common: &GlobalArgs,
     api_client: &RunApiClient,
@@ -2268,11 +2270,6 @@ pub(crate) async fn read_build_records(
         .await
     };
     let client = run_client(common, api_client, notes).await;
-    // The read that met the 401 has said that the run fell back.
-    let client = match client.credential_refused() {
-        true => build_proxy_fallback_client(&common.api_client_overrides()),
-        false => client,
-    };
     let on_proxy = client.uses_public_proxy();
     let mut reads = summaries(client, uuids.to_vec()).await;
     let refused = |read: &Result<_, socket_patch_core::api::client::ApiError>| matches!(read, Err(e) if is_fallback_candidate(e));
@@ -2712,12 +2709,12 @@ mod tests {
     }
 
     /// Once the authenticated API has refused the credential itself (a
-    /// 401), the run's later build records are read from the public proxy
-    /// alone: the credential is not presented again for each of them, and
-    /// the fallback is not noted a second time.
+    /// 401), the run's client is handed out as the public proxy's: the
+    /// reads that follow, of patch records and of build records alike,
+    /// ask the API nothing, and the fallback is not noted a second time.
     #[tokio::test]
     #[serial_test::serial]
-    async fn build_records_stay_on_the_proxy_after_the_credential_is_refused() {
+    async fn the_run_stays_on_the_proxy_after_the_credential_is_refused() {
         let api = wiremock::MockServer::start().await;
         let proxy = wiremock::MockServer::start().await;
         let org = |uuid: &str| format!("/v0/orgs/acme/patches/view/{uuid}");
@@ -2725,16 +2722,25 @@ mod tests {
         mount_view(&api, org(U1), 401, None, 1).await;
         mount_view(&api, org(U2), 401, None, 0).await;
         mount_view(&proxy, public(U1), 200, Some(build_view(U1, "free")), 1).await;
-        mount_view(&proxy, public(U2), 200, Some(build_view(U2, "free")), 1).await;
+        mount_view(&proxy, public(U2), 200, Some(build_view(U2, "free")), 2).await;
 
         let tmp = tempfile::tempdir().unwrap();
         let common = authenticated(tmp.path(), &api, &proxy);
         let run = RunApiClient::new();
         let mut notes: Vec<PlanNote> = Vec::new();
+        let before = run_client(&common, &run, &mut notes).await;
+        assert!(!before.uses_public_proxy());
         let first = read_build_records(&common, &run, &[U1.to_string()], &mut notes).await;
+        let after = run_client(&common, &run, &mut notes).await;
+        assert!(
+            after.uses_public_proxy(),
+            "the client handed out is the proxy's"
+        );
         let later = read_build_records(&common, &run, &[U2.to_string()], &mut notes).await;
+        let records = fetch_records(&common, &run, &[U2.to_string()], &mut notes).await;
 
         assert!(first[0].is_ok() && later[0].is_ok());
+        assert!(records.contains_key(U2), "{records:?}");
         assert_eq!(fallback_notes(&notes), 1, "{notes:?}");
         api.verify().await;
         proxy.verify().await;
