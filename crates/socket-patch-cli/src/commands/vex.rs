@@ -1107,6 +1107,13 @@ async fn generate_vex(
         // A build with an installed copy goes by that copy alone: what the
         // run assumes of the gem never stands in for it.
         gem_builds_judged = judged.builds;
+        for note in judged.notes {
+            let said =
+                |warning: &RunWarning| warning.code == note.code && warning.detail == note.detail;
+            if !warnings.iter().any(said) {
+                note_warning(warnings, common, note.code, note.detail);
+            }
+        }
         for (purl, why) in judged.unknown {
             let gem = plan.hosted_gems.iter().find_map(|(key, gem)| {
                 let build = gem.builds.iter().find(|build| build.purl == purl)?;
@@ -2392,6 +2399,9 @@ struct JudgedBuildCopies {
     /// The builds (by purl) whose own record could not be read, each with
     /// why: nothing judged their copies, so they are never attested.
     unknown: BTreeMap<String, crate::commands::vex_sources::GemBuildUnshown>,
+    /// What reading the records said of the run (a credential the API
+    /// refused, answered by the public proxy).
+    notes: Vec<crate::commands::vex_sources::PlanNote>,
 }
 
 /// Moves the installed copies of each patched platform build of a hosted
@@ -2404,7 +2414,8 @@ struct JudgedBuildCopies {
 /// hashes and is never checked against them. The copies of a build move
 /// under the build's purl (`pkg:gem/<name>@<version>?platform=<platform>`)
 /// with the record of the build's own patch, read once per build without
-/// its file contents, and the installed-files check judges them like any
+/// its file contents (the records of a run are read several at a time),
+/// and the installed-files check judges them like any
 /// other package: every copy must verify (two gem homes can hold the
 /// build), and a missing or unreadable file counts as it does elsewhere.
 /// Where that record cannot be read, nothing judges the copies.
@@ -2414,10 +2425,13 @@ async fn judge_gem_build_copies(
     plan: &Plan,
     hosted: &mut HashMap<String, socket_patch_core::vex::HostedCopies>,
 ) -> JudgedBuildCopies {
-    use crate::commands::vex_sources::read_build_record;
+    use crate::commands::vex_sources::read_build_records;
     use socket_patch_core::formats::gem::GemBuild;
     use socket_patch_core::vex::gem_builds::GemBuildState;
     let mut judged = JudgedBuildCopies::default();
+    // Each build that has an installed copy: its purl, its patch, the
+    // gem's record its own is shaped after, and how its copies are found.
+    let mut builds = Vec::new();
     for (key, gem) in &plan.hosted_gems {
         let (Some(record), Some(consumed)) = (plan.view.patches.get(key), hosted.get_mut(key))
         else {
@@ -2453,25 +2467,32 @@ async fn judge_gem_build_copies(
         let rename = consumed.rename.clone();
         for (purl, (uuid, paths)) in copies {
             judged.builds.insert(purl.to_string());
-            match read_build_record(common, &params.api_client, uuid).await {
-                Ok(files) => {
-                    let record = PatchRecord {
-                        uuid: uuid.clone(),
-                        files,
-                        ..record.clone()
-                    };
-                    judged
-                        .view
-                        .get_or_insert_with(|| plan.view.clone())
-                        .patches
-                        .insert(purl.to_string(), record);
-                    let rename = rename.clone();
-                    let copies = socket_patch_core::vex::HostedCopies { paths, rename };
-                    hosted.insert(purl.to_string(), copies);
-                }
-                Err(why) => {
-                    judged.unknown.insert(purl.to_string(), why);
-                }
+            let copies = socket_patch_core::vex::HostedCopies {
+                paths,
+                rename: rename.clone(),
+            };
+            builds.push((purl.to_string(), uuid.clone(), record, copies));
+        }
+    }
+    let uuids: Vec<String> = builds.iter().map(|(_, uuid, ..)| uuid.clone()).collect();
+    let records = read_build_records(common, &params.api_client, &uuids, &mut judged.notes).await;
+    for ((purl, uuid, record, copies), files) in builds.into_iter().zip(records) {
+        match files {
+            Ok(files) => {
+                let record = PatchRecord {
+                    uuid,
+                    files,
+                    ..record.clone()
+                };
+                judged
+                    .view
+                    .get_or_insert_with(|| plan.view.clone())
+                    .patches
+                    .insert(purl.clone(), record);
+                hosted.insert(purl, copies);
+            }
+            Err(why) => {
+                judged.unknown.insert(purl, why);
             }
         }
     }

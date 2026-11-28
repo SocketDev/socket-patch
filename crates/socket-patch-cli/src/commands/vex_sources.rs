@@ -2230,34 +2230,75 @@ async fn read_gem_builds(
     (lists, indexes)
 }
 
-/// The files the patch `uuid` of a platform build changes, as that patch's
-/// own record lists them (asked without file contents): what the installed
-/// copies of the build are checked against. One request, made only for a
-/// build that has an installed copy. `Err` says why the record could not
-/// be read, safe to print: nothing then judges the copies.
-pub(crate) async fn read_build_record(
+/// The files each patch among `uuids` (the patches of platform builds)
+/// changes, as that patch's own record lists them, in the order asked:
+/// what the installed copies of a build are checked against. One request
+/// per patch, asked without file contents, several at a time, with the
+/// stale-credential fallback of the other reads: a patch the
+/// authenticated API refuses (401/403) is asked of the public proxy, and
+/// `notes` says so once. `Err` says why a record could not be read, safe
+/// to print: nothing then judges that build's copies.
+pub(crate) async fn read_build_records(
     common: &GlobalArgs,
     api_client: &RunApiClient,
-    uuid: &str,
-) -> Result<HashMap<String, PatchFileInfo>, GemBuildUnshown> {
+    uuids: &[String],
+    notes: &mut Vec<PlanNote>,
+) -> Vec<Result<HashMap<String, PatchFileInfo>, GemBuildUnshown>> {
     use socket_patch_core::utils::redact::redact_urls_in;
     if common.offline {
-        return Err(GemBuildUnshown::Offline);
+        return uuids
+            .iter()
+            .map(|_| Err(GemBuildUnshown::Offline))
+            .collect();
     }
-    let client = run_client(common, api_client, &mut Vec::new()).await;
-    let unread = |why: String| GemBuildUnshown::RecordUnread(why);
-    match hold_back_debug(client.fetch_patch_summary(uuid))
+    if uuids.is_empty() {
+        return Vec::new();
+    }
+    let summaries = |client: ApiClient, uuids: Vec<String>| async move {
+        let client = &client;
+        let window = fetch_concurrency(client.uses_public_proxy());
+        ordered_concurrent(uuids.iter(), window, |uuid| async move {
+            hold_back_debug(client.fetch_patch_summary(uuid)).await
+        })
+        .map(|read| read.release())
+        .collect::<Vec<_>>()
         .await
-        .release()
-    {
-        Ok(Some(view)) if view.uuid.eq_ignore_ascii_case(uuid) => Ok(
-            socket_patch_core::manifest::records::files_for_manifest(&view),
-        ),
-        Ok(_) => Err(unread(
-            "the patch API has no record of that patch".to_string(),
-        )),
-        Err(error) => Err(unread(redact_urls_in(&error.to_string()).into_owned())),
+    };
+    let client = run_client(common, api_client, notes).await;
+    let on_proxy = client.uses_public_proxy();
+    let mut reads = summaries(client, uuids.to_vec()).await;
+    let refused = |read: &Result<_, socket_patch_core::api::client::ApiError>| matches!(read, Err(e) if is_fallback_candidate(e));
+    let again: Vec<usize> = (0..reads.len())
+        .filter(|at| !on_proxy && refused(&reads[*at]))
+        .collect();
+    if let Some(Err(error)) = again.first().map(|at| &reads[*at]) {
+        notes.push(PlanNote {
+            code: NOTE_API_AUTH_FALLBACK,
+            detail: format!(
+                "authenticated API returned {error}; falling back to public patch API proxy \
+                 (free patches only)."
+            ),
+        });
+        let proxy = build_proxy_fallback_client(&common.api_client_overrides());
+        let asked = again.iter().map(|at| uuids[*at].clone()).collect();
+        for (at, read) in again.iter().zip(summaries(proxy, asked).await) {
+            reads[*at] = read;
+        }
     }
+    let unread = |why: String| GemBuildUnshown::RecordUnread(why);
+    uuids
+        .iter()
+        .zip(reads)
+        .map(|(uuid, read)| match read {
+            Ok(Some(view)) if view.uuid.eq_ignore_ascii_case(uuid) => Ok(
+                socket_patch_core::manifest::records::files_for_manifest(&view),
+            ),
+            Ok(_) => Err(unread(
+                "the patch API has no record of that patch".to_string(),
+            )),
+            Err(error) => Err(unread(redact_urls_in(&error.to_string()).into_owned())),
+        })
+        .collect()
 }
 
 /// The [`GEM_BUILD_UNKNOWN`] warning of a patched build of the gem at

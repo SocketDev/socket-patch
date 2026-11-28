@@ -7311,6 +7311,12 @@ async fn a_patched_platform_copy_with_a_pruned_cache_is_judged_by_its_own_patch(
 /// The record of the [`PLATFORM`] build's own patch, whose patched lib is
 /// `stamped`, as the patch API serves it.
 async fn mount_build_record(server: &MockServer, stamped: &str) {
+    let api = format!("/v0/orgs/{ORG}/patches/view/{ARM_UUID}");
+    mount_build_record_at(server, &api, stamped).await;
+}
+
+/// [`mount_build_record`] under `route`.
+async fn mount_build_record_at(server: &MockServer, route: &str, stamped: &str) {
     let record = serde_json::json!({
         "uuid": ARM_UUID,
         "purl": format!("{PURL}?platform={PLATFORM}"),
@@ -7323,7 +7329,7 @@ async fn mount_build_record(server: &MockServer, stamped: &str) {
         "description": "x", "license": "MIT", "tier": "free"
     });
     Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/view/{ARM_UUID}")))
+        .and(path(route))
         .respond_with(ResponseTemplate::new(200).set_body_json(record))
         .mount(server)
         .await;
@@ -7611,4 +7617,120 @@ async fn a_platform_build_in_two_gem_homes_has_one_vex_outcome() {
         !statuses.iter().any(|status| status == "not_affected"),
         "a build with an unpatched copy is not attested by the run: {env}\n{doc}"
     );
+}
+
+/// A credential the patch API refuses for the record of a build's own
+/// patch is answered by the public proxy, as for every other read of
+/// `vex`: the build is attested, and the run says which API answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_record_the_api_refuses_is_read_from_the_public_proxy() {
+    use vex_e2e_common::{run_vex, statements_for, VexRun};
+    let stamped = format!("# Socket Community Patch: {ARM_UUID}\n{PATCHED_LIB}");
+    let build = format!("{PURL}?platform={PLATFORM}");
+    let server = MockServer::start().await;
+    let proxy = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = platform_project(&server, tmp.path(), &real_gem_for(&stamped, PLATFORM)).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{ARM_UUID}")))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let on_proxy = format!("/patch/view/{ARM_UUID}");
+    mount_build_record_at(&proxy, &on_proxy, &stamped).await;
+    install_real_gem_for(&project_home(&proj), &stamped, PLATFORM);
+    let uri = server.uri();
+    let (code, stdout, stderr) =
+        common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+
+    let run = VexRun {
+        api_url: Some(uri.clone()),
+        api_token: Some("fake".into()),
+        org: Some(ORG.into()),
+        patch_server_url: Some(uri.clone()),
+        proxy_url: Some(proxy.uri()),
+        product: Some("pkg:gem/app@1.0.0".into()),
+        ..VexRun::default()
+    };
+    let out = run_vex(&vex_e2e_common::binary(), &proj, &run);
+    assert_eq!(out.code, Some(0), "{out}");
+    let attested = statements_for(out.doc(), &build);
+    assert!(
+        attested
+            .iter()
+            .any(|statement| statement["status"] == "not_affected"),
+        "the build is attested by the record the proxy served: {out}"
+    );
+    let warned = out.envelope["warnings"].to_string();
+    assert!(warned.contains("api_auth_fallback"), "{out}");
+    assert!(!warned.contains("vex_gem_build_unknown"), "{out}");
+    let asked = proxy.received_requests().await.unwrap_or_default();
+    let records: Vec<&str> = asked
+        .iter()
+        .map(|request| request.url.path())
+        .filter(|route| *route == on_proxy)
+        .collect();
+    assert_eq!(records.len(), 1, "one request to the proxy: {asked:?}");
+}
+
+/// The guard knows the ruby-platform gem by the sha256 the reference's
+/// list gives for it, whatever the reference's own checksum says: a lock
+/// that names the ruby-platform gem beside a platform build, with the
+/// patched ruby gem installed from its archive, has no stale install.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_ruby_gem_of_a_platform_lock_is_judged_by_its_list_entry() {
+    let stamped = format!("# Socket Community Patch: {ARM_UUID}\n{PATCHED_LIB}");
+    let ruby_sha = sha256_of(&real_gem(PATCHED_LIB));
+    let arm_sha = sha256_of(&real_gem_for(&stamped, PLATFORM));
+    let server = MockServer::start().await;
+    // The reference's own checksum is not the list's entry for the gem.
+    mount_api_with(
+        &server,
+        None,
+        &"f".repeat(64),
+        &[
+            ("ruby", ruby_sha.clone(), Some(UUID)),
+            (PLATFORM, arm_sha, Some(ARM_UUID)),
+        ],
+    )
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("Gemfile"),
+        format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\n"),
+    )
+    .unwrap();
+    let upstream = |platform: &str| sha256_of(&real_gem_for(UPSTREAM_LIB, platform));
+    let lock = format!(
+        "GEM\n  remote: https://rubygems.org/\n  specs:\n    {DEP} ({DEP_VERSION})\n    {DEP} \
+         ({DEP_VERSION}-{PLATFORM})\n\nPLATFORMS\n  {PLATFORM}\n  ruby\n\nDEPENDENCIES\n  {DEP} (= \
+         {DEP_VERSION})\n\nCHECKSUMS\n  {DEP} ({DEP_VERSION}) sha256={}\n  {DEP} \
+         ({DEP_VERSION}-{PLATFORM}) sha256={}\n\nBUNDLED WITH\n  4.0.15\n",
+        sha256_of(&real_gem(UPSTREAM_LIB)),
+        upstream(PLATFORM),
+    );
+    std::fs::write(proj.join("Gemfile.lock"), lock).unwrap();
+    let home = project_home(&proj);
+    let ruby_dir = install_real_gem(&home, PATCHED_LIB);
+    install_real_gem_for(&home, &stamped, PLATFORM);
+
+    let uri = server.uri();
+    let (code, stdout, stderr) =
+        common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    let after = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
+    assert!(
+        after.contains(&format!("  {DEP} ({DEP_VERSION}) sha256={ruby_sha}\n")),
+        "the lock pins the ruby gem to the list's entry: {after}"
+    );
+    assert!(stale_warnings(&env).is_empty(), "{env}");
+    assert!(
+        warnings_with_code(&env, "redirect_gem_install_refreshed").is_empty(),
+        "{env}"
+    );
+    assert_eq!(installed_lib(&ruby_dir), PATCHED_LIB);
 }
