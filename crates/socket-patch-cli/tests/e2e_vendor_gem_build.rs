@@ -2867,8 +2867,9 @@ fn platform_purl(platform: &str) -> String {
 /// (`registryOverride.identifiers.gemBuilds`): the ruby gem, each platform
 /// of `patched` with the patch of its patched build ([`build_uuid`]), and
 /// each of `upstream` with none (the registry hands on upstream's own gem
-/// for it); a platform in neither is one whose patched build is still being
-/// made. Each of those patches serves that platform's gem (`tarball`)
+/// for it); a platform in neither is one the list leaves out, as for a
+/// platform upstream does not publish. Each of those patches serves that
+/// platform's gem (`tarball`)
 /// and stub gemspec, and one request answers for every uuid it names. A
 /// platform of `building` is listed with the patch of its patched build
 /// too, and the reference of that patch answers `pending_build`: the
@@ -3159,8 +3160,10 @@ fn per_platform_gem(
 ///      publishes it as platform gems only, and locks this machine's
 ///      platform and two foreign ones;
 ///   2. while one locked platform has no patched build (the service lists
-///      upstream's own gem for it, does not list it yet, or names a patch
-///      for it that is still being built) the gem is not vendored: the run
+///      upstream's own gem for it, or names a patch for it that is still
+///      being built), or is one the service's list leaves out (a platform
+///      upstream does not publish, which the line says with what settles
+///      it), the gem is not vendored: the run
 ///      exits 0, says so in ONE line that names the platform, asks for the
 ///      gem patch's reference (and, where every platform is named a patch,
 ///      for the platform patches' in one request more), downloads no gem
@@ -3340,11 +3343,12 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
     // 2. One locked platform has no patched build yet: the gem is not
     //    vendored, in one line, the run does not fail, no gem is
     //    downloaded and nothing is written. The same whether the service
-    //    lists upstream's own gem for that platform, does not list it at
-    //    all while its build is being made, or names a patch for it whose
-    //    own reference says it is still being built (which a run learns
-    //    from its second request, for the platform patches). A dry run
-    //    says what the wet run says.
+    //    lists upstream's own gem for that platform or names a patch for
+    //    it whose own reference says it is still being built (which a run
+    //    learns from its second request, for the platform patches). A
+    //    platform the list leaves out is not one to wait for: the line
+    //    says that the registry does not list it, and what settles that.
+    //    A dry run says what the wet run says.
     let mut own_patches: Vec<String> = platforms.iter().map(|p| build_uuid(UUID, p)).collect();
     own_patches.sort();
     let (with_build, without_build) = platforms.split_at(2);
@@ -3356,7 +3360,18 @@ async fn platform_gems_capstone(bundler: &bundler_e2e::Bundler, declared: &str) 
          others now.",
         without_build[0], have[0], have[1]
     );
+    let not_listed = format!(
+        "{PLAT}@{PLAT_VERSION} is not vendored: the patch registry does not list {0}. Vendored \
+         mode needs every locked platform, and a re-run does not change what the registry \
+         lists: this is settled once the lockfile no longer names {0} (`bundle lock \
+         --remove-platform {0}`), or the registry lists a gem for every locked platform.",
+        without_build[0]
+    );
     for (listed, building) in [(without_build, none), (none, none), (none, without_build)] {
+        let not_vendored = match listed.is_empty() && building.is_empty() {
+            true => &not_listed,
+            false => &not_vendored,
+        };
         let partial =
             platform_patch_service(&fixture, &purl, UUID, with_build, listed, building).await;
         let mut asked = vec![vec![UUID.to_string()]];

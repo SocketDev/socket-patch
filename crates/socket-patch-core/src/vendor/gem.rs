@@ -1859,17 +1859,23 @@ fn listed(items: &[&str]) -> String {
 #[derive(Default)]
 struct NoPatchedBuild<'a> {
     /// None yet, as far as the service says: the gem patch's registry
-    /// serves upstream's own gem for the platform, does not list it, or
-    /// the patch of its build is still being built.
+    /// serves upstream's own gem for the platform, or the patch of its
+    /// build is still being built.
     yet: Vec<&'a str>,
     /// The gem patch names a patched build, and the service does not
     /// grant this caller the patch of it.
     unavailable: Vec<&'a str>,
+    /// The gem patch's list leaves the platform out. The service lists
+    /// every platform gem upstream publishes for the version, so this is
+    /// a platform upstream does not publish, and no build of it is on its
+    /// way: what hosted mode reports as
+    /// [`GEM_PLATFORM_UNLISTED`](crate::hosted::engine::GEM_PLATFORM_UNLISTED).
+    unlisted: Vec<&'a str>,
 }
 
 impl NoPatchedBuild<'_> {
     fn is_empty(&self) -> bool {
-        self.yet.is_empty() && self.unavailable.is_empty()
+        self.yet.is_empty() && self.unavailable.is_empty() && self.unlisted.is_empty()
     }
 }
 
@@ -1878,7 +1884,10 @@ impl NoPatchedBuild<'_> {
 /// platforms) have one. Its last clause says what the gem's `standing`
 /// leaves it with: hosted mode can patch the platforms that do have a
 /// build, unless the gem is hosted already, and a vendored copy stays in
-/// force. For a lock already wired to this patch's copy
+/// force. A platform the list leaves out is not one to wait for, and
+/// hosted mode leaves such a gem alone too: the line says what settles
+/// it, as `vex` does of such a build. For a lock already wired to this
+/// patch's copy
 /// ([`Standing::Wired`]) the caller ends the line with what became of
 /// that copy ([`wired_copy_not_rebuilt`]); otherwise it is the whole
 /// line.
@@ -1893,6 +1902,7 @@ fn no_patched_build_detail(
         Standing::Wired | Standing::EarlierPatch => "was not brought up to date",
     };
     let none = match (missing.yet.as_slice(), missing.unavailable.as_slice()) {
+        ([], []) => String::new(),
         (yet, []) => format!("no patched build yet for {}", listed(yet)),
         ([], unavailable) => format!("no patched build available for {}", listed(unavailable)),
         (yet, unavailable) => format!(
@@ -1901,6 +1911,30 @@ fn no_patched_build_detail(
             listed(unavailable)
         ),
     };
+    if !missing.unlisted.is_empty() {
+        let unlisted = &missing.unlisted;
+        let also = match none.as_str() {
+            "" => String::new(),
+            none => format!(", and there is {none}"),
+        };
+        let tail = match standing {
+            Standing::Wired => "",
+            Standing::EarlierPatch => {
+                "; its vendored copy of an earlier patch stays in force as it is."
+            }
+            Standing::NotVendored => ".",
+            Standing::Hosted => "; the gem stays hosted.",
+        };
+        return format!(
+            "{gem} {lead}: the patch registry does not list {names}{also}. Vendored mode needs \
+             every locked platform, and a re-run does not change what the registry lists: this \
+             is settled once the lockfile no longer names {names} (`bundle lock \
+             --remove-platform {args}`), or the registry lists a gem for every locked \
+             platform{tail}",
+            names = listed(unlisted),
+            args = unlisted.join(" "),
+        );
+    }
     let have = match patched {
         [] => String::new(),
         [one] => format!(" ({one} has one)"),
@@ -1929,13 +1963,14 @@ fn no_builds_listed(gem: &str) -> String {
 }
 
 /// [`no_builds_listed`] for the platforms a lock names: the skip of
-/// [`no_patched_build`], opened like its line and closed with what the
+/// [`no_patched_build`], opened like its line, with what to do (in words
+/// that hold for every command that vendors) and closed with what the
 /// gem's `standing` leaves it with. Either answer of [`no_builds_listed`]
 /// is this skip, so one rebuild is not a skip for one and a failure for
 /// the other.
 fn no_builds_listed_skip(trees: &PlatformTrees<'_>) -> Box<VendorOutcome> {
     let (lead, tail) = match trees.standing {
-        Standing::NotVendored => ("is not vendored", "; run the scan again later."),
+        Standing::NotVendored => ("is not vendored", "."),
         Standing::Hosted => ("is not vendored", "; the gem stays hosted."),
         Standing::Wired => ("was not brought up to date", ""),
         Standing::EarlierPatch => (
@@ -1945,7 +1980,11 @@ fn no_builds_listed_skip(trees: &PlatformTrees<'_>) -> Box<VendorOutcome> {
     };
     Box::new(refused(
         super::VENDOR_PREBUILT_PLATFORM_PENDING,
-        format!("{} {lead}: {}{tail}", trees.gem, no_builds_listed("it")),
+        format!(
+            "{} {lead}: {}. Run this again later{tail}",
+            trees.gem,
+            no_builds_listed("it")
+        ),
     ))
 }
 
@@ -1969,8 +2008,8 @@ fn no_patched_build(
 /// reference of the gem's fix `uuid` names them, with the sha256 its
 /// registry lists for that platform gem: ONE request, and nothing
 /// downloaded. While a locked platform has no patched build (the registry
-/// serves upstream's own gem for it, or does not list it) the gem is
-/// skipped ([`no_patched_build`]); a reference with no list at all is
+/// serves upstream's own gem for it, or leaves the platform out) the gem
+/// is skipped ([`no_patched_build`]); a reference with no list at all is
 /// skipped as naming no builds right now ([`no_builds_listed_skip`]).
 async fn locked_build_sources(
     cfg: &VendorServiceConfig,
@@ -1994,9 +2033,12 @@ async fn locked_build_sources(
     let mut sources: Vec<BuildSource> = Vec::with_capacity(platforms.len());
     let mut missing = NoPatchedBuild::default();
     for platform in platforms {
-        let build = builds.iter().find(|build| build.platform == *platform);
-        match build.and_then(|build| Some((build, build.patch_uuid.as_deref()?))) {
-            Some((build, uuid)) => sources.push(BuildSource {
+        let Some(build) = builds.iter().find(|build| build.platform == *platform) else {
+            missing.unlisted.push(platform);
+            continue;
+        };
+        match build.patch_uuid.as_deref() {
+            Some(uuid) => sources.push(BuildSource {
                 platform: platform.clone(),
                 uuid: uuid.to_string(),
                 pinned: BuildPin::Registry(build.gem_checksum_sha256.clone()),
@@ -13232,7 +13274,7 @@ mod tests {
                 listed,
                 ..served(platform)
             };
-            let cases: [(Vec<Served>, bool, &str); 5] = [
+            let cases: [(Vec<Served>, bool, &str); 6] = [
                 (
                     vec![served(DARWIN), listed(LINUX, Listed::PassThrough)],
                     true,
@@ -13240,12 +13282,30 @@ mod tests {
                      (arm64-darwin has one). Vendored mode needs every locked platform; `scan \
                      --mode hosted` can patch the others now.",
                 ),
+                // A platform the list leaves out is one upstream does not
+                // publish: not one to wait for, and hosted mode leaves
+                // such a gem alone too.
                 (
                     vec![listed(DARWIN, Listed::Unlisted), served(LINUX)],
                     true,
-                    "nokogiri@1.18.10 is not vendored: no patched build yet for arm64-darwin \
-                     (x86_64-linux-gnu has one). Vendored mode needs every locked platform; `scan \
-                     --mode hosted` can patch the others now.",
+                    "nokogiri@1.18.10 is not vendored: the patch registry does not list \
+                     arm64-darwin. Vendored mode needs every locked platform, and a re-run does \
+                     not change what the registry lists: this is settled once the lockfile no \
+                     longer names arm64-darwin (`bundle lock --remove-platform arm64-darwin`), \
+                     or the registry lists a gem for every locked platform.",
+                ),
+                (
+                    vec![
+                        listed(DARWIN, Listed::Unlisted),
+                        listed(LINUX, Listed::PassThrough),
+                    ],
+                    true,
+                    "nokogiri@1.18.10 is not vendored: the patch registry does not list \
+                     arm64-darwin, and there is no patched build yet for x86_64-linux-gnu. \
+                     Vendored mode needs every locked platform, and a re-run does not change \
+                     what the registry lists: this is settled once the lockfile no longer names \
+                     arm64-darwin (`bundle lock --remove-platform arm64-darwin`), or the \
+                     registry lists a gem for every locked platform.",
                 ),
                 (
                     vec![
@@ -13259,8 +13319,12 @@ mod tests {
                 (
                     Vec::new(),
                     true,
-                    "nokogiri@1.18.10 is not vendored: no patched build yet for arm64-darwin and \
-                     x86_64-linux-gnu. Vendored mode needs every locked platform.",
+                    "nokogiri@1.18.10 is not vendored: the patch registry does not list \
+                     arm64-darwin and x86_64-linux-gnu. Vendored mode needs every locked \
+                     platform, and a re-run does not change what the registry lists: this is \
+                     settled once the lockfile no longer names arm64-darwin and \
+                     x86_64-linux-gnu (`bundle lock --remove-platform arm64-darwin \
+                     x86_64-linux-gnu`), or the registry lists a gem for every locked platform.",
                 ),
                 // A reference that carries no list of the version's gems:
                 // the service names no builds to vendor from right now.
@@ -13268,7 +13332,7 @@ mod tests {
                     vec![served(DARWIN), served(LINUX)],
                     false,
                     "nokogiri@1.18.10 is not vendored: the patch service lists no builds for it \
-                     right now; run the scan again later.",
+                     right now. Run this again later.",
                 ),
             ];
             for (builds, list, line) in cases {
@@ -13330,7 +13394,7 @@ mod tests {
                     assert_eq!(
                         detail,
                         "nokogiri@1.18.10 is not vendored: the patch service lists no builds \
-                         for it right now; run the scan again later."
+                         for it right now. Run this again later."
                     );
                     let (code, detail) = unwrap_refused(
                         vendor(&root, &not_installed(&root), &record, cfg, dry_run).await,
@@ -13339,7 +13403,8 @@ mod tests {
                     assert_eq!(
                         detail,
                         "nokogiri@1.18.10 was not brought up to date: the patch service lists \
-                         no builds for it right now; its vendored copy stays in force as it is."
+                         no builds for it right now. Run this again later; its vendored copy \
+                         stays in force as it is."
                     );
                     assert!(!detail.contains('\n'), "one line: {detail}");
                 }
@@ -13390,10 +13455,12 @@ mod tests {
         }
 
         /// A copy the lock is ALREADY wired to cannot wait for a patched
-        /// build when one of its trees is lost: with that platform's build
-        /// gone from the registry, the rebuild is the plain miss, a
+        /// build when one of its trees is lost: with that platform gone
+        /// from the registry's list, the rebuild is the plain miss, a
         /// failure, dry run or not, and what is left of the copy stays as
-        /// it was.
+        /// it was. The line says that the registry does not list the
+        /// platform, and what settles that, not that a build is on its
+        /// way.
         #[tokio::test]
         async fn a_wired_copy_that_cannot_be_rebuilt_fails_instead_of_skipping() {
             let (_tmp, root, record) = project(&lock(None)).await;
@@ -13411,10 +13478,12 @@ mod tests {
                 assert_eq!(code, "vendor_prebuilt_required", "{detail}");
                 assert_eq!(
                     detail,
-                    "nokogiri@1.18.10 was not brought up to date: no patched build yet for \
-                     x86_64-linux-gnu (arm64-darwin has one). Vendored mode needs every locked \
-                     platform; its vendored copy is missing or damaged and cannot be rebuilt \
-                     until then."
+                    "nokogiri@1.18.10 was not brought up to date: the patch registry does not \
+                     list x86_64-linux-gnu. Vendored mode needs every locked platform, and a \
+                     re-run does not change what the registry lists: this is settled once the \
+                     lockfile no longer names x86_64-linux-gnu (`bundle lock --remove-platform \
+                     x86_64-linux-gnu`), or the registry lists a gem for every locked platform; \
+                     its vendored copy is missing or damaged and cannot be rebuilt until then."
                 );
                 assert_eq!(ts::tree_snapshot(&root), before, "dry_run={dry_run}");
             }
@@ -13636,7 +13705,7 @@ mod tests {
         #[tokio::test]
         async fn a_damaged_copy_whose_fix_lists_no_builds_is_told_to_run_again_later() {
             const SCAN: &str = "nokogiri@1.18.10 was not brought up to date: the patch service \
-                                lists no builds for it right now";
+                                lists no builds for it right now. Run this again later";
             const RESTORE: &str = "vendor_prebuilt_required: the patch service lists no builds \
                                    for nokogiri@1.18.10 right now; run this again later";
             let (_tmp, root, record) = project(&lock(None)).await;
@@ -13996,7 +14065,7 @@ mod tests {
             const NEEDS: &str = "Vendored mode needs every locked platform";
             let yet = NoPatchedBuild {
                 yet: vec![DARWIN],
-                unavailable: Vec::new(),
+                ..NoPatchedBuild::default()
             };
             let line = |standing: Standing, patched: &[&str]| {
                 no_patched_build_detail(GEM, &yet, patched, standing)
@@ -14041,12 +14110,13 @@ mod tests {
             }
 
             let unavailable = NoPatchedBuild {
-                yet: Vec::new(),
                 unavailable: vec![DARWIN],
+                ..NoPatchedBuild::default()
             };
             let both = NoPatchedBuild {
                 yet: vec![DARWIN],
                 unavailable: vec!["java"],
+                ..NoPatchedBuild::default()
             };
             for missing in [&yet, &unavailable, &both] {
                 for patched in [&[][..], &[LINUX][..], &[LINUX, "aarch64-linux-gnu"][..]] {
@@ -14072,11 +14142,13 @@ mod tests {
 
         /// The line of a fix that names no builds right now, for each
         /// standing: it opens like the line of a platform with no patched
-        /// build, names the gem once, and ends with what the gem is left
+        /// build, names the gem once, says what to do in words that fit
+        /// every command that vendors, and ends with what the gem is left
         /// with (the caller ends the line of a wired copy).
         #[test]
         fn a_fix_that_names_no_builds_says_what_the_gem_is_left_with() {
-            const NONE: &str = "the patch service lists no builds for it right now";
+            const NONE: &str = "the patch service lists no builds for it right now. Run this \
+                                again later";
             let platforms = [LINUX.to_string()];
             let line = |standing: Standing| {
                 let trees = PlatformTrees {
@@ -14090,7 +14162,7 @@ mod tests {
             };
             assert_eq!(
                 line(Standing::NotVendored),
-                format!("nokogiri@1.18.10 is not vendored: {NONE}; run the scan again later.")
+                format!("nokogiri@1.18.10 is not vendored: {NONE}.")
             );
             assert_eq!(
                 line(Standing::Hosted),

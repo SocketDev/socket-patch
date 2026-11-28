@@ -9067,6 +9067,12 @@ mod ui_format_tests {
             "nokogiri@1.19.3 was not brought up to date: no patched build yet for java. \
              Vendored mode needs every locked platform; its vendored copy stays in force as \
              it is.",
+            "nokogiri@1.19.3 is not vendored: the patch registry does not list java. Vendored \
+             mode needs every locked platform, and a re-run does not change what the registry \
+             lists: this is settled once the lockfile no longer names java (`bundle lock \
+             --remove-platform java`), or the registry lists a gem for every locked platform.",
+            "nokogiri@1.19.3 is not vendored: the patch service lists no builds for it right \
+             now. Run this again later.",
         ] {
             assert_eq!(format_skip(purl, pending, line), line);
         }
