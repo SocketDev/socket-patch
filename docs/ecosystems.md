@@ -4960,7 +4960,9 @@ scan reports the gem as already on its patch and `vex` attests its builds. A loc
 snapshot of the patch is told the patch is still being built and is left as it is; the first scan
 after the rebuild moves it. A project that is not on the patch yet is left on its upstream
 registry and takes the patched build on a scan after the rebuild. A vendored copy is not touched
-by a rebuild either: a re-scan, `repair` and `vendor --check` find it as it was. During the
+by a rebuild either: a re-scan, `repair` and `vendor --check` find it as it was. A vendored tree
+that is damaged or missing cannot be restored until the rebuild is over: the run says that the
+patch service lists no builds for the gem right now, and to run it again later. During the
 rebuild a fresh `bundle install` of that platform's gem from the snapshot fails until the rebuilt
 gem is there, as for any gem that is briefly unavailable.
 
